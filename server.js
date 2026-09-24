@@ -1,3 +1,10 @@
+const { loadEnvFile } = require("node:process");
+
+try {
+  loadEnvFile();
+} catch (error) {
+  if (error?.code !== "ENOENT") throw error;
+}
 const express = require("express");
 const multer = require("multer");
 const path = require("path");
