@@ -130,6 +130,39 @@ test("startup accepts only an explicit strong JWT_SECRET", { timeout: 45_000 }, 
   assert.equal(sanitize(running.output(), secrets).includes("[redacted]"), false, "strong secret was echoed");
 });
 
+test("startup loads .env from the working directory and preserves explicit environment values", { timeout: 45_000 }, async (t) => {
+  const fileSecret = crypto.randomBytes(48).toString("base64url");
+  const explicitSecret = crypto.randomBytes(48).toString("base64url");
+  const weakFileSecret = "rootark-test-weak-env-file-secret";
+  const secrets = [fileSecret, explicitSecret, weakFileSecret];
+  const sandboxes = [];
+  const launchedServers = [];
+
+  t.after(async () => {
+    for (const launched of launchedServers) await stop(launched.child, secrets);
+    for (const dir of sandboxes) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const envOnlyCwd = createSandbox();
+  sandboxes.push(envOnlyCwd);
+  fs.writeFileSync(path.join(envOnlyCwd, ".env"), `JWT_SECRET=${fileSecret}\n`);
+  const envOnlyPort = await getUnusedPort();
+  const envOnlyServer = startServer({ cwd: envOnlyCwd, port: envOnlyPort, jwtSecret: undefined });
+  launchedServers.push(envOnlyServer);
+  assert.equal(await waitForServer(envOnlyPort, secrets), 200);
+  await stop(envOnlyServer.child, secrets);
+  assert.equal(sanitize(envOnlyServer.output(), secrets).includes("[redacted]"), false, ".env secret was echoed");
+
+  const explicitCwd = createSandbox();
+  sandboxes.push(explicitCwd);
+  fs.writeFileSync(path.join(explicitCwd, ".env"), `JWT_SECRET=${weakFileSecret}\n`);
+  const explicitPort = await getUnusedPort();
+  const explicitServer = startServer({ cwd: explicitCwd, port: explicitPort, jwtSecret: explicitSecret });
+  launchedServers.push(explicitServer);
+  assert.equal(await waitForServer(explicitPort, secrets), 200);
+  await stop(explicitServer.child, secrets);
+  assert.equal(sanitize(explicitServer.output(), secrets).includes("[redacted]"), false, "JWT secret was echoed");
+});
 test("startup rejects invalid TOTP policy configuration without echoing raw values", { timeout: 45_000 }, async (t) => {
   const strongSecret = crypto.randomBytes(48).toString("base64url");
   const cases = [
