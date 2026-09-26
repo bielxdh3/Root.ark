@@ -5,6 +5,8 @@
 **Private storage, file transfer, and synchronization under administrator control.**
 
 [![Status](https://img.shields.io/badge/status-active%20development-orange)](#project-status)
+[![Security Regression](https://github.com/bielxdh3/Root.ark/actions/workflows/security-regression.yml/badge.svg)](https://github.com/bielxdh3/Root.ark/actions/workflows/security-regression.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 [![Runtime](https://img.shields.io/badge/Node.js-22%2B-339933)](#requirements)
 [![Database](https://img.shields.io/badge/database-SQLite-003B57)](#architecture)
 [![Network](https://img.shields.io/badge/deployment-private%20network-blueviolet)](#security-boundary)
@@ -227,6 +229,10 @@ See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 - [Plan tree](docs/plan-tree.md)
 - [Backup and restore](BACKUP.md)
 - [Synchronization](SYNC.md)
+- [Contributing](CONTRIBUTING.md)
+- [Support](SUPPORT.md)
+- [Governance](GOVERNANCE.md)
+- [Security policy](SECURITY.md)
 
 ## Roadmap
 
@@ -241,6 +247,14 @@ See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 ## Project direction
 
 Root.ark remains an independent project. Future integration or selective reuse with BielOS requires an explicit architecture, security review, migration plan, and authorization. Similar goals do not make the two systems interchangeable.
+
+## License
+
+Root.ark is released under the [Apache License 2.0](LICENSE).
+
+You may use, modify, redistribute, embed, and sell the software, including in commercial or closed-source products, subject to the Apache-2.0 terms. Redistributions must preserve applicable license, copyright, and attribution notices, including the project [NOTICE](NOTICE) where required.
+
+**Copyright 2026 bielxdh3.**
 
 ## Disclaimer
 
