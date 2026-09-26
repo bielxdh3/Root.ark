@@ -1,0 +1,13 @@
+# Default ownership
+* @bielxdh3
+
+# Security- and data-sensitive areas
+/SECURITY.md @bielxdh3
+/docs/security/ @bielxdh3
+/server.js @bielxdh3
+/db/ @bielxdh3
+/repositories/ @bielxdh3
+/services/ @bielxdh3
+/sync-client/ @bielxdh3
+/.github/workflows/ @bielxdh3
+/scripts/ @bielxdh3
