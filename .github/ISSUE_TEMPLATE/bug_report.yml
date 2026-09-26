@@ -1,0 +1,66 @@
+name: Bug report
+description: Report a reproducible Root.ark problem
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, JWTs, cookies, encryption keys, databases,
+        uploads, backups, private paths, or other sensitive data.
+
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      description: Commit SHA or branch/release identifier.
+      placeholder: abc1234
+    validations:
+      required: true
+
+  - type: input
+    id: component
+    attributes:
+      label: Component
+      placeholder: Auth, uploads, backup, WebDAV, sync, storage, UI
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: What happened?
+      description: Describe observed and expected behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Use disposable data only.
+      placeholder: |
+        1. Configure ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed secrets, private data, databases, uploads, backups, and sensitive paths.
+          required: true
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: This is not an undisclosed security vulnerability.
+          required: true
