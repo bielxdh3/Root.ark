@@ -1,0 +1,48 @@
+name: Feature request
+description: Propose a Root.ark improvement
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or operational problem are you trying to solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior you would like to see.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Authentication / authorization
+        - File lifecycle
+        - Backup / restore
+        - Encryption
+        - WebDAV
+        - Synchronization
+        - Storage adapters
+        - Database / migration
+        - UI
+        - Deployment / operations
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: boundary
+    attributes:
+      label: Security boundary impact
+      options:
+        - label: This may affect authentication, permissions, stored data, networking, or destructive actions.
