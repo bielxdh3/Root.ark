@@ -18,7 +18,7 @@
     "sync:start:legacy-dev": "node sync-client/rootark-sync.js start --legacy-development-opt-in"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.1136.0",
+    "@aws-sdk/client-s3": "^3.1140.0",
     "@hpke/core": "1.9.0",
     "@hpke/dhkem-x25519": "1.8.0",
     "archiver": "^8.0.0",
