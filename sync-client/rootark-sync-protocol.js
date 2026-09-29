@@ -6,6 +6,9 @@ const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const PROTOCOL_VERSION = 2;
 const MAX_ID_LENGTH = 160;
 const MAX_METADATA_BYTES = 16 * 1024;
+const MOVE_PAYLOAD_MAGIC = Buffer.from("ROOTARK-SYNC-MOVE\0v1\0", "utf8");
+const MOVE_PAYLOAD_LENGTH_BYTES = 8;
+const MOVE_PAYLOAD_MAC_BYTES = 32;
 const OPERATIONS = new Set(["create", "update", "move", "delete"]);
 const METADATA_KEYS = [
   "fileId", "versionId", "path", "parentId", "name", "contentType", "size",
@@ -176,6 +179,32 @@ function decryptPayload(operation, fileKey) {
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
 
+function encodeMovePayload(plaintext, fileKey) {
+  const key = assertFileKey(fileKey);
+  const content = Buffer.from(plaintext ?? []);
+  const length = Buffer.alloc(MOVE_PAYLOAD_LENGTH_BYTES);
+  length.writeBigUInt64BE(BigInt(content.length));
+  const header = Buffer.concat([MOVE_PAYLOAD_MAGIC, length]);
+  const mac = crypto.createHmac("sha256", key).update(header).update(content).digest();
+  return Buffer.concat([header, mac, content]);
+}
+
+function decodeMovePayload(plaintext, fileKey) {
+  const payload = Buffer.from(plaintext ?? []);
+  if (payload.length < MOVE_PAYLOAD_MAGIC.length || !payload.subarray(0, MOVE_PAYLOAD_MAGIC.length).equals(MOVE_PAYLOAD_MAGIC)) return null;
+  const headerSize = MOVE_PAYLOAD_MAGIC.length + MOVE_PAYLOAD_LENGTH_BYTES;
+  const contentOffset = headerSize + MOVE_PAYLOAD_MAC_BYTES;
+  if (payload.length < contentOffset) return null;
+  const header = payload.subarray(0, headerSize);
+  const contentLength = payload.readBigUInt64BE(MOVE_PAYLOAD_MAGIC.length);
+  if (contentLength > BigInt(Number.MAX_SAFE_INTEGER) || BigInt(payload.length - contentOffset) !== contentLength) return null;
+  const mac = payload.subarray(headerSize, contentOffset);
+  const content = payload.subarray(contentOffset);
+  const expectedMac = crypto.createHmac("sha256", assertFileKey(fileKey)).update(header).update(content).digest();
+  if (!crypto.timingSafeEqual(mac, expectedMac)) return null;
+  return Buffer.from(content);
+}
+
 function createOperation(input = {}) {
   const operation = String(input.operation || "");
   if (!OPERATIONS.has(operation)) fail("Invalid sync operation");
@@ -246,7 +275,9 @@ module.exports = {
   canonicalJson,
   compareRevisions,
   createOperation,
+  decodeMovePayload,
   decryptPayload,
+  encodeMovePayload,
   nextRevision,
   normalizeMetadata,
   normalizeAuthorization,

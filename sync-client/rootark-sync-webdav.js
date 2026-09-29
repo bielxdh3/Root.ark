@@ -54,6 +54,41 @@ async function rejectSymlinks(rootDir, targetPath, allowMissing = true) {
   return resolved;
 }
 
+async function canonicalPath(rootDir, targetPath, allowMissing = true) {
+  const checked = await rejectSymlinks(rootDir, targetPath, allowMissing);
+  if (process.platform !== "win32") return checked;
+
+  const root = path.resolve(rootDir);
+  await rejectSymlinks(root, root, false);
+  let current = root;
+  const segments = path.relative(root, checked).split(path.sep).filter(Boolean);
+  for (let index = 0; index < segments.length; index += 1) {
+    const requestedName = segments[index];
+    const names = await fsp.readdir(current);
+    const matches = names.filter((entry) => entry.toLowerCase() === requestedName.toLowerCase());
+    const name = names.includes(requestedName) ? requestedName : matches.length === 1 ? matches[0] : null;
+    if (!name) {
+      if (matches.length > 1) throw Object.assign(new Error("Ambiguous case-insensitive path"), { statusCode: 400 });
+      current = path.join(current, ...segments.slice(index));
+      break;
+    }
+    current = path.join(current, name);
+    const stats = await fsp.lstat(current);
+    if (stats.isSymbolicLink()) throw Object.assign(new Error("Symlink paths are not supported"), { statusCode: 400 });
+  }
+  return rejectSymlinks(root, current, allowMissing);
+}
+
+async function canonicalExistingPath(rootDir, targetPath) {
+  return canonicalPath(rootDir, targetPath, false);
+}
+
+function encodedWebDavPath(rootDir, targetPath) {
+  const relative = path.relative(path.resolve(rootDir), path.resolve(targetPath)).split(path.sep).join("/");
+  validatePortableRelativePath(relative, "path");
+  return `/${relative.split("/").map((segment) => encodeURIComponent(segment)).join("/")}`;
+}
+
 function xml(value) {
   return String(value).replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }[character]));
 }
@@ -99,24 +134,51 @@ class LocalSyncWebDavBridge {
   async recoverPending() {
     if (!this.journal?.recover) return;
     for (const operation of await this.journal.recover()) {
-      if (!["move", "put"].includes(operation.kind)) continue;
-      const destinationPath = operation.destination || operation.path;
+      if (operation.phase === "protocol-queued") {
+        if (!this.protocolJournal) continue;
+        await this.enqueueProtocol(operation);
+        if (this.journal.markSeen) await this.journal.markSeen(operation.operationId);
+        continue;
+      }
+      if (!["move", "put", "delete"].includes(operation.kind)) continue;
+      const sourcePath = operation.source || operation.path;
+      const destinationPath = operation.kind === "delete" ? sourcePath : (operation.destination || operation.path || operation.source);
       if (!destinationPath) continue;
       const destination = await this.target(destinationPath);
+      const source = sourcePath ? await this.target(sourcePath) : null;
       const backup = operation.trash ? path.resolve(this.rootDir, operation.trash) : null;
       if (backup) await rejectSymlinks(this.rootDir, backup, true);
       const backupExists = backup ? await fsp.lstat(backup).then(() => true, (error) => error.code === "ENOENT" ? false : Promise.reject(error)) : false;
       const destinationExists = await fsp.lstat(destination).then(() => true, (error) => error.code === "ENOENT" ? false : Promise.reject(error));
-      let resolved = false;
-      if (["prepared", "staged"].includes(operation.phase) && backupExists && !destinationExists) {
-        await fsp.rename(backup, destination);
-        resolved = true;
-      } else if (operation.phase === "prepared" && !backupExists && !destinationExists) {
-        resolved = true;
+      const sourceExists = source ? await fsp.lstat(source).then(() => true, (error) => error.code === "ENOENT" ? false : Promise.reject(error)) : false;
+      let applied = false;
+      if (operation.kind === "move") {
+        applied = !sourceExists && destinationExists
+          && (operation.phase === "source-moved" || (!operation.trash && operation.phase === "prepared") || (backupExists && ["prepared", "staged"].includes(operation.phase)));
       }
-      // A source-moved operation may have committed locally but not its protocol
-      // translation. Leave it pending so restart recovery cannot claim completion.
-      if (resolved && this.journal.markSeen) await this.journal.markSeen(operation.operationId);
+      else if (operation.kind === "put") applied = destinationExists && (!operation.existed || backupExists);
+      else applied = !sourceExists && backupExists;
+
+      if (applied) {
+        const protocolQueued = await this.enqueueProtocol(operation);
+        if (protocolQueued) await this.updateJournal(operation.operationId, { phase: "protocol-queued" });
+        if (this.journal.markSeen) await this.journal.markSeen(operation.operationId);
+        continue;
+      }
+
+      const rolledBack = operation.phase === "staged" && !backupExists && destinationExists
+        && ((operation.kind === "move" && sourceExists) || (operation.kind === "put" && operation.existed));
+      if (rolledBack) {
+        if (this.journal.markSeen) await this.journal.markSeen(operation.operationId);
+        continue;
+      }
+
+      if (backupExists && !destinationExists && operation.kind !== "delete") {
+        await fsp.rename(backup, destination);
+      } else if ((backupExists || destinationExists) && operation.phase === "staged") {
+        continue;
+      }
+      if (this.journal.markSeen) await this.journal.markSeen(operation.operationId);
     }
   }
 
@@ -129,11 +191,25 @@ class LocalSyncWebDavBridge {
   }
 
   async enqueueProtocol(operation) {
-    if (!this.protocolJournal) return;
+    if (!this.protocolJournal) return false;
     if (!this.toProtocolOperation) throw new Error("WebDAV protocol translation required");
     const translated = await this.toProtocolOperation(operation);
     if (!translated) throw new Error("WebDAV mutation translation failed");
-    await this.protocolJournal.enqueue(translated);
+    try {
+      if (Array.isArray(translated)) {
+        if (!translated.length) return false;
+        if (typeof this.protocolJournal.enqueueMany !== "function") throw new Error("WebDAV mutation batch cannot be committed atomically");
+        await this.protocolJournal.enqueueMany(translated);
+      } else {
+        await this.protocolJournal.enqueue(translated);
+      }
+    } catch (error) {
+      if (error.journalCommitted) {
+        error.protocolQueueUncertain = true;
+      }
+      throw error;
+    }
+    return true;
   }
 
   async stop() {
@@ -150,11 +226,11 @@ class LocalSyncWebDavBridge {
   }
 
   async target(urlPath) {
-    const target = await rejectSymlinks(this.rootDir, path.join(this.rootDir, ...safeSegments(urlPath)), true);
+    const target = await canonicalPath(this.rootDir, path.join(this.rootDir, ...safeSegments(urlPath)), true);
     if (target === this.rootDir) return target;
     if (sameOrBelow(target, this.trashDir)) throw Object.assign(new Error("Internal trash path is not accessible"), { statusCode: 400 });
-    await rejectSymlinks(this.rootDir, path.dirname(target), false);
-    return target;
+    const parent = await canonicalPath(this.rootDir, path.dirname(target), false);
+    return path.join(parent, path.basename(target));
   }
 
   async body(req) {
@@ -218,9 +294,9 @@ class LocalSyncWebDavBridge {
           operationId,
           kind: "put",
           journalType: "webdav-mutation",
-          path: parsed.pathname,
-          source: parsed.pathname,
-          destination: parsed.pathname,
+          path: process.platform === "win32" ? encodedWebDavPath(this.rootDir, target) : parsed.pathname,
+          source: process.platform === "win32" ? encodedWebDavPath(this.rootDir, target) : parsed.pathname,
+          destination: process.platform === "win32" ? encodedWebDavPath(this.rootDir, target) : parsed.pathname,
           existed: Boolean(existing),
           trash: backup ? path.relative(this.rootDir, backup) : null,
           phase: "prepared",
@@ -229,6 +305,7 @@ class LocalSyncWebDavBridge {
         const temporary = path.join(parent, `.rootark-put-${process.pid}-${crypto.randomUUID()}`);
         let staged = false;
         let installed = false;
+        let protocolQueued = false;
         try {
           await fsp.writeFile(temporary, data, { mode: 0o600 });
           if (backup) {
@@ -240,10 +317,13 @@ class LocalSyncWebDavBridge {
           await fsp.rename(temporary, target);
           installed = true;
           await this.updateJournal(operationId, { phase: "source-moved" });
-          await this.enqueueProtocol(operation);
-          await this.markJournalSeen(operationId);
+          protocolQueued = await this.enqueueProtocol(operation);
+          if (protocolQueued) await this.updateJournal(operationId, { phase: "protocol-queued" });
+          try { await this.markJournalSeen(operationId); } catch (error) { if (!protocolQueued) throw error; }
         } catch (error) {
           await fsp.rm(temporary, { force: true }).catch(() => {});
+          if (error.protocolQueueUncertain) return writeResponse(res, existing ? 204 : 201);
+          if (protocolQueued) return writeResponse(res, existing ? 204 : 201);
           if (installed) await fsp.rm(target, { recursive: true, force: true }).catch(() => {});
           if (staged) await fsp.rename(backup, target).catch(() => {});
           throw error;
@@ -277,45 +357,71 @@ class LocalSyncWebDavBridge {
     if (source === this.rootDir) return writeResponse(res, 400, "Cannot move root");
     const destination = await this.destination(req);
     if (destination.target === source) return writeResponse(res, 400, "Source and destination are identical");
-    const existing = await fsp.lstat(destination.target).catch((error) => error.code === "ENOENT" ? null : Promise.reject(error));
-    if (existing && String(req.headers.overwrite || "T").toUpperCase() !== "T") return writeResponse(res, 412, "Destination exists");
-    await rejectSymlinks(this.rootDir, path.dirname(destination.target), false);
+    let existingTarget = destination.target;
+    let destinationTarget = destination.target;
+    let destinationPath = destination.parsed.pathname;
+    let existingStats = await fsp.lstat(destination.target).catch((error) => error.code === "ENOENT" ? null : Promise.reject(error));
+    let canonicalSource = null;
+    if (process.platform === "win32") {
+      canonicalSource = await canonicalExistingPath(this.rootDir, source);
+      const canonicalParent = await canonicalExistingPath(this.rootDir, path.dirname(destination.target));
+      if (existingStats) {
+        existingTarget = await canonicalExistingPath(this.rootDir, destination.target);
+        if (canonicalSource.toLowerCase() === existingTarget.toLowerCase()) {
+          return writeResponse(res, 400, "Source and destination are identical");
+        }
+        destinationTarget = existingTarget;
+      } else {
+        destinationTarget = path.join(canonicalParent, path.basename(destination.target));
+      }
+      destinationPath = encodedWebDavPath(this.rootDir, destinationTarget);
+    }
+    if (existingStats && String(req.headers.overwrite || "T").toUpperCase() !== "T") return writeResponse(res, 412, "Destination exists");
+    if (existingStats && (await fsp.lstat(source)).isDirectory() !== existingStats.isDirectory()) return writeResponse(res, 409, "Cannot overwrite a file with a collection or vice versa");
+    const sourceForTranslation = process.platform === "win32"
+      ? encodedWebDavPath(this.rootDir, canonicalSource)
+      : parsed.pathname;
+    await rejectSymlinks(this.rootDir, path.dirname(destinationTarget), false);
     const operationId = crypto.randomUUID();
-    const backup = existing ? path.join(this.trashDir, `.rootark-move-${operationId}-${path.basename(destination.target)}`) : null;
+    const backup = existingStats ? path.join(this.trashDir, `.rootark-move-${operationId}-${path.basename(destinationTarget)}`) : null;
     const operation = {
       operationId,
       kind: "move",
       journalType: "webdav-mutation",
-      source: parsed.pathname,
-      destination: destination.parsed.pathname,
+      source: sourceForTranslation,
+      destination: destinationPath,
       trash: backup ? path.relative(this.rootDir, backup) : null,
       phase: "prepared",
     };
     if (this.onOperation) await this.onOperation(operation);
     let staged = false;
     let moved = false;
+    let protocolQueued = false;
     try {
       if (backup) {
         await rejectSymlinks(this.rootDir, backup, true);
-        await fsp.rename(destination.target, backup);
+        await fsp.rename(existingTarget, backup);
         staged = true;
         await this.updateJournal(operationId, { phase: "staged" });
       }
-      await fsp.rename(source, destination.target);
+      await fsp.rename(source, destinationTarget);
       moved = true;
       await this.updateJournal(operationId, { phase: "source-moved" });
-      await this.enqueueProtocol(operation);
-      await this.markJournalSeen(operationId);
+      protocolQueued = await this.enqueueProtocol(operation);
+      if (protocolQueued) await this.updateJournal(operationId, { phase: "protocol-queued" });
+      try { await this.markJournalSeen(operationId); } catch (error) { if (!protocolQueued) throw error; }
     } catch (error) {
+      if (error.protocolQueueUncertain) return writeResponse(res, existingStats ? 204 : 201);
+      if (protocolQueued) return writeResponse(res, existingStats ? 204 : 201);
       if (moved) {
-        await fsp.rename(destination.target, source).catch(() => {});
+        await fsp.rename(destinationTarget, source).catch(() => {});
       }
       if (staged) {
-        await fsp.rename(backup, destination.target).catch(() => {});
+        await fsp.rename(backup, existingTarget).catch(() => {});
       }
       throw error;
     }
-    return writeResponse(res, existing ? 204 : 201);
+    return writeResponse(res, existingStats ? 204 : 201);
   }
 
   async remove(req, res, target, parsed) {
@@ -325,13 +431,19 @@ class LocalSyncWebDavBridge {
     await fsp.mkdir(this.trashDir, { recursive: true });
     const trashTarget = path.join(this.trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(target)}`);
     await rejectSymlinks(this.rootDir, trashTarget, true);
-    const operation = { operationId: crypto.randomUUID(), kind: "delete", journalType: "webdav-mutation", source: parsed.pathname, trash: path.relative(this.rootDir, trashTarget) };
+    const sourcePath = process.platform === "win32" ? encodedWebDavPath(this.rootDir, target) : parsed.pathname;
+    const operation = { operationId: crypto.randomUUID(), kind: "delete", journalType: "webdav-mutation", source: sourcePath, trash: path.relative(this.rootDir, trashTarget), phase: "prepared" };
     if (this.onOperation) await this.onOperation(operation);
     await fsp.rename(target, trashTarget);
+    let protocolQueued = false;
     try {
-      await this.enqueueProtocol(operation);
-      await this.markJournalSeen(operation.operationId);
+      await this.updateJournal(operation.operationId, { phase: "source-moved" });
+      protocolQueued = await this.enqueueProtocol(operation);
+      if (protocolQueued) await this.updateJournal(operation.operationId, { phase: "protocol-queued" });
+      try { await this.markJournalSeen(operation.operationId); } catch (error) { if (!protocolQueued) throw error; }
     } catch (error) {
+      if (error.protocolQueueUncertain) return writeResponse(res, 204);
+      if (protocolQueued) return writeResponse(res, 204);
       await fsp.rename(trashTarget, target).catch(() => {});
       throw error;
     }
