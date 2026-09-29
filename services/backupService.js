@@ -117,7 +117,7 @@ async function collectBackupFiles(options = {}) {
   const includePending = envBool("BACKUP_INCLUDE_PENDING", false);
 
   for (const name of fs.existsSync(dataDir) ? fs.readdirSync(dataDir) : []) {
-    if (name === "quarantine.json") continue;
+    if (name.toLowerCase() === "quarantine.json") continue;
     const absolutePath = path.join(dataDir, name);
     const entryPath = normalizeEntryPath(path.posix.join("data", name));
     if (isSensitivePath(entryPath)) continue;

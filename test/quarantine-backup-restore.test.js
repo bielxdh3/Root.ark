@@ -291,6 +291,50 @@ test("quarantine backup and restore preserve external payloads and reject incomp
   }
 });
 
+test("quarantine backup filters case-aliased metadata on Windows", { skip: process.platform !== "win32", timeout: 30_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-case-backup-runtime-"));
+  const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-case-backup-payloads-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const unzipper = require(${JSON.stringify(path.join(ROOT, "node_modules", "unzipper"))});
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const metadataPath = path.join(process.cwd(), "data", "Quarantine.json");
+      fs.mkdirSync(path.dirname(metadataPath), { recursive: true });
+      fs.mkdirSync(process.env.UPLOAD_QUARANTINE_DIR, { recursive: true });
+      const metadata = { items: [
+        { id: "sensitive-entry", storedQuarantineFilename: "private-key.pem", originalFilename: "private-key.pem" },
+        { id: "safe-entry", storedQuarantineFilename: "safe.bin", originalFilename: "safe.bin" },
+      ] };
+      fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+      fs.writeFileSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "private-key.pem"), "sensitive quarantine payload");
+      fs.writeFileSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "safe.bin"), "safe quarantine payload");
+      (async () => {
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        const zip = await unzipper.Open.file(backupService.getArchivePath(backup.filename));
+        const metadataEntries = zip.files.filter((entry) => entry.path.toLowerCase() === "data/quarantine.json");
+        assert.deepEqual(metadataEntries.map((entry) => entry.path), ["data/quarantine.json"]);
+        const archivedMetadata = JSON.parse((await metadataEntries[0].buffer()).toString("utf8"));
+        assert.deepEqual(archivedMetadata.items, [metadata.items[1]]);
+        assert.equal(zip.files.some((entry) => entry.path.toLowerCase() === "data/quarantine/private-key.pem"), false);
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+    fs.rmSync(quarantineDir, { recursive: true, force: true });
+  }
+});
+
 test("restore rejects legacy dotenv archives before changing runtime files", { timeout: 30_000 }, () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-dotenv-restore-runtime-"));
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-dotenv-restore-payloads-"));
