@@ -60,9 +60,12 @@ test("quarantine readers reject dangling symlinks on Windows", { skip: process.p
     }
     const script = `
       const assert = require("node:assert/strict");
+      const fs = require("node:fs");
       const path = require("node:path");
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
       const quarantinePaths = require(${JSON.stringify(path.join(ROOT, "src", "quarantine-paths"))});
       const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      fs.mkdirSync(backupService.BACKUPS_DIR, { recursive: true });
       assert.throws(() => quarantinePaths.readQuarantineMetadata(path.join(process.cwd(), "data", "quarantine.json")), /not a regular file/);
       assert.throws(() => restoreService.recoverQuarantineRestore(), /journal is invalid/);
       assert.equal(require("node:fs").existsSync(${JSON.stringify(stagePath)}), true);
@@ -402,7 +405,10 @@ test("quarantine restore preserves payloads addressed through a Windows short pa
   try {
     const quarantineDir = path.join(runtime, "uploads", ".quarantine-store");
     fs.mkdirSync(quarantineDir, { recursive: true });
-    const shortPathResult = spawnSync("cmd.exe", ["/d", "/c", `for %I in ("${quarantineDir}") do @echo %~sI`], { encoding: "utf8" });
+    const shortPathResult = spawnSync("cmd.exe", ["/d", "/q"], {
+      input: `for %I in ("${quarantineDir}") do @echo %~sI\r\nexit\r\n`,
+      encoding: "utf8",
+    });
     const shortQuarantineDir = shortPathResult.stdout.trim().split(/\r?\n/).at(-1);
     if (shortPathResult.status !== 0 || !shortQuarantineDir || shortQuarantineDir.toLowerCase() === quarantineDir.toLowerCase()
       || !shortQuarantineDir.includes("~")) {
@@ -676,6 +682,87 @@ test("generic uploads and temp backup collection skip symlinked roots and entrie
     });
     assert.equal(result.status, 0, result.stderr || result.stdout);
     assert.equal(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+    fs.rmSync(external, { recursive: true, force: true });
+  }
+});
+
+test("backup fails closed when a collected source path is swapped before it opens", { timeout: 30_000 }, (t) => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-backup-source-race-runtime-"));
+  const external = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-backup-source-race-external-"));
+  try {
+    const uploadsDir = path.join(runtime, "uploads");
+    const target = path.join(uploadsDir, "ordinary.txt");
+    const secretPath = path.join(external, "outside-secret.txt");
+    const replacementPath = path.join(external, "replacement.txt");
+    const symlinkProbe = path.join(runtime, "symlink-probe");
+    fs.mkdirSync(uploadsDir, { recursive: true });
+    fs.writeFileSync(target, "checked in-root upload");
+    fs.writeFileSync(secretPath, "outside secret sentinel");
+    fs.writeFileSync(replacementPath, "replacement bytes");
+    let useSymlink = true;
+    try {
+      fs.symlinkSync(secretPath, symlinkProbe, "file");
+      fs.unlinkSync(symlinkProbe);
+    } catch (error) {
+      if (["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP", "UNKNOWN"].includes(error.code)) {
+        useSymlink = false;
+      } else throw error;
+    }
+
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const archiver = require(${JSON.stringify(path.join(ROOT, "node_modules", "archiver"))});
+      const unzipper = require(${JSON.stringify(path.join(ROOT, "node_modules", "unzipper"))});
+      const target = path.join(process.cwd(), "uploads", "ordinary.txt");
+      const held = target + ".checked";
+      const external = process.env.EXTERNAL_SECRET_PATH;
+      const replacement = process.env.RACE_REPLACEMENT_PATH;
+      const originalOpenSync = fs.openSync;
+      const originalUpdateQueueTaskWithStats = archiver.Archiver.prototype._updateQueueTaskWithStats;
+      let swapped = false;
+      const replacePath = () => {
+        if (swapped) return;
+        fs.renameSync(target, held);
+        if (process.env.RACE_USE_SYMLINK === "true") fs.symlinkSync(external, target, "file");
+        else fs.renameSync(replacement, target);
+        swapped = true;
+      };
+      archiver.Archiver.prototype._updateQueueTaskWithStats = function replaceAfterLegacyArchiveStat(task, stats) {
+        const updated = originalUpdateQueueTaskWithStats.call(this, task, stats);
+        if (updated && typeof updated.filepath === "string" && path.resolve(updated.filepath) === path.resolve(target)) replacePath();
+        return updated;
+      };
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      fs.openSync = function replaceBeforeDescriptorOpen(filePath, ...args) {
+        if (typeof filePath === "string" && path.resolve(filePath) === path.resolve(target)) replacePath();
+        return originalOpenSync.call(fs, filePath, ...args);
+      };
+      (async () => {
+        let failure = null;
+        try {
+          await backupService.createBackup({ createdBy: "fixture" });
+        } catch (error) {
+          failure = error;
+        }
+        assert.equal(swapped, true, "the fixture should replace the collected pathname");
+        assert.ok(failure, "backup must reject a source that changes after collection");
+        assert.match(String(failure.code || "") + " " + String(failure.message || ""), /Backup source|symbolic link|symlink|ELOOP|aliased/i);
+        console.log(JSON.stringify({ ok: true, swapped }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, EXTERNAL_SECRET_PATH: secretPath, RACE_REPLACEMENT_PATH: replacementPath, RACE_USE_SYMLINK: String(useSymlink), DB_ENABLED: "false", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const outcome = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1));
+    assert.equal(outcome.ok, true);
+    assert.equal(outcome.swapped, true);
   } finally {
     fs.rmSync(runtime, { recursive: true, force: true });
     fs.rmSync(external, { recursive: true, force: true });
