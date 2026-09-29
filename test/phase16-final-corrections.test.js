@@ -637,6 +637,80 @@ test("WebDAV MOVE resolves Windows parent casing for new and overwritten destina
   assert.equal(await fsp.readFile(path.join(rootC, "CaseParent", "Existing.txt"), "utf8"), "replacement source payload");
 });
 
+test("remote Windows paths preserve actual parent casing through reconciliation", { skip: process.platform !== "win32" }, async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-remote-parent-case-"));
+  const root = path.join(dir, "device");
+  await fsp.mkdir(path.join(root, "CaseParent"), { recursive: true });
+  const key = crypto.randomBytes(32);
+  const adapter = { async push() { return { status: 201 }; }, async list() { return []; } };
+  const engine = await new SyncEngine({ rootDir: root, adapter, deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key }).open();
+  const create = protocol.createOperation({
+    operation: "create", objectId: "case-object", fileId: "case-file", versionId: "case-v1", operationId: "case-create",
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 1, deviceId: "device-a" }, baseRevision: null,
+    metadata: { path: "caseparent/new.txt" }, plaintext: Buffer.from("remote case-canonical payload"), fileKey: key,
+  });
+
+  await engine.apply(create);
+  assert.equal(await fsp.readFile(path.join(root, "CaseParent", "new.txt"), "utf8"), "remote case-canonical payload");
+  assert.equal(engine.snapshot.files["CaseParent/new.txt"].objectId, "case-object");
+  assert.equal(engine.snapshot.files["caseparent/new.txt"], undefined);
+  await engine.reconcileLocal();
+  assert.equal(engine.snapshot.files["CaseParent/new.txt"].objectId, "case-object");
+  assert.equal(engine.snapshot.files["CaseParent/new.txt"].deleted, false);
+
+  const deleted = protocol.createOperation({
+    operation: "delete", objectId: "case-object", fileId: "case-file", versionId: "case-v2", operationId: "case-delete",
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 2, deviceId: "device-a" }, baseRevision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "caseparent/new.txt" }, plaintext: Buffer.alloc(0), fileKey: key,
+  });
+  await engine.apply(deleted);
+  assert.equal(await fsp.stat(path.join(root, "CaseParent", "new.txt")).then(() => true, () => false), false);
+  assert.equal(engine.snapshot.files["CaseParent/new.txt"].deleted, true);
+  assert.equal(engine.snapshot.files["caseparent/new.txt"], undefined);
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+});
+
+test("WebDAV PUT and DELETE canonicalize Windows parent casing before enqueue", { skip: process.platform !== "win32" }, async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-put-delete-parent-case-"));
+  const rootA = path.join(dir, "a");
+  const rootB = path.join(dir, "b");
+  await fsp.mkdir(path.join(rootA, "CaseParent"), { recursive: true });
+  await fsp.mkdir(rootB, { recursive: true });
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const key = crypto.randomBytes(32);
+  const adapter = { async push(operation) { const result = await store.put("alice", operation); return result.kind === "stored" ? { status: 201 } : { status: 409, current: result.current, currentRevision: result.current?.revision || null }; }, async list() { return store.list("alice"); } };
+  const protocolJournal = await new SyncJournal(path.join(dir, "protocol-journal.json")).open();
+  const transactionJournal = await new SyncJournal(path.join(dir, "webdav-journal.json")).open();
+  const engine = await new SyncEngine({ rootDir: rootA, journal: protocolJournal, adapter, deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key }).open();
+  const bridge = new LocalSyncWebDavBridge({ rootDir: rootA, token: "webdav-case-put-delete-token", journal: transactionJournal, protocolJournal, toProtocolOperation: (event) => engine.translateWebDavMutation(event) });
+  await bridge.start();
+  t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
+  await engine.syncOnce();
+  const peer = await new SyncEngine({ rootDir: rootB, adapter, deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key }).open();
+  await peer.syncOnce();
+  const port = bridge.address().port;
+  const headers = { authorization: "Bearer webdav-case-put-delete-token" };
+
+  const put = await request(port, "/caseparent/new.txt", { method: "PUT", headers, body: Buffer.from("case-aliased PUT") });
+  assert.equal(put.status, 201);
+  await engine.syncOnce();
+  await peer.syncOnce();
+  assert.equal(await fsp.readFile(path.join(rootB, "CaseParent", "new.txt"), "utf8"), "case-aliased PUT");
+  const created = (await adapter.list()).find((operation) => operation.operation === "create" && operation.metadata.path === "CaseParent/new.txt");
+  assert.ok(created);
+
+  const deleted = await request(port, "/caseparent/new.txt", { method: "DELETE", headers });
+  assert.equal(deleted.status, 204);
+  await engine.syncOnce();
+  const tombstone = (await adapter.list()).find((operation) => operation.objectId === created.objectId);
+  assert.equal(tombstone.operation, "delete");
+  assert.equal(tombstone.metadata.path, "CaseParent/new.txt");
+  await peer.syncOnce();
+  assert.equal(await fsp.stat(path.join(rootB, "CaseParent", "new.txt")).then(() => true, () => false), false);
+});
+
 test("offline peers apply the latest move and delete by file identity after intermediate moves", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-offline-latest-path-"));
   const rootA = path.join(dir, "a");

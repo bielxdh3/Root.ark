@@ -48,6 +48,47 @@ async function contained(rootDir, relativePath, allowMissing = true) {
   return containedAbsolute(rootDir, path.resolve(rootDir, ...safe.split("/")), allowMissing);
 }
 
+async function canonicalRelativePath(rootDir, relativePath) {
+  const safe = protocol.safeRelativePath(relativePath, "path");
+  if (process.platform !== "win32") return safe;
+  const root = path.resolve(rootDir);
+  await containedAbsolute(root, root, false);
+  const segments = safe.split("/");
+  let current = root;
+  for (let index = 0; index < segments.length; index += 1) {
+    const requested = segments[index];
+    const names = await fsp.readdir(current);
+    const matches = names.filter((name) => name.toLowerCase() === requested.toLowerCase());
+    const selected = names.includes(requested) ? requested : matches.length === 1 ? matches[0] : null;
+    if (!selected) {
+      if (matches.length > 1) fail("Ambiguous case-insensitive sync path", "unsafe_path");
+      current = path.join(current, ...segments.slice(index));
+      break;
+    }
+    current = path.join(current, selected);
+    const stats = await fsp.lstat(current);
+    if (stats.isSymbolicLink()) fail("Sync symlink path is not supported", "unsafe_path");
+    if (index < segments.length - 1 && !stats.isDirectory()) fail("Sync path parent must be a directory", "unsafe_path");
+  }
+  await containedAbsolute(root, current, true);
+  return path.relative(root, current).split(path.sep).join("/");
+}
+
+function canonicalMapPath(relativePath, ...maps) {
+  if (process.platform !== "win32") return relativePath;
+  for (const map of maps) {
+    if (Object.prototype.hasOwnProperty.call(map, relativePath)) return relativePath;
+  }
+  const matches = new Set();
+  for (const map of maps) {
+    for (const candidate of Object.keys(map)) {
+      if (candidate.toLowerCase() === relativePath.toLowerCase()) matches.add(candidate);
+    }
+  }
+  if (matches.size > 1) fail("Ambiguous case-insensitive sync snapshot path", "unsafe_path");
+  return matches.size === 1 ? [...matches][0] : relativePath;
+}
+
 async function durableJson(filePath, value) {
   const temporary = `${filePath}.tmp-${process.pid}-${crypto.randomUUID()}`;
   await fsp.writeFile(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600 });
@@ -179,8 +220,8 @@ class SyncEngine {
     const pendingForEvent = (await this.journal.recover()).filter((operation) => typeof operation.operationId === "string" && operation.operationId.startsWith(operationPrefix));
     if (pendingForEvent.length) return pendingForEvent;
     if (this.journal.state?.seen?.some((operationId) => typeof operationId === "string" && operationId.startsWith(operationPrefix))) return [];
-    const sourcePath = normalizeWebDavPath(event.source || event.path);
-    const destinationPath = normalizeWebDavPath(event.destination || event.path || event.source);
+    const requestedSourcePath = normalizeWebDavPath(event.source || event.path);
+    const requestedDestinationPath = normalizeWebDavPath(event.destination || event.path || event.source);
     const current = await this.scanFiles();
     const snapshotFiles = { ...this.snapshot.files };
     for (const pending of await this.journal.recover()) {
@@ -205,6 +246,8 @@ class SyncEngine {
           || ((pending.operation === "move" || pending.operation === "delete") && Boolean(prior.directory)),
       };
     }
+    const sourcePath = canonicalMapPath(requestedSourcePath, snapshotFiles, current);
+    const destinationPath = canonicalMapPath(requestedDestinationPath, current, snapshotFiles);
     const operations = [];
     const mappedSourcePaths = new Set();
     const stableOperationId = (relativePath) => `webdav-${event.operationId}-${crypto.createHash("sha256").update(relativePath).digest("hex").slice(0, 24)}`;
@@ -491,8 +534,26 @@ class SyncEngine {
     await this.verifyIncomingOperation(operation);
     const key = await this.keyFor(operation);
     const plaintext = protocol.decryptPayload(operation, key);
-    const metadata = operation.metadata || {};
-    if (!metadata.path) fail("Sync operation path is required", "unsafe_path");
+    const incomingMetadata = operation.metadata || {};
+    if (!incomingMetadata.path) fail("Sync operation path is required", "unsafe_path");
+    const canonicalSourcePath = incomingMetadata.sourcePath
+      ? await canonicalRelativePath(this.rootDir, incomingMetadata.sourcePath)
+      : null;
+    let canonicalPath = await canonicalRelativePath(this.rootDir, incomingMetadata.path);
+    const requestedPath = String(incomingMetadata.path);
+    const sourceName = canonicalSourcePath ? path.posix.basename(canonicalSourcePath) : null;
+    const requestedName = path.posix.basename(requestedPath);
+    if (process.platform === "win32" && operation.operation === "move" && canonicalSourcePath
+      && canonicalSourcePath.toLowerCase() === canonicalPath.toLowerCase()
+      && sourceName.toLowerCase() === requestedName.toLowerCase() && sourceName !== requestedName) {
+      canonicalPath = path.posix.join(path.posix.dirname(canonicalSourcePath), path.posix.basename(incomingMetadata.path));
+    }
+    const metadata = {
+      ...incomingMetadata,
+      path: canonicalPath,
+      ...(canonicalSourcePath ? { sourcePath: canonicalSourcePath } : {}),
+    };
+    operation = { ...operation, metadata };
     const target = await contained(this.rootDir, metadata.path, true);
     let cleanupPath = null;
     if (operation.operation === "delete" || operation.tombstone) {
@@ -502,10 +563,14 @@ class SyncEngine {
       const sourcePath = targetMatchesIdentity ? metadata.path
         : (activeIdentityPath(this.snapshot.files, operation, metadata.path)
           || activeFileIdentityPath(this.snapshot.files, operation, metadata.path));
-      cleanupPath = sourcePath || metadata.path;
-      const deleteTarget = await contained(this.rootDir, cleanupPath, true);
+      if (!sourcePath) return;
+      cleanupPath = sourcePath;
+      const pathOccupiedByOther = priorAtTarget && !priorAtTarget.deleted
+        && (priorAtTarget.objectId !== operation.objectId || priorAtTarget.fileId !== operation.fileId);
+      const tombstonePath = pathOccupiedByOther ? sourcePath : metadata.path;
+      const deleteTarget = await contained(this.rootDir, sourcePath, true);
       await this.stageExisting(deleteTarget);
-      this.rememberOperation(operation, undefined, cleanupPath);
+      this.rememberOperation({ ...operation, metadata: { ...metadata, path: tombstonePath } }, undefined, sourcePath);
     } else if (operation.operation === "move") {
       if (!metadata.sourcePath) fail("Move source path is required", "unsafe_path");
       if (metadata.sourcePath === metadata.path) fail("Move source and destination must differ", "move_source_missing");

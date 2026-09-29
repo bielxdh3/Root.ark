@@ -189,6 +189,35 @@ test("Phase 16 MOVE never renames an unrelated local source when the recovery pa
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
 });
 
+test("Phase 16 DELETE ignores a reused path when no local identity matches the tombstone", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-engine-delete-identity-"));
+  const root = path.join(dir, "device");
+  const key = crypto.randomBytes(32);
+  await fsp.mkdir(root, { recursive: true });
+  await fsp.writeFile(path.join(root, "reused.txt"), "unrelated current bytes");
+  const sync = await engine(root, { async push() { return { status: 201 }; }, async list() { return []; } }, key);
+  sync.snapshot.files["reused.txt"] = {
+    objectId: "current-object", fileId: "current-file", versionId: "current-version",
+    revision: { counter: 1, deviceId: "device-local" },
+    hash: crypto.createHash("sha256").update("unrelated current bytes").digest("hex"),
+    deleted: false, directory: false,
+  };
+  const tombstone = protocol.createOperation({
+    operation: "delete", objectId: "deleted-object", fileId: "deleted-file", versionId: "deleted-version",
+    operationId: "stale-delete-reused-path", deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 2, deviceId: "device-a" }, baseRevision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "reused.txt" }, plaintext: Buffer.alloc(0), fileKey: key,
+  });
+
+  await sync.apply(tombstone);
+
+  assert.equal(await fsp.readFile(path.join(root, "reused.txt"), "utf8"), "unrelated current bytes");
+  assert.equal(sync.snapshot.files["reused.txt"].objectId, "current-object");
+  assert.equal(sync.snapshot.files["reused.txt"].deleted, false);
+  assert.equal(await fsp.stat(path.join(root, ".rootark-trash")).then(() => true, () => false), false);
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+});
+
 test("Phase 16 engine type transitions replace stale snapshot directory state", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-engine-type-transition-"));
   const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();

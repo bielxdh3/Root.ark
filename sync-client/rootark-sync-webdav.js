@@ -54,22 +54,33 @@ async function rejectSymlinks(rootDir, targetPath, allowMissing = true) {
   return resolved;
 }
 
-async function canonicalExistingPath(rootDir, targetPath) {
-  const checked = await rejectSymlinks(rootDir, targetPath, false);
+async function canonicalPath(rootDir, targetPath, allowMissing = true) {
+  const checked = await rejectSymlinks(rootDir, targetPath, allowMissing);
   if (process.platform !== "win32") return checked;
 
   const root = path.resolve(rootDir);
+  await rejectSymlinks(root, root, false);
   let current = root;
-  for (const requestedName of path.relative(root, checked).split(path.sep).filter(Boolean)) {
+  const segments = path.relative(root, checked).split(path.sep).filter(Boolean);
+  for (let index = 0; index < segments.length; index += 1) {
+    const requestedName = segments[index];
     const names = await fsp.readdir(current);
     const matches = names.filter((entry) => entry.toLowerCase() === requestedName.toLowerCase());
     const name = names.includes(requestedName) ? requestedName : matches.length === 1 ? matches[0] : null;
-    if (!name) throw Object.assign(new Error("Path does not exist"), { code: "ENOENT" });
+    if (!name) {
+      if (matches.length > 1) throw Object.assign(new Error("Ambiguous case-insensitive path"), { statusCode: 400 });
+      current = path.join(current, ...segments.slice(index));
+      break;
+    }
     current = path.join(current, name);
     const stats = await fsp.lstat(current);
     if (stats.isSymbolicLink()) throw Object.assign(new Error("Symlink paths are not supported"), { statusCode: 400 });
   }
-  return current;
+  return rejectSymlinks(root, current, allowMissing);
+}
+
+async function canonicalExistingPath(rootDir, targetPath) {
+  return canonicalPath(rootDir, targetPath, false);
 }
 
 function encodedWebDavPath(rootDir, targetPath) {
@@ -204,11 +215,11 @@ class LocalSyncWebDavBridge {
   }
 
   async target(urlPath) {
-    const target = await rejectSymlinks(this.rootDir, path.join(this.rootDir, ...safeSegments(urlPath)), true);
+    const target = await canonicalPath(this.rootDir, path.join(this.rootDir, ...safeSegments(urlPath)), true);
     if (target === this.rootDir) return target;
     if (sameOrBelow(target, this.trashDir)) throw Object.assign(new Error("Internal trash path is not accessible"), { statusCode: 400 });
-    await rejectSymlinks(this.rootDir, path.dirname(target), false);
-    return target;
+    const parent = await canonicalPath(this.rootDir, path.dirname(target), false);
+    return path.join(parent, path.basename(target));
   }
 
   async body(req) {
@@ -272,9 +283,9 @@ class LocalSyncWebDavBridge {
           operationId,
           kind: "put",
           journalType: "webdav-mutation",
-          path: parsed.pathname,
-          source: parsed.pathname,
-          destination: parsed.pathname,
+          path: process.platform === "win32" ? encodedWebDavPath(this.rootDir, target) : parsed.pathname,
+          source: process.platform === "win32" ? encodedWebDavPath(this.rootDir, target) : parsed.pathname,
+          destination: process.platform === "win32" ? encodedWebDavPath(this.rootDir, target) : parsed.pathname,
           existed: Boolean(existing),
           trash: backup ? path.relative(this.rootDir, backup) : null,
           phase: "prepared",
@@ -407,7 +418,8 @@ class LocalSyncWebDavBridge {
     await fsp.mkdir(this.trashDir, { recursive: true });
     const trashTarget = path.join(this.trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(target)}`);
     await rejectSymlinks(this.rootDir, trashTarget, true);
-    const operation = { operationId: crypto.randomUUID(), kind: "delete", journalType: "webdav-mutation", source: parsed.pathname, trash: path.relative(this.rootDir, trashTarget), phase: "prepared" };
+    const sourcePath = process.platform === "win32" ? encodedWebDavPath(this.rootDir, target) : parsed.pathname;
+    const operation = { operationId: crypto.randomUUID(), kind: "delete", journalType: "webdav-mutation", source: sourcePath, trash: path.relative(this.rootDir, trashTarget), phase: "prepared" };
     if (this.onOperation) await this.onOperation(operation);
     await fsp.rename(target, trashTarget);
     let protocolQueued = false;
