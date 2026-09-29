@@ -251,10 +251,15 @@ class SyncEngine {
     const operations = [];
     const mappedSourcePaths = new Set();
     const stableOperationId = (relativePath) => `webdav-${event.operationId}-${crypto.createHash("sha256").update(relativePath).digest("hex").slice(0, 24)}`;
-    const identityFor = (relativePath, prior) => ({
-      objectId: prior?.objectId || `object-${crypto.createHash("sha256").update(relativePath).digest("hex").slice(0, 32)}`,
-      fileId: prior?.fileId || `file-${crypto.createHash("sha256").update(relativePath).digest("hex").slice(0, 32)}`,
-    });
+    const identityFor = (relativePath, prior) => {
+      const deletedPrior = snapshotFiles[relativePath]?.deleted ? snapshotFiles[relativePath] : null;
+      const identitySeed = deletedPrior ? crypto.randomUUID().replace(/-/g, "")
+        : crypto.createHash("sha256").update(relativePath).digest("hex").slice(0, 32);
+      return {
+        objectId: prior?.objectId || `object-${identitySeed}`,
+        fileId: prior?.fileId || `file-${identitySeed}`,
+      };
+    };
     const buildForPath = async ({ operation, relativePath, source, prior, content, directory }) => {
       const identity = identityFor(relativePath, prior);
       const fileContext = { ...prior, ...identity, path: source || relativePath, keyEpoch: this.keyEpoch };
@@ -543,6 +548,10 @@ class SyncEngine {
     const requestedPath = String(incomingMetadata.path);
     const sourceName = canonicalSourcePath ? path.posix.basename(canonicalSourcePath) : null;
     const requestedName = path.posix.basename(requestedPath);
+    const requestedCaseOnlyMove = process.platform === "win32" && operation.operation === "move"
+      && typeof incomingMetadata.sourcePath === "string"
+      && incomingMetadata.sourcePath.toLowerCase() === requestedPath.toLowerCase()
+      && incomingMetadata.sourcePath !== requestedPath;
     if (process.platform === "win32" && operation.operation === "move" && canonicalSourcePath
       && canonicalSourcePath.toLowerCase() === canonicalPath.toLowerCase()
       && sourceName.toLowerCase() === requestedName.toLowerCase() && sourceName !== requestedName) {
@@ -573,7 +582,7 @@ class SyncEngine {
       this.rememberOperation({ ...operation, metadata: { ...metadata, path: tombstonePath } }, undefined, sourcePath);
     } else if (operation.operation === "move") {
       if (!metadata.sourcePath) fail("Move source path is required", "unsafe_path");
-      if (metadata.sourcePath === metadata.path) fail("Move source and destination must differ", "move_source_missing");
+      if (metadata.sourcePath === metadata.path && !requestedCaseOnlyMove) fail("Move source and destination must differ", "move_source_missing");
       const priorAtSource = this.snapshot.files[metadata.sourcePath];
       const sourceMatchesIdentity = priorAtSource && !priorAtSource.deleted && !priorAtSource.directory
         && priorAtSource.objectId === operation.objectId && priorAtSource.fileId === operation.fileId;

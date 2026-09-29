@@ -342,6 +342,57 @@ test("WebDAV file overwrite keeps the moved source identity and tombstones the o
   }
 });
 
+test("WebDAV recreation after delete uses a fresh identity on the same path", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-recreate-identity-"));
+  const rootA = path.join(dir, "a");
+  const rootB = path.join(dir, "b");
+  await fsp.mkdir(rootA, { recursive: true });
+  await fsp.mkdir(rootB, { recursive: true });
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const key = crypto.randomBytes(32);
+  const adapter = { async push(operation) { const result = await store.put("alice", operation); return result.kind === "stored" ? { status: 201 } : { status: 409, current: result.current, currentRevision: result.current?.revision || null }; }, async list() { return store.list("alice"); } };
+  const protocolJournal = await new SyncJournal(path.join(dir, "protocol-journal.json")).open();
+  const transactionJournal = await new SyncJournal(path.join(dir, "webdav-journal.json")).open();
+  const a = await new SyncEngine({ rootDir: rootA, journal: protocolJournal, adapter, deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key }).open();
+  const bridge = new LocalSyncWebDavBridge({ rootDir: rootA, token: "webdav-recreate-token", journal: transactionJournal, protocolJournal, toProtocolOperation: (event) => a.translateWebDavMutation(event) });
+  await bridge.start();
+  t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
+  await a.syncOnce();
+  const b = await new SyncEngine({ rootDir: rootB, adapter, deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key }).open();
+  await b.syncOnce();
+  const port = bridge.address().port;
+  const headers = { authorization: "Bearer webdav-recreate-token" };
+  const firstPut = await request(port, "/same-path.txt", { method: "PUT", headers, body: Buffer.from("first incarnation") });
+  assert.equal(firstPut.status, 201);
+  await a.syncOnce();
+  await b.syncOnce();
+  const originalIdentity = { ...a.snapshot.files["same-path.txt"] };
+  assert.equal(originalIdentity.deleted, false);
+
+  const deleted = await request(port, "/same-path.txt", { method: "DELETE", headers });
+  assert.equal(deleted.status, 204);
+  await a.syncOnce();
+  await b.syncOnce();
+  assert.equal(a.snapshot.files["same-path.txt"].deleted, true);
+  assert.equal(await fsp.stat(path.join(rootB, "same-path.txt")).then(() => true, () => false), false);
+
+  const secondPut = await request(port, "/same-path.txt", { method: "PUT", headers, body: Buffer.from("second incarnation") });
+  assert.equal(secondPut.status, 201);
+  await a.syncOnce();
+  const recreated = a.snapshot.files["same-path.txt"];
+  assert.equal(recreated.deleted, false);
+  assert.notEqual(recreated.objectId, originalIdentity.objectId);
+  assert.notEqual(recreated.fileId, originalIdentity.fileId);
+  const records = await adapter.list();
+  assert.equal(records.find((operation) => operation.objectId === originalIdentity.objectId)?.operation, "delete");
+  assert.equal(records.find((operation) => operation.objectId === recreated.objectId)?.operation, "create");
+
+  await b.syncOnce();
+  assert.equal(await fsp.readFile(path.join(rootB, "same-path.txt"), "utf8"), "second incarnation");
+  assert.equal(b.snapshot.files["same-path.txt"].objectId, recreated.objectId);
+  assert.equal(b.snapshot.files["same-path.txt"].deleted, false);
+});
+
 test("WebDAV directory MOVE overwrite and DELETE reconcile complete subtrees", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-subtree-"));
   const rootA = path.join(dir, "a");
@@ -568,6 +619,32 @@ test("remote case-only MOVE updates Windows filename casing without staging the 
   assert.equal(await fsp.stat(path.join(root, ".rootark-trash")).then(() => true, () => false), false);
   assert.equal(engine.snapshot.files["Source.txt"], undefined);
   assert.equal(engine.snapshot.files["source.txt"].deleted, false);
+});
+
+test("remote case-only MOVE in a parent directory casing applies on Windows", { skip: process.platform !== "win32" }, async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-remote-parent-case-only-"));
+  const root = path.join(dir, "root");
+  const source = path.join(root, "Dir", "file.txt");
+  await fsp.mkdir(path.dirname(source), { recursive: true });
+  await fsp.writeFile(source, "case-only parent source");
+  const key = crypto.randomBytes(32);
+  const adapter = { async push() { return { status: 201 }; }, async list() { return []; } };
+  const engine = await new SyncEngine({ rootDir: root, adapter, deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key }).open();
+  engine.snapshot.files["Dir/file.txt"] = { objectId: "parent-case-object", fileId: "parent-case-file", revision: { counter: 1, deviceId: "device-a" }, hash: crypto.createHash("sha256").update("case-only parent source").digest("hex"), deleted: false, directory: false };
+  const operation = protocol.createOperation({
+    operation: "move", objectId: "parent-case-object", fileId: "parent-case-file", versionId: "parent-case-v2", operationId: "parent-case-move",
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", baseRevision: { counter: 1, deviceId: "device-a" },
+    revision: { counter: 2, deviceId: "device-a" }, metadata: { path: "dir/file.txt", sourcePath: "Dir/file.txt" },
+    plaintext: Buffer.from("case-only parent source"), fileKey: key,
+  });
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+
+  await engine.apply(operation);
+
+  assert.equal(await fsp.readFile(source, "utf8"), "case-only parent source");
+  assert.equal(engine.snapshot.files["Dir/file.txt"].revision.counter, 2);
+  assert.equal(engine.snapshot.files["dir/file.txt"], undefined);
+  assert.equal(await fsp.stat(path.join(root, ".rootark-trash")).then(() => true, () => false), false);
 });
 
 test("WebDAV MOVE resolves Windows parent casing for new and overwritten destinations", { skip: process.platform !== "win32" }, async (t) => {
