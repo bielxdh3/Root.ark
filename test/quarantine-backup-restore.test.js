@@ -291,6 +291,114 @@ test("quarantine backup and restore preserve external payloads and reject incomp
   }
 });
 
+test("quarantine backup excludes prefixed payloads inside included uploads", { timeout: 30_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-upload-exclusion-runtime-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const unzipper = require(${JSON.stringify(path.join(ROOT, "node_modules", "unzipper"))});
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const uploadsDir = path.join(process.cwd(), "uploads");
+      const quarantineDir = process.env.UPLOAD_QUARANTINE_DIR;
+      const metadataPath = path.join(process.cwd(), "data", "quarantine.json");
+      const payloadName = "quarantined-secret-7f3a2.bin";
+      fs.mkdirSync(quarantineDir, { recursive: true });
+      fs.mkdirSync(path.dirname(metadataPath), { recursive: true });
+      fs.mkdirSync(uploadsDir, { recursive: true });
+      fs.writeFileSync(path.join(uploadsDir, "ordinary-upload.txt"), "ordinary upload");
+      fs.writeFileSync(path.join(quarantineDir, payloadName), "sensitive quarantined bytes");
+      fs.writeFileSync(metadataPath, JSON.stringify({ items: [
+        { id: "sensitive-entry", storedQuarantineFilename: payloadName, originalFilename: ".env.local" },
+      ] }));
+      (async () => {
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        const zip = await unzipper.Open.file(backupService.getArchivePath(backup.filename));
+        const entries = zip.files.map((entry) => entry.path);
+        assert.ok(entries.includes("uploads/ordinary-upload.txt"));
+        assert.equal(entries.includes("uploads/.quarantine-store/" + payloadName), false);
+        assert.equal(entries.includes("data/quarantine/" + payloadName), false);
+        const archivedMetadata = JSON.parse((await zip.files.find((entry) => entry.path === "data/quarantine.json").buffer()).toString("utf8"));
+        assert.deepEqual(archivedMetadata.items, []);
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: path.join(runtime, "uploads", ".quarantine-store"), BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("quarantine restore keeps metadata renames on the data volume", { timeout: 30_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-volume-runtime-"));
+  const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-volume-payloads-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const metadataPath = path.join(process.cwd(), "data", "quarantine.json");
+      const archivePayloadPath = path.join(process.env.UPLOAD_QUARANTINE_DIR, "archive.bin");
+      const currentPayloadPath = path.join(process.env.UPLOAD_QUARANTINE_DIR, "current.bin");
+      fs.mkdirSync(path.dirname(metadataPath), { recursive: true });
+      fs.mkdirSync(process.env.UPLOAD_QUARANTINE_DIR, { recursive: true });
+      fs.writeFileSync(metadataPath, JSON.stringify({ items: [{ id: "archive", storedQuarantineFilename: "archive.bin" }] }));
+      fs.writeFileSync(archivePayloadPath, "archived-payload");
+      (async () => {
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        fs.writeFileSync(metadataPath, JSON.stringify({ items: [{ id: "current", storedQuarantineFilename: "current.bin" }] }));
+        fs.rmSync(archivePayloadPath);
+        fs.writeFileSync(currentPayloadPath, "current-payload");
+        const nativeRename = fs.renameSync;
+        const metadata = path.resolve(metadataPath);
+        const quarantineRoot = path.resolve(process.env.UPLOAD_QUARANTINE_DIR);
+        const isWithinQuarantine = (candidate) => {
+          const relative = path.relative(quarantineRoot, path.resolve(String(candidate)));
+          return relative === "" || (relative !== ".." && !relative.startsWith(".." + path.sep) && !path.isAbsolute(relative));
+        };
+        fs.renameSync = function rejectCrossVolumeMetadataRename(source, destination, ...args) {
+          if ((path.resolve(String(source)) === metadata && isWithinQuarantine(destination))
+            || (path.resolve(String(destination)) === metadata && isWithinQuarantine(source))) {
+            const error = new Error("simulated cross-volume metadata rename");
+            error.code = "EXDEV";
+            throw error;
+          }
+          return nativeRename.call(this, source, destination, ...args);
+        };
+        try {
+          await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" });
+        } finally {
+          fs.renameSync = nativeRename;
+        }
+        assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), { items: [{ id: "archive", storedQuarantineFilename: "archive.bin" }] });
+        assert.equal(fs.readFileSync(archivePayloadPath, "utf8"), "archived-payload");
+        assert.equal(fs.existsSync(currentPayloadPath), false);
+        assert.equal(restoreService.hasPendingQuarantineRestore(), false);
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+    fs.rmSync(quarantineDir, { recursive: true, force: true });
+  }
+});
+
 test("quarantine backup filters case-aliased metadata on Windows", { skip: process.platform !== "win32", timeout: 30_000 }, () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-case-backup-runtime-"));
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-case-backup-payloads-"));
@@ -301,6 +409,7 @@ test("quarantine backup filters case-aliased metadata on Windows", { skip: proce
       const path = require("node:path");
       const unzipper = require(${JSON.stringify(path.join(ROOT, "node_modules", "unzipper"))});
       const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
       const metadataPath = path.join(process.cwd(), "data", "Quarantine.json");
       fs.mkdirSync(path.dirname(metadataPath), { recursive: true });
       fs.mkdirSync(process.env.UPLOAD_QUARANTINE_DIR, { recursive: true });
@@ -319,6 +428,13 @@ test("quarantine backup filters case-aliased metadata on Windows", { skip: proce
         const archivedMetadata = JSON.parse((await metadataEntries[0].buffer()).toString("utf8"));
         assert.deepEqual(archivedMetadata.items, [metadata.items[1]]);
         assert.equal(zip.files.some((entry) => entry.path.toLowerCase() === "data/quarantine/private-key.pem"), false);
+        fs.rmSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "safe.bin"));
+        fs.writeFileSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "current.bin"), "current payload");
+        fs.writeFileSync(metadataPath, JSON.stringify({ items: [{ id: "current-entry", storedQuarantineFilename: "current.bin", originalFilename: "current.bin" }] }));
+        await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" });
+        assert.deepEqual(fs.readFileSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "safe.bin")), Buffer.from("safe quarantine payload"));
+        assert.deepEqual(JSON.parse(fs.readFileSync(path.join(process.cwd(), "data", "quarantine.json"), "utf8")), { items: [metadata.items[1]] });
+        assert.equal(fs.existsSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "current.bin")), false);
         console.log(JSON.stringify({ ok: true }));
       })().catch((error) => { console.error(error); process.exitCode = 1; });
     `;
@@ -649,8 +765,10 @@ test("quarantine restore recovers after each payload and metadata rename boundar
             const to = path.resolve(String(destination));
             const isOldPayload = currentNames.some((name, index) => from === path.join(payloadDir, name) && to.endsWith("old-" + index));
             const isNewPayload = archiveNames.some((name, index) => from.endsWith("new-" + index) && to === path.join(payloadDir, name));
-            const isOldMetadata = from === metadataPath && to.endsWith("old-metadata");
-            const isNewMetadata = from.endsWith("new-metadata") && to === metadataPath;
+            const isOldMetadata = from === metadataPath && path.dirname(to) === path.dirname(metadataPath)
+              && /^\.rootark-quarantine-restore-metadata-[a-f0-9-]{36}-old\.tmp$/i.test(path.basename(to));
+            const isNewMetadata = to === metadataPath && path.dirname(from) === path.dirname(metadataPath)
+              && /^\.rootark-quarantine-restore-metadata-[a-f0-9-]{36}-new\.tmp$/i.test(path.basename(from));
             const isCommittedMarker = from.endsWith("committed.tmp") && to.endsWith("committed");
             const matches = (boundary === "old-payload-1" && isOldPayload && to.endsWith("old-0"))
               || (boundary === "old-payload-2" && isOldPayload && to.endsWith("old-1"))
@@ -689,6 +807,7 @@ test("quarantine restore recovers after each payload and metadata rename boundar
         absentNames.forEach((name) => assert.equal(fs.existsSync(path.join(payloadDir, name)), false));
         assert.equal(restoreService.hasPendingQuarantineRestore(), false);
         assert.equal(fs.readdirSync(payloadDir).some((name) => name.startsWith(".rootark-quarantine-restore-")), false);
+        assert.equal(fs.readdirSync(path.dirname(metadataPath)).some((name) => /^\.rootark-quarantine-restore-metadata-[a-f0-9-]{36}-(?:old|new)\.tmp$/i.test(name)), false);
         console.log(JSON.stringify({ ok: true }));
       `;
       const recovered = spawnSync(process.execPath, ["-e", recoveryScript], { cwd: runtime, env, encoding: "utf8" });
