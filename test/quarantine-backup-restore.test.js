@@ -291,6 +291,114 @@ test("quarantine backup and restore preserve external payloads and reject incomp
   }
 });
 
+test("restore rejects legacy dotenv archives before changing runtime files", { timeout: 30_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-dotenv-restore-runtime-"));
+  const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-dotenv-restore-payloads-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+      const dataEnvPath = path.join(process.cwd(), "data", ".env.local");
+      const uploadEnvPath = path.join(process.cwd(), "uploads", ".ENV.PRODUCTION");
+      const runtimePath = path.join(process.cwd(), "data", "runtime-only.json");
+      fs.mkdirSync(path.dirname(dataEnvPath), { recursive: true });
+      fs.mkdirSync(path.dirname(uploadEnvPath), { recursive: true });
+      fs.writeFileSync(dataEnvPath, "current-data-env");
+      fs.writeFileSync(uploadEnvPath, "current-upload-env");
+      fs.writeFileSync(runtimePath, "current-runtime-data");
+      (async () => {
+        const cases = [
+          { entryPath: "data/.env.local", currentPath: dataEnvPath },
+          { entryPath: "uploads/.ENV.PRODUCTION", currentPath: uploadEnvPath },
+        ];
+        for (const [index, item] of cases.entries()) {
+          const sourcePath = path.join(process.cwd(), "archived-env-" + index);
+          const archivePath = path.join(backupService.BACKUPS_DIR, "rootark-backup-2026-09-29-00-00-00-00" + index + "-0000000" + index + ".zip");
+          fs.mkdirSync(path.dirname(archivePath), { recursive: true });
+          fs.writeFileSync(sourcePath, "attacker-controlled archived secret");
+          const files = [{ absolutePath: sourcePath, entryPath: item.entryPath, size: fs.statSync(sourcePath).size }];
+          const backupId = "55555555-5555-4555-8555-55555555555" + index;
+          const manifest = { backup_id: backupId, included_files: files.map((file) => ({ path: file.entryPath, size: file.size })) };
+          await backupService.createZipArchive(archivePath, manifest, files);
+          backupRepository.saveBackup({ id: backupId, filename: path.basename(archivePath), type: "manual", status: "success", createdAt: new Date().toISOString(), sizeBytes: fs.statSync(archivePath).size, checksum: await backupService.calculateFileHash(archivePath), metadata: {} });
+          await assert.rejects(restoreService.restoreBackup(backupId, { confirmation: "RESTORE", username: "fixture" }), /Entrada sensivel bloqueada/);
+          assert.equal(fs.readFileSync(item.currentPath, "utf8"), index === 0 ? "current-data-env" : "current-upload-env");
+          assert.equal(fs.readFileSync(runtimePath, "utf8"), "current-runtime-data");
+        }
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+    fs.rmSync(quarantineDir, { recursive: true, force: true });
+  }
+});
+
+test("restore rejects case-aliased quarantine control files on Windows", { skip: process.platform !== "win32", timeout: 30_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-control-restore-runtime-"));
+  const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-control-restore-payloads-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+      const quarantineMetadataPath = path.join(process.cwd(), "data", "quarantine.json");
+      const journalPath = path.join(process.cwd(), "data", ".rootark-quarantine-restore-journal.json");
+      const runtimePath = path.join(process.cwd(), "data", "runtime-only.json");
+      fs.mkdirSync(path.dirname(quarantineMetadataPath), { recursive: true });
+      fs.writeFileSync(quarantineMetadataPath, JSON.stringify({ items: [] }));
+      fs.writeFileSync(journalPath, "current recovery journal");
+      fs.writeFileSync(runtimePath, "current runtime data");
+      (async () => {
+        const cases = [
+          { entryPath: "data/Quarantine.json", bytes: "{\\"items\\":[]}" },
+          { entryPath: "data/.ROOTARK-QUARANTINE-RESTORE-JOURNAL.JSON", bytes: "attacker journal" },
+        ];
+        for (const [index, item] of cases.entries()) {
+          const sourcePath = path.join(process.cwd(), "archived-control-" + index);
+          const archivePath = path.join(backupService.BACKUPS_DIR, "rootark-backup-2026-09-29-00-01-00-00" + index + "-0000000" + index + ".zip");
+          fs.mkdirSync(path.dirname(archivePath), { recursive: true });
+          fs.writeFileSync(sourcePath, item.bytes);
+          const files = [{ absolutePath: sourcePath, entryPath: item.entryPath, size: fs.statSync(sourcePath).size }];
+          const backupId = "66666666-6666-4666-8666-66666666666" + index;
+          const manifest = { backup_id: backupId, included_files: files.map((file) => ({ path: file.entryPath, size: file.size })) };
+          await backupService.createZipArchive(archivePath, manifest, files);
+          backupRepository.saveBackup({ id: backupId, filename: path.basename(archivePath), type: "manual", status: "success", createdAt: new Date().toISOString(), sizeBytes: fs.statSync(archivePath).size, checksum: await backupService.calculateFileHash(archivePath), metadata: {} });
+          await assert.rejects(restoreService.restoreBackup(backupId, { confirmation: "RESTORE", username: "fixture" }), /Entrada de controle bloqueada/);
+          assert.equal(fs.readFileSync(quarantineMetadataPath, "utf8"), JSON.stringify({ items: [] }));
+          assert.equal(fs.readFileSync(journalPath, "utf8"), "current recovery journal");
+          assert.equal(fs.readFileSync(runtimePath, "utf8"), "current runtime data");
+        }
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+    fs.rmSync(quarantineDir, { recursive: true, force: true });
+  }
+});
+
 test("quarantine restore recovers its prior state after process interruption", { timeout: 30_000 }, () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-crash-runtime-"));
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-crash-payloads-"));

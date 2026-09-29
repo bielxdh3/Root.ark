@@ -223,7 +223,14 @@ function assertSafeZipPath(entryPath) {
   if (parts[0] !== "backup-manifest.json" && !RESTORABLE_ROOTS.has(parts[0])) {
     throw new Error(`Entrada nao permitida no backup: ${entryPath}`);
   }
-  if (normalized.includes("data/backups/") || normalized.endsWith("server-master.key") || normalized.endsWith(".env")) {
+  const normalizedFolded = normalized.replace(/\/+$/, "").toLowerCase();
+  if (normalizedFolded === "data/.rootark-quarantine-restore-journal.json"
+    || (normalizedFolded === "data/quarantine.json" && normalized !== "data/quarantine.json")) {
+    throw new Error(`Entrada de controle bloqueada no backup: ${entryPath}`);
+  }
+  const sensitiveName = path.posix.basename(normalized).toLowerCase();
+  if (normalized.includes("data/backups/") || sensitiveName === "server-master.key"
+    || sensitiveName === ".env" || sensitiveName.startsWith(".env.")) {
     throw new Error(`Entrada sensivel bloqueada no backup: ${entryPath}`);
   }
   return normalized;
@@ -304,7 +311,8 @@ function restoreDataFiles(extractedRoot) {
   closeDb();
   fs.mkdirSync(resolveRuntimePath("data"), { recursive: true });
   for (const name of fs.readdirSync(extractedData)) {
-    if (name === "backups" || name === "quarantine.json" || name === ".rootark-quarantine-restore-journal.json" || name === "server-master.key" || name.endsWith(".key") || name.startsWith("rootark.sqlite")) continue;
+    const foldedName = name.toLowerCase();
+    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
     const sourcePath = path.join(extractedData, name);
     const destinationPath = resolveRuntimePath("data", name);
     if (fs.statSync(sourcePath).isFile()) {
