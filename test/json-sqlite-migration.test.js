@@ -55,7 +55,7 @@ test("JSON migration preserves trash and backup history in SQLite across restart
       'migrate();',
       'const importedTrash = trashRepository.getTrashItem("11111111-1111-4111-8111-111111111111");',
       'const importedBackup = backupRepository.getBackup("22222222-2222-4222-8222-222222222222");',
-      'if (importedTrash?.metadata?.marker !== "legacy-trash" || importedTrash?.restoreMetadata?.marker !== "restore-state" || importedBackup?.metadata?.marker !== "legacy-backup") throw new Error("Legacy records were not imported before re-run");',
+      'if (importedTrash?.status !== "trashed" || importedTrash?.deletedAt !== "2026-09-01T00:00:00.000Z" || importedTrash?.metadata?.marker !== "legacy-trash" || importedTrash?.restoreMetadata?.marker !== "restore-state" || importedBackup?.status !== "success" || importedBackup?.sizeBytes !== 1234 || importedBackup?.checksum !== "a".repeat(64) || importedBackup?.metadata?.marker !== "legacy-backup") throw new Error("Legacy records were not imported before re-run");',
       `trashRepository.saveTrashItem(${JSON.stringify({ ...trashItem, status: "restored", metadata: { marker: "sqlite-current" } })});`,
       `backupRepository.saveBackup(${JSON.stringify({ ...backup, status: "failed", metadata: { marker: "sqlite-current" } })});`,
       'migrate();',
