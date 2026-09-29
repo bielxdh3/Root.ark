@@ -315,6 +315,23 @@ function isPathWithinAliases(basePath, targetPath) {
   return pathVariants(basePath).some((base) => pathVariants(targetPath).some((target) => isPathWithin(base, target)));
 }
 
+function nestedPathDepth(basePath, targetPath) {
+  const base = path.resolve(basePath);
+  const target = path.resolve(targetPath);
+  const comparableBase = process.platform === "win32" ? base.toLowerCase() : base;
+  const comparableTarget = process.platform === "win32" ? target.toLowerCase() : target;
+  if (!isPathWithin(comparableBase, comparableTarget) || isPathWithin(comparableTarget, comparableBase)) return 0;
+  return path.relative(base, target).split(path.sep).filter(Boolean).length;
+}
+
+function assertSafeQuarantineRestoreLocation() {
+  const uploads = resolveRuntimePath("uploads");
+  const quarantine = getUploadQuarantineDir();
+  if (nestedPathDepth(uploads, quarantine) > 1) {
+    throw new Error("Restore is not supported when the quarantine directory is nested below an uploads subdirectory; configure it outside uploads or as a direct child of uploads");
+  }
+}
+
 function samePathComponent(left, right) {
   return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
 }
@@ -1110,6 +1127,8 @@ async function restoreBackup(id, options = {}) {
   if (String(options.confirmation || "") !== "RESTORE") {
     throw new Error("Confirmacao invalida. Digite RESTORE para restaurar.");
   }
+
+  assertSafeQuarantineRestoreLocation();
 
   const preRestore = await backupService.createBackup({
     type: "pre-restore",

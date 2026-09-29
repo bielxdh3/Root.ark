@@ -467,6 +467,7 @@ test("quarantine restore does not write through upload junction ancestors", { ti
       const fs = require("node:fs");
       const path = require("node:path");
       const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
       const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
       const uploadsDir = path.join(process.cwd(), "uploads");
       const cacheDir = path.join(uploadsDir, "cache");
@@ -501,12 +502,20 @@ test("quarantine restore does not write through upload junction ancestors", { ti
           }
           throw error;
         }
-        await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" });
-        assert.equal(fs.readFileSync(path.join(uploadsDir, "ordinary.txt"), "utf8"), "before restore");
+        const backupCountBeforeRestore = backupRepository.listBackups().length;
+        await assert.rejects(
+          restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" }),
+          /Restore is not supported when the quarantine directory is nested below an uploads subdirectory/,
+        );
+        assert.equal(fs.readFileSync(path.join(uploadsDir, "ordinary.txt"), "utf8"), "after backup");
+        assert.equal(fs.lstatSync(cacheDir).isSymbolicLink(), true);
         assert.equal(fs.readFileSync(siblingPath, "utf8"), "external neighbor after backup");
-        assert.equal(fs.readFileSync(path.join(quarantineDir, "archived-safe.bin"), "utf8"), "archived quarantine payload");
+        assert.equal(fs.existsSync(path.join(quarantineDir, "archived-safe.bin")), false);
         assert.equal(fs.readFileSync(path.join(quarantineDir, "current-sensitive.bin"), "utf8"), "current sensitive payload");
-        assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")).items.map((item) => item.id).sort(), ["archived", "sensitive"]);
+        assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), { items: [
+          { id: "sensitive", storedQuarantineFilename: "current-sensitive.bin", originalFilename: ".env.local" },
+        ] });
+        assert.equal(backupRepository.listBackups().length, backupCountBeforeRestore);
         console.log(JSON.stringify({ ok: true }));
       })().catch((error) => { console.error(error); process.exitCode = 1; });
     `;

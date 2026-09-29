@@ -175,7 +175,8 @@ function archiveSourceMetadata(file) {
 }
 
 function createVerifiedArchiveStream(file) {
-  return Readable.from((async function* readVerifiedArchiveSource() {
+  let source;
+  const stream = Readable.from((async function* readVerifiedArchiveSource() {
     const { absolutePath, archiveRoot: root, sourceStat } = file;
     assertArchiveRootUnchanged(root);
     const pathStat = assertArchiveSourcePath(root, absolutePath);
@@ -184,7 +185,6 @@ function createVerifiedArchiveStream(file) {
     }
 
     let fd;
-    let source;
     try {
       fd = fs.openSync(absolutePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
       const openedStat = fs.fstatSync(fd, { bigint: true });
@@ -205,6 +205,11 @@ function createVerifiedArchiveStream(file) {
       if (fd !== undefined) fs.closeSync(fd);
     }
   })());
+  stream.abortSource = () => {
+    if (source && !source.destroyed) source.destroy();
+    if (!stream.destroyed) stream.destroy();
+  };
+  return stream;
 }
 
 function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
@@ -767,6 +772,7 @@ async function createZipArchive(archivePath, manifest, files) {
     let archive;
     let output;
     let fd;
+    const sourceStreams = new Set();
 
     const closeOutput = () => {
       if (!output || outputClosed || output.destroyed) return;
@@ -808,6 +814,12 @@ async function createZipArchive(archivePath, manifest, files) {
         if (archive && typeof archive.abort === "function") archive.abort();
         else if (archive && typeof archive.destroy === "function") archive.destroy();
       } catch {}
+      for (const sourceStream of sourceStreams) {
+        try {
+          if (typeof sourceStream.abortSource === "function") sourceStream.abortSource();
+          else sourceStream.destroy();
+        } catch {}
+      }
       closeOutput();
     };
 
@@ -844,6 +856,9 @@ async function createZipArchive(archivePath, manifest, files) {
         else {
           const source = archiveSourceMetadata(file);
           const sourceStream = createVerifiedArchiveStream(source);
+          sourceStreams.add(sourceStream);
+          sourceStream.once("end", () => sourceStreams.delete(sourceStream));
+          sourceStream.once("close", () => sourceStreams.delete(sourceStream));
           sourceStream.on("error", onArchiveError);
           archive.append(sourceStream, {
             name: file.entryPath,
