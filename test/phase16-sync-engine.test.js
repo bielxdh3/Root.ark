@@ -130,6 +130,10 @@ test("Phase 16 engine rejects legacy moves safely and preserves raw payloads whe
     revision: { counter: 3, deviceId: "device-a" }, baseRevision: { counter: 2, deviceId: "device-a" },
     metadata: { path: "nested/renamed.txt", sourcePath: "original.txt" }, plaintext: rawLegacyPayload, fileKey: key,
   });
+  sync.snapshot.files["original.txt"] = {
+    objectId: "legacy-object", fileId: "legacy-file", versionId: "legacy-version",
+    revision: { counter: 2, deviceId: "device-a" }, deleted: false, directory: false,
+  };
   await sync.apply(legacyWithSource);
   assert.deepEqual(await fsp.readFile(path.join(root, "nested", "renamed.txt")), rawLegacyPayload);
   const framed = protocol.createOperation({
@@ -141,6 +145,47 @@ test("Phase 16 engine rejects legacy moves safely and preserves raw payloads whe
   });
   await sync.apply(framed);
   assert.deepEqual(await fsp.readFile(path.join(root, "nested", "framed.txt")), rawLegacyPayload);
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+});
+
+test("Phase 16 MOVE never renames an unrelated local source when the recovery payload is authoritative", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-engine-move-identity-"));
+  const root = path.join(dir, "device");
+  const key = crypto.randomBytes(32);
+  await fsp.mkdir(root, { recursive: true });
+  await fsp.writeFile(path.join(root, "source.txt"), "unrelated local bytes");
+  const sync = await engine(root, { async push() { return { status: 201 }; }, async list() { return []; } }, key);
+  sync.snapshot.files["source.txt"] = {
+    objectId: "unrelated-object", fileId: "unrelated-file", versionId: "unrelated-version",
+    revision: { counter: 1, deviceId: "device-local" }, hash: crypto.createHash("sha256").update("unrelated local bytes").digest("hex"),
+    deleted: false, directory: false,
+  };
+
+  const operation = protocol.createOperation({
+    operation: "move", objectId: "remote-object", fileId: "remote-file", versionId: "remote-version",
+    operationId: "remote-move-with-payload", deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 2, deviceId: "device-a" }, baseRevision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "destination.txt", sourcePath: "source.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("authenticated remote bytes"), key), fileKey: key,
+  });
+  await sync.apply(operation);
+
+  assert.equal(await fsp.readFile(path.join(root, "source.txt"), "utf8"), "unrelated local bytes");
+  assert.equal(sync.snapshot.files["source.txt"].objectId, "unrelated-object");
+  assert.equal(await fsp.readFile(path.join(root, "destination.txt"), "utf8"), "authenticated remote bytes");
+  assert.equal(sync.snapshot.files["destination.txt"].objectId, "remote-object");
+
+  const legacyWithoutIdentity = protocol.createOperation({
+    operation: "move", objectId: "legacy-untracked-object", fileId: "legacy-untracked-file", versionId: "legacy-version",
+    operationId: "legacy-move-without-identity", deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 1, deviceId: "device-a" }, baseRevision: null,
+    metadata: { path: "legacy-destination.txt", sourcePath: "source.txt" },
+    plaintext: Buffer.from("legacy move has no payload frame"), fileKey: key,
+  });
+  await assert.rejects(() => sync.apply(legacyWithoutIdentity), { code: "move_source_missing" });
+  assert.equal(await fsp.readFile(path.join(root, "source.txt"), "utf8"), "unrelated local bytes");
+  assert.equal(await fsp.stat(path.join(root, "legacy-destination.txt")).then(() => true, () => false), false);
+
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
 });
 

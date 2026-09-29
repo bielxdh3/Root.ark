@@ -275,10 +275,11 @@ class SyncEngine {
       const sourceIsActive = priorSource && !priorSource.deleted;
       const destinationIsActive = priorDestination && !priorDestination.deleted;
       const content = await fsp.readFile(await contained(this.rootDir, relativePath, false));
-      if (sourceIsActive && destinationIsActive && priorSource.objectId !== priorDestination.objectId) {
+      if (sourceIsActive && destinationIsActive
+        && (priorSource.objectId !== priorDestination.objectId || priorSource.fileId !== priorDestination.fileId)) {
         mappedSourcePaths.add(sourcePath);
-        operations.push(await buildForPath({ operation: "delete", relativePath: sourcePath, prior: priorSource }));
-        operations.push(await buildForPath({ operation: "update", relativePath, prior: priorDestination, content, directory: false }));
+        operations.push(await buildForPath({ operation: "delete", relativePath, prior: priorDestination }));
+        operations.push(await buildForPath({ operation: "move", relativePath, source: sourcePath, prior: priorSource, content, directory: false }));
       } else {
         const prior = sourceIsActive ? priorSource : (destinationIsActive ? priorDestination : null);
         if (sourceIsActive && !priorSource.directory) mappedSourcePaths.add(sourcePath);
@@ -340,7 +341,8 @@ class SyncEngine {
         const priorSource = snapshotFiles[`${sourcePath}${suffix}`];
         const priorDestination = snapshotFiles[relativePath];
         if (priorSource && !priorSource.deleted && priorSource.directory
-          && priorDestination && !priorDestination.deleted && priorDestination.objectId !== priorSource.objectId) {
+          && priorDestination && !priorDestination.deleted
+          && (priorDestination.objectId !== priorSource.objectId || priorDestination.fileId !== priorSource.fileId)) {
           destinationDeletes.set(relativePath, priorDestination);
         }
       }
@@ -372,9 +374,10 @@ class SyncEngine {
         }
 
         const content = await fsp.readFile(await contained(this.rootDir, relativePath, false));
-        if (sourceIsActive && destinationIsActive && priorSource.objectId !== priorDestination.objectId) {
-          operations.push(await buildForPath({ operation: "delete", relativePath: oldPath, prior: priorSource }));
-          operations.push(await buildForPath({ operation: "update", relativePath, prior: priorDestination, content, directory: false }));
+        if (sourceIsActive && destinationIsActive
+          && (priorSource.objectId !== priorDestination.objectId || priorSource.fileId !== priorDestination.fileId)) {
+          operations.push(await buildForPath({ operation: "delete", relativePath, prior: priorDestination }));
+          operations.push(await buildForPath({ operation: "move", relativePath, source: oldPath, prior: priorSource, content, directory: false }));
         } else {
           const prior = sourceIsActive && !priorSource.directory ? priorSource : (destinationIsActive && !priorDestination.directory ? priorDestination : null);
           const operation = sourceIsActive && !priorSource.directory ? "move" : (prior ? "update" : "create");
@@ -496,21 +499,24 @@ class SyncEngine {
       const priorAtTarget = this.snapshot.files[metadata.path];
       const targetMatchesIdentity = priorAtTarget && !priorAtTarget.deleted
         && priorAtTarget.objectId === operation.objectId && priorAtTarget.fileId === operation.fileId;
-      const sourcePath = targetMatchesIdentity ? metadata.path : activeFileIdentityPath(this.snapshot.files, operation, metadata.path);
+      const sourcePath = targetMatchesIdentity ? metadata.path
+        : (activeIdentityPath(this.snapshot.files, operation, metadata.path)
+          || activeFileIdentityPath(this.snapshot.files, operation, metadata.path));
       cleanupPath = sourcePath || metadata.path;
       const deleteTarget = await contained(this.rootDir, cleanupPath, true);
       await this.stageExisting(deleteTarget);
       this.rememberOperation(operation, undefined, cleanupPath);
     } else if (operation.operation === "move") {
       if (!metadata.sourcePath) fail("Move source path is required", "unsafe_path");
+      if (metadata.sourcePath === metadata.path) fail("Move source and destination must differ", "move_source_missing");
       const priorAtSource = this.snapshot.files[metadata.sourcePath];
       const sourceMatchesIdentity = priorAtSource && !priorAtSource.deleted && !priorAtSource.directory
         && priorAtSource.objectId === operation.objectId && priorAtSource.fileId === operation.fileId;
       const sourcePath = sourceMatchesIdentity ? metadata.sourcePath
-        : (activeFileIdentityPath(this.snapshot.files, operation, metadata.path) || metadata.sourcePath);
+        : activeFileIdentityPath(this.snapshot.files, operation, metadata.path);
       cleanupPath = sourcePath;
-      const source = await contained(this.rootDir, sourcePath, true);
-      const sourceExists = await exists(source);
+      const source = sourcePath ? await contained(this.rootDir, sourcePath, true) : null;
+      const sourceExists = source ? await exists(source) : false;
       const movePayload = protocol.decodeMovePayload(plaintext, key);
       if (!sourceExists && movePayload === null) fail("Moved file is unavailable and the operation has no recovery payload", "move_source_missing");
       await fsp.mkdir(path.dirname(target), { recursive: true });
@@ -573,8 +579,8 @@ class SyncEngine {
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
     }
-    if (operation.operation === "move" && metadata.sourcePath) {
-      await this.pruneEmptyUntrackedParents(path.dirname(await contained(this.rootDir, cleanupPath || metadata.sourcePath, true)));
+    if (operation.operation === "move" && cleanupPath) {
+      await this.pruneEmptyUntrackedParents(path.dirname(await contained(this.rootDir, cleanupPath, true)));
     } else if (operation.operation === "delete" || operation.tombstone) {
       await this.pruneEmptyUntrackedParents(path.dirname(await contained(this.rootDir, cleanupPath || metadata.path, true)));
     }

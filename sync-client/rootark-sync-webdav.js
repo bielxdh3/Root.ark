@@ -62,8 +62,8 @@ async function canonicalExistingPath(rootDir, targetPath) {
   let current = root;
   for (const requestedName of path.relative(root, checked).split(path.sep).filter(Boolean)) {
     const names = await fsp.readdir(current);
-    const name = names.find((entry) => entry === requestedName)
-      || names.find((entry) => entry.toLowerCase() === requestedName.toLowerCase());
+    const matches = names.filter((entry) => entry.toLowerCase() === requestedName.toLowerCase());
+    const name = names.includes(requestedName) ? requestedName : matches.length === 1 ? matches[0] : null;
     if (!name) throw Object.assign(new Error("Path does not exist"), { code: "ENOENT" });
     current = path.join(current, name);
     const stats = await fsp.lstat(current);
@@ -334,31 +334,39 @@ class LocalSyncWebDavBridge {
     if (source === this.rootDir) return writeResponse(res, 400, "Cannot move root");
     const destination = await this.destination(req);
     if (destination.target === source) return writeResponse(res, 400, "Source and destination are identical");
-    const existing = await fsp.lstat(destination.target).catch((error) => error.code === "ENOENT" ? null : Promise.reject(error));
+    let existingTarget = destination.target;
+    let destinationTarget = destination.target;
+    let destinationPath = destination.parsed.pathname;
+    let existingStats = await fsp.lstat(destination.target).catch((error) => error.code === "ENOENT" ? null : Promise.reject(error));
     let canonicalSource = null;
     if (process.platform === "win32") {
       canonicalSource = await canonicalExistingPath(this.rootDir, source);
-      if (existing) {
-        const canonicalDestination = await canonicalExistingPath(this.rootDir, destination.target);
-        if (canonicalSource.toLowerCase() === canonicalDestination.toLowerCase()) {
+      const canonicalParent = await canonicalExistingPath(this.rootDir, path.dirname(destination.target));
+      if (existingStats) {
+        existingTarget = await canonicalExistingPath(this.rootDir, destination.target);
+        if (canonicalSource.toLowerCase() === existingTarget.toLowerCase()) {
           return writeResponse(res, 400, "Source and destination are identical");
         }
+        destinationTarget = existingTarget;
+      } else {
+        destinationTarget = path.join(canonicalParent, path.basename(destination.target));
       }
+      destinationPath = encodedWebDavPath(this.rootDir, destinationTarget);
     }
-    if (existing && String(req.headers.overwrite || "T").toUpperCase() !== "T") return writeResponse(res, 412, "Destination exists");
-    if (existing && (await fsp.lstat(source)).isDirectory() !== existing.isDirectory()) return writeResponse(res, 409, "Cannot overwrite a file with a collection or vice versa");
+    if (existingStats && String(req.headers.overwrite || "T").toUpperCase() !== "T") return writeResponse(res, 412, "Destination exists");
+    if (existingStats && (await fsp.lstat(source)).isDirectory() !== existingStats.isDirectory()) return writeResponse(res, 409, "Cannot overwrite a file with a collection or vice versa");
     const sourceForTranslation = process.platform === "win32"
       ? encodedWebDavPath(this.rootDir, canonicalSource)
       : parsed.pathname;
-    await rejectSymlinks(this.rootDir, path.dirname(destination.target), false);
+    await rejectSymlinks(this.rootDir, path.dirname(destinationTarget), false);
     const operationId = crypto.randomUUID();
-    const backup = existing ? path.join(this.trashDir, `.rootark-move-${operationId}-${path.basename(destination.target)}`) : null;
+    const backup = existingStats ? path.join(this.trashDir, `.rootark-move-${operationId}-${path.basename(destinationTarget)}`) : null;
     const operation = {
       operationId,
       kind: "move",
       journalType: "webdav-mutation",
       source: sourceForTranslation,
-      destination: destination.parsed.pathname,
+      destination: destinationPath,
       trash: backup ? path.relative(this.rootDir, backup) : null,
       phase: "prepared",
     };
@@ -369,27 +377,27 @@ class LocalSyncWebDavBridge {
     try {
       if (backup) {
         await rejectSymlinks(this.rootDir, backup, true);
-        await fsp.rename(destination.target, backup);
+        await fsp.rename(existingTarget, backup);
         staged = true;
         await this.updateJournal(operationId, { phase: "staged" });
       }
-      await fsp.rename(source, destination.target);
+      await fsp.rename(source, destinationTarget);
       moved = true;
       await this.updateJournal(operationId, { phase: "source-moved" });
       protocolQueued = await this.enqueueProtocol(operation);
       if (protocolQueued) await this.updateJournal(operationId, { phase: "protocol-queued" });
       try { await this.markJournalSeen(operationId); } catch (error) { if (!protocolQueued) throw error; }
     } catch (error) {
-      if (protocolQueued) return writeResponse(res, existing ? 204 : 201);
+      if (protocolQueued) return writeResponse(res, existingStats ? 204 : 201);
       if (moved) {
-        await fsp.rename(destination.target, source).catch(() => {});
+        await fsp.rename(destinationTarget, source).catch(() => {});
       }
       if (staged) {
-        await fsp.rename(backup, destination.target).catch(() => {});
+        await fsp.rename(backup, existingTarget).catch(() => {});
       }
       throw error;
     }
-    return writeResponse(res, existing ? 204 : 201);
+    return writeResponse(res, existingStats ? 204 : 201);
   }
 
   async remove(req, res, target, parsed) {
