@@ -166,6 +166,13 @@ class LocalSyncWebDavBridge {
         continue;
       }
 
+      const rolledBack = operation.phase === "staged" && !backupExists && destinationExists
+        && ((operation.kind === "move" && sourceExists) || (operation.kind === "put" && operation.existed));
+      if (rolledBack) {
+        if (this.journal.markSeen) await this.journal.markSeen(operation.operationId);
+        continue;
+      }
+
       if (backupExists && !destinationExists && operation.kind !== "delete") {
         await fsp.rename(backup, destination);
       } else if ((backupExists || destinationExists) && operation.phase === "staged") {

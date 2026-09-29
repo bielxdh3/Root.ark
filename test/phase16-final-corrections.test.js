@@ -1001,6 +1001,48 @@ test("WebDAV keeps a queued move committed when transaction completion marking f
   assert.deepEqual(protocolJournal.pending().map((item) => item.operationId), ["mark-failure-protocol-op"]);
 });
 
+test("WebDAV recovery clears staged transactions after a failed update rolls back PUT and MOVE", { timeout: 30_000 }, async (t) => {
+  for (const method of ["PUT", "MOVE"]) {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), `rootark-phase16-webdav-${method.toLowerCase()}-rollback-`));
+    const root = path.join(dir, "root");
+    await fsp.mkdir(root, { recursive: true });
+    await fsp.writeFile(path.join(root, "destination.txt"), "original destination");
+    if (method === "MOVE") await fsp.writeFile(path.join(root, "source.txt"), "original source");
+    const journal = await new SyncJournal(path.join(dir, "webdav-journal.json")).open();
+    const bridge = new LocalSyncWebDavBridge({ rootDir: root, token: `rollback-${method.toLowerCase()}-token`, journal });
+    const updateJournal = bridge.updateJournal.bind(bridge);
+    let failStagedUpdate = true;
+    bridge.updateJournal = async (operationId, patch) => {
+      await updateJournal(operationId, patch);
+      if (failStagedUpdate && patch.phase === "staged") {
+        failStagedUpdate = false;
+        const error = new Error("injected post-commit staged update failure");
+        error.journalCommitted = true;
+        throw error;
+      }
+    };
+    await bridge.start();
+    t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
+    const port = bridge.address().port;
+    const headers = { authorization: `Bearer rollback-${method.toLowerCase()}-token` };
+    const response = await request(port, method === "PUT" ? "/destination.txt" : "/source.txt", {
+      method,
+      headers: method === "MOVE" ? { ...headers, destination: `http://127.0.0.1:${port}/destination.txt` } : headers,
+      ...(method === "PUT" ? { body: Buffer.from("replacement") } : {}),
+    });
+    assert.equal(response.status, 500);
+    assert.equal(journal.pending()[0].phase, "staged");
+    assert.equal(await fsp.readFile(path.join(root, "destination.txt"), "utf8"), "original destination");
+    if (method === "MOVE") assert.equal(await fsp.readFile(path.join(root, "source.txt"), "utf8"), "original source");
+
+    await bridge.stop();
+    await bridge.start();
+    assert.deepEqual(await journal.recover(), []);
+    assert.equal(await fsp.readFile(path.join(root, "destination.txt"), "utf8"), "original destination");
+    if (method === "MOVE") assert.equal(await fsp.readFile(path.join(root, "source.txt"), "utf8"), "original source");
+  }
+});
+
 test("WebDAV retains recovery state when protocol journal directory sync fails after rename", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-journal-sync-failure-"));
   const root = path.join(dir, "root");
