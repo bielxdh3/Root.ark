@@ -13,6 +13,8 @@ const encryptedFilesRepository = require("../repositories/encryptedFilesReposito
 const analyticsRepository = require("../repositories/analyticsRepository");
 const auditRepository = require("../repositories/auditRepository");
 const actionHistoryRepository = require("../repositories/actionHistoryRepository");
+const trashRepository = require("../repositories/trashRepository");
+const backupRepository = require("../repositories/backupRepository");
 
 const DATA_DIR = path.join(ROOT_DIR, "data");
 
@@ -91,6 +93,8 @@ function migrate() {
     analytics: ensureObject(readJson("analytics.json", {}), "analytics.json"),
     auditLogs: ensureObject(readJson("audit-logs.json", { logs: [] }), "audit-logs.json"),
     actionHistory: ensureArray(readJson("actions-history.json", []), "actions-history.json"),
+    trashItems: ensureArray(readJson("trash-items.json", []), "trash-items.json"),
+    backupHistory: ensureArray(readJson("backup-history.json", []), "backup-history.json"),
   };
 
   if (!payload.folders.some((folder) => folder.id === "root")) {
@@ -116,6 +120,12 @@ function migrate() {
     analyticsRepository.saveAnalytics(payload.analytics);
     auditRepository.saveAuditLogs(payload.auditLogs);
     actionHistoryRepository.saveActionHistory(payload.actionHistory);
+    for (const item of payload.trashItems) {
+      if (!trashRepository.getTrashItem(item.id)) trashRepository.saveTrashItem(item);
+    }
+    for (const backup of payload.backupHistory) {
+      if (!backupRepository.getBackup(backup.id)) backupRepository.saveBackup(backup);
+    }
   });
 
   writeAll();
@@ -132,6 +142,8 @@ function migrate() {
     analyticsEvents: Object.values(payload.analytics).reduce((sum, list) => sum + (Array.isArray(list) ? list.length : 0), 0),
     auditLogs: Array.isArray(payload.auditLogs.logs) ? payload.auditLogs.logs.length : 0,
     actionHistory: payload.actionHistory.length,
+    trashItems: payload.trashItems.length,
+    backupHistory: payload.backupHistory.length,
   };
 
   console.log("Migracao JSON -> SQLite concluida:");
