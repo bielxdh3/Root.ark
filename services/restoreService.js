@@ -8,6 +8,7 @@ const { resolveRuntimePath } = require("../src/runtime-paths");
 const backupRepository = require("../repositories/backupRepository");
 const backupService = require("./backupService");
 const { attestCiphertextOnlyArchive } = require("../src/services/deploymentResilience");
+const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, readQuarantineRegularFile, validateQuarantinePayloads } = require("../src/quarantine-paths");
 
 const RESTORE_TMP_DIR = path.join(backupService.BACKUPS_DIR, ".restore-tmp");
 const RESTORE_SYNC_LOCK_DIR = resolveRuntimePath("data", "restore-sync-locks");
@@ -222,7 +223,15 @@ function assertSafeZipPath(entryPath) {
   if (parts[0] !== "backup-manifest.json" && !RESTORABLE_ROOTS.has(parts[0])) {
     throw new Error(`Entrada nao permitida no backup: ${entryPath}`);
   }
-  if (normalized.includes("data/backups/") || normalized.endsWith("server-master.key") || normalized.endsWith(".env")) {
+  const normalizedFolded = normalized.replace(/\/+$/, "").toLowerCase();
+  if (normalizedFolded === "data/.rootark-quarantine-restore-journal.json"
+    || normalizedFolded.startsWith("data/.rootark-quarantine-restore-metadata-")
+    || (normalizedFolded === "data/quarantine.json" && normalized !== "data/quarantine.json")) {
+    throw new Error(`Entrada de controle bloqueada no backup: ${entryPath}`);
+  }
+  const sensitiveName = path.posix.basename(normalized).toLowerCase();
+  if (normalized.includes("data/backups/") || sensitiveName === "server-master.key"
+    || sensitiveName === ".env" || sensitiveName.startsWith(".env.")) {
     throw new Error(`Entrada sensivel bloqueada no backup: ${entryPath}`);
   }
   return normalized;
@@ -280,15 +289,131 @@ async function extractArchive(zip, targetDir) {
   }
 }
 
-function copyDirectoryContents(source, destination) {
+function isPathWithin(basePath, targetPath) {
+  const base = path.resolve(basePath);
+  const target = path.resolve(targetPath);
+  const comparableBase = process.platform === "win32" ? base.toLowerCase() : base;
+  const comparableTarget = process.platform === "win32" ? target.toLowerCase() : target;
+  const relative = path.relative(comparableBase, comparableTarget);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function pathVariants(value) {
+  const resolved = path.resolve(value);
+  const variants = new Map();
+  const add = (candidate) => {
+    const normalized = path.resolve(candidate);
+    const key = process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    if (!variants.has(key)) variants.set(key, normalized);
+  };
+  add(resolved);
+  try { add(fs.realpathSync.native ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved)); } catch {}
+  return [...variants.values()];
+}
+
+function isPathWithinAliases(basePath, targetPath) {
+  return pathVariants(basePath).some((base) => pathVariants(targetPath).some((target) => isPathWithin(base, target)));
+}
+
+function nestedPathDepth(basePath, targetPath) {
+  const base = path.resolve(basePath);
+  const target = path.resolve(targetPath);
+  const comparableBase = process.platform === "win32" ? base.toLowerCase() : base;
+  const comparableTarget = process.platform === "win32" ? target.toLowerCase() : target;
+  if (!isPathWithin(comparableBase, comparableTarget) || isPathWithin(comparableTarget, comparableBase)) return 0;
+  return path.relative(base, target).split(path.sep).filter(Boolean).length;
+}
+
+function assertSafeQuarantineRestoreLocation() {
+  const uploads = resolveRuntimePath("uploads");
+  const quarantine = getUploadQuarantineDir();
+  if (quarantineDirContainsUploads(uploads, quarantine)) {
+    throw new Error("Restore is not supported when the quarantine directory equals or contains uploads");
+  }
+  if (nestedPathDepth(uploads, quarantine) > 1) {
+    throw new Error("Restore is not supported when the quarantine directory is nested below an uploads subdirectory; configure it outside uploads or as a direct child of uploads");
+  }
+}
+
+function samePathComponent(left, right) {
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
+function hasSymlinkInPath(pathname) {
+  const absolute = path.resolve(pathname);
+  const root = path.parse(absolute).root;
+  let current = root;
+  for (const component of absolute.slice(root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    let stat;
+    try { stat = fs.lstatSync(current); } catch (error) {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) return true;
+  }
+  return false;
+}
+
+function clearDirectoryPreservingQuarantine(destination, quarantinePath) {
+  let rootStat;
+  try { rootStat = fs.lstatSync(destination); } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return;
+
+  let relative = null;
+  try {
+    const destinationReal = fs.realpathSync.native ? fs.realpathSync.native(destination) : fs.realpathSync(destination);
+    const quarantineReal = fs.realpathSync.native ? fs.realpathSync.native(quarantinePath) : fs.realpathSync(quarantinePath);
+    if (isPathWithin(destinationReal, quarantineReal)) relative = path.relative(destinationReal, quarantineReal);
+  } catch {}
+  if (relative === null) {
+    for (const destinationPath of pathVariants(destination)) {
+      const nestedVariant = pathVariants(quarantinePath).find((variant) => isPathWithin(destinationPath, variant));
+      if (nestedVariant) {
+        const base = process.platform === "win32" ? destinationPath.toLowerCase() : destinationPath;
+        const target = process.platform === "win32" ? nestedVariant.toLowerCase() : nestedVariant;
+        relative = path.relative(base, target);
+        break;
+      }
+    }
+  }
+  if (relative === null) relative = path.relative(path.resolve(destination), path.resolve(quarantinePath));
+  const remaining = relative.split(path.sep).filter(Boolean);
+  if (!remaining.length) return;
+  const clear = (currentDirectory, components) => {
+    for (const entry of fs.readdirSync(currentDirectory, { withFileTypes: true })) {
+      const entryPath = path.join(currentDirectory, entry.name);
+      if (components.length && samePathComponent(entry.name, components[0])) {
+        if (components.length === 1 || entry.isSymbolicLink() || !entry.isDirectory()) continue;
+        clear(entryPath, components.slice(1));
+        continue;
+      }
+      fs.rmSync(entryPath, { recursive: true, force: true });
+    }
+  };
+  clear(destination, remaining);
+}
+
+function copyDirectoryContents(source, destination, protectedPath = null) {
   if (!fs.existsSync(source)) return;
   fs.mkdirSync(destination, { recursive: true });
   for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
     const sourcePath = path.join(source, entry.name);
     const destinationPath = path.join(destination, entry.name);
+    if (protectedPath && isPathWithinAliases(protectedPath, destinationPath)) continue;
+    if (protectedPath && isPathWithinAliases(destinationPath, protectedPath)) {
+      if (entry.isDirectory() && !hasSymlinkInPath(destinationPath)) {
+        fs.mkdirSync(destinationPath, { recursive: true });
+        copyDirectoryContents(sourcePath, destinationPath, protectedPath);
+      }
+      continue;
+    }
     if (entry.isDirectory()) {
       fs.rmSync(destinationPath, { recursive: true, force: true });
-      copyDirectoryContents(sourcePath, destinationPath);
+      copyDirectoryContents(sourcePath, destinationPath, protectedPath);
     } else if (entry.isFile()) {
       fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
       fs.copyFileSync(sourcePath, destinationPath);
@@ -303,7 +428,8 @@ function restoreDataFiles(extractedRoot) {
   closeDb();
   fs.mkdirSync(resolveRuntimePath("data"), { recursive: true });
   for (const name of fs.readdirSync(extractedData)) {
-    if (name === "backups" || name === "server-master.key" || name.endsWith(".key") || name.startsWith("rootark.sqlite")) continue;
+    const foldedName = name.toLowerCase();
+    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
     const sourcePath = path.join(extractedData, name);
     const destinationPath = resolveRuntimePath("data", name);
     if (fs.statSync(sourcePath).isFile()) {
@@ -317,8 +443,400 @@ function restoreUploads(extractedRoot) {
   if (!fs.existsSync(extractedUploads)) return;
 
   const destinationUploads = resolveRuntimePath("uploads");
+  const quarantineDir = path.resolve(getUploadQuarantineDir());
+  const uploadsContainQuarantine = isPathWithinAliases(destinationUploads, quarantineDir);
+  const quarantineContainsUploads = isPathWithinAliases(quarantineDir, destinationUploads);
+  if (uploadsContainQuarantine && !quarantineContainsUploads) {
+    clearDirectoryPreservingQuarantine(destinationUploads, quarantineDir);
+    const uploadsStat = (() => { try { return fs.lstatSync(destinationUploads); } catch { return null; } })();
+    if (uploadsStat?.isSymbolicLink()) return;
+    copyDirectoryContents(extractedUploads, destinationUploads, quarantineDir);
+    return;
+  }
+  if (quarantineContainsUploads) return;
+
   fs.rmSync(destinationUploads, { recursive: true, force: true });
   copyDirectoryContents(extractedUploads, destinationUploads);
+}
+
+function validateQuarantineArchive(extractedRoot, manifest) {
+  if (manifest?.quarantine_format_version !== undefined && manifest.quarantine_format_version !== 1) {
+    throw new Error("Quarantine archive format is not supported");
+  }
+  const hasQuarantineFormat = manifest?.quarantine_format_version === 1;
+  const metadataPath = path.join(extractedRoot, "data", "quarantine.json");
+  const metadata = readQuarantineMetadata(metadataPath);
+  if (!metadata) {
+    if (hasQuarantineFormat) throw new Error("Quarantine metadata is missing");
+    return false;
+  }
+  const payloadRoot = path.join(extractedRoot, "data", "quarantine");
+  if (!hasQuarantineFormat && metadata.items.length > 0 && !pathExists(payloadRoot)) {
+    throw new Error("Quarantine archive payloads are missing");
+  }
+  validateQuarantinePayloads(metadata.items, payloadRoot);
+  return true;
+}
+
+function pathExists(pathname) {
+  try { fs.lstatSync(pathname); return true; }
+  catch (error) { if (error.code === "ENOENT") return false; throw error; }
+}
+
+function sameRuntimeRoot(left, right) {
+  const a = path.normalize(String(left || ""));
+  const b = path.normalize(String(right || ""));
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function validateQuarantineDestination(destination) {
+  const resolved = path.resolve(destination);
+  const root = path.parse(resolved).root;
+  if (resolved === root) throw new Error("Quarantine directory cannot be a filesystem root");
+  if (pathExists(resolved)) {
+    if (!fs.statSync(resolved).isDirectory()) throw new Error("Quarantine destination is not a directory");
+    const actual = fs.realpathSync(resolved);
+    if (actual === path.parse(actual).root) throw new Error("Quarantine directory cannot be a filesystem root");
+  }
+  return resolved;
+}
+
+function prepareQuarantineRestore(extractedRoot) {
+  const metadataPath = path.join(extractedRoot, "data", "quarantine.json");
+  const metadata = readQuarantineMetadata(metadataPath);
+  if (!metadata) return null;
+
+  const destination = validateQuarantineDestination(getUploadQuarantineDir());
+  const metadataDestination = resolveRuntimePath("data", "quarantine.json");
+  const dataStat = fs.lstatSync(path.dirname(metadataDestination));
+  if (!dataStat.isDirectory() || dataStat.isSymbolicLink()) throw new Error("Quarantine metadata directory is unsafe");
+  const archivedPayloads = validateQuarantinePayloads(metadata.items, path.join(extractedRoot, "data", "quarantine"));
+  const currentMetadata = readQuarantineMetadata(metadataDestination);
+  const currentPayloads = currentMetadata ? validateQuarantinePayloads(currentMetadata.items, destination) : [];
+  const preservedSensitiveItems = (currentMetadata?.items || []).filter((item) => isSensitiveQuarantineItem(item));
+  const preservedNames = new Set(preservedSensitiveItems.map((item) => item.storedQuarantineFilename.toLowerCase()));
+  const preservedIds = new Set(preservedSensitiveItems.map((item) => item.id).filter(Boolean));
+  const archivedItems = metadata.items.filter((item) => !isSensitiveQuarantineItem(item)
+    && !preservedNames.has(item.storedQuarantineFilename.toLowerCase())
+    && !(item.id && preservedIds.has(item.id)));
+  const archivedNames = new Set(archivedItems.map((item) => item.storedQuarantineFilename.toLowerCase()));
+  const extractedPayloads = archivedPayloads.filter((payload) => archivedNames.has(payload.filename.toLowerCase()));
+  const restoredPayloads = [
+    ...extractedPayloads,
+    ...currentPayloads.filter((payload) => preservedNames.has(payload.filename.toLowerCase())),
+  ];
+  const currentFilenames = new Set(currentPayloads.map((payload) => payload.filename.toLowerCase()));
+  for (const payload of restoredPayloads) {
+    let targetExists = false;
+    try { fs.lstatSync(path.join(destination, payload.filename)); targetExists = true; }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+    if (targetExists && !currentFilenames.has(payload.filename.toLowerCase())) {
+      throw new Error("Quarantine payload destination already exists");
+    }
+  }
+
+  return {
+    destination,
+    extractedPayloads,
+    restoredPayloads,
+    metadataContents: Buffer.from(JSON.stringify({ ...metadata, items: [...archivedItems, ...preservedSensitiveItems] })),
+    metadataDestination,
+    oldMetadataExists: Boolean(currentMetadata),
+    currentPayloads,
+  };
+}
+
+function quarantineJournalPath() {
+  return resolveRuntimePath("data", ".rootark-quarantine-restore-journal.json");
+}
+
+function quarantineMetadataStagePath(transactionId, kind) {
+  if (!/^[a-f0-9-]{36}$/i.test(transactionId || "") || !["old", "new"].includes(kind)) {
+    throw new Error("Quarantine metadata staging path is invalid");
+  }
+  return resolveRuntimePath("data", `.rootark-quarantine-restore-metadata-${transactionId}-${kind}.tmp`);
+}
+
+function hasPendingQuarantineRestore() {
+  return pathExists(quarantineJournalPath());
+}
+
+function quarantineStagePath(destination, transactionId) {
+  const root = path.resolve(destination);
+  const stage = path.resolve(root, `.rootark-quarantine-restore-${transactionId}`);
+  if (!stage.startsWith(`${root}${path.sep}`)) throw new Error("Quarantine restore staging escaped its boundary");
+  return stage;
+}
+
+function validQuarantineRestoreJournal(value) {
+  if (!value || value.version !== 1 || !/^[a-f0-9-]{36}$/i.test(value.transactionId || "")) return false;
+  if (typeof value.destination !== "string" || !sameRuntimeRoot(value.destination, getUploadQuarantineDir())) return false;
+  if (typeof value.oldMetadataExists !== "boolean" || !/^[a-f0-9]{64}$/.test(value.metadataHash || "")) return false;
+  if (!Array.isArray(value.oldPayloads) || !Array.isArray(value.newPayloads)) return false;
+  const oldNames = new Set();
+  for (const filename of value.oldPayloads) {
+    if (!isSafeQuarantineFilename(filename) || oldNames.has(filename)) return false;
+    oldNames.add(filename);
+  }
+  const newNames = new Set();
+  for (const payload of value.newPayloads) {
+    if (!payload || !isSafeQuarantineFilename(payload.filename) || !/^[a-f0-9]{64}$/.test(payload.sha256 || "") || newNames.has(payload.filename)) return false;
+    newNames.add(payload.filename);
+  }
+  return true;
+}
+
+function isSafeQuarantineFilename(filename) {
+  return typeof filename === "string" && Boolean(filename) && filename !== "." && filename !== ".."
+    && path.basename(filename) === filename && !/[\\/<>:"|?*\u0000-\u001f]/.test(filename) && !/[. ]$/.test(filename)
+    && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(filename);
+}
+
+function writeQuarantineJournal(journalPath, journal) {
+  const temporary = `${journalPath}.${journal.transactionId}.tmp`;
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(journal)}\n`, { encoding: "utf8", flag: "wx" });
+    fsyncFile(temporary);
+    fs.renameSync(temporary, journalPath);
+    fsyncDirectory(path.dirname(journalPath));
+  } catch (error) {
+    fs.rmSync(temporary, { force: true });
+    throw error;
+  }
+}
+
+function readQuarantineJournal(journalPath) {
+  let journal;
+  let contents;
+  try { contents = readQuarantineRegularFile(journalPath, "utf8"); }
+  catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw new Error("Quarantine restore journal is invalid");
+  }
+  try { journal = JSON.parse(contents); }
+  catch { throw new Error("Quarantine restore journal is invalid"); }
+  if (!validQuarantineRestoreJournal(journal)) throw new Error("Quarantine restore journal is invalid");
+  return journal;
+}
+
+function quarantineJournalStage(journal) {
+  const destination = validateQuarantineDestination(journal.destination);
+  const stage = quarantineStagePath(destination, journal.transactionId);
+  const stat = fs.lstatSync(stage);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Quarantine restore staging is invalid");
+  return stage;
+}
+
+function expectedFileHash(pathname, expectedHash) {
+  if (!pathExists(pathname)) return false;
+  const stat = fs.lstatSync(pathname);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Quarantine restore found an unexpected file");
+  return fileSha256(pathname) === expectedHash;
+}
+
+function rollbackQuarantineRestore(journal, stage) {
+  const destination = journal.destination;
+  for (let index = 0; index < journal.newPayloads.length; index += 1) {
+    const payload = journal.newPayloads[index];
+    const stagedNew = path.join(stage, `new-${index}`);
+    if (pathExists(stagedNew)) continue;
+    const target = path.join(destination, payload.filename);
+    if (pathExists(target)) {
+      if (!expectedFileHash(target, payload.sha256)) throw new Error("Quarantine rollback found a changed destination payload");
+      fs.rmSync(target, { force: false });
+    }
+  }
+  for (let index = journal.oldPayloads.length - 1; index >= 0; index -= 1) {
+    const filename = journal.oldPayloads[index];
+    const stagedOld = path.join(stage, `old-${index}`);
+    if (!pathExists(stagedOld)) continue;
+    const target = path.join(destination, filename);
+    if (pathExists(target)) {
+      const newPayload = journal.newPayloads.find((payload) => payload.filename === filename);
+      if (!newPayload || !expectedFileHash(target, newPayload.sha256)) throw new Error("Quarantine rollback found a changed destination payload");
+      fs.rmSync(target, { force: false });
+    }
+    fs.renameSync(stagedOld, target);
+  }
+
+  const metadataDestination = resolveRuntimePath("data", "quarantine.json");
+  const stagedOldMetadata = quarantineMetadataStagePath(journal.transactionId, "old");
+  const stagedNewMetadata = quarantineMetadataStagePath(journal.transactionId, "new");
+  if (pathExists(stagedOldMetadata)) {
+    if (pathExists(metadataDestination)) {
+      if (!expectedFileHash(metadataDestination, journal.metadataHash)) throw new Error("Quarantine rollback found changed metadata");
+      fs.rmSync(metadataDestination, { force: false });
+    }
+    fs.renameSync(stagedOldMetadata, metadataDestination);
+  } else if (!journal.oldMetadataExists && pathExists(metadataDestination)) {
+    if (!expectedFileHash(metadataDestination, journal.metadataHash)) throw new Error("Quarantine rollback found changed metadata");
+    fs.rmSync(metadataDestination, { force: false });
+  } else if (journal.oldMetadataExists && !pathExists(metadataDestination)) {
+    throw new Error("Quarantine rollback could not find prior metadata");
+  }
+  if (pathExists(stagedNewMetadata)) fs.rmSync(stagedNewMetadata, { force: false });
+  fsyncDirectory(destination);
+  fsyncDirectory(path.dirname(metadataDestination));
+}
+
+function cleanupOrphanQuarantineStages(destination) {
+  if (!pathExists(destination)) return;
+  for (const entry of fs.readdirSync(destination, { withFileTypes: true })) {
+    if (!/^\.rootark-quarantine-restore-[a-f0-9-]{36}$/i.test(entry.name) || !entry.isDirectory() || entry.isSymbolicLink()) continue;
+    fs.rmSync(path.join(destination, entry.name), { recursive: true, force: true });
+  }
+}
+
+function cleanupQuarantineMetadataStages(transactionId) {
+  fs.rmSync(quarantineMetadataStagePath(transactionId, "old"), { force: true });
+  fs.rmSync(quarantineMetadataStagePath(transactionId, "new"), { force: true });
+  fsyncDirectory(path.dirname(quarantineJournalPath()));
+}
+
+function cleanupOrphanQuarantineMetadataStages(dataDirectory) {
+  if (!pathExists(dataDirectory)) return;
+  for (const name of fs.readdirSync(dataDirectory)) {
+    if (!/^\.rootark-quarantine-restore-metadata-[a-f0-9-]{36}-(?:old|new)\.tmp$/i.test(name)) continue;
+    const stagedPath = path.join(dataDirectory, name);
+    const stat = fs.lstatSync(stagedPath);
+    if (stat.isFile() && !stat.isSymbolicLink()) fs.rmSync(stagedPath, { force: false });
+  }
+  fsyncDirectory(dataDirectory);
+}
+
+function recoverQuarantineRestore() {
+  if (!fs.existsSync(backupService.BACKUPS_DIR)) {
+    if (hasPendingQuarantineRestore()) throw new Error("Quarantine recovery cannot acquire its backup lock");
+    return false;
+  }
+  const release = backupService.acquireLock("restore");
+  try {
+    const destination = validateQuarantineDestination(getUploadQuarantineDir());
+    const journalPath = quarantineJournalPath();
+    const journal = readQuarantineJournal(journalPath);
+    if (!journal) {
+      cleanupOrphanQuarantineStages(destination);
+      cleanupOrphanQuarantineMetadataStages(path.dirname(journalPath));
+      return false;
+    }
+    const stage = quarantineJournalStage(journal);
+    const commitMarker = path.join(stage, "committed");
+    if (pathExists(commitMarker)) {
+      const marker = fs.readFileSync(commitMarker, "utf8");
+      if (marker !== journal.transactionId) throw new Error("Quarantine restore commit marker is invalid");
+      cleanupQuarantineMetadataStages(journal.transactionId);
+      fs.rmSync(journalPath, { force: false });
+      fsyncDirectory(path.dirname(journalPath));
+      fs.rmSync(stage, { recursive: true, force: true });
+      return true;
+    }
+    rollbackQuarantineRestore(journal, stage);
+    cleanupQuarantineMetadataStages(journal.transactionId);
+    fs.rmSync(journalPath, { force: false });
+    fsyncDirectory(path.dirname(journalPath));
+    fs.rmSync(stage, { recursive: true, force: true });
+    return true;
+  } finally {
+    release();
+  }
+}
+
+function restoreQuarantine(plan) {
+  if (!plan) return;
+  const destination = validateQuarantineDestination(plan.destination);
+  fs.mkdirSync(destination, { recursive: true });
+  validateQuarantineDestination(destination);
+  const transactionId = crypto.randomUUID();
+  const stagingDirectory = quarantineStagePath(destination, transactionId);
+  const journalPath = quarantineJournalPath();
+  const stagedOldMetadata = quarantineMetadataStagePath(transactionId, "old");
+  const stagedNewMetadata = quarantineMetadataStagePath(transactionId, "new");
+  const journal = {
+    version: 1,
+    transactionId,
+    destination,
+    oldMetadataExists: plan.oldMetadataExists,
+    metadataHash: crypto.createHash("sha256").update(plan.metadataContents).digest("hex"),
+    oldPayloads: plan.currentPayloads.map((payload) => payload.filename),
+    newPayloads: plan.restoredPayloads.map((payload) => ({ filename: payload.filename, sha256: fileSha256(payload.absolutePath) })),
+  };
+  let journalWritten = false;
+  try {
+    if (pathExists(journalPath)) throw new Error("A quarantine restore recovery is pending");
+    fs.mkdirSync(stagingDirectory);
+    plan.restoredPayloads.forEach((payload, index) => {
+      const stagedPath = path.join(stagingDirectory, `new-${index}`);
+      fs.copyFileSync(payload.absolutePath, stagedPath, fs.constants.COPYFILE_EXCL);
+      fsyncFile(stagedPath);
+    });
+    fsyncDirectory(stagingDirectory);
+    fsyncDirectory(destination);
+    writeQuarantineJournal(journalPath, journal);
+    journalWritten = true;
+
+    fs.writeFileSync(stagedNewMetadata, plan.metadataContents, { flag: "wx" });
+    fsyncFile(stagedNewMetadata);
+    fsyncDirectory(path.dirname(plan.metadataDestination));
+    plan.currentPayloads.forEach((payload, index) => {
+      const stagedOldPath = path.join(stagingDirectory, `old-${index}`);
+      fsyncFile(payload.absolutePath);
+      fs.renameSync(payload.absolutePath, stagedOldPath);
+    });
+    fsyncDirectory(destination);
+    fsyncDirectory(stagingDirectory);
+    for (let index = 0; index < plan.restoredPayloads.length; index += 1) {
+      const payload = plan.restoredPayloads[index];
+      const targetPath = path.join(destination, payload.filename);
+      fs.renameSync(path.join(stagingDirectory, `new-${index}`), targetPath);
+    }
+    fsyncDirectory(destination);
+    fsyncDirectory(stagingDirectory);
+    if (plan.oldMetadataExists) {
+      fsyncFile(plan.metadataDestination);
+      fs.renameSync(plan.metadataDestination, stagedOldMetadata);
+      fsyncDirectory(path.dirname(plan.metadataDestination));
+    }
+    fs.renameSync(stagedNewMetadata, plan.metadataDestination);
+    fsyncDirectory(path.dirname(plan.metadataDestination));
+    const markerTemporary = path.join(stagingDirectory, "committed.tmp");
+    fs.writeFileSync(markerTemporary, transactionId, { flag: "wx" });
+    fsyncFile(markerTemporary);
+    fs.renameSync(markerTemporary, path.join(stagingDirectory, "committed"));
+    fsyncDirectory(stagingDirectory);
+  } catch (error) {
+    if (journalWritten) {
+      try {
+        const activeJournal = readQuarantineJournal(journalPath);
+        if (activeJournal) {
+          const stage = quarantineJournalStage(activeJournal);
+          if (pathExists(path.join(stage, "committed"))) {
+            const marker = fs.readFileSync(path.join(stage, "committed"), "utf8");
+            if (marker !== activeJournal.transactionId) throw new Error("Quarantine restore commit marker is invalid");
+            fs.rmSync(path.join(stage, "committed"), { force: false });
+            fsyncDirectory(stage);
+          }
+          rollbackQuarantineRestore(activeJournal, stage);
+          cleanupQuarantineMetadataStages(activeJournal.transactionId);
+        }
+        fs.rmSync(journalPath, { force: true });
+        fsyncDirectory(path.dirname(journalPath));
+        fs.rmSync(stagingDirectory, { recursive: true, force: true });
+      } catch (recoveryError) {
+        error.recoveryError = recoveryError;
+      }
+    } else {
+      fs.rmSync(stagingDirectory, { recursive: true, force: true });
+    }
+    throw error;
+  }
+  try {
+    cleanupQuarantineMetadataStages(transactionId);
+    fs.rmSync(journalPath, { force: false });
+    fsyncDirectory(path.dirname(journalPath));
+    fs.rmSync(stagingDirectory, { recursive: true, force: true });
+  } catch {
+    console.error("[restore] QUARANTINE_RESTORE_CLEANUP_FAILED");
+  }
 }
 
 function validateDatabase(pathname) {
@@ -613,6 +1131,8 @@ async function restoreBackup(id, options = {}) {
     throw new Error("Confirmacao invalida. Digite RESTORE para restaurar.");
   }
 
+  assertSafeQuarantineRestoreLocation();
+
   const preRestore = await backupService.createBackup({
     type: "pre-restore",
     createdBy: options.username || null,
@@ -625,6 +1145,9 @@ async function restoreBackup(id, options = {}) {
     const { backup, archivePath } = backupService.getBackupOrThrow(id);
     const { zip, manifest } = await validateBackupArchive(backup, archivePath);
     await extractArchive(zip, restoreDir);
+    const hasQuarantineState = validateQuarantineArchive(restoreDir, manifest);
+    const quarantinePlan = hasQuarantineState ? prepareQuarantineRestore(restoreDir) : null;
+    restoreQuarantine(quarantinePlan);
     restoreDataFiles(restoreDir);
     restoreUploads(restoreDir);
     const restoredDatabase = restoreDatabaseFiles(restoreDir);
@@ -658,7 +1181,10 @@ module.exports = {
   cancelRestoreSync,
   createRestoreSync,
   getBackupManifest,
+  hasPendingQuarantineRestore,
+  prepareQuarantineRestore,
   processRestoreSync,
+  recoverQuarantineRestore,
   restoreBackup,
   setCloudStorage,
   validateBackupArchive,

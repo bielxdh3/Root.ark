@@ -1,12 +1,14 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { Readable } = require("stream");
 const Database = require("better-sqlite3");
 const { ZipArchive } = require("archiver");
 const backupRepository = require("../repositories/backupRepository");
 const { getDatabasePath, getDb, isDbEnabled } = require("../db");
 const { resolveRuntimePath } = require("../src/runtime-paths");
 const { attestCiphertextOnlyFile } = require("../src/services/deploymentResilience");
+const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, validateQuarantinePayloads } = require("../src/quarantine-paths");
 
 const BACKUPS_DIR = resolveRuntimePath("data", "backups");
 const LOCK_FILE = path.join(BACKUPS_DIR, ".backup.lock");
@@ -77,23 +79,169 @@ function isSensitivePath(relativePath) {
   if (normalized.startsWith("node_modules/") || normalized === "node_modules") return true;
   if (normalized.startsWith("data/backups/") || normalized === "data/backups") return true;
   if (normalized.startsWith("temp/.chunks/") || normalized.startsWith("temp/.incoming/")) return true;
-  if (base === ".env" || base.endsWith(".env")) return true;
+  if (base === ".env" || base.startsWith(".env.") || base.endsWith(".env")) return true;
   if (base.includes("credentials") || base.includes("service-account")) return true;
   if (base.endsWith(".key") || base.endsWith(".pem") || base.endsWith(".p12")) return true;
   if (base === "server-master.key") return true;
+  if (base === ".rootark-quarantine-restore-journal.json" || base.startsWith(".rootark-quarantine-restore-metadata-")) return true;
   return false;
+}
+
+function isPathWithin(basePath, targetPath) {
+  const base = path.resolve(basePath);
+  const target = path.resolve(targetPath);
+  const comparableBase = process.platform === "win32" ? base.toLowerCase() : base;
+  const comparableTarget = process.platform === "win32" ? target.toLowerCase() : target;
+  const relative = path.relative(comparableBase, comparableTarget);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function pathIdentityKey(value) {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function fileIdentity(stat) {
+  return stat?.isFile?.() && stat.ino ? `${stat.dev}:${stat.ino}` : null;
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.ino !== 0n;
+}
+
+function sameFileSnapshot(left, right) {
+  return sameFileIdentity(left, right) && left.size === right.size && left.mode === right.mode
+    && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs && left.birthtimeNs === right.birthtimeNs;
+}
+
+function samePath(left, right) {
+  const a = path.normalize(left);
+  const b = path.normalize(right);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function archiveRootInfo(rootPath, { allowRootSymlink = false } = {}) {
+  const absolutePath = path.resolve(rootPath);
+  const pathStat = fs.lstatSync(absolutePath, { bigint: true });
+  const rootSymlink = pathStat.isSymbolicLink();
+  if (rootSymlink && !allowRootSymlink) throw new Error("Backup source root cannot be a symbolic link");
+  if (!rootSymlink && !pathStat.isDirectory()) throw new Error("Backup source root is not a directory");
+  const realPath = fs.realpathSync.native(absolutePath);
+  const realStat = fs.statSync(realPath, { bigint: true });
+  if (!realStat.isDirectory() || realStat.ino === 0n) throw new Error("Backup source root has no stable directory identity");
+  return { absolutePath, realPath, pathStat, realStat, rootSymlink };
+}
+
+function assertArchiveRootUnchanged(root) {
+  const currentPathStat = fs.lstatSync(root.absolutePath, { bigint: true });
+  if (currentPathStat.isSymbolicLink() !== root.rootSymlink || !sameFileIdentity(root.pathStat, currentPathStat)) {
+    throw new Error("Backup source root changed during archive creation");
+  }
+  const realPath = fs.realpathSync.native(root.absolutePath);
+  if (!samePath(realPath, root.realPath)) throw new Error("Backup source root changed during archive creation");
+  const realStat = fs.statSync(realPath, { bigint: true });
+  if (!realStat.isDirectory() || !sameFileIdentity(root.realStat, realStat)) {
+    throw new Error("Backup source root changed during archive creation");
+  }
+}
+
+function assertArchiveSourcePath(root, absolutePath) {
+  if (!isPathWithin(root.absolutePath, absolutePath) || path.resolve(root.absolutePath) === path.resolve(absolutePath)) {
+    throw new Error("Backup source escaped its collected root");
+  }
+  const segments = path.relative(root.absolutePath, absolutePath).split(path.sep).filter(Boolean);
+  let current = root.absolutePath;
+  for (let index = 0; index < segments.length; index += 1) {
+    current = path.join(current, segments[index]);
+    const stat = fs.lstatSync(current, { bigint: true });
+    if (stat.isSymbolicLink()) throw new Error("Backup source cannot be a symbolic link");
+    if (index < segments.length - 1 && !stat.isDirectory()) throw new Error("Backup source parent is not a directory");
+    if (index === segments.length - 1 && !stat.isFile()) throw new Error("Backup source is not a regular file");
+  }
+  return fs.lstatSync(absolutePath, { bigint: true });
+}
+
+function archiveSourceMetadata(file) {
+  const absolutePath = path.resolve(file.absolutePath);
+  let root = file.archiveRoot;
+  let sourceStat = file.sourceStat;
+  if (!root && !sourceStat) {
+    sourceStat = fs.lstatSync(absolutePath, { bigint: true });
+    if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("Backup source is not a regular file");
+    root = archiveRootInfo(path.dirname(absolutePath));
+  }
+  if (!root || !sourceStat) throw new Error("Backup source verification metadata is missing");
+  return { ...file, absolutePath, archiveRoot: root, sourceStat };
+}
+
+function createVerifiedArchiveStream(file) {
+  let source;
+  const stream = Readable.from((async function* readVerifiedArchiveSource() {
+    const { absolutePath, archiveRoot: root, sourceStat } = file;
+    assertArchiveRootUnchanged(root);
+    const pathStat = assertArchiveSourcePath(root, absolutePath);
+    if (!sameFileSnapshot(sourceStat, pathStat) || pathStat.nlink !== 1n) {
+      throw new Error("Backup source changed or is aliased during archive creation");
+    }
+
+    let fd;
+    try {
+      fd = fs.openSync(absolutePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      const openedStat = fs.fstatSync(fd, { bigint: true });
+      if (!openedStat.isFile() || openedStat.nlink !== 1n || !sameFileSnapshot(sourceStat, openedStat)) {
+        throw new Error("Backup source changed or is aliased during archive creation");
+      }
+      assertArchiveRootUnchanged(root);
+      const finalPathStat = assertArchiveSourcePath(root, absolutePath);
+      const realPath = fs.realpathSync.native(absolutePath);
+      if (!isPathWithin(root.realPath, realPath) || !sameFileSnapshot(openedStat, finalPathStat)) {
+        throw new Error("Backup source escaped its collected root");
+      }
+      source = fs.createReadStream(null, { fd, autoClose: true });
+      fd = undefined;
+      for await (const chunk of source) yield chunk;
+    } finally {
+      if (source) source.destroy();
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+  })());
+  stream.abortSource = () => {
+    if (source && !source.destroyed) source.destroy();
+    if (!stream.destroyed) stream.destroy();
+  };
+  return stream;
 }
 
 function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
   if (!fs.existsSync(rootPath)) return [];
+  const rootAbsolute = path.resolve(rootPath);
+  if (fs.lstatSync(rootAbsolute).isSymbolicLink()) return [];
+  const archiveRoot = archiveRootInfo(rootAbsolute);
+  const excludedPaths = (options.excludePaths || []).filter(Boolean).map((excludedPath) => {
+    const absolute = path.resolve(excludedPath);
+    return { absolute, real: fs.existsSync(absolute) ? fs.realpathSync(absolute) : null };
+  });
+  const isExcluded = (candidatePath) => {
+    if (!excludedPaths.length) return false;
+    const absolute = path.resolve(candidatePath);
+    if (excludedPaths.some((excluded) => isPathWithin(excluded.absolute, absolute))) return true;
+    if (!excludedPaths.some((excluded) => excluded.real)) return false;
+    let real;
+    try { real = fs.realpathSync(absolute); } catch { return false; }
+    return excludedPaths.some((excluded) => excluded.real && isPathWithin(excluded.real, real));
+  };
+  if (isExcluded(rootAbsolute)) return [];
   const files = [];
-  const stack = [{ absolutePath: rootPath, entryPath: entryPrefix }];
+  const stack = [{ absolutePath: rootAbsolute, entryPath: entryPrefix }];
   while (stack.length) {
     const current = stack.pop();
-    const stat = fs.statSync(current.absolutePath);
+    if (isExcluded(current.absolutePath)) continue;
+    const stat = fs.lstatSync(current.absolutePath, { bigint: true });
+    if (stat.isSymbolicLink()) continue;
     if (stat.isDirectory()) {
       for (const name of fs.readdirSync(current.absolutePath)) {
         const absolutePath = path.join(current.absolutePath, name);
+        if (isExcluded(absolutePath)) continue;
         const entryPath = normalizeEntryPath(path.posix.join(current.entryPath, name));
         if (isSensitivePath(entryPath)) continue;
         stack.push({ absolutePath, entryPath });
@@ -101,8 +249,10 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
       continue;
     }
     if (!stat.isFile()) continue;
+    const identity = fileIdentity(stat);
+    if (identity && options.excludeFileIdentities?.has(identity)) continue;
     if (options.maxBytes && stat.size > options.maxBytes) continue;
-    files.push({ absolutePath: current.absolutePath, entryPath: normalizeEntryPath(current.entryPath), size: stat.size });
+    files.push({ absolutePath: current.absolutePath, entryPath: normalizeEntryPath(current.entryPath), size: Number(stat.size), archiveRoot, sourceStat: stat });
   }
   return files;
 }
@@ -110,36 +260,90 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
 async function collectBackupFiles(options = {}) {
   const files = [];
   const dataDir = resolveRuntimePath("data");
+  let dataRootInfo = null;
+  try {
+    const dataStat = fs.lstatSync(dataDir, { bigint: true });
+    if (dataStat.isSymbolicLink()) throw new Error("Backup data directory cannot be a symbolic link");
+    dataRootInfo = archiveRootInfo(dataDir);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
   const includeUploads = envBool("BACKUP_INCLUDE_UPLOADS", true);
   const includeTemp = envBool("BACKUP_INCLUDE_TEMP", false);
   const includePending = envBool("BACKUP_INCLUDE_PENDING", false);
+  const quarantineDir = getUploadQuarantineDir();
+  if (quarantineDirContainsUploads(resolveRuntimePath("uploads"), quarantineDir)) {
+    throw new Error("Backup is not supported when the quarantine directory equals or contains uploads");
+  }
+  const quarantineMetadata = readQuarantineMetadata(resolveRuntimePath("data", "quarantine.json"));
+  const quarantinePayloads = quarantineMetadata ? validateQuarantinePayloads(quarantineMetadata.items, quarantineDir) : [];
+  const quarantineRootInfo = quarantinePayloads.length ? archiveRootInfo(quarantineDir, { allowRootSymlink: true }) : null;
+  const quarantinePathIdentities = new Set();
+  const quarantineFileIdentities = new Set();
+  for (const payload of quarantinePayloads) {
+    quarantinePathIdentities.add(pathIdentityKey(payload.absolutePath));
+    try { quarantinePathIdentities.add(pathIdentityKey(fs.realpathSync(payload.absolutePath))); } catch {}
+    const identity = fileIdentity(fs.lstatSync(payload.absolutePath, { bigint: true }));
+    if (identity) quarantineFileIdentities.add(identity);
+  }
+  const isQuarantinePayloadPath = (candidatePath, stat) => {
+    const identity = fileIdentity(stat);
+    if (identity && quarantineFileIdentities.has(identity)) return true;
+    if (quarantinePathIdentities.has(pathIdentityKey(candidatePath))) return true;
+    try { return quarantinePathIdentities.has(pathIdentityKey(fs.realpathSync(candidatePath))); } catch { return false; }
+  };
 
   for (const name of fs.existsSync(dataDir) ? fs.readdirSync(dataDir) : []) {
+    if (name.toLowerCase() === "quarantine.json") continue;
     const absolutePath = path.join(dataDir, name);
     const entryPath = normalizeEntryPath(path.posix.join("data", name));
     if (isSensitivePath(entryPath)) continue;
-    const stat = fs.statSync(absolutePath);
+    const stat = fs.lstatSync(absolutePath, { bigint: true });
+    if (stat.isSymbolicLink()) continue;
     if (stat.isFile() && (
       name.endsWith(".json") ||
       name === "README.md"
-    )) {
-      files.push({ absolutePath, entryPath, size: stat.size });
+    ) && !isQuarantinePayloadPath(absolutePath, stat)) {
+      files.push({ absolutePath, entryPath, size: Number(stat.size), archiveRoot: dataRootInfo, sourceStat: stat });
     }
+  }
+
+  if (quarantineMetadata) {
+    const safeItems = quarantineMetadata.items.filter((item) => {
+      const storedPath = path.posix.join("data", "quarantine", item.storedQuarantineFilename);
+      return !isSensitivePath(storedPath) && !isSensitiveQuarantineItem(item);
+    });
+    const safeNames = new Set(safeItems.map((item) => item.storedQuarantineFilename));
+    const metadataContents = Buffer.from(JSON.stringify({ ...quarantineMetadata, items: safeItems }));
+    files.push({ contents: metadataContents, entryPath: "data/quarantine.json", size: metadataContents.length });
+    files.push(...quarantinePayloads.filter((payload) => safeNames.has(payload.filename)).map((payload) => {
+      const sourceStat = fs.lstatSync(payload.absolutePath, { bigint: true });
+      if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("Quarantine payload is not a regular file");
+      return {
+        absolutePath: payload.absolutePath,
+        entryPath: normalizeEntryPath(path.posix.join("data", "quarantine", payload.filename)),
+        size: Number(sourceStat.size),
+        archiveRoot: quarantineRootInfo,
+        sourceStat,
+      };
+    }));
   }
 
   if (isDbEnabled()) {
     const snapshotPath = options.sqliteSnapshotPath;
     if (snapshotPath && fs.existsSync(snapshotPath)) {
-      files.push({ absolutePath: snapshotPath, entryPath: "data/rootark.sqlite", size: fs.statSync(snapshotPath).size });
+      const sourceStat = fs.lstatSync(snapshotPath, { bigint: true });
+      if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("SQLite backup snapshot is not a regular file");
+      files.push({ absolutePath: snapshotPath, entryPath: "data/rootark.sqlite", size: Number(sourceStat.size), archiveRoot: dataRootInfo, sourceStat });
     }
   }
 
   if (includeUploads) {
-    files.push(...collectFilesRecursive(resolveRuntimePath("uploads"), "uploads"));
+    files.push(...collectFilesRecursive(resolveRuntimePath("uploads"), "uploads", { excludePaths: [quarantineDir], excludeFileIdentities: quarantineFileIdentities }));
   }
 
   if (includeTemp || includePending) {
-    files.push(...collectFilesRecursive(resolveRuntimePath("temp"), "temp"));
+    files.push(...collectFilesRecursive(resolveRuntimePath("temp"), "temp", { excludePaths: [quarantineDir], excludeFileIdentities: quarantineFileIdentities }));
   }
 
   const syncFile = files.find((file) => file.entryPath === "data/sync-objects.json");
@@ -159,6 +363,7 @@ async function collectBackupFiles(options = {}) {
   }
   const areas = ["uploads", ...(includeTemp || includePending ? ["temp"] : [])];
   const remoteIdentities = new Set();
+  let stageRootInfo = null;
   if (typeof cloudStorage.inventory !== "function") throw new Error("Authoritative cloud inventory is required");
   const remotes = await cloudStorage.inventory();
   for (const remote of remotes) {
@@ -180,10 +385,13 @@ async function collectBackupFiles(options = {}) {
     if (!await cloudStorage.download(folderId, name, staged, remote.area)) throw new Error("Cloud backup object is unavailable");
     const local = known.get(entryPath);
     if (local) {
-      if (await calculateFileHash(local.absolutePath) !== await calculateFileHash(staged)) throw new Error("Cloud and local backup objects differ");
+      if (await calculateBackupEntryHash(local) !== await calculateFileHash(staged)) throw new Error("Cloud and local backup objects differ");
       fs.rmSync(staged, { force: true });
     } else {
-      known.set(entryPath, { absolutePath: staged, entryPath, size: fs.statSync(staged).size, cloudOnly: true });
+      const sourceStat = fs.lstatSync(staged, { bigint: true });
+      if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("Cloud backup staging file is not a regular file");
+      stageRootInfo ||= archiveRootInfo(stageDir);
+      known.set(entryPath, { absolutePath: staged, entryPath, size: Number(sourceStat.size), cloudOnly: true, archiveRoot: stageRootInfo, sourceStat });
     }
   }
   options.cloudComplete = true;
@@ -216,6 +424,13 @@ function calculateFileHash(filePath) {
     input.on("error", reject);
     input.on("end", () => resolve(hash.digest("hex")));
   });
+}
+
+function calculateBackupEntryHash(file) {
+  if (Buffer.isBuffer(file.contents)) {
+    return Promise.resolve(crypto.createHash("sha256").update(file.contents).digest("hex"));
+  }
+  return calculateFileHash(file.absolutePath);
 }
 
 function runtimeRootIdentity() {
@@ -560,6 +775,7 @@ async function createZipArchive(archivePath, manifest, files) {
     let archive;
     let output;
     let fd;
+    const sourceStreams = new Set();
 
     const closeOutput = () => {
       if (!output || outputClosed || output.destroyed) return;
@@ -601,6 +817,12 @@ async function createZipArchive(archivePath, manifest, files) {
         if (archive && typeof archive.abort === "function") archive.abort();
         else if (archive && typeof archive.destroy === "function") archive.destroy();
       } catch {}
+      for (const sourceStream of sourceStreams) {
+        try {
+          if (typeof sourceStream.abortSource === "function") sourceStream.abortSource();
+          else sourceStream.destroy();
+        } catch {}
+      }
       closeOutput();
     };
 
@@ -632,7 +854,22 @@ async function createZipArchive(archivePath, manifest, files) {
       archive.on("error", onArchiveError);
       archive.pipe(output);
       archive.append(JSON.stringify(manifest, null, 2), { name: "backup-manifest.json" });
-      for (const file of files) archive.file(file.absolutePath, { name: file.entryPath });
+      for (const file of files) {
+        if (Buffer.isBuffer(file.contents)) archive.append(file.contents, { name: file.entryPath });
+        else {
+          const source = archiveSourceMetadata(file);
+          const sourceStream = createVerifiedArchiveStream(source);
+          sourceStreams.add(sourceStream);
+          sourceStream.once("end", () => sourceStreams.delete(sourceStream));
+          sourceStream.once("close", () => sourceStreams.delete(sourceStream));
+          sourceStream.on("error", onArchiveError);
+          archive.append(sourceStream, {
+            name: file.entryPath,
+            date: source.sourceStat.mtime,
+            mode: Number(source.sourceStat.mode),
+          });
+        }
+      }
       Promise.resolve(archive.finalize()).then(() => { finalized = true; void finish(); }, onArchiveError);
     } catch (error) {
       if (fd !== undefined && !output) { try { fs.closeSync(fd); } catch {} }
@@ -920,6 +1157,7 @@ async function createBackup(options = {}) {
       included_files: files.map((file) => ({ path: file.entryPath, size: file.size })),
       archive_sha256: null,
       app_version: process.env.npm_package_version || "1.0.0",
+      ...(files.some((file) => file.entryPath === "data/quarantine.json") ? { quarantine_format_version: 1 } : {}),
       status: "success",
       error_message: null,
       duration_ms: null,

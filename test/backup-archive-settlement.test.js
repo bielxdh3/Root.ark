@@ -73,6 +73,46 @@ test("archive failure settles the pipeline before owned cleanup", async (t) => {
     assert.equal(fs.existsSync(archivePath), false);
   });
 
+  await t.test("output failure destroys an active verified source stream", async () => {
+    reset();
+    const archivePath = path.join(backupService.BACKUPS_DIR, "rootark-backup-2026-01-01-00-00-04.zip");
+    const sourcePath = path.join(runtime, "uploads", "pending.bin");
+    fs.writeFileSync(sourcePath, "source data");
+    const originalCreateReadStream = fs.createReadStream;
+    const originalCreateWriteStream = fs.createWriteStream;
+    let source;
+    let notifySourceOpened;
+    let notifySourceClosed;
+    const sourceOpened = new Promise((resolve) => { notifySourceOpened = resolve; });
+    const sourceClosed = new Promise((resolve) => { notifySourceClosed = resolve; });
+    fs.createReadStream = (...args) => {
+      source = originalCreateReadStream(...args);
+      source.pause();
+      source.once("close", notifySourceClosed);
+      notifySourceOpened();
+      return source;
+    };
+    fs.createWriteStream = (...args) => {
+      const output = originalCreateWriteStream(...args);
+      void sourceOpened.then(() => process.nextTick(() => {
+        output.emit("error", Object.assign(new Error("output failed during source read"), { code: "OUTPUT_FAILED" }));
+      }));
+      return output;
+    };
+    try {
+      await assert.rejects(backupService.createZipArchive(archivePath, archiveInput(), [
+        { absolutePath: sourcePath, entryPath: "uploads/pending.bin" },
+      ]), { code: "OUTPUT_FAILED" });
+      await sourceClosed;
+    } finally {
+      fs.createReadStream = originalCreateReadStream;
+      fs.createWriteStream = originalCreateWriteStream;
+    }
+    assert.equal(source?.destroyed, true);
+    assert.equal(source?.closed, true);
+    assert.equal(fs.existsSync(archivePath), false);
+  });
+
   await t.test("Windows-style cleanup retries do not replace the primary error", async () => {
     reset();
     const archivePath = path.join(backupService.BACKUPS_DIR, "rootark-backup-2026-01-01-00-00-02.zip");
