@@ -102,7 +102,7 @@ function pathIdentityKey(value) {
 }
 
 function fileIdentity(stat) {
-  return stat?.isFile?.() && Number(stat.ino) ? `${stat.dev}:${stat.ino}` : null;
+  return stat?.isFile?.() && stat.ino ? `${stat.dev}:${stat.ino}` : null;
 }
 
 function sameFileIdentity(left, right) {
@@ -280,7 +280,7 @@ async function collectBackupFiles(options = {}) {
   for (const payload of quarantinePayloads) {
     quarantinePathIdentities.add(pathIdentityKey(payload.absolutePath));
     try { quarantinePathIdentities.add(pathIdentityKey(fs.realpathSync(payload.absolutePath))); } catch {}
-    const identity = fileIdentity(fs.lstatSync(payload.absolutePath));
+    const identity = fileIdentity(fs.lstatSync(payload.absolutePath, { bigint: true }));
     if (identity) quarantineFileIdentities.add(identity);
   }
   const isQuarantinePayloadPath = (candidatePath, stat) => {
