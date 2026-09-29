@@ -1001,7 +1001,7 @@ test("WebDAV keeps a queued move committed when transaction completion marking f
   assert.deepEqual(protocolJournal.pending().map((item) => item.operationId), ["mark-failure-protocol-op"]);
 });
 
-test("WebDAV does not roll back a move when protocol journal directory sync fails after rename", async (t) => {
+test("WebDAV retains recovery state when protocol journal directory sync fails after rename", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-journal-sync-failure-"));
   const root = path.join(dir, "root");
   const protocolDirectory = path.join(dir, "protocol");
@@ -1021,17 +1021,6 @@ test("WebDAV does not roll back a move when protocol journal directory sync fail
     metadata: { path: "destination.txt", sourcePath: "source.txt" },
     plaintext: Buffer.from("committed despite fsync error"), fileKey: key,
   });
-  const update = transactionJournal.update.bind(transactionJournal);
-  let failQueuedPhase = true;
-  transactionJournal.update = async (operationId, patch) => {
-    if (failQueuedPhase && patch.phase === "protocol-queued") {
-      failQueuedPhase = false;
-      const error = new Error("injected protocol queued phase failure");
-      error.code = "EIO";
-      throw error;
-    }
-    return update(operationId, patch);
-  };
   const bridge = new LocalSyncWebDavBridge({
     rootDir: root, token: "webdav-journal-sync-token", journal: transactionJournal, protocolJournal,
     toProtocolOperation: async () => operation,
@@ -1074,10 +1063,11 @@ test("WebDAV does not roll back a move when protocol journal directory sync fail
   assert.equal(await fsp.readFile(path.join(root, "destination.txt"), "utf8"), "committed despite fsync error");
   assert.deepEqual(protocolJournal.pending().map((item) => item.operationId), ["fsync-protocol-op"]);
   assert.equal(transactionJournal.pending()[0].phase, "source-moved");
-  const reopenedProtocolJournal = await new SyncJournal(protocolPath).open();
-  assert.deepEqual(reopenedProtocolJournal.pending().map((item) => item.operationId), ["fsync-protocol-op"]);
 
   await bridge.stop();
+  await fsp.rm(protocolPath, { force: true });
+  const reopenedProtocolJournal = await new SyncJournal(protocolPath).open();
+  assert.deepEqual(reopenedProtocolJournal.pending(), []);
   const recoveredTransactionJournal = await new SyncJournal(transactionPath).open();
   const recoveredBridge = new LocalSyncWebDavBridge({
     rootDir: root, token: "webdav-journal-sync-token", journal: recoveredTransactionJournal,
@@ -1087,6 +1077,9 @@ test("WebDAV does not roll back a move when protocol journal directory sync fail
   t.after(async () => { await recoveredBridge.stop(); });
   assert.deepEqual(await recoveredTransactionJournal.recover(), []);
   assert.deepEqual(reopenedProtocolJournal.pending().map((item) => item.operationId), ["fsync-protocol-op"]);
+  const recovered = reopenedProtocolJournal.pending()[0];
+  const recoveredPayload = protocol.decryptPayload(recovered, key);
+  assert.equal((protocol.decodeMovePayload(recoveredPayload, key) || recoveredPayload).toString("utf8"), "committed despite fsync error");
 });
 
 test("WebDAV recovery translates a source-moved transaction after a crash before enqueue", async (t) => {
@@ -1117,6 +1110,34 @@ test("WebDAV recovery translates a source-moved transaction after a crash before
   assert.deepEqual(protocolJournal.pending().map((item) => item.operationId), pending.map((item) => item.operationId));
   await bridge.stop();
   t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
+});
+
+test("WebDAV recovery recreates an outbox entry when protocol-queued survived without it", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-recover-missing-outbox-"));
+  const root = path.join(dir, "root");
+  await fsp.mkdir(root, { recursive: true });
+  await fsp.writeFile(path.join(root, "destination.txt"), "recovered after directory sync loss");
+  const key = crypto.randomBytes(32);
+  const protocolJournal = await new SyncJournal(path.join(dir, "protocol-journal.json")).open();
+  const transactionJournal = await new SyncJournal(path.join(dir, "webdav-journal.json")).open();
+  await transactionJournal.enqueue({
+    operationId: "missing-outbox-move", kind: "move", journalType: "webdav-mutation",
+    source: "/source.txt", destination: "/destination.txt", trash: null, phase: "protocol-queued",
+  });
+  const adapter = { async push() { return { status: 201 }; }, async list() { return []; } };
+  const engine = await new SyncEngine({ rootDir: root, journal: protocolJournal, adapter, deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key }).open();
+  engine.snapshot.files["source.txt"] = { objectId: "missing-outbox-object", fileId: "missing-outbox-file", revision: { counter: 1, deviceId: "device-a" }, hash: crypto.createHash("sha256").update("recovered after directory sync loss").digest("hex"), deleted: false, directory: false };
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root, token: "webdav-missing-outbox-token", journal: transactionJournal, protocolJournal, toProtocolOperation: (event) => engine.translateWebDavMutation(event) });
+  await bridge.start();
+  t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
+  const pending = protocolJournal.pending();
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].operation, "move");
+  assert.equal(pending[0].metadata.sourcePath, "source.txt");
+  assert.equal(pending[0].metadata.path, "destination.txt");
+  const decoded = protocol.decodeMovePayload(protocol.decryptPayload(pending[0], key), key);
+  assert.equal(decoded.toString("utf8"), "recovered after directory sync loss");
+  assert.deepEqual(await transactionJournal.recover(), []);
 });
 
 test("WebDAV recovery deduplicates a batch after the protocol-queued phase write fails", async (t) => {

@@ -72,7 +72,7 @@ async function readContainedFile(rootDir, relativePath, expectedStats = null) {
     fail("Sync file must be a regular file with a stable identity", "unsafe_path");
   }
 
-  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
   const handle = await fsp.open(target, flags);
   try {
     const opened = await handle.stat({ bigint: true });
@@ -544,25 +544,11 @@ class SyncEngine {
           throw new SyncConflictError(result);
         }
         if (operation.operation === "move" || operation.operation === "delete") {
-          let hash;
-          if (operation.operation === "move") {
-            const movedPath = await contained(this.rootDir, operation.metadata.path, true);
-            if (await exists(movedPath)) {
-              const movedStats = await fsp.lstat(movedPath, { bigint: true });
-              if (movedStats.isFile()) hash = crypto.createHash("sha256").update(await readContainedFile(this.rootDir, operation.metadata.path, movedStats)).digest("hex");
-              else if (movedStats.isDirectory()) hash = crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex");
-            }
-          }
+          const hash = operation.operation === "move" ? await this.hashPendingPayload(operation) : undefined;
           this.rememberOperation(operation, hash);
           await durableJson(this.snapshotPath, this.snapshot);
         } else {
-          const target = await contained(this.rootDir, operation.metadata.path, true);
-          let hash;
-          if (operation.metadata.contentType === "inode/directory") hash = crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex");
-          else if (await exists(target)) {
-            const targetStats = await fsp.lstat(target, { bigint: true });
-            if (targetStats.isFile()) hash = crypto.createHash("sha256").update(await readContainedFile(this.rootDir, operation.metadata.path, targetStats)).digest("hex");
-          }
+          const hash = await this.hashPendingPayload(operation);
           this.rememberOperation(operation, hash);
           await durableJson(this.snapshotPath, this.snapshot);
         }
@@ -581,6 +567,15 @@ class SyncEngine {
         throw error;
       }
     }
+  }
+
+  async hashPendingPayload(operation) {
+    const key = await this.keyFor(operation);
+    const decrypted = protocol.decryptPayload(operation, key);
+    const content = operation.operation === "move"
+      ? protocol.decodeMovePayload(decrypted, key) || decrypted
+      : decrypted;
+    return crypto.createHash("sha256").update(content).digest("hex");
   }
 
   async stageExisting(target) {

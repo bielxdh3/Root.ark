@@ -1,8 +1,10 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const { execFileSync } = require("node:child_process");
 const crypto = require("node:crypto");
 const fsp = require("node:fs/promises");
+const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
@@ -59,6 +61,122 @@ test("Phase 16 engine reconciles, encrypts, pulls, restarts, and stays ciphertex
   assert.equal((await (await engine(rootA, adapter, key)).syncOnce()).pushed >= 1, true);
   assert.equal((await (await engine(rootB, adapter, key, { deviceId: "device-b" })).syncOnce()).pulled >= 1, true);
   assert.equal(await fsp.readFile(path.join(rootB, "offline.txt"), "utf8"), "reconnect");
+});
+
+test("successful sync commits the payload hash captured before push", { timeout: 30_000 }, async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-push-snapshot-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+
+  async function exercise(root, prepare) {
+    await fsp.mkdir(root, { recursive: true });
+    const accepted = [];
+    let enterPush;
+    let releasePush;
+    const entered = new Promise((resolve) => { enterPush = resolve; });
+    const blocked = new Promise((resolve) => { releasePush = resolve; });
+    let blockFirstPush = true;
+    const adapter = {
+      async push(operation) {
+        const decrypted = protocol.decryptPayload(operation, key);
+        const plaintext = operation.operation === "move"
+          ? protocol.decodeMovePayload(decrypted, key) || decrypted
+          : decrypted;
+        accepted.push({ operation, plaintext: Buffer.from(plaintext) });
+        if (blockFirstPush) {
+          blockFirstPush = false;
+          enterPush();
+          await blocked;
+        }
+        return { status: 201 };
+      },
+      async list() { return []; },
+    };
+    const sync = await engine(root, adapter, key);
+    await prepare(sync, root);
+    const firstSync = sync.syncOnce();
+    await entered;
+    await fsp.writeFile(path.join(root, "target.txt"), "D2 after push began");
+    releasePush();
+    await firstSync;
+    assert.equal(accepted[0].plaintext.toString("utf8"), "D1 captured before push");
+
+    const next = await sync.syncOnce();
+    assert.equal(next.pushed, 1);
+    assert.equal(accepted[1].plaintext.toString("utf8"), "D2 after push began");
+    return accepted;
+  }
+
+  await t.test("create/update payload", async () => {
+    const root = path.join(dir, "ordinary");
+    await fsp.mkdir(root, { recursive: true });
+    await fsp.writeFile(path.join(root, "target.txt"), "D1 captured before push");
+    const accepted = await exercise(root, async () => {});
+    assert.equal(accepted[0].operation.operation, "create");
+    assert.equal(accepted[1].operation.operation, "update");
+  });
+
+  await t.test("MOVE payload", async () => {
+    const root = path.join(dir, "move");
+    const target = path.join(root, "target.txt");
+    await fsp.mkdir(root, { recursive: true });
+    await fsp.writeFile(target, "D1 captured before push");
+    const accepted = await exercise(root, async (sync) => {
+      sync.snapshot.files["source.txt"] = {
+        objectId: "move-object", fileId: "move-file", versionId: "move-v1",
+        revision: { counter: 1, deviceId: "device-a" }, hash: crypto.createHash("sha256").update("D1 captured before push").digest("hex"),
+        deleted: false, directory: false,
+      };
+      await sync.enqueueChange({
+        operation: "move", objectId: "move-object", fileId: "move-file", versionId: "move-v2",
+        baseRevision: { counter: 1, deviceId: "device-a" }, revision: { counter: 2, deviceId: "device-a" },
+        metadata: { path: "target.txt", sourcePath: "source.txt" },
+      });
+    });
+    assert.equal(accepted[0].operation.operation, "move");
+    assert.equal(accepted[1].operation.operation, "update");
+  });
+});
+
+test("sync does not block when a checked file is replaced by a FIFO", { skip: process.platform === "win32", timeout: 30_000 }, async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-sync-fifo-"));
+  const root = path.join(dir, "root");
+  const target = path.join(root, "document.txt");
+  const fifo = path.join(root, "replacement.fifo");
+  const key = crypto.randomBytes(32);
+  await fsp.mkdir(root, { recursive: true });
+  await fsp.writeFile(target, "checked regular file");
+  execFileSync("mkfifo", [fifo]);
+  const sync = await engine(root, { async push() { return { status: 201 }; }, async list() { return []; } }, key);
+  const originalOpen = fsp.open;
+  let swapped = false;
+  fsp.open = async (filePath, flags, ...args) => {
+    if (!swapped && path.resolve(String(filePath)) === target) {
+      swapped = true;
+      await fsp.rename(target, `${target}.original`);
+      await fsp.rename(fifo, target);
+    }
+    return originalOpen(filePath, flags, ...args);
+  };
+  try {
+    let completed = false;
+    const read = sync.reconcileLocal().then((value) => { completed = true; return value; }, (error) => { completed = true; throw error; });
+    const settledEarly = await Promise.race([
+      read.then(() => true, () => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 250)),
+    ]);
+    if (!settledEarly) {
+      const unblock = await originalOpen(target, fs.constants.O_WRONLY);
+      await unblock.close();
+    }
+    await assert.rejects(read, { code: "unsafe_path" });
+    assert.equal(swapped, true);
+    assert.equal(completed, true);
+    assert.equal(settledEarly, true, "opening a raced FIFO must return without waiting for a writer");
+  } finally {
+    fsp.open = originalOpen;
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("Phase 16 engine applies authenticated move/delete and rejects wrong epoch or key", async (t) => {

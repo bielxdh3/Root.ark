@@ -135,6 +135,8 @@ class LocalSyncWebDavBridge {
     if (!this.journal?.recover) return;
     for (const operation of await this.journal.recover()) {
       if (operation.phase === "protocol-queued") {
+        if (!this.protocolJournal) continue;
+        await this.enqueueProtocol(operation);
         if (this.journal.markSeen) await this.journal.markSeen(operation.operationId);
         continue;
       }
@@ -195,7 +197,9 @@ class LocalSyncWebDavBridge {
         await this.protocolJournal.enqueue(translated);
       }
     } catch (error) {
-      if (error.journalCommitted) return true;
+      if (error.journalCommitted) {
+        error.protocolQueueUncertain = true;
+      }
       throw error;
     }
     return true;
@@ -311,6 +315,7 @@ class LocalSyncWebDavBridge {
           try { await this.markJournalSeen(operationId); } catch (error) { if (!protocolQueued) throw error; }
         } catch (error) {
           await fsp.rm(temporary, { force: true }).catch(() => {});
+          if (error.protocolQueueUncertain) return writeResponse(res, existing ? 204 : 201);
           if (protocolQueued) return writeResponse(res, existing ? 204 : 201);
           if (installed) await fsp.rm(target, { recursive: true, force: true }).catch(() => {});
           if (staged) await fsp.rename(backup, target).catch(() => {});
@@ -399,6 +404,7 @@ class LocalSyncWebDavBridge {
       if (protocolQueued) await this.updateJournal(operationId, { phase: "protocol-queued" });
       try { await this.markJournalSeen(operationId); } catch (error) { if (!protocolQueued) throw error; }
     } catch (error) {
+      if (error.protocolQueueUncertain) return writeResponse(res, existingStats ? 204 : 201);
       if (protocolQueued) return writeResponse(res, existingStats ? 204 : 201);
       if (moved) {
         await fsp.rename(destinationTarget, source).catch(() => {});
@@ -429,6 +435,7 @@ class LocalSyncWebDavBridge {
       if (protocolQueued) await this.updateJournal(operation.operationId, { phase: "protocol-queued" });
       try { await this.markJournalSeen(operation.operationId); } catch (error) { if (!protocolQueued) throw error; }
     } catch (error) {
+      if (error.protocolQueueUncertain) return writeResponse(res, 204);
       if (protocolQueued) return writeResponse(res, 204);
       await fsp.rename(trashTarget, target).catch(() => {});
       throw error;
