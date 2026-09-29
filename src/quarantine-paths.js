@@ -5,6 +5,30 @@ function getUploadQuarantineDir() {
   return path.resolve(process.env.UPLOAD_QUARANTINE_DIR || "./data/quarantine");
 }
 
+function pathVariants(value) {
+  const resolved = path.resolve(value);
+  const variants = new Map([[process.platform === "win32" ? resolved.toLowerCase() : resolved, resolved]]);
+  try {
+    const real = fs.realpathSync.native ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved);
+    const key = process.platform === "win32" ? real.toLowerCase() : real;
+    if (!variants.has(key)) variants.set(key, real);
+  } catch {}
+  return [...variants.values()];
+}
+
+function isPathWithin(basePath, targetPath) {
+  const base = path.resolve(basePath);
+  const target = path.resolve(targetPath);
+  const comparableBase = process.platform === "win32" ? base.toLowerCase() : base;
+  const comparableTarget = process.platform === "win32" ? target.toLowerCase() : target;
+  const relative = path.relative(comparableBase, comparableTarget);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function quarantineDirContainsUploads(uploadsDir, quarantineDir) {
+  return pathVariants(quarantineDir).some((quarantinePath) => pathVariants(uploadsDir).some((uploadsPath) => isPathWithin(quarantinePath, uploadsPath)));
+}
+
 function isSensitiveQuarantineItem(item) {
   const sensitiveName = (value) => {
     if (typeof value !== "string" || !value) return false;
@@ -103,4 +127,4 @@ function validateQuarantinePayloads(items, quarantineDir) {
   return payloads;
 }
 
-module.exports = { getUploadQuarantineDir, isSensitiveQuarantineItem, readQuarantineMetadata, readQuarantineRegularFile, validateQuarantinePayloads };
+module.exports = { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, readQuarantineRegularFile, validateQuarantinePayloads };

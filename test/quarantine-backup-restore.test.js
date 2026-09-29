@@ -156,6 +156,68 @@ test("quarantine startup recovery is serialized with cross-process restores", { 
   }
 });
 
+test("backup and restore reject quarantine directories that equal or contain uploads", { timeout: 30_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-overlap-runtime-"));
+  const externalQuarantine = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-overlap-external-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const uploadsDir = path.join(process.cwd(), "uploads");
+      const runtimeRoot = process.cwd();
+      const metadataPath = path.join(process.cwd(), "data", "quarantine.json");
+      fs.mkdirSync(uploadsDir, { recursive: true });
+      fs.mkdirSync(path.dirname(metadataPath), { recursive: true });
+      fs.writeFileSync(path.join(uploadsDir, "ordinary.txt"), "before restore");
+      fs.writeFileSync(metadataPath, JSON.stringify({ items: [] }));
+      (async () => {
+        process.env.UPLOAD_QUARANTINE_DIR = process.env.EXTERNAL_QUARANTINE_DIR;
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        const preRestoreCountBefore = backupRepository.listBackups().filter((item) => item.type === "pre-restore").length;
+        for (const overlapPath of [uploadsDir, runtimeRoot]) {
+          process.env.UPLOAD_QUARANTINE_DIR = overlapPath;
+          await assert.rejects(
+            () => backupService.createBackup({ createdBy: "fixture" }),
+            /quarantine directory equals or contains uploads/,
+          );
+          await assert.rejects(
+            () => restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" }),
+            /quarantine directory equals or contains uploads/,
+          );
+          assert.equal(backupRepository.listBackups().filter((item) => item.type === "pre-restore").length, preRestoreCountBefore);
+          assert.equal(fs.readFileSync(path.join(uploadsDir, "ordinary.txt"), "utf8"), "before restore");
+        }
+        const alias = path.join(runtimeRoot, "uploads-alias");
+        try {
+          fs.symlinkSync(uploadsDir, alias, process.platform === "win32" ? "junction" : "dir");
+          process.env.UPLOAD_QUARANTINE_DIR = alias;
+          await assert.rejects(
+            () => backupService.createBackup({ createdBy: "fixture" }),
+            /quarantine directory equals or contains uploads/,
+          );
+        } catch (error) {
+          if (!["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP"].includes(error.code)) throw error;
+        }
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: externalQuarantine, EXTERNAL_QUARANTINE_DIR: externalQuarantine, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+    fs.rmSync(externalQuarantine, { recursive: true, force: true });
+  }
+});
+
 test("quarantine backup and restore preserve external payloads and reject incomplete archives", { timeout: 30_000 }, () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-restore-runtime-"));
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-payloads-"));

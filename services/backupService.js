@@ -8,7 +8,7 @@ const backupRepository = require("../repositories/backupRepository");
 const { getDatabasePath, getDb, isDbEnabled } = require("../db");
 const { resolveRuntimePath } = require("../src/runtime-paths");
 const { attestCiphertextOnlyFile } = require("../src/services/deploymentResilience");
-const { getUploadQuarantineDir, isSensitiveQuarantineItem, readQuarantineMetadata, validateQuarantinePayloads } = require("../src/quarantine-paths");
+const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, validateQuarantinePayloads } = require("../src/quarantine-paths");
 
 const BACKUPS_DIR = resolveRuntimePath("data", "backups");
 const LOCK_FILE = path.join(BACKUPS_DIR, ".backup.lock");
@@ -272,6 +272,9 @@ async function collectBackupFiles(options = {}) {
   const includeTemp = envBool("BACKUP_INCLUDE_TEMP", false);
   const includePending = envBool("BACKUP_INCLUDE_PENDING", false);
   const quarantineDir = getUploadQuarantineDir();
+  if (quarantineDirContainsUploads(resolveRuntimePath("uploads"), quarantineDir)) {
+    throw new Error("Backup is not supported when the quarantine directory equals or contains uploads");
+  }
   const quarantineMetadata = readQuarantineMetadata(resolveRuntimePath("data", "quarantine.json"));
   const quarantinePayloads = quarantineMetadata ? validateQuarantinePayloads(quarantineMetadata.items, quarantineDir) : [];
   const quarantineRootInfo = quarantinePayloads.length ? archiveRootInfo(quarantineDir, { allowRootSymlink: true }) : null;

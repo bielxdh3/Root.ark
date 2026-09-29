@@ -8,7 +8,7 @@ const { resolveRuntimePath } = require("../src/runtime-paths");
 const backupRepository = require("../repositories/backupRepository");
 const backupService = require("./backupService");
 const { attestCiphertextOnlyArchive } = require("../src/services/deploymentResilience");
-const { getUploadQuarantineDir, isSensitiveQuarantineItem, readQuarantineMetadata, readQuarantineRegularFile, validateQuarantinePayloads } = require("../src/quarantine-paths");
+const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, readQuarantineRegularFile, validateQuarantinePayloads } = require("../src/quarantine-paths");
 
 const RESTORE_TMP_DIR = path.join(backupService.BACKUPS_DIR, ".restore-tmp");
 const RESTORE_SYNC_LOCK_DIR = resolveRuntimePath("data", "restore-sync-locks");
@@ -327,6 +327,9 @@ function nestedPathDepth(basePath, targetPath) {
 function assertSafeQuarantineRestoreLocation() {
   const uploads = resolveRuntimePath("uploads");
   const quarantine = getUploadQuarantineDir();
+  if (quarantineDirContainsUploads(uploads, quarantine)) {
+    throw new Error("Restore is not supported when the quarantine directory equals or contains uploads");
+  }
   if (nestedPathDepth(uploads, quarantine) > 1) {
     throw new Error("Restore is not supported when the quarantine directory is nested below an uploads subdirectory; configure it outside uploads or as a direct child of uploads");
   }
