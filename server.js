@@ -38,6 +38,7 @@ const auditRepository = require("./repositories/auditRepository");
 const actionHistoryRepository = require("./repositories/actionHistoryRepository");
 const backupService = require("./services/backupService");
 const restoreService = require("./services/restoreService");
+const { getUploadQuarantineDir } = require("./src/quarantine-paths");
 const trashRepository = require("./repositories/trashRepository");
 const trashService = require("./services/trashService");
 const { createCloudStorage } = require("./services/cloudStorage");
@@ -125,7 +126,7 @@ const UPLOAD_SCAN_PROVIDER = String(process.env.UPLOAD_SCAN_PROVIDER || "clamav"
 const CLAMAV_HOST = process.env.CLAMAV_HOST || "127.0.0.1";
 const CLAMAV_PORT = Number(process.env.CLAMAV_PORT || 3310);
 const UPLOAD_BLOCK_EXECUTABLES = parseEnvBoolean(process.env.UPLOAD_BLOCK_EXECUTABLES, true);
-const UPLOAD_QUARANTINE_DIR = path.resolve(process.env.UPLOAD_QUARANTINE_DIR || "./data/quarantine");
+const UPLOAD_QUARANTINE_DIR = getUploadQuarantineDir();
 const UPLOAD_FAIL_CLOSED = parseEnvBoolean(process.env.UPLOAD_FAIL_CLOSED, false);
 const UPLOAD_SUSPICIOUS_EXTENSIONS = new Set(
   String(process.env.UPLOAD_SUSPICIOUS_EXTENSIONS || ".exe,.bat,.cmd,.scr,.msi,.ps1,.vbs,.jar,.com")
@@ -4385,10 +4386,10 @@ function initData() {
     if (!fs.existsSync(ENCRYPTED_FILES_FILE)) saveEncryptedFiles({});
     if (!fs.existsSync(ANALYTICS_FILE)) saveAnalytics(getDefaultAnalytics());
     if (!fs.existsSync(AUDIT_LOGS_FILE)) saveAuditLogs(getDefaultAuditLogs());
-    if (!fs.existsSync(QUARANTINE_FILE)) saveQuarantine(getDefaultQuarantine());
+    if (!fs.existsSync(QUARANTINE_FILE) && !restoreService.hasPendingQuarantineRestore()) saveQuarantine(getDefaultQuarantine());
   }
 
-  if (!fs.existsSync(QUARANTINE_FILE)) saveQuarantine(getDefaultQuarantine());
+  if (!fs.existsSync(QUARANTINE_FILE) && !restoreService.hasPendingQuarantineRestore()) saveQuarantine(getDefaultQuarantine());
 
   for (const folder of loadFolders()) {
     ensureFolderDirectories(folder.id);
@@ -7962,6 +7963,8 @@ app.put("/move", authenticate, (req, res) => {
 });
 
 initData();
+restoreService.recoverQuarantineRestore();
+if (!fs.existsSync(QUARANTINE_FILE)) saveQuarantine(getDefaultQuarantine());
 scheduleAutomaticBackups({ cron, createBackup: backupService.createBackup, auditLog, onInvalid: console.error });
 cleanupExpiredTemporaryItems();
 cleanupExpiredTrashItems();
