@@ -167,20 +167,25 @@ test("quarantine backup and restore preserve external payloads and reject incomp
       const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
       const payloadName = "Blocked-Upload.Bin";
       const secretPayloadName = "credentials.pem";
+      const envPayloadNames = [".env.local", ".env.production", ".env.development"];
       const payloadPath = path.join(process.env.UPLOAD_QUARANTINE_DIR, payloadName);
       const secretPayloadPath = path.join(process.env.UPLOAD_QUARANTINE_DIR, secretPayloadName);
+      const envPayloadPaths = envPayloadNames.map((name) => path.join(process.env.UPLOAD_QUARANTINE_DIR, name));
       const metadataPath = path.join(process.cwd(), "data", "quarantine.json");
       const payloadBytes = Buffer.from("disposable quarantined bytes");
       const secretPayloadBytes = Buffer.from("sensitive key material");
+      const envPayloadBytes = envPayloadNames.map((name) => Buffer.from("sensitive " + name));
       const metadata = { items: [
         { id: "quarantine-entry", storedQuarantineFilename: payloadName, originalFilename: "untrusted.bin" },
         { id: "sensitive-quarantine-entry", storedQuarantineFilename: secretPayloadName, originalFilename: "untrusted.pem" },
+        ...envPayloadNames.map((name, index) => ({ id: "sensitive-" + name, storedQuarantineFilename: name, originalFilename: "untrusted-" + index + ".bin" })),
       ] };
       const safeMetadata = { items: [metadata.items[0]] };
       fs.mkdirSync(path.dirname(metadataPath), { recursive: true });
       fs.writeFileSync(metadataPath, JSON.stringify(metadata));
       fs.writeFileSync(payloadPath, payloadBytes);
       fs.writeFileSync(secretPayloadPath, secretPayloadBytes);
+      envPayloadPaths.forEach((filePath, index) => fs.writeFileSync(filePath, envPayloadBytes[index]));
       fs.writeFileSync(path.join(process.cwd(), "data", "runtime-only.json"), "before");
       (async () => {
         const backup = await backupService.createBackup({ createdBy: "fixture" });
@@ -191,6 +196,7 @@ test("quarantine backup and restore preserve external payloads and reject incomp
         assert.ok(archivedPayload);
         assert.deepEqual(await archivedPayload.buffer(), payloadBytes);
         assert.equal(entries.includes("data/quarantine/" + secretPayloadName), false);
+        for (const name of envPayloadNames) assert.equal(entries.includes("data/quarantine/" + name), false);
         const archivedMetadata = JSON.parse(await zip.files.find((entry) => entry.path === "data/quarantine.json").buffer());
         const archivedManifest = JSON.parse((await zip.files.find((entry) => entry.path === "backup-manifest.json").buffer()).toString("utf8"));
         assert.equal(archivedManifest.quarantine_format_version, 1);
@@ -199,14 +205,15 @@ test("quarantine backup and restore preserve external payloads and reject incomp
         const changedPayloadName = "changed-upload.bin";
         fs.rmSync(payloadPath);
         fs.writeFileSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, changedPayloadName), "mutated");
-        const changedMetadata = { items: [{ id: "changed", storedQuarantineFilename: changedPayloadName }, metadata.items[1]] };
+        const changedMetadata = { items: [{ id: "changed", storedQuarantineFilename: changedPayloadName }, ...metadata.items.slice(1)] };
         fs.writeFileSync(metadataPath, JSON.stringify(changedMetadata));
         fs.writeFileSync(path.join(process.cwd(), "data", "runtime-only.json"), "mutated");
         await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" });
         assert.deepEqual(fs.readFileSync(payloadPath), payloadBytes);
-        assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), { items: [metadata.items[0], metadata.items[1]] });
+        assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), { items: [metadata.items[0], ...metadata.items.slice(1)] });
         assert.equal(fs.existsSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, changedPayloadName)), false);
         assert.deepEqual(fs.readFileSync(secretPayloadPath), secretPayloadBytes);
+        envPayloadPaths.forEach((filePath, index) => assert.deepEqual(fs.readFileSync(filePath), envPayloadBytes[index]));
         assert.equal(fs.readFileSync(path.join(process.cwd(), "data", "runtime-only.json"), "utf8"), "before");
 
         const conflictingMetadata = { items: [{ id: "changed", storedQuarantineFilename: changedPayloadName }, metadata.items[1]] };

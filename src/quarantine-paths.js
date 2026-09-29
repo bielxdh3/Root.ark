@@ -9,7 +9,7 @@ function isSensitiveQuarantineItem(item) {
   const sensitiveName = (value) => {
     if (typeof value !== "string" || !value) return false;
     const base = value.replace(/\\/g, "/").split("/").at(-1).toLowerCase();
-    return base === ".env" || base.endsWith(".env") || base.includes("credentials") || base.includes("service-account")
+    return base === ".env" || base.startsWith(".env.") || base.endsWith(".env") || base.includes("credentials") || base.includes("service-account")
       || base.endsWith(".key") || base.endsWith(".pem") || base.endsWith(".p12") || base === "server-master.key";
   };
   return sensitiveName(item?.storedQuarantineFilename) || sensitiveName(item?.originalFilename);

@@ -78,7 +78,7 @@ function isSensitivePath(relativePath) {
   if (normalized.startsWith("node_modules/") || normalized === "node_modules") return true;
   if (normalized.startsWith("data/backups/") || normalized === "data/backups") return true;
   if (normalized.startsWith("temp/.chunks/") || normalized.startsWith("temp/.incoming/")) return true;
-  if (base === ".env" || base.endsWith(".env")) return true;
+  if (base === ".env" || base.startsWith(".env.") || base.endsWith(".env")) return true;
   if (base.includes("credentials") || base.includes("service-account")) return true;
   if (base.endsWith(".key") || base.endsWith(".pem") || base.endsWith(".p12")) return true;
   if (base === "server-master.key") return true;
