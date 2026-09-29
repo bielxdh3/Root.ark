@@ -289,15 +289,111 @@ async function extractArchive(zip, targetDir) {
   }
 }
 
-function copyDirectoryContents(source, destination) {
+function isPathWithin(basePath, targetPath) {
+  const base = path.resolve(basePath);
+  const target = path.resolve(targetPath);
+  const comparableBase = process.platform === "win32" ? base.toLowerCase() : base;
+  const comparableTarget = process.platform === "win32" ? target.toLowerCase() : target;
+  const relative = path.relative(comparableBase, comparableTarget);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function pathVariants(value) {
+  const resolved = path.resolve(value);
+  const variants = new Map();
+  const add = (candidate) => {
+    const normalized = path.resolve(candidate);
+    const key = process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    if (!variants.has(key)) variants.set(key, normalized);
+  };
+  add(resolved);
+  try { add(fs.realpathSync.native ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved)); } catch {}
+  return [...variants.values()];
+}
+
+function isPathWithinAliases(basePath, targetPath) {
+  return pathVariants(basePath).some((base) => pathVariants(targetPath).some((target) => isPathWithin(base, target)));
+}
+
+function samePathComponent(left, right) {
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
+function hasSymlinkInPath(pathname) {
+  const absolute = path.resolve(pathname);
+  const root = path.parse(absolute).root;
+  let current = root;
+  for (const component of absolute.slice(root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    let stat;
+    try { stat = fs.lstatSync(current); } catch (error) {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) return true;
+  }
+  return false;
+}
+
+function clearDirectoryPreservingQuarantine(destination, quarantinePath) {
+  let rootStat;
+  try { rootStat = fs.lstatSync(destination); } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return;
+
+  let relative = null;
+  try {
+    const destinationReal = fs.realpathSync.native ? fs.realpathSync.native(destination) : fs.realpathSync(destination);
+    const quarantineReal = fs.realpathSync.native ? fs.realpathSync.native(quarantinePath) : fs.realpathSync(quarantinePath);
+    if (isPathWithin(destinationReal, quarantineReal)) relative = path.relative(destinationReal, quarantineReal);
+  } catch {}
+  if (relative === null) {
+    for (const destinationPath of pathVariants(destination)) {
+      const nestedVariant = pathVariants(quarantinePath).find((variant) => isPathWithin(destinationPath, variant));
+      if (nestedVariant) {
+        const base = process.platform === "win32" ? destinationPath.toLowerCase() : destinationPath;
+        const target = process.platform === "win32" ? nestedVariant.toLowerCase() : nestedVariant;
+        relative = path.relative(base, target);
+        break;
+      }
+    }
+  }
+  if (relative === null) relative = path.relative(path.resolve(destination), path.resolve(quarantinePath));
+  const remaining = relative.split(path.sep).filter(Boolean);
+  if (!remaining.length) return;
+  const clear = (currentDirectory, components) => {
+    for (const entry of fs.readdirSync(currentDirectory, { withFileTypes: true })) {
+      const entryPath = path.join(currentDirectory, entry.name);
+      if (components.length && samePathComponent(entry.name, components[0])) {
+        if (components.length === 1 || entry.isSymbolicLink() || !entry.isDirectory()) continue;
+        clear(entryPath, components.slice(1));
+        continue;
+      }
+      fs.rmSync(entryPath, { recursive: true, force: true });
+    }
+  };
+  clear(destination, remaining);
+}
+
+function copyDirectoryContents(source, destination, protectedPath = null) {
   if (!fs.existsSync(source)) return;
   fs.mkdirSync(destination, { recursive: true });
   for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
     const sourcePath = path.join(source, entry.name);
     const destinationPath = path.join(destination, entry.name);
+    if (protectedPath && isPathWithinAliases(protectedPath, destinationPath)) continue;
+    if (protectedPath && isPathWithinAliases(destinationPath, protectedPath)) {
+      if (entry.isDirectory() && !hasSymlinkInPath(destinationPath)) {
+        fs.mkdirSync(destinationPath, { recursive: true });
+        copyDirectoryContents(sourcePath, destinationPath, protectedPath);
+      }
+      continue;
+    }
     if (entry.isDirectory()) {
       fs.rmSync(destinationPath, { recursive: true, force: true });
-      copyDirectoryContents(sourcePath, destinationPath);
+      copyDirectoryContents(sourcePath, destinationPath, protectedPath);
     } else if (entry.isFile()) {
       fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
       fs.copyFileSync(sourcePath, destinationPath);
@@ -327,6 +423,18 @@ function restoreUploads(extractedRoot) {
   if (!fs.existsSync(extractedUploads)) return;
 
   const destinationUploads = resolveRuntimePath("uploads");
+  const quarantineDir = path.resolve(getUploadQuarantineDir());
+  const uploadsContainQuarantine = isPathWithinAliases(destinationUploads, quarantineDir);
+  const quarantineContainsUploads = isPathWithinAliases(quarantineDir, destinationUploads);
+  if (uploadsContainQuarantine && !quarantineContainsUploads) {
+    clearDirectoryPreservingQuarantine(destinationUploads, quarantineDir);
+    const uploadsStat = (() => { try { return fs.lstatSync(destinationUploads); } catch { return null; } })();
+    if (uploadsStat?.isSymbolicLink()) return;
+    copyDirectoryContents(extractedUploads, destinationUploads, quarantineDir);
+    return;
+  }
+  if (quarantineContainsUploads) return;
+
   fs.rmSync(destinationUploads, { recursive: true, force: true });
   copyDirectoryContents(extractedUploads, destinationUploads);
 }

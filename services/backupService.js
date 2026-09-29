@@ -95,22 +95,30 @@ function isPathWithin(basePath, targetPath) {
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
+function pathIdentityKey(value) {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function fileIdentity(stat) {
+  return stat?.isFile?.() && Number(stat.ino) ? `${stat.dev}:${stat.ino}` : null;
+}
+
 function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
   if (!fs.existsSync(rootPath)) return [];
   const rootAbsolute = path.resolve(rootPath);
-  const rootReal = fs.realpathSync(rootAbsolute);
+  if (fs.lstatSync(rootAbsolute).isSymbolicLink()) return [];
   const excludedPaths = (options.excludePaths || []).filter(Boolean).map((excludedPath) => {
     const absolute = path.resolve(excludedPath);
     return { absolute, real: fs.existsSync(absolute) ? fs.realpathSync(absolute) : null };
-  }).filter((excluded) => isPathWithin(excluded.absolute, rootAbsolute)
-    || isPathWithin(rootAbsolute, excluded.absolute)
-    || (excluded.real && (isPathWithin(excluded.real, rootReal) || isPathWithin(rootReal, excluded.real))));
+  });
   const isExcluded = (candidatePath) => {
     if (!excludedPaths.length) return false;
     const absolute = path.resolve(candidatePath);
     if (excludedPaths.some((excluded) => isPathWithin(excluded.absolute, absolute))) return true;
     if (!excludedPaths.some((excluded) => excluded.real)) return false;
-    const real = fs.realpathSync(absolute);
+    let real;
+    try { real = fs.realpathSync(absolute); } catch { return false; }
     return excludedPaths.some((excluded) => excluded.real && isPathWithin(excluded.real, real));
   };
   if (isExcluded(rootAbsolute)) return [];
@@ -119,7 +127,8 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
   while (stack.length) {
     const current = stack.pop();
     if (isExcluded(current.absolutePath)) continue;
-    const stat = fs.statSync(current.absolutePath);
+    const stat = fs.lstatSync(current.absolutePath);
+    if (stat.isSymbolicLink()) continue;
     if (stat.isDirectory()) {
       for (const name of fs.readdirSync(current.absolutePath)) {
         const absolutePath = path.join(current.absolutePath, name);
@@ -131,6 +140,8 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
       continue;
     }
     if (!stat.isFile()) continue;
+    const identity = fileIdentity(stat);
+    if (identity && options.excludeFileIdentities?.has(identity)) continue;
     if (options.maxBytes && stat.size > options.maxBytes) continue;
     files.push({ absolutePath: current.absolutePath, entryPath: normalizeEntryPath(current.entryPath), size: stat.size });
   }
@@ -140,27 +151,47 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
 async function collectBackupFiles(options = {}) {
   const files = [];
   const dataDir = resolveRuntimePath("data");
+  try {
+    if (fs.lstatSync(dataDir).isSymbolicLink()) throw new Error("Backup data directory cannot be a symbolic link");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
   const includeUploads = envBool("BACKUP_INCLUDE_UPLOADS", true);
   const includeTemp = envBool("BACKUP_INCLUDE_TEMP", false);
   const includePending = envBool("BACKUP_INCLUDE_PENDING", false);
   const quarantineDir = getUploadQuarantineDir();
+  const quarantineMetadata = readQuarantineMetadata(resolveRuntimePath("data", "quarantine.json"));
+  const quarantinePayloads = quarantineMetadata ? validateQuarantinePayloads(quarantineMetadata.items, quarantineDir) : [];
+  const quarantinePathIdentities = new Set();
+  const quarantineFileIdentities = new Set();
+  for (const payload of quarantinePayloads) {
+    quarantinePathIdentities.add(pathIdentityKey(payload.absolutePath));
+    try { quarantinePathIdentities.add(pathIdentityKey(fs.realpathSync(payload.absolutePath))); } catch {}
+    const identity = fileIdentity(fs.lstatSync(payload.absolutePath));
+    if (identity) quarantineFileIdentities.add(identity);
+  }
+  const isQuarantinePayloadPath = (candidatePath, stat) => {
+    const identity = fileIdentity(stat);
+    if (identity && quarantineFileIdentities.has(identity)) return true;
+    if (quarantinePathIdentities.has(pathIdentityKey(candidatePath))) return true;
+    try { return quarantinePathIdentities.has(pathIdentityKey(fs.realpathSync(candidatePath))); } catch { return false; }
+  };
 
   for (const name of fs.existsSync(dataDir) ? fs.readdirSync(dataDir) : []) {
     if (name.toLowerCase() === "quarantine.json") continue;
     const absolutePath = path.join(dataDir, name);
     const entryPath = normalizeEntryPath(path.posix.join("data", name));
     if (isSensitivePath(entryPath)) continue;
-    const stat = fs.statSync(absolutePath);
+    const stat = fs.lstatSync(absolutePath);
+    if (stat.isSymbolicLink()) continue;
     if (stat.isFile() && (
       name.endsWith(".json") ||
       name === "README.md"
-    )) {
+    ) && !isQuarantinePayloadPath(absolutePath, stat)) {
       files.push({ absolutePath, entryPath, size: stat.size });
     }
   }
 
-  const quarantineMetadata = readQuarantineMetadata(resolveRuntimePath("data", "quarantine.json"));
-  const quarantinePayloads = quarantineMetadata ? validateQuarantinePayloads(quarantineMetadata.items, quarantineDir) : [];
   if (quarantineMetadata) {
     const safeItems = quarantineMetadata.items.filter((item) => {
       const storedPath = path.posix.join("data", "quarantine", item.storedQuarantineFilename);
@@ -184,11 +215,11 @@ async function collectBackupFiles(options = {}) {
   }
 
   if (includeUploads) {
-    files.push(...collectFilesRecursive(resolveRuntimePath("uploads"), "uploads", { excludePaths: [quarantineDir] }));
+    files.push(...collectFilesRecursive(resolveRuntimePath("uploads"), "uploads", { excludePaths: [quarantineDir], excludeFileIdentities: quarantineFileIdentities }));
   }
 
   if (includeTemp || includePending) {
-    files.push(...collectFilesRecursive(resolveRuntimePath("temp"), "temp", { excludePaths: [quarantineDir] }));
+    files.push(...collectFilesRecursive(resolveRuntimePath("temp"), "temp", { excludePaths: [quarantineDir], excludeFileIdentities: quarantineFileIdentities }));
   }
 
   const syncFile = files.find((file) => file.entryPath === "data/sync-objects.json");

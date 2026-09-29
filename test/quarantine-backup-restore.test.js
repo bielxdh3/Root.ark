@@ -336,6 +336,417 @@ test("quarantine backup excludes prefixed payloads inside included uploads", { t
   }
 });
 
+test("quarantine restore preserves payloads nested under uploads", { timeout: 30_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-nested-restore-runtime-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const uploadsDir = path.join(process.cwd(), "uploads");
+      const quarantineDir = process.env.UPLOAD_QUARANTINE_DIR;
+      const metadataPath = path.join(process.cwd(), "data", "quarantine.json");
+      const archivedName = "archived-safe.bin";
+      const currentName = "current-safe.bin";
+      const sensitiveName = "current-sensitive.bin";
+      const metadata = { items: [
+        { id: "archived", storedQuarantineFilename: archivedName, originalFilename: "document.bin" },
+        { id: "sensitive", storedQuarantineFilename: sensitiveName, originalFilename: ".env.local" },
+      ] };
+      fs.mkdirSync(quarantineDir, { recursive: true });
+      fs.mkdirSync(uploadsDir, { recursive: true });
+      fs.mkdirSync(path.dirname(metadataPath), { recursive: true });
+      fs.writeFileSync(path.join(uploadsDir, "ordinary.txt"), "before restore");
+      fs.writeFileSync(path.join(quarantineDir, archivedName), "archived quarantine payload");
+      fs.writeFileSync(path.join(quarantineDir, sensitiveName), "current sensitive payload");
+      fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+      (async () => {
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        fs.rmSync(path.join(quarantineDir, archivedName));
+        fs.writeFileSync(path.join(quarantineDir, currentName), "current safe payload");
+        fs.writeFileSync(path.join(uploadsDir, "ordinary.txt"), "after backup");
+        const currentMetadata = { items: [
+          { id: "current", storedQuarantineFilename: currentName, originalFilename: "current.bin" },
+          metadata.items[1],
+        ] };
+        fs.writeFileSync(metadataPath, JSON.stringify(currentMetadata));
+        await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" });
+        assert.equal(fs.readFileSync(path.join(uploadsDir, "ordinary.txt"), "utf8"), "before restore");
+        assert.equal(fs.readFileSync(path.join(quarantineDir, archivedName), "utf8"), "archived quarantine payload");
+        assert.equal(fs.readFileSync(path.join(quarantineDir, sensitiveName), "utf8"), "current sensitive payload");
+        assert.equal(fs.existsSync(path.join(quarantineDir, currentName)), false);
+        assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), { items: [metadata.items[0], metadata.items[1]] });
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: path.join(runtime, "uploads", ".quarantine-store"), BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("quarantine restore preserves payloads addressed through a Windows short path", { timeout: 30_000 }, (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows short-path aliases are not available on this platform");
+    return;
+  }
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-shortpath-runtime-"));
+  try {
+    const quarantineDir = path.join(runtime, "uploads", ".quarantine-store");
+    fs.mkdirSync(quarantineDir, { recursive: true });
+    const shortPathResult = spawnSync("cmd.exe", ["/d", "/c", `for %I in ("${quarantineDir}") do @echo %~sI`], { encoding: "utf8" });
+    const shortQuarantineDir = shortPathResult.stdout.trim().split(/\r?\n/).at(-1);
+    if (shortPathResult.status !== 0 || !shortQuarantineDir || shortQuarantineDir.toLowerCase() === quarantineDir.toLowerCase()
+      || !shortQuarantineDir.includes("~")) {
+      t.skip("The runtime volume does not provide an 8.3 short-path alias");
+      return;
+    }
+    assert.equal(fs.realpathSync.native(shortQuarantineDir).toLowerCase(), fs.realpathSync.native(quarantineDir).toLowerCase());
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const uploadsDir = path.join(process.cwd(), "uploads");
+      const quarantineDir = process.env.LONG_QUARANTINE_DIR;
+      const metadataPath = path.join(process.cwd(), "data", "quarantine.json");
+      fs.mkdirSync(uploadsDir, { recursive: true });
+      fs.mkdirSync(path.dirname(metadataPath), { recursive: true });
+      fs.writeFileSync(path.join(uploadsDir, "ordinary.txt"), "before restore");
+      fs.writeFileSync(path.join(quarantineDir, "archived-safe.bin"), "archived quarantine payload");
+      fs.writeFileSync(metadataPath, JSON.stringify({ items: [
+        { id: "archived", storedQuarantineFilename: "archived-safe.bin", originalFilename: "document.bin" },
+      ] }));
+      (async () => {
+        process.env.UPLOAD_QUARANTINE_DIR = quarantineDir;
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        fs.rmSync(path.join(quarantineDir, "archived-safe.bin"));
+        fs.writeFileSync(path.join(uploadsDir, "ordinary.txt"), "after backup");
+        fs.writeFileSync(metadataPath, JSON.stringify({ items: [] }));
+        process.env.UPLOAD_QUARANTINE_DIR = process.env.SHORT_QUARANTINE_DIR;
+        await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" });
+        assert.equal(fs.readFileSync(path.join(uploadsDir, "ordinary.txt"), "utf8"), "before restore");
+        assert.equal(fs.readFileSync(path.join(quarantineDir, "archived-safe.bin"), "utf8"), "archived quarantine payload");
+        assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")).items.map((item) => item.id), ["archived"]);
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, DB_ENABLED: "false", LONG_QUARANTINE_DIR: quarantineDir, SHORT_QUARANTINE_DIR: shortQuarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("quarantine restore does not write through upload junction ancestors", { timeout: 30_000 }, (t) => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-junction-restore-runtime-"));
+  const external = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-junction-restore-external-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const uploadsDir = path.join(process.cwd(), "uploads");
+      const cacheDir = path.join(uploadsDir, "cache");
+      const quarantineDir = process.env.UPLOAD_QUARANTINE_DIR;
+      const metadataPath = path.join(process.cwd(), "data", "quarantine.json");
+      const external = process.env.QUARANTINE_EXTERNAL_DIR;
+      const siblingPath = path.join(external, "neighbor.txt");
+      fs.mkdirSync(path.join(cacheDir, "private"), { recursive: true });
+      fs.mkdirSync(path.join(process.cwd(), "data"), { recursive: true });
+      fs.writeFileSync(path.join(uploadsDir, "ordinary.txt"), "before restore");
+      fs.writeFileSync(path.join(cacheDir, "neighbor.txt"), "archived neighbor");
+      fs.writeFileSync(path.join(quarantineDir, "archived-safe.bin"), "archived quarantine payload");
+      fs.writeFileSync(metadataPath, JSON.stringify({ items: [
+        { id: "archived", storedQuarantineFilename: "archived-safe.bin", originalFilename: "document.bin" },
+      ] }));
+      (async () => {
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        fs.mkdirSync(path.join(external, "private"), { recursive: true });
+        fs.writeFileSync(path.join(external, "private", "current-sensitive.bin"), "current sensitive payload");
+        fs.writeFileSync(siblingPath, "external neighbor after backup");
+        fs.writeFileSync(metadataPath, JSON.stringify({ items: [
+          { id: "sensitive", storedQuarantineFilename: "current-sensitive.bin", originalFilename: ".env.local" },
+        ] }));
+        fs.writeFileSync(path.join(uploadsDir, "ordinary.txt"), "after backup");
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+        try {
+          fs.symlinkSync(external, cacheDir, process.platform === "win32" ? "junction" : "dir");
+        } catch (error) {
+          if (["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP"].includes(error.code)) {
+            console.log(JSON.stringify({ skipped: "directory symlink/junction creation is unavailable" }));
+            return;
+          }
+          throw error;
+        }
+        await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" });
+        assert.equal(fs.readFileSync(path.join(uploadsDir, "ordinary.txt"), "utf8"), "before restore");
+        assert.equal(fs.readFileSync(siblingPath, "utf8"), "external neighbor after backup");
+        assert.equal(fs.readFileSync(path.join(quarantineDir, "archived-safe.bin"), "utf8"), "archived quarantine payload");
+        assert.equal(fs.readFileSync(path.join(quarantineDir, "current-sensitive.bin"), "utf8"), "current sensitive payload");
+        assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")).items.map((item) => item.id).sort(), ["archived", "sensitive"]);
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: path.join(runtime, "uploads", "cache", "private"), QUARANTINE_EXTERNAL_DIR: external, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const outcome = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1));
+    if (outcome.skipped) {
+      t.skip(outcome.skipped);
+      return;
+    }
+    assert.equal(outcome.ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+    fs.rmSync(external, { recursive: true, force: true });
+  }
+});
+
+test("quarantine files under data are excluded from generic backup collection", { timeout: 30_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-data-exclusion-runtime-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const unzipper = require(${JSON.stringify(path.join(ROOT, "node_modules", "unzipper"))});
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const dataDir = path.join(process.cwd(), "data");
+      const metadataPath = path.join(dataDir, "quarantine.json");
+      const secretName = "quarantined-secret-123.env.local.json";
+      const safeName = "quarantined-safe-456.json";
+      fs.mkdirSync(dataDir, { recursive: true });
+      fs.writeFileSync(path.join(dataDir, "ordinary.json"), "ordinary runtime data");
+      fs.writeFileSync(path.join(dataDir, secretName), "sensitive quarantined bytes");
+      fs.writeFileSync(path.join(dataDir, safeName), "safe quarantined bytes");
+      fs.writeFileSync(metadataPath, JSON.stringify({ items: [
+        { id: "sensitive", storedQuarantineFilename: secretName, originalFilename: ".env.local.json" },
+        { id: "safe", storedQuarantineFilename: safeName, originalFilename: "document.json" },
+      ] }));
+      (async () => {
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        const zip = await unzipper.Open.file(backupService.getArchivePath(backup.filename));
+        const entries = zip.files.map((entry) => entry.path);
+        assert.ok(entries.includes("data/ordinary.json"));
+        assert.equal(entries.includes("data/" + secretName), false);
+        assert.equal(entries.includes("data/" + safeName), false);
+        assert.ok(entries.includes("data/quarantine/" + safeName));
+        assert.equal(entries.includes("data/quarantine/" + secretName), false);
+        const archivedMetadata = JSON.parse((await zip.files.find((entry) => entry.path === "data/quarantine.json").buffer()).toString("utf8"));
+        assert.deepEqual(archivedMetadata.items, [{ id: "safe", storedQuarantineFilename: safeName, originalFilename: "document.json" }]);
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: path.join(runtime, "data"), BACKUP_ENABLED: "true", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("generic data backup collection skips symlinked files", { timeout: 30_000 }, (t) => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-data-symlink-runtime-"));
+  const external = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-data-symlink-external-"));
+  try {
+    const dataDir = path.join(runtime, "data");
+    const ordinaryPath = path.join(dataDir, "ordinary.json");
+    const externalSecretPath = path.join(external, "private-config");
+    const symlinkPath = path.join(dataDir, "public.json");
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(ordinaryPath, "ordinary data");
+    fs.writeFileSync(externalSecretPath, "external secret bytes");
+    try {
+      fs.symlinkSync(externalSecretPath, symlinkPath, "file");
+    } catch (error) {
+      if (["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP", "EINVAL"].includes(error.code)) {
+        t.skip("file symlink creation is unavailable");
+        return;
+      }
+      throw error;
+    }
+    const script = `
+      const assert = require("node:assert/strict");
+      const unzipper = require(${JSON.stringify(path.join(ROOT, "node_modules", "unzipper"))});
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      (async () => {
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        const zip = await unzipper.Open.file(backupService.getArchivePath(backup.filename));
+        const entries = zip.files.map((entry) => entry.path);
+        assert.ok(entries.includes("data/ordinary.json"));
+        assert.equal(entries.includes("data/public.json"), false);
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, DB_ENABLED: "false", BACKUP_ENABLED: "true", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+    fs.rmSync(external, { recursive: true, force: true });
+  }
+});
+
+test("generic uploads and temp backup collection skip symlinked roots and entries", { timeout: 30_000 }, (t) => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-backup-root-symlink-runtime-"));
+  const external = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-backup-root-symlink-external-"));
+  try {
+    const uploadRoot = path.join(runtime, "uploads");
+    const tempRoot = path.join(runtime, "temp");
+    const externalUploadRoot = path.join(external, "upload-root");
+    const externalTempRoot = path.join(external, "temp-root");
+    const externalTempEntry = path.join(external, "temp-entry");
+    fs.mkdirSync(externalUploadRoot, { recursive: true });
+    fs.mkdirSync(externalTempRoot, { recursive: true });
+    fs.mkdirSync(externalTempEntry, { recursive: true });
+    fs.writeFileSync(path.join(externalUploadRoot, "root-secret.txt"), "external upload root bytes");
+    fs.writeFileSync(path.join(externalTempRoot, "root-secret.txt"), "external temp root bytes");
+    fs.writeFileSync(path.join(externalTempEntry, "entry-secret.txt"), "external temp entry bytes");
+    try {
+      const linkType = process.platform === "win32" ? "junction" : "dir";
+      fs.symlinkSync(externalUploadRoot, uploadRoot, linkType);
+      fs.symlinkSync(externalTempRoot, tempRoot, linkType);
+    } catch (error) {
+      if (["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP"].includes(error.code)) {
+        t.skip("directory symlink/junction creation is unavailable");
+        return;
+      }
+      throw error;
+    }
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const unzipper = require(${JSON.stringify(path.join(ROOT, "node_modules", "unzipper"))});
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const tempRoot = path.join(process.cwd(), "temp");
+      const externalTempEntry = process.env.EXTERNAL_TEMP_ENTRY;
+      const linkType = process.platform === "win32" ? "junction" : "dir";
+      (async () => {
+        const rootBackup = await backupService.createBackup({ createdBy: "fixture" });
+        const rootZip = await unzipper.Open.file(backupService.getArchivePath(rootBackup.filename));
+        const rootEntries = rootZip.files.map((entry) => entry.path);
+        assert.equal(rootEntries.includes("uploads/root-secret.txt"), false);
+        assert.equal(rootEntries.includes("temp/root-secret.txt"), false);
+
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.mkdirSync(tempRoot, { recursive: true });
+        fs.writeFileSync(path.join(tempRoot, "ordinary.txt"), "ordinary temp file");
+        fs.symlinkSync(externalTempEntry, path.join(tempRoot, "external-alias"), linkType);
+        const entryBackup = await backupService.createBackup({ createdBy: "fixture" });
+        const entryZip = await unzipper.Open.file(backupService.getArchivePath(entryBackup.filename));
+        const entryPaths = entryZip.files.map((entry) => entry.path);
+        assert.ok(entryPaths.includes("temp/ordinary.txt"));
+        assert.equal(entryPaths.includes("temp/external-alias/entry-secret.txt"), false);
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, EXTERNAL_TEMP_ENTRY: externalTempEntry, DB_ENABLED: "false", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_INCLUDE_TEMP: "true", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+    fs.rmSync(external, { recursive: true, force: true });
+  }
+});
+
+test("quarantine backups exclude external payloads reached through upload aliases", { timeout: 30_000 }, (t) => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-alias-runtime-"));
+  const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-alias-payloads-"));
+  try {
+    const uploadsDir = path.join(runtime, "uploads");
+    const aliasPath = path.join(uploadsDir, ".quarantine-alias");
+    fs.mkdirSync(uploadsDir, { recursive: true });
+    try {
+      fs.symlinkSync(quarantineDir, aliasPath, process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      if (["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP"].includes(error.code)) {
+        t.skip("directory symlink/junction creation is unavailable");
+        return;
+      }
+      throw error;
+    }
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const unzipper = require(${JSON.stringify(path.join(ROOT, "node_modules", "unzipper"))});
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const uploadsDir = path.join(process.cwd(), "uploads");
+      const quarantineDir = process.env.UPLOAD_QUARANTINE_DIR;
+      const quarantineParentDir = path.dirname(quarantineDir);
+      const secretName = "quarantined-secret-7f3a.env.local";
+      const safeName = "safe-quarantine-item.bin";
+      fs.writeFileSync(path.join(quarantineParentDir, "external-neighbor.txt"), "unrelated external file");
+      fs.writeFileSync(path.join(uploadsDir, "ordinary.txt"), "ordinary upload");
+      fs.mkdirSync(quarantineDir, { recursive: true });
+      fs.writeFileSync(path.join(quarantineDir, secretName), "sensitive quarantined bytes");
+      fs.writeFileSync(path.join(quarantineDir, safeName), "safe quarantined bytes");
+      fs.mkdirSync(path.join(process.cwd(), "data"), { recursive: true });
+      fs.writeFileSync(path.join(process.cwd(), "data", "quarantine.json"), JSON.stringify({ items: [
+        { id: "sensitive", storedQuarantineFilename: secretName, originalFilename: ".env.local" },
+        { id: "safe", storedQuarantineFilename: safeName, originalFilename: "document.bin" },
+      ] }));
+      (async () => {
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        const zip = await unzipper.Open.file(backupService.getArchivePath(backup.filename));
+        const entries = zip.files.map((entry) => entry.path);
+        assert.ok(entries.includes("uploads/ordinary.txt"));
+        assert.equal(entries.includes("uploads/.quarantine-alias/" + secretName), false);
+        assert.equal(entries.includes("uploads/.quarantine-alias/" + safeName), false);
+        assert.equal(entries.includes("uploads/.quarantine-alias/external-neighbor.txt"), false);
+        assert.ok(entries.includes("data/quarantine/" + safeName));
+        assert.equal(entries.includes("data/quarantine/" + secretName), false);
+        const archivedMetadata = JSON.parse((await zip.files.find((entry) => entry.path === "data/quarantine.json").buffer()).toString("utf8"));
+        assert.deepEqual(archivedMetadata.items, [{ id: "safe", storedQuarantineFilename: safeName, originalFilename: "document.bin" }]);
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: path.join(quarantineDir, "private"), BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+    fs.rmSync(quarantineDir, { recursive: true, force: true });
+  }
+});
+
 test("quarantine restore keeps metadata renames on the data volume", { timeout: 30_000 }, () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-volume-runtime-"));
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-volume-payloads-"));
