@@ -1,11 +1,157 @@
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const test = require("node:test");
 
 const ROOT = path.resolve(__dirname, "..");
+
+test("quarantine metadata is read from the validated file descriptor and rejects path swaps", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-metadata-read-"));
+  const metadataPath = path.join(directory, "quarantine.json");
+  const replacementPath = path.join(directory, "replacement.json");
+  const metadata = { items: [] };
+  const originalReadFileSync = fs.readFileSync;
+  const originalLstatSync = fs.lstatSync;
+  let openedDescriptor;
+  try {
+    fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+    fs.writeFileSync(replacementPath, JSON.stringify({ items: [{ id: "replacement" }] }));
+    fs.readFileSync = function readFileFromDescriptor(file, ...args) {
+      if (typeof file === "number") openedDescriptor = file;
+      return originalReadFileSync.call(this, file, ...args);
+    };
+    const quarantinePaths = require("../src/quarantine-paths");
+    assert.deepEqual(quarantinePaths.readQuarantineMetadata(metadataPath), metadata);
+    assert.equal(typeof openedDescriptor, "number");
+    fs.lstatSync = function lstatAfterPathSwap(file, ...args) {
+      if (path.resolve(file) === path.resolve(metadataPath)) return originalLstatSync.call(this, replacementPath, ...args);
+      return originalLstatSync.call(this, file, ...args);
+    };
+    assert.throws(() => quarantinePaths.readQuarantineMetadata(metadataPath), /not a regular file/);
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+    fs.lstatSync = originalLstatSync;
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("quarantine readers reject dangling symlinks on Windows", { skip: process.platform !== "win32", timeout: 30_000 }, (t) => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-dangling-link-runtime-"));
+  const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-dangling-link-payloads-"));
+  const dataDir = path.join(runtime, "data");
+  const metadataPath = path.join(dataDir, "quarantine.json");
+  const journalPath = path.join(dataDir, ".rootark-quarantine-restore-journal.json");
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    const stagePath = path.join(quarantineDir, `.rootark-quarantine-restore-${crypto.randomUUID()}`);
+    fs.mkdirSync(stagePath);
+    try {
+      fs.symlinkSync("missing-target", metadataPath, "file");
+      fs.symlinkSync("missing-target", journalPath, "file");
+    } catch (error) {
+      if (["EPERM", "EACCES", "UNKNOWN"].includes(error.code)) {
+        t.skip("Windows symbolic-link privileges are unavailable");
+        return;
+      }
+      throw error;
+    }
+    const script = `
+      const assert = require("node:assert/strict");
+      const path = require("node:path");
+      const quarantinePaths = require(${JSON.stringify(path.join(ROOT, "src", "quarantine-paths"))});
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      assert.throws(() => quarantinePaths.readQuarantineMetadata(path.join(process.cwd(), "data", "quarantine.json")), /not a regular file/);
+      assert.throws(() => restoreService.recoverQuarantineRestore(), /journal is invalid/);
+      assert.equal(require("node:fs").existsSync(${JSON.stringify(stagePath)}), true);
+      console.log(JSON.stringify({ ok: true }));
+    `;
+    const env = { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_RETENTION_COUNT: "20" };
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, env, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+    fs.rmSync(quarantineDir, { recursive: true, force: true });
+  }
+});
+
+test("quarantine startup recovery is serialized with cross-process restores", { timeout: 30_000 }, async () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-recovery-lock-runtime-"));
+  const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-recovery-lock-payloads-"));
+  const stagePath = path.join(quarantineDir, `.rootark-quarantine-restore-${crypto.randomUUID()}`);
+  const env = { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_RETENTION_COUNT: "20" };
+  let holder;
+  try {
+    fs.mkdirSync(path.join(runtime, "data"), { recursive: true });
+    fs.mkdirSync(stagePath);
+    const holderScript = `
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const release = backupService.acquireLock("restore");
+      process.send({ locked: true });
+      process.on("message", (message) => {
+        if (!message || !message.release) return;
+        release();
+        process.send({ released: true }, () => process.disconnect());
+      });
+    `;
+    holder = spawn(process.execPath, ["-e", holderScript], { cwd: runtime, env, stdio: ["ignore", "ignore", "pipe", "ipc"] });
+    const locked = await new Promise((resolve, reject) => {
+      holder.once("message", resolve);
+      holder.once("error", reject);
+      holder.once("exit", (code) => reject(new Error(`Lock holder exited before acquiring the lock: ${code}`)));
+    });
+    assert.deepEqual(locked, { locked: true });
+
+    const blockedScript = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      assert.throws(() => restoreService.recoverQuarantineRestore(), { code: "BACKUP_LOCKED" });
+      assert.equal(fs.existsSync(${JSON.stringify(stagePath)}), true);
+      console.log(JSON.stringify({ blocked: true }));
+    `;
+    const blocked = spawnSync(process.execPath, ["-e", blockedScript], { cwd: runtime, env, encoding: "utf8" });
+    assert.equal(blocked.status, 0, blocked.stderr || blocked.stdout);
+    assert.equal(JSON.parse(blocked.stdout.trim().split(/\r?\n/).at(-1)).blocked, true);
+
+    const releasedPromise = new Promise((resolve, reject) => {
+      holder.once("message", resolve);
+      holder.once("error", reject);
+      holder.once("exit", (code) => reject(new Error(`Lock holder exited before releasing the lock: ${code}`)));
+    });
+    holder.send({ release: true });
+    assert.deepEqual(await releasedPromise, { released: true });
+    await new Promise((resolve, reject) => {
+      holder.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`Lock holder exited with ${code}`)));
+      holder.once("error", reject);
+    });
+
+    const recoveryScript = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      assert.equal(restoreService.recoverQuarantineRestore(), false);
+      assert.equal(fs.existsSync(${JSON.stringify(stagePath)}), false);
+      console.log(JSON.stringify({ recovered: true }));
+    `;
+    const recovered = spawnSync(process.execPath, ["-e", recoveryScript], { cwd: runtime, env, encoding: "utf8" });
+    assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+    assert.equal(JSON.parse(recovered.stdout.trim().split(/\r?\n/).at(-1)).recovered, true);
+  } finally {
+    if (holder?.connected) {
+      holder.send({ release: true });
+      await new Promise((resolve) => {
+        const timer = setTimeout(() => { holder.kill(); resolve(); }, 2_000);
+        holder.once("exit", () => { clearTimeout(timer); resolve(); });
+      });
+    }
+    fs.rmSync(runtime, { recursive: true, force: true });
+    fs.rmSync(quarantineDir, { recursive: true, force: true });
+  }
+});
 
 test("quarantine backup and restore preserve external payloads and reject incomplete archives", { timeout: 30_000 }, () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-restore-runtime-"));
@@ -19,7 +165,7 @@ test("quarantine backup and restore preserve external payloads and reject incomp
       const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
       const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
       const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
-      const payloadName = "blocked-upload.bin";
+      const payloadName = "Blocked-Upload.Bin";
       const secretPayloadName = "credentials.pem";
       const payloadPath = path.join(process.env.UPLOAD_QUARANTINE_DIR, payloadName);
       const secretPayloadPath = path.join(process.env.UPLOAD_QUARANTINE_DIR, secretPayloadName);
@@ -46,6 +192,8 @@ test("quarantine backup and restore preserve external payloads and reject incomp
         assert.deepEqual(await archivedPayload.buffer(), payloadBytes);
         assert.equal(entries.includes("data/quarantine/" + secretPayloadName), false);
         const archivedMetadata = JSON.parse(await zip.files.find((entry) => entry.path === "data/quarantine.json").buffer());
+        const archivedManifest = JSON.parse((await zip.files.find((entry) => entry.path === "backup-manifest.json").buffer()).toString("utf8"));
+        assert.equal(archivedManifest.quarantine_format_version, 1);
         assert.deepEqual(archivedMetadata, safeMetadata);
 
         const changedPayloadName = "changed-upload.bin";
@@ -81,20 +229,40 @@ test("quarantine backup and restore preserve external payloads and reject incomp
         assert.deepEqual(fs.readFileSync(secretPayloadPath), currentSecretBytes);
         assert.deepEqual(fs.readFileSync(payloadPath), payloadBytes);
 
+        const legacyArchivePath = path.join(backupService.BACKUPS_DIR, "rootark-backup-2026-09-28-23-59-58.zip");
+        const legacyMetadataPath = path.join(process.cwd(), "data", "legacy-quarantine.json");
+        const legacyRuntimePath = path.join(process.cwd(), "data", "legacy-runtime.json");
+        const legacyMetadata = { items: [{ id: "legacy", storedQuarantineFilename: "legacy.bin" }] };
+        const legacyBytes = Buffer.from("restored by legacy backup");
+        fs.writeFileSync(legacyMetadataPath, JSON.stringify(legacyMetadata));
+        fs.writeFileSync(legacyRuntimePath, legacyBytes);
+        const legacyFiles = [
+          { absolutePath: legacyMetadataPath, entryPath: "data/quarantine.json", size: fs.statSync(legacyMetadataPath).size },
+          { absolutePath: legacyRuntimePath, entryPath: "data/runtime-only.json", size: legacyBytes.length },
+        ];
+        const legacyManifest = { backup_id: "33333333-3333-4333-8333-333333333333", included_files: legacyFiles.map((file) => ({ path: file.entryPath, size: file.size })) };
+        await backupService.createZipArchive(legacyArchivePath, legacyManifest, legacyFiles);
+        const legacyBackup = { id: legacyManifest.backup_id, filename: path.basename(legacyArchivePath), type: "manual", status: "success", createdAt: new Date().toISOString(), sizeBytes: fs.statSync(legacyArchivePath).size, checksum: await backupService.calculateFileHash(legacyArchivePath), metadata: {} };
+        backupRepository.saveBackup(legacyBackup);
+        await assert.rejects(restoreService.restoreBackup(legacyBackup.id, { confirmation: "RESTORE", username: "fixture" }), /Quarantine archive payloads are missing/);
+        assert.equal(fs.readFileSync(path.join(process.cwd(), "data", "runtime-only.json"), "utf8"), "before");
+        assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), { items: [sameIdSensitiveItem] });
+        assert.deepEqual(fs.readFileSync(payloadPath), payloadBytes);
+
         const badArchivePath = path.join(backupService.BACKUPS_DIR, "rootark-backup-2026-09-28-23-59-59.zip");
         const badMetadataPath = path.join(process.cwd(), "data", "bad-quarantine.json");
         const badRuntimePath = path.join(process.cwd(), "data", "bad-runtime.json");
-        const missingMetadata = { items: [{ id: "missing", storedQuarantineFilename: "missing.bin" }] };
+        const incompleteMetadata = { items: [{ id: "missing", storedQuarantineFilename: "missing.bin" }] };
         const changedBytes = Buffer.from("must not restore");
-        fs.writeFileSync(badMetadataPath, JSON.stringify(missingMetadata));
+        fs.writeFileSync(badMetadataPath, JSON.stringify(incompleteMetadata));
         fs.writeFileSync(badRuntimePath, changedBytes);
-        const files = [
+        const badFiles = [
           { absolutePath: badMetadataPath, entryPath: "data/quarantine.json", size: fs.statSync(badMetadataPath).size },
           { absolutePath: badRuntimePath, entryPath: "data/runtime-only.json", size: changedBytes.length },
         ];
-        const manifest = { backup_id: "33333333-3333-4333-8333-333333333333", included_files: files.map((file) => ({ path: file.entryPath, size: file.size })) };
-        await backupService.createZipArchive(badArchivePath, manifest, files);
-        const badBackup = { id: manifest.backup_id, filename: path.basename(badArchivePath), type: "manual", status: "success", createdAt: new Date().toISOString(), sizeBytes: fs.statSync(badArchivePath).size, checksum: await backupService.calculateFileHash(badArchivePath), metadata: {} };
+        const badManifest = { backup_id: "44444444-4444-4444-8444-444444444444", quarantine_format_version: 1, included_files: badFiles.map((file) => ({ path: file.entryPath, size: file.size })) };
+        await backupService.createZipArchive(badArchivePath, badManifest, badFiles);
+        const badBackup = { id: badManifest.backup_id, filename: path.basename(badArchivePath), type: "manual", status: "success", createdAt: new Date().toISOString(), sizeBytes: fs.statSync(badArchivePath).size, checksum: await backupService.calculateFileHash(badArchivePath), metadata: {} };
         backupRepository.saveBackup(badBackup);
         await assert.rejects(restoreService.restoreBackup(badBackup.id, { confirmation: "RESTORE", username: "fixture" }), /Quarantine payload is missing/);
         assert.equal(fs.readFileSync(path.join(process.cwd(), "data", "runtime-only.json"), "utf8"), "before");

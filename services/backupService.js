@@ -951,6 +951,7 @@ async function createBackup(options = {}) {
       included_files: files.map((file) => ({ path: file.entryPath, size: file.size })),
       archive_sha256: null,
       app_version: process.env.npm_package_version || "1.0.0",
+      ...(files.some((file) => file.entryPath === "data/quarantine.json") ? { quarantine_format_version: 1 } : {}),
       status: "success",
       error_message: null,
       duration_ms: null,

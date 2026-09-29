@@ -8,7 +8,7 @@ const { resolveRuntimePath } = require("../src/runtime-paths");
 const backupRepository = require("../repositories/backupRepository");
 const backupService = require("./backupService");
 const { attestCiphertextOnlyArchive } = require("../src/services/deploymentResilience");
-const { getUploadQuarantineDir, isSensitiveQuarantineItem, readQuarantineMetadata, validateQuarantinePayloads } = require("../src/quarantine-paths");
+const { getUploadQuarantineDir, isSensitiveQuarantineItem, readQuarantineMetadata, readQuarantineRegularFile, validateQuarantinePayloads } = require("../src/quarantine-paths");
 
 const RESTORE_TMP_DIR = path.join(backupService.BACKUPS_DIR, ".restore-tmp");
 const RESTORE_SYNC_LOCK_DIR = resolveRuntimePath("data", "restore-sync-locks");
@@ -322,11 +322,22 @@ function restoreUploads(extractedRoot) {
   copyDirectoryContents(extractedUploads, destinationUploads);
 }
 
-function validateQuarantineArchive(extractedRoot) {
+function validateQuarantineArchive(extractedRoot, manifest) {
+  if (manifest?.quarantine_format_version !== undefined && manifest.quarantine_format_version !== 1) {
+    throw new Error("Quarantine archive format is not supported");
+  }
+  const hasQuarantineFormat = manifest?.quarantine_format_version === 1;
   const metadataPath = path.join(extractedRoot, "data", "quarantine.json");
   const metadata = readQuarantineMetadata(metadataPath);
-  if (!metadata) return false;
-  validateQuarantinePayloads(metadata.items, path.join(extractedRoot, "data", "quarantine"));
+  if (!metadata) {
+    if (hasQuarantineFormat) throw new Error("Quarantine metadata is missing");
+    return false;
+  }
+  const payloadRoot = path.join(extractedRoot, "data", "quarantine");
+  if (!hasQuarantineFormat && metadata.items.length > 0 && !pathExists(payloadRoot)) {
+    throw new Error("Quarantine archive payloads are missing");
+  }
+  validateQuarantinePayloads(metadata.items, payloadRoot);
   return true;
 }
 
@@ -372,7 +383,7 @@ function prepareQuarantineRestore(extractedRoot) {
     && !preservedNames.has(item.storedQuarantineFilename.toLowerCase())
     && !(item.id && preservedIds.has(item.id)));
   const archivedNames = new Set(archivedItems.map((item) => item.storedQuarantineFilename.toLowerCase()));
-  const extractedPayloads = archivedPayloads.filter((payload) => archivedNames.has(payload.filename));
+  const extractedPayloads = archivedPayloads.filter((payload) => archivedNames.has(payload.filename.toLowerCase()));
   const restoredPayloads = [
     ...extractedPayloads,
     ...currentPayloads.filter((payload) => preservedNames.has(payload.filename.toLowerCase())),
@@ -451,11 +462,14 @@ function writeQuarantineJournal(journalPath, journal) {
 }
 
 function readQuarantineJournal(journalPath) {
-  if (!pathExists(journalPath)) return null;
-  const stat = fs.lstatSync(journalPath);
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Quarantine restore journal is invalid");
   let journal;
-  try { journal = JSON.parse(fs.readFileSync(journalPath, "utf8")); }
+  let contents;
+  try { contents = readQuarantineRegularFile(journalPath, "utf8"); }
+  catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw new Error("Quarantine restore journal is invalid");
+  }
+  try { journal = JSON.parse(contents); }
   catch { throw new Error("Quarantine restore journal is invalid"); }
   if (!validQuarantineRestoreJournal(journal)) throw new Error("Quarantine restore journal is invalid");
   return journal;
@@ -528,28 +542,37 @@ function cleanupOrphanQuarantineStages(destination) {
 }
 
 function recoverQuarantineRestore() {
-  const destination = validateQuarantineDestination(getUploadQuarantineDir());
-  const journalPath = quarantineJournalPath();
-  const journal = readQuarantineJournal(journalPath);
-  if (!journal) {
-    cleanupOrphanQuarantineStages(destination);
+  if (!fs.existsSync(backupService.BACKUPS_DIR)) {
+    if (hasPendingQuarantineRestore()) throw new Error("Quarantine recovery cannot acquire its backup lock");
     return false;
   }
-  const stage = quarantineJournalStage(journal);
-  const commitMarker = path.join(stage, "committed");
-  if (pathExists(commitMarker)) {
-    const marker = fs.readFileSync(commitMarker, "utf8");
-    if (marker !== journal.transactionId) throw new Error("Quarantine restore commit marker is invalid");
+  const release = backupService.acquireLock("restore");
+  try {
+    const destination = validateQuarantineDestination(getUploadQuarantineDir());
+    const journalPath = quarantineJournalPath();
+    const journal = readQuarantineJournal(journalPath);
+    if (!journal) {
+      cleanupOrphanQuarantineStages(destination);
+      return false;
+    }
+    const stage = quarantineJournalStage(journal);
+    const commitMarker = path.join(stage, "committed");
+    if (pathExists(commitMarker)) {
+      const marker = fs.readFileSync(commitMarker, "utf8");
+      if (marker !== journal.transactionId) throw new Error("Quarantine restore commit marker is invalid");
+      fs.rmSync(journalPath, { force: false });
+      fsyncDirectory(path.dirname(journalPath));
+      fs.rmSync(stage, { recursive: true, force: true });
+      return true;
+    }
+    rollbackQuarantineRestore(journal, stage);
     fs.rmSync(journalPath, { force: false });
     fsyncDirectory(path.dirname(journalPath));
     fs.rmSync(stage, { recursive: true, force: true });
     return true;
+  } finally {
+    release();
   }
-  rollbackQuarantineRestore(journal, stage);
-  fs.rmSync(journalPath, { force: false });
-  fsyncDirectory(path.dirname(journalPath));
-  fs.rmSync(stage, { recursive: true, force: true });
-  return true;
 }
 
 function restoreQuarantine(plan) {
@@ -952,8 +975,8 @@ async function restoreBackup(id, options = {}) {
     const { backup, archivePath } = backupService.getBackupOrThrow(id);
     const { zip, manifest } = await validateBackupArchive(backup, archivePath);
     await extractArchive(zip, restoreDir);
-    validateQuarantineArchive(restoreDir);
-    const quarantinePlan = prepareQuarantineRestore(restoreDir);
+    const hasQuarantineState = validateQuarantineArchive(restoreDir, manifest);
+    const quarantinePlan = hasQuarantineState ? prepareQuarantineRestore(restoreDir) : null;
     restoreQuarantine(quarantinePlan);
     restoreDataFiles(restoreDir);
     restoreUploads(restoreDir);

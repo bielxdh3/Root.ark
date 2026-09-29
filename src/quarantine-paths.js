@@ -15,19 +15,60 @@ function isSensitiveQuarantineItem(item) {
   return sensitiveName(item?.storedQuarantineFilename) || sensitiveName(item?.originalFilename);
 }
 
-function readQuarantineMetadata(metadataPath) {
-  let stat;
+function readQuarantineRegularFile(filePath, encoding) {
+  let descriptor;
   try {
-    stat = fs.lstatSync(metadataPath);
+    const noFollow = fs.constants.O_NOFOLLOW || 0;
+    try { descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow); }
+    catch (error) {
+      if (error.code === "ENOENT") {
+        try {
+          const pathStat = fs.lstatSync(filePath);
+          if (pathStat.isSymbolicLink()) {
+            const invalid = new Error("Quarantine file is not a regular file");
+            invalid.code = "QUARANTINE_NOT_REGULAR";
+            throw invalid;
+          }
+        } catch (pathError) {
+          if (pathError.code !== "ENOENT") throw pathError;
+        }
+      }
+      throw error;
+    }
+    const descriptorStat = fs.fstatSync(descriptor);
+    let pathStat;
+    try { pathStat = fs.lstatSync(filePath); }
+    catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const changed = new Error("Quarantine file changed while it was being opened");
+      changed.code = "QUARANTINE_PATH_CHANGED";
+      throw changed;
+    }
+    if (!descriptorStat.isFile() || !pathStat.isFile() || pathStat.isSymbolicLink()
+      || descriptorStat.dev !== pathStat.dev || descriptorStat.ino !== pathStat.ino) {
+      const error = new Error("Quarantine file is not a regular file");
+      error.code = "QUARANTINE_NOT_REGULAR";
+      throw error;
+    }
+    return fs.readFileSync(descriptor, encoding);
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
+
+function readQuarantineMetadata(metadataPath) {
+  let contents;
+  try {
+    contents = readQuarantineRegularFile(metadataPath, "utf8");
   } catch (error) {
     if (error.code === "ENOENT") return null;
-    throw error;
+    if (error.code === "QUARANTINE_NOT_REGULAR") throw new Error("Quarantine metadata is not a regular file");
+    throw new Error("Quarantine metadata is invalid");
   }
-  if (!stat.isFile()) throw new Error("Quarantine metadata is not a regular file");
 
   let metadata;
   try {
-    metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+    metadata = JSON.parse(contents);
   } catch {
     throw new Error("Quarantine metadata is invalid");
   }
@@ -62,4 +103,4 @@ function validateQuarantinePayloads(items, quarantineDir) {
   return payloads;
 }
 
-module.exports = { getUploadQuarantineDir, isSensitiveQuarantineItem, readQuarantineMetadata, validateQuarantinePayloads };
+module.exports = { getUploadQuarantineDir, isSensitiveQuarantineItem, readQuarantineMetadata, readQuarantineRegularFile, validateQuarantinePayloads };
