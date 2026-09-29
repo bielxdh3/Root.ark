@@ -746,8 +746,11 @@ class SyncEngine {
       const isDirectory = Boolean(file.directory);
       if (prior && !prior.deleted && prior.hash === file.hash && Boolean(prior.directory) === isDirectory) continue;
       const isUpdate = prior && !prior.deleted;
-      const objectId = isUpdate ? prior.objectId : `object-${crypto.createHash("sha256").update(relative).digest("hex").slice(0, 32)}`;
-      const fileId = isUpdate ? prior.fileId : `file-${crypto.createHash("sha256").update(relative).digest("hex").slice(0, 32)}`;
+      const identitySeed = prior?.deleted
+        ? crypto.randomUUID().replace(/-/g, "")
+        : crypto.createHash("sha256").update(relative).digest("hex").slice(0, 32);
+      const objectId = isUpdate ? prior.objectId : `object-${identitySeed}`;
+      const fileId = isUpdate ? prior.fileId : `file-${identitySeed}`;
       const data = isDirectory ? Buffer.alloc(0) : await fsp.readFile(path.join(this.rootDir, ...relative.split("/")));
       const key = await this.fileKeyResolver({ objectId, fileId, path: relative, keyEpoch: this.keyEpoch });
       const metadata = { path: relative, name: path.basename(relative), size: data.length, ...(isDirectory ? { contentType: "inode/directory" } : {}) };

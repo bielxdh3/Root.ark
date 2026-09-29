@@ -257,6 +257,39 @@ test("Phase 16 engine type transitions replace stale snapshot directory state", 
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
 });
 
+test("Phase 16 filesystem recreation after a synced delete uses a fresh identity", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-engine-recreate-identity-"));
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const key = crypto.randomBytes(32);
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const rootA = path.join(dir, "a");
+  const rootB = path.join(dir, "b");
+  await fsp.mkdir(rootA, { recursive: true });
+  await fsp.writeFile(path.join(rootA, "recreated.txt"), "first incarnation");
+  const a = await engine(rootA, adapter, key);
+  assert.equal((await a.syncOnce()).pushed, 1);
+  const originalIdentity = { ...a.snapshot.files["recreated.txt"] };
+  const b = await engine(rootB, adapter, key, { deviceId: "device-b" });
+  await b.syncOnce();
+
+  await fsp.rm(path.join(rootA, "recreated.txt"));
+  assert.equal((await a.syncOnce()).pushed, 1);
+  await b.syncOnce();
+  assert.equal(await fsp.stat(path.join(rootB, "recreated.txt")).then(() => true, () => false), false);
+
+  await fsp.writeFile(path.join(rootA, "recreated.txt"), "second incarnation");
+  assert.equal((await a.syncOnce()).pushed, 1);
+  const recreatedIdentity = a.snapshot.files["recreated.txt"];
+  assert.notEqual(recreatedIdentity.objectId, originalIdentity.objectId);
+  assert.notEqual(recreatedIdentity.fileId, originalIdentity.fileId);
+  await b.syncOnce();
+  assert.equal(await fsp.readFile(path.join(rootB, "recreated.txt"), "utf8"), "second incarnation");
+  assert.equal((await a.syncOnce()).pushed, 0);
+  assert.equal((await b.syncOnce()).pushed, 0);
+
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+});
+
 test("Phase 16 peers prune implicit empty parents after remote move and delete", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-engine-prune-parents-"));
   const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
