@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 
@@ -46,6 +47,61 @@ async function containedAbsolute(rootDir, target, allowMissing = true) {
 async function contained(rootDir, relativePath, allowMissing = true) {
   const safe = protocol.safeRelativePath(relativePath, "path");
   return containedAbsolute(rootDir, path.resolve(rootDir, ...safe.split("/")), allowMissing);
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.ino !== 0n;
+}
+
+function sameFileVersion(left, right) {
+  return sameFileIdentity(left, right) && left.size === right.size
+    && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs
+    && left.birthtimeNs === right.birthtimeNs && left.mode === right.mode;
+}
+
+function isWithinPath(root, target) {
+  const relative = path.relative(root, target);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+async function readContainedFile(rootDir, relativePath, expectedStats = null) {
+  const root = path.resolve(rootDir);
+  const target = await contained(root, relativePath, false);
+  const before = expectedStats || await fsp.lstat(target, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink() || before.ino === 0n) {
+    fail("Sync file must be a regular file with a stable identity", "unsafe_path");
+  }
+
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+  const handle = await fsp.open(target, flags);
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || !sameFileVersion(before, opened)) fail("Sync file changed while opening", "unsafe_path");
+
+    await containedAbsolute(root, target, false);
+    const canonicalRoot = await fsp.realpath(root);
+    const canonicalTarget = await fsp.realpath(target);
+    if (!isWithinPath(canonicalRoot, canonicalTarget)) fail("Sync file escaped root", "unsafe_path");
+    const pathStats = await fsp.lstat(target, { bigint: true });
+    if (!pathStats.isFile() || pathStats.isSymbolicLink() || !sameFileIdentity(opened, pathStats)) {
+      fail("Sync file changed while opening", "unsafe_path");
+    }
+
+    const data = await handle.readFile();
+    const openedAfterRead = await handle.stat({ bigint: true });
+    const pathAfterRead = await fsp.lstat(target, { bigint: true });
+    if (!sameFileVersion(opened, openedAfterRead) || !sameFileIdentity(openedAfterRead, pathAfterRead)
+      || !pathAfterRead.isFile() || pathAfterRead.isSymbolicLink()) {
+      fail("Sync file changed while reading", "unsafe_path");
+    }
+    await containedAbsolute(root, target, false);
+    const finalRoot = await fsp.realpath(root);
+    const finalTarget = await fsp.realpath(target);
+    if (!isWithinPath(finalRoot, finalTarget)) fail("Sync file escaped root", "unsafe_path");
+    return data;
+  } finally {
+    await handle.close();
+  }
 }
 
 async function canonicalRelativePath(rootDir, relativePath) {
@@ -176,8 +232,8 @@ class SyncEngine {
       let movePlaintext = input.plaintext;
       if (movePlaintext === undefined) {
         const target = await contained(this.rootDir, input.metadata?.path, false);
-        const stats = await fsp.lstat(target);
-        if (stats.isFile()) movePlaintext = await fsp.readFile(target);
+        const stats = await fsp.lstat(target, { bigint: true });
+        if (stats.isFile()) movePlaintext = await readContainedFile(this.rootDir, input.metadata?.path, stats);
         else if (!stats.isDirectory()) fail("Sync move source must be a regular file or directory", "unsafe_path");
       }
       if (movePlaintext !== undefined) operationInput = { ...input, plaintext: protocol.encodeMovePayload(movePlaintext, key) };
@@ -322,7 +378,7 @@ class SyncEngine {
       const priorDestination = snapshotFiles[relativePath];
       const sourceIsActive = priorSource && !priorSource.deleted;
       const destinationIsActive = priorDestination && !priorDestination.deleted;
-      const content = await fsp.readFile(await contained(this.rootDir, relativePath, false));
+      const content = await readContainedFile(this.rootDir, relativePath);
       if (sourceIsActive && destinationIsActive
         && (priorSource.objectId !== priorDestination.objectId || priorSource.fileId !== priorDestination.fileId)) {
         mappedSourcePaths.add(sourcePath);
@@ -421,7 +477,7 @@ class SyncEngine {
           continue;
         }
 
-        const content = await fsp.readFile(await contained(this.rootDir, relativePath, false));
+        const content = await readContainedFile(this.rootDir, relativePath);
         if (sourceIsActive && destinationIsActive
           && (priorSource.objectId !== priorDestination.objectId || priorSource.fileId !== priorDestination.fileId)) {
           operations.push(await buildForPath({ operation: "delete", relativePath, prior: priorDestination }));
@@ -492,8 +548,8 @@ class SyncEngine {
           if (operation.operation === "move") {
             const movedPath = await contained(this.rootDir, operation.metadata.path, true);
             if (await exists(movedPath)) {
-              const movedStats = await fsp.lstat(movedPath);
-              if (movedStats.isFile()) hash = crypto.createHash("sha256").update(await fsp.readFile(movedPath)).digest("hex");
+              const movedStats = await fsp.lstat(movedPath, { bigint: true });
+              if (movedStats.isFile()) hash = crypto.createHash("sha256").update(await readContainedFile(this.rootDir, operation.metadata.path, movedStats)).digest("hex");
               else if (movedStats.isDirectory()) hash = crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex");
             }
           }
@@ -503,7 +559,10 @@ class SyncEngine {
           const target = await contained(this.rootDir, operation.metadata.path, true);
           let hash;
           if (operation.metadata.contentType === "inode/directory") hash = crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex");
-          else if (await exists(target) && (await fsp.lstat(target)).isFile()) hash = crypto.createHash("sha256").update(await fsp.readFile(target)).digest("hex");
+          else if (await exists(target)) {
+            const targetStats = await fsp.lstat(target, { bigint: true });
+            if (targetStats.isFile()) hash = crypto.createHash("sha256").update(await readContainedFile(this.rootDir, operation.metadata.path, targetStats)).digest("hex");
+          }
           this.rememberOperation(operation, hash);
           await durableJson(this.snapshotPath, this.snapshot);
         }
@@ -603,8 +662,8 @@ class SyncEngine {
           if (!sameWindowsPath && await exists(target)) await this.stageExisting(target);
           await fsp.rename(source, target);
         }
-        const movedStats = await fsp.lstat(target);
-        if (movedStats.isFile()) hash = crypto.createHash("sha256").update(await fsp.readFile(target)).digest("hex");
+        const movedStats = await fsp.lstat(target, { bigint: true });
+        if (movedStats.isFile()) hash = crypto.createHash("sha256").update(await readContainedFile(this.rootDir, metadata.path, movedStats)).digest("hex");
       } else {
         if (await exists(target)) await this.stageExisting(target);
         const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
@@ -682,7 +741,7 @@ class SyncEngine {
           }
           hasSyncEntries = true;
         } else if (entry.isFile()) {
-          const data = await fsp.readFile(target);
+          const data = await readContainedFile(this.rootDir, relative);
           result[relative] = { hash: crypto.createHash("sha256").update(data).digest("hex"), size: data.length, directory: false };
           hasSyncEntries = true;
         }
@@ -751,12 +810,13 @@ class SyncEngine {
         : crypto.createHash("sha256").update(relative).digest("hex").slice(0, 32);
       const objectId = isUpdate ? prior.objectId : `object-${identitySeed}`;
       const fileId = isUpdate ? prior.fileId : `file-${identitySeed}`;
-      const data = isDirectory ? Buffer.alloc(0) : await fsp.readFile(path.join(this.rootDir, ...relative.split("/")));
+      const data = isDirectory ? Buffer.alloc(0) : await readContainedFile(this.rootDir, relative);
+      const contentHash = crypto.createHash("sha256").update(data).digest("hex");
       const key = await this.fileKeyResolver({ objectId, fileId, path: relative, keyEpoch: this.keyEpoch });
       const metadata = { path: relative, name: path.basename(relative), size: data.length, ...(isDirectory ? { contentType: "inode/directory" } : {}) };
       const operation = await this.buildOperation({ operation: isUpdate ? "update" : "create", objectId, fileId, versionId: crypto.randomUUID(), baseRevision: isUpdate ? prior.revision : null, revision: { counter: (prior?.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata, plaintext: data, fileKey: key });
       await this.journal.enqueue(operation);
-      this.rememberOperation(operation, file.hash);
+      this.rememberOperation(operation, contentHash);
     }
     await durableJson(this.snapshotPath, this.snapshot);
   }

@@ -347,3 +347,40 @@ test("Phase 16 engine rejects malicious metadata before local apply", async (t) 
   assert.equal(await fsp.readFile(path.join(root, "safe.txt"), "utf8"), "safe");
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
 });
+
+test("Phase 16 move reads stay bound to the checked file identity", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-file-race-"));
+  const root = path.join(dir, "root");
+  const raced = path.join(root, "raced.txt");
+  const replacement = path.join(root, "replacement.txt");
+  const ordinary = path.join(root, "ordinary.txt");
+  await fsp.mkdir(root, { recursive: true });
+  await fsp.writeFile(raced, "inside payload");
+  await fsp.writeFile(replacement, "replacement payload");
+  await fsp.writeFile(ordinary, "ordinary payload");
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+
+  const key = crypto.randomBytes(32);
+  const sync = await engine(root, { async push() { return { status: 201 }; }, async list() { return []; } }, key);
+  const fspOpen = fsp.open;
+  fsp.open = async (filePath, ...args) => {
+    if (path.resolve(String(filePath)) === path.resolve(raced)) {
+      await fsp.unlink(raced);
+      await fsp.rename(replacement, raced);
+    }
+    return fspOpen.call(fsp, filePath, ...args);
+  };
+  const base = {
+    operation: "move", objectId: "object-race", fileId: "file-race", versionId: "version-race",
+    operationId: "operation-race", deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 1, deviceId: "device-a" }, fileKey: key,
+  };
+  try {
+    await assert.rejects(() => sync.buildOperation({ ...base, metadata: { path: "raced.txt", sourcePath: "previous.txt" } }), { code: "unsafe_path" });
+    const ordinaryMove = await sync.buildOperation({ ...base, operationId: "ordinary-move", metadata: { path: "ordinary.txt", sourcePath: "old.txt" } });
+    const payload = protocol.decodeMovePayload(protocol.decryptPayload(ordinaryMove, key), key);
+    assert.deepEqual(payload, Buffer.from("ordinary payload"));
+  } finally {
+    fsp.open = fspOpen;
+  }
+});
