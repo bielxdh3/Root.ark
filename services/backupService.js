@@ -7,6 +7,7 @@ const backupRepository = require("../repositories/backupRepository");
 const { getDatabasePath, getDb, isDbEnabled } = require("../db");
 const { resolveRuntimePath } = require("../src/runtime-paths");
 const { attestCiphertextOnlyFile } = require("../src/services/deploymentResilience");
+const { getUploadQuarantineDir, isSensitiveQuarantineItem, readQuarantineMetadata, validateQuarantinePayloads } = require("../src/quarantine-paths");
 
 const BACKUPS_DIR = resolveRuntimePath("data", "backups");
 const LOCK_FILE = path.join(BACKUPS_DIR, ".backup.lock");
@@ -81,6 +82,7 @@ function isSensitivePath(relativePath) {
   if (base.includes("credentials") || base.includes("service-account")) return true;
   if (base.endsWith(".key") || base.endsWith(".pem") || base.endsWith(".p12")) return true;
   if (base === "server-master.key") return true;
+  if (base === ".rootark-quarantine-restore-journal.json") return true;
   return false;
 }
 
@@ -115,6 +117,7 @@ async function collectBackupFiles(options = {}) {
   const includePending = envBool("BACKUP_INCLUDE_PENDING", false);
 
   for (const name of fs.existsSync(dataDir) ? fs.readdirSync(dataDir) : []) {
+    if (name === "quarantine.json") continue;
     const absolutePath = path.join(dataDir, name);
     const entryPath = normalizeEntryPath(path.posix.join("data", name));
     if (isSensitivePath(entryPath)) continue;
@@ -125,6 +128,24 @@ async function collectBackupFiles(options = {}) {
     )) {
       files.push({ absolutePath, entryPath, size: stat.size });
     }
+  }
+
+  const quarantineDir = getUploadQuarantineDir();
+  const quarantineMetadata = readQuarantineMetadata(resolveRuntimePath("data", "quarantine.json"));
+  const quarantinePayloads = quarantineMetadata ? validateQuarantinePayloads(quarantineMetadata.items, quarantineDir) : [];
+  if (quarantineMetadata) {
+    const safeItems = quarantineMetadata.items.filter((item) => {
+      const storedPath = path.posix.join("data", "quarantine", item.storedQuarantineFilename);
+      return !isSensitivePath(storedPath) && !isSensitiveQuarantineItem(item);
+    });
+    const safeNames = new Set(safeItems.map((item) => item.storedQuarantineFilename));
+    const metadataContents = Buffer.from(JSON.stringify({ ...quarantineMetadata, items: safeItems }));
+    files.push({ contents: metadataContents, entryPath: "data/quarantine.json", size: metadataContents.length });
+    files.push(...quarantinePayloads.filter((payload) => safeNames.has(payload.filename)).map((payload) => ({
+    absolutePath: payload.absolutePath,
+    entryPath: normalizeEntryPath(path.posix.join("data", "quarantine", payload.filename)),
+    size: payload.size,
+    })));
   }
 
   if (isDbEnabled()) {
@@ -180,7 +201,7 @@ async function collectBackupFiles(options = {}) {
     if (!await cloudStorage.download(folderId, name, staged, remote.area)) throw new Error("Cloud backup object is unavailable");
     const local = known.get(entryPath);
     if (local) {
-      if (await calculateFileHash(local.absolutePath) !== await calculateFileHash(staged)) throw new Error("Cloud and local backup objects differ");
+      if (await calculateBackupEntryHash(local) !== await calculateFileHash(staged)) throw new Error("Cloud and local backup objects differ");
       fs.rmSync(staged, { force: true });
     } else {
       known.set(entryPath, { absolutePath: staged, entryPath, size: fs.statSync(staged).size, cloudOnly: true });
@@ -216,6 +237,13 @@ function calculateFileHash(filePath) {
     input.on("error", reject);
     input.on("end", () => resolve(hash.digest("hex")));
   });
+}
+
+function calculateBackupEntryHash(file) {
+  if (Buffer.isBuffer(file.contents)) {
+    return Promise.resolve(crypto.createHash("sha256").update(file.contents).digest("hex"));
+  }
+  return calculateFileHash(file.absolutePath);
 }
 
 function runtimeRootIdentity() {
@@ -632,7 +660,10 @@ async function createZipArchive(archivePath, manifest, files) {
       archive.on("error", onArchiveError);
       archive.pipe(output);
       archive.append(JSON.stringify(manifest, null, 2), { name: "backup-manifest.json" });
-      for (const file of files) archive.file(file.absolutePath, { name: file.entryPath });
+      for (const file of files) {
+        if (Buffer.isBuffer(file.contents)) archive.append(file.contents, { name: file.entryPath });
+        else archive.file(file.absolutePath, { name: file.entryPath });
+      }
       Promise.resolve(archive.finalize()).then(() => { finalized = true; void finish(); }, onArchiveError);
     } catch (error) {
       if (fd !== undefined && !output) { try { fs.closeSync(fd); } catch {} }
