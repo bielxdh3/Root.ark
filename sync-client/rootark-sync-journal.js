@@ -35,7 +35,12 @@ async function durableWrite(filePath, value) {
     await handle.close();
   }
   await fsp.rename(temporary, filePath);
-  await syncDirectory(directory);
+  try {
+    await syncDirectory(directory);
+  } catch (error) {
+    error.journalCommitted = true;
+    throw error;
+  }
 }
 
 class SyncJournal {
@@ -57,15 +62,21 @@ class SyncJournal {
   }
 
   async commit(mutator) {
-    this.queue = this.queue.then(async () => {
+    const transaction = this.queue.then(async () => {
       const next = { version: JOURNAL_VERSION, pending: [...this.state.pending], seen: [...this.state.seen] };
       await mutator(next);
       next.pending = next.pending.slice(-10000);
       next.seen = next.seen.slice(-10000);
-      await durableWrite(this.filePath, next);
+      try {
+        await durableWrite(this.filePath, next);
+      } catch (error) {
+        if (error.journalCommitted) this.state = next;
+        throw error;
+      }
       this.state = next;
     });
-    return this.queue;
+    this.queue = transaction.catch(() => {});
+    return transaction;
   }
 
   async enqueue(operation) {
@@ -74,6 +85,18 @@ class SyncJournal {
       if (!next.seen.includes(operation.operationId) && !next.pending.some((item) => item.operationId === operation.operationId)) next.pending.push(operation);
     });
     return operation;
+  }
+
+  async enqueueMany(operations) {
+    if (!Array.isArray(operations) || operations.some((operation) => !operation?.operationId)) throw new Error("Journal operations require operationId");
+    const operationIds = operations.map((operation) => operation.operationId);
+    if (new Set(operationIds).size !== operationIds.length) throw new Error("Journal batch operationIds must be unique");
+    await this.commit((next) => {
+      const additions = operations.filter((operation) => !next.seen.includes(operation.operationId) && !next.pending.some((item) => item.operationId === operation.operationId));
+      if (next.pending.length + additions.length > 10000) throw new Error("Sync journal capacity exceeded");
+      next.pending.push(...additions);
+    });
+    return operations;
   }
 
   async markSeen(operationId) {

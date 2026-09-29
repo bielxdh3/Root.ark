@@ -78,6 +78,24 @@ test("Phase 12 journal is durable and recovers pending operations", async () => 
   }
 });
 
+test("sync journal commits move batches atomically and remains usable after capacity rejection", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase12-journal-batch-"));
+  try {
+    const filePath = path.join(dir, "journal.json");
+    const journal = await new SyncJournal(filePath).open();
+    journal.state.pending = Array.from({ length: 9999 }, (_, index) => ({ operationId: `queued-${index}` }));
+    await assert.rejects(journal.enqueueMany([{ operationId: "batch-a" }, { operationId: "batch-b" }]), /capacity/);
+    assert.equal(journal.pending().length, 9999);
+
+    journal.state.pending = [];
+    await journal.enqueueMany([{ operationId: "batch-a" }, { operationId: "batch-b" }]);
+    const recovered = await new SyncJournal(filePath).open();
+    assert.deepEqual(recovered.pending().map((operation) => operation.operationId), ["batch-a", "batch-b"]);
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("Phase 12 local bridge is loopback bearer protected, contained, and trash-backed", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase12-bridge-"));
   const events = [];
@@ -155,7 +173,7 @@ test("Phase 16 WebDAV rename and journal failures leave both paths unchanged", a
   assert.equal(await fsp.readFile(secondDestination, "utf8"), "second-destination");
 });
 
-test("Phase 16 WebDAV journal recovery preserves unresolved entries", async (t) => {
+test("Phase 16 WebDAV journal recovery resolves a staged completed move", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-recovery-"));
   const trashDir = path.join(dir, "configured-trash");
   const journal = await new SyncJournal(path.join(dir, "journal.json")).open();
@@ -171,10 +189,14 @@ test("Phase 16 WebDAV journal recovery preserves unresolved entries", async (t) 
 
   const unresolvedBackup = path.join(trashDir, "unresolved.txt");
   await fsp.writeFile(unresolvedBackup, "backup");
-  await fsp.writeFile(path.join(dir, "unresolved.txt"), "destination");
-  await journal.enqueue({ operationId: "recover-2", kind: "move", source: "/source.txt", destination: "/unresolved.txt", trash: path.relative(dir, unresolvedBackup), phase: "staged" });
+  const unresolvedSource = path.join(dir, "unresolved-source.txt");
+  await fsp.writeFile(unresolvedSource, "source");
+  await fsp.rename(unresolvedSource, path.join(dir, "unresolved.txt"));
+  await journal.enqueue({ operationId: "recover-2", kind: "move", source: "/unresolved-source.txt", destination: "/unresolved.txt", trash: path.relative(dir, unresolvedBackup), phase: "staged" });
   await bridge.recoverPending();
-  assert.equal((await journal.recover()).some((item) => item.operationId === "recover-2"), true);
+  assert.deepEqual(await journal.recover(), []);
+  assert.equal(await fsp.readFile(path.join(dir, "unresolved.txt"), "utf8"), "source");
+  assert.equal(await fsp.readFile(unresolvedBackup, "utf8"), "backup");
 });
 
 test("Phase 12 server route stores opaque records and rejects conflict/replay", async (t) => {
