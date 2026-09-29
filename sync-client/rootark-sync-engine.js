@@ -70,6 +70,12 @@ function activeIdentityPath(files, operation, exceptPath) {
     && prior.objectId === operation.objectId && prior.fileId === operation.fileId)?.[0] || null;
 }
 
+function activeFileIdentityPath(files, operation, exceptPath) {
+  return Object.entries(files).find(([relativePath, prior]) => relativePath !== exceptPath
+    && !prior.deleted && !prior.directory
+    && prior.objectId === operation.objectId && prior.fileId === operation.fileId)?.[0] || null;
+}
+
 class SyncEngine {
   constructor(options = {}) {
     if (!options.adapter || typeof options.adapter.push !== "function" || typeof options.adapter.list !== "function") {
@@ -485,13 +491,25 @@ class SyncEngine {
     const metadata = operation.metadata || {};
     if (!metadata.path) fail("Sync operation path is required", "unsafe_path");
     const target = await contained(this.rootDir, metadata.path, true);
+    let cleanupPath = null;
     if (operation.operation === "delete" || operation.tombstone) {
-      await this.stageExisting(target);
-      const prior = this.snapshot.files[metadata.path] || {};
-      this.snapshot.files[metadata.path] = { objectId: operation.objectId, fileId: operation.fileId, versionId: operation.versionId, revision: operation.revision, deleted: true, directory: Boolean(prior.directory) };
+      const priorAtTarget = this.snapshot.files[metadata.path];
+      const targetMatchesIdentity = priorAtTarget && !priorAtTarget.deleted
+        && priorAtTarget.objectId === operation.objectId && priorAtTarget.fileId === operation.fileId;
+      const sourcePath = targetMatchesIdentity ? metadata.path : activeFileIdentityPath(this.snapshot.files, operation, metadata.path);
+      cleanupPath = sourcePath || metadata.path;
+      const deleteTarget = await contained(this.rootDir, cleanupPath, true);
+      await this.stageExisting(deleteTarget);
+      this.rememberOperation(operation, undefined, cleanupPath);
     } else if (operation.operation === "move") {
       if (!metadata.sourcePath) fail("Move source path is required", "unsafe_path");
-      const source = await contained(this.rootDir, metadata.sourcePath, true);
+      const priorAtSource = this.snapshot.files[metadata.sourcePath];
+      const sourceMatchesIdentity = priorAtSource && !priorAtSource.deleted && !priorAtSource.directory
+        && priorAtSource.objectId === operation.objectId && priorAtSource.fileId === operation.fileId;
+      const sourcePath = sourceMatchesIdentity ? metadata.sourcePath
+        : (activeFileIdentityPath(this.snapshot.files, operation, metadata.path) || metadata.sourcePath);
+      cleanupPath = sourcePath;
+      const source = await contained(this.rootDir, sourcePath, true);
       const sourceExists = await exists(source);
       const movePayload = protocol.decodeMovePayload(plaintext, key);
       if (!sourceExists && movePayload === null) fail("Moved file is unavailable and the operation has no recovery payload", "move_source_missing");
@@ -514,7 +532,7 @@ class SyncEngine {
         } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
         hash = crypto.createHash("sha256").update(movePayload).digest("hex");
       }
-      this.rememberOperation(operation, hash);
+      this.rememberOperation(operation, hash, sourcePath);
     } else {
       await fsp.mkdir(path.dirname(target), { recursive: true });
       await containedAbsolute(this.rootDir, path.dirname(target), false);
@@ -554,9 +572,9 @@ class SyncEngine {
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
     }
     if (operation.operation === "move" && metadata.sourcePath) {
-      await this.pruneEmptyUntrackedParents(path.dirname(await contained(this.rootDir, metadata.sourcePath, true)));
+      await this.pruneEmptyUntrackedParents(path.dirname(await contained(this.rootDir, cleanupPath || metadata.sourcePath, true)));
     } else if (operation.operation === "delete" || operation.tombstone) {
-      await this.pruneEmptyUntrackedParents(path.dirname(target));
+      await this.pruneEmptyUntrackedParents(path.dirname(await contained(this.rootDir, cleanupPath || metadata.path, true)));
     }
     await durableJson(this.snapshotPath, this.snapshot);
     if (summary) summary.applied = (summary.applied || 0) + 1;
@@ -658,12 +676,13 @@ class SyncEngine {
     await durableJson(this.snapshotPath, this.snapshot);
   }
 
-  rememberOperation(operation, hash) {
+  rememberOperation(operation, hash, sourcePathOverride) {
     const pathName = operation.metadata?.path;
     if (!pathName) return;
-    const sourcePath = operation.operation === "move" ? operation.metadata.sourcePath
-      : (operation.operation === "update" && operation.metadata.contentType === "inode/directory"
-        ? activeIdentityPath(this.snapshot.files, operation, pathName) : null);
+    const sourcePath = sourcePathOverride !== undefined ? sourcePathOverride
+      : operation.operation === "move" ? operation.metadata.sourcePath
+        : (operation.operation === "update" && operation.metadata.contentType === "inode/directory"
+          ? activeIdentityPath(this.snapshot.files, operation, pathName) : null);
     const prior = sourcePath
       ? this.snapshot.files[sourcePath] || (sourcePath === pathName ? this.snapshot.files[pathName] : null) || {}
       : this.snapshot.files[pathName] || {};
@@ -671,7 +690,7 @@ class SyncEngine {
     this.snapshot.files[pathName] = {
       objectId: operation.objectId, fileId: operation.fileId, versionId: operation.versionId,
       revision: operation.revision, hash: hash || prior.hash, deleted: Boolean(operation.tombstone),
-      directory: operation.tombstone || operation.operation === "move"
+      directory: operation.tombstone || operation.operation === "move" || operation.operation === "delete"
         ? Boolean(prior.directory)
         : operation.metadata?.contentType === "inode/directory",
     };

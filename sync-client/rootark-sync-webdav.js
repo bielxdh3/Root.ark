@@ -335,10 +335,20 @@ class LocalSyncWebDavBridge {
     const destination = await this.destination(req);
     if (destination.target === source) return writeResponse(res, 400, "Source and destination are identical");
     const existing = await fsp.lstat(destination.target).catch((error) => error.code === "ENOENT" ? null : Promise.reject(error));
+    let canonicalSource = null;
+    if (process.platform === "win32") {
+      canonicalSource = await canonicalExistingPath(this.rootDir, source);
+      if (existing) {
+        const canonicalDestination = await canonicalExistingPath(this.rootDir, destination.target);
+        if (canonicalSource.toLowerCase() === canonicalDestination.toLowerCase()) {
+          return writeResponse(res, 400, "Source and destination are identical");
+        }
+      }
+    }
     if (existing && String(req.headers.overwrite || "T").toUpperCase() !== "T") return writeResponse(res, 412, "Destination exists");
     if (existing && (await fsp.lstat(source)).isDirectory() !== existing.isDirectory()) return writeResponse(res, 409, "Cannot overwrite a file with a collection or vice versa");
     const sourceForTranslation = process.platform === "win32"
-      ? encodedWebDavPath(this.rootDir, await canonicalExistingPath(this.rootDir, source))
+      ? encodedWebDavPath(this.rootDir, canonicalSource)
       : parsed.pathname;
     await rejectSymlinks(this.rootDir, path.dirname(destination.target), false);
     const operationId = crypto.randomUUID();

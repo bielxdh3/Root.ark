@@ -454,6 +454,80 @@ test("WebDAV MOVE preserves explicit directory identities when Windows source ca
   }
 });
 
+test("WebDAV MOVE rejects a Windows case-only rename before changing the source", { skip: process.platform !== "win32" }, async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-case-only-"));
+  const root = path.join(dir, "root");
+  await fsp.mkdir(root, { recursive: true });
+  await fsp.writeFile(path.join(root, "source.txt"), "case-only source");
+  const protocolJournal = await new SyncJournal(path.join(dir, "protocol-journal.json")).open();
+  const transactionJournal = await new SyncJournal(path.join(dir, "webdav-journal.json")).open();
+  const bridge = new LocalSyncWebDavBridge({ rootDir: root, token: "webdav-case-only-token", journal: transactionJournal, protocolJournal, toProtocolOperation: async () => [] });
+  await bridge.start();
+  t.after(async () => { await bridge.stop(); await fsp.rm(dir, { recursive: true, force: true }); });
+
+  const moved = await request(bridge.address().port, "/source.txt", {
+    method: "MOVE",
+    headers: { authorization: "Bearer webdav-case-only-token", destination: `http://127.0.0.1:${bridge.address().port}/SOURCE.txt` },
+  });
+  assert.equal(moved.status, 400);
+  assert.equal(await fsp.readFile(path.join(root, "source.txt"), "utf8"), "case-only source");
+  assert.deepEqual(await fsp.readdir(path.join(root, ".rootark-trash")), []);
+  assert.deepEqual((await fsp.readdir(root)).filter((name) => name !== ".rootark-trash"), ["source.txt"]);
+  assert.deepEqual(await transactionJournal.recover(), []);
+  assert.deepEqual(await protocolJournal.recover(), []);
+});
+
+test("offline peers apply the latest move and delete by file identity after intermediate moves", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-offline-latest-path-"));
+  const rootA = path.join(dir, "a");
+  const rootB = path.join(dir, "b");
+  await fsp.mkdir(rootA, { recursive: true });
+  await fsp.mkdir(rootB, { recursive: true });
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const key = crypto.randomBytes(32);
+  const adapter = { async push(operation) { const result = await store.put("alice", operation); return result.kind === "stored" ? { status: 201 } : { status: 409, current: result.current, currentRevision: result.current?.revision || null }; }, async list() { return store.list("alice"); } };
+  const a = await new SyncEngine({ rootDir: rootA, adapter, deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key }).open();
+  await fsp.writeFile(path.join(rootA, "move-a.txt"), "move through two paths");
+  await fsp.writeFile(path.join(rootA, "delete-a.txt"), "move then delete");
+  await a.syncOnce();
+  const b = await new SyncEngine({ rootDir: rootB, adapter, deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key }).open();
+  await b.syncOnce();
+
+  const moveAt = async (sourcePath, destinationPath, versionId) => {
+    const prior = a.snapshot.files[sourcePath];
+    const content = await fsp.readFile(path.join(rootA, ...sourcePath.split("/")));
+    await fsp.rename(path.join(rootA, ...sourcePath.split("/")), path.join(rootA, ...destinationPath.split("/")));
+    await a.enqueueChange({ operation: "move", objectId: prior.objectId, fileId: prior.fileId, versionId, baseRevision: prior.revision, revision: { counter: prior.revision.counter + 1, deviceId: "device-a" }, metadata: { path: destinationPath, sourcePath }, plaintext: content, fileKey: key });
+    await a.syncOnce();
+  };
+  await moveAt("move-a.txt", "move-b.txt", "move-v2");
+  await moveAt("move-b.txt", "move-c.txt", "move-v3");
+  await moveAt("delete-a.txt", "delete-b.txt", "delete-move-v2");
+  const deletePrior = a.snapshot.files["delete-b.txt"];
+  await fsp.rm(path.join(rootA, "delete-b.txt"));
+  await a.enqueueChange({ operation: "delete", objectId: deletePrior.objectId, fileId: deletePrior.fileId, versionId: "delete-v3", baseRevision: deletePrior.revision, revision: { counter: deletePrior.revision.counter + 1, deviceId: "device-a" }, metadata: { path: "delete-b.txt" }, plaintext: Buffer.alloc(0), fileKey: key });
+  await a.syncOnce();
+
+  const latest = await adapter.list();
+  assert.equal(latest.length, 2);
+  assert.equal(latest.find((operation) => operation.metadata.path === "move-c.txt")?.operation, "move");
+  assert.equal(latest.find((operation) => operation.objectId === deletePrior.objectId)?.operation, "delete");
+  await b.syncOnce();
+
+  assert.equal(await fsp.readFile(path.join(rootB, "move-c.txt"), "utf8"), "move through two paths");
+  assert.equal(await fsp.stat(path.join(rootB, "move-a.txt")).then(() => true, () => false), false);
+  assert.equal(await fsp.stat(path.join(rootB, "move-b.txt")).then(() => true, () => false), false);
+  assert.equal(await fsp.stat(path.join(rootB, "delete-a.txt")).then(() => true, () => false), false);
+  assert.equal(await fsp.stat(path.join(rootB, "delete-b.txt")).then(() => true, () => false), false);
+  assert.equal(b.snapshot.files["move-a.txt"], undefined);
+  assert.equal(b.snapshot.files["move-b.txt"], undefined);
+  assert.equal(b.snapshot.files["delete-a.txt"], undefined);
+  assert.equal(b.snapshot.files["move-c.txt"].deleted, false);
+  assert.equal(b.snapshot.files["delete-b.txt"].deleted, true);
+
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+});
+
 test("WebDAV directory MOVE rejects nested file/collection collisions without changing either tree", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-nested-types-"));
   const root = path.join(dir, "root");
