@@ -518,7 +518,9 @@ class SyncEngine {
       let hash;
       if (sourceExists) {
         if (source !== target) {
-          if (await exists(target)) await this.stageExisting(target);
+          const sameWindowsPath = process.platform === "win32"
+            && path.resolve(source).toLowerCase() === path.resolve(target).toLowerCase();
+          if (!sameWindowsPath && await exists(target)) await this.stageExisting(target);
           await fsp.rename(source, target);
         }
         const movedStats = await fsp.lstat(target);

@@ -477,6 +477,32 @@ test("WebDAV MOVE rejects a Windows case-only rename before changing the source"
   assert.deepEqual(await protocolJournal.recover(), []);
 });
 
+test("remote case-only MOVE updates Windows filename casing without staging the source", { skip: process.platform !== "win32" }, async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-remote-case-only-"));
+  const root = path.join(dir, "root");
+  await fsp.mkdir(root, { recursive: true });
+  await fsp.writeFile(path.join(root, "Source.txt"), "case-only remote source");
+  const key = crypto.randomBytes(32);
+  const adapter = { async push() { return { status: 201 }; }, async list() { return []; } };
+  const engine = await new SyncEngine({ rootDir: root, adapter, deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private", fileKeyResolver: () => key }).open();
+  engine.snapshot.files["Source.txt"] = { objectId: "case-only-object", fileId: "case-only-file", revision: { counter: 1, deviceId: "device-a" }, hash: crypto.createHash("sha256").update("case-only remote source").digest("hex"), deleted: false, directory: false };
+  const operation = protocol.createOperation({
+    operation: "move", objectId: "case-only-object", fileId: "case-only-file", versionId: "case-only-v2", operationId: "case-only-move",
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", baseRevision: { counter: 1, deviceId: "device-a" },
+    revision: { counter: 2, deviceId: "device-a" }, metadata: { path: "source.txt", sourcePath: "Source.txt" },
+    plaintext: Buffer.from("case-only remote source"), fileKey: key,
+  });
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+
+  await engine.apply(operation);
+
+  assert.deepEqual((await fsp.readdir(root)).filter((name) => !name.startsWith(".rootark-sync-")), ["source.txt"]);
+  assert.equal(await fsp.readFile(path.join(root, "source.txt"), "utf8"), "case-only remote source");
+  assert.equal(await fsp.stat(path.join(root, ".rootark-trash")).then(() => true, () => false), false);
+  assert.equal(engine.snapshot.files["Source.txt"], undefined);
+  assert.equal(engine.snapshot.files["source.txt"].deleted, false);
+});
+
 test("offline peers apply the latest move and delete by file identity after intermediate moves", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-offline-latest-path-"));
   const rootA = path.join(dir, "a");
