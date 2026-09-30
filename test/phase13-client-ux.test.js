@@ -81,6 +81,13 @@ test("protected browser session keeps keys in memory and wires queue/sync/logout
   await assert.rejects(protectedSession.getKey());
 });
 
+test("chunked password uploads send the password only on the final chunk", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-workspace.js"), "utf8");
+  assert.match(source, /if \(index === 0\) appendEncryption\(form, \{\s*\.\.\.settings,\s*password: totalChunks === 1 \? settings\.password : "",\s*\}\);/);
+  assert.match(source, /if \(index === totalChunks - 1 && totalChunks > 1 && settings\.password\) form\.append\("password", settings\.password\);/);
+  assert.match(source, /finally \{ form\.delete\("password"\); \}/);
+});
+
 test("offline queue and sync adapter reject plaintext, keys, and search terms", () => {
   const store = new Map();
   const local = { getItem: (key) => store.get(key) || null, setItem: (key, value) => store.set(key, value), removeItem: (key) => store.delete(key) };

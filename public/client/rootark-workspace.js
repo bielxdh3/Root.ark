@@ -639,10 +639,14 @@
       form.append("chunkIndex", String(index));
       form.append("totalChunks", String(totalChunks));
       if (index === 0 && versionComment) form.append("versionComment", versionComment);
-      if (index === 0) appendEncryption(form, settings);
+      if (index === 0) appendEncryption(form, {
+        ...settings,
+        password: totalChunks === 1 ? settings.password : "",
+      });
+      if (index === totalChunks - 1 && totalChunks > 1 && settings.password) form.append("password", settings.password);
       form.append("chunk", file.slice(index * CHUNK_BYTES, Math.min(file.size, (index + 1) * CHUNK_BYTES)), file.name);
       try { payload = await api.postForm(api.query("/upload-chunk", { folderId: state.folderId }), form); }
-      finally { if (index === 0) form.delete("password"); }
+      finally { form.delete("password"); }
       progress(Math.min(99, Math.round(((index + 1) / totalChunks) * 100)));
     }
     return payload;
