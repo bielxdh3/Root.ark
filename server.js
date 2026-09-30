@@ -1712,22 +1712,42 @@ function buildPublicShareUrl(req, token) {
   return `${req.protocol}://${req.get("host")}/share/${token}`;
 }
 
+function redactShareTokenFromAuditValue(value, token) {
+  const literal = String(token || "");
+  if (!literal) return value;
+
+  const escapedToken = literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const tokenPattern = new RegExp(escapedToken, "gi");
+  const redactString = (text) => String(text).replace(tokenPattern, "[REDACTED]");
+  const redact = (item) => {
+    if (typeof item === "string") return redactString(item);
+    if (Array.isArray(item)) return item.map(redact);
+    if (item && typeof item === "object") {
+      return Object.fromEntries(Object.entries(item).map(([key, nested]) => [redactString(key), redact(nested)]));
+    }
+    return item;
+  };
+
+  return redact(value);
+}
+
 function getShareAuditActor(req) {
-  return getAuditActor({ ...req, user: { username: "public", role: "public" } }, "public");
+  return { ...getAuditActor(req, "public"), username: "public", role: "public" };
 }
 
 function logShareAudit(req, eventType, token, link, action, result, details = {}) {
+  const auditTokenId = crypto.createHash("sha256").update(token, "utf8").digest("hex");
   auditLog(
     eventType,
-    getShareAuditActor(req),
-    { type: "public_link", id: token },
+    redactShareTokenFromAuditValue(getShareAuditActor(req), token),
+    { type: "public_link", id: auditTokenId },
     action,
     result,
-    {
+    redactShareTokenFromAuditValue({
       fileName: link?.fileName || null,
       folderId: link?.folderId || ROOT_FOLDER_ID,
       ...details,
-    }
+    }, token)
   );
 }
 

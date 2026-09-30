@@ -372,6 +372,7 @@ This track may proceed conversationally in parallel with stabilization. Runtime 
 - `[DECIDED]` D-005 separates immediate access revocation from retained permanent deletion and requires reinforced confirmation for immediate destruction.
 - `[DECIDED]` D-008 sets 30-day operational logs, 180-day security/audit logs, immediate access revocation, and truthful pending/completed states for backup-aware cryptographic erasure; detailed access, export, deletion, and privacy rules remain `[OPEN]`.
 - `[DECIDED]` D-009 requires quarantine for unverified external uploads and preserves the zero-knowledge boundary for scanning, derived data, sharing, WebDAV, synchronization, and restore.
+- `[DONE]` Public-link audit events correlate a link with a one-way SHA-256 token digest and do not persist the bearer token; route-level regression coverage is in `test/public-share-audit-security.test.js`. This closes the audit-secret exposure only; Issue #68 capability and zero-knowledge acceptance remains open.
 - `[PARALLEL-DISCOVERY]` Define the remaining audit access, export, deletion, privacy, investigation-extension, quarantine, and operational ownership details.
 - `[PARALLEL-DISCOVERY]` Data export and portability.
 - `[PARALLEL-DISCOVERY]` Operational ownership, deployment, updates, and recovery.
