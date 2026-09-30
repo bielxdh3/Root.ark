@@ -93,22 +93,36 @@ function isContained(parent, candidate) {
   return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
 }
 
-async function createHarness(t) {
+async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true } = {}) {
   const password = crypto.randomBytes(24).toString("base64url");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-upload-safety-"));
   const quarantineDir = path.join(dir, "quarantine");
   fs.mkdirSync(path.join(dir, "data"));
   fs.cpSync(PUBLIC, path.join(dir, "public"), { recursive: true });
   fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([
-    { username: "uploader", password: bcrypt.hashSync(password, 10), role: "user", permissions: { upload: true }, sessionVersion: 0 },
+    { username: "uploader", password: bcrypt.hashSync(password, 10), role: "user", permissions: { upload: true, listFiles: true }, sessionVersion: 0 },
     { username: "viewer", password: bcrypt.hashSync(password, 10), role: "user", permissions: {}, sessionVersion: 0 },
   ]));
   fs.writeFileSync(path.join(dir, "data", "folders.json"), JSON.stringify([
     { id: "root", name: "Arquivos atuais", createdBy: "sistema", allowedUsers: [], isRoot: true },
     { id: FOLDER_ID, name: "Upload safety", createdBy: "uploader", allowedUsers: [] },
   ]));
+  const chunkRoot = path.join(dir, "temp", ".chunks");
+  for (const session of chunkSessions) {
+    const sessionDir = path.join(chunkRoot, session.folderId || FOLDER_ID, session.uploadId);
+    fs.mkdirSync(sessionDir, { recursive: true });
+    for (const [name, contents] of Object.entries(session.files || {})) {
+      const bytes = name === "metadata.json" && typeof contents !== "string" ? JSON.stringify(contents) : contents;
+      fs.writeFileSync(path.join(sessionDir, name), bytes);
+    }
+  }
+  const preloadContents = typeof preloadSource === "function" ? preloadSource({ dir, chunkRoot }) : preloadSource;
+  const preloadPath = preloadContents ? path.join(dir, "test-preload.js") : "";
+  if (preloadPath) fs.writeFileSync(preloadPath, preloadContents);
   const port = await getUnusedPort();
-  const child = spawn(process.execPath, [SERVER], {
+  const stdout = [];
+  const stderr = [];
+  const child = spawn(process.execPath, [...(preloadPath ? ["--require", preloadPath] : []), SERVER], {
     cwd: dir,
     env: {
       ...process.env,
@@ -121,9 +135,11 @@ async function createHarness(t) {
       UPLOAD_QUARANTINE_DIR: quarantineDir,
       JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
     },
-    stdio: "ignore",
+    stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
+  child.stdout.on("data", (chunk) => stdout.push(chunk.toString()));
+  child.stderr.on("data", (chunk) => stderr.push(chunk.toString()));
   t.after(async () => {
     if (child.exitCode === null) {
       await new Promise((resolve) => {
@@ -135,8 +151,8 @@ async function createHarness(t) {
     fs.rmSync(dir, { recursive: true, force: true });
     assert.equal(fs.existsSync(dir), false);
   });
-  assert.equal((await waitForServer(port)).status, 200);
-  return { dir, port, quarantineDir, password };
+  if (waitForReady) assert.equal((await waitForServer(port)).status, 200);
+  return { dir, port, quarantineDir, password, chunkRoot, child, stdout, stderr };
 }
 
 async function upload(port, session, filename, bytes) {
@@ -156,6 +172,80 @@ async function uploadPayload(port, session, payload) {
     },
     body: payload.body,
   });
+}
+
+async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, totalChunks, bytes, encryptionLevel, password, versionComment, expiresInDays }) {
+  const parts = [
+    { field: "uploadId", bytes: uploadId },
+    { field: "originalName", bytes: originalName },
+    { field: "chunkIndex", bytes: String(chunkIndex) },
+    { field: "totalChunks", bytes: String(totalChunks) },
+  ];
+  for (const [field, value] of [["encryptionLevel", encryptionLevel], ["password", password], ["versionComment", versionComment], ["expiresInDays", expiresInDays]]) {
+    if (value !== undefined) parts.push({ field, bytes: String(value) });
+  }
+  parts.push({ field: "chunk", filename: originalName, bytes });
+  const payload = multipartParts(parts);
+  return request(port, `/upload-chunk?folderId=${FOLDER_ID}`, {
+    method: "POST",
+    headers: {
+      cookie: session.cookie,
+      origin: `http://127.0.0.1:${port}`,
+      "x-csrf-token": session.csrf,
+      "content-type": payload.contentType,
+      "content-length": payload.body.length,
+    },
+    body: payload.body,
+  });
+}
+
+async function postJson(port, session, requestPath, value) {
+  const body = Buffer.from(JSON.stringify(value));
+  return request(port, requestPath, {
+    method: "POST",
+    headers: {
+      cookie: session.cookie,
+      origin: `http://127.0.0.1:${port}`,
+      "x-csrf-token": session.csrf,
+      "content-type": "application/json",
+      "content-length": body.length,
+    },
+    body,
+  });
+}
+
+function waitForExit(child, timeout = TIMEOUT_MS) {
+  if (child.exitCode !== null) return Promise.resolve(child.exitCode);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("server process did not exit")), timeout);
+    child.once("exit", (code) => { clearTimeout(timer); resolve(code); });
+  });
+}
+
+async function waitForFile(filePath, timeout = TIMEOUT_MS) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(filePath)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return fs.existsSync(filePath);
+}
+
+function legacyChunkMetadata(uploadId, overrides = {}) {
+  return {
+    uploadId,
+    folderId: FOLDER_ID,
+    originalName: "encrypted.txt",
+    fileName: "encrypted.txt",
+    totalChunks: 2,
+    uploadedBy: "uploader",
+    versionComment: "",
+    encryptionLevel: "password",
+    expiresInDays: "",
+    createdAt: new Date().toISOString(),
+    password: "legacy-secret-that-must-be-removed",
+    ...overrides,
+  };
 }
 
 function filesUnder(dir) {
@@ -302,4 +392,241 @@ test("valid binary and UTF-8 filename uploads preserve bytes and API names", { t
   assert.equal(result.fileName, fileName);
   assert.equal(result.originalName, fileName);
   assert.deepEqual(fs.readFileSync(path.join(harness.dir, "temp", FOLDER_ID, fileName)), bytes);
+});
+
+test("chunk uploads scrub legacy secrets and require the final password before saving the last part", { timeout: 45_000 }, async (t) => {
+  const legacyId = "legacy-resume";
+  const firstPart = Buffer.from("resumed ");
+  const finalPart = Buffer.from("upload\n");
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId: legacyId, files: { "metadata.json": legacyChunkMetadata(legacyId), "0.part": firstPart } }],
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const legacyDir = path.join(harness.chunkRoot, FOLDER_ID, legacyId);
+  const legacyMetadataPath = path.join(legacyDir, "metadata.json");
+  const scrubbedLegacyMetadata = JSON.parse(fs.readFileSync(legacyMetadataPath, "utf8"));
+  assert.equal(Object.hasOwn(scrubbedLegacyMetadata, "password"), false);
+  assert.equal(fs.readFileSync(path.join(legacyDir, "0.part")).toString(), firstPart.toString());
+
+  const password = "final-only-secret-42";
+  const resumed = await uploadChunk(harness.port, session, {
+    uploadId: legacyId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    bytes: finalPart,
+    password,
+  });
+  assert.equal(resumed.status, 200, resumed.body);
+  assert.equal(JSON.parse(resumed.body).complete, true);
+  const encryptedFilePath = path.join(harness.dir, "temp", FOLDER_ID, "encrypted.txt");
+  const encryptedFile = fs.readFileSync(encryptedFilePath);
+  const encryptedMetadata = JSON.parse(fs.readFileSync(path.join(harness.dir, "data", "encrypted-files.json"), "utf8"))[`${FOLDER_ID}/encrypted.txt`];
+  assert.equal(encryptedMetadata.accessControl.requiresPassword, true);
+  assert.equal(JSON.stringify(encryptedMetadata).includes(password), false);
+  assert.notDeepEqual(encryptedFile, Buffer.concat([firstPart, finalPart]));
+  const layer = encryptedMetadata.layers.find((item) => item.type === "password");
+  const key = crypto.pbkdf2Sync(password, Buffer.from(layer.salt, "hex"), encryptedMetadata.iterations, 32, "sha256");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(layer.iv, "hex"));
+  decipher.setAuthTag(Buffer.from(layer.authTag, "hex"));
+  const decrypted = Buffer.concat([decipher.update(encryptedFile), decipher.final()]);
+  assert.deepEqual(decrypted, Buffer.concat([firstPart, finalPart]));
+
+  const newUploadId = "new-password-upload";
+  const first = await uploadChunk(harness.port, session, {
+    uploadId: newUploadId,
+    originalName: "new-encrypted.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.from("first "),
+    encryptionLevel: "password",
+    password,
+  });
+  assert.equal(first.status, 200, first.body);
+  const newSessionDir = path.join(harness.chunkRoot, FOLDER_ID, newUploadId);
+  const firstMetadata = JSON.parse(fs.readFileSync(path.join(newSessionDir, "metadata.json"), "utf8"));
+  assert.equal(Object.hasOwn(firstMetadata, "password"), false);
+  assert.equal(JSON.stringify(firstMetadata).includes(password), false);
+  assert.equal(fs.existsSync(path.join(newSessionDir, "1.part")), false);
+
+  const rejectedFinal = await uploadChunk(harness.port, session, {
+    uploadId: newUploadId,
+    originalName: "new-encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    bytes: Buffer.from("last"),
+  });
+  assert.equal(rejectedFinal.status, 400, rejectedFinal.body);
+  assert.match(JSON.parse(rejectedFinal.body).error, /bloco final/i);
+  assert.equal(fs.readFileSync(path.join(newSessionDir, "0.part")).toString(), "first ");
+  assert.equal(fs.existsSync(path.join(newSessionDir, "1.part")), false);
+
+  const acceptedFinal = await uploadChunk(harness.port, session, {
+    uploadId: newUploadId,
+    originalName: "new-encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    bytes: Buffer.from("last"),
+    password,
+  });
+  assert.equal(acceptedFinal.status, 200, acceptedFinal.body);
+  assert.equal(JSON.parse(acceptedFinal.body).complete, true);
+  assert.equal(fs.existsSync(newSessionDir), false);
+  assert.equal((harness.stdout.join("") + harness.stderr.join("")).includes(password), false);
+});
+
+test("malformed, unreadable, and orphan chunk sessions cannot overwrite retained parts", { timeout: 45_000 }, async (t) => {
+  let unreadableMetadataPath;
+  let markerPath;
+  const unreadableId = "unreadable-session";
+  const malformedId = "malformed-session";
+  const orphanId = "orphan-session";
+  const harness = await createHarness(t, {
+    chunkSessions: [
+      { uploadId: unreadableId, files: { "metadata.json": legacyChunkMetadata(unreadableId), "0.part": "unreadable-original" } },
+      { uploadId: malformedId, files: { "metadata.json": "{invalid", "0.part": "malformed-original" } },
+      { uploadId: orphanId, files: { "0.part": "orphan-original" } },
+    ],
+    preloadSource: ({ dir, chunkRoot }) => {
+      unreadableMetadataPath = path.join(chunkRoot, FOLDER_ID, unreadableId, "metadata.json");
+      markerPath = path.join(dir, "unreadable-read-attempted");
+      return [
+        'const fs = require("node:fs");',
+        'const path = require("node:path");',
+        `const target = ${JSON.stringify(unreadableMetadataPath)};`,
+        `const marker = ${JSON.stringify(markerPath)};`,
+        "const originalOpenSync = fs.openSync;",
+        "fs.openSync = function (file, flags, ...args) {",
+        "  if (typeof file === 'string' && path.resolve(file) === path.resolve(target) && (flags & fs.constants.O_RDONLY) === fs.constants.O_RDONLY) {",
+        "    fs.writeFileSync(marker, 'triggered');",
+        "    const error = new Error('injected metadata read failure'); error.code = 'EACCES'; throw error;",
+        "  }",
+        "  return originalOpenSync.call(this, file, flags, ...args);",
+        "};",
+      ].join("\n");
+    },
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  assert.equal(fs.readFileSync(markerPath, "utf8"), "triggered");
+  for (const [uploadId, partName, original] of [
+    [unreadableId, "0.part", "unreadable-original"],
+    [malformedId, "0.part", "malformed-original"],
+    [orphanId, "0.part", "orphan-original"],
+  ]) {
+    const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+    const blocked = JSON.parse(fs.readFileSync(path.join(sessionDir, "metadata.json"), "utf8"));
+    assert.equal(blocked.__resumeBlocked, true, uploadId);
+    assert.equal(JSON.stringify(blocked).includes("legacy-secret-that-must-be-removed"), false);
+    const response = await uploadChunk(harness.port, session, {
+      uploadId,
+      originalName: "encrypted.txt",
+      chunkIndex: 0,
+      totalChunks: 2,
+      bytes: "attempted-overwrite",
+      encryptionLevel: "password",
+      password: "new-password-42",
+    });
+    assert.equal(response.status, 409, response.body);
+    assert.equal(fs.readFileSync(path.join(sessionDir, partName), "utf8"), original);
+  }
+});
+
+test("unsafe chunk session symlinks are rejected before touching the target", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t);
+  const session = await login(harness.port, "uploader", harness.password);
+  const folderDir = path.join(harness.chunkRoot, FOLDER_ID);
+  const targetDir = path.join(harness.dir, "outside-session-target");
+  fs.mkdirSync(folderDir, { recursive: true });
+  fs.mkdirSync(targetDir);
+  fs.writeFileSync(path.join(targetDir, "keep.txt"), "do not touch");
+  const sessionDir = path.join(folderDir, "linked-session");
+  try {
+    fs.symlinkSync(targetDir, sessionDir, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) return t.skip(`directory symlink unavailable: ${error.code}`);
+    throw error;
+  }
+
+  const response = await uploadChunk(harness.port, session, {
+    uploadId: "linked-session",
+    originalName: "encrypted.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: "must-not-write",
+    encryptionLevel: "password",
+    password: "new-password-42",
+  });
+  assert.equal(response.status, 400, response.body);
+  assert.equal(fs.readFileSync(path.join(targetDir, "keep.txt"), "utf8"), "do not touch");
+  assert.equal(fs.existsSync(path.join(targetDir, "0.part")), false);
+});
+
+test("chunk upload storage symlinks are rejected before Multer creates files outside the storage root", { timeout: 30_000 }, async (t) => {
+  let outsidePath;
+  let markerPath;
+  const harness = await createHarness(t, {
+    waitForReady: false,
+    preloadSource: ({ dir }) => {
+      outsidePath = path.join(dir, "outside-chunk-storage");
+      markerPath = path.join(dir, "chunk-storage-symlink-created");
+      return [
+        'const fs = require("node:fs");',
+        'const path = require("node:path");',
+        `const root = ${JSON.stringify(dir)};`,
+        `const outside = ${JSON.stringify(outsidePath)};`,
+        `const marker = ${JSON.stringify(markerPath)};`,
+        'const temp = path.join(root, "temp");',
+        'const chunkRoot = path.join(temp, ".chunks");',
+        'fs.mkdirSync(temp, { recursive: true });',
+        'fs.mkdirSync(outside, { recursive: true });',
+        'try {',
+        '  fs.symlinkSync(outside, chunkRoot, process.platform === "win32" ? "junction" : "dir");',
+        '  fs.writeFileSync(marker, "created");',
+        '} catch (error) {',
+        '  fs.writeFileSync(marker, `unavailable:${error.code || "unknown"}`);',
+        '}',
+      ].join("\n");
+    },
+  });
+
+  assert.equal(await waitForFile(markerPath), true, "startup did not reach the injected storage path setup");
+  const setup = fs.readFileSync(markerPath, "utf8");
+  if (setup.startsWith("unavailable:")) return t.skip(`chunk storage symlink unavailable: ${setup.slice("unavailable:".length)}`);
+
+  assert.notEqual(await waitForExit(harness.child), 0);
+  assert.equal(fs.existsSync(path.join(outsidePath, "incoming")), false);
+  await assert.rejects(request(harness.port, "/login.html"));
+});
+
+test("chunk upload startup fails closed when chunk-session enumeration cannot be verified", { timeout: 45_000 }, async (t) => {
+  for (const targetName of ["root", "folder"]) {
+    await t.test(`${targetName} directory enumeration failure`, { timeout: 20_000 }, async (nested) => {
+      let markerPath;
+      const harness = await createHarness(nested, {
+        waitForReady: false,
+        chunkSessions: targetName === "folder" ? [{ uploadId: "enumeration-seed", files: {} }] : [],
+        preloadSource: ({ dir, chunkRoot }) => {
+          const targetPath = targetName === "root" ? chunkRoot : path.join(chunkRoot, FOLDER_ID);
+          markerPath = path.join(dir, "enumeration-failure-injected");
+          return [
+            'const fs = require("node:fs");',
+            'const path = require("node:path");',
+            `const target = ${JSON.stringify(targetPath)};`,
+            `const marker = ${JSON.stringify(markerPath)};`,
+            "const originalReaddirSync = fs.readdirSync;",
+            "fs.readdirSync = function (directory, ...args) {",
+            "  if (typeof directory === 'string' && path.resolve(directory) === path.resolve(target)) {",
+            "    fs.writeFileSync(marker, 'triggered');",
+            "    const error = new Error('injected directory enumeration failure'); error.code = 'EACCES'; throw error;",
+            "  }",
+            "  return originalReaddirSync.call(this, directory, ...args);",
+            "};",
+          ].join("\n");
+        },
+      });
+      assert.notEqual(await waitForExit(harness.child), 0);
+      assert.equal(fs.readFileSync(markerPath, "utf8"), "triggered");
+      await assert.rejects(request(harness.port, "/login.html"));
+    });
+  }
 });
