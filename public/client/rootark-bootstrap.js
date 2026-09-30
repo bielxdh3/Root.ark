@@ -1,24 +1,28 @@
 (function () {
   "use strict";
 
-  const status = document.getElementById("protectedClientStatus");
-  const result = document.getElementById("protectedSearchResult");
-  const input = document.getElementById("protectedSearchInput");
-  const searchButton = document.getElementById("protectedSearchButton");
   const index = window.RootarkProtectedIndex;
   const protectedStore = window.RootarkProtectedStore?.createProtectedStore?.();
   const session = window.RootarkProtectedSession;
   session?.attachStore?.(protectedStore);
 
-  function setStatus(message) { if (status) status.textContent = message; }
-
-  if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("/service-worker.js", { scope: "/" }).then(() => setStatus("Offline: shell publico pronto; conteudo protegido fica fora do cache."), () => setStatus("Offline indisponivel nesta sessao."));
-  } else {
-    setStatus("Offline indisponivel nesta sessao.");
+  function setStatus(message) {
+    const status = document.getElementById("protectedClientStatus");
+    if (status) status.textContent = message;
   }
 
-  searchButton?.addEventListener("click", async () => {
+  function updateStatus() {
+    if (!("serviceWorker" in navigator)) return setStatus("Offline indisponivel nesta sessao.");
+    setStatus(navigator.onLine
+      ? "Online: o conteúdo protegido não é armazenado no cache público."
+      : "Offline: o conteúdo protegido exige um índice e uma chave já desbloqueados neste dispositivo.");
+  }
+
+  document.addEventListener("click", async (event) => {
+    const searchButton = event.target.closest?.("#protectedSearchButton");
+    if (!searchButton) return;
+    const result = document.getElementById("protectedSearchResult");
+    const input = document.getElementById("protectedSearchInput");
     if (!index || !protectedStore || typeof session?.getKey !== "function") {
       if (result) result.textContent = "Nenhum indice protegido local foi desbloqueado.";
       return;
@@ -35,10 +39,12 @@
   });
 
   window.addEventListener("online", async () => {
-    setStatus("Online: fila local criptografada pronta para sincronizar.");
-    try { await session?.syncOnce?.(); } catch { setStatus("Online: sincronizacao protegida aguardando autorizacao."); }
+    updateStatus();
+    try { await session?.syncOnce?.(); } catch { setStatus("Online: sincronização protegida aguardando autorização."); }
   });
-  window.addEventListener("offline", () => setStatus("Offline: somente o shell publico e a fila criptografada local permanecem disponiveis."));
+  window.addEventListener("offline", updateStatus);
+  window.addEventListener("rootark:workspace-rendered", updateStatus);
   window.addEventListener("rootark:logout", () => session?.logout?.() || protectedStore?.logout?.());
   window.addEventListener("rootark:device-revoked", () => session?.revoke?.() || protectedStore?.revoke?.());
+  updateStatus();
 }());
