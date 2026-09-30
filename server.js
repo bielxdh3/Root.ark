@@ -4856,7 +4856,19 @@ const upload = multer({
   limits: { fileSize: SINGLE_UPLOAD_MAX_BYTES, files: 1, fields: 10, fieldNestingDepth: 0 },
 });
 const chunkUpload = multer({
-  dest: path.join(CHUNK_UPLOAD_DIR, "incoming"),
+  storage: multer.diskStorage({
+    destination: (req, file, callback) => {
+      try {
+        assertSafeChunkStorageRoot();
+        callback(null, CHUNK_UPLOAD_INCOMING_DIR);
+      } catch (error) {
+        callback(error);
+      }
+    },
+    filename: (req, file, callback) => {
+      crypto.randomBytes(16, (error, bytes) => callback(error, error ? undefined : bytes.toString("hex")));
+    },
+  }),
   defParamCharset: "utf8",
   limits: { files: 1, fields: 10, fieldNestingDepth: 0 },
 });
@@ -4896,12 +4908,29 @@ function handleChunkUploadSingle(req, res, next) {
       return;
     }
 
-    if (req.file?.path) {
-      fs.rmSync(req.file.path, { force: true });
-    }
+    removeChunkUploadIncomingFile(req.file);
 
     res.status(400).json({ error: error.message || "Upload do bloco nao concluido" });
   });
+}
+
+function getChunkUploadIncomingFilePath(file) {
+  const filename = typeof file?.filename === "string" ? file.filename : "";
+  if (!/^[a-f0-9]{32}$/.test(filename)) return null;
+  const incomingPath = path.join(CHUNK_UPLOAD_INCOMING_DIR, filename);
+  return isSafeChildPath(CHUNK_UPLOAD_INCOMING_DIR, incomingPath) ? incomingPath : null;
+}
+
+function removeChunkUploadIncomingFile(file) {
+  const incomingPath = getChunkUploadIncomingFilePath(file);
+  if (!incomingPath) return false;
+  try {
+    assertSafeChunkStorageRoot();
+  } catch {
+    return false;
+  }
+  fs.rmSync(incomingPath, { force: true });
+  return true;
 }
 
 function prepareUploadFolder(req, res, next) {
@@ -5847,6 +5876,11 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
     return res.status(400).json({ error: "Bloco obrigatorio" });
   }
 
+  const incomingChunkPath = getChunkUploadIncomingFilePath(req.file);
+  if (!incomingChunkPath) {
+    return res.status(500).json({ error: "Arquivo temporario de upload invalido" });
+  }
+
   if (
     !originalName ||
     !Number.isInteger(chunkIndex) ||
@@ -5856,19 +5890,19 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
     totalChunks > MAX_UPLOAD_CHUNKS ||
     chunkIndex >= totalChunks
   ) {
-    fs.rmSync(req.file.path, { force: true });
+    removeChunkUploadIncomingFile(req.file);
     return res.status(400).json({ error: "Dados do upload em blocos invalidos" });
   }
 
   const requestedEncryptionLevel = typeof req.body.encryptionLevel === "string" ? req.body.encryptionLevel : "none";
   if (!["none", "server-key", "user-key", "password", "dual"].includes(requestedEncryptionLevel)) {
-    fs.rmSync(req.file.path, { force: true });
+    removeChunkUploadIncomingFile(req.file);
     return res.status(400).json({ error: "Nivel de criptografia invalido" });
   }
 
   const sessionDir = getChunkSessionDir(folderId, uploadId);
   if (!sessionDir) {
-    fs.rmSync(req.file.path, { force: true });
+    removeChunkUploadIncomingFile(req.file);
     return res.status(400).json({ error: "Sessao de upload invalida" });
   }
 
@@ -5878,14 +5912,14 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
     let metadata = loadChunkMetadata(sessionDir, uploadId, folderId);
 
     if (metadata?.[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true) {
-      fs.rmSync(req.file.path, { force: true });
+      removeChunkUploadIncomingFile(req.file);
       return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
     }
 
     if (!metadata) {
       if (fs.readdirSync(sessionDir, { withFileTypes: true }).length) {
         blockChunkSessionResume(sessionDir);
-        fs.rmSync(req.file.path, { force: true });
+        removeChunkUploadIncomingFile(req.file);
         return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
       }
       const fileName = getAvailableUploadFileName(originalName, folderId, true);
@@ -5905,20 +5939,20 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
     }
 
     if (metadata.totalChunks !== totalChunks || metadata.originalName !== originalName) {
-      fs.rmSync(req.file.path, { force: true });
+      removeChunkUploadIncomingFile(req.file);
       return res.status(409).json({ error: "Sessao de upload inconsistente" });
     }
 
     const finalPassword = typeof req.body.password === "string" ? req.body.password : "";
     const needsPassword = metadata.encryptionLevel === "password" || metadata.encryptionLevel === "dual";
     if (chunkIndex === totalChunks - 1 && needsPassword && finalPassword.length < 8) {
-      fs.rmSync(req.file.path, { force: true });
+      removeChunkUploadIncomingFile(req.file);
       return res.status(400).json({ error: "A senha de criptografia deve ter pelo menos 8 caracteres no bloco final. Reinicie o envio com o cliente atualizado." });
     }
 
     const chunkPath = path.join(sessionDir, `${chunkIndex}.part`);
     fs.rmSync(chunkPath, { force: true });
-    fs.renameSync(req.file.path, chunkPath);
+    fs.renameSync(incomingChunkPath, chunkPath);
 
     if (!hasAllChunks(sessionDir, totalChunks)) {
       return res.json({
@@ -5981,7 +6015,7 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
 
     res.json({ ...payload, complete: true, totalChunks });
   } catch (error) {
-    fs.rmSync(req.file.path, { force: true });
+    removeChunkUploadIncomingFile(req.file);
     console.error("Erro no upload em blocos:", error.code || error.name || "operation_failed");
     res.status(500).json({ error: "Upload em blocos nao concluido" });
   }

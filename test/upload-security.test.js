@@ -222,6 +222,15 @@ function waitForExit(child, timeout = TIMEOUT_MS) {
   });
 }
 
+async function waitForFile(filePath, timeout = TIMEOUT_MS) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(filePath)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return fs.existsSync(filePath);
+}
+
 function legacyChunkMetadata(uploadId, overrides = {}) {
   return {
     uploadId,
@@ -550,6 +559,43 @@ test("unsafe chunk session symlinks are rejected before touching the target", { 
   assert.equal(response.status, 400, response.body);
   assert.equal(fs.readFileSync(path.join(targetDir, "keep.txt"), "utf8"), "do not touch");
   assert.equal(fs.existsSync(path.join(targetDir, "0.part")), false);
+});
+
+test("chunk upload storage symlinks are rejected before Multer creates files outside the storage root", { timeout: 30_000 }, async (t) => {
+  let outsidePath;
+  let markerPath;
+  const harness = await createHarness(t, {
+    waitForReady: false,
+    preloadSource: ({ dir }) => {
+      outsidePath = path.join(dir, "outside-chunk-storage");
+      markerPath = path.join(dir, "chunk-storage-symlink-created");
+      return [
+        'const fs = require("node:fs");',
+        'const path = require("node:path");',
+        `const root = ${JSON.stringify(dir)};`,
+        `const outside = ${JSON.stringify(outsidePath)};`,
+        `const marker = ${JSON.stringify(markerPath)};`,
+        'const temp = path.join(root, "temp");',
+        'const chunkRoot = path.join(temp, ".chunks");',
+        'fs.mkdirSync(temp, { recursive: true });',
+        'fs.mkdirSync(outside, { recursive: true });',
+        'try {',
+        '  fs.symlinkSync(outside, chunkRoot, process.platform === "win32" ? "junction" : "dir");',
+        '  fs.writeFileSync(marker, "created");',
+        '} catch (error) {',
+        '  fs.writeFileSync(marker, `unavailable:${error.code || "unknown"}`);',
+        '}',
+      ].join("\n");
+    },
+  });
+
+  assert.equal(await waitForFile(markerPath), true, "startup did not reach the injected storage path setup");
+  const setup = fs.readFileSync(markerPath, "utf8");
+  if (setup.startsWith("unavailable:")) return t.skip(`chunk storage symlink unavailable: ${setup.slice("unavailable:".length)}`);
+
+  assert.notEqual(await waitForExit(harness.child), 0);
+  assert.equal(fs.existsSync(path.join(outsidePath, "incoming")), false);
+  await assert.rejects(request(harness.port, "/login.html"));
 });
 
 test("chunk upload startup fails closed when chunk-session enumeration cannot be verified", { timeout: 45_000 }, async (t) => {
