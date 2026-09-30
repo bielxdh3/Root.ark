@@ -1,7 +1,32 @@
 "use strict";
 
-const CACHE_NAME = "rootark-public-shell-v13";
-const SHELL_ASSETS = ["/", "/index.html", "/styles/index.css?v=13", "/background-matrix.js?v=12", "/assets/logo.svg", "/manifest.webmanifest"];
+const CACHE_NAME = "rootark-public-shell-v16";
+const SHELL_ASSETS = [
+  "/",
+  "/index.html",
+  "/login.html",
+  "/dashboard.html",
+  "/audit.html",
+  "/admin.html",
+  "/backups.html",
+  "/styles/app.css",
+  "/client/rootark-api.js",
+  "/client/rootark-ui.js",
+  "/client/rootark-login.js",
+  "/client/rootark-workspace.js",
+  "/client/rootark-management.js",
+  "/client/rootark-offline-shell.js",
+  "/client/rootark-bootstrap.js",
+  "/client/rootark-client-crypto.js",
+  "/client/rootark-protected-index.js",
+  "/client/rootark-protected-preview.js",
+  "/client/rootark-protected-store.js",
+  "/client/rootark-protected-session.js",
+  "/client/rootark-sync-adapter.js",
+  "/client/rootark-offline-queue.js",
+  "/assets/logo.svg",
+  "/manifest.webmanifest",
+];
 const BLOCKED_PATHS = [/^\/auth(?:\/|$)/, /^\/api(?:\/|$)/, /^\/files(?:\/|$)/, /^\/preview(?:\/|$)/, /^\/sync(?:\/|$)/, /^\/encrypted(?:\/|$)/, /^\/open-file(?:\/|$)/, /^\/share(?:\/|$)/, /^\/users(?:\/|$)/, /^\/groups(?:\/|$)/, /^\/folders(?:\/|$)/, /^\/list(?:\/|$)/];
 
 self.addEventListener("install", (event) => {
