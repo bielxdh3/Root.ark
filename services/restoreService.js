@@ -342,10 +342,14 @@ function isPathWithinAliases(basePath, targetPath) {
 }
 
 function nestedPathDepth(basePath, targetPath) {
-  const base = canonicalPathWithMissingSuffix(basePath);
-  const target = canonicalPathWithMissingSuffix(targetPath);
-  if (!isPathWithin(base, target) || isPathWithin(target, base)) return 0;
-  return path.relative(base, target).split(path.sep).filter(Boolean).length;
+  let depth = 0;
+  for (const base of pathVariants(basePath)) {
+    for (const target of pathVariants(targetPath)) {
+      if (!isPathWithin(base, target) || isPathWithin(target, base)) continue;
+      depth = Math.max(depth, path.relative(base, target).split(path.sep).filter(Boolean).length);
+    }
+  }
+  return depth;
 }
 
 function assertSafeQuarantineRestoreLocation() {
@@ -388,16 +392,25 @@ function clearDirectoryPreservingQuarantine(destination, quarantinePath) {
   if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return;
 
   const resolveProtectedChild = () => {
-    const destinationReal = canonicalPathWithMissingSuffix(destination);
-    const quarantineReal = canonicalPathWithMissingSuffix(quarantinePath);
-    if (!isPathWithin(destinationReal, quarantineReal)) {
-      throw new Error("Restore is not supported when the quarantine directory is nested below an uploads subdirectory or resolves outside uploads during restore");
+    const matches = [];
+    for (const destinationReal of pathVariants(destination)) {
+      for (const quarantineReal of pathVariants(quarantinePath)) {
+        if (!isPathWithin(destinationReal, quarantineReal) || isPathWithin(quarantineReal, destinationReal)) continue;
+        const remaining = path.relative(destinationReal, quarantineReal).split(path.sep).filter(Boolean);
+        if (remaining.length !== 1) {
+          throw new Error("Restore is not supported when the quarantine directory is nested below an uploads subdirectory; configure it outside uploads or as a direct child of uploads");
+        }
+        matches.push({ destinationReal, component: remaining[0] });
+      }
     }
-    const remaining = path.relative(destinationReal, quarantineReal).split(path.sep).filter(Boolean);
-    if (remaining.length !== 1) {
-      throw new Error("Restore is not supported when the quarantine directory is nested below an uploads subdirectory; configure it outside uploads or as a direct child of uploads");
+    if (!matches.length) {
+      throw new Error("Restore is not supported when the quarantine directory resolves outside uploads during restore");
     }
-    return { destinationReal, component: remaining[0] };
+    const first = matches[0];
+    if (matches.some((match) => !samePathComponent(match.component, first.component))) {
+      throw new Error("Restore is not supported when the quarantine directory changes during restore");
+    }
+    return first;
   };
   const initial = resolveProtectedChild();
   const confirmProtectedChild = () => {

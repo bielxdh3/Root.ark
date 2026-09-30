@@ -693,13 +693,20 @@ test("quarantine restore fails closed if an upload alias becomes nested during r
         const backup = await backupService.createBackup({ createdBy: "fixture" });
         const originalCreateBackup = backupService.createBackup;
         let raceHookReached = false;
+        const samePath = (left, right) => {
+          const resolvedLeft = path.resolve(left);
+          const resolvedRight = path.resolve(right);
+          return process.platform === "win32"
+            ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+            : resolvedLeft === resolvedRight;
+        };
         backupService.createBackup = async (...args) => {
           const created = await originalCreateBackup(...args);
           if (args[0]?.type === "pre-restore") {
             const originalReadDir = fs.readdirSync;
             fs.readdirSync = function (target, options) {
               const entries = originalReadDir.apply(this, arguments);
-              if (!raceHookReached && path.resolve(target) === uploadsDir && options?.withFileTypes) {
+              if (!raceHookReached && samePath(target, uploadsDir) && options?.withFileTypes) {
                 raceHookReached = true;
                 fs.rmSync(aliasDir, { recursive: true, force: true });
                 fs.symlinkSync(path.join(uploadsDir, "private"), aliasDir, process.platform === "win32" ? "junction" : "dir");
@@ -709,11 +716,14 @@ test("quarantine restore fails closed if an upload alias becomes nested during r
           }
           return created;
         };
-        await assert.rejects(
-          restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" }),
-          /quarantine directory is nested below an uploads subdirectory/,
-        );
+        let restoreError = null;
+        try {
+          await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" });
+        } catch (error) {
+          restoreError = error;
+        }
         assert.equal(raceHookReached, true, "the alias retarget must happen after uploads have been enumerated");
+        assert.match(restoreError?.message || "", /quarantine directory is nested below an uploads subdirectory/);
         assert.equal(fs.readFileSync(path.join(movedQuarantineDir, "current-sensitive.bin"), "utf8"), "moved quarantine payload");
         console.log(JSON.stringify({ ok: true }));
       })().catch((error) => { console.error(error); process.exitCode = 1; });
