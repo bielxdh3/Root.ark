@@ -684,6 +684,7 @@ test("quarantine restore fails closed if an upload alias becomes nested during r
         throw error;
       }
       fs.mkdirSync(quarantineDir, { recursive: true });
+      fs.writeFileSync(path.join(uploadsDir, "ordinary.txt"), "ordinary upload fixture");
       fs.writeFileSync(path.join(cacheDir, "ordinary.txt"), "before restore");
       fs.writeFileSync(path.join(quarantineDir, "current.bin"), "current quarantine payload");
       fs.writeFileSync(path.join(movedQuarantineDir, "current-sensitive.bin"), "moved quarantine payload");

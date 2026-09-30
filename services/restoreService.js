@@ -391,7 +391,7 @@ function clearDirectoryPreservingQuarantine(destination, quarantinePath) {
     const destinationReal = canonicalPathWithMissingSuffix(destination);
     const quarantineReal = canonicalPathWithMissingSuffix(quarantinePath);
     if (!isPathWithin(destinationReal, quarantineReal)) {
-      throw new Error("Restore is not supported when the quarantine directory resolves outside uploads during restore");
+      throw new Error("Restore is not supported when the quarantine directory is nested below an uploads subdirectory or resolves outside uploads during restore");
     }
     const remaining = path.relative(destinationReal, quarantineReal).split(path.sep).filter(Boolean);
     if (remaining.length !== 1) {
