@@ -167,8 +167,8 @@ function filesUnder(dir) {
     .sort();
 }
 
-function assertRejectedClean(harness, response) {
-  assert.equal(response.status, 400, response.body);
+function assertRejectedClean(harness, response, expectedStatus = 400) {
+  assert.equal(response.status, expectedStatus, response.body);
   assert.deepEqual(pending(harness.dir), {});
   assert.deepEqual(quarantine(harness.dir).items, []);
   assert.deepEqual(filesUnder(path.join(harness.dir, "temp", ".incoming")), []);
@@ -263,10 +263,7 @@ test("users without upload permission are rejected before Multer creates artifac
 
   assert.equal(response.status, 403);
   assert.deepEqual(JSON.parse(response.body), { error: "Permissao negada: upload" });
-  assert.deepEqual(pending(harness.dir), {});
-  assert.deepEqual(quarantine(harness.dir).items, []);
-  assert.deepEqual(fs.existsSync(path.join(harness.dir, "temp", ".incoming")) ? fs.readdirSync(path.join(harness.dir, "temp", ".incoming")) : [], []);
-  assert.equal(fs.existsSync(path.join(harness.dir, "temp", FOLDER_ID, "denied.txt")), false);
+  assertRejectedClean(harness, response, 403);
 });
 
 test("Multer rejects malformed or disallowed multipart bodies without artifacts", { timeout: 30_000 }, async (t) => {

@@ -501,9 +501,11 @@ test("browser pages contain no persisted auth keys or WebSocket token URLs", () 
 
 test("dashboard activity escapes dynamic values before rendering", () => {
   const contents = fs.readFileSync("public/client/rootark-management.js", "utf8");
-  assert.match(contents, /esc\(eventDescription\(item\)\)/);
-  assert.match(contents, /datetime="\$\{esc\(item\.timestamp \|\| \"\"\)\}"/);
-  assert.match(contents, /\$\{esc\(ui\.formatDate\(item\.timestamp\)\)\}/);
+  const renderer = contents.match(/activity\.innerHTML = events\.length \? events\.map\(\(item\) => `([^`]+)`\)\.join\(""\)/);
+  assert.ok(renderer, "the recent-activity renderer must remain discoverable");
+  assert.match(renderer[1], /<span>\$\{esc\(eventDescription\(item\)\)\}<\/span>/);
+  assert.match(renderer[1], /datetime="\$\{esc\(item\.timestamp \|\| ""\)\}"/);
+  assert.match(renderer[1], />\$\{esc\(ui\.formatDate\(item\.timestamp\)\)\}<\/time>/);
 });
 
 test("session bootstrap escapes identity data before embedding JavaScript", () => {
