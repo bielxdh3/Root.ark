@@ -102,6 +102,9 @@ test("contract byte builders are deterministic and domain separated", async () =
   assert.equal((await z.buildAadMap(aadInput)).profile, z.PROFILE.AAD);
   const info = await z.buildHpkeInfoBytes(scope());
   assert.equal((await z.buildHpkeInfoMap(scope())).suite, z.SUITE_ID);
+  const v2UnderV1Profile = scope({ envelope_version: 2 });
+  await assert.rejects(z.buildHpkeInfoMap(v2UnderV1Profile), (error) => error.code === "INVALID_PROFILE");
+  await assert.rejects(z.buildHpkeInfoBytes(v2UnderV1Profile), (error) => error.code === "INVALID_PROFILE");
   const wrap = await z.buildWrapInfo({
     suite: z.SUITE_ID,
     compartment_id: b(1),

@@ -356,6 +356,7 @@ async function buildHpkeInfoMap(input) {
   ];
   safeMap(map, exact, exact);
   if (map.profile !== PROFILE.HPKE_INFO) fail("INVALID_PROFILE");
+  if (map.envelope_version !== 1) fail("INVALID_PROFILE");
   const scope = scopedFields(map, true);
   return {
     profile: scope.profile,
