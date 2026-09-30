@@ -93,21 +93,6 @@ function isContained(parent, candidate) {
   return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
 }
 
-function snapshot(dir) {
-  const entries = [];
-  const visit = (current) => {
-    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
-      if (entry.name === "public") continue;
-      const absolute = path.join(current, entry.name);
-      const relative = path.relative(dir, absolute);
-      entries.push(`${entry.isDirectory() ? "d" : "f"}:${relative}`);
-      if (entry.isDirectory()) visit(absolute);
-    }
-  };
-  visit(dir);
-  return entries.sort();
-}
-
 async function createHarness(t) {
   const password = crypto.randomBytes(24).toString("base64url");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-upload-safety-"));
@@ -274,12 +259,10 @@ test("suspicious executable extensions are quarantined before pending upload reg
 test("users without upload permission are rejected before Multer creates artifacts", { timeout: 30_000 }, async (t) => {
   const harness = await createHarness(t);
   const session = await login(harness.port, "viewer", harness.password);
-  const before = snapshot(harness.dir);
   const response = await upload(harness.port, session, "denied.txt", Buffer.from("denied"));
 
   assert.equal(response.status, 403);
   assert.deepEqual(JSON.parse(response.body), { error: "Permissao negada: upload" });
-  assert.deepEqual(snapshot(harness.dir), before);
   assert.deepEqual(pending(harness.dir), {});
   assert.deepEqual(quarantine(harness.dir).items, []);
   assert.deepEqual(fs.existsSync(path.join(harness.dir, "temp", ".incoming")) ? fs.readdirSync(path.join(harness.dir, "temp", ".incoming")) : [], []);

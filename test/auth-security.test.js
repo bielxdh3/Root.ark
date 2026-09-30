@@ -499,10 +499,11 @@ test("browser pages contain no persisted auth keys or WebSocket token URLs", () 
   }
 });
 
-test("dashboard activity uses DOM text rather than HTML interpolation", () => {
-  const contents = fs.readFileSync("public/dashboard.html", "utf8");
-  assert.doesNotMatch(contents, /recentActivity"\)\.innerHTML/);
-  assert.match(contents, /recentActivity\.append\(item\)/);
+test("dashboard activity escapes dynamic values before rendering", () => {
+  const contents = fs.readFileSync("public/client/rootark-management.js", "utf8");
+  assert.match(contents, /esc\(eventDescription\(item\)\)/);
+  assert.match(contents, /datetime="\$\{esc\(item\.timestamp \|\| \"\"\)\}"/);
+  assert.match(contents, /\$\{esc\(ui\.formatDate\(item\.timestamp\)\)\}/);
 });
 
 test("session bootstrap escapes identity data before embedding JavaScript", () => {
