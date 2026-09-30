@@ -599,6 +599,141 @@ test("quarantine restore does not write through upload junction ancestors", { ti
   }
 });
 
+test("quarantine restore rejects deep paths reached through an upload alias", { timeout: 30_000 }, (t) => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-alias-restore-runtime-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const uploadsDir = path.join(process.cwd(), "uploads");
+      const aliasDir = path.join(process.cwd(), "uploads-alias");
+      const quarantineDir = process.env.UPLOAD_QUARANTINE_DIR;
+      const metadataPath = path.join(process.cwd(), "data", "quarantine.json");
+      fs.mkdirSync(uploadsDir, { recursive: true });
+      fs.mkdirSync(path.join(uploadsDir, "cache"), { recursive: true });
+      fs.mkdirSync(path.join(process.cwd(), "data"), { recursive: true });
+      try {
+        fs.symlinkSync(uploadsDir, aliasDir, process.platform === "win32" ? "junction" : "dir");
+      } catch (error) {
+        if (["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP"].includes(error.code)) {
+          console.log(JSON.stringify({ skipped: "directory symlink/junction creation is unavailable" }));
+          process.exit(0);
+        }
+        throw error;
+      }
+      fs.writeFileSync(path.join(uploadsDir, "ordinary.txt"), "before restore");
+      fs.writeFileSync(metadataPath, JSON.stringify({ items: [] }));
+      (async () => {
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        const countBeforeRestore = backupRepository.listBackups().length;
+        await assert.rejects(
+          restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" }),
+          /Restore is not supported when the quarantine directory is nested below an uploads subdirectory/,
+        );
+        assert.equal(backupRepository.listBackups().length, countBeforeRestore);
+        assert.equal(fs.existsSync(quarantineDir), false, "missing quarantine suffix must remain missing");
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: path.join(runtime, "uploads-alias", "cache", "private"), BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const outcome = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1));
+    if (outcome.skipped) {
+      t.skip(outcome.skipped);
+      return;
+    }
+    assert.equal(outcome.ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("quarantine restore fails closed if an upload alias becomes nested during restore", { timeout: 30_000 }, (t) => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-alias-race-runtime-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const uploadsDir = path.join(process.cwd(), "uploads");
+      const aliasDir = path.join(process.cwd(), "uploads-alias");
+      const cacheDir = path.join(uploadsDir, "cache");
+      const movedQuarantineDir = path.join(uploadsDir, "private", "cache");
+      const quarantineDir = process.env.UPLOAD_QUARANTINE_DIR;
+      const metadataPath = path.join(process.cwd(), "data", "quarantine.json");
+      fs.mkdirSync(cacheDir, { recursive: true });
+      fs.mkdirSync(movedQuarantineDir, { recursive: true });
+      fs.mkdirSync(path.join(process.cwd(), "data"), { recursive: true });
+      try {
+        fs.symlinkSync(uploadsDir, aliasDir, process.platform === "win32" ? "junction" : "dir");
+      } catch (error) {
+        if (["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP"].includes(error.code)) {
+          console.log(JSON.stringify({ skipped: "directory symlink/junction creation is unavailable" }));
+          process.exit(0);
+        }
+        throw error;
+      }
+      fs.mkdirSync(quarantineDir, { recursive: true });
+      fs.writeFileSync(path.join(cacheDir, "ordinary.txt"), "before restore");
+      fs.writeFileSync(path.join(quarantineDir, "current.bin"), "current quarantine payload");
+      fs.writeFileSync(path.join(movedQuarantineDir, "current-sensitive.bin"), "moved quarantine payload");
+      fs.writeFileSync(metadataPath, JSON.stringify({ items: [] }));
+      (async () => {
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        const originalCreateBackup = backupService.createBackup;
+        let raceHookReached = false;
+        backupService.createBackup = async (...args) => {
+          const created = await originalCreateBackup(...args);
+          if (args[0]?.type === "pre-restore") {
+            const originalReadDir = fs.readdirSync;
+            fs.readdirSync = function (target, options) {
+              const entries = originalReadDir.apply(this, arguments);
+              if (!raceHookReached && path.resolve(target) === uploadsDir && options?.withFileTypes) {
+                raceHookReached = true;
+                fs.rmSync(aliasDir, { recursive: true, force: true });
+                fs.symlinkSync(path.join(uploadsDir, "private"), aliasDir, process.platform === "win32" ? "junction" : "dir");
+              }
+              return entries;
+            };
+          }
+          return created;
+        };
+        await assert.rejects(
+          restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" }),
+          /quarantine directory is nested below an uploads subdirectory/,
+        );
+        assert.equal(raceHookReached, true, "the alias retarget must happen after uploads have been enumerated");
+        assert.equal(fs.readFileSync(path.join(movedQuarantineDir, "current-sensitive.bin"), "utf8"), "moved quarantine payload");
+        console.log(JSON.stringify({ ok: true }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      cwd: runtime,
+      env: { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: path.join(runtime, "uploads-alias", "cache"), BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_RETENTION_COUNT: "20" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const outcome = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1));
+    if (outcome.skipped) {
+      t.skip(outcome.skipped);
+      return;
+    }
+    assert.equal(outcome.ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("quarantine files under data are excluded from generic backup collection", { timeout: 30_000 }, () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-data-exclusion-runtime-"));
   try {
