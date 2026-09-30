@@ -199,6 +199,11 @@ Prerequisites: phases 2.1 through 2.3 and a product decision about 2FA scope.
 
 Phase 9 bounded foundation closeout: `PHASE_9_BOUNDED_FOUNDATION_ACCEPTED` for the reviewed `rootark-zk-1` foundation at the starting SHA, with local crypto vectors now passing after dependency installation. This does not accept zero-knowledge migration/runtime/release behavior. Residual Phase 9 handoffs remain dependency provenance/reproducibility, integration/runtime migration, provider/browser/CI/production evidence, and independent review.
 
+### Phase 9 runtime protocol compatibility — Issue #65
+
+- `[IN PROGRESS]` Add a separately versioned authorization-manifest profile for HPKE sender setup: v2 `info` binds every static core field before setup, `hpke_enc` is bound by the HPKE KEM context, and v2 AAD binds the digest of the complete core after setup. Preserve exact v1 group-wrap bytes and reject unsupported manifest versions.
+- Acceptance requires deterministic v2 manifest/info/AAD vectors; public RFC 9180 context setup followed by AAD-dependent sealing/opening; signature, scope, expiry, and replay checks; v2 replay may be claimed only by the compound opener after HPKE authentication; a tampered HPKE ciphertext must not consume a replay ID; plaintext may be returned only after an atomic replay claim; unchanged v1 group-sharing behavior; independent crypto/security review; and exact-head CI. This local step does not claim full ZK runtime migration or release acceptance.
+
 ## 3. Operational validation of existing features
 
 Issue: #7

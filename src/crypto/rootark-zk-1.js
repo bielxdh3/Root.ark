@@ -16,14 +16,34 @@ const MAX_U64 = 0xffffffffffffffffn;
 const MAX_I63 = 0x7fffffffffffffffn;
 const ASCII = Object.freeze({
   HPKE_INFO: "Root.ark/zk-1/hpke-info/v1",
+  HPKE_INFO_V2: "Root.ark/zk-1/hpke-info/v2",
   KEY_WRAP: "Root.ark/zk-1/key-wrap/v1",
   AUTHORIZATION: "Root.ark/zk-1/authorization-manifest/v1",
+  AUTHORIZATION_V2: "Root.ark/zk-1/authorization-manifest/v2",
 });
 const PROFILE = Object.freeze({
   ROOT: "rootark-zk-1",
   AAD: "rootark-zk-1/aad/v1",
+  AAD_V2: "rootark-zk-1/aad/v2",
   HPKE_INFO: "rootark-zk-1/hpke-info/v1",
+  HPKE_INFO_V2: "rootark-zk-1/hpke-info/v2",
 });
+const MANIFEST_TYPE = Object.freeze({
+  1: "rootark-authorization-manifest-v1",
+  2: "rootark-authorization-manifest-v2",
+});
+const V2_EXPECTED_SCOPE = Object.freeze([
+  "sender_key_id", "recipient_key_id", "compartment_id", "object_id", "version_id",
+  "key_ref", "purpose", "epoch", "wrap_id",
+]);
+const V1_EXPECTED_FIELDS = Object.freeze([
+  "sender_key_id", "recipient_key_id", "compartment_id", "object_id", "version_id",
+  "purpose", "epoch", "expiry", "replay_id", "idempotency_key", "wrap_id", "hpke_enc",
+  "hpke_info_digest", "wrapped_key_digest", "ciphertext_digest",
+]);
+const V2_EXPECTED_FIELDS = Object.freeze([
+  ...V1_EXPECTED_FIELDS, "type", "suite", "envelope_version", "key_ref",
+]);
 const PURPOSES = Object.freeze([
   "content",
   "derived-data",
@@ -220,10 +240,11 @@ function resolveSuite(suite = SUITE_ID, version = SUITE_VERSION) {
 
 function profile(input) {
   const map = safeMap(input);
-  resolveSuite(map.suite, map.envelope_version);
   if (!Number.isInteger(map.envelope_version) || map.envelope_version < 0 || map.envelope_version > 0xffff) {
     fail("INVALID_ENVELOPE_VERSION");
   }
+  if (map.envelope_version !== 1 && map.envelope_version !== 2) fail("UNSUPPORTED_ENVELOPE_VERSION");
+  resolveSuite(map.suite, SUITE_VERSION);
   return map;
 }
 
@@ -256,7 +277,7 @@ async function manifestCore(input) {
     "expiry", "replay_id", "idempotency_key", "wrap_id", "hpke_enc",
   ];
   safeMap(map, exact, exact);
-  if (map.type !== "rootark-authorization-manifest-v1") fail("INVALID_MANIFEST_TYPE");
+  if (map.type !== MANIFEST_TYPE[map.envelope_version]) fail("INVALID_MANIFEST_TYPE");
   const scope = scopedFields(map, true);
   return {
     type: map.type,
@@ -301,7 +322,8 @@ async function buildAadMap(input) {
     "object_id", "version_id", "key_ref", "wrap_id", "manifest_core_digest",
   ];
   safeMap(map, exact, exact);
-  if (map.profile !== PROFILE.AAD) fail("INVALID_PROFILE");
+  const expectedProfile = map.envelope_version === 1 ? PROFILE.AAD : PROFILE.AAD_V2;
+  if (map.profile !== expectedProfile) fail("INVALID_PROFILE");
   const scope = scopedFields(map, false);
   return {
     profile: scope.profile,
@@ -320,11 +342,13 @@ async function buildAadMap(input) {
 
 async function buildHpkeInfoBytes(input) {
   const infoMap = await buildHpkeInfoMap(input);
-  return Buffer.concat([Buffer.from(ASCII.HPKE_INFO, "ascii"), Buffer.from([0]), await encodeDeterministic(infoMap)]);
+  const prefix = infoMap.profile === PROFILE.HPKE_INFO ? ASCII.HPKE_INFO : ASCII.HPKE_INFO_V2;
+  return Buffer.concat([Buffer.from(prefix, "ascii"), Buffer.from([0]), await encodeDeterministic(infoMap)]);
 }
 
 async function buildHpkeInfoMap(input) {
   const map = safeMap(input);
+  if (map.profile === PROFILE.HPKE_INFO_V2) return buildAuthorizationHpkeInfoV2Map(map);
   const exact = [
     "profile", "suite", "envelope_version", "compartment_id", "epoch", "purpose",
     "object_id", "version_id", "key_ref", "sender_key_id", "recipient_key_id",
@@ -332,6 +356,7 @@ async function buildHpkeInfoMap(input) {
   ];
   safeMap(map, exact, exact);
   if (map.profile !== PROFILE.HPKE_INFO) fail("INVALID_PROFILE");
+  if (map.envelope_version !== 1) fail("INVALID_PROFILE");
   const scope = scopedFields(map, true);
   return {
     profile: scope.profile,
@@ -348,6 +373,57 @@ async function buildHpkeInfoMap(input) {
     wrap_id: bytes(map.wrap_id, "INVALID_WRAP_ID", 16, 16, 16),
     manifest_core_digest: bytes(map.manifest_core_digest, "INVALID_MANIFEST_DIGEST", 32, 32, 32),
   };
+}
+
+function manifestStaticV2(input) {
+  const map = profile(input);
+  const exact = [
+    "type", "suite", "envelope_version", "compartment_id", "epoch", "purpose",
+    "sender_key_id", "recipient_key_id", "object_id", "version_id", "key_ref",
+    "expiry", "replay_id", "idempotency_key", "wrap_id",
+  ];
+  safeMap(map, exact, exact);
+  if (map.envelope_version !== 2 || map.type !== MANIFEST_TYPE[2]) fail("INVALID_MANIFEST_TYPE");
+  const scope = scopedFields(map, true);
+  return {
+    type: map.type,
+    suite: SUITE_ID,
+    envelope_version: 2,
+    compartment_id: scope.compartment_id,
+    epoch: scope.epoch,
+    purpose: scope.purpose,
+    sender_key_id: scope.sender_key_id,
+    recipient_key_id: scope.recipient_key_id,
+    object_id: scope.object_id,
+    version_id: scope.version_id,
+    key_ref: scope.key_ref,
+    expiry: uint(map.expiry, MAX_I63),
+    replay_id: bytes(map.replay_id, "INVALID_REPLAY_ID", undefined, 1, 128),
+    idempotency_key: bytes(map.idempotency_key, "INVALID_IDEMPOTENCY_KEY", undefined, 1, 128),
+    wrap_id: bytes(map.wrap_id, "INVALID_WRAP_ID", 16, 16, 16),
+  };
+}
+
+async function buildAuthorizationHpkeInfoV2Map(input) {
+  const map = safeMap(input);
+  const exact = [
+    "profile", "type", "suite", "envelope_version", "compartment_id", "epoch", "purpose",
+    "sender_key_id", "recipient_key_id", "object_id", "version_id", "key_ref",
+    "expiry", "replay_id", "idempotency_key", "wrap_id",
+  ];
+  safeMap(map, exact, exact);
+  if (map.profile !== PROFILE.HPKE_INFO_V2) fail("INVALID_PROFILE");
+  const { profile: _profile, ...manifestInput } = map;
+  return { profile: PROFILE.HPKE_INFO_V2, ...manifestStaticV2(manifestInput) };
+}
+
+async function buildAuthorizationHpkeInfoV2Bytes(input) {
+  const infoMap = await buildAuthorizationHpkeInfoV2Map(input);
+  return Buffer.concat([
+    Buffer.from(ASCII.HPKE_INFO_V2, "ascii"),
+    Buffer.from([0]),
+    await encodeDeterministic(infoMap),
+  ]);
 }
 
 async function buildHpkeInfoDigest(input) {
@@ -378,7 +454,9 @@ async function buildManifestBytes(input) {
 
 async function buildAuthorizationSignatureInput(manifest) {
   const encoded = await buildManifestBytes(manifest);
-  return Buffer.concat([Buffer.from(ASCII.AUTHORIZATION, "ascii"), Buffer.from([0]), encoded]);
+  const type = (await buildManifestMap(manifest)).type;
+  const prefix = type === MANIFEST_TYPE[1] ? ASCII.AUTHORIZATION : ASCII.AUTHORIZATION_V2;
+  return Buffer.concat([Buffer.from(prefix, "ascii"), Buffer.from([0]), encoded]);
 }
 
 async function buildWrapInfo(input) {
@@ -538,6 +616,107 @@ async function hpkeOpen(input) {
   }
 }
 
+function sha256(input) {
+  return crypto.createHash("sha256").update(input).digest();
+}
+
+function authorizationAadV2Input(core, digest) {
+  return {
+    profile: PROFILE.AAD_V2,
+    suite: SUITE_ID,
+    envelope_version: 2,
+    compartment_id: core.compartment_id,
+    epoch: core.epoch,
+    purpose: core.purpose,
+    object_id: core.object_id,
+    version_id: core.version_id,
+    key_ref: core.key_ref,
+    wrap_id: core.wrap_id,
+    manifest_core_digest: digest,
+  };
+}
+
+async function sealAuthorizationEnvelopeV2(input) {
+  if (!input?.recipientPublicKey || !input?.signingKey) fail("INVALID_AUTHORIZATION_KEY");
+  const core = manifestStaticV2(input.static_core);
+  const plaintext = bytes(input.plaintext, "INVALID_PLAINTEXT");
+  const wrappedKey = bytes(input.wrapped_key, "INVALID_WRAPPED_KEY", 60, 60, 60);
+  const contentCiphertext = bytes(input.ciphertext, "INVALID_CIPHERTEXT");
+  const info = await buildAuthorizationHpkeInfoV2Bytes({ profile: PROFILE.HPKE_INFO_V2, ...core });
+  const hpkeInfoDigest = sha256(info);
+
+  let sender;
+  try {
+    sender = await hpkeSuite().createSenderContext({ recipientPublicKey: input.recipientPublicKey, info });
+  } catch (_) {
+    fail("HPKE_SEAL_FAILED", SECURITY_CLASS.AUTHENTICATION);
+  }
+
+  const hpkeEnc = bytes(Buffer.from(sender.enc), "INVALID_HPKE_ENC", 32, 32, 32);
+  const manifestCoreMap = await manifestCore({ ...core, hpke_enc: hpkeEnc });
+  const manifestCoreDigest = sha256(await encodeDeterministic(manifestCoreMap));
+  const aad = await buildAadBytes(authorizationAadV2Input(manifestCoreMap, manifestCoreDigest));
+  let hpkeCiphertext;
+  try {
+    hpkeCiphertext = Buffer.from(await sender.seal(plaintext, aad));
+  } catch (_) {
+    fail("HPKE_SEAL_FAILED", SECURITY_CLASS.AUTHENTICATION);
+  }
+
+  const manifest = await buildManifestMap({
+    ...manifestCoreMap,
+    hpke_info_digest: hpkeInfoDigest,
+    wrapped_key_digest: sha256(wrappedKey),
+    ciphertext_digest: sha256(contentCiphertext),
+  });
+  const signature = await signAuthorization(manifest, input.signingKey);
+  return { manifest, signature, info, aad, hpke_ciphertext: hpkeCiphertext };
+}
+
+async function openAuthorizationEnvelopeV2(input) {
+  if (!input || typeof input !== "object") fail("INVALID_AUTHORIZATION_INPUT");
+  const manifest = await buildManifestMap(input.manifest);
+  if (manifest.envelope_version !== 2) fail("UNSUPPORTED_ENVELOPE_VERSION");
+  if (!input?.recipientKey || !input?.senderPublicKey) fail("INVALID_AUTHORIZATION_KEY");
+  const { hpke_info_digest: _infoDigest, wrapped_key_digest: _wrappedKeyDigest, ciphertext_digest: _ciphertextDigest, ...core } = manifest;
+  const staticCore = manifestStaticV2(Object.fromEntries(Object.entries(core).filter(([key]) => key !== "hpke_enc")));
+  const info = await buildAuthorizationHpkeInfoV2Bytes({ profile: PROFILE.HPKE_INFO_V2, ...staticCore });
+  const manifestCoreDigest = sha256(await buildManifestCoreBytes(core));
+  const aad = await buildAadBytes(authorizationAadV2Input(core, manifestCoreDigest));
+  const wrappedKey = bytes(input.wrapped_key, "INVALID_WRAPPED_KEY", 60, 60, 60);
+  const contentCiphertext = bytes(input.ciphertext, "INVALID_CIPHERTEXT");
+  const expected = {
+    ...(input.expected || {}),
+    hpke_info_digest: sha256(info),
+    wrapped_key_digest: sha256(wrappedKey),
+    ciphertext_digest: sha256(contentCiphertext),
+  };
+  const normalized = await verifyAuthorizationCore(manifest, input.signature, input.senderPublicKey, {
+    ...expected,
+    now: input.now,
+    claimReplay: input.claimReplay,
+  }, false);
+  const plaintext = await hpkeOpen({
+    recipientKey: input.recipientKey,
+    enc: manifest.hpke_enc,
+    ciphertext: bytes(input.hpke_ciphertext, "INVALID_CIPHERTEXT"),
+    info,
+    aad,
+  });
+  let claimed;
+  try {
+    claimed = await input.claimReplay(normalized);
+  } catch (_) {
+    clearSecret(plaintext);
+    fail("REPLAY_CHECK_FAILED", SECURITY_CLASS.ENVIRONMENT);
+  }
+  if (claimed !== true) {
+    clearSecret(plaintext);
+    fail("REPLAY_DETECTED", SECURITY_CLASS.AUTHENTICATION);
+  }
+  return plaintext;
+}
+
 function signAuthorization(manifest, privateKey) {
   if (!privateKey) fail("INVALID_SIGNING_KEY");
   return buildAuthorizationSignatureInput(manifest).then((input) => {
@@ -550,25 +729,66 @@ function signAuthorization(manifest, privateKey) {
 }
 
 async function verifyAuthorization(manifest, signature, publicKey, expected = {}) {
+  await verifyAuthorizationCore(manifest, signature, publicKey, expected, true);
+  return true;
+}
+
+async function verifyAuthorizationCore(manifest, signature, publicKey, expected = {}, consumeReplay) {
   const sig = bytes(signature, "INVALID_SIGNATURE", 64, 64, 64);
   if (!publicKey) fail("INVALID_VERIFYING_KEY");
-  for (const field of ["sender_key_id", "recipient_key_id", "compartment_id", "object_id", "version_id", "purpose", "epoch", "expiry", "replay_id", "idempotency_key", "wrap_id", "hpke_enc", "hpke_info_digest", "wrapped_key_digest", "ciphertext_digest"]) {
-    if (Object.hasOwn(expected, field)) {
-      const actual = manifest[field];
-      const same = isBytes(actual) && isBytes(expected[field])
-        ? Buffer.from(actual).equals(Buffer.from(expected[field]))
-        : actual === expected[field];
-      if (!same) fail("SCOPE_MISMATCH", SECURITY_CLASS.SCOPE);
+  const expectedMap = safeMap(expected);
+  const normalized = await buildManifestMap(manifest);
+  const checkExpected = (fields, source, normalizeIntegers = false) => {
+    for (const field of fields) {
+      if (Object.hasOwn(expectedMap, field)) {
+        const actual = source[field];
+        let same;
+        if (isBytes(actual) && isBytes(expectedMap[field])) {
+          same = Buffer.from(actual).equals(Buffer.from(expectedMap[field]));
+        } else if (normalizeIntegers && (field === "epoch" || field === "expiry")) {
+          try {
+            same = uint(actual, field === "expiry" ? MAX_I63 : MAX_U64) === uint(expectedMap[field], field === "expiry" ? MAX_I63 : MAX_U64);
+          } catch (_) {
+            same = false;
+          }
+        } else {
+          same = actual === expectedMap[field];
+        }
+        if (!same) fail("SCOPE_MISMATCH", SECURITY_CLASS.SCOPE);
+      }
     }
-  }
+  };
+  if (normalized.envelope_version === 1) checkExpected(V1_EXPECTED_FIELDS, manifest);
+  let valid;
   try {
-    const valid = crypto.verify(null, await buildAuthorizationSignatureInput(manifest), publicKey, sig);
+    valid = crypto.verify(null, await buildAuthorizationSignatureInput(normalized), publicKey, sig);
     if (!valid) fail("AUTHENTICATION_FAILED", SECURITY_CLASS.AUTHENTICATION);
-    return true;
   } catch (error) {
     if (error instanceof RootarkZkError) throw error;
     fail("SIGNATURE_VERIFY_FAILED", SECURITY_CLASS.AUTHENTICATION);
   }
+  if (normalized.envelope_version === 2) {
+    if (V2_EXPECTED_SCOPE.some((field) => !Object.hasOwn(expectedMap, field))) {
+      fail("EXPECTED_SCOPE_REQUIRED", SECURITY_CLASS.SCOPE);
+    }
+    checkExpected(V2_EXPECTED_FIELDS, normalized, true);
+    if (consumeReplay) fail("V2_ENVELOPE_OPEN_REQUIRED");
+    if (!Number.isSafeInteger(expectedMap.now) || typeof expectedMap.claimReplay !== "function") {
+      fail("REPLAY_STATE_REQUIRED", SECURITY_CLASS.ENVIRONMENT);
+    }
+    const now = uint(expectedMap.now, MAX_I63, "INVALID_CURRENT_TIME");
+    if (normalized.expiry <= now) fail("AUTHORIZATION_EXPIRED", SECURITY_CLASS.AUTHENTICATION);
+    if (consumeReplay) {
+      let claimed;
+      try {
+        claimed = await expectedMap.claimReplay(normalized);
+      } catch (_) {
+        fail("REPLAY_CHECK_FAILED", SECURITY_CLASS.ENVIRONMENT);
+      }
+      if (claimed !== true) fail("REPLAY_DETECTED", SECURITY_CLASS.AUTHENTICATION);
+    }
+  }
+  return normalized;
 }
 
 async function deriveRecoveryKey(input) {
@@ -634,6 +854,8 @@ module.exports = {
   buildHpkeInfoMap,
   buildHpkeInfoBytes,
   buildHpkeInfoDigest,
+  buildAuthorizationHpkeInfoV2Map,
+  buildAuthorizationHpkeInfoV2Bytes,
   buildAuthorizationSignatureInput,
   buildWrapInfo,
   hkdfSha256,
@@ -645,6 +867,8 @@ module.exports = {
   hpkeSuite,
   hpkeSeal,
   hpkeOpen,
+  sealAuthorizationEnvelopeV2,
+  openAuthorizationEnvelopeV2,
   signAuthorization,
   verifyAuthorization,
   deriveRecoveryKey,
