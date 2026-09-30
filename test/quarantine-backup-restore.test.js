@@ -694,11 +694,15 @@ test("quarantine restore fails closed if an upload alias becomes nested during r
         const originalCreateBackup = backupService.createBackup;
         let raceHookReached = false;
         const samePath = (left, right) => {
-          const resolvedLeft = path.resolve(left);
-          const resolvedRight = path.resolve(right);
-          return process.platform === "win32"
-            ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
-            : resolvedLeft === resolvedRight;
+          try {
+            const resolvedLeft = fs.realpathSync.native(path.resolve(left));
+            const resolvedRight = fs.realpathSync.native(path.resolve(right));
+            return process.platform === "win32"
+              ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+              : resolvedLeft === resolvedRight;
+          } catch {
+            return false;
+          }
         };
         backupService.createBackup = async (...args) => {
           const created = await originalCreateBackup(...args);
@@ -722,7 +726,7 @@ test("quarantine restore fails closed if an upload alias becomes nested during r
         } catch (error) {
           restoreError = error;
         }
-        assert.equal(raceHookReached, true, "the alias retarget must happen after uploads have been enumerated");
+        assert.equal(raceHookReached, true, "the alias retarget must happen after uploads have been enumerated; restore error: " + (restoreError?.message || "none"));
         assert.match(restoreError?.message || "", /quarantine directory is nested below an uploads subdirectory/);
         assert.equal(fs.readFileSync(path.join(movedQuarantineDir, "current-sensitive.bin"), "utf8"), "moved quarantine payload");
         console.log(JSON.stringify({ ok: true }));
