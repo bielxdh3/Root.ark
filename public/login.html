@@ -1,196 +1,82 @@
 <!doctype html>
 <html lang="pt-BR">
-  <head>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Root.ark — Login</title>
-    <link rel="stylesheet" href="./styles/global.css" />
-    <link rel="icon" href="assets/logo.svg" />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Roboto+Flex:opsz,wght,XOPQ,XTRA,YOPQ,YTDE,YTFI,YTLC,YTUC@8..144,100..1000,96,468,79,-203,738,514,712&family=Roboto+Mono:ital,wght@0,100..700;1,100..700&family=Sora:wght@100..800&display=swap"
-      rel="stylesheet"
-    />
-    <style>
-      .login-wrapper {
-        min-height: 100vh;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        gap: 48px;
-      }
-
-      .brand {
-        color: white;
-        font: 800 2.5rem/130% var(--ff-sora);
-        display: flex;
-        gap: 10px;
-        align-items: center;
-        text-transform: uppercase;
-      }
-
-      .brand img {
-        width: 38px;
-        height: 38px;
-        animation: 45s rotateLogo linear infinite;
-      }
-
-      .brand small {
-        font: var(--display-sm);
-        text-transform: lowercase;
-        background-image: linear-gradient(#044879 70%, #60a0ce);
-        padding: 2px 10px;
-        border-radius: 8px;
-      }
-
-      @keyframes rotateLogo {
-        from { rotate: 90deg; }
-        to   { rotate: 450deg; }
-      }
-
-      .login-card {
-        background: var(--bg-tertiary);
-        border: 1px solid #044879;
-        border-radius: 12px;
-        padding: 40px 48px;
-        width: 360px;
-        display: flex;
-        flex-direction: column;
-        gap: 24px;
-      }
-
-      .login-card h2 {
-        color: white;
-        font: var(--label-md);
-        text-align: center;
-      }
-
-      .field {
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-      }
-
-      .field label {
-        color: #8a8a8a;
-        font: var(--p-sm);
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-      }
-
-      .field input {
-        background: var(--bg-secondary);
-        border: 1px solid #044879;
-        border-radius: 8px;
-        color: white;
-        font: var(--p-md);
-        padding: 10px 14px;
-        outline: none;
-        transition: border-color 0.2s;
-      }
-
-      .field input:focus {
-        border-color: #60a0ce;
-      }
-
-      .btn-login {
-        background: linear-gradient(135deg, #044879, #60a0ce);
-        border: none;
-        border-radius: 8px;
-        color: white;
-        font: var(--label-sm);
-        padding: 12px;
-        cursor: pointer;
-        transition: opacity 0.2s;
-      }
-
-      .btn-login:hover { opacity: 0.85; }
-      .btn-login:disabled { opacity: 0.5; cursor: not-allowed; }
-
-      .error-msg {
-        color: #ff5555;
-        font: var(--p-sm);
-        text-align: center;
-        min-height: 18px;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="login-wrapper">
-      <div class="brand">
-        <img src="assets/logo.svg" alt="Logo" />
-        <p>Root<small>.ark</small></p>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Entre no seu espaço Root.ark.">
+  <title>Entrar — Root.ark</title>
+  <link rel="icon" href="/assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles/app.css?v=16">
+  <script defer src="/client/rootark-api.js?v=16"></script>
+  <script defer src="/client/rootark-login.js?v=16"></script>
+</head>
+<body class="auth-body">
+  <main class="auth-page">
+    <section class="auth-aside" aria-label="Root.ark">
+      <a class="brand" href="/login.html" aria-label="Root.ark">
+        <img src="/assets/logo.svg" width="38" height="38" alt="">
+        <span class="brand-wordmark">Root<span>.ark</span></span>
+      </a>
+      <div class="auth-promise">
+        <span class="auth-promise-mark" aria-hidden="true">R</span>
+        <p class="eyebrow">SEU ESPAÇO DIGITAL</p>
+        <h1>Seu trabalho, em um lugar mais claro.</h1>
+        <p>Acesse arquivos, acompanhe atividades e mantenha sua equipe organizada.</p>
       </div>
+      <footer>Um espaço de trabalho Root.ark</footer>
+    </section>
+    <section class="auth-panel" aria-labelledby="login-title">
+      <div class="auth-card">
+        <p class="eyebrow" id="login-eyebrow">ACESSO SEGURO</p>
+        <h2 id="login-title">Entrar</h2>
+        <p class="auth-intro" id="login-intro">Use suas credenciais para acessar seu espaço.</p>
+        <p class="auth-error" id="auth-error" role="alert" aria-live="assertive"></p>
 
-      <div class="login-card">
-        <h2>Entrar</h2>
+        <form class="auth-form" id="login-form" autocomplete="on">
+          <div class="field-row">
+            <label for="username">Usuário</label>
+            <input class="field" id="username" name="username" autocomplete="username" autocapitalize="none" required>
+          </div>
+          <div class="field-row">
+            <label for="password">Senha</label>
+            <input class="field" id="password" name="password" type="password" autocomplete="current-password" required>
+          </div>
+          <button class="button button-primary" id="login-submit" type="submit">Entrar no espaço</button>
+        </form>
 
-        <div class="field">
-          <label>Usuário</label>
-          <input type="text" id="username" placeholder="seu usuário" autocomplete="username" />
-        </div>
+        <form class="auth-form auth-step" id="totp-form" hidden>
+          <div class="field-row">
+            <label for="totp-code">Código de autenticação</label>
+            <input class="field" id="totp-code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required>
+            <p class="field-help">Digite o código atual do seu aplicativo de autenticação.</p>
+          </div>
+          <button class="button button-primary" type="submit">Verificar código</button>
+          <button class="button button-quiet" id="back-to-login" type="button">Voltar</button>
+        </form>
 
-        <div class="field">
-          <label>Senha</label>
-          <input type="password" id="password" placeholder="••••••••" autocomplete="current-password" />
-        </div>
+        <form class="auth-form auth-step" id="enroll-form" hidden>
+          <div class="notice notice-info">
+            <span aria-hidden="true">i</span>
+            <span>Configure o aplicativo de autenticação e confirme o código para concluir o acesso.</span>
+          </div>
+          <img class="auth-qr" id="enroll-qr" alt="QR Code para configurar a autenticação de dois fatores" hidden>
+          <div class="field-row">
+            <span class="field-label">Chave de configuração</span>
+            <code class="auth-secret" id="enroll-secret"></code>
+            <p class="field-help">Guarde esta chave em um local seguro. Ela não será exibida novamente nesta etapa.</p>
+          </div>
+          <div class="field-row">
+            <label for="enroll-code">Código de confirmação</label>
+            <input class="field" id="enroll-code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required>
+          </div>
+          <button class="button button-primary" type="submit">Ativar autenticação</button>
+          <button class="button button-quiet" id="cancel-enroll" type="button">Recomeçar acesso</button>
+        </form>
 
-        <p class="error-msg" id="errorMsg"></p>
-
-        <button class="btn-login" id="btnLogin">Entrar</button>
+        <p class="auth-meta">Sua sessão é protegida e expira após até 8 horas.</p>
       </div>
-    </div>
-
-    <script>
-      // Se já está logado, redireciona direto
-      fetch("/auth/me", { credentials: "same-origin" }).then((response) => {
-        if (response.ok) window.location.href = "/index.html";
-      });
-
-      const btn = document.getElementById("btnLogin");
-      const errorMsg = document.getElementById("errorMsg");
-
-      async function login() {
-        const username = document.getElementById("username").value.trim();
-        const password = document.getElementById("password").value;
-
-        if (!username || !password) {
-          errorMsg.textContent = "Preencha usuário e senha.";
-          return;
-        }
-
-        btn.disabled = true;
-        btn.textContent = "Entrando...";
-        errorMsg.textContent = "";
-
-        try {
-          const res = await fetch("/auth/login", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ username, password }),
-          });
-          const data = await res.json();
-
-          if (!res.ok) {
-            errorMsg.textContent = data.error || "Erro ao fazer login.";
-            return;
-          }
-
-          window.location.href = "/index.html";
-        } catch {
-          errorMsg.textContent = "Erro de conexão com o servidor.";
-        } finally {
-          btn.disabled = false;
-          btn.textContent = "Entrar";
-        }
-      }
-
-      btn.addEventListener("click", login);
-      document.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") login();
-      });
-    </script>
-  </body>
+    </section>
+  </main>
+</body>
 </html>

@@ -499,10 +499,13 @@ test("browser pages contain no persisted auth keys or WebSocket token URLs", () 
   }
 });
 
-test("dashboard activity uses DOM text rather than HTML interpolation", () => {
-  const contents = fs.readFileSync("public/dashboard.html", "utf8");
-  assert.doesNotMatch(contents, /recentActivity"\)\.innerHTML/);
-  assert.match(contents, /recentActivity\.append\(item\)/);
+test("dashboard activity escapes dynamic values before rendering", () => {
+  const contents = fs.readFileSync("public/client/rootark-management.js", "utf8");
+  const renderer = contents.match(/activity\.innerHTML = events\.length \? events\.map\(\(item\) => `([^`]+)`\)\.join\(""\)/);
+  assert.ok(renderer, "the recent-activity renderer must remain discoverable");
+  assert.match(renderer[1], /<span>\$\{esc\(eventDescription\(item\)\)\}<\/span>/);
+  assert.match(renderer[1], /datetime="\$\{esc\(item\.timestamp \|\| ""\)\}"/);
+  assert.match(renderer[1], />\$\{esc\(ui\.formatDate\(item\.timestamp\)\)\}<\/time>/);
 });
 
 test("session bootstrap escapes identity data before embedding JavaScript", () => {

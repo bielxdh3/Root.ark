@@ -129,10 +129,22 @@ test("service worker caches only the public shell and bypasses protected paths",
   handlers.install({ waitUntil: (promise) => { installWait = promise; } });
   await installWait;
   assert.ok(cached.includes("/index.html"));
-  assert.equal(cached.some((asset) => /auth|api|files|preview|sync|encrypted|groups|folders/i.test(asset)), false);
+  assert.ok(cached.includes("/styles/app.css"));
+  assert.ok(cached.includes("/client/rootark-api.js"));
+  assert.ok(cached.includes("/client/rootark-workspace.js"));
+  assert.ok(cached.includes("/client/rootark-bootstrap.js"));
+  assert.ok(cached.includes("/client/rootark-protected-index.js"));
+  assert.ok(cached.includes("/client/rootark-offline-queue.js"));
+  assert.ok(cached.includes("/client/rootark-protected-session.js"));
+  assert.equal(cached.some((asset) => /^\/(?:auth|api|files|preview|sync|encrypted|groups|folders)(?:\/|$)/i.test(new URL(asset, "https://rootark.test").pathname)), false);
   let fetchWait;
   handlers.fetch({ request: { method: "GET", url: "https://rootark.test/files/private.txt" }, respondWith: (promise) => { fetchWait = promise; } });
   assert.equal(fetchWait, undefined);
+  for (const pathname of ["/auth/me", "/preview/file/public/private.txt", "/encrypted/private.txt/metadata", "/sync/operations", "/share/private-token", "/open-file/private-token/private.txt"]) {
+    let intercepted = false;
+    handlers.fetch({ request: { method: "GET", url: "https://rootark.test" + pathname }, respondWith: () => { intercepted = true; } });
+    assert.equal(intercepted, false, pathname + " must bypass the public shell cache");
+  }
   handlers.fetch({ request: { method: "GET", url: "https://rootark.test/" }, respondWith: (promise) => { fetchWait = promise; } });
   assert.ok(fetchWait);
   await fetchWait;

@@ -298,6 +298,31 @@ function isPathWithin(basePath, targetPath) {
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
+function canonicalPathWithMissingSuffix(value) {
+  let current = path.resolve(value);
+  const missing = [];
+  while (true) {
+    try {
+      const realpath = fs.realpathSync.native || fs.realpathSync;
+      return path.resolve(realpath(current), ...missing);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+
+    try {
+      fs.lstatSync(current);
+      throw new Error("Cannot safely resolve quarantine path");
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) throw new Error("Cannot safely resolve quarantine path");
+    missing.unshift(path.basename(current));
+    current = parent;
+  }
+}
+
 function pathVariants(value) {
   const resolved = path.resolve(value);
   const variants = new Map();
@@ -308,6 +333,7 @@ function pathVariants(value) {
   };
   add(resolved);
   try { add(fs.realpathSync.native ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved)); } catch {}
+  try { add(canonicalPathWithMissingSuffix(resolved)); } catch {}
   return [...variants.values()];
 }
 
@@ -316,12 +342,14 @@ function isPathWithinAliases(basePath, targetPath) {
 }
 
 function nestedPathDepth(basePath, targetPath) {
-  const base = path.resolve(basePath);
-  const target = path.resolve(targetPath);
-  const comparableBase = process.platform === "win32" ? base.toLowerCase() : base;
-  const comparableTarget = process.platform === "win32" ? target.toLowerCase() : target;
-  if (!isPathWithin(comparableBase, comparableTarget) || isPathWithin(comparableTarget, comparableBase)) return 0;
-  return path.relative(base, target).split(path.sep).filter(Boolean).length;
+  let depth = 0;
+  for (const base of pathVariants(basePath)) {
+    for (const target of pathVariants(targetPath)) {
+      if (!isPathWithin(base, target) || isPathWithin(target, base)) continue;
+      depth = Math.max(depth, path.relative(base, target).split(path.sep).filter(Boolean).length);
+    }
+  }
+  return depth;
 }
 
 function assertSafeQuarantineRestoreLocation() {
@@ -363,38 +391,45 @@ function clearDirectoryPreservingQuarantine(destination, quarantinePath) {
   }
   if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return;
 
-  let relative = null;
-  try {
-    const destinationReal = fs.realpathSync.native ? fs.realpathSync.native(destination) : fs.realpathSync(destination);
-    const quarantineReal = fs.realpathSync.native ? fs.realpathSync.native(quarantinePath) : fs.realpathSync(quarantinePath);
-    if (isPathWithin(destinationReal, quarantineReal)) relative = path.relative(destinationReal, quarantineReal);
-  } catch {}
-  if (relative === null) {
-    for (const destinationPath of pathVariants(destination)) {
-      const nestedVariant = pathVariants(quarantinePath).find((variant) => isPathWithin(destinationPath, variant));
-      if (nestedVariant) {
-        const base = process.platform === "win32" ? destinationPath.toLowerCase() : destinationPath;
-        const target = process.platform === "win32" ? nestedVariant.toLowerCase() : nestedVariant;
-        relative = path.relative(base, target);
-        break;
+  const resolveProtectedChild = () => {
+    const matches = [];
+    for (const destinationReal of pathVariants(destination)) {
+      for (const quarantineReal of pathVariants(quarantinePath)) {
+        if (!isPathWithin(destinationReal, quarantineReal) || isPathWithin(quarantineReal, destinationReal)) continue;
+        const remaining = path.relative(destinationReal, quarantineReal).split(path.sep).filter(Boolean);
+        if (remaining.length !== 1) {
+          throw new Error("Restore is not supported when the quarantine directory is nested below an uploads subdirectory; configure it outside uploads or as a direct child of uploads");
+        }
+        matches.push({ destinationReal, component: remaining[0] });
       }
     }
-  }
-  if (relative === null) relative = path.relative(path.resolve(destination), path.resolve(quarantinePath));
-  const remaining = relative.split(path.sep).filter(Boolean);
-  if (!remaining.length) return;
-  const clear = (currentDirectory, components) => {
-    for (const entry of fs.readdirSync(currentDirectory, { withFileTypes: true })) {
-      const entryPath = path.join(currentDirectory, entry.name);
-      if (components.length && samePathComponent(entry.name, components[0])) {
-        if (components.length === 1 || entry.isSymbolicLink() || !entry.isDirectory()) continue;
-        clear(entryPath, components.slice(1));
-        continue;
-      }
-      fs.rmSync(entryPath, { recursive: true, force: true });
+    if (!matches.length) {
+      throw new Error("Restore is not supported when the quarantine directory resolves outside uploads during restore");
+    }
+    const first = matches[0];
+    if (matches.some((match) => !samePathComponent(match.component, first.component))) {
+      throw new Error("Restore is not supported when the quarantine directory changes during restore");
+    }
+    return first;
+  };
+  const initial = resolveProtectedChild();
+  const confirmProtectedChild = () => {
+    const current = resolveProtectedChild();
+    const sameDestination = isPathWithin(initial.destinationReal, current.destinationReal)
+      && isPathWithin(current.destinationReal, initial.destinationReal);
+    if (!sameDestination || !samePathComponent(current.component, initial.component)) {
+      throw new Error("Restore is not supported when the quarantine directory changes during restore");
     }
   };
-  clear(destination, remaining);
+
+  const entries = fs.readdirSync(initial.destinationReal, { withFileTypes: true });
+  confirmProtectedChild();
+  for (const entry of entries) {
+    confirmProtectedChild();
+    if (samePathComponent(entry.name, initial.component)) continue;
+    fs.rmSync(path.join(initial.destinationReal, entry.name), { recursive: true, force: true });
+    confirmProtectedChild();
+  }
 }
 
 function copyDirectoryContents(source, destination, protectedPath = null) {
