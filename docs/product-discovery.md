@@ -45,7 +45,8 @@ Future discovery should work like the AIP planning process: ask a small number o
 - `[DECIDED]` D-009 defines quarantined unverified external uploads, encrypted client-generated previews and indexes, server-blind public links, local-bridge-only zero-knowledge WebDAV, and eventual mandatory bidirectional synchronization.
 - `[CONFLICT]` Existing server-readable, metadata-dependent, preview, scanning, WebDAV, sync, and backup behaviors require reconciliation with D-003; implementation is not itself product approval.
 - `[OPEN]` The final product name and spelling are not confirmed.
-- `[OPEN]` Exact cryptographic algorithms, audited libraries, KDFs, nonces, envelope formats, recovery and rotation protocols, backup key invalidation mechanics, quarantine workflow, sync protocol, WebDAV bridge, and detailed client behavior remain unresolved.
+- `[FROZEN TECHNICAL PROFILE]` Algorithms, library policy, KDF domain separation, nonce construction, and envelope serialization are specified in `docs/architecture/zero-knowledge-migration-contract.md` section 2.1 for bounded Phase 9 foundation work. This does not establish implementation, interoperability, or runtime acceptance.
+- `[OPEN]` Recovery authority, migration scope/window, backup key invalidation mechanics, quarantine workflow, sync conflict authority/protocol implementation, WebDAV bridge deployment, and detailed client behavior remain unresolved or unimplemented as documented in the architecture and owner-decision packet.
 
 ## Decision record format
 
@@ -270,8 +271,8 @@ The product owner explicitly approved these records on 2026-08-02. They define p
   - Silent handling of a leaked recovery package.
   - Selecting algorithms, libraries, KDFs, nonces, or formats during product discovery.
 - Deferred details that remain `[OPEN]`:
-  - Algorithms, audited libraries, KDFs, nonce construction, envelope serialization, and recovery-package format.
-  - Threat model, versioned test vectors, interoperability fixtures, and migration tests.
+  - Recovery-package format and approved authority policy; implementation evidence must verify the frozen technical profile and the agreed recovery policy.
+  - Versioned test vectors, cross-client interoperability fixtures, and migration tests.
   - Device authorization, rotation, rollback, failure recovery, and concurrent-operation rules.
   - Historical re-encryption scope, progress, cancellation, and restore behavior.
 - Affected plan-tree phases:
@@ -730,18 +731,18 @@ Round 1 is complete. D-001, D-002, and D-003 are approved and recorded. Issue #4
 
 ## Round 2 checkpoint
 
-Round 2 is complete at the policy-decision level. D-004, D-005, and D-006 are approved and prepared for publication. All deferred architecture, protocol, retention, recovery, and client-behavior details remain explicitly `[OPEN]`. Issues #4 and #10 remain open.
+Round 2 is complete at the policy-decision level. D-004, D-005, and D-006 are approved and prepared for publication. This checkpoint's unresolved architecture, protocol, retention, recovery, and client-behavior details are historical; the current Zero-Knowledge technical profile and its remaining owner gates are reconciled below and in `docs/architecture/zero-knowledge-migration-contract.md`. Issues #4 and #10 remain open.
 
 ## Round 3 checkpoint
 
-Round 3 is complete at the policy-decision level. D-007, D-008, and D-009 are recorded. The backup-aware cryptographic-erasure rule is preserved, and Phases 3.3, 3.4, and 3.5 remain historical operational-validation phases; they are not reopened or reclassified. Exact expert architecture, implementation, migration, testing, and detailed operational workflows remain explicitly `[OPEN]`. No implementation issues were created automatically. Issues #4 and #10 remain open.
+Round 3 is complete at the policy-decision level. D-007, D-008, and D-009 are recorded. The backup-aware cryptographic-erasure rule is preserved, and Phases 3.3, 3.4, and 3.5 remain historical operational-validation phases; they are not reopened or reclassified. The Zero-Knowledge technical profile and architecture/threat-model baseline are now recorded and accepted for bounded Phase 9 foundation work. Implementation, interoperability, migration, runtime proof, and the remaining detailed operational workflows remain open. No implementation issues were created automatically. Issues #4 and #10 remain open.
 
 ## Current discovery queue
 
 Round 3 questions are resolved locally in D-007 through D-009. The next discovery round is not started by this checkpoint:
 
-1. `[DECIDED]` D-007: cryptographic architecture and recovery policy; expert implementation remains `[OPEN]`.
+1. `[DECIDED]` D-007: cryptographic architecture and recovery policy; the frozen technical profile is in `docs/architecture/zero-knowledge-migration-contract.md`, while vectors, interoperability, implementation, and owner-directed recovery/migration choices remain open.
 2. `[DECIDED]` D-008: retention, audit, deletion, backup, and offline-copy limits; detailed mechanics remain `[OPEN]`.
-3. `[DECIDED]` D-009: zero-knowledge compatibility for scanning, previews, search, sharing, WebDAV, synchronization, and restore; architecture remains `[OPEN]`.
+3. `[DECIDED]` D-009: zero-knowledge compatibility for scanning, previews, search, sharing, WebDAV, synchronization, and restore; the architecture baseline is recorded, while runtime implementation and owner-directed sharing/migration/sync choices remain open.
 
 Do not ask all remaining questions at once. Each round must preserve explicit decisions, inferred consequences, and unresolved details separately.

@@ -1,5 +1,27 @@
 # Root.ark Issue Ledger
 
+## Live roadmap reconciliation — 2026-10-01
+
+Evidence was checked against GitHub, with `Root/main` at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` as the reconciliation baseline. This current-state addendum supersedes older statements about live branch and issue/PR state; dated phase reports remain historical records.
+
+| Item | Live state | Evidence / boundary |
+|---|---|---|
+| #83 | `closed` | Closed 2026-09-30 after PRs #86 and #90. The accepted sensitive-name exclusion remains in force for `.env`, credential/service-account names, and `.key`, `.pem`, and `.p12` files; excluded payload references are omitted from quarantine metadata in backup archives. |
+| #63 | `open; future tracker` | Protected-index crypto primitives exist, but no current UI path populates them. FTS5/advanced search is not implementation-authorized until searchable fields, lifecycle, privacy leakage, threat model, and acceptance are specified. |
+| #64 | `open; future tracker` | No native Android project or Android CI exists. The issue explicitly requires an architecture/threat-model and protocol-compatibility plan before implementation. |
+| #65 | `open; foundational direction approved` | Versioned cryptographic foundation and vectors exist, but current upload/server paths remain server-readable. Read-only migration inventory is the next safe implementation slice; runtime migration, authorized-client proof, recovery authority, migration window, and backup/restore acceptance remain open. |
+| #66 | `open; implementation gap` | Current sync fully materializes remote objects and may turn local absence into a delete tombstone. Files On-Demand, selective sync, remote-only state, local-only eviction, and verified lazy hydration remain unimplemented. |
+| #67 | `open; implementation gap` | Existing whole-instance backups and bounded sync revisions are not an anomaly-triggered ransomware shield. Bulk-change detection, pause/review, protected per-object history, and audited restore remain unimplemented. |
+| #68 | `open; implementation gap and product choices` | Current public links are single-file bearer links with expiry/limits, not operation-scoped capabilities. Capability enforcement and protected recipient-key delivery remain open; link UX, expiry defaults, and recipient recovery require owner direction. |
+| #94 / PR #95 | `open; PR blocked` | Head `cc0f7c3238e7b7e80afd1e2d6ef4822410a71fe4` is based on the current default tip. Focused suite and Linux/Windows CI pass. The separate CodeQL `js/missing-rate-limiting` check still fails on `/upload-chunk`; the route uses path-scoped authentication and rate limiting and tests prove a 429 before multipart handling, but the static alert has not been resolved. Do not merge or close #94 while the required check fails. |
+| PR #96 | `merged` | Merged 2026-10-01 at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; reported exact-head checks passed. |
+
+### Local work after the live baseline — 2026-10-01 (not published)
+
+The following records local branches only; it does not change the live table or close issues. Issue #64 has architecture/threat-model documentation only. Issue #65 has a fixture-only, read-only migration-inventory prototype and contract, but no live-data inventory or runtime migration. Issue #66 has a separate selective-sync implementation in final review, with focused engine and Phase 16 regression tests passing; its current list API transfers full remote records including ciphertext before local filtering, so network payload transfer is not selective. Windows Files On-Demand UI/provider integration, a metadata-only catalog, and paginated remote listing are absent. Issues #67–68 have design/acceptance contracts only, with owner decisions still open. No local work has been merged or published yet.
+
+The older Phase 9–16 statuses below are evidence for their stated local scope, not acceptance of issues #63–68 or release approval. The historical statement that an unnamed associated PR remained Draft is superseded by the current PR state above; the available live open PR is #95 and PR #96 is merged.
+
 ## Fresh control evidence addendum — 2026-08-13
 
 Fresh exact-attachment evidence is linked at `docs/validation/2026-08-13-rootark-fresh-control-evidence.md`. The attachment is verified as 468 lines with SHA-256 `31822A11CACDC5B2693861F2CA945F0A895673F08E925EF1E66CBF4BE73B56DB`. Control-plane provenance is App Server thread `019ffb95-e675-76e1-ae22-a3129af79b5a`, latest fresh completed bounded turn `019ffcfa-d41d-7fc2-a80b-f8790578b6c1`, request `rootark-exact-attachment-20260813-fresh-c`; prior turn `019ffcf0-0977-7e43-a8a8-70065bb1f937` was an incomplete timed-out attempt only.
