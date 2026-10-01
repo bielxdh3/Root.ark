@@ -1,5 +1,6 @@
 const assert = require("node:assert/strict");
 const bcrypt = require("bcryptjs");
+const UploadChunkSlidingWindowStore = require("../src/middlewares/uploadChunkSlidingWindowStore");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
@@ -549,6 +550,20 @@ test("chunk uploads are rate limited per account before Multer writes to disk", 
   assert.equal(denied.status, 403, denied.body);
   assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, deniedId)), false);
   assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
+});
+
+test("rejected chunk requests do not grow the rolling-window store", (t) => {
+  const store = new UploadChunkSlidingWindowStore(60_000, 3);
+  t.after(() => store.shutdown());
+
+  store.increment("uploader");
+  store.increment("uploader");
+  store.increment("uploader");
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    assert.equal(store.increment("uploader").totalHits, 4);
+  }
+
+  assert.equal(store.get("uploader").totalHits, 3);
 });
 
 test("chunk upload throttling expires each account request on a rolling window", { timeout: 45_000 }, async (t) => {

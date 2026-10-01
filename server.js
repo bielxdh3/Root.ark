@@ -7,6 +7,7 @@ try {
 }
 const express = require("express");
 const { rateLimit } = require("express-rate-limit");
+const UploadChunkSlidingWindowStore = require("./src/middlewares/uploadChunkSlidingWindowStore");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
@@ -125,68 +126,10 @@ const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
 const MAX_UPLOAD_CHUNKS = 2000;
 const UPLOAD_CHUNK_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS, 1, MAX_UPLOAD_CHUNKS * 10);
 const UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS", 15 * 60 * 1000, 1000, 60 * 60 * 1000);
-class UploadChunkSlidingWindowStore {
-  constructor(windowMs) {
-    this.windowMs = windowMs;
-    this.requestsByAccount = new Map();
-    this.localKeys = true;
-    this.prefix = "upload-chunk";
-    this.cleanupTimer = setInterval(() => this.sweep(Date.now()), Math.min(windowMs, 60 * 1000));
-    this.cleanupTimer.unref?.();
-  }
-
-  getRequests(account, now = Date.now()) {
-    const requests = this.requestsByAccount.get(account) || [];
-    const oldestAllowed = now - this.windowMs;
-    while (requests.length && requests[0] <= oldestAllowed) requests.shift();
-    if (requests.length) this.requestsByAccount.set(account, requests);
-    else this.requestsByAccount.delete(account);
-    return requests;
-  }
-
-  increment(account) {
-    const now = Date.now();
-    const requests = this.getRequests(account, now);
-    requests.push(now);
-    this.requestsByAccount.set(account, requests);
-    return { totalHits: requests.length, resetTime: new Date(requests[0] + this.windowMs) };
-  }
-
-  decrement(account) {
-    const requests = this.getRequests(account);
-    requests.pop();
-    if (requests.length) this.requestsByAccount.set(account, requests);
-    else this.requestsByAccount.delete(account);
-  }
-
-  get(account) {
-    const requests = this.getRequests(account);
-    return requests.length
-      ? { totalHits: requests.length, resetTime: new Date(requests[0] + this.windowMs) }
-      : undefined;
-  }
-
-  resetKey(account) {
-    this.requestsByAccount.delete(account);
-  }
-
-  resetAll() {
-    this.requestsByAccount.clear();
-  }
-
-  sweep(now) {
-    for (const account of this.requestsByAccount.keys()) this.getRequests(account, now);
-  }
-
-  shutdown() {
-    clearInterval(this.cleanupTimer);
-  }
-}
-
 const uploadChunkRateLimiter = rateLimit({
   windowMs: UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS,
   limit: UPLOAD_CHUNK_RATE_LIMIT_MAX,
-  store: new UploadChunkSlidingWindowStore(UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS),
+  store: new UploadChunkSlidingWindowStore(UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS, UPLOAD_CHUNK_RATE_LIMIT_MAX),
   keyGenerator: (req) => String(req.user?.username || "").trim().toLowerCase(),
   standardHeaders: false,
   legacyHeaders: false,
