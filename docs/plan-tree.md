@@ -1,15 +1,40 @@
 # Root.ark Plan Tree
 
-Last reconstructed: 2026-07-25
-Last branch reconciliation: 2026-08-13
+Last reconstructed: 2026-07-25 (historical baseline)
+Last branch reconciliation: 2026-10-01
 
 Repository: `bielxdh3/root.ark`
 
-Current default branch verified: `Root/main` (GitHub repository settings and `git ls-remote --symref origin HEAD` verified 2026-08-13).
+Current default branch verified: `Root/main` (GitHub repository settings; live branch checked 2026-10-01).
 
-Current canonical baseline HEAD verified: `28747c6ebdac873650e2d5a3c6193824e7cc9985` (`origin/HEAD` and `refs/heads/Root/main`).
+Current canonical baseline HEAD verified at reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`, 2026-10-01). This is the evidence baseline for the dated live-state section below, not a claim about a later merge commit.
 
 Historical reconstruction baseline retained for provenance: `4062f4c67bfda9d144aceb6dbbed539b8a917e4a` (2026-07-25).
+
+## Live GitHub reconciliation — 2026-10-01
+
+This dated section supersedes older statements about the current branch, issue closure, and open PR state. Historical phase reports below retain their original dates and evidence boundaries.
+
+- The live default branch was `Root/main` at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`. At that snapshot GitHub had seven open issues (#63–68 and #94) and one open PR (#95).
+- Issue #83 is closed. Its sensitive-name policy remains active: `.env`, credential/service-account names, and private-key/certificate extensions remain excluded from backup content and quarantine payload references. PRs #86 and #90 contain its completion evidence.
+- PR #96 is merged at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; its exact-head CodeQL analysis, dependency review, Ubuntu validation, Windows validation, and GHAS scan passed. This does not authorize a release.
+- Issue #94 is represented by PR #95, which remains open. Its exact current head `cc0f7c3238e7b7e80afd1e2d6ef4822410a71fe4` passes the CodeQL analysis workflow, dependency review, Ubuntu validation, and Windows validation. A separate CodeQL `js/missing-rate-limiting` check still fails on `/upload-chunk` after the route limiter was moved to path-scoped middleware. Focused route tests prove 23/23 behaviors including a 429 response before Multer, but the static alert remains unresolved; do not merge or close #94 until that check is resolved through an evidence-backed review.
+- Issue #63 is an approved future feature tracker, not implementation authorization. The protected-index primitive exists, but the UI does not populate it; FTS5 and advanced search remain deferred until the searchable corpus, encrypted-index lifecycle, privacy leakage, and acceptance criteria are defined.
+- Issue #64 is a future Android-client tracker, not implementation authorization. There is no Android/Gradle project or Android CI. A native implementation remains gated on a separate architecture/threat-model and protocol-compatibility test plan.
+- Issue #65 approves the Zero-Knowledge direction and bounded cryptographic foundation; it does not establish a Zero-Knowledge runtime. Current uploads and server-side operations can still expose plaintext. Migration inventory, client authorization, recovery authority, mixed-mode window, and exact-head runtime/backup acceptance remain open.
+- Issue #66 is approved but not complete: the current sync engine materializes the remote set locally and can interpret local absence as deletion; selective sync, remote-only state, safe local eviction, and lazy verified fetch are still missing.
+- Issue #67 is approved but not complete: existing backups and sync revisions are recovery prerequisites, not a ransomware shield. Burst detection, a recoverable pause/review barrier, protected per-object recovery history, and authorized restore are absent.
+- Issue #68 is approved but not complete: existing public links are single-file bearer links with expiry/limits, not operation-scoped capabilities. Protected-link delivery remains gated on least-privilege capability enforcement and owner choices for link UX, expiry, and recipient recovery.
+
+## Reconciliation work after the live baseline — 2026-10-01
+
+This addendum records the published work after the live GitHub baseline above. PR #97 remains open and unmerged; PR #98 contains this documentation reconciliation. Neither changes issue state or marks an issue complete.
+
+- Issue #64 has a native-client architecture and threat-model document only. No Android application, Gradle project, build, or CI exists.
+- Issue #65 has a Zero-Knowledge migration contract and a read-only inventory prototype limited to explicitly selected fixture files under an operating-system temporary directory. The prototype reports recognized legacy encryption modes using run-scoped opaque references; it does not inspect live application storage or establish migration readiness. Its four focused tests pass. Runtime migration, authorization, recovery authority, mixed-mode window, backup/restore acceptance, and the remaining owner decisions are still open.
+- Issue #66 has a selective-sync implementation in PR #97 at `de051600ab1390752cdebfeac5febf87efbad153`, with selected-path tracking, remote-only state, verified cache eviction, and explicit verified materialization. The focused engine suite records 25 passing tests and one platform-skipped test; the Phase 16 regression file passes 26/26. The current list API still transfers complete remote records including ciphertext before local path filtering, so network payload transfer is not selective. Exact-head CodeQL, dependency review, and Linux/Windows CI pass, and a targeted independent review approved the fail-closed process-lock patch. The final security-diff report is unavailable, so PR #97 remains open. There is no Windows Files On-Demand provider or UI, metadata-only catalog, or paginated remote listing; the issue remains incomplete.
+- Issues #67 and #68 have architecture/acceptance contracts only. No runtime protection or capability-sharing feature is implemented; the owner choices recorded in those contracts remain unresolved.
+- PR #98 carries this documentation reconciliation. Issue #94 / PR #95 and its unresolved CodeQL check retain the live state recorded above.
 
 ## Status labels
 
@@ -433,7 +458,7 @@ All items below are candidates, not commitments.
 - `[ACCEPTED-LOCAL]` Protocol v2 metadata AAD/schema enforcement, recoverable WebDAV overwrite journaling, bidirectional encrypted sync, strict client/offline boundaries, protected index/preview identity binding, and approved `rootark-zk-1` opaque group wraps are implemented and locally reviewed.
 - `[ACCEPTED-LOCAL]` The controlled final-head cross-phase matrix recorded 66/66 tests passed, with separate realtime transport 4/4 and upload-security 12/12 boundary runs; syntax validation recorded 116/116 passed. WebDAV PUT has a distinct durable mutation event and explicit protocol-v2 translation, and the browser protected store now has an in-memory session hook.
 - `[BLOCKED]` Canonical full `npm test` was attempted but remains blocked by the unavailable `better-sqlite3` native binding in the disposable install; remote CI, browser/provider/live-production/TLS, owner approval, and release evidence remain external.
-- `[NOT_AUTHORIZED]` The associated PR remains Draft and release authorization is `NOT_AUTHORIZED`; no Phase 17 item is created or inferred.
+- `[RECONCILED]` The previously unnamed Draft-PR statement cannot be mapped to a current live PR. The dated GitHub reconciliation records the live state: PR #96 is merged and PR #95 remains open behind its CodeQL check. Merge state is not release authorization; no Phase 17 item is created or inferred.
 
 ### Authentication and administration
 
