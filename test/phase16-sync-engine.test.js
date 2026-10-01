@@ -281,12 +281,14 @@ test("an abandoned process lock directory fails closed and is left for explicit 
   assert.equal((await fsp.lstat(lockPath)).isDirectory(), true);
   assert.deepEqual(await fsp.readdir(lockPath), []);
 
-  await fsp.rmdir(lockPath);
+  const legacyRoot = path.join(dir, "legacy-device");
+  await fsp.mkdir(legacyRoot, { recursive: true });
   const legacyLock = "legacy lock record\n";
-  const legacyHandle = await fsp.open(lockPath, "wx+", 0o600);
+  const legacyLockPath = path.join(legacyRoot, ".rootark-sync.lock");
+  const legacyHandle = await fsp.open(legacyLockPath, "wx+", 0o600);
   try {
     await legacyHandle.writeFile(legacyLock);
-    await assert.rejects(engine(root, adapter, key), { code: "sync_root_busy" });
+    await assert.rejects(engine(legacyRoot, adapter, key), { code: "sync_root_busy" });
     const contents = Buffer.alloc(Buffer.byteLength(legacyLock));
     const { bytesRead } = await legacyHandle.read(contents, 0, contents.length, 0);
     assert.equal(contents.subarray(0, bytesRead).toString("utf8"), legacyLock);
