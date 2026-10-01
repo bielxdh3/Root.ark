@@ -121,6 +121,7 @@ const AUDIT_RETENTION_MS = 1000 * 60 * 60 * 24 * 365;
 const MAX_TEXT_PREVIEW_BYTES = 1024 * 1024;
 const CHUNK_UPLOAD_DIR = path.resolve("./temp/.chunks");
 const CHUNK_UPLOAD_INCOMING_DIR = path.join(CHUNK_UPLOAD_DIR, "incoming");
+const CHUNK_UPLOAD_INCOMING_FILE_PATH = Symbol("chunkUploadIncomingFilePath");
 const CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY = "__resumeBlocked";
 const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
 const MAX_UPLOAD_CHUNKS = 2000;
@@ -4902,7 +4903,12 @@ const chunkUpload = multer({
       }
     },
     filename: (req, file, callback) => {
-      crypto.randomBytes(16, (error, bytes) => callback(error, error ? undefined : bytes.toString("hex")));
+      crypto.randomBytes(16, (error, bytes) => {
+        if (error) return callback(error);
+        const filename = bytes.toString("hex");
+        file[CHUNK_UPLOAD_INCOMING_FILE_PATH] = path.join(CHUNK_UPLOAD_INCOMING_DIR, filename);
+        return callback(null, filename);
+      });
     },
   }),
   defParamCharset: "utf8",
@@ -4951,9 +4957,8 @@ function handleChunkUploadSingle(req, res, next) {
 }
 
 function getChunkUploadIncomingFilePath(file) {
-  const filename = typeof file?.filename === "string" ? file.filename : "";
-  if (!/^[a-f0-9]{32}$/.test(filename)) return null;
-  const incomingPath = path.join(CHUNK_UPLOAD_INCOMING_DIR, filename);
+  const incomingPath = file?.[CHUNK_UPLOAD_INCOMING_FILE_PATH];
+  if (typeof incomingPath !== "string" || !/^[a-f0-9]{32}$/.test(path.basename(incomingPath))) return null;
   return isSafeChildPath(CHUNK_UPLOAD_INCOMING_DIR, incomingPath) ? incomingPath : null;
 }
 
