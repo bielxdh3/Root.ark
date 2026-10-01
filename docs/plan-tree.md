@@ -26,15 +26,15 @@ This dated section supersedes older statements about the current branch, issue c
 - Issue #67 is approved but not complete: existing backups and sync revisions are recovery prerequisites, not a ransomware shield. Burst detection, a recoverable pause/review barrier, protected per-object recovery history, and authorized restore are absent.
 - Issue #68 is approved but not complete: existing public links are single-file bearer links with expiry/limits, not operation-scoped capabilities. Protected-link delivery remains gated on least-privilege capability enforcement and owner choices for link UX, expiry, and recipient recovery.
 
-## Open PR work after the live baseline — 2026-10-01 (not merged)
+## Reconciliation work after the live baseline — 2026-10-01
 
-This addendum records the published PRs after the live GitHub baseline above. PRs #97 and #98 are open and unmerged. Their presence does not change issue state or mark any issue complete.
+This addendum records the published work after the live GitHub baseline above. PR #97 remains open and unmerged; PR #98 contains this documentation reconciliation. Neither changes issue state or marks an issue complete.
 
 - Issue #64 has a native-client architecture and threat-model document only. No Android application, Gradle project, build, or CI exists.
 - Issue #65 has a Zero-Knowledge migration contract and a read-only inventory prototype limited to explicitly selected fixture files under an operating-system temporary directory. The prototype reports recognized legacy encryption modes using run-scoped opaque references; it does not inspect live application storage or establish migration readiness. Its four focused tests pass. Runtime migration, authorization, recovery authority, mixed-mode window, backup/restore acceptance, and the remaining owner decisions are still open.
 - Issue #66 has a selective-sync implementation in PR #97 at `de051600ab1390752cdebfeac5febf87efbad153`, with selected-path tracking, remote-only state, verified cache eviction, and explicit verified materialization. The focused engine suite records 25 passing tests and one platform-skipped test; the Phase 16 regression file passes 26/26. The current list API still transfers complete remote records including ciphertext before local path filtering, so network payload transfer is not selective. Exact-head CodeQL, dependency review, and Linux/Windows CI pass, and a targeted independent review approved the fail-closed process-lock patch. The final security-diff report is unavailable, so PR #97 remains open. There is no Windows Files On-Demand provider or UI, metadata-only catalog, or paginated remote listing; the issue remains incomplete.
 - Issues #67 and #68 have architecture/acceptance contracts only. No runtime protection or capability-sharing feature is implemented; the owner choices recorded in those contracts remain unresolved.
-- PR #98 carries the documentation reconciliation and remains open. Issue #94 / PR #95 and its unresolved CodeQL check retain the live state recorded above.
+- PR #98 carries this documentation reconciliation. Issue #94 / PR #95 and its unresolved CodeQL check retain the live state recorded above.
 
 ## Status labels
 
