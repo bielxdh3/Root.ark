@@ -22,7 +22,9 @@
   let realtimeSocket = null;
   let realtimeReconnectTimer = null;
   let realtimeRefreshTimer = null;
+  let realtimeRefreshPending = false;
   let realtimeClosed = false;
+  const dirtyForms = new WeakSet();
   const CHUNK_BYTES = 8 * 1024 * 1024;
   const CHUNK_THRESHOLD = 5 * 1024 * 1024;
   const MAX_BATCH_FILES = 10;
@@ -315,15 +317,56 @@
     }
   }
 
-  function scheduleRealtimeRefresh() {
-    window.clearTimeout(realtimeRefreshTimer);
-    realtimeRefreshTimer = window.setTimeout(async () => {
+  function hasActiveWorkspaceInteraction() {
+    if (state.loading || document.querySelector("dialog[open]")) return true;
+    const activeElement = document.activeElement;
+    if (activeElement && (activeElement.matches("input, select, textarea") || activeElement.isContentEditable)) return true;
+    return Array.from(document.forms).some((form) => dirtyForms.has(form));
+  }
+
+  function flushRealtimeRefresh() {
+    if (realtimeClosed || !realtimeRefreshPending) return;
+    if (hasActiveWorkspaceInteraction()) {
+      realtimeRefreshTimer = window.setTimeout(flushRealtimeRefresh, 300);
+      return;
+    }
+    realtimeRefreshPending = false;
+    realtimeRefreshTimer = null;
+    (async () => {
       try {
         await loadFolders();
         await loadRoute();
       } catch (_) {}
-    }, 150);
+    })();
   }
+
+  function scheduleRealtimeRefresh() {
+    realtimeRefreshPending = true;
+    window.clearTimeout(realtimeRefreshTimer);
+    realtimeRefreshTimer = window.setTimeout(flushRealtimeRefresh, 150);
+  }
+
+  function schedulePendingRefresh() {
+    if (realtimeRefreshPending) scheduleRealtimeRefresh();
+  }
+
+  document.addEventListener("input", (event) => {
+    if (event.target && event.target.form) dirtyForms.add(event.target.form);
+  }, true);
+  document.addEventListener("change", (event) => {
+    if (event.target && event.target.form) dirtyForms.add(event.target.form);
+  }, true);
+  document.addEventListener("focusout", schedulePendingRefresh, true);
+  document.addEventListener("close", schedulePendingRefresh, true);
+  document.addEventListener("reset", (event) => {
+    const form = event.target;
+    if (!form || form.tagName !== "FORM") return;
+    window.setTimeout(() => {
+      dirtyForms.delete(form);
+      schedulePendingRefresh();
+    }, 0);
+  }, true);
+  window.addEventListener("rootark:workspace-rendered", schedulePendingRefresh);
 
   function connectRealtime() {
     if (!window.WebSocket || realtimeClosed) return;
@@ -550,7 +593,9 @@
     const header = document.createElement("div");
     header.className = "preview-dialog-heading";
     const title = document.createElement("h2");
+    title.id = "file-preview-title";
     title.textContent = name;
+    dialog.setAttribute("aria-labelledby", title.id);
     const close = document.createElement("button");
     close.type = "button";
     close.className = "button button-quiet";
@@ -673,6 +718,7 @@
     const level = String(formData.get("encryptionLevel") || "none");
     const password = String(formData.get("password") || "");
     if ((level === "password" || level === "dual") && password.length < 8) return ui.toast("A senha de criptografia deve ter no mínimo 8 caracteres.", "error");
+    dirtyForms.add(formElement);
     const settings = { level, password, expiresInDays: String(formData.get("expiresInDays") || "") };
     const versionComment = String(formData.get("versionComment") || "").trim();
     const progress = document.getElementById("upload-progress");
@@ -848,7 +894,7 @@
     if (action === "folder-expiration") return setFolderExpiration(id);
     if (action === "delete-folder") return removeFolder(id, button.dataset.name || "pasta");
     if (action === "preview-file") return previewFile(name, "public", folderId);
-    if (action === "preview-pending") return previewFile(name, "temp", folderId);
+    if (action === "preview-pending") return previewFile(name, "pending", folderId);
     if (action === "download-file") return openFile(name, true, folderId);
     if (action === "share-file") return shareFile(name, folderId);
     if (action === "file-access") return editFileAccess(name, folderId);
