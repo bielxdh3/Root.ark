@@ -26,15 +26,15 @@ This dated section supersedes older statements about the current branch, issue c
 - Issue #67 is approved but not complete: existing backups and sync revisions are recovery prerequisites, not a ransomware shield. Burst detection, a recoverable pause/review barrier, protected per-object recovery history, and authorized restore are absent.
 - Issue #68 is approved but not complete: existing public links are single-file bearer links with expiry/limits, not operation-scoped capabilities. Protected-link delivery remains gated on least-privilege capability enforcement and owner choices for link UX, expiry, and recipient recovery.
 
-## Local branch work — 2026-10-01 (not merged)
+## Open PR work after the live baseline — 2026-10-01 (not merged)
 
-This addendum records work in local branches after the live GitHub baseline above. It does not change GitHub issue/PR state or mark any issue complete.
+This addendum records the published PRs after the live GitHub baseline above. PRs #97 and #98 are open and unmerged. Their presence does not change issue state or mark any issue complete.
 
 - Issue #64 has a native-client architecture and threat-model document only. No Android application, Gradle project, build, or CI exists.
 - Issue #65 has a Zero-Knowledge migration contract and a read-only inventory prototype limited to explicitly selected fixture files under an operating-system temporary directory. The prototype reports recognized legacy encryption modes using run-scoped opaque references; it does not inspect live application storage or establish migration readiness. Its four focused tests pass. Runtime migration, authorization, recovery authority, mixed-mode window, backup/restore acceptance, and the remaining owner decisions are still open.
-- Issue #66 has a separate local selective-sync implementation branch with selected-path tracking, remote-only state, verified cache eviction, and explicit verified materialization. Its focused sync suite passes 23 tests with one Windows-only FIFO test skipped; the Phase 16 regression file passes 26 tests. The current list API still transfers complete remote records including ciphertext before local path filtering, so network payload transfer is not selective. Independent final review and security scanning remain in progress. There is no Windows Files On-Demand provider or UI, metadata-only catalog, or paginated remote listing; the issue remains incomplete.
+- Issue #66 has a selective-sync implementation in PR #97 at `c5257facf722b0e989c9c3993881da2d2e66d1ad`, with selected-path tracking, remote-only state, verified cache eviction, and explicit verified materialization. The focused engine suite records 25 passing tests and one platform-skipped test; the Phase 16 regression file passes 26/26. The current list API still transfers complete remote records including ciphertext before local path filtering, so network payload transfer is not selective. A targeted independent review approved the fail-closed process-lock patch; the final security-diff report and exact-head CI must be checked before merge. There is no Windows Files On-Demand provider or UI, metadata-only catalog, or paginated remote listing; the issue remains incomplete.
 - Issues #67 and #68 have architecture/acceptance contracts only. No runtime protection or capability-sharing feature is implemented; the owner choices recorded in those contracts remain unresolved.
-- These local documents and implementation changes have not yet been published or merged. Issue #94 / PR #95 and CodeQL check #180 retain the live state recorded above.
+- PR #98 carries the documentation reconciliation and remains open. Issue #94 / PR #95 and its unresolved CodeQL check retain the live state recorded above.
 
 ## Status labels
 
