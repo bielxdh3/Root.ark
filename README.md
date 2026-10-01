@@ -120,6 +120,22 @@ npm start
 
 The server uses port `3000` unless `PORT` is configured.
 
+Valid incomplete chunked uploads expire after 24 hours without activity. Set
+`UPLOAD_CHUNK_SESSION_TTL_MS` to a value from 60,000 milliseconds to 30 days to
+adjust this retention window; expired uploads must be restarted. Older sessions
+also use the newest chunk's modification time so a saved block still counts as
+activity if the server stops before updating its session record. Sessions with
+missing or invalid metadata are blocked from resuming and retained rather than
+automatically deleted.
+
+Chunk uploads also have a pre-authentication request limit per direct network
+peer. It defaults to 20,000 requests in the configured chunk-rate window; set
+`UPLOAD_CHUNK_IP_RATE_LIMIT_MAX` (1–200,000) to adjust it for the deployment's
+shared proxy or NAT traffic. This limit uses the TCP peer address and ignores
+forwarded IP headers. It is in-memory per server process; deployments with
+multiple workers or instances need shared or edge-level enforcement for an
+aggregate limit. The existing authenticated per-account limit remains active.
+
 For a reviewed deployment profile, set a strong `JWT_SECRET`, an explicit
 `TOTP_POLICY` (`optional`, `role-required`, or `global-required`), and a
 32-byte `SERVER_MASTER_KEY` or protected `data/server-master.key`. `GET

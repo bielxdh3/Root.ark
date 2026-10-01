@@ -6,6 +6,8 @@ try {
   if (error?.code !== "ENOENT") throw error;
 }
 const express = require("express");
+const { rateLimit } = require("express-rate-limit");
+const UploadChunkSlidingWindowStore = require("./src/middlewares/uploadChunkSlidingWindowStore");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
@@ -119,9 +121,41 @@ const AUDIT_RETENTION_MS = 1000 * 60 * 60 * 24 * 365;
 const MAX_TEXT_PREVIEW_BYTES = 1024 * 1024;
 const CHUNK_UPLOAD_DIR = path.resolve("./temp/.chunks");
 const CHUNK_UPLOAD_INCOMING_DIR = path.join(CHUNK_UPLOAD_DIR, "incoming");
+const CHUNK_UPLOAD_INCOMING_FILE_PATH = Symbol("chunkUploadIncomingFilePath");
 const CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY = "__resumeBlocked";
 const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
 const MAX_UPLOAD_CHUNKS = 2000;
+const UPLOAD_CHUNK_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS, 1, MAX_UPLOAD_CHUNKS * 10);
+const UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS", 15 * 60 * 1000, 1000, 60 * 60 * 1000);
+const UPLOAD_CHUNK_IP_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_IP_RATE_LIMIT_MAX", Math.max(MAX_UPLOAD_CHUNKS * 10, UPLOAD_CHUNK_RATE_LIMIT_MAX), 1, MAX_UPLOAD_CHUNKS * 100);
+const UPLOAD_CHUNK_SESSION_TTL_MS = parseBoundedNumber("UPLOAD_CHUNK_SESSION_TTL_MS", 24 * 60 * 60 * 1000, 60 * 1000, 30 * 24 * 60 * 60 * 1000);
+const uploadChunkIpRateLimiter = rateLimit({
+  windowMs: UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS,
+  limit: UPLOAD_CHUNK_IP_RATE_LIMIT_MAX,
+  keyGenerator: (req) => rateLimit.ipKeyGenerator(req.socket?.remoteAddress || "unknown"),
+  standardHeaders: false,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    const resetAt = req.rateLimit?.resetTime?.getTime() ?? Date.now() + UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS;
+    const retryAfterSeconds = Math.max(1, Math.ceil((resetAt - Date.now()) / 1000));
+    res.set("Retry-After", String(retryAfterSeconds));
+    return res.status(429).json({ error: "Limite temporario de requisicoes em blocos atingido. Tente novamente mais tarde." });
+  },
+});
+const uploadChunkRateLimiter = rateLimit({
+  windowMs: UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS,
+  limit: UPLOAD_CHUNK_RATE_LIMIT_MAX,
+  store: new UploadChunkSlidingWindowStore(UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS, UPLOAD_CHUNK_RATE_LIMIT_MAX),
+  keyGenerator: (req) => String(req.user?.username || ""),
+  standardHeaders: false,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    const resetAt = req.rateLimit?.resetTime?.getTime() ?? Date.now() + UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS;
+    const retryAfterSeconds = Math.max(1, Math.ceil((resetAt - Date.now()) / 1000));
+    res.set("Retry-After", String(retryAfterSeconds));
+    return res.status(429).json({ error: "Limite temporario de envios em blocos atingido. Tente novamente mais tarde." });
+  },
+});
 const SINGLE_UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
 const UPLOAD_SCAN_ENABLED = parseEnvBoolean(process.env.UPLOAD_SCAN_ENABLED, true);
 const UPLOAD_SCAN_PROVIDER = String(process.env.UPLOAD_SCAN_PROVIDER || "clamav").toLowerCase();
@@ -4390,6 +4424,7 @@ function initData() {
   if (!fs.existsSync(UPLOAD_QUARANTINE_DIR)) fs.mkdirSync(UPLOAD_QUARANTINE_DIR, { recursive: true });
   ensureSafeChunkUploadStorage();
   scrubLegacyChunkPasswords();
+  cleanupExpiredChunkUploadSessions();
   if (!fs.existsSync(SIMPLE_UPLOAD_INCOMING_DIR)) fs.mkdirSync(SIMPLE_UPLOAD_INCOMING_DIR, { recursive: true });
   if (!fs.existsSync("./uploads")) fs.mkdirSync("./uploads");
 
@@ -4435,6 +4470,8 @@ function initData() {
 }
 
 app.set("trust proxy", true);
+// Enforce the chunk-upload peer limit before the global JSON parser handles request bodies.
+app.post("/upload-chunk", uploadChunkIpRateLimiter);
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
   if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
@@ -4866,11 +4903,16 @@ const chunkUpload = multer({
       }
     },
     filename: (req, file, callback) => {
-      crypto.randomBytes(16, (error, bytes) => callback(error, error ? undefined : bytes.toString("hex")));
+      crypto.randomBytes(16, (error, bytes) => {
+        if (error) return callback(error);
+        const filename = bytes.toString("hex");
+        file[CHUNK_UPLOAD_INCOMING_FILE_PATH] = path.join(CHUNK_UPLOAD_INCOMING_DIR, filename);
+        return callback(null, filename);
+      });
     },
   }),
   defParamCharset: "utf8",
-  limits: { files: 1, fields: 10, fieldNestingDepth: 0 },
+  limits: { fileSize: SINGLE_UPLOAD_MAX_BYTES, files: 1, fields: 10, fieldNestingDepth: 0 },
 });
 
 function rejectLargeSingleUpload(req, res, next) {
@@ -4910,14 +4952,13 @@ function handleChunkUploadSingle(req, res, next) {
 
     removeChunkUploadIncomingFile(req.file);
 
-    res.status(400).json({ error: error.message || "Upload do bloco nao concluido" });
+    res.status(error.code === "LIMIT_FILE_SIZE" ? 413 : 400).json({ error: error.message || "Upload do bloco nao concluido" });
   });
 }
 
 function getChunkUploadIncomingFilePath(file) {
-  const filename = typeof file?.filename === "string" ? file.filename : "";
-  if (!/^[a-f0-9]{32}$/.test(filename)) return null;
-  const incomingPath = path.join(CHUNK_UPLOAD_INCOMING_DIR, filename);
+  const incomingPath = file?.[CHUNK_UPLOAD_INCOMING_FILE_PATH];
+  if (typeof incomingPath !== "string" || !/^[a-f0-9]{32}$/.test(path.basename(incomingPath))) return null;
   return isSafeChildPath(CHUNK_UPLOAD_INCOMING_DIR, incomingPath) ? incomingPath : null;
 }
 
@@ -5741,6 +5782,7 @@ function isValidChunkSessionMetadata(metadata, expectedUploadId = "", expectedFo
     typeof metadata.expiresInDays === "string" &&
     typeof metadata.createdAt === "string" &&
     Number.isFinite(Date.parse(metadata.createdAt)) &&
+    (metadata.lastActivityAt === undefined || (typeof metadata.lastActivityAt === "string" && Number.isFinite(Date.parse(metadata.lastActivityAt)))) &&
     Number.isInteger(metadata.totalChunks) &&
     metadata.totalChunks >= 1 &&
     metadata.totalChunks <= MAX_UPLOAD_CHUNKS &&
@@ -5824,6 +5866,42 @@ function scrubLegacyChunkPasswords() {
   }
 }
 
+function cleanupExpiredChunkUploadSessions(now = Date.now()) {
+  try {
+    assertSafeChunkStorageRoot();
+    for (const folderEntry of fs.readdirSync(CHUNK_UPLOAD_DIR, { withFileTypes: true })) {
+      if (folderEntry.name === "incoming") continue;
+      if (folderEntry.isSymbolicLink()) throw new Error("Unsafe chunk-upload folder entry");
+      if (!folderEntry.isDirectory() || !/^[a-zA-Z0-9_-]{1,80}$/.test(folderEntry.name)) continue;
+      const folderPath = path.join(CHUNK_UPLOAD_DIR, folderEntry.name);
+      for (const sessionEntry of fs.readdirSync(folderPath, { withFileTypes: true })) {
+        if (sessionEntry.isSymbolicLink()) throw new Error("Unsafe chunk-upload session entry");
+        if (!sessionEntry.isDirectory() || !/^[a-zA-Z0-9_-]{1,80}$/.test(sessionEntry.name)) continue;
+        const sessionDir = path.join(folderPath, sessionEntry.name);
+        assertSafeChunkSessionDirectory(sessionDir);
+        const metadata = loadChunkMetadata(sessionDir, sessionEntry.name, folderEntry.name);
+        if (!metadata || metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true) continue;
+        const lastActivityAt = getChunkUploadSessionLastActivityMs(sessionDir, metadata);
+        if (!Number.isFinite(lastActivityAt) || now - lastActivityAt < UPLOAD_CHUNK_SESSION_TTL_MS) continue;
+        assertSafeChunkSessionDirectory(sessionDir);
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+      }
+    }
+  } catch (error) {
+    console.error("Falha ao limpar sessoes antigas de upload em blocos:", error.code || error.name || "cleanup_failed");
+  }
+}
+
+function getChunkUploadSessionLastActivityMs(sessionDir, metadata) {
+  let lastActivityAt = Date.parse(metadata.lastActivityAt || metadata.createdAt);
+  for (const entry of fs.readdirSync(sessionDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !/^(0|[1-9]\d{0,3})\.part$/.test(entry.name)) continue;
+    const stats = fs.lstatSync(path.join(sessionDir, entry.name));
+    if (stats.isFile() && !stats.isSymbolicLink()) lastActivityAt = Math.max(lastActivityAt, stats.mtimeMs);
+  }
+  return lastActivityAt;
+}
+
 function saveChunkMetadata(sessionDir, metadata) {
   const safeMetadata = { ...metadata };
   delete safeMetadata.password;
@@ -5865,7 +5943,7 @@ async function assembleChunkedUpload(sessionDir, destinationPath, totalChunks) {
   }
 }
 
-app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUploadFolder, handleChunkUploadSingle, async (req, res) => {
+app.post("/upload-chunk", authenticate, uploadChunkRateLimiter, requirePermission("upload"), prepareUploadFolder, handleChunkUploadSingle, async (req, res) => {
   const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
   const uploadId = String(req.body.uploadId || "");
   const originalName = path.basename(String(req.body.originalName || ""));
@@ -5916,6 +5994,13 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
       return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
     }
 
+    if (metadata && Date.now() - getChunkUploadSessionLastActivityMs(sessionDir, metadata) >= UPLOAD_CHUNK_SESSION_TTL_MS) {
+      assertSafeChunkSessionDirectory(sessionDir);
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+      removeChunkUploadIncomingFile(req.file);
+      return res.status(409).json({ error: "Sessao de upload expirada; inicie um novo envio" });
+    }
+
     if (!metadata) {
       if (fs.readdirSync(sessionDir, { withFileTypes: true }).length) {
         blockChunkSessionResume(sessionDir);
@@ -5934,6 +6019,7 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
         encryptionLevel: requestedEncryptionLevel,
         expiresInDays: typeof req.body.expiresInDays === "string" ? req.body.expiresInDays : "",
         createdAt: new Date().toISOString(),
+        lastActivityAt: new Date().toISOString(),
       };
       saveChunkMetadata(sessionDir, metadata);
     }
@@ -5953,6 +6039,8 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
     const chunkPath = path.join(sessionDir, `${chunkIndex}.part`);
     fs.rmSync(chunkPath, { force: true });
     fs.renameSync(incomingChunkPath, chunkPath);
+    metadata.lastActivityAt = new Date().toISOString();
+    replaceChunkMetadataFile(sessionDir, path.join(sessionDir, "metadata.json"), metadata);
 
     if (!hasAllChunks(sessionDir, totalChunks)) {
       return res.json({
@@ -8331,6 +8419,7 @@ repairCompressedTempUploads().catch((error) => {
 cleanupOrphanTempUploads();
 cleanupIncomingUploads();
 setInterval(cleanupExpiredTemporaryItems, 60 * 1000);
+setInterval(cleanupExpiredChunkUploadSessions, 60 * 1000);
 setInterval(cleanupExpiredTrashItems, 60 * 60 * 1000);
 setInterval(() => { void processPendingCloudTrashItems(); }, 60 * 1000);
 setInterval(() => { void processPendingCloudRestoreSync().catch(() => {}); }, 60 * 1000);
