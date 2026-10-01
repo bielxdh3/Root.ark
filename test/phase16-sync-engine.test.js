@@ -283,10 +283,17 @@ test("an abandoned process lock directory fails closed and is left for explicit 
 
   await fsp.rmdir(lockPath);
   const legacyLock = "legacy lock record\n";
-  await fsp.writeFile(lockPath, legacyLock, { flag: "wx", mode: 0o600 });
-  await assert.rejects(engine(root, adapter, key), { code: "sync_root_busy" });
-  assert.equal(await fsp.readFile(lockPath, "utf8"), legacyLock);
-  assert.equal(store.list("alice").length, 0);
+  const legacyHandle = await fsp.open(lockPath, "wx+", 0o600);
+  try {
+    await legacyHandle.writeFile(legacyLock);
+    await assert.rejects(engine(root, adapter, key), { code: "sync_root_busy" });
+    const contents = Buffer.alloc(Buffer.byteLength(legacyLock));
+    const { bytesRead } = await legacyHandle.read(contents, 0, contents.length, 0);
+    assert.equal(contents.subarray(0, bytesRead).toString("utf8"), legacyLock);
+    assert.equal(store.list("alice").length, 0);
+  } finally {
+    await legacyHandle.close();
+  }
 });
 
 test("Windows reconciliation protects pending paths across filename casing", { skip: process.platform !== "win32" }, async (t) => {
