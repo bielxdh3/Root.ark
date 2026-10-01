@@ -552,6 +552,49 @@ test("chunk uploads are rate limited per account before Multer writes to disk", 
   assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
 });
 
+test("chunk upload requests are rate limited by the direct peer before authentication", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    extraEnv: {
+      UPLOAD_CHUNK_IP_RATE_LIMIT_MAX: "2",
+      UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS: "60000",
+    },
+  });
+  const first = await request(harness.port, "/upload-chunk", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "content-length": "2",
+      "x-forwarded-for": "198.51.100.1",
+    },
+    body: "{}",
+  });
+  assert.equal(first.status, 401, first.body);
+
+  const second = await request(harness.port, "/upload-chunk", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "content-length": "2",
+      "x-forwarded-for": "203.0.113.2",
+    },
+    body: "{}",
+  });
+  assert.equal(second.status, 401, second.body);
+
+  const third = await request(harness.port, "/upload-chunk", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "content-length": "1",
+      "x-forwarded-for": "192.0.2.3",
+    },
+    body: "{",
+  });
+  assert.equal(third.status, 429, third.body);
+  assert.match(third.headers["retry-after"] || "", /^\d+$/);
+  assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
+});
+
 test("chunk uploads reject files larger than the supported 8 MiB block before creating a session", { timeout: 45_000 }, async (t) => {
   const harness = await createHarness(t);
   const session = await login(harness.port, "uploader", harness.password);

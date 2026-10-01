@@ -126,7 +126,21 @@ const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
 const MAX_UPLOAD_CHUNKS = 2000;
 const UPLOAD_CHUNK_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS, 1, MAX_UPLOAD_CHUNKS * 10);
 const UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS", 15 * 60 * 1000, 1000, 60 * 60 * 1000);
+const UPLOAD_CHUNK_IP_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_IP_RATE_LIMIT_MAX", Math.max(MAX_UPLOAD_CHUNKS * 10, UPLOAD_CHUNK_RATE_LIMIT_MAX), 1, MAX_UPLOAD_CHUNKS * 100);
 const UPLOAD_CHUNK_SESSION_TTL_MS = parseBoundedNumber("UPLOAD_CHUNK_SESSION_TTL_MS", 24 * 60 * 60 * 1000, 60 * 1000, 30 * 24 * 60 * 60 * 1000);
+const uploadChunkIpRateLimiter = rateLimit({
+  windowMs: UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS,
+  limit: UPLOAD_CHUNK_IP_RATE_LIMIT_MAX,
+  keyGenerator: (req) => rateLimit.ipKeyGenerator(req.socket?.remoteAddress || "unknown"),
+  standardHeaders: false,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    const resetAt = req.rateLimit?.resetTime?.getTime() ?? Date.now() + UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS;
+    const retryAfterSeconds = Math.max(1, Math.ceil((resetAt - Date.now()) / 1000));
+    res.set("Retry-After", String(retryAfterSeconds));
+    return res.status(429).json({ error: "Limite temporario de requisicoes em blocos atingido. Tente novamente mais tarde." });
+  },
+});
 const uploadChunkRateLimiter = rateLimit({
   windowMs: UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS,
   limit: UPLOAD_CHUNK_RATE_LIMIT_MAX,
@@ -4455,6 +4469,8 @@ function initData() {
 }
 
 app.set("trust proxy", true);
+// Enforce the chunk-upload peer limit before the global JSON parser handles request bodies.
+app.post("/upload-chunk", uploadChunkIpRateLimiter);
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
   if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
