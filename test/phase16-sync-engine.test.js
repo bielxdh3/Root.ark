@@ -163,6 +163,224 @@ test("selective sync hydrates a remote move when its destination is selected", a
   assert.equal(device.snapshot.remoteOnly[prior.objectId], undefined);
 });
 
+test("selective sync removes a clean local source after a remote move leaves selected scope", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-selective-move-out-clean-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const ownerRoot = path.join(dir, "owner");
+  await fsp.mkdir(path.join(ownerRoot, "selected"), { recursive: true });
+  await fsp.writeFile(path.join(ownerRoot, "selected", "file.txt"), "remote move payload");
+  await (await engine(ownerRoot, adapter, key)).syncOnce();
+  const prior = store.list("alice")[0];
+
+  const deviceRoot = path.join(dir, "device");
+  const device = await engine(deviceRoot, adapter, key, { selectedPaths: ["selected"] });
+  await device.syncOnce();
+  assert.equal(await fsp.readFile(path.join(deviceRoot, "selected", "file.txt"), "utf8"), "remote move payload");
+
+  const move = protocol.createOperation({
+    operation: "move", objectId: prior.objectId, fileId: prior.fileId, versionId: "selective-move-out-v2",
+    operationId: "selective-move-out-v2-op", deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: prior.revision, revision: { counter: prior.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "excluded/file.txt", sourcePath: "selected/file.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("remote move payload"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", move)).kind, "stored");
+
+  await device.syncOnce();
+  assert.equal(await fsp.stat(path.join(deviceRoot, "selected", "file.txt")).then(() => true, () => false), false);
+  assert.equal(device.snapshot.files["selected/file.txt"], undefined);
+  assert.equal(device.snapshot.remoteOnly[prior.objectId].path, "excluded/file.txt");
+  const trashed = await fsp.readdir(path.join(deviceRoot, ".rootark-trash"));
+  assert.equal(trashed.length, 1);
+  assert.equal(await fsp.readFile(path.join(deviceRoot, ".rootark-trash", trashed[0]), "utf8"), "remote move payload");
+  await device.syncOnce();
+  assert.equal(store.list("alice")[0].operationId, move.operationId);
+});
+
+test("selective sync moves a clean directory to trash after it leaves selected scope", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-selective-directory-move-out-clean-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const ownerRoot = path.join(dir, "owner");
+  await fsp.mkdir(path.join(ownerRoot, "selected", "folder"), { recursive: true });
+  await (await engine(ownerRoot, adapter, key)).syncOnce();
+  const prior = store.list("alice").find((operation) => operation.metadata.path === "selected/folder");
+  assert.equal(prior.metadata.contentType, "inode/directory");
+
+  const deviceRoot = path.join(dir, "device");
+  const device = await engine(deviceRoot, adapter, key, { selectedPaths: ["selected"] });
+  await device.syncOnce();
+  assert.equal(await fsp.stat(path.join(deviceRoot, "selected", "folder")).then((stats) => stats.isDirectory(), () => false), true);
+
+  const move = protocol.createOperation({
+    operation: "update", objectId: prior.objectId, fileId: prior.fileId, versionId: "selective-directory-move-out-v2",
+    operationId: "selective-directory-move-out-v2-op", deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: prior.revision, revision: { counter: prior.revision.counter + 1, deviceId: "device-b" },
+    metadata: { path: "excluded/folder", name: "folder", size: 0, contentType: "inode/directory" },
+    plaintext: Buffer.alloc(0), fileKey: key,
+  });
+  assert.equal((await store.put("alice", move)).kind, "stored");
+
+  await device.syncOnce();
+  assert.equal(await fsp.stat(path.join(deviceRoot, "selected", "folder")).then(() => true, () => false), false);
+  assert.equal(device.snapshot.files["selected/folder"], undefined);
+  assert.equal(device.snapshot.remoteOnly[prior.objectId].path, "excluded/folder");
+  assert.equal(device.snapshot.remoteOnly[prior.objectId].directory, true);
+  const trashed = await fsp.readdir(path.join(deviceRoot, ".rootark-trash"));
+  assert.equal(trashed.length, 1);
+  assert.equal(await fsp.stat(path.join(deviceRoot, ".rootark-trash", trashed[0])).then((stats) => stats.isDirectory()), true);
+});
+
+test("selective sync keeps a selected child when its remote directory record moves out of scope", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-selective-directory-selected-child-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const ownerRoot = path.join(dir, "owner");
+  await fsp.mkdir(path.join(ownerRoot, "selected", "folder"), { recursive: true });
+  await (await engine(ownerRoot, adapter, key)).syncOnce();
+  const prior = store.list("alice").find((operation) => operation.metadata.path === "selected/folder");
+  assert.equal(prior.metadata.contentType, "inode/directory");
+
+  const deviceRoot = path.join(dir, "device");
+  const device = await engine(deviceRoot, adapter, key, { selectedPaths: ["selected"] });
+  await device.syncOnce();
+  const childPath = path.join(deviceRoot, "selected", "folder", "local-child.txt");
+  await fsp.writeFile(childPath, "still selected remotely");
+  const move = protocol.createOperation({
+    operation: "update", objectId: prior.objectId, fileId: prior.fileId, versionId: "selective-directory-selected-child-v2",
+    operationId: "selective-directory-selected-child-v2-op", deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: prior.revision, revision: { counter: prior.revision.counter + 1, deviceId: "device-b" },
+    metadata: { path: "excluded/folder", name: "folder", size: 0, contentType: "inode/directory" },
+    plaintext: Buffer.alloc(0), fileKey: key,
+  });
+  assert.equal((await store.put("alice", move)).kind, "stored");
+
+  const summary = await device.syncOnce();
+  assert.equal(summary.pushed, 1);
+  assert.equal(await fsp.readFile(childPath, "utf8"), "still selected remotely");
+  assert.equal(device.snapshot.files["selected/folder"], undefined);
+  const child = device.snapshot.files["selected/folder/local-child.txt"];
+  assert.equal(Boolean(child && !child.deleted), true);
+  assert.equal(device.snapshot.remoteOnly[prior.objectId].path, "excluded/folder");
+  assert.equal(store.list("alice").find((operation) => operation.objectId === child.objectId).metadata.path, "selected/folder/local-child.txt");
+});
+
+test("selective sync preserves a locally changed directory tree after it leaves selected scope", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-selective-directory-move-out-conflict-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const ownerRoot = path.join(dir, "owner");
+  await fsp.mkdir(path.join(ownerRoot, "selected", "folder"), { recursive: true });
+  await (await engine(ownerRoot, adapter, key)).syncOnce();
+  const prior = store.list("alice").find((operation) => operation.metadata.path === "selected/folder");
+  assert.equal(prior.metadata.contentType, "inode/directory");
+
+  const deviceRoot = path.join(dir, "device");
+  const device = await engine(deviceRoot, adapter, key, { selectedPaths: ["selected"] });
+  await device.syncOnce();
+  await fsp.writeFile(path.join(deviceRoot, "selected", "folder", "local-only.txt"), "preserve this edit");
+  const move = protocol.createOperation({
+    operation: "update", objectId: prior.objectId, fileId: prior.fileId, versionId: "selective-directory-conflict-move-v2",
+    operationId: "selective-directory-conflict-move-v2-op", deviceId: "device-c", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: prior.revision, revision: { counter: prior.revision.counter + 1, deviceId: "device-c" },
+    metadata: { path: "excluded/folder", name: "folder", size: 0, contentType: "inode/directory" },
+    plaintext: Buffer.alloc(0), fileKey: key,
+  });
+  assert.equal((await store.put("alice", move)).kind, "stored");
+
+  const summary = { pushed: 0, pulled: 0, conflicts: [], offline: false };
+  await device.pullRemote(summary);
+  assert.equal(summary.conflicts.length, 1);
+  assert.equal(await fsp.readFile(path.join(deviceRoot, "selected", "folder", "local-only.txt"), "utf8"), "preserve this edit");
+  assert.equal(device.snapshot.files["selected/folder"], undefined);
+  assert.equal(device.snapshot.remoteOnly[prior.objectId].path, "excluded/folder");
+});
+
+test("selective sync preserves both branches when a local edit conflicts with a move out of scope", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-selective-move-out-conflict-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const ownerRoot = path.join(dir, "owner");
+  await fsp.mkdir(path.join(ownerRoot, "selected"), { recursive: true });
+  await fsp.writeFile(path.join(ownerRoot, "selected", "file.txt"), "remote version");
+  await (await engine(ownerRoot, adapter, key)).syncOnce();
+  const prior = store.list("alice")[0];
+
+  const deviceRoot = path.join(dir, "device");
+  const device = await engine(deviceRoot, adapter, key, { selectedPaths: ["selected"] });
+  await device.syncOnce();
+  await fsp.writeFile(path.join(deviceRoot, "selected", "file.txt"), "local version");
+  const move = protocol.createOperation({
+    operation: "move", objectId: prior.objectId, fileId: prior.fileId, versionId: "selective-conflict-move-v2",
+    operationId: "selective-conflict-move-v2-op", deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: prior.revision, revision: { counter: prior.revision.counter + 1, deviceId: "device-b" },
+    metadata: { path: "excluded/file.txt", sourcePath: "selected/file.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("remote version"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", move)).kind, "stored");
+
+  const summary = await device.syncOnce();
+  assert.equal(summary.conflicts.length, 1);
+  assert.equal(await fsp.stat(path.join(deviceRoot, "selected", "file.txt")).then(() => true, () => false), false);
+  assert.equal(device.snapshot.files["selected/file.txt"], undefined);
+  assert.equal(device.snapshot.remoteOnly[prior.objectId].path, "excluded/file.txt");
+  const conflicts = await fsp.readdir(path.join(deviceRoot, ".rootark-conflicts"));
+  const contents = await Promise.all(conflicts.map((name) => fsp.readFile(path.join(deviceRoot, ".rootark-conflicts", name), "utf8")));
+  assert.equal(contents.includes("local version"), true);
+  assert.equal(contents.includes("remote version"), true);
+  assert.deepEqual(await device.journal.recover(), []);
+  assert.equal(store.list("alice")[0].operationId, move.operationId);
+});
+
+test("selective sync does not push later pending operations after an out-of-scope move resolves the object", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-selective-move-out-pending-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const ownerRoot = path.join(dir, "owner");
+  await fsp.mkdir(path.join(ownerRoot, "selected"), { recursive: true });
+  await fsp.writeFile(path.join(ownerRoot, "selected", "file.txt"), "baseline");
+  await (await engine(ownerRoot, adapter, key)).syncOnce();
+  const prior = store.list("alice")[0];
+
+  const deviceRoot = path.join(dir, "device");
+  const device = await engine(deviceRoot, adapter, key, { selectedPaths: ["selected"] });
+  await device.syncOnce();
+  const move = protocol.createOperation({
+    operation: "move", objectId: prior.objectId, fileId: prior.fileId, versionId: "selective-pending-move-v2",
+    operationId: "selective-pending-move-v2-op", deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: prior.revision, revision: { counter: prior.revision.counter + 1, deviceId: "device-b" },
+    metadata: { path: "excluded/file.txt", sourcePath: "selected/file.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("baseline"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", move)).kind, "stored");
+  const pendingOperations = ["one", "two"].map((suffix, index) => protocol.createOperation({
+    operation: "update", objectId: prior.objectId, fileId: prior.fileId, versionId: `pending-${suffix}`,
+    operationId: `selective-pending-update-${suffix}`, deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: prior.revision, revision: { counter: prior.revision.counter + index + 1, deviceId: "device-a" },
+    metadata: { path: "selected/file.txt" }, plaintext: Buffer.from(`pending local ${suffix}`), fileKey: key,
+  }));
+  await device.journal.enqueueMany(pendingOperations);
+
+  const summary = await device.syncOnce();
+  assert.equal(summary.conflicts.length, 1);
+  assert.equal(summary.pushed, 1);
+  assert.deepEqual(await device.journal.recover(), []);
+  assert.equal(store.list("alice")[0].operationId, move.operationId);
+});
+
 test("conflict recovery does not materialize the remote version outside selected scope", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-selective-conflict-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
@@ -195,9 +413,13 @@ test("conflict recovery does not materialize the remote version outside selected
 
   const summary = await sync.syncOnce();
   assert.equal(summary.conflicts.length, 1);
-  assert.equal(await fsp.readFile(path.join(root, "selected", "file.txt"), "utf8"), "local version");
+  assert.equal(await fsp.stat(path.join(root, "selected", "file.txt")).then(() => true, () => false), false);
   assert.equal(await fsp.stat(path.join(root, "excluded", "file.txt")).then(() => true, () => false), false);
   assert.equal(sync.snapshot.remoteOnly["conflict-object"].path, "excluded/file.txt");
+  const conflicts = await fsp.readdir(path.join(root, ".rootark-conflicts"));
+  const contents = await Promise.all(conflicts.map((name) => fsp.readFile(path.join(root, ".rootark-conflicts", name), "utf8")));
+  assert.equal(contents.includes("local version"), true);
+  assert.equal(contents.includes("remote version"), true);
 });
 
 test("cache eviction serializes against reconciliation so its intent cannot be cleared", async (t) => {

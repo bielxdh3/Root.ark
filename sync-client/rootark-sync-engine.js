@@ -388,6 +388,93 @@ class SyncEngine {
     };
   }
 
+  async reconcileOutOfScopeMove(operation, summary, options = {}) {
+    const directoryMove = operation.operation === "update" && operation.metadata?.contentType === "inode/directory";
+    if ((operation.operation !== "move" && !directoryMove) || operation.tombstone
+      || typeof operation.metadata?.path !== "string" || this.isSelected(operation.metadata.path)) return false;
+    if (!directoryMove && !operation.metadata?.sourcePath) return false;
+
+    const sourcePath = directoryMove
+      ? activeIdentityPath(this.snapshot.files, operation, operation.metadata.path)
+      : activeFileIdentityPath(this.snapshot.files, operation, operation.metadata.path)
+        || (this.snapshot.files[operation.metadata.sourcePath]?.objectId === operation.objectId
+        && this.snapshot.files[operation.metadata.sourcePath]?.fileId === operation.fileId
+        && !this.snapshot.files[operation.metadata.sourcePath]?.deleted
+        && !this.snapshot.files[operation.metadata.sourcePath]?.directory
+        ? operation.metadata.sourcePath : null);
+    if (!sourcePath || !this.isSelected(sourcePath)) return false;
+
+    const prior = this.snapshot.files[sourcePath];
+    if (!prior || prior.deleted || Boolean(prior.directory) !== directoryMove
+      || prior.objectId !== operation.objectId || prior.fileId !== operation.fileId) return false;
+
+    const pending = (await this.journal.recover()).filter((item) => item.protocolVersion && item.objectId === operation.objectId);
+    const target = await contained(this.rootDir, sourcePath, true);
+    const sourceExists = await exists(target);
+    let changedLocally = false;
+    if (sourceExists) {
+      const stats = await fsp.lstat(target, { bigint: true });
+      if (stats.isSymbolicLink() || (directoryMove ? !stats.isDirectory() : !stats.isFile())) {
+        fail("Tracked sync source has an unexpected type", "unsafe_path");
+      }
+      if (directoryMove) {
+        const currentFiles = await this.scanFiles();
+        const trackedEntries = Object.entries(this.snapshot.files).filter(([relativePath, item]) => !item.deleted
+          && pathWithin(relativePath, sourcePath));
+        const trackedKeys = new Set(trackedEntries.map(([relativePath]) => pathKey(relativePath)));
+        for (const [relativePath, item] of trackedEntries) {
+          const currentPath = canonicalMapPath(relativePath, currentFiles);
+          const current = currentFiles[currentPath];
+          if (!current || current.hash !== item.hash || Boolean(current.directory) !== Boolean(item.directory)) changedLocally = true;
+        }
+        if (Object.keys(currentFiles).some((relativePath) => pathWithin(relativePath, sourcePath) && !trackedKeys.has(pathKey(relativePath)))) {
+          changedLocally = true;
+        }
+      } else {
+        const bytes = await readContainedFile(this.rootDir, sourcePath, stats);
+        changedLocally = crypto.createHash("sha256").update(bytes).digest("hex") !== prior.hash;
+      }
+    }
+
+    const hasLocalConflict = changedLocally || pending.length > 0;
+    if (hasLocalConflict) {
+      for (const item of pending) {
+        if (item.protocolVersion && !(options.preservedOperationIds || []).includes(item.operationId)) await this.recoverConflict(item, summary);
+      }
+      if (sourceExists && !directoryMove) {
+        const conflictRoot = path.join(this.rootDir, ".rootark-conflicts");
+        await fsp.mkdir(conflictRoot, { recursive: true });
+        await containedAbsolute(this.rootDir, conflictRoot, false);
+        const operationKey = crypto.createHash("sha256").update(operation.operationId).digest("hex").slice(0, 16);
+        const conflictPath = path.join(conflictRoot, `${operationKey}-${crypto.randomUUID()}.local.conflict`);
+        await containedAbsolute(this.rootDir, conflictPath, true);
+        await fsp.rename(target, conflictPath);
+      }
+      if (!directoryMove && !options.preservedOperationIds?.includes(operation.operationId)) await this.recoverConflict(operation, summary);
+      summary.conflicts ||= [];
+      if (!options.conflictAlreadyRecorded && !summary.conflicts.some((conflict) => conflict.operationId === operation.operationId)) {
+        summary.conflicts.push({ operationId: operation.operationId, policy: "preserve-local-and-remote", reason: "remote-move-outside-selected-scope" });
+      }
+    } else if (sourceExists) {
+      if (!directoryMove) {
+        await this.stageExisting(target);
+      } else if ((await fsp.readdir(target)).length === 0) {
+        const hasActiveDescendant = Object.entries(this.snapshot.files).some(([relativePath, item]) => relativePath !== sourcePath
+          && !item.deleted && pathWithin(relativePath, sourcePath));
+        if (!hasActiveDescendant) await this.stageExisting(target);
+      }
+    }
+
+    for (const relativePath of Object.keys(this.snapshot.files)) {
+      if (pathsEqual(relativePath, sourcePath)) delete this.snapshot.files[relativePath];
+    }
+    this.rememberRemoteOnly(operation, "excluded");
+    for (const item of pending) await this.journal.markSeen(item.operationId);
+    await this.pruneEmptyUntrackedParents(path.dirname(target));
+    await this.persistSnapshot();
+    return true;
+  }
+
   async buildOperation(input) {
     const key = input.fileKey || await this.fileKeyResolver(input);
     let operationInput = input;
@@ -699,6 +786,7 @@ class SyncEngine {
 
   async _pushPending(summary) {
     for (const original of await this.journal.recover()) {
+      if (this.journal.hasSeen(original.operationId)) continue;
       let pending = original;
       if (pending.journalType === "webdav-mutation") {
         if (!this.translateWebDavOperation) continue;
@@ -738,8 +826,13 @@ class SyncEngine {
               await this._apply(current, summary);
             } else {
               await this.verifyIncomingOperation(current);
-              this.rememberRemoteOnly(current, "excluded");
-              await this.persistSnapshot();
+              const reconciled = await this.reconcileOutOfScopeMove(current, summary, {
+                preservedOperationIds: [operation.operationId], conflictAlreadyRecorded: true,
+              });
+              if (!reconciled) {
+                this.rememberRemoteOnly(current, "excluded");
+                await this.persistSnapshot();
+              }
             }
           }
           await this.journal.markSeen(operation.operationId);
@@ -1214,6 +1307,7 @@ class SyncEngine {
       const operation = protocol.validateOperation(raw);
       if (!this.operationDestinationIsSelected(operation)) {
         await this.verifyIncomingOperation(operation);
+        await this.reconcileOutOfScopeMove(operation, summary);
         this.rememberRemoteOnly(operation, "excluded");
         remoteOnlyChanged = true;
         continue;
