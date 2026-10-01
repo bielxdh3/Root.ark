@@ -552,6 +552,31 @@ test("chunk uploads are rate limited per account before Multer writes to disk", 
   assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
 });
 
+test("case-distinct usernames do not share a chunk upload quota", { timeout: 45_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    extraEnv: {
+      UPLOAD_CHUNK_RATE_LIMIT_MAX: "1",
+      UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS: "60000",
+    },
+    extraUsers: [{ username: "Uploader", role: "user", permissions: { upload: true, listFiles: true } }],
+  });
+  const lowerCaseAccount = await login(harness.port, "uploader", harness.password);
+  const upperCaseAccount = await login(harness.port, "Uploader", harness.password);
+  const sendPart = (session, uploadId) => uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: `${uploadId}.txt`,
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.from(uploadId),
+    folderId: "root",
+  });
+
+  assert.equal((await sendPart(lowerCaseAccount, "case-quota-lower-first")).status, 200);
+  assert.equal((await sendPart(upperCaseAccount, "case-quota-upper-first")).status, 200);
+  assert.equal((await sendPart(lowerCaseAccount, "case-quota-lower-second")).status, 429);
+  assert.equal((await sendPart(upperCaseAccount, "case-quota-upper-second")).status, 429);
+});
+
 test("rejected chunk requests do not grow the rolling-window store", (t) => {
   const store = new UploadChunkSlidingWindowStore(60_000, 3);
   t.after(() => store.shutdown());

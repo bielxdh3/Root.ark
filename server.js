@@ -130,7 +130,7 @@ const uploadChunkRateLimiter = rateLimit({
   windowMs: UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS,
   limit: UPLOAD_CHUNK_RATE_LIMIT_MAX,
   store: new UploadChunkSlidingWindowStore(UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS, UPLOAD_CHUNK_RATE_LIMIT_MAX),
-  keyGenerator: (req) => String(req.user?.username || "").trim().toLowerCase(),
+  keyGenerator: (req) => String(req.user?.username || ""),
   standardHeaders: false,
   legacyHeaders: false,
   handler: (req, res) => {
