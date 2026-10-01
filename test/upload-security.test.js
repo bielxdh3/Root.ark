@@ -93,7 +93,7 @@ function isContained(parent, candidate) {
   return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
 }
 
-async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, extraEnv = {} } = {}) {
+async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, extraEnv = {}, extraUsers = [] } = {}) {
   const password = crypto.randomBytes(24).toString("base64url");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-upload-safety-"));
   const quarantineDir = path.join(dir, "quarantine");
@@ -102,6 +102,7 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
   fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([
     { username: "uploader", password: bcrypt.hashSync(password, 10), role: "user", permissions: { upload: true, listFiles: true }, sessionVersion: 0 },
     { username: "viewer", password: bcrypt.hashSync(password, 10), role: "user", permissions: {}, sessionVersion: 0 },
+    ...extraUsers.map(({ username, role, permissions }) => ({ username, password: bcrypt.hashSync(password, 10), role, permissions, sessionVersion: 0 })),
   ]));
   fs.writeFileSync(path.join(dir, "data", "folders.json"), JSON.stringify([
     { id: "root", name: "Arquivos atuais", createdBy: "sistema", allowedUsers: [], isRoot: true },
@@ -175,7 +176,7 @@ async function uploadPayload(port, session, payload) {
   });
 }
 
-async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, totalChunks, bytes, encryptionLevel, password, versionComment, expiresInDays }) {
+async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, totalChunks, bytes, encryptionLevel, password, versionComment, expiresInDays, folderId = FOLDER_ID }) {
   const parts = [
     { field: "uploadId", bytes: uploadId },
     { field: "originalName", bytes: originalName },
@@ -187,7 +188,7 @@ async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, 
   }
   parts.push({ field: "chunk", filename: originalName, bytes });
   const payload = multipartParts(parts);
-  return request(port, `/upload-chunk?folderId=${FOLDER_ID}`, {
+  return request(port, `/upload-chunk?folderId=${encodeURIComponent(folderId)}`, {
     method: "POST",
     headers: {
       cookie: session.cookie,
@@ -482,6 +483,7 @@ test("chunk uploads are rate limited per account before Multer writes to disk", 
       UPLOAD_CHUNK_RATE_LIMIT_MAX: "3",
       UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS: "60000",
     },
+    extraUsers: [{ username: "other-uploader", role: "user", permissions: { upload: true, listFiles: true } }],
   });
   const session = await login(harness.port, "uploader", harness.password);
   const firstPart = await uploadChunk(harness.port, session, {
@@ -524,6 +526,17 @@ test("chunk uploads are rate limited per account before Multer writes to disk", 
   assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, rejectedId)), false);
   assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
 
+  const otherUploader = await login(harness.port, "other-uploader", harness.password);
+  const otherAccountUpload = await uploadChunk(harness.port, otherUploader, {
+    uploadId: "rate-limit-other-account",
+    originalName: "other-account.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.from("other account"),
+    folderId: "root",
+  });
+  assert.equal(otherAccountUpload.status, 200, otherAccountUpload.body);
+
   const viewer = await login(harness.port, "viewer", harness.password);
   const deniedId = "rate-limit-no-permission";
   const denied = await uploadChunk(harness.port, viewer, {
@@ -536,6 +549,35 @@ test("chunk uploads are rate limited per account before Multer writes to disk", 
   assert.equal(denied.status, 403, denied.body);
   assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, deniedId)), false);
   assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
+});
+
+test("chunk upload throttling expires each account request on a rolling window", { timeout: 45_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    extraEnv: {
+      UPLOAD_CHUNK_RATE_LIMIT_MAX: "2",
+      UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS: "2000",
+    },
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const sendPart = (uploadId) => uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: `${uploadId}.txt`,
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.from(uploadId),
+  });
+
+  assert.equal((await sendPart("rolling-window-first")).status, 200);
+  await new Promise((resolve) => setTimeout(resolve, 1300));
+  assert.equal((await sendPart("rolling-window-second")).status, 200);
+  await new Promise((resolve) => setTimeout(resolve, 800));
+
+  const afterFirstExpired = await sendPart("rolling-window-third");
+  assert.equal(afterFirstExpired.status, 200, afterFirstExpired.body);
+  const overLimit = await sendPart("rolling-window-fourth");
+  assert.equal(overLimit.status, 429, overLimit.body);
+  assert.match(overLimit.headers["retry-after"] || "", /^\d+$/);
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, "rolling-window-fourth")), false);
 });
 
 test("malformed, unreadable, and orphan chunk sessions cannot overwrite retained parts", { timeout: 45_000 }, async (t) => {

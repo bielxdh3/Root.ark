@@ -6,6 +6,7 @@ try {
   if (error?.code !== "ENOENT") throw error;
 }
 const express = require("express");
+const { rateLimit } = require("express-rate-limit");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
@@ -124,8 +125,78 @@ const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
 const MAX_UPLOAD_CHUNKS = 2000;
 const UPLOAD_CHUNK_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS, 1, MAX_UPLOAD_CHUNKS * 10);
 const UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS", 15 * 60 * 1000, 1000, 60 * 60 * 1000);
-const uploadChunkRequestsByUsername = new Map();
-let uploadChunkRateLimitSweepCount = 0;
+class UploadChunkSlidingWindowStore {
+  constructor(windowMs) {
+    this.windowMs = windowMs;
+    this.requestsByAccount = new Map();
+    this.localKeys = true;
+    this.prefix = "upload-chunk";
+    this.cleanupTimer = setInterval(() => this.sweep(Date.now()), Math.min(windowMs, 60 * 1000));
+    this.cleanupTimer.unref?.();
+  }
+
+  getRequests(account, now = Date.now()) {
+    const requests = this.requestsByAccount.get(account) || [];
+    const oldestAllowed = now - this.windowMs;
+    while (requests.length && requests[0] <= oldestAllowed) requests.shift();
+    if (requests.length) this.requestsByAccount.set(account, requests);
+    else this.requestsByAccount.delete(account);
+    return requests;
+  }
+
+  increment(account) {
+    const now = Date.now();
+    const requests = this.getRequests(account, now);
+    requests.push(now);
+    this.requestsByAccount.set(account, requests);
+    return { totalHits: requests.length, resetTime: new Date(requests[0] + this.windowMs) };
+  }
+
+  decrement(account) {
+    const requests = this.getRequests(account);
+    requests.pop();
+    if (requests.length) this.requestsByAccount.set(account, requests);
+    else this.requestsByAccount.delete(account);
+  }
+
+  get(account) {
+    const requests = this.getRequests(account);
+    return requests.length
+      ? { totalHits: requests.length, resetTime: new Date(requests[0] + this.windowMs) }
+      : undefined;
+  }
+
+  resetKey(account) {
+    this.requestsByAccount.delete(account);
+  }
+
+  resetAll() {
+    this.requestsByAccount.clear();
+  }
+
+  sweep(now) {
+    for (const account of this.requestsByAccount.keys()) this.getRequests(account, now);
+  }
+
+  shutdown() {
+    clearInterval(this.cleanupTimer);
+  }
+}
+
+const uploadChunkRateLimiter = rateLimit({
+  windowMs: UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS,
+  limit: UPLOAD_CHUNK_RATE_LIMIT_MAX,
+  store: new UploadChunkSlidingWindowStore(UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS),
+  keyGenerator: (req) => String(req.user?.username || "").trim().toLowerCase(),
+  standardHeaders: false,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    const resetAt = req.rateLimit?.resetTime?.getTime() ?? Date.now() + UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS;
+    const retryAfterSeconds = Math.max(1, Math.ceil((resetAt - Date.now()) / 1000));
+    res.set("Retry-After", String(retryAfterSeconds));
+    return res.status(429).json({ error: "Limite temporario de envios em blocos atingido. Tente novamente mais tarde." });
+  },
+});
 const SINGLE_UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
 const UPLOAD_SCAN_ENABLED = parseEnvBoolean(process.env.UPLOAD_SCAN_ENABLED, true);
 const UPLOAD_SCAN_PROVIDER = String(process.env.UPLOAD_SCAN_PROVIDER || "clamav").toLowerCase();
@@ -4945,32 +5016,6 @@ function prepareUploadFolder(req, res, next) {
   next();
 }
 
-function rateLimitChunkUpload(req, res, next) {
-  const username = String(req.user?.username || "").trim().toLowerCase();
-  if (!username) return res.status(401).json({ error: "Autenticacao obrigatoria" });
-
-  const now = Date.now();
-  const oldestAllowed = now - UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS;
-  const requests = uploadChunkRequestsByUsername.get(username) || [];
-  while (requests.length && requests[0] <= oldestAllowed) requests.shift();
-
-  if (requests.length >= UPLOAD_CHUNK_RATE_LIMIT_MAX) {
-    const retryAfterSeconds = Math.max(1, Math.ceil((requests[0] + UPLOAD_CHUNK_RATE_LIMIT_WINDOW_MS - now) / 1000));
-    res.set("Retry-After", String(retryAfterSeconds));
-    return res.status(429).json({ error: "Limite temporario de envios em blocos atingido. Tente novamente mais tarde." });
-  }
-
-  requests.push(now);
-  uploadChunkRequestsByUsername.set(username, requests);
-  if (++uploadChunkRateLimitSweepCount % 128 === 0) {
-    for (const [account, timestamps] of uploadChunkRequestsByUsername) {
-      while (timestamps.length && timestamps[0] <= oldestAllowed) timestamps.shift();
-      if (!timestamps.length) uploadChunkRequestsByUsername.delete(account);
-    }
-  }
-  return next();
-}
-
 app.get("/folders", authenticate, (req, res) => {
   const folders = loadFolders()
     .filter((folder) => hasFolderAccess(req, folder))
@@ -5895,7 +5940,7 @@ async function assembleChunkedUpload(sessionDir, destinationPath, totalChunks) {
   }
 }
 
-app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUploadFolder, rateLimitChunkUpload, handleChunkUploadSingle, async (req, res) => {
+app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunkRateLimiter, prepareUploadFolder, handleChunkUploadSingle, async (req, res) => {
   const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
   const uploadId = String(req.body.uploadId || "");
   const originalName = path.basename(String(req.body.originalName || ""));
