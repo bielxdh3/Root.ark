@@ -5883,7 +5883,7 @@ async function assembleChunkedUpload(sessionDir, destinationPath, totalChunks) {
   }
 }
 
-app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunkRateLimiter, prepareUploadFolder, handleChunkUploadSingle, async (req, res) => {
+app.post("/upload-chunk", authenticate, uploadChunkRateLimiter, requirePermission("upload"), prepareUploadFolder, handleChunkUploadSingle, async (req, res) => {
   const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
   const uploadId = String(req.body.uploadId || "");
   const originalName = path.basename(String(req.body.originalName || ""));
