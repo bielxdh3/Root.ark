@@ -4,7 +4,6 @@ const crypto = require("node:crypto");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
-const os = require("node:os");
 const path = require("node:path");
 
 const protocol = require("./rootark-sync-protocol");
@@ -273,109 +272,26 @@ class SyncEngine {
 
   async acquireProcessLock() {
     const lockPath = path.join(this.rootDir, ".rootark-sync.lock");
-    const owner = { host: os.hostname(), pid: process.pid, token: crypto.randomUUID() };
-    const create = async () => {
-      const temporaryPath = path.join(this.rootDir, `${INTERNAL_NAME_PREFIXES[0]}${process.pid}-${owner.token}`);
-      const handle = await fsp.open(temporaryPath, "wx", 0o600);
-      let createdStats;
-      let published = false;
-      try {
-        createdStats = await handle.stat({ bigint: true });
-        await handle.writeFile(`${JSON.stringify(owner)}\n`);
-        await handle.sync();
-        // Publish only a complete, synced owner record. A crash before this
-        // atomic hard-link leaves an ignored temporary file, not a malformed
-        // lock that can strand the sync root.
-        await fsp.link(temporaryPath, lockPath);
-        published = true;
-        const lockStats = await fsp.lstat(lockPath, { bigint: true });
-        if (!sameFileIdentity(createdStats, lockStats)) fail("Sync lock changed while publishing", "sync_root_busy");
-        await fsp.unlink(temporaryPath);
-        return { handle, lockPath, owner, stats: createdStats };
-      } catch (error) {
-        await handle.close().catch(() => {});
-        if (createdStats) {
-          for (const candidatePath of published ? [temporaryPath, lockPath] : [temporaryPath]) {
-            try {
-              const pathStats = await fsp.lstat(candidatePath, { bigint: true });
-              if (pathStats.isFile() && !pathStats.isSymbolicLink()
-                && pathStats.dev === createdStats.dev && pathStats.ino === createdStats.ino) {
-                await fsp.unlink(candidatePath);
-              }
-            } catch (cleanupError) {
-              if (cleanupError.code !== "ENOENT") break;
-            }
-          }
-        }
-        throw error;
+    try {
+      // mkdir is an atomic no-overwrite claim. The lock directory is empty so
+      // release can use rmdir, which itself refuses to remove a replacement
+      // directory if it contains anything.
+      await fsp.mkdir(lockPath, { mode: 0o700 });
+      return lockPath;
+    } catch (error) {
+      if (error.code === "EEXIST") {
+        fail("Another sync writer owns this folder, or its leftover lock needs manual recovery", "sync_root_busy");
       }
-    };
-
-    try {
-      return await create();
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-    }
-    if (!await this.removeStaleProcessLock(lockPath)) fail("Another sync writer owns this folder", "sync_root_busy");
-    try {
-      return await create();
-    } catch (error) {
-      if (error.code === "EEXIST") fail("Another sync writer owns this folder", "sync_root_busy");
       throw error;
     }
   }
 
-  async removeStaleProcessLock(lockPath) {
-    let handle;
+  async releaseProcessLock(lockPath) {
     try {
-      const pathStats = await fsp.lstat(lockPath, { bigint: true });
-      if (!pathStats.isFile() || pathStats.isSymbolicLink() || pathStats.size > 1024n) return false;
-      handle = await fsp.open(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-      const handleStats = await handle.stat({ bigint: true });
-      if (!handleStats.isFile() || handleStats.dev !== pathStats.dev || handleStats.ino !== pathStats.ino) return false;
-      const text = await handle.readFile("utf8");
-      let owner;
-      try { owner = JSON.parse(text); } catch { return false; }
-      if (owner.host !== os.hostname() || !Number.isSafeInteger(owner.pid) || owner.pid < 1 || owner.pid === process.pid) return false;
-      try {
-        process.kill(owner.pid, 0);
-        return false;
-      } catch (error) {
-        if (error.code !== "ESRCH") return false;
-      }
-      const latestStats = await fsp.lstat(lockPath, { bigint: true });
-      if (!latestStats.isFile() || latestStats.isSymbolicLink() || latestStats.dev !== handleStats.dev || latestStats.ino !== handleStats.ino) return false;
-      await fsp.unlink(lockPath);
-      return true;
-    } catch (error) {
-      if (error.code === "ENOENT") return true;
-      if (["ELOOP", "EPERM", "EACCES"].includes(error.code)) return false;
-      throw error;
-    } finally {
-      if (handle) await handle.close().catch(() => {});
-    }
-  }
-
-  async releaseProcessLock(processLock) {
-    await processLock.handle.close();
-    try {
-      const pathStats = await fsp.lstat(processLock.lockPath, { bigint: true });
-      if (!pathStats.isFile() || pathStats.isSymbolicLink()
-        || pathStats.dev !== processLock.stats.dev || pathStats.ino !== processLock.stats.ino) return;
-      const handle = await fsp.open(processLock.lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-      try {
-        const currentStats = await handle.stat({ bigint: true });
-        if (!currentStats.isFile() || currentStats.dev !== processLock.stats.dev || currentStats.ino !== processLock.stats.ino) return;
-        const text = await handle.readFile("utf8");
-        if (JSON.parse(text).token !== processLock.owner.token) return;
-      } finally {
-        await handle.close();
-      }
-      const latestStats = await fsp.lstat(processLock.lockPath, { bigint: true });
-      if (latestStats.isFile() && !latestStats.isSymbolicLink()
-        && latestStats.dev === processLock.stats.dev && latestStats.ino === processLock.stats.ino) {
-        await fsp.unlink(processLock.lockPath);
-      }
+      // The operation is atomic with respect to directory contents: if an
+      // unexpected actor replaced this marker with a nonempty lock directory,
+      // rmdir refuses to remove it instead of deleting by checked pathname.
+      await fsp.rmdir(lockPath);
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }

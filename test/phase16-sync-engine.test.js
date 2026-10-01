@@ -266,6 +266,29 @@ test("abandoned process-lock initialization files neither block sync nor enter t
   assert.equal(store.list("alice").length, 0);
 });
 
+test("an abandoned process lock directory fails closed and is left for explicit recovery", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-sync-lock-stale-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  const root = path.join(dir, "device");
+  await fsp.mkdir(root, { recursive: true });
+  const lockPath = path.join(root, ".rootark-sync.lock");
+  await fsp.mkdir(lockPath, { mode: 0o700 });
+
+  await assert.rejects(engine(root, adapter, key), { code: "sync_root_busy" });
+  assert.equal((await fsp.lstat(lockPath)).isDirectory(), true);
+  assert.deepEqual(await fsp.readdir(lockPath), []);
+
+  await fsp.rmdir(lockPath);
+  const legacyLock = "legacy lock record\n";
+  await fsp.writeFile(lockPath, legacyLock, { flag: "wx", mode: 0o600 });
+  await assert.rejects(engine(root, adapter, key), { code: "sync_root_busy" });
+  assert.equal(await fsp.readFile(lockPath, "utf8"), legacyLock);
+  assert.equal(store.list("alice").length, 0);
+});
+
 test("Windows reconciliation protects pending paths across filename casing", { skip: process.platform !== "win32" }, async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-pending-case-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
