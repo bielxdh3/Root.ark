@@ -5,8 +5,8 @@
   --surface-muted: #f7f9fb;
   --surface-raised: #ffffff;
   --text: #182a3a;
-  --text-muted: #65788a;
-  --text-soft: #8494a3;
+  --text-muted: #516576;
+  --text-soft: #5d6b7a;
   --border: #e3e9ef;
   --border-strong: #d2dce5;
   --primary: #18756e;
@@ -332,7 +332,7 @@ img { max-width: 100%; }
   color: var(--text);
   font-size: 13px;
 }
-.field::placeholder, .textarea::placeholder { color: var(--text-soft); }
+.field::placeholder, .textarea::placeholder { color: var(--text-soft); opacity: 1; }
 .textarea { min-height: 96px; resize: vertical; }
 .field:focus, .select:focus, .textarea:focus { border-color: var(--primary); outline: 3px solid color-mix(in srgb, var(--primary) 17%, transparent); }
 .field-row { display: grid; gap: 6px; }
