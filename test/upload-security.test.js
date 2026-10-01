@@ -552,6 +552,96 @@ test("chunk uploads are rate limited per account before Multer writes to disk", 
   assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
 });
 
+test("chunk uploads reject files larger than the supported 8 MiB block before creating a session", { timeout: 45_000 }, async (t) => {
+  const harness = await createHarness(t);
+  const session = await login(harness.port, "uploader", harness.password);
+  const uploadId = "oversized-single-chunk";
+  const response = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "oversized.bin",
+    chunkIndex: 0,
+    totalChunks: 1,
+    bytes: Buffer.alloc(8 * 1024 * 1024 + 1, 0x61),
+  });
+
+  assert.equal(response.status, 413, response.body);
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId)), false);
+  assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
+});
+
+test("chunk upload cleanup expires inactive sessions and refreshes active session timestamps", { timeout: 45_000 }, async (t) => {
+  const now = Date.now();
+  const staleUploadId = "stale-session";
+  const activeUploadId = "active-session";
+  const interruptedUploadId = "interrupted-session";
+  const harness = await createHarness(t, {
+    extraEnv: { UPLOAD_CHUNK_SESSION_TTL_MS: "60000" },
+    chunkSessions: [
+      {
+        uploadId: staleUploadId,
+        files: {
+          "metadata.json": legacyChunkMetadata(staleUploadId, {
+            encryptionLevel: "none",
+            createdAt: new Date(now - 2 * 60 * 1000).toISOString(),
+            lastActivityAt: new Date(now - 2 * 60 * 1000).toISOString(),
+          }),
+          "0.part": "stale-part",
+        },
+      },
+      {
+        uploadId: activeUploadId,
+        files: {
+          "metadata.json": legacyChunkMetadata(activeUploadId, {
+            encryptionLevel: "none",
+            totalChunks: 3,
+            createdAt: new Date(now - 2 * 24 * 60 * 60 * 1000).toISOString(),
+          }),
+          "0.part": "recent-part",
+        },
+      },
+      {
+        uploadId: interruptedUploadId,
+        files: {
+          "metadata.json": legacyChunkMetadata(interruptedUploadId, {
+            encryptionLevel: "none",
+            totalChunks: 3,
+            createdAt: new Date(now - 2 * 60 * 1000).toISOString(),
+            lastActivityAt: new Date(now - 2 * 60 * 1000).toISOString(),
+          }),
+          "0.part": "stored-before-crash",
+        },
+      },
+    ],
+    preloadSource: ({ chunkRoot }) => {
+      const partPath = path.join(chunkRoot, FOLDER_ID, staleUploadId, "0.part");
+      const staleTime = new Date(now - 2 * 60 * 1000);
+      fs.utimesSync(partPath, staleTime, staleTime);
+      return "";
+    },
+  });
+
+  const staleDir = path.join(harness.chunkRoot, FOLDER_ID, staleUploadId);
+  const activeDir = path.join(harness.chunkRoot, FOLDER_ID, activeUploadId);
+  const interruptedDir = path.join(harness.chunkRoot, FOLDER_ID, interruptedUploadId);
+  assert.equal(fs.existsSync(staleDir), false);
+  assert.equal(fs.readFileSync(path.join(activeDir, "0.part"), "utf8"), "recent-part");
+  assert.equal(fs.readFileSync(path.join(interruptedDir, "0.part"), "utf8"), "stored-before-crash");
+
+  const session = await login(harness.port, "uploader", harness.password);
+  const beforeRequest = Date.now();
+  const response = await uploadChunk(harness.port, session, {
+    uploadId: activeUploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 3,
+    bytes: "active-part",
+  });
+  assert.equal(response.status, 200, response.body);
+  assert.equal(JSON.parse(response.body).complete, false);
+  const metadata = JSON.parse(fs.readFileSync(path.join(activeDir, "metadata.json"), "utf8"));
+  assert.equal(Date.parse(metadata.lastActivityAt) >= beforeRequest, true);
+});
+
 test("case-distinct usernames do not share a chunk upload quota", { timeout: 45_000 }, async (t) => {
   const harness = await createHarness(t, {
     extraEnv: {

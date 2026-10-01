@@ -120,6 +120,14 @@ npm start
 
 The server uses port `3000` unless `PORT` is configured.
 
+Valid incomplete chunked uploads expire after 24 hours without activity. Set
+`UPLOAD_CHUNK_SESSION_TTL_MS` to a value from 60,000 milliseconds to 30 days to
+adjust this retention window; expired uploads must be restarted. Older sessions
+also use the newest chunk's modification time so a saved block still counts as
+activity if the server stops before updating its session record. Sessions with
+missing or invalid metadata are blocked from resuming and retained rather than
+automatically deleted.
+
 For a reviewed deployment profile, set a strong `JWT_SECRET`, an explicit
 `TOTP_POLICY` (`optional`, `role-required`, or `global-required`), and a
 32-byte `SERVER_MASTER_KEY` or protected `data/server-master.key`. `GET
