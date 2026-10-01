@@ -1,8 +1,10 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { AsyncLocalStorage } = require("node:async_hooks");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
+const os = require("node:os");
 const path = require("node:path");
 
 const protocol = require("./rootark-sync-protocol");
@@ -10,7 +12,10 @@ const { SyncJournal } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 
 const SNAPSHOT_VERSION = 1;
-const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json"]);
+const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock"]);
+const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-"];
+const ROOT_MUTATION_QUEUES = new Map();
+const ROOT_MUTATION_CONTEXT = new AsyncLocalStorage();
 
 function fail(message, code = "sync_engine_error") {
   throw Object.assign(new Error(message), { code });
@@ -147,8 +152,28 @@ function canonicalMapPath(relativePath, ...maps) {
 
 async function durableJson(filePath, value) {
   const temporary = `${filePath}.tmp-${process.pid}-${crypto.randomUUID()}`;
-  await fsp.writeFile(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600 });
-  await fsp.rename(temporary, filePath);
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+    | (fs.constants.O_SYNC || 0);
+  let handle;
+  try {
+    handle = await fsp.open(temporary, flags, 0o600);
+    await handle.writeFile(`${JSON.stringify(value)}\n`);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fsp.rename(temporary, filePath);
+    // Node cannot reliably fsync directory handles on Windows. Flush the
+    // containing directory where the platform supports it; the file itself
+    // is opened with O_SYNC and explicitly synced before the atomic rename.
+    if (process.platform !== "win32") {
+      const directory = await fsp.open(path.dirname(filePath), fs.constants.O_RDONLY);
+      try { await directory.sync(); } finally { await directory.close(); }
+    }
+  } catch (error) {
+    if (handle) await handle.close().catch(() => {});
+    await fsp.rm(temporary, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 function normalizeWebDavPath(value) {
@@ -158,7 +183,22 @@ function normalizeWebDavPath(value) {
 }
 
 function pathWithin(relativePath, parentPath) {
-  return relativePath === parentPath || relativePath.startsWith(`${parentPath}/`);
+  const relative = process.platform === "win32" ? relativePath.toLowerCase() : relativePath;
+  const parent = process.platform === "win32" ? parentPath.toLowerCase() : parentPath;
+  return relative === parent || relative.startsWith(`${parent}/`);
+}
+
+function pathsEqual(left, right) {
+  return pathWithin(left, right) && pathWithin(right, left);
+}
+
+function pathKey(relativePath) {
+  return process.platform === "win32" ? relativePath.toLowerCase() : relativePath;
+}
+
+function sameSnapshotRevision(left, right) {
+  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino
+    && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs);
 }
 
 function activeIdentityPath(files, operation, exceptPath) {
@@ -193,24 +233,195 @@ class SyncEngine {
     this.requireAuthorization = options.requireAuthorization === true;
     this.translateWebDavOperation = options.translateWebDavOperation || null;
     this.maxRetries = Math.max(1, Math.min(5, Number(options.maxRetries || 3)));
-    this.snapshot = { version: SNAPSHOT_VERSION, files: {} };
+    if (options.selectedPaths != null && !Array.isArray(options.selectedPaths)) fail("Selected paths must be an array", "invalid_selected_paths");
+    this.selectedPaths = options.selectedPaths == null ? null : [...new Set(options.selectedPaths.map((value) => protocol.safeRelativePath(value, "selectedPath")))].sort();
+    this.snapshot = { version: SNAPSHOT_VERSION, files: {}, remoteOnly: {} };
+    this.snapshotDiskRevision = null;
     this.opened = false;
   }
 
+  withMutationLock(work) {
+    const queueKey = process.platform === "win32" ? this.rootDir.toLowerCase() : this.rootDir;
+    if (ROOT_MUTATION_CONTEXT.getStore() === queueKey) {
+      fail("Sync mutations cannot re-enter a root operation", "sync_root_busy");
+    }
+    const previous = ROOT_MUTATION_QUEUES.get(queueKey) || Promise.resolve();
+    let releaseQueue;
+    const queueGate = new Promise((resolve) => { releaseQueue = resolve; });
+    ROOT_MUTATION_QUEUES.set(queueKey, queueGate);
+    const run = async () => {
+      await fsp.mkdir(this.rootDir, { recursive: true });
+      await containedAbsolute(this.rootDir, this.rootDir, false);
+      const processLock = await this.acquireProcessLock();
+      try {
+        await this._open();
+        return await ROOT_MUTATION_CONTEXT.run(queueKey, work);
+      } finally {
+        await this.releaseProcessLock(processLock);
+      }
+    };
+    const operation = previous.then(run, run);
+    return operation.finally(() => {
+      releaseQueue();
+      if (ROOT_MUTATION_QUEUES.get(queueKey) === queueGate) ROOT_MUTATION_QUEUES.delete(queueKey);
+    });
+  }
+
   async open() {
+    return this.withMutationLock(async () => this);
+  }
+
+  async acquireProcessLock() {
+    const lockPath = path.join(this.rootDir, ".rootark-sync.lock");
+    const owner = { host: os.hostname(), pid: process.pid, token: crypto.randomUUID() };
+    const create = async () => {
+      const temporaryPath = path.join(this.rootDir, `${INTERNAL_NAME_PREFIXES[0]}${process.pid}-${owner.token}`);
+      const handle = await fsp.open(temporaryPath, "wx", 0o600);
+      let createdStats;
+      let published = false;
+      try {
+        createdStats = await handle.stat({ bigint: true });
+        await handle.writeFile(`${JSON.stringify(owner)}\n`);
+        await handle.sync();
+        // Publish only a complete, synced owner record. A crash before this
+        // atomic hard-link leaves an ignored temporary file, not a malformed
+        // lock that can strand the sync root.
+        await fsp.link(temporaryPath, lockPath);
+        published = true;
+        const lockStats = await fsp.lstat(lockPath, { bigint: true });
+        if (!sameFileIdentity(createdStats, lockStats)) fail("Sync lock changed while publishing", "sync_root_busy");
+        await fsp.unlink(temporaryPath);
+        return { handle, lockPath, owner, stats: createdStats };
+      } catch (error) {
+        await handle.close().catch(() => {});
+        if (createdStats) {
+          for (const candidatePath of published ? [temporaryPath, lockPath] : [temporaryPath]) {
+            try {
+              const pathStats = await fsp.lstat(candidatePath, { bigint: true });
+              if (pathStats.isFile() && !pathStats.isSymbolicLink()
+                && pathStats.dev === createdStats.dev && pathStats.ino === createdStats.ino) {
+                await fsp.unlink(candidatePath);
+              }
+            } catch (cleanupError) {
+              if (cleanupError.code !== "ENOENT") break;
+            }
+          }
+        }
+        throw error;
+      }
+    };
+
+    try {
+      return await create();
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+    if (!await this.removeStaleProcessLock(lockPath)) fail("Another sync writer owns this folder", "sync_root_busy");
+    try {
+      return await create();
+    } catch (error) {
+      if (error.code === "EEXIST") fail("Another sync writer owns this folder", "sync_root_busy");
+      throw error;
+    }
+  }
+
+  async removeStaleProcessLock(lockPath) {
+    let handle;
+    try {
+      const pathStats = await fsp.lstat(lockPath, { bigint: true });
+      if (!pathStats.isFile() || pathStats.isSymbolicLink() || pathStats.size > 1024n) return false;
+      handle = await fsp.open(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      const handleStats = await handle.stat({ bigint: true });
+      if (!handleStats.isFile() || handleStats.dev !== pathStats.dev || handleStats.ino !== pathStats.ino) return false;
+      const text = await handle.readFile("utf8");
+      let owner;
+      try { owner = JSON.parse(text); } catch { return false; }
+      if (owner.host !== os.hostname() || !Number.isSafeInteger(owner.pid) || owner.pid < 1 || owner.pid === process.pid) return false;
+      try {
+        process.kill(owner.pid, 0);
+        return false;
+      } catch (error) {
+        if (error.code !== "ESRCH") return false;
+      }
+      const latestStats = await fsp.lstat(lockPath, { bigint: true });
+      if (!latestStats.isFile() || latestStats.isSymbolicLink() || latestStats.dev !== handleStats.dev || latestStats.ino !== handleStats.ino) return false;
+      await fsp.unlink(lockPath);
+      return true;
+    } catch (error) {
+      if (error.code === "ENOENT") return true;
+      if (["ELOOP", "EPERM", "EACCES"].includes(error.code)) return false;
+      throw error;
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+    }
+  }
+
+  async releaseProcessLock(processLock) {
+    await processLock.handle.close();
+    try {
+      const pathStats = await fsp.lstat(processLock.lockPath, { bigint: true });
+      if (!pathStats.isFile() || pathStats.isSymbolicLink()
+        || pathStats.dev !== processLock.stats.dev || pathStats.ino !== processLock.stats.ino) return;
+      const handle = await fsp.open(processLock.lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      try {
+        const currentStats = await handle.stat({ bigint: true });
+        if (!currentStats.isFile() || currentStats.dev !== processLock.stats.dev || currentStats.ino !== processLock.stats.ino) return;
+        const text = await handle.readFile("utf8");
+        if (JSON.parse(text).token !== processLock.owner.token) return;
+      } finally {
+        await handle.close();
+      }
+      const latestStats = await fsp.lstat(processLock.lockPath, { bigint: true });
+      if (latestStats.isFile() && !latestStats.isSymbolicLink()
+        && latestStats.dev === processLock.stats.dev && latestStats.ino === processLock.stats.ino) {
+        await fsp.unlink(processLock.lockPath);
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+
+  async _open() {
     await fsp.mkdir(this.rootDir, { recursive: true });
     await containedAbsolute(this.rootDir, this.rootDir, false);
     this.journal = await this.journal.open();
+    let snapshotStats;
     try {
-      const parsed = JSON.parse(await fsp.readFile(this.snapshotPath, "utf8"));
-      if (parsed.version !== SNAPSHOT_VERSION || !parsed.files || typeof parsed.files !== "object") throw new Error("Invalid sync snapshot");
-      this.snapshot = parsed;
+      snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
     } catch (error) {
-      if (error.code !== "ENOENT") fail("Invalid sync snapshot", "invalid_snapshot");
+      if (error.code !== "ENOENT" || this.opened) fail("Sync snapshot is unavailable", "invalid_snapshot");
       await durableJson(this.snapshotPath, this.snapshot);
+      snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
+    }
+    if (!snapshotStats.isFile() || snapshotStats.isSymbolicLink()) fail("Sync snapshot is not a regular file", "invalid_snapshot");
+    if (!sameSnapshotRevision(this.snapshotDiskRevision, snapshotStats)) {
+      let parsed;
+      try {
+        parsed = JSON.parse(await fsp.readFile(this.snapshotPath, "utf8"));
+      } catch {
+        fail("Invalid sync snapshot", "invalid_snapshot");
+      }
+      if (parsed.version !== SNAPSHOT_VERSION || !parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) fail("Invalid sync snapshot", "invalid_snapshot");
+      if (parsed.remoteOnly === undefined) parsed.remoteOnly = {};
+      if (!parsed.remoteOnly || typeof parsed.remoteOnly !== "object" || Array.isArray(parsed.remoteOnly)) fail("Invalid remote-only sync state", "invalid_snapshot");
+      for (const [objectId, item] of Object.entries(parsed.remoteOnly)) {
+        if (!item || typeof item !== "object" || item.objectId !== objectId || typeof item.path !== "string") fail("Invalid remote-only sync entry", "invalid_snapshot");
+        try {
+          protocol.safeRelativePath(item.path, "path");
+          if (item.sourcePath) protocol.safeRelativePath(item.sourcePath, "sourcePath");
+        } catch { fail("Invalid remote-only sync path", "invalid_snapshot"); }
+        if (!["excluded", "evicted"].includes(item.reason) || typeof item.deleted !== "boolean") fail("Invalid remote-only sync entry", "invalid_snapshot");
+      }
+      this.snapshot = parsed;
+      this.snapshotDiskRevision = snapshotStats;
     }
     this.opened = true;
     return this;
+  }
+
+  async persistSnapshot() {
+    await durableJson(this.snapshotPath, this.snapshot);
+    this.snapshotDiskRevision = await fsp.lstat(this.snapshotPath, { bigint: true });
   }
 
   async keyFor(operation) {
@@ -223,6 +434,42 @@ class SyncEngine {
 
   async verifyIncomingOperation(operation) {
     if (this.verifyIncoming && await this.verifyIncoming(operation) !== true) fail("Remote sync authorization rejected", "remote_authorization_rejected");
+  }
+
+  isSelected(relativePath) {
+    return this.selectedPaths === null || this.selectedPaths.some((selected) => pathWithin(relativePath, selected));
+  }
+
+  needsTraversal(relativePath) {
+    return this.selectedPaths === null || this.isSelected(relativePath)
+      || this.selectedPaths.some((selected) => pathWithin(selected, relativePath));
+  }
+
+  operationIsSelected(operation) {
+    const paths = [operation.metadata?.path, operation.metadata?.sourcePath].filter(Boolean);
+    return paths.length > 0 && paths.every((relativePath) => this.isSelected(relativePath));
+  }
+
+  operationDestinationIsSelected(operation) {
+    return typeof operation.metadata?.path === "string" && this.isSelected(operation.metadata.path);
+  }
+
+  rememberRemoteOnly(operation, reason) {
+    const pathName = operation.metadata?.path;
+    if (!pathName) return;
+    const prior = this.snapshot.remoteOnly[operation.objectId] || {};
+    this.snapshot.remoteOnly[operation.objectId] = {
+      objectId: operation.objectId,
+      fileId: operation.fileId,
+      versionId: operation.versionId,
+      revision: operation.revision,
+      path: pathName,
+      ...(operation.metadata.sourcePath ? { sourcePath: operation.metadata.sourcePath } : {}),
+      directory: operation.metadata.contentType === "inode/directory" || prior.directory === true,
+      deleted: Boolean(operation.tombstone),
+      reason: prior.reason === "evicted" ? "evicted" : reason,
+      ...(prior.hash ? { hash: prior.hash } : {}),
+    };
   }
 
   async buildOperation(input) {
@@ -253,7 +500,13 @@ class SyncEngine {
   }
 
   async enqueueChange(input) {
-    if (!this.opened) await this.open();
+    return this.withMutationLock(() => this._enqueueChange(input));
+  }
+
+  async _enqueueChange(input) {
+    if (!this.opened) await this._open();
+    const remoteOnly = this.snapshot.remoteOnly[input.objectId];
+    if (remoteOnly?.reason === "evicted") fail("Materialize a remote-only file before enqueuing changes", "remote_only_object");
     const key = input.fileKey || await this.fileKeyResolver(input);
     const operation = protocol.validateOperation(await this.buildOperation({ ...input, fileKey: key }));
     await this.journal.enqueue(operation);
@@ -263,7 +516,7 @@ class SyncEngine {
       if (plaintext !== null) hash = crypto.createHash("sha256").update(plaintext).digest("hex");
     }
     this.rememberOperation(operation, hash);
-    await durableJson(this.snapshotPath, this.snapshot);
+    await this.persistSnapshot();
     return operation;
   }
 
@@ -525,6 +778,10 @@ class SyncEngine {
   }
 
   async pushPending(summary) {
+    return this.withMutationLock(() => this._pushPending(summary));
+  }
+
+  async _pushPending(summary) {
     for (const original of await this.journal.recover()) {
       let pending = original;
       if (pending.journalType === "webdav-mutation") {
@@ -538,6 +795,7 @@ class SyncEngine {
       let operation;
       try {
         operation = protocol.validateOperation(pending);
+        if (!this.operationIsSelected(operation)) continue;
         const result = await this.retryPush(operation);
         if (result?.status >= 400) {
           if (result.status !== 409) fail("Sync push rejected", "push_rejected");
@@ -546,11 +804,11 @@ class SyncEngine {
         if (operation.operation === "move" || operation.operation === "delete") {
           const hash = operation.operation === "move" ? await this.hashPendingPayload(operation) : undefined;
           this.rememberOperation(operation, hash);
-          await durableJson(this.snapshotPath, this.snapshot);
+          await this.persistSnapshot();
         } else {
           const hash = await this.hashPendingPayload(operation);
           this.rememberOperation(operation, hash);
-          await durableJson(this.snapshotPath, this.snapshot);
+          await this.persistSnapshot();
         }
         await this.journal.markSeen(operation.operationId);
         summary.pushed += 1;
@@ -558,7 +816,16 @@ class SyncEngine {
         if (error instanceof SyncConflictError || error?.status === 409 || error?.code === "sync_conflict") {
           summary.conflicts.push({ operationId: operation?.operationId || pending.operationId, policy: "remote-wins", currentRevision: error.currentRevision || error.payload?.currentRevision || null });
           await this.recoverConflict(operation, summary);
-          if (error.current) await this.apply(protocol.validateOperation(error.current), summary);
+          if (error.current) {
+            const current = protocol.validateOperation(error.current);
+            if (this.operationDestinationIsSelected(current)) {
+              await this._apply(current, summary);
+            } else {
+              await this.verifyIncomingOperation(current);
+              this.rememberRemoteOnly(current, "excluded");
+              await this.persistSnapshot();
+            }
+          }
           await this.journal.markSeen(operation.operationId);
           summary.pushed += 1;
           continue;
@@ -590,6 +857,10 @@ class SyncEngine {
   }
 
   async apply(operation, summary = null) {
+    return this.withMutationLock(() => this._apply(operation, summary));
+  }
+
+  async _apply(operation, summary = null) {
     await this.verifyIncomingOperation(operation);
     const key = await this.keyFor(operation);
     const plaintext = protocol.decryptPayload(operation, key);
@@ -626,7 +897,11 @@ class SyncEngine {
       const sourcePath = targetMatchesIdentity ? metadata.path
         : (activeIdentityPath(this.snapshot.files, operation, metadata.path)
           || activeFileIdentityPath(this.snapshot.files, operation, metadata.path));
-      if (!sourcePath) return;
+      if (!sourcePath) {
+        delete this.snapshot.remoteOnly[operation.objectId];
+        await this.persistSnapshot();
+        return;
+      }
       cleanupPath = sourcePath;
       const pathOccupiedByOther = priorAtTarget && !priorAtTarget.deleted
         && (priorAtTarget.objectId !== operation.objectId || priorAtTarget.fileId !== operation.fileId);
@@ -712,7 +987,7 @@ class SyncEngine {
     } else if (operation.operation === "delete" || operation.tombstone) {
       await this.pruneEmptyUntrackedParents(path.dirname(await contained(this.rootDir, cleanupPath || metadata.path, true)));
     }
-    await durableJson(this.snapshotPath, this.snapshot);
+    await this.persistSnapshot();
     if (summary) summary.applied = (summary.applied || 0) + 1;
   }
 
@@ -722,20 +997,24 @@ class SyncEngine {
     const walk = async (directory, prefix = "") => {
       let hasSyncEntries = false;
       for (const entry of await fsp.readdir(directory, { withFileTypes: true })) {
-        if (prefix === "" && [...INTERNAL_NAMES].some((name) => name.toLowerCase() === entry.name.toLowerCase())) continue;
+        if (prefix === "" && ([...INTERNAL_NAMES].some((name) => name.toLowerCase() === entry.name.toLowerCase())
+          || INTERNAL_NAME_PREFIXES.some((name) => entry.name.toLowerCase().startsWith(name)))) continue;
         if (entry.name.startsWith(".rootark-put-") || entry.name.startsWith(".rootark-move-")) continue;
         const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
         try { protocol.safeRelativePath(relative, "path"); } catch { continue; }
         const target = path.join(directory, entry.name);
         await containedAbsolute(this.rootDir, target, false);
         if (entry.isDirectory()) {
+          if (!this.needsTraversal(relative)) continue;
           const childHasSyncEntries = await walk(target, relative);
           const prior = this.snapshot.files[relative];
-          if (!childHasSyncEntries || (prior && !prior.deleted && prior.directory)) {
+          if (this.selectedPaths === null
+            ? (!childHasSyncEntries || (prior && !prior.deleted && prior.directory))
+            : (this.isSelected(relative) && (!childHasSyncEntries || (prior && !prior.deleted && prior.directory)))) {
             result[relative] = { hash: emptyHash, size: 0, directory: true };
           }
-          hasSyncEntries = true;
-        } else if (entry.isFile()) {
+          if (childHasSyncEntries || this.isSelected(relative) || this.selectedPaths === null) hasSyncEntries = true;
+        } else if (entry.isFile() && this.isSelected(relative)) {
           const data = await readContainedFile(this.rootDir, relative);
           result[relative] = { hash: crypto.createHash("sha256").update(data).digest("hex"), size: data.length, directory: false };
           hasSyncEntries = true;
@@ -770,33 +1049,78 @@ class SyncEngine {
   }
 
   async reconcileLocal() {
-    const current = await this.scanFiles();
+    return this.withMutationLock(() => this._reconcileLocal());
+  }
+
+  async _reconcileLocal() {
+    const scanned = await this.scanFiles();
+    const current = {};
+    const snapshotPathByKey = new Map();
+    if (process.platform === "win32") {
+      for (const relative of Object.keys(this.snapshot.files)) {
+        const key = pathKey(relative);
+        const prior = snapshotPathByKey.get(key);
+        if (prior && prior !== relative) fail("Ambiguous case-insensitive sync snapshot path", "unsafe_path");
+        snapshotPathByKey.set(key, relative);
+      }
+    }
+    for (const [relative, file] of Object.entries(scanned)) {
+      const canonical = process.platform === "win32" ? snapshotPathByKey.get(pathKey(relative)) || relative : relative;
+      current[canonical] = file;
+    }
+    const evictedByPath = new Map();
+    for (const item of Object.values(this.snapshot.remoteOnly)) {
+      if (item.reason !== "evicted" || item.deleted || item.directory) continue;
+      const key = pathKey(item.path);
+      const matches = evictedByPath.get(key) || [];
+      matches.push(item);
+      evictedByPath.set(key, matches);
+    }
     const protectedPaths = new Set();
     for (const operation of await this.journal.recover()) {
-      if (operation.metadata?.path) protectedPaths.add(operation.metadata.path);
-      if (operation.metadata?.sourcePath) protectedPaths.add(operation.metadata.sourcePath);
+      if (operation.metadata?.path) protectedPaths.add(pathKey(operation.metadata.path));
+      if (operation.metadata?.sourcePath) protectedPaths.add(pathKey(operation.metadata.sourcePath));
       if (operation.operation === "update" && operation.metadata?.contentType === "inode/directory") {
         const sourcePath = activeIdentityPath(this.snapshot.files, operation, operation.metadata.path);
-        if (sourcePath) protectedPaths.add(sourcePath);
+        if (sourcePath) protectedPaths.add(pathKey(sourcePath));
       }
       if (operation.journalType === "webdav-mutation") {
         for (const value of [operation.path, operation.source, operation.destination]) {
           if (typeof value !== "string") continue;
-          try { protectedPaths.add(protocol.safeRelativePath(decodeURIComponent(value).replace(/^\/+/, ""), "path")); } catch {}
+          try { protectedPaths.add(pathKey(protocol.safeRelativePath(decodeURIComponent(value).replace(/^\/+/, ""), "path"))); } catch {}
         }
       }
     }
     for (const [relative, prior] of Object.entries(this.snapshot.files)) {
-      if (protectedPaths.has(relative)) continue;
+      if (protectedPaths.has(pathKey(relative))) continue;
+      if (!this.isSelected(relative)) continue;
       if (prior.deleted || current[relative]) continue;
+      const eviction = this.snapshot.remoteOnly[prior.objectId];
+      if (eviction?.reason === "evicted" && pathsEqual(eviction.path, relative)) {
+        delete this.snapshot.files[relative];
+        continue;
+      }
       const key = await this.fileKeyResolver(prior);
       const operation = await this.buildOperation({ operation: "delete", objectId: prior.objectId, fileId: prior.fileId, versionId: crypto.randomUUID(), baseRevision: prior.revision, revision: { counter: (prior.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata: { path: relative }, fileKey: key });
       await this.journal.enqueue(operation);
       this.rememberOperation(operation);
     }
     for (const [relative, file] of Object.entries(current)) {
-      if (protectedPaths.has(relative)) continue;
-      const prior = this.snapshot.files[relative];
+      if (protectedPaths.has(pathKey(relative))) continue;
+      let prior = this.snapshot.files[relative];
+      if (prior && !prior.deleted && this.snapshot.remoteOnly[prior.objectId]?.reason === "evicted"
+        && pathsEqual(this.snapshot.remoteOnly[prior.objectId].path, relative)) delete this.snapshot.remoteOnly[prior.objectId];
+      const evicted = !prior || prior.deleted ? evictedByPath.get(pathKey(relative)) || [] : [];
+      if (evicted.length > 1) fail("More than one evicted remote object matches this path", "remote_object_ambiguous");
+      const evictedEntry = evicted[0] || null;
+      if (evictedEntry) {
+        prior = evictedEntry;
+        if (prior.hash === file.hash) {
+          this.snapshot.files[relative] = { ...prior, hash: file.hash, deleted: false };
+          delete this.snapshot.remoteOnly[prior.objectId];
+          continue;
+        }
+      }
       const isDirectory = Boolean(file.directory);
       if (prior && !prior.deleted && prior.hash === file.hash && Boolean(prior.directory) === isDirectory) continue;
       const isUpdate = prior && !prior.deleted;
@@ -813,7 +1137,7 @@ class SyncEngine {
       await this.journal.enqueue(operation);
       this.rememberOperation(operation, contentHash);
     }
-    await durableJson(this.snapshotPath, this.snapshot);
+    await this.persistSnapshot();
   }
 
   rememberOperation(operation, hash, sourcePathOverride) {
@@ -834,10 +1158,121 @@ class SyncEngine {
         ? Boolean(prior.directory)
         : operation.metadata?.contentType === "inode/directory",
     };
+    delete this.snapshot.remoteOnly[operation.objectId];
+  }
+
+  async evictLocal(relativePath) {
+    return this.withMutationLock(() => this._evictLocal(relativePath));
+  }
+
+  async _evictLocal(relativePath) {
+    if (!this.opened) await this._open();
+    const safePath = await canonicalRelativePath(this.rootDir, relativePath);
+    if (!this.isSelected(safePath)) fail("Only selected paths can be evicted", "path_not_selected");
+    const prior = this.snapshot.files[safePath];
+    if (!prior || prior.deleted || prior.directory || !/^[a-f0-9]{64}$/.test(prior.hash || "")) fail("Only a tracked file can be evicted", "cache_entry_unavailable");
+    const pending = await this.journal.recover();
+    if (pending.some((operation) => operation.objectId === prior.objectId
+      || operation.metadata?.path === safePath || operation.metadata?.sourcePath === safePath)) {
+      fail("A pending sync operation prevents cache eviction", "sync_operation_pending");
+    }
+    const target = await contained(this.rootDir, safePath, false);
+    const before = await fsp.lstat(target, { bigint: true });
+    if (!before.isFile() || before.isSymbolicLink()) fail("Only regular files can be evicted", "unsafe_path");
+    const bytes = await readContainedFile(this.rootDir, safePath, before);
+    const hash = crypto.createHash("sha256").update(bytes).digest("hex");
+    const afterRead = await fsp.lstat(target, { bigint: true });
+    if (hash !== prior.hash || !sameFileVersion(before, afterRead)) fail("Local file changed since its last sync", "local_changes_pending");
+
+    const remoteResult = await this.adapter.list(prior.objectId);
+    const remoteRecords = Array.isArray(remoteResult) ? remoteResult
+      : Array.isArray(remoteResult?.objects) ? remoteResult.objects : remoteResult ? [remoteResult] : [];
+    if (remoteRecords.length !== 1) fail("Current remote object is unavailable", "remote_object_missing");
+    const remote = protocol.validateOperation(remoteRecords[0]);
+    if (remote.objectId !== prior.objectId || remote.fileId !== prior.fileId || !pathsEqual(remote.metadata.path, safePath)) {
+      fail("Current remote object no longer matches the local cache", "remote_object_changed");
+    }
+    await this.verifyIncomingOperation(remote);
+    if (remote.tombstone || remote.operation === "delete") fail("Current remote object has been deleted", "remote_object_deleted");
+    const remoteKey = await this.keyFor(remote);
+    const remotePlaintext = protocol.decryptPayload(remote, remoteKey);
+    const remoteContent = remote.operation === "move"
+      ? protocol.decodeMovePayload(remotePlaintext, remoteKey) || remotePlaintext
+      : remotePlaintext;
+    if (crypto.createHash("sha256").update(remoteContent).digest("hex") !== hash) {
+      fail("Current remote content differs from the local cache", "remote_content_changed");
+    }
+
+    const beforeStage = await fsp.lstat(target, { bigint: true });
+    if (!sameFileVersion(before, beforeStage)) fail("Local file changed during cache verification", "local_changes_pending");
+    const confirmedBytes = await readContainedFile(this.rootDir, safePath, beforeStage);
+    const afterConfirm = await fsp.lstat(target, { bigint: true });
+    if (crypto.createHash("sha256").update(confirmedBytes).digest("hex") !== hash || !sameFileVersion(beforeStage, afterConfirm)) {
+      fail("Local file changed during cache verification", "local_changes_pending");
+    }
+
+    this.snapshot.remoteOnly[prior.objectId] = {
+      objectId: remote.objectId, fileId: remote.fileId, versionId: remote.versionId,
+      revision: remote.revision, path: safePath, directory: false, deleted: false, reason: "evicted", hash,
+    };
+    await this.persistSnapshot();
+    const staged = await this.stageExisting(target);
+    if (!staged) fail("Local cache entry disappeared during eviction", "cache_entry_unavailable");
+    const stagedStats = await fsp.lstat(staged, { bigint: true });
+    if (!stagedStats.isFile() || !sameFileIdentity(beforeStage, stagedStats) || stagedStats.size !== beforeStage.size
+      || stagedStats.mtimeNs !== beforeStage.mtimeNs || stagedStats.mode !== beforeStage.mode) {
+      if (!(await exists(target))) await fsp.rename(staged, target);
+      fail("Local file changed during cache eviction", "unsafe_path");
+    }
+    await fsp.unlink(staged);
+    if (this.snapshot.files[safePath]?.objectId === prior.objectId) delete this.snapshot.files[safePath];
+    await this.persistSnapshot();
+    return true;
+  }
+
+  async materializeRemote(relativePath) {
+    return this.withMutationLock(() => this._materializeRemote(relativePath));
+  }
+
+  async _materializeRemote(relativePath) {
+    if (!this.opened) await this._open();
+    const safePath = await canonicalRelativePath(this.rootDir, relativePath);
+    if (!this.isSelected(safePath)) fail("Remote-only path is outside the selected scope", "path_not_selected");
+    const matches = Object.values(this.snapshot.remoteOnly).filter((item) => pathsEqual(item.path, safePath));
+    const activeMatches = matches.filter((item) => !item.deleted);
+    if (activeMatches.length > 1) fail("More than one remote-only object matches this path", "remote_object_ambiguous");
+    const entry = activeMatches[0] || matches[0];
+    if (!entry) fail("No remote-only object is recorded for this path", "remote_object_unavailable");
+    const result = await this.adapter.list(entry.objectId);
+    const records = Array.isArray(result) ? result : Array.isArray(result?.objects) ? result.objects : result ? [result] : [];
+    if (!records.length) fail("Remote object is no longer available", "remote_object_unavailable");
+    const operation = protocol.validateOperation(records[0]);
+    if (operation.objectId !== entry.objectId || !this.operationDestinationIsSelected(operation)) {
+      fail("Remote object is outside the selected scope", "path_not_selected");
+    }
+    await this.verifyIncomingOperation(operation);
+    if (operation.tombstone) {
+      this.rememberRemoteOnly(operation, entry.reason);
+      await this.persistSnapshot();
+      return false;
+    }
+    await this._apply(operation);
+    await this.journal.markSeen(operation.operationId);
+    return true;
   }
 
   async pullRemote(summary) {
-    const result = await this.adapter.list();
+    return this.withMutationLock(() => this._pullRemote(summary));
+  }
+
+  async _pullRemote(summary) {
+    let result;
+    try {
+      result = await this.adapter.list();
+    } catch (error) {
+      if (transient(error)) { summary.offline = true; return; }
+      throw error;
+    }
     const records = Array.isArray(result) ? result : result?.objects;
     if (!Array.isArray(records)) fail("Sync pull returned an invalid record list", "invalid_pull");
     const rank = (operation) => {
@@ -858,21 +1293,40 @@ class SyncEngine {
       }
       return String(left.objectId).localeCompare(String(right.objectId)) || String(left.versionId).localeCompare(String(right.versionId));
     });
+    let remoteOnlyChanged = false;
     for (const raw of ordered) {
       const operation = protocol.validateOperation(raw);
+      if (!this.operationDestinationIsSelected(operation)) {
+        await this.verifyIncomingOperation(operation);
+        this.rememberRemoteOnly(operation, "excluded");
+        remoteOnlyChanged = true;
+        continue;
+      }
+      const remoteOnly = this.snapshot.remoteOnly[operation.objectId];
+      if (remoteOnly?.reason === "evicted") {
+        await this.verifyIncomingOperation(operation);
+        this.rememberRemoteOnly(operation, "evicted");
+        remoteOnlyChanged = true;
+        continue;
+      }
       if (this.journal.hasSeen(operation.operationId)) continue;
-      await this.apply(operation, summary);
+      await this._apply(operation, summary);
       await this.journal.markSeen(operation.operationId);
       summary.pulled += 1;
     }
+    if (remoteOnlyChanged) await this.persistSnapshot();
   }
 
   async syncOnce() {
-    if (!this.opened) await this.open();
+    return this.withMutationLock(() => this._syncOnce());
+  }
+
+  async _syncOnce() {
+    if (!this.opened) await this._open();
     const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
-    await this.reconcileLocal();
-    await this.pushPending(summary);
-    if (!summary.offline) await this.pullRemote(summary);
+    await this._reconcileLocal();
+    await this._pushPending(summary);
+    if (!summary.offline) await this._pullRemote(summary);
     return summary;
   }
 }
