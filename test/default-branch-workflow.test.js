@@ -12,6 +12,11 @@ test("Security Regression runs on canonical branch pushes and pull requests", ()
   assert.match(securityWorkflow, /pull_request:\s*branches:\s*- Root\/main/);
 });
 
+test("Security Regression does not cancel per-SHA default-branch validation", () => {
+  assert.match(securityWorkflow, /group:\s*security-regression-\$\{\{\s*github\.event\.pull_request\.number\s*\|\|\s*format\('run-\{0\}',\s*github\.run_id\)\s*\}\}/);
+  assert.match(securityWorkflow, /cancel-in-progress:\s*\$\{\{\s*github\.event_name\s*==\s*'pull_request'\s*\}\}/);
+});
+
 test("dependency review compares the exact pushed main commit with its previous commit", () => {
   assert.match(dependencyWorkflow, /on:\s*push:\s*branches:\s*- Root\/main/);
   assert.match(dependencyWorkflow, /pull_request:\s*branches:\s*- Root\/main/);
