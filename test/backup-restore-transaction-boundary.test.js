@@ -1292,6 +1292,66 @@ test("provider reconciliation queued before local commit is removed when restore
   `);
 });
 
+test("provider reconciliation waits for the final distinct restore startup acknowledgement", () => {
+  runFixture(`
+    const { createRestoreRequestGate } = require(${JSON.stringify(path.join(ROOT, "services", "restoreRequestGate"))});
+    process.env.ROOTARK_RESTORE_INSTANCE_COUNT = "2";
+    process.env.ROOTARK_INSTANCE_ID = "restore-worker-fixture";
+    const providerCalls = [];
+    let remoteBytes = "restored cloud bytes";
+    const cloud = {
+      enabled: () => true,
+      provider: "fixture",
+      inventory: async () => [{ provider: "s3", providerIdentity: "fixture-object", area: "uploads", folderId: "root", name: "cloud.txt" }],
+      download: async (_folderId, _name, target) => { fs.writeFileSync(target, remoteBytes); return true; },
+      upload: async (filePath, folderId, name, area) => {
+        providerCalls.push({ contents: fs.readFileSync(filePath, "utf8"), folderId, name, area });
+      },
+    };
+    backupService.setCloudStorage(cloud);
+    restoreService.setCloudStorage(cloud);
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(uploadsDir, "cloud.txt"), "live bytes before restore");
+      remoteBytes = "live bytes before restore";
+      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.equal(restored.cloudSync.state, "pending");
+      assert.equal(restoreService.getWholeRestorePhase(), "restart_required");
+      restoreService.prepareWholeRestoreStartup();
+
+      const gate = createRestoreRequestGate({
+        directory: path.join(dataDir, ".rootark-active-requests"),
+        isBlocked: restoreService.isWholeRestoreBlocked,
+      });
+      const reconcile = () => gate.run(() => restoreService.processRestoreSync({
+        backupId: backup.id,
+        workerId: "fixture-provider-worker",
+        uploader: cloud,
+      }));
+
+      const firstAck = restoreService.acknowledgeWholeRestoreInstance("replica-a");
+      assert.deepEqual([firstAck.acknowledgedInstances, firstAck.requiredInstances, firstAck.complete], [1, 2, false]);
+      assert.equal(await reconcile(), undefined);
+      assert.deepEqual(providerCalls, []);
+      assert.equal(backupService.listBackups().find((entry) => entry.id === backup.id).metadata.restoreSync.state, "pending");
+
+      const duplicateAck = restoreService.acknowledgeWholeRestoreInstance("replica-a");
+      assert.deepEqual([duplicateAck.acknowledgedInstances, duplicateAck.requiredInstances, duplicateAck.complete], [1, 2, false]);
+      assert.equal(await reconcile(), undefined);
+      assert.deepEqual(providerCalls, []);
+
+      const finalAck = restoreService.acknowledgeWholeRestoreInstance("replica-b");
+      assert.deepEqual([finalAck.acknowledgedInstances, finalAck.requiredInstances, finalAck.complete], [2, 2, true]);
+      const completed = await reconcile();
+      assert.equal(completed.metadata.restoreSync.state, "completed");
+      assert.deepEqual(providerCalls, [{ contents: "restored cloud bytes", folderId: "root", name: "cloud.txt", area: "uploads" }]);
+      await reconcile();
+      assert.equal(providerCalls.length, 1, "a completed queue must not upload again");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("provider upload failure survives restart and retry keeps the provider object idempotent", { timeout: 60_000 }, () => {
   runFixture(`
     const { spawnSync } = require("node:child_process");
