@@ -184,6 +184,25 @@ test("fresh production bootstrap fails closed instead of creating default accoun
   assert.equal(launched.output().includes("user123"), false);
 });
 
+test("production bootstrap rejects seed usernames that collide after normalization", { timeout: 30_000 }, async (t) => {
+  const cwd = createSandbox();
+  fs.mkdirSync(path.join(cwd, "data"), { recursive: true });
+  const passwordHash = bcrypt.hashSync(crypto.randomBytes(32).toString("base64url"), 10);
+  fs.writeFileSync(path.join(cwd, "data", "users.json"), JSON.stringify([
+    { username: "Admin", password: passwordHash, role: "admin", permissions: {} },
+    { username: " admin ", password: passwordHash, role: "user", permissions: {} },
+  ]));
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "production", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true" } });
+  t.after(async () => { await stop(launched.child, [strongSecret]); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+  const result = await waitForExit(launched.child, TIMEOUT_MS, [strongSecret]);
+  assert.notEqual(result.code, 0);
+  assert.match(launched.output(), /The configured user seed is invalid/);
+  assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), false);
+});
+
 test("production seed import requires explicit opt-in and does not add default users", { timeout: 30_000 }, async (t) => {
   const cwd = createSandbox();
   const password = crypto.randomBytes(32).toString("base64url");

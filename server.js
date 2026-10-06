@@ -438,10 +438,12 @@ function loadSeedUsers() {
     if (!Array.isArray(users) || !users.length) throw new Error("invalid seed");
     const usernames = new Set();
     for (const user of users) {
-      if (!user || typeof user !== "object" || Array.isArray(user) || typeof user.username !== "string" || !user.username.trim() || usernames.has(user.username)) {
+      if (!user || typeof user !== "object" || Array.isArray(user)) throw new Error("invalid seed user");
+      const normalizedUsername = typeof user.username === "string" ? user.username.trim().toLowerCase() : "";
+      if (!normalizedUsername || usernames.has(normalizedUsername)) {
         throw new Error("invalid seed user");
       }
-      usernames.add(user.username);
+      usernames.add(normalizedUsername);
       let rounds;
       try { rounds = bcrypt.getRounds(user.password); } catch { throw new Error("invalid password hash"); }
       if (!Number.isInteger(rounds) || rounds < 10) throw new Error("password hash is not sufficiently hardened");
