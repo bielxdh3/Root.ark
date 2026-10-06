@@ -1291,3 +1291,104 @@ test("provider reconciliation queued before local commit is removed when restore
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);
 });
+
+test("provider upload failure survives restart and retry keeps the provider object idempotent", { timeout: 60_000 }, () => {
+  runFixture(`
+    const { spawnSync } = require("node:child_process");
+    const backupRepositoryPath = require.resolve(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const restoreServicePath = require.resolve(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+    const providerStatePath = path.join(dataDir, "provider-state.json");
+    const uploadPath = path.join(uploadsDir, "provider-retry.txt");
+    write(uploadPath, "restored provider bytes");
+    write(providerStatePath, JSON.stringify({ requests: 0, objects: {} }));
+    const cloud = {
+      enabled: () => true,
+      provider: "s3",
+      inventory: async () => [{ provider: "s3", providerIdentity: "fixture-object", area: "uploads", folderId: "root", name: "provider-retry.txt" }],
+      download: async (_folderId, _name, target) => { fs.writeFileSync(target, fs.readFileSync(uploadPath)); return true; },
+    };
+    backupService.setCloudStorage(cloud);
+    restoreService.setCloudStorage(cloud);
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(uploadPath, "live bytes before restore");
+      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.equal(fs.readFileSync(uploadPath, "utf8"), "restored provider bytes");
+      assert.equal(restored.backup.metadata.restoreSync.entries[0].state, "pending");
+      restoreService.prepareWholeRestoreStartup();
+      assert.equal(restoreService.acknowledgeWholeRestoreInstance().complete, true);
+
+      const initialNow = Date.now();
+      await restoreService.processRestoreSync({
+        backupId: backup.id,
+        workerId: "provider-failure-worker",
+        clock: () => initialNow,
+        uploader: { enabled: () => true, provider: "s3", upload: async () => { throw new Error("injected provider outage"); } },
+      });
+      let saved = require(backupRepositoryPath).getBackup(backup.id);
+      let entry = saved.metadata.restoreSync.entries[0];
+      assert.equal(entry.state, "retry_wait");
+      assert.equal(entry.attempts, 1);
+      assert.equal(entry.failureCategory, "provider_error");
+      assert.equal(entry.leaseToken, null);
+      assert.equal(Date.parse(entry.nextAttemptAt), initialNow + 1000);
+
+      const worker = (workerNow, crashBeforeCompletion) => \`
+        const assert = require("node:assert/strict");
+        const fs = require("node:fs");
+        const path = require("node:path");
+        const repository = require(\${JSON.stringify(backupRepositoryPath)});
+        const restore = require(\${JSON.stringify(restoreServicePath)});
+        const originalMutation = repository.mutateRestoreSyncEntry;
+        if (\${crashBeforeCompletion}) {
+          repository.mutateRestoreSyncEntry = (options) => originalMutation({
+            ...options,
+            mutate(entry, backup) {
+              const result = options.mutate(entry, backup);
+              if (result.entry.state === "completed") process.exit(87);
+              return result;
+            },
+          });
+        }
+        const statePath = \${JSON.stringify(providerStatePath)};
+        const provider = {
+          enabled: () => true,
+          provider: "s3",
+          upload: async (filePath, folderId, name, area) => {
+            const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+            state.requests += 1;
+            state.objects[area + "/" + folderId + "/" + name] = fs.readFileSync(filePath, "base64");
+            fs.writeFileSync(statePath, JSON.stringify(state));
+          },
+        };
+        restore.processRestoreSync({ backupId: \${JSON.stringify(backup.id)}, workerId: "restarted-worker", clock: () => \${workerNow}, leaseMs: 1000, uploader: provider })
+          .then((result) => { assert.equal(result.metadata.restoreSync.entries[0].state, "completed"); })
+          .catch((error) => { console.error(error); process.exitCode = 1; });
+      \`;
+      const interrupted = spawnSync(process.execPath, ["-e", worker(initialNow + 2000, true)], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 10_000 });
+      assert.equal(interrupted.status, 87, interrupted.stderr || interrupted.stdout);
+      let providerState = JSON.parse(fs.readFileSync(providerStatePath, "utf8"));
+      assert.equal(providerState.objects["uploads/root/provider-retry.txt"], Buffer.from("restored provider bytes").toString("base64"));
+      saved = require(backupRepositoryPath).getBackup(backup.id);
+      entry = saved.metadata.restoreSync.entries[0];
+      assert.equal(entry.state, "in_progress", "the process interruption must leave a leased reconciliation for recovery");
+      assert.equal(entry.attempts, 2);
+
+      const retried = spawnSync(process.execPath, ["-e", worker(initialNow + 5000, false)], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 10_000 });
+      assert.equal(retried.status, 0, retried.stderr || retried.stdout);
+      saved = require(backupRepositoryPath).getBackup(backup.id);
+      entry = saved.metadata.restoreSync.entries[0];
+      assert.equal(entry.state, "completed");
+      assert.equal(entry.attempts, 3);
+      providerState = JSON.parse(fs.readFileSync(providerStatePath, "utf8"));
+      assert.equal(providerState.requests, 2, "the provider must see the retry after the interrupted upload");
+      assert.deepEqual(Object.keys(providerState.objects), ["uploads/root/provider-retry.txt"], "retries overwrite one stable provider key");
+      assert.equal(providerState.objects["uploads/root/provider-retry.txt"], Buffer.from("restored provider bytes").toString("base64"));
+
+      const repeated = spawnSync(process.execPath, ["-e", worker(initialNow + 6000, false)], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 10_000 });
+      assert.equal(repeated.status, 0, repeated.stderr || repeated.stdout);
+      assert.equal(JSON.parse(fs.readFileSync(providerStatePath, "utf8")).requests, 2, "completed reconciliation must not upload again");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
