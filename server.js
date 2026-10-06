@@ -4490,6 +4490,7 @@ function initData() {
 }
 
 app.set("trust proxy", TRUSTED_PROXIES);
+// Uses Express's default process-local store; deployments needing cross-process quotas must configure a shared store.
 const createRouteRateLimit = () => rateLimit({
   windowMs: ROUTE_RATE_LIMIT_WINDOW_MS,
   limit: ROUTE_RATE_LIMIT_MAX,
@@ -4505,6 +4506,9 @@ const rejectRateLimit = createRouteRateLimit();
 const deleteRateLimit = createRouteRateLimit();
 const fileAccessRateLimit = createRouteRateLimit();
 const fileTemporaryRateLimit = createRouteRateLimit();
+const fileListRateLimit = createRouteRateLimit();
+const fileSearchRateLimit = createRouteRateLimit();
+const webDavPropfindRateLimit = createRouteRateLimit();
 const restoreRequestGate = createRestoreRequestGate({
   directory: RESTORE_ACTIVE_REQUESTS_DIR,
   isBlocked: restoreService.isWholeRestoreBlocked,
@@ -5322,7 +5326,8 @@ app.delete("/folders/:id", authenticate, (req, res) => {
 
 });
 
-app.get("/files/search", authenticate, requirePermission("listFiles"), handleFileSearch);
+// These per-IP listing limits run before authentication so they also bound anonymous requests; NAT clients share the configured quota.
+app.get("/files/search", fileSearchRateLimit, authenticate, requirePermission("listFiles"), handleFileSearch);
 
 app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req, res) => {
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
@@ -7410,7 +7415,17 @@ function registerWebDavRoutes() {
       const segments = parseWebDavSegments(req);
       if (!segments) return res.status(404).send("Not found");
 
-      if (req.method === "PROPFIND") return sendWebDavPropfind(req, res, segments);
+      if (req.method === "PROPFIND") return webDavPropfindRateLimit(req, res, (error) => {
+        const sendFailure = (failure) => {
+          auditLog("webdav.error", getAuditActor(req), { type: "webdav", id: getSafeWebDavAuditPath(req) }, req.method, "failure", {
+            error: failure.message,
+            path: getSafeWebDavAuditPath(req),
+          });
+          return res.status(failure.message.includes("Caminho WebDAV") ? 400 : 500).send("WebDAV request failed");
+        };
+        if (error) return sendFailure(error);
+        return sendWebDavPropfind(req, res, segments).catch(sendFailure);
+      });
       if (req.method === "GET") return sendWebDavFile(req, res, segments, false);
       if (req.method === "HEAD") return sendWebDavFile(req, res, segments, true);
       if (req.method === "PUT") return handleWebDavPut(req, res, segments);
@@ -7519,7 +7534,7 @@ function sortSearchResults(files, sortBy, sortOrder) {
   return sorted;
 }
 
-app.get("/list", authenticate, requirePermission("listFiles"), async (req, res) => {
+app.get("/list", fileListRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
   if (!folder) return;
 
