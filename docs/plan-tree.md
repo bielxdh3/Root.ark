@@ -458,7 +458,7 @@ All items below are candidates, not commitments.
 - `[ACCEPTED-LOCAL]` Protocol v2 metadata AAD/schema enforcement, recoverable WebDAV overwrite journaling, bidirectional encrypted sync, strict client/offline boundaries, protected index/preview identity binding, and approved `rootark-zk-1` opaque group wraps are implemented and locally reviewed.
 - `[ACCEPTED-LOCAL]` The controlled final-head cross-phase matrix recorded 66/66 tests passed, with separate realtime transport 4/4 and upload-security 12/12 boundary runs; syntax validation recorded 116/116 passed. WebDAV PUT has a distinct durable mutation event and explicit protocol-v2 translation, and the browser protected store now has an in-memory session hook.
 - `[BLOCKED]` Canonical full `npm test` was attempted but remains blocked by the unavailable `better-sqlite3` native binding in the disposable install; remote CI, browser/provider/live-production/TLS, owner approval, and release evidence remain external.
-- `[RECONCILED]` The previously unnamed Draft-PR statement cannot be mapped to a current live PR. The dated GitHub reconciliation records the live state: PR #96 is merged and PR #95 remains open behind its CodeQL check. Merge state is not release authorization; no Phase 17 item is created or inferred.
+- `[RECONCILED — 2026-10-06]` The previously unnamed Draft-PR statement cannot be mapped to a current live PR. PR #96 is merged; PR #95 remains open with its current CodeQL and Security Regression checks passing, while Issue #94's multi-process/replica enforcement gate remains unresolved. Merge state is not release authorization; no Phase 17 item is created or inferred.
 
 ### Authentication and administration
 
