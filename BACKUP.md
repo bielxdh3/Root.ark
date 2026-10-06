@@ -87,6 +87,21 @@ Pelo painel:
 
 Antes da restauração, o servidor cria um backup `pre-restore`.
 
+### Restore em múltiplas instâncias
+
+Configure `ROOTARK_RESTORE_INSTANCE_COUNT` com a quantidade total de processos do servidor que compartilham o mesmo runtime e o mesmo coordenador de restore. O padrão é `1`; valores aceitos vão de `1` a `128`. Para mais de uma instância, defina também `ROOTARK_INSTANCE_ID` com um identificador estável e único por processo lógico. Mantenha esse identificador igual quando a mesma instância reiniciar; processos diferentes não podem compartilhar o mesmo valor. Em implantação de instância única, o ID pode ser omitido.
+
+Depois que o restore terminar:
+
+1. Pare todas as instâncias que compartilham esse runtime.
+2. Mantenha a mesma contagem configurada e reinicie cada instância com seu próprio `ROOTARK_INSTANCE_ID`.
+3. Cada instância confirma o restore somente depois que seu listener HTTP estiver vinculado. Iniciar duas vezes com o mesmo ID conta como uma única confirmação.
+4. O coordenador e as cópias de recuperação são removidos depois que todas as instâncias distintas confirmarem. Se alguma confirmação faltar, a barreira de restore permanece ativa; confira contagem e IDs e reinicie a instância ausente. Não apague manualmente o coordenador nem os arquivos de confirmação.
+
+Todas as instâncias precisam enxergar o mesmo runtime persistente para compartilhar o coordenador e as confirmações. O mecanismo mantém uma barreira local de recuperação e não coordena restauração entre armazenamentos de runtime independentes.
+
+Restore interrompido em versões anteriores pode deixar um arquivo como `runtime.json.<uuid>.restore-preimage`. O coordenador antigo não registrava esse caminho; por isso, a recuperação atual não o remove automaticamente, pois não consegue provar que seja um temporário e não dado do usuário. Verifique esse resíduo manualmente após preservar um backup; não apague arquivos apenas pelo sufixo.
+
 O restore:
 
 - valida o ZIP;

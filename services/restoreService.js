@@ -325,8 +325,8 @@ function recoverWholeRestorePreimages(coordinator, options = {}) {
     for (const domain of [...manifest.domains].reverse()) {
       recovering = updateWholeRestoreCoordinator(recovering, { rollbackDomain: domain.name });
       const snapshotRoot = path.join(preimageRoot, domain.name);
-      if (domain.kind === "tree") restorePreimage.restoreTree(domain.root, snapshotRoot, domain.snapshot);
-      else restorePreimage.restoreFileSet(domain.files, snapshotRoot);
+      if (domain.kind === "tree") restorePreimage.restoreTree(domain.root, snapshotRoot, domain.snapshot, current.transactionId);
+      else restorePreimage.restoreFileSet(domain.files, snapshotRoot, current.transactionId);
       completed.push(domain.name);
       recovering = updateWholeRestoreCoordinator(recovering, { rollbackProgress: completed });
       options.failureInjector?.(`restore.rollback.${domain.name}.completed`, { completed: [...completed] });

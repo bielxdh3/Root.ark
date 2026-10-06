@@ -160,13 +160,29 @@ function removeTree(pathname) {
   } catch (error) { if (error.code !== "ENOENT") throw error; }
 }
 
-function restoreTree(destination, snapshotRoot, snapshot) {
+function fileRestoreTemporaryPath(destination, transactionId, index) {
+  if (!/^[a-f0-9-]{36}$/i.test(String(transactionId || "")) || !Number.isSafeInteger(index) || index < 0) {
+    throw new Error("Restore pre-image temporary identity is invalid");
+  }
+  return path.resolve(destination) + "." + transactionId + "." + index + ".restore-preimage";
+}
+
+function removeFileRestoreTemporary(pathname) {
+  let stat;
+  try { stat = fs.lstatSync(pathname, { bigint: true }); }
+  catch (error) { if (error.code === "ENOENT") return; throw error; }
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1n) throw new Error("Restore pre-image temporary is unsafe");
+  fs.unlinkSync(pathname);
+}
+
+function restoreTree(destination, snapshotRoot, snapshot, transactionId) {
   if (!snapshot.existed) { removeTree(destination); return; }
   verifyTree(snapshotRoot, snapshot.entries);
   ensureSafeDirectory(path.dirname(destination), { create: true });
   removeTree(destination);
   ensureSafeDirectory(destination, { create: true });
-  for (const entry of snapshot.entries) {
+  for (let index = 0; index < snapshot.entries.length; index += 1) {
+    const entry = snapshot.entries[index];
     safeRelativePath(entry.path);
     const target = path.join(destination, ...entry.path.split("/"));
     const source = path.join(snapshotRoot, ...entry.path.split("/"));
@@ -175,7 +191,8 @@ function restoreTree(destination, snapshotRoot, snapshot) {
       try { fs.chmodSync(target, entry.mode); } catch (error) { if (process.platform !== "win32") throw error; }
     } else {
       ensureSafeDirectory(path.dirname(target), { create: true });
-      const temporary = `${target}.${crypto.randomUUID()}.restore-preimage`;
+      const temporary = fileRestoreTemporaryPath(target, transactionId, index);
+      removeFileRestoreTemporary(temporary);
       const result = copyVerifiedFile(source, temporary, entry.sha256);
       if (result.size !== entry.size) throw new Error("Restore pre-image file size changed during recovery");
       try { fs.renameSync(temporary, target); }
@@ -204,10 +221,13 @@ function snapshotFileSet(paths, snapshotRoot) {
   return files;
 }
 
-function restoreFileSet(files, snapshotRoot) {
-  for (const entry of files) {
+function restoreFileSet(files, snapshotRoot, transactionId) {
+  for (let index = 0; index < files.length; index += 1) {
+    const entry = files[index];
     const destination = path.resolve(entry.destination);
     ensureSafeDirectory(path.dirname(destination), { create: true });
+    const temporary = fileRestoreTemporaryPath(destination, transactionId, index);
+    removeFileRestoreTemporary(temporary);
     let current;
     try { current = fs.lstatSync(destination); }
     catch (error) { if (error.code !== "ENOENT") throw error; }
@@ -216,7 +236,6 @@ function restoreFileSet(files, snapshotRoot) {
     safeRelativePath(entry.stagedName);
     const staged = path.join(snapshotRoot, entry.stagedName);
     if (hashFile(staged) !== entry.sha256) throw new Error("Restore pre-image file failed integrity verification");
-    const temporary = `${destination}.${crypto.randomUUID()}.restore-preimage`;
     const copied = copyVerifiedFile(staged, temporary, entry.sha256);
     if (copied.size !== entry.size) throw new Error("Restore pre-image file size changed during recovery");
     if (current) fs.rmSync(destination, { force: true });
