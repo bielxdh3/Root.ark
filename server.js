@@ -1251,11 +1251,11 @@ function getShareMaxDownloads(rawValue) {
   return rounded;
 }
 
-function getSharePasswordHash(password) {
+function getSharePassword(password) {
   const value = typeof password === "string" ? password.trim() : "";
   if (!value) return null;
   if (value.length < 4 || value.length > 128) return undefined;
-  return bcrypt.hashSync(value, 10);
+  return value;
 }
 
 function escapeHtml(value) {
@@ -3968,6 +3968,39 @@ async function getListedFileDetails(folder, fileName) {
   return files.find((file) => file.name === fileName) || null;
 }
 
+// Process-local account windows bound one server instance; coordinated limits across replicas need shared storage, as does issue #94.
+const cloudMetadataRateLimits = new Map();
+const CLOUD_METADATA_RATE_LIMIT_MAX = 30;
+const CLOUD_METADATA_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+let cloudMetadataRateLimitCleanupAt = 0;
+
+function consumeCloudMetadataRateLimit(req, res) {
+  const now = Date.now();
+  if (now >= cloudMetadataRateLimitCleanupAt) {
+    for (const [key, state] of cloudMetadataRateLimits) {
+      if (now - state.windowStart >= CLOUD_METADATA_RATE_LIMIT_WINDOW_MS) cloudMetadataRateLimits.delete(key);
+    }
+    cloudMetadataRateLimitCleanupAt = now + CLOUD_METADATA_RATE_LIMIT_WINDOW_MS;
+  }
+
+  const username = String(req.user?.username || "").trim().toLowerCase();
+  const route = req.route?.path || req.path;
+  const method = req.method === "HEAD" ? "GET" : req.method;
+  const key = `${username}\0${method}\0${route}`;
+  let state = cloudMetadataRateLimits.get(key);
+  if (!state || now - state.windowStart >= CLOUD_METADATA_RATE_LIMIT_WINDOW_MS) {
+    state = { attempts: 0, windowStart: now };
+    cloudMetadataRateLimits.set(key, state);
+  }
+  if (state.attempts >= CLOUD_METADATA_RATE_LIMIT_MAX) {
+    res.setHeader("Retry-After", String(Math.max(1, Math.ceil((state.windowStart + CLOUD_METADATA_RATE_LIMIT_WINDOW_MS - now) / 1000))));
+    res.status(429).json({ error: "Muitas requisicoes. Tente novamente em instantes." });
+    return false;
+  }
+  state.attempts += 1;
+  return true;
+}
+
 function getDirectorySize(directory) {
   if (!fs.existsSync(directory)) return 0;
 
@@ -4771,6 +4804,7 @@ app.get("/file-access", authenticate, async (req, res) => {
   if (!canManageAccess(req) && !hasFileEditAccess(req, folder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
   if (!await getListedFileDetails(folder, name)) {
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
@@ -4804,6 +4838,7 @@ app.put("/file-access", authenticate, async (req, res) => {
   if (!canManageAccess(req) && !hasFileEditAccess(req, folder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
   if (!await getListedFileDetails(folder, name)) {
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
@@ -6156,6 +6191,7 @@ app.put("/file-temporary", authenticate, async (req, res) => {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
 
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
   if (!await getListedFileDetails(folder, name)) {
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
@@ -7831,7 +7867,7 @@ app.post("/share", authenticate, requirePermission("listFiles"), async (req, res
   const expiresInMinutes = getShareExpirationMinutes(req.body.expiresInMinutes);
   const maxViews = getShareMaxViews(req.body.maxViews);
   const maxDownloads = getShareMaxDownloads(req.body.maxDownloads);
-  const passwordHash = getSharePasswordHash(req.body.password);
+  const sharePassword = getSharePassword(req.body.password);
   const folder = getReadableFolderOrRespond(req, res, req.body.folderId);
   if (!folder) return;
 
@@ -7861,7 +7897,7 @@ app.post("/share", authenticate, requirePermission("listFiles"), async (req, res
     });
   }
 
-  if (passwordHash === undefined) {
+  if (sharePassword === undefined) {
     return res.status(400).json({ error: "Senha do link deve ter entre 4 e 128 caracteres." });
   }
 
@@ -7872,9 +7908,11 @@ app.post("/share", authenticate, requirePermission("listFiles"), async (req, res
   if (getEncryptedFileMetadata(folder.id, name)) {
     return res.status(403).json({ error: "Links publicos nao estao disponiveis para arquivos criptografados" });
   }
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
   if (!await getListedFileDetails(folder, name)) {
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
+  const passwordHash = sharePassword ? bcrypt.hashSync(sharePassword, 10) : null;
 
   const links = cleanupExpiredPublicLinks();
   const shareToken = crypto.randomBytes(24).toString("hex");

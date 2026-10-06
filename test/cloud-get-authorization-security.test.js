@@ -12,6 +12,7 @@ const test = require("node:test");
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = path.join(ROOT, "server.js");
 const PUBLIC = path.join(ROOT, "public");
+const CLOUD_METADATA_REQUEST_LIMIT = 30;
 const OBJECTS = new Map([
   ["rootark/uploads/root/private.txt", Buffer.from("private cloud fixture")],
   ["rootark/uploads/root/private.txt.v1", Buffer.from("private stored version fixture")],
@@ -55,11 +56,13 @@ function request(port, requestPath, { method = "GET", headers = {}, body = "" } 
 
 function startS3Fixture() {
   const getObjects = [];
+  const listRequests = [];
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://fixture.invalid");
     const pathname = decodeURIComponent(url.pathname);
     const key = pathname.replace(/^\/fixture-bucket\//, "");
     if (req.method === "GET" && url.searchParams.get("list-type") === "2") {
+      listRequests.push(url.searchParams.get("prefix") || "");
       const prefix = url.searchParams.get("prefix") || "";
       const matches = Array.from(OBJECTS.keys()).filter((objectKey) => objectKey.startsWith(prefix));
       const contents = matches.map((objectKey) => `<Contents><Key>${objectKey}</Key><LastModified>2026-10-05T00:00:00.000Z</LastModified><ETag>&quot;fixture&quot;</ETag><Size>${OBJECTS.get(objectKey).length}</Size></Contents>`).join("");
@@ -76,7 +79,7 @@ function startS3Fixture() {
   });
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolve({ server, port: server.address().port, getObjects }));
+    server.listen(0, "127.0.0.1", () => resolve({ server, port: server.address().port, getObjects, listRequests }));
   });
 }
 
@@ -95,7 +98,7 @@ function stop(child) {
   return new Promise((resolve) => child.once("exit", resolve));
 }
 
-test("cloud-backed GET routes authorize files before cache hydration", { timeout: 60_000 }, async (t) => {
+test("cloud-backed file routes authorize access and bound repeated metadata listings", { timeout: 60_000 }, async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-get-acl-"));
   const dataDir = path.join(directory, "data");
   fs.mkdirSync(dataDir, { recursive: true });
@@ -152,6 +155,15 @@ test("cloud-backed GET routes authorize files before cache hydration", { timeout
   }));
   const cloud = await startS3Fixture();
   const port = await getUnusedPort();
+  const hashCallsFile = path.join(directory, "bcrypt-hash-calls.txt");
+  const preloadFile = path.join(directory, "bcrypt-hash-instrumentation.js");
+  fs.writeFileSync(preloadFile, [
+    'const fs = require("node:fs");',
+    `const bcrypt = require(${JSON.stringify(require.resolve("bcryptjs"))});`,
+    `const counterFile = ${JSON.stringify(hashCallsFile)};`,
+    "const originalHashSync = bcrypt.hashSync;",
+    'bcrypt.hashSync = function (...args) { fs.appendFileSync(counterFile, "1\\n"); return originalHashSync.apply(this, args); };',
+  ].join("\n"));
   const env = {
     ...process.env,
     PORT: String(port),
@@ -167,6 +179,7 @@ test("cloud-backed GET routes authorize files before cache hydration", { timeout
     AWS_ACCESS_KEY_ID: "fixture-access-key",
     AWS_SECRET_ACCESS_KEY: "fixture-secret-key",
     WEBDAV_ENABLED: "true",
+    NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${preloadFile}`].filter(Boolean).join(" "),
   };
   delete env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS;
   delete env.ROOTARK_BOOTSTRAP_USERS_FROM_SEED;
@@ -321,4 +334,61 @@ test("cloud-backed GET routes authorize files before cache hydration", { timeout
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/private.txt"), false, "denied metadata actions do not hydrate private objects");
   assert.deepEqual(cloud.getObjects, [], "metadata-only file actions do not download cloud bytes");
   assert.equal(fs.existsSync(path.join(directory, "uploads", "public.txt")), false, "metadata-only file actions do not create a local cache");
+
+  const fileAccessListingCount = cloud.listRequests.length;
+  for (let index = 1; index < CLOUD_METADATA_REQUEST_LIMIT; index += 1) {
+    const response = await request(port, "/file-access?name=public.txt", { headers: { cookie, "x-forwarded-for": `198.51.100.${index}` } });
+    assert.equal(response.status, 200, response.body);
+  }
+  const fileAccessAtLimit = cloud.listRequests.length;
+  assert.equal(fileAccessAtLimit - fileAccessListingCount, CLOUD_METADATA_REQUEST_LIMIT - 1);
+  const limitedFileAccess = await request(port, "/file-access?name=public.txt", { headers: { cookie, "x-forwarded-for": "203.0.113.250" } });
+  assert.equal(limitedFileAccess.status, 429, limitedFileAccess.body);
+  assert.equal(cloud.listRequests.length, fileAccessAtLimit, "limited GET is rejected before provider listing");
+  const limitedHeadFileAccess = await request(port, "/file-access?name=public.txt", { method: "HEAD", headers: { cookie } });
+  assert.equal(limitedHeadFileAccess.status, 429, "HEAD fallback shares the GET file-access quota");
+  assert.equal(cloud.listRequests.length, fileAccessAtLimit, "limited HEAD is rejected before provider listing");
+
+  for (let index = 1; index < CLOUD_METADATA_REQUEST_LIMIT; index += 1) {
+    const response = await mutate("/file-access", "PUT", { name: "public.txt", public: true, users: { viewer: { edit: true } } });
+    assert.equal(response.status, 200, response.body);
+  }
+  const accessStateAtLimit = fs.readFileSync(path.join(dataDir, "file-permissions.json"), "utf8");
+  const accessListingAtLimit = cloud.listRequests.length;
+  const limitedAccessChange = await mutate("/file-access", "PUT", { name: "public.txt", public: false, users: {} });
+  assert.equal(limitedAccessChange.status, 429, limitedAccessChange.body);
+  assert.equal(cloud.listRequests.length, accessListingAtLimit, "limited ACL update is rejected before provider listing");
+  assert.equal(fs.readFileSync(path.join(dataDir, "file-permissions.json"), "utf8"), accessStateAtLimit, "limited ACL update does not persist state");
+
+  for (let index = 1; index < CLOUD_METADATA_REQUEST_LIMIT; index += 1) {
+    const response = await mutate("/file-temporary", "PUT", { name: "public.txt", durationAmount: 1, durationUnit: "hours" });
+    assert.equal(response.status, 200, response.body);
+  }
+  const expirationStateAtLimit = fs.readFileSync(path.join(dataDir, "file-expirations.json"), "utf8");
+  const expirationListingAtLimit = cloud.listRequests.length;
+  const limitedExpirationChange = await mutate("/file-temporary", "PUT", { name: "public.txt", durationAmount: 2, durationUnit: "days" });
+  assert.equal(limitedExpirationChange.status, 429, limitedExpirationChange.body);
+  assert.equal(cloud.listRequests.length, expirationListingAtLimit, "limited expiration update is rejected before provider listing");
+  assert.equal(fs.readFileSync(path.join(dataDir, "file-expirations.json"), "utf8"), expirationStateAtLimit, "limited expiration update does not persist state");
+
+  for (let index = 1; index < CLOUD_METADATA_REQUEST_LIMIT; index += 1) {
+    const response = await mutate("/share", "POST", { name: "public.txt", expiresInMinutes: 60 });
+    assert.equal(response.status, 201, response.body);
+  }
+  const shareStateAtLimit = JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"));
+  const shareCountAtLimit = Object.values(shareStateAtLimit).filter((link) => link.fileName === "public.txt" && link.createdBy === "viewer").length;
+  assert.equal(shareCountAtLimit, CLOUD_METADATA_REQUEST_LIMIT);
+  const shareListingAtLimit = cloud.listRequests.length;
+  const hashCallsAtLimit = fs.existsSync(hashCallsFile) ? fs.readFileSync(hashCallsFile, "utf8").length : 0;
+  const limitedShare = await mutate("/share", "POST", { name: "public.txt", expiresInMinutes: 60, maxViews: 5, password: "valid-password" });
+  assert.equal(limitedShare.status, 429, limitedShare.body);
+  assert.equal(fs.existsSync(hashCallsFile) ? fs.readFileSync(hashCallsFile, "utf8").length : 0, hashCallsAtLimit, "limited share does not hash a password");
+  assert.equal(cloud.listRequests.length, shareListingAtLimit, "limited share creation is rejected before provider listing");
+  const shareStateAfterLimit = JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"));
+  assert.equal(Object.values(shareStateAfterLimit).filter((link) => link.fileName === "public.txt" && link.createdBy === "viewer").length, shareCountAtLimit, "limited share creation does not persist a link");
+
+  const hashCallsBeforeDeniedShare = fs.existsSync(hashCallsFile) ? fs.readFileSync(hashCallsFile, "utf8").length : 0;
+  const deniedPasswordShare = await mutate("/share", "POST", { name: "private.txt", expiresInMinutes: 60, password: "valid-password" });
+  assert.equal(deniedPasswordShare.status, 403, deniedPasswordShare.body);
+  assert.equal(fs.existsSync(hashCallsFile) ? fs.readFileSync(hashCallsFile, "utf8").length : 0, hashCallsBeforeDeniedShare, "unauthorized share does not hash a password");
 });
