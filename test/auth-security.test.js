@@ -10,7 +10,7 @@ const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const WebSocket = require("ws");
-const { createAuthenticate, getExpectedOrigin } = require("../src/middlewares/auth");
+const { createAuthenticate, getClientIp, getExpectedOrigin } = require("../src/middlewares/auth");
 
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = path.join(ROOT, "server.js");
@@ -126,10 +126,16 @@ function authenticateRequest({ headers = {}, method = "GET", user = { username: 
 test("cookie session requires CSRF for state changes", () => {
   assert.equal(authenticateRequest({ method: "POST", headers: { cookie: "rootark_session=t; rootark_csrf=c" } }).code, 403);
   assert.equal(authenticateRequest({ method: "POST", headers: { cookie: "rootark_session=t; rootark_csrf=c", "x-csrf-token": "c", origin: "http://localhost" } }).authType, "cookie");
+  assert.equal(authenticateRequest({ method: "POST", headers: { cookie: "rootark_session=t; rootark_csrf=c", "x-csrf-token": "c", origin: "https://localhost", "x-forwarded-proto": "https" } }).code, 403);
 });
 
-test("WebSocket Origin honors trusted proxy HTTPS forwarding", () => {
-  assert.equal(getExpectedOrigin({ headers: { host: "rootark.test", "x-forwarded-proto": "https" }, socket: { encrypted: false } }), "https://rootark.test");
+test("origin and client IP use the Express trusted-proxy decision, never raw forwarded headers", () => {
+  assert.equal(getExpectedOrigin({ protocol: "https", headers: { host: "rootark.test", "x-forwarded-proto": "http" }, socket: { encrypted: false } }), "https://rootark.test");
+  assert.equal(getExpectedOrigin({ protocol: "http", headers: { host: "rootark.test", "x-forwarded-proto": "https" }, socket: { encrypted: false } }), "http://rootark.test");
+  assert.equal(getExpectedOrigin({ headers: { host: "rootark.test", "x-forwarded-proto": "https" }, socket: { encrypted: false, remoteAddress: "198.51.100.20" } }), "http://rootark.test");
+  assert.equal(getExpectedOrigin({ headers: { host: "rootark.test", "x-forwarded-proto": "https, http" }, socket: { encrypted: false, remoteAddress: "127.0.0.1" } }, (address) => address === "127.0.0.1"), "https://rootark.test");
+  assert.equal(getClientIp({ ip: "198.51.100.7", socket: { remoteAddress: "127.0.0.1" }, headers: { "x-forwarded-for": "192.0.2.2" } }), "198.51.100.7");
+  assert.equal(getClientIp({ socket: { remoteAddress: "::ffff:127.0.0.1" }, headers: { "cf-connecting-ip": "192.0.2.2" } }), "127.0.0.1");
 });
 
 test("WebDAV uses the Express 5 named wildcard syntax", () => {

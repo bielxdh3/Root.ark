@@ -38,6 +38,155 @@ function json(value) {
   return Buffer.from(JSON.stringify(value));
 }
 
+test("shared dialog close restores focus to its connected opener", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-ui.js"), "utf8");
+  const listeners = new Map();
+  const opener = { isConnected: true, focus() { document.activeElement = this; } };
+  const cancelButton = { focus() { document.activeElement = this; }, addEventListener() {} };
+  const form = { addEventListener() {} };
+  const dialog = {
+    returnValue: "",
+    addEventListener(name, listener) { listeners.set(name, listener); },
+    removeEventListener(name) { listeners.delete(name); },
+    querySelector(selector) { return selector === "form" ? form : cancelButton; },
+    querySelectorAll() { return [cancelButton]; },
+    showModal() { document.activeElement = this; },
+    close(value) {
+      this.returnValue = value;
+      document.activeElement = this;
+      const listener = listeners.get("close");
+      listeners.delete("close");
+      listener();
+    },
+  };
+  const document = {
+    activeElement: opener,
+    documentElement: { dataset: {} },
+    addEventListener() {},
+    getElementById(id) { return id === "app-dialog" ? dialog : null; },
+  };
+  const context = {
+    document,
+    localStorage: { getItem() { return null; } },
+    window: { addEventListener() {}, setTimeout },
+    FormData: function FormData() {},
+  };
+  vm.runInNewContext(source, context);
+
+  const pending = context.window.RootarkUI.dialog({ title: "Compartilhar arquivo" });
+  dialog.close("cancel");
+  assert.equal(await pending, null);
+  assert.equal(document.activeElement, opener);
+});
+
+test("shared dialog close moves focus to the main region when its opener is removed", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-ui.js"), "utf8");
+  const listeners = new Map();
+  const opener = { isConnected: true, focus() { document.activeElement = this; } };
+  const main = { isConnected: true, focus() { document.activeElement = this; } };
+  const cancelButton = { focus() { document.activeElement = this; }, addEventListener() {} };
+  const form = { addEventListener() {} };
+  const dialog = {
+    returnValue: "",
+    addEventListener(name, listener) { listeners.set(name, listener); },
+    removeEventListener(name) { listeners.delete(name); },
+    querySelector(selector) { return selector === "form" ? form : cancelButton; },
+    querySelectorAll() { return [cancelButton]; },
+    showModal() { document.activeElement = this; },
+    close(value) {
+      this.returnValue = value;
+      document.activeElement = this;
+      const listener = listeners.get("close");
+      listeners.delete("close");
+      listener();
+    },
+  };
+  const document = {
+    activeElement: opener,
+    documentElement: { dataset: {} },
+    addEventListener() {},
+    getElementById(id) { return id === "app-dialog" ? dialog : id === "main" ? main : null; },
+  };
+  const context = {
+    document,
+    localStorage: { getItem() { return null; } },
+    window: { addEventListener() {}, setTimeout },
+    FormData: function FormData() {},
+  };
+  vm.runInNewContext(source, context);
+
+  const pending = context.window.RootarkUI.dialog({ title: "Link criado" });
+  opener.isConnected = false;
+  dialog.close("cancel");
+  assert.equal(await pending, null);
+  assert.equal(document.activeElement, main);
+});
+
+test("backup recovery stays blocked after an in-flight action returns a structured 503", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-management.js"), "utf8");
+  for (const page of ["admin.html", "audit.html", "backups.html", "dashboard.html"]) {
+    const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
+    assert.match(html, /rootark-management\.js\?v=18/);
+  }
+  assert.match(fs.readFileSync(path.join(__dirname, "..", "public", "service-worker.js"), "utf8"), /rootark-public-shell-v18/);
+  const listeners = new Map();
+  const buttons = [{ disabled: false }, { disabled: false }, { disabled: false }];
+  const target = {
+    addEventListener: (name, listener) => listeners.set(name, listener),
+    querySelectorAll: () => buttons,
+    scrollIntoView() {},
+  };
+  const elements = new Map();
+  const element = (id) => {
+    if (!elements.has(id)) elements.set(id, { hidden: false, textContent: "", setAttribute() {}, addEventListener(name, listener) { this.listener = listener; } });
+    return elements.get(id);
+  };
+  const createButton = element("create-backup");
+  const warning = element("backup-warning");
+  let mounted;
+  const didMount = new Promise((resolve) => { mounted = resolve; });
+  let initialBackupsLoaded;
+  const didLoadBackups = new Promise((resolve) => { initialBackupsLoaded = resolve; });
+  const context = {
+    console,
+    window: {
+      RootarkApi: {
+        async get(route) {
+          if (route === "/backups/latest-status") return { latest: null };
+          if (route === "/backups") { initialBackupsLoaded(); return { backups: [{ id: "fixture-backup", status: "success" }] }; }
+          throw new Error("unexpected route");
+        },
+        async post() {
+          const error = new Error("recovery required");
+          error.status = 503;
+          error.payload = { recoveryRequired: true };
+          throw error;
+        },
+      },
+      RootarkUI: {
+        async getSession() { return { username: "fixture-admin", role: "admin", permissions: { manageBackups: true } }; },
+        mount() { mounted(); return target; },
+        escape: (value) => String(value),
+        formatDate: (value) => String(value || ""),
+        formatBytes: (value) => String(value || 0),
+        toast() {},
+      },
+    },
+    document: {
+      body: { dataset: { rootarkView: "backups" } },
+      getElementById(id) { return id === "page-content" ? target : id === "app-root" ? element(id) : id === "backups-body" ? element(id) : id === "backup-warning" ? warning : element(id); },
+    },
+  };
+  vm.runInNewContext(source, context);
+  await didMount;
+  await didLoadBackups;
+  await createButton.listener({ currentTarget: createButton });
+  assert.equal(warning.hidden, false);
+  assert.match(warning.textContent, /Reinicie todas as instâncias/);
+  assert.equal(createButton.disabled, true);
+  assert.deepEqual(buttons.map((button) => button.disabled), [true, true, true]);
+});
+
 test("protected client index canonicalizes metadata and rejects tamper/wrong keys", async () => {
   const key = crypto.randomBytes(32);
   const wrongKey = crypto.randomBytes(32);
@@ -131,6 +280,19 @@ test("service worker caches only the public shell and bypasses protected paths",
     },
     fetch: async () => ({ ok: true, clone: () => ({}) }),
   };
+  assert.match(source, /const CACHE_NAME = "rootark-public-shell-v18";/, "security client changes advance the public shell cache revision");
+  const pageAssets = {
+    "index.html": [["rootark-api.js", 17], ["rootark-workspace.js", 17]],
+    "admin.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
+    "audit.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
+    "backups.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
+    "dashboard.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
+    "login.html": [["rootark-api.js", 17]],
+  };
+  for (const [page, scripts] of Object.entries(pageAssets)) {
+    const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
+    for (const [script, version] of scripts) assert.match(html, new RegExp(`/client/${script.replaceAll(".", "\\.")}\\?v=${version}`), `${page} refreshes ${script}`);
+  }
   vm.runInNewContext(source, context);
   let installWait;
   handlers.install({ waitUntil: (promise) => { installWait = promise; } });

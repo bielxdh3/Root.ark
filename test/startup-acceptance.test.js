@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const bcrypt = require("bcryptjs");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
@@ -45,7 +46,11 @@ function waitForExit(child, timeoutMs, secrets) {
 }
 
 function startServer({ cwd, port, jwtSecret, envOverrides = {} }) {
-  const env = { ...process.env, PORT: String(port), DB_ENABLED: "false", ...envOverrides };
+  const env = { ...process.env, PORT: String(port), DB_ENABLED: "false" };
+  delete env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS;
+  delete env.ROOTARK_BOOTSTRAP_USERS_FROM_SEED;
+  delete env.TRUSTED_PROXIES;
+  Object.assign(env, envOverrides);
   if (jwtSecret === undefined) delete env.JWT_SECRET;
   else env.JWT_SECRET = jwtSecret;
   const child = spawn(process.execPath, [SERVER], {
@@ -124,7 +129,7 @@ test("startup accepts only an explicit strong JWT_SECRET", { timeout: 45_000 }, 
   const cwd = createSandbox();
   sandboxes.push(cwd);
   const port = await getUnusedPort();
-  running = startServer({ cwd, port, jwtSecret: strongSecret });
+  running = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "test", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" } });
   assert.equal(await waitForServer(port, secrets), 200);
   await stop(running.child, secrets);
   assert.equal(sanitize(running.output(), secrets).includes("[redacted]"), false, "strong secret was echoed");
@@ -147,7 +152,7 @@ test("startup loads .env from the working directory and preserves explicit envir
   sandboxes.push(envOnlyCwd);
   fs.writeFileSync(path.join(envOnlyCwd, ".env"), `JWT_SECRET=${fileSecret}\n`);
   const envOnlyPort = await getUnusedPort();
-  const envOnlyServer = startServer({ cwd: envOnlyCwd, port: envOnlyPort, jwtSecret: undefined });
+  const envOnlyServer = startServer({ cwd: envOnlyCwd, port: envOnlyPort, jwtSecret: undefined, envOverrides: { NODE_ENV: "test", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" } });
   launchedServers.push(envOnlyServer);
   assert.equal(await waitForServer(envOnlyPort, secrets), 200);
   await stop(envOnlyServer.child, secrets);
@@ -157,12 +162,149 @@ test("startup loads .env from the working directory and preserves explicit envir
   sandboxes.push(explicitCwd);
   fs.writeFileSync(path.join(explicitCwd, ".env"), `JWT_SECRET=${weakFileSecret}\n`);
   const explicitPort = await getUnusedPort();
-  const explicitServer = startServer({ cwd: explicitCwd, port: explicitPort, jwtSecret: explicitSecret });
+  const explicitServer = startServer({ cwd: explicitCwd, port: explicitPort, jwtSecret: explicitSecret, envOverrides: { NODE_ENV: "test", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" } });
   launchedServers.push(explicitServer);
   assert.equal(await waitForServer(explicitPort, secrets), 200);
   await stop(explicitServer.child, secrets);
   assert.equal(sanitize(explicitServer.output(), secrets).includes("[redacted]"), false, "JWT secret was echoed");
 });
+
+test("fresh production bootstrap fails closed instead of creating default accounts", { timeout: 30_000 }, async (t) => {
+  const cwd = createSandbox();
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "production" } });
+  t.after(async () => { await stop(launched.child, [strongSecret]); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+  const result = await waitForExit(launched.child, TIMEOUT_MS, [strongSecret]);
+  assert.notEqual(result.code, 0);
+  assert.match(launched.output(), /No users are configured/);
+  assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), false);
+  assert.equal(launched.output().includes("admin123"), false);
+  assert.equal(launched.output().includes("user123"), false);
+});
+
+test("production bootstrap rejects seed usernames that collide after normalization", { timeout: 30_000 }, async (t) => {
+  const cwd = createSandbox();
+  fs.mkdirSync(path.join(cwd, "data"), { recursive: true });
+  const passwordHash = bcrypt.hashSync(crypto.randomBytes(32).toString("base64url"), 10);
+  fs.writeFileSync(path.join(cwd, "data", "users.json"), JSON.stringify([
+    { username: "Admin", password: passwordHash, role: "admin", permissions: {} },
+    { username: " admin ", password: passwordHash, role: "user", permissions: {} },
+  ]));
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "production", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true" } });
+  t.after(async () => { await stop(launched.child, [strongSecret]); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+  const result = await waitForExit(launched.child, TIMEOUT_MS, [strongSecret]);
+  assert.notEqual(result.code, 0);
+  assert.match(launched.output(), /The configured user seed is invalid/);
+  assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), false);
+});
+
+test("production seed import requires explicit opt-in and does not add default users", { timeout: 30_000 }, async (t) => {
+  const cwd = createSandbox();
+  const password = crypto.randomBytes(32).toString("base64url");
+  fs.mkdirSync(path.join(cwd, "data"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "data", "users.json"), JSON.stringify([
+    { username: "seed-admin", password: bcrypt.hashSync(password, 10), role: "admin", permissions: {}, sessionVersion: 0 },
+  ]));
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "production", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true" } });
+  t.after(async () => { await stop(launched.child, [strongSecret, password]); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+  assert.equal(await waitForServer(port, [strongSecret, password]), 200);
+  const users = JSON.parse(fs.readFileSync(path.join(cwd, "data", "users.local.json"), "utf8"));
+  assert.deepEqual(users.map((user) => user.username), ["seed-admin"]);
+  assert.equal(launched.output().includes("admin123"), false);
+  assert.equal(launched.output().includes("user123"), false);
+});
+
+test("production refuses a secure user seed unless bootstrap import is explicitly enabled", { timeout: 30_000 }, async (t) => {
+  const cwd = createSandbox();
+  fs.mkdirSync(path.join(cwd, "data"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "data", "users.json"), JSON.stringify([
+    { username: "seed-admin", password: bcrypt.hashSync(crypto.randomBytes(32).toString("base64url"), 10), role: "admin", permissions: {} },
+  ]));
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "production" } });
+  t.after(async () => { await stop(launched.child, [strongSecret]); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+  const result = await waitForExit(launched.child, TIMEOUT_MS, [strongSecret]);
+  assert.notEqual(result.code, 0);
+  assert.match(launched.output(), /Production user seed requires ROOTARK_BOOTSTRAP_USERS_FROM_SEED=true/);
+  assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), false);
+});
+
+test("production rejects plaintext or malformed seed credentials", { timeout: 30_000 }, async (t) => {
+  const cwd = createSandbox();
+  fs.mkdirSync(path.join(cwd, "data"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "data", "users.json"), JSON.stringify([
+    { username: "seed-admin", password: "plain-secret", role: "admin", permissions: {} },
+  ]));
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "production", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true" } });
+  t.after(async () => { await stop(launched.child, [strongSecret]); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+  const result = await waitForExit(launched.child, TIMEOUT_MS, [strongSecret]);
+  assert.notEqual(result.code, 0);
+  assert.match(launched.output(), /The configured user seed is invalid/);
+  assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), false);
+});
+
+test("default accounts require explicit non-production development/test opt-in", { timeout: 30_000 }, async (t) => {
+  const sandboxes = [];
+  const launches = [];
+  t.after(async () => {
+    for (const launched of launches) await stop(launched.child, []);
+    for (const cwd of sandboxes) fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  for (const nodeEnv of ["development", "test"]) {
+    const cwd = createSandbox();
+    sandboxes.push(cwd);
+    const strongSecret = crypto.randomBytes(48).toString("base64url");
+    const port = await getUnusedPort();
+    const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: nodeEnv, ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" } });
+    launches.push(launched);
+    assert.equal(await waitForServer(port, [strongSecret]), 200, nodeEnv);
+    const users = JSON.parse(fs.readFileSync(path.join(cwd, "data", "users.local.json"), "utf8"));
+    assert.deepEqual(users.map((user) => user.username), ["admin", "user"], nodeEnv);
+    assert.equal(bcrypt.compareSync("admin123", users[0].password), true, nodeEnv);
+    assert.equal(bcrypt.compareSync("user123", users[1].password), true, nodeEnv);
+  }
+});
+
+test("fresh test bootstrap also fails closed when the explicit dev/test opt-in is absent", { timeout: 30_000 }, async (t) => {
+  const cwd = createSandbox();
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "test" } });
+  t.after(async () => { await stop(launched.child, [strongSecret]); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+  const result = await waitForExit(launched.child, TIMEOUT_MS, [strongSecret]);
+  assert.notEqual(result.code, 0);
+  assert.match(launched.output(), /No users are configured/);
+  assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), false);
+});
+
+test("production refuses the development-default opt-in", { timeout: 30_000 }, async (t) => {
+  const cwd = createSandbox();
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "production", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" } });
+  t.after(async () => { await stop(launched.child, [strongSecret]); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+  const result = await waitForExit(launched.child, TIMEOUT_MS, [strongSecret]);
+  assert.notEqual(result.code, 0);
+  assert.match(launched.output(), /No users are configured/);
+  assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), false);
+});
+
 test("startup rejects invalid TOTP policy configuration without echoing raw values", { timeout: 45_000 }, async (t) => {
   const strongSecret = crypto.randomBytes(48).toString("base64url");
   const cases = [
