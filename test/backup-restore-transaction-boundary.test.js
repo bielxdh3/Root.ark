@@ -794,6 +794,104 @@ test("restore failure after SQLite commit rolls database, JSON, and uploads back
   }
 });
 
+test("post-migration startup failure keeps the whole-restore barrier until a later listener acknowledgement", { timeout: 60_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-post-migration-"));
+  const databasePath = path.join(runtime, "data", "rootark.sqlite");
+  const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
+  const env = {
+    ...process.env,
+    NODE_ENV: "test",
+    DB_ENABLED: "true",
+    DATABASE_URL: databasePath,
+    DB_AUTO_BACKUP_ON_START: "false",
+    JWT_SECRET: "j".repeat(48),
+    ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true",
+    ROOTARK_RESTORE_INSTANCE_COUNT: "1",
+    ROOTARK_INSTANCE_ID: "post-migration-recovery",
+    PORT: "0",
+    BACKUP_ENABLED: "true",
+    BACKUP_INCLUDE_UPLOADS: "false",
+    BACKUP_INCLUDE_TEMP: "false",
+    BACKUP_RETENTION_COUNT: "20",
+  };
+  const setupScript = `
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const Database = require(${JSON.stringify(path.join(ROOT, "node_modules", "better-sqlite3"))});
+    const { runMigrations } = require(${JSON.stringify(path.join(ROOT, "db", "migrations"))});
+    const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+    const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+    fs.mkdirSync(path.dirname(process.env.DATABASE_URL), { recursive: true });
+    runMigrations({ backup: false });
+    let db = new Database(process.env.DATABASE_URL);
+    db.exec("CREATE TABLE proof (value TEXT NOT NULL); INSERT INTO proof VALUES ('archive-before-migration');");
+    db.exec("ALTER TABLE users DROP COLUMN totp_enrolled_at; ALTER TABLE users DROP COLUMN totp_last_used_step; ALTER TABLE users DROP COLUMN totp_recovery_hashes_json; ALTER TABLE users DROP COLUMN totp_pending_secret_json; ALTER TABLE users DROP COLUMN totp_secret_json; ALTER TABLE users DROP COLUMN totp_enabled; DELETE FROM schema_migrations WHERE version = 5;");
+    db.close();
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      db = new Database(process.env.DATABASE_URL);
+      db.prepare("UPDATE proof SET value = 'live-before-restore'").run();
+      db.close();
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      const coordinator = JSON.parse(fs.readFileSync(${JSON.stringify(coordinatorPath)}, "utf8"));
+      if (coordinator.phase !== "restart_required") throw new Error("restore did not persist restart-required state");
+    })().catch((error) => { console.error(error); process.exit(1); });
+  `;
+  const failedStartupScript = `
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const Database = require(${JSON.stringify(path.join(ROOT, "node_modules", "better-sqlite3"))});
+    const migrationPath = require.resolve(${JSON.stringify(path.join(ROOT, "db", "migrations"))});
+    const migrations = require(migrationPath);
+    const runMigrations = migrations.runMigrations;
+    migrations.runMigrations = (options) => {
+      const result = runMigrations(options);
+      if (result.applied.length !== 1 || result.applied[0] !== 5) throw new Error("expected the fixture's pending migration to apply");
+      throw new Error("injected post-migration startup failure");
+    };
+    try {
+      require(${JSON.stringify(path.join(ROOT, "server.js"))});
+      throw new Error("expected the injected startup failure");
+    } catch (error) {
+      if (error.message !== "injected post-migration startup failure") throw error;
+    }
+    const coordinator = JSON.parse(fs.readFileSync(${JSON.stringify(coordinatorPath)}, "utf8"));
+    assert.equal(coordinator.phase, "restart_required");
+    const db = new Database(process.env.DATABASE_URL, { readonly: true });
+    try {
+      const versions = db.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map((row) => row.version);
+      assert.deepEqual(versions, [1, 2, 3, 4, 5]);
+      const columns = new Set(db.prepare("PRAGMA table_info(users)").all().map((row) => row.name));
+      assert.equal(columns.has("totp_enabled"), true);
+      assert.equal(columns.has("session_version"), true);
+      assert.equal(db.prepare("SELECT value FROM proof").get().value, "archive-before-migration");
+    } finally { db.close(); }
+    process.exit(0);
+  `;
+  const recoveredStartupScript = `
+    const fs = require("node:fs");
+    require(${JSON.stringify(path.join(ROOT, "server.js"))});
+    setTimeout(() => {
+      try {
+        if (fs.existsSync(${JSON.stringify(coordinatorPath)})) throw new Error("whole-restore barrier was not acknowledged");
+        process.exit(0);
+      } catch (error) { console.error(error); process.exit(4); }
+    }, 150);
+  `;
+  try {
+    const setup = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+    const failedStartup = spawnSync(process.execPath, ["-e", failedStartupScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(failedStartup.status, 0, failedStartup.stderr || failedStartup.stdout);
+    assert.equal(JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).phase, "restart_required");
+    const recoveredStartup = spawnSync(process.execPath, ["-e", recoveredStartupScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(recoveredStartup.status, 0, recoveredStartup.stderr || recoveredStartup.stdout);
+    assert.equal(fs.existsSync(coordinatorPath), false);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("application startup recovers an interrupted SQLite restore before migrations read the database", { timeout: 60_000 }, () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-startup-recovery-"));
   const databasePath = path.join(runtime, "data", "rootark.sqlite");
