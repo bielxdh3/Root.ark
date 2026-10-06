@@ -5326,7 +5326,8 @@ app.delete("/folders/:id", authenticate, (req, res) => {
 
 });
 
-app.get("/files/search", authenticate, requirePermission("listFiles"), fileSearchRateLimit, handleFileSearch);
+// These per-IP listing limits run before authentication so they also bound anonymous requests; NAT clients share the configured quota.
+app.get("/files/search", fileSearchRateLimit, authenticate, requirePermission("listFiles"), handleFileSearch);
 
 app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req, res) => {
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
@@ -7533,7 +7534,7 @@ function sortSearchResults(files, sortBy, sortOrder) {
   return sorted;
 }
 
-app.get("/list", authenticate, requirePermission("listFiles"), fileListRateLimit, async (req, res) => {
+app.get("/list", fileListRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
   if (!folder) return;
 

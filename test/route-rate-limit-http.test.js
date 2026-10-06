@@ -48,8 +48,8 @@ test("rate limits are passed directly to each protected route handler", () => {
       'app.put("/file-access", fileAccessRateLimit,',
     ]],
     ["/file-temporary", ['app.put("/file-temporary", fileTemporaryRateLimit,']],
-    ["/list", ['app.get("/list", authenticate, requirePermission("listFiles"), fileListRateLimit,']],
-    ["/files/search", ['app.get("/files/search", authenticate, requirePermission("listFiles"), fileSearchRateLimit,']],
+    ["/list", ['app.get("/list", fileListRateLimit, authenticate, requirePermission("listFiles"),']],
+    ["/files/search", ['app.get("/files/search", fileSearchRateLimit, authenticate, requirePermission("listFiles"),']],
   ];
   for (const [mountPath, handlers] of routeMiddleware) {
     assert.equal(source.includes(`app.use("${mountPath}",`), false, `${mountPath} must not use a prefix mount`);
@@ -227,19 +227,26 @@ test("cloud-backed list, search, and WebDAV PROPFIND stop before another provide
     ["/files/search", (index) => request(port, "/files/search?folderId=all", "GET", { cookie, "x-forwarded-for": `198.51.100.${index}` }), 200],
     ["WebDAV PROPFIND", (index) => request(port, "/dav", "PROPFIND", { authorization: basic, depth: "1", "x-forwarded-for": `198.51.100.${index}` }), 207],
   ]) {
-    await t.test(`${name} is limited before its third provider listing`, async () => {
+    await t.test(`${name} rejects unauthorized work and limits provider enumeration`, async () => {
       const listingsBeforeAllowedRequests = providerListings;
+      if (name !== "WebDAV PROPFIND") {
+        const unauthenticated = await request(port, name === "/files/search" ? "/files/search?folderId=all" : "/list", "GET", {
+          "x-forwarded-for": "198.51.100.99",
+        });
+        assert.equal(unauthenticated.status, 401, `${name} must still authenticate before doing provider work`);
+        assert.equal(providerListings, listingsBeforeAllowedRequests, `${name} unauthenticated request must not enumerate the provider`);
+      }
       const first = await send(1);
-      const second = await send(2);
       assert.equal(first.status, successStatus, `${name} first request: ${first.body}`);
-      assert.equal(second.status, successStatus, `${name} second request: ${second.body}`);
-      assert.equal(providerListings - listingsBeforeAllowedRequests, name === "/files/search" ? 4 : 2,
-        `${name} accepted requests must reach the disposable provider`);
+      const second = name === "WebDAV PROPFIND" ? await send(2) : null;
+      if (second) assert.equal(second.status, successStatus, `${name} second request: ${second.body}`);
+      assert.equal(providerListings - listingsBeforeAllowedRequests, name === "/files/search" ? 2 : name === "WebDAV PROPFIND" ? 2 : 1,
+        `${name} accepted request must reach the disposable provider`);
       const listingsBeforeRejectedRequest = providerListings;
-      const third = await send(3);
-      assert.equal(third.status, 429, `${name} must be rate limited before provider listing`);
+      const rejected = await send(name === "WebDAV PROPFIND" ? 3 : 2);
+      assert.equal(rejected.status, 429, `${name} must be rate limited before provider listing`);
       assert.equal(providerListings, listingsBeforeRejectedRequest, `${name} must not enumerate the provider after 429`);
-      assert.equal(third.headers["ratelimit-limit"], "2");
+      assert.equal(rejected.headers["ratelimit-limit"], "2");
     });
   }
 });
