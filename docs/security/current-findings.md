@@ -14,6 +14,7 @@ This public document intentionally does not retain exploit-ready reproduction st
 - WebSocket authentication must not place credentials in URLs and must preserve session freshness checks.
 - Local data, databases, backups, uploads, credentials, keys, and environment files must remain outside Git.
 - Optional scanning, cloud, WebDAV, backup, and synchronization behavior still depends on deployment-specific validation.
+- Cloud relocation and WebDAV journal recovery require service-private `temp/.incoming` state and same-host process visibility; untrusted local writers and multi-host shared journals are unsupported.
 - The approved future zero-knowledge product direction is not equivalent to the current implementation and requires separate architecture and migration work.
 
 ## Public security guidance

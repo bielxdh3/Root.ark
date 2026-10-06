@@ -53,6 +53,15 @@ based only on age; first stop or verify the owner and inspect the local
 transaction state. Safe multi-host recovery requires a shared coordinator and
 fencing on provider operations, which this implementation does not provide.
 
+Treat `temp/.incoming`, `temp/`, and their runtime-root ancestors as
+service-private state. Run under a dedicated service account and prevent
+untrusted host users or processes from creating, replacing, or renaming entries
+there while Root.ark is active. Exclusive claims and identity rechecks protect
+against cooperating application workers and process interruption; they do not
+protect journal recovery from a malicious local writer that can modify these
+paths. Deployments that cannot enforce this filesystem boundary must not rely
+on the journal takeover and recovery guarantees.
+
 These guarantees cover process termination followed by restart and recovery on
 the supported same-host journal filesystem. Journal contents and lock files are
 flushed before use, but atomic file replacement does not explicitly flush the
