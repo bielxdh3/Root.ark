@@ -636,7 +636,16 @@ function loadFileVersions() {
 
 function saveFileVersions(entries) {
   if (shouldUseDatabase()) fileVersionsRepository.saveFileVersions(entries);
-  if (shouldWriteLegacyJson()) fs.writeFileSync(FILE_VERSIONS_FILE, JSON.stringify(entries, null, 2));
+  if (shouldWriteLegacyJson()) {
+    const temporaryFile = `${FILE_VERSIONS_FILE}.tmp-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
+    try {
+      fs.writeFileSync(temporaryFile, JSON.stringify(entries, null, 2));
+      fs.renameSync(temporaryFile, FILE_VERSIONS_FILE);
+    } catch (error) {
+      fs.rmSync(temporaryFile, { force: true });
+      throw error;
+    }
+  }
   broadcastDataChanged("versions");
 }
 
@@ -2268,6 +2277,177 @@ function recordApprovedFileVersion(folder, fileName, pendingPath, uploadedBy, co
   pruneFileVersions(entries, key, folder);
   saveFileVersions(entries);
   return { currentVersion: newVersion, replaced: true };
+}
+
+function getCloudApprovalStagingPath(folder, fileName, version) {
+  const stagingDirectory = path.join(folder.uploadDir, ".rootark-approval-staging");
+  fs.mkdirSync(stagingDirectory, { recursive: true });
+  const directoryStats = fs.lstatSync(stagingDirectory);
+  if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink()) return null;
+
+  const stagingId = crypto.createHash("sha256")
+    .update(`${folder.id}\0${fileName}\0${version}`)
+    .digest("hex");
+  return path.join(stagingDirectory, `${stagingId}.tmp`);
+}
+
+async function installCloudApprovalBytes(folder, fileName, pendingPath, version, expectedDigest, allowedCurrentDigests) {
+  const currentPath = path.join(folder.uploadDir, fileName);
+  let currentStats = null;
+  try {
+    currentStats = fs.lstatSync(currentPath);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+
+  if (currentStats) {
+    if (!currentStats.isFile() || currentStats.isSymbolicLink()) return false;
+    const currentDigest = await hashLocalFileSha256(currentPath);
+    if (currentDigest === expectedDigest) return true;
+    if (!allowedCurrentDigests.includes(currentDigest)) return false;
+  }
+
+  const stagingPath = getCloudApprovalStagingPath(folder, fileName, version);
+  if (!stagingPath) return false;
+
+  let stagedStats = null;
+  try {
+    stagedStats = fs.lstatSync(stagingPath);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (stagedStats && (!stagedStats.isFile() || stagedStats.isSymbolicLink())) return false;
+  if (stagedStats && await hashLocalFileSha256(stagingPath) !== expectedDigest) {
+    fs.rmSync(stagingPath, { force: true });
+    stagedStats = null;
+  }
+  if (!stagedStats) {
+    fs.copyFileSync(pendingPath, stagingPath, fs.constants.COPYFILE_EXCL);
+    if (await hashLocalFileSha256(stagingPath) !== expectedDigest) {
+      fs.rmSync(stagingPath, { force: true });
+      return false;
+    }
+  }
+
+  if (currentStats) fs.rmSync(currentPath);
+  fs.renameSync(stagingPath, currentPath);
+  const installedStats = fs.lstatSync(currentPath);
+  return installedStats.isFile() && !installedStats.isSymbolicLink() &&
+    await hashLocalFileSha256(currentPath) === expectedDigest;
+}
+
+async function recordCloudApprovedFileVersion(folder, fileName, pendingPath, uploadedBy, comment, retry) {
+  const currentPath = path.join(folder.uploadDir, fileName);
+  const nextVersion = retry.version;
+  const pendingDigest = await hashLocalFileSha256(pendingPath);
+  if (pendingDigest !== retry.sha256) return null;
+
+  const entries = loadFileVersions();
+  const key = getFileVersionKey(folder.id, fileName);
+  let history = normalizeVersionHistory(entries[key]);
+  const currentExists = isExistingFile(currentPath);
+  const currentDigest = currentExists ? await hashLocalFileSha256(currentPath) : null;
+
+  if (!retry.replaced) {
+    if (nextVersion !== 1 || history.currentVersion > 1) return null;
+    if (history.currentVersion === 1 && currentDigest === retry.sha256 &&
+        history.versions.some((version) => version.version === 1 && version.storedAs === fileName)) {
+      return { currentVersion: 1, replaced: false };
+    }
+    if (history.currentVersion !== 0 || (currentExists && currentDigest !== retry.sha256)) return null;
+    if (!await installCloudApprovalBytes(folder, fileName, pendingPath, nextVersion, retry.sha256, [])) return null;
+
+    const stats = fs.statSync(currentPath);
+    entries[key] = {
+      currentVersion: 1,
+      versions: [{
+        version: 1,
+        storedAs: fileName,
+        uploadedBy: uploadedBy || "sistema",
+        uploadedAt: stats.birthtime?.toISOString?.() || new Date().toISOString(),
+        size: stats.size,
+        comment: comment || "",
+      }],
+    };
+    saveFileVersions(entries);
+    return { currentVersion: 1, replaced: false };
+  }
+
+  const oldVersion = nextVersion - 1;
+  const archivedName = getStoredVersionName(fileName, oldVersion);
+  const archivedPath = path.join(folder.uploadDir, archivedName);
+  if (oldVersion < 1 || !/^[a-f0-9]{64}$/.test(retry.previousSha256 || "")) return null;
+  if (history.currentVersion !== 0 && history.currentVersion !== oldVersion) return null;
+
+  let previousVersion = null;
+  if (history.currentVersion === 0) {
+    if (oldVersion !== 1 || history.versions.length !== 0) return null;
+  } else {
+    const previousVersions = history.versions.filter((version) => version.version === oldVersion);
+    if (previousVersions.length !== 1) return null;
+    [previousVersion] = previousVersions;
+    if (![fileName, archivedName].includes(previousVersion.storedAs)) return null;
+  }
+  const nextVersionEntries = history.versions.filter((version) => version.version === nextVersion);
+  if (nextVersionEntries.length > 1) return null;
+  const nextEntry = nextVersionEntries[0] || null;
+  if (nextEntry && nextEntry.storedAs !== fileName) return null;
+
+  let archivedExists = isExistingFile(archivedPath);
+  let archivedDigest = archivedExists ? await hashLocalFileSha256(archivedPath) : null;
+  if (archivedExists && archivedDigest !== retry.previousSha256) return null;
+
+  if (currentExists && currentDigest !== retry.sha256 && currentDigest !== retry.previousSha256) return null;
+  if (!archivedExists) {
+    if (!currentExists || currentDigest !== retry.previousSha256) return null;
+    fs.renameSync(currentPath, archivedPath);
+    archivedExists = true;
+    archivedDigest = retry.previousSha256;
+  }
+  if (!archivedExists || archivedDigest !== retry.previousSha256) return null;
+
+  if (!await installCloudApprovalBytes(folder, fileName, pendingPath, nextVersion, retry.sha256, [retry.previousSha256])) return null;
+
+  const archiveStats = fs.statSync(archivedPath);
+  if (history.currentVersion === 0) {
+    const currentOwner = normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, fileName)).owner;
+    history = {
+      currentVersion: oldVersion,
+      versions: [{
+        version: oldVersion,
+        storedAs: archivedName,
+        uploadedBy: currentOwner || "sistema",
+        uploadedAt: archiveStats.birthtime?.toISOString?.() || new Date().toISOString(),
+        size: archiveStats.size,
+        comment: "Versao inicial",
+      }],
+    };
+  } else {
+    previousVersion.storedAs = archivedName;
+    previousVersion.size = archiveStats.size;
+  }
+
+  const currentStats = fs.statSync(currentPath);
+  history.currentVersion = nextVersion;
+  if (nextEntry) {
+    nextEntry.uploadedBy = uploadedBy || "sistema";
+    nextEntry.size = currentStats.size;
+    nextEntry.comment = comment || "";
+  } else {
+    history.versions.push({
+      version: nextVersion,
+      storedAs: fileName,
+      uploadedBy: uploadedBy || "sistema",
+      uploadedAt: new Date().toISOString(),
+      size: currentStats.size,
+      comment: comment || "",
+    });
+  }
+
+  entries[key] = history;
+  pruneFileVersions(entries, key, folder);
+  saveFileVersions(entries);
+  return { currentVersion: nextVersion, replaced: true };
 }
 
 function syncFileVersionsToCloud(folderId, fileName) {
@@ -9138,8 +9318,14 @@ app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("ap
         if (committed) {
           versionInfo = { currentVersion: retry.version, replaced: retry.replaced };
         } else {
-          const expectedVersion = currentExists ? (history.currentVersion || 1) + 1 : 1;
-          if (retry.state !== "intent" || retry.version !== expectedVersion) {
+          const historyMatchesIntent = retry.replaced
+            ? history.currentVersion === 0 || history.currentVersion === retry.version - 1
+            : history.currentVersion === 0;
+          const priorDigestMatchesIntent = retry.replaced
+            ? /^[a-f0-9]{64}$/.test(retry.previousSha256 || "")
+            : retry.previousSha256 == null;
+          if (retry.state !== "intent" || !historyMatchesIntent || !priorDigestMatchesIntent ||
+              (retry.replaced ? retry.version < 2 : retry.version !== 1)) {
             return res.status(503).json({ status: "reconciliation_required", error: "A aprovacao precisa de conciliacao antes de continuar" });
           }
         }
@@ -9149,19 +9335,24 @@ app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("ap
           version: currentExists ? (history.currentVersion || 1) + 1 : 1,
           replaced: currentExists,
           sha256: pendingDigest,
+          previousSha256: currentExists ? await hashLocalFileSha256(currentPath) : null,
         };
         pendingEntry = { ...pendingEntry, folderId: folder.id, fileName: name, approvalRetry: retry };
         pendingUploads[key] = pendingEntry;
         savePendingUploads(pendingUploads);
       }
       if (!versionInfo) {
-        versionInfo = recordApprovedFileVersion(
+        versionInfo = await recordCloudApprovedFileVersion(
           folder,
           name,
           pendingPath,
           uploadedBy || req.user.username,
-          pendingEntry.versionComment || ""
+          pendingEntry.versionComment || "",
+          retry
         );
+        if (!versionInfo) {
+          return res.status(503).json({ status: "reconciliation_required", error: "A aprovacao precisa de conciliacao antes de continuar" });
+        }
         retry = { ...retry, state: "committed", version: versionInfo.currentVersion, replaced: versionInfo.replaced };
         pendingEntry = { ...pendingEntry, approvalRetry: retry };
         pendingUploads[key] = pendingEntry;

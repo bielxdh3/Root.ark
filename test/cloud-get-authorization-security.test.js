@@ -229,7 +229,9 @@ function startS3Fixture() {
 async function waitForServer(port, child) {
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) throw new Error("disposable server exited");
+    if (child.exitCode !== null) {
+      throw new Error(`disposable server exited (code=${child.exitCode}, signal=${child.signalCode}); stderr=${String(child.startupLogs || "").slice(-2000)}`);
+    }
     try { return await request(port, "/login.html"); } catch { await new Promise((resolve) => setTimeout(resolve, 50)); }
   }
   throw new Error("disposable server did not start; stderr=" + String(child.startupLogs || "").slice(-2000));
@@ -254,7 +256,7 @@ function stop(child) {
   });
 }
 
-test("cloud-backed file routes authorize access and bound repeated metadata listings", { timeout: 60_000 }, async (t) => {
+test("cloud-backed file routes authorize access and bound repeated metadata listings", { timeout: 90_000 }, async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-get-acl-"));
   const dataDir = path.join(directory, "data");
   fs.mkdirSync(dataDir, { recursive: true });
@@ -360,6 +362,24 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     `const counterFile = ${JSON.stringify(hashCallsFile)};`,
     "const originalHashSync = bcrypt.hashSync;",
     'bcrypt.hashSync = function (...args) { fs.appendFileSync(counterFile, "1\\n"); return originalHashSync.apply(this, args); };',
+    "const originalCopyFileSync = fs.copyFileSync.bind(fs);",
+    "fs.copyFileSync = function (source, destination, ...args) {",
+    "  const matchesPartialCopyCrash = process.env.ROOTARK_TEST_CRASH_PARTIAL_COPY_SOURCE && path.resolve(source) === process.env.ROOTARK_TEST_CRASH_PARTIAL_COPY_SOURCE && process.env.ROOTARK_TEST_CRASH_PARTIAL_COPY_DESTINATION_PREFIX && path.resolve(destination).startsWith(process.env.ROOTARK_TEST_CRASH_PARTIAL_COPY_DESTINATION_PREFIX);",
+    "  if (matchesPartialCopyCrash) { const bytes = fs.readFileSync(source); fs.writeFileSync(destination, bytes.subarray(0, Math.max(1, Math.floor(bytes.length / 2)))); process.exit(91); }",
+    "  const result = originalCopyFileSync(source, destination, ...args);",
+    "  const matchesCrash = process.env.ROOTARK_TEST_CRASH_COPY_SOURCE && path.resolve(source) === process.env.ROOTARK_TEST_CRASH_COPY_SOURCE && path.resolve(destination) === process.env.ROOTARK_TEST_CRASH_COPY_DESTINATION;",
+    "  if (matchesCrash) process.exit(89);",
+    "  return result;",
+    "};",
+    "const originalRenameSync = fs.renameSync.bind(fs);",
+    "fs.renameSync = function (source, destination, ...args) {",
+    "  const result = originalRenameSync(source, destination, ...args);",
+    "  const matchesCrash = process.env.ROOTARK_TEST_CRASH_RENAME_SYNC_SOURCE && path.resolve(source) === process.env.ROOTARK_TEST_CRASH_RENAME_SYNC_SOURCE && path.resolve(destination) === process.env.ROOTARK_TEST_CRASH_RENAME_SYNC_DESTINATION;",
+    "  if (matchesCrash) process.exit(90);",
+    "  const matchesInstallCrash = process.env.ROOTARK_TEST_CRASH_INSTALL_DESTINATION && path.resolve(destination) === process.env.ROOTARK_TEST_CRASH_INSTALL_DESTINATION;",
+    "  if (matchesInstallCrash) process.exit(92);",
+    "  return result;",
+    "};",
     "const originalRename = fs.promises.rename.bind(fs.promises);",
     "fs.promises.rename = async function (source, destination) {",
     "  const matchesCrash = process.env.ROOTARK_TEST_CRASH_RENAME_SOURCE && path.resolve(source) === process.env.ROOTARK_TEST_CRASH_RENAME_SOURCE && path.resolve(destination) === process.env.ROOTARK_TEST_CRASH_RENAME_DESTINATION;",
@@ -1016,6 +1036,213 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   assert.equal(pendingAfterSuccessfulRetry[`root/${approvalRetryName}`], undefined, "successful retry clears pending metadata");
   assert.equal(fs.existsSync(path.join(directory, "temp", approvalRetryName)), false, "successful retry removes the local pending source");
   await waitFor(() => !OBJECTS.has(approvalRetryPendingKey));
+
+  const inconsistentHistoryName = "approve-inconsistent-history.txt";
+  const inconsistentHistoryCurrentPath = path.join(directory, "uploads", inconsistentHistoryName);
+  const inconsistentHistoryPendingPath = path.join(directory, "temp", inconsistentHistoryName);
+  const inconsistentHistoryCurrentBytes = Buffer.from("authoritative current bytes with incomplete version metadata");
+  const inconsistentHistoryPendingBytes = Buffer.from("replacement that must not commit against incomplete metadata");
+  fs.writeFileSync(inconsistentHistoryCurrentPath, inconsistentHistoryCurrentBytes);
+  fs.writeFileSync(inconsistentHistoryPendingPath, inconsistentHistoryPendingBytes);
+  OBJECTS.set(`rootark/temp/root/${inconsistentHistoryName}`, inconsistentHistoryPendingBytes);
+  const inconsistentPermissions = JSON.parse(fs.readFileSync(path.join(dataDir, "file-permissions.json"), "utf8"));
+  inconsistentPermissions[`root/${inconsistentHistoryName}`] = { public: false, owner: "viewer", users: {} };
+  fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify(inconsistentPermissions));
+  const inconsistentVersions = JSON.parse(fs.readFileSync(approvalRaceVersionsPath, "utf8"));
+  inconsistentVersions[`root/${inconsistentHistoryName}`] = { currentVersion: 2, versions: [] };
+  fs.writeFileSync(approvalRaceVersionsPath, JSON.stringify(inconsistentVersions));
+  const inconsistentPendingUploads = JSON.parse(fs.readFileSync(pendingUploadsFile, "utf8"));
+  inconsistentPendingUploads[`root/${inconsistentHistoryName}`] = { folderId: "root", fileName: inconsistentHistoryName, uploadedBy: "viewer" };
+  fs.writeFileSync(pendingUploadsFile, JSON.stringify(inconsistentPendingUploads));
+
+  const rejectedInconsistentApproval = await mutate(`/approve/${encodeURIComponent(inconsistentHistoryName)}?folderId=root`, "POST", {});
+  assert.equal(rejectedInconsistentApproval.status, 503, rejectedInconsistentApproval.body, "inconsistent version history fails closed");
+  assert.deepEqual(fs.readFileSync(inconsistentHistoryCurrentPath), inconsistentHistoryCurrentBytes, "fail-closed approval preserves the current file before any commit stage");
+  assert.equal(fs.existsSync(path.join(directory, "uploads", `${inconsistentHistoryName}.v2`)), false, "inconsistent history is rejected before archiving the current file");
+  assert.deepEqual(fs.readFileSync(approvalRaceVersionsPath), Buffer.from(JSON.stringify(inconsistentVersions)), "fail-closed approval leaves version metadata unchanged");
+
+  const firstApprovalCrashName = "approve-first-crash.txt";
+  const firstApprovalCurrentPath = path.join(directory, "uploads", firstApprovalCrashName);
+  const firstApprovalPendingPath = path.join(directory, "temp", firstApprovalCrashName);
+  const firstApprovalBytes = Buffer.from("first approval installed before its version history");
+  fs.writeFileSync(firstApprovalPendingPath, firstApprovalBytes);
+  OBJECTS.set(`rootark/temp/root/${firstApprovalCrashName}`, firstApprovalBytes);
+  const firstApprovalPendingUploads = JSON.parse(fs.readFileSync(pendingUploadsFile, "utf8"));
+  firstApprovalPendingUploads[`root/${firstApprovalCrashName}`] = { folderId: "root", fileName: firstApprovalCrashName, uploadedBy: "viewer" };
+  fs.writeFileSync(pendingUploadsFile, JSON.stringify(firstApprovalPendingUploads));
+
+  await stop(child);
+  child = startChild(port, {
+    ROOTARK_TEST_CRASH_INSTALL_DESTINATION: firstApprovalCurrentPath,
+  });
+  assert.equal((await waitForServer(port, child)).status, 200);
+  const firstApprovalCrashExit = new Promise((resolve) => child.once("exit", resolve));
+  const interruptedFirstApproval = mutate(`/approve/${encodeURIComponent(firstApprovalCrashName)}?folderId=root`, "POST", {}).catch((error) => error);
+  const firstApprovalCrashCode = await Promise.race([
+    firstApprovalCrashExit,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("first approval did not crash after installing the current file")), 8000)),
+  ]);
+  assert.equal(firstApprovalCrashCode, 92, "injected process crash occurs after first current-file installation and before history creation");
+  assert.ok(await interruptedFirstApproval instanceof Error, "the interrupted first approval does not return a success response");
+
+  child = startChild(port);
+  await waitForServer(port, child);
+  const retriedFirstApproval = await mutate(`/approve/${encodeURIComponent(firstApprovalCrashName)}?folderId=root`, "POST", {});
+  assert.equal(retriedFirstApproval.status, 200, retriedFirstApproval.body, "first approval retry recovers after the process exits before history creation");
+  assert.deepEqual(fs.readFileSync(firstApprovalCurrentPath), firstApprovalBytes, "recovery retains the first approved bytes");
+  const recoveredFirstHistory = JSON.parse(fs.readFileSync(approvalRaceVersionsPath, "utf8"))[`root/${firstApprovalCrashName}`];
+  assert.equal(recoveredFirstHistory.currentVersion, 1, "first approval recovery creates exactly version 1");
+  assert.equal(recoveredFirstHistory.versions.length, 1, "first approval recovery does not create a duplicate version");
+  assert.equal(JSON.parse(fs.readFileSync(pendingUploadsFile, "utf8"))[`root/${firstApprovalCrashName}`], undefined, "successful first-approval recovery clears pending metadata");
+
+  const crashApprovalName = "approve-crash-window.txt";
+  const crashApprovalCurrentPath = path.join(directory, "uploads", crashApprovalName);
+  const crashApprovalPendingPath = path.join(directory, "temp", crashApprovalName);
+  const crashApprovalOriginalBytes = Buffer.from("prior approved version that must survive restart");
+  const crashApprovalReplacementBytes = Buffer.from("replacement approved before history commit");
+  fs.writeFileSync(crashApprovalCurrentPath, crashApprovalOriginalBytes);
+  fs.writeFileSync(crashApprovalPendingPath, crashApprovalReplacementBytes);
+  OBJECTS.set(`rootark/temp/root/${crashApprovalName}`, crashApprovalReplacementBytes);
+  const crashApprovalPermissions = JSON.parse(fs.readFileSync(path.join(dataDir, "file-permissions.json"), "utf8"));
+  crashApprovalPermissions[`root/${crashApprovalName}`] = { public: false, owner: "viewer", users: {} };
+  fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify(crashApprovalPermissions));
+  const crashApprovalVersions = JSON.parse(fs.readFileSync(approvalRaceVersionsPath, "utf8"));
+  crashApprovalVersions[`root/${crashApprovalName}`] = {
+    currentVersion: 1,
+    versions: [{ version: 1, storedAs: crashApprovalName, size: crashApprovalOriginalBytes.length }],
+  };
+  fs.writeFileSync(approvalRaceVersionsPath, JSON.stringify(crashApprovalVersions));
+  const crashApprovalPendingUploads = JSON.parse(fs.readFileSync(pendingUploadsFile, "utf8"));
+  crashApprovalPendingUploads[`root/${crashApprovalName}`] = { folderId: "root", fileName: crashApprovalName, uploadedBy: "viewer" };
+  fs.writeFileSync(pendingUploadsFile, JSON.stringify(crashApprovalPendingUploads));
+
+  await stop(child);
+  child = startChild(port, {
+    ROOTARK_TEST_CRASH_INSTALL_DESTINATION: crashApprovalCurrentPath,
+  });
+  assert.equal((await waitForServer(port, child)).status, 200);
+  const crashExit = new Promise((resolve) => child.once("exit", resolve));
+  const interruptedApproval = mutate(`/approve/${encodeURIComponent(crashApprovalName)}?folderId=root`, "POST", {}).catch((error) => error);
+  const crashCode = await Promise.race([
+    crashExit,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("approval did not crash after replacing the current file")), 8000)),
+  ]);
+  assert.equal(crashCode, 92, "injected process crash occurs after current-file replacement and before version-history persistence");
+  assert.ok(await interruptedApproval instanceof Error, "the interrupted approval does not return a success response");
+
+  child = startChild();
+  await waitForServer(port, child);
+  const retriedCrashApproval = await mutate(`/approve/${encodeURIComponent(crashApprovalName)}?folderId=root`, "POST", {});
+  assert.equal(retriedCrashApproval.status, 200, retriedCrashApproval.body, "approval retry recovers after the process exits in the local replacement window");
+
+  const archiveCrashName = "approve-archive-crash.txt";
+  const archiveCrashCurrentPath = path.join(directory, "uploads", archiveCrashName);
+  const archiveCrashPendingPath = path.join(directory, "temp", archiveCrashName);
+  const archiveCrashVersionPath = path.join(directory, "uploads", `${archiveCrashName}.v1`);
+  const archiveCrashOriginalBytes = Buffer.from("previous current bytes archived before crash");
+  const archiveCrashReplacementBytes = Buffer.from("pending bytes awaiting current install");
+  fs.writeFileSync(archiveCrashCurrentPath, archiveCrashOriginalBytes);
+  fs.writeFileSync(archiveCrashPendingPath, archiveCrashReplacementBytes);
+  OBJECTS.set(`rootark/temp/root/${archiveCrashName}`, archiveCrashReplacementBytes);
+  const archiveCrashPermissions = JSON.parse(fs.readFileSync(path.join(dataDir, "file-permissions.json"), "utf8"));
+  archiveCrashPermissions[`root/${archiveCrashName}`] = { public: false, owner: "viewer", users: {} };
+  fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify(archiveCrashPermissions));
+  const archiveCrashVersions = JSON.parse(fs.readFileSync(approvalRaceVersionsPath, "utf8"));
+  archiveCrashVersions[`root/${archiveCrashName}`] = {
+    currentVersion: 1,
+    versions: [{ version: 1, storedAs: archiveCrashName, size: archiveCrashOriginalBytes.length }],
+  };
+  fs.writeFileSync(approvalRaceVersionsPath, JSON.stringify(archiveCrashVersions));
+  const archiveCrashPendingUploads = JSON.parse(fs.readFileSync(pendingUploadsFile, "utf8"));
+  archiveCrashPendingUploads[`root/${archiveCrashName}`] = { folderId: "root", fileName: archiveCrashName, uploadedBy: "viewer" };
+  fs.writeFileSync(pendingUploadsFile, JSON.stringify(archiveCrashPendingUploads));
+
+  await stop(child);
+  child = startChild(port, {
+    ROOTARK_TEST_CRASH_RENAME_SYNC_SOURCE: archiveCrashCurrentPath,
+    ROOTARK_TEST_CRASH_RENAME_SYNC_DESTINATION: archiveCrashVersionPath,
+  });
+  assert.equal((await waitForServer(port, child)).status, 200);
+  const archiveCrashExit = new Promise((resolve) => child.once("exit", resolve));
+  const interruptedArchiveApproval = mutate(`/approve/${encodeURIComponent(archiveCrashName)}?folderId=root`, "POST", {}).catch((error) => error);
+  const archiveCrashCode = await Promise.race([
+    archiveCrashExit,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("approval did not crash after archiving the current file")), 8000)),
+  ]);
+  assert.equal(archiveCrashCode, 90, "injected process crash occurs after currentPath is renamed to its archive and before pending bytes are copied");
+  assert.ok(await interruptedArchiveApproval instanceof Error, "the interrupted archive-stage approval does not return a success response");
+
+  child = startChild();
+  await waitForServer(port, child);
+  const retriedArchiveApproval = await mutate(`/approve/${encodeURIComponent(archiveCrashName)}?folderId=root`, "POST", {});
+  assert.equal(retriedArchiveApproval.status, 200, retriedArchiveApproval.body, "approval retry recovers after the archived-current process crash");
+  assert.deepEqual(fs.readFileSync(archiveCrashCurrentPath), archiveCrashReplacementBytes, "recovery installs the pending bytes as current");
+  assert.deepEqual(fs.readFileSync(archiveCrashVersionPath), archiveCrashOriginalBytes, "recovery preserves the archived prior current bytes");
+  const recoveredArchiveHistory = JSON.parse(fs.readFileSync(approvalRaceVersionsPath, "utf8"))[`root/${archiveCrashName}`];
+  assert.equal(recoveredArchiveHistory.currentVersion, 2, "recovery advances history exactly once");
+  assert.deepEqual(recoveredArchiveHistory.versions.map((version) => version.storedAs), [`${archiveCrashName}.v1`, archiveCrashName]);
+  assert.equal(JSON.parse(fs.readFileSync(pendingUploadsFile, "utf8"))[`root/${archiveCrashName}`], undefined, "successful recovery clears the pending approval entry");
+
+  const partialCopyCrashName = "approve-partial-copy-crash.txt";
+  const partialCopyCurrentPath = path.join(directory, "uploads", partialCopyCrashName);
+  const partialCopyPendingPath = path.join(directory, "temp", partialCopyCrashName);
+  const partialCopyOriginalBytes = Buffer.from("previous approved bytes preserved by archive");
+  const partialCopyReplacementBytes = Buffer.from("replacement bytes must be restored after a partial copy");
+  fs.writeFileSync(partialCopyCurrentPath, partialCopyOriginalBytes);
+  fs.writeFileSync(partialCopyPendingPath, partialCopyReplacementBytes);
+  OBJECTS.set(`rootark/temp/root/${partialCopyCrashName}`, partialCopyReplacementBytes);
+  const partialCopyPermissions = JSON.parse(fs.readFileSync(path.join(dataDir, "file-permissions.json"), "utf8"));
+  partialCopyPermissions[`root/${partialCopyCrashName}`] = { public: false, owner: "viewer", users: {} };
+  fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify(partialCopyPermissions));
+  const partialCopyVersions = JSON.parse(fs.readFileSync(approvalRaceVersionsPath, "utf8"));
+  partialCopyVersions[`root/${partialCopyCrashName}`] = {
+    currentVersion: 1,
+    versions: [{ version: 1, storedAs: partialCopyCrashName, size: partialCopyOriginalBytes.length }],
+  };
+  fs.writeFileSync(approvalRaceVersionsPath, JSON.stringify(partialCopyVersions));
+  const partialCopyPendingUploads = JSON.parse(fs.readFileSync(pendingUploadsFile, "utf8"));
+  partialCopyPendingUploads[`root/${partialCopyCrashName}`] = { folderId: "root", fileName: partialCopyCrashName, uploadedBy: "viewer" };
+  fs.writeFileSync(pendingUploadsFile, JSON.stringify(partialCopyPendingUploads));
+
+  await stop(child);
+  child = startChild(port, {
+    ROOTARK_TEST_CRASH_PARTIAL_COPY_SOURCE: partialCopyPendingPath,
+    ROOTARK_TEST_CRASH_PARTIAL_COPY_DESTINATION_PREFIX: path.join(directory, "uploads"),
+  });
+  assert.equal((await waitForServer(port, child)).status, 200);
+  const partialCopyCrashExit = new Promise((resolve) => child.once("exit", resolve));
+  const interruptedPartialCopyApproval = mutate(`/approve/${encodeURIComponent(partialCopyCrashName)}?folderId=root`, "POST", {}).catch((error) => error);
+  const partialCopyCrashCode = await Promise.race([
+    partialCopyCrashExit,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("approval did not crash during the partial current-file write")), 8000)),
+  ]);
+  assert.equal(partialCopyCrashCode, 91, "injected process crash leaves only a partial replacement write");
+  assert.ok(await interruptedPartialCopyApproval instanceof Error, "the interrupted partial-copy approval does not return success");
+  assert.equal(fs.existsSync(partialCopyCurrentPath), false, "partial staging never replaces or exposes the current-file path");
+  const partialCopyStagingDirectory = path.join(directory, "uploads", ".rootark-approval-staging");
+  assert.equal(fs.readdirSync(partialCopyStagingDirectory).length, 1, "restart recovery has one disposable partial stage to validate");
+
+  child = startChild(port);
+  await waitForServer(port, child);
+  const retriedPartialCopyApproval = await mutate(`/approve/${encodeURIComponent(partialCopyCrashName)}?folderId=root`, "POST", {});
+  assert.equal(retriedPartialCopyApproval.status, 200, retriedPartialCopyApproval.body, "retry recovers after a process crash during replacement copy");
+  assert.deepEqual(fs.readFileSync(partialCopyCurrentPath), partialCopyReplacementBytes, "retry restores the exact pending replacement bytes");
+  assert.deepEqual(fs.readFileSync(path.join(directory, "uploads", `${partialCopyCrashName}.v1`)), partialCopyOriginalBytes, "retry preserves the previous version archive");
+  const recoveredPartialCopyHistory = JSON.parse(fs.readFileSync(approvalRaceVersionsPath, "utf8"))[`root/${partialCopyCrashName}`];
+  assert.equal(recoveredPartialCopyHistory.currentVersion, 2, "partial-copy recovery advances version history exactly once");
+  assert.deepEqual(recoveredPartialCopyHistory.versions.map((version) => version.storedAs), [`${partialCopyCrashName}.v1`, partialCopyCrashName]);
+  assert.equal(JSON.parse(fs.readFileSync(pendingUploadsFile, "utf8"))[`root/${partialCopyCrashName}`], undefined, "successful partial-copy recovery clears the pending entry");
+  assert.equal(fs.readdirSync(partialCopyStagingDirectory).length, 0, "successful retry consumes the staged replacement");
+
+  assert.deepEqual(
+    fs.readFileSync(path.join(directory, "uploads", `${crashApprovalName}.v1`)),
+    crashApprovalOriginalBytes,
+    "crash recovery keeps the previously approved version instead of overwriting it with the stranded replacement",
+  );
+  const recoveredCrashHistory = JSON.parse(fs.readFileSync(approvalRaceVersionsPath, "utf8"))[`root/${crashApprovalName}`];
+  assert.equal(recoveredCrashHistory.currentVersion, 2, "retry records one replacement version after recovery");
+  assert.deepEqual(recoveredCrashHistory.versions.map((version) => version.storedAs), [`${crashApprovalName}.v1`, crashApprovalName]);
+  assert.equal(JSON.parse(fs.readFileSync(pendingUploadsFile, "utf8"))[`root/${crashApprovalName}`], undefined, "successful crash recovery clears the pending retry marker");
 
   const versionMutationRaceName = "v-lock.txt";
   const versionMutationRaceTarget = "v-renamed.txt";
