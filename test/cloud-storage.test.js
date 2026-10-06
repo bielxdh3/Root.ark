@@ -35,10 +35,15 @@ test("S3 uses the expected bucket/key and paginates listings", async () => {
   const calls = [];
   const storage = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket" }, createS3Client: async () => ({ send: async (command) => {
     calls.push(command.input);
-    if (command.constructor.name === "ListObjectsV2Command") return calls.filter((call) => call.Prefix).length === 1 ? { Contents: [{ Key: "rootark/uploads/folder/a.txt" }], NextContinuationToken: "next" } : { Contents: [{ Key: "rootark/uploads/folder/b.txt" }] };
+    if (command.constructor.name === "ListObjectsV2Command") return calls.filter((call) => call.Prefix).length === 1
+      ? { Contents: [{ Key: "rootark/uploads/folder/a.txt", Size: 5, LastModified: new Date("2026-10-01T00:00:00.000Z") }, { Key: "rootark/uploads/folder/nested/hidden.txt", Size: 6 }], NextContinuationToken: "next" }
+      : { Contents: [{ Key: "rootark/uploads/folder/b.txt", Size: 7 }] };
     return {};
   } }) });
-  assert.deepEqual(await storage.list("folder"), [{ name: "a.txt", key: "rootark/uploads/folder/a.txt" }, { name: "b.txt", key: "rootark/uploads/folder/b.txt" }]);
+  assert.deepEqual(await storage.list("folder"), [
+    { name: "a.txt", key: "rootark/uploads/folder/a.txt", size: 5, modifiedAt: "2026-10-01T00:00:00.000Z", uploadedAt: "2026-10-01T00:00:00.000Z" },
+    { name: "b.txt", key: "rootark/uploads/folder/b.txt", size: 7 },
+  ]);
   assert.deepEqual(calls[0], { Bucket: "bucket", Prefix: "rootark/uploads/folder/", ContinuationToken: undefined });
 });
 
@@ -170,11 +175,23 @@ test("Google Drive lists and deletes every paginated prefix entry", async () => 
   let page = 0;
   const deleted = [];
   const drive = { files: { list: async ({ fields }) => {
-    if (fields.includes("appProperties")) return { data: { files: [{ id: "a", name: "a", appProperties: { rootArkKey: "rootark/uploads/root/a" } }], nextPageToken: page++ ? undefined : "next" } };
+    if (fields.includes("appProperties")) {
+      const files = page++ === 0
+        ? [
+          { id: "a", parents: ["parent"], appProperties: { rootArkKey: "rootark/uploads/root/a", rootArkFolderId: "root", rootArkArea: "uploads" }, size: "4", createdTime: "2026-10-01T00:00:00.000Z" },
+          { id: "foreign-parent", parents: ["elsewhere"], appProperties: { rootArkKey: "rootark/uploads/root/foreign-parent", rootArkFolderId: "root", rootArkArea: "uploads" } },
+          { id: "wrong-key", parents: ["parent"], appProperties: { rootArkKey: "outside/uploads/root/wrong-key", rootArkFolderId: "root", rootArkArea: "uploads" } },
+        ]
+        : [{ id: "b", parents: ["parent"], appProperties: { rootArkKey: "rootark/uploads/root/b", rootArkFolderId: "root", rootArkArea: "uploads" } }];
+      return { data: { files, nextPageToken: page === 1 ? "next" : undefined } };
+    }
     return { data: { files: [{ id: "a" }, { id: "b" }], nextPageToken: page++ ? undefined : "next" } };
   }, delete: async ({ fileId }) => deleted.push(fileId) } };
   const storage = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "parent" }, createGoogleDriveClient: async () => drive });
-  assert.equal((await storage.list("root")).length, 2);
+  assert.deepEqual(await storage.list("root"), [
+    { name: "a", id: "a", key: "rootark/uploads/root/a", size: 4, uploadedAt: "2026-10-01T00:00:00.000Z" },
+    { name: "b", id: "b", key: "rootark/uploads/root/b" },
+  ]);
   page = 0;
   assert.equal(await storage.removePrefix("rootark/uploads/root"), true);
   assert.deepEqual(deleted, ["a", "b", "a", "b"]);

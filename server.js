@@ -1766,9 +1766,9 @@ async function ensureShareFileAvailable(link) {
   const info = getShareFileInfo(link);
   if (!info) return null;
   if (isFileInTrash(info.folderId, info.fileName)) return null;
+  if (getEncryptedFileMetadata(info.folderId, info.fileName)) return null;
   await ensureCloudFileCached(info.folderId, info.fileName, info.filePath, "uploads");
   if (!isExistingFile(info.filePath)) return null;
-  if (getEncryptedFileMetadata(info.folderId, info.fileName)) return null;
   return info;
 }
 
@@ -2247,7 +2247,17 @@ function isStoredVersionFile(folderId, fileName, entries = loadFileVersions()) {
     }
   }
 
-  return false;
+  const suffix = name.match(/\.v\d+$/i);
+  if (!suffix) return false;
+  if (entries[getFileVersionKey(folderId, name)]) return false;
+
+  const permissions = loadFilePermissions();
+  if (getFilePermissionEntry(folderId, name, permissions)) return false;
+  const primaryName = name.slice(0, -suffix[0].length);
+  return Boolean(
+    getFilePermissionEntry(folderId, primaryName, permissions) ||
+    entries[getFileVersionKey(folderId, primaryName)]
+  );
 }
 
 function removeFileVersions(folderId, fileName) {
@@ -3925,6 +3935,39 @@ function listFilesWithDetailsAsync(directory) {
   });
 }
 
+async function listFilesWithCloudDetails(directory, folderId, area = "uploads") {
+  const files = await listFilesWithDetailsAsync(directory);
+  if (!isCloudStorageEnabled()) return files;
+
+  try {
+    const localNames = new Set(files.map((file) => file.name));
+    const cloudFiles = await listCloudFiles(folderId, area);
+    for (const cloudFile of cloudFiles) {
+      const name = path.basename(String(cloudFile.name || ""));
+      if (!name || name !== cloudFile.name || localNames.has(name)) continue;
+      const size = Number(cloudFile.size);
+      const modifiedAt = cloudFile.modifiedAt || cloudFile.uploadedAt || null;
+      files.push({
+        name,
+        size: Number.isFinite(size) ? size : 0,
+        uploadedAt: cloudFile.uploadedAt || modifiedAt,
+        modifiedAt,
+      });
+      localNames.add(name);
+    }
+  } catch (error) {
+    console.error("[cloud-storage] list metadata failed:", sanitizeLogValue(error.message));
+  }
+
+  return files;
+}
+
+async function getListedFileDetails(folder, fileName) {
+  if (isStoredVersionFile(folder.id, fileName)) return null;
+  const files = await listFilesWithCloudDetails(folder.uploadDir, folder.id, "uploads");
+  return files.find((file) => file.name === fileName) || null;
+}
+
 function getDirectorySize(directory) {
   if (!fs.existsSync(directory)) return 0;
 
@@ -4315,7 +4358,7 @@ function isWebDavEncryptedFile(folderId, fileName) {
 
 function isWebDavInternalStoredFile(folderId, fileName) {
   const name = path.basename(fileName || "");
-  return isStoredVersionFile(folderId, name) || /\.v\d+$/i.test(name);
+  return isStoredVersionFile(folderId, name);
 }
 
 async function deleteCloudTrashItem(item) {
@@ -4706,7 +4749,7 @@ app.delete("/users/:username", authenticate, requirePermission("manageUsers"), (
   res.json({ message: "Usuario excluido" });
 });
 
-app.get("/file-access", authenticate, (req, res) => {
+app.get("/file-access", authenticate, async (req, res) => {
   const rawName = typeof req.query.name === "string" ? req.query.name.trim() : "";
   const name = path.basename(rawName);
   const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
@@ -4716,13 +4759,11 @@ app.get("/file-access", authenticate, (req, res) => {
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
 
-  const filePath = path.join(folder.uploadDir, name);
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
-
   if (!canManageAccess(req) && !hasFileEditAccess(req, folder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+  }
+  if (!await getListedFileDetails(folder, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
   const entry = getFilePermissionEntry(folder.id, name);
@@ -4741,7 +4782,7 @@ app.get("/file-access", authenticate, (req, res) => {
   });
 });
 
-app.put("/file-access", authenticate, (req, res) => {
+app.put("/file-access", authenticate, async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const folder = getAccessibleFolderOrRespond(req, res, req.body.folderId);
@@ -4751,13 +4792,11 @@ app.put("/file-access", authenticate, (req, res) => {
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
 
-  const filePath = path.join(folder.uploadDir, name);
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
-
   if (!canManageAccess(req) && !hasFileEditAccess(req, folder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+  }
+  if (!await getListedFileDetails(folder, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
   const eligibleUsers = getFolderEligibleUsers(folder);
@@ -5231,13 +5270,11 @@ app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req
   if (!folder) return;
 
   const name = path.basename(req.params.name);
+  if (isStoredVersionFile(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
   if (isFileInTrash(folder.id, name)) {
     return res.status(410).json({ error: "Arquivo esta na lixeira" });
-  }
-  const filePath = path.join(folder.uploadDir, name);
-  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
   if (!hasFileAccess(req, folder, name)) {
@@ -5250,6 +5287,12 @@ app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req
 
   if (getEncryptedFileMetadata(folder.id, name)) {
     return res.status(403).json({ error: "Use a rota de download criptografado para este arquivo" });
+  }
+
+  const filePath = path.join(folder.uploadDir, name);
+  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
+  if (!isExistingFile(filePath)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
   logAnalyticsEvent("download", {
@@ -5275,14 +5318,11 @@ app.post("/file-open-token", authenticate, requirePermission("listFiles"), async
   if (!rawName || name !== rawName) {
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
+  if (isStoredVersionFile(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
   if (isFileInTrash(folder.id, name)) {
     return res.status(410).json({ error: "Arquivo esta na lixeira" });
-  }
-
-  const filePath = path.join(folder.uploadDir, name);
-  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
   if (!hasFileAccess(req, folder, name)) {
@@ -5291,6 +5331,12 @@ app.post("/file-open-token", authenticate, requirePermission("listFiles"), async
 
   if (getEncryptedFileMetadata(folder.id, name)) {
     return res.status(403).json({ error: "Arquivo criptografado. Use Download para informar a senha quando necessario." });
+  }
+
+  const filePath = path.join(folder.uploadDir, name);
+  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
+  if (!isExistingFile(filePath)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
   const openToken = createOpenFileToken(folder.id, name);
@@ -6087,7 +6133,7 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
   }));
 });
 
-app.put("/file-temporary", authenticate, (req, res) => {
+app.put("/file-temporary", authenticate, async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const folder = getAccessibleFolderOrRespond(req, res, req.body.folderId);
@@ -6101,8 +6147,7 @@ app.put("/file-temporary", authenticate, (req, res) => {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
 
-  const filePath = path.join(folder.uploadDir, name);
-  if (!isExistingFile(filePath)) {
+  if (!await getListedFileDetails(folder, name)) {
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
@@ -6198,8 +6243,7 @@ function buildVisibleFileEntry(req, folder, file, caches = getFileListCaches()) 
 }
 
 async function listVisibleFilesForFolder(req, folder, caches = getFileListCaches()) {
-  await syncFolderCacheFromCloud(folder.id, "uploads");
-  const files = await listFilesWithDetailsAsync(folder.uploadDir);
+  const files = await listFilesWithCloudDetails(folder.uploadDir, folder.id, "uploads");
   return files
     .map((file) => buildVisibleFileEntry(req, folder, file, caches))
     .filter(Boolean);
@@ -7508,16 +7552,16 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
 
+  if (getEncryptedFileMetadata(folder.id, name)) {
+    return res.status(403).json({ error: "Download de versoes criptografadas exige a versao atual da rota segura" });
+  }
+
   const target = getVersionFilePath(folder, name, versionNumber);
   if (target?.version?.storedAs) {
     await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads");
   }
   if (!target || !isExistingFile(target.filePath)) {
     return res.status(404).json({ error: "Versao nao encontrada" });
-  }
-
-  if (getEncryptedFileMetadata(folder.id, name)) {
-    return res.status(403).json({ error: "Download de versoes criptografadas exige a versao atual da rota segura" });
   }
 
   sendOptimizedFile(req, res, target.filePath, name, "attachment");
@@ -7536,6 +7580,10 @@ app.post("/version-open-token", authenticate, requirePermission("listFiles"), as
 
   if (!hasFileAccess(req, folder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  }
+
+  if (getEncryptedFileMetadata(folder.id, name)) {
+    return res.status(403).json({ error: "Download de versoes criptografadas exige a versao atual da rota segura" });
   }
 
   const target = getVersionFilePath(folder, name, versionNumber);
@@ -7768,7 +7816,7 @@ registerTrashRoutes(app, {
   trashService,
 });
 
-app.post("/share", authenticate, requirePermission("listFiles"), (req, res) => {
+app.post("/share", authenticate, requirePermission("listFiles"), async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const expiresInMinutes = getShareExpirationMinutes(req.body.expiresInMinutes);
@@ -7808,17 +7856,15 @@ app.post("/share", authenticate, requirePermission("listFiles"), (req, res) => {
     return res.status(400).json({ error: "Senha do link deve ter entre 4 e 128 caracteres." });
   }
 
-  const filePath = path.join(folder.uploadDir, name);
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
-
   if (!hasFileAccess(req, folder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
 
   if (getEncryptedFileMetadata(folder.id, name)) {
     return res.status(403).json({ error: "Links publicos nao estao disponiveis para arquivos criptografados" });
+  }
+  if (!await getListedFileDetails(folder, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
   const links = cleanupExpiredPublicLinks();

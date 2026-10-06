@@ -145,8 +145,54 @@ function createCloudStorage(options = {}) {
   }
   async function list(folderId, area = "uploads") {
     assertProvider(); if (!enabled()) return []; const prefixKey = `${key(folderId, "", area)}/`; const files = [];
-    if (provider === "s3") { const bucketName = bucket(); let token; do { const page = await (await s3()).send(new (require("@aws-sdk/client-s3").ListObjectsV2Command)({ Bucket: bucketName, Prefix: prefixKey, ContinuationToken: token })); for (const item of page.Contents || []) { const name = path.posix.basename(item.Key || ""); if (name) files.push({ name, key: item.Key }); } token = page.NextContinuationToken; } while (token); return files; }
-    let token; do { const page = await (await drive()).files.list({ q: `appProperties has { key='rootArkFolderId' and value='${escapeQuery(folderId || rootFolderId)}' } and appProperties has { key='rootArkArea' and value='${escapeQuery(area)}' } and trashed=false`, fields: "nextPageToken,files(id,name,appProperties)", spaces: "drive", pageToken: token, pageSize: 100 }); for (const file of page.data.files || []) { const cloudKey = file.appProperties?.rootArkKey || ""; const name = path.posix.basename(cloudKey) || path.basename(file.name || ""); if (name) files.push({ name, id: file.id, key: cloudKey }); } token = page.data.nextPageToken; } while (token); return files;
+    if (provider === "s3") {
+      const bucketName = bucket(); let token;
+      do {
+        const page = await (await s3()).send(new (require("@aws-sdk/client-s3").ListObjectsV2Command)({ Bucket: bucketName, Prefix: prefixKey, ContinuationToken: token }));
+        for (const item of page.Contents || []) {
+          const objectKey = String(item.Key || "");
+          if (!objectKey.startsWith(prefixKey)) continue;
+          const name = objectKey.slice(prefixKey.length);
+          if (!name || name.includes("/") || name === "." || name === "..") continue;
+          const entry = { name, key: objectKey };
+          if (Number.isFinite(item.Size)) entry.size = item.Size;
+          if (item.LastModified instanceof Date && Number.isFinite(item.LastModified.getTime())) {
+            entry.modifiedAt = item.LastModified.toISOString();
+            entry.uploadedAt = entry.modifiedAt;
+          }
+          files.push(entry);
+        }
+        token = page.NextContinuationToken;
+      } while (token);
+      return files;
+    }
+    let token;
+    do {
+      const page = await (await drive()).files.list({
+        q: `appProperties has { key='rootArkFolderId' and value='${escapeQuery(folderId || rootFolderId)}' } and appProperties has { key='rootArkArea' and value='${escapeQuery(area)}' } and trashed=false`,
+        fields: "nextPageToken,files(id,name,size,createdTime,modifiedTime,parents,appProperties)",
+        spaces: "drive",
+        pageToken: token,
+        pageSize: 100,
+      });
+      for (const file of page.data.files || []) {
+        const properties = file.appProperties || {};
+        const cloudKey = String(properties.rootArkKey || "");
+        const name = path.posix.basename(cloudKey);
+        if (!name || cloudKey !== key(folderId, name, area)
+          || String(properties.rootArkFolderId || "") !== String(folderId || rootFolderId)
+          || String(properties.rootArkArea || "") !== String(area)
+          || !file.id || !Array.isArray(file.parents) || !file.parents.includes(folder())) continue;
+        const entry = { name, id: file.id, key: cloudKey };
+        const size = Number(file.size);
+        if (Number.isFinite(size)) entry.size = size;
+        if (typeof file.createdTime === "string") entry.uploadedAt = file.createdTime;
+        if (typeof file.modifiedTime === "string") entry.modifiedAt = file.modifiedTime;
+        files.push(entry);
+      }
+      token = page.data.nextPageToken;
+    } while (token);
+    return files;
   }
   const run = async (operation, ...args) => {
     try { return await operation(...args); } catch (error) { throw classify(error); }
