@@ -29,7 +29,7 @@ function request(port, requestPath, method = "GET", headers = {}) {
     const req = http.request({ host: "127.0.0.1", port, path: requestPath, method, headers }, (res) => {
       let body = "";
       res.on("data", (chunk) => { body += chunk; });
-      res.on("end", () => resolve({ status: res.statusCode, body }));
+      res.on("end", () => resolve({ status: res.statusCode, body, headers: res.headers }));
     });
     req.setTimeout(TIMEOUT_MS, () => req.destroy(new Error("request timed out")));
     req.once("error", reject);
@@ -70,7 +70,7 @@ test("public-share audit logs correlate by token digest without storing the bear
       views: 0,
       maxViews: 0,
       downloads: 0,
-      maxDownloads: 0,
+      maxDownloads: 1,
       viewers: {},
     },
   }));
@@ -82,6 +82,8 @@ test("public-share audit logs correlate by token digest without storing the bear
       PORT: String(port),
       DB_ENABLED: "false",
       CLOUD_STORAGE_PROVIDER: "local",
+      NODE_ENV: "test",
+      ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true",
       JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
     },
     stdio: "ignore",
@@ -100,12 +102,66 @@ test("public-share audit logs correlate by token digest without storing the bear
   });
 
   assert.equal((await waitForServer(port)).status, 200);
-  const shareHeaders = {
+  const sharePage = await request(port, `/share/${token}`);
+  assert.equal(sharePage.status, 200);
+  assert.match(sharePage.body, /<label[^>]*for="sharePassword">Senha do link<\/label>/, "the password field retains its visible label while users type");
+  assert.match(sharePage.body, /<form id="sharePasswordForm">[\s\S]*<input type="password" id="sharePassword"[^>]*aria-label="Senha do link"/);
+  assert.match(sharePage.body, /passwordForm\.addEventListener\("submit"/);
+  const expiredPageToken = crypto.randomBytes(24).toString("hex");
+  const expiredFileToken = crypto.randomBytes(24).toString("hex");
+  const publicLinksPath = path.join(dataDir, "public-links.json");
+  fs.writeFileSync(publicLinksPath, JSON.stringify({
+    [token]: JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[token],
+    [expiredPageToken]: { folderId: "root", fileName, expiresAt: new Date(Date.now() - 60_000).toISOString(), views: 0, downloads: 0, activeViewers: {} },
+    [expiredFileToken]: { folderId: "root", fileName, expiresAt: new Date(Date.now() - 60_000).toISOString(), views: 0, downloads: 0, activeViewers: {} },
+  }));
+  const expiredPage = await request(port, `/share/${expiredPageToken}`);
+  assert.equal(expiredPage.status, 410);
+  assert.ok(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[expiredPageToken], "expired-link navigation does not persist cleanup");
+  const expiredFile = await request(port, `/share/${expiredFileToken}/file`);
+  assert.equal(expiredFile.status, 410);
+  assert.ok(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[expiredFileToken], "expired-file GET does not persist cleanup");
+
+  const requestHeaders = {
     "user-agent": `audit-client-${token}`,
     "x-forwarded-for": `${token.toUpperCase()}, 198.51.100.8`,
   };
+  const shareHeaders = { ...requestHeaders, origin: `http://127.0.0.1:${port}` };
+  assert.equal((await request(port, `/share/${token}/view`, "POST", requestHeaders)).status, 403, "missing Origin cannot consume a share view");
+  assert.equal((await request(port, `/share/${token}/password`, "POST", requestHeaders)).status, 403, "missing Origin cannot establish a password/view session");
+  const unchangedAfterMissingOrigin = JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[token];
+  assert.equal(unchangedAfterMissingOrigin.views, 0);
+  assert.equal(unchangedAfterMissingOrigin.downloads, 0);
   assert.equal((await request(port, `/share/${token}/view`, "POST", shareHeaders)).status, 200);
   assert.equal((await request(port, `/share/${token}/view`, "POST", shareHeaders)).status, 200);
+  assert.equal((await request(port, `/share/${token}/view`, "POST", {
+    ...shareHeaders,
+    origin: "https://attacker.example",
+  })).status, 403);
+
+  const legacyDownload = await request(port, `/share/${token}/download`, "GET", shareHeaders);
+  assert.equal(legacyDownload.status, 405);
+  assert.equal(legacyDownload.headers.allow, "POST");
+  const crossOriginDownload = await request(port, `/share/${token}/download`, "POST", {
+    ...shareHeaders,
+    origin: "https://attacker.example",
+  });
+  assert.equal(crossOriginDownload.status, 403);
+  assert.equal((await request(port, `/share/${token}/download`, "POST", requestHeaders)).status, 403, "missing Origin cannot consume a download");
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[token].downloads, 0);
+
+  const download = await request(port, `/share/${token}/download`, "POST", {
+    ...shareHeaders,
+    origin: `http://127.0.0.1:${port}`,
+  });
+  assert.equal(download.status, 200);
+  assert.equal(download.body, "disposable share fixture\n");
+  assert.equal((await request(port, `/share/${token}/download`, "POST", {
+    ...shareHeaders,
+    origin: `http://127.0.0.1:${port}`,
+  })).status, 410);
+  const publicLink = JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"))[token];
+  assert.equal(publicLink.downloads, 1);
 
   const { logs } = JSON.parse(fs.readFileSync(path.join(dataDir, "audit-logs.json"), "utf8"));
   const shareLogs = logs.filter((entry) => entry.eventType.startsWith("share."));
@@ -114,7 +170,7 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.equal(opened.length, 2);
   assert.deepEqual(opened.map((entry) => entry.target.id), [expectedAuditId, expectedAuditId]);
   assert.equal(opened[0].actor.userAgent, `audit-client-[REDACTED]`);
-  assert.equal(opened[0].actor.ip, "[REDACTED]");
+  assert.equal(opened[0].actor.ip, "127.0.0.1", "untrusted forwarding headers do not replace the socket peer");
   const serializedShareLogs = JSON.stringify(shareLogs);
   assert.equal(serializedShareLogs.includes(token), false);
   assert.equal(serializedShareLogs.includes(token.toUpperCase()), false);

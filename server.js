@@ -49,7 +49,8 @@ const registerBackupRoutes = require("./src/routes/backups");
 const registerTrashRoutes = require("./src/routes/trash");
 const { registerSyncRoutes } = require("./src/routes/sync");
 const { registerGroupRoutes } = require("./src/routes/groups");
-const { createAuthenticate, createRealtimeAuthenticator, getExpectedOrigin, parseCookies } = require("./src/middlewares/auth");
+const { createAuthenticate, createRealtimeAuthenticator, getClientIp, getExpectedOrigin, parseCookies } = require("./src/middlewares/auth");
+const { parseTrustedProxies } = require("./src/middlewares/trustedProxies");
 const { createRequirePermission } = require("./src/middlewares/permissions");
 const { validateTotpPolicy } = require("./src/services/totpPolicy");
 const { getDeploymentReadiness, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
@@ -82,6 +83,7 @@ if (JWT_SECRET.length < 32 || JWT_SECRET === "rootark_secret_change_in_productio
 }
 validateTotpPolicy();
 const PORT = Number(process.env.PORT || 3000);
+const TRUSTED_PROXIES = parseTrustedProxies(process.env.TRUSTED_PROXIES);
 const SESSION_COOKIE_OPTIONS = { httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production", path: "/" };
 const USERS_SEED_FILE = "./data/users.json";
 const USERS_FILE = "./data/users.local.json";
@@ -405,6 +407,10 @@ function normalizeUserPermissions(user = {}) {
 }
 
 function getDefaultUsers() {
+  if (!["development", "test"].includes(process.env.NODE_ENV) || process.env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS !== "true") {
+    throw new Error("No users are configured. Provide an explicit user seed or enable local development bootstrap.");
+  }
+
   return [
     {
       username: "admin",
@@ -429,9 +435,20 @@ function loadSeedUsers() {
 
   try {
     const users = JSON.parse(fs.readFileSync(USERS_SEED_FILE, "utf-8"));
-    return Array.isArray(users) && users.length ? users : null;
+    if (!Array.isArray(users) || !users.length) throw new Error("invalid seed");
+    const usernames = new Set();
+    for (const user of users) {
+      if (!user || typeof user !== "object" || Array.isArray(user) || typeof user.username !== "string" || !user.username.trim() || usernames.has(user.username)) {
+        throw new Error("invalid seed user");
+      }
+      usernames.add(user.username);
+      let rounds;
+      try { rounds = bcrypt.getRounds(user.password); } catch { throw new Error("invalid password hash"); }
+      if (!Number.isInteger(rounds) || rounds < 10) throw new Error("password hash is not sufficiently hardened");
+    }
+    return users;
   } catch {
-    return null;
+    throw new Error("The configured user seed is invalid.");
   }
 }
 
@@ -964,23 +981,10 @@ function saveAuditLogs(entries, file = AUDIT_LOGS_FILE) {
 }
 
 function getAuditActor(req, fallbackUsername = "system") {
-  const forwardedFor = String(req?.headers?.["x-forwarded-for"] || "")
-    .split(",")
-    .map((ip) => ip.trim())
-    .filter(Boolean);
-  const rawIp =
-    req?.headers?.["cf-connecting-ip"] ||
-    req?.headers?.["x-real-ip"] ||
-    forwardedFor[0] ||
-    req?.ip ||
-    req?.socket?.remoteAddress ||
-    null;
-  const ip = rawIp === "::1" || rawIp === "::ffff:127.0.0.1" ? "127.0.0.1" : rawIp;
-
   return {
     username: req?.user?.username || fallbackUsername || "system",
     role: req?.user?.role || null,
-    ip,
+    ip: getClientIp(req),
     userAgent: req?.headers?.["user-agent"] || null,
   };
 }
@@ -1279,7 +1283,7 @@ function setSharePasswordCookie(req, res, token) {
   res.cookie(getSharePasswordCookieName(token), "ok", {
     httpOnly: true,
     sameSite: "lax",
-    secure: req.secure || req.get("x-forwarded-proto") === "https",
+    secure: req.secure,
     maxAge: 1000 * 60 * 60,
   });
 }
@@ -1376,7 +1380,7 @@ function setShareViewerCookie(req, res, token, viewerId, expiresAt) {
   res.cookie(`rootark_share_${token}`, viewerId, {
     httpOnly: true,
     sameSite: "lax",
-    secure: req.secure || req.get("x-forwarded-proto") === "https",
+    secure: req.secure,
     maxAge,
   });
 }
@@ -1525,6 +1529,13 @@ function renderPublicSharePage(token) {
         color: white;
       }
 
+      .password-label {
+        display: block;
+        margin-top: 10px;
+        color: var(--muted);
+        font-weight: 700;
+      }
+
       .hidden { display: none !important; }
 
       .preview {
@@ -1591,16 +1602,21 @@ function renderPublicSharePage(token) {
 
         <div id="passwordBox" class="hidden">
           <p>Este link esta protegido. Digite a senha para continuar.</p>
-          <input type="password" id="sharePassword" placeholder="Senha do link" autocomplete="current-password" />
-          <div class="actions">
-            <button type="button" class="primary" id="passwordButton">Acessar</button>
-          </div>
+          <form id="sharePasswordForm">
+            <label class="password-label" for="sharePassword">Senha do link</label>
+            <input type="password" id="sharePassword" placeholder="Digite a senha" aria-label="Senha do link" autocomplete="current-password" />
+            <div class="actions">
+              <button type="submit" class="primary" id="passwordButton">Acessar</button>
+            </div>
+          </form>
         </div>
 
         <div id="contentBox" class="hidden">
           <div class="meta" id="meta"></div>
           <div class="actions">
-            <a class="primary" id="downloadButton" href="/share/${safeToken}/download">Download</a>
+            <form method="post" action="/share/${safeToken}/download">
+              <button class="primary" id="downloadButton" type="submit">Download</button>
+            </form>
             <button type="button" id="previewButton">Preview</button>
             <button type="button" id="copyButton">Copiar link</button>
             <button type="button" id="qrButton">QR Code</button>
@@ -1616,6 +1632,7 @@ function renderPublicSharePage(token) {
       const status = document.getElementById("status");
       const passwordBox = document.getElementById("passwordBox");
       const contentBox = document.getElementById("contentBox");
+      const passwordForm = document.getElementById("sharePasswordForm");
       const passwordInput = document.getElementById("sharePassword");
       const passwordButton = document.getElementById("passwordButton");
       const meta = document.getElementById("meta");
@@ -1675,9 +1692,9 @@ function renderPublicSharePage(token) {
         renderAccess(data);
       }
 
-      passwordButton.addEventListener("click", () => accessShare(passwordInput.value));
-      passwordInput.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") accessShare(passwordInput.value);
+      passwordForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        accessShare(passwordInput.value);
       });
 
       previewButton.addEventListener("click", () => {
@@ -1819,6 +1836,14 @@ function validateShareToken(rawToken) {
   return /^[a-f0-9]{48}$/i.test(token) ? token : "";
 }
 
+function requireSameOriginPublicShareMutation(req, res, next) {
+  const origin = req.headers.origin;
+  if (!origin || origin !== getExpectedOrigin(req, app.get("trust proxy fn"))) {
+    return res.status(403).type("text/plain").send("Origem negada");
+  }
+  return next();
+}
+
 function getShareAccessCookieRequired(link) {
   return hasSharePassword(link) || (Number(link.maxViews) || 0) > 0;
 }
@@ -1830,8 +1855,6 @@ async function resolveShareAccess(req, res, token, options = {}) {
 
   const expiresAt = new Date(link.expiresAt).getTime();
   if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
-    delete links[token];
-    savePublicLinks(links);
     logShareAudit(req, "share.expired", token, link, "expired", "failure");
     return { status: 410, error: "Link indisponivel." };
   }
@@ -1870,9 +1893,6 @@ async function resolveShareAccess(req, res, token, options = {}) {
     link.lastViewedAt = new Date().toISOString();
     link.views = incrementPublicLinkViews(token, link, links);
     logShareAudit(req, "share.opened", token, link, "opened", "success");
-  } else {
-    const cleaned = cleanupShareViewers(link);
-    if (cleaned.changed) savePublicLinks(links);
   }
 
   if (options.countDownload) {
@@ -3791,11 +3811,9 @@ async function findPendingApprovalTarget(req, requestedFolder, fileName) {
 }
 
 function canAccessPendingFile(req, folderId, fileName) {
-  return (
-    req.user?.permissions?.listPending ||
-    getPendingUploadOwner(folderId, fileName) === req.user?.username ||
-    !getPendingUploadOwner(folderId, fileName)
-  );
+  if (req.user?.permissions?.listPending) return true;
+  const owner = getPendingUploadOwner(folderId, fileName);
+  return Boolean(owner && sameUsername(owner, req.user?.username));
 }
 
 function resolveScopedFile(scope, rawName, rawFolderId = ROOT_FOLDER_ID) {
@@ -4423,18 +4441,16 @@ function initData() {
 
   if (!hasUsers) {
     const seedUsers = loadSeedUsers();
+    const seedOptIn = process.env.ROOTARK_BOOTSTRAP_USERS_FROM_SEED === "true";
+    if (seedUsers && process.env.NODE_ENV === "production" && !seedOptIn) throw new Error("Production user seed requires ROOTARK_BOOTSTRAP_USERS_FROM_SEED=true.");
+    if (seedOptIn && !seedUsers) throw new Error("ROOTARK_BOOTSTRAP_USERS_FROM_SEED is enabled but data/users.json is missing or invalid.");
     const users = seedUsers || getDefaultUsers();
-
     saveUsers(users);
-    console.log(
-      seedUsers
-        ? "Usuarios locais restaurados a partir de data/users.json"
-        : "Usuarios padrao criados -> admin:admin123 / user:user123"
-    );
+    console.log(seedUsers ? "User seed imported from data/users.json." : "Explicit local development users created.");
   }
 }
 
-app.set("trust proxy", true);
+app.set("trust proxy", TRUSTED_PROXIES);
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
   if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
@@ -4449,11 +4465,6 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.static("./public"));
-app.use((req, res, next) => {
-  cleanupExpiredTemporaryItems();
-  next();
-});
-
 const loadCurrentUser = (username) => loadUsers().find((user) => user.username === username);
 const authenticate = createAuthenticate({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
 const authenticateRealtimeToken = createRealtimeAuthenticator({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
@@ -4466,7 +4477,7 @@ app.get("/auth/session.js", authenticate, (req, res) => {
 
 wss.on("connection", (socket, req) => {
   const origin = req.headers.origin;
-  const expectedOrigin = getExpectedOrigin(req);
+  const expectedOrigin = getExpectedOrigin(req, app.get("trust proxy fn"));
   const user = origin === expectedOrigin && authenticateRealtimeToken(parseCookies(req.headers.cookie).rootark_session);
 
   if (!user) {
@@ -6149,7 +6160,7 @@ function getFileListCaches() {
     fileExpirations: loadFileExpirations(),
     fileVersions: loadFileVersions(),
     encryptedFiles: loadEncryptedFiles(),
-    publicLinks: cleanupExpiredPublicLinks(),
+    publicLinks: loadPublicLinks(),
   };
 }
 
@@ -7480,7 +7491,7 @@ app.get("/versions/:filename", authenticate, requirePermission("listFiles"), (re
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
 
-  const { history } = ensureVersionHistory(folder, name, normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, name)).owner, "Versao inicial");
+  const history = getVersionHistory(folder.id, name);
   const owner = normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, name)).owner;
   res.json({
     folderId: folder.id,
@@ -7491,6 +7502,20 @@ app.get("/versions/:filename", authenticate, requirePermission("listFiles"), (re
     versions: history.versions.slice().sort((a, b) => b.version - a.version),
     actionHistory: getActionHistoryForFile(folder.id, name),
   });
+});
+
+
+app.post("/versions/:filename/initialize", authenticate, requirePermission("listFiles"), (req, res) => {
+  const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
+  const name = path.basename(rawName);
+  const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
+  if (!folder) return;
+  if (!rawName || name !== rawName) return res.status(400).json({ error: "Nome de arquivo invalido" });
+  if (!hasFileAccess(req, folder, name)) return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  const filePath = path.join(folder.uploadDir, name);
+  if (!isExistingFile(filePath)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  const { history } = ensureVersionHistory(folder, name, normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, name)).owner, "Versao inicial");
+  return res.json({ folderId: folder.id, fileName: name, currentVersion: history.currentVersion });
 });
 
 app.get("/download/:filename/v/:version", authenticate, requirePermission("listFiles"), async (req, res) => {
@@ -7885,15 +7910,13 @@ app.get("/share/:token", (req, res) => {
 
   const expiresAt = new Date(link.expiresAt).getTime();
   if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
-    delete links[shareToken];
-    savePublicLinks(links);
     return res.status(410).type("html").send(getShareFailurePage("Este link nao esta disponivel."));
   }
 
   res.type("html").send(renderPublicSharePage(shareToken));
 });
 
-app.post("/share/:token/password", async (req, res) => {
+app.post("/share/:token/password", requireSameOriginPublicShareMutation, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
 
@@ -7912,7 +7935,7 @@ app.post("/share/:token/password", async (req, res) => {
   res.json(getSharePublicPayload(access.link, access.fileInfo, access.limits));
 });
 
-app.post("/share/:token/view", async (req, res) => {
+app.post("/share/:token/view", requireSameOriginPublicShareMutation, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
 
@@ -7925,7 +7948,9 @@ app.post("/share/:token/view", async (req, res) => {
   });
 });
 
-app.get("/share/:token/download", async (req, res) => {
+app.get("/share/:token/download", (_req, res) => res.setHeader("Allow", "POST").status(405).type("text/plain").send("Metodo nao permitido"));
+
+app.post("/share/:token/download", requireSameOriginPublicShareMutation, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).type("html").send(getShareFailurePage("Este link nao esta disponivel."));
 
@@ -7984,6 +8009,17 @@ app.get("/share/:token/file", async (req, res) => {
   });
 });
 
+app.post("/pending/repair", authenticate, async (req, res) => {
+  if (!req.user?.permissions?.listPending && !req.user?.permissions?.upload) {
+    return res.status(403).json({ error: "Permissao negada: listPending" });
+  }
+  const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
+  if (!folder) return;
+  await repairCompressedTempUploads(folder.tempDir);
+  cleanupOrphanTempUploads(folder.tempDir);
+  return res.json({ message: "Uploads pendentes verificados" });
+});
+
 app.get("/pending", authenticate, async (req, res) => {
   if (!req.user?.permissions?.listPending && !req.user?.permissions?.upload) {
     return res.status(403).json({ error: "Permissao negada: listPending" });
@@ -7992,9 +8028,6 @@ app.get("/pending", authenticate, async (req, res) => {
   const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!folder) return;
 
-  await repairCompressedTempUploads(folder.tempDir);
-  cleanupOrphanTempUploads(folder.tempDir);
-  await syncFolderCacheFromCloud(folder.id, "temp");
   listFilesWithDetails(folder.tempDir, (err, files) => {
     if (err) return res.status(500).json({ error: "Erro ao listar" });
     const encryptedFiles = loadEncryptedFiles();
@@ -8039,7 +8072,8 @@ app.get("/preview/text/:scope/:name", authenticate, async (req, res) => {
   }
 });
 
-app.get("/approve/:name", authenticate, requirePermission("approve"), async (req, res) => {
+app.get("/approve/:name", (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
+app.post("/approve/:name", authenticate, requirePermission("approve"), async (req, res) => {
   const name = path.basename(req.params.name);
   const requestedFolder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!requestedFolder) return;
@@ -8102,7 +8136,8 @@ app.get("/approve/:name", authenticate, requirePermission("approve"), async (req
   }
 });
 
-app.get("/reject/:name", authenticate, requirePermission("approve"), async (req, res) => {
+app.get("/reject/:name", (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
+app.post("/reject/:name", authenticate, requirePermission("approve"), async (req, res) => {
   const name = path.basename(req.params.name);
   const requestedFolder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!requestedFolder) return;
@@ -8138,7 +8173,8 @@ app.get("/reject/:name", authenticate, requirePermission("approve"), async (req,
   });
 });
 
-app.get("/delete/:name", authenticate, (req, res) => {
+app.get("/delete/:name", (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
+app.post("/delete/:name", authenticate, (req, res) => {
   if (!isTrashEnabled()) return res.status(503).json({ error: "Lixeira desativada" });
   const name = path.basename(req.params.name);
   const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
