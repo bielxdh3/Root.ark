@@ -6,6 +6,7 @@ try {
   if (error?.code !== "ENOENT") throw error;
 }
 const express = require("express");
+const { rateLimit } = require("express-rate-limit");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
@@ -63,12 +64,23 @@ function parseBoundedNumber(name, fallback, minimum, maximum) {
   return Number.isFinite(value) && Number.isInteger(value) && value >= minimum && value <= maximum ? value : fallback;
 }
 
+function parsePositiveIntegerEnv(name, fallback, maximum) {
+  if (process.env[name] === undefined) return fallback;
+  const value = Number(process.env[name]);
+  if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+    throw new Error(`${name} deve ser um inteiro positivo menor ou igual a ${maximum}.`);
+  }
+  return value;
+}
+
 const REALTIME_MAX_PAYLOAD_BYTES = parseBoundedNumber("REALTIME_MAX_PAYLOAD_BYTES", 16 * 1024, 1024, 1024 * 1024);
 const REALTIME_MAX_BUFFERED_BYTES = parseBoundedNumber("REALTIME_MAX_BUFFERED_BYTES", 64 * 1024, 1024, 16 * 1024 * 1024);
 const REALTIME_MAX_MESSAGES_PER_WINDOW = parseBoundedNumber("REALTIME_MAX_MESSAGES_PER_WINDOW", 30, 1, 10_000);
 const REALTIME_RATE_WINDOW_MS = parseBoundedNumber("REALTIME_RATE_WINDOW_MS", 10 * 1000, 1000, 10 * 60 * 1000);
 const REALTIME_HEARTBEAT_MS = parseBoundedNumber("REALTIME_HEARTBEAT_MS", 30 * 1000, 1000, 10 * 60 * 1000);
 const REALTIME_IDLE_TIMEOUT_MS = parseBoundedNumber("REALTIME_IDLE_TIMEOUT_MS", 2 * REALTIME_HEARTBEAT_MS, REALTIME_HEARTBEAT_MS, 60 * 60 * 1000);
+const ROUTE_RATE_LIMIT_MAX = parsePositiveIntegerEnv("ROUTE_RATE_LIMIT_MAX", 60, 1_000_000);
+const ROUTE_RATE_LIMIT_WINDOW_MS = parsePositiveIntegerEnv("ROUTE_RATE_LIMIT_WINDOW_MS", 15 * 60 * 1000, 2_147_483_647);
 const wss = new WebSocket.Server({ server, path: "/ws", maxPayload: REALTIME_MAX_PAYLOAD_BYTES, perMessageDeflate: false });
 const realtimeHeartbeat = setInterval(() => {
   for (const socket of wss.clients) {
@@ -4469,6 +4481,21 @@ function initData() {
 }
 
 app.set("trust proxy", TRUSTED_PROXIES);
+const createRouteRateLimit = () => rateLimit({
+  windowMs: ROUTE_RATE_LIMIT_WINDOW_MS,
+  limit: ROUTE_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas solicitações. Tente novamente mais tarde." },
+});
+app.use("/versions", createRouteRateLimit());
+app.use("/share", createRouteRateLimit());
+app.use("/pending/repair", createRouteRateLimit());
+app.use("/approve", createRouteRateLimit());
+app.use("/reject", createRouteRateLimit());
+app.use("/delete", createRouteRateLimit());
+app.use("/file-access", createRouteRateLimit());
+app.use("/file-temporary", createRouteRateLimit());
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
   if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);

@@ -27,3 +27,5 @@ Security changes should be backed by focused automated tests, exact-revision val
 ## Remaining responsibility
 
 A passing test suite does not make an arbitrary deployment safe. Operators are responsible for network exposure, reverse-proxy configuration, TLS, secret management, operating-system permissions, enabled providers, backup handling, and the exact revision deployed.
+
+The route-scoped HTTP request limits use a per-process in-memory store. Each process or container enforces its own budget; deployments with multiple workers need a shared rate-limit store for a deployment-wide budget. This does not close Issue #94: the separate multi-process `/upload-chunk` gate remains open.

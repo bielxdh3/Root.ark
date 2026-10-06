@@ -63,7 +63,7 @@ function runSharePageScript(page, fetchImpl) {
     }
     return elements.get(id);
   };
-  const script = page.match(/<script>\s*([\s\S]*?)\s*<\/script>/)?.[1];
+  const script = page.match(/<script\b[^>]*>\s*([\s\S]*?)\s*<\/script\s*>/i)?.[1];
   assert.ok(script, "share page has an inline client script");
   vm.runInNewContext(script, {
     document: { getElementById },
@@ -73,6 +73,11 @@ function runSharePageScript(page, fetchImpl) {
   });
   return elements;
 }
+
+test("public-share script extraction accepts case-insensitive script tags", () => {
+  const elements = runSharePageScript('<SCRIPT type="text/javascript">document.getElementById("status").textContent = "loaded";</SCRIPT>');
+  assert.equal(elements.get("status").textContent, "loaded");
+});
 
 async function waitForServer(port) {
   const deadline = Date.now() + TIMEOUT_MS;
