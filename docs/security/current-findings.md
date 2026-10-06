@@ -29,3 +29,10 @@ Security changes should be backed by focused automated tests, exact-revision val
 A passing test suite does not make an arbitrary deployment safe. Operators are responsible for network exposure, reverse-proxy configuration, TLS, secret management, operating-system permissions, enabled providers, backup handling, and the exact revision deployed.
 
 The route-scoped HTTP request limits use a per-process in-memory store. Each process or container enforces its own budget; deployments with multiple workers need a shared rate-limit store for a deployment-wide budget. This does not close Issue #94: the separate multi-process `/upload-chunk` gate remains open.
+
+Cloud relocation cleanup and WebDAV MOVE recovery use durable journals under
+`temp/.incoming` and same-host process claims. Foreign-host owners fail closed
+and are not reclaimed by timeout because provider operations have no fencing
+token; the associated objects and names remain reserved until an operator can
+verify the owner is stopped and recover the journal. Do not share one journal
+directory across hosts. See [deployment resilience](phase-14-deployment-resilience.md#journal-topology).

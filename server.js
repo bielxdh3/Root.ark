@@ -9,6 +9,7 @@ const express = require("express");
 const { rateLimit } = require("express-rate-limit");
 const multer = require("multer");
 const path = require("path");
+const os = require("node:os");
 const fs = require("fs");
 const crypto = require("crypto");
 const zlib = require("zlib");
@@ -160,6 +161,8 @@ const WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS = parseBoundedNumber("WEBDAV_MOVE_R
 const WEBDAV_MOVE_RECONCILIATION_MAX_ATTEMPTS = parseBoundedNumber("WEBDAV_MOVE_RECONCILIATION_MAX_ATTEMPTS", 5, 1, 100);
 const WEBDAV_MOVE_RECONCILIATION_LEASE_MS = parseBoundedNumber("WEBDAV_MOVE_RECONCILIATION_LEASE_MS", 60 * 1000, 1000, 60 * 60 * 1000);
 const WEBDAV_MOVE_RECONCILIATION_MAX_BACKOFF_MS = parseBoundedNumber("WEBDAV_MOVE_RECONCILIATION_MAX_BACKOFF_MS", 60 * 60 * 1000, 1000, 24 * 60 * 60 * 1000);
+const CLOUD_RELOCATION_CLEANUP_INTERVAL_MS = parseBoundedNumber("CLOUD_RELOCATION_CLEANUP_INTERVAL_MS", 60 * 1000, 1000, 60 * 60 * 1000);
+const CLOUD_RELOCATION_CLEANUP_MAX_BACKOFF_MS = parseBoundedNumber("CLOUD_RELOCATION_CLEANUP_MAX_BACKOFF_MS", 60 * 60 * 1000, 1000, 24 * 60 * 60 * 1000);
 const WEBDAV_MOVE_REMOTE_INTENT_STATES = new Set([
   "claimed",
   "destination_upload_intent",
@@ -182,6 +185,8 @@ const WEBDAV_MOVE_REMOTE_INTENT_STATES = new Set([
 ]);
 let webDavReconciliationRunning = false;
 let webDavReconciliationTimer = null;
+let cloudRelocationCleanupRunning = false;
+let cloudRelocationCleanupTimer = null;
 const ENCRYPTION_ITERATIONS = 100000;
 const openFileTokens = new Map();
 let groupsStore = null;
@@ -243,7 +248,14 @@ const ENCRYPTION_LEVELS = {
 function isCloudStorageEnabled() { return cloudStorage.enabled(); }
 function getCloudStorageStatus() { return cloudStorage.status(); }
 function getCloudKey(folderId = ROOT_FOLDER_ID, fileName = "", area = "uploads") { return cloudStorage.key(folderId, fileName, area); }
-async function uploadFileToCloud(localPath, folderId, fileName, area = "uploads") { return cloudStorage.upload(localPath, folderId, fileName, area); }
+async function uploadFileToCloud(localPath, folderId, fileName, area = "uploads", { relocationTransactionId = null, webDavMoveTransactionId = null } = {}) {
+  if (area === "uploads" && isCloudRelocationCleanupReserved(folderId, fileName) &&
+      !isCloudRelocationDestinationForTransaction(relocationTransactionId, folderId, fileName) &&
+      !isWebDavMoveDestinationForTransaction(webDavMoveTransactionId, folderId, fileName)) {
+    throw Object.assign(new Error("Cloud key is reserved for relocation cleanup"), { code: "CLOUD_RECONCILIATION_REQUIRED" });
+  }
+  return cloudStorage.upload(localPath, folderId, fileName, area);
+}
 async function downloadFileFromCloud(folderId, fileName, localPath, area = "uploads") { return cloudStorage.download(folderId, fileName, localPath, area); }
 async function deleteFileFromCloud(folderId, fileName, area = "uploads") { return cloudStorage.remove(folderId, fileName, area); }
 async function deleteCloudPrefix(prefix) { return cloudStorage.removePrefix(prefix); }
@@ -288,7 +300,7 @@ function deleteCloudFolderLater(folderId) {
   syncCloudFireAndForget(deleteCloudPrefix(getCloudKey(folderId, "", "temp")), `delete temp folder ${folderId}`);
 }
 
-async function ensureCloudFileCached(folderId, fileName, localPath, area = "uploads") {
+async function ensureCloudFileCached(folderId, fileName, localPath, area = "uploads", { strictCloud = false } = {}) {
   if (isExistingFile(localPath)) return true;
   if (!isCloudStorageEnabled()) return false;
 
@@ -296,6 +308,7 @@ async function ensureCloudFileCached(folderId, fileName, localPath, area = "uplo
     return await downloadFileFromCloud(folderId, fileName, localPath, area);
   } catch (error) {
     console.error("[cloud-storage] restore cache failed:", sanitizeLogValue(error.message));
+    if (strictCloud) throw Object.assign(new Error("Cloud storage is temporarily unavailable"), { code: "CLOUD_STORAGE_UNAVAILABLE" });
     return false;
   }
 }
@@ -1812,6 +1825,7 @@ function getShareFileInfo(link) {
 async function ensureShareFileAvailable(link) {
   const info = getShareFileInfo(link);
   if (!info) return null;
+  if (isCloudRelocationCleanupReserved(info.folderId, info.fileName)) return null;
   if (isFileInTrash(info.folderId, info.fileName)) return null;
   if (getEncryptedFileMetadata(info.folderId, info.fileName)) return null;
   await ensureCloudFileCached(info.folderId, info.fileName, info.filePath, "uploads");
@@ -2214,7 +2228,7 @@ function recordApprovedFileVersion(folder, fileName, pendingPath, uploadedBy, co
   const initialComment = comment || "Versao inicial";
 
   if (!exists) {
-    fs.renameSync(pendingPath, currentPath);
+    fs.copyFileSync(pendingPath, currentPath);
     ensureVersionHistory(folder, fileName, uploadedBy || "sistema", initialComment);
     return { currentVersion: 1, replaced: false };
   }
@@ -2233,7 +2247,7 @@ function recordApprovedFileVersion(folder, fileName, pendingPath, uploadedBy, co
     }
   }
 
-  fs.renameSync(pendingPath, currentPath);
+  fs.copyFileSync(pendingPath, currentPath);
   const stats = fs.statSync(currentPath);
   const newVersion = oldCurrentVersion + 1;
   history.currentVersion = newVersion;
@@ -2263,12 +2277,89 @@ function syncFileVersionsToCloud(folderId, fileName) {
     ...history.versions.map((version) => path.basename(version.storedAs || "")).filter(Boolean),
   ]);
 
+  const pendingUploads = [];
   for (const storedName of storedNames) {
     const storedPath = path.join(folder.uploadDir, storedName);
     if (isExistingFile(storedPath)) {
-      syncCloudFireAndForget(uploadFileToCloud(storedPath, folder.id, storedName, "uploads"), `sync version ${folder.id}/${storedName}`);
+      const upload = uploadFileToCloud(storedPath, folder.id, storedName, "uploads");
+      syncCloudFireAndForget(upload, `sync version ${folder.id}/${storedName}`);
+      pendingUploads.push(upload);
     }
   }
+  return Promise.allSettled(pendingUploads);
+}
+
+async function hashLocalFileSha256(filePath) {
+  const hash = crypto.createHash("sha256");
+  for await (const chunk of fs.createReadStream(filePath)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+function getArchivedVersionDestinationNames(history, fileName) {
+  return history.versions
+    .filter((version) => version.version !== history.currentVersion && version.storedAs)
+    .map((version) => getStoredVersionName(fileName, version.version));
+}
+
+async function deleteStagedCloudVersionCopies(copies) {
+  if (!copies.length) return [];
+  try {
+    return await queueCloudRelocationCleanup(copies) ? copies : [];
+  } catch (error) {
+    console.error("[cloud-storage] staged version cleanup could not be persisted:", sanitizeLogValue(error.message));
+    return copies;
+  }
+}
+
+async function stageCloudVersionsForRelocation(sourceFolder, sourceName, destinationFolder, destinationName, history, { cleanupOnFailure = true, transactionId = null } = {}) {
+  if (!isCloudStorageEnabled()) return [];
+
+  // All keys referenced after relocation must exist before local metadata changes or source-key deletion.
+  const copies = [];
+  try {
+    const sourcePath = path.join(sourceFolder.uploadDir, sourceName);
+    copies.push({ folderId: destinationFolder.id, fileName: destinationName });
+    if (!await uploadFileToCloud(sourcePath, destinationFolder.id, destinationName, "uploads", { relocationTransactionId: transactionId })) {
+      throw Object.assign(new Error("Cloud file could not be copied"), { code: "CLOUD_STORAGE_UNAVAILABLE" });
+    }
+
+    for (const version of history.versions) {
+      if (version.version === history.currentVersion || !version.storedAs) continue;
+      const sourceStoredName = path.basename(version.storedAs);
+      const destinationStoredName = getStoredVersionName(destinationName, version.version);
+      if (sourceFolder.id === destinationFolder.id && sourceStoredName === destinationStoredName) continue;
+
+      const versionPath = path.join(sourceFolder.uploadDir, sourceStoredName);
+      if (!await ensureCloudFileCached(sourceFolder.id, sourceStoredName, versionPath, "uploads", { strictCloud: true })) {
+        throw Object.assign(new Error("Cloud version is temporarily unavailable"), { code: "CLOUD_STORAGE_UNAVAILABLE" });
+      }
+      copies.push({ folderId: destinationFolder.id, fileName: destinationStoredName });
+      const uploaded = await uploadFileToCloud(versionPath, destinationFolder.id, destinationStoredName, "uploads", { relocationTransactionId: transactionId });
+      if (!uploaded) {
+        throw Object.assign(new Error("Cloud version could not be copied"), { code: "CLOUD_STORAGE_UNAVAILABLE" });
+      }
+    }
+    return copies;
+  } catch (error) {
+    const cleanupFailures = cleanupOnFailure ? await deleteStagedCloudVersionCopies(copies) : [];
+    if (cleanupFailures.length) {
+      throw Object.assign(new Error("Cloud staging cleanup requires reconciliation"), { code: "CLOUD_RECONCILIATION_REQUIRED" });
+    }
+    throw error;
+  }
+}
+
+function sendCloudRelocationFailure(res, error) {
+  if (error?.code === "CLOUD_RELOCATION_CONFLICT") {
+    return res.status(409).json({ error: "Arquivo de origem ou destino mudou; atualize a lista e tente novamente" });
+  }
+  if (error?.code === "CLOUD_RECONCILIATION_REQUIRED") {
+    return res.status(503).json({
+      status: "reconciliation_required",
+      error: "A operacao nao foi aplicada; a limpeza dos objetos temporarios na nuvem precisa de conciliacao antes de tentar novamente",
+    });
+  }
+  return res.status(503).json({ error: "Armazenamento temporariamente indisponivel" });
 }
 
 function getVersionFilePath(folder, fileName, versionNumber) {
@@ -2303,11 +2394,9 @@ function isStoredVersionFile(folderId, fileName, entries = loadFileVersions()) {
 
   const permissions = loadFilePermissions();
   if (getFilePermissionEntry(folderId, name, permissions)) return false;
-  const primaryName = name.slice(0, -suffix[0].length);
-  return Boolean(
-    getFilePermissionEntry(folderId, primaryName, permissions) ||
-    entries[getFileVersionKey(folderId, primaryName)]
-  );
+  // Without file-local metadata, a `.vN` object could be orphaned historical
+  // bytes. Hide it consistently from ordinary listings and file endpoints.
+  return true;
 }
 
 function removeFileVersions(folderId, fileName) {
@@ -2963,6 +3052,48 @@ function getFilePermissionEntry(folderId, fileName, entries = loadFilePermission
   return entries[getFilePermissionKey(folderId, fileName)] || null;
 }
 
+function setFilePermissionEntry(folderId, fileName, entry) {
+  const entries = loadFilePermissions();
+  const key = getFilePermissionKey(folderId, fileName);
+  if (entry) entries[key] = entry;
+  else delete entries[key];
+  saveFilePermissions(entries);
+}
+
+function copyFilePermission(oldFolderId, oldName, newFolderId, newName) {
+  const entries = loadFilePermissions();
+  const oldKey = getFilePermissionKey(oldFolderId, oldName);
+  const newKey = getFilePermissionKey(newFolderId, newName);
+  if (!entries[oldKey]) return null;
+  const previousDestination = entries[newKey] ? JSON.parse(JSON.stringify(entries[newKey])) : null;
+  entries[newKey] = {
+    ...entries[oldKey],
+    folderId: newFolderId,
+    fileName: newName,
+    updatedAt: new Date().toISOString(),
+  };
+  saveFilePermissions(entries);
+  return { folderId: newFolderId, fileName: newName, previousDestination };
+}
+
+function restoreCopiedFilePermission(snapshot) {
+  if (!snapshot) return;
+  setFilePermissionEntry(snapshot.folderId, snapshot.fileName, snapshot.previousDestination);
+}
+
+function tombstoneFilePermission(folderId, fileName) {
+  const entries = loadFilePermissions();
+  entries[getFilePermissionKey(folderId, fileName)] = {
+    folderId,
+    fileName,
+    public: false,
+    users: {},
+    cleanupPending: true,
+    updatedAt: new Date().toISOString(),
+  };
+  saveFilePermissions(entries);
+}
+
 function normalizeFilePermissionEntry(entry) {
   const legacyAllowedUsers = normalizeAllowedUsers(entry?.allowedUsers);
   const rawUsers = entry?.users && typeof entry.users === "object" ? entry.users : {};
@@ -3017,9 +3148,10 @@ function normalizeFolderGroupIds(value, allowMissing = true) {
 
 function hasFileAccess(req, folder, fileName, entries = loadFilePermissions()) {
   if (!hasFolderAccess(req, folder)) return false;
+  const entry = getFilePermissionEntry(folder.id, fileName, entries);
+  if (entry?.cleanupPending || isCloudRelocationCleanupReserved(folder.id, fileName)) return false;
   if (canManageAccess(req)) return true;
 
-  const entry = getFilePermissionEntry(folder.id, fileName, entries);
   const permissions = normalizeFilePermissionEntry(entry);
   const userAccess = permissions.users[req.user?.username];
 
@@ -3033,9 +3165,10 @@ function hasFileAccess(req, folder, fileName, entries = loadFilePermissions()) {
 
 function hasFileEditAccess(req, folder, fileName, entries = loadFilePermissions()) {
   if (!hasFolderAccess(req, folder)) return false;
+  const entry = getFilePermissionEntry(folder.id, fileName, entries);
+  if (entry?.cleanupPending || isCloudRelocationCleanupReserved(folder.id, fileName)) return false;
   if (canManageAccess(req)) return true;
 
-  const entry = getFilePermissionEntry(folder.id, fileName, entries);
   if (!entry) return Boolean(req.user?.permissions?.delete);
 
   const permissions = normalizeFilePermissionEntry(entry);
@@ -3634,26 +3767,49 @@ function shortenFileName(fileName) {
   return `${baseName.slice(0, maxBaseLength)}${extension}`;
 }
 
-function getAvailableUploadFileName(originalName, folderId = ROOT_FOLDER_ID, allowExistingPublic = false) {
+function getAvailableUploadFileName(originalName, folderId = ROOT_FOLDER_ID, allowExistingPublic = false, existingNames = new Set()) {
   const shortenedName = shortenFileName(originalName);
   const extension = path.extname(shortenedName);
   const baseName = path.basename(shortenedName, extension);
-  let candidate = shortenedName;
-  let counter = 1;
   const uploadDir = getFolderStoragePath("./uploads", folderId);
   const tempDir = getFolderStoragePath("./temp", folderId);
-
-  while (
-    fs.existsSync(path.join(tempDir, candidate)) ||
-    (!allowExistingPublic && fs.existsSync(path.join(uploadDir, candidate)))
-  ) {
-    const suffix = `-${counter}`;
-    const maxBaseLength = Math.max(1, MAX_FILE_NAME_LENGTH - extension.length - suffix.length);
-    candidate = `${baseName.slice(0, maxBaseLength)}${suffix}${extension}`;
-    counter += 1;
+  for (let counter = 0; counter < 1000; counter += 1) {
+    const suffixNumber = counter;
+    const candidate = suffixNumber === 0 ? shortenedName : (() => {
+      const suffix = `-${suffixNumber}`;
+      const maxBaseLength = Math.max(1, MAX_FILE_NAME_LENGTH - extension.length - suffix.length);
+      return `${baseName.slice(0, maxBaseLength)}${suffix}${extension}`;
+    })();
+    const reservationState = getCloudRelocationCleanupReservationState(folderId, candidate);
+    if (reservationState === "unavailable") throw cloudRelocationCleanupUnavailableError();
+    if (
+      !fs.existsSync(path.join(tempDir, candidate)) &&
+      (allowExistingPublic || !fs.existsSync(path.join(uploadDir, candidate))) &&
+      !existingNames.has(candidate) &&
+      reservationState === "clear"
+    ) return candidate;
   }
+  throw Object.assign(new Error("No available upload filename"), { code: "UPLOAD_FILENAME_UNAVAILABLE" });
+}
 
-  return candidate;
+function getAvailableVersionedUploadFileName(originalName, folderId, existingNames, history) {
+  const archivedVersions = history.versions.filter((version) => version.version !== history.currentVersion && version.storedAs);
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    const candidate = getAvailableUploadFileName(originalName, folderId, false, existingNames);
+    let archiveCollision = false;
+    for (const version of archivedVersions) {
+      const storedName = getStoredVersionName(candidate, version.version);
+      const reservationState = getCloudRelocationCleanupReservationState(folderId, storedName);
+      if (reservationState === "unavailable") throw cloudRelocationCleanupUnavailableError();
+      if (existingNames.has(storedName) || reservationState === "reserved") {
+        archiveCollision = true;
+        break;
+      }
+    }
+    if (!archiveCollision) return candidate;
+    existingNames.add(candidate);
+  }
+  throw Object.assign(new Error("No available versioned upload filename"), { code: "UPLOAD_FILENAME_UNAVAILABLE" });
 }
 
 function isExistingFile(filePath) {
@@ -3983,7 +4139,7 @@ function listFilesWithDetailsAsync(directory) {
   });
 }
 
-async function listFilesWithCloudDetails(directory, folderId, area = "uploads") {
+async function listFilesWithCloudDetails(directory, folderId, area = "uploads", { strictCloud = false } = {}) {
   const files = await listFilesWithDetailsAsync(directory);
   if (!isCloudStorageEnabled()) return files;
 
@@ -4004,15 +4160,17 @@ async function listFilesWithCloudDetails(directory, folderId, area = "uploads") 
       localNames.add(name);
     }
   } catch (error) {
+    if (strictCloud) throw Object.assign(new Error("Cloud metadata is temporarily unavailable"), { code: "CLOUD_STORAGE_UNAVAILABLE" });
     console.error("[cloud-storage] list metadata failed:", sanitizeLogValue(error.message));
   }
 
   return files;
 }
 
-async function getListedFileDetails(folder, fileName) {
+async function getListedFileDetails(folder, fileName, options = {}) {
+  if (isCloudRelocationCleanupReserved(folder.id, fileName)) return null;
   if (isStoredVersionFile(folder.id, fileName)) return null;
-  const files = await listFilesWithCloudDetails(folder.uploadDir, folder.id, "uploads");
+  const files = await listFilesWithCloudDetails(folder.uploadDir, folder.id, "uploads", options);
   return files.find((file) => file.name === fileName) || null;
 }
 
@@ -4022,7 +4180,7 @@ const CLOUD_METADATA_RATE_LIMIT_MAX = 30;
 const CLOUD_METADATA_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 let cloudMetadataRateLimitCleanupAt = 0;
 
-function consumeCloudMetadataRateLimit(req, res) {
+function consumeCloudMetadataRateLimit(req, res, routeOverride) {
   const now = Date.now();
   if (now >= cloudMetadataRateLimitCleanupAt) {
     for (const [key, state] of cloudMetadataRateLimits) {
@@ -4032,7 +4190,7 @@ function consumeCloudMetadataRateLimit(req, res) {
   }
 
   const username = String(req.user?.username || "").trim().toLowerCase();
-  const route = req.route?.path || req.path;
+  const route = routeOverride || req.route?.path || req.path;
   const method = req.method === "HEAD" ? "GET" : req.method;
   const key = `${username}\0${method}\0${route}`;
   let state = cloudMetadataRateLimits.get(key);
@@ -4438,17 +4596,7 @@ function isWebDavEncryptedFile(folderId, fileName) {
 }
 
 function isWebDavInternalStoredFile(folderId, fileName) {
-  const name = path.basename(fileName || "");
-  if (isStoredVersionFile(folderId, name)) return true;
-
-  // With the version manifest missing, an unmarked `.vN` object is ambiguous:
-  // it may be an ordinary file or orphaned historical bytes. WebDAV requires
-  // file-local metadata to expose that ambiguous name; ordinary files that
-  // have their own ACL or version history remain available.
-  if (!/\.v\d+$/i.test(name)) return false;
-  const versionEntries = loadFileVersions();
-  if (versionEntries[getFileVersionKey(folderId, name)]) return false;
-  return !getFilePermissionEntry(folderId, name, loadFilePermissions());
+  return isStoredVersionFile(folderId, path.basename(fileName || ""));
 }
 
 async function deleteCloudTrashItem(item) {
@@ -5036,7 +5184,7 @@ function handleUploadSingle(req, res, next) {
       fs.rmSync(req.file.path, { force: true });
     }
 
-    res.status(400).json({ error: error.message || "Upload nao concluido" });
+    res.status(error.code === "CLOUD_RECONCILIATION_REQUIRED" ? 503 : 400).json({ error: error.message || "Upload nao concluido" });
   });
 }
 
@@ -6163,7 +6311,7 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
   } catch (error) {
     removeChunkUploadIncomingFile(req.file);
     console.error("Erro no upload em blocos:", error.code || error.name || "operation_failed");
-    res.status(500).json({ error: "Upload em blocos nao concluido" });
+    res.status(error.code === "CLOUD_RECONCILIATION_REQUIRED" ? 503 : 500).json({ error: "Upload em blocos nao concluido" });
   }
 });
 
@@ -6344,7 +6492,7 @@ function buildVisibleFileEntry(req, folder, file, caches = getFileListCaches()) 
 }
 
 async function listVisibleFilesForFolder(req, folder, caches = getFileListCaches()) {
-  const files = await listFilesWithCloudDetails(folder.uploadDir, folder.id, "uploads");
+  const files = await listFilesWithCloudDetails(folder.uploadDir, folder.id, "uploads", { strictCloud: true });
   return files
     .map((file) => buildVisibleFileEntry(req, folder, file, caches))
     .filter(Boolean);
@@ -6355,7 +6503,7 @@ async function getWebDavVisibleFiles(req, folder) {
   return visible.filter((file) => !isWebDavEncryptedFile(folder.id, file.name) && !isWebDavInternalStoredFile(folder.id, file.name));
 }
 
-async function resolveWebDavFile(req, folder, fileName) {
+async function resolveWebDavFile(req, folder, fileName, { hydrate = true, verifyMetadata = true, requireEdit = false } = {}) {
   const name = path.basename(String(fileName || ""));
   if (!name || name !== fileName) return null;
   if (!folder || !hasFolderAccess(req, folder)) return null;
@@ -6366,9 +6514,23 @@ async function resolveWebDavFile(req, folder, fileName) {
     return { blocked: true, status: 403, message: "Arquivos criptografados nao estao disponiveis via WebDAV neste MVP" };
   }
   if (!hasFileAccess(req, folder, name)) return null;
+  if (requireEdit && !hasFileEditAccess(req, folder, name)) {
+    return { blocked: true, status: 403, message: "Permission denied" };
+  }
 
   const filePath = path.join(folder.uploadDir, name);
-  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
+  if (!verifyMetadata) return { type: "file", folder, name, filePath, stats: null, listedFiles: null };
+  if (!hydrate) {
+    let listedFiles;
+    try {
+      listedFiles = await listFilesWithCloudDetails(folder.uploadDir, folder.id, "uploads", { strictCloud: true });
+    } catch {
+      throw Object.assign(new Error("Cloud storage is temporarily unavailable"), { code: "CLOUD_STORAGE_UNAVAILABLE" });
+    }
+    if (!listedFiles.some((file) => file.name === name)) return null;
+    return { type: "file", folder, name, filePath, stats: null, listedFiles };
+  }
+  await ensureCloudFileCached(folder.id, name, filePath, "uploads", { strictCloud: true });
   if (!isExistingFile(filePath)) return null;
 
   return {
@@ -6380,7 +6542,9 @@ async function resolveWebDavFile(req, folder, fileName) {
   };
 }
 
-async function resolveWebDavTarget(req, segments) {
+async function resolveWebDavTarget(req, segments, options = {}) {
+  const { hydrateFiles = true, verifyMetadata = true, requireEdit = false } = options;
+  const fileOptions = { hydrate: hydrateFiles, verifyMetadata, requireEdit };
   const rootFolder = getWebDavRootFolder();
 
   if (!segments.length) {
@@ -6390,13 +6554,13 @@ async function resolveWebDavTarget(req, segments) {
   if (segments.length === 1) {
     const folder = findWebDavFolderByName(req, segments[0]);
     if (folder) return { type: "folder", folder: hydrateFolderForWebDav(folder) };
-    return resolveWebDavFile(req, rootFolder, segments[0]);
+    return resolveWebDavFile(req, rootFolder, segments[0], fileOptions);
   }
 
   if (segments.length === 2) {
     const folder = findWebDavFolderByName(req, segments[0]);
     if (!folder) return null;
-    return resolveWebDavFile(req, hydrateFolderForWebDav(folder), segments[1]);
+    return resolveWebDavFile(req, hydrateFolderForWebDav(folder), segments[1], fileOptions);
   }
 
   return null;
@@ -6673,6 +6837,7 @@ async function handleWebDavPut(req, res, segments) {
       error: error.message,
       path: getSafeWebDavAuditPath(req),
     });
+    if (error.code === "CLOUD_RECONCILIATION_REQUIRED") return res.status(503).send("Cloud relocation cleanup needs recovery");
     return res.status(error.code === "WEBDAV_UPLOAD_TOO_LARGE" ? 413 : error.code === "ABORT_ERR" ? 400 : 500).send(error.code === "WEBDAV_UPLOAD_TOO_LARGE" ? "File too large for WebDAV MVP upload" : "Upload failed");
   }
 }
@@ -6760,6 +6925,535 @@ function writeWebDavMoveFileAtomically(filePath, contents) {
   fs.renameSync(temporary, filePath);
 }
 
+function cloudRelocationCleanupJournalPath(transactionId) {
+  return path.resolve(WEBDAV_MOVE_JOURNAL_DIR, `rootark-cloud-relocation-cleanup-${transactionId}.json`);
+}
+
+function cloudRelocationCleanupLockPath(transactionId) {
+  return path.resolve(WEBDAV_MOVE_JOURNAL_DIR, "rootark-cloud-relocation-cleanup-" + transactionId + ".lock");
+}
+
+function claimCloudRelocationMutationLock(now = Date.now()) {
+  // ponytail: one shared lock serializes rename/move; split by resource only if measured throughput requires it.
+  const transactionId = "00000000-0000-4000-8000-000000000000";
+  if (!recoverCloudRelocationCleanupClaimTakeovers()) return null;
+  const lockPath = cloudRelocationCleanupLockPath(transactionId);
+  const token = "cloud-relocation-mutation:" + crypto.randomUUID();
+  fs.mkdirSync(WEBDAV_MOVE_JOURNAL_DIR, { recursive: true });
+  try {
+    writeWebDavMoveClaimLock(lockPath, webDavMoveClaimRecord(token, transactionId, now));
+  } catch (error) {
+    if (error.code !== "EEXIST") return null;
+    try {
+      const existingStat = fs.statSync(lockPath);
+      const existing = fs.readFileSync(lockPath, "utf8");
+      const record = (() => { try { return JSON.parse(existing); } catch { return null; } })();
+      if (!validWebDavMoveClaimRecord(record, transactionId) || webDavMoveOwnerIsLive(record)) return null;
+      const takeover = takeoverWebDavMoveClaim(lockPath, transactionId, record.token, webDavMoveClaimObservation(existing, existingStat), now);
+      if (!takeover) return null;
+      return { path: lockPath, token: takeover };
+    } catch {
+      return null;
+    }
+  }
+  return { path: lockPath, token };
+}
+
+function recoverCloudRelocationCleanupClaimTakeovers() {
+  if (!fs.existsSync(WEBDAV_MOVE_JOURNAL_DIR)) return true;
+  for (const name of fs.readdirSync(WEBDAV_MOVE_JOURNAL_DIR).filter((entry) => /^rootark-cloud-relocation-cleanup-[a-f0-9-]{36}\.lock\.takeover$/i.test(entry))) {
+    const match = name.match(/^rootark-cloud-relocation-cleanup-([a-f0-9-]{36})\.lock\.takeover$/i);
+    if (!match) continue;
+    try { webDavMoveRecoverTakeoverAuthority(cloudRelocationCleanupLockPath(match[1]), match[1]); }
+    catch { return false; }
+  }
+  return true;
+}
+
+function isSafeCloudRelocationCleanupItem(item) {
+  return item && typeof item.folderId === "string" && item.folderId.length <= 128 && item.folderId !== "." && item.folderId !== ".." && !item.folderId.includes("/") && !item.folderId.includes("\\") &&
+    typeof item.fileName === "string" && item.fileName.length <= MAX_FILE_NAME_LENGTH && item.fileName !== "." && item.fileName !== ".." && !item.fileName.includes("/") && !item.fileName.includes("\\") &&
+    item.area === "uploads" && (!Object.prototype.hasOwnProperty.call(item, "clearPermission") || typeof item.clearPermission === "boolean");
+}
+
+function isSafeCloudRelocationPermissionEntry(entry) {
+  if (entry === null) return true;
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  if (entry.public !== undefined && typeof entry.public !== "boolean") return false;
+  if (entry.owner !== undefined && (typeof entry.owner !== "string" || entry.owner.length > 128)) return false;
+  if (entry.allowedUsers !== undefined && (!Array.isArray(entry.allowedUsers) || !entry.allowedUsers.every((user) => typeof user === "string" && user.length <= 128))) return false;
+  if (entry.users !== undefined) {
+    if (!entry.users || typeof entry.users !== "object" || Array.isArray(entry.users)) return false;
+    if (!Object.entries(entry.users).every(([user, access]) => user.length <= 128 && access && typeof access === "object" && !Array.isArray(access) &&
+      (access.read === undefined || typeof access.read === "boolean") && (access.edit === undefined || typeof access.edit === "boolean"))) return false;
+  }
+  return true;
+}
+
+function isSafeCloudFileRelocationOperation(operation) {
+  if (!operation || !["rename", "move"].includes(operation.kind) || !["prepared", "committing", "committed", "aborting", "ambiguous"].includes(operation.phase)) return false;
+  const namesAreSafe = [operation.sourceFolderId, operation.destinationFolderId].every((id) => typeof id === "string" && id.length <= 128 && id && id !== "." && id !== ".." && !id.includes("/") && !id.includes("\\")) &&
+    [operation.sourceName, operation.destinationName].every((name) => typeof name === "string" && name.length <= MAX_FILE_NAME_LENGTH && name && name === path.basename(name));
+  if (!namesAreSafe) return false;
+  if (path.resolve(operation.sourcePath || "") !== path.resolve(getFolderStoragePath("./uploads", operation.sourceFolderId), operation.sourceName) ||
+      path.resolve(operation.destinationPath || "") !== path.resolve(getFolderStoragePath("./uploads", operation.destinationFolderId), operation.destinationName)) return false;
+  const identity = operation.sourceIdentity;
+  if (!identity || !["dev", "ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"].every((key) => Number.isFinite(Number(identity[key])))) return false;
+  if (!Array.isArray(operation.sourceCleanupItems) || !operation.sourceCleanupItems.length || operation.sourceCleanupItems.length > 1000 || !operation.sourceCleanupItems.every((item) => isSafeCloudRelocationCleanupItem(item) && item.folderId === operation.sourceFolderId)) return false;
+  if (!Array.isArray(operation.destinationCopies) || !operation.destinationCopies.length || operation.destinationCopies.length > 1000 || !operation.destinationCopies.every((item) => isSafeCloudRelocationCleanupItem(item) && item.folderId === operation.destinationFolderId)) return false;
+  const snapshot = operation.destinationPermissionSnapshot;
+  if (!snapshot || snapshot.folderId !== operation.destinationFolderId || snapshot.fileName !== operation.destinationName ||
+      !isSafeCloudRelocationPermissionEntry(snapshot.previousDestination)) return false;
+  return true;
+}
+
+function isSafeCloudRelocationCleanupJournal(journal) {
+  if (!journal || journal.version !== 1 || !/^[a-f0-9-]{36}$/i.test(String(journal.transactionId || ""))) return false;
+  if (path.resolve(journal.journalPath || "") !== cloudRelocationCleanupJournalPath(journal.transactionId)) return false;
+  if (typeof journal.provider !== "string" || !/^[a-z0-9_-]{1,32}$/i.test(journal.provider)) return false;
+  if (!Array.isArray(journal.items) || journal.items.length > 1000) return false;
+  return journal.items.every(isSafeCloudRelocationCleanupItem) &&
+    (!Object.prototype.hasOwnProperty.call(journal, "operation") || isSafeCloudFileRelocationOperation(journal.operation));
+}
+
+function getCloudRelocationCleanupReservationState(folderId, fileName) {
+  const cleanFolderId = String(folderId || ROOT_FOLDER_ID);
+  const cleanFileName = String(fileName || "");
+  if (!cleanFileName || path.basename(cleanFileName) !== cleanFileName) return "clear";
+  if (getFilePermissionEntry(cleanFolderId, cleanFileName)?.cleanupPending) return "reserved";
+  try {
+    const journalNames = fs.readdirSync(WEBDAV_MOVE_JOURNAL_DIR);
+    for (const name of journalNames.filter((entry) => /^rootark-cloud-relocation-cleanup-[a-f0-9-]{36}\.json$/i.test(entry))) {
+      const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, name);
+      try {
+        const stat = fs.statSync(journalPath);
+        if (!stat.isFile() || stat.size > 1024 * 1024) return "unavailable";
+        const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+        if (!isSafeCloudRelocationCleanupJournal(journal)) return "unavailable";
+        if (journal.items.some((item) => item.folderId === cleanFolderId && item.fileName === cleanFileName && item.area === "uploads")) return "reserved";
+        const operation = journal.operation;
+        if (operation && [
+          { folderId: operation.sourceFolderId, fileName: operation.sourceName },
+          { folderId: operation.destinationFolderId, fileName: operation.destinationName },
+          ...operation.sourceCleanupItems,
+          ...operation.destinationCopies,
+        ].some((item) => item.folderId === cleanFolderId && item.fileName === cleanFileName)) return "reserved";
+      } catch {
+        return "unavailable";
+      }
+    }
+    for (const name of journalNames.filter((entry) => /^rootark-webdav-move-[a-f0-9-]{36}\.json$/i.test(entry))) {
+      const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, name);
+      try {
+        const stat = fs.statSync(journalPath);
+        if (!stat.isFile() || stat.size > 1024 * 1024) return "unavailable";
+        const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+        if (!isSafeWebDavMoveJournal(journal)) return "unavailable";
+        if (journal.cloud?.folderId === cleanFolderId &&
+            [...(journal.cloud.sourceNames || [journal.cloud.sourceName]), ...(journal.cloud.destinationNames || [journal.cloud.destinationName])].includes(cleanFileName)) return "reserved";
+      } catch {
+        return "unavailable";
+      }
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") return "unavailable";
+    return "clear";
+  }
+  return "clear";
+}
+
+function isCloudRelocationCleanupReserved(folderId, fileName) {
+  return getCloudRelocationCleanupReservationState(folderId, fileName) !== "clear";
+}
+
+function isCloudRelocationDestinationForTransaction(transactionId, folderId, fileName) {
+  if (!/^[a-f0-9-]{36}$/i.test(String(transactionId || ""))) return false;
+  try {
+    const journalPath = cloudRelocationCleanupJournalPath(transactionId);
+    const stat = fs.statSync(journalPath);
+    if (!stat.isFile() || stat.size > 1024 * 1024) return false;
+    const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+    return isSafeCloudRelocationCleanupJournal(journal) && journal.operation?.phase === "prepared" &&
+      journal.operation.destinationCopies.some((item) => item.folderId === String(folderId || "") && item.fileName === String(fileName || ""));
+  } catch {
+    return false;
+  }
+}
+
+function isWebDavMoveDestinationForTransaction(transactionId, folderId, fileName) {
+  if (!/^[a-f0-9-]{36}$/i.test(String(transactionId || ""))) return false;
+  try {
+    const journalPath = path.resolve(WEBDAV_MOVE_JOURNAL_DIR, `rootark-webdav-move-${transactionId}.json`);
+    const stat = fs.statSync(journalPath);
+    if (!stat.isFile() || stat.size > 1024 * 1024) return false;
+    const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+    return isSafeWebDavMoveJournal(journal) && journal.cloud?.folderId === String(folderId || "") &&
+      (journal.cloud.destinationNames || [journal.cloud.destinationName]).includes(String(fileName || ""));
+  } catch {
+    return false;
+  }
+}
+
+function cloudRelocationCleanupUnavailableError() {
+  return Object.assign(new Error("Cloud relocation cleanup needs recovery before this file can be changed"), { code: "CLOUD_RECONCILIATION_REQUIRED" });
+}
+
+function writeCloudRelocationCleanupJournal(journal) {
+  if (!isSafeCloudRelocationCleanupJournal(journal)) throw new Error("Unsafe cloud relocation cleanup journal");
+  writeWebDavMoveFileAtomically(journal.journalPath, JSON.stringify(journal));
+}
+
+function claimCloudRelocationCleanupJournal(journal, now = Date.now()) {
+  if (!isSafeCloudRelocationCleanupJournal(journal) || !recoverCloudRelocationCleanupClaimTakeovers()) return null;
+  const lockPath = cloudRelocationCleanupLockPath(journal.transactionId);
+  const token = "cloud-cleanup:" + crypto.randomUUID();
+  fs.mkdirSync(WEBDAV_MOVE_JOURNAL_DIR, { recursive: true });
+  try {
+    writeWebDavMoveClaimLock(lockPath, webDavMoveClaimRecord(token, journal.transactionId, now));
+  } catch (error) {
+    if (error.code !== "EEXIST") return null;
+    try {
+      const existingStat = fs.statSync(lockPath);
+      const existing = fs.readFileSync(lockPath, "utf8");
+      const record = (() => { try { return JSON.parse(existing); } catch { return null; } })();
+      if (!validWebDavMoveClaimRecord(record, journal.transactionId) || webDavMoveOwnerIsLive(record)) return null;
+      const takeover = takeoverWebDavMoveClaim(lockPath, journal.transactionId, record.token, webDavMoveClaimObservation(existing, existingStat), now);
+      if (!takeover) return null;
+      return { path: lockPath, token: takeover };
+    } catch {
+      return null;
+    }
+  }
+  return { path: lockPath, token };
+}
+
+function getCloudRelocationFileIdentity(filePath) {
+  try {
+    const stat = fs.lstatSync(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) return { invalid: true };
+    return webDavMoveFileStatIdentity(stat);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    return { invalid: true };
+  }
+}
+
+function classifyCloudRelocationLocalState(operation) {
+  const sourceIdentity = getCloudRelocationFileIdentity(operation.sourcePath);
+  const destinationIdentity = getCloudRelocationFileIdentity(operation.destinationPath);
+  if (sourceIdentity && !sourceIdentity.invalid && !destinationIdentity && webDavMoveSameStatIdentity(sourceIdentity, operation.sourceIdentity)) return "abort";
+  if (!sourceIdentity && destinationIdentity && !destinationIdentity.invalid && webDavMoveSameRenamedIdentity(destinationIdentity, operation.sourceIdentity)) return "commit";
+  return "ambiguous";
+}
+
+function finalizeCloudRelocationLocalMetadata(journal) {
+  const operation = journal.operation;
+  if (operation.phase !== "committing") {
+    operation.phase = "committing";
+    writeCloudRelocationCleanupJournal(journal);
+  }
+  if (operation.kind === "rename") {
+    renamePublicLinksForFile(operation.sourceName, operation.destinationName, operation.sourceFolderId);
+    renameFileExpiration(operation.sourceFolderId, operation.sourceName, operation.destinationName);
+    renameFileVersions(operation.sourceFolderId, operation.sourceName, operation.destinationName);
+    renameEncryptedMetadata(operation.sourceFolderId, operation.sourceName, operation.destinationName);
+  } else {
+    movePublicLinksForFile(operation.sourceName, operation.destinationName, operation.sourceFolderId, operation.destinationFolderId);
+    moveFileExpiration(operation.sourceFolderId, operation.sourceName, operation.destinationFolderId, operation.destinationName);
+    moveFileVersions(operation.sourceFolderId, operation.sourceName, operation.destinationFolderId, operation.destinationName);
+    moveEncryptedMetadata(operation.sourceFolderId, operation.sourceName, operation.destinationFolderId, operation.destinationName);
+  }
+  for (const item of operation.sourceCleanupItems) tombstoneFilePermission(item.folderId, item.fileName);
+  operation.phase = "committed";
+  journal.items = operation.sourceCleanupItems.map((item) => ({ ...item, clearPermission: true }));
+  journal.state = "queued";
+  journal.nextAttemptAt = null;
+  journal.updatedAt = new Date().toISOString();
+  writeCloudRelocationCleanupJournal(journal);
+}
+
+function beginCloudFileRelocation(sourceFolder, sourceName, destinationFolder, destinationName, history, kind) {
+  const sourcePath = path.resolve(sourceFolder.uploadDir, sourceName);
+  const destinationPath = path.resolve(destinationFolder.uploadDir, destinationName);
+  const sourceIdentity = getCloudRelocationFileIdentity(sourcePath);
+  if (!sourceIdentity || sourceIdentity.invalid) throw Object.assign(new Error("Cloud relocation source changed before commit"), { code: "CLOUD_RECONCILIATION_REQUIRED" });
+  const sourceNames = [...new Set([sourceName, ...history.versions.map((version) => path.basename(version.storedAs || "")).filter(Boolean)])];
+  const destinationNames = [...new Set([destinationName, ...getArchivedVersionDestinationNames(history, destinationName)])];
+  const transactionId = crypto.randomUUID();
+  const journal = {
+    version: 1,
+    transactionId,
+    journalPath: cloudRelocationCleanupJournalPath(transactionId),
+    provider: CLOUD_STORAGE_PROVIDER,
+    items: [],
+    attempts: 0,
+    state: "prepared",
+    failureCategory: null,
+    nextAttemptAt: null,
+    createdAt: new Date().toISOString(),
+    operation: {
+      kind,
+      phase: "prepared",
+      sourceFolderId: sourceFolder.id,
+      sourceName,
+      destinationFolderId: destinationFolder.id,
+      destinationName,
+      sourcePath,
+      destinationPath,
+      sourceIdentity,
+      sourceCleanupItems: sourceNames.map((fileName) => ({ folderId: sourceFolder.id, fileName, area: "uploads" })),
+      destinationCopies: destinationNames.map((fileName) => ({ folderId: destinationFolder.id, fileName, area: "uploads" })),
+      destinationPermissionSnapshot: {
+        folderId: destinationFolder.id,
+        fileName: destinationName,
+        previousDestination: getFilePermissionEntry(destinationFolder.id, destinationName),
+      },
+    },
+  };
+  const claim = claimCloudRelocationCleanupJournal(journal);
+  if (!claim) throw Object.assign(new Error("Cloud relocation journal is already claimed"), { code: "CLOUD_RECONCILIATION_REQUIRED" });
+  try {
+    writeCloudRelocationCleanupJournal(journal);
+    copyFilePermission(sourceFolder.id, sourceName, destinationFolder.id, destinationName);
+    return { journal, claim };
+  } catch (error) {
+    releaseWebDavMoveClaim(claim);
+    throw error;
+  }
+}
+
+async function resolveCloudFileRelocation(journal, now = Date.now()) {
+  const operation = journal.operation;
+  if (!operation) return;
+  if (operation.phase === "prepared") {
+    const outcome = classifyCloudRelocationLocalState(operation);
+    operation.phase = outcome === "commit" ? "committing" : outcome === "abort" ? "aborting" : "ambiguous";
+    journal.state = outcome === "ambiguous" ? "manual_recovery" : outcome === "commit" ? "committing" : "aborting";
+    journal.failureCategory = outcome === "ambiguous" ? "local_identity_ambiguous" : null;
+    journal.updatedAt = new Date(now).toISOString();
+    writeCloudRelocationCleanupJournal(journal);
+  }
+  if (operation.phase === "committing") {
+    finalizeCloudRelocationLocalMetadata(journal);
+  } else if (operation.phase === "committed") {
+    return;
+  } else if (operation.phase === "aborting") {
+    journal.items = operation.destinationCopies.map((item) => ({ ...item }));
+    journal.state = "queued";
+    journal.failureCategory = null;
+    journal.updatedAt = new Date(now).toISOString();
+    writeCloudRelocationCleanupJournal(journal);
+  }
+}
+
+async function performCloudFileRelocation(sourceFolder, sourceName, destinationFolder, destinationName, history, kind, acquiredMutationClaim = null) {
+  const mutationClaim = acquiredMutationClaim || claimCloudRelocationMutationLock();
+  const ownsMutationClaim = !acquiredMutationClaim;
+  if (!mutationClaim) throw Object.assign(new Error("Another cloud relocation is active"), { code: "CLOUD_RECONCILIATION_REQUIRED" });
+  let transaction;
+  try {
+    if (isFileInTrash(sourceFolder.id, sourceName)) {
+      throw Object.assign(new Error("Cloud relocation source is in trash"), { code: "CLOUD_RELOCATION_CONFLICT" });
+    }
+    const sourceObjects = await listCloudFiles(sourceFolder.id, "uploads");
+    const destinationObjects = sourceFolder.id === destinationFolder.id ? sourceObjects : await listCloudFiles(destinationFolder.id, "uploads");
+    const sourceNames = [...new Set([sourceName, ...history.versions.map((version) => path.basename(version.storedAs || "")).filter(Boolean)])];
+    const destinationNames = [...new Set([destinationName, ...getArchivedVersionDestinationNames(history, destinationName)])];
+    if (!sourceObjects.some((file) => file.name === sourceName) || sourceNames.some((name) => isCloudRelocationCleanupReserved(sourceFolder.id, name))) {
+      throw Object.assign(new Error("Cloud relocation source changed before commit"), { code: "CLOUD_RELOCATION_CONFLICT" });
+    }
+    const destinationObjectNames = new Set(destinationObjects.map((file) => file.name));
+    if (destinationNames.some((name) => destinationObjectNames.has(name) || fs.existsSync(path.join(destinationFolder.uploadDir, name)) || getCloudRelocationCleanupReservationState(destinationFolder.id, name) !== "clear")) {
+      throw Object.assign(new Error("Cloud relocation destination changed before commit"), { code: "CLOUD_RELOCATION_CONFLICT" });
+    }
+    transaction = beginCloudFileRelocation(sourceFolder, sourceName, destinationFolder, destinationName, history, kind);
+    try {
+      await stageCloudVersionsForRelocation(sourceFolder, sourceName, destinationFolder, destinationName, history, { cleanupOnFailure: false, transactionId: transaction.journal.transactionId });
+    } catch (error) {
+      const pending = await reconcileCloudRelocationCleanupJournal(transaction.journal);
+      return { committed: transaction.journal.operation.phase === "committed", pending, error, stageFailure: true };
+    }
+    const operation = transaction.journal.operation;
+    const currentSourceIdentity = getCloudRelocationFileIdentity(operation.sourcePath);
+    if (!currentSourceIdentity || currentSourceIdentity.invalid || !webDavMoveSameStatIdentity(currentSourceIdentity, operation.sourceIdentity) || fs.existsSync(operation.destinationPath)) {
+      if (currentSourceIdentity && !currentSourceIdentity.invalid && !fs.existsSync(operation.destinationPath)) {
+        operation.phase = "aborting";
+        transaction.journal.state = "aborting";
+        transaction.journal.failureCategory = "source_changed_before_local_commit";
+      } else {
+        operation.phase = "ambiguous";
+        transaction.journal.state = "manual_recovery";
+        transaction.journal.failureCategory = "local_identity_ambiguous";
+      }
+      transaction.journal.updatedAt = new Date().toISOString();
+      writeCloudRelocationCleanupJournal(transaction.journal);
+      await reconcileCloudRelocationCleanupJournal(transaction.journal);
+      return { committed: transaction.journal.operation.phase === "committed", pending: true, error: { code: "CLOUD_RECONCILIATION_REQUIRED" } };
+    }
+    try {
+      await fs.promises.rename(operation.sourcePath, operation.destinationPath);
+    } catch (error) {
+      const pending = await reconcileCloudRelocationCleanupJournal(transaction.journal);
+      return { committed: transaction.journal.operation.phase === "committed", pending, error };
+    }
+    const pending = await reconcileCloudRelocationCleanupJournal(transaction.journal);
+    return { committed: transaction.journal.operation.phase === "committed", pending };
+  } finally {
+    if (transaction?.claim) releaseWebDavMoveClaim(transaction.claim);
+    if (ownsMutationClaim) releaseWebDavMoveClaim(mutationClaim);
+  }
+}
+
+async function reconcileCloudRelocationCleanupJournal(journal, now = Date.now()) {
+  if (!isSafeCloudRelocationCleanupJournal(journal)) throw new Error("Unsafe cloud relocation cleanup journal");
+  await resolveCloudFileRelocation(journal, now);
+  if (journal.operation?.phase === "ambiguous") return true;
+  if (journal.provider !== CLOUD_STORAGE_PROVIDER || !isCloudStorageEnabled()) {
+    journal.state = "waiting_for_provider";
+    journal.failureCategory = journal.provider !== CLOUD_STORAGE_PROVIDER ? "provider_mismatch" : "provider_unavailable";
+    journal.nextAttemptAt = new Date(now + CLOUD_RELOCATION_CLEANUP_INTERVAL_MS).toISOString();
+    writeCloudRelocationCleanupJournal(journal);
+    return true;
+  }
+
+  while (journal.items.length) {
+    const item = journal.items[0];
+    journal.state = "delete_uncertain";
+    journal.activeItem = item;
+    journal.updatedAt = new Date(now).toISOString();
+    writeCloudRelocationCleanupJournal(journal);
+    try {
+      await deleteFileFromCloud(item.folderId, item.fileName, item.area);
+      if (item.clearPermission) removeFilePermission(item.folderId, item.fileName);
+    } catch (error) {
+      journal.attempts = (Number(journal.attempts) || 0) + 1;
+      journal.state = "retry_wait";
+      journal.failureCategory = String(error?.code || "provider_failure").slice(0, 80);
+      journal.nextAttemptAt = new Date(now + Math.min(CLOUD_RELOCATION_CLEANUP_MAX_BACKOFF_MS, 1000 * (2 ** Math.max(0, journal.attempts - 1)))).toISOString();
+      writeCloudRelocationCleanupJournal(journal);
+      console.error("[cloud-storage] staged relocation cleanup pending:", sanitizeLogValue(error.message));
+      return true;
+    }
+    journal.items.shift();
+    journal.activeItem = null;
+    journal.state = journal.items.length ? "queued" : "completed";
+    journal.failureCategory = null;
+    journal.nextAttemptAt = null;
+    journal.updatedAt = new Date(now).toISOString();
+    writeCloudRelocationCleanupJournal(journal);
+  }
+  if (journal.operation?.phase === "aborting") restoreCopiedFilePermission(journal.operation.destinationPermissionSnapshot);
+  fs.rmSync(journal.journalPath, { force: true });
+  return false;
+}
+
+async function queueCloudRelocationCleanup(copies) {
+  const unique = new Map();
+  for (const copy of copies) {
+    const key = `${copy.folderId}\0${copy.fileName}`;
+    const previous = unique.get(key);
+    unique.set(key, {
+      folderId: String(copy.folderId || ""),
+      fileName: String(copy.fileName || ""),
+      area: "uploads",
+      ...(copy.clearPermission || previous?.clearPermission ? { clearPermission: true } : {}),
+    });
+  }
+  const items = [...unique.values()];
+  if (!items.length) return false;
+  const transactionId = crypto.randomUUID();
+  const journal = {
+    version: 1,
+    transactionId,
+    journalPath: cloudRelocationCleanupJournalPath(transactionId),
+    provider: CLOUD_STORAGE_PROVIDER,
+    items,
+    attempts: 0,
+    state: "queued",
+    failureCategory: null,
+    nextAttemptAt: null,
+    createdAt: new Date().toISOString(),
+  };
+  writeCloudRelocationCleanupJournal(journal);
+  await resumeCloudRelocationCleanupJournals();
+  return fs.existsSync(journal.journalPath);
+}
+
+function findCloudRelocationCleanupJournal(folderId, fileName) {
+  let names;
+  try { names = fs.readdirSync(WEBDAV_MOVE_JOURNAL_DIR); }
+  catch (error) { return error.code === "ENOENT" ? false : null; }
+  for (const name of names.filter((entry) => /^rootark-cloud-relocation-cleanup-[a-f0-9-]{36}\.json$/i.test(entry))) {
+    try {
+      const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, name);
+      const stat = fs.statSync(journalPath);
+      if (!stat.isFile() || stat.size > 1024 * 1024) return null;
+      const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+      if (!isSafeCloudRelocationCleanupJournal(journal)) return null;
+      if (journal.items.some((item) => item.folderId === folderId && item.fileName === fileName && item.area === "uploads")) return true;
+    } catch {
+      return null;
+    }
+  }
+  return false;
+}
+
+async function queueOrphanCloudRelocationCleanupTombstones() {
+  for (const [key, entry] of Object.entries(loadFilePermissions())) {
+    if (!entry?.cleanupPending || typeof key !== "string") continue;
+    const separator = key.lastIndexOf("/");
+    if (separator < 1 || separator === key.length - 1) continue;
+    const folderId = key.slice(0, separator);
+    const fileName = key.slice(separator + 1);
+    const hasJournal = findCloudRelocationCleanupJournal(folderId, fileName);
+    if (hasJournal !== false) continue;
+    try {
+      await queueCloudRelocationCleanup([{ folderId, fileName, clearPermission: true }]);
+    } catch (error) {
+      console.error("[cloud-storage] orphan relocation tombstone remains pending:", sanitizeLogValue(error.message));
+    }
+  }
+}
+
+async function resumeCloudRelocationCleanupJournals(now = Date.now()) {
+  if (cloudRelocationCleanupRunning || !fs.existsSync(WEBDAV_MOVE_JOURNAL_DIR)) return;
+  cloudRelocationCleanupRunning = true;
+  try {
+    await queueOrphanCloudRelocationCleanupTombstones();
+    for (const name of fs.readdirSync(WEBDAV_MOVE_JOURNAL_DIR).filter((entry) => /^rootark-cloud-relocation-cleanup-[a-f0-9-]{36}\.json$/i.test(entry))) {
+      const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, name);
+      let journal;
+      try { journal = JSON.parse(fs.readFileSync(journalPath, "utf8")); } catch { continue; }
+      if (!isSafeCloudRelocationCleanupJournal(journal) || (journal.nextAttemptAt && new Date(journal.nextAttemptAt).getTime() > now)) continue;
+      const claim = claimCloudRelocationCleanupJournal(journal, now);
+      if (!claim) continue;
+      try {
+        const latest = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+        if (isSafeCloudRelocationCleanupJournal(latest) && (!latest.nextAttemptAt || new Date(latest.nextAttemptAt).getTime() <= now)) {
+          await reconcileCloudRelocationCleanupJournal(latest, now);
+        }
+      } catch (error) {
+        console.error("[cloud-storage] staged relocation cleanup failed:", sanitizeLogValue(error.message));
+      } finally {
+        releaseWebDavMoveClaim(claim);
+      }
+    }
+  } finally {
+    cloudRelocationCleanupRunning = false;
+  }
+}
+
+function startCloudRelocationCleanup() {
+  void resumeCloudRelocationCleanupJournals().catch((error) => console.error("[cloud-storage] cleanup recovery failed:", sanitizeLogValue(error.message)));
+  if (!cloudRelocationCleanupTimer) {
+    cloudRelocationCleanupTimer = setInterval(() => {
+      void resumeCloudRelocationCleanupJournals().catch((error) => console.error("[cloud-storage] cleanup recovery failed:", sanitizeLogValue(error.message)));
+    }, CLOUD_RELOCATION_CLEANUP_INTERVAL_MS);
+    cloudRelocationCleanupTimer.unref?.();
+    server.once("close", () => clearInterval(cloudRelocationCleanupTimer));
+  }
+}
+
 function persistWebDavMoveMetadataSnapshot(transactionId, snapshot) {
   const directory = path.resolve(WEBDAV_MOVE_JOURNAL_DIR, `rootark-webdav-move-${transactionId}`, "metadata");
   if (!isSafeChildPath(WEBDAV_MOVE_JOURNAL_DIR, directory)) throw new Error("Invalid WebDAV metadata snapshot path");
@@ -6822,6 +7516,8 @@ function isSafeWebDavMoveJournal(journal) {
   if (!journal.metadata?.directory || !isSafeChildPath(WEBDAV_MOVE_JOURNAL_DIR, journal.metadata.directory)) return false;
   if (!journal.metadata?.files || Object.keys(journal.metadata.files).some((file) => !WEBDAV_MOVE_METADATA_FILES.includes(file))) return false;
   if (Object.values(journal.metadata.files).some((entry) => !entry || !isSafeChildPath(journal.metadata.directory, entry.path))) return false;
+  const validObjectNames = (names) => Array.isArray(names) && names.length <= 1000 && names.every((name) => typeof name === "string" && name && name !== "." && name !== ".." && !name.includes("/") && !name.includes("\\"));
+  if (journal.cloud && [journal.cloud.sourceNames, journal.cloud.destinationNames, journal.cloud.uploadedDestinationNames, journal.cloud.removedSourceNames].some((names) => names !== undefined && !validObjectNames(names))) return false;
   return path.dirname(path.resolve(journal.destinationPath)) === sourceDir &&
     path.dirname(path.resolve(journal.stagePath)) === sourceDir &&
     path.dirname(path.resolve(journal.destinationBackupPath)) === sourceDir &&
@@ -6956,7 +7652,7 @@ function webDavMoveClaimToken(contents) {
 }
 
 function webDavMoveClaimRecord(token, transactionId, now) {
-  return { version: 1, token, transactionId, pid: process.pid, processStartIdentity: webDavMoveProcessStartIdentity(process.pid), claimedAt: new Date(now).toISOString() };
+  return { version: 1, token, transactionId, pid: process.pid, hostname: os.hostname(), processStartIdentity: webDavMoveProcessStartIdentity(process.pid), claimedAt: new Date(now).toISOString() };
 }
 
 function webDavMoveProcessStartIdentity(pid) {
@@ -6970,6 +7666,7 @@ function webDavMoveProcessStartIdentity(pid) {
 }
 
 function webDavMoveOwnerIsLive(record) {
+  if (typeof record?.hostname === "string" && record.hostname !== os.hostname()) return true;
   if (!Number.isInteger(Number(record?.pid)) || Number(record.pid) <= 0) return false;
   try { process.kill(Number(record.pid), 0); } catch (error) { return error.code === "EPERM"; }
   if (record.processStartIdentity && webDavMoveProcessStartIdentity(Number(record.pid))) return record.processStartIdentity === webDavMoveProcessStartIdentity(Number(record.pid));
@@ -7025,7 +7722,7 @@ function webDavMoveReadTakeoverAuthority(lockPath, transactionId) {
   }
   let record;
   try { record = JSON.parse(fs.readFileSync(webDavMoveTakeoverMeta(lockPath), "utf8")); } catch { return { kind: "malformed", mtimeMs: stat.mtimeMs }; }
-  const expectedLock = webDavMoveLockPath(transactionId);
+  const expectedLock = path.resolve(lockPath);
   if (record?.version !== 1 || typeof record.token !== "string" || !record.token || record.transactionId !== transactionId || path.resolve(record.lockPath || "") !== path.resolve(expectedLock) || path.resolve(record.evidencePath || "") !== path.resolve(webDavMoveTakeoverEvidence(lockPath)) || !Number.isInteger(Number(record.pid)) || Number(record.pid) <= 0 || !Number.isFinite(Date.parse(record.claimedAt || "")) || !record.observed?.sha256 || !Number.isInteger(record.observed.size) || !record.observed.stat) return { kind: "mismatch", record };
   return { kind: "valid", record, live: webDavMoveOwnerIsLive(record), mtimeMs: stat.mtimeMs };
 }
@@ -7070,16 +7767,20 @@ function webDavMoveRecoverTakeoverAuthority(lockPath, transactionId) {
 
 function writeWebDavMoveClaimLock(lockPath, record) {
   let fd;
+  const temporaryPath = `${lockPath}.${crypto.randomUUID()}.tmp`;
   try {
-    fd = fs.openSync(lockPath, "wx");
+    fd = fs.openSync(temporaryPath, "wx");
     const contents = Buffer.from(JSON.stringify(record));
     fs.writeSync(fd, contents, 0, contents.length);
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;
+    fs.linkSync(temporaryPath, lockPath);
   } catch (error) {
     try { if (fd !== undefined) fs.closeSync(fd); } catch {}
     throw error;
+  } finally {
+    try { fs.rmSync(temporaryPath, { force: true }); } catch {}
   }
 }
 
@@ -7097,7 +7798,7 @@ function recoverWebDavMoveClaimTakeovers() {
 function takeoverWebDavMoveClaim(lockPath, transactionId, previousToken, observed, now) {
   const ownerToken = `${crypto.randomUUID()}:${crypto.randomUUID()}`;
   const takeoverDir = webDavMoveTakeoverDir(lockPath);
-  const authority = { version: 1, transactionId, lockPath, evidencePath: webDavMoveTakeoverEvidence(lockPath), token: ownerToken, previousToken, pid: process.pid, processStartIdentity: webDavMoveProcessStartIdentity(process.pid), claimedAt: new Date(now).toISOString(), observed: webDavMoveTakeoverObservation(observed) };
+  const authority = { version: 1, transactionId, lockPath, evidencePath: webDavMoveTakeoverEvidence(lockPath), token: ownerToken, previousToken, pid: process.pid, hostname: os.hostname(), processStartIdentity: webDavMoveProcessStartIdentity(process.pid), claimedAt: new Date(now).toISOString(), observed: webDavMoveTakeoverObservation(observed) };
   try {
     webDavMoveRecoverTakeoverAuthority(lockPath, transactionId);
     fs.mkdirSync(takeoverDir, { recursive: false });
@@ -7193,44 +7894,78 @@ function markWebDavMoveRetry(journal, error, now = Date.now()) {
   return terminal;
 }
 
+function deferWebDavMoveForProvider(journal, failureCategory, now = Date.now()) {
+  const at = new Date(now).toISOString();
+  webDavCloudTransition(journal, "retry_wait", at, {
+    failureCategory,
+    nextAttemptAt: new Date(now + WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS).toISOString(),
+    leaseToken: null,
+    leaseUntil: null,
+  });
+  writeWebDavMoveJournal(journal);
+  return { pending: true, blocked: true };
+}
+
 async function reconcileWebDavMoveCloud(journal, { claimToken = null, now = Date.now() } = {}) {
-  if (!journal.cloud || !isCloudStorageEnabled()) {
+  if (!journal.cloud) {
     webDavCloudTransition(journal, "completed", new Date(now).toISOString(), { completedAt: new Date(now).toISOString(), leaseToken: null, leaseUntil: null });
     writeWebDavMoveJournal(journal);
     return { pending: false };
   }
   if (claimToken && journal.cloud.leaseToken !== claimToken) throw Object.assign(new Error("MOVE claim mismatch"), { code: "WEBDAV_MOVE_CLAIM_MISMATCH" });
-  const { folderId, sourceName, destinationName } = journal.cloud;
-  if (!journal.cloud.destinationUploaded) {
-    webDavCloudTransition(journal, "destination_upload_intent", new Date(now).toISOString(), { failureCategory: null });
+  const expectedProvider = String(journal.cloud.provider || "").toLowerCase();
+  if (!expectedProvider) return deferWebDavMoveForProvider(journal, "provider_unknown", now);
+  if (expectedProvider !== "local" && expectedProvider !== CLOUD_STORAGE_PROVIDER) return deferWebDavMoveForProvider(journal, "provider_mismatch", now);
+  if (expectedProvider !== "local" && !isCloudStorageEnabled()) return deferWebDavMoveForProvider(journal, "provider_unavailable", now);
+  if (expectedProvider === "local") {
+    webDavCloudTransition(journal, "completed", new Date(now).toISOString(), { completedAt: new Date(now).toISOString(), leaseToken: null, leaseUntil: null });
     writeWebDavMoveJournal(journal);
-    webDavCloudTransition(journal, "destination_upload_uncertain", new Date(now).toISOString());
+    return { pending: false };
+  }
+  const { folderId, sourceName, destinationName } = journal.cloud;
+  const destinationNames = [...new Set(Array.isArray(journal.cloud.destinationNames) ? journal.cloud.destinationNames : [destinationName])];
+  const uploadedDestinationNames = new Set(journal.cloud.uploadedDestinationNames || (journal.cloud.destinationUploaded ? destinationNames : []));
+  for (const objectName of destinationNames) {
+    if (uploadedDestinationNames.has(objectName)) continue;
+    webDavCloudTransition(journal, "destination_upload_intent", new Date(now).toISOString(), { failureCategory: null, activeObjectName: objectName });
+    writeWebDavMoveJournal(journal);
+    webDavCloudTransition(journal, "destination_upload_uncertain", new Date(now).toISOString(), { activeObjectName: objectName });
     writeWebDavMoveJournal(journal);
     try {
-      await uploadFileToCloud(journal.destinationPath, folderId, destinationName, "uploads");
+      const objectPath = objectName === destinationName
+        ? journal.destinationPath
+        : path.join(path.dirname(journal.destinationPath), objectName);
+      if (!isSafeChildPath(path.dirname(journal.destinationPath), objectPath)) throw Object.assign(new Error("Invalid MOVE version path"), { code: "WEBDAV_MOVE_INVALID_VERSION_PATH" });
+      if (!await uploadFileToCloud(objectPath, folderId, objectName, "uploads", { webDavMoveTransactionId: journal.transactionId })) throw Object.assign(new Error("MOVE cloud destination is unavailable"), { code: "CLOUD_STORAGE_UNAVAILABLE" });
     } catch (error) {
       if (!['already_exists', 'PreconditionFailed', 'duplicate'].includes(String(error?.code || ""))) {
         const terminal = markWebDavMoveRetry(journal, error, now);
         return { pending: !terminal, terminal, error };
       }
     }
-    journal.cloud.destinationUploaded = true;
-    journal.completedOperations.push("cloud.destination.upload");
-    webDavCloudTransition(journal, "destination_uploaded", new Date(now).toISOString(), { failureCategory: null });
+    uploadedDestinationNames.add(objectName);
+    journal.cloud.uploadedDestinationNames = [...uploadedDestinationNames];
+    journal.cloud.destinationUploaded = destinationNames.every((name) => uploadedDestinationNames.has(name));
+    journal.completedOperations.push(`cloud.destination.upload:${objectName}`);
+    webDavCloudTransition(journal, "destination_uploaded", new Date(now).toISOString(), { failureCategory: null, activeObjectName: objectName });
     writeWebDavMoveJournal(journal);
   }
+  journal.cloud.destinationUploaded = destinationNames.every((name) => uploadedDestinationNames.has(name));
   if (!journal.cloud.lastAttemptAt) {
     journal.cloud.attempts = Math.max(1, Number(journal.cloud.attempts) || 0);
     journal.cloud.lastAttemptAt = new Date(now).toISOString();
     writeWebDavMoveJournal(journal);
   }
-  if (!journal.cloud.sourceRemoved) {
-    webDavCloudTransition(journal, "source_delete_intent", new Date(now).toISOString(), { failureCategory: null });
+  const sourceNames = [...new Set(Array.isArray(journal.cloud.sourceNames) ? journal.cloud.sourceNames : [sourceName])];
+  const removedSourceNames = new Set(journal.cloud.removedSourceNames || (journal.cloud.sourceRemoved ? sourceNames : []));
+  for (const objectName of sourceNames) {
+    if (removedSourceNames.has(objectName)) continue;
+    webDavCloudTransition(journal, "source_delete_intent", new Date(now).toISOString(), { failureCategory: null, activeObjectName: objectName });
     writeWebDavMoveJournal(journal);
-    webDavCloudTransition(journal, "source_delete_uncertain", new Date(now).toISOString());
+    webDavCloudTransition(journal, "source_delete_uncertain", new Date(now).toISOString(), { activeObjectName: objectName });
     writeWebDavMoveJournal(journal);
     try {
-      await deleteFileFromCloud(folderId, sourceName, "uploads");
+      await deleteFileFromCloud(folderId, objectName, "uploads");
     } catch (error) {
       if (webDavCloudFailureCategory(error) === "source_already_absent") {
         // Deleting an already-absent source is the idempotent success case.
@@ -7239,11 +7974,21 @@ async function reconcileWebDavMoveCloud(journal, { claimToken = null, now = Date
         return { pending: !terminal, terminal, error };
       }
     }
-    journal.cloud.sourceRemoved = true;
-    journal.completedOperations.push("cloud.source.remove");
-    webDavCloudTransition(journal, "completed", new Date(now).toISOString(), { completedAt: new Date(now).toISOString(), nextAttemptAt: null, failureCategory: null, leaseToken: null, leaseUntil: null });
+    removedSourceNames.add(objectName);
+    journal.cloud.removedSourceNames = [...removedSourceNames];
+    journal.cloud.sourceRemoved = sourceNames.every((name) => removedSourceNames.has(name));
+    journal.completedOperations.push(`cloud.source.remove:${objectName}`);
+    webDavCloudTransition(journal, journal.cloud.sourceRemoved ? "completed" : "source_delete_uncertain", new Date(now).toISOString(), {
+      completedAt: journal.cloud.sourceRemoved ? new Date(now).toISOString() : null,
+      nextAttemptAt: null,
+      failureCategory: null,
+      leaseToken: journal.cloud.sourceRemoved ? null : journal.cloud.leaseToken,
+      leaseUntil: journal.cloud.sourceRemoved ? null : journal.cloud.leaseUntil,
+      activeObjectName: objectName,
+    });
     writeWebDavMoveJournal(journal);
   }
+  journal.cloud.sourceRemoved = sourceNames.every((name) => removedSourceNames.has(name));
   return { pending: false };
 }
 
@@ -7282,18 +8027,80 @@ async function resumeWebDavMoveCloudJournals() {
 async function handleWebDavMove(req, res, segments) {
   if (!WEBDAV_ALLOW_MOVE) return res.status(405).send("MOVE is disabled for WebDAV MVP");
   if (!req.user?.permissions?.upload) return res.status(403).send("Upload permission required");
-  const source = await resolveWebDavTarget(req, segments);
+  const mutationClaim = isCloudStorageEnabled() ? claimCloudRelocationMutationLock() : null;
+  if (isCloudStorageEnabled() && !mutationClaim) return res.status(503).json({ status: "reconciliation_required" });
+  try {
+    return await handleWebDavMoveUnderMutationClaim(req, res, segments);
+  } finally {
+    releaseWebDavMoveClaim(mutationClaim);
+  }
+}
+
+async function handleWebDavMoveUnderMutationClaim(req, res, segments) {
+  if (!WEBDAV_ALLOW_MOVE) return res.status(405).send("MOVE is disabled for WebDAV MVP");
+  if (!req.user?.permissions?.upload) return res.status(403).send("Upload permission required");
+  const source = await resolveWebDavTarget(req, segments, { hydrateFiles: false, verifyMetadata: false, requireEdit: true });
+  if (source?.blocked) return res.status(source.status).send(source.message);
   const destinationSegments = getWebDavMoveDestination(req);
   const destination = destinationSegments && getWebDavUploadTarget(req, destinationSegments);
   if (!source || source.type !== "file" || !destination) return res.status(409).send("Invalid MOVE target");
   if (source.folder.id !== destination.folder.id) return res.status(403).send("Cross-folder MOVE is not supported");
-  if (!hasFileEditAccess(req, source.folder, source.name)) return res.status(403).send("Permission denied");
   if (source.name === destination.fileName) return res.status(403).send("Source and destination are identical");
+  if (isCloudStorageEnabled() && isCloudRelocationCleanupReserved(source.folder.id, source.name)) return res.status(409).send("Source is reserved for relocation recovery");
+  if (isCloudRelocationCleanupReserved(source.folder.id, destination.fileName)) return res.status(409).send("Destination is reserved for relocation recovery");
+  if (!consumeCloudMetadataRateLimit(req, res, "/webdav/move")) return;
+  try {
+    source.listedFiles = await listFilesWithCloudDetails(source.folder.uploadDir, source.folder.id, "uploads", { strictCloud: true });
+  } catch {
+    return res.status(503).send("Cloud storage is temporarily unavailable");
+  }
+  if (!source.listedFiles.some((file) => file.name === source.name)) return res.status(404).send("Not found");
   const destinationPath = path.join(source.folder.uploadDir, destination.fileName);
   if (!isSafeChildPath(source.folder.uploadDir, source.filePath) || !isSafeChildPath(source.folder.uploadDir, destinationPath)) return res.status(409).send("Invalid MOVE target");
   const overwrite = String(req.headers.overwrite || "F").toUpperCase() === "T";
-  const destinationExists = isExistingFile(destinationPath);
+  const destinationExists = isExistingFile(destinationPath) || source.listedFiles.some((file) => file.name === destination.fileName);
   if (destinationExists && !overwrite) return res.status(412).send("Destination exists");
+  if (destinationExists && isWebDavInternalStoredFile(source.folder.id, destination.fileName)) return res.status(409).send("Invalid MOVE target");
+  if (destinationExists && !hasFileEditAccess(req, source.folder, destination.fileName)) return res.status(403).send("Permission denied");
+  const versionHistory = getVersionHistory(source.folder.id, source.name);
+  const sourceVersionNames = versionHistory.versions
+    .filter((version) => version.version !== versionHistory.currentVersion && version.storedAs)
+    .map((version) => path.basename(version.storedAs));
+  const destinationVersionNames = getArchivedVersionDestinationNames(versionHistory, destination.fileName);
+  if (destinationVersionNames.some((name) => source.listedFiles.some((file) => file.name === name) || isCloudRelocationCleanupReserved(source.folder.id, name))) {
+    return res.status(409).send("Version destination already exists");
+  }
+  const destinationHistory = getVersionHistory(source.folder.id, destination.fileName);
+  if (destinationExists && destinationHistory.versions.some((version) => version.version !== destinationHistory.currentVersion && version.storedAs)) {
+    return res.status(409).send("Cannot overwrite a file with stored versions");
+  }
+  if (destinationExists && !isExistingFile(destinationPath)) {
+    try {
+      if (!await ensureCloudFileCached(source.folder.id, destination.fileName, destinationPath, "uploads", { strictCloud: true })) {
+        return res.status(503).send("Cloud storage is temporarily unavailable");
+      }
+    } catch {
+      return res.status(503).send("Cloud storage is temporarily unavailable");
+    }
+  }
+  for (const versionName of sourceVersionNames) {
+    const versionPath = path.join(source.folder.uploadDir, versionName);
+    try {
+      if (!await ensureCloudFileCached(source.folder.id, versionName, versionPath, "uploads", { strictCloud: true })) {
+        return res.status(503).send("Cloud storage is temporarily unavailable");
+      }
+    } catch {
+      return res.status(503).send("Cloud storage is temporarily unavailable");
+    }
+  }
+  try {
+    if (!await ensureCloudFileCached(source.folder.id, source.name, source.filePath, "uploads", { strictCloud: true })) {
+      return res.status(503).send("Cloud storage is temporarily unavailable");
+    }
+    source.stats = fs.statSync(source.filePath);
+  } catch {
+    return res.status(503).send("Cloud storage is temporarily unavailable");
+  }
   const transactionId = crypto.randomUUID();
   let journal = {
     version: 1,
@@ -7320,6 +8127,10 @@ async function handleWebDavMove(req, res, segments) {
     folderId: source.folder.id,
     sourceName: source.name,
     destinationName: destination.fileName,
+    sourceNames: [...new Set([source.name, ...sourceVersionNames])],
+    destinationNames: [...new Set([destination.fileName, ...destinationVersionNames])],
+    uploadedDestinationNames: [],
+    removedSourceNames: [],
     destinationUploaded: false,
     sourceRemoved: false,
     state: "queued",
@@ -7478,6 +8289,7 @@ function registerWebDavRoutes() {
         error: error.message,
         path: getSafeWebDavAuditPath(req),
       });
+    if (error.code === "CLOUD_STORAGE_UNAVAILABLE") return res.status(503).send("Cloud storage is temporarily unavailable");
       return res.status(error.message.includes("Caminho WebDAV") ? 400 : 500).send("WebDAV request failed");
     }
   };
@@ -7574,7 +8386,7 @@ app.get("/list", authenticate, requirePermission("listFiles"), async (req, res) 
     const visibleFiles = await listVisibleFilesForFolder(req, folder);
     res.json(visibleFiles);
   } catch (error) {
-    res.status(500).json({ error: "Erro ao listar" });
+    res.status(error.code === "CLOUD_STORAGE_UNAVAILABLE" ? 503 : 500).json({ error: error.code === "CLOUD_STORAGE_UNAVAILABLE" ? "Armazenamento temporariamente indisponivel" : "Erro ao listar" });
   }
 });
 
@@ -7598,15 +8410,15 @@ async function handleFileSearch(req, res) {
 
   try {
     const caches = getFileListCaches();
-    const lists = await Promise.all(foldersToSearch.map((folder) => listVisibleFilesForFolder(req, folder, caches).catch(() => [])));
+    const lists = await Promise.all(foldersToSearch.map((folder) => listVisibleFilesForFolder(req, folder, caches)));
     const results = sortSearchResults(filterSearchResults(lists.flat(), filters), sortBy, sortOrder);
     res.json(results);
   } catch (error) {
-    res.status(500).json({ error: "Erro ao buscar arquivos" });
+    res.status(error.code === "CLOUD_STORAGE_UNAVAILABLE" ? 503 : 500).json({ error: error.code === "CLOUD_STORAGE_UNAVAILABLE" ? "Armazenamento temporariamente indisponivel" : "Erro ao buscar arquivos" });
   }
 }
 
-app.get("/versions/:filename", versionsRateLimit, authenticate, requirePermission("listFiles"), (req, res) => {
+app.get("/versions/:filename", versionsRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
@@ -7616,14 +8428,17 @@ app.get("/versions/:filename", versionsRateLimit, authenticate, requirePermissio
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
 
-  const filePath = path.join(folder.uploadDir, name);
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
-
   if (!hasFileAccess(req, folder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
+  let listedFile;
+  try {
+    listedFile = await getListedFileDetails(folder, name, { strictCloud: true });
+  } catch {
+    return res.status(503).json({ error: "Armazenamento temporariamente indisponivel" });
+  }
+  if (!listedFile) return res.status(404).json({ error: "Arquivo nao encontrado" });
 
   const history = getVersionHistory(folder.id, name);
   const owner = normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, name)).owner;
@@ -7639,15 +8454,29 @@ app.get("/versions/:filename", versionsRateLimit, authenticate, requirePermissio
 });
 
 
-app.post("/versions/:filename/initialize", versionsRateLimit, authenticate, requirePermission("listFiles"), (req, res) => {
+app.post("/versions/:filename/initialize", versionsRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
   if (!folder) return;
   if (!rawName || name !== rawName) return res.status(400).json({ error: "Nome de arquivo invalido" });
   if (!hasFileAccess(req, folder, name)) return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
+  let listedFile;
+  try {
+    listedFile = await getListedFileDetails(folder, name, { strictCloud: true });
+  } catch {
+    return res.status(503).json({ error: "Armazenamento temporariamente indisponivel" });
+  }
+  if (!listedFile) return res.status(404).json({ error: "Arquivo nao encontrado" });
   const filePath = path.join(folder.uploadDir, name);
-  if (!isExistingFile(filePath)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  try {
+    if (!await ensureCloudFileCached(folder.id, name, filePath, "uploads", { strictCloud: true })) {
+      return res.status(503).json({ error: "Armazenamento temporariamente indisponivel" });
+    }
+  } catch {
+    return res.status(503).json({ error: "Armazenamento temporariamente indisponivel" });
+  }
   const { history } = ensureVersionHistory(folder, name, normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, name)).owner, "Versao inicial");
   return res.json({ folderId: folder.id, fileName: name, currentVersion: history.currentVersion });
 });
@@ -7736,6 +8565,13 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
 
+  const mutationClaim = isCloudStorageEnabled() ? claimCloudRelocationMutationLock() : null;
+  if (isCloudStorageEnabled() && !mutationClaim) return res.status(503).json({ status: "reconciliation_required" });
+  try {
+  if (isCloudStorageEnabled() && !hasFileEditAccess(req, folder, name)) {
+    return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+  }
+
   const entries = loadFileVersions();
   const key = getFileVersionKey(folder.id, name);
   const history = normalizeVersionHistory(entries[key]);
@@ -7751,8 +8587,8 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
 
   const currentPath = path.join(folder.uploadDir, name);
   const targetPath = path.join(folder.uploadDir, target.storedAs);
-  await ensureCloudFileCached(folder.id, name, currentPath, "uploads");
-  await ensureCloudFileCached(folder.id, target.storedAs, targetPath, "uploads");
+  await ensureCloudFileCached(folder.id, name, currentPath, "uploads", { strictCloud: isCloudStorageEnabled() });
+  await ensureCloudFileCached(folder.id, target.storedAs, targetPath, "uploads", { strictCloud: isCloudStorageEnabled() });
   if (!isExistingFile(currentPath) || !isExistingFile(targetPath)) {
     return res.status(404).json({ error: "Arquivo da versao nao encontrado" });
   }
@@ -7786,7 +8622,9 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
     entries[key] = history;
     pruneFileVersions(entries, key, folder);
     saveFileVersions(entries);
-    syncFileVersionsToCloud(folder.id, name);
+    const versionSync = syncFileVersionsToCloud(folder.id, name);
+    if (isCloudStorageEnabled()) await versionSync;
+    else void versionSync;
     addActionHistory("version_restored", name, req.user.username, {
       folderId: folder.id,
       folderName: folder.name,
@@ -7811,6 +8649,9 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
     console.error("Erro ao restaurar versao:", error.message);
     res.status(500).json({ error: "Erro ao restaurar versao" });
   }
+  } finally {
+    releaseWebDavMoveClaim(mutationClaim);
+  }
 });
 
 app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, requirePermission("delete"), (req, res) => {
@@ -7829,6 +8670,13 @@ app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, re
     return res.status(403).json({ error: "Apenas o dono ou admin pode deletar versoes" });
   }
 
+  const mutationClaim = isCloudStorageEnabled() ? claimCloudRelocationMutationLock() : null;
+  if (isCloudStorageEnabled() && !mutationClaim) return res.status(503).json({ status: "reconciliation_required" });
+  try {
+  const currentOwner = normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, name)).owner;
+  if (!canManageAccess(req) && currentOwner !== req.user?.username) {
+    return res.status(403).json({ error: "Apenas o dono ou admin pode deletar versoes" });
+  }
   const entries = loadFileVersions();
   const key = getFileVersionKey(folder.id, name);
   const history = normalizeVersionHistory(entries[key]);
@@ -7864,6 +8712,9 @@ app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, re
     version: versionNumber,
   });
   res.json({ message: "Versao deletada" });
+  } finally {
+    releaseWebDavMoveClaim(mutationClaim);
+  }
 });
 
 app.get("/history", authenticate, requirePermission("listFiles"), (req, res) => {
@@ -8216,26 +9067,97 @@ app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("ap
   const requestedFolder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!requestedFolder) return;
 
+  let mutationClaim = null;
   try {
+    if (isCloudStorageEnabled()) {
+      mutationClaim = claimCloudRelocationMutationLock();
+      if (!mutationClaim) {
+        return res.status(503).json({ status: "reconciliation_required", error: "A operacao precisa de conciliacao antes de aprovar este arquivo" });
+      }
+    }
     const target = await findPendingApprovalTarget(req, requestedFolder, name);
     if (!target) {
       return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
     }
 
     const { folder, pendingPath } = target;
+    if (isCloudStorageEnabled()) {
+      if (isCloudRelocationCleanupReserved(folder.id, name)) {
+        return res.status(503).json({ status: "reconciliation_required", error: "A operacao precisa de conciliacao antes de aprovar este arquivo" });
+      }
+      if (!isExistingFile(pendingPath)) return res.status(409).json({ error: "Arquivo pendente mudou; atualize a lista e tente novamente" });
+    }
     const pendingUploads = loadPendingUploads();
     const key = getPendingKey(folder.id, name);
-    const pendingEntry = pendingUploads[key] || pendingUploads[name] || {};
+    let pendingEntry = pendingUploads[key] || pendingUploads[name] || {};
     const uploadedBy = pendingEntry.uploadedBy || null;
-    const versionInfo = recordApprovedFileVersion(
-      folder,
-      name,
-      pendingPath,
-      uploadedBy || req.user.username,
-      pendingEntry.versionComment || ""
-    );
+    let versionInfo;
+    if (isCloudStorageEnabled()) {
+      const pendingDigest = await hashLocalFileSha256(pendingPath);
+      const currentPath = path.join(folder.uploadDir, name);
+      const currentExists = isExistingFile(currentPath);
+      const history = getVersionHistory(folder.id, name);
+      let retry = pendingEntry.approvalRetry;
+      if (retry) {
+        if (!retry || !["intent", "committed"].includes(retry.state) || !Number.isInteger(retry.version) || retry.version < 1 ||
+            typeof retry.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(retry.sha256) || typeof retry.replaced !== "boolean" || retry.sha256 !== pendingDigest) {
+          return res.status(503).json({ status: "reconciliation_required", error: "A aprovacao precisa de conciliacao antes de continuar" });
+        }
+        const currentDigest = currentExists ? await hashLocalFileSha256(currentPath) : null;
+        const committed = history.currentVersion === retry.version &&
+          history.versions.some((version) => version.version === retry.version && version.storedAs === name) && currentDigest === retry.sha256;
+        if (committed) {
+          versionInfo = { currentVersion: retry.version, replaced: retry.replaced };
+        } else {
+          const expectedVersion = currentExists ? (history.currentVersion || 1) + 1 : 1;
+          if (retry.state !== "intent" || retry.version !== expectedVersion) {
+            return res.status(503).json({ status: "reconciliation_required", error: "A aprovacao precisa de conciliacao antes de continuar" });
+          }
+        }
+      } else {
+        retry = {
+          state: "intent",
+          version: currentExists ? (history.currentVersion || 1) + 1 : 1,
+          replaced: currentExists,
+          sha256: pendingDigest,
+        };
+        pendingEntry = { ...pendingEntry, folderId: folder.id, fileName: name, approvalRetry: retry };
+        pendingUploads[key] = pendingEntry;
+        savePendingUploads(pendingUploads);
+      }
+      if (!versionInfo) {
+        versionInfo = recordApprovedFileVersion(
+          folder,
+          name,
+          pendingPath,
+          uploadedBy || req.user.username,
+          pendingEntry.versionComment || ""
+        );
+        retry = { ...retry, state: "committed", version: versionInfo.currentVersion, replaced: versionInfo.replaced };
+        pendingEntry = { ...pendingEntry, approvalRetry: retry };
+        pendingUploads[key] = pendingEntry;
+        savePendingUploads(pendingUploads);
+      } else if (retry.state !== "committed") {
+        retry = { ...retry, state: "committed" };
+        pendingEntry = { ...pendingEntry, approvalRetry: retry };
+        pendingUploads[key] = pendingEntry;
+        savePendingUploads(pendingUploads);
+      }
+    } else {
+      versionInfo = recordApprovedFileVersion(
+        folder,
+        name,
+        pendingPath,
+        uploadedBy || req.user.username,
+        pendingEntry.versionComment || ""
+      );
+    }
     promoteEncryptedMetadataAfterApproval(folder.id, name, uploadedBy || req.user.username);
-    syncFileVersionsToCloud(folder.id, name);
+    const versionSync = await syncFileVersionsToCloud(folder.id, name);
+    if (isCloudStorageEnabled() && versionSync.some((result) => result.status !== "fulfilled" || !result.value)) {
+      return res.status(503).json({ status: "reconciliation_required", error: "A versao foi aprovada localmente; sincronizacao com o armazenamento precisa ser repetida" });
+    }
+    await fs.promises.rm(pendingPath, { force: true });
     deleteCloudFileLater(folder.id, name, "temp");
 
     delete pendingUploads[key];
@@ -8271,6 +9193,8 @@ app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("ap
   } catch (error) {
     console.error("Erro ao aprovar arquivo:", error.message);
     res.status(500).json({ error: "Erro ao aprovar" });
+  } finally {
+    releaseWebDavMoveClaim(mutationClaim);
   }
 });
 
@@ -8280,15 +9204,21 @@ app.post("/reject/:name", rejectRateLimit, authenticate, requirePermission("appr
   const requestedFolder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!requestedFolder) return;
 
-  const target = await findPendingApprovalTarget(req, requestedFolder, name);
-  if (!target) {
-    return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
-  }
+  let mutationClaim = null;
+  try {
+    if (isCloudStorageEnabled()) {
+      mutationClaim = claimCloudRelocationMutationLock();
+      if (!mutationClaim) {
+        return res.status(503).json({ status: "reconciliation_required", error: "A operacao precisa de conciliacao antes de rejeitar este arquivo" });
+      }
+    }
+    const target = await findPendingApprovalTarget(req, requestedFolder, name);
+    if (!target) {
+      return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
+    }
 
-  const { folder, pendingPath } = target;
-  fs.unlink(pendingPath, (err) => {
-    if (err) return res.status(500).json({ error: "Erro ao rejeitar" });
-
+    const { folder, pendingPath } = target;
+    await fs.promises.unlink(pendingPath);
     const pendingUploads = loadPendingUploads();
     const key = getPendingKey(folder.id, name);
     const uploadedBy = pendingUploads[key]?.uploadedBy || pendingUploads[name]?.uploadedBy || null;
@@ -8307,12 +9237,17 @@ app.post("/reject/:name", rejectRateLimit, authenticate, requirePermission("appr
       uploadedBy,
     });
     addActionHistory("rejected", name, req.user.username, { uploadedBy, folderId: folder.id, folderName: folder.name });
-    res.json({ message: "Rejeitado" });
-  });
+    return res.json({ message: "Rejeitado" });
+  } catch (error) {
+    console.error("Erro ao rejeitar arquivo:", error.message);
+    return res.status(500).json({ error: "Erro ao rejeitar" });
+  } finally {
+    releaseWebDavMoveClaim(mutationClaim);
+  }
 });
 
 app.get("/delete/:name", deleteRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
-app.post("/delete/:name", deleteRateLimit, authenticate, (req, res) => {
+app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
   if (!isTrashEnabled()) return res.status(503).json({ error: "Lixeira desativada" });
   const name = path.basename(req.params.name);
   const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
@@ -8327,7 +9262,28 @@ app.post("/delete/:name", deleteRateLimit, authenticate, (req, res) => {
   }
 
   const filePath = path.join(folder.uploadDir, name);
-  const fileSize = isExistingFile(filePath) ? fs.statSync(filePath).size : 0;
+  if (isStoredVersionFile(folder.id, name) || isFileInTrash(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
+  const mutationClaim = isCloudStorageEnabled() ? claimCloudRelocationMutationLock() : null;
+  if (isCloudStorageEnabled() && !mutationClaim) return res.status(503).json({ status: "reconciliation_required" });
+  try {
+    if (isCloudStorageEnabled()) {
+      if (!hasFileEditAccess(req, folder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+      if (isCloudRelocationCleanupReserved(folder.id, name)) return res.status(409).json({ error: "Arquivo reservado para recuperacao de movimentacao" });
+    }
+  let listedFile;
+  try {
+    listedFile = await getListedFileDetails(folder, name, { strictCloud: true });
+    if (!listedFile) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (!await ensureCloudFileCached(folder.id, name, filePath, "uploads", { strictCloud: true })) {
+      return res.status(503).json({ error: "Armazenamento temporariamente indisponivel" });
+    }
+  } catch {
+    return res.status(503).json({ error: "Armazenamento temporariamente indisponivel" });
+  }
+  const fileSize = fs.statSync(filePath).size;
 
   try {
     const trashItem = trashService.moveFileToTrash({
@@ -8360,9 +9316,12 @@ app.post("/delete/:name", deleteRateLimit, authenticate, (req, res) => {
     });
     res.status(500).json({ error: "Erro ao mover arquivo para lixeira" });
   }
+  } finally {
+    releaseWebDavMoveClaim(mutationClaim);
+  }
 });
 
-app.put("/rename", authenticate, (req, res) => {
+app.put("/rename", authenticate, async (req, res) => {
   const rawOldName = typeof req.body.oldName === "string" ? req.body.oldName.trim() : "";
   const rawNewName = typeof req.body.newName === "string" ? req.body.newName.trim() : "";
   const oldName = path.basename(rawOldName);
@@ -8388,49 +9347,100 @@ app.put("/rename", authenticate, (req, res) => {
 
   const oldPath = path.join(folder.uploadDir, oldName);
   const newPath = path.join(folder.uploadDir, newName);
-  const oldStoredNames = getVersionHistory(folder.id, oldName).versions
+  let versionHistory = getVersionHistory(folder.id, oldName);
+  let oldStoredNames = versionHistory.versions
     .map((version) => path.basename(version.storedAs || ""))
     .filter(Boolean);
 
-  if (!fs.existsSync(oldPath)) {
+  if (isStoredVersionFile(folder.id, oldName) || isFileInTrash(folder.id, oldName)) {
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
-
   if (!hasFileEditAccess(req, folder, oldName)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
-
-  if (fs.existsSync(newPath)) {
-    return res.status(409).json({ error: "Ja existe um arquivo com esse nome" });
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
+  const mutationClaim = isCloudStorageEnabled() ? claimCloudRelocationMutationLock() : null;
+  if (isCloudStorageEnabled() && !mutationClaim) return res.status(503).json({ status: "reconciliation_required" });
+  try {
+  if (isCloudStorageEnabled()) {
+    if (!hasFileEditAccess(req, folder, oldName)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (isStoredVersionFile(folder.id, oldName) || isFileInTrash(folder.id, oldName)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    versionHistory = getVersionHistory(folder.id, oldName);
+    oldStoredNames = versionHistory.versions
+      .map((version) => path.basename(version.storedAs || ""))
+      .filter(Boolean);
+  }
+  let listedFiles;
+  try {
+    listedFiles = await listFilesWithCloudDetails(folder.uploadDir, folder.id, "uploads", { strictCloud: true });
+  } catch {
+    return res.status(503).json({ error: "Armazenamento temporariamente indisponivel" });
+  }
+  if (isStoredVersionFile(folder.id, oldName) || !listedFiles.some((file) => file.name === oldName)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
-  fs.rename(oldPath, newPath, (err) => {
-    if (err) return res.status(500).json({ error: "Erro ao renomear arquivo" });
+  if (fs.existsSync(newPath) || listedFiles.some((file) => file.name === newName) || isCloudRelocationCleanupReserved(folder.id, newName)) {
+    return res.status(409).json({ error: "Ja existe um arquivo com esse nome" });
+  }
+  const archivedDestinationNames = getArchivedVersionDestinationNames(versionHistory, newName);
+  if (archivedDestinationNames.some((storedName) => listedFiles.some((file) => file.name === storedName) || isCloudRelocationCleanupReserved(folder.id, storedName))) {
+    return res.status(409).json({ error: "Ja existe uma versao com esse nome" });
+  }
+  try {
+    if (!await ensureCloudFileCached(folder.id, oldName, oldPath, "uploads", { strictCloud: true })) {
+      return res.status(503).json({ error: "Armazenamento temporariamente indisponivel" });
+    }
+  } catch {
+    return res.status(503).json({ error: "Armazenamento temporariamente indisponivel" });
+  }
+
+  let cloudCleanupPending = false;
+  if (isCloudStorageEnabled()) {
+    let relocation;
+    try {
+      relocation = await performCloudFileRelocation(folder, oldName, folder, newName, versionHistory, "rename", mutationClaim);
+    } catch (error) {
+      return sendCloudRelocationFailure(res, error);
+    }
+    cloudCleanupPending = relocation.pending;
+    if (!relocation.committed) {
+      if (relocation.pending) return sendCloudRelocationFailure(res, { code: "CLOUD_RECONCILIATION_REQUIRED" });
+      if (relocation.stageFailure) return sendCloudRelocationFailure(res, relocation.error);
+      return res.status(500).json({ error: "Erro ao renomear arquivo" });
+    }
+  } else {
+    try {
+      await fs.promises.rename(oldPath, newPath);
+    } catch {
+      return res.status(500).json({ error: "Erro ao renomear arquivo" });
+    }
     renamePublicLinksForFile(oldName, newName, folder.id);
     renameFilePermission(folder.id, oldName, newName);
     renameFileExpiration(folder.id, oldName, newName);
     renameFileVersions(folder.id, oldName, newName);
     renameEncryptedMetadata(folder.id, oldName, newName);
-    for (const storedName of new Set([oldName, ...oldStoredNames])) {
-      deleteCloudFileLater(folder.id, storedName, "uploads");
-    }
-    syncFileVersionsToCloud(folder.id, newName);
-    auditLog("file.rename", getAuditActor(req), { type: "file", id: newName }, "renamed", "success", {
-      oldName,
-      newName,
-      folderId: folder.id,
-    });
-    addActionHistory("renamed", newName, req.user.username, {
-      oldName,
-      newName,
-      folderId: folder.id,
-      folderName: folder.name,
-    });
-    res.json({ message: "Arquivo renomeado" });
+    for (const storedName of new Set([oldName, ...oldStoredNames])) deleteCloudFileLater(folder.id, storedName, "uploads");
+  }
+  auditLog("file.rename", getAuditActor(req), { type: "file", id: newName }, "renamed", "success", {
+    oldName,
+    newName,
+    folderId: folder.id,
+    cloudCleanupPending,
   });
+  addActionHistory("renamed", newName, req.user.username, {
+    oldName,
+    newName,
+    folderId: folder.id,
+    folderName: folder.name,
+  });
+  return res.json({ message: "Arquivo renomeado", ...(cloudCleanupPending ? { cloudCleanupPending: true } : {}) });
+  } finally {
+    releaseWebDavMoveClaim(mutationClaim);
+  }
 });
 
-app.put("/move", authenticate, (req, res) => {
+app.put("/move", authenticate, async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const fromFolder = getAccessibleFolderOrRespond(req, res, req.body.fromFolderId);
@@ -8447,51 +9457,103 @@ app.put("/move", authenticate, (req, res) => {
   }
 
   const sourcePath = path.join(fromFolder.uploadDir, name);
-  if (!isExistingFile(sourcePath)) {
+  if (isStoredVersionFile(fromFolder.id, name) || isFileInTrash(fromFolder.id, name)) {
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
-
   if (!hasFileEditAccess(req, fromFolder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
+  const mutationClaim = isCloudStorageEnabled() ? claimCloudRelocationMutationLock() : null;
+  if (isCloudStorageEnabled() && !mutationClaim) return res.status(503).json({ status: "reconciliation_required" });
+  try {
+  if (isCloudStorageEnabled()) {
+    if (!hasFileEditAccess(req, fromFolder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (isStoredVersionFile(fromFolder.id, name) || isFileInTrash(fromFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+  let sourceFiles;
+  let destinationFiles;
+  try {
+    sourceFiles = await listFilesWithCloudDetails(fromFolder.uploadDir, fromFolder.id, "uploads", { strictCloud: true });
+    if (isStoredVersionFile(fromFolder.id, name) || !sourceFiles.some((file) => file.name === name)) {
+      return res.status(404).json({ error: "Arquivo nao encontrado" });
+    }
+    destinationFiles = await listFilesWithCloudDetails(toFolder.uploadDir, toFolder.id, "uploads", { strictCloud: true });
+  } catch {
+    return res.status(503).json({ error: "Armazenamento temporariamente indisponivel" });
+  }
+  try {
+    if (!await ensureCloudFileCached(fromFolder.id, name, sourcePath, "uploads", { strictCloud: true })) {
+      return res.status(503).json({ error: "Armazenamento temporariamente indisponivel" });
+    }
+  } catch {
+    return res.status(503).json({ error: "Armazenamento temporariamente indisponivel" });
+  }
 
-  const finalName = getAvailableUploadFileName(name, toFolder.id);
+  const versionHistory = getVersionHistory(fromFolder.id, name);
+  const remoteAndLocalNames = new Set(destinationFiles.map((file) => file.name));
+  let finalName;
+  try {
+    finalName = getAvailableVersionedUploadFileName(name, toFolder.id, remoteAndLocalNames, versionHistory);
+  } catch (error) {
+    if (error.code === "CLOUD_RECONCILIATION_REQUIRED") return res.status(503).json({ error: "Armazenamento aguardando conciliacao" });
+    return res.status(409).json({ error: "Nao ha um nome disponivel para mover o arquivo" });
+  }
   const destinationPath = path.join(toFolder.uploadDir, finalName);
-  const oldStoredNames = getVersionHistory(fromFolder.id, name).versions
+  const oldStoredNames = versionHistory.versions
     .map((version) => path.basename(version.storedAs || ""))
     .filter(Boolean);
 
-  fs.rename(sourcePath, destinationPath, (err) => {
-    if (err) return res.status(500).json({ error: "Erro ao mover arquivo" });
-
+  let cloudCleanupPending = false;
+  if (isCloudStorageEnabled()) {
+    let relocation;
+    try {
+      relocation = await performCloudFileRelocation(fromFolder, name, toFolder, finalName, versionHistory, "move", mutationClaim);
+    } catch (error) {
+      return sendCloudRelocationFailure(res, error);
+    }
+    cloudCleanupPending = relocation.pending;
+    if (!relocation.committed) {
+      if (relocation.pending) return sendCloudRelocationFailure(res, { code: "CLOUD_RECONCILIATION_REQUIRED" });
+      if (relocation.stageFailure) return sendCloudRelocationFailure(res, relocation.error);
+      return res.status(500).json({ error: "Erro ao mover arquivo" });
+    }
+  } else {
+    try {
+      await fs.promises.rename(sourcePath, destinationPath);
+    } catch {
+      return res.status(500).json({ error: "Erro ao mover arquivo" });
+    }
     movePublicLinksForFile(name, finalName, fromFolder.id, toFolder.id);
     moveFilePermission(fromFolder.id, name, toFolder.id, finalName);
     moveFileExpiration(fromFolder.id, name, toFolder.id, finalName);
     moveFileVersions(fromFolder.id, name, toFolder.id, finalName);
     moveEncryptedMetadata(fromFolder.id, name, toFolder.id, finalName);
-    for (const storedName of new Set([name, ...oldStoredNames])) {
-      deleteCloudFileLater(fromFolder.id, storedName, "uploads");
-    }
-    syncFileVersionsToCloud(toFolder.id, finalName);
-    auditLog("file.move", getAuditActor(req), { type: "file", id: finalName }, "moved", "success", {
-      oldName: name,
-      newName: finalName,
-      fromFolderId: fromFolder.id,
-      toFolderId: toFolder.id,
-    });
-    addActionHistory("moved", finalName, req.user.username, {
-      oldName: name,
-      newName: finalName,
-      fromFolderId: fromFolder.id,
-      fromFolderName: fromFolder.name,
-      toFolderId: toFolder.id,
-      toFolderName: toFolder.name,
-    });
-    res.json({ message: "Arquivo movido", fileName: finalName, folderId: toFolder.id });
+    for (const storedName of new Set([name, ...oldStoredNames])) deleteCloudFileLater(fromFolder.id, storedName, "uploads");
+  }
+  auditLog("file.move", getAuditActor(req), { type: "file", id: finalName }, "moved", "success", {
+    oldName: name,
+    newName: finalName,
+    fromFolderId: fromFolder.id,
+    toFolderId: toFolder.id,
+    cloudCleanupPending,
   });
+  addActionHistory("moved", finalName, req.user.username, {
+    oldName: name,
+    newName: finalName,
+    fromFolderId: fromFolder.id,
+    fromFolderName: fromFolder.name,
+    toFolderId: toFolder.id,
+    toFolderName: toFolder.name,
+  });
+  return res.json({ message: "Arquivo movido", fileName: finalName, folderId: toFolder.id, ...(cloudCleanupPending ? { cloudCleanupPending: true } : {}) });
+  } finally {
+    releaseWebDavMoveClaim(mutationClaim);
+  }
 });
 
 initData();
+startCloudRelocationCleanup();
 restoreService.recoverQuarantineRestore();
 if (!fs.existsSync(QUARANTINE_FILE)) saveQuarantine(getDefaultQuarantine());
 scheduleAutomaticBackups({ cron, createBackup: backupService.createBackup, auditLog, onInvalid: console.error });

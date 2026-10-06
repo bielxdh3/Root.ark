@@ -55,8 +55,8 @@ function childSource(localCrash = false) {
     const waitFor=(file)=>{const signal=new Int32Array(new SharedArrayBuffer(4)); while(!fs.existsSync(file)) Atomics.wait(signal,0,0,20);};
     let installPause=null; if(process.env.CLAIM_PAUSE_LOCK_PATH){let installed=false; installPause=()=>{if(installed)return; installed=true; let paused=false; const pause=()=>{if(paused)return; paused=true; fs.writeFileSync(process.env.CLAIM_PAUSE_OBSERVED,"observed"); waitFor(process.env.CLAIM_PAUSE_RESUME);}; const originalMkdir=fs.mkdirSync; const originalOpen=fs.openSync; fs.mkdirSync=(target,options)=>{if(path.resolve(String(target))===path.resolve(process.env.CLAIM_PAUSE_LOCK_PATH+".takeover")) pause(); return originalMkdir(target,options);}; fs.openSync=(target,flags,...args)=>{if(String(target).startsWith(process.env.CLAIM_PAUSE_LOCK_PATH+".takeover-")) pause(); return originalOpen(target,flags,...args);};};}
     const fake={
-      enabled:()=>true,
-      status:()=>({provider:"fake",enabled:true}),
+      enabled:()=>process.env.FAKE_PROVIDER_DISABLED!=="true",
+      status:()=>({provider:"fake",enabled:process.env.FAKE_PROVIDER_DISABLED!=="true"}),
       key:(folderId,fileName,area)=>[area,folderId,fileName].join("/"),
       inventory:async()=>[],
       upload:async(localPath,folderId,fileName)=>{call("upload",folderId,fileName); const state=readState(); state.destination=true; writeState(state); if(process.env.FAKE_PROVIDER_MODE==="crash-after-upload") process.kill(process.pid,"SIGKILL"); if(process.env.FAKE_PROVIDER_MODE==="wait-upload") await new Promise((resolve)=>{const poll=()=>fs.existsSync(process.env.FAKE_PROVIDER_RELEASE)?resolve():setTimeout(poll,10); poll();}); return {provider:"fake",key:"uploads:"+folderId+":"+fileName};},
@@ -113,13 +113,22 @@ function stop(child) {
   });
 }
 
-function fixture() {
+function fixture({ versioned = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-crash-"));
   fs.mkdirSync(path.join(dir, "data"));
   fs.mkdirSync(path.join(dir, "uploads"));
   fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([{ username: "agent", password: bcrypt.hashSync("password", 10), role: "admin", permissions: { upload: true }, sessionVersion: 0 }]));
   fs.writeFileSync(path.join(dir, "uploads", "source.txt"), "source bytes");
   fs.writeFileSync(path.join(dir, "uploads", "target.txt"), "old destination");
+  if (versioned) {
+    fs.writeFileSync(path.join(dir, "uploads", "source.txt.v1"), "source archive bytes");
+    fs.writeFileSync(path.join(dir, "data", "file-versions.json"), JSON.stringify({
+      "root/source.txt": { currentVersion: 2, versions: [
+        { version: 1, storedAs: "source.txt.v1", size: Buffer.byteLength("source archive bytes") },
+        { version: 2, storedAs: "source.txt", size: Buffer.byteLength("source bytes") },
+      ] },
+    }));
+  }
   fs.writeFileSync(path.join(dir, "provider-state.json"), JSON.stringify({ destination: false, source: true }));
   fs.writeFileSync(path.join(dir, "provider-calls.json"), "[]");
   return { dir, source: path.join(dir, "uploads", "source.txt"), target: path.join(dir, "uploads", "target.txt"), backup: path.join(dir, "uploads") };
@@ -170,6 +179,79 @@ test("WebDAV MOVE persists remote intent before provider effects", { timeout: 90
     } finally {
       if (first?.child.exitCode === null) await stop(first.child);
       if (second?.child.exitCode === null) await stop(second.child);
+      fs.rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("versioned MOVE restart uploads every archive before deleting source keys", async () => {
+    const f = fixture({ versioned: true });
+    let crashed;
+    let recovered;
+    try {
+      crashed = await startServer(f.dir, { FAKE_PROVIDER_MODE: "crash-after-upload" });
+      try { await move(f.dir, crashed.port); } catch {}
+      await waitFor(() => readJournal(f.dir)?.cloud?.state === "destination_upload_uncertain");
+      await stop(crashed.child);
+
+      recovered = await startServer(f.dir);
+      await waitFor(() => !journalPaths(f.dir)).catch((error) => { throw new Error(`${error.message}; stderr=${recovered.stderr()}`); });
+
+      assert.equal(fs.existsSync(path.join(f.dir, "uploads", "source.txt")), false);
+      assert.equal(fs.existsSync(path.join(f.dir, "uploads", "source.txt.v1")), false);
+      assert.equal(fs.readFileSync(f.target, "utf8"), "source bytes");
+      assert.equal(fs.readFileSync(path.join(f.dir, "uploads", "target.txt.v1"), "utf8"), "source archive bytes");
+      const history = JSON.parse(fs.readFileSync(path.join(f.dir, "data", "file-versions.json"), "utf8"));
+      assert.equal(history["root/source.txt"], undefined);
+      assert.deepEqual(history["root/target.txt"].versions.map((entry) => entry.storedAs), ["target.txt.v1", "target.txt"]);
+
+      const values = calls(f.dir);
+      const destinationUploads = values.filter((entry) => entry.operation === "upload");
+      assert.deepEqual(new Set(destinationUploads.map((entry) => entry.fileName)), new Set(["target.txt", "target.txt.v1"]));
+      const firstSourceDelete = values.findIndex((entry) => entry.operation === "remove");
+      assert.ok(firstSourceDelete > -1);
+      assert.ok(values.slice(0, firstSourceDelete).every((entry) => entry.operation === "upload"), "all destination versions are present before any source version is removed");
+      assert.deepEqual(new Set(values.filter((entry) => entry.operation === "remove").map((entry) => entry.fileName)), new Set(["source.txt", "source.txt.v1"]));
+    } finally {
+      if (crashed?.child.exitCode === null) await stop(crashed.child);
+      if (recovered?.child.exitCode === null) await stop(recovered.child);
+      fs.rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("pending MOVE waits for its original provider to return after restart", async () => {
+    const f = fixture();
+    let crashed;
+    let mismatched;
+    let disabled;
+    let recovered;
+    try {
+      crashed = await startServer(f.dir, { FAKE_PROVIDER_MODE: "crash-after-upload" });
+      try { await move(f.dir, crashed.port); } catch {}
+      await waitFor(() => readJournal(f.dir)?.cloud?.state === "destination_upload_uncertain");
+      await stop(crashed.child);
+
+      mismatched = await startServer(f.dir, { CLOUD_STORAGE_PROVIDER: "gdrive" });
+      await waitFor(() => readJournal(f.dir)?.cloud?.failureCategory === "provider_mismatch");
+      assert.ok(journalPaths(f.dir), "provider mismatch retains the pending transaction");
+      assert.equal(calls(f.dir).length, 1, "a different provider is not asked to reconcile recorded effects");
+      await stop(mismatched.child);
+
+      disabled = await startServer(f.dir, { CLOUD_STORAGE_PROVIDER: "s3", FAKE_PROVIDER_DISABLED: "true" });
+      await waitFor(() => readJournal(f.dir)?.cloud?.failureCategory === "provider_unavailable");
+      assert.ok(journalPaths(f.dir), "temporarily disabled provider does not finalize the journal");
+      assert.equal(calls(f.dir).length, 1, "disabled provider causes no upload or deletion");
+      await stop(disabled.child);
+
+      recovered = await startServer(f.dir, { CLOUD_STORAGE_PROVIDER: "s3" });
+      await waitFor(() => !journalPaths(f.dir)).catch((error) => { throw new Error(`${error.message}; stderr=${recovered.stderr()}`); });
+      assert.equal(calls(f.dir).filter((entry) => entry.operation === "upload").length, 2, "the original provider idempotently retries the uncertain upload");
+      assert.equal(calls(f.dir).filter((entry) => entry.operation === "remove").length, 1, "source removal runs only after provider recovery");
+      assert.equal(fs.readFileSync(f.target, "utf8"), "source bytes");
+    } finally {
+      if (crashed?.child.exitCode === null) await stop(crashed.child);
+      if (mismatched?.child.exitCode === null) await stop(mismatched.child);
+      if (disabled?.child.exitCode === null) await stop(disabled.child);
+      if (recovered?.child.exitCode === null) await stop(recovered.child);
       fs.rmSync(f.dir, { recursive: true, force: true });
     }
   });
@@ -299,7 +381,7 @@ test("WebDAV MOVE persists remote intent before provider effects", { timeout: 90
       fs.utimesSync(claimPath, new Date(0), new Date(0));
       await waitFor(() => fs.existsSync(bObserved));
       first = await startServer(f.dir, { FAKE_PROVIDER_MODE: "wait-upload", FAKE_PROVIDER_RELEASE: releaseUpload });
-      await waitFor(() => calls(f.dir).filter((entry) => entry.operation === "upload").length >= 2);
+      await waitFor(() => calls(f.dir).filter((entry) => entry.operation === "upload").length >= 2, 30_000);
       const ownerClaim = fs.readFileSync(claimPath, "utf8");
       assert.notEqual(JSON.parse(ownerClaim).token, stale.token);
       await new Promise((resolve) => setTimeout(resolve, 1600));
