@@ -5765,6 +5765,7 @@ app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req
   }
 
   const filePath = path.join(folder.uploadDir, name);
+  if (isCloudStorageEnabled() && !isExistingFile(filePath) && !consumeCloudMetadataRateLimit(req, res)) return;
   await ensureCloudFileCached(folder.id, name, filePath, "uploads");
   if (!isExistingFile(filePath)) {
     return res.status(404).json({ error: "Arquivo nao encontrado" });
@@ -8800,6 +8801,17 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
 
   if (!hasFileEditAccess(req, folder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+  }
+
+  if (isCloudStorageEnabled()) {
+    const requestedHistory = normalizeVersionHistory(loadFileVersions()[getFileVersionKey(folder.id, name)]);
+    if (!requestedHistory.versions.some((item) => item.version === versionNumber)) {
+      return res.status(404).json({ error: "Versao nao encontrada" });
+    }
+    if (versionNumber === requestedHistory.currentVersion) {
+      return res.status(400).json({ error: "Esta versao ja e a atual" });
+    }
+    if (!consumeCloudMetadataRateLimit(req, res)) return;
   }
 
   const mutationClaim = isCloudStorageEnabled() ? claimCloudRelocationMutationLock() : null;

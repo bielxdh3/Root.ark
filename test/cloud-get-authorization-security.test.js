@@ -83,6 +83,7 @@ function request(port, requestPath, { method = "GET", headers = {}, body = "" } 
 
 function startS3Fixture() {
   const getObjects = [];
+  const getRequests = [];
   const listRequests = [];
   let failList = false;
   let failPutAfter = 0;
@@ -111,6 +112,7 @@ function startS3Fixture() {
       res.writeHead(200, { "content-type": "application/xml" });
       return res.end(`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>fixture-bucket</Name><Prefix></Prefix><KeyCount>${matches.length}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>${contents}</ListBucketResult>`);
     }
+    if (req.method === "GET") getRequests.push(key);
     if (req.method === "GET" && OBJECTS.has(key)) {
       getObjects.push(key);
       if (getBarrier?.keys.has(key)) {
@@ -191,7 +193,9 @@ function startS3Fixture() {
       server,
       port: server.address().port,
       getObjects,
+      getRequests,
       listRequests,
+      get putCount() { return putCount; },
       setGetBarrier(keys) {
         let readyResolve;
         const ready = new Promise((resolve) => { readyResolve = resolve; });
@@ -278,7 +282,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     "root/public.txt.v1": { public: true, owner: "viewer", users: {} },
     "root/legacy.v9": { public: true, owner: "viewer", users: {} },
     "root/budget.v2": { public: false, owner: "viewer", users: {} },
-    "root/notes.v2": { public: false, owner: "viewer", users: {} },
+    "root/notes.v2": { public: false, owner: "viewer", users: { other: { read: true, edit: false } } },
     "root/rename-me.txt": { public: false, owner: "viewer", users: {} },
     "root/crash-abort.txt": { public: true, owner: "viewer", users: {} },
     "root/crash-abort-target.txt": { public: false, owner: "other", users: {} },
@@ -448,12 +452,22 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const otherLoginBody = JSON.stringify({ username: "other", password });
   const otherLogin = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(otherLoginBody) }, body: otherLoginBody });
   assert.equal(otherLogin.status, 200, otherLogin.body);
-  const otherCookie = otherLogin.headers["set-cookie"].map((value) => value.split(";", 1)[0]).join("; ");
+  const otherCookies = otherLogin.headers["set-cookie"].map((value) => value.split(";", 1)[0]);
+  const otherCookie = otherCookies.join("; ");
+  const otherCsrf = otherCookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1];
   const mutate = (requestPath, method, payload) => {
     const body = JSON.stringify(payload);
     return request(port, requestPath, {
       method,
       headers: { cookie, origin: `http://127.0.0.1:${port}`, "x-csrf-token": csrf, "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+      body,
+    });
+  };
+  const mutateOther = (requestPath, method, payload) => {
+    const body = JSON.stringify(payload);
+    return request(port, requestPath, {
+      method,
+      headers: { cookie: otherCookie, origin: `http://127.0.0.1:${port}`, "x-csrf-token": otherCsrf, "content-type": "application/json", "content-length": Buffer.byteLength(body) },
       body,
     });
   };
@@ -475,6 +489,62 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const ordinaryLocalFile = await request(port, "/files/notes.v2", { headers: { cookie } });
   assert.equal(ordinaryLocalFile.status, 200, "an ordinary local .vN file must be downloadable");
   assert.equal(ordinaryLocalFile.body, "ordinary local suffix fixture");
+
+  const limitedDownloadKey = "rootark/uploads/root/limited-download.txt";
+  const downloadPermissions = JSON.parse(fs.readFileSync(path.join(dataDir, "file-permissions.json"), "utf8"));
+  downloadPermissions["root/limited-download.txt"] = { public: true, owner: "other", users: {} };
+  fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify(downloadPermissions));
+  for (let index = 0; index < CLOUD_METADATA_REQUEST_LIMIT; index += 1) {
+    const response = await request(port, "/files/limited-download.txt", { headers: { cookie: otherCookie } });
+    assert.equal(response.status, 404, response.body);
+  }
+  const downloadProviderAttempts = cloud.getRequests.filter((key) => key === limitedDownloadKey).length;
+  assert.equal(downloadProviderAttempts, CLOUD_METADATA_REQUEST_LIMIT, "cloud-backed download cache misses consume the per-route provider budget");
+  const limitedDownload = await request(port, "/files/limited-download.txt", { headers: { cookie: otherCookie } });
+  assert.equal(limitedDownload.status, 429, limitedDownload.body);
+  assert.equal(cloud.getRequests.filter((key) => key === limitedDownloadKey).length, downloadProviderAttempts, "a limited download is rejected before another provider GET");
+  for (let index = 0; index < CLOUD_METADATA_REQUEST_LIMIT + 1; index += 1) {
+    const localResponse = await request(port, "/files/notes.v2", { headers: { cookie: otherCookie } });
+    assert.equal(localResponse.status, 200, "local-file downloads do not consume the cloud provider budget");
+  }
+
+  const limitedRestoreName = "limited-restore.txt";
+  const limitedRestoreCurrentPath = path.join(directory, "uploads", limitedRestoreName);
+  const limitedRestoreVersionPath = path.join(directory, "uploads", `${limitedRestoreName}.v1`);
+  const restorePermissions = JSON.parse(fs.readFileSync(path.join(dataDir, "file-permissions.json"), "utf8"));
+  restorePermissions[`root/${limitedRestoreName}`] = { public: false, owner: "other", users: {} };
+  fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify(restorePermissions));
+  const restoreVersions = JSON.parse(fs.readFileSync(path.join(dataDir, "file-versions.json"), "utf8"));
+  restoreVersions[`root/${limitedRestoreName}`] = { currentVersion: 3, versions: [
+    { version: 1, storedAs: `${limitedRestoreName}.v1`, size: 1 },
+    { version: 2, storedAs: `${limitedRestoreName}.v2`, size: 1 },
+    { version: 3, storedAs: limitedRestoreName, size: 1 },
+  ] };
+  fs.writeFileSync(path.join(dataDir, "file-versions.json"), JSON.stringify(restoreVersions));
+  fs.writeFileSync(limitedRestoreCurrentPath, "warm current restore fixture");
+  fs.writeFileSync(limitedRestoreVersionPath, "warm archived restore fixture");
+  fs.writeFileSync(path.join(directory, "uploads", `${limitedRestoreName}.v2`), "warm second archived restore fixture");
+  const restorePutBaseline = cloud.putCount;
+  for (let index = 0; index < CLOUD_METADATA_REQUEST_LIMIT; index += 1) {
+    const currentHistory = JSON.parse(fs.readFileSync(path.join(dataDir, "file-versions.json"), "utf8"))[`root/${limitedRestoreName}`];
+    const availableTargets = currentHistory.versions.filter((version) => version.version !== currentHistory.currentVersion).slice(-2);
+    const requestedVersion = availableTargets[index % 2].version;
+    const response = await mutateOther(`/restore/${limitedRestoreName}/v/${requestedVersion}?folderId=root`, "POST", {}).catch((error) => {
+      throw new Error(`warm version restore request ${index + 1} failed; child=${child.exitCode}/${child.signalCode}; stderr=${String(child.startupLogs).slice(-1000)}; ${error.message}`);
+    });
+    assert.equal(response.status, 200, `restore ${requestedVersion} on iteration ${index + 1}: ${response.body}; history=${fs.readFileSync(path.join(dataDir, "file-versions.json"), "utf8")}`);
+  }
+  assert.ok(cloud.putCount > restorePutBaseline, "warm-cache version restores reach cloud provider synchronization");
+  const restoreStateAtLimit = fs.readFileSync(path.join(dataDir, "file-versions.json"), "utf8");
+  const restorePutsAtLimit = cloud.putCount;
+  const latestRestorableVersion = JSON.parse(restoreStateAtLimit)[`root/${limitedRestoreName}`].versions
+    .filter((version) => version.version !== JSON.parse(restoreStateAtLimit)[`root/${limitedRestoreName}`].currentVersion)
+    .at(-1).version;
+  const limitedRestore = await mutateOther(`/restore/${limitedRestoreName}/v/${latestRestorableVersion}?folderId=root`, "POST", {});
+  assert.equal(limitedRestore.status, 429, limitedRestore.body);
+  assert.equal(cloud.putCount, restorePutsAtLimit, "a limited warm-cache version restore is rejected before provider synchronization");
+  assert.equal(fs.readFileSync(path.join(dataDir, "file-versions.json"), "utf8"), restoreStateAtLimit, "a limited version restore does not mutate version history");
+
   const legacyFile = await request(port, "/files/legacy.v9", { headers: { cookie } });
   assert.equal(legacyFile.status, 200, "suffix-named primary files remain accessible when they have their own ACL");
   assert.equal(legacyFile.body, "suffix-named primary with its own ACL fixture");
