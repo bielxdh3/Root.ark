@@ -37,6 +37,8 @@ After local commit, the coordinator changes to `restart_required`. The response 
 
 Cloud-provider actions cannot participate in one portable transaction with local files and databases. Once the local commit barrier clears, a provider outage may leave durable work pending or failed while local restored state remains authoritative. Retries use operation IDs and leases. Google Drive restore entries persist a stable generated or existing file ID before upload; retries target that ID after verifying the Root.ark key and configured parent. S3 retries use the same deterministic object key. This is resumable reconciliation, not distributed atomicity. Live provider credentials were not used for validation.
 
+The disposable regression `provider upload failure survives restart and retry keeps the provider object idempotent` injects a provider outage, verifies the persisted retry state, interrupts a worker after writing the deterministic provider key but before completion is committed, and confirms a restarted worker retries the same logical key and completes without another upload after completion. This validates the retry state machine against a fake provider; it does not establish live S3 or Google Drive interoperability.
+
 An archive can include files under `temp/` only when `BACKUP_INCLUDE_TEMP=true` or `BACKUP_INCLUDE_PENDING=true`; `temp/.chunks/` and `temp/.incoming/` remain excluded. Restore does not materialize these ephemeral files or add them to provider-reconciliation entries. Only archived `uploads/` entries are reconciled. The ZIP manifest records archived bytes; it does not promise that ephemeral temp state is restored.
 
 ## Durability and recovery limits
