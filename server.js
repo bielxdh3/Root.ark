@@ -41,9 +41,11 @@ const actionHistoryRepository = require("./repositories/actionHistoryRepository"
 const backupService = require("./services/backupService");
 const restoreService = require("./services/restoreService");
 const { getUploadQuarantineDir } = require("./src/quarantine-paths");
+const { createRestoreRequestGate } = require("./services/restoreRequestGate");
 const trashRepository = require("./repositories/trashRepository");
 const trashService = require("./services/trashService");
 const { createCloudStorage } = require("./services/cloudStorage");
+const { resolveRuntimePath } = require("./src/runtime-paths");
 const registerAuthRoutes = require("./src/routes/auth");
 const registerAnalyticsRoutes = require("./src/routes/analytics");
 const registerAuditRoutes = require("./src/routes/audit");
@@ -115,6 +117,7 @@ const AUDIT_LOGS_FILE = "./data/audit-logs.json";
 const AUDIT_ARCHIVE_FILE = "./data/audit-logs-archive.json";
 const QUARANTINE_FILE = "./data/quarantine.json";
 const GROUPS_FILE = "./data/groups.json";
+const RESTORE_ACTIVE_REQUESTS_DIR = resolveRuntimePath("data", ".rootark-active-requests");
 const CLOUD_STORAGE_PROVIDER = String(process.env.CLOUD_STORAGE_PROVIDER || "local").toLowerCase();
 const CLOUD_STORAGE_PREFIX = String(process.env.CLOUD_STORAGE_PREFIX || "rootark").replace(/^\/+|\/+$/g, "") || "rootark";
 const ROOT_FOLDER_ID = "root";
@@ -278,9 +281,10 @@ async function syncFolderCacheFromCloud(folderId, area = "uploads") {
   }
 }
 
-function syncCloudFireAndForget(promise, label) {
+function syncCloudFireAndForget(operation, label) {
   if (!isCloudStorageEnabled()) return;
-  Promise.resolve(promise).catch((error) => {
+  const work = typeof operation === "function" ? operation : () => operation;
+  restoreRequestGate.run(work).catch((error) => {
     console.error("[cloud-storage] operation failed:", sanitizeLogValue(error.message));
   });
 }
@@ -288,16 +292,16 @@ function syncCloudFireAndForget(promise, label) {
 function syncFileToCloud(folderId, fileName, area = "uploads") {
   const baseDir = area === "temp" ? "./temp" : "./uploads";
   const localPath = path.join(getFolderStoragePath(baseDir, folderId), path.basename(fileName));
-  syncCloudFireAndForget(uploadFileToCloud(localPath, folderId, fileName, area), `sync ${area}/${folderId}/${fileName}`);
+  syncCloudFireAndForget(() => uploadFileToCloud(localPath, folderId, fileName, area), `sync ${area}/${folderId}/${fileName}`);
 }
 
 function deleteCloudFileLater(folderId, fileName, area = "uploads") {
-  syncCloudFireAndForget(deleteFileFromCloud(folderId, fileName, area), `delete ${area}/${folderId}/${fileName}`);
+  syncCloudFireAndForget(() => deleteFileFromCloud(folderId, fileName, area), `delete ${area}/${folderId}/${fileName}`);
 }
 
 function deleteCloudFolderLater(folderId) {
-  syncCloudFireAndForget(deleteCloudPrefix(getCloudKey(folderId, "", "uploads")), `delete uploads folder ${folderId}`);
-  syncCloudFireAndForget(deleteCloudPrefix(getCloudKey(folderId, "", "temp")), `delete temp folder ${folderId}`);
+  syncCloudFireAndForget(() => deleteCloudPrefix(getCloudKey(folderId, "", "uploads")), `delete uploads folder ${folderId}`);
+  syncCloudFireAndForget(() => deleteCloudPrefix(getCloudKey(folderId, "", "temp")), `delete temp folder ${folderId}`);
 }
 
 async function ensureCloudFileCached(folderId, fileName, localPath, area = "uploads", { strictCloud = false } = {}) {
@@ -4616,22 +4620,24 @@ async function deleteCloudTrashItem(item) {
 }
 
 async function processPendingCloudTrashItems() {
-  if (!isCloudStorageEnabled()) return;
-  try {
-    for (const item of trashRepository.listTrashItems({ status: "remote_delete_pending" })) {
-      try {
-        const result = await trashService.processRemoteDeletion({ item, provider: deleteCloudTrashItem });
-        const state = result.metadata?.remoteDeletion?.state;
-        if (state === "completed") auditLog("trash.remote_delete.completed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "success", {});
-        else if (state === "terminal_failure") auditLog("trash.remote_delete.failed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "failure", { category: result.metadata?.remoteDeletion?.failureCategory });
-      } catch (error) {
-        auditLog("trash.remote_delete.operational_failure", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "failure", { category: error.code || "persistence_error" });
-        console.error("[cloud-trash] pending remote deletion failed:", error.code || "persistence_error");
+  return restoreRequestGate.run(async () => {
+    if (!isCloudStorageEnabled()) return;
+    try {
+      for (const item of trashRepository.listTrashItems({ status: "remote_delete_pending" })) {
+        try {
+          const result = await trashService.processRemoteDeletion({ item, provider: deleteCloudTrashItem });
+          const state = result.metadata?.remoteDeletion?.state;
+          if (state === "completed") auditLog("trash.remote_delete.completed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "success", {});
+          else if (state === "terminal_failure") auditLog("trash.remote_delete.failed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "failure", { category: result.metadata?.remoteDeletion?.failureCategory });
+        } catch (error) {
+          auditLog("trash.remote_delete.operational_failure", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "failure", { category: error.code || "persistence_error" });
+          console.error("[cloud-trash] pending remote deletion failed:", error.code || "persistence_error");
+        }
       }
+    } catch (error) {
+      console.error("[cloud-trash] pending retry failed:", error.code || "persistence_error");
     }
-  } catch (error) {
-    console.error("[cloud-trash] pending retry failed:", error.code || "persistence_error");
-  }
+  });
 }
 
 function deleteCloudTrashItemLater(item) {
@@ -4653,16 +4659,18 @@ function deleteCloudTrashItemLater(item) {
 }
 
 async function processPendingCloudRestoreSync() {
-  if (!isCloudStorageEnabled()) return;
-  for (const backup of backupService.listBackups()) {
-    const state = backup.metadata?.restoreSync?.state;
-    if (!["pending", "retry_wait"].includes(state)) continue;
-    try {
-      await restoreService.processRestoreSync({ backupId: backup.id });
-    } catch {
-      // The durable entry remains retryable; never create an unhandled rejection.
+  return restoreRequestGate.run(async () => {
+    if (!isCloudStorageEnabled()) return;
+    for (const backup of backupService.listBackups()) {
+      const state = backup.metadata?.restoreSync?.state;
+      if (!["pending", "retry_wait"].includes(state)) continue;
+      try {
+        await restoreService.processRestoreSync({ backupId: backup.id });
+      } catch {
+        // The durable entry remains retryable; never create an unhandled rejection.
+      }
     }
-  }
+  });
 }
 
 function initData() {
@@ -4675,6 +4683,7 @@ function initData() {
   if (!fs.existsSync("./uploads")) fs.mkdirSync("./uploads");
 
   if (shouldUseDatabase()) {
+      restoreService.recoverDatabaseRollback(dbConfig.getDatabasePath());
     runMigrations({ backup: String(process.env.DB_AUTO_BACKUP_ON_START || "false").toLowerCase() === "true" });
   }
 
@@ -4729,6 +4738,20 @@ const rejectRateLimit = createRouteRateLimit();
 const deleteRateLimit = createRouteRateLimit();
 const fileAccessRateLimit = createRouteRateLimit();
 const fileTemporaryRateLimit = createRouteRateLimit();
+const restoreRequestGate = createRestoreRequestGate({
+  directory: RESTORE_ACTIVE_REQUESTS_DIR,
+  isBlocked: restoreService.isWholeRestoreBlocked,
+});
+const startupRestoreLease = restoreRequestGate.acquire({ allowBlocked: true });
+process.once("exit", startupRestoreLease);
+let startupRestoreState;
+try {
+  startupRestoreState = restoreService.assertNoPendingWholeRestore();
+} catch (error) {
+  startupRestoreLease();
+  throw error;
+}
+app.use(restoreRequestGate.middleware);
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
   if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
@@ -4754,6 +4777,10 @@ app.get("/auth/session.js", authenticate, (req, res) => {
 });
 
 wss.on("connection", (socket, req) => {
+  if (restoreService.isWholeRestoreBlocked()) {
+    socket.close(1012, "Restore recovery required");
+    return;
+  }
   const origin = req.headers.origin;
   const expectedOrigin = getExpectedOrigin(req, app.get("trust proxy fn"));
   const user = origin === expectedOrigin && authenticateRealtimeToken(parseCookies(req.headers.cookie).rootark_session);
@@ -4773,6 +4800,7 @@ wss.on("connection", (socket, req) => {
 
   socket.on("message", (rawMessage, isBinary) => {
     socket.lastActivityAt = Date.now();
+    if (restoreService.isWholeRestoreBlocked()) return socket.close(1012, "Restore recovery required");
     if (!refreshRealtimeUser(socket)) return;
     if (isBinary) return socket.close(1003, "Quadro binario nao suportado");
     const now = Date.now();
@@ -8756,6 +8784,7 @@ registerBackupRoutes(app, {
   getAuditActor,
   requireBackupAccess,
   restoreService,
+  waitForRequestQuiescence: (requestLeasePath) => restoreRequestGate.waitForQuiescence(requestLeasePath),
 });
 
 registerTrashRoutes(app, {
@@ -9556,19 +9585,46 @@ initData();
 startCloudRelocationCleanup();
 restoreService.recoverQuarantineRestore();
 if (!fs.existsSync(QUARANTINE_FILE)) saveQuarantine(getDefaultQuarantine());
-scheduleAutomaticBackups({ cron, createBackup: backupService.createBackup, auditLog, onInvalid: console.error });
-cleanupExpiredTemporaryItems();
-cleanupExpiredTrashItems();
+const startupRestoreCoordinator = startupRestoreState.restartRequired
+  ? restoreService.prepareWholeRestoreStartup()
+  : null;
+if (!startupRestoreCoordinator) {
+  cleanupExpiredPublicLinks();
+  cleanupExpiredTemporaryItems();
+  cleanupExpiredTrashItems();
+  restoreRequestGate.run(() => repairCompressedTempUploads()).catch((error) => {
+    console.error("Falha ao reparar uploads temporarios:", error.message);
+  });
+  cleanupOrphanTempUploads();
+  cleanupIncomingUploads();
+}
+scheduleAutomaticBackups({
+  cron,
+  createBackup: (...args) => {
+    if (restoreService.isWholeRestoreBlocked()) return Promise.reject(new Error("Backup pausado durante recuperacao de restore"));
+    return backupService.createBackup(...args);
+  },
+  auditLog,
+  onInvalid: console.error,
+});
 void processPendingCloudTrashItems();
 void processPendingCloudRestoreSync().catch(() => {});
-repairCompressedTempUploads().catch((error) => {
-  console.error("Falha ao reparar uploads temporarios:", error.message);
-});
-cleanupOrphanTempUploads();
-cleanupIncomingUploads();
-setInterval(cleanupExpiredTemporaryItems, 60 * 1000);
-setInterval(cleanupExpiredTrashItems, 60 * 60 * 1000);
+setInterval(() => { void restoreRequestGate.run(() => cleanupExpiredTemporaryItems()); }, 60 * 1000);
+setInterval(() => { void restoreRequestGate.run(() => cleanupExpiredPublicLinks()); }, 60 * 1000);
+setInterval(() => { void restoreRequestGate.run(() => cleanupExpiredTrashItems()); }, 60 * 60 * 1000);
 setInterval(() => { void processPendingCloudTrashItems(); }, 60 * 1000);
 setInterval(() => { void processPendingCloudRestoreSync().catch(() => {}); }, 60 * 1000);
-setInterval(cleanupIncomingUploads, 60 * 1000);
-server.listen(PORT, () => console.log(`Servidor rodando em http://localhost:${PORT}`));
+setInterval(() => { void restoreRequestGate.run(() => cleanupIncomingUploads()); }, 60 * 1000);
+server.listen(PORT, () => {
+  try {
+    if (startupRestoreCoordinator) {
+      const acknowledgement = restoreService.acknowledgeWholeRestoreInstance();
+      console.log(`[restore] startup acknowledgement ${acknowledgement.acknowledgedInstances}/${acknowledgement.requiredInstances}`);
+    }
+  } catch (error) {
+    console.error("[restore] startup acknowledgement failed:", sanitizeLogValue(error.message));
+  } finally {
+    startupRestoreLease();
+  }
+  console.log(`Servidor rodando em http://localhost:${PORT}`);
+});

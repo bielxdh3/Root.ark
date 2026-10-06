@@ -273,7 +273,10 @@ test("quarantine backup and restore preserve external payloads and reject incomp
         const changedMetadata = { items: [{ id: "changed", storedQuarantineFilename: changedPayloadName }, ...metadata.items.slice(1)] };
         fs.writeFileSync(metadataPath, JSON.stringify(changedMetadata));
         fs.writeFileSync(path.join(process.cwd(), "data", "runtime-only.json"), "mutated");
-        await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" });
+        const firstRestore = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" });
+        assert.equal(firstRestore.restartRecommended, true);
+        restoreService.prepareWholeRestoreStartup();
+        assert.equal(restoreService.acknowledgeWholeRestoreInstance().complete, true);
         assert.deepEqual(fs.readFileSync(payloadPath), payloadBytes);
         assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), { items: [metadata.items[0], ...metadata.items.slice(1)] });
         assert.equal(fs.existsSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, changedPayloadName)), false);
@@ -296,7 +299,10 @@ test("quarantine backup and restore preserve external payloads and reject incomp
         const currentSecretBytes = Buffer.from("new current secret bytes");
         fs.writeFileSync(secretPayloadPath, currentSecretBytes);
         fs.writeFileSync(metadataPath, JSON.stringify({ items: [sameIdSensitiveItem] }));
-        await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" });
+        const secondRestore = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" });
+        assert.equal(secondRestore.restartRecommended, true);
+        restoreService.prepareWholeRestoreStartup();
+        assert.equal(restoreService.acknowledgeWholeRestoreInstance().complete, true);
         assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), { items: [sameIdSensitiveItem] });
         assert.deepEqual(fs.readFileSync(secretPayloadPath), currentSecretBytes);
         assert.deepEqual(fs.readFileSync(payloadPath), payloadBytes);

@@ -18,6 +18,9 @@
   function publicError(error, fallback) {
     if (error && error.status === 401) { ui.redirectToLogin(); return ""; }
     if (error && error.status === 403) return "Sua conta não tem permissão para esta ação.";
+    if (error && error.status === 503 && error.payload?.cleanupPending) return "Backup restaurado, mas a limpeza temporária falhou. Reinicie todas as instâncias; o serviço tentará remover a área temporária antes de aceitar novas solicitações.";
+    if (error && error.status === 503 && error.payload?.restartRequired) return "Backup restaurado. Reinicie todas as instâncias do servidor para liberar o acesso.";
+    if (error && error.status === 503 && error.payload?.recoveryRequired) return "O servidor está bloqueado durante a recuperação do backup. Reinicie todas as instâncias e revise o estado antes de tentar novamente.";
     const message = String(error && error.message || "");
     if (!message || error.status >= 500 || /[A-Za-z]:[\\/]|(?:^|[\s"'(])\/(?:[^/\s]+\/){2,}/.test(message)) return fallback;
     return message;
@@ -537,8 +540,23 @@
     if (!canManage) { noAccess(target, "Backups exigem a permissão manageBackups."); return; }
     target.innerHTML = backupsMarkup();
     let backups = [];
+    let recoveryBlocked = false;
     const body = document.getElementById("backups-body"), warning = document.getElementById("backup-warning");
     const manifestPanel = document.getElementById("manifest-panel"), manifestContent = document.getElementById("manifest-content");
+    function blockForRestoreRecovery(message) {
+      recoveryBlocked = true;
+      warning.textContent = message;
+      warning.hidden = false;
+      warning.setAttribute("role", "alert");
+      target.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+    }
+    function blockOnRestoreRecovery(error, message) {
+      if (error?.status === 503 && (error.payload?.restartRequired || error.payload?.recoveryRequired)) {
+        blockForRestoreRecovery(message);
+        return true;
+      }
+      return false;
+    }
     function renderBackups() {
       if (!backups.length) { body.innerHTML = tableState(5, "Nenhum backup encontrado.", "empty"); return; }
       const labels = { success: "Concluído", completed: "Concluído", failed: "Falhou", creating: "Criando", running: "Em andamento" };
@@ -559,38 +577,56 @@
       } catch (error) {
         const message = publicError(error, "Não foi possível consultar o resultado do backup mais recente.");
         warning.textContent = message; warning.hidden = !message;
+        blockOnRestoreRecovery(error, message);
       }
     }
     async function loadBackups() {
       body.innerHTML = tableState(5, "Carregando backups…", "loading");
       await loadLatestStatus();
       try { backups = asArray((await api.get("/backups")).backups); renderBackups(); }
-      catch (error) { backups = []; body.innerHTML = tableState(5, publicError(error, "Não foi possível carregar os backups."), "error"); }
+      catch (error) {
+        backups = [];
+        const message = publicError(error, "Não foi possível carregar os backups.");
+        body.innerHTML = tableState(5, message, "error");
+        blockOnRestoreRecovery(error, message);
+      }
     }
     document.getElementById("create-backup").addEventListener("click", async (event) => {
       const button = event.currentTarget, feedback = document.getElementById("backup-feedback");
       button.disabled = true; setFeedback(feedback, "Criando backup…");
       try { await api.post("/backups", { notes: "Backup manual via painel" }); setFeedback(feedback, "Backup criado.", "success"); ui.toast("Backup criado.", "success"); await loadBackups(); }
-      catch (error) { const message = publicError(error, "Não foi possível criar o backup."); if (message) setFeedback(feedback, message, "error"); }
-      finally { button.disabled = false; }
+      catch (error) {
+        const message = publicError(error, "Não foi possível criar o backup.");
+        if (message) setFeedback(feedback, message, "error");
+        blockOnRestoreRecovery(error, message);
+      }
+      finally { button.disabled = recoveryBlocked; }
     });
     target.addEventListener("click", async (event) => {
       const button = event.target.closest("button[data-action]"); if (!button) return;
       const action = button.dataset.action;
-      if (action === "refresh-backups") { button.disabled = true; await loadBackups(); button.disabled = false; return; }
+      if (action === "refresh-backups") { button.disabled = true; await loadBackups(); button.disabled = recoveryBlocked; return; }
       if (action === "close-manifest") { manifestPanel.hidden = true; manifestContent.textContent = ""; return; }
       const backup = backups[Number(button.dataset.backupIndex)]; if (!backup) return;
       if (action === "download-backup") {
         button.disabled = true;
         try { await api.download(`/backups/${encodeURIComponent(backup.id)}/download`, String(backup.filename || "rootark-backup.zip")); ui.toast("Download iniciado.", "success"); }
-        catch (error) { const message = publicError(error, "Não foi possível baixar o backup."); if (message) ui.toast(message, "error"); }
-        finally { button.disabled = false; }
+        catch (error) {
+          const message = publicError(error, "Não foi possível baixar o backup.");
+          blockOnRestoreRecovery(error, message);
+          if (message) ui.toast(message, "error");
+        }
+        finally { button.disabled = recoveryBlocked; }
         return;
       }
       if (action === "show-manifest") {
         manifestPanel.hidden = false; manifestContent.textContent = "Carregando manifesto…";
         try { manifestContent.textContent = JSON.stringify(await api.get(`/backups/${encodeURIComponent(backup.id)}/manifest`), null, 2); }
-        catch (error) { manifestContent.textContent = publicError(error, "Não foi possível carregar o manifesto."); }
+        catch (error) {
+          const message = publicError(error, "Não foi possível carregar o manifesto.");
+          manifestContent.textContent = message;
+          blockOnRestoreRecovery(error, message);
+        }
         manifestPanel.scrollIntoView({ block: "nearest" });
         return;
       }
@@ -604,12 +640,20 @@
         const confirmation = String(result.get("confirmation") || "");
         if (confirmation !== "RESTORE") { ui.toast("Digite RESTORE exatamente para confirmar.", "error"); return; }
         button.disabled = true;
+        let restartRequired = false;
         try {
           const restored = await api.post(`/backups/${encodeURIComponent(backup.id)}/restore`, { confirmation });
-          ui.toast(restored && restored.restartRecommended ? "Backup restaurado. O serviço recomenda reiniciar a aplicação." : "Backup restaurado.", "success");
-          await loadBackups();
-        } catch (error) { const message = publicError(error, "Não foi possível restaurar o backup."); if (message) ui.toast(message, "error"); }
-        finally { button.disabled = false; }
+          restartRequired = Boolean(restored && restored.restartRecommended);
+          ui.toast(restartRequired ? "Backup restaurado. Reinicie todas as instâncias do servidor para liberar o acesso." : "Backup restaurado.", "success");
+          if (restartRequired) blockForRestoreRecovery("Backup restaurado. Reinicie todas as instâncias do servidor para liberar o acesso.");
+          if (!restartRequired) await loadBackups();
+        } catch (error) {
+          restartRequired = error?.status === 503 && Boolean(error.payload?.restartRequired || error.payload?.recoveryRequired);
+          const message = publicError(error, "Não foi possível restaurar o backup.");
+          if (restartRequired) blockForRestoreRecovery(message);
+          if (message) ui.toast(message, "error");
+        }
+        finally { button.disabled = restartRequired || recoveryBlocked; }
         return;
       }
       if (action === "delete-backup") {
@@ -617,7 +661,12 @@
         if (!accepted) return;
         button.disabled = true;
         try { await api.delete(`/backups/${encodeURIComponent(backup.id)}`); ui.toast("Backup excluído.", "success"); await loadBackups(); }
-        catch (error) { const message = publicError(error, "Não foi possível excluir o backup."); if (message) ui.toast(message, "error"); button.disabled = false; }
+        catch (error) {
+          const message = publicError(error, "Não foi possível excluir o backup.");
+          blockOnRestoreRecovery(error, message);
+          if (message) ui.toast(message, "error");
+          button.disabled = recoveryBlocked;
+        }
       }
     });
     await loadBackups();
@@ -637,6 +686,10 @@
     try { user = await ui.getSession(); }
     catch (error) {
       if (error && error.status === 401) { ui.redirectToLogin(); return; }
+      if (error?.status === 503 && (error.payload?.restartRequired || error.payload?.recoveryRequired)) {
+        root.innerHTML = `<main class="standalone-state" role="alert"><h1>Servidor em recuperação</h1><p>${esc(publicError(error, "O servidor está bloqueado para recuperação do backup."))}</p></main>`;
+        return;
+      }
       root.innerHTML = `<main class="standalone-state" role="alert"><h1>Não foi possível abrir esta página</h1><p>${esc(publicError(error, "A sessão não pôde ser validada. Tente novamente."))}</p><a class="button button-primary" href="/login.html">Ir para entrar</a></main>`;
       return;
     }

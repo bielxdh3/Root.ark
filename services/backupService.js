@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const crypto = require("crypto");
 const { Readable } = require("stream");
 const Database = require("better-sqlite3");
@@ -84,6 +85,9 @@ function isSensitivePath(relativePath) {
   if (base.endsWith(".key") || base.endsWith(".pem") || base.endsWith(".p12")) return true;
   if (base === "server-master.key") return true;
   if (base === ".rootark-quarantine-restore-journal.json" || base.startsWith(".rootark-quarantine-restore-metadata-")) return true;
+  if (base.startsWith(".rootark-restore-coordinator.json")) return true;
+  if (normalized.toLowerCase().startsWith("data/.rootark-active-requests/")) return true;
+  if (normalized.toLowerCase().startsWith("data/.rootark-restore-restart-acks/")) return true;
   return false;
 }
 
@@ -443,8 +447,14 @@ function sameRuntimeRoot(left, right) {
   return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
+function lockOwnerInstanceId() {
+  return String(process.env.ROOTARK_INSTANCE_ID || process.env.HOSTNAME || process.env.COMPUTERNAME || os.hostname() || "default").trim();
+}
+
 function ownerIsLive(record) {
   if (!Number.isInteger(record?.pid) || record.pid <= 0) return false;
+  const hasVersionedOwner = record.formatVersion === OPERATION_LOCK_FORMAT_VERSION || record.version === OPERATION_LOCK_FORMAT_VERSION;
+  if (hasVersionedOwner && (!record.instanceId || record.instanceId !== lockOwnerInstanceId())) return true;
   try { process.kill(record.pid, 0); } catch (error) { return error.code === "EPERM"; }
   if (record.processStartIdentity && processStartIdentity(record.pid)) {
     return record.processStartIdentity === processStartIdentity(record.pid);
@@ -531,7 +541,7 @@ function authorityPathIsSafe(target) {
 }
 
 function validTakeoverAuthority(record) {
-  return record && record.version === OPERATION_LOCK_FORMAT_VERSION && typeof record.token === "string" && record.token && Number.isInteger(record.pid) && record.pid > 0 && typeof record.claimedAt === "string" && Number.isFinite(Date.parse(record.claimedAt)) && typeof record.runtimeRoot === "string" && sameRuntimeRoot(record.runtimeRoot, runtimeRootIdentity()) && record.lockPath === LOCK_FILE && record.evidencePath === LOCK_TAKEOVER_EVIDENCE && record.observed && typeof record.observed.sha256 === "string" && Number.isInteger(record.observed.size) && record.observed.stat;
+  return record && record.version === OPERATION_LOCK_FORMAT_VERSION && typeof record.token === "string" && record.token && Number.isInteger(record.pid) && record.pid > 0 && typeof record.instanceId === "string" && Boolean(record.instanceId) && typeof record.claimedAt === "string" && Number.isFinite(Date.parse(record.claimedAt)) && typeof record.runtimeRoot === "string" && sameRuntimeRoot(record.runtimeRoot, runtimeRootIdentity()) && record.lockPath === LOCK_FILE && record.evidencePath === LOCK_TAKEOVER_EVIDENCE && record.observed && typeof record.observed.sha256 === "string" && Number.isInteger(record.observed.size) && record.observed.stat;
 }
 
 function readTakeoverAuthority() {
@@ -598,6 +608,7 @@ function acquireTakeoverAuthority(observed, operation) {
     token,
     operation,
     pid: process.pid,
+    instanceId: lockOwnerInstanceId(),
     processStartIdentity: CURRENT_PROCESS_START_IDENTITY,
     claimedAt: new Date().toISOString(),
     runtimeRoot: runtimeRootIdentity(),
@@ -657,6 +668,7 @@ function lockRecord(operation, token, claimToken = null) {
     token,
     operation,
     pid: process.pid,
+    instanceId: lockOwnerInstanceId(),
     processStartIdentity: CURRENT_PROCESS_START_IDENTITY,
     startedAt: new Date().toISOString(),
     runtimeRoot: runtimeRootIdentity(),
@@ -1115,7 +1127,7 @@ async function createBackup(options = {}) {
     throw new Error("Backups desativados por BACKUP_ENABLED=false");
   }
 
-  const release = acquireLock("backup");
+  const release = options.lockHeld ? null : acquireLock("backup");
   const startedAt = Date.now();
   const id = crypto.randomUUID();
   const createdAt = new Date().toISOString();
@@ -1239,7 +1251,7 @@ async function createBackup(options = {}) {
         console.error(`[backup] ${evidence.code}`);
       }
     }
-    release();
+    release?.();
   }
 }
 

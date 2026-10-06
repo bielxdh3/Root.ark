@@ -52,6 +52,60 @@ function createCloudStorage(options = {}) {
     const files = result.data.files || [];
     return files.sort((a, b) => String(a.id).localeCompare(String(b.id)))[0] || null;
   }
+  async function resolveUploadId(folderId, fileName, area = "uploads") {
+    assertProvider();
+    if (provider !== "gdrive") throw cloudError("unsupported_provider", "Stable upload IDs are supported only by Google Drive");
+    const cloudKey = objectKey(folderId, fileName, area);
+    const existing = await findDriveFile(cloudKey);
+    if (existing) {
+      const file = await getDriveFile(existing.id);
+      assertDriveFileOwnership(file, cloudKey, folderId, area);
+      return String(file.id);
+    }
+    const result = await (await drive()).files.generateIds({ count: 1, space: "drive", fields: "ids" });
+    const id = String(result.data.ids?.[0] || "");
+    if (!isDriveFileId(id)) throw cloudError("provider_error", "Google Drive did not reserve a valid file ID");
+    return id;
+  }
+  async function getDriveFile(fileId) {
+    return (await (await drive()).files.get({ fileId, fields: "id,parents,appProperties" })).data;
+  }
+  function assertDriveFileOwnership(file, cloudKey, folderId, area) {
+    const properties = file?.appProperties || {};
+    if (!file?.id || properties.rootArkKey !== cloudKey
+      || String(properties.rootArkFolderId || "") !== String(folderId || rootFolderId)
+      || String(properties.rootArkArea || "") !== String(area)
+      || !Array.isArray(file.parents) || !file.parents.includes(folder())) {
+      throw cloudError("provider_error", "Pinned Google Drive file does not belong to this object");
+    }
+  }
+  function driveRequestBody(folderId, fileName, area, cloudKey) {
+    return {
+      name: fileName,
+      appProperties: { rootArkKey: cloudKey, rootArkFolderId: String(folderId || rootFolderId), rootArkArea: area },
+    };
+  }
+  async function uploadToPinnedDriveId(localPath, fileId, requestBody, cloudKey, folderId, area) {
+    const client = await drive();
+    let existing;
+    try { existing = await getDriveFile(fileId); }
+    catch (error) { if (!isDriveStatus(error, 404)) throw error; }
+    if (existing) {
+      assertDriveFileOwnership(existing, cloudKey, folderId, area);
+      await client.files.update({ fileId, requestBody, media: { body: fs.createReadStream(localPath) }, fields: "id" });
+      return { provider, key: cloudKey, id: fileId };
+    }
+    try {
+      const result = await client.files.create({ requestBody: { ...requestBody, id: fileId, parents: [folder()] }, media: { body: fs.createReadStream(localPath) }, fields: "id" });
+      return { provider, key: cloudKey, id: String(result.data.id || fileId) };
+    } catch (error) {
+      if (!isDriveStatus(error, 409)) throw error;
+      const raced = await getDriveFile(fileId);
+      assertDriveFileOwnership(raced, cloudKey, folderId, area);
+      await client.files.update({ fileId, requestBody, media: { body: fs.createReadStream(localPath) }, fields: "id" });
+      return { provider, key: cloudKey, id: fileId };
+    }
+  }
   function parseInventoryKey(value) {
     const clean = String(value || "").replace(/\\/g, "/");
     const root = `${prefix}/`;
@@ -112,15 +166,20 @@ function createCloudStorage(options = {}) {
     } while (token);
     return objects;
   }
-  async function upload(localPath, folderId, fileName, area = "uploads") {
+  async function upload(localPath, folderId, fileName, area = "uploads", uploadOptions = {}) {
     assertProvider(); if (!enabled() || !fs.statSync(localPath, { throwIfNoEntry: false })?.isFile()) return null;
     const cloudKey = objectKey(folderId, fileName, area);
     if (provider === "s3") { const bucketName = bucket(); await (await s3()).send(new (require("@aws-sdk/client-s3").PutObjectCommand)({ Bucket: bucketName, Key: cloudKey, Body: fs.createReadStream(localPath) })); return { provider, key: cloudKey }; }
+    const providerFileId = String(uploadOptions?.providerFileId || "").trim();
+    if (providerFileId) {
+      if (!isDriveFileId(providerFileId)) throw cloudError("invalid_path", "Google Drive file ID is invalid");
+      return uploadToPinnedDriveId(localPath, providerFileId, driveRequestBody(folderId, fileName, area, cloudKey), cloudKey, folderId, area);
+    }
     const existing = await findDriveFile(cloudKey);
-    const requestBody = { name: fileName, appProperties: { rootArkKey: cloudKey, rootArkFolderId: String(folderId || rootFolderId), rootArkArea: area } };
+    const requestBody = driveRequestBody(folderId, fileName, area, cloudKey);
     const media = { body: fs.createReadStream(localPath) };
     if (existing) { await (await drive()).files.update({ fileId: existing.id, requestBody, media, fields: "id" }); return { provider, key: cloudKey, id: existing.id }; }
-    requestBody.parents = [folder()]; const result = await (await drive()).files.create({ requestBody, media, fields: "id" }); return { provider, key: cloudKey, id: result.data.id };
+    const result = await (await drive()).files.create({ requestBody: { ...requestBody, parents: [folder()] }, media, fields: "id" }); return { provider, key: cloudKey, id: result.data.id };
   }
   async function download(folderId, fileName, localPath, area = "uploads") {
     assertProvider(); if (!enabled() || fs.existsSync(localPath)) return false;
@@ -197,11 +256,13 @@ function createCloudStorage(options = {}) {
   const run = async (operation, ...args) => {
     try { return await operation(...args); } catch (error) { throw classify(error); }
   };
-  return { enabled, status, key, inventory: (...args) => run(inventory, ...args), upload: (...args) => run(upload, ...args), download: (...args) => run(download, ...args), remove: (...args) => run(remove, ...args), removePrefix: (...args) => run(removePrefix, ...args), list: (...args) => run(list, ...args) };
+  return { provider, enabled, status, key, inventory: (...args) => run(inventory, ...args), resolveUploadId: (...args) => run(resolveUploadId, ...args), upload: (...args) => run(upload, ...args), download: (...args) => run(download, ...args), remove: (...args) => run(remove, ...args), removePrefix: (...args) => run(removePrefix, ...args), list: (...args) => run(list, ...args) };
 }
 
 function normalizePrefix(value) { const clean = String(value || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""); if (!clean || clean.split("/").some((part) => !part || part === "." || part === "..")) throw cloudError("invalid_prefix", "Invalid cloud prefix"); return clean; }
 function cloudError(code, message) { const error = new Error(message); error.code = code; return error; }
+function isDriveFileId(value) { return /^[A-Za-z0-9_-]{1,256}$/.test(String(value || "")); }
+function isDriveStatus(error, status) { return Number(error?.response?.status || error?.response?.data?.error?.code || error?.status || error?.code) === status; }
 function classify(error) { return normalizeProviderError(error); }
 function defaultS3Client(config) { return async () => { const { S3Client } = require("@aws-sdk/client-s3"); return new S3Client({ region: config.region || "us-east-1", ...(config.endpoint ? { endpoint: config.endpoint } : {}), ...(config.forcePathStyle ? { forcePathStyle: true } : {}) }); }; }
 function defaultGoogleDriveClient(config) { return async () => { const { google } = require("googleapis"); const auth = new google.auth.GoogleAuth({ ...(config.credentials ? { credentials: JSON.parse(config.credentials) } : {}), scopes: ["https://www.googleapis.com/auth/drive"] }); return google.drive({ version: "v3", auth }); }; }

@@ -1,0 +1,284 @@
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+
+const FORMAT_VERSION = 1;
+const FILE_MODE = 0o600;
+const DIR_MODE = 0o700;
+const COPY_BUFFER_SIZE = 1024 * 1024;
+
+function hashFile(pathname) {
+  const digest = crypto.createHash("sha256");
+  const buffer = Buffer.allocUnsafe(COPY_BUFFER_SIZE);
+  const fd = fs.openSync(pathname, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+  try {
+    const opened = fs.fstatSync(fd, { bigint: true });
+    const before = fs.lstatSync(pathname, { bigint: true });
+    if (!opened.isFile() || opened.nlink !== 1n || !before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) {
+      throw new Error("Restore pre-image file is aliased or invalid");
+    }
+    if (!identityMatches(before, opened)) throw new Error("Restore pre-image file changed while opening");
+    let read;
+    while ((read = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) digest.update(buffer.subarray(0, read));
+    const after = fs.fstatSync(fd, { bigint: true });
+    if (!identityMatches(opened, after)) throw new Error("Restore pre-image file changed while hashing");
+  } finally { fs.closeSync(fd); }
+  return digest.digest("hex");
+}
+
+function ensureSafeDirectory(pathname, { create = false } = {}) {
+  const resolved = path.resolve(pathname);
+  const root = path.parse(resolved).root;
+  let current = root;
+  for (const segment of path.relative(root, resolved).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    try {
+      const stat = fs.lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Restore pre-image path contains an unsafe directory");
+    } catch (error) {
+      if (error.code !== "ENOENT" || !create) throw error;
+      fs.mkdirSync(current, { mode: DIR_MODE });
+    }
+  }
+  return resolved;
+}
+
+function safeRelativePath(relative) {
+  if (typeof relative !== "string" || !relative || path.isAbsolute(relative) || relative.includes("\\") || relative.split("/").some((part) => !part || part === "." || part === ".." || part.includes(":"))) {
+    throw new Error("Restore pre-image contains an unsafe relative path");
+  }
+  return relative;
+}
+
+function identityMatches(before, after) {
+  return before.dev === after.dev && before.ino === after.ino
+    && before.size === after.size && before.mtimeNs === after.mtimeNs
+    && before.ctimeNs === after.ctimeNs && before.nlink === after.nlink;
+}
+
+function copyVerifiedFile(source, destination, expectedHash = null) {
+  const sourceFd = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+  let outputFd;
+  let destinationCreated = false;
+  const digest = crypto.createHash("sha256");
+  const buffer = Buffer.allocUnsafe(COPY_BUFFER_SIZE);
+  try {
+    const opened = fs.fstatSync(sourceFd, { bigint: true });
+    const before = fs.lstatSync(source, { bigint: true });
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) throw new Error("Restore pre-image source is aliased or invalid");
+    if (!opened.isFile() || opened.nlink !== 1n || !identityMatches(before, opened)) throw new Error("Restore pre-image source changed while opening");
+    outputFd = fs.openSync(destination, "wx", FILE_MODE);
+    destinationCreated = true;
+    let position = 0;
+    let read;
+    while ((read = fs.readSync(sourceFd, buffer, 0, buffer.length, position)) > 0) {
+      const chunk = buffer.subarray(0, read);
+      digest.update(chunk);
+      let written = 0;
+      while (written < read) written += fs.writeSync(outputFd, chunk, written, read - written);
+      position += read;
+    }
+    const copiedHash = digest.digest("hex");
+    const finalSource = fs.fstatSync(sourceFd, { bigint: true });
+    if (!identityMatches(opened, finalSource) || (expectedHash && copiedHash !== expectedHash)) throw new Error("Restore pre-image source changed or failed integrity verification");
+    fs.fsyncSync(outputFd);
+    return { sha256: copiedHash, size: Number(finalSource.size), mode: Number(finalSource.mode & 0o777n) };
+  } catch (error) {
+    if (destinationCreated) fs.rmSync(destination, { force: true });
+    throw error;
+  } finally {
+    if (outputFd !== undefined) fs.closeSync(outputFd);
+    fs.closeSync(sourceFd);
+  }
+}
+
+function walkTree(root, excludedPath = null) {
+  const rootStat = fs.lstatSync(root);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error("Restore pre-image tree root is unsafe");
+  const entries = [];
+  const excluded = excludedPath ? path.resolve(excludedPath) : null;
+  const excludedReal = excluded && fs.existsSync(excluded) ? fs.realpathSync(excluded) : null;
+  const visit = (directory, relative = "") => {
+    for (const name of fs.readdirSync(directory)) {
+      const absolute = path.join(directory, name);
+      const childRelative = relative ? `${relative}/${name}` : name;
+      const stat = fs.lstatSync(absolute, { bigint: true });
+      if (stat.isSymbolicLink()) throw new Error("Restore pre-image tree contains a symbolic link");
+      if (excluded && (absolute === excluded || absolute.startsWith(`${excluded}${path.sep}`))) continue;
+      if (excludedReal) {
+        let real;
+        try { real = fs.realpathSync(absolute); } catch {}
+        if (real && (real === excludedReal || real.startsWith(`${excludedReal}${path.sep}`))) continue;
+      }
+      if (stat.isDirectory()) {
+        entries.push({ path: safeRelativePath(childRelative), type: "directory", mode: Number(stat.mode & 0o777n) });
+        visit(absolute, childRelative);
+      } else if (stat.isFile()) {
+        if (stat.nlink !== 1n) throw new Error("Restore pre-image tree contains a hard-linked file");
+        entries.push({ path: safeRelativePath(childRelative), type: "file", size: Number(stat.size), mode: Number(stat.mode & 0o777n), sha256: hashFile(absolute) });
+      } else throw new Error("Restore pre-image tree contains an unsupported filesystem entry");
+    }
+  };
+  visit(root);
+  return entries.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function snapshotTree(destination, snapshotRoot, excludedPath = null) {
+  let rootStat;
+  try { rootStat = fs.lstatSync(destination); }
+  catch (error) { if (error.code === "ENOENT") return { existed: false, entries: [] }; throw error; }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error("Restore pre-image destination root is not a safe directory");
+  ensureSafeDirectory(snapshotRoot, { create: true });
+  const entries = walkTree(destination, excludedPath);
+  for (const entry of entries) {
+    const stagedPath = path.join(snapshotRoot, ...entry.path.split("/"));
+    if (entry.type === "directory") {
+      ensureSafeDirectory(stagedPath, { create: true });
+      try { fs.chmodSync(stagedPath, entry.mode); } catch (error) { if (process.platform !== "win32") throw error; }
+    } else {
+      ensureSafeDirectory(path.dirname(stagedPath), { create: true });
+      const result = copyVerifiedFile(path.join(destination, ...entry.path.split("/")), stagedPath, entry.sha256);
+      if (result.size !== entry.size) throw new Error("Restore pre-image file size changed while staging");
+    }
+  }
+  verifyTree(snapshotRoot, entries);
+  return { existed: true, entries };
+}
+
+function verifyTree(root, entries) {
+  const listed = walkTree(root);
+  if (listed.length !== entries.length) throw new Error("Restore pre-image staging tree is incomplete");
+  const expected = new Map(entries.map((entry) => [entry.path, entry]));
+  for (const actual of listed) {
+    const prior = expected.get(actual.path);
+    if (!prior || prior.type !== actual.type || (prior.type === "file" && (prior.sha256 !== actual.sha256 || prior.size !== actual.size))) {
+      throw new Error("Restore pre-image staging tree failed integrity verification");
+    }
+  }
+  return true;
+}
+
+function removeTree(pathname) {
+  try {
+    const stat = fs.lstatSync(pathname);
+    if (stat.isSymbolicLink()) throw new Error("Restore pre-image destination became a symbolic link");
+    fs.rmSync(pathname, { recursive: true, force: true });
+  } catch (error) { if (error.code !== "ENOENT") throw error; }
+}
+
+function fileRestoreTemporaryPath(destination, transactionId, index) {
+  if (!/^[a-f0-9-]{36}$/i.test(String(transactionId || "")) || !Number.isSafeInteger(index) || index < 0) {
+    throw new Error("Restore pre-image temporary identity is invalid");
+  }
+  return path.resolve(destination) + "." + transactionId + "." + index + ".restore-preimage";
+}
+
+function removeFileRestoreTemporary(pathname) {
+  let stat;
+  try { stat = fs.lstatSync(pathname, { bigint: true }); }
+  catch (error) { if (error.code === "ENOENT") return; throw error; }
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1n) throw new Error("Restore pre-image temporary is unsafe");
+  fs.unlinkSync(pathname);
+}
+
+function restoreTree(destination, snapshotRoot, snapshot, transactionId) {
+  if (!snapshot.existed) { removeTree(destination); return; }
+  verifyTree(snapshotRoot, snapshot.entries);
+  ensureSafeDirectory(path.dirname(destination), { create: true });
+  removeTree(destination);
+  ensureSafeDirectory(destination, { create: true });
+  for (let index = 0; index < snapshot.entries.length; index += 1) {
+    const entry = snapshot.entries[index];
+    safeRelativePath(entry.path);
+    const target = path.join(destination, ...entry.path.split("/"));
+    const source = path.join(snapshotRoot, ...entry.path.split("/"));
+    if (entry.type === "directory") {
+      ensureSafeDirectory(target, { create: true });
+      try { fs.chmodSync(target, entry.mode); } catch (error) { if (process.platform !== "win32") throw error; }
+    } else {
+      ensureSafeDirectory(path.dirname(target), { create: true });
+      const temporary = fileRestoreTemporaryPath(target, transactionId, index);
+      removeFileRestoreTemporary(temporary);
+      const result = copyVerifiedFile(source, temporary, entry.sha256);
+      if (result.size !== entry.size) throw new Error("Restore pre-image file size changed during recovery");
+      try { fs.renameSync(temporary, target); }
+      catch (error) { fs.rmSync(target, { force: true }); fs.renameSync(temporary, target); }
+      try { fs.chmodSync(target, entry.mode); } catch (error) { if (process.platform !== "win32") throw error; }
+    }
+  }
+}
+
+function snapshotFileSet(paths, snapshotRoot) {
+  ensureSafeDirectory(snapshotRoot, { create: true });
+  const files = [];
+  for (let index = 0; index < paths.length; index += 1) {
+    const destination = path.resolve(paths[index]);
+    let stat;
+    try { stat = fs.lstatSync(destination, { bigint: true }); }
+    catch (error) { if (error.code === "ENOENT") { files.push({ destination, existed: false }); continue; } throw error; }
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n) throw new Error("Restore pre-image file destination is aliased or invalid");
+    const stagedName = String(index);
+    const stagedPath = path.join(snapshotRoot, stagedName);
+    const originalHash = hashFile(destination);
+    const copied = copyVerifiedFile(destination, stagedPath, originalHash);
+    if (copied.size !== Number(stat.size)) throw new Error("Restore pre-image file changed while staging");
+    files.push({ destination, existed: true, stagedName, ...copied });
+  }
+  return files;
+}
+
+function restoreFileSet(files, snapshotRoot, transactionId) {
+  for (let index = 0; index < files.length; index += 1) {
+    const entry = files[index];
+    const destination = path.resolve(entry.destination);
+    ensureSafeDirectory(path.dirname(destination), { create: true });
+    const temporary = fileRestoreTemporaryPath(destination, transactionId, index);
+    removeFileRestoreTemporary(temporary);
+    let current;
+    try { current = fs.lstatSync(destination); }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+    if (current && (current.isSymbolicLink() || !current.isFile())) throw new Error("Restore pre-image file destination became unsafe");
+    if (!entry.existed) { if (current) fs.rmSync(destination, { force: true }); continue; }
+    safeRelativePath(entry.stagedName);
+    const staged = path.join(snapshotRoot, entry.stagedName);
+    if (hashFile(staged) !== entry.sha256) throw new Error("Restore pre-image file failed integrity verification");
+    const copied = copyVerifiedFile(staged, temporary, entry.sha256);
+    if (copied.size !== entry.size) throw new Error("Restore pre-image file size changed during recovery");
+    if (current) fs.rmSync(destination, { force: true });
+    fs.renameSync(temporary, destination);
+    try { fs.chmodSync(destination, entry.mode); } catch (error) { if (process.platform !== "win32") throw error; }
+  }
+}
+
+function writeManifest(manifestPath, manifest) {
+  const contents = `${JSON.stringify(manifest)}\n`;
+  const fd = fs.openSync(manifestPath, "wx", FILE_MODE);
+  try { fs.writeFileSync(fd, contents); fs.fsyncSync(fd); }
+  finally { fs.closeSync(fd); }
+  return crypto.createHash("sha256").update(contents).digest("hex");
+}
+
+function readManifest(manifestPath, expectedHash, transactionId) {
+  const contents = fs.readFileSync(manifestPath, "utf8");
+  const actualHash = crypto.createHash("sha256").update(contents).digest("hex");
+  if (actualHash !== expectedHash) throw new Error("Restore pre-image manifest failed integrity verification");
+  const manifest = JSON.parse(contents);
+  if (manifest.version !== FORMAT_VERSION || manifest.transactionId !== transactionId || !Array.isArray(manifest.domains)) {
+    throw new Error("Restore pre-image manifest is invalid");
+  }
+  return manifest;
+}
+
+module.exports = {
+  FORMAT_VERSION,
+  copyVerifiedFile,
+  ensureSafeDirectory,
+  hashFile,
+  readManifest,
+  restoreFileSet,
+  restoreTree,
+  snapshotFileSet,
+  snapshotTree,
+  verifyTree,
+  writeManifest,
+};
