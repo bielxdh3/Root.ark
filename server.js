@@ -4488,14 +4488,14 @@ const createRouteRateLimit = () => rateLimit({
   legacyHeaders: false,
   message: { error: "Muitas solicitações. Tente novamente mais tarde." },
 });
-app.use("/versions", createRouteRateLimit());
-app.use("/share", createRouteRateLimit());
-app.use("/pending/repair", createRouteRateLimit());
-app.use("/approve", createRouteRateLimit());
-app.use("/reject", createRouteRateLimit());
-app.use("/delete", createRouteRateLimit());
-app.use("/file-access", createRouteRateLimit());
-app.use("/file-temporary", createRouteRateLimit());
+const versionsRateLimit = createRouteRateLimit();
+const shareRateLimit = createRouteRateLimit();
+const pendingRepairRateLimit = createRouteRateLimit();
+const approveRateLimit = createRouteRateLimit();
+const rejectRateLimit = createRouteRateLimit();
+const deleteRateLimit = createRouteRateLimit();
+const fileAccessRateLimit = createRouteRateLimit();
+const fileTemporaryRateLimit = createRouteRateLimit();
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
   if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
@@ -4762,7 +4762,7 @@ app.delete("/users/:username", authenticate, requirePermission("manageUsers"), (
   res.json({ message: "Usuario excluido" });
 });
 
-app.get("/file-access", authenticate, (req, res) => {
+app.get("/file-access", fileAccessRateLimit, authenticate, (req, res) => {
   const rawName = typeof req.query.name === "string" ? req.query.name.trim() : "";
   const name = path.basename(rawName);
   const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
@@ -4797,7 +4797,7 @@ app.get("/file-access", authenticate, (req, res) => {
   });
 });
 
-app.put("/file-access", authenticate, (req, res) => {
+app.put("/file-access", fileAccessRateLimit, authenticate, (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const folder = getAccessibleFolderOrRespond(req, res, req.body.folderId);
@@ -6143,7 +6143,7 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
   }));
 });
 
-app.put("/file-temporary", authenticate, (req, res) => {
+app.put("/file-temporary", fileTemporaryRateLimit, authenticate, (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const folder = getAccessibleFolderOrRespond(req, res, req.body.folderId);
@@ -7517,7 +7517,7 @@ async function handleFileSearch(req, res) {
   }
 }
 
-app.get("/versions/:filename", authenticate, requirePermission("listFiles"), (req, res) => {
+app.get("/versions/:filename", versionsRateLimit, authenticate, requirePermission("listFiles"), (req, res) => {
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
@@ -7550,7 +7550,7 @@ app.get("/versions/:filename", authenticate, requirePermission("listFiles"), (re
 });
 
 
-app.post("/versions/:filename/initialize", authenticate, requirePermission("listFiles"), (req, res) => {
+app.post("/versions/:filename/initialize", versionsRateLimit, authenticate, requirePermission("listFiles"), (req, res) => {
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
@@ -7720,7 +7720,7 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
   }
 });
 
-app.delete("/versions/:filename/v/:version", authenticate, requirePermission("delete"), (req, res) => {
+app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, requirePermission("delete"), (req, res) => {
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const versionNumber = Number(req.params.version);
@@ -7838,7 +7838,7 @@ registerTrashRoutes(app, {
   trashService,
 });
 
-app.post("/share", authenticate, requirePermission("listFiles"), (req, res) => {
+app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"), (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const expiresInMinutes = getShareExpirationMinutes(req.body.expiresInMinutes);
@@ -7941,7 +7941,7 @@ app.post("/share", authenticate, requirePermission("listFiles"), (req, res) => {
   });
 });
 
-app.get("/share/:token", (req, res) => {
+app.get("/share/:token", shareRateLimit, (req, res) => {
   const shareToken = String(req.params.token || "");
   if (!/^[a-f0-9]{48}$/i.test(shareToken)) {
     return res.status(404).type("html").send(getShareFailurePage("Este link nao esta disponivel."));
@@ -7961,7 +7961,7 @@ app.get("/share/:token", (req, res) => {
   res.type("html").send(renderPublicSharePage(shareToken));
 });
 
-app.post("/share/:token/password", requireSameOriginPublicShareMutation, async (req, res) => {
+app.post("/share/:token/password", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
 
@@ -7980,7 +7980,7 @@ app.post("/share/:token/password", requireSameOriginPublicShareMutation, async (
   res.json(getSharePublicPayload(access.link, access.fileInfo, access.limits));
 });
 
-app.post("/share/:token/view", requireSameOriginPublicShareMutation, async (req, res) => {
+app.post("/share/:token/view", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
 
@@ -7993,9 +7993,9 @@ app.post("/share/:token/view", requireSameOriginPublicShareMutation, async (req,
   });
 });
 
-app.get("/share/:token/download", (_req, res) => res.setHeader("Allow", "POST").status(405).type("text/plain").send("Metodo nao permitido"));
+app.get("/share/:token/download", shareRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).type("text/plain").send("Metodo nao permitido"));
 
-app.post("/share/:token/download", requireSameOriginPublicShareMutation, async (req, res) => {
+app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).type("html").send(getShareFailurePage("Este link nao esta disponivel."));
 
@@ -8010,7 +8010,7 @@ app.post("/share/:token/download", requireSameOriginPublicShareMutation, async (
   });
 });
 
-app.get("/share/:token/preview", async (req, res) => {
+app.get("/share/:token/preview", shareRateLimit, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
 
@@ -8023,7 +8023,7 @@ app.get("/share/:token/preview", async (req, res) => {
   });
 });
 
-app.get("/share/:token/qr", async (req, res) => {
+app.get("/share/:token/qr", shareRateLimit, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
 
@@ -8042,7 +8042,7 @@ app.get("/share/:token/qr", async (req, res) => {
   }
 });
 
-app.get("/share/:token/file", async (req, res) => {
+app.get("/share/:token/file", shareRateLimit, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
 
@@ -8054,7 +8054,7 @@ app.get("/share/:token/file", async (req, res) => {
   });
 });
 
-app.post("/pending/repair", authenticate, async (req, res) => {
+app.post("/pending/repair", pendingRepairRateLimit, authenticate, async (req, res) => {
   if (!req.user?.permissions?.listPending && !req.user?.permissions?.upload) {
     return res.status(403).json({ error: "Permissao negada: listPending" });
   }
@@ -8117,8 +8117,8 @@ app.get("/preview/text/:scope/:name", authenticate, async (req, res) => {
   }
 });
 
-app.get("/approve/:name", (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
-app.post("/approve/:name", authenticate, requirePermission("approve"), async (req, res) => {
+app.get("/approve/:name", approveRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
+app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("approve"), async (req, res) => {
   const name = path.basename(req.params.name);
   const requestedFolder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!requestedFolder) return;
@@ -8181,8 +8181,8 @@ app.post("/approve/:name", authenticate, requirePermission("approve"), async (re
   }
 });
 
-app.get("/reject/:name", (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
-app.post("/reject/:name", authenticate, requirePermission("approve"), async (req, res) => {
+app.get("/reject/:name", rejectRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
+app.post("/reject/:name", rejectRateLimit, authenticate, requirePermission("approve"), async (req, res) => {
   const name = path.basename(req.params.name);
   const requestedFolder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!requestedFolder) return;
@@ -8218,8 +8218,8 @@ app.post("/reject/:name", authenticate, requirePermission("approve"), async (req
   });
 });
 
-app.get("/delete/:name", (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
-app.post("/delete/:name", authenticate, (req, res) => {
+app.get("/delete/:name", deleteRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
+app.post("/delete/:name", deleteRateLimit, authenticate, (req, res) => {
   if (!isTrashEnabled()) return res.status(503).json({ error: "Lixeira desativada" });
   const name = path.basename(req.params.name);
   const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);

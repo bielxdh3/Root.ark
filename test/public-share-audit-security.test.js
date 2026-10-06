@@ -39,6 +39,7 @@ function request(port, requestPath, method = "GET", headers = {}) {
 }
 
 function runSharePageScript(page, fetchImpl) {
+  const isHtmlWhitespace = (character) => [" ", "\t", "\r", "\n", "\f"].includes(character);
   const elements = new Map();
   const getElementById = (id) => {
     if (!elements.has(id)) {
@@ -63,7 +64,31 @@ function runSharePageScript(page, fetchImpl) {
     }
     return elements.get(id);
   };
-  const script = page.match(/<script\b[^>]*>\s*([\s\S]*?)\s*<\/script\s*>/i)?.[1];
+  const lowerPage = page.toLowerCase();
+  let openingStart = lowerPage.indexOf("<script");
+  while (openingStart >= 0) {
+    const boundary = lowerPage[openingStart + 7];
+    if (boundary === ">" || [" ", "\t", "\r", "\n", "\f"].includes(boundary)) break;
+    openingStart = lowerPage.indexOf("<script", openingStart + 7);
+  }
+  const openingEnd = openingStart >= 0 ? lowerPage.indexOf(">", openingStart + 7) : -1;
+  let closingStart = openingEnd >= 0 ? lowerPage.indexOf("</", openingEnd + 1) : -1;
+  let closingEnd = -1;
+  while (closingStart >= 0) {
+    let closingNameStart = closingStart + 2;
+    while (isHtmlWhitespace(lowerPage[closingNameStart])) closingNameStart += 1;
+    if (lowerPage.slice(closingNameStart, closingNameStart + 6) === "script") {
+      const boundary = lowerPage[closingNameStart + 6];
+      if (boundary === ">" || isHtmlWhitespace(boundary)) {
+        closingEnd = lowerPage.indexOf(">", closingNameStart + 6);
+        if (closingEnd >= 0) break;
+      }
+    }
+    closingStart = lowerPage.indexOf("</", closingStart + 2);
+  }
+  const script = openingEnd >= 0 && closingStart >= 0 && closingEnd >= 0
+    ? page.slice(openingEnd + 1, closingStart).trim()
+    : undefined;
   assert.ok(script, "share page has an inline client script");
   vm.runInNewContext(script, {
     document: { getElementById },
@@ -75,7 +100,7 @@ function runSharePageScript(page, fetchImpl) {
 }
 
 test("public-share script extraction accepts case-insensitive script tags", () => {
-  const elements = runSharePageScript('<SCRIPT type="text/javascript">document.getElementById("status").textContent = "loaded";</SCRIPT>');
+  const elements = runSharePageScript('<SCRIPT type="text/javascript" data-kind="inline">document.getElementById("status").textContent = "loaded";</ \t ScRiPt \t  >');
   assert.equal(elements.get("status").textContent, "loaded");
 });
 

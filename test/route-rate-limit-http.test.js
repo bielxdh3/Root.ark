@@ -11,6 +11,50 @@ const test = require("node:test");
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = path.join(ROOT, "server.js");
 
+test("rate limits are passed directly to each protected route handler", () => {
+  const source = fs.readFileSync(SERVER, "utf8");
+  const routeMiddleware = [
+    ["/versions", [
+      'app.get("/versions/:filename", versionsRateLimit,',
+      'app.post("/versions/:filename/initialize", versionsRateLimit,',
+      'app.delete("/versions/:filename/v/:version", versionsRateLimit,',
+    ]],
+    ["/share", [
+      'app.post("/share", shareRateLimit,',
+      'app.get("/share/:token", shareRateLimit,',
+      'app.post("/share/:token/password", shareRateLimit,',
+      'app.post("/share/:token/view", shareRateLimit,',
+      'app.get("/share/:token/download", shareRateLimit,',
+      'app.post("/share/:token/download", shareRateLimit,',
+      'app.get("/share/:token/preview", shareRateLimit,',
+      'app.get("/share/:token/qr", shareRateLimit,',
+      'app.get("/share/:token/file", shareRateLimit,',
+    ]],
+    ["/pending/repair", ['app.post("/pending/repair", pendingRepairRateLimit,']],
+    ["/approve", [
+      'app.get("/approve/:name", approveRateLimit,',
+      'app.post("/approve/:name", approveRateLimit,',
+    ]],
+    ["/reject", [
+      'app.get("/reject/:name", rejectRateLimit,',
+      'app.post("/reject/:name", rejectRateLimit,',
+    ]],
+    ["/delete", [
+      'app.get("/delete/:name", deleteRateLimit,',
+      'app.post("/delete/:name", deleteRateLimit,',
+    ]],
+    ["/file-access", [
+      'app.get("/file-access", fileAccessRateLimit,',
+      'app.put("/file-access", fileAccessRateLimit,',
+    ]],
+    ["/file-temporary", ['app.put("/file-temporary", fileTemporaryRateLimit,']],
+  ];
+  for (const [mountPath, handlers] of routeMiddleware) {
+    assert.equal(source.includes(`app.use("${mountPath}",`), false, `${mountPath} must not use a prefix mount`);
+    for (const handler of handlers) assert.ok(source.includes(handler), `missing direct middleware on ${handler}`);
+  }
+});
+
 function getUnusedPort() {
   return new Promise((resolve, reject) => {
     const probe = net.createServer();
