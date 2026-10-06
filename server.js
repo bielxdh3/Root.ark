@@ -4821,7 +4821,7 @@ app.get("/file-access", fileAccessRateLimit, authenticate, (req, res) => {
     allowedUsers: Object.entries(normalizedEntry.users)
       .filter(([, access]) => access.read || access.edit)
       .map(([username]) => username),
-    inherited: !entry,
+    inherited: !entry || Boolean(entry.inheritFolderAccess),
   });
 });
 
@@ -4883,7 +4883,21 @@ app.put("/file-access", fileAccessRateLimit, authenticate, (req, res) => {
   const hasSpecificUsers = Object.keys(userAccess).length > 0;
 
   if (publicAccess && !hasSpecificUsers) {
-    delete entries[key];
+    if (entries[key]) {
+      const previous = normalizeFilePermissionEntry(entries[key]);
+      entries[key] = {
+        folderId: folder.id,
+        fileName: name,
+        owner: previous.owner,
+        public: true,
+        users: {},
+        inheritFolderAccess: true,
+        updatedAt: new Date().toISOString(),
+        updatedBy: req.user.username,
+      };
+    } else {
+      delete entries[key];
+    }
   } else {
     const previous = normalizeFilePermissionEntry(entries[key]);
     entries[key] = {
