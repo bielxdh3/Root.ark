@@ -1600,7 +1600,7 @@ function renderPublicSharePage(token) {
       </div>
       <section class="file-box">
         <h2 id="fileName">Validando link...</h2>
-        <p class="status" id="status">Aguarde um instante.</p>
+        <p class="status" id="status" role="status" aria-live="polite" aria-atomic="true">Aguarde um instante.</p>
 
         <div id="passwordBox" class="hidden">
           <p>Este link esta protegido. Digite a senha para continuar.</p>
@@ -1643,6 +1643,7 @@ function renderPublicSharePage(token) {
       const qrButton = document.getElementById("qrButton");
       const qrBox = document.getElementById("qrBox");
       const copyButton = document.getElementById("copyButton");
+      let accessRequestPending = false;
 
       function formatSize(bytes) {
         const size = Number(bytes) || 0;
@@ -1667,31 +1668,46 @@ function renderPublicSharePage(token) {
       }
 
       async function accessShare(password = "") {
+        if (accessRequestPending) return;
+        accessRequestPending = true;
         status.textContent = "Validando link...";
-        const response = await fetch("/share/" + token + "/password", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ password })
-        });
-        const data = await response.json().catch(() => ({}));
+        passwordButton.disabled = true;
+        passwordButton.textContent = "Validando...";
+        try {
+          const response = await fetch("/share/" + token + "/password", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ password })
+          });
+          const data = await response.json();
 
-        if (response.status === 401 && data.passwordRequired) {
-          fileName.textContent = "Link protegido";
-          status.textContent = "Informe a senha para continuar.";
-          passwordBox.classList.remove("hidden");
-          contentBox.classList.add("hidden");
-          return;
+          if (response.status === 401 && data.passwordRequired) {
+            fileName.textContent = "Link protegido";
+            status.textContent = password
+              ? "Nao foi possivel validar a senha. Verifique se ela esta correta e tente novamente."
+              : "Informe a senha para continuar.";
+            passwordBox.classList.remove("hidden");
+            contentBox.classList.add("hidden");
+            return;
+          }
+
+          if (!response.ok) {
+            fileName.textContent = "Link indisponivel";
+            status.textContent = data.error || "Nao foi possivel acessar este compartilhamento.";
+            passwordBox.classList.add("hidden");
+            contentBox.classList.add("hidden");
+            return;
+          }
+
+          renderAccess(data);
+        } catch {
+          fileName.textContent = "Validacao indisponivel";
+          status.textContent = "Nao foi possivel validar o link. Tente novamente ou recarregue a pagina.";
+        } finally {
+          accessRequestPending = false;
+          passwordButton.disabled = false;
+          passwordButton.textContent = "Acessar";
         }
-
-        if (!response.ok) {
-          fileName.textContent = "Link indisponivel";
-          status.textContent = data.error || "Nao foi possivel acessar este compartilhamento.";
-          passwordBox.classList.add("hidden");
-          contentBox.classList.add("hidden");
-          return;
-        }
-
-        renderAccess(data);
       }
 
       passwordForm.addEventListener("submit", (event) => {

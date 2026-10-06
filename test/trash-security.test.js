@@ -141,7 +141,7 @@ test("file trash lifecycle keeps authorization and paths inside a disposable run
 
   const bytes = Buffer.from("authorized trash\n");
   const source = writeFile(sandbox, "authorized.txt", bytes);
-  const moved = await request(port, `/delete/authorized.txt?folderId=${FOLDER_ID}`, { headers: { cookie: deleter.cookie } });
+  const moved = await request(port, `/delete/authorized.txt?folderId=${FOLDER_ID}`, { method: "POST", headers: headers(port, deleter) });
   const movedResult = JSON.parse(moved.body);
   assert.equal(moved.status, 200, moved.body);
   assert.equal(movedResult.message, "Movido para lixeira");
@@ -163,7 +163,7 @@ test("file trash lifecycle keeps authorization and paths inside a disposable run
 
   const deniedSource = writeFile(sandbox, "denied.txt", Buffer.from("must stay live\n"));
   const deniedBefore = { source: state(deniedSource), json: state(sandboxJson), trash: fs.existsSync(trashRoot) ? fs.readdirSync(trashRoot).sort() : [] };
-  const denied = await request(port, `/delete/denied.txt?folderId=${FOLDER_ID}`, { headers: { cookie: viewer.cookie } });
+  const denied = await request(port, `/delete/denied.txt?folderId=${FOLDER_ID}`, { method: "POST", headers: headers(port, viewer) });
   assert.equal(denied.status, 403);
   assert.equal(JSON.parse(denied.body).error, "Permissao negada: delete");
   assert.deepEqual(state(deniedSource), deniedBefore.source);
@@ -191,7 +191,7 @@ test("file trash lifecycle keeps authorization and paths inside a disposable run
 
   const permanentBytes = Buffer.from("permanent deletion\n");
   writeFile(sandbox, "permanent.txt", permanentBytes);
-  const permanentResponse = JSON.parse((await request(port, `/delete/permanent.txt?folderId=${FOLDER_ID}`, { headers: { cookie: deleter.cookie } })).body).trashItem;
+  const permanentResponse = JSON.parse((await request(port, `/delete/permanent.txt?folderId=${FOLDER_ID}`, { method: "POST", headers: headers(port, deleter) })).body).trashItem;
   const permanentMove = json(sandboxJson).find((entry) => entry.id === permanentResponse.id);
   const permanentPath = path.resolve(trashRoot, permanentMove.trashPath);
   const permanentDenied = await request(port, `/trash/${permanentMove.id}`, { method: "DELETE", headers: headers(port, viewer) });

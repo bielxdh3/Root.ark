@@ -6,6 +6,7 @@ const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const vm = require("node:vm");
 const test = require("node:test");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -35,6 +36,42 @@ function request(port, requestPath, method = "GET", headers = {}) {
     req.once("error", reject);
     req.end();
   });
+}
+
+function runSharePageScript(page, fetchImpl) {
+  const elements = new Map();
+  const getElementById = (id) => {
+    if (!elements.has(id)) {
+      const classes = new Set(["passwordBox", "contentBox", "previewBox", "qrBox"].includes(id) ? ["hidden"] : []);
+      const element = {
+        textContent: "",
+        innerHTML: "",
+        value: "",
+        disabled: false,
+        hidden: false,
+        dataset: {},
+        listeners: {},
+        classList: {
+          add(name) { classes.add(name); },
+          remove(name) { classes.delete(name); },
+          toggle(name) { if (classes.has(name)) classes.delete(name); else classes.add(name); },
+          contains(name) { return classes.has(name); },
+        },
+        addEventListener(type, handler) { this.listeners[type] = handler; },
+      };
+      elements.set(id, element);
+    }
+    return elements.get(id);
+  };
+  const script = page.match(/<script>\s*([\s\S]*?)\s*<\/script>/)?.[1];
+  assert.ok(script, "share page has an inline client script");
+  vm.runInNewContext(script, {
+    document: { getElementById },
+    fetch: fetchImpl,
+    navigator: { clipboard: { writeText: async () => {} } },
+    window: { location: { href: "https://rootark.test/share/example" } },
+  });
+  return elements;
 }
 
 async function waitForServer(port) {
@@ -105,8 +142,72 @@ test("public-share audit logs correlate by token digest without storing the bear
   const sharePage = await request(port, `/share/${token}`);
   assert.equal(sharePage.status, 200);
   assert.match(sharePage.body, /<label[^>]*for="sharePassword">Senha do link<\/label>/, "the password field retains its visible label while users type");
+  assert.match(sharePage.body, /<p class="status" id="status" role="status" aria-live="polite" aria-atomic="true">/, "status changes are announced without moving focus");
   assert.match(sharePage.body, /<form id="sharePasswordForm">[\s\S]*<input type="password" id="sharePassword"[^>]*aria-label="Senha do link"/);
   assert.match(sharePage.body, /passwordForm\.addEventListener\("submit"/);
+  let shareFetchCalls = 0;
+  let initialShareRequest;
+  let submitRequestResolve;
+  let malformedResponseResolve;
+  const sharePageElements = runSharePageScript(sharePage.body, (url, options) => {
+    shareFetchCalls += 1;
+    if (shareFetchCalls === 1) {
+      initialShareRequest = { url, options };
+      return Promise.resolve({ status: 401, ok: false, json: async () => ({ passwordRequired: true }) });
+    }
+    if (shareFetchCalls === 2) {
+      return new Promise((resolve) => { submitRequestResolve = resolve; });
+    }
+    if (shareFetchCalls === 3) {
+      return new Promise((resolve) => { malformedResponseResolve = resolve; });
+    }
+    return Promise.reject(new Error("offline"));
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(initialShareRequest.url, /\/password$/);
+  assert.equal(initialShareRequest.options.method, "POST");
+  assert.deepEqual(JSON.parse(initialShareRequest.options.body), { password: "" }, "initial access checks send an empty password");
+  const shareStatus = sharePageElements.get("status");
+  assert.equal(shareStatus.textContent, "Informe a senha para continuar.", "the password-required response gives the initial password prompt");
+  assert.equal(sharePageElements.get("passwordBox").classList.contains("hidden"), false, "the password form is shown after the initial challenge");
+  assert.equal(sharePageElements.get("contentBox").classList.contains("hidden"), true, "shared content stays hidden until access succeeds");
+  const passwordButton = sharePageElements.get("passwordButton");
+  const submitPassword = () => sharePageElements.get("sharePasswordForm").listeners.submit({ preventDefault() {} });
+  sharePageElements.get("sharePassword").value = "wrong-password";
+  submitPassword();
+  assert.equal(passwordButton.disabled, true, "the password button is disabled while access is being checked");
+  assert.equal(passwordButton.textContent, "Validando...");
+  submitPassword();
+  assert.equal(shareFetchCalls, 2, "repeated submits do not send duplicate access requests");
+  submitRequestResolve({ status: 401, ok: false, json: async () => ({ error: "Nao foi possivel acessar este link.", passwordRequired: true }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(shareStatus.textContent, /senha.*correta.*tente novamente/i, "an incorrect password gets an accurate generic retry message");
+  assert.doesNotMatch(shareStatus.textContent, /informe a senha/i, "an incorrect password is not described as a missing password");
+  assert.equal(passwordButton.disabled, false, "the password button is re-enabled after an incorrect password");
+  submitPassword();
+  malformedResponseResolve({ status: 200, ok: true, json: async () => { throw new SyntaxError("invalid JSON"); } });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(shareStatus.textContent, /validar o link.*tente novamente/i, "invalid JSON produces a generic recoverable status");
+  assert.doesNotMatch(shareStatus.textContent, /conexao|rede|offline/i, "invalid JSON does not assume a network outage");
+  assert.equal(sharePageElements.get("fileName").textContent, "Validacao indisponivel", "invalid JSON has a neutral heading");
+  assert.equal(passwordButton.disabled, false, "the password button is re-enabled after invalid JSON");
+  assert.equal(passwordButton.textContent, "Acessar");
+  submitPassword();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(shareStatus.textContent, /validar o link.*tente novamente/i, "network failure produces a generic recoverable status");
+  assert.doesNotMatch(shareStatus.textContent, /conexao|rede|offline/i, "network failure uses neutral recovery guidance");
+  assert.equal(sharePageElements.get("fileName").textContent, "Validacao indisponivel", "network failure has a neutral heading");
+  assert.equal(passwordButton.disabled, false, "the password button is re-enabled after a network failure");
+  const initialFailureElements = runSharePageScript(sharePage.body, async () => { throw new Error("offline"); });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  const initialFailureStatus = initialFailureElements.get("status").textContent;
+  assert.match(initialFailureStatus, /validar o link.*tente novamente/i, "initial access failure offers recovery guidance");
+  assert.doesNotMatch(initialFailureStatus, /conexao|rede|offline/i, "initial access failure does not assume a network outage");
+  assert.equal(initialFailureElements.get("fileName").textContent, "Validacao indisponivel", "initial access failure has a neutral heading");
   const expiredPageToken = crypto.randomBytes(24).toString("hex");
   const expiredFileToken = crypto.randomBytes(24).toString("hex");
   const publicLinksPath = path.join(dataDir, "public-links.json");
