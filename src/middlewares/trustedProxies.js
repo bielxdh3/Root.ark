@@ -1,6 +1,7 @@
 "use strict";
 
 const net = require("node:net");
+const CLOUDFLARE_IPV6_RANGE = "2a06:98c0::/29";
 
 function isIpv4MappedAddress(address) {
   let value = address.toLowerCase();
@@ -35,8 +36,9 @@ function parseTrustedProxies(value) {
     const maxPrefix = family === 4 ? 32 : family === 6 ? 128 : -1;
     const mappedAddress = family === 6 && isIpv4MappedAddress(address);
     const minimumPrefix = family === 4 ? 8 : mappedAddress ? 104 : 32;
+    const isCloudflareIpv6Range = range.toLowerCase() === CLOUDFLARE_IPV6_RANGE;
     if (maxPrefix < 0 || address.includes("%") || extra.length > 0) throw new Error("TRUSTED_PROXIES must contain only explicit IP addresses or CIDR ranges.");
-    if (prefix !== undefined && (!/^\d+$/.test(prefix) || Number(prefix) < minimumPrefix || Number(prefix) > maxPrefix)) {
+    if (prefix !== undefined && (!/^\d+$/.test(prefix) || (Number(prefix) < minimumPrefix && !isCloudflareIpv6Range) || Number(prefix) > maxPrefix)) {
       throw new Error("TRUSTED_PROXIES must contain only explicit IP addresses or CIDR ranges.");
     }
   }

@@ -69,10 +69,17 @@ function waitForWebSocketEvent(socket, event, timeout = 3_000) {
 test("trusted proxy configuration accepts explicit IP ranges and rejects malformed or empty entries", () => {
   assert.equal(parseTrustedProxies(undefined), false);
   assert.equal(parseTrustedProxies("  "), false);
-  assert.deepEqual(parseTrustedProxies("127.0.0.1, 10.0.0.0/8, 2001:db8::/32, ::ffff:10.0.0.0/104"), ["127.0.0.1", "10.0.0.0/8", "2001:db8::/32", "::ffff:10.0.0.0/104"]);
-  for (const invalid of ["true", "*", "localhost", "127.0.0.1,", "0.0.0.0/0", "0.0.0.0/7", "::/0", "::/1", "::ffff:10.0.0.0/8", "::ffff:0.0.0.0/96", "::ffff:0.0.0.0/096", "::ffff:10.0.0.0/103", "::ffff:0:0/96", "::ffff:0:0/0103", "0:0:0:0:0:ffff:0:0/96", "fe80::1%eth0", "fe80::1%eth0/128", "192.0.2.1/33", "2001:db8::/129"]) {
+  assert.deepEqual(parseTrustedProxies("127.0.0.1, 10.0.0.0/8, 2001:db8::/32, 2a06:98c0::/29, ::ffff:10.0.0.0/104"), ["127.0.0.1", "10.0.0.0/8", "2001:db8::/32", "2a06:98c0::/29", "::ffff:10.0.0.0/104"]);
+  for (const invalid of ["true", "*", "localhost", "127.0.0.1,", "0.0.0.0/0", "0.0.0.0/7", "::/0", "::/1", "2a06:98c0::/28", "::ffff:10.0.0.0/8", "::ffff:0.0.0.0/96", "::ffff:0.0.0.0/096", "::ffff:10.0.0.0/103", "::ffff:0:0/96", "::ffff:0:0/0103", "0:0:0:0:0:ffff:0:0/96", "fe80::1%eth0", "fe80::1%eth0/128", "192.0.2.1/33", "2001:db8::/129"]) {
     assert.throws(() => parseTrustedProxies(invalid), /explicit IP addresses or CIDR ranges/);
   }
+});
+
+test("the explicitly supported Cloudflare IPv6 proxy range matches only its published prefix", () => {
+  const trust = proxyaddr.compile(parseTrustedProxies("2a06:98c0::/29"));
+  assert.equal(trust("2a06:98c0::103", 0), true);
+  assert.equal(trust("2a06:98c7:ffff:ffff:ffff:ffff:ffff:ffff", 0), true);
+  assert.equal(trust("2a06:98c8::1", 0), false);
 });
 
 test("proxy-addr does not match IPv4-mapped peers against broad IPv6 prefixes", () => {
