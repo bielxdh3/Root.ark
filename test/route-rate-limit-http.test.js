@@ -2,7 +2,6 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
-const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
@@ -57,17 +56,6 @@ test("rate limits are passed directly to each protected route handler", () => {
   }
 });
 
-function getUnusedPort() {
-  return new Promise((resolve, reject) => {
-    const probe = net.createServer();
-    probe.once("error", reject);
-    probe.listen(0, "127.0.0.1", () => {
-      const { port } = probe.address();
-      probe.close((error) => error ? reject(error) : resolve(port));
-    });
-  });
-}
-
 function request(port, requestPath, method = "GET", headers = {}, body) {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: "127.0.0.1", port, path: requestPath, method, headers }, (res) => {
@@ -81,32 +69,79 @@ function request(port, requestPath, method = "GET", headers = {}, body) {
   });
 }
 
-async function waitForServer(port) {
-  const deadline = Date.now() + 10_000;
-  let lastError;
-  while (Date.now() < deadline) {
-    try {
-      return await request(port, "/login.html");
-    } catch (error) {
-      lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+function serverBootstrap() {
+  return `
+const http = require("node:http");
+const originalListen = http.Server.prototype.listen;
+let readinessSent = false;
+http.Server.prototype.listen = function (...args) {
+  const callbackIndex = args.findIndex((arg) => typeof arg === "function");
+  if (callbackIndex >= 0) {
+    const callback = args[callbackIndex];
+    args[callbackIndex] = function (...callbackArgs) {
+      if (!readinessSent && process.send) {
+        const address = this.address();
+        if (address && typeof address === "object") {
+          readinessSent = true;
+          process.send({ type: "rootark-test-server-ready", port: address.port });
+        }
+      }
+      return callback.apply(this, callbackArgs);
+    };
   }
-  throw lastError;
+  return originalListen.apply(this, args);
+};
+require(${JSON.stringify(SERVER)});
+`;
+}
+
+async function waitForServer(child) {
+  let startupError = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { startupError += chunk; });
+  const port = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => finish(new Error("server readiness timed out")), 10_000);
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.off("message", onMessage);
+      child.off("error", onError);
+      child.off("exit", onExit);
+    };
+    const finish = (error, readyPort) => {
+      cleanup();
+      error ? reject(error) : resolve(readyPort);
+    };
+    const onMessage = (message) => {
+      if (message?.type !== "rootark-test-server-ready" || !Number.isInteger(message.port) || message.port < 1) {
+        return finish(new Error("server sent invalid readiness message"));
+      }
+      finish(null, message.port);
+    };
+    const onError = (error) => finish(error);
+    const onExit = (code, signal) => finish(new Error(`server exited before readiness (code=${code}, signal=${signal}): ${startupError.slice(-2_000)}`));
+    child.on("message", onMessage);
+    child.once("error", onError);
+    child.once("exit", onExit);
+    if (child.exitCode !== null || child.signalCode !== null) onExit(child.exitCode, child.signalCode);
+  });
+  const response = await request(port, "/login.html");
+  if (response.status !== 200 || !response.body.includes('aria-labelledby="login-title"')) {
+    throw new Error(`server readiness probe failed (status=${response.status})`);
+  }
+  return port;
 }
 
 test("route rate limits enforce separate budgets despite direct-origin X-Forwarded-For spoofing", { timeout: 30_000 }, async (t) => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-route-rate-limit-"));
-  const port = await getUnusedPort();
   fs.mkdirSync(path.join(sandbox, "data"), { recursive: true });
   fs.mkdirSync(path.join(sandbox, "uploads"), { recursive: true });
   fs.cpSync(path.join(ROOT, "public"), path.join(sandbox, "public"), { recursive: true });
 
-  const child = spawn(process.execPath, [SERVER], {
+  const child = spawn(process.execPath, ["-e", serverBootstrap()], {
     cwd: sandbox,
     env: {
       ...process.env,
-      PORT: String(port),
+      PORT: "0",
       DB_ENABLED: "false",
       CLOUD_STORAGE_PROVIDER: "local",
       NODE_ENV: "test",
@@ -115,7 +150,7 @@ test("route rate limits enforce separate budgets despite direct-origin X-Forward
       ROUTE_RATE_LIMIT_MAX: "2",
       ROUTE_RATE_LIMIT_WINDOW_MS: "60000",
     },
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
     windowsHide: true,
   });
 
@@ -130,7 +165,7 @@ test("route rate limits enforce separate budgets despite direct-origin X-Forward
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
-  assert.equal((await waitForServer(port)).status, 200);
+  const port = await waitForServer(child);
 
   const repairResponses = await Promise.all([1, 2, 3].map((index) => request(port, "/pending/repair", "POST", {
     "x-forwarded-for": `198.51.100.${index}`,
@@ -150,7 +185,6 @@ test("route rate limits enforce separate budgets despite direct-origin X-Forward
 
 test("cloud-backed list, search, and WebDAV PROPFIND stop before another provider listing at their limits", { timeout: 30_000 }, async (t) => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-list-rate-limit-"));
-  const port = await getUnusedPort();
   const provider = http.createServer();
   let providerListings = 0;
   provider.on("request", (req, res) => {
@@ -174,11 +208,11 @@ test("cloud-backed list, search, and WebDAV PROPFIND stop before another provide
   ]));
   fs.cpSync(path.join(ROOT, "public"), path.join(sandbox, "public"), { recursive: true });
 
-  const child = spawn(process.execPath, [SERVER], {
+  const child = spawn(process.execPath, ["-e", serverBootstrap()], {
     cwd: sandbox,
     env: {
       ...process.env,
-      PORT: String(port),
+      PORT: "0",
       DB_ENABLED: "false",
       CLOUD_STORAGE_PROVIDER: "s3",
       CLOUD_STORAGE_PREFIX: "rootark",
@@ -196,7 +230,7 @@ test("cloud-backed list, search, and WebDAV PROPFIND stop before another provide
       ROUTE_RATE_LIMIT_MAX: "2",
       ROUTE_RATE_LIMIT_WINDOW_MS: "60000",
     },
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
     windowsHide: true,
   });
 
@@ -212,7 +246,7 @@ test("cloud-backed list, search, and WebDAV PROPFIND stop before another provide
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
-  assert.equal((await waitForServer(port)).status, 200);
+  const port = await waitForServer(child);
   const body = JSON.stringify({ username: "admin", password: "admin123" });
   const login = await request(port, "/auth/login", "POST", {
     "content-type": "application/json",
