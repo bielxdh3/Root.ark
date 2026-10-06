@@ -25,6 +25,7 @@ const WebSocket = require("ws");
 const cron = require("node-cron");
 const { Transform } = require("node:stream");
 const { scheduleAutomaticBackups } = require("./services/backupScheduler");
+const { getServerMasterKey: readServerMasterKey } = require("./services/serverMasterKey");
 const dbConfig = require("./db");
 const { runMigrations } = require("./db/migrations");
 const usersRepository = require("./repositories/usersRepository");
@@ -2801,27 +2802,7 @@ function isInlinePreviewFile(fileName) {
 }
 
 function getServerMasterKey(options = {}) {
-  const createIfMissing = options.createIfMissing !== false;
-  const envKey = process.env.SERVER_MASTER_KEY;
-  if (envKey) {
-    const cleanKey = envKey.trim();
-    if (/^[a-f0-9]{64}$/i.test(cleanKey)) return Buffer.from(cleanKey, "hex");
-    const decoded = Buffer.from(cleanKey, "base64");
-    if (decoded.length === 32) return decoded;
-    throw new Error("SERVER_MASTER_KEY precisa ter 32 bytes em hex ou base64");
-  }
-
-  if (!fs.existsSync(SERVER_MASTER_KEY_FILE)) {
-    if (!createIfMissing) throw new Error("SERVER_MASTER_KEY ausente");
-    const masterKey = crypto.randomBytes(32);
-    fs.writeFileSync(SERVER_MASTER_KEY_FILE, masterKey.toString("hex"), { mode: 0o600 });
-    console.warn("[security] Nova chave mestra gerada em data/server-master.key. Faca backup seguro imediatamente.");
-    return masterKey;
-  }
-
-  const fileKey = fs.readFileSync(SERVER_MASTER_KEY_FILE, "utf-8").trim();
-  if (!/^[a-f0-9]{64}$/i.test(fileKey)) throw new Error("SERVER_MASTER_KEY invalida");
-  return Buffer.from(fileKey, "hex");
+  return readServerMasterKey({ ...options, filePath: SERVER_MASTER_KEY_FILE });
 }
 
 function deriveKeyFromPassword(password, salt = null) {
