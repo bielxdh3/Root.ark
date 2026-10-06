@@ -193,7 +193,7 @@ test("reset file ACL owner survives SQLite route persistence and a cross-folder 
   ];
   const folders = [
     { id: "root", name: "Arquivos atuais", createdBy: "sistema", allowedUsers: [], isRoot: true },
-    { id: "owner-space", name: "Pasta do proprietario", createdBy: "owner", allowedUsers: [], isRoot: false },
+    { id: "owner-space", name: "Pasta do proprietario", createdBy: "owner", allowedUsers: ["outsider"], isRoot: false },
   ];
   fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify({
     "root/owned.txt": { folderId: "root", fileName: "owned.txt", owner: "owner", public: false, users: {} },
@@ -288,7 +288,22 @@ test("reset file ACL owner survives SQLite route persistence and a cross-folder 
   assert.equal(move.status, 200, move.body);
 
   const outsider = await login("outsider", outsiderPassword);
-  const denied = await request(port, "/file-access?name=owned.txt&folderId=owner-space", { headers: { cookie: outsider.cookie } });
+  const inheritedListing = await request(port, "/list?folderId=owner-space", { headers: { cookie: outsider.cookie } });
+  assert.equal(inheritedListing.status, 200, inheritedListing.body);
+  assert.ok(JSON.parse(inheritedListing.body).some((file) => file.name === "owned.txt"));
+
+  const deniedBody = JSON.stringify({ name: "owned.txt", folderId: "owner-space", public: true, users: {} });
+  const denied = await request(port, "/file-access", {
+    method: "PUT",
+    headers: {
+      cookie: outsider.cookie,
+      origin: `http://127.0.0.1:${port}`,
+      "x-csrf-token": outsider.csrf,
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(deniedBody),
+    },
+    body: deniedBody,
+  });
   assert.equal(denied.status, 403, denied.body);
 
   await stop(child);
