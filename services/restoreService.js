@@ -7,18 +7,492 @@ const { closeDb, getDatabasePath, isDbEnabled } = require("../db");
 const { resolveRuntimePath } = require("../src/runtime-paths");
 const backupRepository = require("../repositories/backupRepository");
 const backupService = require("./backupService");
+const restorePreimage = require("./restorePreimage");
 const { attestCiphertextOnlyArchive } = require("../src/services/deploymentResilience");
 const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, readQuarantineRegularFile, validateQuarantinePayloads } = require("../src/quarantine-paths");
 
 const RESTORE_TMP_DIR = path.join(backupService.BACKUPS_DIR, ".restore-tmp");
 const RESTORE_SYNC_LOCK_DIR = resolveRuntimePath("data", "restore-sync-locks");
+const WHOLE_RESTORE_COORDINATOR_PATH = resolveRuntimePath("data", ".rootark-restore-coordinator.json");
+const WHOLE_RESTORE_ACK_ROOT = resolveRuntimePath("data", ".rootark-restore-restart-acks");
 const RESTORABLE_ROOTS = new Set(["data", "uploads"]);
+const WHOLE_RESTORE_COORDINATOR_VERSION = 3;
 const S_IFMT = 0xf000;
 const S_IFLNK = 0xa000;
 let cloudStorage = null;
-
 function setCloudStorage(storage) {
   cloudStorage = storage || null;
+}
+
+function writeWholeRestoreCoordinator(coordinator) {
+  fs.mkdirSync(path.dirname(WHOLE_RESTORE_COORDINATOR_PATH), { recursive: true });
+  const persisted = {
+    ...coordinator,
+    directorySync: process.platform === "win32" ? "unsupported" : "fsync",
+  };
+  const temporary = `${WHOLE_RESTORE_COORDINATOR_PATH}.${crypto.randomUUID()}.tmp`;
+  const fd = fs.openSync(temporary, "wx", 0o600);
+  try {
+    fs.writeFileSync(fd, `${JSON.stringify(persisted, null, 2)}\n`);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  try {
+    fs.renameSync(temporary, WHOLE_RESTORE_COORDINATOR_PATH);
+    fsyncCoordinatorDirectory(path.dirname(WHOLE_RESTORE_COORDINATOR_PATH));
+  } catch (error) {
+    fs.rmSync(temporary, { force: true });
+    throw error;
+  }
+  return persisted;
+}
+
+function configuredRestartInstanceCount() {
+  const raw = String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim();
+  if (!/^[1-9]\d{0,2}$/.test(raw)) throw new Error("ROOTARK_RESTORE_INSTANCE_COUNT must be an integer from 1 to 128");
+  const count = Number(raw);
+  if (count > 128) throw new Error("ROOTARK_RESTORE_INSTANCE_COUNT must be an integer from 1 to 128");
+  return count;
+}
+
+function restoreInstanceId(requiredInstances, explicitInstanceId) {
+  const configured = explicitInstanceId == null
+    ? process.env.ROOTARK_INSTANCE_ID || (requiredInstances === 1 ? process.env.HOSTNAME || "default" : "")
+    : explicitInstanceId;
+  const instanceId = String(configured || "").trim();
+  if (!instanceId || instanceId.length > 256 || /[\u0000-\u001f\u007f]/.test(instanceId)) {
+    throw new Error(requiredInstances > 1
+      ? "ROOTARK_INSTANCE_ID must be configured uniquely for every restore instance"
+      : "ROOTARK_INSTANCE_ID is invalid");
+  }
+  return instanceId;
+}
+
+function persistWholeRestoreCoordinator({ backupId, requiredRestartInstances, preRestoreBackupId = null, providerReconciliation = [], phase = "preparing" }) {
+  return writeWholeRestoreCoordinator({
+    version: WHOLE_RESTORE_COORDINATOR_VERSION,
+    transactionId: crypto.randomUUID(),
+    phase,
+    backupId: String(backupId),
+    requiredRestartInstances,
+    preRestoreBackupId: preRestoreBackupId == null ? null : String(preRestoreBackupId),
+    providerReconciliation,
+    startedAt: new Date().toISOString(),
+  });
+}
+
+function updateWholeRestoreCoordinator(coordinator, patch) {
+  return writeWholeRestoreCoordinator({ ...coordinator, ...patch, updatedAt: new Date().toISOString() });
+}
+
+function readWholeRestoreCoordinator() {
+  if (!pathExists(WHOLE_RESTORE_COORDINATOR_PATH)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(WHOLE_RESTORE_COORDINATOR_PATH, "utf8"));
+  } catch {
+    throw new Error("Whole-restore coordinator is invalid; startup blocked for manual recovery");
+  }
+}
+
+function wholeRestorePreimageRoot(transactionId) {
+  if (!/^[a-f0-9-]{36}$/i.test(String(transactionId || ""))) throw new Error("Whole-restore pre-image transaction ID is invalid");
+  return resolveRuntimePath("data", "backups", ".restore-preimages", transactionId);
+}
+
+function cleanupWholeRestorePreimages(transactionId) {
+  const preimageRoot = wholeRestorePreimageRoot(transactionId);
+  try { restorePreimage.ensureSafeDirectory(path.dirname(preimageRoot)); }
+  catch (error) { if (error.code === "ENOENT") return false; throw error; }
+  const stat = (() => { try { return fs.lstatSync(preimageRoot); } catch (error) { if (error.code === "ENOENT") return null; throw error; } })();
+  if (!stat) return false;
+  if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Whole-restore pre-image directory is unsafe");
+  fs.rmSync(preimageRoot, { recursive: true, force: false });
+  fsyncDirectory(path.dirname(preimageRoot));
+  return true;
+}
+
+function restoreExtractionPaths(backupId, { createRoot = false } = {}) {
+  const id = String(backupId || "");
+  if (!/^[a-f0-9-]{36}$/i.test(id) || /[\\/]/.test(id)) throw new Error("Restore staging directory ID is invalid");
+  const restoreRoot = restorePreimage.ensureSafeDirectory(RESTORE_TMP_DIR, { create: createRoot });
+  const restoreDir = path.resolve(restoreRoot, id);
+  if (path.dirname(restoreDir) !== restoreRoot) throw new Error("Restore staging directory escaped its root");
+  let stageStat = null;
+  try { stageStat = fs.lstatSync(restoreDir); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (stageStat && (stageStat.isSymbolicLink() || !stageStat.isDirectory())) throw new Error("Restore staging directory is unsafe");
+  return { id, restoreRoot, restoreDir, stageStat };
+}
+
+function cleanupRestoreExtraction(backupId) {
+  let paths;
+  try { paths = restoreExtractionPaths(backupId); }
+  catch (error) { if (error.code === "ENOENT") return false; throw error; }
+  const { restoreRoot, restoreDir, stageStat } = paths;
+  if (stageStat) {
+    fs.rmSync(restoreDir, { recursive: true, force: true });
+    fsyncDirectory(restoreRoot);
+  }
+  try {
+    fs.rmdirSync(restoreRoot);
+    fsyncDirectory(path.dirname(restoreRoot));
+  } catch (error) {
+    if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes(error.code)) throw error;
+  }
+  return Boolean(stageStat);
+}
+
+function restorableDataNames(extractedRoot) {
+  const extractedData = path.join(extractedRoot, "data");
+  const names = new Set(["backup-history.json"]);
+  if (!fs.existsSync(extractedData)) return [...names].sort();
+  for (const name of fs.readdirSync(extractedData)) {
+    const foldedName = name.toLowerCase();
+    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
+    if (path.basename(name) !== name || name === "." || name === "..") throw new Error("Restore archive contains an unsafe data filename");
+    const source = path.join(extractedData, name);
+    const stat = fs.lstatSync(source);
+    if (stat.isSymbolicLink()) throw new Error("Restore archive data file is a symbolic link");
+    if (stat.isFile()) names.add(name);
+  }
+  return [...names].sort();
+}
+
+function wholePreimagePlan(extractedRoot, quarantinePlan) {
+  const domains = [];
+  if (quarantinePlan) domains.push("quarantine-files", "quarantine-tree");
+  domains.push("data-files");
+  if (pathExists(path.join(extractedRoot, "uploads"))) domains.push("uploads-tree");
+  if (isDbEnabled()) domains.push("database-files");
+  return { domains, dataFiles: restorableDataNames(extractedRoot) };
+}
+
+function syncPreimageDirectories(root) {
+  if (process.platform === "win32") return;
+  const directories = [root];
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const child = path.join(root, entry.name);
+    if (entry.isDirectory() && !entry.isSymbolicLink()) directories.push(...syncPreimageDirectories(child));
+  }
+  for (const directory of directories.reverse()) {
+    const fd = fs.openSync(directory, "r");
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  }
+  return directories;
+}
+
+function syncPreimageParentDirectory(root) {
+  if (process.platform === "win32") return false;
+  const fd = fs.openSync(path.dirname(root), "r");
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  return true;
+}
+
+function createWholeRestorePreimages(coordinator, extractedRoot, quarantinePlan, onDomainComplete) {
+  const plan = wholePreimagePlan(extractedRoot, quarantinePlan);
+  const preimageRoot = wholeRestorePreimageRoot(coordinator.transactionId);
+  restorePreimage.ensureSafeDirectory(path.dirname(preimageRoot), { create: true });
+  fs.mkdirSync(preimageRoot, { mode: 0o700 });
+  syncPreimageParentDirectory(preimageRoot);
+  const dataRoot = resolveRuntimePath("data");
+  const domains = [];
+  const stagePath = (name) => path.join(preimageRoot, name);
+  if (plan.domains.includes("quarantine-files")) {
+    domains.push({
+      name: "quarantine-files",
+      kind: "files",
+      root: path.resolve(dataRoot),
+      files: restorePreimage.snapshotFileSet([resolveRuntimePath("data", "quarantine.json")], stagePath("quarantine-files")),
+    });
+    onDomainComplete("quarantine-files");
+    const quarantineRoot = validateQuarantineDestination(getUploadQuarantineDir());
+    domains.push({
+      name: "quarantine-tree",
+      kind: "tree",
+      root: quarantineRoot,
+      snapshot: restorePreimage.snapshotTree(quarantineRoot, stagePath("quarantine-tree")),
+    });
+    onDomainComplete("quarantine-tree");
+  }
+
+  domains.push({
+    name: "data-files",
+    kind: "files",
+    root: path.resolve(dataRoot),
+    files: restorePreimage.snapshotFileSet(plan.dataFiles.map((name) => path.join(dataRoot, name)), stagePath("data-files")),
+  });
+  onDomainComplete("data-files");
+
+  if (plan.domains.includes("uploads-tree")) {
+    const uploadsRoot = path.resolve(resolveRuntimePath("uploads"));
+    domains.push({ name: "uploads-tree", kind: "tree", root: uploadsRoot, snapshot: restorePreimage.snapshotTree(uploadsRoot, stagePath("uploads-tree")) });
+    onDomainComplete("uploads-tree");
+  }
+
+  if (plan.domains.includes("database-files")) {
+    closeDb();
+    const databasePath = path.resolve(getDatabasePath());
+    domains.push({
+      name: "database-files",
+      kind: "files",
+      root: path.dirname(databasePath),
+      files: restorePreimage.snapshotFileSet(SQLITE_SUFFIXES.map((suffix) => `${databasePath}${suffix}`), stagePath("database-files")),
+    });
+    onDomainComplete("database-files");
+  }
+
+  syncPreimageDirectories(preimageRoot);
+  const manifest = { version: restorePreimage.FORMAT_VERSION, transactionId: coordinator.transactionId, plan, domains };
+  const manifestHash = restorePreimage.writeManifest(path.join(preimageRoot, "manifest.json"), manifest);
+  syncPreimageDirectories(preimageRoot);
+  syncPreimageParentDirectory(preimageRoot);
+  return { preimagePlan: plan, preimageHash: manifestHash };
+}
+
+function validateWholeRestorePreimages(coordinator, manifest) {
+  const preimageRoot = wholeRestorePreimageRoot(coordinator.transactionId);
+  if (!manifest || manifest.version !== restorePreimage.FORMAT_VERSION || manifest.transactionId !== coordinator.transactionId
+    || !Array.isArray(manifest.domains) || !manifest.plan || !Array.isArray(manifest.plan.domains) || !Array.isArray(manifest.plan.dataFiles)
+    || JSON.stringify(manifest.plan) !== JSON.stringify(coordinator.preimagePlan)
+    || [...manifest.plan.domains].sort().join("\n") !== [...new Set(manifest.plan.domains)].sort().join("\n")) {
+    throw new Error("Whole-restore pre-image plan is invalid");
+  }
+  const expected = new Set(manifest.plan.domains);
+  if (manifest.plan.dataFiles.some((name) => typeof name !== "string" || !name || name === "." || name === ".."
+    || path.basename(name) !== name || name.includes("/") || name.includes("\\") || name.includes(":"))
+    || new Set(manifest.plan.dataFiles).size !== manifest.plan.dataFiles.length
+    || !manifest.plan.dataFiles.includes("backup-history.json")) throw new Error("Whole-restore data pre-image plan is invalid");
+  if (manifest.domains.length !== expected.size || manifest.domains.some((domain) => !expected.delete(domain.name)) || expected.size) {
+    throw new Error("Whole-restore pre-image domains are incomplete");
+  }
+  if (manifest.domains.map((domain) => domain.name).join("\n") !== manifest.plan.domains.join("\n")) throw new Error("Whole-restore pre-image order is invalid");
+  const dataRoot = path.resolve(resolveRuntimePath("data"));
+  const quarantineRoot = path.resolve(validateQuarantineDestination(getUploadQuarantineDir()));
+  const uploadsRoot = path.resolve(resolveRuntimePath("uploads"));
+  const databasePath = path.resolve(getDatabasePath());
+  for (const domain of manifest.domains) {
+    const snapshotRoot = path.join(preimageRoot, domain.name);
+    if (domain.name === "data-files" || domain.name === "quarantine-files") {
+      if (domain.kind !== "files" || path.resolve(domain.root) !== dataRoot || !Array.isArray(domain.files)) throw new Error("Whole-restore data pre-image is invalid");
+      const expectedNames = domain.name === "data-files" ? coordinator.preimagePlan.dataFiles : ["quarantine.json"];
+      if (domain.files.length !== expectedNames.length) throw new Error("Whole-restore file pre-image is incomplete");
+      for (let index = 0; index < expectedNames.length; index += 1) {
+        const entry = domain.files[index];
+        const expectedPath = path.resolve(dataRoot, expectedNames[index]);
+        if (typeof entry.existed !== "boolean" || entry.destination !== expectedPath || path.basename(entry.destination) !== expectedNames[index]) throw new Error("Whole-restore file pre-image target is invalid");
+        if (entry.existed) {
+          if (entry.stagedName !== String(index) || !/^[a-f0-9]{64}$/.test(entry.sha256 || "") || !Number.isSafeInteger(entry.size) || entry.size < 0) throw new Error("Whole-restore file pre-image metadata is invalid");
+          if (restorePreimage.hashFile(path.join(snapshotRoot, entry.stagedName)) !== entry.sha256) throw new Error("Whole-restore file pre-image failed integrity verification");
+        } else if (entry.stagedName !== undefined) throw new Error("Whole-restore absent pre-image has unexpected staged data");
+      }
+    } else if (domain.name === "database-files") {
+      if (!isDbEnabled() || domain.kind !== "files" || path.resolve(domain.root) !== path.dirname(databasePath) || !Array.isArray(domain.files)
+        || domain.files.length !== SQLITE_SUFFIXES.length) throw new Error("Whole-restore database pre-image is invalid");
+      for (let index = 0; index < SQLITE_SUFFIXES.length; index += 1) {
+        const entry = domain.files[index];
+        if (typeof entry.existed !== "boolean" || entry.destination !== `${databasePath}${SQLITE_SUFFIXES[index]}`) throw new Error("Whole-restore database pre-image target is invalid");
+        if (entry.existed && (entry.stagedName !== String(index) || !/^[a-f0-9]{64}$/.test(entry.sha256 || "") || restorePreimage.hashFile(path.join(snapshotRoot, entry.stagedName)) !== entry.sha256)) throw new Error("Whole-restore database pre-image failed integrity verification");
+      }
+    } else if (domain.name === "uploads-tree" || domain.name === "quarantine-tree") {
+      const target = domain.name === "uploads-tree" ? uploadsRoot : quarantineRoot;
+      if (domain.kind !== "tree" || path.resolve(domain.root) !== target || !domain.snapshot || typeof domain.snapshot.existed !== "boolean" || !Array.isArray(domain.snapshot.entries)) throw new Error("Whole-restore directory pre-image is invalid");
+      if (domain.snapshot.existed) restorePreimage.verifyTree(snapshotRoot, domain.snapshot.entries);
+      else if (domain.snapshot.entries.length) throw new Error("Whole-restore absent directory pre-image has entries");
+    } else throw new Error("Whole-restore pre-image has an unknown domain");
+  }
+  return manifest;
+}
+
+function recoverWholeRestorePreimages(coordinator, options = {}) {
+  const release = options.lockHeld ? null : backupService.acquireLock("restore-recovery");
+  let manifest = null;
+  const completed = [];
+  try {
+    const current = readWholeRestoreCoordinator();
+    if (!current || current.transactionId !== coordinator.transactionId || current.version !== WHOLE_RESTORE_COORDINATOR_VERSION
+      || !["prepared", "rolling_back"].includes(current.phase)) throw new Error("Whole-restore coordinator changed during recovery");
+    const preimageRoot = wholeRestorePreimageRoot(current.transactionId);
+    manifest = restorePreimage.readManifest(path.join(preimageRoot, "manifest.json"), current.preimageHash, current.transactionId);
+    validateWholeRestorePreimages(current, manifest);
+    closeDb();
+    if (isDbEnabled()) {
+      const databasePath = getDatabasePath();
+      if (pathExists(path.dirname(databasePath))) recoverDatabaseRollback(databasePath);
+    }
+    recoverQuarantineRestore({ lockHeld: true });
+    let recovering = updateWholeRestoreCoordinator(current, { phase: "rolling_back", rollbackProgress: [] });
+    for (const domain of [...manifest.domains].reverse()) {
+      recovering = updateWholeRestoreCoordinator(recovering, { rollbackDomain: domain.name });
+      const snapshotRoot = path.join(preimageRoot, domain.name);
+      if (domain.kind === "tree") restorePreimage.restoreTree(domain.root, snapshotRoot, domain.snapshot, current.transactionId);
+      else restorePreimage.restoreFileSet(domain.files, snapshotRoot, current.transactionId);
+      completed.push(domain.name);
+      recovering = updateWholeRestoreCoordinator(recovering, { rollbackProgress: completed });
+      options.failureInjector?.(`restore.rollback.${domain.name}.completed`, { completed: [...completed] });
+    }
+    recovering = updateWholeRestoreCoordinator(recovering, {
+      phase: "rollback_complete",
+      rollbackCompletedAt: new Date().toISOString(),
+      rollbackProgress: completed,
+    });
+    completeWholeRestoreCoordinator(recovering);
+    return { recovered: true, transactionId: current.transactionId };
+  } catch (error) {
+    const current = readWholeRestoreCoordinator();
+    const allDomainsRestored = Array.isArray(manifest?.domains)
+      && manifest.domains.every((domain) => completed.includes(domain.name));
+    if (current?.transactionId === coordinator.transactionId && current.phase !== "rollback_complete" && !allDomainsRestored) {
+      try { updateWholeRestoreCoordinator(current, { phase: "manual_recovery", recoveryErrorCode: String(error.code || "recovery_failed").slice(0, 80) }); } catch {}
+    }
+    throw new Error("Whole-restore rollback failed; startup remains blocked for manual recovery", { cause: error });
+  } finally { release?.(); }
+}
+
+function assertNoPendingWholeRestore(options = {}) {
+  const coordinator = readWholeRestoreCoordinator();
+  if (!coordinator) return { recovered: false, reason: "no_pending_restore" };
+  if (![2, WHOLE_RESTORE_COORDINATOR_VERSION].includes(coordinator.version)
+    || !["preparing", "prepared", "rolling_back", "rollback_complete", "manual_recovery", "restart_required"].includes(coordinator.phase)
+    || !coordinator.backupId
+    || !/^[a-f0-9-]{36}$/i.test(String(coordinator.transactionId || ""))
+    || !Number.isInteger(coordinator.requiredRestartInstances)
+    || coordinator.requiredRestartInstances < 1
+    || coordinator.requiredRestartInstances > 128) {
+    throw new Error("Whole-restore coordinator is ambiguous; startup blocked for manual recovery");
+  }
+  if (coordinator.phase === "restart_required" && coordinator.preRestoreBackupId) {
+    return { recovered: false, restartRequired: true, coordinator };
+  }
+  if (coordinator.version === WHOLE_RESTORE_COORDINATOR_VERSION && coordinator.phase === "preparing") {
+    const release = backupService.acquireLock("restore-preparation-recovery");
+    try {
+      const current = readWholeRestoreCoordinator();
+      if (!current || current.transactionId !== coordinator.transactionId || current.phase !== "preparing") throw new Error("Whole-restore preparation changed during startup");
+      cleanupWholeRestorePreimages(current.transactionId);
+      completeWholeRestoreCoordinator(current);
+      return { recovered: true, reason: "incomplete_preimage_preparation" };
+    } finally { release(); }
+  }
+  if (coordinator.version === WHOLE_RESTORE_COORDINATOR_VERSION && ["prepared", "rolling_back"].includes(coordinator.phase)) {
+    return recoverWholeRestorePreimages(coordinator, options);
+  }
+  if (coordinator.version === WHOLE_RESTORE_COORDINATOR_VERSION && coordinator.phase === "rollback_complete") {
+    const release = backupService.acquireLock("restore-rollback-cleanup");
+    try {
+      const current = readWholeRestoreCoordinator();
+      if (!current || current.transactionId !== coordinator.transactionId || current.phase !== "rollback_complete") {
+        throw new Error("Whole-restore rollback cleanup changed during startup");
+      }
+      completeWholeRestoreCoordinator(current);
+      return { recovered: true, reason: "completed_rollback_cleanup", transactionId: current.transactionId };
+    } finally { release(); }
+  }
+  if (coordinator.phase === "manual_recovery") throw new Error("Whole-restore rollback failed; startup blocked for manual recovery");
+  throw new Error("Whole-restore recovery is pending; startup blocked for manual recovery");
+}
+
+function completeWholeRestoreCoordinator(expectedCoordinator = null) {
+  const current = readWholeRestoreCoordinator();
+  if (!current) return false;
+  if (expectedCoordinator && current.transactionId !== expectedCoordinator.transactionId) return false;
+  if (!/^[a-f0-9-]{36}$/i.test(String(current.transactionId || ""))) {
+    throw new Error("Whole-restore coordinator is ambiguous; startup blocked for manual recovery");
+  }
+  cleanupRestoreExtraction(current.backupId);
+  const ackDirectory = path.join(WHOLE_RESTORE_ACK_ROOT, current.transactionId);
+  fs.rmSync(ackDirectory, { recursive: true, force: true });
+  if (current.version === WHOLE_RESTORE_COORDINATOR_VERSION) {
+    const removed = cleanupWholeRestorePreimages(current.transactionId);
+    if (current.phase === "rolling_back" && !removed) throw new Error("Whole-restore rollback pre-image disappeared before cleanup");
+  }
+  fs.rmSync(WHOLE_RESTORE_COORDINATOR_PATH, { force: true });
+  fsyncCoordinatorDirectory(path.dirname(WHOLE_RESTORE_COORDINATOR_PATH));
+  return true;
+}
+
+function prepareWholeRestoreStartup() {
+  const coordinator = readWholeRestoreCoordinator();
+  if (!coordinator) return false;
+  if (![2, WHOLE_RESTORE_COORDINATOR_VERSION].includes(coordinator.version)
+    || coordinator.phase !== "restart_required"
+    || !coordinator.backupId
+    || !coordinator.preRestoreBackupId
+    || !/^[a-f0-9-]{36}$/i.test(String(coordinator.transactionId || ""))
+    || !Number.isInteger(coordinator.requiredRestartInstances)
+    || coordinator.requiredRestartInstances < 1
+    || coordinator.requiredRestartInstances > 128) {
+    throw new Error("Whole-restore recovery is pending; startup blocked for manual recovery");
+  }
+  if (configuredRestartInstanceCount() !== coordinator.requiredRestartInstances) {
+    throw new Error("ROOTARK_RESTORE_INSTANCE_COUNT does not match the pending restore coordinator instance count");
+  }
+  restoreInstanceId(coordinator.requiredRestartInstances);
+  if (!coordinator.selectedBackup || coordinator.selectedBackup.id !== coordinator.backupId
+    || !coordinator.preRestoreBackup || coordinator.preRestoreBackup.id !== coordinator.preRestoreBackupId) {
+    throw new Error("Whole-restore recovery records are incomplete; startup blocked for manual recovery");
+  }
+  backupRepository.saveBackup(coordinator.selectedBackup);
+  backupRepository.saveBackup(coordinator.preRestoreBackup);
+  return coordinator;
+}
+
+function acknowledgeWholeRestoreInstance(explicitInstanceId) {
+  const coordinator = readWholeRestoreCoordinator();
+  if (!coordinator) return { acknowledgedInstances: 0, requiredInstances: 0, complete: true };
+  if (![2, WHOLE_RESTORE_COORDINATOR_VERSION].includes(coordinator.version) || coordinator.phase !== "restart_required") {
+    throw new Error("Whole-restore recovery is pending; startup blocked for manual recovery");
+  }
+  const requiredInstances = Number(coordinator.requiredRestartInstances);
+  if (configuredRestartInstanceCount() !== requiredInstances) {
+    throw new Error("ROOTARK_RESTORE_INSTANCE_COUNT does not match the pending restore coordinator instance count");
+  }
+  const instanceId = restoreInstanceId(requiredInstances, explicitInstanceId);
+  const transactionId = String(coordinator.transactionId || "");
+  if (!/^[a-f0-9-]{36}$/i.test(transactionId)) throw new Error("Whole-restore coordinator is ambiguous; startup blocked for manual recovery");
+  const ackDirectory = path.join(WHOLE_RESTORE_ACK_ROOT, transactionId);
+  fs.mkdirSync(ackDirectory, { recursive: true, mode: 0o700 });
+  const instanceHash = crypto.createHash("sha256").update(instanceId).digest("hex");
+  const ackPath = path.join(ackDirectory, `${instanceHash}.json`);
+  const temporary = `${ackPath}.${crypto.randomUUID()}.tmp`;
+  const fd = fs.openSync(temporary, "wx", 0o600);
+  try {
+    fs.writeFileSync(fd, `${JSON.stringify({ transactionId, instanceId, acknowledgedAt: new Date().toISOString() })}\n`);
+    fs.fsyncSync(fd);
+  } finally { fs.closeSync(fd); }
+  try {
+    fs.renameSync(temporary, ackPath);
+    fsyncCoordinatorDirectory(ackDirectory);
+  } catch (error) {
+    fs.rmSync(temporary, { force: true });
+    throw error;
+  }
+
+  const acknowledgedIds = new Set();
+  for (const name of fs.readdirSync(ackDirectory).filter((entry) => /^[a-f0-9]{64}\.json$/i.test(entry))) {
+    try {
+      const ack = JSON.parse(fs.readFileSync(path.join(ackDirectory, name), "utf8"));
+      const hash = crypto.createHash("sha256").update(String(ack.instanceId || "")).digest("hex");
+      if (ack.transactionId === transactionId && hash === name.slice(0, -5)) acknowledgedIds.add(hash);
+    } catch {}
+  }
+  const acknowledgedInstances = acknowledgedIds.size;
+  const complete = acknowledgedInstances >= requiredInstances;
+  if (complete) completeWholeRestoreCoordinator(coordinator);
+  return { acknowledgedInstances, requiredInstances, complete: complete && !isWholeRestoreBlocked() };
+}
+
+function isWholeRestoreBlocked() {
+  return pathExists(WHOLE_RESTORE_COORDINATOR_PATH);
+}
+
+function getWholeRestorePhase() {
+  try {
+    const phase = readWholeRestoreCoordinator()?.phase;
+    return ["preparing", "prepared", "rolling_back", "rollback_complete", "manual_recovery", "restart_required"].includes(phase) ? phase : phase ? "manual_recovery" : null;
+  } catch {
+    return "manual_recovery";
+  }
 }
 
 function syncNow(clock) {
@@ -28,13 +502,13 @@ function syncNow(clock) {
 function syncEntries(manifest) {
   return (manifest?.included_files || [])
     .map((entry) => String(entry.path || "").replace(/\\/g, "/"))
-    .filter((entryPath) => entryPath.startsWith("uploads/") || entryPath.startsWith("temp/"))
+    .filter((entryPath) => entryPath.startsWith("uploads/"))
     .map((entryPath) => {
       const [area, ...parts] = entryPath.split("/");
       const name = parts.pop();
       const folderId = parts.join("/") || "root";
       if (!name || !folderId || folderId.includes("/") || folderId === "." || folderId === ".." || /(^|\/)(\.env|.*credentials.*|.*\.key)$/i.test(name)) return null;
-      return { entryId: crypto.randomUUID(), path: entryPath, area, folderId, name, providerIdentity: null, state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null, failureCategory: null, leaseToken: null, leaseUntil: null };
+      return { entryId: crypto.randomUUID(), path: entryPath, area, folderId, name, providerIdentity: null, providerFileId: null, state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null, failureCategory: null, leaseToken: null, leaseUntil: null };
     })
     .filter(Boolean);
 }
@@ -153,7 +627,7 @@ async function processRestoreSync({ backupId, clock, maxAttempts = 5, uploader, 
   }
   if (["completed", "cancelled", "terminal_failure"].includes(latest.metadata.restoreSync.state)) return latest;
   const now = typeof clock === "function" ? clock() : clock?.now ? clock.now() : Date.now();
-  const providerIdentity = provider.provider || provider.name || "cloud";
+  const providerIdentity = String(provider.provider || provider.name || "cloud").toLowerCase();
   for (const candidate of latest.metadata.restoreSync.entries || []) {
     if (candidate.state === "completed" || candidate.state === "terminal_failure") continue;
     if (candidate.nextAttemptAt && new Date(candidate.nextAttemptAt).getTime() > now) continue;
@@ -162,7 +636,37 @@ async function processRestoreSync({ backupId, clock, maxAttempts = 5, uploader, 
     try {
       const localPath = resolveRuntimePath(lease.entry.path);
       if (!fs.existsSync(localPath) || !fs.statSync(localPath).isFile()) throw Object.assign(new Error("restore source unavailable"), { code: "source_unavailable" });
-      await provider.upload(localPath, lease.entry.folderId, lease.entry.name, lease.entry.area);
+      let entryForUpload = lease.entry;
+      if (providerIdentity === "gdrive") {
+        if (typeof provider.resolveUploadId !== "function") {
+          throw Object.assign(new Error("Google Drive adapter cannot reserve an idempotent restore target"), { code: "configuration" });
+        }
+        let providerFileId = String(entryForUpload.providerFileId || "").trim();
+        if (!providerFileId) {
+          providerFileId = String(await provider.resolveUploadId(entryForUpload.folderId, entryForUpload.name, entryForUpload.area) || "").trim();
+          if (!providerFileId) throw Object.assign(new Error("Google Drive did not provide a stable restore target"), { code: "configuration" });
+          const beforePin = backupRepository.getBackup(backupId);
+          const currentEntry = beforePin?.metadata?.restoreSync?.entries?.find((value) => value.entryId === lease.entry.entryId);
+          if (!currentEntry || currentEntry.leaseToken !== lease.token) continue;
+          const pinned = backupRepository.mutateRestoreSyncEntry({
+            backupId,
+            operationId: beforePin.metadata.restoreSync.operationId,
+            entryId: lease.entry.entryId,
+            expectedState: "in_progress",
+            expectedLeaseToken: lease.token,
+            expectedRevision: Number(beforePin.metadata.restoreSync.revision) || 0,
+            mutate: (latestEntry) => ({
+              entry: { ...latestEntry, providerFileId },
+              details: {},
+              at: syncNow(clock),
+            }),
+          });
+          entryForUpload = pinned.metadata.restoreSync.entries.find((value) => value.entryId === lease.entry.entryId);
+          if (!entryForUpload || entryForUpload.leaseToken !== lease.token || entryForUpload.providerFileId !== providerFileId) continue;
+        }
+      }
+      await provider.upload(localPath, entryForUpload.folderId, entryForUpload.name, entryForUpload.area,
+        providerIdentity === "gdrive" ? { providerFileId: entryForUpload.providerFileId } : undefined);
       const current = backupRepository.getBackup(backupId);
       const entry = current?.metadata?.restoreSync?.entries?.find((value) => value.entryId === lease.entry.entryId);
       if (!entry || entry.leaseToken !== lease.token) continue;
@@ -226,6 +730,9 @@ function assertSafeZipPath(entryPath) {
   const normalizedFolded = normalized.replace(/\/+$/, "").toLowerCase();
   if (normalizedFolded === "data/.rootark-quarantine-restore-journal.json"
     || normalizedFolded.startsWith("data/.rootark-quarantine-restore-metadata-")
+    || normalizedFolded.startsWith("data/.rootark-restore-coordinator.json")
+    || normalizedFolded.startsWith("data/.rootark-active-requests/")
+    || normalizedFolded.startsWith("data/.rootark-restore-restart-acks/")
     || (normalizedFolded === "data/quarantine.json" && normalized !== "data/quarantine.json")) {
     throw new Error(`Entrada de controle bloqueada no backup: ${entryPath}`);
   }
@@ -269,8 +776,12 @@ async function validateBackupArchive(backup, archivePath) {
 }
 
 async function extractArchive(zip, targetDir) {
-  fs.rmSync(targetDir, { recursive: true, force: true });
-  fs.mkdirSync(targetDir, { recursive: true });
+  const paths = restoreExtractionPaths(path.basename(path.resolve(targetDir)), { createRoot: true });
+  const { restoreDir: target, stageStat: targetStat } = paths;
+  if (path.resolve(targetDir) !== target) throw new Error("Restore staging directory escaped its root");
+  if (targetStat) fs.rmSync(target, { recursive: true, force: false });
+  restorePreimage.ensureSafeDirectory(RESTORE_TMP_DIR);
+  fs.mkdirSync(target, { mode: 0o700 });
 
   for (const entry of zip.files) {
     const safePath = assertSafeZipPath(entry.path);
@@ -278,14 +789,13 @@ async function extractArchive(zip, targetDir) {
     if (entry.type === "Directory") continue;
     if (isZipSymlink(entry)) throw new Error(`Symlink bloqueado no backup: ${entry.path}`);
 
-    const root = path.resolve(targetDir);
-    const destination = path.resolve(root, safePath);
-    const relative = path.relative(root, destination);
+    const destination = path.resolve(target, safePath);
+    const relative = path.relative(target, destination);
     if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
       throw new Error(`Path traversal bloqueado: ${entry.path}`);
     }
-    fs.mkdirSync(path.dirname(destination), { recursive: true });
-    fs.writeFileSync(destination, await entry.buffer());
+    restorePreimage.ensureSafeDirectory(path.dirname(destination), { create: true });
+    fs.writeFileSync(destination, await entry.buffer(), { flag: "wx", mode: 0o600 });
   }
 }
 
@@ -432,7 +942,7 @@ function clearDirectoryPreservingQuarantine(destination, quarantinePath) {
   }
 }
 
-function copyDirectoryContents(source, destination, protectedPath = null) {
+function copyDirectoryContents(source, destination, protectedPath = null, onFile = null) {
   if (!fs.existsSync(source)) return;
   fs.mkdirSync(destination, { recursive: true });
   for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
@@ -442,21 +952,23 @@ function copyDirectoryContents(source, destination, protectedPath = null) {
     if (protectedPath && isPathWithinAliases(destinationPath, protectedPath)) {
       if (entry.isDirectory() && !hasSymlinkInPath(destinationPath)) {
         fs.mkdirSync(destinationPath, { recursive: true });
-        copyDirectoryContents(sourcePath, destinationPath, protectedPath);
+        copyDirectoryContents(sourcePath, destinationPath, protectedPath, onFile);
       }
       continue;
     }
     if (entry.isDirectory()) {
       fs.rmSync(destinationPath, { recursive: true, force: true });
-      copyDirectoryContents(sourcePath, destinationPath, protectedPath);
+      copyDirectoryContents(sourcePath, destinationPath, protectedPath, onFile);
     } else if (entry.isFile()) {
       fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+      onFile?.(sourcePath, destinationPath, "before-copy");
       fs.copyFileSync(sourcePath, destinationPath);
+      onFile?.(sourcePath, destinationPath, "copied");
     }
   }
 }
 
-function restoreDataFiles(extractedRoot) {
+function restoreDataFiles(extractedRoot, onFile = null) {
   const extractedData = path.join(extractedRoot, "data");
   if (!fs.existsSync(extractedData)) return;
 
@@ -464,16 +976,18 @@ function restoreDataFiles(extractedRoot) {
   fs.mkdirSync(resolveRuntimePath("data"), { recursive: true });
   for (const name of fs.readdirSync(extractedData)) {
     const foldedName = name.toLowerCase();
-    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
+    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
     const sourcePath = path.join(extractedData, name);
     const destinationPath = resolveRuntimePath("data", name);
     if (fs.statSync(sourcePath).isFile()) {
+      onFile?.(sourcePath, destinationPath, "before-copy");
       fs.copyFileSync(sourcePath, destinationPath);
+      onFile?.(sourcePath, destinationPath, "copied");
     }
   }
 }
 
-function restoreUploads(extractedRoot) {
+function restoreUploads(extractedRoot, onFile = null) {
   const extractedUploads = path.join(extractedRoot, "uploads");
   if (!fs.existsSync(extractedUploads)) return;
 
@@ -483,15 +997,26 @@ function restoreUploads(extractedRoot) {
   const quarantineContainsUploads = isPathWithinAliases(quarantineDir, destinationUploads);
   if (uploadsContainQuarantine && !quarantineContainsUploads) {
     clearDirectoryPreservingQuarantine(destinationUploads, quarantineDir);
+    onFile?.(null, destinationUploads, "cleared");
     const uploadsStat = (() => { try { return fs.lstatSync(destinationUploads); } catch { return null; } })();
     if (uploadsStat?.isSymbolicLink()) return;
-    copyDirectoryContents(extractedUploads, destinationUploads, quarantineDir);
+    copyDirectoryContents(extractedUploads, destinationUploads, quarantineDir, onFile);
     return;
   }
   if (quarantineContainsUploads) return;
 
   fs.rmSync(destinationUploads, { recursive: true, force: true });
-  copyDirectoryContents(extractedUploads, destinationUploads);
+  onFile?.(null, destinationUploads, "cleared");
+  copyDirectoryContents(extractedUploads, destinationUploads, null, onFile);
+}
+
+function restoreFailureHook(options = {}) {
+  let stepNumber = 0;
+  return (step, details = {}) => {
+    if (typeof options.failureInjector !== "function") return;
+    stepNumber += 1;
+    options.failureInjector(step, { ...details, stepNumber });
+  };
 }
 
 function validateQuarantineArchive(extractedRoot, manifest) {
@@ -739,12 +1264,12 @@ function cleanupOrphanQuarantineMetadataStages(dataDirectory) {
   fsyncDirectory(dataDirectory);
 }
 
-function recoverQuarantineRestore() {
+function recoverQuarantineRestore(options = {}) {
   if (!fs.existsSync(backupService.BACKUPS_DIR)) {
     if (hasPendingQuarantineRestore()) throw new Error("Quarantine recovery cannot acquire its backup lock");
     return false;
   }
-  const release = backupService.acquireLock("restore");
+  const release = options.lockHeld ? null : backupService.acquireLock("restore");
   try {
     const destination = validateQuarantineDestination(getUploadQuarantineDir());
     const journalPath = quarantineJournalPath();
@@ -771,9 +1296,7 @@ function recoverQuarantineRestore() {
     fsyncDirectory(path.dirname(journalPath));
     fs.rmSync(stage, { recursive: true, force: true });
     return true;
-  } finally {
-    release();
-  }
+  } finally { release?.(); }
 }
 
 function restoreQuarantine(plan) {
@@ -911,20 +1434,30 @@ function fsyncFile(pathname) {
 
 function fsyncDirectory(dirname) {
   if (process.platform === "win32") return;
-  try {
-    const fd = fs.openSync(dirname, "r");
-    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  } catch {}
+  const fd = fs.openSync(dirname, "r");
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+}
+
+function fsyncCoordinatorDirectory(dirname) {
+  if (process.platform === "win32") return false;
+  const fd = fs.openSync(dirname, "r");
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  return true;
 }
 
 function writeRestoreJournal(journal) {
   const pathname = journal.journalPath;
-  const temporary = `${pathname}.${journal.transactionId}.tmp`;
+  const temporary = `${pathname}.${crypto.randomUUID()}.tmp`;
   fs.mkdirSync(path.dirname(pathname), { recursive: true });
-  fs.writeFileSync(temporary, `${JSON.stringify(journal, null, 2)}\n`, { flag: "w" });
-  fsyncFile(temporary);
-  fs.renameSync(temporary, pathname);
-  fsyncDirectory(path.dirname(pathname));
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(journal, null, 2)}\n`, { flag: "wx" });
+    fsyncFile(temporary);
+    fs.renameSync(temporary, pathname);
+    fsyncDirectory(path.dirname(pathname));
+  } catch (error) {
+    try { fs.rmSync(temporary, { force: true }); } catch {}
+    throw error;
+  }
 }
 
 function readRestoreJournal(destinationPath) {
@@ -1166,43 +1699,114 @@ async function restoreBackup(id, options = {}) {
     throw new Error("Confirmacao invalida. Digite RESTORE para restaurar.");
   }
 
+  const pending = assertNoPendingWholeRestore();
+  if (pending.restartRequired) throw new Error("Reinicie todas as instancias do servidor antes de iniciar outro restore");
+  const requiredRestartInstances = configuredRestartInstanceCount();
+  restoreInstanceId(requiredRestartInstances);
+
   assertSafeQuarantineRestoreLocation();
-
-  const preRestore = await backupService.createBackup({
-    type: "pre-restore",
-    createdBy: options.username || null,
-    notes: `Backup automatico antes de restaurar ${id}`,
-  });
-
   const release = backupService.acquireLock("restore");
-  const restoreDir = path.join(RESTORE_TMP_DIR, String(id));
+  let restoreDir = null;
+  const injectFailure = restoreFailureHook(options);
+  let coordinator = null;
+  let mutationStarted = false;
   try {
     const { backup, archivePath } = backupService.getBackupOrThrow(id);
+    const staging = restoreExtractionPaths(backup.id, { createRoot: true });
+    restoreDir = staging.restoreDir;
+    coordinator = persistWholeRestoreCoordinator({ backupId: backup.id, requiredRestartInstances });
+    await options.waitForRequestQuiescence?.();
+    const preRestore = await backupService.createBackup({
+      lockHeld: true,
+      type: "pre-restore",
+      createdBy: options.username || null,
+      notes: `Backup automatico antes de restaurar ${id}`,
+    });
+    coordinator = updateWholeRestoreCoordinator(coordinator, {
+      preRestoreBackupId: preRestore.id,
+      selectedBackup: backup,
+      preRestoreBackup: preRestore,
+    });
     const { zip, manifest } = await validateBackupArchive(backup, archivePath);
     await extractArchive(zip, restoreDir);
     const hasQuarantineState = validateQuarantineArchive(restoreDir, manifest);
     const quarantinePlan = hasQuarantineState ? prepareQuarantineRestore(restoreDir) : null;
-    restoreQuarantine(quarantinePlan);
-    restoreDataFiles(restoreDir);
-    restoreUploads(restoreDir);
-    const restoredDatabase = restoreDatabaseFiles(restoreDir);
+    const preimagePlan = wholePreimagePlan(restoreDir, quarantinePlan);
     const cloudSync = cloudStorage?.enabled() && manifest.cloud_complete
       ? createRestoreSync(manifest)
       : { state: "not_required" };
-    if (cloudSync.state === "pending") {
-      backupRepository.saveBackup({ ...backup, metadata: { ...backup.metadata, restoreSync: cloudSync } });
+    const providerReconciliation = cloudSync.state === "pending"
+      ? { backupId: backup.id, sync: cloudSync }
+      : [];
+    coordinator = updateWholeRestoreCoordinator(coordinator, {
+      preimagePlan,
+      preimageProgress: [],
+      providerReconciliation,
+      selectedBackup: cloudSync.state === "pending"
+        ? { ...backup, metadata: { ...backup.metadata, restoreSync: cloudSync } }
+        : backup,
+    });
+    const preimage = createWholeRestorePreimages(coordinator, restoreDir, quarantinePlan, (domain) => {
+      coordinator = updateWholeRestoreCoordinator(coordinator, { preimageProgress: [...coordinator.preimageProgress, domain] });
+      injectFailure(`restore.preimage.${domain}.verified`);
+    });
+    coordinator = updateWholeRestoreCoordinator(coordinator, { ...preimage, phase: "prepared" });
+    injectFailure("restore.preimage.completed");
+    injectFailure("restore.coordinator.persisted");
+    injectFailure("restore.before-local-commit");
+    mutationStarted = true;
+    restoreQuarantine(quarantinePlan);
+    if (quarantinePlan) {
+      coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "quarantine" });
+      injectFailure("restore.quarantine.committed");
     }
+    restoreDataFiles(restoreDir, (sourcePath, destinationPath, phase) => {
+      injectFailure(`restore.data.${phase}`, { sourcePath, destinationPath });
+    });
+    coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "data" });
+    restoreUploads(restoreDir, (sourcePath, destinationPath, phase) => {
+      const step = phase === "cleared" ? "restore.uploads.cleared" : `restore.uploads.${phase}`;
+      injectFailure(step, { sourcePath, destinationPath });
+    });
+    coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "uploads" });
+    injectFailure("restore.sqlite.before-replacement");
+    const restoredDatabase = restoreDatabaseFiles(restoreDir, {
+      failureInjector(step, details) { injectFailure(`restore.sqlite.${step}`, details); },
+    });
+    coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "sqlite" });
+    if (restoredDatabase) injectFailure("restore.sqlite.committed");
+    const restoredBackup = coordinator.selectedBackup;
+    backupRepository.saveBackup(restoredBackup);
+    if (cloudSync.state === "pending") {
+      injectFailure("restore.cloud-sync.persisted");
+    }
+    backupRepository.saveBackup(preRestore);
+    injectFailure("restore.backup-history.reconciled");
+    coordinator = updateWholeRestoreCoordinator(coordinator, {
+      phase: "restart_required",
+      completedAt: new Date().toISOString(),
+      lastCompletedStage: "backup-history",
+      selectedBackup: restoredBackup,
+      preRestoreBackup: preRestore,
+    });
     return {
-      backup,
+      backup: restoredBackup,
       manifest,
       preRestore,
-      restartRecommended: restoredDatabase,
+      restartRecommended: true,
       cloudSync,
     };
+  } catch (error) {
+    if (!mutationStarted && pathExists(WHOLE_RESTORE_COORDINATOR_PATH)) {
+      try { completeWholeRestoreCoordinator(); } catch (cleanupError) { error.coordinatorCleanupError = cleanupError; }
+    }
+    throw error;
   } finally {
-    fs.rmSync(restoreDir, { recursive: true, force: true });
-    fs.rmSync(RESTORE_TMP_DIR, { recursive: true, force: true });
-    release();
+    try {
+      if (restoreDir) cleanupRestoreExtraction(path.basename(restoreDir));
+    } finally {
+      release();
+    }
   }
 }
 
@@ -1226,6 +1830,11 @@ module.exports = {
   validateDatabase,
   recoverDatabaseRollback,
   recoverDatabaseRestore,
+  assertNoPendingWholeRestore,
+  prepareWholeRestoreStartup,
+  acknowledgeWholeRestoreInstance,
+  isWholeRestoreBlocked,
+  getWholeRestorePhase,
   restoreDatabaseFiles,
   databaseJournalPath,
   SQLITE_SUFFIXES,

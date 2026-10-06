@@ -6,6 +6,7 @@ function registerBackupRoutes(app, context) {
     getAuditActor,
     requireBackupAccess,
     restoreService,
+    waitForRequestQuiescence,
   } = context;
 
   app.get("/backups", authenticate, requireBackupAccess, (req, res) => {
@@ -64,6 +65,7 @@ function registerBackupRoutes(app, context) {
       const result = await restoreService.restoreBackup(req.params.id, {
         confirmation: req.body?.confirmation,
         username: req.user.username,
+        waitForRequestQuiescence: () => waitForRequestQuiescence(req.rootarkRestoreRequestLease),
       });
       auditLog("backup.restore.completed", getAuditActor(req), { type: "backup", id: result.backup.id }, "restore", "success", {
         preRestoreBackupId: result.preRestore.id,
@@ -76,10 +78,25 @@ function registerBackupRoutes(app, context) {
         restartRecommended: result.restartRecommended,
       });
     } catch (error) {
+      const restorePhase = restoreService.getWholeRestorePhase?.() || null;
       auditLog("backup.restore.failed", getAuditActor(req), { type: "backup", id: req.params.id }, "restore", "failure", {
-        error: error.message,
+        error: restorePhase ? "restore_recovery_pending" : error.message,
+        phase: restorePhase,
       });
-      res.status(error.code === "BACKUP_LOCKED" ? 409 : 400).json({ error: error.message });
+      if (restorePhase === "restart_required") {
+        res.status(503).json({
+          error: "Backup restaurado, mas a limpeza temporária falhou. Reinicie todas as instâncias; o serviço tentará remover a área temporária antes de aceitar novas solicitações.",
+          restartRequired: true,
+          cleanupPending: true,
+        });
+      } else if (restorePhase) {
+        res.status(503).json({
+          error: "A restauração permanece bloqueada para recuperação. Reinicie todas as instâncias e revise o estado antes de tentar novamente.",
+          recoveryRequired: true,
+        });
+      } else {
+        res.status(error.code === "BACKUP_LOCKED" ? 409 : 400).json({ error: error.message });
+      }
     }
   });
 

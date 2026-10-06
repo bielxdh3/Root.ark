@@ -131,6 +131,42 @@ test("backup operation lock is exclusive across real child processes", { timeout
     try { await assertOneCriticalSection(runtime, true); } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
   });
 
+  await t.test("a versioned lock from another runtime instance is never stolen by local PID checks", async () => {
+    const runtime = newRuntime("rootark-lock-remote-instance-");
+    const lock = path.join(runtime, "data", "backups", ".backup.lock");
+    const remoteLock = {
+      formatVersion: 1,
+      token: "remote-restore-token",
+      operation: "restore",
+      pid: 99999999,
+      processStartIdentity: null,
+      instanceId: "replica-a",
+      startedAt: new Date(0).toISOString(),
+      runtimeRoot: runtime,
+      takeoverClaimToken: null,
+    };
+    fs.writeFileSync(lock, JSON.stringify(remoteLock));
+    fs.utimesSync(lock, new Date(0), new Date(0));
+    try {
+      const result = await runChild(runtime, `
+        const assert=require("node:assert/strict");
+        const fs=require("node:fs");
+        const service=require(${JSON.stringify(SERVICE)});
+        const lock=${JSON.stringify(lock)};
+        const before=fs.readFileSync(lock, "utf8");
+        try { const release=service.acquireLock("restore"); release(); process.exit(1); }
+        catch (error) {
+          if (error.code !== "BACKUP_LOCKED") process.exit(2);
+          assert.equal(fs.readFileSync(lock, "utf8"), before);
+          console.log(JSON.stringify({ locked: true, preserved: true }));
+        }
+      `, { ROOTARK_INSTANCE_ID: "replica-b" });
+      assert.equal(result.code, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout.trim()), { locked: true, preserved: true });
+      assert.equal(fs.readFileSync(lock, "utf8"), JSON.stringify(remoteLock));
+    } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
+  });
+
   await t.test("a crash after stale evidence quarantine is recoverable", async () => {
     const runtime = newRuntime("rootark-lock-quarantine-");
     try {
