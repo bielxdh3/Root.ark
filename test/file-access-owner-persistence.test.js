@@ -6,7 +6,7 @@ const http = require("node:http");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const test = require("node:test");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -65,6 +65,7 @@ test("resetting a file ACL preserves its owner and owner-based edit access", { t
   ]));
   fs.writeFileSync(path.join(dataDir, "folders.json"), JSON.stringify([
     { id: "root", name: "Arquivos atuais", createdBy: "sistema", allowedUsers: [], isRoot: true },
+    { id: "owner-space", name: "Pasta do proprietario", createdBy: "owner", allowedUsers: [], isRoot: false },
   ]));
   fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify({
     "root/owned.txt": { folderId: "root", fileName: "owned.txt", owner: "owner", public: false, users: {} },
@@ -141,6 +142,24 @@ test("resetting a file ACL preserves its owner and owner-based edit access", { t
   assert.equal(JSON.parse(renamedAccess.body).owner, "owner");
   assert.equal(JSON.parse(renamedAccess.body).inherited, true);
 
+  const moveBody = JSON.stringify({ name: "owned-renamed.txt", fromFolderId: "root", toFolderId: "owner-space" });
+  const move = await request(port, "/move", {
+    method: "PUT",
+    headers: {
+      cookie: sessionCookie,
+      origin: `http://127.0.0.1:${port}`,
+      "x-csrf-token": csrf,
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(moveBody),
+    },
+    body: moveBody,
+  });
+  assert.equal(move.status, 200, move.body);
+  const movedAccess = await request(port, "/file-access?name=owned-renamed.txt&folderId=owner-space", { headers: { cookie: sessionCookie } });
+  assert.equal(movedAccess.status, 200, movedAccess.body);
+  assert.equal(JSON.parse(movedAccess.body).owner, "owner");
+  assert.equal(JSON.parse(movedAccess.body).inherited, true);
+
   await stop(child);
   child = startChild();
   assert.equal((await waitForServer(port, child)).status, 200);
@@ -151,7 +170,132 @@ test("resetting a file ACL preserves its owner and owner-based edit access", { t
   });
   assert.equal(restartedLogin.status, 200, restartedLogin.body);
   const restartedCookie = restartedLogin.headers["set-cookie"].map((value) => value.split(";", 1)[0]).join("; ");
-  const afterRestart = await request(port, "/file-access?name=owned-renamed.txt&folderId=root", { headers: { cookie: restartedCookie } });
+  const afterRestart = await request(port, "/file-access?name=owned-renamed.txt&folderId=owner-space", { headers: { cookie: restartedCookie } });
+  assert.equal(afterRestart.status, 200, afterRestart.body);
+  assert.equal(JSON.parse(afterRestart.body).owner, "owner");
+  assert.equal(JSON.parse(afterRestart.body).inherited, true);
+});
+
+test("reset file ACL owner survives SQLite route persistence and a cross-folder move", { timeout: 30_000 }, async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-owner-sqlite-"));
+  const dataDir = path.join(directory, "data");
+  const uploadsDir = path.join(directory, "uploads");
+  const databasePath = path.join(dataDir, "rootark.sqlite");
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(uploadsDir, { recursive: true });
+  fs.symlinkSync(PUBLIC, path.join(directory, "public"), "junction");
+
+  const password = crypto.randomBytes(24).toString("base64url");
+  const outsiderPassword = crypto.randomBytes(24).toString("base64url");
+  const users = [
+    { username: "owner", password: bcrypt.hashSync(password, 10), role: "user", permissions: { listFiles: true }, sessionVersion: 0 },
+    { username: "outsider", password: bcrypt.hashSync(outsiderPassword, 10), role: "user", permissions: { listFiles: true }, sessionVersion: 0 },
+  ];
+  const folders = [
+    { id: "root", name: "Arquivos atuais", createdBy: "sistema", allowedUsers: [], isRoot: true },
+    { id: "owner-space", name: "Pasta do proprietario", createdBy: "owner", allowedUsers: [], isRoot: false },
+  ];
+  fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify({
+    "root/owned.txt": { folderId: "root", fileName: "owned.txt", owner: "owner", public: false, users: {} },
+  }));
+  fs.writeFileSync(path.join(uploadsDir, "owned.txt"), "disposable SQLite owner fixture\n");
+
+  const migrationsPath = path.join(ROOT, "db", "migrations");
+  const usersRepositoryPath = path.join(ROOT, "repositories", "usersRepository");
+  const foldersRepositoryPath = path.join(ROOT, "repositories", "foldersRepository");
+  const prepareDatabase = [
+    `process.chdir(${JSON.stringify(directory)});`,
+    'process.env.DB_ENABLED = "true";',
+    `process.env.DATABASE_URL = ${JSON.stringify(databasePath)};`,
+    `require(${JSON.stringify(migrationsPath)}).runMigrations({ backup: false });`,
+    `require(${JSON.stringify(usersRepositoryPath)}).saveUsers(${JSON.stringify(users)});`,
+    `require(${JSON.stringify(foldersRepositoryPath)}).saveFolders(${JSON.stringify(folders)});`,
+  ].join(" ");
+  const prepared = spawnSync(process.execPath, ["-e", prepareDatabase], { encoding: "utf8" });
+  assert.equal(prepared.status, 0, prepared.stderr);
+
+  const port = await getUnusedPort();
+  const env = {
+    ...process.env,
+    PORT: String(port),
+    DB_ENABLED: "true",
+    DATABASE_URL: databasePath,
+    DB_READ_FALLBACK_JSON: "true",
+    DB_WRITE_LEGACY_JSON: "false",
+    NODE_ENV: "test",
+    JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+    CLOUD_STORAGE_PROVIDER: "local",
+  };
+  delete env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS;
+  delete env.ROOTARK_BOOTSTRAP_USERS_FROM_SEED;
+  delete env.TRUSTED_PROXIES;
+  const startChild = () => spawn(process.execPath, [SERVER], { cwd: directory, env, stdio: "ignore", windowsHide: true });
+  let child = startChild();
+  t.after(async () => {
+    await stop(child);
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  assert.equal((await waitForServer(port, child)).status, 200);
+
+  async function login(username, userPassword) {
+    const body = JSON.stringify({ username, password: userPassword });
+    const response = await request(port, "/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+      body,
+    });
+    assert.equal(response.status, 200, response.body);
+    const cookies = response.headers["set-cookie"].map((value) => value.split(";", 1)[0]);
+    return {
+      cookie: cookies.join("; "),
+      csrf: cookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1],
+    };
+  }
+
+  const owner = await login("owner", password);
+  const initial = await request(port, "/file-access?name=owned.txt&folderId=root", { headers: { cookie: owner.cookie } });
+  assert.equal(initial.status, 200, initial.body);
+  assert.equal(JSON.parse(initial.body).owner, "owner");
+
+  const resetBody = JSON.stringify({ name: "owned.txt", folderId: "root", public: true, users: {} });
+  const reset = await request(port, "/file-access", {
+    method: "PUT",
+    headers: {
+      cookie: owner.cookie,
+      origin: `http://127.0.0.1:${port}`,
+      "x-csrf-token": owner.csrf,
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(resetBody),
+    },
+    body: resetBody,
+  });
+  assert.equal(reset.status, 200, reset.body);
+  assert.equal(JSON.parse(reset.body).owner, "owner");
+  assert.equal(JSON.parse(reset.body).inherited, true);
+
+  const moveBody = JSON.stringify({ name: "owned.txt", fromFolderId: "root", toFolderId: "owner-space" });
+  const move = await request(port, "/move", {
+    method: "PUT",
+    headers: {
+      cookie: owner.cookie,
+      origin: `http://127.0.0.1:${port}`,
+      "x-csrf-token": owner.csrf,
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(moveBody),
+    },
+    body: moveBody,
+  });
+  assert.equal(move.status, 200, move.body);
+
+  const outsider = await login("outsider", outsiderPassword);
+  const denied = await request(port, "/file-access?name=owned.txt&folderId=owner-space", { headers: { cookie: outsider.cookie } });
+  assert.equal(denied.status, 403, denied.body);
+
+  await stop(child);
+  child = startChild();
+  assert.equal((await waitForServer(port, child)).status, 200);
+  const restartedOwner = await login("owner", password);
+  const afterRestart = await request(port, "/file-access?name=owned.txt&folderId=owner-space", { headers: { cookie: restartedOwner.cookie } });
   assert.equal(afterRestart.status, 200, afterRestart.body);
   assert.equal(JSON.parse(afterRestart.body).owner, "owner");
   assert.equal(JSON.parse(afterRestart.body).inherited, true);
