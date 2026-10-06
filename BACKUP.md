@@ -100,7 +100,15 @@ Depois que o restore terminar:
 
 Todas as instâncias precisam enxergar o mesmo runtime persistente para compartilhar o coordenador e as confirmações. O mecanismo mantém uma barreira local de recuperação e não coordena restauração entre armazenamentos de runtime independentes.
 
+### Proteção dos diretórios no host
+
+Execute Root.ark com uma conta de serviço dedicada. Os diretórios de runtime usados como origem ou destino de restore — incluindo `data`, `uploads`, quarentena, extração/pre-images de backup e os diretórios-pai dos caminhos SQLite ou de outros armazenamentos configurados — devem pertencer ao domínio de confiança do serviço/operador. Nenhum usuário ou processo não confiável do host pode renomear, substituir ou gravar nesses diretórios ou em qualquer ancestral deles enquanto o servidor estiver ativo. Configure caminhos de armazenamento absolutos e protegidos por permissões do sistema operacional; não use diretórios compartilhados graváveis por usuários não confiáveis.
+
+O restore rejeita symlinks e compara a identidade do arquivo aberto com a identidade do caminho antes de copiar bytes. Ainda assim, as APIs portáveis de caminhos do Node.js não mantêm handles de diretório para cada componente ancestral; portanto, essa verificação não elimina corridas se um ator local puder substituir um ancestral por symlink/junction durante a operação. Restrinja essa autoridade por ACL/permissões do host e pare o serviço antes de alterar os caminhos configurados.
+
 Restore interrompido em versões anteriores pode deixar um arquivo como `runtime.json.<uuid>.restore-preimage`. O coordenador antigo não registrava esse caminho; por isso, a recuperação atual não o remove automaticamente, pois não consegue provar que seja um temporário e não dado do usuário. Verifique esse resíduo manualmente após preservar um backup; não apague arquivos apenas pelo sufixo.
+
+Cada atualização do journal SQLite é gravada em um temporário exclusivo no mesmo diretório, sincronizada e publicada por rename atômico; temporários abandonados não substituem o journal válido. No POSIX, falhas ao sincronizar o diretório são propagadas e mantêm o restore em falha/recuperação, em vez de serem ignoradas. O Node.js não oferece sincronização portável de diretórios no Windows; a persistência contra perda súbita de energia nesse sistema continua limitada pelas garantias do sistema de arquivos e da plataforma.
 
 O restore:
 

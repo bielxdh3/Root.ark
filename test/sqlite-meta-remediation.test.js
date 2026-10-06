@@ -203,6 +203,62 @@ test("SQLite disaster-recovery meta-remediation matrix", async (t) => {
     ["49 retry after failed restore succeeds", () => {
       const f = makeFixture(); try { assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "replacement.move.primary" })); assert.equal(restoreService.restoreDatabaseFiles(f.sourceRoot), true); assert.equal(readValue(f.destinationPath), "new"); } finally { f.cleanup(); }
     }],
+    ["interrupted SQLite journal update preserves the prior recovery journal", () => {
+      const f = makeFixture();
+      const journalPath = restoreService.databaseJournalPath(f.destinationPath);
+      const originalWriteFileSync = fs.writeFileSync;
+      let temporaryWrites = 0;
+      let abandonedTemporary;
+      fs.writeFileSync = function interruptJournalUpdate(pathname, data, options) {
+        const candidate = path.resolve(String(pathname));
+        if (candidate.startsWith(`${path.resolve(journalPath)}.`) && candidate.endsWith(".tmp") && ++temporaryWrites === 2) {
+          abandonedTemporary = candidate;
+          originalWriteFileSync.call(this, pathname, String(data).slice(0, 12), options);
+          throw Object.assign(new Error("injected interrupted journal update"), { code: "EIO" });
+        }
+        return originalWriteFileSync.call(this, pathname, data, options);
+      };
+      try {
+        assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { simulateCrash: true }), /interrupted journal update/);
+      } finally { fs.writeFileSync = originalWriteFileSync; }
+      try {
+        assert.ok(abandonedTemporary, "the interrupted update leaves only its unique temporary journal");
+        assert.doesNotThrow(() => JSON.parse(fs.readFileSync(journalPath, "utf8")), "the previously committed recovery journal must remain intact");
+        originalWriteFileSync(abandonedTemporary, "partial abandoned journal", { flag: "wx" });
+        const recoveryWrites = [];
+        fs.writeFileSync = function recordRecoveryJournalWrites(pathname, data, options) {
+          if (path.resolve(String(pathname)).startsWith(`${path.resolve(journalPath)}.`) && String(pathname).endsWith(".tmp")) {
+            recoveryWrites.push({ pathname: path.resolve(String(pathname)), flag: options?.flag });
+          }
+          return originalWriteFileSync.call(this, pathname, data, options);
+        };
+        assert.doesNotThrow(() => restoreService.recoverDatabaseRestore(f.destinationPath));
+        assert.ok(recoveryWrites.length > 0);
+        assert.ok(recoveryWrites.every((entry) => entry.pathname !== abandonedTemporary && entry.flag === "wx"), "recovery must use fresh exclusive journal temporaries");
+        assert.equal(fs.readFileSync(abandonedTemporary, "utf8"), "partial abandoned journal", "restart recovery must not reuse an abandoned temporary");
+        assert.equal(readValue(f.destinationPath), "old");
+        assert.equal(fs.existsSync(journalPath), false);
+        fs.rmSync(abandonedTemporary, { force: true });
+        assert.deepEqual(artifactNames(f), []);
+      } finally { fs.writeFileSync = originalWriteFileSync; f.cleanup(); }
+    }],
+    ["directory fsync EIO fails restore closed and permits later recovery", (t) => {
+      if (process.platform === "win32") return t.skip("Node does not expose portable directory fsync on Windows");
+      const f = makeFixture();
+      const originalFsyncSync = fs.fsyncSync;
+      fs.fsyncSync = function failDirectorySync(fd) {
+        if (fs.fstatSync(fd).isDirectory()) throw Object.assign(new Error("injected directory fsync failure"), { code: "EIO" });
+        return originalFsyncSync.call(this, fd);
+      };
+      try {
+        assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot), { code: "EIO" });
+        assert.equal(readValue(f.destinationPath), "old", "failed directory durability must not replace the original database");
+      } finally { fs.fsyncSync = originalFsyncSync; }
+      try {
+        restoreService.recoverDatabaseRestore(f.destinationPath);
+        assertOriginalSafe(f);
+      } finally { f.cleanup(); }
+    }],
     ["50 retry after crash recovery succeeds", () => {
       const f = makeFixture(); try { assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "replacement.move.primary", simulateCrash: true })); restoreService.recoverDatabaseRestore(f.destinationPath); assert.equal(restoreService.restoreDatabaseFiles(f.sourceRoot), true); assert.equal(readValue(f.destinationPath), "new"); } finally { f.cleanup(); }
     }],
@@ -220,5 +276,5 @@ test("SQLite disaster-recovery meta-remediation matrix", async (t) => {
     if (originalEnv.DB_ENABLED === undefined) delete process.env.DB_ENABLED; else process.env.DB_ENABLED = originalEnv.DB_ENABLED;
     if (originalEnv.DATABASE_URL === undefined) delete process.env.DATABASE_URL; else process.env.DATABASE_URL = originalEnv.DATABASE_URL;
   }
-  assert.equal(cases.length, 52);
+  assert.equal(cases.length, 54);
 });

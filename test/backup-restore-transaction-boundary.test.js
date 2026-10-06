@@ -20,6 +20,133 @@ test("pre-image copy preserves a pre-existing destination when exclusive staging
   } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
 });
 
+test("pre-image copy rejects a source replaced after open but before path validation", () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-preimage-open-race-runtime-"));
+  const source = path.join(runtime, "source.bin");
+  const replacement = path.join(runtime, "replacement.bin");
+  const displaced = path.join(runtime, "displaced.bin");
+  const destination = path.join(runtime, "staged.bin");
+  fs.writeFileSync(source, "opened bytes");
+  fs.writeFileSync(replacement, "replacement bytes");
+  const originalOpenSync = fs.openSync;
+  const originalLstatSync = fs.lstatSync;
+  let sourceOpened = false;
+  let validatedAfterOpen = false;
+  fs.openSync = function (pathname, ...args) {
+    if (pathname === source) sourceOpened = true;
+    return originalOpenSync.call(this, pathname, ...args);
+  };
+  fs.lstatSync = function (pathname, ...args) {
+    if (pathname === source && sourceOpened && !validatedAfterOpen) {
+      validatedAfterOpen = true;
+      fs.renameSync(source, displaced);
+      fs.renameSync(replacement, source);
+    }
+    return originalLstatSync.call(this, pathname, ...args);
+  };
+  try {
+    const preimage = require("../services/restorePreimage");
+    assert.throws(() => preimage.copyVerifiedFile(source, destination), /changed while opening/);
+    assert.equal(validatedAfterOpen, true, "the pathname must be checked after its descriptor is opened");
+    assert.equal(fs.existsSync(destination), false, "changed source must be rejected before staging bytes");
+    assert.equal(fs.readFileSync(displaced, "utf8"), "opened bytes");
+    assert.equal(fs.readFileSync(source, "utf8"), "replacement bytes");
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.lstatSync = originalLstatSync;
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("tree hashing rejects a source replaced after open before staging it", () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-preimage-tree-open-race-runtime-"));
+  const treeRoot = path.join(runtime, "tree");
+  const source = path.join(treeRoot, "entry.txt");
+  const replacement = path.join(runtime, "replacement.txt");
+  const displaced = path.join(runtime, "displaced.txt");
+  const snapshotRoot = path.join(runtime, "snapshot");
+  fs.mkdirSync(treeRoot);
+  fs.writeFileSync(source, "opened bytes");
+  fs.writeFileSync(replacement, "replacement bytes");
+  const originalOpenSync = fs.openSync;
+  let sourceOpened = false;
+  fs.openSync = function (pathname, ...args) {
+    const fd = originalOpenSync.call(this, pathname, ...args);
+    if (pathname === source && !sourceOpened) {
+      sourceOpened = true;
+      fs.renameSync(source, displaced);
+      fs.renameSync(replacement, source);
+    }
+    return fd;
+  };
+  try {
+    const preimage = require("../services/restorePreimage");
+    assert.throws(() => preimage.snapshotTree(treeRoot, snapshotRoot), /file changed while opening/);
+    assert.equal(sourceOpened, true);
+    assert.equal(fs.existsSync(path.join(snapshotRoot, "entry.txt")), false);
+    assert.equal(fs.readFileSync(displaced, "utf8"), "opened bytes");
+    assert.equal(fs.readFileSync(source, "utf8"), "replacement bytes");
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("pre-image copy and tree hashing reject FIFO sources without blocking", (t) => {
+  if (process.platform === "win32" || typeof fs.constants.O_NONBLOCK !== "number") {
+    t.skip("FIFO or O_NONBLOCK is unavailable");
+    return;
+  }
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-preimage-fifo-runtime-"));
+  const copyFifo = path.join(runtime, "copy.fifo");
+  const copyDestination = path.join(runtime, "copy-staged.bin");
+  const treeRoot = path.join(runtime, "tree");
+  const treeFile = path.join(treeRoot, "entry.txt");
+  const replacementFifo = path.join(runtime, "replacement.fifo");
+  const displaced = path.join(runtime, "displaced.txt");
+  const snapshotRoot = path.join(runtime, "snapshot");
+  try {
+    fs.mkdirSync(treeRoot);
+    fs.writeFileSync(treeFile, "tree source");
+    const fifo = spawnSync("mkfifo", [copyFifo, replacementFifo], { encoding: "utf8" });
+    if (fifo.error?.code === "ENOENT") {
+      t.skip("mkfifo is unavailable");
+      return;
+    }
+    assert.equal(fifo.status, 0, fifo.stderr || fifo.stdout);
+    const preimagePath = path.resolve(__dirname, "../services/restorePreimage.js");
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const preimage = require(${JSON.stringify(preimagePath)});
+      const [copyFifo, copyDestination, treeFile, replacementFifo, displaced, treeRoot, snapshotRoot] = process.argv.slice(1);
+      assert.throws(() => preimage.copyVerifiedFile(copyFifo, copyDestination), /source is aliased or invalid/);
+      assert.equal(fs.existsSync(copyDestination), false);
+      const originalOpenSync = fs.openSync;
+      let swapped = false;
+      fs.openSync = function (pathname, ...args) {
+        if (pathname === treeFile && !swapped) {
+          swapped = true;
+          fs.renameSync(treeFile, displaced);
+          fs.renameSync(replacementFifo, treeFile);
+        }
+        return originalOpenSync.call(this, pathname, ...args);
+      };
+      try {
+        assert.throws(() => preimage.snapshotTree(treeRoot, snapshotRoot), /file is aliased or invalid/);
+      } finally { fs.openSync = originalOpenSync; }
+      assert.equal(swapped, true, "the tree entry must be replaced after lstat and before open");
+      assert.equal(fs.existsSync(path.join(snapshotRoot, "entry.txt")), false);
+    `;
+    const result = spawnSync(process.execPath, ["-e", script, copyFifo, copyDestination, treeFile, replacementFifo, displaced, treeRoot, snapshotRoot], {
+      encoding: "utf8",
+      timeout: 2000,
+    });
+    assert.equal(result.error, undefined, result.error?.message);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
+});
+
 function runFixture(body) {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-boundary-runtime-"));
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-boundary-quarantine-"));
@@ -792,6 +919,79 @@ test("restore failure after SQLite commit rolls database, JSON, and uploads back
     fs.rmSync(runtime, { recursive: true, force: true });
     fs.rmSync(databaseDir, { recursive: true, force: true });
   }
+});
+
+test("restart recovers whole-restore pre-images after an interrupted SQLite journal update", { timeout: 60_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-journal-restart-"));
+  const databasePath = path.join(runtime, "data", "rootark.sqlite");
+  const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
+  const env = {
+    ...process.env,
+    NODE_ENV: "test",
+    DB_ENABLED: "true",
+    DATABASE_URL: databasePath,
+    DB_AUTO_BACKUP_ON_START: "false",
+    JWT_SECRET: "j".repeat(48),
+    ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true",
+    ROOTARK_RESTORE_INSTANCE_COUNT: "1",
+    ROOTARK_INSTANCE_ID: "journal-restart-fixture",
+    PORT: "0",
+    BACKUP_ENABLED: "true",
+    BACKUP_INCLUDE_UPLOADS: "true",
+    BACKUP_INCLUDE_TEMP: "false",
+    BACKUP_RETENTION_COUNT: "20",
+  };
+  const interruptDuringSqliteJournalUpdate = `
+    const fs=require("node:fs"),path=require("node:path");
+    const Database=require(${JSON.stringify(path.join(ROOT,"node_modules","better-sqlite3"))});
+    const backup=require(${JSON.stringify(path.join(ROOT,"services","backupService"))});
+    const restore=require(${JSON.stringify(path.join(ROOT,"services","restoreService"))});
+    const write=(p,v)=>{fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,v)};
+    fs.mkdirSync(path.dirname(process.env.DATABASE_URL),{recursive:true});
+    fs.mkdirSync("uploads",{recursive:true});
+    let db=new Database(process.env.DATABASE_URL);
+    db.exec("CREATE TABLE proof (value TEXT NOT NULL); INSERT INTO proof VALUES ('archived-db');");
+    db.close();
+    write("data/runtime.json","archived-json");write("uploads/file.txt","archived-upload");
+    const originalWrite=fs.writeFileSync;
+    const journalPrefix=process.env.DATABASE_URL+".restore-journal.json.";
+    fs.writeFileSync=function interrupt(pathname,data,options){
+      if(String(pathname).startsWith(journalPrefix)&&String(pathname).endsWith(".tmp")&&String(data).includes("replacement.move.primary")){
+        originalWrite.call(this,pathname,String(data).slice(0,12),options);
+        process.exit(87);
+      }
+      return originalWrite.call(this,pathname,data,options);
+    };
+    (async()=>{
+      const saved=await backup.createBackup({createdBy:"fixture"});
+      write("data/runtime.json","live-json");write("uploads/file.txt","live-upload");
+      db=new Database(process.env.DATABASE_URL);db.prepare("UPDATE proof SET value='live-db'").run();db.close();
+      await restore.restoreBackup(saved.id,{confirmation:"RESTORE"});
+      throw new Error("journal interruption was not reached");
+    })().catch(error=>{console.error(error);process.exit(2)});
+  `;
+  const restart = `
+    const assert=require("node:assert/strict"),fs=require("node:fs"),Database=require(${JSON.stringify(path.join(ROOT,"node_modules","better-sqlite3"))});
+    require(${JSON.stringify(path.join(ROOT,"server.js"))});
+    setTimeout(()=>{
+      try{
+        assert.equal(fs.readFileSync("data/runtime.json","utf8"),"live-json");
+        assert.equal(fs.readFileSync("uploads/file.txt","utf8"),"live-upload");
+        assert.equal(fs.existsSync(${JSON.stringify(coordinatorPath)}),false);
+        const db=new Database(process.env.DATABASE_URL,{readonly:true});
+        try{assert.equal(db.prepare("SELECT value FROM proof").get().value,"live-db")}finally{db.close()}
+        process.exit(0);
+      }catch(error){console.error(error);process.exit(4)}
+    },100);
+  `;
+  try {
+    const interrupted = spawnSync(process.execPath, ["-e", interruptDuringSqliteJournalUpdate], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(interrupted.status, 87, interrupted.stderr || interrupted.stdout);
+    const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
+    assert.equal(coordinator.phase, "prepared");
+    const restarted = spawnSync(process.execPath, ["-e", restart], { cwd: runtime, env, encoding: "utf8", timeout: 25_000 });
+    assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+  } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
 });
 
 test("post-migration startup failure keeps the whole-restore barrier until a later listener acknowledgement", { timeout: 60_000 }, () => {

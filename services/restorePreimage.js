@@ -10,12 +10,18 @@ const COPY_BUFFER_SIZE = 1024 * 1024;
 function hashFile(pathname) {
   const digest = crypto.createHash("sha256");
   const buffer = Buffer.allocUnsafe(COPY_BUFFER_SIZE);
-  const fd = fs.openSync(pathname, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  const fd = fs.openSync(pathname, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
   try {
-    const stat = fs.fstatSync(fd, { bigint: true });
-    if (!stat.isFile() || stat.nlink !== 1n) throw new Error("Restore pre-image file is aliased or invalid");
+    const opened = fs.fstatSync(fd, { bigint: true });
+    const before = fs.lstatSync(pathname, { bigint: true });
+    if (!opened.isFile() || opened.nlink !== 1n || !before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) {
+      throw new Error("Restore pre-image file is aliased or invalid");
+    }
+    if (!identityMatches(before, opened)) throw new Error("Restore pre-image file changed while opening");
     let read;
     while ((read = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) digest.update(buffer.subarray(0, read));
+    const after = fs.fstatSync(fd, { bigint: true });
+    if (!identityMatches(opened, after)) throw new Error("Restore pre-image file changed while hashing");
   } finally { fs.closeSync(fd); }
   return digest.digest("hex");
 }
@@ -51,15 +57,15 @@ function identityMatches(before, after) {
 }
 
 function copyVerifiedFile(source, destination, expectedHash = null) {
-  const before = fs.lstatSync(source, { bigint: true });
-  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) throw new Error("Restore pre-image source is aliased or invalid");
-  const sourceFd = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  const sourceFd = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
   let outputFd;
   let destinationCreated = false;
   const digest = crypto.createHash("sha256");
   const buffer = Buffer.allocUnsafe(COPY_BUFFER_SIZE);
   try {
     const opened = fs.fstatSync(sourceFd, { bigint: true });
+    const before = fs.lstatSync(source, { bigint: true });
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) throw new Error("Restore pre-image source is aliased or invalid");
     if (!opened.isFile() || opened.nlink !== 1n || !identityMatches(before, opened)) throw new Error("Restore pre-image source changed while opening");
     outputFd = fs.openSync(destination, "wx", FILE_MODE);
     destinationCreated = true;

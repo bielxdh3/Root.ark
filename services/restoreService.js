@@ -1434,10 +1434,8 @@ function fsyncFile(pathname) {
 
 function fsyncDirectory(dirname) {
   if (process.platform === "win32") return;
-  try {
-    const fd = fs.openSync(dirname, "r");
-    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  } catch {}
+  const fd = fs.openSync(dirname, "r");
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
 
 function fsyncCoordinatorDirectory(dirname) {
@@ -1449,12 +1447,17 @@ function fsyncCoordinatorDirectory(dirname) {
 
 function writeRestoreJournal(journal) {
   const pathname = journal.journalPath;
-  const temporary = `${pathname}.${journal.transactionId}.tmp`;
+  const temporary = `${pathname}.${crypto.randomUUID()}.tmp`;
   fs.mkdirSync(path.dirname(pathname), { recursive: true });
-  fs.writeFileSync(temporary, `${JSON.stringify(journal, null, 2)}\n`, { flag: "w" });
-  fsyncFile(temporary);
-  fs.renameSync(temporary, pathname);
-  fsyncDirectory(path.dirname(pathname));
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(journal, null, 2)}\n`, { flag: "wx" });
+    fsyncFile(temporary);
+    fs.renameSync(temporary, pathname);
+    fsyncDirectory(path.dirname(pathname));
+  } catch (error) {
+    try { fs.rmSync(temporary, { force: true }); } catch {}
+    throw error;
+  }
 }
 
 function readRestoreJournal(destinationPath) {
