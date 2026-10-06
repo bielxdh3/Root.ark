@@ -1,4 +1,5 @@
 const crypto = require("node:crypto");
+const { getClientIp: resolveClientIp } = require("../middlewares/auth");
 const {
   DEFAULT_WINDOW,
   PERIOD_SECONDS,
@@ -88,7 +89,7 @@ function pruneLoginStore(store, now, config) {
 }
 
 function getClientIp(req, actor) {
-  return actor?.ip || req.ip || req.socket?.remoteAddress || "unknown";
+  return actor?.ip || resolveClientIp(req) || "unknown";
 }
 
 function getLoginSecurityState(req, username, getAuditActor) {
@@ -218,7 +219,7 @@ function getChallengeRateState(store, key, now) {
 }
 
 function getRequestIp(req) {
-  return String(req.ip || req.socket?.remoteAddress || "unknown");
+  return String(resolveClientIp(req) || "unknown");
 }
 
 function verificationRateLimit(req, username) {

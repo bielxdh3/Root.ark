@@ -171,6 +171,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     NODE_ENV: "test",
     JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
     TOTP_POLICY: "optional",
+    ROUTE_RATE_LIMIT_MAX: "1000",
     CLOUD_STORAGE_PROVIDER: "s3",
     AWS_S3_BUCKET: "fixture-bucket",
     AWS_REGION: "us-east-1",

@@ -120,6 +120,8 @@ npm start
 
 The server uses port `3000` unless `PORT` is configured.
 
+See [Local development setup](docs/development-setup.md) for clean-install user bootstrap and local-only sample account rules.
+
 For a reviewed deployment profile, set a strong `JWT_SECRET`, an explicit
 `TOTP_POLICY` (`optional`, `role-required`, or `global-required`), and a
 32-byte `SERVER_MASTER_KEY` or protected `data/server-master.key`. `GET

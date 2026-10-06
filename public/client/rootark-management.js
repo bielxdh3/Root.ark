@@ -503,7 +503,7 @@
     document.getElementById("audit-export").addEventListener("click", async (event) => {
       const button = event.currentTarget; button.disabled = true;
       const feedback = document.getElementById("audit-filter-feedback"); setFeedback(feedback, "Preparando CSV…");
-      try { await api.download(api.query("/audit/export", Object.assign({ format: "csv" }, currentFilters)), "rootark-audit.csv"); setFeedback(feedback, "Exportação iniciada.", "success"); }
+      try { await api.download(api.query("/audit/export", Object.assign({ format: "csv" }, currentFilters)), "rootark-audit.csv", { method: "POST" }); setFeedback(feedback, "Exportação iniciada.", "success"); }
       catch (error) { const message = publicError(error, "Não foi possível exportar os registros."); if (message) setFeedback(feedback, message, "error"); }
       finally { button.disabled = false; }
     });
