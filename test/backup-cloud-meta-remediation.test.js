@@ -136,6 +136,40 @@ test("authoritative cloud backup and restore matrix", async (t) => {
   await t.test("SQLite restore queue adapter remains restart-safe", () => { assert.equal(typeof backupRepository.saveBackup, "function"); });
   await t.test("S3 reconciliation", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "s3.txt"), "s3"); const saved = syncBackup([{ path: "uploads/s3.txt", area: "uploads", folderId: "root", name: "s3.txt", state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]); let provider = ""; const result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { provider = "s3"; } } }); assert.equal(provider, "s3"); assert.equal(result.metadata.restoreSync.state, "completed"); });
   await t.test("Drive reconciliation", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "drive.txt"), "drive"); const saved = syncBackup([{ path: "uploads/drive.txt", area: "uploads", folderId: "root", name: "drive.txt", state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]); let provider = ""; const result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { provider = "gdrive"; } } }); assert.equal(provider, "gdrive"); assert.equal(result.metadata.restoreSync.state, "completed"); });
+  await t.test("production Drive adapter pins restore uploads to a reserved ID", async () => {
+    reset();
+    fs.writeFileSync(path.join(runtime, "uploads", "drive-restore.txt"), "drive restore bytes");
+    const saved = syncBackup([{ path: "uploads/drive-restore.txt", area: "uploads", folderId: "root", name: "drive-restore.txt", state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]);
+    const calls = { generated: 0, creates: [] };
+    const storage = createCloudStorage({
+      provider: "gdrive",
+      prefix: "rootark",
+      gdrive: { folderId: "drive-root" },
+      createGoogleDriveClient: async () => ({ files: {
+        list: async () => ({ data: { files: [] } }),
+        generateIds: async () => { calls.generated += 1; return { data: { ids: ["reserved-drive-id"] } }; },
+        get: async ({ fileId }) => {
+          if (fileId === "reserved-drive-id") throw Object.assign(new Error("not found"), { response: { status: 404 } });
+          throw new Error("unexpected file lookup");
+        },
+        create: async (request) => {
+          calls.creates.push(request);
+          for await (const _chunk of request.media.body) { /* drain the real upload stream */ }
+          return { data: { id: request.requestBody.id } };
+        },
+      } }),
+    });
+
+    // Pass the adapter as createCloudStorage returns it in production; do not
+    // decorate it with a synthetic `provider` field in the test.
+    const result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: storage });
+    const entry = result.metadata.restoreSync.entries[0];
+    assert.equal(result.metadata.restoreSync.state, "completed");
+    assert.equal(calls.generated, 1);
+    assert.equal(entry.providerFileId, "reserved-drive-id");
+    assert.equal(calls.creates.length, 1);
+    assert.equal(calls.creates[0].requestBody.id, "reserved-drive-id");
+  });
   await t.test("retry success", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "retry.txt"), "retry"); const saved = syncBackup([{ path: "uploads/retry.txt", area: "uploads", folderId: "root", name: "retry.txt", state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]); let calls = 0; let result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { calls += 1; if (calls === 1) throw new Error("offline"); } } }); assert.equal(result.metadata.restoreSync.state, "pending"); clock.value = new Date(result.metadata.restoreSync.entries[0].nextAttemptAt).getTime(); result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { calls += 1; } } }); assert.equal(result.metadata.restoreSync.state, "completed"); });
   await t.test("terminal sync failure", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "terminal.txt"), "terminal"); const saved = syncBackup([{ path: "uploads/terminal.txt", area: "uploads", folderId: "root", name: "terminal.txt", state: "pending", attempts: 0, maxAttempts: 1, nextAttemptAt: null }]); const result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { throw new Error("offline"); } } }); assert.equal(result.metadata.restoreSync.state, "terminal_failure"); });
   await t.test("restart resumes sync", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "restart.txt"), "restart"); const saved = syncBackup([{ path: "uploads/restart.txt", area: "uploads", folderId: "root", name: "restart.txt", state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]); const reloaded = backupRepository.getBackup(saved.id); const result = await restoreService.processRestoreSync({ backupId: reloaded.id, clock, uploader: { enabled: () => true, upload: async () => true } }); assert.equal(result.metadata.restoreSync.state, "completed"); });
