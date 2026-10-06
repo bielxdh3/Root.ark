@@ -166,7 +166,7 @@ function runFixture(body) {
     ${body}
   `;
   const env = {
-    ...process.env,
+    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(AWS_|GOOGLE_|CLOUD_STORAGE_|S3_|GDRIVE_|DRIVE_)/i.test(key))),
     DB_ENABLED: "false",
     BACKUP_ENABLED: "true",
     BACKUP_INCLUDE_UPLOADS: "true",
@@ -1086,6 +1086,120 @@ test("post-migration startup failure keeps the whole-restore barrier until a lat
     assert.equal(JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).phase, "restart_required");
     const recoveredStartup = spawnSync(process.execPath, ["-e", recoveredStartupScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
     assert.equal(recoveredStartup.status, 0, recoveredStartup.stderr || recoveredStartup.stdout);
+    assert.equal(fs.existsSync(coordinatorPath), false);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("successful migrations before listener acknowledgement preserve the restore barrier and provider queue across restart", { timeout: 60_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-migration-before-ack-"));
+  const databasePath = path.join(runtime, "data", "rootark.sqlite");
+  const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
+  const backupIdPath = path.join(runtime, "data", "restore-backup-id.txt");
+  const env = {
+    ...process.env,
+    NODE_ENV: "test",
+    DB_ENABLED: "true",
+    DATABASE_URL: databasePath,
+    DB_AUTO_BACKUP_ON_START: "false",
+    JWT_SECRET: "j".repeat(48),
+    ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true",
+    ROOTARK_RESTORE_INSTANCE_COUNT: "1",
+    ROOTARK_INSTANCE_ID: "migration-before-ack",
+    CLOUD_STORAGE_PROVIDER: "local",
+    PORT: "0",
+    BACKUP_ENABLED: "true",
+    BACKUP_INCLUDE_UPLOADS: "false",
+    BACKUP_INCLUDE_TEMP: "false",
+    BACKUP_RETENTION_COUNT: "20",
+  };
+  const setupScript = `
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const Database = require(${JSON.stringify(path.join(ROOT, "node_modules", "better-sqlite3"))});
+    const { runMigrations } = require(${JSON.stringify(path.join(ROOT, "db", "migrations"))});
+    const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+    const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+    const cloud = {
+      enabled: () => true,
+      provider: "fixture",
+      inventory: async () => [{ provider: "s3", providerIdentity: "fixture-object", area: "uploads", folderId: "root", name: "cloud.txt" }],
+      download: async (_folderId, _name, target) => { fs.writeFileSync(target, "cloud fixture"); return true; },
+      upload: async () => { throw new Error("provider upload must wait for restore startup acknowledgement"); },
+    };
+    fs.mkdirSync(path.dirname(process.env.DATABASE_URL), { recursive: true });
+    runMigrations({ backup: false });
+    let db = new Database(process.env.DATABASE_URL);
+    db.exec("CREATE TABLE proof (value TEXT NOT NULL); INSERT INTO proof VALUES ('archive-before-migration');");
+    db.exec("ALTER TABLE users DROP COLUMN totp_enrolled_at; ALTER TABLE users DROP COLUMN totp_last_used_step; ALTER TABLE users DROP COLUMN totp_recovery_hashes_json; ALTER TABLE users DROP COLUMN totp_pending_secret_json; ALTER TABLE users DROP COLUMN totp_secret_json; ALTER TABLE users DROP COLUMN totp_enabled; DELETE FROM schema_migrations WHERE version = 5;");
+    db.close();
+    backupService.setCloudStorage(cloud);
+    restoreService.setCloudStorage(cloud);
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      fs.writeFileSync(${JSON.stringify(backupIdPath)}, backup.id);
+      db = new Database(process.env.DATABASE_URL);
+      db.prepare("UPDATE proof SET value = 'live-before-restore'").run();
+      db.close();
+      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      if (restored.cloudSync.state !== "pending") throw new Error("restore did not persist provider reconciliation");
+      if (restoreService.getWholeRestorePhase() !== "restart_required") throw new Error("restore did not persist restart-required state");
+    })().catch((error) => { console.error(error); process.exit(1); });
+  `;
+  const interruptedBeforeAcknowledgement = `
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const net = require("node:net");
+    const Database = require(${JSON.stringify(path.join(ROOT, "node_modules", "better-sqlite3"))});
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const restoreServicePath = ${JSON.stringify(path.join(ROOT, "services", "restoreService"))};
+    const restore = require(restoreServicePath);
+    const originalListen = net.Server.prototype.listen;
+    net.Server.prototype.listen = function () { throw new Error("injected listener bind interruption"); };
+    try {
+      assert.throws(() => require(${JSON.stringify(path.join(ROOT, "server.js"))}), /injected listener bind interruption/);
+    } finally { net.Server.prototype.listen = originalListen; }
+    assert.equal(JSON.parse(fs.readFileSync(${JSON.stringify(coordinatorPath)}, "utf8")).phase, "restart_required");
+    assert.equal(restore.assertNoPendingWholeRestore().restartRequired, true);
+    const backup = backupRepository.getBackup(fs.readFileSync(${JSON.stringify(backupIdPath)}, "utf8"));
+    assert.equal(backup.metadata.restoreSync.state, "pending");
+    assert.equal(backup.metadata.restoreSync.entries.length, 1);
+    const db = new Database(process.env.DATABASE_URL, { readonly: true });
+    try {
+      assert.deepEqual(db.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map((row) => row.version), [1, 2, 3, 4, 5]);
+      assert.equal(db.prepare("SELECT value FROM proof").get().value, "archive-before-migration");
+    } finally { db.close(); }
+    process.exit(0);
+  `;
+  const recoveredStartup = `
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const migrationPath = require.resolve(${JSON.stringify(path.join(ROOT, "db", "migrations"))});
+    const migrations = require(migrationPath);
+    const runMigrations = migrations.runMigrations;
+    let applied;
+    migrations.runMigrations = (options) => { const result = runMigrations(options); applied = result.applied; return result; };
+    require(${JSON.stringify(path.join(ROOT, "server.js"))});
+    setTimeout(() => {
+      try {
+        assert.deepEqual(applied, [], "the successfully migrated restored database should not rerun migrations");
+        assert.equal(fs.existsSync(${JSON.stringify(coordinatorPath)}), false, "a later listener acknowledgement should clear the barrier");
+        const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+        const backup = backupRepository.getBackup(fs.readFileSync(${JSON.stringify(backupIdPath)}, "utf8"));
+        assert.equal(backup.metadata.restoreSync.state, "pending", "provider reconciliation must remain durable until a provider can process it");
+        process.exit(0);
+      } catch (error) { console.error(error); process.exit(4); }
+    }, 200);
+  `;
+  try {
+    const setup = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+    const interrupted = spawnSync(process.execPath, ["-e", interruptedBeforeAcknowledgement], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(interrupted.status, 0, interrupted.stderr || interrupted.stdout);
+    assert.equal(JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).phase, "restart_required");
+    const recovered = spawnSync(process.execPath, ["-e", recoveredStartup], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
     assert.equal(fs.existsSync(coordinatorPath), false);
   } finally {
     fs.rmSync(runtime, { recursive: true, force: true });
