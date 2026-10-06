@@ -1,6 +1,9 @@
 name: Security Regression
 
 on:
+  push:
+    branches:
+      - Root/main
   pull_request:
     branches:
       - Root/main
