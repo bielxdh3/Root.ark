@@ -78,12 +78,113 @@ test("download cleans up a partial cache file after a provider stream failure", 
 test("Google Drive escapes lookup values and uses a deterministic duplicate", async () => {
   const queries = [];
   const drive = { files: {
-    list: async ({ q }) => { queries.push(q); return { data: { files: [{ id: "z" }, { id: "a" }] } }; },
-    delete: async ({ fileId }) => { assert.equal(fileId, "a"); },
+    list: async ({ q }) => { queries.push(q); return { data: { files: [
+      { id: "a", parents: ["other-parent"], appProperties: { rootArkKey: "rootark/uploads/folder'one/safe.txt", rootArkFolderId: "folder'one", rootArkArea: "uploads" } },
+      { id: "z", parents: ["parent"], appProperties: { rootArkKey: "rootark/uploads/folder'one/safe.txt", rootArkFolderId: "folder'one", rootArkArea: "uploads" } },
+    ] } }; },
+    get: async () => ({ data: { id: "z", parents: ["parent"], appProperties: { rootArkKey: "rootark/uploads/folder'one/safe.txt", rootArkFolderId: "folder'one", rootArkArea: "uploads" } } }),
+    delete: async ({ fileId }) => { assert.equal(fileId, "z"); },
   } };
   const storage = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "parent" }, createGoogleDriveClient: async () => drive });
   assert.equal(await storage.remove("folder'one", "safe.txt"), true);
   assert.match(queries[0], /folder\\'one/);
+});
+
+test("Google Drive operations ignore same-key records outside the configured parent or with mismatched metadata", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-drive-ownership-"));
+  const source = path.join(root, "source.txt");
+  const target = path.join(root, "download.txt");
+  fs.writeFileSync(source, "replacement bytes");
+  const key = "rootark/uploads/folder/file.txt";
+  const records = [
+    { id: "a-outside", parents: ["other-parent"], appProperties: { rootArkKey: key, rootArkFolderId: "folder", rootArkArea: "uploads" } },
+    { id: "b-wrong-folder", parents: ["parent"], appProperties: { rootArkKey: key, rootArkFolderId: "other", rootArkArea: "uploads" } },
+    { id: "c-wrong-area", parents: ["parent"], appProperties: { rootArkKey: key, rootArkFolderId: "folder", rootArkArea: "temp" } },
+    { id: "z-owned", parents: ["parent"], appProperties: { rootArkKey: key, rootArkFolderId: "folder", rootArkArea: "uploads" } },
+  ];
+  const calls = [];
+  const drive = { files: {
+    list: async () => ({ data: { files: records } }),
+    get: async ({ fileId, alt }) => {
+      calls.push(["get", fileId, alt || "metadata"]);
+      if (alt === "media") return { data: Readable.from(fileId === "z-owned" ? "owned bytes" : "outside bytes") };
+      return { data: records.find((record) => record.id === fileId) };
+    },
+    update: async ({ fileId, media }) => { calls.push(["update", fileId]); await drain(media.body); },
+    create: async ({ requestBody, media }) => { calls.push(["create", requestBody.parents[0]]); await drain(media.body); return { data: { id: "created" } }; },
+    delete: async ({ fileId }) => { calls.push(["delete", fileId]); },
+  } };
+  const storage = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "parent" }, createGoogleDriveClient: async () => drive });
+
+  try {
+    assert.equal(await storage.download("folder", "file.txt", target), true);
+    assert.equal(fs.readFileSync(target, "utf8"), "owned bytes");
+    assert.deepEqual(await storage.upload(source, "folder", "file.txt"), { provider: "gdrive", key, id: "z-owned" });
+    assert.equal(await storage.remove("folder", "file.txt"), true);
+    assert.deepEqual(calls.filter((call) => call[0] === "update" || call[0] === "delete"), [["update", "z-owned"], ["delete", "z-owned"]]);
+    assert.deepEqual(calls.filter((call) => call[0] === "get" && call[2] === "media"), [["get", "z-owned", "media"]]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Google Drive operations do not read, overwrite, or delete a matching key outside its configured parent", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-drive-foreign-"));
+  const source = path.join(root, "source.txt");
+  const target = path.join(root, "download.txt");
+  fs.writeFileSync(source, "replacement bytes");
+  const foreign = { id: "foreign", parents: ["other-parent"], appProperties: { rootArkKey: "rootark/uploads/folder/file.txt", rootArkFolderId: "folder", rootArkArea: "uploads" } };
+  const calls = [];
+  const drive = { files: {
+    list: async () => ({ data: { files: [foreign] } }),
+    get: async ({ fileId, alt }) => { calls.push(["get", fileId, alt || "metadata"]); return { data: Readable.from("foreign bytes") }; },
+    update: async ({ fileId }) => calls.push(["update", fileId]),
+    create: async ({ requestBody, media }) => { calls.push(["create", requestBody.parents[0]]); await drain(media.body); return { data: { id: "owned-created" } }; },
+    delete: async ({ fileId }) => calls.push(["delete", fileId]),
+  } };
+  const storage = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "parent" }, createGoogleDriveClient: async () => drive });
+
+  try {
+    assert.equal(await storage.download("folder", "file.txt", target), false);
+    assert.equal(fs.existsSync(target), false);
+    assert.deepEqual(await storage.upload(source, "folder", "file.txt"), { provider: "gdrive", key: foreign.appProperties.rootArkKey, id: "owned-created" });
+    assert.equal(await storage.remove("folder", "file.txt"), false);
+    assert.deepEqual(calls, [["create", "parent"]]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Google Drive operations recheck parent and key metadata immediately before provider effects", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-drive-stale-"));
+  const source = path.join(root, "source.txt");
+  const target = path.join(root, "download.txt");
+  fs.writeFileSync(source, "replacement bytes");
+  const key = "rootark/uploads/folder/file.txt";
+  const listed = { id: "listed", parents: ["parent"], appProperties: { rootArkKey: key, rootArkFolderId: "folder", rootArkArea: "uploads" } };
+  const moved = { ...listed, parents: ["other-parent"] };
+  const calls = [];
+  const drive = { files: {
+    list: async () => ({ data: { files: [listed] } }),
+    get: async ({ fileId, alt }) => {
+      calls.push(["get", fileId, alt || "metadata"]);
+      return { data: alt === "media" ? Readable.from("unexpected bytes") : moved };
+    },
+    update: async ({ fileId }) => calls.push(["update", fileId]),
+    create: async () => assert.fail("a stale object must not be replaced by a duplicate"),
+    delete: async ({ fileId }) => calls.push(["delete", fileId]),
+  } };
+  const storage = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "parent" }, createGoogleDriveClient: async () => drive });
+
+  try {
+    await assert.rejects(storage.download("folder", "file.txt", target), { code: "provider_error" });
+    await assert.rejects(storage.upload(source, "folder", "file.txt"), { code: "provider_error" });
+    await assert.rejects(storage.remove("folder", "file.txt"), { code: "provider_error" });
+    assert.equal(fs.existsSync(target), false);
+    assert.deepEqual(calls, [["get", "listed", "metadata"], ["get", "listed", "metadata"], ["get", "listed", "metadata"]]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("provider selection and configuration failures have stable categories", async () => {
@@ -152,8 +253,10 @@ test("Google Drive creates, updates, lists pages, and deletes missing or existin
   fs.writeFileSync(source, "bytes");
   let mode = "absent";
   const calls = [];
+  const owned = { id: "existing", parents: ["parent"], appProperties: { rootArkKey: "rootark/uploads/root/file.txt", rootArkFolderId: "root", rootArkArea: "uploads" } };
   const drive = { files: {
-    list: async (request) => { calls.push(request); if (request.fields === "files(id,name)") return { data: { files: mode === "update" ? [{ id: "existing" }] : [] } }; return { data: { files: [] } }; },
+    list: async (request) => { calls.push(request); if (request.fields.includes("appProperties")) return { data: { files: mode === "update" ? [owned] : [] } }; return { data: { files: [] } }; },
+    get: async () => ({ data: owned }),
     create: async (request) => { calls.push(request); await drain(request.media.body); return { data: { id: "created" } }; },
     update: async (request) => { calls.push(request); await drain(request.media.body); },
     delete: async (request) => { calls.push(request); },
@@ -257,19 +360,19 @@ test("Google Drive refuses to update a pinned ID owned by another key or parent"
 test("Google Drive lists and deletes every paginated prefix entry", async () => {
   let page = 0;
   const deleted = [];
-  const drive = { files: { list: async ({ fields }) => {
-    if (fields.includes("appProperties")) {
-      const files = page++ === 0
-        ? [
-          { id: "a", parents: ["parent"], appProperties: { rootArkKey: "rootark/uploads/root/a", rootArkFolderId: "root", rootArkArea: "uploads" }, size: "4", createdTime: "2026-10-01T00:00:00.000Z" },
-          { id: "foreign-parent", parents: ["elsewhere"], appProperties: { rootArkKey: "rootark/uploads/root/foreign-parent", rootArkFolderId: "root", rootArkArea: "uploads" } },
-          { id: "wrong-key", parents: ["parent"], appProperties: { rootArkKey: "outside/uploads/root/wrong-key", rootArkFolderId: "root", rootArkArea: "uploads" } },
-        ]
-        : [{ id: "b", parents: ["parent"], appProperties: { rootArkKey: "rootark/uploads/root/b", rootArkFolderId: "root", rootArkArea: "uploads" } }];
-      return { data: { files, nextPageToken: page === 1 ? "next" : undefined } };
-    }
-    return { data: { files: [{ id: "a" }, { id: "b" }], nextPageToken: page++ ? undefined : "next" } };
-  }, delete: async ({ fileId }) => deleted.push(fileId) } };
+  const pages = [
+    [
+      { id: "a", parents: ["parent"], appProperties: { rootArkKey: "rootark/uploads/root/a", rootArkFolderId: "root", rootArkArea: "uploads" }, size: "4", createdTime: "2026-10-01T00:00:00.000Z" },
+      { id: "foreign-parent", parents: ["elsewhere"], appProperties: { rootArkKey: "rootark/uploads/root/foreign-parent", rootArkFolderId: "root", rootArkArea: "uploads" } },
+      { id: "wrong-key", parents: ["parent"], appProperties: { rootArkKey: "outside/uploads/root/wrong-key", rootArkFolderId: "root", rootArkArea: "uploads" } },
+    ],
+    [{ id: "b", parents: ["parent"], appProperties: { rootArkKey: "rootark/uploads/root/b", rootArkFolderId: "root", rootArkArea: "uploads" } }],
+  ];
+  const drive = { files: { list: async ({ fields, pageToken }) => {
+    assert.equal(pageToken, page === 0 ? undefined : "next");
+    const files = pages[page++] || [];
+    return { data: { files, nextPageToken: page === 1 ? "next" : undefined } };
+  }, get: async ({ fileId }) => ({ data: pages.flat().find((file) => file.id === fileId) }), delete: async ({ fileId }) => deleted.push(fileId) } };
   const storage = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "parent" }, createGoogleDriveClient: async () => drive });
   assert.deepEqual(await storage.list("root"), [
     { name: "a", id: "a", key: "rootark/uploads/root/a", size: 4, uploadedAt: "2026-10-01T00:00:00.000Z" },
@@ -277,7 +380,56 @@ test("Google Drive lists and deletes every paginated prefix entry", async () => 
   ]);
   page = 0;
   assert.equal(await storage.removePrefix("rootark/uploads/root"), true);
-  assert.deepEqual(deleted, ["a", "b", "a", "b"]);
+  assert.deepEqual(deleted, ["a", "b"]);
+});
+
+test("Google Drive prefix removal ignores matching tags outside its parent or canonical prefix", async () => {
+  const key = "rootark/uploads/root/owned.txt";
+  const files = [
+    { id: "owned", parents: ["parent"], appProperties: { rootArkKey: key, rootArkFolderId: "root", rootArkArea: "uploads" } },
+    { id: "outside-parent", parents: ["other-parent"], appProperties: { rootArkKey: "rootark/uploads/root/outside.txt", rootArkFolderId: "root", rootArkArea: "uploads" } },
+    { id: "wrong-prefix", parents: ["parent"], appProperties: { rootArkKey: "other/uploads/root/unrelated.txt", rootArkFolderId: "root", rootArkArea: "uploads" } },
+  ];
+  const deleted = [];
+  const checked = [];
+  const drive = { files: {
+    list: async ({ pageToken }) => ({ data: { files: pageToken ? [] : files } }),
+    get: async ({ fileId }) => { checked.push(fileId); return { data: files.find((file) => file.id === fileId) }; },
+    delete: async ({ fileId }) => deleted.push(fileId),
+  } };
+  const storage = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "parent" }, createGoogleDriveClient: async () => drive });
+
+  assert.equal(await storage.removePrefix("rootark/uploads/root"), true);
+  assert.deepEqual(checked, ["owned"]);
+  assert.deepEqual(deleted, ["owned"]);
+});
+
+test("Google Drive prefix removal rechecks ownership immediately before deletion", async () => {
+  const listed = { id: "moved", parents: ["parent"], appProperties: { rootArkKey: "rootark/uploads/root/file.txt", rootArkFolderId: "root", rootArkArea: "uploads" } };
+  const deleted = [];
+  const drive = { files: {
+    list: async () => ({ data: { files: [listed] } }),
+    get: async () => ({ data: { ...listed, parents: ["other-parent"] } }),
+    delete: async ({ fileId }) => deleted.push(fileId),
+  } };
+  const storage = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "parent" }, createGoogleDriveClient: async () => drive });
+
+  await assert.rejects(storage.removePrefix("rootark/uploads/root"), { code: "provider_error" });
+  assert.deepEqual(deleted, []);
+});
+
+test("Google Drive prefix removal parses folder identity relative to a multi-segment configured prefix", async () => {
+  const owned = { id: "owned", parents: ["parent"], appProperties: { rootArkKey: "tenant/rootark/uploads/team/file.txt", rootArkFolderId: "team", rootArkArea: "uploads" } };
+  const deleted = [];
+  const drive = { files: {
+    list: async () => ({ data: { files: [owned] } }),
+    get: async () => ({ data: owned }),
+    delete: async ({ fileId }) => deleted.push(fileId),
+  } };
+  const storage = createCloudStorage({ provider: "gdrive", prefix: "tenant/rootark", gdrive: { folderId: "parent" }, createGoogleDriveClient: async () => drive });
+
+  assert.equal(await storage.removePrefix("tenant/rootark/uploads/team"), true);
+  assert.deepEqual(deleted, ["owned"]);
 });
 
 test("configuration errors avoid client creation and provider errors do not disclose credentials", async () => {
@@ -299,9 +451,12 @@ test("Google Drive download succeeds, misses cleanly, and removes partial files"
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-"));
   const target = path.join(root, "file.txt");
   let mode = "success";
+  const owned = { id: "file", parents: ["parent"], appProperties: { rootArkKey: "rootark/uploads/root/file.txt", rootArkFolderId: "root", rootArkArea: "uploads" } };
   const drive = { files: {
-    list: async () => ({ data: { files: mode === "missing" ? [] : [{ id: "file" }] } }),
-    get: async () => ({ data: mode === "failure" ? new Readable({ read() { this.push("partial"); this.destroy(new Error("failure")); } }) : Readable.from("content") }),
+    list: async () => ({ data: { files: mode === "missing" ? [] : [owned] } }),
+    get: async ({ alt }) => ({ data: alt === "media"
+      ? mode === "failure" ? new Readable({ read() { this.push("partial"); this.destroy(new Error("failure")); } }) : Readable.from("content")
+      : owned }),
   } };
   const storage = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "parent" }, createGoogleDriveClient: async () => drive });
   assert.equal(await storage.download("root", "file.txt", target), true);
@@ -310,7 +465,7 @@ test("Google Drive download succeeds, misses cleanly, and removes partial files"
   mode = "missing";
   assert.equal(await storage.download("root", "missing.txt", target), false);
   mode = "failure";
-  await assert.rejects(storage.download("root", "broken.txt", target), { code: "provider_error" });
+  await assert.rejects(storage.download("root", "file.txt", target), { code: "provider_error" });
   assert.equal(fs.existsSync(target), false);
   fs.rmSync(root, { recursive: true, force: true });
 });
