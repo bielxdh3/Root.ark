@@ -38,6 +38,47 @@ function json(value) {
   return Buffer.from(JSON.stringify(value));
 }
 
+test("shared dialog close restores focus to its connected opener", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-ui.js"), "utf8");
+  const listeners = new Map();
+  const opener = { isConnected: true, focus() { document.activeElement = this; } };
+  const cancelButton = { focus() { document.activeElement = this; }, addEventListener() {} };
+  const form = { addEventListener() {} };
+  const dialog = {
+    returnValue: "",
+    addEventListener(name, listener) { listeners.set(name, listener); },
+    removeEventListener(name) { listeners.delete(name); },
+    querySelector(selector) { return selector === "form" ? form : cancelButton; },
+    querySelectorAll() { return [cancelButton]; },
+    showModal() { document.activeElement = this; },
+    close(value) {
+      this.returnValue = value;
+      document.activeElement = this;
+      const listener = listeners.get("close");
+      listeners.delete("close");
+      listener();
+    },
+  };
+  const document = {
+    activeElement: opener,
+    documentElement: { dataset: {} },
+    addEventListener() {},
+    getElementById(id) { return id === "app-dialog" ? dialog : null; },
+  };
+  const context = {
+    document,
+    localStorage: { getItem() { return null; } },
+    window: { addEventListener() {}, setTimeout },
+    FormData: function FormData() {},
+  };
+  vm.runInNewContext(source, context);
+
+  const pending = context.window.RootarkUI.dialog({ title: "Compartilhar arquivo" });
+  dialog.close("cancel");
+  assert.equal(await pending, null);
+  assert.equal(document.activeElement, opener);
+});
+
 test("backup recovery stays blocked after an in-flight action returns a structured 503", async () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-management.js"), "utf8");
   for (const page of ["admin.html", "audit.html", "backups.html", "dashboard.html"]) {
