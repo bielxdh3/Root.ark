@@ -4358,7 +4358,16 @@ function isWebDavEncryptedFile(folderId, fileName) {
 
 function isWebDavInternalStoredFile(folderId, fileName) {
   const name = path.basename(fileName || "");
-  return isStoredVersionFile(folderId, name);
+  if (isStoredVersionFile(folderId, name)) return true;
+
+  // With the version manifest missing, an unmarked `.vN` object is ambiguous:
+  // it may be an ordinary file or orphaned historical bytes. WebDAV requires
+  // file-local metadata to expose that ambiguous name; ordinary files that
+  // have their own ACL or version history remain available.
+  if (!/\.v\d+$/i.test(name)) return false;
+  const versionEntries = loadFileVersions();
+  if (versionEntries[getFileVersionKey(folderId, name)]) return false;
+  return !getFilePermissionEntry(folderId, name, loadFilePermissions());
 }
 
 async function deleteCloudTrashItem(item) {

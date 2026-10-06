@@ -19,6 +19,7 @@ const OBJECTS = new Map([
   ["rootark/uploads/root/history-only.txt.v9", Buffer.from("history-only orphan version fixture")],
   ["rootark/uploads/root/public.txt", Buffer.from("public cloud fixture")],
   ["rootark/uploads/root/public.txt.v1", Buffer.from("public stored version fixture")],
+  ["rootark/uploads/root/ambiguous-orphan.v1", Buffer.from("unclassified stored version fixture")],
   ["rootark/uploads/root/budget.v2", Buffer.from("ordinary cloud suffix fixture")],
   ["rootark/uploads/root/private.txt.v7", Buffer.from("ordinary suffix with distinct ACL")],
   ["rootark/uploads/root/private.txt.v8", Buffer.from("ordinary suffix with primary history")],
@@ -195,7 +196,7 @@ test("cloud-backed GET routes authorize files before cache hydration", { timeout
 
   const list = await request(port, "/list", { headers: { cookie, referer: "https://attacker.invalid/" } });
   assert.equal(list.status, 200, list.body);
-  assert.deepEqual(JSON.parse(list.body).map((file) => file.name).sort(), ["budget.v2", "encrypted.txt", "legacy.v9", "notes.v2", "private.txt.v7", "private.txt.v8", "public.txt"]);
+  assert.deepEqual(JSON.parse(list.body).map((file) => file.name).sort(), ["ambiguous-orphan.v1", "budget.v2", "encrypted.txt", "legacy.v9", "notes.v2", "private.txt.v7", "private.txt.v8", "public.txt"]);
   assert.deepEqual(cloud.getObjects, [], "listing reads provider metadata without materializing file bytes");
   assert.equal(fs.existsSync(path.join(directory, "uploads", "budget.v2")), false, "ordinary cloud file is visible before hydration");
 
@@ -286,9 +287,24 @@ test("cloud-backed GET routes authorize files before cache hydration", { timeout
   assert.equal(propfind.body.includes("encrypted.txt"), false, "WebDAV does not expose encrypted files");
   assert.equal(propfind.body.includes("private.txt.v1"), false, "WebDAV hides stored versions");
   assert.equal(propfind.body.includes("public.txt.v1"), false, "WebDAV hides versions recognized by metadata");
+  assert.equal(propfind.body.includes("ambiguous-orphan.v1"), false, "WebDAV fails closed for suffix-named objects with no primary metadata");
   assert.equal(propfind.body.includes("budget.v2"), true, "WebDAV lists ordinary suffix names");
   assert.equal(propfind.body.includes("notes.v2"), true, "WebDAV lists ordinary local suffix names");
+  assert.equal(propfind.body.includes("private.txt.v7"), true, "WebDAV preserves a suffix-named primary file with its own ACL");
+  assert.equal(propfind.body.includes("private.txt.v8"), true, "WebDAV preserves a suffix-named primary file with its own history");
   assert.deepEqual(cloud.getObjects, [], "WebDAV listing does not hydrate cloud objects");
+  const orphanWebDavFile = await request(port, "/dav/ambiguous-orphan.v1", { headers: { authorization: webDavAuth } });
+  assert.equal(orphanWebDavFile.status, 404, orphanWebDavFile.body);
+  assert.equal(cloud.getObjects.includes("rootark/uploads/root/ambiguous-orphan.v1"), false, "ambiguous suffix artifacts never hydrate through WebDAV");
+  const orphanWebDavHead = await request(port, "/dav/ambiguous-orphan.v1", { method: "HEAD", headers: { authorization: webDavAuth } });
+  assert.equal(orphanWebDavHead.status, 404, "HEAD does not disclose ambiguous suffix metadata");
+  assert.equal(cloud.getObjects.includes("rootark/uploads/root/ambiguous-orphan.v1"), false, "denied HEAD never hydrates the object");
+  const ordinaryCloudWebDavFile = await request(port, "/dav/budget.v2", { headers: { authorization: webDavAuth } });
+  assert.equal(ordinaryCloudWebDavFile.status, 200, ordinaryCloudWebDavFile.body);
+  assert.equal(ordinaryCloudWebDavFile.body, "ordinary cloud suffix fixture");
+  const ordinaryLocalWebDavFile = await request(port, "/dav/notes.v2", { headers: { authorization: webDavAuth } });
+  assert.equal(ordinaryLocalWebDavFile.status, 200, ordinaryLocalWebDavFile.body);
+  assert.equal(ordinaryLocalWebDavFile.body, "ordinary local suffix fixture");
 
   const fileAccess = await request(port, "/file-access?name=public.txt", { headers: { cookie } });
   assert.equal(fileAccess.status, 200, fileAccess.body);
