@@ -229,6 +229,7 @@
     const element = document.getElementById("app-dialog");
     if (!element) return Promise.resolve(null);
     const opener = document.activeElement;
+    const focusFallback = document.getElementById("main");
     element.innerHTML = [
       '<form method="dialog" class="dialog-card">',
       '  <div class="dialog-heading"><div><p class="eyebrow">' + escape(opts.eyebrow || "CONFIRMAÇÃO") + '</p><h2 id="dialog-title">' + escape(opts.title || "Confirmar ação") + "</h2></div>",
@@ -249,6 +250,7 @@
         element.removeEventListener("click", outsideClick);
         element.innerHTML = "";
         if (opener && opener.isConnected) opener.focus();
+        else if (focusFallback && focusFallback.isConnected) focusFallback.focus();
         resolve(result);
       };
       element.addEventListener("close", finish, { once: true });
