@@ -61,7 +61,10 @@ async function login(port, username, password) {
   });
   assert.equal(response.status, 200);
   const cookies = response.headers["set-cookie"].map((cookie) => cookie.split(";", 1)[0]);
-  return { cookie: cookies.join("; ") };
+  return {
+    cookie: cookies.join("; "),
+    csrf: cookies.find((cookie) => cookie.startsWith("rootark_csrf=")).split("=", 2)[1],
+  };
 }
 
 function statState(target) {
@@ -126,7 +129,13 @@ test("file trash stays inside the child server runtime root", { timeout: 30_000 
 
   assert.equal((await waitForServer(port)).status, 200);
   const session = await login(port, "deleter", password);
-  const deleted = await request(port, `/delete/keep.txt?folderId=${FOLDER_ID}`, { headers: { cookie: session.cookie } });
+  const legacyDelete = await request(port, `/delete/keep.txt?folderId=${FOLDER_ID}`, { headers: { cookie: session.cookie } });
+  assert.equal(legacyDelete.status, 405, "legacy GET cannot move a file to trash");
+  assert.equal(fs.existsSync(source), true, "legacy GET leaves the source unchanged");
+  const deleted = await request(port, `/delete/keep.txt?folderId=${FOLDER_ID}`, {
+    method: "POST",
+    headers: { cookie: session.cookie, origin: `http://127.0.0.1:${port}`, "x-csrf-token": session.csrf },
+  });
   const result = JSON.parse(deleted.body);
   const sandboxJson = path.join(sandbox, "data", "trash-items.json");
 

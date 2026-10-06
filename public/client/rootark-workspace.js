@@ -274,6 +274,7 @@
       state.files = Array.isArray(result) ? result : [];
       if (hasPermission("listPending") || hasPermission("upload")) {
         try {
+          await api.post(api.query("/pending/repair", { folderId: state.folderId }), {});
           const pending = await api.get(api.query("/pending", { folderId: state.folderId }));
           state.pending = Array.isArray(pending) ? pending : [];
         } catch (error) {
@@ -807,6 +808,7 @@
 
   async function fileVersions(name, folderId) {
     try {
+      await api.post(api.query("/versions/" + encodeURIComponent(name) + "/initialize", { folderId }), {});
       state.versions = await api.get(api.query("/versions/" + encodeURIComponent(name), { folderId }));
       state.versions.folderId = folderId;
       state.versions.isEncrypted = isEncrypted(state.files.find((item) => item.name === name && fileFolderId(item) === folderId));
@@ -834,7 +836,7 @@
     await confirmThen(verb + " envio?", '<p>Confirma ' + verb.toLowerCase() + ' o arquivo <strong>' + esc(name) + '</strong>?</p>', async () => {
       try {
         const path = api.query("/" + (yes ? "approve" : "reject") + "/" + encodeURIComponent(name), { folderId });
-        await api.get(path);
+        await api.post(path, {});
         ui.toast(yes ? "Arquivo aprovado." : "Arquivo rejeitado.", "success");
         await loadFiles();
       } catch (error) { reportError(error); }
@@ -844,7 +846,7 @@
   async function moveFileToTrash(name, folderId) {
     await confirmThen("Mover arquivo para a lixeira?", '<p><strong>' + esc(name) + '</strong> poderá ser restaurado pela lixeira.</p>', async () => {
       try {
-        await api.get(api.query("/delete/" + encodeURIComponent(name), { folderId }));
+        await api.post(api.query("/delete/" + encodeURIComponent(name), { folderId }), {});
         ui.toast("Arquivo movido para a lixeira.", "success");
         await loadFiles();
       } catch (error) { reportError(error); }

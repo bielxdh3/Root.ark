@@ -43,11 +43,16 @@ function registerAuditRoutes(app, context) {
     });
   });
 
-  app.get("/audit/export", authenticate, requireAuditAccess, (req, res) => {
+  app.get("/audit/export", authenticate, requireAuditAccess, (_req, res) => {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ error: "Use POST to export audit logs." });
+  });
+
+  app.post("/audit/export", authenticate, requireAuditAccess, (req, res) => {
     const format = String(req.query.format || "json").toLowerCase();
     const logs = getFilteredAuditLogs(req.query);
 
-    auditLog("system.config.changed", getAuditActor(req), { type: "audit", id: "export" }, "exported", "success", {
+    auditLog("audit.exported", getAuditActor(req), { type: "audit", id: "export" }, "exported", "success", {
       format,
       count: logs.length,
     });

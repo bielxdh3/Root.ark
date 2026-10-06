@@ -83,8 +83,8 @@
     return suffix ? path + (path.includes("?") ? "&" : "?") + suffix : path;
   }
 
-  function download(path, filename) {
-    return request(path, { responseType: "blob" }).then((blob) => {
+  function download(path, filename, options) {
+    return request(path, Object.assign({}, options, { responseType: "blob" })).then((blob) => {
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;

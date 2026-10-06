@@ -196,6 +196,19 @@ test("service worker caches only the public shell and bypasses protected paths",
     },
     fetch: async () => ({ ok: true, clone: () => ({}) }),
   };
+  assert.match(source, /const CACHE_NAME = "rootark-public-shell-v18";/, "security client changes advance the public shell cache revision");
+  const pageAssets = {
+    "index.html": ["rootark-api.js", "rootark-workspace.js"],
+    "admin.html": ["rootark-api.js", "rootark-management.js"],
+    "audit.html": ["rootark-api.js", "rootark-management.js"],
+    "backups.html": ["rootark-api.js", "rootark-management.js"],
+    "dashboard.html": ["rootark-api.js", "rootark-management.js"],
+    "login.html": ["rootark-api.js"],
+  };
+  for (const [page, scripts] of Object.entries(pageAssets)) {
+    const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
+    for (const script of scripts) assert.match(html, new RegExp(`/client/${script.replaceAll(".", "\\.")}\\?v=17`), `${page} refreshes ${script}`);
+  }
   vm.runInNewContext(source, context);
   let installWait;
   handlers.install({ waitUntil: (promise) => { installWait = promise; } });
