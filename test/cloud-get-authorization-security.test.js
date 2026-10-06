@@ -81,7 +81,7 @@ function request(port, requestPath, { method = "GET", headers = {}, body = "" } 
   });
 }
 
-function startS3Fixture() {
+function startS3Fixture(objects = OBJECTS) {
   const getObjects = [];
   const getRequests = [];
   const listRequests = [];
@@ -107,13 +107,13 @@ function startS3Fixture() {
         return res.end("<Error><Code>ServiceUnavailable</Code></Error>");
       }
       const prefix = url.searchParams.get("prefix") || "";
-      const matches = Array.from(OBJECTS.keys()).filter((objectKey) => objectKey.startsWith(prefix));
-      const contents = matches.map((objectKey) => `<Contents><Key>${objectKey}</Key><LastModified>2026-10-05T00:00:00.000Z</LastModified><ETag>&quot;fixture&quot;</ETag><Size>${OBJECTS.get(objectKey).length}</Size></Contents>`).join("");
+      const matches = Array.from(objects.keys()).filter((objectKey) => objectKey.startsWith(prefix));
+      const contents = matches.map((objectKey) => `<Contents><Key>${objectKey}</Key><LastModified>2026-10-05T00:00:00.000Z</LastModified><ETag>&quot;fixture&quot;</ETag><Size>${objects.get(objectKey).length}</Size></Contents>`).join("");
       res.writeHead(200, { "content-type": "application/xml" });
       return res.end(`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>fixture-bucket</Name><Prefix></Prefix><KeyCount>${matches.length}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>${contents}</ListBucketResult>`);
     }
     if (req.method === "GET") getRequests.push(key);
-    if (req.method === "GET" && OBJECTS.has(key)) {
+    if (req.method === "GET" && objects.has(key)) {
       getObjects.push(key);
       if (getBarrier?.keys.has(key)) {
         getBarrier.seen.add(key);
@@ -124,8 +124,8 @@ function startS3Fixture() {
           getBarrier.waiters.set(key, waiters);
         });
       }
-      res.writeHead(200, { "content-length": OBJECTS.get(key).length });
-      return res.end(OBJECTS.get(key));
+      res.writeHead(200, { "content-length": objects.get(key).length });
+      return res.end(objects.get(key));
     }
     if (req.method === "PUT") {
       putCount += 1;
@@ -157,7 +157,7 @@ function startS3Fixture() {
             putBarrier.waiters.set(key, waiters);
           });
         }
-        if (!shouldFail || commitPutOnFailure) OBJECTS.set(key, body);
+        if (!shouldFail || commitPutOnFailure) objects.set(key, body);
         if (shouldFail) {
           res.writeHead(503, { "content-type": "application/xml" });
           return res.end("<Error><Code>ServiceUnavailable</Code></Error>");
@@ -177,7 +177,7 @@ function startS3Fixture() {
           res.writeHead(503, { "content-type": "application/xml" });
           return res.end("<Error><Code>ServiceUnavailable</Code></Error>");
         }
-        OBJECTS.delete(key);
+        objects.delete(key);
         res.writeHead(204);
         return res.end();
       } finally {
@@ -426,8 +426,8 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   delete env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS;
   delete env.ROOTARK_BOOTSTRAP_USERS_FROM_SEED;
   delete env.TRUSTED_PROXIES;
-  const startChild = (childPort = port, extraEnv = {}) => {
-    const child = spawn(process.execPath, [SERVER], { cwd: directory, env: { ...env, PORT: String(childPort), ...extraEnv }, stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+  const startChild = (childPort = port, extraEnv = {}, childCwd = directory) => {
+    const child = spawn(process.execPath, [SERVER], { cwd: childCwd, env: { ...env, PORT: String(childPort), ...extraEnv }, stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
     child.startupLogs = "";
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => { child.startupLogs += chunk; });
@@ -435,10 +435,16 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   };
   let child = startChild();
   let secondChild = null;
+  let rateLimitChild = null;
+  let rateLimitCloud = null;
+  let rateLimitDirectory = null;
   t.after(async () => {
+    await stop(rateLimitChild);
     await stop(secondChild);
     await stop(child);
+    if (rateLimitCloud) await new Promise((resolve) => rateLimitCloud.server.close(resolve));
     await new Promise((resolve) => cloud.server.close(resolve));
+    if (rateLimitDirectory) fs.rmSync(rateLimitDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   assert.equal((await waitForServer(port, child)).status, 200);
@@ -455,6 +461,69 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const otherCookies = otherLogin.headers["set-cookie"].map((value) => value.split(";", 1)[0]);
   const otherCookie = otherCookies.join("; ");
   const otherCsrf = otherCookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1];
+  rateLimitDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-rate-limit-isolated-"));
+  const rateLimitDataDir = path.join(rateLimitDirectory, "data");
+  fs.mkdirSync(rateLimitDataDir, { recursive: true });
+  fs.mkdirSync(path.join(rateLimitDirectory, "temp"), { recursive: true });
+  fs.mkdirSync(path.join(rateLimitDirectory, "uploads"), { recursive: true });
+  fs.symlinkSync(PUBLIC, path.join(rateLimitDirectory, "public"), "junction");
+  const rateLimitPassword = crypto.randomBytes(24).toString("base64url");
+  fs.writeFileSync(path.join(rateLimitDataDir, "users.local.json"), JSON.stringify([
+    { username: "viewer", password: bcrypt.hashSync(rateLimitPassword, 10), role: "user", permissions: { listFiles: true, upload: true, delete: true }, sessionVersion: 0 },
+  ]));
+  fs.writeFileSync(path.join(rateLimitDataDir, "folders.json"), JSON.stringify([
+    { id: "root", name: "Arquivos", createdBy: "sistema", allowedUsers: [], isRoot: true },
+    { id: "destination", name: "Destino", createdBy: "viewer", allowedUsers: [] },
+  ]));
+  fs.writeFileSync(path.join(rateLimitDataDir, "file-permissions.json"), JSON.stringify({
+    "root/rename-me.txt": { public: false, owner: "viewer", users: {} },
+    "root/move-me.txt": { public: false, owner: "viewer", users: {} },
+  }));
+  const rateLimitObjects = new Map([
+    ["rootark/uploads/root/rename-me.txt", Buffer.from("isolated rename fixture")],
+    ["rootark/uploads/root/move-me.txt", Buffer.from("isolated move fixture")],
+  ]);
+  rateLimitCloud = await startS3Fixture(rateLimitObjects);
+  const rateLimitPort = await getUnusedPort();
+  rateLimitChild = startChild(rateLimitPort, {
+    ROUTE_RATE_LIMIT_MAX: "1",
+    AWS_ENDPOINT_URL: `http://127.0.0.1:${rateLimitCloud.port}`,
+    JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+    NODE_OPTIONS: "",
+  }, rateLimitDirectory);
+  assert.equal((await waitForServer(rateLimitPort, rateLimitChild)).status, 200);
+  const limitedLoginBody = JSON.stringify({ username: "viewer", password: rateLimitPassword });
+  const limitedLogin = await request(rateLimitPort, "/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json", "content-length": Buffer.byteLength(limitedLoginBody) },
+    body: limitedLoginBody,
+  });
+  assert.equal(limitedLogin.status, 200, limitedLogin.body);
+  const limitedCookies = limitedLogin.headers["set-cookie"].map((value) => value.split(";", 1)[0]);
+  const limitedCookie = limitedCookies.join("; ");
+  const limitedCsrf = limitedCookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1];
+  const limitedMutate = (requestPath, payload) => {
+    const body = JSON.stringify(payload);
+    return request(rateLimitPort, requestPath, {
+      method: "PUT",
+      headers: { cookie: limitedCookie, origin: `http://127.0.0.1:${rateLimitPort}`, "x-csrf-token": limitedCsrf, "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+      body,
+    });
+  };
+  const rateLimitListingProbe = await request(rateLimitPort, "/list", { headers: { cookie: limitedCookie } });
+  assert.equal(rateLimitListingProbe.status, 200, rateLimitListingProbe.body);
+  assert.equal(rateLimitCloud.listRequests.length, 1, "isolated route-limit server uses its own fake provider");
+  rateLimitCloud.listRequests.length = 0;
+  assert.equal((await limitedMutate("/rename", { oldName: "", newName: "" })).status, 400);
+  const listsBeforeLimitedRename = rateLimitCloud.listRequests.length;
+  const limitedRename = await limitedMutate("/rename", { oldName: "rename-me.txt", newName: "limited-rename.txt" });
+  assert.equal(limitedRename.status, 429, limitedRename.body);
+  assert.equal(rateLimitCloud.listRequests.length, listsBeforeLimitedRename, "route limiter rejects rename before fake S3 listing");
+  assert.equal((await limitedMutate("/move", { name: "", fromFolderId: "root", toFolderId: "destination" })).status, 400);
+  const listsBeforeLimitedMove = rateLimitCloud.listRequests.length;
+  const limitedMove = await limitedMutate("/move", { name: "move-me.txt", fromFolderId: "root", toFolderId: "destination" });
+  assert.equal(limitedMove.status, 429, limitedMove.body);
+  assert.equal(rateLimitCloud.listRequests.length, listsBeforeLimitedMove, "route limiter rejects move before fake S3 listing");
   const mutate = (requestPath, method, payload) => {
     const body = JSON.stringify(payload);
     return request(port, requestPath, {

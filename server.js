@@ -45,6 +45,7 @@ const { createRestoreRequestGate } = require("./services/restoreRequestGate");
 const trashRepository = require("./repositories/trashRepository");
 const trashService = require("./services/trashService");
 const { createCloudStorage } = require("./services/cloudStorage");
+const { readBoundedRegularFile } = require("./services/internalFile");
 const { resolveRuntimePath } = require("./src/runtime-paths");
 const registerAuthRoutes = require("./src/routes/auth");
 const registerAnalyticsRoutes = require("./src/routes/analytics");
@@ -4922,6 +4923,8 @@ const fileTemporaryRateLimit = createRouteRateLimit();
 const fileListRateLimit = createRouteRateLimit();
 const fileSearchRateLimit = createRouteRateLimit();
 const webDavPropfindRateLimit = createRouteRateLimit();
+const renameRateLimit = createRouteRateLimit();
+const moveRateLimit = createRouteRateLimit();
 const restoreRequestGate = createRestoreRequestGate({
   directory: RESTORE_ACTIVE_REQUESTS_DIR,
   isBlocked: restoreService.isWholeRestoreBlocked,
@@ -7173,8 +7176,9 @@ function claimCloudRelocationMutationLock(now = Date.now()) {
   } catch (error) {
     if (error.code !== "EEXIST") return null;
     try {
-      const existingStat = fs.statSync(lockPath);
-      const existing = fs.readFileSync(lockPath, "utf8");
+      const existingRead = readBoundedRegularFile(lockPath, 64 * 1024);
+      const existingStat = existingRead.stat;
+      const existing = existingRead.contents.toString("utf8");
       const record = (() => { try { return JSON.parse(existing); } catch { return null; } })();
       if (!validWebDavMoveClaimRecord(record, transactionId) || webDavMoveOwnerIsLive(record)) return null;
       const takeover = takeoverWebDavMoveClaim(lockPath, transactionId, record.token, webDavMoveClaimObservation(existing, existingStat), now);
@@ -7254,9 +7258,7 @@ function getCloudRelocationCleanupReservationState(folderId, fileName) {
     for (const name of journalNames.filter((entry) => /^rootark-cloud-relocation-cleanup-[a-f0-9-]{36}\.json$/i.test(entry))) {
       const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, name);
       try {
-        const stat = fs.statSync(journalPath);
-        if (!stat.isFile() || stat.size > 1024 * 1024) return "unavailable";
-        const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+        const journal = JSON.parse(readBoundedRegularFile(journalPath, 1024 * 1024).contents.toString("utf8"));
         if (!isSafeCloudRelocationCleanupJournal(journal)) return "unavailable";
         if (journal.items.some((item) => item.folderId === cleanFolderId && item.fileName === cleanFileName && item.area === "uploads")) return "reserved";
         const operation = journal.operation;
@@ -7273,9 +7275,7 @@ function getCloudRelocationCleanupReservationState(folderId, fileName) {
     for (const name of journalNames.filter((entry) => /^rootark-webdav-move-[a-f0-9-]{36}\.json$/i.test(entry))) {
       const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, name);
       try {
-        const stat = fs.statSync(journalPath);
-        if (!stat.isFile() || stat.size > 1024 * 1024) return "unavailable";
-        const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+        const journal = JSON.parse(readBoundedRegularFile(journalPath, 1024 * 1024).contents.toString("utf8"));
         if (!isSafeWebDavMoveJournal(journal)) return "unavailable";
         if (journal.cloud?.folderId === cleanFolderId &&
             [...(journal.cloud.sourceNames || [journal.cloud.sourceName]), ...(journal.cloud.destinationNames || [journal.cloud.destinationName])].includes(cleanFileName)) return "reserved";
@@ -7298,9 +7298,7 @@ function isCloudRelocationDestinationForTransaction(transactionId, folderId, fil
   if (!/^[a-f0-9-]{36}$/i.test(String(transactionId || ""))) return false;
   try {
     const journalPath = cloudRelocationCleanupJournalPath(transactionId);
-    const stat = fs.statSync(journalPath);
-    if (!stat.isFile() || stat.size > 1024 * 1024) return false;
-    const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+    const journal = JSON.parse(readBoundedRegularFile(journalPath, 1024 * 1024).contents.toString("utf8"));
     return isSafeCloudRelocationCleanupJournal(journal) && journal.operation?.phase === "prepared" &&
       journal.operation.destinationCopies.some((item) => item.folderId === String(folderId || "") && item.fileName === String(fileName || ""));
   } catch {
@@ -7312,9 +7310,7 @@ function isWebDavMoveDestinationForTransaction(transactionId, folderId, fileName
   if (!/^[a-f0-9-]{36}$/i.test(String(transactionId || ""))) return false;
   try {
     const journalPath = path.resolve(WEBDAV_MOVE_JOURNAL_DIR, `rootark-webdav-move-${transactionId}.json`);
-    const stat = fs.statSync(journalPath);
-    if (!stat.isFile() || stat.size > 1024 * 1024) return false;
-    const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+    const journal = JSON.parse(readBoundedRegularFile(journalPath, 1024 * 1024).contents.toString("utf8"));
     return isSafeWebDavMoveJournal(journal) && journal.cloud?.folderId === String(folderId || "") &&
       (journal.cloud.destinationNames || [journal.cloud.destinationName]).includes(String(fileName || ""));
   } catch {
@@ -7341,8 +7337,9 @@ function claimCloudRelocationCleanupJournal(journal, now = Date.now()) {
   } catch (error) {
     if (error.code !== "EEXIST") return null;
     try {
-      const existingStat = fs.statSync(lockPath);
-      const existing = fs.readFileSync(lockPath, "utf8");
+      const existingRead = readBoundedRegularFile(lockPath, 64 * 1024);
+      const existingStat = existingRead.stat;
+      const existing = existingRead.contents.toString("utf8");
       const record = (() => { try { return JSON.parse(existing); } catch { return null; } })();
       if (!validWebDavMoveClaimRecord(record, journal.transactionId) || webDavMoveOwnerIsLive(record)) return null;
       const takeover = takeoverWebDavMoveClaim(lockPath, journal.transactionId, record.token, webDavMoveClaimObservation(existing, existingStat), now);
@@ -7614,9 +7611,7 @@ function findCloudRelocationCleanupJournal(folderId, fileName) {
   for (const name of names.filter((entry) => /^rootark-cloud-relocation-cleanup-[a-f0-9-]{36}\.json$/i.test(entry))) {
     try {
       const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, name);
-      const stat = fs.statSync(journalPath);
-      if (!stat.isFile() || stat.size > 1024 * 1024) return null;
-      const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+      const journal = JSON.parse(readBoundedRegularFile(journalPath, 1024 * 1024).contents.toString("utf8"));
       if (!isSafeCloudRelocationCleanupJournal(journal)) return null;
       if (journal.items.some((item) => item.folderId === folderId && item.fileName === fileName && item.area === "uploads")) return true;
     } catch {
@@ -8033,12 +8028,16 @@ function takeoverWebDavMoveClaim(lockPath, transactionId, previousToken, observe
     writeWebDavMoveFileAtomically(webDavMoveTakeoverMeta(lockPath), JSON.stringify(authority));
     let currentStat;
     let currentContents;
-    try { currentStat = fs.statSync(lockPath); currentContents = fs.readFileSync(lockPath, "utf8"); } catch (error) { if (error.code === "ENOENT") return null; throw error; }
+    try {
+      const currentRead = readBoundedRegularFile(lockPath, 64 * 1024);
+      currentStat = currentRead.stat;
+      currentContents = currentRead.contents.toString("utf8");
+    } catch (error) { if (error.code === "ENOENT") return null; throw error; }
     if (currentContents !== observed.contents || !webDavMoveSameStatIdentity(webDavMoveFileStatIdentity(currentStat), webDavMoveFileStatIdentity(observed.stat)) || webDavMoveClaimToken(currentContents) !== previousToken) { webDavMoveRemoveTakeoverAuthority(lockPath, transactionId, ownerToken); return null; }
     fs.renameSync(lockPath, webDavMoveTakeoverEvidence(lockPath));
     if (!webDavMoveEvidenceMatchesAuthority(lockPath, authority)) throw new Error("WebDAV claim evidence changed during takeover");
     writeWebDavMoveClaimLock(lockPath, webDavMoveClaimRecord(ownerToken, transactionId, now));
-    if (webDavMoveClaimToken(fs.readFileSync(lockPath, "utf8")) !== ownerToken) throw new Error("WebDAV replacement claim was not confirmed");
+    if (webDavMoveClaimToken(readBoundedRegularFile(lockPath, 64 * 1024).contents.toString("utf8")) !== ownerToken) throw new Error("WebDAV replacement claim was not confirmed");
     webDavMoveRemoveTakeoverAuthority(lockPath, transactionId, ownerToken);
     return ownerToken;
   } catch (error) {
@@ -8069,11 +8068,12 @@ function claimWebDavMoveJournal(journal, now = Date.now(), workerId = crypto.ran
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
     try {
-      const existingStat = fs.statSync(lockPath);
-      const existing = fs.readFileSync(lockPath, "utf8");
+      const existingRead = readBoundedRegularFile(lockPath, 64 * 1024);
+      const existingStat = existingRead.stat;
+      const existing = existingRead.contents.toString("utf8");
       const existingRecord = (() => { try { return JSON.parse(existing); } catch { return null; } })();
       if (!validWebDavMoveClaimRecord(existingRecord, journal.transactionId) || webDavMoveOwnerIsLive(existingRecord)) return null;
-      const leaseExpired = existingRecord?.claimedAt ? Date.parse(existingRecord.claimedAt) + WEBDAV_MOVE_RECONCILIATION_LEASE_MS <= now : fs.statSync(lockPath).mtimeMs + WEBDAV_MOVE_RECONCILIATION_LEASE_MS <= now;
+      const leaseExpired = existingRecord?.claimedAt ? Date.parse(existingRecord.claimedAt) + WEBDAV_MOVE_RECONCILIATION_LEASE_MS <= now : existingStat.mtimeMs + WEBDAV_MOVE_RECONCILIATION_LEASE_MS <= now;
       if (!leaseExpired) return null;
       const takeover = takeoverWebDavMoveClaim(lockPath, journal.transactionId, existingRecord.token, webDavMoveClaimObservation(existing, existingStat), now);
       if (!takeover) return null;
@@ -9582,7 +9582,7 @@ app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
   }
 });
 
-app.put("/rename", authenticate, async (req, res) => {
+app.put("/rename", authenticate, renameRateLimit, async (req, res) => {
   const rawOldName = typeof req.body.oldName === "string" ? req.body.oldName.trim() : "";
   const rawNewName = typeof req.body.newName === "string" ? req.body.newName.trim() : "";
   const oldName = path.basename(rawOldName);
@@ -9701,7 +9701,7 @@ app.put("/rename", authenticate, async (req, res) => {
   }
 });
 
-app.put("/move", authenticate, async (req, res) => {
+app.put("/move", authenticate, moveRateLimit, async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const fromFolder = getAccessibleFolderOrRespond(req, res, req.body.fromFolderId);

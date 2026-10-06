@@ -62,6 +62,12 @@ protect journal recovery from a malicious local writer that can modify these
 paths. Deployments that cannot enforce this filesystem boundary must not rely
 on the journal takeover and recovery guarantees.
 
+Journal and claim reads use one bounded file descriptor with `O_NOFOLLOW` where
+the platform supports it, then compare descriptor and path identity. Node does
+not provide portable directory-relative no-follow opens on Windows, so the
+runtime-root ancestors must also remain trusted and non-substitutable while the
+server is running.
+
 These guarantees cover process termination followed by restart and recovery on
 the supported same-host journal filesystem. Journal contents and lock files are
 flushed before use, but atomic file replacement does not explicitly flush the
