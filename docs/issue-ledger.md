@@ -1,8 +1,45 @@
 # Root.ark Issue Ledger
 
-## Live roadmap reconciliation — 2026-10-01
+## Current live snapshot — 2026-10-06
 
-The reconciliation began from `Root/main` at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; after PR #98 merged, the latest verified default-branch head is `1df5e4640d4aea7dc700f2088059f489c2e51af0`. The current-state addendum below records the subsequent PR status updates; dated phase reports remain historical.
+GitHub was queried after PR #109 merged, with `Root/main` at `1955eab3d05f72632396eff62ef96d39eedd634b`. This is the evidence baseline for this documentation-only reconciliation, not the commit produced by publishing it. Older dated sections below are retained as historical evidence and are superseded where they conflict with this snapshot. PR #99 carries this update and does not change feature-issue state.
+
+### Current open issues and pull requests
+
+| Item | Live state | Remaining acceptance boundary |
+|---|---|---|
+| #63 | `open` | Protected-index primitives do not complete search: UI population, FTS/advanced search, encrypted-index lifecycle, metadata-leakage acceptance, and full search acceptance remain open. |
+| #64 | `open` | Architecture and threat-model material exists; there is no functioning native Android client or Android CI. |
+| #65 | `open` | The runtime is not end-to-end Zero-Knowledge; supported server paths can access plaintext. Upload, preview, scanning, sync/WebDAV, backup/restore, sharing, migration, recovery, authorization, and key lifecycle require full runtime acceptance. |
+| #66 / PR #97 | `open` / `open` | PR #97 is partial. The remote catalog still transfers complete records before filtering; metadata-only listing, pagination, native Files On-Demand integration, safe eviction around external open-handle writers, and restart/reconnect acceptance remain incomplete. |
+| #67 | `open` | Backups and revision history do not provide burst detection, a pause/review barrier, protected history, recovery authorization, or deterministic recovery UX. |
+| #68 | `open` | Existing bearer links are not operation-scoped capabilities; least-privilege enforcement and recipient-key delivery remain incomplete. |
+| #94 / PR #95 | `open` / `open` | Exact PR-head checks pass, but production replica topology is unverified. The process-local limiter does not establish shared/edge enforcement for multi-process deployments. |
+| PR #95 | `open` at `95d99e4a934384fcfa2101dfc210741cd791a3d1` | CodeQL, Analyze, dependency review, Ubuntu, and Windows checks passed on that head. Its base is stale and GitHub reports a dirty merge state; update and revalidate before merge. |
+| PR #97 | `open` at `a6a33a92cd6902f303254e60031da4bdc04cec04` | Exact-head checks passed. Its base is stale; keep open until the selective-sync acceptance gaps above are closed and the updated head is reviewed and validated. |
+| PR #102 | `open` at `dc219c14e6ace0e83b1ff46511395899ec59ba4e` | Authorization-before-hydration is directionally sound, but this branch predates PR #109, is stale, and its exact-head CodeQL run failed with 92 alerts (reported as 88 high and 4 medium; three annotations were in unchanged files and the remaining alerts were not all individually validated). PR #109 adds list/search metadata rate limits to current `Root/main`; PR #102 still requires current-base validation and triage of changed-code alerts before merge. |
+| Dependabot alert `GHSA-hp3w-g68c-fv3c` | `open`, moderate | `sprintf-js` is reported through `argparse@1.0.10`; GitHub currently reports no first patched version. Do not describe dependency risk as entirely clear until an upstream fix or reachability-based disposition is recorded. |
+
+### Merged correction PRs
+
+| PR | Merge commit |
+|---|---|
+| #100 | `71a53ce36757a3958ab3bbea2f527a1f3cd96ae3` |
+| #101 | `5c86bd2a9844fdf21921f08cf2bf9d9a7253d652` |
+| #103 | `f85cb389f3152191d612fb36b1ad97bde89ba99a` |
+| #104 | `5ee044b628ed55f34e007e7d16c9c57e38a4ae27` |
+| #105 | `9b4019427f2864257677caa420c07043c7ef6437` |
+| #106 | `88404142edb9a5e9612e78b92706a6770eca4793` |
+| #107 | `4bd7d46675001538663e49337d237f63fb8cf826` |
+| #108 | `e7ac1c5ed9957478ddeb597fb41f9936a1a3af73` |
+| #110 | `7bc9e81a1496041b3d75c5bd3cd359a603c6f6a8` |
+| #109 | `1955eab3d05f72632396eff62ef96d39eedd634b` |
+
+The `Root/main` SHA above is a dated snapshot. Check live GitHub for later merges, check runs, and issue state; this ledger does not replace exact-final-SHA release validation.
+
+## Historical live roadmap snapshot — 2026-10-01
+
+The reconciliation began from `Root/main` at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; after PR #98 merged, the latest verified default-branch head was `1df5e4640d4aea7dc700f2088059f489c2e51af0`. The dated PR status addenda below preserve the evidence available then; they are not the current live state.
 
 | Item | Live state | Evidence / boundary |
 |---|---|---|
@@ -18,7 +55,7 @@ The reconciliation began from `Root/main` at `d2ae0eb1c2fc87c1131a73c2a324c695b7
 | PR #97 | `open; selective-sync implementation is partial` | Exact head `a6a33a92cd6902f303254e60031da4bdc04cec04`. The branch reconciles moves outside selected paths while preserving dirty/untracked files and conflicts. Exact-head CodeQL, Analyze JavaScript / TypeScript, dependency review, and Ubuntu/Windows CI pass; focused suite passes 31 tests with one platform skip; targeted independent move-out review found no actionable issues. The list API still transfers complete remote records including ciphertext before filtering; metadata-only listing, pagination, a Files On-Demand provider/UI, and portable open-handle quiescence for eviction are missing. |
 | PR #98 | `merged` | Documentation/contract reconciliation merged into `Root/main` at `1df5e4640d4aea7dc700f2088059f489c2e51af0`. It did not close issues #63–68 or #94. |
 
-### PR work after the live baseline — 2026-10-01
+### Historical PR work after the live baseline — 2026-10-01
 
 PR #97 remains open and unmerged; its exact-head CodeQL, dependency-review, Linux/Windows CI, and targeted move-out review passed. PR #98 merged the previous documentation reconciliation at `1df5e4640d4aea7dc700f2088059f489c2e51af0`; this update adds later PR status evidence and did not close any issue. This section records implementation boundaries, not issue completion. Issue #64 has architecture/threat-model documentation only. Issue #65 has a fixture-only, read-only migration-inventory prototype and contract, but no live-data inventory or runtime migration. Issue #66 has a selective-sync implementation in PR #97; its current list API transfers full remote records including ciphertext before local filtering, so network payload transfer is not selective. Windows Files On-Demand UI/provider integration, a metadata-only catalog, and paginated remote listing are absent. Safe eviction under concurrent open-handle writes remains unresolved. Issues #67–68 have design/acceptance contracts only; conservative recommendations are documented, while owner-dependent UX and policy choices remain unapproved. Issue #94 / PR #95 passes exact-head checks but remains open until production replica topology is confirmed or distributed enforcement is added.
 

@@ -1,19 +1,19 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Last branch reconciliation: 2026-10-01
+Last branch reconciliation: 2026-10-06
 
 Repository: `bielxdh3/root.ark`
 
-Current default branch verified: `Root/main` (GitHub repository settings; live branch checked 2026-10-01).
+Current-state source: the live issue/PR snapshot in [docs/issue-ledger.md](issue-ledger.md). The dated GitHub sections below remain historical evidence unless a newer section explicitly supersedes them.
 
-Current canonical baseline HEAD verified at reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`, 2026-10-01). This is the evidence baseline for the dated live-state section below, not a claim about a later merge commit.
+Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
 Historical reconstruction baseline retained for provenance: `4062f4c67bfda9d144aceb6dbbed539b8a917e4a` (2026-07-25).
 
-## Live GitHub reconciliation — 2026-10-01
+## Historical live GitHub reconciliation — 2026-10-01
 
-This dated section supersedes older statements about the current branch, issue closure, and open PR state. Historical phase reports below retain their original dates and evidence boundaries.
+This dated section superseded older statements at the time it was written. Its issue, branch, and PR states are historical; use the current snapshot linked above for live state. Historical phase reports below retain their original dates and evidence boundaries.
 
 - The live default branch was `Root/main` at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`. At that snapshot GitHub had seven open issues (#63–68 and #94) and one open PR (#95).
 - Issue #83 is closed. Its sensitive-name policy remains active: `.env`, credential/service-account names, and private-key/certificate extensions remain excluded from backup content and quarantine payload references. PRs #86 and #90 contain its completion evidence.
@@ -26,7 +26,7 @@ This dated section supersedes older statements about the current branch, issue c
 - Issue #67 is approved but not complete: existing backups and sync revisions are recovery prerequisites, not a ransomware shield. Burst detection, a recoverable pause/review barrier, protected per-object recovery history, and authorized restore are absent.
 - Issue #68 is approved but not complete: existing public links are single-file bearer links with expiry/limits, not operation-scoped capabilities. Protected-link delivery remains gated on least-privilege capability enforcement and owner choices for link UX, expiry, and recipient recovery.
 
-## Reconciliation work after the live baseline — 2026-10-01
+## Historical reconciliation work after the live baseline — 2026-10-01
 
 This addendum records the published work after the live GitHub baseline above. PR #97 remains open and unmerged; PR #98 was merged into `Root/main` at `1df5e4640d4aea7dc700f2088059f489c2e51af0`. Neither PR changes issue state or marks an issue complete. PR #95 remains open after all exact-head checks passed because production replica topology is still unverified.
 
