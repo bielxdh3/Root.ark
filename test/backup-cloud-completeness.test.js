@@ -126,6 +126,34 @@ test("a cloud-only object survives SQLite backup and restore", () => {
   assert.equal(JSON.parse(result.stdout.trim()).ok, true);
 });
 
+test("an incomplete backup does not claim a same-path provider object was archived", () => {
+  const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-incomplete-cloud-restore-"));
+  const servicePath = path.join(__dirname, "..", "services", "backupService");
+  const restorePath = path.join(__dirname, "..", "services", "restoreService");
+  const orphanPolicyPath = path.join(isolated, "data", ".rootark-restore-provider-orphans.json");
+  const script = [
+    `process.chdir(${JSON.stringify(isolated)}); process.env.DB_ENABLED = "false";`,
+    'const assert = require("node:assert/strict"); const fs = require("node:fs");',
+    `const backup = require(${JSON.stringify(servicePath)}); const restore = require(${JSON.stringify(restorePath)});`,
+    'fs.mkdirSync("uploads", { recursive: true }); fs.writeFileSync("uploads/same.txt", "archived local bytes");',
+    'backup.setCloudStorage({ enabled: () => false });',
+    'backup.createBackup({ createdBy: "test" }).then(async (saved) => {',
+    '  let inventoryCalls = 0;',
+    '  const cloud = { enabled: () => true, inventory: async () => ++inventoryCalls === 1 ? [] : [{ provider: "s3", providerIdentity: "uncaptured", area: "uploads", folderId: "root", name: "same.txt" }], download: async (_folder, _name, target) => { fs.writeFileSync(target, "provider bytes not in the backup"); return true; } };',
+    '  backup.setCloudStorage(cloud); restore.setCloudStorage(cloud);',
+    '  const result = await restore.restoreBackup(saved.id, { confirmation: "RESTORE", username: "test" });',
+    '  assert.equal(result.manifest.cloud_complete, false);',
+    `  const policy = JSON.parse(fs.readFileSync(${JSON.stringify(orphanPolicyPath)}, "utf8"));`,
+    '  assert.deepEqual(policy.objects, [{ area: "uploads", folderId: "root", name: "same.txt" }], "provider content absent from an incomplete archive remains suppressed even when its logical path matches");',
+    '  process.stdout.write(JSON.stringify({ ok: true }));',
+    '}).catch((error) => { console.error(error); process.exitCode = 1; });',
+  ].join(" ");
+  const result = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 20_000 });
+  fs.rmSync(isolated, { recursive: true, force: true });
+  assert.equal(result.status, 0, result.stderr || result.stdout || result.error?.message);
+  assert.equal(JSON.parse(result.stdout.trim()).ok, true);
+});
+
 test("cloud backup object matrix", async (t) => {
   const servicePath = path.join(__dirname, "..", "services", "backupService");
   const unzipperPath = path.join(__dirname, "..", "node_modules", "unzipper");

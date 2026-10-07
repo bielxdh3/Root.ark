@@ -515,6 +515,7 @@ function syncEntries(manifest) {
 }
 
 function archivedProviderObjects(manifest) {
+  if (manifest?.cloud_complete !== true) return new Set();
   return new Set((manifest?.included_files || [])
     .map((entry) => String(entry.path || "").replace(/\\/g, "/"))
     .filter((entryPath) => /^(uploads|temp)\//.test(entryPath))
@@ -684,6 +685,7 @@ async function processRestoreSync({ backupId, clock, maxAttempts = 5, uploader, 
         }
         await provider.upload(localPath, entryForUpload.folderId, entryForUpload.name, entryForUpload.area,
           providerIdentity === "gdrive" ? { providerFileId: entryForUpload.providerFileId } : undefined);
+        await restoreProviderOrphans.clear(entryForUpload.folderId, entryForUpload.name, entryForUpload.area);
         return true;
       };
       const runMutation = typeof runFileLifecycleMutation === "function"
@@ -1767,7 +1769,7 @@ async function restoreBackup(id, options = {}) {
         .filter((entry) => ["uploads", "temp"].includes(entry.area) && !archivedObjects.has(`${entry.area}\0${entry.folderId}\0${entry.name}`))
         .map(({ area, folderId, name }) => ({ area, folderId, name })));
     }
-    const cloudSync = cloudStorage?.enabled() && manifest.cloud_complete
+    const cloudSync = cloudStorage?.enabled() && syncEntries(manifest).length > 0
       ? createRestoreSync(manifest)
       : { state: "not_required" };
     const providerReconciliation = cloudSync.state === "pending"
@@ -1812,7 +1814,7 @@ async function restoreBackup(id, options = {}) {
     if (restoredDatabase) injectFailure("restore.sqlite.committed");
     if (providerOrphans !== null) {
       injectFailure("restore.provider-orphans.before-persist");
-      restoreProviderOrphans.write(providerOrphans);
+      await restoreProviderOrphans.write(providerOrphans);
       injectFailure("restore.provider-orphans.persisted");
     }
     const restoredBackup = coordinator.selectedBackup;

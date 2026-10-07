@@ -38,17 +38,19 @@ test("restore provider orphan identities follow host path case rules for areas, 
         { area: "uploads", folderId: "rootfolder", name: "case-orphan.txt" },
       ]);
       assert.equal(normalized.length, windows ? 1 : 2);
-      policy.write([{ area: "uploads", folderId: "RootFolder", name: "Case-Orphan.TXT" }]);
-      assert.equal(policy.isSuppressed("rootfolder", "case-orphan.txt", "uploads"), windows);
-      assert.equal(policy.isSuppressed("RootFolder", "Case-Orphan.TXT", "temp"), false, "area remains part of the identity");
-      if (windows) {
-        assert.equal(policy.clear("rootfolder", "case-orphan.txt", "uploads"), true);
-        assert.equal(policy.read().length, 0, "clear uses the same case-insensitive path identity");
-      } else {
-        assert.equal(policy.clear("rootfolder", "case-orphan.txt", "uploads"), false);
-        assert.equal(policy.read().length, 1, "Linux keeps path identity case-sensitive");
-      }
-      process.stdout.write(JSON.stringify({ ok: true, platform: process.platform, normalized: normalized.length }));
+      (async () => {
+        await policy.write([{ area: "uploads", folderId: "RootFolder", name: "Case-Orphan.TXT" }]);
+        assert.equal(policy.isSuppressed("rootfolder", "case-orphan.txt", "uploads"), windows);
+        assert.equal(policy.isSuppressed("RootFolder", "Case-Orphan.TXT", "temp"), false, "area remains part of the identity");
+        if (windows) {
+          assert.equal(await policy.clear("rootfolder", "case-orphan.txt", "uploads"), true);
+          assert.equal(policy.read().length, 0, "clear uses the same case-insensitive path identity");
+        } else {
+          assert.equal(await policy.clear("rootfolder", "case-orphan.txt", "uploads"), false);
+          assert.equal(policy.read().length, 1, "Linux keeps path identity case-sensitive");
+        }
+        process.stdout.write(JSON.stringify({ ok: true, platform: process.platform, normalized: normalized.length }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
     `;
     const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -90,7 +92,9 @@ test("separate processes clearing different restore orphans do not lose either u
       return value;
     };
     const fileName = id === "a" ? "first.txt" : "second.txt";
-    if (!policy.clear("folder", fileName)) throw new Error("expected suppression entry to be cleared");
+    (async () => {
+      if (!await policy.clear("folder", fileName)) throw new Error("expected suppression entry to be cleared");
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
   `;
   fs.mkdirSync(path.dirname(policyPath), { recursive: true });
   fs.writeFileSync(policyPath, `${JSON.stringify({ version: 1, objects: [
@@ -125,5 +129,50 @@ test("separate processes clearing different restore orphans do not lose either u
     for (const processRef of [first.child, second?.child]) {
       if (processRef && processRef.exitCode === null) processRef.kill();
     }
+  }
+});
+
+test("waiting for the provider-orphan policy lock lets the event loop release it", () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-yield-"));
+  try {
+    const backupRepositoryPath = path.resolve(__dirname, "../repositories/backupRepository.js");
+    const script = `
+      const assert = require("node:assert/strict");
+      const policy = require(${JSON.stringify(servicePath)});
+      const backupRepository = require(${JSON.stringify(backupRepositoryPath)});
+      (async () => {
+        const holder = backupRepository.acquireJsonMutationLock("test-policy-holder");
+        let releasedByTimer = false;
+        setTimeout(() => { releasedByTimer = true; holder.release(); }, 30);
+        await policy.write([{ area: "uploads", folderId: "folder", name: "timer.txt" }]);
+        assert.equal(releasedByTimer, true, "policy acquisition must yield so the timer can release the held lock");
+        assert.equal(policy.isSuppressed("folder", "timer.txt"), true);
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8", timeout: 1500 });
+    assert.equal(result.status, 0, result.stderr || result.stdout || result.error?.message);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("suppress restores a cleared orphan identity idempotently under the policy lock", async () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-suppress-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const policy = require(${JSON.stringify(servicePath)});
+      (async () => {
+        await policy.write([]);
+        await policy.suppress("folder", "replacement.txt", "temp");
+        await policy.suppress("folder", "replacement.txt", "temp");
+        assert.equal(policy.isSuppressed("folder", "replacement.txt", "temp"), true);
+        assert.deepEqual(policy.read(), [{ area: "temp", folderId: "folder", name: "replacement.txt" }]);
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
   }
 });

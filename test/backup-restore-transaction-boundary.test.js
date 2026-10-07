@@ -1481,6 +1481,60 @@ test("restore suppresses provider objects absent from the selected backup and ke
   `);
 });
 
+test("incomplete cloud backups reconcile same-name provider objects before clearing their restore suppression", () => {
+  runFixture(`
+    const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+    const uploadPath = path.join(uploadsDir, "same-name.txt");
+    let remoteBytes = "stale provider bytes";
+    const cloud = {
+      enabled: () => true,
+      provider: "fixture",
+      inventory: async () => [{ provider: "s3", providerIdentity: "same-name-object", area: "uploads", folderId: "root", name: "same-name.txt" }],
+      download: async (_folderId, _name, target) => { fs.writeFileSync(target, remoteBytes); return true; },
+      upload: async (source, _folderId, _name, area) => {
+        assert.equal(area, "uploads");
+        remoteBytes = fs.readFileSync(source, "utf8");
+        return { provider: "fixture" };
+      },
+    };
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(uploadPath, "selected archive bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      assert.equal(backup.metadata.cloudComplete, false);
+      write(uploadPath, "live bytes before restore");
+      remoteBytes = "live bytes before restore";
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+
+      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.equal(fs.readFileSync(uploadPath, "utf8"), "selected archive bytes");
+      assert.equal(restored.cloudSync.state, "pending", "selected archive objects need durable reconciliation even when the provider inventory was incomplete at backup time");
+      assert.equal(JSON.parse(fs.readFileSync(policyPath, "utf8")).objects.some((entry) => entry.name === "same-name.txt"), true, "the stale provider object stays suppressed until the selected bytes are uploaded");
+
+      restoreService.prepareWholeRestoreStartup();
+      assert.equal(restoreService.acknowledgeWholeRestoreInstance().complete, true);
+      const retryAt = Date.parse("2026-10-07T14:00:00.000Z");
+      await restoreService.processRestoreSync({
+        backupId: backup.id,
+        workerId: "incomplete-backup-worker",
+        clock: () => retryAt,
+        uploader: { enabled: () => true, provider: "fixture", upload: async () => { throw new Error("injected provider outage"); } },
+      });
+      assert.equal(backupService.listBackups().find((entry) => entry.id === backup.id).metadata.restoreSync.entries[0].state, "retry_wait");
+      assert.equal(JSON.parse(fs.readFileSync(policyPath, "utf8")).objects.some((entry) => entry.name === "same-name.txt"), true, "a provider outage must not reveal stale bytes");
+
+      await restoreService.processRestoreSync({ backupId: backup.id, workerId: "incomplete-backup-retry", clock: () => retryAt + 1000, uploader: cloud });
+
+      assert.equal(remoteBytes, "selected archive bytes", "the selected archive is authoritative for the shared provider key");
+      assert.equal(JSON.parse(fs.readFileSync(policyPath, "utf8")).objects.some((entry) => entry.name === "same-name.txt"), false, "successful provider reconciliation releases the suppression");
+      assert.equal(backupService.listBackups().find((entry) => entry.id === backup.id).metadata.restoreSync.state, "completed");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("restore keeps the existing fail-closed behavior for archives containing temp payloads", () => {
   runFixture(`
     const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");

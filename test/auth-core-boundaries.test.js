@@ -31,6 +31,11 @@ test("JWT claim boundary accepts only current HS256 session identities", async (
 
 test("cookie parsing fails closed on duplicates and bearer remains deliberate precedence", () => {
   assert.equal(parseCookies("rootark_session=a; rootark_session=b").rootark_session, undefined);
+  const unusual = parseCookies("__proto__=hostile; constructor=hostile; rootark_session=valid");
+  assert.equal(Object.getPrototypeOf(unusual), null);
+  assert.equal(unusual.rootark_session, "valid");
+  assert.equal(Object.hasOwn(unusual, "__proto__"), true);
+  assert.equal(Object.hasOwn(unusual, "constructor"), true);
   assert.equal(auth({ authorization: "Bearer token", cookie: "rootark_session=other" }).ok, true);
   assert.equal(auth({ cookie: "rootark_session=a; rootark_session=b" }).code, 401);
 });

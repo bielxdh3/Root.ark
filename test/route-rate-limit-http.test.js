@@ -49,6 +49,7 @@ test("rate limits are passed directly to each protected route handler", () => {
     ["/file-temporary", ['app.put("/file-temporary", fileTemporaryRateLimit,']],
     ["/list", ['app.get("/list", fileListRateLimit, authenticate, requirePermission("listFiles"),']],
     ["/files/search", ['app.get("/files/search", fileSearchRateLimit, authenticate, requirePermission("listFiles"),']],
+    ["/open-file", ['app.get("/open-file/:token/:name", openFileRedemptionRateLimit,']],
   ];
   for (const [mountPath, handlers] of routeMiddleware) {
     assert.equal(source.includes(`app.use("${mountPath}",`), false, `${mountPath} must not use a prefix mount`);
@@ -135,6 +136,7 @@ test("route rate limits enforce separate budgets despite direct-origin X-Forward
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-route-rate-limit-"));
   fs.mkdirSync(path.join(sandbox, "data"), { recursive: true });
   fs.mkdirSync(path.join(sandbox, "uploads"), { recursive: true });
+  fs.writeFileSync(path.join(sandbox, "uploads", "open-file-limit.txt"), "valid open-file token fixture");
   fs.cpSync(path.join(ROOT, "public"), path.join(sandbox, "public"), { recursive: true });
 
   const child = spawn(process.execPath, ["-e", serverBootstrap()], {
@@ -146,9 +148,11 @@ test("route rate limits enforce separate budgets despite direct-origin X-Forward
       CLOUD_STORAGE_PROVIDER: "local",
       NODE_ENV: "test",
       ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true",
+      TOTP_POLICY: "optional",
       JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
       ROUTE_RATE_LIMIT_MAX: "2",
       ROUTE_RATE_LIMIT_WINDOW_MS: "60000",
+      TRUSTED_PROXIES: "",
     },
     stdio: ["ignore", "ignore", "pipe", "ipc"],
     windowsHide: true,
@@ -167,6 +171,32 @@ test("route rate limits enforce separate budgets despite direct-origin X-Forward
 
   const port = await waitForServer(child);
 
+  const loginBody = JSON.stringify({ username: "admin", password: "admin123" });
+  const login = await request(port, "/auth/login", "POST", {
+    "content-type": "application/json",
+    "content-length": String(Buffer.byteLength(loginBody)),
+  }, loginBody);
+  assert.equal(login.status, 200, login.body);
+  const sessionCookie = login.headers["set-cookie"].find((value) => value.startsWith("rootark_session=")).split(";", 1)[0];
+  const csrf = login.headers["set-cookie"].find((value) => value.startsWith("rootark_csrf=")).split(";", 1)[0].split("=", 2)[1];
+  const tokenBody = JSON.stringify({ name: "open-file-limit.txt" });
+  const issued = await request(port, "/file-open-token", "POST", {
+    cookie: `${sessionCookie}; rootark_csrf=${csrf}`,
+    origin: `http://127.0.0.1:${port}`,
+    "x-csrf-token": csrf,
+    "content-type": "application/json",
+    "content-length": String(Buffer.byteLength(tokenBody)),
+  }, tokenBody);
+  assert.equal(issued.status, 200, issued.body);
+  const openUrl = JSON.parse(issued.body).url;
+  const redemptions = await Promise.all([1, 2, 3].map((index) => request(port, openUrl, "GET", {
+    "x-forwarded-for": `198.51.100.${index}`,
+  })));
+  assert.deepEqual(redemptions.map((response) => response.status), [200, 200, 429]);
+  assert.equal(redemptions[0].body, "valid open-file token fixture");
+  assert.equal(redemptions[2].headers["ratelimit-limit"], "2");
+  assert.match(redemptions[2].body, /Muitas solicitações/);
+
   const repairResponses = await Promise.all([1, 2, 3].map((index) => request(port, "/pending/repair", "POST", {
     "x-forwarded-for": `198.51.100.${index}`,
   })));
@@ -181,6 +211,69 @@ test("route rate limits enforce separate budgets despite direct-origin X-Forward
   assert.deepEqual(shareResponses.map((response) => response.status), [404, 404, 429]);
   assert.equal(shareResponses[2].headers["ratelimit-limit"], "2");
   assert.match(shareResponses[2].body, /Muitas solicitações/);
+});
+
+test("open-file redemption rate limits by the client IP behind configured proxy hops", { timeout: 30_000 }, async (t) => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-open-file-proxy-limit-"));
+  fs.mkdirSync(path.join(sandbox, "data"), { recursive: true });
+  fs.mkdirSync(path.join(sandbox, "uploads"), { recursive: true });
+  fs.writeFileSync(path.join(sandbox, "uploads", "proxy-open-file.txt"), "trusted proxy token fixture");
+  fs.cpSync(path.join(ROOT, "public"), path.join(sandbox, "public"), { recursive: true });
+
+  const child = spawn(process.execPath, ["-e", serverBootstrap()], {
+    cwd: sandbox,
+    env: {
+      ...process.env,
+      PORT: "0",
+      DB_ENABLED: "false",
+      CLOUD_STORAGE_PROVIDER: "local",
+      NODE_ENV: "test",
+      ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true",
+      TOTP_POLICY: "optional",
+      JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+      ROUTE_RATE_LIMIT_MAX: "2",
+      ROUTE_RATE_LIMIT_WINDOW_MS: "60000",
+      TRUSTED_PROXIES: "127.0.0.1/32,10.0.0.0/8",
+    },
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+    windowsHide: true,
+  });
+
+  t.after(async () => {
+    if (child.exitCode === null) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 10_000);
+        child.once("exit", () => { clearTimeout(timer); resolve(); });
+        child.kill();
+      });
+    }
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  const port = await waitForServer(child);
+  const loginBody = JSON.stringify({ username: "admin", password: "admin123" });
+  const login = await request(port, "/auth/login", "POST", {
+    "content-type": "application/json",
+    "content-length": String(Buffer.byteLength(loginBody)),
+  }, loginBody);
+  assert.equal(login.status, 200, login.body);
+  const sessionCookie = login.headers["set-cookie"].find((value) => value.startsWith("rootark_session=")).split(";", 1)[0];
+  const csrf = login.headers["set-cookie"].find((value) => value.startsWith("rootark_csrf=")).split(";", 1)[0].split("=", 2)[1];
+  const tokenBody = JSON.stringify({ name: "proxy-open-file.txt" });
+  const issued = await request(port, "/file-open-token", "POST", {
+    cookie: `${sessionCookie}; rootark_csrf=${csrf}`,
+    origin: `http://127.0.0.1:${port}`,
+    "x-csrf-token": csrf,
+    "content-type": "application/json",
+    "content-length": String(Buffer.byteLength(tokenBody)),
+  }, tokenBody);
+  assert.equal(issued.status, 200, issued.body);
+  const openUrl = JSON.parse(issued.body).url;
+  const proxyChain = { "x-forwarded-for": "198.51.100.20, 10.0.0.7" };
+  const redemptions = await Promise.all([1, 2, 3].map(() => request(port, openUrl, "GET", proxyChain)));
+  assert.deepEqual(redemptions.map((response) => response.status), [200, 200, 429]);
+  const otherClient = await request(port, openUrl, "GET", { "x-forwarded-for": "198.51.100.21, 10.0.0.7" });
+  assert.equal(otherClient.status, 200, otherClient.body);
 });
 
 test("cloud-backed list, search, and WebDAV PROPFIND stop before another provider listing at their limits", { timeout: 30_000 }, async (t) => {

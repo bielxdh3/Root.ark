@@ -2,10 +2,11 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 
-function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, upload, remove, isSuppressed = () => false } = {}) {
+function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, upload, remove, isSuppressed = () => false, area = "temp" } = {}) {
   if (!directory || !lifecycleLock?.run || typeof localPathFor !== "function" || typeof upload !== "function" || typeof remove !== "function") {
-    throw new TypeError("Cloud temp mutation queue requires storage, lock, and provider operations");
+    throw new TypeError("Cloud mutation queue requires storage, lock, and provider operations");
   }
+  if (!["temp", "uploads"].includes(area)) throw new TypeError("Invalid cloud mutation area");
   const queueDirectory = path.resolve(directory);
 
   function identity(folderId, fileName) {
@@ -27,7 +28,7 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
       if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Cloud temp queue record is not a regular file");
       const record = JSON.parse(fs.readFileSync(filePath, "utf8"));
       const item = identity(folderId, fileName);
-      if (record?.version !== 1 || record.folderId !== item.folderId || record.fileName !== item.fileName || !["present", "absent"].includes(record.desired) || typeof record.generation !== "string" || !record.generation) {
+      if (record?.version !== 1 || record.folderId !== item.folderId || record.fileName !== item.fileName || (record.area || "temp") !== area || !["present", "absent"].includes(record.desired) || typeof record.generation !== "string" || !record.generation) {
         throw new Error("Cloud temp queue record is invalid");
       }
       return record;
@@ -63,9 +64,27 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
   function setDesired(folderId, fileName, desired) {
     if (!["present", "absent"].includes(desired)) throw new TypeError("Invalid cloud temp desired state");
     const item = identity(folderId, fileName);
-    const record = { version: 1, ...item, desired, generation: crypto.randomUUID(), updatedAt: new Date().toISOString() };
+    const record = { version: 1, ...item, ...(area === "temp" ? {} : { area }), desired, generation: crypto.randomUUID(), updatedAt: new Date().toISOString() };
     write(record);
     return record;
+  }
+
+  function getRecord(folderId, fileName) {
+    return read(folderId, fileName);
+  }
+
+  function restoreRecord(folderId, fileName, record) {
+    const item = identity(folderId, fileName);
+    if (record === null) {
+      fs.rmSync(recordPath(item.folderId, item.fileName), { force: true });
+      return;
+    }
+    if (!record || record.version !== 1 || record.folderId !== item.folderId || record.fileName !== item.fileName
+      || (record.area || "temp") !== area || !["present", "absent"].includes(record.desired)
+      || typeof record.generation !== "string" || !record.generation) {
+      throw new Error("Cloud temp queue snapshot is invalid");
+    }
+    write(record);
   }
 
   function hasPending(folderId, fileName) {
@@ -84,16 +103,16 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
       const record = read(item.folderId, item.fileName);
       if (!record) return;
       if (record.desired === "absent") {
-        await remove(item.folderId, item.fileName, "temp");
+        await remove(item.folderId, item.fileName, area);
       } else {
-        if (isSuppressed(item.folderId, item.fileName, "temp")) {
+        if (area === "temp" && isSuppressed(item.folderId, item.fileName, area)) {
           if (removeIfCurrent(record)) return;
           continue;
         }
-        const localPath = localPathFor(item.folderId, item.fileName);
+        const localPath = localPathFor(item.folderId, item.fileName, area);
         const stat = fs.lstatSync(localPath);
         if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Cloud temp source is not a regular file");
-        await upload(localPath, item.folderId, item.fileName, "temp");
+        await upload(localPath, item.folderId, item.fileName, area);
       }
       if (removeIfCurrent(record)) return;
     }
@@ -121,7 +140,7 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
       let record;
       try { record = JSON.parse(fs.readFileSync(path.join(queueDirectory, entry.name), "utf8")); }
       catch { throw new Error("Cloud temp queue contains a malformed record"); }
-      if (record?.version !== 1 || typeof record.folderId !== "string" || typeof record.fileName !== "string" || !["present", "absent"].includes(record.desired) || typeof record.generation !== "string") {
+      if (record?.version !== 1 || typeof record.folderId !== "string" || typeof record.fileName !== "string" || (record.area || "temp") !== area || !["present", "absent"].includes(record.desired) || typeof record.generation !== "string") {
         throw new Error("Cloud temp queue contains an invalid record");
       }
       if (recordPath(record.folderId, record.fileName) !== path.join(queueDirectory, entry.name)) throw new Error("Cloud temp queue record identity does not match its filename");
@@ -132,7 +151,7 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
     if (failed.length) throw new AggregateError(failed.map((result) => result.reason), "Cloud temp mutations remain pending");
   }
 
-  return { enqueue, hasPending, process, processAll, setDesired };
+  return { enqueue, getRecord, hasPending, process, processAll, restoreRecord, setDesired };
 }
 
 module.exports = { createCloudTempMutationQueue };

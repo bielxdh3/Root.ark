@@ -10,7 +10,7 @@ const {
 } = require("../services/totpPolicy");
 
 function parseCookies(header = "") {
-  const cookies = {};
+  const cookies = Object.create(null);
   for (const part of String(header).split(";")) {
     const [key, value] = part.trim().split(/=(.*)/s, 2);
     if (!key || Object.hasOwn(cookies, key)) cookies[key] = undefined;

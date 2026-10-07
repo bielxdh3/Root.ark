@@ -78,6 +78,8 @@ function makeS3Fixture(objects) {
   const deleteGates = new Map();
   const deleteFailures = new Map();
   const deleteAttempts = new Map();
+  const uploadFailures = new Map();
+  const uploadAttempts = new Map();
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://fixture.invalid");
     const key = decodeURIComponent(url.pathname).replace(/^\/fixture-bucket\//, "");
@@ -104,7 +106,20 @@ function makeS3Fixture(objects) {
     if (req.method === "PUT") {
       const chunks = [];
       req.on("data", (chunk) => chunks.push(chunk));
-      req.on("end", () => { const body = decodeAwsChunkedBody(Buffer.concat(chunks)); objects.set(key, body); mutationLog.push({ method: "PUT", key, body: body.toString() }); res.writeHead(200); res.end(); });
+      req.on("end", () => {
+        const body = decodeAwsChunkedBody(Buffer.concat(chunks));
+        uploadAttempts.set(key, (uploadAttempts.get(key) || 0) + 1);
+        const remainingFailures = uploadFailures.get(key) || 0;
+        if (remainingFailures > 0) {
+          uploadFailures.set(key, remainingFailures - 1);
+          res.writeHead(500);
+          return res.end();
+        }
+        objects.set(key, body);
+        mutationLog.push({ method: "PUT", key, body: body.toString() });
+        res.writeHead(200);
+        res.end();
+      });
       return;
     }
     if (req.method === "DELETE") {
@@ -146,6 +161,8 @@ function makeS3Fixture(objects) {
       failNextDeletes(key, count) { deleteFailures.set(key, count); },
       clearDeleteFailures(key) { deleteFailures.delete(key); },
       deleteAttemptCount(key) { return deleteAttempts.get(key) || 0; },
+      failNextUploads(key, count) { uploadFailures.set(key, count); },
+      uploadAttemptCount(key) { return uploadAttempts.get(key) || 0; },
       mutationsFor(key) { return mutationLog.filter((mutation) => mutation.key === key); },
     }));
   });
@@ -175,6 +192,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   fs.symlinkSync(path.join(ROOT, "public"), path.join(directory, "public"), "junction");
 
   const restoreName = "version-restore-race.txt";
+  const queueRestoreName = "version-restore-queue-failure.txt";
   const deleteName = "version-delete-race.txt";
   const rejectedName = "rejected-pending-race.txt";
   const uploadRejectName = "upload-reject-race.txt";
@@ -186,19 +204,23 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const failedPruneSaveName = "version-prune-save-failure.txt";
   const approveSaveFailureName = "approve-history-save-failure.txt";
   const approveInitialSaveFailureName = "approve-initial-history-save-failure.txt";
+  const approveCloudQueueFailureName = "approve-cloud-queue-write-failure.txt";
   const approveRevokedName = "approve-revoked-during-cache-recovery.txt";
   const rejectRevokedName = "reject-revoked-during-cache-recovery.txt";
+  const orphanReplacementName = "orphan-replacement.txt";
   const failedUploadName = "queue-write-failed.txt";
   const revokedWebDavMoveName = "revoked-during-webdav-move-cache.txt";
   const revokedWebDavMoveDestination = "revoked-webdav-move-target.txt";
   const objects = new Map();
-  for (const name of [restoreName, deleteName, revokedDeleteName, aclRevokedRestoreName, failedRestoreName]) {
+  for (const name of [restoreName, queueRestoreName, deleteName, revokedDeleteName, aclRevokedRestoreName, failedRestoreName]) {
     objects.set(`rootark/uploads/root/${name}`, Buffer.from(`current v3 ${name}`));
     objects.set(`rootark/uploads/root/${name}.v1`, Buffer.from(`version v1 ${name}`));
     objects.set(`rootark/uploads/root/${name}.v2`, Buffer.from(`version v2 ${name}`));
   }
   objects.set(`rootark/uploads/root/${approveSaveFailureName}`, Buffer.from(`prior current ${approveSaveFailureName}`));
+  objects.set(`rootark/uploads/root/${orphanReplacementName}`, Buffer.from("stale provider replacement"));
   for (const name of [approveSaveFailureName, approveInitialSaveFailureName]) objects.set(`rootark/temp/root/${name}`, Buffer.from(`pending replacement ${name}`));
+  objects.set(`rootark/temp/root/${approveCloudQueueFailureName}`, Buffer.from(`pending replacement ${approveCloudQueueFailureName}`));
   for (let version = 1; version <= 10; version += 1) {
     const storedAs = version === 10 ? failedPruneSaveName : `${failedPruneSaveName}.v${version}`;
     objects.set(`rootark/uploads/root/${storedAs}`, Buffer.from(version === 10 ? `current v10 ${failedPruneSaveName}` : `version v${version} ${failedPruneSaveName}`));
@@ -219,11 +241,12 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   fs.writeFileSync(path.join(dataDir, "folders.json"), JSON.stringify([
     { id: "root", name: "Root", createdBy: "system", allowedUsers: [], isRoot: true },
   ]));
-  const initialPermissions = Object.fromEntries([restoreName, deleteName, revokedDeleteName, revokedWebDavMoveName, failedRestoreName, failedPruneSaveName, approveSaveFailureName, approveInitialSaveFailureName].map((name) => [`root/${name}`, { public: false, owner: "tester", users: {} }]));
+  const initialPermissions = Object.fromEntries([restoreName, queueRestoreName, deleteName, revokedDeleteName, revokedWebDavMoveName, failedRestoreName, failedPruneSaveName, approveSaveFailureName, approveInitialSaveFailureName, approveCloudQueueFailureName].map((name) => [`root/${name}`, { public: false, owner: "tester", users: {} }]));
+  initialPermissions[`root/${orphanReplacementName}`] = { public: false, owner: "tester", users: { limited: { read: true, edit: false } } };
   initialPermissions[`root/${aclRevokedRestoreName}`] = { public: false, owner: null, users: { limited: { read: true, edit: true } } };
   const filePermissionsPath = path.join(dataDir, "file-permissions.json");
   fs.writeFileSync(filePermissionsPath, JSON.stringify(initialPermissions));
-  const initialHistory = Object.fromEntries([restoreName, deleteName, revokedDeleteName, aclRevokedRestoreName, failedRestoreName].map((name) => [`root/${name}`, {
+  const initialHistory = Object.fromEntries([restoreName, queueRestoreName, deleteName, revokedDeleteName, aclRevokedRestoreName, failedRestoreName].map((name) => [`root/${name}`, {
     currentVersion: 3,
     versions: [
       { version: 1, storedAs: `${name}.v1`, size: objects.get(`rootark/uploads/root/${name}.v1`).length },
@@ -248,12 +271,19 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const unlinkStarted = path.join(directory, "pending-unlink-started");
   const releaseUnlink = path.join(directory, "release-pending-unlink");
   const failQueueWrites = path.join(directory, "fail-cloud-temp-queue-writes");
+  const failUploadQueueWrites = path.join(directory, "fail-cloud-upload-queue-writes");
+  const failUploadQueueAfterWrites = path.join(directory, "fail-cloud-upload-queue-after-writes.json");
+  const failPolicyClearAfterRename = path.join(directory, "fail-policy-clear-after-rename");
   const failVersionCopy = path.join(directory, "fail-version-copy-once");
   const failVersionHistorySave = path.join(directory, "fail-version-history-save-once");
   const failApprovalHistorySave = path.join(directory, "fail-approval-history-save-once");
   const evictPendingConfig = path.join(directory, "evict-pending-cache.json");
   const cloudQueueDirectory = path.join(dataDir, ".rootark-cloud-temp-mutations");
+  const cloudUploadQueueDirectory = path.join(dataDir, ".rootark-cloud-upload-mutations");
+  const orphanPolicyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+  const rollbackPolicyUploadName = "rollback-policy-clear.txt";
   const pendingRegistryPath = path.join(dataDir, "pending-uploads.json");
+  const orphanReplacementPending = { fileName: orphanReplacementName, folderId: "root", uploadedBy: "limited", uploadedAt: "2026-10-01T00:00:00.000Z" };
   const priorFailedUploadPending = { fileName: failedUploadName, folderId: "root", uploadedBy: "tester", uploadedAt: "2026-10-01T00:00:00.000Z", versionComment: "preserve pending" };
   const priorFailedUploadEncryption = { originalFilename: "prior-encrypted-name.txt", fileName: failedUploadName, folderId: "root", encryptionLevel: "server-key", marker: "preserve encrypted metadata" };
   fs.writeFileSync(versionHistoryPath, JSON.stringify(initialHistory));
@@ -266,15 +296,24 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     [`root/${failedUploadName}`]: priorFailedUploadPending,
     [`root/${approveSaveFailureName}`]: { fileName: approveSaveFailureName, folderId: "root", uploadedBy: "limited", uploadedAt: new Date().toISOString() },
     [`root/${approveInitialSaveFailureName}`]: { fileName: approveInitialSaveFailureName, folderId: "root", uploadedBy: "limited", uploadedAt: new Date().toISOString() },
+    [`root/${approveCloudQueueFailureName}`]: { fileName: approveCloudQueueFailureName, folderId: "root", uploadedBy: "tester", uploadedAt: new Date().toISOString() },
     [`root/${approveRevokedName}`]: { fileName: approveRevokedName, folderId: "root", uploadedBy: "tester", uploadedAt: new Date().toISOString() },
     [`root/${rejectRevokedName}`]: { fileName: rejectRevokedName, folderId: "root", uploadedBy: "tester", uploadedAt: new Date().toISOString() },
+    [`root/${orphanReplacementName}`]: orphanReplacementPending,
   }));
+  fs.writeFileSync(orphanPolicyPath, JSON.stringify({ version: 1, objects: [
+    { area: "temp", folderId: "root", name: rollbackPolicyUploadName },
+    { area: "uploads", folderId: "root", name: orphanReplacementName },
+  ] }));
+  fs.writeFileSync(path.join(directory, "temp", orphanReplacementName), "approved replacement bytes");
   fs.writeFileSync(path.join(directory, "temp", approveRevokedName), `pending ${approveRevokedName}`);
   fs.writeFileSync(path.join(directory, "temp", rejectRevokedName), `pending ${rejectRevokedName}`);
   fs.writeFileSync(path.join(directory, "uploads", approveSaveFailureName), `prior current ${approveSaveFailureName}`);
   fs.writeFileSync(path.join(directory, "temp", approveSaveFailureName), `pending replacement ${approveSaveFailureName}`);
   fs.writeFileSync(path.join(directory, "temp", approveInitialSaveFailureName), `pending replacement ${approveInitialSaveFailureName}`);
-  fs.writeFileSync(path.join(dataDir, "encrypted-files.json"), JSON.stringify({ [`root/${failedUploadName}`]: priorFailedUploadEncryption }));
+  fs.writeFileSync(path.join(directory, "temp", approveCloudQueueFailureName), `pending replacement ${approveCloudQueueFailureName}`);
+  const approveQueueFailureEncryption = { originalFilename: "encrypted-pending.txt", fileName: approveCloudQueueFailureName, folderId: "root", encryptionLevel: "server-key", marker: "preserve encrypted approval metadata" };
+  fs.writeFileSync(path.join(dataDir, "encrypted-files.json"), JSON.stringify({ [`root/${failedUploadName}`]: priorFailedUploadEncryption, [`root/${approveCloudQueueFailureName}`]: approveQueueFailureEncryption }));
   fs.writeFileSync(path.join(dataDir, "trash-items.json"), "[]");
   const cloud = await makeS3Fixture(objects);
   const port = await unusedPort();
@@ -288,6 +327,10 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     `const unlinkStarted = ${JSON.stringify(unlinkStarted)};`,
     `const releaseUnlink = ${JSON.stringify(releaseUnlink)};`,
     `const failQueueWrites = ${JSON.stringify(failQueueWrites)};`,
+    `const failUploadQueueWrites = ${JSON.stringify(failUploadQueueWrites)};`,
+    `const failUploadQueueAfterWrites = ${JSON.stringify(failUploadQueueAfterWrites)};`,
+    `const failPolicyClearAfterRename = ${JSON.stringify(failPolicyClearAfterRename)};`,
+    `const restoreOrphanPolicy = ${JSON.stringify(orphanPolicyPath)};`,
     `const failVersionCopy = ${JSON.stringify(failVersionCopy)};`,
     `const failVersionHistorySave = ${JSON.stringify(failVersionHistorySave)};`,
     `const failApprovalHistorySave = ${JSON.stringify(failApprovalHistorySave)};`,
@@ -295,6 +338,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     `const failedRestoreTarget = ${JSON.stringify(path.join(directory, "uploads", `${failedRestoreName}.v1`))};`,
     `const evictPendingConfig = ${JSON.stringify(evictPendingConfig)};`,
     `const cloudQueueDirectory = ${JSON.stringify(cloudQueueDirectory)};`,
+    `const cloudUploadQueueDirectory = ${JSON.stringify(cloudUploadQueueDirectory)};`,
     'const original = fs.readFileSync;',
     'fs.readFileSync = function (file, ...args) { if (typeof file === "string" && path.resolve(file) === history) fs.appendFileSync(marker, "1\\n"); return original.call(this, file, ...args); };',
     'const originalStatSync = fs.statSync; const originalUnlinkSync = fs.unlinkSync.bind(fs); fs.statSync = function (file, ...args) { const stat = originalStatSync.call(this, file, ...args); if (typeof file === "string" && fs.existsSync(evictPendingConfig)) { try { const config = JSON.parse(fs.readFileSync(evictPendingConfig, "utf8")); if (path.resolve(file) === path.resolve(config.path)) { config.count += 1; fs.writeFileSync(evictPendingConfig, JSON.stringify(config)); if (config.count === 2) { originalUnlinkSync(file); originalUnlinkSync(evictPendingConfig); } } } catch {} } return stat; };',
@@ -305,14 +349,15 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     'fs.promises.unlink = async function (file) { if (typeof file === "string" && path.resolve(file) === path.resolve(pending)) await waitForRelease(); return originalPromiseUnlink(file); };',
     'const originalCopyFileSync = fs.copyFileSync; fs.copyFileSync = function (source, destination, ...args) { if (fs.existsSync(failVersionCopy) && typeof source === "string" && path.resolve(source) === path.resolve(failedRestoreTarget)) { fs.unlinkSync(failVersionCopy); const error = new Error("injected version copy failure"); error.code = "EIO"; throw error; } return originalCopyFileSync.call(this, source, destination, ...args); };',
     'const originalWriteFileSync = fs.writeFileSync; fs.writeFileSync = function (file, ...args) { if ((fs.existsSync(failVersionHistorySave) || fs.existsSync(failApprovalHistorySave)) && typeof file === "string" && path.resolve(file) === path.resolve(versionHistoryFile)) { if (fs.existsSync(failVersionHistorySave)) fs.unlinkSync(failVersionHistorySave); if (fs.existsSync(failApprovalHistorySave)) fs.unlinkSync(failApprovalHistorySave); const error = new Error("injected version history save failure"); error.code = "EIO"; throw error; } return originalWriteFileSync.call(this, file, ...args); };',
-    'const originalOpen = fs.openSync; fs.openSync = function (file, flags, ...args) { if (fs.existsSync(failQueueWrites) && typeof file === "string" && path.resolve(file).startsWith(path.resolve(cloudQueueDirectory) + path.sep) && flags === "wx") { const error = new Error("injected cloud queue write failure"); error.code = "EIO"; throw error; } return originalOpen.call(this, file, flags, ...args); };',
+    'const originalOpen = fs.openSync; fs.openSync = function (file, flags, ...args) { const inTempQueue = typeof file === "string" && path.resolve(file).startsWith(path.resolve(cloudQueueDirectory) + path.sep); const inUploadQueue = typeof file === "string" && path.resolve(file).startsWith(path.resolve(cloudUploadQueueDirectory) + path.sep); if (flags === "wx" && ((fs.existsSync(failQueueWrites) && inTempQueue) || (fs.existsSync(failUploadQueueWrites) && inUploadQueue))) { const error = new Error("injected cloud queue write failure"); error.code = "EIO"; throw error; } if (flags === "wx" && inUploadQueue && fs.existsSync(failUploadQueueAfterWrites)) { const config = JSON.parse(fs.readFileSync(failUploadQueueAfterWrites, "utf8")); config.remaining -= 1; if (config.remaining <= 0) { fs.unlinkSync(failUploadQueueAfterWrites); const error = new Error("injected later cloud upload queue write failure"); error.code = "EIO"; throw error; } fs.writeFileSync(failUploadQueueAfterWrites, JSON.stringify(config)); } return originalOpen.call(this, file, flags, ...args); };',
+    'const originalRename = fs.renameSync; fs.renameSync = function (source, destination, ...args) { if (fs.existsSync(failPolicyClearAfterRename) && typeof destination === "string" && path.resolve(destination) === path.resolve(restoreOrphanPolicy)) { fs.unlinkSync(failPolicyClearAfterRename); originalRename.call(this, source, destination, ...args); const error = new Error("injected policy directory-sync failure after rename"); error.code = "EIO"; throw error; } return originalRename.call(this, source, destination, ...args); };',
   ].join("\n"));
   const env = {
     ...process.env,
     PORT: String(port), DB_ENABLED: "false", NODE_ENV: "test", JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
     TOTP_POLICY: "optional", CLOUD_STORAGE_PROVIDER: "s3", AWS_S3_BUCKET: "fixture-bucket", AWS_REGION: "us-east-1",
     AWS_ENDPOINT_URL: `http://127.0.0.1:${cloud.port}`, AWS_FORCE_PATH_STYLE: "true", AWS_ACCESS_KEY_ID: "fixture-access-key",
-    AWS_SECRET_ACCESS_KEY: "fixture-secret-key", TRASH_ENABLED: "true", TRASH_AUTO_CLEANUP_ENABLED: "false", CLOUD_TEMP_RECONCILIATION_INTERVAL_MS: "1000",
+    AWS_SECRET_ACCESS_KEY: "fixture-secret-key", TRASH_ENABLED: "true", TRASH_AUTO_CLEANUP_ENABLED: "false", CLOUD_TEMP_RECONCILIATION_INTERVAL_MS: "1000", CLOUD_UPLOAD_RECONCILIATION_INTERVAL_MS: "1000",
     WEBDAV_ENABLED: "true",
     WEBDAV_ALLOW_MOVE: "true",
     NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${preloadFile}`].filter(Boolean).join(" "),
@@ -379,6 +424,72 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   assert.ok(initialPending, "failed initial approval preserves pending registry");
   assert.equal(Object.hasOwn(historyAfterInitialApproval, `root/${approveInitialSaveFailureName}`), false);
 
+  const approveQueueFailureKey = `rootark/uploads/root/${approveCloudQueueFailureName}`;
+  const approveQueueFailureRecord = path.join(cloudUploadQueueDirectory, `${crypto.createHash("sha256").update(`root\0${approveCloudQueueFailureName}`).digest("hex")}.json`);
+  fs.writeFileSync(failUploadQueueWrites, "fail once");
+  const failedCloudQueueApproval = await mutate(`/approve/${approveCloudQueueFailureName}?folderId=root`, "POST");
+  fs.rmSync(failUploadQueueWrites, { force: true });
+  const approvalPendingAfterQueueFailure = JSON.parse(fs.readFileSync(pendingRegistryPath, "utf8"))[`root/${approveCloudQueueFailureName}`];
+  const approvalHistoryAfterQueueFailure = JSON.parse(fs.readFileSync(versionHistoryPath, "utf8"));
+  const encryptionAfterApprovalQueueFailure = JSON.parse(fs.readFileSync(path.join(dataDir, "encrypted-files.json"), "utf8"))[`root/${approveCloudQueueFailureName}`];
+  results.push({
+    case: "approval-cloud-queue-write-failure-happens-before-promoting-local-state",
+    actual: {
+      status: failedCloudQueueApproval.status,
+      uploadExists: fs.existsSync(path.join(directory, "uploads", approveCloudQueueFailureName)),
+      tempBytes: fs.existsSync(path.join(directory, "temp", approveCloudQueueFailureName)) ? fs.readFileSync(path.join(directory, "temp", approveCloudQueueFailureName), "utf8") : null,
+      pendingMetadataExists: Boolean(approvalPendingAfterQueueFailure),
+      historyExists: Object.hasOwn(approvalHistoryAfterQueueFailure, `root/${approveCloudQueueFailureName}`),
+      encryptionMetadata: encryptionAfterApprovalQueueFailure,
+      providerIntentExists: fs.existsSync(approveQueueFailureRecord),
+      providerObjectUnchanged: objects.get(approveQueueFailureKey)?.toString() === undefined,
+    },
+    expected: {
+      status: 500,
+      uploadExists: false,
+      tempBytes: `pending replacement ${approveCloudQueueFailureName}`,
+      pendingMetadataExists: true,
+      historyExists: false,
+      encryptionMetadata: approveQueueFailureEncryption,
+      providerIntentExists: false,
+      providerObjectUnchanged: true,
+    },
+  });
+
+  const failedReplacementQueuePath = path.join(cloudUploadQueueDirectory, `${crypto.createHash("sha256").update(`root\0${approveSaveFailureName}`).digest("hex")}.json`);
+  assert.equal(fs.existsSync(failedReplacementQueuePath), false, "a failed local version transaction removes the staged provider intent");
+  const successfulReplacementApproval = await mutate(`/approve/${approveSaveFailureName}?folderId=root`, "POST");
+  assert.equal(successfulReplacementApproval.status, 202, successfulReplacementApproval.body);
+  assert.equal(JSON.parse(successfulReplacementApproval.body).cloudSyncPending, true);
+  const replacementProviderDeadline = Date.now() + 5000;
+  while ((objects.get(`rootark/uploads/root/${approveSaveFailureName}`)?.toString() !== `pending replacement ${approveSaveFailureName}`
+    || objects.get(`rootark/uploads/root/${approveSaveFailureName}.v1`)?.toString() !== `prior current ${approveSaveFailureName}`) && Date.now() < replacementProviderDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(objects.get(`rootark/uploads/root/${approveSaveFailureName}`)?.toString(), `pending replacement ${approveSaveFailureName}`);
+  assert.equal(objects.get(`rootark/uploads/root/${approveSaveFailureName}.v1`)?.toString(), `prior current ${approveSaveFailureName}`);
+
+  const orphanReplacementKey = `rootark/uploads/root/${orphanReplacementName}`;
+  const orphanReplacementQueuePath = path.join(cloudUploadQueueDirectory, `${crypto.createHash("sha256").update(`root\0${orphanReplacementName}`).digest("hex")}.json`);
+  cloud.failNextUploads(orphanReplacementKey, 1);
+  const orphanReplacementApproval = await mutate(`/approve/${orphanReplacementName}?folderId=root`, "POST");
+  assert.equal(orphanReplacementApproval.status, 202, orphanReplacementApproval.body);
+  assert.equal(JSON.parse(orphanReplacementApproval.body).cloudSyncPending, true, "approval reports its durable provider reconciliation");
+  assert.equal(fs.existsSync(orphanReplacementQueuePath), true, "provider intent is durable before approval responds");
+  assert.equal(fs.readFileSync(path.join(directory, "uploads", orphanReplacementName), "utf8"), "approved replacement bytes");
+  const limitedOrphanBeforeProviderRetry = await request(port, `/files/${orphanReplacementName}`, { headers: { cookie: limitedCookie } });
+  assert.notEqual(limitedOrphanBeforeProviderRetry.status, 200, "ordinary readers cannot receive stale provider bytes while replacement is pending");
+  const providerRetryDeadline = Date.now() + 5000;
+  while (cloud.uploadAttemptCount(orphanReplacementKey) < 2 && Date.now() < providerRetryDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(cloud.uploadAttemptCount(orphanReplacementKey), 2, "startup-style reconciliation retries a failed provider upload");
+  assert.equal(objects.get(orphanReplacementKey)?.toString(), "approved replacement bytes", "retry converges the provider to the approved local content");
+  const providerQueueRemovalDeadline = Date.now() + 2000;
+  while (fs.existsSync(orphanReplacementQueuePath) && Date.now() < providerQueueRemovalDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(fs.existsSync(orphanReplacementQueuePath), false, "completed provider intent is removed only after success");
+  const limitedOrphanAfterProviderRetry = await request(port, `/files/${orphanReplacementName}`, { headers: { cookie: limitedCookie } });
+  assert.equal(limitedOrphanAfterProviderRetry.status, 200, limitedOrphanAfterProviderRetry.body);
+  assert.equal(limitedOrphanAfterProviderRetry.body, "approved replacement bytes");
+
   const revokedDeleteGate = cloud.blockGet(`rootark/uploads/root/${revokedDeleteName}.v1`);
   gates.push(revokedDeleteGate);
   const restoreWhileDeleteWaits = mutate(`/restore/${revokedDeleteName}/v/1?folderId=root`, "POST");
@@ -430,6 +541,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const failedRestoreResponse = await mutate(`/restore/${failedRestoreName}/v/1?folderId=root`, "POST");
   const failedRestoreHistory = JSON.parse(fs.readFileSync(versionHistoryPath, "utf8"))[`root/${failedRestoreName}`];
   const failedRestoreCurrentPath = path.join(directory, "uploads", failedRestoreName);
+  const failedRestoreQueueRecord = path.join(cloudUploadQueueDirectory, `${crypto.createHash("sha256").update(`root\0${failedRestoreName}`).digest("hex")}.json`);
   results.push({
     case: "version-restore-copy-failure-preserves-current-file",
     actual: {
@@ -437,8 +549,9 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
       currentExists: fs.existsSync(failedRestoreCurrentPath),
       currentBytes: fs.existsSync(failedRestoreCurrentPath) ? fs.readFileSync(failedRestoreCurrentPath, "utf8") : null,
       currentVersion: failedRestoreHistory.currentVersion,
+      providerIntentExists: fs.existsSync(failedRestoreQueueRecord),
     },
-    expected: { status: 500, currentExists: true, currentBytes: `current v3 ${failedRestoreName}`, currentVersion: 3 },
+    expected: { status: 500, currentExists: true, currentBytes: `current v3 ${failedRestoreName}`, currentVersion: 3, providerIntentExists: false },
   });
 
   fs.writeFileSync(failVersionHistorySave, "fail once");
@@ -493,6 +606,17 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     usersDuringPendingMutation[0].sessionVersion -= 1;
     fs.writeFileSync(usersPath, JSON.stringify(usersDuringPendingMutation));
   }
+
+  fs.writeFileSync(failUploadQueueAfterWrites, JSON.stringify({ remaining: 2 }));
+  const failedVersionQueueRestore = await mutate(`/restore/${queueRestoreName}/v/1?folderId=root`, "POST");
+  const failedVersionQueueRestoreHistory = JSON.parse(fs.readFileSync(versionHistoryPath, "utf8"))[`root/${queueRestoreName}`];
+  const failedVersionQueueRestoreRecords = fs.existsSync(cloudUploadQueueDirectory)
+    ? fs.readdirSync(cloudUploadQueueDirectory).filter((entry) => entry.endsWith(".json"))
+    : [];
+  assert.equal(failedVersionQueueRestore.status, 500);
+  assert.equal(fs.readFileSync(path.join(directory, "uploads", queueRestoreName), "utf8"), `current v3 ${queueRestoreName}`);
+  assert.deepEqual(failedVersionQueueRestoreHistory, initialHistory[`root/${queueRestoreName}`]);
+  assert.deepEqual(failedVersionQueueRestoreRecords, [], "failed precommit queue staging rolls back earlier queue records");
 
   const restoreGate = cloud.blockGet(`rootark/uploads/root/${restoreName}.v1`);
   gates.push(restoreGate);
@@ -615,6 +739,38 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     case: "failed-cloud-queue-write-rolls-back-upload-metadata",
     actual: { status: queueFailureResponse.status, localTempExists: fs.existsSync(path.join(directory, "temp", failedUploadName)), pendingMetadata: pendingAfterQueueFailure[`root/${failedUploadName}`], encryptedMetadata: encryptedAfterQueueFailure[`root/${failedUploadName}`] },
     expected: { status: 500, localTempExists: false, pendingMetadata: priorFailedUploadPending, encryptedMetadata: priorFailedUploadEncryption },
+  });
+
+  fs.writeFileSync(failPolicyClearAfterRename, "fail");
+  const policyRollbackPayload = multipartFields({ encryptionLevel: "server-key" }, "file", rollbackPolicyUploadName, Buffer.from("policy clear rollback fixture"));
+  const policyRollbackResponse = await request(port, "/upload?folderId=root", {
+    method: "POST",
+    headers: { cookie, origin: `http://127.0.0.1:${port}`, "x-csrf-token": csrf, "content-type": policyRollbackPayload.contentType, "content-length": policyRollbackPayload.body.length },
+    body: policyRollbackPayload.body,
+  });
+  fs.rmSync(failPolicyClearAfterRename, { force: true });
+  const pendingAfterPolicyRollback = JSON.parse(fs.readFileSync(pendingRegistryPath, "utf8"));
+  const encryptedAfterPolicyRollback = JSON.parse(fs.readFileSync(path.join(dataDir, "encrypted-files.json"), "utf8"));
+  const policyAfterRollback = JSON.parse(fs.readFileSync(orphanPolicyPath, "utf8"));
+  const policyRollbackQueuePath = path.join(cloudQueueDirectory, `${crypto.createHash("sha256").update(`root\0${rollbackPolicyUploadName}`).digest("hex")}.json`);
+  results.push({
+    case: "suppression-clear-failure-rolls-back-all-upload-state-and-restores-visibility-barrier",
+    actual: {
+      status: policyRollbackResponse.status,
+      localTempExists: fs.existsSync(path.join(directory, "temp", rollbackPolicyUploadName)),
+      pendingMetadataExists: Boolean(pendingAfterPolicyRollback[`root/${rollbackPolicyUploadName}`]),
+      encryptedMetadataExists: Boolean(encryptedAfterPolicyRollback[`root/${rollbackPolicyUploadName}`]),
+      queueIntentExists: fs.existsSync(policyRollbackQueuePath),
+      stillSuppressed: policyAfterRollback.objects.some((entry) => entry.area === "temp" && entry.folderId === "root" && entry.name === rollbackPolicyUploadName),
+    },
+    expected: {
+      status: 500,
+      localTempExists: false,
+      pendingMetadataExists: false,
+      encryptedMetadataExists: false,
+      queueIntentExists: false,
+      stillSuppressed: true,
+    },
   });
 
   const failedChunkName = "chunk-queue-write-failed.txt";

@@ -26,6 +26,9 @@ const OBJECTS = new Map([
   ["rootark/uploads/root/token-race.txt.v1", Buffer.from("version token race fixture")],
   ["rootark/uploads/root/restore-race.txt.v1", Buffer.from("version restore race fixture")],
   ["rootark/uploads/root/issued-token-race.txt.v1", Buffer.from("previously issued version token fixture")],
+  ["rootark/uploads/root/webdav-session-revocation.txt", Buffer.from("WebDAV session revocation fixture")],
+  ["rootark/uploads/root/webdav-listfiles-revocation.txt", Buffer.from("WebDAV listFiles revocation fixture")],
+  ["rootark/uploads/root/webdav-acl-revocation.txt", Buffer.from("WebDAV ACL revocation fixture")],
   ["rootark/uploads/root/public.txt", Buffer.from("public cloud fixture")],
   ["rootark/uploads/root/public.txt.v1", Buffer.from("public stored version fixture")],
   ["rootark/uploads/root/ambiguous-orphan.v1", Buffer.from("unclassified stored version fixture")],
@@ -168,6 +171,11 @@ function stop(child) {
 
 test("cloud-backed file routes authorize access and bound repeated metadata listings", { timeout: 60_000 }, async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-get-acl-"));
+  const unregisteredMagicNames = ["constructor", "toString", "__proto__"];
+  for (const name of unregisteredMagicNames) OBJECTS.set(`rootark/temp/root/${name}`, Buffer.from("unregistered pending fixture"));
+  t.after(() => {
+    for (const name of unregisteredMagicNames) OBJECTS.delete(`rootark/temp/root/${name}`);
+  });
   const dataDir = path.join(directory, "data");
   fs.mkdirSync(dataDir, { recursive: true });
   fs.mkdirSync(path.join(directory, "temp"), { recursive: true });
@@ -206,6 +214,9 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     "root/revoke-version-token.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
     "root/revoke-encrypted.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
     "root/revoke-webdav.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
+    "root/webdav-session-revocation.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
+    "root/webdav-listfiles-revocation.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
+    "root/webdav-acl-revocation.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
     "root/session-target.txt": { public: false, owner: "owner", users: { editor: { read: true, edit: true } } },
     "root/orphan-private.txt": { public: false, owner: "owner", users: {} },
     "root/public.txt": { public: true, owner: "viewer", users: {} },
@@ -408,11 +419,25 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(path.join(dataDir, "pending-uploads.json"), "utf8")), "root/restore-orphan-pending.txt"), false, "authorized rejection removes stale metadata explicitly");
   assert.equal(cloud.getObjects.includes("rootark/temp/root/restore-orphan-pending.txt"), false, "authorized cleanup never hydrates the stale provider payload");
 
+  for (const name of unregisteredMagicNames) {
+    const pendingMetadata = JSON.parse(fs.readFileSync(path.join(dataDir, "pending-uploads.json"), "utf8"));
+    assert.equal(Object.hasOwn(pendingMetadata, `root/${name}`), false);
+    assert.equal(Object.hasOwn(pendingMetadata, name), false);
+    const providerGetsBeforeApproval = cloud.getObjects.length;
+    const approval = await mutateAsOwner(`/approve/${encodeURIComponent(name)}?folderId=root`, "POST", {});
+    assert.equal(approval.status, 404, `${name} without own pending metadata cannot be approved: ${approval.body}`);
+    assert.equal(cloud.getObjects.length, providerGetsBeforeApproval, `${name} without own pending metadata is not hydrated`);
+    assert.equal(fs.existsSync(path.join(directory, "temp", name)), false);
+    assert.equal(fs.existsSync(path.join(directory, "uploads", name)), false);
+    const rejection = await mutateAsOwner(`/reject/${encodeURIComponent(name)}?folderId=root`, "POST", {});
+    assert.equal(rejection.status, 404, `${name} without own pending metadata cannot be rejected: ${rejection.body}`);
+  }
+
   const providerGetsBeforeList = cloud.getObjects.length;
   const list = await request(port, "/list", { headers: { cookie, referer: "https://attacker.invalid/" } });
   assert.equal(list.status, 200, list.body);
   assert.equal(JSON.parse(list.body).some((file) => file.name === "restore-orphan.txt"), false, "persisted restore orphans remain hidden after server restart");
-  const expectedVisibleNames = ["ambiguous-orphan.v1", "budget.v2", "cloud-only-version-init.txt", "encrypted.txt", "legacy.v9", "notes.v2", "private.txt.v7", "private.txt.v8", "public.txt", "version-primary.txt"];
+  const expectedVisibleNames = ["ambiguous-orphan.v1", "budget.v2", "cloud-only-version-init.txt", "encrypted.txt", "legacy.v9", "notes.v2", "private.txt.v7", "private.txt.v8", "public.txt", "version-primary.txt", "webdav-acl-revocation.txt", "webdav-listfiles-revocation.txt", "webdav-session-revocation.txt"];
   if (process.platform !== "win32") expectedVisibleNames.push("case-orphan.txt");
   assert.deepEqual(JSON.parse(list.body).map((file) => file.name).sort(), expectedVisibleNames.sort());
   assert.equal(cloud.getObjects.length, providerGetsBeforeList, "listing reads provider metadata without materializing file bytes");
@@ -483,6 +508,41 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     historyUnchanged: true,
     primaryBytesUnchanged: true,
   }, "suppressed storedAs aliases are denied across download, token, and restore even when the primary is authorized");
+  const managerSuppressedVersionToken = await mutateAsOwner("/version-open-token", "POST", { name: "version-primary.txt", version: 1 });
+  assert.equal(managerSuppressedVersionToken.status, 200, managerSuppressedVersionToken.body);
+  const managerSuppressedVersionUrl = JSON.parse(managerSuppressedVersionToken.body).downloadUrl;
+  const managerSuppressedVersionOpen = await request(port, managerSuppressedVersionUrl, { headers: { cookie: ownerCookie } });
+  assert.equal(managerSuppressedVersionOpen.status, 200, "a manager may review a restore-suppressed historical version");
+  assert.equal(managerSuppressedVersionOpen.body, "suppressed provider-only version fixture");
+  assert.notEqual((await request(port, managerSuppressedVersionUrl)).status, 200, "a manager review version token is not an anonymous bearer link");
+  assert.notEqual((await request(port, managerSuppressedVersionUrl, { headers: { cookie } })).status, 200, "a manager review version token is bound to its issuing manager");
+  fs.rmSync(aliasVersionPath, { force: true });
+  const ownerUsersPath = path.join(dataDir, "users.local.json");
+  const ownerUsersBeforeRevocation = fs.readFileSync(ownerUsersPath, "utf8");
+  const ownerUsersWithoutManagerAccess = JSON.parse(ownerUsersBeforeRevocation);
+  ownerUsersWithoutManagerAccess.find((user) => user.username === "owner").role = "user";
+  fs.writeFileSync(ownerUsersPath, JSON.stringify(ownerUsersWithoutManagerAccess));
+  const versionReviewGetsBeforeReauthorization = cloud.getObjects.length;
+  const managerVersionTokenWithoutCurrentRole = await request(port, managerSuppressedVersionUrl, { headers: { cookie: ownerCookie } });
+  assert.notEqual(managerVersionTokenWithoutCurrentRole.status, 200, "manager access is rechecked before version-token hydration");
+  assert.equal(cloud.getObjects.length, versionReviewGetsBeforeReauthorization, "a demoted manager cannot hydrate a suppressed version");
+  fs.writeFileSync(ownerUsersPath, ownerUsersBeforeRevocation);
+  const secondManagerVersionToken = await mutateAsOwner("/version-open-token", "POST", { name: "version-primary.txt", version: 1 });
+  assert.equal(secondManagerVersionToken.status, 200, secondManagerVersionToken.body);
+  const secondManagerVersionUrl = JSON.parse(secondManagerVersionToken.body).downloadUrl;
+  fs.rmSync(aliasVersionPath, { force: true });
+  const versionReviewGate = cloud.blockGet("rootark/uploads/root/version-primary.txt.v1");
+  const managerVersionReviewAfterHydration = request(port, secondManagerVersionUrl, { headers: { cookie: ownerCookie } });
+  await versionReviewGate.started;
+  const ownerUsersDuringHydration = JSON.parse(fs.readFileSync(ownerUsersPath, "utf8"));
+  ownerUsersDuringHydration.find((user) => user.username === "owner").role = "user";
+  fs.writeFileSync(ownerUsersPath, JSON.stringify(ownerUsersDuringHydration));
+  versionReviewGate.release();
+  const revokedManagerVersionReview = await managerVersionReviewAfterHydration;
+  assert.notEqual(revokedManagerVersionReview.status, 200, "manager access is rechecked after version-token hydration");
+  assert.equal(revokedManagerVersionReview.body.includes("suppressed provider-only version fixture"), false);
+  fs.writeFileSync(ownerUsersPath, ownerUsersBeforeRevocation);
+  fs.rmSync(aliasVersionPath, { force: true });
   const authorizedSiblingVersion = await request(port, "/download/version-primary.txt/v/2", { headers: { cookie } });
   assert.equal(authorizedSiblingVersion.status, 200, "an authorized sibling version remains available when only v1 is suppressed");
   assert.equal(authorizedSiblingVersion.body, "authorized stored version fixture");
@@ -671,6 +731,69 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const restoreOrphanWebDavFile = await request(port, "/dav/restore-orphan.txt", { headers: { authorization: webDavAuth } });
   assert.equal(restoreOrphanWebDavFile.status, 404, restoreOrphanWebDavFile.body);
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/restore-orphan.txt"), false, "denied WebDAV access never hydrates provider bytes");
+
+  const webDavUsersPath = path.join(dataDir, "users.local.json");
+  const originalWebDavUsers = fs.readFileSync(webDavUsersPath, "utf8");
+  const filePermissionsPath = path.join(dataDir, "file-permissions.json");
+  const originalFilePermissions = fs.readFileSync(filePermissionsPath, "utf8");
+  async function assertWebDavReadRevalidation(method, name, mutateState, restoreState) {
+    const localPath = path.join(directory, "uploads", name);
+    fs.rmSync(localPath, { force: true });
+    const gate = cloud.blockGet(`rootark/uploads/root/${name}`);
+    const pendingRead = request(port, `/dav/${name}`, { method, headers: { authorization: webDavAuth } });
+    await gate.started;
+    mutateState();
+    gate.release();
+    const response = await pendingRead;
+    restoreState();
+    fs.rmSync(localPath, { force: true });
+    assert.notEqual(response.status, 200, `${method} does not serve a file after authorization changes during hydration`);
+    assert.notEqual(response.status, 207, `${method} does not expose file metadata after authorization changes during hydration`);
+    assert.equal(response.body.includes(OBJECTS.get(`rootark/uploads/root/${name}`).toString()), false);
+  }
+  await assertWebDavReadRevalidation(
+    "GET",
+    "webdav-session-revocation.txt",
+    () => {
+      const users = JSON.parse(originalWebDavUsers);
+      users.find((user) => user.username === "viewer").sessionVersion += 1;
+      fs.writeFileSync(webDavUsersPath, JSON.stringify(users));
+    },
+    () => fs.writeFileSync(webDavUsersPath, originalWebDavUsers)
+  );
+  await assertWebDavReadRevalidation(
+    "HEAD",
+    "webdav-listfiles-revocation.txt",
+    () => {
+      const users = JSON.parse(originalWebDavUsers);
+      users.find((user) => user.username === "viewer").permissions.listFiles = false;
+      fs.writeFileSync(webDavUsersPath, JSON.stringify(users));
+    },
+    () => fs.writeFileSync(webDavUsersPath, originalWebDavUsers)
+  );
+  await assertWebDavReadRevalidation(
+    "PROPFIND",
+    "webdav-acl-revocation.txt",
+    () => {
+      const permissions = JSON.parse(originalFilePermissions);
+      permissions["root/webdav-acl-revocation.txt"].users = {};
+      fs.writeFileSync(filePermissionsPath, JSON.stringify(permissions));
+    },
+    () => fs.writeFileSync(filePermissionsPath, originalFilePermissions)
+  );
+
+  const validOrphanPolicy = fs.readFileSync(orphanPolicyPath, "utf8");
+  const pendingRegistryPath = path.join(dataDir, "pending-uploads.json");
+  const validPendingRegistry = fs.readFileSync(pendingRegistryPath, "utf8");
+  const pendingRegistryWithRestoreOrphan = JSON.parse(validPendingRegistry);
+  pendingRegistryWithRestoreOrphan["root/restore-orphan-pending.txt"] = { fileName: "restore-orphan-pending.txt", folderId: "root", uploadedBy: "viewer" };
+  fs.writeFileSync(pendingRegistryPath, JSON.stringify(pendingRegistryWithRestoreOrphan));
+  fs.writeFileSync(orphanPolicyPath, "{");
+  const pendingWithInvalidPolicy = await request(port, "/pending?folderId=root", { headers: { cookie } });
+  assert.equal(pendingWithInvalidPolicy.status, 503, pendingWithInvalidPolicy.body);
+  assert.ok(Number(pendingWithInvalidPolicy.headers["retry-after"]) > 0, "policy read failures are retryable");
+  fs.writeFileSync(orphanPolicyPath, validOrphanPolicy);
+  fs.writeFileSync(pendingRegistryPath, validPendingRegistry);
 
   cloud.getObjects.length = 0;
   for (const [name, route] of [["revoke-download.txt", "/files/revoke-download.txt"], ["revoke-preview.txt", "/preview/file/public/revoke-preview.txt"]]) {
