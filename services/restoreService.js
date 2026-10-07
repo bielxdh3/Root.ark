@@ -509,7 +509,7 @@ function syncEntries(manifest) {
       const name = parts.pop();
       const folderId = parts.join("/") || "root";
       if (!name || !folderId || folderId.includes("/") || folderId === "." || folderId === ".." || /(^|\/)(\.env|.*credentials.*|.*\.key)$/i.test(name)) return null;
-      return { entryId: crypto.randomUUID(), path: entryPath, area, folderId, name, providerIdentity: null, providerFileId: null, state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null, failureCategory: null, leaseToken: null, leaseUntil: null };
+      return { entryId: crypto.randomUUID(), path: entryPath, area, folderId, name, providerIdentity: null, providerFileId: null, state: "pending", attempts: 0, nextAttemptAt: null, failureCategory: null, leaseToken: null, leaseUntil: null };
     })
     .filter(Boolean);
 }
@@ -558,14 +558,14 @@ function claimSyncEntry(backupId, entryId, { now, leaseMs = 60 * 1000, workerId 
   if (!current || !sync || index < 0) return null;
   const existing = sync.entries[index];
   const leaseUntil = new Date(existing.leaseUntil || 0).getTime();
-  if (existing.state === "completed" || existing.state === "terminal_failure" || (existing.leaseToken && leaseUntil > now)) return null;
+  if (existing.state === "completed" || (existing.leaseToken && leaseUntil > now)) return null;
   const token = `${workerId}:${crypto.randomUUID()}`;
   try {
     const saved = backupRepository.mutateRestoreSyncEntry({
       backupId,
       operationId: sync.operationId,
       entryId,
-      expectedState: ["pending", "retry_wait", "in_progress"],
+      expectedState: ["pending", "retry_wait", "in_progress", "terminal_failure"],
       expectedLeaseToken: existing.leaseToken || null,
       expectedRevision: Number(sync.revision) || 0,
       mutate: (entry) => ({
@@ -619,7 +619,7 @@ function cancelRestoreSync(backupId, reason = "cancelled", { clock } = {}) {
   return backupRepository.getBackup(backupId) || backup;
 }
 
-async function processRestoreSync({ backupId, clock, maxAttempts = 5, uploader, leaseMs = 60 * 1000, workerId, runFileLifecycleMutation } = {}) {
+async function processRestoreSync({ backupId, clock, uploader, leaseMs = 60 * 1000, workerId, runFileLifecycleMutation } = {}) {
   const provider = uploader || cloudStorage;
   let latest = backupRepository.getBackup(backupId);
   if (!latest || !latest.metadata?.restoreSync || !provider?.enabled?.()) return latest;
@@ -642,11 +642,11 @@ async function processRestoreSync({ backupId, clock, maxAttempts = 5, uploader, 
       latest = backupRepository.getBackup(backupId) || latest;
     }
   }
-  if (["completed", "cancelled", "terminal_failure"].includes(latest.metadata.restoreSync.state)) return latest;
+  if (["completed", "cancelled"].includes(latest.metadata.restoreSync.state)) return latest;
   const now = typeof clock === "function" ? clock() : clock?.now ? clock.now() : Date.now();
   const providerIdentity = String(provider.provider || provider.name || "cloud").toLowerCase();
   for (const candidate of latest.metadata.restoreSync.entries || []) {
-    if (candidate.state === "completed" || candidate.state === "terminal_failure") continue;
+    if (candidate.state === "completed") continue;
     if (candidate.nextAttemptAt && new Date(candidate.nextAttemptAt).getTime() > now) continue;
     const lease = claimSyncEntry(backupId, candidate.entryId, { now, leaseMs, workerId, providerIdentity });
     if (!lease) continue;
@@ -715,9 +715,8 @@ async function processRestoreSync({ backupId, clock, maxAttempts = 5, uploader, 
       if (!entry) continue;
       const attempts = Math.max(1, Number(entry.attempts) || 1);
       const failureCategory = ["source_unavailable", "configuration"].includes(error.code) ? error.code : "provider_error";
-      const terminal = attempts >= Math.max(1, Number(entry.maxAttempts || maxAttempts));
       const at = syncNow(clock);
-      const nextAttemptAt = terminal ? null : new Date(now + Math.min(60 * 60 * 1000, 1000 * (2 ** (attempts - 1)))).toISOString();
+      const nextAttemptAt = new Date(Date.parse(at) + Math.min(60 * 60 * 1000, 1000 * (2 ** (attempts - 1)))).toISOString();
       try {
         backupRepository.mutateRestoreSyncEntry({
           backupId,
@@ -726,7 +725,7 @@ async function processRestoreSync({ backupId, clock, maxAttempts = 5, uploader, 
           expectedState: "in_progress",
           expectedLeaseToken: lease.token,
           expectedRevision: Number(current.metadata.restoreSync.revision) || 0,
-          mutate: (latestEntry) => ({ entry: { ...latestEntry, state: terminal ? "terminal_failure" : "retry_wait", failureCategory, nextAttemptAt, leaseToken: null, leaseUntil: null }, details: { failureCategory: terminal ? failureCategory : null }, at }),
+          mutate: (latestEntry) => ({ entry: { ...latestEntry, state: "retry_wait", failureCategory, nextAttemptAt, leaseToken: null, leaseUntil: null }, details: { failureCategory: null }, at }),
         });
       } catch (mutationError) {
         if (!["backup_revision_conflict", "backup_state_conflict", "backup_lease_conflict", "backup_mutation_conflict"].includes(mutationError.code)) throw mutationError;
@@ -1327,7 +1326,7 @@ function recoverQuarantineRestore(options = {}) {
   } finally { release?.(); }
 }
 
-function restoreQuarantine(plan) {
+function restoreQuarantine(plan, onProgress = null) {
   if (!plan) return;
   const destination = validateQuarantineDestination(plan.destination);
   fs.mkdirSync(destination, { recursive: true });
@@ -1359,6 +1358,7 @@ function restoreQuarantine(plan) {
     fsyncDirectory(destination);
     writeQuarantineJournal(journalPath, journal);
     journalWritten = true;
+    onProgress?.("restore.quarantine.journal.persisted", { transactionId });
 
     fs.writeFileSync(stagedNewMetadata, plan.metadataContents, { flag: "wx" });
     fsyncFile(stagedNewMetadata);
@@ -1367,6 +1367,7 @@ function restoreQuarantine(plan) {
       const stagedOldPath = path.join(stagingDirectory, `old-${index}`);
       fsyncFile(payload.absolutePath);
       fs.renameSync(payload.absolutePath, stagedOldPath);
+      onProgress?.("restore.quarantine.old-payload.moved", { filename: payload.filename, index });
     });
     fsyncDirectory(destination);
     fsyncDirectory(stagingDirectory);
@@ -1374,6 +1375,7 @@ function restoreQuarantine(plan) {
       const payload = plan.restoredPayloads[index];
       const targetPath = path.join(destination, payload.filename);
       fs.renameSync(path.join(stagingDirectory, `new-${index}`), targetPath);
+      onProgress?.("restore.quarantine.new-payload.installed", { filename: payload.filename, index });
     }
     fsyncDirectory(destination);
     fsyncDirectory(stagingDirectory);
@@ -1381,14 +1383,17 @@ function restoreQuarantine(plan) {
       fsyncFile(plan.metadataDestination);
       fs.renameSync(plan.metadataDestination, stagedOldMetadata);
       fsyncDirectory(path.dirname(plan.metadataDestination));
+      onProgress?.("restore.quarantine.old-metadata.moved", { transactionId });
     }
     fs.renameSync(stagedNewMetadata, plan.metadataDestination);
     fsyncDirectory(path.dirname(plan.metadataDestination));
+    onProgress?.("restore.quarantine.metadata.installed", { transactionId });
     const markerTemporary = path.join(stagingDirectory, "committed.tmp");
     fs.writeFileSync(markerTemporary, transactionId, { flag: "wx" });
     fsyncFile(markerTemporary);
     fs.renameSync(markerTemporary, path.join(stagingDirectory, "committed"));
     fsyncDirectory(stagingDirectory);
+    onProgress?.("restore.quarantine.committed-marker.persisted", { transactionId });
   } catch (error) {
     if (journalWritten) {
       try {
@@ -1792,7 +1797,7 @@ async function restoreBackup(id, options = {}) {
     injectFailure("restore.coordinator.persisted");
     injectFailure("restore.before-local-commit");
     mutationStarted = true;
-    restoreQuarantine(quarantinePlan);
+    restoreQuarantine(quarantinePlan, (step, details) => injectFailure(step, details));
     if (quarantinePlan) {
       coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "quarantine" });
       injectFailure("restore.quarantine.committed");

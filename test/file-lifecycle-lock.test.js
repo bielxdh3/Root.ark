@@ -103,6 +103,90 @@ test("file lifecycle lock release does not remove a replacement owner lease", as
   assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).token, "replacement-owner");
 });
 
+test("file lifecycle release preserves a same-token lease replaced during ownership validation", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-release-race-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 1000 });
+  const lockPath = path.join(directory, crypto.createHash("sha256").update("root\0release-race.txt").digest("hex") + ".lock");
+  const replacementPath = path.join(directory, "replacement-lease.json");
+  const originalLstatSync = fs.lstatSync;
+  let pathChecks = 0;
+  let replacement;
+  fs.lstatSync = function (target, ...args) {
+    if (target === lockPath && ++pathChecks === 2) {
+      replacement = fs.readFileSync(lockPath, "utf8");
+      fs.writeFileSync(replacementPath, replacement);
+      fs.renameSync(lockPath, lockPath + ".displaced");
+      fs.renameSync(replacementPath, lockPath);
+    }
+    return originalLstatSync.call(this, target, ...args);
+  };
+  try {
+    await lock.run("root", "release-race.txt", async () => {});
+    assert.equal(pathChecks >= 2, true);
+    assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).token.length > 0, true);
+  } finally {
+    fs.lstatSync = originalLstatSync;
+  }
+});
+
+test("file lifecycle lock refuses symlinked owner records without touching their targets", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-symlink-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 20, pollMs: 5 });
+  const lockPath = path.join(directory, `${crypto.createHash("sha256").update("root\0linked.txt").digest("hex")}.lock`);
+  const targetPath = path.join(directory, "outside-owner.json");
+  const target = JSON.stringify({ token: "protected", pid: 999999, hostname: require("node:os").hostname() });
+  fs.writeFileSync(targetPath, target);
+  try {
+    fs.symlinkSync(targetPath, lockPath);
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) return t.skip(`symlink creation unavailable: ${error.code}`);
+    throw error;
+  }
+
+  await assert.rejects(lock.run("root", "linked.txt", async () => assert.fail("a linked owner record must never be reclaimed")), { code: "FILE_LIFECYCLE_LOCK_TIMEOUT" });
+  assert.equal(fs.readFileSync(targetPath, "utf8"), target);
+  assert.equal(fs.lstatSync(lockPath).isSymbolicLink(), true);
+});
+
+test("file lifecycle lock does not reclaim an owner replaced after its descriptor opens", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-path-swap-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 30, pollMs: 5 });
+  const lockPath = path.join(directory, `${crypto.createHash("sha256").update("root\0swapped.txt").digest("hex")}.lock`);
+  const replacementPath = path.join(directory, "replacement-owner.json");
+  fs.writeFileSync(lockPath, JSON.stringify({ token: "initial-dead-owner", pid: 999999, hostname: require("node:os").hostname() }));
+  const replacement = JSON.stringify({ token: "replacement-owner", pid: process.pid, hostname: require("node:os").hostname() });
+  fs.writeFileSync(replacementPath, replacement);
+  const originalLstatSync = fs.lstatSync;
+  const originalOpenSync = fs.openSync;
+  const calls = [];
+  let swapped = false;
+  fs.openSync = function (target, flags, ...args) {
+    if (target === lockPath && typeof flags === "number") calls.push("read-open");
+    return originalOpenSync.call(this, target, flags, ...args);
+  };
+  fs.lstatSync = function (target, ...args) {
+    if (target === lockPath && !swapped) {
+      calls.push("lstat");
+      swapped = true;
+      fs.renameSync(lockPath, `${lockPath}.displaced`);
+      fs.renameSync(replacementPath, lockPath);
+    }
+    return originalLstatSync.call(this, target, ...args);
+  };
+  try {
+    await assert.rejects(lock.run("root", "swapped.txt", async () => assert.fail("replaced owner must not be reclaimed")), { code: "FILE_LIFECYCLE_LOCK_TIMEOUT" });
+    assert.equal(swapped, true);
+    assert.equal(calls[0], "read-open", "the owner record must be opened before its path is validated");
+    assert.equal(fs.readFileSync(lockPath, "utf8"), replacement);
+  } finally {
+    fs.lstatSync = originalLstatSync;
+    fs.openSync = originalOpenSync;
+  }
+});
+
 test("folder lifecycle lock serializes every trash action for the same stable folder id", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-folder-lock-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));

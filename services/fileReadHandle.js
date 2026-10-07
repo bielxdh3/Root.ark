@@ -21,13 +21,13 @@ function openReadHandle(filePath) {
     if (typeof fs.constants.O_NONBLOCK === "number") flags |= fs.constants.O_NONBLOCK;
     descriptor = fs.openSync(filePath, flags);
     const opened = fs.fstatSync(descriptor, { bigint: true });
-    const sameFile = beforeOpen.dev === opened.dev
-      && beforeOpen.ino === opened.ino
-      && beforeOpen.mode === opened.mode
-      && beforeOpen.size === opened.size
-      && beforeOpen.mtimeNs === opened.mtimeNs
-      && beforeOpen.ctimeNs === opened.ctimeNs;
-    if (!opened.isFile() || !sameFile) {
+    const currentPath = fs.lstatSync(filePath, { bigint: true });
+    const afterPathCheck = fs.fstatSync(descriptor, { bigint: true });
+    const stableSnapshot = (stat) => stat.dev === beforeOpen.dev && stat.ino === beforeOpen.ino
+      && stat.mode === beforeOpen.mode && stat.size === beforeOpen.size
+      && stat.mtimeNs === beforeOpen.mtimeNs && stat.ctimeNs === beforeOpen.ctimeNs;
+    if (!opened.isFile() || !currentPath.isFile() || currentPath.isSymbolicLink()
+      || !stableSnapshot(opened) || !stableSnapshot(currentPath) || !stableSnapshot(afterPathCheck)) {
       throw fileReadError("FILE_HANDLE_CHANGED", "File changed while it was being opened");
     }
 

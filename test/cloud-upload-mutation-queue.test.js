@@ -51,3 +51,55 @@ test("upload queue persists provider failure and retries it after restart", asyn
   }
 });
 
+test("upload queue rejects a symlinked record without reading or changing its target", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-upload-queue-symlink-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const queue = createHarness(directory, async () => {});
+  const record = queue.setDesired("root", "linked.txt", "absent");
+  const queueDirectory = path.join(directory, "queue");
+  const recordPath = path.join(queueDirectory, `${require("node:crypto").createHash("sha256").update("root\0linked.txt").digest("hex")}.json`);
+  const targetPath = path.join(directory, "outside-record.json");
+  const target = JSON.stringify({ ...record, desired: "present", generation: "outside" });
+  fs.writeFileSync(targetPath, target);
+  fs.unlinkSync(recordPath);
+  try {
+    fs.symlinkSync(targetPath, recordPath);
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) return t.skip(`symlink creation unavailable: ${error.code}`);
+    throw error;
+  }
+
+  assert.throws(() => queue.getRecord("root", "linked.txt"));
+  assert.equal(fs.readFileSync(targetPath, "utf8"), target);
+  assert.equal(fs.lstatSync(recordPath).isSymbolicLink(), true);
+});
+
+test("upload queue rejects a record replaced between descriptor open and path validation", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-upload-queue-path-swap-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const queue = createHarness(directory, async () => {});
+  const original = queue.setDesired("root", "swapped.txt", "absent");
+  const queueDirectory = path.join(directory, "queue");
+  const recordPath = path.join(queueDirectory, `${require("node:crypto").createHash("sha256").update("root\0swapped.txt").digest("hex")}.json`);
+  const replacementPath = path.join(directory, "replacement-record.json");
+  const replacement = { ...original, generation: "replacement-generation" };
+  fs.writeFileSync(replacementPath, JSON.stringify(replacement));
+  const originalLstatSync = fs.lstatSync;
+  let swapped = false;
+  fs.lstatSync = function (target, ...args) {
+    if (target === recordPath && !swapped) {
+      swapped = true;
+      fs.renameSync(recordPath, `${recordPath}.displaced`);
+      fs.renameSync(replacementPath, recordPath);
+    }
+    return originalLstatSync.call(this, target, ...args);
+  };
+  try {
+    assert.throws(() => queue.getRecord("root", "swapped.txt"), /stable regular file/);
+    assert.equal(swapped, true);
+    assert.equal(JSON.parse(fs.readFileSync(recordPath, "utf8")).generation, "replacement-generation");
+  } finally {
+    fs.lstatSync = originalLstatSync;
+  }
+});
+

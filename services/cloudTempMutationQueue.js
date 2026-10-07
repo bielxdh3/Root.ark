@@ -21,12 +21,30 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
     return path.join(queueDirectory, `${digest}.json`);
   }
 
+  function readRecordSnapshot(filePath) {
+    let descriptor;
+    try {
+      let flags = fs.constants.O_RDONLY;
+      if (typeof fs.constants.O_NOFOLLOW === "number") flags |= fs.constants.O_NOFOLLOW;
+      if (typeof fs.constants.O_NONBLOCK === "number") flags |= fs.constants.O_NONBLOCK;
+      descriptor = fs.openSync(filePath, flags);
+      const opened = fs.fstatSync(descriptor, { bigint: true });
+      const current = fs.lstatSync(filePath, { bigint: true });
+      if (!opened.isFile() || !current.isFile() || current.isSymbolicLink() || opened.dev !== current.dev || opened.ino !== current.ino) {
+        throw new Error("Cloud temp queue record is not a stable regular file");
+      }
+      return { record: JSON.parse(fs.readFileSync(descriptor, "utf8")), identity: { dev: opened.dev, ino: opened.ino } };
+    } finally { if (descriptor !== undefined) try { fs.closeSync(descriptor); } catch {} }
+  }
+
+  function readRecordFile(filePath) {
+    return readRecordSnapshot(filePath).record;
+  }
+
   function read(folderId, fileName) {
     const filePath = recordPath(folderId, fileName);
     try {
-      const stat = fs.lstatSync(filePath);
-      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Cloud temp queue record is not a regular file");
-      const record = JSON.parse(fs.readFileSync(filePath, "utf8"));
+      const record = readRecordFile(filePath);
       const item = identity(folderId, fileName);
       if (record?.version !== 1 || record.folderId !== item.folderId || record.fileName !== item.fileName || (record.area || "temp") !== area || !["present", "absent"].includes(record.desired) || typeof record.generation !== "string" || !record.generation) {
         throw new Error("Cloud temp queue record is invalid");
@@ -92,9 +110,20 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
   }
 
   function removeIfCurrent(record) {
-    const current = read(record.folderId, record.fileName);
-    if (current?.generation !== record.generation) return false;
-    fs.rmSync(recordPath(record.folderId, record.fileName), { force: false });
+    const filePath = recordPath(record.folderId, record.fileName);
+    let snapshot;
+    try { snapshot = readRecordSnapshot(filePath); }
+    catch (error) {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    }
+    if (snapshot.record?.generation !== record.generation) return false;
+    try {
+      const current = fs.lstatSync(filePath, { bigint: true });
+      if (!current.isFile() || current.isSymbolicLink() || current.dev !== snapshot.identity.dev || current.ino !== snapshot.identity.ino) return false;
+    } catch { return false; }
+    // Deployment boundary: OS permissions/ACLs must limit write, rename, and delete on runtime-root/data and descendants to the service account. Other writers can alter authoritative state directly; Node has no portable unlink-by-descriptor API.
+    fs.rmSync(filePath, { force: false });
     return true;
   }
 
@@ -138,7 +167,7 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
     for (const entry of fs.readdirSync(queueDirectory, { withFileTypes: true })) {
       if (!entry.isFile() || entry.isSymbolicLink() || !/^[a-f0-9]{64}\.json$/.test(entry.name)) continue;
       let record;
-      try { record = JSON.parse(fs.readFileSync(path.join(queueDirectory, entry.name), "utf8")); }
+      try { record = readRecordFile(path.join(queueDirectory, entry.name)); }
       catch { throw new Error("Cloud temp queue contains a malformed record"); }
       if (record?.version !== 1 || typeof record.folderId !== "string" || typeof record.fileName !== "string" || (record.area || "temp") !== area || !["present", "absent"].includes(record.desired) || typeof record.generation !== "string") {
         throw new Error("Cloud temp queue contains an invalid record");

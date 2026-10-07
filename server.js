@@ -4930,7 +4930,7 @@ async function processPendingCloudRestoreSync() {
     if (!isCloudStorageEnabled()) return;
     for (const backup of backupService.listBackups()) {
       const state = backup.metadata?.restoreSync?.state;
-      if (!["pending", "retry_wait"].includes(state)) continue;
+      if (!["pending", "retry_wait", "terminal_failure"].includes(state)) continue;
       try {
         await restoreService.processRestoreSync({
           backupId: backup.id,
@@ -7561,9 +7561,23 @@ function writeWebDavMoveJournal(journal) {
   fs.renameSync(temporary, journal.journalPath);
 }
 
+function canonicalWebDavMoveTransactionId(value) {
+  const transactionId = String(value || "").toLowerCase();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(transactionId)
+    ? transactionId
+    : null;
+}
+
+function webDavMoveJournalPath(transactionId) {
+  const canonicalId = canonicalWebDavMoveTransactionId(transactionId);
+  if (!canonicalId) return null;
+  return path.join(WEBDAV_MOVE_JOURNAL_DIR, path.basename(`rootark-webdav-move-${canonicalId}.json`));
+}
+
 function isSafeWebDavMoveJournal(journal) {
-  if (!journal || journal.version !== 1 || !/^[a-f0-9-]{36}$/i.test(String(journal.transactionId || ""))) return false;
-  const expectedJournal = path.resolve(WEBDAV_MOVE_JOURNAL_DIR, `rootark-webdav-move-${journal.transactionId}.json`);
+  if (!journal || journal.version !== 1) return false;
+  const expectedJournal = webDavMoveJournalPath(journal.transactionId);
+  if (!expectedJournal) return false;
   if (path.resolve(journal.journalPath || "") !== expectedJournal) return false;
   if ([journal.sourcePath, journal.destinationPath, journal.stagePath, journal.destinationBackupPath].some((target) => typeof target !== "string" || !isSafeChildPath(path.resolve("."), target))) return false;
   const sourceDir = path.dirname(path.resolve(journal.sourcePath));
@@ -8193,8 +8207,9 @@ function registerWebDavRoutes() {
     server.once("close", () => clearInterval(webDavReconciliationTimer));
   }
   app.get("/webdav/moves/:transactionId/status", authenticate, requirePermission("upload"), (req, res) => {
-    if (!/^[a-f0-9-]{36}$/i.test(String(req.params.transactionId || ""))) return res.status(404).send("Not found");
-    const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, `rootark-webdav-move-${req.params.transactionId}.json`);
+    const transactionId = canonicalWebDavMoveTransactionId(req.params.transactionId);
+    if (!transactionId) return res.status(404).send("Not found");
+    const journalPath = webDavMoveJournalPath(transactionId);
     if (!fs.existsSync(journalPath)) return res.status(404).send("Not found");
     let journal;
     try { journal = JSON.parse(fs.readFileSync(journalPath, "utf8")); } catch { return res.status(409).send("Status unavailable"); }

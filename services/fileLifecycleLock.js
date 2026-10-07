@@ -23,12 +23,35 @@ function createFileLifecycleLock({ directory, timeoutMs = 30_000, pollMs = 25 } 
     return path.join(lockDirectory, digest + ".lock");
   }
 
-  function releaseIfOwned(lockPath, token) {
+  function readOwner(filePath) {
+    let descriptor;
     try {
-      const stat = fs.lstatSync(lockPath);
-      if (!stat.isFile() || stat.isSymbolicLink()) return;
-      const owner = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-      if (owner.token === token) fs.unlinkSync(lockPath);
+      let flags = fs.constants.O_RDONLY;
+      if (typeof fs.constants.O_NOFOLLOW === "number") flags |= fs.constants.O_NOFOLLOW;
+      if (typeof fs.constants.O_NONBLOCK === "number") flags |= fs.constants.O_NONBLOCK;
+      descriptor = fs.openSync(filePath, flags);
+      const opened = fs.fstatSync(descriptor, { bigint: true });
+      const current = fs.lstatSync(filePath, { bigint: true });
+      if (!opened.isFile() || !current.isFile() || current.isSymbolicLink() || opened.dev !== current.dev || opened.ino !== current.ino) return null;
+      return { owner: JSON.parse(fs.readFileSync(descriptor, "utf8")), identity: { dev: opened.dev, ino: opened.ino } };
+    } catch { return null; }
+    finally { if (descriptor !== undefined) try { fs.closeSync(descriptor); } catch {} }
+  }
+
+  function pathMatchesIdentity(filePath, identity) {
+    try {
+      const current = fs.lstatSync(filePath, { bigint: true });
+      return current.isFile() && !current.isSymbolicLink() && current.dev === identity.dev && current.ino === identity.ino;
+    } catch { return false; }
+  }
+
+  function releaseIfOwned(lockPath, token, identity) {
+    try {
+      const current = readOwner(lockPath);
+      if (!current || current.owner.token !== token || (identity && (current.identity.dev !== identity.dev || current.identity.ino !== identity.ino))) return;
+      // Deployment boundary: OS permissions/ACLs must limit write, rename, and delete on runtime-root/data and descendants to the service account. Other writers can alter authoritative state directly; Node has no portable unlink-by-descriptor API.
+      if (!pathMatchesIdentity(lockPath, current.identity)) return;
+      fs.unlinkSync(lockPath);
     } catch {}
   }
 
@@ -43,19 +66,19 @@ function createFileLifecycleLock({ directory, timeoutMs = 30_000, pollMs = 25 } 
   }
 
   function reclaimDeadOwner(lockPath) {
-    let owner;
-    try {
-      const stat = fs.lstatSync(lockPath);
-      if (!stat.isFile() || stat.isSymbolicLink()) return false;
-      owner = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-    } catch { return false; }
+    const snapshot = readOwner(lockPath);
+    const owner = snapshot?.owner;
+    if (!snapshot) return false;
     if (!sameHostOwnerIsDead(owner)) return false;
 
     const reaperPath = `${lockPath}.reaper`;
     const reaperToken = crypto.randomUUID();
     let descriptor;
+    let reaperIdentity;
     try {
       descriptor = fs.openSync(reaperPath, "wx", 0o600);
+      const reaperStat = fs.fstatSync(descriptor, { bigint: true });
+      reaperIdentity = { dev: reaperStat.dev, ino: reaperStat.ino };
       fs.writeFileSync(descriptor, JSON.stringify({ token: reaperToken, pid: process.pid, hostname: os.hostname() }));
       fs.fsyncSync(descriptor);
       fs.closeSync(descriptor);
@@ -66,22 +89,15 @@ function createFileLifecycleLock({ directory, timeoutMs = 30_000, pollMs = 25 } 
     }
 
     try {
-      let current;
-      try {
-        const stat = fs.lstatSync(lockPath);
-        if (!stat.isFile() || stat.isSymbolicLink()) return false;
-        current = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-      } catch { return false; }
-      if (current.token !== owner.token || !sameHostOwnerIsDead(current)) return false;
+      const current = readOwner(lockPath);
+      if (!current || current.owner.token !== owner.token || current.identity.dev !== snapshot.identity.dev || current.identity.ino !== snapshot.identity.ino || !sameHostOwnerIsDead(current.owner)) return false;
+      if (!pathMatchesIdentity(lockPath, current.identity)) return false;
       fs.unlinkSync(lockPath);
       return true;
     } catch {
       return false;
     } finally {
-      try {
-        const reaper = JSON.parse(fs.readFileSync(reaperPath, "utf8"));
-        if (reaper.token === reaperToken) fs.unlinkSync(reaperPath);
-      } catch {}
+      releaseIfOwned(reaperPath, reaperToken, reaperIdentity);
     }
   }
 
@@ -91,16 +107,23 @@ function createFileLifecycleLock({ directory, timeoutMs = 30_000, pollMs = 25 } 
     const token = crypto.randomUUID();
     while (true) {
       let descriptor;
+      let identity;
       try {
         descriptor = fs.openSync(lockPath, "wx", 0o600);
+        const opened = fs.fstatSync(descriptor, { bigint: true });
+        identity = { dev: opened.dev, ino: opened.ino };
         fs.writeFileSync(descriptor, `${JSON.stringify({ token, pid: process.pid, hostname: require("node:os").hostname(), createdAt: new Date().toISOString() })}\n`);
         fs.fsyncSync(descriptor);
         fs.closeSync(descriptor);
-        return () => releaseIfOwned(lockPath, token);
+        return () => releaseIfOwned(lockPath, token, identity);
       } catch (error) {
         if (descriptor !== undefined) {
+          try {
+            const opened = fs.fstatSync(descriptor, { bigint: true });
+            identity = { dev: opened.dev, ino: opened.ino };
+          } catch {}
           try { fs.closeSync(descriptor); } catch {}
-          releaseIfOwned(lockPath, token);
+          releaseIfOwned(lockPath, token, identity);
         }
         if (error.code !== "EEXIST") {
           const unavailable = new Error("File lifecycle lock is unavailable");
