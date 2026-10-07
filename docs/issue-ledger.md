@@ -1,10 +1,47 @@
 # Root.ark Issue Ledger
 
-## Current live snapshot — 2026-10-06
+## Current live snapshot — 2026-10-07
 
-GitHub was queried after PR #109 merged, with `Root/main` at `1955eab3d05f72632396eff62ef96d39eedd634b`. This is the evidence baseline for this documentation-only reconciliation, not the commit produced by publishing it. Older dated sections below are retained as historical evidence and are superseded where they conflict with this snapshot. PR #99 carries this update and does not change feature-issue state.
+GitHub was queried on 2026-10-07 after PR #113 merged. The source `Root/main` SHA was `964f820417baf44f059a04e5363a2a172dccdc7a`, queried before this documentation commit. This is a point-in-time evidence snapshot, not a claim about the branch after these docs are published; re-query GitHub before relying on it as live state. The prior 2026-10-06 snapshots based on `1955eab3d05f72632396eff62ef96d39eedd634b` are retained below as historical evidence.
 
-### Current open issues and pull requests
+### Open issues and pull requests at source SHA `964f820417baf44f059a04e5363a2a172dccdc7a`
+
+| Item | Live state at query | Remaining acceptance boundary |
+|---|---|---|
+| #63 | `open` | Protected-index primitives do not complete search: UI population, FTS/advanced search, encrypted-index lifecycle, metadata leakage acceptance, and full search acceptance remain open. |
+| #64 | `open` | Architecture and threat-model material exists; there is no functioning native Android client or Android CI. |
+| #65 | `open` | Root.ark is not an end-to-end Zero-Knowledge runtime; supported server paths can access plaintext. Upload, preview, scanning, sync/WebDAV, backup/restore, sharing, migration, recovery, authorization, and key lifecycle remain to be accepted. |
+| #66 / PR #97 | `open` / `open` | PR #97 remains partial: remote listing transfers full records before filtering; metadata-only listing, pagination, native Files On-Demand integration, safe eviction around external open-handle writers, and restart/reconnect acceptance remain incomplete. |
+| #67 | `open` | Backups and revision history do not provide burst detection, a pause/review barrier, protected history, recovery authorization, or deterministic recovery UX. |
+| #68 | `open` | Existing bearer links are not operation-scoped capabilities; least-privilege enforcement and recipient-key delivery remain incomplete. |
+| #94 / PR #95 | `open` / `open` | The process-local limiter does not establish shared/edge enforcement for multi-process deployments; production topology is unverified. |
+| PR #95 | `open`, head `95d99e4a934384fcfa2101dfc210741cd791a3d1`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; merge state `DIRTY` | CodeQL, Analyze, dependency-review, Ubuntu, and Windows checks pass on that stale head; 0 unresolved review threads. Update/rebase and exact-head validation are still required; #94 remains open pending shared or edge enforcement and deployment-topology evidence. |
+| PR #97 | `open`, head `a6a33a92cd6902f303254e60031da4bdc04cec04`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; merge state `CLEAN` | CodeQL, Analyze, dependency-review, Ubuntu, and Windows checks pass on that stale head; 0 unresolved review threads. Selective-sync acceptance gaps remain. |
+| PR #99 | `open`, remote head `93249b2731e1bbe8aa930c5ce28c6183b9529fc4`, base `1955eab3d05f72632396eff62ef96d39eedd634b`; merge state `CLEAN` at query; 0 review threads | Its CodeQL, Analyze, dependency-review, Ubuntu, and Windows checks pass on that head, but the remote base predates source `Root/main` SHA `964f820417baf44f059a04e5363a2a172dccdc7a`. The local PR branch has since merged that source SHA; publication and exact-head checks remain pending. |
+| PR #102 | `open`, head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`, base `9de3c85ab59aa16fc46916abc0cf638c539086ef`; merge state `UNSTABLE` | CodeQL alert gate fails (check run `112556673970`): 74 high and 5 medium alerts. Analyze, dependency-review, Ubuntu, and Windows checks pass on that head. One of 6 review threads remains unresolved at `services/internalFile.js:31`. Update against current main, triage alerts, and resolve review before merge. |
+| PR #114 | `open`, head `e4b9a1bcb43e5089535119109ff93592f63fbcce`, base `964f820417baf44f059a04e5363a2a172dccdc7a`; merge state `UNSTABLE` | CodeQL alert gate fails (check run `113032406735`): 11 high and 3 medium alerts. Ubuntu full validation and Windows syntax/tests fail; Analyze and dependency-review pass. 11 of 32 review threads remain unresolved (10 current, 1 outdated). Do not infer closure from fixes visible only in the local candidate; publish and revalidate the corrected head. |
+
+### Relevant merged restore PRs
+
+| PR | State | Merge commit |
+|---|---|---|
+| #101 | merged — authentication, CSRF, and proxy trust | `5c86bd2a9844fdf21921f08cf2bf9d9a7253d652` |
+| #103 | merged — validate every Root/main push | `f85cb389f3152191d612fb36b1ad97bde89ba99a` |
+| #104 | merged — restart-safe local restore rollback | `5ee044b628ed55f34e007e7d16c9c57e38a4ae27` |
+| #110 | merged — restore provider startup gate regression | `7bc9e81a1496041b3d75c5bd3cd359a603c6f6a8` |
+| #111 | merged — restore migration restart boundary regression | `2259f3d76ae51bbc03ebaae1213f1328c30fbb52` |
+| #112 | merged — atomic server master-key publication | `9de3c85ab59aa16fc46916abc0cf638c539086ef` |
+| #113 | merged — restore focus after closing Versions panel | `964f820417baf44f059a04e5363a2a172dccdc7a` |
+
+The restore model uses compensating rollback for locally controlled domains and a durable, retryable provider-reconciliation queue; it is not a single atomic transaction across storage domains or external providers. If startup migration fails after local commit, the restored state and restart barrier remain for retry or operator recovery; the restore is not automatically rolled back to its prior state.
+
+At this query, the exact source SHA `964f820417baf44f059a04e5363a2a172dccdc7a` had successful Security Regression, Dependency Review, CodeQL, and Pages runs (run IDs `37549800190`, `37549800109`, `37549800373`, and `37549799593`). The open moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` remains on `sprintf-js` via `package-lock.json`; GitHub reports no first patched version. This evidence is only for that SHA and does not replace validation of a later final SHA.
+
+## Historical live snapshot — 2026-10-06 (source SHA `1955eab3d05f72632396eff62ef96d39eedd634b`)
+
+GitHub was queried after PR #109 merged. The following snapshot was accurate for its stated source SHA and is retained as history; it is superseded by the newer snapshot above. PR #99 carried that earlier documentation update and did not change feature-issue state.
+
+### Open issues and pull requests at historical source SHA `1955eab3d05f72632396eff62ef96d39eedd634b`
 
 | Item | Live state | Remaining acceptance boundary |
 |---|---|---|
@@ -20,7 +57,7 @@ GitHub was queried after PR #109 merged, with `Root/main` at `1955eab3d05f726323
 | PR #102 | `open` at `dc219c14e6ace0e83b1ff46511395899ec59ba4e` | Authorization-before-hydration is directionally sound, but this branch predates PR #109, is stale, and its exact-head CodeQL run failed with 92 alerts (reported as 88 high and 4 medium; three annotations were in unchanged files and the remaining alerts were not all individually validated). PR #109 adds list/search metadata rate limits to current `Root/main`; PR #102 still requires current-base validation and triage of changed-code alerts before merge. |
 | Dependabot alert `GHSA-hp3w-g68c-fv3c` | `open`, moderate | `sprintf-js` is reported through `argparse@1.0.10`; GitHub currently reports no first patched version. Do not describe dependency risk as entirely clear until an upstream fix or reachability-based disposition is recorded. |
 
-### Merged correction PRs
+### Merged correction PRs at source SHA `1955eab3d05f72632396eff62ef96d39eedd634b`
 
 | PR | Merge commit |
 |---|---|
@@ -35,7 +72,7 @@ GitHub was queried after PR #109 merged, with `Root/main` at `1955eab3d05f726323
 | #110 | `7bc9e81a1496041b3d75c5bd3cd359a603c6f6a8` |
 | #109 | `1955eab3d05f72632396eff62ef96d39eedd634b` |
 
-The `Root/main` SHA above is a dated snapshot. Check live GitHub for later merges, check runs, and issue state; this ledger does not replace exact-final-SHA release validation.
+This older table records the state at SHA `1955eab3d05f72632396eff62ef96d39eedd634b`; the newer snapshot above records later observed state.
 
 ## Historical live roadmap snapshot — 2026-10-01
 

@@ -1,11 +1,11 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Last branch reconciliation: 2026-10-06
+Last branch reconciliation: 2026-10-07
 
 Repository: `bielxdh3/root.ark`
 
-Current-state source: the live issue/PR snapshot in [docs/issue-ledger.md](issue-ledger.md). The dated GitHub sections below remain historical evidence unless a newer section explicitly supersedes them.
+Current-state source: the newest dated issue/PR snapshot in [docs/issue-ledger.md](issue-ledger.md). The latest query recorded source SHA `964f820417baf44f059a04e5363a2a172dccdc7a` on 2026-10-07 UTC, before the documentation commit; it is a point-in-time snapshot, not a claim about later live state. Re-query GitHub before using it as current truth. Older dated GitHub sections remain historical evidence.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
