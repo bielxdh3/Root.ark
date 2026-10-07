@@ -679,6 +679,7 @@ test("chunk upload startup fails closed when chunk-session enumeration cannot be
 
 test("folder lifecycle lock timeouts reject uploads and remove all disposable staging files", { timeout: 30_000 }, async (t) => {
   const uploadId = "lifecycle-timeout-chunk";
+  let timeoutResponseMarker;
   const harness = await createHarness(t, {
     chunkSessions: [{
       uploadId,
@@ -691,12 +692,22 @@ test("folder lifecycle lock timeouts reject uploads and remove all disposable st
         }),
       },
     }],
-    preloadSource: () => [
-      "const lockModule = require(" + JSON.stringify(path.join(ROOT, "services", "fileLifecycleLock.js")) + ");",
-      "const create = lockModule.createFileLifecycleLock;",
-      "lockModule.createFileLifecycleLock = (options) => create({ ...options, timeoutMs: 150, pollMs: 5 });",
-      'process.env.WEBDAV_ENABLED = "true";',
-    ].join("\n"),
+    preloadSource: ({ dir }) => {
+      const sessionDir = path.join(dir, "temp", ".chunks", FOLDER_ID, uploadId);
+      timeoutResponseMarker = path.join(dir, "chunk-timeout-response-marker.txt");
+      return [
+        "const lockModule = require(" + JSON.stringify(path.join(ROOT, "services", "fileLifecycleLock.js")) + ");",
+        "const create = lockModule.createFileLifecycleLock;",
+        "lockModule.createFileLifecycleLock = (options) => create({ ...options, timeoutMs: 150, pollMs: 5 });",
+        'const fs = require("node:fs");',
+        `const expressResponse = require(${JSON.stringify(require.resolve("express/lib/response", { paths: [ROOT] }))});`,
+        `const sessionDir = ${JSON.stringify(sessionDir)};`,
+        `const markerPath = ${JSON.stringify(timeoutResponseMarker)};`,
+        "const originalJson = expressResponse.json;",
+        'expressResponse.json = function (...args) { if (this.statusCode === 503 && this.req?.url?.startsWith("/upload-chunk")) fs.writeFileSync(markerPath, fs.existsSync(sessionDir) ? "present" : "absent"); return originalJson.apply(this, args); };',
+        'process.env.WEBDAV_ENABLED = "true";',
+      ].join("\n");
+    },
   });
   const session = await login(harness.port, "uploader", harness.password);
   const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
@@ -728,6 +739,7 @@ test("folder lifecycle lock timeouts reject uploads and remove all disposable st
     assertRejectedClean(harness, chunk, 503);
     assert.equal(chunk.headers["retry-after"], "5");
     assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId)), false);
+    assert.equal(fs.readFileSync(timeoutResponseMarker, "utf8"), "absent", "chunk session staging is removed before the 503 response is sent");
     assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
 
     const webDavBody = Buffer.from("disposable WebDAV upload");
@@ -742,6 +754,87 @@ test("folder lifecycle lock timeouts reject uploads and remove all disposable st
     assertRejectedClean(harness, webDav, 503);
   } finally {
     releaseLock();
+    await heldOperation;
+  }
+});
+
+test("a timed-out duplicate chunk request cannot mutate an active upload session", { timeout: 30_000 }, async (t) => {
+  const scanner = await startGatedClamAv();
+  t.after(async () => {
+    for (const gate of scanner.scans) gate.release();
+    await new Promise((resolve) => scanner.server.close(resolve));
+  });
+  const uploadId = "Concurrent-Timeout-Chunk";
+  const harness = await createHarness(t, {
+    chunkSessions: [{
+      uploadId,
+      files: {
+        "metadata.json": legacyChunkMetadata(uploadId, {
+          originalName: "concurrent-timeout.txt",
+          fileName: "concurrent-timeout.txt",
+          totalChunks: 2,
+          encryptionLevel: "none",
+        }),
+        "0.part": Buffer.alloc(2 * 1024 * 1024, 0x61),
+      },
+    }],
+    preloadSource: () => {
+      return [
+        "const lockModule = require(" + JSON.stringify(path.join(ROOT, "services", "fileLifecycleLock.js")) + ");",
+        "const create = lockModule.createFileLifecycleLock;",
+        "lockModule.createFileLifecycleLock = (options) => create({ ...options, timeoutMs: 200, pollMs: 5 });",
+      ].join("\n");
+    },
+    envOverrides: { UPLOAD_SCAN_PROVIDER: "clamav", CLAMAV_HOST: "127.0.0.1", CLAMAV_PORT: String(scanner.port) },
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
+  const lock = createFileLifecycleLock({
+    directory: path.join(harness.dir, "data", ".rootark-cloud-file-locks"),
+    timeoutMs: 10_000,
+    pollMs: 5,
+  });
+  let releaseFolder;
+  let markFolderHeld;
+  const folderHeld = new Promise((resolve) => { markFolderHeld = resolve; });
+  const heldOperation = lock.runFolder(FOLDER_ID, async () => {
+    markFolderHeld();
+    await new Promise((resolve) => { releaseFolder = resolve; });
+  });
+  await folderHeld;
+
+  try {
+    const uploadArgs = {
+      uploadId,
+      originalName: "concurrent-timeout.txt",
+      chunkIndex: 1,
+      totalChunks: 2,
+      bytes: Buffer.alloc(2 * 1024 * 1024, 0x62),
+    };
+    const firstPromise = uploadChunk(harness.port, session, uploadArgs);
+    const firstScanDeadline = Date.now() + 5000;
+    while (scanner.scans.length < 1 && Date.now() < firstScanDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(scanner.scans[0], "first upload did not reach scanning");
+    await scanner.scans[0].started;
+
+    const secondArgs = {
+      ...uploadArgs,
+      uploadId: process.platform === "win32" ? uploadId.toLowerCase() : uploadId,
+    };
+    const secondPromise = uploadChunk(harness.port, session, secondArgs);
+    const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+    const stagedPath = path.join(sessionDir, "assembled.upload");
+    const second = await secondPromise;
+    assert.equal(second.status, 503, second.body);
+    assert.equal(fs.existsSync(stagedPath), true, "a timed-out duplicate request must not remove another request's staged file");
+    const activeMetadata = JSON.parse(fs.readFileSync(path.join(sessionDir, "metadata.json"), "utf8"));
+    assert.notEqual(activeMetadata.__resumeBlocked, true, "an alias request must not block the active session metadata");
+
+    scanner.scans[0].release();
+    const first = await firstPromise;
+    assert.equal(first.status, 503, first.body);
+  } finally {
+    releaseFolder();
     await heldOperation;
   }
 });

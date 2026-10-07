@@ -363,9 +363,10 @@ async function ensureCloudFileCached(folderId, fileName, localPath, area = "uplo
   }
 }
 
-function handleCloudLifecycleMutation(operation, res, itemType) {
+function handleCloudLifecycleMutation(operation, res, itemType, onTimeout) {
   return operation.catch((error) => {
     if (["FILE_LIFECYCLE_LOCK_TIMEOUT", "FILE_LIFECYCLE_LOCK_UNAVAILABLE"].includes(error?.code)) {
+      onTimeout?.();
       if (!res || res.headersSent) throw error;
       return res.status(503).set("Retry-After", "5").json({ error: itemType + " temporariamente indisponivel" });
     }
@@ -377,8 +378,22 @@ function runCloudFileLifecycleMutation(folderId, fileName, work, res) {
   return handleCloudLifecycleMutation(cloudFileLifecycleLock.run(folderId, fileName, work), res, "Arquivo");
 }
 
-function runCloudFolderLifecycleMutation(folderId, work, res) {
-  return handleCloudLifecycleMutation(cloudFileLifecycleLock.runFolder(folderId, work), res, "Pasta");
+function runCloudFolderLifecycleMutation(folderId, work, res, onTimeout) {
+  return handleCloudLifecycleMutation(cloudFileLifecycleLock.runFolder(folderId, work), res, "Pasta", onTimeout);
+}
+
+function withChunkUploadSessionLock(handler) {
+  return (req, res, next) => {
+    const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
+    const uploadId = String(req.body?.uploadId || "");
+    const sessionDir = getChunkSessionDir(folderId, uploadId);
+    if (!sessionDir) return handler(req, res, next);
+
+    const sessionIdentity = path.resolve(sessionDir);
+    const lockIdentity = process.platform === "win32" ? sessionIdentity.toLowerCase() : sessionIdentity;
+    const operation = cloudFileLifecycleLock.runFolder(`chunk-upload:${lockIdentity}`, () => handler(req, res, next));
+    return handleCloudLifecycleMutation(operation, res, "Upload", () => removeChunkUploadIncomingFile(req.file));
+  };
 }
 
 function processCloudTempMutationAfterLifecycle(folderId, fileName) {
@@ -6654,7 +6669,7 @@ async function assembleChunkedUpload(sessionDir, destinationPath, totalChunks) {
   }
 }
 
-app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUploadFolder, handleChunkUploadSingle, async (req, res) => {
+app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUploadFolder, handleChunkUploadSingle, withChunkUploadSessionLock(async (req, res) => {
   const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
   const uploadId = String(req.body.uploadId || "");
   const originalName = path.basename(String(req.body.originalName || ""));
@@ -6808,7 +6823,11 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
           chunkedUpload: true,
           encryptionMetadata,
         });
-      }, res);
+      }, res, () => {
+        fs.rmSync(stagedPath, { force: true });
+        if (publishedPath) fs.rmSync(publishedPath, { force: true });
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+      });
     } catch (error) {
       fs.rmSync(stagedPath, { force: true });
       if (publishedPath) fs.rmSync(publishedPath, { force: true });
@@ -6829,7 +6848,7 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
     console.error("Erro no upload em blocos:", error.code || error.name || "operation_failed");
     res.status(500).json({ error: "Upload em blocos nao concluido" });
   }
-});
+}));
 
 app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFolder, rejectLargeSingleUpload, handleUploadSingle, async (req, res) => {
   const originalName = path.basename(req.file?.originalname || "");

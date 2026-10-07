@@ -73,14 +73,31 @@ function request(port, requestPath, { method = "GET", headers = {}, body = "" } 
   });
 }
 
-async function waitForNoActiveRequests(directory, timeoutMs = 5_000) {
+async function waitForNoActiveRequests(directory, timeoutMs = 15_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (!fs.existsSync(directory) || fs.readdirSync(directory).length === 0) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error(`active request leases did not clear within ${timeoutMs}ms`);
+  const remaining = fs.existsSync(directory) ? fs.readdirSync(directory) : [];
+  throw new Error(`active request leases did not clear within ${timeoutMs}ms; remaining leases: ${remaining.join(", ") || "none"}`);
 }
+
+test("active request lease wait allows delayed teardown and reports remaining leases", { timeout: 20_000 }, async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-active-request-lease-wait-"));
+  const leasePath = path.join(directory, "fixture-lease.json");
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  fs.writeFileSync(leasePath, "{}\n");
+  const delayedRelease = setTimeout(() => fs.rmSync(leasePath, { force: true }), 5_100);
+  try {
+    await waitForNoActiveRequests(directory);
+  } finally {
+    clearTimeout(delayedRelease);
+  }
+
+  fs.writeFileSync(leasePath, "{}\n");
+  await assert.rejects(waitForNoActiveRequests(directory, 10), /remaining leases: fixture-lease\.json/);
+});
 
 function startS3Fixture() {
   const getObjects = [];
