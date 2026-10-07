@@ -348,6 +348,7 @@ async function ensureCloudFileCached(folderId, fileName, localPath, area = "uplo
 function handleCloudLifecycleMutation(operation, res, itemType) {
   return operation.catch((error) => {
     if (["FILE_LIFECYCLE_LOCK_TIMEOUT", "FILE_LIFECYCLE_LOCK_UNAVAILABLE"].includes(error?.code)) {
+      if (!res || res.headersSent) throw error;
       return res.status(503).set("Retry-After", "5").json({ error: itemType + " temporariamente indisponivel" });
     }
     throw error;
@@ -2547,6 +2548,7 @@ function createOpenFileToken(folderId, fileName, options = {}) {
     filePath: options.filePath || null,
     downloadName: options.downloadName || fileName,
     cloudFileName: options.cloudFileName || path.basename(options.filePath || fileName),
+    managerReviewUsername: options.managerReviewUsername || null,
     expiresAt: Date.now() + OPEN_FILE_TOKEN_TTL_MS,
   });
   return token;
@@ -3360,18 +3362,19 @@ async function cleanupExpiredTrashItems() {
           const pending = trashService.queueRemoteDeletion({ item: current, deletedBy: "system", loaders: getTrashLoaders(), provider: getCloudStorageStatus().provider });
           if (pending.status === "remote_delete_pending" && pending.metadata?.remoteDeletion) {
             auditLog("trash.remote_delete.queued", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "success", {});
-            void processCloudTrashDeletion(pending)
-              .then((result) => {
-                const persisted = trashRepository.getTrashItem(current.id) || result;
-                const state = persisted.metadata?.remoteDeletion?.state;
-                if (state === "completed") auditLog("trash.remote_delete.completed", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "success", {});
-                else if (state === "cancelled") auditLog("trash.remote_delete.cancelled", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "success", { reason: persisted.metadata?.remoteDeletion?.cancellationReason });
-                else if (state === "terminal_failure") auditLog("trash.remote_delete.failed", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "failure", { category: persisted.metadata?.remoteDeletion?.failureCategory });
-              })
-              .catch((error) => {
-                auditLog("trash.remote_delete.operational_failure", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "failure", { category: error.code || "persistence_error" });
-                console.error("[cloud-trash] remote deletion state could not be persisted:", error.code || "persistence_error");
-              });
+            try {
+              const result = await processCloudTrashDeletion(pending);
+              const persisted = trashRepository.getTrashItem(current.id) || result;
+              const state = persisted.metadata?.remoteDeletion?.state;
+              if (state === "completed") auditLog("trash.remote_delete.completed", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "success", {});
+              else if (state === "cancelled") auditLog("trash.remote_delete.cancelled", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "success", { reason: persisted.metadata?.remoteDeletion?.cancellationReason });
+              else if (state === "terminal_failure") auditLog("trash.remote_delete.failed", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "failure", { category: persisted.metadata?.remoteDeletion?.failureCategory });
+              else return false;
+            } catch (error) {
+              auditLog("trash.remote_delete.operational_failure", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "failure", { category: error.code || "persistence_error" });
+              console.error("[cloud-trash] remote deletion state could not be persisted:", error.code || "persistence_error");
+              return false;
+            }
           }
         }
         if (!isCloudStorageEnabled()) {
@@ -4804,6 +4807,8 @@ const createRouteRateLimit = () => rateLimit({
   message: { error: "Muitas solicitações. Tente novamente mais tarde." },
 });
 const versionsRateLimit = createRouteRateLimit();
+const fileOpenTokenRateLimit = createRouteRateLimit();
+const versionOpenTokenRateLimit = createRouteRateLimit();
 const shareRateLimit = createRouteRateLimit();
 const pendingRepairRateLimit = createRouteRateLimit();
 const approveRateLimit = createRouteRateLimit();
@@ -5619,6 +5624,7 @@ app.put("/folders/:id/temporary", authenticate, (req, res) => {
     return res.status(403).json({ error: "Permissao negada para editar esta pasta" });
   }
   return runCloudFolderLifecycleMutation(folderId, () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
     const currentFolders = loadFolders();
     const currentFolder = currentFolders.find((item) => item.id === folderId);
     if (!currentFolder) return res.status(404).json({ error: "Pasta nao encontrada" });
@@ -5651,6 +5657,8 @@ app.delete("/folders/:id", authenticate, (req, res) => {
     return res.status(403).json({ error: "Permissao negada: delete" });
   }
   return runCloudFolderLifecycleMutation(folderId, () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    if (!canMoveToTrash(req)) return res.status(403).json({ error: "Permissao negada: delete" });
     const currentFolder = loadFolders().find((item) => item.id === folderId);
     if (!currentFolder) return res.status(404).json({ error: "Pasta nao encontrada" });
     if (!hasFolderEditAccess(req, currentFolder)) return res.status(403).json({ error: "Permissao negada para excluir esta pasta" });
@@ -5737,7 +5745,7 @@ app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req
   sendOptimizedFile(req, res, filePath, name, "attachment");
 });
 
-app.post("/file-open-token", authenticate, requirePermission("listFiles"), async (req, res) => {
+app.post("/file-open-token", fileOpenTokenRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const folder = getReadableFolderOrRespond(req, res, req.body.folderId);
@@ -5763,6 +5771,7 @@ app.post("/file-open-token", authenticate, requirePermission("listFiles"), async
   }
 
   const filePath = path.join(folder.uploadDir, name);
+  if (isCloudStorageEnabled() && !isExistingFile(filePath) && !consumeCloudMetadataRateLimit(req, res)) return;
   await ensureCloudFileCached(folder.id, name, filePath, "uploads", () => !isFileInTrash(folder.id, name));
   if (!refreshAuthenticatedUser(req, res)) return;
   const currentFolder = getFolderById(folder.id);
@@ -5778,7 +5787,10 @@ app.post("/file-open-token", authenticate, requirePermission("listFiles"), async
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
-  const openToken = createOpenFileToken(folder.id, name);
+  const managerReviewUsername = restoreProviderOrphans.isSuppressed(folder.id, name, "uploads")
+    ? req.user.username
+    : null;
+  const openToken = createOpenFileToken(folder.id, name, { managerReviewUsername });
   if (req.body.download === true) {
     logAnalyticsEvent("download", {
       filename: name,
@@ -5800,7 +5812,11 @@ app.post("/file-open-token", authenticate, requirePermission("listFiles"), async
   });
 });
 
-app.get("/open-file/:token/:name", async (req, res) => {
+app.get("/open-file/:token/:name", (req, res, next) => {
+  const entry = openFileTokens.get(String(req.params.token || ""));
+  if (!entry?.managerReviewUsername) return next();
+  return authenticate(req, res, next);
+}, async (req, res) => {
   cleanupOpenFileTokens();
 
   const openToken = String(req.params.token || "");
@@ -5825,12 +5841,23 @@ app.get("/open-file/:token/:name", async (req, res) => {
 
   const filePath = entry.filePath || path.join(getFolderStoragePath("./uploads", entry.folderId), name);
   const cloudFileName = entry.cloudFileName || entry.downloadName || name;
-  if (restoreProviderOrphans.isSuppressed(entry.folderId, cloudFileName)) {
-    openFileTokens.delete(openToken);
+  const canRedeemManagerReviewToken = () => {
+    if (!entry.managerReviewUsername) return !restoreProviderOrphans.isSuppressed(entry.folderId, cloudFileName);
+    return Boolean(
+      req.user &&
+      req.user.username === entry.managerReviewUsername &&
+      refreshAuthenticatedUser(req, res) &&
+      canManageAccess(req)
+    );
+  };
+  if (!canRedeemManagerReviewToken()) {
+    if (res.headersSent) return;
+    if (!entry.managerReviewUsername) openFileTokens.delete(openToken);
     return res.status(404).send("Arquivo nao encontrado");
   }
   await ensureCloudFileCached(entry.folderId, cloudFileName, filePath, "uploads", () => !isFileInTrash(entry.folderId, entry.fileName), entry.fileName);
-  if (restoreProviderOrphans.isSuppressed(entry.folderId, cloudFileName)) {
+  if (!canRedeemManagerReviewToken()) {
+    if (res.headersSent) return;
     openFileTokens.delete(openToken);
     return res.status(404).send("Arquivo nao encontrado");
   }
@@ -6532,6 +6559,11 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
     let publishedPath = null;
     try {
       await runCloudFolderLifecycleMutation(folderId, async () => {
+        if (!refreshAuthenticatedUser(req, res)) return;
+        const currentFolder = getFolderById(folderId);
+        if (!currentFolder || !isFolderAvailable(folderId)) return res.status(404).json({ error: "Pasta nao encontrada" });
+        if (!req.user?.permissions?.upload || !hasFolderAccess(req, currentFolder)) return res.status(403).json({ error: "Permissao negada para upload nesta pasta" });
+        req.uploadFolder = { ...currentFolder, ...ensureFolderDirectories(folderId) };
         finalFileName = getAvailableUploadFileName(metadata.fileName, folderId, true);
         encryptionMetadata = encryptFileInPlace(stagedPath, {
           req,
@@ -6556,12 +6588,18 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
           chunkedUpload: true,
           encryptionMetadata,
         });
-      });
+      }, res);
     } catch (error) {
       fs.rmSync(stagedPath, { force: true });
       if (publishedPath) fs.rmSync(publishedPath, { force: true });
       fs.rmSync(sessionDir, { recursive: true, force: true });
       return res.status(400).json({ error: error.message || "Falha ao criptografar arquivo" });
+    }
+    if (res.headersSent) {
+      fs.rmSync(stagedPath, { force: true });
+      if (publishedPath) fs.rmSync(publishedPath, { force: true });
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+      return;
     }
     fs.rmSync(sessionDir, { recursive: true, force: true });
     processCloudTempMutationAfterLifecycle(folderId, finalFileName);
@@ -6597,6 +6635,11 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
   let payload;
   try {
     await runCloudFolderLifecycleMutation(folderId, async () => {
+      if (!refreshAuthenticatedUser(req, res)) return;
+      let currentFolder = getFolderById(folderId);
+      if (!currentFolder || !isFolderAvailable(folderId)) return res.status(404).json({ error: "Pasta nao encontrada" });
+      if (!req.user?.permissions?.upload || !hasFolderAccess(req, currentFolder)) return res.status(403).json({ error: "Permissao negada para upload nesta pasta" });
+      req.uploadFolder = { ...currentFolder, ...ensureFolderDirectories(folderId) };
       fileName = getAvailableUploadFileName(originalName, folderId, true);
       const scan = await scanUploadBeforePending(req, {
         filePath: incomingPath,
@@ -6609,6 +6652,12 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
         payload = { rejected: true, status: scan.status || 400, error: scan.error || "Upload bloqueado por seguranca" };
         return;
       }
+
+      if (!refreshAuthenticatedUser(req, res)) return;
+      currentFolder = getFolderById(folderId);
+      if (!currentFolder || !isFolderAvailable(folderId)) return res.status(404).json({ error: "Pasta nao encontrada" });
+      if (!req.user?.permissions?.upload || !hasFolderAccess(req, currentFolder)) return res.status(403).json({ error: "Permissao negada para upload nesta pasta" });
+      req.uploadFolder = { ...currentFolder, ...ensureFolderDirectories(folderId) };
 
       let encryptionMetadata;
       try {
@@ -6639,11 +6688,17 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
         compressedUpload: uploadWasCompressed,
         encryptionMetadata,
       });
-    });
+    }, res);
   } catch (error) {
     fs.rmSync(incomingPath, { force: true });
     if (finalTempPath) fs.rmSync(finalTempPath, { force: true });
     return res.status(500).json({ error: error.message || "Nao foi possivel finalizar o upload" });
+  }
+
+  if (res.headersSent) {
+    fs.rmSync(incomingPath, { force: true });
+    if (finalTempPath) fs.rmSync(finalTempPath, { force: true });
+    return;
   }
 
   if (payload?.rejected) {
@@ -7098,7 +7153,7 @@ async function handleWebDavPut(req, res, segments) {
         size: written,
         mimeType: getMimeType(target.fileName),
       });
-    });
+    }, res);
     if (res.headersSent) {
       fs.rmSync(incomingPath, { force: true });
       return;
@@ -8109,7 +8164,7 @@ app.get("/versions/:filename", versionsRateLimit, authenticate, requirePermissio
 });
 
 
-app.post("/versions/:filename/initialize", versionsRateLimit, authenticate, requirePermission("listFiles"), (req, res) => {
+app.post("/versions/:filename/initialize", versionsRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
@@ -8118,8 +8173,20 @@ app.post("/versions/:filename/initialize", versionsRateLimit, authenticate, requ
   if (isFileInTrash(folder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
   if (!hasFileAccess(req, folder, name)) return res.status(403).json({ error: "Acesso negado a este arquivo" });
   const filePath = path.join(folder.uploadDir, name);
+  if (!isExistingFile(filePath)) {
+    if (!isCloudStorageEnabled()) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (!consumeCloudMetadataRateLimit(req, res)) return;
+    await ensureCloudFileCached(folder.id, name, filePath, "uploads", () => !isFileInTrash(folder.id, name));
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name)) return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  if (!isFolderAvailable(currentFolder.id) || isFileInTrash(currentFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (isFileExpired(currentFolder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
   if (!isExistingFile(filePath)) return res.status(404).json({ error: "Arquivo nao encontrado" });
-  const { history } = ensureVersionHistory(folder, name, normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, name)).owner, "Versao inicial");
+  const currentFolderWithPaths = { ...currentFolder, ...ensureFolderDirectories(currentFolder.id) };
+  const { history } = ensureVersionHistory(currentFolderWithPaths, name, normalizeFilePermissionEntry(getFilePermissionEntry(currentFolder.id, name)).owner, "Versao inicial");
   return res.json({ folderId: folder.id, fileName: name, currentVersion: history.currentVersion });
 });
 
@@ -8169,7 +8236,7 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
   sendOptimizedFile(req, res, target.filePath, name, "attachment");
 });
 
-app.post("/version-open-token", authenticate, requirePermission("listFiles"), async (req, res) => {
+app.post("/version-open-token", versionOpenTokenRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const versionNumber = Number(req.body.version);
@@ -8195,6 +8262,7 @@ app.post("/version-open-token", authenticate, requirePermission("listFiles"), as
   const target = getVersionFilePath(folder, name, versionNumber);
   if (target?.version?.storedAs) {
     if (restoreProviderOrphans.isSuppressed(folder.id, target.version.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+    if (isCloudStorageEnabled() && !isExistingFile(target.filePath) && !consumeCloudMetadataRateLimit(req, res)) return;
     await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads", () => !isFileInTrash(folder.id, name), name);
   }
   if (!refreshAuthenticatedUser(req, res)) return;

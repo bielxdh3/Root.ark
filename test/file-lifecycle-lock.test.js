@@ -31,6 +31,41 @@ test("file lifecycle lock serializes the same file and permits reentrant work", 
   assert.equal(secondStarted, true);
 });
 
+test("file lifecycle lock follows filesystem case sensitivity for file-name aliases", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-case-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 1000, pollMs: 5 });
+  let releaseFirst;
+  let signalFirst;
+  let signalSecond;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const firstEntered = new Promise((resolve) => { signalFirst = resolve; });
+  const secondEntered = new Promise((resolve) => { signalSecond = resolve; });
+  let secondStarted = false;
+
+  const runFile = (fileName, work) => lock.runAcrossFolders([], "root", fileName, work);
+  const first = runFile("Report.txt", async () => {
+    signalFirst();
+    await firstGate;
+  });
+  await firstEntered;
+  const second = runFile("report.txt", async () => {
+    secondStarted = true;
+    signalSecond();
+  });
+
+  if (process.platform === "win32") {
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(secondStarted, false, "case aliases must share a lock on case-insensitive filesystems");
+  } else {
+    await secondEntered;
+    assert.equal(secondStarted, true, "case-distinct names must retain separate locks on POSIX filesystems");
+  }
+
+  releaseFirst();
+  await Promise.all([first, second]);
+});
+
 test("file lifecycle lock fails closed on an existing owner and never steals it", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-stale-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));

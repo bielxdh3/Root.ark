@@ -19,6 +19,7 @@ const OBJECTS = new Map([
   ["rootark/uploads/root/orphan-private.txt.v1", Buffer.from("orphan stored version fixture")],
   ["rootark/uploads/root/history-only.txt.v9", Buffer.from("history-only orphan version fixture")],
   ["rootark/uploads/root/version-primary.txt", Buffer.from("authorized version primary fixture")],
+  ["rootark/uploads/root/cloud-only-version-init.txt", Buffer.from("cloud-only version initialization fixture")],
   ["rootark/uploads/root/version-primary.txt.v1", Buffer.from("suppressed provider-only version fixture")],
   ["rootark/uploads/root/version-primary.txt.v2", Buffer.from("authorized stored version fixture")],
   ["rootark/uploads/root/version-race.txt.v1", Buffer.from("version download race fixture")],
@@ -38,6 +39,8 @@ const OBJECTS = new Map([
   ["rootark/temp/root/orphan-pending.txt", Buffer.from("orphan pending fixture")],
   ["rootark/temp/root/restore-orphan-pending.txt", Buffer.from("post-backup pending bytes")],
   ["rootark/uploads/root/cloud-limit.txt", Buffer.from("cloud cache miss limiter fixture")],
+  ["rootark/uploads/root/cloud-open-token-limit.txt", Buffer.from("cloud open token limiter fixture")],
+  ["rootark/uploads/root/cloud-open-token-limit.txt.v1", Buffer.from("cloud version open token limiter fixture")],
   ["rootark/uploads/root/restore-limit.txt", Buffer.from("current restore limiter fixture")],
   ["rootark/uploads/root/restore-limit.txt.v1", Buffer.from("old restore limiter fixture")],
   ["rootark/uploads/root/Case-Orphan.TXT", Buffer.from("suppressed case-alias provider bytes")],
@@ -203,9 +206,11 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     "root/private.txt.v7": { public: false, owner: "viewer", users: {} },
     "root/denied.v2": { public: false, owner: "owner", users: {} },
     "root/cloud-limit.txt": { public: false, owner: "cache-limiter", users: {} },
+    "root/cloud-open-token-limit.txt": { public: false, owner: "cache-limiter", users: {} },
     "root/local-limit.txt": { public: false, owner: "cache-limiter", users: {} },
     "root/restore-limit.txt": { public: false, owner: "restore-limiter", users: {} },
     "root/version-primary.txt": { public: false, owner: "viewer", users: { viewer: { read: true, edit: true } } },
+    "root/cloud-only-version-init.txt": { public: false, owner: "viewer", users: { viewer: { read: true, edit: true } } },
     "root/restore-race.txt": { public: false, owner: "viewer", users: { viewer: { read: true, edit: true } } },
     "root/issued-token-race.txt": { public: false, owner: "viewer", users: { viewer: { read: true, edit: false } } },
   }));
@@ -223,6 +228,10 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     "root/restore-limit.txt": { currentVersion: 2, versions: [
       { version: 1, storedAs: "restore-limit.txt.v1", size: OBJECTS.get("rootark/uploads/root/restore-limit.txt.v1").length },
       { version: 2, storedAs: "restore-limit.txt", size: OBJECTS.get("rootark/uploads/root/restore-limit.txt").length },
+    ] },
+    "root/cloud-open-token-limit.txt": { currentVersion: 2, versions: [
+      { version: 1, storedAs: "cloud-open-token-limit.txt.v1", size: OBJECTS.get("rootark/uploads/root/cloud-open-token-limit.txt.v1").length },
+      { version: 2, storedAs: "cloud-open-token-limit.txt", size: OBJECTS.get("rootark/uploads/root/cloud-open-token-limit.txt").length },
     ] },
     "root/private.txt": { currentVersion: 2, versions: [
       { version: 1, storedAs: "private.txt.v1", size: OBJECTS.get("rootark/uploads/root/private.txt.v1").length },
@@ -393,7 +402,9 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const list = await request(port, "/list", { headers: { cookie, referer: "https://attacker.invalid/" } });
   assert.equal(list.status, 200, list.body);
   assert.equal(JSON.parse(list.body).some((file) => file.name === "restore-orphan.txt"), false, "persisted restore orphans remain hidden after server restart");
-  assert.deepEqual(JSON.parse(list.body).map((file) => file.name).sort(), ["ambiguous-orphan.v1", "budget.v2", "encrypted.txt", "legacy.v9", "notes.v2", "private.txt.v7", "private.txt.v8", "public.txt", "version-primary.txt"]);
+  const expectedVisibleNames = ["ambiguous-orphan.v1", "budget.v2", "cloud-only-version-init.txt", "encrypted.txt", "legacy.v9", "notes.v2", "private.txt.v7", "private.txt.v8", "public.txt", "version-primary.txt"];
+  if (process.platform !== "win32") expectedVisibleNames.push("case-orphan.txt");
+  assert.deepEqual(JSON.parse(list.body).map((file) => file.name).sort(), expectedVisibleNames.sort());
   assert.deepEqual(cloud.getObjects, [], "listing reads provider metadata without materializing file bytes");
   assert.equal(fs.existsSync(path.join(directory, "uploads", "budget.v2")), false, "ordinary cloud file is visible before hydration");
   OBJECTS.set("rootark/uploads/root/revoke-download.txt", Buffer.from("download access revocation fixture"));
@@ -410,11 +421,26 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const ordinaryCloudFile = await request(port, "/files/budget.v2", { headers: { cookie } });
   assert.equal(ordinaryCloudFile.status, 200, "an ordinary cloud-only .vN file must be downloadable");
   assert.equal(ordinaryCloudFile.body, "ordinary cloud suffix fixture");
+  const cloudOnlyVersionInit = await mutate("/versions/cloud-only-version-init.txt/initialize?folderId=root", "POST", {});
+  assert.equal(cloudOnlyVersionInit.status, 200, cloudOnlyVersionInit.body);
+  assert.equal(JSON.parse(cloudOnlyVersionInit.body).fileName, "cloud-only-version-init.txt");
+  assert.equal(fs.existsSync(path.join(directory, "uploads", "cloud-only-version-init.txt")), true, "version initialization hydrates an authorized cloud-only file");
+  assert.equal(cloud.getObjects.includes("rootark/uploads/root/cloud-only-version-init.txt"), true);
+
   const restoreOrphanFile = await request(port, "/files/restore-orphan.txt", { headers: { cookie } });
   assert.equal(restoreOrphanFile.status, 403, "restore-orphan provider objects are denied despite legacy default-public ACLs");
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/restore-orphan.txt"), false, "denied restore-orphan downloads never hydrate provider bytes");
   const restoreOrphanToken = await mutate("/file-open-token", "POST", { name: "restore-orphan.txt" });
   assert.equal(restoreOrphanToken.status, 403, "restore-orphan files cannot issue open tokens");
+  const managerOrphanToken = await mutateAsOwner("/file-open-token", "POST", { name: "restore-orphan.txt" });
+  assert.equal(managerOrphanToken.status, 200, managerOrphanToken.body);
+  const managerOrphanUrl = JSON.parse(managerOrphanToken.body).url;
+  const managerOrphanOpen = await request(port, managerOrphanUrl, { headers: { cookie: ownerCookie } });
+  assert.equal(managerOrphanOpen.status, 200, "a manager-issued orphan review token must remain usable by its manager");
+  assert.equal(managerOrphanOpen.body, "post-backup provider bytes");
+  assert.equal(cloud.getObjects.includes("rootark/uploads/root/restore-orphan.txt"), true, "manager review may hydrate the reviewed provider orphan");
+  const managerOrphanOpenAnonymous = await request(port, managerOrphanUrl);
+  assert.notEqual(managerOrphanOpenAnonymous.status, 200, "a manager review token must not become an anonymous bearer link");
   const restoreOrphanSearch = await request(port, "/files/search?q=restore-orphan", { headers: { cookie } });
   assert.equal(restoreOrphanSearch.status, 200, restoreOrphanSearch.body);
   assert.deepEqual(JSON.parse(restoreOrphanSearch.body), [], "search uses the same restore-orphan visibility boundary");
@@ -818,7 +844,17 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const limiterBody = JSON.stringify({ username: "cache-limiter", password });
   const limiterLogin = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(limiterBody) }, body: limiterBody });
   assert.equal(limiterLogin.status, 200, limiterLogin.body);
-  const limiterCookie = limiterLogin.headers["set-cookie"].map((value) => value.split(";", 1)[0]).join("; ");
+  const limiterCookies = limiterLogin.headers["set-cookie"].map((value) => value.split(";", 1)[0]);
+  const limiterCookie = limiterCookies.join("; ");
+  const limiterCsrf = limiterCookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1];
+  const limiterMutation = (requestPath, payload) => {
+    const body = JSON.stringify(payload);
+    return request(port, requestPath, {
+      method: "POST",
+      headers: { cookie: limiterCookie, origin: `http://127.0.0.1:${port}`, "x-csrf-token": limiterCsrf, "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+      body,
+    });
+  };
   const cachePath = path.join(directory, "uploads", "cloud-limit.txt");
   const providerGetsBeforeCacheBudget = cloud.getObjects.length;
   for (let index = 0; index < CLOUD_METADATA_REQUEST_LIMIT; index += 1) {
@@ -840,6 +876,34 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const limitedCloudMiss = await request(port, "/files/cloud-limit.txt", { headers: { cookie: limiterCookie } });
   assert.equal(limitedCloudMiss.status, 429, limitedCloudMiss.body);
   assert.equal(cloud.getObjects.length, cloudMissesBeforeLimit, "the rejected cloud cache miss is stopped before provider GET");
+
+  const openTokenCachePath = path.join(directory, "uploads", "cloud-open-token-limit.txt");
+  const providerGetsBeforeOpenTokenBudget = cloud.getObjects.length;
+  for (let index = 0; index < CLOUD_METADATA_REQUEST_LIMIT; index += 1) {
+    fs.rmSync(openTokenCachePath, { force: true });
+    const response = await limiterMutation("/file-open-token", { name: "cloud-open-token-limit.txt" });
+    assert.equal(response.status, 200, response.body);
+  }
+  assert.equal(cloud.getObjects.length - providerGetsBeforeOpenTokenBudget, CLOUD_METADATA_REQUEST_LIMIT, "open-token cloud misses consume the metadata budget");
+  fs.rmSync(openTokenCachePath, { force: true });
+  const providerGetsAtOpenTokenLimit = cloud.getObjects.length;
+  const limitedOpenToken = await limiterMutation("/file-open-token", { name: "cloud-open-token-limit.txt" });
+  assert.equal(limitedOpenToken.status, 429, limitedOpenToken.body);
+  assert.equal(cloud.getObjects.length, providerGetsAtOpenTokenLimit, "a rejected open-token cache miss does not call the provider");
+
+  const versionOpenTokenCachePath = path.join(directory, "uploads", "cloud-open-token-limit.txt.v1");
+  const providerGetsBeforeVersionOpenTokenBudget = cloud.getObjects.length;
+  for (let index = 0; index < CLOUD_METADATA_REQUEST_LIMIT; index += 1) {
+    fs.rmSync(versionOpenTokenCachePath, { force: true });
+    const response = await limiterMutation("/version-open-token", { name: "cloud-open-token-limit.txt", version: 1 });
+    assert.equal(response.status, 200, response.body);
+  }
+  assert.equal(cloud.getObjects.length - providerGetsBeforeVersionOpenTokenBudget, CLOUD_METADATA_REQUEST_LIMIT, "version-token cloud misses consume the metadata budget");
+  fs.rmSync(versionOpenTokenCachePath, { force: true });
+  const providerGetsAtVersionOpenTokenLimit = cloud.getObjects.length;
+  const limitedVersionOpenToken = await limiterMutation("/version-open-token", { name: "cloud-open-token-limit.txt", version: 1 });
+  assert.equal(limitedVersionOpenToken.status, 429, limitedVersionOpenToken.body);
+  assert.equal(cloud.getObjects.length, providerGetsAtVersionOpenTokenLimit, "a rejected version-token cache miss does not call the provider");
 
   const restoreLimiterBody = JSON.stringify({ username: "restore-limiter", password });
   const restoreLimiterLogin = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(restoreLimiterBody) }, body: restoreLimiterBody });

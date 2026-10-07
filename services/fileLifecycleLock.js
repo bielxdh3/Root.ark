@@ -10,7 +10,9 @@ function createFileLifecycleLock({ directory, timeoutMs = 30_000, pollMs = 25 } 
   const context = new AsyncLocalStorage();
 
   function lockPathFor(folderId, fileName) {
-    const identity = `${String(folderId || "root")}\0${path.basename(String(fileName || ""))}`;
+    const basename = path.basename(String(fileName || ""));
+    const fileIdentity = process.platform === "win32" ? basename.toLowerCase() : basename;
+    const identity = `${String(folderId || "root")}\0${fileIdentity}`;
     const digest = crypto.createHash("sha256").update(identity).digest("hex");
     return path.join(lockDirectory, `${digest}.lock`);
   }

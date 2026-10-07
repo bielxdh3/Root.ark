@@ -10,6 +10,7 @@ const { spawn } = require("node:child_process");
 const test = require("node:test");
 
 const ROOT = path.resolve(__dirname, "..");
+const SERVER = process.env.ROOTARK_TEST_SERVER || path.join(ROOT, "server.js");
 
 function getUnusedPort() {
   return new Promise((resolve, reject) => {
@@ -131,7 +132,7 @@ test("rename and move reject sessions revoked while waiting for a file lifecycle
   };
   delete env.CLOUD_STORAGE_PROVIDER;
   delete env.TRUSTED_PROXIES;
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: directory, env, stdio: "ignore", windowsHide: true });
+  const child = spawn(process.execPath, [SERVER], { cwd: directory, env, stdio: "ignore", windowsHide: true });
   t.after(async () => {
     fs.writeFileSync(gateReleasePath, "release");
     releaseScan();
@@ -212,4 +213,100 @@ test("rename and move reject sessions revoked while waiting for a file lifecycle
   const pendingUploads = JSON.parse(fs.readFileSync(path.join(dataDir, "pending-uploads.json"), "utf8"));
   assert.equal(Boolean(pendingUploads["root/webdav-first.txt"]), true);
   assert.equal(Boolean(pendingUploads["root/webdav-stale.txt"]), false, "permission revoked during the wait prevents WebDAV upload registration");
+
+  const folderLockDirectory = path.join(dataDir, ".rootark-cloud-file-locks");
+  const holdFolderLock = async (folderId) => {
+    const marker = path.join(directory, folderId + "-folder-lock-held");
+    const release = path.join(directory, folderId + "-folder-lock-release");
+    const lockScript = path.join(directory, folderId + "-hold-folder-lock.cjs");
+    fs.rmSync(marker, { force: true });
+    fs.rmSync(release, { force: true });
+    fs.writeFileSync(lockScript, [
+      'const fs = require("node:fs");',
+      "const { createFileLifecycleLock } = require(" + JSON.stringify(path.join(ROOT, "services", "fileLifecycleLock.js")) + ");",
+      "const lock = createFileLifecycleLock({ directory: " + JSON.stringify(folderLockDirectory) + ", timeoutMs: 10000, pollMs: 5 });",
+      "lock.runFolder(" + JSON.stringify(folderId) + ", async () => { fs.writeFileSync(" + JSON.stringify(marker) + ", 'held'); while (!fs.existsSync(" + JSON.stringify(release) + ")) await new Promise((resolve) => setTimeout(resolve, 5)); }).catch((error) => { console.error(error.message); process.exitCode = 1; });",
+    ].join("\n"));
+    const lockHolder = spawn(process.execPath, [lockScript], { cwd: directory, env, stdio: "ignore", windowsHide: true });
+    const lockDigest = crypto.createHash("sha256").update("folder:" + folderId).digest("hex");
+    try {
+      await waitForServerFile(marker);
+      return {
+        lockHolder,
+        release() { fs.writeFileSync(release, "release"); },
+        lockPath: path.join(folderLockDirectory, lockDigest + ".lock"),
+      };
+    } catch (error) {
+      fs.writeFileSync(release, "release");
+      await stop(lockHolder);
+      throw error;
+    }
+  };
+
+  async function waitForServerFile(file) {
+    const deadline = Date.now() + 5000;
+    while (!fs.existsSync(file) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(fs.existsSync(file), true, "timed out waiting for " + path.basename(file));
+  }
+
+  async function loginCookie() {
+    const body = JSON.stringify({ username: "editor", password });
+    const response = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
+    assert.equal(response.status, 200, response.body);
+    const cookies = response.headers["set-cookie"].map((value) => value.split(";", 1)[0]);
+    return { cookie: cookies.join("; "), csrf: cookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1] };
+  }
+
+  async function runFolderMutationWhileLocked(folderId, requestPath, { method, bodyValue }, changeState, expectedStatus, assertUnchanged) {
+    const session = await loginCookie();
+    const holder = await holdFolderLock(folderId);
+    let settled = false;
+    const body = bodyValue === undefined ? "" : JSON.stringify(bodyValue);
+    const mutation = request(port, requestPath, {
+      method,
+      headers: {
+        cookie: session.cookie,
+        origin: "http://127.0.0.1:" + port,
+        "x-csrf-token": session.csrf,
+        ...(body ? { "content-type": "application/json", "content-length": Buffer.byteLength(body) } : {}),
+      },
+      body,
+    }).then((response) => { settled = true; return response; });
+    try {
+      await waitForServerFile(holder.lockPath);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(settled, false, requestPath + " waits behind the folder lifecycle lock");
+      changeState();
+      holder.release();
+      const response = await mutation;
+      await stop(holder.lockHolder);
+      assert.equal(response.status, expectedStatus, response.body);
+      assertUnchanged();
+    } finally {
+      holder.release();
+      await stop(holder.lockHolder);
+    }
+  }
+
+  await runFolderMutationWhileLocked("folder-c", "/folders/folder-c/temporary", {
+    method: "PUT",
+    bodyValue: { expiresAt: new Date(Date.now() + 60_000).toISOString() },
+  }, () => {
+    const users = JSON.parse(fs.readFileSync(usersPath, "utf8"));
+    users.find((user) => user.username === "editor").sessionVersion += 1;
+    fs.writeFileSync(usersPath, JSON.stringify(users));
+  }, 401, () => {
+    const folders = JSON.parse(fs.readFileSync(path.join(dataDir, "folders.json"), "utf8"));
+    assert.equal(folders.find((folder) => folder.id === "folder-c").expiresAt, undefined);
+  });
+
+  await runFolderMutationWhileLocked("folder-b", "/folders/folder-b", { method: "DELETE" }, () => {
+    const users = JSON.parse(fs.readFileSync(usersPath, "utf8"));
+    users.find((user) => user.username === "editor").permissions.delete = false;
+    fs.writeFileSync(usersPath, JSON.stringify(users));
+  }, 403, () => {
+    const folders = JSON.parse(fs.readFileSync(path.join(dataDir, "folders.json"), "utf8"));
+    assert.equal(folders.some((folder) => folder.id === "folder-b"), true);
+    assert.equal(fs.existsSync(path.join(uploadsDir, "folder-b")), true);
+  });
 });

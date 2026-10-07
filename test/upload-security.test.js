@@ -10,7 +10,7 @@ const { spawn } = require("node:child_process");
 const test = require("node:test");
 
 const ROOT = path.resolve(__dirname, "..");
-const SERVER = path.join(ROOT, "server.js");
+const SERVER = process.env.ROOTARK_TEST_SERVER || path.join(ROOT, "server.js");
 const PUBLIC = path.join(ROOT, "public");
 const TIMEOUT_MS = 10_000;
 const FOLDER_ID = "upload-safety";
@@ -651,5 +651,73 @@ test("chunk upload startup fails closed when chunk-session enumeration cannot be
       assert.equal(fs.readFileSync(markerPath, "utf8"), "triggered");
       await assert.rejects(request(harness.port, "/login.html"));
     });
+  }
+});
+
+test("folder lifecycle lock timeouts reject uploads and remove all disposable staging files", { timeout: 30_000 }, async (t) => {
+  const uploadId = "lifecycle-timeout-chunk";
+  const harness = await createHarness(t, {
+    chunkSessions: [{
+      uploadId,
+      files: {
+        "metadata.json": legacyChunkMetadata(uploadId, {
+          originalName: "timeout-chunk.txt",
+          fileName: "timeout-chunk.txt",
+          totalChunks: 1,
+          encryptionLevel: "none",
+        }),
+      },
+    }],
+    preloadSource: () => [
+      "const lockModule = require(" + JSON.stringify(path.join(ROOT, "services", "fileLifecycleLock.js")) + ");",
+      "const create = lockModule.createFileLifecycleLock;",
+      "lockModule.createFileLifecycleLock = (options) => create({ ...options, timeoutMs: 150, pollMs: 5 });",
+      'process.env.WEBDAV_ENABLED = "true";',
+    ].join("\n"),
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
+  const lock = createFileLifecycleLock({
+    directory: path.join(harness.dir, "data", ".rootark-cloud-file-locks"),
+    timeoutMs: 10_000,
+    pollMs: 5,
+  });
+  let releaseLock;
+  let markLockHeld;
+  const lockHeld = new Promise((resolve) => { markLockHeld = resolve; });
+  const heldOperation = lock.runFolder(FOLDER_ID, async () => {
+    markLockHeld();
+    await new Promise((resolve) => { releaseLock = resolve; });
+  });
+  await lockHeld;
+
+  try {
+    const simple = await upload(harness.port, session, "timeout-simple.txt", Buffer.from("disposable simple upload"));
+    assertRejectedClean(harness, simple, 503);
+
+    const chunk = await uploadChunk(harness.port, session, {
+      uploadId,
+      originalName: "timeout-chunk.txt",
+      chunkIndex: 0,
+      totalChunks: 1,
+      bytes: Buffer.from("disposable final chunk"),
+    });
+    assertRejectedClean(harness, chunk, 503);
+    assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId)), false);
+    assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
+
+    const webDavBody = Buffer.from("disposable WebDAV upload");
+    const webDav = await request(harness.port, "/dav/" + FOLDER_ID + "/timeout-webdav.txt", {
+      method: "PUT",
+      headers: {
+        authorization: "Basic " + Buffer.from("uploader:" + harness.password).toString("base64"),
+        "content-length": webDavBody.length,
+      },
+      body: webDavBody,
+    });
+    assertRejectedClean(harness, webDav, 503);
+  } finally {
+    releaseLock();
+    await heldOperation;
   }
 });

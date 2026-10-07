@@ -1,8 +1,21 @@
 const fs = require("fs");
 const path = require("path");
 const { resolveRuntimePath } = require("../src/runtime-paths");
+const { acquireJsonMutationLock } = require("../repositories/backupRepository");
 
 const POLICY_PATH = resolveRuntimePath("data", ".rootark-restore-provider-orphans.json");
+const LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
+
+function acquirePolicyLock() {
+  const deadline = Date.now() + 10_000;
+  while (true) {
+    try { return acquireJsonMutationLock("restore-provider-orphans"); }
+    catch (error) {
+      if (error.code !== "BACKUP_METADATA_LOCK_BUSY" || error.reason === "runtime-root-mismatch" || Date.now() >= deadline) throw error;
+      Atomics.wait(LOCK_WAIT, 0, 0, 10);
+    }
+  }
+}
 
 function identityKey(area, folderId, name) {
   const normalizePathPart = (value) => process.platform === "win32" ? String(value).toLowerCase() : String(value);
@@ -36,7 +49,7 @@ function read() {
   return normalizeObjects(value.objects);
 }
 
-function write(objects) {
+function writeUnlocked(objects) {
   const normalized = normalizeObjects(objects);
   fs.mkdirSync(path.dirname(POLICY_PATH), { recursive: true });
   const temporary = `${POLICY_PATH}.${require("node:crypto").randomUUID()}.tmp`;
@@ -58,6 +71,12 @@ function write(objects) {
   return normalized;
 }
 
+function write(objects) {
+  const lease = acquirePolicyLock();
+  try { return writeUnlocked(objects); }
+  finally { lease.release(); }
+}
+
 function isSuppressed(folderId, fileName, area = "uploads") {
   const key = identityKey(area, String(folderId || "root"), String(fileName || ""));
   return read().some((entry) => identityKey(entry.area, entry.folderId, entry.name) === key);
@@ -65,10 +84,13 @@ function isSuppressed(folderId, fileName, area = "uploads") {
 
 function clear(folderId, fileName, area = "uploads") {
   const key = identityKey(area, String(folderId || "root"), String(fileName || ""));
-  const current = read();
-  if (!current.some((entry) => identityKey(entry.area, entry.folderId, entry.name) === key)) return false;
-  write(current.filter((entry) => identityKey(entry.area, entry.folderId, entry.name) !== key));
-  return true;
+  const lease = acquirePolicyLock();
+  try {
+    const current = read();
+    if (!current.some((entry) => identityKey(entry.area, entry.folderId, entry.name) === key)) return false;
+    writeUnlocked(current.filter((entry) => identityKey(entry.area, entry.folderId, entry.name) !== key));
+    return true;
+  } finally { lease.release(); }
 }
 
 module.exports = { POLICY_PATH, clear, identityKey, isSuppressed, normalizeObjects, read, write };
