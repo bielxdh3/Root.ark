@@ -310,15 +310,41 @@ function syncCloudFireAndForget(operation, label) {
   });
 }
 
-function processCloudUploadMutationsLater() {
-  if (!isCloudStorageEnabled()) return;
+let cloudUploadMutationDrainScheduled = false;
+let cloudUploadMutationDrainRunning = false;
+let cloudUploadMutationDrainRequested = false;
+
+function requestCloudUploadMutationDrain(label, { requireCloud = false } = {}) {
+  if (requireCloud && !isCloudStorageEnabled()) return;
+  cloudUploadMutationDrainRequested = true;
+  if (cloudUploadMutationDrainScheduled || cloudUploadMutationDrainRunning) return;
+
+  cloudUploadMutationDrainScheduled = true;
   cloudFileLifecycleLock.runDetached(() => {
     setImmediate(() => {
-      restoreRequestGate.run(() => cloudUploadMutationQueue.processAll()).catch((error) => {
-        console.error("[cloud-upload] reconciliation pending:", sanitizeLogValue(error.message));
-      });
+      cloudUploadMutationDrainScheduled = false;
+      if (cloudUploadMutationDrainRunning) return;
+      cloudUploadMutationDrainRunning = true;
+      void (async () => {
+        try {
+          do {
+            cloudUploadMutationDrainRequested = false;
+            await restoreRequestGate.run(() => cloudUploadMutationQueue.processAll());
+          } while (cloudUploadMutationDrainRequested);
+        } catch (error) {
+          cloudUploadMutationDrainRequested = false;
+          console.error(`[cloud-upload] ${label} pending:`, sanitizeLogValue(error.message));
+        } finally {
+          cloudUploadMutationDrainRunning = false;
+          if (cloudUploadMutationDrainRequested) requestCloudUploadMutationDrain(label);
+        }
+      })();
     });
   });
+}
+
+function processCloudUploadMutationsLater() {
+  requestCloudUploadMutationDrain("reconciliation", { requireCloud: true });
 }
 
 function deleteCloudFileLater(folderId, fileName, area = "uploads") {
@@ -952,7 +978,7 @@ function loadPublicLinks() {
   if (shouldUseDatabase()) {
     try {
       const entries = publicLinksRepository.loadPublicLinks();
-      if (Object.keys(entries).length || !shouldReadJsonFallback() || !fs.existsSync(PUBLIC_LINKS_FILE)) return entries;
+      if (!shouldReadJsonFallback() || !fs.existsSync(PUBLIC_LINKS_FILE)) return entries;
 
       let fallbackEntries;
       try {
@@ -972,7 +998,7 @@ function loadPublicLinks() {
       const unrecordedFallbackEntries = Object.fromEntries(
         Object.entries(fallbackEntries || {}).filter(([token]) => /^[a-f0-9]{48}$/i.test(token) && !recordedTokens.has(token))
       );
-      return unrecordedFallbackEntries;
+      return { ...unrecordedFallbackEntries, ...entries };
     } catch (error) {
       console.error("Falha ao ler links publicos do SQLite:", error.message);
       return {};
@@ -2480,7 +2506,29 @@ function pruneFileVersions(entries, key) {
   return prunedStoredNames;
 }
 
-function deletePrunedFileVersions(folder, key, storedNames) {
+function prepareCloudUploadAbsenceMutations(folderId, currentFileName, storedNames) {
+  if (!isCloudStorageEnabled()) return { queued: false, rollback() {} };
+  const snapshots = [];
+  const rollback = () => {
+    for (const snapshot of [...snapshots].reverse()) {
+      try { cloudUploadMutationQueue.restoreRecord(folderId, snapshot.fileName, snapshot.record); }
+      catch (error) { console.error("[cloud-upload] pruned-version queue rollback failed:", sanitizeLogValue(error.message)); }
+    }
+  };
+  try {
+    for (const fileName of new Set(storedNames.filter((value) => typeof value === "string" && value === path.basename(value) && value !== path.basename(currentFileName)))) {
+      const record = cloudUploadMutationQueue.getRecord(folderId, fileName);
+      snapshots.push({ fileName, record });
+      cloudUploadMutationQueue.setDesired(folderId, fileName, "absent");
+    }
+  } catch (error) {
+    rollback();
+    throw error;
+  }
+  return { queued: snapshots.length > 0, rollback };
+}
+
+function deletePrunedFileVersions(folder, key, storedNames, cloudQueuePrepared = false) {
   for (const storedAs of storedNames) {
     if (typeof storedAs !== "string" || storedAs !== path.basename(storedAs) || storedAs === path.basename(key)) continue;
 
@@ -2491,12 +2539,8 @@ function deletePrunedFileVersions(folder, key, storedNames) {
       console.error("Erro ao remover versao antiga local:", sanitizeLogValue(error.message));
     }
 
-    try {
-      deleteCloudFileLater(folder.id, storedAs, "uploads");
-    } catch (error) {
-      console.error("Erro ao agendar remocao de versao antiga na nuvem:", sanitizeLogValue(error.message));
-    }
   }
+  if (cloudQueuePrepared) processCloudUploadMutationsLater();
 }
 
 function restoreFileVersionsJsonSnapshot(snapshot) {
@@ -2551,6 +2595,7 @@ function recordApprovedFileVersion(folder, fileName, pendingPath, uploadedBy, co
   let entries;
   let key;
   let history;
+  let cloudPrunePreparation = null;
   try {
     const currentOwner = normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, fileName)).owner;
     ({ entries, key, history } = ensureVersionHistory(folder, fileName, currentOwner, "Versao inicial", { persist: false }));
@@ -2584,10 +2629,12 @@ function recordApprovedFileVersion(folder, fileName, pendingPath, uploadedBy, co
 
     entries[key] = history;
     const prunedStoredNames = pruneFileVersions(entries, key);
+    cloudPrunePreparation = prepareCloudUploadAbsenceMutations(folder.id, fileName, prunedStoredNames);
     saveFileVersions(entries, { tolerateLegacyJsonMirrorFailure: true });
-    deletePrunedFileVersions(folder, key, prunedStoredNames);
+    deletePrunedFileVersions(folder, key, prunedStoredNames, cloudPrunePreparation?.queued);
     return { currentVersion: newVersion, replaced: true };
   } catch (error) {
+    if (cloudPrunePreparation) cloudPrunePreparation.rollback();
     try {
       if (pendingPromoted && isExistingFile(currentPath) && !isExistingFile(pendingPath)) fs.renameSync(currentPath, pendingPath);
       if (currentArchived && archivedPath && isExistingFile(archivedPath) && !isExistingFile(currentPath)) fs.renameSync(archivedPath, currentPath);
@@ -3623,6 +3670,7 @@ async function deleteFolderContents(folder) {
     throw new Error("Caminho de pasta invalido");
   }
 
+  await deleteCloudFolder(folderId);
   removePendingEntriesForFolder(folderId);
   removePublicLinksForFolder(folderId);
   removeFilePermissionsForFolder(folderId);
@@ -3631,7 +3679,6 @@ async function deleteFolderContents(folder) {
   removeEncryptedMetadataForFolder(folderId);
   fs.rmSync(uploadDir, { recursive: true, force: true });
   fs.rmSync(tempDir, { recursive: true, force: true });
-  await deleteCloudFolder(folderId);
 }
 
 function shouldAutoCleanupTrash() {
@@ -4257,6 +4304,10 @@ function cleanupIncomingUploads() {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const fullPath = path.join(directory, entry.name);
       if (!entry.isFile()) continue;
+      const isUploadStagingFile = directory === SIMPLE_UPLOAD_INCOMING_DIR
+        ? /^\d+-[a-f0-9]{16}\.(?:upload|webdav)$/i.test(entry.name)
+        : /^[a-f0-9]{32}$/i.test(entry.name);
+      if (!isUploadStagingFile) continue;
 
       const stats = fs.statSync(fullPath);
       if (now - stats.mtimeMs > 5 * 60 * 1000) {
@@ -4926,7 +4977,12 @@ function canRestoreTrashItem(req, item) {
 }
 
 function isFileInTrash(folderId, fileName) {
-  return trashRepository.isFileTrashed(folderId || ROOT_FOLDER_ID, path.basename(fileName || ""));
+  const normalizedFolderId = folderId || ROOT_FOLDER_ID;
+  const normalizedName = path.basename(fileName || "");
+  if (!trashRepository.isFileTrashed(normalizedFolderId, normalizedName)) return false;
+  const pendingReplacement = trashRepository.listPendingFileRemoteDeletions(normalizedFolderId, normalizedName)
+    .some(isTrashReplacementActive);
+  return !pendingReplacement;
 }
 
 function hydrateFolderForWebDav(folder) {
@@ -5169,6 +5225,7 @@ process.once("exit", startupRestoreLease);
 let startupRestoreState;
 try {
   startupRestoreState = restoreService.assertNoPendingWholeRestore();
+  restoreProviderOrphans.initialize({ requirePolicy: restoreService.requiresProviderOrphanPolicyAtStartup(startupRestoreState) });
 } catch (error) {
   startupRestoreLease();
   throw error;
@@ -8806,6 +8863,7 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
     let restoredCurrentInstalled = false;
     let localRestoreCommitted = false;
     let cloudMutationPreparation = null;
+    let cloudPrunePreparation = null;
     try {
       const oldCurrentVersion = history.currentVersion;
       const archivedName = getStoredVersionName(name, oldCurrentVersion);
@@ -8850,9 +8908,10 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
       });
       entries[key] = history;
       const prunedStoredNames = pruneFileVersions(entries, key);
+      cloudPrunePreparation = prepareCloudUploadAbsenceMutations(currentFolder.id, name, prunedStoredNames);
       saveFileVersions(entries, { tolerateLegacyJsonMirrorFailure: true });
       localRestoreCommitted = true;
-      deletePrunedFileVersions(currentFolder, key, prunedStoredNames);
+      deletePrunedFileVersions(currentFolder, key, prunedStoredNames, cloudPrunePreparation?.queued);
       if (cloudMutationPreparation?.queued) processCloudUploadMutationsLater();
       addActionHistory("version_restored", name, req.user.username, { folderId: currentFolder.id, folderName: currentFolder.name, restoredVersion: versionNumber, newVersion });
       logAnalyticsEvent("restore", { filename: name, restoredBy: req.user.username, restoredVersion: versionNumber, newVersion, folderId: currentFolder.id, folderName: currentFolder.name });
@@ -8860,6 +8919,7 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
       return res.json({ message: "Versao restaurada", version: newVersion, restoredVersion: versionNumber });
     } catch (error) {
       if (!localRestoreCommitted && cloudMutationPreparation) cloudMutationPreparation.rollback();
+      if (!localRestoreCommitted && cloudPrunePreparation) cloudPrunePreparation.rollback();
       if (!localRestoreCommitted && currentArchived) {
         try {
           if (restoredCurrentInstalled && isExistingFile(currentPath)) fs.rmSync(currentPath, { force: true });
@@ -9358,15 +9418,25 @@ app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("ap
         cloudMutations.rollback();
         throw error;
       }
+      let trashCancellationPending = false;
       for (const pendingDeletion of trashRepository.listPendingFileRemoteDeletions(folder.id, name)) {
         const remoteDeletion = pendingDeletion.metadata?.remoteDeletion;
-        const retired = remoteDeletion?.state === "cancelled"
-          ? trashRepository.saveTrashItem({ ...pendingDeletion, status: "permanently_deleted" })
-          : trashService.cancelRemoteDeletion(pendingDeletion, "replacement_active", { status: "permanently_deleted" });
-        if (retired.metadata?.remoteDeletion?.state === "cancelled") {
-          auditLog("trash.remote_delete.cancelled", getAuditActor(req), { type: "trash", id: retired.id }, "remote_delete", "success", {
+        try {
+          const retired = remoteDeletion?.state === "cancelled"
+            ? trashRepository.saveTrashItem({ ...pendingDeletion, status: "permanently_deleted" })
+            : trashService.cancelRemoteDeletion(pendingDeletion, "replacement_active", { status: "permanently_deleted" });
+          if (retired.metadata?.remoteDeletion?.state === "cancelled") {
+            auditLog("trash.remote_delete.cancelled", getAuditActor(req), { type: "trash", id: retired.id }, "remote_delete", "success", {
+              reason: "replacement_active",
+            });
+          }
+        } catch (error) {
+          trashCancellationPending = true;
+          auditLog("trash.remote_delete.cancellation_pending", getAuditActor(req), { type: "trash", id: pendingDeletion.id }, "remote_delete", "failure", {
             reason: "replacement_active",
+            category: error.code || "persistence_error",
           });
+          console.error("[cloud-trash] replacement cancellation remains pending:", error.code || "persistence_error");
         }
       }
       promoteEncryptedMetadataAfterApproval(folder.id, name, uploadedBy || req.user.username);
@@ -9403,7 +9473,7 @@ app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("ap
         version: versionInfo.currentVersion,
         replaced: versionInfo.replaced,
       });
-      return res.status(cloudCleanupPending || cloudSyncPending ? 202 : 200).json({
+      return res.status(cloudCleanupPending || cloudSyncPending || trashCancellationPending ? 202 : 200).json({
         message: "Aprovado",
         fileName: name,
         folderId: folder.id,
@@ -9411,6 +9481,7 @@ app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("ap
         replaced: versionInfo.replaced,
         cloudCleanupPending,
         cloudSyncPending,
+        trashCancellationPending,
       });
     });
   } catch (error) {
@@ -9788,12 +9859,8 @@ const retryCloudTempMutations = () => restoreRequestGate.run(() => cloudTempMuta
 setTimeout(() => { void recoverCloudTempMutations(); }, 0);
 setInterval(() => { void retryCloudTempMutations(); }, cloudTempReconciliationIntervalMs);
 const cloudUploadReconciliationIntervalMs = parseBoundedNumber("CLOUD_UPLOAD_RECONCILIATION_INTERVAL_MS", 30_000, 1_000, 60 * 60 * 1000);
-const recoverCloudUploadMutations = () => restoreRequestGate.run(() => cloudUploadMutationQueue.processAll()).catch((error) => {
-  console.error("[cloud-upload] startup reconciliation pending:", sanitizeLogValue(error.message));
-});
-const retryCloudUploadMutations = () => restoreRequestGate.run(() => cloudUploadMutationQueue.processAll()).catch((error) => {
-  console.error("[cloud-upload] retry reconciliation pending:", sanitizeLogValue(error.message));
-});
+const recoverCloudUploadMutations = () => requestCloudUploadMutationDrain("startup reconciliation");
+const retryCloudUploadMutations = () => requestCloudUploadMutationDrain("retry reconciliation");
 setTimeout(() => { void recoverCloudUploadMutations(); }, 0);
 setInterval(() => { void retryCloudUploadMutations(); }, cloudUploadReconciliationIntervalMs);
 setInterval(() => {

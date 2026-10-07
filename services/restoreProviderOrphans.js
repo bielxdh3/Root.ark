@@ -1,9 +1,11 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("node:crypto");
 const { resolveRuntimePath } = require("../src/runtime-paths");
 const { acquireJsonMutationLock } = require("../repositories/backupRepository");
 
 const POLICY_PATH = resolveRuntimePath("data", ".rootark-restore-provider-orphans.json");
+const STATE_PATH = resolveRuntimePath("data", ".rootark-restore-provider-orphans-state.json");
 let suppressionSnapshot = null;
 
 async function acquirePolicyLock() {
@@ -52,10 +54,56 @@ function normalizeObjects(objects) {
   return [...unique.values()].sort((left, right) => left.area.localeCompare(right.area) || left.folderId.localeCompare(right.folderId) || left.name.localeCompare(right.name));
 }
 
+function readState() {
+  let stat;
+  try { stat = fs.lstatSync(STATE_PATH); }
+  catch (error) { if (error.code === "ENOENT") return null; throw error; }
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Restore provider suppression state is unsafe; file access is blocked");
+  let value;
+  try { value = JSON.parse(fs.readFileSync(STATE_PATH, "utf8")); }
+  catch { throw new Error("Restore provider suppression state is invalid; file access is blocked"); }
+  if (value?.version !== 1) throw new Error("Restore provider suppression state version is unsupported; file access is blocked");
+  return value;
+}
+
+function policyFileExists() {
+  try { fs.lstatSync(POLICY_PATH); return true; }
+  catch (error) { if (error.code === "ENOENT") return false; throw error; }
+}
+
+function writeJsonAtomically(destination, value) {
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  const temporary = `${destination}.${crypto.randomUUID()}.tmp`;
+  const descriptor = fs.openSync(temporary, "wx", 0o600);
+  try {
+    fs.writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`);
+    fs.fsyncSync(descriptor);
+  } finally { fs.closeSync(descriptor); }
+  try {
+    fs.renameSync(temporary, destination);
+    if (process.platform !== "win32") {
+      const directory = fs.openSync(path.dirname(destination), "r");
+      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    }
+  } catch (error) {
+    fs.rmSync(temporary, { force: true });
+    throw error;
+  }
+}
+
+function writeState() {
+  writeJsonAtomically(STATE_PATH, { version: 1, initializedAt: new Date().toISOString() });
+}
+
 function read() {
+  const state = readState();
   let text;
   try { text = fs.readFileSync(POLICY_PATH, "utf8"); }
-  catch (error) { if (error.code === "ENOENT") return []; throw error; }
+  catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    if (state) throw new Error("Restore provider suppression policy is missing; file access is blocked");
+    return [];
+  }
   let value;
   try { value = JSON.parse(text); }
   catch { throw new Error("Restore provider suppression policy is invalid; file access is blocked"); }
@@ -64,6 +112,7 @@ function read() {
 }
 
 function policySignature() {
+  if (readState() && !policyFileExists()) throw new Error("Restore provider suppression policy is missing; file access is blocked");
   try {
     const stat = fs.statSync(POLICY_PATH, { bigint: true });
     return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].map(String).join(":");
@@ -94,25 +143,26 @@ function readSuppressionSnapshot() {
 
 function writeUnlocked(objects) {
   const normalized = normalizeObjects(objects);
-  fs.mkdirSync(path.dirname(POLICY_PATH), { recursive: true });
-  const temporary = `${POLICY_PATH}.${require("node:crypto").randomUUID()}.tmp`;
-  const descriptor = fs.openSync(temporary, "wx", 0o600);
-  try {
-    fs.writeFileSync(descriptor, `${JSON.stringify({ version: 1, objects: normalized }, null, 2)}\n`);
-    fs.fsyncSync(descriptor);
-  } finally { fs.closeSync(descriptor); }
-  try {
-    fs.renameSync(temporary, POLICY_PATH);
-    suppressionSnapshot = null;
-    if (process.platform !== "win32") {
-      const directory = fs.openSync(path.dirname(POLICY_PATH), "r");
-      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
-    }
-  } catch (error) {
-    fs.rmSync(temporary, { force: true });
-    throw error;
-  }
+  const state = readState();
+  if (state && !policyFileExists()) throw new Error("Restore provider suppression policy is missing; file access is blocked");
+  writeJsonAtomically(POLICY_PATH, { version: 1, objects: normalized });
+  suppressionSnapshot = null;
+  if (!state) writeState();
   return normalized;
+}
+
+function initialize({ requirePolicy = false } = {}) {
+  const state = readState();
+  const hasPolicy = policyFileExists();
+  if (state && !hasPolicy) throw new Error("Restore provider suppression policy is missing; startup is blocked for recovery");
+  if (!hasPolicy && requirePolicy) throw new Error("Restore provider suppression policy is missing after cloud restore; startup is blocked for recovery");
+  if (!hasPolicy) writeUnlocked([]);
+  else {
+    read();
+    if (!state) writeState();
+  }
+  suppressionSnapshot = null;
+  return read();
 }
 
 async function write(objects) {
@@ -168,4 +218,4 @@ async function clear(folderId, fileName, area = "uploads", provider = null) {
   } finally { lease.release(); }
 }
 
-module.exports = { POLICY_PATH, assertSafeToUnhide, assertUnambiguousProviderInventory, clear, identityKey, isSuppressed, normalizeObjects, read, suppress, write };
+module.exports = { POLICY_PATH, STATE_PATH, assertSafeToUnhide, assertUnambiguousProviderInventory, clear, identityKey, initialize, isSuppressed, normalizeObjects, read, suppress, write };

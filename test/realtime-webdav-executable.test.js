@@ -136,6 +136,52 @@ test("restart recovery restores a source staged by MOVE from the durable journal
   assert.equal(fs.existsSync(stagePath), false);
 });
 
+test("startup incoming cleanup preserves an aged pending WebDAV MOVE journal", { timeout: 20_000 }, async (t) => {
+  const dir = createWebDavFixture("rootark-move-cleanup-preserve-");
+  const id = crypto.randomUUID();
+  const incoming = path.join(dir, "temp", ".incoming");
+  const metadataDirectory = path.join(incoming, `rootark-webdav-move-${id}`, "metadata");
+  fs.mkdirSync(metadataDirectory, { recursive: true });
+  const sourcePath = path.join(dir, "uploads", "source.txt");
+  const journalPath = path.join(incoming, `rootark-webdav-move-${id}.json`);
+  const nextAttemptAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  fs.writeFileSync(journalPath, JSON.stringify({
+    version: 1,
+    transactionId: id,
+    phase: "cloud_source_delete_intent",
+    journalPath,
+    sourcePath,
+    destinationPath: path.join(dir, "uploads", "target.txt"),
+    stagePath: path.join(dir, "uploads", `.rootark-move-${id}.source`),
+    destinationBackupPath: path.join(dir, "uploads", `.rootark-move-${id}.destination`),
+    replacementInstalled: true,
+    completedOperations: ["source.stage", "replacement.install", "cloud.destination.upload"],
+    metadata: { directory: metadataDirectory, files: {} },
+    cloud: { state: "source_delete_intent", nextAttemptAt, attempts: 1, maxAttempts: 5 },
+  }));
+  const staleTime = new Date(Date.now() - 10 * 60 * 1000);
+  fs.utimesSync(journalPath, staleTime, staleTime);
+  const uploadStagingPath = path.join(incoming, `${Date.now()}-${"a".repeat(16)}.upload`);
+  fs.writeFileSync(uploadStagingPath, "partial upload");
+  fs.utimesSync(uploadStagingPath, staleTime, staleTime);
+  const webDavPutStagingPath = path.join(incoming, `${Date.now()}-${"c".repeat(16)}.webdav`);
+  fs.writeFileSync(webDavPutStagingPath, "partial WebDAV upload");
+  fs.utimesSync(webDavPutStagingPath, staleTime, staleTime);
+  const chunkIncoming = path.join(dir, "temp", ".chunks", "incoming");
+  fs.mkdirSync(chunkIncoming, { recursive: true });
+  const chunkStagingPath = path.join(chunkIncoming, "b".repeat(32));
+  fs.writeFileSync(chunkStagingPath, "partial chunk");
+  fs.utimesSync(chunkStagingPath, staleTime, staleTime);
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: "ignore", windowsHide: true });
+  t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
+  await ready(port);
+  assert.equal(fs.existsSync(journalPath), true, "generic incoming cleanup must preserve durable retry journals");
+  assert.equal(fs.existsSync(uploadStagingPath), false, "stale simple-upload staging files should still be cleaned");
+  assert.equal(fs.existsSync(webDavPutStagingPath), false, "stale WebDAV PUT staging files should still be cleaned");
+  assert.equal(fs.existsSync(chunkStagingPath), false, "stale chunk-upload staging files should still be cleaned");
+});
+
 test("metadata checksum mismatch fails closed during MOVE journal recovery", { timeout: 10_000 }, async () => {
   const dir = createWebDavFixture("rootark-move-checksum-");
   const id = crypto.randomUUID();

@@ -149,7 +149,8 @@ test("file lifecycle lock fails closed on a stranded reaper until an operator re
   // Disposable fixture: this models the documented operator action after all
   // processes sharing the lock directory have been stopped and both PIDs checked.
   fs.unlinkSync(reaperPath);
-  assert.equal(await lock.run("root", "stale-reaper.txt", async () => "recovered"), "recovered");
+  const recoveryLock = createFileLifecycleLock({ directory, timeoutMs: 5_000, pollMs: 5 });
+  assert.equal(await recoveryLock.run("root", "stale-reaper.txt", async () => "recovered"), "recovered");
   assert.equal(fs.existsSync(lockPath), false);
   assert.equal(fs.existsSync(reaperPath), false);
 });

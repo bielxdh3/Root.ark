@@ -107,6 +107,8 @@ test("public-share script extraction accepts case-insensitive script tags", () =
 test("SQLite mode preserves counted access for a JSON-fallback public link", { timeout: 30_000 }, async (t) => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-share-sqlite-fallback-"));
   const token = crypto.randomBytes(24).toString("hex");
+  const secondToken = crypto.randomBytes(24).toString("hex");
+  const invalidToken = "not-a-valid-share-token";
   const port = await getUnusedPort();
   const dataDir = path.join(sandbox, "data");
   const databasePath = path.join(dataDir, "rootark.sqlite");
@@ -127,6 +129,24 @@ test("SQLite mode preserves counted access for a JSON-fallback public link", { t
       downloads: 0,
       maxDownloads: 1,
       activeViewers: {},
+    },
+    [secondToken]: {
+      folderId: "root",
+      fileName,
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      views: 0,
+      maxViews: 0,
+      downloads: 0,
+      maxDownloads: 0,
+      activeViewers: {},
+    },
+    [invalidToken]: {
+      folderId: "root",
+      fileName,
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      views: 0,
     },
   }));
 
@@ -166,6 +186,9 @@ test("SQLite mode preserves counted access for a JSON-fallback public link", { t
   const view = await request(port, `/share/${token}/view`, "POST", { origin });
   assert.equal(view.status, 200, view.body);
   assert.equal(JSON.parse(view.body).views, 1);
+  assert.equal((await request(port, `/share/${secondToken}`)).status, 200, "counting one legacy link must not hide other unrecorded JSON links");
+  assert.equal((await request(port, `/share/${secondToken}/view`, "POST", { origin })).status, 200);
+  assert.equal((await request(port, `/share/${invalidToken}`)).status, 404, "invalid legacy JSON tokens are not served");
 
   const firstDownload = await request(port, `/share/${token}/download`, "POST", { origin });
   assert.equal(firstDownload.status, 200, firstDownload.body);

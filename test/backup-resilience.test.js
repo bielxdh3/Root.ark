@@ -64,3 +64,27 @@ test("archive lookup accepts legacy and collision-safe filenames only", () => {
   const result = run(`const service = require(${JSON.stringify(servicePath)}); console.log(JSON.stringify([Boolean(service.getArchivePath("rootark-backup-2020-01-01-00-00-00.zip")), Boolean(service.getArchivePath("rootark-backup-2020-01-01-00-00-00-000-aabbccdd.zip")), Boolean(service.getArchivePath("../outside.zip"))]));`);
   assert.deepEqual(result, [true, true, false]);
 });
+
+test("backups do not traverse nested runtime lifecycle lock or provider queue directories", async () => {
+  const result = run(`
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const unzipper = require("unzipper");
+    const service = require(${JSON.stringify(servicePath)});
+    const directories = [
+      "data/.rootark-cloud-file-locks",
+      "data/.rootark-cloud-temp-mutations",
+      "data/.rootark-cloud-upload-mutations",
+    ];
+    for (const directory of directories) {
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, "live-queue.json"), "runtime coordination state");
+    }
+    (async () => {
+      const backup = await service.createBackup();
+      const archive = await unzipper.Open.file(service.getArchivePath(backup.filename));
+      console.log(JSON.stringify(archive.files.map((entry) => entry.path)));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+  assert.equal(result.some((entry) => entry.startsWith("data/.rootark-cloud-")), false);
+});

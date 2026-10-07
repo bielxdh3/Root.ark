@@ -70,7 +70,13 @@ function restoreInstanceId(requiredInstances, explicitInstanceId) {
   return instanceId;
 }
 
-function persistWholeRestoreCoordinator({ backupId, requiredRestartInstances, preRestoreBackupId = null, providerReconciliation = [], phase = "preparing" }) {
+function requiresProviderOrphanPolicyAtStartup(startupState) {
+  if (!startupState?.restartRequired) return false;
+  const coordinator = startupState.coordinator || {};
+  return coordinator.providerPolicyRequired !== false;
+}
+
+function persistWholeRestoreCoordinator({ backupId, requiredRestartInstances, preRestoreBackupId = null, providerReconciliation = [], providerPolicyRequired = false, phase = "preparing" }) {
   return writeWholeRestoreCoordinator({
     version: WHOLE_RESTORE_COORDINATOR_VERSION,
     transactionId: crypto.randomUUID(),
@@ -79,6 +85,7 @@ function persistWholeRestoreCoordinator({ backupId, requiredRestartInstances, pr
     requiredRestartInstances,
     preRestoreBackupId: preRestoreBackupId == null ? null : String(preRestoreBackupId),
     providerReconciliation,
+    providerPolicyRequired: Boolean(providerPolicyRequired),
     startedAt: new Date().toISOString(),
   });
 }
@@ -150,7 +157,7 @@ function restorableDataNames(extractedRoot) {
   if (!fs.existsSync(extractedData)) return [...names].sort();
   for (const name of fs.readdirSync(extractedData)) {
     const foldedName = name.toLowerCase();
-    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
+    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === path.basename(restoreProviderOrphans.POLICY_PATH) || foldedName === path.basename(restoreProviderOrphans.STATE_PATH) || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
     if (path.basename(name) !== name || name === "." || name === "..") throw new Error("Restore archive contains an unsafe data filename");
     const source = path.join(extractedData, name);
     const stat = fs.lstatSync(source);
@@ -166,7 +173,7 @@ function wholePreimagePlan(extractedRoot, quarantinePlan) {
   domains.push("data-files");
   if (pathExists(path.join(extractedRoot, "uploads"))) domains.push("uploads-tree");
   if (isDbEnabled()) domains.push("database-files");
-  return { domains, dataFiles: [...new Set([...restorableDataNames(extractedRoot), path.basename(restoreProviderOrphans.POLICY_PATH)])].sort() };
+  return { domains, dataFiles: [...new Set([...restorableDataNames(extractedRoot), path.basename(restoreProviderOrphans.POLICY_PATH), path.basename(restoreProviderOrphans.STATE_PATH)])].sort() };
 }
 
 function syncPreimageDirectories(root) {
@@ -758,6 +765,8 @@ function assertSafeZipPath(entryPath) {
   if (normalizedFolded === "data/.rootark-quarantine-restore-journal.json"
     || normalizedFolded.startsWith("data/.rootark-quarantine-restore-metadata-")
     || normalizedFolded.startsWith("data/.rootark-restore-coordinator.json")
+    || normalizedFolded === `data/${path.basename(restoreProviderOrphans.POLICY_PATH)}`
+    || normalizedFolded === `data/${path.basename(restoreProviderOrphans.STATE_PATH)}`
     || normalizedFolded.startsWith("data/.rootark-active-requests/")
     || normalizedFolded.startsWith("data/.rootark-restore-restart-acks/")
     || (normalizedFolded === "data/quarantine.json" && normalized !== "data/quarantine.json")) {
@@ -1003,7 +1012,7 @@ function restoreDataFiles(extractedRoot, onFile = null) {
   fs.mkdirSync(resolveRuntimePath("data"), { recursive: true });
   for (const name of fs.readdirSync(extractedData)) {
     const foldedName = name.toLowerCase();
-    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === path.basename(restoreProviderOrphans.POLICY_PATH) || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
+    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === path.basename(restoreProviderOrphans.POLICY_PATH) || foldedName === path.basename(restoreProviderOrphans.STATE_PATH) || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
     const sourcePath = path.join(extractedData, name);
     const destinationPath = resolveRuntimePath("data", name);
     if (fs.statSync(sourcePath).isFile()) {
@@ -1753,6 +1762,7 @@ async function restoreBackup(id, options = {}) {
     if (cloudStorage?.enabled()) {
       if (typeof cloudStorage.inventory !== "function") throw new Error("Cloud provider inventory is required before restore can protect unarchived objects");
       providerInventory = await cloudStorage.inventory();
+      coordinator = updateWholeRestoreCoordinator(coordinator, { providerPolicyRequired: true });
       restoreProviderOrphans.assertUnambiguousProviderInventory(providerInventory
         .filter((entry) => ["uploads", "temp"].includes(entry.area))
         .map(({ area, folderId, name }) => ({ area, folderId, name })));
@@ -1774,13 +1784,13 @@ async function restoreBackup(id, options = {}) {
     const quarantinePlan = hasQuarantineState ? prepareQuarantineRestore(restoreDir) : null;
     const preimagePlan = wholePreimagePlan(restoreDir, quarantinePlan);
     let providerOrphans = null;
-    if (cloudStorage?.enabled()) {
+    if (providerInventory !== null) {
       const archivedObjects = archivedProviderObjects(manifest);
       providerOrphans = restoreProviderOrphans.normalizeObjects(providerInventory
         .filter((entry) => ["uploads", "temp"].includes(entry.area) && !archivedObjects.has(`${entry.area}\0${entry.folderId}\0${entry.name}`))
         .map(({ area, folderId, name }) => ({ area, folderId, name })));
     }
-    const cloudSync = cloudStorage?.enabled() && syncEntries(manifest).length > 0
+    const cloudSync = providerInventory !== null && syncEntries(manifest).length > 0
       ? createRestoreSync(manifest)
       : { state: "not_required" };
     const providerReconciliation = cloudSync.state === "pending"
@@ -1887,6 +1897,7 @@ module.exports = {
   prepareWholeRestoreStartup,
   acknowledgeWholeRestoreInstance,
   isWholeRestoreBlocked,
+  requiresProviderOrphanPolicyAtStartup,
   getWholeRestorePhase,
   restoreDatabaseFiles,
   databaseJournalPath,

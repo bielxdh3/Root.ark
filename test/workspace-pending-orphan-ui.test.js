@@ -13,7 +13,10 @@ test("restore-orphan pending uploads show recovery state, block approval, and al
     { name: "restored.txt", folderId: "root", owner: "tester", size: 20, restoreOrphan: true, availability: "recovery_required" },
   ];
   let rendered = "";
-  const root = { addEventListener() {} };
+  let liveToast = "";
+  const listeners = new Map();
+  const toasts = [];
+  const root = { addEventListener(name, listener) { listeners.set(name, listener); }, contains: () => true };
   const context = {
     document: {
       forms: [],
@@ -28,15 +31,16 @@ test("restore-orphan pending uploads show recovery state, block approval, and al
       RootarkApi: {
         query: (pathname) => pathname,
         get: async (pathname) => pathname === "/folders" ? [{ id: "root", name: "Arquivos", isRoot: true }] : pathname === "/list" ? [] : pathname === "/pending" ? pending : [],
-        post: async () => ({}),
+        post: async (pathname) => pathname.startsWith("/approve/") ? { cloudSyncPending: true, cloudCleanupPending: true, trashCancellationPending: true } : ({}),
       },
       RootarkUI: {
         escape: (value) => String(value || ""),
         formatBytes: (value) => `${value} B`,
         formatDate: () => "",
         getSession: async () => ({ username: "tester", role: "admin", permissions: { listFiles: true, listPending: true, approve: true } }),
-        mount: ({ content }) => { rendered = content; },
-        toast() {},
+        mount: ({ content }) => { rendered = content; liveToast = ""; },
+        dialog: async () => ({}),
+        toast(message, tone) { toasts.push({ message, tone }); liveToast = message; },
         redirectToLogin() {},
       },
     },
@@ -52,4 +56,12 @@ test("restore-orphan pending uploads show recovery state, block approval, and al
   assert.match(rendered, /data-action="approve-file" data-name="ordinary\.txt"/);
   assert.doesNotMatch(rendered, /data-action="approve-file" data-name="restored\.txt"/);
   assert.doesNotMatch(rendered, /data-action="preview-pending" data-name="restored\.txt"/);
+
+  const approveButton = { dataset: { action: "approve-file", name: "ordinary.txt", folder: "root" } };
+  await listeners.get("click")({ target: { closest: () => approveButton } });
+  assert.match(toasts.at(-1).message, /sincronização na nuvem/i);
+  assert.match(toasts.at(-1).message, /limpeza do envio temporário/i);
+  assert.match(toasts.at(-1).message, /cancelamento da exclusão remota anterior/i);
+  assert.notEqual(toasts.at(-1).tone, "success", "pending background work must not look fully complete");
+  assert.equal(liveToast, toasts.at(-1).message, "approval status remains in the live region after the file list rerenders");
 });

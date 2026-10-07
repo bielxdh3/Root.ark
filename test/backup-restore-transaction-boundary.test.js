@@ -266,6 +266,7 @@ test("backup archives exclude whole-restore coordinator files", () => {
   runFixture(`
     write(path.join(dataDir, ".rootark-restore-coordinator.json"), JSON.stringify({ version: 1, phase: "prepared", backupId: "fixture" }));
     write(path.join(dataDir, ".rootark-restore-provider-orphans.json"), JSON.stringify({ version: 1, objects: [{ area: "uploads", folderId: "root", name: "private-name.txt" }] }));
+    write(path.join(dataDir, ".rootark-restore-provider-orphans-state.json"), JSON.stringify({ version: 1, initializedAt: new Date().toISOString() }));
     write(path.join(dataDir, ".rootark-active-requests", "active.json"), JSON.stringify({ pid: 1 }));
     write(path.join(dataDir, ".rootark-restore-restart-acks", "transaction", "instance.json"), JSON.stringify({ transactionId: "fixture" }));
     (async () => {
@@ -274,6 +275,7 @@ test("backup archives exclude whole-restore coordinator files", () => {
       const { zip } = await restoreService.validateBackupArchive(backup, archivePath);
       assert.equal(zip.files.some((entry) => entry.path.toLowerCase().startsWith("data/.rootark-restore-coordinator")), false);
       assert.equal(zip.files.some((entry) => entry.path.toLowerCase() === "data/.rootark-restore-provider-orphans.json"), false, "restore-derived provider names are not copied into future backup archives");
+      assert.equal(zip.files.some((entry) => entry.path.toLowerCase() === "data/.rootark-restore-provider-orphans-state.json"), false, "restore policy state is not copied into future backup archives");
       assert.equal(zip.files.some((entry) => entry.path.toLowerCase().startsWith("data/.rootark-active-requests/")), false);
       assert.equal(zip.files.some((entry) => entry.path.toLowerCase().startsWith("data/.rootark-restore-restart-acks/")), false);
       console.log(JSON.stringify({ ok: true }));
@@ -283,6 +285,31 @@ test("backup archives exclude whole-restore coordinator files", () => {
 
 test("successful whole restore preserves both recovery records and blocks service until startup", () => {
   runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const legacyCloudStartup = {
+      restartRequired: true,
+      coordinator: { providerReconciliation: { backupId: "fixture", sync: { state: "pending" } } },
+    };
+    const ambiguousLegacyStartup = { restartRequired: true, coordinator: { providerReconciliation: [] } };
+    assert.equal(restoreService.requiresProviderOrphanPolicyAtStartup({
+      restartRequired: true,
+      coordinator: { providerPolicyRequired: true },
+    }), true, "the committed restore requirement survives a provider being disabled before restart");
+    assert.equal(restoreService.requiresProviderOrphanPolicyAtStartup({
+      restartRequired: true,
+      coordinator: { providerPolicyRequired: false },
+    }), false, "a local-only restore does not require cloud suppression state");
+    assert.equal(restoreService.requiresProviderOrphanPolicyAtStartup(legacyCloudStartup), true, "legacy cloud reconciliation remains fail-closed without its suppression policy");
+    assert.throws(() => providerOrphans.initialize({ requirePolicy: restoreService.requiresProviderOrphanPolicyAtStartup(legacyCloudStartup) }), /missing after cloud restore/);
+    assert.equal(fs.existsSync(providerOrphans.POLICY_PATH), false, "a legacy cloud restore cannot silently initialize an empty policy");
+    assert.equal(restoreService.requiresProviderOrphanPolicyAtStartup(ambiguousLegacyStartup), true, "an empty legacy reconciliation list cannot prove the provider inventory was not captured");
+    assert.throws(() => providerOrphans.initialize({ requirePolicy: restoreService.requiresProviderOrphanPolicyAtStartup(ambiguousLegacyStartup) }), /missing after cloud restore/);
+    assert.equal(fs.existsSync(providerOrphans.POLICY_PATH), false, "an ambiguous legacy restore cannot initialize an empty policy and unhide provider objects");
+    assert.equal(restoreService.requiresProviderOrphanPolicyAtStartup({
+      restartRequired: true,
+      coordinator: {},
+    }), true, "legacy pending coordinators fail closed when their provider requirement is unknown");
+    assert.equal(restoreService.requiresProviderOrphanPolicyAtStartup({ restartRequired: false }), false);
     write(path.join(dataDir, "runtime.json"), "backup-state");
     (async () => {
       const backup = await backupService.createBackup({ createdBy: "fixture" });
@@ -293,6 +320,7 @@ test("successful whole restore preserves both recovery records and blocks servic
       const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
       const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
       assert.equal(coordinator.phase, "restart_required");
+      assert.equal(coordinator.providerPolicyRequired, false);
       assert.equal(coordinator.directorySync, process.platform === "win32" ? "unsupported" : "fsync");
       assert.equal(coordinator.requiredRestartInstances, 1);
       assert.equal(coordinator.selectedBackup.id, backup.id);
@@ -1526,6 +1554,7 @@ test("provider reconciliation queued before local commit is removed when restore
 
 test("restore suppresses provider objects absent from the selected backup and keeps the suppression after restart", () => {
   runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
     let selectedBackup = false;
     const cloud = {
       enabled: () => true,
@@ -1548,6 +1577,19 @@ test("restore suppresses provider objects absent from the selected backup and ke
       selectedBackup = true;
       const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
       assert.equal(restored.cloudSync.state, "pending");
+      const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+      const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
+      assert.equal(coordinator.providerPolicyRequired, true, "a cloud restore durably records the policy requirement before local commit");
+      const policyBytes = fs.readFileSync(providerOrphans.POLICY_PATH);
+      restoreService.setCloudStorage({ enabled: () => false });
+      fs.unlinkSync(providerOrphans.POLICY_PATH);
+      const startup = restoreService.assertNoPendingWholeRestore();
+      assert.equal(restoreService.requiresProviderOrphanPolicyAtStartup(startup), true,
+        "the startup requirement is based on the committed transaction even while the provider is disabled");
+      assert.throws(() => providerOrphans.initialize({ requirePolicy: restoreService.requiresProviderOrphanPolicyAtStartup(startup) }),
+        /policy.*missing/i, "disabled provider configuration cannot replace a missing committed suppression policy with an empty one");
+      fs.writeFileSync(providerOrphans.POLICY_PATH, policyBytes);
+      providerOrphans.initialize({ requirePolicy: restoreService.requiresProviderOrphanPolicyAtStartup(startup) });
       restoreService.prepareWholeRestoreStartup();
       assert.equal(restoreService.acknowledgeWholeRestoreInstance().complete, true);
       const child = require("node:child_process").spawnSync(process.execPath, ["-e", "const fs=require('node:fs');const policy=JSON.parse(fs.readFileSync('data/.rootark-restore-provider-orphans.json','utf8'));process.stdout.write(JSON.stringify(policy));"], { cwd: process.cwd(), encoding: "utf8" });
@@ -1728,11 +1770,14 @@ test("restore inventory failure aborts before local commit", () => {
   `);
 });
 
-test("restore rollback restores the prior provider-orphan suppression file", () => {
+test("restore rollback restores the prior provider-orphan suppression policy and state", () => {
   runFixture(`
     const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+    const statePath = path.join(dataDir, ".rootark-restore-provider-orphans-state.json");
     const priorPolicy = JSON.stringify({ version: 1, objects: [{ area: "uploads", folderId: "root", name: "prior-orphan.txt" }] });
+    const priorState = JSON.stringify({ version: 1, initializedAt: "2026-01-01T00:00:00.000Z" });
     write(policyPath, priorPolicy);
+    write(statePath, priorState);
     const cloud = {
       enabled: () => true,
       provider: "fixture",
@@ -1751,6 +1796,7 @@ test("restore rollback restores the prior provider-orphan suppression file", () 
       }), /injected suppression commit failure/);
       assert.equal(restoreService.assertNoPendingWholeRestore().recovered, true);
       assert.equal(fs.readFileSync(policyPath, "utf8"), priorPolicy);
+      assert.equal(fs.readFileSync(statePath, "utf8"), priorState, "rollback restores the marker paired with the prior policy");
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);
@@ -1778,14 +1824,17 @@ test("abrupt exit after provider-orphan policy persistence restores pre-restore 
       const crashed = childProcess.spawnSync(process.execPath, ["-e", restoreCode], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
       assert.equal(crashed.status, 86, crashed.stderr || crashed.stdout);
       const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+      const policyStatePath = path.join(dataDir, ".rootark-restore-provider-orphans-state.json");
       assert.equal(JSON.parse(fs.readFileSync(policyPath, "utf8")).objects.some((entry) => entry.area === "temp" && entry.name === "post-backup-pending.txt"), true, "the abrupt exit occurs after the new suppression policy is durable");
+      assert.equal(fs.existsSync(policyStatePath), true, "the marker is durable before the restore transaction advances");
       const recoveryCode = [
         'const fs = require("node:fs");',
         "const restoreService = require(" + JSON.stringify(${JSON.stringify(path.join(ROOT, "services", "restoreService"))}) + ");",
         'const result = restoreService.assertNoPendingWholeRestore();',
         'const state = fs.readFileSync("data/restore-state.json", "utf8");',
         'const policyExists = fs.existsSync("data/.rootark-restore-provider-orphans.json");',
-        'process.stdout.write(JSON.stringify({ result, state, policyExists }));',
+        'const policyStateExists = fs.existsSync("data/.rootark-restore-provider-orphans-state.json");',
+        'process.stdout.write(JSON.stringify({ result, state, policyExists, policyStateExists }));',
       ].join("\\n");
       const restarted = childProcess.spawnSync(process.execPath, ["-e", recoveryCode], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
       assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
@@ -1793,6 +1842,7 @@ test("abrupt exit after provider-orphan policy persistence restores pre-restore 
       assert.equal(recovered.result.recovered, true);
       assert.equal(recovered.state, "live state");
       assert.equal(recovered.policyExists, false, "restart rolls back the newly persisted suppression with the other local preimages");
+      assert.equal(recovered.policyStateExists, false, "restart rolls back the newly persisted policy marker with the other local preimages");
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);

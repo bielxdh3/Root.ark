@@ -160,6 +160,7 @@ function makeS3Fixture(objects) {
       blockDelete(key) { return this.block(deleteGates, key); },
       failNextDeletes(key, count) { deleteFailures.set(key, count); },
       clearDeleteFailures(key) { deleteFailures.delete(key); },
+      clearUploadFailures(key) { uploadFailures.delete(key); },
       deleteAttemptCount(key) { return deleteAttempts.get(key) || 0; },
       failNextUploads(key, count) { uploadFailures.set(key, count); },
       uploadAttemptCount(key) { return uploadAttempts.get(key) || 0; },
@@ -204,6 +205,10 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const failedPruneSaveName = "version-prune-save-failure.txt";
   const approveSaveFailureName = "approve-history-save-failure.txt";
   const approveInitialSaveFailureName = "approve-initial-history-save-failure.txt";
+  const approveTrashRecoveryName = "approve-trash-cancellation-failure.txt";
+  const approveTrashRecoveryId = "6c3b9d5b-ef0a-45d9-86d8-7dd7785a0014";
+  const approvePruneQueueFailureName = "approve-pruned-queue-write-failure.txt";
+  const restorePruneRetryName = "restore-pruned-queue-retry.txt";
   const approveCloudQueueFailureName = "approve-cloud-queue-write-failure.txt";
   const approveRevokedName = "approve-revoked-during-cache-recovery.txt";
   const rejectRevokedName = "reject-revoked-during-cache-recovery.txt";
@@ -225,6 +230,14 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     const storedAs = version === 10 ? failedPruneSaveName : `${failedPruneSaveName}.v${version}`;
     objects.set(`rootark/uploads/root/${storedAs}`, Buffer.from(version === 10 ? `current v10 ${failedPruneSaveName}` : `version v${version} ${failedPruneSaveName}`));
   }
+  for (const name of [approvePruneQueueFailureName, restorePruneRetryName]) {
+    for (let version = 1; version <= 10; version += 1) {
+      const storedAs = version === 10 ? name : `${name}.v${version}`;
+      const bytes = Buffer.from(`${name} version ${version}`);
+      objects.set(`rootark/uploads/root/${storedAs}`, bytes);
+      fs.writeFileSync(path.join(directory, "uploads", storedAs), bytes);
+    }
+  }
   objects.set(`rootark/temp/root/${rejectedName}`, Buffer.from(`rejected ${rejectedName}`));
   objects.set(`rootark/temp/root/${uploadRejectName}`, Buffer.from(`old ${uploadRejectName}`));
   objects.set(`rootark/temp/root/${reuseName}`, Buffer.from(`old ${reuseName}`));
@@ -241,9 +254,10 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   fs.writeFileSync(path.join(dataDir, "folders.json"), JSON.stringify([
     { id: "root", name: "Root", createdBy: "system", allowedUsers: [], isRoot: true },
   ]));
-  const initialPermissions = Object.fromEntries([restoreName, queueRestoreName, deleteName, revokedDeleteName, revokedWebDavMoveName, failedRestoreName, failedPruneSaveName, approveSaveFailureName, approveInitialSaveFailureName, approveCloudQueueFailureName].map((name) => [`root/${name}`, { public: false, owner: "tester", users: {} }]));
+  const initialPermissions = Object.fromEntries([restoreName, queueRestoreName, deleteName, revokedDeleteName, revokedWebDavMoveName, failedRestoreName, failedPruneSaveName, approveSaveFailureName, approveInitialSaveFailureName, approveCloudQueueFailureName, approvePruneQueueFailureName, restorePruneRetryName].map((name) => [`root/${name}`, { public: false, owner: "tester", users: {} }]));
   initialPermissions[`root/${orphanReplacementName}`] = { public: false, owner: "tester", users: { limited: { read: true, edit: false } } };
   initialPermissions[`root/${aclRevokedRestoreName}`] = { public: false, owner: null, users: { limited: { read: true, edit: true } } };
+  initialPermissions["root/" + approveTrashRecoveryName] = { public: false, owner: "tester", users: {} };
   const filePermissionsPath = path.join(dataDir, "file-permissions.json");
   fs.writeFileSync(filePermissionsPath, JSON.stringify(initialPermissions));
   const initialHistory = Object.fromEntries([restoreName, queueRestoreName, deleteName, revokedDeleteName, aclRevokedRestoreName, failedRestoreName].map((name) => [`root/${name}`, {
@@ -266,6 +280,16 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     currentVersion: 1,
     versions: [{ version: 1, storedAs: approveSaveFailureName, size: Buffer.byteLength(`prior current ${approveSaveFailureName}`) }],
   };
+  for (const name of [approvePruneQueueFailureName, restorePruneRetryName]) {
+    initialHistory[`root/${name}`] = {
+      currentVersion: 10,
+      versions: Array.from({ length: 10 }, (_, index) => ({
+        version: index + 1,
+        storedAs: index === 9 ? name : `${name}.v${index + 1}`,
+        size: Buffer.byteLength(`${name} version ${index + 1}`),
+      })),
+    };
+  }
   const versionHistoryPath = path.join(dataDir, "file-versions.json");
   const versionReadMarker = path.join(directory, "version-history-reads.txt");
   const unlinkStarted = path.join(directory, "pending-unlink-started");
@@ -277,9 +301,14 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const failVersionCopy = path.join(directory, "fail-version-copy-once");
   const failVersionHistorySave = path.join(directory, "fail-version-history-save-once");
   const failApprovalHistorySave = path.join(directory, "fail-approval-history-save-once");
+  const failTrashCancellationSave = path.join(directory, "fail-trash-cancellation-save-once");
+  const failPrunedQueueWrite = path.join(directory, "fail-pruned-upload-queue-write-once");
+  const trashItemsPath = path.join(dataDir, "trash-items.json");
   const evictPendingConfig = path.join(directory, "evict-pending-cache.json");
   const cloudQueueDirectory = path.join(dataDir, ".rootark-cloud-temp-mutations");
   const cloudUploadQueueDirectory = path.join(dataDir, ".rootark-cloud-upload-mutations");
+  const prunedQueueRecordPath = path.join(cloudUploadQueueDirectory, `${crypto.createHash("sha256").update(`root\0${approvePruneQueueFailureName}.v1`).digest("hex")}.json`);
+  const restorePrunedQueueRecordPath = path.join(cloudUploadQueueDirectory, `${crypto.createHash("sha256").update(`root\0${restorePruneRetryName}.v1`).digest("hex")}.json`);
   const orphanPolicyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
   const rollbackPolicyUploadName = "rollback-policy-clear.txt";
   const pendingRegistryPath = path.join(dataDir, "pending-uploads.json");
@@ -297,6 +326,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     [`root/${approveSaveFailureName}`]: { fileName: approveSaveFailureName, folderId: "root", uploadedBy: "limited", uploadedAt: new Date().toISOString() },
     [`root/${approveInitialSaveFailureName}`]: { fileName: approveInitialSaveFailureName, folderId: "root", uploadedBy: "limited", uploadedAt: new Date().toISOString() },
     [`root/${approveCloudQueueFailureName}`]: { fileName: approveCloudQueueFailureName, folderId: "root", uploadedBy: "tester", uploadedAt: new Date().toISOString() },
+    [`root/${approvePruneQueueFailureName}`]: { fileName: approvePruneQueueFailureName, folderId: "root", uploadedBy: "tester", uploadedAt: new Date().toISOString() },
     [`root/${approveRevokedName}`]: { fileName: approveRevokedName, folderId: "root", uploadedBy: "tester", uploadedAt: new Date().toISOString() },
     [`root/${rejectRevokedName}`]: { fileName: rejectRevokedName, folderId: "root", uploadedBy: "tester", uploadedAt: new Date().toISOString() },
     [`root/${orphanReplacementName}`]: orphanReplacementPending,
@@ -312,6 +342,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   fs.writeFileSync(path.join(directory, "temp", approveSaveFailureName), `pending replacement ${approveSaveFailureName}`);
   fs.writeFileSync(path.join(directory, "temp", approveInitialSaveFailureName), `pending replacement ${approveInitialSaveFailureName}`);
   fs.writeFileSync(path.join(directory, "temp", approveCloudQueueFailureName), `pending replacement ${approveCloudQueueFailureName}`);
+  fs.writeFileSync(path.join(directory, "temp", approvePruneQueueFailureName), "approved bytes after queue-write failure");
   const approveQueueFailureEncryption = { originalFilename: "encrypted-pending.txt", fileName: approveCloudQueueFailureName, folderId: "root", encryptionLevel: "server-key", marker: "preserve encrypted approval metadata" };
   fs.writeFileSync(path.join(dataDir, "encrypted-files.json"), JSON.stringify({ [`root/${failedUploadName}`]: priorFailedUploadEncryption, [`root/${approveCloudQueueFailureName}`]: approveQueueFailureEncryption }));
   fs.writeFileSync(path.join(dataDir, "trash-items.json"), "[]");
@@ -334,6 +365,11 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     `const failVersionCopy = ${JSON.stringify(failVersionCopy)};`,
     `const failVersionHistorySave = ${JSON.stringify(failVersionHistorySave)};`,
     `const failApprovalHistorySave = ${JSON.stringify(failApprovalHistorySave)};`,
+    `const failTrashCancellationSave = ${JSON.stringify(failTrashCancellationSave)};`,
+    `const failPrunedQueueWrite = ${JSON.stringify(failPrunedQueueWrite)};`,
+    `const prunedQueueRecordFile = ${JSON.stringify(prunedQueueRecordPath)};`,
+    `const trashItemsFile = ${JSON.stringify(trashItemsPath)};`,
+    `const failedTrashId = ${JSON.stringify(approveTrashRecoveryId)};`,
     `const versionHistoryFile = ${JSON.stringify(versionHistoryPath)};`,
     `const failedRestoreTarget = ${JSON.stringify(path.join(directory, "uploads", `${failedRestoreName}.v1`))};`,
     `const evictPendingConfig = ${JSON.stringify(evictPendingConfig)};`,
@@ -348,8 +384,8 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     'const originalPromiseUnlink = fs.promises.unlink.bind(fs.promises);',
     'fs.promises.unlink = async function (file) { if (typeof file === "string" && path.resolve(file) === path.resolve(pending)) await waitForRelease(); return originalPromiseUnlink(file); };',
     'const originalCopyFileSync = fs.copyFileSync; fs.copyFileSync = function (source, destination, ...args) { if (fs.existsSync(failVersionCopy) && typeof source === "string" && path.resolve(source) === path.resolve(failedRestoreTarget)) { fs.unlinkSync(failVersionCopy); const error = new Error("injected version copy failure"); error.code = "EIO"; throw error; } return originalCopyFileSync.call(this, source, destination, ...args); };',
-    'const originalWriteFileSync = fs.writeFileSync; fs.writeFileSync = function (file, ...args) { if ((fs.existsSync(failVersionHistorySave) || fs.existsSync(failApprovalHistorySave)) && typeof file === "string" && path.resolve(file) === path.resolve(versionHistoryFile)) { if (fs.existsSync(failVersionHistorySave)) fs.unlinkSync(failVersionHistorySave); if (fs.existsSync(failApprovalHistorySave)) fs.unlinkSync(failApprovalHistorySave); const error = new Error("injected version history save failure"); error.code = "EIO"; throw error; } return originalWriteFileSync.call(this, file, ...args); };',
-    'const originalOpen = fs.openSync; fs.openSync = function (file, flags, ...args) { const inTempQueue = typeof file === "string" && path.resolve(file).startsWith(path.resolve(cloudQueueDirectory) + path.sep); const inUploadQueue = typeof file === "string" && path.resolve(file).startsWith(path.resolve(cloudUploadQueueDirectory) + path.sep); if (flags === "wx" && ((fs.existsSync(failQueueWrites) && inTempQueue) || (fs.existsSync(failUploadQueueWrites) && inUploadQueue))) { const error = new Error("injected cloud queue write failure"); error.code = "EIO"; throw error; } if (flags === "wx" && inUploadQueue && fs.existsSync(failUploadQueueAfterWrites)) { const config = JSON.parse(fs.readFileSync(failUploadQueueAfterWrites, "utf8")); config.remaining -= 1; if (config.remaining <= 0) { fs.unlinkSync(failUploadQueueAfterWrites); const error = new Error("injected later cloud upload queue write failure"); error.code = "EIO"; throw error; } fs.writeFileSync(failUploadQueueAfterWrites, JSON.stringify(config)); } return originalOpen.call(this, file, flags, ...args); };',
+    'const originalWriteFileSync = fs.writeFileSync; fs.writeFileSync = function (file, ...args) { if ((fs.existsSync(failVersionHistorySave) || fs.existsSync(failApprovalHistorySave)) && typeof file === "string" && path.resolve(file) === path.resolve(versionHistoryFile)) { if (fs.existsSync(failVersionHistorySave)) fs.unlinkSync(failVersionHistorySave); if (fs.existsSync(failApprovalHistorySave)) fs.unlinkSync(failApprovalHistorySave); const error = new Error("injected version history save failure"); error.code = "EIO"; throw error; } if (fs.existsSync(failTrashCancellationSave) && typeof file === "string" && path.resolve(file) === path.resolve(trashItemsFile)) { const items = JSON.parse(String(args[0])); if (items.some((item) => item.id === failedTrashId && item.status === "permanently_deleted" && item.metadata?.remoteDeletion?.state === "cancelled")) { fs.unlinkSync(failTrashCancellationSave); const error = new Error("injected trash cancellation save failure"); error.code = "EIO"; throw error; } } return originalWriteFileSync.call(this, file, ...args); };',
+    'const originalOpen = fs.openSync; fs.openSync = function (file, flags, ...args) { const inTempQueue = typeof file === "string" && path.resolve(file).startsWith(path.resolve(cloudQueueDirectory) + path.sep); const inUploadQueue = typeof file === "string" && path.resolve(file).startsWith(path.resolve(cloudUploadQueueDirectory) + path.sep); if (flags === "wx" && fs.existsSync(failPrunedQueueWrite) && typeof file === "string" && path.resolve(file).startsWith(path.resolve(prunedQueueRecordFile) + ".")) { fs.unlinkSync(failPrunedQueueWrite); const error = new Error("injected pruned upload queue write failure"); error.code = "EIO"; throw error; } if (flags === "wx" && ((fs.existsSync(failQueueWrites) && inTempQueue) || (fs.existsSync(failUploadQueueWrites) && inUploadQueue))) { const error = new Error("injected cloud queue write failure"); error.code = "EIO"; throw error; } if (flags === "wx" && inUploadQueue && fs.existsSync(failUploadQueueAfterWrites)) { const config = JSON.parse(fs.readFileSync(failUploadQueueAfterWrites, "utf8")); config.remaining -= 1; if (config.remaining <= 0) { fs.unlinkSync(failUploadQueueAfterWrites); const error = new Error("injected later cloud upload queue write failure"); error.code = "EIO"; throw error; } fs.writeFileSync(failUploadQueueAfterWrites, JSON.stringify(config)); } return originalOpen.call(this, file, flags, ...args); };',
     'const originalRename = fs.renameSync; fs.renameSync = function (source, destination, ...args) { if (fs.existsSync(failPolicyClearAfterRename) && typeof destination === "string" && path.resolve(destination) === path.resolve(restoreOrphanPolicy)) { fs.unlinkSync(failPolicyClearAfterRename); originalRename.call(this, source, destination, ...args); const error = new Error("injected policy directory-sync failure after rename"); error.code = "EIO"; throw error; } return originalRename.call(this, source, destination, ...args); };',
   ].join("\n"));
   const env = {
@@ -403,6 +439,71 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const readCount = () => fs.readFileSync(versionReadMarker, "utf8").trim().split(/\r?\n/).filter(Boolean).length;
   const results = [];
 
+  const approvalProviderKey = `rootark/uploads/root/${approveTrashRecoveryName}`;
+  const approvalQueuePath = path.join(cloudUploadQueueDirectory, `${crypto.createHash("sha256").update(`root\0${approveTrashRecoveryName}`).digest("hex")}.json`);
+  const approvalTrashRecord = {
+    id: approveTrashRecoveryId,
+    itemType: "file",
+    originalFolderId: "root",
+    originalFileName: approveTrashRecoveryName,
+    trashPath: `files/${approveTrashRecoveryId}/${approveTrashRecoveryName}`,
+    deletedAt: new Date().toISOString(),
+    status: "remote_delete_pending",
+    metadata: { remoteDeletion: { operationId: "approval-recovery-delete", provider: "s3", state: "pending", attempts: 0, maxAttempts: 25, nextAttemptAt: new Date().toISOString(), transitions: [{ state: "pending", at: new Date().toISOString() }] } },
+    restoreMetadata: { versions: { versions: [] } },
+  };
+  const trashItems = JSON.parse(fs.readFileSync(trashItemsPath, "utf8"));
+  trashItems.push(approvalTrashRecord);
+  fs.writeFileSync(trashItemsPath, JSON.stringify(trashItems));
+  const approvalPending = JSON.parse(fs.readFileSync(pendingRegistryPath, "utf8"));
+  approvalPending[`root/${approveTrashRecoveryName}`] = { fileName: approveTrashRecoveryName, folderId: "root", uploadedBy: "tester", uploadedAt: new Date().toISOString() };
+  fs.writeFileSync(pendingRegistryPath, JSON.stringify(approvalPending));
+  fs.writeFileSync(path.join(directory, "temp", approveTrashRecoveryName), "replacement bytes after cancellation failure");
+  objects.set(approvalProviderKey, Buffer.from("old remote bytes"));
+  fs.writeFileSync(failTrashCancellationSave, "fail once");
+  const approvalDeleteAttempts = cloud.deleteAttemptCount(approvalProviderKey);
+  cloud.failNextUploads(approvalProviderKey, 100);
+  const cancellationFailureResponse = await mutate(`/approve/${approveTrashRecoveryName}?folderId=root`, "POST");
+  assert.equal(cancellationFailureResponse.status, 202, cancellationFailureResponse.body);
+  assert.equal(JSON.parse(cancellationFailureResponse.body).trashCancellationPending, true);
+  assert.equal(fs.readFileSync(path.join(directory, "uploads", approveTrashRecoveryName), "utf8"), "replacement bytes after cancellation failure");
+  assert.equal(fs.existsSync(path.join(directory, "temp", approveTrashRecoveryName)), false);
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(pendingRegistryPath, "utf8")), `root/${approveTrashRecoveryName}`), false);
+  assert.equal(JSON.parse(fs.readFileSync(versionHistoryPath, "utf8"))[`root/${approveTrashRecoveryName}`].currentVersion, 1);
+  assert.equal(JSON.parse(fs.readFileSync(approvalQueuePath, "utf8")).desired, "present");
+  const trashAfterApprovalFailure = JSON.parse(fs.readFileSync(trashItemsPath, "utf8")).find((item) => item.id === approveTrashRecoveryId);
+  assert.equal(trashAfterApprovalFailure.status, "remote_delete_pending");
+  assert.equal(trashAfterApprovalFailure.metadata.remoteDeletion.state, "pending");
+  assert.equal(cloud.deleteAttemptCount(approvalProviderKey), approvalDeleteAttempts, "approval does not delete the provider replacement while trash cancellation is pending");
+  const replacementRead = await request(port, `/files/${encodeURIComponent(approveTrashRecoveryName)}?folderId=root`, { headers: { cookie } });
+  assert.equal(replacementRead.status, 200, replacementRead.body);
+  assert.equal(replacementRead.body, "replacement bytes after cancellation failure");
+  const replacementReadPath = "/files/" + encodeURIComponent(approveTrashRecoveryName) + "?folderId=root";
+  const unauthorizedReplacementRead = await request(port, replacementReadPath, { headers: { cookie: limitedCookie } });
+  assert.equal(unauthorizedReplacementRead.status, 403, unauthorizedReplacementRead.body);
+  const firstUploadDeadline = Date.now() + 5000;
+  while (cloud.uploadAttemptCount(approvalProviderKey) === 0 && Date.now() < firstUploadDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(cloud.uploadAttemptCount(approvalProviderKey) > 0, "the approval upload reconciliation was attempted");
+  cloud.clearUploadFailures(approvalProviderKey);
+  await stop(child);
+  child = startChild();
+  childErrors = "";
+  child.stderr?.on("data", (chunk) => { childErrors += chunk.toString(); });
+  assert.equal((await waitForServer(port, child)).status, 200);
+  const approvalRecoveryDeadline = Date.now() + 5000;
+  let recoveredApprovalTrash;
+  while (Date.now() < approvalRecoveryDeadline) {
+    recoveredApprovalTrash = JSON.parse(fs.readFileSync(trashItemsPath, "utf8")).find((item) => item.id === approveTrashRecoveryId);
+    if (recoveredApprovalTrash.status === "permanently_deleted" && recoveredApprovalTrash.metadata.remoteDeletion.state === "cancelled"
+      && !fs.existsSync(approvalQueuePath) && objects.get(approvalProviderKey)?.toString() === "replacement bytes after cancellation failure") break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(recoveredApprovalTrash.status, "permanently_deleted");
+  assert.equal(recoveredApprovalTrash.metadata.remoteDeletion.state, "cancelled");
+  assert.equal(fs.existsSync(approvalQueuePath), false, "restart reconciles the durable approval upload intent");
+  assert.equal(objects.get(approvalProviderKey)?.toString(), "replacement bytes after cancellation failure");
+  assert.equal(cloud.deleteAttemptCount(approvalProviderKey), approvalDeleteAttempts, "restart cancellation detects the local replacement before provider deletion");
+
   fs.writeFileSync(failApprovalHistorySave, "fail once");
   const failedReplacementApproval = await mutate(`/approve/${approveSaveFailureName}?folderId=root`, "POST");
   const replacementPending = JSON.parse(fs.readFileSync(pendingRegistryPath, "utf8"))[`root/${approveSaveFailureName}`];
@@ -455,6 +556,54 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
       providerObjectUnchanged: true,
     },
   });
+
+  fs.mkdirSync(cloudUploadQueueDirectory, { recursive: true });
+  fs.writeFileSync(prunedQueueRecordPath, JSON.stringify({
+    version: 1,
+    folderId: "root",
+    fileName: `${approvePruneQueueFailureName}.v1`,
+    area: "uploads",
+    desired: "present",
+    generation: crypto.randomUUID(),
+    updatedAt: new Date().toISOString(),
+  }));
+  const prunedQueueProviderKey = `rootark/uploads/root/${approvePruneQueueFailureName}.v1`;
+  objects.delete(prunedQueueProviderKey);
+  cloud.failNextUploads(prunedQueueProviderKey, 100);
+  const pruneQueueFailureHistory = JSON.parse(fs.readFileSync(versionHistoryPath, "utf8"))[`root/${approvePruneQueueFailureName}`];
+  fs.writeFileSync(failPrunedQueueWrite, "fail once");
+  const failedPruneQueueApproval = await mutate(`/approve/${approvePruneQueueFailureName}?folderId=root`, "POST");
+  assert.equal(failedPruneQueueApproval.status, 500);
+  assert.equal(fs.readFileSync(path.join(directory, "uploads", approvePruneQueueFailureName), "utf8"), `${approvePruneQueueFailureName} version 10`);
+  assert.equal(fs.readFileSync(path.join(directory, "uploads", `${approvePruneQueueFailureName}.v1`), "utf8"), `${approvePruneQueueFailureName} version 1`);
+  assert.equal(fs.readFileSync(path.join(directory, "temp", approvePruneQueueFailureName), "utf8"), "approved bytes after queue-write failure");
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(pendingRegistryPath, "utf8")), `root/${approvePruneQueueFailureName}`), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(versionHistoryPath, "utf8"))[`root/${approvePruneQueueFailureName}`], pruneQueueFailureHistory);
+  assert.equal(JSON.parse(fs.readFileSync(prunedQueueRecordPath, "utf8")).desired, "present", "failed absent-intent persistence leaves the still-present local version queued as present");
+  cloud.clearUploadFailures(prunedQueueProviderKey);
+
+  fs.writeFileSync(restorePrunedQueueRecordPath, JSON.stringify({ version: 1, folderId: "root", fileName: restorePruneRetryName + ".v1", area: "uploads", desired: "present", generation: crypto.randomUUID(), updatedAt: new Date().toISOString() }));
+  const restorePrunedCloudKey = "rootark/uploads/root/" + restorePruneRetryName + ".v1";
+  const restorePrunedDeleteAttempts = cloud.deleteAttemptCount(restorePrunedCloudKey);
+  cloud.failNextDeletes(restorePrunedCloudKey, 100);
+  const prunedVersionRestore = await mutate(`/restore/${restorePruneRetryName}/v/1?folderId=root`, "POST");
+  assert.equal(prunedVersionRestore.status, 200, prunedVersionRestore.body);
+  const prunedDeleteDeadline = Date.now() + 5000;
+  while (cloud.deleteAttemptCount(restorePrunedCloudKey) === restorePrunedDeleteAttempts && Date.now() < prunedDeleteDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(cloud.deleteAttemptCount(restorePrunedCloudKey) > restorePrunedDeleteAttempts, "pruned remote version deletion was attempted");
+  assert.equal(JSON.parse(fs.readFileSync(restorePrunedQueueRecordPath, "utf8")).desired, "absent", "pruned version has a durable absent intent instead of its previous present intent");
+  assert.equal(fs.existsSync(path.join(directory, "uploads", restorePruneRetryName + ".v1")), false, "pruned local version is removed only after the absent intent is durable");
+  assert.equal(objects.has(restorePrunedCloudKey), true, "failed provider deletion retains remote bytes while the absent intent remains pending");
+  cloud.clearDeleteFailures(restorePrunedCloudKey);
+  await stop(child);
+  child = startChild();
+  childErrors = "";
+  child.stderr?.on("data", (chunk) => { childErrors += chunk.toString(); });
+  assert.equal((await waitForServer(port, child)).status, 200);
+  const pruneRetryDeadline = Date.now() + 5000;
+  while ((objects.has(restorePrunedCloudKey) || fs.existsSync(restorePrunedQueueRecordPath)) && Date.now() < pruneRetryDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(objects.has(restorePrunedCloudKey), false, "restart retries and completes the durable absent intent");
+  assert.equal(fs.existsSync(restorePrunedQueueRecordPath), false, "completed absent intent is removed after provider success");
 
   const failedReplacementQueuePath = path.join(cloudUploadQueueDirectory, `${crypto.createHash("sha256").update(`root\0${approveSaveFailureName}`).digest("hex")}.json`);
   assert.equal(fs.existsSync(failedReplacementQueuePath), false, "a failed local version transaction removes the staged provider intent");
@@ -561,6 +710,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const failedPruneCurrentPath = path.join(directory, "uploads", failedPruneSaveName);
   const failedPruneOldVersionPath = path.join(directory, "uploads", `${failedPruneSaveName}.v1`);
   const failedPruneCloudKey = `rootark/uploads/root/${failedPruneSaveName}.v1`;
+  const failedPruneQueueRecord = path.join(cloudUploadQueueDirectory, `${crypto.createHash("sha256").update(`root\0${failedPruneSaveName}.v1`).digest("hex")}.json`);
   results.push({
     case: "version-restore-save-failure-preserves-pruned-history",
     actual: {
@@ -569,6 +719,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
       currentVersion: failedPruneHistory.currentVersion,
       oldVersionExists: fs.existsSync(failedPruneOldVersionPath),
       oldCloudVersionExists: objects.has(failedPruneCloudKey),
+      absentIntentRolledBack: !fs.existsSync(failedPruneQueueRecord),
       oldVersionDeleteScheduled: cloud.mutationsFor(failedPruneCloudKey).some((mutation) => mutation.method === "DELETE"),
     },
     expected: {
@@ -577,6 +728,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
       currentVersion: 10,
       oldVersionExists: true,
       oldCloudVersionExists: true,
+      absentIntentRolledBack: true,
       oldVersionDeleteScheduled: false,
     },
   });

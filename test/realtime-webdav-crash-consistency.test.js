@@ -362,7 +362,13 @@ test("WebDAV MOVE persists remote intent before provider effects", { timeout: 90
       const verified = path.join(f.dir, "claim-verification-complete");
       const timerSignal = path.join(f.dir, "reconciliation-timer-entered");
       second = await startServer(f.dir, { CLAIM_SWAP_LOCK_PATH: lockPath, CLAIM_SWAP_EVIDENCE_PATH: evidencePath, CLAIM_SWAP_CONTENTS: replacement, CLAIM_SWAP_OBSERVED: swapped, CLAIM_SWAP_COMPLETED: verified, CLAIM_TIMER_DELAY_MS: "1200", CLAIM_TIMER_SIGNAL: timerSignal, WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS: "1200", CLOUD_TEMP_RECONCILIATION_INTERVAL_MS: "30000", CLOUD_UPLOAD_RECONCILIATION_INTERVAL_MS: "30000" });
-      await waitFor(() => fs.existsSync(swapped));
+      await waitFor(() => fs.existsSync(swapped)).catch((error) => {
+        const pendingJournal = journalPaths(f.dir);
+        const stderrTail = second.stderr().slice(-4_000);
+        let journalState = null;
+        try { if (pendingJournal) journalState = JSON.parse(fs.readFileSync(pendingJournal, "utf8")); } catch (journalError) { journalState = { readError: journalError.message }; }
+        throw new Error(`${error.message}; childExitCode=${second.child.exitCode}; stderrTail=${stderrTail}; swapped=${fs.existsSync(swapped)}; verified=${fs.existsSync(verified)}; timerSignal=${fs.existsSync(timerSignal)}; lockExists=${fs.existsSync(lockPath)}; evidenceExists=${fs.existsSync(evidencePath)}; journalPath=${pendingJournal}; journal=${JSON.stringify(journalState)}; providerCalls=${JSON.stringify(calls(f.dir))}`);
+      });
       await waitFor(() => fs.existsSync(verified));
       await waitFor(() => fs.existsSync(timerSignal));
       assert.equal(calls(f.dir).filter((entry) => entry.operation === "upload").length, 1, "a path replacement after identity validation must not trigger a provider retry");

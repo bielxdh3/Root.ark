@@ -24,6 +24,8 @@
   let realtimeRefreshTimer = null;
   let realtimeRefreshPending = false;
   let realtimeClosed = false;
+  let uploadInProgress = false;
+  let versionsRequestPending = false;
   const dirtyForms = new WeakSet();
   const CHUNK_BYTES = 8 * 1024 * 1024;
   const CHUNK_THRESHOLD = 5 * 1024 * 1024;
@@ -62,6 +64,47 @@
   function date(value) { return ui.formatDate(value); }
   function ownerOf(file) { return file.owner || file.uploadedBy || file.createdBy || "—"; }
   function isEncrypted(file) { return Boolean(file && (file.isEncrypted || file.encrypted || file.encryption && file.encryption.isEncrypted)); }
+  function captureDirtyFormControls() {
+    const occurrences = new Map();
+    return Array.from(root.querySelectorAll("input, select, textarea")).flatMap((control) => {
+      if (!control.form || !dirtyForms.has(control.form)) return [];
+      const baseKey = [control.form.id || "", control.id || "", control.name || "", control.tagName, control.type || ""].join("\0");
+      const occurrence = occurrences.get(baseKey) || 0;
+      occurrences.set(baseKey, occurrence + 1);
+      return [{
+        baseKey,
+        occurrence,
+        value: control.type === "file" ? undefined : control.value,
+        checked: typeof control.checked === "boolean" ? control.checked : undefined,
+        selectedValues: control.tagName === "SELECT" && control.multiple ? Array.from(control.selectedOptions, (option) => option.value) : undefined,
+        fileNode: control.type === "file" && control.files && control.files.length ? control : null,
+      }];
+    });
+  }
+  function restoreDirtyFormControls(snapshots) {
+    if (!snapshots.length) return;
+    const occurrences = new Map();
+    const controls = Array.from(root.querySelectorAll("input, select, textarea"));
+    for (const control of controls) {
+      const baseKey = [control.form && control.form.id || "", control.id || "", control.name || "", control.tagName, control.type || ""].join("\0");
+      const occurrence = occurrences.get(baseKey) || 0;
+      occurrences.set(baseKey, occurrence + 1);
+      const snapshot = snapshots.find((item) => item.baseKey === baseKey && item.occurrence === occurrence);
+      if (!snapshot) continue;
+      let restored = control;
+      if (snapshot.fileNode && snapshot.fileNode !== control) {
+        control.replaceWith(snapshot.fileNode);
+        restored = snapshot.fileNode;
+      } else if (snapshot.value !== undefined) {
+        restored.value = snapshot.value;
+      }
+      if (snapshot.checked !== undefined) restored.checked = snapshot.checked;
+      if (snapshot.selectedValues) {
+        for (const option of Array.from(restored.options || [])) option.selected = snapshot.selectedValues.includes(option.value);
+      }
+      if (restored.form) dirtyForms.add(restored.form);
+    }
+  }
   function historyActionLabel(action) {
     const labels = {
       upload_pending: "Enviou para aprovação", approved: "Aprovou arquivo", rejected: "Rejeitou arquivo", deleted: "Moveu arquivo para a lixeira",
@@ -208,7 +251,7 @@
       (data.canRestore && version.version !== data.currentVersion ? actionButton("restore-version", "Restaurar", { name: data.fileName, version: version.version, folder: data.folderId }, "button-quiet") : "") +
       (data.canDeleteVersions && version.version !== data.currentVersion ? actionButton("delete-version", "Excluir", { name: data.fileName, version: version.version, folder: data.folderId }, "button-quiet") : "") + "</div></td></tr>").join("");
     const actionRows = (data.actionHistory || []).map((entry) => '<tr><td data-label="Ação">' + esc(historyActionLabel(entry.action)) + '</td><td data-label="Responsável">' + esc(entry.actor || "sistema") + '</td><td data-label="Data">' + esc(date(entry.timestamp)) + '</td><td data-label="Arquivo">' + esc(historyFileLabel(entry)) + '</td><td data-label="Pasta">' + esc(entry.details && entry.details.folderName || "—") + '</td></tr>').join("");
-    return '<section class="panel versions-panel"><div class="panel-heading"><div><p class="eyebrow">HISTÓRICO DE ARQUIVO</p><h2>' + esc(data.fileName) + '</h2></div>' + actionButton("close-versions", "Fechar", {}, "button-quiet") + '</div><div class="table-wrap"><table class="data-table"><thead><tr><th>Versão</th><th>Tamanho</th><th>Enviado por</th><th>Data</th><th>Comentário</th><th>Ações</th></tr></thead><tbody>' + (rows || '<tr><td colspan="6">Nenhuma versão disponível.</td></tr>') + '</tbody></table></div><h3>Histórico do arquivo</h3><div class="table-wrap"><table class="data-table"><thead><tr><th>Ação</th><th>Responsável</th><th>Data</th><th>Arquivo</th><th>Pasta</th></tr></thead><tbody>' + (actionRows || '<tr><td colspan="5">Nenhuma ação registrada.</td></tr>') + '</tbody></table></div></section>';
+    return '<section class="panel versions-panel"><div class="panel-heading"><div><p class="eyebrow">HISTÓRICO DE ARQUIVO</p><h2 tabindex="-1">' + esc(data.fileName) + '</h2></div>' + actionButton("close-versions", "Fechar", {}, "button-quiet") + '</div><div class="table-wrap"><table class="data-table"><thead><tr><th>Versão</th><th>Tamanho</th><th>Enviado por</th><th>Data</th><th>Comentário</th><th>Ações</th></tr></thead><tbody>' + (rows || '<tr><td colspan="6">Nenhuma versão disponível.</td></tr>') + '</tbody></table></div><h3>Histórico do arquivo</h3><div class="table-wrap"><table class="data-table"><thead><tr><th>Ação</th><th>Responsável</th><th>Data</th><th>Arquivo</th><th>Pasta</th></tr></thead><tbody>' + (actionRows || '<tr><td colspan="5">Nenhuma ação registrada.</td></tr>') + '</tbody></table></div></section>';
   }
 
   function protectedPanel() {
@@ -719,6 +762,14 @@
   }
 
   async function submitUpload(formElement, filesOverride) {
+    if (uploadInProgress) {
+      ui.toast("Já existe um envio em andamento.", "error");
+      return;
+    }
+    if (versionsRequestPending) {
+      ui.toast("Aguarde o carregamento das versões antes de enviar.", "error");
+      return;
+    }
     const formData = new FormData(formElement);
     const files = Array.from(filesOverride || document.getElementById("upload-files").files || []);
     if (!files.length) return;
@@ -730,9 +781,10 @@
     const settings = { level, password, expiresInDays: String(formData.get("expiresInDays") || "") };
     const versionComment = String(formData.get("versionComment") || "").trim();
     const progress = document.getElementById("upload-progress");
-    progress.hidden = false;
-    formElement.querySelector('button[type="submit"]').disabled = true;
+    uploadInProgress = true;
     try {
+      progress.hidden = false;
+      formElement.querySelector('button[type="submit"]').disabled = true;
       for (let i = 0; i < files.length; i += 1) {
         const file = files[i];
         progress.textContent = "Enviando " + file.name + " (" + (i + 1) + "/" + files.length + ")…";
@@ -748,6 +800,7 @@
       progress.textContent = error.message || "O envio não foi concluído.";
       ui.toast(progress.textContent, "error");
     } finally {
+      uploadInProgress = false;
       formElement.querySelector('button[type="submit"]').disabled = false;
       const passwordField = formElement.querySelector('[name="password"]');
       if (passwordField) passwordField.value = "";
@@ -816,15 +869,59 @@
     finally { password = ""; }
   }
 
-  async function fileVersions(name, folderId) {
+  async function fileVersions(name, folderId, focusTrigger) {
+    if (uploadInProgress) {
+      ui.toast("Aguarde o envio terminar antes de abrir as versões.", "error");
+      return;
+    }
+    if (versionsRequestPending) return;
+    versionsRequestPending = true;
     try {
+      if (focusTrigger && typeof focusTrigger.focus === "function") focusTrigger.focus({ preventScroll: true });
+      const focusAtStart = document.activeElement;
       await api.post(api.query("/versions/" + encodeURIComponent(name) + "/initialize", { folderId }), {});
       state.versions = await api.get(api.query("/versions/" + encodeURIComponent(name), { folderId }));
       state.versions.folderId = folderId;
       state.versions.isEncrypted = isEncrypted(state.files.find((item) => item.name === name && fileFolderId(item) === folderId));
+      const shouldFocusHeading = document.activeElement === focusAtStart;
+      const activeElement = document.activeElement;
+      const activeAction = !shouldFocusHeading && activeElement.closest ? activeElement.closest("[data-action]") : null;
+      const activeDetails = !shouldFocusHeading && activeElement.closest ? activeElement.closest("details") : null;
+      const focusTarget = !shouldFocusHeading && root.contains(activeElement)
+        ? activeAction && root.contains(activeAction)
+          ? { action: { ...activeAction.dataset } }
+          : activeElement.id
+            ? { id: activeElement.id }
+            : activeElement.name
+              ? { name: activeElement.name, tagName: activeElement.tagName, type: activeElement.type || "" }
+              : activeElement.tagName === "SUMMARY" && activeDetails
+                ? { summaryText: String(activeElement.textContent || "").replace(/\s+/g, " ").trim(), detailsClassName: activeDetails.className || "" }
+                : null
+        : null;
+      const dirtyFormControls = captureDirtyFormControls();
+      const advancedDetailsOpen = Boolean(root.querySelector("details.search-advanced")?.open);
       render();
-      document.querySelector(".versions-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      restoreDirtyFormControls(dirtyFormControls);
+      const nextAdvancedDetails = root.querySelector("details.search-advanced");
+      if (nextAdvancedDetails) nextAdvancedDetails.open = advancedDetailsOpen;
+      if (shouldFocusHeading) document.querySelector(".versions-panel h2")?.focus();
+      else if (focusTarget) {
+        const selector = "[data-action], input, select, textarea, button, a[href], summary, [tabindex]:not([tabindex=\"-1\"])";
+        const replacement = Array.from(root.querySelectorAll(selector)).find((item) => {
+          if (focusTarget.action) return Object.entries(focusTarget.action).every(([key, value]) => item.dataset[key] === value);
+          if (focusTarget.id) return item.id === focusTarget.id;
+          if (focusTarget.summaryText !== undefined) {
+            const details = item.closest("details");
+            return item.tagName === "SUMMARY" && String(item.textContent || "").replace(/\s+/g, " ").trim() === focusTarget.summaryText
+              && (details?.className || "") === focusTarget.detailsClassName;
+          }
+          return item.name === focusTarget.name && item.tagName === focusTarget.tagName && (item.type || "") === focusTarget.type;
+        });
+        if (replacement) replacement.focus();
+      }
+      if (shouldFocusHeading) document.querySelector(".versions-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
     } catch (error) { reportError(error); }
+    finally { versionsRequestPending = false; }
   }
 
   async function restoreVersion(name, version, folderId) {
@@ -846,9 +943,21 @@
     await confirmThen(verb + " envio?", '<p>Confirma ' + verb.toLowerCase() + ' o arquivo <strong>' + esc(name) + '</strong>?</p>', async () => {
       try {
         const path = api.query("/" + (yes ? "approve" : "reject") + "/" + encodeURIComponent(name), { folderId });
-        await api.post(path, {});
-        ui.toast(yes ? "Arquivo aprovado." : "Arquivo rejeitado.", "success");
+        const result = await api.post(path, {});
+        let message;
+        let tone = "success";
+        if (yes && result && (result.cloudSyncPending || result.cloudCleanupPending || result.trashCancellationPending)) {
+          const pending = [];
+          if (result.cloudSyncPending) pending.push("sincronização na nuvem");
+          if (result.cloudCleanupPending) pending.push("limpeza do envio temporário");
+          if (result.trashCancellationPending) pending.push("cancelamento da exclusão remota anterior");
+          message = "Arquivo aprovado. Pendências em segundo plano: " + pending.join(", ") + ".";
+          tone = undefined;
+        } else {
+          message = yes ? "Arquivo aprovado." : "Arquivo rejeitado.";
+        }
         await loadFiles();
+        ui.toast(message, tone);
       } catch (error) { reportError(error); }
     }, !yes);
   }
@@ -910,7 +1019,7 @@
     if (action === "download-file") return openFile(name, true, folderId);
     if (action === "share-file") return shareFile(name, folderId);
     if (action === "file-access") return editFileAccess(name, folderId);
-    if (action === "file-versions") return fileVersions(name, folderId);
+    if (action === "file-versions") return fileVersions(name, folderId, button);
     if (action === "file-expiration") return setFileExpiration(name, folderId);
     if (action === "rename-file") return renameFile(name, folderId);
     if (action === "move-file") return moveFile(name, folderId);

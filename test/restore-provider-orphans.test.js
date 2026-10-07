@@ -26,6 +26,69 @@ async function waitForFile(filePath, timeoutMs = 5000) {
   return fs.existsSync(filePath);
 }
 
+test("missing restore provider suppression policy fails closed in-process and after restart", () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-missing-policy-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const policy = require(${JSON.stringify(servicePath)});
+      (async () => {
+        await policy.write([{ area: "uploads", folderId: "root", name: "stale-provider-object.txt" }]);
+        fs.unlinkSync(policy.POLICY_PATH);
+        assert.throws(() => policy.isSuppressed("root", "stale-provider-object.txt"), /policy.*missing|missing.*policy/i,
+          "a missing policy cannot turn previously suppressed provider objects into visible files");
+        process.stdout.write("running-process-blocked");
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(result.stdout, "running-process-blocked");
+
+    const restartScript = `
+      const policy = require(${JSON.stringify(servicePath)});
+      try { policy.initialize(); }
+      catch (error) {
+        if (/policy.*missing|missing.*policy/i.test(error.message)) process.exit(0);
+        console.error(error);
+        process.exit(2);
+      }
+      console.error("restart accepted a missing policy");
+      process.exit(1);
+    `;
+    const restarted = spawnSync(process.execPath, ["-e", restartScript], { cwd: runtime, encoding: "utf8" });
+    assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("provider suppression initialization creates a fail-closed marker and preserves legacy policy", () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-initialize-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const policy = require(${JSON.stringify(servicePath)});
+      assert.throws(() => policy.initialize({ requirePolicy: true }), /missing after cloud restore/i,
+        "a pending cloud restore cannot start without its committed policy");
+      assert.deepEqual(policy.initialize(), [], "a new runtime starts with an explicit empty policy");
+      assert.equal(fs.existsSync(policy.POLICY_PATH), true);
+      assert.equal(fs.existsSync(policy.STATE_PATH), true);
+      fs.writeFileSync(policy.POLICY_PATH, JSON.stringify({ version: 1, objects: [{ area: "uploads", folderId: "root", name: "legacy-orphan.txt" }] }));
+      fs.unlinkSync(policy.STATE_PATH);
+      assert.deepEqual(policy.initialize(), [{ area: "uploads", folderId: "root", name: "legacy-orphan.txt" }],
+        "a legacy policy is upgraded without discarding its suppressions");
+      assert.equal(fs.existsSync(policy.STATE_PATH), true);
+      assert.equal(policy.isSuppressed("root", "legacy-orphan.txt"), true);
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("restore provider orphan identities preserve provider object case on every host", () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-"));
   try {

@@ -41,6 +41,7 @@ function startS3Fixture({ failListings = false, failListingPrefixes = [] } = {})
   const deleteStarted = new Promise((resolve) => { markDeleteStarted = resolve; });
   const deleteReleased = new Promise((resolve) => { releaseDelete = resolve; });
   const deleteKeys = [];
+  const listPrefixes = [];
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://fixture.invalid");
     if (req.method === "DELETE") {
@@ -53,6 +54,7 @@ function startS3Fixture({ failListings = false, failListingPrefixes = [] } = {})
     }
     if (req.method === "GET" && url.searchParams.has("list-type")) {
       const requestedPrefix = url.searchParams.get("prefix") || "";
+      listPrefixes.push(requestedPrefix);
       if (failListings || failListingPrefixes.some((prefix) => requestedPrefix.includes(prefix))) {
         res.writeHead(503, { "content-type": "application/xml" });
         res.end("<Error><Code>ServiceUnavailable</Code></Error>");
@@ -71,6 +73,7 @@ function startS3Fixture({ failListings = false, failListingPrefixes = [] } = {})
       server,
       port: server.address().port,
       deleteKeys,
+      listPrefixes,
       deleteStarted,
       releaseDelete,
     }));
@@ -211,7 +214,7 @@ test("expired folder stays unavailable when cloud cleanup fails and cannot be re
   const dataDir = path.join(directory, "data");
   const oldExpiry = new Date(Date.now() - 60_000).toISOString();
   const password = crypto.randomBytes(24).toString("base64url");
-  const cloud = await startS3Fixture({ failListings: true });
+  const cloud = await startS3Fixture({ failListingPrefixes: ["rootark/temp/expired-folder"] });
   const port = await unusedPort();
   fs.mkdirSync(dataDir, { recursive: true });
   fs.mkdirSync(path.join(directory, "uploads", "expired-folder"), { recursive: true });
@@ -224,6 +227,12 @@ test("expired folder stays unavailable when cloud cleanup fails and cannot be re
     { id: "root", name: "Root", createdBy: "system", allowedUsers: [], isRoot: true },
     { id: "expired-folder", name: "Expired", createdBy: "tester", allowedUsers: ["tester"], isRoot: false, expiresAt: oldExpiry },
   ]));
+  const protectedFile = path.join(directory, "uploads", "expired-folder", "protected.txt");
+  const permissionsPath = path.join(dataDir, "file-permissions.json");
+  fs.writeFileSync(protectedFile, "disposable protected fixture");
+  fs.writeFileSync(permissionsPath, JSON.stringify({
+    "expired-folder/protected.txt": { folderId: "expired-folder", fileName: "protected.txt", owner: "tester", public: false, users: { tester: { read: true, edit: false } } },
+  }));
   let output = "";
   const child = spawn(process.execPath, [SERVER], {
     cwd: directory,
@@ -258,9 +267,13 @@ test("expired folder stays unavailable when cloud cleanup fails and cannot be re
   const cleanupDeadline = Date.now() + 5000;
   while (!output.includes("Falha ao limpar pasta temporaria:") && Date.now() < cleanupDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.match(output, /Falha ao limpar pasta temporaria: Provider operation failed/, "provider failure must be exercised before checking reactivation");
+  assert.ok(cloud.listPrefixes.some((prefix) => prefix.includes("rootark/uploads/expired-folder")), "the upload prefix was listed successfully");
+  assert.ok(cloud.listPrefixes.some((prefix) => prefix.includes("rootark/temp/expired-folder")), "the temp prefix failure was injected after the upload prefix request");
   const foldersPath = path.join(dataDir, "folders.json");
   const expiredFolder = JSON.parse(fs.readFileSync(foldersPath, "utf8")).find((folder) => folder.id === "expired-folder");
   assert.equal(expiredFolder.expiresAt, oldExpiry);
+  assert.equal(fs.readFileSync(protectedFile, "utf8"), "disposable protected fixture", "local file bytes remain intact while provider deletion is incomplete");
+  assert.equal(JSON.parse(fs.readFileSync(permissionsPath, "utf8"))["expired-folder/protected.txt"].public, false, "file permissions remain intact while provider deletion is incomplete");
 
   const loginBody = JSON.stringify({ username: "tester", password });
   const login = await new Promise((resolve, reject) => {
