@@ -399,13 +399,14 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(path.join(dataDir, "pending-uploads.json"), "utf8")), "root/restore-orphan-pending.txt"), false, "authorized rejection removes stale metadata explicitly");
   assert.equal(cloud.getObjects.includes("rootark/temp/root/restore-orphan-pending.txt"), false, "authorized cleanup never hydrates the stale provider payload");
 
+  const providerGetsBeforeList = cloud.getObjects.length;
   const list = await request(port, "/list", { headers: { cookie, referer: "https://attacker.invalid/" } });
   assert.equal(list.status, 200, list.body);
   assert.equal(JSON.parse(list.body).some((file) => file.name === "restore-orphan.txt"), false, "persisted restore orphans remain hidden after server restart");
   const expectedVisibleNames = ["ambiguous-orphan.v1", "budget.v2", "cloud-only-version-init.txt", "encrypted.txt", "legacy.v9", "notes.v2", "private.txt.v7", "private.txt.v8", "public.txt", "version-primary.txt"];
   if (process.platform !== "win32") expectedVisibleNames.push("case-orphan.txt");
   assert.deepEqual(JSON.parse(list.body).map((file) => file.name).sort(), expectedVisibleNames.sort());
-  assert.deepEqual(cloud.getObjects, [], "listing reads provider metadata without materializing file bytes");
+  assert.equal(cloud.getObjects.length, providerGetsBeforeList, "listing reads provider metadata without materializing file bytes");
   assert.equal(fs.existsSync(path.join(directory, "uploads", "budget.v2")), false, "ordinary cloud file is visible before hydration");
   OBJECTS.set("rootark/uploads/root/revoke-download.txt", Buffer.from("download access revocation fixture"));
   OBJECTS.set("rootark/uploads/root/revoke-preview.txt", Buffer.from("preview access revocation fixture"));

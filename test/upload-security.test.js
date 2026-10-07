@@ -703,6 +703,7 @@ test("folder lifecycle lock timeouts reject uploads and remove all disposable st
       bytes: Buffer.from("disposable final chunk"),
     });
     assertRejectedClean(harness, chunk, 503);
+    assert.equal(chunk.headers["retry-after"], "5");
     assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId)), false);
     assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
 

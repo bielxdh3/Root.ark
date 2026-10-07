@@ -6588,11 +6588,14 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
           chunkedUpload: true,
           encryptionMetadata,
         });
-      }, res);
+      });
     } catch (error) {
       fs.rmSync(stagedPath, { force: true });
       if (publishedPath) fs.rmSync(publishedPath, { force: true });
       fs.rmSync(sessionDir, { recursive: true, force: true });
+      if (["FILE_LIFECYCLE_LOCK_TIMEOUT", "FILE_LIFECYCLE_LOCK_UNAVAILABLE"].includes(error?.code)) {
+        return res.status(503).set("Retry-After", "5").json({ error: "Pasta temporariamente indisponivel" });
+      }
       return res.status(400).json({ error: error.message || "Falha ao criptografar arquivo" });
     }
     if (res.headersSent) {
