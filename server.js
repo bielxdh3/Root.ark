@@ -3484,9 +3484,9 @@ function normalizeFolderGroupIds(value, allowMissing = true) {
   return groupsStore?.validateIds(value);
 }
 
-function hasFileAccess(req, folder, fileName, entries = loadFilePermissions(), expirationEntries = loadFileExpirations()) {
+function hasFileAccess(req, folder, fileName, entries = loadFilePermissions(), expirationEntries = loadFileExpirations(), orphanSnapshot = null) {
   if (!hasFolderAccess(req, folder) || isFileExpired(folder.id, fileName, expirationEntries)) return false;
-  if (restoreProviderOrphans.isSuppressed(folder.id, fileName)) return canManageAccess(req);
+  if (restoreProviderOrphans.isSuppressed(folder.id, fileName, "uploads", orphanSnapshot)) return canManageAccess(req);
   if (canManageAccess(req)) return true;
 
   const entry = getFilePermissionEntry(folder.id, fileName, entries);
@@ -3501,9 +3501,9 @@ function hasFileAccess(req, folder, fileName, entries = loadFilePermissions(), e
   );
 }
 
-function hasFileEditAccess(req, folder, fileName, entries = loadFilePermissions()) {
+function hasFileEditAccess(req, folder, fileName, entries = loadFilePermissions(), orphanSnapshot = null) {
   if (!hasFolderAccess(req, folder)) return false;
-  if (restoreProviderOrphans.isSuppressed(folder.id, fileName)) return canManageAccess(req);
+  if (restoreProviderOrphans.isSuppressed(folder.id, fileName, "uploads", orphanSnapshot)) return canManageAccess(req);
   if (canManageAccess(req)) return true;
 
   const entry = getFilePermissionEntry(folder.id, fileName, entries);
@@ -7271,6 +7271,7 @@ function getFileListCaches() {
     fileVersions: loadFileVersions(),
     encryptedFiles: loadEncryptedFiles(),
     publicLinks: loadPublicLinks(),
+    restoreProviderOrphanSnapshot: restoreProviderOrphans.createSnapshot(),
   };
 }
 
@@ -7284,7 +7285,7 @@ function hasPublicLinkForFile(folderId, fileName, publicLinks = {}) {
 function buildVisibleFileEntry(req, folder, file, caches = getFileListCaches()) {
   if (isStoredVersionFile(folder.id, file.name, caches.fileVersions)) return null;
   if (isFileInTrash(folder.id, file.name)) return null;
-  if (!hasFileAccess(req, folder, file.name, caches.filePermissions, caches.fileExpirations)) return null;
+  if (!hasFileAccess(req, folder, file.name, caches.filePermissions, caches.fileExpirations, caches.restoreProviderOrphanSnapshot)) return null;
 
   const encryption = getEncryptedFileMetadata(folder.id, file.name, caches.encryptedFiles);
   if (!canAccessEncryptedFile(req, encryption)) return null;
@@ -7313,8 +7314,8 @@ function buildVisibleFileEntry(req, folder, file, caches = getFileListCaches()) 
     currentVersion: versions.currentVersion || 0,
     versionCount: versions.versions.length,
     encryption: getPublicEncryptionMetadata(encryption),
-    canEdit: hasFileEditAccess(req, folder, file.name, caches.filePermissions),
-    canManageAccess: canManageAccess(req) || hasFileEditAccess(req, folder, file.name, caches.filePermissions),
+    canEdit: hasFileEditAccess(req, folder, file.name, caches.filePermissions, caches.restoreProviderOrphanSnapshot),
+    canManageAccess: canManageAccess(req) || hasFileEditAccess(req, folder, file.name, caches.filePermissions, caches.restoreProviderOrphanSnapshot),
   };
 }
 

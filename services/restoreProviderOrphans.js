@@ -7,6 +7,7 @@ const { acquireJsonMutationLock } = require("../repositories/backupRepository");
 const POLICY_PATH = resolveRuntimePath("data", ".rootark-restore-provider-orphans.json");
 const STATE_PATH = resolveRuntimePath("data", ".rootark-restore-provider-orphans-state.json");
 let suppressionSnapshot = null;
+const renameRetryWait = new Int32Array(new SharedArrayBuffer(4));
 
 async function acquirePolicyLock() {
   const deadline = Date.now() + 10_000;
@@ -55,15 +56,52 @@ function normalizeObjects(objects) {
 }
 
 function readState() {
-  let stat;
-  try { stat = fs.lstatSync(STATE_PATH); }
+  let text;
+  try { text = readControlFile(STATE_PATH, "Restore provider suppression state"); }
   catch (error) { if (error.code === "ENOENT") return null; throw error; }
-  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Restore provider suppression state is unsafe; file access is blocked");
   let value;
-  try { value = JSON.parse(fs.readFileSync(STATE_PATH, "utf8")); }
+  try { value = JSON.parse(text); }
   catch { throw new Error("Restore provider suppression state is invalid; file access is blocked"); }
   if (value?.version !== 1) throw new Error("Restore provider suppression state version is unsupported; file access is blocked");
   return value;
+}
+
+function sameControlFileSnapshot(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode
+    && left.nlink === right.nlink && left.size === right.size
+    && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
+function readControlFile(filePath, label) {
+  let descriptor;
+  try {
+    let flags = fs.constants.O_RDONLY;
+    if (typeof fs.constants.O_NOFOLLOW === "number") flags |= fs.constants.O_NOFOLLOW;
+    if (typeof fs.constants.O_NONBLOCK === "number") flags |= fs.constants.O_NONBLOCK;
+    descriptor = fs.openSync(filePath, flags);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    if (!opened.isFile() || opened.nlink !== 1n) {
+      throw Object.assign(new Error(label + " is unsafe; file access is blocked"), { code: "CONTROL_FILE_UNSAFE" });
+    }
+
+    const text = fs.readFileSync(descriptor, "utf8");
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    const currentPath = fs.lstatSync(filePath, { bigint: true });
+    if (!currentPath.isFile() || currentPath.isSymbolicLink()
+      || !sameControlFileSnapshot(opened, afterRead) || !sameControlFileSnapshot(opened, currentPath)) {
+      throw Object.assign(new Error(label + " changed while being read; file access is blocked"), { code: "CONTROL_FILE_CHANGED" });
+    }
+    return text;
+  } catch (error) {
+    if (["ENOENT", "CONTROL_FILE_UNSAFE", "CONTROL_FILE_CHANGED"].includes(error.code)) throw error;
+    throw Object.assign(new Error(label + " is invalid; file access is blocked"), { code: "CONTROL_FILE_INVALID", cause: error });
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch {}
+    }
+  }
 }
 
 function policyFileExists() {
@@ -80,7 +118,7 @@ function writeJsonAtomically(destination, value) {
     fs.fsyncSync(descriptor);
   } finally { fs.closeSync(descriptor); }
   try {
-    fs.renameSync(temporary, destination);
+    renameWithSharingRetry(temporary, destination);
     if (process.platform !== "win32") {
       const directory = fs.openSync(path.dirname(destination), "r");
       try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
@@ -91,6 +129,19 @@ function writeJsonAtomically(destination, value) {
   }
 }
 
+function renameWithSharingRetry(source, destination) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(source, destination);
+      return;
+    } catch (error) {
+      const retryable = process.platform === "win32" && ["EACCES", "EBUSY", "EPERM"].includes(error.code);
+      if (!retryable || attempt >= 9) throw error;
+      Atomics.wait(renameRetryWait, 0, 0, 10);
+    }
+  }
+}
+
 function writeState() {
   writeJsonAtomically(STATE_PATH, { version: 1, initializedAt: new Date().toISOString() });
 }
@@ -98,7 +149,7 @@ function writeState() {
 function read() {
   const state = readState();
   let text;
-  try { text = fs.readFileSync(POLICY_PATH, "utf8"); }
+  try { text = readControlFile(POLICY_PATH, "Restore provider suppression policy"); }
   catch (error) {
     if (error.code !== "ENOENT") throw error;
     if (state) throw new Error("Restore provider suppression policy is missing; file access is blocked");
@@ -171,10 +222,23 @@ async function write(objects) {
   finally { lease.release(); }
 }
 
-function isSuppressed(folderId, fileName, area = "uploads") {
+function createSnapshot() {
+  const current = readSuppressionSnapshot();
+  const keys = new Set(current.keys);
+  const foldedKeys = current.foldedKeys ? new Set(current.foldedKeys) : null;
+  return Object.freeze({
+    isSuppressed(folderId, fileName, area = "uploads") {
+      const key = identityKey(area, String(folderId || "root"), String(fileName || ""));
+      return keys.has(key) || Boolean(foldedKeys?.has(key.toLowerCase()));
+    },
+  });
+}
+
+function isSuppressed(folderId, fileName, area = "uploads", snapshot = null) {
+  if (typeof snapshot?.isSuppressed === "function") return snapshot.isSuppressed(folderId, fileName, area);
   const key = identityKey(area, String(folderId || "root"), String(fileName || ""));
-  const snapshot = readSuppressionSnapshot();
-  return snapshot.keys.has(key) || Boolean(snapshot.foldedKeys?.has(key.toLowerCase()));
+  const current = readSuppressionSnapshot();
+  return current.keys.has(key) || Boolean(current.foldedKeys?.has(key.toLowerCase()));
 }
 
 async function assertSafeToUnhide(provider) {
@@ -207,7 +271,11 @@ async function suppress(folderId, fileName, area = "uploads") {
 
 async function clear(folderId, fileName, area = "uploads", provider = null) {
   const key = identityKey(area, String(folderId || "root"), String(fileName || ""));
-  if (!read().some((entry) => identityKey(entry.area, entry.folderId, entry.name) === key)) return false;
+  try {
+    if (!read().some((entry) => identityKey(entry.area, entry.folderId, entry.name) === key)) return false;
+  } catch (error) {
+    if (error.code !== "CONTROL_FILE_CHANGED") throw error;
+  }
   await assertSafeToUnhide(provider);
   const lease = await acquirePolicyLock();
   try {
@@ -218,4 +286,4 @@ async function clear(folderId, fileName, area = "uploads", provider = null) {
   } finally { lease.release(); }
 }
 
-module.exports = { POLICY_PATH, STATE_PATH, assertSafeToUnhide, assertUnambiguousProviderInventory, clear, identityKey, initialize, isSuppressed, normalizeObjects, read, suppress, write };
+module.exports = { POLICY_PATH, STATE_PATH, assertSafeToUnhide, assertUnambiguousProviderInventory, clear, createSnapshot, identityKey, initialize, isSuppressed, normalizeObjects, read, suppress, write };

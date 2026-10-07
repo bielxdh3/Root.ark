@@ -20,11 +20,80 @@ function startChild(script, cwd, env) {
   return { child, result };
 }
 
+test("restore provider state is read through an open descriptor rather than a checked path", () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-state-race-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const policy = require(${JSON.stringify(servicePath)});
+      fs.mkdirSync(path.dirname(policy.STATE_PATH), { recursive: true });
+      const originalState = JSON.stringify({ version: 1, initializedAt: "before" });
+      fs.writeFileSync(policy.STATE_PATH, originalState);
+      fs.writeFileSync(policy.POLICY_PATH, JSON.stringify({ version: 1, objects: [] }));
+      const originalReadFileSync = fs.readFileSync;
+      let pathRead = false;
+      let descriptorRead = false;
+      fs.readFileSync = function (target, ...args) {
+        if (typeof target === "string" && path.resolve(target) === path.resolve(policy.STATE_PATH)) {
+          pathRead = true;
+          fs.writeFileSync(policy.STATE_PATH, "invalid replacement state");
+          try { return originalReadFileSync.call(fs, target, ...args); }
+          finally { fs.writeFileSync(policy.STATE_PATH, originalState); }
+        }
+        if (typeof target === "number") descriptorRead = true;
+        return originalReadFileSync.call(fs, target, ...args);
+      };
+      assert.doesNotThrow(() => policy.initialize());
+      assert.equal(pathRead, false, "control state must not be read through a separately checked path");
+      assert.equal(descriptorRead, true, "control state must be read from a descriptor that can be checked");
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 async function waitForFile(filePath, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   while (!fs.existsSync(filePath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
   return fs.existsSync(filePath);
 }
+
+test("restore provider policy retries transient Windows sharing violations", () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-rename-retry-"));
+  try {
+    const script = [
+      'const assert = require("node:assert/strict");',
+      'const fs = require("node:fs");',
+      'const path = require("node:path");',
+      'Object.defineProperty(process, "platform", { value: "win32" });',
+      'const policy = require(' + JSON.stringify(servicePath) + ');',
+      'const originalRenameSync = fs.renameSync;',
+      'let failures = 0;',
+      'fs.renameSync = function (source, destination) {',
+      '  if (path.resolve(destination) === path.resolve(policy.POLICY_PATH) && failures === 0) {',
+      '    failures += 1;',
+      '    const error = new Error("sharing violation");',
+      '    error.code = "EPERM";',
+      '    throw error;',
+      '  }',
+      '  return originalRenameSync.call(this, source, destination);',
+      '};',
+      '(async () => {',
+      '  await policy.write([{ area: "uploads", folderId: "root", name: "retry.txt" }]);',
+      '  assert.equal(failures, 1);',
+      '  assert.deepEqual(policy.read(), [{ area: "uploads", folderId: "root", name: "retry.txt" }]);',
+      '})().catch((error) => { console.error(error); process.exitCode = 1; });',
+    ].join("\n");
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
 
 test("missing restore provider suppression policy fails closed in-process and after restart", () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-missing-policy-"));
@@ -130,24 +199,39 @@ test("suppression checks reuse one policy snapshot and observe another process u
       const { spawnSync } = require("node:child_process");
       const policy = require(${JSON.stringify(servicePath)});
       const policyPath = policy.POLICY_PATH;
+      const statePath = policy.STATE_PATH;
       (async () => {
         await policy.write([{ area: "uploads", folderId: "folder", name: "before.txt" }]);
-        const originalReadFileSync = fs.readFileSync;
+        const snapshot = policy.createSnapshot();
+        const originalOpenSync = fs.openSync;
+        const originalStatSync = fs.statSync;
+        const originalLstatSync = fs.lstatSync;
         let reads = 0;
-        fs.readFileSync = function (target, ...args) {
-          if (require("node:path").resolve(String(target)) === policyPath) reads += 1;
-          return originalReadFileSync.call(this, target, ...args);
+        let markerReads = 0;
+        fs.openSync = function (target, ...args) {
+          if (typeof target === "string" && require("node:path").resolve(target) === policyPath) reads += 1;
+          if (typeof target === "string" && require("node:path").resolve(target) === statePath) markerReads += 1;
+          return originalOpenSync.call(this, target, ...args);
+        };
+        fs.statSync = function (target, ...args) {
+          if (typeof target === "string" && [policyPath, statePath].includes(require("node:path").resolve(target))) markerReads += 1;
+          return originalStatSync.call(this, target, ...args);
+        };
+        fs.lstatSync = function (target, ...args) {
+          if (typeof target === "string" && [policyPath, statePath].includes(require("node:path").resolve(target))) markerReads += 1;
+          return originalLstatSync.call(this, target, ...args);
         };
         for (let index = 0; index < 100; index++) {
-          assert.equal(policy.isSuppressed("folder", "missing-" + index + ".txt"), false);
+          assert.equal(policy.isSuppressed("folder", "missing-" + index + ".txt", "uploads", snapshot), false);
         }
-        assert.equal(reads, 1, "bulk checks should parse the unchanged policy only once");
+        assert.equal(reads, 0, "bulk checks should reuse their captured policy snapshot");
+        assert.equal(markerReads, 0, "bulk checks should not reread the marker or stat control files per entry");
         const updateScript = "const policy = require(" + JSON.stringify(${JSON.stringify(servicePath)}) + "); policy.write([{ area: 'uploads', folderId: 'folder', name: 'after.txt' }]).catch((error) => { console.error(error); process.exitCode = 1; });";
         const updated = spawnSync(process.execPath, ["-e", updateScript], { cwd: process.cwd(), encoding: "utf8" });
         assert.equal(updated.status, 0, updated.stderr || updated.stdout);
         assert.equal(policy.isSuppressed("folder", "before.txt"), false, "a replaced policy must invalidate the old snapshot");
         assert.equal(policy.isSuppressed("folder", "after.txt"), true, "the replacement policy must be observed");
-        assert.equal(reads, 2, "one replacement policy parse should refresh the snapshot");
+        assert.equal(reads, 1, "one replacement policy parse should refresh the snapshot");
       })().catch((error) => { console.error(error); process.exitCode = 1; });
     `;
     const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8" });
@@ -236,11 +320,18 @@ test("separate processes clearing different restore orphans do not lose either u
     const policy = require(${JSON.stringify(servicePath)});
     const policyPath = path.resolve(${JSON.stringify(policyPath)});
     const id = process.env.CHILD_ID;
-    const originalReadFileSync = fs.readFileSync;
+    const originalOpenSync = fs.openSync;
+    const originalCloseSync = fs.closeSync;
+    const policyDescriptors = new Set();
     let gated = false;
-    fs.readFileSync = function (target, ...args) {
-      const value = originalReadFileSync.call(this, target, ...args);
-      if (!gated && path.resolve(String(target)) === policyPath) {
+    fs.openSync = function (target, ...args) {
+      const descriptor = originalOpenSync.call(this, target, ...args);
+      if (typeof target === "string" && path.resolve(target) === policyPath) policyDescriptors.add(descriptor);
+      return descriptor;
+    };
+    fs.closeSync = function (descriptor, ...args) {
+      const result = originalCloseSync.call(this, descriptor, ...args);
+      if (!gated && policyDescriptors.delete(descriptor)) {
         gated = true;
         fs.writeFileSync(process.env.READY_FILE, "ready");
         const deadline = Date.now() + 10000;
@@ -249,7 +340,8 @@ test("separate processes clearing different restore orphans do not lose either u
         }
         if (!fs.existsSync(process.env.RELEASE_FILE)) throw new Error("test gate timed out");
       }
-      return value;
+      policyDescriptors.delete(descriptor);
+      return result;
     };
     const fileName = id === "a" ? "first.txt" : "second.txt";
     (async () => {
