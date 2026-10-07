@@ -904,7 +904,14 @@
     if (action === "file-expiration") return setFileExpiration(name, folderId);
     if (action === "rename-file") return renameFile(name, folderId);
     if (action === "move-file") return moveFile(name, folderId);
-    if (action === "close-versions") { state.versions = null; return render(); }
+    if (action === "close-versions") {
+      const { fileName, folderId } = state.versions || {};
+      state.versions = null;
+      render();
+      const opener = Array.from(root.querySelectorAll('[data-action="file-versions"]')).find((item) => item.dataset.name === fileName && item.dataset.folder === folderId);
+      if (opener && opener.isConnected) opener.focus();
+      return;
+    }
     if (action === "delete-file") return moveFileToTrash(name, folderId);
     if (action === "approve-file") return approve(name, true, folderId);
     if (action === "reject-file") return approve(name, false, folderId);
