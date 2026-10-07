@@ -108,6 +108,7 @@ test("file trash stays inside the child server runtime root", { timeout: 30_000 
       ...process.env,
       PORT: String(port),
       DB_ENABLED: "false",
+      ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
       CLOUD_STORAGE_PROVIDER: "local",
       TRASH_ENABLED: "true",
       TRASH_AUTO_CLEANUP_ENABLED: "false",

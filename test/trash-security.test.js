@@ -119,7 +119,7 @@ test("file trash lifecycle keeps authorization and paths inside a disposable run
   const port = await getUnusedPort();
   const child = spawn(process.execPath, [SERVER], {
     cwd: sandbox,
-    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", CLOUD_STORAGE_PROVIDER: "local", TRASH_ENABLED: "true", TRASH_AUTO_CLEANUP_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", TRASH_ENABLED: "true", TRASH_AUTO_CLEANUP_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: "ignore",
     windowsHide: true,
   });

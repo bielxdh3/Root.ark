@@ -162,7 +162,7 @@ test("deleted usernames cannot resurrect old HTTP or WebSocket sessions", { time
   const port = await getUnusedPort();
   const child = spawn(process.execPath, [SERVER], {
     cwd,
-    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: "ignore",
     windowsHide: true,
   });
@@ -238,7 +238,7 @@ test("JSON user generations survive restart before same-username recreation", { 
   let port = await getUnusedPort();
   let child = spawn(process.execPath, [SERVER], {
     cwd,
-    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", JWT_SECRET: jwtSecret },
+    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", JWT_SECRET: jwtSecret },
     stdio: "ignore",
     windowsHide: true,
   });
@@ -268,7 +268,7 @@ test("JSON user generations survive restart before same-username recreation", { 
   port = await getUnusedPort();
   child = spawn(process.execPath, [SERVER], {
     cwd,
-    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", JWT_SECRET: jwtSecret },
+    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", JWT_SECRET: jwtSecret },
     stdio: "ignore",
     windowsHide: true,
   });
@@ -319,7 +319,7 @@ test("permission removal revokes an existing browser session before a protected 
   const port = await getUnusedPort();
   const child = spawn(process.execPath, [SERVER], {
     cwd,
-    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: "ignore",
     windowsHide: true,
   });
@@ -369,7 +369,7 @@ test("permission removal closes an active WebSocket before its next authenticate
   const port = await getUnusedPort();
   const child = spawn(process.execPath, [SERVER], {
     cwd,
-    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: "ignore",
     windowsHide: true,
   });
@@ -434,7 +434,7 @@ test("expired browser session cookie is rejected before a protected HTTP handler
   const jwtSecret = crypto.randomBytes(48).toString("base64url");
   const child = spawn(process.execPath, [SERVER], {
     cwd,
-    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", JWT_SECRET: jwtSecret },
+    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", JWT_SECRET: jwtSecret },
     stdio: "ignore",
     windowsHide: true,
   });
@@ -472,7 +472,7 @@ test("an expired active WebSocket closes before processing its next message", { 
   const jwtSecret = crypto.randomBytes(48).toString("base64url");
   const child = spawn(process.execPath, [SERVER], {
     cwd,
-    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", JWT_SECRET: jwtSecret },
+    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", JWT_SECRET: jwtSecret },
     stdio: "ignore",
     windowsHide: true,
   });

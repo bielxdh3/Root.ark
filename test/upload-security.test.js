@@ -129,6 +129,7 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
       ...process.env,
       PORT: String(port),
       DB_ENABLED: "false",
+      ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
       CLOUD_STORAGE_PROVIDER: "local",
       UPLOAD_SCAN_ENABLED: "true",
       UPLOAD_SCAN_PROVIDER: "disabled",
@@ -400,6 +401,28 @@ test("users without upload permission are rejected before Multer creates artifac
   assert.equal(response.status, 403);
   assert.deepEqual(JSON.parse(response.body), { error: "Permissao negada: upload" });
   assertRejectedClean(harness, response, 403);
+});
+
+test("dot-segment upload IDs are rejected without touching sibling chunk sessions", { timeout: 30_000 }, async (t) => {
+  const siblingId = "preserved-sibling-session";
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId: siblingId, files: { "sentinel.txt": "preserve this session" } }],
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const siblingDirectory = path.join(harness.chunkRoot, FOLDER_ID, siblingId);
+
+  for (const uploadId of [".", ".."]) {
+    const response = await uploadChunk(harness.port, session, {
+      uploadId,
+      originalName: "invalid.txt",
+      chunkIndex: 0,
+      totalChunks: 1,
+      bytes: Buffer.from("must not be staged"),
+    });
+    assert.equal(response.status, 400, response.body);
+    assert.equal(fs.readFileSync(path.join(siblingDirectory, "sentinel.txt"), "utf8"), "preserve this session");
+    assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
+  }
 });
 
 test("upload chunk route limit rejects requests before Multer writes staging files", { timeout: 30_000 }, async (t) => {

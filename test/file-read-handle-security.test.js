@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { once } = require("node:events");
+const { finished } = require("node:stream/promises");
 const test = require("node:test");
 const { openReadHandle } = require("../services/fileReadHandle");
 
@@ -14,16 +14,19 @@ test("opened file descriptor keeps the authorized bytes after path replacement",
   const displacedPath = path.join(directory, "displaced.txt");
   fs.writeFileSync(filePath, "authorized bytes");
   const handle = openReadHandle(filePath);
+  let stream;
   try {
     fs.renameSync(filePath, displacedPath);
     fs.writeFileSync(filePath, "replacement bytes");
-    const stream = fs.createReadStream(null, { fd: handle.fd, autoClose: true });
+    stream = fs.createReadStream(null, { fd: handle.fd, autoClose: true });
     const chunks = [];
     stream.on("data", (chunk) => chunks.push(chunk));
-    await once(stream, "end");
+    await finished(stream);
     assert.equal(Buffer.concat(chunks).toString("utf8"), "authorized bytes");
   } finally {
-    try { fs.closeSync(handle.fd); } catch {}
+    if (!stream) {
+      try { fs.closeSync(handle.fd); } catch {}
+    }
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });

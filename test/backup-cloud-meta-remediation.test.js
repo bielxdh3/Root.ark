@@ -209,6 +209,102 @@ test("authoritative cloud backup and restore matrix", async (t) => {
     assert.equal(calls.creates.length, 1);
     assert.equal(calls.creates[0].requestBody.id, "reserved-drive-id");
   });
+  await t.test("Google Drive restore retry reuses the reserved ID after a worker restart", { timeout: 30_000 }, () => {
+    const { spawnSync } = require("node:child_process");
+    reset();
+    const name = "drive-restart.txt";
+    fs.writeFileSync(path.join(runtime, "uploads", name), "restored Drive bytes");
+    const statePath = path.join(runtime, "data", "drive-provider-fixture.json");
+    fs.writeFileSync(statePath, JSON.stringify({ generated: 0, creates: [], updates: [], objects: {} }));
+    const saved = syncBackup([{ path: `uploads/${name}`, area: "uploads", folderId: "root", name, state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]);
+    const repositoryPath = require.resolve("../repositories/backupRepository");
+    const restorePath = require.resolve("../services/restoreService");
+    const cloudStoragePath = require.resolve("../services/cloudStorage");
+    const worker = (crashAfterUpload) => `
+      const fs = require("node:fs");
+      const repository = require(${JSON.stringify(repositoryPath)});
+      const restore = require(${JSON.stringify(restorePath)});
+      const { createCloudStorage } = require(${JSON.stringify(cloudStoragePath)});
+      const statePath = ${JSON.stringify(statePath)};
+      const readState = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
+      const writeState = (state) => fs.writeFileSync(statePath, JSON.stringify(state));
+      const provider = createCloudStorage({
+        provider: "gdrive",
+        prefix: "rootark",
+        gdrive: { folderId: "drive-root" },
+        createGoogleDriveClient: async () => ({ files: {
+          list: async () => ({ data: { files: Object.entries(readState().objects).map(([id, file]) => ({ id, name: file.name, parents: file.parents, appProperties: file.appProperties })) } }),
+          generateIds: async () => {
+            const state = readState();
+            state.generated += 1;
+            writeState(state);
+            return { data: { ids: ["reserved-drive-id-" + state.generated] } };
+          },
+          get: async ({ fileId }) => {
+            const file = readState().objects[fileId];
+            if (!file) throw Object.assign(new Error("not found"), { response: { status: 404 } });
+            return { data: { id: fileId, parents: file.parents, appProperties: file.appProperties } };
+          },
+          create: async (request) => {
+            let bytes = "";
+            for await (const chunk of request.media.body) bytes += chunk;
+            const state = readState();
+            state.creates.push(request.requestBody.id);
+            state.objects[request.requestBody.id] = {
+              name: request.requestBody.name,
+              parents: request.requestBody.parents,
+              appProperties: request.requestBody.appProperties,
+              bytes,
+            };
+            writeState(state);
+            return { data: { id: request.requestBody.id } };
+          },
+          update: async ({ fileId, requestBody, media }) => {
+            let bytes = "";
+            for await (const chunk of media.body) bytes += chunk;
+            const state = readState();
+            state.updates.push(fileId);
+            state.objects[fileId] = { name: requestBody.name, parents: ["drive-root"], appProperties: requestBody.appProperties, bytes };
+            writeState(state);
+            return { data: { id: fileId } };
+          },
+        } }),
+      });
+      const originalMutation = repository.mutateRestoreSyncEntry;
+      if (${crashAfterUpload}) {
+        repository.mutateRestoreSyncEntry = (options) => originalMutation({
+          ...options,
+          mutate(entry, backup) {
+            const result = options.mutate(entry, backup);
+            if (result.entry.state === "completed") process.exit(87);
+            return result;
+          },
+        });
+      }
+      restore.processRestoreSync({ backupId: ${JSON.stringify(saved.id)}, workerId: "drive-restart-fixture", clock: () => Date.now() + (${crashAfterUpload} ? 0 : 61_000), uploader: provider })
+        .then(() => process.exit(0))
+        .catch((error) => { console.error(error); process.exit(1); });
+    `;
+    const interrupted = spawnSync(process.execPath, ["-e", worker(true)], { cwd: runtime, env: process.env, encoding: "utf8", timeout: 15_000 });
+    assert.equal(interrupted.status, 87, interrupted.stderr || interrupted.stdout);
+    const interruptedBackup = backupRepository.getBackup(saved.id);
+    const pinnedId = interruptedBackup.metadata.restoreSync.entries[0].providerFileId;
+    assert.equal(interruptedBackup.metadata.restoreSync.entries[0].state, "in_progress");
+    assert.ok(Date.parse(interruptedBackup.metadata.restoreSync.entries[0].leaseUntil) > Date.now(), "the first worker must leave a live lease before restart");
+    assert.equal(pinnedId, "reserved-drive-id-1");
+
+    const restarted = spawnSync(process.execPath, ["-e", worker(false)], { cwd: runtime, env: process.env, encoding: "utf8", timeout: 15_000 });
+    assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+    const completed = backupRepository.getBackup(saved.id);
+    assert.equal(completed.metadata.restoreSync.entries[0].state, "completed");
+    assert.equal(completed.metadata.restoreSync.entries[0].providerFileId, pinnedId);
+    const providerState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(providerState.generated, 1, "restart must use the already persisted Drive ID");
+    assert.deepEqual(providerState.creates, [pinnedId]);
+    assert.deepEqual(providerState.updates, [pinnedId]);
+    assert.deepEqual(Object.keys(providerState.objects), [pinnedId], "retry must update the same object instead of creating a duplicate");
+    assert.equal(providerState.objects[pinnedId].bytes, "restored Drive bytes");
+  });
   await t.test("retry success", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "retry.txt"), "retry"); const saved = syncBackup([{ path: "uploads/retry.txt", area: "uploads", folderId: "root", name: "retry.txt", state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]); let calls = 0; let result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { calls += 1; if (calls === 1) throw new Error("offline"); } } }); assert.equal(result.metadata.restoreSync.state, "pending"); clock.value = new Date(result.metadata.restoreSync.entries[0].nextAttemptAt).getTime(); result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { calls += 1; } } }); assert.equal(result.metadata.restoreSync.state, "completed"); });
   await t.test("provider failures remain retryable after legacy maxAttempts", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "terminal.txt"), "terminal"); const saved = syncBackup([{ path: "uploads/terminal.txt", area: "uploads", folderId: "root", name: "terminal.txt", state: "pending", attempts: 0, maxAttempts: 1, nextAttemptAt: null }]); const result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { throw new Error("offline"); } } }); assert.equal(result.metadata.restoreSync.state, "pending"); assert.equal(result.metadata.restoreSync.entries[0].state, "retry_wait"); assert.ok(result.metadata.restoreSync.entries[0].nextAttemptAt); });
   await t.test("restart resumes sync", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "restart.txt"), "restart"); const saved = syncBackup([{ path: "uploads/restart.txt", area: "uploads", folderId: "root", name: "restart.txt", state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]); const reloaded = backupRepository.getBackup(saved.id); const result = await restoreService.processRestoreSync({ backupId: reloaded.id, clock, uploader: { enabled: () => true, upload: async () => true } }); assert.equal(result.metadata.restoreSync.state, "completed"); });

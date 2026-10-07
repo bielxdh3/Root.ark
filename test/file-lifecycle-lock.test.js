@@ -6,6 +6,19 @@ const path = require("node:path");
 const test = require("node:test");
 const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
 
+function findAbsentPid() {
+  for (let candidate = 2_147_000_000, attempts = 0; candidate > 1_000_000 && attempts < 4096; candidate -= 1, attempts += 1) {
+    try {
+      process.kill(candidate, 0);
+    } catch (error) {
+      if (error.code === "ESRCH") return candidate;
+      if (error.code === "EPERM" || error.code === "EACCES") continue;
+      throw error;
+    }
+  }
+  throw new Error("Could not find a provably absent process id for the disposable lock fixture");
+}
+
 test("file lifecycle lock serializes the same file and permits reentrant work", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -111,7 +124,7 @@ test("file lifecycle lock reclaims only a provably dead same-host owner", async 
   const lock = createFileLifecycleLock({ directory, timeoutMs: 40, pollMs: 5 });
   const identityHash = crypto.createHash("sha256").update("root\0dead-owner.txt").digest("hex");
   const lockPath = path.join(directory, `${identityHash}.lock`);
-  fs.writeFileSync(lockPath, JSON.stringify({ token: "dead-owner", pid: 999999, hostname: require("node:os").hostname(), createdAt: new Date(0).toISOString() }), { flag: "wx" });
+  fs.writeFileSync(lockPath, JSON.stringify({ token: "dead-owner", pid: findAbsentPid(), hostname: os.hostname(), createdAt: new Date(0).toISOString() }), { flag: "wx" });
 
   assert.equal(await lock.run("root", "dead-owner.txt", async () => "reclaimed"), "reclaimed");
   assert.equal(fs.existsSync(lockPath), false);
@@ -123,8 +136,9 @@ test("file lifecycle lock fails closed on a stranded reaper until an operator re
   const lock = createFileLifecycleLock({ directory, timeoutMs: 20, pollMs: 5 });
   const lockPath = path.join(directory, `${crypto.createHash("sha256").update("root\0stale-reaper.txt").digest("hex")}.lock`);
   const reaperPath = `${lockPath}.reaper`;
-  const deadOwner = { token: "dead-owner", pid: 999999, hostname: os.hostname(), createdAt: new Date(0).toISOString() };
-  const deadReaper = { token: "interrupted-reaper", pid: 999999, hostname: os.hostname() };
+  const deadPid = findAbsentPid();
+  const deadOwner = { token: "dead-owner", pid: deadPid, hostname: os.hostname(), createdAt: new Date(0).toISOString() };
+  const deadReaper = { token: "interrupted-reaper", pid: deadPid, hostname: os.hostname() };
   fs.writeFileSync(lockPath, JSON.stringify(deadOwner), { flag: "wx" });
   fs.writeFileSync(reaperPath, JSON.stringify(deadReaper), { flag: "wx" });
 
@@ -206,7 +220,7 @@ test("file lifecycle lock does not reclaim an owner replaced after its descripto
   const lock = createFileLifecycleLock({ directory, timeoutMs: 30, pollMs: 5 });
   const lockPath = path.join(directory, `${crypto.createHash("sha256").update("root\0swapped.txt").digest("hex")}.lock`);
   const replacementPath = path.join(directory, "replacement-owner.json");
-  fs.writeFileSync(lockPath, JSON.stringify({ token: "initial-dead-owner", pid: 999999, hostname: require("node:os").hostname() }));
+  fs.writeFileSync(lockPath, JSON.stringify({ token: "initial-dead-owner", pid: findAbsentPid(), hostname: os.hostname() }));
   const replacement = JSON.stringify({ token: "replacement-owner", pid: process.pid, hostname: require("node:os").hostname() });
   fs.writeFileSync(replacementPath, replacement);
   const originalLstatSync = fs.lstatSync;

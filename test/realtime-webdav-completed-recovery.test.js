@@ -42,7 +42,7 @@ async function ready(port) {
 }
 
 function serverEnv(port) {
-  return { ...process.env, PORT: String(port), DB_ENABLED: "false", WEBDAV_ENABLED: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
+  return { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
 }
 
 function createFixture({ phase = "cloud_complete", state = "completed", absent = [], terminal = false } = {}) {

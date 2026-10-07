@@ -60,7 +60,7 @@ function createWebDavFixture(prefix) {
 }
 
 function serverEnv(port, extra = {}) {
-  return { ...process.env, PORT: String(port), DB_ENABLED: "false", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url"), ...extra };
+  return { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url"), ...extra };
 }
 
 test("PROPFIND rejects malformed and unsupported non-empty bodies while empty requests succeed", { timeout: 20_000 }, async (t) => {

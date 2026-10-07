@@ -5,6 +5,10 @@ try {
 } catch (error) {
   if (error?.code !== "ENOENT") throw error;
 }
+
+if (String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim() !== "1") {
+  throw new Error("Multiple server instances are unsupported while authentication state is process-local.");
+}
 const express = require("express");
 const { rateLimit } = require("express-rate-limit");
 const multer = require("multer");
@@ -5110,7 +5114,7 @@ function initData() {
   if (!hasUsers) {
     const seedUsers = loadSeedUsers();
     const seedOptIn = process.env.ROOTARK_BOOTSTRAP_USERS_FROM_SEED === "true";
-    if (seedUsers && process.env.NODE_ENV === "production" && !seedOptIn) throw new Error("Production user seed requires ROOTARK_BOOTSTRAP_USERS_FROM_SEED=true.");
+    if (seedUsers && !seedOptIn) throw new Error("User seed import requires ROOTARK_BOOTSTRAP_USERS_FROM_SEED=true.");
     if (seedOptIn && !seedUsers) throw new Error("ROOTARK_BOOTSTRAP_USERS_FROM_SEED is enabled but data/users.json is missing or invalid.");
     const users = seedUsers || getDefaultUsers();
     saveUsers(users);

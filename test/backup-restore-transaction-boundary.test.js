@@ -1449,7 +1449,7 @@ test("startup checks whole-restore coordinator before WebDAV journal recovery", 
   }
 });
 
-test("server startup acknowledges restored state only once its listener binds and counts distinct instances", { timeout: 60_000 }, () => {
+test("declared multi-instance startup fails closed without acknowledging or touching a pending restore", { timeout: 60_000 }, () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-multi-instance-startup-"));
   const quarantineDir = path.join(runtime, "quarantine");
   const env = {
@@ -1464,53 +1464,31 @@ test("server startup acknowledges restored state only once its listener binds an
     ROOTARK_RESTORE_INSTANCE_COUNT: "2",
     ROOTARK_INSTANCE_ID: "replica-a",
   };
-  const setupScript = `
-    const fs = require("node:fs");
-    const path = require("node:path");
-    const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
-    const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
-    fs.mkdirSync("data", { recursive: true });
-    fs.mkdirSync("uploads", { recursive: true });
-    fs.mkdirSync(process.env.UPLOAD_QUARANTINE_DIR, { recursive: true });
-    fs.writeFileSync(path.join("data", "runtime.json"), "selected-state");
-    (async () => {
-      const backup = await backupService.createBackup({ createdBy: "fixture" });
-      fs.writeFileSync(path.join("data", "runtime.json"), "live-state");
-      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
-      console.log(JSON.stringify({ ok: true }));
-    })().catch((error) => { console.error(error); process.exitCode = 1; });
-  `;
-  const serverScript = `
-    require(${JSON.stringify(path.join(ROOT, "server.js"))});
-    setTimeout(() => process.exit(0), 150);
-  `;
+  const setupScript = "const fs=require('node:fs');\n"
+    + "const path=require('node:path');\n"
+    + "const backupService=require(" + JSON.stringify(path.join(ROOT, "services", "backupService")) + ");\n"
+    + "const restoreService=require(" + JSON.stringify(path.join(ROOT, "services", "restoreService")) + ");\n"
+    + "fs.mkdirSync('data',{recursive:true});fs.mkdirSync('uploads',{recursive:true});fs.mkdirSync(process.env.UPLOAD_QUARANTINE_DIR,{recursive:true});\n"
+    + "fs.writeFileSync(path.join('data','runtime.json'),'selected-state');\n"
+    + "(async()=>{const backup=await backupService.createBackup({createdBy:'fixture'});fs.writeFileSync(path.join('data','runtime.json'),'live-state');await restoreService.restoreBackup(backup.id,{confirmation:'RESTORE'});})().catch(error=>{console.error(error);process.exitCode=1;});";
+  const serverScript = "require(" + JSON.stringify(path.join(ROOT, "server.js")) + ");";
   try {
     const setup = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
     assert.equal(setup.status, 0, setup.stderr || setup.stdout);
     const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
     assert.equal(fs.existsSync(coordinatorPath), true);
 
-    for (const instanceId of ["replica-a", "replica-a"]) {
-      const started = spawnSync(process.execPath, ["-e", serverScript], {
-        cwd: runtime,
-        env: { ...env, ROOTARK_INSTANCE_ID: instanceId, JWT_SECRET: "j".repeat(48), PORT: "0", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" },
-        encoding: "utf8",
-        timeout: 30_000,
-      });
-      assert.equal(started.status, 0, started.stderr || started.stdout);
-      assert.match(started.stdout, /startup acknowledgement 1\/2/);
-      assert.equal(fs.existsSync(coordinatorPath), true, "a repeated instance identity must not release the gate");
-    }
-
-    const second = spawnSync(process.execPath, ["-e", serverScript], {
+    const started = spawnSync(process.execPath, ["-e", serverScript], {
       cwd: runtime,
-      env: { ...env, ROOTARK_INSTANCE_ID: "replica-b", JWT_SECRET: "j".repeat(48), PORT: "0", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" },
+      env: { ...env, JWT_SECRET: "j".repeat(48), PORT: "0", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" },
       encoding: "utf8",
       timeout: 30_000,
     });
-    assert.equal(second.status, 0, second.stderr || second.stdout);
-    assert.match(second.stdout, /startup acknowledgement 2\/2/);
-    assert.equal(fs.existsSync(coordinatorPath), false);
+    assert.notEqual(started.status, 0);
+    assert.match(started.stderr, /Multiple server instances are unsupported while authentication state is process-local/i);
+    assert.equal(fs.existsSync(coordinatorPath), true, "a refused app topology must preserve the pending restore coordinator");
+    assert.equal(fs.existsSync(path.join(runtime, "data", ".rootark-restore-restart-acks")), false);
+    assert.equal(fs.existsSync(path.join(runtime, "data", ".rootark-active-requests")), false);
   } finally {
     fs.rmSync(runtime, { recursive: true, force: true });
   }
