@@ -1695,7 +1695,7 @@ test("restore provider reconciliation remains retryable after five failures and 
       assert.equal(legacyTerminal.metadata.restoreSync.state, "terminal_failure", "fixture represents a persisted pre-retry-format record");
       const recoveryScript = [
         "const assert=require('node:assert/strict'),fs=require('node:fs'),restore=require(" + JSON.stringify(restorePath) + "),repository=require(" + JSON.stringify(backupRepositoryPath) + ");",
-        "const provider={enabled:()=>true,provider:'fixture',upload:async(source)=>fs.writeFileSync('data/provider-object.txt',fs.readFileSync(source))};",
+        "const provider={enabled:()=>true,provider:'fixture',inventory:async()=>[{area:'uploads',folderId:'root',name:'retry-after-five.txt'}],upload:async(source)=>fs.writeFileSync('data/provider-object.txt',fs.readFileSync(source))};",
         "(async()=>{await restore.processRestoreSync({backupId:" + JSON.stringify(backup.id) + ",workerId:'after-five-restart',clock:()=>Date.parse(" + JSON.stringify(retryAt) + ")+1,uploader:provider});",
         "const backup=repository.getBackup(" + JSON.stringify(backup.id) + ");assert.equal(backup.metadata.restoreSync.state,'completed');assert.equal(backup.metadata.restoreSync.entries[0].attempts,6);",
         "assert.equal(fs.readFileSync('data/provider-object.txt','utf8'),'selected archive bytes');const policy=JSON.parse(fs.readFileSync('data/.rootark-restore-provider-orphans.json','utf8'));assert.equal(policy.objects.some(value=>value.name==='retry-after-five.txt'),false);",

@@ -139,7 +139,7 @@ test("an incomplete backup does not claim a same-path provider object was archiv
     'backup.setCloudStorage({ enabled: () => false });',
     'backup.createBackup({ createdBy: "test" }).then(async (saved) => {',
     '  let inventoryCalls = 0;',
-    '  const cloud = { enabled: () => true, inventory: async () => ++inventoryCalls === 1 ? [] : [{ provider: "s3", providerIdentity: "uncaptured", area: "uploads", folderId: "root", name: "same.txt" }], download: async (_folder, _name, target) => { fs.writeFileSync(target, "provider bytes not in the backup"); return true; } };',
+    '  const cloud = { enabled: () => true, inventory: async () => ++inventoryCalls === 1 ? [{ provider: "s3", providerIdentity: "uncaptured", area: "uploads", folderId: "root", name: "same.txt" }] : [], download: async (_folder, _name, target) => { fs.writeFileSync(target, "provider bytes not in the backup"); return true; } };',
     '  backup.setCloudStorage(cloud); restore.setCloudStorage(cloud);',
     '  const result = await restore.restoreBackup(saved.id, { confirmation: "RESTORE", username: "test" });',
     '  assert.equal(result.manifest.cloud_complete, false);',
