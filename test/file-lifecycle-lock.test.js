@@ -117,6 +117,29 @@ test("file lifecycle lock reclaims only a provably dead same-host owner", async 
   assert.equal(fs.existsSync(lockPath), false);
 });
 
+test("file lifecycle lock fails closed on a stranded reaper until an operator removes that exact stale marker", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-stale-reaper-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 20, pollMs: 5 });
+  const lockPath = path.join(directory, `${crypto.createHash("sha256").update("root\0stale-reaper.txt").digest("hex")}.lock`);
+  const reaperPath = `${lockPath}.reaper`;
+  const deadOwner = { token: "dead-owner", pid: 999999, hostname: os.hostname(), createdAt: new Date(0).toISOString() };
+  const deadReaper = { token: "interrupted-reaper", pid: 999999, hostname: os.hostname() };
+  fs.writeFileSync(lockPath, JSON.stringify(deadOwner), { flag: "wx" });
+  fs.writeFileSync(reaperPath, JSON.stringify(deadReaper), { flag: "wx" });
+
+  await assert.rejects(lock.run("root", "stale-reaper.txt", async () => assert.fail("a stranded reaper must keep protected work closed")), { code: "FILE_LIFECYCLE_LOCK_TIMEOUT" });
+  assert.deepEqual(JSON.parse(fs.readFileSync(lockPath, "utf8")), deadOwner, "the dead owner's lock remains available for safe operator recovery");
+  assert.deepEqual(JSON.parse(fs.readFileSync(reaperPath, "utf8")), deadReaper, "the reaper marker is not automatically stolen");
+
+  // Disposable fixture: this models the documented operator action after all
+  // processes sharing the lock directory have been stopped and both PIDs checked.
+  fs.unlinkSync(reaperPath);
+  assert.equal(await lock.run("root", "stale-reaper.txt", async () => "recovered"), "recovered");
+  assert.equal(fs.existsSync(lockPath), false);
+  assert.equal(fs.existsSync(reaperPath), false);
+});
+
 test("file lifecycle lock release does not remove a replacement owner lease", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-owner-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
