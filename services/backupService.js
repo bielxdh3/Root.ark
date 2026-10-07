@@ -352,16 +352,25 @@ async function collectBackupFiles(options = {}) {
     files.push(...collectFilesRecursive(resolveRuntimePath("temp"), "temp", { excludePaths: [quarantineDir], excludeFileIdentities: quarantineFileIdentities }));
   }
 
-  const syncFile = files.find((file) => file.entryPath === "data/sync-objects.json");
+  const unsuppressedFiles = files.filter((file) => {
+    const parts = file.entryPath.split("/");
+    const area = parts.shift();
+    if (!["uploads", "temp"].includes(area)) return true;
+    const name = parts.pop();
+    const folderId = parts.pop() || "root";
+    return parts.length > 0 || !restoreProviderOrphans.isSuppressed(folderId, name, area);
+  });
+
+  const syncFile = unsuppressedFiles.find((file) => file.entryPath === "data/sync-objects.json");
   if (syncFile) attestCiphertextOnlyFile(syncFile.absolutePath);
 
-  if (!cloudStorage?.enabled()) return files.sort((a, b) => a.entryPath.localeCompare(b.entryPath));
+  if (!cloudStorage?.enabled()) return unsuppressedFiles.sort((a, b) => a.entryPath.localeCompare(b.entryPath));
 
   const stageDir = options.stageDir;
   if (!stageDir) throw new Error("Cloud backup staging is required");
   const known = new Map();
   const collisions = new Map();
-  for (const file of files) {
+  for (const file of unsuppressedFiles) {
     const key = collisionKey(file.entryPath);
     if (collisions.has(key) && collisions.get(key) !== file.entryPath) throw new Error("Backup entry collision");
     collisions.set(key, file.entryPath);

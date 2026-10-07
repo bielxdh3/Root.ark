@@ -70,6 +70,15 @@ function request(port, requestPath, { method = "GET", headers = {}, body = "" } 
   });
 }
 
+async function waitForNoActiveRequests(directory, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!fs.existsSync(directory) || fs.readdirSync(directory).length === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`active request leases did not clear within ${timeoutMs}ms`);
+}
+
 function startS3Fixture() {
   const getObjects = [];
   const putObjects = [];
@@ -923,6 +932,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   }
   const versionsPath = path.join(dataDir, "file-versions.json");
   const versionsAtRestoreLimit = fs.readFileSync(versionsPath, "utf8");
+  await waitForNoActiveRequests(path.join(dataDir, ".rootark-active-requests"));
   const providerGetsAtRestoreLimit = cloud.getObjects.length;
   const providerPutsAtRestoreLimit = cloud.putObjects.length;
   const limitedRestore = await request(port, `/restore/restore-limit.txt/v/${currentVersion - 1}`, {

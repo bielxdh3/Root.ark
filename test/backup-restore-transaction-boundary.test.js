@@ -714,11 +714,26 @@ test("corrupt rollback pre-image keeps the service fail-closed for manual recove
   `);
 });
 
-test("rollback write failure retains the durable barrier after partial recovery", () => {
+test("rollback write failure is retried from a verified pre-image on fresh startup", () => {
+  const recoveryScript = [
+    'const assert = require("node:assert/strict");',
+    'const fs = require("node:fs");',
+    'const path = require("node:path");',
+    `const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});`,
+    'const dataDir = path.join(process.cwd(), "data");',
+    'const uploadsDir = path.join(process.cwd(), "uploads");',
+    'const recovered = restoreService.assertNoPendingWholeRestore();',
+    'assert.equal(recovered.recovered, true);',
+    'assert.equal(restoreService.isWholeRestoreBlocked(), false);',
+    'assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "live-state");',
+    'assert.equal(fs.readFileSync(path.join(uploadsDir, "file.txt"), "utf8"), "live-upload");',
+    'console.log(JSON.stringify({ ok: true }));',
+  ].join("\n");
   runFixture(`
     write(path.join(dataDir, "runtime.json"), "archived-state");
     write(path.join(uploadsDir, "file.txt"), "archived-upload");
     (async () => {
+      const { spawnSync } = require("node:child_process");
       const backup = await backupService.createBackup({ createdBy: "fixture" });
       write(path.join(dataDir, "runtime.json"), "live-state");
       write(path.join(uploadsDir, "file.txt"), "live-upload");
@@ -726,13 +741,30 @@ test("rollback write failure retains the durable barrier after partial recovery"
         confirmation: "RESTORE",
         failureInjector(step) { if (step === "restore.uploads.cleared") throw new Error("injected interruption"); },
       }), /injected interruption/);
-      assert.throws(() => restoreService.assertNoPendingWholeRestore({
-        failureInjector(step) { if (step === "restore.rollback.uploads-tree.completed") throw new Error("injected rollback write failure"); },
-      }), /rollback failed/i);
+      const originalOpenSync = fs.openSync;
+      let failedRestoreWrite = false;
+      fs.openSync = function (pathname, flags, ...args) {
+        if (!failedRestoreWrite && typeof pathname === "string"
+          && pathname.startsWith(path.join(uploadsDir, "file.txt") + ".")
+          && pathname.endsWith(".restore-preimage") && flags === "wx") {
+          failedRestoreWrite = true;
+          const error = new Error("injected rollback storage write failure");
+          error.code = "EIO";
+          throw error;
+        }
+        return originalOpenSync.call(this, pathname, flags, ...args);
+      };
+      try {
+        assert.throws(() => restoreService.assertNoPendingWholeRestore(), /rollback failed/i);
+      } finally { fs.openSync = originalOpenSync; }
+      assert.equal(failedRestoreWrite, true, "the rollback failed while recreating the uploads tree");
       const coordinator = JSON.parse(fs.readFileSync(path.join(dataDir, ".rootark-restore-coordinator.json"), "utf8"));
       assert.equal(coordinator.phase, "manual_recovery");
       assert.equal(restoreService.isWholeRestoreBlocked(), true);
-      assert.throws(() => restoreService.assertNoPendingWholeRestore(), /manual recovery/i);
+      assert.equal(fs.existsSync(path.join(uploadsDir, "file.txt")), false, "the injected I/O failure leaves an incomplete tree behind the barrier");
+      const restarted = spawnSync(process.execPath, ["-e", ${JSON.stringify(recoveryScript)}], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 10_000 });
+      assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+      assert.equal(JSON.parse(restarted.stdout.trim().split(String.fromCharCode(10)).at(-1)).ok, true);
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);

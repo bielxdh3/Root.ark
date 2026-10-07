@@ -165,7 +165,7 @@ test("restore-suppressed provider objects are not downloaded or archived", () =>
     `process.chdir(${JSON.stringify(isolated)}); process.env.DB_ENABLED = "false"; process.env.BACKUP_INCLUDE_PENDING = "true";`,
     'const fs = require("node:fs"); const path = require("node:path");',
     `const service = require(${JSON.stringify(servicePath)}); const unzipper = require(${JSON.stringify(unzipperPath)});`,
-    'fs.mkdirSync("uploads", { recursive: true }); fs.mkdirSync("temp", { recursive: true }); fs.writeFileSync("uploads/local.txt", "local upload"); fs.writeFileSync("temp/local-pending.txt", "local pending");',
+    'fs.mkdirSync("uploads", { recursive: true }); fs.mkdirSync("temp", { recursive: true }); fs.writeFileSync("uploads/local.txt", "local upload"); fs.writeFileSync("temp/local-pending.txt", "local pending"); fs.writeFileSync("uploads/suppressed-upload.txt", "stale local upload"); fs.writeFileSync("temp/suppressed-pending.txt", "stale local pending");',
     'fs.mkdirSync("data", { recursive: true }); fs.writeFileSync("data/.rootark-restore-provider-orphans.json", JSON.stringify({ version: 1, objects: [{ area: "uploads", folderId: "root", name: "suppressed-upload.txt" }, { area: "temp", folderId: "root", name: "suppressed-pending.txt" }] }));',
     'const remotes = [{ area: "uploads", folderId: "root", name: "suppressed-upload.txt" }, { area: "temp", folderId: "root", name: "suppressed-pending.txt" }, { area: "uploads", folderId: "root", name: "cloud.txt" }, { area: "temp", folderId: "root", name: "cloud-pending.txt" }]; const downloads = [];',
     'service.setCloudStorage({ enabled: () => true, inventory: async () => remotes.map((remote) => ({ provider: "s3", providerIdentity: remote.name, ...remote })), download: async (folderId, name, target, area) => { downloads.push(`${area}/${name}`); fs.writeFileSync(target, `${area}:${name}`); return true; } });',
@@ -179,10 +179,10 @@ test("restore-suppressed provider objects are not downloaded or archived", () =>
   assert.equal(downloads.includes("temp/suppressed-pending.txt"), false);
   assert.ok(entries.includes("uploads/local.txt"));
   assert.ok(entries.includes("temp/local-pending.txt"));
-  assert.ok(entries.includes("uploads/cloud.txt"));
-  assert.ok(entries.includes("temp/cloud-pending.txt"));
   assert.equal(entries.includes("uploads/suppressed-upload.txt"), false);
   assert.equal(entries.includes("temp/suppressed-pending.txt"), false);
+  assert.ok(entries.includes("uploads/cloud.txt"));
+  assert.ok(entries.includes("temp/cloud-pending.txt"));
 });
 
 test.after(() => {

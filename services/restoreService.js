@@ -312,7 +312,7 @@ function recoverWholeRestorePreimages(coordinator, options = {}) {
   try {
     const current = readWholeRestoreCoordinator();
     if (!current || current.transactionId !== coordinator.transactionId || current.version !== WHOLE_RESTORE_COORDINATOR_VERSION
-      || !["prepared", "rolling_back"].includes(current.phase)) throw new Error("Whole-restore coordinator changed during recovery");
+      || !["prepared", "rolling_back", "manual_recovery"].includes(current.phase)) throw new Error("Whole-restore coordinator changed during recovery");
     const preimageRoot = wholeRestorePreimageRoot(current.transactionId);
     manifest = restorePreimage.readManifest(path.join(preimageRoot, "manifest.json"), current.preimageHash, current.transactionId);
     validateWholeRestorePreimages(current, manifest);
@@ -375,7 +375,7 @@ function assertNoPendingWholeRestore(options = {}) {
       return { recovered: true, reason: "incomplete_preimage_preparation" };
     } finally { release(); }
   }
-  if (coordinator.version === WHOLE_RESTORE_COORDINATOR_VERSION && ["prepared", "rolling_back"].includes(coordinator.phase)) {
+  if (coordinator.version === WHOLE_RESTORE_COORDINATOR_VERSION && ["prepared", "rolling_back", "manual_recovery"].includes(coordinator.phase)) {
     return recoverWholeRestorePreimages(coordinator, options);
   }
   if (coordinator.version === WHOLE_RESTORE_COORDINATOR_VERSION && coordinator.phase === "rollback_complete") {

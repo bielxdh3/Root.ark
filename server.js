@@ -143,6 +143,7 @@ const CHUNK_UPLOAD_DIR = path.resolve("./temp/.chunks");
 const CHUNK_UPLOAD_INCOMING_DIR = path.join(CHUNK_UPLOAD_DIR, "incoming");
 const CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY = "__resumeBlocked";
 const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
+const UPLOAD_STAGING_PATH = Symbol("rootarkUploadStagingPath");
 const MAX_UPLOAD_CHUNKS = 2000;
 const SINGLE_UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
 const UPLOAD_SCAN_ENABLED = parseEnvBoolean(process.env.UPLOAD_SCAN_ENABLED, true);
@@ -693,9 +694,16 @@ function loadFileVersions() {
   }
 }
 
-function saveFileVersions(entries) {
+function saveFileVersions(entries, { tolerateLegacyJsonMirrorFailure = false } = {}) {
   if (shouldUseDatabase()) fileVersionsRepository.saveFileVersions(entries);
-  if (shouldWriteLegacyJson()) fs.writeFileSync(FILE_VERSIONS_FILE, JSON.stringify(entries, null, 2));
+  if (shouldWriteLegacyJson()) {
+    try {
+      fs.writeFileSync(FILE_VERSIONS_FILE, JSON.stringify(entries, null, 2));
+    } catch (error) {
+      if (!shouldUseDatabase() || !tolerateLegacyJsonMirrorFailure) throw error;
+      console.error("Falha ao atualizar espelho JSON das versoes:", sanitizeLogValue(error.message));
+    }
+  }
   broadcastDataChanged("versions");
 }
 
@@ -2256,7 +2264,7 @@ function getVersionHistory(folderId, fileName, entries = loadFileVersions()) {
   return normalizeVersionHistory(entries[getFileVersionKey(folderId, fileName)]);
 }
 
-function ensureVersionHistory(folder, fileName, uploadedBy = "sistema", comment = "Versao inicial") {
+function ensureVersionHistory(folder, fileName, uploadedBy = "sistema", comment = "Versao inicial", { persist = true } = {}) {
   const entries = loadFileVersions();
   const key = getFileVersionKey(folder.id, fileName);
   const history = normalizeVersionHistory(entries[key]);
@@ -2284,12 +2292,13 @@ function ensureVersionHistory(folder, fileName, uploadedBy = "sistema", comment 
   };
 
   entries[key] = createdHistory;
-  saveFileVersions(entries);
+  if (persist) saveFileVersions(entries);
   return { entries, key, history: createdHistory };
 }
 
-function pruneFileVersions(entries, key, folder) {
+function pruneFileVersions(entries, key) {
   const history = normalizeVersionHistory(entries[key]);
+  const prunedStoredNames = [];
   let changed = false;
 
   while (history.versions.length > MAX_FILE_VERSIONS) {
@@ -2299,61 +2308,133 @@ function pruneFileVersions(entries, key, folder) {
 
     if (!removable) break;
 
-    const storedPath = path.join(folder.uploadDir, removable.storedAs);
-    if (removable.storedAs && removable.storedAs !== path.basename(key) && fs.existsSync(storedPath)) {
-      fs.unlinkSync(storedPath);
-    }
-    if (removable.storedAs) deleteCloudFileLater(folder.id, removable.storedAs, "uploads");
+    if (removable.storedAs) prunedStoredNames.push(removable.storedAs);
 
     history.versions = history.versions.filter((version) => version.version !== removable.version);
     changed = true;
   }
 
   if (changed) entries[key] = history;
+  return prunedStoredNames;
+}
+
+function deletePrunedFileVersions(folder, key, storedNames) {
+  for (const storedAs of storedNames) {
+    if (typeof storedAs !== "string" || storedAs !== path.basename(storedAs) || storedAs === path.basename(key)) continue;
+
+    const storedPath = path.join(folder.uploadDir, storedAs);
+    try {
+      if (fs.existsSync(storedPath)) fs.rmSync(storedPath, { force: true });
+    } catch (error) {
+      console.error("Erro ao remover versao antiga local:", sanitizeLogValue(error.message));
+    }
+
+    try {
+      deleteCloudFileLater(folder.id, storedAs, "uploads");
+    } catch (error) {
+      console.error("Erro ao agendar remocao de versao antiga na nuvem:", sanitizeLogValue(error.message));
+    }
+  }
+}
+
+function restoreFileVersionsJsonSnapshot(snapshot) {
+  if (!shouldWriteLegacyJson()) return;
+  const target = path.resolve(FILE_VERSIONS_FILE);
+  if (snapshot === null) {
+    fs.rmSync(target, { force: true });
+    return;
+  }
+
+  const rollbackPath = `${target}.rollback-${crypto.randomBytes(8).toString("hex")}.tmp`;
+  try {
+    fs.writeFileSync(rollbackPath, snapshot, { flag: "wx", mode: 0o600 });
+    fs.renameSync(rollbackPath, target);
+  } finally {
+    fs.rmSync(rollbackPath, { force: true });
+  }
 }
 
 function recordApprovedFileVersion(folder, fileName, pendingPath, uploadedBy, comment = "") {
   const currentPath = path.join(folder.uploadDir, fileName);
   const exists = isExistingFile(currentPath);
   const initialComment = comment || "Versao inicial";
+  let historySnapshot = null;
+  if (shouldWriteLegacyJson()) {
+    try { historySnapshot = fs.readFileSync(FILE_VERSIONS_FILE); }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+  }
 
   if (!exists) {
-    fs.renameSync(pendingPath, currentPath);
-    ensureVersionHistory(folder, fileName, uploadedBy || "sistema", initialComment);
+    let promoted = false;
+    try {
+      fs.renameSync(pendingPath, currentPath);
+      promoted = true;
+      const { entries } = ensureVersionHistory(folder, fileName, uploadedBy || "sistema", initialComment, { persist: false });
+      saveFileVersions(entries, { tolerateLegacyJsonMirrorFailure: true });
+    } catch (error) {
+      try {
+        if (promoted && isExistingFile(currentPath) && !isExistingFile(pendingPath)) fs.renameSync(currentPath, pendingPath);
+        restoreFileVersionsJsonSnapshot(historySnapshot);
+      } catch (rollbackError) {
+        console.error("Erro ao reverter aprovacao inicial:", sanitizeLogValue(rollbackError.message));
+      }
+      throw error;
+    }
     return { currentVersion: 1, replaced: false };
   }
 
-  const currentOwner = normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, fileName)).owner;
-  const { entries, key, history } = ensureVersionHistory(folder, fileName, currentOwner, "Versao inicial");
-  const oldCurrentVersion = history.currentVersion || 1;
-  const archivedName = getStoredVersionName(fileName, oldCurrentVersion);
-  const archivedPath = path.join(folder.uploadDir, archivedName);
+  let archivedPath = null;
+  let currentArchived = false;
+  let pendingPromoted = false;
+  let entries;
+  let key;
+  let history;
+  try {
+    const currentOwner = normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, fileName)).owner;
+    ({ entries, key, history } = ensureVersionHistory(folder, fileName, currentOwner, "Versao inicial", { persist: false }));
+    const oldCurrentVersion = history.currentVersion || 1;
+    const archivedName = getStoredVersionName(fileName, oldCurrentVersion);
+    archivedPath = path.join(folder.uploadDir, archivedName);
+    if (fs.existsSync(archivedPath)) throw new Error("Arquivo de versao atual ja existe");
 
-  fs.renameSync(currentPath, archivedPath);
-  for (const version of history.versions) {
-    if (version.version === oldCurrentVersion) {
-      version.storedAs = archivedName;
-      version.size = fs.statSync(archivedPath).size;
+    fs.renameSync(currentPath, archivedPath);
+    currentArchived = true;
+    for (const version of history.versions) {
+      if (version.version === oldCurrentVersion) {
+        version.storedAs = archivedName;
+        version.size = fs.statSync(archivedPath).size;
+      }
     }
+
+    fs.renameSync(pendingPath, currentPath);
+    pendingPromoted = true;
+    const stats = fs.statSync(currentPath);
+    const newVersion = oldCurrentVersion + 1;
+    history.currentVersion = newVersion;
+    history.versions.push({
+      version: newVersion,
+      storedAs: fileName,
+      uploadedBy: uploadedBy || "sistema",
+      uploadedAt: new Date().toISOString(),
+      size: stats.size,
+      comment: comment || "",
+    });
+
+    entries[key] = history;
+    const prunedStoredNames = pruneFileVersions(entries, key);
+    saveFileVersions(entries, { tolerateLegacyJsonMirrorFailure: true });
+    deletePrunedFileVersions(folder, key, prunedStoredNames);
+    return { currentVersion: newVersion, replaced: true };
+  } catch (error) {
+    try {
+      if (pendingPromoted && isExistingFile(currentPath) && !isExistingFile(pendingPath)) fs.renameSync(currentPath, pendingPath);
+      if (currentArchived && archivedPath && isExistingFile(archivedPath) && !isExistingFile(currentPath)) fs.renameSync(archivedPath, currentPath);
+      restoreFileVersionsJsonSnapshot(historySnapshot);
+    } catch (rollbackError) {
+      console.error("Erro ao reverter aprovacao de versao:", sanitizeLogValue(rollbackError.message));
+    }
+    throw error;
   }
-
-  fs.renameSync(pendingPath, currentPath);
-  const stats = fs.statSync(currentPath);
-  const newVersion = oldCurrentVersion + 1;
-  history.currentVersion = newVersion;
-  history.versions.push({
-    version: newVersion,
-    storedAs: fileName,
-    uploadedBy: uploadedBy || "sistema",
-    uploadedAt: new Date().toISOString(),
-    size: stats.size,
-    comment: comment || "",
-  });
-
-  entries[key] = history;
-  pruneFileVersions(entries, key, folder);
-  saveFileVersions(entries);
-  return { currentVersion: newVersion, replaced: true };
 }
 
 function syncFileVersionsToCloud(folderId, fileName) {
@@ -2414,7 +2495,7 @@ function isStoredVersionFile(folderId, fileName, entries = loadFileVersions()) {
   );
 }
 
-function removeFileVersions(folderId, fileName) {
+async function removeFileVersions(folderId, fileName, { remoteAlreadyDeleted = false } = {}) {
   const entries = loadFileVersions();
   const key = getFileVersionKey(folderId, fileName);
   const history = normalizeVersionHistory(entries[key]);
@@ -2422,8 +2503,10 @@ function removeFileVersions(folderId, fileName) {
 
   for (const version of history.versions) {
     if (version.storedAs && version.storedAs !== fileName) {
+      if (!remoteAlreadyDeleted && isCloudStorageEnabled()) {
+        await deleteFileFromCloud(folderId, version.storedAs, "uploads");
+      }
       fs.rmSync(path.join(uploadDir, version.storedAs), { force: true });
-      deleteCloudFileLater(folderId, version.storedAs, "uploads");
     }
   }
 
@@ -3467,7 +3550,7 @@ async function cleanupExpiredTemporaryItems() {
         if (isExistingFile(filePath)) fs.unlinkSync(filePath);
         removePublicLinksForFile(fileName, folderId);
         removeFilePermission(folderId, fileName);
-        removeFileVersions(folderId, fileName);
+        await removeFileVersions(folderId, fileName, { remoteAlreadyDeleted: isCloudStorageEnabled() });
         delete expirations[key];
         saveFileExpirations(expirations);
         addActionHistory("file_expired", fileName, "sistema", {
@@ -3827,10 +3910,11 @@ function isGzipFile(filePath) {
 
 async function decompressUploadedFileIfNeeded(req) {
   const compression = String(req.body?.rootarkCompression || req.query?.rootarkCompression || "").toLowerCase();
-  if (!req.file?.path) return false;
+  const trustedPath = getTrustedUploadStagingPath(req.file);
+  if (!trustedPath) return false;
 
   const extension = path.extname(req.file.originalname || req.file.filename || "").toLowerCase();
-  const hasGzipHeader = isGzipFile(req.file.path);
+  const hasGzipHeader = isGzipFile(trustedPath);
   const shouldDecompress = compression === "gzip" || (hasGzipHeader && extension !== ".gz");
   if (!shouldDecompress) return false;
 
@@ -3838,7 +3922,7 @@ async function decompressUploadedFileIfNeeded(req) {
     throw new Error("Upload marcado como compactado, mas o arquivo nao esta em gzip");
   }
 
-  const compressedPath = req.file.path;
+  const compressedPath = trustedPath;
   const outputPath = `${compressedPath}.decompressed`;
 
   try {
@@ -5299,7 +5383,9 @@ const storage = multer.diskStorage({
   filename: (req, file, cb) => {
     try {
       req.uploadFinalFileName = getAvailableUploadFileName(file.originalname, req.uploadFolder?.id || ROOT_FOLDER_ID, true);
-      cb(null, `${Date.now()}-${crypto.randomBytes(8).toString("hex")}.upload`);
+      const filename = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}.upload`;
+      req[UPLOAD_STAGING_PATH] = path.join(SIMPLE_UPLOAD_INCOMING_DIR, filename);
+      cb(null, filename);
     } catch (error) {
       cb(error);
     }
@@ -5345,16 +5431,30 @@ function rejectLargeSingleUpload(req, res, next) {
 function handleUploadSingle(req, res, next) {
   upload.single("file")(req, res, (error) => {
     if (!error) {
+      const trustedPath = getTrustedUploadStagingPath(req);
+      if (!req.file || !trustedPath || req.file.path !== trustedPath) {
+        if (trustedPath) fs.rmSync(trustedPath, { force: true });
+        res.status(400).json({ error: "Upload nao concluido" });
+        return;
+      }
+
+      Object.defineProperty(req.file, UPLOAD_STAGING_PATH, { value: trustedPath, writable: true });
       next();
       return;
     }
 
-    if (req.file?.path) {
-      fs.rmSync(req.file.path, { force: true });
-    }
+    const trustedPath = getTrustedUploadStagingPath(req);
+    if (trustedPath) fs.rmSync(trustedPath, { force: true });
 
     res.status(400).json({ error: error.message || "Upload nao concluido" });
   });
+}
+
+function getTrustedUploadStagingPath(valueHolder) {
+  const value = valueHolder?.[UPLOAD_STAGING_PATH];
+  if (typeof value !== "string") return null;
+  const resolved = path.resolve(value);
+  return isSafeChildPath(SIMPLE_UPLOAD_INCOMING_DIR, resolved) ? resolved : null;
 }
 
 function handleChunkUploadSingle(req, res, next) {
@@ -6588,14 +6688,11 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
           chunkedUpload: true,
           encryptionMetadata,
         });
-      });
+      }, res);
     } catch (error) {
       fs.rmSync(stagedPath, { force: true });
       if (publishedPath) fs.rmSync(publishedPath, { force: true });
       fs.rmSync(sessionDir, { recursive: true, force: true });
-      if (["FILE_LIFECYCLE_LOCK_TIMEOUT", "FILE_LIFECYCLE_LOCK_UNAVAILABLE"].includes(error?.code)) {
-        return res.status(503).set("Retry-After", "5").json({ error: "Pasta temporariamente indisponivel" });
-      }
       return res.status(400).json({ error: error.message || "Falha ao criptografar arquivo" });
     }
     if (res.headersSent) {
@@ -6617,9 +6714,10 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
 app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFolder, rejectLargeSingleUpload, handleUploadSingle, async (req, res) => {
   const originalName = path.basename(req.file?.originalname || "");
   const requestedFileName = path.basename(req.uploadFinalFileName || "");
+  const incomingPath = getTrustedUploadStagingPath(req.file);
 
-  if (!req.file || !requestedFileName) {
-    if (req.file?.path) fs.rmSync(req.file.path, { force: true });
+  if (!req.file || !requestedFileName || !incomingPath) {
+    if (incomingPath) fs.rmSync(incomingPath, { force: true });
     return res.status(400).json({ error: "Arquivo obrigatorio" });
   }
 
@@ -6627,11 +6725,10 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
   try {
     uploadWasCompressed = await decompressUploadedFileIfNeeded(req);
   } catch (error) {
-    fs.rmSync(req.file.path, { force: true });
+    fs.rmSync(incomingPath, { force: true });
     return res.status(400).json({ error: error.message || "Upload compactado invalido" });
   }
 
-  const incomingPath = req.file.path;
   const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
   let finalTempPath = null;
   let fileName = requestedFileName;
@@ -8311,7 +8408,7 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
 
   return runCloudFileLifecycleMutation(folder.id, name, async () => {
     if (!refreshAuthenticatedUser(req, res)) return;
-    const currentFolder = getReadableFolderOrRespond(req, res, folder.id);
+    let currentFolder = getReadableFolderOrRespond(req, res, folder.id);
     if (!currentFolder) return;
     if (isFileInTrash(currentFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
     if (isFileExpired(currentFolder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
@@ -8332,23 +8429,38 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
     if (isRestoreProviderOrphanDenied(req, currentFolder.id, target.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
     await ensureCloudFileCached(currentFolder.id, target.storedAs, targetPath, "uploads", () => !isFileInTrash(currentFolder.id, name), name);
     if (isRestoreProviderOrphanDenied(req, currentFolder.id, target.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+    if (!refreshAuthenticatedUser(req, res)) return;
+    currentFolder = getReadableFolderOrRespond(req, res, currentFolder.id);
+    if (!currentFolder) return;
+    if (!req.user?.permissions?.listFiles || !hasFileEditAccess(req, currentFolder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
     if (!isFolderAvailable(currentFolder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
     if (isFileExpired(currentFolder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
     if (isFileInTrash(currentFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
     if (!isExistingFile(currentPath) || !isExistingFile(targetPath)) return res.status(404).json({ error: "Arquivo da versao nao encontrado" });
 
+    let restoreStagePath = null;
+    let archivedPath = null;
+    let currentArchived = false;
+    let restoredCurrentInstalled = false;
+    let localRestoreCommitted = false;
     try {
       const oldCurrentVersion = history.currentVersion;
       const archivedName = getStoredVersionName(name, oldCurrentVersion);
-      const archivedPath = path.join(currentFolder.uploadDir, archivedName);
+      archivedPath = path.join(currentFolder.uploadDir, archivedName);
+      if (fs.existsSync(archivedPath)) return res.status(409).json({ error: "Arquivo de versao atual ja existe" });
+      restoreStagePath = path.join(currentFolder.uploadDir, `.rootark-restore-${crypto.randomBytes(12).toString("hex")}.tmp`);
+      fs.copyFileSync(targetPath, restoreStagePath, fs.constants.COPYFILE_EXCL);
       fs.renameSync(currentPath, archivedPath);
+      currentArchived = true;
+      fs.renameSync(restoreStagePath, currentPath);
+      restoreStagePath = null;
+      restoredCurrentInstalled = true;
       for (const version of history.versions) {
         if (version.version === oldCurrentVersion) {
           version.storedAs = archivedName;
           version.size = fs.statSync(archivedPath).size;
         }
       }
-      fs.copyFileSync(targetPath, currentPath);
       const stats = fs.statSync(currentPath);
       const newVersion = oldCurrentVersion + 1;
       history.currentVersion = newVersion;
@@ -8361,14 +8473,25 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
         comment: `Restaurado da versao ${versionNumber}`,
       });
       entries[key] = history;
-      pruneFileVersions(entries, key, currentFolder);
-      saveFileVersions(entries);
+      const prunedStoredNames = pruneFileVersions(entries, key);
+      saveFileVersions(entries, { tolerateLegacyJsonMirrorFailure: true });
+      localRestoreCommitted = true;
+      deletePrunedFileVersions(currentFolder, key, prunedStoredNames);
       syncFileVersionsToCloud(currentFolder.id, name);
       addActionHistory("version_restored", name, req.user.username, { folderId: currentFolder.id, folderName: currentFolder.name, restoredVersion: versionNumber, newVersion });
       logAnalyticsEvent("restore", { filename: name, restoredBy: req.user.username, restoredVersion: versionNumber, newVersion, folderId: currentFolder.id, folderName: currentFolder.name });
       auditLog("file.version.restore", getAuditActor(req), { type: "file", id: name }, "restored", "success", { folderId: currentFolder.id, restoredVersion: versionNumber, newVersion });
       return res.json({ message: "Versao restaurada", version: newVersion, restoredVersion: versionNumber });
     } catch (error) {
+      if (!localRestoreCommitted && currentArchived) {
+        try {
+          if (restoredCurrentInstalled && isExistingFile(currentPath)) fs.rmSync(currentPath, { force: true });
+          if (!isExistingFile(currentPath)) fs.renameSync(archivedPath, currentPath);
+        } catch (rollbackError) {
+          console.error("Erro ao restaurar arquivo apos falha de versao:", sanitizeLogValue(rollbackError.message));
+        }
+      }
+      if (restoreStagePath) fs.rmSync(restoreStagePath, { force: true });
       console.error("Erro ao restaurar versao:", error.message);
       return res.status(500).json({ error: "Erro ao restaurar versao" });
     }
@@ -8796,7 +8919,7 @@ app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("ap
     return runCloudFileLifecycleMutation(target.folder.id, name, async () => {
       if (!refreshAuthenticatedUser(req, res)) return;
       if (!req.user.permissions?.approve) return res.status(403).json({ error: "Permissao negada: approve" });
-      const folder = getApprovalFolderById(target.folder.id);
+      let folder = getApprovalFolderById(target.folder.id);
       if (!folder || !isFolderAvailable(folder.id) || (!canManageAccess(req) && !hasFolderAccess(req, folder))) {
         return res.status(403).json({ error: "Permissao negada para aprovar nesta pasta" });
       }
@@ -8810,17 +8933,27 @@ app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("ap
       }
       const pendingPath = path.join(folder.tempDir, name);
       if (!isExistingFile(pendingPath)) await ensureCloudFileCached(folder.id, name, pendingPath, "temp");
-      if (!isExistingFile(pendingPath) || !getPendingUploadEntry(folder.id, name)) {
+      if (!refreshAuthenticatedUser(req, res)) return;
+      if (!req.user.permissions?.approve) return res.status(403).json({ error: "Permissao negada: approve" });
+      folder = getApprovalFolderById(target.folder.id);
+      if (!folder || !isFolderAvailable(folder.id) || (!canManageAccess(req) && !hasFolderAccess(req, folder))) {
+        return res.status(403).json({ error: "Permissao negada para aprovar nesta pasta" });
+      }
+      const refreshedPendingEntry = getPendingUploadEntry(folder.id, name);
+      if (restoreProviderOrphans.isSuppressed(folder.id, name, "temp")) {
+        return res.status(409).json({ error: "Payload pendente nao consta no backup restaurado; rejeite ou envie novamente" });
+      }
+      if (!isExistingFile(path.join(folder.tempDir, name)) || !refreshedPendingEntry) {
         return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
       }
 
-      const uploadedBy = pendingEntry.uploadedBy || null;
+      const uploadedBy = refreshedPendingEntry.uploadedBy || null;
       const versionInfo = recordApprovedFileVersion(
         folder,
         name,
-        pendingPath,
+        path.join(folder.tempDir, name),
         uploadedBy || req.user.username,
-        pendingEntry.versionComment || ""
+        refreshedPendingEntry.versionComment || ""
       );
       promoteEncryptedMetadataAfterApproval(folder.id, name, uploadedBy || req.user.username);
       syncFileVersionsToCloud(folder.id, name);
@@ -8883,19 +9016,29 @@ app.post("/reject/:name", rejectRateLimit, authenticate, requirePermission("appr
   return runCloudFileLifecycleMutation(target.folder.id, name, async () => {
     if (!refreshAuthenticatedUser(req, res)) return;
     if (!req.user.permissions?.approve) return res.status(403).json({ error: "Permissao negada: approve" });
-    const folder = getApprovalFolderById(target.folder.id);
+    let folder = getApprovalFolderById(target.folder.id);
     if (!folder || !isFolderAvailable(folder.id) || (!canManageAccess(req) && !hasFolderAccess(req, folder))) {
       return res.status(403).json({ error: "Permissao negada para rejeitar nesta pasta" });
     }
 
-    const pendingUploads = loadPendingUploads();
+    let pendingUploads = loadPendingUploads();
     const key = getPendingKey(folder.id, name);
-    const pendingEntry = pendingUploads[key] || pendingUploads[name];
+    let pendingEntry = pendingUploads[key] || pendingUploads[name];
     if (!pendingEntry) return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
-    const pendingPath = path.join(folder.tempDir, name);
-    const restoreOrphan = restoreProviderOrphans.isSuppressed(folder.id, name, "temp");
+    let pendingPath = path.join(folder.tempDir, name);
+    let restoreOrphan = restoreProviderOrphans.isSuppressed(folder.id, name, "temp");
     if (!restoreOrphan && !isExistingFile(pendingPath)) await ensureCloudFileCached(folder.id, name, pendingPath, "temp");
-    if ((!restoreOrphan && !isExistingFile(pendingPath)) || !getPendingUploadEntry(folder.id, name)) {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    if (!req.user.permissions?.approve) return res.status(403).json({ error: "Permissao negada: approve" });
+    folder = getApprovalFolderById(target.folder.id);
+    if (!folder || !isFolderAvailable(folder.id) || (!canManageAccess(req) && !hasFolderAccess(req, folder))) {
+      return res.status(403).json({ error: "Permissao negada para rejeitar nesta pasta" });
+    }
+    pendingPath = path.join(folder.tempDir, name);
+    restoreOrphan = restoreProviderOrphans.isSuppressed(folder.id, name, "temp");
+    pendingUploads = loadPendingUploads();
+    pendingEntry = pendingUploads[key] || pendingUploads[name];
+    if ((!restoreOrphan && !isExistingFile(pendingPath)) || !pendingEntry) {
       return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
     }
 

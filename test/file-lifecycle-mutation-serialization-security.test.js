@@ -181,30 +181,49 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const reuseName = "reused-pending-name.txt";
   const failedDeleteName = "failed-pending-delete.txt";
   const revokedDeleteName = "revoked-during-delete-wait.txt";
+  const aclRevokedRestoreName = "acl-revoked-during-restore-wait.txt";
+  const failedRestoreName = "version-copy-failure.txt";
+  const failedPruneSaveName = "version-prune-save-failure.txt";
+  const approveSaveFailureName = "approve-history-save-failure.txt";
+  const approveInitialSaveFailureName = "approve-initial-history-save-failure.txt";
+  const approveRevokedName = "approve-revoked-during-cache-recovery.txt";
+  const rejectRevokedName = "reject-revoked-during-cache-recovery.txt";
   const failedUploadName = "queue-write-failed.txt";
   const revokedWebDavMoveName = "revoked-during-webdav-move-cache.txt";
   const revokedWebDavMoveDestination = "revoked-webdav-move-target.txt";
   const objects = new Map();
-  for (const name of [restoreName, deleteName, revokedDeleteName]) {
+  for (const name of [restoreName, deleteName, revokedDeleteName, aclRevokedRestoreName, failedRestoreName]) {
     objects.set(`rootark/uploads/root/${name}`, Buffer.from(`current v3 ${name}`));
     objects.set(`rootark/uploads/root/${name}.v1`, Buffer.from(`version v1 ${name}`));
     objects.set(`rootark/uploads/root/${name}.v2`, Buffer.from(`version v2 ${name}`));
+  }
+  objects.set(`rootark/uploads/root/${approveSaveFailureName}`, Buffer.from(`prior current ${approveSaveFailureName}`));
+  for (const name of [approveSaveFailureName, approveInitialSaveFailureName]) objects.set(`rootark/temp/root/${name}`, Buffer.from(`pending replacement ${name}`));
+  for (let version = 1; version <= 10; version += 1) {
+    const storedAs = version === 10 ? failedPruneSaveName : `${failedPruneSaveName}.v${version}`;
+    objects.set(`rootark/uploads/root/${storedAs}`, Buffer.from(version === 10 ? `current v10 ${failedPruneSaveName}` : `version v${version} ${failedPruneSaveName}`));
   }
   objects.set(`rootark/temp/root/${rejectedName}`, Buffer.from(`rejected ${rejectedName}`));
   objects.set(`rootark/temp/root/${uploadRejectName}`, Buffer.from(`old ${uploadRejectName}`));
   objects.set(`rootark/temp/root/${reuseName}`, Buffer.from(`old ${reuseName}`));
   objects.set(`rootark/temp/root/${failedDeleteName}`, Buffer.from(`failed delete ${failedDeleteName}`));
+  objects.set(`rootark/temp/root/${approveRevokedName}`, Buffer.from(`pending ${approveRevokedName}`));
+  objects.set(`rootark/temp/root/${rejectRevokedName}`, Buffer.from(`pending ${rejectRevokedName}`));
   const revokedWebDavMoveBytes = Buffer.from("remote WebDAV MOVE source");
   objects.set(`rootark/uploads/root/${revokedWebDavMoveName}`, revokedWebDavMoveBytes);
   const password = crypto.randomBytes(24).toString("base64url");
   fs.writeFileSync(path.join(dataDir, "users.local.json"), JSON.stringify([
     { username: "tester", password: bcrypt.hashSync(password, 10), role: "admin", permissions: { listFiles: true, upload: true, approve: true, delete: true }, sessionVersion: 0 },
+    { username: "limited", password: bcrypt.hashSync(password, 10), role: "user", permissions: { listFiles: true, upload: true, approve: true, delete: true }, sessionVersion: 0 },
   ]));
   fs.writeFileSync(path.join(dataDir, "folders.json"), JSON.stringify([
     { id: "root", name: "Root", createdBy: "system", allowedUsers: [], isRoot: true },
   ]));
-  fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify(Object.fromEntries([restoreName, deleteName, revokedDeleteName, revokedWebDavMoveName].map((name) => [`root/${name}`, { public: false, owner: "tester", users: {} }]))));
-  const initialHistory = Object.fromEntries([restoreName, deleteName, revokedDeleteName].map((name) => [`root/${name}`, {
+  const initialPermissions = Object.fromEntries([restoreName, deleteName, revokedDeleteName, revokedWebDavMoveName, failedRestoreName, failedPruneSaveName, approveSaveFailureName, approveInitialSaveFailureName].map((name) => [`root/${name}`, { public: false, owner: "tester", users: {} }]));
+  initialPermissions[`root/${aclRevokedRestoreName}`] = { public: false, owner: null, users: { limited: { read: true, edit: true } } };
+  const filePermissionsPath = path.join(dataDir, "file-permissions.json");
+  fs.writeFileSync(filePermissionsPath, JSON.stringify(initialPermissions));
+  const initialHistory = Object.fromEntries([restoreName, deleteName, revokedDeleteName, aclRevokedRestoreName, failedRestoreName].map((name) => [`root/${name}`, {
     currentVersion: 3,
     versions: [
       { version: 1, storedAs: `${name}.v1`, size: objects.get(`rootark/uploads/root/${name}.v1`).length },
@@ -212,11 +231,27 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
       { version: 3, storedAs: name, size: objects.get(`rootark/uploads/root/${name}`).length },
     ],
   }]));
+  initialHistory[`root/${failedPruneSaveName}`] = {
+    currentVersion: 10,
+    versions: Array.from({ length: 10 }, (_, index) => ({
+      version: index + 1,
+      storedAs: index === 9 ? failedPruneSaveName : `${failedPruneSaveName}.v${index + 1}`,
+      size: objects.get(`rootark/uploads/root/${index === 9 ? failedPruneSaveName : `${failedPruneSaveName}.v${index + 1}`}`).length,
+    })),
+  };
+  initialHistory[`root/${approveSaveFailureName}`] = {
+    currentVersion: 1,
+    versions: [{ version: 1, storedAs: approveSaveFailureName, size: Buffer.byteLength(`prior current ${approveSaveFailureName}`) }],
+  };
   const versionHistoryPath = path.join(dataDir, "file-versions.json");
   const versionReadMarker = path.join(directory, "version-history-reads.txt");
   const unlinkStarted = path.join(directory, "pending-unlink-started");
   const releaseUnlink = path.join(directory, "release-pending-unlink");
   const failQueueWrites = path.join(directory, "fail-cloud-temp-queue-writes");
+  const failVersionCopy = path.join(directory, "fail-version-copy-once");
+  const failVersionHistorySave = path.join(directory, "fail-version-history-save-once");
+  const failApprovalHistorySave = path.join(directory, "fail-approval-history-save-once");
+  const evictPendingConfig = path.join(directory, "evict-pending-cache.json");
   const cloudQueueDirectory = path.join(dataDir, ".rootark-cloud-temp-mutations");
   const pendingRegistryPath = path.join(dataDir, "pending-uploads.json");
   const priorFailedUploadPending = { fileName: failedUploadName, folderId: "root", uploadedBy: "tester", uploadedAt: "2026-10-01T00:00:00.000Z", versionComment: "preserve pending" };
@@ -229,7 +264,16 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     [`root/${reuseName}`]: { fileName: reuseName, folderId: "root", uploadedBy: "tester", uploadedAt: new Date().toISOString() },
     [`root/${failedDeleteName}`]: { fileName: failedDeleteName, folderId: "root", uploadedBy: "tester", uploadedAt: new Date().toISOString() },
     [`root/${failedUploadName}`]: priorFailedUploadPending,
+    [`root/${approveSaveFailureName}`]: { fileName: approveSaveFailureName, folderId: "root", uploadedBy: "limited", uploadedAt: new Date().toISOString() },
+    [`root/${approveInitialSaveFailureName}`]: { fileName: approveInitialSaveFailureName, folderId: "root", uploadedBy: "limited", uploadedAt: new Date().toISOString() },
+    [`root/${approveRevokedName}`]: { fileName: approveRevokedName, folderId: "root", uploadedBy: "tester", uploadedAt: new Date().toISOString() },
+    [`root/${rejectRevokedName}`]: { fileName: rejectRevokedName, folderId: "root", uploadedBy: "tester", uploadedAt: new Date().toISOString() },
   }));
+  fs.writeFileSync(path.join(directory, "temp", approveRevokedName), `pending ${approveRevokedName}`);
+  fs.writeFileSync(path.join(directory, "temp", rejectRevokedName), `pending ${rejectRevokedName}`);
+  fs.writeFileSync(path.join(directory, "uploads", approveSaveFailureName), `prior current ${approveSaveFailureName}`);
+  fs.writeFileSync(path.join(directory, "temp", approveSaveFailureName), `pending replacement ${approveSaveFailureName}`);
+  fs.writeFileSync(path.join(directory, "temp", approveInitialSaveFailureName), `pending replacement ${approveInitialSaveFailureName}`);
   fs.writeFileSync(path.join(dataDir, "encrypted-files.json"), JSON.stringify({ [`root/${failedUploadName}`]: priorFailedUploadEncryption }));
   fs.writeFileSync(path.join(dataDir, "trash-items.json"), "[]");
   const cloud = await makeS3Fixture(objects);
@@ -244,14 +288,23 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     `const unlinkStarted = ${JSON.stringify(unlinkStarted)};`,
     `const releaseUnlink = ${JSON.stringify(releaseUnlink)};`,
     `const failQueueWrites = ${JSON.stringify(failQueueWrites)};`,
+    `const failVersionCopy = ${JSON.stringify(failVersionCopy)};`,
+    `const failVersionHistorySave = ${JSON.stringify(failVersionHistorySave)};`,
+    `const failApprovalHistorySave = ${JSON.stringify(failApprovalHistorySave)};`,
+    `const versionHistoryFile = ${JSON.stringify(versionHistoryPath)};`,
+    `const failedRestoreTarget = ${JSON.stringify(path.join(directory, "uploads", `${failedRestoreName}.v1`))};`,
+    `const evictPendingConfig = ${JSON.stringify(evictPendingConfig)};`,
     `const cloudQueueDirectory = ${JSON.stringify(cloudQueueDirectory)};`,
     'const original = fs.readFileSync;',
     'fs.readFileSync = function (file, ...args) { if (typeof file === "string" && path.resolve(file) === history) fs.appendFileSync(marker, "1\\n"); return original.call(this, file, ...args); };',
+    'const originalStatSync = fs.statSync; const originalUnlinkSync = fs.unlinkSync.bind(fs); fs.statSync = function (file, ...args) { const stat = originalStatSync.call(this, file, ...args); if (typeof file === "string" && fs.existsSync(evictPendingConfig)) { try { const config = JSON.parse(fs.readFileSync(evictPendingConfig, "utf8")); if (path.resolve(file) === path.resolve(config.path)) { config.count += 1; fs.writeFileSync(evictPendingConfig, JSON.stringify(config)); if (config.count === 2) { originalUnlinkSync(file); originalUnlinkSync(evictPendingConfig); } } } catch {} } return stat; };',
     'const waitForRelease = async () => { fs.writeFileSync(unlinkStarted, "started"); while (!fs.existsSync(releaseUnlink)) await new Promise((resolve) => setTimeout(resolve, 10)); };',
     'const originalUnlink = fs.unlink;',
     'fs.unlink = function (file, ...args) { if (typeof file === "string" && path.resolve(file) === path.resolve(pending)) { waitForRelease().then(() => originalUnlink.call(this, file, ...args)); return; } return originalUnlink.call(this, file, ...args); };',
     'const originalPromiseUnlink = fs.promises.unlink.bind(fs.promises);',
     'fs.promises.unlink = async function (file) { if (typeof file === "string" && path.resolve(file) === path.resolve(pending)) await waitForRelease(); return originalPromiseUnlink(file); };',
+    'const originalCopyFileSync = fs.copyFileSync; fs.copyFileSync = function (source, destination, ...args) { if (fs.existsSync(failVersionCopy) && typeof source === "string" && path.resolve(source) === path.resolve(failedRestoreTarget)) { fs.unlinkSync(failVersionCopy); const error = new Error("injected version copy failure"); error.code = "EIO"; throw error; } return originalCopyFileSync.call(this, source, destination, ...args); };',
+    'const originalWriteFileSync = fs.writeFileSync; fs.writeFileSync = function (file, ...args) { if ((fs.existsSync(failVersionHistorySave) || fs.existsSync(failApprovalHistorySave)) && typeof file === "string" && path.resolve(file) === path.resolve(versionHistoryFile)) { if (fs.existsSync(failVersionHistorySave)) fs.unlinkSync(failVersionHistorySave); if (fs.existsSync(failApprovalHistorySave)) fs.unlinkSync(failApprovalHistorySave); const error = new Error("injected version history save failure"); error.code = "EIO"; throw error; } return originalWriteFileSync.call(this, file, ...args); };',
     'const originalOpen = fs.openSync; fs.openSync = function (file, flags, ...args) { if (fs.existsSync(failQueueWrites) && typeof file === "string" && path.resolve(file).startsWith(path.resolve(cloudQueueDirectory) + path.sep) && flags === "wx") { const error = new Error("injected cloud queue write failure"); error.code = "EIO"; throw error; } return originalOpen.call(this, file, flags, ...args); };',
   ].join("\n"));
   const env = {
@@ -291,8 +344,40 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     headers: { cookie, origin: `http://127.0.0.1:${port}`, "x-csrf-token": csrf, "content-type": "application/json", "content-length": 2 },
     body: "{}",
   });
+  const limitedLoginBody = JSON.stringify({ username: "limited", password });
+  const limitedLogin = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(limitedLoginBody) }, body: limitedLoginBody });
+  assert.equal(limitedLogin.status, 200, limitedLogin.body);
+  const limitedCookies = limitedLogin.headers["set-cookie"].map((value) => value.split(";", 1)[0]);
+  const limitedCookie = limitedCookies.join("; ");
+  const limitedCsrf = limitedCookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1];
+  const mutateAsLimited = (url, method) => request(port, url, {
+    method,
+    headers: { cookie: limitedCookie, origin: `http://127.0.0.1:${port}`, "x-csrf-token": limitedCsrf, "content-type": "application/json", "content-length": 2 },
+    body: "{}",
+  });
   const readCount = () => fs.readFileSync(versionReadMarker, "utf8").trim().split(/\r?\n/).filter(Boolean).length;
   const results = [];
+
+  fs.writeFileSync(failApprovalHistorySave, "fail once");
+  const failedReplacementApproval = await mutate(`/approve/${approveSaveFailureName}?folderId=root`, "POST");
+  const replacementPending = JSON.parse(fs.readFileSync(pendingRegistryPath, "utf8"))[`root/${approveSaveFailureName}`];
+  const replacementHistory = JSON.parse(fs.readFileSync(versionHistoryPath, "utf8"))[`root/${approveSaveFailureName}`];
+  assert.equal(failedReplacementApproval.status, 500);
+  assert.equal(fs.readFileSync(path.join(directory, "uploads", approveSaveFailureName), "utf8"), `prior current ${approveSaveFailureName}`);
+  assert.equal(fs.existsSync(path.join(directory, "uploads", `${approveSaveFailureName}.v1`)), false);
+  assert.equal(fs.readFileSync(path.join(directory, "temp", approveSaveFailureName), "utf8"), `pending replacement ${approveSaveFailureName}`);
+  assert.ok(replacementPending, "failed approval preserves pending registry");
+  assert.deepEqual(replacementHistory, initialHistory[`root/${approveSaveFailureName}`]);
+
+  fs.writeFileSync(failApprovalHistorySave, "fail once");
+  const failedInitialApproval = await mutate(`/approve/${approveInitialSaveFailureName}?folderId=root`, "POST");
+  const initialPending = JSON.parse(fs.readFileSync(pendingRegistryPath, "utf8"))[`root/${approveInitialSaveFailureName}`];
+  const historyAfterInitialApproval = JSON.parse(fs.readFileSync(versionHistoryPath, "utf8"));
+  assert.equal(failedInitialApproval.status, 500);
+  assert.equal(fs.existsSync(path.join(directory, "uploads", approveInitialSaveFailureName)), false);
+  assert.equal(fs.readFileSync(path.join(directory, "temp", approveInitialSaveFailureName), "utf8"), `pending replacement ${approveInitialSaveFailureName}`);
+  assert.ok(initialPending, "failed initial approval preserves pending registry");
+  assert.equal(Object.hasOwn(historyAfterInitialApproval, `root/${approveInitialSaveFailureName}`), false);
 
   const revokedDeleteGate = cloud.blockGet(`rootark/uploads/root/${revokedDeleteName}.v1`);
   gates.push(revokedDeleteGate);
@@ -313,13 +398,101 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   revokedDeleteGate.release();
   const restoreResponseBeforeDelete = await restoreWhileDeleteWaits;
   const revokedDeleteResponse = await deleteAfterSessionRevocation;
+  const revokedRestoreHistory = JSON.parse(fs.readFileSync(versionHistoryPath, "utf8"))[`root/${revokedDeleteName}`];
+  const revokedRestoreBytes = fs.readFileSync(path.join(directory, "uploads", revokedDeleteName), "utf8");
   results.push({
-    case: "delete-revalidates-session-after-lifecycle-lock-wait",
-    actual: { restoreStatus: restoreResponseBeforeDelete.status, status: revokedDeleteResponse.status, fileStillExists: fs.existsSync(path.join(directory, "uploads", revokedDeleteName)), trashed: JSON.parse(fs.readFileSync(path.join(dataDir, "trash-items.json"), "utf8")).some((item) => item.fileName === revokedDeleteName) },
-    expected: { restoreStatus: 200, status: 401, fileStillExists: true, trashed: false },
+    case: "version-restore-and-delete-revalidate-session-after-lifecycle-waits",
+    actual: { restoreStatus: restoreResponseBeforeDelete.status, status: revokedDeleteResponse.status, fileStillExists: fs.existsSync(path.join(directory, "uploads", revokedDeleteName)), trashed: JSON.parse(fs.readFileSync(path.join(dataDir, "trash-items.json"), "utf8")).some((item) => item.fileName === revokedDeleteName), restoredBytes: revokedRestoreBytes, currentVersion: revokedRestoreHistory.currentVersion },
+    expected: { restoreStatus: 401, status: 401, fileStillExists: true, trashed: false, restoredBytes: `current v3 ${revokedDeleteName}`, currentVersion: 3 },
   });
   usersWhileDeleteWaits[0].sessionVersion -= 1;
   fs.writeFileSync(usersPath, JSON.stringify(usersWhileDeleteWaits));
+
+  const aclRestoreGate = cloud.blockGet(`rootark/uploads/root/${aclRevokedRestoreName}.v1`);
+  gates.push(aclRestoreGate);
+  const restoreWhileAclRevoked = mutateAsLimited(`/restore/${aclRevokedRestoreName}/v/1?folderId=root`, "POST");
+  await aclRestoreGate.started;
+  const permissionsDuringRestore = JSON.parse(fs.readFileSync(filePermissionsPath, "utf8"));
+  permissionsDuringRestore[`root/${aclRevokedRestoreName}`] = { public: false, owner: "tester", users: {} };
+  fs.writeFileSync(filePermissionsPath, JSON.stringify(permissionsDuringRestore));
+  aclRestoreGate.release();
+  const aclRestoreResponse = await restoreWhileAclRevoked;
+  const aclRestoreHistory = JSON.parse(fs.readFileSync(versionHistoryPath, "utf8"))[`root/${aclRevokedRestoreName}`];
+  results.push({
+    case: "version-restore-rechecks-file-access-after-provider-wait",
+    actual: { status: aclRestoreResponse.status, bytes: fs.readFileSync(path.join(directory, "uploads", aclRevokedRestoreName), "utf8"), currentVersion: aclRestoreHistory.currentVersion },
+    expected: { status: 403, bytes: `current v3 ${aclRevokedRestoreName}`, currentVersion: 3 },
+  });
+  permissionsDuringRestore[`root/${aclRevokedRestoreName}`] = { public: false, owner: null, users: { limited: { read: true, edit: true } } };
+  fs.writeFileSync(filePermissionsPath, JSON.stringify(permissionsDuringRestore));
+
+  fs.writeFileSync(failVersionCopy, "fail once");
+  const failedRestoreResponse = await mutate(`/restore/${failedRestoreName}/v/1?folderId=root`, "POST");
+  const failedRestoreHistory = JSON.parse(fs.readFileSync(versionHistoryPath, "utf8"))[`root/${failedRestoreName}`];
+  const failedRestoreCurrentPath = path.join(directory, "uploads", failedRestoreName);
+  results.push({
+    case: "version-restore-copy-failure-preserves-current-file",
+    actual: {
+      status: failedRestoreResponse.status,
+      currentExists: fs.existsSync(failedRestoreCurrentPath),
+      currentBytes: fs.existsSync(failedRestoreCurrentPath) ? fs.readFileSync(failedRestoreCurrentPath, "utf8") : null,
+      currentVersion: failedRestoreHistory.currentVersion,
+    },
+    expected: { status: 500, currentExists: true, currentBytes: `current v3 ${failedRestoreName}`, currentVersion: 3 },
+  });
+
+  fs.writeFileSync(failVersionHistorySave, "fail once");
+  const failedPruneSaveResponse = await mutate(`/restore/${failedPruneSaveName}/v/1?folderId=root`, "POST");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const failedPruneHistory = JSON.parse(fs.readFileSync(versionHistoryPath, "utf8"))[`root/${failedPruneSaveName}`];
+  const failedPruneCurrentPath = path.join(directory, "uploads", failedPruneSaveName);
+  const failedPruneOldVersionPath = path.join(directory, "uploads", `${failedPruneSaveName}.v1`);
+  const failedPruneCloudKey = `rootark/uploads/root/${failedPruneSaveName}.v1`;
+  results.push({
+    case: "version-restore-save-failure-preserves-pruned-history",
+    actual: {
+      status: failedPruneSaveResponse.status,
+      currentBytes: fs.existsSync(failedPruneCurrentPath) ? fs.readFileSync(failedPruneCurrentPath, "utf8") : null,
+      currentVersion: failedPruneHistory.currentVersion,
+      oldVersionExists: fs.existsSync(failedPruneOldVersionPath),
+      oldCloudVersionExists: objects.has(failedPruneCloudKey),
+      oldVersionDeleteScheduled: cloud.mutationsFor(failedPruneCloudKey).some((mutation) => mutation.method === "DELETE"),
+    },
+    expected: {
+      status: 500,
+      currentBytes: `current v10 ${failedPruneSaveName}`,
+      currentVersion: 10,
+      oldVersionExists: true,
+      oldCloudVersionExists: true,
+      oldVersionDeleteScheduled: false,
+    },
+  });
+
+  for (const [name, route] of [[approveRevokedName, "approve"], [rejectRevokedName, "reject"]]) {
+    fs.writeFileSync(evictPendingConfig, JSON.stringify({ path: path.join(directory, "temp", name), count: 0 }));
+    const cacheGate = cloud.blockGet(`rootark/temp/root/${name}`);
+    gates.push(cacheGate);
+    const mutation = mutate(`/${route}/${name}?folderId=root`, "POST");
+    await cacheGate.started;
+    const usersDuringPendingMutation = JSON.parse(fs.readFileSync(usersPath, "utf8"));
+    usersDuringPendingMutation[0].sessionVersion += 1;
+    fs.writeFileSync(usersPath, JSON.stringify(usersDuringPendingMutation));
+    cacheGate.release();
+    const response = await mutation;
+    const pendingAfter = JSON.parse(fs.readFileSync(pendingRegistryPath, "utf8"));
+    results.push({
+      case: `${route}-rechecks-session-after-pending-cache-recovery`,
+      actual: {
+        status: response.status,
+        pendingRegistered: Boolean(pendingAfter[`root/${name}`]),
+        tempExists: fs.existsSync(path.join(directory, "temp", name)),
+        promoted: fs.existsSync(path.join(directory, "uploads", name)),
+      },
+      expected: { status: 401, pendingRegistered: true, tempExists: true, promoted: false },
+    });
+    usersDuringPendingMutation[0].sessionVersion -= 1;
+    fs.writeFileSync(usersPath, JSON.stringify(usersDuringPendingMutation));
+  }
 
   const restoreGate = cloud.blockGet(`rootark/uploads/root/${restoreName}.v1`);
   gates.push(restoreGate);
