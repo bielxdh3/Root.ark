@@ -158,12 +158,13 @@ test("remote pending state persists through SQLite reopen", () => {
     'const id = "44444444-4444-4444-8444-444444444444"; const rel = path.join("files", id, "file.txt");',
     'const target = path.join(process.cwd(), "data", "trash", rel); fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, "x");',
     'service.queueRemoteDeletion({ item: { id, itemType: "file", originalFolderId: "root", originalFileName: "file.txt", trashPath: rel, metadata: {}, restoreMetadata: { versions: { versions: [] } }, status: "trashed" }, deletedBy: "tester", loaders: {} });',
-    'console.log(JSON.stringify(repo.getTrashItem(id)));',
+    'console.log(JSON.stringify({ item: repo.getTrashItem(id), hidden: repo.isFileTrashed("root", "file.txt") }));',
   ].join(" ");
   const result = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /"status":"remote_delete_pending"/);
   assert.match(result.stdout, /"state":"pending"/);
+  assert.match(result.stdout, /"hidden":true/);
   fs.rmSync(sqliteRuntime, { recursive: true, force: true });
 });
 

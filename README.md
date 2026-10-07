@@ -69,14 +69,17 @@ The repository currently contains working foundations for:
 - [x] bounded provider retry/cancellation, idempotency, ciphertext-only attestation, and secret-safe observability helpers;
 - [x] automated syntax, test, dependency, and artifact validation.
 
-Phase 15 adds a local release-gate runner and repairs the release-candidate
-lockfile to the reviewed `brace-expansion` 5.0.9 integrity. The current local
-verdict is `RELEASE_GATE_BLOCKED_ENVIRONMENT`: the controlled pre-commit gate
-recorded 13 passed, 0 failed, and 1 expected clean-worktree block. Provider,
-browser, production, remote-CI, publication, and Phase 16 review gates remain
-separate.
+### Current exact-SHA CI snapshot — 2026-10-07
 
-Phase 16 final-review evidence is recorded in [the Phase 16 security review](docs/security/phase-16-final-review.md): 66/66 cross-phase tests and 116/116 syntax checks passed, with separate realtime 4/4 and upload 12/12 boundary runs. The canonical full `npm test` remains blocked by the unavailable `better-sqlite3` native binding in the disposable install; it is not claimed as passed. Remote CI, browser, provider, live-production/TLS, owner, Draft PR, and release authorization gates remain external or unavailable, with release authorization `NOT_AUTHORIZED`.
+On `Root/main` SHA `964f820417baf44f059a04e5363a2a172dccdc7a`, the push-triggered Security Regression workflow passed Ubuntu Node 22 full validation and Windows Node 22 syntax/tests. CodeQL and the default-branch dependency-review check also passed on this exact SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37549800190), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37549800373), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37549800109)). The PR-only dependency-review job was skipped on the push. This is exact-commit CI evidence; it does not establish browser acceptance, provider interoperability, production deployment safety, or release authorization.
+
+### Historical local release-gate evidence
+
+Phase 15 introduced a local release-gate runner and repaired the release-candidate lockfile to the reviewed `brace-expansion` 5.0.9 integrity. Its recorded candidate-local verdict was `RELEASE_GATE_BLOCKED_ENVIRONMENT`: 13 passed, 0 failed, and 1 expected clean-worktree block. That earlier local result is not the current exact-`Root/main` validation result.
+
+Phase 16 evidence is recorded in [the Phase 16 security review](docs/security/phase-16-final-review.md): 66/66 cross-phase tests and 116/116 syntax checks passed, with separate realtime 4/4 and upload 12/12 boundary runs. The review's then-current disposable-install failure to load the `better-sqlite3` native binding, and its pending remote CI evidence, are historical; the exact-SHA CI evidence above supersedes only the remote-CI status. Browser, provider, live-production/TLS, owner, and release authorization remain separate gates, with release authorization `NOT_AUTHORIZED`.
+
+The historical 2026-10-06 GitHub snapshot at `1955eab3d05f72632396eff62ef96d39eedd634b` is retained in [the issue ledger](docs/issue-ledger.md); it is not the current default-branch SHA.
 
 > [!IMPORTANT]
 > The approved long-term direction includes client-side zero-knowledge encryption. The current implementation predates that architecture and must not be described as zero-knowledge or treated as the final security model.

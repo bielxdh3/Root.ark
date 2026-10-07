@@ -147,10 +147,22 @@ function saveTrashItem(item) {
 }
 
 function isFileTrashed(folderId, fileName) {
-  return listTrashItems().some((item) => (
+  const name = path.basename(fileName || "");
+  if (!name) return false;
+  const folder = folderId || "root";
+  if (isDbEnabled() && hasTrashTable()) {
+    return Boolean(getDb().prepare(`
+      SELECT 1 FROM trash_items
+      WHERE item_type = ? AND status IN (?, ?) AND original_folder_id = ? AND original_file_name = ?
+      LIMIT 1
+    `).get("file", "trashed", "remote_delete_pending", folder, name));
+  }
+
+  return loadJsonItems().some((item) => (
     item.itemType === "file" &&
-    item.originalFolderId === (folderId || "root") &&
-    item.originalFileName === path.basename(fileName || "")
+    ["trashed", "remote_delete_pending"].includes(item.status) &&
+    item.originalFolderId === folder &&
+    item.originalFileName === name
   ));
 }
 

@@ -1,19 +1,19 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Last branch reconciliation: 2026-10-01
+Last branch reconciliation: 2026-10-07
 
 Repository: `bielxdh3/root.ark`
 
-Current default branch verified: `Root/main` (GitHub repository settings; live branch checked 2026-10-01).
+Current-state source: the live issue/PR snapshot in [docs/issue-ledger.md](issue-ledger.md), queried against GitHub on 2026-10-07 at `Root/main` SHA `964f820417baf44f059a04e5363a2a172dccdc7a`. That exact SHA passed push-triggered Security Regression, CodeQL, and Dependency Review. This plan tree retains dated phase and roadmap evidence; consult the linked ledger for current GitHub state and the README for exact run links.
 
-Current canonical baseline HEAD verified at reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`, 2026-10-01). This is the evidence baseline for the dated live-state section below, not a claim about a later merge commit.
+Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
 Historical reconstruction baseline retained for provenance: `4062f4c67bfda9d144aceb6dbbed539b8a917e4a` (2026-07-25).
 
-## Live GitHub reconciliation — 2026-10-01
+## Historical live GitHub reconciliation — 2026-10-01
 
-This dated section supersedes older statements about the current branch, issue closure, and open PR state. Historical phase reports below retain their original dates and evidence boundaries.
+This dated section superseded older statements at the time it was written. Its branch, issue, and PR states are historical; use the current snapshot linked above for live state. Historical phase reports below retain their original dates and evidence boundaries.
 
 - The live default branch was `Root/main` at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`. At that snapshot GitHub had seven open issues (#63–68 and #94) and one open PR (#95).
 - Issue #83 is closed. Its sensitive-name policy remains active: `.env`, credential/service-account names, and private-key/certificate extensions remain excluded from backup content and quarantine payload references. PRs #86 and #90 contain its completion evidence.
@@ -26,9 +26,9 @@ This dated section supersedes older statements about the current branch, issue c
 - Issue #67 is approved but not complete: existing backups and sync revisions are recovery prerequisites, not a ransomware shield. Burst detection, a recoverable pause/review barrier, protected per-object recovery history, and authorized restore are absent.
 - Issue #68 is approved but not complete: existing public links are single-file bearer links with expiry/limits, not operation-scoped capabilities. Protected-link delivery remains gated on least-privilege capability enforcement and owner choices for link UX, expiry, and recipient recovery.
 
-## Reconciliation work after the live baseline — 2026-10-01
+## Historical reconciliation work after the live baseline — 2026-10-01
 
-This addendum records the published work after the live GitHub baseline above. PR #97 remains open and unmerged; PR #98 contains this documentation reconciliation. Neither changes issue state or marks an issue complete.
+This addendum records published work after the 2026-10-01 GitHub baseline above. PR #98 merged at `1df5e4640d4aea7dc700f2088059f489c2e51af0`; PR and issue state recorded below is historical. Neither PR #97 nor PR #98 marked an issue complete.
 
 - Issue #64 has a native-client architecture and threat-model document only. No Android application, Gradle project, build, or CI exists.
 - Issue #65 has a Zero-Knowledge migration contract and a read-only inventory prototype limited to explicitly selected fixture files under an operating-system temporary directory. The prototype reports recognized legacy encryption modes using run-scoped opaque references; it does not inspect live application storage or establish migration readiness. Its four focused tests pass. Runtime migration, authorization, recovery authority, mixed-mode window, backup/restore acceptance, and the remaining owner decisions are still open.
@@ -54,23 +54,26 @@ A feature is not `[DONE]` merely because files, routes, UI, or documentation exi
 ## Source-of-truth order
 
 1. Current code and tests on the actual branch.
-2. This plan tree for phase order and state.
-3. Dedicated security, architecture, operations, and validation documents.
-4. GitHub issues for executable scope.
-5. Historical chat context only as input, never as proof.
+2. `docs/issue-ledger.md` for the latest verified live GitHub issue, PR, and default-branch snapshot.
+3. This plan tree for phase order and historical acceptance evidence.
+4. Dedicated security, architecture, operations, and validation documents.
+5. GitHub issues for executable scope.
+6. Historical chat context only as input, never as proof.
 
-Issue reconciliation ledger: `docs/issue-ledger.md` (locally reconciled 2026-08-13; remote issue state was not mutated). The canonical Phase 11 Issue #6 reconciliation is `docs/roadmap/phase-11-backlog-reconciliation.md` and records `PHASE_11_BACKLOG_RECONCILED` at the accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
+The current issue reconciliation snapshot is `docs/issue-ledger.md` (verified against GitHub 2026-10-07). The canonical Phase 11 Issue #6 reconciliation remains historical evidence: `docs/roadmap/phase-11-backlog-reconciliation.md` records `PHASE_11_BACKLOG_RECONCILED` at the accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
 
 Master Phase 0-16 ledger and independent local blocker taxonomy: `docs/issue-ledger.md`. The governing continuation supplies the original meanings for all phases; local statuses and evidence are reconciled there without converting design or historical evidence into acceptance.
 
-## 0. Current product snapshot
+## 0. Historical product snapshot
+
+This product inventory was reconstructed before the 2026-10-07 live-state snapshot above. Treat its implementation labels as dated evidence rather than current release acceptance.
 
 ### Application identity
 
 - `[IMPLEMENTED-UNVERIFIED]` Independent Node.js/Express file-management application currently exists in this repository.
 - `[DECIDED]` D-001 keeps this repository actively developed as Root.ark while allowing only a future, explicitly designed and approved migration or selective reuse into BielOS. Track remaining relationship consequences in issue #10.
 - `[DECISION REQUIRED]` Confirm final spelling and branding: `Root.ark`, `root.ark`, `root.arc`, or another approved name. Track in issue #4.
-- `[DONE]` Root/main is the verified canonical/default branch: GitHub reports `Root/main`, and `origin/HEAD` plus `refs/heads/Root/main` resolve to `28747c6ebdac873650e2d5a3c6193824e7cc9985` (verified 2026-08-13). The `codex/folders-acl` references remain historical provenance; CI now targets `Root/main`, with no history rewrite or remote mutation performed. Issue #14 is locally closure-ready; remote issue closure is not claimed here.
+- `[RECONCILED — historical 2026-08-13]` At that local reconciliation, GitHub reported `Root/main` and `origin/HEAD` resolved to `28747c6ebdac873650e2d5a3c6193824e7cc9985`. That SHA is historical; the current default-branch SHA is recorded in `docs/issue-ledger.md`. The `codex/folders-acl` references remain historical provenance. Issue #14 was locally closure-ready at that time; remote issue closure was not claimed.
 
 ### Verified code-level capabilities
 

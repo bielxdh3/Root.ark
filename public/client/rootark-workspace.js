@@ -186,10 +186,17 @@
 
   function pendingSection() {
     if (!hasPermission("listPending") && !hasPermission("upload")) return "";
-    const cards = state.pending.map((file) => '<article class="pending-row"><div class="file-cell"><span class="file-type-mark" aria-hidden="true">↑</span><span><strong>' + esc(file.name) + '</strong><small>' + esc(ownerOf(file)) + ' · ' + esc(ui.formatBytes(file.size)) + '</small></span></div><div class="row-actions">' +
-      (isEncrypted(file) ? "" : actionButton("preview-pending", "Pré-visualizar", { name: file.name, folder: fileFolderId(file) }, "button-quiet")) +
-      (hasPermission("approve") ? actionButton("approve-file", "Aprovar", { name: file.name, folder: fileFolderId(file) }, "button-primary") + actionButton("reject-file", "Rejeitar", { name: file.name, folder: fileFolderId(file) }, "button-quiet") : "") +
-      "</div></article>").join("");
+    const cards = state.pending.map((file) => {
+      const recoveryRequired = file.restoreOrphan === true && file.availability === "recovery_required";
+      return '<article class="pending-row"><div class="file-cell"><span class="file-type-mark" aria-hidden="true">↑</span><span><strong>' + esc(file.name) + '</strong>' +
+        (recoveryRequired ? '<span class="badge badge-warning">Recuperação necessária</span>' : "") +
+        '<small>' + esc(ownerOf(file)) + ' · ' + esc(ui.formatBytes(file.size)) + '</small>' +
+        (recoveryRequired ? '<small class="pending-recovery-note">Arquivo original indisponível. Solicite um novo envio.</small>' : "") +
+        '</span></div><div class="row-actions">' +
+        (!recoveryRequired && !isEncrypted(file) ? actionButton("preview-pending", "Pré-visualizar", { name: file.name, folder: fileFolderId(file) }, "button-quiet") : "") +
+        (hasPermission("approve") ? (recoveryRequired ? '<button type="button" class="button button-primary button-small" disabled>Aprovação indisponível</button>' : actionButton("approve-file", "Aprovar", { name: file.name, folder: fileFolderId(file) }, "button-primary")) + actionButton("reject-file", "Rejeitar", { name: file.name, folder: fileFolderId(file) }, "button-quiet") : "") +
+        "</div></article>";
+    }).join("");
     return '<section class="panel"><div class="panel-heading"><div><p class="eyebrow">REVISÃO</p><h2>Aguardando aprovação</h2></div><span class="count-pill">' + state.pending.length + '</span></div>' + (cards || '<p class="empty-inline">Nenhum envio aguardando aprovação.</p>') + '</section>';
   }
 
@@ -802,7 +809,10 @@
       });
       saveBlob(blob, metadata.originalFilename || name);
       ui.toast("Arquivo descriptografado para esta transferência.", "success");
-    } catch (error) { reportError(error); }
+    } catch (error) {
+      if (permissionError(error)) reportError(error);
+      else ui.toast(error && error.message ? error.message : "Não foi possível descriptografar o arquivo.", "error");
+    }
     finally { password = ""; }
   }
 

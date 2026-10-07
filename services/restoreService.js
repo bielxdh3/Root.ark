@@ -8,6 +8,7 @@ const { resolveRuntimePath } = require("../src/runtime-paths");
 const backupRepository = require("../repositories/backupRepository");
 const backupService = require("./backupService");
 const restorePreimage = require("./restorePreimage");
+const restoreProviderOrphans = require("./restoreProviderOrphans");
 const { attestCiphertextOnlyArchive } = require("../src/services/deploymentResilience");
 const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, readQuarantineRegularFile, validateQuarantinePayloads } = require("../src/quarantine-paths");
 
@@ -165,7 +166,7 @@ function wholePreimagePlan(extractedRoot, quarantinePlan) {
   domains.push("data-files");
   if (pathExists(path.join(extractedRoot, "uploads"))) domains.push("uploads-tree");
   if (isDbEnabled()) domains.push("database-files");
-  return { domains, dataFiles: restorableDataNames(extractedRoot) };
+  return { domains, dataFiles: [...new Set([...restorableDataNames(extractedRoot), path.basename(restoreProviderOrphans.POLICY_PATH)])].sort() };
 }
 
 function syncPreimageDirectories(root) {
@@ -513,6 +514,21 @@ function syncEntries(manifest) {
     .filter(Boolean);
 }
 
+function archivedProviderObjects(manifest) {
+  return new Set((manifest?.included_files || [])
+    .map((entry) => String(entry.path || "").replace(/\\/g, "/"))
+    .filter((entryPath) => /^(uploads|temp)\//.test(entryPath))
+    .map((entryPath) => {
+      const [area, ...parts] = entryPath.split("/");
+      const name = parts.pop();
+      const folderId = parts.join("/") || "root";
+      return name && folderId && !folderId.includes("/") && folderId !== "." && folderId !== ".."
+        ? `${area}\0${folderId}\0${name}`
+        : null;
+    })
+    .filter(Boolean));
+}
+
 function createRestoreSync(manifest, clock) {
   const queuedAt = syncNow(clock);
   const entries = syncEntries(manifest);
@@ -602,7 +618,7 @@ function cancelRestoreSync(backupId, reason = "cancelled", { clock } = {}) {
   return backupRepository.getBackup(backupId) || backup;
 }
 
-async function processRestoreSync({ backupId, clock, maxAttempts = 5, uploader, leaseMs = 60 * 1000, workerId } = {}) {
+async function processRestoreSync({ backupId, clock, maxAttempts = 5, uploader, leaseMs = 60 * 1000, workerId, runFileLifecycleMutation } = {}) {
   const provider = uploader || cloudStorage;
   let latest = backupRepository.getBackup(backupId);
   if (!latest || !latest.metadata?.restoreSync || !provider?.enabled?.()) return latest;
@@ -634,39 +650,49 @@ async function processRestoreSync({ backupId, clock, maxAttempts = 5, uploader, 
     const lease = claimSyncEntry(backupId, candidate.entryId, { now, leaseMs, workerId, providerIdentity });
     if (!lease) continue;
     try {
-      const localPath = resolveRuntimePath(lease.entry.path);
-      if (!fs.existsSync(localPath) || !fs.statSync(localPath).isFile()) throw Object.assign(new Error("restore source unavailable"), { code: "source_unavailable" });
-      let entryForUpload = lease.entry;
-      if (providerIdentity === "gdrive") {
-        if (typeof provider.resolveUploadId !== "function") {
-          throw Object.assign(new Error("Google Drive adapter cannot reserve an idempotent restore target"), { code: "configuration" });
+      const reconcileObject = async () => {
+        const localPath = resolveRuntimePath(lease.entry.path);
+        if (!fs.existsSync(localPath) || !fs.statSync(localPath).isFile()) throw Object.assign(new Error("restore source unavailable"), { code: "source_unavailable" });
+        let entryForUpload = lease.entry;
+        if (providerIdentity === "gdrive") {
+          if (typeof provider.resolveUploadId !== "function") {
+            throw Object.assign(new Error("Google Drive adapter cannot reserve an idempotent restore target"), { code: "configuration" });
+          }
+          let providerFileId = String(entryForUpload.providerFileId || "").trim();
+          if (!providerFileId) {
+            providerFileId = String(await provider.resolveUploadId(entryForUpload.folderId, entryForUpload.name, entryForUpload.area) || "").trim();
+            if (!providerFileId) throw Object.assign(new Error("Google Drive did not provide a stable restore target"), { code: "configuration" });
+            const beforePin = backupRepository.getBackup(backupId);
+            const currentEntry = beforePin?.metadata?.restoreSync?.entries?.find((value) => value.entryId === lease.entry.entryId);
+            if (!currentEntry || currentEntry.leaseToken !== lease.token) return false;
+            const pinned = backupRepository.mutateRestoreSyncEntry({
+              backupId,
+              operationId: beforePin.metadata.restoreSync.operationId,
+              entryId: lease.entry.entryId,
+              expectedState: "in_progress",
+              expectedLeaseToken: lease.token,
+              expectedRevision: Number(beforePin.metadata.restoreSync.revision) || 0,
+              mutate: (latestEntry) => ({
+                entry: { ...latestEntry, providerFileId },
+                details: {},
+                at: syncNow(clock),
+              }),
+            });
+            entryForUpload = pinned.metadata.restoreSync.entries.find((value) => value.entryId === lease.entry.entryId);
+            if (!entryForUpload || entryForUpload.leaseToken !== lease.token || entryForUpload.providerFileId !== providerFileId) return false;
+          }
         }
-        let providerFileId = String(entryForUpload.providerFileId || "").trim();
-        if (!providerFileId) {
-          providerFileId = String(await provider.resolveUploadId(entryForUpload.folderId, entryForUpload.name, entryForUpload.area) || "").trim();
-          if (!providerFileId) throw Object.assign(new Error("Google Drive did not provide a stable restore target"), { code: "configuration" });
-          const beforePin = backupRepository.getBackup(backupId);
-          const currentEntry = beforePin?.metadata?.restoreSync?.entries?.find((value) => value.entryId === lease.entry.entryId);
-          if (!currentEntry || currentEntry.leaseToken !== lease.token) continue;
-          const pinned = backupRepository.mutateRestoreSyncEntry({
-            backupId,
-            operationId: beforePin.metadata.restoreSync.operationId,
-            entryId: lease.entry.entryId,
-            expectedState: "in_progress",
-            expectedLeaseToken: lease.token,
-            expectedRevision: Number(beforePin.metadata.restoreSync.revision) || 0,
-            mutate: (latestEntry) => ({
-              entry: { ...latestEntry, providerFileId },
-              details: {},
-              at: syncNow(clock),
-            }),
-          });
-          entryForUpload = pinned.metadata.restoreSync.entries.find((value) => value.entryId === lease.entry.entryId);
-          if (!entryForUpload || entryForUpload.leaseToken !== lease.token || entryForUpload.providerFileId !== providerFileId) continue;
-        }
+        await provider.upload(localPath, entryForUpload.folderId, entryForUpload.name, entryForUpload.area,
+          providerIdentity === "gdrive" ? { providerFileId: entryForUpload.providerFileId } : undefined);
+        return true;
+      };
+      const runMutation = typeof runFileLifecycleMutation === "function"
+        ? runFileLifecycleMutation
+        : (_folderId, _fileName, work) => work();
+      if (await runMutation(lease.entry.folderId, lease.entry.name, reconcileObject) === false) {
+        latest = backupRepository.getBackup(backupId) || latest;
+        continue;
       }
-      await provider.upload(localPath, entryForUpload.folderId, entryForUpload.name, entryForUpload.area,
-        providerIdentity === "gdrive" ? { providerFileId: entryForUpload.providerFileId } : undefined);
       const current = backupRepository.getBackup(backupId);
       const entry = current?.metadata?.restoreSync?.entries?.find((value) => value.entryId === lease.entry.entryId);
       if (!entry || entry.leaseToken !== lease.token) continue;
@@ -976,7 +1002,7 @@ function restoreDataFiles(extractedRoot, onFile = null) {
   fs.mkdirSync(resolveRuntimePath("data"), { recursive: true });
   for (const name of fs.readdirSync(extractedData)) {
     const foldedName = name.toLowerCase();
-    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
+    if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === path.basename(restoreProviderOrphans.POLICY_PATH) || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
     const sourcePath = path.join(extractedData, name);
     const destinationPath = resolveRuntimePath("data", name);
     if (fs.statSync(sourcePath).isFile()) {
@@ -1732,6 +1758,15 @@ async function restoreBackup(id, options = {}) {
     const hasQuarantineState = validateQuarantineArchive(restoreDir, manifest);
     const quarantinePlan = hasQuarantineState ? prepareQuarantineRestore(restoreDir) : null;
     const preimagePlan = wholePreimagePlan(restoreDir, quarantinePlan);
+    let providerOrphans = null;
+    if (cloudStorage?.enabled()) {
+      if (typeof cloudStorage.inventory !== "function") throw new Error("Cloud provider inventory is required before restore can protect unarchived objects");
+      const inventory = await cloudStorage.inventory();
+      const archivedObjects = archivedProviderObjects(manifest);
+      providerOrphans = restoreProviderOrphans.normalizeObjects(inventory
+        .filter((entry) => ["uploads", "temp"].includes(entry.area) && !archivedObjects.has(`${entry.area}\0${entry.folderId}\0${entry.name}`))
+        .map(({ area, folderId, name }) => ({ area, folderId, name })));
+    }
     const cloudSync = cloudStorage?.enabled() && manifest.cloud_complete
       ? createRestoreSync(manifest)
       : { state: "not_required" };
@@ -1775,6 +1810,11 @@ async function restoreBackup(id, options = {}) {
     });
     coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "sqlite" });
     if (restoredDatabase) injectFailure("restore.sqlite.committed");
+    if (providerOrphans !== null) {
+      injectFailure("restore.provider-orphans.before-persist");
+      restoreProviderOrphans.write(providerOrphans);
+      injectFailure("restore.provider-orphans.persisted");
+    }
     const restoredBackup = coordinator.selectedBackup;
     backupRepository.saveBackup(restoredBackup);
     if (cloudSync.state === "pending") {

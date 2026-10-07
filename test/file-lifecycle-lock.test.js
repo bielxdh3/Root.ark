@@ -1,0 +1,128 @@
+const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const test = require("node:test");
+const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
+
+test("file lifecycle lock serializes the same file and permits reentrant work", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 1000, pollMs: 5 });
+  let signalFirstStarted;
+  let releaseFirst;
+  const firstStarted = new Promise((resolve) => { signalFirstStarted = resolve; });
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  let secondStarted = false;
+
+  const first = lock.run("root", "same.txt", async () => {
+    signalFirstStarted();
+    await firstGate;
+    return lock.run("root", "same.txt", async () => "nested work");
+  });
+  await firstStarted;
+  const second = lock.run("root", "same.txt", async () => { secondStarted = true; return "second work"; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(secondStarted, false);
+  releaseFirst();
+  assert.equal(await first, "nested work");
+  assert.equal(await second, "second work");
+  assert.equal(secondStarted, true);
+});
+
+test("file lifecycle lock fails closed on an existing owner and never steals it", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-stale-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 20, pollMs: 5 });
+  const identityHash = crypto.createHash("sha256").update("root\0stale.txt").digest("hex");
+  const lockPath = path.join(directory, `${identityHash}.lock`);
+  fs.writeFileSync(lockPath, JSON.stringify({ token: "preserved-owner", pid: 999999, hostname: "unknown", createdAt: new Date(0).toISOString() }), { flag: "wx" });
+
+  await assert.rejects(lock.run("root", "stale.txt", async () => assert.fail("stale lock must not enter protected work")), { code: "FILE_LIFECYCLE_LOCK_TIMEOUT" });
+  assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).token, "preserved-owner", "potentially stale owner is preserved for operator recovery");
+});
+
+test("file lifecycle lock reclaims only a provably dead same-host owner", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-dead-owner-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 40, pollMs: 5 });
+  const identityHash = crypto.createHash("sha256").update("root\0dead-owner.txt").digest("hex");
+  const lockPath = path.join(directory, `${identityHash}.lock`);
+  fs.writeFileSync(lockPath, JSON.stringify({ token: "dead-owner", pid: 999999, hostname: require("node:os").hostname(), createdAt: new Date(0).toISOString() }), { flag: "wx" });
+
+  assert.equal(await lock.run("root", "dead-owner.txt", async () => "reclaimed"), "reclaimed");
+  assert.equal(fs.existsSync(lockPath), false);
+});
+
+test("file lifecycle lock release does not remove a replacement owner lease", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-owner-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 1000 });
+  const identityHash = crypto.createHash("sha256").update("root\0owner.txt").digest("hex");
+  const lockPath = path.join(directory, `${identityHash}.lock`);
+
+  await lock.run("root", "owner.txt", async () => {
+    fs.writeFileSync(lockPath, JSON.stringify({ token: "replacement-owner" }));
+  });
+  assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).token, "replacement-owner");
+});
+
+test("folder lifecycle lock serializes every trash action for the same stable folder id", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-folder-lock-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 1000, pollMs: 5 });
+  let releaseRestore;
+  let restoreStarted;
+  const restoreGate = new Promise((resolve) => { releaseRestore = resolve; });
+  const restoreEntered = new Promise((resolve) => { restoreStarted = resolve; });
+  const restore = lock.runFolder("folder-123", async () => {
+    restoreStarted();
+    await restoreGate;
+    return "restored";
+  });
+  await restoreEntered;
+  let deleteStarted = false;
+  let fileStarted = false;
+  const deletion = lock.runFolder("folder-123", async () => { deleteStarted = true; return "deleted"; });
+  const fileOperation = lock.run("folder-123", "during-restore.txt", async () => { fileStarted = true; return "file operation"; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(deleteStarted, false, "a second process-level trash action for the same folder must wait for restore");
+  assert.equal(fileStarted, false, "file cache and trash operations in a folder must wait while the folder itself changes lifecycle state");
+  releaseRestore();
+  assert.equal(await restore, "restored");
+  assert.equal(await deletion, "deleted");
+  assert.equal(await fileOperation, "file operation");
+  assert.equal(deleteStarted, true);
+  assert.equal(fileStarted, true);
+});
+
+test("cross-folder move locks both folders in a stable order", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-move-lock-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 1000, pollMs: 5 });
+  let releaseDestination;
+  let destinationStarted;
+  const destinationGate = new Promise((resolve) => { releaseDestination = resolve; });
+  const destinationEntered = new Promise((resolve) => { destinationStarted = resolve; });
+  const deletion = lock.runFolder("destination", async () => {
+    destinationStarted();
+    await destinationGate;
+  });
+  await destinationEntered;
+  let moveStarted = false;
+  const move = lock.runAcrossFolders(["source", "destination"], "source", "moving.txt", async () => {
+    moveStarted = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(moveStarted, false, "a move must wait for lifecycle changes in its destination folder");
+  releaseDestination();
+  await deletion;
+  await move;
+  assert.equal(moveStarted, true);
+
+  await Promise.all([
+    lock.runAcrossFolders(["z-folder", "a-folder"], "z-folder", "left.txt", async () => "left"),
+    lock.runAcrossFolders(["a-folder", "z-folder"], "a-folder", "right.txt", async () => "right"),
+  ]);
+});

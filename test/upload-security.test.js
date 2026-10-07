@@ -93,14 +93,14 @@ function isContained(parent, candidate) {
   return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
 }
 
-async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true } = {}) {
+async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, uploaderPermissions = {} } = {}) {
   const password = crypto.randomBytes(24).toString("base64url");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-upload-safety-"));
   const quarantineDir = path.join(dir, "quarantine");
   fs.mkdirSync(path.join(dir, "data"));
   fs.cpSync(PUBLIC, path.join(dir, "public"), { recursive: true });
   fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([
-    { username: "uploader", password: bcrypt.hashSync(password, 10), role: "user", permissions: { upload: true, listFiles: true }, sessionVersion: 0 },
+    { username: "uploader", password: bcrypt.hashSync(password, 10), role: "user", permissions: { upload: true, listFiles: true, ...uploaderPermissions }, sessionVersion: 0 },
     { username: "viewer", password: bcrypt.hashSync(password, 10), role: "user", permissions: {}, sessionVersion: 0 },
   ]));
   fs.writeFileSync(path.join(dir, "data", "folders.json"), JSON.stringify([
@@ -298,6 +298,29 @@ test("authorized harmless multipart upload enters the selected folder pending ar
   assert.deepEqual(fs.readFileSync(path.join(harness.dir, "temp", FOLDER_ID, "notes.txt")), bytes);
   assert.deepEqual(quarantine(harness.dir).items, []);
   assert.deepEqual(fs.existsSync(harness.quarantineDir) ? fs.readdirSync(harness.quarantineDir) : [], []);
+});
+
+test("wrong encrypted-file password stays an input error and records failed decrypt only", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t, { uploaderPermissions: { approve: true } });
+  const session = await login(harness.port, "uploader", harness.password);
+  const correctPassword = "correct-test-file-password";
+  const payload = multipartParts([
+    { field: "encryptionLevel", bytes: "password" },
+    { field: "password", bytes: correctPassword },
+    { filename: "password-check.txt", bytes: Buffer.from("disposable encrypted fixture") },
+  ]);
+  const uploaded = await uploadPayload(harness.port, session, payload);
+  assert.equal(uploaded.status, 200, uploaded.body);
+  const approved = await postJson(harness.port, session, `/approve/password-check.txt?folderId=${FOLDER_ID}`, {});
+  assert.equal(approved.status, 200, approved.body);
+
+  const wrongPassword = await postJson(harness.port, session, `/encrypted-download/password-check.txt?folderId=${FOLDER_ID}`, { password: "wrong-test-file-password" });
+  assert.equal(wrongPassword.status, 422, wrongPassword.body);
+  const stillAuthenticated = await request(harness.port, "/auth/me", { headers: { cookie: session.cookie } });
+  assert.equal(stillAuthenticated.status, 200, stillAuthenticated.body);
+  const audit = JSON.parse(fs.readFileSync(path.join(harness.dir, "data", "audit-logs.json"), "utf8"));
+  assert.ok(audit.logs.some((entry) => entry.eventType === "file.decrypt.failed" && entry.result === "failure"));
+  assert.equal(audit.logs.some((entry) => entry.eventType === "file.decrypt" && entry.result === "success"), false);
 });
 
 test("traversal-style multipart filenames stay contained in the selected folder", { timeout: 30_000 }, async (t) => {

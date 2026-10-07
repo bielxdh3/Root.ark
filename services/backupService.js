@@ -85,6 +85,7 @@ function isSensitivePath(relativePath) {
   if (base.endsWith(".key") || base.endsWith(".pem") || base.endsWith(".p12")) return true;
   if (base === "server-master.key") return true;
   if (base === ".rootark-quarantine-restore-journal.json" || base.startsWith(".rootark-quarantine-restore-metadata-")) return true;
+  if (base === ".rootark-restore-provider-orphans.json") return true;
   if (base.startsWith(".rootark-restore-coordinator.json")) return true;
   if (normalized.toLowerCase().startsWith("data/.rootark-active-requests/")) return true;
   if (normalized.toLowerCase().startsWith("data/.rootark-restore-restart-acks/")) return true;

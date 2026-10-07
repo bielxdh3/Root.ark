@@ -147,7 +147,7 @@ test("pre-image copy and tree hashing reject FIFO sources without blocking", (t)
   } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
 });
 
-function runFixture(body) {
+function runFixture(body, envOverrides = {}) {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-boundary-runtime-"));
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-boundary-quarantine-"));
   const script = `
@@ -175,6 +175,7 @@ function runFixture(body) {
     ROOTARK_RESTORE_INSTANCE_COUNT: "1",
     ROOTARK_INSTANCE_ID: "fixture-single",
     UPLOAD_QUARANTINE_DIR: quarantineDir,
+    ...envOverrides,
   };
   try {
     const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
@@ -264,6 +265,7 @@ test("valid restore cleanup preserves unrelated restore temp siblings", () => {
 test("backup archives exclude whole-restore coordinator files", () => {
   runFixture(`
     write(path.join(dataDir, ".rootark-restore-coordinator.json"), JSON.stringify({ version: 1, phase: "prepared", backupId: "fixture" }));
+    write(path.join(dataDir, ".rootark-restore-provider-orphans.json"), JSON.stringify({ version: 1, objects: [{ area: "uploads", folderId: "root", name: "private-name.txt" }] }));
     write(path.join(dataDir, ".rootark-active-requests", "active.json"), JSON.stringify({ pid: 1 }));
     write(path.join(dataDir, ".rootark-restore-restart-acks", "transaction", "instance.json"), JSON.stringify({ transactionId: "fixture" }));
     (async () => {
@@ -271,6 +273,7 @@ test("backup archives exclude whole-restore coordinator files", () => {
       const { backup, archivePath } = backupService.getBackupOrThrow(created.id);
       const { zip } = await restoreService.validateBackupArchive(backup, archivePath);
       assert.equal(zip.files.some((entry) => entry.path.toLowerCase().startsWith("data/.rootark-restore-coordinator")), false);
+      assert.equal(zip.files.some((entry) => entry.path.toLowerCase() === "data/.rootark-restore-provider-orphans.json"), false, "restore-derived provider names are not copied into future backup archives");
       assert.equal(zip.files.some((entry) => entry.path.toLowerCase().startsWith("data/.rootark-active-requests/")), false);
       assert.equal(zip.files.some((entry) => entry.path.toLowerCase().startsWith("data/.rootark-restore-restart-acks/")), false);
       console.log(JSON.stringify({ ok: true }));
@@ -1401,6 +1404,158 @@ test("provider reconciliation queued before local commit is removed when restore
       assert.equal(persisted.metadata.restoreSync, undefined);
       assert.equal(fs.existsSync(path.join(uploadsDir, "cloud.txt")), false);
       assert.equal(restoreService.isWholeRestoreBlocked(), false);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore suppresses provider objects absent from the selected backup and keeps the suppression after restart", () => {
+  runFixture(`
+    let selectedBackup = false;
+    const cloud = {
+      enabled: () => true,
+      provider: "fixture",
+      inventory: async () => [
+        { provider: "s3", providerIdentity: "restored", area: "uploads", folderId: "root", name: "restored.txt" },
+        ...(selectedBackup ? [
+          { provider: "s3", providerIdentity: "orphan", area: "uploads", folderId: "root", name: "after-backup.txt" },
+          { provider: "s3", providerIdentity: "pending-orphan", area: "temp", folderId: "root", name: "pending-after-backup.txt" },
+        ] : []),
+      ],
+      download: async (_folderId, name, target) => { fs.writeFileSync(target, name === "restored.txt" ? "selected bytes" : "later bytes"); return true; },
+      upload: async () => {},
+    };
+    backupService.setCloudStorage(cloud);
+    restoreService.setCloudStorage(cloud);
+    (async () => {
+      write(path.join(uploadsDir, "restored.txt"), "selected bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      selectedBackup = true;
+      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.equal(restored.cloudSync.state, "pending");
+      restoreService.prepareWholeRestoreStartup();
+      assert.equal(restoreService.acknowledgeWholeRestoreInstance().complete, true);
+      const child = require("node:child_process").spawnSync(process.execPath, ["-e", "const fs=require('node:fs');const policy=JSON.parse(fs.readFileSync('data/.rootark-restore-provider-orphans.json','utf8'));process.stdout.write(JSON.stringify(policy));"], { cwd: process.cwd(), encoding: "utf8" });
+      assert.equal(child.status, 0, child.stderr);
+      assert.deepEqual(JSON.parse(child.stdout), {
+        version: 1,
+        objects: [
+          { area: "temp", folderId: "root", name: "pending-after-backup.txt" },
+          { area: "uploads", folderId: "root", name: "after-backup.txt" },
+        ],
+      });
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore keeps the existing fail-closed behavior for archives containing temp payloads", () => {
+  runFixture(`
+    const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(dataDir, "restore-state.json"), "archive state");
+      write(path.join(process.cwd(), "temp", "archived-pending.txt"), "pending archive bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "restore-state.json"), "live state");
+      write(policyPath, JSON.stringify({ version: 1, objects: [{ area: "uploads", folderId: "root", name: "prior-orphan.txt" }] }));
+      await assert.rejects(restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }), /Entrada nao permitida no backup: temp\\/archived-pending.txt/);
+      assert.equal(fs.readFileSync(path.join(dataDir, "restore-state.json"), "utf8"), "live state");
+      assert.deepEqual(JSON.parse(fs.readFileSync(policyPath, "utf8")).objects, [{ area: "uploads", folderId: "root", name: "prior-orphan.txt" }]);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `, { BACKUP_INCLUDE_TEMP: "true" });
+});
+
+test("restore inventory failure aborts before local commit", () => {
+  runFixture(`
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(dataDir, "restore-state.json"), "backup state");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "restore-state.json"), "live state");
+      const failingCloud = {
+        enabled: () => true,
+        inventory: async () => { throw new Error("injected provider inventory outage"); },
+      };
+      backupService.setCloudStorage(failingCloud);
+      restoreService.setCloudStorage(failingCloud);
+      await assert.rejects(restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }), /injected provider inventory outage/);
+      assert.equal(fs.readFileSync(path.join(dataDir, "restore-state.json"), "utf8"), "live state");
+      assert.equal(fs.existsSync(path.join(dataDir, ".rootark-restore-provider-orphans.json")), false);
+      assert.equal(restoreService.assertNoPendingWholeRestore().reason, "no_pending_restore");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore rollback restores the prior provider-orphan suppression file", () => {
+  runFixture(`
+    const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+    const priorPolicy = JSON.stringify({ version: 1, objects: [{ area: "uploads", folderId: "root", name: "prior-orphan.txt" }] });
+    write(policyPath, priorPolicy);
+    const cloud = {
+      enabled: () => true,
+      provider: "fixture",
+      inventory: async () => [{ provider: "s3", providerIdentity: "restored", area: "uploads", folderId: "root", name: "restore.txt" }],
+      download: async (_folderId, _name, target) => { fs.writeFileSync(target, "archive bytes"); return true; },
+      upload: async () => {},
+    };
+    backupService.setCloudStorage(cloud);
+    restoreService.setCloudStorage(cloud);
+    (async () => {
+      write(path.join(uploadsDir, "restore.txt"), "archive bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      await assert.rejects(restoreService.restoreBackup(backup.id, {
+        confirmation: "RESTORE",
+        failureInjector(step) { if (step === "restore.provider-orphans.persisted") throw new Error("injected suppression commit failure"); },
+      }), /injected suppression commit failure/);
+      assert.equal(restoreService.assertNoPendingWholeRestore().recovered, true);
+      assert.equal(fs.readFileSync(policyPath, "utf8"), priorPolicy);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("abrupt exit after provider-orphan policy persistence restores pre-restore state on restart", () => {
+  runFixture(`
+    const childProcess = require("node:child_process");
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      const statePath = path.join(dataDir, "restore-state.json");
+      write(statePath, "backup state");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(statePath, "live state");
+      const quotedBackupId = JSON.stringify(backup.id);
+      const restoreCode = [
+        "const backupService = require(" + JSON.stringify(${JSON.stringify(path.join(ROOT, "services", "backupService"))}) + ");",
+        "const restoreService = require(" + JSON.stringify(${JSON.stringify(path.join(ROOT, "services", "restoreService"))}) + ");",
+        'const cloud = { enabled: () => true, provider: "fixture", inventory: async () => [{ area: "temp", folderId: "root", name: "post-backup-pending.txt" }] };',
+        'backupService.setCloudStorage(cloud);',
+        'restoreService.setCloudStorage(cloud);',
+        'restoreService.restoreBackup(' + quotedBackupId + ', { confirmation: "RESTORE", failureInjector(step) { if (step === "restore.provider-orphans.persisted") process.exit(86); } }).catch(() => process.exit(87));',
+      ].join("\\n");
+      const crashed = childProcess.spawnSync(process.execPath, ["-e", restoreCode], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
+      assert.equal(crashed.status, 86, crashed.stderr || crashed.stdout);
+      const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+      assert.equal(JSON.parse(fs.readFileSync(policyPath, "utf8")).objects.some((entry) => entry.area === "temp" && entry.name === "post-backup-pending.txt"), true, "the abrupt exit occurs after the new suppression policy is durable");
+      const recoveryCode = [
+        'const fs = require("node:fs");',
+        "const restoreService = require(" + JSON.stringify(${JSON.stringify(path.join(ROOT, "services", "restoreService"))}) + ");",
+        'const result = restoreService.assertNoPendingWholeRestore();',
+        'const state = fs.readFileSync("data/restore-state.json", "utf8");',
+        'const policyExists = fs.existsSync("data/.rootark-restore-provider-orphans.json");',
+        'process.stdout.write(JSON.stringify({ result, state, policyExists }));',
+      ].join("\\n");
+      const restarted = childProcess.spawnSync(process.execPath, ["-e", recoveryCode], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
+      assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+      const recovered = JSON.parse(restarted.stdout);
+      assert.equal(recovered.result.recovered, true);
+      assert.equal(recovered.state, "live state");
+      assert.equal(recovered.policyExists, false, "restart rolls back the newly persisted suppression with the other local preimages");
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);

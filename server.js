@@ -40,11 +40,15 @@ const auditRepository = require("./repositories/auditRepository");
 const actionHistoryRepository = require("./repositories/actionHistoryRepository");
 const backupService = require("./services/backupService");
 const restoreService = require("./services/restoreService");
+const restoreProviderOrphans = require("./services/restoreProviderOrphans");
 const { getUploadQuarantineDir } = require("./src/quarantine-paths");
 const { createRestoreRequestGate } = require("./services/restoreRequestGate");
 const trashRepository = require("./repositories/trashRepository");
 const trashService = require("./services/trashService");
 const { createCloudStorage } = require("./services/cloudStorage");
+const { createFileLifecycleLock } = require("./services/fileLifecycleLock");
+const { openReadHandle } = require("./services/fileReadHandle");
+const { createCloudTempMutationQueue } = require("./services/cloudTempMutationQueue");
 const { resolveRuntimePath } = require("./src/runtime-paths");
 const registerAuthRoutes = require("./src/routes/auth");
 const registerAnalyticsRoutes = require("./src/routes/analytics");
@@ -197,6 +201,17 @@ const cloudStorage = createCloudStorage({
   s3: { bucket: process.env.AWS_S3_BUCKET, region: process.env.AWS_REGION, endpoint: process.env.AWS_ENDPOINT_URL, forcePathStyle: process.env.AWS_FORCE_PATH_STYLE === "true" },
   gdrive: { folderId: process.env.GOOGLE_DRIVE_FOLDER_ID, credentials: process.env.GOOGLE_SERVICE_ACCOUNT_JSON, credentialsPath: process.env.GOOGLE_APPLICATION_CREDENTIALS },
 });
+const cloudFileLifecycleLock = createFileLifecycleLock({
+  directory: resolveRuntimePath("data", ".rootark-cloud-file-locks"),
+});
+const cloudTempMutationQueue = createCloudTempMutationQueue({
+  directory: resolveRuntimePath("data", ".rootark-cloud-temp-mutations"),
+  lifecycleLock: cloudFileLifecycleLock,
+  localPathFor: (folderId, fileName) => path.join(getFolderStoragePath("./temp", folderId), fileName),
+  upload: uploadFileToCloud,
+  remove: deleteFileFromCloud,
+  isSuppressed: restoreProviderOrphans.isSuppressed,
+});
 backupService.setCloudStorage(cloudStorage);
 restoreService.setCloudStorage(cloudStorage);
 registerReadinessRoutes(app, {
@@ -247,8 +262,12 @@ const ENCRYPTION_LEVELS = {
 function isCloudStorageEnabled() { return cloudStorage.enabled(); }
 function getCloudStorageStatus() { return cloudStorage.status(); }
 function getCloudKey(folderId = ROOT_FOLDER_ID, fileName = "", area = "uploads") { return cloudStorage.key(folderId, fileName, area); }
-async function uploadFileToCloud(localPath, folderId, fileName, area = "uploads") { return cloudStorage.upload(localPath, folderId, fileName, area); }
-async function downloadFileFromCloud(folderId, fileName, localPath, area = "uploads") { return cloudStorage.download(folderId, fileName, localPath, area); }
+async function uploadFileToCloud(localPath, folderId, fileName, area = "uploads") {
+  const result = await cloudStorage.upload(localPath, folderId, fileName, area);
+  if (result) restoreProviderOrphans.clear(folderId, fileName, area);
+  return result;
+}
+async function downloadFileFromCloud(folderId, fileName, localPath, area = "uploads", canPublish) { return cloudStorage.download(folderId, fileName, localPath, area, canPublish); }
 async function deleteFileFromCloud(folderId, fileName, area = "uploads") { return cloudStorage.remove(folderId, fileName, area); }
 async function deleteCloudPrefix(prefix) { return cloudStorage.removePrefix(prefix); }
 async function listCloudFiles(folderId, area = "uploads") { return cloudStorage.list(folderId, area); }
@@ -278,31 +297,82 @@ function syncCloudFireAndForget(operation, label) {
   });
 }
 
-function syncFileToCloud(folderId, fileName, area = "uploads") {
-  const baseDir = area === "temp" ? "./temp" : "./uploads";
-  const localPath = path.join(getFolderStoragePath(baseDir, folderId), path.basename(fileName));
-  syncCloudFireAndForget(() => uploadFileToCloud(localPath, folderId, fileName, area), `sync ${area}/${folderId}/${fileName}`);
-}
-
 function deleteCloudFileLater(folderId, fileName, area = "uploads") {
+  if (area === "temp") {
+    cloudTempMutationQueue.enqueue(folderId, path.basename(fileName), "absent").catch((error) => {
+      console.error("[cloud-temp] reconciliation pending:", sanitizeLogValue(error.message));
+    });
+    return;
+  }
   syncCloudFireAndForget(() => deleteFileFromCloud(folderId, fileName, area), `delete ${area}/${folderId}/${fileName}`);
 }
 
-function deleteCloudFolderLater(folderId) {
-  syncCloudFireAndForget(() => deleteCloudPrefix(getCloudKey(folderId, "", "uploads")), `delete uploads folder ${folderId}`);
-  syncCloudFireAndForget(() => deleteCloudPrefix(getCloudKey(folderId, "", "temp")), `delete temp folder ${folderId}`);
+async function deleteCloudTempFile(folderId, fileName) {
+  if (!isCloudStorageEnabled()) return true;
+  await cloudTempMutationQueue.enqueue(folderId, path.basename(fileName), "absent");
+  return true;
 }
 
-async function ensureCloudFileCached(folderId, fileName, localPath, area = "uploads") {
-  if (isExistingFile(localPath)) return true;
-  if (!isCloudStorageEnabled()) return false;
+async function deleteCloudFolder(folderId) {
+  if (!isCloudStorageEnabled()) return;
+  await Promise.all([
+    deleteCloudPrefix(getCloudKey(folderId, "", "uploads")),
+    deleteCloudPrefix(getCloudKey(folderId, "", "temp")),
+  ]);
+}
 
+async function ensureCloudFileCached(folderId, fileName, localPath, area = "uploads", canPublish, logicalFileName = fileName) {
   try {
-    return await downloadFileFromCloud(folderId, fileName, localPath, area);
+    return await cloudFileLifecycleLock.run(folderId, logicalFileName, async () => {
+      if (!isFolderAvailable(folderId)) return false;
+      if (area === "temp" && restoreProviderOrphans.isSuppressed(folderId, fileName, area)) return false;
+      if (area === "uploads" && isFileExpired(folderId, logicalFileName)) return false;
+      if (isExistingFile(localPath)) return true;
+      if (!isCloudStorageEnabled()) return false;
+      const publishAllowed = () => (
+        (typeof canPublish !== "function" || canPublish()) &&
+        isFolderAvailable(folderId) &&
+        (area !== "temp" || !restoreProviderOrphans.isSuppressed(folderId, fileName, area)) &&
+        (area !== "uploads" || !isFileExpired(folderId, logicalFileName)) &&
+        (area !== "temp" || Boolean(getPendingUploadEntry(folderId, logicalFileName))) &&
+        (typeof canPublish === "function" || area !== "uploads" || !isFileInTrash(folderId, logicalFileName))
+      );
+      return await downloadFileFromCloud(folderId, fileName, localPath, area, publishAllowed);
+    });
   } catch (error) {
     console.error("[cloud-storage] restore cache failed:", sanitizeLogValue(error.message));
     return false;
   }
+}
+
+function handleCloudLifecycleMutation(operation, res, itemType) {
+  return operation.catch((error) => {
+    if (["FILE_LIFECYCLE_LOCK_TIMEOUT", "FILE_LIFECYCLE_LOCK_UNAVAILABLE"].includes(error?.code)) {
+      return res.status(503).set("Retry-After", "5").json({ error: itemType + " temporariamente indisponivel" });
+    }
+    throw error;
+  });
+}
+
+function runCloudFileLifecycleMutation(folderId, fileName, work, res) {
+  return handleCloudLifecycleMutation(cloudFileLifecycleLock.run(folderId, fileName, work), res, "Arquivo");
+}
+
+function runCloudFolderLifecycleMutation(folderId, work, res) {
+  return handleCloudLifecycleMutation(cloudFileLifecycleLock.runFolder(folderId, work), res, "Pasta");
+}
+
+function processCloudTempMutationAfterLifecycle(folderId, fileName) {
+  if (!isCloudStorageEnabled()) return;
+  setImmediate(() => {
+    cloudTempMutationQueue.process(folderId, fileName).catch((error) => {
+      console.error("[cloud-temp] reconciliation pending:", sanitizeLogValue(error.message));
+    });
+  });
+}
+
+function runCloudMoveLifecycleMutation(fromFolderId, toFolderId, fileName, work, res) {
+  return handleCloudLifecycleMutation(cloudFileLifecycleLock.runAcrossFolders([fromFolderId, toFolderId], fromFolderId, fileName, work), res, "Arquivo");
 }
 
 function refreshRealtimeUser(socket) {
@@ -1058,6 +1128,7 @@ function authenticateWebDavRequest(req, res) {
     username: user.username,
     role: user.role,
     permissions: normalizeUserPermissions(user),
+    sessionVersion: user.sessionVersion || 0,
   };
   return true;
 }
@@ -1274,11 +1345,11 @@ function getShareMaxDownloads(rawValue) {
   return rounded;
 }
 
-function getSharePasswordHash(password) {
+function getSharePassword(password) {
   const value = typeof password === "string" ? password.trim() : "";
   if (!value) return null;
   if (value.length < 4 || value.length > 128) return undefined;
-  return bcrypt.hashSync(value, 10);
+  return value;
 }
 
 function escapeHtml(value) {
@@ -1319,6 +1390,7 @@ function getShareFailurePage(message = "Este link nao esta disponivel.") {
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/assets/logo.svg" type="image/svg+xml" />
     <meta name="robots" content="noindex, nofollow, noarchive" />
     <title>Root.ark - Link indisponivel</title>
     <style>
@@ -1415,6 +1487,7 @@ function renderPublicSharePage(token) {
     <meta name="robots" content="noindex, nofollow, noarchive" />
     <meta property="og:title" content="Root.ark - Compartilhamento" />
     <meta property="og:description" content="Acesse um arquivo compartilhado com segurança pelo Root.ark." />
+    <link rel="icon" href="/assets/logo.svg" type="image/svg+xml" />
     <title>Root.ark - Compartilhamento</title>
     <style>
       :root {
@@ -1817,10 +1890,13 @@ function getShareFileInfo(link) {
 async function ensureShareFileAvailable(link) {
   const info = getShareFileInfo(link);
   if (!info) return null;
-  if (isFileInTrash(info.folderId, info.fileName)) return null;
-  await ensureCloudFileCached(info.folderId, info.fileName, info.filePath, "uploads");
-  if (!isExistingFile(info.filePath)) return null;
+  if (!isFolderAvailable(info.folderId) || isFileInTrash(info.folderId, info.fileName) || isFileExpired(info.folderId, info.fileName)) return null;
+  if (restoreProviderOrphans.isSuppressed(info.folderId, info.fileName)) return null;
   if (getEncryptedFileMetadata(info.folderId, info.fileName)) return null;
+  await ensureCloudFileCached(info.folderId, info.fileName, info.filePath, "uploads", () => !isFileInTrash(info.folderId, info.fileName));
+  if (!isFolderAvailable(info.folderId) || isFileInTrash(info.folderId, info.fileName) || isFileExpired(info.folderId, info.fileName)
+    || restoreProviderOrphans.isSuppressed(info.folderId, info.fileName)) return null;
+  if (!isExistingFile(info.filePath)) return null;
   return info;
 }
 
@@ -1963,7 +2039,7 @@ function getFolderById(folderId = ROOT_FOLDER_ID) {
 }
 
 function hasFolderAccess(req, folder) {
-  if (!folder) return false;
+  if (!folder || !isFolderAvailable(folder.id)) return false;
   if (folder.isRoot || folder.id === ROOT_FOLDER_ID) return true;
   if (req.user?.role === "admin" || req.user?.permissions?.manageUsers) return true;
   if (folder.createdBy === req.user?.username) return true;
@@ -1974,6 +2050,10 @@ function hasFolderAccess(req, folder) {
 
 function canManageAccess(req) {
   return req.user?.role === "admin" || req.user?.permissions?.manageUsers;
+}
+
+function isRestoreProviderOrphanDenied(req, folderId, fileName) {
+  return Boolean(fileName) && restoreProviderOrphans.isSuppressed(folderId, fileName) && !canManageAccess(req);
 }
 
 function sameUsername(left, right) {
@@ -2101,6 +2181,24 @@ function getFileExpirationKey(folderId, fileName) {
 
 function getFileExpirationEntry(folderId, fileName, entries = loadFileExpirations()) {
   return entries[getFileExpirationKey(folderId, fileName)] || null;
+}
+
+function isFileExpired(folderId, fileName, entries = loadFileExpirations()) {
+  const expiresAt = new Date(getFileExpirationEntry(folderId, fileName, entries)?.expiresAt).getTime();
+  return Number.isFinite(expiresAt) && expiresAt <= Date.now();
+}
+
+function isFolderExpired(folder) {
+  const rawExpiresAt = folder?.expiresAt;
+  if (rawExpiresAt === null || rawExpiresAt === undefined || rawExpiresAt === "") return false;
+  const expiresAt = new Date(rawExpiresAt).getTime();
+  return Number.isFinite(expiresAt) && expiresAt <= Date.now();
+}
+
+function isFolderAvailable(folderId, folders = loadFolders()) {
+  if (folderId === ROOT_FOLDER_ID) return true;
+  const folder = folders.find((item) => item.id === folderId);
+  return Boolean(folder && !isFolderExpired(folder));
 }
 
 function getFileVersionKey(folderId, fileName) {
@@ -2302,7 +2400,17 @@ function isStoredVersionFile(folderId, fileName, entries = loadFileVersions()) {
     }
   }
 
-  return false;
+  const suffix = name.match(/\.v\d+$/i);
+  if (!suffix) return false;
+  if (entries[getFileVersionKey(folderId, name)]) return false;
+
+  const permissions = loadFilePermissions();
+  if (getFilePermissionEntry(folderId, name, permissions)) return false;
+  const primaryName = name.slice(0, -suffix[0].length);
+  return Boolean(
+    getFilePermissionEntry(folderId, primaryName, permissions) ||
+    entries[getFileVersionKey(folderId, primaryName)]
+  );
 }
 
 function removeFileVersions(folderId, fileName) {
@@ -2821,7 +2929,16 @@ function parseRangeHeader(rangeHeader, size) {
 }
 
 function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "inline", options = {}) {
-  const stats = fs.statSync(filePath);
+  let readHandle;
+  try {
+    readHandle = openReadHandle(filePath);
+  } catch (error) {
+    const unavailable = new Set(["ENOENT", "ENOTDIR", "ELOOP", "FILE_NOT_REGULAR", "FILE_HANDLE_CHANGED"]);
+    if (unavailable.has(error.code)) return res.status(404).send("Arquivo nao encontrado");
+    console.error("Erro ao abrir arquivo para transmissao:", error.message);
+    return res.status(500).send("Nao foi possivel abrir o arquivo");
+  }
+  const { fd, stats } = readHandle;
   const size = stats.size;
   const safeName = path.basename(downloadName || path.basename(filePath));
   const range = parseRangeHeader(req.headers.range, size);
@@ -2829,6 +2946,7 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
   const highWaterMark = Number(options.highWaterMark) || 1024 * 1024;
 
   if (range?.invalid) {
+    try { fs.closeSync(fd); } catch {}
     res.writeHead(416, {
       "Content-Range": `bytes */${size}`,
       "Accept-Ranges": "bytes",
@@ -2863,8 +2981,15 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
     };
   }
 
-  res.writeHead(statusCode, headers);
-  const stream = fs.createReadStream(filePath, streamOptions);
+  let stream;
+  try {
+    res.writeHead(statusCode, headers);
+    stream = fs.createReadStream(null, { ...streamOptions, fd, autoClose: true });
+  } catch (error) {
+    try { fs.closeSync(fd); } catch {}
+    if (!res.headersSent) return res.status(500).send("Erro ao transmitir arquivo");
+    return res.destroy(error);
+  }
 
   stream.on("error", (error) => {
     console.error("Erro ao transmitir arquivo:", error.message);
@@ -2990,8 +3115,9 @@ function normalizeFolderGroupIds(value, allowMissing = true) {
   return groupsStore?.validateIds(value);
 }
 
-function hasFileAccess(req, folder, fileName, entries = loadFilePermissions()) {
-  if (!hasFolderAccess(req, folder)) return false;
+function hasFileAccess(req, folder, fileName, entries = loadFilePermissions(), expirationEntries = loadFileExpirations()) {
+  if (!hasFolderAccess(req, folder) || isFileExpired(folder.id, fileName, expirationEntries)) return false;
+  if (restoreProviderOrphans.isSuppressed(folder.id, fileName)) return canManageAccess(req);
   if (canManageAccess(req)) return true;
 
   const entry = getFilePermissionEntry(folder.id, fileName, entries);
@@ -3008,6 +3134,7 @@ function hasFileAccess(req, folder, fileName, entries = loadFilePermissions()) {
 
 function hasFileEditAccess(req, folder, fileName, entries = loadFilePermissions()) {
   if (!hasFolderAccess(req, folder)) return false;
+  if (restoreProviderOrphans.isSuppressed(folder.id, fileName)) return canManageAccess(req);
   if (canManageAccess(req)) return true;
 
   const entry = getFilePermissionEntry(folder.id, fileName, entries);
@@ -3030,7 +3157,7 @@ function getReadableFolderOrRespond(req, res, rawFolderId = ROOT_FOLDER_ID) {
   const folderId = String(rawFolderId || ROOT_FOLDER_ID);
   const folder = getFolderById(folderId);
 
-  if (!folder) {
+  if (!folder || !isFolderAvailable(folderId)) {
     res.status(404).json({ error: "Pasta nao encontrada" });
     return null;
   }
@@ -3165,7 +3292,7 @@ function removeUserFromFolderPermissions(username) {
   if (changed) saveFolders(folders);
 }
 
-function deleteFolderContents(folder) {
+async function deleteFolderContents(folder) {
   const folderId = folder.id;
   const uploadDir = getFolderStoragePath("./uploads", folderId);
   const tempDir = getFolderStoragePath("./temp", folderId);
@@ -3182,7 +3309,7 @@ function deleteFolderContents(folder) {
   removeEncryptedMetadataForFolder(folderId);
   fs.rmSync(uploadDir, { recursive: true, force: true });
   fs.rmSync(tempDir, { recursive: true, force: true });
-  deleteCloudFolderLater(folderId);
+  await deleteCloudFolder(folderId);
 }
 
 function shouldAutoCleanupTrash() {
@@ -3198,7 +3325,7 @@ function getTrashRetentionDays() {
   return Number.isFinite(days) && days > 0 ? days : 30;
 }
 
-function cleanupExpiredTrashItems() {
+async function cleanupExpiredTrashItems() {
   if (!isTrashEnabled()) return;
   if (!shouldAutoCleanupTrash()) return;
 
@@ -3208,35 +3335,71 @@ function cleanupExpiredTrashItems() {
     return Number.isFinite(deletedAt) && deletedAt <= cutoff;
   });
 
+  let cleanedCount = 0;
   for (const item of items) {
+    const cleanupItem = async () => {
+      let current;
+      try {
+        current = trashRepository.getTrashItem(item.id);
+      } catch (error) {
+        auditLog("trash.delete.failed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "auto_cleanup", "failure", { error: error.message });
+        return false;
+      }
+      const currentDeletedAt = new Date(current?.deletedAt).getTime();
+      if (
+        !current || current.status !== "trashed" || current.itemType !== item.itemType ||
+        current.originalFolderId !== item.originalFolderId || current.originalFileName !== item.originalFileName ||
+        current.trashPath !== item.trashPath || current.deletedAt !== item.deletedAt ||
+        !Number.isFinite(currentDeletedAt) || currentDeletedAt > cutoff
+      ) return false;
+
+      try {
+        if (!isCloudStorageEnabled()) {
+          trashService.permanentlyDelete({ item: current, deletedBy: "system", loaders: getTrashLoaders() });
+        } else {
+          const pending = trashService.queueRemoteDeletion({ item: current, deletedBy: "system", loaders: getTrashLoaders(), provider: getCloudStorageStatus().provider });
+          if (pending.status === "remote_delete_pending" && pending.metadata?.remoteDeletion) {
+            auditLog("trash.remote_delete.queued", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "success", {});
+            void processCloudTrashDeletion(pending)
+              .then((result) => {
+                const persisted = trashRepository.getTrashItem(current.id) || result;
+                const state = persisted.metadata?.remoteDeletion?.state;
+                if (state === "completed") auditLog("trash.remote_delete.completed", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "success", {});
+                else if (state === "cancelled") auditLog("trash.remote_delete.cancelled", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "success", { reason: persisted.metadata?.remoteDeletion?.cancellationReason });
+                else if (state === "terminal_failure") auditLog("trash.remote_delete.failed", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "failure", { category: persisted.metadata?.remoteDeletion?.failureCategory });
+              })
+              .catch((error) => {
+                auditLog("trash.remote_delete.operational_failure", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "failure", { category: error.code || "persistence_error" });
+                console.error("[cloud-trash] remote deletion state could not be persisted:", error.code || "persistence_error");
+              });
+          }
+        }
+        if (!isCloudStorageEnabled()) {
+          auditLog(
+            current.itemType === "file" ? "trash.file.permanently_deleted" : "trash.folder.permanently_deleted",
+            { username: "system", role: "system" },
+            { type: "trash", id: current.id },
+            "auto_cleanup",
+            "success",
+            { retentionDays: getTrashRetentionDays(), itemType: current.itemType }
+          );
+        }
+        return true;
+      } catch (error) {
+        auditLog("trash.delete.failed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "auto_cleanup", "failure", {
+          error: error.message,
+        });
+        return false;
+      }
+    };
+
     try {
-      if (!isCloudStorageEnabled()) {
-        trashService.permanentlyDelete({ item, deletedBy: "system", loaders: getTrashLoaders() });
-      } else {
-        const pending = trashService.queueRemoteDeletion({ item, deletedBy: "system", loaders: getTrashLoaders(), provider: getCloudStorageStatus().provider });
-        auditLog("trash.remote_delete.queued", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "success", {});
-        void trashService.processRemoteDeletion({ item: pending, provider: deleteCloudTrashItem })
-          .then((result) => {
-            const persisted = trashRepository.getTrashItem(item.id) || result;
-            const state = persisted.metadata?.remoteDeletion?.state;
-            if (state === "completed") auditLog("trash.remote_delete.completed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "success", {});
-            else if (state === "terminal_failure") auditLog("trash.remote_delete.failed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "failure", { category: persisted.metadata?.remoteDeletion?.failureCategory });
-          })
-          .catch((error) => {
-            auditLog("trash.remote_delete.operational_failure", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "failure", { category: error.code || "persistence_error" });
-            console.error("[cloud-trash] remote deletion state could not be persisted:", error.code || "persistence_error");
-          });
-      }
-      if (!isCloudStorageEnabled()) {
-        auditLog(
-          item.itemType === "file" ? "trash.file.permanently_deleted" : "trash.folder.permanently_deleted",
-          { username: "system", role: "system" },
-          { type: "trash", id: item.id },
-          "auto_cleanup",
-          "success",
-          { retentionDays: getTrashRetentionDays(), itemType: item.itemType }
-        );
-      }
+      const cleaned = item.itemType === "file"
+        ? await cloudFileLifecycleLock.run(item.originalFolderId, item.originalFileName, cleanupItem)
+        : item.itemType === "folder"
+          ? await cloudFileLifecycleLock.runFolder(item.originalFolderId, cleanupItem)
+          : await cleanupItem();
+      if (cleaned) cleanedCount += 1;
     } catch (error) {
       auditLog("trash.delete.failed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "auto_cleanup", "failure", {
         error: error.message,
@@ -3244,71 +3407,72 @@ function cleanupExpiredTrashItems() {
     }
   }
 
-  if (items.length) broadcastDataChanged("trash", { action: "auto_cleanup", count: items.length });
+  if (cleanedCount) broadcastDataChanged("trash", { action: "auto_cleanup", count: cleanedCount });
 }
 
-function cleanupExpiredTemporaryItems() {
+async function cleanupExpiredTemporaryItems() {
   const now = Date.now();
 
   try {
-    const folders = loadFolders();
-    const remainingFolders = [];
-    let foldersChanged = false;
-
-    for (const folder of folders) {
+    for (const folder of loadFolders()) {
       const expiresAt = folder.expiresAt ? new Date(folder.expiresAt).getTime() : null;
-      if (
-        folder.id !== ROOT_FOLDER_ID &&
-        Number.isFinite(expiresAt) &&
-        expiresAt <= now
-      ) {
-        deleteFolderContents(folder);
-        addActionHistory("folder_expired", folder.name, "sistema", {
-          folderId: folder.id,
-          folderName: folder.name,
-          expiresAt: folder.expiresAt,
+      if (folder.id === ROOT_FOLDER_ID || !Number.isFinite(expiresAt) || expiresAt > now) continue;
+      await cloudFileLifecycleLock.runFolder(folder.id, async () => {
+        const currentFolders = loadFolders();
+        const currentFolder = currentFolders.find((item) => item.id === folder.id);
+        const currentExpiry = new Date(currentFolder?.expiresAt).getTime();
+        if (!currentFolder || !Number.isFinite(currentExpiry) || currentExpiry > now) return;
+        await deleteFolderContents(currentFolder);
+        saveFolders(currentFolders.filter((item) => item.id !== currentFolder.id));
+        addActionHistory("folder_expired", currentFolder.name, "sistema", {
+          folderId: currentFolder.id,
+          folderName: currentFolder.name,
+          expiresAt: currentFolder.expiresAt,
         });
-        foldersChanged = true;
-        continue;
-      }
-
-      remainingFolders.push(folder);
+      });
     }
-
-    if (foldersChanged) saveFolders(remainingFolders);
   } catch (error) {
     console.error("Falha ao limpar pastas temporarias:", error.message);
   }
 
   try {
-    const expirations = loadFileExpirations();
-    let filesChanged = false;
-
-    for (const [key, entry] of Object.entries(expirations)) {
+    for (const [key, entry] of Object.entries(loadFileExpirations())) {
       const expiresAt = new Date(entry?.expiresAt).getTime();
       if (!Number.isFinite(expiresAt) || expiresAt > now) continue;
 
       const folderId = entry.folderId || ROOT_FOLDER_ID;
       const fileName = path.basename(entry.fileName || "");
-      const filePath = path.join(getFolderStoragePath("./uploads", folderId), fileName);
+      if (!fileName) continue;
+      await cloudFileLifecycleLock.run(folderId, fileName, async () => {
+        const expirations = loadFileExpirations();
+        const current = expirations[key];
+        const currentExpiry = new Date(current?.expiresAt).getTime();
+        if (
+          !current || (current.folderId || ROOT_FOLDER_ID) !== folderId || path.basename(current.fileName || "") !== fileName ||
+          !Number.isFinite(currentExpiry) || currentExpiry > now
+        ) return;
 
-      if (fileName && isExistingFile(filePath)) {
-        fs.unlinkSync(filePath);
-      }
-
-      deleteCloudFileLater(folderId, fileName, "uploads");
-      removePublicLinksForFile(fileName, folderId);
-      removeFilePermission(folderId, fileName);
-      removeFileVersions(folderId, fileName);
-      delete expirations[key];
-      addActionHistory("file_expired", fileName, "sistema", {
-        folderId,
-        expiresAt: entry.expiresAt,
+        const filePath = path.join(getFolderStoragePath("./uploads", folderId), fileName);
+        const versionNames = getVersionHistory(folderId, fileName).versions
+          .map((version) => path.basename(version.storedAs || ""))
+          .filter(Boolean);
+        if (isCloudStorageEnabled()) {
+          for (const storedName of new Set([fileName, ...versionNames])) {
+            await deleteFileFromCloud(folderId, storedName, "uploads");
+          }
+        }
+        if (isExistingFile(filePath)) fs.unlinkSync(filePath);
+        removePublicLinksForFile(fileName, folderId);
+        removeFilePermission(folderId, fileName);
+        removeFileVersions(folderId, fileName);
+        delete expirations[key];
+        saveFileExpirations(expirations);
+        addActionHistory("file_expired", fileName, "sistema", {
+          folderId,
+          expiresAt: current.expiresAt,
+        });
       });
-      filesChanged = true;
     }
-
-    if (filesChanged) saveFileExpirations(expirations);
   } catch (error) {
     console.error("Falha ao limpar arquivos temporarios:", error.message);
   }
@@ -3573,10 +3737,17 @@ function removePendingEntriesForFolder(folderId) {
 }
 
 function getAccessibleFolderOrRespond(req, res, rawFolderId = ROOT_FOLDER_ID) {
+  const folder = getAccessibleFolderRecordOrRespond(req, res, rawFolderId);
+  if (!folder) return null;
+  const paths = ensureFolderDirectories(folder.id);
+  return { ...folder, ...paths };
+}
+
+function getAccessibleFolderRecordOrRespond(req, res, rawFolderId = ROOT_FOLDER_ID) {
   const folderId = String(rawFolderId || ROOT_FOLDER_ID);
   const folder = getFolderById(folderId);
 
-  if (!folder) {
+  if (!folder || !isFolderAvailable(folderId)) {
     res.status(404).json({ error: "Pasta nao encontrada" });
     return null;
   }
@@ -3586,8 +3757,7 @@ function getAccessibleFolderOrRespond(req, res, rawFolderId = ROOT_FOLDER_ID) {
     return null;
   }
 
-  const paths = ensureFolderDirectories(folder.id);
-  return { ...folder, ...paths };
+  return folder;
 }
 
 function getPendingKey(folderId, fileName) {
@@ -3787,7 +3957,7 @@ function getApprovalFolderById(folderId) {
   return { ...folder, ...ensureFolderDirectories(folder.id) };
 }
 
-async function findPendingApprovalTarget(req, requestedFolder, fileName) {
+async function findPendingApprovalTarget(req, requestedFolder, fileName, { allowRestoreOrphan = false } = {}) {
   const name = path.basename(fileName || "");
   if (!name) return null;
 
@@ -3818,6 +3988,10 @@ async function findPendingApprovalTarget(req, requestedFolder, fileName) {
   }
 
   for (const candidate of candidates) {
+    if (restoreProviderOrphans.isSuppressed(candidate.folder.id, name, "temp")) {
+      if (allowRestoreOrphan && getPendingUploadEntry(candidate.folder.id, name)) return { ...candidate, restoreOrphan: true };
+      continue;
+    }
     await ensureCloudFileCached(candidate.folder.id, name, candidate.pendingPath, "temp");
     if (isExistingFile(candidate.pendingPath)) return candidate;
   }
@@ -3840,7 +4014,7 @@ function resolveScopedFile(scope, rawName, rawFolderId = ROOT_FOLDER_ID) {
   }
 
   const folder = getFolderById(folderId);
-  if (!folder) return null;
+  if (!folder || !isFolderAvailable(folderId)) return null;
 
   if (scope === "public") {
     return {
@@ -3872,8 +4046,18 @@ async function ensurePreviewAccess(req, res, scope, rawName, rawFolderId = ROOT_
     return null;
   }
 
+  if (!target.isPending && isFileExpired(target.folderId, target.name)) {
+    res.status(410).json({ error: "Arquivo expirado" });
+    return null;
+  }
+
   if (target.isPending && !hasFolderAccess(req, target.folder)) {
     res.status(403).json({ error: "Acesso negado a esta pasta" });
+    return null;
+  }
+
+  if (target.isPending && restoreProviderOrphans.isSuppressed(target.folderId, target.name, "temp")) {
+    res.status(409).json({ error: "Payload pendente nao consta no backup restaurado; rejeite ou envie novamente" });
     return null;
   }
 
@@ -3904,6 +4088,43 @@ async function ensurePreviewAccess(req, res, scope, rawName, rawFolderId = ROOT_
   }
 
   await ensureCloudFileCached(target.folderId, target.name, target.filePath, target.isPending ? "temp" : "uploads");
+  if (!refreshAuthenticatedUser(req, res)) return null;
+  if (target.isPending && restoreProviderOrphans.isSuppressed(target.folderId, target.name, "temp")) {
+    res.status(409).json({ error: "Payload pendente nao consta no backup restaurado; rejeite ou envie novamente" });
+    return null;
+  }
+  const currentFolder = getFolderById(target.folderId);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder)) {
+    res.status(403).json({ error: "Acesso negado a esta pasta" });
+    return null;
+  }
+  if (target.isPending) {
+    if (!req.user?.permissions?.listPending && !req.user?.permissions?.upload) {
+      res.status(403).json({ error: "Permissao negada: listPending" });
+      return null;
+    }
+    if (!canAccessPendingFile(req, target.folderId, target.name) || !getPendingUploadEntry(target.folderId, target.name)) {
+      res.status(403).json({ error: "Permissao negada para esse arquivo" });
+      return null;
+    }
+  } else {
+    if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, target.name)) {
+      res.status(403).json({ error: "Acesso negado a este arquivo" });
+      return null;
+    }
+    if (isFileInTrash(target.folderId, target.name)) {
+      res.status(410).json({ error: "Arquivo esta na lixeira" });
+      return null;
+    }
+    if (getEncryptedFileMetadata(target.folderId, target.name)) {
+      res.status(403).json({ error: "Preview indisponivel para arquivos criptografados" });
+      return null;
+    }
+  }
+  if (!isFolderAvailable(target.folderId) || (!target.isPending && isFileExpired(target.folderId, target.name))) {
+    res.status(410).json({ error: "Arquivo expirado" });
+    return null;
+  }
   if (!fs.existsSync(target.filePath)) {
     res.status(404).json({ error: "Arquivo nao encontrado" });
     return null;
@@ -3956,6 +4177,73 @@ function listFilesWithDetailsAsync(directory) {
       else resolve(files);
     });
   });
+}
+
+async function listFilesWithCloudDetails(directory, folderId, area = "uploads") {
+  const files = await listFilesWithDetailsAsync(directory);
+  if (!isCloudStorageEnabled()) return files;
+
+  try {
+    const localNames = new Set(files.map((file) => file.name));
+    const cloudFiles = await listCloudFiles(folderId, area);
+    for (const cloudFile of cloudFiles) {
+      const name = path.basename(String(cloudFile.name || ""));
+      if (!name || name !== cloudFile.name || localNames.has(name)) continue;
+      const size = Number(cloudFile.size);
+      const modifiedAt = cloudFile.modifiedAt || cloudFile.uploadedAt || null;
+      files.push({
+        name,
+        size: Number.isFinite(size) ? size : 0,
+        uploadedAt: cloudFile.uploadedAt || modifiedAt,
+        modifiedAt,
+      });
+      localNames.add(name);
+    }
+  } catch (error) {
+    console.error("[cloud-storage] list metadata failed:", sanitizeLogValue(error.message));
+  }
+
+  return files;
+}
+
+async function getListedFileDetails(folder, fileName) {
+  if (isStoredVersionFile(folder.id, fileName)) return null;
+  if (isFileInTrash(folder.id, fileName)) return null;
+  const files = await listFilesWithCloudDetails(folder.uploadDir, folder.id, "uploads");
+  return files.find((file) => file.name === fileName) || null;
+}
+
+// Process-local account windows bound one server instance; coordinated limits across replicas need shared storage, as does issue #94.
+const cloudMetadataRateLimits = new Map();
+const CLOUD_METADATA_RATE_LIMIT_MAX = 30;
+const CLOUD_METADATA_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+let cloudMetadataRateLimitCleanupAt = 0;
+
+function consumeCloudMetadataRateLimit(req, res) {
+  const now = Date.now();
+  if (now >= cloudMetadataRateLimitCleanupAt) {
+    for (const [key, state] of cloudMetadataRateLimits) {
+      if (now - state.windowStart >= CLOUD_METADATA_RATE_LIMIT_WINDOW_MS) cloudMetadataRateLimits.delete(key);
+    }
+    cloudMetadataRateLimitCleanupAt = now + CLOUD_METADATA_RATE_LIMIT_WINDOW_MS;
+  }
+
+  const username = String(req.user?.username || "").trim().toLowerCase();
+  const route = req.route?.path || req.path;
+  const method = req.method === "HEAD" ? "GET" : req.method;
+  const key = `${username}\0${method}\0${route}`;
+  let state = cloudMetadataRateLimits.get(key);
+  if (!state || now - state.windowStart >= CLOUD_METADATA_RATE_LIMIT_WINDOW_MS) {
+    state = { attempts: 0, windowStart: now };
+    cloudMetadataRateLimits.set(key, state);
+  }
+  if (state.attempts >= CLOUD_METADATA_RATE_LIMIT_MAX) {
+    res.setHeader("Retry-After", String(Math.max(1, Math.ceil((state.windowStart + CLOUD_METADATA_RATE_LIMIT_WINDOW_MS - now) / 1000))));
+    res.status(429).json({ error: "Muitas requisicoes. Tente novamente em instantes." });
+    return false;
+  }
+  state.attempts += 1;
+  return true;
 }
 
 function getDirectorySize(directory) {
@@ -4348,7 +4636,16 @@ function isWebDavEncryptedFile(folderId, fileName) {
 
 function isWebDavInternalStoredFile(folderId, fileName) {
   const name = path.basename(fileName || "");
-  return isStoredVersionFile(folderId, name) || /\.v\d+$/i.test(name);
+  if (isStoredVersionFile(folderId, name)) return true;
+
+  // With the version manifest missing, an unmarked `.vN` object is ambiguous:
+  // it may be an ordinary file or orphaned historical bytes. WebDAV requires
+  // file-local metadata to expose that ambiguous name; ordinary files that
+  // have their own ACL or version history remain available.
+  if (!/\.v\d+$/i.test(name)) return false;
+  const versionEntries = loadFileVersions();
+  if (versionEntries[getFileVersionKey(folderId, name)]) return false;
+  return !getFilePermissionEntry(folderId, name, loadFilePermissions());
 }
 
 async function deleteCloudTrashItem(item) {
@@ -4367,15 +4664,39 @@ async function deleteCloudTrashItem(item) {
   return true;
 }
 
+function isTrashReplacementActive(item) {
+  if (item.itemType === "file") {
+    const fileName = path.basename(item.originalFileName || "");
+    if (!fileName) return false;
+    const localPath = path.join(getFolderStoragePath("./uploads", item.originalFolderId || ROOT_FOLDER_ID), fileName);
+    return isExistingFile(localPath);
+  }
+  if (item.itemType === "folder") {
+    return loadFolders().some((folder) => folder.id === item.originalFolderId && !folder.deletedAt);
+  }
+  return false;
+}
+
+function processCloudTrashDeletion(item) {
+  return trashService.processRemoteDeletion({
+    item,
+    provider: deleteCloudTrashItem,
+    runFileLifecycleMutation: (folderId, fileName, work) => cloudFileLifecycleLock.run(folderId, fileName, work),
+    runFolderLifecycleMutation: (folderId, work) => cloudFileLifecycleLock.runFolder(folderId, work),
+    isReplacementActive: isTrashReplacementActive,
+  });
+}
+
 async function processPendingCloudTrashItems() {
   return restoreRequestGate.run(async () => {
     if (!isCloudStorageEnabled()) return;
     try {
       for (const item of trashRepository.listTrashItems({ status: "remote_delete_pending" })) {
         try {
-          const result = await trashService.processRemoteDeletion({ item, provider: deleteCloudTrashItem });
+          const result = await processCloudTrashDeletion(item);
           const state = result.metadata?.remoteDeletion?.state;
           if (state === "completed") auditLog("trash.remote_delete.completed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "success", {});
+          else if (state === "cancelled") auditLog("trash.remote_delete.cancelled", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "success", { reason: result.metadata?.remoteDeletion?.cancellationReason });
           else if (state === "terminal_failure") auditLog("trash.remote_delete.failed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "failure", { category: result.metadata?.remoteDeletion?.failureCategory });
         } catch (error) {
           auditLog("trash.remote_delete.operational_failure", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "failure", { category: error.code || "persistence_error" });
@@ -4413,7 +4734,10 @@ async function processPendingCloudRestoreSync() {
       const state = backup.metadata?.restoreSync?.state;
       if (!["pending", "retry_wait"].includes(state)) continue;
       try {
-        await restoreService.processRestoreSync({ backupId: backup.id });
+        await restoreService.processRestoreSync({
+          backupId: backup.id,
+          runFileLifecycleMutation: (folderId, fileName, work) => cloudFileLifecycleLock.run(folderId, fileName, work),
+        });
       } catch {
         // The durable entry remains retryable; never create an unhandled rejection.
       }
@@ -4485,6 +4809,8 @@ const pendingRepairRateLimit = createRouteRateLimit();
 const approveRateLimit = createRouteRateLimit();
 const rejectRateLimit = createRouteRateLimit();
 const deleteRateLimit = createRouteRateLimit();
+const renameRateLimit = createRouteRateLimit();
+const moveRateLimit = createRouteRateLimit();
 const fileAccessRateLimit = createRouteRateLimit();
 const fileTemporaryRateLimit = createRouteRateLimit();
 const fileListRateLimit = createRouteRateLimit();
@@ -4521,6 +4847,40 @@ app.use(express.static("./public"));
 const loadCurrentUser = (username) => loadUsers().find((user) => user.username === username);
 const authenticate = createAuthenticate({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
 const authenticateRealtimeToken = createRealtimeAuthenticator({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
+
+function refreshAuthenticatedUser(req, res) {
+  let user;
+  try {
+    user = loadCurrentUser(req.user?.username);
+  } catch {
+    res.status(503).json({ error: "Autorizacao indisponivel" });
+    return false;
+  }
+
+  if (!user || user.disabled || (user.sessionVersion || 0) !== req.user?.sessionVersion) {
+    res.status(401).json({ error: "Sessao invalida ou expirada" });
+    return false;
+  }
+
+  req.user = {
+    ...req.user,
+    username: user.username,
+    role: user.role,
+    permissions: normalizeUserPermissions(user),
+    sessionVersion: user.sessionVersion || 0,
+    totpEnabled: Boolean(user.totpEnabled),
+  };
+  return true;
+}
+
+function revalidateTrashManageAccess(req, res) {
+  if (!refreshAuthenticatedUser(req, res)) return false;
+  if (!canManageTrash(req)) {
+    res.status(403).json({ error: "Permissao negada: manageTrash" });
+    return false;
+  }
+  return true;
+}
 
 app.get("/auth/session.js", authenticate, (req, res) => {
   res.type("application/javascript").set("Cache-Control", "no-store");
@@ -4775,7 +5135,7 @@ app.delete("/users/:username", authenticate, requirePermission("manageUsers"), (
   res.json({ message: "Usuario excluido" });
 });
 
-app.get("/file-access", fileAccessRateLimit, authenticate, (req, res) => {
+app.get("/file-access", fileAccessRateLimit, authenticate, async (req, res) => {
   const rawName = typeof req.query.name === "string" ? req.query.name.trim() : "";
   const name = path.basename(rawName);
   const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
@@ -4785,12 +5145,16 @@ app.get("/file-access", fileAccessRateLimit, authenticate, (req, res) => {
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
 
-  const filePath = path.join(folder.uploadDir, name);
-  if (!isExistingFile(filePath)) {
+  if (!canManageAccess(req) && !hasFileEditAccess(req, folder, name)) {
+    return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+  }
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
+  if (!await getListedFileDetails(folder, name)) {
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
-
-  if (!canManageAccess(req) && !hasFileEditAccess(req, folder, name)) {
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !hasFileEditAccess(req, currentFolder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
 
@@ -4802,7 +5166,7 @@ app.get("/file-access", fileAccessRateLimit, authenticate, (req, res) => {
     owner: normalizedEntry.owner,
     public: normalizedEntry.public,
     users: normalizedEntry.users,
-    eligibleUsers: getFolderEligibleUsers(folder),
+    eligibleUsers: getFolderEligibleUsers(currentFolder),
     allowedUsers: Object.entries(normalizedEntry.users)
       .filter(([, access]) => access.read || access.edit)
       .map(([username]) => username),
@@ -4810,7 +5174,7 @@ app.get("/file-access", fileAccessRateLimit, authenticate, (req, res) => {
   });
 });
 
-app.put("/file-access", fileAccessRateLimit, authenticate, (req, res) => {
+app.put("/file-access", fileAccessRateLimit, authenticate, async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const folder = getAccessibleFolderOrRespond(req, res, req.body.folderId);
@@ -4820,16 +5184,20 @@ app.put("/file-access", fileAccessRateLimit, authenticate, (req, res) => {
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
 
-  const filePath = path.join(folder.uploadDir, name);
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
-
   if (!canManageAccess(req) && !hasFileEditAccess(req, folder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
+  if (!await getListedFileDetails(folder, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !hasFileEditAccess(req, currentFolder, name)) {
+    return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+  }
 
-  const eligibleUsers = getFolderEligibleUsers(folder);
+  const eligibleUsers = getFolderEligibleUsers(currentFolder);
   const validUsernames = new Set(eligibleUsers.map((user) => user.username));
   const publicAccess = Boolean(req.body.public);
   const requestedUsers = req.body.users && typeof req.body.users === "object"
@@ -5245,24 +5613,27 @@ app.put("/folders/:id/temporary", authenticate, (req, res) => {
     return res.status(400).json({ error: "Expiracao temporaria invalida" });
   }
 
-  const folders = loadFolders();
-  const folder = folders.find((item) => item.id === folderId);
+  const folder = loadFolders().find((item) => item.id === folderId);
   if (!folder) return res.status(404).json({ error: "Pasta nao encontrada" });
   if (!hasFolderEditAccess(req, folder)) {
     return res.status(403).json({ error: "Permissao negada para editar esta pasta" });
   }
-
-  folder.expiresAt = expiresAt;
-  folder.updatedAt = new Date().toISOString();
-  saveFolders(folders);
-  addActionHistory("folder_temporary_updated", folder.name, req.user.username, {
-    folderId,
-    folderName: folder.name,
-    expiresAt,
-    temporary: Boolean(expiresAt),
-  });
-
-  res.json(serializeFolderForUser(req, folder));
+  return runCloudFolderLifecycleMutation(folderId, () => {
+    const currentFolders = loadFolders();
+    const currentFolder = currentFolders.find((item) => item.id === folderId);
+    if (!currentFolder) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderEditAccess(req, currentFolder)) return res.status(403).json({ error: "Permissao negada para editar esta pasta" });
+    currentFolder.expiresAt = expiresAt;
+    currentFolder.updatedAt = new Date().toISOString();
+    saveFolders(currentFolders);
+    addActionHistory("folder_temporary_updated", currentFolder.name, req.user.username, {
+      folderId,
+      folderName: currentFolder.name,
+      expiresAt,
+      temporary: Boolean(expiresAt),
+    });
+    return res.json(serializeFolderForUser(req, currentFolder));
+  }, res);
 });
 
 app.delete("/folders/:id", authenticate, (req, res) => {
@@ -5279,32 +5650,32 @@ app.delete("/folders/:id", authenticate, (req, res) => {
   if (!canMoveToTrash(req)) {
     return res.status(403).json({ error: "Permissao negada: delete" });
   }
-  if (!hasFolderEditAccess(req, folder)) {
-    return res.status(403).json({ error: "Permissao negada para excluir esta pasta" });
-  }
-
-  try {
-    const paths = ensureFolderDirectories(folder.id);
-    const trashItem = trashService.moveFolderToTrash({
-      folder: { ...folder, ...paths },
-      deletedBy: req.user.username,
-      loaders: getTrashLoaders(),
-    });
-    auditLog("trash.folder.moved", getAuditActor(req), { type: "trash", id: trashItem.id }, "moved", "success", {
-      itemType: "folder",
-      originalFolderId: folderId,
-      folderName: folder.name,
-    });
-    addActionHistory("folder_deleted", folder.name, req.user.username, { folderId, trashId: trashItem.id });
-    broadcastDataChanged("trash", { folderId, itemType: "folder" });
-    return res.json({ message: "Pasta movida para lixeira", trashItem: serializeTrashItemForUser(trashItem) });
-  } catch (error) {
-    auditLog("trash.delete.failed", getAuditActor(req), { type: "folder", id: folderId }, "move_to_trash", "failure", {
-      error: error.message,
-    });
-    return res.status(500).json({ error: "Erro ao mover pasta para lixeira" });
-  }
-
+  return runCloudFolderLifecycleMutation(folderId, () => {
+    const currentFolder = loadFolders().find((item) => item.id === folderId);
+    if (!currentFolder) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderEditAccess(req, currentFolder)) return res.status(403).json({ error: "Permissao negada para excluir esta pasta" });
+    try {
+      const paths = ensureFolderDirectories(currentFolder.id);
+      const trashItem = trashService.moveFolderToTrash({
+        folder: { ...currentFolder, ...paths },
+        deletedBy: req.user.username,
+        loaders: getTrashLoaders(),
+      });
+      auditLog("trash.folder.moved", getAuditActor(req), { type: "trash", id: trashItem.id }, "moved", "success", {
+        itemType: "folder",
+        originalFolderId: folderId,
+        folderName: currentFolder.name,
+      });
+      addActionHistory("folder_deleted", currentFolder.name, req.user.username, { folderId, trashId: trashItem.id });
+      broadcastDataChanged("trash", { folderId, itemType: "folder" });
+      return res.json({ message: "Pasta movida para lixeira", trashItem: serializeTrashItemForUser(trashItem) });
+    } catch (error) {
+      auditLog("trash.delete.failed", getAuditActor(req), { type: "folder", id: folderId }, "move_to_trash", "failure", {
+        error: error.message,
+      });
+      return res.status(500).json({ error: "Erro ao mover pasta para lixeira" });
+    }
+  }, res);
 });
 
 // These per-IP listing limits run before authentication so they also bound anonymous requests; NAT clients share the configured quota.
@@ -5315,14 +5686,13 @@ app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req
   if (!folder) return;
 
   const name = path.basename(req.params.name);
+  if (isStoredVersionFile(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
   if (isFileInTrash(folder.id, name)) {
     return res.status(410).json({ error: "Arquivo esta na lixeira" });
   }
-  const filePath = path.join(folder.uploadDir, name);
-  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
+  if (isFileExpired(folder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
 
   if (!hasFileAccess(req, folder, name)) {
     auditLog("file.access.denied", getAuditActor(req), { type: "file", id: name }, "download", "failure", {
@@ -5334,6 +5704,23 @@ app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req
 
   if (getEncryptedFileMetadata(folder.id, name)) {
     return res.status(403).json({ error: "Use a rota de download criptografado para este arquivo" });
+  }
+
+  const filePath = path.join(folder.uploadDir, name);
+  if (isCloudStorageEnabled() && !isExistingFile(filePath) && !consumeCloudMetadataRateLimit(req, res)) return;
+  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name)) {
+    return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  }
+  if (isFileInTrash(folder.id, name)) return res.status(410).json({ error: "Arquivo esta na lixeira" });
+  if (getEncryptedFileMetadata(folder.id, name)) return res.status(403).json({ error: "Use a rota de download criptografado para este arquivo" });
+  if (!isFolderAvailable(folder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (isFileExpired(folder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+  if (!isExistingFile(filePath)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
   logAnalyticsEvent("download", {
@@ -5359,15 +5746,13 @@ app.post("/file-open-token", authenticate, requirePermission("listFiles"), async
   if (!rawName || name !== rawName) {
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
+  if (isStoredVersionFile(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
   if (isFileInTrash(folder.id, name)) {
     return res.status(410).json({ error: "Arquivo esta na lixeira" });
   }
-
-  const filePath = path.join(folder.uploadDir, name);
-  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
+  if (isFileExpired(folder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
 
   if (!hasFileAccess(req, folder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
@@ -5375,6 +5760,22 @@ app.post("/file-open-token", authenticate, requirePermission("listFiles"), async
 
   if (getEncryptedFileMetadata(folder.id, name)) {
     return res.status(403).json({ error: "Arquivo criptografado. Use Download para informar a senha quando necessario." });
+  }
+
+  const filePath = path.join(folder.uploadDir, name);
+  await ensureCloudFileCached(folder.id, name, filePath, "uploads", () => !isFileInTrash(folder.id, name));
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name)) {
+    return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  }
+  if (getEncryptedFileMetadata(folder.id, name)) return res.status(403).json({ error: "Arquivo criptografado. Use Download para informar a senha quando necessario." });
+  if (!isFolderAvailable(folder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (isFileExpired(folder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+  if (isFileInTrash(folder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (!isExistingFile(filePath)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
   const openToken = createOpenFileToken(folder.id, name);
@@ -5413,9 +5814,34 @@ app.get("/open-file/:token/:name", async (req, res) => {
   if (!name || name !== entry.fileName) {
     return res.status(400).send("Nome de arquivo invalido");
   }
+  if (isFileInTrash(entry.folderId, entry.fileName)) {
+    openFileTokens.delete(openToken);
+    return res.status(404).send("Arquivo nao encontrado");
+  }
+  if (!isFolderAvailable(entry.folderId) || isFileExpired(entry.folderId, entry.fileName)) {
+    openFileTokens.delete(openToken);
+    return res.status(404).send("Arquivo nao encontrado");
+  }
 
   const filePath = entry.filePath || path.join(getFolderStoragePath("./uploads", entry.folderId), name);
-  await ensureCloudFileCached(entry.folderId, entry.cloudFileName || entry.downloadName || name, filePath, "uploads");
+  const cloudFileName = entry.cloudFileName || entry.downloadName || name;
+  if (restoreProviderOrphans.isSuppressed(entry.folderId, cloudFileName)) {
+    openFileTokens.delete(openToken);
+    return res.status(404).send("Arquivo nao encontrado");
+  }
+  await ensureCloudFileCached(entry.folderId, cloudFileName, filePath, "uploads", () => !isFileInTrash(entry.folderId, entry.fileName), entry.fileName);
+  if (restoreProviderOrphans.isSuppressed(entry.folderId, cloudFileName)) {
+    openFileTokens.delete(openToken);
+    return res.status(404).send("Arquivo nao encontrado");
+  }
+  if (!isFolderAvailable(entry.folderId) || isFileExpired(entry.folderId, entry.fileName)) {
+    openFileTokens.delete(openToken);
+    return res.status(404).send("Arquivo nao encontrado");
+  }
+  if (isFileInTrash(entry.folderId, entry.fileName)) {
+    openFileTokens.delete(openToken);
+    return res.status(404).send("Arquivo nao encontrado");
+  }
   if (!isExistingFile(filePath)) {
     openFileTokens.delete(openToken);
     return res.status(404).send("Arquivo nao encontrado");
@@ -5457,7 +5883,7 @@ app.post("/encrypted-download/:filename", authenticate, requirePermission("listF
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
 
-  const metadata = getEncryptedFileMetadata(folder.id, name);
+  let metadata = getEncryptedFileMetadata(folder.id, name);
   if (!metadata) return res.status(404).json({ error: "Arquivo criptografado nao encontrado" });
   if (isFileInTrash(folder.id, name)) {
     return res.status(410).json({ error: "Arquivo esta na lixeira" });
@@ -5476,11 +5902,28 @@ app.post("/encrypted-download/:filename", authenticate, requirePermission("listF
   }
 
   if (metadata.accessControl?.requiresPassword && !req.body?.password) {
-    return res.status(401).json({ error: "Senha obrigatoria para este arquivo" });
+    return res.status(422).json({ error: "Senha obrigatoria para este arquivo" });
   }
 
   const filePath = path.join(folder.uploadDir, name);
-  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
+  await ensureCloudFileCached(folder.id, name, filePath, "uploads", () => !isFileInTrash(folder.id, name));
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolder = getFolderById(folder.id);
+  const currentMetadata = getEncryptedFileMetadata(folder.id, name);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name) || !currentMetadata || !canAccessEncryptedFile(req, currentMetadata)) {
+    return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  }
+  if (currentMetadata.accessControl?.expiresAt && new Date(currentMetadata.accessControl.expiresAt).getTime() <= Date.now()) {
+    return res.status(410).json({ error: "Arquivo criptografado expirado" });
+  }
+  if (currentMetadata.accessControl?.requiresPassword && !req.body?.password) {
+    return res.status(422).json({ error: "Senha obrigatoria para este arquivo" });
+  }
+  metadata = currentMetadata;
+  if (!isFolderAvailable(folder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (isFileExpired(folder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+  if (isFileInTrash(folder.id, name)) return res.status(410).json({ error: "Arquivo esta na lixeira" });
   if (!isExistingFile(filePath)) return res.status(404).json({ error: "Arquivo nao encontrado" });
 
   try {
@@ -5504,7 +5947,7 @@ app.post("/encrypted-download/:filename", authenticate, requirePermission("listF
       folderId: folder.id,
       reason: "bad_key_or_corrupt_file",
     });
-    res.status(401).json({ error: "Falha na descriptografia: senha incorreta ou arquivo corrompido" });
+    res.status(422).json({ error: "Falha na descriptografia: senha incorreta ou arquivo corrompido" });
   }
 });
 
@@ -5569,7 +6012,10 @@ function registerPendingUpload(req, options) {
   const encryptionMetadata = options.encryptionMetadata || null;
 
   const pendingUploads = loadPendingUploads();
-  pendingUploads[getPendingKey(folderId, fileName)] = {
+  const pendingKey = getPendingKey(folderId, fileName);
+  const previousPending = pendingUploads[pendingKey];
+  const previousEncryptedFiles = encryptionMetadata ? loadEncryptedFiles() : null;
+  pendingUploads[pendingKey] = {
     uploadedBy: req.user.username,
     uploadedAt,
     originalName: originalName !== fileName ? originalName : undefined,
@@ -5579,7 +6025,19 @@ function registerPendingUpload(req, options) {
   };
   savePendingUploads(pendingUploads);
   if (encryptionMetadata) saveEncryptedMetadata(folderId, fileName, encryptionMetadata);
-  syncFileToCloud(folderId, fileName, "temp");
+  if (isCloudStorageEnabled()) {
+    try {
+      cloudTempMutationQueue.setDesired(folderId, fileName, "present");
+    } catch (error) {
+      const rollbackPending = loadPendingUploads();
+      if (previousPending === undefined) delete rollbackPending[pendingKey];
+      else rollbackPending[pendingKey] = previousPending;
+      savePendingUploads(rollbackPending);
+      if (previousEncryptedFiles) saveEncryptedFiles(previousEncryptedFiles);
+      throw error;
+    }
+  }
+  restoreProviderOrphans.clear(folderId, fileName, "temp");
   logAnalyticsEvent("upload", {
     filename: fileName,
     uploadedBy: req.user.username,
@@ -6052,51 +6510,61 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
       return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
     }
 
-    const finalPath = path.join(req.uploadFolder.tempDir, metadata.fileName);
-    await assembleChunkedUpload(sessionDir, finalPath, totalChunks);
-    const stats = fs.statSync(finalPath);
+    const stagedPath = path.join(sessionDir, "assembled.upload");
+    await assembleChunkedUpload(sessionDir, stagedPath, totalChunks);
+    const stats = fs.statSync(stagedPath);
     const scan = await scanUploadBeforePending(req, {
-      filePath: finalPath,
+      filePath: stagedPath,
       fileName: metadata.fileName,
       originalName: metadata.originalName,
       folderId,
       size: stats.size,
     });
     if (!scan.allowed) {
+      fs.rmSync(stagedPath, { force: true });
       fs.rmSync(sessionDir, { recursive: true, force: true });
       return res.status(scan.status || 400).json({ error: scan.error || "Upload bloqueado por seguranca" });
     }
 
     let encryptionMetadata = null;
+    let payload;
+    let finalFileName = metadata.fileName;
+    let publishedPath = null;
     try {
-      encryptionMetadata = encryptFileInPlace(finalPath, {
-        req,
-        fileName: metadata.fileName,
-        originalName: metadata.originalName,
-        folderId,
-        originalSize: stats.size,
-        mimeType: req.file.mimetype,
-        encryptionLevel: metadata.encryptionLevel || "none",
-        password: finalPassword,
-        expiresInDays: metadata.expiresInDays || "",
+      await runCloudFolderLifecycleMutation(folderId, async () => {
+        finalFileName = getAvailableUploadFileName(metadata.fileName, folderId, true);
+        encryptionMetadata = encryptFileInPlace(stagedPath, {
+          req,
+          fileName: finalFileName,
+          originalName: metadata.originalName,
+          folderId,
+          originalSize: stats.size,
+          mimeType: req.file.mimetype,
+          encryptionLevel: metadata.encryptionLevel || "none",
+          password: finalPassword,
+          expiresInDays: metadata.expiresInDays || "",
+        });
+        const finalPath = path.join(req.uploadFolder.tempDir, finalFileName);
+        publishedPath = finalPath;
+        fs.renameSync(stagedPath, finalPath);
+        payload = registerPendingUpload(req, {
+          fileName: finalFileName,
+          originalName: metadata.originalName,
+          versionComment: metadata.versionComment,
+          size: stats.size,
+          mimeType: req.file.mimetype,
+          chunkedUpload: true,
+          encryptionMetadata,
+        });
       });
     } catch (error) {
-      fs.rmSync(finalPath, { force: true });
+      fs.rmSync(stagedPath, { force: true });
+      if (publishedPath) fs.rmSync(publishedPath, { force: true });
       fs.rmSync(sessionDir, { recursive: true, force: true });
       return res.status(400).json({ error: error.message || "Falha ao criptografar arquivo" });
     }
     fs.rmSync(sessionDir, { recursive: true, force: true });
-
-    const payload = registerPendingUpload(req, {
-      fileName: metadata.fileName,
-      originalName: metadata.originalName,
-      versionComment: metadata.versionComment,
-      size: stats.size,
-      mimeType: req.file.mimetype,
-      chunkedUpload: true,
-      encryptionMetadata,
-    });
-
+    processCloudTempMutationAfterLifecycle(folderId, finalFileName);
     res.json({ ...payload, complete: true, totalChunks });
   } catch (error) {
     removeChunkUploadIncomingFile(req.file);
@@ -6107,9 +6575,9 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
 
 app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFolder, rejectLargeSingleUpload, handleUploadSingle, async (req, res) => {
   const originalName = path.basename(req.file?.originalname || "");
-  const fileName = path.basename(req.uploadFinalFileName || "");
+  const requestedFileName = path.basename(req.uploadFinalFileName || "");
 
-  if (!req.file || !fileName) {
+  if (!req.file || !requestedFileName) {
     if (req.file?.path) fs.rmSync(req.file.path, { force: true });
     return res.status(400).json({ error: "Arquivo obrigatorio" });
   }
@@ -6122,59 +6590,74 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
     return res.status(400).json({ error: error.message || "Upload compactado invalido" });
   }
 
-  const finalTempPath = path.join(req.uploadFolder.tempDir, fileName);
+  const incomingPath = req.file.path;
+  const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
+  let finalTempPath = null;
+  let fileName = requestedFileName;
+  let payload;
   try {
-    fs.renameSync(req.file.path, finalTempPath);
-    req.file.path = finalTempPath;
-  } catch (error) {
-    fs.rmSync(req.file.path, { force: true });
-    return res.status(500).json({ error: "Nao foi possivel finalizar o upload" });
-  }
+    await runCloudFolderLifecycleMutation(folderId, async () => {
+      fileName = getAvailableUploadFileName(originalName, folderId, true);
+      const scan = await scanUploadBeforePending(req, {
+        filePath: incomingPath,
+        fileName,
+        originalName,
+        folderId,
+        size: req.file.size,
+      });
+      if (!scan.allowed) {
+        payload = { rejected: true, status: scan.status || 400, error: scan.error || "Upload bloqueado por seguranca" };
+        return;
+      }
 
-  const scan = await scanUploadBeforePending(req, {
-    filePath: finalTempPath,
-    fileName,
-    originalName,
-    folderId: req.uploadFolder?.id || ROOT_FOLDER_ID,
-    size: req.file.size,
-  });
-  if (!scan.allowed) {
-    return res.status(scan.status || 400).json({ error: scan.error || "Upload bloqueado por seguranca" });
-  }
-
-  let encryptionMetadata = null;
-  try {
-    encryptionMetadata = encryptFileInPlace(finalTempPath, {
-      req,
-      fileName,
-      originalName,
-      folderId: req.uploadFolder?.id || ROOT_FOLDER_ID,
-      originalSize: req.file.size,
-      mimeType: req.file.mimetype,
-      encryptionLevel: req.body.encryptionLevel || "none",
-      password: req.body.password || "",
-      expiresInDays: req.body.expiresInDays || "",
+      let encryptionMetadata;
+      try {
+        encryptionMetadata = encryptFileInPlace(incomingPath, {
+          req,
+          fileName,
+          originalName,
+          folderId,
+          originalSize: req.file.size,
+          mimeType: req.file.mimetype,
+          encryptionLevel: req.body.encryptionLevel || "none",
+          password: req.body.password || "",
+          expiresInDays: req.body.expiresInDays || "",
+        });
+      } catch (error) {
+        payload = { rejected: true, status: 400, error: error.message || "Falha ao criptografar arquivo" };
+        return;
+      }
+      finalTempPath = path.join(req.uploadFolder.tempDir, fileName);
+      fs.renameSync(incomingPath, finalTempPath);
+      req.file.path = finalTempPath;
+      payload = registerPendingUpload(req, {
+        fileName,
+        originalName,
+        versionComment: req.body.versionComment,
+        size: req.file.size,
+        mimeType: req.file.mimetype,
+        compressedUpload: uploadWasCompressed,
+        encryptionMetadata,
+      });
     });
   } catch (error) {
-    fs.rmSync(finalTempPath, { force: true });
-    return res.status(400).json({ error: error.message || "Falha ao criptografar arquivo" });
+    fs.rmSync(incomingPath, { force: true });
+    if (finalTempPath) fs.rmSync(finalTempPath, { force: true });
+    return res.status(500).json({ error: error.message || "Nao foi possivel finalizar o upload" });
   }
 
-  res.json(registerPendingUpload(req, {
-    fileName,
-    originalName,
-    versionComment: req.body.versionComment,
-    size: req.file.size,
-    mimeType: req.file.mimetype,
-    compressedUpload: uploadWasCompressed,
-    encryptionMetadata,
-  }));
+  if (payload?.rejected) {
+    fs.rmSync(incomingPath, { force: true });
+    return res.status(payload.status).json({ error: payload.error });
+  }
+  processCloudTempMutationAfterLifecycle(folderId, fileName);
+  res.json(payload);
 });
 
-app.put("/file-temporary", fileTemporaryRateLimit, authenticate, (req, res) => {
+app.put("/file-temporary", fileTemporaryRateLimit, authenticate, async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
-  const folder = getAccessibleFolderOrRespond(req, res, req.body.folderId);
+  const folder = getAccessibleFolderRecordOrRespond(req, res, req.body.folderId);
   if (!folder) return;
 
   if (!rawName || name !== rawName) {
@@ -6185,46 +6668,49 @@ app.put("/file-temporary", fileTemporaryRateLimit, authenticate, (req, res) => {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
 
-  const filePath = path.join(folder.uploadDir, name);
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
 
   const expiresAt = getTemporaryExpirationFromBody(req.body);
   if (expiresAt === undefined) {
     return res.status(400).json({ error: "Expiracao temporaria invalida" });
   }
 
-  const expirations = loadFileExpirations();
-  const key = getFileExpirationKey(folder.id, name);
-
-  if (!expiresAt) {
-    delete expirations[key];
-  } else {
-    expirations[key] = {
+  return runCloudFileLifecycleMutation(folder.id, name, async () => {
+    const currentFolder = getFolderById(folder.id);
+    if (!currentFolder || !isFolderAvailable(folder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderAccess(req, currentFolder) || !hasFileEditAccess(req, currentFolder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (!await getListedFileDetails({ ...currentFolder, ...ensureFolderDirectories(currentFolder.id) }, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const revalidatedFolder = getFolderById(folder.id);
+    if (!revalidatedFolder || !hasFileEditAccess(req, revalidatedFolder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    const expirations = loadFileExpirations();
+    const key = getFileExpirationKey(folder.id, name);
+    if (!expiresAt) {
+      delete expirations[key];
+    } else {
+      expirations[key] = {
+        folderId: folder.id,
+        fileName: name,
+        expiresAt,
+        updatedAt: new Date().toISOString(),
+        updatedBy: req.user.username,
+      };
+    }
+    saveFileExpirations(expirations);
+    addActionHistory("file_temporary_updated", name, req.user.username, {
+      folderId: folder.id,
+      folderName: currentFolder.name,
+      expiresAt,
+      temporary: Boolean(expiresAt),
+    });
+    return res.json({
+      message: "Temporariedade do arquivo atualizada",
       folderId: folder.id,
       fileName: name,
       expiresAt,
-      updatedAt: new Date().toISOString(),
-      updatedBy: req.user.username,
-    };
-  }
-
-  saveFileExpirations(expirations);
-  addActionHistory("file_temporary_updated", name, req.user.username, {
-    folderId: folder.id,
-    folderName: folder.name,
-    expiresAt,
-    temporary: Boolean(expiresAt),
-  });
-
-  res.json({
-    message: "Temporariedade do arquivo atualizada",
-    folderId: folder.id,
-    fileName: name,
-    expiresAt,
-    temporary: Boolean(expiresAt),
-  });
+      temporary: Boolean(expiresAt),
+    });
+  }, res);
 });
 
 function getFileListCaches() {
@@ -6247,7 +6733,7 @@ function hasPublicLinkForFile(folderId, fileName, publicLinks = {}) {
 function buildVisibleFileEntry(req, folder, file, caches = getFileListCaches()) {
   if (isStoredVersionFile(folder.id, file.name, caches.fileVersions)) return null;
   if (isFileInTrash(folder.id, file.name)) return null;
-  if (!hasFileAccess(req, folder, file.name, caches.filePermissions)) return null;
+  if (!hasFileAccess(req, folder, file.name, caches.filePermissions, caches.fileExpirations)) return null;
 
   const encryption = getEncryptedFileMetadata(folder.id, file.name, caches.encryptedFiles);
   if (!canAccessEncryptedFile(req, encryption)) return null;
@@ -6282,8 +6768,8 @@ function buildVisibleFileEntry(req, folder, file, caches = getFileListCaches()) 
 }
 
 async function listVisibleFilesForFolder(req, folder, caches = getFileListCaches()) {
-  await syncFolderCacheFromCloud(folder.id, "uploads");
-  const files = await listFilesWithDetailsAsync(folder.uploadDir);
+  const files = await listFilesWithCloudDetails(folder.uploadDir, folder.id, "uploads");
+  caches.fileExpirations = loadFileExpirations();
   return files
     .map((file) => buildVisibleFileEntry(req, folder, file, caches))
     .filter(Boolean);
@@ -6307,7 +6793,11 @@ async function resolveWebDavFile(req, folder, fileName) {
   if (!hasFileAccess(req, folder, name)) return null;
 
   const filePath = path.join(folder.uploadDir, name);
-  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
+  await ensureCloudFileCached(folder.id, name, filePath, "uploads", () => !isFileInTrash(folder.id, name));
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder) || !hasFileAccess(req, currentFolder, name)) return null;
+  if (isWebDavFileExpired(folder.id, name) || isWebDavEncryptedFile(folder.id, name) || isWebDavInternalStoredFile(folder.id, name)) return null;
+  if (!isFolderAvailable(folder.id) || isFileInTrash(folder.id, name) || isFileExpired(folder.id, name)) return null;
   if (!isExistingFile(filePath)) return null;
 
   return {
@@ -6573,29 +7063,51 @@ async function handleWebDavPut(req, res, segments) {
       return res.status(written > SINGLE_UPLOAD_MAX_BYTES ? 413 : 400).send(written > SINGLE_UPLOAD_MAX_BYTES ? "File too large for WebDAV MVP upload" : "Content-Length mismatch");
     }
 
-    const finalFileName = getAvailableUploadFileName(target.fileName, target.folder.id, true);
-    finalPath = path.join(target.folder.tempDir, finalFileName);
-    fs.mkdirSync(target.folder.tempDir, { recursive: true });
-    fs.renameSync(incomingPath, finalPath);
-    const scan = await scanUploadBeforePending(req, {
-      filePath: finalPath,
-      fileName: finalFileName,
-      originalName: target.fileName,
-      folderId: target.folder.id,
-      size: written,
-    });
-    if (!scan.allowed) {
-      fs.rmSync(finalPath, { force: true });
-      return res.status(scan.status || 400).send(scan.error || "Upload bloqueado por seguranca");
-    }
-
     req.uploadFolder = target.folder;
-    registerPendingUpload(req, {
-      fileName: finalFileName,
-      originalName: target.fileName,
-      size: written,
-      mimeType: getMimeType(target.fileName),
+    let finalFileName;
+    let scanFailure;
+    await runCloudFolderLifecycleMutation(target.folder.id, async () => {
+      if (!refreshAuthenticatedUser(req, res)) return;
+      const currentFolder = getFolderById(target.folder.id);
+      if (!currentFolder || !isFolderAvailable(currentFolder.id)) return res.status(404).send("Folder not found");
+      if (!hasFolderAccess(req, currentFolder) || !req.user.permissions?.upload) return res.status(403).send("Upload permission required");
+      req.uploadFolder = { ...currentFolder, ...ensureFolderDirectories(currentFolder.id) };
+      finalFileName = getAvailableUploadFileName(target.fileName, target.folder.id, true);
+      const scan = await scanUploadBeforePending(req, {
+        filePath: incomingPath,
+        fileName: finalFileName,
+        originalName: target.fileName,
+        folderId: target.folder.id,
+        size: written,
+      });
+      if (!scan.allowed) {
+        scanFailure = { status: scan.status || 400, error: scan.error || "Upload bloqueado por seguranca" };
+        return;
+      }
+      if (!refreshAuthenticatedUser(req, res)) return;
+      const publishFolder = getFolderById(target.folder.id);
+      if (!publishFolder || !isFolderAvailable(publishFolder.id)) return res.status(404).send("Folder not found");
+      if (!hasFolderAccess(req, publishFolder) || !req.user.permissions?.upload) return res.status(403).send("Upload permission required");
+      req.uploadFolder = { ...publishFolder, ...ensureFolderDirectories(publishFolder.id) };
+      finalPath = path.join(req.uploadFolder.tempDir, finalFileName);
+      fs.mkdirSync(req.uploadFolder.tempDir, { recursive: true });
+      fs.renameSync(incomingPath, finalPath);
+      registerPendingUpload(req, {
+        fileName: finalFileName,
+        originalName: target.fileName,
+        size: written,
+        mimeType: getMimeType(target.fileName),
+      });
     });
+    if (res.headersSent) {
+      fs.rmSync(incomingPath, { force: true });
+      return;
+    }
+    if (scanFailure) {
+      fs.rmSync(incomingPath, { force: true });
+      return res.status(scanFailure.status).send(scanFailure.error);
+    }
+    processCloudTempMutationAfterLifecycle(target.folder.id, finalFileName);
 
     auditLog("webdav.upload", getAuditActor(req), { type: "file", id: finalFileName }, "upload", "success", {
       folderId: target.folder.id,
@@ -7225,6 +7737,11 @@ async function handleWebDavMove(req, res, segments) {
   const destinationSegments = getWebDavMoveDestination(req);
   const destination = destinationSegments && getWebDavUploadTarget(req, destinationSegments);
   if (!source || source.type !== "file" || !destination) return res.status(409).send("Invalid MOVE target");
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentSource = getFolderById(source.folder.id);
+  const currentDestination = getFolderById(destination.folder.id);
+  if (!currentSource || !currentDestination || !hasFolderAccess(req, currentSource) || !hasFolderAccess(req, currentDestination) || !hasFileEditAccess(req, currentSource, source.name)) return res.status(403).send("Permission denied");
+  if (!req.user.permissions?.upload || !isFolderAvailable(currentSource.id) || !isFolderAvailable(currentDestination.id) || isFileInTrash(currentSource.id, source.name)) return res.status(404).send("Not found");
   if (source.folder.id !== destination.folder.id) return res.status(403).send("Cross-folder MOVE is not supported");
   if (!hasFileEditAccess(req, source.folder, source.name)) return res.status(403).send("Permission denied");
   if (source.name === destination.fileName) return res.status(403).send("Source and destination are identical");
@@ -7565,6 +8082,10 @@ app.get("/versions/:filename", versionsRateLimit, authenticate, requirePermissio
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
 
+  if (isFileInTrash(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+
   const filePath = path.join(folder.uploadDir, name);
   if (!isExistingFile(filePath)) {
     return res.status(404).json({ error: "Arquivo nao encontrado" });
@@ -7594,6 +8115,7 @@ app.post("/versions/:filename/initialize", versionsRateLimit, authenticate, requ
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
   if (!folder) return;
   if (!rawName || name !== rawName) return res.status(400).json({ error: "Nome de arquivo invalido" });
+  if (isFileInTrash(folder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
   if (!hasFileAccess(req, folder, name)) return res.status(403).json({ error: "Acesso negado a este arquivo" });
   const filePath = path.join(folder.uploadDir, name);
   if (!isExistingFile(filePath)) return res.status(404).json({ error: "Arquivo nao encontrado" });
@@ -7612,20 +8134,36 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
     return res.status(400).json({ error: "Versao invalida" });
   }
 
+  if (isFileInTrash(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+
   if (!hasFileAccess(req, folder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
 
+  if (getEncryptedFileMetadata(folder.id, name)) {
+    return res.status(403).json({ error: "Download de versoes criptografadas exige a versao atual da rota segura" });
+  }
+
   const target = getVersionFilePath(folder, name, versionNumber);
   if (target?.version?.storedAs) {
-    await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads");
+    if (isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+    await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads", () => !isFileInTrash(folder.id, name), name);
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  if (target?.version?.storedAs && isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name)) return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  if (getEncryptedFileMetadata(folder.id, name)) return res.status(403).json({ error: "Download de versoes criptografadas exige a versao atual da rota segura" });
+  if (!isFolderAvailable(folder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (isFileExpired(folder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+  if (isFileInTrash(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
   if (!target || !isExistingFile(target.filePath)) {
     return res.status(404).json({ error: "Versao nao encontrada" });
-  }
-
-  if (getEncryptedFileMetadata(folder.id, name)) {
-    return res.status(403).json({ error: "Download de versoes criptografadas exige a versao atual da rota segura" });
   }
 
   sendOptimizedFile(req, res, target.filePath, name, "attachment");
@@ -7642,13 +8180,33 @@ app.post("/version-open-token", authenticate, requirePermission("listFiles"), as
     return res.status(400).json({ error: "Versao invalida" });
   }
 
+  if (isFileInTrash(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+
   if (!hasFileAccess(req, folder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
 
+  if (getEncryptedFileMetadata(folder.id, name)) {
+    return res.status(403).json({ error: "Download de versoes criptografadas exige a versao atual da rota segura" });
+  }
+
   const target = getVersionFilePath(folder, name, versionNumber);
   if (target?.version?.storedAs) {
-    await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads");
+    if (restoreProviderOrphans.isSuppressed(folder.id, target.version.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+    await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads", () => !isFileInTrash(folder.id, name), name);
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  if (target?.version?.storedAs && restoreProviderOrphans.isSuppressed(folder.id, target.version.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name)) return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  if (getEncryptedFileMetadata(folder.id, name)) return res.status(403).json({ error: "Download de versoes criptografadas exige a versao atual da rota segura" });
+  if (!isFolderAvailable(folder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (isFileExpired(folder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+  if (isFileInTrash(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
   if (!target || !isExistingFile(target.filePath)) {
     return res.status(404).json({ error: "Versao nao encontrada" });
@@ -7677,88 +8235,76 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
     return res.status(400).json({ error: "Versao invalida" });
   }
 
-  if (!hasFileEditAccess(req, folder, name)) {
-    return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
-  }
+  if (isFileInTrash(folder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (!hasFileEditAccess(req, folder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
 
-  const entries = loadFileVersions();
-  const key = getFileVersionKey(folder.id, name);
-  const history = normalizeVersionHistory(entries[key]);
-  const target = history.versions.find((item) => item.version === versionNumber);
+  return runCloudFileLifecycleMutation(folder.id, name, async () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const currentFolder = getReadableFolderOrRespond(req, res, folder.id);
+    if (!currentFolder) return;
+    if (isFileInTrash(currentFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (isFileExpired(currentFolder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+    if (!hasFileEditAccess(req, currentFolder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
 
-  if (!target) {
-    return res.status(404).json({ error: "Versao nao encontrada" });
-  }
+    const entries = loadFileVersions();
+    const key = getFileVersionKey(currentFolder.id, name);
+    const history = normalizeVersionHistory(entries[key]);
+    const target = history.versions.find((item) => item.version === versionNumber);
+    if (!target) return res.status(404).json({ error: "Versao nao encontrada" });
+    if (versionNumber === history.currentVersion) return res.status(400).json({ error: "Esta versao ja e a atual" });
+    if (isRestoreProviderOrphanDenied(req, currentFolder.id, target.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+    if (isCloudStorageEnabled() && !consumeCloudMetadataRateLimit(req, res)) return;
 
-  if (versionNumber === history.currentVersion) {
-    return res.status(400).json({ error: "Esta versao ja e a atual" });
-  }
+    const currentPath = path.join(currentFolder.uploadDir, name);
+    const targetPath = path.join(currentFolder.uploadDir, target.storedAs);
+    await ensureCloudFileCached(currentFolder.id, name, currentPath, "uploads", () => !isFileInTrash(currentFolder.id, name));
+    if (isRestoreProviderOrphanDenied(req, currentFolder.id, target.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+    await ensureCloudFileCached(currentFolder.id, target.storedAs, targetPath, "uploads", () => !isFileInTrash(currentFolder.id, name), name);
+    if (isRestoreProviderOrphanDenied(req, currentFolder.id, target.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+    if (!isFolderAvailable(currentFolder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (isFileExpired(currentFolder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+    if (isFileInTrash(currentFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (!isExistingFile(currentPath) || !isExistingFile(targetPath)) return res.status(404).json({ error: "Arquivo da versao nao encontrado" });
 
-  const currentPath = path.join(folder.uploadDir, name);
-  const targetPath = path.join(folder.uploadDir, target.storedAs);
-  await ensureCloudFileCached(folder.id, name, currentPath, "uploads");
-  await ensureCloudFileCached(folder.id, target.storedAs, targetPath, "uploads");
-  if (!isExistingFile(currentPath) || !isExistingFile(targetPath)) {
-    return res.status(404).json({ error: "Arquivo da versao nao encontrado" });
-  }
-
-  try {
-    const oldCurrentVersion = history.currentVersion;
-    const archivedName = getStoredVersionName(name, oldCurrentVersion);
-    const archivedPath = path.join(folder.uploadDir, archivedName);
-
-    fs.renameSync(currentPath, archivedPath);
-    for (const version of history.versions) {
-      if (version.version === oldCurrentVersion) {
-        version.storedAs = archivedName;
-        version.size = fs.statSync(archivedPath).size;
+    try {
+      const oldCurrentVersion = history.currentVersion;
+      const archivedName = getStoredVersionName(name, oldCurrentVersion);
+      const archivedPath = path.join(currentFolder.uploadDir, archivedName);
+      fs.renameSync(currentPath, archivedPath);
+      for (const version of history.versions) {
+        if (version.version === oldCurrentVersion) {
+          version.storedAs = archivedName;
+          version.size = fs.statSync(archivedPath).size;
+        }
       }
+      fs.copyFileSync(targetPath, currentPath);
+      const stats = fs.statSync(currentPath);
+      const newVersion = oldCurrentVersion + 1;
+      history.currentVersion = newVersion;
+      history.versions.push({
+        version: newVersion,
+        storedAs: name,
+        uploadedBy: req.user.username,
+        uploadedAt: new Date().toISOString(),
+        size: stats.size,
+        comment: `Restaurado da versao ${versionNumber}`,
+      });
+      entries[key] = history;
+      pruneFileVersions(entries, key, currentFolder);
+      saveFileVersions(entries);
+      syncFileVersionsToCloud(currentFolder.id, name);
+      addActionHistory("version_restored", name, req.user.username, { folderId: currentFolder.id, folderName: currentFolder.name, restoredVersion: versionNumber, newVersion });
+      logAnalyticsEvent("restore", { filename: name, restoredBy: req.user.username, restoredVersion: versionNumber, newVersion, folderId: currentFolder.id, folderName: currentFolder.name });
+      auditLog("file.version.restore", getAuditActor(req), { type: "file", id: name }, "restored", "success", { folderId: currentFolder.id, restoredVersion: versionNumber, newVersion });
+      return res.json({ message: "Versao restaurada", version: newVersion, restoredVersion: versionNumber });
+    } catch (error) {
+      console.error("Erro ao restaurar versao:", error.message);
+      return res.status(500).json({ error: "Erro ao restaurar versao" });
     }
-
-    fs.copyFileSync(targetPath, currentPath);
-    const stats = fs.statSync(currentPath);
-    const newVersion = oldCurrentVersion + 1;
-    history.currentVersion = newVersion;
-    history.versions.push({
-      version: newVersion,
-      storedAs: name,
-      uploadedBy: req.user.username,
-      uploadedAt: new Date().toISOString(),
-      size: stats.size,
-      comment: `Restaurado da versao ${versionNumber}`,
-    });
-
-    entries[key] = history;
-    pruneFileVersions(entries, key, folder);
-    saveFileVersions(entries);
-    syncFileVersionsToCloud(folder.id, name);
-    addActionHistory("version_restored", name, req.user.username, {
-      folderId: folder.id,
-      folderName: folder.name,
-      restoredVersion: versionNumber,
-      newVersion,
-    });
-    logAnalyticsEvent("restore", {
-      filename: name,
-      restoredBy: req.user.username,
-      restoredVersion: versionNumber,
-      newVersion,
-      folderId: folder.id,
-      folderName: folder.name,
-    });
-    auditLog("file.version.restore", getAuditActor(req), { type: "file", id: name }, "restored", "success", {
-      folderId: folder.id,
-      restoredVersion: versionNumber,
-      newVersion,
-    });
-    res.json({ message: "Versao restaurada", version: newVersion, restoredVersion: versionNumber });
-  } catch (error) {
-    console.error("Erro ao restaurar versao:", error.message);
-    res.status(500).json({ error: "Erro ao restaurar versao" });
-  }
+  }, res);
 });
 
-app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, requirePermission("delete"), (req, res) => {
+app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, requirePermission("delete"), async (req, res) => {
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const versionNumber = Number(req.params.version);
@@ -7769,46 +8315,32 @@ app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, re
     return res.status(400).json({ error: "Versao invalida" });
   }
 
-  const owner = normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, name)).owner;
-  if (!canManageAccess(req) && owner !== req.user?.username) {
-    return res.status(403).json({ error: "Apenas o dono ou admin pode deletar versoes" });
-  }
+  return runCloudFileLifecycleMutation(folder.id, name, async () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    if (!req.user?.permissions?.delete) return res.status(403).json({ error: "Permissao negada: delete" });
+    const currentFolder = getReadableFolderOrRespond(req, res, folder.id);
+    if (!currentFolder) return;
+    if (isFileInTrash(currentFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    const owner = normalizeFilePermissionEntry(getFilePermissionEntry(currentFolder.id, name)).owner;
+    if (!canManageAccess(req) && owner !== req.user?.username) return res.status(403).json({ error: "Apenas o dono ou admin pode deletar versoes" });
 
-  const entries = loadFileVersions();
-  const key = getFileVersionKey(folder.id, name);
-  const history = normalizeVersionHistory(entries[key]);
-  const target = history.versions.find((item) => item.version === versionNumber);
+    const entries = loadFileVersions();
+    const key = getFileVersionKey(currentFolder.id, name);
+    const history = normalizeVersionHistory(entries[key]);
+    const target = history.versions.find((item) => item.version === versionNumber);
+    if (!target) return res.status(404).json({ error: "Versao nao encontrada" });
+    if (versionNumber === history.currentVersion) return res.status(400).json({ error: "A versao atual nao pode ser deletada" });
 
-  if (!target) {
-    return res.status(404).json({ error: "Versao nao encontrada" });
-  }
-
-  if (versionNumber === history.currentVersion) {
-    return res.status(400).json({ error: "A versao atual nao pode ser deletada" });
-  }
-
-  fs.rmSync(path.join(folder.uploadDir, target.storedAs), { force: true });
-  deleteCloudFileLater(folder.id, target.storedAs, "uploads");
-  history.versions = history.versions.filter((item) => item.version !== versionNumber);
-  entries[key] = history;
-  saveFileVersions(entries);
-  addActionHistory("version_deleted", name, req.user.username, {
-    folderId: folder.id,
-    folderName: folder.name,
-    version: versionNumber,
-  });
-  logAnalyticsEvent("versionDeletion", {
-    filename: name,
-    deletedBy: req.user.username,
-    version: versionNumber,
-    folderId: folder.id,
-    folderName: folder.name,
-  });
-  auditLog("file.version.delete", getAuditActor(req), { type: "file", id: name }, "deleted", "success", {
-    folderId: folder.id,
-    version: versionNumber,
-  });
-  res.json({ message: "Versao deletada" });
+    fs.rmSync(path.join(currentFolder.uploadDir, target.storedAs), { force: true });
+    deleteCloudFileLater(currentFolder.id, target.storedAs, "uploads");
+    history.versions = history.versions.filter((item) => item.version !== versionNumber);
+    entries[key] = history;
+    saveFileVersions(entries);
+    addActionHistory("version_deleted", name, req.user.username, { folderId: currentFolder.id, folderName: currentFolder.name, version: versionNumber });
+    logAnalyticsEvent("versionDeletion", { filename: name, deletedBy: req.user.username, version: versionNumber, folderId: currentFolder.id, folderName: currentFolder.name });
+    auditLog("file.version.delete", getAuditActor(req), { type: "file", id: name }, "deleted", "success", { folderId: currentFolder.id, version: versionNumber });
+    return res.json({ message: "Versao deletada" });
+  }, res);
 });
 
 app.get("/history", authenticate, requirePermission("listFiles"), (req, res) => {
@@ -7862,6 +8394,7 @@ registerTrashRoutes(app, {
   canRestoreTrashItem,
   deleteCloudTrashItem,
   deleteCloudTrashItemLater,
+  processCloudTrashDeletion,
   ensureFolderDirectories,
   getAuditActor,
   getCloudStorageStatus,
@@ -7871,19 +8404,23 @@ registerTrashRoutes(app, {
   isCloudStorageEnabled,
   requirePermission,
   requireTrashManageAccess,
+  refreshAuthenticatedUser,
+  revalidateTrashManageAccess,
+  runCloudFileLifecycleMutation,
+  runCloudFolderLifecycleMutation,
   rootFolderId: ROOT_FOLDER_ID,
   serializeTrashItemForUser,
   trashRepository,
   trashService,
 });
 
-app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"), (req, res) => {
+app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const expiresInMinutes = getShareExpirationMinutes(req.body.expiresInMinutes);
   const maxViews = getShareMaxViews(req.body.maxViews);
   const maxDownloads = getShareMaxDownloads(req.body.maxDownloads);
-  const passwordHash = getSharePasswordHash(req.body.password);
+  const sharePassword = getSharePassword(req.body.password);
   const folder = getReadableFolderOrRespond(req, res, req.body.folderId);
   if (!folder) return;
 
@@ -7913,13 +8450,8 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     });
   }
 
-  if (passwordHash === undefined) {
+  if (sharePassword === undefined) {
     return res.status(400).json({ error: "Senha do link deve ter entre 4 e 128 caracteres." });
-  }
-
-  const filePath = path.join(folder.uploadDir, name);
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
   if (!hasFileAccess(req, folder, name)) {
@@ -7929,6 +8461,19 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
   if (getEncryptedFileMetadata(folder.id, name)) {
     return res.status(403).json({ error: "Links publicos nao estao disponiveis para arquivos criptografados" });
   }
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
+  if (!await getListedFileDetails(folder, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name)) {
+    return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  }
+  if (getEncryptedFileMetadata(folder.id, name)) {
+    return res.status(403).json({ error: "Links publicos nao estao disponiveis para arquivos criptografados" });
+  }
+  const passwordHash = sharePassword ? bcrypt.hashSync(sharePassword, 10) : null;
 
   const links = cleanupExpiredPublicLinks();
   const shareToken = crypto.randomBytes(24).toString("hex");
@@ -7936,7 +8481,7 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
 
   links[shareToken] = {
     fileName: name,
-    folderId: folder.id,
+    folderId: currentFolder.id,
     createdAt: new Date().toISOString(),
     expiresAt,
     createdBy: req.user.username,
@@ -7951,14 +8496,14 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
   savePublicLinks(links);
   addActionHistory("share_created", name, req.user.username, {
     expiresAt,
-    folderId: folder.id,
-    folderName: folder.name,
+    folderId: currentFolder.id,
+    folderName: currentFolder.name,
     maxViews,
     maxDownloads,
     passwordProtected: Boolean(passwordHash),
   });
   auditLog("share.created", getAuditActor(req), { type: "file", id: name }, "created", "success", {
-    folderId: folder.id,
+    folderId: currentFolder.id,
     token: shareToken,
     expiresAt,
     maxViews,
@@ -8116,7 +8661,16 @@ app.get("/pending", authenticate, async (req, res) => {
     if (err) return res.status(500).json({ error: "Erro ao listar" });
     const encryptedFiles = loadEncryptedFiles();
 
-    const visibleFiles = files
+    const byName = new Map(files.map((file) => [file.name, file]));
+    for (const [key, entry] of Object.entries(loadPendingUploads())) {
+      const name = path.basename(entry?.fileName || key);
+      const entryFolderId = entry?.folderId || (String(key).includes("/") ? String(key).split("/")[0] : ROOT_FOLDER_ID);
+      if (entryFolderId !== folder.id || !name || !restoreProviderOrphans.isSuppressed(folder.id, name, "temp")) continue;
+      const existing = byName.get(name);
+      byName.set(name, { ...(existing || { name, size: 0, modified: null }), restoreOrphan: true, availability: "recovery_required" });
+    }
+
+    const visibleFiles = [...byName.values()]
       .map((file) => ({
         ...file,
         folderId: folder.id,
@@ -8161,58 +8715,83 @@ app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("ap
   const name = path.basename(req.params.name);
   const requestedFolder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!requestedFolder) return;
+  if (!refreshAuthenticatedUser(req, res)) return;
+  if (!req.user.permissions?.approve) return res.status(403).json({ error: "Permissao negada: approve" });
+  const target = await findPendingApprovalTarget(req, requestedFolder, name, { allowRestoreOrphan: true });
+  if (!target) return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
+  if (target.restoreOrphan) return res.status(409).json({ error: "Payload pendente nao consta no backup restaurado; rejeite ou envie novamente" });
 
   try {
-    const target = await findPendingApprovalTarget(req, requestedFolder, name);
-    if (!target) {
-      return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
-    }
+    return runCloudFileLifecycleMutation(target.folder.id, name, async () => {
+      if (!refreshAuthenticatedUser(req, res)) return;
+      if (!req.user.permissions?.approve) return res.status(403).json({ error: "Permissao negada: approve" });
+      const folder = getApprovalFolderById(target.folder.id);
+      if (!folder || !isFolderAvailable(folder.id) || (!canManageAccess(req) && !hasFolderAccess(req, folder))) {
+        return res.status(403).json({ error: "Permissao negada para aprovar nesta pasta" });
+      }
 
-    const { folder, pendingPath } = target;
-    const pendingUploads = loadPendingUploads();
-    const key = getPendingKey(folder.id, name);
-    const pendingEntry = pendingUploads[key] || pendingUploads[name] || {};
-    const uploadedBy = pendingEntry.uploadedBy || null;
-    const versionInfo = recordApprovedFileVersion(
-      folder,
-      name,
-      pendingPath,
-      uploadedBy || req.user.username,
-      pendingEntry.versionComment || ""
-    );
-    promoteEncryptedMetadataAfterApproval(folder.id, name, uploadedBy || req.user.username);
-    syncFileVersionsToCloud(folder.id, name);
-    deleteCloudFileLater(folder.id, name, "temp");
+      const pendingUploads = loadPendingUploads();
+      const key = getPendingKey(folder.id, name);
+      const pendingEntry = pendingUploads[key] || pendingUploads[name];
+      if (!pendingEntry) return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
+      if (restoreProviderOrphans.isSuppressed(folder.id, name, "temp")) {
+        return res.status(409).json({ error: "Payload pendente nao consta no backup restaurado; rejeite ou envie novamente" });
+      }
+      const pendingPath = path.join(folder.tempDir, name);
+      if (!isExistingFile(pendingPath)) await ensureCloudFileCached(folder.id, name, pendingPath, "temp");
+      if (!isExistingFile(pendingPath) || !getPendingUploadEntry(folder.id, name)) {
+        return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
+      }
 
-    delete pendingUploads[key];
-    if (folder.id === ROOT_FOLDER_ID) delete pendingUploads[name];
-    savePendingUploads(pendingUploads);
-    setFileOwner(folder.id, name, uploadedBy);
-    logAnalyticsEvent("approval", {
-      filename: name,
-      approvedBy: req.user.username,
-      folderId: folder.id,
-      folderName: folder.name,
-    });
-    auditLog("file.approve", getAuditActor(req), { type: "file", id: name }, "approved", "success", {
-      from: "temp",
-      to: "uploads",
-      folderId: folder.id,
-      version: versionInfo.currentVersion,
-    });
-    addActionHistory("approved", name, req.user.username, {
-      uploadedBy,
-      folderId: folder.id,
-      folderName: folder.name,
-      version: versionInfo.currentVersion,
-      replaced: versionInfo.replaced,
-    });
-    res.json({
-      message: "Aprovado",
-      fileName: name,
-      folderId: folder.id,
-      version: versionInfo.currentVersion,
-      replaced: versionInfo.replaced,
+      const uploadedBy = pendingEntry.uploadedBy || null;
+      const versionInfo = recordApprovedFileVersion(
+        folder,
+        name,
+        pendingPath,
+        uploadedBy || req.user.username,
+        pendingEntry.versionComment || ""
+      );
+      promoteEncryptedMetadataAfterApproval(folder.id, name, uploadedBy || req.user.username);
+      syncFileVersionsToCloud(folder.id, name);
+      let cloudCleanupPending = false;
+      try {
+        await deleteCloudTempFile(folder.id, name);
+      } catch (error) {
+        cloudCleanupPending = true;
+        console.error("[cloud-temp] approval cleanup pending:", sanitizeLogValue(error.message));
+      }
+
+      delete pendingUploads[key];
+      if (folder.id === ROOT_FOLDER_ID) delete pendingUploads[name];
+      savePendingUploads(pendingUploads);
+      setFileOwner(folder.id, name, uploadedBy);
+      logAnalyticsEvent("approval", {
+        filename: name,
+        approvedBy: req.user.username,
+        folderId: folder.id,
+        folderName: folder.name,
+      });
+      auditLog("file.approve", getAuditActor(req), { type: "file", id: name }, "approved", "success", {
+        from: "temp",
+        to: "uploads",
+        folderId: folder.id,
+        version: versionInfo.currentVersion,
+      });
+      addActionHistory("approved", name, req.user.username, {
+        uploadedBy,
+        folderId: folder.id,
+        folderName: folder.name,
+        version: versionInfo.currentVersion,
+        replaced: versionInfo.replaced,
+      });
+      return res.status(cloudCleanupPending ? 202 : 200).json({
+        message: "Aprovado",
+        fileName: name,
+        folderId: folder.id,
+        version: versionInfo.currentVersion,
+        replaced: versionInfo.replaced,
+        cloudCleanupPending,
+      });
     });
   } catch (error) {
     console.error("Erro ao aprovar arquivo:", error.message);
@@ -8225,23 +8804,50 @@ app.post("/reject/:name", rejectRateLimit, authenticate, requirePermission("appr
   const name = path.basename(req.params.name);
   const requestedFolder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!requestedFolder) return;
+  if (!refreshAuthenticatedUser(req, res)) return;
+  if (!req.user.permissions?.approve) return res.status(403).json({ error: "Permissao negada: approve" });
+  const target = await findPendingApprovalTarget(req, requestedFolder, name, { allowRestoreOrphan: true });
+  if (!target) return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
 
-  const target = await findPendingApprovalTarget(req, requestedFolder, name);
-  if (!target) {
-    return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
-  }
-
-  const { folder, pendingPath } = target;
-  fs.unlink(pendingPath, (err) => {
-    if (err) return res.status(500).json({ error: "Erro ao rejeitar" });
+  return runCloudFileLifecycleMutation(target.folder.id, name, async () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    if (!req.user.permissions?.approve) return res.status(403).json({ error: "Permissao negada: approve" });
+    const folder = getApprovalFolderById(target.folder.id);
+    if (!folder || !isFolderAvailable(folder.id) || (!canManageAccess(req) && !hasFolderAccess(req, folder))) {
+      return res.status(403).json({ error: "Permissao negada para rejeitar nesta pasta" });
+    }
 
     const pendingUploads = loadPendingUploads();
     const key = getPendingKey(folder.id, name);
-    const uploadedBy = pendingUploads[key]?.uploadedBy || pendingUploads[name]?.uploadedBy || null;
+    const pendingEntry = pendingUploads[key] || pendingUploads[name];
+    if (!pendingEntry) return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
+    const pendingPath = path.join(folder.tempDir, name);
+    const restoreOrphan = restoreProviderOrphans.isSuppressed(folder.id, name, "temp");
+    if (!restoreOrphan && !isExistingFile(pendingPath)) await ensureCloudFileCached(folder.id, name, pendingPath, "temp");
+    if ((!restoreOrphan && !isExistingFile(pendingPath)) || !getPendingUploadEntry(folder.id, name)) {
+      return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
+    }
+
+    if (isExistingFile(pendingPath)) {
+      try {
+        await fs.promises.unlink(pendingPath);
+      } catch {
+        return res.status(500).json({ error: "Erro ao rejeitar" });
+      }
+    }
+
+    const uploadedBy = pendingEntry.uploadedBy || null;
     delete pendingUploads[key];
     if (folder.id === ROOT_FOLDER_ID) delete pendingUploads[name];
     savePendingUploads(pendingUploads);
-    deleteCloudFileLater(folder.id, name, "temp");
+    let cloudCleanupPending = false;
+    try {
+      await deleteCloudTempFile(folder.id, name);
+      if (restoreOrphan) restoreProviderOrphans.clear(folder.id, name, "temp");
+    } catch (error) {
+      cloudCleanupPending = true;
+      console.error("[cloud-temp] rejection cleanup pending:", sanitizeLogValue(error.message));
+    }
     logAnalyticsEvent("rejection", {
       filename: name,
       rejectedBy: req.user.username,
@@ -8253,12 +8859,12 @@ app.post("/reject/:name", rejectRateLimit, authenticate, requirePermission("appr
       uploadedBy,
     });
     addActionHistory("rejected", name, req.user.username, { uploadedBy, folderId: folder.id, folderName: folder.name });
-    res.json({ message: "Rejeitado" });
+    return res.status(cloudCleanupPending ? 202 : 200).json({ message: "Rejeitado", cloudCleanupPending });
   });
 });
 
 app.get("/delete/:name", deleteRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
-app.post("/delete/:name", deleteRateLimit, authenticate, (req, res) => {
+app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
   if (!isTrashEnabled()) return res.status(503).json({ error: "Lixeira desativada" });
   const name = path.basename(req.params.name);
   const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
@@ -8272,12 +8878,27 @@ app.post("/delete/:name", deleteRateLimit, authenticate, (req, res) => {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
 
-  const filePath = path.join(folder.uploadDir, name);
-  const fileSize = isExistingFile(filePath) ? fs.statSync(filePath).size : 0;
+  return runCloudFileLifecycleMutation(folder.id, name, async () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const currentFolderRecord = getFolderById(folder.id);
+    if (!currentFolderRecord || !isFolderAvailable(currentFolderRecord.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderAccess(req, currentFolderRecord)) return res.status(403).json({ error: "Acesso negado a esta pasta" });
+    if (!canMoveToTrash(req)) return res.status(403).json({ error: "Permissao negada: delete" });
+    if (!hasFileEditAccess(req, currentFolderRecord, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (isFileInTrash(currentFolderRecord.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    const currentFolder = { ...currentFolderRecord, ...ensureFolderDirectories(currentFolderRecord.id) };
+    const filePath = path.join(currentFolder.uploadDir, name);
+    await ensureCloudFileCached(folder.id, name, filePath, "uploads");
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const publishFolder = getFolderById(folder.id);
+    if (!publishFolder || !isFolderAvailable(publishFolder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderAccess(req, publishFolder) || !canMoveToTrash(req) || !hasFileEditAccess(req, publishFolder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (isFileInTrash(publishFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    const fileSize = isExistingFile(filePath) ? fs.statSync(filePath).size : 0;
 
-  try {
+    try {
     const trashItem = trashService.moveFileToTrash({
-      folder,
+      folder: currentFolder,
       fileName: name,
       deletedBy: req.user.username,
       loaders: getTrashLoaders(),
@@ -8299,16 +8920,17 @@ app.post("/delete/:name", deleteRateLimit, authenticate, (req, res) => {
     addActionHistory("deleted", name, req.user.username, { folderId: folder.id, folderName: folder.name, trashId: trashItem.id });
     broadcastDataChanged("trash", { folderId: folder.id, fileName: name, itemType: "file" });
     res.json({ message: "Movido para lixeira", trashItem: serializeTrashItemForUser(trashItem) });
-  } catch (error) {
-    auditLog("trash.delete.failed", getAuditActor(req), { type: "file", id: name }, "move_to_trash", "failure", {
-      folderId: folder.id,
-      error: error.message,
-    });
-    res.status(500).json({ error: "Erro ao mover arquivo para lixeira" });
-  }
+    } catch (error) {
+      auditLog("trash.delete.failed", getAuditActor(req), { type: "file", id: name }, "move_to_trash", "failure", {
+        folderId: folder.id,
+        error: error.message,
+      });
+      res.status(500).json({ error: "Erro ao mover arquivo para lixeira" });
+    }
+  }, res);
 });
 
-app.put("/rename", authenticate, (req, res) => {
+app.put("/rename", renameRateLimit, authenticate, async (req, res) => {
   const rawOldName = typeof req.body.oldName === "string" ? req.body.oldName.trim() : "";
   const rawNewName = typeof req.body.newName === "string" ? req.body.newName.trim() : "";
   const oldName = path.basename(rawOldName);
@@ -8332,56 +8954,74 @@ app.put("/rename", authenticate, (req, res) => {
     return res.status(400).json({ error: `O nome do arquivo deve ter no maximo ${MAX_FILE_NAME_LENGTH} caracteres` });
   }
 
-  const oldPath = path.join(folder.uploadDir, oldName);
-  const newPath = path.join(folder.uploadDir, newName);
-  const oldStoredNames = getVersionHistory(folder.id, oldName).versions
-    .map((version) => path.basename(version.storedAs || ""))
-    .filter(Boolean);
-
-  if (!fs.existsSync(oldPath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
-
   if (!hasFileEditAccess(req, folder, oldName)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
+  if (isFileInTrash(folder.id, oldName)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (isCloudStorageEnabled()) return res.status(503).json({ error: "Renomeacao em nuvem indisponivel ate a reconciliacao segura estar ativa" });
+  return runCloudFileLifecycleMutation(folder.id, oldName, async () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const currentFolderRecord = getFolderById(folder.id);
+    if (!currentFolderRecord || !isFolderAvailable(currentFolderRecord.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderAccess(req, currentFolderRecord) || !hasFileEditAccess(req, currentFolderRecord, oldName)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (isFileInTrash(currentFolderRecord.id, oldName)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    const currentFolder = { ...currentFolderRecord, ...ensureFolderDirectories(currentFolderRecord.id) };
+    const oldPath = path.join(currentFolder.uploadDir, oldName);
+    const newPath = path.join(currentFolder.uploadDir, newName);
+    await ensureCloudFileCached(folder.id, oldName, oldPath, "uploads");
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const publishFolder = getFolderById(folder.id);
+    if (!publishFolder || !isFolderAvailable(publishFolder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderAccess(req, publishFolder) || !hasFileEditAccess(req, publishFolder, oldName)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (isFileInTrash(publishFolder.id, oldName)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (!fs.existsSync(oldPath)) return res.status(404).json({ error: "Arquivo nao encontrado" });
 
-  if (fs.existsSync(newPath)) {
-    return res.status(409).json({ error: "Ja existe um arquivo com esse nome" });
-  }
+    const oldStoredNames = getVersionHistory(currentFolder.id, oldName).versions
+      .map((version) => path.basename(version.storedAs || ""))
+      .filter(Boolean);
+    if (fs.existsSync(newPath)) return res.status(409).json({ error: "Ja existe um arquivo com esse nome" });
 
-  fs.rename(oldPath, newPath, (err) => {
-    if (err) return res.status(500).json({ error: "Erro ao renomear arquivo" });
-    renamePublicLinksForFile(oldName, newName, folder.id);
-    renameFilePermission(folder.id, oldName, newName);
-    renameFileExpiration(folder.id, oldName, newName);
-    renameFileVersions(folder.id, oldName, newName);
-    renameEncryptedMetadata(folder.id, oldName, newName);
-    for (const storedName of new Set([oldName, ...oldStoredNames])) {
-      deleteCloudFileLater(folder.id, storedName, "uploads");
+    try {
+      await fs.promises.rename(oldPath, newPath);
+    } catch {
+      return res.status(500).json({ error: "Erro ao renomear arquivo" });
     }
-    syncFileVersionsToCloud(folder.id, newName);
+    try {
+      for (const storedName of new Set([oldName, ...oldStoredNames])) {
+        await deleteFileFromCloud(folder.id, storedName, "uploads");
+      }
+    } catch {
+      try { await fs.promises.rename(newPath, oldPath); } catch {}
+      syncFileVersionsToCloud(folder.id, oldName);
+      return res.status(500).json({ error: "Erro ao renomear arquivo" });
+    }
+    renamePublicLinksForFile(oldName, newName, currentFolder.id);
+    renameFilePermission(currentFolder.id, oldName, newName);
+    renameFileExpiration(currentFolder.id, oldName, newName);
+    renameFileVersions(currentFolder.id, oldName, newName);
+    renameEncryptedMetadata(currentFolder.id, oldName, newName);
+    syncFileVersionsToCloud(currentFolder.id, newName);
     auditLog("file.rename", getAuditActor(req), { type: "file", id: newName }, "renamed", "success", {
       oldName,
       newName,
-      folderId: folder.id,
+      folderId: currentFolder.id,
     });
     addActionHistory("renamed", newName, req.user.username, {
       oldName,
       newName,
-      folderId: folder.id,
-      folderName: folder.name,
+      folderId: currentFolder.id,
+      folderName: currentFolder.name,
     });
     res.json({ message: "Arquivo renomeado" });
-  });
+  }, res);
 });
 
-app.put("/move", authenticate, (req, res) => {
+app.put("/move", moveRateLimit, authenticate, async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
-  const fromFolder = getAccessibleFolderOrRespond(req, res, req.body.fromFolderId);
+  const fromFolder = getAccessibleFolderRecordOrRespond(req, res, req.body.fromFolderId);
   if (!fromFolder) return;
-  const toFolder = getAccessibleFolderOrRespond(req, res, req.body.toFolderId);
+  const toFolder = getAccessibleFolderRecordOrRespond(req, res, req.body.toFolderId);
   if (!toFolder) return;
 
   if (!rawName || name !== rawName) {
@@ -8392,49 +9032,75 @@ app.put("/move", authenticate, (req, res) => {
     return res.status(400).json({ error: "Escolha uma pasta diferente da atual" });
   }
 
-  const sourcePath = path.join(fromFolder.uploadDir, name);
-  if (!isExistingFile(sourcePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
-
   if (!hasFileEditAccess(req, fromFolder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
-
-  const finalName = getAvailableUploadFileName(name, toFolder.id);
-  const destinationPath = path.join(toFolder.uploadDir, finalName);
-  const oldStoredNames = getVersionHistory(fromFolder.id, name).versions
-    .map((version) => path.basename(version.storedAs || ""))
-    .filter(Boolean);
-
-  fs.rename(sourcePath, destinationPath, (err) => {
-    if (err) return res.status(500).json({ error: "Erro ao mover arquivo" });
-
-    movePublicLinksForFile(name, finalName, fromFolder.id, toFolder.id);
-    moveFilePermission(fromFolder.id, name, toFolder.id, finalName);
-    moveFileExpiration(fromFolder.id, name, toFolder.id, finalName);
-    moveFileVersions(fromFolder.id, name, toFolder.id, finalName);
-    moveEncryptedMetadata(fromFolder.id, name, toFolder.id, finalName);
-    for (const storedName of new Set([name, ...oldStoredNames])) {
-      deleteCloudFileLater(fromFolder.id, storedName, "uploads");
+  if (isFileInTrash(fromFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (isCloudStorageEnabled()) return res.status(503).json({ error: "Movimentacao em nuvem indisponivel ate a reconciliacao segura estar ativa" });
+  return runCloudMoveLifecycleMutation(fromFolder.id, toFolder.id, name, async () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const currentSource = getFolderById(fromFolder.id);
+    const currentDestination = getFolderById(toFolder.id);
+    if (!currentSource || !currentDestination || !isFolderAvailable(currentSource.id) || !isFolderAvailable(currentDestination.id)) {
+      return res.status(404).json({ error: "Pasta nao encontrada" });
     }
-    syncFileVersionsToCloud(toFolder.id, finalName);
+    if (!hasFolderAccess(req, currentSource) || !hasFolderAccess(req, currentDestination)) return res.status(403).json({ error: "Acesso negado a esta pasta" });
+    if (!hasFileEditAccess(req, currentSource, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (isFileInTrash(currentSource.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    const sourceFolder = { ...currentSource, ...ensureFolderDirectories(currentSource.id) };
+    const destinationFolder = { ...currentDestination, ...ensureFolderDirectories(currentDestination.id) };
+    const sourcePath = path.join(sourceFolder.uploadDir, name);
+    await ensureCloudFileCached(sourceFolder.id, name, sourcePath, "uploads");
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const publishSource = getFolderById(fromFolder.id);
+    const publishDestination = getFolderById(toFolder.id);
+    if (!publishSource || !publishDestination || !isFolderAvailable(publishSource.id) || !isFolderAvailable(publishDestination.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderAccess(req, publishSource) || !hasFolderAccess(req, publishDestination) || !hasFileEditAccess(req, publishSource, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (isFileInTrash(publishSource.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (!isExistingFile(sourcePath)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+
+    const finalName = getAvailableUploadFileName(name, destinationFolder.id);
+    const destinationPath = path.join(destinationFolder.uploadDir, finalName);
+    const oldStoredNames = getVersionHistory(sourceFolder.id, name).versions
+      .map((version) => path.basename(version.storedAs || ""))
+      .filter(Boolean);
+    try {
+      await fs.promises.rename(sourcePath, destinationPath);
+    } catch {
+      return res.status(500).json({ error: "Erro ao mover arquivo" });
+    }
+    try {
+      for (const storedName of new Set([name, ...oldStoredNames])) {
+        await deleteFileFromCloud(sourceFolder.id, storedName, "uploads");
+      }
+    } catch {
+      try { await fs.promises.rename(destinationPath, sourcePath); } catch {}
+      syncFileVersionsToCloud(sourceFolder.id, name);
+      return res.status(500).json({ error: "Erro ao mover arquivo" });
+    }
+
+    movePublicLinksForFile(name, finalName, sourceFolder.id, destinationFolder.id);
+    moveFilePermission(sourceFolder.id, name, destinationFolder.id, finalName);
+    moveFileExpiration(sourceFolder.id, name, destinationFolder.id, finalName);
+    moveFileVersions(sourceFolder.id, name, destinationFolder.id, finalName);
+    moveEncryptedMetadata(sourceFolder.id, name, destinationFolder.id, finalName);
+    syncFileVersionsToCloud(destinationFolder.id, finalName);
     auditLog("file.move", getAuditActor(req), { type: "file", id: finalName }, "moved", "success", {
       oldName: name,
       newName: finalName,
-      fromFolderId: fromFolder.id,
-      toFolderId: toFolder.id,
+      fromFolderId: sourceFolder.id,
+      toFolderId: destinationFolder.id,
     });
     addActionHistory("moved", finalName, req.user.username, {
       oldName: name,
       newName: finalName,
       fromFolderId: fromFolder.id,
-      fromFolderName: fromFolder.name,
-      toFolderId: toFolder.id,
-      toFolderName: toFolder.name,
+      fromFolderName: sourceFolder.name,
+      toFolderId: destinationFolder.id,
+      toFolderName: destinationFolder.name,
     });
-    res.json({ message: "Arquivo movido", fileName: finalName, folderId: toFolder.id });
-  });
+    res.json({ message: "Arquivo movido", fileName: finalName, folderId: destinationFolder.id });
+  }, res);
 });
 
 initData();
@@ -8445,8 +9111,12 @@ const startupRestoreCoordinator = startupRestoreState.restartRequired
   : null;
 if (!startupRestoreCoordinator) {
   cleanupExpiredPublicLinks();
-  cleanupExpiredTemporaryItems();
-  cleanupExpiredTrashItems();
+  void cleanupExpiredTemporaryItems().catch((error) => {
+    console.error("Falha ao limpar expiracoes temporarias:", sanitizeLogValue(error.message));
+  });
+  void cleanupExpiredTrashItems().catch((error) => {
+    console.error("Falha ao limpar lixeira expirada:", sanitizeLogValue(error.message));
+  });
   restoreRequestGate.run(() => repairCompressedTempUploads()).catch((error) => {
     console.error("Falha ao reparar uploads temporarios:", error.message);
   });
@@ -8464,9 +9134,40 @@ scheduleAutomaticBackups({
 });
 void processPendingCloudTrashItems();
 void processPendingCloudRestoreSync().catch(() => {});
-setInterval(() => { void restoreRequestGate.run(() => cleanupExpiredTemporaryItems()); }, 60 * 1000);
+const cloudTempReconciliationIntervalMs = parseBoundedNumber("CLOUD_TEMP_RECONCILIATION_INTERVAL_MS", 30_000, 1_000, 60 * 60 * 1000);
+const recoverCloudTempMutations = () => restoreRequestGate.run(async () => {
+  let pendingUploads = {};
+  try { pendingUploads = loadPendingUploads(); }
+  catch (error) { console.error("[cloud-temp] pending registry unavailable:", sanitizeLogValue(error.message)); }
+  for (const [key, entry] of Object.entries(pendingUploads)) {
+    const fileName = path.basename(entry?.fileName || key);
+    const folderId = entry?.folderId || (String(key).includes("/") ? String(key).split("/")[0] : ROOT_FOLDER_ID);
+    const localPath = path.join(getFolderStoragePath("./temp", folderId), fileName);
+    if (fileName && isExistingFile(localPath) && !cloudTempMutationQueue.hasPending(folderId, fileName)) {
+      try { await cloudTempMutationQueue.enqueue(folderId, fileName, "present"); }
+      catch (error) { console.error("[cloud-temp] pending upload reconciliation failed:", sanitizeLogValue(error.message)); }
+    }
+  }
+  await cloudTempMutationQueue.processAll();
+}).catch((error) => {
+  console.error("[cloud-temp] startup reconciliation failed:", sanitizeLogValue(error.message));
+});
+const retryCloudTempMutations = () => restoreRequestGate.run(() => cloudTempMutationQueue.processAll()).catch((error) => {
+  console.error("[cloud-temp] retry reconciliation failed:", sanitizeLogValue(error.message));
+});
+setTimeout(() => { void recoverCloudTempMutations(); }, 0);
+setInterval(() => { void retryCloudTempMutations(); }, cloudTempReconciliationIntervalMs);
+setInterval(() => {
+  void restoreRequestGate.run(() => cleanupExpiredTemporaryItems()).catch((error) => {
+    console.error("Falha ao limpar expiracoes temporarias:", sanitizeLogValue(error.message));
+  });
+}, 60 * 1000);
 setInterval(() => { void restoreRequestGate.run(() => cleanupExpiredPublicLinks()); }, 60 * 1000);
-setInterval(() => { void restoreRequestGate.run(() => cleanupExpiredTrashItems()); }, 60 * 60 * 1000);
+setInterval(() => {
+  void restoreRequestGate.run(() => cleanupExpiredTrashItems()).catch((error) => {
+    console.error("Falha ao limpar lixeira expirada:", sanitizeLogValue(error.message));
+  });
+}, 60 * 60 * 1000);
 setInterval(() => { void processPendingCloudTrashItems(); }, 60 * 1000);
 setInterval(() => { void processPendingCloudRestoreSync().catch(() => {}); }, 60 * 1000);
 setInterval(() => { void restoreRequestGate.run(() => cleanupIncomingUploads()); }, 60 * 1000);
