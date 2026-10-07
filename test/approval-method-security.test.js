@@ -76,6 +76,19 @@ test("approval, rejection, and trash actions reject legacy GET without mutation 
     "root/approve.txt": { folderId: "root", fileName: "approve.txt", uploadedBy: "submitter" },
     "root/reject.txt": { folderId: "root", fileName: "reject.txt", uploadedBy: "submitter" },
   }));
+  const pendingTrashId = "45454545-4545-4545-8545-454545454545";
+  const trashItemsFile = path.join(dataDir, "trash-items.json");
+  fs.writeFileSync(trashItemsFile, JSON.stringify([{
+    id: pendingTrashId,
+    itemType: "file",
+    originalFolderId: "root",
+    originalFileName: "approve.txt",
+    trashPath: `files/${pendingTrashId}/approve.txt`,
+    deletedAt: new Date().toISOString(),
+    status: "remote_delete_pending",
+    metadata: { remoteDeletion: { operationId: "old-delete", state: "pending", attempts: 0, transitions: [] } },
+    restoreMetadata: { versions: { versions: [] } },
+  }]));
 
   const port = await getUnusedPort();
   const jwtSecret = crypto.randomBytes(48).toString("base64url");
@@ -147,6 +160,10 @@ test("approval, rejection, and trash actions reject legacy GET without mutation 
   assert.equal(approved.status, 200, approved.body);
   assert.equal(fs.existsSync(path.join(tempDir, "approve.txt")), false);
   assert.equal(fs.existsSync(path.join(uploadsDir, "approve.txt")), true);
+  const retiredDeletion = JSON.parse(fs.readFileSync(trashItemsFile, "utf8")).find((item) => item.id === pendingTrashId);
+  assert.equal(retiredDeletion.status, "permanently_deleted", "same-name approval retires the obsolete trash operation before success");
+  assert.equal(retiredDeletion.metadata.remoteDeletion.state, "cancelled");
+  assert.equal(retiredDeletion.metadata.remoteDeletion.cancellationReason, "replacement_active");
 
   const rejected = await request(port, "/reject/reject.txt", { method: "POST", headers: postHeaders });
   assert.equal(rejected.status, 200, rejected.body);

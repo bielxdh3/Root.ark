@@ -31,6 +31,33 @@ test("file lifecycle lock serializes the same file and permits reentrant work", 
   assert.equal(secondStarted, true);
 });
 
+test("detached lifecycle work clears inherited lock ownership and reacquires before entering", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-detached-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 1000, pollMs: 5 });
+  let releaseOuter;
+  let signalOuter;
+  let secondStarted = false;
+  const outerGate = new Promise((resolve) => { releaseOuter = resolve; });
+  const outerEntered = new Promise((resolve) => { signalOuter = resolve; });
+  let detachedTask;
+
+  const outer = lock.run("root", "same.txt", async () => {
+    signalOuter();
+    setImmediate(() => {
+      detachedTask = lock.runDetached(() => lock.run("root", "same.txt", async () => { secondStarted = true; }));
+    });
+    await outerGate;
+  });
+  await outerEntered;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(secondStarted, false, "detached work must not inherit the outer operation's held-lock marker");
+  releaseOuter();
+  await outer;
+  await detachedTask;
+  assert.equal(secondStarted, true, "detached work reacquires the lock after the original owner releases it");
+});
+
 test("file lifecycle lock follows filesystem case sensitivity for file-name aliases", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-case-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));

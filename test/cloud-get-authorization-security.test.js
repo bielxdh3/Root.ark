@@ -30,6 +30,10 @@ const OBJECTS = new Map([
   ["rootark/uploads/root/webdav-listfiles-revocation.txt", Buffer.from("WebDAV listFiles revocation fixture")],
   ["rootark/uploads/root/webdav-acl-revocation.txt", Buffer.from("WebDAV ACL revocation fixture")],
   ["rootark/uploads/root/public.txt", Buffer.from("public cloud fixture")],
+  ["rootark/uploads/root/share-download-race.txt", Buffer.from("public share download race fixture")],
+  ["rootark/uploads/root/share-trash-race.txt", Buffer.from("share trash race fixture")],
+  ["rootark/uploads/root/access-trash-race.txt", Buffer.from("access trash race fixture")],
+  ["rootark/uploads/root/encrypted-grant-trash-race.txt", Buffer.from("encrypted grant trash race fixture")],
   ["rootark/uploads/root/public.txt.v1", Buffer.from("public stored version fixture")],
   ["rootark/uploads/root/ambiguous-orphan.v1", Buffer.from("unclassified stored version fixture")],
   ["rootark/uploads/root/budget.v2", Buffer.from("ordinary cloud suffix fixture")],
@@ -81,6 +85,17 @@ async function waitForNoActiveRequests(directory, timeoutMs = 15_000) {
   }
   const remaining = fs.existsSync(directory) ? fs.readdirSync(directory) : [];
   throw new Error(`active request leases did not clear within ${timeoutMs}ms; remaining leases: ${remaining.join(", ") || "none"}`);
+}
+
+async function waitForActiveRequestCount(directory, expectedCount, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const count = fs.existsSync(directory) ? fs.readdirSync(directory).length : 0;
+    if (count >= expectedCount) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const count = fs.existsSync(directory) ? fs.readdirSync(directory).length : 0;
+  throw new Error(`expected at least ${expectedCount} active request leases, observed ${count}`);
 }
 
 test("active request lease wait allows delayed teardown and reports remaining leases", { timeout: 20_000 }, async (t) => {
@@ -151,7 +166,7 @@ function startS3Fixture() {
       getObjects,
       putObjects,
       listRequests,
-      block(map, key) {
+      block(map, key, skippedRequests = 0) {
         let markStarted;
         let release;
         const gate = {
@@ -161,12 +176,13 @@ function startS3Fixture() {
           release: () => release(),
         };
         const queue = map.get(key) || [];
+        for (let index = 0; index < skippedRequests; index += 1) queue.push(null);
         queue.push(gate);
         map.set(key, queue);
         return gate;
       },
       blockGet(key) { return this.block(getGates, key); },
-      blockList(prefix) { return this.block(listGates, prefix); },
+      blockList(prefix, skippedRequests = 0) { return this.block(listGates, prefix, skippedRequests); },
     }));
   });
 }
@@ -225,6 +241,11 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify({
     "root/private.txt": { public: false, owner: "owner", users: {} },
     "root/revoke-download.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
+    "root/file-access-session-revocation.txt": { public: false, owner: "owner", users: {} },
+    "root/share-session-revocation.txt": { public: false, owner: "owner", users: {} },
+    "root/share-race-first.txt": { public: false, owner: "owner", users: {} },
+    "root/share-race-second.txt": { public: false, owner: "owner", users: {} },
+    "root/encrypted-grant-session-revocation.txt": { public: false, owner: "owner", users: {} },
     "root/revoke-preview.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
     "root/revoke-share.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
     "root/revoke-version.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
@@ -238,6 +259,9 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     "root/orphan-private.txt": { public: false, owner: "owner", users: {} },
     "root/public.txt": { public: true, owner: "viewer", users: {} },
     "root/public.txt.v1": { public: true, owner: "viewer", users: {} },
+    "root/share-trash-race.txt": { public: false, owner: "owner", users: {} },
+    "root/access-trash-race.txt": { public: false, owner: "owner", users: {} },
+    "root/encrypted-grant-trash-race.txt": { public: false, owner: "owner", users: {} },
     "root/budget.v2": { public: false, owner: "viewer", users: {} },
     "root/notes.v2": { public: false, owner: "viewer", users: {} },
     "root/private.txt.v7": { public: false, owner: "viewer", users: {} },
@@ -310,6 +334,8 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   fs.writeFileSync(path.join(dataDir, "encrypted-files.json"), JSON.stringify({
     "root/encrypted.txt": { encryptionLevel: "server-key", originalFilename: "encrypted.txt" },
     "root/revoke-encrypted.txt": { encryptionLevel: "server-key", originalFilename: "revoke-encrypted.txt" },
+    "root/encrypted-grant-trash-race.txt": { encryptionLevel: "server-key", originalFilename: "encrypted-grant-trash-race.txt", accessControl: { owner: "owner", authorizedUsers: [] } },
+    "root/encrypted-grant-session-revocation.txt": { encryptionLevel: "server-key", originalFilename: "encrypted-grant-session-revocation.txt", accessControl: { owner: "owner", authorizedUsers: [] } },
   }));
   fs.writeFileSync(path.join(dataDir, "pending-uploads.json"), JSON.stringify({
     "root/restore-orphan-pending.txt": { fileName: "restore-orphan-pending.txt", folderId: "root", uploadedBy: "viewer", uploadedAt: new Date().toISOString() },
@@ -326,6 +352,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   }));
   const encryptedShareToken = "a".repeat(48);
   const restoreOrphanShareToken = "b".repeat(48);
+  const limitedShareDownloadToken = "c".repeat(48);
   fs.writeFileSync(path.join(dataDir, "public-links.json"), JSON.stringify({
     [encryptedShareToken]: {
       fileName: "encrypted.txt", folderId: "root", createdAt: new Date().toISOString(),
@@ -336,6 +363,11 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
       fileName: "restore-orphan.txt", folderId: "root", createdAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(), createdBy: "owner",
       views: 0, maxViews: 0, downloads: 0, maxDownloads: 0, passwordHash: "", activeViewers: {},
+    },
+    [limitedShareDownloadToken]: {
+      fileName: "share-download-race.txt", folderId: "root", createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(), createdBy: "owner",
+      views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, passwordHash: "", activeViewers: {},
     },
   }));
   const cloud = await startS3Fixture();
@@ -407,6 +439,97 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     });
   };
 
+  const concurrentShareFolderResponse = await mutateAsOwner("/folders", "POST", { name: "share-created-during-download-folder" });
+  assert.equal(concurrentShareFolderResponse.status, 201, concurrentShareFolderResponse.body);
+  const concurrentShareFolderId = JSON.parse(concurrentShareFolderResponse.body).id;
+  OBJECTS.set(`rootark/uploads/${concurrentShareFolderId}/share-created-during-download.txt`, Buffer.from("share created during download fixture"));
+  const permissionsBeforeConcurrentShare = JSON.parse(fs.readFileSync(path.join(dataDir, "file-permissions.json"), "utf8"));
+  permissionsBeforeConcurrentShare[`${concurrentShareFolderId}/share-created-during-download.txt`] = { public: false, owner: "owner", users: {} };
+  fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify(permissionsBeforeConcurrentShare));
+
+  const downloadRaceFirstGate = cloud.blockGet("rootark/uploads/root/share-download-race.txt");
+  const downloadRaceFirst = request(port, `/share/${limitedShareDownloadToken}/download`, {
+    method: "POST",
+    headers: { origin: `http://127.0.0.1:${port}` },
+  });
+  await downloadRaceFirstGate.started;
+  const downloadRaceSecond = request(port, `/share/${limitedShareDownloadToken}/download`, {
+    method: "POST",
+    headers: { origin: `http://127.0.0.1:${port}` },
+  });
+  await waitForActiveRequestCount(path.join(dataDir, ".rootark-active-requests"), 2);
+  const shareCreatedDuringDownload = await mutateAsOwner("/share", "POST", {
+    folderId: concurrentShareFolderId,
+    name: "share-created-during-download.txt",
+    expiresInMinutes: 60,
+  });
+  assert.equal(shareCreatedDuringDownload.status, 201, shareCreatedDuringDownload.body);
+  downloadRaceFirstGate.release();
+  const firstShareDownload = await downloadRaceFirst;
+  assert.equal(firstShareDownload.status, 200, firstShareDownload.body);
+  const secondShareDownload = await downloadRaceSecond;
+  assert.equal(secondShareDownload.status, 410, "a concurrent request must not exceed maxDownloads after provider hydration");
+  const limitedShareAfterDownloads = JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"))[limitedShareDownloadToken];
+  assert.equal(limitedShareAfterDownloads.downloads, 1, "the permitted download count is committed once");
+  const linksAfterConcurrentDownload = JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"));
+  assert.equal(linksAfterConcurrentDownload[JSON.parse(shareCreatedDuringDownload.body).token].fileName, "share-created-during-download.txt", "a link created during provider hydration is not overwritten by the download counter update");
+
+  async function assertNameBoundMutationSerializesWithTrash(name, pathName, method, payload, expectedStatus) {
+    const gate = cloud.blockList("rootark/uploads/root/");
+    const mutation = mutateAsOwner(pathName, method, payload);
+    await gate.started;
+    let deleteSettled = false;
+    const deletion = mutateAsOwner(`/delete/${name}?folderId=root`, "POST", {});
+    deletion.then(() => { deleteSettled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const waitedForMutation = !deleteSettled;
+    gate.release();
+    const [mutationResponse, deletionResponse] = await Promise.all([mutation, deletion]);
+    assert.equal(mutationResponse.status, expectedStatus, mutationResponse.body);
+    assert.equal(deletionResponse.status, 200, deletionResponse.body);
+    assert.equal(waitedForMutation, true, "trash waits for the name-bound mutation's in-flight provider listing");
+    const trashItems = JSON.parse(fs.readFileSync(path.join(dataDir, "trash-items.json"), "utf8"));
+    assert.ok(trashItems.some((item) => item.originalFileName === name && item.status === "trashed"));
+    return mutationResponse;
+  }
+
+  await assertNameBoundMutationSerializesWithTrash(
+    "share-trash-race.txt",
+    "/share",
+    "POST",
+    { name: "share-trash-race.txt", expiresInMinutes: 60 },
+    201,
+  );
+  assert.equal(
+    Object.values(JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"))).some((link) => link.fileName === "share-trash-race.txt"),
+    false,
+    "trash retires any same-name public link created before its lifecycle commit",
+  );
+  await assertNameBoundMutationSerializesWithTrash(
+    "access-trash-race.txt",
+    "/file-access",
+    "PUT",
+    { name: "access-trash-race.txt", public: true, users: {} },
+    200,
+  );
+  assert.equal(
+    Object.hasOwn(JSON.parse(fs.readFileSync(path.join(dataDir, "file-permissions.json"), "utf8")), "root/access-trash-race.txt"),
+    false,
+    "trash leaves no same-name access grant persisted after its lifecycle commit",
+  );
+  await assertNameBoundMutationSerializesWithTrash(
+    "encrypted-grant-trash-race.txt",
+    "/encrypted/encrypted-grant-trash-race.txt/grant-access",
+    "POST",
+    { username: "viewer" },
+    200,
+  );
+  assert.equal(
+    Object.hasOwn(JSON.parse(fs.readFileSync(path.join(dataDir, "encrypted-files.json"), "utf8")), "root/encrypted-grant-trash-race.txt"),
+    false,
+    "trash leaves no same-name encrypted access grant persisted after its lifecycle commit",
+  );
+
   const caseAliasResponse = await request(port, "/files/case-orphan.txt", { headers: { cookie } });
   if (process.platform === "win32") {
     assert.equal(caseAliasResponse.status, 403, caseAliasResponse.body);
@@ -454,12 +577,17 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const list = await request(port, "/list", { headers: { cookie, referer: "https://attacker.invalid/" } });
   assert.equal(list.status, 200, list.body);
   assert.equal(JSON.parse(list.body).some((file) => file.name === "restore-orphan.txt"), false, "persisted restore orphans remain hidden after server restart");
-  const expectedVisibleNames = ["ambiguous-orphan.v1", "budget.v2", "cloud-only-version-init.txt", "encrypted.txt", "legacy.v9", "notes.v2", "private.txt.v7", "private.txt.v8", "public.txt", "version-primary.txt", "webdav-acl-revocation.txt", "webdav-listfiles-revocation.txt", "webdav-session-revocation.txt"];
+  const expectedVisibleNames = ["ambiguous-orphan.v1", "budget.v2", "cloud-only-version-init.txt", "encrypted.txt", "legacy.v9", "notes.v2", "private.txt.v7", "private.txt.v8", "public.txt", "share-download-race.txt", "version-primary.txt", "webdav-acl-revocation.txt", "webdav-listfiles-revocation.txt", "webdav-session-revocation.txt"];
   if (process.platform !== "win32") expectedVisibleNames.push("case-orphan.txt");
   assert.deepEqual(JSON.parse(list.body).map((file) => file.name).sort(), expectedVisibleNames.sort());
   assert.equal(cloud.getObjects.length, providerGetsBeforeList, "listing reads provider metadata without materializing file bytes");
   assert.equal(fs.existsSync(path.join(directory, "uploads", "budget.v2")), false, "ordinary cloud file is visible before hydration");
   OBJECTS.set("rootark/uploads/root/revoke-download.txt", Buffer.from("download access revocation fixture"));
+  OBJECTS.set("rootark/uploads/root/file-access-session-revocation.txt", Buffer.from("file access session revocation fixture"));
+  OBJECTS.set("rootark/uploads/root/share-session-revocation.txt", Buffer.from("share session revocation fixture"));
+  OBJECTS.set("rootark/uploads/root/share-race-first.txt", Buffer.from("first concurrent share fixture"));
+  OBJECTS.set("rootark/uploads/root/share-race-second.txt", Buffer.from("second concurrent share fixture"));
+  OBJECTS.set("rootark/uploads/root/encrypted-grant-session-revocation.txt", Buffer.from("encrypted grant session revocation fixture"));
   OBJECTS.set("rootark/uploads/root/revoke-preview.txt", Buffer.from("preview access revocation fixture"));
   OBJECTS.set("rootark/uploads/root/revoke-share.txt", Buffer.from("share access revocation fixture"));
   OBJECTS.set("rootark/uploads/root/revoke-version.txt", Buffer.from("version current revocation fixture"));
@@ -799,6 +927,15 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     () => fs.writeFileSync(filePermissionsPath, originalFilePermissions)
   );
 
+  const revokeFileAccessDuringHydration = (name) => {
+    const permissions = JSON.parse(fs.readFileSync(filePermissionsPath, "utf8"));
+    const entry = permissions[`root/${name}`];
+    assert.ok(entry, `fixture permissions exist for ${name}`);
+    entry.public = false;
+    entry.users = {};
+    fs.writeFileSync(filePermissionsPath, JSON.stringify(permissions));
+  };
+
   const validOrphanPolicy = fs.readFileSync(orphanPolicyPath, "utf8");
   const pendingRegistryPath = path.join(dataDir, "pending-uploads.json");
   const validPendingRegistry = fs.readFileSync(pendingRegistryPath, "utf8");
@@ -817,8 +954,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     const gate = cloud.blockGet(`rootark/uploads/root/${name}`);
     const read = request(port, route, { headers: { cookie } });
     await gate.started;
-    const revoked = await mutateAsOwner("/file-access", "PUT", { name, public: false, users: {} });
-    assert.equal(revoked.status, 200, revoked.body);
+    revokeFileAccessDuringHydration(name);
     gate.release();
     const response = await read;
     assert.equal(response.status, 403, `${route} rechecks the current ACL after cache hydration`);
@@ -829,8 +965,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     const gate = cloud.blockGet("rootark/uploads/root/revoke-version.txt.v1");
     const read = request(port, "/download/revoke-version.txt/v/1", { headers: { cookie } });
     await gate.started;
-    const revoked = await mutateAsOwner("/file-access", "PUT", { name, public: false, users: {} });
-    assert.equal(revoked.status, 200, revoked.body);
+    revokeFileAccessDuringHydration(name);
     gate.release();
     const response = await read;
     assert.equal(response.status, 403, "version download rechecks the current ACL after cache hydration");
@@ -841,8 +976,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     const gate = cloud.blockGet("rootark/uploads/root/revoke-version-token.txt.v1");
     const read = mutate("/version-open-token", "POST", { name, version: 1 });
     await gate.started;
-    const revoked = await mutateAsOwner("/file-access", "PUT", { name, public: false, users: {} });
-    assert.equal(revoked.status, 200, revoked.body);
+    revokeFileAccessDuringHydration(name);
     gate.release();
     const response = await read;
     assert.equal(response.status, 403, "version token issuance rechecks the current ACL after cache hydration");
@@ -854,8 +988,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     const gate = cloud.blockGet("rootark/uploads/root/revoke-encrypted.txt");
     const read = mutate(`/encrypted-download/${name}`, "POST", {});
     await gate.started;
-    const revoked = await mutateAsOwner("/file-access", "PUT", { name, public: false, users: {} });
-    assert.equal(revoked.status, 200, revoked.body);
+    revokeFileAccessDuringHydration(name);
     gate.release();
     const response = await read;
     assert.equal(response.status, 403, "encrypted download rechecks current ACL after cache hydration");
@@ -866,8 +999,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     const gate = cloud.blockGet(`rootark/uploads/root/${name}`);
     const read = request(port, `/dav/${name}`, { headers: { authorization: webDavAuth } });
     await gate.started;
-    const revoked = await mutateAsOwner("/file-access", "PUT", { name, public: false, users: {} });
-    assert.equal(revoked.status, 200, revoked.body);
+    revokeFileAccessDuringHydration(name);
     gate.release();
     const response = await read;
     assert.equal(response.status, 404, "WebDAV hides files after ACL revocation during cache hydration");
@@ -891,13 +1023,102 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const hashCallsBeforeRevokedShare = fs.existsSync(hashCallsFile) ? fs.readFileSync(hashCallsFile, "utf8").length : 0;
   const revokedShareRequest = mutate("/share", "POST", { name: "revoke-share.txt", expiresInMinutes: 60, password: "valid-password" });
   await shareGate.started;
-  const sharePermissionChange = await mutateAsOwner("/file-access", "PUT", { name: "revoke-share.txt", public: false, users: {} });
-  assert.equal(sharePermissionChange.status, 200, sharePermissionChange.body);
+  revokeFileAccessDuringHydration("revoke-share.txt");
   shareGate.release();
   const revokedShare = await revokedShareRequest;
   assert.equal(revokedShare.status, 403, revokedShare.body);
   assert.equal(fs.existsSync(hashCallsFile) ? fs.readFileSync(hashCallsFile, "utf8").length : 0, hashCallsBeforeRevokedShare, "share password is not hashed after requester access is revoked");
   assert.equal(Object.values(JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"))).some((link) => link.fileName === "revoke-share.txt"), false);
+
+  const shareRaceFolderResponse = await mutateAsOwner("/folders", "POST", { name: "share-race-second-folder" });
+  assert.equal(shareRaceFolderResponse.status, 201, shareRaceFolderResponse.body);
+  const shareRaceFolderId = JSON.parse(shareRaceFolderResponse.body).id;
+  OBJECTS.set(`rootark/uploads/${shareRaceFolderId}/share-race-second.txt`, Buffer.from("second concurrent share fixture"));
+  const shareRacePermissions = JSON.parse(fs.readFileSync(filePermissionsPath, "utf8"));
+  shareRacePermissions[`${shareRaceFolderId}/share-race-second.txt`] = { public: false, owner: "owner", users: {} };
+  fs.writeFileSync(filePermissionsPath, JSON.stringify(shareRacePermissions));
+  const shareRaceFirstGate = cloud.blockList("rootark/uploads/root/", 1);
+  const shareRaceFirst = mutateAsOwner("/share", "POST", { name: "share-race-first.txt", expiresInMinutes: 60 });
+  await shareRaceFirstGate.started;
+  const shareRaceSecondGate = cloud.blockList(`rootark/uploads/${shareRaceFolderId}/`, 1);
+  const shareRaceSecond = mutateAsOwner("/share", "POST", { folderId: shareRaceFolderId, name: "share-race-second.txt", expiresInMinutes: 60 });
+  await shareRaceSecondGate.started;
+  shareRaceFirstGate.release();
+  const firstShareResponse = await shareRaceFirst;
+  assert.equal(firstShareResponse.status, 201, firstShareResponse.body);
+  shareRaceSecondGate.release();
+  const secondShareResponse = await shareRaceSecond;
+  assert.equal(secondShareResponse.status, 201, secondShareResponse.body);
+  const concurrentShares = Object.values(JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8")));
+  assert.ok(concurrentShares.some((link) => link.fileName === "share-race-first.txt"));
+  assert.ok(concurrentShares.some((link) => link.fileName === "share-race-second.txt"), "serially released share saves must preserve earlier concurrent links");
+
+  const folderCreation = await mutateAsOwner("/folders", "POST", {
+    name: "folder-eligibility-race",
+    users: { viewer: { read: true, edit: true } },
+  });
+  assert.equal(folderCreation.status, 201, folderCreation.body);
+  const folderId = JSON.parse(folderCreation.body).id;
+  OBJECTS.set(`rootark/uploads/${folderId}/folder-acl-race.txt`, Buffer.from("folder ACL eligibility race fixture"));
+  const filePermissionsBeforeFolderAccessChange = fs.readFileSync(filePermissionsPath, "utf8");
+  const folderFileAccessGate = cloud.blockList(`rootark/uploads/${folderId}/`, 1);
+  const folderFileAccess = mutateAsOwner("/file-access", "PUT", {
+    folderId,
+    name: "folder-acl-race.txt",
+    public: false,
+    users: { viewer: { read: true } },
+  });
+  await folderFileAccessGate.started;
+  const removeViewerFromFolder = await mutateAsOwner(`/folders/${folderId}/access`, "PUT", { users: {} });
+  assert.equal(removeViewerFromFolder.status, 200, removeViewerFromFolder.body);
+  folderFileAccessGate.release();
+  const staleFolderGrant = await folderFileAccess;
+  assert.equal(staleFolderGrant.status, 400, staleFolderGrant.body);
+  assert.equal(fs.readFileSync(filePermissionsPath, "utf8"), filePermissionsBeforeFolderAccessChange, "file ACL is not persisted for a target removed from folder eligibility during listing");
+
+  async function assertFreshSessionBeforeMutationPersistence(requestPath, method, payload, gate, statePath) {
+    const stateBefore = fs.readFileSync(statePath, "utf8");
+    const pending = mutateAsOwner(requestPath, method, payload);
+    await gate.started;
+    const users = JSON.parse(fs.readFileSync(webDavUsersPath, "utf8"));
+    users.find((user) => user.username === "owner").sessionVersion += 1;
+    fs.writeFileSync(webDavUsersPath, JSON.stringify(users));
+    gate.release();
+    const response = await pending;
+    fs.writeFileSync(webDavUsersPath, originalWebDavUsers);
+    assert.equal(response.status, 401, response.body);
+    assert.equal(fs.readFileSync(statePath, "utf8"), stateBefore, `${requestPath} must not persist after session revocation`);
+  }
+
+  const fileAccessStatePath = path.join(dataDir, "file-permissions.json");
+  await assertFreshSessionBeforeMutationPersistence(
+    "/file-access",
+    "PUT",
+    { name: "file-access-session-revocation.txt", public: true, users: {} },
+    cloud.blockList("rootark/uploads/root/", 1),
+    fileAccessStatePath,
+  );
+  await assertFreshSessionBeforeMutationPersistence(
+    "/share",
+    "POST",
+    { name: "share-session-revocation.txt", expiresInMinutes: 60 },
+    cloud.blockList("rootark/uploads/root/", 1),
+    path.join(dataDir, "public-links.json"),
+  );
+  await assertFreshSessionBeforeMutationPersistence(
+    "/encrypted/encrypted-grant-session-revocation.txt/grant-access",
+    "POST",
+    { username: "viewer" },
+    cloud.blockList("rootark/uploads/root/"),
+    path.join(dataDir, "encrypted-files.json"),
+  );
+  await assertFreshSessionBeforeMutationPersistence(
+    "/encrypted/encrypted-grant-session-revocation.txt/grant-access",
+    "POST",
+    { username: "viewer" },
+    cloud.blockList("rootark/uploads/root/", 1),
+    path.join(dataDir, "encrypted-files.json"),
+  );
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/private.txt"), false, "denied metadata actions do not hydrate private objects");
   assert.deepEqual(cloud.getObjects, [], "metadata-only file actions do not download cloud bytes");
   assert.equal(fs.existsSync(path.join(directory, "uploads", "public.txt")), false, "metadata-only file actions do not create a local cache");

@@ -27,7 +27,6 @@ test("opened file descriptor keeps the authorized bytes after path replacement",
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
-
 test("opening rejects a path replaced between metadata check and descriptor open", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-open-file-race-"));
   const filePath = path.join(directory, "file.txt");

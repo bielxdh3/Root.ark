@@ -136,6 +136,45 @@ test("authoritative cloud backup and restore matrix", async (t) => {
   await t.test("SQLite restore queue adapter remains restart-safe", () => { assert.equal(typeof backupRepository.saveBackup, "function"); });
   await t.test("S3 reconciliation", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "s3.txt"), "s3"); const saved = syncBackup([{ path: "uploads/s3.txt", area: "uploads", folderId: "root", name: "s3.txt", state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]); let provider = ""; const result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { provider = "s3"; } } }); assert.equal(provider, "s3"); assert.equal(result.metadata.restoreSync.state, "completed"); });
   await t.test("Drive reconciliation", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "drive.txt"), "drive"); const saved = syncBackup([{ path: "uploads/drive.txt", area: "uploads", folderId: "root", name: "drive.txt", state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]); let provider = ""; const result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { provider = "gdrive"; } } }); assert.equal(provider, "gdrive"); assert.equal(result.metadata.restoreSync.state, "completed"); });
+  await t.test("Windows restore keeps selected bytes suppressed while a provider case alias exists", async () => {
+    reset();
+    const fileName = "Case-Orphan.TXT";
+    fs.writeFileSync(path.join(runtime, "uploads", fileName), "restored bytes");
+    const saved = syncBackup([{ path: `uploads/${fileName}`, area: "uploads", folderId: "root", name: fileName, state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]);
+    const policy = require("../services/restoreProviderOrphans");
+    await policy.write([{ area: "uploads", folderId: "root", name: fileName }]);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { value: "win32" });
+    let aliasPresent = true;
+    let uploadCalls = 0;
+    const provider = {
+      provider: "s3",
+      enabled: () => true,
+      upload: async () => { uploadCalls += 1; },
+      inventory: async () => aliasPresent
+        ? [
+            { area: "uploads", folderId: "root", name: fileName },
+            { area: "uploads", folderId: "root", name: fileName.toLowerCase() },
+          ]
+        : [{ area: "uploads", folderId: "root", name: fileName }],
+    };
+    try {
+      const blocked = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: provider });
+      assert.equal(blocked.metadata.restoreSync.state, "pending");
+      assert.equal(blocked.metadata.restoreSync.entries[0].failureCategory, "configuration");
+      assert.equal(policy.isSuppressed("root", fileName), true);
+      assert.equal(policy.isSuppressed("root", fileName.toLowerCase()), true);
+
+      aliasPresent = false;
+      clock.value = Date.parse(blocked.metadata.restoreSync.entries[0].nextAttemptAt) + 1;
+      const completed = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: provider });
+      assert.equal(completed.metadata.restoreSync.state, "completed");
+      assert.equal(uploadCalls, 2);
+      assert.equal(policy.isSuppressed("root", fileName), false);
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
+  });
   await t.test("production Drive adapter pins restore uploads to a reserved ID", async () => {
     reset();
     fs.writeFileSync(path.join(runtime, "uploads", "drive-restore.txt"), "drive restore bytes");
@@ -171,7 +210,7 @@ test("authoritative cloud backup and restore matrix", async (t) => {
     assert.equal(calls.creates[0].requestBody.id, "reserved-drive-id");
   });
   await t.test("retry success", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "retry.txt"), "retry"); const saved = syncBackup([{ path: "uploads/retry.txt", area: "uploads", folderId: "root", name: "retry.txt", state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]); let calls = 0; let result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { calls += 1; if (calls === 1) throw new Error("offline"); } } }); assert.equal(result.metadata.restoreSync.state, "pending"); clock.value = new Date(result.metadata.restoreSync.entries[0].nextAttemptAt).getTime(); result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { calls += 1; } } }); assert.equal(result.metadata.restoreSync.state, "completed"); });
-  await t.test("terminal sync failure", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "terminal.txt"), "terminal"); const saved = syncBackup([{ path: "uploads/terminal.txt", area: "uploads", folderId: "root", name: "terminal.txt", state: "pending", attempts: 0, maxAttempts: 1, nextAttemptAt: null }]); const result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { throw new Error("offline"); } } }); assert.equal(result.metadata.restoreSync.state, "terminal_failure"); });
+  await t.test("provider failures remain retryable after legacy maxAttempts", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "terminal.txt"), "terminal"); const saved = syncBackup([{ path: "uploads/terminal.txt", area: "uploads", folderId: "root", name: "terminal.txt", state: "pending", attempts: 0, maxAttempts: 1, nextAttemptAt: null }]); const result = await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { throw new Error("offline"); } } }); assert.equal(result.metadata.restoreSync.state, "pending"); assert.equal(result.metadata.restoreSync.entries[0].state, "retry_wait"); assert.ok(result.metadata.restoreSync.entries[0].nextAttemptAt); });
   await t.test("restart resumes sync", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "restart.txt"), "restart"); const saved = syncBackup([{ path: "uploads/restart.txt", area: "uploads", folderId: "root", name: "restart.txt", state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]); const reloaded = backupRepository.getBackup(saved.id); const result = await restoreService.processRestoreSync({ backupId: reloaded.id, clock, uploader: { enabled: () => true, upload: async () => true } }); assert.equal(result.metadata.restoreSync.state, "completed"); });
   await t.test("exact local bytes", async () => { reset(); const bytes = Buffer.from([0, 255, 1, 2]); fs.writeFileSync(path.join(runtime, "uploads", "bytes.bin"), bytes); const saved = syncBackup([{ path: "uploads/bytes.bin", area: "uploads", folderId: "root", name: "bytes.bin", state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]); let received; await restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async (localPath) => { received = fs.readFileSync(localPath); } } }); assert.deepEqual(received, bytes); });
   await t.test("provider success then persistence failure", async () => { reset(); fs.writeFileSync(path.join(runtime, "uploads", "persist.txt"), "persist"); const saved = syncBackup([{ path: "uploads/persist.txt", area: "uploads", folderId: "root", name: "persist.txt", state: "pending", attempts: 0, maxAttempts: 5, nextAttemptAt: null }]); const original = backupRepository.mutateRestoreSyncEntry; let mutations = 0; backupRepository.mutateRestoreSyncEntry = (...args) => { mutations += 1; if (mutations > 1) throw Object.assign(new Error("persist"), { code: "persistence_error" }); return original(...args); }; let calls = 0; try { await assert.rejects(restoreService.processRestoreSync({ backupId: saved.id, clock, uploader: { enabled: () => true, upload: async () => { calls += 1; } } })); } finally { backupRepository.mutateRestoreSyncEntry = original; } assert.equal(calls, 1); });

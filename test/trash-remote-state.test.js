@@ -12,12 +12,12 @@ process.env.DB_ENABLED = "false";
 const trashRepository = require("../repositories/trashRepository");
 const trashService = require("../services/trashService");
 
-function item(id) {
-  const relative = path.join("files", id, "file.txt");
+function item(id, fileName = "file.txt") {
+  const relative = path.join("files", id, fileName);
   const absolute = path.join(runtime, "data", "trash", relative);
   fs.mkdirSync(path.dirname(absolute), { recursive: true });
   fs.writeFileSync(absolute, "disposable");
-  return { id, itemType: "file", originalFolderId: "root", originalFileName: "file.txt", trashPath: relative, metadata: {}, restoreMetadata: { versions: { versions: [] } }, status: "trashed" };
+  return { id, itemType: "file", originalFolderId: "root", originalFileName: fileName, trashPath: relative, metadata: {}, restoreMetadata: { versions: { versions: [] } }, status: "trashed" };
 }
 
 test("remote deletion remains pending until completion and survives JSON persistence", () => {
@@ -28,6 +28,17 @@ test("remote deletion remains pending until completion and survives JSON persist
   const persisted = JSON.parse(fs.readFileSync(path.join(runtime, "data", "trash-items.json"), "utf8"));
   assert.equal(persisted[0].status, "remote_delete_pending");
   assert.equal(persisted[0].metadata.remoteDeletion.state, "pending");
+});
+
+test("trash repository finds pending deletion by exact file identity", () => {
+  const matching = trashService.queueRemoteDeletion({ item: item("45454545-4545-4545-8545-454545454545", "target.txt"), deletedBy: "tester", loaders: {} });
+  const differentFolder = trashService.queueRemoteDeletion({ item: { ...item("46464646-4646-4646-8646-464646464646", "target.txt"), originalFolderId: "other" }, deletedBy: "tester", loaders: {} });
+
+  assert.deepEqual(
+    trashRepository.listPendingFileRemoteDeletions("root", "target.txt").map((entry) => entry.id),
+    [matching.id],
+  );
+  assert.equal(trashRepository.listPendingFileRemoteDeletions("other", "target.txt")[0].id, differentFolder.id);
 });
 
 test("failed retries are bounded and cannot falsely report permanent completion", () => {

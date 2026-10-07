@@ -402,6 +402,32 @@ test("users without upload permission are rejected before Multer creates artifac
   assertRejectedClean(harness, response, 403);
 });
 
+test("upload chunk route limit rejects requests before Multer writes staging files", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t, { envOverrides: { ROUTE_RATE_LIMIT_MAX: "1" } });
+  const session = await login(harness.port, "uploader", harness.password);
+  const first = await uploadChunk(harness.port, session, {
+    uploadId: "rate-limited-first",
+    originalName: "first.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.from("first"),
+  });
+  assert.equal(first.status, 200, first.body);
+
+  const rejectedId = "rate-limited-before-multer";
+  const rejected = await uploadChunk(harness.port, session, {
+    uploadId: rejectedId,
+    originalName: "rejected.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.from("must not be staged"),
+  });
+  assert.equal(rejected.status, 429, rejected.body);
+  assert.match(rejected.headers["retry-after"] || "", /^\d+$/);
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, rejectedId)), false);
+  assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
+});
+
 test("Multer rejects malformed or disallowed multipart bodies without artifacts", { timeout: 30_000 }, async (t) => {
   const harness = await createHarness(t);
   const session = await login(harness.port, "uploader", harness.password);

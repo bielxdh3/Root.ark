@@ -26,35 +26,132 @@ async function waitForFile(filePath, timeoutMs = 5000) {
   return fs.existsSync(filePath);
 }
 
-test("restore provider orphan identities follow host path case rules for areas, folders, and names", () => {
+test("restore provider orphan identities preserve provider object case on every host", () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-"));
   try {
     const script = `
       const assert = require("node:assert/strict");
       const policy = require(${JSON.stringify(servicePath)});
-      const windows = process.platform === "win32";
       const normalized = policy.normalizeObjects([
         { area: "uploads", folderId: "RootFolder", name: "Case-Orphan.TXT" },
         { area: "uploads", folderId: "rootfolder", name: "case-orphan.txt" },
       ]);
-      assert.equal(normalized.length, windows ? 1 : 2);
+      assert.equal(normalized.length, 2);
       (async () => {
         await policy.write([{ area: "uploads", folderId: "RootFolder", name: "Case-Orphan.TXT" }]);
-        assert.equal(policy.isSuppressed("rootfolder", "case-orphan.txt", "uploads"), windows);
+        assert.equal(policy.isSuppressed("rootfolder", "case-orphan.txt", "uploads"), process.platform === "win32");
         assert.equal(policy.isSuppressed("RootFolder", "Case-Orphan.TXT", "temp"), false, "area remains part of the identity");
-        if (windows) {
-          assert.equal(await policy.clear("rootfolder", "case-orphan.txt", "uploads"), true);
-          assert.equal(policy.read().length, 0, "clear uses the same case-insensitive path identity");
-        } else {
-          assert.equal(await policy.clear("rootfolder", "case-orphan.txt", "uploads"), false);
-          assert.equal(policy.read().length, 1, "Linux keeps path identity case-sensitive");
-        }
+        assert.equal(await policy.clear("rootfolder", "case-orphan.txt", "uploads"), false);
+        assert.equal(policy.read().length, 1, "clearing a case-distinct provider key cannot remove another object");
+        assert.equal(await policy.clear("RootFolder", "Case-Orphan.TXT", "uploads", { inventory: async () => [
+          { area: "uploads", folderId: "RootFolder", name: "Case-Orphan.TXT" },
+        ] }), true);
+        assert.equal(policy.read().length, 0);
         process.stdout.write(JSON.stringify({ ok: true, platform: process.platform, normalized: normalized.length }));
       })().catch((error) => { console.error(error); process.exitCode = 1; });
     `;
     const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr || result.stdout);
     assert.equal(JSON.parse(result.stdout).ok, true);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("suppression checks reuse one policy snapshot and observe another process update", () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-snapshot-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const { spawnSync } = require("node:child_process");
+      const policy = require(${JSON.stringify(servicePath)});
+      const policyPath = policy.POLICY_PATH;
+      (async () => {
+        await policy.write([{ area: "uploads", folderId: "folder", name: "before.txt" }]);
+        const originalReadFileSync = fs.readFileSync;
+        let reads = 0;
+        fs.readFileSync = function (target, ...args) {
+          if (require("node:path").resolve(String(target)) === policyPath) reads += 1;
+          return originalReadFileSync.call(this, target, ...args);
+        };
+        for (let index = 0; index < 100; index++) {
+          assert.equal(policy.isSuppressed("folder", "missing-" + index + ".txt"), false);
+        }
+        assert.equal(reads, 1, "bulk checks should parse the unchanged policy only once");
+        const updateScript = "const policy = require(" + JSON.stringify(${JSON.stringify(servicePath)}) + "); policy.write([{ area: 'uploads', folderId: 'folder', name: 'after.txt' }]).catch((error) => { console.error(error); process.exitCode = 1; });";
+        const updated = spawnSync(process.execPath, ["-e", updateScript], { cwd: process.cwd(), encoding: "utf8" });
+        assert.equal(updated.status, 0, updated.stderr || updated.stdout);
+        assert.equal(policy.isSuppressed("folder", "before.txt"), false, "a replaced policy must invalidate the old snapshot");
+        assert.equal(policy.isSuppressed("folder", "after.txt"), true, "the replacement policy must be observed");
+        assert.equal(reads, 2, "one replacement policy parse should refresh the snapshot");
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("Windows provider aliases with different case remain independently suppressible and clearable", () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-case-alias-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      Object.defineProperty(process, "platform", { value: "win32" });
+      const policy = require(${JSON.stringify(servicePath)});
+      (async () => {
+        await policy.write([
+          { area: "uploads", folderId: "folder", name: "Alias.txt" },
+          { area: "uploads", folderId: "folder", name: "alias.txt" },
+        ]);
+        assert.equal(policy.read().length, 2, "provider aliases differing by case are separate objects");
+        assert.equal(policy.isSuppressed("folder", "Alias.txt"), true);
+        assert.equal(policy.isSuppressed("folder", "alias.txt"), true);
+        assert.equal(await policy.clear("folder", "Alias.txt", "uploads", { inventory: async () => [
+          { area: "uploads", folderId: "folder", name: "Alias.txt" },
+        ] }), true);
+        assert.deepEqual(policy.read(), [{ area: "uploads", folderId: "folder", name: "alias.txt" }], "exact clear retains the unselected case-distinct provider object");
+        assert.equal(policy.isSuppressed("folder", "Alias.txt"), true, "both local spellings remain fail-closed while the Windows alias is suppressed");
+        assert.equal(policy.isSuppressed("folder", "alias.txt"), true, "clearing the selected alias must retain the unselected alias");
+        assert.equal(await policy.clear("folder", "alias.txt", "uploads", { inventory: async () => [
+          { area: "uploads", folderId: "folder", name: "alias.txt" },
+        ] }), true);
+        assert.equal(policy.isSuppressed("folder", "Alias.txt"), false);
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("Windows case-fold aliases keep restored objects suppressed until inventory is unambiguous", () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-case-fold-access-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      Object.defineProperty(process, "platform", { value: "win32" });
+      const policy = require(${JSON.stringify(servicePath)});
+      (async () => {
+        await policy.write([{ area: "uploads", folderId: "root", name: "Case-Orphan.TXT" }]);
+        assert.equal(policy.isSuppressed("root", "case-orphan.txt"), true, "Windows local path aliases cannot expose suppressed provider bytes");
+        const aliases = [
+          { area: "uploads", folderId: "root", name: "Case-Orphan.TXT" },
+          { area: "uploads", folderId: "root", name: "case-orphan.txt" },
+        ];
+        assert.throws(() => policy.assertUnambiguousProviderInventory(aliases), /case-colliding.*restore is blocked/i);
+        await assert.rejects(policy.clear("root", "Case-Orphan.TXT", "uploads", { inventory: async () => aliases }), { code: "configuration" });
+        assert.equal(policy.isSuppressed("root", "Case-Orphan.TXT"), true, "an alias conflict keeps the selected file suppressed");
+        assert.equal(policy.isSuppressed("root", "case-orphan.txt"), true, "an alias conflict keeps the remote alias suppressed");
+        assert.equal(await policy.clear("root", "Case-Orphan.TXT", "uploads", { inventory: async () => [aliases[0]] }), true);
+        assert.equal(policy.isSuppressed("root", "Case-Orphan.TXT"), false, "an unambiguous provider inventory permits unhide");
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
   } finally {
     fs.rmSync(runtime, { recursive: true, force: true });
   }
@@ -93,7 +190,7 @@ test("separate processes clearing different restore orphans do not lose either u
     };
     const fileName = id === "a" ? "first.txt" : "second.txt";
     (async () => {
-      if (!await policy.clear("folder", fileName)) throw new Error("expected suppression entry to be cleared");
+      if (!await policy.clear("folder", fileName, "uploads", { inventory: async () => [{ area: "uploads", folderId: "folder", name: fileName }] })) throw new Error("expected suppression entry to be cleared");
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `;
   fs.mkdirSync(path.dirname(policyPath), { recursive: true });

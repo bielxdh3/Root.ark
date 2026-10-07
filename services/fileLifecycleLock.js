@@ -177,7 +177,13 @@ function createFileLifecycleLock({ directory, timeoutMs = 30_000, pollMs = 25 } 
     return runWithFolderLocks([folderId], work);
   }
 
-  return { run, runAcrossFolders, runFolder };
+  // Reconciliation scheduled from a locked operation must not inherit its
+  // AsyncLocalStorage marker after the physical lock has been released.
+  function runDetached(work) {
+    return context.exit(work);
+  }
+
+  return { run, runAcrossFolders, runDetached, runFolder };
 }
 
 module.exports = { createFileLifecycleLock };

@@ -286,6 +286,21 @@ test("JSON user generations survive restart before same-username recreation", { 
     body: createBody,
   })).status, 201);
 
+  const specialUsernameBody = JSON.stringify({ username: "constructor", password: crypto.randomBytes(24).toString("base64url"), role: "user", permissions: { manageUsers: true } });
+  assert.equal((await request(port, "/users", {
+    method: "POST",
+    headers: {
+      cookie: admin.cookie,
+      origin: `http://127.0.0.1:${port}`,
+      "x-csrf-token": admin.csrf,
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(specialUsernameBody),
+    },
+    body: specialUsernameBody,
+  })).status, 201);
+  const generations = JSON.parse(fs.readFileSync(path.join(cwd, "data", "user-generations.local.json"), "utf-8"));
+  assert.equal(generations.constructor, 0, "special property names must persist as ordinary username keys");
+
   assert.equal((await request(port, "/storage/status", { headers: { cookie: agent.cookie } })).status, 401);
   const recreated = await login(port, "agent", recreatedPassword);
   assert.ok(recreated.sessionVersion > agent.sessionVersion);

@@ -4,6 +4,7 @@ const { resolveRuntimePath } = require("../src/runtime-paths");
 const { acquireJsonMutationLock } = require("../repositories/backupRepository");
 
 const POLICY_PATH = resolveRuntimePath("data", ".rootark-restore-provider-orphans.json");
+let suppressionSnapshot = null;
 
 async function acquirePolicyLock() {
   const deadline = Date.now() + 10_000;
@@ -17,8 +18,22 @@ async function acquirePolicyLock() {
 }
 
 function identityKey(area, folderId, name) {
-  const normalizePathPart = (value) => process.platform === "win32" ? String(value).toLowerCase() : String(value);
-  return `${area}\0${normalizePathPart(folderId)}\0${normalizePathPart(name)}`;
+  return `${area}\0${String(folderId)}\0${String(name)}`;
+}
+
+function assertUnambiguousProviderInventory(objects) {
+  if (process.platform !== "win32") return true;
+  const identities = new Map();
+  for (const entry of normalizeObjects(objects)) {
+    const exact = identityKey(entry.area, entry.folderId, entry.name);
+    const folded = exact.toLowerCase();
+    const previous = identities.get(folded);
+    if (previous !== undefined && previous !== exact) {
+      throw new Error("Cloud provider inventory contains case-colliding paths; restore is blocked on Windows");
+    }
+    identities.set(folded, exact);
+  }
+  return true;
 }
 
 function normalizeObjects(objects) {
@@ -48,6 +63,35 @@ function read() {
   return normalizeObjects(value.objects);
 }
 
+function policySignature() {
+  try {
+    const stat = fs.statSync(POLICY_PATH, { bigint: true });
+    return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].map(String).join(":");
+  } catch (error) {
+    if (error.code === "ENOENT") return "missing";
+    throw error;
+  }
+}
+
+function readSuppressionSnapshot() {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const before = policySignature();
+    if (suppressionSnapshot?.signature === before) return suppressionSnapshot;
+    const entries = read();
+    const after = policySignature();
+    if (before === after) {
+      const keys = new Set(entries.map((entry) => identityKey(entry.area, entry.folderId, entry.name)));
+      suppressionSnapshot = {
+        signature: after,
+        keys,
+        foldedKeys: process.platform === "win32" ? new Set([...keys].map((key) => key.toLowerCase())) : null,
+      };
+      return suppressionSnapshot;
+    }
+  }
+  throw new Error("Restore provider suppression policy changed repeatedly; file access is blocked");
+}
+
 function writeUnlocked(objects) {
   const normalized = normalizeObjects(objects);
   fs.mkdirSync(path.dirname(POLICY_PATH), { recursive: true });
@@ -59,6 +103,7 @@ function writeUnlocked(objects) {
   } finally { fs.closeSync(descriptor); }
   try {
     fs.renameSync(temporary, POLICY_PATH);
+    suppressionSnapshot = null;
     if (process.platform !== "win32") {
       const directory = fs.openSync(path.dirname(POLICY_PATH), "r");
       try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
@@ -78,7 +123,24 @@ async function write(objects) {
 
 function isSuppressed(folderId, fileName, area = "uploads") {
   const key = identityKey(area, String(folderId || "root"), String(fileName || ""));
-  return read().some((entry) => identityKey(entry.area, entry.folderId, entry.name) === key);
+  const snapshot = readSuppressionSnapshot();
+  return snapshot.keys.has(key) || Boolean(snapshot.foldedKeys?.has(key.toLowerCase()));
+}
+
+async function assertSafeToUnhide(provider) {
+  if (process.platform !== "win32") return true;
+  if (typeof provider?.inventory !== "function") {
+    throw Object.assign(new Error("Provider inventory is required before un-hiding restored files on Windows"), { code: "configuration" });
+  }
+  const inventory = await provider.inventory();
+  try {
+    assertUnambiguousProviderInventory(inventory
+      .filter((entry) => ["uploads", "temp"].includes(entry.area))
+      .map(({ area, folderId, name }) => ({ area, folderId, name })));
+  } catch {
+    throw Object.assign(new Error("Case-colliding provider objects keep restored files suppressed on Windows"), { code: "configuration" });
+  }
+  return true;
 }
 
 async function suppress(folderId, fileName, area = "uploads") {
@@ -93,8 +155,10 @@ async function suppress(folderId, fileName, area = "uploads") {
   } finally { lease.release(); }
 }
 
-async function clear(folderId, fileName, area = "uploads") {
+async function clear(folderId, fileName, area = "uploads", provider = null) {
   const key = identityKey(area, String(folderId || "root"), String(fileName || ""));
+  if (!read().some((entry) => identityKey(entry.area, entry.folderId, entry.name) === key)) return false;
+  await assertSafeToUnhide(provider);
   const lease = await acquirePolicyLock();
   try {
     const current = read();
@@ -104,4 +168,4 @@ async function clear(folderId, fileName, area = "uploads") {
   } finally { lease.release(); }
 }
 
-module.exports = { POLICY_PATH, clear, identityKey, isSuppressed, normalizeObjects, read, suppress, write };
+module.exports = { POLICY_PATH, assertSafeToUnhide, assertUnambiguousProviderInventory, clear, identityKey, isSuppressed, normalizeObjects, read, suppress, write };

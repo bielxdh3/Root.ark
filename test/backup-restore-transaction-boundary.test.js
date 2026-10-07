@@ -592,6 +592,17 @@ test("abrupt whole-restore interruptions automatically roll back before startup 
     const assert=require("node:assert/strict");
     const fs=require("node:fs");
     const Database=require(${JSON.stringify(path.join(ROOT, "node_modules", "better-sqlite3"))});
+    const migrations=require(${JSON.stringify(path.join(ROOT, "db", "migrations.js"))});
+    const runMigrations=migrations.runMigrations;
+    migrations.runMigrations=(options)=>{
+      assert.equal(fs.readFileSync("data/runtime.json", "utf8"), "live-state", "whole-restore recovery completes before startup migrations");
+      assert.equal(fs.readFileSync("uploads/file.txt", "utf8"), "live-upload");
+      assert.equal(fs.readFileSync("quarantine/live.bin", "utf8"), "live-quarantine");
+      assert.equal(fs.existsSync("data/.rootark-restore-coordinator.json"), false);
+      const db=new Database(process.env.DATABASE_URL,{readonly:true});
+      try { assert.equal(db.prepare("SELECT value FROM proof").get().value,"live-state"); } finally { db.close(); }
+      return runMigrations(options);
+    };
     require(${JSON.stringify(path.join(ROOT, "server.js"))});
     setTimeout(() => {
       try {

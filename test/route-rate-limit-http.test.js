@@ -132,6 +132,52 @@ async function waitForServer(child) {
   return port;
 }
 
+test("dynamic request limit is shared across API routes while static assets remain available", { timeout: 30_000 }, async (t) => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-api-rate-limit-"));
+  fs.mkdirSync(path.join(sandbox, "data"), { recursive: true });
+  fs.mkdirSync(path.join(sandbox, "uploads"), { recursive: true });
+  fs.cpSync(path.join(ROOT, "public"), path.join(sandbox, "public"), { recursive: true });
+
+  const child = spawn(process.execPath, ["-e", serverBootstrap()], {
+    cwd: sandbox,
+    env: {
+      ...process.env,
+      PORT: "0",
+      DB_ENABLED: "false",
+      CLOUD_STORAGE_PROVIDER: "local",
+      NODE_ENV: "test",
+      ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true",
+      TOTP_POLICY: "optional",
+      JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+      ROUTE_RATE_LIMIT_MAX: "1000",
+      ROUTE_RATE_LIMIT_WINDOW_MS: "60000",
+      API_RATE_LIMIT_MAX: "2",
+      TRUSTED_PROXIES: "",
+    },
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+    windowsHide: true,
+  });
+
+  t.after(async () => {
+    if (child.exitCode === null) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 10_000);
+        child.once("exit", () => { clearTimeout(timer); resolve(); });
+        child.kill();
+      });
+    }
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  const port = await waitForServer(child);
+  assert.equal((await request(port, "/login.html")).status, 200, "static login assets are outside the API quota");
+  const first = await request(port, "/file-access");
+  const second = await request(port, "/not-a-route");
+  const third = await request(port, "/list");
+  assert.deepEqual([first.status, second.status, third.status], [401, 404, 429]);
+  assert.equal(third.headers["ratelimit-limit"], "2");
+});
+
 test("route rate limits enforce separate budgets despite direct-origin X-Forwarded-For spoofing", { timeout: 30_000 }, async (t) => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-route-rate-limit-"));
   fs.mkdirSync(path.join(sandbox, "data"), { recursive: true });

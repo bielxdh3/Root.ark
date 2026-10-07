@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const bcrypt = require("bcryptjs");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
@@ -34,7 +35,7 @@ function request(port, requestPath) {
   });
 }
 
-function startS3Fixture() {
+function startS3Fixture({ failListings = false, failListingPrefixes = [] } = {}) {
   let markDeleteStarted;
   let releaseDelete;
   const deleteStarted = new Promise((resolve) => { markDeleteStarted = resolve; });
@@ -51,6 +52,12 @@ function startS3Fixture() {
       });
     }
     if (req.method === "GET" && url.searchParams.has("list-type")) {
+      const requestedPrefix = url.searchParams.get("prefix") || "";
+      if (failListings || failListingPrefixes.some((prefix) => requestedPrefix.includes(prefix))) {
+        res.writeHead(503, { "content-type": "application/xml" });
+        res.end("<Error><Code>ServiceUnavailable</Code></Error>");
+        return;
+      }
       res.writeHead(200, { "content-type": "application/xml" });
       res.end("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>fixture-bucket</Name><Prefix></Prefix><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>");
       return;
@@ -67,6 +74,25 @@ function startS3Fixture() {
       deleteStarted,
       releaseDelete,
     }));
+  });
+}
+
+function requestJson(port, requestPath, body, headers = {}) {
+  const payload = JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: "127.0.0.1",
+      port,
+      path: requestPath,
+      method: "PUT",
+      headers: { ...headers, "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
+    }, (res) => {
+      let text = "";
+      res.on("data", (chunk) => { text += chunk; });
+      res.on("end", () => resolve({ status: res.statusCode, body: text }));
+    });
+    req.once("error", reject);
+    req.end(payload);
   });
 }
 
@@ -178,4 +204,154 @@ test("expired cloud trash cleanup holds the lifecycle lock through persisted pro
   await replacementMutation;
   assert.equal(mutationSettled, true);
   assert.equal((await waitForTrashStatus(trashFile, "permanently_deleted"))?.status, "permanently_deleted");
+});
+
+test("expired folder stays unavailable when cloud cleanup fails and cannot be reactivated", { timeout: 30_000 }, async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-expired-folder-cloud-failure-"));
+  const dataDir = path.join(directory, "data");
+  const oldExpiry = new Date(Date.now() - 60_000).toISOString();
+  const password = crypto.randomBytes(24).toString("base64url");
+  const cloud = await startS3Fixture({ failListings: true });
+  const port = await unusedPort();
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(path.join(directory, "uploads", "expired-folder"), { recursive: true });
+  fs.mkdirSync(path.join(directory, "temp", "expired-folder"), { recursive: true });
+  fs.symlinkSync(PUBLIC, path.join(directory, "public"), process.platform === "win32" ? "junction" : "dir");
+  fs.writeFileSync(path.join(dataDir, "users.local.json"), JSON.stringify([
+    { username: "tester", password: bcrypt.hashSync(password, 10), role: "admin", permissions: {}, sessionVersion: 0 },
+  ]));
+  fs.writeFileSync(path.join(dataDir, "folders.json"), JSON.stringify([
+    { id: "root", name: "Root", createdBy: "system", allowedUsers: [], isRoot: true },
+    { id: "expired-folder", name: "Expired", createdBy: "tester", allowedUsers: ["tester"], isRoot: false, expiresAt: oldExpiry },
+  ]));
+  let output = "";
+  const child = spawn(process.execPath, [SERVER], {
+    cwd: directory,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DB_ENABLED: "false",
+      NODE_ENV: "test",
+      JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+      CLOUD_STORAGE_PROVIDER: "s3",
+      AWS_S3_BUCKET: "fixture-bucket",
+      AWS_REGION: "us-east-1",
+      AWS_ENDPOINT_URL: `http://127.0.0.1:${cloud.port}`,
+      AWS_FORCE_PATH_STYLE: "true",
+      AWS_ACCESS_KEY_ID: "fixture-access-key",
+      AWS_SECRET_ACCESS_KEY: "fixture-secret-key",
+      TOTP_POLICY: "optional",
+    },
+  });
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { output += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { output += chunk; });
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    if (child.exitCode === null && child.signalCode === null) await new Promise((resolve) => child.once("exit", resolve));
+    await new Promise((resolve) => cloud.server.close(resolve));
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+
+  await waitForServer(port, child, () => output);
+  const cleanupDeadline = Date.now() + 5000;
+  while (!output.includes("Falha ao limpar pasta temporaria:") && Date.now() < cleanupDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.match(output, /Falha ao limpar pasta temporaria: Provider operation failed/, "provider failure must be exercised before checking reactivation");
+  const foldersPath = path.join(dataDir, "folders.json");
+  const expiredFolder = JSON.parse(fs.readFileSync(foldersPath, "utf8")).find((folder) => folder.id === "expired-folder");
+  assert.equal(expiredFolder.expiresAt, oldExpiry);
+
+  const loginBody = JSON.stringify({ username: "tester", password });
+  const login = await new Promise((resolve, reject) => {
+    const req = http.request({
+      host: "127.0.0.1",
+      port,
+      path: "/auth/login",
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(loginBody) },
+    }, (res) => {
+      let text = "";
+      res.on("data", (chunk) => { text += chunk; });
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: text }));
+    });
+    req.once("error", reject);
+    req.end(loginBody);
+  });
+  assert.equal(login.status, 200, login.body);
+  const cookies = login.headers["set-cookie"].map((cookie) => cookie.split(";", 1)[0]);
+  const cookie = cookies.join("; ");
+  const csrf = cookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1];
+  const revive = await requestJson(port, "/folders/expired-folder/temporary", { expiresAt: null }, {
+    cookie,
+    origin: `http://127.0.0.1:${port}`,
+    "x-csrf-token": csrf,
+  });
+  assert.equal(revive.status, 409, revive.body);
+  assert.equal(JSON.parse(fs.readFileSync(foldersPath, "utf8")).find((folder) => folder.id === "expired-folder").expiresAt, oldExpiry);
+});
+
+test("expired folder cleanup continues after one provider prefix fails", { timeout: 30_000 }, async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-expired-folder-continues-"));
+  const dataDir = path.join(directory, "data");
+  const oldExpiry = new Date(Date.now() - 60_000).toISOString();
+  const cloud = await startS3Fixture({ failListingPrefixes: ["expired-fail"] });
+  const port = await unusedPort();
+  fs.mkdirSync(dataDir, { recursive: true });
+  for (const folderId of ["expired-fail", "expired-success"]) {
+    fs.mkdirSync(path.join(directory, "uploads", folderId), { recursive: true });
+    fs.mkdirSync(path.join(directory, "temp", folderId), { recursive: true });
+  }
+  fs.symlinkSync(PUBLIC, path.join(directory, "public"), process.platform === "win32" ? "junction" : "dir");
+  fs.writeFileSync(path.join(dataDir, "users.local.json"), JSON.stringify([
+    { username: "tester", password: bcrypt.hashSync(crypto.randomBytes(24).toString("base64url"), 10), role: "admin", permissions: {}, sessionVersion: 0 },
+  ]));
+  const foldersPath = path.join(dataDir, "folders.json");
+  fs.writeFileSync(foldersPath, JSON.stringify([
+    { id: "root", name: "Root", createdBy: "system", allowedUsers: [], isRoot: true },
+    { id: "expired-fail", name: "Fails", createdBy: "tester", allowedUsers: ["tester"], isRoot: false, expiresAt: oldExpiry },
+    { id: "expired-success", name: "Succeeds", createdBy: "tester", allowedUsers: ["tester"], isRoot: false, expiresAt: oldExpiry },
+  ]));
+  let output = "";
+  const child = spawn(process.execPath, [SERVER], {
+    cwd: directory,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DB_ENABLED: "false",
+      NODE_ENV: "test",
+      JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+      CLOUD_STORAGE_PROVIDER: "s3",
+      AWS_S3_BUCKET: "fixture-bucket",
+      AWS_REGION: "us-east-1",
+      AWS_ENDPOINT_URL: `http://127.0.0.1:${cloud.port}`,
+      AWS_FORCE_PATH_STYLE: "true",
+      AWS_ACCESS_KEY_ID: "fixture-access-key",
+      AWS_SECRET_ACCESS_KEY: "fixture-secret-key",
+      TOTP_POLICY: "optional",
+    },
+  });
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { output += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { output += chunk; });
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    if (child.exitCode === null && child.signalCode === null) await new Promise((resolve) => child.once("exit", resolve));
+    cloud.releaseDelete();
+    await new Promise((resolve) => cloud.server.close(resolve));
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+
+  await waitForServer(port, child, () => output);
+  const deadline = Date.now() + 2_000;
+  let folders = [];
+  while (Date.now() < deadline) {
+    folders = JSON.parse(fs.readFileSync(foldersPath, "utf8"));
+    if (!folders.some((folder) => folder.id === "expired-success")) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.match(output, /Provider operation failed/, "the first folder's provider failure is observed");
+  assert.equal(folders.some((folder) => folder.id === "expired-fail"), true, "failed folder remains expired and unavailable for a later retry");
+  assert.equal(folders.some((folder) => folder.id === "expired-success"), false, "later expired folders are still cleaned in the same sweep");
 });

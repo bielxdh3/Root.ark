@@ -685,7 +685,7 @@ async function processRestoreSync({ backupId, clock, uploader, leaseMs = 60 * 10
         }
         await provider.upload(localPath, entryForUpload.folderId, entryForUpload.name, entryForUpload.area,
           providerIdentity === "gdrive" ? { providerFileId: entryForUpload.providerFileId } : undefined);
-        await restoreProviderOrphans.clear(entryForUpload.folderId, entryForUpload.name, entryForUpload.area);
+        await restoreProviderOrphans.clear(entryForUpload.folderId, entryForUpload.name, entryForUpload.area, provider);
         return true;
       };
       const runMutation = typeof runFileLifecycleMutation === "function"
@@ -1749,6 +1749,14 @@ async function restoreBackup(id, options = {}) {
     restoreDir = staging.restoreDir;
     coordinator = persistWholeRestoreCoordinator({ backupId: backup.id, requiredRestartInstances });
     await options.waitForRequestQuiescence?.();
+    let providerInventory = null;
+    if (cloudStorage?.enabled()) {
+      if (typeof cloudStorage.inventory !== "function") throw new Error("Cloud provider inventory is required before restore can protect unarchived objects");
+      providerInventory = await cloudStorage.inventory();
+      restoreProviderOrphans.assertUnambiguousProviderInventory(providerInventory
+        .filter((entry) => ["uploads", "temp"].includes(entry.area))
+        .map(({ area, folderId, name }) => ({ area, folderId, name })));
+    }
     const preRestore = await backupService.createBackup({
       lockHeld: true,
       type: "pre-restore",
@@ -1767,10 +1775,8 @@ async function restoreBackup(id, options = {}) {
     const preimagePlan = wholePreimagePlan(restoreDir, quarantinePlan);
     let providerOrphans = null;
     if (cloudStorage?.enabled()) {
-      if (typeof cloudStorage.inventory !== "function") throw new Error("Cloud provider inventory is required before restore can protect unarchived objects");
-      const inventory = await cloudStorage.inventory();
       const archivedObjects = archivedProviderObjects(manifest);
-      providerOrphans = restoreProviderOrphans.normalizeObjects(inventory
+      providerOrphans = restoreProviderOrphans.normalizeObjects(providerInventory
         .filter((entry) => ["uploads", "temp"].includes(entry.area) && !archivedObjects.has(`${entry.area}\0${entry.folderId}\0${entry.name}`))
         .map(({ area, folderId, name }) => ({ area, folderId, name })));
     }

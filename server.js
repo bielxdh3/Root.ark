@@ -273,7 +273,7 @@ function getCloudStorageStatus() { return cloudStorage.status(); }
 function getCloudKey(folderId = ROOT_FOLDER_ID, fileName = "", area = "uploads") { return cloudStorage.key(folderId, fileName, area); }
 async function uploadFileToCloud(localPath, folderId, fileName, area = "uploads") {
   const result = await cloudStorage.upload(localPath, folderId, fileName, area);
-  if (result) await restoreProviderOrphans.clear(folderId, fileName, area);
+  if (result) await restoreProviderOrphans.clear(folderId, fileName, area, cloudStorage);
   return result;
 }
 async function downloadFileFromCloud(folderId, fileName, localPath, area = "uploads", canPublish) { return cloudStorage.download(folderId, fileName, localPath, area, canPublish); }
@@ -308,9 +308,11 @@ function syncCloudFireAndForget(operation, label) {
 
 function processCloudUploadMutationsLater() {
   if (!isCloudStorageEnabled()) return;
-  setImmediate(() => {
-    restoreRequestGate.run(() => cloudUploadMutationQueue.processAll()).catch((error) => {
-      console.error("[cloud-upload] reconciliation pending:", sanitizeLogValue(error.message));
+  cloudFileLifecycleLock.runDetached(() => {
+    setImmediate(() => {
+      restoreRequestGate.run(() => cloudUploadMutationQueue.processAll()).catch((error) => {
+        console.error("[cloud-upload] reconciliation pending:", sanitizeLogValue(error.message));
+      });
     });
   });
 }
@@ -398,9 +400,11 @@ function withChunkUploadSessionLock(handler) {
 
 function processCloudTempMutationAfterLifecycle(folderId, fileName) {
   if (!isCloudStorageEnabled()) return;
-  setImmediate(() => {
-    cloudTempMutationQueue.process(folderId, fileName).catch((error) => {
-      console.error("[cloud-temp] reconciliation pending:", sanitizeLogValue(error.message));
+  cloudFileLifecycleLock.runDetached(() => {
+    setImmediate(() => {
+      cloudTempMutationQueue.process(folderId, fileName).catch((error) => {
+        console.error("[cloud-temp] reconciliation pending:", sanitizeLogValue(error.message));
+      });
     });
   });
 }
@@ -450,7 +454,7 @@ function loadUsers() {
 }
 
 function loadUserGenerations() {
-  if (!fs.existsSync(USER_GENERATIONS_FILE)) return {};
+  if (!fs.existsSync(USER_GENERATIONS_FILE)) return Object.create(null);
 
   let generations;
   try {
@@ -462,7 +466,7 @@ function loadUserGenerations() {
   if (!generations || typeof generations !== "object" || Array.isArray(generations) || Object.values(generations).some((version) => !Number.isSafeInteger(version) || version < 0)) {
     throw new Error("Historico de geracoes de usuario invalido");
   }
-  return generations;
+  return Object.assign(Object.create(null), generations);
 }
 
 function rememberUserGenerations(users) {
@@ -944,19 +948,49 @@ function loadPublicLinks() {
   if (shouldUseDatabase()) {
     try {
       const entries = publicLinksRepository.loadPublicLinks();
-      if (Object.keys(entries).length || !shouldReadJsonFallback()) return entries;
+      if (Object.keys(entries).length || !shouldReadJsonFallback() || !fs.existsSync(PUBLIC_LINKS_FILE)) return entries;
+
+      let fallbackEntries;
+      try {
+        fallbackEntries = JSON.parse(fs.readFileSync(PUBLIC_LINKS_FILE, "utf-8"));
+      } catch (error) {
+        console.error("Falha ao ler links publicos JSON de fallback:", error.message);
+        return entries;
+      }
+
+      let recordedTokens;
+      try {
+        recordedTokens = publicLinksRepository.getRecordedPublicLinkTokens(Object.keys(fallbackEntries || {}));
+      } catch (error) {
+        console.error("Falha ao reconciliar links publicos JSON com SQLite:", error.message);
+        return entries;
+      }
+      const unrecordedFallbackEntries = Object.fromEntries(
+        Object.entries(fallbackEntries || {}).filter(([token]) => /^[a-f0-9]{48}$/i.test(token) && !recordedTokens.has(token))
+      );
+      return unrecordedFallbackEntries;
     } catch (error) {
       console.error("Falha ao ler links publicos do SQLite:", error.message);
-      if (!shouldReadJsonFallback()) return {};
+      return {};
     }
   }
   if (!fs.existsSync(PUBLIC_LINKS_FILE)) return {};
   return JSON.parse(fs.readFileSync(PUBLIC_LINKS_FILE, "utf-8"));
 }
 
-function savePublicLinks(entries) {
-  if (shouldUseDatabase()) publicLinksRepository.savePublicLinks(entries);
-  if (shouldWriteLegacyJson()) fs.writeFileSync(PUBLIC_LINKS_FILE, JSON.stringify(entries, null, 2));
+function savePublicLinks(entries = {}) {
+  const nextEntries = entries && typeof entries === "object" ? entries : {};
+  let removedFallbackEntries = {};
+  if (shouldUseDatabase() && shouldReadJsonFallback() && fs.existsSync(PUBLIC_LINKS_FILE)) {
+    const priorFallbackEntries = JSON.parse(fs.readFileSync(PUBLIC_LINKS_FILE, "utf-8"));
+    removedFallbackEntries = Object.fromEntries(
+      Object.entries(priorFallbackEntries || {}).filter(([token]) => !Object.prototype.hasOwnProperty.call(nextEntries, token))
+    );
+  }
+  if (shouldUseDatabase()) {
+    publicLinksRepository.savePublicLinks(nextEntries, { removedEntries: removedFallbackEntries });
+  }
+  if (shouldWriteLegacyJson()) fs.writeFileSync(PUBLIC_LINKS_FILE, JSON.stringify(nextEntries, null, 2));
   broadcastDataChanged("shares");
 }
 
@@ -1248,7 +1282,13 @@ function auditLog(eventType, actor, target, action, result, details = {}) {
 
   appendAuditLog(log);
   if (log.severity === "critical" || log.severity === "error") {
-    console.error(`[AUDIT ${log.severity.toUpperCase()}]`, log);
+    console.error(`[AUDIT ${log.severity.toUpperCase()}]`, {
+      id: log.id,
+      timestamp: log.timestamp,
+      eventType: log.eventType,
+      severity: log.severity,
+      result: log.result,
+    });
   }
   return log.id;
 }
@@ -2012,6 +2052,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
   }
 
   const passwordHash = link.passwordHash || link.password_hash || null;
+  let verifiedPasswordHash = null;
   if (passwordHash && !hasValidSharePasswordSession(req, token, link)) {
     if (!options.password) return { status: 401, error: "Senha obrigatoria.", passwordRequired: true };
     if (!bcrypt.compareSync(String(options.password), passwordHash)) {
@@ -2019,6 +2060,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
       return { status: 401, error: "Nao foi possivel acessar este link.", passwordRequired: true };
     }
     setSharePasswordCookie(req, res, token);
+    verifiedPasswordHash = passwordHash;
   }
 
   const limits = getShareLimitState(link);
@@ -2040,22 +2082,106 @@ async function resolveShareAccess(req, res, token, options = {}) {
   const fileInfo = await ensureShareFileAvailable(link);
   if (!fileInfo) return { status: 404, error: "Link indisponivel." };
 
-  if (options.countView && !viewerAlreadyActive) {
-    createShareViewer(req, res, token, link, expiresAt);
-    link.lastViewedAt = new Date().toISOString();
-    link.views = incrementPublicLinkViews(token, link, links);
-    logShareAudit(req, "share.opened", token, link, "opened", "success");
+  // Provider hydration yields the event loop. Reload and revalidate the link so
+  // concurrent requests cannot consume the same final view/download allowance
+  // or overwrite link metadata saved while this request was waiting.
+  const currentLinks = loadPublicLinks();
+  let currentLink = currentLinks[token];
+  if (!currentLink || currentLink.fileName !== link.fileName || (currentLink.folderId || ROOT_FOLDER_ID) !== (link.folderId || ROOT_FOLDER_ID)) {
+    return { status: 404, error: "Link indisponivel." };
+  }
+  const currentExpiresAt = new Date(currentLink.expiresAt).getTime();
+  if (!Number.isFinite(currentExpiresAt) || currentExpiresAt <= Date.now()) {
+    logShareAudit(req, "share.expired", token, currentLink, "expired", "failure");
+    return { status: 410, error: "Link indisponivel." };
+  }
+  const currentPasswordHash = currentLink.passwordHash || currentLink.password_hash || null;
+  if (currentPasswordHash && !hasValidSharePasswordSession(req, token, currentLink) && currentPasswordHash !== verifiedPasswordHash) {
+    return { status: 401, error: "Senha obrigatoria.", passwordRequired: true };
+  }
+  const currentLimits = getShareLimitState(currentLink);
+  const currentViewerAlreadyActive = isShareViewerActive(req, token, currentLink);
+  if (options.countView && !currentViewerAlreadyActive && currentLimits.maxViews > 0 && currentLimits.views >= currentLimits.maxViews) {
+    logShareAudit(req, "share.limit_reached", token, currentLink, "view", "failure", { limit: "views" });
+    return { status: 410, error: "Link indisponivel." };
+  }
+  if (options.requireViewer && getShareAccessCookieRequired(currentLink) && !currentViewerAlreadyActive && !options.countView) {
+    return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
+  }
+  if (options.countDownload && currentLimits.maxDownloads > 0 && currentLimits.downloads >= currentLimits.maxDownloads) {
+    logShareAudit(req, "share.limit_reached", token, currentLink, "download", "failure", { limit: "downloads" });
+    return { status: 410, error: "Link indisponivel." };
+  }
+
+  let databaseViewReserved = false;
+  let databaseDownloadReserved = false;
+  const reserveDatabaseShareQuota = (kind, viewer) => {
+    const reservation = publicLinksRepository.consumePublicLinkQuota(token, {
+      kind,
+      expectedFileName: currentLink.fileName,
+      expectedFolderId: currentLink.folderId || ROOT_FOLDER_ID,
+      expectedPasswordHash: currentLink.passwordHash || currentLink.password_hash || null,
+      ...(shouldReadJsonFallback() ? { fallbackLinks: { [token]: currentLink } } : {}),
+      ...(viewer ? { viewer } : {}),
+    });
+    if (reservation.status !== "ok") {
+      if (reservation.status === "limit") {
+        logShareAudit(req, "share.limit_reached", token, currentLink, "limit", "failure", { limit: reservation.limit || (kind === "view" ? "views" : "downloads") });
+        return { status: 410, error: "Link indisponivel." };
+      }
+      if (reservation.status === "expired") {
+        logShareAudit(req, "share.expired", token, currentLink, "expired", "failure");
+        return { status: 410, error: "Link indisponivel." };
+      }
+      if (reservation.status === "password_changed") {
+        return { status: 401, error: "Senha obrigatoria.", passwordRequired: true };
+      }
+      return { status: 404, error: "Link indisponivel." };
+    }
+
+    currentLink = reservation.link;
+    currentLinks[token] = currentLink;
+    if (shouldWriteLegacyJson()) fs.writeFileSync(PUBLIC_LINKS_FILE, JSON.stringify(currentLinks, null, 2));
+    broadcastDataChanged("shares");
+    return null;
+  };
+
+  if (shouldUseDatabase() && options.countView && !currentViewerAlreadyActive) {
+    const viewerId = crypto.randomBytes(16).toString("hex");
+    const viewerCreatedAt = new Date().toISOString();
+    const viewerExpiresAt = new Date(Math.min(Date.now() + SHARE_VIEW_SESSION_MS, currentExpiresAt)).toISOString();
+    const failure = reserveDatabaseShareQuota("view", { id: viewerId, createdAt: viewerCreatedAt, expiresAt: viewerExpiresAt });
+    if (failure) return failure;
+    setShareViewerCookie(req, res, token, viewerId, new Date(currentLink.expiresAt).getTime());
+    databaseViewReserved = true;
+  }
+
+  if (shouldUseDatabase() && options.countDownload) {
+    const failure = reserveDatabaseShareQuota("download");
+    if (failure) return failure;
+    databaseDownloadReserved = true;
+  }
+
+  if (options.countView && !currentViewerAlreadyActive) {
+    if (!databaseViewReserved) {
+      createShareViewer(req, res, token, currentLink, currentExpiresAt);
+      currentLink.lastViewedAt = new Date().toISOString();
+      currentLink.views = incrementPublicLinkViews(token, currentLink, currentLinks);
+    }
+    logShareAudit(req, "share.opened", token, currentLink, "opened", "success");
   }
 
   if (options.countDownload) {
-    link.downloads = (Number(link.downloads) || 0) + 1;
-    link.lastDownloadedAt = new Date().toISOString();
-    links[token] = link;
-    savePublicLinks(links);
-    logShareAudit(req, "share.downloaded", token, link, "downloaded", "success");
+    if (!databaseDownloadReserved) {
+      currentLink.downloads = (Number(currentLink.downloads) || 0) + 1;
+      currentLink.lastDownloadedAt = new Date().toISOString();
+      currentLinks[token] = currentLink;
+      savePublicLinks(currentLinks);
+    }
+    logShareAudit(req, "share.downloaded", token, currentLink, "downloaded", "success");
   }
 
-  return { link, fileInfo, limits: getShareLimitState(link), expiresAt };
+  return { link: currentLink, fileInfo, limits: getShareLimitState(currentLink), expiresAt: currentExpiresAt };
 }
 
 function getSharePublicPayload(link, fileInfo, limits) {
@@ -3606,10 +3732,10 @@ async function cleanupExpiredTrashItems() {
 async function cleanupExpiredTemporaryItems() {
   const now = Date.now();
 
-  try {
-    for (const folder of loadFolders()) {
-      const expiresAt = folder.expiresAt ? new Date(folder.expiresAt).getTime() : null;
-      if (folder.id === ROOT_FOLDER_ID || !Number.isFinite(expiresAt) || expiresAt > now) continue;
+  for (const folder of loadFolders()) {
+    const expiresAt = folder.expiresAt ? new Date(folder.expiresAt).getTime() : null;
+    if (folder.id === ROOT_FOLDER_ID || !Number.isFinite(expiresAt) || expiresAt > now) continue;
+    try {
       await cloudFileLifecycleLock.runFolder(folder.id, async () => {
         const currentFolders = loadFolders();
         const currentFolder = currentFolders.find((item) => item.id === folder.id);
@@ -3623,9 +3749,9 @@ async function cleanupExpiredTemporaryItems() {
           expiresAt: currentFolder.expiresAt,
         });
       });
+    } catch (error) {
+      console.error("Falha ao limpar pasta temporaria:", sanitizeLogValue(error.message));
     }
-  } catch (error) {
-    console.error("Falha ao limpar pastas temporarias:", error.message);
   }
 
   try {
@@ -5007,6 +5133,7 @@ const openFileRedemptionRateLimit = createRouteRateLimit();
 const versionOpenTokenRateLimit = createRouteRateLimit();
 const shareRateLimit = createRouteRateLimit();
 const pendingRepairRateLimit = createRouteRateLimit();
+const uploadChunkRateLimit = createRouteRateLimit();
 const approveRateLimit = createRouteRateLimit();
 const rejectRateLimit = createRouteRateLimit();
 const deleteRateLimit = createRouteRateLimit();
@@ -5017,6 +5144,18 @@ const fileTemporaryRateLimit = createRouteRateLimit();
 const fileListRateLimit = createRouteRateLimit();
 const fileSearchRateLimit = createRouteRateLimit();
 const webDavPropfindRateLimit = createRouteRateLimit();
+const API_RATE_LIMIT_MAX = parsePositiveIntegerEnv(
+  "API_RATE_LIMIT_MAX",
+  Math.min(ROUTE_RATE_LIMIT_MAX * 10, 1_000_000),
+  1_000_000,
+);
+const apiRequestRateLimit = rateLimit({
+  windowMs: ROUTE_RATE_LIMIT_WINDOW_MS,
+  limit: API_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas solicitações. Tente novamente mais tarde." },
+});
 const restoreRequestGate = createRestoreRequestGate({
   directory: RESTORE_ACTIVE_REQUESTS_DIR,
   isBlocked: restoreService.isWholeRestoreBlocked,
@@ -5032,11 +5171,6 @@ try {
 }
 app.use(restoreRequestGate.middleware);
 app.use((req, res, next) => {
-  if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
-  if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
-  return express.json()(req, res, next);
-});
-app.use((req, res, next) => {
   if (req.path === "/" || req.path.endsWith(".html")) {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
     res.setHeader("Pragma", "no-cache");
@@ -5045,6 +5179,12 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.static("./public"));
+app.use(apiRequestRateLimit);
+app.use((req, res, next) => {
+  if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
+  if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
+  return express.json()(req, res, next);
+});
 const loadCurrentUser = (username) => loadUsers().find((user) => user.username === username);
 const authenticate = createAuthenticate({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
 const authenticateRealtimeToken = createRealtimeAuthenticator({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
@@ -5385,6 +5525,7 @@ app.put("/file-access", fileAccessRateLimit, authenticate, async (req, res) => {
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
 
+  return runCloudFileLifecycleMutation(folder.id, name, async () => {
   if (!canManageAccess(req) && !hasFileEditAccess(req, folder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
@@ -5393,7 +5534,8 @@ app.put("/file-access", fileAccessRateLimit, authenticate, async (req, res) => {
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
   if (!refreshAuthenticatedUser(req, res)) return;
-  const currentFolder = getFolderById(folder.id);
+  const currentFolderRecord = getFolderById(folder.id);
+  const currentFolder = currentFolderRecord && { ...currentFolderRecord, ...ensureFolderDirectories(currentFolderRecord.id) };
   if (!currentFolder || !hasFileEditAccess(req, currentFolder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
@@ -5432,6 +5574,23 @@ app.put("/file-access", fileAccessRateLimit, authenticate, async (req, res) => {
     });
   }
 
+  if (!await getListedFileDetails(currentFolder, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const finalFolderRecord = getFolderById(folder.id);
+  const finalFolder = finalFolderRecord && { ...finalFolderRecord, ...ensureFolderDirectories(finalFolderRecord.id) };
+  if (!finalFolder || !hasFileEditAccess(req, finalFolder, name)) {
+    return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+  }
+  const finalEligibleUsers = getFolderEligibleUsers(finalFolder);
+  const finalEligibleUsernames = new Set(finalEligibleUsers.map((user) => user.username));
+  const noLongerEligibleUsers = Object.keys(userAccess).filter((username) => !finalEligibleUsernames.has(username));
+  if (noLongerEligibleUsers.length) {
+    return res.status(400).json({
+      error: `Usuarios sem acesso a pasta ou invalidos: ${noLongerEligibleUsers.join(", ")}`,
+    });
+  }
   const entries = loadFilePermissions();
   const key = getFilePermissionKey(folder.id, name);
   const hasSpecificUsers = Object.keys(userAccess).length > 0;
@@ -5481,10 +5640,11 @@ app.put("/file-access", fileAccessRateLimit, authenticate, async (req, res) => {
     owner: entries[key]?.owner || "sistema",
     public: publicAccess,
     users: userAccess,
-    eligibleUsers,
+    eligibleUsers: finalEligibleUsers,
     allowedUsers: Object.keys(userAccess),
     inherited: publicAccess && !hasSpecificUsers,
   });
+  }, res);
 });
 
 const storage = multer.diskStorage({
@@ -5841,6 +6001,9 @@ app.put("/folders/:id/temporary", authenticate, (req, res) => {
     const currentFolder = currentFolders.find((item) => item.id === folderId);
     if (!currentFolder) return res.status(404).json({ error: "Pasta nao encontrada" });
     if (!hasFolderEditAccess(req, currentFolder)) return res.status(403).json({ error: "Permissao negada para editar esta pasta" });
+    if (isFolderExpired(currentFolder) && (!expiresAt || new Date(expiresAt).getTime() > Date.now())) {
+      return res.status(409).json({ error: "Pasta expirada aguardando limpeza e nao pode ser reativada" });
+    }
     currentFolder.expiresAt = expiresAt;
     currentFolder.updatedAt = new Date().toISOString();
     saveFolders(currentFolders);
@@ -6195,8 +6358,25 @@ app.post("/encrypted/:filename/grant-access", authenticate, (req, res) => {
   const name = path.basename(rawName);
   const folder = getAccessibleFolderOrRespond(req, res, req.body.folderId || req.query.folderId);
   if (!folder) return;
+  return runCloudFileLifecycleMutation(folder.id, name, async () => {
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolderRecord = getFolderById(folder.id);
+  const currentFolder = currentFolderRecord && { ...currentFolderRecord, ...ensureFolderDirectories(currentFolderRecord.id) };
+  if (!currentFolder || !isFolderAvailable(currentFolder.id) || !hasFolderAccess(req, currentFolder)) {
+    return res.status(404).json({ error: "Pasta nao encontrada" });
+  }
   const username = String(req.body.username || "").trim();
-  const metadata = getEncryptedFileMetadata(folder.id, name);
+  const listedFile = await getListedFileDetails(currentFolder, name);
+  if (!listedFile || isFileExpired(currentFolder.id, name)) {
+    return res.status(404).json({ error: "Arquivo criptografado nao encontrado" });
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const firstFolderRecord = getFolderById(folder.id);
+  const firstFolder = firstFolderRecord && { ...firstFolderRecord, ...ensureFolderDirectories(firstFolderRecord.id) };
+  if (!firstFolder || !isFolderAvailable(firstFolder.id) || !hasFolderAccess(req, firstFolder)) {
+    return res.status(404).json({ error: "Pasta nao encontrada" });
+  }
+  const metadata = getEncryptedFileMetadata(firstFolder.id, name);
   if (!metadata) return res.status(404).json({ error: "Arquivo criptografado nao encontrado" });
   if (metadata.accessControl?.owner !== req.user.username && req.user.role !== "admin") {
     return res.status(403).json({ error: "Apenas o dono ou admin pode conceder acesso" });
@@ -6204,8 +6384,23 @@ app.post("/encrypted/:filename/grant-access", authenticate, (req, res) => {
   if (!loadUsers().some((user) => user.username === username)) {
     return res.status(404).json({ error: "Usuario nao encontrado" });
   }
+  if (!await getListedFileDetails(currentFolder, name) || isFileExpired(currentFolder.id, name)) {
+    return res.status(404).json({ error: "Arquivo criptografado nao encontrado" });
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const finalFolderRecord = getFolderById(folder.id);
+  const finalFolder = finalFolderRecord && { ...finalFolderRecord, ...ensureFolderDirectories(finalFolderRecord.id) };
+  if (!finalFolder || !isFolderAvailable(finalFolder.id) || !hasFolderAccess(req, finalFolder) || isFileExpired(finalFolder.id, name)) {
+    return res.status(404).json({ error: "Arquivo criptografado nao encontrado" });
+  }
+  const finalMetadata = getEncryptedFileMetadata(finalFolder.id, name);
+  if (!finalMetadata) return res.status(404).json({ error: "Arquivo criptografado nao encontrado" });
+  if (finalMetadata.accessControl?.owner !== req.user.username && req.user.role !== "admin") {
+    return res.status(403).json({ error: "Apenas o dono ou admin pode conceder acesso" });
+  }
   const entries = loadEncryptedFiles();
-  const key = getEncryptedFileKey(folder.id, name);
+  const key = getEncryptedFileKey(finalFolder.id, name);
+  if (!entries[key]?.accessControl) return res.status(404).json({ error: "Arquivo criptografado nao encontrado" });
   const users = new Set(entries[key].accessControl.authorizedUsers || []);
   users.add(username);
   entries[key].accessControl.authorizedUsers = [...users];
@@ -6215,6 +6410,7 @@ app.post("/encrypted/:filename/grant-access", authenticate, (req, res) => {
     username,
   });
   res.json({ message: `Acesso concedido para ${username}` });
+  }, res);
 });
 
 app.delete("/encrypted/:filename/revoke-access", authenticate, (req, res) => {
@@ -6270,7 +6466,7 @@ async function registerPendingUpload(req, options) {
     savePendingUploads(pendingUploads);
     if (encryptionMetadata) saveEncryptedMetadata(folderId, fileName, encryptionMetadata);
     if (cloudEnabled) cloudTempMutationQueue.setDesired(folderId, fileName, "present");
-    await restoreProviderOrphans.clear(folderId, fileName, "temp");
+    await restoreProviderOrphans.clear(folderId, fileName, "temp", cloudStorage);
   } catch (error) {
     try {
       const rollbackPending = loadPendingUploads();
@@ -6669,7 +6865,7 @@ async function assembleChunkedUpload(sessionDir, destinationPath, totalChunks) {
   }
 }
 
-app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUploadFolder, handleChunkUploadSingle, withChunkUploadSessionLock(async (req, res) => {
+app.post("/upload-chunk", authenticate, uploadChunkRateLimit, requirePermission("upload"), prepareUploadFolder, handleChunkUploadSingle, withChunkUploadSessionLock(async (req, res) => {
   const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
   const uploadId = String(req.body.uploadId || "");
   const originalName = path.basename(String(req.body.originalName || ""));
@@ -8825,6 +9021,7 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     return res.status(400).json({ error: "Senha do link deve ter entre 4 e 128 caracteres." });
   }
 
+  return runCloudFileLifecycleMutation(folder.id, name, async () => {
   if (!hasFileAccess(req, folder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
@@ -8837,7 +9034,8 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
   if (!refreshAuthenticatedUser(req, res)) return;
-  const currentFolder = getFolderById(folder.id);
+  const currentFolderRecord = getFolderById(folder.id);
+  const currentFolder = currentFolderRecord && { ...currentFolderRecord, ...ensureFolderDirectories(currentFolderRecord.id) };
   if (!currentFolder || !req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
@@ -8845,14 +9043,24 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     return res.status(403).json({ error: "Links publicos nao estao disponiveis para arquivos criptografados" });
   }
   const passwordHash = sharePassword ? bcrypt.hashSync(sharePassword, 10) : null;
-
+  if (!await getListedFileDetails(currentFolder, name) || !hasFileAccess(req, currentFolder, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const finalFolderRecord = getFolderById(folder.id);
+  const finalFolder = finalFolderRecord && { ...finalFolderRecord, ...ensureFolderDirectories(finalFolderRecord.id) };
+  if (!finalFolder || !isFolderAvailable(finalFolder.id) || !req.user?.permissions?.listFiles || !hasFileAccess(req, finalFolder, name)) {
+    return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  }
+  if (getEncryptedFileMetadata(finalFolder.id, name)) {
+    return res.status(403).json({ error: "Links publicos nao estao disponiveis para arquivos criptografados" });
+  }
   const links = cleanupExpiredPublicLinks();
   const shareToken = crypto.randomBytes(24).toString("hex");
   const expiresAt = new Date(Date.now() + expiresInMinutes * 60 * 1000).toISOString();
-
   links[shareToken] = {
     fileName: name,
-    folderId: currentFolder.id,
+    folderId: finalFolder.id,
     createdAt: new Date().toISOString(),
     expiresAt,
     createdBy: req.user.username,
@@ -8863,7 +9071,6 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     passwordHash,
     activeViewers: {},
   };
-
   savePublicLinks(links);
   addActionHistory("share_created", name, req.user.username, {
     expiresAt,
@@ -8894,6 +9101,7 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     remainingViews: maxViews > 0 ? maxViews : null,
     remainingDownloads: maxDownloads > 0 ? maxDownloads : null,
   });
+  }, res);
 });
 
 app.get("/share/:token", shareRateLimit, (req, res) => {
@@ -9146,6 +9354,17 @@ app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("ap
         cloudMutations.rollback();
         throw error;
       }
+      for (const pendingDeletion of trashRepository.listPendingFileRemoteDeletions(folder.id, name)) {
+        const remoteDeletion = pendingDeletion.metadata?.remoteDeletion;
+        const retired = remoteDeletion?.state === "cancelled"
+          ? trashRepository.saveTrashItem({ ...pendingDeletion, status: "permanently_deleted" })
+          : trashService.cancelRemoteDeletion(pendingDeletion, "replacement_active", { status: "permanently_deleted" });
+        if (retired.metadata?.remoteDeletion?.state === "cancelled") {
+          auditLog("trash.remote_delete.cancelled", getAuditActor(req), { type: "trash", id: retired.id }, "remote_delete", "success", {
+            reason: "replacement_active",
+          });
+        }
+      }
       promoteEncryptedMetadataAfterApproval(folder.id, name, uploadedBy || req.user.username);
       const cloudSyncPending = cloudMutations.queued;
       if (cloudSyncPending) processCloudUploadMutationsLater();
@@ -9250,7 +9469,7 @@ app.post("/reject/:name", rejectRateLimit, authenticate, requirePermission("appr
     let cloudCleanupPending = false;
     try {
       await deleteCloudTempFile(folder.id, name);
-      if (restoreOrphan) await restoreProviderOrphans.clear(folder.id, name, "temp");
+      if (restoreOrphan) await restoreProviderOrphans.clear(folder.id, name, "temp", cloudStorage);
     } catch (error) {
       cloudCleanupPending = true;
       console.error("[cloud-temp] rejection cleanup pending:", sanitizeLogValue(error.message));
