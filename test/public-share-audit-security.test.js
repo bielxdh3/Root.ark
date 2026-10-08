@@ -42,6 +42,7 @@ function runSharePageScript(page, fetchImpl) {
   const isHtmlWhitespace = (character) => [" ", "\t", "\r", "\n", "\f"].includes(character);
   const elements = new Map();
   const createdElements = [];
+  let activeElement = null;
   const createMockElement = (id, tagName = "") => {
     const classes = new Set(["passwordBox", "contentBox", "previewBox", "qrBox"].includes(id) ? ["hidden"] : []);
     return {
@@ -62,6 +63,7 @@ function runSharePageScript(page, fetchImpl) {
         contains(name) { return classes.has(name); },
       },
       addEventListener(type, handler) { this.listeners[type] = handler; },
+      focus() { activeElement = this; },
       replaceChildren(...children) { this.children = children; },
       append(...children) { this.children.push(...children); },
     };
@@ -98,20 +100,23 @@ function runSharePageScript(page, fetchImpl) {
     ? page.slice(openingEnd + 1, closingStart).trim()
     : undefined;
   assert.ok(script, "share page has an inline client script");
-  vm.runInNewContext(script, {
-    document: {
-      getElementById,
-      createElement(tagName) {
-        const element = createMockElement(`created-${createdElements.length}`, tagName);
-        createdElements.push(element);
-        return element;
-      },
+  const document = {
+    get activeElement() { return activeElement; },
+    getElementById,
+    createElement(tagName) {
+      const element = createMockElement(`created-${createdElements.length}`, tagName);
+      createdElements.push(element);
+      return element;
     },
+  };
+  vm.runInNewContext(script, {
+    document,
     fetch: fetchImpl,
     navigator: { clipboard: { writeText: async () => {} } },
     window: { location: { href: "https://rootark.test/share/example" } },
   });
   elements.createdElements = createdElements;
+  Object.defineProperty(elements, "activeElement", { get: () => document.activeElement });
   return elements;
 }
 
@@ -500,6 +505,73 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.equal(previewRefreshElements.get("meta").innerHTML.includes("0 downloads restantes"), true);
   assert.equal(previewRefreshElements.get("downloadButton").disabled, true);
   assert.match(previewRefreshElements.get("status").textContent, /limite de downloads atingido/i);
+
+  const expiredRefreshResponses = [
+    { status: 401, ok: false, json: async () => ({ passwordRequired: true, error: "Senha necessaria." }) },
+    { status: 200, ok: true, json: async () => ({ fileName: "preview.pdf", expiresAt: new Date(Date.now() + 60_000).toISOString(), remainingViews: null, remainingDownloads: 1, canPreview: true, size: 12 }) },
+    { status: 401, ok: false, json: async () => ({ passwordRequired: true, error: "Senha necessaria." }) },
+    { status: 200, ok: true, json: async () => ({ fileName: "preview.pdf", expiresAt: new Date(Date.now() + 60_000).toISOString(), remainingViews: null, remainingDownloads: 1, canPreview: true, size: 12 }) },
+  ];
+  const expiredRefreshCalls = [];
+  const expiredRefreshElements = runSharePageScript(sharePage.body, (url, options) => {
+    expiredRefreshCalls.push({ url, options });
+    return Promise.resolve(expiredRefreshResponses.shift());
+  });
+  const assertPasswordPost = (call, password, description) => {
+    assert.equal(call.url, `/share/${token}/password`, `${description} uses a same-origin password route`);
+    assert.equal(call.options.method, "POST", `${description} uses POST`);
+    assert.deepEqual(JSON.parse(call.options.body), { password }, `${description} sends the expected password body`);
+  };
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assertPasswordPost(expiredRefreshCalls[0], "", "initial password challenge");
+  assert.equal(expiredRefreshElements.activeElement, expiredRefreshElements.get("sharePassword"), "initial password challenges focus the password field");
+  expiredRefreshElements.get("sharePassword").value = "disposable-share-password";
+  expiredRefreshElements.get("sharePasswordForm").listeners.submit({ preventDefault() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assertPasswordPost(expiredRefreshCalls[1], "disposable-share-password", "initial password submission");
+  assert.equal(expiredRefreshElements.get("sharePassword").value, "", "successful access clears the submitted password from the hidden field");
+  expiredRefreshElements.get("previewButton").listeners.click();
+  const expiredPreviewFrame = expiredRefreshElements.createdElements.find((element) => element.tagName === "iframe");
+  expiredPreviewFrame.listeners.load();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assertPasswordPost(expiredRefreshCalls[2], "", "expired preview refresh");
+  assert.equal(expiredRefreshElements.get("passwordBox").classList.contains("hidden"), false);
+  assert.equal(expiredRefreshElements.get("contentBox").classList.contains("hidden"), true);
+  assert.equal(expiredRefreshElements.activeElement, expiredRefreshElements.get("sharePassword"), "expired preview sessions return keyboard focus to the password field");
+  assert.equal(expiredRefreshElements.get("sharePassword").value, "", "expired preview sessions do not reveal a retained password");
+  assert.equal(expiredRefreshElements.get("previewBox").classList.contains("hidden"), true, "an expired preview is hidden until access is restored");
+  assert.equal(expiredRefreshElements.get("previewBox").children.length, 0, "the expired iframe is removed so it can be retried");
+  assert.equal(expiredRefreshElements.get("previewBox").dataset.loaded, undefined, "the expired preview resets its loaded marker");
+  assert.match(expiredRefreshElements.get("status").textContent, /sess[aã]o do link expirou/i);
+  expiredRefreshElements.get("sharePassword").value = "reauth-password";
+  expiredRefreshElements.get("sharePasswordForm").listeners.submit({ preventDefault() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assertPasswordPost(expiredRefreshCalls[3], "reauth-password", "password reauthentication");
+  assert.equal(expiredRefreshElements.activeElement, expiredRefreshElements.get("previewButton"), "successful reauthentication moves keyboard focus to the available preview action");
+  expiredRefreshElements.get("previewButton").listeners.click();
+  const retriedPreviewFrame = expiredRefreshElements.createdElements.find((element, index) => index > 0 && element.tagName === "iframe");
+  assert.ok(retriedPreviewFrame, "the user can create a new iframe after reauthentication");
+  assert.equal(retriedPreviewFrame.src, `/share/${token}/preview`);
+  assert.equal(expiredRefreshCalls.length, 4, "the expired preview recovery sends only the expected password checks");
+
+  const wrongPasswordResponses = [
+    { status: 401, ok: false, json: async () => ({ passwordRequired: true, error: "Senha necessaria." }) },
+    { status: 401, ok: false, json: async () => ({ passwordRequired: true, error: "Senha incorreta." }) },
+  ];
+  const wrongPasswordElements = runSharePageScript(sharePage.body, () => Promise.resolve(wrongPasswordResponses.shift()));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  wrongPasswordElements.get("sharePassword").value = "wrong-password";
+  wrongPasswordElements.get("sharePasswordForm").listeners.submit({ preventDefault() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(wrongPasswordElements.get("sharePassword").value, "", "a rejected password is cleared");
+  assert.equal(wrongPasswordElements.activeElement, wrongPasswordElements.get("sharePassword"), "a rejected password returns focus to the password field");
+  assert.match(wrongPasswordElements.get("status").textContent, /verifique se ela esta correta/i);
 
   const previewHead = await request(port, `/share/${previewFirstToken}/preview`, "HEAD");
   assert.equal(previewHead.status, 405, "HEAD does not act as a preview download");

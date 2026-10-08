@@ -1893,6 +1893,7 @@ function renderPublicSharePage(token) {
       }
 
       function renderAccess(data) {
+        passwordInput.value = "";
         passwordBox.classList.add("hidden");
         contentBox.classList.remove("hidden");
         fileName.textContent = data.fileName || "Arquivo compartilhado";
@@ -1921,8 +1922,13 @@ function renderPublicSharePage(token) {
             if (response.status === 401 && data.passwordRequired) {
               fileName.textContent = "Link protegido";
               status.textContent = "A sessao do link expirou. Informe a senha novamente.";
+              passwordInput.value = "";
               passwordBox.classList.remove("hidden");
               contentBox.classList.add("hidden");
+              previewBox.replaceChildren();
+              delete previewBox.dataset.loaded;
+              previewBox.classList.add("hidden");
+              passwordInput.focus();
               return;
             }
             throw new Error("Share access refresh failed");
@@ -1954,8 +1960,10 @@ function renderPublicSharePage(token) {
             status.textContent = password
               ? "Nao foi possivel validar a senha. Verifique se ela esta correta e tente novamente."
               : "Informe a senha para continuar.";
+            passwordInput.value = "";
             passwordBox.classList.remove("hidden");
             contentBox.classList.add("hidden");
+            passwordInput.focus();
             return;
           }
 
@@ -1968,6 +1976,10 @@ function renderPublicSharePage(token) {
           }
 
           renderAccess(data);
+          if (password) {
+            const nextControl = data.canPreview ? previewButton : downloadButton;
+            if (!nextControl.hidden && !nextControl.disabled) nextControl.focus();
+          }
         } catch {
           fileName.textContent = "Validacao indisponivel";
           status.textContent = "Nao foi possivel validar o link. Tente novamente ou recarregue a pagina.";

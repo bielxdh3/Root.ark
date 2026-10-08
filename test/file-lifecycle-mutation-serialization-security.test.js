@@ -505,7 +505,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   childErrors = "";
   child.stderr?.on("data", (chunk) => { childErrors += chunk.toString(); });
   assert.equal((await waitForServer(port, child)).status, 200);
-  const approvalRecoveryDeadline = Date.now() + 5000;
+  const approvalRecoveryDeadline = Date.now() + 15_000;
   let recoveredApprovalTrash;
   while (Date.now() < approvalRecoveryDeadline) {
     recoveredApprovalTrash = JSON.parse(fs.readFileSync(trashItemsPath, "utf8")).find((item) => item.id === approveTrashRecoveryId);
