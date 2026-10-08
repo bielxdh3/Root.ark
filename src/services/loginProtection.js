@@ -72,7 +72,7 @@ function getLoginSecurityState(req, username, getAuditActor) {
 function getLoginRejection({ config, ipState, usernameState, now }) {
   const blockedState = [ipState, usernameState].find((state) => state?.blockedUntil && state.blockedUntil > now);
   if (blockedState) return { reason: "blocked", retryAfter: getRetryAfterSeconds(ipState, usernameState) };
-  if (ipState.attempts > config.maxAttempts) {
+  if (ipState.attempts >= config.maxAttempts) {
     return { reason: "rate_limit", retryAfter: Math.max(1, Math.ceil(((ipState.windowStart + config.windowMs) - now) / 1000)) };
   }
   const delayedState = [ipState, usernameState].find((state) => state?.nextAllowedAt && state.nextAllowedAt > now);
@@ -100,8 +100,7 @@ function resetLoginState(store, key) {
   if (key) store.delete(key);
 }
 
-function resetLoginSecurityState({ ip, normalizedUsername }) {
-  resetLoginState(loginAttemptsByIp, ip);
+function resetLoginUsernameState({ normalizedUsername }) {
   resetLoginState(loginAttemptsByUsername, normalizedUsername);
 }
 
@@ -114,4 +113,4 @@ function getRetryAfterSeconds(...states) {
   return retryAt ? Math.max(1, Math.ceil((retryAt - now) / 1000)) : 1;
 }
 
-module.exports = { getLoginRejection, getLoginSecurityState, getRetryAfterSeconds, registerFailedLoginAttempt, resetLoginSecurityState };
+module.exports = { getLoginRejection, getLoginSecurityState, getRetryAfterSeconds, registerFailedLoginAttempt, resetLoginUsernameState };

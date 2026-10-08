@@ -67,7 +67,7 @@ const { createRealtimeUpgradeGuard } = require("./src/realtime/upgradeGuard");
 const { createRequirePermission } = require("./src/middlewares/permissions");
 const { isTotpRequired, validateTotpPolicy } = require("./src/services/totpPolicy");
 const { getDeploymentReadiness, isSessionCookieSecure, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
-const { getLoginRejection, getLoginSecurityState, registerFailedLoginAttempt, resetLoginSecurityState } = require("./src/services/loginProtection");
+const { getLoginRejection, getLoginSecurityState, registerFailedLoginAttempt, resetLoginUsernameState } = require("./src/services/loginProtection");
 
 const app = express();
 const server = http.createServer(app);
@@ -1266,10 +1266,10 @@ function authenticateWebDavRequest(req, res) {
   }
 
   const security = getLoginSecurityState(req, username, getAuditActor);
-  security.ipState.attempts += 1;
   const rejection = getLoginRejection(security);
   if (rejection) return sendWebDavUnauthorized(req, res, rejection.reason, 429, rejection.retryAfter);
   if (parseFailure) {
+    security.ipState.attempts += 1;
     registerFailedLoginAttempt(security.ipState, security.now, security.config);
     registerFailedLoginAttempt(security.usernameState, security.now, security.config);
     return sendWebDavUnauthorized(req, res, parseFailure);
@@ -1277,6 +1277,7 @@ function authenticateWebDavRequest(req, res) {
 
   const user = loadUsers().find((entry) => sameUsername(entry.username, username));
   if (!user || user.disabled || !bcrypt.compareSync(password, user.password)) {
+    security.ipState.attempts += 1;
     registerFailedLoginAttempt(security.ipState, security.now, security.config);
     registerFailedLoginAttempt(security.usernameState, security.now, security.config);
     const failureRejection = getLoginRejection(security);
@@ -1285,7 +1286,7 @@ function authenticateWebDavRequest(req, res) {
     }
     return sendWebDavUnauthorized(req, res, "invalid_credentials");
   }
-  resetLoginSecurityState(security);
+  resetLoginUsernameState(security);
 
   let totpPolicy;
   try {

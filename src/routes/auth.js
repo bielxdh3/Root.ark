@@ -17,7 +17,7 @@ const {
   isTotpRequired,
   TOTP_POLICY_ERROR_MESSAGE,
 } = require("../services/totpPolicy");
-const { getLoginRejection, getLoginSecurityState, registerFailedLoginAttempt, resetLoginSecurityState, getRetryAfterSeconds } = require("../services/loginProtection");
+const { getLoginRejection, getLoginSecurityState, registerFailedLoginAttempt, resetLoginUsernameState, getRetryAfterSeconds } = require("../services/loginProtection");
 
 const loginChallenges = new Map();
 const verificationAttemptsByIp = new Map();
@@ -174,8 +174,6 @@ function registerAuthRoutes(app, context) {
 
     const security = getLoginSecurityState(req, username, getAuditActor);
     const { actor, config, ip, ipState, normalizedUsername, usernameState, now } = security;
-    ipState.attempts += 1;
-
     const rejection = getLoginRejection(security);
     if (rejection) {
       const eventType = rejection.reason === "blocked" ? "auth.login.blocked" : "auth.login.rate_limited";
@@ -194,6 +192,7 @@ function registerAuthRoutes(app, context) {
     const passwordMatches = bcrypt.compareSync(password, passwordHash);
 
     if (!user || !passwordMatches) {
+      ipState.attempts += 1;
       registerFailedLoginAttempt(ipState, now, config);
       registerFailedLoginAttempt(usernameState, now, config);
       const retryAfter = getRetryAfterSeconds(ipState, usernameState);
@@ -214,7 +213,7 @@ function registerAuthRoutes(app, context) {
       return sendLoginProtectionError(res, blocked ? 429 : 401, retryAfter);
     }
 
-    resetLoginSecurityState(security);
+    resetLoginUsernameState(security);
 
     const totpPolicy = getRuntimeTotpPolicy(res);
     if (!totpPolicy) return;

@@ -205,7 +205,7 @@ test("WebDAV HTTP boundary rejects unauthenticated, hostile, traversing, and inf
   fs.writeFileSync(path.join(dir, "uploads", "source.txt"), "source");
   fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
   const portNumber = await port();
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", TOTP_POLICY: "optional", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", TOTP_POLICY: "optional", LOGIN_RATE_LIMIT_MAX: "20", LOGIN_DELAY_BASE: "0", LOGIN_BLOCK_THRESHOLD: "50", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
   t.after(async () => { await stopChild(child); fs.rmSync(dir, { recursive: true, force: true }); });
   await ready(portNumber);
   const basic = `Basic ${Buffer.from("agent:password").toString("base64")}`;
@@ -281,6 +281,53 @@ test("WebDAV Basic failures share normal login IP and username throttles", { tim
   assert.ok(Number(login.headers["retry-after"]) >= 1);
 });
 
+test("successful login and WebDAV requests preserve the shared IP failure limit", { timeout: 20_000 }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-password-spray-"));
+  fs.mkdirSync(path.join(dir, "data"));
+  fs.mkdirSync(path.join(dir, "uploads"));
+  fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([
+    { username: "agent", password: bcrypt.hashSync("correct-password", 10), role: "admin", permissions: { listFiles: true }, sessionVersion: 0 },
+  ]));
+  fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
+  const portNumber = await port();
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: {
+    ...process.env,
+    NODE_ENV: "test",
+    PORT: String(portNumber),
+    DB_ENABLED: "false",
+    ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
+    WEBDAV_ENABLED: "true",
+    UPLOAD_SCAN_ENABLED: "false",
+    TOTP_POLICY: "optional",
+    LOGIN_RATE_LIMIT_MAX: "5",
+    LOGIN_DELAY_BASE: "0",
+    LOGIN_BLOCK_THRESHOLD: "50",
+    JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+  }, stdio: "ignore", windowsHide: true });
+  t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
+  await ready(portNumber);
+
+  async function failedLogin(username) {
+    const body = JSON.stringify({ username, password: "wrong-password" });
+    return request(portNumber, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
+  }
+  const validBasic = `Basic ${Buffer.from("agent:correct-password").toString("base64")}`;
+  const webDavSuccess = () => request(portNumber, "/dav", { method: "PROPFIND", headers: { authorization: validBasic } });
+  const validLogin = () => {
+    const body = JSON.stringify({ username: "agent", password: "correct-password" });
+    return request(portNumber, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
+  };
+
+  for (let i = 0; i < 6; i += 1) assert.equal((await webDavSuccess()).status, 207, "successful WebDAV traffic must not consume the failed-login limit");
+  assert.equal((await failedLogin("spray-one")).status, 401);
+  assert.equal((await failedLogin("spray-two")).status, 401);
+  assert.equal((await failedLogin("spray-three")).status, 401);
+  assert.equal((await webDavSuccess()).status, 207);
+  assert.equal((await failedLogin("spray-four")).status, 401);
+  assert.equal((await validLogin()).status, 200);
+  assert.equal((await failedLogin("spray-five")).status, 401);
+  assert.equal((await failedLogin("spray-six")).status, 429, "successful auth for another account must not erase the shared per-IP failure window");
+});
 test("WebDAV Basic auth cannot bypass a required TOTP policy", { timeout: 20_000 }, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-totp-policy-"));
   fs.mkdirSync(path.join(dir, "data"));
