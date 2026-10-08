@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 
-function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, upload, remove, isSuppressed = () => false, area = "temp" } = {}) {
+function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, upload, remove, isSuppressed = () => false, isEnabled = () => true, area = "temp" } = {}) {
   if (!directory || !lifecycleLock?.run || typeof localPathFor !== "function" || typeof upload !== "function" || typeof remove !== "function") {
     throw new TypeError("Cloud mutation queue requires storage, lock, and provider operations");
   }
@@ -128,6 +128,7 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
   }
 
   async function processLocked(item) {
+    if (!isEnabled()) return;
     for (let pass = 0; pass < 100; pass += 1) {
       const record = read(item.folderId, item.fileName);
       if (!record) return;
@@ -162,6 +163,7 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
   }
 
   async function processAll() {
+    if (!isEnabled()) return;
     if (!fs.existsSync(queueDirectory)) return;
     const records = [];
     for (const entry of fs.readdirSync(queueDirectory, { withFileTypes: true })) {

@@ -8,6 +8,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
+const { createCloudTempMutationQueue } = require("../services/cloudTempMutationQueue");
 
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = path.join(ROOT, "server.js");
@@ -117,6 +118,8 @@ test("active request lease wait allows delayed teardown and reports remaining le
 function startS3Fixture() {
   const getObjects = [];
   const putObjects = [];
+  const deleteObjects = [];
+  const failedDeleteKeys = new Set();
   const listRequests = [];
   const getGates = new Map();
   const listGates = new Map();
@@ -155,6 +158,18 @@ function startS3Fixture() {
       });
       return;
     }
+    if (req.method === "DELETE") {
+      deleteObjects.push(key);
+      if (failedDeleteKeys.has(key)) {
+        res.writeHead(503);
+        res.end();
+      } else {
+        OBJECTS.delete(key);
+        res.writeHead(204);
+        res.end();
+      }
+      return;
+    }
     res.writeHead(404, { "content-type": "application/xml" });
     res.end("<Error><Code>NoSuchKey</Code><Message>Not found</Message></Error>");
   });
@@ -165,6 +180,8 @@ function startS3Fixture() {
       port: server.address().port,
       getObjects,
       putObjects,
+      deleteObjects,
+      failDelete(key) { failedDeleteKeys.add(key); },
       listRequests,
       block(map, key, skippedRequests = 0) {
         let markStarted;
@@ -1305,4 +1322,102 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   assert.equal(fs.readFileSync(versionsPath, "utf8"), versionsAtRestoreLimit, "the rejected warm-cache restore does not mutate version history");
   assert.equal(cloud.getObjects.length, providerGetsAtRestoreLimit, "the rejected warm-cache restore makes no provider GET");
   assert.equal(cloud.putObjects.length, providerPutsAtRestoreLimit, "the rejected warm-cache restore makes no provider PUT");
+
+  const durableDeleteName = "durable-version-delete.txt";
+  const durableDeleteStoredName = `${durableDeleteName}.v1`;
+  const durableDeleteKey = `rootark/uploads/root/${durableDeleteStoredName}`;
+  cloud.failDelete(durableDeleteKey);
+  OBJECTS.set(durableDeleteKey, Buffer.from("disposable historical version"));
+  fs.writeFileSync(path.join(directory, "uploads", durableDeleteStoredName), "disposable historical version");
+  const deletePermissionsPath = path.join(dataDir, "file-permissions.json");
+  const deletePermissions = JSON.parse(fs.readFileSync(deletePermissionsPath, "utf8"));
+  deletePermissions[`root/${durableDeleteName}`] = { public: false, owner: "owner", users: {} };
+  fs.writeFileSync(deletePermissionsPath, JSON.stringify(deletePermissions));
+  const deleteVersionsPath = path.join(dataDir, "file-versions.json");
+  const deleteVersions = JSON.parse(fs.readFileSync(deleteVersionsPath, "utf8"));
+  deleteVersions[`root/${durableDeleteName}`] = { currentVersion: 2, versions: [
+    { version: 1, storedAs: durableDeleteStoredName, size: Buffer.byteLength("disposable historical version") },
+    { version: 2, storedAs: durableDeleteName, size: 0 },
+  ] };
+  fs.writeFileSync(deleteVersionsPath, JSON.stringify(deleteVersions));
+  const deletedVersionResponse = await mutateAsOwner(`/versions/${durableDeleteName}/v/1?folderId=root`, "DELETE", {});
+  assert.equal(deletedVersionResponse.status, 200, deletedVersionResponse.body);
+  assert.equal(fs.existsSync(path.join(directory, "uploads", durableDeleteStoredName)), false, "the explicit delete removes local archived bytes");
+  const durableIntentPath = path.join(dataDir, ".rootark-cloud-upload-mutations", `${crypto.createHash("sha256").update(`root\0${durableDeleteStoredName}`).digest("hex")}.json`);
+  const durableIntent = JSON.parse(fs.readFileSync(durableIntentPath, "utf8"));
+  assert.equal(durableIntent.desired, "absent", "failed provider deletion leaves a durable absent intent after local version removal");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(cloud.deleteObjects.includes(durableDeleteKey), true, "reconciliation attempted provider deletion");
+  assert.equal(OBJECTS.has(durableDeleteKey), true, "provider failure leaves remote data for retry");
+  assert.equal(JSON.parse(fs.readFileSync(durableIntentPath, "utf8")).desired, "absent", "failed reconciliation retains its durable intent");
+});
+
+test("local version deletion cancels an existing cloud-present intent without queueing local-only history", { timeout: 30_000 }, async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-local-version-delete-intent-"));
+  const dataDir = path.join(directory, "data");
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(path.join(directory, "uploads"), { recursive: true });
+  fs.mkdirSync(path.join(directory, "temp"), { recursive: true });
+  fs.symlinkSync(PUBLIC, path.join(directory, "public"), "junction");
+
+  const pendingName = "pending-cloud-version.txt.v1";
+  const localName = "local-only-version.txt.v1";
+  for (const name of [pendingName, localName]) fs.writeFileSync(path.join(directory, "uploads", name), "disposable archived version");
+  const password = crypto.randomBytes(24).toString("base64url");
+  fs.writeFileSync(path.join(dataDir, "users.local.json"), JSON.stringify([
+    { username: "owner", password: bcrypt.hashSync(password, 10), role: "user", permissions: { listFiles: true, delete: true }, sessionVersion: 0 },
+  ]));
+  fs.writeFileSync(path.join(dataDir, "folders.json"), JSON.stringify([
+    { id: "root", name: "Root", createdBy: "system", allowedUsers: [], isRoot: true },
+  ]));
+  fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify(Object.fromEntries([
+    "pending-cloud-version.txt", "local-only-version.txt",
+  ].map((name) => [`root/${name}`, { public: false, owner: "owner", users: {} }]))));
+  fs.writeFileSync(path.join(dataDir, "file-versions.json"), JSON.stringify(Object.fromEntries([
+    ["pending-cloud-version.txt", pendingName], ["local-only-version.txt", localName],
+  ].map(([name, storedAs]) => [`root/${name}`, { currentVersion: 2, versions: [
+    { version: 1, storedAs, size: Buffer.byteLength("disposable archived version") },
+    { version: 2, storedAs: name, size: 0 },
+  ] }]))));
+
+  const queueDirectory = path.join(dataDir, ".rootark-cloud-upload-mutations");
+  const disabledQueue = createCloudTempMutationQueue({
+    area: "uploads", directory: queueDirectory,
+    lifecycleLock: { run: async (_folderId, _fileName, work) => work() },
+    localPathFor: () => "", upload: async () => {}, remove: async () => {}, isEnabled: () => false,
+  });
+  disabledQueue.setDesired("root", pendingName, "present");
+  const port = await getUnusedPort();
+  const env = {
+    ...process.env, PORT: String(port), DB_ENABLED: "false", NODE_ENV: "test",
+    JWT_SECRET: crypto.randomBytes(48).toString("base64url"), TOTP_POLICY: "optional",
+    CLOUD_STORAGE_PROVIDER: "local", WEBDAV_ENABLED: "false",
+  };
+  delete env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS;
+  delete env.ROOTARK_BOOTSTRAP_USERS_FROM_SEED;
+  delete env.TRUSTED_PROXIES;
+  const child = spawn(process.execPath, [SERVER], { cwd: directory, env, stdio: "ignore", windowsHide: true });
+  t.after(async () => {
+    await stop(child);
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  assert.equal((await waitForServer(port, child)).status, 200);
+  const loginBody = JSON.stringify({ username: "owner", password });
+  const login = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(loginBody) }, body: loginBody });
+  assert.equal(login.status, 200, login.body);
+  const cookies = login.headers["set-cookie"].map((value) => value.split(";", 1)[0]);
+  const cookie = cookies.join("; ");
+  const csrf = cookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1];
+  const removeVersion = (fileName) => request(port, `/versions/${fileName}/v/1?folderId=root`, {
+    method: "DELETE",
+    headers: { cookie, origin: `http://127.0.0.1:${port}`, "x-csrf-token": csrf, "content-type": "application/json", "content-length": 2 },
+    body: "{}",
+  });
+
+  const existingIntentDelete = await removeVersion("pending-cloud-version.txt");
+  assert.equal(existingIntentDelete.status, 200, existingIntentDelete.body);
+  assert.equal(disabledQueue.getRecord("root", pendingName)?.desired, "absent", "local deletion supersedes a persisted cloud-present intent while the provider is disabled");
+  const localOnlyDelete = await removeVersion("local-only-version.txt");
+  assert.equal(localOnlyDelete.status, 200, localOnlyDelete.body);
+  assert.equal(disabledQueue.getRecord("root", localName), null, "local-only version deletion does not create a cloud mutation intent");
 });

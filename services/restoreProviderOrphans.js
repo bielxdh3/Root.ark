@@ -227,11 +227,28 @@ function createSnapshot() {
   const keys = new Set(current.keys);
   const foldedKeys = current.foldedKeys ? new Set(current.foldedKeys) : null;
   return Object.freeze({
+    assertCurrent() {
+      if (policySignature() !== current.signature) {
+        throw new Error("Restore provider suppression policy changed during backup");
+      }
+    },
     isSuppressed(folderId, fileName, area = "uploads") {
       const key = identityKey(area, String(folderId || "root"), String(fileName || ""));
       return keys.has(key) || Boolean(foldedKeys?.has(key.toLowerCase()));
     },
   });
+}
+
+async function lockSnapshot(snapshot) {
+  const lease = await acquirePolicyLock();
+  try {
+    if (typeof snapshot?.assertCurrent !== "function") throw new Error("Restore provider suppression snapshot is invalid");
+    snapshot.assertCurrent();
+    return () => lease.release();
+  } catch (error) {
+    lease.release();
+    throw error;
+  }
 }
 
 function isSuppressed(folderId, fileName, area = "uploads", snapshot = null) {
@@ -286,4 +303,4 @@ async function clear(folderId, fileName, area = "uploads", provider = null) {
   } finally { lease.release(); }
 }
 
-module.exports = { POLICY_PATH, STATE_PATH, assertSafeToUnhide, assertUnambiguousProviderInventory, clear, createSnapshot, identityKey, initialize, isSuppressed, normalizeObjects, read, suppress, write };
+module.exports = { POLICY_PATH, STATE_PATH, assertSafeToUnhide, assertUnambiguousProviderInventory, clear, createSnapshot, identityKey, initialize, isSuppressed, lockSnapshot, normalizeObjects, read, suppress, write };

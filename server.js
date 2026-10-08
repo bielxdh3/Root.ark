@@ -51,7 +51,7 @@ const trashRepository = require("./repositories/trashRepository");
 const trashService = require("./services/trashService");
 const { createCloudStorage } = require("./services/cloudStorage");
 const { createFileLifecycleLock } = require("./services/fileLifecycleLock");
-const { openReadHandle } = require("./services/fileReadHandle");
+const { openReadHandle, readBoundedRegularFile } = require("./services/fileReadHandle");
 const { createCloudTempMutationQueue } = require("./services/cloudTempMutationQueue");
 const { resolveRuntimePath } = require("./src/runtime-paths");
 const registerAuthRoutes = require("./src/routes/auth");
@@ -146,9 +146,11 @@ const MAX_TEXT_PREVIEW_BYTES = 1024 * 1024;
 const CHUNK_UPLOAD_DIR = path.resolve("./temp/.chunks");
 const CHUNK_UPLOAD_INCOMING_DIR = path.join(CHUNK_UPLOAD_DIR, "incoming");
 const CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY = "__resumeBlocked";
+const CHUNK_UPLOAD_INCOMING_FILE_PATH = Symbol("rootarkChunkUploadIncomingFilePath");
 const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
 const UPLOAD_STAGING_PATH = Symbol("rootarkUploadStagingPath");
 const MAX_UPLOAD_CHUNKS = 2000;
+const CHUNK_PART_FILENAMES = Array.from({ length: MAX_UPLOAD_CHUNKS }, (_, index) => `${index}.part`);
 const SINGLE_UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
 const UPLOAD_SCAN_ENABLED = parseEnvBoolean(process.env.UPLOAD_SCAN_ENABLED, true);
 const UPLOAD_SCAN_PROVIDER = String(process.env.UPLOAD_SCAN_PROVIDER || "clamav").toLowerCase();
@@ -168,6 +170,10 @@ const WEBDAV_PATH = normalizeWebDavMountPath(process.env.WEBDAV_PATH || "/dav");
 const WEBDAV_ALLOW_DELETE = parseEnvBoolean(process.env.WEBDAV_ALLOW_DELETE, false);
 const WEBDAV_ALLOW_MOVE = parseEnvBoolean(process.env.WEBDAV_ALLOW_MOVE, false);
 const WEBDAV_MOVE_JOURNAL_DIR = path.resolve("./temp/.incoming");
+const WEBDAV_MOVE_MAX_JOURNAL_BYTES = 1024 * 1024;
+const WEBDAV_MOVE_MAX_CLAIM_BYTES = 64 * 1024;
+// A 16 MiB per-file ceiling leaves room for large metadata indexes while bounding recovery reads.
+const WEBDAV_MOVE_MAX_METADATA_SNAPSHOT_BYTES = 16 * 1024 * 1024;
 const WEBDAV_MOVE_METADATA_FILES = [PUBLIC_LINKS_FILE, FILE_PERMISSIONS_FILE, FILE_EXPIRATIONS_FILE, FILE_VERSIONS_FILE, ENCRYPTED_FILES_FILE];
 const WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS = parseBoundedNumber("WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS", 60 * 1000, 1000, 60 * 60 * 1000);
 const WEBDAV_MOVE_RECONCILIATION_MAX_ATTEMPTS = parseBoundedNumber("WEBDAV_MOVE_RECONCILIATION_MAX_ATTEMPTS", 5, 1, 100);
@@ -216,6 +222,7 @@ const cloudTempMutationQueue = createCloudTempMutationQueue({
   upload: uploadFileToCloud,
   remove: deleteFileFromCloud,
   isSuppressed: restoreProviderOrphans.isSuppressed,
+  isEnabled: isCloudStorageEnabled,
 });
 const cloudUploadMutationQueue = createCloudTempMutationQueue({
   area: "uploads",
@@ -224,6 +231,7 @@ const cloudUploadMutationQueue = createCloudTempMutationQueue({
   localPathFor: (folderId, fileName) => path.join(getFolderStoragePath("./uploads", folderId), fileName),
   upload: uploadFileToCloud,
   remove: deleteFileFromCloud,
+  isEnabled: isCloudStorageEnabled,
 });
 backupService.setCloudStorage(cloudStorage);
 restoreService.setCloudStorage(cloudStorage);
@@ -314,8 +322,8 @@ let cloudUploadMutationDrainScheduled = false;
 let cloudUploadMutationDrainRunning = false;
 let cloudUploadMutationDrainRequested = false;
 
-function requestCloudUploadMutationDrain(label, { requireCloud = false } = {}) {
-  if (requireCloud && !isCloudStorageEnabled()) return;
+function requestCloudUploadMutationDrain(label) {
+  if (!isCloudStorageEnabled()) return;
   cloudUploadMutationDrainRequested = true;
   if (cloudUploadMutationDrainScheduled || cloudUploadMutationDrainRunning) return;
 
@@ -344,7 +352,7 @@ function requestCloudUploadMutationDrain(label, { requireCloud = false } = {}) {
 }
 
 function processCloudUploadMutationsLater() {
-  requestCloudUploadMutationDrain("reconciliation", { requireCloud: true });
+  requestCloudUploadMutationDrain("reconciliation");
 }
 
 function deleteCloudFileLater(folderId, fileName, area = "uploads") {
@@ -500,15 +508,15 @@ function loadUserGenerations() {
 }
 
 function rememberUserGenerations(users) {
-  const generations = loadUserGenerations();
+  const generations = new Map(Object.entries(loadUserGenerations()));
   for (const user of users) {
     const username = String(user?.username || "").trim();
     const version = user?.sessionVersion || 0;
     if (username && Number.isSafeInteger(version) && version >= 0) {
-      generations[username] = Math.max(generations[username] ?? 0, version);
+      generations.set(username, Math.max(generations.get(username) ?? 0, version));
     }
   }
-  fs.writeFileSync(USER_GENERATIONS_FILE, JSON.stringify(generations, null, 2));
+  fs.writeFileSync(USER_GENERATIONS_FILE, JSON.stringify(Object.fromEntries(generations), null, 2));
 }
 
 function getCreatedUserSessionVersion(username) {
@@ -2507,7 +2515,7 @@ function pruneFileVersions(entries, key) {
 }
 
 function prepareCloudUploadAbsenceMutations(folderId, currentFileName, storedNames) {
-  if (!isCloudStorageEnabled()) return { queued: false, rollback() {} };
+  const cloudEnabled = isCloudStorageEnabled();
   const snapshots = [];
   const rollback = () => {
     for (const snapshot of [...snapshots].reverse()) {
@@ -2518,6 +2526,7 @@ function prepareCloudUploadAbsenceMutations(folderId, currentFileName, storedNam
   try {
     for (const fileName of new Set(storedNames.filter((value) => typeof value === "string" && value === path.basename(value) && value !== path.basename(currentFileName)))) {
       const record = cloudUploadMutationQueue.getRecord(folderId, fileName);
+      if (!cloudEnabled && !record) continue;
       snapshots.push({ fileName, record });
       cloudUploadMutationQueue.setDesired(folderId, fileName, "absent");
     }
@@ -3628,10 +3637,13 @@ function removeUserFromFilePermissions(username) {
       }
     }
 
-    if (entry.users && typeof entry.users === "object" && entry.users[username]) {
-      delete entry.users[username];
-      entry.updatedAt = new Date().toISOString();
-      changed = true;
+    if (entry.users && typeof entry.users === "object") {
+      const matchingUser = Object.entries(entry.users).find(([candidate]) => candidate === username);
+      if (matchingUser?.[1]) {
+        entry.users = Object.fromEntries(Object.entries(entry.users).filter(([candidate]) => candidate !== username));
+        entry.updatedAt = new Date().toISOString();
+        changed = true;
+      }
     }
   }
 
@@ -3651,10 +3663,13 @@ function removeUserFromFolderPermissions(username) {
       }
     }
 
-    if (folder.users && typeof folder.users === "object" && folder.users[username]) {
-      delete folder.users[username];
-      folder.updatedAt = new Date().toISOString();
-      changed = true;
+    if (folder.users && typeof folder.users === "object") {
+      const matchingUser = Object.entries(folder.users).find(([candidate]) => candidate === username);
+      if (matchingUser?.[1]) {
+        folder.users = Object.fromEntries(Object.entries(folder.users).filter(([candidate]) => candidate !== username));
+        folder.updatedAt = new Date().toISOString();
+        changed = true;
+      }
     }
   }
 
@@ -5297,7 +5312,7 @@ wss.on("connection", (socket, req) => {
   }
   const origin = req.headers.origin;
   const expectedOrigin = getExpectedOrigin(req, app.get("trust proxy fn"));
-  const user = origin === expectedOrigin && authenticateRealtimeToken(parseCookies(req.headers.cookie).rootark_session);
+  const user = origin === expectedOrigin && authenticateRealtimeToken(parseCookies(req.headers.cookie).get("rootark_session"));
 
   if (!user) {
     socket.close(1008, "Token invalido");
@@ -5741,7 +5756,16 @@ const chunkUpload = multer({
       }
     },
     filename: (req, file, callback) => {
-      crypto.randomBytes(16, (error, bytes) => callback(error, error ? undefined : bytes.toString("hex")));
+      crypto.randomBytes(16, (error, bytes) => {
+        if (error) return callback(error);
+        const filename = bytes.toString("hex");
+        try {
+          req[CHUNK_UPLOAD_INCOMING_FILE_PATH] = path.join(CHUNK_UPLOAD_INCOMING_DIR, filename);
+          callback(null, filename);
+        } catch (definitionError) {
+          callback(definitionError);
+        }
+      });
     },
   }),
   defParamCharset: "utf8",
@@ -5793,10 +5817,16 @@ function getTrustedUploadStagingPath(valueHolder) {
 function handleChunkUploadSingle(req, res, next) {
   chunkUpload.single("chunk")(req, res, (error) => {
     if (!error) {
+      if (req.file && typeof req[CHUNK_UPLOAD_INCOMING_FILE_PATH] === "string") {
+        Object.defineProperty(req.file, CHUNK_UPLOAD_INCOMING_FILE_PATH, { value: req[CHUNK_UPLOAD_INCOMING_FILE_PATH] });
+      }
       next();
       return;
     }
 
+    if (req.file && typeof req[CHUNK_UPLOAD_INCOMING_FILE_PATH] === "string") {
+      Object.defineProperty(req.file, CHUNK_UPLOAD_INCOMING_FILE_PATH, { value: req[CHUNK_UPLOAD_INCOMING_FILE_PATH] });
+    }
     removeChunkUploadIncomingFile(req.file);
 
     res.status(400).json({ error: error.message || "Upload do bloco nao concluido" });
@@ -5804,9 +5834,12 @@ function handleChunkUploadSingle(req, res, next) {
 }
 
 function getChunkUploadIncomingFilePath(file) {
+  const trustedPath = file?.[CHUNK_UPLOAD_INCOMING_FILE_PATH];
   const filename = typeof file?.filename === "string" ? file.filename : "";
   if (!/^[a-f0-9]{32}$/.test(filename)) return null;
-  const incomingPath = path.join(CHUNK_UPLOAD_INCOMING_DIR, filename);
+  if (typeof trustedPath !== "string") return null;
+  const incomingPath = path.resolve(trustedPath);
+  if (path.basename(incomingPath) !== filename) return null;
   return isSafeChildPath(CHUNK_UPLOAD_INCOMING_DIR, incomingPath) ? incomingPath : null;
 }
 
@@ -7011,7 +7044,7 @@ app.post("/upload-chunk", authenticate, uploadChunkRateLimit, requirePermission(
       return res.status(400).json({ error: "A senha de criptografia deve ter pelo menos 8 caracteres no bloco final. Reinicie o envio com o cliente atualizado." });
     }
 
-    const chunkPath = path.join(sessionDir, `${chunkIndex}.part`);
+    const chunkPath = path.join(sessionDir, CHUNK_PART_FILENAMES[chunkIndex]);
     fs.rmSync(chunkPath, { force: true });
     fs.renameSync(incomingChunkPath, chunkPath);
 
@@ -7777,6 +7810,9 @@ function persistWebDavMoveMetadataSnapshot(transactionId, snapshot) {
     if (contents === null) {
       files[file] = { present: false, path: snapshotPath, checksum: null };
     } else {
+      if (!Buffer.isBuffer(contents) || contents.length > WEBDAV_MOVE_MAX_METADATA_SNAPSHOT_BYTES) {
+        throw new Error("WebDAV metadata snapshot exceeds its size limit");
+      }
       writeWebDavMoveFileAtomically(snapshotPath, contents);
       files[file] = { present: true, path: snapshotPath, checksum: sha256Buffer(contents) };
     }
@@ -7796,7 +7832,7 @@ function restoreWebDavMoveMetadata(snapshot) {
         fs.rmSync(target, { force: true });
         continue;
       }
-      const contents = fs.readFileSync(snapshotPath);
+      const { contents } = readBoundedRegularFile(snapshotPath, WEBDAV_MOVE_MAX_METADATA_SNAPSHOT_BYTES);
       if (sha256Buffer(contents) !== value.checksum) throw new Error("WebDAV metadata snapshot checksum mismatch");
       writeWebDavMoveFileAtomically(target, contents);
       continue;
@@ -7934,7 +7970,7 @@ function recoverWebDavMoveJournals() {
   for (const name of fs.readdirSync(WEBDAV_MOVE_JOURNAL_DIR).filter((entry) => /^rootark-webdav-move-[a-f0-9-]{36}\.json$/i.test(entry))) {
     const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, name);
     let journal;
-    try { journal = JSON.parse(fs.readFileSync(journalPath, "utf8")); } catch { throw new Error("Journal WebDAV invalido"); }
+    try { journal = readWebDavMoveJournal(journalPath); } catch { throw new Error("Journal WebDAV invalido"); }
     if (!isSafeWebDavMoveJournal(journal)) throw new Error("Journal WebDAV ambiguo");
     if (isDurablyCompletedWebDavMove(journal)) {
       finalizeWebDavMoveJournal(journal);
@@ -7973,6 +8009,16 @@ function webDavMoveLockPath(transactionId) {
 
 function webDavMoveClaimToken(contents) {
   try { return JSON.parse(contents).token || null; } catch { return String(contents || ""); }
+}
+
+function readWebDavMoveJournal(journalPath) {
+  const { contents } = readBoundedRegularFile(journalPath, WEBDAV_MOVE_MAX_JOURNAL_BYTES);
+  return JSON.parse(contents.toString("utf8"));
+}
+
+function readWebDavMoveClaimFile(lockPath) {
+  const { contents, stat } = readBoundedRegularFile(lockPath, WEBDAV_MOVE_MAX_CLAIM_BYTES);
+  return { contents: contents.toString("utf8"), stat };
 }
 
 function webDavMoveClaimRecord(token, transactionId, now) {
@@ -8044,7 +8090,7 @@ function webDavMoveReadTakeoverAuthority(lockPath, transactionId) {
     throw error;
   }
   let record;
-  try { record = JSON.parse(fs.readFileSync(webDavMoveTakeoverMeta(lockPath), "utf8")); } catch { return { kind: "malformed", mtimeMs: stat.mtimeMs }; }
+  try { record = JSON.parse(readBoundedRegularFile(webDavMoveTakeoverMeta(lockPath), WEBDAV_MOVE_MAX_CLAIM_BYTES).contents.toString("utf8")); } catch { return { kind: "malformed", mtimeMs: stat.mtimeMs }; }
   const expectedLock = webDavMoveLockPath(transactionId);
   if (record?.version !== 1 || typeof record.token !== "string" || !record.token || record.transactionId !== transactionId || path.resolve(record.lockPath || "") !== path.resolve(expectedLock) || path.resolve(record.evidencePath || "") !== path.resolve(webDavMoveTakeoverEvidence(lockPath)) || !Number.isInteger(Number(record.pid)) || Number(record.pid) <= 0 || !Number.isFinite(Date.parse(record.claimedAt || "")) || !record.observed?.sha256 || !Number.isInteger(record.observed.size) || !record.observed.stat) return { kind: "mismatch", record };
   return { kind: "valid", record, live: webDavMoveOwnerIsLive(record), mtimeMs: stat.mtimeMs };
@@ -8057,7 +8103,7 @@ function webDavMoveEvidenceMatchesAuthority(lockPath, authority) {
     const link = fs.lstatSync(webDavMoveTakeoverEvidence(lockPath));
     if (!link.isFile() || link.isSymbolicLink()) return false;
     stat = link;
-    contents = fs.readFileSync(webDavMoveTakeoverEvidence(lockPath));
+    contents = readBoundedRegularFile(webDavMoveTakeoverEvidence(lockPath), WEBDAV_MOVE_MAX_CLAIM_BYTES).contents;
   } catch (error) {
     return error.code === "ENOENT";
   }
@@ -8124,12 +8170,16 @@ function takeoverWebDavMoveClaim(lockPath, transactionId, previousToken, observe
     writeWebDavMoveFileAtomically(webDavMoveTakeoverMeta(lockPath), JSON.stringify(authority));
     let currentStat;
     let currentContents;
-    try { currentStat = fs.statSync(lockPath); currentContents = fs.readFileSync(lockPath, "utf8"); } catch (error) { if (error.code === "ENOENT") return null; throw error; }
+    try {
+      const current = readWebDavMoveClaimFile(lockPath);
+      currentStat = current.stat;
+      currentContents = current.contents;
+    } catch (error) { if (error.code === "ENOENT") return null; throw error; }
     if (currentContents !== observed.contents || !webDavMoveSameStatIdentity(webDavMoveFileStatIdentity(currentStat), webDavMoveFileStatIdentity(observed.stat)) || webDavMoveClaimToken(currentContents) !== previousToken) { webDavMoveRemoveTakeoverAuthority(lockPath, transactionId, ownerToken); return null; }
     fs.renameSync(lockPath, webDavMoveTakeoverEvidence(lockPath));
     if (!webDavMoveEvidenceMatchesAuthority(lockPath, authority)) throw new Error("WebDAV claim evidence changed during takeover");
     writeWebDavMoveClaimLock(lockPath, webDavMoveClaimRecord(ownerToken, transactionId, now));
-    if (webDavMoveClaimToken(fs.readFileSync(lockPath, "utf8")) !== ownerToken) throw new Error("WebDAV replacement claim was not confirmed");
+    if (webDavMoveClaimToken(readWebDavMoveClaimFile(lockPath).contents) !== ownerToken) throw new Error("WebDAV replacement claim was not confirmed");
     webDavMoveRemoveTakeoverAuthority(lockPath, transactionId, ownerToken);
     return ownerToken;
   } catch (error) {
@@ -8143,7 +8193,7 @@ function takeoverWebDavMoveClaim(lockPath, transactionId, previousToken, observe
 
 function releaseWebDavMoveClaim(claim) {
   if (!claim?.path) return;
-  try { if (webDavMoveClaimToken(fs.readFileSync(claim.path, "utf8")) === claim.token) fs.rmSync(claim.path, { force: true }); } catch {}
+  try { if (webDavMoveClaimToken(readWebDavMoveClaimFile(claim.path).contents) === claim.token) fs.rmSync(claim.path, { force: true }); } catch {}
 }
 
 function claimWebDavMoveJournal(journal, now = Date.now(), workerId = crypto.randomUUID()) {
@@ -8160,11 +8210,12 @@ function claimWebDavMoveJournal(journal, now = Date.now(), workerId = crypto.ran
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
     try {
-      const existingStat = fs.statSync(lockPath);
-      const existing = fs.readFileSync(lockPath, "utf8");
+      const existingRead = readWebDavMoveClaimFile(lockPath);
+      const existingStat = existingRead.stat;
+      const existing = existingRead.contents;
       const existingRecord = (() => { try { return JSON.parse(existing); } catch { return null; } })();
       if (!validWebDavMoveClaimRecord(existingRecord, journal.transactionId) || webDavMoveOwnerIsLive(existingRecord)) return null;
-      const leaseExpired = existingRecord?.claimedAt ? Date.parse(existingRecord.claimedAt) + WEBDAV_MOVE_RECONCILIATION_LEASE_MS <= now : fs.statSync(lockPath).mtimeMs + WEBDAV_MOVE_RECONCILIATION_LEASE_MS <= now;
+      const leaseExpired = existingRecord?.claimedAt ? Date.parse(existingRecord.claimedAt) + WEBDAV_MOVE_RECONCILIATION_LEASE_MS <= now : existingStat.mtimeMs + WEBDAV_MOVE_RECONCILIATION_LEASE_MS <= now;
       if (!leaseExpired) return null;
       const takeover = takeoverWebDavMoveClaim(lockPath, journal.transactionId, existingRecord.token, webDavMoveClaimObservation(existing, existingStat), now);
       if (!takeover) return null;
@@ -8176,7 +8227,7 @@ function claimWebDavMoveJournal(journal, now = Date.now(), workerId = crypto.ran
 
 function finalizeWebDavMoveClaim(journal, lockPath, ownerToken, workerId, now) {
   try {
-    const current = JSON.parse(fs.readFileSync(journal.journalPath, "utf8"));
+    const current = readWebDavMoveJournal(journal.journalPath);
     if (current.cloud?.leaseToken && new Date(current.cloud.leaseUntil || 0).getTime() > now) { releaseWebDavMoveClaim({ path: lockPath, token: ownerToken }); return null; }
     const at = new Date(now).toISOString();
     const claimed = webDavCloudTransition(current, "claimed", at, {
@@ -8274,7 +8325,7 @@ async function resumeWebDavMoveCloudJournals() {
     for (const name of fs.readdirSync(WEBDAV_MOVE_JOURNAL_DIR).filter((entry) => /^rootark-webdav-move-[a-f0-9-]{36}\.json$/i.test(entry))) {
       const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, name);
       let journal;
-      try { journal = JSON.parse(fs.readFileSync(journalPath, "utf8")); } catch { continue; }
+      try { journal = readWebDavMoveJournal(journalPath); } catch { continue; }
       if (!isSafeWebDavMoveJournal(journal)) continue;
       const claim = claimWebDavMoveJournal(journal);
       if (!claim) continue;
@@ -8289,7 +8340,7 @@ async function resumeWebDavMoveCloudJournals() {
           auditLog("webdav.move.reconciliation.retry", { username: "system", role: "system" }, { type: "webdav_move", id: claim.journal.transactionId }, "reconcile", "pending", { category: claim.journal.cloud.failureCategory, attempts: claim.journal.cloud.attempts });
         }
       } catch (error) {
-        try { markWebDavMoveRetry(JSON.parse(fs.readFileSync(journalPath, "utf8")), error); } catch {}
+        try { markWebDavMoveRetry(readWebDavMoveJournal(journalPath), error); } catch {}
       } finally {
         releaseWebDavMoveClaim(claim);
       }
@@ -8470,7 +8521,7 @@ function registerWebDavRoutes() {
     const journalPath = webDavMoveJournalPath(transactionId);
     if (!fs.existsSync(journalPath)) return res.status(404).send("Not found");
     let journal;
-    try { journal = JSON.parse(fs.readFileSync(journalPath, "utf8")); } catch { return res.status(409).send("Status unavailable"); }
+    try { journal = readWebDavMoveJournal(journalPath); } catch { return res.status(409).send("Status unavailable"); }
     if (!isSafeWebDavMoveJournal(journal)) return res.status(409).send("Status unavailable");
     const cloud = journal.cloud || {};
     return res.json({ transactionId: journal.transactionId, phase: journal.phase, state: cloud.state || journal.phase, provider: cloud.provider || null, attempts: cloud.attempts || 0, maxAttempts: cloud.maxAttempts || WEBDAV_MOVE_RECONCILIATION_MAX_ATTEMPTS, lastAttemptAt: cloud.lastAttemptAt || null, nextAttemptAt: cloud.nextAttemptAt || null, failureCategory: cloud.failureCategory || null, completedAt: cloud.completedAt || null, terminalAt: cloud.terminalAt || null, transitions: Array.isArray(cloud.transitions) ? cloud.transitions : [] });
@@ -8963,11 +9014,17 @@ app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, re
     if (!target) return res.status(404).json({ error: "Versao nao encontrada" });
     if (versionNumber === history.currentVersion) return res.status(400).json({ error: "A versao atual nao pode ser deletada" });
 
-    fs.rmSync(path.join(currentFolder.uploadDir, target.storedAs), { force: true });
-    deleteCloudFileLater(currentFolder.id, target.storedAs, "uploads");
+    const cloudDeletePreparation = prepareCloudUploadAbsenceMutations(currentFolder.id, name, [target.storedAs]);
+    try {
+      fs.rmSync(path.join(currentFolder.uploadDir, target.storedAs), { force: true });
+    } catch (error) {
+      cloudDeletePreparation.rollback();
+      throw error;
+    }
     history.versions = history.versions.filter((item) => item.version !== versionNumber);
     entries[key] = history;
     saveFileVersions(entries);
+    if (cloudDeletePreparation.queued) processCloudUploadMutationsLater();
     addActionHistory("version_deleted", name, req.user.username, { folderId: currentFolder.id, folderName: currentFolder.name, version: versionNumber });
     logAnalyticsEvent("versionDeletion", { filename: name, deletedBy: req.user.username, version: versionNumber, folderId: currentFolder.id, folderName: currentFolder.name });
     auditLog("file.version.delete", getAuditActor(req), { type: "file", id: name }, "deleted", "success", { folderId: currentFolder.id, version: versionNumber });
@@ -9838,6 +9895,7 @@ void processPendingCloudTrashItems();
 void processPendingCloudRestoreSync().catch(() => {});
 const cloudTempReconciliationIntervalMs = parseBoundedNumber("CLOUD_TEMP_RECONCILIATION_INTERVAL_MS", 30_000, 1_000, 60 * 60 * 1000);
 const recoverCloudTempMutations = () => restoreRequestGate.run(async () => {
+  if (!isCloudStorageEnabled()) return;
   let pendingUploads = {};
   try { pendingUploads = loadPendingUploads(); }
   catch (error) { console.error("[cloud-temp] pending registry unavailable:", sanitizeLogValue(error.message)); }

@@ -525,7 +525,7 @@ function archivedProviderObjects(manifest) {
   if (manifest?.cloud_complete !== true) return new Set();
   return new Set((manifest?.included_files || [])
     .map((entry) => String(entry.path || "").replace(/\\/g, "/"))
-    .filter((entryPath) => /^(uploads|temp)\//.test(entryPath))
+    .filter((entryPath) => entryPath.startsWith("uploads/"))
     .map((entryPath) => {
       const [area, ...parts] = entryPath.split("/");
       const name = parts.pop();
@@ -1818,14 +1818,18 @@ async function restoreBackup(id, options = {}) {
       coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "quarantine" });
       injectFailure("restore.quarantine.committed");
     }
+    const restoredDataNames = restorableDataNames(restoreDir)
+      .filter((name) => pathExists(path.join(restoreDir, "data", name)));
     restoreDataFiles(restoreDir, (sourcePath, destinationPath, phase) => {
       injectFailure(`restore.data.${phase}`, { sourcePath, destinationPath });
     });
+    restorePreimage.syncFileSet(restoredDataNames.map((name) => resolveRuntimePath("data", name)));
     coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "data" });
     restoreUploads(restoreDir, (sourcePath, destinationPath, phase) => {
       const step = phase === "cleared" ? "restore.uploads.cleared" : `restore.uploads.${phase}`;
       injectFailure(step, { sourcePath, destinationPath });
     });
+    if (pathExists(path.join(restoreDir, "uploads"))) restorePreimage.syncTree(resolveRuntimePath("uploads"));
     coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "uploads" });
     injectFailure("restore.sqlite.before-replacement");
     const restoredDatabase = restoreDatabaseFiles(restoreDir, {

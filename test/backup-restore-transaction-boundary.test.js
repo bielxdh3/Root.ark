@@ -202,6 +202,113 @@ test("invalid restore ids cannot delete paths outside the restore temp directory
   `);
 });
 
+test("restore does not persist restart-required until restored files are flushed", () => {
+  runFixture(`
+    write(path.join(dataDir, "runtime.json"), "archived-state");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const target = path.join(dataDir, "runtime.json");
+      write(target, "live-state");
+      const originalOpenSync = fs.openSync;
+      const originalFsyncSync = fs.fsyncSync;
+      const openedPaths = new Map();
+      let failed = false;
+      fs.openSync = function trackOpenedPath(pathname, ...args) {
+        const fd = originalOpenSync.call(this, pathname, ...args);
+        if (typeof pathname === "string") openedPaths.set(fd, path.resolve(pathname));
+        return fd;
+      };
+      fs.fsyncSync = function failRestoredTargetOnce(fd) {
+        if (!failed && openedPaths.get(fd) === path.resolve(target)) {
+          failed = true;
+          throw Object.assign(new Error("injected restored file flush failure"), { code: "EIO" });
+        }
+        return originalFsyncSync.call(this, fd);
+      };
+      try {
+        await assert.rejects(restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }), /injected restored file flush failure/);
+      } finally {
+        fs.openSync = originalOpenSync;
+        fs.fsyncSync = originalFsyncSync;
+      }
+      assert.equal(failed, true, "the restored data file must be flushed before the commit marker");
+      const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+      const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
+      assert.notEqual(coordinator.phase, "restart_required", "a failed restored-file flush must not commit the local restore");
+      assert.equal(restoreService.assertNoPendingWholeRestore().recovered, true);
+      assert.equal(fs.readFileSync(target, "utf8"), "live-state", "startup recovers the preimage after the failed flush");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore rejects a missing archived file instead of persisting restart-required", () => {
+  runFixture(`
+    write(path.join(dataDir, "runtime.json"), "archived-state");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const target = path.join(dataDir, "runtime.json");
+      write(target, "live-state");
+      await assert.rejects(restoreService.restoreBackup(backup.id, {
+        confirmation: "RESTORE",
+        failureInjector(step) {
+          if (step === "restore.data.copied") fs.rmSync(target, { force: true });
+        },
+      }), /durability target is missing/i);
+      const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+      assert.notEqual(JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).phase, "restart_required");
+      assert.equal(restoreService.assertNoPendingWholeRestore().recovered, true);
+      assert.equal(fs.readFileSync(target, "utf8"), "live-state");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("rollback does not persist rollback-complete until restored targets are flushed", () => {
+  runFixture(`
+    write(path.join(dataDir, "runtime.json"), "archived-state");
+    write(path.join(uploadsDir, "file.txt"), "archived-upload");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const target = path.join(uploadsDir, "file.txt");
+      write(path.join(dataDir, "runtime.json"), "live-state");
+      write(target, "live-upload");
+      await assert.rejects(restoreService.restoreBackup(backup.id, {
+        confirmation: "RESTORE",
+        failureInjector(step) { if (step === "restore.uploads.cleared") throw new Error("injected interruption"); },
+      }), /injected interruption/);
+      const originalOpenSync = fs.openSync;
+      const originalFsyncSync = fs.fsyncSync;
+      const openedPaths = new Map();
+      let failed = false;
+      fs.openSync = function trackOpenedPath(pathname, ...args) {
+        const fd = originalOpenSync.call(this, pathname, ...args);
+        if (typeof pathname === "string") openedPaths.set(fd, path.resolve(pathname));
+        return fd;
+      };
+      fs.fsyncSync = function failRollbackTargetOnce(fd) {
+        if (!failed && openedPaths.get(fd) === path.resolve(target)) {
+          failed = true;
+          throw Object.assign(new Error("injected rollback target flush failure"), { code: "EIO" });
+        }
+        return originalFsyncSync.call(this, fd);
+      };
+      try {
+        assert.throws(() => restoreService.assertNoPendingWholeRestore(), /rollback failed/i);
+      } finally {
+        fs.openSync = originalOpenSync;
+        fs.fsyncSync = originalFsyncSync;
+      }
+      assert.equal(failed, true, "rollback must flush restored payloads before recording completion");
+      const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+      assert.notEqual(JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).phase, "rollback_complete");
+      assert.equal(restoreService.assertNoPendingWholeRestore().recovered, true, "a later startup retries rollback after the transient flush failure");
+      assert.equal(fs.readFileSync(target, "utf8"), "live-upload");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("restore refuses a symlinked staging root before deleting or extracting outside it", (t) => {
   const outcome = runFixture(`
     write(path.join(dataDir, "runtime.json"), "archived-state");
@@ -1745,6 +1852,79 @@ test("restore keeps the existing fail-closed behavior for archives containing te
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `, { BACKUP_INCLUDE_TEMP: "true" });
+});
+
+test("cloud restore leaves newer local and provider pending bytes unchanged when the archive contains temp payloads", () => {
+  runFixture(`
+    const pendingPath = path.join(process.cwd(), "temp", "archived-pending.txt");
+    let providerBytes = "archive pending bytes";
+    const cloud = {
+      enabled: () => true,
+      provider: "fixture",
+      inventory: async () => [{ provider: "fixture", providerIdentity: "pending-object", area: "temp", folderId: "root", name: "archived-pending.txt" }],
+      download: async (_folderId, _name, target) => { write(target, providerBytes); return true; },
+      upload: async () => ({ provider: "fixture" }),
+    };
+    backupService.setCloudStorage(cloud);
+    restoreService.setCloudStorage(cloud);
+    (async () => {
+      write(pendingPath, providerBytes);
+      write(path.join(dataDir, "restore-state.json"), "archive state");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      assert.equal(backup.metadata.cloudComplete, true);
+      const unzipper = require(${JSON.stringify(path.join(ROOT, "node_modules", "unzipper"))});
+      const archive = await unzipper.Open.file(backupService.getBackupOrThrow(backup.id).archivePath);
+      const manifest = JSON.parse((await archive.files.find((entry) => entry.path === "backup-manifest.json").buffer()).toString("utf8"));
+      assert.ok(manifest.included_files.some((entry) => entry.path === "temp/archived-pending.txt"));
+
+      providerBytes = "newer live pending bytes";
+      write(pendingPath, providerBytes);
+      write(path.join(dataDir, "restore-state.json"), "live state");
+      await assert.rejects(restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }), /Entrada nao permitida no backup: temp\\/archived-pending.txt/);
+      assert.equal(fs.readFileSync(pendingPath, "utf8"), "newer live pending bytes");
+      assert.equal(providerBytes, "newer live pending bytes");
+      assert.equal(fs.readFileSync(path.join(dataDir, "restore-state.json"), "utf8"), "live state");
+      assert.equal(restoreService.assertNoPendingWholeRestore().reason, "no_pending_restore");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `, { BACKUP_INCLUDE_TEMP: "true" });
+});
+
+test("manifest-only temp paths cannot exempt live provider temp objects from restore suppression", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    let providerBytes = "newer provider pending bytes";
+    const cloud = {
+      enabled: () => true,
+      provider: "fixture",
+      inventory: async () => [{ provider: "fixture", providerIdentity: "pending-object", area: "temp", folderId: "root", name: "pending.txt" }],
+      download: async (_folderId, _name, target) => { write(target, providerBytes); return true; },
+      upload: async () => ({ provider: "fixture" }),
+    };
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(dataDir, "restore-state.json"), "selected archive state");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const stored = backupService.getBackupOrThrow(backup.id);
+      fs.rmSync(stored.archivePath);
+      await backupService.createZipArchive(stored.archivePath, {
+        backup_id: backup.id,
+        included_files: [{ path: "temp/pending.txt", size: 20 }],
+        cloud_complete: true,
+      }, []);
+      await backupRepository.saveBackup({ ...backup, checksum: null });
+
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.equal(restored.cloudSync.state, "not_required");
+      const policy = JSON.parse(fs.readFileSync(path.join(dataDir, ".rootark-restore-provider-orphans.json"), "utf8"));
+      assert.deepEqual(policy.objects, [{ area: "temp", folderId: "root", name: "pending.txt" }]);
+      assert.equal(providerBytes, "newer provider pending bytes");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
 });
 
 test("restore inventory failure aborts before local commit", () => {

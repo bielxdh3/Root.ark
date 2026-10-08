@@ -298,12 +298,65 @@ test("JSON user generations survive restart before same-username recreation", { 
     },
     body: specialUsernameBody,
   })).status, 201);
+  const prototypeUsernameBody = JSON.stringify({ username: "__proto__", password: crypto.randomBytes(24).toString("base64url"), role: "user", permissions: { manageUsers: true } });
+  assert.equal((await request(port, "/users", {
+    method: "POST",
+    headers: {
+      cookie: admin.cookie,
+      origin: `http://127.0.0.1:${port}`,
+      "x-csrf-token": admin.csrf,
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(prototypeUsernameBody),
+    },
+    body: prototypeUsernameBody,
+  })).status, 201);
   const generations = JSON.parse(fs.readFileSync(path.join(cwd, "data", "user-generations.local.json"), "utf-8"));
   assert.equal(generations.constructor, 0, "special property names must persist as ordinary username keys");
+  assert.equal(Object.hasOwn(generations, "__proto__"), true, "prototype-sensitive usernames must persist as ordinary keys");
+  assert.equal(generations.__proto__, 0);
 
   assert.equal((await request(port, "/storage/status", { headers: { cookie: agent.cookie } })).status, 401);
   const recreated = await login(port, "agent", recreatedPassword);
   assert.ok(recreated.sessionVersion > agent.sessionVersion);
+});
+
+test("deleting a user removes only that username from JSON file and folder access maps", { timeout: 30_000 }, async (t) => {
+  const password = crypto.randomBytes(24).toString("base64url");
+  const cwd = createSandbox([
+    { username: "admin", password: bcrypt.hashSync(password, 10), role: "admin", permissions: {}, sessionVersion: 0 },
+    { username: "__proto__", password: bcrypt.hashSync(password, 10), role: "user", permissions: {}, sessionVersion: 0 },
+  ]);
+  const filePermissions = JSON.parse('{"root/protected.txt":{"folderId":"root","users":{"__proto__":{"edit":true},"keep":{"edit":true}}}}');
+  const folders = [
+    { id: "root", name: "Root", isRoot: true, users: JSON.parse('{"__proto__":{"edit":true},"keep":{"edit":true}}') },
+  ];
+  fs.writeFileSync(path.join(cwd, "data", "file-permissions.json"), JSON.stringify(filePermissions));
+  fs.writeFileSync(path.join(cwd, "data", "folders.json"), JSON.stringify(folders));
+  const port = await getUnusedPort();
+  const child = spawn(process.execPath, [SERVER], {
+    cwd,
+    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  t.after(async () => {
+    if (child.exitCode === null) {
+      await new Promise((resolve) => { child.once("exit", resolve); child.kill(); });
+    }
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  assert.equal((await waitForServer(port)).status, 200);
+  const admin = await login(port, "admin", password);
+  assert.equal((await request(port, "/users/__proto__", {
+    method: "DELETE",
+    headers: { cookie: admin.cookie, origin: `http://127.0.0.1:${port}`, "x-csrf-token": admin.csrf },
+  })).status, 200);
+
+  const savedFilePermissions = JSON.parse(fs.readFileSync(path.join(cwd, "data", "file-permissions.json"), "utf8"));
+  const savedFolders = JSON.parse(fs.readFileSync(path.join(cwd, "data", "folders.json"), "utf8"));
+  assert.deepEqual(savedFilePermissions["root/protected.txt"].users, { keep: { edit: true } });
+  assert.deepEqual(savedFolders[0].users, { keep: { edit: true } });
 });
 
 test("permission removal revokes an existing browser session before a protected HTTP handler", { timeout: 30_000 }, async (t) => {

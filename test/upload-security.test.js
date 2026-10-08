@@ -570,6 +570,44 @@ test("chunk uploads scrub legacy secrets and require the final password before s
   assert.equal((harness.stdout.join("") + harness.stderr.join("")).includes(password), false);
 });
 
+test("chunk session ids and numeric chunk indexes remain contained at their boundaries", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t);
+  const session = await login(harness.port, "uploader", harness.password);
+
+  const traversal = await uploadChunk(harness.port, session, {
+    uploadId: "../outside-session",
+    originalName: "bounded.txt",
+    chunkIndex: 0,
+    totalChunks: 1,
+    bytes: "must not escape",
+  });
+  assert.equal(traversal.status, 400, traversal.body);
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, "outside-session")), false);
+
+  const uploadId = "bounded-index";
+  const acceptedBoundary = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "bounded.txt",
+    chunkIndex: 1999,
+    totalChunks: 2000,
+    bytes: "last allowed index",
+  });
+  assert.equal(acceptedBoundary.status, 200, acceptedBoundary.body);
+  assert.equal(JSON.parse(acceptedBoundary.body).complete, false);
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  assert.equal(fs.readFileSync(path.join(sessionDir, "1999.part"), "utf8"), "last allowed index");
+
+  const rejectedBoundary = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "bounded.txt",
+    chunkIndex: 2000,
+    totalChunks: 2000,
+    bytes: "out of range",
+  });
+  assert.equal(rejectedBoundary.status, 400, rejectedBoundary.body);
+  assert.equal(fs.existsSync(path.join(sessionDir, "2000.part")), false);
+});
+
 test("malformed, unreadable, and orphan chunk sessions cannot overwrite retained parts", { timeout: 45_000 }, async (t) => {
   let unreadableMetadataPath;
   let markerPath;

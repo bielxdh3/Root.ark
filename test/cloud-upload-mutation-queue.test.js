@@ -5,7 +5,7 @@ const path = require("node:path");
 const test = require("node:test");
 const { createCloudTempMutationQueue } = require("../services/cloudTempMutationQueue");
 
-function createHarness(directory, upload, isSuppressed = () => false) {
+function createHarness(directory, upload, isSuppressed = () => false, isEnabled = () => true, remove = async () => {}) {
   const lifecycleLock = { run: async (_folderId, _fileName, work) => work() };
   return createCloudTempMutationQueue({
     area: "uploads",
@@ -13,10 +13,34 @@ function createHarness(directory, upload, isSuppressed = () => false) {
     lifecycleLock,
     localPathFor: (_folderId, fileName) => path.join(directory, "files", fileName),
     upload,
-    remove: async () => {},
+    remove,
     isSuppressed,
+    isEnabled,
   });
 }
+
+test("disabled upload reconciliation retains durable intent until the provider is enabled", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-upload-queue-disabled-"));
+  try {
+    const fileDirectory = path.join(directory, "files");
+    fs.mkdirSync(fileDirectory, { recursive: true });
+    fs.writeFileSync(path.join(fileDirectory, "deleted-version.txt.v1"), "archived version");
+    let providerCalls = 0;
+    const disabled = createHarness(directory, async () => { providerCalls += 1; }, () => false, () => false, async () => { providerCalls += 1; });
+    disabled.setDesired("root", "deleted-version.txt.v1", "absent");
+    await disabled.processAll();
+
+    assert.equal(providerCalls, 0, "disabled cloud storage does not call provider operations");
+    assert.equal(disabled.getRecord("root", "deleted-version.txt.v1")?.desired, "absent", "disabled reconciliation preserves the durable intent");
+
+    const enabled = createHarness(directory, async () => { providerCalls += 1; }, () => false, () => true, async () => { providerCalls += 1; });
+    await enabled.processAll();
+    assert.equal(providerCalls, 1, "the intent is reconciled after cloud storage is enabled");
+    assert.equal(enabled.hasPending("root", "deleted-version.txt.v1"), false);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("upload queue persists provider failure and retries it after restart", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-upload-queue-"));
