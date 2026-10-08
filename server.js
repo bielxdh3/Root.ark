@@ -62,10 +62,12 @@ const registerTrashRoutes = require("./src/routes/trash");
 const { registerSyncRoutes } = require("./src/routes/sync");
 const { registerGroupRoutes } = require("./src/routes/groups");
 const { createAuthenticate, createRealtimeAuthenticator, getClientIp, getExpectedOrigin, parseCookies } = require("./src/middlewares/auth");
-const { parseTrustedProxies } = require("./src/middlewares/trustedProxies");
+const { getTrustedClientIp, parseTrustedProxies } = require("./src/middlewares/trustedProxies");
+const { createRealtimeUpgradeGuard } = require("./src/realtime/upgradeGuard");
 const { createRequirePermission } = require("./src/middlewares/permissions");
 const { isTotpRequired, validateTotpPolicy } = require("./src/services/totpPolicy");
-const { getDeploymentReadiness, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
+const { getDeploymentReadiness, isSessionCookieSecure, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
+const { getLoginRejection, getLoginSecurityState, registerFailedLoginAttempt, resetLoginUsernameState } = require("./src/services/loginProtection");
 
 const app = express();
 const server = http.createServer(app);
@@ -90,9 +92,24 @@ const REALTIME_MAX_MESSAGES_PER_WINDOW = parseBoundedNumber("REALTIME_MAX_MESSAG
 const REALTIME_RATE_WINDOW_MS = parseBoundedNumber("REALTIME_RATE_WINDOW_MS", 10 * 1000, 1000, 10 * 60 * 1000);
 const REALTIME_HEARTBEAT_MS = parseBoundedNumber("REALTIME_HEARTBEAT_MS", 30 * 1000, 1000, 10 * 60 * 1000);
 const REALTIME_IDLE_TIMEOUT_MS = parseBoundedNumber("REALTIME_IDLE_TIMEOUT_MS", 2 * REALTIME_HEARTBEAT_MS, REALTIME_HEARTBEAT_MS, 60 * 60 * 1000);
+const REALTIME_UPGRADE_MAX_PER_WINDOW = parseBoundedNumber("REALTIME_UPGRADE_MAX_PER_WINDOW", 120, 1, 100_000);
+const REALTIME_UPGRADE_RATE_WINDOW_MS = parseBoundedNumber("REALTIME_UPGRADE_RATE_WINDOW_MS", 60_000, 1000, 10 * 60 * 1000);
+const REALTIME_MAX_CONNECTIONS_PER_PEER = parseBoundedNumber("REALTIME_MAX_CONNECTIONS_PER_PEER", 100, 1, 10_000);
 const ROUTE_RATE_LIMIT_MAX = parsePositiveIntegerEnv("ROUTE_RATE_LIMIT_MAX", 60, 1_000_000);
 const ROUTE_RATE_LIMIT_WINDOW_MS = parsePositiveIntegerEnv("ROUTE_RATE_LIMIT_WINDOW_MS", 15 * 60 * 1000, 2_147_483_647);
-const wss = new WebSocket.Server({ server, path: "/ws", maxPayload: REALTIME_MAX_PAYLOAD_BYTES, perMessageDeflate: false });
+const realtimeUpgradeGuard = createRealtimeUpgradeGuard({
+  getPeerKey: (req) => getTrustedClientIp(req, app.get("trust proxy fn")),
+  authorize: (req) => {
+    if (restoreService.isWholeRestoreBlocked()) return { statusCode: 503, message: "Restore recovery required" };
+    if (req.headers.origin !== getExpectedOrigin(req, app.get("trust proxy fn"))) return { statusCode: 403, message: "Origin denied" };
+    const user = authenticateRealtimeToken(parseCookies(req.headers.cookie).get("rootark_session"));
+    return user ? { user } : { statusCode: 401, message: "WebSocket authentication required" };
+  },
+  maxAttempts: REALTIME_UPGRADE_MAX_PER_WINDOW,
+  windowMs: REALTIME_UPGRADE_RATE_WINDOW_MS,
+  maxConnections: REALTIME_MAX_CONNECTIONS_PER_PEER,
+});
+const wss = new WebSocket.Server({ server, path: "/ws", maxPayload: REALTIME_MAX_PAYLOAD_BYTES, perMessageDeflate: false, verifyClient: realtimeUpgradeGuard.verifyClient });
 const realtimeHeartbeat = setInterval(() => {
   for (const socket of wss.clients) {
     if (socket.isAlive === false || Date.now() - socket.lastActivityAt > REALTIME_IDLE_TIMEOUT_MS) socket.terminate();
@@ -107,7 +124,10 @@ if (JWT_SECRET.length < 32 || JWT_SECRET === "rootark_secret_change_in_productio
 validateTotpPolicy();
 const PORT = Number(process.env.PORT || 3000);
 const TRUSTED_PROXIES = parseTrustedProxies(process.env.TRUSTED_PROXIES);
-const SESSION_COOKIE_OPTIONS = { httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production", path: "/" };
+const SESSION_COOKIE_OPTIONS = { httpOnly: true, sameSite: "lax", secure: isSessionCookieSecure(process.env), path: "/" };
+if (process.env.NODE_ENV === "production" && !SESSION_COOKIE_OPTIONS.secure) {
+  throw new Error("Production session cookies must use the Secure attribute.");
+}
 const USERS_SEED_FILE = "./data/users.json";
 const USERS_FILE = "./data/users.local.json";
 const USER_GENERATIONS_FILE = "./data/user-generations.local.json";
@@ -592,6 +612,14 @@ function getDefaultUsers() {
       },
     },
   ];
+}
+
+function hasDevelopmentBootstrapCredentials(users) {
+  const defaults = new Map([["admin", "admin123"], ["user", "user123"]]);
+  return users.some((user) => {
+    const password = defaults.get(String(user?.username || "").trim().toLowerCase());
+    return Boolean(password && bcrypt.compareSync(password, String(user.password || "")));
+  });
 }
 
 function loadSeedUsers() {
@@ -1201,8 +1229,9 @@ function getSafeWebDavAuditPath(req) {
   }
 }
 
-function sendWebDavUnauthorized(req, res, reason = "invalid_credentials") {
+function sendWebDavUnauthorized(req, res, reason = "invalid_credentials", status = 401, retryAfter) {
   res.setHeader("WWW-Authenticate", 'Basic realm="Root.ark WebDAV", charset="UTF-8"');
+  if (retryAfter) res.setHeader("Retry-After", String(retryAfter));
   auditLog(
     "webdav.login.failed",
     getAuditActor(req, "anonymous"),
@@ -1211,32 +1240,53 @@ function sendWebDavUnauthorized(req, res, reason = "invalid_credentials") {
     "failure",
     { reason, method: req.method, path: getSafeWebDavAuditPath(req) }
   );
-  res.status(401).send("Authentication required");
+  res.status(status).send(status === 429 ? "Too many authentication attempts" : "Authentication required");
   return false;
 }
 
 function authenticateWebDavRequest(req, res) {
   const header = String(req.headers.authorization || "");
-  if (!header.toLowerCase().startsWith("basic ")) {
-    return sendWebDavUnauthorized(req, res, "missing_basic_auth");
-  }
-
   let username = "";
   let password = "";
-  try {
-    const decoded = Buffer.from(header.slice(6), "base64").toString("utf-8");
-    const separator = decoded.indexOf(":");
-    if (separator === -1) return sendWebDavUnauthorized(req, res, "malformed_basic_auth");
-    username = decoded.slice(0, separator).trim();
-    password = decoded.slice(separator + 1);
-  } catch {
-    return sendWebDavUnauthorized(req, res, "malformed_basic_auth");
+  let parseFailure = "";
+  if (!header.toLowerCase().startsWith("basic ")) {
+    parseFailure = "missing_basic_auth";
+  } else {
+    try {
+      const decoded = Buffer.from(header.slice(6), "base64").toString("utf-8");
+      const separator = decoded.indexOf(":");
+      if (separator === -1) parseFailure = "malformed_basic_auth";
+      else {
+        username = decoded.slice(0, separator).trim();
+        password = decoded.slice(separator + 1);
+      }
+    } catch {
+      parseFailure = "malformed_basic_auth";
+    }
+  }
+
+  const security = getLoginSecurityState(req, username, getAuditActor);
+  const rejection = getLoginRejection(security);
+  if (rejection) return sendWebDavUnauthorized(req, res, rejection.reason, 429, rejection.retryAfter);
+  if (parseFailure) {
+    security.ipState.attempts += 1;
+    registerFailedLoginAttempt(security.ipState, security.now, security.config);
+    registerFailedLoginAttempt(security.usernameState, security.now, security.config);
+    return sendWebDavUnauthorized(req, res, parseFailure);
   }
 
   const user = loadUsers().find((entry) => sameUsername(entry.username, username));
   if (!user || user.disabled || !bcrypt.compareSync(password, user.password)) {
+    security.ipState.attempts += 1;
+    registerFailedLoginAttempt(security.ipState, security.now, security.config);
+    registerFailedLoginAttempt(security.usernameState, security.now, security.config);
+    const failureRejection = getLoginRejection(security);
+    if (failureRejection && failureRejection.reason !== "rate_limit") {
+      return sendWebDavUnauthorized(req, res, failureRejection.reason, 429, failureRejection.retryAfter);
+    }
     return sendWebDavUnauthorized(req, res, "invalid_credentials");
   }
+  resetLoginUsernameState(security);
 
   let totpPolicy;
   try {
@@ -5350,6 +5400,10 @@ function initData() {
     saveUsers(users);
     console.log(seedUsers ? "User seed imported from data/users.json." : "Explicit local development users created.");
   }
+
+  if (process.env.NODE_ENV === "production" && hasDevelopmentBootstrapCredentials(loadUsers())) {
+    throw new Error("Development bootstrap credentials must be changed before production startup.");
+  }
 }
 
 app.set("trust proxy", TRUSTED_PROXIES);
@@ -5465,19 +5519,12 @@ app.get("/auth/session.js", authenticate, (req, res) => {
 });
 
 wss.on("connection", (socket, req) => {
+  realtimeUpgradeGuard.trackConnection(socket, req);
   if (restoreService.isWholeRestoreBlocked()) {
     socket.close(1012, "Restore recovery required");
     return;
   }
-  const origin = req.headers.origin;
-  const expectedOrigin = getExpectedOrigin(req, app.get("trust proxy fn"));
-  const user = origin === expectedOrigin && authenticateRealtimeToken(parseCookies(req.headers.cookie).get("rootark_session"));
-
-  if (!user) {
-    socket.close(1008, "Token invalido");
-    return;
-  }
-
+  const user = req.rootarkRealtimeUser;
   socket.user = user;
   socket.isAlive = true;
   socket.lastActivityAt = Date.now();

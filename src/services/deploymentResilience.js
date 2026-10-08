@@ -240,10 +240,16 @@ function validateMasterKey(env, masterKeyFile) {
   try { return /^[a-f0-9]{64}$/i.test(fs.readFileSync(masterKeyFile, "utf8").trim()); } catch { return false; }
 }
 
+function isSessionCookieSecure(env = process.env) {
+  if (env.SESSION_COOKIE_SECURE !== undefined) return env.SESSION_COOKIE_SECURE === "true";
+  return env.NODE_ENV === "production";
+}
+
 function getDeploymentReadiness({ env = process.env, masterKeyFile, cloudStatus = {}, validateTotp } = {}) {
   const checks = {
     jwt: String(env.JWT_SECRET || "").length >= 32 && env.JWT_SECRET !== "rootark_secret_change_in_production",
     totp: Object.hasOwn(env, "TOTP_POLICY") && typeof validateTotp === "function",
+    sessionCookie: isSessionCookieSecure(env),
     masterKey: validateMasterKey(env, masterKeyFile),
     provider: true,
   };
@@ -276,6 +282,7 @@ module.exports = {
   attestCiphertextOnlySyncState,
   createIdempotencyKey,
   getDeploymentReadiness,
+  isSessionCookieSecure,
   normalizeProviderError,
   registerReadinessRoutes,
   retryWithBackoff,
