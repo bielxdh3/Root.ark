@@ -34,6 +34,7 @@
     "mammoth": "^1.13.0",
     "multer": "^2.4.0",
     "node-cron": "^4.6.0",
+    "proxy-addr": "2.0.8",
     "qrcode": "^1.5.4",
     "unzipper": "^0.12.5",
     "word-extractor": "^1.0.4",
