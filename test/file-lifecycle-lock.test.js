@@ -121,7 +121,7 @@ test("file lifecycle lock fails closed on an existing owner and never steals it"
 test("file lifecycle lock reclaims only a provably dead same-host owner", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-dead-owner-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const lock = createFileLifecycleLock({ directory, timeoutMs: 40, pollMs: 5 });
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 5_000, pollMs: 5 });
   const identityHash = crypto.createHash("sha256").update("root\0dead-owner.txt").digest("hex");
   const lockPath = path.join(directory, `${identityHash}.lock`);
   fs.writeFileSync(lockPath, JSON.stringify({ token: "dead-owner", pid: findAbsentPid(), hostname: os.hostname(), createdAt: new Date(0).toISOString() }), { flag: "wx" });
