@@ -1,6 +1,40 @@
 # Root.ark closure validation — 2026-10-08
 
-## Latest closure snapshot — after PR #124, before documentation follow-up
+## Closure snapshot used for the documentation follow-up — after PR #127
+
+Queried live on 2026-10-08 after PR #127 merged. `Root/main` was `25e50cbaa26062202d470330e93d7beb4575693a`; this snapshot is time-scoped and the final post-documentation merge SHA must be queried and validated separately.
+
+### Exact main validation at this snapshot
+
+- Security Regression push [run #37787160598](https://github.com/bielxdh3/Root.ark/actions/runs/37787160598): Ubuntu Node 22 ran 987 tests (976 passed, 11 skipped, 0 failed); Windows Node 22 ran 987 tests (983 passed, 4 skipped, 0 failed). Syntax passed on both; Ubuntu passed runtime-artifact and configured high-severity dependency-audit checks.
+- CodeQL [run #37787160551](https://github.com/bielxdh3/Root.ark/actions/runs/37787160551), default-branch Dependency Review [run #37787160662](https://github.com/bielxdh3/Root.ark/actions/runs/37787160662), and Pages [run #37787159434](https://github.com/bielxdh3/Root.ark/actions/runs/37787159434) passed on this SHA.
+- `npm run validate:release-gate` passed on PR #127 candidate `2334bf0cd02125d316b3ff083cf784b3e9f82abb` with 21 passed, 0 blocked, and 0 failed. It has not yet run on exact merged SHA `25e50c…`.
+
+### Live GitHub state at this snapshot
+
+- PR #127 (`fix(restore): preserve provider inventory baseline`) merged from head `2334bf0cd02125d316b3ff083cf784b3e9f82abb` at `25e50cbaa26062202d470330e93d7beb4575693a`; its exact-head Analyze, Ubuntu, Windows, and CodeQL checks succeeded. The PR-only dependency-review job succeeded; the default-branch-only job was skipped on the PR event and later passed on the merged SHA.
+- Open PRs #95 and #97 still target base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; #95 is `DIRTY` and #97 `CLEAN`. Listed checks are from 2026-10-01, before this base. All 4 threads on #95 and all 5 on #97 are resolved. Their feature/security boundaries remain incomplete.
+- Issues #63–68 and #94 remain open. The moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` for `sprintf-js` remains open with no first patched version listed.
+
+### Browser acceptance on disposable fixtures
+
+A fresh Playwright session exercised a disposable runtime from PR #127 candidate `2334bf0…` on port `43781`, using temporary data, uploads, and quarantine directories. It did not use the user app on port `3215`. Verified flows include login and TOTP enrollment/challenge; folder creation; password-protected share creation and guest password access; server-key-encrypted synthetic upload and approval; trash and restore; permanent deletion of a synthetic item after typed confirmation; manual backup, manifest inspection, and restore-confirmation/cancel; and chunk upload of a 9 MiB synthetic file. Two chunk requests succeeded with HTTP 200; an intercepted first-chunk HTTP 500 appeared as an alert and created no pending row. A pending chunk upload was also rejected successfully. A second synthetic version was uploaded and approved. The browser confirmed that restore-dialog Cancel returned focus to its still-connected opener and did not alter the backup table.
+
+At desktop 1280×800, tablet 768×1024, and mobile 390×844, document/body widths matched the viewport. Mobile navigation opened by keyboard Enter and closed with Escape, returning focus to the toggle. No horizontal overflow was measured. Restoring version v1 after creating v2 restored the prior 23-byte synthetic file and recorded a successful `file.version.restore` audit event. Audit CSV export downloaded `rootark-audit.csv`; the observed `POST /audit/export` returned 200. Saving the owner-only inherited-access control generated an audit event, and setting expiration generated an audit event, although response status and actual expiry were not captured; no outsider ACL denial or explicit ACL grant/deny was tested. An overlength synthetic rename returned 400 and displayed the maximum-length alert, but a valid rename was not completed. No quarantine UI, users/groups, cross-session realtime refresh with a dirty form, session revocation, or move was verified in this fresh pass. Preview content was not verified; public-share download returned 200, while authenticated download status was not captured. CSRF headers were not independently verified across mutations. No unexpected JavaScript exception was observed. Full browser acceptance therefore remains `PARTIAL`. Per-flow screenshots and a machine-readable trace were not retained.
+
+The approved cleanup of the exact disposable fixture name `closure-ui-sample.txt` on the earlier test service at port `62376` was not performed: the deletion command was rejected by the tool safety boundary after the user authorized it. No alternate deletion route was used; current presence is unverified. The isolated browser runtime at port `43781` and user service at `3215` were not targeted for that cleanup.
+
+### Restore semantics at this snapshot
+
+PR #127 binds provider inventory markers and restore-sync queues to provider namespace and authenticated principal, validates provider context around inventory/commit/upload operations, and hardens legacy queue replacement. One unambiguous legacy queue can be rebuilt from a validated archived baseline; a durable supersession pointer retires the old queue after its lease and resumes after restart. Multiple ambiguous queues fail closed. Provider failure leaves durable retry state and cloud access blocked until reconciliation succeeds. Tests use fake providers and disposable fixtures; live S3/Google interoperability was not exercised.
+
+Whole restore uses verified local preimages and compensating rollback/restart recovery for quarantine, JSON, uploads, SQLite files/sidecars, and restore-derived provider policy. It is not a globally atomic transaction. Migration failures after local commit retain a restart barrier and retry forward; previously committed migrations remain committed. External writers and cloud-provider state remain outside local rollback. Windows also lacks a portable directory-entry flush guarantee equivalent to POSIX. These are bounded residuals, not claims of full restore atomicity.
+
+### Mission status at this snapshot
+
+`PARTIAL`: exact-SHA CI is green on `25e50c…`, but the release gate on the merged SHA, complete browser acceptance, documentation merge, and fresh independent review remain pending. No claim of production readiness or end-to-end Zero-Knowledge is made.
+
+## Superseded closure snapshot — after PR #124, before documentation follow-up
 
 Queried live on 2026-10-08. `Root/main` was `ad4707037933ee9a65a53e76a26ae3b1cea01160`. This snapshot supersedes the historical status farther below, which reflects an earlier SHA. The documentation follow-up and its final-main validation were still pending at this snapshot.
 

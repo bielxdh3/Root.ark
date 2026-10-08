@@ -103,6 +103,8 @@ Um restore feito com o cloud desativado mantém a aplicação local disponível,
 
 Em endpoints S3 compatíveis sem identidade STS, configure `AWS_S3_PRINCIPAL_ID` com um identificador estável, não secreto, da conta/principal. A inicialização falha fechada se esse identificador estiver ausente; o access key ID não substitui esse vínculo.
 
+Filas de reconciliação antigas sem contexto do provider não são reaproveitadas automaticamente. Na inicialização, o servidor valida o backup da fila antes de reconstruir uma única fila pendente; se houver mais de uma fila ambígua, falta de backup completo ou falha de identidade/inventário, mantém o acesso cloud bloqueado. A fila substituta registra de forma durável qual fila antiga deve aposentar, respeita um lease ativo e retoma a aposentadoria após reinício. Se necessário, selecione um baseline completo explicitamente; o servidor nunca escolhe o backup mais recente por conta própria. Os detalhes e a cobertura de falha estão em [limites da transação de restore](docs/backup-restore-transaction-boundary.md).
+
 O provider externo não participa do rollback local. Restore oferece recuperação local por pre-images e reconciliação cloud retomável, não uma transação atômica entre filesystem, bancos e provider. Uma falha cloud após o commit local pode atrasar a disponibilidade dos arquivos até a fila ser concluída.
 
 ### Proteção dos diretórios no host
