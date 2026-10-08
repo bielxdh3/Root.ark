@@ -1854,7 +1854,7 @@ function artifactPath(prefix, suffix) {
 
 function fileSha256(pathname) {
   if (!fs.existsSync(pathname)) return null;
-  return crypto.createHash("sha256").update(fs.readFileSync(pathname)).digest("hex");
+  return restorePreimage.hashFile(pathname);
 }
 
 function fsyncFile(pathname) {

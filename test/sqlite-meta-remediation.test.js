@@ -191,6 +191,27 @@ test("SQLite disaster-recovery meta-remediation matrix", async (t) => {
     ["42 rollback restores after primary move crash", () => {
       const f = makeFixture(); try { assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "original.move.primary", simulateCrash: true })); restoreService.recoverDatabaseRestore(f.destinationPath); assert.equal(readValue(f.destinationPath), "old"); } finally { f.cleanup(); }
     }],
+    ["SQLite journal hashing streams database artifacts through interrupted restore recovery", () => {
+      const f = makeFixture();
+      const originalReadFileSync = fs.readFileSync;
+      const databasePath = path.resolve(f.destinationPath);
+      const databaseArtifacts = new Set([databasePath, `${databasePath}-wal`, `${databasePath}-shm`]);
+      fs.readFileSync = function rejectWholeDatabaseReads(pathname, ...args) {
+        const candidate = path.resolve(String(pathname));
+        if (databaseArtifacts.has(candidate) || candidate.startsWith(`${databasePath}.restore-rollback-`)) {
+          throw new Error("SQLite database artifacts must not be loaded into one Buffer");
+        }
+        return originalReadFileSync.call(this, pathname, ...args);
+      };
+      try {
+        assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "replacement.move.primary", simulateCrash: true }), /replacement.move.primary/);
+        assert.equal(restoreService.recoverDatabaseRestore(f.destinationPath).recovered, true);
+        assert.equal(readValue(f.destinationPath), "old");
+      } finally {
+        fs.readFileSync = originalReadFileSync;
+        f.cleanup();
+      }
+    }],
     ["43 recovery refuses multiple legacy rollback candidates", () => {
       const f = makeFixture(); try { fs.rmSync(f.destinationPath); fs.writeFileSync(`${f.destinationPath}.restore-rollback-a`, "a"); fs.writeFileSync(`${f.destinationPath}.restore-rollback-b`, "b"); assert.throws(() => restoreService.recoverDatabaseRollback(f.destinationPath), /ambiguos/); } finally { f.cleanup(); }
     }],
@@ -285,5 +306,5 @@ test("SQLite disaster-recovery meta-remediation matrix", async (t) => {
     if (originalEnv.DB_ENABLED === undefined) delete process.env.DB_ENABLED; else process.env.DB_ENABLED = originalEnv.DB_ENABLED;
     if (originalEnv.DATABASE_URL === undefined) delete process.env.DATABASE_URL; else process.env.DATABASE_URL = originalEnv.DATABASE_URL;
   }
-  assert.equal(cases.length, 54);
+  assert.equal(cases.length, 55);
 });
