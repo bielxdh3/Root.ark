@@ -69,6 +69,14 @@ The repository currently contains working foundations for:
 - [x] bounded provider retry/cancellation, idempotency, ciphertext-only attestation, and secret-safe observability helpers;
 - [x] automated syntax, test, dependency, and artifact validation.
 
+### Exact-SHA CI snapshot — 2026-10-08 (after PR #118, source SHA `1c2f7a8b276e63e53555f5de824afc9b7a9aa55e`)
+
+After PR #118 merged, the push-triggered Security Regression workflow passed on this exact `Root/main` SHA: Ubuntu Node 22 ran 938 tests (927 passed, 11 skipped, 0 failed) and Windows Node 22 ran 938 tests (934 passed, 4 skipped, 0 failed). CodeQL, default-branch Dependency Review, and Pages also passed on this SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37729789854), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37729789865), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37729789780), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37729789584)). This is a point-in-time source snapshot; it does not validate a later merge SHA or complete the browser acceptance matrix.
+
+### Historical exact-SHA CI snapshot — 2026-10-08 (after PR #117, source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`)
+
+After PR #117 merged, the push-triggered Security Regression workflow passed on this exact `Root/main` SHA: Ubuntu Node 22 ran 938 tests (927 passed, 11 skipped, 0 failed) and Windows Node 22 ran 938 tests (934 passed, 4 skipped, 0 failed). CodeQL, default-branch dependency review, and Pages also passed on this exact SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37720151580), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37720151634), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37720151454), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37720150655)). This snapshot predates the current-base update of PR #116 and any later merge; it is not evidence for any later merge SHA.
+
 ### Historical exact-SHA CI snapshot — 2026-10-07
 
 On `Root/main` SHA `964f820417baf44f059a04e5363a2a172dccdc7a`, the push-triggered Security Regression workflow passed Ubuntu Node 22 full validation and Windows Node 22 syntax/tests. CodeQL and the default-branch dependency-review check also passed on this exact SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37549800190), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37549800373), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37549800109)). The PR-only dependency-review job was skipped on the push. This is exact-commit CI evidence; it does not establish browser acceptance, provider interoperability, production deployment safety, or release authorization.

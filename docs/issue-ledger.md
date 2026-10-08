@@ -1,8 +1,72 @@
 # Root.ark Issue Ledger
 
-## Latest live snapshot — 2026-10-08 (source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`)
+## Latest verified GitHub snapshot — after PR #118 (2026-10-08, `Root/main` `1c2f7a8b276e63e53555f5de824afc9b7a9aa55e`)
 
-GitHub was queried after PR #115 merged into `Root/main` at `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`, before this documentation update was published. This is a timestamped snapshot, not a claim that the default branch remains at that SHA after this PR merges. The closure report records the later final SHA and validation.
+Queried after the exact-SHA push workflows completed for `1c2f7a8…`, before this refreshed PR #116 candidate was published. This is a timestamped snapshot; later PR publication or merge changes the live state.
+
+PR #118 (`test: cover restore migration failure recovery`) merged at `1c2f7a8…` from head `5ed55e4a1f2509aea939c6a89dda7d0bef87cd99`. Its exact-head Security Regression, CodeQL, and Dependency Review passed. On the resulting exact `Root/main` SHA `1c2f7a8…`, push Security Regression run [#37729789854](https://github.com/bielxdh3/Root.ark/actions/runs/37729789854) passed: Ubuntu Node 22 938 total (927 passed, 11 skipped, 0 failed), Windows Node 22 938 total (934 passed, 4 skipped, 0 failed). CodeQL [#37729789865](https://github.com/bielxdh3/Root.ark/actions/runs/37729789865), default-branch Dependency Review [#37729789780](https://github.com/bielxdh3/Root.ark/actions/runs/37729789780), and Pages [#37729789584](https://github.com/bielxdh3/Root.ark/actions/runs/37729789584) also passed.
+
+The seven feature/security issues remain open: #63 protected search, #64 native Android, #65 Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change protection, #68 capability sharing, and #94 deployment-wide chunk-upload limits. Their acceptance boundaries remain as recorded below; no partial foundation is being marked complete.
+
+| Open PR | State at query | Remaining boundary |
+|---|---|---|
+| #95 | Open at head `95d99e4a934384fcfa2101dfc210741cd791a3d1`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`, merge state `DIRTY`; four review threads resolved. Its old-head checks passed on 2026-10-01. | #94 still lacks verified deployment-wide limits or proven single-process topology. |
+| #97 | Open at head `a6a33a92cd6902f303254e60031da4bdc04cec04`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`, merge state `CLEAN`; five review threads resolved. Its old-head checks passed on 2026-10-01. | Selective transfer, metadata-only paginated listing, native Files On-Demand, and external-writer-safe eviction remain incomplete. |
+| #102 | Open at head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`, base `9de3c85ab59aa16fc46916abc0cf638c539086ef`, merge state `DIRTY`; CodeQL check failed; one unresolved review thread remains at `services/internalFile.js:31`. | Resolve the thread/finding, update the base, and pass exact-head checks. |
+| #116 | Open at remote head `75efa003136c0799cf678fa8ad264076893882d3`, last PR base snapshot `14428690bef7c02648fd0be9570aabb17ae6de1a`; no review threads. Its prior head checks passed. This branch was then refreshed locally with PR #118's merge before publishing this documentation update. | Validate the newly published head and merge only after review and checks pass. |
+
+The moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` for transitive `sprintf-js` remains open; GitHub lists no first patched version. PR #118 has no unresolved review threads. The only unresolved thread among the open PRs above is on #102.
+
+## Historical live snapshot — 2026-10-08 (after PR #117, source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`)
+
+This point-in-time snapshot was queried from GitHub after PR #117 merged and before the PR #116 branch was updated to the current base. The follow-up candidate snapshot below records the later PR state; the table here applies only to `1442869…` at the original query time.
+
+### Open issues and pull requests at source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a` before the PR #116 update
+
+| Item | Live state at query | Remaining acceptance boundary |
+|---|---|---|
+| #63 | `open` | Protected-index primitives do not complete search: UI population, FTS/advanced search, encrypted-index lifecycle, metadata-leakage acceptance, and full search acceptance remain open. |
+| #64 | `open` | No functioning native Android client or Android CI. |
+| #65 | `open` | Root.ark is not an end-to-end Zero-Knowledge runtime; supported server paths can access plaintext in legacy flows. |
+| #66 / PR #97 | `open` / `open` | Metadata-only listing/pagination, native Files On-Demand, external open-handle-safe eviction, and restart/reconnect acceptance remain incomplete. |
+| #67 | `open` | Burst detection, pause/review barrier, protected history, recovery authorization, and deterministic recovery UX remain incomplete. |
+| #68 | `open` | Existing bearer links are not operation-scoped capabilities. |
+| #94 / PR #95 | `open` / `open` | Process-local limits do not prove deployment-wide enforcement; topology remains unverified. |
+| PR #95 | `open`, head `95d99e4a934384fcfa2101dfc210741cd791a3d1`, stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; listed checks pass; 4 threads resolved. | Update to current base and provide shared/edge limits or verified single-process topology before merge. |
+| PR #97 | `open`, head `a6a33a92cd6902f303254e60031da4bdc04cec04`, stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; listed checks pass; 5 threads resolved. | Selective-sync acceptance gaps above remain. |
+| PR #102 | `open`, head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`, base `9de3c85ab59aa16fc46916abc0cf638c539086ef`; CodeQL fails, other listed checks pass; one unresolved thread at `services/internalFile.js:31`. | Update, resolve the finding/thread, and revalidate. |
+| PR #116 | `open` at head `daa6025e0c08c29a4d4cc0b55ec9fbb31b7e4fca`, base `9e070823f2ee6372521a53d2fc130701ed074aab`; no review threads. Earlier Ubuntu run failed on an async cloud-restore test race. | PR #117 corrected the race on main; the candidate was later updated to current base and validated as recorded in the follow-up snapshot. |
+
+## Historical follow-up PR snapshot — 2026-10-08 (candidate head `a72d2f21db25363dc3f13d8816e3db3bd1ee2d93`, base `Root/main` `14428690bef7c02648fd0be9570aabb17ae6de1a`)
+
+At that historical query after the initial PR #116 update, issues #63 protected search, #64 native Android, #65 Zero-Knowledge, #66 selective sync/Files On-Demand, #67 destructive-change protection, #68 capability sharing, and #94 deployment-wide chunk-upload limits were open. PR #116 was then at candidate head `a72d2f2…` with clean merge state. PR #102 had a CodeQL failure and one unresolved thread at `services/internalFile.js:31`; PR #97 and #95 had stale bases, with #95 also dirty. PR #116 had zero submitted GitHub reviews and zero review threads at that query; its Security Regression, CodeQL, and Dependency Review checks passed on `a72d2f2…`. At that time, the subsequently published wording correction still required fresh checks. The moderate `sprintf-js` alert `GHSA-hp3w-g68c-fv3c` remained open.
+
+## Latest PR #116 candidate snapshot — 2026-10-08 (head `448d1c1ecd2cd3a1391dd741027dc146be3735b6`, base `Root/main` `14428690bef7c02648fd0be9570aabb17ae6de1a`)
+
+At this query, issues #63 protected search, #64 native Android, #65 Zero-Knowledge, #66 selective sync/Files On-Demand, #67 destructive-change protection, #68 capability sharing, and #94 deployment-wide chunk-upload limits were open. PR #116 was open with `CLEAN` merge state at the head/base above; PRs #95, #97, and #102 were also open. PR #95 remained `DIRTY` on stale base `d2ae0eb…`; PR #97 remained open on stale base `d2ae0eb…`; PR #102 remained `DIRTY` with a CodeQL failure and one unresolved thread at `services/internalFile.js:31`. PR #116 had no submitted GitHub reviews or unresolved review threads at query time.
+
+Exact-head checks on PR #116 head `448d1c1…` passed: Security Regression [run `37725263473`](https://github.com/bielxdh3/Root.ark/actions/runs/37725263473), Ubuntu Node 22 938 total (927 passed, 11 skipped, 0 failed) and Windows Node 22 938 total (934 passed, 4 skipped, 0 failed); CodeQL [run `37725263468`](https://github.com/bielxdh3/Root.ark/actions/runs/37725263468); and PR Dependency Review [run `37725263466`](https://github.com/bielxdh3/Root.ark/actions/runs/37725263466). The default-branch dependency-review job was skipped for this PR event. The local release gate passed on prior docs-only candidate head `a72d2f2…` (21 passed, 0 blocked, 0 failed); the 448d1c1 update changed documentation only.
+
+This snapshot is time-scoped to the query above. A subsequent documentation correction updates the record; its own PR head requires exact-head validation. The moderate `sprintf-js` Dependabot alert `GHSA-hp3w-g68c-fv3c` remained open.
+
+### Merged PRs and exact-SHA validation
+
+| PR | State | Merge commit |
+|---|---|---|
+| #114 | Merged — bootstrap, CSRF/mutation methods, proxy trust, main-push validation, restore recovery | `566a3d24591423c624ef3bcb82290a77ff359210` |
+| #115 | Merged — Windows lock-recovery test timeout | `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1` |
+| #99 | Merged — roadmap and issue reconciliation | `9e070823f2ee6372521a53d2fc130701ed074aab` |
+| #117 | Merged — waits for cloud-restore mutation records before test baseline | `14428690bef7c02648fd0be9570aabb17ae6de1a` |
+
+On exact `Root/main` SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`, Security Regression [#37720151580](https://github.com/bielxdh3/Root.ark/actions/runs/37720151580) succeeded: Ubuntu 938 total (927 passed, 11 skipped, 0 failed); Windows 938 total (934 passed, 4 skipped, 0 failed). CodeQL [#37720151634](https://github.com/bielxdh3/Root.ark/actions/runs/37720151634), dependency review [#37720151454](https://github.com/bielxdh3/Root.ark/actions/runs/37720151454), and Pages [#37720150655](https://github.com/bielxdh3/Root.ark/actions/runs/37720150655) succeeded. The moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` for transitive `sprintf-js` remains open; no first patched version is listed.
+
+Restore is rollback-recoverable for local domains with durable provider reconciliation, not globally atomic. See [the restore transaction boundary](backup-restore-transaction-boundary.md) and [closure report](validation/2026-10-08-rootark-mission-closure.md).
+
+---
+
+## Historical live snapshot — 2026-10-08 (source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`)
+
+GitHub was queried after PR #115 merged into `Root/main` at `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`. This remains a timestamped historical snapshot, not a claim about the current default branch. The later mission state and exact-SHA validation are recorded in the [2026-10-08 closure validation report](validation/2026-10-08-rootark-mission-closure.md).
 
 ### Open issues and pull requests at source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`
 
@@ -330,7 +394,7 @@ These are independent local execution classifications. None is a publication aut
 
 | Boundary | Classification | Safe evidence | Meaning and next action |
 |---|---|---|---|
-| Linked-worktree Git metadata | `BLOCKED_ENVIRONMENT_LOCAL_GIT_ACL` | `E:\servidor-roadmap\.git` points to `E:\servidor\.git\worktrees\servidor-roadmap`; the common object store is `E:\servidor\.git`. `git worktree list --porcelain` shows no live lock files; `git cat-file -e HEAD` succeeds. Read-only ACL inspection found no deny entry for the active `codexsandboxoffline` account, but metadata/object write behavior remains unsafe to change. | No safe ACL repair was applied because no active-account deny was proven and broad ownership/permission changes are prohibited. Preserve the worktree and classify the write boundary as environment-blocked. |
+| Linked-worktree Git metadata | `BLOCKED_ENVIRONMENT_LOCAL_GIT_ACL` | The linked worktree `.git` file points to the repository common Git metadata store. `git worktree list --porcelain` shows no live lock files; `git cat-file -e HEAD` succeeds. Read-only ACL inspection found no deny entry for the active sandbox account, but metadata/object write behavior remains unsafe to change. | No safe ACL repair was applied because no active-account deny was proven and broad ownership/permission changes are prohibited. Preserve the worktree and classify the write boundary as environment-blocked. |
 | npm install/toolchain | `BLOCKED_TOOLCHAIN_DEPENDENCY_INSTALL` | Node `v24.14.1`, npm `11.11.0`, lockfile version 3 with 378 locked packages, absent `node_modules`, and missing `bcryptjs`, `@aws-sdk/client-s3`, and `better-sqlite3`. DNS resolves `registry.npmjs.org`, but TCP/HTTPS 443 connectivity fails. A disposable cache/install was attempted; `npm.cmd ci` timed out after 120 seconds and did not produce usable dependencies. | The dependency tree is incomplete. This is an environment/network boundary, not a source regression; retry only with a functioning disposable install path. |
 | Native SQLite dependency | `BLOCKED_NATIVE_DEPENDENCY` | The existing continuation evidence records `npm.cmd rebuild better-sqlite3` exiting 0 while package contents remained incomplete and `require()` still failed. | A successful rebuild exit code is insufficient evidence of a usable native binding; do not claim SQLite runtime validation. |
 | npm audit and lockfile repair | `SECURITY_DEPENDENCY_ADVISORY` plus `BLOCKED_ENVIRONMENT_TOOLCHAIN_REPAIR` | The unmerged source baseline audit returned exit 1 with one high GHSA-rgw5-rvv9-x895 advisory in brace-expansion 5.0.8 via archiver -> readdir-glob -> minimatch 10.2.6; PR #50 separately hardens the lockfile to 5.0.9 and its branch audit is clean. | The unmerged source baseline remains advisory-affected; remote CI is confirmed partial and advisory-blocked, while independent provider/browser/production/cryptographic validation remains unconfirmed or blocked. |

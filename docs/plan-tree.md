@@ -5,7 +5,9 @@ Last branch reconciliation: 2026-10-08
 
 Repository: `bielxdh3/root.ark`
 
-Current-state source: the newest dated issue/PR snapshot in [docs/issue-ledger.md](issue-ledger.md). The latest query recorded source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1` on 2026-10-08 UTC after PR #115 merged and before this documentation update is published. It is a point-in-time snapshot, not a claim about the branch after publication; the closure report records the later final SHA and its checks. Older dated sections remain historical evidence.
+The latest recorded GitHub query in [the issue ledger](issue-ledger.md) is after PR #118 merged, at `Root/main` `1c2f7a8b276e63e53555f5de824afc9b7a9aa55e`. At that query PR #116 was still remotely at head `75efa003136c0799cf678fa8ad264076893882d3` on the prior base `14428690bef7c02648fd0be9570aabb17ae6de1a`; its candidate branch was refreshed locally with the PR #118 merge before this follow-up. The issue and PR snapshot is time-scoped, not a claim about later publication or merge state.
+
+The security-correction code and main-push CI work in PRs #101, #103, #114, #115, #99, #117, and #118 are merged. Push Security Regression, CodeQL, default-branch Dependency Review, and Pages passed on exact main SHA `1c2f7a8…`; the test totals and run links are in the issue ledger. Mission closure remains `[PARTIAL]`: the full browser matrix is incomplete, PR #116 still needs publication/review/merge, and the exact final main SHA after that work still needs validation and fresh independent review. Whole restore is locally rollback-recoverable with durable provider reconciliation, not globally atomic.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
@@ -60,7 +62,7 @@ A feature is not `[DONE]` merely because files, routes, UI, or documentation exi
 5. GitHub issues for executable scope.
 6. Historical chat context only as input, never as proof.
 
-The newest issue reconciliation snapshot is `docs/issue-ledger.md` (verified against GitHub 2026-10-08 at source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`). The canonical Phase 11 Issue #6 reconciliation remains historical evidence: `docs/roadmap/phase-11-backlog-reconciliation.md` records `PHASE_11_BACKLOG_RECONCILED` at the accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
+The newest issue reconciliation snapshot is `docs/issue-ledger.md` (queried against GitHub on 2026-10-08 at source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`; point-in-time and superseded by later PR publication/merge). The canonical Phase 11 Issue #6 reconciliation remains historical evidence: `docs/roadmap/phase-11-backlog-reconciliation.md` records `PHASE_11_BACKLOG_RECONCILED` at the accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
 
 Master Phase 0-16 ledger and independent local blocker taxonomy: `docs/issue-ledger.md`. The governing continuation supplies the original meanings for all phases; local statuses and evidence are reconciled there without converting design or historical evidence into acceptance.
 
