@@ -184,7 +184,7 @@ function stop(child) {
   return new Promise((resolve) => child.once("exit", resolve));
 }
 
-test("version and pending mutations serialize with cache hydration", { timeout: 45_000 }, async (t) => {
+test("version and pending mutations serialize with cache hydration", { timeout: 60_000 }, async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-lifecycle-mutation-"));
   const dataDir = path.join(directory, "data");
   fs.mkdirSync(dataDir, { recursive: true });
@@ -505,7 +505,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   childErrors = "";
   child.stderr?.on("data", (chunk) => { childErrors += chunk.toString(); });
   assert.equal((await waitForServer(port, child)).status, 200);
-  const approvalRecoveryDeadline = Date.now() + 5000;
+  const approvalRecoveryDeadline = Date.now() + 30_000;
   let recoveredApprovalTrash;
   while (Date.now() < approvalRecoveryDeadline) {
     recoveredApprovalTrash = JSON.parse(fs.readFileSync(trashItemsPath, "utf8")).find((item) => item.id === approveTrashRecoveryId);

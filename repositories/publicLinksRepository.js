@@ -1,6 +1,10 @@
 const { getDb } = require("../db");
 const { ensureFolderId, ensureRootFolder, jsonStringify, nowIso, safeJsonParse, basename } = require("./repositoryUtils");
 
+function isPublicLinkViewerId(viewerId) {
+  return typeof viewerId === "string" && /^[a-f0-9]{32}$/.test(viewerId);
+}
+
 function rowToLink(row) {
   const metadata = safeJsonParse(row.metadata_json, {});
   return {
@@ -79,8 +83,16 @@ function savePublicLinks(entries = {}, options = {}) {
       for (const viewers of [existingLink?.activeViewers, link.activeViewers]) {
         if (!viewers || typeof viewers !== "object") continue;
         for (const [viewerId, viewer] of Object.entries(viewers)) {
+          if (!isPublicLinkViewerId(viewerId)) continue;
           const viewerExpiresAt = new Date(viewer?.expiresAt).getTime();
-          if (Number.isFinite(viewerExpiresAt) && viewerExpiresAt > Date.now()) activeViewers[viewerId] = viewer;
+          if (Number.isFinite(viewerExpiresAt) && viewerExpiresAt > Date.now()) {
+            const previous = activeViewers[viewerId];
+            activeViewers[viewerId] = {
+              ...previous,
+              ...viewer,
+              ...(previous?.downloadCounted === true || viewer?.downloadCounted === true ? { downloadCounted: true } : {}),
+            };
+          }
         }
       }
       const mergedLink = {
@@ -221,9 +233,13 @@ function consumePublicLinkQuota(token, options = {}) {
 
       link.views = views + 1;
       link.lastViewedAt = now;
-      if (options.viewer?.id && options.viewer?.expiresAt) {
+      if (isPublicLinkViewerId(options.viewer?.id) && options.viewer?.expiresAt) {
         const viewers = link.activeViewers && typeof link.activeViewers === "object" ? link.activeViewers : {};
         for (const [viewerId, viewer] of Object.entries(viewers)) {
+          if (!isPublicLinkViewerId(viewerId)) {
+            delete viewers[viewerId];
+            continue;
+          }
           const viewerExpiresAt = new Date(viewer?.expiresAt).getTime();
           if (!Number.isFinite(viewerExpiresAt) || viewerExpiresAt <= Date.now()) delete viewers[viewerId];
         }
@@ -238,11 +254,27 @@ function consumePublicLinkQuota(token, options = {}) {
     } else {
       const downloads = Number(link.downloads) || 0;
       const maxDownloads = Number(link.maxDownloads) || 0;
+      const downloadViewerId = isPublicLinkViewerId(options.downloadViewerId) ? options.downloadViewerId : "";
+      const viewers = link.activeViewers && typeof link.activeViewers === "object" ? link.activeViewers : {};
+      const downloadViewer = downloadViewerId && Object.prototype.hasOwnProperty.call(viewers, downloadViewerId)
+        ? viewers[downloadViewerId]
+        : null;
+      const viewerExpiresAt = new Date(downloadViewer?.expiresAt).getTime();
+      const activeDownloadViewer = downloadViewerId && Number.isFinite(viewerExpiresAt) && viewerExpiresAt > Date.now()
+        ? downloadViewer
+        : null;
+      if (activeDownloadViewer?.downloadCounted) {
+        return { status: "ok", link, alreadyConsumed: true };
+      }
       if (process.env.NODE_ENV === "test" && typeof options.afterQuotaRead === "function") options.afterQuotaRead();
       if (maxDownloads > 0 && downloads >= maxDownloads) return { status: "limit", limit: "downloads" };
 
       link.downloads = downloads + 1;
       link.lastDownloadedAt = now;
+      if (activeDownloadViewer) {
+        activeDownloadViewer.downloadCounted = true;
+        link.activeViewers = viewers;
+      }
       db.prepare("UPDATE public_links SET metadata_json = ? WHERE token = ? AND revoked_at IS NULL")
         .run(jsonStringify(link), token);
     }

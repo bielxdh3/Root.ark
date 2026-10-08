@@ -41,3 +41,31 @@ test("committed restore cleanup failure returns restart-required service unavail
   assert.equal(auditEvents.at(-1)[5].error, "restore_recovery_pending");
   assert.equal(JSON.stringify(auditEvents.at(-1)[5]).includes("injected staging cleanup failure"), false);
 });
+
+test("backup HEAD metadata checks do not create download audit events", async () => {
+  let downloadHandler;
+  const auditEvents = [];
+  registerBackupRoutes({
+    get(route, ...handlers) {
+      if (route === "/backups/:id/download") downloadHandler = handlers.at(-1);
+    },
+    post() {},
+    delete() {},
+  }, {
+    auditLog(...event) { auditEvents.push(event); },
+    authenticate() {},
+    backupService: {
+      getBackupOrThrow(id) { return { backup: { id, filename: "fixture.zip" }, archivePath: "/fixture.zip" }; },
+    },
+    getAuditActor() { return { username: "fixture-manager" }; },
+    requireBackupAccess() {},
+    restoreService: {},
+    waitForRequestQuiescence: async () => true,
+  });
+
+  const response = { download(path, filename) { this.downloaded = { path, filename }; } };
+  await downloadHandler({ method: "HEAD", params: { id: "fixture-id" } }, response);
+  assert.deepEqual(auditEvents, [], "HEAD inspects the resource without claiming that bytes were downloaded");
+  await downloadHandler({ method: "GET", params: { id: "fixture-id" } }, response);
+  assert.equal(auditEvents.filter((event) => event[0] === "backup.downloaded").length, 1, "GET still records backup downloads");
+});

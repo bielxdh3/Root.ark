@@ -64,7 +64,7 @@ const { registerGroupRoutes } = require("./src/routes/groups");
 const { createAuthenticate, createRealtimeAuthenticator, getClientIp, getExpectedOrigin, parseCookies } = require("./src/middlewares/auth");
 const { parseTrustedProxies } = require("./src/middlewares/trustedProxies");
 const { createRequirePermission } = require("./src/middlewares/permissions");
-const { validateTotpPolicy } = require("./src/services/totpPolicy");
+const { isTotpRequired, validateTotpPolicy } = require("./src/services/totpPolicy");
 const { getDeploymentReadiness, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
 
 const app = express();
@@ -1234,8 +1234,27 @@ function authenticateWebDavRequest(req, res) {
   }
 
   const user = loadUsers().find((entry) => sameUsername(entry.username, username));
-  if (!user || !bcrypt.compareSync(password, user.password)) {
+  if (!user || user.disabled || !bcrypt.compareSync(password, user.password)) {
     return sendWebDavUnauthorized(req, res, "invalid_credentials");
+  }
+
+  let totpPolicy;
+  try {
+    totpPolicy = validateTotpPolicy();
+  } catch {
+    auditLog(
+      "webdav.login.failed",
+      getAuditActor(req, "anonymous"),
+      { type: "webdav", id: WEBDAV_PATH },
+      "authenticate",
+      "failure",
+      { reason: "totp_policy_unavailable", method: req.method, path: getSafeWebDavAuditPath(req) }
+    );
+    res.status(503).send("Authentication policy unavailable");
+    return false;
+  }
+  if (user.totpEnabled || isTotpRequired(user, totpPolicy)) {
+    return sendWebDavUnauthorized(req, res, "totp_required");
   }
 
   req.user = {
@@ -1557,11 +1576,20 @@ function getTemporaryExpirationFromBody(body = {}) {
   return new Date(Date.now() + durationMs).toISOString();
 }
 
+function isShareViewerId(viewerId) {
+  return typeof viewerId === "string" && /^[a-f0-9]{32}$/.test(viewerId);
+}
+
 function cleanupShareViewers(link, now = Date.now()) {
   const viewers = link.activeViewers && typeof link.activeViewers === "object" ? link.activeViewers : {};
   let changed = false;
 
   for (const [viewerId, viewer] of Object.entries(viewers)) {
+    if (!isShareViewerId(viewerId)) {
+      delete viewers[viewerId];
+      changed = true;
+      continue;
+    }
     const expiresAt = new Date(viewer?.expiresAt).getTime();
     if (!Number.isFinite(expiresAt) || expiresAt <= now) {
       delete viewers[viewerId];
@@ -1590,7 +1618,7 @@ function setShareViewerCookie(req, res, token, viewerId, expiresAt) {
   const maxAge = Math.max(1, Math.min(SHARE_VIEW_SESSION_MS, expiresAt - Date.now()));
   res.cookie(`rootark_share_${token}`, viewerId, {
     httpOnly: true,
-    sameSite: "lax",
+    sameSite: "strict",
     secure: req.secure,
     maxAge,
   });
@@ -1847,6 +1875,7 @@ function renderPublicSharePage(token) {
       const passwordForm = document.getElementById("sharePasswordForm");
       const passwordInput = document.getElementById("sharePassword");
       const passwordButton = document.getElementById("passwordButton");
+      const downloadButton = document.getElementById("downloadButton");
       const meta = document.getElementById("meta");
       const previewButton = document.getElementById("previewButton");
       const previewBox = document.getElementById("previewBox");
@@ -1864,6 +1893,7 @@ function renderPublicSharePage(token) {
       }
 
       function renderAccess(data) {
+        passwordInput.value = "";
         passwordBox.classList.add("hidden");
         contentBox.classList.remove("hidden");
         fileName.textContent = data.fileName || "Arquivo compartilhado";
@@ -1875,6 +1905,40 @@ function renderPublicSharePage(token) {
           data.remainingDownloads !== null ? '<span class="pill">' + data.remainingDownloads + ' downloads restantes</span>' : '<span class="pill">Downloads ilimitados</span>'
         ].filter(Boolean).join("");
         previewButton.hidden = !data.canPreview;
+        downloadButton.disabled = data.remainingDownloads === 0;
+      }
+
+      async function refreshShareAccess() {
+        downloadButton.disabled = true;
+        status.textContent = "Atualizando os limites de acesso...";
+        try {
+          const response = await fetch("/share/" + token + "/password", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ password: "" })
+          });
+          const data = await response.json();
+          if (!response.ok) {
+            if (response.status === 401 && data.passwordRequired) {
+              fileName.textContent = "Link protegido";
+              status.textContent = "A sessao do link expirou. Informe a senha novamente.";
+              passwordInput.value = "";
+              passwordBox.classList.remove("hidden");
+              contentBox.classList.add("hidden");
+              previewBox.replaceChildren();
+              delete previewBox.dataset.loaded;
+              previewBox.classList.add("hidden");
+              passwordInput.focus();
+              return;
+            }
+            throw new Error("Share access refresh failed");
+          }
+          renderAccess(data);
+          if (data.remainingDownloads === 0) status.textContent = "Limite de downloads atingido.";
+        } catch {
+          downloadButton.disabled = true;
+          status.textContent = "Nao foi possivel atualizar os limites. Recarregue a pagina.";
+        }
       }
 
       async function accessShare(password = "") {
@@ -1896,8 +1960,10 @@ function renderPublicSharePage(token) {
             status.textContent = password
               ? "Nao foi possivel validar a senha. Verifique se ela esta correta e tente novamente."
               : "Informe a senha para continuar.";
+            passwordInput.value = "";
             passwordBox.classList.remove("hidden");
             contentBox.classList.add("hidden");
+            passwordInput.focus();
             return;
           }
 
@@ -1910,6 +1976,10 @@ function renderPublicSharePage(token) {
           }
 
           renderAccess(data);
+          if (password) {
+            const nextControl = data.canPreview ? previewButton : downloadButton;
+            if (!nextControl.hidden && !nextControl.disabled) nextControl.focus();
+          }
         } catch {
           fileName.textContent = "Validacao indisponivel";
           status.textContent = "Nao foi possivel validar o link. Tente novamente ou recarregue a pagina.";
@@ -1928,8 +1998,28 @@ function renderPublicSharePage(token) {
       previewButton.addEventListener("click", () => {
         previewBox.classList.toggle("hidden");
         if (!previewBox.dataset.loaded) {
-          previewBox.innerHTML = '<iframe src="/share/' + token + '/preview" title="Preview"></iframe>';
+          const previewFrame = document.createElement("iframe");
+          previewFrame.title = "Preview";
+          previewFrame.name = "rootark-share-preview-" + token;
+          previewFrame.addEventListener("load", () => {
+            try {
+              if (previewFrame.contentDocument?.location?.href === "about:blank") return;
+              if (previewFrame.contentDocument?.body?.textContent?.trim() === "Abra a pagina do compartilhamento novamente.") {
+                previewBox.replaceChildren();
+                delete previewBox.dataset.loaded;
+                previewBox.classList.add("hidden");
+              }
+            } catch {}
+            refreshShareAccess();
+          });
+          const previewForm = document.createElement("form");
+          previewForm.method = "POST";
+          previewForm.action = "/share/" + token + "/preview";
+          previewForm.target = previewFrame.name;
+          previewForm.hidden = true;
+          previewBox.replaceChildren(previewFrame, previewForm);
           previewBox.dataset.loaded = "1";
+          previewForm.requestSubmit();
         }
       });
 
@@ -2029,10 +2119,11 @@ function getPublicShareCanPreview(fileName) {
   return ["image", "pdf", "audio", "video"].includes(getPreviewKind(fileName));
 }
 
-function isShareViewerActive(req, token, link) {
+function getActiveShareViewer(req, token, link) {
   const { viewers } = cleanupShareViewers(link);
   const viewerId = getCookieValue(req, `rootark_share_${token}`);
-  return Boolean(viewerId && viewers[viewerId]);
+  if (!isShareViewerId(viewerId) || !Object.prototype.hasOwnProperty.call(viewers, viewerId)) return null;
+  return { id: viewerId, viewer: viewers[viewerId] };
 }
 
 function createShareViewer(req, res, token, link, expiresAt) {
@@ -2075,8 +2166,21 @@ function requireSameOriginPublicShareMutation(req, res, next) {
   return next();
 }
 
-function getShareAccessCookieRequired(link) {
-  return hasSharePassword(link) || (Number(link.maxViews) || 0) > 0;
+function requireSameOriginPublicSharePreview(req, res, next) {
+  const fetchSite = String(req.headers["sec-fetch-site"] || "").toLowerCase();
+  const origin = req.headers.origin;
+  if ((!fetchSite && !origin)
+    || (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none")
+    || (origin && origin !== getExpectedOrigin(req, app.get("trust proxy fn")))) {
+    return res.status(403).type("text/plain").send("Origem negada");
+  }
+  return next();
+}
+
+function getShareAccessCookieRequired(link, countDownloadOncePerViewer = false) {
+  return hasSharePassword(link)
+    || (Number(link.maxViews) || 0) > 0
+    || (countDownloadOncePerViewer && (Number(link.maxDownloads) || 0) > 0);
 }
 
 async function resolveShareAccess(req, res, token, options = {}) {
@@ -2103,17 +2207,22 @@ async function resolveShareAccess(req, res, token, options = {}) {
   }
 
   const limits = getShareLimitState(link);
-  const viewerAlreadyActive = isShareViewerActive(req, token, link);
+  const activeShareViewer = getActiveShareViewer(req, token, link);
+  const viewerAlreadyActive = Boolean(activeShareViewer);
+  let downloadAlreadyCounted = Boolean(options.countDownloadOncePerViewer && activeShareViewer?.viewer.downloadCounted);
   if (options.countView && !viewerAlreadyActive && limits.maxViews > 0 && limits.views >= limits.maxViews) {
     logShareAudit(req, "share.limit_reached", token, link, "view", "failure", { limit: "views" });
     return { status: 410, error: "Link indisponivel." };
   }
 
-  if (options.requireViewer && getShareAccessCookieRequired(link) && !viewerAlreadyActive && !options.countView) {
+  if (options.requireViewer && getShareAccessCookieRequired(link, options.countDownloadOncePerViewer) && !viewerAlreadyActive && !options.countView) {
+    return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
+  }
+  if (options.requireDownloadCountedViewer && (Number(link.maxDownloads) || 0) > 0 && !downloadAlreadyCounted) {
     return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
   }
 
-  if (options.countDownload && limits.maxDownloads > 0 && limits.downloads >= limits.maxDownloads) {
+  if (options.countDownload && !downloadAlreadyCounted && limits.maxDownloads > 0 && limits.downloads >= limits.maxDownloads) {
     logShareAudit(req, "share.limit_reached", token, link, "download", "failure", { limit: "downloads" });
     return { status: 410, error: "Link indisponivel." };
   }
@@ -2138,23 +2247,31 @@ async function resolveShareAccess(req, res, token, options = {}) {
   if (currentPasswordHash && !hasValidSharePasswordSession(req, token, currentLink) && currentPasswordHash !== verifiedPasswordHash) {
     return { status: 401, error: "Senha obrigatoria.", passwordRequired: true };
   }
+  if (options.requirePreview && !getPublicShareCanPreview(fileInfo.fileName)) {
+    return { status: 415, error: "Preview indisponivel" };
+  }
   const currentLimits = getShareLimitState(currentLink);
-  const currentViewerAlreadyActive = isShareViewerActive(req, token, currentLink);
+  const currentShareViewer = getActiveShareViewer(req, token, currentLink);
+  const currentViewerAlreadyActive = Boolean(currentShareViewer);
+  downloadAlreadyCounted = Boolean(options.countDownloadOncePerViewer && currentShareViewer?.viewer.downloadCounted);
   if (options.countView && !currentViewerAlreadyActive && currentLimits.maxViews > 0 && currentLimits.views >= currentLimits.maxViews) {
     logShareAudit(req, "share.limit_reached", token, currentLink, "view", "failure", { limit: "views" });
     return { status: 410, error: "Link indisponivel." };
   }
-  if (options.requireViewer && getShareAccessCookieRequired(currentLink) && !currentViewerAlreadyActive && !options.countView) {
+  if (options.requireViewer && getShareAccessCookieRequired(currentLink, options.countDownloadOncePerViewer) && !currentViewerAlreadyActive && !options.countView) {
     return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
   }
-  if (options.countDownload && currentLimits.maxDownloads > 0 && currentLimits.downloads >= currentLimits.maxDownloads) {
+  if (options.requireDownloadCountedViewer && (Number(currentLink.maxDownloads) || 0) > 0 && !downloadAlreadyCounted) {
+    return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
+  }
+  if (options.countDownload && !downloadAlreadyCounted && currentLimits.maxDownloads > 0 && currentLimits.downloads >= currentLimits.maxDownloads) {
     logShareAudit(req, "share.limit_reached", token, currentLink, "download", "failure", { limit: "downloads" });
     return { status: 410, error: "Link indisponivel." };
   }
 
   let databaseViewReserved = false;
   let databaseDownloadReserved = false;
-  const reserveDatabaseShareQuota = (kind, viewer) => {
+  const reserveDatabaseShareQuota = (kind, viewer, downloadViewerId) => {
     const reservation = publicLinksRepository.consumePublicLinkQuota(token, {
       kind,
       expectedFileName: currentLink.fileName,
@@ -2162,6 +2279,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
       expectedPasswordHash: currentLink.passwordHash || currentLink.password_hash || null,
       ...(shouldReadJsonFallback() ? { fallbackLinks: { [token]: currentLink } } : {}),
       ...(viewer ? { viewer } : {}),
+      ...(downloadViewerId ? { downloadViewerId } : {}),
     });
     if (reservation.status !== "ok") {
       if (reservation.status === "limit") {
@@ -2180,6 +2298,9 @@ async function resolveShareAccess(req, res, token, options = {}) {
 
     currentLink = reservation.link;
     currentLinks[token] = currentLink;
+    if (kind === "download") {
+      downloadAlreadyCounted = Boolean(reservation.alreadyConsumed);
+    }
     if (shouldWriteLegacyJson()) fs.writeFileSync(PUBLIC_LINKS_FILE, JSON.stringify(currentLinks, null, 2));
     broadcastDataChanged("shares");
     return null;
@@ -2195,12 +2316,6 @@ async function resolveShareAccess(req, res, token, options = {}) {
     databaseViewReserved = true;
   }
 
-  if (shouldUseDatabase() && options.countDownload) {
-    const failure = reserveDatabaseShareQuota("download");
-    if (failure) return failure;
-    databaseDownloadReserved = true;
-  }
-
   if (options.countView && !currentViewerAlreadyActive) {
     if (!databaseViewReserved) {
       createShareViewer(req, res, token, currentLink, currentExpiresAt);
@@ -2210,17 +2325,45 @@ async function resolveShareAccess(req, res, token, options = {}) {
     logShareAudit(req, "share.opened", token, currentLink, "opened", "success");
   }
 
-  if (options.countDownload) {
+  const reserveDownloadQuota = () => {
+    if (!options.countDownload || downloadAlreadyCounted) return null;
+    if (shouldUseDatabase()) {
+      const failure = reserveDatabaseShareQuota(
+        "download",
+        null,
+        options.countDownloadOncePerViewer ? currentShareViewer?.id : undefined
+      );
+      if (failure) return failure;
+      databaseDownloadReserved = true;
+    }
     if (!databaseDownloadReserved) {
       currentLink.downloads = (Number(currentLink.downloads) || 0) + 1;
       currentLink.lastDownloadedAt = new Date().toISOString();
+      if (options.countDownloadOncePerViewer && currentShareViewer) {
+        currentShareViewer.viewer.downloadCounted = true;
+        currentLink.activeViewers = currentLink.activeViewers || {};
+      }
       currentLinks[token] = currentLink;
       savePublicLinks(currentLinks);
     }
+    if (downloadAlreadyCounted) return null;
+    downloadAlreadyCounted = true;
     logShareAudit(req, "share.downloaded", token, currentLink, "downloaded", "success");
+    return null;
+  };
+
+  if (options.countDownload && !options.deferDownloadReservation) {
+    const failure = reserveDownloadQuota();
+    if (failure) return failure;
   }
 
-  return { link: currentLink, fileInfo, limits: getShareLimitState(currentLink), expiresAt: currentExpiresAt };
+  return {
+    link: currentLink,
+    fileInfo,
+    limits: getShareLimitState(currentLink),
+    expiresAt: currentExpiresAt,
+    ...(options.deferDownloadReservation ? { reserveDownload: reserveDownloadQuota } : {}),
+  };
 }
 
 function getSharePublicPayload(link, fileInfo, limits) {
@@ -3332,6 +3475,21 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
     });
     res.end();
     return;
+  }
+
+  if (typeof options.beforeSend === "function") {
+    let rejection;
+    try {
+      rejection = options.beforeSend();
+    } catch {
+      try { fs.closeSync(fd); } catch {}
+      return res.status(500).send("Erro ao autorizar transmissao");
+    }
+    if (rejection) {
+      try { fs.closeSync(fd); } catch {}
+      if (typeof options.onBeforeSendReject === "function") return options.onBeforeSendReject(rejection);
+      return res.status(rejection.status || 403).type("text/plain").send(rejection.error || "Link indisponivel.");
+    }
   }
 
   const commonHeaders = {
@@ -6201,16 +6359,18 @@ app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
-  logAnalyticsEvent("download", {
-    filename: name,
-    downloadedBy: req.user.username,
-    folderId: folder.id,
-    folderName: folder.name,
-  });
-  auditLog("file.download", getAuditActor(req), { type: "file", id: name }, "downloaded", "success", {
-    folderId: folder.id,
-    folderName: folder.name,
-  });
+  if (req.method !== "HEAD") {
+    logAnalyticsEvent("download", {
+      filename: name,
+      downloadedBy: req.user.username,
+      folderId: folder.id,
+      folderName: folder.name,
+    });
+    auditLog("file.download", getAuditActor(req), { type: "file", id: name }, "downloaded", "success", {
+      folderId: folder.id,
+      folderName: folder.name,
+    });
+  }
 
   sendOptimizedFile(req, res, filePath, name, "attachment");
 });
@@ -7595,11 +7755,13 @@ async function sendWebDavFile(req, res, segments, headOnly = false) {
   if (res.headersSent) return;
   if (!target || target.type !== "file") return res.status(target?.status || 404).send(target?.message || "Not found");
 
-  auditLog("webdav.download", getAuditActor(req), { type: "file", id: target.name }, "download", "success", {
-    folderId: target.folder.id,
-    method: req.method,
-    path: getSafeWebDavAuditPath(req),
-  });
+  if (!headOnly) {
+    auditLog("webdav.download", getAuditActor(req), { type: "file", id: target.name }, "download", "success", {
+      folderId: target.folder.id,
+      method: req.method,
+      path: getSafeWebDavAuditPath(req),
+    });
+  }
 
   if (headOnly) {
     res.setHeader("Content-Type", getMimeType(target.name));
@@ -9276,6 +9438,7 @@ app.post("/share/:token/view", shareRateLimit, requireSameOriginPublicShareMutat
   res.json({
     ...getSharePublicPayload(access.link, access.fileInfo, access.limits),
     url: `/share/${shareToken}/file`,
+    urlMethod: "POST",
   });
 });
 
@@ -9288,24 +9451,51 @@ app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareM
   const access = await resolveShareAccess(req, res, shareToken, {
     requireViewer: true,
     countDownload: true,
+    deferDownloadReservation: true,
   });
   if (access.error) return res.status(access.status || 400).type("html").send(getShareFailurePage(access.error));
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "attachment", {
     cacheControl: "private, max-age=600",
+    beforeSend: access.reserveDownload,
+    onBeforeSendReject: (failure) => res.status(failure.status || 400).type("html").send(getShareFailurePage(failure.error)),
   });
 });
 
-app.get("/share/:token/preview", shareRateLimit, async (req, res) => {
+app.get("/share/:token/preview", shareRateLimit, requireSameOriginPublicSharePreview, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
+  if (req.method === "HEAD") return res.setHeader("Allow", "GET, POST").status(405).type("text/plain").send("Metodo nao permitido");
 
-  const access = await resolveShareAccess(req, res, shareToken, { requireViewer: true });
+  const access = await resolveShareAccess(req, res, shareToken, {
+    requireViewer: true,
+    requirePreview: true,
+    countDownloadOncePerViewer: true,
+    requireDownloadCountedViewer: true,
+  });
   if (access.error) return res.status(access.status || 400).send(access.error);
-  if (!getPublicShareCanPreview(access.fileInfo.fileName)) return res.status(415).send("Preview indisponivel");
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "inline", {
     cacheControl: "private, max-age=600",
+  });
+});
+
+app.post("/share/:token/preview", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
+  const shareToken = validateShareToken(req.params.token);
+  if (!shareToken) return res.status(404).send("Link indisponivel.");
+
+  const access = await resolveShareAccess(req, res, shareToken, {
+    requireViewer: true,
+    requirePreview: true,
+    countDownload: true,
+    countDownloadOncePerViewer: true,
+    deferDownloadReservation: true,
+  });
+  if (access.error) return res.status(access.status || 400).send(access.error);
+
+  sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "inline", {
+    cacheControl: "private, max-age=600",
+    beforeSend: access.reserveDownload,
   });
 });
 
@@ -9328,15 +9518,23 @@ app.get("/share/:token/qr", shareRateLimit, async (req, res) => {
   }
 });
 
-app.get("/share/:token/file", shareRateLimit, async (req, res) => {
+app.get("/share/:token/file", shareRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).type("text/plain").send("Metodo nao permitido"));
+
+app.post("/share/:token/file", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
 
-  const access = await resolveShareAccess(req, res, shareToken, { requireViewer: true });
+  const access = await resolveShareAccess(req, res, shareToken, {
+    requireViewer: true,
+    countDownload: true,
+    deferDownloadReservation: true,
+  });
   if (access.error) return res.status(access.status || 400).send(access.error);
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "inline", {
     cacheControl: "private, max-age=600",
+    beforeSend: access.reserveDownload,
+    onBeforeSendReject: (failure) => res.status(failure.status || 400).send(failure.error),
   });
 });
 

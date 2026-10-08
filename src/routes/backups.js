@@ -41,9 +41,11 @@ function registerBackupRoutes(app, context) {
   app.get("/backups/:id/download", authenticate, requireBackupAccess, (req, res) => {
     try {
       const { backup, archivePath } = backupService.getBackupOrThrow(req.params.id);
-      auditLog("backup.downloaded", getAuditActor(req), { type: "backup", id: backup.id }, "downloaded", "success", {
-        filename: backup.filename,
-      });
+      if (req.method !== "HEAD") {
+        auditLog("backup.downloaded", getAuditActor(req), { type: "backup", id: backup.id }, "downloaded", "success", {
+          filename: backup.filename,
+        });
+      }
       res.download(archivePath, backup.filename);
     } catch (error) {
       res.status(404).json({ error: error.message });
