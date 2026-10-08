@@ -212,6 +212,7 @@ const cloudStorage = createCloudStorage({
   s3: { bucket: process.env.AWS_S3_BUCKET, region: process.env.AWS_REGION, endpoint: process.env.AWS_ENDPOINT_URL, forcePathStyle: process.env.AWS_FORCE_PATH_STYLE === "true" },
   gdrive: { folderId: process.env.GOOGLE_DRIVE_FOLDER_ID, credentials: process.env.GOOGLE_SERVICE_ACCOUNT_JSON, credentialsPath: process.env.GOOGLE_APPLICATION_CREDENTIALS },
 });
+const guardedCloudStorage = restoreProviderOrphans.guardProvider(cloudStorage);
 const cloudFileLifecycleLock = createFileLifecycleLock({
   directory: resolveRuntimePath("data", ".rootark-cloud-file-locks"),
 });
@@ -233,7 +234,7 @@ const cloudUploadMutationQueue = createCloudTempMutationQueue({
   remove: deleteFileFromCloud,
   isEnabled: isCloudStorageEnabled,
 });
-backupService.setCloudStorage(cloudStorage);
+backupService.setCloudStorage(guardedCloudStorage);
 restoreService.setCloudStorage(cloudStorage);
 registerReadinessRoutes(app, {
   getReadiness: () => getDeploymentReadiness({
@@ -284,14 +285,14 @@ function isCloudStorageEnabled() { return cloudStorage.enabled(); }
 function getCloudStorageStatus() { return cloudStorage.status(); }
 function getCloudKey(folderId = ROOT_FOLDER_ID, fileName = "", area = "uploads") { return cloudStorage.key(folderId, fileName, area); }
 async function uploadFileToCloud(localPath, folderId, fileName, area = "uploads") {
-  const result = await cloudStorage.upload(localPath, folderId, fileName, area);
+  const result = await guardedCloudStorage.upload(localPath, folderId, fileName, area);
   if (result) await restoreProviderOrphans.clear(folderId, fileName, area, cloudStorage);
   return result;
 }
-async function downloadFileFromCloud(folderId, fileName, localPath, area = "uploads", canPublish) { return cloudStorage.download(folderId, fileName, localPath, area, canPublish); }
-async function deleteFileFromCloud(folderId, fileName, area = "uploads") { return cloudStorage.remove(folderId, fileName, area); }
-async function deleteCloudPrefix(prefix) { return cloudStorage.removePrefix(prefix); }
-async function listCloudFiles(folderId, area = "uploads") { return cloudStorage.list(folderId, area); }
+async function downloadFileFromCloud(folderId, fileName, localPath, area = "uploads", canPublish) { return guardedCloudStorage.download(folderId, fileName, localPath, area, canPublish); }
+async function deleteFileFromCloud(folderId, fileName, area = "uploads") { return guardedCloudStorage.remove(folderId, fileName, area); }
+async function deleteCloudPrefix(prefix) { return guardedCloudStorage.removePrefix(prefix); }
+async function listCloudFiles(folderId, area = "uploads") { return guardedCloudStorage.list(folderId, area); }
 
 async function syncFolderCacheFromCloud(folderId, area = "uploads") {
   if (!isCloudStorageEnabled()) return;
@@ -9936,16 +9937,27 @@ setInterval(() => {
 setInterval(() => { void processPendingCloudTrashItems(); }, 60 * 1000);
 setInterval(() => { void processPendingCloudRestoreSync().catch(() => {}); }, 60 * 1000);
 setInterval(() => { void restoreRequestGate.run(() => cleanupIncomingUploads()); }, 60 * 1000);
-server.listen(PORT, () => {
-  try {
-    if (startupRestoreCoordinator) {
-      const acknowledgement = restoreService.acknowledgeWholeRestoreInstance();
-      console.log(`[restore] startup acknowledgement ${acknowledgement.acknowledgedInstances}/${acknowledgement.requiredInstances}`);
+const listenForRequests = () => {
+  server.listen(PORT, () => {
+    try {
+      if (startupRestoreCoordinator) {
+        const acknowledgement = restoreService.acknowledgeWholeRestoreInstance();
+        console.log(`[restore] startup acknowledgement ${acknowledgement.acknowledgedInstances}/${acknowledgement.requiredInstances}`);
+      }
+    } catch (error) {
+      console.error("[restore] startup acknowledgement failed:", sanitizeLogValue(error.message));
+    } finally {
+      startupRestoreLease();
     }
-  } catch (error) {
-    console.error("[restore] startup acknowledgement failed:", sanitizeLogValue(error.message));
-  } finally {
+    console.log(`Servidor rodando em http://localhost:${PORT}`);
+  });
+};
+if (restoreProviderOrphans.isInventoryUnknown() && cloudStorage.enabled()) {
+  void restoreService.reconcileUnknownProviderInventory().then(listenForRequests).catch((error) => {
     startupRestoreLease();
-  }
-  console.log(`Servidor rodando em http://localhost:${PORT}`);
-});
+    console.error("[restore] provider inventory reconciliation failed; startup blocked:", sanitizeLogValue(error.message));
+    process.exit(1);
+  });
+} else {
+  listenForRequests();
+}

@@ -87,6 +87,7 @@ test("restore provider reconciliation waits for a file mutation and uploads the 
         await userMutationReleased;
       }
       remoteObject = snapshot;
+      return { provider: "s3" };
     },
   };
 
@@ -160,7 +161,7 @@ test("overlapping provider uploads and sibling retry/terminal transitions are lo
   let releaseA;
   const gate = new Promise((resolve) => { releaseA = resolve; });
   const calls = [];
-  const provider = { enabled: () => true, upload: async (filePath) => { calls.push(path.basename(filePath)); if (path.basename(filePath) === "a.txt") await gate; } };
+  const provider = { enabled: () => true, upload: async (filePath) => { calls.push(path.basename(filePath)); if (path.basename(filePath) === "a.txt") await gate; return { provider: "fixture" }; } };
   const first = restoreService.processRestoreSync({ backupId: saved.id, workerId: "worker-a", clock: { now: () => Date.parse("2026-08-01T00:00:00.000Z") }, uploader: provider });
   await new Promise((resolve) => setImmediate(resolve));
   const second = restoreService.processRestoreSync({ backupId: saved.id, workerId: "worker-b", clock: { now: () => Date.parse("2026-08-01T00:00:00.000Z") }, uploader: provider });

@@ -132,6 +132,33 @@ test("missing restore provider suppression policy fails closed in-process and af
   }
 });
 
+test("unknown restore inventory keeps disabled local storage available while guarding enabled providers", () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-local-guard-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const policy = require(${JSON.stringify(servicePath)});
+      const { createCloudStorage } = require(${JSON.stringify(path.resolve(__dirname, "../services/cloudStorage.js"))});
+      (async () => {
+        policy.initialize();
+        await policy.markInventoryUnknown("123e4567-e89b-42d3-a456-426614174000");
+        const local = policy.guardProvider(createCloudStorage({ provider: "local" }));
+        assert.equal(local.enabled(), false);
+        assert.deepEqual(await local.list("root"), []);
+        assert.equal(await local.upload(path.join(process.cwd(), "missing-upload.txt"), "root", "local.txt"), null);
+        const cloud = policy.guardProvider(createCloudStorage({ provider: "s3", s3: { bucket: "fixture" } }));
+        await assert.rejects(cloud.list("root"), { code: "PROVIDER_INVENTORY_UNKNOWN" });
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("provider suppression initialization creates a fail-closed marker and preserves legacy policy", () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-initialize-"));
   try {
