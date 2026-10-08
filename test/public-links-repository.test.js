@@ -71,6 +71,48 @@ test("SQLite enforces public share view and download limits across concurrent pr
 
   const repositoryPath = path.join(__dirname, "..", "repositories", "publicLinksRepository.js");
   const repository = require("../repositories/publicLinksRepository");
+  const viewerToken = "a".repeat(48);
+  const viewerId = "b".repeat(32);
+  const viewerNow = new Date().toISOString();
+  repository.savePublicLinks({ [viewerToken]: {
+    fileName: "viewer-quota.txt",
+    folderId: "root",
+    createdAt: viewerNow,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    maxViews: 0,
+    views: 0,
+    maxDownloads: 2,
+    downloads: 0,
+    activeViewers: {},
+  } });
+  repository.consumePublicLinkQuota(viewerToken, {
+    kind: "view",
+    expectedFileName: "viewer-quota.txt",
+    expectedFolderId: "root",
+    expectedPasswordHash: null,
+    viewer: { id: viewerId, createdAt: viewerNow, expiresAt: new Date(Date.now() + 60_000).toISOString() },
+  });
+  const viewerSnapshot = repository.loadPublicLinks();
+  const firstViewerDownload = repository.consumePublicLinkQuota(viewerToken, {
+    kind: "download",
+    expectedFileName: "viewer-quota.txt",
+    expectedFolderId: "root",
+    expectedPasswordHash: null,
+    downloadViewerId: viewerId,
+  });
+  assert.equal(firstViewerDownload.status, "ok");
+  repository.savePublicLinks(viewerSnapshot);
+  const repeatedViewerDownload = repository.consumePublicLinkQuota(viewerToken, {
+    kind: "download",
+    expectedFileName: "viewer-quota.txt",
+    expectedFolderId: "root",
+    expectedPasswordHash: null,
+    downloadViewerId: viewerId,
+  });
+  assert.equal(repeatedViewerDownload.status, "ok");
+  assert.equal(repeatedViewerDownload.alreadyConsumed, true, "a stale snapshot cannot clear the per-viewer download marker");
+  assert.equal(repeatedViewerDownload.link.downloads, 1, "retries by the same viewer do not consume quota twice");
+
   for (const kind of ["view", "download"]) {
     const token = kind === "view" ? "d".repeat(48) : "e".repeat(48);
     const now = new Date().toISOString();

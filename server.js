@@ -2000,7 +2000,16 @@ function renderPublicSharePage(token) {
         if (!previewBox.dataset.loaded) {
           const previewFrame = document.createElement("iframe");
           previewFrame.title = "Preview";
-          previewFrame.addEventListener("load", refreshShareAccess);
+          previewFrame.addEventListener("load", () => {
+            try {
+              if (previewFrame.contentDocument?.body?.textContent?.trim() === "Abra a pagina do compartilhamento novamente.") {
+                previewBox.replaceChildren();
+                delete previewBox.dataset.loaded;
+                previewBox.classList.add("hidden");
+              }
+            } catch {}
+            refreshShareAccess();
+          });
           previewFrame.src = "/share/" + token + "/preview";
           previewBox.replaceChildren(previewFrame);
           previewBox.dataset.loaded = "1";

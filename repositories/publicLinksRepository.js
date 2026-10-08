@@ -85,7 +85,14 @@ function savePublicLinks(entries = {}, options = {}) {
         for (const [viewerId, viewer] of Object.entries(viewers)) {
           if (!isPublicLinkViewerId(viewerId)) continue;
           const viewerExpiresAt = new Date(viewer?.expiresAt).getTime();
-          if (Number.isFinite(viewerExpiresAt) && viewerExpiresAt > Date.now()) activeViewers[viewerId] = viewer;
+          if (Number.isFinite(viewerExpiresAt) && viewerExpiresAt > Date.now()) {
+            const previous = activeViewers[viewerId];
+            activeViewers[viewerId] = {
+              ...previous,
+              ...viewer,
+              ...(previous?.downloadCounted === true || viewer?.downloadCounted === true ? { downloadCounted: true } : {}),
+            };
+          }
         }
       }
       const mergedLink = {

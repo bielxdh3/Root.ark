@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const bcrypt = require("bcryptjs");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
@@ -272,6 +273,7 @@ async function waitForServer(port) {
 test("public-share audit logs correlate by token digest without storing the bearer token", { timeout: 30_000 }, async (t) => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-share-audit-"));
   const token = crypto.randomBytes(24).toString("hex");
+  const expiredViewerToken = crypto.randomBytes(24).toString("hex");
   const port = await getUnusedPort();
   const dataDir = path.join(sandbox, "data");
   const fileName = "shared-audit-fixture.txt";
@@ -291,6 +293,17 @@ test("public-share audit logs correlate by token digest without storing the bear
       maxViews: 0,
       downloads: 0,
       maxDownloads: 1,
+      viewers: {},
+    },
+    [expiredViewerToken]: {
+      folderId: "root",
+      fileName: previewFileName,
+      passwordHash: bcrypt.hashSync("synthetic-viewer-password", 4),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      views: 0,
+      maxViews: 0,
+      downloads: 0,
+      maxDownloads: 2,
       viewers: {},
     },
   }));
@@ -322,6 +335,11 @@ test("public-share audit logs correlate by token digest without storing the bear
   });
 
   assert.equal((await waitForServer(port)).status, 200);
+  const expiredViewerPreview = await request(port, `/share/${expiredViewerToken}/preview`, "GET", {
+    cookie: `rootark_share_pwd_${expiredViewerToken}=ok`,
+  });
+  assert.equal(expiredViewerPreview.status, 403, "an expired viewer cookie is rejected even while the password session remains valid");
+  assert.equal(expiredViewerPreview.body, "Abra a pagina do compartilhamento novamente.");
   const sharePage = await request(port, `/share/${token}`);
   assert.equal(sharePage.status, 200);
   assert.match(sharePage.body, /<label[^>]*for="sharePassword">Senha do link<\/label>/, "the password field retains its visible label while users type");
@@ -557,6 +575,24 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.ok(retriedPreviewFrame, "the user can create a new iframe after reauthentication");
   assert.equal(retriedPreviewFrame.src, `/share/${token}/preview`);
   assert.equal(expiredRefreshCalls.length, 4, "the expired preview recovery sends only the expected password checks");
+
+  const viewerRefreshElements = runSharePageScript(sharePage.body, () => Promise.resolve({
+    status: 200,
+    ok: true,
+    json: async () => ({ fileName: "preview.pdf", expiresAt: new Date(Date.now() + 60_000).toISOString(), remainingViews: null, remainingDownloads: 1, canPreview: true, size: 12 }),
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  viewerRefreshElements.get("previewButton").listeners.click();
+  const expiredViewerFrame = viewerRefreshElements.createdElements.find((element) => element.tagName === "iframe");
+  expiredViewerFrame.contentDocument = { body: { textContent: expiredViewerPreview.body } };
+  expiredViewerFrame.listeners.load();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(viewerRefreshElements.get("previewBox").children.length, 0, "a viewer-expired preview response is removed after its password session refreshes");
+  assert.equal(viewerRefreshElements.get("previewBox").dataset.loaded, undefined, "a viewer-expired preview can be requested again after refresh");
+  viewerRefreshElements.get("previewButton").listeners.click();
+  assert.equal(viewerRefreshElements.createdElements.filter((element) => element.tagName === "iframe").length, 2, "retrying preview creates a fresh iframe after the viewer session is renewed");
 
   const wrongPasswordResponses = [
     { status: 401, ok: false, json: async () => ({ passwordRequired: true, error: "Senha necessaria." }) },
