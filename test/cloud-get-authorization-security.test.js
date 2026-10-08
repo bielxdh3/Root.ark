@@ -1365,7 +1365,10 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const durableIntentPath = path.join(dataDir, ".rootark-cloud-upload-mutations", `${crypto.createHash("sha256").update(`root\0${durableDeleteStoredName}`).digest("hex")}.json`);
   const durableIntent = JSON.parse(fs.readFileSync(durableIntentPath, "utf8"));
   assert.equal(durableIntent.desired, "absent", "failed provider deletion leaves a durable absent intent after local version removal");
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  const deleteReconciliationDeadline = Date.now() + 5000;
+  while (!cloud.deleteObjects.includes(durableDeleteKey) && Date.now() < deleteReconciliationDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   assert.equal(cloud.deleteObjects.includes(durableDeleteKey), true, "reconciliation attempted provider deletion");
   assert.equal(OBJECTS.has(durableDeleteKey), true, "provider failure leaves remote data for retry");
   assert.equal(JSON.parse(fs.readFileSync(durableIntentPath, "utf8")).desired, "absent", "failed reconciliation retains its durable intent");
