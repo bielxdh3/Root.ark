@@ -1304,6 +1304,7 @@ test("post-migration startup failure keeps the whole-restore barrier until a lat
     db.close();
     (async () => {
       const backup = await backupService.createBackup({ createdBy: "fixture" });
+      fs.writeFileSync(path.join(process.cwd(), "data", "restore-backup-id.txt"), backup.id);
       db = new Database(process.env.DATABASE_URL);
       db.prepare("UPDATE proof SET value = 'live-before-restore'").run();
       db.close();
@@ -1343,6 +1344,84 @@ test("post-migration startup failure keeps the whole-restore barrier until a lat
     } finally { db.close(); }
     process.exit(0);
   `;
+  const migrationFailureStartupScript = `
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const Database = require(${JSON.stringify(path.join(ROOT, "node_modules", "better-sqlite3"))});
+    const migrationPath = require.resolve(${JSON.stringify(path.join(ROOT, "db", "migrations"))});
+    const migrations = require(migrationPath);
+    const migration = migrations.MIGRATIONS.find((entry) => entry.version === 5);
+    assert.ok(migration, "the fixture must have migration 5 pending");
+    const apply = migration.up;
+    migration.up = (db) => {
+      apply(db);
+      throw new Error("injected failure during migration apply");
+    };
+    try {
+      require(${JSON.stringify(path.join(ROOT, "server.js"))});
+      throw new Error("expected the injected migration failure");
+    } catch (error) {
+      if (error.message !== "injected failure during migration apply") throw error;
+    }
+    const coordinator = JSON.parse(fs.readFileSync(${JSON.stringify(coordinatorPath)}, "utf8"));
+    assert.equal(coordinator.phase, "restart_required");
+    const preimageRoot = path.join("data", "backups", ".restore-preimages", coordinator.transactionId);
+    assert.equal(fs.existsSync(path.join(preimageRoot, "manifest.json")), true, "the committed restore must retain its rollback preimage");
+    assert.equal(fs.existsSync(path.join("data", ".rootark-restore-restart-acks", coordinator.transactionId)), false, "failed startup must not acknowledge a listener");
+    const db = new Database(process.env.DATABASE_URL, { readonly: true });
+    try {
+      const versions = db.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map((row) => row.version);
+      assert.deepEqual(versions, [1, 2, 3, 4], "the failed migration transaction must not record version 5");
+      const columns = new Set(db.prepare("PRAGMA table_info(users)").all().map((row) => row.name));
+      assert.equal(columns.has("totp_enabled"), false, "the failed migration's schema changes must roll back");
+      assert.equal(db.prepare("SELECT value FROM proof").get().value, "archive-before-migration");
+    } finally { db.close(); }
+    process.exit(0);
+  `;
+  const retryAfterMigrationFailureScript = `
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const Database = require(${JSON.stringify(path.join(ROOT, "node_modules", "better-sqlite3"))});
+    const migrationPath = require.resolve(${JSON.stringify(path.join(ROOT, "db", "migrations"))});
+    const migrations = require(migrationPath);
+    const runMigrations = migrations.runMigrations;
+    let applied;
+    migrations.runMigrations = (options) => {
+      const result = runMigrations(options);
+      applied = result.applied;
+      return result;
+    };
+    require(${JSON.stringify(path.join(ROOT, "server.js"))});
+    assert.deepEqual(applied, [5], "normal retry must apply the migration that failed previously");
+    const db = new Database(process.env.DATABASE_URL, { readonly: true });
+    try {
+      const columns = new Set(db.prepare("PRAGMA table_info(users)").all().map((row) => row.name));
+      assert.equal(columns.has("totp_enabled"), true);
+      assert.equal(db.prepare("SELECT value FROM proof").get().value, "archive-before-migration");
+    } finally { db.close(); }
+    setTimeout(() => {
+      try {
+        assert.equal(fs.existsSync(${JSON.stringify(coordinatorPath)}), false, "successful listener acknowledgement must clear the barrier");
+        process.exit(0);
+      } catch (error) { console.error(error); process.exit(4); }
+    }, 150);
+  `;
+  const rearmPostMigrationFailureScript = `
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const Database = require(${JSON.stringify(path.join(ROOT, "node_modules", "better-sqlite3"))});
+    const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+    (async () => {
+      const backupId = fs.readFileSync(path.join("data", "restore-backup-id.txt"), "utf8");
+      const db = new Database(process.env.DATABASE_URL);
+      db.prepare("UPDATE proof SET value = 'live-before-restore'").run();
+      db.close();
+      await restoreService.restoreBackup(backupId, { confirmation: "RESTORE" });
+      assert.equal(JSON.parse(fs.readFileSync(${JSON.stringify(coordinatorPath)}, "utf8")).phase, "restart_required");
+      process.exit(0);
+    })().catch((error) => { console.error(error); process.exit(1); });
+  `;
   const recoveredStartupScript = `
     const fs = require("node:fs");
     require(${JSON.stringify(path.join(ROOT, "server.js"))});
@@ -1356,12 +1435,22 @@ test("post-migration startup failure keeps the whole-restore barrier until a lat
   try {
     const setup = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
     assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+    const migrationFailureStartup = spawnSync(process.execPath, ["-e", migrationFailureStartupScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(migrationFailureStartup.status, 0, migrationFailureStartup.stderr || migrationFailureStartup.stdout);
+    assert.equal(JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).phase, "restart_required");
+    const retryAfterMigrationFailure = spawnSync(process.execPath, ["-e", retryAfterMigrationFailureScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(retryAfterMigrationFailure.status, 0, retryAfterMigrationFailure.stderr || retryAfterMigrationFailure.stdout);
+    assert.equal(fs.existsSync(coordinatorPath), false);
+    const rearmPostMigrationFailure = spawnSync(process.execPath, ["-e", rearmPostMigrationFailureScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(rearmPostMigrationFailure.status, 0, rearmPostMigrationFailure.stderr || rearmPostMigrationFailure.stdout);
     const failedStartup = spawnSync(process.execPath, ["-e", failedStartupScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
     assert.equal(failedStartup.status, 0, failedStartup.stderr || failedStartup.stdout);
     assert.equal(JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).phase, "restart_required");
+    const transactionId = JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).transactionId;
     const recoveredStartup = spawnSync(process.execPath, ["-e", recoveredStartupScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
     assert.equal(recoveredStartup.status, 0, recoveredStartup.stderr || recoveredStartup.stdout);
     assert.equal(fs.existsSync(coordinatorPath), false);
+    assert.equal(fs.existsSync(path.join(runtime, "data", "backups", ".restore-preimages", transactionId)), false, "successful retry must release the retained preimage");
   } finally {
     fs.rmSync(runtime, { recursive: true, force: true });
   }
