@@ -2159,8 +2159,10 @@ function requireSameOriginPublicShareMutation(req, res, next) {
   return next();
 }
 
-function getShareAccessCookieRequired(link) {
-  return hasSharePassword(link) || (Number(link.maxViews) || 0) > 0;
+function getShareAccessCookieRequired(link, countDownloadOncePerViewer = false) {
+  return hasSharePassword(link)
+    || (Number(link.maxViews) || 0) > 0
+    || (countDownloadOncePerViewer && (Number(link.maxDownloads) || 0) > 0);
 }
 
 async function resolveShareAccess(req, res, token, options = {}) {
@@ -2195,7 +2197,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
     return { status: 410, error: "Link indisponivel." };
   }
 
-  if (options.requireViewer && getShareAccessCookieRequired(link) && !viewerAlreadyActive && !options.countView) {
+  if (options.requireViewer && getShareAccessCookieRequired(link, options.countDownloadOncePerViewer) && !viewerAlreadyActive && !options.countView) {
     return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
   }
 
@@ -2235,7 +2237,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
     logShareAudit(req, "share.limit_reached", token, currentLink, "view", "failure", { limit: "views" });
     return { status: 410, error: "Link indisponivel." };
   }
-  if (options.requireViewer && getShareAccessCookieRequired(currentLink) && !currentViewerAlreadyActive && !options.countView) {
+  if (options.requireViewer && getShareAccessCookieRequired(currentLink, options.countDownloadOncePerViewer) && !currentViewerAlreadyActive && !options.countView) {
     return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
   }
   if (options.countDownload && !downloadAlreadyCounted && currentLimits.maxDownloads > 0 && currentLimits.downloads >= currentLimits.maxDownloads) {
