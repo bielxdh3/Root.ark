@@ -126,9 +126,9 @@ test("backup recovery stays blocked after an in-flight action returns a structur
   const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-management.js"), "utf8");
   for (const page of ["admin.html", "audit.html", "backups.html", "dashboard.html"]) {
     const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
-    assert.match(html, /rootark-management\.js\?v=18/);
+    assert.match(html, new RegExp(`rootark-management\\.js\\?v=${page === "audit.html" ? 19 : 18}`));
   }
-  assert.match(fs.readFileSync(path.join(__dirname, "..", "public", "service-worker.js"), "utf8"), /rootark-public-shell-v18/);
+  assert.match(fs.readFileSync(path.join(__dirname, "..", "public", "service-worker.js"), "utf8"), /rootark-public-shell-v19/);
   const listeners = new Map();
   const buttons = [{ disabled: false }, { disabled: false }, { disabled: false }];
   const target = {
@@ -280,11 +280,11 @@ test("service worker caches only the public shell and bypasses protected paths",
     },
     fetch: async () => ({ ok: true, clone: () => ({}) }),
   };
-  assert.match(source, /const CACHE_NAME = "rootark-public-shell-v18";/, "security client changes advance the public shell cache revision");
+  assert.match(source, /const CACHE_NAME = "rootark-public-shell-v19";/, "security client changes advance the public shell cache revision");
   const pageAssets = {
     "index.html": [["rootark-api.js", 17], ["rootark-workspace.js", 17]],
     "admin.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
-    "audit.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
+    "audit.html": [["rootark-api.js", 17], ["rootark-management.js", 19]],
     "backups.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
     "dashboard.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
     "login.html": [["rootark-api.js", 17]],
@@ -293,6 +293,8 @@ test("service worker caches only the public shell and bypasses protected paths",
     const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
     for (const [script, version] of scripts) assert.match(html, new RegExp(`/client/${script.replaceAll(".", "\\.")}\\?v=${version}`), `${page} refreshes ${script}`);
   }
+  const auditHtml = fs.readFileSync(path.join(__dirname, "..", "public", "audit.html"), "utf8");
+  assert.match(auditHtml, /\/styles\/app\.css\?v=17/, "audit page refreshes the updated stylesheet");
   vm.runInNewContext(source, context);
   let installWait;
   handlers.install({ waitUntil: (promise) => { installWait = promise; } });
