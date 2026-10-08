@@ -1045,6 +1045,302 @@ test("provider inventory refuses an incomplete backup baseline and gives replace
   `);
 });
 
+test("restore retries provider identity resolution after a transient same-process failure", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      write(path.join(dataDir, "runtime.json"), "archived state");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      let identity = null;
+      let resolveAttempts = 0;
+      const cloud = {
+        provider: "fixture",
+        enabled: () => true,
+        inventoryContext: () => {
+          if (!identity) throw new Error("Cloud provider identity has not been resolved; cloud access remains blocked");
+          return identity;
+        },
+        resolveInventoryContext: async () => {
+          resolveAttempts += 1;
+          identity = null;
+          if (resolveAttempts === 2) throw new Error("Cloud provider identity could not be resolved; cloud access remains blocked");
+          identity = "b".repeat(64);
+          return identity;
+        },
+        inventory: async () => [],
+        upload: async () => true,
+      };
+      await cloud.resolveInventoryContext();
+      await providerOrphans.markInventoryUnknown(backup.id, { inventoryContext: identity });
+      await providerOrphans.reconcileInventory(backup.id, [], cloud.inventoryContext());
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+
+      write(path.join(dataDir, "runtime.json"), "current state");
+      await assert.rejects(restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }), /identity could not be resolved/);
+      assert.equal(resolveAttempts, 2, "the failed identity refresh occurs at the restore boundary");
+      assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "current state",
+        "failed identity resolution does not mutate local data");
+      assert.equal(restoreService.getWholeRestorePhase(), null, "failed identity resolution does not leave a pending restore");
+
+      const result = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.equal(result.backup.id, backup.id);
+      assert.ok(resolveAttempts >= 3, "restore retries identity resolution before checking the inventory marker");
+      assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "archived state");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("provider reconciliation does not upload local paths excluded from backup sources", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      const configuredQuarantineDir = path.join(uploadsDir, "quarantine");
+      process.env.UPLOAD_QUARANTINE_DIR = configuredQuarantineDir;
+      write(path.join(uploadsDir, "root", "normal.txt"), "normal bytes");
+      const uploads = [];
+      const cloud = {
+        enabled: () => true,
+        inventoryContext: () => "c".repeat(64),
+        inventory: async () => [],
+        upload: async (source) => { uploads.push(path.relative(uploadsDir, source).split(path.sep).join("/")); return true; },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      const baseline = await backupService.createBackup({ createdBy: "fixture" });
+      await providerOrphans.markInventoryUnknown(baseline.id, { inventoryContext: "c".repeat(64) });
+
+      write(path.join(uploadsDir, "service-account", "secret.json"), "must stay local");
+      write(path.join(uploadsDir, "credentials", "nested.txt"), "must stay local");
+      write(path.join(uploadsDir, "private.pem", "nested.txt"), "must stay local");
+      write(path.join(uploadsDir, ".env.runtime", "nested.txt"), "must stay local");
+      write(path.join(uploadsDir, "root", ".rootark-cloud-cache-partial"), "must stay local");
+      write(path.join(uploadsDir, "root", ".env.production"), "must stay local");
+      write(path.join(uploadsDir, "root", "service-account.json"), "must stay local");
+      write(path.join(uploadsDir, "root", "certificate.pem"), "must stay local");
+      write(path.join(uploadsDir, "root", "keystore.p12"), "must stay local");
+      write(path.join(configuredQuarantineDir, "held.bin"), "quarantined payload");
+      write(path.join(dataDir, "quarantine.json"), JSON.stringify({
+        items: [{ id: "held", storedQuarantineFilename: "held.bin", originalFilename: "document.bin" }],
+      }));
+      fs.linkSync(path.join(configuredQuarantineDir, "held.bin"), path.join(uploadsDir, "root", "quarantine-alias.bin"));
+
+      const originalReaddirSync = fs.readdirSync;
+      const excludedDirectoriesVisited = [];
+      fs.readdirSync = function (directory, ...args) {
+        const relative = path.relative(uploadsDir, directory).split(path.sep).join("/");
+        if (["service-account", "credentials", "private.pem", ".env.runtime", "quarantine"].some((name) => relative === name || relative.startsWith(name + "/"))) {
+          excludedDirectoriesVisited.push(relative);
+        }
+        return originalReaddirSync.call(this, directory, ...args);
+      };
+      try { await restoreService.reconcileUnknownProviderInventory(); }
+      finally { fs.readdirSync = originalReaddirSync; }
+      assert.deepEqual(uploads, ["root/normal.txt"],
+        "local provider reconciliation must use the same exclusions as backup collection");
+      assert.deepEqual(excludedDirectoriesVisited, [], "excluded directory subtrees must not be traversed");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("provider reconciliation excludes a configured quarantine subtree under uploads", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      process.env.UPLOAD_QUARANTINE_DIR = path.join(uploadsDir, "quarantine");
+      write(path.join(process.env.UPLOAD_QUARANTINE_DIR, "pending.bin"), "quarantined bytes");
+      write(path.join(dataDir, "quarantine.json"), JSON.stringify({ items: [{ id: "fixture", storedQuarantineFilename: "pending.bin" }] }));
+      write(path.join(uploadsDir, "root", "normal.txt"), "normal bytes");
+
+      const uploadedPaths = [];
+      const cloud = {
+        enabled: () => true,
+        inventoryContext: () => "e".repeat(64),
+        inventory: async () => [],
+        upload: async (source) => {
+          const relative = path.relative(uploadsDir, source);
+          if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) {
+            uploadedPaths.push(relative.split(path.sep).join("/"));
+          }
+          return true;
+        },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      const baseline = await backupService.createBackup({ createdBy: "fixture" });
+      await providerOrphans.markInventoryUnknown(baseline.id, { inventoryContext: "e".repeat(64) });
+      await restoreService.reconcileUnknownProviderInventory();
+      assert.deepEqual(uploadedPaths, ["root/normal.txt"],
+        "local reconciliation must exclude the same configured quarantine subtree as backup collection");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("provider reconciliation excludes hardlink aliases of quarantine payloads", (t) => {
+  const outcome = runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      const payloadPath = path.join(quarantineDir, "pending.bin");
+      const aliasPath = path.join(uploadsDir, "root", "quarantine-alias.bin");
+      write(path.join(dataDir, "quarantine.json"), JSON.stringify({ items: [{ id: "fixture", storedQuarantineFilename: "pending.bin" }] }));
+      write(payloadPath, "quarantined bytes");
+      write(path.join(uploadsDir, "root", "normal.txt"), "normal bytes");
+      const uploadedPaths = [];
+      const cloud = {
+        enabled: () => true,
+        inventoryContext: () => "f".repeat(64),
+        inventory: async () => [],
+        upload: async (source) => {
+          const relative = path.relative(uploadsDir, source);
+          if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) uploadedPaths.push(relative.split(path.sep).join("/"));
+          return true;
+        },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      const baseline = await backupService.createBackup({ createdBy: "fixture" });
+      try { fs.linkSync(payloadPath, aliasPath); }
+      catch (error) {
+        if (["EACCES", "EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV"].includes(error.code)) {
+          console.log(JSON.stringify({ ok: true, skipped: "hard links unavailable: " + error.code }));
+          return;
+        }
+        throw error;
+      }
+
+      await providerOrphans.markInventoryUnknown(baseline.id, { inventoryContext: "f".repeat(64) });
+      uploadedPaths.length = 0;
+      await restoreService.reconcileUnknownProviderInventory();
+      assert.deepEqual(uploadedPaths, ["root/normal.txt"],
+        "local reconciliation must exclude quarantined file identities even through an ordinary alias path");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+  if (outcome.skipped) t.skip(outcome.skipped);
+});
+
+test("restore does not queue or trust excluded paths declared by a backup manifest", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const archivePath = backupService.getBackupOrThrow(backup.id).archivePath;
+      fs.rmSync(archivePath);
+      const entries = [
+        { path: "uploads/root/normal.txt", contents: Buffer.from("normal bytes") },
+        { path: "uploads/service-account/secret.json", contents: Buffer.from("secret bytes") },
+        { path: "uploads/credentials/nested.txt", contents: Buffer.from("credential bytes") },
+        { path: "uploads/private.pem/nested.txt", contents: Buffer.from("private key bytes") },
+        { path: "uploads/.env.runtime/nested.txt", contents: Buffer.from("environment bytes") },
+        { path: "uploads/root/.rootark-cloud-cache-stale", contents: Buffer.from("partial cache bytes") },
+      ];
+      await backupService.createZipArchive(archivePath, {
+        backup_id: backup.id,
+        included_files: entries.map(({ path: entryPath, contents }) => ({ path: entryPath, size: contents.length })),
+        cloud_complete: true,
+      }, entries.map(({ path: entryPath, contents }) => ({ entryPath, contents, size: contents.length })));
+      await backupRepository.saveBackup({ ...backup, checksum: null });
+
+      const context = "d".repeat(64);
+      const remoteObjects = [
+        { area: "uploads", folderId: "root", name: "normal.txt" },
+        { area: "uploads", folderId: "service-account", name: "secret.json" },
+        { area: "uploads", folderId: "credentials", name: "nested.txt" },
+        { area: "uploads", folderId: "private.pem", name: "nested.txt" },
+        { area: "uploads", folderId: ".env.runtime", name: "nested.txt" },
+        { area: "uploads", folderId: "root", name: ".rootark-cloud-cache-stale" },
+      ];
+      let inventoryCalls = 0;
+      const cloud = {
+        enabled: () => true,
+        inventoryContext: () => context,
+        inventory: async () => (++inventoryCalls === 1 ? remoteObjects : []),
+        upload: async () => true,
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      await providerOrphans.markInventoryUnknown(backup.id, { inventoryContext: context });
+      await providerOrphans.reconcileInventory(backup.id, [], context);
+
+      const result = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.deepEqual(result.cloudSync.entries.map((entry) => entry.path), ["uploads/root/normal.txt"],
+        "sensitive manifest entries cannot seed provider uploads");
+      assert.equal(providerOrphans.isSuppressed("root", "normal.txt", "uploads"), false);
+      assert.equal(providerOrphans.isSuppressed("service-account", "secret.json", "uploads"), true,
+        "an excluded ancestor does not certify the remote object as archived");
+      assert.equal(providerOrphans.isSuppressed("credentials", "nested.txt", "uploads"), true);
+      assert.equal(providerOrphans.isSuppressed("private.pem", "nested.txt", "uploads"), true);
+      assert.equal(providerOrphans.isSuppressed(".env.runtime", "nested.txt", "uploads"), true);
+      assert.equal(providerOrphans.isSuppressed("root", ".rootark-cloud-cache-stale", "uploads"), true);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("an explicit complete replacement can replace an existing incomplete inventory baseline", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      const oldBaseline = await backupService.createBackup({ createdBy: "fixture" });
+      const incompleteReplacement = await backupService.createBackup({ createdBy: "fixture" });
+      await providerOrphans.markInventoryUnknown(oldBaseline.id);
+
+      const provider = {
+        enabled: () => true,
+        inventoryContext: () => "a".repeat(64),
+        inventory: async () => { inventoryCalls += 1; return []; },
+        upload: async () => true,
+      };
+      let inventoryCalls = 0;
+      backupService.setCloudStorage(provider);
+      restoreService.setCloudStorage(provider);
+      process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID = incompleteReplacement.id;
+      await assert.rejects(restoreService.reconcileUnknownProviderInventory(), /complete backup/i);
+      assert.equal(providerOrphans.getInventoryStatus().backupId, oldBaseline.id,
+        "an incomplete replacement must not replace the durable selection");
+      assert.equal(inventoryCalls, 0, "invalid replacement candidates fail before provider inventory");
+
+      const wrongIdentity = await backupService.createBackup({ createdBy: "fixture" });
+      inventoryCalls = 0;
+      const wrongIdentityArchive = backupService.getBackupOrThrow(wrongIdentity.id).archivePath;
+      fs.rmSync(wrongIdentityArchive);
+      await backupService.createZipArchive(wrongIdentityArchive, {
+        backup_id: "11111111-1111-4111-8111-111111111111",
+        included_files: [],
+        cloud_complete: true,
+      }, []);
+      await backupRepository.saveBackup({ ...wrongIdentity, checksum: null });
+      process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID = wrongIdentity.id;
+      await assert.rejects(restoreService.reconcileUnknownProviderInventory(), /identity|manifest/i);
+      assert.equal(providerOrphans.getInventoryStatus().backupId, oldBaseline.id,
+        "a mismatched manifest cannot replace the durable selection");
+      assert.equal(inventoryCalls, 0, "candidate identity is checked before provider inventory");
+
+      const completeReplacement = await backupService.createBackup({ createdBy: "fixture" });
+      inventoryCalls = 0;
+      process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID = completeReplacement.id;
+      const result = await restoreService.reconcileUnknownProviderInventory();
+      assert.equal(result.backupId, completeReplacement.id);
+      assert.equal(providerOrphans.getInventoryStatus().state, "reconciled");
+      assert.equal(providerOrphans.getInventoryStatus().backupId, completeReplacement.id);
+      assert.equal(inventoryCalls, 1, "only a validated complete replacement reaches provider inventory");
+      delete process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID;
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { delete process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID; console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("provider inventory reconciliation fails closed on symlink and unsupported upload entries", () => {
   for (const kind of ["symlink", "unsupported"]) runFixture(`
     backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });

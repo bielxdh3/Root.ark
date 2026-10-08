@@ -512,7 +512,7 @@ function syncNow(clock) {
 function syncEntries(manifest) {
   return (manifest?.included_files || [])
     .map((entry) => String(entry.path || "").replace(/\\/g, "/"))
-    .filter((entryPath) => entryPath.startsWith("uploads/"))
+    .filter((entryPath) => entryPath.startsWith("uploads/") && !backupService.isBackupExcludedPath(entryPath))
     .map((entryPath) => {
       const [area, ...parts] = entryPath.split("/");
       const name = parts.pop();
@@ -525,6 +525,7 @@ function syncEntries(manifest) {
 
 function localUploadFiles() {
   const root = resolveRuntimePath("uploads");
+  const quarantineExclusions = backupService.getQuarantineExclusionState();
   let rootStat;
   try { rootStat = fs.lstatSync(root); }
   catch (error) { if (error.code === "ENOENT") return []; throw error; }
@@ -534,8 +535,16 @@ function localUploadFiles() {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const absolute = path.join(directory, entry.name);
       if (entry.isSymbolicLink()) throw new Error("Local upload tree contains a symlink; cloud reconciliation remains blocked");
-      if (entry.isDirectory()) visit(absolute);
-      else if (entry.isFile()) files.push(`uploads/${path.relative(root, absolute).replace(/\\/g, "/")}`);
+      if (!entry.isDirectory() && !entry.isFile()) throw new Error("Local upload tree contains an unsupported filesystem entry; cloud reconciliation remains blocked");
+      const stat = fs.lstatSync(absolute, { bigint: true });
+      if (stat.isSymbolicLink()) throw new Error("Local upload tree contains a symlink; cloud reconciliation remains blocked");
+      if (entry.isDirectory()) {
+        const entryPath = `uploads/${path.relative(root, absolute).split(path.sep).join("/")}`;
+        if (!backupService.isBackupExcludedPath(entryPath) && !quarantineExclusions.isExcludedPath(absolute, stat)) visit(absolute);
+      } else if (entry.isFile()) {
+        const entryPath = `uploads/${path.relative(root, absolute).split(path.sep).join("/")}`;
+        if (!backupService.isBackupExcludedPath(entryPath) && !quarantineExclusions.isExcludedPath(absolute, stat)) files.push(entryPath);
+      }
       else throw new Error("Local upload tree contains an unsupported filesystem entry; cloud reconciliation remains blocked");
     }
   };
@@ -558,11 +567,20 @@ async function localReconciliationPlan(manifest) {
   return { entries, fingerprint };
 }
 
+async function validatedProviderBaseline(backupId) {
+  const { backup, archivePath } = backupService.getBackupOrThrow(backupId);
+  const { manifest } = await validateBackupArchive(backup, archivePath);
+  if (String(manifest.backup_id).toLowerCase() !== String(backup.id).toLowerCase()) {
+    throw new Error("Selected provider inventory baseline manifest identity does not match the selected backup");
+  }
+  return { backup, archivePath, manifest };
+}
+
 function archivedProviderObjects(manifest) {
   if (manifest?.cloud_complete !== true) return new Set();
   return new Set((manifest?.included_files || [])
     .map((entry) => String(entry.path || "").replace(/\\/g, "/"))
-    .filter((entryPath) => entryPath.startsWith("uploads/"))
+    .filter((entryPath) => entryPath.startsWith("uploads/") && !backupService.isBackupExcludedPath(entryPath))
     .map((entryPath) => {
       const [area, ...parts] = entryPath.split("/");
       const name = parts.pop();
@@ -622,27 +640,44 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
   if (typeof cloudStorage.inventory !== "function") throw new Error("Cloud provider inventory is required before cloud access can resume");
   const explicitBaseline = String(baselineBackupId || process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID || "").trim();
   let missingSelectedBaseline = false;
+  let incompleteSelectedBaseline = false;
+  let selectedBaseline = null;
   if (status.backupId) {
-    try { backupService.getBackupOrThrow(status.backupId); }
+    try {
+      selectedBaseline = await validatedProviderBaseline(status.backupId);
+      incompleteSelectedBaseline = selectedBaseline.manifest.cloud_complete !== true;
+    }
     catch (error) {
       if (!["Backup nao encontrado", "Arquivo de backup nao encontrado"].includes(error.message)) throw error;
       missingSelectedBaseline = true;
     }
   }
-  if (missingSelectedBaseline && !explicitBaseline) {
-    throw new Error("The selected provider inventory baseline is missing; set ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID to a different complete backup");
+  const replacementRequired = missingSelectedBaseline || incompleteSelectedBaseline || !status.backupId;
+  if (replacementRequired && !explicitBaseline) {
+    if (!status.backupId) throw new Error("An explicit backup baseline is required to reconcile legacy provider inventory");
+    const reason = missingSelectedBaseline ? "missing" : incompleteSelectedBaseline ? "incomplete" : "not selected";
+    throw new Error(`The selected provider inventory baseline is ${reason}; set ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID to a different complete backup`);
   }
-  if (missingSelectedBaseline && explicitBaseline === status.backupId) {
-    throw new Error("The selected provider inventory baseline is missing; ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID must name a different complete backup");
+  if (replacementRequired && status.backupId && explicitBaseline === status.backupId) {
+    throw new Error("The selected provider inventory baseline is missing or incomplete; ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID must name a different complete backup");
   }
   if (status.backupId && explicitBaseline && status.backupId !== explicitBaseline) {
-    if (!missingSelectedBaseline) throw new Error("Explicit provider inventory baseline conflicts with the durable restore selection");
+    if (!replacementRequired) throw new Error("Explicit provider inventory baseline conflicts with the durable restore selection");
   }
-  const selectedBackupId = missingSelectedBaseline || !status.backupId ? explicitBaseline : status.backupId;
+  const selectedBackupId = replacementRequired ? explicitBaseline : status.backupId;
   if (!selectedBackupId) throw new Error("An explicit backup baseline is required to reconcile legacy provider inventory");
-  if (missingSelectedBaseline || !status.backupId) {
+  if (replacementRequired) {
+    selectedBaseline = await validatedProviderBaseline(selectedBackupId);
+    if (selectedBaseline.manifest.cloud_complete !== true) {
+      throw new Error("The selected replacement provider inventory baseline is incomplete; configure ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID with a complete backup");
+    }
     await restoreProviderOrphans.markInventoryUnknown(selectedBackupId, { inventoryContext: currentInventoryContext }, {
-      validateBaseline: () => backupService.getBackupOrThrow(selectedBackupId),
+      validateBaseline: async () => {
+        const current = await validatedProviderBaseline(selectedBackupId);
+        if (current.manifest.cloud_complete !== true) {
+          throw new Error("Restore provider inventory replacement baseline is incomplete");
+        }
+      },
     });
   } else if (markerNeedsUpdate) {
     await restoreProviderOrphans.markInventoryUnknown(status.backupId, {
@@ -651,8 +686,10 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
     }, { validateBaseline: () => backupService.getBackupOrThrow(status.backupId) });
   }
 
-  const { backup, archivePath } = backupService.getBackupOrThrow(selectedBackupId);
-  const { manifest } = await validateBackupArchive(backup, archivePath);
+  if (!selectedBaseline || selectedBaseline.backup.id !== selectedBackupId) {
+    selectedBaseline = await validatedProviderBaseline(selectedBackupId);
+  }
+  const { backup, manifest } = selectedBaseline;
   const localPlan = await localReconciliationPlan(manifest);
   let selectedBackup = backupRepository.getBackup(selectedBackupId) || backup;
   const previousSync = selectedBackup.metadata?.restoreSync;
@@ -2004,6 +2041,9 @@ async function restoreBackup(id, options = {}) {
 
   const pending = assertNoPendingWholeRestore();
   if (pending.restartRequired) throw new Error("Reinicie todas as instancias do servidor antes de iniciar outro restore");
+  if (cloudStorage?.enabled?.() && typeof cloudStorage.resolveInventoryContext === "function") {
+    await cloudStorage.resolveInventoryContext();
+  }
   if (cloudStorage?.enabled?.() && restoreProviderOrphans.isInventoryUnknown(cloudStorage)) restoreProviderOrphans.assertProviderAvailable(cloudStorage);
   const requiredRestartInstances = configuredRestartInstanceCount();
   restoreInstanceId(requiredRestartInstances);
