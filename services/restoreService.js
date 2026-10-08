@@ -2289,6 +2289,7 @@ async function restoreBackup(id, options = {}) {
       selectedBackup: restoredBackup,
       preRestoreBackup: preRestore,
     });
+    injectFailure("restore.commit-marker.persisted");
     return {
       backup: restoredBackup,
       manifest,

@@ -2237,6 +2237,65 @@ test("abrupt whole-restore interruptions automatically roll back before startup 
   }
 });
 
+test("abrupt exit after the restart-required marker preserves committed state and startup acknowledges it", { timeout: 60_000 }, () => {
+  runFixture(`
+    const childProcess = require("node:child_process");
+    const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+    write(path.join(dataDir, "runtime.json"), "archive-state");
+    write(path.join(uploadsDir, "archive.txt"), "archive-upload");
+    write(path.join(dataDir, "quarantine.json"), JSON.stringify({ items: [{ id: "archive", storedQuarantineFilename: "archive.bin" }] }));
+    write(path.join(quarantineDir, "archive.bin"), "archive-quarantine");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "runtime.json"), "live-state");
+      write(path.join(uploadsDir, "live.txt"), "live-upload");
+      fs.rmSync(path.join(uploadsDir, "archive.txt"), { force: true });
+      write(path.join(dataDir, "quarantine.json"), JSON.stringify({ items: [{ id: "live", storedQuarantineFilename: "live.bin" }] }));
+      fs.rmSync(path.join(quarantineDir, "archive.bin"), { force: true });
+      write(path.join(quarantineDir, "live.bin"), "live-quarantine");
+      const restoreScript = [
+        "const restore = require(" + JSON.stringify(${JSON.stringify(path.join(ROOT, "services", "restoreService"))}) + ");",
+        "restore.restoreBackup(" + JSON.stringify(backup.id) + ", { confirmation: 'RESTORE', failureInjector(step) { if (step === 'restore.commit-marker.persisted') process.exit(86); } }).then(() => process.exit(0)).catch(error => { console.error(error); process.exit(1); });",
+      ].join("\\n");
+      const interrupted = childProcess.spawnSync(process.execPath, ["-e", restoreScript], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
+      assert.equal(interrupted.status, 86, interrupted.stderr || interrupted.stdout);
+      const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
+      assert.equal(coordinator.phase, "restart_required", "the process exits only after the durable commit marker is written");
+      assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "archive-state");
+      assert.equal(fs.readFileSync(path.join(uploadsDir, "archive.txt"), "utf8"), "archive-upload");
+      assert.equal(fs.existsSync(path.join(uploadsDir, "live.txt")), false);
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dataDir, "quarantine.json"), "utf8")), { items: [{ id: "archive", storedQuarantineFilename: "archive.bin" }] });
+      assert.equal(fs.readFileSync(path.join(quarantineDir, "archive.bin"), "utf8"), "archive-quarantine");
+      assert.equal(fs.existsSync(path.join(quarantineDir, "live.bin")), false);
+
+      const startupScript = [
+        "const assert = require('node:assert/strict');",
+        "const fs = require('node:fs');",
+        "const coordinatorPath = " + JSON.stringify(coordinatorPath) + ";",
+        "require(" + JSON.stringify(${JSON.stringify(path.join(ROOT, "server.js"))}) + ");",
+        "const acknowledgementDeadline = Date.now() + 20_000;",
+        "function waitForAcknowledgement() {",
+        "if (fs.existsSync(coordinatorPath)) {",
+        "if (Date.now() >= acknowledgementDeadline) { console.error('restore coordinator acknowledgement timed out'); process.exit(1); }",
+        "return setTimeout(waitForAcknowledgement, 25);",
+        "}",
+        "try {",
+        "assert.equal(fs.existsSync(" + JSON.stringify(coordinatorPath) + "), false, 'successful listener startup acknowledges and clears the committed restore barrier');",
+        "assert.equal(fs.readFileSync('data/runtime.json', 'utf8'), 'archive-state');",
+        "assert.equal(fs.readFileSync('uploads/archive.txt', 'utf8'), 'archive-upload');",
+        "assert.deepEqual(JSON.parse(fs.readFileSync('data/quarantine.json', 'utf8')), { items: [{ id: 'archive', storedQuarantineFilename: 'archive.bin' }] });",
+        "assert.equal(fs.readFileSync(require('node:path').join(process.env.UPLOAD_QUARANTINE_DIR, 'archive.bin'), 'utf8'), 'archive-quarantine');",
+        "process.exit(0); } catch (error) { console.error(error); process.exit(1); }",
+        "}",
+        "waitForAcknowledgement();",
+      ].join("\\n");
+      const restarted = childProcess.spawnSync(process.execPath, ["-e", startupScript], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
+      assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch(error => { console.error(error); process.exitCode = 1; });
+  `, { NODE_ENV: "test", JWT_SECRET: "j".repeat(48), ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", PORT: "0" });
+});
+
 test("abrupt exit during partial whole-restore pre-image creation cleans preparing state", { timeout: 30_000 }, () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-partial-preimage-"));
   const quarantineDir = path.join(runtime, "quarantine");
