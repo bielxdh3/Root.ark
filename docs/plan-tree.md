@@ -5,7 +5,7 @@ Last branch reconciliation: 2026-10-08
 
 Repository: `bielxdh3/root.ark`
 
-Current-state source: the newest dated issue/PR snapshot in [docs/issue-ledger.md](issue-ledger.md). The latest query recorded source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1` on 2026-10-08 UTC after PR #115 merged and before this documentation update is published. It is a point-in-time snapshot, not a claim about the branch after publication; the closure report records the later final SHA and its checks. Older dated sections remain historical evidence.
+Current-state source: the [2026-10-08 closure validation report](validation/2026-10-08-rootark-mission-closure.md) records the later mission state and exact-SHA checks. The `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1` issue/PR snapshot in [docs/issue-ledger.md](issue-ledger.md) is historical and point-in-time. Older dated sections remain historical evidence.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 

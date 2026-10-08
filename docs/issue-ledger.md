@@ -1,8 +1,8 @@
 # Root.ark Issue Ledger
 
-## Latest live snapshot — 2026-10-08 (source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`)
+## Historical live snapshot — 2026-10-08 (source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`)
 
-GitHub was queried after PR #115 merged into `Root/main` at `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`, before this documentation update was published. This is a timestamped snapshot, not a claim that the default branch remains at that SHA after this PR merges. The closure report records the later final SHA and validation.
+GitHub was queried after PR #115 merged into `Root/main` at `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`. This remains a timestamped historical snapshot, not a claim about the current default branch. The later mission state and exact-SHA validation are recorded in the [2026-10-08 closure validation report](validation/2026-10-08-rootark-mission-closure.md).
 
 ### Open issues and pull requests at source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`
 
