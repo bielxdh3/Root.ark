@@ -187,16 +187,39 @@
     const root = document.getElementById("app-root");
     const target = event.target && event.target.closest ? event.target : null;
     if (!root || !isCompactViewport() || !root.classList.contains("nav-open") || target && target.closest(".sidebar, .mobile-menu")) return;
-    setMobileNavigation(root, false);
+    const topbarAction = target && target.closest('.topbar button, .topbar a[href], .topbar input:not([disabled]), .topbar select:not([disabled]), .topbar textarea:not([disabled]), .topbar summary, .topbar [role="button"], .topbar [tabindex]:not([tabindex="-1"])');
+    setMobileNavigation(root, false, !topbarAction);
   }
 
   document.addEventListener("click", closeMobileNav);
   document.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape" || document.querySelector("dialog[open]")) return;
     const root = document.getElementById("app-root");
     if (!root || !isCompactViewport() || !root.classList.contains("nav-open")) return;
-    event.preventDefault();
-    setMobileNavigation(root, false, true);
+    if (event.key === "Escape") {
+      if (document.querySelector("dialog[open]")) return;
+      event.preventDefault();
+      setMobileNavigation(root, false, true);
+      return;
+    }
+    if (event.key !== "Tab" || document.querySelector("dialog[open]")) return;
+    const sidebar = root.querySelector(".sidebar");
+    if (!sidebar) return;
+    const focusable = Array.from(sidebar.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+      .filter((element) => !element.disabled && !element.hidden && element.getClientRects().length > 0);
+    if (!focusable.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const focusOutsideSidebar = !sidebar.contains(document.activeElement);
+    if (event.shiftKey && (document.activeElement === first || focusOutsideSidebar)) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (document.activeElement === last || focusOutsideSidebar)) {
+      event.preventDefault();
+      first.focus();
+    }
   });
 
   function toggleTheme() {
