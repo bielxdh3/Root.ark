@@ -558,6 +558,9 @@ img { max-width: 100%; }
   .data-table td:first-child { justify-content: flex-start; }
   .data-table td:first-child::before { display: none; }
   .data-table .row-actions { justify-content: flex-end; }
+  .audit-table tbody { grid-template-columns: minmax(0, 1fr); min-width: 0; }
+  .audit-table tbody tr, .audit-table td { min-width: 0; }
+  .audit-table td { overflow-wrap: anywhere; }
   .file-name-cell { min-width: 0; flex: 1; }
   .file-name-cell .table-primary { max-width: 58vw; }
   .file-actions-cell::before { align-self: flex-start; padding-top: 8px; }
