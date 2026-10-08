@@ -586,6 +586,52 @@ test("a reconciled provider inventory is scoped to its provider configuration", 
   `);
 });
 
+test("dynamic provider identity blocks guarded access and aborts restore reconciliation on the same instance", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const { createCloudStorage } = require(${JSON.stringify(path.join(ROOT, "services", "cloudStorage"))});
+    (async () => {
+      let principal = "drive-principal-a";
+      let uploadCalls = 0;
+      let listCalls = 0;
+      let inventoryCalls = 0;
+      const cloud = createCloudStorage({
+        provider: "gdrive",
+        gdrive: { folderId: "fixture-folder" },
+        resolvePrincipalIdentity: async () => principal,
+      });
+      cloud.inventory = async () => { inventoryCalls += 1; return []; };
+      cloud.resolveUploadId = async () => "fixture-drive-id";
+      cloud.upload = async () => { uploadCalls += 1; principal = "drive-principal-c"; return true; };
+      cloud.list = async () => { listCalls += 1; return []; };
+      backupService.setCloudStorage(cloud);
+      write(path.join(uploadsDir, "root", "file.txt"), "local bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const contextA = cloud.inventoryContext();
+      await providerOrphans.markInventoryUnknown(backup.id, { inventoryContext: contextA });
+      await providerOrphans.reconcileInventory(backup.id, [], contextA);
+
+      principal = "drive-principal-b";
+      const contextB = await cloud.resolveInventoryContext();
+      assert.notEqual(contextA, contextB, "the same adapter detects an authenticated principal change");
+      await assert.rejects(providerOrphans.guardProvider(cloud).list(), { code: "PROVIDER_INVENTORY_UNKNOWN" });
+      assert.equal(listCalls, 0, "guarded cloud access is blocked before provider I/O");
+
+      restoreService.setCloudStorage(cloud);
+      inventoryCalls = 0;
+      await assert.rejects(restoreService.reconcileUnknownProviderInventory(), /Selected archive uploads are not fully reconciled/);
+      const marker = providerOrphans.getInventoryStatus();
+      assert.equal(marker.state, "unknown");
+      assert.equal(marker.inventoryContext, contextB, "the attempted reconciliation context is durably recorded");
+      assert.equal(marker.previousInventoryContext, contextA);
+      assert.equal(uploadCalls, 1, "the upload runs under the expected principal before the injected identity switch");
+      assert.equal(inventoryCalls, 0, "inventory is never certified after the provider identity changes mid-reconciliation");
+      assert.equal(providerOrphans.getInventoryStatus(cloud).state, "unknown");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("cloud-disabled provider change persists invalidation and protects its backup baseline", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});

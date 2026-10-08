@@ -253,7 +253,12 @@ function guardProvider(provider) {
       if (getInventoryStatus().state === "unknown") assertProviderAvailable();
       if (typeof provider.resolveInventoryContext === "function") await provider.resolveInventoryContext();
       assertProviderAvailable(provider);
-      return provider[operation](...args);
+      const result = await provider[operation](...args);
+      if (typeof provider.resolveInventoryContext === "function") {
+        await provider.resolveInventoryContext();
+        assertProviderAvailable(provider);
+      }
+      return result;
     };
   }
   return guarded;

@@ -603,6 +603,7 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
   const status = restoreProviderOrphans.getInventoryStatus(cloudStorage);
   if (status.state !== "unknown") return { state: status.state, changed: false };
   const currentInventoryContext = cloudStorage.inventoryContext?.() || null;
+  const contextBoundCloudStorage = bindProviderContext(cloudStorage, currentInventoryContext);
   const markerNeedsUpdate = status.backupId && (previousStatus.state !== "unknown" || previousStatus.inventoryContext !== currentInventoryContext);
   if (!cloudStorage?.enabled?.()) {
     if (markerNeedsUpdate) {
@@ -711,7 +712,7 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
     const revision = Number(sync?.revision) || 0;
     const priorAttempts = new Map(entries.map((entry) => [entry.entryId, Number(entry.attempts) || 0]));
     selectedBackup = await processRestoreSyncInternal(
-      { backupId: selectedBackupId, clock, uploader: cloudStorage },
+      { backupId: selectedBackupId, clock, uploader: contextBoundCloudStorage },
       STARTUP_INVENTORY_RECONCILIATION,
     );
     const updatedSync = selectedBackup?.metadata?.restoreSync;
@@ -725,7 +726,7 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
     throw new Error(`Selected archive uploads are not fully reconciled (${sync?.state || "missing"}); cloud access remains blocked`);
   }
   const selectedUploads = new Set(sync.entries.map((entry) => restoreProviderOrphans.identityKey(entry.area, entry.folderId, entry.name)));
-  const inventory = await cloudStorage.inventory();
+  const inventory = await contextBoundCloudStorage.inventory();
   if (!Array.isArray(inventory)) throw new Error("Cloud provider inventory is invalid; cloud access remains blocked");
   const normalizedInventory = restoreProviderOrphans.normalizeObjects(inventory
     .filter((entry) => ["uploads", "temp"].includes(entry.area))
@@ -734,8 +735,32 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
   const orphaned = normalizedInventory.filter((entry) => !selectedUploads.has(
     restoreProviderOrphans.identityKey(entry.area, entry.folderId, entry.name),
   ));
-  await restoreProviderOrphans.reconcileInventory(selectedBackupId, orphaned, cloudStorage.inventoryContext?.() || null);
+  await assertProviderContext(cloudStorage, currentInventoryContext);
+  await restoreProviderOrphans.reconcileInventory(selectedBackupId, orphaned, currentInventoryContext);
   return { state: "reconciled", backupId: backup.id, suppressed: orphaned.length, changed: true };
+}
+
+function bindProviderContext(provider, expectedContext) {
+  if (!provider || typeof provider !== "object" || typeof provider.resolveInventoryContext !== "function") return provider;
+  const bound = Object.create(provider);
+  for (const operation of ["inventory", "resolveUploadId", "upload"]) {
+    if (typeof provider[operation] !== "function") continue;
+    bound[operation] = async (...args) => {
+      await assertProviderContext(provider, expectedContext);
+      const result = await provider[operation](...args);
+      await assertProviderContext(provider, expectedContext);
+      return result;
+    };
+  }
+  return bound;
+}
+
+async function assertProviderContext(provider, expectedContext) {
+  if (typeof provider?.resolveInventoryContext !== "function") return;
+  const currentContext = await provider.resolveInventoryContext();
+  if (!expectedContext || currentContext !== expectedContext) {
+    throw new Error("Cloud provider identity changed during restore inventory reconciliation; cloud access remains blocked");
+  }
 }
 
 function createRestoreSync(manifest, clock, entriesOverride = null) {

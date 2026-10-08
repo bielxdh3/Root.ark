@@ -29,7 +29,9 @@ function createCloudStorage(options = {}) {
     return resolvedInventoryContext;
   }
   async function resolveInventoryContext() {
-    if (resolvedInventoryContext) return resolvedInventoryContext;
+    // Refresh the authenticated identity at every operation boundary. Keep the
+    // last context unavailable if the identity probe itself fails.
+    resolvedInventoryContext = null;
     try {
       const principal = typeof options.resolvePrincipalIdentity === "function"
         ? await options.resolvePrincipalIdentity({ provider, s3: options.s3 || {}, gdrive: options.gdrive || {} })

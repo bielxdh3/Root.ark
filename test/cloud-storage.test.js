@@ -458,6 +458,42 @@ test("provider inventory context binds to stable authenticated principal and fai
   await assert.rejects(unavailableDrive.resolveInventoryContext(), /provider identity could not be resolved/i);
 });
 
+test("inventory context revalidates a changing principal on the same provider instance", async () => {
+  let principal = "gdrive-principal-a";
+  const storage = createCloudStorage({
+    provider: "gdrive",
+    gdrive: { folderId: "folder" },
+    resolvePrincipalIdentity: async () => principal,
+  });
+  const first = await storage.resolveInventoryContext();
+  principal = "gdrive-principal-b";
+  const second = await storage.resolveInventoryContext();
+  assert.notEqual(first, second, "same-instance identity refresh updates the context");
+  assert.equal(storage.inventoryContext(), second);
+
+  principal = "";
+  await assert.rejects(storage.resolveInventoryContext(), /provider identity could not be resolved/i);
+  assert.throws(() => storage.inventoryContext(), /identity has not been resolved/i,
+    "a failed refresh must not leave the prior principal trusted");
+
+  let arn = "arn:aws:sts::111111111111:assumed-role/reader/session-a";
+  const s3 = createCloudStorage({
+    provider: "s3",
+    s3: { bucket: "fixture-bucket", region: "eu" },
+    createS3Client: async () => ({ config: { credentials: async () => ({ accessKeyId: "fixture" }) } }),
+    createStsClient: async () => ({
+      send: async () => ({ Account: "111111111111", Arn: arn }),
+      destroy() {},
+    }),
+  });
+  const roleSessionA = await s3.resolveInventoryContext();
+  arn = "arn:aws:sts::111111111111:assumed-role/reader/session-b";
+  const roleSessionB = await s3.resolveInventoryContext();
+  assert.equal(roleSessionA, roleSessionB, "same-role assumed-session rotation preserves the context on one adapter");
+  arn = "arn:aws:sts::111111111111:assumed-role/writer/session-c";
+  assert.notEqual(await s3.resolveInventoryContext(), roleSessionB, "a role change updates the context on one adapter");
+});
+
 test("custom S3 endpoints require an explicit stable principal identifier", async () => {
   const create = (principalId) => createCloudStorage({
     provider: "s3",
