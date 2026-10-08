@@ -21,6 +21,19 @@ function freePort() {
   });
 }
 
+function findAbsentPid() {
+  for (let candidate = 2_147_000_000, attempts = 0; candidate > 1_000_000 && attempts < 4096; candidate -= 1, attempts += 1) {
+    try {
+      process.kill(candidate, 0);
+    } catch (error) {
+      if (error.code === "ESRCH") return candidate;
+      if (error.code === "EPERM" || error.code === "EACCES") continue;
+      throw error;
+    }
+  }
+  throw new Error("Could not find a provably absent process id for the disposable lock fixture");
+}
+
 function request(port, requestPath, options = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: "127.0.0.1", port, path: requestPath, ...options }, (res) => {
@@ -46,6 +59,7 @@ function childSource(localCrash = false) {
   return `
     const fs=require("fs");
     const path=require("path");
+    if(process.env.CLAIM_TIMER_DELAY_MS){const expectedDelay=Number(process.env.CLAIM_TIMER_DELAY_MS);const originalSetInterval=global.setInterval;global.setInterval=function(callback,delay,...args){if(delay!==expectedDelay)return originalSetInterval(callback,delay,...args);return originalSetInterval(function(...callbackArgs){const result=callback.apply(this,callbackArgs);if(fs.existsSync(process.env.CLAIM_SWAP_COMPLETED))fs.writeFileSync(process.env.CLAIM_TIMER_SIGNAL,"tick");return result;},delay,...args);};}
     const cloudPath=${JSON.stringify(CLOUD)};
     const logPath=process.env.FAKE_PROVIDER_LOG;
     const statePath=process.env.FAKE_PROVIDER_STATE;
@@ -67,6 +81,7 @@ function childSource(localCrash = false) {
     };
     require.cache[cloudPath]={id:cloudPath,filename:cloudPath,loaded:true,exports:{createCloudStorage:()=>fake}};
     ${localCrash ? `const originalRename=fs.renameSync; fs.renameSync=(from,to)=>{const result=originalRename(from,to); if(process.env.LOCAL_CRASH_TO&&String(from).includes(".rootark-move-")&&String(from).endsWith(".source")&&path.resolve(to)===path.resolve(process.env.LOCAL_CRASH_TO)) process.kill(process.pid,"SIGKILL"); return result;};` : ""}
+    if(process.env.CLAIM_SWAP_LOCK_PATH){const lockPath=path.resolve(process.env.CLAIM_SWAP_LOCK_PATH);const evidencePath=path.resolve(process.env.CLAIM_SWAP_EVIDENCE_PATH);const originalRename=fs.renameSync;const originalOpenSync=fs.openSync;const originalReadSync=fs.readSync;let evidenceFd=null;let swapped=false;let completionQueued=false;fs.renameSync=(from,to)=>{if(!swapped&&path.resolve(String(from))===lockPath&&path.resolve(String(to))===evidencePath){swapped=true;fs.writeFileSync(lockPath,process.env.CLAIM_SWAP_CONTENTS);const result=originalRename(from,to);fs.writeFileSync(process.env.CLAIM_SWAP_OBSERVED,"swapped");return result;}return originalRename(from,to);};fs.openSync=(file,...args)=>{const fd=originalOpenSync(file,...args);if(path.resolve(String(file))===evidencePath)evidenceFd=fd;return fd;};fs.readSync=(fd,...args)=>{const result=originalReadSync(fd,...args);if(swapped&&!completionQueued&&fd===evidenceFd&&result>0){completionQueued=true;setImmediate(()=>fs.writeFileSync(process.env.CLAIM_SWAP_COMPLETED,"verified"));}return result;};}
     require(${JSON.stringify(SERVER)});
     if(process.env.CLAIM_PAUSE_POST_START) setImmediate(installPause); else if(installPause) installPause();
   `;
@@ -77,6 +92,7 @@ function serverEnv(dir, port, extra = {}) {
     ...process.env,
     PORT: String(port),
     DB_ENABLED: "false",
+    ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
     WEBDAV_ENABLED: "true",
     WEBDAV_ALLOW_MOVE: "true",
     UPLOAD_SCAN_ENABLED: "false",
@@ -322,6 +338,45 @@ test("WebDAV MOVE persists remote intent before provider effects", { timeout: 90
       if (first?.child.exitCode === null) await stop(first.child);
       if (second?.child.exitCode === null) await stop(second.child);
       if (third?.child.exitCode === null) await stop(third.child);
+      fs.rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+  await t.test("same-inode lock replacement at stale takeover rename fails closed before provider retry", async () => {
+    const f = fixture();
+    let crashed;
+    let second;
+    const swapped = path.join(f.dir, "claim-swapped");
+    try {
+      crashed = await startServer(f.dir, { FAKE_PROVIDER_MODE: "crash-after-upload" });
+      try { await move(f.dir, crashed.port); } catch {}
+      await waitFor(() => readJournal(f.dir)?.cloud?.state === "destination_upload_uncertain");
+      await stop(crashed.child);
+      const journal = readJournal(f.dir);
+      const lockPath = path.join(f.dir, "temp", ".incoming", "rootark-webdav-move-" + journal.transactionId + ".lock");
+      const evidencePath = lockPath + ".takeover" + path.sep + "evidence";
+      const original = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+      const stale = { ...original, pid: findAbsentPid(), processStartIdentity: null, claimedAt: new Date(Date.now() - 5000).toISOString() };
+      fs.writeFileSync(lockPath, JSON.stringify(stale));
+      fs.utimesSync(lockPath, new Date(0), new Date(0));
+      const replacement = JSON.stringify({ ...stale, token: "raced-replacement-token", pid: process.pid, claimedAt: new Date().toISOString() });
+      const verified = path.join(f.dir, "claim-verification-complete");
+      const timerSignal = path.join(f.dir, "reconciliation-timer-entered");
+      second = await startServer(f.dir, { CLAIM_SWAP_LOCK_PATH: lockPath, CLAIM_SWAP_EVIDENCE_PATH: evidencePath, CLAIM_SWAP_CONTENTS: replacement, CLAIM_SWAP_OBSERVED: swapped, CLAIM_SWAP_COMPLETED: verified, CLAIM_TIMER_DELAY_MS: "1200", CLAIM_TIMER_SIGNAL: timerSignal, WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS: "1200", CLOUD_TEMP_RECONCILIATION_INTERVAL_MS: "30000", CLOUD_UPLOAD_RECONCILIATION_INTERVAL_MS: "30000" });
+      await waitFor(() => fs.existsSync(swapped)).catch((error) => {
+        const pendingJournal = journalPaths(f.dir);
+        const stderrTail = second.stderr().slice(-4_000);
+        let journalState = null;
+        try { if (pendingJournal) journalState = JSON.parse(fs.readFileSync(pendingJournal, "utf8")); } catch (journalError) { journalState = { readError: journalError.message }; }
+        throw new Error(`${error.message}; childExitCode=${second.child.exitCode}; stderrTail=${stderrTail}; swapped=${fs.existsSync(swapped)}; verified=${fs.existsSync(verified)}; timerSignal=${fs.existsSync(timerSignal)}; lockExists=${fs.existsSync(lockPath)}; evidenceExists=${fs.existsSync(evidencePath)}; journalPath=${pendingJournal}; journal=${JSON.stringify(journalState)}; providerCalls=${JSON.stringify(calls(f.dir))}`);
+      });
+      await waitFor(() => fs.existsSync(verified));
+      await waitFor(() => fs.existsSync(timerSignal));
+      assert.equal(calls(f.dir).filter((entry) => entry.operation === "upload").length, 1, "a path replacement after identity validation must not trigger a provider retry");
+      assert.ok(journalPaths(f.dir), "ambiguous takeover must remain pending for operator recovery");
+      assert.equal(fs.readFileSync(evidencePath, "utf8"), replacement);
+    } finally {
+      if (crashed?.child.exitCode === null) await stop(crashed.child);
+      if (second?.child.exitCode === null) await stop(second.child);
       fs.rmSync(f.dir, { recursive: true, force: true });
     }
   });

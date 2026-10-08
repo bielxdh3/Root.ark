@@ -47,16 +47,22 @@ function createCloudStorage(options = {}) {
   function bucket() { if (!options.s3?.bucket) throw cloudError("configuration", "S3 bucket is not configured"); return options.s3.bucket; }
   function folder() { if (!options.gdrive?.folderId) throw cloudError("configuration", "Google Drive folder is not configured"); return options.gdrive.folderId; }
   function escapeQuery(value) { return String(value).replace(/'/g, "\\'"); }
-  async function findDriveFile(cloudKey) {
-    const result = await (await drive()).files.list({ q: `appProperties has { key='rootArkKey' and value='${escapeQuery(cloudKey)}' } and trashed=false`, fields: "files(id,name)", spaces: "drive", pageSize: 100 });
+  async function findDriveFile(cloudKey, folderId, area) {
+    const result = await (await drive()).files.list({
+      q: `appProperties has { key='rootArkKey' and value='${escapeQuery(cloudKey)}' } and trashed=false`,
+      fields: "files(id,name,parents,appProperties)",
+      spaces: "drive",
+      pageSize: 100,
+    });
     const files = result.data.files || [];
+    for (const file of files) assertDriveFileOwnership(file, cloudKey, folderId, area);
     return files.sort((a, b) => String(a.id).localeCompare(String(b.id)))[0] || null;
   }
   async function resolveUploadId(folderId, fileName, area = "uploads") {
     assertProvider();
     if (provider !== "gdrive") throw cloudError("unsupported_provider", "Stable upload IDs are supported only by Google Drive");
     const cloudKey = objectKey(folderId, fileName, area);
-    const existing = await findDriveFile(cloudKey);
+    const existing = await findDriveFile(cloudKey, folderId, area);
     if (existing) {
       const file = await getDriveFile(existing.id);
       assertDriveFileOwnership(file, cloudKey, folderId, area);
@@ -76,7 +82,7 @@ function createCloudStorage(options = {}) {
       || String(properties.rootArkFolderId || "") !== String(folderId || rootFolderId)
       || String(properties.rootArkArea || "") !== String(area)
       || !Array.isArray(file.parents) || !file.parents.includes(folder())) {
-      throw cloudError("provider_error", "Pinned Google Drive file does not belong to this object");
+      throw cloudError("provider_error", "Google Drive file does not belong to this object");
     }
   }
   function driveRequestBody(folderId, fileName, area, cloudKey) {
@@ -175,37 +181,118 @@ function createCloudStorage(options = {}) {
       if (!isDriveFileId(providerFileId)) throw cloudError("invalid_path", "Google Drive file ID is invalid");
       return uploadToPinnedDriveId(localPath, providerFileId, driveRequestBody(folderId, fileName, area, cloudKey), cloudKey, folderId, area);
     }
-    const existing = await findDriveFile(cloudKey);
+    const existing = await findDriveFile(cloudKey, folderId, area);
     const requestBody = driveRequestBody(folderId, fileName, area, cloudKey);
     const media = { body: fs.createReadStream(localPath) };
-    if (existing) { await (await drive()).files.update({ fileId: existing.id, requestBody, media, fields: "id" }); return { provider, key: cloudKey, id: existing.id }; }
+    if (existing) {
+      const current = await getDriveFile(existing.id);
+      assertDriveFileOwnership(current, cloudKey, folderId, area);
+      await (await drive()).files.update({ fileId: existing.id, requestBody, media, fields: "id" });
+      return { provider, key: cloudKey, id: existing.id };
+    }
     const result = await (await drive()).files.create({ requestBody: { ...requestBody, parents: [folder()] }, media, fields: "id" }); return { provider, key: cloudKey, id: result.data.id };
   }
-  async function download(folderId, fileName, localPath, area = "uploads") {
+  async function download(folderId, fileName, localPath, area = "uploads", canPublish = () => true) {
     assertProvider(); if (!enabled() || fs.existsSync(localPath)) return false;
-    const cloudKey = objectKey(folderId, fileName, area); fs.mkdirSync(path.dirname(localPath), { recursive: true });
+    const cloudKey = objectKey(folderId, fileName, area);
+    const parentPath = path.dirname(localPath);
+    fs.mkdirSync(parentPath, { recursive: true });
+    const stagingDirectory = fs.mkdtempSync(path.join(parentPath, ".rootark-cloud-cache-"));
+    const stagedPath = path.join(stagingDirectory, path.basename(localPath));
     try {
       let input;
       if (provider === "s3") { const bucketName = bucket(); input = (await (await s3()).send(new (require("@aws-sdk/client-s3").GetObjectCommand)({ Bucket: bucketName, Key: cloudKey }))).Body; }
-      else { const existing = await findDriveFile(cloudKey); if (!existing) return false; input = (await (await drive()).files.get({ fileId: existing.id, alt: "media" }, { responseType: "stream" })).data; }
-      await pipeline(input, fs.createWriteStream(localPath)); return true;
-    } catch (error) { fs.rmSync(localPath, { force: true }); throw classify(error); }
+      else {
+        const existing = await findDriveFile(cloudKey, folderId, area);
+        if (!existing) return false;
+        const current = await getDriveFile(existing.id);
+        assertDriveFileOwnership(current, cloudKey, folderId, area);
+        input = (await (await drive()).files.get({ fileId: existing.id, alt: "media" }, { responseType: "stream" })).data;
+      }
+      await pipeline(input, fs.createWriteStream(stagedPath));
+      if (typeof canPublish === "function" && !canPublish()) return false;
+      if (fs.existsSync(localPath)) return true;
+      fs.renameSync(stagedPath, localPath);
+      return true;
+    } catch (error) { throw classify(error); }
+    finally { fs.rmSync(stagingDirectory, { recursive: true, force: true }); }
   }
   async function remove(folderId, fileName, area = "uploads") {
     assertProvider(); if (!enabled()) return false; const cloudKey = objectKey(folderId, fileName, area);
     if (provider === "s3") { const bucketName = bucket(); await (await s3()).send(new (require("@aws-sdk/client-s3").DeleteObjectCommand)({ Bucket: bucketName, Key: cloudKey })); return true; }
-    const existing = await findDriveFile(cloudKey); if (!existing) return false; await (await drive()).files.delete({ fileId: existing.id }); return true;
+    const existing = await findDriveFile(cloudKey, folderId, area);
+    if (!existing) return false;
+    const current = await getDriveFile(existing.id);
+    assertDriveFileOwnership(current, cloudKey, folderId, area);
+    await (await drive()).files.delete({ fileId: existing.id });
+    return true;
   }
   async function removePrefix(value) {
     assertProvider(); if (!enabled()) return false;
     const clean = normalizePrefix(value); if (clean !== prefix && !clean.startsWith(`${prefix}/`)) throw cloudError("invalid_prefix", "Prefix is outside cloud root");
     if (provider === "s3") { const bucketName = bucket(); let token; do { const page = await (await s3()).send(new (require("@aws-sdk/client-s3").ListObjectsV2Command)({ Bucket: bucketName, Prefix: `${clean}/`, ContinuationToken: token })); const objects = (page.Contents || []).map(({ Key }) => ({ Key })).filter(({ Key }) => Key); if (objects.length) { const deleted = await (await s3()).send(new (require("@aws-sdk/client-s3").DeleteObjectsCommand)({ Bucket: bucketName, Delete: { Objects: objects } })); if (deleted.Errors?.length) throw cloudError("partial_delete", "Cloud prefix deletion was incomplete"); } token = page.NextContinuationToken; } while (token); return true; }
-    const [, area, folderId] = clean.split("/"); if (!area || !folderId) throw cloudError("invalid_prefix", "Invalid cloud prefix"); let token; do { const page = await (await drive()).files.list({ q: `appProperties has { key='rootArkFolderId' and value='${escapeQuery(folderId)}' } and appProperties has { key='rootArkArea' and value='${escapeQuery(area)}' } and trashed=false`, fields: "nextPageToken,files(id)", spaces: "drive", pageToken: token, pageSize: 100 }); for (const file of page.data.files || []) await (await drive()).files.delete({ fileId: file.id }); token = page.data.nextPageToken; } while (token); return true;
+    const relative = clean.startsWith(`${prefix}/`) ? clean.slice(prefix.length + 1) : "";
+    const [area, ...folderSegments] = relative.split("/");
+    const folderId = folderSegments.join("/");
+    if (!folderId || !["uploads", "temp"].includes(area)) throw cloudError("invalid_prefix", "Invalid cloud prefix");
+    const files = await list(folderId, area);
+    for (const file of files) {
+      const current = await getDriveFile(file.id);
+      assertDriveFileOwnership(current, file.key, folderId, area);
+      await (await drive()).files.delete({ fileId: file.id });
+    }
+    return true;
   }
   async function list(folderId, area = "uploads") {
     assertProvider(); if (!enabled()) return []; const prefixKey = `${key(folderId, "", area)}/`; const files = [];
-    if (provider === "s3") { const bucketName = bucket(); let token; do { const page = await (await s3()).send(new (require("@aws-sdk/client-s3").ListObjectsV2Command)({ Bucket: bucketName, Prefix: prefixKey, ContinuationToken: token })); for (const item of page.Contents || []) { const name = path.posix.basename(item.Key || ""); if (name) files.push({ name, key: item.Key }); } token = page.NextContinuationToken; } while (token); return files; }
-    let token; do { const page = await (await drive()).files.list({ q: `appProperties has { key='rootArkFolderId' and value='${escapeQuery(folderId || rootFolderId)}' } and appProperties has { key='rootArkArea' and value='${escapeQuery(area)}' } and trashed=false`, fields: "nextPageToken,files(id,name,appProperties)", spaces: "drive", pageToken: token, pageSize: 100 }); for (const file of page.data.files || []) { const cloudKey = file.appProperties?.rootArkKey || ""; const name = path.posix.basename(cloudKey) || path.basename(file.name || ""); if (name) files.push({ name, id: file.id, key: cloudKey }); } token = page.data.nextPageToken; } while (token); return files;
+    if (provider === "s3") {
+      const bucketName = bucket(); let token;
+      do {
+        const page = await (await s3()).send(new (require("@aws-sdk/client-s3").ListObjectsV2Command)({ Bucket: bucketName, Prefix: prefixKey, ContinuationToken: token }));
+        for (const item of page.Contents || []) {
+          const objectKey = String(item.Key || "");
+          if (!objectKey.startsWith(prefixKey)) continue;
+          const name = objectKey.slice(prefixKey.length);
+          if (!name || name.includes("/") || name === "." || name === "..") continue;
+          const entry = { name, key: objectKey };
+          if (Number.isFinite(item.Size)) entry.size = item.Size;
+          if (item.LastModified instanceof Date && Number.isFinite(item.LastModified.getTime())) {
+            entry.modifiedAt = item.LastModified.toISOString();
+            entry.uploadedAt = entry.modifiedAt;
+          }
+          files.push(entry);
+        }
+        token = page.NextContinuationToken;
+      } while (token);
+      return files;
+    }
+    let token;
+    do {
+      const page = await (await drive()).files.list({
+        q: `appProperties has { key='rootArkFolderId' and value='${escapeQuery(folderId || rootFolderId)}' } and appProperties has { key='rootArkArea' and value='${escapeQuery(area)}' } and trashed=false`,
+        fields: "nextPageToken,files(id,name,size,createdTime,modifiedTime,parents,appProperties)",
+        spaces: "drive",
+        pageToken: token,
+        pageSize: 100,
+      });
+      for (const file of page.data.files || []) {
+        const properties = file.appProperties || {};
+        const cloudKey = String(properties.rootArkKey || "");
+        const name = path.posix.basename(cloudKey);
+        if (!name || cloudKey !== key(folderId, name, area)
+          || String(properties.rootArkFolderId || "") !== String(folderId || rootFolderId)
+          || String(properties.rootArkArea || "") !== String(area)
+          || !file.id || !Array.isArray(file.parents) || !file.parents.includes(folder())) continue;
+        const entry = { name, id: file.id, key: cloudKey };
+        const size = Number(file.size);
+        if (Number.isFinite(size)) entry.size = size;
+        if (typeof file.createdTime === "string") entry.uploadedAt = file.createdTime;
+        if (typeof file.modifiedTime === "string") entry.modifiedAt = file.modifiedTime;
+        files.push(entry);
+      }
+      token = page.data.nextPageToken;
+    } while (token);
+    return files;
   }
   const run = async (operation, ...args) => {
     try { return await operation(...args); } catch (error) { throw classify(error); }

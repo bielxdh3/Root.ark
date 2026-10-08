@@ -1,10 +1,10 @@
 # Root.ark Issue Ledger
 
-## Current live snapshot — 2026-10-07
+## Current live snapshot — 2026-10-08
 
-GitHub was queried on 2026-10-07 after PR #113 merged. The source `Root/main` SHA was `964f820417baf44f059a04e5363a2a172dccdc7a`, queried before this documentation commit. This is a point-in-time evidence snapshot, not a claim about the branch after these docs are published; re-query GitHub before relying on it as live state. The prior 2026-10-06 snapshots based on `1955eab3d05f72632396eff62ef96d39eedd634b` are retained below as historical evidence.
+GitHub was queried on 2026-10-08 after PR #114 merged. The source `Root/main` SHA was `566a3d24591423c624ef3bcb82290a77ff359210`. This point-in-time query predates publication of this documentation update; merging it advances the default branch, so use the final closure report and exact-SHA checks for the later state. Earlier dated snapshots remain below as historical evidence.
 
-### Open issues and pull requests at source SHA `964f820417baf44f059a04e5363a2a172dccdc7a`
+### Open issues and pull requests at source SHA `566a3d24591423c624ef3bcb82290a77ff359210`
 
 | Item | Live state at query | Remaining acceptance boundary |
 |---|---|---|
@@ -15,11 +15,10 @@ GitHub was queried on 2026-10-07 after PR #113 merged. The source `Root/main` SH
 | #67 | `open` | Backups and revision history do not provide burst detection, a pause/review barrier, protected history, recovery authorization, or deterministic recovery UX. |
 | #68 | `open` | Existing bearer links are not operation-scoped capabilities; least-privilege enforcement and recipient-key delivery remain incomplete. |
 | #94 / PR #95 | `open` / `open` | The process-local limiter does not establish shared/edge enforcement for multi-process deployments; production topology is unverified. |
-| PR #95 | `open`, head `95d99e4a934384fcfa2101dfc210741cd791a3d1`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; merge state `DIRTY` | CodeQL, Analyze, dependency-review, Ubuntu, and Windows checks pass on that stale head; 0 unresolved review threads. Update/rebase and exact-head validation are still required; #94 remains open pending shared or edge enforcement and deployment-topology evidence. |
-| PR #97 | `open`, head `a6a33a92cd6902f303254e60031da4bdc04cec04`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; merge state `CLEAN` | CodeQL, Analyze, dependency-review, Ubuntu, and Windows checks pass on that stale head; 0 unresolved review threads. Selective-sync acceptance gaps remain. |
-| PR #99 | `open`, remote head `93249b2731e1bbe8aa930c5ce28c6183b9529fc4`, base `1955eab3d05f72632396eff62ef96d39eedd634b`; merge state `CLEAN` at query; 0 review threads | Its CodeQL, Analyze, dependency-review, Ubuntu, and Windows checks pass on that head, but the remote base predates source `Root/main` SHA `964f820417baf44f059a04e5363a2a172dccdc7a`. The local PR branch has since merged that source SHA; publication and exact-head checks remain pending. |
-| PR #102 | `open`, head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`, base `9de3c85ab59aa16fc46916abc0cf638c539086ef`; merge state `UNSTABLE` | CodeQL alert gate fails (check run `112556673970`): 74 high and 5 medium alerts. Analyze, dependency-review, Ubuntu, and Windows checks pass on that head. One of 6 review threads remains unresolved at `services/internalFile.js:31`. Update against current main, triage alerts, and resolve review before merge. |
-| PR #114 | `open`, head `e4b9a1bcb43e5089535119109ff93592f63fbcce`, base `964f820417baf44f059a04e5363a2a172dccdc7a`; merge state `UNSTABLE` | CodeQL alert gate fails (check run `113032406735`): 11 high and 3 medium alerts. Ubuntu full validation and Windows syntax/tests fail; Analyze and dependency-review pass. 11 of 32 review threads remain unresolved (10 current, 1 outdated). Do not infer closure from fixes visible only in the local candidate; publish and revalidate the corrected head. |
+| PR #95 | `open`, head `95d99e4a934384fcfa2101dfc210741cd791a3d1`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; merge state `DIRTY` | CodeQL, Analyze, dependency-review, Ubuntu, and Windows checks pass on that head; 0 unresolved review threads. The base is stale; update/rebase and exact-head validation are required. Issue #94 remains open pending shared or edge enforcement and deployment-topology evidence. |
+| PR #97 | `open`, head `a6a33a92cd6902f303254e60031da4bdc04cec04`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; merge state `CLEAN` | CodeQL, Analyze, dependency-review, Ubuntu, and Windows checks pass on that head; 0 unresolved review threads. The base is stale and selective-sync acceptance gaps remain. |
+| PR #99 | `open`, remote head `dfd3d3b58426e06b5cc2bc20d31cf5ff9e049bd7`, base `964f820417baf44f059a04e5363a2a172dccdc7a`; merge state `DIRTY` at query; 0 unresolved review threads | The remote branch had not yet published its merge of current SHA `566a3d24591423c624ef3bcb82290a77ff359210` or the updated snapshot. The local candidate was resolving that merge; publication and exact-head checks were pending. |
+| PR #102 | `open`, head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`, base `9de3c85ab59aa16fc46916abc0cf638c539086ef`; merge state `DIRTY` | CodeQL alert gate fails (check run `112556673970`): 74 high and 5 medium alerts. Analyze, dependency-review, Ubuntu, and Windows checks pass on that head. One review thread remains unresolved at `services/internalFile.js:31`. Update against current main, triage alerts, and resolve review before merge. |
 
 ### Relevant merged restore PRs
 
@@ -32,10 +31,11 @@ GitHub was queried on 2026-10-07 after PR #113 merged. The source `Root/main` SH
 | #111 | merged — restore migration restart boundary regression | `2259f3d76ae51bbc03ebaae1213f1328c30fbb52` |
 | #112 | merged — atomic server master-key publication | `9de3c85ab59aa16fc46916abc0cf638c539086ef` |
 | #113 | merged — restore focus after closing Versions panel | `964f820417baf44f059a04e5363a2a172dccdc7a` |
+| #114 | merged — cloud lifecycle, backup/restore, and security regressions; PR head `3c113718d421c4bccbd09e9163f079031248142d` | `566a3d24591423c624ef3bcb82290a77ff359210` |
 
-The restore model uses compensating rollback for locally controlled domains and a durable, retryable provider-reconciliation queue; it is not a single atomic transaction across storage domains or external providers. If startup migration fails after local commit, the restored state and restart barrier remain for retry or operator recovery; the restore is not automatically rolled back to its prior state.
+The restore model uses compensating rollback for locally controlled domains and a durable, retryable provider-reconciliation queue; it is not a single atomic transaction across storage domains or external providers. If startup migration fails after local commit, the restored state and restart barrier remain for retry or operator recovery; restore is not automatically rolled back to its prior state.
 
-At this query, the exact source SHA `964f820417baf44f059a04e5363a2a172dccdc7a` had successful Security Regression, Dependency Review, CodeQL, and Pages runs (run IDs `37549800190`, `37549800109`, `37549800373`, and `37549799593`). The open moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` remains on `sprintf-js` via `package-lock.json`; GitHub reports no first patched version. This evidence is only for that SHA and does not replace validation of a later final SHA.
+At this query, exact source SHA `566a3d24591423c624ef3bcb82290a77ff359210` had successful Security Regression, CodeQL analysis, default-branch dependency review, and GitHub Pages build/deployment runs (run IDs `37712454578`, `37712454551`, `37712454481`, and `37712453703`). Ubuntu full validation and Windows syntax/tests passed in Security Regression; the PR-only dependency-review job was skipped on this push. The open moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` affects transitive `sprintf-js` via `package-lock.json`; GitHub reports no first patched version. These results apply only to the stated SHA and do not replace validation of a later final SHA.
 
 ## Historical live snapshot — 2026-10-06 (source SHA `1955eab3d05f72632396eff62ef96d39eedd634b`)
 

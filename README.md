@@ -69,17 +69,21 @@ The repository currently contains working foundations for:
 - [x] bounded provider retry/cancellation, idempotency, ciphertext-only attestation, and secret-safe observability helpers;
 - [x] automated syntax, test, dependency, and artifact validation.
 
-### Current automated validation snapshot — 2026-10-06
+### Historical exact-SHA CI snapshot — 2026-10-07
 
-On `Root/main` SHA `1955eab3d05f72632396eff62ef96d39eedd634b`, the push-triggered Security Regression workflow passed Linux full validation and Windows syntax/tests, including the runtime-artifact guard and configured high-severity dependency-audit gate. CodeQL, Dependency Review, and Pages also passed on that exact SHA. This is a dated CI snapshot before the documentation and remaining closure work; it is not evidence for any later SHA and does not authorize release.
+On `Root/main` SHA `964f820417baf44f059a04e5363a2a172dccdc7a`, the push-triggered Security Regression workflow passed Ubuntu Node 22 full validation and Windows Node 22 syntax/tests. CodeQL and the default-branch dependency-review check also passed on this exact SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37549800190), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37549800373), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37549800109)). The PR-only dependency-review job was skipped on the push. This is exact-commit CI evidence; it does not establish browser acceptance, provider interoperability, production deployment safety, or release authorization.
 
-GitHub still reports the moderate `GHSA-hp3w-g68c-fv3c` alert for transitive runtime `sprintf-js`; the advisory reports no first patched version. Deployment-specific TLS, proxy topology, provider interoperability, and production operation have not been validated. Root.ark is not production-ready, and the current runtime must not be described as end-to-end zero-knowledge.
+### Exact-SHA CI snapshot — 2026-10-08 (before PR #99 publication)
+
+At the recorded snapshot, `Root/main` was `566a3d24591423c624ef3bcb82290a77ff359210`. The push-triggered Security Regression workflow passed Ubuntu Node 22 full validation and Windows Node 22 syntax/tests; CodeQL analysis, default-branch dependency review, and GitHub Pages build and deployment also passed on that exact SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37712454578), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37712454551), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37712454481), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37712453703)). The PR-only dependency-review job was skipped on the push. This snapshot predates publication of the documentation PR and is not evidence for the later merge SHA.
 
 ### Historical local release-gate evidence
 
-Phase 15 introduced the local release-gate runner and repaired the release-candidate lockfile to the reviewed `brace-expansion` 5.0.9 integrity. Its recorded local verdict was `RELEASE_GATE_BLOCKED_ENVIRONMENT`: 13 passed, 0 failed, and 1 expected clean-worktree block. This was a candidate-local snapshot, not the current exact-`Root/main` result.
+Phase 15 introduced a local release-gate runner and repaired the release-candidate lockfile to the reviewed `brace-expansion` 5.0.9 integrity. Its recorded candidate-local verdict was `RELEASE_GATE_BLOCKED_ENVIRONMENT`: 13 passed, 0 failed, and 1 expected clean-worktree block. That earlier local result is not the current exact-`Root/main` validation result.
 
-Phase 16 evidence is preserved in [the Phase 16 security review](docs/security/phase-16-final-review.md): 66/66 cross-phase tests and 116/116 syntax checks passed, with separate realtime 4/4 and upload 12/12 boundary runs. That review's disposable-install failure to load the `better-sqlite3` native binding and its then-pending remote CI, browser, provider, and release evidence are historical; exact later CI evidence is listed above. Live deployment, TLS, provider, owner, and release authorization remain separate gates.
+Phase 16 evidence is recorded in [the Phase 16 security review](docs/security/phase-16-final-review.md): 66/66 cross-phase tests and 116/116 syntax checks passed, with separate realtime 4/4 and upload 12/12 boundary runs. The review's then-current disposable-install failure to load the `better-sqlite3` native binding, and its pending remote CI evidence, are historical; the exact-SHA CI evidence above supersedes only the remote-CI status. Browser, provider, live-production/TLS, owner, and release authorization remain separate gates, with release authorization `NOT_AUTHORIZED`.
+
+The historical 2026-10-06 GitHub snapshot at `1955eab3d05f72632396eff62ef96d39eedd634b` is retained in [the issue ledger](docs/issue-ledger.md); it is not the current default-branch SHA.
 
 > [!IMPORTANT]
 > The approved long-term direction includes client-side zero-knowledge encryption. The current implementation predates that architecture and must not be described as zero-knowledge or treated as the final security model.

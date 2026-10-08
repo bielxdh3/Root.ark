@@ -60,7 +60,7 @@ function createWebDavFixture(prefix) {
 }
 
 function serverEnv(port, extra = {}) {
-  return { ...process.env, PORT: String(port), DB_ENABLED: "false", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url"), ...extra };
+  return { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url"), ...extra };
 }
 
 test("PROPFIND rejects malformed and unsupported non-empty bodies while empty requests succeed", { timeout: 20_000 }, async (t) => {
@@ -136,6 +136,52 @@ test("restart recovery restores a source staged by MOVE from the durable journal
   assert.equal(fs.existsSync(stagePath), false);
 });
 
+test("startup incoming cleanup preserves an aged pending WebDAV MOVE journal", { timeout: 20_000 }, async (t) => {
+  const dir = createWebDavFixture("rootark-move-cleanup-preserve-");
+  const id = crypto.randomUUID();
+  const incoming = path.join(dir, "temp", ".incoming");
+  const metadataDirectory = path.join(incoming, `rootark-webdav-move-${id}`, "metadata");
+  fs.mkdirSync(metadataDirectory, { recursive: true });
+  const sourcePath = path.join(dir, "uploads", "source.txt");
+  const journalPath = path.join(incoming, `rootark-webdav-move-${id}.json`);
+  const nextAttemptAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  fs.writeFileSync(journalPath, JSON.stringify({
+    version: 1,
+    transactionId: id,
+    phase: "cloud_source_delete_intent",
+    journalPath,
+    sourcePath,
+    destinationPath: path.join(dir, "uploads", "target.txt"),
+    stagePath: path.join(dir, "uploads", `.rootark-move-${id}.source`),
+    destinationBackupPath: path.join(dir, "uploads", `.rootark-move-${id}.destination`),
+    replacementInstalled: true,
+    completedOperations: ["source.stage", "replacement.install", "cloud.destination.upload"],
+    metadata: { directory: metadataDirectory, files: {} },
+    cloud: { state: "source_delete_intent", nextAttemptAt, attempts: 1, maxAttempts: 5 },
+  }));
+  const staleTime = new Date(Date.now() - 10 * 60 * 1000);
+  fs.utimesSync(journalPath, staleTime, staleTime);
+  const uploadStagingPath = path.join(incoming, `${Date.now()}-${"a".repeat(16)}.upload`);
+  fs.writeFileSync(uploadStagingPath, "partial upload");
+  fs.utimesSync(uploadStagingPath, staleTime, staleTime);
+  const webDavPutStagingPath = path.join(incoming, `${Date.now()}-${"c".repeat(16)}.webdav`);
+  fs.writeFileSync(webDavPutStagingPath, "partial WebDAV upload");
+  fs.utimesSync(webDavPutStagingPath, staleTime, staleTime);
+  const chunkIncoming = path.join(dir, "temp", ".chunks", "incoming");
+  fs.mkdirSync(chunkIncoming, { recursive: true });
+  const chunkStagingPath = path.join(chunkIncoming, "b".repeat(32));
+  fs.writeFileSync(chunkStagingPath, "partial chunk");
+  fs.utimesSync(chunkStagingPath, staleTime, staleTime);
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: "ignore", windowsHide: true });
+  t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
+  await ready(port);
+  assert.equal(fs.existsSync(journalPath), true, "generic incoming cleanup must preserve durable retry journals");
+  assert.equal(fs.existsSync(uploadStagingPath), false, "stale simple-upload staging files should still be cleaned");
+  assert.equal(fs.existsSync(webDavPutStagingPath), false, "stale WebDAV PUT staging files should still be cleaned");
+  assert.equal(fs.existsSync(chunkStagingPath), false, "stale chunk-upload staging files should still be cleaned");
+});
+
 test("metadata checksum mismatch fails closed during MOVE journal recovery", { timeout: 10_000 }, async () => {
   const dir = createWebDavFixture("rootark-move-checksum-");
   const id = crypto.randomUUID();
@@ -158,6 +204,94 @@ test("metadata checksum mismatch fails closed during MOVE journal recovery", { t
   const code = await new Promise((resolve) => { const timer = setTimeout(() => { child.kill(); resolve(0); }, 5000); child.once("exit", (value) => { clearTimeout(timer); resolve(value); }); });
   fs.rmSync(dir, { recursive: true, force: true });
   assert.notEqual(code, 0);
+});
+
+test("oversized WebDAV MOVE journal fails closed before startup recovery", { timeout: 10_000 }, async () => {
+  const dir = createWebDavFixture("rootark-move-oversized-journal-");
+  const id = crypto.randomUUID();
+  const incoming = path.join(dir, "temp", ".incoming");
+  const metadataDirectory = path.join(incoming, `rootark-webdav-move-${id}`, "metadata");
+  fs.mkdirSync(metadataDirectory, { recursive: true });
+  const sourcePath = path.join(dir, "uploads", "source.txt");
+  const stagePath = path.join(dir, "uploads", `.rootark-move-${id}.source`);
+  fs.writeFileSync(stagePath, "source");
+  const metadataFiles = {};
+  for (const [index, file] of ["public-links.json", "file-permissions.json", "file-expirations.json", "file-versions.json", "encrypted-files.json"].entries()) {
+    metadataFiles[`./data/${file}`] = { present: false, path: path.join(metadataDirectory, `${index}-${file}.snapshot`), checksum: null };
+  }
+  const journalPath = path.join(incoming, `rootark-webdav-move-${id}.json`);
+  fs.writeFileSync(journalPath, JSON.stringify({
+    version: 1,
+    transactionId: id,
+    phase: "source_staged",
+    journalPath,
+    sourcePath,
+    destinationPath: path.join(dir, "uploads", "target.txt"),
+    stagePath,
+    destinationBackupPath: path.join(dir, "uploads", `.rootark-move-${id}.destination`),
+    destinationExisted: false,
+    replacementInstalled: false,
+    completedOperations: ["source.stage"],
+    metadata: { directory: metadataDirectory, files: metadataFiles },
+    padding: "x".repeat(1024 * 1024),
+  }));
+
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: "ignore", windowsHide: true });
+  const code = await new Promise((resolve) => {
+    const timer = setTimeout(() => { child.kill(); resolve(0); }, 5000);
+    child.once("exit", (value) => { clearTimeout(timer); resolve(value ?? 1); });
+  });
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.notEqual(code, 0, "startup must reject oversized internal recovery records");
+});
+
+test("oversized WebDAV MOVE metadata snapshot fails closed before checksum verification", { timeout: 10_000 }, async () => {
+  const dir = createWebDavFixture("rootark-move-oversized-snapshot-");
+  const id = crypto.randomUUID();
+  const incoming = path.join(dir, "temp", ".incoming");
+  const metadataDirectory = path.join(incoming, `rootark-webdav-move-${id}`, "metadata");
+  fs.mkdirSync(metadataDirectory, { recursive: true });
+  const snapshotPath = path.join(metadataDirectory, "0-public-links.json.snapshot");
+  const descriptor = fs.openSync(snapshotPath, "w");
+  try { fs.ftruncateSync(descriptor, 16 * 1024 * 1024 + 1); } finally { fs.closeSync(descriptor); }
+  const sourcePath = path.join(dir, "uploads", "source.txt");
+  const stagePath = path.join(dir, "uploads", `.rootark-move-${id}.source`);
+  fs.writeFileSync(stagePath, "source");
+  const metadataFiles = {};
+  for (const [index, file] of ["public-links.json", "file-permissions.json", "file-expirations.json", "file-versions.json", "encrypted-files.json"].entries()) {
+    metadataFiles[`./data/${file}`] = index === 0
+      ? { present: true, path: snapshotPath, checksum: "00".repeat(32) }
+      : { present: false, path: path.join(metadataDirectory, `${index}-${file}.snapshot`), checksum: null };
+  }
+  const journalPath = path.join(incoming, `rootark-webdav-move-${id}.json`);
+  fs.writeFileSync(journalPath, JSON.stringify({
+    version: 1,
+    transactionId: id,
+    phase: "source_staged",
+    journalPath,
+    sourcePath,
+    destinationPath: path.join(dir, "uploads", "target.txt"),
+    stagePath,
+    destinationBackupPath: path.join(dir, "uploads", `.rootark-move-${id}.destination`),
+    destinationExisted: false,
+    replacementInstalled: false,
+    completedOperations: ["source.stage"],
+    metadata: { directory: metadataDirectory, files: metadataFiles },
+  }));
+
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const code = await new Promise((resolve) => {
+    const timer = setTimeout(() => { child.kill(); resolve(0); }, 5000);
+    child.once("exit", (value) => { clearTimeout(timer); resolve(value ?? 1); });
+  });
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.notEqual(code, 0, "startup must reject an oversized metadata snapshot");
+  assert.match(stderr, /bounded regular file|exceeds its size limit/, "recovery must reject the snapshot at the bounded-read boundary");
 });
 
 test("configured WebSocket rate boundary is enforced at runtime", { timeout: 20_000 }, async (t) => {

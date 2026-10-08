@@ -8,9 +8,10 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
+const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
 
 const ROOT = path.resolve(__dirname, "..");
-const SERVER = path.join(ROOT, "server.js");
+const SERVER = process.env.ROOTARK_TEST_SERVER || path.join(ROOT, "server.js");
 const PUBLIC = path.join(ROOT, "public");
 const TIMEOUT_MS = 10_000;
 const FOLDER_ID = "upload-safety";
@@ -93,14 +94,14 @@ function isContained(parent, candidate) {
   return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
 }
 
-async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true } = {}) {
+async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, uploaderPermissions = {}, envOverrides = {} } = {}) {
   const password = crypto.randomBytes(24).toString("base64url");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-upload-safety-"));
   const quarantineDir = path.join(dir, "quarantine");
   fs.mkdirSync(path.join(dir, "data"));
   fs.cpSync(PUBLIC, path.join(dir, "public"), { recursive: true });
   fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([
-    { username: "uploader", password: bcrypt.hashSync(password, 10), role: "user", permissions: { upload: true, listFiles: true }, sessionVersion: 0 },
+    { username: "uploader", password: bcrypt.hashSync(password, 10), role: "user", permissions: { upload: true, listFiles: true, ...uploaderPermissions }, sessionVersion: 0 },
     { username: "viewer", password: bcrypt.hashSync(password, 10), role: "user", permissions: {}, sessionVersion: 0 },
   ]));
   fs.writeFileSync(path.join(dir, "data", "folders.json"), JSON.stringify([
@@ -128,12 +129,14 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
       ...process.env,
       PORT: String(port),
       DB_ENABLED: "false",
+      ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
       CLOUD_STORAGE_PROVIDER: "local",
       UPLOAD_SCAN_ENABLED: "true",
       UPLOAD_SCAN_PROVIDER: "disabled",
       UPLOAD_BLOCK_EXECUTABLES: "true",
       UPLOAD_QUARANTINE_DIR: quarantineDir,
       JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+      ...envOverrides,
     },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
@@ -153,6 +156,27 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
   });
   if (waitForReady) assert.equal((await waitForServer(port)).status, 200);
   return { dir, port, quarantineDir, password, chunkRoot, child, stdout, stderr };
+}
+
+async function startGatedClamAv() {
+  const scans = [];
+  const server = net.createServer((socket) => {
+    let markStarted;
+    let release;
+    const gate = {
+      started: new Promise((resolve) => { markStarted = resolve; }),
+      release: () => release(),
+    };
+    gate.releasePromise = new Promise((resolve) => { release = resolve; });
+    scans.push(gate);
+    socket.once("data", () => markStarted());
+    gate.releasePromise.then(() => socket.end("stream: OK\0"));
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  return { server, port: server.address().port, scans };
 }
 
 async function upload(port, session, filename, bytes) {
@@ -300,6 +324,29 @@ test("authorized harmless multipart upload enters the selected folder pending ar
   assert.deepEqual(fs.existsSync(harness.quarantineDir) ? fs.readdirSync(harness.quarantineDir) : [], []);
 });
 
+test("wrong encrypted-file password stays an input error and records failed decrypt only", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t, { uploaderPermissions: { approve: true } });
+  const session = await login(harness.port, "uploader", harness.password);
+  const correctPassword = "correct-test-file-password";
+  const payload = multipartParts([
+    { field: "encryptionLevel", bytes: "password" },
+    { field: "password", bytes: correctPassword },
+    { filename: "password-check.txt", bytes: Buffer.from("disposable encrypted fixture") },
+  ]);
+  const uploaded = await uploadPayload(harness.port, session, payload);
+  assert.equal(uploaded.status, 200, uploaded.body);
+  const approved = await postJson(harness.port, session, `/approve/password-check.txt?folderId=${FOLDER_ID}`, {});
+  assert.equal(approved.status, 200, approved.body);
+
+  const wrongPassword = await postJson(harness.port, session, `/encrypted-download/password-check.txt?folderId=${FOLDER_ID}`, { password: "wrong-test-file-password" });
+  assert.equal(wrongPassword.status, 422, wrongPassword.body);
+  const stillAuthenticated = await request(harness.port, "/auth/me", { headers: { cookie: session.cookie } });
+  assert.equal(stillAuthenticated.status, 200, stillAuthenticated.body);
+  const audit = JSON.parse(fs.readFileSync(path.join(harness.dir, "data", "audit-logs.json"), "utf8"));
+  assert.ok(audit.logs.some((entry) => entry.eventType === "file.decrypt.failed" && entry.result === "failure"));
+  assert.equal(audit.logs.some((entry) => entry.eventType === "file.decrypt" && entry.result === "success"), false);
+});
+
 test("traversal-style multipart filenames stay contained in the selected folder", { timeout: 30_000 }, async (t) => {
   const harness = await createHarness(t);
   const session = await login(harness.port, "uploader", harness.password);
@@ -354,6 +401,54 @@ test("users without upload permission are rejected before Multer creates artifac
   assert.equal(response.status, 403);
   assert.deepEqual(JSON.parse(response.body), { error: "Permissao negada: upload" });
   assertRejectedClean(harness, response, 403);
+});
+
+test("dot-segment upload IDs are rejected without touching sibling chunk sessions", { timeout: 30_000 }, async (t) => {
+  const siblingId = "preserved-sibling-session";
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId: siblingId, files: { "sentinel.txt": "preserve this session" } }],
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const siblingDirectory = path.join(harness.chunkRoot, FOLDER_ID, siblingId);
+
+  for (const uploadId of [".", ".."]) {
+    const response = await uploadChunk(harness.port, session, {
+      uploadId,
+      originalName: "invalid.txt",
+      chunkIndex: 0,
+      totalChunks: 1,
+      bytes: Buffer.from("must not be staged"),
+    });
+    assert.equal(response.status, 400, response.body);
+    assert.equal(fs.readFileSync(path.join(siblingDirectory, "sentinel.txt"), "utf8"), "preserve this session");
+    assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
+  }
+});
+
+test("upload chunk route limit rejects requests before Multer writes staging files", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t, { envOverrides: { ROUTE_RATE_LIMIT_MAX: "1" } });
+  const session = await login(harness.port, "uploader", harness.password);
+  const first = await uploadChunk(harness.port, session, {
+    uploadId: "rate-limited-first",
+    originalName: "first.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.from("first"),
+  });
+  assert.equal(first.status, 200, first.body);
+
+  const rejectedId = "rate-limited-before-multer";
+  const rejected = await uploadChunk(harness.port, session, {
+    uploadId: rejectedId,
+    originalName: "rejected.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.from("must not be staged"),
+  });
+  assert.equal(rejected.status, 429, rejected.body);
+  assert.match(rejected.headers["retry-after"] || "", /^\d+$/);
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, rejectedId)), false);
+  assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
 });
 
 test("Multer rejects malformed or disallowed multipart bodies without artifacts", { timeout: 30_000 }, async (t) => {
@@ -473,6 +568,44 @@ test("chunk uploads scrub legacy secrets and require the final password before s
   assert.equal(JSON.parse(acceptedFinal.body).complete, true);
   assert.equal(fs.existsSync(newSessionDir), false);
   assert.equal((harness.stdout.join("") + harness.stderr.join("")).includes(password), false);
+});
+
+test("chunk session ids and numeric chunk indexes remain contained at their boundaries", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t);
+  const session = await login(harness.port, "uploader", harness.password);
+
+  const traversal = await uploadChunk(harness.port, session, {
+    uploadId: "../outside-session",
+    originalName: "bounded.txt",
+    chunkIndex: 0,
+    totalChunks: 1,
+    bytes: "must not escape",
+  });
+  assert.equal(traversal.status, 400, traversal.body);
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, "outside-session")), false);
+
+  const uploadId = "bounded-index";
+  const acceptedBoundary = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "bounded.txt",
+    chunkIndex: 1999,
+    totalChunks: 2000,
+    bytes: "last allowed index",
+  });
+  assert.equal(acceptedBoundary.status, 200, acceptedBoundary.body);
+  assert.equal(JSON.parse(acceptedBoundary.body).complete, false);
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  assert.equal(fs.readFileSync(path.join(sessionDir, "1999.part"), "utf8"), "last allowed index");
+
+  const rejectedBoundary = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "bounded.txt",
+    chunkIndex: 2000,
+    totalChunks: 2000,
+    bytes: "out of range",
+  });
+  assert.equal(rejectedBoundary.status, 400, rejectedBoundary.body);
+  assert.equal(fs.existsSync(path.join(sessionDir, "2000.part")), false);
 });
 
 test("malformed, unreadable, and orphan chunk sessions cannot overwrite retained parts", { timeout: 45_000 }, async (t) => {
@@ -629,4 +762,300 @@ test("chunk upload startup fails closed when chunk-session enumeration cannot be
       await assert.rejects(request(harness.port, "/login.html"));
     });
   }
+});
+
+test("folder lifecycle lock timeouts reject uploads and remove all disposable staging files", { timeout: 30_000 }, async (t) => {
+  const uploadId = "lifecycle-timeout-chunk";
+  let timeoutResponseMarker;
+  const harness = await createHarness(t, {
+    chunkSessions: [{
+      uploadId,
+      files: {
+        "metadata.json": legacyChunkMetadata(uploadId, {
+          originalName: "timeout-chunk.txt",
+          fileName: "timeout-chunk.txt",
+          totalChunks: 1,
+          encryptionLevel: "none",
+        }),
+      },
+    }],
+    preloadSource: ({ dir }) => {
+      const sessionDir = path.join(dir, "temp", ".chunks", FOLDER_ID, uploadId);
+      timeoutResponseMarker = path.join(dir, "chunk-timeout-response-marker.txt");
+      return [
+        "const lockModule = require(" + JSON.stringify(path.join(ROOT, "services", "fileLifecycleLock.js")) + ");",
+        "const create = lockModule.createFileLifecycleLock;",
+        "lockModule.createFileLifecycleLock = (options) => create({ ...options, timeoutMs: 150, pollMs: 5 });",
+        'const fs = require("node:fs");',
+        `const expressResponse = require(${JSON.stringify(require.resolve("express/lib/response", { paths: [ROOT] }))});`,
+        `const sessionDir = ${JSON.stringify(sessionDir)};`,
+        `const markerPath = ${JSON.stringify(timeoutResponseMarker)};`,
+        "const originalJson = expressResponse.json;",
+        'expressResponse.json = function (...args) { if (this.statusCode === 503 && this.req?.url?.startsWith("/upload-chunk")) fs.writeFileSync(markerPath, fs.existsSync(sessionDir) ? "present" : "absent"); return originalJson.apply(this, args); };',
+        'process.env.WEBDAV_ENABLED = "true";',
+      ].join("\n");
+    },
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
+  const lock = createFileLifecycleLock({
+    directory: path.join(harness.dir, "data", ".rootark-cloud-file-locks"),
+    timeoutMs: 10_000,
+    pollMs: 5,
+  });
+  let releaseLock;
+  let markLockHeld;
+  const lockHeld = new Promise((resolve) => { markLockHeld = resolve; });
+  const heldOperation = lock.runFolder(FOLDER_ID, async () => {
+    markLockHeld();
+    await new Promise((resolve) => { releaseLock = resolve; });
+  });
+  await lockHeld;
+
+  try {
+    const simple = await upload(harness.port, session, "timeout-simple.txt", Buffer.from("disposable simple upload"));
+    assertRejectedClean(harness, simple, 503);
+
+    const chunk = await uploadChunk(harness.port, session, {
+      uploadId,
+      originalName: "timeout-chunk.txt",
+      chunkIndex: 0,
+      totalChunks: 1,
+      bytes: Buffer.from("disposable final chunk"),
+    });
+    assertRejectedClean(harness, chunk, 503);
+    assert.equal(chunk.headers["retry-after"], "5");
+    assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId)), false);
+    assert.equal(fs.readFileSync(timeoutResponseMarker, "utf8"), "absent", "chunk session staging is removed before the 503 response is sent");
+    assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
+
+    const webDavBody = Buffer.from("disposable WebDAV upload");
+    const webDav = await request(harness.port, "/dav/" + FOLDER_ID + "/timeout-webdav.txt", {
+      method: "PUT",
+      headers: {
+        authorization: "Basic " + Buffer.from("uploader:" + harness.password).toString("base64"),
+        "content-length": webDavBody.length,
+      },
+      body: webDavBody,
+    });
+    assertRejectedClean(harness, webDav, 503);
+  } finally {
+    releaseLock();
+    await heldOperation;
+  }
+});
+
+test("a timed-out duplicate chunk request cannot mutate an active upload session", { timeout: 30_000 }, async (t) => {
+  const scanner = await startGatedClamAv();
+  t.after(async () => {
+    for (const gate of scanner.scans) gate.release();
+    await new Promise((resolve) => scanner.server.close(resolve));
+  });
+  const uploadId = "Concurrent-Timeout-Chunk";
+  const harness = await createHarness(t, {
+    chunkSessions: [{
+      uploadId,
+      files: {
+        "metadata.json": legacyChunkMetadata(uploadId, {
+          originalName: "concurrent-timeout.txt",
+          fileName: "concurrent-timeout.txt",
+          totalChunks: 2,
+          encryptionLevel: "none",
+        }),
+        "0.part": Buffer.alloc(2 * 1024 * 1024, 0x61),
+      },
+    }],
+    preloadSource: () => {
+      return [
+        "const lockModule = require(" + JSON.stringify(path.join(ROOT, "services", "fileLifecycleLock.js")) + ");",
+        "const create = lockModule.createFileLifecycleLock;",
+        "lockModule.createFileLifecycleLock = (options) => create({ ...options, timeoutMs: 200, pollMs: 5 });",
+      ].join("\n");
+    },
+    envOverrides: { UPLOAD_SCAN_PROVIDER: "clamav", CLAMAV_HOST: "127.0.0.1", CLAMAV_PORT: String(scanner.port) },
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
+  const lock = createFileLifecycleLock({
+    directory: path.join(harness.dir, "data", ".rootark-cloud-file-locks"),
+    timeoutMs: 10_000,
+    pollMs: 5,
+  });
+  let releaseFolder;
+  let markFolderHeld;
+  const folderHeld = new Promise((resolve) => { markFolderHeld = resolve; });
+  const heldOperation = lock.runFolder(FOLDER_ID, async () => {
+    markFolderHeld();
+    await new Promise((resolve) => { releaseFolder = resolve; });
+  });
+  await folderHeld;
+
+  try {
+    const uploadArgs = {
+      uploadId,
+      originalName: "concurrent-timeout.txt",
+      chunkIndex: 1,
+      totalChunks: 2,
+      bytes: Buffer.alloc(2 * 1024 * 1024, 0x62),
+    };
+    const firstPromise = uploadChunk(harness.port, session, uploadArgs);
+    const firstScanDeadline = Date.now() + 5000;
+    while (scanner.scans.length < 1 && Date.now() < firstScanDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(scanner.scans[0], "first upload did not reach scanning");
+    await scanner.scans[0].started;
+
+    const secondArgs = {
+      ...uploadArgs,
+      uploadId: process.platform === "win32" ? uploadId.toLowerCase() : uploadId,
+    };
+    const secondPromise = uploadChunk(harness.port, session, secondArgs);
+    const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+    const stagedPath = path.join(sessionDir, "assembled.upload");
+    const second = await secondPromise;
+    assert.equal(second.status, 503, second.body);
+    assert.equal(fs.existsSync(stagedPath), true, "a timed-out duplicate request must not remove another request's staged file");
+    const activeMetadata = JSON.parse(fs.readFileSync(path.join(sessionDir, "metadata.json"), "utf8"));
+    assert.notEqual(activeMetadata.__resumeBlocked, true, "an alias request must not block the active session metadata");
+
+    scanner.scans[0].release();
+    const first = await firstPromise;
+    assert.equal(first.status, 503, first.body);
+  } finally {
+    releaseFolder();
+    await heldOperation;
+  }
+});
+
+test("folder mutations revalidate session and upload permission after waiting for the lifecycle lock", { timeout: 45_000 }, async (t) => {
+  let markerPath;
+  const harness = await createHarness(t, {
+    preloadSource: ({ dir }) => {
+      markerPath = path.join(dir, "folder-lock-waiting");
+      const lockDirectory = path.join(dir, "data", ".rootark-cloud-file-locks");
+      return [
+        'const fs = require("node:fs");',
+        'const path = require("node:path");',
+        `const lockDirectory = ${JSON.stringify(lockDirectory)};`,
+        `const markerPath = ${JSON.stringify(markerPath)};`,
+        'const originalOpenSync = fs.openSync;',
+        'fs.openSync = function (file, ...args) { try { return originalOpenSync.call(this, file, ...args); } catch (error) { if (error.code === "EEXIST" && typeof file === "string" && path.resolve(file).startsWith(path.resolve(lockDirectory) + path.sep)) fs.writeFileSync(markerPath, "waiting"); throw error; } };',
+      ].join("\n");
+    },
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const usersPath = path.join(harness.dir, "data", "users.local.json");
+  const lock = createFileLifecycleLock({ directory: path.join(harness.dir, "data", ".rootark-cloud-file-locks"), timeoutMs: 5000, pollMs: 5 });
+  const mutateUser = (change) => {
+    const users = JSON.parse(fs.readFileSync(usersPath, "utf8"));
+    change(users[0]);
+    fs.writeFileSync(usersPath, JSON.stringify(users));
+  };
+  const withHeldFolderLock = async (startRequest, changeUser) => {
+    fs.rmSync(markerPath, { force: true });
+    let release;
+    let markHeld;
+    const held = new Promise((resolve) => { markHeld = resolve; });
+    const operation = lock.runFolder(FOLDER_ID, async () => {
+      markHeld();
+      await new Promise((resolve) => { release = resolve; });
+    });
+    await held;
+    const responsePromise = startRequest();
+    assert.equal(await waitForFile(markerPath), true, "request did not reach the held folder lock");
+    changeUser();
+    release();
+    const response = await responsePromise;
+    await operation;
+    return response;
+  };
+
+  const simple = await withHeldFolderLock(
+    () => upload(harness.port, session, "revoked-simple.txt", Buffer.from("disposable simple bytes")),
+    () => mutateUser((user) => { user.permissions.upload = false; }),
+  );
+  assert.equal(simple.status, 403, simple.body);
+  assert.deepEqual(pending(harness.dir), {});
+  assert.equal(fs.existsSync(path.join(harness.dir, "temp", FOLDER_ID, "revoked-simple.txt")), false);
+
+  mutateUser((user) => { user.permissions.upload = true; });
+  const uploadId = "revoked-chunk-after-scan";
+  const chunk = await withHeldFolderLock(
+    () => uploadChunk(harness.port, session, { uploadId, originalName: "revoked-chunk.txt", chunkIndex: 0, totalChunks: 1, bytes: Buffer.from("disposable chunk bytes") }),
+    () => mutateUser((user) => { user.permissions.upload = false; }),
+  );
+  assert.equal(chunk.status, 403, chunk.body);
+  assert.deepEqual(pending(harness.dir), {});
+  const chunkDirectory = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  const cleanupDeadline = Date.now() + 5000;
+  while (filesUnder(chunkDirectory).length && Date.now() < cleanupDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(filesUnder(chunkDirectory), []);
+  assert.equal(fs.existsSync(path.join(harness.dir, "temp", FOLDER_ID, "revoked-chunk.txt")), false);
+
+  mutateUser((user) => { user.permissions.upload = true; });
+  const folderBefore = JSON.parse(fs.readFileSync(path.join(harness.dir, "data", "folders.json"), "utf8")).find((folder) => folder.id === FOLDER_ID);
+  const body = JSON.stringify({ expiresAt: new Date(Date.now() + 60_000).toISOString() });
+  const temporary = await withHeldFolderLock(
+    () => request(harness.port, `/folders/${FOLDER_ID}/temporary`, {
+      method: "PUT",
+      headers: { cookie: session.cookie, origin: `http://127.0.0.1:${harness.port}`, "x-csrf-token": session.csrf, "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+      body,
+    }),
+    () => mutateUser((user) => { user.sessionVersion += 1; }),
+  );
+  assert.equal(temporary.status, 401, temporary.body);
+  const folderAfter = JSON.parse(fs.readFileSync(path.join(harness.dir, "data", "folders.json"), "utf8")).find((folder) => folder.id === FOLDER_ID);
+  assert.equal(folderAfter.expiresAt, folderBefore.expiresAt, "revoked session cannot update folder expiration after lock wait");
+});
+
+test("simple and chunk uploads revalidate current upload permission after a long scan", { timeout: 45_000 }, async (t) => {
+  const scanner = await startGatedClamAv();
+  const harness = await createHarness(t, {
+    envOverrides: { UPLOAD_SCAN_PROVIDER: "clamav", CLAMAV_HOST: "127.0.0.1", CLAMAV_PORT: String(scanner.port) },
+  });
+  t.after(async () => {
+    for (const gate of scanner.scans) gate.release();
+    await new Promise((resolve) => scanner.server.close(resolve));
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const usersPath = path.join(harness.dir, "data", "users.local.json");
+  const setUploadPermission = (allowed) => {
+    const users = JSON.parse(fs.readFileSync(usersPath, "utf8"));
+    users[0].permissions.upload = allowed;
+    fs.writeFileSync(usersPath, JSON.stringify(users));
+  };
+  const waitForScan = async (index) => {
+    const deadline = Date.now() + TIMEOUT_MS;
+    while (scanner.scans.length <= index && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(scanner.scans[index], `ClamAV scan ${index + 1} did not start`);
+    await scanner.scans[index].started;
+  };
+
+  const simplePromise = upload(harness.port, session, "scan-revoked-simple.txt", Buffer.from("disposable simple bytes"));
+  await waitForScan(0);
+  setUploadPermission(false);
+  scanner.scans[0].release();
+  const simple = await simplePromise;
+  assert.equal(simple.status, 403, simple.body);
+  assert.deepEqual(pending(harness.dir), {});
+  assert.equal(fs.existsSync(path.join(harness.dir, "temp", FOLDER_ID, "scan-revoked-simple.txt")), false);
+
+  setUploadPermission(true);
+  const chunkPromise = uploadChunk(harness.port, session, {
+    uploadId: "scan-revoked-chunk",
+    originalName: "scan-revoked-chunk.txt",
+    chunkIndex: 0,
+    totalChunks: 1,
+    bytes: Buffer.from("disposable chunk bytes"),
+  });
+  await waitForScan(1);
+  setUploadPermission(false);
+  scanner.scans[1].release();
+  const chunk = await chunkPromise;
+  assert.equal(chunk.status, 403, chunk.body);
+  assert.deepEqual(pending(harness.dir), {});
+  const chunkDirectory = path.join(harness.chunkRoot, FOLDER_ID, "scan-revoked-chunk");
+  const cleanupDeadline = Date.now() + TIMEOUT_MS;
+  while (filesUnder(chunkDirectory).length && Date.now() < cleanupDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(filesUnder(chunkDirectory), []);
+  assert.equal(fs.existsSync(path.join(harness.dir, "temp", FOLDER_ID, "scan-revoked-chunk.txt")), false);
 });

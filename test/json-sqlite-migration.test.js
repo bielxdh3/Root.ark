@@ -7,6 +7,26 @@ const { spawnSync } = require("node:child_process");
 
 const ROOT = path.join(__dirname, "..");
 
+test("SQLite JSON read fallback is disabled unless explicitly enabled", () => {
+  const env = { ...process.env };
+  delete env.DB_READ_FALLBACK_JSON;
+  const defaultResult = spawnSync(process.execPath, ["-e", 'process.stdout.write(String(require("./db").isJsonReadFallbackEnabled()))'], {
+    cwd: ROOT,
+    env,
+    encoding: "utf8",
+  });
+  assert.equal(defaultResult.status, 0, defaultResult.stderr || defaultResult.stdout);
+  assert.equal(defaultResult.stdout, "false");
+
+  const enabledResult = spawnSync(process.execPath, ["-e", 'process.stdout.write(String(require("./db").isJsonReadFallbackEnabled()))'], {
+    cwd: ROOT,
+    env: { ...env, DB_READ_FALLBACK_JSON: "true" },
+    encoding: "utf8",
+  });
+  assert.equal(enabledResult.status, 0, enabledResult.stderr || enabledResult.stdout);
+  assert.equal(enabledResult.stdout, "true");
+});
+
 test("JSON migration preserves trash and backup history in SQLite across restart", { timeout: 20_000 }, () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-json-sqlite-migration-"));
   try {

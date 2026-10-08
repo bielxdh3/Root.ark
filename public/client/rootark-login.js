@@ -5,6 +5,7 @@
   const loginForm = document.getElementById("login-form");
   const totpForm = document.getElementById("totp-form");
   const enrollForm = document.getElementById("enroll-form");
+  const recoveryStep = document.getElementById("recovery-step");
   const errorRegion = document.getElementById("auth-error");
   const loginTitle = document.getElementById("login-title");
   const loginIntro = document.getElementById("login-intro");
@@ -48,6 +49,7 @@
     loginForm.hidden = step !== "login";
     totpForm.hidden = step !== "totp";
     enrollForm.hidden = step !== "enroll";
+    recoveryStep.hidden = step !== "recovery";
     errorRegion.textContent = "";
     if (step === "login") {
       eyebrow.textContent = "ACESSO SEGURO";
@@ -59,6 +61,11 @@
       loginTitle.textContent = "Confirme sua identidade";
       loginIntro.textContent = "Sua conta usa autenticação de dois fatores.";
       document.getElementById("totp-code").focus();
+    } else if (step === "recovery") {
+      eyebrow.textContent = "CONFIGURAÇÃO CONCLUÍDA";
+      loginTitle.textContent = "Autenticação ativada";
+      loginIntro.textContent = "Guarde os códigos de recuperação. Depois, entre novamente com sua senha e o código do aplicativo.";
+      document.getElementById("recovery-step-title").focus();
     } else {
       eyebrow.textContent = "CONFIGURAÇÃO NECESSÁRIA";
       loginTitle.textContent = "Ative a autenticação";
@@ -128,6 +135,7 @@
     } catch (error) {
       const payload = error && error.payload;
       if (error && error.status === 403 && payload && payload.enrollmentRequired && payload.token) {
+        document.getElementById("password").value = "";
         try {
           await completeEnrollment(payload.token);
         } catch (enrollError) {
@@ -169,9 +177,15 @@
     setBusy(enrollForm, true, "Ativando…");
     try {
       const code = new FormData(enrollForm).get("code");
-      await api.post("/auth/2fa/confirm", { code }, { token: enrollmentToken });
+      const result = await api.post("/auth/2fa/confirm", { code }, { token: enrollmentToken });
       enrollmentToken = null;
       clearEnrollmentDetails();
+      if (result && result.loginRequired) {
+        const codes = Array.isArray(result.recoveryCodes) ? result.recoveryCodes.map(String).filter(Boolean) : [];
+        document.getElementById("recovery-codes").value = codes.join("\n");
+        showStep("recovery");
+        return;
+      }
       finishLogin();
     } catch (error) {
       message(friendlyError(error, "Código inválido. Confira o aplicativo e tente novamente."));
@@ -192,6 +206,14 @@
     clearEnrollmentDetails();
     loginForm.reset();
     showStep("login");
+  });
+  document.getElementById("continue-after-enroll").addEventListener("click", () => {
+    document.getElementById("recovery-codes").value = "";
+    showStep("login");
+    loginIntro.textContent = "A autenticação foi ativada. Entre novamente para iniciar uma sessão protegida.";
+    const passwordInput = document.getElementById("password");
+    passwordInput.value = "";
+    passwordInput.focus();
   });
 
   api.get("/auth/me").then(finishLogin).catch(() => {

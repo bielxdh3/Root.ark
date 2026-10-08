@@ -181,8 +181,71 @@ function removeFileRestoreTemporary(pathname) {
   fs.unlinkSync(pathname);
 }
 
+function syncFile(pathname) {
+  const fd = fs.openSync(pathname, "r");
+  try {
+    try { fs.fsyncSync(fd); }
+    catch (error) {
+      if (!(process.platform === "win32" && ["EPERM", "ENOTSUP", "EINVAL"].includes(error.code))) throw error;
+    }
+  } finally { fs.closeSync(fd); }
+}
+
+function syncDirectory(directory) {
+  if (process.platform === "win32") return false;
+  const fd = fs.openSync(directory, "r");
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  return true;
+}
+
+function syncFileSet(paths) {
+  const directories = new Set();
+  for (const pathname of paths) {
+    let stat;
+    try { stat = fs.lstatSync(pathname); }
+    catch (error) {
+      if (error.code === "ENOENT") throw new Error("Expected restore durability target is missing", { cause: error });
+      throw error;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Restore durability target is not a regular file");
+    syncFile(pathname);
+    directories.add(path.dirname(pathname));
+  }
+  for (const directory of directories) syncDirectory(directory);
+}
+
+function syncTree(root) {
+  let rootStat;
+  try { rootStat = fs.lstatSync(root); }
+  catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    syncDirectory(path.dirname(root));
+    return;
+  }
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("Restore durability tree is unsafe");
+  const directories = [];
+  const visit = (directory) => {
+    directories.push(directory);
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const pathname = path.join(directory, entry.name);
+      const stat = fs.lstatSync(pathname);
+      if (stat.isSymbolicLink()) throw new Error("Restore durability tree contains a symbolic link");
+      if (stat.isDirectory()) visit(pathname);
+      else if (stat.isFile()) syncFile(pathname);
+      else throw new Error("Restore durability tree contains an unsupported entry");
+    }
+  };
+  visit(root);
+  for (const directory of directories.reverse()) syncDirectory(directory);
+  syncDirectory(path.dirname(root));
+}
+
 function restoreTree(destination, snapshotRoot, snapshot, transactionId) {
-  if (!snapshot.existed) { removeTree(destination); return; }
+  if (!snapshot.existed) {
+    removeTree(destination);
+    syncDirectory(path.dirname(destination));
+    return;
+  }
   verifyTree(snapshotRoot, snapshot.entries);
   ensureSafeDirectory(path.dirname(destination), { create: true });
   removeTree(destination);
@@ -206,6 +269,7 @@ function restoreTree(destination, snapshotRoot, snapshot, transactionId) {
       try { fs.chmodSync(target, entry.mode); } catch (error) { if (process.platform !== "win32") throw error; }
     }
   }
+  syncTree(destination);
 }
 
 function snapshotFileSet(paths, snapshotRoot) {
@@ -228,10 +292,12 @@ function snapshotFileSet(paths, snapshotRoot) {
 }
 
 function restoreFileSet(files, snapshotRoot, transactionId) {
+  const affectedDirectories = new Set();
   for (let index = 0; index < files.length; index += 1) {
     const entry = files[index];
     const destination = path.resolve(entry.destination);
     ensureSafeDirectory(path.dirname(destination), { create: true });
+    affectedDirectories.add(path.dirname(destination));
     const temporary = fileRestoreTemporaryPath(destination, transactionId, index);
     removeFileRestoreTemporary(temporary);
     let current;
@@ -247,7 +313,9 @@ function restoreFileSet(files, snapshotRoot, transactionId) {
     if (current) fs.rmSync(destination, { force: true });
     fs.renameSync(temporary, destination);
     try { fs.chmodSync(destination, entry.mode); } catch (error) { if (process.platform !== "win32") throw error; }
+    syncFile(destination);
   }
+  for (const directory of affectedDirectories) syncDirectory(directory);
 }
 
 function writeManifest(manifestPath, manifest) {
@@ -279,6 +347,8 @@ module.exports = {
   restoreTree,
   snapshotFileSet,
   snapshotTree,
+  syncFileSet,
+  syncTree,
   verifyTree,
   writeManifest,
 };

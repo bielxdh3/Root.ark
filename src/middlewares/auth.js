@@ -10,11 +10,11 @@ const {
 } = require("../services/totpPolicy");
 
 function parseCookies(header = "") {
-  const cookies = {};
+  const cookies = new Map();
   for (const part of String(header).split(";")) {
     const [key, value] = part.trim().split(/=(.*)/s, 2);
-    if (!key || Object.hasOwn(cookies, key)) cookies[key] = undefined;
-    else cookies[key] = value;
+    if (!key || cookies.has(key)) cookies.set(key, undefined);
+    else cookies.set(key, value);
   }
   return cookies;
 }
@@ -48,7 +48,7 @@ function createAuthenticate({ jwt, jwtSecret, loadUser, normalizeUserPermissions
     const auth = req.headers.authorization;
     const cookies = parseCookies(req.headers.cookie);
     const bearer = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
-    const token = bearer || cookies[cookieName];
+    const token = bearer || cookies.get(cookieName);
     if (!token) {
       return res.status(401).json({ error: "Token ausente" });
     }
@@ -75,7 +75,8 @@ function createAuthenticate({ jwt, jwtSecret, loadUser, normalizeUserPermissions
       if (req.authType === "cookie" && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
         const origin = req.headers.origin;
         const expectedOrigin = getExpectedOrigin(req);
-        if ((origin && origin !== expectedOrigin) || !cookies.rootark_csrf || req.headers["x-csrf-token"] !== cookies.rootark_csrf) {
+        const csrfCookie = cookies.get("rootark_csrf");
+        if ((origin && origin !== expectedOrigin) || !csrfCookie || req.headers["x-csrf-token"] !== csrfCookie) {
           return res.status(403).json({ error: "CSRF invalido" });
         }
       }

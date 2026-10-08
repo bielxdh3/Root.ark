@@ -147,16 +147,47 @@ function saveTrashItem(item) {
 }
 
 function isFileTrashed(folderId, fileName) {
-  return listTrashItems().some((item) => (
+  const name = path.basename(fileName || "");
+  if (!name) return false;
+  const folder = folderId || "root";
+  if (isDbEnabled() && hasTrashTable()) {
+    return Boolean(getDb().prepare(`
+      SELECT 1 FROM trash_items
+      WHERE item_type = ? AND status IN (?, ?) AND original_folder_id = ? AND original_file_name = ?
+      LIMIT 1
+    `).get("file", "trashed", "remote_delete_pending", folder, name));
+  }
+
+  return loadJsonItems().some((item) => (
     item.itemType === "file" &&
-    item.originalFolderId === (folderId || "root") &&
-    item.originalFileName === path.basename(fileName || "")
+    ["trashed", "remote_delete_pending"].includes(item.status) &&
+    item.originalFolderId === folder &&
+    item.originalFileName === name
+  ));
+}
+
+function listPendingFileRemoteDeletions(folderId, fileName) {
+  const name = path.basename(fileName || "");
+  if (!name) return [];
+  const folder = folderId || "root";
+  if (isDbEnabled() && hasTrashTable()) {
+    return getDb().prepare(`
+      SELECT * FROM trash_items
+      WHERE item_type = ? AND status = ? AND original_folder_id = ? AND original_file_name = ?
+      ORDER BY deleted_at DESC
+    `).all("file", "remote_delete_pending", folder, name).map(rowToItem);
+  }
+
+  return loadJsonItems().filter((item) => (
+    item.itemType === "file" && item.status === "remote_delete_pending" &&
+    item.originalFolderId === folder && path.basename(item.originalFileName || "") === name
   ));
 }
 
 module.exports = {
   getTrashItem,
   isFileTrashed,
+  listPendingFileRemoteDeletions,
   listTrashItems,
   saveTrashItem,
 };

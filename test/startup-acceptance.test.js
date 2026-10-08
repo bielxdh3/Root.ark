@@ -50,6 +50,7 @@ function startServer({ cwd, port, jwtSecret, envOverrides = {} }) {
   delete env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS;
   delete env.ROOTARK_BOOTSTRAP_USERS_FROM_SEED;
   delete env.TRUSTED_PROXIES;
+  delete env.ROOTARK_RESTORE_INSTANCE_COUNT;
   Object.assign(env, envOverrides);
   if (jwtSecret === undefined) delete env.JWT_SECRET;
   else env.JWT_SECRET = jwtSecret;
@@ -235,7 +236,28 @@ test("production refuses a secure user seed unless bootstrap import is explicitl
 
   const result = await waitForExit(launched.child, TIMEOUT_MS, [strongSecret]);
   assert.notEqual(result.code, 0);
-  assert.match(launched.output(), /Production user seed requires ROOTARK_BOOTSTRAP_USERS_FROM_SEED=true/);
+  assert.match(launched.output(), /User seed import requires ROOTARK_BOOTSTRAP_USERS_FROM_SEED=true/);
+  assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), false);
+});
+
+test("non-production seed import also requires explicit bootstrap opt-in", { timeout: 30_000 }, async (t) => {
+  const cwd = createSandbox();
+  fs.mkdirSync(path.join(cwd, "data"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "data", "users.json"), JSON.stringify([
+    { username: "seed-admin", password: bcrypt.hashSync(crypto.randomBytes(32).toString("base64url"), 10), role: "admin", permissions: {} },
+  ]));
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "staging" } });
+  t.after(async () => { await stop(launched.child, [strongSecret]); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+  const result = await Promise.race([
+    new Promise((resolve) => launched.child.once("exit", (code, signal) => resolve({ code, signal }))),
+    new Promise((resolve) => setTimeout(() => resolve(null), 5_000)),
+  ]);
+  assert.ok(result, "startup should fail closed instead of importing a seed without opt-in");
+  assert.notEqual(result.code, 0);
+  assert.match(launched.output(), /User seed import requires ROOTARK_BOOTSTRAP_USERS_FROM_SEED=true/);
   assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), false);
 });
 
@@ -290,6 +312,29 @@ test("fresh test bootstrap also fails closed when the explicit dev/test opt-in i
   assert.notEqual(result.code, 0);
   assert.match(launched.output(), /No users are configured/);
   assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), false);
+});
+
+test("declared multi-instance deployment fails closed while auth state is process-local", { timeout: 30_000 }, async (t) => {
+  const cwd = createSandbox();
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({
+    cwd,
+    port,
+    jwtSecret: strongSecret,
+    envOverrides: { NODE_ENV: "development", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", ROOTARK_RESTORE_INSTANCE_COUNT: "2" },
+  });
+  t.after(async () => { await stop(launched.child, [strongSecret]); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+  const result = await Promise.race([
+    new Promise((resolve) => launched.child.once("exit", (code, signal) => resolve({ code, signal }))),
+    new Promise((resolve) => setTimeout(() => resolve(null), 5_000)),
+  ]);
+  assert.ok(result, "server startup must reject a declared multi-instance topology without shared auth state");
+  assert.notEqual(result.code, 0);
+  assert.match(launched.output(), /authentication state is process-local/i);
+  assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), false);
+  assert.equal(fs.existsSync(path.join(cwd, "data", ".rootark-active-requests")), false);
 });
 
 test("production refuses the development-default opt-in", { timeout: 30_000 }, async (t) => {
