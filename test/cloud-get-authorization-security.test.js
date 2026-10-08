@@ -426,6 +426,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     AWS_S3_BUCKET: "fixture-bucket",
     AWS_REGION: "us-east-1",
     AWS_ENDPOINT_URL: `http://127.0.0.1:${cloud.port}`,
+    AWS_S3_PRINCIPAL_ID: "fixture-account",
     AWS_FORCE_PATH_STYLE: "true",
     AWS_ACCESS_KEY_ID: "fixture-access-key",
     AWS_SECRET_ACCESS_KEY: "fixture-secret-key",

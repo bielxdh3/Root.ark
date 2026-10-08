@@ -58,7 +58,9 @@ function normalizeObjects(objects) {
 function validateInventoryMarker(marker, label) {
   if (marker === undefined) return null;
   if (!marker || typeof marker !== "object" || !["known", "unknown", "reconciled"].includes(marker.state)
-    || (marker.backupId != null && !/^[a-f0-9-]{36}$/i.test(String(marker.backupId)))) {
+    || (marker.backupId != null && !/^[a-f0-9-]{36}$/i.test(String(marker.backupId)))
+    || (marker.inventoryContext != null && !/^[a-f0-9]{64}$/i.test(String(marker.inventoryContext)))
+    || (marker.previousInventoryContext != null && !/^[a-f0-9]{64}$/i.test(String(marker.previousInventoryContext)))) {
     throw new Error(`${label} is invalid; provider access is blocked`);
   }
   if (marker.state === "reconciled" && (!marker.backupId || typeof marker.reconciledAt !== "string")) {
@@ -135,8 +137,13 @@ function policyFileExists() {
 }
 
 function markerForStatus(status) {
-  if (status.state === "unknown") return { state: "unknown", ...(status.backupId ? { backupId: status.backupId } : {}) };
-  if (status.state === "reconciled") return { state: "reconciled", backupId: status.backupId, reconciledAt: status.reconciledAt || new Date().toISOString() };
+  if (status.state === "unknown") return {
+    state: "unknown",
+    ...(status.backupId ? { backupId: status.backupId } : {}),
+    ...(status.inventoryContext ? { inventoryContext: status.inventoryContext } : {}),
+    ...(status.previousInventoryContext ? { previousInventoryContext: status.previousInventoryContext } : {}),
+  };
+  if (status.state === "reconciled") return { state: "reconciled", backupId: status.backupId, reconciledAt: status.reconciledAt || new Date().toISOString(), ...(status.inventoryContext ? { inventoryContext: status.inventoryContext } : {}) };
   return { state: "known" };
 }
 
@@ -173,25 +180,54 @@ function renameWithSharingRetry(source, destination) {
   }
 }
 
-function getInventoryStatus() {
+function getInventoryStatus(provider = null) {
   const state = readState();
   const policy = readPolicyDocument();
   if (!state && !policy) return { state: "known" };
   const stateMarker = validateInventoryMarker(state?.providerInventory, "Restore provider inventory state");
   const policyMarker = validateInventoryMarker(policy?.providerInventory, "Restore provider inventory policy");
+  if (stateMarker && policyMarker
+    && (stateMarker.inventoryContext !== policyMarker.inventoryContext
+      || stateMarker.previousInventoryContext !== policyMarker.previousInventoryContext)) {
+    return {
+      state: "unknown",
+      backupId: stateMarker.backupId === policyMarker.backupId ? stateMarker.backupId || null : null,
+      contextConflict: true,
+    };
+  }
   if (!state || !policy || !stateMarker || !policyMarker) {
     const unknown = [stateMarker, policyMarker].filter((marker) => marker?.state === "unknown");
     const ids = new Set(unknown.map((marker) => marker.backupId).filter(Boolean));
-    return { state: "unknown", backupId: ids.size === 1 ? [...ids][0] : null };
+    const marker = unknown.find((value) => value.inventoryContext || value.previousInventoryContext) || {};
+    return { state: "unknown", backupId: ids.size === 1 ? [...ids][0] : null,
+      ...(marker.inventoryContext ? { inventoryContext: marker.inventoryContext } : {}),
+      ...(marker.previousInventoryContext ? { previousInventoryContext: marker.previousInventoryContext } : {}) };
   }
   if (stateMarker.state === policyMarker.state && stateMarker.backupId === policyMarker.backupId) {
-    if (stateMarker.state === "unknown") return { state: "unknown", backupId: stateMarker.backupId || null };
-    if (stateMarker.state === "reconciled") return { state: "reconciled", backupId: stateMarker.backupId, reconciledAt: stateMarker.reconciledAt };
+    if (stateMarker.state === "unknown") return { state: "unknown", backupId: stateMarker.backupId || null,
+      ...(stateMarker.inventoryContext ? { inventoryContext: stateMarker.inventoryContext } : {}),
+      ...(stateMarker.previousInventoryContext ? { previousInventoryContext: stateMarker.previousInventoryContext } : {}) };
+    if (stateMarker.state === "reconciled") {
+      if (stateMarker.inventoryContext !== policyMarker.inventoryContext) return {
+        state: "unknown", backupId: stateMarker.backupId,
+        previousInventoryContext: stateMarker.inventoryContext || undefined,
+      };
+      const context = typeof provider?.inventoryContext === "function" ? provider.inventoryContext() : null;
+      if (context && (stateMarker.inventoryContext !== context || policyMarker.inventoryContext !== context)) {
+        return { state: "unknown", backupId: stateMarker.backupId, inventoryContext: context,
+          previousInventoryContext: stateMarker.inventoryContext || undefined };
+      }
+      return { state: "reconciled", backupId: stateMarker.backupId, reconciledAt: stateMarker.reconciledAt,
+        ...(stateMarker.inventoryContext ? { inventoryContext: stateMarker.inventoryContext } : {}) };
+    }
     return { state: "known" };
   }
   const unknown = [stateMarker, policyMarker].filter((marker) => marker.state === "unknown");
   const ids = new Set(unknown.map((marker) => marker.backupId).filter(Boolean));
-  return { state: "unknown", backupId: ids.size === 1 ? [...ids][0] : null };
+  const marker = unknown.find((value) => value.inventoryContext || value.previousInventoryContext) || {};
+  return { state: "unknown", backupId: ids.size === 1 ? [...ids][0] : null,
+    ...(marker.inventoryContext ? { inventoryContext: marker.inventoryContext } : {}),
+    ...(marker.previousInventoryContext ? { previousInventoryContext: marker.previousInventoryContext } : {}) };
 }
 
 function writeState(marker) {
@@ -204,12 +240,12 @@ function writeState(marker) {
   });
 }
 
-function isInventoryUnknown() {
-  return getInventoryStatus().state === "unknown";
+function isInventoryUnknown(provider = null) {
+  return getInventoryStatus(provider).state === "unknown";
 }
 
-function assertProviderAvailable() {
-  if (isInventoryUnknown()) {
+function assertProviderAvailable(provider = null) {
+  if (isInventoryUnknown(provider)) {
     throw Object.assign(new Error("Cloud provider inventory is unknown after restore; reconciliation is required"), { code: "PROVIDER_INVENTORY_UNKNOWN" });
   }
 }
@@ -223,35 +259,56 @@ function guardProvider(provider) {
       if (provider.provider === "local" && typeof provider.enabled === "function" && provider.enabled() === false) {
         return provider[operation](...args);
       }
-      assertProviderAvailable();
-      return provider[operation](...args);
+      if (getInventoryStatus().state === "unknown") assertProviderAvailable();
+      if (typeof provider.resolveInventoryContext === "function") await provider.resolveInventoryContext();
+      assertProviderAvailable(provider);
+      const result = await provider[operation](...args);
+      if (typeof provider.resolveInventoryContext === "function") {
+        await provider.resolveInventoryContext();
+        assertProviderAvailable(provider);
+      }
+      return result;
     };
   }
   return guarded;
 }
 
-async function markInventoryUnknown(backupId) {
+async function markInventoryUnknown(backupId, context = {}, options = {}) {
   const id = String(backupId || "");
   if (!/^[a-f0-9-]{36}$/i.test(id)) throw new Error("Restore provider inventory baseline is invalid");
   const lease = await acquirePolicyLock();
   try {
+    if (typeof options.validateBaseline === "function") await options.validateBaseline(id);
     const policy = readPolicyDocument();
-    writeUnlocked(policy?.objects || [], { state: "unknown", backupId: id });
+    writeUnlocked(policy?.objects || [], { state: "unknown", backupId: id,
+      ...(context.inventoryContext ? { inventoryContext: context.inventoryContext } : {}),
+      ...(context.previousInventoryContext ? { previousInventoryContext: context.previousInventoryContext } : {}) });
   } finally { lease.release(); }
 }
 
-async function reconcileInventory(backupId, objects) {
+async function reconcileInventory(backupId, objects, inventoryContext = null) {
   const id = String(backupId || "");
   if (!/^[a-f0-9-]{36}$/i.test(id)) throw new Error("Restore provider inventory baseline is invalid");
   const normalized = normalizeObjects(objects);
   const lease = await acquirePolicyLock();
   try {
     const status = getInventoryStatus();
-    if (status.state === "reconciled" && status.backupId === id) return read();
+    if (status.contextConflict) {
+      throw new Error("Restore provider inventory context records are inconsistent during reconciliation");
+    }
+    if (status.state === "reconciled" && status.backupId === id) {
+      if ((status.inventoryContext ?? null) !== (inventoryContext ?? null)) {
+        throw new Error("Restore provider inventory context changed during reconciliation");
+      }
+      return read();
+    }
     if (status.state !== "unknown" || (status.backupId && status.backupId !== id)) {
       throw new Error("Restore provider inventory baseline changed during reconciliation");
     }
-    writeUnlocked(normalized, { state: "reconciled", backupId: id, reconciledAt: new Date().toISOString() });
+    if (status.inventoryContext && status.inventoryContext !== inventoryContext) {
+      throw new Error("Restore provider inventory context changed during reconciliation");
+    }
+    writeUnlocked(normalized, { state: "reconciled", backupId: id, reconciledAt: new Date().toISOString(), inventoryContext });
     return normalized;
   } finally { lease.release(); }
 }
@@ -298,6 +355,9 @@ function readSuppressionSnapshot() {
 
 function writeUnlocked(objects, inventoryStatus = getInventoryStatus()) {
   const normalized = normalizeObjects(objects);
+  if (inventoryStatus.state === "reconciled" && !inventoryStatus.inventoryContext) {
+    inventoryStatus = { ...inventoryStatus, inventoryContext: readPolicyDocument()?.providerInventory?.inventoryContext };
+  }
   const marker = markerForStatus(inventoryStatus);
   writeJsonAtomically(POLICY_PATH, { version: 1, objects: normalized, providerInventory: marker });
   suppressionSnapshot = null;
@@ -317,9 +377,13 @@ function initialize({ requirePolicy = false } = {}) {
   return read();
 }
 
-async function write(objects) {
+async function write(objects, inventoryStatus) {
   const lease = await acquirePolicyLock();
-  try { return writeUnlocked(objects); }
+  try {
+    const status = inventoryStatus === undefined ? getInventoryStatus() : inventoryStatus;
+    if (status.contextConflict) throw new Error("Restore provider inventory context records are inconsistent; explicit repair is required");
+    return writeUnlocked(objects, status);
+  }
   finally { lease.release(); }
 }
 
@@ -404,4 +468,4 @@ async function clear(folderId, fileName, area = "uploads", provider = null) {
   } finally { lease.release(); }
 }
 
-module.exports = { POLICY_PATH, STATE_PATH, assertProviderAvailable, assertSafeToUnhide, assertUnambiguousProviderInventory, clear, createSnapshot, getInventoryStatus, guardProvider, identityKey, initialize, isInventoryUnknown, isSuppressed, lockSnapshot, markInventoryUnknown, normalizeObjects, read, reconcileInventory, suppress, write };
+module.exports = { POLICY_PATH, STATE_PATH, acquireInventoryLock: acquirePolicyLock, assertProviderAvailable, assertSafeToUnhide, assertUnambiguousProviderInventory, clear, createSnapshot, getInventoryStatus, guardProvider, identityKey, initialize, isInventoryUnknown, isSuppressed, lockSnapshot, markInventoryUnknown, normalizeObjects, read, reconcileInventory, suppress, write };

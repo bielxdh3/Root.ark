@@ -209,7 +209,7 @@ const cloudStorage = createCloudStorage({
   provider: CLOUD_STORAGE_PROVIDER,
   prefix: CLOUD_STORAGE_PREFIX,
   rootFolderId: ROOT_FOLDER_ID,
-  s3: { bucket: process.env.AWS_S3_BUCKET, region: process.env.AWS_REGION, endpoint: process.env.AWS_ENDPOINT_URL, forcePathStyle: process.env.AWS_FORCE_PATH_STYLE === "true" },
+  s3: { bucket: process.env.AWS_S3_BUCKET, region: process.env.AWS_REGION, endpoint: process.env.AWS_ENDPOINT_URL, forcePathStyle: process.env.AWS_FORCE_PATH_STYLE === "true", principalId: process.env.AWS_S3_PRINCIPAL_ID },
   gdrive: { folderId: process.env.GOOGLE_DRIVE_FOLDER_ID, credentials: process.env.GOOGLE_SERVICE_ACCOUNT_JSON, credentialsPath: process.env.GOOGLE_APPLICATION_CREDENTIALS },
 });
 const guardedCloudStorage = restoreProviderOrphans.guardProvider(cloudStorage);
@@ -9952,12 +9952,12 @@ const listenForRequests = () => {
     console.log(`Servidor rodando em http://localhost:${PORT}`);
   });
 };
-if (restoreProviderOrphans.isInventoryUnknown() && cloudStorage.enabled()) {
-  void restoreService.reconcileUnknownProviderInventory().then(listenForRequests).catch((error) => {
-    startupRestoreLease();
-    console.error("[restore] provider inventory reconciliation failed; startup blocked:", sanitizeLogValue(error.message));
-    process.exit(1);
-  });
-} else {
+void (async () => {
+  if (typeof cloudStorage.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
+  await restoreService.reconcileUnknownProviderInventory();
   listenForRequests();
-}
+})().catch((error) => {
+  startupRestoreLease();
+  console.error("[restore] provider inventory initialization or reconciliation failed; startup blocked:", sanitizeLogValue(error.message));
+  process.exit(1);
+});

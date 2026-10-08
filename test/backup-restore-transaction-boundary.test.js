@@ -447,7 +447,8 @@ test("successful whole restore preserves both recovery records and blocks servic
 test("local-only restore keeps cloud inventory unknown until selected-archive reconciliation succeeds", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
-    backupService.setCloudStorage({ enabled: () => false });
+    const cloudContext = "f".repeat(64);
+    backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
     restoreService.setCloudStorage({ enabled: () => false });
     (async () => {
       write(path.join(uploadsDir, "root", "archived.txt"), "archived bytes");
@@ -483,6 +484,7 @@ test("local-only restore keeps cloud inventory unknown until selected-archive re
       const cloud = {
         enabled: () => true,
         provider: "fixture",
+        inventoryContext: () => cloudContext,
         inventory: async () => {
           calls.push("inventory");
           return [
@@ -511,25 +513,37 @@ test("local-only restore keeps cloud inventory unknown until selected-archive re
       restoreService.setCloudStorage(cloud);
       cloud.inventory = async () => { throw new Error("injected provider inventory outage"); };
       await assert.rejects(restoreService.reconcileUnknownProviderInventory(), /injected provider inventory outage/);
-      assert.deepEqual(providerOrphans.getInventoryStatus(), { state: "unknown", backupId: backup.id },
-        "failed inventory leaves the durable state unknown and retryable");
+      const retryableStatus = providerOrphans.getInventoryStatus();
+      assert.equal(retryableStatus.state, "unknown");
+      assert.equal(retryableStatus.backupId, backup.id);
+      assert.equal(retryableStatus.inventoryContext, cloudContext,
+        "failed inventory leaves the active provider context durable");
+      assert.match(retryableStatus.previousInventoryContext, /^[a-f0-9]{64}$/);
+      assert.notEqual(retryableStatus.previousInventoryContext, retryableStatus.inventoryContext,
+        "the prior local-provider context remains recorded across the provider change");
 
       const restoreServicePath = ${JSON.stringify(path.join(ROOT, "services", "restoreService"))};
       const restartFailureCode = [
         "const restore = require(" + JSON.stringify(restoreServicePath) + ");",
-        'restore.setCloudStorage({ enabled: () => true, upload: async () => true, inventory: async () => { throw new Error("injected restart inventory outage"); } });',
+        "const cloudContext = " + JSON.stringify(cloudContext) + ";",
+        'restore.setCloudStorage({ enabled: () => true, inventoryContext: () => cloudContext, upload: async () => true, inventory: async () => { throw new Error("injected restart inventory outage"); } });',
         'restore.reconcileUnknownProviderInventory().then(() => process.exit(2), (error) => { if (!/injected restart inventory outage/.test(error.message)) process.exit(3); process.stdout.write("retryable"); });',
       ].join("\\n");
       const restartFailure = childProcess.spawnSync(process.execPath, ["-e", restartFailureCode], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
       assert.equal(restartFailure.status, 0, restartFailure.stderr || restartFailure.stdout);
       assert.match(restartFailure.stdout, /retryable/);
-      assert.deepEqual(providerOrphans.getInventoryStatus(), { state: "unknown", backupId: backup.id },
-        "inventory failure after restart preserves the fail-closed marker");
+      const restartFailureStatus = providerOrphans.getInventoryStatus();
+      assert.equal(restartFailureStatus.state, "unknown");
+      assert.equal(restartFailureStatus.backupId, backup.id);
+      assert.equal(restartFailureStatus.inventoryContext, cloudContext);
+      assert.equal(restartFailureStatus.previousInventoryContext, retryableStatus.previousInventoryContext,
+        "inventory failure after restart preserves the active and previous provider contexts");
 
       const restartSuccessCode = [
         "const restore = require(" + JSON.stringify(restoreServicePath) + ");",
+        "const cloudContext = " + JSON.stringify(cloudContext) + ";",
         "let inventoryCalls = 0;",
-        "restore.setCloudStorage({ enabled: () => true, upload: async () => true, inventory: async () => { inventoryCalls += 1; return ["
+        "restore.setCloudStorage({ enabled: () => true, inventoryContext: () => cloudContext, upload: async () => true, inventory: async () => { inventoryCalls += 1; return ["
           + '{ provider: "fixture", providerIdentity: "archived", area: "uploads", folderId: "root", name: "archived.txt" },'
           + '{ provider: "fixture", providerIdentity: "orphan", area: "uploads", folderId: "root", name: "orphan.txt" }'
           + "]; } });",
@@ -553,10 +567,861 @@ test("local-only restore keeps cloud inventory unknown until selected-archive re
   `);
 });
 
-test("incomplete selected archives overwrite stale provider bytes before inventory reopens and retry after restart", () => {
+test("a reconciled provider inventory is scoped to its provider configuration", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
-    backupService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      const backupId = "11111111-1111-4111-8111-111111111111";
+      await providerOrphans.markInventoryUnknown(backupId);
+      const contextA = "a".repeat(64);
+      const contextB = "b".repeat(64);
+      await providerOrphans.reconcileInventory(backupId, [], contextA);
+      const original = { enabled: () => true, inventoryContext: () => contextA, list: async () => [] };
+      assert.equal(providerOrphans.getInventoryStatus(original).state, "reconciled");
+
+      const changed = { enabled: () => true, inventoryContext: () => contextB, list: async () => [] };
+      const guarded = providerOrphans.guardProvider(changed);
+      await assert.rejects(guarded.list(), { code: "PROVIDER_INVENTORY_UNKNOWN" });
+      assert.deepEqual(providerOrphans.getInventoryStatus(changed), { state: "unknown", backupId, inventoryContext: contextB, previousInventoryContext: contextA },
+        "a different provider namespace invalidates the prior reconciled marker and keeps its backup baseline");
+      await providerOrphans.markInventoryUnknown(providerOrphans.getInventoryStatus(changed).backupId);
+      assert.deepEqual(providerOrphans.getInventoryStatus(), { state: "unknown", backupId },
+        "startup can durably persist invalidation while cloud is disabled");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("reconciliation for a different provider context cannot reuse the same backup baseline", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      const backupId = "11111111-1111-4111-8111-111111111111";
+      const contextA = "a".repeat(64);
+      const contextB = "b".repeat(64);
+      await providerOrphans.markInventoryUnknown(backupId, { inventoryContext: contextA });
+      await providerOrphans.reconcileInventory(backupId, [], contextA);
+
+      await assert.rejects(
+        providerOrphans.reconcileInventory(backupId, [], contextB),
+        /provider inventory context changed during reconciliation/i,
+      );
+      const providerB = { enabled: () => true, inventoryContext: () => contextB };
+      assert.deepEqual(providerOrphans.getInventoryStatus(providerB), {
+        state: "unknown", backupId, inventoryContext: contextB, previousInventoryContext: contextA,
+      }, "a different provider context stays unknown until it performs its own inventory");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("a stale provider context cannot replace a context-bound unknown marker", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      const backupId = "33333333-3333-4333-8333-333333333333";
+      const contextA = "a".repeat(64);
+      const contextB = "b".repeat(64);
+      await providerOrphans.markInventoryUnknown(backupId, {
+        inventoryContext: contextB,
+        previousInventoryContext: contextA,
+      });
+
+      await assert.rejects(
+        providerOrphans.reconcileInventory(backupId, [], contextA),
+        /provider inventory context changed during reconciliation/i,
+      );
+      assert.deepEqual(providerOrphans.getInventoryStatus(), {
+        state: "unknown", backupId, inventoryContext: contextB, previousInventoryContext: contextA,
+      }, "a stale worker cannot overwrite the durable context selected by the newer worker");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("reconciliation without a provider context remains idempotent", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      const backupId = "22222222-2222-4222-8222-222222222222";
+      await providerOrphans.markInventoryUnknown(backupId);
+      await providerOrphans.reconcileInventory(backupId, []);
+      assert.deepEqual(await providerOrphans.reconcileInventory(backupId, []), []);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("dynamic provider identity blocks guarded access and aborts restore reconciliation on the same instance", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const { createCloudStorage } = require(${JSON.stringify(path.join(ROOT, "services", "cloudStorage"))});
+    (async () => {
+      let principal = "drive-principal-a";
+      let uploadCalls = 0;
+      let listCalls = 0;
+      let inventoryCalls = 0;
+      const cloud = createCloudStorage({
+        provider: "gdrive",
+        gdrive: { folderId: "fixture-folder" },
+        resolvePrincipalIdentity: async () => principal,
+      });
+      cloud.inventory = async () => { inventoryCalls += 1; return []; };
+      cloud.resolveUploadId = async () => "fixture-drive-id";
+      cloud.upload = async () => { uploadCalls += 1; principal = "drive-principal-c"; return true; };
+      cloud.list = async () => { listCalls += 1; return []; };
+      backupService.setCloudStorage(cloud);
+      write(path.join(uploadsDir, "root", "file.txt"), "local bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const contextA = cloud.inventoryContext();
+      await providerOrphans.markInventoryUnknown(backup.id, { inventoryContext: contextA });
+      await providerOrphans.reconcileInventory(backup.id, [], contextA);
+
+      principal = "drive-principal-b";
+      const contextB = await cloud.resolveInventoryContext();
+      assert.notEqual(contextA, contextB, "the same adapter detects an authenticated principal change");
+      await assert.rejects(providerOrphans.guardProvider(cloud).list(), { code: "PROVIDER_INVENTORY_UNKNOWN" });
+      assert.equal(listCalls, 0, "guarded cloud access is blocked before provider I/O");
+
+      restoreService.setCloudStorage(cloud);
+      inventoryCalls = 0;
+      await assert.rejects(restoreService.reconcileUnknownProviderInventory(), /Selected archive uploads are not fully reconciled/);
+      const marker = providerOrphans.getInventoryStatus();
+      assert.equal(marker.state, "unknown");
+      assert.equal(marker.inventoryContext, contextB, "the attempted reconciliation context is durably recorded");
+      assert.equal(marker.previousInventoryContext, contextA);
+      assert.equal(uploadCalls, 1, "the upload runs under the expected principal before the injected identity switch");
+      assert.equal(inventoryCalls, 0, "inventory is never certified after the provider identity changes mid-reconciliation");
+      assert.equal(providerOrphans.getInventoryStatus(cloud).state, "unknown");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore sync worker keeps its queue and suppression when principal changes during upload", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const { createCloudStorage } = require(${JSON.stringify(path.join(ROOT, "services", "cloudStorage"))});
+    (async () => {
+      let principal = "drive-principal-a";
+      let uploadCalls = 0;
+      let clearCalls = 0;
+      const cloud = createCloudStorage({
+        provider: "gdrive",
+        gdrive: { folderId: "fixture-folder" },
+        resolvePrincipalIdentity: async () => principal,
+      });
+      cloud.inventory = async () => [];
+      cloud.resolveUploadId = async () => "fixture-drive-id";
+      cloud.upload = async () => { uploadCalls += 1; principal = "drive-principal-b"; return true; };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      write(path.join(uploadsDir, "root", "file.txt"), "local bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      const context = await cloud.resolveInventoryContext();
+      await providerOrphans.markInventoryUnknown(backup.id, { inventoryContext: context });
+      await providerOrphans.reconcileInventory(backup.id, [
+        { area: "uploads", folderId: "root", name: "file.txt" },
+      ], context);
+      assert.equal(providerOrphans.isSuppressed("root", "file.txt", "uploads"), true);
+
+      const originalClear = providerOrphans.clear;
+      providerOrphans.clear = async (...args) => { clearCalls += 1; return originalClear(...args); };
+      restoreService.setCloudStorage(cloud);
+      try {
+        const result = await restoreService.processRestoreSync({ backupId: backup.id, uploader: cloud });
+        const sync = result.metadata.restoreSync;
+        assert.notEqual(sync.state, "completed");
+        assert.equal(sync.entries[0].state, "retry_wait");
+        assert.equal(uploadCalls, 1);
+        assert.equal(clearCalls, 0, "suppression is not cleared after identity changes during the provider upload");
+        assert.equal(providerOrphans.isSuppressed("root", "file.txt", "uploads"), true);
+        assert.equal(providerOrphans.getInventoryStatus(cloud).state, "unknown");
+      } finally { providerOrphans.clear = originalClear; }
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("cloud-disabled provider change persists invalidation and protects its backup baseline", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      write(path.join(uploadsDir, "root", "baseline.txt"), "baseline");
+      const baseline = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(uploadsDir, "root", "newer.txt"), "newer");
+      await backupService.createBackup({ createdBy: "fixture" });
+      await providerOrphans.markInventoryUnknown(baseline.id);
+      await providerOrphans.reconcileInventory(baseline.id, [], "a".repeat(64));
+
+      restoreService.setCloudStorage({ enabled: () => false, inventoryContext: () => "b".repeat(64) });
+      const result = await restoreService.reconcileUnknownProviderInventory();
+      assert.deepEqual(result, { state: "unknown", providerDisabled: true, changed: false });
+      assert.deepEqual(providerOrphans.getInventoryStatus(), {
+        state: "unknown", backupId: baseline.id, inventoryContext: "b".repeat(64), previousInventoryContext: "a".repeat(64),
+      }, "the attempted and previous contexts must be durable even while cloud access is disabled");
+
+      process.env.BACKUP_RETENTION_COUNT = "1";
+      process.env.BACKUP_RETENTION_DAYS = "0";
+      await backupService.cleanupRetention();
+      assert.equal(backupService.listBackups().find((item) => item.id === baseline.id)?.exists, true,
+        "the retained marker baseline remains available to future reconciliation");
+      await assert.rejects(backupService.deleteBackup(baseline.id), /provider inventory baseline/i);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("an explicit replacement baseline recovers a legacy marker whose archive was deleted", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
+      restoreService.setCloudStorage({ enabled: () => false });
+      const deletedBaseline = await backupService.createBackup({ createdBy: "fixture" });
+      const replacement = await backupService.createBackup({ createdBy: "fixture" });
+      await providerOrphans.markInventoryUnknown(deletedBaseline.id);
+      await providerOrphans.reconcileInventory(deletedBaseline.id, []);
+      await backupService.deleteBackup(deletedBaseline.id);
+
+      const provider = { enabled: () => true, inventoryContext: () => "d".repeat(64), inventory: async () => [] };
+      backupService.setCloudStorage(provider);
+      restoreService.setCloudStorage(provider);
+      const result = await restoreService.reconcileUnknownProviderInventory({ baselineBackupId: replacement.id });
+      assert.deepEqual(result, { state: "reconciled", backupId: replacement.id, suppressed: 0, changed: true });
+      assert.equal(providerOrphans.getInventoryStatus().state, "reconciled");
+      assert.equal(providerOrphans.getInventoryStatus().backupId, replacement.id);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("retention and deletion revalidate provider context under the shared marker lock", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      const baseline = await backupService.createBackup({ createdBy: "fixture" });
+      await backupService.createBackup({ createdBy: "fixture" });
+      await providerOrphans.markInventoryUnknown(baseline.id);
+      await providerOrphans.reconcileInventory(baseline.id, [], "a".repeat(64));
+      const changedProvider = { enabled: () => true, inventoryContext: () => "b".repeat(64) };
+      backupService.setCloudStorage(changedProvider);
+
+      await assert.rejects(backupService.deleteBackup(baseline.id), /provider inventory baseline/i,
+        "deletion sees the changed principal/configuration even before startup rewrites the marker");
+      process.env.BACKUP_RETENTION_COUNT = "1";
+      process.env.BACKUP_RETENTION_DAYS = "0";
+      await backupService.cleanupRetention();
+      assert.equal(backupService.listBackups().find((item) => item.id === baseline.id)?.exists, true,
+        "retention uses the same current-context check and shared marker lock");
+      assert.equal(providerOrphans.getInventoryStatus().state, "reconciled",
+        "the check remains safe even before marker invalidation is persisted");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("deletion-first interleaving cannot publish an unresolved marker for a missing baseline", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      const baseline = await backupService.createBackup({ createdBy: "fixture" });
+      await backupService.deleteBackup(baseline.id);
+      await assert.rejects(providerOrphans.markInventoryUnknown(baseline.id, {}, {
+        validateBaseline: () => backupService.getBackupOrThrow(baseline.id),
+      }), /Backup nao encontrado|Arquivo de backup nao encontrado/i,
+      "the validator runs after deletion has won the shared inventory lock");
+      assert.equal(providerOrphans.getInventoryStatus().state, "known",
+        "a deleted baseline is never persisted as unresolved provider inventory state");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("cloud-disabled startup routes a deleted legacy baseline through guarded reconciliation", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      const baseline = await backupService.createBackup({ createdBy: "fixture" });
+      await providerOrphans.markInventoryUnknown(baseline.id);
+      await providerOrphans.reconcileInventory(baseline.id, [], "a".repeat(64));
+      await backupService.deleteBackup(baseline.id);
+      const statePath = providerOrphans.STATE_PATH;
+      const policyPath = providerOrphans.POLICY_PATH;
+      const stateBefore = fs.readFileSync(statePath, "utf8");
+      const policyBefore = fs.readFileSync(policyPath, "utf8");
+      const listenMarker = path.join(process.cwd(), "local-listener-started");
+      const serverPath = ${JSON.stringify(path.join(ROOT, "server.js"))};
+      const script = [
+        'const fs=require("node:fs");const net=require("node:net");const original=net.Server.prototype.listen;',
+        'net.Server.prototype.listen=function(...args){fs.writeFileSync(' + JSON.stringify(listenMarker) + ',"started");const server=original.apply(this,args);setTimeout(()=>process.exit(0),100);return server;};',
+        'require(' + JSON.stringify(serverPath) + ');',
+      ].join("\\n");
+      const child = require("node:child_process").spawnSync(process.execPath, ["-e", script], {
+        cwd: process.cwd(),
+        env: { ...process.env, PORT: "0", NODE_ENV: "test", JWT_SECRET: "j".repeat(48), ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", CLOUD_STORAGE_PROVIDER: "local", DB_ENABLED: "false" },
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+      assert.equal(child.status, 0, child.stderr || child.stdout);
+      assert.equal(fs.existsSync(listenMarker), true, "cloud-disabled local startup remains available");
+      assert.equal(fs.readFileSync(statePath, "utf8"), stateBefore, "startup does not publish a new marker referencing a missing baseline");
+      assert.equal(fs.readFileSync(policyPath, "utf8"), policyBefore, "both durable marker copies remain unchanged");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("provider context change resets a failed Drive restore pin before retry", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(uploadsDir, "root", "drive.txt"), "local current bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      const oldContext = "a".repeat(64);
+      const newContext = "b".repeat(64);
+      const oldProvider = {
+        enabled: () => true, provider: "gdrive", inventoryContext: () => oldContext,
+        resolveUploadId: async () => "old-pin",
+        upload: async () => { throw Object.assign(new Error("old namespace failed"), { code: "provider_error" }); },
+        inventory: async () => [],
+      };
+      restoreService.setCloudStorage(oldProvider);
+      await assert.rejects(restoreService.reconcileUnknownProviderInventory({ sleep: async () => {} }), /not fully reconciled/);
+      const failedEntry = backupRepository.getBackup(backup.id).metadata.restoreSync.entries[0];
+      assert.equal(failedEntry.providerFileId, "old-pin");
+      assert.equal(backupRepository.getBackup(backup.id).metadata.restoreSync.providerContext, oldContext);
+
+      const pins = [];
+      const newProvider = {
+        enabled: () => true, provider: "gdrive", inventoryContext: () => newContext,
+        resolveUploadId: async () => "new-pin",
+        upload: async (_source, _folder, _name, _area, options) => { pins.push(options.providerFileId); return true; },
+        inventory: async () => [{ area: "uploads", folderId: "root", name: "drive.txt" }],
+      };
+      restoreService.setCloudStorage(newProvider);
+      await restoreService.reconcileUnknownProviderInventory({ sleep: async () => {} });
+      const retried = backupRepository.getBackup(backup.id).metadata.restoreSync.entries[0];
+      assert.deepEqual(pins, ["new-pin"], "retry reserves a new file ID under the new provider identity");
+      assert.equal(retried.providerFileId, "new-pin");
+      assert.equal(backupRepository.getBackup(backup.id).metadata.restoreSync.providerContext, newContext);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restart after a failed inventory recomputes and uploads a newer local delta", () => {
+  runFixture(`
+    backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      const localFile = path.join(uploadsDir, "root", "changed.txt");
+      write(localFile, "ARCHIVE bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      write(localFile, "first local delta");
+      const uploaded = [];
+      let inventoryAttempts = 0;
+      const provider = {
+        enabled: () => true, provider: "fixture", inventoryContext: () => "e".repeat(64),
+        upload: async (sourcePath) => { uploaded.push(fs.readFileSync(sourcePath, "utf8")); return true; },
+        inventory: async () => {
+          inventoryAttempts += 1;
+          if (inventoryAttempts === 1) throw new Error("injected inventory interruption");
+          return [{ area: "uploads", folderId: "root", name: "changed.txt" }];
+        },
+      };
+      restoreService.setCloudStorage(provider);
+      await assert.rejects(restoreService.reconcileUnknownProviderInventory(), /injected inventory interruption/);
+      write(localFile, "newer local delta after restart");
+      await restoreService.reconcileUnknownProviderInventory();
+      assert.deepEqual(uploaded, ["first local delta", "newer local delta after restart"],
+        "a changed local-tree fingerprint resets completed sync entries and never replays old archive bytes");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("cloud-disabled local edits are preserved and uploaded after restart", () => {
+  runFixture(`
+    backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(uploadsDir, "root", "edited.txt"), "ARCHIVED bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      write(path.join(uploadsDir, "root", "edited.txt"), "USER EDIT after restore");
+      const restoreServicePath = ${JSON.stringify(path.join(ROOT, "services", "restoreService"))};
+      const childProcess = require("node:child_process");
+      const script = [
+        'const fs = require("node:fs");',
+        'const originalMkdtempSync = fs.mkdtempSync;',
+        'fs.mkdtempSync = function(prefix, ...args) { if (String(prefix).includes("rootark-restore-sync-")) throw new Error("untracked restore payload staging is forbidden"); return originalMkdtempSync.call(this, prefix, ...args); };',
+        'const restore = require(' + JSON.stringify(restoreServicePath) + ');',
+        'let providerBytes = null;',
+        'restore.setCloudStorage({ enabled: () => true, provider: "fixture", inventoryContext: () => "' + "c".repeat(64) + '", upload: async (sourcePath) => { providerBytes = fs.readFileSync(sourcePath, "utf8"); return true; }, inventory: async () => [{ area: "uploads", folderId: "root", name: "edited.txt" }] });',
+        'restore.reconcileUnknownProviderInventory({ sleep: async () => {} }).then(() => process.stdout.write(JSON.stringify({ providerBytes })), (error) => { console.error(error); process.exitCode = 1; });',
+      ].join("\\n");
+      const restarted = childProcess.spawnSync(process.execPath, ["-e", script], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
+      assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+      assert.equal(JSON.parse(restarted.stdout).providerBytes, "USER EDIT after restore", "after restart, reconciliation uploads the current local delta rather than stale archive bytes");
+      assert.equal(fs.readFileSync(path.join(uploadsDir, "root", "edited.txt"), "utf8"), "USER EDIT after restore",
+        "reconciliation does not overwrite the local edit");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("cloud-disabled edits, deletions, and renames reconcile the current local delta", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(uploadsDir, "root", "edited.txt"), "ARCHIVED edit bytes");
+      write(path.join(uploadsDir, "root", "deleted.txt"), "ARCHIVED deleted bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(uploadsDir, "root", "edited.txt"), "LIVE mutable bytes");
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      write(path.join(uploadsDir, "root", "edited.txt"), "USER EDIT after restore");
+      fs.rmSync(path.join(uploadsDir, "root", "deleted.txt"));
+      write(path.join(uploadsDir, "root", "renamed.txt"), "USER RENAMED bytes");
+
+      const uploaded = {};
+      const cloud = {
+        enabled: () => true,
+        provider: "fixture",
+        inventoryContext: () => "c".repeat(64),
+        upload: async (sourcePath, _folderId, name) => { uploaded[name] = fs.readFileSync(sourcePath, "utf8"); return true; },
+        inventory: async () => [
+          { area: "uploads", folderId: "root", name: "edited.txt" },
+          { area: "uploads", folderId: "root", name: "deleted.txt" },
+          { area: "uploads", folderId: "root", name: "renamed.txt" },
+        ],
+      };
+      restoreService.setCloudStorage(cloud);
+      await restoreService.reconcileUnknownProviderInventory({ sleep: async () => {} });
+      assert.deepEqual(uploaded, { "edited.txt": "USER EDIT after restore", "renamed.txt": "USER RENAMED bytes" },
+        "startup reconciliation uploads changed and renamed local content without recreating deleted archive files");
+      assert.equal(fs.readFileSync(path.join(uploadsDir, "root", "edited.txt"), "utf8"), "USER EDIT after restore",
+        "provider reconciliation preserves the user's local edit");
+      assert.equal(fs.readFileSync(path.join(uploadsDir, "root", "renamed.txt"), "utf8"), "USER RENAMED bytes");
+      assert.equal(fs.existsSync(path.join(uploadsDir, "root", "deleted.txt")), false);
+      assert.equal(providerOrphans.getInventoryStatus().state, "reconciled");
+      assert.equal(providerOrphans.isSuppressed("root", "deleted.txt"), true,
+        "remote bytes for a locally deleted file remain suppressed after reconciliation");
+      assert.equal(providerOrphans.isSuppressed("root", "renamed.txt"), false);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("provider inventory refuses an incomplete backup baseline and gives replacement guidance", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      const backup = await backupService.createBackup({ label: "incomplete-baseline" });
+      providerOrphans.initialize();
+      await providerOrphans.markInventoryUnknown(backup.id);
+      const enabledProvider = {
+        provider: "gdrive", enabled: () => true, inventoryContext: () => "${"a".repeat(64)}",
+        resolveInventoryContext: async () => "${"a".repeat(64)}", inventory: async () => [],
+      };
+      restoreService.setCloudStorage(enabledProvider);
+      await assert.rejects(restoreService.reconcileUnknownProviderInventory(), /ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID.*complete backup/i);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore retries provider identity resolution after a transient same-process failure", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      write(path.join(dataDir, "runtime.json"), "archived state");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      let identity = null;
+      let resolveAttempts = 0;
+      const cloud = {
+        provider: "fixture",
+        enabled: () => true,
+        inventoryContext: () => {
+          if (!identity) throw new Error("Cloud provider identity has not been resolved; cloud access remains blocked");
+          return identity;
+        },
+        resolveInventoryContext: async () => {
+          resolveAttempts += 1;
+          identity = null;
+          if (resolveAttempts === 2) throw new Error("Cloud provider identity could not be resolved; cloud access remains blocked");
+          identity = "b".repeat(64);
+          return identity;
+        },
+        inventory: async () => [],
+        upload: async () => true,
+      };
+      await cloud.resolveInventoryContext();
+      await providerOrphans.markInventoryUnknown(backup.id, { inventoryContext: identity });
+      await providerOrphans.reconcileInventory(backup.id, [], cloud.inventoryContext());
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+
+      write(path.join(dataDir, "runtime.json"), "current state");
+      await assert.rejects(restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }), /identity could not be resolved/);
+      assert.equal(resolveAttempts, 2, "the failed identity refresh occurs at the restore boundary");
+      assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "current state",
+        "failed identity resolution does not mutate local data");
+      assert.equal(restoreService.getWholeRestorePhase(), null, "failed identity resolution does not leave a pending restore");
+
+      const result = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.equal(result.backup.id, backup.id);
+      assert.ok(resolveAttempts >= 3, "restore retries identity resolution before checking the inventory marker");
+      assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "archived state");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("provider reconciliation does not upload local paths excluded from backup sources", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      const configuredQuarantineDir = path.join(uploadsDir, "quarantine");
+      process.env.UPLOAD_QUARANTINE_DIR = configuredQuarantineDir;
+      write(path.join(uploadsDir, "root", "normal.txt"), "normal bytes");
+      const uploads = [];
+      const cloud = {
+        enabled: () => true,
+        inventoryContext: () => "c".repeat(64),
+        inventory: async () => [],
+        upload: async (source) => { uploads.push(path.relative(uploadsDir, source).split(path.sep).join("/")); return true; },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      const baseline = await backupService.createBackup({ createdBy: "fixture" });
+      await providerOrphans.markInventoryUnknown(baseline.id, { inventoryContext: "c".repeat(64) });
+
+      write(path.join(uploadsDir, "service-account", "secret.json"), "must stay local");
+      write(path.join(uploadsDir, "credentials", "nested.txt"), "must stay local");
+      write(path.join(uploadsDir, "private.pem", "nested.txt"), "must stay local");
+      write(path.join(uploadsDir, ".env.runtime", "nested.txt"), "must stay local");
+      write(path.join(uploadsDir, "root", ".rootark-cloud-cache-partial"), "must stay local");
+      write(path.join(uploadsDir, "root", ".env.production"), "must stay local");
+      write(path.join(uploadsDir, "root", "service-account.json"), "must stay local");
+      write(path.join(uploadsDir, "root", "certificate.pem"), "must stay local");
+      write(path.join(uploadsDir, "root", "keystore.p12"), "must stay local");
+      write(path.join(configuredQuarantineDir, "held.bin"), "quarantined payload");
+      write(path.join(dataDir, "quarantine.json"), JSON.stringify({
+        items: [{ id: "held", storedQuarantineFilename: "held.bin", originalFilename: "document.bin" }],
+      }));
+      fs.linkSync(path.join(configuredQuarantineDir, "held.bin"), path.join(uploadsDir, "root", "quarantine-alias.bin"));
+
+      const originalReaddirSync = fs.readdirSync;
+      const excludedDirectoriesVisited = [];
+      fs.readdirSync = function (directory, ...args) {
+        const relative = path.relative(uploadsDir, directory).split(path.sep).join("/");
+        if (["service-account", "credentials", "private.pem", ".env.runtime", "quarantine"].some((name) => relative === name || relative.startsWith(name + "/"))) {
+          excludedDirectoriesVisited.push(relative);
+        }
+        return originalReaddirSync.call(this, directory, ...args);
+      };
+      try { await restoreService.reconcileUnknownProviderInventory(); }
+      finally { fs.readdirSync = originalReaddirSync; }
+      assert.deepEqual(uploads, ["root/normal.txt"],
+        "local provider reconciliation must use the same exclusions as backup collection");
+      assert.deepEqual(excludedDirectoriesVisited, [], "excluded directory subtrees must not be traversed");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("provider reconciliation excludes a configured quarantine subtree under uploads", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      process.env.UPLOAD_QUARANTINE_DIR = path.join(uploadsDir, "quarantine");
+      write(path.join(process.env.UPLOAD_QUARANTINE_DIR, "pending.bin"), "quarantined bytes");
+      write(path.join(dataDir, "quarantine.json"), JSON.stringify({ items: [{ id: "fixture", storedQuarantineFilename: "pending.bin" }] }));
+      write(path.join(uploadsDir, "root", "normal.txt"), "normal bytes");
+
+      const uploadedPaths = [];
+      const cloud = {
+        enabled: () => true,
+        inventoryContext: () => "e".repeat(64),
+        inventory: async () => [],
+        upload: async (source) => {
+          const relative = path.relative(uploadsDir, source);
+          if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) {
+            uploadedPaths.push(relative.split(path.sep).join("/"));
+          }
+          return true;
+        },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      const baseline = await backupService.createBackup({ createdBy: "fixture" });
+      await providerOrphans.markInventoryUnknown(baseline.id, { inventoryContext: "e".repeat(64) });
+      await restoreService.reconcileUnknownProviderInventory();
+      assert.deepEqual(uploadedPaths, ["root/normal.txt"],
+        "local reconciliation must exclude the same configured quarantine subtree as backup collection");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("provider reconciliation excludes hardlink aliases of quarantine payloads", (t) => {
+  const outcome = runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      const payloadPath = path.join(quarantineDir, "pending.bin");
+      const aliasPath = path.join(uploadsDir, "root", "quarantine-alias.bin");
+      write(path.join(dataDir, "quarantine.json"), JSON.stringify({ items: [{ id: "fixture", storedQuarantineFilename: "pending.bin" }] }));
+      write(payloadPath, "quarantined bytes");
+      write(path.join(uploadsDir, "root", "normal.txt"), "normal bytes");
+      const uploadedPaths = [];
+      const cloud = {
+        enabled: () => true,
+        inventoryContext: () => "f".repeat(64),
+        inventory: async () => [],
+        upload: async (source) => {
+          const relative = path.relative(uploadsDir, source);
+          if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) uploadedPaths.push(relative.split(path.sep).join("/"));
+          return true;
+        },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      const baseline = await backupService.createBackup({ createdBy: "fixture" });
+      try { fs.linkSync(payloadPath, aliasPath); }
+      catch (error) {
+        if (["EACCES", "EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV"].includes(error.code)) {
+          console.log(JSON.stringify({ ok: true, skipped: "hard links unavailable: " + error.code }));
+          return;
+        }
+        throw error;
+      }
+
+      await providerOrphans.markInventoryUnknown(baseline.id, { inventoryContext: "f".repeat(64) });
+      uploadedPaths.length = 0;
+      await restoreService.reconcileUnknownProviderInventory();
+      assert.deepEqual(uploadedPaths, ["root/normal.txt"],
+        "local reconciliation must exclude quarantined file identities even through an ordinary alias path");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+  if (outcome.skipped) t.skip(outcome.skipped);
+});
+
+test("provider reconciliation fails closed on hardlinks to backup-sensitive files", (t) => {
+  const outcome = runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      write(path.join(uploadsDir, "root", "normal.txt"), "normal bytes");
+      const uploadedPaths = [];
+      const cloud = {
+        enabled: () => true,
+        inventoryContext: () => "a".repeat(64),
+        inventory: async () => [],
+        upload: async (source) => {
+          const relative = path.relative(uploadsDir, source);
+          if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) uploadedPaths.push(relative.split(path.sep).join("/"));
+          return true;
+        },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      const baseline = await backupService.createBackup({ createdBy: "fixture" });
+      await providerOrphans.markInventoryUnknown(baseline.id, { inventoryContext: "a".repeat(64) });
+
+      const sensitivePath = path.join(uploadsDir, "root", ".env.production");
+      const aliasPath = path.join(uploadsDir, "root", "ordinary-alias.txt");
+      write(sensitivePath, "fixture secret placeholder");
+      try { fs.linkSync(sensitivePath, aliasPath); }
+      catch (error) {
+        if (["EACCES", "EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV"].includes(error.code)) {
+          console.log(JSON.stringify({ ok: true, skipped: "hard links unavailable: " + error.code }));
+          return;
+        }
+        throw error;
+      }
+      await assert.rejects(restoreService.reconcileUnknownProviderInventory(), /hardlinked file/i,
+        "local reconciliation must fail closed on the same hardlink condition rejected by backup collection");
+      assert.deepEqual(uploadedPaths, [], "no local files are uploaded after a hardlink is detected");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+  if (outcome.skipped) t.skip(outcome.skipped);
+});
+
+test("restore does not queue or trust excluded paths declared by a backup manifest", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const archivePath = backupService.getBackupOrThrow(backup.id).archivePath;
+      fs.rmSync(archivePath);
+      const entries = [
+        { path: "uploads/root/normal.txt", contents: Buffer.from("normal bytes") },
+        { path: "uploads/service-account/secret.json", contents: Buffer.from("secret bytes") },
+        { path: "uploads/credentials/nested.txt", contents: Buffer.from("credential bytes") },
+        { path: "uploads/private.pem/nested.txt", contents: Buffer.from("private key bytes") },
+        { path: "uploads/.env.runtime/nested.txt", contents: Buffer.from("environment bytes") },
+        { path: "uploads/root/.rootark-cloud-cache-stale", contents: Buffer.from("partial cache bytes") },
+      ];
+      await backupService.createZipArchive(archivePath, {
+        backup_id: backup.id,
+        included_files: entries.map(({ path: entryPath, contents }) => ({ path: entryPath, size: contents.length })),
+        cloud_complete: true,
+      }, entries.map(({ path: entryPath, contents }) => ({ entryPath, contents, size: contents.length })));
+      await backupRepository.saveBackup({ ...backup, checksum: null });
+
+      const context = "d".repeat(64);
+      const remoteObjects = [
+        { area: "uploads", folderId: "root", name: "normal.txt" },
+        { area: "uploads", folderId: "service-account", name: "secret.json" },
+        { area: "uploads", folderId: "credentials", name: "nested.txt" },
+        { area: "uploads", folderId: "private.pem", name: "nested.txt" },
+        { area: "uploads", folderId: ".env.runtime", name: "nested.txt" },
+        { area: "uploads", folderId: "root", name: ".rootark-cloud-cache-stale" },
+      ];
+      let inventoryCalls = 0;
+      const cloud = {
+        enabled: () => true,
+        inventoryContext: () => context,
+        inventory: async () => (++inventoryCalls === 1 ? remoteObjects : []),
+        upload: async () => true,
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      await providerOrphans.markInventoryUnknown(backup.id, { inventoryContext: context });
+      await providerOrphans.reconcileInventory(backup.id, [], context);
+
+      const result = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.deepEqual(result.cloudSync.entries.map((entry) => entry.path), ["uploads/root/normal.txt"],
+        "sensitive manifest entries cannot seed provider uploads");
+      assert.equal(providerOrphans.isSuppressed("root", "normal.txt", "uploads"), false);
+      assert.equal(providerOrphans.isSuppressed("service-account", "secret.json", "uploads"), true,
+        "an excluded ancestor does not certify the remote object as archived");
+      assert.equal(providerOrphans.isSuppressed("credentials", "nested.txt", "uploads"), true);
+      assert.equal(providerOrphans.isSuppressed("private.pem", "nested.txt", "uploads"), true);
+      assert.equal(providerOrphans.isSuppressed(".env.runtime", "nested.txt", "uploads"), true);
+      assert.equal(providerOrphans.isSuppressed("root", ".rootark-cloud-cache-stale", "uploads"), true);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("an explicit complete replacement can replace an existing incomplete inventory baseline", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      const oldBaseline = await backupService.createBackup({ createdBy: "fixture" });
+      const incompleteReplacement = await backupService.createBackup({ createdBy: "fixture" });
+      await providerOrphans.markInventoryUnknown(oldBaseline.id);
+
+      const provider = {
+        enabled: () => true,
+        inventoryContext: () => "a".repeat(64),
+        inventory: async () => { inventoryCalls += 1; return []; },
+        upload: async () => true,
+      };
+      let inventoryCalls = 0;
+      backupService.setCloudStorage(provider);
+      restoreService.setCloudStorage(provider);
+      process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID = incompleteReplacement.id;
+      await assert.rejects(restoreService.reconcileUnknownProviderInventory(), /complete backup/i);
+      assert.equal(providerOrphans.getInventoryStatus().backupId, oldBaseline.id,
+        "an incomplete replacement must not replace the durable selection");
+      assert.equal(inventoryCalls, 0, "invalid replacement candidates fail before provider inventory");
+
+      const wrongIdentity = await backupService.createBackup({ createdBy: "fixture" });
+      inventoryCalls = 0;
+      const wrongIdentityArchive = backupService.getBackupOrThrow(wrongIdentity.id).archivePath;
+      fs.rmSync(wrongIdentityArchive);
+      await backupService.createZipArchive(wrongIdentityArchive, {
+        backup_id: "11111111-1111-4111-8111-111111111111",
+        included_files: [],
+        cloud_complete: true,
+      }, []);
+      await backupRepository.saveBackup({ ...wrongIdentity, checksum: null });
+      process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID = wrongIdentity.id;
+      await assert.rejects(restoreService.reconcileUnknownProviderInventory(), /identity|manifest/i);
+      assert.equal(providerOrphans.getInventoryStatus().backupId, oldBaseline.id,
+        "a mismatched manifest cannot replace the durable selection");
+      assert.equal(inventoryCalls, 0, "candidate identity is checked before provider inventory");
+
+      const completeReplacement = await backupService.createBackup({ createdBy: "fixture" });
+      inventoryCalls = 0;
+      process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID = completeReplacement.id;
+      const result = await restoreService.reconcileUnknownProviderInventory();
+      assert.equal(result.backupId, completeReplacement.id);
+      assert.equal(providerOrphans.getInventoryStatus().state, "reconciled");
+      assert.equal(providerOrphans.getInventoryStatus().backupId, completeReplacement.id);
+      assert.equal(inventoryCalls, 1, "only a validated complete replacement reaches provider inventory");
+      delete process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID;
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { delete process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID; console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("provider inventory reconciliation fails closed on symlink and unsupported upload entries", () => {
+  for (const kind of ["symlink", "unsupported"]) runFixture(`
+    backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(uploadsDir, "root", "source.txt"), "complete baseline");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      let inventoryCalls = 0;
+      const originalReaddir = fs.readdirSync;
+      fs.readdirSync = function (directory, options) {
+        const entries = originalReaddir.call(this, directory, options);
+        if (options?.withFileTypes && path.resolve(directory) === path.resolve(path.join(uploadsDir, "root"))) {
+          return [...entries, {
+            name: "alias.txt",
+            isSymbolicLink: () => ${JSON.stringify(kind)} === "symlink",
+            isDirectory: () => false,
+            isFile: () => false,
+          }];
+        }
+        return entries;
+      };
+      restoreService.setCloudStorage({
+        enabled: () => true, provider: "fixture", inventoryContext: () => "${"f".repeat(64)}",
+        inventory: async () => { inventoryCalls += 1; return []; },
+        upload: async () => { throw new Error("upload must not start for an ambiguous local tree"); },
+      });
+      const expected = ${JSON.stringify(kind)} === "symlink" ? /contains a symlink.*blocked/i : /unsupported filesystem entry.*blocked/i;
+      try { await assert.rejects(restoreService.reconcileUnknownProviderInventory(), expected); }
+      finally { fs.readdirSync = originalReaddir; }
+      assert.equal(inventoryCalls, 0, "the provider inventory is not certified from a partial local tree");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("selected archive bytes overwrite stale provider content before inventory reopens and retry after restart", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
     restoreService.setCloudStorage({ enabled: () => false });
     (async () => {
       write(path.join(uploadsDir, "root", "same.txt"), "ARCHIVED bytes");
@@ -615,7 +1480,7 @@ test("unknown inventory reuploads completed entries from a pending legacy restor
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
     const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
-    backupService.setCloudStorage({ enabled: () => false });
+    backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
     restoreService.setCloudStorage({ enabled: () => false });
     (async () => {
       write(path.join(uploadsDir, "root", "already-completed.txt"), "SELECTED first bytes");
@@ -685,7 +1550,7 @@ test("unknown inventory recovery waits for persisted leases and backoff before r
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
     const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
-    backupService.setCloudStorage({ enabled: () => false });
+    backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
     restoreService.setCloudStorage({ enabled: () => false });
     (async () => {
       write(path.join(uploadsDir, "root", "leased.txt"), "ARCHIVED lease bytes");
@@ -749,7 +1614,7 @@ test("unknown inventory recovery processes eligible uploads before waiting for f
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
     const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
-    backupService.setCloudStorage({ enabled: () => false });
+    backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
     restoreService.setCloudStorage({ enabled: () => false });
     (async () => {
       write(path.join(uploadsDir, "root", "ready.txt"), "ARCHIVED ready bytes");
@@ -805,7 +1670,7 @@ test("unknown inventory rejects persisted restore deadlines beyond the retry bou
     runFixture(`
       const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
       const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
-      backupService.setCloudStorage({ enabled: () => false });
+      backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
       restoreService.setCloudStorage({ enabled: () => false });
       (async () => {
         write(path.join(uploadsDir, "root", "bounded.txt"), "ARCHIVED bytes");
@@ -908,7 +1773,7 @@ test("cloud-complete selected archives upload selected bytes before opening same
 test("cloud startup keeps the listener closed when selected archive uploads fail", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
-    backupService.setCloudStorage({ enabled: () => false });
+    backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
     restoreService.setCloudStorage({ enabled: () => false });
     (async () => {
       write(path.join(uploadsDir, "root", "startup.txt"), "selected bytes");
@@ -934,7 +1799,7 @@ test("cloud startup keeps the listener closed when selected archive uploads fail
         timeout: 30_000,
       });
       assert.equal(result.status, 1, result.stderr || result.stdout);
-      assert.match(result.stderr, /provider inventory reconciliation failed; startup blocked/);
+      assert.match(result.stderr, /provider inventory initialization or reconciliation failed; startup blocked/);
       assert.equal(fs.existsSync(marker), false);
       assert.equal(providerOrphans.isInventoryUnknown(), true);
       const queued = backupService.listBackups().find((entry) => entry.id === backup.id);
@@ -972,7 +1837,7 @@ test("quarantine restore persists the provider policy pair before the next backu
 test("markerless provider control files require an explicit backup baseline and survive single-file loss", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
-    backupService.setCloudStorage({ enabled: () => false });
+    backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
     restoreService.setCloudStorage({ enabled: () => false });
     (async () => {
       write(path.join(uploadsDir, "root", "archive.txt"), "archive bytes");
@@ -2114,22 +2979,30 @@ test("successful migrations before listener acknowledgement preserve the restore
     const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
     const restoreServicePath = ${JSON.stringify(path.join(ROOT, "services", "restoreService"))};
     const restore = require(restoreServicePath);
+    const originalExit = process.exit;
+    let startupExitCode = null;
+    process.exit = (code) => { startupExitCode = code; };
     const originalListen = net.Server.prototype.listen;
     net.Server.prototype.listen = function () { throw new Error("injected listener bind interruption"); };
-    try {
-      assert.throws(() => require(${JSON.stringify(path.join(ROOT, "server.js"))}), /injected listener bind interruption/);
-    } finally { net.Server.prototype.listen = originalListen; }
-    assert.equal(JSON.parse(fs.readFileSync(${JSON.stringify(coordinatorPath)}, "utf8")).phase, "restart_required");
-    assert.equal(restore.assertNoPendingWholeRestore().restartRequired, true);
-    const backup = backupRepository.getBackup(fs.readFileSync(${JSON.stringify(backupIdPath)}, "utf8"));
-    assert.equal(backup.metadata.restoreSync.state, "pending");
-    assert.equal(backup.metadata.restoreSync.entries.length, 1);
-    const db = new Database(process.env.DATABASE_URL, { readonly: true });
-    try {
-      assert.deepEqual(db.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map((row) => row.version), [1, 2, 3, 4, 5]);
-      assert.equal(db.prepare("SELECT value FROM proof").get().value, "archive-before-migration");
-    } finally { db.close(); }
-    process.exit(0);
+    require(${JSON.stringify(path.join(ROOT, "server.js"))});
+    setTimeout(() => {
+      try {
+        assert.equal(startupExitCode, 1, "an asynchronous listener failure exits startup without acknowledging the restore");
+        assert.equal(JSON.parse(fs.readFileSync(${JSON.stringify(coordinatorPath)}, "utf8")).phase, "restart_required");
+        assert.equal(restore.assertNoPendingWholeRestore().restartRequired, true);
+        const backup = backupRepository.getBackup(fs.readFileSync(${JSON.stringify(backupIdPath)}, "utf8"));
+        assert.equal(backup.metadata.restoreSync.state, "pending");
+        assert.equal(backup.metadata.restoreSync.entries.length, 1);
+        const db = new Database(process.env.DATABASE_URL, { readonly: true });
+        try {
+          assert.deepEqual(db.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map((row) => row.version), [1, 2, 3, 4, 5]);
+          assert.equal(db.prepare("SELECT value FROM proof").get().value, "archive-before-migration");
+        } finally { db.close(); }
+        net.Server.prototype.listen = originalListen;
+        process.exit = originalExit;
+        originalExit(0);
+      } catch (error) { console.error(error); originalExit(1); }
+    }, 150);
   `;
   const recoveredStartup = `
     const assert = require("node:assert/strict");
@@ -2685,6 +3558,332 @@ test("restore inventory failure aborts before local commit", () => {
       assert.equal(fs.readFileSync(path.join(dataDir, "restore-state.json"), "utf8"), "live state");
       assert.equal(fs.existsSync(path.join(dataDir, ".rootark-restore-provider-orphans.json")), false);
       assert.equal(restoreService.assertNoPendingWholeRestore().reason, "no_pending_restore");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("cloud restore binds suppression and sync state to the provider context", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      write(path.join(uploadsDir, "root", "restored.txt"), "selected archive bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      let context = "a".repeat(64);
+      let uploads = 0;
+      const cloud = {
+        enabled: () => true,
+        provider: "fixture",
+        resolveInventoryContext: async () => context,
+        inventoryContext: () => context,
+        inventory: async () => [],
+        upload: async () => { uploads += 1; return true; },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.equal(restored.cloudSync.state, "pending");
+      assert.equal(restored.cloudSync.providerContext, context,
+        "the queued selected-archive uploads are bound to the identity used for inventory");
+      const policy = JSON.parse(fs.readFileSync(path.join(dataDir, ".rootark-restore-provider-orphans.json"), "utf8"));
+      assert.equal(policy.providerInventory.state, "reconciled");
+      assert.equal(policy.providerInventory.backupId, backup.id);
+      assert.equal(policy.providerInventory.inventoryContext, context,
+        "the durable suppression marker records the provider namespace used to build it");
+      assert.equal(providerOrphans.getInventoryStatus(cloud).state, "reconciled");
+
+      context = "b".repeat(64);
+      await cloud.resolveInventoryContext();
+      const changed = providerOrphans.getInventoryStatus(cloud);
+      assert.equal(changed.state, "unknown",
+        "a restart under a different provider identity must require inventory reconciliation");
+      assert.equal(changed.inventoryContext, context);
+      await assert.rejects(restoreService.processRestoreSync({ backupId: backup.id }), /provider context changed|inventory is unknown/i);
+      assert.equal(uploads, 0, "a queued upload from the previous provider context cannot run under the new namespace");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("legacy restore queue without provider context cannot upload to current provider identity", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      write(path.join(uploadsDir, "root", "legacy-queued.txt"), "queued archive bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      let context = "a".repeat(64);
+      let uploads = 0;
+      const cloud = {
+        enabled: () => true,
+        provider: "fixture",
+        resolveInventoryContext: async () => context,
+        inventoryContext: () => context,
+        inventory: async () => [],
+        upload: async () => { uploads += 1; return true; },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+
+      const saved = backupRepository.getBackup(backup.id);
+      const legacySync = { ...saved.metadata.restoreSync };
+      delete legacySync.providerContext;
+      await backupRepository.saveBackup({ ...saved, checksum: null, metadata: { ...saved.metadata, restoreSync: legacySync } });
+      await providerOrphans.write([], { state: "known" });
+
+      context = "b".repeat(64);
+      await cloud.resolveInventoryContext();
+      assert.equal(providerOrphans.getInventoryStatus(cloud).state, "known",
+        "a legacy known marker does not prove which provider identity owns a pending queue");
+      await assert.rejects(restoreService.processRestoreSync({ backupId: backup.id, uploader: cloud }), {
+        code: "PROVIDER_CONTEXT_MISSING",
+      });
+      assert.equal(uploads, 0, "a contextless legacy queue cannot upload to the current provider identity");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("startup reconciles a sole legacy restore queue before rebinding it to the current provider", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      let context = "a".repeat(64);
+      const uploads = [];
+      const cloud = {
+        enabled: () => true,
+        provider: "fixture",
+        resolveInventoryContext: async () => context,
+        inventoryContext: () => context,
+        inventory: async () => [],
+        upload: async (sourcePath, _folderId, name, _area) => {
+          uploads.push({ name, contents: fs.readFileSync(sourcePath, "utf8"), context });
+          return true;
+        },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      write(path.join(uploadsDir, "root", "legacy-queued.txt"), "selected archive bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+
+      const saved = backupRepository.getBackup(backup.id);
+      const legacySync = { ...saved.metadata.restoreSync };
+      delete legacySync.providerContext;
+      backupRepository.saveBackup({ ...saved, checksum: null, metadata: { ...saved.metadata, restoreSync: legacySync } });
+      await providerOrphans.write([], { state: "known" });
+      context = "b".repeat(64);
+
+      assert.equal(providerOrphans.getInventoryStatus(cloud).state, "known");
+      await restoreService.reconcileUnknownProviderInventory();
+
+      const reconciled = backupRepository.getBackup(backup.id).metadata.restoreSync;
+      assert.equal(reconciled.providerContext, context,
+        "the legacy queue is rebuilt from its validated archive before being bound to the current identity");
+      assert.equal(reconciled.state, "completed");
+      assert.deepEqual(uploads, [{ name: "legacy-queued.txt", contents: "selected archive bytes", context }]);
+      assert.equal(providerOrphans.getInventoryStatus(cloud).state, "reconciled");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("startup blocks ambiguous legacy restore queues before provider uploads", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      write(path.join(uploadsDir, "root", "ambiguous-legacy.txt"), "archive bytes");
+      const backups = [
+        await backupService.createBackup({ createdBy: "fixture" }),
+        await backupService.createBackup({ createdBy: "fixture" }),
+      ];
+      for (const backup of backups) {
+        const saved = backupRepository.getBackup(backup.id);
+        backupRepository.saveBackup({
+          ...saved,
+          checksum: null,
+          metadata: { ...saved.metadata, restoreSync: {
+            operationId: backup.id,
+            state: "pending",
+            providerContext: "old-provider-context",
+            entries: [{ state: "pending" }],
+          } },
+        });
+      }
+      await providerOrphans.write([], { state: "known" });
+      let inventories = 0;
+      let uploads = 0;
+      const cloud = {
+        enabled: () => true,
+        provider: "fixture",
+        resolveInventoryContext: async () => "b".repeat(64),
+        inventoryContext: () => "b".repeat(64),
+        inventory: async () => { inventories += 1; return []; },
+        upload: async () => { uploads += 1; return true; },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+
+      await assert.rejects(restoreService.reconcileUnknownProviderInventory(), {
+        code: "LEGACY_RESTORE_SYNC_AMBIGUOUS",
+      });
+      assert.equal(inventories, 0, "startup must not choose an arbitrary archive baseline");
+      assert.equal(uploads, 0, "ambiguous legacy queues cannot reach the provider");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("replacement baseline retires the superseded legacy queue across restarts", () => {
+  runFixture(`
+    const { spawnSync: spawnChildSync } = require("node:child_process");
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const backupRepositoryPath = ${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))};
+    const restoreServicePath = ${JSON.stringify(path.join(ROOT, "services", "restoreService"))};
+    const providerOrphansPath = ${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))};
+    (async () => {
+      let context = "a".repeat(64);
+      const uploadCountPath = path.join(dataDir, "fixture-provider-upload-count.txt");
+      write(uploadCountPath, "0");
+      const uploadCount = () => Number(fs.readFileSync(uploadCountPath, "utf8")) || 0;
+      const cloud = {
+        enabled: () => true,
+        provider: "fixture",
+        resolveInventoryContext: async () => context,
+        inventoryContext: () => context,
+        inventory: async () => [],
+        upload: async () => { write(uploadCountPath, String(uploadCount() + 1)); return true; },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      write(path.join(uploadsDir, "root", "legacy-replacement.txt"), "selected archive bytes");
+      const legacyBackup = await backupService.createBackup({ createdBy: "fixture" });
+      const restored = await restoreService.restoreBackup(legacyBackup.id, { confirmation: "RESTORE" });
+      assert.equal(restored.cloudSync.state, "pending");
+      const replacement = await backupService.createBackup({ createdBy: "fixture" });
+      const legacyArchive = backupService.getBackupOrThrow(legacyBackup.id).archivePath;
+      fs.unlinkSync(legacyArchive);
+      const savedLegacy = backupRepository.getBackup(legacyBackup.id);
+      backupRepository.saveBackup({
+        ...savedLegacy,
+        checksum: null,
+        metadata: { ...savedLegacy.metadata, restoreSync: {
+          ...savedLegacy.metadata.restoreSync,
+          state: "pending",
+          entries: savedLegacy.metadata.restoreSync.entries.map((entry) => ({
+            ...entry,
+            state: "in_progress",
+            leaseToken: "fixture-active-provider-lease",
+            leaseUntil: new Date(Date.now() + 60_000).toISOString(),
+          })),
+        } },
+      });
+      await providerOrphans.write([], { state: "known" });
+      context = "b".repeat(64);
+
+      const previousBaseline = process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID;
+      process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID = replacement.id;
+      try {
+        await assert.rejects(restoreService.reconcileUnknownProviderInventory(), {
+          code: "LEGACY_RESTORE_SYNC_LEASE_ACTIVE",
+        }, "a live old-context lease must block replacement uploads");
+        assert.equal(uploadCount(), 0, "the interrupted startup does not upload while the old queue lease is active");
+        assert.equal(backupRepository.getBackup(replacement.id).metadata.providerReconciliationSupersedesBackupId, legacyBackup.id,
+          "the selected replacement durably records which legacy queue still needs retirement");
+        assert.equal(providerOrphans.getInventoryStatus(cloud).state, "unknown");
+
+        const leased = backupRepository.getBackup(legacyBackup.id);
+        backupRepository.saveBackup({
+          ...leased,
+          checksum: null,
+          metadata: { ...leased.metadata, restoreSync: {
+            ...leased.metadata.restoreSync,
+            state: "pending",
+            entries: leased.metadata.restoreSync.entries.map((entry) => ({
+              ...entry,
+              state: "pending",
+              leaseToken: null,
+              leaseUntil: null,
+            })),
+          } },
+        });
+        const restartScript = [
+          "const fs=require('node:fs');",
+          "const path=require('node:path');",
+          "const backupRepository=require(" + JSON.stringify(backupRepositoryPath) + ");",
+          "const restoreService=require(" + JSON.stringify(restoreServicePath) + ");",
+          "const providerOrphans=require(" + JSON.stringify(providerOrphansPath) + ");",
+          "const dataDir=path.join(process.cwd(),'data');",
+          "const uploadCountPath=path.join(dataDir,'fixture-provider-upload-count.txt');",
+          "const uploadCount=()=>Number(fs.readFileSync(uploadCountPath,'utf8'))||0;",
+          "const cloud={enabled:()=>true,provider:'fixture',resolveInventoryContext:async()=> 'b'.repeat(64),inventoryContext:()=> 'b'.repeat(64),inventory:async()=>[],upload:async()=>{fs.writeFileSync(uploadCountPath,String(uploadCount()+1));return true;}};",
+          "(async()=>{await restoreService.setCloudStorage(cloud);const result=await restoreService.reconcileUnknownProviderInventory();const legacy=backupRepository.getBackup(" + JSON.stringify(legacyBackup.id) + ");const replacement=backupRepository.getBackup(" + JSON.stringify(replacement.id) + ");console.log(JSON.stringify({ok:true,uploads:uploadCount(),legacyState:legacy.metadata.restoreSync.state,replacementState:replacement.metadata.restoreSync.state,pointer:replacement.metadata.providerReconciliationSupersedesBackupId||null,inventoryState:providerOrphans.getInventoryStatus(cloud).state,changed:result.changed}));})().catch(error=>{console.error(error);process.exitCode=1;});",
+        ].join(String.fromCharCode(10));
+        const resumed = spawnChildSync(process.execPath, ["-e", restartScript], {
+          cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000,
+        });
+        assert.equal(resumed.status, 0, resumed.stderr || resumed.stdout);
+        const resumedState = JSON.parse(resumed.stdout.trim().split(String.fromCharCode(10)).at(-1));
+        assert.equal(resumedState.legacyState, "cancelled",
+          "a fresh process resumes and durably retires the stale queue");
+        assert.equal(resumedState.replacementState, "completed");
+        assert.equal(resumedState.pointer, null, "the durable supersession pointer clears only after retirement");
+        assert.equal(resumedState.inventoryState, "reconciled");
+        const uploadsAfterRestart = resumedState.uploads;
+        assert.ok(uploadsAfterRestart > 0, "the replacement baseline's selected bytes reconcile once");
+        const secondRestart = spawnChildSync(process.execPath, ["-e", restartScript], {
+          cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000,
+        });
+        assert.equal(secondRestart.status, 0, secondRestart.stderr || secondRestart.stdout);
+        const secondRestartState = JSON.parse(secondRestart.stdout.trim().split(String.fromCharCode(10)).at(-1));
+        assert.equal(secondRestartState.uploads, uploadsAfterRestart,
+          "a subsequent fresh process does not rediscover or replay the superseded queue");
+      } finally {
+        if (previousBaseline === undefined) delete process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID;
+        else process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID = previousBaseline;
+      }
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("divergent unknown provider marker contexts fail closed until repaired", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      const backupId = "123e4567-e89b-42d3-a456-426614174000";
+      const statePath = path.join(dataDir, ".rootark-restore-provider-orphans-state.json");
+      const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+      const stateContext = "a".repeat(64);
+      const policyContext = "b".repeat(64);
+      write(statePath, JSON.stringify({ version: 1, initializedAt: "2026-01-01T00:00:00.000Z", providerInventory: {
+        state: "unknown", backupId, inventoryContext: stateContext,
+      } }));
+      write(policyPath, JSON.stringify({ version: 1, objects: [], providerInventory: {
+        state: "unknown", backupId, inventoryContext: policyContext,
+      } }));
+
+      const divergent = providerOrphans.getInventoryStatus({ inventoryContext: () => policyContext });
+      assert.equal(divergent.state, "unknown");
+      assert.equal(divergent.contextConflict, true,
+        "the policy and state records are separate durable witnesses and must not select one conflicting context");
+      assert.equal(divergent.inventoryContext, undefined);
+      await assert.rejects(providerOrphans.reconcileInventory(backupId, [], policyContext), /context records are inconsistent/i);
+
+      await providerOrphans.markInventoryUnknown(backupId, { inventoryContext: policyContext });
+      assert.deepEqual(providerOrphans.getInventoryStatus(), {
+        state: "unknown", backupId, inventoryContext: policyContext,
+      }, "an explicit current context repairs both unknown records under the policy lock");
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);

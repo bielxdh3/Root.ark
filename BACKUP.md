@@ -43,12 +43,16 @@ BACKUP_COMPRESS=true
 
 - `node_modules`
 - `.git`
-- `.env`
-- credenciais AWS/GDrive
-- arquivos `.key`, `.pem`, `.p12`
+- `.env`, `.env.*` e arquivos terminados em `.env`, em qualquer caminho incluído
+- caminhos com nomes que contenham `credentials` ou `service-account`
+- arquivos `.key`, `.pem` e `.p12`, em qualquer caminho incluído
+- arquivos e diretórios `.rootark-cloud-cache-*` e arquivos de controle internos do runtime
 - `data/server-master.key`
 - `data/backups`
+- a árvore de quarentena configurada, seus aliases de caminho real e hardlinks para payloads em quarentena
 - uploads temporários incompletos em `temp/.chunks` e `temp/.incoming`
+
+Essas exclusões são por caminho/nome; o backup não inspeciona o conteúdo de arquivos arbitrários em busca de credenciais. A criação do backup e a reconciliação do inventário cloud falham fechadas se um arquivo elegível tiver hardlinks, para impedir que um nome comum contorne a exclusão de outro caminho.
 
 ## Backup manual
 
@@ -95,7 +99,9 @@ Após restaurar, reinicie o único processo do servidor. O serviço recupera ou 
 
 ### Restore local e armazenamento cloud
 
-Um restore feito com o cloud desativado mantém a aplicação local disponível, mas marca o inventário do provider como desconhecido. Se o cloud for habilitado depois, o servidor valida o backup selecionado, persiste uma fila para cada entrada `uploads/` desse arquivo (mesmo se o manifesto cloud for incompleto) e envia os bytes restaurados antes de confiar no inventário ou abrir o listener da aplicação. Na inicialização, a reconciliação aguarda o menor prazo persistido de lease/backoff e retoma os itens vencidos; o atraso de retry pode chegar a uma hora. Se uma tentativa cloud falhar, o listener permanece fechado e a fila durável fica para a próxima inicialização. Para estado legado sem marcador de inventário, configure explicitamente `ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID` com o ID do backup que deve servir de baseline; não escolha o backup mais recente automaticamente.
+Um restore feito com o cloud desativado mantém a aplicação local disponível, mas marca o inventário do provider como desconhecido. Se o cloud for habilitado depois, o servidor exige um backup selecionado com `cloud_complete: true` como baseline e planeja uploads a partir da árvore `uploads/` local atual: arquivos novos ou alterados são enviados, enquanto objetos remotos de arquivos apagados ou renomeados continuam suprimidos. Um backup incompleto não é certificado; selecione um backup completo por `ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID`. Na inicialização, a reconciliação e o worker agendado atualizam a identidade do provider antes dos uploads e conferem que ela continua igual depois; se ela mudar durante uma tentativa, a entrada permanece pendente para retry e a supressão não é limpa. A inicialização aguarda o menor prazo persistido de lease/backoff e retoma os itens vencidos; o atraso de retry pode chegar a uma hora. Se uma tentativa cloud falhar, o listener permanece fechado e a fila durável fica para a próxima inicialização. Para estado legado sem marcador de inventário, configure explicitamente `ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID` com o ID do backup que deve servir de baseline; não escolha o backup mais recente automaticamente.
+
+Em endpoints S3 compatíveis sem identidade STS, configure `AWS_S3_PRINCIPAL_ID` com um identificador estável, não secreto, da conta/principal. A inicialização falha fechada se esse identificador estiver ausente; o access key ID não substitui esse vínculo.
 
 O provider externo não participa do rollback local. Restore oferece recuperação local por pre-images e reconciliação cloud retomável, não uma transação atômica entre filesystem, bancos e provider. Uma falha cloud após o commit local pode atrasar a disponibilidade dos arquivos até a fila ser concluída.
 

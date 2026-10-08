@@ -394,6 +394,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     PORT: String(port), DB_ENABLED: "false", NODE_ENV: "test", JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
     TOTP_POLICY: "optional", CLOUD_STORAGE_PROVIDER: "s3", AWS_S3_BUCKET: "fixture-bucket", AWS_REGION: "us-east-1",
     AWS_ENDPOINT_URL: `http://127.0.0.1:${cloud.port}`, AWS_FORCE_PATH_STYLE: "true", AWS_ACCESS_KEY_ID: "fixture-access-key",
+    AWS_S3_PRINCIPAL_ID: "fixture-account",
     AWS_SECRET_ACCESS_KEY: "fixture-secret-key", TRASH_ENABLED: "true", TRASH_AUTO_CLEANUP_ENABLED: "false", CLOUD_TEMP_RECONCILIATION_INTERVAL_MS: "1000", CLOUD_UPLOAD_RECONCILIATION_INTERVAL_MS: "1000",
     WEBDAV_ENABLED: "true",
     WEBDAV_ALLOW_MOVE: "true",
@@ -485,8 +486,21 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const firstUploadDeadline = Date.now() + 5000;
   while (cloud.uploadAttemptCount(approvalProviderKey) === 0 && Date.now() < firstUploadDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.ok(cloud.uploadAttemptCount(approvalProviderKey) > 0, "the approval upload reconciliation was attempted");
-  cloud.clearUploadFailures(approvalProviderKey);
+  const approvalLifecycleLockDirectory = path.join(dataDir, ".rootark-cloud-file-locks");
+  const approvalLifecycleLockPaths = ["folder:root", `root\0${approveTrashRecoveryName}`].map((identity) =>
+    path.join(approvalLifecycleLockDirectory, `${crypto.createHash("sha256").update(identity).digest("hex")}.lock`));
+  const approvalLockReleaseDeadline = Date.now() + 5000;
+  while (approvalLifecycleLockPaths.some((lockPath) => fs.existsSync(lockPath)) && Date.now() < approvalLockReleaseDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(approvalLifecycleLockPaths.every((lockPath) => !fs.existsSync(lockPath)),
+    "the failed approval upload must release its folder and file lifecycle locks before child restart");
+  assert.ok(fs.existsSync(approvalQueuePath), "the failed approval upload intent remains queued before restart");
+  assert.equal(JSON.parse(fs.readFileSync(approvalQueuePath, "utf8")).desired, "present");
+  assert.equal(objects.get(approvalProviderKey)?.toString(), "old remote bytes",
+    "the provider replacement remains unchanged while upload failures are active");
   await stop(child);
+  cloud.clearUploadFailures(approvalProviderKey);
   child = startChild();
   childErrors = "";
   child.stderr?.on("data", (chunk) => { childErrors += chunk.toString(); });

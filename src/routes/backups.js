@@ -100,9 +100,9 @@ function registerBackupRoutes(app, context) {
     }
   });
 
-  app.delete("/backups/:id", authenticate, requireBackupAccess, (req, res) => {
+  app.delete("/backups/:id", authenticate, requireBackupAccess, async (req, res) => {
     try {
-      const backup = backupService.deleteBackup(req.params.id);
+      const backup = await backupService.deleteBackup(req.params.id);
       auditLog("backup.deleted", getAuditActor(req), { type: "backup", id: backup.id }, "deleted", "success", {
         filename: backup.filename,
       });

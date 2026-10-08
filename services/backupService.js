@@ -75,23 +75,24 @@ function collisionKey(value) {
 
 function isSensitivePath(relativePath) {
   const normalized = normalizeEntryPath(relativePath);
-  const base = path.basename(normalized).toLowerCase();
+  const lowerPath = normalized.toLowerCase();
+  const segments = lowerPath.split("/").filter(Boolean);
   if (!normalized) return true;
-  if (normalized.startsWith(".git/") || normalized === ".git") return true;
-  if (normalized.startsWith("node_modules/") || normalized === "node_modules") return true;
-  if (normalized.startsWith("data/backups/") || normalized === "data/backups") return true;
-  if (normalized.toLowerCase().startsWith("data/.rootark-cloud-")) return true;
-  if (normalized.startsWith("temp/.chunks/") || normalized.startsWith("temp/.incoming/")) return true;
-  if (base === ".env" || base.startsWith(".env.") || base.endsWith(".env")) return true;
-  if (base.includes("credentials") || base.includes("service-account")) return true;
-  if (base.endsWith(".key") || base.endsWith(".pem") || base.endsWith(".p12")) return true;
-  if (base === "server-master.key") return true;
-  if (base === ".rootark-quarantine-restore-journal.json" || base.startsWith(".rootark-quarantine-restore-metadata-")) return true;
-  if (base === ".rootark-restore-provider-orphans.json") return true;
-  if (base === ".rootark-restore-provider-orphans-state.json") return true;
-  if (base.startsWith(".rootark-restore-coordinator.json")) return true;
-  if (normalized.toLowerCase().startsWith("data/.rootark-active-requests/")) return true;
-  if (normalized.toLowerCase().startsWith("data/.rootark-restore-restart-acks/")) return true;
+  if (lowerPath.startsWith(".git/") || lowerPath === ".git") return true;
+  if (lowerPath.startsWith("node_modules/") || lowerPath === "node_modules") return true;
+  if (lowerPath.startsWith("data/backups/") || lowerPath === "data/backups") return true;
+  if (lowerPath.startsWith("data/.rootark-cloud-")) return true;
+  if (lowerPath.startsWith("temp/.chunks/") || lowerPath.startsWith("temp/.incoming/")) return true;
+  if (lowerPath.startsWith("data/.rootark-active-requests/")) return true;
+  if (lowerPath.startsWith("data/.rootark-restore-restart-acks/")) return true;
+  if (segments.some((segment) => segment === ".env" || segment.startsWith(".env.") || segment.endsWith(".env"))) return true;
+  if (segments.some((segment) => segment.includes("credentials") || segment.includes("service-account"))) return true;
+  if (segments.some((segment) => segment.endsWith(".key") || segment.endsWith(".pem") || segment.endsWith(".p12"))) return true;
+  if (segments.some((segment) => segment.startsWith(".rootark-cloud-cache-"))) return true;
+  if (segments.some((segment) => segment === ".rootark-quarantine-restore-journal.json" || segment.startsWith(".rootark-quarantine-restore-metadata-"))) return true;
+  if (segments.some((segment) => segment === ".rootark-restore-provider-orphans.json")) return true;
+  if (segments.some((segment) => segment === ".rootark-restore-provider-orphans-state.json")) return true;
+  if (segments.some((segment) => segment.startsWith(".rootark-restore-coordinator.json"))) return true;
   return false;
 }
 
@@ -111,6 +112,42 @@ function pathIdentityKey(value) {
 
 function fileIdentity(stat) {
   return stat?.isFile?.() && stat.ino ? `${stat.dev}:${stat.ino}` : null;
+}
+
+function getQuarantineExclusionState() {
+  const directory = getUploadQuarantineDir();
+  if (quarantineDirContainsUploads(resolveRuntimePath("uploads"), directory)) {
+    throw new Error("Backup is not supported when the quarantine directory equals or contains uploads");
+  }
+  const metadata = readQuarantineMetadata(resolveRuntimePath("data", "quarantine.json"));
+  const payloads = metadata ? validateQuarantinePayloads(metadata.items, directory) : [];
+  const pathIdentities = new Set();
+  const fileIdentities = new Set();
+  for (const payload of payloads) {
+    pathIdentities.add(pathIdentityKey(payload.absolutePath));
+    try { pathIdentities.add(pathIdentityKey(fs.realpathSync(payload.absolutePath))); } catch {}
+    const identity = fileIdentity(fs.lstatSync(payload.absolutePath, { bigint: true }));
+    if (identity) fileIdentities.add(identity);
+  }
+  let directoryReal = null;
+  try { directoryReal = fs.realpathSync(directory); } catch {}
+  const isPayloadPath = (candidatePath, stat) => {
+    const identity = fileIdentity(stat);
+    if (identity && fileIdentities.has(identity)) return true;
+    if (pathIdentities.has(pathIdentityKey(candidatePath))) return true;
+    try { return pathIdentities.has(pathIdentityKey(fs.realpathSync(candidatePath))); } catch { return false; }
+  };
+  const isExcludedPath = (candidatePath, stat) => {
+    const absolute = path.resolve(candidatePath);
+    if (isPathWithin(directory, absolute)) return true;
+    if (directoryReal) {
+      try {
+        if (isPathWithin(directoryReal, fs.realpathSync(absolute))) return true;
+      } catch {}
+    }
+    return isPayloadPath(absolute, stat);
+  };
+  return { directory, metadata, payloads, fileIdentities, isPayloadPath, isExcludedPath };
 }
 
 function sameFileIdentity(left, right) {
@@ -229,23 +266,24 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
     const absolute = path.resolve(excludedPath);
     return { absolute, real: fs.existsSync(absolute) ? fs.realpathSync(absolute) : null };
   });
-  const isExcluded = (candidatePath) => {
-    if (!excludedPaths.length) return false;
+  const isExcluded = (candidatePath, stat) => {
     const absolute = path.resolve(candidatePath);
     if (excludedPaths.some((excluded) => isPathWithin(excluded.absolute, absolute))) return true;
-    if (!excludedPaths.some((excluded) => excluded.real)) return false;
-    let real;
-    try { real = fs.realpathSync(absolute); } catch { return false; }
-    return excludedPaths.some((excluded) => excluded.real && isPathWithin(excluded.real, real));
+    if (excludedPaths.some((excluded) => excluded.real && (() => {
+      try { return isPathWithin(excluded.real, fs.realpathSync(absolute)); } catch { return false; }
+    })())) return true;
+    const identity = fileIdentity(stat);
+    if (identity && options.excludeFileIdentities?.has(identity)) return true;
+    return Boolean(options.excludePredicate?.(absolute, stat));
   };
-  if (isExcluded(rootAbsolute)) return [];
+  const rootStat = fs.lstatSync(rootAbsolute, { bigint: true });
+  if (rootStat.isSymbolicLink() || isExcluded(rootAbsolute, rootStat)) return [];
   const files = [];
   const stack = [{ absolutePath: rootAbsolute, entryPath: entryPrefix }];
   while (stack.length) {
     const current = stack.pop();
-    if (isExcluded(current.absolutePath)) continue;
     const stat = fs.lstatSync(current.absolutePath, { bigint: true });
-    if (stat.isSymbolicLink()) continue;
+    if (stat.isSymbolicLink() || isExcluded(current.absolutePath, stat)) continue;
     if (stat.isDirectory()) {
       for (const name of fs.readdirSync(current.absolutePath)) {
         if (options.excludeNamePrefixes?.some((prefix) => name.startsWith(prefix))) continue;
@@ -259,7 +297,6 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
     }
     if (!stat.isFile()) continue;
     const identity = fileIdentity(stat);
-    if (identity && options.excludeFileIdentities?.has(identity)) continue;
     if (options.maxBytes && stat.size > options.maxBytes) continue;
     files.push({ absolutePath: current.absolutePath, entryPath: normalizeEntryPath(current.entryPath), size: Number(stat.size), archiveRoot, sourceStat: stat });
   }
@@ -281,27 +318,9 @@ async function collectBackupFiles(options = {}) {
   const includeUploads = envBool("BACKUP_INCLUDE_UPLOADS", true);
   const includeTemp = envBool("BACKUP_INCLUDE_TEMP", false);
   const includePending = envBool("BACKUP_INCLUDE_PENDING", false);
-  const quarantineDir = getUploadQuarantineDir();
-  if (quarantineDirContainsUploads(resolveRuntimePath("uploads"), quarantineDir)) {
-    throw new Error("Backup is not supported when the quarantine directory equals or contains uploads");
-  }
-  const quarantineMetadata = readQuarantineMetadata(resolveRuntimePath("data", "quarantine.json"));
-  const quarantinePayloads = quarantineMetadata ? validateQuarantinePayloads(quarantineMetadata.items, quarantineDir) : [];
+  const quarantineExclusions = getQuarantineExclusionState();
+  const { directory: quarantineDir, metadata: quarantineMetadata, payloads: quarantinePayloads } = quarantineExclusions;
   const quarantineRootInfo = quarantinePayloads.length ? archiveRootInfo(quarantineDir, { allowRootSymlink: true }) : null;
-  const quarantinePathIdentities = new Set();
-  const quarantineFileIdentities = new Set();
-  for (const payload of quarantinePayloads) {
-    quarantinePathIdentities.add(pathIdentityKey(payload.absolutePath));
-    try { quarantinePathIdentities.add(pathIdentityKey(fs.realpathSync(payload.absolutePath))); } catch {}
-    const identity = fileIdentity(fs.lstatSync(payload.absolutePath, { bigint: true }));
-    if (identity) quarantineFileIdentities.add(identity);
-  }
-  const isQuarantinePayloadPath = (candidatePath, stat) => {
-    const identity = fileIdentity(stat);
-    if (identity && quarantineFileIdentities.has(identity)) return true;
-    if (quarantinePathIdentities.has(pathIdentityKey(candidatePath))) return true;
-    try { return quarantinePathIdentities.has(pathIdentityKey(fs.realpathSync(candidatePath))); } catch { return false; }
-  };
 
   for (const name of fs.existsSync(dataDir) ? fs.readdirSync(dataDir) : []) {
     if (name.toLowerCase() === "quarantine.json") continue;
@@ -313,7 +332,7 @@ async function collectBackupFiles(options = {}) {
     if (stat.isFile() && (
       name.endsWith(".json") ||
       name === "README.md"
-    ) && !isQuarantinePayloadPath(absolutePath, stat)) {
+    ) && !quarantineExclusions.isPayloadPath(absolutePath, stat)) {
       files.push({ absolutePath, entryPath, size: Number(stat.size), archiveRoot: dataRootInfo, sourceStat: stat });
     }
   }
@@ -349,11 +368,11 @@ async function collectBackupFiles(options = {}) {
   }
 
   if (includeUploads) {
-    files.push(...collectFilesRecursive(resolveRuntimePath("uploads"), "uploads", { excludePaths: [quarantineDir], excludeFileIdentities: quarantineFileIdentities, excludeNamePrefixes: [".rootark-cloud-cache-"] }));
+    files.push(...collectFilesRecursive(resolveRuntimePath("uploads"), "uploads", { excludePredicate: quarantineExclusions.isExcludedPath, excludeNamePrefixes: [".rootark-cloud-cache-"] }));
   }
 
   if (includeTemp || includePending) {
-    files.push(...collectFilesRecursive(resolveRuntimePath("temp"), "temp", { excludePaths: [quarantineDir], excludeFileIdentities: quarantineFileIdentities, excludeNamePrefixes: [".rootark-cloud-cache-"] }));
+    files.push(...collectFilesRecursive(resolveRuntimePath("temp"), "temp", { excludePredicate: quarantineExclusions.isExcludedPath, excludeNamePrefixes: [".rootark-cloud-cache-"] }));
   }
 
   const unsuppressedFiles = files.filter((file) => {
@@ -1098,13 +1117,18 @@ function recoverRetentionTombstones() {
 
 async function cleanupRetention(options = {}) {
   const release = options.lockHeld ? null : acquireLock("backup");
+  let inventoryLease = null;
   try {
+  if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
+  inventoryLease = await restoreProviderOrphans.acquireInventoryLock();
   const count = Math.max(0, Math.floor(envNumber("BACKUP_RETENTION_COUNT", 10)));
   const days = Math.max(0, Math.floor(envNumber("BACKUP_RETENTION_DAYS", 30)));
   const cutoff = days ? Date.now() - days * 24 * 60 * 60 * 1000 : null;
   recoverRetentionTombstones();
+  const inventory = restoreProviderOrphans.getInventoryStatus(cloudStorage);
+  const unresolvedBaselineId = inventory.state === "unknown" ? inventory.backupId : null;
   const backups = backupRepository.listBackups()
-    .filter((item) => item.status === "success" && item.type !== "pre-restore")
+    .filter((item) => item.status === "success" && item.type !== "pre-restore" && item.id !== unresolvedBaselineId)
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt) || String(b.id).localeCompare(String(a.id)));
 
   const toDelete = backups.filter((item, index) => (count > 0 && index >= count) || (cutoff && new Date(item.createdAt).getTime() < cutoff));
@@ -1134,6 +1158,7 @@ async function cleanupRetention(options = {}) {
     }
   }
   } finally {
+    inventoryLease?.release();
     if (release) release();
   }
 }
@@ -1290,14 +1315,22 @@ function getBackupOrThrow(id) {
   return { backup, archivePath };
 }
 
-function deleteBackup(id) {
+async function deleteBackup(id) {
   const release = acquireLock("delete");
+  let inventoryLease = null;
   try {
+    if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
+    inventoryLease = await restoreProviderOrphans.acquireInventoryLock();
+    const inventory = restoreProviderOrphans.getInventoryStatus(cloudStorage);
+    if (inventory.state === "unknown" && inventory.backupId === String(id)) {
+      throw new Error("Backup is the unresolved provider inventory baseline and cannot be deleted");
+    }
     const { backup, archivePath } = getBackupOrThrow(id);
     fs.rmSync(archivePath, { force: true });
     backupRepository.deleteBackup(backup.id);
     return backup;
   } finally {
+    inventoryLease?.release();
     release();
   }
 }
@@ -1317,8 +1350,10 @@ module.exports = {
   createBackup,
   createZipArchive,
   deleteBackup,
+  getQuarantineExclusionState,
   getArchivePath,
   getBackupOrThrow,
+  isBackupExcludedPath: isSensitivePath,
   latestStatus,
   listBackups,
   setCloudStorage,
