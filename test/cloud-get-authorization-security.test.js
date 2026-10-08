@@ -851,7 +851,9 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   for (const [route, method] of [["view", "POST"], ["download", "POST"], ["preview", "GET"], ["file", "POST"]]) {
     const sharedOrphan = await request(port, `/share/${restoreOrphanShareToken}/${route}`, {
       method,
-      headers: method === "POST" ? { origin: `http://127.0.0.1:${port}` } : {},
+    headers: method === "POST"
+      ? { origin: `http://127.0.0.1:${port}` }
+      : route === "preview" ? { "sec-fetch-site": "same-origin" } : {},
     });
     assert.equal(sharedOrphan.status, 404, `${route} cannot expose a restore-orphan share`);
     assert.equal(sharedOrphan.body.includes("post-backup provider bytes"), false);

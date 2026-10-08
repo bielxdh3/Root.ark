@@ -162,7 +162,9 @@ test("expired cached files and folders are denied across direct, preview, token,
     body: shareViewBody,
   });
   assert.notEqual(shareView.status, 200, "a valid share link must stop granting access when its file expires");
-  const shareFile = await request(port, `/share/${shareToken}/file`);
+  const shareFile = await request(port, `/share/${shareToken}/file`, "POST", {
+    origin: `http://127.0.0.1:${port}`,
+  });
   assert.notEqual(shareFile.status, 200, "public share file route must reject expired content");
   assert.equal(shareFile.body.includes("DISPOSABLE EXPIRED FILE CONTENT"), false);
 

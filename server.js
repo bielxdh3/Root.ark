@@ -1618,7 +1618,7 @@ function setShareViewerCookie(req, res, token, viewerId, expiresAt) {
   const maxAge = Math.max(1, Math.min(SHARE_VIEW_SESSION_MS, expiresAt - Date.now()));
   res.cookie(`rootark_share_${token}`, viewerId, {
     httpOnly: true,
-    sameSite: "lax",
+    sameSite: "strict",
     secure: req.secure,
     maxAge,
   });
@@ -2154,6 +2154,17 @@ function validateShareToken(rawToken) {
 function requireSameOriginPublicShareMutation(req, res, next) {
   const origin = req.headers.origin;
   if (!origin || origin !== getExpectedOrigin(req, app.get("trust proxy fn"))) {
+    return res.status(403).type("text/plain").send("Origem negada");
+  }
+  return next();
+}
+
+function requireSameOriginPublicSharePreview(req, res, next) {
+  const fetchSite = String(req.headers["sec-fetch-site"] || "").toLowerCase();
+  const origin = req.headers.origin;
+  if ((!fetchSite && !origin)
+    || (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none")
+    || (origin && origin !== getExpectedOrigin(req, app.get("trust proxy fn")))) {
     return res.status(403).type("text/plain").send("Origem negada");
   }
   return next();
@@ -9434,7 +9445,7 @@ app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareM
   });
 });
 
-app.get("/share/:token/preview", shareRateLimit, async (req, res) => {
+app.get("/share/:token/preview", shareRateLimit, requireSameOriginPublicSharePreview, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
   if (req.method === "HEAD") return res.setHeader("Allow", "GET").status(405).type("text/plain").send("Metodo nao permitido");

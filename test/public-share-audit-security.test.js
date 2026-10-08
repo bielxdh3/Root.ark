@@ -26,16 +26,20 @@ function getUnusedPort() {
   });
 }
 
-function request(port, requestPath, method = "GET", headers = {}) {
+function request(port, requestPath, method = "GET", headers = {}, body = "", options = {}) {
+  const requestHeaders = { ...headers };
+  if (options.includeDefaultFetchSite !== false && method === "GET" && /^\/share\/[^/]+\/preview$/.test(requestPath) && !Object.hasOwn(requestHeaders, "sec-fetch-site") && !Object.hasOwn(requestHeaders, "origin")) {
+    requestHeaders["sec-fetch-site"] = "same-origin";
+  }
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, path: requestPath, method, headers }, (res) => {
+    const req = http.request({ host: "127.0.0.1", port, path: requestPath, method, headers: requestHeaders }, (res) => {
       let body = "";
       res.on("data", (chunk) => { body += chunk; });
       res.on("end", () => resolve({ status: res.statusCode, body, headers: res.headers }));
     });
     req.setTimeout(TIMEOUT_MS, () => req.destroy(new Error("request timed out")));
     req.once("error", reject);
-    req.end();
+    req.end(body);
   });
 }
 
@@ -420,6 +424,7 @@ test("public-share audit logs correlate by token digest without storing the bear
   const unsupportedPreviewToken = crypto.randomBytes(24).toString("hex");
   const unboundPreviewToken = crypto.randomBytes(24).toString("hex");
   const rangedPreviewToken = crypto.randomBytes(24).toString("hex");
+  const protectedPreviewToken = crypto.randomBytes(24).toString("hex");
   const prototypeViewerToken = crypto.randomBytes(24).toString("hex");
   const prototypeUnmeteredViewerToken = crypto.randomBytes(24).toString("hex");
   const rangedFileToken = crypto.randomBytes(24).toString("hex");
@@ -434,6 +439,7 @@ test("public-share audit logs correlate by token digest without storing the bear
     [unsupportedPreviewToken]: { folderId: "root", fileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
     [unboundPreviewToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 2, activeViewers: {} },
     [rangedPreviewToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
+    [protectedPreviewToken]: { folderId: "root", fileName: previewFileName, passwordHash: bcrypt.hashSync("preview-fixture-password", 4), expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
     [prototypeViewerToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
     [prototypeUnmeteredViewerToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 0, activeViewers: {} },
     [rangedFileToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
@@ -662,16 +668,67 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.equal(previewFirstView.status, 200);
   const previewFirstCookieHeader = previewFirstView.headers["set-cookie"];
   const previewFirstCookie = String(Array.isArray(previewFirstCookieHeader) ? previewFirstCookieHeader[0] : previewFirstCookieHeader || "").split(";", 1)[0];
-  const previewHead = await request(port, `/share/${previewFirstToken}/preview`, "HEAD", { cookie: previewFirstCookie });
+  const crossSitePreview = await request(port, `/share/${previewFirstToken}/preview`, "GET", {
+    cookie: previewFirstCookie,
+    "sec-fetch-site": "cross-site",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-dest": "document",
+  });
+  assert.equal(crossSitePreview.status, 403, "cross-site top-level preview navigation cannot consume quota");
+  assert.equal(crossSitePreview.body.includes("disposable preview fixture"), false);
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[previewFirstToken].downloads, 0, "cross-site preview does not consume download quota");
+  assert.match(String(previewFirstCookieHeader), /SameSite=Strict/i, "viewer cookies are withheld on cross-site top-level navigation");
+  const previewHead = await request(port, "/share/" + previewFirstToken + "/preview", "HEAD", {
+    cookie: previewFirstCookie,
+    "sec-fetch-site": "same-origin",
+  });
   assert.equal(previewHead.status, 405, "HEAD does not act as a preview download");
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[previewFirstToken].downloads, 0);
   const invalidPreviewRange = await request(port, `/share/${previewFirstToken}/preview`, "GET", { cookie: previewFirstCookie, range: "bytes=999-1000" });
   assert.equal(invalidPreviewRange.status, 416);
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[previewFirstToken].downloads, 0, "an unsatisfiable range does not consume download quota");
-  const previewFirst = await request(port, `/share/${previewFirstToken}/preview`, "GET", { cookie: previewFirstCookie });
+  const previewFirst = await request(port, `/share/${previewFirstToken}/preview`, "GET", {
+    cookie: previewFirstCookie,
+    "sec-fetch-site": "same-origin",
+  });
   assert.equal(previewFirst.status, 200);
   assert.equal(previewFirst.body, "disposable preview fixture\n");
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[previewFirstToken].downloads, 1, "preview delivery consumes the shared download budget");
+  const protectedPreviewAccess = await request(port, "/share/" + protectedPreviewToken + "/password", "POST", {
+    origin: "http://127.0.0.1:" + port,
+    "content-type": "application/json",
+  }, JSON.stringify({ password: "preview-fixture-password" }));
+  assert.equal(protectedPreviewAccess.status, 200, protectedPreviewAccess.body);
+  const protectedPreviewSetCookies = Array.isArray(protectedPreviewAccess.headers["set-cookie"])
+    ? protectedPreviewAccess.headers["set-cookie"]
+    : [protectedPreviewAccess.headers["set-cookie"] || ""];
+  const protectedPreviewCookies = protectedPreviewSetCookies.map((cookie) => String(cookie).split(";", 1)[0]).filter(Boolean);
+  const protectedPreviewCookie = protectedPreviewCookies.join("; ");
+  assert.ok(protectedPreviewCookies.some((cookie) => cookie.startsWith("rootark_share_" + protectedPreviewToken + "=")), "password access establishes a viewer session");
+  assert.ok(protectedPreviewCookies.some((cookie) => cookie.startsWith("rootark_share_pwd_" + protectedPreviewToken + "=")), "password access establishes a password session");
+  assert.ok(protectedPreviewSetCookies.some((cookie) => cookie.includes("rootark_share_" + protectedPreviewToken + "=") && /SameSite=Strict/i.test(cookie)), "viewer cookies are withheld on cross-site top-level navigation");
+  const crossSiteProtectedPreview = await request(port, "/share/" + protectedPreviewToken + "/preview", "GET", {
+    cookie: protectedPreviewCookie,
+    "sec-fetch-site": "cross-site",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-dest": "document",
+  });
+  assert.equal(crossSiteProtectedPreview.status, 403, "cross-site top-level navigation cannot consume a password-protected share quota");
+  assert.equal(crossSiteProtectedPreview.body.includes("disposable preview fixture"), false);
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[protectedPreviewToken].downloads, 0);
+  const headerlessProtectedPreview = await request(port, "/share/" + protectedPreviewToken + "/preview", "GET", {
+    cookie: protectedPreviewCookie,
+  }, "", { includeDefaultFetchSite: false });
+  assert.equal(headerlessProtectedPreview.status, 403, "preview fails closed when Origin and Fetch Metadata are both absent");
+  assert.equal(headerlessProtectedPreview.body.includes("disposable preview fixture"), false);
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[protectedPreviewToken].downloads, 0);
+  const protectedSameOriginPreview = await request(port, "/share/" + protectedPreviewToken + "/preview", "GET", {
+    cookie: protectedPreviewCookie,
+    "sec-fetch-site": "same-origin",
+  });
+  assert.equal(protectedSameOriginPreview.status, 200);
+  assert.equal(protectedSameOriginPreview.body, "disposable preview fixture\n");
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[protectedPreviewToken].downloads, 1, "same-origin preview remains available and consumes the quota");
   const secondPreviewView = await request(port, `/share/${previewFirstToken}/view`, "POST", {
     origin: `http://127.0.0.1:${port}`,
   });
