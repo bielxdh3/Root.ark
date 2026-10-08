@@ -511,8 +511,12 @@ test("local-only restore keeps cloud inventory unknown until selected-archive re
       restoreService.setCloudStorage(cloud);
       cloud.inventory = async () => { throw new Error("injected provider inventory outage"); };
       await assert.rejects(restoreService.reconcileUnknownProviderInventory(), /injected provider inventory outage/);
-      assert.deepEqual(providerOrphans.getInventoryStatus(), { state: "unknown", backupId: backup.id },
-        "failed inventory leaves the durable state unknown and retryable");
+      const retryableStatus = providerOrphans.getInventoryStatus();
+      assert.equal(retryableStatus.state, "unknown");
+      assert.equal(retryableStatus.backupId, backup.id);
+      assert.match(retryableStatus.inventoryContext, /^[a-f0-9]{64}$/);
+      assert.equal(retryableStatus.previousInventoryContext, retryableStatus.inventoryContext,
+        "failed inventory leaves the provider context and selected baseline durable and retryable");
 
       const restoreServicePath = ${JSON.stringify(path.join(ROOT, "services", "restoreService"))};
       const restartFailureCode = [
@@ -523,8 +527,12 @@ test("local-only restore keeps cloud inventory unknown until selected-archive re
       const restartFailure = childProcess.spawnSync(process.execPath, ["-e", restartFailureCode], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
       assert.equal(restartFailure.status, 0, restartFailure.stderr || restartFailure.stdout);
       assert.match(restartFailure.stdout, /retryable/);
-      assert.deepEqual(providerOrphans.getInventoryStatus(), { state: "unknown", backupId: backup.id },
-        "inventory failure after restart preserves the fail-closed marker");
+      const restartFailureStatus = providerOrphans.getInventoryStatus();
+      assert.equal(restartFailureStatus.state, "unknown");
+      assert.equal(restartFailureStatus.backupId, backup.id);
+      assert.match(restartFailureStatus.inventoryContext, /^[a-f0-9]{64}$/);
+      assert.equal(restartFailureStatus.previousInventoryContext, restartFailureStatus.inventoryContext,
+        "inventory failure after restart preserves the fail-closed marker and provider context");
 
       const restartSuccessCode = [
         "const restore = require(" + JSON.stringify(restoreServicePath) + ");",
@@ -671,6 +679,42 @@ test("deletion-first interleaving cannot publish an unresolved marker for a miss
       "the validator runs after deletion has won the shared inventory lock");
       assert.equal(providerOrphans.getInventoryStatus().state, "known",
         "a deleted baseline is never persisted as unresolved provider inventory state");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("cloud-disabled startup routes a deleted legacy baseline through guarded reconciliation", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      const baseline = await backupService.createBackup({ createdBy: "fixture" });
+      await providerOrphans.markInventoryUnknown(baseline.id);
+      await providerOrphans.reconcileInventory(baseline.id, [], "a".repeat(64));
+      await backupService.deleteBackup(baseline.id);
+      const statePath = providerOrphans.STATE_PATH;
+      const policyPath = providerOrphans.POLICY_PATH;
+      const stateBefore = fs.readFileSync(statePath, "utf8");
+      const policyBefore = fs.readFileSync(policyPath, "utf8");
+      const listenMarker = path.join(process.cwd(), "local-listener-started");
+      const serverPath = ${JSON.stringify(path.join(ROOT, "server.js"))};
+      const script = [
+        'const fs=require("node:fs");const net=require("node:net");const original=net.Server.prototype.listen;',
+        'net.Server.prototype.listen=function(...args){fs.writeFileSync(' + JSON.stringify(listenMarker) + ',"started");const server=original.apply(this,args);setTimeout(()=>process.exit(0),100);return server;};',
+        'require(' + JSON.stringify(serverPath) + ');',
+      ].join("\\n");
+      const child = require("node:child_process").spawnSync(process.execPath, ["-e", script], {
+        cwd: process.cwd(),
+        env: { ...process.env, PORT: "0", NODE_ENV: "test", JWT_SECRET: "j".repeat(48), ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", CLOUD_STORAGE_PROVIDER: "local", DB_ENABLED: "false" },
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+      assert.equal(child.status, 0, child.stderr || child.stdout);
+      assert.equal(fs.existsSync(listenMarker), true, "cloud-disabled local startup remains available");
+      assert.equal(fs.readFileSync(statePath, "utf8"), stateBefore, "startup does not publish a new marker referencing a missing baseline");
+      assert.equal(fs.readFileSync(policyPath, "utf8"), policyBefore, "both durable marker copies remain unchanged");
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);

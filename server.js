@@ -9956,13 +9956,7 @@ void (async () => {
   if (typeof cloudStorage.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
   const startupProviderInventory = restoreProviderOrphans.getInventoryStatus(cloudStorage);
   if (startupProviderInventory.state === "unknown") {
-    if (cloudStorage.enabled()) await restoreService.reconcileUnknownProviderInventory();
-    else if (restoreProviderOrphans.getInventoryStatus().state !== "unknown") {
-      await restoreProviderOrphans.markInventoryUnknown(startupProviderInventory.backupId, {
-        inventoryContext: startupProviderInventory.inventoryContext || cloudStorage.inventoryContext?.(),
-        previousInventoryContext: startupProviderInventory.previousInventoryContext,
-      }, { validateBaseline: () => backupService.getBackupOrThrow(startupProviderInventory.backupId) });
-    }
+    await restoreService.reconcileUnknownProviderInventory();
   }
   listenForRequests();
 })().catch((error) => {
