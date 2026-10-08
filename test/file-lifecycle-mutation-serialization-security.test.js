@@ -1041,7 +1041,8 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   childErrors = "";
   child.stderr?.on("data", (chunk) => { childErrors += chunk.toString(); });
   assert.equal((await waitForServer(port, child)).status, 200);
-  const recoveryDeadline = Date.now() + 5000;
+  // Listener readiness does not wait for the asynchronous, lock-serialized startup reconciliation.
+  const recoveryDeadline = Date.now() + 15_000;
   while (objects.has(failedDeleteKey) && Date.now() < recoveryDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
   const restartRecoveryDiagnostics = {
     cloudTempErrors: childErrors.split(/\r?\n/)
