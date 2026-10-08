@@ -20,11 +20,11 @@ The final validation worktree was clean and matched `Root/main` at `9e070823f2ee
 
 | Validation | Result |
 |---|---|
-| Push-triggered Security Regression, run `37716182470` | Success on this exact SHA. Ubuntu Node 22 full validation and Windows Node 22 syntax/tests both passed; automated tests, syntax, runtime-artifact guard, locked-dependency audit, and clean-checkout checks passed. |
+| Push-triggered Security Regression, run `37716182470` | Success on this exact SHA. Ubuntu Node 22: 938 tests, 927 passed, 11 skipped, 0 failed. Windows Node 22: 938 tests, 934 passed, 4 skipped, 0 failed. Syntax, runtime-artifact guard, locked-dependency audit, and clean-checkout checks passed on both jobs. |
 | CodeQL, run `37716182350` | Success on this exact SHA. |
 | Dependency Review, run `37716182451` | Success on this exact SHA. |
 | Pages build/deployment, run `37716181679` | Success on this exact SHA. |
-| `node scripts/validate-release-gate.js` on Windows, Node `v24.14.1` | 21 passed, 0 blocked, 0 failed. Included canonical `npm test`, syntax, runtime artifacts, dependency lock/provenance, high-severity npm audit, focused security/restore suites, 253-file secret-pattern scan, and clean-worktree checks. |
+| `node scripts/validate-release-gate.js` on the documentation PR head `00852536538eb8ac9261b1091d965f74bd9a6c22`, Windows, Node `v24.14.1` | 21 passed, 0 blocked, 0 failed. Captured output: [release-gate record](2026-10-08-rootark-final-release-gate-0085253.txt). It includes canonical `npm test`, syntax, runtime artifacts, dependency lock/provenance, high-severity npm audit, focused security/restore suites, 254-file secret-pattern scan, and clean-worktree checks. |
 | `git diff --check` | Passed. |
 
 The lockfile audit passed the repository's high-severity gate. GitHub still reports one open moderate Dependabot alert, `GHSA-hp3w-g68c-fv3c` (`sprintf-js` via `package-lock.json`), with no first patched version currently listed.
@@ -49,7 +49,9 @@ Restore is **not globally atomic** across those local storage domains and extern
 
 ## Browser acceptance
 
-The real-browser matrix used the disposable local application on desktop, 390 px compact/mobile and 820 px tablet widths. It covered login/2FA, file and folder navigation, upload/chunk progress and encryption controls, approval/rejection, preview/download, share creation/password unlock, versions, rename/move, file and folder permissions, expiration, trash/restore, admin/users/groups, quarantine, audit/export, backup/manifest/restore confirmation, denied/error states, responsive layout, keyboard/focus, session expiry, realtime refresh and dirty-form preservation. The browser run reported no console errors and confirmed mutation requests use non-safe methods.
+The manual real-browser matrix was performed against the disposable local application on desktop, 390 px compact/mobile and 820 px tablet widths. The run reported coverage of login/2FA, file and folder navigation, upload/chunk progress and encryption controls, approval/rejection, preview/download, share creation/password unlock, versions, rename/move, file and folder permissions, expiration, trash/restore, admin/users/groups, quarantine, audit/export, backup/manifest/restore confirmation, denied/error states, responsive layout, keyboard/focus, session expiry, realtime refresh and dirty-form preservation. The full sanitized per-flow trace was not retained, so this coverage is an operator-reported manual result rather than a replayable browser artifact; it does not establish complete browser acceptance by itself.
+
+Available console logs include a 401 on `/auth/me` during unauthenticated page initialization, plus 401/403/415 responses in the share/access flow and a 503 on `/auth/2fa/enroll`; the retained snapshots do not fully attribute those responses to a specific expected negative test. After restore, the server correctly required restart and returned 503 for page assets while the recovery barrier was active. Accordingly this report does not claim a clean console; the 2FA endpoint response remains an unclassified browser evidence limitation. Mutation requests were observed using non-safe methods. The test fixture remains in the disposable trash; permanent deletion is pending explicit action-time confirmation.
 
 A backup restore was then executed only against the disposable server and showed the expected restart-required barrier; the backup controls were disabled afterward. The `closure-ui-sample.txt` fixture remains in the disposable trash. Permanent deletion was not executed pending explicit action-time confirmation; no user-instance data was touched.
 
