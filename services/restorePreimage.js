@@ -148,6 +148,9 @@ function snapshotTree(destination, snapshotRoot, excludedPath = null) {
 }
 
 function verifyTree(root, entries) {
+  if (!Array.isArray(entries) || entries.some((entry) => !entry || !Number.isSafeInteger(entry.mode) || entry.mode < 0 || entry.mode > 0o777)) {
+    throw new Error("Restore pre-image tree entry mode is invalid");
+  }
   const listed = walkTree(root);
   if (listed.length !== entries.length) throw new Error("Restore pre-image staging tree is incomplete");
   const expected = new Map(entries.map((entry) => [entry.path, entry]));
@@ -263,7 +266,7 @@ function restoreTree(destination, snapshotRoot, snapshot, transactionId, options
     const source = path.join(snapshotRoot, ...entry.path.split("/"));
     if (entry.type === "directory") {
       ensureSafeDirectory(target, { create: true });
-      try { fs.chmodSync(target, entry.mode); } catch (error) { if (process.platform !== "win32") throw error; }
+      try { fs.chmodSync(target, restoredTreeMode(entry.mode)); } catch (error) { if (process.platform !== "win32") throw error; }
     } else {
       ensureSafeDirectory(path.dirname(target), { create: true });
       const temporary = fileRestoreTemporaryPath(target, transactionId, index);
@@ -272,13 +275,17 @@ function restoreTree(destination, snapshotRoot, snapshot, transactionId, options
       if (result.size !== entry.size) throw new Error("Restore pre-image file size changed during recovery");
       try { fs.renameSync(temporary, target); }
       catch (error) { fs.rmSync(target, { force: true }); fs.renameSync(temporary, target); }
-      try { fs.chmodSync(target, entry.mode); } catch (error) { if (process.platform !== "win32") throw error; }
+      try { fs.chmodSync(target, restoredTreeMode(entry.mode)); } catch (error) { if (process.platform !== "win32") throw error; }
     }
   }
   if (!legacyManifest) {
-    try { fs.chmodSync(destination, snapshot.rootMode); } catch (error) { if (process.platform !== "win32") throw error; }
+    try { fs.chmodSync(destination, restoredTreeMode(snapshot.rootMode)); } catch (error) { if (process.platform !== "win32") throw error; }
   }
   syncTree(destination);
+}
+
+function restoredTreeMode(mode) {
+  return process.platform === "win32" ? mode : mode | ((mode & 0o070) << 3);
 }
 
 function snapshotFileSet(paths, snapshotRoot) {

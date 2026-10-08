@@ -118,6 +118,71 @@ test("tree rollback restores the source root directory mode", (t) => {
   }
 });
 
+test("tree rollback keeps recreated entries accessible when their pre-image used group-only modes", (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows does not expose portable POSIX owner/group permission semantics");
+    return;
+  }
+
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-group-access-"));
+  const treeRoot = path.join(runtime, "tree");
+  const nestedRoot = path.join(treeRoot, "nested");
+  const snapshotRoot = path.join(runtime, "snapshot");
+  try {
+    fs.mkdirSync(nestedRoot, { recursive: true });
+    fs.writeFileSync(path.join(nestedRoot, "entry.txt"), "original");
+    const snapshot = restorePreimage.snapshotTree(treeRoot, snapshotRoot);
+    snapshot.rootMode = 0o070;
+    for (const entry of snapshot.entries) entry.mode = entry.type === "directory" ? 0o070 : 0o060;
+
+    fs.rmSync(treeRoot, { recursive: true });
+    restorePreimage.restoreTree(treeRoot, snapshotRoot, snapshot, crypto.randomUUID());
+
+    assert.equal(fs.statSync(treeRoot).mode & 0o777, 0o770, "group traversal is retained for the service-owned restored root");
+    assert.equal(fs.statSync(nestedRoot).mode & 0o777, 0o770, "nested group traversal is retained for the service-owned directory");
+    assert.equal(fs.statSync(path.join(nestedRoot, "entry.txt")).mode & 0o777, 0o660, "group file access is retained for the service-owned file");
+    assert.equal(fs.readFileSync(path.join(nestedRoot, "entry.txt"), "utf8"), "original");
+  } finally {
+    if (fs.existsSync(treeRoot)) {
+      fs.chmodSync(treeRoot, 0o700);
+      if (fs.existsSync(nestedRoot)) {
+        fs.chmodSync(nestedRoot, 0o700);
+        const entryPath = path.join(nestedRoot, "entry.txt");
+        if (fs.existsSync(entryPath)) fs.chmodSync(entryPath, 0o600);
+      }
+    }
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("tree rollback rejects invalid snapshot entry modes before removing the destination", () => {
+  const cases = [
+    { type: "directory", mode: 0o1000 },
+    { type: "file", mode: -1 },
+    { type: "directory", mode: 1.5 },
+    { type: "file", mode: "0600" },
+  ];
+  for (const invalid of cases) {
+    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-invalid-mode-"));
+    const sourceRoot = path.join(runtime, "source");
+    const treeRoot = path.join(runtime, "tree");
+    const snapshotRoot = path.join(runtime, "snapshot");
+    try {
+      fs.mkdirSync(path.join(sourceRoot, "nested"), { recursive: true });
+      fs.writeFileSync(path.join(sourceRoot, "nested", "entry.txt"), "archived");
+      const snapshot = restorePreimage.snapshotTree(sourceRoot, snapshotRoot);
+      snapshot.entries.find((entry) => entry.type === invalid.type).mode = invalid.mode;
+      fs.mkdirSync(path.join(treeRoot, "nested"), { recursive: true });
+      fs.writeFileSync(path.join(treeRoot, "nested", "entry.txt"), "live destination");
+
+      assert.throws(() => restorePreimage.restoreTree(treeRoot, snapshotRoot, snapshot, crypto.randomUUID()), /entry mode is invalid/i);
+      assert.equal(fs.readFileSync(path.join(treeRoot, "nested", "entry.txt"), "utf8"), "live destination", "invalid metadata is rejected before destination content changes");
+    } finally {
+      fs.rmSync(runtime, { recursive: true, force: true });
+    }
+  }
+});
+
 test("journal recovery rejects a wrong destination when its original rollback file is missing", () => {
   const originalEnv = { DB_ENABLED: process.env.DB_ENABLED, DATABASE_URL: process.env.DATABASE_URL };
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-journal-hash-"));

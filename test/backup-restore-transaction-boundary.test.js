@@ -2122,7 +2122,7 @@ test("restore failure after quarantine commit rolls quarantine, JSON, and upload
 });
 
 test("abrupt whole-restore interruptions automatically roll back before startup migrations", { timeout: 60_000 }, () => {
-  for (const crashStep of ["restore.coordinator.persisted", "restore.before-local-commit", "restore.quarantine.committed", "restore.data.copied", "restore.uploads.cleared", "restore.sqlite.before-replacement", "restore.sqlite.committed", "restore.backup-history.reconciled", "restore.cloud-sync.persisted"]) {
+  for (const crashStep of ["restore.coordinator.persisted", "restore.before-local-commit", "restore.quarantine.committed", "restore.data.copied", "restore.uploads.copied", "restore.uploads.cleared", "restore.sqlite.before-replacement", "restore.sqlite.committed", "restore.backup-history.reconciled", "restore.cloud-sync.persisted"]) {
     const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-coordinator-runtime-"));
     const quarantineDir = path.join(runtime, "quarantine");
     const env = {
