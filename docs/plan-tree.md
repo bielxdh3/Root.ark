@@ -269,7 +269,7 @@ Prerequisites: critical security fixes complete and disposable local workspace a
 - `[BLOCKED]` Verify safe file upload.
 - `[BLOCKED]` Verify suspicious extension handling.
 - `[BLOCKED]` Verify quarantine invisibility and access denial.
-- `[BLOCKED]` Verify ClamAV-unavailable fail-open/fail-closed behavior.
+- `[DONE]` Verify unavailable ClamAV fails closed by default: simple, final-chunk, and WebDAV PUT uploads are quarantined with 503 before pending registration or approval; unknown providers fail startup; production rejects disabled or fail-open scanner configuration. Focused disposable regressions passed 4/4 in the follow-up worktree based on `dec7ef02f86adc07c7f17f7d834c7bed92026ca4`.
 - `[BLOCKED]` Run live ClamAV validation only when the daemon is actually available.
 - `[BLOCKED]` Verify simple, chunked, pending, preview, download, share, cloud-sync, and audit boundaries.
 
@@ -325,10 +325,10 @@ Prerequisites: phases 2.1 through 2.3 complete and relevant tests covering each 
 - `[DONE]` Extract the realtime transport and notification fan-out boundary into `src/realtime/server.js`; retain thin compatibility adapters in `server.js`, preserve the shared `parseBoundedNumber` helper used by WebDAV, and leave producer call sites and public contracts unchanged.
 - `[DONE]` Validate the extracted working tree with realtime transport 7/7 twice, auth-security 13/13, realtime/WebDAV meta-remediation 62/62, combined realtime/auth 20/20, syntax checks, and `git diff --check` at local base `28747c6ebdac873650e2d5a3c6193824e7cc9985`.
 - `[IMPLEMENTED-UNVERIFIED]` Buffered-client close is not directly covered; browser, CI, provider, production, and remote-closure behavior remain outside this local phase.
-- `[DONE]` Add disposable upload-scanning contract coverage for ClamAV-unavailable fail-open, fail-closed quarantine, clean INSTREAM parsing, infected INSTREAM quarantine, suspicious extensions, and path containment in `test/upload-security.test.js`; the focused suite passed 16/16 twice locally.
-- `[IMPLEMENTED-UNVERIFIED]` Live ClamAV daemon behavior, chunked/WebDAV/provider/production scan-entry parity, and zero-knowledge client-side scanning remain unverified or architecturally open.
-- `[DONE]` Extract the current upload scanning/quarantine boundary into deliverable `src/upload-scanning.js`; preserve the thin `server.js` adapter, all three entry points, fail-open/fail-closed semantics, quarantine/audit contracts, and D-009's unverified-quarantine limitation.
-- `[DONE]` Validate the extracted working tree with upload-security 16/16 twice, realtime transport 7/7, auth-security 13/13, realtime/WebDAV meta-remediation 62/62, syntax checks, and `git diff --check` at local base `28747c6ebdac873650e2d5a3c6193824e7cc9985`.
+- `[HISTORICAL]` Earlier disposable upload-scanning coverage included ClamAV-unavailable fail-open, fail-closed quarantine, clean INSTREAM parsing, infected INSTREAM quarantine, suspicious extensions, and path containment; the recorded focused suite passed 16/16 twice in that earlier working tree. The fail-open expectation is not the current safe default.
+- `[IMPLEMENTED-UNVERIFIED]` Live ClamAV daemon/provider behavior and zero-knowledge client-side scanning remain unverified; current route regressions cover unavailable-scanner fail-closed behavior across simple, final-chunk, and WebDAV PUT entry points.
+- `[HISTORICAL]` An earlier working-tree note recorded extraction to `src/upload-scanning.js` at local base `28747c6ebdac873650e2d5a3c6193824e7cc9985`. That module is absent at current base `dec7ef02f86adc07c7f17f7d834c7bed92026ca4`; upload scanning and quarantine are inline in `server.js` here.
+- `[HISTORICAL]` The earlier extraction validation record remains attached to its local base `28747c6ebdac873650e2d5a3c6193824e7cc9985`; it is not evidence for the current implementation.
 - `[DONE]` Validate the existing `services/cloudStorage.js` boundary with mock-only inventory contracts for S3/Drive prefix, parent, metadata, and duplicate-identity containment; `test/cloud-storage.test.js` passed 27/27 twice without provider credentials.
 - `[IMPLEMENTED-UNVERIFIED]` No redundant cloud runtime extraction was made; external provider behavior and D-003/D-009 compatibility remain unverified.
 - `[DONE]` Validate the existing direct-protocol WebDAV boundary with executable/oversize/abort, completed-journal recovery, crash-consistency, and meta-remediation suites (90/90 combined); no OS mount or runtime extraction was claimed.

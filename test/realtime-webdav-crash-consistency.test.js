@@ -91,6 +91,7 @@ function childSource(localCrash = false) {
 function serverEnv(dir, port, extra = {}) {
   return {
     ...process.env,
+    NODE_ENV: "test",
     PORT: String(port),
     DB_ENABLED: "false",
     ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",

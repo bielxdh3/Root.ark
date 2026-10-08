@@ -391,7 +391,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   ].join("\n"));
   const env = {
     ...process.env,
-    PORT: String(port), DB_ENABLED: "false", NODE_ENV: "test", JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+    PORT: String(port), DB_ENABLED: "false", NODE_ENV: "test", UPLOAD_SCAN_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
     TOTP_POLICY: "optional", CLOUD_STORAGE_PROVIDER: "s3", AWS_S3_BUCKET: "fixture-bucket", AWS_REGION: "us-east-1",
     AWS_ENDPOINT_URL: `http://127.0.0.1:${cloud.port}`, AWS_FORCE_PATH_STYLE: "true", AWS_ACCESS_KEY_ID: "fixture-access-key",
     AWS_S3_PRINCIPAL_ID: "fixture-account",
@@ -1041,7 +1041,8 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   childErrors = "";
   child.stderr?.on("data", (chunk) => { childErrors += chunk.toString(); });
   assert.equal((await waitForServer(port, child)).status, 200);
-  const recoveryDeadline = Date.now() + 5000;
+  // Listener readiness does not wait for the asynchronous, lock-serialized startup reconciliation.
+  const recoveryDeadline = Date.now() + 15_000;
   while (objects.has(failedDeleteKey) && Date.now() < recoveryDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
   const restartRecoveryDiagnostics = {
     cloudTempErrors: childErrors.split(/\r?\n/)

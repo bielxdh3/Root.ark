@@ -2122,7 +2122,7 @@ test("restore failure after quarantine commit rolls quarantine, JSON, and upload
 });
 
 test("abrupt whole-restore interruptions automatically roll back before startup migrations", { timeout: 60_000 }, () => {
-  for (const crashStep of ["restore.coordinator.persisted", "restore.before-local-commit", "restore.quarantine.committed", "restore.data.copied", "restore.uploads.cleared", "restore.sqlite.before-replacement", "restore.sqlite.committed", "restore.backup-history.reconciled", "restore.cloud-sync.persisted"]) {
+  for (const crashStep of ["restore.coordinator.persisted", "restore.before-local-commit", "restore.quarantine.committed", "restore.data.copied", "restore.uploads.copied", "restore.uploads.cleared", "restore.sqlite.before-replacement", "restore.sqlite.committed", "restore.backup-history.reconciled", "restore.cloud-sync.persisted"]) {
     const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-coordinator-runtime-"));
     const quarantineDir = path.join(runtime, "quarantine");
     const env = {
@@ -2224,7 +2224,7 @@ test("abrupt whole-restore interruptions automatically roll back before startup 
       const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
       assert.ok(fs.existsSync(coordinatorPath), `${crashStep}: durable restore intent must remain`);
       const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
-      assert.equal(coordinator.version, 3);
+      assert.equal(coordinator.version, 4);
       assert.equal(coordinator.phase, "prepared");
       assert.equal(coordinator.providerReconciliation.sync.state, "pending");
       assert.equal(coordinator.providerReconciliation.sync.entries[0].path, "uploads/cloud.txt");
@@ -2372,6 +2372,69 @@ test("startup rolls back an interrupted JSON and uploads restore from verified l
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);
+});
+
+test("startup rejects mismatched whole-restore coordinator and pre-image schema pairs before restoring data", { timeout: 30_000 }, () => {
+  for (const [coordinatorVersion, manifestVersion] of [[3, 2], [4, 1]]) {
+    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-schema-mismatch-"));
+    const quarantineDir = path.join(runtime, "quarantine");
+    const env = {
+      ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(AWS_|GOOGLE_|CLOUD_STORAGE_|S3_|GDRIVE_|DRIVE_)/i.test(key))),
+      NODE_ENV: "test",
+      DB_ENABLED: "false",
+      BACKUP_ENABLED: "true",
+      BACKUP_INCLUDE_UPLOADS: "true",
+      BACKUP_INCLUDE_TEMP: "false",
+      BACKUP_RETENTION_COUNT: "20",
+      ROOTARK_RESTORE_INSTANCE_COUNT: "1",
+      ROOTARK_INSTANCE_ID: `schema-mismatch-${coordinatorVersion}-${manifestVersion}`,
+      UPLOAD_QUARANTINE_DIR: quarantineDir,
+    };
+    const interruptScript = `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const backup = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const restore = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const write = (pathname, value) => { fs.mkdirSync(path.dirname(pathname), { recursive: true }); fs.writeFileSync(pathname, value); };
+      fs.mkdirSync("data", { recursive: true }); fs.mkdirSync("uploads", { recursive: true }); fs.mkdirSync(process.env.UPLOAD_QUARANTINE_DIR, { recursive: true });
+      (async () => {
+        write("data/runtime.json", "archive-state"); write("uploads/file.txt", "archive-upload");
+        const selected = await backup.createBackup({ createdBy: "fixture" });
+        write("data/runtime.json", "live-state"); write("uploads/file.txt", "live-upload");
+        await restore.restoreBackup(selected.id, { confirmation: "RESTORE", failureInjector(step) { if (step === "restore.preimage.completed") process.exit(86); } });
+        process.exit(0);
+      })().catch((error) => { console.error(error); process.exit(1); });
+    `;
+    try {
+      const interrupted = spawnSync(process.execPath, ["-e", interruptScript], { cwd: runtime, env, encoding: "utf8", timeout: 15_000 });
+      assert.equal(interrupted.status, 86, interrupted.stderr || interrupted.stdout);
+      const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
+      const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
+      const manifestPath = path.join(runtime, "data", "backups", ".restore-preimages", coordinator.transactionId, "manifest.json");
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      coordinator.version = coordinatorVersion;
+      manifest.version = manifestVersion;
+      const manifestContents = `${JSON.stringify(manifest)}\n`;
+      fs.writeFileSync(manifestPath, manifestContents);
+      coordinator.preimageHash = require("node:crypto").createHash("sha256").update(manifestContents).digest("hex");
+      fs.writeFileSync(coordinatorPath, JSON.stringify(coordinator));
+
+      const recoverScript = `
+        const assert = require("node:assert/strict");
+        const fs = require("node:fs");
+        const restore = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+        assert.throws(() => restore.assertNoPendingWholeRestore(), (error) => {
+          assert.match(error.cause?.message || "", /pre-image plan is invalid/);
+          return true;
+        });
+        assert.equal(fs.readFileSync("data/runtime.json", "utf8"), "live-state");
+        assert.equal(fs.readFileSync("uploads/file.txt", "utf8"), "live-upload");
+        assert.equal(JSON.parse(fs.readFileSync("data/.rootark-restore-coordinator.json", "utf8")).phase, "manual_recovery");
+      `;
+      const recovery = spawnSync(process.execPath, ["-e", recoverScript], { cwd: runtime, env, encoding: "utf8", timeout: 10_000 });
+      assert.equal(recovery.status, 0, `${coordinatorVersion}/${manifestVersion}: ${recovery.stderr || recovery.stdout}`);
+    } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
+  }
 });
 
 test("pre-image staging failure removes its barrier before any restore destination changes", () => {
