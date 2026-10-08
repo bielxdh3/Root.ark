@@ -1224,6 +1224,47 @@ test("provider reconciliation excludes hardlink aliases of quarantine payloads",
   if (outcome.skipped) t.skip(outcome.skipped);
 });
 
+test("provider reconciliation fails closed on hardlinks to backup-sensitive files", (t) => {
+  const outcome = runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      write(path.join(uploadsDir, "root", "normal.txt"), "normal bytes");
+      const uploadedPaths = [];
+      const cloud = {
+        enabled: () => true,
+        inventoryContext: () => "a".repeat(64),
+        inventory: async () => [],
+        upload: async (source) => {
+          const relative = path.relative(uploadsDir, source);
+          if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) uploadedPaths.push(relative.split(path.sep).join("/"));
+          return true;
+        },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      const baseline = await backupService.createBackup({ createdBy: "fixture" });
+      await providerOrphans.markInventoryUnknown(baseline.id, { inventoryContext: "a".repeat(64) });
+
+      const sensitivePath = path.join(uploadsDir, "root", ".env.production");
+      const aliasPath = path.join(uploadsDir, "root", "ordinary-alias.txt");
+      write(sensitivePath, "fixture secret placeholder");
+      try { fs.linkSync(sensitivePath, aliasPath); }
+      catch (error) {
+        if (["EACCES", "EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV"].includes(error.code)) {
+          console.log(JSON.stringify({ ok: true, skipped: "hard links unavailable: " + error.code }));
+          return;
+        }
+        throw error;
+      }
+      await assert.rejects(restoreService.reconcileUnknownProviderInventory(), /hardlinked file/i,
+        "local reconciliation must fail closed on the same hardlink condition rejected by backup collection");
+      assert.deepEqual(uploadedPaths, [], "no local files are uploaded after a hardlink is detected");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+  if (outcome.skipped) t.skip(outcome.skipped);
+});
+
 test("restore does not queue or trust excluded paths declared by a backup manifest", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});

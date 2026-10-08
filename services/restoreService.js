@@ -543,7 +543,10 @@ function localUploadFiles() {
         if (!backupService.isBackupExcludedPath(entryPath) && !quarantineExclusions.isExcludedPath(absolute, stat)) visit(absolute);
       } else if (entry.isFile()) {
         const entryPath = `uploads/${path.relative(root, absolute).split(path.sep).join("/")}`;
-        if (!backupService.isBackupExcludedPath(entryPath) && !quarantineExclusions.isExcludedPath(absolute, stat)) files.push(entryPath);
+        if (!backupService.isBackupExcludedPath(entryPath) && !quarantineExclusions.isExcludedPath(absolute, stat)) {
+          if (stat.nlink !== 1n) throw new Error("Local upload tree contains a hardlinked file; cloud reconciliation remains blocked");
+          files.push(entryPath);
+        }
       }
       else throw new Error("Local upload tree contains an unsupported filesystem entry; cloud reconciliation remains blocked");
     }

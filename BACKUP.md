@@ -43,12 +43,16 @@ BACKUP_COMPRESS=true
 
 - `node_modules`
 - `.git`
-- `.env`
-- credenciais AWS/GDrive
-- arquivos `.key`, `.pem`, `.p12`
+- `.env`, `.env.*` e arquivos terminados em `.env`, em qualquer caminho incluído
+- caminhos com nomes que contenham `credentials` ou `service-account`
+- arquivos `.key`, `.pem` e `.p12`, em qualquer caminho incluído
+- arquivos e diretórios `.rootark-cloud-cache-*` e arquivos de controle internos do runtime
 - `data/server-master.key`
 - `data/backups`
+- a árvore de quarentena configurada, seus aliases de caminho real e hardlinks para payloads em quarentena
 - uploads temporários incompletos em `temp/.chunks` e `temp/.incoming`
+
+Essas exclusões são por caminho/nome; o backup não inspeciona o conteúdo de arquivos arbitrários em busca de credenciais. A criação do backup e a reconciliação do inventário cloud falham fechadas se um arquivo elegível tiver hardlinks, para impedir que um nome comum contorne a exclusão de outro caminho.
 
 ## Backup manual
 
