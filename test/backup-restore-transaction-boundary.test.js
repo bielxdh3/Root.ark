@@ -179,7 +179,12 @@ function runFixture(body, envOverrides = {}) {
   };
   try {
     const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
-    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(result.status, 0, [
+      `spawn error: ${result.error?.message || "none"}`,
+      `signal: ${result.signal || "none"}`,
+      `stderr:\n${result.stderr || ""}`,
+      `stdout:\n${result.stdout || ""}`,
+    ].join("\n"));
     const outcome = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1));
     assert.equal(outcome.ok, true);
     return outcome;
