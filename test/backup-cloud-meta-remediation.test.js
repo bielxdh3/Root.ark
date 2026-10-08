@@ -184,7 +184,7 @@ test("authoritative cloud backup and restore matrix", async (t) => {
       provider: "gdrive",
       prefix: "rootark",
       gdrive: { folderId: "drive-root" },
-      createGoogleDriveClient: async () => ({ files: {
+      createGoogleDriveClient: async () => ({ about: { get: async () => ({ data: { user: { permissionId: "drive-fixture-principal" } } }) }, files: {
         list: async () => ({ data: { files: [] } }),
         generateIds: async () => { calls.generated += 1; return { data: { ids: ["reserved-drive-id"] } }; },
         get: async ({ fileId }) => {
@@ -232,7 +232,7 @@ test("authoritative cloud backup and restore matrix", async (t) => {
         provider: "gdrive",
         prefix: "rootark",
         gdrive: { folderId: "drive-root" },
-        createGoogleDriveClient: async () => ({ files: {
+        createGoogleDriveClient: async () => ({ about: { get: async () => ({ data: { user: { permissionId: "drive-fixture-principal" } } }) }, files: {
           list: async () => ({ data: { files: Object.entries(readState().objects).map(([id, file]) => ({ id, name: file.name, parents: file.parents, appProperties: file.appProperties })) } }),
           generateIds: async () => {
             const state = readState();

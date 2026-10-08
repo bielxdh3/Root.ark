@@ -447,6 +447,7 @@ test("successful whole restore preserves both recovery records and blocks servic
 test("local-only restore keeps cloud inventory unknown until selected-archive reconciliation succeeds", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const cloudContext = "f".repeat(64);
     backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
     restoreService.setCloudStorage({ enabled: () => false });
     (async () => {
@@ -483,6 +484,7 @@ test("local-only restore keeps cloud inventory unknown until selected-archive re
       const cloud = {
         enabled: () => true,
         provider: "fixture",
+        inventoryContext: () => cloudContext,
         inventory: async () => {
           calls.push("inventory");
           return [
@@ -514,14 +516,17 @@ test("local-only restore keeps cloud inventory unknown until selected-archive re
       const retryableStatus = providerOrphans.getInventoryStatus();
       assert.equal(retryableStatus.state, "unknown");
       assert.equal(retryableStatus.backupId, backup.id);
-      assert.match(retryableStatus.inventoryContext, /^[a-f0-9]{64}$/);
-      assert.equal(retryableStatus.previousInventoryContext, retryableStatus.inventoryContext,
-        "failed inventory leaves the provider context and selected baseline durable and retryable");
+      assert.equal(retryableStatus.inventoryContext, cloudContext,
+        "failed inventory leaves the active provider context durable");
+      assert.match(retryableStatus.previousInventoryContext, /^[a-f0-9]{64}$/);
+      assert.notEqual(retryableStatus.previousInventoryContext, retryableStatus.inventoryContext,
+        "the prior local-provider context remains recorded across the provider change");
 
       const restoreServicePath = ${JSON.stringify(path.join(ROOT, "services", "restoreService"))};
       const restartFailureCode = [
         "const restore = require(" + JSON.stringify(restoreServicePath) + ");",
-        'restore.setCloudStorage({ enabled: () => true, upload: async () => true, inventory: async () => { throw new Error("injected restart inventory outage"); } });',
+        "const cloudContext = " + JSON.stringify(cloudContext) + ";",
+        'restore.setCloudStorage({ enabled: () => true, inventoryContext: () => cloudContext, upload: async () => true, inventory: async () => { throw new Error("injected restart inventory outage"); } });',
         'restore.reconcileUnknownProviderInventory().then(() => process.exit(2), (error) => { if (!/injected restart inventory outage/.test(error.message)) process.exit(3); process.stdout.write("retryable"); });',
       ].join("\\n");
       const restartFailure = childProcess.spawnSync(process.execPath, ["-e", restartFailureCode], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
@@ -530,14 +535,15 @@ test("local-only restore keeps cloud inventory unknown until selected-archive re
       const restartFailureStatus = providerOrphans.getInventoryStatus();
       assert.equal(restartFailureStatus.state, "unknown");
       assert.equal(restartFailureStatus.backupId, backup.id);
-      assert.match(restartFailureStatus.inventoryContext, /^[a-f0-9]{64}$/);
-      assert.equal(restartFailureStatus.previousInventoryContext, restartFailureStatus.inventoryContext,
-        "inventory failure after restart preserves the fail-closed marker and provider context");
+      assert.equal(restartFailureStatus.inventoryContext, cloudContext);
+      assert.equal(restartFailureStatus.previousInventoryContext, retryableStatus.previousInventoryContext,
+        "inventory failure after restart preserves the active and previous provider contexts");
 
       const restartSuccessCode = [
         "const restore = require(" + JSON.stringify(restoreServicePath) + ");",
+        "const cloudContext = " + JSON.stringify(cloudContext) + ";",
         "let inventoryCalls = 0;",
-        "restore.setCloudStorage({ enabled: () => true, upload: async () => true, inventory: async () => { inventoryCalls += 1; return ["
+        "restore.setCloudStorage({ enabled: () => true, inventoryContext: () => cloudContext, upload: async () => true, inventory: async () => { inventoryCalls += 1; return ["
           + '{ provider: "fixture", providerIdentity: "archived", area: "uploads", folderId: "root", name: "archived.txt" },'
           + '{ provider: "fixture", providerIdentity: "orphan", area: "uploads", folderId: "root", name: "orphan.txt" }'
           + "]; } });",
@@ -581,6 +587,66 @@ test("a reconciled provider inventory is scoped to its provider configuration", 
       await providerOrphans.markInventoryUnknown(providerOrphans.getInventoryStatus(changed).backupId);
       assert.deepEqual(providerOrphans.getInventoryStatus(), { state: "unknown", backupId },
         "startup can durably persist invalidation while cloud is disabled");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("reconciliation for a different provider context cannot reuse the same backup baseline", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      const backupId = "11111111-1111-4111-8111-111111111111";
+      const contextA = "a".repeat(64);
+      const contextB = "b".repeat(64);
+      await providerOrphans.markInventoryUnknown(backupId, { inventoryContext: contextA });
+      await providerOrphans.reconcileInventory(backupId, [], contextA);
+
+      await assert.rejects(
+        providerOrphans.reconcileInventory(backupId, [], contextB),
+        /provider inventory context changed during reconciliation/i,
+      );
+      const providerB = { enabled: () => true, inventoryContext: () => contextB };
+      assert.deepEqual(providerOrphans.getInventoryStatus(providerB), {
+        state: "unknown", backupId, inventoryContext: contextB, previousInventoryContext: contextA,
+      }, "a different provider context stays unknown until it performs its own inventory");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("a stale provider context cannot replace a context-bound unknown marker", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      const backupId = "33333333-3333-4333-8333-333333333333";
+      const contextA = "a".repeat(64);
+      const contextB = "b".repeat(64);
+      await providerOrphans.markInventoryUnknown(backupId, {
+        inventoryContext: contextB,
+        previousInventoryContext: contextA,
+      });
+
+      await assert.rejects(
+        providerOrphans.reconcileInventory(backupId, [], contextA),
+        /provider inventory context changed during reconciliation/i,
+      );
+      assert.deepEqual(providerOrphans.getInventoryStatus(), {
+        state: "unknown", backupId, inventoryContext: contextB, previousInventoryContext: contextA,
+      }, "a stale worker cannot overwrite the durable context selected by the newer worker");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("reconciliation without a provider context remains idempotent", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      const backupId = "22222222-2222-4222-8222-222222222222";
+      await providerOrphans.markInventoryUnknown(backupId);
+      await providerOrphans.reconcileInventory(backupId, []);
+      assert.deepEqual(await providerOrphans.reconcileInventory(backupId, []), []);
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);

@@ -284,9 +284,17 @@ async function reconcileInventory(backupId, objects, inventoryContext = null) {
   const lease = await acquirePolicyLock();
   try {
     const status = getInventoryStatus();
-    if (status.state === "reconciled" && status.backupId === id) return read();
+    if (status.state === "reconciled" && status.backupId === id) {
+      if ((status.inventoryContext ?? null) !== (inventoryContext ?? null)) {
+        throw new Error("Restore provider inventory context changed during reconciliation");
+      }
+      return read();
+    }
     if (status.state !== "unknown" || (status.backupId && status.backupId !== id)) {
       throw new Error("Restore provider inventory baseline changed during reconciliation");
+    }
+    if (status.inventoryContext && status.inventoryContext !== inventoryContext) {
+      throw new Error("Restore provider inventory context changed during reconciliation");
     }
     writeUnlocked(normalized, { state: "reconciled", backupId: id, reconciledAt: new Date().toISOString(), inventoryContext });
     return normalized;
