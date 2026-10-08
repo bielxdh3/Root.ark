@@ -127,6 +127,7 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
     cwd: dir,
     env: {
       ...process.env,
+      NODE_ENV: "test",
       PORT: String(port),
       DB_ENABLED: "false",
       ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
@@ -161,16 +162,54 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
 async function startGatedClamAv() {
   const scans = [];
   const server = net.createServer((socket) => {
+    let buffer = Buffer.alloc(0);
+    let commandReceived = false;
+    let streamComplete = false;
+    let releaseRequested = false;
+    let responded = false;
     let markStarted;
-    let release;
     const gate = {
       started: new Promise((resolve) => { markStarted = resolve; }),
-      release: () => release(),
+      release: () => {
+        releaseRequested = true;
+        respondWhenReady();
+      },
     };
-    gate.releasePromise = new Promise((resolve) => { release = resolve; });
     scans.push(gate);
-    socket.once("data", () => markStarted());
-    gate.releasePromise.then(() => socket.end("stream: OK\0"));
+    function respondWhenReady() {
+      if (!responded && releaseRequested && streamComplete) {
+        responded = true;
+        socket.end("stream: OK\0");
+      }
+    }
+    socket.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (!commandReceived) {
+        if (buffer.length < 10) return;
+        assert.equal(buffer.subarray(0, 10).toString("binary"), "zINSTREAM\0");
+        buffer = buffer.subarray(10);
+        commandReceived = true;
+        markStarted();
+      }
+
+      let offset = 0;
+      while (buffer.length >= offset + 4) {
+        const length = buffer.readUInt32BE(offset);
+        offset += 4;
+        if (length === 0) {
+          streamComplete = true;
+          buffer = buffer.subarray(offset);
+          respondWhenReady();
+          return;
+        }
+        if (buffer.length < offset + length) {
+          buffer = buffer.subarray(offset - 4);
+          return;
+        }
+        offset += length;
+      }
+      buffer = buffer.subarray(offset);
+    });
   });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -322,6 +361,98 @@ test("authorized harmless multipart upload enters the selected folder pending ar
   assert.deepEqual(fs.readFileSync(path.join(harness.dir, "temp", FOLDER_ID, "notes.txt")), bytes);
   assert.deepEqual(quarantine(harness.dir).items, []);
   assert.deepEqual(fs.existsSync(harness.quarantineDir) ? fs.readdirSync(harness.quarantineDir) : [], []);
+});
+
+test("unavailable ClamAV fails closed before simple, chunked, or WebDAV uploads can reach approval", { timeout: 45_000 }, async (t) => {
+  const unavailablePort = await getUnusedPort();
+  const harness = await createHarness(t, {
+    uploaderPermissions: { approve: true },
+    envOverrides: {
+      UPLOAD_SCAN_PROVIDER: "clamav",
+      UPLOAD_FAIL_CLOSED: "",
+      CLAMAV_HOST: "127.0.0.1",
+      CLAMAV_PORT: String(unavailablePort),
+      WEBDAV_ENABLED: "true",
+    },
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const simple = await upload(harness.port, session, "unavailable-simple.txt", Buffer.from("disposable simple bytes"));
+  const chunked = await uploadChunk(harness.port, session, {
+    uploadId: "unavailable-final-chunk",
+    originalName: "unavailable-chunk.txt",
+    chunkIndex: 0,
+    totalChunks: 1,
+    bytes: Buffer.from("disposable chunk bytes"),
+  });
+  const webDav = await request(harness.port, `/dav/${FOLDER_ID}/unavailable-webdav.txt`, {
+    method: "PUT",
+    headers: {
+      authorization: "Basic " + Buffer.from(`uploader:${harness.password}`).toString("base64"),
+      "content-length": "23",
+    },
+    body: Buffer.from("disposable WebDAV bytes"),
+  });
+
+  for (const response of [simple, chunked, webDav]) assert.equal(response.status, 503, response.body);
+  assert.deepEqual(pending(harness.dir), {});
+  assert.equal(quarantine(harness.dir).items.length, 3);
+  assert.deepEqual(filesUnder(path.join(harness.dir, "uploads")), []);
+  for (const name of ["unavailable-simple.txt", "unavailable-chunk.txt", "unavailable-webdav.txt"]) {
+    const approval = await postJson(harness.port, session, `/approve/${name}?folderId=${FOLDER_ID}`, {});
+    assert.equal(approval.status, 404, approval.body);
+  }
+});
+
+test("clean ClamAV INSTREAM responses with the protocol NUL terminator allow pending registration", { timeout: 30_000 }, async (t) => {
+  const scanner = await startGatedClamAv();
+  t.after(async () => {
+    for (const gate of scanner.scans) gate.release();
+    await new Promise((resolve) => scanner.server.close(resolve));
+  });
+  const harness = await createHarness(t, {
+    envOverrides: { UPLOAD_SCAN_PROVIDER: "clamav", CLAMAV_HOST: "127.0.0.1", CLAMAV_PORT: String(scanner.port) },
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const bytes = Buffer.from("disposable clean scan fixture");
+  const uploadPromise = upload(harness.port, session, "clean-scan.txt", bytes);
+  const deadline = Date.now() + TIMEOUT_MS;
+  while (!scanner.scans.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(scanner.scans[0], "upload did not reach ClamAV");
+  await scanner.scans[0].started;
+  scanner.scans[0].release();
+
+  const response = await uploadPromise;
+  assert.equal(response.status, 200, response.body);
+  assert.equal(pending(harness.dir)[`${FOLDER_ID}/clean-scan.txt`].folderId, FOLDER_ID);
+  assert.deepEqual(fs.readFileSync(path.join(harness.dir, "temp", FOLDER_ID, "clean-scan.txt")), bytes);
+  assert.deepEqual(quarantine(harness.dir).items, []);
+});
+
+test("unknown upload scan providers fail startup instead of skipping scanning", { timeout: 10_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    waitForReady: false,
+    envOverrides: { UPLOAD_SCAN_PROVIDER: "unknown-provider", UPLOAD_FAIL_CLOSED: "false" },
+  });
+  const exitCode = await waitForExit(harness.child, 3_000);
+
+  assert.notEqual(exitCode, 0);
+  assert.match(harness.stderr.join(""), /UPLOAD_SCAN_PROVIDER/);
+});
+
+test("non-development startup rejects disabled or fail-open upload scanning", { timeout: 15_000 }, async (t) => {
+  const configurations = [
+    { env: { NODE_ENV: "production", UPLOAD_SCAN_PROVIDER: "disabled" }, error: /production.*upload scanning/i },
+    { env: { NODE_ENV: "production", UPLOAD_SCAN_PROVIDER: "clamav", UPLOAD_FAIL_CLOSED: "false" }, error: /production.*upload scanning/i },
+    { env: { NODE_ENV: "production", UPLOAD_SCAN_ENABLED: "false", UPLOAD_SCAN_PROVIDER: "clamav" }, error: /production.*upload scanning/i },
+    { env: { NODE_ENV: "staging", UPLOAD_SCAN_PROVIDER: "disabled" }, error: /bypass requires NODE_ENV=development or test/i },
+  ];
+
+  for (const { env: envOverrides, error } of configurations) {
+    const harness = await createHarness(t, { waitForReady: false, envOverrides });
+    const exitCode = await waitForExit(harness.child, 3_000);
+    assert.notEqual(exitCode, 0);
+    assert.match(harness.stderr.join(""), error);
+  }
 });
 
 test("wrong encrypted-file password stays an input error and records failed decrypt only", { timeout: 30_000 }, async (t) => {
