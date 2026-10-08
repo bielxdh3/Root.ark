@@ -5,9 +5,9 @@ Last branch reconciliation: 2026-10-08
 
 Repository: `bielxdh3/root.ark`
 
-The latest recorded GitHub query in [the issue ledger](issue-ledger.md) is after PR #118 merged, at `Root/main` `1c2f7a8b276e63e53555f5de824afc9b7a9aa55e`. At that query PR #116 was still remotely at head `75efa003136c0799cf678fa8ad264076893882d3` on the prior base `14428690bef7c02648fd0be9570aabb17ae6de1a`; its candidate branch was refreshed locally with the PR #118 merge before this follow-up. The issue and PR snapshot is time-scoped, not a claim about later publication or merge state.
+The latest recorded GitHub query in [the issue ledger](issue-ledger.md) is after PR #116 merged, at `Root/main` `fd995b2ae587140db8ea1ba9de62cf7557ee0516`. Push Security Regression, CodeQL, default-branch Dependency Review, and Pages passed on that exact SHA. The mission execution record reports the local release gate passed there as well, but its exact stdout was not retained in the repository. The issue and PR snapshot is time-scoped; re-query GitHub before relying on it after later repository changes.
 
-The security-correction code and main-push CI work in PRs #101, #103, #114, #115, #99, #117, and #118 are merged. Push Security Regression, CodeQL, default-branch Dependency Review, and Pages passed on exact main SHA `1c2f7a8…`; the test totals and run links are in the issue ledger. Mission closure remains `[PARTIAL]`: the full browser matrix is incomplete, PR #116 still needs publication/review/merge, and the exact final main SHA after that work still needs validation and fresh independent review. Whole restore is locally rollback-recoverable with durable provider reconciliation, not globally atomic.
+The security-correction code and main-push CI work in PRs #101, #103, #114, #115, #99, #117, #118, and #116 are merged. Mission closure remains `[PARTIAL]`: the full browser matrix is incomplete, so complete UI acceptance is unproven. Whole restore is locally rollback-recoverable with durable provider reconciliation, not globally atomic. Issues #63–68 and #94, and incomplete PRs #95, #97, and #102, remain open as recorded in the issue ledger.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
