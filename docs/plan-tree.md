@@ -5,9 +5,9 @@ Last branch reconciliation: 2026-10-08
 
 Repository: `bielxdh3/root.ark`
 
-Current-state source: the [2026-10-08 closure validation report](validation/2026-10-08-rootark-mission-closure.md) records exact-SHA evidence for `Root/main` `14428690bef7c02648fd0be9570aabb17ae6de1a` after PR #117. The issue ledger contains a historical snapshot from before PR #116 was updated and a later candidate snapshot at head `a72d2f2…`; both are time-scoped. Older dated sections remain historical evidence.
+As of the 2026-10-08 GitHub query, the closure validation report records `Root/main` `14428690bef7c02648fd0be9570aabb17ae6de1a` and PR #116 candidate head `448d1c1ecd2cd3a1391dd741027dc146be3735b6` on that base. The issue ledger preserves the earlier `a72d2f2…` state as a historical snapshot. Later merges require a new exact-SHA query.
 
-The security-correction code in PRs #114, #115, #99, and #117 is merged. PR #116 is open on current base `1442869…`; its candidate head `a72d2f2…` passed exact-head CI and the local release gate. A documentation review found stale state wording, now corrected in this follow-up; its resulting head needs fresh checks/review. Mission closure remains `[PARTIAL]` pending that cycle, post-merge final-SHA validation, fresh final review, and the incomplete file-dependent browser matrix. Whole restore remains rollback-recoverable locally with durable provider reconciliation, not globally atomic.
+The security-correction code in PRs #114, #115, #99, and #117 is merged. At the latest query snapshot, PR #116 was open with clean merge state at head `448d1c1ecd2cd3a1391dd741027dc146be3735b6` on base `14428690bef7c02648fd0be9570aabb17ae6de1a`; exact-head Linux/Windows Security Regression, CodeQL, and PR Dependency Review passed. The local release gate passed on code-equivalent head `a72d2f2…` before this documentation-only correction. Mission closure remains `[PARTIAL]` pending post-merge exact-SHA validation, fresh final review, and remaining browser acceptance. Whole restore remains rollback-recoverable locally with durable provider reconciliation, not globally atomic.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
