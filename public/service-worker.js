@@ -9,12 +9,12 @@ const SHELL_ASSETS = [
   "/audit.html",
   "/admin.html",
   "/backups.html",
-  "/styles/app.css?v=17",
+  "/styles/app.css",
   "/client/rootark-api.js",
   "/client/rootark-ui.js",
   "/client/rootark-login.js",
   "/client/rootark-workspace.js",
-  "/client/rootark-management.js?v=19",
+  "/client/rootark-management.js",
   "/client/rootark-offline-shell.js",
   "/client/rootark-bootstrap.js",
   "/client/rootark-client-crypto.js",
@@ -42,7 +42,7 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(request.url);
   if (request.method !== "GET" || url.origin !== self.location.origin || BLOCKED_PATHS.some((pattern) => pattern.test(url.pathname))) return;
   if (!SHELL_ASSETS.some((asset) => new URL(asset, self.location.origin).pathname === url.pathname)) return;
-  event.respondWith(caches.match(request).then((cached) => cached || fetch(request).then((response) => {
+  event.respondWith(caches.match(request, { ignoreSearch: true }).then((cached) => cached || fetch(request).then((response) => {
     if (response.ok) caches.open(CACHE_NAME).then((cache) => cache.put(request, response.clone()));
     return response;
   })));
