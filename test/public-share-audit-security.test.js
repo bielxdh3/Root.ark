@@ -41,26 +41,34 @@ function request(port, requestPath, method = "GET", headers = {}) {
 function runSharePageScript(page, fetchImpl) {
   const isHtmlWhitespace = (character) => [" ", "\t", "\r", "\n", "\f"].includes(character);
   const elements = new Map();
+  const createdElements = [];
+  const createMockElement = (id, tagName = "") => {
+    const classes = new Set(["passwordBox", "contentBox", "previewBox", "qrBox"].includes(id) ? ["hidden"] : []);
+    return {
+      id,
+      tagName,
+      textContent: "",
+      innerHTML: "",
+      value: "",
+      disabled: false,
+      hidden: false,
+      dataset: {},
+      listeners: {},
+      children: [],
+      classList: {
+        add(name) { classes.add(name); },
+        remove(name) { classes.delete(name); },
+        toggle(name) { if (classes.has(name)) classes.delete(name); else classes.add(name); },
+        contains(name) { return classes.has(name); },
+      },
+      addEventListener(type, handler) { this.listeners[type] = handler; },
+      replaceChildren(...children) { this.children = children; },
+      append(...children) { this.children.push(...children); },
+    };
+  };
   const getElementById = (id) => {
     if (!elements.has(id)) {
-      const classes = new Set(["passwordBox", "contentBox", "previewBox", "qrBox"].includes(id) ? ["hidden"] : []);
-      const element = {
-        textContent: "",
-        innerHTML: "",
-        value: "",
-        disabled: false,
-        hidden: false,
-        dataset: {},
-        listeners: {},
-        classList: {
-          add(name) { classes.add(name); },
-          remove(name) { classes.delete(name); },
-          toggle(name) { if (classes.has(name)) classes.delete(name); else classes.add(name); },
-          contains(name) { return classes.has(name); },
-        },
-        addEventListener(type, handler) { this.listeners[type] = handler; },
-      };
-      elements.set(id, element);
+      elements.set(id, createMockElement(id));
     }
     return elements.get(id);
   };
@@ -91,11 +99,19 @@ function runSharePageScript(page, fetchImpl) {
     : undefined;
   assert.ok(script, "share page has an inline client script");
   vm.runInNewContext(script, {
-    document: { getElementById },
+    document: {
+      getElementById,
+      createElement(tagName) {
+        const element = createMockElement(`created-${createdElements.length}`, tagName);
+        createdElements.push(element);
+        return element;
+      },
+    },
     fetch: fetchImpl,
     navigator: { clipboard: { writeText: async () => {} } },
     window: { location: { href: "https://rootark.test/share/example" } },
   });
+  elements.createdElements = createdElements;
   return elements;
 }
 
@@ -376,6 +392,9 @@ test("public-share audit logs correlate by token digest without storing the bear
   const previewFirstToken = crypto.randomBytes(24).toString("hex");
   const unsupportedPreviewToken = crypto.randomBytes(24).toString("hex");
   const rangedPreviewToken = crypto.randomBytes(24).toString("hex");
+  const prototypeViewerToken = crypto.randomBytes(24).toString("hex");
+  const rangedFileToken = crypto.randomBytes(24).toString("hex");
+  const rangedDownloadToken = crypto.randomBytes(24).toString("hex");
   const publicLinksPath = path.join(dataDir, "public-links.json");
   fs.writeFileSync(publicLinksPath, JSON.stringify({
     [token]: JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[token],
@@ -385,6 +404,9 @@ test("public-share audit logs correlate by token digest without storing the bear
     [previewFirstToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, viewers: {} },
     [unsupportedPreviewToken]: { folderId: "root", fileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
     [rangedPreviewToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
+    [prototypeViewerToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
+    [rangedFileToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
+    [rangedDownloadToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
   }));
   const expiredPage = await request(port, `/share/${expiredPageToken}`);
   assert.equal(expiredPage.status, 410);
@@ -421,6 +443,63 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.equal(continuedPreview.status, 206, "later ranges from the same viewer do not consume additional downloads");
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[rangedPreviewToken].downloads, 1);
   assert.equal((await request(port, `/share/${rangedPreviewToken}/preview`, "GET", { range: "bytes=8-11" })).status, 410, "another viewer cannot bypass the exhausted download quota");
+
+  const protoCookie = `rootark_share_${prototypeViewerToken}=__proto__`;
+  assert.equal((await request(port, `/share/${prototypeViewerToken}/preview`, "GET", { cookie: protoCookie })).status, 200);
+  const repeatedProtoPreview = await request(port, `/share/${prototypeViewerToken}/preview`, "GET", { cookie: protoCookie });
+  assert.equal(repeatedProtoPreview.status, 410, "an invalid viewer cookie cannot mark Object.prototype as already counted and bypass the quota");
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[prototypeViewerToken].downloads, 1);
+
+  const invalidFileRange = await request(port, `/share/${rangedFileToken}/file`, "POST", {
+    origin: `http://127.0.0.1:${port}`,
+    range: "bytes=999-1000",
+  });
+  assert.equal(invalidFileRange.status, 416);
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[rangedFileToken].downloads, 0, "an unsatisfiable file Range must not consume quota");
+  const validFileRange = await request(port, `/share/${rangedFileToken}/file`, "POST", {
+    origin: `http://127.0.0.1:${port}`,
+    range: "bytes=0-3",
+  });
+  assert.equal(validFileRange.status, 206);
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[rangedFileToken].downloads, 1);
+
+  const invalidDownloadRange = await request(port, `/share/${rangedDownloadToken}/download`, "POST", {
+    origin: `http://127.0.0.1:${port}`,
+    range: "bytes=999-1000",
+  });
+  assert.equal(invalidDownloadRange.status, 416);
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[rangedDownloadToken].downloads, 0, "an unsatisfiable attachment Range must not consume quota");
+  const validDownloadRange = await request(port, `/share/${rangedDownloadToken}/download`, "POST", {
+    origin: `http://127.0.0.1:${port}`,
+    range: "bytes=0-3",
+  });
+  assert.equal(validDownloadRange.status, 206);
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[rangedDownloadToken].downloads, 1);
+
+  const previewRefreshCalls = [];
+  const previewRefreshResponses = [
+    { fileName: "preview.pdf", expiresAt: new Date(Date.now() + 60_000).toISOString(), remainingViews: null, remainingDownloads: 1, canPreview: true, size: 12 },
+    { fileName: "preview.pdf", expiresAt: new Date(Date.now() + 60_000).toISOString(), remainingViews: null, remainingDownloads: 0, canPreview: true, size: 12 },
+  ];
+  const previewRefreshElements = runSharePageScript(sharePage.body, (url, options) => {
+    previewRefreshCalls.push({ url, options });
+    const payload = previewRefreshResponses.shift();
+    return Promise.resolve({ status: 200, ok: true, json: async () => payload });
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(previewRefreshElements.get("downloadButton").disabled, false);
+  previewRefreshElements.get("previewButton").listeners.click();
+  const previewFrame = previewRefreshElements.createdElements.find((element) => element.tagName === "iframe");
+  assert.ok(previewFrame, "the preview flow creates an iframe with a load handler");
+  previewFrame.listeners.load();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(previewRefreshCalls.length, 2, "preview completion reloads the current share limits");
+  assert.equal(previewRefreshCalls[1].options.method, "POST");
+  assert.equal(previewRefreshElements.get("meta").innerHTML.includes("0 downloads restantes"), true);
+  assert.equal(previewRefreshElements.get("downloadButton").disabled, true);
+  assert.match(previewRefreshElements.get("status").textContent, /limite de downloads atingido/i);
 
   const previewHead = await request(port, `/share/${previewFirstToken}/preview`, "HEAD");
   assert.equal(previewHead.status, 405, "HEAD does not act as a preview download");

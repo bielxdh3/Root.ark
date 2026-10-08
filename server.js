@@ -1576,11 +1576,20 @@ function getTemporaryExpirationFromBody(body = {}) {
   return new Date(Date.now() + durationMs).toISOString();
 }
 
+function isShareViewerId(viewerId) {
+  return typeof viewerId === "string" && /^[a-f0-9]{32}$/.test(viewerId);
+}
+
 function cleanupShareViewers(link, now = Date.now()) {
   const viewers = link.activeViewers && typeof link.activeViewers === "object" ? link.activeViewers : {};
   let changed = false;
 
   for (const [viewerId, viewer] of Object.entries(viewers)) {
+    if (!isShareViewerId(viewerId)) {
+      delete viewers[viewerId];
+      changed = true;
+      continue;
+    }
     const expiresAt = new Date(viewer?.expiresAt).getTime();
     if (!Number.isFinite(expiresAt) || expiresAt <= now) {
       delete viewers[viewerId];
@@ -1866,6 +1875,7 @@ function renderPublicSharePage(token) {
       const passwordForm = document.getElementById("sharePasswordForm");
       const passwordInput = document.getElementById("sharePassword");
       const passwordButton = document.getElementById("passwordButton");
+      const downloadButton = document.getElementById("downloadButton");
       const meta = document.getElementById("meta");
       const previewButton = document.getElementById("previewButton");
       const previewBox = document.getElementById("previewBox");
@@ -1894,6 +1904,35 @@ function renderPublicSharePage(token) {
           data.remainingDownloads !== null ? '<span class="pill">' + data.remainingDownloads + ' downloads restantes</span>' : '<span class="pill">Downloads ilimitados</span>'
         ].filter(Boolean).join("");
         previewButton.hidden = !data.canPreview;
+        downloadButton.disabled = data.remainingDownloads === 0;
+      }
+
+      async function refreshShareAccess() {
+        downloadButton.disabled = true;
+        status.textContent = "Atualizando os limites de acesso...";
+        try {
+          const response = await fetch("/share/" + token + "/password", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ password: "" })
+          });
+          const data = await response.json();
+          if (!response.ok) {
+            if (response.status === 401 && data.passwordRequired) {
+              fileName.textContent = "Link protegido";
+              status.textContent = "A sessao do link expirou. Informe a senha novamente.";
+              passwordBox.classList.remove("hidden");
+              contentBox.classList.add("hidden");
+              return;
+            }
+            throw new Error("Share access refresh failed");
+          }
+          renderAccess(data);
+          if (data.remainingDownloads === 0) status.textContent = "Limite de downloads atingido.";
+        } catch {
+          downloadButton.disabled = true;
+          status.textContent = "Nao foi possivel atualizar os limites. Recarregue a pagina.";
+        }
       }
 
       async function accessShare(password = "") {
@@ -1947,7 +1986,11 @@ function renderPublicSharePage(token) {
       previewButton.addEventListener("click", () => {
         previewBox.classList.toggle("hidden");
         if (!previewBox.dataset.loaded) {
-          previewBox.innerHTML = '<iframe src="/share/' + token + '/preview" title="Preview"></iframe>';
+          const previewFrame = document.createElement("iframe");
+          previewFrame.title = "Preview";
+          previewFrame.addEventListener("load", refreshShareAccess);
+          previewFrame.src = "/share/" + token + "/preview";
+          previewBox.replaceChildren(previewFrame);
           previewBox.dataset.loaded = "1";
         }
       });
@@ -2051,7 +2094,8 @@ function getPublicShareCanPreview(fileName) {
 function getActiveShareViewer(req, token, link) {
   const { viewers } = cleanupShareViewers(link);
   const viewerId = getCookieValue(req, `rootark_share_${token}`);
-  return viewerId && viewers[viewerId] ? { id: viewerId, viewer: viewers[viewerId] } : null;
+  if (!isShareViewerId(viewerId) || !Object.prototype.hasOwnProperty.call(viewers, viewerId)) return null;
+  return { id: viewerId, viewer: viewers[viewerId] };
 }
 
 function createShareViewer(req, res, token, link, expiresAt) {
@@ -3396,6 +3440,7 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
     }
     if (rejection) {
       try { fs.closeSync(fd); } catch {}
+      if (typeof options.onBeforeSendReject === "function") return options.onBeforeSendReject(rejection);
       return res.status(rejection.status || 403).type("text/plain").send(rejection.error || "Link indisponivel.");
     }
   }
@@ -9355,11 +9400,14 @@ app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareM
   const access = await resolveShareAccess(req, res, shareToken, {
     requireViewer: true,
     countDownload: true,
+    deferDownloadReservation: true,
   });
   if (access.error) return res.status(access.status || 400).type("html").send(getShareFailurePage(access.error));
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "attachment", {
     cacheControl: "private, max-age=600",
+    beforeSend: access.reserveDownload,
+    onBeforeSendReject: (failure) => res.status(failure.status || 400).type("html").send(getShareFailurePage(failure.error)),
   });
 });
 
@@ -9408,11 +9456,17 @@ app.post("/share/:token/file", shareRateLimit, requireSameOriginPublicShareMutat
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
 
-  const access = await resolveShareAccess(req, res, shareToken, { requireViewer: true, countDownload: true });
+  const access = await resolveShareAccess(req, res, shareToken, {
+    requireViewer: true,
+    countDownload: true,
+    deferDownloadReservation: true,
+  });
   if (access.error) return res.status(access.status || 400).send(access.error);
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "inline", {
     cacheControl: "private, max-age=600",
+    beforeSend: access.reserveDownload,
+    onBeforeSendReject: (failure) => res.status(failure.status || 400).send(failure.error),
   });
 });
 

@@ -135,4 +135,28 @@ test("SQLite enforces public share view and download limits across concurrent pr
     repository.savePublicLinks(staleSnapshot);
     assert.equal(repository.loadPublicLinks()[token], undefined, "a stale active snapshot cannot reactivate a revoked share");
   }
+
+  const prototypeToken = "f".repeat(48);
+  const prototypeNow = new Date().toISOString();
+  repository.savePublicLinks({ [prototypeToken]: {
+    fileName: "prototype-viewer.txt",
+    folderId: "root",
+    createdAt: prototypeNow,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    maxViews: 0,
+    views: 0,
+    maxDownloads: 0,
+    downloads: 0,
+    activeViewers: {},
+  } });
+  const invalidViewer = repository.consumePublicLinkQuota(prototypeToken, {
+    kind: "view",
+    expectedFileName: "prototype-viewer.txt",
+    expectedFolderId: "root",
+    expectedPasswordHash: null,
+    viewer: { id: "__proto__", createdAt: prototypeNow, expiresAt: new Date(Date.now() + 60_000).toISOString() },
+  });
+  assert.equal(invalidViewer.status, "ok");
+  assert.equal(Object.getPrototypeOf(invalidViewer.link.activeViewers), Object.prototype, "invalid viewer identifiers cannot replace the viewer map prototype");
+  assert.equal(Object.prototype.hasOwnProperty.call(invalidViewer.link.activeViewers, "__proto__"), false);
 });
