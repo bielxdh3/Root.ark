@@ -104,6 +104,108 @@ test("public-share script extraction accepts case-insensitive script tags", () =
   assert.equal(elements.get("status").textContent, "loaded");
 });
 
+test("SQLite mode preserves counted access for a JSON-fallback public link", { timeout: 30_000 }, async (t) => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-share-sqlite-fallback-"));
+  const token = crypto.randomBytes(24).toString("hex");
+  const secondToken = crypto.randomBytes(24).toString("hex");
+  const invalidToken = "not-a-valid-share-token";
+  const port = await getUnusedPort();
+  const dataDir = path.join(sandbox, "data");
+  const databasePath = path.join(dataDir, "rootark.sqlite");
+  const fileName = "sqlite-fallback-share.txt";
+
+  fs.mkdirSync(path.join(sandbox, "uploads"), { recursive: true });
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.cpSync(PUBLIC, path.join(sandbox, "public"), { recursive: true });
+  fs.writeFileSync(path.join(sandbox, "uploads", fileName), "disposable SQLite fallback fixture\n");
+  fs.writeFileSync(path.join(dataDir, "public-links.json"), JSON.stringify({
+    [token]: {
+      folderId: "root",
+      fileName,
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      views: 0,
+      maxViews: 0,
+      downloads: 0,
+      maxDownloads: 1,
+      activeViewers: {},
+    },
+    [secondToken]: {
+      folderId: "root",
+      fileName,
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      views: 0,
+      maxViews: 0,
+      downloads: 0,
+      maxDownloads: 0,
+      activeViewers: {},
+    },
+    [invalidToken]: {
+      folderId: "root",
+      fileName,
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      views: 0,
+    },
+  }));
+
+  const child = spawn(process.execPath, [SERVER], {
+    cwd: sandbox,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DB_ENABLED: "true",
+      DATABASE_URL: databasePath,
+      DB_READ_FALLBACK_JSON: "true",
+      DB_WRITE_LEGACY_JSON: "false",
+      DB_AUTO_BACKUP_ON_START: "false",
+      CLOUD_STORAGE_PROVIDER: "local",
+      NODE_ENV: "test",
+      ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true",
+      JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+    },
+    stdio: "ignore",
+    windowsHide: true,
+  });
+
+  t.after(async () => {
+    if (child.exitCode === null) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, TIMEOUT_MS);
+        child.once("exit", () => { clearTimeout(timer); resolve(); });
+        child.kill();
+      });
+    }
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  assert.equal((await waitForServer(port)).status, 200);
+  assert.equal((await request(port, `/share/${token}`)).status, 200);
+  const origin = `http://127.0.0.1:${port}`;
+  const view = await request(port, `/share/${token}/view`, "POST", { origin });
+  assert.equal(view.status, 200, view.body);
+  assert.equal(JSON.parse(view.body).views, 1);
+  assert.equal((await request(port, `/share/${secondToken}`)).status, 200, "counting one legacy link must not hide other unrecorded JSON links");
+  assert.equal((await request(port, `/share/${secondToken}/view`, "POST", { origin })).status, 200);
+  assert.equal((await request(port, `/share/${invalidToken}`)).status, 404, "invalid legacy JSON tokens are not served");
+
+  const firstDownload = await request(port, `/share/${token}/download`, "POST", { origin });
+  assert.equal(firstDownload.status, 200, firstDownload.body);
+  assert.equal(firstDownload.body, "disposable SQLite fallback fixture\n");
+  const exhaustedDownload = await request(port, `/share/${token}/download`, "POST", { origin });
+  assert.equal(exhaustedDownload.status, 410);
+
+  const Database = require("better-sqlite3");
+  const database = new Database(databasePath);
+  try {
+    database.prepare("UPDATE public_links SET revoked_at = ? WHERE token = ?").run(new Date().toISOString(), token);
+  } finally {
+    database.close();
+  }
+  assert.equal((await request(port, `/share/${token}`)).status, 404, "a revoked SQLite token must not be restored from stale JSON fallback data");
+});
+
 async function waitForServer(port) {
   const deadline = Date.now() + TIMEOUT_MS;
   let lastError;

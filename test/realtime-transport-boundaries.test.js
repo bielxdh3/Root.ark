@@ -38,7 +38,7 @@ test("WebSocket HTTP upgrade enforces cookie, Origin, message, and binary bounda
   fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([{ username: "agent", password: bcrypt.hashSync("password", 10), role: "admin", permissions: {}, sessionVersion: 0 }]));
   fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
   const portNumber = await port();
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
   t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
   await ready(portNumber);
   const body = JSON.stringify({ username: "agent", password: "password" });
@@ -63,7 +63,7 @@ test("WebDAV HTTP boundary rejects unauthenticated, hostile, traversing, and inf
   fs.writeFileSync(path.join(dir, "uploads", "source.txt"), "source");
   fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
   const portNumber = await port();
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
   t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
   await ready(portNumber);
   const basic = `Basic ${Buffer.from("agent:password").toString("base64")}`;
@@ -98,7 +98,7 @@ test("WebDAV enabled MOVE preserves same-folder files and fails closed for hosti
   fs.writeFileSync(path.join(dir, "uploads", "replace.txt"), "replacement");
   fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
   const portNumber = await port();
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", WEBDAV_ENABLED: "true", WEBDAV_ALLOW_MOVE: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", WEBDAV_ALLOW_MOVE: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
   t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
   await ready(portNumber);
   const basic = `Basic ${Buffer.from("agent:password").toString("base64")}`;

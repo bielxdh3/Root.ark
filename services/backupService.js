@@ -10,6 +10,7 @@ const { getDatabasePath, getDb, isDbEnabled } = require("../db");
 const { resolveRuntimePath } = require("../src/runtime-paths");
 const { attestCiphertextOnlyFile } = require("../src/services/deploymentResilience");
 const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, validateQuarantinePayloads } = require("../src/quarantine-paths");
+const restoreProviderOrphans = require("./restoreProviderOrphans");
 
 const BACKUPS_DIR = resolveRuntimePath("data", "backups");
 const LOCK_FILE = path.join(BACKUPS_DIR, ".backup.lock");
@@ -79,12 +80,15 @@ function isSensitivePath(relativePath) {
   if (normalized.startsWith(".git/") || normalized === ".git") return true;
   if (normalized.startsWith("node_modules/") || normalized === "node_modules") return true;
   if (normalized.startsWith("data/backups/") || normalized === "data/backups") return true;
+  if (normalized.toLowerCase().startsWith("data/.rootark-cloud-")) return true;
   if (normalized.startsWith("temp/.chunks/") || normalized.startsWith("temp/.incoming/")) return true;
   if (base === ".env" || base.startsWith(".env.") || base.endsWith(".env")) return true;
   if (base.includes("credentials") || base.includes("service-account")) return true;
   if (base.endsWith(".key") || base.endsWith(".pem") || base.endsWith(".p12")) return true;
   if (base === "server-master.key") return true;
   if (base === ".rootark-quarantine-restore-journal.json" || base.startsWith(".rootark-quarantine-restore-metadata-")) return true;
+  if (base === ".rootark-restore-provider-orphans.json") return true;
+  if (base === ".rootark-restore-provider-orphans-state.json") return true;
   if (base.startsWith(".rootark-restore-coordinator.json")) return true;
   if (normalized.toLowerCase().startsWith("data/.rootark-active-requests/")) return true;
   if (normalized.toLowerCase().startsWith("data/.rootark-restore-restart-acks/")) return true;
@@ -244,6 +248,7 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
     if (stat.isSymbolicLink()) continue;
     if (stat.isDirectory()) {
       for (const name of fs.readdirSync(current.absolutePath)) {
+        if (options.excludeNamePrefixes?.some((prefix) => name.startsWith(prefix))) continue;
         const absolutePath = path.join(current.absolutePath, name);
         if (isExcluded(absolutePath)) continue;
         const entryPath = normalizeEntryPath(path.posix.join(current.entryPath, name));
@@ -263,6 +268,7 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
 
 async function collectBackupFiles(options = {}) {
   const files = [];
+  const suppressionSnapshot = options.suppressionSnapshot || restoreProviderOrphans.createSnapshot();
   const dataDir = resolveRuntimePath("data");
   let dataRootInfo = null;
   try {
@@ -343,23 +349,32 @@ async function collectBackupFiles(options = {}) {
   }
 
   if (includeUploads) {
-    files.push(...collectFilesRecursive(resolveRuntimePath("uploads"), "uploads", { excludePaths: [quarantineDir], excludeFileIdentities: quarantineFileIdentities }));
+    files.push(...collectFilesRecursive(resolveRuntimePath("uploads"), "uploads", { excludePaths: [quarantineDir], excludeFileIdentities: quarantineFileIdentities, excludeNamePrefixes: [".rootark-cloud-cache-"] }));
   }
 
   if (includeTemp || includePending) {
-    files.push(...collectFilesRecursive(resolveRuntimePath("temp"), "temp", { excludePaths: [quarantineDir], excludeFileIdentities: quarantineFileIdentities }));
+    files.push(...collectFilesRecursive(resolveRuntimePath("temp"), "temp", { excludePaths: [quarantineDir], excludeFileIdentities: quarantineFileIdentities, excludeNamePrefixes: [".rootark-cloud-cache-"] }));
   }
 
-  const syncFile = files.find((file) => file.entryPath === "data/sync-objects.json");
+  const unsuppressedFiles = files.filter((file) => {
+    const parts = file.entryPath.split("/");
+    const area = parts.shift();
+    if (!["uploads", "temp"].includes(area)) return true;
+    const name = parts.pop();
+    const folderId = parts.pop() || "root";
+    return parts.length > 0 || !restoreProviderOrphans.isSuppressed(folderId, name, area, suppressionSnapshot);
+  });
+
+  const syncFile = unsuppressedFiles.find((file) => file.entryPath === "data/sync-objects.json");
   if (syncFile) attestCiphertextOnlyFile(syncFile.absolutePath);
 
-  if (!cloudStorage?.enabled()) return files.sort((a, b) => a.entryPath.localeCompare(b.entryPath));
+  if (!cloudStorage?.enabled()) return unsuppressedFiles.sort((a, b) => a.entryPath.localeCompare(b.entryPath));
 
   const stageDir = options.stageDir;
   if (!stageDir) throw new Error("Cloud backup staging is required");
   const known = new Map();
   const collisions = new Map();
-  for (const file of files) {
+  for (const file of unsuppressedFiles) {
     const key = collisionKey(file.entryPath);
     if (collisions.has(key) && collisions.get(key) !== file.entryPath) throw new Error("Backup entry collision");
     collisions.set(key, file.entryPath);
@@ -380,6 +395,7 @@ async function collectBackupFiles(options = {}) {
     if (!folderId || folderId === "." || folderId === ".." || /[\\\\/]/.test(folderId)) throw new Error("Cloud backup inventory contains an unsafe folder");
     if (!name || name !== path.basename(name) || /[\\/]/.test(name) || isSensitivePath(`${remote.area}/${folderId}/${name}`)) throw new Error("Cloud backup inventory contains an unsafe path");
     const entryPath = normalizeEntryPath(path.posix.join(remote.area, folderId === "root" ? "" : folderId, name));
+    if (restoreProviderOrphans.isSuppressed(folderId, name, remote.area, suppressionSnapshot)) continue;
     const key = collisionKey(entryPath);
     if (collisions.has(key) && collisions.get(key) !== entryPath) throw new Error("Backup entry collision");
     collisions.set(key, entryPath);
@@ -1157,7 +1173,7 @@ async function createBackup(options = {}) {
 
   try {
     sqliteSnapshot = await createSqliteSnapshot();
-    const collectionOptions = { stageDir, sqliteSnapshotPath: sqliteSnapshot?.snapshotPath };
+    const collectionOptions = { stageDir, sqliteSnapshotPath: sqliteSnapshot?.snapshotPath, suppressionSnapshot: restoreProviderOrphans.createSnapshot() };
     const files = await collectBackupFiles(collectionOptions);
     const totalSize = files.reduce((sum, file) => sum + file.size, 0);
     const manifest = {
@@ -1200,19 +1216,22 @@ async function createBackup(options = {}) {
     const durationMs = Date.now() - startedAt;
     const sizeBytes = fs.statSync(archivePath).size;
 
-    saved = backupRepository.saveBackup({
-      ...baseEntry,
-      status: "success",
-      finishedAt,
-      sizeBytes,
-      checksum,
-      metadata: {
-        ...baseEntry.metadata,
-        manifest: { ...manifest, duration_ms: durationMs },
-        includedFiles: files.length,
-        cloudComplete: Boolean(collectionOptions.cloudComplete),
-      },
-    });
+    const releaseSuppressionSnapshot = await restoreProviderOrphans.lockSnapshot(collectionOptions.suppressionSnapshot);
+    try {
+      saved = backupRepository.saveBackup({
+        ...baseEntry,
+        status: "success",
+        finishedAt,
+        sizeBytes,
+        checksum,
+        metadata: {
+          ...baseEntry.metadata,
+          manifest: { ...manifest, duration_ms: durationMs },
+          includedFiles: files.length,
+          cloudComplete: Boolean(collectionOptions.cloudComplete),
+        },
+      });
+    } finally { releaseSuppressionSnapshot(); }
 
     await cleanupRetention({ lockHeld: true });
     return saved;

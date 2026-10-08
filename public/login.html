@@ -30,7 +30,7 @@
       <div class="auth-card">
         <p class="eyebrow" id="login-eyebrow">ACESSO SEGURO</p>
         <h2 id="login-title">Entrar</h2>
-        <p class="auth-intro" id="login-intro">Use suas credenciais para acessar seu espaço.</p>
+        <p class="auth-intro" id="login-intro" aria-live="polite">Use suas credenciais para acessar seu espaço.</p>
         <p class="auth-error" id="auth-error" role="alert" aria-live="assertive"></p>
 
         <form class="auth-form" id="login-form" autocomplete="on">
@@ -73,6 +73,20 @@
           <button class="button button-primary" type="submit">Ativar autenticação</button>
           <button class="button button-quiet" id="cancel-enroll" type="button">Recomeçar acesso</button>
         </form>
+
+        <section class="auth-step" id="recovery-step" hidden aria-labelledby="recovery-step-title">
+          <div class="notice notice-info">
+            <span aria-hidden="true">i</span>
+            <span>Estes códigos só aparecem uma vez. Guarde-os em um local seguro separado do seu aplicativo de autenticação.</span>
+          </div>
+          <div class="field-row">
+            <h3 class="field-label" id="recovery-step-title" tabindex="-1">Códigos de recuperação</h3>
+            <label class="visually-hidden" for="recovery-codes">Códigos de recuperação de uso único</label>
+            <textarea class="field recovery-codes" id="recovery-codes" rows="5" readonly aria-describedby="recovery-code-help"></textarea>
+            <p class="field-help" id="recovery-code-help">Você pode selecionar e copiar os códigos. Cada código pode ser usado uma única vez.</p>
+          </div>
+          <button class="button button-primary" id="continue-after-enroll" type="button">Já guardei os códigos — continuar</button>
+        </section>
 
         <p class="auth-meta">Sua sessão é protegida e expira após até 8 horas.</p>
       </div>

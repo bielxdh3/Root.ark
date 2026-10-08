@@ -12,7 +12,7 @@ function isDbEnabled() {
 }
 
 function isJsonReadFallbackEnabled() {
-  return String(process.env.DB_READ_FALLBACK_JSON || "true").toLowerCase() !== "false";
+  return String(process.env.DB_READ_FALLBACK_JSON || "false").toLowerCase() === "true";
 }
 
 function isLegacyJsonWriteEnabled() {

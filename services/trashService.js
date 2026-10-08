@@ -500,10 +500,11 @@ function failRemoteDeletion(item, error, { clock, claimToken } = {}) {
   return trashRepository.saveTrashItem(item);
 }
 
-function cancelRemoteDeletion(item, reason = "cancelled", { clock } = {}) {
+function cancelRemoteDeletion(item, reason = "cancelled", { clock, status } = {}) {
   const previous = remoteState(item);
   if (!previous || ["completed", "cancelled"].includes(previous.state)) return item;
   const at = nowIso(clock);
+  if (status) item.status = status;
   item.metadata = { ...item.metadata, remoteDeletion: transition(previous, "cancelled", at, {
     cancellationReason: String(reason).slice(0, 120),
     nextAttemptAt: null,
@@ -513,24 +514,50 @@ function cancelRemoteDeletion(item, reason = "cancelled", { clock } = {}) {
   return trashRepository.saveTrashItem(item);
 }
 
-async function processRemoteDeletion({ item, provider, clock, leaseMs, workerId } = {}) {
+async function processRemoteDeletion({ item, provider, clock, leaseMs, workerId, runFileLifecycleMutation, runFolderLifecycleMutation, isReplacementActive } = {}) {
   if (typeof provider !== "function") throw new TypeError("Remote deletion provider is required");
-  const claim = claimRemoteDeletion({ item, clock, leaseMs, workerId });
-  if (!claim) return trashRepository.getTrashItem(item.id) || item;
-  try {
-    const current = trashRepository.getTrashItem(item.id) || claim.item;
-    const state = remoteState(current);
-    if (current.status !== "remote_delete_pending" || !state || state.state === "cancelled") return current;
-    const result = await provider(current);
-    // Provider remove operations are idempotent; false means the object was already absent.
-    return completeRemoteDeletion(current, { clock, claimToken: claim.token });
-  } catch (error) {
-    const current = trashRepository.getTrashItem(item.id) || claim.item;
-    if (failureCategory(error) === "missing_object") return completeRemoteDeletion(current, { clock, claimToken: claim.token });
-    return failRemoteDeletion(current, error, { clock, claimToken: claim.token });
-  } finally {
-    releaseRemoteClaim(claim);
+  const processLocked = async () => {
+    const latest = trashRepository.getTrashItem(item.id) || item;
+    const latestState = remoteState(latest);
+    if (latest.status === "remote_delete_pending" && latestState?.state === "cancelled") {
+      // Repair records written by older two-save cancellation logic. A cancelled
+      // deletion must not remain visible as retryable work after a restart. A
+      // replacement has superseded the trash record; a restore cancellation
+      // remains available in trash if its separate restore operation stopped.
+      latest.status = latestState.cancellationReason === "replacement_active" ? "permanently_deleted" : "trashed";
+      return trashRepository.saveTrashItem(latest);
+    }
+    if (latest.status !== "remote_delete_pending" || !latestState) return latest;
+    if (latest.itemType !== item.itemType || latest.originalFolderId !== item.originalFolderId || latest.originalFileName !== item.originalFileName) return latest;
+    if (typeof isReplacementActive === "function" && await isReplacementActive(latest)) {
+      return cancelRemoteDeletion(latest, "replacement_active", { clock, status: "permanently_deleted" });
+    }
+
+    const claim = claimRemoteDeletion({ item: latest, clock, leaseMs, workerId });
+    if (!claim) return trashRepository.getTrashItem(item.id) || latest;
+    try {
+      const current = trashRepository.getTrashItem(item.id) || claim.item;
+      const state = remoteState(current);
+      if (current.status !== "remote_delete_pending" || !state || state.state === "cancelled") return current;
+      await provider(current);
+      // Provider remove operations are idempotent; false means the object was already absent.
+      return completeRemoteDeletion(current, { clock, claimToken: claim.token });
+    } catch (error) {
+      const current = trashRepository.getTrashItem(item.id) || claim.item;
+      if (failureCategory(error) === "missing_object") return completeRemoteDeletion(current, { clock, claimToken: claim.token });
+      return failRemoteDeletion(current, error, { clock, claimToken: claim.token });
+    } finally {
+      releaseRemoteClaim(claim);
+    }
+  };
+
+  if (item.itemType === "file" && typeof runFileLifecycleMutation === "function") {
+    return runFileLifecycleMutation(item.originalFolderId, item.originalFileName, processLocked);
   }
+  if (item.itemType === "folder" && typeof runFolderLifecycleMutation === "function") {
+    return runFolderLifecycleMutation(item.originalFolderId, processLocked);
+  }
+  return processLocked();
 }
 
 function summary() {

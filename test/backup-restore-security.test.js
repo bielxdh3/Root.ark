@@ -101,7 +101,7 @@ test("backup and restore stay in the child runtime root", { timeout: 45_000 }, a
   fs.writeFileSync(path.join(sandbox, "data", "folders.json"), JSON.stringify([]));
 
   const port = await getUnusedPort();
-  const childEnv = { ...process.env, PORT: String(port), DB_ENABLED: "false", CLOUD_STORAGE_PROVIDER: "local", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_INCLUDE_TEMP: "false", BACKUP_RETENTION_COUNT: "20", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
+  const childEnv = { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_INCLUDE_TEMP: "false", BACKUP_RETENTION_COUNT: "20", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
   let child = spawn(process.execPath, [SERVER], { cwd: sandbox, env: childEnv, stdio: "ignore", windowsHide: true });
   const stopChild = async () => {
     if (child.exitCode === null) await new Promise((resolve) => {

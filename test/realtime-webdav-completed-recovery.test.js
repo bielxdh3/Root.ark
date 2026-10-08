@@ -42,7 +42,7 @@ async function ready(port) {
 }
 
 function serverEnv(port) {
-  return { ...process.env, PORT: String(port), DB_ENABLED: "false", WEBDAV_ENABLED: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
+  return { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
 }
 
 function createFixture({ phase = "cloud_complete", state = "completed", absent = [], terminal = false } = {}) {
@@ -209,6 +209,25 @@ test("terminal, retry-wait, and uncertain journals are preserved without rollbac
       fs.rmSync(fixture.dir, { recursive: true, force: true });
     });
   }
+});
+
+test("WebDAV MOVE status rejects non-canonical transaction UUIDs", { timeout: 20_000 }, async (t) => {
+  const fixture = createFixture();
+  const originalJournal = JSON.parse(fs.readFileSync(fixture.journalPath, "utf8"));
+  const { child, port } = await startServer(fixture.dir);
+  t.after(async () => { await stop(child); fs.rmSync(fixture.dir, { recursive: true, force: true }); });
+
+  const transactionId = "00000000-0000-0000-0000-000000000000";
+  const journalPath = path.join(path.dirname(fixture.journalPath), `rootark-webdav-move-${transactionId}.json`);
+  fs.writeFileSync(journalPath, JSON.stringify({ ...originalJournal, transactionId, journalPath }));
+
+  const body = JSON.stringify({ username: "agent", password: "password" });
+  const login = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
+  const cookie = login.headers["set-cookie"].map((item) => item.split(";", 1)[0]).join("; ");
+  const status = await request(port, `/webdav/moves/${transactionId}/status`, { headers: { cookie } });
+
+  assert.equal(status.status, 404);
+  assert.equal(status.body.includes(fixture.dir), false);
 });
 
 test("orphan transaction directory after journal deletion is cleaned without touching destination", { timeout: 20_000 }, async () => {

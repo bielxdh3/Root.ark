@@ -1,8 +1,49 @@
 # Root.ark Issue Ledger
 
-## Live roadmap reconciliation — 2026-10-01
+## Current live snapshot — 2026-10-07
 
-Evidence was checked against GitHub, with `Root/main` at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` as the reconciliation baseline. This current-state addendum supersedes older statements about live branch and issue/PR state; dated phase reports remain historical records.
+GitHub was queried with `Root/main` at `964f820417baf44f059a04e5363a2a172dccdc7a`, the merge commit for PR #113. This exact SHA passed the push-triggered Security Regression Linux full-validation and Windows syntax/tests jobs, CodeQL, and default-branch dependency review. The ordinary PR-only dependency-review job was skipped on the push. See the linked exact-SHA runs in [README.md](../README.md). This snapshot supersedes the dated snapshots below for live state; it is not candidate, browser, provider, deployment, or release acceptance.
+
+### Open issues
+
+| Item | Live state | Remaining acceptance boundary |
+|---|---|---|
+| #63 | `open` | Protected-index primitives do not complete search. UI population, FTS/advanced search, encrypted-index lifecycle, metadata-leakage acceptance, and full search acceptance remain open. |
+| #64 | `open` | Architecture and threat-model material exists; there is no functioning native Android client or Android CI. |
+| #65 | `open` | Root.ark is not end-to-end Zero-Knowledge: supported server paths can access plaintext. Upload, preview, scanning, sync/WebDAV, backup/restore, sharing, migration, recovery, authorization, and key lifecycle need full runtime acceptance. |
+| #66 | `open` | PR #97 is partial. The remote catalog transfers complete records before filtering; metadata-only listing, pagination, native Files On-Demand integration, safe eviction around external open-handle writers, and restart/reconnect acceptance remain incomplete. |
+| #67 | `open` | Backups and revision history do not provide burst detection, a pause/review barrier, protected history, recovery authorization, or deterministic recovery UX. |
+| #68 | `open` | Existing bearer links are not operation-scoped capabilities; least-privilege enforcement and recipient-key delivery remain incomplete. |
+| #94 | `open` | PR #95's process-local limiter does not establish shared/edge enforcement for multi-process deployments; production topology is unverified. |
+
+### Open pull requests
+
+| PR | Live state | Remaining boundary |
+|---|---|---|
+| #95 | `open`; head `95d99e4a934384fcfa2101dfc210741cd791a3d1`; base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; GitHub reports `DIRTY` | Exact-head CodeQL, dependency review, Ubuntu, and Windows checks passed on 2026-10-01. The branch is stale and has a dirty merge state; update and revalidate before considering merge. Keep #94 open until shared/edge enforcement or single-process deployment is established. |
+| #97 | `open`; head `a6a33a92cd6902f303254e60031da4bdc04cec04`; base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` | Exact-head checks passed on 2026-10-01, but the branch is stale and needs current-base review and validation. Selective-sync acceptance gaps in issue #66 remain. |
+| #99 | `open`; head `93249b2731e1bbe8aa930c5ce28c6183b9529fc4`; base `1955eab3d05f72632396eff62ef96d39eedd634b` | Its exact-head CodeQL, dependency review, Ubuntu, and Windows checks pass. Its snapshot predates this entry and requires reconciliation before merge. |
+| #102 | `open`; head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`; base `9de3c85ab59aa16fc46916abc0cf638c539086ef`; GitHub reports `UNSTABLE` | Analyze, dependency review, Ubuntu, and Windows checks pass; the separate CodeQL check fails. One unresolved, current review thread at `services/internalFile.js:31` flags a potential filesystem race. The branch needs current-base validation and review resolution. |
+
+### Merged pull requests since the 2026-10-06 snapshot
+
+| PR | Merge commit | Scope |
+|---|---|---|
+| #111 | `2259f3d76ae51bbc03ebaae1213f1328c30fbb52` | Restore migration restart-boundary regression coverage. |
+| #112 | `9de3c85ab59aa16fc46916abc0cf638c539086ef` | Atomically publish the server master key. |
+| #113 | `964f820417baf44f059a04e5363a2a172dccdc7a` | Restore focus after closing the Versions panel. |
+
+### Open dependency alert
+
+GitHub reports one open moderate Dependabot alert: `GHSA-hp3w-g68c-fv3c`, affecting transitive runtime dependency `sprintf-js` (denial of service through unbounded precision specifiers). This records alert state only; it does not assert a patched version is available.
+
+## Historical live snapshot — 2026-10-06
+
+The earlier reconciliation recorded `Root/main` at `1955eab3d05f72632396eff62ef96d39eedd634b`, after PR #109 merged. It documented open issues #63–68 and #94, open PRs #95, #97, and #102, and merged PRs #100–110. This is historical evidence; the 2026-10-07 snapshot above is the current live record. PR #99 carries the historical snapshot and is itself still open at the current snapshot.
+
+## Historical live-roadmap snapshot — 2026-10-01
+
+Evidence was checked against GitHub, with `Root/main` at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` as the reconciliation baseline. This was a snapshot at that time; it is retained for history and superseded for current state by the 2026-10-07 snapshot above.
 
 | Item | Live state | Evidence / boundary |
 |---|---|---|
@@ -22,7 +63,7 @@ Evidence was checked against GitHub, with `Root/main` at `d2ae0eb1c2fc87c1131a73
 
 PR #97 remains open and unmerged. PR #98 contains this documentation reconciliation; merging it does not close any issue. This section records implementation boundaries, not issue completion. Issue #64 has architecture/threat-model documentation only. Issue #65 has a fixture-only, read-only migration-inventory prototype and contract, but no live-data inventory or runtime migration. Issue #66 has a selective-sync implementation in PR #97; its current list API transfers full remote records including ciphertext before local filtering, so network payload transfer is not selective. Windows Files On-Demand UI/provider integration, a metadata-only catalog, and paginated remote listing are absent. The PR's lock patch fails closed when a lock path already exists; a crash can leave a marker requiring manual recovery after all sync processes using that root are stopped. Issues #67–68 have design/acceptance contracts only, with owner decisions still open.
 
-The older Phase 9–16 statuses below are evidence for their stated local scope, not acceptance of issues #63–68 or release approval. The historical statement that an unnamed associated PR remained Draft is superseded by the current PR state above; the available live open PR is #95 and PR #96 is merged.
+The older Phase 9–16 statuses below are evidence for their stated local scope, not acceptance of issues #63–68 or release approval. At the 2026-10-01 snapshot, the unnamed associated Draft-PR statement could not be mapped to a live PR; PR #95 was open and PR #96 was merged. The current PR state is listed at the top of this ledger.
 
 ## Fresh control evidence addendum — 2026-08-13
 

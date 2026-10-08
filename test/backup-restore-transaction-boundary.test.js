@@ -147,7 +147,7 @@ test("pre-image copy and tree hashing reject FIFO sources without blocking", (t)
   } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
 });
 
-function runFixture(body) {
+function runFixture(body, envOverrides = {}) {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-boundary-runtime-"));
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-boundary-quarantine-"));
   const script = `
@@ -175,6 +175,7 @@ function runFixture(body) {
     ROOTARK_RESTORE_INSTANCE_COUNT: "1",
     ROOTARK_INSTANCE_ID: "fixture-single",
     UPLOAD_QUARANTINE_DIR: quarantineDir,
+    ...envOverrides,
   };
   try {
     const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
@@ -196,6 +197,113 @@ test("invalid restore ids cannot delete paths outside the restore temp directory
     (async () => {
       await assert.rejects(restoreService.restoreBackup("../../../victim", { confirmation: "RESTORE" }), /Backup invalido/);
       assert.equal(fs.readFileSync(sentinelPath, "utf8"), "preserve unrelated data");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore does not persist restart-required until restored files are flushed", () => {
+  runFixture(`
+    write(path.join(dataDir, "runtime.json"), "archived-state");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const target = path.join(dataDir, "runtime.json");
+      write(target, "live-state");
+      const originalOpenSync = fs.openSync;
+      const originalFsyncSync = fs.fsyncSync;
+      const openedPaths = new Map();
+      let failed = false;
+      fs.openSync = function trackOpenedPath(pathname, ...args) {
+        const fd = originalOpenSync.call(this, pathname, ...args);
+        if (typeof pathname === "string") openedPaths.set(fd, path.resolve(pathname));
+        return fd;
+      };
+      fs.fsyncSync = function failRestoredTargetOnce(fd) {
+        if (!failed && openedPaths.get(fd) === path.resolve(target)) {
+          failed = true;
+          throw Object.assign(new Error("injected restored file flush failure"), { code: "EIO" });
+        }
+        return originalFsyncSync.call(this, fd);
+      };
+      try {
+        await assert.rejects(restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }), /injected restored file flush failure/);
+      } finally {
+        fs.openSync = originalOpenSync;
+        fs.fsyncSync = originalFsyncSync;
+      }
+      assert.equal(failed, true, "the restored data file must be flushed before the commit marker");
+      const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+      const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
+      assert.notEqual(coordinator.phase, "restart_required", "a failed restored-file flush must not commit the local restore");
+      assert.equal(restoreService.assertNoPendingWholeRestore().recovered, true);
+      assert.equal(fs.readFileSync(target, "utf8"), "live-state", "startup recovers the preimage after the failed flush");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore rejects a missing archived file instead of persisting restart-required", () => {
+  runFixture(`
+    write(path.join(dataDir, "runtime.json"), "archived-state");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const target = path.join(dataDir, "runtime.json");
+      write(target, "live-state");
+      await assert.rejects(restoreService.restoreBackup(backup.id, {
+        confirmation: "RESTORE",
+        failureInjector(step) {
+          if (step === "restore.data.copied") fs.rmSync(target, { force: true });
+        },
+      }), /durability target is missing/i);
+      const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+      assert.notEqual(JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).phase, "restart_required");
+      assert.equal(restoreService.assertNoPendingWholeRestore().recovered, true);
+      assert.equal(fs.readFileSync(target, "utf8"), "live-state");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("rollback does not persist rollback-complete until restored targets are flushed", () => {
+  runFixture(`
+    write(path.join(dataDir, "runtime.json"), "archived-state");
+    write(path.join(uploadsDir, "file.txt"), "archived-upload");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const target = path.join(uploadsDir, "file.txt");
+      write(path.join(dataDir, "runtime.json"), "live-state");
+      write(target, "live-upload");
+      await assert.rejects(restoreService.restoreBackup(backup.id, {
+        confirmation: "RESTORE",
+        failureInjector(step) { if (step === "restore.uploads.cleared") throw new Error("injected interruption"); },
+      }), /injected interruption/);
+      const originalOpenSync = fs.openSync;
+      const originalFsyncSync = fs.fsyncSync;
+      const openedPaths = new Map();
+      let failed = false;
+      fs.openSync = function trackOpenedPath(pathname, ...args) {
+        const fd = originalOpenSync.call(this, pathname, ...args);
+        if (typeof pathname === "string") openedPaths.set(fd, path.resolve(pathname));
+        return fd;
+      };
+      fs.fsyncSync = function failRollbackTargetOnce(fd) {
+        if (!failed && openedPaths.get(fd) === path.resolve(target)) {
+          failed = true;
+          throw Object.assign(new Error("injected rollback target flush failure"), { code: "EIO" });
+        }
+        return originalFsyncSync.call(this, fd);
+      };
+      try {
+        assert.throws(() => restoreService.assertNoPendingWholeRestore(), /rollback failed/i);
+      } finally {
+        fs.openSync = originalOpenSync;
+        fs.fsyncSync = originalFsyncSync;
+      }
+      assert.equal(failed, true, "rollback must flush restored payloads before recording completion");
+      const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+      assert.notEqual(JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).phase, "rollback_complete");
+      assert.equal(restoreService.assertNoPendingWholeRestore().recovered, true, "a later startup retries rollback after the transient flush failure");
+      assert.equal(fs.readFileSync(target, "utf8"), "live-upload");
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);
@@ -264,6 +372,8 @@ test("valid restore cleanup preserves unrelated restore temp siblings", () => {
 test("backup archives exclude whole-restore coordinator files", () => {
   runFixture(`
     write(path.join(dataDir, ".rootark-restore-coordinator.json"), JSON.stringify({ version: 1, phase: "prepared", backupId: "fixture" }));
+    write(path.join(dataDir, ".rootark-restore-provider-orphans.json"), JSON.stringify({ version: 1, objects: [{ area: "uploads", folderId: "root", name: "private-name.txt" }] }));
+    write(path.join(dataDir, ".rootark-restore-provider-orphans-state.json"), JSON.stringify({ version: 1, initializedAt: new Date().toISOString() }));
     write(path.join(dataDir, ".rootark-active-requests", "active.json"), JSON.stringify({ pid: 1 }));
     write(path.join(dataDir, ".rootark-restore-restart-acks", "transaction", "instance.json"), JSON.stringify({ transactionId: "fixture" }));
     (async () => {
@@ -271,6 +381,8 @@ test("backup archives exclude whole-restore coordinator files", () => {
       const { backup, archivePath } = backupService.getBackupOrThrow(created.id);
       const { zip } = await restoreService.validateBackupArchive(backup, archivePath);
       assert.equal(zip.files.some((entry) => entry.path.toLowerCase().startsWith("data/.rootark-restore-coordinator")), false);
+      assert.equal(zip.files.some((entry) => entry.path.toLowerCase() === "data/.rootark-restore-provider-orphans.json"), false, "restore-derived provider names are not copied into future backup archives");
+      assert.equal(zip.files.some((entry) => entry.path.toLowerCase() === "data/.rootark-restore-provider-orphans-state.json"), false, "restore policy state is not copied into future backup archives");
       assert.equal(zip.files.some((entry) => entry.path.toLowerCase().startsWith("data/.rootark-active-requests/")), false);
       assert.equal(zip.files.some((entry) => entry.path.toLowerCase().startsWith("data/.rootark-restore-restart-acks/")), false);
       console.log(JSON.stringify({ ok: true }));
@@ -280,6 +392,31 @@ test("backup archives exclude whole-restore coordinator files", () => {
 
 test("successful whole restore preserves both recovery records and blocks service until startup", () => {
   runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const legacyCloudStartup = {
+      restartRequired: true,
+      coordinator: { providerReconciliation: { backupId: "fixture", sync: { state: "pending" } } },
+    };
+    const ambiguousLegacyStartup = { restartRequired: true, coordinator: { providerReconciliation: [] } };
+    assert.equal(restoreService.requiresProviderOrphanPolicyAtStartup({
+      restartRequired: true,
+      coordinator: { providerPolicyRequired: true },
+    }), true, "the committed restore requirement survives a provider being disabled before restart");
+    assert.equal(restoreService.requiresProviderOrphanPolicyAtStartup({
+      restartRequired: true,
+      coordinator: { providerPolicyRequired: false },
+    }), false, "a local-only restore does not require cloud suppression state");
+    assert.equal(restoreService.requiresProviderOrphanPolicyAtStartup(legacyCloudStartup), true, "legacy cloud reconciliation remains fail-closed without its suppression policy");
+    assert.throws(() => providerOrphans.initialize({ requirePolicy: restoreService.requiresProviderOrphanPolicyAtStartup(legacyCloudStartup) }), /missing after cloud restore/);
+    assert.equal(fs.existsSync(providerOrphans.POLICY_PATH), false, "a legacy cloud restore cannot silently initialize an empty policy");
+    assert.equal(restoreService.requiresProviderOrphanPolicyAtStartup(ambiguousLegacyStartup), true, "an empty legacy reconciliation list cannot prove the provider inventory was not captured");
+    assert.throws(() => providerOrphans.initialize({ requirePolicy: restoreService.requiresProviderOrphanPolicyAtStartup(ambiguousLegacyStartup) }), /missing after cloud restore/);
+    assert.equal(fs.existsSync(providerOrphans.POLICY_PATH), false, "an ambiguous legacy restore cannot initialize an empty policy and unhide provider objects");
+    assert.equal(restoreService.requiresProviderOrphanPolicyAtStartup({
+      restartRequired: true,
+      coordinator: {},
+    }), true, "legacy pending coordinators fail closed when their provider requirement is unknown");
+    assert.equal(restoreService.requiresProviderOrphanPolicyAtStartup({ restartRequired: false }), false);
     write(path.join(dataDir, "runtime.json"), "backup-state");
     (async () => {
       const backup = await backupService.createBackup({ createdBy: "fixture" });
@@ -290,6 +427,7 @@ test("successful whole restore preserves both recovery records and blocks servic
       const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
       const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
       assert.equal(coordinator.phase, "restart_required");
+      assert.equal(coordinator.providerPolicyRequired, false);
       assert.equal(coordinator.directorySync, process.platform === "win32" ? "unsupported" : "fsync");
       assert.equal(coordinator.requiredRestartInstances, 1);
       assert.equal(coordinator.selectedBackup.id, backup.id);
@@ -589,6 +727,17 @@ test("abrupt whole-restore interruptions automatically roll back before startup 
     const assert=require("node:assert/strict");
     const fs=require("node:fs");
     const Database=require(${JSON.stringify(path.join(ROOT, "node_modules", "better-sqlite3"))});
+    const migrations=require(${JSON.stringify(path.join(ROOT, "db", "migrations.js"))});
+    const runMigrations=migrations.runMigrations;
+    migrations.runMigrations=(options)=>{
+      assert.equal(fs.readFileSync("data/runtime.json", "utf8"), "live-state", "whole-restore recovery completes before startup migrations");
+      assert.equal(fs.readFileSync("uploads/file.txt", "utf8"), "live-upload");
+      assert.equal(fs.readFileSync("quarantine/live.bin", "utf8"), "live-quarantine");
+      assert.equal(fs.existsSync("data/.rootark-restore-coordinator.json"), false);
+      const db=new Database(process.env.DATABASE_URL,{readonly:true});
+      try { assert.equal(db.prepare("SELECT value FROM proof").get().value,"live-state"); } finally { db.close(); }
+      return runMigrations(options);
+    };
     require(${JSON.stringify(path.join(ROOT, "server.js"))});
     setTimeout(() => {
       try {
@@ -620,6 +769,100 @@ test("abrupt whole-restore interruptions automatically roll back before startup 
     } finally {
       fs.rmSync(runtime, { recursive: true, force: true });
     }
+  }
+});
+
+test("abrupt exit during partial whole-restore pre-image creation cleans preparing state", { timeout: 30_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-partial-preimage-"));
+  const quarantineDir = path.join(runtime, "quarantine");
+  const env = {
+    ...process.env,
+    NODE_ENV: "test",
+    DB_ENABLED: "false",
+    BACKUP_ENABLED: "true",
+    BACKUP_INCLUDE_UPLOADS: "true",
+    BACKUP_INCLUDE_TEMP: "false",
+    BACKUP_RETENTION_COUNT: "20",
+    ROOTARK_RESTORE_INSTANCE_COUNT: "1",
+    ROOTARK_INSTANCE_ID: "partial-preimage-fixture",
+    UPLOAD_QUARANTINE_DIR: quarantineDir,
+  };
+  const runScript = `
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const backup = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+    const restore = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+    const write = (p, value) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, value); };
+    fs.mkdirSync("data", { recursive: true }); fs.mkdirSync("uploads", { recursive: true }); fs.mkdirSync(process.env.UPLOAD_QUARANTINE_DIR, { recursive: true });
+    write("data/quarantine.json", JSON.stringify({ items: [{ id: "archived", storedQuarantineFilename: "archived.bin" }] }));
+    write(path.join(process.env.UPLOAD_QUARANTINE_DIR, "archived.bin"), "archive payload");
+    (async () => {
+      const selected = await backup.createBackup({ createdBy: "fixture" });
+      write("data/runtime.json", "live state");
+      write("data/quarantine.json", JSON.stringify({ items: [{ id: "live", storedQuarantineFilename: "live.bin" }] }));
+      fs.rmSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "archived.bin"), { force: true });
+      write(path.join(process.env.UPLOAD_QUARANTINE_DIR, "live.bin"), "live payload");
+      await restore.restoreBackup(selected.id, { confirmation: "RESTORE", failureInjector(step) { if (step === "restore.preimage.quarantine-files.verified") process.exit(86); } });
+      process.exit(0);
+    })().catch((error) => { console.error(error); process.exit(1); });
+  `;
+  const recoverScript = `
+    const assert = require("node:assert/strict"); const fs = require("node:fs"); const path = require("node:path");
+    const restore = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+    const result = restore.assertNoPendingWholeRestore();
+    assert.equal(result.recovered, true);
+    assert.equal(fs.readFileSync("data/runtime.json", "utf8"), "live state");
+    assert.deepEqual(JSON.parse(fs.readFileSync("data/quarantine.json", "utf8")), { items: [{ id: "live", storedQuarantineFilename: "live.bin" }] });
+    assert.equal(fs.readFileSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "live.bin"), "utf8"), "live payload");
+    assert.equal(fs.existsSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "archived.bin")), false);
+    assert.equal(fs.existsSync("data/.rootark-restore-coordinator.json"), false);
+  `;
+  try {
+    const interrupted = spawnSync(process.execPath, ["-e", runScript], { cwd: runtime, env, encoding: "utf8", timeout: 20_000 });
+    assert.equal(interrupted.status, 86, interrupted.stderr || interrupted.stdout);
+    const coordinator = JSON.parse(fs.readFileSync(path.join(runtime, "data", ".rootark-restore-coordinator.json"), "utf8"));
+    assert.equal(coordinator.phase, "preparing");
+    assert.deepEqual(coordinator.preimageProgress, ["quarantine-files"]);
+    const recovered = spawnSync(process.execPath, ["-e", recoverScript], { cwd: runtime, env, encoding: "utf8", timeout: 20_000 });
+    assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+  } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
+});
+
+test("restart rolls back crashes inside quarantine journal and commit boundaries", { timeout: 60_000 }, () => {
+  const crashSteps = ["restore.quarantine.journal.persisted", "restore.quarantine.old-payload.moved", "restore.quarantine.new-payload.installed", "restore.quarantine.metadata.installed", "restore.quarantine.committed-marker.persisted"];
+  for (const crashStep of crashSteps) {
+    runFixture(`
+      const { spawnSync } = require("node:child_process");
+      const restorePath = require.resolve(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const metadataPath = path.join(dataDir, "quarantine.json");
+      const currentPayload = path.join(quarantineDir, "live.bin");
+      const archivedPayload = path.join(quarantineDir, "archived.bin");
+      write(metadataPath, JSON.stringify({ items: [{ id: "archived", storedQuarantineFilename: "archived.bin" }] }));
+      write(archivedPayload, "archive payload");
+      (async () => {
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        write(metadataPath, JSON.stringify({ items: [{ id: "live", storedQuarantineFilename: "live.bin" }] }));
+        fs.rmSync(archivedPayload, { force: true });
+        write(currentPayload, "live payload");
+        write(path.join(dataDir, "runtime.json"), "live state");
+        const crashScript = "const restore=require(" + JSON.stringify(restorePath) + ");restore.restoreBackup(" + JSON.stringify(backup.id) + ",{confirmation:'RESTORE',failureInjector(step){if(step===" + JSON.stringify(process.env.CRASH_STEP) + ")process.exit(86)}}).then(()=>process.exit(0)).catch(error=>{console.error(error);process.exit(1)});";
+        const crashed = spawnSync(process.execPath, ["-e", crashScript], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 20_000 });
+        assert.equal(crashed.status, 86, crashed.stderr || crashed.stdout);
+        const recoveryScript = [
+          "const assert=require('node:assert/strict'),fs=require('node:fs'),restore=require(" + JSON.stringify(restorePath) + ");",
+          "const result=restore.assertNoPendingWholeRestore();assert.equal(result.recovered,true);",
+          "assert.deepEqual(JSON.parse(fs.readFileSync(" + JSON.stringify(metadataPath) + ",'utf8')),{items:[{id:'live',storedQuarantineFilename:'live.bin'}]});",
+          "assert.equal(fs.readFileSync(" + JSON.stringify(currentPayload) + ",'utf8'),'live payload');",
+          "assert.equal(fs.existsSync(" + JSON.stringify(archivedPayload) + "),false);",
+          "assert.equal(fs.readFileSync('data/runtime.json','utf8'),'live state');",
+          "assert.equal(fs.existsSync('data/.rootark-quarantine-restore-journal.json'),false);",
+          "assert.equal(fs.existsSync('data/.rootark-restore-coordinator.json'),false);",
+        ].join(" ");
+        const recovered = spawnSync(process.execPath, ["-e", recoveryScript], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 20_000 });
+        assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+        console.log(JSON.stringify({ ok: true }));
+      })().catch(error => { console.error(error); process.exitCode = 1; });
+    `, { CRASH_STEP: crashStep });
   }
 });
 
@@ -711,11 +954,26 @@ test("corrupt rollback pre-image keeps the service fail-closed for manual recove
   `);
 });
 
-test("rollback write failure retains the durable barrier after partial recovery", () => {
+test("rollback write failure is retried from a verified pre-image on fresh startup", () => {
+  const recoveryScript = [
+    'const assert = require("node:assert/strict");',
+    'const fs = require("node:fs");',
+    'const path = require("node:path");',
+    `const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});`,
+    'const dataDir = path.join(process.cwd(), "data");',
+    'const uploadsDir = path.join(process.cwd(), "uploads");',
+    'const recovered = restoreService.assertNoPendingWholeRestore();',
+    'assert.equal(recovered.recovered, true);',
+    'assert.equal(restoreService.isWholeRestoreBlocked(), false);',
+    'assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "live-state");',
+    'assert.equal(fs.readFileSync(path.join(uploadsDir, "file.txt"), "utf8"), "live-upload");',
+    'console.log(JSON.stringify({ ok: true }));',
+  ].join("\n");
   runFixture(`
     write(path.join(dataDir, "runtime.json"), "archived-state");
     write(path.join(uploadsDir, "file.txt"), "archived-upload");
     (async () => {
+      const { spawnSync } = require("node:child_process");
       const backup = await backupService.createBackup({ createdBy: "fixture" });
       write(path.join(dataDir, "runtime.json"), "live-state");
       write(path.join(uploadsDir, "file.txt"), "live-upload");
@@ -723,13 +981,30 @@ test("rollback write failure retains the durable barrier after partial recovery"
         confirmation: "RESTORE",
         failureInjector(step) { if (step === "restore.uploads.cleared") throw new Error("injected interruption"); },
       }), /injected interruption/);
-      assert.throws(() => restoreService.assertNoPendingWholeRestore({
-        failureInjector(step) { if (step === "restore.rollback.uploads-tree.completed") throw new Error("injected rollback write failure"); },
-      }), /rollback failed/i);
+      const originalOpenSync = fs.openSync;
+      let failedRestoreWrite = false;
+      fs.openSync = function (pathname, flags, ...args) {
+        if (!failedRestoreWrite && typeof pathname === "string"
+          && pathname.startsWith(path.join(uploadsDir, "file.txt") + ".")
+          && pathname.endsWith(".restore-preimage") && flags === "wx") {
+          failedRestoreWrite = true;
+          const error = new Error("injected rollback storage write failure");
+          error.code = "EIO";
+          throw error;
+        }
+        return originalOpenSync.call(this, pathname, flags, ...args);
+      };
+      try {
+        assert.throws(() => restoreService.assertNoPendingWholeRestore(), /rollback failed/i);
+      } finally { fs.openSync = originalOpenSync; }
+      assert.equal(failedRestoreWrite, true, "the rollback failed while recreating the uploads tree");
       const coordinator = JSON.parse(fs.readFileSync(path.join(dataDir, ".rootark-restore-coordinator.json"), "utf8"));
       assert.equal(coordinator.phase, "manual_recovery");
       assert.equal(restoreService.isWholeRestoreBlocked(), true);
-      assert.throws(() => restoreService.assertNoPendingWholeRestore(), /manual recovery/i);
+      assert.equal(fs.existsSync(path.join(uploadsDir, "file.txt")), false, "the injected I/O failure leaves an incomplete tree behind the barrier");
+      const restarted = spawnSync(process.execPath, ["-e", ${JSON.stringify(recoveryScript)}], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 10_000 });
+      assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+      assert.equal(JSON.parse(restarted.stdout.trim().split(String.fromCharCode(10)).at(-1)).ok, true);
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);
@@ -1309,7 +1584,7 @@ test("startup checks whole-restore coordinator before WebDAV journal recovery", 
   }
 });
 
-test("server startup acknowledges restored state only once its listener binds and counts distinct instances", { timeout: 60_000 }, () => {
+test("declared multi-instance startup fails closed without acknowledging or touching a pending restore", { timeout: 60_000 }, () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-multi-instance-startup-"));
   const quarantineDir = path.join(runtime, "quarantine");
   const env = {
@@ -1324,53 +1599,31 @@ test("server startup acknowledges restored state only once its listener binds an
     ROOTARK_RESTORE_INSTANCE_COUNT: "2",
     ROOTARK_INSTANCE_ID: "replica-a",
   };
-  const setupScript = `
-    const fs = require("node:fs");
-    const path = require("node:path");
-    const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
-    const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
-    fs.mkdirSync("data", { recursive: true });
-    fs.mkdirSync("uploads", { recursive: true });
-    fs.mkdirSync(process.env.UPLOAD_QUARANTINE_DIR, { recursive: true });
-    fs.writeFileSync(path.join("data", "runtime.json"), "selected-state");
-    (async () => {
-      const backup = await backupService.createBackup({ createdBy: "fixture" });
-      fs.writeFileSync(path.join("data", "runtime.json"), "live-state");
-      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
-      console.log(JSON.stringify({ ok: true }));
-    })().catch((error) => { console.error(error); process.exitCode = 1; });
-  `;
-  const serverScript = `
-    require(${JSON.stringify(path.join(ROOT, "server.js"))});
-    setTimeout(() => process.exit(0), 150);
-  `;
+  const setupScript = "const fs=require('node:fs');\n"
+    + "const path=require('node:path');\n"
+    + "const backupService=require(" + JSON.stringify(path.join(ROOT, "services", "backupService")) + ");\n"
+    + "const restoreService=require(" + JSON.stringify(path.join(ROOT, "services", "restoreService")) + ");\n"
+    + "fs.mkdirSync('data',{recursive:true});fs.mkdirSync('uploads',{recursive:true});fs.mkdirSync(process.env.UPLOAD_QUARANTINE_DIR,{recursive:true});\n"
+    + "fs.writeFileSync(path.join('data','runtime.json'),'selected-state');\n"
+    + "(async()=>{const backup=await backupService.createBackup({createdBy:'fixture'});fs.writeFileSync(path.join('data','runtime.json'),'live-state');await restoreService.restoreBackup(backup.id,{confirmation:'RESTORE'});})().catch(error=>{console.error(error);process.exitCode=1;});";
+  const serverScript = "require(" + JSON.stringify(path.join(ROOT, "server.js")) + ");";
   try {
     const setup = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
     assert.equal(setup.status, 0, setup.stderr || setup.stdout);
     const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
     assert.equal(fs.existsSync(coordinatorPath), true);
 
-    for (const instanceId of ["replica-a", "replica-a"]) {
-      const started = spawnSync(process.execPath, ["-e", serverScript], {
-        cwd: runtime,
-        env: { ...env, ROOTARK_INSTANCE_ID: instanceId, JWT_SECRET: "j".repeat(48), PORT: "0", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" },
-        encoding: "utf8",
-        timeout: 30_000,
-      });
-      assert.equal(started.status, 0, started.stderr || started.stdout);
-      assert.match(started.stdout, /startup acknowledgement 1\/2/);
-      assert.equal(fs.existsSync(coordinatorPath), true, "a repeated instance identity must not release the gate");
-    }
-
-    const second = spawnSync(process.execPath, ["-e", serverScript], {
+    const started = spawnSync(process.execPath, ["-e", serverScript], {
       cwd: runtime,
-      env: { ...env, ROOTARK_INSTANCE_ID: "replica-b", JWT_SECRET: "j".repeat(48), PORT: "0", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" },
+      env: { ...env, JWT_SECRET: "j".repeat(48), PORT: "0", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" },
       encoding: "utf8",
       timeout: 30_000,
     });
-    assert.equal(second.status, 0, second.stderr || second.stdout);
-    assert.match(second.stdout, /startup acknowledgement 2\/2/);
-    assert.equal(fs.existsSync(coordinatorPath), false);
+    assert.notEqual(started.status, 0);
+    assert.match(started.stderr, /Multiple server instances are unsupported while authentication state is process-local/i);
+    assert.equal(fs.existsSync(coordinatorPath), true, "a refused app topology must preserve the pending restore coordinator");
+    assert.equal(fs.existsSync(path.join(runtime, "data", ".rootark-restore-restart-acks")), false);
+    assert.equal(fs.existsSync(path.join(runtime, "data", ".rootark-active-requests")), false);
   } finally {
     fs.rmSync(runtime, { recursive: true, force: true });
   }
@@ -1401,6 +1654,375 @@ test("provider reconciliation queued before local commit is removed when restore
       assert.equal(persisted.metadata.restoreSync, undefined);
       assert.equal(fs.existsSync(path.join(uploadsDir, "cloud.txt")), false);
       assert.equal(restoreService.isWholeRestoreBlocked(), false);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore suppresses provider objects absent from the selected backup and keeps the suppression after restart", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    let selectedBackup = false;
+    const cloud = {
+      enabled: () => true,
+      provider: "fixture",
+      inventory: async () => [
+        { provider: "s3", providerIdentity: "restored", area: "uploads", folderId: "root", name: "restored.txt" },
+        ...(selectedBackup ? [
+          { provider: "s3", providerIdentity: "orphan", area: "uploads", folderId: "root", name: "after-backup.txt" },
+          { provider: "s3", providerIdentity: "pending-orphan", area: "temp", folderId: "root", name: "pending-after-backup.txt" },
+        ] : []),
+      ],
+      download: async (_folderId, name, target) => { fs.writeFileSync(target, name === "restored.txt" ? "selected bytes" : "later bytes"); return true; },
+      upload: async () => {},
+    };
+    backupService.setCloudStorage(cloud);
+    restoreService.setCloudStorage(cloud);
+    (async () => {
+      write(path.join(uploadsDir, "restored.txt"), "selected bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      selectedBackup = true;
+      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.equal(restored.cloudSync.state, "pending");
+      const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+      const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
+      assert.equal(coordinator.providerPolicyRequired, true, "a cloud restore durably records the policy requirement before local commit");
+      const policyBytes = fs.readFileSync(providerOrphans.POLICY_PATH);
+      restoreService.setCloudStorage({ enabled: () => false });
+      fs.unlinkSync(providerOrphans.POLICY_PATH);
+      const startup = restoreService.assertNoPendingWholeRestore();
+      assert.equal(restoreService.requiresProviderOrphanPolicyAtStartup(startup), true,
+        "the startup requirement is based on the committed transaction even while the provider is disabled");
+      assert.throws(() => providerOrphans.initialize({ requirePolicy: restoreService.requiresProviderOrphanPolicyAtStartup(startup) }),
+        /policy.*missing/i, "disabled provider configuration cannot replace a missing committed suppression policy with an empty one");
+      fs.writeFileSync(providerOrphans.POLICY_PATH, policyBytes);
+      providerOrphans.initialize({ requirePolicy: restoreService.requiresProviderOrphanPolicyAtStartup(startup) });
+      restoreService.prepareWholeRestoreStartup();
+      assert.equal(restoreService.acknowledgeWholeRestoreInstance().complete, true);
+      const child = require("node:child_process").spawnSync(process.execPath, ["-e", "const fs=require('node:fs');const policy=JSON.parse(fs.readFileSync('data/.rootark-restore-provider-orphans.json','utf8'));process.stdout.write(JSON.stringify(policy));"], { cwd: process.cwd(), encoding: "utf8" });
+      assert.equal(child.status, 0, child.stderr);
+      assert.deepEqual(JSON.parse(child.stdout), {
+        version: 1,
+        objects: [
+          { area: "temp", folderId: "root", name: "pending-after-backup.txt" },
+          { area: "uploads", folderId: "root", name: "after-backup.txt" },
+        ],
+      });
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("incomplete cloud backups reconcile same-name provider objects before clearing their restore suppression", () => {
+  runFixture(`
+    const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+    const uploadPath = path.join(uploadsDir, "same-name.txt");
+    let remoteBytes = "stale provider bytes";
+    const cloud = {
+      enabled: () => true,
+      provider: "fixture",
+      inventory: async () => [{ provider: "s3", providerIdentity: "same-name-object", area: "uploads", folderId: "root", name: "same-name.txt" }],
+      download: async (_folderId, _name, target) => { fs.writeFileSync(target, remoteBytes); return true; },
+      upload: async (source, _folderId, _name, area) => {
+        assert.equal(area, "uploads");
+        remoteBytes = fs.readFileSync(source, "utf8");
+        return { provider: "fixture" };
+      },
+    };
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(uploadPath, "selected archive bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      assert.equal(backup.metadata.cloudComplete, false);
+      write(uploadPath, "live bytes before restore");
+      remoteBytes = "live bytes before restore";
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+
+      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.equal(fs.readFileSync(uploadPath, "utf8"), "selected archive bytes");
+      assert.equal(restored.cloudSync.state, "pending", "selected archive objects need durable reconciliation even when the provider inventory was incomplete at backup time");
+      assert.equal(JSON.parse(fs.readFileSync(policyPath, "utf8")).objects.some((entry) => entry.name === "same-name.txt"), true, "the stale provider object stays suppressed until the selected bytes are uploaded");
+
+      restoreService.prepareWholeRestoreStartup();
+      assert.equal(restoreService.acknowledgeWholeRestoreInstance().complete, true);
+      const retryAt = Date.parse("2026-10-07T14:00:00.000Z");
+      await restoreService.processRestoreSync({
+        backupId: backup.id,
+        workerId: "incomplete-backup-worker",
+        clock: () => retryAt,
+        uploader: { enabled: () => true, provider: "fixture", upload: async () => { throw new Error("injected provider outage"); } },
+      });
+      assert.equal(backupService.listBackups().find((entry) => entry.id === backup.id).metadata.restoreSync.entries[0].state, "retry_wait");
+      assert.equal(JSON.parse(fs.readFileSync(policyPath, "utf8")).objects.some((entry) => entry.name === "same-name.txt"), true, "a provider outage must not reveal stale bytes");
+
+      await restoreService.processRestoreSync({ backupId: backup.id, workerId: "incomplete-backup-retry", clock: () => retryAt + 1000, uploader: cloud });
+
+      assert.equal(remoteBytes, "selected archive bytes", "the selected archive is authoritative for the shared provider key");
+      assert.equal(JSON.parse(fs.readFileSync(policyPath, "utf8")).objects.some((entry) => entry.name === "same-name.txt"), false, "successful provider reconciliation releases the suppression");
+      assert.equal(backupService.listBackups().find((entry) => entry.id === backup.id).metadata.restoreSync.state, "completed");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore provider reconciliation remains retryable after five failures and restart", { timeout: 30_000 }, () => {
+  runFixture(`
+    const { spawnSync } = require("node:child_process");
+    const restorePath = require.resolve(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+    const backupRepositoryPath = require.resolve(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+    const uploadPath = path.join(uploadsDir, "retry-after-five.txt");
+    let remoteBytes = "live before restore";
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(uploadPath, "selected archive bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const cloud = {
+        enabled: () => true,
+        provider: "fixture",
+        inventory: async () => [{ provider: "fixture", providerIdentity: "retry-target", area: "uploads", folderId: "root", name: "retry-after-five.txt" }],
+        download: async (_folder, _name, target) => { write(target, remoteBytes); return true; },
+        upload: async () => { throw new Error("fixture provider outage"); },
+      };
+      write(uploadPath, "live before restore");
+      backupService.setCloudStorage(cloud); restoreService.setCloudStorage(cloud);
+      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.equal(restored.cloudSync.state, "pending");
+      restoreService.prepareWholeRestoreStartup();
+      assert.equal(restoreService.acknowledgeWholeRestoreInstance().complete, true);
+      let now = Date.parse("2026-10-07T14:00:00.000Z");
+      let latest;
+      for (let attempt = 1; attempt <= 5; attempt += 1) {
+        latest = await restoreService.processRestoreSync({ backupId: backup.id, workerId: "failure-" + attempt, clock: () => now, uploader: cloud });
+        const entry = latest.metadata.restoreSync.entries[0];
+        assert.equal(entry.attempts, attempt);
+        assert.equal(entry.state, "retry_wait", "provider reconciliation must remain resumable after every failed attempt");
+        assert.equal(restoreService.isWholeRestoreBlocked(), false);
+        assert.equal(JSON.parse(fs.readFileSync(policyPath, "utf8")).objects.some((value) => value.name === "retry-after-five.txt"), true, "failed provider writes must keep stale bytes suppressed");
+        now = Date.parse(entry.nextAttemptAt) + 1;
+      }
+      const retryAt = latest.metadata.restoreSync.entries[0].nextAttemptAt;
+      const repository = require(backupRepositoryPath);
+      const legacyTerminal = repository.mutateRestoreSyncEntry({
+        backupId: backup.id,
+        operationId: latest.metadata.restoreSync.operationId,
+        entryId: latest.metadata.restoreSync.entries[0].entryId,
+        expectedState: "retry_wait",
+        expectedLeaseToken: null,
+        expectedRevision: latest.metadata.restoreSync.revision,
+        mutate: (entry) => ({
+          entry: { ...entry, state: "terminal_failure", nextAttemptAt: null },
+          details: { failureCategory: "provider_error" },
+          at: new Date(now).toISOString(),
+        }),
+      });
+      assert.equal(legacyTerminal.metadata.restoreSync.state, "terminal_failure", "fixture represents a persisted pre-retry-format record");
+      const recoveryScript = [
+        "const assert=require('node:assert/strict'),fs=require('node:fs'),restore=require(" + JSON.stringify(restorePath) + "),repository=require(" + JSON.stringify(backupRepositoryPath) + ");",
+        "const provider={enabled:()=>true,provider:'fixture',inventory:async()=>[{area:'uploads',folderId:'root',name:'retry-after-five.txt'}],upload:async(source)=>fs.writeFileSync('data/provider-object.txt',fs.readFileSync(source))};",
+        "(async()=>{await restore.processRestoreSync({backupId:" + JSON.stringify(backup.id) + ",workerId:'after-five-restart',clock:()=>Date.parse(" + JSON.stringify(retryAt) + ")+1,uploader:provider});",
+        "const backup=repository.getBackup(" + JSON.stringify(backup.id) + ");assert.equal(backup.metadata.restoreSync.state,'completed');assert.equal(backup.metadata.restoreSync.entries[0].attempts,6);",
+        "assert.equal(fs.readFileSync('data/provider-object.txt','utf8'),'selected archive bytes');const policy=JSON.parse(fs.readFileSync('data/.rootark-restore-provider-orphans.json','utf8'));assert.equal(policy.objects.some(value=>value.name==='retry-after-five.txt'),false);",
+        "console.log(JSON.stringify({ok:true}));})().catch(error=>{console.error(error);process.exit(1)});",
+      ].join(" ");
+      const restarted = spawnSync(process.execPath, ["-e", recoveryScript], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 20_000 });
+      assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore keeps the existing fail-closed behavior for archives containing temp payloads", () => {
+  runFixture(`
+    const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(dataDir, "restore-state.json"), "archive state");
+      write(path.join(process.cwd(), "temp", "archived-pending.txt"), "pending archive bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "restore-state.json"), "live state");
+      write(policyPath, JSON.stringify({ version: 1, objects: [{ area: "uploads", folderId: "root", name: "prior-orphan.txt" }] }));
+      await assert.rejects(restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }), /Entrada nao permitida no backup: temp\\/archived-pending.txt/);
+      assert.equal(fs.readFileSync(path.join(dataDir, "restore-state.json"), "utf8"), "live state");
+      assert.deepEqual(JSON.parse(fs.readFileSync(policyPath, "utf8")).objects, [{ area: "uploads", folderId: "root", name: "prior-orphan.txt" }]);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `, { BACKUP_INCLUDE_TEMP: "true" });
+});
+
+test("cloud restore leaves newer local and provider pending bytes unchanged when the archive contains temp payloads", () => {
+  runFixture(`
+    const pendingPath = path.join(process.cwd(), "temp", "archived-pending.txt");
+    let providerBytes = "archive pending bytes";
+    const cloud = {
+      enabled: () => true,
+      provider: "fixture",
+      inventory: async () => [{ provider: "fixture", providerIdentity: "pending-object", area: "temp", folderId: "root", name: "archived-pending.txt" }],
+      download: async (_folderId, _name, target) => { write(target, providerBytes); return true; },
+      upload: async () => ({ provider: "fixture" }),
+    };
+    backupService.setCloudStorage(cloud);
+    restoreService.setCloudStorage(cloud);
+    (async () => {
+      write(pendingPath, providerBytes);
+      write(path.join(dataDir, "restore-state.json"), "archive state");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      assert.equal(backup.metadata.cloudComplete, true);
+      const unzipper = require(${JSON.stringify(path.join(ROOT, "node_modules", "unzipper"))});
+      const archive = await unzipper.Open.file(backupService.getBackupOrThrow(backup.id).archivePath);
+      const manifest = JSON.parse((await archive.files.find((entry) => entry.path === "backup-manifest.json").buffer()).toString("utf8"));
+      assert.ok(manifest.included_files.some((entry) => entry.path === "temp/archived-pending.txt"));
+
+      providerBytes = "newer live pending bytes";
+      write(pendingPath, providerBytes);
+      write(path.join(dataDir, "restore-state.json"), "live state");
+      await assert.rejects(restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }), /Entrada nao permitida no backup: temp\\/archived-pending.txt/);
+      assert.equal(fs.readFileSync(pendingPath, "utf8"), "newer live pending bytes");
+      assert.equal(providerBytes, "newer live pending bytes");
+      assert.equal(fs.readFileSync(path.join(dataDir, "restore-state.json"), "utf8"), "live state");
+      assert.equal(restoreService.assertNoPendingWholeRestore().reason, "no_pending_restore");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `, { BACKUP_INCLUDE_TEMP: "true" });
+});
+
+test("manifest-only temp paths cannot exempt live provider temp objects from restore suppression", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    let providerBytes = "newer provider pending bytes";
+    const cloud = {
+      enabled: () => true,
+      provider: "fixture",
+      inventory: async () => [{ provider: "fixture", providerIdentity: "pending-object", area: "temp", folderId: "root", name: "pending.txt" }],
+      download: async (_folderId, _name, target) => { write(target, providerBytes); return true; },
+      upload: async () => ({ provider: "fixture" }),
+    };
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(dataDir, "restore-state.json"), "selected archive state");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const stored = backupService.getBackupOrThrow(backup.id);
+      fs.rmSync(stored.archivePath);
+      await backupService.createZipArchive(stored.archivePath, {
+        backup_id: backup.id,
+        included_files: [{ path: "temp/pending.txt", size: 20 }],
+        cloud_complete: true,
+      }, []);
+      await backupRepository.saveBackup({ ...backup, checksum: null });
+
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.equal(restored.cloudSync.state, "not_required");
+      const policy = JSON.parse(fs.readFileSync(path.join(dataDir, ".rootark-restore-provider-orphans.json"), "utf8"));
+      assert.deepEqual(policy.objects, [{ area: "temp", folderId: "root", name: "pending.txt" }]);
+      assert.equal(providerBytes, "newer provider pending bytes");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore inventory failure aborts before local commit", () => {
+  runFixture(`
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(dataDir, "restore-state.json"), "backup state");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "restore-state.json"), "live state");
+      const failingCloud = {
+        enabled: () => true,
+        inventory: async () => { throw new Error("injected provider inventory outage"); },
+      };
+      backupService.setCloudStorage(failingCloud);
+      restoreService.setCloudStorage(failingCloud);
+      await assert.rejects(restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }), /injected provider inventory outage/);
+      assert.equal(fs.readFileSync(path.join(dataDir, "restore-state.json"), "utf8"), "live state");
+      assert.equal(fs.existsSync(path.join(dataDir, ".rootark-restore-provider-orphans.json")), false);
+      assert.equal(restoreService.assertNoPendingWholeRestore().reason, "no_pending_restore");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore rollback restores the prior provider-orphan suppression policy and state", () => {
+  runFixture(`
+    const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+    const statePath = path.join(dataDir, ".rootark-restore-provider-orphans-state.json");
+    const priorPolicy = JSON.stringify({ version: 1, objects: [{ area: "uploads", folderId: "root", name: "prior-orphan.txt" }] });
+    const priorState = JSON.stringify({ version: 1, initializedAt: "2026-01-01T00:00:00.000Z" });
+    write(policyPath, priorPolicy);
+    write(statePath, priorState);
+    const cloud = {
+      enabled: () => true,
+      provider: "fixture",
+      inventory: async () => [{ provider: "s3", providerIdentity: "restored", area: "uploads", folderId: "root", name: "restore.txt" }],
+      download: async (_folderId, _name, target) => { fs.writeFileSync(target, "archive bytes"); return true; },
+      upload: async () => {},
+    };
+    backupService.setCloudStorage(cloud);
+    restoreService.setCloudStorage(cloud);
+    (async () => {
+      write(path.join(uploadsDir, "restore.txt"), "archive bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      await assert.rejects(restoreService.restoreBackup(backup.id, {
+        confirmation: "RESTORE",
+        failureInjector(step) { if (step === "restore.provider-orphans.persisted") throw new Error("injected suppression commit failure"); },
+      }), /injected suppression commit failure/);
+      assert.equal(restoreService.assertNoPendingWholeRestore().recovered, true);
+      assert.equal(fs.readFileSync(policyPath, "utf8"), priorPolicy);
+      assert.equal(fs.readFileSync(statePath, "utf8"), priorState, "rollback restores the marker paired with the prior policy");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("abrupt exit after provider-orphan policy persistence restores pre-restore state on restart", () => {
+  runFixture(`
+    const childProcess = require("node:child_process");
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      const statePath = path.join(dataDir, "restore-state.json");
+      write(statePath, "backup state");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(statePath, "live state");
+      const quotedBackupId = JSON.stringify(backup.id);
+      const restoreCode = [
+        "const backupService = require(" + JSON.stringify(${JSON.stringify(path.join(ROOT, "services", "backupService"))}) + ");",
+        "const restoreService = require(" + JSON.stringify(${JSON.stringify(path.join(ROOT, "services", "restoreService"))}) + ");",
+        'const cloud = { enabled: () => true, provider: "fixture", inventory: async () => [{ area: "temp", folderId: "root", name: "post-backup-pending.txt" }] };',
+        'backupService.setCloudStorage(cloud);',
+        'restoreService.setCloudStorage(cloud);',
+        'restoreService.restoreBackup(' + quotedBackupId + ', { confirmation: "RESTORE", failureInjector(step) { if (step === "restore.provider-orphans.persisted") process.exit(86); } }).catch(() => process.exit(87));',
+      ].join("\\n");
+      const crashed = childProcess.spawnSync(process.execPath, ["-e", restoreCode], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
+      assert.equal(crashed.status, 86, crashed.stderr || crashed.stdout);
+      const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+      const policyStatePath = path.join(dataDir, ".rootark-restore-provider-orphans-state.json");
+      assert.equal(JSON.parse(fs.readFileSync(policyPath, "utf8")).objects.some((entry) => entry.area === "temp" && entry.name === "post-backup-pending.txt"), true, "the abrupt exit occurs after the new suppression policy is durable");
+      assert.equal(fs.existsSync(policyStatePath), true, "the marker is durable before the restore transaction advances");
+      const recoveryCode = [
+        'const fs = require("node:fs");',
+        "const restoreService = require(" + JSON.stringify(${JSON.stringify(path.join(ROOT, "services", "restoreService"))}) + ");",
+        'const result = restoreService.assertNoPendingWholeRestore();',
+        'const state = fs.readFileSync("data/restore-state.json", "utf8");',
+        'const policyExists = fs.existsSync("data/.rootark-restore-provider-orphans.json");',
+        'const policyStateExists = fs.existsSync("data/.rootark-restore-provider-orphans-state.json");',
+        'process.stdout.write(JSON.stringify({ result, state, policyExists, policyStateExists }));',
+      ].join("\\n");
+      const restarted = childProcess.spawnSync(process.execPath, ["-e", recoveryCode], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
+      assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+      const recovered = JSON.parse(restarted.stdout);
+      assert.equal(recovered.result.recovered, true);
+      assert.equal(recovered.state, "live state");
+      assert.equal(recovered.policyExists, false, "restart rolls back the newly persisted suppression with the other local preimages");
+      assert.equal(recovered.policyStateExists, false, "restart rolls back the newly persisted policy marker with the other local preimages");
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);
@@ -1493,10 +2115,11 @@ test("provider upload failure survives restart and retry keeps the provider obje
       assert.equal(restoreService.acknowledgeWholeRestoreInstance().complete, true);
 
       const initialNow = Date.now();
+      let failureClockCalls = 0;
       await restoreService.processRestoreSync({
         backupId: backup.id,
         workerId: "provider-failure-worker",
-        clock: () => initialNow,
+        clock: () => (failureClockCalls++ === 0 ? initialNow : initialNow + 30_000),
         uploader: { enabled: () => true, provider: "s3", upload: async () => { throw new Error("injected provider outage"); } },
       });
       let saved = require(backupRepositoryPath).getBackup(backup.id);
@@ -1505,7 +2128,8 @@ test("provider upload failure survives restart and retry keeps the provider obje
       assert.equal(entry.attempts, 1);
       assert.equal(entry.failureCategory, "provider_error");
       assert.equal(entry.leaseToken, null);
-      assert.equal(Date.parse(entry.nextAttemptAt), initialNow + 1000);
+      assert.equal(Date.parse(entry.nextAttemptAt), initialNow + 31_000, "backoff starts when provider failure is recorded, not before provider I/O");
+      const retryNow = Date.parse(entry.nextAttemptAt) + 1000;
 
       const worker = (workerNow, crashBeforeCompletion) => \`
         const assert = require("node:assert/strict");
@@ -1539,7 +2163,7 @@ test("provider upload failure survives restart and retry keeps the provider obje
           .then((result) => { assert.equal(result.metadata.restoreSync.entries[0].state, "completed"); })
           .catch((error) => { console.error(error); process.exitCode = 1; });
       \`;
-      const interrupted = spawnSync(process.execPath, ["-e", worker(initialNow + 2000, true)], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 10_000 });
+      const interrupted = spawnSync(process.execPath, ["-e", worker(retryNow, true)], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 10_000 });
       assert.equal(interrupted.status, 87, interrupted.stderr || interrupted.stdout);
       let providerState = JSON.parse(fs.readFileSync(providerStatePath, "utf8"));
       assert.equal(providerState.objects["uploads/root/provider-retry.txt"], Buffer.from("restored provider bytes").toString("base64"));
@@ -1548,7 +2172,7 @@ test("provider upload failure survives restart and retry keeps the provider obje
       assert.equal(entry.state, "in_progress", "the process interruption must leave a leased reconciliation for recovery");
       assert.equal(entry.attempts, 2);
 
-      const retried = spawnSync(process.execPath, ["-e", worker(initialNow + 5000, false)], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 10_000 });
+      const retried = spawnSync(process.execPath, ["-e", worker(retryNow + 3000, false)], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 10_000 });
       assert.equal(retried.status, 0, retried.stderr || retried.stdout);
       saved = require(backupRepositoryPath).getBackup(backup.id);
       entry = saved.metadata.restoreSync.entries[0];
@@ -1559,7 +2183,7 @@ test("provider upload failure survives restart and retry keeps the provider obje
       assert.deepEqual(Object.keys(providerState.objects), ["uploads/root/provider-retry.txt"], "retries overwrite one stable provider key");
       assert.equal(providerState.objects["uploads/root/provider-retry.txt"], Buffer.from("restored provider bytes").toString("base64"));
 
-      const repeated = spawnSync(process.execPath, ["-e", worker(initialNow + 6000, false)], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 10_000 });
+      const repeated = spawnSync(process.execPath, ["-e", worker(retryNow + 4000, false)], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 10_000 });
       assert.equal(repeated.status, 0, repeated.stderr || repeated.stdout);
       assert.equal(JSON.parse(fs.readFileSync(providerStatePath, "utf8")).requests, 2, "completed reconciliation must not upload again");
       console.log(JSON.stringify({ ok: true }));
