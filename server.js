@@ -64,7 +64,7 @@ const { registerGroupRoutes } = require("./src/routes/groups");
 const { createAuthenticate, createRealtimeAuthenticator, getClientIp, getExpectedOrigin, parseCookies } = require("./src/middlewares/auth");
 const { parseTrustedProxies } = require("./src/middlewares/trustedProxies");
 const { createRequirePermission } = require("./src/middlewares/permissions");
-const { validateTotpPolicy } = require("./src/services/totpPolicy");
+const { isTotpRequired, validateTotpPolicy } = require("./src/services/totpPolicy");
 const { getDeploymentReadiness, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
 
 const app = express();
@@ -1234,8 +1234,18 @@ function authenticateWebDavRequest(req, res) {
   }
 
   const user = loadUsers().find((entry) => sameUsername(entry.username, username));
-  if (!user || !bcrypt.compareSync(password, user.password)) {
+  if (!user || user.disabled || !bcrypt.compareSync(password, user.password)) {
     return sendWebDavUnauthorized(req, res, "invalid_credentials");
+  }
+
+  let totpPolicy;
+  try {
+    totpPolicy = validateTotpPolicy();
+  } catch {
+    return res.status(503).send("Authentication policy unavailable");
+  }
+  if (user.totpEnabled || isTotpRequired(user, totpPolicy)) {
+    return sendWebDavUnauthorized(req, res, "totp_required");
   }
 
   req.user = {
@@ -9276,6 +9286,7 @@ app.post("/share/:token/view", shareRateLimit, requireSameOriginPublicShareMutat
   res.json({
     ...getSharePublicPayload(access.link, access.fileInfo, access.limits),
     url: `/share/${shareToken}/file`,
+    urlMethod: "POST",
   });
 });
 
@@ -9328,11 +9339,13 @@ app.get("/share/:token/qr", shareRateLimit, async (req, res) => {
   }
 });
 
-app.get("/share/:token/file", shareRateLimit, async (req, res) => {
+app.get("/share/:token/file", shareRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).type("text/plain").send("Metodo nao permitido"));
+
+app.post("/share/:token/file", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
 
-  const access = await resolveShareAccess(req, res, shareToken, { requireViewer: true });
+  const access = await resolveShareAccess(req, res, shareToken, { requireViewer: true, countDownload: true });
   if (access.error) return res.status(access.status || 400).send(access.error);
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "inline", {

@@ -848,7 +848,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   });
   assert.equal(encryptedShare.status, 404, encryptedShare.body);
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/encrypted.txt"), false, "legacy encrypted share rejects before cache hydration");
-  for (const [route, method] of [["view", "POST"], ["download", "POST"], ["preview", "GET"], ["file", "GET"]]) {
+  for (const [route, method] of [["view", "POST"], ["download", "POST"], ["preview", "GET"], ["file", "POST"]]) {
     const sharedOrphan = await request(port, `/share/${restoreOrphanShareToken}/${route}`, {
       method,
       headers: method === "POST" ? { origin: `http://127.0.0.1:${port}` } : {},

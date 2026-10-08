@@ -157,6 +157,10 @@ For a reviewed deployment profile, set a strong `JWT_SECRET`, an explicit
 /health` is liveness-only; `GET /ready` returns `503` until these checks and
 the selected cloud-provider prerequisites pass. These endpoints do not require
 authentication and intentionally return no paths, credentials, or key data.
+WebDAV Basic authentication cannot complete a TOTP challenge and is rejected
+for accounts with TOTP enrolled or covered by a required TOTP policy; with
+`optional` policy, Basic authentication remains available only to accounts
+without enrolled TOTP.
 
 ## Architecture
 

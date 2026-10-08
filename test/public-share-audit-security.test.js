@@ -342,18 +342,20 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.equal(initialFailureElements.get("fileName").textContent, "Validacao indisponivel", "initial access failure has a neutral heading");
   const expiredPageToken = crypto.randomBytes(24).toString("hex");
   const expiredFileToken = crypto.randomBytes(24).toString("hex");
+  const countedFileToken = crypto.randomBytes(24).toString("hex");
   const publicLinksPath = path.join(dataDir, "public-links.json");
   fs.writeFileSync(publicLinksPath, JSON.stringify({
     [token]: JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[token],
     [expiredPageToken]: { folderId: "root", fileName, expiresAt: new Date(Date.now() - 60_000).toISOString(), views: 0, downloads: 0, activeViewers: {} },
     [expiredFileToken]: { folderId: "root", fileName, expiresAt: new Date(Date.now() - 60_000).toISOString(), views: 0, downloads: 0, activeViewers: {} },
+    [countedFileToken]: { folderId: "root", fileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, viewers: {} },
   }));
   const expiredPage = await request(port, `/share/${expiredPageToken}`);
   assert.equal(expiredPage.status, 410);
   assert.ok(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[expiredPageToken], "expired-link navigation does not persist cleanup");
-  const expiredFile = await request(port, `/share/${expiredFileToken}/file`);
+  const expiredFile = await request(port, `/share/${expiredFileToken}/file`, "POST", { origin: `http://127.0.0.1:${port}` });
   assert.equal(expiredFile.status, 410);
-  assert.ok(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[expiredFileToken], "expired-file GET does not persist cleanup");
+  assert.ok(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[expiredFileToken], "expired-file POST does not persist cleanup");
 
   const requestHeaders = {
     "user-agent": `audit-client-${token}`,
@@ -365,12 +367,32 @@ test("public-share audit logs correlate by token digest without storing the bear
   const unchangedAfterMissingOrigin = JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[token];
   assert.equal(unchangedAfterMissingOrigin.views, 0);
   assert.equal(unchangedAfterMissingOrigin.downloads, 0);
-  assert.equal((await request(port, `/share/${token}/view`, "POST", shareHeaders)).status, 200);
+  const view = await request(port, `/share/${token}/view`, "POST", shareHeaders);
+  assert.equal(view.status, 200);
+  assert.deepEqual(JSON.parse(view.body).url, `/share/${token}/file`);
+  assert.equal(JSON.parse(view.body).urlMethod, "POST", "the returned file URL identifies its required safe method");
   assert.equal((await request(port, `/share/${token}/view`, "POST", shareHeaders)).status, 200);
   assert.equal((await request(port, `/share/${token}/view`, "POST", {
     ...shareHeaders,
     origin: "https://attacker.example",
   })).status, 403);
+
+  const legacyFile = await request(port, `/share/${countedFileToken}/file`);
+  assert.equal(legacyFile.status, 405, "legacy GET file delivery is no longer reachable");
+  assert.equal(legacyFile.headers.allow, "POST");
+  const missingOriginFile = await request(port, `/share/${countedFileToken}/file`, "POST");
+  assert.equal(missingOriginFile.status, 403, "file delivery POST requires a same-origin request");
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[countedFileToken].downloads, 0);
+  const countedFile = await request(port, `/share/${countedFileToken}/file`, "POST", {
+    origin: `http://127.0.0.1:${port}`,
+  });
+  assert.equal(countedFile.status, 200);
+  assert.equal(countedFile.body, "disposable share fixture\n");
+  const exhaustedFile = await request(port, `/share/${countedFileToken}/file`, "POST", {
+    origin: `http://127.0.0.1:${port}`,
+  });
+  assert.equal(exhaustedFile.status, 410, "counted file delivery cannot exceed the download quota");
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[countedFileToken].downloads, 1);
 
   const legacyDownload = await request(port, `/share/${token}/download`, "GET", shareHeaders);
   assert.equal(legacyDownload.status, 405);

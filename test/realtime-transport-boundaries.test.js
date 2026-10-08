@@ -63,7 +63,7 @@ test("WebDAV HTTP boundary rejects unauthenticated, hostile, traversing, and inf
   fs.writeFileSync(path.join(dir, "uploads", "source.txt"), "source");
   fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
   const portNumber = await port();
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", TOTP_POLICY: "optional", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
   t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
   await ready(portNumber);
   const basic = `Basic ${Buffer.from("agent:password").toString("base64")}`;
@@ -87,6 +87,63 @@ test("WebDAV HTTP boundary rejects unauthenticated, hostile, traversing, and inf
   assert.equal((await request(portNumber, "/dav/source.txt", { method: "DELETE", headers: { authorization: basic } })).status, 405);
   assert.equal((await request(portNumber, "/dav/source.txt", { method: "MOVE", headers: { authorization: basic, destination: "/dav/target.txt" } })).status, 405);
   assert.equal(fs.existsSync(path.join(dir, "temp", "source.txt")), false);
+});
+
+test("WebDAV rejects disabled accounts for Basic-auth mutations", { timeout: 20_000 }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-disabled-user-"));
+  fs.mkdirSync(path.join(dir, "data"));
+  fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([
+    { username: "disabled", password: bcrypt.hashSync("password", 10), role: "admin", disabled: true, sessionVersion: 0 },
+  ]));
+  fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
+  const portNumber = await port();
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", TOTP_POLICY: "optional", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
+  t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
+  await ready(portNumber);
+  const basic = `Basic ${Buffer.from("disabled:password").toString("base64")}`;
+  const createFolder = await request(portNumber, "/dav/should-not-exist", { method: "MKCOL", headers: { authorization: basic } });
+  assert.equal(createFolder.status, 401);
+  assert.equal(fs.existsSync(path.join(dir, "uploads", "should-not-exist")), false);
+});
+
+test("WebDAV Basic auth cannot bypass a required TOTP policy", { timeout: 20_000 }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-totp-policy-"));
+  fs.mkdirSync(path.join(dir, "data"));
+  fs.mkdirSync(path.join(dir, "uploads"));
+  fs.writeFileSync(path.join(dir, "uploads", "source.txt"), "source");
+  fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([
+    { username: "admin", password: bcrypt.hashSync("admin-password", 10), role: "admin", permissions: {}, sessionVersion: 0 },
+    { username: "user", password: bcrypt.hashSync("user-password", 10), role: "user", permissions: { listFiles: true }, sessionVersion: 0 },
+  ]));
+  fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
+  const portNumber = await port();
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", TOTP_POLICY: "role-required", TOTP_REQUIRED_ROLES: "admin", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
+  t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
+  await ready(portNumber);
+  const adminBasic = `Basic ${Buffer.from("admin:admin-password").toString("base64")}`;
+  const userBasic = `Basic ${Buffer.from("user:user-password").toString("base64")}`;
+  assert.equal((await request(portNumber, "/dav/source.txt", { headers: { authorization: adminBasic } })).status, 401);
+  assert.equal((await request(portNumber, "/dav/source.txt", { headers: { authorization: userBasic } })).status, 200);
+});
+
+test("WebDAV Basic auth rejects enrolled TOTP users under optional policy", { timeout: 20_000 }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-enrolled-totp-"));
+  fs.mkdirSync(path.join(dir, "data"));
+  fs.mkdirSync(path.join(dir, "uploads"));
+  fs.writeFileSync(path.join(dir, "uploads", "source.txt"), "source");
+  fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([
+    { username: "enrolled", password: bcrypt.hashSync("enrolled-password", 10), role: "user", totpEnabled: true, permissions: { listFiles: true }, sessionVersion: 0 },
+    { username: "unenrolled", password: bcrypt.hashSync("unenrolled-password", 10), role: "user", permissions: { listFiles: true }, sessionVersion: 0 },
+  ]));
+  fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
+  const portNumber = await port();
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", TOTP_POLICY: "optional", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
+  t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
+  await ready(portNumber);
+  const enrolledBasic = `Basic ${Buffer.from("enrolled:enrolled-password").toString("base64")}`;
+  const unenrolledBasic = `Basic ${Buffer.from("unenrolled:unenrolled-password").toString("base64")}`;
+  assert.equal((await request(portNumber, "/dav/source.txt", { headers: { authorization: enrolledBasic } })).status, 401);
+  assert.equal((await request(portNumber, "/dav/source.txt", { headers: { authorization: unenrolledBasic } })).status, 200);
 });
 
 test("WebDAV enabled MOVE preserves same-folder files and fails closed for hostile destinations", { timeout: 20_000 }, async (t) => {
