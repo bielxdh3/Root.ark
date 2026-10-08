@@ -16,6 +16,14 @@ test("release gate recognizes missing modules and npm network failures", () => {
   assert.equal(isDependencyOrNetworkUnavailable("npm error code ENETUNREACH\nnpm error network request to https://registry.npmjs.org failed"), true);
 });
 
+test("release gate recognizes missing locked transitive imports from dependency code", () => {
+  assert.equal(isDependencyOrNetworkUnavailable("Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'gaxios' imported from /repo/node_modules/google-auth-library/build/src/auth/oauth2client.js", { resolvePackage: () => false }), true);
+});
+
+test("release gate does not treat a lockfile-only app import as a dependency block", () => {
+  assert.equal(isDependencyOrNetworkUnavailable("Error: Cannot find module 'accepts'\nRequire stack:\n- /repo/src/server.js\nnpm error code ECONNRESET", { resolvePackage: () => false }), false);
+});
+
 test("release gate treats unknown external imports as source failures, not environment blocks", () => {
   const missingInstalledPackage = () => false;
   assert.equal(isDependencyOrNetworkUnavailable("Error: Cannot find module 'rootark-release-gate-typo'\ncode: 'MODULE_NOT_FOUND'", { resolvePackage: missingInstalledPackage }), false);

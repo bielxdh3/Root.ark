@@ -1,6 +1,7 @@
 "use strict";
 
 const projectPackage = require("../package.json");
+const lockfile = require("../package-lock.json");
 const projectPackageName = projectPackage.name;
 const declaredPackageNames = new Set([
   ...Object.keys(projectPackage.dependencies || {}),
@@ -8,6 +9,11 @@ const declaredPackageNames = new Set([
   ...Object.keys(projectPackage.optionalDependencies || {}),
   ...Object.keys(projectPackage.peerDependencies || {}),
 ]);
+const lockedPackageNames = new Set(Object.keys(lockfile.packages || {}).flatMap((location) => {
+  const marker = "node_modules/";
+  const markerIndex = location.lastIndexOf(marker);
+  return markerIndex < 0 ? [] : [location.slice(markerIndex + marker.length)];
+}));
 const missingModulePattern = /(?:^|\n)(?:Error(?: \[ERR_MODULE_NOT_FOUND\])?:\s*)?Cannot find (?:module|package)\s+['"]([^'"]+)['"](?:(?: imported from )([^\r\n]+))?/gim;
 
 function packageNameFromSpecifier(specifier) {
@@ -33,10 +39,10 @@ function isLocalOrProjectSpecifier(specifier) {
   return isLocalOrBuiltinSpecifier || isProjectSelfReference;
 }
 
-function isImportedFromDeclaredPackage(importer) {
+function isImportedFromLockedPackage(importer) {
   if (!importer) return false;
   const normalizedImporter = String(importer).replace(/[\\/]+/g, "/").toLowerCase();
-  return Array.from(declaredPackageNames).some((packageName) => {
+  return Array.from(lockedPackageNames).some((packageName) => {
     const marker = `node_modules/${packageName}`.toLowerCase();
     const markerIndex = normalizedImporter.lastIndexOf(marker);
     if (markerIndex < 0) return false;
@@ -66,7 +72,7 @@ function isDependencyOrNetworkUnavailable(output, { resolvePackage = isResolvabl
     const packageName = packageNameFromSpecifier(specifier);
     if (!packageName) return false;
     if (declaredPackageNames.has(packageName)) return !resolvePackage(packageName);
-    return isImportedFromDeclaredPackage(importer) && !resolvePackage(packageName);
+    return lockedPackageNames.has(packageName) && isImportedFromLockedPackage(importer) && !resolvePackage(packageName);
   };
   const hasLocalModuleFailure = missingFailures.some(({ specifier }) => isLocalOrProjectSpecifier(specifier) || resolvePackage(specifier));
   const hasUnavailableDeclaredPackage = missingFailures.some(isDeclaredDependencyFailure);
