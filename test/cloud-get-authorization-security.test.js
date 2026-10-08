@@ -88,6 +88,18 @@ async function waitForNoActiveRequests(directory, timeoutMs = 15_000) {
   throw new Error(`active request leases did not clear within ${timeoutMs}ms; remaining leases: ${remaining.join(", ") || "none"}`);
 }
 
+async function waitForNoCloudUploadMutationRecords(directory, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const records = fs.existsSync(directory)
+      ? fs.readdirSync(directory).filter((name) => /^[a-f0-9]{64}\.json$/.test(name))
+      : [];
+    if (records.length === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`cloud upload mutation records did not drain within ${timeoutMs}ms`);
+}
+
 async function waitForActiveRequestCount(directory, expectedCount, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -1311,6 +1323,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const versionsPath = path.join(dataDir, "file-versions.json");
   const versionsAtRestoreLimit = fs.readFileSync(versionsPath, "utf8");
   await waitForNoActiveRequests(path.join(dataDir, ".rootark-active-requests"));
+  await waitForNoCloudUploadMutationRecords(path.join(dataDir, ".rootark-cloud-upload-mutations"));
   const providerGetsAtRestoreLimit = cloud.getObjects.length;
   const providerPutsAtRestoreLimit = cloud.putObjects.length;
   const limitedRestore = await request(port, `/restore/restore-limit.txt/v/${currentVersion - 1}`, {
