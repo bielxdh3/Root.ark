@@ -117,7 +117,16 @@ test("SQLite disaster-recovery meta-remediation matrix", async (t) => {
       const f = makeFixture(); try { assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "replacement.move.primary", simulateCrash: true })); assert.equal(restoreService.recoverDatabaseRestore(f.destinationPath).phase, "rolled_back"); assert.equal(restoreService.recoverDatabaseRestore(f.destinationPath).reason, "no_journal"); assert.equal(readValue(f.destinationPath), "old"); } finally { f.cleanup(); }
     }],
     ["21 committed journal cleanup is safe", () => {
-      const f = makeFixture(); try { assert.equal(restoreService.restoreDatabaseFiles(f.sourceRoot), true); const journalPath = restoreService.databaseJournalPath(f.destinationPath); const transactionId = crypto.randomUUID(); const journal = { version: 1, transactionId, destination: path.resolve(f.destinationPath), journalPath, stagePrefix: `${f.destinationPath}.restore-stage-${transactionId}`, rollbackPrefix: `${f.destinationPath}.restore-rollback-${transactionId}`, phase: "committed", originalPresent: { "": true, "-wal": false, "-shm": false }, stagedPresent: { "": true, "-wal": false, "-shm": false }, completedOperations: [] }; fs.writeFileSync(journalPath, JSON.stringify(journal)); assert.equal(restoreService.recoverDatabaseRestore(f.destinationPath).phase, "committed"); assert.equal(readValue(f.destinationPath), "new"); } finally { f.cleanup(); }
+      const f = makeFixture(); try {
+        const originalSha256 = { "": crypto.createHash("sha256").update(fs.readFileSync(f.destinationPath)).digest("hex"), "-wal": null, "-shm": null };
+        assert.equal(restoreService.restoreDatabaseFiles(f.sourceRoot), true);
+        const journalPath = restoreService.databaseJournalPath(f.destinationPath);
+        const transactionId = crypto.randomUUID();
+        const journal = { version: 1, transactionId, destination: path.resolve(f.destinationPath), journalPath, stagePrefix: `${f.destinationPath}.restore-stage-${transactionId}`, rollbackPrefix: `${f.destinationPath}.restore-rollback-${transactionId}`, phase: "committed", originalPresent: { "": true, "-wal": false, "-shm": false }, stagedPresent: { "": true, "-wal": false, "-shm": false }, originalSha256, completedOperations: [] };
+        fs.writeFileSync(journalPath, JSON.stringify(journal));
+        assert.equal(restoreService.recoverDatabaseRestore(f.destinationPath).phase, "committed");
+        assert.equal(readValue(f.destinationPath), "new");
+      } finally { f.cleanup(); }
     }],
     ["22 malformed journal fails closed", () => {
       const f = makeFixture(); try { fs.writeFileSync(restoreService.databaseJournalPath(f.destinationPath), "{"); assert.throws(() => restoreService.recoverDatabaseRestore(f.destinationPath), /Journal SQLite invalido/); assert.equal(readValue(f.destinationPath), "old"); } finally { f.cleanup(); }

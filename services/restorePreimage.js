@@ -2,7 +2,8 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const FORMAT_VERSION = 1;
+const LEGACY_FORMAT_VERSION = 1;
+const FORMAT_VERSION = 2;
 const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;
 const COPY_BUFFER_SIZE = 1024 * 1024;
@@ -126,8 +127,9 @@ function walkTree(root, excludedPath = null) {
 function snapshotTree(destination, snapshotRoot, excludedPath = null) {
   let rootStat;
   try { rootStat = fs.lstatSync(destination); }
-  catch (error) { if (error.code === "ENOENT") return { existed: false, entries: [] }; throw error; }
+  catch (error) { if (error.code === "ENOENT") return { existed: false, rootMode: null, entries: [] }; throw error; }
   if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error("Restore pre-image destination root is not a safe directory");
+  const rootMode = rootStat.mode & 0o777;
   ensureSafeDirectory(snapshotRoot, { create: true });
   const entries = walkTree(destination, excludedPath);
   for (const entry of entries) {
@@ -142,7 +144,7 @@ function snapshotTree(destination, snapshotRoot, excludedPath = null) {
     }
   }
   verifyTree(snapshotRoot, entries);
-  return { existed: true, entries };
+  return { existed: true, rootMode, entries };
 }
 
 function verifyTree(root, entries) {
@@ -240,11 +242,15 @@ function syncTree(root) {
   syncDirectory(path.dirname(root));
 }
 
-function restoreTree(destination, snapshotRoot, snapshot, transactionId) {
+function restoreTree(destination, snapshotRoot, snapshot, transactionId, options = {}) {
   if (!snapshot.existed) {
     removeTree(destination);
     syncDirectory(path.dirname(destination));
     return;
+  }
+  const legacyManifest = options.legacyManifest === true;
+  if (!legacyManifest && (!Number.isSafeInteger(snapshot.rootMode) || snapshot.rootMode < 0 || snapshot.rootMode > 0o777)) {
+    throw new Error("Restore pre-image tree root mode is invalid");
   }
   verifyTree(snapshotRoot, snapshot.entries);
   ensureSafeDirectory(path.dirname(destination), { create: true });
@@ -268,6 +274,9 @@ function restoreTree(destination, snapshotRoot, snapshot, transactionId) {
       catch (error) { fs.rmSync(target, { force: true }); fs.renameSync(temporary, target); }
       try { fs.chmodSync(target, entry.mode); } catch (error) { if (process.platform !== "win32") throw error; }
     }
+  }
+  if (!legacyManifest) {
+    try { fs.chmodSync(destination, snapshot.rootMode); } catch (error) { if (process.platform !== "win32") throw error; }
   }
   syncTree(destination);
 }
@@ -331,7 +340,7 @@ function readManifest(manifestPath, expectedHash, transactionId) {
   const actualHash = crypto.createHash("sha256").update(contents).digest("hex");
   if (actualHash !== expectedHash) throw new Error("Restore pre-image manifest failed integrity verification");
   const manifest = JSON.parse(contents);
-  if (manifest.version !== FORMAT_VERSION || manifest.transactionId !== transactionId || !Array.isArray(manifest.domains)) {
+  if (![LEGACY_FORMAT_VERSION, FORMAT_VERSION].includes(manifest.version) || manifest.transactionId !== transactionId || !Array.isArray(manifest.domains)) {
     throw new Error("Restore pre-image manifest is invalid");
   }
   return manifest;
@@ -339,6 +348,7 @@ function readManifest(manifestPath, expectedHash, transactionId) {
 
 module.exports = {
   FORMAT_VERSION,
+  LEGACY_FORMAT_VERSION,
   copyVerifiedFile,
   ensureSafeDirectory,
   hashFile,

@@ -17,7 +17,8 @@ const RESTORE_SYNC_LOCK_DIR = resolveRuntimePath("data", "restore-sync-locks");
 const WHOLE_RESTORE_COORDINATOR_PATH = resolveRuntimePath("data", ".rootark-restore-coordinator.json");
 const WHOLE_RESTORE_ACK_ROOT = resolveRuntimePath("data", ".rootark-restore-restart-acks");
 const RESTORABLE_ROOTS = new Set(["data", "uploads"]);
-const WHOLE_RESTORE_COORDINATOR_VERSION = 3;
+const LEGACY_WHOLE_RESTORE_COORDINATOR_VERSION = 3;
+const WHOLE_RESTORE_COORDINATOR_VERSION = 4;
 const MAX_RESTORE_SYNC_RETRY_DELAY_MS = 60 * 60 * 1000;
 const PROVIDER_CONTEXT_BINDING = Symbol("restore-provider-context-binding");
 const S_IFMT = 0xf000;
@@ -49,6 +50,10 @@ function writeWholeRestoreCoordinator(coordinator) {
     throw error;
   }
   return persisted;
+}
+
+function hasWholeRestorePreimages(version) {
+  return [LEGACY_WHOLE_RESTORE_COORDINATOR_VERSION, WHOLE_RESTORE_COORDINATOR_VERSION].includes(version);
 }
 
 function configuredRestartInstanceCount() {
@@ -262,7 +267,11 @@ function createWholeRestorePreimages(coordinator, extractedRoot, quarantinePlan,
 
 function validateWholeRestorePreimages(coordinator, manifest) {
   const preimageRoot = wholeRestorePreimageRoot(coordinator.transactionId);
-  if (!manifest || manifest.version !== restorePreimage.FORMAT_VERSION || manifest.transactionId !== coordinator.transactionId
+  const legacyManifest = coordinator.version === LEGACY_WHOLE_RESTORE_COORDINATOR_VERSION
+    && manifest?.version === restorePreimage.LEGACY_FORMAT_VERSION;
+  const currentManifest = coordinator.version === WHOLE_RESTORE_COORDINATOR_VERSION
+    && manifest?.version === restorePreimage.FORMAT_VERSION;
+  if (!manifest || (!legacyManifest && !currentManifest) || manifest.transactionId !== coordinator.transactionId
     || !Array.isArray(manifest.domains) || !manifest.plan || !Array.isArray(manifest.plan.domains) || !Array.isArray(manifest.plan.dataFiles)
     || JSON.stringify(manifest.plan) !== JSON.stringify(coordinator.preimagePlan)
     || [...manifest.plan.domains].sort().join("\n") !== [...new Set(manifest.plan.domains)].sort().join("\n")) {
@@ -306,7 +315,13 @@ function validateWholeRestorePreimages(coordinator, manifest) {
       }
     } else if (domain.name === "uploads-tree" || domain.name === "quarantine-tree") {
       const target = domain.name === "uploads-tree" ? uploadsRoot : quarantineRoot;
-      if (domain.kind !== "tree" || path.resolve(domain.root) !== target || !domain.snapshot || typeof domain.snapshot.existed !== "boolean" || !Array.isArray(domain.snapshot.entries)) throw new Error("Whole-restore directory pre-image is invalid");
+      const rootModeMatchesFormat = legacyManifest
+        ? domain.snapshot?.rootMode === undefined
+        : (domain.snapshot?.existed
+          ? Number.isSafeInteger(domain.snapshot.rootMode) && domain.snapshot.rootMode >= 0 && domain.snapshot.rootMode <= 0o777
+          : domain.snapshot?.rootMode === null);
+      if (domain.kind !== "tree" || path.resolve(domain.root) !== target || !domain.snapshot || typeof domain.snapshot.existed !== "boolean" || !Array.isArray(domain.snapshot.entries)
+        || !rootModeMatchesFormat) throw new Error("Whole-restore directory pre-image is invalid");
       if (domain.snapshot.existed) restorePreimage.verifyTree(snapshotRoot, domain.snapshot.entries);
       else if (domain.snapshot.entries.length) throw new Error("Whole-restore absent directory pre-image has entries");
     } else throw new Error("Whole-restore pre-image has an unknown domain");
@@ -320,7 +335,7 @@ function recoverWholeRestorePreimages(coordinator, options = {}) {
   const completed = [];
   try {
     const current = readWholeRestoreCoordinator();
-    if (!current || current.transactionId !== coordinator.transactionId || current.version !== WHOLE_RESTORE_COORDINATOR_VERSION
+    if (!current || current.transactionId !== coordinator.transactionId || !hasWholeRestorePreimages(current.version)
       || !["prepared", "rolling_back", "manual_recovery"].includes(current.phase)) throw new Error("Whole-restore coordinator changed during recovery");
     const preimageRoot = wholeRestorePreimageRoot(current.transactionId);
     manifest = restorePreimage.readManifest(path.join(preimageRoot, "manifest.json"), current.preimageHash, current.transactionId);
@@ -335,7 +350,7 @@ function recoverWholeRestorePreimages(coordinator, options = {}) {
     for (const domain of [...manifest.domains].reverse()) {
       recovering = updateWholeRestoreCoordinator(recovering, { rollbackDomain: domain.name });
       const snapshotRoot = path.join(preimageRoot, domain.name);
-      if (domain.kind === "tree") restorePreimage.restoreTree(domain.root, snapshotRoot, domain.snapshot, current.transactionId);
+      if (domain.kind === "tree") restorePreimage.restoreTree(domain.root, snapshotRoot, domain.snapshot, current.transactionId, { legacyManifest: manifest.version === restorePreimage.LEGACY_FORMAT_VERSION });
       else restorePreimage.restoreFileSet(domain.files, snapshotRoot, current.transactionId);
       completed.push(domain.name);
       recovering = updateWholeRestoreCoordinator(recovering, { rollbackProgress: completed });
@@ -347,7 +362,9 @@ function recoverWholeRestorePreimages(coordinator, options = {}) {
       rollbackProgress: completed,
     });
     completeWholeRestoreCoordinator(recovering);
-    return { recovered: true, transactionId: current.transactionId };
+    const legacyRootModeUnverifiable = manifest.version === restorePreimage.LEGACY_FORMAT_VERSION
+      && manifest.domains.some((domain) => domain.kind === "tree" && domain.snapshot.existed);
+    return { recovered: true, transactionId: current.transactionId, legacyRootModeUnverifiable };
   } catch (error) {
     const current = readWholeRestoreCoordinator();
     const allDomainsRestored = Array.isArray(manifest?.domains)
@@ -362,7 +379,7 @@ function recoverWholeRestorePreimages(coordinator, options = {}) {
 function assertNoPendingWholeRestore(options = {}) {
   const coordinator = readWholeRestoreCoordinator();
   if (!coordinator) return { recovered: false, reason: "no_pending_restore" };
-  if (![2, WHOLE_RESTORE_COORDINATOR_VERSION].includes(coordinator.version)
+  if (![2, LEGACY_WHOLE_RESTORE_COORDINATOR_VERSION, WHOLE_RESTORE_COORDINATOR_VERSION].includes(coordinator.version)
     || !["preparing", "prepared", "rolling_back", "rollback_complete", "manual_recovery", "restart_required"].includes(coordinator.phase)
     || !coordinator.backupId
     || !/^[a-f0-9-]{36}$/i.test(String(coordinator.transactionId || ""))
@@ -374,7 +391,7 @@ function assertNoPendingWholeRestore(options = {}) {
   if (coordinator.phase === "restart_required" && coordinator.preRestoreBackupId) {
     return { recovered: false, restartRequired: true, coordinator };
   }
-  if (coordinator.version === WHOLE_RESTORE_COORDINATOR_VERSION && coordinator.phase === "preparing") {
+  if (hasWholeRestorePreimages(coordinator.version) && coordinator.phase === "preparing") {
     const release = backupService.acquireLock("restore-preparation-recovery");
     try {
       const current = readWholeRestoreCoordinator();
@@ -384,10 +401,10 @@ function assertNoPendingWholeRestore(options = {}) {
       return { recovered: true, reason: "incomplete_preimage_preparation" };
     } finally { release(); }
   }
-  if (coordinator.version === WHOLE_RESTORE_COORDINATOR_VERSION && ["prepared", "rolling_back", "manual_recovery"].includes(coordinator.phase)) {
+  if (hasWholeRestorePreimages(coordinator.version) && ["prepared", "rolling_back", "manual_recovery"].includes(coordinator.phase)) {
     return recoverWholeRestorePreimages(coordinator, options);
   }
-  if (coordinator.version === WHOLE_RESTORE_COORDINATOR_VERSION && coordinator.phase === "rollback_complete") {
+  if (hasWholeRestorePreimages(coordinator.version) && coordinator.phase === "rollback_complete") {
     const release = backupService.acquireLock("restore-rollback-cleanup");
     try {
       const current = readWholeRestoreCoordinator();
@@ -412,7 +429,7 @@ function completeWholeRestoreCoordinator(expectedCoordinator = null) {
   cleanupRestoreExtraction(current.backupId);
   const ackDirectory = path.join(WHOLE_RESTORE_ACK_ROOT, current.transactionId);
   fs.rmSync(ackDirectory, { recursive: true, force: true });
-  if (current.version === WHOLE_RESTORE_COORDINATOR_VERSION) {
+  if (hasWholeRestorePreimages(current.version)) {
     const removed = cleanupWholeRestorePreimages(current.transactionId);
     if (current.phase === "rolling_back" && !removed) throw new Error("Whole-restore rollback pre-image disappeared before cleanup");
   }
@@ -424,7 +441,7 @@ function completeWholeRestoreCoordinator(expectedCoordinator = null) {
 function prepareWholeRestoreStartup() {
   const coordinator = readWholeRestoreCoordinator();
   if (!coordinator) return false;
-  if (![2, WHOLE_RESTORE_COORDINATOR_VERSION].includes(coordinator.version)
+  if (![2, LEGACY_WHOLE_RESTORE_COORDINATOR_VERSION, WHOLE_RESTORE_COORDINATOR_VERSION].includes(coordinator.version)
     || coordinator.phase !== "restart_required"
     || !coordinator.backupId
     || !coordinator.preRestoreBackupId
@@ -450,7 +467,7 @@ function prepareWholeRestoreStartup() {
 function acknowledgeWholeRestoreInstance(explicitInstanceId) {
   const coordinator = readWholeRestoreCoordinator();
   if (!coordinator) return { acknowledgedInstances: 0, requiredInstances: 0, complete: true };
-  if (![2, WHOLE_RESTORE_COORDINATOR_VERSION].includes(coordinator.version) || coordinator.phase !== "restart_required") {
+  if (![2, LEGACY_WHOLE_RESTORE_COORDINATOR_VERSION, WHOLE_RESTORE_COORDINATOR_VERSION].includes(coordinator.version) || coordinator.phase !== "restart_required") {
     throw new Error("Whole-restore recovery is pending; startup blocked for manual recovery");
   }
   const requiredInstances = Number(coordinator.requiredRestartInstances);
@@ -1824,7 +1841,8 @@ function validateDatabase(pathname) {
 }
 
 const SQLITE_SUFFIXES = ["", "-wal", "-shm"];
-const RESTORE_JOURNAL_VERSION = 1;
+const LEGACY_RESTORE_JOURNAL_VERSION = 1;
+const RESTORE_JOURNAL_VERSION = 2;
 
 function databaseJournalPath(destinationPath) {
   return `${destinationPath}.restore-journal.json`;
@@ -1886,7 +1904,7 @@ function readRestoreJournal(destinationPath) {
     throw new Error(`Journal SQLite invalido; recuperacao interrompida: ${error.message}`);
   }
   const expectedDestination = path.resolve(destinationPath);
-  if (journal.version !== RESTORE_JOURNAL_VERSION ||
+  if (![LEGACY_RESTORE_JOURNAL_VERSION, RESTORE_JOURNAL_VERSION].includes(journal.version) ||
       journal.destination !== expectedDestination ||
       !/^[a-f0-9-]{36}$/i.test(String(journal.transactionId || "")) ||
       !journal.stagePrefix || !journal.rollbackPrefix ||
@@ -1930,7 +1948,7 @@ function recordOperation(journal, operation) {
   writeRestoreJournal(journal);
 }
 
-function validateJournalArtifacts(journal) {
+function validateJournalArtifacts(journal, { allowLegacyCommittedWithoutOriginalHash = false } = {}) {
   const expected = new Set(SQLITE_SUFFIXES);
   for (const suffix of Object.keys(journal.originalPresent || {})) {
     if (!expected.has(suffix)) throw new Error("Journal SQLite contem sidecar desconhecido");
@@ -1939,6 +1957,22 @@ function validateJournalArtifacts(journal) {
     if (typeof journal.originalPresent?.[suffix] !== "boolean" || typeof journal.stagedPresent?.[suffix] !== "boolean") {
       throw new Error("Journal SQLite incompleto; recuperacao interrompida");
     }
+  }
+  for (const suffix of SQLITE_SUFFIXES) {
+    const originalSha256 = journal.originalSha256?.[suffix];
+    const hasValidHash = /^[a-f0-9]{64}$/.test(originalSha256 || "");
+    const absentOriginalHashIsValid = journal.version === LEGACY_RESTORE_JOURNAL_VERSION
+      ? originalSha256 === undefined || originalSha256 === null
+      : originalSha256 === null;
+    if (journal.originalPresent[suffix] && !hasValidHash) {
+      if (allowLegacyCommittedWithoutOriginalHash && journal.version === LEGACY_RESTORE_JOURNAL_VERSION
+        && (originalSha256 === undefined || originalSha256 === null)) continue;
+      if (journal.version === LEGACY_RESTORE_JOURNAL_VERSION && (originalSha256 === undefined || originalSha256 === null)) {
+        throw new Error("Legacy SQLite original is ambiguous without its hash; manual recovery required");
+      }
+      throw new Error("Journal SQLite hash original invalido; recuperacao interrompida");
+    }
+    if (!journal.originalPresent[suffix] && !absentOriginalHashIsValid) throw new Error("Journal SQLite hash original invalido; recuperacao interrompida");
   }
 }
 
@@ -1951,23 +1985,25 @@ function rollbackRestoreJournal(journal, options = {}) {
     const destination = artifactPath(journal.destination, suffix);
     const rollback = artifactPath(journal.rollbackPrefix, suffix);
     const stage = artifactPath(journal.stagePrefix, suffix);
-    const originalMove = `original.move${suffix || ".primary"}`;
     const replacementMove = `replacement.move${suffix || ".primary"}`;
     const rollbackMove = `rollback.restore${suffix || ".primary"}`;
 
     if (journal.originalPresent[suffix]) {
+      const originalSha256 = journal.originalSha256?.[suffix];
       if (fs.existsSync(rollback)) {
+        if (fileSha256(rollback) !== originalSha256) throw new Error("Journal SQLite pre-image failed integrity verification");
         if (fs.existsSync(destination)) {
           fs.rmSync(destination, { force: true });
           recordOperation(journal, `rollback.remove-replacement${suffix || ".primary"}`);
           hook(`rollback.remove-replacement${suffix || ".primary"}`, journal);
         }
         fs.renameSync(rollback, destination);
+        if (fileSha256(destination) !== originalSha256) throw new Error("Journal SQLite restored original failed integrity verification");
         recordOperation(journal, rollbackMove);
         hook(rollbackMove, journal);
-      } else if (!journalHas(journal, originalMove) && !journalHas(journal, rollbackMove)) {
-        // The original was not moved. Leave it untouched.
-      } else if (!fs.existsSync(destination)) {
+      } else if (fs.existsSync(destination)) {
+        if (fileSha256(destination) !== originalSha256) throw new Error("Journal SQLite destination does not match original hash");
+      } else {
         throw new Error(`Journal SQLite perdeu o original ${suffix || "principal"}`);
       }
     } else if (fs.existsSync(destination) && (journalHas(journal, replacementMove) || journal.phase !== "staged")) {
@@ -1993,7 +2029,7 @@ function recoverDatabaseRestore(destinationPath, options = {}) {
   }
 
   if (journal.phase === "committed") {
-    validateJournalArtifacts(journal);
+    validateJournalArtifacts(journal, { allowLegacyCommittedWithoutOriginalHash: true });
     for (const suffix of SQLITE_SUFFIXES) {
       fs.rmSync(artifactPath(journal.stagePrefix, suffix), { force: true });
       fs.rmSync(artifactPath(journal.rollbackPrefix, suffix), { force: true });
