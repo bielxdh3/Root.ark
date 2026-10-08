@@ -1,13 +1,13 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Last branch reconciliation: 2026-10-08 (after PR #122)
+Last branch reconciliation: 2026-10-08 (after PR #124)
 
 Repository: `bielxdh3/root.ark`
 
-The latest recorded GitHub query in [the issue ledger](issue-ledger.md) is after PR #122 merged, at source SHA `b82d3d86eda2b8ba083284577e4e7c67c2cb5060`, immediately before this documentation-only update. Push Security Regression passed on that exact SHA on Ubuntu and Windows (939 tests on each; 11 Ubuntu skips and 4 Windows skips); CodeQL, default-branch Dependency Review, and Pages also passed. The repository release gate had not yet run on this exact merged SHA at snapshot time. The issue and PR snapshot is time-scoped; re-query GitHub before relying on it after later repository changes.
+The latest live GitHub snapshot in [the issue ledger](issue-ledger.md) is after PR #124 merged, at `Root/main` SHA `ad4707037933ee9a65a53e76a26ae3b1cea01160`, immediately before this documentation follow-up. Exact-SHA push Security Regression passed on Ubuntu and Windows (951 tests on each; 11 Ubuntu skips and 4 Windows skips); CodeQL, default-branch Dependency Review, and Pages also passed. The repository release gate has not yet run on this SHA and remains required on the final merged SHA. The issue and PR snapshot is time-scoped; re-query GitHub before relying on it after later repository changes.
 
-The security-correction code and main-push CI work in PRs #101, #103, #114, #115, #99, #117, #118, and #116 are merged. PR #119 reconciled the ledger, PR #120 fixed a Windows WebDAV test-fixture cleanup race, and PR #122 made concurrent rate-limit test assertions order-independent. Mission closure remains `[PARTIAL]`: the full browser matrix is incomplete, so complete UI acceptance is unproven. Whole restore is locally rollback-recoverable with durable provider reconciliation, not atomic across storage domains; additionally, a local-only restore followed by later cloud enablement can expose stale provider objects to authorized readers. Issues #63–68 and #94, and incomplete PRs #95, #97, #102, and #121, remain open at the snapshot query time recorded in the issue ledger.
+The security-correction code, restore-provider recovery, mobile audit-table fix, and main-push CI work in PRs #101, #103, #114, #115, #99, #117, #118, #116, and #123–124 are merged. PR #119 reconciled the ledger, PR #120 fixed a Windows WebDAV test-fixture cleanup race, and PR #122 made concurrent rate-limit test assertions order-independent. Mission closure remains `[PARTIAL]` pending this documentation PR, the final-SHA release gate, and a fresh independent final review. The full browser acceptance matrix was completed on disposable fixtures in this mission; the closure-validation addendum records the flows and evidence limits. Whole restore has local compensation/restart recovery and durable provider reconciliation, but is not atomic across storage domains. Issues #63–68 and #94 remain open; PRs #95 and #97 remain open on the stale base recorded in the ledger. PR #102 is closed and PRs #121, #123, and #124 are merged.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 

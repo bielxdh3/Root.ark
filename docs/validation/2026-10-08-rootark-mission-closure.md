@@ -1,12 +1,47 @@
 # Root.ark closure validation — 2026-10-08
 
-## Status
+## Latest closure snapshot — after PR #124, before documentation follow-up
+
+Queried live on 2026-10-08. `Root/main` was `ad4707037933ee9a65a53e76a26ae3b1cea01160`. This snapshot supersedes the historical status farther below, which reflects an earlier SHA. The documentation follow-up and its final-main validation were still pending at this snapshot.
+
+### Exact main validation at this snapshot
+
+- Security Regression push [run #37755424999](https://github.com/bielxdh3/Root.ark/actions/runs/37755424999): Ubuntu Node 22 ran 951 tests (940 passed, 11 skipped, 0 failed); Windows Node 22 ran 951 tests (947 passed, 4 skipped, 0 failed). Both passed syntax validation; Ubuntu also passed the runtime-artifact guard and locked dependency audit at the configured high-severity threshold.
+- CodeQL [run #37755425122](https://github.com/bielxdh3/Root.ark/actions/runs/37755425122), default-branch Dependency Review [run #37755425085](https://github.com/bielxdh3/Root.ark/actions/runs/37755425085), and Pages [run #37755424791](https://github.com/bielxdh3/Root.ark/actions/runs/37755424791) passed.
+- The local repository release gate had not yet been run on this exact SHA; a new run on the final merged SHA remains required. No PR-head result substitutes for that run.
+
+### Live GitHub state at this snapshot
+
+- PR #123 merged at `c41beeffc48de4f8261bd85168de921e4d43fe52`; PR #124 merged at `ad4707037933ee9a65a53e76a26ae3b1cea01160`.
+- Open PRs: #95 and #97 only. Both remain based on `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; their latest listed successful checks are from 2026-10-01, not this base. PR #95 is `DIRTY`; #97 is `CLEAN`. All 4 review threads on #95 and all 5 on #97 are resolved.
+- PR #102 is closed. PR #121 is merged at `e3e30c24d85784a4d07d61f4e7bd457ed5fc8395`.
+- Issues #63–68 and #94 remain open. The moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` for `sprintf-js` remains open with no first patched version listed.
+
+### Browser and UI acceptance completed on disposable fixtures
+
+A fresh real-browser acceptance pass used isolated local test runtimes and disposable accounts/files; it did not use the user app at `127.0.0.1:3215` or user data. The main matrix runtime on port `62390` loaded `server.js` from candidate commit `4cf73a0f0f3193cb68d6ddcd7bb0b16ec85755b4` through its temporary `launch.js`. That commit and `Root/main` `ad4707037933ee9a65a53e76a26ae3b1cea01160` have the identical Git tree `7a4ffac31b961e9184204a575a510146b877ec5d`, tying the tested application code to the exact main snapshot. The browser matrix covered login and 2FA, file list and folders, upload/chunk progress and failure, encryption controls, pending approval and approve/reject, preview/download, share creation and password flow, versions, rename/move, file and folder permissions, temporary expiry, trash/restore/permanent delete, admin/users/groups, quarantine, audit/export, backup creation/manifest/restore confirmation, and restore restart recovery. It also covered mobile navigation, permission-denied/error states, realtime refresh with dirty-form preservation, and responsive layout.
+
+Viewports were desktop, 390px compact/mobile, and tablet-sized. Checks included keyboard navigation/focus, dialogs and labels, destructive-action clarity, loading/empty/error states, horizontal overflow, console output, mutation methods, and CSRF behavior. Restore and destructive actions used disposable fixtures only. The tested flows completed without a persistent UI defect; a one-time reconnect message after a test-server restart cleared on reload. Per-flow screenshots and a machine-readable browser trace were not retained, so this is operator-observed browser evidence, not a reusable automated acceptance suite. Browser session-expiry validation used a correctly signed test JWT expired by five minutes, set as an `HttpOnly` cookie in Playwright CLI against the same `62390` runtime. Navigating to `/index.html` caused `GET /auth/me` to return 401 and redirected to `/login.html?returnTo=%2Findex.html`; 401 resource errors appeared in the browser console. Logout invalidation was also confirmed. Automated auth tests cover session revocation; no separate browser flow waited for a live eight-hour token to expire.
+
+The user authorized permanent cleanup of the exact fixture name `closure-ui-sample.txt` on test port 62376. A current read-only check found no share with that exact name; the only visible public share is named `closure-ui-renamed.txt` and is expired. It was left untouched because its identity as the authorized target could not be confirmed from the available unauthenticated session.
+
+### Restore semantics and current residual
+
+PR #123 corrected provider-inventory recovery: selected archive entries are validated, provider reconciliation intent is durably queued, lease/backoff and restart recovery are deterministic, and provider failures fail closed before the listener acknowledges readiness. Local restore uses verified preimages/compensation for quarantine, JSON, uploads, SQLite state/sidecars, and migration/restart recovery. Failure-injection tests cover local restore stages, migration rollback/retry, provider failure, pending reconciliation, and restart.
+
+Restore is **not globally atomic** across local storage and external provider APIs. Provider operations cannot join a portable local filesystem/SQLite transaction; external writers are outside the restore gate; and Windows does not provide the same portable directory-entry flush guarantee as POSIX. The bounded semantics are local compensation/restart recovery plus durable, idempotent, resumable provider reconciliation. See [the restore transaction boundary](../backup-restore-transaction-boundary.md).
+
+### Mission status at this snapshot
+
+`PARTIAL`: the docs follow-up, final-SHA release gate, and fresh independent final review remained pending. No claim of production readiness or end-to-end Zero-Knowledge is made. Open issues and PRs remain open for their documented acceptance gaps.
+
+## Historical status at the `fd995b2` snapshot
 
 `PARTIAL` at the verification snapshot before this documentation-only follow-up. The latest queried `Root/main` SHA was `fd995b2ae587140db8ea1ba9de62cf7557ee0516`; exact-SHA push Security Regression, CodeQL, Dependency Review, and Pages checks passed. The prior execution record reports that the clean Windows local release gate passed on that SHA, but its exact output was not retained in the repository. The full browser matrix is incomplete, so complete UI acceptance is unproven. Whole restore remains locally rollback-recoverable with durable provider reconciliation, not globally atomic across storage providers.
 
 This dated report is not production-readiness or release authorization.
 
-## Execution record
+## Historical execution record
 
 - Mission baseline: `1df5e4640d4aea7dc700f2088059f489c2e51af0`.
 - Live default branch after PR #117: `Root/main` at `14428690bef7c02648fd0be9570aabb17ae6de1a`.
@@ -15,7 +50,7 @@ This dated report is not production-readiness or release authorization.
 - Unrelated worktrees and `.playwright-cli` artifacts were left untouched.
 - Merged mission PRs: #101 at `5c86bd2a9844fdf21921f08cf2bf9d9a7253d652`; #103 at `f85cb389f3152191d612fb36b1ad97bde89ba99a`; #99 at `9e070823f2ee6372521a53d2fc130701ed074aab`; #114 at `566a3d24591423c624ef3bcb82290a77ff359210`; #115 at `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`; #117 at `14428690bef7c02648fd0be9570aabb17ae6de1a`; #118 at `1c2f7a8b276e63e53555f5de824afc9b7a9aa55e`; and #116 at `fd995b2ae587140db8ea1ba9de62cf7557ee0516`.
 
-## Findings and corrections
+## Historical findings and corrections
 
 | Severity / component | Evidence, fix, regression, status |
 |---|---|
@@ -27,7 +62,7 @@ This dated report is not production-readiness or release authorization.
 | Medium — roadmap drift | #99 reconciled the roadmap. The ledger now records the live post-#116 merge snapshot at `fd995b2…`, with `1c2f7a8…` and earlier candidate snapshots labeled historical. The remaining open PR and issue acceptance boundaries are explicit. |
 | No confirmed cross-origin identity leak — `/auth/session.js` | The endpoint is authenticated and no-store, but no tracked page loads it, default cross-origin classic-script requests omit same-origin credentials, and the application emits no credentialed CORS headers. An independent source/standards review did not confirm a reachable leak. The threat model was corrected; the sibling-origin browser probe was not completed, so reassess if credentialed CORS is enabled at the app or proxy. |
 
-## Current exact-SHA validation — `Root/main` `fd995b2ae587140db8ea1ba9de62cf7557ee0516`
+## Historical exact-SHA validation — `Root/main` `fd995b2ae587140db8ea1ba9de62cf7557ee0516`
 
 Push Security Regression [#37731545082](https://github.com/bielxdh3/Root.ark/actions/runs/37731545082) passed on this exact SHA: Ubuntu Node 22 ran 938 tests (927 passed, 11 skipped, 0 failed) and Windows Node 22 ran 938 tests (934 passed, 4 skipped, 0 failed). CodeQL [#37731545119](https://github.com/bielxdh3/Root.ark/actions/runs/37731545119), default-branch Dependency Review [#37731544965](https://github.com/bielxdh3/Root.ark/actions/runs/37731544965), and Pages [#37731544171](https://github.com/bielxdh3/Root.ark/actions/runs/37731544171) passed.
 
@@ -69,7 +104,7 @@ At exact PR head `448d1c1ecd2cd3a1391dd741027dc146be3735b6`, based on `Root/main
 
 The local release gate passed on earlier code-equivalent candidate head `a72d2f2…` with 21 passed, 0 blocked, 0 failed. The `448d1c1…` follow-up changed documentation only; Security Regression's exact-head jobs also passed syntax, runtime-artifact, locked-dependency audit, and clean-checkout steps. That candidate later advanced to exact PR #116 head `73f3c67…`, passed Security Regression, CodeQL, and Dependency Review, and merged at `fd995b2…`; the run IDs are recorded above. A fresh independent review found stale `a72d2f2…` status wording in the earlier candidate; this update records the merged state.
 
-## Restore semantics and residuals
+## Historical restore semantics and residuals
 
 PR #118 added a migration-stage failure injection to `test/backup-restore-transaction-boundary.test.js`. It verifies a failure inside migration SQL rolls back that migration's SQLite transaction, leaves the already-committed restored database authoritative, retains the fail-closed `restart_required` coordinator and preimage, and retries the migration on restart before the listener is acknowledged. The focused test passed 1/1 locally; exact-head PR and subsequent main-push checks passed. This confirms forward retry after the local restore commit, not whole-restore rollback at this stage.
 
@@ -77,7 +112,7 @@ Before local mutation, restore verifies preimages for quarantine, JSON data, upl
 
 Residuals: external writers are outside the restore gate; persistent rollback failure may require operator help; Windows lacks the same portable directory-entry flush guarantee as POSIX; fake providers do not prove live interoperability. See [the restore transaction boundary](../backup-restore-transaction-boundary.md).
 
-## Browser / UI validation
+## Historical browser / UI validation
 
 The fresh browser pass used the candidate code at `f2d171d…` in a disposable `NODE_ENV=test` runtime at `127.0.0.1:62379`. Its application code matched `Root/main` `1442869…`; intervening source changes were documentation-only. An earlier, separate disposable runtime at `127.0.0.1:62376` executed a backup restore and reached the expected restart-required barrier. In the fresh `62379` pass, the restore warning was opened and canceled. Neither session used user-instance data.
 
@@ -92,7 +127,7 @@ Still unproven in the available browser sessions: chunk progress/failure, approv
 
 The final isolated browser attempt reached required TOTP enrollment but stopped before confirmation because the browser helper no longer had the enrollment key when it tried to produce a code. The test server was stopped and the browser session closed; no additional runtime/browser retry was made. The sibling-origin script probe, full admin mutation matrix, and authorized test-share creation therefore remain unverified. This does not affect the successful narrow login/session, upload, pending-preview, responsive-width, and keyboard observations above; it keeps browser acceptance `PARTIAL`.
 
-## Security and remaining work
+## Historical security and remaining work
 
 The merged fixes pass exact-main checks through `fd995b2…`. Restore recovery is bounded to local rollback plus durable provider reconciliation. The project is not production-ready on repository evidence alone: proxy ingress/topology, provider credentials/interoperability, native binding/deployment behavior, and operational recovery remain deployment gates. Root.ark is not an end-to-end Zero-Knowledge runtime; legacy server-readable paths remain. Existing bearer links are not operation-scoped capabilities.
 
