@@ -167,6 +167,12 @@ test("expired cached files and folders are denied across direct, preview, token,
   });
   assert.notEqual(shareFile.status, 200, "public share file route must reject expired content");
   assert.equal(shareFile.body.includes("DISPOSABLE EXPIRED FILE CONTENT"), false);
+  const sharePreview = await request(port, `/share/${shareToken}/preview`, {
+    method: "POST",
+    headers: { origin: `http://127.0.0.1:${port}` },
+  });
+  assert.notEqual(sharePreview.status, 200, "public share preview POST must reject expired content");
+  assert.equal(sharePreview.body.includes("DISPOSABLE EXPIRED FILE CONTENT"), false);
 
   const folders = await request(port, "/folders", { headers: { cookie } });
   assert.equal(folders.status, 200, folders.body);

@@ -796,6 +796,13 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const ordinaryLocalFile = await request(port, "/files/notes.v2", { headers: { cookie } });
   assert.equal(ordinaryLocalFile.status, 200, "an ordinary local .vN file must be downloadable");
   assert.equal(ordinaryLocalFile.body, "ordinary local suffix fixture");
+  const auditEventCount = (eventType) => JSON.parse(fs.readFileSync(path.join(dataDir, "audit-logs.json"), "utf8")).logs.filter((entry) => entry.eventType === eventType).length;
+  const fileDownloadsBeforeHead = auditEventCount("file.download");
+  const ordinaryLocalHead = await request(port, "/files/notes.v2", { method: "HEAD", headers: { cookie } });
+  assert.equal(ordinaryLocalHead.status, 200, "HEAD may inspect authorized file metadata");
+  assert.equal(auditEventCount("file.download"), fileDownloadsBeforeHead, "HEAD does not record a file download");
+  assert.equal((await request(port, "/files/notes.v2", { headers: { cookie } })).status, 200);
+  assert.equal(auditEventCount("file.download"), fileDownloadsBeforeHead + 1, "GET continues to record a file download");
   const legacyFile = await request(port, "/files/legacy.v9", { headers: { cookie } });
   assert.equal(legacyFile.status, 200, "unmatched .vN names retain legacy default-public access");
   assert.equal(legacyFile.body, "legacy file without ACL fixture");
@@ -848,14 +855,14 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   });
   assert.equal(encryptedShare.status, 404, encryptedShare.body);
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/encrypted.txt"), false, "legacy encrypted share rejects before cache hydration");
-  for (const [route, method] of [["view", "POST"], ["download", "POST"], ["preview", "GET"], ["file", "POST"]]) {
+  for (const [route, method] of [["view", "POST"], ["download", "POST"], ["preview", "POST"], ["file", "POST"]]) {
     const sharedOrphan = await request(port, `/share/${restoreOrphanShareToken}/${route}`, {
       method,
     headers: method === "POST"
       ? { origin: `http://127.0.0.1:${port}` }
       : route === "preview" ? { "sec-fetch-site": "same-origin" } : {},
     });
-    assert.equal(sharedOrphan.status, 404, `${route} cannot expose a restore-orphan share`);
+    assert.equal(sharedOrphan.status, 404, `${route} denies a restore-orphan share before provider hydration`);
     assert.equal(sharedOrphan.body.includes("post-backup provider bytes"), false);
   }
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/restore-orphan.txt"), false, "public share denial happens before provider hydration");
@@ -907,6 +914,12 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const ordinaryLocalWebDavFile = await request(port, "/dav/notes.v2", { headers: { authorization: webDavAuth } });
   assert.equal(ordinaryLocalWebDavFile.status, 200, ordinaryLocalWebDavFile.body);
   assert.equal(ordinaryLocalWebDavFile.body, "ordinary local suffix fixture");
+  const webDavDownloadsBeforeHead = auditEventCount("webdav.download");
+  const ordinaryLocalWebDavHead = await request(port, "/dav/notes.v2", { method: "HEAD", headers: { authorization: webDavAuth } });
+  assert.equal(ordinaryLocalWebDavHead.status, 200, "WebDAV HEAD remains a supported metadata request");
+  assert.equal(auditEventCount("webdav.download"), webDavDownloadsBeforeHead, "WebDAV HEAD is not recorded as a file download");
+  assert.equal((await request(port, "/dav/notes.v2", { headers: { authorization: webDavAuth } })).status, 200);
+  assert.equal(auditEventCount("webdav.download"), webDavDownloadsBeforeHead + 1, "WebDAV GET continues to be recorded as a file download");
   const restoreOrphanWebDavList = await request(port, "/dav", { method: "PROPFIND", headers: { authorization: webDavAuth, depth: "1" } });
   assert.equal(restoreOrphanWebDavList.status, 207, restoreOrphanWebDavList.body);
   assert.equal(restoreOrphanWebDavList.body.includes("restore-orphan.txt"), false, "WebDAV does not disclose restored orphans");

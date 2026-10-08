@@ -2000,8 +2000,10 @@ function renderPublicSharePage(token) {
         if (!previewBox.dataset.loaded) {
           const previewFrame = document.createElement("iframe");
           previewFrame.title = "Preview";
+          previewFrame.name = "rootark-share-preview-" + token;
           previewFrame.addEventListener("load", () => {
             try {
+              if (previewFrame.contentDocument?.location?.href === "about:blank") return;
               if (previewFrame.contentDocument?.body?.textContent?.trim() === "Abra a pagina do compartilhamento novamente.") {
                 previewBox.replaceChildren();
                 delete previewBox.dataset.loaded;
@@ -2010,9 +2012,14 @@ function renderPublicSharePage(token) {
             } catch {}
             refreshShareAccess();
           });
-          previewFrame.src = "/share/" + token + "/preview";
-          previewBox.replaceChildren(previewFrame);
+          const previewForm = document.createElement("form");
+          previewForm.method = "POST";
+          previewForm.action = "/share/" + token + "/preview";
+          previewForm.target = previewFrame.name;
+          previewForm.hidden = true;
+          previewBox.replaceChildren(previewFrame, previewForm);
           previewBox.dataset.loaded = "1";
+          previewForm.requestSubmit();
         }
       });
 
@@ -2211,6 +2218,9 @@ async function resolveShareAccess(req, res, token, options = {}) {
   if (options.requireViewer && getShareAccessCookieRequired(link, options.countDownloadOncePerViewer) && !viewerAlreadyActive && !options.countView) {
     return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
   }
+  if (options.requireDownloadCountedViewer && (Number(link.maxDownloads) || 0) > 0 && !downloadAlreadyCounted) {
+    return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
+  }
 
   if (options.countDownload && !downloadAlreadyCounted && limits.maxDownloads > 0 && limits.downloads >= limits.maxDownloads) {
     logShareAudit(req, "share.limit_reached", token, link, "download", "failure", { limit: "downloads" });
@@ -2249,6 +2259,9 @@ async function resolveShareAccess(req, res, token, options = {}) {
     return { status: 410, error: "Link indisponivel." };
   }
   if (options.requireViewer && getShareAccessCookieRequired(currentLink, options.countDownloadOncePerViewer) && !currentViewerAlreadyActive && !options.countView) {
+    return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
+  }
+  if (options.requireDownloadCountedViewer && (Number(currentLink.maxDownloads) || 0) > 0 && !downloadAlreadyCounted) {
     return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
   }
   if (options.countDownload && !downloadAlreadyCounted && currentLimits.maxDownloads > 0 && currentLimits.downloads >= currentLimits.maxDownloads) {
@@ -6346,16 +6359,18 @@ app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
-  logAnalyticsEvent("download", {
-    filename: name,
-    downloadedBy: req.user.username,
-    folderId: folder.id,
-    folderName: folder.name,
-  });
-  auditLog("file.download", getAuditActor(req), { type: "file", id: name }, "downloaded", "success", {
-    folderId: folder.id,
-    folderName: folder.name,
-  });
+  if (req.method !== "HEAD") {
+    logAnalyticsEvent("download", {
+      filename: name,
+      downloadedBy: req.user.username,
+      folderId: folder.id,
+      folderName: folder.name,
+    });
+    auditLog("file.download", getAuditActor(req), { type: "file", id: name }, "downloaded", "success", {
+      folderId: folder.id,
+      folderName: folder.name,
+    });
+  }
 
   sendOptimizedFile(req, res, filePath, name, "attachment");
 });
@@ -7740,11 +7755,13 @@ async function sendWebDavFile(req, res, segments, headOnly = false) {
   if (res.headersSent) return;
   if (!target || target.type !== "file") return res.status(target?.status || 404).send(target?.message || "Not found");
 
-  auditLog("webdav.download", getAuditActor(req), { type: "file", id: target.name }, "download", "success", {
-    folderId: target.folder.id,
-    method: req.method,
-    path: getSafeWebDavAuditPath(req),
-  });
+  if (!headOnly) {
+    auditLog("webdav.download", getAuditActor(req), { type: "file", id: target.name }, "download", "success", {
+      folderId: target.folder.id,
+      method: req.method,
+      path: getSafeWebDavAuditPath(req),
+    });
+  }
 
   if (headOnly) {
     res.setHeader("Content-Type", getMimeType(target.name));
@@ -9448,7 +9465,24 @@ app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareM
 app.get("/share/:token/preview", shareRateLimit, requireSameOriginPublicSharePreview, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
-  if (req.method === "HEAD") return res.setHeader("Allow", "GET").status(405).type("text/plain").send("Metodo nao permitido");
+  if (req.method === "HEAD") return res.setHeader("Allow", "GET, POST").status(405).type("text/plain").send("Metodo nao permitido");
+
+  const access = await resolveShareAccess(req, res, shareToken, {
+    requireViewer: true,
+    requirePreview: true,
+    countDownloadOncePerViewer: true,
+    requireDownloadCountedViewer: true,
+  });
+  if (access.error) return res.status(access.status || 400).send(access.error);
+
+  sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "inline", {
+    cacheControl: "private, max-age=600",
+  });
+});
+
+app.post("/share/:token/preview", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
+  const shareToken = validateShareToken(req.params.token);
+  if (!shareToken) return res.status(404).send("Link indisponivel.");
 
   const access = await resolveShareAccess(req, res, shareToken, {
     requireViewer: true,

@@ -71,6 +71,7 @@ function runSharePageScript(page, fetchImpl) {
       focus() { activeElement = this; },
       replaceChildren(...children) { this.children = children; },
       append(...children) { this.children.push(...children); },
+      requestSubmit() { this.submitted = true; },
     };
   };
   const getElementById = (id) => {
@@ -232,15 +233,17 @@ test("SQLite mode preserves counted access for a JSON-fallback public link", { t
   const previewCookie = String(Array.isArray(previewCookieHeader) ? previewCookieHeader[0] : previewCookieHeader || "").split(";", 1)[0];
   assert.match(previewCookie, /^rootark_share_[a-f0-9]{48}=/);
   const rangeResponses = await Promise.all([
-    request(port, `/share/${previewToken}/preview`, "GET", { cookie: previewCookie, range: "bytes=0-4" }),
-    request(port, `/share/${previewToken}/preview`, "GET", { cookie: previewCookie, range: "bytes=5-9" }),
+    request(port, `/share/${previewToken}/preview`, "POST", { cookie: previewCookie, origin, range: "bytes=0-4" }),
+    request(port, `/share/${previewToken}/preview`, "POST", { cookie: previewCookie, origin, range: "bytes=5-9" }),
   ]);
   assert.deepEqual(rangeResponses.map((response) => response.status), [206, 206], "SQLite quota reservation is idempotent for concurrent ranges in one viewer session");
+  const laterRange = await request(port, `/share/${previewToken}/preview`, "GET", { cookie: previewCookie, range: "bytes=10-14" });
+  assert.equal(laterRange.status, 206, "a viewer can fetch additional preview ranges after the POST reserves quota");
   const secondPreviewView = await request(port, `/share/${previewToken}/view`, "POST", { origin });
   assert.equal(secondPreviewView.status, 200, secondPreviewView.body);
   const secondPreviewCookieHeader = secondPreviewView.headers["set-cookie"];
   const secondPreviewCookie = String(Array.isArray(secondPreviewCookieHeader) ? secondPreviewCookieHeader[0] : secondPreviewCookieHeader || "").split(";", 1)[0];
-  assert.equal((await request(port, `/share/${previewToken}/preview`, "GET", { cookie: secondPreviewCookie, range: "bytes=0-4" })).status, 410);
+  assert.equal((await request(port, `/share/${previewToken}/preview`, "POST", { cookie: secondPreviewCookie, origin, range: "bytes=0-4" })).status, 410);
   assert.equal((await request(port, `/share/${secondToken}`)).status, 200, "counting one legacy link must not hide other unrecorded JSON links");
   assert.equal((await request(port, `/share/${secondToken}/view`, "POST", { origin })).status, 200);
   assert.equal((await request(port, `/share/${invalidToken}`)).status, 404, "invalid legacy JSON tokens are not served");
@@ -343,8 +346,9 @@ test("public-share audit logs correlate by token digest without storing the bear
   });
 
   assert.equal((await waitForServer(port)).status, 200);
-  const expiredViewerPreview = await request(port, `/share/${expiredViewerToken}/preview`, "GET", {
+  const expiredViewerPreview = await request(port, `/share/${expiredViewerToken}/preview`, "POST", {
     cookie: `rootark_share_pwd_${expiredViewerToken}=ok`,
+    origin: `http://127.0.0.1:${port}`,
   });
   assert.equal(expiredViewerPreview.status, 403, "an expired viewer cookie is rejected even while the password session remains valid");
   assert.equal(expiredViewerPreview.body, "Abra a pagina do compartilhamento novamente.");
@@ -458,7 +462,10 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.equal(unsupportedView.status, 200);
   const unsupportedCookieHeader = unsupportedView.headers["set-cookie"];
   const unsupportedViewerCookie = String(Array.isArray(unsupportedCookieHeader) ? unsupportedCookieHeader[0] : unsupportedCookieHeader || "").split(";", 1)[0];
-  const unsupportedPreview = await request(port, `/share/${unsupportedPreviewToken}/preview`, "GET", { cookie: unsupportedViewerCookie });
+  const unsupportedPreview = await request(port, `/share/${unsupportedPreviewToken}/preview`, "POST", {
+    cookie: unsupportedViewerCookie,
+    origin: `http://127.0.0.1:${port}`,
+  });
   assert.equal(unsupportedPreview.status, 415);
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[unsupportedPreviewToken].downloads, 0, "a rejected preview does not consume download quota");
   const unsupportedPreviewDownload = await request(port, `/share/${unsupportedPreviewToken}/file`, "POST", {
@@ -473,6 +480,18 @@ test("public-share audit logs correlate by token digest without storing the bear
     range: "bytes=4-7",
   });
   assert.equal(staleViewerRange.status, 403, "an unknown or expired viewer cannot consume preview quota");
+  const unboundPreviewPost = await request(port, `/share/${unboundPreviewToken}/preview`, "POST", {
+    origin: `http://127.0.0.1:${port}`,
+  });
+  assert.equal(unboundPreviewPost.status, 403, "a download-limited preview POST requires an active viewer even without password or view limits");
+  assert.equal(unboundPreviewPost.body.includes("disposable preview fixture"), false);
+  const expiredViewerId = crypto.randomBytes(16).toString("hex");
+  const expiredViewerPost = await request(port, `/share/${unboundPreviewToken}/preview`, "POST", {
+    cookie: `rootark_share_${unboundPreviewToken}=${expiredViewerId}`,
+    origin: `http://127.0.0.1:${port}`,
+  });
+  assert.equal(expiredViewerPost.status, 403, "an expired or unknown viewer cannot reserve a download through POST");
+  assert.equal(expiredViewerPost.body.includes("disposable preview fixture"), false);
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[unboundPreviewToken].downloads, 0, "rejected ranges leave download quota untouched");
   const unboundView = await request(port, `/share/${unboundPreviewToken}/view`, "POST", {
     origin: `http://127.0.0.1:${port}`,
@@ -481,11 +500,14 @@ test("public-share audit logs correlate by token digest without storing the bear
   const unboundCookieHeader = unboundView.headers["set-cookie"];
   const unboundViewerCookie = String(Array.isArray(unboundCookieHeader) ? unboundCookieHeader[0] : unboundCookieHeader || "").split(";", 1)[0];
   const unboundViewerRanges = await Promise.all([
-    request(port, `/share/${unboundPreviewToken}/preview`, "GET", { cookie: unboundViewerCookie, range: "bytes=0-3" }),
-    request(port, `/share/${unboundPreviewToken}/preview`, "GET", { cookie: unboundViewerCookie, range: "bytes=4-7" }),
+    request(port, `/share/${unboundPreviewToken}/preview`, "POST", { cookie: unboundViewerCookie, origin: `http://127.0.0.1:${port}`, range: "bytes=0-3" }),
+    request(port, `/share/${unboundPreviewToken}/preview`, "POST", { cookie: unboundViewerCookie, origin: `http://127.0.0.1:${port}`, range: "bytes=4-7" }),
   ]);
   assert.deepEqual(unboundViewerRanges.map((response) => response.status), [206, 206], "one active viewer can fetch multiple preview ranges");
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[unboundPreviewToken].downloads, 1, "all ranges for one viewer share a single download quota charge");
+  const unboundViewerLaterRange = await request(port, `/share/${unboundPreviewToken}/preview`, "GET", { cookie: unboundViewerCookie, range: "bytes=8-11" });
+  assert.equal(unboundViewerLaterRange.status, 206, "native preview range reads remain available after the quota-bearing POST");
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[unboundPreviewToken].downloads, 1, "subsequent GET ranges do not mutate download quota");
 
   const rangedPreviewView = await request(port, `/share/${rangedPreviewToken}/view`, "POST", {
     origin: `http://127.0.0.1:${port}`,
@@ -495,8 +517,8 @@ test("public-share audit logs correlate by token digest without storing the bear
   const viewerCookie = String(Array.isArray(viewerCookieHeader) ? viewerCookieHeader[0] : viewerCookieHeader || "").split(";", 1)[0];
   assert.match(viewerCookie, /^rootark_share_[a-f0-9]{48}=/, "the viewer session correlates range requests from one preview");
   const rangedPreviewParts = await Promise.all([
-    request(port, `/share/${rangedPreviewToken}/preview`, "GET", { cookie: viewerCookie, range: "bytes=0-3" }),
-    request(port, `/share/${rangedPreviewToken}/preview`, "GET", { cookie: viewerCookie, range: "bytes=4-7" }),
+    request(port, `/share/${rangedPreviewToken}/preview`, "POST", { cookie: viewerCookie, origin: `http://127.0.0.1:${port}`, range: "bytes=0-3" }),
+    request(port, `/share/${rangedPreviewToken}/preview`, "POST", { cookie: viewerCookie, origin: `http://127.0.0.1:${port}`, range: "bytes=4-7" }),
   ]);
   assert.deepEqual(rangedPreviewParts.map((response) => response.status), [206, 206], "parallel range reads for one viewer remain available");
   assert.deepEqual(rangedPreviewParts.map((response) => response.body), ["disp", "osab"]);
@@ -512,16 +534,22 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.equal(secondRangedView.status, 200);
   const secondRangedCookieHeader = secondRangedView.headers["set-cookie"];
   const secondRangedCookie = String(Array.isArray(secondRangedCookieHeader) ? secondRangedCookieHeader[0] : secondRangedCookieHeader || "").split(";", 1)[0];
-  assert.equal((await request(port, `/share/${rangedPreviewToken}/preview`, "GET", { cookie: secondRangedCookie, range: "bytes=8-11" })).status, 410, "another active viewer cannot bypass the exhausted download quota");
+  assert.equal((await request(port, `/share/${rangedPreviewToken}/preview`, "POST", { cookie: secondRangedCookie, origin: `http://127.0.0.1:${port}`, range: "bytes=8-11" })).status, 410, "another active viewer cannot bypass the exhausted download quota");
 
   const protoCookie = `rootark_share_${prototypeViewerToken}=__proto__`;
-  assert.equal((await request(port, `/share/${prototypeViewerToken}/preview`, "GET", { cookie: protoCookie })).status, 403, "an invalid viewer cookie cannot establish a quota-bearing preview session");
+  assert.equal((await request(port, `/share/${prototypeViewerToken}/preview`, "POST", { cookie: protoCookie, origin: `http://127.0.0.1:${port}` })).status, 403, "an invalid viewer cookie cannot establish a quota-bearing preview session");
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[prototypeViewerToken].downloads, 0);
+  const protoUnmeteredView = await request(port, `/share/${prototypeUnmeteredViewerToken}/view`, "POST", { origin: `http://127.0.0.1:${port}` });
+  assert.equal(protoUnmeteredView.status, 200);
+  const protoUnmeteredViewerHeader = protoUnmeteredView.headers["set-cookie"];
+  const protoUnmeteredViewerCookie = String(Array.isArray(protoUnmeteredViewerHeader) ? protoUnmeteredViewerHeader[0] : protoUnmeteredViewerHeader || "").split(";", 1)[0];
   const protoUnmeteredCookie = `rootark_share_${prototypeUnmeteredViewerToken}=__proto__`;
-  assert.equal((await request(port, `/share/${prototypeUnmeteredViewerToken}/preview`, "GET", { cookie: protoUnmeteredCookie })).status, 200);
-  assert.equal((await request(port, `/share/${prototypeUnmeteredViewerToken}/preview`, "GET", { cookie: protoUnmeteredCookie })).status, 200);
+  assert.equal((await request(port, `/share/${prototypeUnmeteredViewerToken}/preview`, "POST", { cookie: protoUnmeteredCookie, origin: `http://127.0.0.1:${port}` })).status, 200, "unmetered links retain their bearer-link access semantics");
+  assert.equal((await request(port, `/share/${prototypeUnmeteredViewerToken}/preview`, "POST", { cookie: protoUnmeteredViewerCookie, origin: `http://127.0.0.1:${port}` })).status, 200);
+  const downloadsAfterPosts = JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[prototypeUnmeteredViewerToken].downloads;
+  assert.equal((await request(port, `/share/${prototypeUnmeteredViewerToken}/preview`, "GET", { cookie: protoUnmeteredViewerCookie })).status, 200);
   const protoUnmeteredLink = JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[prototypeUnmeteredViewerToken];
-  assert.equal(protoUnmeteredLink.downloads, 2, "an invalid viewer cannot inherit a prior per-viewer quota marker");
+  assert.equal(protoUnmeteredLink.downloads, downloadsAfterPosts, "subsequent GET previews do not mutate download statistics");
   assert.equal(Object.prototype.hasOwnProperty.call(protoUnmeteredLink.activeViewers, "__proto__"), false);
   assert.equal(protoUnmeteredLink.activeViewers.downloadCounted, undefined);
   assert.equal(Object.prototype.downloadCounted, undefined, "invalid viewer input never mutates Object.prototype");
@@ -626,7 +654,12 @@ test("public-share audit logs correlate by token digest without storing the bear
   expiredRefreshElements.get("previewButton").listeners.click();
   const retriedPreviewFrame = expiredRefreshElements.createdElements.find((element, index) => index > 0 && element.tagName === "iframe");
   assert.ok(retriedPreviewFrame, "the user can create a new iframe after reauthentication");
-  assert.equal(retriedPreviewFrame.src, `/share/${token}/preview`);
+  const retriedPreviewForm = expiredRefreshElements.createdElements.find((element) => element.tagName === "form");
+  assert.ok(retriedPreviewForm, "the preview starts through a form POST");
+  assert.equal(retriedPreviewForm.method, "POST");
+  assert.equal(retriedPreviewForm.action, `/share/${token}/preview`);
+  assert.equal(retriedPreviewForm.target, retriedPreviewFrame.name);
+  assert.equal(retriedPreviewForm.submitted, true);
   assert.equal(expiredRefreshCalls.length, 4, "the expired preview recovery sends only the expected password checks");
 
   const viewerRefreshElements = runSharePageScript(sharePage.body, () => Promise.resolve({
@@ -677,6 +710,13 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.equal(crossSitePreview.status, 403, "cross-site top-level preview navigation cannot consume quota");
   assert.equal(crossSitePreview.body.includes("disposable preview fixture"), false);
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[previewFirstToken].downloads, 0, "cross-site preview does not consume download quota");
+  const legacySameOriginPreview = await request(port, `/share/${previewFirstToken}/preview`, "GET", {
+    cookie: previewFirstCookie,
+    "sec-fetch-site": "same-origin",
+  });
+  assert.equal(legacySameOriginPreview.status, 403, "a GET cannot start a quota-bearing preview before the same-origin POST");
+  assert.equal(legacySameOriginPreview.body.includes("disposable preview fixture"), false);
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[previewFirstToken].downloads, 0, "legacy GET preview attempts do not mutate quota");
   assert.match(String(previewFirstCookieHeader), /SameSite=Strict/i, "viewer cookies are withheld on cross-site top-level navigation");
   const previewHead = await request(port, "/share/" + previewFirstToken + "/preview", "HEAD", {
     cookie: previewFirstCookie,
@@ -684,12 +724,16 @@ test("public-share audit logs correlate by token digest without storing the bear
   });
   assert.equal(previewHead.status, 405, "HEAD does not act as a preview download");
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[previewFirstToken].downloads, 0);
-  const invalidPreviewRange = await request(port, `/share/${previewFirstToken}/preview`, "GET", { cookie: previewFirstCookie, range: "bytes=999-1000" });
+  const invalidPreviewRange = await request(port, `/share/${previewFirstToken}/preview`, "POST", {
+    cookie: previewFirstCookie,
+    origin: `http://127.0.0.1:${port}`,
+    range: "bytes=999-1000",
+  });
   assert.equal(invalidPreviewRange.status, 416);
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[previewFirstToken].downloads, 0, "an unsatisfiable range does not consume download quota");
-  const previewFirst = await request(port, `/share/${previewFirstToken}/preview`, "GET", {
+  const previewFirst = await request(port, `/share/${previewFirstToken}/preview`, "POST", {
     cookie: previewFirstCookie,
-    "sec-fetch-site": "same-origin",
+    origin: `http://127.0.0.1:${port}`,
   });
   assert.equal(previewFirst.status, 200);
   assert.equal(previewFirst.body, "disposable preview fixture\n");
@@ -722,9 +766,19 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.equal(headerlessProtectedPreview.status, 403, "preview fails closed when Origin and Fetch Metadata are both absent");
   assert.equal(headerlessProtectedPreview.body.includes("disposable preview fixture"), false);
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[protectedPreviewToken].downloads, 0);
-  const protectedSameOriginPreview = await request(port, "/share/" + protectedPreviewToken + "/preview", "GET", {
+  const crossSitePreviewPost = await request(port, "/share/" + protectedPreviewToken + "/preview", "POST", {
     cookie: protectedPreviewCookie,
-    "sec-fetch-site": "same-origin",
+    origin: "https://attacker.example",
+  });
+  assert.equal(crossSitePreviewPost.status, 403, "cross-site POST cannot start a quota-bearing preview");
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[protectedPreviewToken].downloads, 0);
+  const headerlessPreviewPost = await request(port, "/share/" + protectedPreviewToken + "/preview", "POST", {
+    cookie: protectedPreviewCookie,
+  });
+  assert.equal(headerlessPreviewPost.status, 403, "preview POST fails closed without Origin");
+  const protectedSameOriginPreview = await request(port, "/share/" + protectedPreviewToken + "/preview", "POST", {
+    cookie: protectedPreviewCookie,
+    origin: `http://127.0.0.1:${port}`,
   });
   assert.equal(protectedSameOriginPreview.status, 200);
   assert.equal(protectedSameOriginPreview.body, "disposable preview fixture\n");
@@ -735,7 +789,10 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.equal(secondPreviewView.status, 200);
   const secondPreviewCookieHeader = secondPreviewView.headers["set-cookie"];
   const secondPreviewCookie = String(Array.isArray(secondPreviewCookieHeader) ? secondPreviewCookieHeader[0] : secondPreviewCookieHeader || "").split(";", 1)[0];
-  const exhaustedPreview = await request(port, `/share/${previewFirstToken}/preview`, "GET", { cookie: secondPreviewCookie });
+  const exhaustedPreview = await request(port, `/share/${previewFirstToken}/preview`, "POST", {
+    cookie: secondPreviewCookie,
+    origin: `http://127.0.0.1:${port}`,
+  });
   assert.equal(exhaustedPreview.status, 410, "preview delivery cannot exceed maxDownloads");
   assert.equal(exhaustedPreview.body.includes("disposable preview fixture"), false);
 
@@ -780,7 +837,10 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.equal(quotaPreviewView.status, 200);
   const quotaPreviewCookieHeader = quotaPreviewView.headers["set-cookie"];
   const quotaPreviewCookie = String(Array.isArray(quotaPreviewCookieHeader) ? quotaPreviewCookieHeader[0] : quotaPreviewCookieHeader || "").split(";", 1)[0];
-  const previewAfterFileQuota = await request(port, `/share/${countedFileToken}/preview`, "GET", { cookie: quotaPreviewCookie });
+  const previewAfterFileQuota = await request(port, `/share/${countedFileToken}/preview`, "POST", {
+    cookie: quotaPreviewCookie,
+    origin: `http://127.0.0.1:${port}`,
+  });
   assert.equal(previewAfterFileQuota.status, 410, "preview cannot bypass an exhausted download quota");
   assert.equal(previewAfterFileQuota.body.includes("disposable preview fixture"), false);
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[countedFileToken].downloads, 1);
