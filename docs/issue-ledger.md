@@ -2,9 +2,9 @@
 
 ## Historical live snapshot — 2026-10-08 (after PR #117, source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`)
 
-This point-in-time snapshot was queried from GitHub after PR #117 merged. Later PR #116 publication and merge require a newer snapshot; checks below apply only to `1442869…`.
+This point-in-time snapshot was queried from GitHub after PR #117 merged and before the PR #116 branch was updated to the current base. The follow-up candidate snapshot below records the later PR state; the table here applies only to `1442869…` at the original query time.
 
-### Open issues and pull requests at source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`
+### Open issues and pull requests at source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a` before the PR #116 update
 
 | Item | Live state at query | Remaining acceptance boundary |
 |---|---|---|
@@ -18,7 +18,11 @@ This point-in-time snapshot was queried from GitHub after PR #117 merged. Later 
 | PR #95 | `open`, head `95d99e4a934384fcfa2101dfc210741cd791a3d1`, stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; listed checks pass; 4 threads resolved. | Update to current base and provide shared/edge limits or verified single-process topology before merge. |
 | PR #97 | `open`, head `a6a33a92cd6902f303254e60031da4bdc04cec04`, stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; listed checks pass; 5 threads resolved. | Selective-sync acceptance gaps above remain. |
 | PR #102 | `open`, head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`, base `9de3c85ab59aa16fc46916abc0cf638c539086ef`; CodeQL fails, other listed checks pass; one unresolved thread at `services/internalFile.js:31`. | Update, resolve the finding/thread, and revalidate. |
-| PR #116 | `open` at head `daa6025e0c08c29a4d4cc0b55ec9fbb31b7e4fca`, base `9e070823f2ee6372521a53d2fc130701ed074aab`; no review threads. Earlier Ubuntu run failed on an async cloud-restore test race. | PR #117 corrected the race on main; publish the candidate merge and obtain new exact-head checks and review. |
+| PR #116 | `open` at head `daa6025e0c08c29a4d4cc0b55ec9fbb31b7e4fca`, base `9e070823f2ee6372521a53d2fc130701ed074aab`; no review threads. Earlier Ubuntu run failed on an async cloud-restore test race. | PR #117 corrected the race on main; the candidate was later updated to current base and validated as recorded in the follow-up snapshot. |
+
+## Follow-up PR snapshot — 2026-10-08 (candidate head `a72d2f21db25363dc3f13d8816e3db3bd1ee2d93`, base `Root/main` `14428690bef7c02648fd0be9570aabb17ae6de1a`)
+
+Re-queried after updating the existing PR #116. Open issues remained #63 protected search, #64 native Android, #65 Zero-Knowledge, #66 selective sync/Files On-Demand, #67 destructive-change protection, #68 capability sharing, and #94 deployment-wide chunk-upload limits. Open PRs remained #116 (candidate head `a72d2f2…`, clean merge state), #102 (CodeQL failure and one unresolved thread at `services/internalFile.js:31`), #97 (stale base, selective-sync acceptance gaps), and #95 (stale/dirty base, deployment-wide limit evidence missing). PR #116 had zero submitted GitHub reviews and zero review threads at query time; its Security Regression, CodeQL, and Dependency Review checks passed on `a72d2f2…`. This follow-up adds the current candidate snapshot and corrects status wording; the resulting PR head needs fresh checks. The moderate `sprintf-js` alert `GHSA-hp3w-g68c-fv3c` remained open.
 
 ### Merged PRs and exact-SHA validation
 

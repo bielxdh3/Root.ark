@@ -71,7 +71,7 @@ The repository currently contains working foundations for:
 
 ### Exact-SHA CI snapshot — 2026-10-08 (after PR #117, source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`)
 
-After PR #117 merged, the push-triggered Security Regression workflow passed on this exact `Root/main` SHA: Ubuntu Node 22 ran 938 tests (927 passed, 11 skipped, 0 failed) and Windows Node 22 ran 938 tests (934 passed, 4 skipped, 0 failed). CodeQL, default-branch dependency review, and Pages also passed on this exact SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37720151580), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37720151634), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37720151454), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37720150655)). This snapshot predates the final closure documentation PR and is not evidence for a later merge SHA.
+After PR #117 merged, the push-triggered Security Regression workflow passed on this exact `Root/main` SHA: Ubuntu Node 22 ran 938 tests (927 passed, 11 skipped, 0 failed) and Windows Node 22 ran 938 tests (934 passed, 4 skipped, 0 failed). CodeQL, default-branch dependency review, and Pages also passed on this exact SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37720151580), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37720151634), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37720151454), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37720150655)). This snapshot predates the current-base update of PR #116 and any later merge; it is not evidence for any later merge SHA.
 
 ### Historical exact-SHA CI snapshot — 2026-10-07
 
