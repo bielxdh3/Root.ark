@@ -391,7 +391,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   ].join("\n"));
   const env = {
     ...process.env,
-    PORT: String(port), DB_ENABLED: "false", NODE_ENV: "test", JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+    PORT: String(port), DB_ENABLED: "false", NODE_ENV: "test", UPLOAD_SCAN_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
     TOTP_POLICY: "optional", CLOUD_STORAGE_PROVIDER: "s3", AWS_S3_BUCKET: "fixture-bucket", AWS_REGION: "us-east-1",
     AWS_ENDPOINT_URL: `http://127.0.0.1:${cloud.port}`, AWS_FORCE_PATH_STYLE: "true", AWS_ACCESS_KEY_ID: "fixture-access-key",
     AWS_S3_PRINCIPAL_ID: "fixture-account",
