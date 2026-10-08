@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 const bcrypt = require("bcryptjs");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -117,17 +118,29 @@ function startServer(dir, extra = {}, localCrash = false) {
   });
 }
 
-function stop(child) {
-  return new Promise((resolve) => {
-    if (child.exitCode !== null) return resolve(child.exitCode);
-    let finished = false;
-    const done = (code) => { if (finished) return; finished = true; resolve(code); };
-    child.once("exit", done);
+function stop(child, timeoutMs = 10_000) {
+  return new Promise((resolve, reject) => {
+    const streamsClosed = child.stdio.every((stream) => stream === null || stream.closed);
+    if ((child.exitCode !== null || child.signalCode !== null) && streamsClosed) return resolve(child.exitCode);
+    let timer;
+    const done = (code) => { clearTimeout(timer); resolve(code); };
+    child.once("close", done);
+    timer = setTimeout(() => {
+      child.removeListener("close", done);
+      reject(new Error("child process " + child.pid + " did not close within " + timeoutMs + "ms after termination"));
+    }, timeoutMs);
+    if (child.exitCode !== null || child.signalCode !== null) return;
     if (process.platform === "win32") spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
     else child.kill("SIGKILL");
-    setTimeout(() => done(child.exitCode), 1_000);
   });
 }
+
+test("stop rejects when a process does not close after termination", { timeout: 3_000 }, async () => {
+  const child = new EventEmitter();
+  Object.assign(child, { exitCode: null, signalCode: null, stdio: [null, null, null], pid: "not-a-pid" });
+  child.kill = () => true;
+  await assert.rejects(stop(child, 5), /did not close within 5ms/);
+});
 
 function fixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-crash-"));
