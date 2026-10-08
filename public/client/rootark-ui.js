@@ -52,13 +52,15 @@
     menuButton.setAttribute("aria-label", open ? "Fechar navegação" : "Abrir navegação");
   }
 
-  function setMobileNavigation(root, open, restoreFocus) {
+  function setMobileNavigation(root, open, restoreFocus, focusTarget) {
     root.classList.toggle("nav-open", Boolean(open));
     syncMobileNavigation(root);
     if (open && isCompactViewport()) {
       const sidebar = root.querySelector(".sidebar");
       const firstLink = sidebar && (sidebar.querySelector(".nav-link") || sidebar.querySelector("a[href], button:not([disabled])"));
       if (firstLink) firstLink.focus();
+    } else if (!open && focusTarget && typeof focusTarget.focus === "function") {
+      focusTarget.focus();
     } else if (restoreFocus) {
       const menuButton = root.querySelector(".mobile-menu");
       if (menuButton) menuButton.focus();
@@ -175,7 +177,12 @@
 
     const menuButton = root.querySelector('[data-action="menu"]');
     if (menuButton) menuButton.addEventListener("click", () => {
-      setMobileNavigation(root, !root.classList.contains("nav-open"));
+      const opening = !root.classList.contains("nav-open");
+      if (opening && isCompactViewport()) {
+        const accountMenu = root.querySelector(".account-menu");
+        if (accountMenu) accountMenu.open = false;
+      }
+      setMobileNavigation(root, opening);
     });
     const themeButton = root.querySelector('[data-action="theme"]');
     if (themeButton) themeButton.addEventListener("click", toggleTheme);
@@ -188,7 +195,7 @@
     const target = event.target && event.target.closest ? event.target : null;
     if (!root || !isCompactViewport() || !root.classList.contains("nav-open") || target && target.closest(".sidebar, .mobile-menu")) return;
     const topbarAction = target && target.closest('.topbar button, .topbar a[href], .topbar input:not([disabled]), .topbar select:not([disabled]), .topbar textarea:not([disabled]), .topbar summary, .topbar [role="button"], .topbar [tabindex]:not([tabindex="-1"])');
-    setMobileNavigation(root, false, !topbarAction);
+    setMobileNavigation(root, false, !topbarAction, topbarAction);
   }
 
   document.addEventListener("click", closeMobileNav);

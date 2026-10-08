@@ -27,6 +27,7 @@
   let uploadInProgress = false;
   let versionsRequestPending = false;
   const dirtyForms = new WeakSet();
+  const formValueBaselines = new WeakMap();
   const CHUNK_BYTES = 8 * 1024 * 1024;
   const CHUNK_THRESHOLD = 5 * 1024 * 1024;
   const MAX_BATCH_FILES = 10;
@@ -71,12 +72,16 @@
       const baseKey = [control.form.id || "", control.id || "", control.name || "", control.tagName, control.type || ""].join("\0");
       const occurrence = occurrences.get(baseKey) || 0;
       occurrences.set(baseKey, occurrence + 1);
+      const formControls = Array.from(control.form.elements || []);
+      const controlIndex = formControls.indexOf(control);
+      const baseline = formValueBaselines.get(control.form);
       return [{
         baseKey,
         occurrence,
         value: control.type === "file" ? undefined : control.value,
         checked: typeof control.checked === "boolean" ? control.checked : undefined,
         selectedValues: control.tagName === "SELECT" && control.multiple ? Array.from(control.selectedOptions, (option) => option.value) : undefined,
+        baselineValue: baseline && controlIndex >= 0 ? baseline[controlIndex] : formControlDefaultValue(control),
         fileNode: control.type === "file" && control.files && control.files.length ? control : null,
       }];
     });
@@ -85,6 +90,7 @@
     if (!snapshots.length) return;
     const occurrences = new Map();
     const controls = Array.from(root.querySelectorAll("input, select, textarea"));
+    for (const form of new Set(controls.map((control) => control.form).filter(Boolean))) captureFormBaseline(form);
     for (const control of controls) {
       const baseKey = [control.form && control.form.id || "", control.id || "", control.name || "", control.tagName, control.type || ""].join("\0");
       const occurrence = occurrences.get(baseKey) || 0;
@@ -102,7 +108,13 @@
       if (snapshot.selectedValues) {
         for (const option of Array.from(restored.options || [])) option.selected = snapshot.selectedValues.includes(option.value);
       }
-      if (restored.form) dirtyForms.add(restored.form);
+      if (restored.form) {
+        const baseline = formValueBaselines.get(restored.form) || Array.from(restored.form.elements || [], formControlValue);
+        const controlIndex = Array.from(restored.form.elements || []).indexOf(restored);
+        if (controlIndex >= 0) baseline[controlIndex] = snapshot.baselineValue;
+        formValueBaselines.set(restored.form, baseline);
+        dirtyForms.add(restored.form);
+      }
     }
   }
   function historyActionLabel(action) {
@@ -368,6 +380,52 @@
     }
   }
 
+  function formControlValue(control) {
+    if (control.type === "file") return Boolean(control.files && control.files.length);
+    if (control.type === "checkbox" || control.type === "radio") return Boolean(control.checked);
+    if (control.tagName === "SELECT") {
+      return control.multiple
+        ? Array.from(control.selectedOptions || [], (option) => option.value)
+        : control.value;
+    }
+    return control.value;
+  }
+
+  function formControlDefaultValue(control) {
+    if (control.type === "file") return false;
+    if (control.type === "checkbox" || control.type === "radio") return Boolean(control.defaultChecked);
+    if (control.tagName === "SELECT") {
+      return control.multiple
+        ? Array.from(control.options || []).filter((option) => option.defaultSelected).map((option) => option.value)
+        : Array.from(control.options || []).find((option) => option.defaultSelected)?.value || "";
+    }
+    return control.defaultValue;
+  }
+
+  function formValuesEqual(left, right) {
+    if (Array.isArray(left) && Array.isArray(right)) return left.length === right.length && left.every((value, index) => value === right[index]);
+    return left === right;
+  }
+
+  function captureFormBaseline(form) {
+    if (!form || formValueBaselines.has(form)) return;
+    formValueBaselines.set(form, Array.from(form.elements || [], formControlValue));
+  }
+
+  function formHasChangedValues(form) {
+    const baselines = formValueBaselines.get(form);
+    return Array.from(form.elements || []).some((control, index) => {
+      const baseline = baselines && index < baselines.length ? baselines[index] : formControlDefaultValue(control);
+      return !formValuesEqual(formControlValue(control), baseline);
+    });
+  }
+
+  function syncDirtyForm(form) {
+    if (!form) return;
+    if (formHasChangedValues(form)) dirtyForms.add(form);
+    else dirtyForms.delete(form);
+  }
+
   function hasActiveWorkspaceInteraction() {
     if (state.loading || document.querySelector("dialog[open]")) return true;
     const activeElement = document.activeElement;
@@ -401,18 +459,26 @@
     if (realtimeRefreshPending) scheduleRealtimeRefresh();
   }
 
+  document.addEventListener("focusin", (event) => {
+    captureFormBaseline(event.target && event.target.form);
+  }, true);
   document.addEventListener("input", (event) => {
-    if (event.target && event.target.form) dirtyForms.add(event.target.form);
+    syncDirtyForm(event.target && event.target.form);
   }, true);
   document.addEventListener("change", (event) => {
-    if (event.target && event.target.form) dirtyForms.add(event.target.form);
+    syncDirtyForm(event.target && event.target.form);
   }, true);
-  document.addEventListener("focusout", schedulePendingRefresh, true);
+  document.addEventListener("focusout", (event) => {
+    syncDirtyForm(event.target && event.target.form);
+    schedulePendingRefresh();
+  }, true);
   document.addEventListener("close", schedulePendingRefresh, true);
   document.addEventListener("reset", (event) => {
     const form = event.target;
     if (!form || form.tagName !== "FORM") return;
     window.setTimeout(() => {
+      formValueBaselines.delete(form);
+      captureFormBaseline(form);
       dirtyForms.delete(form);
       schedulePendingRefresh();
     }, 0);

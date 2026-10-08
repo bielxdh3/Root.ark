@@ -174,10 +174,12 @@ test("mobile navigation keeps focus on an activated topbar action", () => {
   const accountMenu = { className: "account-menu", parentElement: topbar };
   const accountSummary = { tagName: "SUMMARY", parentElement: accountMenu, focus() { document.activeElement = this; } };
   const avatar = { tagName: "SPAN", parentElement: accountSummary };
+  const sidebarLink = { focus() { document.activeElement = this; } };
   const topbarActionSelector = '.topbar button, .topbar a[href], .topbar input:not([disabled]), .topbar select:not([disabled]), .topbar textarea:not([disabled]), .topbar summary, .topbar [role="button"], .topbar [tabindex]:not([tabindex="-1"])';
   const sidebar = {
     inert: false,
-    contains() { return false; },
+    contains(element) { return element === sidebarLink; },
+    querySelector(selector) { return selector === ".nav-link" ? sidebarLink : null; },
     setAttribute() {},
     removeAttribute() {},
   };
@@ -191,7 +193,7 @@ test("mobile navigation keeps focus on an activated topbar action", () => {
     querySelector(selector) { return selector === ".sidebar" ? sidebar : selector === ".mobile-menu" ? menuButton : null; },
   };
   const document = {
-    activeElement: accountSummary,
+    activeElement: sidebarLink,
     documentElement: { dataset: {} },
     addEventListener(name, listener) { listeners.set(name, listener); },
     getElementById(id) { return id === "app-root" ? root : null; },
@@ -217,7 +219,72 @@ test("mobile navigation keeps focus on an activated topbar action", () => {
   assert.equal(menuButton.attributes.get("aria-expanded"), "false");
   assert.equal(source.includes(`closest('${topbarActionSelector}')`), true, "the handler asks for the exact selector that matches a summary inside the topbar");
   assert.equal(matchedTopbarActionSelector, true, "a clicked descendant resolves to its summary inside the topbar");
-  assert.equal(document.activeElement, accountSummary, "closing the drawer does not steal focus from the topbar action");
+  assert.equal(document.activeElement, accountSummary, "closing the drawer moves focus from the sidebar to the activated topbar action");
+});
+
+test("opening compact navigation closes the account details popover and focuses the drawer", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-ui.js"), "utf8");
+  const listeners = new Map();
+  const firstLink = { focus() { document.activeElement = this; } };
+  const sidebar = {
+    inert: false,
+    contains(element) { return element === firstLink; },
+    querySelector(selector) { return selector === ".nav-link" ? firstLink : null; },
+    setAttribute() {},
+    removeAttribute() {},
+  };
+  const menuButton = { setAttribute() {}, addEventListener(name, listener) { listeners.set("menu:" + name, listener); }, focus() { document.activeElement = this; } };
+  const accountMenu = { open: true };
+  const root = {
+    innerHTML: "",
+    navOpen: false,
+    classList: {
+      contains(name) { return name === "nav-open" && root.navOpen; },
+      toggle(name, value) { if (name === "nav-open") root.navOpen = Boolean(value); },
+      remove(name) { if (name === "nav-open") root.navOpen = false; },
+    },
+    querySelector(selector) {
+      if (selector === ".sidebar") return sidebar;
+      if (selector === '[data-action="menu"]') return menuButton;
+      if (selector === ".account-menu") return accountMenu;
+      return null;
+    },
+  };
+  const document = {
+    activeElement: menuButton,
+    documentElement: { dataset: {} },
+    addEventListener(name, listener) { listeners.set("document:" + name, listener); },
+    getElementById(id) { return id === "app-root" ? root : null; },
+  };
+  const context = {
+    document,
+    localStorage: { getItem() { return null; } },
+    window: { addEventListener() {}, matchMedia() { return { matches: true }; }, setTimeout },
+  };
+  vm.runInNewContext(source, context);
+
+  context.window.RootarkUI.mount({ user: { username: "admin", role: "admin", permissions: {} } });
+  listeners.get("menu:click")();
+
+  assert.equal(accountMenu.open, false, "opening the drawer closes the account details popover");
+  assert.equal(root.classList.contains("nav-open"), true);
+  assert.equal(document.activeElement, firstLink, "focus enters the open drawer");
+});
+
+test("compact drawer keeps geometry and stacking declarations stable while it animates", () => {
+  const css = fs.readFileSync(path.join(__dirname, "..", "public", "styles", "app.css"), "utf8");
+  const compactRules = css.match(/@media\s*\(max-width:\s*860px\)\s*\{([\s\S]*?)\n\}/);
+  assert.ok(compactRules, "compact navigation styles are present");
+  const sidebarRule = compactRules[1].match(/\.sidebar\s*\{([^}]*)\}/);
+  const openRule = compactRules[1].match(/\.nav-open\s+\.sidebar\s*\{([^}]*)\}/);
+  assert.ok(sidebarRule && openRule, "closed and open compact drawer rules are present");
+  for (const property of ["top: 62px", "z-index: 15", "height: calc(100vh - 62px)"]) {
+    assert.ok(sidebarRule[1].includes(property), `closed drawer geometry includes ${property}`);
+  }
+  assert.match(sidebarRule[1], /transition:\s*transform\s+180ms\s+ease/);
+  assert.match(sidebarRule[1], /transform:\s*translateX\(-102%\)/);
+  assert.match(openRule[1], /transform:\s*translateX\(0\)/);
+  assert.doesNotMatch(openRule[1], /(?:top|height|z-index)\s*:/, "open and closed states share geometry and stacking");
 });
 
 test("mobile navigation traps keyboard focus at both sidebar boundaries", () => {

@@ -141,8 +141,8 @@
         } catch (enrollError) {
           enrollmentToken = null;
           clearEnrollmentDetails();
-          message(friendlyError(enrollError, "Não foi possível iniciar a configuração de autenticação."));
           showStep("login");
+          message(friendlyError(enrollError, "Não foi possível iniciar a configuração de autenticação."));
         }
       } else {
         message(friendlyError(error, "Não foi possível entrar. Tente novamente.", true));

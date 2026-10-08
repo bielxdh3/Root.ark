@@ -42,6 +42,7 @@ test("opening and closing the inline versions panel preserve keyboard focus", as
     name: "q",
     tagName: "INPUT",
     type: "search",
+    defaultValue: "",
     form,
     value: "",
     closest(selector) { return selector === "[data-action]" ? null : this; },
@@ -65,6 +66,7 @@ test("opening and closing the inline versions panel preserve keyboard focus", as
       id: "upload-form",
       tagName: "FORM",
       isConnected: true,
+      elements: [uploadFileInput],
       reset() { uploadFileInput.files = []; },
       querySelector(selector) { return selector === 'button[type="submit"]' ? uploadSubmitButton : null; },
     };
@@ -143,12 +145,13 @@ test("opening and closing the inline versions panel preserve keyboard focus", as
       if (advancedDetails) advancedDetails.isConnected = false;
       if (advancedSummary) advancedSummary.isConnected = false;
       if (versionsHeading) versionsHeading.isConnected = false;
-      searchForm = content.includes('id="search-form"') ? { id: "search-form" } : null;
+      searchForm = content.includes('id="search-form"') ? { id: "search-form", elements: [] } : null;
       advancedDetails = content.includes('<details class="search-advanced">') ? { className: "search-advanced", open: false, isConnected: true } : null;
       versionButton = content.includes('data-action="file-versions"') ? makeButton("file-versions", "example.txt", "root") : null;
       closeButton = content.includes('data-action="close-versions"') ? makeButton("close-versions", "", "") : null;
       folderButton = content.includes('data-action="select-folder"') ? makeButton("select-folder", "", "", "archive") : null;
       searchInput = content.includes('name="q" type="search"') ? makeSearchInput(searchForm) : null;
+      if (searchForm && searchInput) searchForm.elements.push(searchInput);
       advancedSummary = content.includes("<summary>Filtros avançados</summary>") ? makeAdvancedSummary() : null;
       versionsHeading = content.includes('<h2 tabindex="-1">') ? { isConnected: true, focus() { activeElement = this; } } : null;
       uploadForm = content.includes('id="upload-form"') ? makeUploadForm() : null;
