@@ -46,7 +46,9 @@ This point-in-time snapshot was queried from GitHub after PR #117 merged and bef
 
 At that historical query after the initial PR #116 update, issues #63 protected search, #64 native Android, #65 Zero-Knowledge, #66 selective sync/Files On-Demand, #67 destructive-change protection, #68 capability sharing, and #94 deployment-wide chunk-upload limits were open. PR #116 was then at candidate head `a72d2f2…` with clean merge state. PR #102 had a CodeQL failure and one unresolved thread at `services/internalFile.js:31`; PR #97 and #95 had stale bases, with #95 also dirty. PR #116 had zero submitted GitHub reviews and zero review threads at that query; its Security Regression, CodeQL, and Dependency Review checks passed on `a72d2f2…`. At that time, the subsequently published wording correction still required fresh checks. The moderate `sprintf-js` alert `GHSA-hp3w-g68c-fv3c` remained open.
 
-## Latest PR #116 candidate snapshot — 2026-10-08 (head `448d1c1ecd2cd3a1391dd741027dc146be3735b6`, base `Root/main` `14428690bef7c02648fd0be9570aabb17ae6de1a`)
+## Historical PR #116 candidate snapshot before merge — 2026-10-08 (head `448d1c1ecd2cd3a1391dd741027dc146be3735b6`, base `Root/main` `14428690bef7c02648fd0be9570aabb17ae6de1a`)
+
+This point-in-time candidate snapshot predates the final PR #116 head and merge; use the latest GitHub snapshot at the top of this ledger for the current state.
 
 At this query, issues #63 protected search, #64 native Android, #65 Zero-Knowledge, #66 selective sync/Files On-Demand, #67 destructive-change protection, #68 capability sharing, and #94 deployment-wide chunk-upload limits were open. PR #116 was open with `CLEAN` merge state at the head/base above; PRs #95, #97, and #102 were also open. PR #95 remained `DIRTY` on stale base `d2ae0eb…`; PR #97 remained open on stale base `d2ae0eb…`; PR #102 remained `DIRTY` with a CodeQL failure and one unresolved thread at `services/internalFile.js:31`. PR #116 had no submitted GitHub reviews or unresolved review threads at query time.
 
