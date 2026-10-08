@@ -1028,6 +1028,21 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   assert.equal((await waitForServer(port, child)).status, 200);
   const recoveryDeadline = Date.now() + 5000;
   while (objects.has(failedDeleteKey) && Date.now() < recoveryDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  const restartRecoveryDiagnostics = {
+    cloudTempErrors: childErrors.split(/\r?\n/)
+      .filter((line) => line.includes("[cloud-temp]"))
+      .map((line) => line.replaceAll(directory, "<fixture>")),
+    cloudTempQueueEntries: fs.existsSync(cloudQueueDirectory)
+      ? fs.readdirSync(cloudQueueDirectory).map((name) => {
+        try {
+          const record = JSON.parse(fs.readFileSync(path.join(cloudQueueDirectory, name), "utf8"));
+          return { name, parses: true, folderId: record.folderId, fileName: record.fileName, area: record.area || "temp", desired: record.desired };
+        } catch (error) {
+          return { name, parses: false, error: error.code || error.name };
+        }
+      })
+      : [],
+  };
   results.push({
     case: "failed-temp-delete-retries-after-restart",
     actual: { rejectStatus: failedDeleteResponse.status, providerObjectRemains: objects.has(failedDeleteKey), attemptsBeforeRestart, attemptsAfterRestart: cloud.deleteAttemptCount(failedDeleteKey), staleLocalBytesRemain: fs.existsSync(stalePendingPath), stalePendingRegistrationRemains: Boolean(JSON.parse(fs.readFileSync(pendingRegistryPath, "utf8"))[`root/${failedDeleteName}`]) },
@@ -1060,5 +1075,8 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   ]);
   assert.ok(resolvedApprovals, "cross-folder approval lookup completes without waiting on the other request's folder lock");
   assert.deepEqual(resolvedApprovals.map((response) => response.status), [404, 404]);
-  assert.deepEqual(results.map(({ actual }) => actual), results.map(({ expected }) => expected), JSON.stringify(results, null, 2));
+  assert.deepEqual(results.map(({ actual }) => actual), results.map(({ expected }) => expected), JSON.stringify({
+    results,
+    restartRecovery: restartRecoveryDiagnostics,
+  }, null, 2));
 });
