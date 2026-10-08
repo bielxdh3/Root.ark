@@ -171,7 +171,10 @@ test("backup and restore stay in the child runtime root", { timeout: 45_000 }, a
   assert.equal((await waitForServer(port)).status, 200);
   assert.equal((await request(port, "/backups", { headers: { cookie: manager.cookie } })).status, 200);
   const removed = await request(port, `/backups/${backup.id}`, { method: "DELETE", headers: headers(port, manager) });
-  assert.equal(removed.status, 200, removed.body); assert.equal(fs.existsSync(archivePath), false); assert.equal(fs.existsSync(path.join(sandbox, "data", "backups", restoredBody.preRestoreBackup.filename)), true);
+  assert.equal(removed.status, 400, removed.body);
+  assert.match(JSON.parse(removed.body).error, /unresolved provider inventory baseline/i);
+  assert.equal(fs.existsSync(archivePath), true, "the selected baseline remains available until provider reconciliation completes");
+  assert.equal(fs.existsSync(path.join(sandbox, "data", "backups", restoredBody.preRestoreBackup.filename)), true);
   assert.deepEqual(checkoutState(path.join(ROOT, "data", "backups")), checkoutBefore.backups);
   assert.deepEqual(checkoutState(path.join(ROOT, "data", "backup-history.json")), checkoutBefore.history);
   assert.deepEqual(checkoutState(path.join(ROOT, "data", "backups", ".restore-tmp")), checkoutBefore.restoreTemp);

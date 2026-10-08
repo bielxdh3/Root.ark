@@ -55,6 +55,41 @@ test("retention retains only eligible backups", async (t) => {
   await t.test("combined count and age retain excluded history only", () => assert.deepEqual(retention({ BACKUP_RETENTION_COUNT: "1", BACKUP_RETENTION_DAYS: "1" }), ["00000000-0000-4000-8000-000000000003", "00000000-0000-4000-8000-000000000004"]));
 });
 
+test("retention and explicit deletion preserve an unresolved provider inventory baseline", () => {
+  const result = run(`
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const service = require(${JSON.stringify(servicePath)});
+    const orphans = require(${JSON.stringify(path.join(__dirname, "..", "services", "restoreProviderOrphans"))});
+    const now = Date.now();
+    const baselineId = "00000000-0000-4000-8000-000000000001";
+    const otherId = "00000000-0000-4000-8000-000000000002";
+    const entries = [
+      { id: baselineId, filename: "rootark-backup-2026-01-01-00-00-00.zip", status: "success", type: "manual", createdAt: new Date(now - 3 * 86400000).toISOString() },
+      { id: otherId, filename: "rootark-backup-2026-01-02-00-00-00.zip", status: "success", type: "manual", createdAt: new Date(now).toISOString() },
+    ];
+    fs.mkdirSync(service.BACKUPS_DIR, { recursive: true });
+    for (const item of entries) fs.writeFileSync(path.join(service.BACKUPS_DIR, item.filename), item.id);
+    fs.mkdirSync("data", { recursive: true });
+    fs.writeFileSync("data/backup-history.json", JSON.stringify(entries));
+    const marker = { state: "unknown", backupId: baselineId };
+    fs.writeFileSync(orphans.POLICY_PATH, JSON.stringify({ version: 1, objects: [], providerInventory: marker }));
+    fs.writeFileSync(orphans.STATE_PATH, JSON.stringify({ version: 1, providerInventory: marker }));
+    (async () => {
+      process.env.BACKUP_RETENTION_COUNT = "1";
+      process.env.BACKUP_RETENTION_DAYS = "0";
+      await service.cleanupRetention();
+      let blocked = false;
+      try { service.deleteBackup(baselineId); } catch (error) { blocked = /provider inventory baseline/i.test(error.message); }
+      console.log(JSON.stringify({ ids: service.listBackups().filter((item) => item.exists).map((item) => item.id), baselineExists: fs.existsSync(path.join(service.BACKUPS_DIR, entries[0].filename)), blocked }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `, { BACKUP_RETENTION_COUNT: "1", BACKUP_RETENTION_DAYS: "0" });
+  assert.deepEqual(new Set(result.ids), new Set(["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"]),
+    "the unresolved baseline is retained even when older than the retention limit, alongside the newest eligible backup");
+  assert.equal(result.baselineExists, true);
+  assert.equal(result.blocked, true, "manual deletion cannot discard the only unresolved provider baseline");
+});
+
 test("a released lock permits a different backup operation", () => {
   const result = run(`const service = require(${JSON.stringify(servicePath)}); const release = service.acquireLock("backup"); let locked; try { service.acquireLock("delete"); } catch (error) { locked = error.code; } release(); const second = service.acquireLock("delete"); second(); console.log(JSON.stringify(locked));`);
   assert.equal(result, "BACKUP_LOCKED");

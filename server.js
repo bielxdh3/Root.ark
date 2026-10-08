@@ -9952,8 +9952,15 @@ const listenForRequests = () => {
     console.log(`Servidor rodando em http://localhost:${PORT}`);
   });
 };
-if (restoreProviderOrphans.isInventoryUnknown() && cloudStorage.enabled()) {
-  void restoreService.reconcileUnknownProviderInventory().then(listenForRequests).catch((error) => {
+const startupProviderInventory = restoreProviderOrphans.getInventoryStatus(cloudStorage);
+if (startupProviderInventory.state === "unknown") {
+  void (async () => {
+    if (restoreProviderOrphans.getInventoryStatus().state !== "unknown") {
+      await restoreProviderOrphans.markInventoryUnknown(startupProviderInventory.backupId);
+    }
+    if (cloudStorage.enabled()) await restoreService.reconcileUnknownProviderInventory();
+    listenForRequests();
+  })().catch((error) => {
     startupRestoreLease();
     console.error("[restore] provider inventory reconciliation failed; startup blocked:", sanitizeLogValue(error.message));
     process.exit(1);

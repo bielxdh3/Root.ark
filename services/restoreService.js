@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const crypto = require("crypto");
 const Database = require("better-sqlite3");
 const unzipper = require("unzipper");
@@ -563,9 +564,12 @@ function restoreSyncEntryDueAt(entry, now) {
 }
 
 async function reconcileUnknownProviderInventory({ baselineBackupId, clock, sleep } = {}) {
-  const status = restoreProviderOrphans.getInventoryStatus();
+  const status = restoreProviderOrphans.getInventoryStatus(cloudStorage);
   if (status.state !== "unknown") return { state: status.state, changed: false };
   if (!cloudStorage?.enabled?.()) return { state: "unknown", providerDisabled: true, changed: false };
+  if (restoreProviderOrphans.getInventoryStatus().state !== "unknown") {
+    await restoreProviderOrphans.markInventoryUnknown(status.backupId);
+  }
   if (typeof cloudStorage.inventory !== "function") throw new Error("Cloud provider inventory is required before cloud access can resume");
   const explicitBaseline = String(baselineBackupId || process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID || "").trim();
   if (status.backupId && explicitBaseline && status.backupId !== explicitBaseline) {
@@ -575,7 +579,10 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
   if (!selectedBackupId) throw new Error("An explicit backup baseline is required to reconcile legacy provider inventory");
 
   const { backup, archivePath } = backupService.getBackupOrThrow(selectedBackupId);
-  const { manifest } = await validateBackupArchive(backup, archivePath);
+  const { zip, manifest } = await validateBackupArchive(backup, archivePath);
+  const archiveEntries = new Map(zip.files
+    .filter((entry) => entry.type !== "Directory")
+    .map((entry) => [String(entry.path || "").replace(/\\/g, "/"), entry]));
   let selectedBackup = backupRepository.getBackup(selectedBackupId) || backup;
   if (!selectedBackup.metadata?.restoreSync || ["completed", "cancelled"].includes(selectedBackup.metadata.restoreSync.state)) {
     const restoreSync = createRestoreSync(manifest);
@@ -624,7 +631,7 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
     const revision = Number(sync?.revision) || 0;
     const priorAttempts = new Map(entries.map((entry) => [entry.entryId, Number(entry.attempts) || 0]));
     selectedBackup = await processRestoreSyncInternal(
-      { backupId: selectedBackupId, clock, uploader: cloudStorage },
+      { backupId: selectedBackupId, clock, uploader: cloudStorage, archiveEntries },
       STARTUP_INVENTORY_RECONCILIATION,
     );
     const updatedSync = selectedBackup?.metadata?.restoreSync;
@@ -647,7 +654,7 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
   const orphaned = normalizedInventory.filter((entry) => !selectedUploads.has(
     restoreProviderOrphans.identityKey(entry.area, entry.folderId, entry.name),
   ));
-  await restoreProviderOrphans.reconcileInventory(selectedBackupId, orphaned);
+  await restoreProviderOrphans.reconcileInventory(selectedBackupId, orphaned, cloudStorage.inventoryContext?.() || null);
   return { state: "reconciled", backupId: backup.id, suppressed: orphaned.length, changed: true };
 }
 
@@ -742,11 +749,11 @@ function cancelRestoreSync(backupId, reason = "cancelled", { clock } = {}) {
 
 const STARTUP_INVENTORY_RECONCILIATION = Symbol("startup-inventory-reconciliation");
 
-async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs = 60 * 1000, workerId, runFileLifecycleMutation } = {}, authority) {
+async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs = 60 * 1000, workerId, runFileLifecycleMutation, archiveEntries } = {}, authority) {
   const provider = uploader || cloudStorage;
   let latest = backupRepository.getBackup(backupId);
   if (!latest || !latest.metadata?.restoreSync || !provider?.enabled?.()) return latest;
-  if (restoreProviderOrphans.isInventoryUnknown() && authority !== STARTUP_INVENTORY_RECONCILIATION) restoreProviderOrphans.assertProviderAvailable();
+  if (restoreProviderOrphans.isInventoryUnknown(provider) && authority !== STARTUP_INVENTORY_RECONCILIATION) restoreProviderOrphans.assertProviderAvailable(provider);
   if (latest.metadata.restoreSync.entries?.length
     && latest.metadata.restoreSync.entries.every((entry) => entry.state === "completed")
     && latest.metadata.restoreSync.state !== "completed") {
@@ -776,44 +783,57 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
     if (!lease) continue;
     try {
       const reconcileObject = async () => {
-        const localPath = resolveRuntimePath(lease.entry.path);
-        if (!fs.existsSync(localPath) || !fs.statSync(localPath).isFile()) throw Object.assign(new Error("restore source unavailable"), { code: "source_unavailable" });
-        let entryForUpload = lease.entry;
-        if (providerIdentity === "gdrive") {
-          if (typeof provider.resolveUploadId !== "function") {
-            throw Object.assign(new Error("Google Drive adapter cannot reserve an idempotent restore target"), { code: "configuration" });
+        const archiveEntry = archiveEntries?.get(String(lease.entry.path || "").replace(/\\/g, "/"));
+        let localPath = resolveRuntimePath(lease.entry.path);
+        let temporarySourceDirectory = null;
+        try {
+          if (archiveEntries) {
+            if (!archiveEntry) throw Object.assign(new Error("restore archive source unavailable"), { code: "source_unavailable" });
+            temporarySourceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-sync-"));
+            localPath = path.join(temporarySourceDirectory, path.basename(lease.entry.path));
+            fs.writeFileSync(localPath, await archiveEntry.buffer(), { flag: "wx", mode: 0o600 });
+          } else if (!fs.existsSync(localPath) || !fs.statSync(localPath).isFile()) {
+            throw Object.assign(new Error("restore source unavailable"), { code: "source_unavailable" });
           }
-          let providerFileId = String(entryForUpload.providerFileId || "").trim();
-          if (!providerFileId) {
-            providerFileId = String(await provider.resolveUploadId(entryForUpload.folderId, entryForUpload.name, entryForUpload.area) || "").trim();
-            if (!providerFileId) throw Object.assign(new Error("Google Drive did not provide a stable restore target"), { code: "configuration" });
-            const beforePin = backupRepository.getBackup(backupId);
-            const currentEntry = beforePin?.metadata?.restoreSync?.entries?.find((value) => value.entryId === lease.entry.entryId);
-            if (!currentEntry || currentEntry.leaseToken !== lease.token) return false;
-            const pinned = backupRepository.mutateRestoreSyncEntry({
-              backupId,
-              operationId: beforePin.metadata.restoreSync.operationId,
-              entryId: lease.entry.entryId,
-              expectedState: "in_progress",
-              expectedLeaseToken: lease.token,
-              expectedRevision: Number(beforePin.metadata.restoreSync.revision) || 0,
-              mutate: (latestEntry) => ({
-                entry: { ...latestEntry, providerFileId },
-                details: {},
-                at: syncNow(clock),
-              }),
-            });
-            entryForUpload = pinned.metadata.restoreSync.entries.find((value) => value.entryId === lease.entry.entryId);
-            if (!entryForUpload || entryForUpload.leaseToken !== lease.token || entryForUpload.providerFileId !== providerFileId) return false;
+          let entryForUpload = lease.entry;
+          if (providerIdentity === "gdrive") {
+            if (typeof provider.resolveUploadId !== "function") {
+              throw Object.assign(new Error("Google Drive adapter cannot reserve an idempotent restore target"), { code: "configuration" });
+            }
+            let providerFileId = String(entryForUpload.providerFileId || "").trim();
+            if (!providerFileId) {
+              providerFileId = String(await provider.resolveUploadId(entryForUpload.folderId, entryForUpload.name, entryForUpload.area) || "").trim();
+              if (!providerFileId) throw Object.assign(new Error("Google Drive did not provide a stable restore target"), { code: "configuration" });
+              const beforePin = backupRepository.getBackup(backupId);
+              const currentEntry = beforePin?.metadata?.restoreSync?.entries?.find((value) => value.entryId === lease.entry.entryId);
+              if (!currentEntry || currentEntry.leaseToken !== lease.token) return false;
+              const pinned = backupRepository.mutateRestoreSyncEntry({
+                backupId,
+                operationId: beforePin.metadata.restoreSync.operationId,
+                entryId: lease.entry.entryId,
+                expectedState: "in_progress",
+                expectedLeaseToken: lease.token,
+                expectedRevision: Number(beforePin.metadata.restoreSync.revision) || 0,
+                mutate: (latestEntry) => ({
+                  entry: { ...latestEntry, providerFileId },
+                  details: {},
+                  at: syncNow(clock),
+                }),
+              });
+              entryForUpload = pinned.metadata.restoreSync.entries.find((value) => value.entryId === lease.entry.entryId);
+              if (!entryForUpload || entryForUpload.leaseToken !== lease.token || entryForUpload.providerFileId !== providerFileId) return false;
+            }
           }
+          const uploaded = await provider.upload(localPath, entryForUpload.folderId, entryForUpload.name, entryForUpload.area,
+            providerIdentity === "gdrive" ? { providerFileId: entryForUpload.providerFileId } : undefined);
+          if (!uploaded) throw Object.assign(new Error("restore source unavailable"), { code: "source_unavailable" });
+          if (authority !== STARTUP_INVENTORY_RECONCILIATION) {
+            await restoreProviderOrphans.clear(entryForUpload.folderId, entryForUpload.name, entryForUpload.area, provider);
+          }
+          return true;
+        } finally {
+          if (temporarySourceDirectory) fs.rmSync(temporarySourceDirectory, { recursive: true, force: true });
         }
-        const uploaded = await provider.upload(localPath, entryForUpload.folderId, entryForUpload.name, entryForUpload.area,
-          providerIdentity === "gdrive" ? { providerFileId: entryForUpload.providerFileId } : undefined);
-        if (!uploaded) throw Object.assign(new Error("restore source unavailable"), { code: "source_unavailable" });
-        if (authority !== STARTUP_INVENTORY_RECONCILIATION) {
-          await restoreProviderOrphans.clear(entryForUpload.folderId, entryForUpload.name, entryForUpload.area, provider);
-        }
-        return true;
       };
       const runMutation = typeof runFileLifecycleMutation === "function"
         ? runFileLifecycleMutation
@@ -1867,7 +1887,7 @@ async function restoreBackup(id, options = {}) {
 
   const pending = assertNoPendingWholeRestore();
   if (pending.restartRequired) throw new Error("Reinicie todas as instancias do servidor antes de iniciar outro restore");
-  if (cloudStorage?.enabled?.() && restoreProviderOrphans.isInventoryUnknown()) restoreProviderOrphans.assertProviderAvailable();
+  if (cloudStorage?.enabled?.() && restoreProviderOrphans.isInventoryUnknown(cloudStorage)) restoreProviderOrphans.assertProviderAvailable(cloudStorage);
   const requiredRestartInstances = configuredRestartInstanceCount();
   restoreInstanceId(requiredRestartInstances);
 

@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { pipeline } = require("stream/promises");
 const { normalizeProviderError } = require("../src/services/deploymentResilience");
 
@@ -21,6 +22,14 @@ function createCloudStorage(options = {}) {
       s3: { bucketConfigured: Boolean(options.s3?.bucket), region: options.s3?.region || "", endpointConfigured: Boolean(options.s3?.endpoint) },
       gdrive: { folderConfigured: Boolean(options.gdrive?.folderId), credentialsConfigured: Boolean(options.gdrive?.credentials || options.gdrive?.credentialsPath) },
     };
+  }
+  function inventoryContext() {
+    const context = provider === "s3"
+      ? [provider, prefix, options.s3?.bucket || "", options.s3?.region || "", options.s3?.endpoint || ""]
+      : provider === "gdrive"
+        ? [provider, prefix, options.gdrive?.folderId || "", options.gdrive?.credentials ? crypto.createHash("sha256").update(String(options.gdrive.credentials)).digest("hex") : options.gdrive?.credentialsPath || "default-credentials"]
+        : [provider, prefix];
+    return crypto.createHash("sha256").update(JSON.stringify(context)).digest("hex");
   }
   function key(folderId = rootFolderId, fileName = "", area = "uploads") {
     const segment = (value, name) => {
@@ -297,7 +306,7 @@ function createCloudStorage(options = {}) {
   const run = async (operation, ...args) => {
     try { return await operation(...args); } catch (error) { throw classify(error); }
   };
-  return { provider, enabled, status, key, inventory: (...args) => run(inventory, ...args), resolveUploadId: (...args) => run(resolveUploadId, ...args), upload: (...args) => run(upload, ...args), download: (...args) => run(download, ...args), remove: (...args) => run(remove, ...args), removePrefix: (...args) => run(removePrefix, ...args), list: (...args) => run(list, ...args) };
+  return { provider, enabled, status, inventoryContext, key, inventory: (...args) => run(inventory, ...args), resolveUploadId: (...args) => run(resolveUploadId, ...args), upload: (...args) => run(upload, ...args), download: (...args) => run(download, ...args), remove: (...args) => run(remove, ...args), removePrefix: (...args) => run(removePrefix, ...args), list: (...args) => run(list, ...args) };
 }
 
 function normalizePrefix(value) { const clean = String(value || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""); if (!clean || clean.split("/").some((part) => !part || part === "." || part === "..")) throw cloudError("invalid_prefix", "Invalid cloud prefix"); return clean; }

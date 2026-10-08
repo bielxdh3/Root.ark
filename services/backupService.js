@@ -1103,8 +1103,10 @@ async function cleanupRetention(options = {}) {
   const days = Math.max(0, Math.floor(envNumber("BACKUP_RETENTION_DAYS", 30)));
   const cutoff = days ? Date.now() - days * 24 * 60 * 60 * 1000 : null;
   recoverRetentionTombstones();
+  const inventory = restoreProviderOrphans.getInventoryStatus();
+  const unresolvedBaselineId = inventory.state === "unknown" ? inventory.backupId : null;
   const backups = backupRepository.listBackups()
-    .filter((item) => item.status === "success" && item.type !== "pre-restore")
+    .filter((item) => item.status === "success" && item.type !== "pre-restore" && item.id !== unresolvedBaselineId)
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt) || String(b.id).localeCompare(String(a.id)));
 
   const toDelete = backups.filter((item, index) => (count > 0 && index >= count) || (cutoff && new Date(item.createdAt).getTime() < cutoff));
@@ -1293,6 +1295,10 @@ function getBackupOrThrow(id) {
 function deleteBackup(id) {
   const release = acquireLock("delete");
   try {
+    const inventory = restoreProviderOrphans.getInventoryStatus();
+    if (inventory.state === "unknown" && inventory.backupId === String(id)) {
+      throw new Error("Backup is the unresolved provider inventory baseline and cannot be deleted");
+    }
     const { backup, archivePath } = getBackupOrThrow(id);
     fs.rmSync(archivePath, { force: true });
     backupRepository.deleteBackup(backup.id);

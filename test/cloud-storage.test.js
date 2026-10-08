@@ -403,6 +403,16 @@ test("status exposes provider-neutral configuration without credentials", () => 
   assert.deepEqual(storage.status(), { provider: "s3", enabled: true, prefix: "rootark", s3: { bucketConfigured: true, region: "eu", endpointConfigured: false }, gdrive: { folderConfigured: false, credentialsConfigured: false } });
 });
 
+test("inventory context changes with provider namespace configuration without exposing config values", () => {
+  const base = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket-a", region: "eu" } });
+  const bucketChanged = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket-b", region: "eu" } });
+  const prefixChanged = createCloudStorage({ provider: "s3", prefix: "other", s3: { bucket: "bucket-a", region: "eu" } });
+  const providerChanged = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "folder-a", credentials: "fixture-private-credential" } });
+  assert.match(base.inventoryContext(), /^[a-f0-9]{64}$/);
+  assert.equal(new Set([base.inventoryContext(), bucketChanged.inventoryContext(), prefixChanged.inventoryContext(), providerChanged.inventoryContext()]).size, 4);
+  assert.equal(JSON.stringify(providerChanged.inventoryContext()).includes("fixture-private-credential"), false);
+});
+
 test("root-folder keys use the uploads area", () => {
   const storage = createCloudStorage({ provider: "s3" });
   assert.equal(storage.key(), "rootark/uploads/root");
