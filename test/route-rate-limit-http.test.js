@@ -238,25 +238,28 @@ test("route rate limits enforce separate budgets despite direct-origin X-Forward
   const redemptions = await Promise.all([1, 2, 3].map((index) => request(port, openUrl, "GET", {
     "x-forwarded-for": `198.51.100.${index}`,
   })));
-  assert.deepEqual(redemptions.map((response) => response.status), [200, 200, 429]);
-  assert.equal(redemptions[0].body, "valid open-file token fixture");
-  assert.equal(redemptions[2].headers["ratelimit-limit"], "2");
-  assert.match(redemptions[2].body, /Muitas solicitações/);
+  assert.deepEqual(redemptions.map((response) => response.status).sort((a, b) => a - b), [200, 200, 429]);
+  assert.equal(redemptions.find((response) => response.status === 200).body, "valid open-file token fixture");
+  const limitedRedemption = redemptions.find((response) => response.status === 429);
+  assert.equal(limitedRedemption.headers["ratelimit-limit"], "2");
+  assert.match(limitedRedemption.body, /Muitas solicitações/);
 
   const repairResponses = await Promise.all([1, 2, 3].map((index) => request(port, "/pending/repair", "POST", {
     "x-forwarded-for": `198.51.100.${index}`,
   })));
-  assert.deepEqual(repairResponses.map((response) => response.status), [401, 401, 429]);
-  assert.equal(repairResponses[2].headers["ratelimit-limit"], "2");
-  assert.equal(repairResponses[2].headers["ratelimit-remaining"], "0");
-  assert.match(repairResponses[2].body, /Muitas solicitações/);
+  assert.deepEqual(repairResponses.map((response) => response.status).sort((a, b) => a - b), [401, 401, 429]);
+  const limitedRepair = repairResponses.find((response) => response.status === 429);
+  assert.equal(limitedRepair.headers["ratelimit-limit"], "2");
+  assert.equal(limitedRepair.headers["ratelimit-remaining"], "0");
+  assert.match(limitedRepair.body, /Muitas solicitações/);
 
   const shareResponses = await Promise.all([1, 2, 3].map((index) => request(port, "/share/not-a-real-token", "GET", {
     "x-forwarded-for": `203.0.113.${index}`,
   })));
-  assert.deepEqual(shareResponses.map((response) => response.status), [404, 404, 429]);
-  assert.equal(shareResponses[2].headers["ratelimit-limit"], "2");
-  assert.match(shareResponses[2].body, /Muitas solicitações/);
+  assert.deepEqual(shareResponses.map((response) => response.status).sort((a, b) => a - b), [404, 404, 429]);
+  const limitedShare = shareResponses.find((response) => response.status === 429);
+  assert.equal(limitedShare.headers["ratelimit-limit"], "2");
+  assert.match(limitedShare.body, /Muitas solicitações/);
 });
 
 test("open-file redemption rate limits by the client IP behind configured proxy hops", { timeout: 30_000 }, async (t) => {
@@ -317,7 +320,9 @@ test("open-file redemption rate limits by the client IP behind configured proxy 
   const openUrl = JSON.parse(issued.body).url;
   const proxyChain = { "x-forwarded-for": "198.51.100.20, 10.0.0.7" };
   const redemptions = await Promise.all([1, 2, 3].map(() => request(port, openUrl, "GET", proxyChain)));
-  assert.deepEqual(redemptions.map((response) => response.status), [200, 200, 429]);
+  assert.deepEqual(redemptions.map((response) => response.status).sort((a, b) => a - b), [200, 200, 429]);
+  const limitedRedemption = redemptions.find((response) => response.status === 429);
+  assert.equal(limitedRedemption.headers["ratelimit-limit"], "2");
   const otherClient = await request(port, openUrl, "GET", { "x-forwarded-for": "198.51.100.21, 10.0.0.7" });
   assert.equal(otherClient.status, 200, otherClient.body);
 });
