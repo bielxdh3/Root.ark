@@ -146,6 +146,50 @@ test("WebDAV Basic auth rejects enrolled TOTP users under optional policy", { ti
   assert.equal((await request(portNumber, "/dav/source.txt", { headers: { authorization: unenrolledBasic } })).status, 200);
 });
 
+test("WebDAV stops dispatch when the TOTP policy becomes invalid after startup", { timeout: 20_000 }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-invalid-totp-policy-"));
+  fs.mkdirSync(path.join(dir, "data"));
+  fs.mkdirSync(path.join(dir, "uploads"));
+  fs.writeFileSync(path.join(dir, "uploads", "source.txt"), "source");
+  fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([
+    { username: "agent", password: bcrypt.hashSync("password", 10), role: "admin", permissions: { listFiles: true }, sessionVersion: 0 },
+  ]));
+  fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
+  const portNumber = await port();
+  const childBootstrap = [
+    `require(${JSON.stringify(path.join(ROOT, "server.js"))});`,
+    'process.on("message", (message) => { if (message === "invalidate-totp-policy") { process.env.TOTP_POLICY = "invalid"; process.send("policy-invalidated"); } });',
+  ].join("\n");
+  const child = spawn(process.execPath, ["-e", childBootstrap], {
+    cwd: dir,
+    env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", TOTP_POLICY: "optional", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+    windowsHide: true,
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
+  await ready(portNumber);
+  const policyChanged = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("child did not acknowledge the policy change")), 2_000);
+    child.once("message", (message) => { clearTimeout(timer); resolve(message); });
+    child.send("invalidate-totp-policy");
+  });
+  assert.equal(await policyChanged, "policy-invalidated");
+
+  const basic = `Basic ${Buffer.from("agent:password").toString("base64")}`;
+  const denied = await request(portNumber, "/dav/source.txt", { method: "DELETE", headers: { authorization: basic } });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(denied.status, 503);
+  assert.equal(denied.body, "Authentication policy unavailable");
+  assert.equal(fs.readFileSync(path.join(dir, "uploads", "source.txt"), "utf8"), "source");
+  const auditLogs = JSON.parse(fs.readFileSync(path.join(dir, "data", "audit-logs.json"), "utf8")).logs;
+  assert.ok(auditLogs.some((entry) => entry.eventType === "webdav.login.failed" && entry.details?.reason === "totp_policy_unavailable"), "the policy failure is audited");
+  assert.equal(auditLogs.some((entry) => entry.eventType === "webdav.delete"), false, "the rejected request does not continue into the WebDAV method handler");
+  assert.doesNotMatch(stderr, /ERR_HTTP_HEADERS_SENT|Cannot set headers after they are sent/i);
+});
+
 test("WebDAV enabled MOVE preserves same-folder files and fails closed for hostile destinations", { timeout: 20_000 }, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-move-"));
   fs.mkdirSync(path.join(dir, "data"));

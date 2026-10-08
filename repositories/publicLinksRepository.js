@@ -238,11 +238,25 @@ function consumePublicLinkQuota(token, options = {}) {
     } else {
       const downloads = Number(link.downloads) || 0;
       const maxDownloads = Number(link.maxDownloads) || 0;
+      const downloadViewerId = String(options.downloadViewerId || "");
+      const viewers = link.activeViewers && typeof link.activeViewers === "object" ? link.activeViewers : {};
+      const downloadViewer = viewers[downloadViewerId];
+      const viewerExpiresAt = new Date(downloadViewer?.expiresAt).getTime();
+      const activeDownloadViewer = downloadViewerId && Number.isFinite(viewerExpiresAt) && viewerExpiresAt > Date.now()
+        ? downloadViewer
+        : null;
+      if (activeDownloadViewer?.downloadCounted) {
+        return { status: "ok", link, alreadyConsumed: true };
+      }
       if (process.env.NODE_ENV === "test" && typeof options.afterQuotaRead === "function") options.afterQuotaRead();
       if (maxDownloads > 0 && downloads >= maxDownloads) return { status: "limit", limit: "downloads" };
 
       link.downloads = downloads + 1;
       link.lastDownloadedAt = now;
+      if (activeDownloadViewer) {
+        activeDownloadViewer.downloadCounted = true;
+        link.activeViewers = viewers;
+      }
       db.prepare("UPDATE public_links SET metadata_json = ? WHERE token = ? AND revoked_at IS NULL")
         .run(jsonStringify(link), token);
     }

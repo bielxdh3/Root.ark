@@ -108,16 +108,19 @@ test("SQLite mode preserves counted access for a JSON-fallback public link", { t
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-share-sqlite-fallback-"));
   const token = crypto.randomBytes(24).toString("hex");
   const secondToken = crypto.randomBytes(24).toString("hex");
+  const previewToken = crypto.randomBytes(24).toString("hex");
   const invalidToken = "not-a-valid-share-token";
   const port = await getUnusedPort();
   const dataDir = path.join(sandbox, "data");
   const databasePath = path.join(dataDir, "rootark.sqlite");
   const fileName = "sqlite-fallback-share.txt";
+  const previewFileName = "sqlite-fallback-preview.pdf";
 
   fs.mkdirSync(path.join(sandbox, "uploads"), { recursive: true });
   fs.mkdirSync(dataDir, { recursive: true });
   fs.cpSync(PUBLIC, path.join(sandbox, "public"), { recursive: true });
   fs.writeFileSync(path.join(sandbox, "uploads", fileName), "disposable SQLite fallback fixture\n");
+  fs.writeFileSync(path.join(sandbox, "uploads", previewFileName), "range preview fixture\n");
   fs.writeFileSync(path.join(dataDir, "public-links.json"), JSON.stringify({
     [token]: {
       folderId: "root",
@@ -139,6 +142,17 @@ test("SQLite mode preserves counted access for a JSON-fallback public link", { t
       maxViews: 0,
       downloads: 0,
       maxDownloads: 0,
+      activeViewers: {},
+    },
+    [previewToken]: {
+      folderId: "root",
+      fileName: previewFileName,
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      views: 0,
+      maxViews: 0,
+      downloads: 0,
+      maxDownloads: 1,
       activeViewers: {},
     },
     [invalidToken]: {
@@ -186,6 +200,17 @@ test("SQLite mode preserves counted access for a JSON-fallback public link", { t
   const view = await request(port, `/share/${token}/view`, "POST", { origin });
   assert.equal(view.status, 200, view.body);
   assert.equal(JSON.parse(view.body).views, 1);
+  const previewView = await request(port, `/share/${previewToken}/view`, "POST", { origin });
+  assert.equal(previewView.status, 200, previewView.body);
+  const previewCookieHeader = previewView.headers["set-cookie"];
+  const previewCookie = String(Array.isArray(previewCookieHeader) ? previewCookieHeader[0] : previewCookieHeader || "").split(";", 1)[0];
+  assert.match(previewCookie, /^rootark_share_[a-f0-9]{48}=/);
+  const rangeResponses = await Promise.all([
+    request(port, `/share/${previewToken}/preview`, "GET", { cookie: previewCookie, range: "bytes=0-4" }),
+    request(port, `/share/${previewToken}/preview`, "GET", { cookie: previewCookie, range: "bytes=5-9" }),
+  ]);
+  assert.deepEqual(rangeResponses.map((response) => response.status), [206, 206], "SQLite quota reservation is idempotent for concurrent ranges in one viewer session");
+  assert.equal((await request(port, `/share/${previewToken}/preview`, "GET", { range: "bytes=0-4" })).status, 410);
   assert.equal((await request(port, `/share/${secondToken}`)).status, 200, "counting one legacy link must not hide other unrecorded JSON links");
   assert.equal((await request(port, `/share/${secondToken}/view`, "POST", { origin })).status, 200);
   assert.equal((await request(port, `/share/${invalidToken}`)).status, 404, "invalid legacy JSON tokens are not served");
@@ -199,6 +224,9 @@ test("SQLite mode preserves counted access for a JSON-fallback public link", { t
   const Database = require("better-sqlite3");
   const database = new Database(databasePath);
   try {
+    const previewMetadata = JSON.parse(database.prepare("SELECT metadata_json FROM public_links WHERE token = ?").get(previewToken).metadata_json);
+    assert.equal(previewMetadata.downloads, 1);
+    assert.equal(previewMetadata.activeViewers[previewCookie.split("=", 2)[1]].downloadCounted, true);
     database.prepare("UPDATE public_links SET revoked_at = ? WHERE token = ?").run(new Date().toISOString(), token);
   } finally {
     database.close();
@@ -226,11 +254,13 @@ test("public-share audit logs correlate by token digest without storing the bear
   const port = await getUnusedPort();
   const dataDir = path.join(sandbox, "data");
   const fileName = "shared-audit-fixture.txt";
+  const previewFileName = "shared-preview-fixture.pdf";
 
   fs.mkdirSync(path.join(sandbox, "uploads"), { recursive: true });
   fs.mkdirSync(dataDir, { recursive: true });
   fs.cpSync(PUBLIC, path.join(sandbox, "public"), { recursive: true });
   fs.writeFileSync(path.join(sandbox, "uploads", fileName), "disposable share fixture\n");
+  fs.writeFileSync(path.join(sandbox, "uploads", previewFileName), "disposable preview fixture\n");
   fs.writeFileSync(path.join(dataDir, "public-links.json"), JSON.stringify({
     [token]: {
       folderId: "root",
@@ -343,12 +373,18 @@ test("public-share audit logs correlate by token digest without storing the bear
   const expiredPageToken = crypto.randomBytes(24).toString("hex");
   const expiredFileToken = crypto.randomBytes(24).toString("hex");
   const countedFileToken = crypto.randomBytes(24).toString("hex");
+  const previewFirstToken = crypto.randomBytes(24).toString("hex");
+  const unsupportedPreviewToken = crypto.randomBytes(24).toString("hex");
+  const rangedPreviewToken = crypto.randomBytes(24).toString("hex");
   const publicLinksPath = path.join(dataDir, "public-links.json");
   fs.writeFileSync(publicLinksPath, JSON.stringify({
     [token]: JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[token],
     [expiredPageToken]: { folderId: "root", fileName, expiresAt: new Date(Date.now() - 60_000).toISOString(), views: 0, downloads: 0, activeViewers: {} },
     [expiredFileToken]: { folderId: "root", fileName, expiresAt: new Date(Date.now() - 60_000).toISOString(), views: 0, downloads: 0, activeViewers: {} },
-    [countedFileToken]: { folderId: "root", fileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, viewers: {} },
+    [countedFileToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, viewers: {} },
+    [previewFirstToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, viewers: {} },
+    [unsupportedPreviewToken]: { folderId: "root", fileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
+    [rangedPreviewToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
   }));
   const expiredPage = await request(port, `/share/${expiredPageToken}`);
   assert.equal(expiredPage.status, 410);
@@ -356,6 +392,49 @@ test("public-share audit logs correlate by token digest without storing the bear
   const expiredFile = await request(port, `/share/${expiredFileToken}/file`, "POST", { origin: `http://127.0.0.1:${port}` });
   assert.equal(expiredFile.status, 410);
   assert.ok(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[expiredFileToken], "expired-file POST does not persist cleanup");
+
+  const unsupportedPreview = await request(port, `/share/${unsupportedPreviewToken}/preview`);
+  assert.equal(unsupportedPreview.status, 415);
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[unsupportedPreviewToken].downloads, 0, "a rejected preview does not consume download quota");
+  const unsupportedPreviewDownload = await request(port, `/share/${unsupportedPreviewToken}/file`, "POST", {
+    origin: `http://127.0.0.1:${port}`,
+  });
+  assert.equal(unsupportedPreviewDownload.status, 200, "a rejected preview leaves the allowed file download available");
+
+  const rangedPreviewView = await request(port, `/share/${rangedPreviewToken}/view`, "POST", {
+    origin: `http://127.0.0.1:${port}`,
+  });
+  assert.equal(rangedPreviewView.status, 200);
+  const viewerCookieHeader = rangedPreviewView.headers["set-cookie"];
+  const viewerCookie = String(Array.isArray(viewerCookieHeader) ? viewerCookieHeader[0] : viewerCookieHeader || "").split(";", 1)[0];
+  assert.match(viewerCookie, /^rootark_share_[a-f0-9]{48}=/, "the viewer session correlates range requests from one preview");
+  const rangedPreviewParts = await Promise.all([
+    request(port, `/share/${rangedPreviewToken}/preview`, "GET", { cookie: viewerCookie, range: "bytes=0-3" }),
+    request(port, `/share/${rangedPreviewToken}/preview`, "GET", { cookie: viewerCookie, range: "bytes=4-7" }),
+  ]);
+  assert.deepEqual(rangedPreviewParts.map((response) => response.status), [206, 206], "parallel range reads for one viewer remain available");
+  assert.deepEqual(rangedPreviewParts.map((response) => response.body), ["disp", "osab"]);
+  const continuedPreview = await request(port, `/share/${rangedPreviewToken}/preview`, "GET", {
+    cookie: viewerCookie,
+    range: "bytes=8-11",
+  });
+  assert.equal(continuedPreview.status, 206, "later ranges from the same viewer do not consume additional downloads");
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[rangedPreviewToken].downloads, 1);
+  assert.equal((await request(port, `/share/${rangedPreviewToken}/preview`, "GET", { range: "bytes=8-11" })).status, 410, "another viewer cannot bypass the exhausted download quota");
+
+  const previewHead = await request(port, `/share/${previewFirstToken}/preview`, "HEAD");
+  assert.equal(previewHead.status, 405, "HEAD does not act as a preview download");
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[previewFirstToken].downloads, 0);
+  const invalidPreviewRange = await request(port, `/share/${previewFirstToken}/preview`, "GET", { range: "bytes=999-1000" });
+  assert.equal(invalidPreviewRange.status, 416);
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[previewFirstToken].downloads, 0, "an unsatisfiable range does not consume download quota");
+  const previewFirst = await request(port, `/share/${previewFirstToken}/preview`);
+  assert.equal(previewFirst.status, 200);
+  assert.equal(previewFirst.body, "disposable preview fixture\n");
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[previewFirstToken].downloads, 1, "preview delivery consumes the shared download budget");
+  const exhaustedPreview = await request(port, `/share/${previewFirstToken}/preview`);
+  assert.equal(exhaustedPreview.status, 410, "preview delivery cannot exceed maxDownloads");
+  assert.equal(exhaustedPreview.body.includes("disposable preview fixture"), false);
 
   const requestHeaders = {
     "user-agent": `audit-client-${token}`,
@@ -387,11 +466,14 @@ test("public-share audit logs correlate by token digest without storing the bear
     origin: `http://127.0.0.1:${port}`,
   });
   assert.equal(countedFile.status, 200);
-  assert.equal(countedFile.body, "disposable share fixture\n");
+  assert.equal(countedFile.body, "disposable preview fixture\n");
   const exhaustedFile = await request(port, `/share/${countedFileToken}/file`, "POST", {
     origin: `http://127.0.0.1:${port}`,
   });
   assert.equal(exhaustedFile.status, 410, "counted file delivery cannot exceed the download quota");
+  const previewAfterFileQuota = await request(port, `/share/${countedFileToken}/preview`);
+  assert.equal(previewAfterFileQuota.status, 410, "preview cannot bypass an exhausted download quota");
+  assert.equal(previewAfterFileQuota.body.includes("disposable preview fixture"), false);
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[countedFileToken].downloads, 1);
 
   const legacyDownload = await request(port, `/share/${token}/download`, "GET", shareHeaders);
@@ -420,8 +502,8 @@ test("public-share audit logs correlate by token digest without storing the bear
 
   const { logs } = JSON.parse(fs.readFileSync(path.join(dataDir, "audit-logs.json"), "utf8"));
   const shareLogs = logs.filter((entry) => entry.eventType.startsWith("share."));
-  const opened = shareLogs.filter((entry) => entry.eventType === "share.opened");
   const expectedAuditId = crypto.createHash("sha256").update(token, "utf8").digest("hex");
+  const opened = shareLogs.filter((entry) => entry.eventType === "share.opened" && entry.target.id === expectedAuditId);
   assert.equal(opened.length, 2);
   assert.deepEqual(opened.map((entry) => entry.target.id), [expectedAuditId, expectedAuditId]);
   assert.equal(opened[0].actor.userAgent, `audit-client-[REDACTED]`);

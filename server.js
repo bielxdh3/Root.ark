@@ -1242,7 +1242,16 @@ function authenticateWebDavRequest(req, res) {
   try {
     totpPolicy = validateTotpPolicy();
   } catch {
-    return res.status(503).send("Authentication policy unavailable");
+    auditLog(
+      "webdav.login.failed",
+      getAuditActor(req, "anonymous"),
+      { type: "webdav", id: WEBDAV_PATH },
+      "authenticate",
+      "failure",
+      { reason: "totp_policy_unavailable", method: req.method, path: getSafeWebDavAuditPath(req) }
+    );
+    res.status(503).send("Authentication policy unavailable");
+    return false;
   }
   if (user.totpEnabled || isTotpRequired(user, totpPolicy)) {
     return sendWebDavUnauthorized(req, res, "totp_required");
@@ -2039,10 +2048,10 @@ function getPublicShareCanPreview(fileName) {
   return ["image", "pdf", "audio", "video"].includes(getPreviewKind(fileName));
 }
 
-function isShareViewerActive(req, token, link) {
+function getActiveShareViewer(req, token, link) {
   const { viewers } = cleanupShareViewers(link);
   const viewerId = getCookieValue(req, `rootark_share_${token}`);
-  return Boolean(viewerId && viewers[viewerId]);
+  return viewerId && viewers[viewerId] ? { id: viewerId, viewer: viewers[viewerId] } : null;
 }
 
 function createShareViewer(req, res, token, link, expiresAt) {
@@ -2113,7 +2122,9 @@ async function resolveShareAccess(req, res, token, options = {}) {
   }
 
   const limits = getShareLimitState(link);
-  const viewerAlreadyActive = isShareViewerActive(req, token, link);
+  const activeShareViewer = getActiveShareViewer(req, token, link);
+  const viewerAlreadyActive = Boolean(activeShareViewer);
+  let downloadAlreadyCounted = Boolean(options.countDownloadOncePerViewer && activeShareViewer?.viewer.downloadCounted);
   if (options.countView && !viewerAlreadyActive && limits.maxViews > 0 && limits.views >= limits.maxViews) {
     logShareAudit(req, "share.limit_reached", token, link, "view", "failure", { limit: "views" });
     return { status: 410, error: "Link indisponivel." };
@@ -2123,7 +2134,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
     return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
   }
 
-  if (options.countDownload && limits.maxDownloads > 0 && limits.downloads >= limits.maxDownloads) {
+  if (options.countDownload && !downloadAlreadyCounted && limits.maxDownloads > 0 && limits.downloads >= limits.maxDownloads) {
     logShareAudit(req, "share.limit_reached", token, link, "download", "failure", { limit: "downloads" });
     return { status: 410, error: "Link indisponivel." };
   }
@@ -2148,8 +2159,13 @@ async function resolveShareAccess(req, res, token, options = {}) {
   if (currentPasswordHash && !hasValidSharePasswordSession(req, token, currentLink) && currentPasswordHash !== verifiedPasswordHash) {
     return { status: 401, error: "Senha obrigatoria.", passwordRequired: true };
   }
+  if (options.requirePreview && !getPublicShareCanPreview(fileInfo.fileName)) {
+    return { status: 415, error: "Preview indisponivel" };
+  }
   const currentLimits = getShareLimitState(currentLink);
-  const currentViewerAlreadyActive = isShareViewerActive(req, token, currentLink);
+  const currentShareViewer = getActiveShareViewer(req, token, currentLink);
+  const currentViewerAlreadyActive = Boolean(currentShareViewer);
+  downloadAlreadyCounted = Boolean(options.countDownloadOncePerViewer && currentShareViewer?.viewer.downloadCounted);
   if (options.countView && !currentViewerAlreadyActive && currentLimits.maxViews > 0 && currentLimits.views >= currentLimits.maxViews) {
     logShareAudit(req, "share.limit_reached", token, currentLink, "view", "failure", { limit: "views" });
     return { status: 410, error: "Link indisponivel." };
@@ -2157,14 +2173,14 @@ async function resolveShareAccess(req, res, token, options = {}) {
   if (options.requireViewer && getShareAccessCookieRequired(currentLink) && !currentViewerAlreadyActive && !options.countView) {
     return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
   }
-  if (options.countDownload && currentLimits.maxDownloads > 0 && currentLimits.downloads >= currentLimits.maxDownloads) {
+  if (options.countDownload && !downloadAlreadyCounted && currentLimits.maxDownloads > 0 && currentLimits.downloads >= currentLimits.maxDownloads) {
     logShareAudit(req, "share.limit_reached", token, currentLink, "download", "failure", { limit: "downloads" });
     return { status: 410, error: "Link indisponivel." };
   }
 
   let databaseViewReserved = false;
   let databaseDownloadReserved = false;
-  const reserveDatabaseShareQuota = (kind, viewer) => {
+  const reserveDatabaseShareQuota = (kind, viewer, downloadViewerId) => {
     const reservation = publicLinksRepository.consumePublicLinkQuota(token, {
       kind,
       expectedFileName: currentLink.fileName,
@@ -2172,6 +2188,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
       expectedPasswordHash: currentLink.passwordHash || currentLink.password_hash || null,
       ...(shouldReadJsonFallback() ? { fallbackLinks: { [token]: currentLink } } : {}),
       ...(viewer ? { viewer } : {}),
+      ...(downloadViewerId ? { downloadViewerId } : {}),
     });
     if (reservation.status !== "ok") {
       if (reservation.status === "limit") {
@@ -2190,6 +2207,9 @@ async function resolveShareAccess(req, res, token, options = {}) {
 
     currentLink = reservation.link;
     currentLinks[token] = currentLink;
+    if (kind === "download") {
+      downloadAlreadyCounted = Boolean(reservation.alreadyConsumed);
+    }
     if (shouldWriteLegacyJson()) fs.writeFileSync(PUBLIC_LINKS_FILE, JSON.stringify(currentLinks, null, 2));
     broadcastDataChanged("shares");
     return null;
@@ -2205,12 +2225,6 @@ async function resolveShareAccess(req, res, token, options = {}) {
     databaseViewReserved = true;
   }
 
-  if (shouldUseDatabase() && options.countDownload) {
-    const failure = reserveDatabaseShareQuota("download");
-    if (failure) return failure;
-    databaseDownloadReserved = true;
-  }
-
   if (options.countView && !currentViewerAlreadyActive) {
     if (!databaseViewReserved) {
       createShareViewer(req, res, token, currentLink, currentExpiresAt);
@@ -2220,17 +2234,45 @@ async function resolveShareAccess(req, res, token, options = {}) {
     logShareAudit(req, "share.opened", token, currentLink, "opened", "success");
   }
 
-  if (options.countDownload) {
+  const reserveDownloadQuota = () => {
+    if (!options.countDownload || downloadAlreadyCounted) return null;
+    if (shouldUseDatabase()) {
+      const failure = reserveDatabaseShareQuota(
+        "download",
+        null,
+        options.countDownloadOncePerViewer ? currentShareViewer?.id : undefined
+      );
+      if (failure) return failure;
+      databaseDownloadReserved = true;
+    }
     if (!databaseDownloadReserved) {
       currentLink.downloads = (Number(currentLink.downloads) || 0) + 1;
       currentLink.lastDownloadedAt = new Date().toISOString();
+      if (options.countDownloadOncePerViewer && currentShareViewer) {
+        currentShareViewer.viewer.downloadCounted = true;
+        currentLink.activeViewers = currentLink.activeViewers || {};
+      }
       currentLinks[token] = currentLink;
       savePublicLinks(currentLinks);
     }
+    if (downloadAlreadyCounted) return null;
+    downloadAlreadyCounted = true;
     logShareAudit(req, "share.downloaded", token, currentLink, "downloaded", "success");
+    return null;
+  };
+
+  if (options.countDownload && !options.deferDownloadReservation) {
+    const failure = reserveDownloadQuota();
+    if (failure) return failure;
   }
 
-  return { link: currentLink, fileInfo, limits: getShareLimitState(currentLink), expiresAt: currentExpiresAt };
+  return {
+    link: currentLink,
+    fileInfo,
+    limits: getShareLimitState(currentLink),
+    expiresAt: currentExpiresAt,
+    ...(options.deferDownloadReservation ? { reserveDownload: reserveDownloadQuota } : {}),
+  };
 }
 
 function getSharePublicPayload(link, fileInfo, limits) {
@@ -3342,6 +3384,20 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
     });
     res.end();
     return;
+  }
+
+  if (typeof options.beforeSend === "function") {
+    let rejection;
+    try {
+      rejection = options.beforeSend();
+    } catch {
+      try { fs.closeSync(fd); } catch {}
+      return res.status(500).send("Erro ao autorizar transmissao");
+    }
+    if (rejection) {
+      try { fs.closeSync(fd); } catch {}
+      return res.status(rejection.status || 403).type("text/plain").send(rejection.error || "Link indisponivel.");
+    }
   }
 
   const commonHeaders = {
@@ -9310,13 +9366,20 @@ app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareM
 app.get("/share/:token/preview", shareRateLimit, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
+  if (req.method === "HEAD") return res.setHeader("Allow", "GET").status(405).type("text/plain").send("Metodo nao permitido");
 
-  const access = await resolveShareAccess(req, res, shareToken, { requireViewer: true });
+  const access = await resolveShareAccess(req, res, shareToken, {
+    requireViewer: true,
+    requirePreview: true,
+    countDownload: true,
+    countDownloadOncePerViewer: true,
+    deferDownloadReservation: true,
+  });
   if (access.error) return res.status(access.status || 400).send(access.error);
-  if (!getPublicShareCanPreview(access.fileInfo.fileName)) return res.status(415).send("Preview indisponivel");
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "inline", {
     cacheControl: "private, max-age=600",
+    beforeSend: access.reserveDownload,
   });
 });
 
