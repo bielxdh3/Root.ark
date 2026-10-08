@@ -203,18 +203,24 @@ function createCloudStorage(options = {}) {
     let token;
     do {
       const page = await (await drive()).files.list({
-        q: "appProperties has { key='rootArkKey' } and trashed=false",
+        q: `'${escapeQuery(folder())}' in parents and appProperties has { key='rootArkKey' } and trashed=false`,
         fields: "nextPageToken,files(id,name,parents,appProperties)",
         spaces: "drive",
         pageToken: token,
         pageSize: 100,
       });
       for (const file of page.data.files || []) {
-        if (!Array.isArray(file.parents) || !file.parents.includes(folder())) {
-          throw cloudError("outside_configured_parent", "Drive object is outside the configured parent folder");
+        if (!Array.isArray(file.parents)) {
+          throw cloudError("invalid_inventory_identity", "Drive object is missing its parent metadata");
         }
+        if (!file.parents.includes(folder())) continue;
         const properties = file.appProperties || {};
-        const parsed = parseInventoryKey(properties.rootArkKey);
+        if (typeof properties.rootArkKey !== "string" || !properties.rootArkKey) {
+          throw cloudError("invalid_inventory_key", "Drive object is missing its inventory key");
+        }
+        const normalizedKey = properties.rootArkKey.replace(/\\/g, "/");
+        if (!normalizedKey.startsWith(`${prefix}/`)) continue;
+        const parsed = parseInventoryKey(normalizedKey);
         if (String(properties.rootArkFolderId || "") !== parsed.folderId || String(properties.rootArkArea || "") !== parsed.area) {
           throw cloudError("invalid_inventory_metadata", "Drive metadata does not match rootArkKey");
         }

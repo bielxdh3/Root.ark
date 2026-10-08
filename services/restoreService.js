@@ -622,16 +622,37 @@ function restoreSyncEntryDueAt(entry, now) {
 async function reconcileUnknownProviderInventory({ baselineBackupId, clock, sleep } = {}) {
   if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
   const previousStatus = restoreProviderOrphans.getInventoryStatus();
-  const status = restoreProviderOrphans.getInventoryStatus(cloudStorage);
-  if (status.state !== "unknown") return { state: status.state, changed: false };
+  let status = restoreProviderOrphans.getInventoryStatus(cloudStorage);
   const currentInventoryContext = cloudStorage.inventoryContext?.() || null;
+  let legacyQueueBackupId = null;
+  if (status.state !== "unknown" && typeof cloudStorage?.resolveInventoryContext === "function") {
+    const legacyQueues = backupService.listBackups().filter((backup) => {
+      const sync = backup.metadata?.restoreSync;
+      return sync
+        && sync.providerContext !== currentInventoryContext
+        && !["completed", "cancelled"].includes(sync.state)
+        && (sync.entries || []).some((entry) => !["completed", "cancelled"].includes(entry.state));
+    });
+    if (legacyQueues.length > 1) {
+      throw Object.assign(new Error("Multiple pending restore queues lack a matching provider context; resolve them before cloud access"), {
+        code: "LEGACY_RESTORE_SYNC_AMBIGUOUS",
+      });
+    }
+    if (legacyQueues.length === 1) {
+      legacyQueueBackupId = legacyQueues[0].id;
+      status = { state: "unknown", backupId: legacyQueues[0].id, inventoryContext: currentInventoryContext };
+    }
+  }
+  if (status.state !== "unknown") return { state: status.state, changed: false };
   const contextBoundCloudStorage = bindProviderContext(cloudStorage, currentInventoryContext);
-  const markerNeedsUpdate = status.backupId && (previousStatus.state !== "unknown" || previousStatus.inventoryContext !== currentInventoryContext);
+  const markerNeedsUpdate = status.backupId && (previousStatus.state !== "unknown"
+    || previousStatus.inventoryContext !== currentInventoryContext
+    || previousStatus.contextConflict || status.contextConflict);
   if (!cloudStorage?.enabled?.()) {
     if (markerNeedsUpdate) {
       try {
         await restoreProviderOrphans.markInventoryUnknown(status.backupId, {
-          inventoryContext: currentInventoryContext || status.inventoryContext,
+          inventoryContext: currentInventoryContext || (status.contextConflict ? undefined : status.inventoryContext),
           previousInventoryContext: status.previousInventoryContext || previousStatus.inventoryContext,
         }, { validateBaseline: () => backupService.getBackupOrThrow(status.backupId) });
       } catch (error) {
@@ -674,6 +695,19 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
     if (selectedBaseline.manifest.cloud_complete !== true) {
       throw new Error("The selected replacement provider inventory baseline is incomplete; configure ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID with a complete backup");
     }
+    if (legacyQueueBackupId && legacyQueueBackupId !== selectedBackupId) {
+      const replacement = backupRepository.getBackup(selectedBackupId) || selectedBaseline.backup;
+      const existingSupersededId = replacement.metadata?.providerReconciliationSupersedesBackupId;
+      if (existingSupersededId && existingSupersededId !== legacyQueueBackupId) {
+        throw new Error("Replacement provider baseline already records a different superseded restore queue");
+      }
+      if (!existingSupersededId) {
+        backupRepository.saveBackup({
+          ...replacement,
+          metadata: { ...replacement.metadata, providerReconciliationSupersedesBackupId: legacyQueueBackupId },
+        });
+      }
+    }
     await restoreProviderOrphans.markInventoryUnknown(selectedBackupId, { inventoryContext: currentInventoryContext }, {
       validateBaseline: async () => {
         const current = await validatedProviderBaseline(selectedBackupId);
@@ -712,6 +746,36 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
       ...selectedBackup,
       metadata: { ...selectedBackup.metadata, restoreSync },
     });
+  }
+  const supersededQueueBackupId = String(selectedBackup.metadata?.providerReconciliationSupersedesBackupId || "");
+  if (supersededQueueBackupId) {
+    if (!/^[a-f0-9-]{36}$/i.test(supersededQueueBackupId) || supersededQueueBackupId === selectedBackupId) {
+      throw new Error("Replacement provider baseline has an invalid superseded restore queue reference");
+    }
+    const supersededBackup = backupRepository.getBackup(supersededQueueBackupId);
+    const supersededSync = supersededBackup?.metadata?.restoreSync;
+    if (supersededSync && !["completed", "cancelled"].includes(supersededSync.state)) {
+      const now = Date.parse(syncNow(clock));
+      const activeLease = (supersededSync.entries || []).some((entry) => {
+        if (!entry.leaseToken) return false;
+        const leaseUntil = Date.parse(entry.leaseUntil || "");
+        return !Number.isFinite(leaseUntil) || leaseUntil > now;
+      });
+      if (activeLease) {
+        throw Object.assign(new Error("Superseded restore queue still has an active provider lease; cloud reconciliation remains blocked"), {
+          code: "LEGACY_RESTORE_SYNC_LEASE_ACTIVE",
+        });
+      }
+      cancelRestoreSync(supersededQueueBackupId, "superseded-provider-context-change", { clock });
+      const retired = backupRepository.getBackup(supersededQueueBackupId);
+      if ((retired?.metadata?.restoreSync?.entries || []).some((entry) => !["completed", "cancelled"].includes(entry.state))) {
+        throw new Error("Superseded restore queue could not be durably retired; cloud reconciliation remains blocked");
+      }
+    }
+    const latestSelected = backupRepository.getBackup(selectedBackupId) || selectedBackup;
+    const metadata = { ...latestSelected.metadata };
+    delete metadata.providerReconciliationSupersedesBackupId;
+    selectedBackup = backupRepository.saveBackup({ ...latestSelected, metadata });
   }
   const queuedSync = selectedBackup.metadata?.restoreSync;
   if ((queuedSync?.entries || []).some((entry) => entry.state === "completed")) {
@@ -910,6 +974,15 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
   let operationProvider = provider;
   if (typeof provider.resolveInventoryContext === "function") {
     expectedProviderContext = await provider.resolveInventoryContext();
+    const queuedProviderContext = latest.metadata.restoreSync.providerContext;
+    if (typeof queuedProviderContext !== "string" || !queuedProviderContext) {
+      throw Object.assign(new Error("Restore sync has no saved provider context; run restore again before cloud access"), {
+        code: "PROVIDER_CONTEXT_MISSING",
+      });
+    }
+    if (queuedProviderContext !== expectedProviderContext) {
+      throw new Error("Restore sync provider context changed; cloud access remains blocked");
+    }
     operationProvider = bindProviderContext(provider, expectedProviderContext);
   }
   if (restoreProviderOrphans.isInventoryUnknown(provider) && authority !== STARTUP_INVENTORY_RECONCILIATION) restoreProviderOrphans.assertProviderAvailable(provider);
@@ -2044,8 +2117,12 @@ async function restoreBackup(id, options = {}) {
 
   const pending = assertNoPendingWholeRestore();
   if (pending.restartRequired) throw new Error("Reinicie todas as instancias do servidor antes de iniciar outro restore");
+  let providerInventoryContext = null;
   if (cloudStorage?.enabled?.() && typeof cloudStorage.resolveInventoryContext === "function") {
-    await cloudStorage.resolveInventoryContext();
+    const resolvedContext = await cloudStorage.resolveInventoryContext();
+    providerInventoryContext = typeof cloudStorage.inventoryContext === "function"
+      ? cloudStorage.inventoryContext()
+      : resolvedContext || null;
   }
   if (cloudStorage?.enabled?.() && restoreProviderOrphans.isInventoryUnknown(cloudStorage)) restoreProviderOrphans.assertProviderAvailable(cloudStorage);
   const requiredRestartInstances = configuredRestartInstanceCount();
@@ -2066,7 +2143,9 @@ async function restoreBackup(id, options = {}) {
     let providerInventory = null;
     if (cloudStorage?.enabled()) {
       if (typeof cloudStorage.inventory !== "function") throw new Error("Cloud provider inventory is required before restore can protect unarchived objects");
-      providerInventory = await cloudStorage.inventory();
+      const contextBoundCloudStorage = bindProviderContext(cloudStorage, providerInventoryContext);
+      providerInventory = await contextBoundCloudStorage.inventory();
+      await assertProviderContext(cloudStorage, providerInventoryContext);
       coordinator = updateWholeRestoreCoordinator(coordinator, { providerPolicyRequired: true });
       restoreProviderOrphans.assertUnambiguousProviderInventory(providerInventory
         .filter((entry) => ["uploads", "temp"].includes(entry.area))
@@ -2098,6 +2177,7 @@ async function restoreBackup(id, options = {}) {
     const cloudSync = providerInventory !== null && syncEntries(manifest).length > 0
       ? createRestoreSync(manifest)
       : { state: "not_required" };
+    if (providerInventoryContext) cloudSync.providerContext = providerInventoryContext;
     const providerReconciliation = cloudSync.state === "pending"
       ? { backupId: backup.id, sync: cloudSync }
       : [];
@@ -2116,6 +2196,7 @@ async function restoreBackup(id, options = {}) {
     coordinator = updateWholeRestoreCoordinator(coordinator, { ...preimage, phase: "prepared" });
     injectFailure("restore.preimage.completed");
     injectFailure("restore.coordinator.persisted");
+    if (providerInventory !== null) await assertProviderContext(cloudStorage, providerInventoryContext);
     injectFailure("restore.before-local-commit");
     mutationStarted = true;
     restoreQuarantine(quarantinePlan, (step, details) => injectFailure(step, details));
@@ -2144,7 +2225,9 @@ async function restoreBackup(id, options = {}) {
     if (restoredDatabase) injectFailure("restore.sqlite.committed");
     if (providerOrphans !== null) {
       injectFailure("restore.provider-orphans.before-persist");
-      await restoreProviderOrphans.write(providerOrphans);
+      await restoreProviderOrphans.write(providerOrphans, providerInventoryContext
+        ? { state: "reconciled", backupId: backup.id, inventoryContext: providerInventoryContext }
+        : undefined);
       injectFailure("restore.provider-orphans.persisted");
     } else {
       injectFailure("restore.provider-inventory-unknown.before-persist");

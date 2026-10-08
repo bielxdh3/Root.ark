@@ -186,6 +186,15 @@ function getInventoryStatus(provider = null) {
   if (!state && !policy) return { state: "known" };
   const stateMarker = validateInventoryMarker(state?.providerInventory, "Restore provider inventory state");
   const policyMarker = validateInventoryMarker(policy?.providerInventory, "Restore provider inventory policy");
+  if (stateMarker && policyMarker
+    && (stateMarker.inventoryContext !== policyMarker.inventoryContext
+      || stateMarker.previousInventoryContext !== policyMarker.previousInventoryContext)) {
+    return {
+      state: "unknown",
+      backupId: stateMarker.backupId === policyMarker.backupId ? stateMarker.backupId || null : null,
+      contextConflict: true,
+    };
+  }
   if (!state || !policy || !stateMarker || !policyMarker) {
     const unknown = [stateMarker, policyMarker].filter((marker) => marker?.state === "unknown");
     const ids = new Set(unknown.map((marker) => marker.backupId).filter(Boolean));
@@ -284,6 +293,9 @@ async function reconcileInventory(backupId, objects, inventoryContext = null) {
   const lease = await acquirePolicyLock();
   try {
     const status = getInventoryStatus();
+    if (status.contextConflict) {
+      throw new Error("Restore provider inventory context records are inconsistent during reconciliation");
+    }
     if (status.state === "reconciled" && status.backupId === id) {
       if ((status.inventoryContext ?? null) !== (inventoryContext ?? null)) {
         throw new Error("Restore provider inventory context changed during reconciliation");
@@ -365,9 +377,13 @@ function initialize({ requirePolicy = false } = {}) {
   return read();
 }
 
-async function write(objects) {
+async function write(objects, inventoryStatus) {
   const lease = await acquirePolicyLock();
-  try { return writeUnlocked(objects); }
+  try {
+    const status = inventoryStatus === undefined ? getInventoryStatus() : inventoryStatus;
+    if (status.contextConflict) throw new Error("Restore provider inventory context records are inconsistent; explicit repair is required");
+    return writeUnlocked(objects, status);
+  }
   finally { lease.release(); }
 }
 

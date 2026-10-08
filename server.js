@@ -9954,10 +9954,7 @@ const listenForRequests = () => {
 };
 void (async () => {
   if (typeof cloudStorage.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
-  const startupProviderInventory = restoreProviderOrphans.getInventoryStatus(cloudStorage);
-  if (startupProviderInventory.state === "unknown") {
-    await restoreService.reconcileUnknownProviderInventory();
-  }
+  await restoreService.reconcileUnknownProviderInventory();
   listenForRequests();
 })().catch((error) => {
   startupRestoreLease();

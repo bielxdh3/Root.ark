@@ -57,12 +57,43 @@ test("cloud inventory rejects foreign, malformed, duplicate, and mismatched iden
   await assert.rejects(s3.inventory(), { code: "duplicate_inventory_identity" });
 
   let driveFiles = [{ id: "drive-1", parents: ["other-parent"], appProperties: { rootArkKey: "rootark/uploads/folder/file.txt", rootArkFolderId: "folder", rootArkArea: "uploads" } }];
-  const drive = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "parent" }, createGoogleDriveClient: async () => ({ files: { list: async () => ({ data: { files: driveFiles } }) } }) });
-  await assert.rejects(drive.inventory(), { code: "outside_configured_parent" });
+  const driveCalls = [];
+  const drive = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "parent" }, createGoogleDriveClient: async () => ({ files: { list: async (request) => { driveCalls.push(request); return { data: { files: driveFiles } }; } } }) });
+  assert.deepEqual(await drive.inventory(), [], "objects from an old Drive parent are outside the active namespace");
+  assert.match(driveCalls[0].q, /'parent' in parents/, "the Drive list query is scoped to the configured parent");
+  driveFiles = [{ id: "drive-1", appProperties: { rootArkKey: "rootark/uploads/folder/file.txt", rootArkFolderId: "folder", rootArkArea: "uploads" } }];
+  await assert.rejects(drive.inventory(), { code: "invalid_inventory_identity" });
   driveFiles = [{ id: "drive-1", parents: ["parent"], appProperties: { rootArkKey: "rootark/uploads/folder/file.txt", rootArkFolderId: "wrong", rootArkArea: "uploads" } }];
   await assert.rejects(drive.inventory(), { code: "invalid_inventory_metadata" });
   driveFiles = [{ parents: ["parent"], appProperties: { rootArkKey: "rootark/uploads/folder/file.txt", rootArkFolderId: "folder", rootArkArea: "uploads" } }];
   await assert.rejects(drive.inventory(), { code: "invalid_inventory_identity" });
+});
+
+test("Drive inventory filters old parents and prefixes while paginating the configured namespace", async () => {
+  const calls = [];
+  let page = 0;
+  const storage = createCloudStorage({
+    provider: "gdrive",
+    prefix: "rootark",
+    gdrive: { folderId: "current-parent" },
+    createGoogleDriveClient: async () => ({ files: { list: async (request) => {
+      calls.push(request);
+      if (page++ === 0) return { data: { files: [
+        { id: "stale-parent", parents: ["old-parent"], appProperties: { rootArkKey: "rootark/uploads/root/stale.txt", rootArkFolderId: "root", rootArkArea: "uploads" } },
+        { id: "stale-prefix", parents: ["current-parent"], appProperties: { rootArkKey: "old-prefix/uploads/root/stale.txt", rootArkFolderId: "root", rootArkArea: "uploads" } },
+        { id: "current-one", parents: ["current-parent"], appProperties: { rootArkKey: "rootark/uploads/root/one.txt", rootArkFolderId: "root", rootArkArea: "uploads" } },
+      ], nextPageToken: "next" } };
+      return { data: { files: [
+        { id: "current-two", parents: ["current-parent"], appProperties: { rootArkKey: "rootark/temp/root/two.txt", rootArkFolderId: "root", rootArkArea: "temp" } },
+      ] } };
+    } } }),
+  });
+  const inventory = await storage.inventory();
+  assert.deepEqual(inventory.map((entry) => entry.key), ["rootark/uploads/root/one.txt", "rootark/temp/root/two.txt"]);
+  assert.equal(calls.length, 2, "inventory continues through every Drive page");
+  assert.ok(calls.every((request) => request.q.includes("'current-parent' in parents")));
+  assert.equal(calls[0].pageToken, undefined);
+  assert.equal(calls[1].pageToken, "next");
 });
 
 test("download cleans up a partial cache file after a provider stream failure", async () => {

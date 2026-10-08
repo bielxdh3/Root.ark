@@ -3563,6 +3563,332 @@ test("restore inventory failure aborts before local commit", () => {
   `);
 });
 
+test("cloud restore binds suppression and sync state to the provider context", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      write(path.join(uploadsDir, "root", "restored.txt"), "selected archive bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      let context = "a".repeat(64);
+      let uploads = 0;
+      const cloud = {
+        enabled: () => true,
+        provider: "fixture",
+        resolveInventoryContext: async () => context,
+        inventoryContext: () => context,
+        inventory: async () => [],
+        upload: async () => { uploads += 1; return true; },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      assert.equal(restored.cloudSync.state, "pending");
+      assert.equal(restored.cloudSync.providerContext, context,
+        "the queued selected-archive uploads are bound to the identity used for inventory");
+      const policy = JSON.parse(fs.readFileSync(path.join(dataDir, ".rootark-restore-provider-orphans.json"), "utf8"));
+      assert.equal(policy.providerInventory.state, "reconciled");
+      assert.equal(policy.providerInventory.backupId, backup.id);
+      assert.equal(policy.providerInventory.inventoryContext, context,
+        "the durable suppression marker records the provider namespace used to build it");
+      assert.equal(providerOrphans.getInventoryStatus(cloud).state, "reconciled");
+
+      context = "b".repeat(64);
+      await cloud.resolveInventoryContext();
+      const changed = providerOrphans.getInventoryStatus(cloud);
+      assert.equal(changed.state, "unknown",
+        "a restart under a different provider identity must require inventory reconciliation");
+      assert.equal(changed.inventoryContext, context);
+      await assert.rejects(restoreService.processRestoreSync({ backupId: backup.id }), /provider context changed|inventory is unknown/i);
+      assert.equal(uploads, 0, "a queued upload from the previous provider context cannot run under the new namespace");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("legacy restore queue without provider context cannot upload to current provider identity", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      write(path.join(uploadsDir, "root", "legacy-queued.txt"), "queued archive bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      let context = "a".repeat(64);
+      let uploads = 0;
+      const cloud = {
+        enabled: () => true,
+        provider: "fixture",
+        resolveInventoryContext: async () => context,
+        inventoryContext: () => context,
+        inventory: async () => [],
+        upload: async () => { uploads += 1; return true; },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+
+      const saved = backupRepository.getBackup(backup.id);
+      const legacySync = { ...saved.metadata.restoreSync };
+      delete legacySync.providerContext;
+      await backupRepository.saveBackup({ ...saved, checksum: null, metadata: { ...saved.metadata, restoreSync: legacySync } });
+      await providerOrphans.write([], { state: "known" });
+
+      context = "b".repeat(64);
+      await cloud.resolveInventoryContext();
+      assert.equal(providerOrphans.getInventoryStatus(cloud).state, "known",
+        "a legacy known marker does not prove which provider identity owns a pending queue");
+      await assert.rejects(restoreService.processRestoreSync({ backupId: backup.id, uploader: cloud }), {
+        code: "PROVIDER_CONTEXT_MISSING",
+      });
+      assert.equal(uploads, 0, "a contextless legacy queue cannot upload to the current provider identity");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("startup reconciles a sole legacy restore queue before rebinding it to the current provider", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      let context = "a".repeat(64);
+      const uploads = [];
+      const cloud = {
+        enabled: () => true,
+        provider: "fixture",
+        resolveInventoryContext: async () => context,
+        inventoryContext: () => context,
+        inventory: async () => [],
+        upload: async (sourcePath, _folderId, name, _area) => {
+          uploads.push({ name, contents: fs.readFileSync(sourcePath, "utf8"), context });
+          return true;
+        },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      write(path.join(uploadsDir, "root", "legacy-queued.txt"), "selected archive bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+
+      const saved = backupRepository.getBackup(backup.id);
+      const legacySync = { ...saved.metadata.restoreSync };
+      delete legacySync.providerContext;
+      backupRepository.saveBackup({ ...saved, checksum: null, metadata: { ...saved.metadata, restoreSync: legacySync } });
+      await providerOrphans.write([], { state: "known" });
+      context = "b".repeat(64);
+
+      assert.equal(providerOrphans.getInventoryStatus(cloud).state, "known");
+      await restoreService.reconcileUnknownProviderInventory();
+
+      const reconciled = backupRepository.getBackup(backup.id).metadata.restoreSync;
+      assert.equal(reconciled.providerContext, context,
+        "the legacy queue is rebuilt from its validated archive before being bound to the current identity");
+      assert.equal(reconciled.state, "completed");
+      assert.deepEqual(uploads, [{ name: "legacy-queued.txt", contents: "selected archive bytes", context }]);
+      assert.equal(providerOrphans.getInventoryStatus(cloud).state, "reconciled");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("startup blocks ambiguous legacy restore queues before provider uploads", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      write(path.join(uploadsDir, "root", "ambiguous-legacy.txt"), "archive bytes");
+      const backups = [
+        await backupService.createBackup({ createdBy: "fixture" }),
+        await backupService.createBackup({ createdBy: "fixture" }),
+      ];
+      for (const backup of backups) {
+        const saved = backupRepository.getBackup(backup.id);
+        backupRepository.saveBackup({
+          ...saved,
+          checksum: null,
+          metadata: { ...saved.metadata, restoreSync: {
+            operationId: backup.id,
+            state: "pending",
+            providerContext: "old-provider-context",
+            entries: [{ state: "pending" }],
+          } },
+        });
+      }
+      await providerOrphans.write([], { state: "known" });
+      let inventories = 0;
+      let uploads = 0;
+      const cloud = {
+        enabled: () => true,
+        provider: "fixture",
+        resolveInventoryContext: async () => "b".repeat(64),
+        inventoryContext: () => "b".repeat(64),
+        inventory: async () => { inventories += 1; return []; },
+        upload: async () => { uploads += 1; return true; },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+
+      await assert.rejects(restoreService.reconcileUnknownProviderInventory(), {
+        code: "LEGACY_RESTORE_SYNC_AMBIGUOUS",
+      });
+      assert.equal(inventories, 0, "startup must not choose an arbitrary archive baseline");
+      assert.equal(uploads, 0, "ambiguous legacy queues cannot reach the provider");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("replacement baseline retires the superseded legacy queue across restarts", () => {
+  runFixture(`
+    const { spawnSync: spawnChildSync } = require("node:child_process");
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const backupRepositoryPath = ${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))};
+    const restoreServicePath = ${JSON.stringify(path.join(ROOT, "services", "restoreService"))};
+    const providerOrphansPath = ${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))};
+    (async () => {
+      let context = "a".repeat(64);
+      const uploadCountPath = path.join(dataDir, "fixture-provider-upload-count.txt");
+      write(uploadCountPath, "0");
+      const uploadCount = () => Number(fs.readFileSync(uploadCountPath, "utf8")) || 0;
+      const cloud = {
+        enabled: () => true,
+        provider: "fixture",
+        resolveInventoryContext: async () => context,
+        inventoryContext: () => context,
+        inventory: async () => [],
+        upload: async () => { write(uploadCountPath, String(uploadCount() + 1)); return true; },
+      };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      write(path.join(uploadsDir, "root", "legacy-replacement.txt"), "selected archive bytes");
+      const legacyBackup = await backupService.createBackup({ createdBy: "fixture" });
+      const restored = await restoreService.restoreBackup(legacyBackup.id, { confirmation: "RESTORE" });
+      assert.equal(restored.cloudSync.state, "pending");
+      const replacement = await backupService.createBackup({ createdBy: "fixture" });
+      const legacyArchive = backupService.getBackupOrThrow(legacyBackup.id).archivePath;
+      fs.unlinkSync(legacyArchive);
+      const savedLegacy = backupRepository.getBackup(legacyBackup.id);
+      backupRepository.saveBackup({
+        ...savedLegacy,
+        checksum: null,
+        metadata: { ...savedLegacy.metadata, restoreSync: {
+          ...savedLegacy.metadata.restoreSync,
+          state: "pending",
+          entries: savedLegacy.metadata.restoreSync.entries.map((entry) => ({
+            ...entry,
+            state: "in_progress",
+            leaseToken: "fixture-active-provider-lease",
+            leaseUntil: new Date(Date.now() + 60_000).toISOString(),
+          })),
+        } },
+      });
+      await providerOrphans.write([], { state: "known" });
+      context = "b".repeat(64);
+
+      const previousBaseline = process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID;
+      process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID = replacement.id;
+      try {
+        await assert.rejects(restoreService.reconcileUnknownProviderInventory(), {
+          code: "LEGACY_RESTORE_SYNC_LEASE_ACTIVE",
+        }, "a live old-context lease must block replacement uploads");
+        assert.equal(uploadCount(), 0, "the interrupted startup does not upload while the old queue lease is active");
+        assert.equal(backupRepository.getBackup(replacement.id).metadata.providerReconciliationSupersedesBackupId, legacyBackup.id,
+          "the selected replacement durably records which legacy queue still needs retirement");
+        assert.equal(providerOrphans.getInventoryStatus(cloud).state, "unknown");
+
+        const leased = backupRepository.getBackup(legacyBackup.id);
+        backupRepository.saveBackup({
+          ...leased,
+          checksum: null,
+          metadata: { ...leased.metadata, restoreSync: {
+            ...leased.metadata.restoreSync,
+            state: "pending",
+            entries: leased.metadata.restoreSync.entries.map((entry) => ({
+              ...entry,
+              state: "pending",
+              leaseToken: null,
+              leaseUntil: null,
+            })),
+          } },
+        });
+        const restartScript = [
+          "const fs=require('node:fs');",
+          "const path=require('node:path');",
+          "const backupRepository=require(" + JSON.stringify(backupRepositoryPath) + ");",
+          "const restoreService=require(" + JSON.stringify(restoreServicePath) + ");",
+          "const providerOrphans=require(" + JSON.stringify(providerOrphansPath) + ");",
+          "const dataDir=path.join(process.cwd(),'data');",
+          "const uploadCountPath=path.join(dataDir,'fixture-provider-upload-count.txt');",
+          "const uploadCount=()=>Number(fs.readFileSync(uploadCountPath,'utf8'))||0;",
+          "const cloud={enabled:()=>true,provider:'fixture',resolveInventoryContext:async()=> 'b'.repeat(64),inventoryContext:()=> 'b'.repeat(64),inventory:async()=>[],upload:async()=>{fs.writeFileSync(uploadCountPath,String(uploadCount()+1));return true;}};",
+          "(async()=>{await restoreService.setCloudStorage(cloud);const result=await restoreService.reconcileUnknownProviderInventory();const legacy=backupRepository.getBackup(" + JSON.stringify(legacyBackup.id) + ");const replacement=backupRepository.getBackup(" + JSON.stringify(replacement.id) + ");console.log(JSON.stringify({ok:true,uploads:uploadCount(),legacyState:legacy.metadata.restoreSync.state,replacementState:replacement.metadata.restoreSync.state,pointer:replacement.metadata.providerReconciliationSupersedesBackupId||null,inventoryState:providerOrphans.getInventoryStatus(cloud).state,changed:result.changed}));})().catch(error=>{console.error(error);process.exitCode=1;});",
+        ].join(String.fromCharCode(10));
+        const resumed = spawnChildSync(process.execPath, ["-e", restartScript], {
+          cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000,
+        });
+        assert.equal(resumed.status, 0, resumed.stderr || resumed.stdout);
+        const resumedState = JSON.parse(resumed.stdout.trim().split(String.fromCharCode(10)).at(-1));
+        assert.equal(resumedState.legacyState, "cancelled",
+          "a fresh process resumes and durably retires the stale queue");
+        assert.equal(resumedState.replacementState, "completed");
+        assert.equal(resumedState.pointer, null, "the durable supersession pointer clears only after retirement");
+        assert.equal(resumedState.inventoryState, "reconciled");
+        const uploadsAfterRestart = resumedState.uploads;
+        assert.ok(uploadsAfterRestart > 0, "the replacement baseline's selected bytes reconcile once");
+        const secondRestart = spawnChildSync(process.execPath, ["-e", restartScript], {
+          cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000,
+        });
+        assert.equal(secondRestart.status, 0, secondRestart.stderr || secondRestart.stdout);
+        const secondRestartState = JSON.parse(secondRestart.stdout.trim().split(String.fromCharCode(10)).at(-1));
+        assert.equal(secondRestartState.uploads, uploadsAfterRestart,
+          "a subsequent fresh process does not rediscover or replay the superseded queue");
+      } finally {
+        if (previousBaseline === undefined) delete process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID;
+        else process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID = previousBaseline;
+      }
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("divergent unknown provider marker contexts fail closed until repaired", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      const backupId = "123e4567-e89b-42d3-a456-426614174000";
+      const statePath = path.join(dataDir, ".rootark-restore-provider-orphans-state.json");
+      const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+      const stateContext = "a".repeat(64);
+      const policyContext = "b".repeat(64);
+      write(statePath, JSON.stringify({ version: 1, initializedAt: "2026-01-01T00:00:00.000Z", providerInventory: {
+        state: "unknown", backupId, inventoryContext: stateContext,
+      } }));
+      write(policyPath, JSON.stringify({ version: 1, objects: [], providerInventory: {
+        state: "unknown", backupId, inventoryContext: policyContext,
+      } }));
+
+      const divergent = providerOrphans.getInventoryStatus({ inventoryContext: () => policyContext });
+      assert.equal(divergent.state, "unknown");
+      assert.equal(divergent.contextConflict, true,
+        "the policy and state records are separate durable witnesses and must not select one conflicting context");
+      assert.equal(divergent.inventoryContext, undefined);
+      await assert.rejects(providerOrphans.reconcileInventory(backupId, [], policyContext), /context records are inconsistent/i);
+
+      await providerOrphans.markInventoryUnknown(backupId, { inventoryContext: policyContext });
+      assert.deepEqual(providerOrphans.getInventoryStatus(), {
+        state: "unknown", backupId, inventoryContext: policyContext,
+      }, "an explicit current context repairs both unknown records under the policy lock");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("restore rollback restores the prior provider-orphan suppression policy and state", () => {
   runFixture(`
     const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
