@@ -24,10 +24,20 @@ function createCloudStorage(options = {}) {
     };
   }
   function inventoryContext() {
+    let googleCredentialHash = "default-credentials";
+    if (options.gdrive?.credentials) {
+      googleCredentialHash = crypto.createHash("sha256").update(String(options.gdrive.credentials)).digest("hex");
+    } else if (options.gdrive?.credentialsPath) {
+      try {
+        googleCredentialHash = crypto.createHash("sha256").update(fs.readFileSync(options.gdrive.credentialsPath)).digest("hex");
+      } catch {
+        throw new Error("Google Drive credentials cannot be read");
+      }
+    }
     const context = provider === "s3"
-      ? [provider, prefix, options.s3?.bucket || "", options.s3?.region || "", options.s3?.endpoint || ""]
+      ? [provider, prefix, rootFolderId, options.s3?.bucket || "", options.s3?.region || "", options.s3?.endpoint || ""]
       : provider === "gdrive"
-        ? [provider, prefix, options.gdrive?.folderId || "", options.gdrive?.credentials ? crypto.createHash("sha256").update(String(options.gdrive.credentials)).digest("hex") : options.gdrive?.credentialsPath || "default-credentials"]
+        ? [provider, prefix, rootFolderId, options.gdrive?.folderId || "", googleCredentialHash]
         : [provider, prefix];
     return crypto.createHash("sha256").update(JSON.stringify(context)).digest("hex");
   }

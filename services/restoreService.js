@@ -566,10 +566,10 @@ function restoreSyncEntryDueAt(entry, now) {
 async function reconcileUnknownProviderInventory({ baselineBackupId, clock, sleep } = {}) {
   const status = restoreProviderOrphans.getInventoryStatus(cloudStorage);
   if (status.state !== "unknown") return { state: status.state, changed: false };
-  if (!cloudStorage?.enabled?.()) return { state: "unknown", providerDisabled: true, changed: false };
   if (restoreProviderOrphans.getInventoryStatus().state !== "unknown") {
     await restoreProviderOrphans.markInventoryUnknown(status.backupId);
   }
+  if (!cloudStorage?.enabled?.()) return { state: "unknown", providerDisabled: true, changed: false };
   if (typeof cloudStorage.inventory !== "function") throw new Error("Cloud provider inventory is required before cloud access can resume");
   const explicitBaseline = String(baselineBackupId || process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID || "").trim();
   if (status.backupId && explicitBaseline && status.backupId !== explicitBaseline) {

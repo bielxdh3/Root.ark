@@ -578,6 +578,36 @@ test("a reconciled provider inventory is scoped to its provider configuration", 
   `);
 });
 
+test("cloud-disabled provider change persists invalidation and protects its backup baseline", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    (async () => {
+      backupService.setCloudStorage({ enabled: () => false });
+      restoreService.setCloudStorage({ enabled: () => false });
+      write(path.join(uploadsDir, "root", "baseline.txt"), "baseline");
+      const baseline = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(uploadsDir, "root", "newer.txt"), "newer");
+      await backupService.createBackup({ createdBy: "fixture" });
+      await providerOrphans.markInventoryUnknown(baseline.id);
+      await providerOrphans.reconcileInventory(baseline.id, [], "a".repeat(64));
+
+      restoreService.setCloudStorage({ enabled: () => false, inventoryContext: () => "b".repeat(64) });
+      const result = await restoreService.reconcileUnknownProviderInventory();
+      assert.deepEqual(result, { state: "unknown", providerDisabled: true, changed: false });
+      assert.deepEqual(providerOrphans.getInventoryStatus(), { state: "unknown", backupId: baseline.id },
+        "the context mismatch must be durably invalidated even while cloud access is disabled");
+
+      process.env.BACKUP_RETENTION_COUNT = "1";
+      process.env.BACKUP_RETENTION_DAYS = "0";
+      await backupService.cleanupRetention();
+      assert.equal(backupService.listBackups().find((item) => item.id === baseline.id)?.exists, true,
+        "the retained marker baseline remains available to future reconciliation");
+      assert.throws(() => backupService.deleteBackup(baseline.id), /provider inventory baseline/i);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("cloud-disabled local edits are preserved while reconciliation uploads selected archive bytes", () => {
   runFixture(`
     backupService.setCloudStorage({ enabled: () => false });

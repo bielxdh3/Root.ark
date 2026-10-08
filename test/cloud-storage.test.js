@@ -407,10 +407,26 @@ test("inventory context changes with provider namespace configuration without ex
   const base = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket-a", region: "eu" } });
   const bucketChanged = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket-b", region: "eu" } });
   const prefixChanged = createCloudStorage({ provider: "s3", prefix: "other", s3: { bucket: "bucket-a", region: "eu" } });
+  const rootChanged = createCloudStorage({ provider: "s3", prefix: "rootark", rootFolderId: "different-root", s3: { bucket: "bucket-a", region: "eu" } });
   const providerChanged = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "folder-a", credentials: "fixture-private-credential" } });
+  const gdriveRootChanged = createCloudStorage({ provider: "gdrive", prefix: "rootark", rootFolderId: "different-root", gdrive: { folderId: "folder-a", credentials: "fixture-private-credential" } });
   assert.match(base.inventoryContext(), /^[a-f0-9]{64}$/);
-  assert.equal(new Set([base.inventoryContext(), bucketChanged.inventoryContext(), prefixChanged.inventoryContext(), providerChanged.inventoryContext()]).size, 4);
+  assert.equal(new Set([base.inventoryContext(), bucketChanged.inventoryContext(), prefixChanged.inventoryContext(), rootChanged.inventoryContext(), providerChanged.inventoryContext(), gdriveRootChanged.inventoryContext()]).size, 6);
   assert.equal(JSON.stringify(providerChanged.inventoryContext()).includes("fixture-private-credential"), false);
+});
+
+test("Google Drive credential file content scopes provider inventory and unreadable credentials fail closed", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-drive-credentials-context-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const credentialsPath = path.join(root, "service-account.json");
+  fs.writeFileSync(credentialsPath, '{"client_email":"before@example.invalid"}');
+  const storage = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "folder-a", credentialsPath } });
+  const before = storage.inventoryContext();
+  fs.writeFileSync(credentialsPath, '{"client_email":"after@example.invalid"}');
+  assert.notEqual(storage.inventoryContext(), before, "replacing credentials at the same path invalidates the old inventory context");
+
+  const missing = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "folder-a", credentialsPath: path.join(root, "missing.json") } });
+  assert.throws(() => missing.inventoryContext(), /Google Drive credentials cannot be read/);
 });
 
 test("root-folder keys use the uploads area", () => {
