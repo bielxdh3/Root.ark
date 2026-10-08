@@ -632,6 +632,52 @@ test("dynamic provider identity blocks guarded access and aborts restore reconci
   `);
 });
 
+test("restore sync worker keeps its queue and suppression when principal changes during upload", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const { createCloudStorage } = require(${JSON.stringify(path.join(ROOT, "services", "cloudStorage"))});
+    (async () => {
+      let principal = "drive-principal-a";
+      let uploadCalls = 0;
+      let clearCalls = 0;
+      const cloud = createCloudStorage({
+        provider: "gdrive",
+        gdrive: { folderId: "fixture-folder" },
+        resolvePrincipalIdentity: async () => principal,
+      });
+      cloud.inventory = async () => [];
+      cloud.resolveUploadId = async () => "fixture-drive-id";
+      cloud.upload = async () => { uploadCalls += 1; principal = "drive-principal-b"; return true; };
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+      write(path.join(uploadsDir, "root", "file.txt"), "local bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      const context = await cloud.resolveInventoryContext();
+      await providerOrphans.markInventoryUnknown(backup.id, { inventoryContext: context });
+      await providerOrphans.reconcileInventory(backup.id, [
+        { area: "uploads", folderId: "root", name: "file.txt" },
+      ], context);
+      assert.equal(providerOrphans.isSuppressed("root", "file.txt", "uploads"), true);
+
+      const originalClear = providerOrphans.clear;
+      providerOrphans.clear = async (...args) => { clearCalls += 1; return originalClear(...args); };
+      restoreService.setCloudStorage(cloud);
+      try {
+        const result = await restoreService.processRestoreSync({ backupId: backup.id, uploader: cloud });
+        const sync = result.metadata.restoreSync;
+        assert.notEqual(sync.state, "completed");
+        assert.equal(sync.entries[0].state, "retry_wait");
+        assert.equal(uploadCalls, 1);
+        assert.equal(clearCalls, 0, "suppression is not cleared after identity changes during the provider upload");
+        assert.equal(providerOrphans.isSuppressed("root", "file.txt", "uploads"), true);
+        assert.equal(providerOrphans.getInventoryStatus(cloud).state, "unknown");
+      } finally { providerOrphans.clear = originalClear; }
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("cloud-disabled provider change persists invalidation and protects its backup baseline", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});

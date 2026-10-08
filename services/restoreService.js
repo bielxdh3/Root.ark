@@ -19,6 +19,7 @@ const WHOLE_RESTORE_ACK_ROOT = resolveRuntimePath("data", ".rootark-restore-rest
 const RESTORABLE_ROOTS = new Set(["data", "uploads"]);
 const WHOLE_RESTORE_COORDINATOR_VERSION = 3;
 const MAX_RESTORE_SYNC_RETRY_DELAY_MS = 60 * 60 * 1000;
+const PROVIDER_CONTEXT_BINDING = Symbol("restore-provider-context-binding");
 const S_IFMT = 0xf000;
 const S_IFLNK = 0xa000;
 let cloudStorage = null;
@@ -742,7 +743,14 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
 
 function bindProviderContext(provider, expectedContext) {
   if (!provider || typeof provider !== "object" || typeof provider.resolveInventoryContext !== "function") return provider;
+  if (provider[PROVIDER_CONTEXT_BINDING] !== undefined) {
+    if (provider[PROVIDER_CONTEXT_BINDING] !== expectedContext) {
+      throw new Error("Cloud provider identity changed during restore inventory reconciliation; cloud access remains blocked");
+    }
+    return provider;
+  }
   const bound = Object.create(provider);
+  Object.defineProperty(bound, PROVIDER_CONTEXT_BINDING, { value: expectedContext });
   for (const operation of ["inventory", "resolveUploadId", "upload"]) {
     if (typeof provider[operation] !== "function") continue;
     bound[operation] = async (...args) => {
@@ -858,6 +866,12 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
   const provider = uploader || cloudStorage;
   let latest = backupRepository.getBackup(backupId);
   if (!latest || !latest.metadata?.restoreSync || !provider?.enabled?.()) return latest;
+  let expectedProviderContext = null;
+  let operationProvider = provider;
+  if (typeof provider.resolveInventoryContext === "function") {
+    expectedProviderContext = await provider.resolveInventoryContext();
+    operationProvider = bindProviderContext(provider, expectedProviderContext);
+  }
   if (restoreProviderOrphans.isInventoryUnknown(provider) && authority !== STARTUP_INVENTORY_RECONCILIATION) restoreProviderOrphans.assertProviderAvailable(provider);
   if (latest.metadata.restoreSync.entries?.length
     && latest.metadata.restoreSync.entries.every((entry) => entry.state === "completed")
@@ -903,7 +917,7 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
             }
             let providerFileId = String(entryForUpload.providerFileId || "").trim();
             if (!providerFileId) {
-              providerFileId = String(await provider.resolveUploadId(entryForUpload.folderId, entryForUpload.name, entryForUpload.area) || "").trim();
+              providerFileId = String(await operationProvider.resolveUploadId(entryForUpload.folderId, entryForUpload.name, entryForUpload.area) || "").trim();
               if (!providerFileId) throw Object.assign(new Error("Google Drive did not provide a stable restore target"), { code: "configuration" });
               const beforePin = backupRepository.getBackup(backupId);
               const currentEntry = beforePin?.metadata?.restoreSync?.entries?.find((value) => value.entryId === lease.entry.entryId);
@@ -925,15 +939,17 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
               if (!entryForUpload || entryForUpload.leaseToken !== lease.token || entryForUpload.providerFileId !== providerFileId) return false;
             }
           }
-          const uploaded = await provider.upload(localPath, entryForUpload.folderId, entryForUpload.name, entryForUpload.area,
+          const uploaded = await operationProvider.upload(localPath, entryForUpload.folderId, entryForUpload.name, entryForUpload.area,
             providerIdentity === "gdrive" ? { providerFileId: entryForUpload.providerFileId } : undefined);
           if (!uploaded) throw Object.assign(new Error("restore source unavailable"), { code: "source_unavailable" });
           if (lease.entry.sourceHash && await backupService.calculateFileHash(localPath) !== lease.entry.sourceHash) {
             throw Object.assign(new Error("restore source changed during upload"), { code: "source_unavailable" });
           }
           if (authority !== STARTUP_INVENTORY_RECONCILIATION) {
-            await restoreProviderOrphans.clear(entryForUpload.folderId, entryForUpload.name, entryForUpload.area, provider);
+            await assertProviderContext(provider, expectedProviderContext);
+            await restoreProviderOrphans.clear(entryForUpload.folderId, entryForUpload.name, entryForUpload.area, operationProvider);
           }
+          await assertProviderContext(provider, expectedProviderContext);
           return true;
       };
       const runMutation = typeof runFileLifecycleMutation === "function"
