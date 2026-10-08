@@ -1,13 +1,13 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Last branch reconciliation: 2026-10-08 (after PR #127)
+Last branch reconciliation: 2026-10-08 (after PR #129)
 
 Repository: `bielxdh3/root.ark`
 
-The live GitHub verification snapshot used for this documentation follow-up is after PR #127 merged, at `Root/main` SHA `25e50cbaa26062202d470330e93d7beb4575693a`. Exact-SHA push Security Regression passed on Ubuntu (987 tests: 976 passed, 11 skipped) and Windows (987 tests: 983 passed, 4 skipped); CodeQL, default-branch Dependency Review, and Pages also passed. The candidate release gate passed 21/21 on PR head `2334bf0…`; it had not run on that merged SHA at the time of the query. This snapshot is time-scoped; query GitHub again after later repository changes.
+The latest recorded closure snapshot is after PR #129 merged, at `Root/main` SHA `f543f0f4045d12ecbaf6f8b793d3d24aecb98e25`; see [the exact validation and GitHub record](validation/2026-10-08-rootark-final-closure-post-129.md). On that SHA, Security Regression, CodeQL, Dependency Review, and Pages passed, and the local release gate passed 21/21. The snapshot also records the remaining browser acceptance gaps, open issues and PRs, and restore boundary. It is time-scoped; re-query GitHub before relying on it after later changes.
 
-The security-correction code, restore-provider recovery, mobile audit-table fix, and main-push CI work through PR #127 are merged. PR #127 hardens provider inventory identity and legacy restore-queue recovery. Mission closure remains `[PARTIAL]` pending this documentation PR, the final-SHA release gate, complete browser acceptance, and a fresh independent final review. Browser checks on disposable fixtures have verified several authentication, upload, sharing, restore, responsive, and keyboard paths, but required journeys remain untested; see the closure-validation addendum. Whole restore has local compensation/restart recovery and durable provider reconciliation, but is not atomic across storage domains. Issues #63–68 and #94 remain open. PRs #95 and #97 remain open on stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; PR #95 is `DIRTY`, #97 is `CLEAN`, and their checks are from 2026-10-01. PR #102 is closed; #125–127 are merged.
+The post-#129 snapshot recorded security-correction code, restore-provider recovery, and main-push CI as merged, while closure remained `[PARTIAL]`: a scoped review had identified a release-gate classification edge case and browser acceptance still had explicit untested flows. Whole restore has local compensation/restart recovery and durable provider reconciliation, but is not atomic across storage domains. The snapshot records issues #63–68 and #94 open and PRs #95 and #97 on stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`. Do not use either the post-#127 or post-#129 point-in-time snapshot as current live state without re-querying GitHub.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
@@ -62,7 +62,7 @@ A feature is not `[DONE]` merely because files, routes, UI, or documentation exi
 5. GitHub issues for executable scope.
 6. Historical chat context only as input, never as proof.
 
-The latest full issue reconciliation snapshot recorded in `docs/issue-ledger.md` is after PR #127, queried against GitHub on 2026-10-08 at source SHA `25e50cbaa26062202d470330e93d7beb4575693a`. The older source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a` is historical and superseded. Later closure PRs update validation and documentation evidence; re-query GitHub before relying on this point-in-time issue, PR, or check state. The canonical Phase 11 Issue #6 reconciliation remains historical evidence: `docs/roadmap/phase-11-backlog-reconciliation.md` records `PHASE_11_BACKLOG_RECONCILED` at the accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
+The latest full issue reconciliation snapshot recorded in `docs/issue-ledger.md` is after PR #129, queried against GitHub on 2026-10-08 at source SHA `f543f0f4045d12ecbaf6f8b793d3d24aecb98e25`; the older post-#127 SHA `25e50cbaa26062202d470330e93d7beb4575693a` and source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a` are historical. Later closure PRs can make point-in-time issue, PR, and check state stale; re-query GitHub before relying on it. The canonical Phase 11 Issue #6 reconciliation remains historical evidence: `docs/roadmap/phase-11-backlog-reconciliation.md` records `PHASE_11_BACKLOG_RECONCILED` at the accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
 
 Master Phase 0-16 ledger and independent local blocker taxonomy: `docs/issue-ledger.md`. The governing continuation supplies the original meanings for all phases; local statuses and evidence are reconciled there without converting design or historical evidence into acceptance.
 

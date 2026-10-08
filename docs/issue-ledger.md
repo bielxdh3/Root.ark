@@ -1,5 +1,9 @@
 # Root.ark Issue Ledger
 
+## Latest closure verification snapshot — after PR #129 (2026-10-08)
+
+The exact post-#129 `Root/main` state and closure evidence are recorded in [the final closure snapshot](validation/2026-10-08-rootark-final-closure-post-129.md), at `f543f0f4045d12ecbaf6f8b793d3d24aecb98e25`. The older PR #127 issue reconciliation below remains a historical snapshot, not current live GitHub state. Re-query GitHub before relying on issue, PR, alert, or check status after this snapshot.
+
 ## Verified GitHub snapshot used for this documentation follow-up — after PR #127 (2026-10-08, `Root/main` `25e50cbaa26062202d470330e93d7beb4575693a`)
 
 Queried live after PR #127 merged and push-triggered checks completed on this exact SHA. This is a point-in-time snapshot; re-query GitHub before relying on its issue, PR, or check state after later changes.
