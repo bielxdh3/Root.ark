@@ -1,11 +1,11 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Last branch reconciliation: 2026-10-07
+Last branch reconciliation: 2026-10-08
 
 Repository: `bielxdh3/root.ark`
 
-Current-state source: the live issue/PR snapshot in [docs/issue-ledger.md](issue-ledger.md), queried against GitHub on 2026-10-07 at `Root/main` SHA `964f820417baf44f059a04e5363a2a172dccdc7a`. That exact SHA passed push-triggered Security Regression, CodeQL, and Dependency Review. This plan tree retains dated phase and roadmap evidence; consult the linked ledger for current GitHub state and the README for exact run links.
+Current-state source: the newest dated issue/PR snapshot in [docs/issue-ledger.md](issue-ledger.md). The latest query recorded source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1` on 2026-10-08 UTC after PR #115 merged and before this documentation update is published. It is a point-in-time snapshot, not a claim about the branch after publication; the closure report records the later final SHA and its checks. Older dated sections remain historical evidence.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
@@ -13,28 +13,28 @@ Historical reconstruction baseline retained for provenance: `4062f4c67bfda9d144a
 
 ## Historical live GitHub reconciliation — 2026-10-01
 
-This dated section superseded older statements at the time it was written. Its branch, issue, and PR states are historical; use the current snapshot linked above for live state. Historical phase reports below retain their original dates and evidence boundaries.
+This dated section superseded older statements at the time it was written. Its issue, branch, and PR states are historical; use the current snapshot linked above for live state. Historical phase reports below retain their original dates and evidence boundaries.
 
 - The live default branch was `Root/main` at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`. At that snapshot GitHub had seven open issues (#63–68 and #94) and one open PR (#95).
 - Issue #83 is closed. Its sensitive-name policy remains active: `.env`, credential/service-account names, and private-key/certificate extensions remain excluded from backup content and quarantine payload references. PRs #86 and #90 contain its completion evidence.
 - PR #96 is merged at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; its exact-head CodeQL analysis, dependency review, Ubuntu validation, Windows validation, and GHAS scan passed. This does not authorize a release.
-- Issue #94 is represented by PR #95, which remains open. Its exact current head `cc0f7c3238e7b7e80afd1e2d6ef4822410a71fe4` passes the CodeQL analysis workflow, dependency review, Ubuntu validation, and Windows validation. A separate CodeQL `js/missing-rate-limiting` check still fails on `/upload-chunk` after the route limiter was moved to path-scoped middleware. Focused route tests prove 23/23 behaviors including a 429 response before Multer, but the static alert remains unresolved; do not merge or close #94 until that check is resolved through an evidence-backed review.
+- Issue #94 is represented by PR #95, which remains open. Exact head `95d99e4a934384fcfa2101dfc210741cd791a3d1` passes CodeQL, Analyze JavaScript / TypeScript, dependency review, Ubuntu Node 22 full validation, and Windows Node 22 syntax/tests. The focused upload-security suite passes 26/26, and targeted independent reviews approve parser ordering and server-generated staging-path identity/cleanup. Production replica topology is still unknown; the in-memory limiter and local-disk staging need shared/edge enforcement or confirmed single-process deployment before #94 can close.
 - Issue #63 is an approved future feature tracker, not implementation authorization. The protected-index primitive exists, but the UI does not populate it; FTS5 and advanced search remain deferred until the searchable corpus, encrypted-index lifecycle, privacy leakage, and acceptance criteria are defined.
 - Issue #64 is a future Android-client tracker, not implementation authorization. There is no Android/Gradle project or Android CI. A native implementation remains gated on a separate architecture/threat-model and protocol-compatibility test plan.
 - Issue #65 approves the Zero-Knowledge direction and bounded cryptographic foundation; it does not establish a Zero-Knowledge runtime. Current uploads and server-side operations can still expose plaintext. Migration inventory, client authorization, recovery authority, mixed-mode window, and exact-head runtime/backup acceptance remain open.
-- Issue #66 is approved but not complete: the current sync engine materializes the remote set locally and can interpret local absence as deletion; selective sync, remote-only state, safe local eviction, and lazy verified fetch are still missing.
+- Issue #66 is approved but not complete. PR #97 implements selected-path reconciliation, remote-only state, and guarded cache/materialization flows. Metadata-only remote listing and pagination, a Files On-Demand native provider/UI, and a portable guarantee that eviction cannot race an external writer with an open handle remain missing.
 - Issue #67 is approved but not complete: existing backups and sync revisions are recovery prerequisites, not a ransomware shield. Burst detection, a recoverable pause/review barrier, protected per-object recovery history, and authorized restore are absent.
 - Issue #68 is approved but not complete: existing public links are single-file bearer links with expiry/limits, not operation-scoped capabilities. Protected-link delivery remains gated on least-privilege capability enforcement and owner choices for link UX, expiry, and recipient recovery.
 
 ## Historical reconciliation work after the live baseline — 2026-10-01
 
-This addendum records published work after the 2026-10-01 GitHub baseline above. PR #98 merged at `1df5e4640d4aea7dc700f2088059f489c2e51af0`; PR and issue state recorded below is historical. Neither PR #97 nor PR #98 marked an issue complete.
+This addendum records the published work after the live GitHub baseline above. PR #97 remains open and unmerged; PR #98 was merged into `Root/main` at `1df5e4640d4aea7dc700f2088059f489c2e51af0`. Neither PR changes issue state or marks an issue complete. PR #95 remains open after all exact-head checks passed because production replica topology is still unverified.
 
 - Issue #64 has a native-client architecture and threat-model document only. No Android application, Gradle project, build, or CI exists.
 - Issue #65 has a Zero-Knowledge migration contract and a read-only inventory prototype limited to explicitly selected fixture files under an operating-system temporary directory. The prototype reports recognized legacy encryption modes using run-scoped opaque references; it does not inspect live application storage or establish migration readiness. Its four focused tests pass. Runtime migration, authorization, recovery authority, mixed-mode window, backup/restore acceptance, and the remaining owner decisions are still open.
-- Issue #66 has a selective-sync implementation in PR #97 at `de051600ab1390752cdebfeac5febf87efbad153`, with selected-path tracking, remote-only state, verified cache eviction, and explicit verified materialization. The focused engine suite records 25 passing tests and one platform-skipped test; the Phase 16 regression file passes 26/26. The current list API still transfers complete remote records including ciphertext before local path filtering, so network payload transfer is not selective. Exact-head CodeQL, dependency review, and Linux/Windows CI pass, and a targeted independent review approved the fail-closed process-lock patch. The final security-diff report is unavailable, so PR #97 remains open. There is no Windows Files On-Demand provider or UI, metadata-only catalog, or paginated remote listing; the issue remains incomplete.
+- Issue #66 has a selective-sync implementation in PR #97 at `a6a33a92cd6902f303254e60031da4bdc04cec04`, including selected-path tracking, remote-only state, move-out reconciliation, and guarded cache/materialization flows. The focused `test/phase16-sync-engine.test.js` run records 31 passing tests and one platform-skipped test. The current list API still transfers complete remote records including ciphertext before local path filtering, so network payload transfer is not selective. Exact-head CodeQL, Analyze JavaScript / TypeScript, dependency review, and Ubuntu/Windows CI pass; an independent targeted review of the move-out change found no actionable findings. There is no Windows Files On-Demand provider/UI, metadata-only catalog, or paginated remote listing, and portable open-handle quiescence for eviction is unresolved. PR #97 and the issue remain open.
 - Issues #67 and #68 have architecture/acceptance contracts only. No runtime protection or capability-sharing feature is implemented; the owner choices recorded in those contracts remain unresolved.
-- PR #98 carries this documentation reconciliation. Issue #94 / PR #95 and its unresolved CodeQL check retain the live state recorded above.
+- PR #98 merged the previous documentation reconciliation. This update records the later #95/#97 checks and open acceptance gates above.
 
 ## Status labels
 
@@ -60,7 +60,7 @@ A feature is not `[DONE]` merely because files, routes, UI, or documentation exi
 5. GitHub issues for executable scope.
 6. Historical chat context only as input, never as proof.
 
-The current issue reconciliation snapshot is `docs/issue-ledger.md` (verified against GitHub 2026-10-07). The canonical Phase 11 Issue #6 reconciliation remains historical evidence: `docs/roadmap/phase-11-backlog-reconciliation.md` records `PHASE_11_BACKLOG_RECONCILED` at the accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
+The newest issue reconciliation snapshot is `docs/issue-ledger.md` (verified against GitHub 2026-10-08 at source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`). The canonical Phase 11 Issue #6 reconciliation remains historical evidence: `docs/roadmap/phase-11-backlog-reconciliation.md` records `PHASE_11_BACKLOG_RECONCILED` at the accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
 
 Master Phase 0-16 ledger and independent local blocker taxonomy: `docs/issue-ledger.md`. The governing continuation supplies the original meanings for all phases; local statuses and evidence are reconciled there without converting design or historical evidence into acceptance.
 
@@ -461,7 +461,7 @@ All items below are candidates, not commitments.
 - `[ACCEPTED-LOCAL]` Protocol v2 metadata AAD/schema enforcement, recoverable WebDAV overwrite journaling, bidirectional encrypted sync, strict client/offline boundaries, protected index/preview identity binding, and approved `rootark-zk-1` opaque group wraps are implemented and locally reviewed.
 - `[ACCEPTED-LOCAL]` The controlled final-head cross-phase matrix recorded 66/66 tests passed, with separate realtime transport 4/4 and upload-security 12/12 boundary runs; syntax validation recorded 116/116 passed. WebDAV PUT has a distinct durable mutation event and explicit protocol-v2 translation, and the browser protected store now has an in-memory session hook.
 - `[BLOCKED]` Canonical full `npm test` was attempted but remains blocked by the unavailable `better-sqlite3` native binding in the disposable install; remote CI, browser/provider/live-production/TLS, owner approval, and release evidence remain external.
-- `[RECONCILED]` The previously unnamed Draft-PR statement cannot be mapped to a current live PR. The dated GitHub reconciliation records the live state: PR #96 is merged and PR #95 remains open behind its CodeQL check. Merge state is not release authorization; no Phase 17 item is created or inferred.
+- `[RECONCILED — 2026-10-06]` The previously unnamed Draft-PR statement cannot be mapped to a current live PR. PR #96 is merged; PR #95 remains open with its current CodeQL and Security Regression checks passing, while Issue #94's multi-process/replica enforcement gate remains unresolved. Merge state is not release authorization; no Phase 17 item is created or inferred.
 
 ### Authentication and administration
 
