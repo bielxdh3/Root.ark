@@ -1,6 +1,5 @@
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
 const crypto = require("crypto");
 const Database = require("better-sqlite3");
 const unzipper = require("unzipper");
@@ -523,6 +522,41 @@ function syncEntries(manifest) {
     .filter(Boolean);
 }
 
+function localUploadFiles() {
+  const root = resolveRuntimePath("uploads");
+  let rootStat;
+  try { rootStat = fs.lstatSync(root); }
+  catch (error) { if (error.code === "ENOENT") return []; throw error; }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error("Local upload tree is unsafe; cloud reconciliation remains blocked");
+  const files = [];
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name);
+      if (entry.isSymbolicLink()) throw new Error("Local upload tree contains a symlink; cloud reconciliation remains blocked");
+      if (entry.isDirectory()) visit(absolute);
+      else if (entry.isFile()) files.push(`uploads/${path.relative(root, absolute).replace(/\\/g, "/")}`);
+      else throw new Error("Local upload tree contains an unsupported filesystem entry; cloud reconciliation remains blocked");
+    }
+  };
+  visit(root);
+  return files.sort();
+}
+
+async function localReconciliationPlan(manifest) {
+  if (manifest?.cloud_complete !== true) {
+    throw new Error("The selected backup has no complete cloud upload baseline; configure ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID with a complete backup and restart reconciliation");
+  }
+  const files = localUploadFiles();
+  const entries = syncEntries({ included_files: files.map((entryPath) => ({ path: entryPath })) });
+  for (const entry of entries) {
+    const sourcePath = resolveRuntimePath(entry.path);
+    if (fs.lstatSync(sourcePath).isSymbolicLink()) throw new Error("Local upload source changed to an unsafe path; cloud reconciliation remains blocked");
+    entry.sourceHash = await backupService.calculateFileHash(sourcePath);
+  }
+  const fingerprint = crypto.createHash("sha256").update(JSON.stringify(entries.map(({ path: entryPath, sourceHash }) => [entryPath, sourceHash]))).digest("hex");
+  return { entries, fingerprint };
+}
+
 function archivedProviderObjects(manifest) {
   if (manifest?.cloud_complete !== true) return new Set();
   return new Set((manifest?.included_files || [])
@@ -564,28 +598,74 @@ function restoreSyncEntryDueAt(entry, now) {
 }
 
 async function reconcileUnknownProviderInventory({ baselineBackupId, clock, sleep } = {}) {
+  if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
+  const previousStatus = restoreProviderOrphans.getInventoryStatus();
   const status = restoreProviderOrphans.getInventoryStatus(cloudStorage);
   if (status.state !== "unknown") return { state: status.state, changed: false };
-  if (restoreProviderOrphans.getInventoryStatus().state !== "unknown") {
-    await restoreProviderOrphans.markInventoryUnknown(status.backupId);
+  const currentInventoryContext = cloudStorage.inventoryContext?.() || null;
+  const markerNeedsUpdate = status.backupId && (previousStatus.state !== "unknown" || previousStatus.inventoryContext !== currentInventoryContext);
+  if (!cloudStorage?.enabled?.()) {
+    if (markerNeedsUpdate) {
+      try {
+        await restoreProviderOrphans.markInventoryUnknown(status.backupId, {
+          inventoryContext: currentInventoryContext || status.inventoryContext,
+          previousInventoryContext: status.previousInventoryContext || previousStatus.inventoryContext,
+        }, { validateBaseline: () => backupService.getBackupOrThrow(status.backupId) });
+      } catch (error) {
+        if (!["Backup nao encontrado", "Arquivo de backup nao encontrado"].includes(error.message)) throw error;
+      }
+    }
+    return { state: "unknown", providerDisabled: true, changed: false };
   }
-  if (!cloudStorage?.enabled?.()) return { state: "unknown", providerDisabled: true, changed: false };
   if (typeof cloudStorage.inventory !== "function") throw new Error("Cloud provider inventory is required before cloud access can resume");
   const explicitBaseline = String(baselineBackupId || process.env.ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID || "").trim();
-  if (status.backupId && explicitBaseline && status.backupId !== explicitBaseline) {
-    throw new Error("Explicit provider inventory baseline conflicts with the durable restore selection");
+  let missingSelectedBaseline = false;
+  if (status.backupId) {
+    try { backupService.getBackupOrThrow(status.backupId); }
+    catch (error) {
+      if (!["Backup nao encontrado", "Arquivo de backup nao encontrado"].includes(error.message)) throw error;
+      missingSelectedBaseline = true;
+    }
   }
-  const selectedBackupId = status.backupId || explicitBaseline;
+  if (missingSelectedBaseline && !explicitBaseline) {
+    throw new Error("The selected provider inventory baseline is missing; set ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID to a different complete backup");
+  }
+  if (missingSelectedBaseline && explicitBaseline === status.backupId) {
+    throw new Error("The selected provider inventory baseline is missing; ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID must name a different complete backup");
+  }
+  if (status.backupId && explicitBaseline && status.backupId !== explicitBaseline) {
+    if (!missingSelectedBaseline) throw new Error("Explicit provider inventory baseline conflicts with the durable restore selection");
+  }
+  const selectedBackupId = missingSelectedBaseline || !status.backupId ? explicitBaseline : status.backupId;
   if (!selectedBackupId) throw new Error("An explicit backup baseline is required to reconcile legacy provider inventory");
+  if (missingSelectedBaseline || !status.backupId) {
+    await restoreProviderOrphans.markInventoryUnknown(selectedBackupId, { inventoryContext: currentInventoryContext }, {
+      validateBaseline: () => backupService.getBackupOrThrow(selectedBackupId),
+    });
+  } else if (markerNeedsUpdate) {
+    await restoreProviderOrphans.markInventoryUnknown(status.backupId, {
+      inventoryContext: currentInventoryContext || status.inventoryContext,
+      previousInventoryContext: status.previousInventoryContext || previousStatus.inventoryContext,
+    }, { validateBaseline: () => backupService.getBackupOrThrow(status.backupId) });
+  }
 
   const { backup, archivePath } = backupService.getBackupOrThrow(selectedBackupId);
-  const { zip, manifest } = await validateBackupArchive(backup, archivePath);
-  const archiveEntries = new Map(zip.files
-    .filter((entry) => entry.type !== "Directory")
-    .map((entry) => [String(entry.path || "").replace(/\\/g, "/"), entry]));
+  const { manifest } = await validateBackupArchive(backup, archivePath);
+  const localPlan = await localReconciliationPlan(manifest);
   let selectedBackup = backupRepository.getBackup(selectedBackupId) || backup;
-  if (!selectedBackup.metadata?.restoreSync || ["completed", "cancelled"].includes(selectedBackup.metadata.restoreSync.state)) {
-    const restoreSync = createRestoreSync(manifest);
+  const previousSync = selectedBackup.metadata?.restoreSync;
+  const samePlan = previousSync?.providerContext === currentInventoryContext
+    && previousSync?.localDeltaFingerprint === localPlan.fingerprint
+    && JSON.stringify((previousSync.entries || []).map(({ path: entryPath, sourceHash }) => [entryPath, sourceHash]))
+      === JSON.stringify(localPlan.entries.map(({ path: entryPath, sourceHash }) => [entryPath, sourceHash]));
+  if (!samePlan || previousSync.state === "cancelled") {
+    const now = Date.now();
+    if ((previousSync?.entries || []).some((entry) => entry.leaseToken && Date.parse(entry.leaseUntil || "") > now)) {
+      throw new Error("Provider restore sync lease is active during context change; cloud access remains blocked");
+    }
+    const restoreSync = createRestoreSync(manifest, clock, localPlan.entries);
+    restoreSync.providerContext = currentInventoryContext;
+    restoreSync.localDeltaFingerprint = localPlan.fingerprint;
     selectedBackup = backupRepository.saveBackup({
       ...selectedBackup,
       metadata: { ...selectedBackup.metadata, restoreSync },
@@ -631,7 +711,7 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
     const revision = Number(sync?.revision) || 0;
     const priorAttempts = new Map(entries.map((entry) => [entry.entryId, Number(entry.attempts) || 0]));
     selectedBackup = await processRestoreSyncInternal(
-      { backupId: selectedBackupId, clock, uploader: cloudStorage, archiveEntries },
+      { backupId: selectedBackupId, clock, uploader: cloudStorage },
       STARTUP_INVENTORY_RECONCILIATION,
     );
     const updatedSync = selectedBackup?.metadata?.restoreSync;
@@ -658,9 +738,9 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
   return { state: "reconciled", backupId: backup.id, suppressed: orphaned.length, changed: true };
 }
 
-function createRestoreSync(manifest, clock) {
+function createRestoreSync(manifest, clock, entriesOverride = null) {
   const queuedAt = syncNow(clock);
-  const entries = syncEntries(manifest);
+  const entries = entriesOverride || syncEntries(manifest);
   const state = entries.length ? "pending" : "completed";
   return {
     operationId: crypto.randomUUID(),
@@ -749,7 +829,7 @@ function cancelRestoreSync(backupId, reason = "cancelled", { clock } = {}) {
 
 const STARTUP_INVENTORY_RECONCILIATION = Symbol("startup-inventory-reconciliation");
 
-async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs = 60 * 1000, workerId, runFileLifecycleMutation, archiveEntries } = {}, authority) {
+async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs = 60 * 1000, workerId, runFileLifecycleMutation } = {}, authority) {
   const provider = uploader || cloudStorage;
   let latest = backupRepository.getBackup(backupId);
   if (!latest || !latest.metadata?.restoreSync || !provider?.enabled?.()) return latest;
@@ -783,18 +863,14 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
     if (!lease) continue;
     try {
       const reconcileObject = async () => {
-        const archiveEntry = archiveEntries?.get(String(lease.entry.path || "").replace(/\\/g, "/"));
-        let localPath = resolveRuntimePath(lease.entry.path);
-        let temporarySourceDirectory = null;
-        try {
-          if (archiveEntries) {
-            if (!archiveEntry) throw Object.assign(new Error("restore archive source unavailable"), { code: "source_unavailable" });
-            temporarySourceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-sync-"));
-            localPath = path.join(temporarySourceDirectory, path.basename(lease.entry.path));
-            fs.writeFileSync(localPath, await archiveEntry.buffer(), { flag: "wx", mode: 0o600 });
-          } else if (!fs.existsSync(localPath) || !fs.statSync(localPath).isFile()) {
-            throw Object.assign(new Error("restore source unavailable"), { code: "source_unavailable" });
-          }
+        const localPath = resolveRuntimePath(lease.entry.path);
+        const sourceStat = fs.lstatSync(localPath, { throwIfNoEntry: false });
+        if (!sourceStat?.isFile() || sourceStat.isSymbolicLink()) {
+          throw Object.assign(new Error("restore source unavailable"), { code: "source_unavailable" });
+        }
+        if (lease.entry.sourceHash && await backupService.calculateFileHash(localPath) !== lease.entry.sourceHash) {
+          throw Object.assign(new Error("restore source changed during reconciliation"), { code: "source_unavailable" });
+        }
           let entryForUpload = lease.entry;
           if (providerIdentity === "gdrive") {
             if (typeof provider.resolveUploadId !== "function") {
@@ -827,13 +903,13 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
           const uploaded = await provider.upload(localPath, entryForUpload.folderId, entryForUpload.name, entryForUpload.area,
             providerIdentity === "gdrive" ? { providerFileId: entryForUpload.providerFileId } : undefined);
           if (!uploaded) throw Object.assign(new Error("restore source unavailable"), { code: "source_unavailable" });
+          if (lease.entry.sourceHash && await backupService.calculateFileHash(localPath) !== lease.entry.sourceHash) {
+            throw Object.assign(new Error("restore source changed during upload"), { code: "source_unavailable" });
+          }
           if (authority !== STARTUP_INVENTORY_RECONCILIATION) {
             await restoreProviderOrphans.clear(entryForUpload.folderId, entryForUpload.name, entryForUpload.area, provider);
           }
           return true;
-        } finally {
-          if (temporarySourceDirectory) fs.rmSync(temporarySourceDirectory, { recursive: true, force: true });
-        }
       };
       const runMutation = typeof runFileLifecycleMutation === "function"
         ? runFileLifecycleMutation
@@ -1988,7 +2064,12 @@ async function restoreBackup(id, options = {}) {
       injectFailure("restore.provider-orphans.persisted");
     } else {
       injectFailure("restore.provider-inventory-unknown.before-persist");
-      await restoreProviderOrphans.markInventoryUnknown(backup.id);
+      await restoreProviderOrphans.markInventoryUnknown(backup.id, {}, {
+        validateBaseline: () => {
+          const archiveStat = fs.lstatSync(archivePath);
+          if (!archiveStat.isFile() || archiveStat.isSymbolicLink()) throw new Error("Restore provider inventory baseline archive is unavailable");
+        },
+      });
       injectFailure("restore.provider-inventory-unknown.persisted");
     }
     const restoredBackup = coordinator.selectedBackup;

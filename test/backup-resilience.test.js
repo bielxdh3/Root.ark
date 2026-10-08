@@ -80,7 +80,7 @@ test("retention and explicit deletion preserve an unresolved provider inventory 
       process.env.BACKUP_RETENTION_DAYS = "0";
       await service.cleanupRetention();
       let blocked = false;
-      try { service.deleteBackup(baselineId); } catch (error) { blocked = /provider inventory baseline/i.test(error.message); }
+      try { await service.deleteBackup(baselineId); } catch (error) { blocked = /provider inventory baseline/i.test(error.message); }
       console.log(JSON.stringify({ ids: service.listBackups().filter((item) => item.exists).map((item) => item.id), baselineExists: fs.existsSync(path.join(service.BACKUPS_DIR, entries[0].filename)), blocked }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `, { BACKUP_RETENTION_COUNT: "1", BACKUP_RETENTION_DAYS: "0" });

@@ -394,6 +394,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     PORT: String(port), DB_ENABLED: "false", NODE_ENV: "test", JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
     TOTP_POLICY: "optional", CLOUD_STORAGE_PROVIDER: "s3", AWS_S3_BUCKET: "fixture-bucket", AWS_REGION: "us-east-1",
     AWS_ENDPOINT_URL: `http://127.0.0.1:${cloud.port}`, AWS_FORCE_PATH_STYLE: "true", AWS_ACCESS_KEY_ID: "fixture-access-key",
+    AWS_S3_PRINCIPAL_ID: "fixture-account",
     AWS_SECRET_ACCESS_KEY: "fixture-secret-key", TRASH_ENABLED: "true", TRASH_AUTO_CLEANUP_ENABLED: "false", CLOUD_TEMP_RECONCILIATION_INTERVAL_MS: "1000", CLOUD_UPLOAD_RECONCILIATION_INTERVAL_MS: "1000",
     WEBDAV_ENABLED: "true",
     WEBDAV_ALLOW_MOVE: "true",

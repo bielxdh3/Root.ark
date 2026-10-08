@@ -1098,12 +1098,15 @@ function recoverRetentionTombstones() {
 
 async function cleanupRetention(options = {}) {
   const release = options.lockHeld ? null : acquireLock("backup");
+  let inventoryLease = null;
   try {
+  if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
+  inventoryLease = await restoreProviderOrphans.acquireInventoryLock();
   const count = Math.max(0, Math.floor(envNumber("BACKUP_RETENTION_COUNT", 10)));
   const days = Math.max(0, Math.floor(envNumber("BACKUP_RETENTION_DAYS", 30)));
   const cutoff = days ? Date.now() - days * 24 * 60 * 60 * 1000 : null;
   recoverRetentionTombstones();
-  const inventory = restoreProviderOrphans.getInventoryStatus();
+  const inventory = restoreProviderOrphans.getInventoryStatus(cloudStorage);
   const unresolvedBaselineId = inventory.state === "unknown" ? inventory.backupId : null;
   const backups = backupRepository.listBackups()
     .filter((item) => item.status === "success" && item.type !== "pre-restore" && item.id !== unresolvedBaselineId)
@@ -1136,6 +1139,7 @@ async function cleanupRetention(options = {}) {
     }
   }
   } finally {
+    inventoryLease?.release();
     if (release) release();
   }
 }
@@ -1292,10 +1296,13 @@ function getBackupOrThrow(id) {
   return { backup, archivePath };
 }
 
-function deleteBackup(id) {
+async function deleteBackup(id) {
   const release = acquireLock("delete");
+  let inventoryLease = null;
   try {
-    const inventory = restoreProviderOrphans.getInventoryStatus();
+    if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
+    inventoryLease = await restoreProviderOrphans.acquireInventoryLock();
+    const inventory = restoreProviderOrphans.getInventoryStatus(cloudStorage);
     if (inventory.state === "unknown" && inventory.backupId === String(id)) {
       throw new Error("Backup is the unresolved provider inventory baseline and cannot be deleted");
     }
@@ -1304,6 +1311,7 @@ function deleteBackup(id) {
     backupRepository.deleteBackup(backup.id);
     return backup;
   } finally {
+    inventoryLease?.release();
     release();
   }
 }

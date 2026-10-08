@@ -4,7 +4,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { Readable } = require("stream");
-const { createCloudStorage } = require("../services/cloudStorage");
+const { createCloudStorage, stableAwsPrincipal } = require("../services/cloudStorage");
 
 function drain(stream) {
   return new Promise((resolve) => {
@@ -403,30 +403,74 @@ test("status exposes provider-neutral configuration without credentials", () => 
   assert.deepEqual(storage.status(), { provider: "s3", enabled: true, prefix: "rootark", s3: { bucketConfigured: true, region: "eu", endpointConfigured: false }, gdrive: { folderConfigured: false, credentialsConfigured: false } });
 });
 
-test("inventory context changes with provider namespace configuration without exposing config values", () => {
-  const base = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket-a", region: "eu" } });
-  const bucketChanged = createCloudStorage({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket-b", region: "eu" } });
-  const prefixChanged = createCloudStorage({ provider: "s3", prefix: "other", s3: { bucket: "bucket-a", region: "eu" } });
-  const rootChanged = createCloudStorage({ provider: "s3", prefix: "rootark", rootFolderId: "different-root", s3: { bucket: "bucket-a", region: "eu" } });
-  const providerChanged = createCloudStorage({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "folder-a", credentials: "fixture-private-credential" } });
-  const gdriveRootChanged = createCloudStorage({ provider: "gdrive", prefix: "rootark", rootFolderId: "different-root", gdrive: { folderId: "folder-a", credentials: "fixture-private-credential" } });
-  assert.match(base.inventoryContext(), /^[a-f0-9]{64}$/);
-  assert.equal(new Set([base.inventoryContext(), bucketChanged.inventoryContext(), prefixChanged.inventoryContext(), rootChanged.inventoryContext(), providerChanged.inventoryContext(), gdriveRootChanged.inventoryContext()]).size, 6);
-  assert.equal(JSON.stringify(providerChanged.inventoryContext()).includes("fixture-private-credential"), false);
+test("inventory context changes with provider namespace configuration", async () => {
+  const create = (options) => createCloudStorage({ ...options, resolvePrincipalIdentity: async () => "fixture-principal" });
+  const base = create({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket-a", region: "eu" } });
+  const bucketChanged = create({ provider: "s3", prefix: "rootark", s3: { bucket: "bucket-b", region: "eu" } });
+  const prefixChanged = create({ provider: "s3", prefix: "other", s3: { bucket: "bucket-a", region: "eu" } });
+  const rootChanged = create({ provider: "s3", prefix: "rootark", rootFolderId: "different-root", s3: { bucket: "bucket-a", region: "eu" } });
+  const providerChanged = create({ provider: "gdrive", prefix: "rootark", gdrive: { folderId: "folder-a", credentials: "fixture-private-credential" } });
+  const gdriveRootChanged = create({ provider: "gdrive", prefix: "rootark", rootFolderId: "different-root", gdrive: { folderId: "folder-a", credentials: "fixture-private-credential" } });
+  for (const provider of [base, bucketChanged, prefixChanged, rootChanged, providerChanged, gdriveRootChanged]) await provider.resolveInventoryContext();
+  const contexts = [base, bucketChanged, prefixChanged, rootChanged, providerChanged, gdriveRootChanged].map((provider) => provider.inventoryContext());
+  assert.match(contexts[0], /^[a-f0-9]{64}$/);
+  assert.equal(new Set(contexts).size, 6);
 });
 
-test("Google Drive credential file content scopes provider inventory and unreadable credentials fail closed", (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-drive-credentials-context-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const credentialsPath = path.join(root, "service-account.json");
-  fs.writeFileSync(credentialsPath, '{"client_email":"before@example.invalid"}');
-  const storage = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "folder-a", credentialsPath } });
-  const before = storage.inventoryContext();
-  fs.writeFileSync(credentialsPath, '{"client_email":"after@example.invalid"}');
-  assert.notEqual(storage.inventoryContext(), before, "replacing credentials at the same path invalidates the old inventory context");
+test("provider inventory context binds to stable authenticated principal and fails closed if unresolved", async () => {
+  const s3Context = async (arn, account = "111111111111") => {
+    const storage = createCloudStorage({
+      provider: "s3",
+      s3: { bucket: "bucket", region: "eu" },
+      createS3Client: async () => ({ config: { credentials: async () => ({ accessKeyId: "fixture" }) } }),
+      createStsClient: async () => ({ send: async (command) => {
+        assert.equal(command.constructor.name, "GetCallerIdentityCommand");
+        return { Account: account, Arn: arn };
+      }, destroy() {} }),
+    });
+    return storage.resolveInventoryContext();
+  };
+  const driveContext = async (principal, credentials) => {
+    const storage = createCloudStorage({
+      provider: "gdrive",
+      gdrive: { folderId: "folder", credentials },
+      createGoogleDriveClient: async () => ({ about: { get: async () => ({ data: { user: { permissionId: principal } } }) } }),
+    });
+    return storage.resolveInventoryContext();
+  };
+  assert.equal(stableAwsPrincipal("arn:aws:sts::111111111111:assumed-role/reader/session-a"), stableAwsPrincipal("arn:aws:sts::111111111111:assumed-role/reader/session-b"));
+  assert.equal(await s3Context("arn:aws:sts::111111111111:assumed-role/reader/session-a"), await s3Context("arn:aws:sts::111111111111:assumed-role/reader/session-b"),
+    "rotating sessions for the same assumed role retain the stable AWS principal context");
+  assert.notEqual(await s3Context("arn:aws:iam::111111111111:role/reader"), await s3Context("arn:aws:iam::222222222222:role/reader", "222222222222"));
+  assert.notEqual(await driveContext("gdrive-principal-a", "rotated-key-a"), await driveContext("gdrive-principal-b", "rotated-key-b"));
+  assert.equal(await driveContext("gdrive-principal-a", "credential-format-one"), await driveContext("gdrive-principal-a", "credential-format-two"),
+    "credential formatting and key rotation do not invalidate a stable principal context");
+  const unavailable = createCloudStorage({
+    provider: "s3",
+    createS3Client: async () => ({ config: { credentials: async () => ({ accessKeyId: "fixture" }) } }),
+    createStsClient: async () => ({ send: async () => { throw new Error("no identity"); }, destroy() {} }),
+  });
+  await assert.rejects(unavailable.resolveInventoryContext(), /provider identity could not be resolved/i);
+  const unavailableDrive = createCloudStorage({
+    provider: "gdrive",
+    createGoogleDriveClient: async () => ({ about: { get: async () => ({ data: { user: { emailAddress: "renamable@example.test" } } }) } }),
+  });
+  await assert.rejects(unavailableDrive.resolveInventoryContext(), /provider identity could not be resolved/i);
+});
 
-  const missing = createCloudStorage({ provider: "gdrive", gdrive: { folderId: "folder-a", credentialsPath: path.join(root, "missing.json") } });
-  assert.throws(() => missing.inventoryContext(), /Google Drive credentials cannot be read/);
+test("custom S3 endpoints require an explicit stable principal identifier", async () => {
+  const create = (principalId) => createCloudStorage({
+    provider: "s3",
+    s3: { endpoint: "http://127.0.0.1:9000", bucket: "bucket", principalId },
+    createS3Client: async () => ({ config: { credentials: async () => ({ accessKeyId: "rotatable-secret-id" }) } }),
+  });
+  const firstKey = create("tenant-account-1");
+  const rotatedKey = create("tenant-account-1");
+  const differentPrincipal = create("tenant-account-2");
+  await Promise.all([firstKey, rotatedKey, differentPrincipal].map((provider) => provider.resolveInventoryContext()));
+  assert.equal(firstKey.inventoryContext(), rotatedKey.inventoryContext(), "credential rotation does not change an explicitly stable principal");
+  assert.notEqual(firstKey.inventoryContext(), differentPrincipal.inventoryContext());
+  await assert.rejects(create("").resolveInventoryContext(), /provider identity could not be resolved/i);
 });
 
 test("root-folder keys use the uploads area", () => {

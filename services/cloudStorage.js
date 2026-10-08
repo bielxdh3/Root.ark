@@ -12,6 +12,7 @@ function createCloudStorage(options = {}) {
   const createGoogleDriveClient = options.createGoogleDriveClient || defaultGoogleDriveClient(options.gdrive || {});
   let s3Client;
   let driveClient;
+  let resolvedInventoryContext = null;
 
   function enabled() { return provider === "s3" || provider === "gdrive"; }
   function status() {
@@ -24,22 +25,53 @@ function createCloudStorage(options = {}) {
     };
   }
   function inventoryContext() {
-    let googleCredentialHash = "default-credentials";
-    if (options.gdrive?.credentials) {
-      googleCredentialHash = crypto.createHash("sha256").update(String(options.gdrive.credentials)).digest("hex");
-    } else if (options.gdrive?.credentialsPath) {
-      try {
-        googleCredentialHash = crypto.createHash("sha256").update(fs.readFileSync(options.gdrive.credentialsPath)).digest("hex");
-      } catch {
-        throw new Error("Google Drive credentials cannot be read");
-      }
+    if (!resolvedInventoryContext) throw new Error("Cloud provider identity has not been resolved; cloud access remains blocked");
+    return resolvedInventoryContext;
+  }
+  async function resolveInventoryContext() {
+    if (resolvedInventoryContext) return resolvedInventoryContext;
+    try {
+      const principal = typeof options.resolvePrincipalIdentity === "function"
+        ? await options.resolvePrincipalIdentity({ provider, s3: options.s3 || {}, gdrive: options.gdrive || {} })
+        : await resolvePrincipalIdentity();
+      if (typeof principal !== "string" || !principal.trim()) throw new Error("missing provider identity");
+      const namespace = provider === "s3"
+        ? [provider, prefix, rootFolderId, options.s3?.bucket || "", options.s3?.region || "", options.s3?.endpoint || "", Boolean(options.s3?.forcePathStyle)]
+        : provider === "gdrive"
+          ? [provider, prefix, rootFolderId, options.gdrive?.folderId || ""]
+          : [provider, prefix];
+      resolvedInventoryContext = crypto.createHash("sha256").update(JSON.stringify([...namespace, principal.trim()])).digest("hex");
+      return resolvedInventoryContext;
+    } catch {
+      throw new Error("Cloud provider identity could not be resolved; cloud access remains blocked");
     }
-    const context = provider === "s3"
-      ? [provider, prefix, rootFolderId, options.s3?.bucket || "", options.s3?.region || "", options.s3?.endpoint || ""]
-      : provider === "gdrive"
-        ? [provider, prefix, rootFolderId, options.gdrive?.folderId || "", googleCredentialHash]
-        : [provider, prefix];
-    return crypto.createHash("sha256").update(JSON.stringify(context)).digest("hex");
+  }
+  async function resolvePrincipalIdentity() {
+    if (provider === "s3") {
+      const s3Provider = await s3();
+      if (options.s3?.endpoint) {
+        const principalId = String(options.s3?.principalId || "").trim();
+        if (!principalId) throw new Error("missing custom S3 principal identifier");
+        return `s3-compatible:${principalId}`;
+      }
+      const { STSClient, GetCallerIdentityCommand } = require("@aws-sdk/client-sts");
+      const sts = options.createStsClient
+        ? await options.createStsClient(s3Provider)
+        : new STSClient({ region: options.s3?.region || "us-east-1", credentials: s3Provider.config.credentials });
+      try {
+        const identity = await sts.send(new GetCallerIdentityCommand({}));
+        if (!identity.Account || !identity.Arn) throw new Error("missing identity fields");
+        return `${identity.Account}:${stableAwsPrincipal(identity.Arn)}`;
+      } finally { sts.destroy(); }
+    }
+    if (provider === "gdrive") {
+      const response = await (await drive()).about.get({ fields: "user(permissionId,emailAddress)" });
+      const user = response?.data?.user;
+      const identity = String(user?.permissionId || "").trim();
+      if (!identity) throw new Error("missing Google Drive identity");
+      return `gdrive:${identity}`;
+    }
+    return "local";
   }
   function key(folderId = rootFolderId, fileName = "", area = "uploads") {
     const segment = (value, name) => {
@@ -316,7 +348,7 @@ function createCloudStorage(options = {}) {
   const run = async (operation, ...args) => {
     try { return await operation(...args); } catch (error) { throw classify(error); }
   };
-  return { provider, enabled, status, inventoryContext, key, inventory: (...args) => run(inventory, ...args), resolveUploadId: (...args) => run(resolveUploadId, ...args), upload: (...args) => run(upload, ...args), download: (...args) => run(download, ...args), remove: (...args) => run(remove, ...args), removePrefix: (...args) => run(removePrefix, ...args), list: (...args) => run(list, ...args) };
+  return { provider, enabled, status, inventoryContext, resolveInventoryContext, key, inventory: (...args) => run(inventory, ...args), resolveUploadId: (...args) => run(resolveUploadId, ...args), upload: (...args) => run(upload, ...args), download: (...args) => run(download, ...args), remove: (...args) => run(remove, ...args), removePrefix: (...args) => run(removePrefix, ...args), list: (...args) => run(list, ...args) };
 }
 
 function normalizePrefix(value) { const clean = String(value || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""); if (!clean || clean.split("/").some((part) => !part || part === "." || part === "..")) throw cloudError("invalid_prefix", "Invalid cloud prefix"); return clean; }
@@ -324,7 +356,13 @@ function cloudError(code, message) { const error = new Error(message); error.cod
 function isDriveFileId(value) { return /^[A-Za-z0-9_-]{1,256}$/.test(String(value || "")); }
 function isDriveStatus(error, status) { return Number(error?.response?.status || error?.response?.data?.error?.code || error?.status || error?.code) === status; }
 function classify(error) { return normalizeProviderError(error); }
+function stableAwsPrincipal(arn) {
+  const value = String(arn || "");
+  const assumedRole = value.match(/^arn:([^:]+):sts::([^:]+):assumed-role\/(.+)\/[^/]+$/);
+  if (assumedRole) return `arn:${assumedRole[1]}:iam::${assumedRole[2]}:role/${assumedRole[3]}`;
+  return value;
+}
 function defaultS3Client(config) { return async () => { const { S3Client } = require("@aws-sdk/client-s3"); return new S3Client({ region: config.region || "us-east-1", ...(config.endpoint ? { endpoint: config.endpoint } : {}), ...(config.forcePathStyle ? { forcePathStyle: true } : {}) }); }; }
 function defaultGoogleDriveClient(config) { return async () => { const { google } = require("googleapis"); const auth = new google.auth.GoogleAuth({ ...(config.credentials ? { credentials: JSON.parse(config.credentials) } : {}), scopes: ["https://www.googleapis.com/auth/drive"] }); return google.drive({ version: "v3", auth }); }; }
 
-module.exports = { createCloudStorage };
+module.exports = { createCloudStorage, stableAwsPrincipal };
