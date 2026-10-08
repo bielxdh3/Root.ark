@@ -178,7 +178,18 @@ const CLAMAV_HOST = process.env.CLAMAV_HOST || "127.0.0.1";
 const CLAMAV_PORT = Number(process.env.CLAMAV_PORT || 3310);
 const UPLOAD_BLOCK_EXECUTABLES = parseEnvBoolean(process.env.UPLOAD_BLOCK_EXECUTABLES, true);
 const UPLOAD_QUARANTINE_DIR = getUploadQuarantineDir();
-const UPLOAD_FAIL_CLOSED = parseEnvBoolean(process.env.UPLOAD_FAIL_CLOSED, false);
+const UPLOAD_FAIL_CLOSED = parseEnvBoolean(process.env.UPLOAD_FAIL_CLOSED, true);
+const NODE_ENV = String(process.env.NODE_ENV || "").trim().toLowerCase();
+const IS_PRODUCTION = NODE_ENV === "production";
+if (!new Set(["clamav", "disabled"]).has(UPLOAD_SCAN_PROVIDER)) {
+  throw new Error("UPLOAD_SCAN_PROVIDER must be 'clamav' or the explicit development-only value 'disabled'");
+}
+if (IS_PRODUCTION && (!UPLOAD_SCAN_ENABLED || UPLOAD_SCAN_PROVIDER !== "clamav" || !UPLOAD_FAIL_CLOSED)) {
+  throw new Error("Production requires enabled ClamAV upload scanning with fail-closed behavior");
+}
+if ((!UPLOAD_SCAN_ENABLED || UPLOAD_SCAN_PROVIDER === "disabled" || !UPLOAD_FAIL_CLOSED) && !["development", "test"].includes(NODE_ENV)) {
+  throw new Error("Upload scan bypass requires NODE_ENV=development or test");
+}
 const UPLOAD_SUSPICIOUS_EXTENSIONS = new Set(
   String(process.env.UPLOAD_SUSPICIOUS_EXTENSIONS || ".exe,.bat,.cmd,.scr,.msi,.ps1,.vbs,.jar,.com")
     .split(",")
@@ -4146,7 +4157,7 @@ function scanFileWithClamAv(filePath) {
     socket.on("error", (error) => finish(error));
     socket.on("data", (chunk) => chunks.push(chunk));
     socket.on("end", () => {
-      const response = Buffer.concat(chunks).toString("utf-8").trim();
+      const response = Buffer.concat(chunks).toString("utf-8").replace(/\0+$/g, "").trim();
       if (/FOUND$/i.test(response)) {
         const virus = response.replace(/^stream:\s*/i, "").replace(/\s+FOUND$/i, "");
         return finish(null, { status: "infected", provider: "clamav", virus, raw: response.slice(0, 300) });

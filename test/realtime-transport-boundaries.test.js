@@ -205,7 +205,7 @@ test("WebDAV HTTP boundary rejects unauthenticated, hostile, traversing, and inf
   fs.writeFileSync(path.join(dir, "uploads", "source.txt"), "source");
   fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
   const portNumber = await port();
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", TOTP_POLICY: "optional", LOGIN_RATE_LIMIT_MAX: "20", LOGIN_DELAY_BASE: "0", LOGIN_BLOCK_THRESHOLD: "50", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, NODE_ENV: "test", PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", TOTP_POLICY: "optional", LOGIN_RATE_LIMIT_MAX: "20", LOGIN_DELAY_BASE: "0", LOGIN_BLOCK_THRESHOLD: "50", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
   t.after(async () => { await stopChild(child); fs.rmSync(dir, { recursive: true, force: true }); });
   await ready(portNumber);
   const basic = `Basic ${Buffer.from("agent:password").toString("base64")}`;
