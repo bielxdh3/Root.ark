@@ -69,11 +69,15 @@ The repository currently contains working foundations for:
 - [x] bounded provider retry/cancellation, idempotency, ciphertext-only attestation, and secret-safe observability helpers;
 - [x] automated syntax, test, dependency, and artifact validation.
 
-### Exact-SHA CI snapshot — 2026-10-08 (after PR #120, source SHA `acbdd721ac49fdd5d01d17817f723168ee53a57b`)
+### Exact-SHA CI snapshot — 2026-10-08 (after PR #122, source SHA `b82d3d86eda2b8ba083284577e4e7c67c2cb5060`)
+
+PR #122 merged at this SHA from head `92e333c46390294ee1fb162a5b0ae0b691c9febd`. The push-triggered Security Regression workflow passed on exact `Root/main` SHA `b82d3d86eda2b8ba083284577e4e7c67c2cb5060`: Ubuntu Node 22 ran 939 tests (928 passed, 11 skipped, 0 failed) and Windows Node 22 ran 939 tests (935 passed, 4 skipped, 0 failed); both syntax checks reported 169 files checked and 0 failures. CodeQL, default-branch Dependency Review, and Pages also passed ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37739612111), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37739612063), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37739612110), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37739611731)). The repository release gate has not yet been run on the final merged `Root/main` SHA. The full browser acceptance matrix remains incomplete. Whole restore has local rollback recovery and durable provider reconciliation, but is not atomic across storage domains. Review also found that a local-only restore followed by enabling cloud storage can expose stale provider objects to authorized folder readers; that integrity gap still needs a fail-closed correction.
+
+The issue and PR snapshot associated with this source SHA was queried immediately before this documentation-only reconciliation; see [the issue ledger](docs/issue-ledger.md). That snapshot predates this PR's merge, so query GitHub for the current state.
+
+### Historical exact-SHA CI snapshot — 2026-10-08 (after PR #120, source SHA `acbdd721ac49fdd5d01d17817f723168ee53a57b`)
 
 After PR #120 merged, the push-triggered Security Regression workflow passed on exact `Root/main` SHA `acbdd721ac49fdd5d01d17817f723168ee53a57b`: Ubuntu Node 22 ran 939 tests (928 passed, 11 skipped, 0 failed) and Windows Node 22 ran 939 tests (935 passed, 4 skipped, 0 failed). CodeQL, default-branch Dependency Review, Pages, and `node scripts/validate-release-gate.js` on a clean Windows checkout also passed on this SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37737256757), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37737256839), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37737256816), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37737256170)). The release gate reported 21 passed, 0 blocked, and 0 failed. The browser acceptance matrix remains incomplete.
-
-The issue and PR snapshot associated with this source SHA is immediately before the documentation-only reconciliation; see [the issue ledger](docs/issue-ledger.md) for open issues, PRs, and their remaining acceptance boundaries.
 
 ### Historical exact-SHA CI snapshot — 2026-10-08 (after PR #118, source SHA `1c2f7a8b276e63e53555f5de824afc9b7a9aa55e`)
 
