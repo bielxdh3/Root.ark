@@ -9,16 +9,65 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
 const WebSocket = require("ws");
+const { EventEmitter } = require("node:events");
 
 const ROOT = path.resolve(__dirname, "..");
 function port() { return new Promise((resolve, reject) => { const server = net.createServer(); server.once("error", reject); server.listen(0, "127.0.0.1", () => { const value = server.address().port; server.close(() => resolve(value)); }); }); }
 function stopChild(child) { if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(); const exited = new Promise((resolve) => child.once("exit", resolve)); child.kill(); return exited; }
 function request(portNumber, requestPath, options = {}) { return new Promise((resolve, reject) => { const req = http.request({ host: "127.0.0.1", port: portNumber, path: requestPath, ...options }, (res) => { let body = ""; res.on("data", (chunk) => { body += chunk; }); res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body })); }); req.once("error", reject); req.end(options.body); }); }
 async function ready(portNumber) { for (let index = 0; index < 100; index += 1) { try { await request(portNumber, "/login.html"); return; } catch { await new Promise((resolve) => setTimeout(resolve, 50)); } } throw new Error("server did not start"); }
-function event(socket, name) { return new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error(`missing ${name}`)), 2000); socket.on("message", (raw) => { const message = JSON.parse(raw); if (message.event === name) { clearTimeout(timer); resolve(message); } }); socket.once("error", reject); }); }
+const websocketMessageStates = new WeakMap();
+function observeWebSocketMessages(socket) {
+  const state = { messages: [], waiters: [] };
+  websocketMessageStates.set(socket, state);
+  socket.on("message", (raw) => {
+    let message;
+    try { message = JSON.parse(raw); } catch { return; }
+    const index = state.waiters.findIndex((waiter) => waiter.name === message.event);
+    if (index < 0) {
+      state.messages.push(message);
+      return;
+    }
+    const waiter = state.waiters.splice(index, 1)[0];
+    clearTimeout(waiter.timer);
+    socket.off("error", waiter.onError);
+    waiter.resolve(message);
+  });
+  return socket;
+}
+function event(socket, name) {
+  const state = websocketMessageStates.get(socket);
+  if (!state) return Promise.reject(new Error("WebSocket message observer was not installed"));
+  const index = state.messages.findIndex((message) => message.event === name);
+  if (index >= 0) return Promise.resolve(state.messages.splice(index, 1)[0]);
+  return new Promise((resolve, reject) => {
+    const waiter = { name, resolve, timer: null, onError: null };
+    waiter.timer = setTimeout(() => {
+      const waiterIndex = state.waiters.indexOf(waiter);
+      if (waiterIndex >= 0) state.waiters.splice(waiterIndex, 1);
+      socket.off("error", waiter.onError);
+      reject(new Error(`missing ${name}`));
+    }, 2000);
+    waiter.onError = (error) => {
+      const waiterIndex = state.waiters.indexOf(waiter);
+      if (waiterIndex >= 0) state.waiters.splice(waiterIndex, 1);
+      clearTimeout(waiter.timer);
+      reject(error);
+    };
+    state.waiters.push(waiter);
+    socket.once("error", waiter.onError);
+  });
+}
+
+test("WebSocket test harness buffers a greeting received before the assertion waits", async () => {
+  const socket = new EventEmitter();
+  observeWebSocketMessages(socket);
+  socket.emit("message", Buffer.from(JSON.stringify({ event: "connected" })));
+  assert.deepEqual(await event(socket, "connected"), { event: "connected" });
+});
 function close(socket) { return new Promise((resolve) => socket.once("close", (code) => resolve(code))); }
 function websocketUpgrade(portNumber, cookie, origin, requestHeaders = {}) {
-  const socket = new WebSocket(`ws://127.0.0.1:${portNumber}/ws`, { headers: { ...(cookie ? { cookie } : {}), ...requestHeaders }, origin });
+  const socket = observeWebSocketMessages(new WebSocket(`ws://127.0.0.1:${portNumber}/ws`, { headers: { ...(cookie ? { cookie } : {}), ...requestHeaders }, origin }));
   return new Promise((resolve, reject) => {
     socket.once("open", () => resolve({ status: 101, socket }));
     socket.once("unexpected-response", (_request, response) => { response.resume(); resolve({ status: response.statusCode, socket }); });
@@ -57,7 +106,7 @@ test("WebSocket HTTP upgrade enforces cookie, Origin, message, and binary bounda
   const login = await request(portNumber, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
   const cookie = login.headers["set-cookie"].map((item) => item.split(";", 1)[0]).join("; ");
   const origin = `http://127.0.0.1:${portNumber}`;
-  const connect = (headers = {}, requestedOrigin = origin) => new WebSocket(`ws://127.0.0.1:${portNumber}/ws`, { headers, origin: requestedOrigin });
+  const connect = (headers = {}, requestedOrigin = origin) => observeWebSocketMessages(new WebSocket(`ws://127.0.0.1:${portNumber}/ws`, { headers, origin: requestedOrigin }));
   const allowed = connect({ cookie }); t.after(() => allowed.terminate()); await event(allowed, "connected"); allowed.send("not-json"); allowed.send(JSON.stringify({ event: "ping" })); await event(allowed, "pong");
   const missing = await websocketUpgrade(portNumber, "", origin); assert.equal(missing.status, 401);
   const malformed = await websocketUpgrade(portNumber, "rootark_session=not-a-token", origin); assert.equal(malformed.status, 401);
