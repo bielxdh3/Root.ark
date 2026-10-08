@@ -1,10 +1,41 @@
 # Root.ark Issue Ledger
 
-## Current live snapshot — 2026-10-08
+## Latest live snapshot — 2026-10-08 (source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`)
 
-GitHub was queried on 2026-10-08 after PR #114 merged. The source `Root/main` SHA was `566a3d24591423c624ef3bcb82290a77ff359210`. This point-in-time query predates publication of this documentation update; merging it advances the default branch, so use the final closure report and exact-SHA checks for the later state. Earlier dated snapshots remain below as historical evidence.
+GitHub was queried after PR #115 merged into `Root/main` at `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`, before this documentation update was published. This is a timestamped snapshot, not a claim that the default branch remains at that SHA after this PR merges. The closure report records the later final SHA and validation.
 
-### Open issues and pull requests at source SHA `566a3d24591423c624ef3bcb82290a77ff359210`
+### Open issues and pull requests at source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`
+
+| Item | Live state at query | Remaining acceptance boundary |
+|---|---|---|
+| #63 | `open` | Protected-index primitives do not complete search: UI population, FTS/advanced search, encrypted-index lifecycle, metadata leakage acceptance, and full search acceptance remain open. |
+| #64 | `open` | Architecture and threat-model material exists; there is no functioning native Android client or Android CI. |
+| #65 | `open` | Root.ark is not an end-to-end Zero-Knowledge runtime; supported server paths can access plaintext. Upload, preview, scanning, sync/WebDAV, backup/restore, sharing, migration, recovery, authorization, and key lifecycle remain to be accepted. |
+| #66 / PR #97 | `open` / `open` | PR #97 remains partial: remote listing transfers full records before filtering; metadata-only listing, pagination, native Files On-Demand integration, safe eviction around external open-handle writers, and restart/reconnect acceptance remain incomplete. |
+| #67 | `open` | Backups and revision history do not provide burst detection, a pause/review barrier, protected history, recovery authorization, or deterministic recovery UX. |
+| #68 | `open` | Existing bearer links are not operation-scoped capabilities; least-privilege enforcement and recipient-key delivery remain incomplete. |
+| #94 / PR #95 | `open` / `open` | The process-local limiter does not establish shared/edge enforcement for multi-process deployments; production topology is unverified. |
+| PR #95 | `open`, head `95d99e4a934384fcfa2101dfc210741cd791a3d1`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` | CodeQL, Analyze, dependency-review, Ubuntu, and Windows checks pass on that exact head; 0 unresolved review threads. Its base is stale and issue #94 remains open pending shared/edge enforcement and deployment-topology evidence. |
+| PR #97 | `open`, head `a6a33a92cd6902f303254e60031da4bdc04cec04`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` | CodeQL, Analyze, dependency-review, Ubuntu, and Windows checks pass on that exact head; 0 unresolved review threads. Its base is stale and selective-sync acceptance gaps remain. |
+| PR #99 | `open` at the query, remote head `e8aebd34413e5172498065d602e1a7fc48742b54`, base `566a3d24591423c624ef3bcb82290a77ff359210`; 0 unresolved review threads | The old head's Windows suite failed only in `file lifecycle lock reclaims only a provably dead same-host owner` with `FILE_LIFECYCLE_LOCK_TIMEOUT` (run `37713856506`). The 40 ms test-only timeout was increased to 5 seconds in PR #115, now merged at this source SHA; at the query, PR #99 still needed updating to this base and exact-head checks. |
+| PR #102 | `open`, head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`, base `9de3c85ab59aa16fc46916abc0cf638c539086ef`; 1 unresolved review thread at `services/internalFile.js:31` | CodeQL fails with 74 high and 5 medium alerts (run `112556673970`); Analyze, dependency-review, Ubuntu, and Windows pass on that head. The base is stale; triage and review resolution remain before merge. |
+
+### Relevant merged pull requests
+
+| PR | State | Merge commit |
+|---|---|---|
+| #114 | merged — cloud lifecycle, backup/restore, and security regressions; PR head `3c113718d421c4bccbd09e9163f079031248142d` | `566a3d24591423c624ef3bcb82290a77ff359210` |
+| #115 | merged — Windows lock-recovery test timeout; PR head `87ec6c23c7c62b56aa72bce6c61575968fe1bb3c` | `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1` |
+
+At this query, source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1` passed the push-triggered Security Regression workflow (Linux full validation and Windows syntax/tests; run `37715043302`), CodeQL (`37715043209`), default-branch dependency review (`37715043243`), and Pages build/deployment (`37715042929`). The PR-only dependency-review job was skipped on the push. The open moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` affects transitive `sprintf-js` via `package-lock.json`; GitHub reports no first patched version. These results apply only to this exact SHA.
+
+The restore model uses compensating rollback for locally controlled domains and a durable, retryable provider-reconciliation queue; it is not a single atomic transaction across storage domains or external providers. If startup migration fails after local commit, the restored state and restart barrier remain for retry or operator recovery; restore is not automatically rolled back to its prior state. See [the whole-restore transaction boundary](backup-restore-transaction-boundary.md).
+
+## Historical live snapshot — 2026-10-08 (after PR #114, source SHA `566a3d24591423c624ef3bcb82290a77ff359210`)
+
+This earlier 2026-10-08 snapshot records state after PR #114 and before PR #115 merged. It is retained as historical evidence; the latest snapshot above supersedes it. Its run results apply only to its stated source SHA.
+
+### Open issues and pull requests at historical source SHA `566a3d24591423c624ef3bcb82290a77ff359210`
 
 | Item | Live state at query | Remaining acceptance boundary |
 |---|---|---|

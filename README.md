@@ -73,9 +73,13 @@ The repository currently contains working foundations for:
 
 On `Root/main` SHA `964f820417baf44f059a04e5363a2a172dccdc7a`, the push-triggered Security Regression workflow passed Ubuntu Node 22 full validation and Windows Node 22 syntax/tests. CodeQL and the default-branch dependency-review check also passed on this exact SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37549800190), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37549800373), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37549800109)). The PR-only dependency-review job was skipped on the push. This is exact-commit CI evidence; it does not establish browser acceptance, provider interoperability, production deployment safety, or release authorization.
 
-### Exact-SHA CI snapshot — 2026-10-08 (before PR #99 publication)
+### Historical exact-SHA CI snapshot — 2026-10-08 (source SHA `566a3d24591423c624ef3bcb82290a77ff359210`)
 
 At the recorded snapshot, `Root/main` was `566a3d24591423c624ef3bcb82290a77ff359210`. The push-triggered Security Regression workflow passed Ubuntu Node 22 full validation and Windows Node 22 syntax/tests; CodeQL analysis, default-branch dependency review, and GitHub Pages build and deployment also passed on that exact SHA ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37712454578), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37712454551), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37712454481), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37712453703)). The PR-only dependency-review job was skipped on the push. This snapshot predates publication of the documentation PR and is not evidence for the later merge SHA.
+
+### Historical exact-SHA CI snapshot — 2026-10-08 (source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`)
+
+After PR #115 merged, the push-triggered Security Regression workflow passed Ubuntu Node 22 full validation and Windows Node 22 syntax/tests; CodeQL, default-branch dependency review, and GitHub Pages build/deployment also passed on exact `Root/main` SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1` ([Security Regression](https://github.com/bielxdh3/Root.ark/actions/runs/37715043302), [CodeQL](https://github.com/bielxdh3/Root.ark/actions/runs/37715043209), [Dependency Review](https://github.com/bielxdh3/Root.ark/actions/runs/37715043243), [Pages](https://github.com/bielxdh3/Root.ark/actions/runs/37715042929)). The PR-only dependency-review job was skipped on the push. This historical evidence does not replace validation of a later final SHA.
 
 ### Historical local release-gate evidence
 
