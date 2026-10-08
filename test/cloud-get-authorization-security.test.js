@@ -249,14 +249,17 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   fs.writeFileSync(path.join(directory, "uploads", "version-primary.txt"), "authorized version primary fixture");
   fs.writeFileSync(path.join(directory, "uploads", "Case-Orphan.TXT"), "stale mixed-case orphan cache");
   OBJECTS.set("rootark/uploads/root/restore-orphan.txt", Buffer.from("post-backup provider bytes"));
+  const orphanStatePath = path.join(dataDir, ".rootark-restore-provider-orphans-state.json");
   fs.writeFileSync(path.join(dataDir, ".rootark-restore-provider-orphans.json"), JSON.stringify({
     version: 1,
+    providerInventory: { state: "known" },
     objects: [
       { area: "uploads", folderId: "root", name: "restore-orphan.txt" },
       { area: "uploads", folderId: "root", name: "version-primary.txt.v1" },
       { area: "uploads", folderId: "root", name: "Case-Orphan.TXT" },
     ],
   }));
+  fs.writeFileSync(orphanStatePath, JSON.stringify({ version: 1, providerInventory: { state: "known" } }));
   fs.symlinkSync(PUBLIC, path.join(directory, "public"), "junction");
 
   const password = crypto.randomBytes(24).toString("base64url");
@@ -372,6 +375,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   fs.writeFileSync(path.join(directory, "temp", "restore-orphan-pending.txt"), "stale local pending cache");
   fs.writeFileSync(path.join(dataDir, ".rootark-restore-provider-orphans.json"), JSON.stringify({
     version: 1,
+    providerInventory: { state: "known" },
     objects: [
       { area: "uploads", folderId: "root", name: "restore-orphan.txt" },
       { area: "uploads", folderId: "root", name: "version-primary.txt.v1" },
@@ -379,6 +383,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
       { area: "temp", folderId: "root", name: "restore-orphan-pending.txt" },
     ],
   }));
+  fs.writeFileSync(orphanStatePath, JSON.stringify({ version: 1, providerInventory: { state: "known" } }));
   const encryptedShareToken = "a".repeat(48);
   const restoreOrphanShareToken = "b".repeat(48);
   const limitedShareDownloadToken = "c".repeat(48);

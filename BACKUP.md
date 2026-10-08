@@ -93,6 +93,12 @@ Execute exatamente um processo do servidor por runtime. `ROOTARK_RESTORE_INSTANC
 
 Após restaurar, reinicie o único processo do servidor. O serviço recupera ou confirma o coordenador antes de liberar requisições. Se o processo não iniciar e a barreira permanecer ativa, preserve o coordenador e os arquivos de recuperação e siga o procedimento de recuperação documentado; não os apague manualmente.
 
+### Restore local e armazenamento cloud
+
+Um restore feito com o cloud desativado mantém a aplicação local disponível, mas marca o inventário do provider como desconhecido. Se o cloud for habilitado depois, o servidor valida o backup selecionado, persiste uma fila para cada entrada `uploads/` desse arquivo (mesmo se o manifesto cloud for incompleto) e envia os bytes restaurados antes de confiar no inventário ou abrir o listener da aplicação. Na inicialização, a reconciliação aguarda o menor prazo persistido de lease/backoff e retoma os itens vencidos; o atraso de retry pode chegar a uma hora. Se uma tentativa cloud falhar, o listener permanece fechado e a fila durável fica para a próxima inicialização. Para estado legado sem marcador de inventário, configure explicitamente `ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID` com o ID do backup que deve servir de baseline; não escolha o backup mais recente automaticamente.
+
+O provider externo não participa do rollback local. Restore oferece recuperação local por pre-images e reconciliação cloud retomável, não uma transação atômica entre filesystem, bancos e provider. Uma falha cloud após o commit local pode atrasar a disponibilidade dos arquivos até a fila ser concluída.
+
 ### Proteção dos diretórios no host
 
 Execute Root.ark com uma conta de serviço dedicada. Os diretórios de runtime usados como origem ou destino de restore — incluindo `data`, `uploads`, quarentena, extração/pre-images de backup e os diretórios-pai dos caminhos SQLite ou de outros armazenamentos configurados — devem pertencer ao domínio de confiança do serviço/operador. Nenhum usuário ou processo não confiável do host pode renomear, substituir ou gravar nesses diretórios ou em qualquer ancestral deles enquanto o servidor estiver ativo. Configure caminhos de armazenamento absolutos e protegidos por permissões do sistema operacional; não use diretórios compartilhados graváveis por usuários não confiáveis.

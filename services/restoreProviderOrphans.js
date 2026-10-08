@@ -55,6 +55,18 @@ function normalizeObjects(objects) {
   return [...unique.values()].sort((left, right) => left.area.localeCompare(right.area) || left.folderId.localeCompare(right.folderId) || left.name.localeCompare(right.name));
 }
 
+function validateInventoryMarker(marker, label) {
+  if (marker === undefined) return null;
+  if (!marker || typeof marker !== "object" || !["known", "unknown", "reconciled"].includes(marker.state)
+    || (marker.backupId != null && !/^[a-f0-9-]{36}$/i.test(String(marker.backupId)))) {
+    throw new Error(`${label} is invalid; provider access is blocked`);
+  }
+  if (marker.state === "reconciled" && (!marker.backupId || typeof marker.reconciledAt !== "string")) {
+    throw new Error(`${label} is invalid; provider access is blocked`);
+  }
+  return marker;
+}
+
 function readState() {
   let text;
   try { text = readControlFile(STATE_PATH, "Restore provider suppression state"); }
@@ -63,7 +75,20 @@ function readState() {
   try { value = JSON.parse(text); }
   catch { throw new Error("Restore provider suppression state is invalid; file access is blocked"); }
   if (value?.version !== 1) throw new Error("Restore provider suppression state version is unsupported; file access is blocked");
+  validateInventoryMarker(value.providerInventory, "Restore provider inventory state");
   return value;
+}
+
+function readPolicyDocument() {
+  let text;
+  try { text = readControlFile(POLICY_PATH, "Restore provider suppression policy"); }
+  catch (error) { if (error.code === "ENOENT") return null; throw error; }
+  let value;
+  try { value = JSON.parse(text); }
+  catch { throw new Error("Restore provider suppression policy is invalid; file access is blocked"); }
+  if (value?.version !== 1) throw new Error("Restore provider suppression policy version is unsupported; file access is blocked");
+  validateInventoryMarker(value.providerInventory, "Restore provider inventory policy");
+  return { ...value, objects: normalizeObjects(value.objects) };
 }
 
 function sameControlFileSnapshot(left, right) {
@@ -109,6 +134,12 @@ function policyFileExists() {
   catch (error) { if (error.code === "ENOENT") return false; throw error; }
 }
 
+function markerForStatus(status) {
+  if (status.state === "unknown") return { state: "unknown", ...(status.backupId ? { backupId: status.backupId } : {}) };
+  if (status.state === "reconciled") return { state: "reconciled", backupId: status.backupId, reconciledAt: status.reconciledAt || new Date().toISOString() };
+  return { state: "known" };
+}
+
 function writeJsonAtomically(destination, value) {
   fs.mkdirSync(path.dirname(destination), { recursive: true });
   const temporary = `${destination}.${crypto.randomUUID()}.tmp`;
@@ -142,24 +173,97 @@ function renameWithSharingRetry(source, destination) {
   }
 }
 
-function writeState() {
-  writeJsonAtomically(STATE_PATH, { version: 1, initializedAt: new Date().toISOString() });
+function getInventoryStatus() {
+  const state = readState();
+  const policy = readPolicyDocument();
+  if (!state && !policy) return { state: "known" };
+  const stateMarker = validateInventoryMarker(state?.providerInventory, "Restore provider inventory state");
+  const policyMarker = validateInventoryMarker(policy?.providerInventory, "Restore provider inventory policy");
+  if (!state || !policy || !stateMarker || !policyMarker) {
+    const unknown = [stateMarker, policyMarker].filter((marker) => marker?.state === "unknown");
+    const ids = new Set(unknown.map((marker) => marker.backupId).filter(Boolean));
+    return { state: "unknown", backupId: ids.size === 1 ? [...ids][0] : null };
+  }
+  if (stateMarker.state === policyMarker.state && stateMarker.backupId === policyMarker.backupId) {
+    if (stateMarker.state === "unknown") return { state: "unknown", backupId: stateMarker.backupId || null };
+    if (stateMarker.state === "reconciled") return { state: "reconciled", backupId: stateMarker.backupId, reconciledAt: stateMarker.reconciledAt };
+    return { state: "known" };
+  }
+  const unknown = [stateMarker, policyMarker].filter((marker) => marker.state === "unknown");
+  const ids = new Set(unknown.map((marker) => marker.backupId).filter(Boolean));
+  return { state: "unknown", backupId: ids.size === 1 ? [...ids][0] : null };
+}
+
+function writeState(marker) {
+  const current = readState() || {};
+  writeJsonAtomically(STATE_PATH, {
+    ...current,
+    version: 1,
+    initializedAt: current.initializedAt || new Date().toISOString(),
+    providerInventory: marker,
+  });
+}
+
+function isInventoryUnknown() {
+  return getInventoryStatus().state === "unknown";
+}
+
+function assertProviderAvailable() {
+  if (isInventoryUnknown()) {
+    throw Object.assign(new Error("Cloud provider inventory is unknown after restore; reconciliation is required"), { code: "PROVIDER_INVENTORY_UNKNOWN" });
+  }
+}
+
+function guardProvider(provider) {
+  if (!provider || typeof provider !== "object") return provider;
+  const guarded = Object.create(provider);
+  for (const operation of ["inventory", "list", "download", "upload", "remove", "removePrefix", "resolveUploadId"]) {
+    if (typeof provider[operation] !== "function") continue;
+    guarded[operation] = async (...args) => {
+      if (provider.provider === "local" && typeof provider.enabled === "function" && provider.enabled() === false) {
+        return provider[operation](...args);
+      }
+      assertProviderAvailable();
+      return provider[operation](...args);
+    };
+  }
+  return guarded;
+}
+
+async function markInventoryUnknown(backupId) {
+  const id = String(backupId || "");
+  if (!/^[a-f0-9-]{36}$/i.test(id)) throw new Error("Restore provider inventory baseline is invalid");
+  const lease = await acquirePolicyLock();
+  try {
+    const policy = readPolicyDocument();
+    writeUnlocked(policy?.objects || [], { state: "unknown", backupId: id });
+  } finally { lease.release(); }
+}
+
+async function reconcileInventory(backupId, objects) {
+  const id = String(backupId || "");
+  if (!/^[a-f0-9-]{36}$/i.test(id)) throw new Error("Restore provider inventory baseline is invalid");
+  const normalized = normalizeObjects(objects);
+  const lease = await acquirePolicyLock();
+  try {
+    const status = getInventoryStatus();
+    if (status.state === "reconciled" && status.backupId === id) return read();
+    if (status.state !== "unknown" || (status.backupId && status.backupId !== id)) {
+      throw new Error("Restore provider inventory baseline changed during reconciliation");
+    }
+    writeUnlocked(normalized, { state: "reconciled", backupId: id, reconciledAt: new Date().toISOString() });
+    return normalized;
+  } finally { lease.release(); }
 }
 
 function read() {
   const state = readState();
-  let text;
-  try { text = readControlFile(POLICY_PATH, "Restore provider suppression policy"); }
-  catch (error) {
-    if (error.code !== "ENOENT") throw error;
+  const policy = readPolicyDocument();
+  if (!policy) {
     if (state) throw new Error("Restore provider suppression policy is missing; file access is blocked");
     return [];
   }
-  let value;
-  try { value = JSON.parse(text); }
-  catch { throw new Error("Restore provider suppression policy is invalid; file access is blocked"); }
-  if (value?.version !== 1) throw new Error("Restore provider suppression policy version is unsupported; file access is blocked");
-  return normalizeObjects(value.objects);
+  return policy.objects;
 }
 
 function policySignature() {
@@ -192,26 +296,23 @@ function readSuppressionSnapshot() {
   throw new Error("Restore provider suppression policy changed repeatedly; file access is blocked");
 }
 
-function writeUnlocked(objects) {
+function writeUnlocked(objects, inventoryStatus = getInventoryStatus()) {
   const normalized = normalizeObjects(objects);
-  const state = readState();
-  if (state && !policyFileExists()) throw new Error("Restore provider suppression policy is missing; file access is blocked");
-  writeJsonAtomically(POLICY_PATH, { version: 1, objects: normalized });
+  const marker = markerForStatus(inventoryStatus);
+  writeJsonAtomically(POLICY_PATH, { version: 1, objects: normalized, providerInventory: marker });
   suppressionSnapshot = null;
-  if (!state) writeState();
+  writeState(marker);
   return normalized;
 }
 
 function initialize({ requirePolicy = false } = {}) {
   const state = readState();
-  const hasPolicy = policyFileExists();
-  if (state && !hasPolicy) throw new Error("Restore provider suppression policy is missing; startup is blocked for recovery");
-  if (!hasPolicy && requirePolicy) throw new Error("Restore provider suppression policy is missing after cloud restore; startup is blocked for recovery");
-  if (!hasPolicy) writeUnlocked([]);
-  else {
-    read();
-    if (!state) writeState();
-  }
+  const policy = readPolicyDocument();
+  if (state && !policy) throw new Error("Restore provider suppression policy is missing; startup is blocked for recovery");
+  if (!policy && requirePolicy) throw new Error("Restore provider suppression policy is missing after cloud restore; startup is blocked for recovery");
+  const status = getInventoryStatus();
+  if (!state && !policy) writeUnlocked([], { state: "known" });
+  else writeUnlocked(policy?.objects || [], status);
   suppressionSnapshot = null;
   return read();
 }
@@ -303,4 +404,4 @@ async function clear(folderId, fileName, area = "uploads", provider = null) {
   } finally { lease.release(); }
 }
 
-module.exports = { POLICY_PATH, STATE_PATH, assertSafeToUnhide, assertUnambiguousProviderInventory, clear, createSnapshot, identityKey, initialize, isSuppressed, lockSnapshot, normalizeObjects, read, suppress, write };
+module.exports = { POLICY_PATH, STATE_PATH, assertProviderAvailable, assertSafeToUnhide, assertUnambiguousProviderInventory, clear, createSnapshot, getInventoryStatus, guardProvider, identityKey, initialize, isInventoryUnknown, isSuppressed, lockSnapshot, markInventoryUnknown, normalizeObjects, read, reconcileInventory, suppress, write };

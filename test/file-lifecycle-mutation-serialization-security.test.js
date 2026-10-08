@@ -331,10 +331,11 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     [`root/${rejectRevokedName}`]: { fileName: rejectRevokedName, folderId: "root", uploadedBy: "tester", uploadedAt: new Date().toISOString() },
     [`root/${orphanReplacementName}`]: orphanReplacementPending,
   }));
-  fs.writeFileSync(orphanPolicyPath, JSON.stringify({ version: 1, objects: [
+  fs.writeFileSync(orphanPolicyPath, JSON.stringify({ version: 1, providerInventory: { state: "known" }, objects: [
     { area: "temp", folderId: "root", name: rollbackPolicyUploadName },
     { area: "uploads", folderId: "root", name: orphanReplacementName },
   ] }));
+  fs.writeFileSync(path.join(dataDir, ".rootark-restore-provider-orphans-state.json"), JSON.stringify({ version: 1, providerInventory: { state: "known" } }));
   fs.writeFileSync(path.join(directory, "temp", orphanReplacementName), "approved replacement bytes");
   fs.writeFileSync(path.join(directory, "temp", approveRevokedName), `pending ${approveRevokedName}`);
   fs.writeFileSync(path.join(directory, "temp", rejectRevokedName), `pending ${rejectRevokedName}`);
