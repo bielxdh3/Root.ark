@@ -36,7 +36,7 @@ All remote checks below ran on exact `Root/main` SHA `14428690bef7c02648fd0be957
 | Dependency Review [#37720151454](https://github.com/bielxdh3/Root.ark/actions/runs/37720151454) | Success. |
 | Pages [#37720150655](https://github.com/bielxdh3/Root.ark/actions/runs/37720150655) | Success. |
 
-One moderate Dependabot alert remains open: `GHSA-hp3w-g68c-fv3c` for transitive `sprintf-js`; GitHub lists no first patched version. The older local release-gate run on `0085253…` is historical, not evidence for this SHA. A fresh release-gate run on the published documentation candidate remains pending.
+One moderate Dependabot alert remains open: `GHSA-hp3w-g68c-fv3c` for transitive `sprintf-js`; GitHub lists no first patched version. The earlier local gate on `0085253…` is historical. `node scripts/validate-release-gate.js` passed on clean Windows candidate SHA `df38a8a5e78ce3fa4154e6e55e63719a810a767b` with Node `v24.14.1`: 21 passed, 0 blocked, 0 failed. Exact-head PR checks remain pending for this candidate publication.
 
 ## Live GitHub snapshot at query time
 
