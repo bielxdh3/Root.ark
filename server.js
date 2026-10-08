@@ -62,7 +62,7 @@ const registerTrashRoutes = require("./src/routes/trash");
 const { registerSyncRoutes } = require("./src/routes/sync");
 const { registerGroupRoutes } = require("./src/routes/groups");
 const { createAuthenticate, createRealtimeAuthenticator, getClientIp, getExpectedOrigin, parseCookies } = require("./src/middlewares/auth");
-const { parseTrustedProxies } = require("./src/middlewares/trustedProxies");
+const { getTrustedClientIp, parseTrustedProxies } = require("./src/middlewares/trustedProxies");
 const { createRealtimeUpgradeGuard } = require("./src/realtime/upgradeGuard");
 const { createRequirePermission } = require("./src/middlewares/permissions");
 const { isTotpRequired, validateTotpPolicy } = require("./src/services/totpPolicy");
@@ -98,7 +98,7 @@ const REALTIME_MAX_CONNECTIONS_PER_PEER = parseBoundedNumber("REALTIME_MAX_CONNE
 const ROUTE_RATE_LIMIT_MAX = parsePositiveIntegerEnv("ROUTE_RATE_LIMIT_MAX", 60, 1_000_000);
 const ROUTE_RATE_LIMIT_WINDOW_MS = parsePositiveIntegerEnv("ROUTE_RATE_LIMIT_WINDOW_MS", 15 * 60 * 1000, 2_147_483_647);
 const realtimeUpgradeGuard = createRealtimeUpgradeGuard({
-  getPeerKey: (req) => getClientIp({ socket: req.socket }),
+  getPeerKey: (req) => getTrustedClientIp(req, app.get("trust proxy fn")),
   authorize: (req) => {
     if (restoreService.isWholeRestoreBlocked()) return { statusCode: 503, message: "Restore recovery required" };
     if (req.headers.origin !== getExpectedOrigin(req, app.get("trust proxy fn"))) return { statusCode: 403, message: "Origin denied" };

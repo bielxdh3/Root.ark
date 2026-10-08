@@ -99,7 +99,7 @@ test("WebSocket rejects unauthorized upgrades before 101 and caps concurrent pee
   const invalidAgain = await websocketUpgrade(portNumber, "rootark_session=invalid", origin); sockets.push(invalidAgain.socket); assert.equal(invalidAgain.status, 429);
 });
 
-test("WebSocket upgrade throttling ignores caller-supplied forwarded IPs from a configured proxy peer", { timeout: 20_000 }, async (t) => {
+test("WebSocket upgrade throttling uses the first untrusted client address across multiple configured proxy hops", { timeout: 20_000 }, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-realtime-upgrade-proxy-peer-"));
   fs.mkdirSync(path.join(dir, "data"));
   fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([{ username: "agent", password: bcrypt.hashSync("password", 10), role: "admin", permissions: {}, sessionVersion: 0 }]));
@@ -111,7 +111,32 @@ test("WebSocket upgrade throttling ignores caller-supplied forwarded IPs from a 
     DB_ENABLED: "false",
     ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
     REALTIME_UPGRADE_MAX_PER_WINDOW: "1",
-    TRUSTED_PROXIES: "127.0.0.1",
+    TRUSTED_PROXIES: "127.0.0.1,10.0.0.0/8",
+    JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+  }, stdio: "ignore", windowsHide: true });
+  const sockets = [];
+  t.after(async () => { for (const socket of sockets) socket.terminate(); await stopChild(child); fs.rmSync(dir, { recursive: true, force: true }); });
+  await ready(portNumber);
+  const origin = `http://127.0.0.1:${portNumber}`;
+  const first = await websocketUpgrade(portNumber, "", origin, { "x-forwarded-for": "203.0.113.77, 198.51.100.10, 10.1.2.3" }); sockets.push(first.socket); assert.equal(first.status, 401);
+  const second = await websocketUpgrade(portNumber, "", origin, { "x-forwarded-for": "203.0.113.77, 203.0.113.20, 10.2.3.4" }); sockets.push(second.socket); assert.equal(second.status, 401, "a different untrusted client address behind the same trusted proxy chain has a distinct budget");
+  const firstAgain = await websocketUpgrade(portNumber, "", origin, { "x-forwarded-for": "192.0.2.90, 198.51.100.10, 10.1.2.3" }); sockets.push(firstAgain.socket);
+  assert.equal(firstAgain.status, 429, "the client budget uses the nearest untrusted address and ignores untrusted prefixes to the left");
+});
+
+test("WebSocket upgrade throttling ignores spoofed forwarded IPs on direct origin requests", { timeout: 20_000 }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-realtime-upgrade-direct-peer-"));
+  fs.mkdirSync(path.join(dir, "data"));
+  fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([{ username: "agent", password: bcrypt.hashSync("password", 10), role: "admin", permissions: {}, sessionVersion: 0 }]));
+  fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
+  const portNumber = await port();
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: {
+    ...process.env,
+    PORT: String(portNumber),
+    DB_ENABLED: "false",
+    ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
+    REALTIME_UPGRADE_MAX_PER_WINDOW: "1",
+    TRUSTED_PROXIES: "",
     JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
   }, stdio: "ignore", windowsHide: true });
   const sockets = [];
@@ -120,7 +145,7 @@ test("WebSocket upgrade throttling ignores caller-supplied forwarded IPs from a 
   const origin = `http://127.0.0.1:${portNumber}`;
   const first = await websocketUpgrade(portNumber, "", origin, { "x-forwarded-for": "198.51.100.10" }); sockets.push(first.socket); assert.equal(first.status, 401);
   const second = await websocketUpgrade(portNumber, "", origin, { "x-forwarded-for": "203.0.113.20" }); sockets.push(second.socket);
-  assert.equal(second.status, 429, "different caller-controlled X-Forwarded-For values share the immediate TCP peer budget");
+  assert.equal(second.status, 429, "untrusted forwarded headers cannot repartition the direct TCP peer budget");
 });
 
 test("WebDAV HTTP boundary rejects unauthenticated, hostile, traversing, and infinite-depth requests", { timeout: 20_000 }, async (t) => {

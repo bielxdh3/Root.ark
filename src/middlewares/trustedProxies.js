@@ -1,6 +1,7 @@
 "use strict";
 
 const net = require("node:net");
+const proxyaddr = require("proxy-addr");
 const CLOUDFLARE_IPV6_RANGE = "2a06:98c0::/29";
 
 function isIpv4MappedAddress(address) {
@@ -46,4 +47,17 @@ function parseTrustedProxies(value) {
   return ranges;
 }
 
-module.exports = { parseTrustedProxies };
+function getTrustedClientIp(req, trustProxyFn) {
+  const peerAddress = req?.socket?.remoteAddress || req?.connection?.remoteAddress || null;
+  if (!peerAddress) return null;
+
+  let address = peerAddress;
+  if (typeof trustProxyFn === "function") {
+    try { address = proxyaddr(req, trustProxyFn) || peerAddress; } catch { address = peerAddress; }
+  }
+
+  if (address === "::1" || address === "::ffff:127.0.0.1") return "127.0.0.1";
+  return address;
+}
+
+module.exports = { getTrustedClientIp, parseTrustedProxies };
