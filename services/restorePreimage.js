@@ -259,33 +259,47 @@ function restoreTree(destination, snapshotRoot, snapshot, transactionId, options
   ensureSafeDirectory(path.dirname(destination), { create: true });
   removeTree(destination);
   ensureSafeDirectory(destination, { create: true });
-  for (let index = 0; index < snapshot.entries.length; index += 1) {
-    const entry = snapshot.entries[index];
-    safeRelativePath(entry.path);
-    const target = path.join(destination, ...entry.path.split("/"));
-    const source = path.join(snapshotRoot, ...entry.path.split("/"));
-    if (entry.type === "directory") {
-      ensureSafeDirectory(target, { create: true });
-      try { fs.chmodSync(target, restoredTreeMode(entry.mode)); } catch (error) { if (process.platform !== "win32") throw error; }
-    } else {
-      ensureSafeDirectory(path.dirname(target), { create: true });
-      const temporary = fileRestoreTemporaryPath(target, transactionId, index);
-      removeFileRestoreTemporary(temporary);
-      const result = copyVerifiedFile(source, temporary, entry.sha256);
-      if (result.size !== entry.size) throw new Error("Restore pre-image file size changed during recovery");
-      try { fs.renameSync(temporary, target); }
-      catch (error) { fs.rmSync(target, { force: true }); fs.renameSync(temporary, target); }
-      try { fs.chmodSync(target, restoredTreeMode(entry.mode)); } catch (error) { if (process.platform !== "win32") throw error; }
+  const directories = [{ path: destination, mode: legacyManifest ? null : restoredTreeMode(snapshot.rootMode) }];
+  try {
+    for (let index = 0; index < snapshot.entries.length; index += 1) {
+      const entry = snapshot.entries[index];
+      safeRelativePath(entry.path);
+      const target = path.join(destination, ...entry.path.split("/"));
+      const source = path.join(snapshotRoot, ...entry.path.split("/"));
+      if (entry.type === "directory") {
+        ensureSafeDirectory(target, { create: true });
+        directories.push({ path: target, mode: restoredTreeMode(entry.mode) });
+      } else {
+        ensureSafeDirectory(path.dirname(target), { create: true });
+        const temporary = fileRestoreTemporaryPath(target, transactionId, index);
+        removeFileRestoreTemporary(temporary);
+        const result = copyVerifiedFile(source, temporary, entry.sha256);
+        if (result.size !== entry.size) throw new Error("Restore pre-image file size changed during recovery");
+        try { fs.renameSync(temporary, target); }
+        catch (error) { fs.rmSync(target, { force: true }); fs.renameSync(temporary, target); }
+        try { fs.chmodSync(target, restoredTreeMode(entry.mode)); } catch (error) { if (process.platform !== "win32") throw error; }
+      }
     }
+    for (let index = directories.length - 1; index > 0; index -= 1) {
+      try { fs.chmodSync(directories[index].path, directories[index].mode); } catch (error) { if (process.platform !== "win32") throw error; }
+    }
+    if (!legacyManifest) {
+      try { fs.chmodSync(destination, directories[0].mode); } catch (error) { if (process.platform !== "win32") throw error; }
+    }
+    syncTree(destination);
+  } catch (error) {
+    for (const directory of directories) {
+      try {
+        ensureSafeDirectory(directory.path);
+        fs.chmodSync(directory.path, DIR_MODE);
+      } catch {}
+    }
+    throw error;
   }
-  if (!legacyManifest) {
-    try { fs.chmodSync(destination, restoredTreeMode(snapshot.rootMode)); } catch (error) { if (process.platform !== "win32") throw error; }
-  }
-  syncTree(destination);
 }
 
 function restoredTreeMode(mode) {
-  return process.platform === "win32" ? mode : mode | ((mode & 0o070) << 3);
+  return process.platform === "win32" ? mode : mode | ((mode & 0o070) << 3) | ((mode & 0o007) << 6);
 }
 
 function snapshotFileSet(paths, snapshotRoot) {

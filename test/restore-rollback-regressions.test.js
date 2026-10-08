@@ -155,6 +155,103 @@ test("tree rollback keeps recreated entries accessible when their pre-image used
   }
 });
 
+test("tree rollback keeps recreated entries accessible when their pre-image used other-only modes", (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows does not expose portable POSIX owner/group/other permission semantics");
+    return;
+  }
+  if (process.getuid && process.getuid() === 0) {
+    t.skip("root bypasses POSIX permission checks needed to prove owner access");
+    return;
+  }
+
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-other-access-"));
+  const treeRoot = path.join(runtime, "tree");
+  const nestedRoot = path.join(treeRoot, "nested");
+  const snapshotRoot = path.join(runtime, "snapshot");
+  try {
+    fs.mkdirSync(nestedRoot, { recursive: true });
+    fs.writeFileSync(path.join(nestedRoot, "entry.txt"), "original");
+    const snapshot = restorePreimage.snapshotTree(treeRoot, snapshotRoot);
+    snapshot.rootMode = 0o005;
+    for (const entry of snapshot.entries) entry.mode = entry.type === "directory" ? 0o005 : 0o004;
+
+    fs.rmSync(treeRoot, { recursive: true });
+    restorePreimage.restoreTree(treeRoot, snapshotRoot, snapshot, crypto.randomUUID());
+
+    assert.equal(fs.statSync(treeRoot).mode & 0o777, 0o505, "other traversal is promoted to owner traversal on the restored root");
+    assert.equal(fs.statSync(nestedRoot).mode & 0o777, 0o505, "other traversal is promoted to owner traversal on nested directories");
+    assert.equal(fs.statSync(path.join(nestedRoot, "entry.txt")).mode & 0o777, 0o404, "other read is promoted to owner read on restored files");
+    assert.equal(fs.readdirSync(treeRoot).includes("nested"), true, "the service can traverse the restored root");
+    assert.equal(fs.readdirSync(nestedRoot).includes("entry.txt"), true, "the service can traverse the restored nested directory");
+    assert.equal(fs.readFileSync(path.join(nestedRoot, "entry.txt"), "utf8"), "original", "the service can read restored file contents");
+  } finally {
+    if (fs.existsSync(treeRoot)) {
+      fs.chmodSync(treeRoot, 0o700);
+      if (fs.existsSync(nestedRoot)) {
+        fs.chmodSync(nestedRoot, 0o700);
+        const entryPath = path.join(nestedRoot, "entry.txt");
+        if (fs.existsSync(entryPath)) fs.chmodSync(entryPath, 0o600);
+      }
+    }
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("tree rollback restores directory access after a final-mode failure", (t) => {
+  if (process.platform === "win32" || (process.getuid && process.getuid() === 0)) {
+    t.skip("requires unprivileged POSIX permission checks");
+    return;
+  }
+
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-mode-failure-"));
+  const treeRoot = path.join(runtime, "tree");
+  const nestedRoot = path.join(treeRoot, "nested");
+  const deepRoot = path.join(nestedRoot, "deep");
+  const snapshotRoot = path.join(runtime, "snapshot");
+  const originalChmodSync = fs.chmodSync;
+  let deepFinalModeApplied = false;
+  let injectedFailure = false;
+  try {
+    fs.mkdirSync(deepRoot, { recursive: true });
+    fs.writeFileSync(path.join(deepRoot, "entry.txt"), "original");
+    const snapshot = restorePreimage.snapshotTree(treeRoot, snapshotRoot);
+    snapshot.rootMode = 0o070;
+    for (const entry of snapshot.entries) {
+      entry.mode = entry.type === "directory" ? (entry.path === "nested/deep" ? 0o000 : 0o005) : 0o004;
+    }
+
+    fs.rmSync(treeRoot, { recursive: true });
+    fs.chmodSync = function failNestedFinalMode(pathname, mode) {
+      if (pathname === deepRoot && mode === 0o000) deepFinalModeApplied = true;
+      if (!injectedFailure && deepFinalModeApplied && pathname === nestedRoot && mode === 0o505) {
+        injectedFailure = true;
+        const error = new Error("injected directory mode failure");
+        error.code = "EIO";
+        throw error;
+      }
+      return originalChmodSync.call(fs, pathname, mode);
+    };
+    assert.throws(() => restorePreimage.restoreTree(treeRoot, snapshotRoot, snapshot, crypto.randomUUID()), /injected directory mode failure/);
+    assert.equal(deepFinalModeApplied, true, "the deeper directory received its restrictive final mode first");
+    assert.equal(injectedFailure, true, "the nested directory final-mode update failed after the deep update");
+    for (const directory of [treeRoot, nestedRoot, deepRoot]) {
+      assert.equal(fs.statSync(directory).mode & 0o777, 0o700, "failure cleanup restores owner access to partial directories");
+    }
+    assert.equal(fs.readFileSync(path.join(deepRoot, "entry.txt"), "utf8"), "original", "the partial tree remains accessible for recovery");
+  } finally {
+    fs.chmodSync = originalChmodSync;
+    if (fs.existsSync(treeRoot)) {
+      fs.chmodSync(treeRoot, 0o700);
+      if (fs.existsSync(nestedRoot)) {
+        fs.chmodSync(nestedRoot, 0o700);
+        if (fs.existsSync(deepRoot)) fs.chmodSync(deepRoot, 0o700);
+      }
+    }
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("tree rollback rejects invalid snapshot entry modes before removing the destination", () => {
   const cases = [
     { type: "directory", mode: 0o1000 },
