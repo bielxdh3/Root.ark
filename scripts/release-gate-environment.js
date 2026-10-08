@@ -1,7 +1,6 @@
 "use strict";
 
 const projectPackage = require("../package.json");
-const packageLock = require("../package-lock.json");
 const projectPackageName = projectPackage.name;
 const declaredPackageNames = new Set([
   ...Object.keys(projectPackage.dependencies || {}),
@@ -9,12 +8,7 @@ const declaredPackageNames = new Set([
   ...Object.keys(projectPackage.optionalDependencies || {}),
   ...Object.keys(projectPackage.peerDependencies || {}),
 ]);
-for (const packagePath of Object.keys(packageLock.packages || {})) {
-  const marker = "node_modules/";
-  const markerIndex = packagePath.lastIndexOf(marker);
-  if (markerIndex >= 0) declaredPackageNames.add(packagePath.slice(markerIndex + marker.length));
-}
-const missingModulePattern = /(?:^|\n)(?:Error(?: \[ERR_MODULE_NOT_FOUND\])?:\s*)?Cannot find (?:module|package)\s+['"]([^'"]+)['"]/gim;
+const missingModulePattern = /(?:^|\n)(?:Error(?: \[ERR_MODULE_NOT_FOUND\])?:\s*)?Cannot find (?:module|package)\s+['"]([^'"]+)['"](?:(?: imported from )([^\r\n]+))?/gim;
 
 function packageNameFromSpecifier(specifier) {
   const parts = specifier.split(/[\\/]/);
@@ -39,19 +33,47 @@ function isLocalOrProjectSpecifier(specifier) {
   return isLocalOrBuiltinSpecifier || isProjectSelfReference;
 }
 
+function isImportedFromDeclaredPackage(importer) {
+  if (!importer) return false;
+  const normalizedImporter = String(importer).replace(/[\\/]+/g, "/").toLowerCase();
+  return Array.from(declaredPackageNames).some((packageName) => {
+    const marker = `node_modules/${packageName}`.toLowerCase();
+    const markerIndex = normalizedImporter.lastIndexOf(marker);
+    if (markerIndex < 0) return false;
+    const nextCharacter = normalizedImporter[markerIndex + marker.length];
+    return nextCharacter === undefined || nextCharacter === "/";
+  });
+}
+
+function getMissingModuleFailures(text) {
+  const matches = Array.from(text.matchAll(missingModulePattern));
+  return matches.map((match, index) => {
+    const end = matches[index + 1]?.index ?? text.length;
+    const failureText = text.slice(match.index, end);
+    const requireStackImporter = failureText.match(/Require stack:\s*\r?\n\s*-\s*([^\r\n]+)/i)?.[1];
+    return {
+      specifier: match[1],
+      importer: match[2] || requireStackImporter,
+    };
+  });
+}
+
 function isDependencyOrNetworkUnavailable(output, { resolvePackage = isResolvablePackage } = {}) {
   const text = String(output || "");
-  const missingSpecifiers = Array.from(text.matchAll(missingModulePattern), (match) => match[1]);
-  const hasLocalModuleFailure = missingSpecifiers.some((specifier) => isLocalOrProjectSpecifier(specifier) || resolvePackage(specifier));
-  const hasUnavailableDeclaredPackage = missingSpecifiers.some((specifier) => {
+  const missingFailures = getMissingModuleFailures(text);
+  const isDeclaredDependencyFailure = ({ specifier, importer }) => {
     if (isLocalOrProjectSpecifier(specifier)) return false;
     const packageName = packageNameFromSpecifier(specifier);
-    return Boolean(packageName && declaredPackageNames.has(packageName) && !resolvePackage(packageName));
-  });
-  const hasUnknownExternalModuleFailure = missingSpecifiers.some((specifier) => {
+    if (!packageName) return false;
+    if (declaredPackageNames.has(packageName)) return !resolvePackage(packageName);
+    return isImportedFromDeclaredPackage(importer) && !resolvePackage(packageName);
+  };
+  const hasLocalModuleFailure = missingFailures.some(({ specifier }) => isLocalOrProjectSpecifier(specifier) || resolvePackage(specifier));
+  const hasUnavailableDeclaredPackage = missingFailures.some(isDeclaredDependencyFailure);
+  const hasUnknownExternalModuleFailure = missingFailures.some(({ specifier, importer }) => {
     if (isLocalOrProjectSpecifier(specifier) || resolvePackage(specifier)) return false;
     const packageName = packageNameFromSpecifier(specifier);
-    return !packageName || !declaredPackageNames.has(packageName);
+    return !packageName || !isDeclaredDependencyFailure({ specifier, importer });
   });
   return !hasLocalModuleFailure && !hasUnknownExternalModuleFailure && (hasUnavailableDeclaredPackage
     || /(?:^|\n)npm (?:ERR!|error) (?:code )?(?:ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|EAI_AGAIN|ENOTFOUND)\b/im.test(text)

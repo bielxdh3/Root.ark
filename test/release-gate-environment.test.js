@@ -11,12 +11,15 @@ test("release gate recognizes missing modules and npm network failures", () => {
   assert.equal(isDependencyOrNetworkUnavailable("Error: Cannot find module 'better-sqlite3'\ncode: 'MODULE_NOT_FOUND'", { resolvePackage: missingInstalledPackage }), true);
   assert.equal(isDependencyOrNetworkUnavailable("Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'express' imported from /repo/test/example.test.js", { resolvePackage: missingInstalledPackage }), true);
   assert.equal(isDependencyOrNetworkUnavailable("Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@aws-sdk/checksums' imported from /repo/node_modules/@aws-sdk/client-s3/index.js", { resolvePackage: missingInstalledPackage }), true);
+  assert.equal(isDependencyOrNetworkUnavailable("Error: Cannot find module '@aws-sdk/checksums'\nRequire stack:\n- /repo/node_modules/@aws-sdk/client-s3/dist-cjs/index.js\n- /repo/src/server.js", { resolvePackage: missingInstalledPackage }), true);
+  assert.equal(isDependencyOrNetworkUnavailable("Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@aws-sdk/checksums' imported from /repo/src/server.js", { resolvePackage: missingInstalledPackage }), false);
   assert.equal(isDependencyOrNetworkUnavailable("npm error code ENETUNREACH\nnpm error network request to https://registry.npmjs.org failed"), true);
 });
 
 test("release gate treats unknown external imports as source failures, not environment blocks", () => {
   const missingInstalledPackage = () => false;
   assert.equal(isDependencyOrNetworkUnavailable("Error: Cannot find module 'rootark-release-gate-typo'\ncode: 'MODULE_NOT_FOUND'", { resolvePackage: missingInstalledPackage }), false);
+  assert.equal(isDependencyOrNetworkUnavailable("Error: Cannot find module 'accepts'\nRequire stack:\n- /repo/src/server.js\ncode: 'MODULE_NOT_FOUND'\nnpm error code ECONNRESET\nnpm error network request to https://registry.npmjs.org failed", { resolvePackage: missingInstalledPackage }), false);
   assert.equal(isDependencyOrNetworkUnavailable("Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@rootark-release-gate/typo' imported from /repo/test/example.test.js", { resolvePackage: missingInstalledPackage }), false);
   assert.equal(isDependencyOrNetworkUnavailable("Error: Cannot find module 'rootark-release-gate-typo'\ncode: 'MODULE_NOT_FOUND'\nnpm error code ECONNRESET\nnpm error network request to https://registry.npmjs.org failed", { resolvePackage: missingInstalledPackage }), false);
 });
