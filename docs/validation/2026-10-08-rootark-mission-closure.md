@@ -2,7 +2,7 @@
 
 ## Status
 
-`PARTIAL` at the 2026-10-08 candidate snapshot: PR #116 was open with clean merge state at head `448d1c1ecd2cd3a1391dd741027dc146be3735b6`, based on `Root/main` `14428690bef7c02648fd0be9570aabb17ae6de1a`. Exact-head Security Regression passed on Linux and Windows; CodeQL and PR Dependency Review passed. The local release gate passed on prior docs-only candidate `a72d2f2…` (21 passed, 0 blocked, 0 failed); exact-head CI passed after the 448d1c1 documentation correction. Post-merge default-branch validation and a fresh independent final review remain required. Browser acceptance remains partial. Whole restore remains rollback-recoverable locally, not globally atomic across storage providers.
+`PARTIAL` at the latest recorded GitHub query after PR #118: `Root/main` was `1c2f7a8b276e63e53555f5de824afc9b7a9aa55e`; its exact-SHA Security Regression, CodeQL, Dependency Review, and Pages checks passed. At that query, remote PR #116 was still at head `75efa003136c0799cf678fa8ad264076893882d3` on the earlier base `14428690bef7c02648fd0be9570aabb17ae6de1a`. The candidate branch has since been refreshed locally with PR #118's merge. The full browser matrix is incomplete, so no complete closure verdict is justified. Whole restore remains rollback-recoverable locally, not globally atomic across storage providers.
 
 This dated report is not production-readiness or release authorization.
 
@@ -10,9 +10,10 @@ This dated report is not production-readiness or release authorization.
 
 - Mission baseline: `1df5e4640d4aea7dc700f2088059f489c2e51af0`.
 - Live default branch after PR #117: `Root/main` at `14428690bef7c02648fd0be9570aabb17ae6de1a`.
-- Candidate: `cdx/final-closure-evidence`. Local HEAD before the first documentation update: `f2d171d5338e543a9c752dff1e77bd56f0f994a6`. At the initial source-SHA query, remote PR #116 still pointed to `daa6025e0c08c29a4d4cc0b55ec9fbb31b7e4fca` with stale base `9e070823f2ee6372521a53d2fc130701ed074aab`; it was later updated to candidate head `a72d2f21db25363dc3f13d8816e3db3bd1ee2d93` on current base `14428690bef7c02648fd0be9570aabb17ae6de1a`.
-- This candidate is documentation-only. Unrelated workspace files and the cloud-access worktree were left untouched.
-- Merged PRs: #114 at `566a3d24591423c624ef3bcb82290a77ff359210`; #115 at `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`; #99 at `9e070823f2ee6372521a53d2fc130701ed074aab`; #117 at `14428690bef7c02648fd0be9570aabb17ae6de1a`.
+- Latest queried default branch after PR #118: `Root/main` at `1c2f7a8b276e63e53555f5de824afc9b7a9aa55e`.
+- Candidate: `cdx/final-closure-evidence`. The refreshed local branch merged `origin/Root/main` at `1c2f7a8…` before these changes. Its remote PR #116 head at the re-query was `75efa003136c0799cf678fa8ad264076893882d3`; the candidate changes the README, issue ledger, plan tree, browser-session threat model, closure report, and test-only failure diagnostics.
+- Unrelated worktrees and `.playwright-cli` artifacts were left untouched.
+- Merged mission PRs: #101 at `5c86bd2a9844fdf21921f08cf2bf9d9a7253d652`; #103 at `f85cb389f3152191d612fb36b1ad97bde89ba99a`; #99 at `9e070823f2ee6372521a53d2fc130701ed074aab`; #114 at `566a3d24591423c624ef3bcb82290a77ff359210`; #115 at `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`; #117 at `14428690bef7c02648fd0be9570aabb17ae6de1a`; and #118 at `1c2f7a8b276e63e53555f5de824afc9b7a9aa55e`.
 
 ## Findings and corrections
 
@@ -23,11 +24,14 @@ This dated report is not production-readiness or release authorization.
 | High — proxy/client IP | #114 added explicit `TRUSTED_PROXIES` policy, ignores forwarding headers from untrusted peers, and documents proxy-hop/Cloudflare configuration. Tests cover direct origin, spoofed headers, trusted peers, and hop parsing. Deployment topology remains operator evidence. |
 | Medium — default-branch CI | #114 added push validation for `Root/main` while keeping PR validation. Security Regression ran on exact SHA `1442869…`; CodeQL and dependency review also passed there. |
 | High — restore recovery | #114 stages verified preimages, compensates local quarantine/JSON/upload/SQLite mutations, recovers before migrations after restart, and persists retryable provider reconciliation. Failure injection covers local stages, migration, provider failure, pending work, and restart. Local rollback is recoverable; whole restore is not globally atomic. |
-| Medium — roadmap drift | #99 reconciled the roadmap; this update records the post-#117 source SHA and dated issue/PR snapshots. PR #116 passed exact-head checks at `448d1c1…` on base `1442869…`; this follow-up corrects the stale `a72d2f2…` status snapshot and requires checks on its new documentation-only head. |
+| Medium — roadmap drift | #99 reconciled the roadmap. Older post-#117 and PR #116 candidate snapshots remain explicitly historical; the refreshed ledger records the post-#118 `Root/main` SHA `1c2f7a8…` and the PR/issue state at the latest query. The current PR #116 head must pass its own exact-head checks after this candidate is published. |
+| No confirmed cross-origin identity leak — `/auth/session.js` | The endpoint is authenticated and no-store, but no tracked page loads it, default cross-origin classic-script requests omit same-origin credentials, and the application emits no credentialed CORS headers. An independent source/standards review did not confirm a reachable leak. The threat model was corrected; the sibling-origin browser probe was not completed, so reassess if credentialed CORS is enabled at the app or proxy. |
 
 ## Exact-SHA validation
 
 All remote checks below ran on exact `Root/main` SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`.
+
+The later exact `Root/main` push validation for PR #118's merge at `1c2f7a8b276e63e53555f5de824afc9b7a9aa55e` also passed: Security Regression [#37729789854](https://github.com/bielxdh3/Root.ark/actions/runs/37729789854), Ubuntu 938 total (927 passed, 11 skipped, 0 failed) and Windows 938 total (934 passed, 4 skipped, 0 failed); CodeQL [#37729789865](https://github.com/bielxdh3/Root.ark/actions/runs/37729789865), default-branch Dependency Review [#37729789780](https://github.com/bielxdh3/Root.ark/actions/runs/37729789780), and Pages [#37729789584](https://github.com/bielxdh3/Root.ark/actions/runs/37729789584) passed. This is not validation of any later default-branch SHA.
 
 | Check | Result |
 |---|---|
@@ -61,6 +65,8 @@ The local release gate passed on earlier code-equivalent candidate head `a72d2f2
 
 ## Restore semantics and residuals
 
+PR #118 added a migration-stage failure injection to `test/backup-restore-transaction-boundary.test.js`. It verifies a failure inside migration SQL rolls back that migration's SQLite transaction, leaves the already-committed restored database authoritative, retains the fail-closed `restart_required` coordinator and preimage, and retries the migration on restart before the listener is acknowledged. The focused test passed 1/1 locally; exact-head PR and subsequent main-push checks passed. This confirms forward retry after the local restore commit, not whole-restore rollback at this stage.
+
 Before local mutation, restore verifies preimages for quarantine, JSON data, uploads, SQLite files/sidecars, and restore policy. A pre-commit interruption is rolled back at startup before migrations or request handling. If recovery cannot safely complete, the service stays blocked for operator recovery. After local commit, cloud reconciliation is persisted, leased, idempotent, retryable, and resumed after restart. Provider APIs cannot join a portable local filesystem/SQLite transaction.
 
 Residuals: external writers are outside the restore gate; persistent rollback failure may require operator help; Windows lacks the same portable directory-entry flush guarantee as POSIX; fake providers do not prove live interoperability. See [the restore transaction boundary](../backup-restore-transaction-boundary.md).
@@ -78,8 +84,10 @@ A separate disposable `NODE_ENV=test`, `DB_ENABLED=false` runtime used generated
 
 Still unproven in the available browser sessions: chunk progress/failure, approve/reject, download, share creation/password flow, versions, move, permission mutations, nonempty quarantine, permanent-delete flow, session expiry/revocation independent of logout, and cross-tab realtime refresh. The new README upload remains pending in the separate 62376 disposable runtime; it was not approved, rejected, or permanently deleted. In that session, the existing account reached the TOTP challenge but no account code was used; the isolated fixture runtime above covered a limited admin 2FA/folder subset. The earlier authorized deletion of `closure-ui-sample.txt` was narrow cleanup evidence only; it does not prove the full permanent-delete flow. Earlier operator-observed checks at `62379` and `9e070…` remain supplemental and have no retained per-flow trace. Full browser acceptance remains incomplete.
 
+The final isolated browser attempt reached required TOTP enrollment but stopped before confirmation because the browser helper no longer had the enrollment key when it tried to produce a code. The test server was stopped and the browser session closed; no additional runtime/browser retry was made. The sibling-origin script probe, full admin mutation matrix, and authorized test-share creation therefore remain unverified. This does not affect the successful narrow login/session, upload, pending-preview, responsive-width, and keyboard observations above; it keeps browser acceptance `PARTIAL`.
+
 ## Security and remaining work
 
-The merged fixes pass exact-main checks. Restore recovery is bounded to local rollback plus durable provider reconciliation. The project is not production-ready on repository evidence alone: proxy ingress/topology, provider credentials/interoperability, native binding/deployment behavior, and operational recovery remain deployment gates. Root.ark is not an end-to-end Zero-Knowledge runtime; legacy server-readable paths remain. Existing bearer links are not operation-scoped capabilities.
+The merged fixes pass exact-main checks through `1c2f7a8…`. Restore recovery is bounded to local rollback plus durable provider reconciliation. The project is not production-ready on repository evidence alone: proxy ingress/topology, provider credentials/interoperability, native binding/deployment behavior, and operational recovery remain deployment gates. Root.ark is not an end-to-end Zero-Knowledge runtime; legacy server-readable paths remain. Existing bearer links are not operation-scoped capabilities.
 
-Pending at the 448d1c1 snapshot: publish the follow-up state correction and browser evidence, validate its exact PR head, and merge PR #116 only after checks and review pass. Then fetch and validate the resulting exact `Root/main` SHA and conduct a fresh independent final review. The complete browser matrix remains incomplete. Keep #63–68 and #94, and incomplete PRs #95/#97/#102, open.
+At the latest query, PR #116 still needed publication of the refreshed snapshot, exact-head checks, independent review, and merge. Afterward, validate the resulting exact `Root/main` SHA and conduct a fresh independent final review. The complete browser matrix remains incomplete. Keep #63–68 and #94, and incomplete PRs #95/#97/#102, open.

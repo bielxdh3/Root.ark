@@ -1,5 +1,22 @@
 # Root.ark Issue Ledger
 
+## Latest verified GitHub snapshot — after PR #118 (2026-10-08, `Root/main` `1c2f7a8b276e63e53555f5de824afc9b7a9aa55e`)
+
+Queried after the exact-SHA push workflows completed for `1c2f7a8…`, before this refreshed PR #116 candidate was published. This is a timestamped snapshot; later PR publication or merge changes the live state.
+
+PR #118 (`test: cover restore migration failure recovery`) merged at `1c2f7a8…` from head `5ed55e4a1f2509aea939c6a89dda7d0bef87cd99`. Its exact-head Security Regression, CodeQL, and Dependency Review passed. On the resulting exact `Root/main` SHA `1c2f7a8…`, push Security Regression run [#37729789854](https://github.com/bielxdh3/Root.ark/actions/runs/37729789854) passed: Ubuntu Node 22 938 total (927 passed, 11 skipped, 0 failed), Windows Node 22 938 total (934 passed, 4 skipped, 0 failed). CodeQL [#37729789865](https://github.com/bielxdh3/Root.ark/actions/runs/37729789865), default-branch Dependency Review [#37729789780](https://github.com/bielxdh3/Root.ark/actions/runs/37729789780), and Pages [#37729789584](https://github.com/bielxdh3/Root.ark/actions/runs/37729789584) also passed.
+
+The seven feature/security issues remain open: #63 protected search, #64 native Android, #65 Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change protection, #68 capability sharing, and #94 deployment-wide chunk-upload limits. Their acceptance boundaries remain as recorded below; no partial foundation is being marked complete.
+
+| Open PR | State at query | Remaining boundary |
+|---|---|---|
+| #95 | Open at head `95d99e4a934384fcfa2101dfc210741cd791a3d1`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`, merge state `DIRTY`; four review threads resolved. Its old-head checks passed on 2026-10-01. | #94 still lacks verified deployment-wide limits or proven single-process topology. |
+| #97 | Open at head `a6a33a92cd6902f303254e60031da4bdc04cec04`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`, merge state `CLEAN`; five review threads resolved. Its old-head checks passed on 2026-10-01. | Selective transfer, metadata-only paginated listing, native Files On-Demand, and external-writer-safe eviction remain incomplete. |
+| #102 | Open at head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`, base `9de3c85ab59aa16fc46916abc0cf638c539086ef`, merge state `DIRTY`; CodeQL check failed; one unresolved review thread remains at `services/internalFile.js:31`. | Resolve the thread/finding, update the base, and pass exact-head checks. |
+| #116 | Open at remote head `75efa003136c0799cf678fa8ad264076893882d3`, last PR base snapshot `14428690bef7c02648fd0be9570aabb17ae6de1a`; no review threads. Its prior head checks passed. This branch was then refreshed locally with PR #118's merge before publishing this documentation update. | Validate the newly published head and merge only after review and checks pass. |
+
+The moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` for transitive `sprintf-js` remains open; GitHub lists no first patched version. PR #118 has no unresolved review threads. The only unresolved thread among the open PRs above is on #102.
+
 ## Historical live snapshot — 2026-10-08 (after PR #117, source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`)
 
 This point-in-time snapshot was queried from GitHub after PR #117 merged and before the PR #116 branch was updated to the current base. The follow-up candidate snapshot below records the later PR state; the table here applies only to `1442869…` at the original query time.
