@@ -155,12 +155,19 @@ For a reviewed deployment profile, set a strong `JWT_SECRET`, an explicit
 `TOTP_POLICY` (`optional`, `role-required`, or `global-required`), and a
 32-byte `SERVER_MASTER_KEY` or protected `data/server-master.key`. `GET
 /health` is liveness-only; `GET /ready` returns `503` until these checks and
-the selected cloud-provider prerequisites pass. These endpoints do not require
-authentication and intentionally return no paths, credentials, or key data.
+the selected cloud-provider prerequisites and Secure session-cookie policy
+pass. `NODE_ENV=production` enables Secure cookies by default; production
+startup rejects an explicit insecure setting, while non-production HTTPS
+deployments can set `SESSION_COOKIE_SECURE=true`. These endpoints do not
+require authentication and intentionally return no paths, credentials, or key data.
 WebDAV Basic authentication cannot complete a TOTP challenge and is rejected
 for accounts with TOTP enrolled or covered by a required TOTP policy; with
 `optional` policy, Basic authentication remains available only to accounts
-without enrolled TOTP.
+without enrolled TOTP. WebDAV authentication also shares the normal per-IP and
+per-username login throttles. WebSocket upgrades authenticate and validate
+Origin before `101`, with configurable per-peer rate and concurrent-connection
+bounds (`REALTIME_UPGRADE_MAX_PER_WINDOW`, `REALTIME_UPGRADE_RATE_WINDOW_MS`,
+and `REALTIME_MAX_CONNECTIONS_PER_PEER`).
 
 ## Architecture
 

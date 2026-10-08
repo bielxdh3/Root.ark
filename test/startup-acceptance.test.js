@@ -301,6 +301,72 @@ test("default accounts require explicit non-production development/test opt-in",
   }
 });
 
+test("production refuses a persisted development bootstrap account until its password is changed", { timeout: 30_000 }, async (t) => {
+  const cwd = createSandbox();
+  fs.mkdirSync(path.join(cwd, "data"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "data", "users.local.json"), JSON.stringify([
+    { username: "admin", password: bcrypt.hashSync("admin123", 10), role: "admin", permissions: {} },
+  ]));
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "production" } });
+  t.after(async () => { await stop(launched.child, [strongSecret]); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+  const result = await waitForExit(launched.child, TIMEOUT_MS, [strongSecret]);
+  assert.notEqual(result.code, 0);
+  assert.match(launched.output(), /development bootstrap credentials must be changed/i);
+  assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), true, "the existing account store is preserved for operator recovery");
+});
+
+test("production startup fails when session cookies are explicitly configured without Secure", { timeout: 30_000 }, async (t) => {
+  const cwd = createSandbox();
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "production", SESSION_COOKIE_SECURE: "false" } });
+  t.after(async () => { await stop(launched.child, [strongSecret]); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+  const result = await waitForExit(launched.child, TIMEOUT_MS, [strongSecret]);
+  assert.notEqual(result.code, 0);
+  assert.match(launched.output(), /Production session cookies must use the Secure attribute/);
+});
+
+test("production emits Secure session cookies and reports readiness only with that policy", { timeout: 30_000 }, async (t) => {
+  const cwd = createSandbox();
+  fs.mkdirSync(path.join(cwd, "data"), { recursive: true });
+  const password = crypto.randomBytes(32).toString("base64url");
+  fs.writeFileSync(path.join(cwd, "data", "users.json"), JSON.stringify([
+    { username: "seed-admin", password: bcrypt.hashSync(password, 10), role: "admin", permissions: {} },
+  ]));
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const masterKey = crypto.randomBytes(32).toString("base64");
+  const port = await getUnusedPort();
+  const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: {
+    NODE_ENV: "production",
+    ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
+    TOTP_POLICY: "optional",
+    SERVER_MASTER_KEY: masterKey,
+  } });
+  t.after(async () => { await stop(launched.child, [strongSecret, masterKey, password]); fs.rmSync(cwd, { recursive: true, force: true }); });
+  assert.equal(await waitForServer(port, [strongSecret, masterKey, password]), 200);
+
+  const readyResponse = await new Promise((resolve, reject) => {
+    http.get({ host: "127.0.0.1", port, path: "/ready" }, (res) => { res.resume(); res.on("end", () => resolve(res.statusCode)); }).once("error", reject);
+  });
+  assert.equal(readyResponse, 200);
+  const body = JSON.stringify({ username: "seed-admin", password });
+  const login = await new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port, path: "/auth/login", method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) } }, (res) => {
+      res.resume();
+      res.on("end", () => resolve({ status: res.statusCode, cookies: res.headers["set-cookie"] || [] }));
+    });
+    req.once("error", reject);
+    req.end(body);
+  });
+  assert.equal(login.status, 200);
+  assert.equal(login.cookies.length, 2);
+  assert.ok(login.cookies.every((cookie) => /; Secure(?:;|$)/i.test(cookie)));
+});
+
 test("fresh test bootstrap also fails closed when the explicit dev/test opt-in is absent", { timeout: 30_000 }, async (t) => {
   const cwd = createSandbox();
   const strongSecret = crypto.randomBytes(48).toString("base64url");

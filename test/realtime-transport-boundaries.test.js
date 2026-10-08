@@ -12,10 +12,22 @@ const WebSocket = require("ws");
 
 const ROOT = path.resolve(__dirname, "..");
 function port() { return new Promise((resolve, reject) => { const server = net.createServer(); server.once("error", reject); server.listen(0, "127.0.0.1", () => { const value = server.address().port; server.close(() => resolve(value)); }); }); }
+function stopChild(child) { if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(); const exited = new Promise((resolve) => child.once("exit", resolve)); child.kill(); return exited; }
 function request(portNumber, requestPath, options = {}) { return new Promise((resolve, reject) => { const req = http.request({ host: "127.0.0.1", port: portNumber, path: requestPath, ...options }, (res) => { let body = ""; res.on("data", (chunk) => { body += chunk; }); res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body })); }); req.once("error", reject); req.end(options.body); }); }
 async function ready(portNumber) { for (let index = 0; index < 100; index += 1) { try { await request(portNumber, "/login.html"); return; } catch { await new Promise((resolve) => setTimeout(resolve, 50)); } } throw new Error("server did not start"); }
 function event(socket, name) { return new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error(`missing ${name}`)), 2000); socket.on("message", (raw) => { const message = JSON.parse(raw); if (message.event === name) { clearTimeout(timer); resolve(message); } }); socket.once("error", reject); }); }
 function close(socket) { return new Promise((resolve) => socket.once("close", (code) => resolve(code))); }
+function websocketUpgrade(portNumber, cookie, origin, requestHeaders = {}) {
+  const socket = new WebSocket(`ws://127.0.0.1:${portNumber}/ws`, { headers: { ...(cookie ? { cookie } : {}), ...requestHeaders }, origin });
+  return new Promise((resolve, reject) => {
+    socket.once("open", () => resolve({ status: 101, socket }));
+    socket.once("unexpected-response", (_request, response) => { response.resume(); resolve({ status: response.statusCode, socket }); });
+    socket.once("error", (error) => {
+      if (socket.readyState === WebSocket.CLOSED) return;
+      reject(error);
+    });
+  });
+}
 
 test("realtime transport declares bounded payload, compression, binary, and burst handling", () => {
   const contents = fs.readFileSync(path.join(ROOT, "server.js"), "utf8");
@@ -47,12 +59,68 @@ test("WebSocket HTTP upgrade enforces cookie, Origin, message, and binary bounda
   const origin = `http://127.0.0.1:${portNumber}`;
   const connect = (headers = {}, requestedOrigin = origin) => new WebSocket(`ws://127.0.0.1:${portNumber}/ws`, { headers, origin: requestedOrigin });
   const allowed = connect({ cookie }); t.after(() => allowed.terminate()); await event(allowed, "connected"); allowed.send("not-json"); allowed.send(JSON.stringify({ event: "ping" })); await event(allowed, "pong");
-  const missing = connect(); assert.equal(await close(missing), 1008);
-  const malformed = connect({ cookie: "rootark_session=not-a-token" }); assert.equal(await close(malformed), 1008);
-  const wrongOrigin = connect({ cookie }, "https://evil.test"); assert.equal(await close(wrongOrigin), 1008);
+  const missing = await websocketUpgrade(portNumber, "", origin); assert.equal(missing.status, 401);
+  const malformed = await websocketUpgrade(portNumber, "rootark_session=not-a-token", origin); assert.equal(malformed.status, 401);
+  const wrongOrigin = await websocketUpgrade(portNumber, cookie, "https://evil.test"); assert.equal(wrongOrigin.status, 403);
   const binary = connect({ cookie }); await event(binary, "connected"); const binaryClose = close(binary); binary.send(Buffer.from([1])); assert.equal(await binaryClose, 1003);
   const oversized = connect({ cookie }); await event(oversized, "connected"); const oversizedClose = close(oversized); oversized.send("x".repeat(17 * 1024)); assert.equal(await oversizedClose, 1009);
   const burst = connect({ cookie }); await event(burst, "connected"); const burstClose = close(burst); for (let index = 0; index < 31; index += 1) burst.send(JSON.stringify({ event: "ping" })); assert.equal(await burstClose, 1008);
+});
+
+test("WebSocket rejects unauthorized upgrades before 101 and caps concurrent peer connections", { timeout: 20_000 }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-realtime-upgrade-guard-"));
+  fs.mkdirSync(path.join(dir, "data"));
+  fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([{ username: "agent", password: bcrypt.hashSync("password", 10), role: "admin", permissions: {}, sessionVersion: 0 }]));
+  fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
+  const portNumber = await port();
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: {
+    ...process.env,
+    PORT: String(portNumber),
+    DB_ENABLED: "false",
+    ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
+    REALTIME_UPGRADE_MAX_PER_WINDOW: "6",
+    REALTIME_MAX_CONNECTIONS_PER_PEER: "1",
+    JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+  }, stdio: "ignore", windowsHide: true });
+  const sockets = [];
+  t.after(async () => { for (const socket of sockets) socket.terminate(); await stopChild(child); fs.rmSync(dir, { recursive: true, force: true }); });
+  await ready(portNumber);
+  const loginBody = JSON.stringify({ username: "agent", password: "password" });
+  const login = await request(portNumber, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(loginBody) }, body: loginBody });
+  const cookie = login.headers["set-cookie"].map((value) => value.split(";", 1)[0]).join("; ");
+  const origin = `http://127.0.0.1:${portNumber}`;
+  const missing = await websocketUpgrade(portNumber, "", origin); sockets.push(missing.socket); assert.equal(missing.status, 401);
+  const wrongOrigin = await websocketUpgrade(portNumber, cookie, "https://evil.test"); sockets.push(wrongOrigin.socket); assert.equal(wrongOrigin.status, 403);
+  const active = await websocketUpgrade(portNumber, cookie, origin); sockets.push(active.socket); assert.equal(active.status, 101); await event(active.socket, "connected");
+  const overCap = await websocketUpgrade(portNumber, cookie, origin); sockets.push(overCap.socket); assert.equal(overCap.status, 429);
+  active.socket.close(); await new Promise((resolve) => active.socket.once("close", resolve));
+  const afterRelease = await websocketUpgrade(portNumber, cookie, origin); sockets.push(afterRelease.socket); assert.equal(afterRelease.status, 101); await event(afterRelease.socket, "connected");
+  const invalid = await websocketUpgrade(portNumber, "rootark_session=invalid", origin); sockets.push(invalid.socket); assert.equal(invalid.status, 401);
+  const invalidAgain = await websocketUpgrade(portNumber, "rootark_session=invalid", origin); sockets.push(invalidAgain.socket); assert.equal(invalidAgain.status, 429);
+});
+
+test("WebSocket upgrade throttling ignores caller-supplied forwarded IPs from a configured proxy peer", { timeout: 20_000 }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-realtime-upgrade-proxy-peer-"));
+  fs.mkdirSync(path.join(dir, "data"));
+  fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([{ username: "agent", password: bcrypt.hashSync("password", 10), role: "admin", permissions: {}, sessionVersion: 0 }]));
+  fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
+  const portNumber = await port();
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: {
+    ...process.env,
+    PORT: String(portNumber),
+    DB_ENABLED: "false",
+    ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
+    REALTIME_UPGRADE_MAX_PER_WINDOW: "1",
+    TRUSTED_PROXIES: "127.0.0.1",
+    JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+  }, stdio: "ignore", windowsHide: true });
+  const sockets = [];
+  t.after(async () => { for (const socket of sockets) socket.terminate(); await stopChild(child); fs.rmSync(dir, { recursive: true, force: true }); });
+  await ready(portNumber);
+  const origin = `http://127.0.0.1:${portNumber}`;
+  const first = await websocketUpgrade(portNumber, "", origin, { "x-forwarded-for": "198.51.100.10" }); sockets.push(first.socket); assert.equal(first.status, 401);
+  const second = await websocketUpgrade(portNumber, "", origin, { "x-forwarded-for": "203.0.113.20" }); sockets.push(second.socket);
+  assert.equal(second.status, 429, "different caller-controlled X-Forwarded-For values share the immediate TCP peer budget");
 });
 
 test("WebDAV HTTP boundary rejects unauthenticated, hostile, traversing, and infinite-depth requests", { timeout: 20_000 }, async (t) => {
@@ -64,7 +132,7 @@ test("WebDAV HTTP boundary rejects unauthenticated, hostile, traversing, and inf
   fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
   const portNumber = await port();
   const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", TOTP_POLICY: "optional", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
-  t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
+  t.after(async () => { await stopChild(child); fs.rmSync(dir, { recursive: true, force: true }); });
   await ready(portNumber);
   const basic = `Basic ${Buffer.from("agent:password").toString("base64")}`;
   assert.equal((await request(portNumber, "/dav", { method: "PROPFIND" })).status, 401);
@@ -104,6 +172,39 @@ test("WebDAV rejects disabled accounts for Basic-auth mutations", { timeout: 20_
   const createFolder = await request(portNumber, "/dav/should-not-exist", { method: "MKCOL", headers: { authorization: basic } });
   assert.equal(createFolder.status, 401);
   assert.equal(fs.existsSync(path.join(dir, "uploads", "should-not-exist")), false);
+});
+
+test("WebDAV Basic failures share normal login IP and username throttles", { timeout: 20_000 }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-login-throttle-"));
+  fs.mkdirSync(path.join(dir, "data"));
+  fs.mkdirSync(path.join(dir, "uploads"));
+  fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([
+    { username: "agent", password: bcrypt.hashSync("correct-password", 10), role: "admin", permissions: { listFiles: true }, sessionVersion: 0 },
+  ]));
+  fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
+  const portNumber = await port();
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: {
+    ...process.env,
+    PORT: String(portNumber),
+    DB_ENABLED: "false",
+    ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
+    WEBDAV_ENABLED: "true",
+    TOTP_POLICY: "optional",
+    TRUSTED_PROXIES: "127.0.0.1",
+    LOGIN_RATE_LIMIT_MAX: "20",
+    LOGIN_DELAY_BASE: "10",
+    LOGIN_BLOCK_THRESHOLD: "50",
+    JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+  }, stdio: "ignore", windowsHide: true });
+  t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
+  await ready(portNumber);
+  const wrong = `Basic ${Buffer.from("agent:wrong-password").toString("base64")}`;
+  assert.equal((await request(portNumber, "/dav/source.txt", { headers: { authorization: wrong, "x-forwarded-for": "198.51.100.10" } })).status, 401);
+  assert.equal((await request(portNumber, "/dav/source.txt", { headers: { authorization: wrong, "x-forwarded-for": "198.51.100.10" } })).status, 429);
+  const loginBody = JSON.stringify({ username: "agent", password: "correct-password" });
+  const login = await request(portNumber, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(loginBody), "x-forwarded-for": "198.51.100.11" }, body: loginBody });
+  assert.equal(login.status, 429, "a different trusted client IP cannot bypass the shared per-username progressive delay");
+  assert.ok(Number(login.headers["retry-after"]) >= 1);
 });
 
 test("WebDAV Basic auth cannot bypass a required TOTP policy", { timeout: 20_000 }, async (t) => {
