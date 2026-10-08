@@ -1,5 +1,40 @@
 # Root.ark Issue Ledger
 
+## Historical live snapshot — 2026-10-08 (after PR #117, source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`)
+
+This point-in-time snapshot was queried from GitHub after PR #117 merged. Later PR #116 publication and merge require a newer snapshot; checks below apply only to `1442869…`.
+
+### Open issues and pull requests at source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`
+
+| Item | Live state at query | Remaining acceptance boundary |
+|---|---|---|
+| #63 | `open` | Protected-index primitives do not complete search: UI population, FTS/advanced search, encrypted-index lifecycle, metadata-leakage acceptance, and full search acceptance remain open. |
+| #64 | `open` | No functioning native Android client or Android CI. |
+| #65 | `open` | Root.ark is not an end-to-end Zero-Knowledge runtime; supported server paths can access plaintext in legacy flows. |
+| #66 / PR #97 | `open` / `open` | Metadata-only listing/pagination, native Files On-Demand, external open-handle-safe eviction, and restart/reconnect acceptance remain incomplete. |
+| #67 | `open` | Burst detection, pause/review barrier, protected history, recovery authorization, and deterministic recovery UX remain incomplete. |
+| #68 | `open` | Existing bearer links are not operation-scoped capabilities. |
+| #94 / PR #95 | `open` / `open` | Process-local limits do not prove deployment-wide enforcement; topology remains unverified. |
+| PR #95 | `open`, head `95d99e4a934384fcfa2101dfc210741cd791a3d1`, stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; listed checks pass; 4 threads resolved. | Update to current base and provide shared/edge limits or verified single-process topology before merge. |
+| PR #97 | `open`, head `a6a33a92cd6902f303254e60031da4bdc04cec04`, stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; listed checks pass; 5 threads resolved. | Selective-sync acceptance gaps above remain. |
+| PR #102 | `open`, head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`, base `9de3c85ab59aa16fc46916abc0cf638c539086ef`; CodeQL fails, other listed checks pass; one unresolved thread at `services/internalFile.js:31`. | Update, resolve the finding/thread, and revalidate. |
+| PR #116 | `open` at head `daa6025e0c08c29a4d4cc0b55ec9fbb31b7e4fca`, base `9e070823f2ee6372521a53d2fc130701ed074aab`; no review threads. Earlier Ubuntu run failed on an async cloud-restore test race. | PR #117 corrected the race on main; publish the candidate merge and obtain new exact-head checks and review. |
+
+### Merged PRs and exact-SHA validation
+
+| PR | State | Merge commit |
+|---|---|---|
+| #114 | Merged — bootstrap, CSRF/mutation methods, proxy trust, main-push validation, restore recovery | `566a3d24591423c624ef3bcb82290a77ff359210` |
+| #115 | Merged — Windows lock-recovery test timeout | `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1` |
+| #99 | Merged — roadmap and issue reconciliation | `9e070823f2ee6372521a53d2fc130701ed074aab` |
+| #117 | Merged — waits for cloud-restore mutation records before test baseline | `14428690bef7c02648fd0be9570aabb17ae6de1a` |
+
+On exact `Root/main` SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`, Security Regression [#37720151580](https://github.com/bielxdh3/Root.ark/actions/runs/37720151580) succeeded: Ubuntu 938 total (927 passed, 11 skipped, 0 failed); Windows 938 total (934 passed, 4 skipped, 0 failed). CodeQL [#37720151634](https://github.com/bielxdh3/Root.ark/actions/runs/37720151634), dependency review [#37720151454](https://github.com/bielxdh3/Root.ark/actions/runs/37720151454), and Pages [#37720150655](https://github.com/bielxdh3/Root.ark/actions/runs/37720150655) succeeded. The moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` for transitive `sprintf-js` remains open; no first patched version is listed.
+
+Restore is rollback-recoverable for local domains with durable provider reconciliation, not globally atomic. See [the restore transaction boundary](backup-restore-transaction-boundary.md) and [closure report](validation/2026-10-08-rootark-mission-closure.md).
+
+---
+
 ## Historical live snapshot — 2026-10-08 (source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`)
 
 GitHub was queried after PR #115 merged into `Root/main` at `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`. This remains a timestamped historical snapshot, not a claim about the current default branch. The later mission state and exact-SHA validation are recorded in the [2026-10-08 closure validation report](validation/2026-10-08-rootark-mission-closure.md).
