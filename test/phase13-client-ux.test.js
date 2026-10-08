@@ -126,9 +126,9 @@ test("backup recovery stays blocked after an in-flight action returns a structur
   const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-management.js"), "utf8");
   for (const page of ["admin.html", "audit.html", "backups.html", "dashboard.html"]) {
     const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
-    assert.match(html, /rootark-management\.js\?v=18/);
+    assert.match(html, new RegExp(`rootark-management\\.js\\?v=${page === "audit.html" ? 19 : 18}`));
   }
-  assert.match(fs.readFileSync(path.join(__dirname, "..", "public", "service-worker.js"), "utf8"), /rootark-public-shell-v18/);
+  assert.match(fs.readFileSync(path.join(__dirname, "..", "public", "service-worker.js"), "utf8"), /rootark-public-shell-v19/);
   const listeners = new Map();
   const buttons = [{ disabled: false }, { disabled: false }, { disabled: false }];
   const target = {
@@ -259,7 +259,10 @@ test("offline queue and sync adapter reject plaintext, keys, and search terms", 
 test("service worker caches only the public shell and bypasses protected paths", async () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "public", "service-worker.js"), "utf8");
   const handlers = {};
-  const cached = [];
+  const caches = new Map([["rootark-public-shell-v18", new Map()]]);
+  const cacheValue = (asset) => ({ asset });
+  caches.get("rootark-public-shell-v18").set("https://rootark.test/styles/app.css", cacheValue("stale css"));
+  caches.get("rootark-public-shell-v18").set("https://rootark.test/client/rootark-management.js", cacheValue("stale management js"));
   const context = {
     URL,
     Promise,
@@ -270,21 +273,33 @@ test("service worker caches only the public shell and bypasses protected paths",
       clients: { claim: () => Promise.resolve() },
     },
     caches: {
-      open: async () => ({
-        addAll: async (assets) => cached.push(...assets),
-        put: async () => {},
-      }),
-      match: async () => null,
-      keys: async () => [],
-      delete: async () => true,
+      open: async (name) => {
+        if (!caches.has(name)) caches.set(name, new Map());
+        const cache = caches.get(name);
+        return {
+          addAll: async (assets) => assets.forEach((asset) => cache.set(new URL(asset, "https://rootark.test").href, cacheValue(asset))),
+          put: async (request, response) => cache.set(new URL(request.url).href, response),
+        };
+      },
+      match: async (request, options) => {
+        const url = new URL(request.url);
+        if (options && options.ignoreSearch) url.search = "";
+        for (const cache of caches.values()) {
+          const hit = cache.get(url.href);
+          if (hit) return hit;
+        }
+        return null;
+      },
+      keys: async () => [...caches.keys()],
+      delete: async (name) => caches.delete(name),
     },
-    fetch: async () => ({ ok: true, clone: () => ({}) }),
+    fetch: async () => { throw new Error("offline cache miss"); },
   };
-  assert.match(source, /const CACHE_NAME = "rootark-public-shell-v18";/, "security client changes advance the public shell cache revision");
+  assert.match(source, /const CACHE_NAME = "rootark-public-shell-v19";/, "security client changes advance the public shell cache revision");
   const pageAssets = {
     "index.html": [["rootark-api.js", 17], ["rootark-workspace.js", 17]],
     "admin.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
-    "audit.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
+    "audit.html": [["rootark-api.js", 17], ["rootark-management.js", 19]],
     "backups.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
     "dashboard.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
     "login.html": [["rootark-api.js", 17]],
@@ -293,19 +308,34 @@ test("service worker caches only the public shell and bypasses protected paths",
     const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
     for (const [script, version] of scripts) assert.match(html, new RegExp(`/client/${script.replaceAll(".", "\\.")}\\?v=${version}`), `${page} refreshes ${script}`);
   }
+  const auditHtml = fs.readFileSync(path.join(__dirname, "..", "public", "audit.html"), "utf8");
+  assert.match(auditHtml, /\/styles\/app\.css\?v=17/, "audit page refreshes the updated stylesheet");
   vm.runInNewContext(source, context);
   let installWait;
   handlers.install({ waitUntil: (promise) => { installWait = promise; } });
   await installWait;
-  assert.ok(cached.includes("/index.html"));
-  assert.ok(cached.includes("/styles/app.css"));
-  assert.ok(cached.includes("/client/rootark-api.js"));
-  assert.ok(cached.includes("/client/rootark-workspace.js"));
-  assert.ok(cached.includes("/client/rootark-bootstrap.js"));
-  assert.ok(cached.includes("/client/rootark-protected-index.js"));
-  assert.ok(cached.includes("/client/rootark-offline-queue.js"));
-  assert.ok(cached.includes("/client/rootark-protected-session.js"));
-  assert.equal(cached.some((asset) => /^\/(?:auth|api|files|preview|sync|encrypted|groups|folders)(?:\/|$)/i.test(new URL(asset, "https://rootark.test").pathname)), false);
+  assert.ok(caches.get("rootark-public-shell-v19").has("https://rootark.test/"));
+  assert.ok(caches.get("rootark-public-shell-v19").has("https://rootark.test/client/rootark-api.js"));
+  assert.ok(caches.get("rootark-public-shell-v19").has("https://rootark.test/client/rootark-workspace.js"));
+  assert.ok(caches.get("rootark-public-shell-v19").has("https://rootark.test/client/rootark-bootstrap.js"));
+  assert.ok(caches.get("rootark-public-shell-v19").has("https://rootark.test/client/rootark-protected-index.js"));
+  assert.ok(caches.get("rootark-public-shell-v19").has("https://rootark.test/client/rootark-offline-queue.js"));
+  assert.ok(caches.get("rootark-public-shell-v19").has("https://rootark.test/client/rootark-protected-session.js"));
+  assert.equal([...caches.get("rootark-public-shell-v19").keys()].some((asset) => /^https:\/\/rootark\.test\/(?:auth|api|files|preview|sync|encrypted|groups|folders)(?:\/|$)/i.test(new URL(asset).pathname)), false);
+  let activateWait;
+  handlers.activate({ waitUntil: (promise) => { activateWait = promise; } });
+  await activateWait;
+  assert.deepEqual([...caches.keys()], ["rootark-public-shell-v19"]);
+  const shellPages = ["index.html", "login.html", "dashboard.html", "audit.html", "admin.html", "backups.html"];
+  const versionedAssets = [...new Set(shellPages.flatMap((page) => {
+    const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
+    return [...html.matchAll(/<(?:script|link)\b[^>]*(?:src|href)="([^\"]+\?v=\d+)"[^>]*>/g)].map((match) => match[1]);
+  }))];
+  for (const asset of versionedAssets) {
+    let response;
+    handlers.fetch({ request: { method: "GET", url: "https://rootark.test" + asset }, respondWith: (promise) => { response = promise; } });
+    assert.equal((await response).asset, new URL(asset, "https://rootark.test").pathname, `${asset} is served from the upgraded cache while offline`);
+  }
   let fetchWait;
   handlers.fetch({ request: { method: "GET", url: "https://rootark.test/files/private.txt" }, respondWith: (promise) => { fetchWait = promise; } });
   assert.equal(fetchWait, undefined);

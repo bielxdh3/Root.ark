@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_NAME = "rootark-public-shell-v18";
+const CACHE_NAME = "rootark-public-shell-v19";
 const SHELL_ASSETS = [
   "/",
   "/index.html",
@@ -42,7 +42,7 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(request.url);
   if (request.method !== "GET" || url.origin !== self.location.origin || BLOCKED_PATHS.some((pattern) => pattern.test(url.pathname))) return;
   if (!SHELL_ASSETS.some((asset) => new URL(asset, self.location.origin).pathname === url.pathname)) return;
-  event.respondWith(caches.match(request).then((cached) => cached || fetch(request).then((response) => {
+  event.respondWith(caches.match(request, { ignoreSearch: true }).then((cached) => cached || fetch(request).then((response) => {
     if (response.ok) caches.open(CACHE_NAME).then((cache) => cache.put(request, response.clone()));
     return response;
   })));
