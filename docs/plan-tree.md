@@ -62,7 +62,7 @@ A feature is not `[DONE]` merely because files, routes, UI, or documentation exi
 5. GitHub issues for executable scope.
 6. Historical chat context only as input, never as proof.
 
-The newest issue reconciliation snapshot is `docs/issue-ledger.md` (queried against GitHub on 2026-10-08 at source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`; point-in-time and superseded by later PR publication/merge). The canonical Phase 11 Issue #6 reconciliation remains historical evidence: `docs/roadmap/phase-11-backlog-reconciliation.md` records `PHASE_11_BACKLOG_RECONCILED` at the accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
+The latest full issue reconciliation snapshot recorded in `docs/issue-ledger.md` is after PR #127, queried against GitHub on 2026-10-08 at source SHA `25e50cbaa26062202d470330e93d7beb4575693a`. The older source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a` is historical and superseded. Later closure PRs update validation and documentation evidence; re-query GitHub before relying on this point-in-time issue, PR, or check state. The canonical Phase 11 Issue #6 reconciliation remains historical evidence: `docs/roadmap/phase-11-backlog-reconciliation.md` records `PHASE_11_BACKLOG_RECONCILED` at the accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
 
 Master Phase 0-16 ledger and independent local blocker taxonomy: `docs/issue-ledger.md`. The governing continuation supplies the original meanings for all phases; local statuses and evidence are reconciled there without converting design or historical evidence into acceptance.
 
