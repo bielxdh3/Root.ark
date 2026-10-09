@@ -1037,14 +1037,27 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const failedDeleteDeadline = Date.now() + 5000;
   while (cloud.deleteAttemptCount(failedDeleteKey) === priorDeleteAttempts && Date.now() < failedDeleteDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.ok(cloud.deleteAttemptCount(failedDeleteKey) > priorDeleteAttempts, "provider delete failure is injected");
+  const failedDeleteLifecycleLockDirectory = path.join(dataDir, ".rootark-cloud-file-locks");
+  const failedDeleteLifecycleLockPaths = ["folder:root", `root\0${failedDeleteName}`].map((identity) =>
+    path.join(failedDeleteLifecycleLockDirectory, `${crypto.createHash("sha256").update(identity).digest("hex")}.lock`));
+  const failedDeleteLockReleaseDeadline = Date.now() + 5000;
+  while (failedDeleteLifecycleLockPaths.some((lockPath) => fs.existsSync(lockPath)) && Date.now() < failedDeleteLockReleaseDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(failedDeleteLifecycleLockPaths.every((lockPath) => !fs.existsSync(lockPath)),
+    "the failed delete must release its folder and file lifecycle locks before child restart");
+  await stop(child);
   const attemptsBeforeRestart = cloud.deleteAttemptCount(failedDeleteKey);
+  assert.equal(objects.has(failedDeleteKey), true, "the provider object remains while delete failures are active");
+  const failedDeleteQueuePath = path.join(cloudQueueDirectory, `${crypto.createHash("sha256").update(`root\0${failedDeleteName}`).digest("hex")}.json`);
+  assert.ok(fs.existsSync(failedDeleteQueuePath), "the failed delete intent remains durably queued before restart");
+  assert.equal(JSON.parse(fs.readFileSync(failedDeleteQueuePath, "utf8")).desired, "absent");
   const stalePendingPath = path.join(directory, "temp", failedDeleteName);
   fs.writeFileSync(stalePendingPath, "stale rejected bytes");
   const pendingRegistry = JSON.parse(fs.readFileSync(pendingRegistryPath, "utf8"));
   pendingRegistry[`root/${failedDeleteName}`] = { uploadedBy: "tester", folderId: "root", uploadedAt: new Date().toISOString() };
   fs.writeFileSync(pendingRegistryPath, JSON.stringify(pendingRegistry));
   cloud.clearDeleteFailures(failedDeleteKey);
-  await stop(child);
   child = startChild();
   childErrors = "";
   child.stderr?.on("data", (chunk) => { childErrors += chunk.toString(); });
