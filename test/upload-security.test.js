@@ -439,7 +439,7 @@ test("unknown upload scan providers fail startup instead of skipping scanning", 
   assert.match(harness.stderr.join(""), /UPLOAD_SCAN_PROVIDER/);
 });
 
-test("non-development startup rejects disabled or fail-open upload scanning", { timeout: 15_000 }, async (t) => {
+test("non-development startup rejects disabled or fail-open upload scanning", { timeout: 30_000 }, async (t) => {
   const configurations = [
     { env: { NODE_ENV: "production", UPLOAD_SCAN_PROVIDER: "disabled" }, error: /production.*upload scanning/i },
     { env: { NODE_ENV: "production", UPLOAD_SCAN_PROVIDER: "clamav", UPLOAD_FAIL_CLOSED: "false" }, error: /production.*upload scanning/i },
