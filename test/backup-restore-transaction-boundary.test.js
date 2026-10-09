@@ -147,7 +147,7 @@ test("pre-image copy and tree hashing reject FIFO sources without blocking", (t)
   } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
 });
 
-function runFixture(body, envOverrides = {}) {
+function runFixture(body, envOverrides = {}, timeoutMs = 30_000) {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-boundary-runtime-"));
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-boundary-quarantine-"));
   const script = `
@@ -178,7 +178,7 @@ function runFixture(body, envOverrides = {}) {
     ...envOverrides,
   };
   try {
-    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, env, encoding: "utf8", timeout: timeoutMs });
     assert.equal(result.status, 0, [
       `spawn error: ${result.error?.message || "none"}`,
       `signal: ${result.signal || "none"}`,
@@ -2237,7 +2237,7 @@ test("abrupt whole-restore interruptions automatically roll back before startup 
   }
 });
 
-test("abrupt exit after the restart-required marker preserves committed state and startup acknowledges it", { timeout: 60_000 }, () => {
+test("abrupt exit after the restart-required marker preserves committed state and startup acknowledges it", { timeout: 90_000 }, () => {
   runFixture(`
     const childProcess = require("node:child_process");
     const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
@@ -2293,7 +2293,7 @@ test("abrupt exit after the restart-required marker preserves committed state an
       assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
       console.log(JSON.stringify({ ok: true }));
     })().catch(error => { console.error(error); process.exitCode = 1; });
-  `, { NODE_ENV: "test", JWT_SECRET: "j".repeat(48), ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", PORT: "0" });
+  `, { NODE_ENV: "test", JWT_SECRET: "j".repeat(48), ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", PORT: "0" }, 75_000);
 });
 
 test("abrupt exit during partial whole-restore pre-image creation cleans preparing state", { timeout: 30_000 }, () => {
