@@ -4244,7 +4244,13 @@ function quarantineUploadedFile(req, options) {
 async function scanUploadBeforePending(req, options) {
   const fileName = path.basename(options.fileName || options.originalName || "");
   const folderId = options.folderId || ROOT_FOLDER_ID;
-  const extension = path.extname(fileName.replace(/[. ]+$/u, "")).toLowerCase();
+  let extensionNameEnd = fileName.length;
+  while (extensionNameEnd > 0) {
+    const lastCharacter = fileName[extensionNameEnd - 1];
+    if (lastCharacter !== "." && lastCharacter !== " ") break;
+    extensionNameEnd -= 1;
+  }
+  const extension = path.extname(fileName.slice(0, extensionNameEnd)).toLowerCase();
   const auditTarget = { type: "file", id: fileName };
 
   if (UPLOAD_BLOCK_EXECUTABLES && UPLOAD_SUSPICIOUS_EXTENSIONS.has(extension)) {
