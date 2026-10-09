@@ -234,8 +234,10 @@ function stop(child) {
 test("cloud-backed file routes authorize access and bound repeated metadata listings", { timeout: 60_000 }, async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-get-acl-"));
   const unregisteredMagicNames = ["constructor", "toString", "__proto__"];
+  const sentinelFiles = ["legacy-missing-owner.txt", "legacy-blank-owner.txt", "legacy-sentinel-case.txt", "legacy-sentinel-space.txt"];
   for (const name of unregisteredMagicNames) OBJECTS.set(`rootark/temp/root/${name}`, Buffer.from("unregistered pending fixture"));
   t.after(() => {
+    for (const name of sentinelFiles) OBJECTS.delete(`rootark/uploads/root/${name}`);
     for (const name of unregisteredMagicNames) OBJECTS.delete(`rootark/temp/root/${name}`);
   });
   const dataDir = path.join(directory, "data");
@@ -1266,6 +1268,37 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   assert.equal(listedReadOnlyFile.status, 200, listedReadOnlyFile.body);
   assert.equal(JSON.parse(listedReadOnlyFile.body).find((file) => file.name === "read-only-share.txt")?.canEdit, false);
   assert.equal(JSON.parse(listedReadOnlyFile.body).find((file) => file.name === "read-only-share.txt")?.canShare, false);
+
+  const createSentinelOwner = await mutateAsOwner("/users", "POST", { username: "sistema", password, role: "user", permissions: { listFiles: true } });
+  assert.equal(createSentinelOwner.status, 201, createSentinelOwner.body);
+  for (const name of sentinelFiles) OBJECTS.set(`rootark/uploads/root/${name}`, Buffer.from("disposable sentinel owner fixture"));
+  const sentinelPermissions = JSON.parse(fs.readFileSync(path.join(dataDir, "file-permissions.json"), "utf8"));
+  sentinelPermissions["root/legacy-blank-owner.txt"] = { public: false, owner: "   ", users: {} };
+  sentinelPermissions["root/legacy-sentinel-case.txt"] = { public: false, owner: "Sistema", users: {} };
+  sentinelPermissions["root/legacy-sentinel-space.txt"] = { public: false, owner: " SISTEMA ", users: {} };
+  fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify(sentinelPermissions));
+
+  const sistemaBody = JSON.stringify({ username: "sistema", password });
+  const sistemaLogin = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(sistemaBody) }, body: sistemaBody });
+  assert.equal(sistemaLogin.status, 200, sistemaLogin.body);
+  const sistemaCookies = sistemaLogin.headers["set-cookie"].map((value) => value.split(";", 1)[0]);
+  const sistemaCookie = sistemaCookies.join("; ");
+  const sistemaCsrf = sistemaCookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1];
+  const mutateAsSistema = (requestPath, method, payload) => {
+    const body = JSON.stringify(payload);
+    return request(port, requestPath, {
+      method,
+      headers: { cookie: sistemaCookie, origin: `http://127.0.0.1:${port}`, "x-csrf-token": sistemaCsrf, "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+      body,
+    });
+  };
+  const listedSentinelFiles = await request(port, "/list?folderId=root", { headers: { cookie: sistemaCookie } });
+  assert.equal(listedSentinelFiles.status, 200, listedSentinelFiles.body);
+  for (const name of sentinelFiles) {
+    assert.notEqual(JSON.parse(listedSentinelFiles.body).find((file) => file.name === name)?.canShare, true, `${name} does not expose share authority through the sistema sentinel`);
+    const response = await mutateAsSistema("/share", "POST", { name, expiresInMinutes: 60 });
+    assert.ok([403, 404].includes(response.status), `${name} sentinel owner is not a real sistema account identity: ${response.body}`);
+  }
 
   const editorShare = await mutateAsShareEditor("/share", "POST", { name: "session-target.txt", expiresInMinutes: 60 });
   assert.equal(editorShare.status, 403, "delegated file editing does not grant public bearer-link authority");

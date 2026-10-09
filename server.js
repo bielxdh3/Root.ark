@@ -3751,7 +3751,8 @@ function hasPublicShareAccess(req, folder, fileName, entries = loadFilePermissio
   if (!hasFolderAccess(req, folder) || isFileExpired(folder.id, fileName, expirationEntries)) return false;
   if (restoreProviderOrphans.isSuppressed(folder.id, fileName, "uploads", orphanSnapshot)) return canManageAccess(req);
   if (canManageAccess(req)) return true;
-  return sameUsername(normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, fileName, entries)).owner, req.user?.username);
+  const owner = getFilePermissionEntry(folder.id, fileName, entries)?.owner;
+  return typeof owner === "string" && owner.trim() !== "" && !sameUsername(owner, "sistema") && sameUsername(owner, req.user?.username);
 }
 
 function hasReadableFolderAccess(req, folder) {
