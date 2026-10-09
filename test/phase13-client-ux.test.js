@@ -602,7 +602,7 @@ test("service worker caches only the public shell and bypasses protected paths",
   };
   assert.match(source, /const CACHE_NAME = "rootark-public-shell-v20";/, "security and navigation client changes advance the public shell cache revision");
   const pageAssets = {
-    "index.html": [["rootark-api.js", 17], ["rootark-workspace.js", 17], ["rootark-ui.js", 17]],
+    "index.html": [["rootark-api.js", 17], ["rootark-workspace.js", 18], ["rootark-ui.js", 17]],
     "admin.html": [["rootark-api.js", 17], ["rootark-management.js", 18], ["rootark-ui.js", 17]],
     "audit.html": [["rootark-api.js", 17], ["rootark-management.js", 19], ["rootark-ui.js", 17]],
     "backups.html": [["rootark-api.js", 17], ["rootark-management.js", 18], ["rootark-ui.js", 17]],

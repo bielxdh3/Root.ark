@@ -219,7 +219,7 @@
     let actions = (isEncrypted(file) ? "" : actionButton("preview-file", "Pré-visualizar", attrs, "button-quiet")) +
       actionButton("download-file", isEncrypted(file) ? "Descriptografar e baixar" : "Baixar", attrs, "button-quiet") +
       actionButton("file-versions", "Versões", attrs, "button-quiet");
-    if (!isEncrypted(file)) actions += actionButton("share-file", "Compartilhar", attrs, "button-quiet");
+    if (!isEncrypted(file) && file.canShare) actions += actionButton("share-file", "Compartilhar", attrs, "button-quiet");
     if (file.canManageAccess || ownerOf(file) === state.user.username) actions += actionButton("file-access", "Permissões", attrs, "button-quiet");
     if (file.canEdit) {
       actions += actionButton("file-expiration", "Expiração", attrs, "button-quiet") +

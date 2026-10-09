@@ -279,7 +279,8 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     "root/share-race-second.txt": { public: false, owner: "owner", users: {} },
     "root/encrypted-grant-session-revocation.txt": { public: false, owner: "owner", users: {} },
     "root/revoke-preview.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
-    "root/revoke-share.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
+    "root/read-only-share.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
+    "root/revoke-share.txt": { public: false, owner: "editor", users: {} },
     "root/revoke-version.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
     "root/revoke-version-token.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
     "root/revoke-encrypted.txt": { public: false, owner: "owner", users: { viewer: { read: true, edit: false } } },
@@ -474,6 +475,21 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     });
   };
 
+  const shareEditorBody = JSON.stringify({ username: "editor", password });
+  const shareEditorLogin = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(shareEditorBody) }, body: shareEditorBody });
+  assert.equal(shareEditorLogin.status, 200, shareEditorLogin.body);
+  const shareEditorCookies = shareEditorLogin.headers["set-cookie"].map((value) => value.split(";", 1)[0]);
+  const shareEditorCookie = shareEditorCookies.join("; ");
+  const shareEditorCsrf = shareEditorCookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1];
+  const mutateAsShareEditor = (requestPath, method, payload) => {
+    const body = JSON.stringify(payload);
+    return request(port, requestPath, {
+      method,
+      headers: { cookie: shareEditorCookie, origin: `http://127.0.0.1:${port}`, "x-csrf-token": shareEditorCsrf, "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+      body,
+    });
+  };
+
   const concurrentShareFolderResponse = await mutateAsOwner("/folders", "POST", { name: "share-created-during-download-folder" });
   assert.equal(concurrentShareFolderResponse.status, 201, concurrentShareFolderResponse.body);
   const concurrentShareFolderId = JSON.parse(concurrentShareFolderResponse.body).id;
@@ -624,6 +640,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   OBJECTS.set("rootark/uploads/root/share-race-second.txt", Buffer.from("second concurrent share fixture"));
   OBJECTS.set("rootark/uploads/root/encrypted-grant-session-revocation.txt", Buffer.from("encrypted grant session revocation fixture"));
   OBJECTS.set("rootark/uploads/root/revoke-preview.txt", Buffer.from("preview access revocation fixture"));
+  OBJECTS.set("rootark/uploads/root/read-only-share.txt", Buffer.from("read-only share authorization fixture"));
   OBJECTS.set("rootark/uploads/root/revoke-share.txt", Buffer.from("share access revocation fixture"));
   OBJECTS.set("rootark/uploads/root/revoke-version.txt", Buffer.from("version current revocation fixture"));
   OBJECTS.set("rootark/uploads/root/revoke-version.txt.v1", Buffer.from("version history revocation fixture"));
@@ -986,6 +1003,14 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     fs.writeFileSync(filePermissionsPath, JSON.stringify(permissions));
   };
 
+  const revokeFileShareOwnerDuringHydration = (name) => {
+    const permissions = JSON.parse(fs.readFileSync(filePermissionsPath, "utf8"));
+    permissions[`root/${name}`].owner = "owner";
+    permissions[`root/${name}`].public = false;
+    permissions[`root/${name}`].users = {};
+    fs.writeFileSync(filePermissionsPath, JSON.stringify(permissions));
+  };
+
   const validOrphanPolicy = fs.readFileSync(orphanPolicyPath, "utf8");
   const pendingRegistryPath = path.join(dataDir, "pending-uploads.json");
   const validPendingRegistry = fs.readFileSync(pendingRegistryPath, "utf8");
@@ -1071,9 +1096,9 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   assert.equal(deniedShare.status, 403, deniedShare.body);
   const shareGate = cloud.blockList("rootark/uploads/root/");
   const hashCallsBeforeRevokedShare = fs.existsSync(hashCallsFile) ? fs.readFileSync(hashCallsFile, "utf8").length : 0;
-  const revokedShareRequest = mutate("/share", "POST", { name: "revoke-share.txt", expiresInMinutes: 60, password: "valid-password" });
+  const revokedShareRequest = mutateAsShareEditor("/share", "POST", { name: "revoke-share.txt", expiresInMinutes: 60, password: "valid-password" });
   await shareGate.started;
-  revokeFileAccessDuringHydration("revoke-share.txt");
+  revokeFileShareOwnerDuringHydration("revoke-share.txt");
   shareGate.release();
   const revokedShare = await revokedShareRequest;
   assert.equal(revokedShare.status, 403, revokedShare.body);
@@ -1209,17 +1234,17 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   assert.equal(cloud.listRequests.length, expirationListingAtLimit, "limited expiration update is rejected before provider listing");
   assert.equal(fs.readFileSync(path.join(dataDir, "file-expirations.json"), "utf8"), expirationStateAtLimit, "limited expiration update does not persist state");
 
-  for (let index = 1; index < CLOUD_METADATA_REQUEST_LIMIT - 1; index += 1) {
+  for (let index = 1; index < CLOUD_METADATA_REQUEST_LIMIT; index += 1) {
     const response = await mutate("/share", "POST", { name: "public.txt", expiresInMinutes: 60 });
     assert.equal(response.status, 201, response.body);
   }
   const shareStateAtLimit = JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"));
   const shareCountAtLimit = Object.values(shareStateAtLimit).filter((link) => link.fileName === "public.txt" && link.createdBy === "viewer").length;
-  assert.equal(shareCountAtLimit, CLOUD_METADATA_REQUEST_LIMIT - 1);
+  assert.equal(shareCountAtLimit, CLOUD_METADATA_REQUEST_LIMIT);
   const shareListingAtLimit = cloud.listRequests.length;
   const hashCallsAtLimit = fs.existsSync(hashCallsFile) ? fs.readFileSync(hashCallsFile, "utf8").length : 0;
   const limitedShare = await mutate("/share", "POST", { name: "public.txt", expiresInMinutes: 60, maxViews: 5, password: "valid-password" });
-  assert.equal(limitedShare.status, 429, limitedShare.body);
+  assert.equal(limitedShare.status, 429, "public-share creation is rate limited before it can issue another bearer link");
   assert.equal(fs.existsSync(hashCallsFile) ? fs.readFileSync(hashCallsFile, "utf8").length : 0, hashCallsAtLimit, "limited share does not hash a password");
   assert.equal(cloud.listRequests.length, shareListingAtLimit, "limited share creation is rejected before provider listing");
   const shareStateAfterLimit = JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"));
@@ -1229,6 +1254,22 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const deniedPasswordShare = await mutate("/share", "POST", { name: "private.txt", expiresInMinutes: 60, password: "valid-password" });
   assert.equal(deniedPasswordShare.status, 403, deniedPasswordShare.body);
   assert.equal(fs.existsSync(hashCallsFile) ? fs.readFileSync(hashCallsFile, "utf8").length : 0, hashCallsBeforeDeniedShare, "unauthorized share does not hash a password");
+
+  const shareCountBeforeReadOnlyRequest = Object.keys(JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"))).length;
+  const listingsBeforeReadOnlyRequest = cloud.listRequests.length;
+  const deniedReadOnlyShare = await mutate("/share", "POST", { name: "read-only-share.txt", expiresInMinutes: 60 });
+  assert.equal(deniedReadOnlyShare.status, 403, "read-only ACL cannot create a public bearer link");
+  assert.equal(cloud.listRequests.length, listingsBeforeReadOnlyRequest, "read-only ACL denial happens before provider listing");
+  const sharesAfterReadOnlyRequest = JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"));
+  assert.equal(Object.keys(sharesAfterReadOnlyRequest).length, shareCountBeforeReadOnlyRequest, "read-only ACL denial does not persist a bearer link");
+  const listedReadOnlyFile = await request(port, "/list?folderId=root", { headers: { cookie } });
+  assert.equal(listedReadOnlyFile.status, 200, listedReadOnlyFile.body);
+  assert.equal(JSON.parse(listedReadOnlyFile.body).find((file) => file.name === "read-only-share.txt")?.canEdit, false);
+  assert.equal(JSON.parse(listedReadOnlyFile.body).find((file) => file.name === "read-only-share.txt")?.canShare, false);
+
+  const editorShare = await mutateAsShareEditor("/share", "POST", { name: "session-target.txt", expiresInMinutes: 60 });
+  assert.equal(editorShare.status, 403, "delegated file editing does not grant public bearer-link authority");
+  assert.equal(Object.keys(JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"))).length, shareCountBeforeReadOnlyRequest, "delegated editor denial does not persist a bearer link");
 
   const editorBody = JSON.stringify({ username: "editor", password });
   const editorLogin = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(editorBody) }, body: editorBody });
