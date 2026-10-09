@@ -166,6 +166,61 @@ test("mobile navigation backdrop close restores focus to the menu button", () =>
   assert.equal(document.activeElement, menuButton);
 });
 
+test("skip-link fragment keeps the route mounted while history and trash hashes still load", async () => {
+  const workspaceSource = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-workspace.js"), "utf8");
+  const hashListeners = new Map();
+  const requests = [];
+  const root = { addEventListener() {} };
+  let mounts = 0;
+  const window = {
+    location: { hash: "", host: "127.0.0.1", protocol: "http:" },
+    RootarkApi: {
+      async get(requestPath) {
+        requests.push(requestPath);
+        if (requestPath === "/folders") return [{ id: "root", name: "Arquivos atuais", isRoot: true }];
+        if (requestPath === "/trash") return { items: [], canManageTrash: false };
+        return [];
+      },
+      query(requestPath) { return requestPath; },
+    },
+    RootarkUI: {
+      async getSession() { return { username: "qa-admin", role: "admin", permissions: { listFiles: true } }; },
+      escape(value) { return String(value == null ? "" : value); },
+      formatBytes() { return "0 B"; },
+      formatDate() { return ""; },
+      mount() { mounts += 1; },
+    },
+    WebSocket: null,
+    addEventListener(name, listener) { hashListeners.set(name, listener); },
+    dispatchEvent() {},
+    setTimeout,
+    clearTimeout,
+  };
+  const document = { getElementById() { return root; }, addEventListener() {} };
+  vm.runInNewContext(workspaceSource, { window, document, Event, setTimeout, clearTimeout, FormData });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const routeHandler = hashListeners.get("hashchange");
+  assert.equal(typeof routeHandler, "function");
+  const baselineRequests = requests.length;
+  const baselineMounts = mounts;
+
+  window.location.hash = "#main";
+  await routeHandler();
+  assert.equal(requests.length, baselineRequests);
+  assert.equal(mounts, baselineMounts);
+
+  window.location.hash = "#/history";
+  await routeHandler();
+  assert.ok(requests.includes("/history"));
+
+  window.location.hash = "#/trash";
+  await routeHandler();
+  assert.ok(requests.includes("/trash"));
+
+  assert.ok(mounts > baselineMounts);
+});
+
 test("mobile navigation keeps focus on an activated topbar action", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-ui.js"), "utf8");
   const listeners = new Map();
