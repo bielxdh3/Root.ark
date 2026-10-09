@@ -1,8 +1,18 @@
 # Root.ark Issue Ledger
 
-## Latest closure verification snapshot — after PR #129 (2026-10-08)
+## Latest verified GitHub snapshot — after PR #142 (2026-10-09; source SHA `8771d87084e458202d77ab956e3d341c0fe4868f`)
 
-The exact post-#129 `Root/main` state and closure evidence are recorded in [the final closure snapshot](validation/2026-10-08-rootark-final-closure-post-129.md), at `f543f0f4045d12ecbaf6f8b793d3d24aecb98e25`. The older PR #127 issue reconciliation below remains a historical snapshot, not current live GitHub state. Re-query GitHub before relying on issue, PR, alert, or check status after this snapshot.
+Queried live after PR #142 merged. This is a time-scoped snapshot of application code before the current documentation-only follow-up; re-query GitHub after later changes. Detailed validation and remaining closure limits are in [the current validation snapshot](validation/2026-10-09-rootark-current-state.md).
+
+PR #141 merged from head `f1a4fbaa22e2cfc78b53703b28639d935bfdd009` at `6005b5ea0fd69653066ae5283c101f43510d73aa`. PR #142 merged from head `e511134f56f5eae44569e3c1614295022fccb328` at current source SHA `8771d87084e458202d77ab956e3d341c0fe4868f`. Exact `Root/main` Security Regression [run #37931149881](https://github.com/bielxdh3/Root.ark/actions/runs/37931149881) passed Ubuntu (1,028 passed, 11 skipped, 0 failed) and Windows (1,032 passed, 7 skipped, 0 failed). CodeQL [run #37931149727](https://github.com/bielxdh3/Root.ark/actions/runs/37931149727), default-branch Dependency Review [run #37931149738](https://github.com/bielxdh3/Root.ark/actions/runs/37931149738), and Pages [run #37931148943](https://github.com/bielxdh3/Root.ark/actions/runs/37931148943) passed on that exact SHA.
+
+Issues #63 protected search, #64 native Android, #65 Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change protection, #68 capability sharing, and #94 deployment-wide chunk-upload limits remain open. PR #95 remains open with head `95d99e4a934384fcfa2101dfc210741cd791a3d1`, stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`, and merge state `DIRTY`; PR #97 remains open with head `a6a33a92cd6902f303254e60031da4bdc04cec04`, the same stale base, and merge state `CLEAN`. Their listed checks are from 2026-10-01, before the current base; all four #95 and all five #97 review threads were resolved at the last query. Do not merge or close either until current-base validation and the remaining acceptance criteria are satisfied. The moderate `sprintf-js` Dependabot alert `GHSA-hp3w-g68c-fv3c` remains open with no first patched version listed.
+
+Restore remains locally rollback-recoverable across quarantine, filesystem, JSON/SQLite, and restart recovery, with durable provider reconciliation; it is not globally atomic, and provider interoperability remains unverified. Closure is **PARTIAL**: the local official release-gate result is unresolved, quarantine ingestion has not been proven in a browser, and post-documentation-merge exact-SHA validation and fresh independent final review remain pending.
+
+## Historical closure snapshot — after PR #129 (2026-10-08)
+
+The exact post-#129 `Root/main` state and closure evidence are recorded in [the final closure snapshot](validation/2026-10-08-rootark-final-closure-post-129.md), at `f543f0f4045d12ecbaf6f8b793d3d24aecb98e25`. This and the older PR #127 reconciliation below are historical snapshots, not current live GitHub state. Re-query GitHub before relying on issue, PR, alert, or check status after those snapshots.
 
 ## Verified GitHub snapshot used for this documentation follow-up — after PR #127 (2026-10-08, `Root/main` `25e50cbaa26062202d470330e93d7beb4575693a`)
 

@@ -1,13 +1,13 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Last branch reconciliation: 2026-10-08 (after PR #129)
+Last branch reconciliation: 2026-10-09 (after PR #142)
 
 Repository: `bielxdh3/root.ark`
 
-The latest recorded closure snapshot is after PR #129 merged, at `Root/main` SHA `f543f0f4045d12ecbaf6f8b793d3d24aecb98e25`; see [the exact validation and GitHub record](validation/2026-10-08-rootark-final-closure-post-129.md). On that SHA, Security Regression, CodeQL, Dependency Review, and Pages passed, and the local release gate passed 21/21. The snapshot also records the remaining browser acceptance gaps, open issues and PRs, and restore boundary. It is time-scoped; re-query GitHub before relying on it after later changes.
+The latest verified application-code snapshot is after PR #142 merged, at `Root/main` SHA `8771d87084e458202d77ab956e3d341c0fe4868f`; see [the current validation and GitHub record](validation/2026-10-09-rootark-current-state.md). Exact-SHA Security Regression, CodeQL, Dependency Review, and Pages passed. Closure remains `[PARTIAL]`: the official local release gate has not produced a clean final-head result, quarantine ingestion is unproven in the browser, whole restore is not globally atomic, and final post-documentation-SHA validation and independent review remain pending. This is a point-in-time snapshot before the documentation follow-up; re-query GitHub after later changes.
 
-The post-#129 snapshot recorded security-correction code, restore-provider recovery, and main-push CI as merged, while closure remained `[PARTIAL]`: a scoped review had identified a release-gate classification edge case and browser acceptance still had explicit untested flows. Whole restore has local compensation/restart recovery and durable provider reconciliation, but is not atomic across storage domains. The snapshot records issues #63–68 and #94 open and PRs #95 and #97 on stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`. Do not use either the post-#127 or post-#129 point-in-time snapshot as current live state without re-querying GitHub.
+The post-#129 and post-#127 sections below are historical snapshots. Their recorded issue, PR, browser, and release-gate states are not current live state; use the post-#142 snapshot above for the 2026-10-09 reconciliation.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
@@ -62,7 +62,7 @@ A feature is not `[DONE]` merely because files, routes, UI, or documentation exi
 5. GitHub issues for executable scope.
 6. Historical chat context only as input, never as proof.
 
-The latest full issue reconciliation snapshot recorded in `docs/issue-ledger.md` is after PR #129, queried against GitHub on 2026-10-08 at source SHA `f543f0f4045d12ecbaf6f8b793d3d24aecb98e25`; the older post-#127 SHA `25e50cbaa26062202d470330e93d7beb4575693a` and source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a` are historical. Later closure PRs can make point-in-time issue, PR, and check state stale; re-query GitHub before relying on it. The canonical Phase 11 Issue #6 reconciliation remains historical evidence: `docs/roadmap/phase-11-backlog-reconciliation.md` records `PHASE_11_BACKLOG_RECONCILED` at the accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
+The current full issue reconciliation snapshot recorded in `docs/issue-ledger.md` is after PR #142, queried against GitHub on 2026-10-09 at application source SHA `8771d87084e458202d77ab956e3d341c0fe4868f`; the post-#129 SHA `f543f0f4045d12ecbaf6f8b793d3d24aecb98e25`, post-#127 SHA `25e50cbaa26062202d470330e93d7beb4575693a`, and source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a` are historical. Later closure PRs can make point-in-time issue, PR, and check state stale; re-query GitHub before relying on it. The canonical Phase 11 Issue #6 reconciliation remains historical evidence: `docs/roadmap/phase-11-backlog-reconciliation.md` records `PHASE_11_BACKLOG_RECONCILED` at the accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
 
 Master Phase 0-16 ledger and independent local blocker taxonomy: `docs/issue-ledger.md`. The governing continuation supplies the original meanings for all phases; local statuses and evidence are reconciled there without converting design or historical evidence into acceptance.
 

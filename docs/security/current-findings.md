@@ -6,6 +6,7 @@ This public document intentionally does not retain exploit-ready reproduction st
 
 ## Current position
 
+- The latest reconciled application-code snapshot is `Root/main` SHA `8771d87084e458202d77ab956e3d341c0fe4868f`, after PRs #141 and #142. Exact-SHA Security Regression, CodeQL, Dependency Review, and Pages passed; closure remains partial while the official local release-gate result, quarantine-ingestion browser proof, and final post-documentation-SHA review remain outstanding. See [the current validation snapshot](../validation/2026-10-09-rootark-current-state.md).
 - Root.ark is still under active development and is not production-ready.
 - The default expectation is a private, administrator-controlled deployment on a trusted network.
 - A strong explicit `JWT_SECRET` is required; no public fallback secret should be used.
