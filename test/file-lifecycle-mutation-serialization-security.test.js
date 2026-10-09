@@ -477,11 +477,15 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   assert.equal(trashAfterApprovalFailure.status, "remote_delete_pending");
   assert.equal(trashAfterApprovalFailure.metadata.remoteDeletion.state, "pending");
   assert.equal(cloud.deleteAttemptCount(approvalProviderKey), approvalDeleteAttempts, "approval does not delete the provider replacement while trash cancellation is pending");
-  const replacementRead = await request(port, `/files/${encodeURIComponent(approveTrashRecoveryName)}?folderId=root`, { headers: { cookie } });
+  const replacementRead = await request(port, `/files/${encodeURIComponent(approveTrashRecoveryName)}?folderId=root`, {
+    headers: { cookie, origin: `http://127.0.0.1:${port}`, "sec-fetch-site": "same-origin" },
+  });
   assert.equal(replacementRead.status, 200, replacementRead.body);
   assert.equal(replacementRead.body, "replacement bytes after cancellation failure");
   const replacementReadPath = "/files/" + encodeURIComponent(approveTrashRecoveryName) + "?folderId=root";
-  const unauthorizedReplacementRead = await request(port, replacementReadPath, { headers: { cookie: limitedCookie } });
+  const unauthorizedReplacementRead = await request(port, replacementReadPath, {
+    headers: { cookie: limitedCookie, origin: `http://127.0.0.1:${port}`, "sec-fetch-site": "same-origin" },
+  });
   assert.equal(unauthorizedReplacementRead.status, 403, unauthorizedReplacementRead.body);
   const firstUploadDeadline = Date.now() + 5000;
   while (cloud.uploadAttemptCount(approvalProviderKey) === 0 && Date.now() < firstUploadDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -641,7 +645,9 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   assert.equal(JSON.parse(orphanReplacementApproval.body).cloudSyncPending, true, "approval reports its durable provider reconciliation");
   assert.equal(fs.existsSync(orphanReplacementQueuePath), true, "provider intent is durable before approval responds");
   assert.equal(fs.readFileSync(path.join(directory, "uploads", orphanReplacementName), "utf8"), "approved replacement bytes");
-  const limitedOrphanBeforeProviderRetry = await request(port, `/files/${orphanReplacementName}`, { headers: { cookie: limitedCookie } });
+  const limitedOrphanBeforeProviderRetry = await request(port, `/files/${orphanReplacementName}`, {
+    headers: { cookie: limitedCookie, origin: `http://127.0.0.1:${port}`, "sec-fetch-site": "same-origin" },
+  });
   assert.notEqual(limitedOrphanBeforeProviderRetry.status, 200, "ordinary readers cannot receive stale provider bytes while replacement is pending");
   const providerRetryDeadline = Date.now() + 5000;
   while (cloud.uploadAttemptCount(orphanReplacementKey) < 2 && Date.now() < providerRetryDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
@@ -650,7 +656,9 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const providerQueueRemovalDeadline = Date.now() + 2000;
   while (fs.existsSync(orphanReplacementQueuePath) && Date.now() < providerQueueRemovalDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
   assert.equal(fs.existsSync(orphanReplacementQueuePath), false, "completed provider intent is removed only after success");
-  const limitedOrphanAfterProviderRetry = await request(port, `/files/${orphanReplacementName}`, { headers: { cookie: limitedCookie } });
+  const limitedOrphanAfterProviderRetry = await request(port, `/files/${orphanReplacementName}`, {
+    headers: { cookie: limitedCookie, origin: `http://127.0.0.1:${port}`, "sec-fetch-site": "same-origin" },
+  });
   assert.equal(limitedOrphanAfterProviderRetry.status, 200, limitedOrphanAfterProviderRetry.body);
   assert.equal(limitedOrphanAfterProviderRetry.body, "approved replacement bytes");
 

@@ -3,6 +3,7 @@ const bcrypt = require("bcryptjs");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
+const jwt = require("jsonwebtoken");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
@@ -418,12 +419,13 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     "const originalHashSync = bcrypt.hashSync;",
     'bcrypt.hashSync = function (...args) { fs.appendFileSync(counterFile, "1\\n"); return originalHashSync.apply(this, args); };',
   ].join("\n"));
+  const jwtSecret = crypto.randomBytes(48).toString("base64url");
   const env = {
     ...process.env,
     PORT: String(port),
     DB_ENABLED: "false",
     NODE_ENV: "test",
-    JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+    JWT_SECRET: jwtSecret,
     TOTP_POLICY: "optional",
     CLOUD_STORAGE_PROVIDER: "s3",
     AWS_S3_BUCKET: "fixture-bucket",
@@ -476,6 +478,27 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
       body,
     });
   };
+  const sameOriginFileHeaders = (sessionCookie) => ({
+    cookie: sessionCookie,
+    origin: `http://127.0.0.1:${port}`,
+    "sec-fetch-site": "same-origin",
+  });
+
+  const headerlessAnalyticsCount = () => JSON.parse(fs.readFileSync(path.join(dataDir, "analytics.json"), "utf8")).downloads.length;
+  const headerlessAuditBefore = fs.readFileSync(path.join(dataDir, "audit-logs.json"), "utf8");
+  const headerlessAnalyticsBefore = headerlessAnalyticsCount();
+  const headerlessProviderGetsBefore = cloud.getObjects.length;
+  const headerlessAuthorized = await request(port, "/files/budget.v2", { headers: { cookie } });
+  assert.equal(headerlessAuthorized.status, 403, "headerless cookie download is rejected before cloud lookup");
+  assert.equal(headerlessAuthorized.body.includes("ordinary cloud suffix fixture"), false, "headerless cookie download returns no file bytes");
+  assert.equal(cloud.getObjects.length, headerlessProviderGetsBefore, "headerless cookie download does not hydrate cloud content");
+  assert.equal(headerlessAnalyticsCount(), headerlessAnalyticsBefore, "headerless cookie download does not change analytics");
+  assert.equal(fs.readFileSync(path.join(dataDir, "audit-logs.json"), "utf8"), headerlessAuditBefore, "headerless cookie download does not append audit events");
+  const headerlessDenied = await request(port, "/files/private.txt", { headers: { cookie } });
+  assert.equal(headerlessDenied.status, 403, "headerless cookie request for a denied file is rejected before ACL auditing");
+  assert.equal(cloud.getObjects.length, headerlessProviderGetsBefore, "headerless denied lookup does not query the cloud provider");
+  assert.equal(headerlessAnalyticsCount(), headerlessAnalyticsBefore, "headerless denied lookup does not change analytics");
+  assert.equal(fs.readFileSync(path.join(dataDir, "audit-logs.json"), "utf8"), headerlessAuditBefore, "headerless denied lookup does not append audit events");
 
   const shareEditorBody = JSON.stringify({ username: "editor", password });
   const shareEditorLogin = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(shareEditorBody) }, body: shareEditorBody });
@@ -583,7 +606,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
     "trash leaves no same-name encrypted access grant persisted after its lifecycle commit",
   );
 
-  const caseAliasResponse = await request(port, "/files/case-orphan.txt", { headers: { cookie } });
+  const caseAliasResponse = await request(port, "/files/case-orphan.txt", { headers: sameOriginFileHeaders(cookie) });
   if (process.platform === "win32") {
     assert.equal(caseAliasResponse.status, 403, caseAliasResponse.body);
     assert.equal(caseAliasResponse.body.includes("stale mixed-case orphan cache"), false, "Windows case aliases of suppressed provider objects remain denied");
@@ -652,7 +675,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   OBJECTS.set("rootark/uploads/root/revoke-webdav.txt", Buffer.from("WebDAV access revocation fixture"));
   OBJECTS.set("rootark/uploads/root/session-target.txt", Buffer.from("session revocation fixture"));
 
-  const ordinaryCloudFile = await request(port, "/files/budget.v2", { headers: { cookie } });
+  const ordinaryCloudFile = await request(port, "/files/budget.v2", { headers: sameOriginFileHeaders(cookie) });
   assert.equal(ordinaryCloudFile.status, 200, "an ordinary cloud-only .vN file must be downloadable");
   assert.equal(ordinaryCloudFile.body, "ordinary cloud suffix fixture");
   const cloudOnlyVersionInit = await mutate("/versions/cloud-only-version-init.txt/initialize?folderId=root", "POST", {});
@@ -661,7 +684,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   assert.equal(fs.existsSync(path.join(directory, "uploads", "cloud-only-version-init.txt")), true, "version initialization hydrates an authorized cloud-only file");
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/cloud-only-version-init.txt"), true);
 
-  const restoreOrphanFile = await request(port, "/files/restore-orphan.txt", { headers: { cookie } });
+  const restoreOrphanFile = await request(port, "/files/restore-orphan.txt", { headers: sameOriginFileHeaders(cookie) });
   assert.equal(restoreOrphanFile.status, 403, "restore-orphan provider objects are denied despite legacy default-public ACLs");
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/restore-orphan.txt"), false, "denied restore-orphan downloads never hydrate provider bytes");
   const restoreOrphanToken = await mutate("/file-open-token", "POST", { name: "restore-orphan.txt" });
@@ -809,35 +832,83 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const authorizedVersionDownload = await request(port, "/download/public.txt/v/1", { headers: { cookie } });
   assert.equal(authorizedVersionDownload.status, 200, "non-suppressed historical versions remain available");
   assert.equal(authorizedVersionDownload.body, "public stored version fixture");
-  const ownerOrphanFile = await request(port, "/files/restore-orphan.txt", { headers: { cookie: ownerCookie } });
+  const ownerOrphanFile = await request(port, "/files/restore-orphan.txt", { headers: sameOriginFileHeaders(ownerCookie) });
   assert.equal(ownerOrphanFile.status, 200, "admins retain restore-orphan review access");
   assert.equal(ownerOrphanFile.body, "post-backup provider bytes");
-  const ordinaryLocalFile = await request(port, "/files/notes.v2", { headers: { cookie } });
+  const ordinaryLocalFile = await request(port, "/files/notes.v2", { headers: sameOriginFileHeaders(cookie) });
   assert.equal(ordinaryLocalFile.status, 200, "an ordinary local .vN file must be downloadable");
   assert.equal(ordinaryLocalFile.body, "ordinary local suffix fixture");
   const auditEventCount = (eventType) => JSON.parse(fs.readFileSync(path.join(dataDir, "audit-logs.json"), "utf8")).logs.filter((entry) => entry.eventType === eventType).length;
   const fileDownloadsBeforeHead = auditEventCount("file.download");
-  const ordinaryLocalHead = await request(port, "/files/notes.v2", { method: "HEAD", headers: { cookie } });
+  const ordinaryLocalHead = await request(port, "/files/notes.v2", {
+    method: "HEAD",
+    headers: { cookie, origin: `http://127.0.0.1:${port}`, "sec-fetch-site": "same-origin" },
+  });
   assert.equal(ordinaryLocalHead.status, 200, "HEAD may inspect authorized file metadata");
   assert.equal(auditEventCount("file.download"), fileDownloadsBeforeHead, "HEAD does not record a file download");
-  assert.equal((await request(port, "/files/notes.v2", { headers: { cookie } })).status, 200);
+  assert.equal((await request(port, "/files/notes.v2", { headers: sameOriginFileHeaders(cookie) })).status, 200);
   assert.equal(auditEventCount("file.download"), fileDownloadsBeforeHead + 1, "GET continues to record a file download");
-  const legacyFile = await request(port, "/files/legacy.v9", { headers: { cookie } });
+  const analyticsDownloadCount = () => JSON.parse(fs.readFileSync(path.join(dataDir, "analytics.json"), "utf8")).downloads.length;
+  const crossSiteAuditBefore = fs.readFileSync(path.join(dataDir, "audit-logs.json"), "utf8");
+  const crossSiteAnalyticsBefore = analyticsDownloadCount();
+  const crossSiteAuthorized = await request(port, "/files/notes.v2", {
+    headers: { cookie, origin: "https://attacker.invalid", "sec-fetch-site": "cross-site" },
+  });
+  assert.equal(crossSiteAuthorized.status, 403, "cross-site navigation cannot download a cookie-authorized file");
+  assert.equal(crossSiteAuthorized.body.includes("ordinary local suffix fixture"), false, "cross-site navigation receives no file bytes");
+  assert.equal(analyticsDownloadCount(), crossSiteAnalyticsBefore, "cross-site navigation cannot create download analytics");
+  assert.equal(fs.readFileSync(path.join(dataDir, "audit-logs.json"), "utf8"), crossSiteAuditBefore, "cross-site navigation cannot create audit entries");
+  const crossSiteDenied = await request(port, "/files/private.txt", {
+    headers: { cookie, origin: "https://attacker.invalid", "sec-fetch-site": "cross-site" },
+  });
+  assert.equal(crossSiteDenied.status, 403, "cross-site navigation is rejected before ACL denial logging");
+  assert.equal(crossSiteDenied.body.includes("private cloud fixture"), false, "cross-site denied lookup returns no file bytes");
+  assert.equal(analyticsDownloadCount(), crossSiteAnalyticsBefore, "cross-site denied lookup cannot change analytics");
+  assert.equal(fs.readFileSync(path.join(dataDir, "audit-logs.json"), "utf8"), crossSiteAuditBefore, "cross-site denied lookup cannot create audit entries");
+  const mismatchedOrigin = await request(port, "/files/notes.v2", {
+    headers: { cookie, origin: "https://attacker.invalid", "sec-fetch-site": "same-origin" },
+  });
+  assert.equal(mismatchedOrigin.status, 403, "a supplied foreign Origin is rejected independently of Fetch Metadata");
+  const sameOrigin = await request(port, "/files/notes.v2", {
+    headers: { cookie, origin: `http://127.0.0.1:${port}`, "sec-fetch-site": "same-origin" },
+  });
+  assert.equal(sameOrigin.status, 200, "same-origin browser download remains available");
+  const noMetadataBearer = await request(port, "/files/notes.v2", {
+    headers: { authorization: `Bearer ${jwt.sign({ username: "viewer", sessionVersion: 0 }, jwtSecret, { expiresIn: "5m" })}` },
+  });
+  assert.equal(noMetadataBearer.status, 200, "bearer API download without browser metadata remains available");
+  const directNavigation = await request(port, "/files/notes.v2", {
+    headers: { cookie, "sec-fetch-site": "none" },
+  });
+  assert.equal(directNavigation.status, 200, "address-bar direct navigation remains available");
+  const sameSiteCrossOrigin = await request(port, "/files/notes.v2", {
+    headers: { cookie, origin: "https://sibling.example", "sec-fetch-site": "same-site" },
+  });
+  assert.equal(sameSiteCrossOrigin.status, 403, "same-site sibling origin cannot use the cookie-authenticated endpoint");
+  const sameSiteFetchMetadata = await request(port, "/files/notes.v2", {
+    headers: { cookie, "sec-fetch-site": "same-site" },
+  });
+  assert.equal(sameSiteFetchMetadata.status, 403, "same-site browser request is rejected even when Origin is absent");
+  const refererOnlyCrossOrigin = await request(port, "/files/notes.v2", {
+    headers: { cookie, referer: "https://sibling.example/page" },
+  });
+  assert.equal(refererOnlyCrossOrigin.status, 403, "a mismatching Referer is rejected when Fetch Metadata is absent");
+  const legacyFile = await request(port, "/files/legacy.v9", { headers: sameOriginFileHeaders(cookie) });
   assert.equal(legacyFile.status, 200, "unmatched .vN names retain legacy default-public access");
   assert.equal(legacyFile.body, "legacy file without ACL fixture");
-  const distinctAclFile = await request(port, "/files/private.txt.v7", { headers: { cookie } });
+  const distinctAclFile = await request(port, "/files/private.txt.v7", { headers: sameOriginFileHeaders(cookie) });
   assert.equal(distinctAclFile.status, 200, "a primary .vN file uses its own ACL even when the base name is private");
   assert.equal(distinctAclFile.body, "ordinary suffix with distinct ACL");
-  const distinctHistoryFile = await request(port, "/files/private.txt.v8", { headers: { cookie } });
+  const distinctHistoryFile = await request(port, "/files/private.txt.v8", { headers: sameOriginFileHeaders(cookie) });
   assert.equal(distinctHistoryFile.status, 200, "a .vN primary history is independent from the unsuffixed file");
   assert.equal(distinctHistoryFile.body, "ordinary suffix with primary history");
-  const deniedSuffixFile = await request(port, "/files/denied.v2", { headers: { cookie } });
+  const deniedSuffixFile = await request(port, "/files/denied.v2", { headers: sameOriginFileHeaders(cookie) });
   assert.equal(deniedSuffixFile.status, 403, "ordinary .vN names retain file authorization");
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/denied.v2"), false, JSON.stringify(cloud.getObjects));
   const ordinaryOpenToken = await mutate("/file-open-token", "POST", { name: "budget.v2" });
   assert.equal(ordinaryOpenToken.status, 200, ordinaryOpenToken.body);
   cloud.getObjects.length = 0;
-  const storedPublicVersion = await request(port, "/files/public.txt.v1", { headers: { cookie } });
+  const storedPublicVersion = await request(port, "/files/public.txt.v1", { headers: sameOriginFileHeaders(cookie) });
   assert.equal(storedPublicVersion.status, 404, "version metadata hides historical bytes even with an alias ACL");
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/public.txt.v1"), false);
   cloud.getObjects.length = 0;
@@ -848,15 +919,15 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   assert.equal(fs.existsSync(path.join(directory, "uploads", "private.txt")), false, "denied direct GET never materializes the object");
 
   const privateVersion = await request(port, "/files/private.txt.v1", { headers: { cookie, referer: "https://attacker.invalid/" } });
-  assert.equal(privateVersion.status, 404, privateVersion.body);
-  assert.equal(cloud.getObjects.includes("rootark/uploads/root/private.txt.v1"), false, "stored versions cannot bypass the primary file ACL");
+  assert.equal(privateVersion.status, 403, privateVersion.body);
+  assert.equal(cloud.getObjects.includes("rootark/uploads/root/private.txt.v1"), false, "cross-origin requests are rejected before stored-version lookup or provider hydration");
 
-  const orphanVersion = await request(port, "/files/orphan-private.txt.v1", { headers: { cookie } });
+  const orphanVersion = await request(port, "/files/orphan-private.txt.v1", { headers: sameOriginFileHeaders(cookie) });
   assert.equal(orphanVersion.status, 404, orphanVersion.body);
   const orphanOpenToken = await mutate("/file-open-token", "POST", { name: "orphan-private.txt.v1" });
   assert.equal(orphanOpenToken.status, 404, orphanOpenToken.body);
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/orphan-private.txt.v1"), false, "ownerless version aliases never hydrate");
-  const historyOnlyOrphan = await request(port, "/files/history-only.txt.v9", { headers: { cookie } });
+  const historyOnlyOrphan = await request(port, "/files/history-only.txt.v9", { headers: sameOriginFileHeaders(cookie) });
   assert.equal(historyOnlyOrphan.status, 404, "primary history also identifies orphan aliases without a primary ACL");
   assert.equal(cloud.getObjects.includes("rootark/uploads/root/history-only.txt.v9"), false);
 
@@ -1029,7 +1100,7 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   cloud.getObjects.length = 0;
   for (const [name, route] of [["revoke-download.txt", "/files/revoke-download.txt"], ["revoke-preview.txt", "/preview/file/public/revoke-preview.txt"]]) {
     const gate = cloud.blockGet(`rootark/uploads/root/${name}`);
-    const read = request(port, route, { headers: { cookie } });
+    const read = request(port, route, { headers: route === "/files/revoke-download.txt" ? sameOriginFileHeaders(cookie) : { cookie } });
     await gate.started;
     revokeFileAccessDuringHydration(name);
     gate.release();
@@ -1354,21 +1425,21 @@ test("cloud-backed file routes authorize access and bound repeated metadata list
   const providerGetsBeforeCacheBudget = cloud.getObjects.length;
   for (let index = 0; index < CLOUD_METADATA_REQUEST_LIMIT; index += 1) {
     fs.rmSync(cachePath, { force: true });
-    const response = await request(port, "/files/cloud-limit.txt", { headers: { cookie: limiterCookie } });
+    const response = await request(port, "/files/cloud-limit.txt", { headers: sameOriginFileHeaders(limiterCookie) });
     assert.equal(response.status, 200, response.body);
   }
   assert.equal(cloud.getObjects.length - providerGetsBeforeCacheBudget, CLOUD_METADATA_REQUEST_LIMIT, "each cloud cache miss consumes one provider GET budget unit");
   const warmCloudGets = cloud.getObjects.length;
-  const warmCloudFile = await request(port, "/files/cloud-limit.txt", { headers: { cookie: limiterCookie } });
+  const warmCloudFile = await request(port, "/files/cloud-limit.txt", { headers: sameOriginFileHeaders(limiterCookie) });
   assert.equal(warmCloudFile.status, 200, "warm cloud cache reads remain available after the miss budget is exhausted");
   assert.equal(cloud.getObjects.length, warmCloudGets, "warm cloud cache reads do not call the provider");
   fs.writeFileSync(path.join(directory, "uploads", "local-limit.txt"), "local file does not use cloud budget");
-  const localFile = await request(port, "/files/local-limit.txt", { headers: { cookie: limiterCookie } });
+  const localFile = await request(port, "/files/local-limit.txt", { headers: sameOriginFileHeaders(limiterCookie) });
   assert.equal(localFile.status, 200, "local-file reads remain available after the cloud miss budget is exhausted");
   assert.equal(cloud.getObjects.length, warmCloudGets, "local-file reads do not call the provider");
   fs.rmSync(cachePath, { force: true });
   const cloudMissesBeforeLimit = cloud.getObjects.length;
-  const limitedCloudMiss = await request(port, "/files/cloud-limit.txt", { headers: { cookie: limiterCookie } });
+  const limitedCloudMiss = await request(port, "/files/cloud-limit.txt", { headers: sameOriginFileHeaders(limiterCookie) });
   assert.equal(limitedCloudMiss.status, 429, limitedCloudMiss.body);
   assert.equal(cloud.getObjects.length, cloudMissesBeforeLimit, "the rejected cloud cache miss is stopped before provider GET");
 
