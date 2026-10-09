@@ -275,8 +275,25 @@
       const outsideClick = (event) => {
         if (event.target === element) element.close("cancel");
       };
+      const trapTab = (event) => {
+        if (event.key !== "Tab" || !element.open) return;
+        const focusable = Array.from(element.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+          .filter((control) => !control.disabled && !control.hidden && control.getClientRects().length > 0);
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const focusOutsideDialog = !element.contains(document.activeElement);
+        if (event.shiftKey && (document.activeElement === first || focusOutsideDialog)) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && (document.activeElement === last || focusOutsideDialog)) {
+          event.preventDefault();
+          first.focus();
+        }
+      };
       const finish = () => {
         const result = element.returnValue === "confirm" ? new FormData(form) : null;
+        document.removeEventListener("keydown", trapTab, true);
         element.removeEventListener("click", outsideClick);
         element.innerHTML = "";
         if (opener && opener.isConnected) opener.focus();
@@ -293,6 +310,7 @@
       });
       element.addEventListener("click", outsideClick);
       element.showModal();
+      document.addEventListener("keydown", trapTab, true);
       const focusTarget = element.querySelector("input, select, textarea") || element.querySelector("[data-dialog-cancel]");
       if (focusTarget) focusTarget.focus();
     });

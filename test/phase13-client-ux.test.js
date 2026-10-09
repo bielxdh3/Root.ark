@@ -63,6 +63,7 @@ test("shared dialog close restores focus to its connected opener", async () => {
     activeElement: opener,
     documentElement: { dataset: {} },
     addEventListener() {},
+    removeEventListener() {},
     getElementById(id) { return id === "app-dialog" ? dialog : null; },
   };
   const context = {
@@ -105,6 +106,7 @@ test("shared dialog close moves focus to the main region when its opener is remo
     activeElement: opener,
     documentElement: { dataset: {} },
     addEventListener() {},
+    removeEventListener() {},
     getElementById(id) { return id === "app-dialog" ? dialog : id === "main" ? main : null; },
   };
   const context = {
@@ -120,6 +122,82 @@ test("shared dialog close moves focus to the main region when its opener is remo
   dialog.close("cancel");
   assert.equal(await pending, null);
   assert.equal(document.activeElement, main);
+});
+
+test("shared dialog keeps keyboard focus inside while it is open", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-ui.js"), "utf8");
+  const dialogListeners = new Map();
+  const documentListeners = [];
+  const opener = { isConnected: true, focus() { document.activeElement = this; } };
+  const controls = ["link", "copy", "cancel", "confirm"].map((name) => ({
+    name,
+    disabled: false,
+    hidden: false,
+    getClientRects() { return [{}]; },
+    focus() { document.activeElement = this; },
+    addEventListener() {},
+  }));
+  const form = { addEventListener() {} };
+  const dialog = {
+    returnValue: "",
+    open: false,
+    addEventListener(name, listener) { dialogListeners.set(name, listener); },
+    removeEventListener(name) { dialogListeners.delete(name); },
+    querySelector(selector) { return selector === "form" ? form : selector.includes("input") ? controls[0] : controls[2]; },
+    querySelectorAll() { return controls; },
+    contains(element) { return element === this || controls.includes(element); },
+    showModal() { this.open = true; document.activeElement = this; },
+    close(value) {
+      this.open = false;
+      this.returnValue = value;
+      const listener = dialogListeners.get("close");
+      dialogListeners.delete("close");
+      listener();
+    },
+  };
+  const document = {
+    activeElement: opener,
+    documentElement: { dataset: {} },
+    addEventListener(name, listener, options) { documentListeners.push({ name, listener, options }); },
+    removeEventListener(name, listener, options) {
+      const index = documentListeners.findIndex((entry) => entry.name === name && entry.listener === listener && entry.options === options);
+      if (index !== -1) documentListeners.splice(index, 1);
+    },
+    getElementById(id) { return id === "app-dialog" ? dialog : null; },
+  };
+  const context = {
+    document,
+    localStorage: { getItem() { return null; } },
+    window: { addEventListener() {}, setTimeout },
+    FormData: function FormData() {},
+  };
+  vm.runInNewContext(source, context);
+
+  const initialListenerCount = documentListeners.length;
+  const pending = context.window.RootarkUI.dialog({ title: "Link criado" });
+  assert.ok(dialog.open);
+  assert.equal(document.activeElement, controls[0]);
+
+  const dispatchTab = (shiftKey) => {
+    const event = { key: "Tab", shiftKey, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+    documentListeners.filter((entry) => entry.name === "keydown").forEach((entry) => entry.listener(event));
+    if (!event.defaultPrevented) document.activeElement = {};
+    return event;
+  };
+
+  document.activeElement = controls[3];
+  assert.ok(dispatchTab(false).defaultPrevented);
+  assert.equal(document.activeElement, controls[0]);
+  document.activeElement = controls[0];
+  assert.ok(dispatchTab(true).defaultPrevented);
+  assert.equal(document.activeElement, controls[3]);
+  document.activeElement = {};
+  assert.ok(dispatchTab(false).defaultPrevented);
+  assert.equal(document.activeElement, controls[0]);
+
+  dialog.close("cancel");
+  assert.equal(await pending, null);
+  assert.equal(documentListeners.length, initialListenerCount);
 });
 
 test("mobile navigation backdrop close restores focus to the menu button", () => {
