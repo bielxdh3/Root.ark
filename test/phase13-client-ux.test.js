@@ -122,13 +122,318 @@ test("shared dialog close moves focus to the main region when its opener is remo
   assert.equal(document.activeElement, main);
 });
 
+test("mobile navigation backdrop close restores focus to the menu button", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-ui.js"), "utf8");
+  const listeners = new Map();
+  const body = {};
+  const menuButton = {
+    attributes: new Map(),
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    focus() { document.activeElement = this; },
+  };
+  const sidebar = {
+    inert: false,
+    contains() { return false; },
+    setAttribute() {},
+    removeAttribute() {},
+  };
+  const root = {
+    navOpen: true,
+    classList: {
+      contains(name) { return name === "nav-open" && root.navOpen; },
+      toggle(name, value) { if (name === "nav-open") root.navOpen = Boolean(value); },
+      remove(name) { if (name === "nav-open") root.navOpen = false; },
+    },
+    querySelector(selector) { return selector === ".sidebar" ? sidebar : selector === ".mobile-menu" ? menuButton : null; },
+  };
+  const document = {
+    activeElement: body,
+    documentElement: { dataset: {} },
+    addEventListener(name, listener) { listeners.set(name, listener); },
+    getElementById(id) { return id === "app-root" ? root : null; },
+  };
+  const context = {
+    document,
+    localStorage: { getItem() { return null; } },
+    window: { addEventListener() {}, matchMedia() { return { matches: true }; }, setTimeout },
+  };
+  vm.runInNewContext(source, context);
+
+  listeners.get("click")({ target: { closest() { return null; } } });
+
+  assert.equal(root.classList.contains("nav-open"), false);
+  assert.equal(menuButton.attributes.get("aria-expanded"), "false");
+  assert.equal(document.activeElement, menuButton);
+});
+
+test("mobile navigation keeps focus on an activated topbar action", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-ui.js"), "utf8");
+  const listeners = new Map();
+  const menuButton = { attributes: new Map(), setAttribute(name, value) { this.attributes.set(name, value); }, focus() { document.activeElement = this; } };
+  const topbar = { className: "topbar" };
+  const accountMenu = { className: "account-menu", parentElement: topbar };
+  const accountSummary = { tagName: "SUMMARY", parentElement: accountMenu, focus() { document.activeElement = this; } };
+  const avatar = { tagName: "SPAN", parentElement: accountSummary };
+  const sidebarLink = { focus() { document.activeElement = this; } };
+  const topbarActionSelector = '.topbar button, .topbar a[href], .topbar input:not([disabled]), .topbar select:not([disabled]), .topbar textarea:not([disabled]), .topbar summary, .topbar [role="button"], .topbar [tabindex]:not([tabindex="-1"])';
+  const sidebar = {
+    inert: false,
+    contains(element) { return element === sidebarLink; },
+    querySelector(selector) { return selector === ".nav-link" ? sidebarLink : null; },
+    setAttribute() {},
+    removeAttribute() {},
+  };
+  const root = {
+    navOpen: true,
+    classList: {
+      contains(name) { return name === "nav-open" && root.navOpen; },
+      toggle(name, value) { if (name === "nav-open") root.navOpen = Boolean(value); },
+      remove(name) { if (name === "nav-open") root.navOpen = false; },
+    },
+    querySelector(selector) { return selector === ".sidebar" ? sidebar : selector === ".mobile-menu" ? menuButton : null; },
+  };
+  const document = {
+    activeElement: sidebarLink,
+    documentElement: { dataset: {} },
+    addEventListener(name, listener) { listeners.set(name, listener); },
+    getElementById(id) { return id === "app-root" ? root : null; },
+  };
+  const context = {
+    document,
+    localStorage: { getItem() { return null; } },
+    window: { addEventListener() {}, matchMedia() { return { matches: true }; }, setTimeout },
+  };
+  vm.runInNewContext(source, context);
+
+  let matchedTopbarActionSelector = false;
+  listeners.get("click")({ target: { closest(selector) {
+    if (selector === ".sidebar, .mobile-menu") return null;
+    if (selector === topbarActionSelector && avatar.parentElement === accountSummary && accountSummary.parentElement.parentElement === topbar) {
+      matchedTopbarActionSelector = true;
+      return accountSummary;
+    }
+    return null;
+  } } });
+
+  assert.equal(root.classList.contains("nav-open"), false);
+  assert.equal(menuButton.attributes.get("aria-expanded"), "false");
+  assert.equal(source.includes(`closest('${topbarActionSelector}')`), true, "the handler asks for the exact selector that matches a summary inside the topbar");
+  assert.equal(matchedTopbarActionSelector, true, "a clicked descendant resolves to its summary inside the topbar");
+  assert.equal(document.activeElement, accountSummary, "closing the drawer moves focus from the sidebar to the activated topbar action");
+});
+
+test("opening compact navigation closes the account details popover and focuses the drawer", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-ui.js"), "utf8");
+  const listeners = new Map();
+  const firstLink = { focus() { document.activeElement = this; } };
+  const sidebar = {
+    inert: false,
+    contains(element) { return element === firstLink; },
+    querySelector(selector) { return selector === ".nav-link" ? firstLink : null; },
+    setAttribute() {},
+    removeAttribute() {},
+  };
+  const menuButton = { setAttribute() {}, addEventListener(name, listener) { listeners.set("menu:" + name, listener); }, focus() { document.activeElement = this; } };
+  const accountMenu = { open: true };
+  const root = {
+    innerHTML: "",
+    navOpen: false,
+    classList: {
+      contains(name) { return name === "nav-open" && root.navOpen; },
+      toggle(name, value) { if (name === "nav-open") root.navOpen = Boolean(value); },
+      remove(name) { if (name === "nav-open") root.navOpen = false; },
+    },
+    querySelector(selector) {
+      if (selector === ".sidebar") return sidebar;
+      if (selector === '[data-action="menu"]') return menuButton;
+      if (selector === ".account-menu") return accountMenu;
+      return null;
+    },
+  };
+  const document = {
+    activeElement: menuButton,
+    documentElement: { dataset: {} },
+    addEventListener(name, listener) { listeners.set("document:" + name, listener); },
+    getElementById(id) { return id === "app-root" ? root : null; },
+  };
+  const context = {
+    document,
+    localStorage: { getItem() { return null; } },
+    window: { addEventListener() {}, matchMedia() { return { matches: true }; }, setTimeout },
+  };
+  vm.runInNewContext(source, context);
+
+  context.window.RootarkUI.mount({ user: { username: "admin", role: "admin", permissions: {} } });
+  listeners.get("menu:click")();
+
+  assert.equal(accountMenu.open, false, "opening the drawer closes the account details popover");
+  assert.equal(root.classList.contains("nav-open"), true);
+  assert.equal(document.activeElement, firstLink, "focus enters the open drawer");
+});
+
+test("compact drawer keeps geometry and stacking declarations stable while it animates", () => {
+  const css = fs.readFileSync(path.join(__dirname, "..", "public", "styles", "app.css"), "utf8");
+  const compactRules = css.match(/@media\s*\(max-width:\s*860px\)\s*\{([\s\S]*?)\n\}/);
+  assert.ok(compactRules, "compact navigation styles are present");
+  const sidebarRule = compactRules[1].match(/\.sidebar\s*\{([^}]*)\}/);
+  const openRule = compactRules[1].match(/\.nav-open\s+\.sidebar\s*\{([^}]*)\}/);
+  assert.ok(sidebarRule && openRule, "closed and open compact drawer rules are present");
+  for (const property of ["top: 62px", "z-index: 15", "height: calc(100vh - 62px)"]) {
+    assert.ok(sidebarRule[1].includes(property), `closed drawer geometry includes ${property}`);
+  }
+  assert.match(sidebarRule[1], /transition:\s*transform\s+180ms\s+ease/);
+  assert.match(sidebarRule[1], /transform:\s*translateX\(-102%\)/);
+  assert.match(openRule[1], /transform:\s*translateX\(0\)/);
+  assert.doesNotMatch(openRule[1], /(?:top|height|z-index)\s*:/, "open and closed states share geometry and stacking");
+});
+
+test("mobile navigation traps keyboard focus at both sidebar boundaries", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-ui.js"), "utf8");
+  const listeners = new Map();
+  const brandLink = { focus() { document.activeElement = this; }, getAttribute() { return null; }, getClientRects() { return [1]; } };
+  const navLink = { focus() { document.activeElement = this; }, getAttribute() { return null; }, getClientRects() { return [1]; } };
+  const hiddenLink = { hidden: true, focus() { document.activeElement = this; }, getAttribute() { return null; }, getClientRects() { return []; } };
+  const lastControl = { focus() { document.activeElement = this; }, getAttribute() { return null; }, getClientRects() { return [1]; } };
+  const sidebar = {
+    inert: false,
+    contains(element) { return [brandLink, navLink, hiddenLink, lastControl].includes(element); },
+    querySelectorAll() { return [brandLink, navLink, hiddenLink, lastControl]; },
+    setAttribute() {},
+    removeAttribute() {},
+  };
+  const menuButton = { setAttribute() {}, focus() { document.activeElement = this; } };
+  const root = {
+    navOpen: true,
+    classList: {
+      contains(name) { return name === "nav-open" && root.navOpen; },
+      toggle(name, value) { if (name === "nav-open") root.navOpen = Boolean(value); },
+      remove(name) { if (name === "nav-open") root.navOpen = false; },
+    },
+    querySelector(selector) { return selector === ".sidebar" ? sidebar : selector === ".mobile-menu" ? menuButton : null; },
+  };
+  const document = {
+    activeElement: brandLink,
+    documentElement: { dataset: {} },
+    addEventListener(name, listener) { listeners.set(name, listener); },
+    getElementById(id) { return id === "app-root" ? root : null; },
+    querySelector() { return null; },
+  };
+  const context = {
+    document,
+    localStorage: { getItem() { return null; } },
+    window: { addEventListener() {}, matchMedia() { return { matches: true }; }, setTimeout },
+  };
+  vm.runInNewContext(source, context);
+  const keydown = listeners.get("keydown");
+
+  let prevented = false;
+  keydown({ key: "Tab", shiftKey: true, preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(document.activeElement, lastControl);
+
+  prevented = false;
+  document.activeElement = lastControl;
+  keydown({ key: "Tab", shiftKey: false, preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(document.activeElement, brandLink);
+
+  prevented = false;
+  document.activeElement = navLink;
+  keydown({ key: "Tab", shiftKey: true, preventDefault() { prevented = true; } });
+  assert.equal(prevented, false, "focus can move naturally between visible links inside the sidebar");
+  assert.equal(document.activeElement, navLink);
+});
+
+test("mobile navigation does not intercept Tab while a dialog is open", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-ui.js"), "utf8");
+  const listeners = new Map();
+  const firstLink = { focus() { document.activeElement = this; }, getAttribute() { return null; }, getClientRects() { return [1]; } };
+  const sidebar = {
+    contains() { return false; },
+    querySelectorAll() { return [firstLink]; },
+  };
+  const dialogButton = { focus() { document.activeElement = this; } };
+  const root = {
+    classList: { contains(name) { return name === "nav-open"; } },
+    querySelector(selector) { return selector === ".sidebar" ? sidebar : null; },
+  };
+  const document = {
+    activeElement: dialogButton,
+    documentElement: { dataset: {} },
+    addEventListener(name, listener) { listeners.set(name, listener); },
+    getElementById(id) { return id === "app-root" ? root : null; },
+    querySelector(selector) { return selector === "dialog[open]" ? {} : null; },
+  };
+  const context = {
+    document,
+    localStorage: { getItem() { return null; } },
+    window: { addEventListener() {}, matchMedia() { return { matches: true }; }, setTimeout },
+  };
+  vm.runInNewContext(source, context);
+
+  let prevented = false;
+  listeners.get("keydown")({ key: "Tab", shiftKey: false, preventDefault() { prevented = true; } });
+
+  assert.equal(prevented, false, "the mobile navigation handler leaves Tab uncanceled");
+  assert.equal(document.activeElement, dialogButton, "the handler does not redirect focus into the drawer");
+});
+
+test("Escape closes mobile navigation and restores focus unless a dialog is open", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-ui.js"), "utf8");
+  const listeners = new Map();
+  const menuButton = { setAttribute() {}, focus() { document.activeElement = this; } };
+  const sidebar = {
+    inert: false,
+    contains() { return false; },
+    setAttribute() {},
+    removeAttribute() {},
+  };
+  const root = {
+    navOpen: true,
+    classList: {
+      contains(name) { return name === "nav-open" && root.navOpen; },
+      toggle(name, value) { if (name === "nav-open") root.navOpen = Boolean(value); },
+      remove(name) { if (name === "nav-open") root.navOpen = false; },
+    },
+    querySelector(selector) { return selector === ".sidebar" ? sidebar : selector === ".mobile-menu" ? menuButton : null; },
+  };
+  let dialogOpen = false;
+  const document = {
+    activeElement: {},
+    documentElement: { dataset: {} },
+    addEventListener(name, listener) { listeners.set(name, listener); },
+    getElementById(id) { return id === "app-root" ? root : null; },
+    querySelector() { return dialogOpen ? {} : null; },
+  };
+  const context = {
+    document,
+    localStorage: { getItem() { return null; } },
+    window: { addEventListener() {}, matchMedia() { return { matches: true }; }, setTimeout },
+  };
+  vm.runInNewContext(source, context);
+  const keydown = listeners.get("keydown");
+
+  let prevented = false;
+  keydown({ key: "Escape", preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(root.navOpen, false);
+  assert.equal(document.activeElement, menuButton);
+
+  root.navOpen = true;
+  dialogOpen = true;
+  prevented = false;
+  keydown({ key: "Escape", preventDefault() { prevented = true; } });
+  assert.equal(prevented, false);
+  assert.equal(root.navOpen, true, "Escape remains available to the active dialog");
+});
+
 test("backup recovery stays blocked after an in-flight action returns a structured 503", async () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-management.js"), "utf8");
   for (const page of ["admin.html", "audit.html", "backups.html", "dashboard.html"]) {
     const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
     assert.match(html, new RegExp(`rootark-management\\.js\\?v=${page === "audit.html" ? 19 : 18}`));
   }
-  assert.match(fs.readFileSync(path.join(__dirname, "..", "public", "service-worker.js"), "utf8"), /rootark-public-shell-v19/);
+  assert.match(fs.readFileSync(path.join(__dirname, "..", "public", "service-worker.js"), "utf8"), /rootark-public-shell-v20/);
   const listeners = new Map();
   const buttons = [{ disabled: false }, { disabled: false }, { disabled: false }];
   const target = {
@@ -295,37 +600,40 @@ test("service worker caches only the public shell and bypasses protected paths",
     },
     fetch: async () => { throw new Error("offline cache miss"); },
   };
-  assert.match(source, /const CACHE_NAME = "rootark-public-shell-v19";/, "security client changes advance the public shell cache revision");
+  assert.match(source, /const CACHE_NAME = "rootark-public-shell-v20";/, "security and navigation client changes advance the public shell cache revision");
   const pageAssets = {
-    "index.html": [["rootark-api.js", 17], ["rootark-workspace.js", 17]],
-    "admin.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
-    "audit.html": [["rootark-api.js", 17], ["rootark-management.js", 19]],
-    "backups.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
-    "dashboard.html": [["rootark-api.js", 17], ["rootark-management.js", 18]],
+    "index.html": [["rootark-api.js", 17], ["rootark-workspace.js", 17], ["rootark-ui.js", 17]],
+    "admin.html": [["rootark-api.js", 17], ["rootark-management.js", 18], ["rootark-ui.js", 17]],
+    "audit.html": [["rootark-api.js", 17], ["rootark-management.js", 19], ["rootark-ui.js", 17]],
+    "backups.html": [["rootark-api.js", 17], ["rootark-management.js", 18], ["rootark-ui.js", 17]],
+    "dashboard.html": [["rootark-api.js", 17], ["rootark-management.js", 18], ["rootark-ui.js", 17]],
     "login.html": [["rootark-api.js", 17]],
   };
   for (const [page, scripts] of Object.entries(pageAssets)) {
     const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
     for (const [script, version] of scripts) assert.match(html, new RegExp(`/client/${script.replaceAll(".", "\\.")}\\?v=${version}`), `${page} refreshes ${script}`);
   }
-  const auditHtml = fs.readFileSync(path.join(__dirname, "..", "public", "audit.html"), "utf8");
-  assert.match(auditHtml, /\/styles\/app\.css\?v=17/, "audit page refreshes the updated stylesheet");
+  for (const page of Object.keys(pageAssets)) {
+    const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
+    assert.match(html, /\/styles\/app\.css\?v=18/, `${page} refreshes the updated stylesheet`);
+  }
   vm.runInNewContext(source, context);
   let installWait;
   handlers.install({ waitUntil: (promise) => { installWait = promise; } });
   await installWait;
-  assert.ok(caches.get("rootark-public-shell-v19").has("https://rootark.test/"));
-  assert.ok(caches.get("rootark-public-shell-v19").has("https://rootark.test/client/rootark-api.js"));
-  assert.ok(caches.get("rootark-public-shell-v19").has("https://rootark.test/client/rootark-workspace.js"));
-  assert.ok(caches.get("rootark-public-shell-v19").has("https://rootark.test/client/rootark-bootstrap.js"));
-  assert.ok(caches.get("rootark-public-shell-v19").has("https://rootark.test/client/rootark-protected-index.js"));
-  assert.ok(caches.get("rootark-public-shell-v19").has("https://rootark.test/client/rootark-offline-queue.js"));
-  assert.ok(caches.get("rootark-public-shell-v19").has("https://rootark.test/client/rootark-protected-session.js"));
-  assert.equal([...caches.get("rootark-public-shell-v19").keys()].some((asset) => /^https:\/\/rootark\.test\/(?:auth|api|files|preview|sync|encrypted|groups|folders)(?:\/|$)/i.test(new URL(asset).pathname)), false);
+  assert.ok(caches.get("rootark-public-shell-v20").has("https://rootark.test/"));
+  assert.ok(caches.get("rootark-public-shell-v20").has("https://rootark.test/client/rootark-api.js"));
+  assert.ok(caches.get("rootark-public-shell-v20").has("https://rootark.test/client/rootark-workspace.js"));
+  assert.ok(caches.get("rootark-public-shell-v20").has("https://rootark.test/client/rootark-bootstrap.js"));
+  assert.ok(caches.get("rootark-public-shell-v20").has("https://rootark.test/client/rootark-protected-index.js"));
+  assert.ok(caches.get("rootark-public-shell-v20").has("https://rootark.test/client/rootark-offline-queue.js"));
+  assert.ok(caches.get("rootark-public-shell-v20").has("https://rootark.test/client/rootark-protected-session.js"));
+  assert.ok(caches.get("rootark-public-shell-v20").has("https://rootark.test/client/rootark-ui.js"));
+  assert.equal([...caches.get("rootark-public-shell-v20").keys()].some((asset) => /^https:\/\/rootark\.test\/(?:auth|api|files|preview|sync|encrypted|groups|folders)(?:\/|$)/i.test(new URL(asset).pathname)), false);
   let activateWait;
   handlers.activate({ waitUntil: (promise) => { activateWait = promise; } });
   await activateWait;
-  assert.deepEqual([...caches.keys()], ["rootark-public-shell-v19"]);
+  assert.deepEqual([...caches.keys()], ["rootark-public-shell-v20"]);
   const shellPages = ["index.html", "login.html", "dashboard.html", "audit.html", "admin.html", "backups.html"];
   const versionedAssets = [...new Set(shellPages.flatMap((page) => {
     const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");

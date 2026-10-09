@@ -120,3 +120,58 @@ test("2FA enrollment asks for a new login after the server revokes the setup ses
   assert.equal(document.activeElement && document.activeElement.id, "password", "focus must move to the password field for the fresh login");
   assert.deepEqual(location.assigned, []);
 });
+
+test("failed 2FA enrollment keeps the setup error visible", async () => {
+  const document = { activeElement: null, elements: new Map() };
+  const formIds = ["login-form", "totp-form", "enroll-form"];
+  const ids = [
+    ...formIds,
+    "auth-error", "login-title", "login-intro", "login-eyebrow", "login-submit",
+    "username", "password", "totp-code", "enroll-code", "enroll-secret", "enroll-qr",
+    "back-to-login", "cancel-enroll", "recovery-step", "recovery-step-title", "recovery-codes",
+    "continue-after-enroll",
+  ];
+  ids.forEach((id) => document.elements.set(id, createElement(id, document)));
+  const submitButtons = new Map([ ["login-form", document.elements.get("login-submit")] ]);
+  for (const id of formIds) {
+    const form = document.elements.get(id);
+    form.values = {};
+    form.querySelector = (selector) => selector === 'button[type="submit"]' ? submitButtons.get(id) : null;
+    form.reset = () => { form.values = {}; };
+  }
+  document.getElementById = (id) => document.elements.get(id);
+  const window = {
+    RootarkApi: {
+      async get() { throw new Error("anonymous"); },
+      async post(route) {
+        if (route === "/auth/login") {
+          throw Object.assign(new Error("Enrollment required"), {
+            status: 403,
+            payload: { enrollmentRequired: true, token: "disposable-enrollment-token" },
+          });
+        }
+        if (route === "/auth/2fa/enroll") throw Object.assign(new Error("TOTP unavailable"), { status: 503 });
+        throw new Error(`Unexpected route: ${route}`);
+      },
+    },
+    location: { search: "", origin: "http://localhost", assigned: [], assign(value) { this.assigned.push(value); } },
+    localStorage: { getItem() { return null; } },
+  };
+  class FormDataFixture {
+    constructor(form) { this.form = form; }
+    get(name) { return this.form.values[name] ?? null; }
+  }
+  const source = fs.readFileSync(path.join(__dirname, "../public/client/rootark-login.js"), "utf8");
+  vm.runInNewContext(source, { document, window, FormData: FormDataFixture, URL, URLSearchParams });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const loginForm = document.getElementById("login-form");
+  loginForm.values = { username: "admin", password: "test-only" };
+  document.getElementById("username").value = "admin";
+  document.getElementById("password").value = "test-only";
+  await loginForm.listeners.submit({ preventDefault() {} });
+
+  assert.equal(loginForm.hidden, false);
+  assert.equal(document.getElementById("password").value, "");
+  assert.equal(document.getElementById("auth-error").textContent, "TOTP unavailable");
+});
