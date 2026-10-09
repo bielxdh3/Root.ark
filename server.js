@@ -6392,6 +6392,23 @@ app.delete("/folders/:id", authenticate, (req, res) => {
 app.get("/files/search", fileSearchRateLimit, authenticate, requirePermission("listFiles"), handleFileSearch);
 
 app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req, res) => {
+  if (req.authType === "cookie") {
+    const expectedOrigin = getExpectedOrigin(req, app.get("trust proxy fn"));
+    const origin = req.headers.origin;
+    const fetchSite = String(req.headers["sec-fetch-site"] || "").toLowerCase();
+    const referer = req.headers.referer;
+    let refererOrigin = "";
+    if (!fetchSite && referer) {
+      try { refererOrigin = new URL(referer).origin; } catch {}
+    }
+    if ((origin && origin !== expectedOrigin)
+      || (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none")
+      || (!fetchSite && referer && refererOrigin !== expectedOrigin)
+      || (!origin && !fetchSite && !referer)) {
+      return res.status(403).json({ error: "Origem negada" });
+    }
+  }
+
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
   if (!folder) return;
 

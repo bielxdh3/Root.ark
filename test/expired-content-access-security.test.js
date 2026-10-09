@@ -119,6 +119,15 @@ test("expired cached files and folders are denied across direct, preview, token,
   const cookies = login.headers["set-cookie"].map((value) => value.split(";", 1)[0]);
   const cookie = cookies.join("; ");
   const csrf = cookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1];
+  const auditPath = path.join(dataDir, "audit-logs.json");
+  const analyticsPath = path.join(dataDir, "analytics.json");
+  const auditBeforeHeaderlessRead = fs.readFileSync(auditPath, "utf8");
+  const analyticsBeforeHeaderlessRead = fs.readFileSync(analyticsPath, "utf8");
+  const headerlessRead = await request(port, `/files/${encodeURIComponent(fileName)}?folderId=root`, { headers: { cookie } });
+  assert.equal(headerlessRead.status, 403, "a headerless cookie download is rejected before file lookup");
+  assert.equal(headerlessRead.body.includes("DISPOSABLE EXPIRED FILE CONTENT"), false);
+  assert.equal(fs.readFileSync(auditPath, "utf8"), auditBeforeHeaderlessRead, "a headerless cookie download cannot write audit data");
+  assert.equal(fs.readFileSync(analyticsPath, "utf8"), analyticsBeforeHeaderlessRead, "a headerless cookie download cannot write analytics");
   const body = JSON.stringify({ name: fileName, folderId: "root" });
   const openToken = await request(port, "/file-open-token", {
     method: "POST",
@@ -133,7 +142,8 @@ test("expired cached files and folders are denied across direct, preview, token,
   expirations[`root/${fileName}`].expiresAt = past;
   fs.writeFileSync(expirationsPath, JSON.stringify(expirations));
 
-  const directRead = await request(port, `/files/${encodeURIComponent(fileName)}?folderId=root`, { headers: { cookie } });
+  const sameOriginFileHeaders = { cookie, origin: `http://127.0.0.1:${port}`, "sec-fetch-site": "same-origin" };
+  const directRead = await request(port, `/files/${encodeURIComponent(fileName)}?folderId=root`, { headers: sameOriginFileHeaders });
   assert.notEqual(directRead.status, 200, "an expired file with a local cache must not be served");
   assert.equal(directRead.body.includes("DISPOSABLE EXPIRED FILE CONTENT"), false);
 
@@ -179,7 +189,7 @@ test("expired cached files and folders are denied across direct, preview, token,
   assert.equal(JSON.parse(folders.body).some((folder) => folder.id === "dead"), false, "expired folders are omitted from folder navigation");
   const expiredFolderList = await request(port, `/list?folderId=dead`, { headers: { cookie } });
   assert.notEqual(expiredFolderList.status, 200, "an expired folder cannot be listed");
-  const expiredFolderRead = await request(port, `/files/${encodeURIComponent(folderFileName)}?folderId=dead`, { headers: { cookie } });
+  const expiredFolderRead = await request(port, `/files/${encodeURIComponent(folderFileName)}?folderId=dead`, { headers: sameOriginFileHeaders });
   assert.notEqual(expiredFolderRead.status, 200, "an expired folder cannot serve cached files");
   assert.equal(expiredFolderRead.body.includes("DISPOSABLE EXPIRED FOLDER CONTENT"), false);
 });
