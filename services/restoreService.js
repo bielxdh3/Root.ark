@@ -343,7 +343,7 @@ function recoverWholeRestorePreimages(coordinator, options = {}) {
     closeDb();
     if (isDbEnabled()) {
       const databasePath = getDatabasePath();
-      if (pathExists(path.dirname(databasePath))) recoverDatabaseRollback(databasePath);
+      if (pathExists(path.dirname(databasePath))) recoverDatabaseRollback(databasePath, { lockHeld: true });
     }
     recoverQuarantineRestore({ lockHeld: true });
     let recovering = updateWholeRestoreCoordinator(current, { phase: "rolling_back", rollbackProgress: [] });
@@ -2043,21 +2043,116 @@ function recoverDatabaseRestore(destinationPath, options = {}) {
   return { recovered: true, phase: "rolled_back" };
 }
 
-function recoverDatabaseRollback(destinationPath) {
-  const journalResult = recoverDatabaseRestore(destinationPath);
+function recoverDatabaseRollback(destinationPath, options = {}) {
+  if (!options.lockHeld) {
+    const release = backupService.acquireLock("sqlite-rollback-recovery");
+    try {
+      return recoverDatabaseRollback(destinationPath, { ...options, lockHeld: true });
+    } finally {
+      release();
+    }
+  }
+
+  const resolvedDestination = path.resolve(destinationPath);
+  const journalResult = recoverDatabaseRestore(resolvedDestination, options);
   if (journalResult.recovered) return journalResult;
-  if (fs.existsSync(destinationPath)) return { recovered: false, reason: "destination_exists" };
-  const prefix = `${path.basename(destinationPath)}.restore-rollback-`;
-  const candidates = fs.readdirSync(path.dirname(destinationPath)).filter((name) => name.startsWith(prefix) && !name.endsWith("-wal") && !name.endsWith("-shm"));
+  if (fs.existsSync(resolvedDestination)) return { recovered: false, reason: "destination_exists" };
+  const prefix = `${path.basename(resolvedDestination)}.restore-rollback-`;
+  const candidates = fs.readdirSync(path.dirname(resolvedDestination)).filter((name) => name.startsWith(prefix) && !name.endsWith("-wal") && !name.endsWith("-shm"));
   if (candidates.length > 1) throw new Error("Rollbacks SQLite ambiguos; recuperacao interrompida");
   if (!candidates.length) return { recovered: false, reason: "no_rollback" };
-  const rollbackPath = path.join(path.dirname(destinationPath), candidates[0]);
-  fs.renameSync(rollbackPath, destinationPath);
-  for (const suffix of ["-wal", "-shm"]) {
-    const sidecar = `${rollbackPath}${suffix}`;
-    if (fs.existsSync(sidecar)) fs.renameSync(sidecar, `${destinationPath}${suffix}`);
+  const transactionId = candidates[0].slice(prefix.length);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(transactionId)) {
+    throw new Error("Legacy SQLite rollback candidate name is invalid; manual recovery required");
   }
-  return { recovered: true, phase: "legacy_rollback" };
+  const rollbackPrefix = `${resolvedDestination}.restore-rollback-${transactionId}`;
+  const stagePrefix = `${resolvedDestination}.restore-stage-${transactionId}`;
+  if (path.resolve(path.dirname(resolvedDestination), candidates[0]) !== rollbackPrefix) {
+    throw new Error("Legacy SQLite rollback candidate path is ambiguous; manual recovery required");
+  }
+  for (const suffix of SQLITE_SUFFIXES) {
+    if (pathExists(artifactPath(stagePrefix, suffix))) {
+      throw new Error("Legacy SQLite rollback candidate conflicts with staged data; manual recovery required");
+    }
+  }
+
+  const originalPresent = {};
+  const originalSha256 = {};
+  const originalSources = {};
+  for (const suffix of SQLITE_SUFFIXES) {
+    const rollbackArtifact = artifactPath(rollbackPrefix, suffix);
+    const destinationArtifact = artifactPath(resolvedDestination, suffix);
+    const rollbackExists = pathExists(rollbackArtifact);
+    const destinationExists = suffix !== "" && pathExists(destinationArtifact);
+    if (suffix !== "" && (rollbackExists || destinationExists)) {
+      throw new Error("Legacy SQLite rollback sidecar provenance cannot be established without a journal; manual recovery required");
+    }
+    if (rollbackExists && destinationExists) {
+      throw new Error("Legacy SQLite rollback sidecar is ambiguous; manual recovery required");
+    }
+    const source = rollbackExists ? rollbackArtifact : null;
+    originalSources[suffix] = source;
+    originalPresent[suffix] = Boolean(source);
+    originalSha256[suffix] = source ? fileSha256(source) : null;
+  }
+  if (!originalPresent[""]) {
+    throw new Error("Legacy SQLite rollback candidate is missing its primary database; manual recovery required");
+  }
+
+  const validationDirectory = fs.mkdtempSync(path.join(path.dirname(resolvedDestination), `.${path.basename(resolvedDestination)}.legacy-rollback-`));
+  try {
+    const validationPath = path.join(validationDirectory, path.basename(resolvedDestination));
+    restorePreimage.copyVerifiedFile(originalSources[""], validationPath, originalSha256[""]);
+    if (originalSources["-wal"]) {
+      restorePreimage.copyVerifiedFile(originalSources["-wal"], `${validationPath}-wal`, originalSha256["-wal"]);
+    }
+    validateDatabase(validationPath);
+  } catch (error) {
+    throw new Error("Legacy SQLite rollback candidate is unsafe or failed integrity verification; manual recovery required", { cause: error });
+  } finally {
+    fs.rmSync(validationDirectory, { recursive: true, force: true });
+  }
+
+  for (const suffix of SQLITE_SUFFIXES) {
+    const source = originalSources[suffix];
+    if (source && fileSha256(source) !== originalSha256[suffix]) {
+      throw new Error("Legacy SQLite rollback candidate changed during validation; manual recovery required");
+    }
+  }
+
+  const hook = failureHook(options);
+  const journal = {
+    version: RESTORE_JOURNAL_VERSION,
+    transactionId,
+    destination: resolvedDestination,
+    journalPath: databaseJournalPath(resolvedDestination),
+    stagePrefix,
+    rollbackPrefix,
+    phase: "originals_preserved",
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    completedOperations: [],
+    originalPresent,
+    stagedPresent: Object.fromEntries(SQLITE_SUFFIXES.map((suffix) => [suffix, false])),
+    originalSha256,
+  };
+  validateJournalArtifacts(journal);
+  hook("legacy.rollback.before-journal", journal);
+  if (pathExists(journal.journalPath) || pathExists(resolvedDestination)) {
+    throw new Error("Legacy SQLite rollback state changed during validation; manual recovery required");
+  }
+  for (const suffix of SQLITE_SUFFIXES.slice(1)) {
+    if (pathExists(artifactPath(rollbackPrefix, suffix)) || pathExists(artifactPath(resolvedDestination, suffix))) {
+      throw new Error("Legacy SQLite rollback sidecar provenance changed during validation; manual recovery required");
+    }
+  }
+  if (fileSha256(rollbackPrefix) !== originalSha256[""]) {
+    throw new Error("Legacy SQLite rollback candidate changed during validation; manual recovery required");
+  }
+  writeRestoreJournal(journal);
+  hook("legacy.rollback.journal.persisted", journal);
+  const recovered = recoverDatabaseRestore(resolvedDestination, options);
+  return { ...recovered, phase: "legacy_rollback" };
 }
 
 function restoreDatabaseFiles(extractedRoot, options = {}) {
@@ -2068,7 +2163,7 @@ function restoreDatabaseFiles(extractedRoot, options = {}) {
   const destinationPath = getDatabasePath();
   closeDb();
   fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
-  recoverDatabaseRollback(destinationPath);
+  recoverDatabaseRollback(destinationPath, options);
   const token = crypto.randomUUID();
   const stagePath = `${destinationPath}.restore-stage-${token}`;
   const rollbackPath = `${destinationPath}.restore-rollback-${token}`;
@@ -2255,6 +2350,7 @@ async function restoreBackup(id, options = {}) {
     coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "uploads" });
     injectFailure("restore.sqlite.before-replacement");
     const restoredDatabase = restoreDatabaseFiles(restoreDir, {
+      lockHeld: true,
       failureInjector(step, details) { injectFailure(`restore.sqlite.${step}`, details); },
     });
     coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "sqlite" });

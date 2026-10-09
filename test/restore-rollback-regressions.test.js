@@ -322,6 +322,186 @@ test("journal recovery rejects a wrong destination when its original rollback fi
   }
 });
 
+test("legacy SQLite rollback without a journal preserves an invalid orphan and leaves the destination absent", () => {
+  const fixture = makeDatabaseFixture();
+  const rollbackPath = `${fixture.destinationPath}.restore-rollback-${crypto.randomUUID()}`;
+  const invalidBytes = "not a SQLite database";
+  try {
+    fs.rmSync(fixture.destinationPath);
+    fs.writeFileSync(rollbackPath, invalidBytes);
+
+    assert.throws(
+      () => restoreService.recoverDatabaseRollback(fixture.destinationPath),
+      /legacy SQLite rollback candidate|manual recovery/i,
+    );
+    assert.equal(fs.existsSync(fixture.destinationPath), false, "recovery does not install an invalid database candidate");
+    assert.equal(fs.readFileSync(rollbackPath, "utf8"), invalidBytes, "failed recovery preserves the orphan for manual inspection");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("legacy SQLite rollback without a journal rejects a hard-linked orphan", () => {
+  const fixture = makeDatabaseFixture();
+  const rollbackPath = `${fixture.destinationPath}.restore-rollback-${crypto.randomUUID()}`;
+  try {
+    fs.rmSync(fixture.destinationPath);
+    fs.linkSync(path.join(fixture.sourceRoot, "data", "rootark.sqlite"), rollbackPath);
+
+    assert.throws(
+      () => restoreService.recoverDatabaseRollback(fixture.destinationPath),
+      /aliased|legacy SQLite rollback candidate|manual recovery/i,
+    );
+    assert.equal(fs.existsSync(fixture.destinationPath), false, "recovery does not install an aliased database file");
+    assert.equal(fs.existsSync(rollbackPath), true, "the legacy candidate remains available for manual recovery");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("legacy SQLite rollback without a journal rejects a symlinked orphan", (t) => {
+  const fixture = makeDatabaseFixture();
+  const rollbackPath = `${fixture.destinationPath}.restore-rollback-${crypto.randomUUID()}`;
+  try {
+    fs.rmSync(fixture.destinationPath);
+    try {
+      fs.symlinkSync(path.join(fixture.sourceRoot, "data", "rootark.sqlite"), rollbackPath, "file");
+    } catch (error) {
+      if (process.platform === "win32" && ["EPERM", "EACCES", "ERROR_PRIVILEGE_NOT_HELD"].includes(error.code)) {
+        t.skip("Windows host does not permit creating a symlink fixture");
+        return;
+      }
+      throw error;
+    }
+
+    assert.throws(
+      () => restoreService.recoverDatabaseRollback(fixture.destinationPath),
+      /aliased|legacy SQLite rollback candidate|manual recovery/i,
+    );
+    assert.equal(fs.existsSync(fixture.destinationPath), false, "recovery does not install a symlink target");
+    assert.equal(fs.lstatSync(rollbackPath).isSymbolicLink(), true, "failed recovery preserves the symlink for manual inspection");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("legacy SQLite rollback without a journal fails closed when matching stage artifacts exist", () => {
+  const fixture = makeDatabaseFixture();
+  const transactionId = crypto.randomUUID();
+  const rollbackPath = `${fixture.destinationPath}.restore-rollback-${transactionId}`;
+  const stagePath = `${fixture.destinationPath}.restore-stage-${transactionId}`;
+  try {
+    fs.rmSync(fixture.destinationPath);
+    fs.copyFileSync(path.join(fixture.sourceRoot, "data", "rootark.sqlite"), rollbackPath);
+    fs.writeFileSync(stagePath, "uncommitted stage");
+
+    assert.throws(
+      () => restoreService.recoverDatabaseRollback(fixture.destinationPath),
+      /staged data|manual recovery/i,
+    );
+    assert.equal(fs.existsSync(fixture.destinationPath), false);
+    assert.equal(fs.existsSync(rollbackPath), true, "the rollback candidate remains untouched");
+    assert.equal(fs.readFileSync(stagePath, "utf8"), "uncommitted stage", "the unrelated stage artifact remains untouched");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("legacy SQLite rollback without a journal fails closed on competing WAL sidecars", () => {
+  const fixture = makeDatabaseFixture();
+  const rollbackPath = `${fixture.destinationPath}.restore-rollback-${crypto.randomUUID()}`;
+  const rollbackWalPath = `${rollbackPath}-wal`;
+  const destinationWalPath = `${fixture.destinationPath}-wal`;
+  try {
+    fs.rmSync(fixture.destinationPath);
+    fs.copyFileSync(path.join(fixture.sourceRoot, "data", "rootark.sqlite"), rollbackPath);
+    fs.writeFileSync(rollbackWalPath, "rollback WAL");
+    fs.writeFileSync(destinationWalPath, "destination WAL");
+
+    assert.throws(
+      () => restoreService.recoverDatabaseRollback(fixture.destinationPath),
+      /ambiguous|manual recovery/i,
+    );
+    assert.equal(fs.existsSync(fixture.destinationPath), false);
+    assert.equal(fs.readFileSync(rollbackWalPath, "utf8"), "rollback WAL");
+    assert.equal(fs.readFileSync(destinationWalPath, "utf8"), "destination WAL");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("legacy SQLite rollback serializes fallback recovery across processes", () => {
+  const fixture = makeDatabaseFixture();
+  const rollbackPath = `${fixture.destinationPath}.restore-rollback-${crypto.randomUUID()}`;
+  const backupServicePath = path.join(ROOT, "services", "backupService.js");
+  const restoreServicePath = path.join(ROOT, "services", "restoreService.js");
+  const probeScript = `const service = require(${JSON.stringify(restoreServicePath)}); try { service.recoverDatabaseRollback(process.env.DATABASE_URL); process.stdout.write(JSON.stringify({ code: null })); } catch (error) { process.stdout.write(JSON.stringify({ code: error.code || null })); }`;
+  const runnerScript = `
+    const { spawnSync } = require("node:child_process");
+    const backupService = require(${JSON.stringify(backupServicePath)});
+    const service = require(${JSON.stringify(restoreServicePath)});
+    const release = backupService.acquireLock("restore");
+    try {
+      const probe = spawnSync(process.execPath, ["-e", ${JSON.stringify(probeScript)}], { cwd: process.cwd(), env: process.env, encoding: "utf8" });
+      if (probe.error) throw probe.error;
+      const blockedCode = JSON.parse(probe.stdout).code;
+      const remainedUnchanged = !require("node:fs").existsSync(process.env.DATABASE_URL)
+        && require("node:fs").existsSync(process.env.ROLLBACK_PATH);
+      release();
+      const recovered = service.recoverDatabaseRollback(process.env.DATABASE_URL);
+      process.stdout.write(JSON.stringify({ probeStatus: probe.status, blockedCode, remainedUnchanged, recoveredPhase: recovered.phase }));
+    } catch (error) {
+      release();
+      throw error;
+    }
+  `;
+  try {
+    fs.rmSync(fixture.destinationPath);
+    fs.copyFileSync(path.join(fixture.sourceRoot, "data", "rootark.sqlite"), rollbackPath);
+    const result = spawnSync(process.execPath, ["-e", runnerScript], {
+      cwd: fixture.runtime,
+      encoding: "utf8",
+      env: { ...process.env, DB_ENABLED: "true", DATABASE_URL: fixture.destinationPath, ROLLBACK_PATH: rollbackPath },
+      timeout: 15_000,
+    });
+
+    assert.equal(result.status, 0, result.stderr || result.error?.message);
+    const outcome = JSON.parse(result.stdout);
+    assert.equal(outcome.probeStatus, 0);
+    assert.equal(outcome.blockedCode, "BACKUP_LOCKED", "a competing process cannot enter rollback while the shared restore lock is held");
+    assert.equal(outcome.remainedUnchanged, true, "the competing process preserves the destination and rollback candidate");
+    assert.equal(outcome.recoveredPhase, "legacy_rollback", "recovery proceeds after the lock owner releases the operation lock");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("legacy SQLite rollback resumes after interruption at journal and primary-restore boundaries", () => {
+  for (const failAt of ["legacy.rollback.journal.persisted", "rollback.restore.primary"]) {
+    const fixture = makeDatabaseFixture();
+    const rollbackPath = `${fixture.destinationPath}.restore-rollback-${crypto.randomUUID()}`;
+    const journalPath = restoreService.databaseJournalPath(fixture.destinationPath);
+    try {
+      fs.rmSync(fixture.destinationPath);
+      fs.copyFileSync(path.join(fixture.sourceRoot, "data", "rootark.sqlite"), rollbackPath);
+
+      assert.throws(
+        () => restoreService.recoverDatabaseRollback(fixture.destinationPath, { failAt }),
+        /Falha injetada/,
+      );
+      assert.equal(fs.existsSync(journalPath), true, "the recovery journal remains after interruption");
+
+      assert.equal(restoreService.recoverDatabaseRollback(fixture.destinationPath).phase, "rolled_back");
+      assert.equal(readDatabaseValue(fixture.destinationPath), "replacement");
+      assert.equal(fs.existsSync(journalPath), false, "successful restart recovery removes its journal");
+      assert.equal(fs.existsSync(rollbackPath), false, "successful restart recovery consumes only the verified pre-image");
+    } finally {
+      fs.rmSync(journalPath, { force: true });
+      fixture.cleanup();
+    }
+  }
+});
+
 test("new SQLite restore writes version 2 journals", () => {
   const fixture = makeDatabaseFixture();
   try {
