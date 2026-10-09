@@ -1196,7 +1196,10 @@
     const form = document.getElementById("upload-form");
     if (form && files.length) submitUpload(form, files);
   });
-  window.addEventListener("hashchange", loadRoute);
+  window.addEventListener("hashchange", () => {
+    if (window.location.hash === "#main") return;
+    return loadRoute();
+  });
 
   async function start() {
     try {
