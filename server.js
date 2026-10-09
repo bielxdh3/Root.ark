@@ -3747,6 +3747,14 @@ function hasFileEditAccess(req, folder, fileName, entries = loadFilePermissions(
   return Boolean(permissions.users[req.user?.username]?.edit);
 }
 
+function hasPublicShareAccess(req, folder, fileName, entries = loadFilePermissions(), expirationEntries = loadFileExpirations(), orphanSnapshot = null) {
+  if (!hasFolderAccess(req, folder) || isFileExpired(folder.id, fileName, expirationEntries)) return false;
+  if (restoreProviderOrphans.isSuppressed(folder.id, fileName, "uploads", orphanSnapshot)) return canManageAccess(req);
+  if (canManageAccess(req)) return true;
+  const owner = getFilePermissionEntry(folder.id, fileName, entries)?.owner;
+  return typeof owner === "string" && owner.trim() !== "" && !sameUsername(owner, "sistema") && sameUsername(owner, req.user?.username);
+}
+
 function hasReadableFolderAccess(req, folder) {
   return hasFolderAccess(req, folder);
 }
@@ -7576,6 +7584,7 @@ function buildVisibleFileEntry(req, folder, file, caches = getFileListCaches()) 
     encryption: getPublicEncryptionMetadata(encryption),
     canEdit: hasFileEditAccess(req, folder, file.name, caches.filePermissions, caches.restoreProviderOrphanSnapshot),
     canManageAccess: canManageAccess(req) || hasFileEditAccess(req, folder, file.name, caches.filePermissions, caches.restoreProviderOrphanSnapshot),
+    canShare: hasPublicShareAccess(req, folder, file.name, caches.filePermissions, caches.fileExpirations, caches.restoreProviderOrphanSnapshot),
   };
 }
 
@@ -9372,8 +9381,12 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     return res.status(400).json({ error: "Senha do link deve ter entre 4 e 128 caracteres." });
   }
 
+  if (!hasPublicShareAccess(req, folder, name)) {
+    return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  }
+
   return runCloudFileLifecycleMutation(folder.id, name, async () => {
-  if (!hasFileAccess(req, folder, name)) {
+  if (!hasPublicShareAccess(req, folder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
 
@@ -9387,20 +9400,20 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
   if (!refreshAuthenticatedUser(req, res)) return;
   const currentFolderRecord = getFolderById(folder.id);
   const currentFolder = currentFolderRecord && { ...currentFolderRecord, ...ensureFolderDirectories(currentFolderRecord.id) };
-  if (!currentFolder || !req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name)) {
+  if (!currentFolder || !req.user?.permissions?.listFiles || !hasPublicShareAccess(req, currentFolder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
   if (getEncryptedFileMetadata(folder.id, name)) {
     return res.status(403).json({ error: "Links publicos nao estao disponiveis para arquivos criptografados" });
   }
   const passwordHash = sharePassword ? bcrypt.hashSync(sharePassword, 10) : null;
-  if (!await getListedFileDetails(currentFolder, name) || !hasFileAccess(req, currentFolder, name)) {
+  if (!await getListedFileDetails(currentFolder, name) || !hasPublicShareAccess(req, currentFolder, name)) {
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
   if (!refreshAuthenticatedUser(req, res)) return;
   const finalFolderRecord = getFolderById(folder.id);
   const finalFolder = finalFolderRecord && { ...finalFolderRecord, ...ensureFolderDirectories(finalFolderRecord.id) };
-  if (!finalFolder || !isFolderAvailable(finalFolder.id) || !req.user?.permissions?.listFiles || !hasFileAccess(req, finalFolder, name)) {
+  if (!finalFolder || !isFolderAvailable(finalFolder.id) || !req.user?.permissions?.listFiles || !hasPublicShareAccess(req, finalFolder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
   if (getEncryptedFileMetadata(finalFolder.id, name)) {
