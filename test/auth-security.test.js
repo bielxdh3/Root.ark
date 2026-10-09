@@ -573,6 +573,47 @@ test("browser pages contain no persisted auth keys or WebSocket token URLs", () 
   }
 });
 
+test("authenticated session script blocks cross-origin embedding while remaining usable same-origin", { timeout: 30_000 }, async (t) => {
+  const password = crypto.randomBytes(24).toString("base64url");
+  const cwd = createSandbox([{
+    username: "admin",
+    password: bcrypt.hashSync(password, 10),
+    role: "admin",
+    permissions: { manageUsers: true },
+    sessionVersion: 0,
+  }]);
+  const port = await getUnusedPort();
+  const child = spawn(process.execPath, [SERVER], {
+    cwd,
+    env: { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  t.after(async () => {
+    if (child.exitCode === null) {
+      await new Promise((resolve) => {
+        child.once("exit", resolve);
+        child.kill();
+      });
+    }
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  assert.equal((await waitForServer(port)).status, 200);
+  const admin = await login(port, "admin", password);
+  const deniedForeignOrigin = await request(port, "/auth/session.js", {
+    headers: { cookie: admin.cookie, origin: "https://attacker.invalid" },
+  });
+  assert.equal(deniedForeignOrigin.status, 403);
+  assert.doesNotMatch(deniedForeignOrigin.body, /window\.ROOTARK_AUTH=/);
+  const response = await request(port, "/auth/session.js", { headers: { cookie: admin.cookie } });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers["cross-origin-resource-policy"], "same-origin");
+  assert.match(response.headers["content-type"], /application\/javascript/i);
+  assert.equal(response.headers["cache-control"], "no-store");
+  assert.match(response.body, /window\.ROOTARK_AUTH=/);
+});
+
 test("dashboard activity escapes dynamic values before rendering", () => {
   const contents = fs.readFileSync("public/client/rootark-management.js", "utf8");
   const renderer = contents.match(/activity\.innerHTML = events\.length \? events\.map\(\(item\) => `([^`]+)`\)\.join\(""\)/);

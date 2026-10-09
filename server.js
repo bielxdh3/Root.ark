@@ -5524,7 +5524,15 @@ function revalidateTrashManageAccess(req, res) {
 }
 
 app.get("/auth/session.js", authenticate, (req, res) => {
-  res.type("application/javascript").set("Cache-Control", "no-store");
+  res.set({
+    "Cache-Control": "no-store",
+    "Cross-Origin-Resource-Policy": "same-origin",
+  });
+  const requestOrigin = req.get("origin");
+  if (requestOrigin && requestOrigin !== getExpectedOrigin(req, app.get("trust proxy fn"))) {
+    return res.status(403).json({ error: "Origin denied" });
+  }
+  res.type("application/javascript");
   const identity = JSON.stringify({ username: req.user.username, role: req.user.role, permissions: req.user.permissions }).replace(/</g, "\\u003c");
   res.send(`window.ROOTARK_AUTH=${identity};`);
 });
