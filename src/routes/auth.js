@@ -386,6 +386,16 @@ function registerAuthRoutes(app, context) {
   });
 
   app.post("/auth/logout", authenticate, (req, res) => {
+    try {
+      const users = loadUsers();
+      const user = users.find((entry) => entry.username === req.user.username);
+      if (user && !user.disabled && (user.sessionVersion || 0) === req.user.sessionVersion) {
+        user.sessionVersion = (user.sessionVersion || 0) + 1;
+        saveUsers(users);
+      }
+    } catch {
+      return sensitiveAuthResponse(res).status(503).json({ error: "Sessao nao pode ser revogada agora." });
+    }
     res.clearCookie("rootark_session", sessionCookieOptions);
     res.clearCookie("rootark_csrf", sessionCookieOptions);
     res.status(204).end();

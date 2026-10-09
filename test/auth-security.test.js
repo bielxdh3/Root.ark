@@ -565,6 +565,109 @@ test("an expired active WebSocket closes before processing its next message", { 
   assert.equal(closed.reason, "Sessao expirada");
 });
 
+async function runLogoutRevocationScenario(t, useDatabase) {
+  const password = crypto.randomBytes(24).toString("base64url");
+  const jwtSecret = crypto.randomBytes(48).toString("base64url");
+  const cwd = createSandbox([{
+    username: "agent",
+    password: bcrypt.hashSync(password, 10),
+    role: "user",
+    permissions: { listFiles: true },
+    sessionVersion: 0,
+  }]);
+  const port = await getUnusedPort();
+  const origin = `http://127.0.0.1:${port}`;
+  let child;
+  let firstSocket;
+  let secondSocket;
+  const startServer = () => spawn(process.execPath, [SERVER], {
+    cwd,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DB_ENABLED: useDatabase ? "true" : "false",
+      DATABASE_URL: path.join(cwd, "data", "rootark.sqlite"),
+      ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
+      JWT_SECRET: jwtSecret,
+    },
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  const stopServer = async () => {
+    if (!child || child.exitCode !== null) return;
+    await new Promise((resolve) => {
+      child.once("exit", resolve);
+      child.kill();
+    });
+    child = null;
+  };
+  t.after(async () => {
+    firstSocket?.terminate();
+    secondSocket?.terminate();
+    await stopServer();
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  child = startServer();
+  assert.equal((await waitForServer(port)).status, 200);
+  const firstSession = await login(port, "agent", password);
+  const secondSession = await login(port, "agent", password);
+  const firstToken = firstSession.cookie.match(/(?:^|; )rootark_session=([^;]+)/)[1];
+  const secondToken = secondSession.cookie.match(/(?:^|; )rootark_session=([^;]+)/)[1];
+  assert.equal((await request(port, "/auth/me", { headers: { authorization: `Bearer ${firstToken}` } })).status, 200);
+  assert.equal((await request(port, "/auth/me", { headers: { authorization: `Bearer ${secondToken}` } })).status, 200);
+
+  firstSocket = new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { cookie: firstSession.cookie }, origin });
+  secondSocket = new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { cookie: secondSession.cookie }, origin });
+  await Promise.all([
+    waitForWebSocketEvent(firstSocket, "connected"),
+    waitForWebSocketEvent(secondSocket, "connected"),
+  ]);
+  firstSocket.send(JSON.stringify({ event: "ping" }));
+  secondSocket.send(JSON.stringify({ event: "ping" }));
+  await Promise.all([
+    waitForWebSocketEvent(firstSocket, "pong"),
+    waitForWebSocketEvent(secondSocket, "pong"),
+  ]);
+
+  const missingCsrf = await request(port, "/auth/logout", {
+    method: "POST",
+    headers: { cookie: firstSession.cookie, origin },
+  });
+  assert.equal(missingCsrf.status, 403);
+  assert.equal((await request(port, "/auth/me", { headers: { authorization: `Bearer ${firstToken}` } })).status, 200);
+
+  const logout = await request(port, "/auth/logout", {
+    method: "POST",
+    headers: { cookie: firstSession.cookie, origin, "x-csrf-token": firstSession.csrf },
+  });
+  assert.equal(logout.status, 204);
+  assert.equal((await request(port, "/auth/me", { headers: { cookie: firstSession.cookie } })).status, 401);
+  assert.equal((await request(port, "/auth/me", { headers: { authorization: `Bearer ${firstToken}` } })).status, 401);
+  assert.equal((await request(port, "/auth/me", { headers: { cookie: secondSession.cookie } })).status, 401);
+  assert.equal((await request(port, "/auth/me", { headers: { authorization: `Bearer ${secondToken}` } })).status, 401);
+
+  const firstSocketClose = waitForWebSocketClose(firstSocket);
+  const secondSocketClose = waitForWebSocketClose(secondSocket);
+  firstSocket.send(JSON.stringify({ event: "ping" }));
+  secondSocket.send(JSON.stringify({ event: "ping" }));
+  assert.deepEqual(await firstSocketClose, { code: 1008, reason: "Sessao revogada" });
+  assert.deepEqual(await secondSocketClose, { code: 1008, reason: "Sessao revogada" });
+
+  await stopServer();
+  child = startServer();
+  assert.equal((await waitForServer(port)).status, 200);
+  assert.equal((await request(port, "/auth/me", { headers: { authorization: `Bearer ${firstToken}` } })).status, 401);
+  assert.equal((await request(port, "/auth/me", { headers: { authorization: `Bearer ${secondToken}` } })).status, 401);
+  const freshSession = await login(port, "agent", password);
+  assert.equal((await request(port, "/auth/me", { headers: { cookie: freshSession.cookie } })).status, 200);
+}
+
+test("logout revokes all cookie and bearer sessions across HTTP, WebSocket, and restart", { timeout: 90_000 }, async (t) => {
+  await t.test("JSON persistence", { timeout: 30_000 }, (subtest) => runLogoutRevocationScenario(subtest, false));
+  await t.test("SQLite persistence", { timeout: 30_000 }, (subtest) => runLogoutRevocationScenario(subtest, true));
+});
+
 test("browser pages contain no persisted auth keys or WebSocket token URLs", () => {
   for (const file of ["login.html", "index.html", "dashboard.html", "admin.html", "audit.html", "backups.html"]) {
     const contents = fs.readFileSync(`public/${file}`, "utf8");
