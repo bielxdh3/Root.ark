@@ -6,8 +6,10 @@ const os = require("node:os");
 const path = require("node:path");
 const Database = require("better-sqlite3");
 const test = require("node:test");
+require("./isolated-runtime")(test, "rootark-restore-rollback-runtime-");
 
 const restorePreimage = require("../services/restorePreimage");
+const backupService = require("../services/backupService");
 const restoreService = require("../services/restoreService");
 const ROOT = path.resolve(__dirname, "..");
 
@@ -381,6 +383,22 @@ test("legacy SQLite rollback without a journal rejects a symlinked orphan", (t) 
     assert.equal(fs.existsSync(fixture.destinationPath), false, "recovery does not install a symlink target");
     assert.equal(fs.lstatSync(rollbackPath).isSymbolicLink(), true, "failed recovery preserves the symlink for manual inspection");
   } finally {
+    fixture.cleanup();
+  }
+});
+
+test("SQLite rollback recovery still requires the shared lock when the database already exists", () => {
+  const fixture = makeDatabaseFixture();
+  let release;
+  try {
+    release = backupService.acquireLock("test-restore");
+    assert.throws(
+      () => restoreService.recoverDatabaseRollback(fixture.destinationPath),
+      { code: "BACKUP_LOCKED" },
+    );
+    assert.equal(fs.existsSync(fixture.destinationPath), true, "the no-op recovery check does not change the database");
+  } finally {
+    release?.();
     fixture.cleanup();
   }
 });

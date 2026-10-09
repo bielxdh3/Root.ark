@@ -1857,6 +1857,11 @@ function fileSha256(pathname) {
   return restorePreimage.hashFile(pathname);
 }
 
+function legacyRollbackSha256(pathname) {
+  try { return fileSha256(pathname); }
+  catch { throw new Error("Legacy SQLite rollback candidate is unsafe or cannot be verified; manual recovery required"); }
+}
+
 function fsyncFile(pathname) {
   const fd = fs.openSync(pathname, "r");
   try {
@@ -2093,7 +2098,7 @@ function recoverDatabaseRollback(destinationPath, options = {}) {
     const source = rollbackExists ? rollbackArtifact : null;
     originalSources[suffix] = source;
     originalPresent[suffix] = Boolean(source);
-    originalSha256[suffix] = source ? fileSha256(source) : null;
+    originalSha256[suffix] = source ? legacyRollbackSha256(source) : null;
   }
   if (!originalPresent[""]) {
     throw new Error("Legacy SQLite rollback candidate is missing its primary database; manual recovery required");
@@ -2115,7 +2120,7 @@ function recoverDatabaseRollback(destinationPath, options = {}) {
 
   for (const suffix of SQLITE_SUFFIXES) {
     const source = originalSources[suffix];
-    if (source && fileSha256(source) !== originalSha256[suffix]) {
+    if (source && legacyRollbackSha256(source) !== originalSha256[suffix]) {
       throw new Error("Legacy SQLite rollback candidate changed during validation; manual recovery required");
     }
   }
@@ -2146,7 +2151,7 @@ function recoverDatabaseRollback(destinationPath, options = {}) {
       throw new Error("Legacy SQLite rollback sidecar provenance changed during validation; manual recovery required");
     }
   }
-  if (fileSha256(rollbackPrefix) !== originalSha256[""]) {
+  if (legacyRollbackSha256(rollbackPrefix) !== originalSha256[""]) {
     throw new Error("Legacy SQLite rollback candidate changed during validation; manual recovery required");
   }
   writeRestoreJournal(journal);

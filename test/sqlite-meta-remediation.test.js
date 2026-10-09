@@ -5,6 +5,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const Database = require("better-sqlite3");
 const test = require("node:test");
+require("./isolated-runtime")(test, "rootark-sqlite-meta-runtime-");
 
 const restoreService = require("../services/restoreService");
 
@@ -156,7 +157,7 @@ test("SQLite disaster-recovery meta-remediation matrix", async (t) => {
       const f = makeFixture(); try { restoreService.restoreDatabaseFiles(f.sourceRoot); assert.equal(readValue(f.destinationPath), "new"); assert.equal(fs.existsSync(path.join(f.dir, "data", "rootark.sqlite")), false); } finally { f.cleanup(); }
     }],
     ["31 no raw failure text is persisted in journal", () => {
-      const f = makeFixture(); try { assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "replacement.move.primary", simulateCrash: true })); const raw = fs.readFileSync(restoreService.databaseJournalPath(f.destinationPath), "utf8"); assert.equal(raw.includes("Error"), false); restoreService.recoverDatabaseRestore(f.destinationPath); } finally { f.cleanup(); }
+      const f = makeFixture(); try { assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "replacement.move.primary", simulateCrash: true }), /Falha injetada.*replacement\.move\.primary/i); const raw = fs.readFileSync(restoreService.databaseJournalPath(f.destinationPath), "utf8"); assert.equal(raw.includes("Error"), false); restoreService.recoverDatabaseRestore(f.destinationPath); } finally { f.cleanup(); }
     }],
     ["32 successful commit leaves no stage artifacts", () => {
       const f = makeFixture(); try { restoreService.restoreDatabaseFiles(f.sourceRoot); assert.deepEqual(artifactNames(f), []); } finally { f.cleanup(); }

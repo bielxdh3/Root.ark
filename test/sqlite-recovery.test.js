@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const Database = require("better-sqlite3");
 const test = require("node:test");
+require("./isolated-runtime")(test, "rootark-sqlite-recovery-runtime-");
 const {
   validateDatabase,
   recoverDatabaseRollback,

@@ -4,6 +4,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
+require("./isolated-runtime")(test, "rootark-backup-restore-runtime-");
 
 const ROOT = path.resolve(__dirname, "..");
 
