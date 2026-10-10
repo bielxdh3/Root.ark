@@ -3,8 +3,24 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { spawn } = require("node:child_process");
 const test = require("node:test");
 const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
+
+function spawnLifecycleLockTestChild(mode, directory, markerPath) {
+  const projectRoot = path.resolve(__dirname, "..");
+  const childPath = path.join(__dirname, "..", "scripts", "fixtures", "file-lifecycle-lock-child.cjs");
+  return spawn(process.execPath, [childPath], {
+    cwd: projectRoot,
+    env: {
+      ROOTARK_LOCK_CHILD_MODE: mode,
+      ROOTARK_LOCK_CHILD_DIRECTORY: directory,
+      ROOTARK_LOCK_CHILD_MARKER: markerPath,
+    },
+    stdio: "ignore",
+    windowsHide: true,
+  });
+}
 
 function findAbsentPid() {
   for (let candidate = 2_147_000_000, attempts = 0; candidate > 1_000_000 && attempts < 4096; candidate -= 1, attempts += 1) {
@@ -116,6 +132,96 @@ test("file lifecycle lock fails closed on an existing owner and never steals it"
 
   await assert.rejects(lock.run("root", "stale.txt", async () => assert.fail("stale lock must not enter protected work")), { code: "FILE_LIFECYCLE_LOCK_TIMEOUT" });
   assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).token, "preserved-owner", "potentially stale owner is preserved for operator recovery");
+});
+
+test("file lifecycle lock cleans an incomplete temporary owner record after a write failure", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-partial-owner-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 1000, pollMs: 5 });
+  const lockPath = path.join(directory, `${crypto.createHash("sha256").update("folder:root").digest("hex")}.lock`);
+  const originalWriteFileSync = fs.writeFileSync;
+  let injected = false;
+  fs.writeFileSync = function (target, data, ...args) {
+    if (!injected && typeof target === "number" && String(data).includes('"createdAt"')) {
+      injected = true;
+      originalWriteFileSync.call(this, target, '{"token":"incomplete-owner"', ...args);
+      const error = new Error("injected lifecycle owner write failure");
+      error.code = "EIO";
+      throw error;
+    }
+    return originalWriteFileSync.call(this, target, data, ...args);
+  };
+  try {
+    await assert.rejects(lock.runFolder("root", async () => assert.fail("incomplete lock owner must not enter protected work")), { code: "FILE_LIFECYCLE_LOCK_UNAVAILABLE" });
+  } finally {
+    fs.writeFileSync = originalWriteFileSync;
+  }
+
+  assert.equal(injected, true, "the owner-record write failure was injected after exclusive file creation");
+  assert.equal(fs.existsSync(lockPath), false, "failed acquisition does not publish a malformed lock path");
+  assert.equal(fs.readdirSync(directory).some((name) => name.endsWith(".tmp")), false, "failed acquisition removes its incomplete temporary owner record");
+  assert.equal(await lock.runFolder("root", async () => "recovered"), "recovered", "a later operation can acquire the same folder lock");
+  assert.equal(fs.existsSync(lockPath), false, "the recovered operation releases its lock normally");
+});
+
+test("process interruption during lock initialization cannot publish a partial owner file", { timeout: 10_000 }, async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-interrupted-init-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const markerPath = path.join(directory, "owner-write-paused");
+  const lockPath = path.join(directory, `${crypto.createHash("sha256").update("folder:root").digest("hex")}.lock`);
+  const child = spawnLifecycleLockTestChild("interrupt-initialization", directory, markerPath);
+  let exited = false;
+  child.once("exit", () => { exited = true; });
+  t.after(async () => {
+    if (!exited) child.kill();
+    if (!exited) await new Promise((resolve) => child.once("exit", resolve));
+  });
+
+  const deadline = Date.now() + 5000;
+  while (!fs.existsSync(markerPath) && !exited && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  try {
+    assert.equal(fs.existsSync(markerPath), true, "the child reached the owner-record write boundary");
+    assert.equal(fs.existsSync(lockPath), false, "the final lock path is not visible before its complete owner record is published");
+  } finally {
+    if (!exited) child.kill();
+    if (!exited) await new Promise((resolve) => child.once("exit", resolve));
+  }
+
+  assert.equal(fs.existsSync(lockPath), false, "interrupting initialization leaves no blocking lock path");
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 1000, pollMs: 5 });
+  assert.equal(await lock.runFolder("root", async () => "recovered"), "recovered", "a later process can acquire the folder lock after interruption");
+  assert.equal(fs.readdirSync(directory).some((name) => name.endsWith(".tmp")), false, "a later process removes the dead owner's partial temporary record");
+});
+
+test("file lifecycle lock reclaims a valid owner after abrupt same-host process death", { timeout: 10_000 }, async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-lock-interrupted-owner-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const markerPath = path.join(directory, "owner-work-started");
+  const lockPath = path.join(directory, `${crypto.createHash("sha256").update("folder:root").digest("hex")}.lock`);
+  const child = spawnLifecycleLockTestChild("hold-published-lock", directory, markerPath);
+  let exited = false;
+  child.once("exit", () => { exited = true; });
+  t.after(async () => {
+    if (!exited) child.kill();
+    if (!exited) await new Promise((resolve) => child.once("exit", resolve));
+  });
+
+  const deadline = Date.now() + 5000;
+  while (!fs.existsSync(markerPath) && !exited && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  try {
+    assert.equal(fs.existsSync(markerPath), true, "the child entered the protected work while holding the published lock");
+    const owner = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+    assert.equal(owner.pid, child.pid, "the lock records the actual child process owner");
+    assert.equal(owner.hostname, os.hostname(), "the owner record is scoped to this host");
+  } finally {
+    if (!exited) child.kill();
+    if (!exited) await new Promise((resolve) => child.once("exit", resolve));
+  }
+
+  assert.equal(fs.existsSync(lockPath), true, "abrupt process death leaves the published lease for liveness-checked recovery");
+  const lock = createFileLifecycleLock({ directory, timeoutMs: 1000, pollMs: 5 });
+  assert.equal(await lock.runFolder("root", async () => "recovered"), "recovered", "a later process reclaims the proven-dead same-host owner");
+  assert.equal(fs.existsSync(lockPath), false, "recovery releases the dead owner's lock path");
 });
 
 test("file lifecycle lock reclaims only a provably dead same-host owner", async (t) => {
