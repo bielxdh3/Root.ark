@@ -7,6 +7,21 @@ const { spawn } = require("node:child_process");
 const test = require("node:test");
 const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
 
+function spawnLifecycleLockTestChild(mode, directory, markerPath) {
+  const projectRoot = path.resolve(__dirname, "..");
+  const childPath = path.join(__dirname, "fixtures", "file-lifecycle-lock-child.cjs");
+  return spawn(process.execPath, [childPath], {
+    cwd: projectRoot,
+    env: {
+      ROOTARK_LOCK_CHILD_MODE: mode,
+      ROOTARK_LOCK_CHILD_DIRECTORY: directory,
+      ROOTARK_LOCK_CHILD_MARKER: markerPath,
+    },
+    stdio: "ignore",
+    windowsHide: true,
+  });
+}
+
 function findAbsentPid() {
   for (let candidate = 2_147_000_000, attempts = 0; candidate > 1_000_000 && attempts < 4096; candidate -= 1, attempts += 1) {
     try {
@@ -154,17 +169,7 @@ test("process interruption during lock initialization cannot publish a partial o
   t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
   const markerPath = path.join(directory, "owner-write-paused");
   const lockPath = path.join(directory, `${crypto.createHash("sha256").update("folder:root").digest("hex")}.lock`);
-  const childSource = [
-    'const fs = require("node:fs");',
-    `const marker = ${JSON.stringify(markerPath)};`,
-    'const originalWrite = fs.writeFileSync;',
-    `fs.writeFileSync = function (target, data, ...args) { if (typeof target === "number" && String(data).includes(${JSON.stringify('"createdAt"')})) { originalWrite.call(this, target, ${JSON.stringify('{"token":"partial-before-crash"')}); originalWrite.call(this, marker, "paused"); const wait = new Int32Array(new SharedArrayBuffer(4)); while (true) Atomics.wait(wait, 0, 0, 1000); } return originalWrite.call(this, target, data, ...args); };`,
-    `const { createFileLifecycleLock } = require(${JSON.stringify(path.resolve(__dirname, "../services/fileLifecycleLock.js"))});`,
-    `createFileLifecycleLock({ directory: ${JSON.stringify(directory)}, timeoutMs: 5000 }).runFolder("root", async () => { throw new Error("interrupted owner must not enter protected work"); }).catch(() => {});`,
-  ].join("\n");
-  const childPath = path.join(directory, "interrupt-lock-init.cjs");
-  fs.writeFileSync(childPath, childSource);
-  const child = spawn(process.execPath, [childPath], { stdio: "ignore", windowsHide: true });
+  const child = spawnLifecycleLockTestChild("interrupt-initialization", directory, markerPath);
   let exited = false;
   child.once("exit", () => { exited = true; });
   t.after(async () => {
@@ -193,15 +198,7 @@ test("file lifecycle lock reclaims a valid owner after abrupt same-host process 
   t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
   const markerPath = path.join(directory, "owner-work-started");
   const lockPath = path.join(directory, `${crypto.createHash("sha256").update("folder:root").digest("hex")}.lock`);
-  const childSource = [
-    'const fs = require("node:fs");',
-    `const marker = ${JSON.stringify(markerPath)};`,
-    `const { createFileLifecycleLock } = require(${JSON.stringify(path.resolve(__dirname, "../services/fileLifecycleLock.js"))});`,
-    `createFileLifecycleLock({ directory: ${JSON.stringify(directory)}, timeoutMs: 5000 }).runFolder("root", async () => { fs.writeFileSync(marker, String(process.pid)); const wait = new Int32Array(new SharedArrayBuffer(4)); while (true) Atomics.wait(wait, 0, 0, 1000); }).catch(() => {});`,
-  ].join("\n");
-  const childPath = path.join(directory, "hold-published-lock.cjs");
-  fs.writeFileSync(childPath, childSource);
-  const child = spawn(process.execPath, [childPath], { stdio: "ignore", windowsHide: true });
+  const child = spawnLifecycleLockTestChild("hold-published-lock", directory, markerPath);
   let exited = false;
   child.once("exit", () => { exited = true; });
   t.after(async () => {
