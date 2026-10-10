@@ -184,7 +184,7 @@ function stop(child) {
   return new Promise((resolve) => child.once("exit", resolve));
 }
 
-test("version and pending mutations serialize with cache hydration", { timeout: 60_000 }, async (t) => {
+test("version and pending mutations serialize with cache hydration", { timeout: 90_000 }, async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-lifecycle-mutation-"));
   const dataDir = path.join(directory, "data");
   fs.mkdirSync(dataDir, { recursive: true });
@@ -1063,9 +1063,29 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   child.stderr?.on("data", (chunk) => { childErrors += chunk.toString(); });
   assert.equal((await waitForServer(port, child)).status, 200);
   // Listener readiness does not wait for the asynchronous, lock-serialized startup reconciliation.
-  const recoveryDeadline = Date.now() + 15_000;
+  const recoveryStartedAt = Date.now();
+  // One sibling queue record may serialize on the same folder lock, whose documented acquisition timeout is 30 seconds.
+  const recoveryDeadline = recoveryStartedAt + 40_000;
   while (objects.has(failedDeleteKey) && Date.now() < recoveryDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  const lifecycleLockOwners = fs.existsSync(failedDeleteLifecycleLockDirectory)
+    ? fs.readdirSync(failedDeleteLifecycleLockDirectory).filter((name) => name.endsWith(".lock")).map((name) => {
+      try {
+        const owner = JSON.parse(fs.readFileSync(path.join(failedDeleteLifecycleLockDirectory, name), "utf8"));
+        return { name, pid: owner.pid, hostname: owner.hostname, createdAt: owner.createdAt };
+      } catch (error) {
+        return { name, error: error.code || error.name };
+      }
+    })
+    : [];
+  const competingPresentKey = "rootark/temp/root/approve-history-save-failure.txt";
   const restartRecoveryDiagnostics = {
+    recoveryElapsedMs: Date.now() - recoveryStartedAt,
+    restartChildPid: child.pid,
+    lifecycleLockOwners,
+    competingPresentIntent: {
+      uploadAttempts: cloud.uploadAttemptCount(competingPresentKey),
+      providerObjectPresent: objects.has(competingPresentKey),
+    },
     cloudTempErrors: childErrors.split(/\r?\n/)
       .filter((line) => line.includes("[cloud-temp]"))
       .map((line) => line.replaceAll(directory, "<fixture>")),
