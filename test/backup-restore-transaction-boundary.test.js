@@ -396,6 +396,125 @@ test("backup archives exclude whole-restore coordinator files", () => {
   `);
 });
 
+test("restore rejects backup metadata coordination SQLite files and sidecars", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(dataDir, "runtime.json"), "archived state");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const archivePath = backupService.getBackupOrThrow(backup.id).archivePath;
+      const coordinationPath = backupRepository.MUTATION_COORDINATION_DB_FILE;
+      const coordinationBefore = fs.readFileSync(coordinationPath);
+      const coordinationName = path.basename(coordinationPath);
+      const entries = [
+        { path: "data/runtime.json", contents: Buffer.from("archived state") },
+        { path: "data/" + coordinationName, contents: Buffer.from("attacker-controlled database") },
+        { path: "data/" + coordinationName + "-journal", contents: Buffer.from("attacker-controlled journal") },
+        { path: "data/" + coordinationName + "-wal", contents: Buffer.from("attacker-controlled wal") },
+        { path: "data/" + coordinationName + "-shm", contents: Buffer.from("attacker-controlled shm") },
+      ];
+      fs.rmSync(archivePath);
+      await backupService.createZipArchive(archivePath, {
+        backup_id: backup.id,
+        included_files: entries.map(({ path: entryPath, contents }) => ({ path: entryPath, size: contents.length })),
+        cloud_complete: true,
+      }, entries.map(({ path: entryPath, contents }) => ({ entryPath, contents, size: contents.length })));
+      await backupRepository.saveBackup({ ...backup, checksum: null });
+      write(path.join(dataDir, "runtime.json"), "live state");
+
+      await assert.rejects(
+        restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }),
+        /Entrada de controle bloqueada no backup/,
+      );
+      assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "live state");
+      assert.deepEqual(fs.readFileSync(coordinationPath), coordinationBefore, "restore must not replace the live mutation lock database");
+      assert.equal(restoreService.assertNoPendingWholeRestore().reason, "no_pending_restore");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("JSON metadata lock and stale-claim files are excluded from backup and rejected by restore", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      const lockName = path.basename(backupRepository.MUTATION_LOCK_FILE);
+      const claimName = lockName + ".claim-fixture";
+      assert.equal(backupService.isBackupExcludedPath("data/" + lockName), true);
+      assert.equal(backupService.isBackupExcludedPath("data/" + claimName), true);
+      write(path.join(dataDir, claimName), "stale claim");
+      write(path.join(dataDir, "runtime.json"), "archived state");
+
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const stored = backupService.getBackupOrThrow(backup.id);
+      const { zip } = await restoreService.validateBackupArchive(stored.backup, stored.archivePath);
+      assert.equal(zip.files.some((entry) => entry.path.toLowerCase() === "data/" + lockName.toLowerCase()), false);
+      assert.equal(zip.files.some((entry) => entry.path.toLowerCase() === "data/" + claimName.toLowerCase()), false,
+        "stale lock claims must not be copied into backup archives");
+
+      write(path.join(dataDir, "runtime.json"), "live state");
+      for (const blockedName of [lockName, claimName]) {
+        const entries = [
+          { path: "data/runtime.json", contents: Buffer.from("attacker state") },
+          { path: "data/" + blockedName, contents: Buffer.from("attacker control file") },
+        ];
+        fs.rmSync(stored.archivePath);
+        await backupService.createZipArchive(stored.archivePath, {
+          backup_id: backup.id,
+          included_files: entries.map(({ path: entryPath, contents }) => ({ path: entryPath, size: contents.length })),
+          cloud_complete: true,
+        }, entries.map(({ path: entryPath, contents }) => ({ entryPath, contents, size: contents.length })));
+        await backupRepository.saveBackup({ ...backup, checksum: null });
+        await assert.rejects(
+          restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }),
+          /Entrada de controle bloqueada no backup/,
+          "archive entry " + blockedName + " must be rejected before restore starts",
+        );
+        assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "live state");
+        assert.equal(fs.readFileSync(path.join(dataDir, claimName), "utf8"), "stale claim");
+        assert.equal(restoreService.assertNoPendingWholeRestore().reason, "no_pending_restore");
+      }
+
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("backup collection excludes a live JSON metadata lease", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    backupService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(dataDir, "runtime.json"), "backup data");
+      const lease = backupRepository.acquireJsonMutationLock("backup-collection-test");
+      const originalLockSnapshot = providerOrphans.lockSnapshot;
+      try {
+        providerOrphans.lockSnapshot = async (snapshot) => {
+          snapshot.assertCurrent();
+          const release = () => lease.release();
+          release.mutationLease = lease;
+          return release;
+        };
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        const stored = backupService.getBackupOrThrow(backup.id);
+        const { zip } = await restoreService.validateBackupArchive(stored.backup, stored.archivePath);
+        const lockEntry = "data/" + path.basename(backupRepository.MUTATION_LOCK_FILE).toLowerCase();
+        assert.equal(zip.files.some((entry) => entry.path.toLowerCase() === lockEntry), false,
+          "a live mutation owner must not be serialized into a backup collected under its lease");
+      } finally {
+        providerOrphans.lockSnapshot = originalLockSnapshot;
+        lease.release();
+      }
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("successful whole restore preserves both recovery records and blocks service until startup", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});

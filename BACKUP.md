@@ -126,6 +126,7 @@ O restore:
 - verifica checksum quando disponível;
 - bloqueia path traversal;
 - rejeita paths absolutos e symlinks;
+- exclui locks de coordenação do histórico de backup e rejeita arquivos de lock/claims ou o SQLite de coordenação e seus sidecars antes de alterar dados;
 - extrai em `<runtime-root>/data/backups/.restore-tmp`;
 - restaura JSON em `<runtime-root>/data` e uploads em `<runtime-root>/uploads`;
 - limpa temporários.

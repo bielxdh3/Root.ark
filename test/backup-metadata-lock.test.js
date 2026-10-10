@@ -8,6 +8,7 @@ const test = require("node:test");
 const originalCwd = process.cwd();
 const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-metadata-lock-"));
 const repoRoot = path.resolve(__dirname, "..");
+const staleRaceChild = path.join(__dirname, "helpers", "backup-metadata-lock-race-child.js");
 process.chdir(runtime);
 process.env.DB_ENABLED = "false";
 const backupRepository = require("../repositories/backupRepository");
@@ -44,20 +45,19 @@ function readLock() {
 }
 
 function withDifferentLockFileIdentity(callback) {
-  const originalStatSync = fs.statSync;
-  fs.statSync = function (target, ...args) {
-    const stat = originalStatSync.call(this, target, ...args);
+  const originalLstatSync = fs.lstatSync;
+  fs.lstatSync = function (target, ...args) {
+    const stat = originalLstatSync.call(this, target, ...args);
     if (path.resolve(String(target)) !== path.resolve(backupRepository.MUTATION_LOCK_FILE)) return stat;
-    return {
-      dev: stat.dev + 1,
-      ino: stat.ino + 1,
-      birthtimeMs: stat.birthtimeMs + 1,
-      ctimeMs: stat.ctimeMs + 1,
-      mtimeMs: stat.mtimeMs,
-    };
+    const altered = Object.assign(Object.create(Object.getPrototypeOf(stat)), stat);
+    altered.dev += 1;
+    altered.ino += 1;
+    altered.birthtimeMs += 1;
+    altered.ctimeMs += 1;
+    return altered;
   };
   try { return callback(); }
-  finally { fs.statSync = originalStatSync; }
+  finally { fs.lstatSync = originalLstatSync; }
 }
 
 function childSource(action) {
@@ -179,7 +179,11 @@ test("JSON metadata lock uses crash-safe bounded ownership", async (t) => {
     const lease = backupRepository.acquireJsonMutationLock();
     assert.equal(readLock().formatVersion, 1);
     lease.release();
-    assert.deepEqual(fs.readdirSync(path.dirname(backupRepository.MUTATION_LOCK_FILE)), []);
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(backupRepository.MUTATION_LOCK_FILE))
+        .filter((name) => name !== path.basename(backupRepository.MUTATION_COORDINATION_DB_FILE)),
+      [],
+    );
   });
 
   await t.test("record write failure removes only the owned incomplete lock", () => {
@@ -258,6 +262,123 @@ test("JSON metadata lock uses crash-safe bounded ownership", async (t) => {
     assert.equal(values.filter((value) => value.winner).length, 1, results.map((result) => `${result.code}:${result.stderr}:${result.stdout}`).join(" | "));
     assert.equal(values.filter((value) => value.code === "BACKUP_METADATA_LOCK_BUSY").length, 1);
     assert.equal(fs.existsSync(backupRepository.MUTATION_LOCK_FILE), false);
+  });
+
+  await t.test("concurrent stale-lock recovery cannot steal a newly published live owner", async () => {
+    reset();
+    const raceDir = path.join(runtime, "stale-race");
+    fs.mkdirSync(raceDir);
+    const staleClassified = path.join(raceDir, "stale-classified");
+    const allowFirstClaim = path.join(raceDir, "allow-first-claim");
+    const firstActive = path.join(raceDir, "first-active");
+    const secondActive = path.join(raceDir, "second-active");
+    const releaseFirst = path.join(raceDir, "release-first");
+    const releaseSecond = path.join(raceDir, "release-second");
+    writeLock(lockRecord({ pid: 99999999, createdAt: "2020-01-01T00:00:00.000Z" }));
+    const baseEnv = {
+      NODE_PATH: process.env.NODE_PATH || path.join(repoRoot, "node_modules"),
+      STALE_CLASSIFIED_FILE: staleClassified,
+      ALLOW_FIRST_CLAIM_FILE: allowFirstClaim,
+      FIRST_ACTIVE_FILE: firstActive,
+      SECOND_ACTIVE_FILE: secondActive,
+      RELEASE_FIRST_FILE: releaseFirst,
+      RELEASE_SECOND_FILE: releaseSecond,
+    };
+    const first = spawn(process.execPath, [staleRaceChild, "paused-stale-claim"], {
+      cwd: runtime,
+      env: { ...process.env, ...baseEnv },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const secondHolder = { child: null, result: null };
+    const collect = (child) => new Promise((resolve, reject) => {
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
+    });
+    const firstResult = collect(first);
+    const waitFor = async (condition, description, timeoutMs = 5000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (!condition() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.ok(condition(), `timed out waiting for ${description}`);
+    };
+    try {
+      await waitFor(() => fs.existsSync(staleClassified), "first process to classify the stale lock");
+      secondHolder.child = spawn(process.execPath, [staleRaceChild, "competing-claim"], {
+        cwd: runtime,
+        env: { ...process.env, ...baseEnv },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      secondHolder.result = collect(secondHolder.child);
+      await waitFor(() => fs.existsSync(secondActive) || secondHolder.child.exitCode !== null,
+        "second stale-lock contender to acquire or report busy");
+      fs.writeFileSync(allowFirstClaim, "continue");
+      await waitFor(() => fs.existsSync(firstActive) || first.exitCode !== null,
+        "first stale-lock contender to acquire or report busy");
+    } finally {
+      fs.writeFileSync(allowFirstClaim, "continue");
+      fs.writeFileSync(releaseFirst, "release");
+      fs.writeFileSync(releaseSecond, "release");
+    }
+    assert.ok(secondHolder.result, "the competing stale-lock process must start");
+    const results = await Promise.all([firstResult, secondHolder.result]);
+    assert.equal(fs.existsSync(firstActive) && fs.existsSync(secondActive), false,
+      "a stale snapshot must not let one contender replace another process's live lock");
+    assert.equal(results.filter((result) => result.code === 0).length, 1,
+      results.map((result) => `${result.code}:${result.stderr}:${result.stdout}`).join(" | "));
+    assert.equal(results.filter((result) => result.code === 2).length, 1,
+      results.map((result) => `${result.code}:${result.stderr}:${result.stdout}`).join(" | "));
+    assert.equal(fs.existsSync(backupRepository.MUTATION_LOCK_FILE), false);
+  });
+
+  await t.test("lease release waits for a transient coordination lock holder", async () => {
+    reset();
+    const lease = backupRepository.acquireJsonMutationLock("finally-release");
+    const heldFile = path.join(runtime, "coordination-held");
+    const child = spawn(process.execPath, [staleRaceChild, "hold-coordination-lock"], {
+      cwd: runtime,
+      env: {
+        ...process.env,
+        NODE_PATH: process.env.NODE_PATH || path.join(repoRoot, "node_modules"),
+        COORDINATION_HELD_FILE: heldFile,
+        COORDINATION_HOLD_MS: "300",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const result = new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
+    });
+    await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 5000;
+      const poll = () => {
+        if (fs.existsSync(heldFile)) return resolve();
+        if (child.exitCode !== null) return reject(new Error(`coordinator holder exited early: ${stderr}`));
+        if (Date.now() >= deadline) return reject(new Error("coordinator holder did not acquire its transaction"));
+        setTimeout(poll, 10);
+      };
+      poll();
+    });
+
+    assert.doesNotThrow(() => lease.release());
+    const childResult = await result;
+    assert.equal(childResult.code, 0, childResult.stderr);
+    assert.equal(fs.existsSync(backupRepository.MUTATION_LOCK_FILE), false,
+      "the finally-path release must remove its lock after the transient namespace transaction commits");
+  });
+
+  await t.test("coordination database and sidecars are excluded from backup content", () => {
+    const backupService = require("../services/backupService");
+    for (const suffix of ["", "-journal", "-wal", "-shm"]) {
+      assert.equal(backupService.isBackupExcludedPath(`data/.backup-metadata-coordination.sqlite${suffix}`), true);
+    }
+    assert.equal(backupService.isBackupExcludedPath("data/backup-history.json"), false);
   });
 
   await t.test("a stale releaser cannot remove a replacement owner", () => {
@@ -439,7 +560,7 @@ test("a released JSON mutation lease cannot be renewed", () => {
 test("a same-token JSON lock with a different file identity cannot renew the old lease", () => {
   reset();
   const originalTtl = process.env.ROOTARK_JSON_LOCK_TTL_MS;
-  const originalStatSync = fs.statSync;
+  const originalLstatSync = fs.lstatSync;
   let lease;
   let lockStatCalls = 0;
   try {
@@ -449,24 +570,23 @@ test("a same-token JSON lock with a different file identity cannot renew the old
     record.createdAt = new Date(Date.now() - 2000).toISOString();
     writeLock(record);
 
-    fs.statSync = function (target, ...args) {
-      const stat = originalStatSync.call(this, target, ...args);
+    fs.lstatSync = function (target, ...args) {
+      const stat = originalLstatSync.call(this, target, ...args);
       if (path.resolve(String(target)) !== path.resolve(backupRepository.MUTATION_LOCK_FILE)) return stat;
       lockStatCalls += 1;
       // Simulate a same-token replacement with a different inode without relying on
       // platform-specific rename semantics for an open lock descriptor.
-      return {
-        dev: stat.dev + 1,
-        ino: stat.ino + 1,
-        birthtimeMs: stat.birthtimeMs + 1,
-        ctimeMs: stat.ctimeMs + 1,
-        mtimeMs: stat.mtimeMs,
-      };
+      const altered = Object.assign(Object.create(Object.getPrototypeOf(stat)), stat);
+      altered.dev += 1;
+      altered.ino += 1;
+      altered.birthtimeMs += 1;
+      altered.ctimeMs += 1;
+      return altered;
     };
     assert.throws(() => lease.renew(), { code: "BACKUP_METADATA_LOCK_INVALID" });
     assert.ok(lockStatCalls > 0, "renewal must inspect the current lock path identity");
   } finally {
-    fs.statSync = originalStatSync;
+    fs.lstatSync = originalLstatSync;
     lease?.release();
     if (originalTtl === undefined) delete process.env.ROOTARK_JSON_LOCK_TTL_MS;
     else process.env.ROOTARK_JSON_LOCK_TTL_MS = originalTtl;
@@ -476,7 +596,7 @@ test("a same-token JSON lock with a different file identity cannot renew the old
 test("lease renewal rechecks path identity after writing through the descriptor", () => {
   reset();
   const originalTtl = process.env.ROOTARK_JSON_LOCK_TTL_MS;
-  const originalStatSync = fs.statSync;
+  const originalLstatSync = fs.lstatSync;
   const originalFtruncateSync = fs.ftruncateSync;
   let lease;
   let writeStarted = false;
@@ -492,24 +612,23 @@ test("lease renewal rechecks path identity after writing through the descriptor"
       writeStarted = true;
       return result;
     };
-    fs.statSync = function (target, ...args) {
-      const stat = originalStatSync.call(this, target, ...args);
+    fs.lstatSync = function (target, ...args) {
+      const stat = originalLstatSync.call(this, target, ...args);
       if (!writeStarted || path.resolve(String(target)) !== path.resolve(backupRepository.MUTATION_LOCK_FILE)) return stat;
       // Model a replacement at the descriptor-write boundary without relying on
       // platform-specific rename semantics for an open lock file.
-      return {
-        dev: stat.dev + 1,
-        ino: stat.ino + 1,
-        birthtimeMs: stat.birthtimeMs + 1,
-        ctimeMs: stat.ctimeMs + 1,
-        mtimeMs: stat.mtimeMs,
-      };
+      const altered = Object.assign(Object.create(Object.getPrototypeOf(stat)), stat);
+      altered.dev += 1;
+      altered.ino += 1;
+      altered.birthtimeMs += 1;
+      altered.ctimeMs += 1;
+      return altered;
     };
 
     assert.throws(() => lease.renew(), { code: "BACKUP_METADATA_LOCK_INVALID" });
     assert.equal(writeStarted, true, "the replacement must be simulated after the renewal write begins");
   } finally {
-    fs.statSync = originalStatSync;
+    fs.lstatSync = originalLstatSync;
     fs.ftruncateSync = originalFtruncateSync;
     lease?.release();
     if (originalTtl === undefined) delete process.env.ROOTARK_JSON_LOCK_TTL_MS;
@@ -519,24 +638,23 @@ test("lease renewal rechecks path identity after writing through the descriptor"
 
 test("a stale JSON lease release preserves a same-token replacement file", () => {
   reset();
-  const originalStatSync = fs.statSync;
+  const originalLstatSync = fs.lstatSync;
   let lease;
   try {
     lease = backupRepository.acquireJsonMutationLock("replacement-release");
     const replacement = readLock();
     writeLock(replacement);
 
-    fs.statSync = function (target, ...args) {
-      const stat = originalStatSync.call(this, target, ...args);
+    fs.lstatSync = function (target, ...args) {
+      const stat = originalLstatSync.call(this, target, ...args);
       if (path.resolve(String(target)) !== path.resolve(backupRepository.MUTATION_LOCK_FILE)) return stat;
       // Model the path now naming a distinct file while its contents reuse the old token.
-      return {
-        dev: stat.dev + 1,
-        ino: stat.ino + 1,
-        birthtimeMs: stat.birthtimeMs + 1,
-        ctimeMs: stat.ctimeMs + 1,
-        mtimeMs: stat.mtimeMs,
-      };
+      const altered = Object.assign(Object.create(Object.getPrototypeOf(stat)), stat);
+      altered.dev += 1;
+      altered.ino += 1;
+      altered.birthtimeMs += 1;
+      altered.ctimeMs += 1;
+      return altered;
     };
 
     lease.release();
@@ -544,10 +662,34 @@ test("a stale JSON lease release preserves a same-token replacement file", () =>
       "releasing an old descriptor must not delete a replacement path with the same token");
     assert.equal(readLock().token, lease.token);
   } finally {
-    fs.statSync = originalStatSync;
+    fs.lstatSync = originalLstatSync;
     lease?.release();
     fs.rmSync(backupRepository.MUTATION_LOCK_FILE, { force: true });
   }
+});
+
+test("a failed JSON lock unlink keeps the lease retryable", () => {
+  reset();
+  const lease = backupRepository.acquireJsonMutationLock("retryable-release");
+  const originalRmSync = fs.rmSync;
+  let injected = false;
+  fs.rmSync = function (target, ...args) {
+    if (!injected && path.resolve(String(target)) === path.resolve(backupRepository.MUTATION_LOCK_FILE)) {
+      injected = true;
+      throw Object.assign(new Error("injected lock unlink failure"), { code: "EACCES" });
+    }
+    return originalRmSync.call(this, target, ...args);
+  };
+  try {
+    assert.throws(() => lease.release(), { code: "EACCES" });
+    assert.equal(injected, true);
+    assert.equal(fs.existsSync(backupRepository.MUTATION_LOCK_FILE), true);
+    assert.doesNotThrow(() => lease.renew(), "a failed unlink must leave the lease active for retry");
+  } finally {
+    fs.rmSync = originalRmSync;
+  }
+  assert.doesNotThrow(() => lease.release());
+  assert.equal(fs.existsSync(backupRepository.MUTATION_LOCK_FILE), false);
 });
 
 test("JSON history save rejects an active lease whose same-token lock path identity changed", () => {

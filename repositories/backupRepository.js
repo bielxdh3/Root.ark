@@ -1,11 +1,13 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const Database = require("better-sqlite3");
 const { getDb, isDbEnabled, jsonStringify, safeJsonParse } = require("../db");
 const { RUNTIME_ROOT, resolveRuntimePath } = require("../src/runtime-paths");
 
 const HISTORY_FILE = resolveRuntimePath("data", "backup-history.json");
 const MUTATION_LOCK_FILE = resolveRuntimePath("data", ".backup-metadata.lock");
+const MUTATION_COORDINATION_DB_FILE = resolveRuntimePath("data", ".backup-metadata-coordination.sqlite");
 const MUTATION_LOCK_FORMAT_VERSION = 1;
 const MUTATION_LOCK_TTL_MS = 30 * 1000;
 const MALFORMED_LOCK_TTL_MS = 60 * 1000;
@@ -43,6 +45,31 @@ function mutationBusy(reason) {
   return error;
 }
 
+function withMutationNamespaceLock(callback, busyTimeoutMs = 2000) {
+  fs.mkdirSync(path.dirname(MUTATION_COORDINATION_DB_FILE), { recursive: true });
+  const db = new Database(MUTATION_COORDINATION_DB_FILE);
+  try {
+    db.pragma(`busy_timeout = ${Math.max(0, Math.floor(Number(busyTimeoutMs) || 0))}`);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = callback();
+      db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  } catch (error) {
+    if (error.code === "SQLITE_BUSY" || error.code === "SQLITE_BUSY_SNAPSHOT") {
+      throw mutationBusy("coordination-busy");
+    }
+    throw error;
+  } finally {
+    try { if (db.inTransaction) db.exec("ROLLBACK"); } catch {}
+    db.close();
+  }
+}
+
 function sameRuntimeRoot(left, right) {
   const normalize = (value) => path.normalize(String(value || ""));
   const a = normalize(left);
@@ -73,26 +100,49 @@ function ownerIsLive(record) {
   return true;
 }
 
-function readMutationLock() {
-  let stat;
+function readLockSnapshot() {
+  let pathStat;
   try {
-    stat = fs.statSync(MUTATION_LOCK_FILE);
+    pathStat = fs.lstatSync(MUTATION_LOCK_FILE);
   } catch (error) {
     if (error.code === "ENOENT") return { kind: "missing" };
     throw error;
   }
+  if (pathStat.isSymbolicLink() || !pathStat.isFile()) return { kind: "unsafe" };
+
+  let fd;
   try {
-    const record = JSON.parse(fs.readFileSync(MUTATION_LOCK_FILE, "utf8"));
-    if (!validLockRecord(record)) return { kind: "malformed", mtimeMs: stat.mtimeMs };
+    const noFollow = fs.constants.O_NOFOLLOW || 0;
+    fd = fs.openSync(MUTATION_LOCK_FILE, fs.constants.O_RDONLY | noFollow);
+  } catch (error) {
+    if (error.code === "ENOENT") return { kind: "missing" };
+    if (error.code === "ELOOP") return { kind: "unsafe" };
+    throw error;
+  }
+  try {
+    const descriptorStat = fs.fstatSync(fd);
+    if (!descriptorStat.isFile() || !sameFileIdentity(pathStat, descriptorStat)) return { kind: "changed" };
+    return { kind: "file", fileIdentity: descriptorStat, mtimeMs: descriptorStat.mtimeMs, contents: fs.readFileSync(fd, "utf8") };
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+  }
+}
+
+function readMutationLock() {
+  const snapshot = readLockSnapshot();
+  if (snapshot.kind !== "file") return snapshot;
+  try {
+    const record = JSON.parse(snapshot.contents);
+    if (!validLockRecord(record)) return { kind: "malformed", mtimeMs: snapshot.mtimeMs, fileIdentity: snapshot.fileIdentity };
     if (!sameRuntimeRoot(record.runtimeRootIdentity, runtimeRootIdentity())) {
-      return { kind: "mismatch", record };
+      return { kind: "mismatch", record, fileIdentity: snapshot.fileIdentity };
     }
     const createdAtMs = Date.parse(record.createdAt);
     const ageMs = Date.now() - createdAtMs;
     const ttlMs = boundedLockDuration("ROOTARK_JSON_LOCK_TTL_MS", MUTATION_LOCK_TTL_MS);
-    return { kind: "valid", record, ageMs, live: ownerIsLive(record), expired: ageMs > ttlMs };
+    return { kind: "valid", record, ageMs, live: ownerIsLive(record), expired: ageMs > ttlMs, fileIdentity: snapshot.fileIdentity };
   } catch {
-    return { kind: "malformed", mtimeMs: stat.mtimeMs };
+    return { kind: "malformed", mtimeMs: snapshot.mtimeMs, fileIdentity: snapshot.fileIdentity };
   }
 }
 
@@ -102,11 +152,11 @@ function sameFileIdentity(left, right) {
   return left.birthtimeMs === right.birthtimeMs || left.ctimeMs === right.ctimeMs;
 }
 
-function cleanupOwnedIncompleteLock(fd, descriptorStat, token) {
+function cleanupOwnedIncompleteLock(descriptorStat) {
+  if (!descriptorStat) return;
   try {
-    const currentStat = fs.statSync(MUTATION_LOCK_FILE);
-    const content = fs.readFileSync(MUTATION_LOCK_FILE, "utf8");
-    if (sameFileIdentity(descriptorStat, currentStat) || content.includes(`"token":"${token}"`)) {
+    const current = readMutationLock();
+    if (sameFileIdentity(descriptorStat, current.fileIdentity)) {
       fs.rmSync(MUTATION_LOCK_FILE, { force: true });
     }
   } catch {}
@@ -155,6 +205,7 @@ function writeMutationLockRecord(fd, record) {
 }
 
 function acquireJsonMutationLock(operationName = "restore-sync") {
+  return withMutationNamespaceLock(() => {
   fs.mkdirSync(path.dirname(MUTATION_LOCK_FILE), { recursive: true });
   cleanupOldClaims();
   let claimPath = null;
@@ -201,50 +252,43 @@ function acquireJsonMutationLock(operationName = "restore-sync") {
           if (released || !JSON_MUTATION_LEASES.has(lease)) {
             throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease is not active");
           }
-          const state = readMutationLock();
-          let pathStat;
-          try { pathStat = fs.statSync(MUTATION_LOCK_FILE); }
-          catch { throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease no longer owns the lock"); }
-          if (state.kind !== "valid" || state.record.token !== token || !state.live || !sameFileIdentity(descriptorStat, pathStat)) {
-            throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease no longer owns the lock");
-          }
-          const renewedRecord = { ...state.record, createdAt: new Date().toISOString() };
-          writeMutationLockRecord(fd, renewedRecord);
-          const renewedState = readMutationLock();
-          let renewedPathStat;
-          try { renewedPathStat = fs.statSync(MUTATION_LOCK_FILE); }
-          catch { throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease no longer owns the lock"); }
-          if (renewedState.kind !== "valid" || renewedState.record.token !== token || renewedState.expired || !renewedState.live ||
-              !sameFileIdentity(descriptorStat, renewedPathStat)) {
-            throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease could not be renewed");
-          }
-          Object.assign(record, renewedRecord);
-          return true;
+          return withMutationNamespaceLock(() => {
+            const state = readMutationLock();
+            if (state.kind !== "valid" || state.record.token !== token || !state.live || !sameFileIdentity(descriptorStat, state.fileIdentity)) {
+              throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease no longer owns the lock");
+            }
+            const renewedRecord = { ...state.record, createdAt: new Date().toISOString() };
+            writeMutationLockRecord(fd, renewedRecord);
+            const renewedState = readMutationLock();
+            if (renewedState.kind !== "valid" || renewedState.record.token !== token || renewedState.expired || !renewedState.live ||
+                !sameFileIdentity(descriptorStat, renewedState.fileIdentity)) {
+              throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease could not be renewed");
+            }
+            Object.assign(record, renewedRecord);
+            return true;
+          });
         },
         release() {
           if (released) return;
-          released = true;
-          JSON_MUTATION_LEASES.delete(lease);
-          let ownsPath = false;
-          try {
-            const currentStat = fs.statSync(MUTATION_LOCK_FILE);
-            const current = JSON.parse(fs.readFileSync(MUTATION_LOCK_FILE, "utf8"));
-            ownsPath = current.token === token && sameFileIdentity(descriptorStat, currentStat);
-          } catch {}
-          try { fs.closeSync(fd); } catch {}
-          if (ownsPath) {
-            try {
-              const releaseStat = fs.statSync(MUTATION_LOCK_FILE);
-              if (sameFileIdentity(descriptorStat, releaseStat)) fs.rmSync(MUTATION_LOCK_FILE, { force: true });
-            } catch {}
-          }
+          withMutationNamespaceLock(() => {
+            if (released) return;
+            const current = readMutationLock();
+            const ownsPath = current.kind === "valid" && current.record.token === token && sameFileIdentity(descriptorStat, current.fileIdentity);
+            if (ownsPath) {
+              try { fs.rmSync(MUTATION_LOCK_FILE, { force: true }); }
+              catch (error) { if (error.code !== "ENOENT") throw error; }
+            }
+            released = true;
+            JSON_MUTATION_LEASES.delete(lease);
+            try { fs.closeSync(fd); } catch {}
+          }, 30_000);
         },
       };
       JSON_MUTATION_LEASES.set(lease, { descriptorStat, token });
       return lease;
     } catch (error) {
       try { if (fd !== undefined) fs.closeSync(fd); } catch {}
-      cleanupOwnedIncompleteLock(fd, descriptorStat, token);
+      cleanupOwnedIncompleteLock(descriptorStat);
       cleanupClaim(claimPath);
       claimPath = null;
       if (error.code === "EEXIST") continue;
@@ -252,6 +296,7 @@ function acquireJsonMutationLock(operationName = "restore-sync") {
     }
   }
   throw mutationBusy("claim-race");
+  });
 }
 
 function withJsonMutationLock(callback, operationName = "restore-sync") {
@@ -270,11 +315,8 @@ function withJsonMutationLease(callback, operationName, existingLease) {
       throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease is not active");
     }
     const state = readMutationLock();
-    let pathStat;
-    try { pathStat = fs.statSync(MUTATION_LOCK_FILE); }
-    catch { throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease no longer owns the lock"); }
     if (state.kind !== "valid" || state.record.token !== leaseState.token || state.expired || !state.live ||
-        !sameFileIdentity(leaseState.descriptorStat, pathStat)) {
+        !sameFileIdentity(leaseState.descriptorStat, state.fileIdentity)) {
       throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease no longer owns the lock");
     }
     return callback();
@@ -553,4 +595,5 @@ module.exports = {
   saveBackup,
   withJsonMutationLock,
   MUTATION_LOCK_FILE,
+  MUTATION_COORDINATION_DB_FILE,
 };
