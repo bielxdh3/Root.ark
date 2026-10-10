@@ -60,13 +60,14 @@ function childSource(localCrash = false) {
   return `
     const fs=require("fs");
     const path=require("path");
+    const crypto=require("crypto");
     if(process.env.CLAIM_TIMER_DELAY_MS){const expectedDelay=Number(process.env.CLAIM_TIMER_DELAY_MS);const originalSetInterval=global.setInterval;global.setInterval=function(callback,delay,...args){if(delay!==expectedDelay)return originalSetInterval(callback,delay,...args);return originalSetInterval(function(...callbackArgs){const result=callback.apply(this,callbackArgs);if(fs.existsSync(process.env.CLAIM_SWAP_COMPLETED))fs.writeFileSync(process.env.CLAIM_TIMER_SIGNAL,"tick");return result;},delay,...args);};}
     const cloudPath=${JSON.stringify(CLOUD)};
     const logPath=process.env.FAKE_PROVIDER_LOG;
     const statePath=process.env.FAKE_PROVIDER_STATE;
     const readState=()=>{try{return JSON.parse(fs.readFileSync(statePath,"utf8"))}catch{return {destination:false,source:true}}};
     const writeState=(value)=>fs.writeFileSync(statePath,JSON.stringify(value));
-    const call=(operation,folderId,fileName)=>{const values=fs.existsSync(logPath)?JSON.parse(fs.readFileSync(logPath,"utf8")):[]; values.push({operation,folderId,fileName,identity:operation+":"+folderId+":"+fileName}); fs.writeFileSync(logPath,JSON.stringify(values));};
+    const call=(operation,folderId,fileName)=>{const id=crypto.randomUUID();const target=path.join(logPath,id+".json");const temporary=path.join(logPath,"."+id+".tmp");fs.writeFileSync(temporary,JSON.stringify({operation,folderId,fileName,identity:operation+":"+folderId+":"+fileName}),{flag:"wx"});fs.renameSync(temporary,target);};
     const waitFor=(file)=>{const signal=new Int32Array(new SharedArrayBuffer(4)); while(!fs.existsSync(file)) Atomics.wait(signal,0,0,20);};
     let installPause=null; if(process.env.CLAIM_PAUSE_LOCK_PATH){let installed=false; installPause=()=>{if(installed)return; installed=true; let paused=false; const pause=()=>{if(paused)return; paused=true; fs.writeFileSync(process.env.CLAIM_PAUSE_OBSERVED,"observed"); waitFor(process.env.CLAIM_PAUSE_RESUME);}; const originalMkdir=fs.mkdirSync; const originalOpen=fs.openSync; fs.mkdirSync=(target,options)=>{if(path.resolve(String(target))===path.resolve(process.env.CLAIM_PAUSE_LOCK_PATH+".takeover")) pause(); return originalMkdir(target,options);}; fs.openSync=(target,flags,...args)=>{if(String(target).startsWith(process.env.CLAIM_PAUSE_LOCK_PATH+".takeover-")) pause(); return originalOpen(target,flags,...args);};};}
     const fake={
@@ -102,7 +103,7 @@ function serverEnv(dir, port, extra = {}) {
     CLOUD_STORAGE_PROVIDER: "s3",
     WEBDAV_MOVE_RECONCILIATION_LEASE_MS: "1000",
     WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS: "1000",
-    FAKE_PROVIDER_LOG: path.join(dir, "provider-calls.json"),
+    FAKE_PROVIDER_LOG: path.join(dir, "provider-calls"),
     FAKE_PROVIDER_STATE: path.join(dir, "provider-state.json"),
     ...extra,
   };
@@ -151,7 +152,7 @@ function fixture() {
   fs.writeFileSync(path.join(dir, "uploads", "source.txt"), "source bytes");
   fs.writeFileSync(path.join(dir, "uploads", "target.txt"), "old destination");
   fs.writeFileSync(path.join(dir, "provider-state.json"), JSON.stringify({ destination: false, source: true }));
-  fs.writeFileSync(path.join(dir, "provider-calls.json"), "[]");
+  fs.mkdirSync(path.join(dir, "provider-calls"));
   return { dir, source: path.join(dir, "uploads", "source.txt"), target: path.join(dir, "uploads", "target.txt"), backup: path.join(dir, "uploads") };
 }
 
@@ -172,7 +173,13 @@ function readJournal(dir) {
   try { return JSON.parse(fs.readFileSync(journalPath, "utf8")); } catch { return null; }
 }
 
-function calls(dir) { return JSON.parse(fs.readFileSync(path.join(dir, "provider-calls.json"), "utf8")); }
+function calls(dir) {
+  const logDirectory = path.join(dir, "provider-calls");
+  return fs.readdirSync(logDirectory)
+    .filter((name) => name.endsWith(".json"))
+    .sort()
+    .map((name) => JSON.parse(fs.readFileSync(path.join(logDirectory, name), "utf8")));
+}
 
 test("WebDAV MOVE persists remote intent before provider effects", { timeout: 90_000 }, async (t) => {
   await t.test("uncertain upload is retained and reconciled without local rollback", async () => {
