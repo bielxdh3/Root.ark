@@ -6,15 +6,24 @@ const path = require("node:path");
 const vm = require("node:vm");
 const test = require("node:test");
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 test("admin group member draft survives account creation refresh", async () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-management.js"), "utf8");
   const group = { id: "group-1", name: "Operações", members: ["member"] };
   const user = { username: "admin", role: "admin", permissions: { manageUsers: true } };
   const elements = new Map();
   const targetListeners = new Map();
-  const groupsLoaded = new Promise((resolve) => { group.loadInitial = resolve; });
+  const firstGroupRead = deferred(), secondGroupRead = deferred();
+  const firstGroupReadStarted = deferred(), secondGroupReadStarted = deferred();
+  let groupReadCount = 0;
   let createdUser;
   let groupInput;
+  let groupInputConnected = false;
 
   function element(id) {
     if (!elements.has(id)) {
@@ -33,6 +42,20 @@ test("admin group member draft survives account creation refresh", async () => {
         querySelector(selector) { return selector === "button[type='submit']" ? element(`${id}-submit`) : null; },
         reset() { this.wasReset = true; },
       };
+      if (id === "groups-body") {
+        let html = "";
+        Object.defineProperty(value, "innerHTML", {
+          get() { return html; },
+          set(next) {
+            html = String(next);
+            const renderedGroup = html.match(/<input[^>]*data-group-id="group-1"[^>]*value="([^"]*)"/);
+            groupInputConnected = Boolean(renderedGroup);
+            if (renderedGroup && groupInput) {
+              groupInput.value = renderedGroup[1].replace(/&quot;/g, "\"").replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+            }
+          },
+        });
+      }
       elements.set(id, value);
     }
     return elements.get(id);
@@ -63,7 +86,9 @@ test("admin group member draft survives account creation refresh", async () => {
     async get(route) {
       if (route === "/users") return [user, ...(createdUser ? [createdUser] : [])];
       if (route === "/groups") {
-        group.loadInitial();
+        const index = groupReadCount++;
+        if (index === 0) { firstGroupReadStarted.resolve(); return firstGroupRead.promise; }
+        if (index === 1) { secondGroupReadStarted.resolve(); return secondGroupRead.promise; }
         return [{ id: group.id, name: group.name, members: [...group.members] }];
       }
       if (route === "/quarantine" || route === "/folders") return [];
@@ -101,19 +126,25 @@ test("admin group member draft survives account creation refresh", async () => {
   };
 
   vm.runInNewContext(source, context);
-  await groupsLoaded;
-  await new Promise((resolve) => setImmediate(resolve));
-
   const groupsBody = element("groups-body");
+  await firstGroupReadStarted.promise;
+
+  const createUserForm = element("create-user-form");
+  createUserForm.values = { username: "new-user", password: "fixture-only", role: "user", "permission-listFiles": "on" };
+  const createUser = createUserForm.listeners.get("submit")({ currentTarget: createUserForm, preventDefault() {} });
+  await secondGroupReadStarted.promise;
+  secondGroupRead.resolve([{ id: group.id, name: group.name, members: [...group.members] }]);
+  await createUser;
   assert.match(groupsBody.innerHTML, /value="member"/);
 
   groupInput = { dataset: { groupId: group.id }, value: "member, admin" };
+  groupInputConnected = groupsBody.innerHTML.includes(`data-group-id="${group.id}"`);
   targetListeners.get("input")?.({ target: groupInput });
-  const createUserForm = element("create-user-form");
-  createUserForm.values = { username: "new-user", password: "fixture-only", role: "user", "permission-listFiles": "on" };
-  await createUserForm.listeners.get("submit")({ currentTarget: createUserForm, preventDefault() {} });
+  firstGroupRead.resolve([]);
+  await new Promise((resolve) => setImmediate(resolve));
 
-  assert.match(groupsBody.innerHTML, /value="member, admin"/, "refreshing groups must preserve an unsaved member edit");
+  assert.equal(groupInputConnected, true, "a stale response must not replace the group input that is being edited");
+  assert.equal(groupInput.value, "member, admin", "the live input keeps its current unsaved value");
   assert.match(groupsBody.innerHTML, /aria-label="Membros de Operações"/);
 
   const saveGroupButton = { dataset: { action: "save-group", groupIndex: "0" }, disabled: false, closest() { return this; } };

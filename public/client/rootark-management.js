@@ -114,6 +114,7 @@
     target.innerHTML = adminMarkup();
     let users = [], groups = [], quarantine = [], folders = [], eligibleUsers = [], allowedUsers = [];
     const groupMemberDrafts = new Map();
+    let groupLoadGeneration = 0;
     const usersBody = document.getElementById("users-body");
     const groupsBody = document.getElementById("groups-body");
     const quarantineBody = document.getElementById("quarantine-body");
@@ -180,14 +181,20 @@
       catch (error) { users = []; usersBody.innerHTML = tableState(4, publicError(error, "Não foi possível carregar as contas."), "error"); }
     }
     async function loadGroups() {
+      const generation = ++groupLoadGeneration;
       groupsBody.innerHTML = tableState(4, "Carregando grupos…", "loading");
       try {
-        groups = asArray(await api.get("/groups"));
+        const loadedGroups = asArray(await api.get("/groups"));
+        if (generation !== groupLoadGeneration) return;
+        groups = loadedGroups;
         const liveGroupIds = new Set(groups.map((group) => String(group.id || "")));
         for (const groupId of groupMemberDrafts.keys()) if (!liveGroupIds.has(groupId)) groupMemberDrafts.delete(groupId);
         renderGroups();
       }
-      catch (error) { groups = []; groupsBody.innerHTML = tableState(4, publicError(error, "Não foi possível carregar os grupos."), "error"); }
+      catch (error) {
+        if (generation !== groupLoadGeneration) return;
+        groups = []; groupsBody.innerHTML = tableState(4, publicError(error, "Não foi possível carregar os grupos."), "error");
+      }
     }
     async function loadQuarantine() {
       quarantineBody.innerHTML = tableState(6, "Carregando quarentena…", "loading");
