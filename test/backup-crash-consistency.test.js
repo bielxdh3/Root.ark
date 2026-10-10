@@ -8,6 +8,29 @@ const test = require("node:test");
 
 const CHILD_HELPER = path.resolve(__dirname, "..", "scripts", "test-helpers", "backup-crash-child.js");
 
+function findDefinitelyDeadPid() {
+  const highestValidPid = 0x7fffffff;
+  for (let pid = highestValidPid; pid > highestValidPid - 1024; pid -= 1) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error.code === "ESRCH") return pid;
+      if (error.code !== "EPERM") throw error;
+    }
+  }
+  throw new Error("could not find a valid unused PID for the crash-recovery fixture");
+}
+
+function assertPidIsDead(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if (error.code === "ESRCH") return;
+    throw error;
+  }
+  throw new Error("crash-recovery fixture PID became live");
+}
+
 function startChild(runtime, mode, data = {}, env = {}) {
   const child = spawn(process.execPath, [CHILD_HELPER, JSON.stringify({ mode, data })], {
     cwd: runtime,
@@ -35,6 +58,23 @@ function newRuntime(prefix) {
   fs.mkdirSync(path.join(runtime, "data", "backups"), { recursive: true });
   fs.mkdirSync(path.join(runtime, "uploads"), { recursive: true });
   return runtime;
+}
+
+function makeTakeoverOwnerDefinitelyDead(runtime, lockContainsOwner) {
+  const deadPid = findDefinitelyDeadPid();
+  const backupDir = path.join(runtime, "data", "backups");
+  const lock = path.join(backupDir, ".backup.lock");
+  const authorityPath = path.join(backupDir, ".backup.lock.takeover", "authority.json");
+  if (lockContainsOwner) {
+    const record = JSON.parse(fs.readFileSync(lock, "utf8"));
+    fs.writeFileSync(lock, JSON.stringify({ ...record, pid: deadPid }));
+  } else {
+    assert.throws(() => fs.readFileSync(lock, "utf8"), { code: "ENOENT" });
+  }
+  const authority = JSON.parse(fs.readFileSync(authorityPath, "utf8"));
+  assert.equal(typeof authority.processInstanceId, "string");
+  fs.writeFileSync(authorityPath, JSON.stringify({ ...authority, pid: deadPid }));
+  assertPidIsDead(deadPid);
 }
 
 function criticalAction(enteredPath, criticalPath) {
@@ -155,6 +195,7 @@ test("backup operation lock is exclusive across real child processes", { timeout
       fs.utimesSync(lock, new Date(0), new Date(0));
       const crashed = await runChild(runtime, action);
       assert.notEqual(crashed.code, 0);
+      makeTakeoverOwnerDefinitelyDead(runtime, false);
       const recoveredAction = criticalAction(path.join(runtime, "entered.log"), path.join(runtime, "critical"));
       const recovered = await runChild(runtime, recoveredAction.mode, recoveredAction.data);
       assert.equal(recovered.code, 0, recovered.stderr);
@@ -171,6 +212,7 @@ test("backup operation lock is exclusive across real child processes", { timeout
       fs.utimesSync(lock, new Date(0), new Date(0));
       const crashed = await runChild(runtime, action);
       assert.notEqual(crashed.code, 0);
+      makeTakeoverOwnerDefinitelyDead(runtime, true);
       const recoveredAction = criticalAction(path.join(runtime, "entered.log"), path.join(runtime, "critical"));
       const recovered = await runChild(runtime, recoveredAction.mode, recoveredAction.data);
       assert.equal(recovered.code, 0, recovered.stderr);

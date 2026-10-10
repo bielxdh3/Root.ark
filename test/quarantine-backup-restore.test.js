@@ -1326,7 +1326,12 @@ test("quarantine restore recovers its prior state after process interruption", {
       const assert = require("node:assert/strict");
       const fs = require("node:fs");
       const path = require("node:path");
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
       const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const staleLock = JSON.parse(fs.readFileSync(backupService.LOCK_FILE, "utf8"));
+      staleLock.pid = process.pid;
+      staleLock.processInstanceId = "interrupted-process-instance";
+      fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify(staleLock));
       restoreService.recoverQuarantineRestore();
       assert.deepEqual(JSON.parse(fs.readFileSync(path.join(process.cwd(), "data", "quarantine.json"), "utf8")), { items: [{ id: "current", storedQuarantineFilename: "current.bin" }] });
       assert.equal(fs.readFileSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "current.bin"), "utf8"), "current-payload");

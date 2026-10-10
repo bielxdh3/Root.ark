@@ -67,6 +67,62 @@ test("scheduler, lock, filename, and retention meta-remediation matrix", async (
   await t.test("backup/restore exclusion", () => { const release = backupService.acquireLock("backup"); try { assert.throws(() => backupService.acquireLock("restore"), { code: "BACKUP_LOCKED" }); } finally { release(); } });
   await t.test("backup/delete exclusion", () => { const release = backupService.acquireLock("backup"); try { assert.throws(() => backupService.acquireLock("delete"), { code: "BACKUP_LOCKED" }); } finally { release(); } });
   await t.test("live external lock", () => { reset(); fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify({ token: "external", operation: "backup", pid: process.pid, runtimeRoot: runtime })); fs.utimesSync(backupService.LOCK_FILE, new Date(0), new Date(0)); assert.throws(() => backupService.acquireLock("backup"), { code: "BACKUP_LOCKED" }); fs.rmSync(backupService.LOCK_FILE, { force: true }); });
+  await t.test("same-process versioned lock identity remains live", () => {
+    reset();
+    const release = backupService.acquireLock("backup");
+    const record = JSON.parse(fs.readFileSync(backupService.LOCK_FILE, "utf8"));
+    release();
+    fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify(record));
+    assert.throws(() => backupService.acquireLock("restore"), { code: "BACKUP_LOCKED" });
+    fs.rmSync(backupService.LOCK_FILE, { force: true });
+  });
+  await t.test("reused PID does not keep a prior process lock alive", () => {
+    reset();
+    const release = backupService.acquireLock("backup");
+    const record = JSON.parse(fs.readFileSync(backupService.LOCK_FILE, "utf8"));
+    release();
+    fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify({ ...record, pid: process.pid, processInstanceId: "prior-process-instance" }));
+    const recovered = backupService.acquireLock("restore");
+    recovered();
+  });
+  await t.test("legacy versioned lock without process identity remains fail-closed", () => {
+    reset();
+    const record = {
+      formatVersion: 1,
+      token: "legacy-versioned-lock",
+      operation: "restore",
+      pid: process.pid,
+      instanceId: process.env.ROOTARK_INSTANCE_ID || os.hostname() || "default",
+      startedAt: new Date().toISOString(),
+      runtimeRoot: runtime,
+    };
+    fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify(record));
+    assert.throws(() => backupService.acquireLock("restore"), { code: "BACKUP_LOCKED" });
+    fs.rmSync(backupService.LOCK_FILE, { force: true });
+  });
+  await t.test("same PID from a distinct instance remains live", () => {
+    reset();
+    const previousInstanceId = process.env.ROOTARK_INSTANCE_ID;
+    process.env.ROOTARK_INSTANCE_ID = "rootark-lock-test-local";
+    try {
+      const record = {
+        formatVersion: 1,
+        token: "remote-instance-lock",
+        operation: "restore",
+        pid: process.pid,
+        processInstanceId: "remote-process-instance",
+        instanceId: "rootark-lock-test-remote",
+        startedAt: new Date().toISOString(),
+        runtimeRoot: runtime,
+      };
+      fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify(record));
+      assert.throws(() => backupService.acquireLock("restore"), { code: "BACKUP_LOCKED" });
+    } finally {
+      if (previousInstanceId === undefined) delete process.env.ROOTARK_INSTANCE_ID;
+      else process.env.ROOTARK_INSTANCE_ID = previousInstanceId;
+      fs.rmSync(backupService.LOCK_FILE, { force: true });
+    }
+  });
   await t.test("stale dead PID", () => { reset(); fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify({ token: "dead", pid: 99999999 })); fs.utimesSync(backupService.LOCK_FILE, new Date(0), new Date(0)); const release = backupService.acquireLock("backup"); release(); });
   await t.test("stale age", () => { reset(); fs.writeFileSync(backupService.LOCK_FILE, "broken"); fs.utimesSync(backupService.LOCK_FILE, new Date(0), new Date(0)); const release = backupService.acquireLock("backup"); release(); });
   await t.test("malformed recent lock", () => { reset(); fs.writeFileSync(backupService.LOCK_FILE, "broken"); assert.throws(() => backupService.acquireLock("backup"), { code: "BACKUP_LOCKED" }); fs.rmSync(backupService.LOCK_FILE, { force: true }); });
