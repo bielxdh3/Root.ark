@@ -4,7 +4,7 @@
 
 **Status at this code milestone: PARTIAL.** The application-code state recorded here is exact `Root/main` SHA `6d4548808bf7090fc0ae13b238ab6cf948f67d5a`. The mission baseline is `1df5e4640d4aea7dc700f2088059f489c2e51af0`; the live branch before PR #147 merged was `a6bfefc93c545ecc40ec5129206a2695fed2713a`. This is a dated source-code and GitHub snapshot. The documentation-only reconciliation has its own commit and exact-SHA checks, which are recorded in the final engineering report rather than this pre-documentation code snapshot.
 
-The supported restore path now has a durable, restart-recoverable local commit boundary and idempotent, durable provider reconciliation. It is not a simultaneous atomic switch across quarantine, files, JSON/SQLite, and cloud providers. Provider interoperability, deployed proxy/provider topology, and a real-browser quarantine-ingestion flow are not proven here.
+The supported restore path now has a durable, restart-recoverable local commit boundary and idempotent, durable provider reconciliation. It is not a simultaneous atomic switch across quarantine, files, JSON/SQLite, and cloud providers. A supplemental browser run on the same application tree later proved quarantine ingestion and applied local restore flows with disposable data. Provider interoperability and deployed proxy/provider topology remain unverified.
 
 ## Published work
 
@@ -62,7 +62,15 @@ Covered flows included login and TOTP enrollment/challenge/replay protection; fi
 
 Responsive checks found no horizontal overflow at the tested widths. Initial Tab reached the skip link; the tested permission dialog had a programmatic label, focused its close control, and kept Tab navigation inside the dialog. Public text shares did not show Preview; PDF shares did and opened successfully. The corrected public-share tab ended with zero console errors/warnings; expected wrong-password, replay, and injected-503 responses were observed in the broader test session.
 
-Residual browser limits: quarantine ingestion was not proven (only the empty state was visited); folder expiration was set and read back but not allowed to elapse; restore was confirmed and cancelled in the browser rather than applied to user data; no live cloud provider was used. These remain unverified acceptance boundaries, not passes.
+Supplemental real-browser validation ran on 2026-10-10 against the exact PR #148 application tree (`265aaf9f5a2f838f239ddb8b623dd2077476941d`) in a disposable runtime at desktop 929×925, DPR 1, Chromium 150 on Windows. The runtime used fresh JSON data, explicit development bootstrap, manual backup enabled, and automatic backups disabled; no existing deployment or user data was touched.
+
+- Uploading disposable `closure-ui-sample.txt` returned `POST /upload` 415; the Administration UI listed it in quarantine as `suspicious_extension`. The exact authorized fixture was permanently deleted through the UI and `DELETE /quarantine/:id` returned 200.
+- A pending disposable upload was approved through the UI (`POST /approve/...` 200) and appeared in current files. A second pending upload was rejected through the UI (`POST /reject/...` 200) and left the pending list.
+- A 15-minute, one-view password-protected share opened in a fresh anonymous Chromium session without login; the password flow returned 200 and the page showed the file and view limit. No download was performed.
+- UI-created temporary folder metadata showed the interface's one-hour minimum. To verify elapsed expiration without waiting an hour or changing clocks, the disposable folder was updated through the supported authenticated `PUT /folders/:id/temporary` route with its explicit `expiresAt` field and normal cookie/CSRF checks. The route returned 200 for expiry `2026-10-10T18:58:58.737Z` and the UI read back the timestamp. At `2026-10-10T18:59:24.694Z`, the 60-second cleanup job had removed the folder; a reload 26 seconds later and `GET /folders` 200 no longer listed it.
+- The first backup attempt returned a generic 500 because the isolated test runtime had `BACKUP_ENABLED=false`; no user data was involved. After enabling manual backups and leaving automatic backups disabled in that disposable runtime, creation returned `POST /backups` 201 and produced an 8.2 KB manifest. The UI applied that backup; `POST /backups/<id>/restore` returned 200 and showed the restored state. Version restore also succeeded through the UI (`POST /restore/closure-review-approve.md/v/1` 200), changing the test file from 49 B to 28 B.
+
+The earlier browser flow created a 1-hour temporary folder but did not wait for it; the supplemental run above separately proves elapsed-expiry behavior. The browser console showed the initial unauthenticated `/auth/me` 401, expected extension-block 415, the test-configuration 500 above, and WebSocket errors during the deliberate server stop/restart; the share form emitted an autocomplete warning. No JavaScript application error was seen in the successful flows. No live cloud provider was used, so provider interoperability remains unverified. Browser evidence was recorded from the Chromium UI and network responses; no screenshot artifact was committed.
 
 ## Restore transaction semantics
 
@@ -92,5 +100,5 @@ The merged source enforces fail-closed production bootstrap, explicit trusted-pr
 
 - The final engineering report must cite the exact post-documentation `Root/main` SHA and its push-triggered Security Regression on Ubuntu and Windows, CodeQL, Dependency Review, Pages where configured, release gate, full tests, artifact/secret checks, and clean checkout. The checks above apply only to `6d454…`.
 - The fresh independent final review must use that exact post-documentation SHA, including auth/session/TOTP, CSRF/proxy, mutation routes, upload/storage, backup/restore, sync/WebDAV, sharing/ZK boundaries, CI, docs, and remaining issues/PRs. This dated snapshot predates that review.
-- Keep quarantine-ingestion browser proof and folder-expiration-elapse proof explicitly open unless exercised with disposable data.
+- Keep live cloud-provider interoperability and deployed proxy/provider topology unverified; they were not exercised against a real deployment.
 - Keep issues #63–68 and #94 and incomplete PRs #95/#97 open until their actual acceptance criteria pass.
