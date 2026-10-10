@@ -60,14 +60,16 @@ function newRuntime(prefix) {
   return runtime;
 }
 
-function makeTakeoverOwnerDefinitelyDead(runtime) {
+function makeTakeoverOwnerDefinitelyDead(runtime, lockContainsOwner) {
   const deadPid = findDefinitelyDeadPid();
   const backupDir = path.join(runtime, "data", "backups");
   const lock = path.join(backupDir, ".backup.lock");
   const authorityPath = path.join(backupDir, ".backup.lock.takeover", "authority.json");
-  if (fs.existsSync(lock)) {
+  if (lockContainsOwner) {
     const record = JSON.parse(fs.readFileSync(lock, "utf8"));
     fs.writeFileSync(lock, JSON.stringify({ ...record, pid: deadPid }));
+  } else {
+    assert.throws(() => fs.readFileSync(lock, "utf8"), { code: "ENOENT" });
   }
   const authority = JSON.parse(fs.readFileSync(authorityPath, "utf8"));
   assert.equal(typeof authority.processInstanceId, "string");
@@ -193,7 +195,7 @@ test("backup operation lock is exclusive across real child processes", { timeout
       fs.utimesSync(lock, new Date(0), new Date(0));
       const crashed = await runChild(runtime, action);
       assert.notEqual(crashed.code, 0);
-      makeTakeoverOwnerDefinitelyDead(runtime);
+      makeTakeoverOwnerDefinitelyDead(runtime, false);
       const recoveredAction = criticalAction(path.join(runtime, "entered.log"), path.join(runtime, "critical"));
       const recovered = await runChild(runtime, recoveredAction.mode, recoveredAction.data);
       assert.equal(recovered.code, 0, recovered.stderr);
@@ -210,7 +212,7 @@ test("backup operation lock is exclusive across real child processes", { timeout
       fs.utimesSync(lock, new Date(0), new Date(0));
       const crashed = await runChild(runtime, action);
       assert.notEqual(crashed.code, 0);
-      makeTakeoverOwnerDefinitelyDead(runtime);
+      makeTakeoverOwnerDefinitelyDead(runtime, true);
       const recoveredAction = criticalAction(path.join(runtime, "entered.log"), path.join(runtime, "critical"));
       const recovered = await runChild(runtime, recoveredAction.mode, recoveredAction.data);
       assert.equal(recovered.code, 0, recovered.stderr);
