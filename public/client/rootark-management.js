@@ -113,6 +113,7 @@
     }
     target.innerHTML = adminMarkup();
     let users = [], groups = [], quarantine = [], folders = [], eligibleUsers = [], allowedUsers = [];
+    const groupMemberDrafts = new Map();
     const usersBody = document.getElementById("users-body");
     const groupsBody = document.getElementById("groups-body");
     const quarantineBody = document.getElementById("quarantine-body");
@@ -144,7 +145,9 @@
       if (!groups.length) { groupsBody.innerHTML = tableState(4, "Nenhum grupo cadastrado.", "empty"); return; }
       groupsBody.innerHTML = groups.map((group, index) => {
         const members = asArray(group.members).map(String);
-        return `<tr><th scope="row">${esc(group.name)}</th><td>${members.length ? esc(members.join(", ")) : '<span class="muted">Sem membros</span>'}</td><td><input class="field" type="text" data-group-members="${index}" value="${esc(members.join(", "))}" aria-label="Membros de ${esc(group.name)}" /></td><td><div class="row-actions"><button type="button" class="button button-primary button-small" data-action="save-group" data-group-index="${index}">Salvar</button><button type="button" class="button button-danger button-small" data-action="delete-group" data-group-index="${index}">Excluir</button></div></td></tr>`;
+        const groupId = String(group.id || "");
+        const draft = groupMemberDrafts.has(groupId) ? groupMemberDrafts.get(groupId) : members.join(", ");
+        return `<tr><th scope="row">${esc(group.name)}</th><td>${members.length ? esc(members.join(", ")) : '<span class="muted">Sem membros</span>'}</td><td><input class="field" type="text" data-group-members="${index}" data-group-id="${esc(groupId)}" value="${esc(draft)}" aria-label="Membros de ${esc(group.name)}" /></td><td><div class="row-actions"><button type="button" class="button button-primary button-small" data-action="save-group" data-group-index="${index}">Salvar</button><button type="button" class="button button-danger button-small" data-action="delete-group" data-group-index="${index}">Excluir</button></div></td></tr>`;
       }).join("");
     }
     function renderQuarantine() {
@@ -178,7 +181,12 @@
     }
     async function loadGroups() {
       groupsBody.innerHTML = tableState(4, "Carregando grupos…", "loading");
-      try { groups = asArray(await api.get("/groups")); renderGroups(); }
+      try {
+        groups = asArray(await api.get("/groups"));
+        const liveGroupIds = new Set(groups.map((group) => String(group.id || "")));
+        for (const groupId of groupMemberDrafts.keys()) if (!liveGroupIds.has(groupId)) groupMemberDrafts.delete(groupId);
+        renderGroups();
+      }
       catch (error) { groups = []; groupsBody.innerHTML = tableState(4, publicError(error, "Não foi possível carregar os grupos."), "error"); }
     }
     async function loadQuarantine() {
@@ -276,7 +284,18 @@
         form.reset(); setFeedback(feedback, "Grupo criado.", "success"); ui.toast("Grupo criado.", "success"); await loadGroups();
       } catch (error) { const message = publicError(error, "Não foi possível criar o grupo."); if (message) setFeedback(feedback, message, "error"); }
       finally { button.disabled = false; }
-    });    folderSelect.addEventListener("change", loadFiles);
+    });
+    target.addEventListener("input", (event) => {
+      const input = event.target, groupId = String(input && input.dataset && input.dataset.groupId || "");
+      if (!groupId) return;
+      const group = groups.find((item) => String(item.id || "") === groupId);
+      if (!group) return;
+      const persistedValue = asArray(group.members).map(String).join(", ");
+      const draftValue = String(input.value == null ? "" : input.value);
+      if (draftValue === persistedValue) groupMemberDrafts.delete(groupId);
+      else groupMemberDrafts.set(groupId, draftValue);
+    });
+    folderSelect.addEventListener("change", loadFiles);
     fileSelect.addEventListener("change", loadSelectedFileAccess);
     saveAccess.addEventListener("click", async () => {
       const folderId = folderSelect.value, name = fileSelect.value;
@@ -323,7 +342,7 @@
         if (!group || !input) return;
         const members = input.value.split(",").map((item) => item.trim()).filter(Boolean);
         button.disabled = true;
-        try { await api.put(`/groups/${encodeURIComponent(group.id)}/members`, { members }); setFeedback(document.getElementById("group-feedback"), "Membros atualizados.", "success"); ui.toast("Membros do grupo atualizados.", "success"); await loadGroups(); }
+        try { await api.put(`/groups/${encodeURIComponent(group.id)}/members`, { members }); groupMemberDrafts.delete(String(group.id || "")); setFeedback(document.getElementById("group-feedback"), "Membros atualizados.", "success"); ui.toast("Membros do grupo atualizados.", "success"); await loadGroups(); }
         catch (error) { const message = publicError(error, "Não foi possível atualizar os membros."); if (message) setFeedback(document.getElementById("group-feedback"), message, "error"); button.disabled = false; }
         return;
       }
