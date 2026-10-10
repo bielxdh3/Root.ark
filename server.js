@@ -179,6 +179,13 @@ const CLAMAV_PORT = Number(process.env.CLAMAV_PORT || 3310);
 const UPLOAD_BLOCK_EXECUTABLES = parseEnvBoolean(process.env.UPLOAD_BLOCK_EXECUTABLES, true);
 const UPLOAD_QUARANTINE_DIR = getUploadQuarantineDir();
 const UPLOAD_FAIL_CLOSED = parseEnvBoolean(process.env.UPLOAD_FAIL_CLOSED, true);
+const DEFAULT_UPLOAD_SUSPICIOUS_EXTENSIONS = [".exe", ".bat", ".cmd", ".scr", ".msi", ".ps1", ".vbs", ".jar", ".com"];
+const UPLOAD_SUSPICIOUS_EXTENSIONS = new Set(
+  String(process.env.UPLOAD_SUSPICIOUS_EXTENSIONS || DEFAULT_UPLOAD_SUSPICIOUS_EXTENSIONS.join(","))
+    .split(",")
+    .map((extension) => extension.trim().toLowerCase())
+    .filter(Boolean)
+);
 const NODE_ENV = String(process.env.NODE_ENV || "").trim().toLowerCase();
 const IS_PRODUCTION = NODE_ENV === "production";
 if (!new Set(["clamav", "disabled"]).has(UPLOAD_SCAN_PROVIDER)) {
@@ -187,15 +194,15 @@ if (!new Set(["clamav", "disabled"]).has(UPLOAD_SCAN_PROVIDER)) {
 if (IS_PRODUCTION && (!UPLOAD_SCAN_ENABLED || UPLOAD_SCAN_PROVIDER !== "clamav" || !UPLOAD_FAIL_CLOSED)) {
   throw new Error("Production requires enabled ClamAV upload scanning with fail-closed behavior");
 }
+if (IS_PRODUCTION && !UPLOAD_BLOCK_EXECUTABLES) {
+  throw new Error("Production requires executable extension blocking");
+}
+if (IS_PRODUCTION && DEFAULT_UPLOAD_SUSPICIOUS_EXTENSIONS.some((extension) => !UPLOAD_SUSPICIOUS_EXTENSIONS.has(extension))) {
+  throw new Error("Production requires the default suspicious-extension denylist");
+}
 if ((!UPLOAD_SCAN_ENABLED || UPLOAD_SCAN_PROVIDER === "disabled" || !UPLOAD_FAIL_CLOSED) && !["development", "test"].includes(NODE_ENV)) {
   throw new Error("Upload scan bypass requires NODE_ENV=development or test");
 }
-const UPLOAD_SUSPICIOUS_EXTENSIONS = new Set(
-  String(process.env.UPLOAD_SUSPICIOUS_EXTENSIONS || ".exe,.bat,.cmd,.scr,.msi,.ps1,.vbs,.jar,.com")
-    .split(",")
-    .map((extension) => extension.trim().toLowerCase())
-    .filter(Boolean)
-);
 const WEBDAV_ENABLED = parseEnvBoolean(process.env.WEBDAV_ENABLED, false);
 const WEBDAV_PATH = normalizeWebDavMountPath(process.env.WEBDAV_PATH || "/dav");
 const WEBDAV_ALLOW_DELETE = parseEnvBoolean(process.env.WEBDAV_ALLOW_DELETE, false);
@@ -4235,13 +4242,15 @@ function quarantineUploadedFile(req, options) {
 }
 
 async function scanUploadBeforePending(req, options) {
-  if (!UPLOAD_SCAN_ENABLED) {
-    return { allowed: true, scanResult: { status: "skipped", provider: "disabled" } };
-  }
-
   const fileName = path.basename(options.fileName || options.originalName || "");
   const folderId = options.folderId || ROOT_FOLDER_ID;
-  const extension = path.extname(fileName).toLowerCase();
+  let extensionNameEnd = fileName.length;
+  while (extensionNameEnd > 0) {
+    const lastCharacter = fileName[extensionNameEnd - 1];
+    if (lastCharacter !== "." && lastCharacter !== " ") break;
+    extensionNameEnd -= 1;
+  }
+  const extension = path.extname(fileName.slice(0, extensionNameEnd)).toLowerCase();
   const auditTarget = { type: "file", id: fileName };
 
   if (UPLOAD_BLOCK_EXECUTABLES && UPLOAD_SUSPICIOUS_EXTENSIONS.has(extension)) {
@@ -4264,6 +4273,10 @@ async function scanUploadBeforePending(req, options) {
       quarantine,
       scanResult,
     };
+  }
+
+  if (!UPLOAD_SCAN_ENABLED) {
+    return { allowed: true, scanResult: { status: "skipped", provider: "disabled" } };
   }
 
   if (UPLOAD_SCAN_PROVIDER !== "clamav") {

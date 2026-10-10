@@ -439,11 +439,14 @@ test("unknown upload scan providers fail startup instead of skipping scanning", 
   assert.match(harness.stderr.join(""), /UPLOAD_SCAN_PROVIDER/);
 });
 
-test("non-development startup rejects disabled or fail-open upload scanning", { timeout: 15_000 }, async (t) => {
+test("non-development startup rejects disabled or fail-open upload scanning", { timeout: 30_000 }, async (t) => {
   const configurations = [
     { env: { NODE_ENV: "production", UPLOAD_SCAN_PROVIDER: "disabled" }, error: /production.*upload scanning/i },
     { env: { NODE_ENV: "production", UPLOAD_SCAN_PROVIDER: "clamav", UPLOAD_FAIL_CLOSED: "false" }, error: /production.*upload scanning/i },
     { env: { NODE_ENV: "production", UPLOAD_SCAN_ENABLED: "false", UPLOAD_SCAN_PROVIDER: "clamav" }, error: /production.*upload scanning/i },
+    { env: { NODE_ENV: "production", UPLOAD_SCAN_PROVIDER: "clamav", UPLOAD_BLOCK_EXECUTABLES: "false" }, error: /production.*executable extension blocking/i },
+    { env: { NODE_ENV: "production", UPLOAD_SCAN_PROVIDER: "clamav", UPLOAD_SUSPICIOUS_EXTENSIONS: ".txt" }, error: /production.*default suspicious-extension denylist/i },
+    { env: { NODE_ENV: "production", UPLOAD_SCAN_PROVIDER: "clamav", UPLOAD_SUSPICIOUS_EXTENSIONS: ", " }, error: /production.*default suspicious-extension denylist/i },
     { env: { NODE_ENV: "staging", UPLOAD_SCAN_PROVIDER: "disabled" }, error: /bypass requires NODE_ENV=development or test/i },
   ];
 
@@ -453,6 +456,18 @@ test("non-development startup rejects disabled or fail-open upload scanning", { 
     assert.notEqual(exitCode, 0);
     assert.match(harness.stderr.join(""), error);
   }
+});
+
+test("production allows additive suspicious extensions while retaining its required denylist", { timeout: 15_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    envOverrides: {
+      NODE_ENV: "production",
+      UPLOAD_SCAN_PROVIDER: "clamav",
+      UPLOAD_SUSPICIOUS_EXTENSIONS: ".exe,.bat,.cmd,.scr,.msi,.ps1,.vbs,.jar,.com,.custom",
+    },
+  });
+
+  assert.equal(harness.child.exitCode, null);
 });
 
 test("wrong encrypted-file password stays an input error and records failed decrypt only", { timeout: 30_000 }, async (t) => {
@@ -522,6 +537,94 @@ test("suspicious executable extensions are quarantined before pending upload reg
   const quarantinedPath = path.join(harness.quarantineDir, items[0].storedQuarantineFilename);
   assert.equal(isContained(harness.quarantineDir, quarantinedPath), true);
   assert.deepEqual(fs.readFileSync(quarantinedPath), Buffer.from("plain text only"));
+});
+
+test("suspicious executable extensions remain blocked with Windows trailing-dot or trailing-space aliases", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t);
+  const session = await login(harness.port, "uploader", harness.password);
+  const fixtures = [
+    ["payload-trailing-dot.exe.", Buffer.from("trailing dot executable fixture")],
+    ["payload-trailing-space.exe ", Buffer.from("trailing space executable fixture")],
+  ];
+
+  for (const [fileName, bytes] of fixtures) {
+    const response = await upload(harness.port, session, fileName, bytes);
+    assert.equal(response.status, 415, response.body);
+  }
+
+  assert.deepEqual(pending(harness.dir), {});
+  const items = quarantine(harness.dir).items;
+  assert.equal(items.length, fixtures.length);
+  assert.ok(items.every((item) => item.reason === "suspicious_extension"));
+  const quarantinedBytes = items.map((item) => fs.readFileSync(path.join(harness.quarantineDir, item.storedQuarantineFilename)).toString());
+  assert.deepEqual(quarantinedBytes.sort(), fixtures.map(([, bytes]) => bytes.toString()).sort());
+});
+
+test("suspicious executable extensions remain quarantined when development scanning is disabled", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t, { envOverrides: { UPLOAD_SCAN_ENABLED: "false", WEBDAV_ENABLED: "true" } });
+  const session = await login(harness.port, "uploader", harness.password);
+  const bytesByRoute = new Map([
+    ["multipart", Buffer.from("inert multipart fixture")],
+    ["chunked", Buffer.from("inert chunked fixture")],
+    ["webdav", Buffer.from("inert WebDAV fixture")],
+  ]);
+  const simple = await upload(harness.port, session, "disabled-scan-multipart.exe.", bytesByRoute.get("multipart"));
+  const chunked = await uploadChunk(harness.port, session, {
+    uploadId: "disabled-scan-executable",
+    originalName: "disabled-scan-chunked.exe ",
+    chunkIndex: 0,
+    totalChunks: 1,
+    bytes: bytesByRoute.get("chunked"),
+  });
+  const webDav = await request(harness.port, `/dav/${FOLDER_ID}/disabled-scan-webdav.exe.`, {
+    method: "PUT",
+    headers: {
+      authorization: "Basic " + Buffer.from(`uploader:${harness.password}`).toString("base64"),
+      "content-length": bytesByRoute.get("webdav").length,
+    },
+    body: bytesByRoute.get("webdav"),
+  });
+  const items = quarantine(harness.dir).items;
+
+  for (const response of [simple, chunked, webDav]) assert.equal(response.status, 415, response.body);
+  assert.deepEqual(pending(harness.dir), {});
+  assert.equal(items.length, bytesByRoute.size);
+  assert.ok(items.every((item) => item.reason === "suspicious_extension"));
+  const quarantinedBytes = items.map((item) => {
+    const quarantinedPath = path.join(harness.quarantineDir, item.storedQuarantineFilename);
+    assert.equal(isContained(harness.quarantineDir, quarantinedPath), true);
+    return fs.readFileSync(quarantinedPath).toString();
+  });
+  assert.deepEqual(quarantinedBytes.sort(), Array.from(bytesByRoute.values(), (bytes) => bytes.toString()).sort());
+  assert.deepEqual(filesUnder(path.join(harness.dir, "uploads")), []);
+  assert.deepEqual(filesUnder(path.join(harness.dir, "temp", ".incoming")), []);
+  assert.deepEqual(filesUnder(path.join(harness.dir, "temp", FOLDER_ID)), []);
+  assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
+  assert.deepEqual(filesUnder(path.join(harness.chunkRoot, FOLDER_ID)), []);
+});
+
+test("ordinary text uploads remain available when development scanning is disabled", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t, { envOverrides: { UPLOAD_SCAN_ENABLED: "false" } });
+  const session = await login(harness.port, "uploader", harness.password);
+  const bytes = Buffer.from("ordinary text upload");
+  const response = await upload(harness.port, session, "disabled-scan.txt", bytes);
+
+  assert.equal(response.status, 200, response.body);
+  assert.equal(pending(harness.dir)[`${FOLDER_ID}/disabled-scan.txt`].folderId, FOLDER_ID);
+  assert.deepEqual(fs.readFileSync(path.join(harness.dir, "temp", FOLDER_ID, "disabled-scan.txt")), bytes);
+  assert.deepEqual(quarantine(harness.dir).items, []);
+});
+
+test("development scanning can explicitly opt out of the executable extension block", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t, { envOverrides: { UPLOAD_SCAN_ENABLED: "false", UPLOAD_BLOCK_EXECUTABLES: "false" } });
+  const session = await login(harness.port, "uploader", harness.password);
+  const bytes = Buffer.from("explicit development opt-out fixture");
+  const response = await upload(harness.port, session, "opt-out.exe", bytes);
+
+  assert.equal(response.status, 200, response.body);
+  assert.equal(pending(harness.dir)[`${FOLDER_ID}/opt-out.exe`].folderId, FOLDER_ID);
+  assert.deepEqual(fs.readFileSync(path.join(harness.dir, "temp", FOLDER_ID, "opt-out.exe")), bytes);
+  assert.deepEqual(quarantine(harness.dir).items, []);
 });
 
 test("users without upload permission are rejected before Multer creates artifacts", { timeout: 30_000 }, async (t) => {
