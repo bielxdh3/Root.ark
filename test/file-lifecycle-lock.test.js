@@ -9,7 +9,7 @@ const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
 
 function spawnLifecycleLockTestChild(mode, directory, markerPath) {
   const projectRoot = path.resolve(__dirname, "..");
-  const childPath = path.join(__dirname, "fixtures", "file-lifecycle-lock-child.cjs");
+  const childPath = path.join(__dirname, "..", "scripts", "fixtures", "file-lifecycle-lock-child.cjs");
   return spawn(process.execPath, [childPath], {
     cwd: projectRoot,
     env: {
