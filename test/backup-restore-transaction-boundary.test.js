@@ -2637,6 +2637,8 @@ test("restart rolls back crashes inside quarantine journal and commit boundaries
     runFixture(`
       const { spawnSync } = require("node:child_process");
       const restorePath = require.resolve(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const ownerPidPath = path.join(dataDir, "restore-crash-owner.pid");
+      const lockPath = path.join(dataDir, "backups", ".backup.lock");
       const metadataPath = path.join(dataDir, "quarantine.json");
       const currentPayload = path.join(quarantineDir, "live.bin");
       const archivedPayload = path.join(quarantineDir, "archived.bin");
@@ -2648,11 +2650,19 @@ test("restart rolls back crashes inside quarantine journal and commit boundaries
         fs.rmSync(archivedPayload, { force: true });
         write(currentPayload, "live payload");
         write(path.join(dataDir, "runtime.json"), "live state");
-        const crashScript = "const restore=require(" + JSON.stringify(restorePath) + ");restore.restoreBackup(" + JSON.stringify(backup.id) + ",{confirmation:'RESTORE',failureInjector(step){if(step===" + JSON.stringify(process.env.CRASH_STEP) + ")process.exit(86)}}).then(()=>process.exit(0)).catch(error=>{console.error(error);process.exit(1)});";
+        const crashScript = "const fs=require('node:fs');fs.writeFileSync(" + JSON.stringify(ownerPidPath) + ",String(process.pid));const restore=require(" + JSON.stringify(restorePath) + ");restore.restoreBackup(" + JSON.stringify(backup.id) + ",{confirmation:'RESTORE',failureInjector(step){if(step===" + JSON.stringify(process.env.CRASH_STEP) + ")process.exit(86)}}).then(()=>process.exit(0)).catch(error=>{console.error(error);process.exit(1)});";
         const crashed = spawnSync(process.execPath, ["-e", crashScript], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 20_000 });
         assert.equal(crashed.status, 86, crashed.stderr || crashed.stdout);
+        const crashedOwnerPid = Number(fs.readFileSync(ownerPidPath, "utf8"));
+        assert.ok(Number.isInteger(crashedOwnerPid) && crashedOwnerPid > 0, "the interrupted restore owner must be recorded");
+        const lockRecord = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+        assert.equal(lockRecord.pid, crashedOwnerPid, "the persisted backup lock must belong to the interrupted child");
+        assert.equal(typeof lockRecord.processInstanceId, "string", "the crashed lock must retain its process identity");
         const recoveryScript = [
           "const assert=require('node:assert/strict'),fs=require('node:fs'),restore=require(" + JSON.stringify(restorePath) + ");",
+          "const lockPath=" + JSON.stringify(lockPath) + ",ownerPidPath=" + JSON.stringify(ownerPidPath) + ";",
+          "const lockRecord=JSON.parse(fs.readFileSync(lockPath,'utf8'));assert.equal(lockRecord.pid,Number(fs.readFileSync(ownerPidPath,'utf8')));",
+          "lockRecord.pid=process.pid;lockRecord.processInstanceId='stale-crashed-owner-instance';fs.writeFileSync(lockPath,JSON.stringify(lockRecord));",
           "const result=restore.assertNoPendingWholeRestore();assert.equal(result.recovered,true);",
           "assert.deepEqual(JSON.parse(fs.readFileSync(" + JSON.stringify(metadataPath) + ",'utf8')),{items:[{id:'live',storedQuarantineFilename:'live.bin'}]});",
           "assert.equal(fs.readFileSync(" + JSON.stringify(currentPayload) + ",'utf8'),'live payload');",
