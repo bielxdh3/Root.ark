@@ -13,6 +13,12 @@ const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContains
 const restoreProviderOrphans = require("./restoreProviderOrphans");
 
 const BACKUPS_DIR = resolveRuntimePath("data", "backups");
+const SQLITE_BACKUP_STAGE_PREFIX = ".sqlite-backup-";
+const MAX_ORPHAN_SQLITE_BACKUP_STAGES = 128;
+const SQLITE_BACKUP_STAGE_FILES = new Set(["rootark.sqlite", "rootark.sqlite-wal", "rootark.sqlite-shm"]);
+const BACKUP_METADATA_LOCK_NAME = path.basename(backupRepository.MUTATION_LOCK_FILE).toLowerCase();
+const BACKUP_METADATA_LOCK_CLAIM_PREFIX = `${BACKUP_METADATA_LOCK_NAME}.claim-`;
+const BACKUP_METADATA_COORDINATION_DB_PREFIX = path.basename(backupRepository.MUTATION_COORDINATION_DB_FILE).toLowerCase();
 const LOCK_FILE = path.join(BACKUPS_DIR, ".backup.lock");
 const LOCK_TAKEOVER_DIR = `${LOCK_FILE}.takeover`;
 const LOCK_TAKEOVER_META = path.join(LOCK_TAKEOVER_DIR, "authority.json");
@@ -81,6 +87,8 @@ function isSensitivePath(relativePath) {
   if (lowerPath.startsWith(".git/") || lowerPath === ".git") return true;
   if (lowerPath.startsWith("node_modules/") || lowerPath === "node_modules") return true;
   if (lowerPath.startsWith("data/backups/") || lowerPath === "data/backups") return true;
+  if (lowerPath === `data/${BACKUP_METADATA_LOCK_NAME}` || lowerPath.startsWith(`data/${BACKUP_METADATA_LOCK_CLAIM_PREFIX}`)) return true;
+  if (lowerPath.startsWith(`data/${BACKUP_METADATA_COORDINATION_DB_PREFIX}`)) return true;
   if (lowerPath.startsWith("data/.rootark-cloud-")) return true;
   if (lowerPath.startsWith("temp/.chunks/") || lowerPath.startsWith("temp/.incoming/")) return true;
   if (lowerPath.startsWith("data/.rootark-active-requests/")) return true;
@@ -690,11 +698,29 @@ function writeDurableFile(filePath, contents) {
     fs.closeSync(fd);
     fd = undefined;
     fs.renameSync(temporary, filePath);
+    syncDirectory(path.dirname(filePath));
   } catch (error) {
     try { if (fd !== undefined) fs.closeSync(fd); } catch {}
     try { fs.rmSync(temporary, { force: true }); } catch {}
     throw error;
   }
+}
+
+function syncDirectory(directory) {
+  // Windows Node does not expose a supported parent-directory fsync path; directory-entry power-loss durability remains platform-dependent there.
+  if (process.platform === "win32") return;
+  const fd = fs.openSync(directory, "r");
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+}
+
+function renameDurably(source, destination) {
+  fs.renameSync(source, destination);
+  syncDirectory(path.dirname(destination));
+}
+
+function removeDurably(target, options = { force: false }) {
+  fs.rmSync(target, options);
+  syncDirectory(path.dirname(target));
 }
 
 function lockRecord(operation, token, claimToken = null) {
@@ -979,7 +1005,15 @@ function validRetentionTransaction(transaction) {
 
 function persistRetentionTransaction(transaction) {
   const transactionPath = retentionTransactionPath(transaction.transactionId);
-  fs.mkdirSync(path.dirname(transactionPath), { recursive: true });
+  const transactionDirectory = path.dirname(transactionPath);
+  for (const [directory, parent] of [[RETENTION_TRANSACTIONS_DIR, BACKUPS_DIR], [transactionDirectory, RETENTION_TRANSACTIONS_DIR]]) {
+    try {
+      fs.mkdirSync(directory);
+      syncDirectory(parent);
+    } catch (error) {
+      if (error.code !== "EEXIST" || !fs.statSync(directory).isDirectory()) throw error;
+    }
+  }
   writeDurableFile(transactionPath, JSON.stringify(transaction));
   return transactionPath;
 }
@@ -992,7 +1026,7 @@ function listRetentionTransactions() {
     if (!name.startsWith("tx-") || !fs.statSync(directory).isDirectory()) throw new Error("Malformed retention transaction directory");
     const transactionPath = path.join(directory, "transaction.json");
     if (!fs.existsSync(transactionPath)) {
-      if (fs.readdirSync(directory).length === 0) { fs.rmSync(directory, { recursive: true, force: false }); continue; }
+      if (fs.readdirSync(directory).length === 0) { removeDurably(directory, { recursive: true, force: false }); continue; }
       throw new Error("Retention transaction metadata is missing");
     }
     let transaction;
@@ -1011,8 +1045,8 @@ function listRetentionTransactions() {
 }
 
 function removeRetentionTransaction(record) {
-  fs.rmSync(record.transactionPath, { force: false });
-  fs.rmSync(record.directory, { recursive: true, force: false });
+  removeDurably(record.transactionPath, { force: false });
+  removeDurably(record.directory, { recursive: true, force: false });
 }
 
 function sameArchiveBytes(left, right) {
@@ -1037,24 +1071,24 @@ function recoverRetentionTransactions() {
 
     if (transaction.phase === "prepared" || transaction.phase === "archive_moved") {
       if (history.length === 1) {
-        if (originalExists && tombstoneExists) fs.rmSync(tombstone, { force: false });
-        else if (!originalExists && tombstoneExists) fs.renameSync(tombstone, original);
+        if (originalExists && tombstoneExists) removeDurably(tombstone, { force: false });
+        else if (!originalExists && tombstoneExists) renameDurably(tombstone, original);
         else if (!originalExists) throw new Error("Retention history points to a missing archive");
         if (awaitableChecksum(original, transaction.checksum) === false) throw new Error("Retention archive checksum mismatch");
         removeRetentionTransaction(record);
         continue;
       }
       if (transaction.phase === "prepared") throw new Error("Prepared retention transaction lost repository history");
-      if (originalExists && tombstoneExists) { fs.rmSync(original, { force: false }); fs.rmSync(tombstone, { force: false }); }
-      else if (tombstoneExists) fs.rmSync(tombstone, { force: false });
+      if (originalExists && tombstoneExists) { removeDurably(original, { force: false }); removeDurably(tombstone, { force: false }); }
+      else if (tombstoneExists) removeDurably(tombstone, { force: false });
       else if (originalExists) throw new Error("Retention cleanup found an unowned archive");
       removeRetentionTransaction(record);
       continue;
     }
 
     if (history.length > 0) throw new Error("Retention history survived repository-delete phase");
-    if (originalExists && tombstoneExists) { fs.rmSync(original, { force: false }); fs.rmSync(tombstone, { force: false }); }
-    else if (tombstoneExists) fs.rmSync(tombstone, { force: false });
+    if (originalExists && tombstoneExists) { removeDurably(original, { force: false }); removeDurably(tombstone, { force: false }); }
+    else if (tombstoneExists) removeDurably(tombstone, { force: false });
     else if (originalExists) throw new Error("Retention cleanup found an unowned archive");
     removeRetentionTransaction(record);
   }
@@ -1096,16 +1130,16 @@ function recoverLegacyRetentionTombstones() {
     if (matches.length > 1) throw new Error("Ambiguous retention tombstone history");
     if (fs.existsSync(original)) {
       if (matches.length === 0 || (matches[0].checksum && matches[0].checksum !== metadata.checksum) || (metadata.checksum && matches[0].checksum !== metadata.checksum)) throw new Error("Conflicting retention archive evidence");
-      if (sameArchiveBytes(original, tombstone)) { fs.rmSync(tombstone, { force: false }); fs.rmSync(metadataPath, { force: false }); }
+      if (sameArchiveBytes(original, tombstone)) { removeDurably(tombstone, { force: false }); removeDurably(metadataPath, { force: false }); }
       else throw new Error("Conflicting retention archive bytes");
     } else if (matches.length === 1) {
       if (metadata.checksum !== null && metadata.checksum !== undefined && matches[0].checksum !== metadata.checksum) throw new Error("Retention checksum mismatch");
       if (matches[0].checksum && !metadata.checksum) throw new Error("Retention checksum evidence missing");
-      fs.renameSync(tombstone, original);
-      fs.rmSync(metadataPath, { force: false });
+      renameDurably(tombstone, original);
+      removeDurably(metadataPath, { force: false });
     } else {
-      fs.rmSync(tombstone, { force: false });
-      fs.rmSync(metadataPath, { force: false });
+      removeDurably(tombstone, { force: false });
+      removeDurably(metadataPath, { force: false });
     }
   }
 }
@@ -1113,6 +1147,79 @@ function recoverLegacyRetentionTombstones() {
 function recoverRetentionTombstones() {
   recoverRetentionTransactions();
   recoverLegacyRetentionTombstones();
+}
+
+function cleanupOrphanCloudBackupStages() {
+  const stageRoot = path.join(BACKUPS_DIR, ".cloud-stage");
+  let rootStat;
+  try { rootStat = fs.lstatSync(stageRoot); }
+  catch (error) { if (error.code === "ENOENT") return false; throw error; }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error("Backup cloud staging directory is unsafe");
+  const backupsReal = fs.realpathSync(BACKUPS_DIR);
+  const stageRootReal = fs.realpathSync(stageRoot);
+  if (!isPathWithin(backupsReal, stageRootReal) || stageRootReal === backupsReal) throw new Error("Backup cloud staging directory escaped its boundary");
+
+  for (const name of fs.readdirSync(stageRoot)) {
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(name)) {
+      throw new Error("Backup cloud staging contains an unrecognized entry");
+    }
+    const stagePath = path.resolve(stageRoot, name);
+    if (path.dirname(stagePath) !== path.resolve(stageRoot)) throw new Error("Backup cloud staging entry escaped its boundary");
+    const stageStat = fs.lstatSync(stagePath);
+    if (stageStat.isSymbolicLink() || !stageStat.isDirectory()) throw new Error("Backup cloud staging entry is unsafe");
+    const stageReal = fs.realpathSync(stagePath);
+    if (!isPathWithin(stageRootReal, stageReal) || stageReal === stageRootReal) throw new Error("Backup cloud staging entry escaped its boundary");
+    removeDurably(stagePath, { recursive: true, force: false });
+  }
+
+  fs.rmdirSync(stageRoot);
+  syncDirectory(BACKUPS_DIR);
+  return true;
+}
+
+function cleanupOrphanSqliteBackupStages() {
+  const dataDir = resolveRuntimePath("data");
+  let names;
+  try { names = fs.readdirSync(dataDir); }
+  catch (error) { if (error.code === "ENOENT") return false; throw error; }
+  const stageNames = names.filter((name) => name.startsWith(SQLITE_BACKUP_STAGE_PREFIX));
+  if (stageNames.length > MAX_ORPHAN_SQLITE_BACKUP_STAGES) throw new Error("Too many SQLite backup staging directories require recovery");
+  if (!stageNames.length) return false;
+
+  const dataReal = fs.realpathSync(dataDir);
+  for (const name of stageNames) {
+    if (!/^\.sqlite-backup-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(name)) {
+      throw new Error("SQLite backup staging contains an unrecognized entry");
+    }
+    const stagePath = path.resolve(dataDir, name);
+    if (path.dirname(stagePath) !== path.resolve(dataDir)) throw new Error("SQLite backup staging entry escaped its boundary");
+    const stageStat = fs.lstatSync(stagePath);
+    if (stageStat.isSymbolicLink() || !stageStat.isDirectory()) throw new Error("SQLite backup staging directory is unsafe");
+    const stageReal = fs.realpathSync(stagePath);
+    if (!isPathWithin(dataReal, stageReal) || stageReal === dataReal) throw new Error("SQLite backup staging directory escaped its boundary");
+    for (const entry of fs.readdirSync(stagePath)) {
+      if (!SQLITE_BACKUP_STAGE_FILES.has(entry)) throw new Error("SQLite backup staging contains an unrecognized file");
+      const entryStat = fs.lstatSync(path.join(stagePath, entry));
+      if (entryStat.isSymbolicLink() || !entryStat.isFile()) throw new Error("SQLite backup staging contains an unsafe file");
+    }
+    removeDurably(stagePath, { recursive: true, force: false });
+  }
+  return true;
+}
+
+async function recoverRetentionAtStartup() {
+  const release = acquireLock("backup-history-recovery");
+  let inventoryLease = null;
+  try {
+    if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
+    inventoryLease = await restoreProviderOrphans.acquireInventoryLock();
+    recoverRetentionTombstones();
+    cleanupOrphanCloudBackupStages();
+    cleanupOrphanSqliteBackupStages();
+  } finally {
+    inventoryLease?.release();
+    release();
+  }
 }
 
 async function cleanupRetention(options = {}) {
@@ -1140,19 +1247,20 @@ async function cleanupRetention(options = {}) {
     const transaction = { version: 1, transactionId, phase: "prepared", backupId: String(backup.id), filename: path.basename(archivePath), archivePath, tombstonePath: tombstone, checksum: await calculateFileHash(archivePath), createdAt: new Date().toISOString() };
     const record = { transaction, transactionPath: persistRetentionTransaction(transaction), directory: path.dirname(retentionTransactionPath(transactionId)) };
     try {
-      fs.renameSync(archivePath, tombstone);
+      renameDurably(archivePath, tombstone);
       transaction.phase = "archive_moved";
       persistRetentionTransaction(transaction);
-      backupRepository.deleteBackup(backup.id);
+      inventoryLease.renew();
+      backupRepository.deleteBackup(backup.id, { mutationLease: inventoryLease });
       transaction.phase = "history_removed";
       persistRetentionTransaction(transaction);
-      fs.rmSync(tombstone, { force: false });
+      removeDurably(tombstone, { force: false });
       transaction.phase = "cleanup_committed";
       persistRetentionTransaction(transaction);
       removeRetentionTransaction(record);
     } catch (error) {
       if (fs.existsSync(tombstone) && !fs.existsSync(archivePath) && backupRepository.getBackup(backup.id)) {
-        try { fs.renameSync(tombstone, archivePath); transaction.phase = "prepared"; persistRetentionTransaction(transaction); removeRetentionTransaction(record); } catch (rollbackError) { error.rollbackError = rollbackError; }
+        try { renameDurably(tombstone, archivePath); transaction.phase = "prepared"; persistRetentionTransaction(transaction); removeRetentionTransaction(record); } catch (rollbackError) { error.rollbackError = rollbackError; }
       }
       throw error;
     }
@@ -1194,6 +1302,7 @@ async function createBackup(options = {}) {
   };
   let sqliteSnapshot = null;
   let saved = null;
+  let successEntry = null;
   let outcomeError = null;
 
   try {
@@ -1243,7 +1352,7 @@ async function createBackup(options = {}) {
 
     const releaseSuppressionSnapshot = await restoreProviderOrphans.lockSnapshot(collectionOptions.suppressionSnapshot);
     try {
-      saved = backupRepository.saveBackup({
+      successEntry = {
         ...baseEntry,
         status: "success",
         finishedAt,
@@ -1255,13 +1364,26 @@ async function createBackup(options = {}) {
           includedFiles: files.length,
           cloudComplete: Boolean(collectionOptions.cloudComplete),
         },
-      });
+      };
+      saved = backupRepository.saveBackup(successEntry, { mutationLease: releaseSuppressionSnapshot.mutationLease });
     } finally { releaseSuppressionSnapshot(); }
 
     await cleanupRetention({ lockHeld: true });
     return saved;
   } catch (error) {
     outcomeError = error;
+    if (successEntry && (saved?.status === "success" || error.historyRenameVisible)) {
+      // Once a success row is visible, compensating cleanup could leave it
+      // pointing at a missing archive if later persistence also fails.
+      const historyDurable = saved?.status === "success";
+      error.backup = saved || successEntry;
+      error.backupHistoryState = historyDurable ? "durable" : "visible-durability-uncertain";
+      error.backupOperationState = historyDurable ? "created-post-processing-failed" : "created-history-durability-uncertain";
+      error.message = historyDurable
+        ? `Backup was created, but post-create processing failed: ${error.message}`
+        : `Backup history is visible, but its directory durability could not be confirmed: ${error.message}`;
+      throw error;
+    }
     let cleanupError = null;
     if (archiveCreated) {
       try { fs.rmSync(archivePath, { force: false }); } catch (cleanupFailure) { cleanupError = cleanupFailure; }
@@ -1281,21 +1403,44 @@ async function createBackup(options = {}) {
     if (cleanupError) error.archiveCleanupError = cleanupError;
     throw Object.assign(error, { backup: failed });
   } finally {
-    fs.rmSync(stageDir, { recursive: true, force: true });
+    const cleanupFailureCodes = [];
+    let postCreateCleanupError = null;
+    try { fs.rmSync(stageDir, { recursive: true, force: true }); }
+    catch { cleanupFailureCodes.push("BACKUP_STAGE_CLEANUP_FAILED"); }
     try { fs.rmdirSync(path.dirname(stageDir)); } catch {}
     if (sqliteSnapshot?.stageDir) {
       try { fs.rmSync(sqliteSnapshot.stageDir, { recursive: true, force: true }); }
-      catch (error) {
+      catch {
         const evidence = { code: "SQLITE_STAGE_CLEANUP_FAILED", message: "SQLite staging cleanup failed" };
+        cleanupFailureCodes.push(evidence.code);
         if (outcomeError) outcomeError.sqliteStageCleanupFailure = evidence;
         if (saved?.status === "success") {
           saved.metadata = { ...saved.metadata, sqliteStageCleanup: evidence };
-          try { backupRepository.saveBackup(saved); } catch (persistError) { outcomeError = outcomeError || persistError; }
+          try { backupRepository.saveBackup(saved); }
+          catch (persistError) {
+            cleanupFailureCodes.push(persistError.code || "BACKUP_HISTORY_CLEANUP_STATE_FAILED");
+            if (outcomeError) outcomeError.sqliteStageCleanupPersistenceFailure = { code: persistError.code || null };
+          }
         }
         console.error(`[backup] ${evidence.code}`);
       }
     }
+    if (cleanupFailureCodes.length) {
+      const uniqueCleanupFailureCodes = [...new Set(cleanupFailureCodes)];
+      if (outcomeError) outcomeError.postCreateCleanupFailureCodes = uniqueCleanupFailureCodes;
+      else if (saved?.status === "success") {
+        postCreateCleanupError = Object.assign(new Error("Backup was created, but post-create staging cleanup failed"), {
+          code: "BACKUP_STAGE_CLEANUP_FAILED",
+          backup: saved,
+          backupHistoryState: "durable",
+          backupOperationState: "created-post-processing-failed",
+          cleanupFailureCodes: uniqueCleanupFailureCodes,
+        });
+      }
+      console.error("[backup] BACKUP_STAGE_CLEANUP_FAILED");
+    }
     release?.();
+    if (postCreateCleanupError) throw postCreateCleanupError;
   }
 }
 
@@ -1315,6 +1460,69 @@ function getBackupOrThrow(id) {
   return { backup, archivePath };
 }
 
+function compensateFailedBackupDeletion(backup, mutationLease, originalError) {
+  try {
+    if (!backupRepository.getBackup(backup.id)) {
+      mutationLease?.renew?.();
+      backupRepository.saveBackup(backup, { mutationLease });
+    }
+  } catch (compensationError) {
+    originalError.historyRecoveryRequired = true;
+    originalError.historyCompensationError = {
+      code: compensationError.code || null,
+      message: "Backup history could not be restored after deletion failed",
+    };
+  }
+}
+
+async function deleteBackupTransaction(backup, archivePath, mutationLease) {
+  const transactionId = crypto.randomUUID();
+  const tombstone = retentionTombstone(archivePath);
+  const transaction = {
+    version: 1,
+    transactionId,
+    phase: "prepared",
+    backupId: String(backup.id),
+    filename: path.basename(archivePath),
+    archivePath,
+    tombstonePath: tombstone,
+    checksum: await calculateFileHash(archivePath),
+    createdAt: new Date().toISOString(),
+  };
+  const record = {
+    transaction,
+    transactionPath: persistRetentionTransaction(transaction),
+    directory: path.dirname(retentionTransactionPath(transactionId)),
+  };
+  let removedBackup = null;
+  try {
+    renameDurably(archivePath, tombstone);
+    transaction.phase = "archive_moved";
+    persistRetentionTransaction(transaction);
+    mutationLease?.renew?.();
+    removedBackup = backupRepository.deleteBackup(backup.id, { mutationLease }) || backup;
+    transaction.phase = "history_removed";
+    persistRetentionTransaction(transaction);
+    removeDurably(tombstone, { force: false });
+    removeRetentionTransaction(record);
+  } catch (error) {
+    if (fs.existsSync(tombstone)) {
+      compensateFailedBackupDeletion(removedBackup || backup, mutationLease, error);
+      if (backupRepository.getBackup(backup.id)) {
+        try {
+          if (!fs.existsSync(archivePath)) renameDurably(tombstone, archivePath);
+          transaction.phase = "prepared";
+          persistRetentionTransaction(transaction);
+          removeRetentionTransaction(record);
+        } catch (rollbackError) {
+          error.rollbackError = rollbackError;
+        }
+      }
+    }
+    throw error;
+  }
+}
+
 async function deleteBackup(id) {
   const release = acquireLock("delete");
   let inventoryLease = null;
@@ -1326,8 +1534,7 @@ async function deleteBackup(id) {
       throw new Error("Backup is the unresolved provider inventory baseline and cannot be deleted");
     }
     const { backup, archivePath } = getBackupOrThrow(id);
-    fs.rmSync(archivePath, { force: true });
-    backupRepository.deleteBackup(backup.id);
+    await deleteBackupTransaction(backup, archivePath, inventoryLease);
     return backup;
   } finally {
     inventoryLease?.release();
@@ -1358,4 +1565,5 @@ module.exports = {
   listBackups,
   setCloudStorage,
   recoverRetentionTombstones,
+  recoverRetentionAtStartup,
 };

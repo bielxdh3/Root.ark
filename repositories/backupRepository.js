@@ -1,16 +1,19 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const Database = require("better-sqlite3");
 const { getDb, isDbEnabled, jsonStringify, safeJsonParse } = require("../db");
 const { RUNTIME_ROOT, resolveRuntimePath } = require("../src/runtime-paths");
 
 const HISTORY_FILE = resolveRuntimePath("data", "backup-history.json");
 const MUTATION_LOCK_FILE = resolveRuntimePath("data", ".backup-metadata.lock");
+const MUTATION_COORDINATION_DB_FILE = resolveRuntimePath("data", ".backup-metadata-coordination.sqlite");
 const MUTATION_LOCK_FORMAT_VERSION = 1;
 const MUTATION_LOCK_TTL_MS = 30 * 1000;
 const MALFORMED_LOCK_TTL_MS = 60 * 1000;
 const MAX_LOCK_TTL_MS = 5 * 60 * 1000;
 const CLAIM_PREFIX = `${path.basename(MUTATION_LOCK_FILE)}.claim-`;
+const JSON_MUTATION_LEASES = new WeakMap();
 
 function boundedLockDuration(name, fallback) {
   const value = Number(process.env[name]);
@@ -40,6 +43,31 @@ function mutationBusy(reason) {
   error.code = "BACKUP_METADATA_LOCK_BUSY";
   error.reason = reason;
   return error;
+}
+
+function withMutationNamespaceLock(callback, busyTimeoutMs = 2000) {
+  fs.mkdirSync(path.dirname(MUTATION_COORDINATION_DB_FILE), { recursive: true });
+  const db = new Database(MUTATION_COORDINATION_DB_FILE);
+  try {
+    db.pragma(`busy_timeout = ${Math.max(0, Math.floor(Number(busyTimeoutMs) || 0))}`);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = callback();
+      db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  } catch (error) {
+    if (error.code === "SQLITE_BUSY" || error.code === "SQLITE_BUSY_SNAPSHOT") {
+      throw mutationBusy("coordination-busy");
+    }
+    throw error;
+  } finally {
+    try { if (db.inTransaction) db.exec("ROLLBACK"); } catch {}
+    db.close();
+  }
 }
 
 function sameRuntimeRoot(left, right) {
@@ -72,26 +100,49 @@ function ownerIsLive(record) {
   return true;
 }
 
-function readMutationLock() {
-  let stat;
+function readLockSnapshot() {
+  let fd;
   try {
-    stat = fs.statSync(MUTATION_LOCK_FILE);
+    const noFollow = fs.constants.O_NOFOLLOW || 0;
+    fd = fs.openSync(MUTATION_LOCK_FILE, fs.constants.O_RDONLY | noFollow);
   } catch (error) {
     if (error.code === "ENOENT") return { kind: "missing" };
+    if (error.code === "ELOOP") return { kind: "unsafe" };
     throw error;
   }
   try {
-    const record = JSON.parse(fs.readFileSync(MUTATION_LOCK_FILE, "utf8"));
-    if (!validLockRecord(record)) return { kind: "malformed", mtimeMs: stat.mtimeMs };
+    const descriptorStat = fs.fstatSync(fd);
+    if (!descriptorStat.isFile()) return { kind: "unsafe" };
+    let pathStat;
+    try {
+      pathStat = fs.lstatSync(MUTATION_LOCK_FILE);
+    } catch (error) {
+      if (error.code === "ENOENT") return { kind: "changed" };
+      throw error;
+    }
+    if (pathStat.isSymbolicLink() || !pathStat.isFile()) return { kind: "unsafe" };
+    if (!sameFileIdentity(pathStat, descriptorStat)) return { kind: "changed" };
+    return { kind: "file", fileIdentity: descriptorStat, mtimeMs: descriptorStat.mtimeMs, contents: fs.readFileSync(fd, "utf8") };
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+  }
+}
+
+function readMutationLock() {
+  const snapshot = readLockSnapshot();
+  if (snapshot.kind !== "file") return snapshot;
+  try {
+    const record = JSON.parse(snapshot.contents);
+    if (!validLockRecord(record)) return { kind: "malformed", mtimeMs: snapshot.mtimeMs, fileIdentity: snapshot.fileIdentity };
     if (!sameRuntimeRoot(record.runtimeRootIdentity, runtimeRootIdentity())) {
-      return { kind: "mismatch", record };
+      return { kind: "mismatch", record, fileIdentity: snapshot.fileIdentity };
     }
     const createdAtMs = Date.parse(record.createdAt);
     const ageMs = Date.now() - createdAtMs;
     const ttlMs = boundedLockDuration("ROOTARK_JSON_LOCK_TTL_MS", MUTATION_LOCK_TTL_MS);
-    return { kind: "valid", record, ageMs, live: ownerIsLive(record), expired: ageMs > ttlMs };
+    return { kind: "valid", record, ageMs, live: ownerIsLive(record), expired: ageMs > ttlMs, fileIdentity: snapshot.fileIdentity };
   } catch {
-    return { kind: "malformed", mtimeMs: stat.mtimeMs };
+    return { kind: "malformed", mtimeMs: snapshot.mtimeMs, fileIdentity: snapshot.fileIdentity };
   }
 }
 
@@ -101,11 +152,11 @@ function sameFileIdentity(left, right) {
   return left.birthtimeMs === right.birthtimeMs || left.ctimeMs === right.ctimeMs;
 }
 
-function cleanupOwnedIncompleteLock(fd, descriptorStat, token) {
+function cleanupOwnedIncompleteLock(descriptorStat) {
+  if (!descriptorStat) return;
   try {
-    const currentStat = fs.statSync(MUTATION_LOCK_FILE);
-    const content = fs.readFileSync(MUTATION_LOCK_FILE, "utf8");
-    if (sameFileIdentity(descriptorStat, currentStat) || content.includes(`"token":"${token}"`)) {
+    const current = readMutationLock();
+    if (sameFileIdentity(descriptorStat, current.fileIdentity)) {
       fs.rmSync(MUTATION_LOCK_FILE, { force: true });
     }
   } catch {}
@@ -141,14 +192,31 @@ function claimStaleMutationLock() {
   }
 }
 
+function writeMutationLockRecord(fd, record) {
+  const contents = Buffer.from(JSON.stringify(record));
+  fs.ftruncateSync(fd, 0);
+  let offset = 0;
+  while (offset < contents.length) {
+    const written = fs.writeSync(fd, contents, offset, contents.length - offset, offset);
+    if (!written) throw new Error("Backup metadata lock write made no progress");
+    offset += written;
+  }
+  fs.fsyncSync(fd);
+}
+
 function acquireJsonMutationLock(operationName = "restore-sync") {
+  return withMutationNamespaceLock(() => {
   fs.mkdirSync(path.dirname(MUTATION_LOCK_FILE), { recursive: true });
   cleanupOldClaims();
   let claimPath = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const state = readMutationLock();
     if (state.kind === "mismatch") throw mutationBusy("runtime-root-mismatch");
-    if (state.kind === "valid" && state.live && !state.expired) throw mutationBusy("live-owner");
+    if (state.kind === "valid" && state.live) {
+      // TTL cannot make a live writer safe to replace while it may be between read and rename;
+      // a hung live owner therefore blocks mutations until that process exits.
+      throw mutationBusy(state.expired ? "live-owner-expired" : "live-owner");
+    }
     if (state.kind === "malformed") {
       const ageMs = Date.now() - state.mtimeMs;
       const ttlMs = boundedLockDuration("ROOTARK_JSON_MALFORMED_TTL_MS", MALFORMED_LOCK_TTL_MS);
@@ -174,36 +242,53 @@ function acquireJsonMutationLock(operationName = "restore-sync") {
         runtimeRootIdentity: runtimeRootIdentity(),
         operationName,
       };
-      const contents = Buffer.from(JSON.stringify(record));
-      let offset = 0;
-      while (offset < contents.length) {
-        const written = fs.writeSync(fd, contents, offset, contents.length - offset);
-        if (!written) throw new Error("Backup metadata lock write made no progress");
-        offset += written;
-      }
-      fs.fsyncSync(fd);
+      writeMutationLockRecord(fd, record);
       cleanupClaim(claimPath);
       claimPath = null;
       let released = false;
-      return {
+      const lease = {
         token,
+        renew() {
+          if (released || !JSON_MUTATION_LEASES.has(lease)) {
+            throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease is not active");
+          }
+          return withMutationNamespaceLock(() => {
+            const state = readMutationLock();
+            if (state.kind !== "valid" || state.record.token !== token || !state.live || !sameFileIdentity(descriptorStat, state.fileIdentity)) {
+              throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease no longer owns the lock");
+            }
+            const renewedRecord = { ...state.record, createdAt: new Date().toISOString() };
+            writeMutationLockRecord(fd, renewedRecord);
+            const renewedState = readMutationLock();
+            if (renewedState.kind !== "valid" || renewedState.record.token !== token || renewedState.expired || !renewedState.live ||
+                !sameFileIdentity(descriptorStat, renewedState.fileIdentity)) {
+              throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease could not be renewed");
+            }
+            Object.assign(record, renewedRecord);
+            return true;
+          });
+        },
         release() {
           if (released) return;
-          released = true;
-          let ownsPath = false;
-          try {
-            const current = JSON.parse(fs.readFileSync(MUTATION_LOCK_FILE, "utf8"));
-            ownsPath = current.token === token;
-          } catch {}
-          try { fs.closeSync(fd); } catch {}
-          if (ownsPath) {
-            try { fs.rmSync(MUTATION_LOCK_FILE, { force: true }); } catch {}
-          }
+          withMutationNamespaceLock(() => {
+            if (released) return;
+            const current = readMutationLock();
+            const ownsPath = current.kind === "valid" && current.record.token === token && sameFileIdentity(descriptorStat, current.fileIdentity);
+            if (ownsPath) {
+              try { fs.rmSync(MUTATION_LOCK_FILE, { force: true }); }
+              catch (error) { if (error.code !== "ENOENT") throw error; }
+            }
+            released = true;
+            JSON_MUTATION_LEASES.delete(lease);
+            try { fs.closeSync(fd); } catch {}
+          }, 30_000);
         },
       };
+      JSON_MUTATION_LEASES.set(lease, { descriptorStat, token });
+      return lease;
     } catch (error) {
       try { if (fd !== undefined) fs.closeSync(fd); } catch {}
-      cleanupOwnedIncompleteLock(fd, descriptorStat, token);
+      cleanupOwnedIncompleteLock(descriptorStat);
       cleanupClaim(claimPath);
       claimPath = null;
       if (error.code === "EEXIST") continue;
@@ -211,6 +296,7 @@ function acquireJsonMutationLock(operationName = "restore-sync") {
     }
   }
   throw mutationBusy("claim-race");
+  });
 }
 
 function withJsonMutationLock(callback, operationName = "restore-sync") {
@@ -220,6 +306,22 @@ function withJsonMutationLock(callback, operationName = "restore-sync") {
   } finally {
     lease.release();
   }
+}
+
+function withJsonMutationLease(callback, operationName, existingLease) {
+  if (existingLease !== undefined) {
+    const leaseState = JSON_MUTATION_LEASES.get(existingLease);
+    if (!leaseState) {
+      throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease is not active");
+    }
+    const state = readMutationLock();
+    if (state.kind !== "valid" || state.record.token !== leaseState.token || state.expired || !state.live ||
+        !sameFileIdentity(leaseState.descriptorStat, state.fileIdentity)) {
+      throw mutationError("BACKUP_METADATA_LOCK_INVALID", "Backup metadata mutation lease no longer owns the lock");
+    }
+    return callback();
+  }
+  return withJsonMutationLock(callback, operationName);
 }
 
 function rowToBackup(row) {
@@ -256,23 +358,56 @@ function normalize(entry = {}) {
 }
 
 function loadJsonHistory() {
-  if (!fs.existsSync(HISTORY_FILE)) return [];
+  let contents;
   try {
-    const entries = JSON.parse(fs.readFileSync(HISTORY_FILE, "utf-8"));
-    return Array.isArray(entries) ? entries.map(normalize) : [];
-  } catch {
-    return [];
+    contents = fs.readFileSync(HISTORY_FILE, "utf-8");
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw Object.assign(new Error("Backup history could not be read safely"), { code: "BACKUP_HISTORY_READ_FAILED" });
   }
+
+  let entries;
+  try { entries = JSON.parse(contents); }
+  catch { throw Object.assign(new Error("Backup history is malformed"), { code: "BACKUP_HISTORY_INVALID" }); }
+  if (!Array.isArray(entries) || entries.some((entry) => !entry || typeof entry !== "object" || Array.isArray(entry)
+    || typeof entry.id !== "string" || !entry.id.trim()
+    || typeof entry.filename !== "string" || !entry.filename.trim())) {
+    throw Object.assign(new Error("Backup history has an invalid structure"), { code: "BACKUP_HISTORY_INVALID" });
+  }
+  return entries.map(normalize);
 }
 
 function saveJsonHistory(entries) {
-  fs.mkdirSync(path.dirname(HISTORY_FILE), { recursive: true });
+  const directory = path.dirname(HISTORY_FILE);
+  fs.mkdirSync(directory, { recursive: true });
   const temporary = `${HISTORY_FILE}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify(entries.map(normalize), null, 2));
+  let fd;
+  let ownsTemporary = false;
+  let renamedIntoPlace = false;
   try {
+    fd = fs.openSync(temporary, "wx");
+    ownsTemporary = true;
+    fs.writeFileSync(fd, JSON.stringify(entries.map(normalize), null, 2));
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
     fs.renameSync(temporary, HISTORY_FILE);
+    ownsTemporary = false;
+    renamedIntoPlace = true;
+    if (process.platform !== "win32") {
+      const directoryFd = fs.openSync(directory, "r");
+      try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
+    }
   } catch (error) {
-    fs.rmSync(temporary, { force: true });
+    if (error && typeof error === "object") {
+      error.historyRenameVisible = renamedIntoPlace;
+    }
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+    if (ownsTemporary) {
+      try { fs.rmSync(temporary, { force: true }); } catch {}
+    }
     throw error;
   }
 }
@@ -350,11 +485,7 @@ function mutateRestoreSyncEntry(options = {}) {
 }
 
 function hasBackupTable() {
-  try {
-    return Boolean(getDb().prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='backup_history'").get());
-  } catch {
-    return false;
-  }
+  return Boolean(getDb().prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='backup_history'").get());
 }
 
 function listBackups() {
@@ -383,7 +514,7 @@ function getBackup(id) {
   return loadJsonHistory().find((entry) => entry.id === id) || null;
 }
 
-function saveBackup(entry) {
+function saveBackup(entry, options = {}) {
   const normalized = normalize(entry);
   if (isDbEnabled() && hasBackupTable()) {
     getDb().prepare(`
@@ -416,21 +547,37 @@ function saveBackup(entry) {
     return normalized;
   }
 
-  const entries = loadJsonHistory();
-  const index = entries.findIndex((item) => item.id === normalized.id);
-  if (index === -1) entries.push(normalized);
-  else entries[index] = normalized;
-  saveJsonHistory(entries);
-  return normalized;
+  return withJsonMutationLease(() => {
+    const entries = loadJsonHistory();
+    const index = entries.findIndex((item) => item.id === normalized.id);
+    if (index === -1) entries.push(normalized);
+    else entries[index] = normalized;
+    saveJsonHistory(entries);
+    return normalized;
+  }, "backup-history-save", options.mutationLease);
 }
 
-function deleteBackup(id) {
+function deleteBackup(id, options = {}) {
   if (isDbEnabled() && hasBackupTable()) {
-    getDb().prepare("DELETE FROM backup_history WHERE id = ?").run(id);
-    return;
+    const db = getDb();
+    const removeWithSnapshot = db.transaction(() => {
+      const row = db.prepare(`
+        SELECT id, filename, type, status, created_by, created_at, finished_at, size_bytes, checksum, error_message, metadata_json
+        FROM backup_history WHERE id = ?
+      `).get(id);
+      if (!row) return null;
+      db.prepare("DELETE FROM backup_history WHERE id = ?").run(id);
+      return rowToBackup(row);
+    });
+    return removeWithSnapshot.immediate();
   }
 
-  saveJsonHistory(loadJsonHistory().filter((entry) => entry.id !== id));
+  return withJsonMutationLease(() => {
+    const entries = loadJsonHistory();
+    const removed = entries.find((entry) => entry.id === id) || null;
+    saveJsonHistory(entries.filter((entry) => entry.id !== id));
+    return removed;
+  }, "backup-history-delete", options.mutationLease);
 }
 
 function latestStatus() {
@@ -448,4 +595,5 @@ module.exports = {
   saveBackup,
   withJsonMutationLock,
   MUTATION_LOCK_FILE,
+  MUTATION_COORDINATION_DB_FILE,
 };

@@ -6,6 +6,7 @@ const { spawn, spawnSync } = require("node:child_process");
 const test = require("node:test");
 
 const servicePath = path.resolve(__dirname, "../services/restoreProviderOrphans.js");
+const betterSqlitePath = require.resolve("better-sqlite3");
 
 function startChild(script, cwd, env) {
   const child = spawn(process.execPath, ["-e", script], { cwd, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
@@ -69,6 +70,9 @@ test("restore provider policy retries transient Windows sharing violations", () 
       'const assert = require("node:assert/strict");',
       'const fs = require("node:fs");',
       'const path = require("node:path");',
+      'const Database = require(' + JSON.stringify(betterSqlitePath) + ');',
+      'const nativeProbe = new Database(":memory:");',
+      'nativeProbe.close();',
       'Object.defineProperty(process, "platform", { value: "win32" });',
       'const policy = require(' + JSON.stringify(servicePath) + ');',
       'const originalRenameSync = fs.renameSync;',
@@ -185,6 +189,27 @@ test("provider suppression initialization creates a fail-closed marker and prese
   }
 });
 
+test("malformed pending restore download fences fail closed", () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-invalid-fence-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const policy = require(${JSON.stringify(servicePath)});
+      policy.initialize();
+      const value = JSON.parse(fs.readFileSync(policy.POLICY_PATH, "utf8"));
+      value.pendingRestoreUploads = null;
+      fs.writeFileSync(policy.POLICY_PATH, JSON.stringify(value));
+      assert.throws(() => policy.isRestoreUploadPending("root", "stale.txt", "uploads"), /policy is invalid/i,
+        "a present but malformed fence must not be treated as an empty fence");
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("restore provider orphan identities preserve provider object case on every host", () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-"));
   try {
@@ -273,6 +298,9 @@ test("Windows provider aliases with different case remain independently suppress
   try {
     const script = `
       const assert = require("node:assert/strict");
+      const Database = require(${JSON.stringify(betterSqlitePath)});
+      const nativeProbe = new Database(":memory:");
+      nativeProbe.close();
       Object.defineProperty(process, "platform", { value: "win32" });
       const policy = require(${JSON.stringify(servicePath)});
       (async () => {
@@ -307,6 +335,9 @@ test("Windows case-fold aliases keep restored objects suppressed until inventory
   try {
     const script = `
       const assert = require("node:assert/strict");
+      const Database = require(${JSON.stringify(betterSqlitePath)});
+      const nativeProbe = new Database(":memory:");
+      nativeProbe.close();
       Object.defineProperty(process, "platform", { value: "win32" });
       const policy = require(${JSON.stringify(servicePath)});
       (async () => {

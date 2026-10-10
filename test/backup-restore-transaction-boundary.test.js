@@ -396,6 +396,125 @@ test("backup archives exclude whole-restore coordinator files", () => {
   `);
 });
 
+test("restore rejects backup metadata coordination SQLite files and sidecars", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(dataDir, "runtime.json"), "archived state");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const archivePath = backupService.getBackupOrThrow(backup.id).archivePath;
+      const coordinationPath = backupRepository.MUTATION_COORDINATION_DB_FILE;
+      const coordinationBefore = fs.readFileSync(coordinationPath);
+      const coordinationName = path.basename(coordinationPath);
+      const entries = [
+        { path: "data/runtime.json", contents: Buffer.from("archived state") },
+        { path: "data/" + coordinationName, contents: Buffer.from("attacker-controlled database") },
+        { path: "data/" + coordinationName + "-journal", contents: Buffer.from("attacker-controlled journal") },
+        { path: "data/" + coordinationName + "-wal", contents: Buffer.from("attacker-controlled wal") },
+        { path: "data/" + coordinationName + "-shm", contents: Buffer.from("attacker-controlled shm") },
+      ];
+      fs.rmSync(archivePath);
+      await backupService.createZipArchive(archivePath, {
+        backup_id: backup.id,
+        included_files: entries.map(({ path: entryPath, contents }) => ({ path: entryPath, size: contents.length })),
+        cloud_complete: true,
+      }, entries.map(({ path: entryPath, contents }) => ({ entryPath, contents, size: contents.length })));
+      await backupRepository.saveBackup({ ...backup, checksum: null });
+      write(path.join(dataDir, "runtime.json"), "live state");
+
+      await assert.rejects(
+        restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }),
+        /Entrada de controle bloqueada no backup/,
+      );
+      assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "live state");
+      assert.deepEqual(fs.readFileSync(coordinationPath), coordinationBefore, "restore must not replace the live mutation lock database");
+      assert.equal(restoreService.assertNoPendingWholeRestore().reason, "no_pending_restore");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("JSON metadata lock and stale-claim files are excluded from backup and rejected by restore", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      const lockName = path.basename(backupRepository.MUTATION_LOCK_FILE);
+      const claimName = lockName + ".claim-fixture";
+      assert.equal(backupService.isBackupExcludedPath("data/" + lockName), true);
+      assert.equal(backupService.isBackupExcludedPath("data/" + claimName), true);
+      write(path.join(dataDir, claimName), "stale claim");
+      write(path.join(dataDir, "runtime.json"), "archived state");
+
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const stored = backupService.getBackupOrThrow(backup.id);
+      const { zip } = await restoreService.validateBackupArchive(stored.backup, stored.archivePath);
+      assert.equal(zip.files.some((entry) => entry.path.toLowerCase() === "data/" + lockName.toLowerCase()), false);
+      assert.equal(zip.files.some((entry) => entry.path.toLowerCase() === "data/" + claimName.toLowerCase()), false,
+        "stale lock claims must not be copied into backup archives");
+
+      write(path.join(dataDir, "runtime.json"), "live state");
+      for (const blockedName of [lockName, claimName]) {
+        const entries = [
+          { path: "data/runtime.json", contents: Buffer.from("attacker state") },
+          { path: "data/" + blockedName, contents: Buffer.from("attacker control file") },
+        ];
+        fs.rmSync(stored.archivePath);
+        await backupService.createZipArchive(stored.archivePath, {
+          backup_id: backup.id,
+          included_files: entries.map(({ path: entryPath, contents }) => ({ path: entryPath, size: contents.length })),
+          cloud_complete: true,
+        }, entries.map(({ path: entryPath, contents }) => ({ entryPath, contents, size: contents.length })));
+        await backupRepository.saveBackup({ ...backup, checksum: null });
+        await assert.rejects(
+          restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }),
+          /Entrada de controle bloqueada no backup/,
+          "archive entry " + blockedName + " must be rejected before restore starts",
+        );
+        assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "live state");
+        assert.equal(fs.readFileSync(path.join(dataDir, claimName), "utf8"), "stale claim");
+        assert.equal(restoreService.assertNoPendingWholeRestore().reason, "no_pending_restore");
+      }
+
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("backup collection excludes a live JSON metadata lease", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    backupService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(dataDir, "runtime.json"), "backup data");
+      const lease = backupRepository.acquireJsonMutationLock("backup-collection-test");
+      const originalLockSnapshot = providerOrphans.lockSnapshot;
+      try {
+        providerOrphans.lockSnapshot = async (snapshot) => {
+          snapshot.assertCurrent();
+          const release = () => lease.release();
+          release.mutationLease = lease;
+          return release;
+        };
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        const stored = backupService.getBackupOrThrow(backup.id);
+        const { zip } = await restoreService.validateBackupArchive(stored.backup, stored.archivePath);
+        const lockEntry = "data/" + path.basename(backupRepository.MUTATION_LOCK_FILE).toLowerCase();
+        assert.equal(zip.files.some((entry) => entry.path.toLowerCase() === lockEntry), false,
+          "a live mutation owner must not be serialized into a backup collected under its lease");
+      } finally {
+        providerOrphans.lockSnapshot = originalLockSnapshot;
+        lease.release();
+      }
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("successful whole restore preserves both recovery records and blocks service until startup", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
@@ -1776,6 +1895,165 @@ test("cloud-complete selected archives upload selected bytes before opening same
   `);
 });
 
+test("pending cloud restore sync blocks stale provider downloads until selected bytes are uploaded", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    backupService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      const uploadPath = path.join(uploadsDir, "root", "same.txt");
+      write(uploadPath, "ARCHIVED bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const stored = backupService.getBackupOrThrow(backup.id);
+      fs.rmSync(stored.archivePath);
+      await backupService.createZipArchive(stored.archivePath, {
+        backup_id: backup.id,
+        included_files: [{ path: "uploads/root/same.txt", size: 14 }],
+        cloud_complete: true,
+      }, [{ absolutePath: uploadPath, entryPath: "uploads/root/same.txt", size: 14 }]);
+      await backupRepository.saveBackup({ ...backup, checksum: null });
+      write(uploadPath, "live bytes");
+
+      let providerBytes = "STALE provider bytes";
+      let failUploads = true;
+      const cloud = {
+        enabled: () => true,
+        provider: "fixture",
+        upload: async (source) => {
+          if (failUploads) throw new Error("injected provider upload failure");
+          providerBytes = fs.readFileSync(source, "utf8");
+          return true;
+        },
+        inventory: async () => [{ area: "uploads", folderId: "root", name: "same.txt" }],
+        download: async (_folderId, _name, target) => { write(target, providerBytes); return true; },
+      };
+      restoreService.setCloudStorage(cloud);
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      const selected = backupRepository.getBackup(backup.id);
+      assert.equal(selected.metadata.restoreSync.state, "pending");
+
+      const childProcess = require("node:child_process");
+      const restartCachePath = path.join(uploadsDir, "root", "restart-cache.txt");
+      const restartProbe = childProcess.spawnSync(process.execPath, ["-e", [
+        'const fs=require("node:fs");',
+        'const orphans=require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans").split(String.fromCharCode(92)).join("/"))});',
+        'const target=' + JSON.stringify(restartCachePath) + ';',
+        'const cloud={enabled:()=>true,download:async()=>{fs.writeFileSync(target,"STALE provider bytes");return true;}};',
+        'orphans.guardProvider(cloud).download("root","same.txt",target,"uploads").then(()=>console.log(JSON.stringify({code:null,cached:fs.existsSync(target)}))).catch(error=>console.log(JSON.stringify({code:error.code,cached:fs.existsSync(target)})));',
+      ].join("\\n")], { cwd: process.cwd(), encoding: "utf8", timeout: 30_000 });
+      assert.equal(restartProbe.status, 0, restartProbe.stderr || restartProbe.stdout);
+      assert.deepEqual(JSON.parse(restartProbe.stdout.trim()), {
+        code: "PROVIDER_RESTORE_SYNC_PENDING",
+        cached: false,
+      }, "a restarted process must preserve the durable download fence");
+
+      const policyPath = providerOrphans.POLICY_PATH;
+      const legacyPolicy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
+      delete legacyPolicy.pendingRestoreUploads;
+      fs.writeFileSync(policyPath, JSON.stringify(legacyPolicy));
+      await restoreService.reconcileUnknownProviderInventory();
+      const upgradedPolicy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
+      assert.deepEqual(upgradedPolicy.pendingRestoreUploads, [
+        { area: "uploads", folderId: "root", name: "same.txt" },
+      ], "startup must reconstruct download fences from older durable restore queues");
+      await providerOrphans.write(
+        [{ area: "uploads", folderId: "root", name: "same.txt" }],
+        undefined,
+        [{ area: "uploads", folderId: "root", name: "same.txt" }],
+      );
+      assert.equal(await providerOrphans.clear("root", "same.txt", "uploads", cloud), true);
+      assert.equal(providerOrphans.isRestoreUploadPending("root", "same.txt", "uploads"), true,
+        "clearing an orphan suppression must not remove a separate pending restore fence");
+      const upgradeCachePath = path.join(uploadsDir, "root", "upgrade-cache.txt");
+      await assert.rejects(
+        providerOrphans.guardProvider(cloud).download("root", "same.txt", upgradeCachePath, "uploads"),
+        (error) => error.code === "PROVIDER_RESTORE_SYNC_PENDING",
+        "an older policy file must not re-enable hydration of stale provider bytes",
+      );
+      assert.equal(fs.existsSync(upgradeCachePath), false);
+
+      const cachedPath = path.join(uploadsDir, "root", "missing-cache.txt");
+      await assert.rejects(
+        providerOrphans.guardProvider(cloud).download("root", "same.txt", cachedPath, "uploads"),
+        (error) => error.code === "PROVIDER_RESTORE_SYNC_PENDING",
+        "the provider must not hydrate the previous bytes while selected archive bytes are pending",
+      );
+      assert.equal(fs.existsSync(cachedPath), false, "blocked downloads must not write stale bytes to the cache");
+
+      failUploads = false;
+      await restoreService.processRestoreSync({ backupId: backup.id });
+      assert.equal(providerBytes, "ARCHIVED bytes");
+      assert.equal(backupRepository.getBackup(backup.id).metadata.restoreSync.state, "completed");
+      assert.equal(await providerOrphans.guardProvider(cloud).download("root", "same.txt", cachedPath, "uploads"), true);
+      assert.equal(fs.readFileSync(cachedPath, "utf8"), "ARCHIVED bytes");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("startup download fences include every active restore queue and release only completed keys", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const context = "c".repeat(64);
+    const cloud = {
+      enabled: () => true,
+      resolveInventoryContext: async () => context,
+      inventoryContext: () => context,
+    };
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    const persistQueue = async (name) => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const restoreSync = {
+        operationId: backup.id,
+        state: "pending",
+        providerContext: context,
+        entries: [{
+          entryId: "restore-" + name,
+          state: "pending",
+          area: "uploads",
+          folderId: "root",
+          name: name + ".txt",
+        }],
+      };
+      backupRepository.saveBackup({
+        ...backupRepository.getBackup(backup.id),
+        metadata: { ...backup.metadata, restoreSync },
+      });
+      return backup.id;
+    };
+    (async () => {
+      const firstId = await persistQueue("first-queue");
+      const secondId = await persistQueue("second-queue");
+      await providerOrphans.write([], { state: "reconciled", backupId: firstId, inventoryContext: context });
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+
+      await restoreService.reconcileUnknownProviderInventory();
+      const policyAfterStartup = JSON.parse(fs.readFileSync(providerOrphans.POLICY_PATH, "utf8"));
+      assert.deepEqual(policyAfterStartup.pendingRestoreUploads, [
+        { area: "uploads", folderId: "root", name: "first-queue.txt" },
+        { area: "uploads", folderId: "root", name: "second-queue.txt" },
+      ]);
+
+      const first = backupRepository.getBackup(firstId);
+      const completedFirstSync = {
+        ...first.metadata.restoreSync,
+        state: "completed",
+        entries: first.metadata.restoreSync.entries.map((entry) => ({ ...entry, state: "completed" })),
+      };
+      backupRepository.saveBackup({ ...first, metadata: { ...first.metadata, restoreSync: completedFirstSync } });
+      await restoreService.reconcileUnknownProviderInventory();
+      const policyAfterFirstCompletion = JSON.parse(fs.readFileSync(providerOrphans.POLICY_PATH, "utf8"));
+      assert.deepEqual(policyAfterFirstCompletion.pendingRestoreUploads, [
+        { area: "uploads", folderId: "root", name: "second-queue.txt" },
+      ], "completion of one queue must not unblock a different pending restore");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("cloud startup keeps the listener closed when selected archive uploads fail", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
@@ -1805,7 +2083,7 @@ test("cloud startup keeps the listener closed when selected archive uploads fail
         timeout: 30_000,
       });
       assert.equal(result.status, 1, result.stderr || result.stdout);
-      assert.match(result.stderr, /provider inventory initialization or reconciliation failed; startup blocked/);
+      assert.match(result.stderr, /backup history recovery or provider inventory initialization failed; startup blocked/);
       assert.equal(fs.existsSync(marker), false);
       assert.equal(providerOrphans.isInventoryUnknown(), true);
       const queued = backupService.listBackups().find((entry) => entry.id === backup.id);
@@ -3389,6 +3667,7 @@ test("restore suppresses provider objects absent from the selected backup and ke
       assert.deepEqual(JSON.parse(child.stdout), {
         version: 1,
         providerInventory: { state: "known" },
+        pendingRestoreUploads: [{ area: "uploads", folderId: "root", name: "restored.txt" }],
         objects: [
           { area: "temp", folderId: "root", name: "pending-after-backup.txt" },
           { area: "uploads", folderId: "root", name: "after-backup.txt" },

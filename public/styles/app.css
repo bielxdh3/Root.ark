@@ -486,6 +486,7 @@ img { max-width: 100%; }
 .empty-inline { margin: 4px 0 0; }
 .feedback { margin-bottom: 12px; padding: 12px 14px; border-radius: 9px; font-size: 12px; }
 .feedback-error { border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--border)); background: var(--danger-soft); color: var(--danger); }
+.feedback-warning { border: 1px solid color-mix(in srgb, var(--warning) 30%, var(--border)); background: var(--warning-soft); color: var(--warning); }
 .access-list { display: grid; max-height: 48vh; gap: 6px; margin: 14px 0; overflow: auto; }
 .access-user-row { display: grid; grid-template-columns: minmax(110px, 1fr) 90px 90px; align-items: center; gap: 10px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-muted); font-size: 11px; }
 .access-user-row > strong { overflow: hidden; text-overflow: ellipsis; }

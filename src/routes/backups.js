@@ -31,10 +31,34 @@ function registerBackupRoutes(app, context) {
       });
       res.status(201).json({ backup });
     } catch (error) {
+      if (error.backupOperationState && error.backup) {
+        const warning = error.backupOperationState === "created-history-durability-uncertain"
+          ? "Backup criado e mantido, mas a gravação durável do histórico não foi confirmada. Confira a lista e a auditoria antes de repetir a operação."
+          : "Backup criado, mas uma etapa de manutenção automática falhou. Confira a lista e a auditoria antes de repetir a operação.";
+        auditLog("backup.created", getAuditActor(req), { type: "backup", id: error.backup.id }, "created", "partial", {
+          filename: error.backup.filename,
+          sizeBytes: error.backup.sizeBytes,
+          checksum: error.backup.checksum,
+          postCreateState: error.backupOperationState,
+          errorCode: error.code || null,
+        });
+        res.status(201).json({
+          backup: error.backup,
+          backupOperationState: error.backupOperationState,
+          warning,
+        });
+        return;
+      }
+      const errorCode = typeof error.code === "string" && /^[A-Z0-9_]{1,64}$/.test(error.code)
+        ? error.code
+        : "BACKUP_CREATE_FAILED";
+      const locked = errorCode === "BACKUP_LOCKED";
       auditLog("backup.failed", getAuditActor(req), { type: "backup", id: error.backup?.id || null }, "created", "failure", {
-        error: error.message,
+        errorCode,
       });
-      res.status(error.code === "BACKUP_LOCKED" ? 409 : 500).json({ error: error.message });
+      res.status(locked ? 409 : 500).json({
+        error: locked ? "Já existe uma operação de backup em andamento. Tente novamente." : "Não foi possível criar o backup.",
+      });
     }
   });
 

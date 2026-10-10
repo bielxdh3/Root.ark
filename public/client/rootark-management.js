@@ -30,7 +30,7 @@
     const text = String(message || "");
     element.textContent = text;
     element.hidden = !text;
-    element.className = tone === "error" ? "feedback feedback-error" : "feedback";
+    element.className = tone === "error" ? "feedback feedback-error" : tone === "warning" ? "feedback feedback-warning" : "feedback";
     element.setAttribute("role", tone === "error" ? "alert" : "status");
   }
   function tableState(colspan, message, kind) {
@@ -594,7 +594,15 @@
     document.getElementById("create-backup").addEventListener("click", async (event) => {
       const button = event.currentTarget, feedback = document.getElementById("backup-feedback");
       button.disabled = true; setFeedback(feedback, "Criando backup…");
-      try { await api.post("/backups", { notes: "Backup manual via painel" }); setFeedback(feedback, "Backup criado.", "success"); ui.toast("Backup criado.", "success"); await loadBackups(); }
+      try {
+        const result = await api.post("/backups", { notes: "Backup manual via painel" });
+        if (result?.backupOperationState) {
+          setFeedback(feedback, result.warning || "Backup criado com uma etapa de manutenção pendente. Confira a lista antes de repetir a operação.", "warning");
+          await loadBackups();
+          return;
+        }
+        setFeedback(feedback, "Backup criado.", "success"); ui.toast("Backup criado.", "success"); await loadBackups();
+      }
       catch (error) {
         const message = publicError(error, "Não foi possível criar o backup.");
         if (message) setFeedback(feedback, message, "error");

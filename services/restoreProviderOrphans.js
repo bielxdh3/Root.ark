@@ -90,7 +90,13 @@ function readPolicyDocument() {
   catch { throw new Error("Restore provider suppression policy is invalid; file access is blocked"); }
   if (value?.version !== 1) throw new Error("Restore provider suppression policy version is unsupported; file access is blocked");
   validateInventoryMarker(value.providerInventory, "Restore provider inventory policy");
-  return { ...value, objects: normalizeObjects(value.objects) };
+  return {
+    ...value,
+    objects: normalizeObjects(value.objects),
+    pendingRestoreUploads: value.pendingRestoreUploads === undefined
+      ? []
+      : normalizeObjects(value.pendingRestoreUploads),
+  };
 }
 
 function sameControlFileSnapshot(left, right) {
@@ -134,6 +140,13 @@ function readControlFile(filePath, label) {
 function policyFileExists() {
   try { fs.lstatSync(POLICY_PATH); return true; }
   catch (error) { if (error.code === "ENOENT") return false; throw error; }
+}
+
+function readPolicyState() {
+  const state = readState();
+  const policy = readPolicyDocument();
+  if (!policy && state) throw new Error("Restore provider suppression policy is missing; file access is blocked");
+  return { state, policy };
 }
 
 function markerForStatus(status) {
@@ -260,6 +273,11 @@ function guardProvider(provider) {
         return provider[operation](...args);
       }
       if (getInventoryStatus().state === "unknown") assertProviderAvailable();
+      if (operation === "download" && isRestoreUploadPending(args[0], args[1], args[3] || "uploads")) {
+        throw Object.assign(new Error("Selected restore bytes are still pending provider reconciliation"), {
+          code: "PROVIDER_RESTORE_SYNC_PENDING",
+        });
+      }
       if (typeof provider.resolveInventoryContext === "function") await provider.resolveInventoryContext();
       assertProviderAvailable(provider);
       const result = await provider[operation](...args);
@@ -286,7 +304,7 @@ async function markInventoryUnknown(backupId, context = {}, options = {}) {
   } finally { lease.release(); }
 }
 
-async function reconcileInventory(backupId, objects, inventoryContext = null) {
+async function reconcileInventory(backupId, objects, inventoryContext = null, pendingRestoreUploads) {
   const id = String(backupId || "");
   if (!/^[a-f0-9-]{36}$/i.test(id)) throw new Error("Restore provider inventory baseline is invalid");
   const normalized = normalizeObjects(objects);
@@ -308,19 +326,29 @@ async function reconcileInventory(backupId, objects, inventoryContext = null) {
     if (status.inventoryContext && status.inventoryContext !== inventoryContext) {
       throw new Error("Restore provider inventory context changed during reconciliation");
     }
-    writeUnlocked(normalized, { state: "reconciled", backupId: id, reconciledAt: new Date().toISOString(), inventoryContext });
+    writeUnlocked(normalized, { state: "reconciled", backupId: id, reconciledAt: new Date().toISOString(), inventoryContext }, pendingRestoreUploads);
+    return normalized;
+  } finally { lease.release(); }
+}
+
+async function setPendingRestoreUploads(objects) {
+  const normalized = normalizeObjects(objects);
+  const lease = await acquirePolicyLock();
+  try {
+    const policy = readPolicyDocument();
+    const status = getInventoryStatus();
+    if (status.contextConflict) {
+      throw new Error("Restore provider inventory context records are inconsistent while updating restore download fences");
+    }
+    if (JSON.stringify(policy?.pendingRestoreUploads || []) === JSON.stringify(normalized)) return normalized;
+    if (!policy && normalized.length === 0) return normalized;
+    writeUnlocked(policy?.objects || [], status, normalized);
     return normalized;
   } finally { lease.release(); }
 }
 
 function read() {
-  const state = readState();
-  const policy = readPolicyDocument();
-  if (!policy) {
-    if (state) throw new Error("Restore provider suppression policy is missing; file access is blocked");
-    return [];
-  }
-  return policy.objects;
+  return readPolicyState().policy?.objects || [];
 }
 
 function policySignature() {
@@ -338,14 +366,21 @@ function readSuppressionSnapshot() {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const before = policySignature();
     if (suppressionSnapshot?.signature === before) return suppressionSnapshot;
-    const entries = read();
+    const { policy } = readPolicyState();
     const after = policySignature();
     if (before === after) {
+      const entries = policy?.objects || [];
       const keys = new Set(entries.map((entry) => identityKey(entry.area, entry.folderId, entry.name)));
+      const pendingRestoreUploads = new Set((policy?.pendingRestoreUploads || [])
+        .map((entry) => identityKey(entry.area, entry.folderId, entry.name)));
       suppressionSnapshot = {
         signature: after,
         keys,
         foldedKeys: process.platform === "win32" ? new Set([...keys].map((key) => key.toLowerCase())) : null,
+        pendingRestoreUploads,
+        foldedPendingRestoreUploads: process.platform === "win32"
+          ? new Set([...pendingRestoreUploads].map((key) => key.toLowerCase()))
+          : null,
       };
       return suppressionSnapshot;
     }
@@ -353,13 +388,22 @@ function readSuppressionSnapshot() {
   throw new Error("Restore provider suppression policy changed repeatedly; file access is blocked");
 }
 
-function writeUnlocked(objects, inventoryStatus = getInventoryStatus()) {
+function writeUnlocked(objects, inventoryStatus = getInventoryStatus(), pendingRestoreUploads) {
   const normalized = normalizeObjects(objects);
+  const currentPolicy = readPolicyDocument();
+  const pendingUploads = pendingRestoreUploads === undefined
+    ? currentPolicy?.pendingRestoreUploads || []
+    : normalizeObjects(pendingRestoreUploads);
   if (inventoryStatus.state === "reconciled" && !inventoryStatus.inventoryContext) {
-    inventoryStatus = { ...inventoryStatus, inventoryContext: readPolicyDocument()?.providerInventory?.inventoryContext };
+    inventoryStatus = { ...inventoryStatus, inventoryContext: currentPolicy?.providerInventory?.inventoryContext };
   }
   const marker = markerForStatus(inventoryStatus);
-  writeJsonAtomically(POLICY_PATH, { version: 1, objects: normalized, providerInventory: marker });
+  writeJsonAtomically(POLICY_PATH, {
+    version: 1,
+    objects: normalized,
+    pendingRestoreUploads: pendingUploads,
+    providerInventory: marker,
+  });
   suppressionSnapshot = null;
   writeState(marker);
   return normalized;
@@ -377,12 +421,12 @@ function initialize({ requirePolicy = false } = {}) {
   return read();
 }
 
-async function write(objects, inventoryStatus) {
+async function write(objects, inventoryStatus, pendingRestoreUploads) {
   const lease = await acquirePolicyLock();
   try {
     const status = inventoryStatus === undefined ? getInventoryStatus() : inventoryStatus;
     if (status.contextConflict) throw new Error("Restore provider inventory context records are inconsistent; explicit repair is required");
-    return writeUnlocked(objects, status);
+    return writeUnlocked(objects, status, pendingRestoreUploads);
   }
   finally { lease.release(); }
 }
@@ -409,7 +453,9 @@ async function lockSnapshot(snapshot) {
   try {
     if (typeof snapshot?.assertCurrent !== "function") throw new Error("Restore provider suppression snapshot is invalid");
     snapshot.assertCurrent();
-    return () => lease.release();
+    const release = () => lease.release();
+    release.mutationLease = lease;
+    return release;
   } catch (error) {
     lease.release();
     throw error;
@@ -421,6 +467,13 @@ function isSuppressed(folderId, fileName, area = "uploads", snapshot = null) {
   const key = identityKey(area, String(folderId || "root"), String(fileName || ""));
   const current = readSuppressionSnapshot();
   return current.keys.has(key) || Boolean(current.foldedKeys?.has(key.toLowerCase()));
+}
+
+function isRestoreUploadPending(folderId, fileName, area = "uploads") {
+  const key = identityKey(area, String(folderId || "root"), String(fileName || ""));
+  const current = readSuppressionSnapshot();
+  return current.pendingRestoreUploads.has(key)
+    || Boolean(current.foldedPendingRestoreUploads?.has(key.toLowerCase()));
 }
 
 async function assertSafeToUnhide(provider) {
@@ -461,11 +514,11 @@ async function clear(folderId, fileName, area = "uploads", provider = null) {
   await assertSafeToUnhide(provider);
   const lease = await acquirePolicyLock();
   try {
-    const current = read();
-    if (!current.some((entry) => identityKey(entry.area, entry.folderId, entry.name) === key)) return false;
-    writeUnlocked(current.filter((entry) => identityKey(entry.area, entry.folderId, entry.name) !== key));
+    const objects = read();
+    if (!objects.some((entry) => identityKey(entry.area, entry.folderId, entry.name) === key)) return false;
+    writeUnlocked(objects.filter((entry) => identityKey(entry.area, entry.folderId, entry.name) !== key), getInventoryStatus());
     return true;
   } finally { lease.release(); }
 }
 
-module.exports = { POLICY_PATH, STATE_PATH, acquireInventoryLock: acquirePolicyLock, assertProviderAvailable, assertSafeToUnhide, assertUnambiguousProviderInventory, clear, createSnapshot, getInventoryStatus, guardProvider, identityKey, initialize, isInventoryUnknown, isSuppressed, lockSnapshot, markInventoryUnknown, normalizeObjects, read, reconcileInventory, suppress, write };
+module.exports = { POLICY_PATH, STATE_PATH, acquireInventoryLock: acquirePolicyLock, assertProviderAvailable, assertSafeToUnhide, assertUnambiguousProviderInventory, clear, createSnapshot, getInventoryStatus, guardProvider, identityKey, initialize, isInventoryUnknown, isSuppressed, isRestoreUploadPending, lockSnapshot, markInventoryUnknown, normalizeObjects, read, reconcileInventory, setPendingRestoreUploads, suppress, write };

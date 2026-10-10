@@ -116,6 +116,13 @@ test("backup and restore stay in the child runtime root", { timeout: 45_000 }, a
   });
 
   assert.equal((await waitForServer(port)).status, 200);
+  const backupDirectory = path.join(sandbox, "data", "backups");
+  const backupHistory = path.join(sandbox, "data", "backup-history.json");
+  const backupDirectoryState = () => fs.existsSync(backupDirectory) ? fs.readdirSync(backupDirectory).sort() : null;
+  const beforeDeniedRequests = { directory: backupDirectoryState(), history: checkoutState(backupHistory) };
+  assert.ok(beforeDeniedRequests.directory === null || beforeDeniedRequests.directory.length === 0,
+    "startup recovery may leave an empty backup directory, but must release its lock before serving requests");
+  assert.equal(beforeDeniedRequests.history.type, "absent");
   const manager = await login(port, "manager", password);
   const ordinary = await login(port, "ordinary", password);
   const deniedGet = await request(port, "/backups", { headers: { cookie: ordinary.cookie } });
@@ -123,8 +130,8 @@ test("backup and restore stay in the child runtime root", { timeout: 45_000 }, a
   const deniedPost = await request(port, "/backups", { method: "POST", headers: { ...headers(port, ordinary), "content-type": "application/json", "content-length": Buffer.byteLength(deniedPostBody) }, body: deniedPostBody });
   assert.equal(deniedGet.status, 403); assert.equal(JSON.parse(deniedGet.body).error, "Permissao negada: manageBackups");
   assert.equal(deniedPost.status, 403); assert.equal(JSON.parse(deniedPost.body).error, "Permissao negada: manageBackups");
-  assert.equal(fs.existsSync(path.join(sandbox, "data", "backups")), false);
-  assert.equal(fs.existsSync(path.join(sandbox, "data", "backup-history.json")), false);
+  assert.deepEqual(backupDirectoryState(), beforeDeniedRequests.directory, "denied backup requests must not create archive or lock artifacts");
+  assert.deepEqual(checkoutState(backupHistory), beforeDeniedRequests.history);
 
   const createBody = JSON.stringify({ notes: "runtime root" });
   const created = await request(port, "/backups", { method: "POST", headers: { ...headers(port, manager), "content-type": "application/json", "content-length": Buffer.byteLength(createBody) }, body: createBody });

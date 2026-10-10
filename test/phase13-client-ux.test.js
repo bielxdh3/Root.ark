@@ -560,13 +560,90 @@ test("Escape closes mobile navigation and restores focus unless a dialog is open
   assert.equal(root.navOpen, true, "Escape remains available to the active dialog");
 });
 
+test("backup creation announces partial success and refreshes the backup list", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-management.js"), "utf8");
+  const listeners = new Map();
+  const createButton = { disabled: false, addEventListener(name, listener) { this.listener = listener; } };
+  const body = { innerHTML: "" };
+  const feedback = { hidden: false, textContent: "", className: "", setAttribute(name, value) { this[name] = value; } };
+  const elements = new Map([["create-backup", createButton], ["backups-body", body], ["backup-feedback", feedback]]);
+  const element = (id) => {
+    if (!elements.has(id)) elements.set(id, { hidden: false, textContent: "", className: "", setAttribute(name, value) { this[name] = value; }, addEventListener(name, listener) { this.listener = listener; } });
+    return elements.get(id);
+  };
+  const target = {
+    addEventListener(name, listener) { listeners.set(name, listener); },
+    querySelectorAll() { return []; },
+    scrollIntoView() {},
+  };
+  let mounted;
+  const didMount = new Promise((resolve) => { mounted = resolve; });
+  let initialBackupsLoaded;
+  const didLoadBackups = new Promise((resolve) => { initialBackupsLoaded = resolve; });
+  let backupListRequests = 0;
+  let postedRoute = null;
+  let successToasts = 0;
+  const createdBackup = { id: "fixture-backup", filename: "fixture.zip", createdAt: "2026-10-10T10:00:00.000Z", type: "manual", status: "success", sizeBytes: 128 };
+  const context = {
+    console,
+    window: {
+      RootarkApi: {
+        async get(route) {
+          if (route === "/backups/latest-status") return { latest: null };
+          if (route === "/backups") {
+            backupListRequests += 1;
+            if (backupListRequests === 1) { initialBackupsLoaded(); return { backups: [] }; }
+            return { backups: [createdBackup] };
+          }
+          throw new Error("unexpected route: " + route);
+        },
+        async post(route) {
+          postedRoute = route;
+          return {
+            backup: createdBackup,
+            backupOperationState: "created-post-processing-failed",
+            warning: "Backup criado, mas uma etapa de manutenção automática falhou. Confira a lista e a auditoria antes de repetir a operação.",
+          };
+        },
+      },
+      RootarkUI: {
+        async getSession() { return { username: "fixture-admin", role: "admin", permissions: { manageBackups: true } }; },
+        mount() { mounted(); return target; },
+        escape: (value) => String(value),
+        formatDate: (value) => String(value || ""),
+        formatBytes: (value) => String(value || 0),
+        toast(message, tone) { if (tone === "success") successToasts += 1; },
+      },
+      addEventListener() {},
+    },
+    document: {
+      body: { dataset: { rootarkView: "backups" } },
+      getElementById(id) { return id === "page-content" ? target : element(id); },
+    },
+  };
+  vm.runInNewContext(source, context);
+  await didMount;
+  await didLoadBackups;
+  await createButton.listener({ currentTarget: createButton });
+
+  assert.equal(postedRoute, "/backups");
+  assert.equal(backupListRequests, 2, "the history is reloaded after partial success");
+  assert.match(body.innerHTML, /Concluído/, "the newly created backup appears in the refreshed list");
+  assert.equal(feedback.hidden, false);
+  assert.equal(feedback.className, "feedback feedback-warning");
+  assert.equal(feedback.role, "status");
+  assert.match(feedback.textContent, /Backup criado/);
+  assert.equal(successToasts, 0, "partial success must not look like an unqualified success toast");
+  assert.equal(createButton.disabled, false);
+});
+
 test("backup recovery stays blocked after an in-flight action returns a structured 503", async () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-management.js"), "utf8");
   for (const page of ["admin.html", "audit.html", "backups.html", "dashboard.html"]) {
     const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
-    assert.match(html, new RegExp(`rootark-management\\.js\\?v=${page === "audit.html" ? 19 : 18}`));
+    assert.match(html, new RegExp(`rootark-management\\.js\\?v=19`));
   }
-  assert.match(fs.readFileSync(path.join(__dirname, "..", "public", "service-worker.js"), "utf8"), /rootark-public-shell-v21/);
+  assert.match(fs.readFileSync(path.join(__dirname, "..", "public", "service-worker.js"), "utf8"), /rootark-public-shell-v22/);
   const listeners = new Map();
   const buttons = [{ disabled: false }, { disabled: false }, { disabled: false }];
   const target = {
@@ -735,13 +812,13 @@ test("service worker caches only the public shell and bypasses protected paths",
     },
     fetch: async () => { throw new Error("offline cache miss"); },
   };
-  assert.match(source, /const CACHE_NAME = "rootark-public-shell-v21";/, "workspace asset updates advance the public shell cache revision");
+  assert.match(source, /const CACHE_NAME = "rootark-public-shell-v22";/, "workspace asset updates advance the public shell cache revision");
   const pageAssets = {
     "index.html": [["rootark-api.js", 17], ["rootark-workspace.js", 18], ["rootark-ui.js", 17]],
-    "admin.html": [["rootark-api.js", 17], ["rootark-management.js", 18], ["rootark-ui.js", 17]],
+    "admin.html": [["rootark-api.js", 17], ["rootark-management.js", 19], ["rootark-ui.js", 17]],
     "audit.html": [["rootark-api.js", 17], ["rootark-management.js", 19], ["rootark-ui.js", 17]],
-    "backups.html": [["rootark-api.js", 17], ["rootark-management.js", 18], ["rootark-ui.js", 17]],
-    "dashboard.html": [["rootark-api.js", 17], ["rootark-management.js", 18], ["rootark-ui.js", 17]],
+    "backups.html": [["rootark-api.js", 17], ["rootark-management.js", 19], ["rootark-ui.js", 17]],
+    "dashboard.html": [["rootark-api.js", 17], ["rootark-management.js", 19], ["rootark-ui.js", 17]],
     "login.html": [["rootark-api.js", 17]],
   };
   for (const [page, scripts] of Object.entries(pageAssets)) {
@@ -750,25 +827,25 @@ test("service worker caches only the public shell and bypasses protected paths",
   }
   for (const page of Object.keys(pageAssets)) {
     const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
-    assert.match(html, /\/styles\/app\.css\?v=18/, `${page} refreshes the updated stylesheet`);
+    assert.match(html, /\/styles\/app\.css\?v=19/, `${page} refreshes the updated stylesheet`);
   }
   vm.runInNewContext(source, context);
   let installWait;
   handlers.install({ waitUntil: (promise) => { installWait = promise; } });
   await installWait;
-  assert.ok(caches.get("rootark-public-shell-v21").has("https://rootark.test/"));
-  assert.ok(caches.get("rootark-public-shell-v21").has("https://rootark.test/client/rootark-api.js"));
-  assert.ok(caches.get("rootark-public-shell-v21").has("https://rootark.test/client/rootark-workspace.js"));
-  assert.ok(caches.get("rootark-public-shell-v21").has("https://rootark.test/client/rootark-bootstrap.js"));
-  assert.ok(caches.get("rootark-public-shell-v21").has("https://rootark.test/client/rootark-protected-index.js"));
-  assert.ok(caches.get("rootark-public-shell-v21").has("https://rootark.test/client/rootark-offline-queue.js"));
-  assert.ok(caches.get("rootark-public-shell-v21").has("https://rootark.test/client/rootark-protected-session.js"));
-  assert.ok(caches.get("rootark-public-shell-v21").has("https://rootark.test/client/rootark-ui.js"));
-  assert.equal([...caches.get("rootark-public-shell-v21").keys()].some((asset) => /^https:\/\/rootark\.test\/(?:auth|api|files|preview|sync|encrypted|groups|folders)(?:\/|$)/i.test(new URL(asset).pathname)), false);
+  assert.ok(caches.get("rootark-public-shell-v22").has("https://rootark.test/"));
+  assert.ok(caches.get("rootark-public-shell-v22").has("https://rootark.test/client/rootark-api.js"));
+  assert.ok(caches.get("rootark-public-shell-v22").has("https://rootark.test/client/rootark-workspace.js"));
+  assert.ok(caches.get("rootark-public-shell-v22").has("https://rootark.test/client/rootark-bootstrap.js"));
+  assert.ok(caches.get("rootark-public-shell-v22").has("https://rootark.test/client/rootark-protected-index.js"));
+  assert.ok(caches.get("rootark-public-shell-v22").has("https://rootark.test/client/rootark-offline-queue.js"));
+  assert.ok(caches.get("rootark-public-shell-v22").has("https://rootark.test/client/rootark-protected-session.js"));
+  assert.ok(caches.get("rootark-public-shell-v22").has("https://rootark.test/client/rootark-ui.js"));
+  assert.equal([...caches.get("rootark-public-shell-v22").keys()].some((asset) => /^https:\/\/rootark\.test\/(?:auth|api|files|preview|sync|encrypted|groups|folders)(?:\/|$)/i.test(new URL(asset).pathname)), false);
   let activateWait;
   handlers.activate({ waitUntil: (promise) => { activateWait = promise; } });
   await activateWait;
-  assert.deepEqual([...caches.keys()], ["rootark-public-shell-v21"]);
+  assert.deepEqual([...caches.keys()], ["rootark-public-shell-v22"]);
   const shellPages = ["index.html", "login.html", "dashboard.html", "audit.html", "admin.html", "backups.html"];
   const versionedAssets = [...new Set(shellPages.flatMap((page) => {
     const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
