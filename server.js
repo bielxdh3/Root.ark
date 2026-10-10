@@ -1973,6 +1973,7 @@ function renderPublicSharePage(token) {
           data.remainingDownloads !== null ? '<span class="pill">' + data.remainingDownloads + ' downloads restantes</span>' : '<span class="pill">Downloads ilimitados</span>'
         ].filter(Boolean).join("");
         previewButton.hidden = !data.canPreview;
+        previewButton.classList.toggle("hidden", !data.canPreview);
         downloadButton.disabled = data.remainingDownloads === 0;
       }
 

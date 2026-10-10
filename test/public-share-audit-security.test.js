@@ -64,7 +64,12 @@ function runSharePageScript(page, fetchImpl) {
       classList: {
         add(name) { classes.add(name); },
         remove(name) { classes.delete(name); },
-        toggle(name) { if (classes.has(name)) classes.delete(name); else classes.add(name); },
+        toggle(name, force) {
+          const shouldAdd = arguments.length > 1 ? Boolean(force) : !classes.has(name);
+          if (shouldAdd) classes.add(name);
+          else classes.delete(name);
+          return shouldAdd;
+        },
         contains(name) { return classes.has(name); },
       },
       addEventListener(type, handler) { this.listeners[type] = handler; },
@@ -593,6 +598,24 @@ test("public-share audit logs correlate by token digest without storing the bear
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(previewRefreshElements.get("downloadButton").disabled, false);
+  const unsupportedPreviewElements = runSharePageScript(sharePage.body, async () => ({
+    status: 200,
+    ok: true,
+    json: async () => ({ fileName: "unsupported.txt", expiresAt: new Date(Date.now() + 60_000).toISOString(), remainingViews: null, remainingDownloads: null, canPreview: false, size: 12 }),
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(unsupportedPreviewElements.get("previewButton").hidden, true, "unsupported shares mark the preview button hidden");
+  assert.equal(unsupportedPreviewElements.get("previewButton").classList.contains("hidden"), true, "the preview action uses the page's enforced hidden style for unsupported shares");
+  const supportedPreviewElements = runSharePageScript(sharePage.body, async () => ({
+    status: 200,
+    ok: true,
+    json: async () => ({ fileName: "preview.pdf", expiresAt: new Date(Date.now() + 60_000).toISOString(), remainingViews: null, remainingDownloads: 1, canPreview: true, size: 12 }),
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(supportedPreviewElements.get("previewButton").hidden, false, "supported shares expose the preview button");
+  assert.equal(supportedPreviewElements.get("previewButton").classList.contains("hidden"), false, "the preview action is visible again for supported shares");
   previewRefreshElements.get("previewButton").listeners.click();
   const previewFrame = previewRefreshElements.createdElements.find((element) => element.tagName === "iframe");
   assert.ok(previewFrame, "the preview flow creates an iframe with a load handler");
