@@ -28,6 +28,11 @@ const OPERATION_LOCK_FORMAT_VERSION = 1;
 const MALFORMED_LOCK_TTL_MS = 60 * 1000;
 const MALFORMED_TAKEOVER_TTL_MS = 60 * 1000;
 const MAX_LOCK_TTL_MS = 24 * 60 * 60 * 1000;
+const PROCESS_INSTANCE_ID_SYMBOL = Symbol.for("rootark.backup.process-instance-id");
+if (!globalThis[PROCESS_INSTANCE_ID_SYMBOL]) {
+  Object.defineProperty(globalThis, PROCESS_INSTANCE_ID_SYMBOL, { value: crypto.randomUUID() });
+}
+const CURRENT_PROCESS_INSTANCE_ID = globalThis[PROCESS_INSTANCE_ID_SYMBOL];
 let operationLock = null;
 let cloudStorage = null;
 
@@ -498,6 +503,9 @@ function ownerIsLive(record) {
   if (!Number.isInteger(record?.pid) || record.pid <= 0) return false;
   const hasVersionedOwner = record.formatVersion === OPERATION_LOCK_FORMAT_VERSION || record.version === OPERATION_LOCK_FORMAT_VERSION;
   if (hasVersionedOwner && (!record.instanceId || record.instanceId !== lockOwnerInstanceId())) return true;
+  if (record.pid === process.pid && typeof record.processInstanceId === "string" && record.processInstanceId) {
+    return record.processInstanceId === CURRENT_PROCESS_INSTANCE_ID;
+  }
   try { process.kill(record.pid, 0); } catch (error) { return error.code === "EPERM"; }
   if (record.processStartIdentity && processStartIdentity(record.pid)) {
     return record.processStartIdentity === processStartIdentity(record.pid);
@@ -508,6 +516,7 @@ function ownerIsLive(record) {
 function validLockRecord(record) {
   if (!record || typeof record !== "object") return false;
   if (!Number.isInteger(record.pid) || record.pid <= 0) return false;
+  if (record.processInstanceId !== undefined && (typeof record.processInstanceId !== "string" || !record.processInstanceId)) return false;
   if (record.formatVersion === OPERATION_LOCK_FORMAT_VERSION) {
     return typeof record.token === "string" && Boolean(record.token) && typeof record.operation === "string" && Boolean(record.operation) && typeof record.startedAt === "string" && Number.isFinite(Date.parse(record.startedAt)) && typeof record.runtimeRoot === "string" && Boolean(record.runtimeRoot);
   }
@@ -584,7 +593,7 @@ function authorityPathIsSafe(target) {
 }
 
 function validTakeoverAuthority(record) {
-  return record && record.version === OPERATION_LOCK_FORMAT_VERSION && typeof record.token === "string" && record.token && Number.isInteger(record.pid) && record.pid > 0 && typeof record.instanceId === "string" && Boolean(record.instanceId) && typeof record.claimedAt === "string" && Number.isFinite(Date.parse(record.claimedAt)) && typeof record.runtimeRoot === "string" && sameRuntimeRoot(record.runtimeRoot, runtimeRootIdentity()) && record.lockPath === LOCK_FILE && record.evidencePath === LOCK_TAKEOVER_EVIDENCE && record.observed && typeof record.observed.sha256 === "string" && Number.isInteger(record.observed.size) && record.observed.stat;
+  return record && record.version === OPERATION_LOCK_FORMAT_VERSION && typeof record.token === "string" && record.token && Number.isInteger(record.pid) && record.pid > 0 && (record.processInstanceId === undefined || (typeof record.processInstanceId === "string" && Boolean(record.processInstanceId))) && typeof record.instanceId === "string" && Boolean(record.instanceId) && typeof record.claimedAt === "string" && Number.isFinite(Date.parse(record.claimedAt)) && typeof record.runtimeRoot === "string" && sameRuntimeRoot(record.runtimeRoot, runtimeRootIdentity()) && record.lockPath === LOCK_FILE && record.evidencePath === LOCK_TAKEOVER_EVIDENCE && record.observed && typeof record.observed.sha256 === "string" && Number.isInteger(record.observed.size) && record.observed.stat;
 }
 
 function readTakeoverAuthority() {
@@ -651,6 +660,7 @@ function acquireTakeoverAuthority(observed, operation) {
     token,
     operation,
     pid: process.pid,
+    processInstanceId: CURRENT_PROCESS_INSTANCE_ID,
     instanceId: lockOwnerInstanceId(),
     processStartIdentity: CURRENT_PROCESS_START_IDENTITY,
     claimedAt: new Date().toISOString(),
@@ -729,6 +739,7 @@ function lockRecord(operation, token, claimToken = null) {
     token,
     operation,
     pid: process.pid,
+    processInstanceId: CURRENT_PROCESS_INSTANCE_ID,
     instanceId: lockOwnerInstanceId(),
     processStartIdentity: CURRENT_PROCESS_START_IDENTITY,
     startedAt: new Date().toISOString(),
