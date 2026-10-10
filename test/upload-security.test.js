@@ -1166,13 +1166,15 @@ test("folder mutations revalidate session and upload permission after waiting fo
     preloadSource: ({ dir }) => {
       markerPath = path.join(dir, "folder-lock-waiting");
       const lockDirectory = path.join(dir, "data", ".rootark-cloud-file-locks");
+      const expectedLockPath = path.join(lockDirectory, `${crypto.createHash("sha256").update(`folder:${FOLDER_ID}`).digest("hex")}.lock`);
       return [
         'const fs = require("node:fs");',
         'const path = require("node:path");',
         `const lockDirectory = ${JSON.stringify(lockDirectory)};`,
+        `const expectedLockPath = ${JSON.stringify(expectedLockPath)};`,
         `const markerPath = ${JSON.stringify(markerPath)};`,
-        'const originalOpenSync = fs.openSync;',
-        'fs.openSync = function (file, ...args) { try { return originalOpenSync.call(this, file, ...args); } catch (error) { if (error.code === "EEXIST" && typeof file === "string" && path.resolve(file).startsWith(path.resolve(lockDirectory) + path.sep)) fs.writeFileSync(markerPath, "waiting"); throw error; } };',
+        'const originalLinkSync = fs.linkSync;',
+        'fs.linkSync = function (source, target) { try { return originalLinkSync.call(this, source, target); } catch (error) { if (error.code === "EEXIST" && typeof source === "string" && path.resolve(source).startsWith(path.resolve(lockDirectory) + path.sep) && typeof target === "string" && path.resolve(target) === path.resolve(expectedLockPath)) fs.writeFileSync(markerPath, "waiting"); throw error; } };',
       ].join("\n");
     },
   });
