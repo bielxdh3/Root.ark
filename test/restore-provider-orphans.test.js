@@ -185,6 +185,27 @@ test("provider suppression initialization creates a fail-closed marker and prese
   }
 });
 
+test("malformed pending restore download fences fail closed", () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-invalid-fence-"));
+  try {
+    const script = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const policy = require(${JSON.stringify(servicePath)});
+      policy.initialize();
+      const value = JSON.parse(fs.readFileSync(policy.POLICY_PATH, "utf8"));
+      value.pendingRestoreUploads = null;
+      fs.writeFileSync(policy.POLICY_PATH, JSON.stringify(value));
+      assert.throws(() => policy.isRestoreUploadPending("root", "stale.txt", "uploads"), /policy is invalid/i,
+        "a present but malformed fence must not be treated as an empty fence");
+    `;
+    const result = spawnSync(process.execPath, ["-e", script], { cwd: runtime, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("restore provider orphan identities preserve provider object case on every host", () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-provider-orphans-"));
   try {

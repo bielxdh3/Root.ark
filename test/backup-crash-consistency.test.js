@@ -239,7 +239,7 @@ test("retention transactions converge from real crash boundaries", { timeout: 60
   await t.test("crash after repository deletion finalizes without an orphan", async () => {
     const fixture = retentionFixture();
     try {
-      const action = `const repository=require(${JSON.stringify(REPOSITORY)}); const original=repository.deleteBackup; repository.deleteBackup=(id)=>{const value=original(id); process.kill(process.pid,"SIGKILL"); return value;}; ${cleanupAction(SERVICE)}`;
+      const action = `const repository=require(${JSON.stringify(REPOSITORY)}); const original=repository.deleteBackup; repository.deleteBackup=(...args)=>{const value=original(...args); process.kill(process.pid,"SIGKILL"); return value;}; ${cleanupAction(SERVICE)}`;
       const crashed = await runChild(fixture.runtime, action, { BACKUP_RETENTION_DAYS: "1" });
       assert.notEqual(crashed.code, 0);
       const recovered = await runChild(fixture.runtime, recoveryAction(SERVICE));
@@ -363,4 +363,146 @@ test("retention transactions converge from real crash boundaries", { timeout: 60
       assert.equal(fs.existsSync(fixture.tombstone), false);
     } finally { fs.rmSync(fixture.runtime, { recursive: true, force: true }); }
   });
+});
+
+test("normal server startup recovers backup tombstones before listening and fails closed on corrupt journals", { timeout: 45_000 }, async (t) => {
+  const serverPath = path.join(ROOT, "server.js");
+  const runtimeEnv = {
+    NODE_ENV: "test",
+    DB_ENABLED: "false",
+    ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true",
+    ROOTARK_RESTORE_INSTANCE_COUNT: "1",
+    ROOTARK_INSTANCE_ID: "backup-recovery-startup-fixture",
+    JWT_SECRET: "j".repeat(48),
+    BACKUP_ENABLED: "true",
+    CLOUD_STORAGE_PROVIDER: "local",
+    PORT: "0",
+  };
+  const restartAtListener = (fixture, resultPath) => `
+    const fs = require("fs");
+    const net = require("net");
+    const repository = require(${JSON.stringify(REPOSITORY)});
+    const service = require(${JSON.stringify(SERVICE)});
+    net.Server.prototype.listen = function () {
+      const history = repository.getBackup(${JSON.stringify(fixture.id)});
+      const result = {
+        archiveExists: fs.existsSync(${JSON.stringify(fixture.archivePath)}),
+        tombstoneExists: fs.existsSync(${JSON.stringify(fixture.tombstone)}),
+        historyExists: Boolean(history),
+        transactionRootExists: fs.existsSync(${JSON.stringify(fixture.transactionRoot)})
+          && fs.readdirSync(${JSON.stringify(fixture.transactionRoot)}).length > 0,
+      };
+      fs.writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify(result));
+      const expected = ${JSON.stringify(fixture.expected)};
+      process.exit(JSON.stringify(result) === JSON.stringify(expected) ? 0 : 4);
+    };
+    require(${JSON.stringify(serverPath)});
+  `;
+
+  for (const boundary of ["before-history-removal", "after-history-removal"]) {
+    await t.test(`${boundary} crash is recovered through server entrypoint`, async () => {
+      const fixture = retentionFixture();
+      try {
+        const action = boundary === "before-history-removal"
+          ? `const fs=require("fs"); const path=require("path"); const service=require(${JSON.stringify(SERVICE)}); const original=fs.renameSync; fs.renameSync=function(from,to){const result=original.call(this,from,to); if(path.resolve(from)===path.resolve(${JSON.stringify(fixture.archivePath)})&&path.resolve(to)===path.resolve(${JSON.stringify(fixture.tombstone)})) process.kill(process.pid,"SIGKILL"); return result;}; service.deleteBackup(${JSON.stringify(fixture.id)}).catch(error=>{console.error(error);process.exitCode=1;});`
+          : `const repository=require(${JSON.stringify(REPOSITORY)}); const original=repository.deleteBackup; repository.deleteBackup=(...args)=>{const result=original(...args); process.kill(process.pid,"SIGKILL"); return result;}; require(${JSON.stringify(SERVICE)}).deleteBackup(${JSON.stringify(fixture.id)}).catch(error=>{console.error(error);process.exitCode=1;});`;
+        const crashed = await runChild(fixture.runtime, action);
+        assert.notEqual(crashed.code, 0);
+        // The operation-lock recovery path is independent; these cases isolate history/tombstone startup recovery.
+        fs.rmSync(path.join(fixture.runtime, "data", "backups", ".backup.lock"), { force: true });
+        fixture.expected = boundary === "before-history-removal"
+          ? { archiveExists: true, tombstoneExists: false, historyExists: true, transactionRootExists: false }
+          : { archiveExists: false, tombstoneExists: false, historyExists: false, transactionRootExists: false };
+        const resultPath = path.join(fixture.runtime, "server-recovery-result.json");
+        const restarted = await runChild(fixture.runtime, restartAtListener(fixture, resultPath), runtimeEnv);
+        assert.equal(restarted.code, 0, restarted.stderr || restarted.stdout);
+        assert.deepEqual(JSON.parse(fs.readFileSync(resultPath, "utf8")), fixture.expected);
+      } finally { fs.rmSync(fixture.runtime, { recursive: true, force: true }); }
+    });
+  }
+
+  await t.test("corrupt transaction metadata prevents the listener from starting", async () => {
+    const fixture = retentionFixture();
+    try {
+      const record = transactionFor(fixture, "archive_moved");
+      fs.writeFileSync(path.join(record.directory, "transaction.json"), "{broken");
+      const listenerMarker = path.join(fixture.runtime, "listener-started");
+      const action = `const fs=require("fs"); const net=require("net"); net.Server.prototype.listen=function(){fs.writeFileSync(${JSON.stringify(listenerMarker)},"started"); process.exit(0);}; require(${JSON.stringify(serverPath)});`;
+      const result = await runChild(fixture.runtime, action, runtimeEnv);
+      assert.notEqual(result.code, 0, "corrupt journal state must block normal startup");
+      assert.equal(fs.existsSync(listenerMarker), false, "the listener must not be opened when recovery is ambiguous");
+    } finally { fs.rmSync(fixture.runtime, { recursive: true, force: true }); }
+  });
+});
+
+test("retention journal and archive transitions sync parent directories after each durable step", { timeout: 30_000 }, async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Node.js on Windows has no supported parent-directory fsync path");
+    return;
+  }
+  const fixture = retentionFixture();
+  try {
+    const script = `
+      const fs=require("fs"); const path=require("path"); const service=require(${JSON.stringify(SERVICE)});
+      const events=[]; const fdPaths=new Map(); const originalOpen=fs.openSync; const originalClose=fs.closeSync;
+      const originalFsync=fs.fsyncSync; const originalRename=fs.renameSync; const originalRm=fs.rmSync;
+      fs.openSync=function(target,...args){const fd=originalOpen.call(this,target,...args);fdPaths.set(fd,String(target));return fd;};
+      fs.closeSync=function(fd){fdPaths.delete(fd);return originalClose.call(this,fd);};
+      fs.fsyncSync=function(fd){const target=fdPaths.get(fd);if(target&&fs.statSync(target).isDirectory())events.push("dir-sync:"+path.resolve(target));else events.push("file-sync:"+target);return originalFsync.call(this,fd);};
+      fs.renameSync=function(from,to){const result=originalRename.call(this,from,to);if(String(to).endsWith("transaction.json"))events.push("journal-rename:"+path.resolve(to));if(path.resolve(from)===path.resolve(${JSON.stringify(fixture.archivePath)})&&path.resolve(to)===path.resolve(${JSON.stringify(fixture.tombstone)}))events.push("archive-rename");return result;};
+      fs.rmSync=function(target,options){const result=originalRm.call(this,target,options);const resolved=path.resolve(target);if(resolved===path.resolve(${JSON.stringify(fixture.tombstone)}))events.push("tombstone-remove");if(String(target).endsWith("transaction.json"))events.push("transaction-file-remove:"+path.dirname(resolved));if(path.dirname(resolved)===path.resolve(service.RETENTION_TRANSACTIONS_DIR))events.push("transaction-directory-remove:"+path.dirname(resolved));return result;};
+      process.env.BACKUP_RETENTION_DAYS="1";process.env.BACKUP_RETENTION_COUNT="0";
+      service.cleanupRetention().then(()=>console.log(JSON.stringify(events))).catch(error=>{console.error(error);process.exitCode=1;});
+    `;
+    const result = await runChild(fixture.runtime, script);
+    assert.equal(result.code, 0, result.stderr);
+    const events = JSON.parse(result.stdout.trim());
+    const backupDir = path.join(fixture.runtime, "data", "backups");
+    const transactionsDir = fixture.transactionRoot;
+    for (const event of events.filter((value) => value.startsWith("journal-rename:"))) {
+      const directory = path.dirname(event.slice("journal-rename:".length));
+      const index = events.indexOf(event);
+      assert.equal(events[index + 1], `dir-sync:${directory}`, "journal rename must be followed by its directory fsync");
+    }
+    for (const event of ["archive-rename", "tombstone-remove"]) {
+      const index = events.indexOf(event);
+      assert.notEqual(index, -1, `${event} must be observed`);
+      assert.equal(events[index + 1], `dir-sync:${backupDir}`, `${event} must be followed by backup-directory fsync`);
+    }
+    for (const event of events.filter((value) => value.startsWith("transaction-file-remove:"))) {
+      const directory = event.slice("transaction-file-remove:".length);
+      const index = events.indexOf(event);
+      assert.equal(events[index + 1], `dir-sync:${directory}`, "transaction removal must sync its containing directory");
+    }
+    const transactionDirectoryRemoval = events.findIndex((value) => value.startsWith("transaction-directory-remove:"));
+    assert.notEqual(transactionDirectoryRemoval, -1, "the transaction directory must be removed");
+    assert.equal(events[transactionDirectoryRemoval + 1], `dir-sync:${transactionsDir}`, "removing the transaction directory must sync its parent");
+  } finally { fs.rmSync(fixture.runtime, { recursive: true, force: true }); }
+});
+
+test("parent-directory fsync failure after archive rename rolls the retention move back", { timeout: 20_000 }, async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Node.js on Windows has no supported parent-directory fsync path");
+    return;
+  }
+  const fixture = retentionFixture();
+  try {
+    const script = `
+      const fs=require("fs"); const path=require("path"); const service=require(${JSON.stringify(SERVICE)}); const repository=require(${JSON.stringify(REPOSITORY)});
+      const originalOpen=fs.openSync; const originalFsync=fs.fsyncSync; const originalRename=fs.renameSync; const fdPaths=new Map(); let moved=false; let injected=false;
+      fs.openSync=function(target,...args){const fd=originalOpen.call(this,target,...args);fdPaths.set(fd,String(target));return fd;};
+      fs.fsyncSync=function(fd){const target=fdPaths.get(fd);if(moved&&!injected&&target===service.BACKUPS_DIR){injected=true;throw Object.assign(new Error("injected parent directory fsync failure"),{code:"EIO"});}return originalFsync.call(this,fd);};
+      fs.renameSync=function(from,to){const result=originalRename.call(this,from,to);if(path.resolve(from)===path.resolve(${JSON.stringify(fixture.archivePath)})&&path.resolve(to)===path.resolve(${JSON.stringify(fixture.tombstone)}))moved=true;return result;};
+      process.env.BACKUP_RETENTION_DAYS="1";process.env.BACKUP_RETENTION_COUNT="0";
+      service.cleanupRetention().then(()=>{console.log(JSON.stringify({injected,unexpectedSuccess:true}));}).catch(error=>console.log(JSON.stringify({injected,error:error.message,archive:fs.existsSync(${JSON.stringify(fixture.archivePath)}),tombstone:fs.existsSync(${JSON.stringify(fixture.tombstone)}),history:Boolean(repository.getBackup(${JSON.stringify(fixture.id)}))})));
+    `;
+    const result = await runChild(fixture.runtime, script);
+    assert.equal(result.code, 0, result.stderr);
+    const outcome = JSON.parse(result.stdout.trim());
+    assert.equal(outcome.injected, true);
+    assert.match(outcome.error || "", /injected parent directory fsync failure/);
+    assert.equal(outcome.archive, true);
+    assert.equal(outcome.tombstone, false);
+    assert.equal(outcome.history, true);
+  } finally { fs.rmSync(fixture.runtime, { recursive: true, force: true }); }
 });

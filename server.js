@@ -10158,7 +10158,6 @@ app.put("/move", moveRateLimit, authenticate, async (req, res) => {
 });
 
 initData();
-restoreService.recoverQuarantineRestore();
 if (!fs.existsSync(QUARANTINE_FILE)) saveQuarantine(getDefaultQuarantine());
 const startupRestoreCoordinator = startupRestoreState.restartRequired
   ? restoreService.prepareWholeRestoreStartup()
@@ -10187,7 +10186,6 @@ scheduleAutomaticBackups({
   onInvalid: console.error,
 });
 void processPendingCloudTrashItems();
-void processPendingCloudRestoreSync().catch(() => {});
 const cloudTempReconciliationIntervalMs = parseBoundedNumber("CLOUD_TEMP_RECONCILIATION_INTERVAL_MS", 30_000, 1_000, 60 * 60 * 1000);
 const recoverCloudTempMutations = () => restoreRequestGate.run(async () => {
   if (!isCloudStorageEnabled()) return;
@@ -10247,11 +10245,14 @@ const listenForRequests = () => {
   });
 };
 void (async () => {
+  await backupService.recoverRetentionAtStartup();
+  restoreService.recoverQuarantineRestore();
   if (typeof cloudStorage.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
   await restoreService.reconcileUnknownProviderInventory();
+  void processPendingCloudRestoreSync().catch(() => {});
   listenForRequests();
 })().catch((error) => {
   startupRestoreLease();
-  console.error("[restore] provider inventory initialization or reconciliation failed; startup blocked:", sanitizeLogValue(error.message));
+  console.error("[restore] backup history recovery or provider inventory initialization failed; startup blocked:", sanitizeLogValue(error.message));
   process.exit(1);
 });

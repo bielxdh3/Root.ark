@@ -636,6 +636,28 @@ function restoreSyncEntryDueAt(entry, now) {
   return dueAt > now ? dueAt : null;
 }
 
+function pendingRestoreUploadEntries({ excludeBackupIds = [], additionalSyncs = [] } = {}) {
+  const excluded = new Set(excludeBackupIds.map((id) => String(id)));
+  const entries = [];
+  const appendSync = (sync) => {
+    if (!sync || ["completed", "cancelled"].includes(sync.state)) return;
+    for (const entry of sync.entries || []) {
+      if (["completed", "cancelled"].includes(entry.state)) continue;
+      entries.push({ area: entry.area, folderId: entry.folderId, name: entry.name });
+    }
+  };
+  for (const backup of backupService.listBackups()) {
+    if (excluded.has(String(backup.id))) continue;
+    appendSync(backup.metadata?.restoreSync);
+  }
+  for (const sync of additionalSyncs) appendSync(sync);
+  return restoreProviderOrphans.normalizeObjects(entries);
+}
+
+async function refreshPendingRestoreDownloadFences() {
+  return restoreProviderOrphans.setPendingRestoreUploads(pendingRestoreUploadEntries());
+}
+
 async function reconcileUnknownProviderInventory({ baselineBackupId, clock, sleep } = {}) {
   if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
   const previousStatus = restoreProviderOrphans.getInventoryStatus();
@@ -660,6 +682,7 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
       status = { state: "unknown", backupId: legacyQueues[0].id, inventoryContext: currentInventoryContext };
     }
   }
+  await refreshPendingRestoreDownloadFences();
   if (status.state !== "unknown") return { state: status.state, changed: false };
   const contextBoundCloudStorage = bindProviderContext(cloudStorage, currentInventoryContext);
   const markerNeedsUpdate = status.backupId && (previousStatus.state !== "unknown"
@@ -813,6 +836,7 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
       },
     });
   }
+  await refreshPendingRestoreDownloadFences();
   const wait = typeof sleep === "function"
     ? sleep
     : (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -858,7 +882,8 @@ async function reconcileUnknownProviderInventory({ baselineBackupId, clock, slee
     restoreProviderOrphans.identityKey(entry.area, entry.folderId, entry.name),
   ));
   await assertProviderContext(cloudStorage, currentInventoryContext);
-  await restoreProviderOrphans.reconcileInventory(selectedBackupId, orphaned, currentInventoryContext);
+  await restoreProviderOrphans.reconcileInventory(selectedBackupId, orphaned, currentInventoryContext,
+    pendingRestoreUploadEntries());
   return { state: "reconciled", backupId: backup.id, suppressed: orphaned.length, changed: true };
 }
 
@@ -1102,6 +1127,7 @@ async function processRestoreSyncInternal({ backupId, clock, uploader, leaseMs =
         expectedRevision: Number(current.metadata.restoreSync.revision) || 0,
         mutate: (latestEntry) => ({ entry: { ...latestEntry, state: "completed", failureCategory: null, nextAttemptAt: null, leaseToken: null, leaseUntil: null }, details: { failureCategory: null }, at }),
       });
+      await refreshPendingRestoreDownloadFences();
     } catch (error) {
       if (error.code?.startsWith("backup_")) throw error;
       const current = backupRepository.getBackup(backupId);
@@ -2317,6 +2343,10 @@ async function restoreBackup(id, options = {}) {
     const providerReconciliation = cloudSync.state === "pending"
       ? { backupId: backup.id, sync: cloudSync }
       : [];
+    const pendingRestoreUploads = pendingRestoreUploadEntries({
+      excludeBackupIds: [backup.id],
+      additionalSyncs: cloudSync.state === "pending" ? [cloudSync] : [],
+    });
     coordinator = updateWholeRestoreCoordinator(coordinator, {
       preimagePlan,
       preimageProgress: [],
@@ -2364,7 +2394,7 @@ async function restoreBackup(id, options = {}) {
       injectFailure("restore.provider-orphans.before-persist");
       await restoreProviderOrphans.write(providerOrphans, providerInventoryContext
         ? { state: "reconciled", backupId: backup.id, inventoryContext: providerInventoryContext }
-        : undefined);
+        : undefined, pendingRestoreUploads);
       injectFailure("restore.provider-orphans.persisted");
     } else {
       injectFailure("restore.provider-inventory-unknown.before-persist");

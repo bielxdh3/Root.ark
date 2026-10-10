@@ -11,6 +11,7 @@ process.chdir(runtime);
 process.env.DB_ENABLED = "false";
 const backupService = require("../services/backupService");
 const backupRepository = require("../repositories/backupRepository");
+const restoreProviderOrphans = require("../services/restoreProviderOrphans");
 
 function reset() {
   fs.rmSync(path.join(runtime, "data"), { recursive: true, force: true });
@@ -163,6 +164,146 @@ test("history failure is not reported as archive failure", async () => {
   }
   assert.equal(calls, 2);
   assert.equal(fs.readdirSync(backupService.BACKUPS_DIR).some((name) => name.endsWith(".zip")), false);
+});
+
+test("post-rename history durability failure preserves the archive if failed-history recovery also fails", async () => {
+  reset();
+  const historyPath = path.join(runtime, "data", "backup-history.json");
+  const historyDirectory = path.dirname(historyPath);
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const originalOpenSync = fs.openSync;
+  const originalFsyncSync = fs.fsyncSync;
+  const originalCloseSync = fs.closeSync;
+  const fakeDirectoryDescriptors = new Map();
+  let nextFakeDescriptor = 0x7fff0000;
+  let historyTemporaryOpens = 0;
+
+  Object.defineProperty(process, "platform", { ...originalPlatform, value: "linux" });
+  fs.openSync = function openWithInjectedRecoveryFailure(target, flags, ...rest) {
+    const targetPath = String(target);
+    if (targetPath.startsWith(`${historyPath}.`) && targetPath.endsWith(".tmp")) {
+      historyTemporaryOpens += 1;
+      if (historyTemporaryOpens === 2) {
+        throw Object.assign(new Error("injected failed-history temp open error"), { code: "EIO" });
+      }
+    }
+    try {
+      if (fs.statSync(targetPath).isDirectory()) {
+        const descriptor = nextFakeDescriptor++;
+        fakeDirectoryDescriptors.set(descriptor, targetPath);
+        return descriptor;
+      }
+    } catch {}
+    return originalOpenSync.call(this, target, flags, ...rest);
+  };
+  fs.fsyncSync = function failHistoryDirectorySync(descriptor) {
+    if (fakeDirectoryDescriptors.get(descriptor) === historyDirectory) {
+      throw Object.assign(new Error("injected history directory fsync error"), { code: "EIO" });
+    }
+    if (fakeDirectoryDescriptors.has(descriptor)) return;
+    return originalFsyncSync.call(this, descriptor);
+  };
+  fs.closeSync = function closeFakeDirectory(descriptor) {
+    if (fakeDirectoryDescriptors.has(descriptor)) return;
+    return originalCloseSync.call(this, descriptor);
+  };
+
+  let failure;
+  try {
+    await backupService.createBackup();
+  } catch (error) {
+    failure = error;
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.fsyncSync = originalFsyncSync;
+    fs.closeSync = originalCloseSync;
+    Object.defineProperty(process, "platform", originalPlatform);
+  }
+
+  assert.equal(historyTemporaryOpens, 1, "the post-rename failure must not attempt a second history replacement");
+  assert.equal(failure?.code, "EIO");
+  const visibleSuccess = backupRepository.listBackups().find((entry) => entry.status === "success");
+  assert.ok(visibleSuccess, "the first history rename remains visible after directory fsync fails");
+  assert.equal(fs.existsSync(path.join(backupService.BACKUPS_DIR, visibleSuccess.filename)), true,
+    "a visible success history row must never be left without its archive");
+  assert.equal(failure.backupOperationState, "created-history-durability-uncertain");
+});
+
+test("retention failure preserves a backup whose success history is already committed", async () => {
+  reset();
+  const historyPath = path.join(runtime, "data", "backup-history.json");
+  const originalAcquireInventoryLock = restoreProviderOrphans.acquireInventoryLock;
+  const originalOpenSync = fs.openSync;
+  let historyTemporaryOpens = 0;
+  restoreProviderOrphans.acquireInventoryLock = async () => {
+    throw Object.assign(new Error("injected retention lock failure"), { code: "RETENTION_LOCK_FAILED" });
+  };
+  fs.openSync = function failFallbackHistoryWrite(target, flags, ...rest) {
+    const targetPath = String(target);
+    if (targetPath.startsWith(`${historyPath}.`) && targetPath.endsWith(".tmp")) {
+      historyTemporaryOpens += 1;
+      if (historyTemporaryOpens === 2) {
+        throw Object.assign(new Error("injected failed-history temp open error"), { code: "EIO" });
+      }
+    }
+    return originalOpenSync.call(this, target, flags, ...rest);
+  };
+
+  let failure;
+  try {
+    await backupService.createBackup();
+  } catch (error) {
+    failure = error;
+  } finally {
+    restoreProviderOrphans.acquireInventoryLock = originalAcquireInventoryLock;
+    fs.openSync = originalOpenSync;
+  }
+
+  assert.equal(failure?.code, "RETENTION_LOCK_FAILED");
+  assert.equal(historyTemporaryOpens, 1, "committed success history must not be rewritten as a failed backup");
+  const visibleSuccess = backupRepository.listBackups().find((entry) => entry.status === "success");
+  assert.ok(visibleSuccess);
+  assert.equal(fs.existsSync(path.join(backupService.BACKUPS_DIR, visibleSuccess.filename)), true,
+    "retention maintenance failure must not remove an already-created backup");
+  assert.equal(failure.backup.id, visibleSuccess.id);
+  assert.equal(failure.backupOperationState, "created-post-processing-failed");
+  assert.match(failure.message, /Backup was created/);
+});
+
+test("staging cleanup failure keeps created backup visible and returns a safe partial outcome", async () => {
+  reset();
+  const stageRoot = path.join(backupService.BACKUPS_DIR, ".cloud-stage");
+  const originalRmSync = fs.rmSync;
+  let stagePath = null;
+  let failure = null;
+  fs.rmSync = function failStageCleanup(target, options) {
+    if (!stagePath && typeof target === "string" && path.dirname(path.resolve(target)) === stageRoot) {
+      stagePath = path.resolve(target);
+      fs.mkdirSync(stagePath, { recursive: true });
+      fs.writeFileSync(path.join(stagePath, "private-fixture.txt"), "disposable staging fixture");
+      throw Object.assign(new Error(`EACCES: permission denied, removing '${stagePath}'`), { code: "EACCES" });
+    }
+    return originalRmSync.call(this, target, options);
+  };
+
+  try {
+    await backupService.createBackup();
+  } catch (error) {
+    failure = error;
+  } finally {
+    fs.rmSync = originalRmSync;
+    if (stagePath) originalRmSync(stagePath, { recursive: true, force: true });
+    try { originalRmSync(stageRoot, { recursive: true, force: true }); } catch {}
+  }
+
+  const created = backupRepository.listBackups().find((entry) => entry.status === "success");
+  assert.ok(created, "the archive and successful history row remain committed");
+  assert.equal(fs.existsSync(path.join(backupService.BACKUPS_DIR, created.filename)), true);
+  assert.equal(failure?.backup?.id, created.id);
+  assert.equal(failure?.backupHistoryState, "durable");
+  assert.equal(failure?.backupOperationState, "created-post-processing-failed");
+  assert.equal(failure?.code, "BACKUP_STAGE_CLEANUP_FAILED");
+  assert.equal(failure.message.includes(stagePath), false, "local staging paths are not exposed in the outcome");
 });
 
 test.after(() => {

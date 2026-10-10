@@ -1776,6 +1776,165 @@ test("cloud-complete selected archives upload selected bytes before opening same
   `);
 });
 
+test("pending cloud restore sync blocks stale provider downloads until selected bytes are uploaded", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    backupService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      const uploadPath = path.join(uploadsDir, "root", "same.txt");
+      write(uploadPath, "ARCHIVED bytes");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const stored = backupService.getBackupOrThrow(backup.id);
+      fs.rmSync(stored.archivePath);
+      await backupService.createZipArchive(stored.archivePath, {
+        backup_id: backup.id,
+        included_files: [{ path: "uploads/root/same.txt", size: 14 }],
+        cloud_complete: true,
+      }, [{ absolutePath: uploadPath, entryPath: "uploads/root/same.txt", size: 14 }]);
+      await backupRepository.saveBackup({ ...backup, checksum: null });
+      write(uploadPath, "live bytes");
+
+      let providerBytes = "STALE provider bytes";
+      let failUploads = true;
+      const cloud = {
+        enabled: () => true,
+        provider: "fixture",
+        upload: async (source) => {
+          if (failUploads) throw new Error("injected provider upload failure");
+          providerBytes = fs.readFileSync(source, "utf8");
+          return true;
+        },
+        inventory: async () => [{ area: "uploads", folderId: "root", name: "same.txt" }],
+        download: async (_folderId, _name, target) => { write(target, providerBytes); return true; },
+      };
+      restoreService.setCloudStorage(cloud);
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      const selected = backupRepository.getBackup(backup.id);
+      assert.equal(selected.metadata.restoreSync.state, "pending");
+
+      const childProcess = require("node:child_process");
+      const restartCachePath = path.join(uploadsDir, "root", "restart-cache.txt");
+      const restartProbe = childProcess.spawnSync(process.execPath, ["-e", [
+        'const fs=require("node:fs");',
+        'const orphans=require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans").split(String.fromCharCode(92)).join("/"))});',
+        'const target=' + JSON.stringify(restartCachePath) + ';',
+        'const cloud={enabled:()=>true,download:async()=>{fs.writeFileSync(target,"STALE provider bytes");return true;}};',
+        'orphans.guardProvider(cloud).download("root","same.txt",target,"uploads").then(()=>console.log(JSON.stringify({code:null,cached:fs.existsSync(target)}))).catch(error=>console.log(JSON.stringify({code:error.code,cached:fs.existsSync(target)})));',
+      ].join("\\n")], { cwd: process.cwd(), encoding: "utf8", timeout: 30_000 });
+      assert.equal(restartProbe.status, 0, restartProbe.stderr || restartProbe.stdout);
+      assert.deepEqual(JSON.parse(restartProbe.stdout.trim()), {
+        code: "PROVIDER_RESTORE_SYNC_PENDING",
+        cached: false,
+      }, "a restarted process must preserve the durable download fence");
+
+      const policyPath = providerOrphans.POLICY_PATH;
+      const legacyPolicy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
+      delete legacyPolicy.pendingRestoreUploads;
+      fs.writeFileSync(policyPath, JSON.stringify(legacyPolicy));
+      await restoreService.reconcileUnknownProviderInventory();
+      const upgradedPolicy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
+      assert.deepEqual(upgradedPolicy.pendingRestoreUploads, [
+        { area: "uploads", folderId: "root", name: "same.txt" },
+      ], "startup must reconstruct download fences from older durable restore queues");
+      await providerOrphans.write(
+        [{ area: "uploads", folderId: "root", name: "same.txt" }],
+        undefined,
+        [{ area: "uploads", folderId: "root", name: "same.txt" }],
+      );
+      assert.equal(await providerOrphans.clear("root", "same.txt", "uploads", cloud), true);
+      assert.equal(providerOrphans.isRestoreUploadPending("root", "same.txt", "uploads"), true,
+        "clearing an orphan suppression must not remove a separate pending restore fence");
+      const upgradeCachePath = path.join(uploadsDir, "root", "upgrade-cache.txt");
+      await assert.rejects(
+        providerOrphans.guardProvider(cloud).download("root", "same.txt", upgradeCachePath, "uploads"),
+        (error) => error.code === "PROVIDER_RESTORE_SYNC_PENDING",
+        "an older policy file must not re-enable hydration of stale provider bytes",
+      );
+      assert.equal(fs.existsSync(upgradeCachePath), false);
+
+      const cachedPath = path.join(uploadsDir, "root", "missing-cache.txt");
+      await assert.rejects(
+        providerOrphans.guardProvider(cloud).download("root", "same.txt", cachedPath, "uploads"),
+        (error) => error.code === "PROVIDER_RESTORE_SYNC_PENDING",
+        "the provider must not hydrate the previous bytes while selected archive bytes are pending",
+      );
+      assert.equal(fs.existsSync(cachedPath), false, "blocked downloads must not write stale bytes to the cache");
+
+      failUploads = false;
+      await restoreService.processRestoreSync({ backupId: backup.id });
+      assert.equal(providerBytes, "ARCHIVED bytes");
+      assert.equal(backupRepository.getBackup(backup.id).metadata.restoreSync.state, "completed");
+      assert.equal(await providerOrphans.guardProvider(cloud).download("root", "same.txt", cachedPath, "uploads"), true);
+      assert.equal(fs.readFileSync(cachedPath, "utf8"), "ARCHIVED bytes");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("startup download fences include every active restore queue and release only completed keys", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    const context = "c".repeat(64);
+    const cloud = {
+      enabled: () => true,
+      resolveInventoryContext: async () => context,
+      inventoryContext: () => context,
+    };
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    const persistQueue = async (name) => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const restoreSync = {
+        operationId: backup.id,
+        state: "pending",
+        providerContext: context,
+        entries: [{
+          entryId: "restore-" + name,
+          state: "pending",
+          area: "uploads",
+          folderId: "root",
+          name: name + ".txt",
+        }],
+      };
+      backupRepository.saveBackup({
+        ...backupRepository.getBackup(backup.id),
+        metadata: { ...backup.metadata, restoreSync },
+      });
+      return backup.id;
+    };
+    (async () => {
+      const firstId = await persistQueue("first-queue");
+      const secondId = await persistQueue("second-queue");
+      await providerOrphans.write([], { state: "reconciled", backupId: firstId, inventoryContext: context });
+      backupService.setCloudStorage(cloud);
+      restoreService.setCloudStorage(cloud);
+
+      await restoreService.reconcileUnknownProviderInventory();
+      const policyAfterStartup = JSON.parse(fs.readFileSync(providerOrphans.POLICY_PATH, "utf8"));
+      assert.deepEqual(policyAfterStartup.pendingRestoreUploads, [
+        { area: "uploads", folderId: "root", name: "first-queue.txt" },
+        { area: "uploads", folderId: "root", name: "second-queue.txt" },
+      ]);
+
+      const first = backupRepository.getBackup(firstId);
+      const completedFirstSync = {
+        ...first.metadata.restoreSync,
+        state: "completed",
+        entries: first.metadata.restoreSync.entries.map((entry) => ({ ...entry, state: "completed" })),
+      };
+      backupRepository.saveBackup({ ...first, metadata: { ...first.metadata, restoreSync: completedFirstSync } });
+      await restoreService.reconcileUnknownProviderInventory();
+      const policyAfterFirstCompletion = JSON.parse(fs.readFileSync(providerOrphans.POLICY_PATH, "utf8"));
+      assert.deepEqual(policyAfterFirstCompletion.pendingRestoreUploads, [
+        { area: "uploads", folderId: "root", name: "second-queue.txt" },
+      ], "completion of one queue must not unblock a different pending restore");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("cloud startup keeps the listener closed when selected archive uploads fail", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
@@ -1805,7 +1964,7 @@ test("cloud startup keeps the listener closed when selected archive uploads fail
         timeout: 30_000,
       });
       assert.equal(result.status, 1, result.stderr || result.stdout);
-      assert.match(result.stderr, /provider inventory initialization or reconciliation failed; startup blocked/);
+      assert.match(result.stderr, /backup history recovery or provider inventory initialization failed; startup blocked/);
       assert.equal(fs.existsSync(marker), false);
       assert.equal(providerOrphans.isInventoryUnknown(), true);
       const queued = backupService.listBackups().find((entry) => entry.id === backup.id);
@@ -3389,6 +3548,7 @@ test("restore suppresses provider objects absent from the selected backup and ke
       assert.deepEqual(JSON.parse(child.stdout), {
         version: 1,
         providerInventory: { state: "known" },
+        pendingRestoreUploads: [{ area: "uploads", folderId: "root", name: "restored.txt" }],
         objects: [
           { area: "temp", folderId: "root", name: "pending-after-backup.txt" },
           { area: "uploads", folderId: "root", name: "after-backup.txt" },
