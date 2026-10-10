@@ -232,7 +232,8 @@ function stop(child) {
   return new Promise((resolve) => child.once("exit", resolve));
 }
 
-test("cloud-backed file routes authorize access and bound repeated metadata listings", { timeout: 60_000 }, async (t) => {
+// This serialized end-to-end matrix may run beside many process-isolated tests on Windows.
+test("cloud-backed file routes authorize access and bound repeated metadata listings", { timeout: 120_000 }, async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-get-acl-"));
   const unregisteredMagicNames = ["constructor", "toString", "__proto__"];
   const sentinelFiles = ["legacy-missing-owner.txt", "legacy-blank-owner.txt", "legacy-sentinel-case.txt", "legacy-sentinel-space.txt"];
