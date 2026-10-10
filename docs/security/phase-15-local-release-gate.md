@@ -1,7 +1,7 @@
 # Phase 15 local release gate
 
 > Historical phase report for the Phase 14 base below. It is not the current
-> closure verdict; see the [2026-10-09 current validation snapshot](../validation/2026-10-09-rootark-current-state.md)
+> closure verdict; see the [2026-10-10 current validation snapshot](../validation/2026-10-10-rootark-current-state.md)
 > for the later exact-SHA CI state and remaining release gates.
 
 Status: `RELEASE_GATE_BLOCKED_ENVIRONMENT`. This is a bounded local release

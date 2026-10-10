@@ -4,11 +4,15 @@ O sistema de backup protege metadados, banco SQLite local e arquivos enviados se
 
 ## Local
 
-Backups, o lock, o histórico JSON e os temporários de restore ficam no diretório de runtime do processo:
+Os arquivos de backup e o staging de restore ficam no diretório de runtime do processo:
 
 ```text
 <runtime-root>/data/backups
 ```
+
+O histórico JSON e o lock de metadados ficam em `<runtime-root>/data`; o staging de restore fica em `<runtime-root>/data/backups/.restore-tmp`.
+
+O catálogo de backups fica em `data/backup-history.json` quando a persistência JSON está ativa; com SQLite, as entradas usam a tabela `backup_history`. No modo JSON, as mutações são serializadas entre processos cooperantes Root.ark e o arquivo é substituído por um temporário exclusivo no mesmo diretório, com flush antes do rename. Em POSIX, o diretório também é sincronizado; o Node.js não oferece esse flush de diretório de forma portável no Windows, então não há garantia equivalente contra perda súbita de energia nessa plataforma. Histórico corrompido ou ilegível falha fechado e não é sobrescrito. Os arquivos de lock, claims e coordenação ficam no runtime e não são estado restaurável.
 
 Formato:
 
