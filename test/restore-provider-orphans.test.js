@@ -6,6 +6,7 @@ const { spawn, spawnSync } = require("node:child_process");
 const test = require("node:test");
 
 const servicePath = path.resolve(__dirname, "../services/restoreProviderOrphans.js");
+const betterSqlitePath = require.resolve("better-sqlite3");
 
 function startChild(script, cwd, env) {
   const child = spawn(process.execPath, ["-e", script], { cwd, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
@@ -69,6 +70,9 @@ test("restore provider policy retries transient Windows sharing violations", () 
       'const assert = require("node:assert/strict");',
       'const fs = require("node:fs");',
       'const path = require("node:path");',
+      'const Database = require(' + JSON.stringify(betterSqlitePath) + ');',
+      'const nativeProbe = new Database(":memory:");',
+      'nativeProbe.close();',
       'Object.defineProperty(process, "platform", { value: "win32" });',
       'const policy = require(' + JSON.stringify(servicePath) + ');',
       'const originalRenameSync = fs.renameSync;',
@@ -294,6 +298,9 @@ test("Windows provider aliases with different case remain independently suppress
   try {
     const script = `
       const assert = require("node:assert/strict");
+      const Database = require(${JSON.stringify(betterSqlitePath)});
+      const nativeProbe = new Database(":memory:");
+      nativeProbe.close();
       Object.defineProperty(process, "platform", { value: "win32" });
       const policy = require(${JSON.stringify(servicePath)});
       (async () => {
@@ -328,6 +335,9 @@ test("Windows case-fold aliases keep restored objects suppressed until inventory
   try {
     const script = `
       const assert = require("node:assert/strict");
+      const Database = require(${JSON.stringify(betterSqlitePath)});
+      const nativeProbe = new Database(":memory:");
+      nativeProbe.close();
       Object.defineProperty(process, "platform", { value: "win32" });
       const policy = require(${JSON.stringify(servicePath)});
       (async () => {

@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
 
-const CHILD_HELPER = path.join(__dirname, "helpers", "backup-crash-child.js");
+const CHILD_HELPER = path.resolve(__dirname, "..", "scripts", "test-helpers", "backup-crash-child.js");
 
 function startChild(runtime, mode, data = {}, env = {}) {
   const child = spawn(process.execPath, [CHILD_HELPER, JSON.stringify({ mode, data })], {

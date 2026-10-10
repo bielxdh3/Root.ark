@@ -101,15 +101,6 @@ function ownerIsLive(record) {
 }
 
 function readLockSnapshot() {
-  let pathStat;
-  try {
-    pathStat = fs.lstatSync(MUTATION_LOCK_FILE);
-  } catch (error) {
-    if (error.code === "ENOENT") return { kind: "missing" };
-    throw error;
-  }
-  if (pathStat.isSymbolicLink() || !pathStat.isFile()) return { kind: "unsafe" };
-
   let fd;
   try {
     const noFollow = fs.constants.O_NOFOLLOW || 0;
@@ -121,7 +112,16 @@ function readLockSnapshot() {
   }
   try {
     const descriptorStat = fs.fstatSync(fd);
-    if (!descriptorStat.isFile() || !sameFileIdentity(pathStat, descriptorStat)) return { kind: "changed" };
+    if (!descriptorStat.isFile()) return { kind: "unsafe" };
+    let pathStat;
+    try {
+      pathStat = fs.lstatSync(MUTATION_LOCK_FILE);
+    } catch (error) {
+      if (error.code === "ENOENT") return { kind: "changed" };
+      throw error;
+    }
+    if (pathStat.isSymbolicLink() || !pathStat.isFile()) return { kind: "unsafe" };
+    if (!sameFileIdentity(pathStat, descriptorStat)) return { kind: "changed" };
     return { kind: "file", fileIdentity: descriptorStat, mtimeMs: descriptorStat.mtimeMs, contents: fs.readFileSync(fd, "utf8") };
   } finally {
     try { fs.closeSync(fd); } catch {}

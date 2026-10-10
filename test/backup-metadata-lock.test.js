@@ -8,7 +8,7 @@ const test = require("node:test");
 const originalCwd = process.cwd();
 const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-metadata-lock-"));
 const repoRoot = path.resolve(__dirname, "..");
-const staleRaceChild = path.join(__dirname, "helpers", "backup-metadata-lock-race-child.js");
+const staleRaceChild = path.resolve(__dirname, "..", "scripts", "test-helpers", "backup-metadata-lock-race-child.js");
 process.chdir(runtime);
 process.env.DB_ENABLED = "false";
 const backupRepository = require("../repositories/backupRepository");
@@ -590,6 +590,45 @@ test("a same-token JSON lock with a different file identity cannot renew the old
     lease?.release();
     if (originalTtl === undefined) delete process.env.ROOTARK_JSON_LOCK_TTL_MS;
     else process.env.ROOTARK_JSON_LOCK_TTL_MS = originalTtl;
+  }
+});
+
+test("lock snapshot rejects a path identity change after opening the lock descriptor", () => {
+  reset();
+  const originalOpenSync = fs.openSync;
+  const originalLstatSync = fs.lstatSync;
+  let lease;
+  let lockOpened = false;
+  const pathCheckOrder = [];
+  try {
+    lease = backupRepository.acquireJsonMutationLock("replaced-after-open");
+    fs.openSync = function (target, ...args) {
+      const fd = originalOpenSync.call(this, target, ...args);
+      if (path.resolve(String(target)) === path.resolve(backupRepository.MUTATION_LOCK_FILE)) lockOpened = true;
+      return fd;
+    };
+    fs.lstatSync = function (target, ...args) {
+      const stat = originalLstatSync.call(this, target, ...args);
+      if (path.resolve(String(target)) !== path.resolve(backupRepository.MUTATION_LOCK_FILE)) return stat;
+      pathCheckOrder.push(lockOpened ? "after-open" : "before-open");
+      if (!lockOpened) return stat;
+      // Model replacement after open without relying on platform-specific rename
+      // behavior for a descriptor that is already open.
+      const altered = Object.assign(Object.create(Object.getPrototypeOf(stat)), stat);
+      altered.dev += 1;
+      altered.ino += 1;
+      altered.birthtimeMs += 1;
+      altered.ctimeMs += 1;
+      return altered;
+    };
+
+    assert.throws(() => lease.renew(), { code: "BACKUP_METADATA_LOCK_INVALID" });
+    assert.equal(lockOpened, true, "the lock descriptor must be opened before checking the current path");
+    assert.equal(pathCheckOrder[0], "after-open", "the first path identity check must follow descriptor open");
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.lstatSync = originalLstatSync;
+    lease?.release();
   }
 });
 
