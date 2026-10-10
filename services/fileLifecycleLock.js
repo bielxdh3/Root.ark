@@ -8,6 +8,8 @@ function createFileLifecycleLock({ directory, timeoutMs = 30_000, pollMs = 25 } 
   if (!directory) throw new TypeError("File lifecycle lock requires a shared directory");
   const lockDirectory = path.resolve(directory);
   const context = new AsyncLocalStorage();
+  const hostIdentity = crypto.createHash("sha256").update(os.hostname()).digest("hex").slice(0, 16);
+  let orphanLockTemporariesCleaned = false;
 
   function lockPathFor(folderId, fileName) {
     const basename = path.basename(String(fileName || ""));
@@ -45,6 +47,77 @@ function createFileLifecycleLock({ directory, timeoutMs = 30_000, pollMs = 25 } 
     } catch { return false; }
   }
 
+  function removePathIfIdentity(filePath, identity) {
+    if (!identity || !pathMatchesIdentity(filePath, identity)) return false;
+    try {
+      fs.unlinkSync(filePath);
+      return true;
+    } catch { return false; }
+  }
+
+  function cleanupOrphanLockTemporaries() {
+    if (orphanLockTemporariesCleaned) return;
+    let entries;
+    try { entries = fs.readdirSync(lockDirectory, { withFileTypes: true }); }
+    catch { return; }
+    orphanLockTemporariesCleaned = true;
+
+    for (const entry of entries) {
+      if (!entry.isFile() || entry.isSymbolicLink()) continue;
+      const match = entry.name.match(/^[a-f0-9]{64}\.lock(?:\.reaper)?\.([a-f0-9]{16})\.(\d+)\.[a-f0-9-]{36}\.tmp$/i);
+      if (!match || match[1] !== hostIdentity) continue;
+      const ownerPid = Number(match[2]);
+      if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) continue;
+      try {
+        process.kill(ownerPid, 0);
+        continue;
+      } catch (error) {
+        if (error.code !== "ESRCH") continue;
+      }
+
+      const temporaryPath = path.join(lockDirectory, entry.name);
+      let identity;
+      try {
+        const stat = fs.lstatSync(temporaryPath, { bigint: true });
+        if (!stat.isFile() || stat.isSymbolicLink()) continue;
+        identity = { dev: stat.dev, ino: stat.ino };
+      } catch { continue; }
+      removePathIfIdentity(temporaryPath, identity);
+    }
+  }
+
+  function createExclusiveLock(lockPath, owner) {
+    const temporaryPath = `${lockPath}.${hostIdentity}.${process.pid}.${owner.token}.tmp`;
+    let descriptor;
+    let identity;
+    let published = false;
+    try {
+      descriptor = fs.openSync(temporaryPath, "wx", 0o600);
+      const opened = fs.fstatSync(descriptor, { bigint: true });
+      identity = { dev: opened.dev, ino: opened.ino };
+      fs.writeFileSync(descriptor, `${JSON.stringify(owner)}\n`);
+      fs.fsyncSync(descriptor);
+      fs.closeSync(descriptor);
+      descriptor = undefined;
+
+      // Publish a complete owner record atomically. A process interruption
+      // during the write leaves only a private temporary file, never a lock
+      // path that other processes would mistake for a live owner. The lock
+      // filesystem must support same-directory hard links; otherwise callers
+      // fail closed instead of using a partially published lease.
+      fs.linkSync(temporaryPath, lockPath);
+      published = true;
+      if (!pathMatchesIdentity(lockPath, identity)) throw new Error("File lifecycle lock publication identity changed");
+      return identity;
+    } catch (error) {
+      if (published) releaseIfOwned(lockPath, owner.token, identity);
+      throw error;
+    } finally {
+      if (descriptor !== undefined) try { fs.closeSync(descriptor); } catch {}
+      removePathIfIdentity(temporaryPath, identity);
+    }
+  }
+
   function releaseIfOwned(lockPath, token, identity) {
     try {
       const current = readOwner(lockPath);
@@ -73,18 +146,10 @@ function createFileLifecycleLock({ directory, timeoutMs = 30_000, pollMs = 25 } 
 
     const reaperPath = `${lockPath}.reaper`;
     const reaperToken = crypto.randomUUID();
-    let descriptor;
     let reaperIdentity;
     try {
-      descriptor = fs.openSync(reaperPath, "wx", 0o600);
-      const reaperStat = fs.fstatSync(descriptor, { bigint: true });
-      reaperIdentity = { dev: reaperStat.dev, ino: reaperStat.ino };
-      fs.writeFileSync(descriptor, JSON.stringify({ token: reaperToken, pid: process.pid, hostname: os.hostname() }));
-      fs.fsyncSync(descriptor);
-      fs.closeSync(descriptor);
-      descriptor = undefined;
+      reaperIdentity = createExclusiveLock(reaperPath, { token: reaperToken, pid: process.pid, hostname: os.hostname() });
     } catch (error) {
-      if (descriptor !== undefined) try { fs.closeSync(descriptor); } catch {}
       return false;
     }
 
@@ -103,28 +168,15 @@ function createFileLifecycleLock({ directory, timeoutMs = 30_000, pollMs = 25 } 
 
   async function acquire(lockPath) {
     fs.mkdirSync(lockDirectory, { recursive: true, mode: 0o700 });
+    cleanupOrphanLockTemporaries();
     const deadline = Date.now() + Math.max(1, timeoutMs);
     const token = crypto.randomUUID();
     while (true) {
-      let descriptor;
-      let identity;
+      const owner = { token, pid: process.pid, hostname: os.hostname(), createdAt: new Date().toISOString() };
       try {
-        descriptor = fs.openSync(lockPath, "wx", 0o600);
-        const opened = fs.fstatSync(descriptor, { bigint: true });
-        identity = { dev: opened.dev, ino: opened.ino };
-        fs.writeFileSync(descriptor, `${JSON.stringify({ token, pid: process.pid, hostname: require("node:os").hostname(), createdAt: new Date().toISOString() })}\n`);
-        fs.fsyncSync(descriptor);
-        fs.closeSync(descriptor);
+        const identity = createExclusiveLock(lockPath, owner);
         return () => releaseIfOwned(lockPath, token, identity);
       } catch (error) {
-        if (descriptor !== undefined) {
-          try {
-            const opened = fs.fstatSync(descriptor, { bigint: true });
-            identity = { dev: opened.dev, ino: opened.ino };
-          } catch {}
-          try { fs.closeSync(descriptor); } catch {}
-          releaseIfOwned(lockPath, token, identity);
-        }
         if (error.code !== "EEXIST") {
           const unavailable = new Error("File lifecycle lock is unavailable");
           unavailable.code = "FILE_LIFECYCLE_LOCK_UNAVAILABLE";
