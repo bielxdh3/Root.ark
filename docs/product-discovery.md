@@ -388,7 +388,7 @@ Concrete answer options:
 
 ### Q2. Final name
 
-- Status: `[OPEN]`
+- Status: `[RESOLVED by D-010 on 2026-08-17]`
 - Question: What is the exact canonical spelling and capitalization?
 - Existing variants:
   - `Root.ark`
