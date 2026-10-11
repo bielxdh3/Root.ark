@@ -69,7 +69,17 @@ The repository currently contains working foundations for:
 - [x] bounded provider retry/cancellation, idempotency, ciphertext-only attestation, and secret-safe observability helpers;
 - [x] automated syntax, test, dependency, and artifact validation.
 
-### Current application-code snapshot — 2026-10-10 (after PR #156; `Root/main` SHA `c49fee7997580edb7868ecd7cb739aa1f173245f`)
+### Verified application-code snapshot — 2026-10-11 (after PR #162; application SHA `e0cf2f59b5a51594ed5d744d18d2829bb07db51b`)
+
+PR #161 merged the upload-setting preservation fix at `c402ec16219b68cbe5fd425f863a63182d56d94a`; PR #162 merged the anonymous login-audit actor fix at application SHA `e0cf2f59b5a51594ed5d744d18d2829bb07db51b`. The exact PR #162 head release gate reported 21 passed, 0 blocked, and 0 failed. On exact `Root/main` SHA `e0cf2f5`, push-triggered Security Regression [run #38129407042](https://github.com/bielxdh3/Root.ark/actions/runs/38129407042) passed on Ubuntu and Windows; CodeQL [#38129407037](https://github.com/bielxdh3/Root.ark/actions/runs/38129407037), Dependency Review [#38129407038](https://github.com/bielxdh3/Root.ark/actions/runs/38129407038), and Pages [#38129406689](https://github.com/bielxdh3/Root.ark/actions/runs/38129406689) passed. This prepublication snapshot does not predict the documentation PR's merge SHA; that exact default-branch SHA still needs its own validation.
+
+The fresh browser evidence for PR #161 covers the upload settings behavior and the existing application journeys; the follow-up PR #162 changes only server authentication-audit behavior. A fresh login/workspace smoke on the exact `e0cf2f5` runtime checked compact navigation and no horizontal overflow at 390, 768, and 1440 pixels. Full evidence and limitations are recorded in the [post-#162 closure snapshot](docs/validation/2026-10-11-rootark-post-162.md). Whole restore remains compensating-rollback and restart recoverable, not an atomic visibility switch across local stores or cloud providers. Windows directory-entry power-loss durability, live provider interoperability, and deployed proxy topology remain unverified. Root.ark is not production-ready or an end-to-end Zero-Knowledge runtime. The public-share model remains bearer-link based.
+
+### Historical application-code snapshot — 2026-10-11 (after PR #159; `Root/main` SHA `d2d5f387b52241efc981108c79a21bbf7f27a5c9`)
+
+This dated post-#159 snapshot is superseded by the post-#162 application snapshot above. Its evidence remains scoped to its original SHAs in [the post-#159 validation record](docs/validation/2026-10-11-rootark-post-159.md).
+
+### Historical application-code snapshot — 2026-10-10 (after PR #156; `Root/main` SHA `c49fee7997580edb7868ecd7cb739aa1f173245f`)
 
 PR #153 merged at `4dc8510058718dc5aaab7e2c425b0bf4622b6d4a`, #154 at `5464d050c40c3ff5ea70a67e2314231cef0c9595`, #155 at `2913db3da7708afb46132395e16482907618c158`, and #156 produced the application SHA `c49fee7997580edb7868ecd7cb739aa1f173245f` captured here. On this exact SHA, push-triggered Security Regression [run #38107020584](https://github.com/bielxdh3/Root.ark/actions/runs/38107020584), CodeQL [run #38107020730](https://github.com/bielxdh3/Root.ark/actions/runs/38107020730), default-branch Dependency Review [run #38107020836](https://github.com/bielxdh3/Root.ark/actions/runs/38107020836), and Pages [run #38107019648](https://github.com/bielxdh3/Root.ark/actions/runs/38107019648) passed. PR #156 keeps the restore request barrier active until all configured instances acknowledge restored startup and provider reconciliation succeeds; provider failure retains the durable restore coordinator for restart recovery.
 
