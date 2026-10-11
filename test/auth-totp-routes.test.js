@@ -44,7 +44,11 @@ function createHarness(users, options = {}) {
     auditLog(...args) { events.push(args); },
     bcrypt,
     checkAnomalies() {},
-    getAuditActor: (_req, username) => ({ username: username || "alice", ip: "127.0.0.1" }),
+    getAuditActor: (req, fallbackUsername = "system") => ({
+      username: req?.user?.username || fallbackUsername || "system",
+      role: req?.user?.role || null,
+      ip: req?.ip || "unknown",
+    }),
     getTotpKey: options.getTotpKey || (() => key),
     jwt,
     jwtSecret: "s".repeat(48),
@@ -58,7 +62,7 @@ function createHarness(users, options = {}) {
   };
   registerAuthRoutes(app, context);
   async function call(method, path, body = {}, username = "alice") {
-    const req = { body, user: { username }, headers: {}, method, path, ip, params: path.includes(":username") ? { username: "alice" } : {} };
+    const req = { body, user: path.startsWith("/auth/login") ? undefined : { username }, headers: {}, method, path, ip, params: path.includes(":username") ? { username: "alice" } : {} };
     const res = response();
     for (const handler of routes.get(`${method} ${path}`) || []) {
       let continued = false;
@@ -67,7 +71,7 @@ function createHarness(users, options = {}) {
     }
     return res;
   }
-  return { call, events, key, users };
+  return { call, events, ip, key, users };
 }
 
 function user(username, role = "user") {
@@ -235,6 +239,8 @@ test("expired pending enrollment and expired login challenges fail generically",
     Date.now = () => now() + 61 * 1000;
     const expired = await harness.call("POST", "/auth/login/2fa", { challengeId: challenge.body.challengeId, code: "000000" }, "expiry");
     assert.equal(expired.code, 401);
+    assert.equal(harness.events.some(([eventType, , , , , details]) => eventType === "auth.login.challenge.failed" && details.reason === "invalid_challenge"), true);
+    assert.doesNotMatch(JSON.stringify(harness.events), new RegExp(challenge.body.challengeId));
   } finally {
     Date.now = originalNow;
     if (originalTtl === undefined) delete process.env.TOTP_CHALLENGE_TTL_MS;
@@ -290,4 +296,119 @@ test("fresh challenges share bounded IP and account throttles", async () => {
   last = await harness.call("POST", "/auth/login/2fa", { challengeId: fresh.body.challengeId, code: "000000" }, "throttled");
   assert.equal(last.code, 429);
   assert.match(last.body.error, /dois fatores/);
+});
+
+test("failed login audit identifies an anonymous actor and keeps attempted username separate", async () => {
+  const password = "synthetic-password-that-must-not-be-audited";
+  const username = "synthetic-missing-user";
+  const harness = createHarness([]);
+  const result = await harness.call("POST", "/auth/login", { username, password }, username);
+
+  assert.equal(result.code, 401);
+  const [eventType, actor, target, , , details] = harness.events.find(([name]) => name === "auth.login.failed");
+  assert.equal(eventType, "auth.login.failed");
+  assert.deepEqual(actor, { username: "anonymous", role: null, ip: harness.ip });
+  assert.deepEqual(target, { type: "auth", id: username });
+  assert.equal(details.attemptedUsername, username);
+  assert.equal(details.ip, harness.ip);
+  assert.doesNotMatch(JSON.stringify(harness.events), /synthetic-password-that-must-not-be-audited/);
+});
+
+test("invalid login 2FA audit identifies an anonymous actor and omits credential material", async () => {
+  const account = user("synthetic-totp-user");
+  const harness = createHarness([account]);
+  const secret = generateSecret();
+  const secretCode = "synthetic-totp-code-that-must-not-be-audited";
+  account.totpEnabled = true;
+  account.totpSecret = encryptSecret(secret, harness.key, `Root.ark/TOTP/${account.username}`);
+  account.totpRecoveryHashes = [];
+  account.totpLastUsedStep = Math.floor(Date.now() / 1000 / 30) - 1;
+
+  const primary = await harness.call("POST", "/auth/login", { username: account.username, password: "password" }, account.username);
+  const result = await harness.call("POST", "/auth/login/2fa", { challengeId: primary.body.challengeId, code: secretCode }, account.username);
+
+  assert.equal(result.code, 401);
+  const [eventType, actor, target, , , details] = harness.events.find(([name]) => name === "auth.login.challenge.failed");
+  assert.equal(eventType, "auth.login.challenge.failed");
+  assert.deepEqual(actor, { username: "anonymous", role: null, ip: harness.ip });
+  assert.deepEqual(target, { type: "user", id: account.username });
+  assert.equal(details.reason, "invalid_proof");
+  assert.doesNotMatch(JSON.stringify(harness.events), new RegExp(secret));
+  assert.doesNotMatch(JSON.stringify(harness.events), new RegExp(secretCode));
+});
+
+test("invalid and rate-limited challenge submissions are audited once per IP window without logging challenge IDs", async () => {
+  const originalMax = process.env.TOTP_CHALLENGE_MAX_ATTEMPTS;
+  process.env.TOTP_CHALLENGE_MAX_ATTEMPTS = "5";
+  try {
+    const harness = createHarness([]);
+    const challengeId = "synthetic-bearer-challenge-id";
+    const results = [];
+    for (let attempt = 0; attempt < 7; attempt += 1) {
+      results.push(await harness.call("POST", "/auth/login/2fa", { challengeId, code: "synthetic-secret-code" }));
+    }
+
+    assert.deepEqual(results.slice(0, 5).map((result) => result.code), [401, 401, 401, 401, 401]);
+    assert.deepEqual(results.slice(5).map((result) => result.code), [429, 429]);
+    assert.ok(results.every((result) => result.body.error === "Autenticacao de dois fatores invalida."));
+    const failures = harness.events.filter(([eventType]) => eventType === "auth.login.challenge.failed");
+    assert.deepEqual(failures.map(([, , , , , details]) => details.reason), ["invalid_challenge", "rate_limited"]);
+    for (const [, actor, target, , , details] of failures) {
+      assert.equal(actor.username, "anonymous");
+      assert.equal(actor.ip, harness.ip);
+      assert.deepEqual(target, { type: "auth", id: "login/2fa" });
+      assert.equal(details.ip, harness.ip);
+    }
+    assert.doesNotMatch(JSON.stringify(harness.events), /synthetic-bearer-challenge-id|synthetic-secret-code/);
+  } finally {
+    if (originalMax === undefined) delete process.env.TOTP_CHALLENGE_MAX_ATTEMPTS;
+    else process.env.TOTP_CHALLENGE_MAX_ATTEMPTS = originalMax;
+  }
+});
+
+test("a challenge for a stale account is audited without exposing its bearer ID", async () => {
+  const account = user("synthetic-stale-account");
+  const harness = createHarness([account]);
+  account.totpEnabled = true;
+  account.totpSecret = encryptSecret(generateSecret(), harness.key, `Root.ark/TOTP/${account.username}`);
+  account.totpRecoveryHashes = [];
+  account.totpLastUsedStep = Math.floor(Date.now() / 1000 / 30) - 1;
+  const primary = await harness.call("POST", "/auth/login", { username: account.username, password: "password" }, account.username);
+  account.disabled = true;
+
+  const result = await harness.call("POST", "/auth/login/2fa", { challengeId: primary.body.challengeId, code: "synthetic-secret-code" }, account.username);
+
+  assert.equal(result.code, 401);
+  assert.equal(result.body.error, "Autenticacao de dois fatores invalida.");
+  const failure = harness.events.find(([eventType, , , , , details]) => eventType === "auth.login.challenge.failed" && details.reason === "account_unavailable");
+  assert.ok(failure);
+  assert.deepEqual(failure[1], { username: "anonymous", role: null, ip: harness.ip });
+  assert.deepEqual(failure[2], { type: "user", id: account.username });
+  assert.doesNotMatch(JSON.stringify(harness.events), new RegExp(primary.body.challengeId));
+  assert.doesNotMatch(JSON.stringify(harness.events), /synthetic-secret-code/);
+});
+
+test("an exhausted challenge is audited on reuse without logging its bearer ID", async () => {
+  const account = user("synthetic-exhausted-account");
+  const harness = createHarness([account]);
+  account.totpEnabled = true;
+  account.totpSecret = encryptSecret(generateSecret(), harness.key, `Root.ark/TOTP/${account.username}`);
+  account.totpRecoveryHashes = [];
+  account.totpLastUsedStep = Math.floor(Date.now() / 1000 / 30) - 1;
+  const primary = await harness.call("POST", "/auth/login", { username: account.username, password: "password" }, account.username);
+  const invalidProofs = [];
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    invalidProofs.push(await harness.call("POST", "/auth/login/2fa", { challengeId: primary.body.challengeId, code: "synthetic-secret-code" }, account.username));
+  }
+  const reused = await harness.call("POST", "/auth/login/2fa", { challengeId: primary.body.challengeId, code: "synthetic-secret-code" }, account.username);
+
+  assert.ok(invalidProofs.every((result) => result.code === 401));
+  assert.equal(reused.code, 401);
+  assert.equal(reused.body.error, "Autenticacao de dois fatores invalida.");
+  const invalidChallenge = harness.events.find(([eventType, , , , , details]) => eventType === "auth.login.challenge.failed" && details.reason === "invalid_challenge");
+  assert.ok(invalidChallenge);
+  assert.equal(invalidChallenge[1].username, "anonymous");
+  assert.equal(invalidChallenge[1].ip, harness.ip);
+  assert.doesNotMatch(JSON.stringify(harness.events), new RegExp(primary.body.challengeId));
+  assert.doesNotMatch(JSON.stringify(harness.events), /synthetic-secret-code/);
 });
