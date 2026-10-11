@@ -61,7 +61,7 @@ const registerBackupRoutes = require("./src/routes/backups");
 const registerTrashRoutes = require("./src/routes/trash");
 const { registerSyncRoutes } = require("./src/routes/sync");
 const { registerGroupRoutes } = require("./src/routes/groups");
-const { createAuthenticate, createRealtimeAuthenticator, getClientIp, getExpectedOrigin, parseCookies } = require("./src/middlewares/auth");
+const { createAuthenticate, createRealtimeAuthenticator, getClientIp, getExpectedOrigin, isAuthTokenExpired, parseCookies } = require("./src/middlewares/auth");
 const { getTrustedClientIp, parseTrustedProxies } = require("./src/middlewares/trustedProxies");
 const { createRealtimeUpgradeGuard } = require("./src/realtime/upgradeGuard");
 const { createRequirePermission } = require("./src/middlewares/permissions");
@@ -518,14 +518,19 @@ function broadcastDataChanged(source, payload = {}) {
   broadcastRealtime("data:changed", { source, ...payload });
 }
 
-function loadUsers() {
+function loadUsers({ failOnDatabaseError = false } = {}) {
   if (shouldUseDatabase()) {
     try {
       const users = usersRepository.loadUsers();
       if (users.length || !shouldReadJsonFallback()) return users;
     } catch (error) {
       console.error("Falha ao ler usuarios do SQLite:", error.message);
-      if (!shouldReadJsonFallback()) return [];
+      if (!shouldReadJsonFallback()) {
+        if (failOnDatabaseError) {
+          throw Object.assign(new Error("Authorization store unavailable"), { code: "AUTHORIZATION_STORE_UNAVAILABLE" });
+        }
+        return [];
+      }
     }
   }
   return JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
@@ -5548,21 +5553,21 @@ app.use((req, res, next) => {
   return express.json()(req, res, next);
 });
 const loadCurrentUser = (username) => loadUsers().find((user) => user.username === username);
-const authenticate = createAuthenticate({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
+const loadCurrentAuthenticatedUser = (username) => loadUsers({ failOnDatabaseError: true }).find((user) => user.username === username);
+const authenticate = createAuthenticate({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentAuthenticatedUser, normalizeUserPermissions });
 const authenticateRealtimeToken = createRealtimeAuthenticator({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
 
-function refreshAuthenticatedUser(req, res) {
+function refreshAuthenticatedUserState(req) {
+  if (isAuthTokenExpired(req)) return { status: 401, error: "Sessao invalida ou expirada" };
   let user;
   try {
-    user = loadCurrentUser(req.user?.username);
+    user = loadCurrentAuthenticatedUser(req.user?.username);
   } catch {
-    res.status(503).json({ error: "Autorizacao indisponivel" });
-    return false;
+    return { status: 503, error: "Autorizacao indisponivel" };
   }
 
   if (!user || user.disabled || (user.sessionVersion || 0) !== req.user?.sessionVersion) {
-    res.status(401).json({ error: "Sessao invalida ou expirada" });
-    return false;
+    return { status: 401, error: "Sessao invalida ou expirada" };
   }
 
   req.user = {
@@ -5573,7 +5578,23 @@ function refreshAuthenticatedUser(req, res) {
     sessionVersion: user.sessionVersion || 0,
     totpEnabled: Boolean(user.totpEnabled),
   };
+  return null;
+}
+
+function refreshAuthenticatedUser(req, res) {
+  const failure = refreshAuthenticatedUserState(req);
+  if (failure) {
+    res.status(failure.status).json({ error: failure.error });
+    return false;
+  }
   return true;
+}
+
+function revalidateBackupAccess(req) {
+  const failure = refreshAuthenticatedUserState(req);
+  if (failure) return failure;
+  if (!canManageBackups(req)) return { status: 403, error: "Permissao negada: manageBackups" };
+  return null;
 }
 
 function revalidateTrashManageAccess(req, res) {
@@ -9413,6 +9434,7 @@ registerBackupRoutes(app, {
   backupService,
   getAuditActor,
   requireBackupAccess,
+  revalidateBackupAccess,
   restoreService,
   waitForRequestQuiescence: (requestLeasePath) => restoreRequestGate.waitForQuiescence(requestLeasePath),
 });

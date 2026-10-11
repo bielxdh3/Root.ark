@@ -121,6 +121,130 @@ test("committed restore cleanup failure returns restart-required service unavail
   assert.equal(JSON.stringify(auditEvents.at(-1)[5]).includes("injected staging cleanup failure"), false);
 });
 
+test("backup restore revalidates current authorization after request quiescence", async (t) => {
+  const cases = [
+    { name: "revoked session", status: 401, error: "Sessao invalida ou expirada" },
+    { name: "removed backup permission", status: 403, error: "Permissao negada: manageBackups" },
+    { name: "unavailable authorization store", status: 503, error: "Autorizacao indisponivel" },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      let restoreHandler;
+      let releaseQuiescence;
+      let markQuiescenceEntered;
+      let authorizationRevoked = false;
+      let restoreContinuedPastQuiescence = false;
+      const quiescence = new Promise((resolve) => { releaseQuiescence = resolve; });
+      const quiescenceEntered = new Promise((resolve) => { markQuiescenceEntered = resolve; });
+      const auditEvents = [];
+
+      registerBackupRoutes({
+        get() {},
+        post(route, ...handlers) {
+          if (route === "/backups/:id/restore") restoreHandler = handlers.at(-1);
+        },
+        delete() {},
+      }, {
+        auditLog(...event) { auditEvents.push(event); },
+        authenticate() {},
+        backupService: {},
+        getAuditActor() { return { username: "fixture-manager" }; },
+        requireBackupAccess() {},
+        revalidateBackupAccess() {
+          return authorizationRevoked ? scenario : null;
+        },
+        restoreService: {
+          async restoreBackup(_id, options) {
+            await options.waitForRequestQuiescence();
+            await options.revalidateAuthorization();
+            restoreContinuedPastQuiescence = true;
+            return {
+              backup: { id: "selected-backup" },
+              preRestore: { id: "pre-restore-backup" },
+              restartRecommended: true,
+            };
+          },
+          getWholeRestorePhase() { return null; },
+        },
+        waitForRequestQuiescence: async () => {
+          markQuiescenceEntered();
+          await quiescence;
+        },
+      });
+
+      const response = {
+        statusCode: null,
+        body: null,
+        status(code) { this.statusCode = code; return this; },
+        json(body) { this.body = body; return this; },
+      };
+      const restore = restoreHandler({
+        params: { id: "selected-backup" },
+        body: { confirmation: "RESTORE" },
+        user: { username: "fixture-manager", permissions: { manageBackups: true }, sessionVersion: 0 },
+      }, response);
+
+      await quiescenceEntered;
+      authorizationRevoked = true;
+      releaseQuiescence();
+      await restore;
+
+      assert.equal(response.statusCode, scenario.status);
+      assert.deepEqual(response.body, { error: scenario.error });
+      assert.equal(restoreContinuedPastQuiescence, false, "restore must stop before its first mutation if current authorization cannot be confirmed");
+      assert.equal(auditEvents.at(-1)[0], "backup.restore.failed");
+      assert.equal(auditEvents.at(-1)[5].error, "RESTORE_AUTHORIZATION_REVOKED");
+      assert.equal(auditEvents.some((event) => event[0] === "backup.restore.completed"), false);
+    });
+  }
+});
+
+test("backup restore reports a sanitized 503 when authorization cleanup is pending", async () => {
+  let restoreHandler;
+  const auditEvents = [];
+  registerBackupRoutes({
+    get() {},
+    post(route, ...handlers) { if (route === "/backups/:id/restore") restoreHandler = handlers.at(-1); },
+    delete() {},
+  }, {
+    auditLog(...event) { auditEvents.push(event); },
+    authenticate() {},
+    backupService: {},
+    getAuditActor() { return { username: "fixture-manager" }; },
+    requireBackupAccess() {},
+    revalidateBackupAccess() { return null; },
+    restoreService: {
+      async restoreBackup() {
+        throw Object.assign(new Error("Autorizacao revogada; a limpeza do backup temporario esta pendente"), {
+          code: "RESTORE_AUTHORIZATION_REVOKED",
+          statusCode: 503,
+          authorizationCleanupPending: true,
+        });
+      },
+      getWholeRestorePhase() { return null; },
+    },
+    waitForRequestQuiescence: async () => {},
+  });
+
+  const response = {
+    statusCode: null,
+    body: null,
+    status(code) { this.statusCode = code; return this; },
+    json(body) { this.body = body; return this; },
+  };
+  await restoreHandler({ params: { id: "selected-backup" }, body: { confirmation: "RESTORE" }, user: { username: "fixture-manager" } }, response);
+
+  assert.equal(response.statusCode, 503);
+  assert.deepEqual(response.body, {
+    error: "Autorizacao revogada; a limpeza do backup temporario esta pendente",
+    cleanupPending: true,
+  });
+  assert.equal(auditEvents.at(-1)[5].error, "RESTORE_AUTHORIZATION_REVOKED");
+  assert.equal(auditEvents.at(-1)[5].cleanupPending, true);
+  assert.doesNotMatch(JSON.stringify(auditEvents), /private cleanup failure|EIO/i);
+});
+
 test("backup HEAD metadata checks do not create download audit events", async () => {
   let downloadHandler;
   const auditEvents = [];
