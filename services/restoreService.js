@@ -383,7 +383,7 @@ function assertNoPendingWholeRestore(options = {}) {
   const coordinator = readWholeRestoreCoordinator();
   if (!coordinator) return { recovered: false, reason: "no_pending_restore" };
   if (![2, LEGACY_WHOLE_RESTORE_COORDINATOR_VERSION, WHOLE_RESTORE_COORDINATOR_VERSION].includes(coordinator.version)
-    || !["preparing", "prepared", "rolling_back", "rollback_complete", "manual_recovery", "restart_required"].includes(coordinator.phase)
+    || !["preparing", "prepared", "cancelled", "rolling_back", "rollback_complete", "manual_recovery", "restart_required"].includes(coordinator.phase)
     || !coordinator.backupId
     || !/^[a-f0-9-]{36}$/i.test(String(coordinator.transactionId || ""))
     || !Number.isInteger(coordinator.requiredRestartInstances)
@@ -393,6 +393,17 @@ function assertNoPendingWholeRestore(options = {}) {
   }
   if (coordinator.phase === "restart_required" && coordinator.preRestoreBackupId) {
     return { recovered: false, restartRequired: true, coordinator };
+  }
+  if (coordinator.phase === "cancelled") {
+    const release = backupService.acquireLock("restore-cancellation-cleanup");
+    try {
+      const current = readWholeRestoreCoordinator();
+      if (!current || current.transactionId !== coordinator.transactionId || current.phase !== "cancelled") {
+        throw new Error("Whole-restore cancellation changed during startup");
+      }
+      completeWholeRestoreCoordinator(current);
+      return { recovered: true, reason: "cancelled_restore_cleanup", transactionId: current.transactionId };
+    } finally { release(); }
   }
   if (hasWholeRestorePreimages(coordinator.version) && coordinator.phase === "preparing") {
     const release = backupService.acquireLock("restore-preparation-recovery");
@@ -521,7 +532,7 @@ function isWholeRestoreBlocked() {
 function getWholeRestorePhase() {
   try {
     const phase = readWholeRestoreCoordinator()?.phase;
-    return ["preparing", "prepared", "rolling_back", "rollback_complete", "manual_recovery", "restart_required"].includes(phase) ? phase : phase ? "manual_recovery" : null;
+    return ["preparing", "prepared", "cancelled", "rolling_back", "rollback_complete", "manual_recovery", "restart_required"].includes(phase) ? phase : phase ? "manual_recovery" : null;
   } catch {
     return "manual_recovery";
   }
@@ -2443,18 +2454,32 @@ async function restoreBackup(id, options = {}) {
       cloudSync,
     };
   } catch (error) {
-    if (!mutationStarted && error.code === "RESTORE_AUTHORIZATION_REVOKED" && preRestore) {
+    let coordinatorCleanupFailed = false;
+    if (!mutationStarted && pathExists(WHOLE_RESTORE_COORDINATOR_PATH)) {
       try {
-        await backupService.deleteBackup(preRestore.id, { lockHeld: true });
-      } catch (cleanupError) {
+        const activeCoordinator = readWholeRestoreCoordinator();
+        if (!activeCoordinator || (coordinator && activeCoordinator.transactionId !== coordinator.transactionId)) {
+          throw new Error("Whole-restore coordinator changed before cancellation");
+        }
+        const cancelledCoordinator = updateWholeRestoreCoordinator(activeCoordinator, { phase: "cancelled" });
+        completeWholeRestoreCoordinator(cancelledCoordinator);
+      }
+      catch (cleanupError) {
+        error.coordinatorCleanupError = cleanupError;
+        coordinatorCleanupFailed = true;
+      }
+    }
+    if (!mutationStarted && error.code === "RESTORE_AUTHORIZATION_REVOKED" && preRestore && !coordinatorCleanupFailed) {
+      try { await backupService.deleteBackup(preRestore.id, { lockHeld: true }); }
+      catch (cleanupError) {
         error.authorizationCleanupPending = true;
         error.statusCode = 503;
         error.message = "Autorizacao revogada; a limpeza do backup temporario esta pendente";
         error.authorizationCleanupErrorCode = String(cleanupError.code || "BACKUP_CLEANUP_FAILED").slice(0, 80);
       }
-    }
-    if (!mutationStarted && pathExists(WHOLE_RESTORE_COORDINATOR_PATH)) {
-      try { completeWholeRestoreCoordinator(); } catch (cleanupError) { error.coordinatorCleanupError = cleanupError; }
+    } else if (coordinatorCleanupFailed && error.code === "RESTORE_AUTHORIZATION_REVOKED") {
+      error.statusCode = 503;
+      error.message = "Autorizacao revogada; a recuperacao do restore esta pendente";
     }
     throw error;
   } finally {

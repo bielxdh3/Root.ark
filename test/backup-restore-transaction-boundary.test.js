@@ -2540,6 +2540,202 @@ test("restore preserves the pre-restore backup and surfaces pending cleanup if c
   `);
 });
 
+test("restore clears whole-restore preimage before deleting the pre-restore backup", () => {
+  runFixture(`
+    const runtimePath = path.join(dataDir, "runtime.json");
+    write(runtimePath, "selected-backup-state");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(runtimePath, "current-live-state");
+      const originalDeleteBackup = backupService.deleteBackup.bind(backupService);
+      const originalRmSync = fs.rmSync;
+      let interruptedCleanup = false;
+      let coordinatorPresentAtDeletion = null;
+      backupService.deleteBackup = async (...args) => {
+        const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+        coordinatorPresentAtDeletion = fs.existsSync(coordinatorPath);
+        const removed = await originalDeleteBackup(...args);
+        if (coordinatorPresentAtDeletion) {
+          const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
+          const preimageRoot = path.join(dataDir, "backups", ".restore-preimages", coordinator.transactionId);
+          fs.rmSync = function failPreimageCleanup(pathname, ...options) {
+            if (!interruptedCleanup && path.resolve(pathname) === path.resolve(preimageRoot)) {
+              interruptedCleanup = true;
+              throw Object.assign(new Error("injected interruption after compensation"), { code: "EIO" });
+            }
+            return originalRmSync.call(this, pathname, ...options);
+          };
+        }
+        return removed;
+      };
+      let restoreError;
+      let authorizationChecks = 0;
+      try {
+        await restoreService.restoreBackup(backup.id, {
+          confirmation: "RESTORE",
+          async waitForRequestQuiescence() {},
+          async revalidateAuthorization() {
+            authorizationChecks += 1;
+            if (authorizationChecks === 3) {
+              throw Object.assign(new Error("authorization revoked"), { code: "RESTORE_AUTHORIZATION_REVOKED" });
+            }
+          },
+        });
+      } catch (error) { restoreError = error; }
+      finally { fs.rmSync = originalRmSync; }
+
+      assert.equal(restoreError?.code, "RESTORE_AUTHORIZATION_REVOKED");
+      assert.equal(authorizationChecks, 3);
+      assert.equal(coordinatorPresentAtDeletion, false, "startup rollback state must be cleared before deleting the pre-restore snapshot");
+      assert.equal(interruptedCleanup, false);
+      assert.equal(restoreService.assertNoPendingWholeRestore().reason, "no_pending_restore");
+      assert.equal(fs.readFileSync(runtimePath, "utf8"), "current-live-state");
+      const retainedBackups = backupService.listBackups();
+      const preRestoreBackup = retainedBackups.find((entry) => entry.type === "pre-restore");
+      assert.ok(!preRestoreBackup || fs.existsSync(backupService.getArchivePath(preRestoreBackup.filename)),
+        "startup recovery must not restore a history entry after its archive was durably removed");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore authorization cleanup preserves a valid snapshot when coordinator cleanup fails", () => {
+  runFixture(`
+    const runtimePath = path.join(dataDir, "runtime.json");
+    const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+    const originalRmSync = fs.rmSync;
+    write(runtimePath, "selected-backup-state");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(runtimePath, "current-live-state");
+      let authorizationChecks = 0;
+      let cleanupFailureInjected = false;
+      let restoreError;
+      try {
+        await restoreService.restoreBackup(backup.id, {
+          confirmation: "RESTORE",
+          async waitForRequestQuiescence() {},
+          async revalidateAuthorization() {
+            authorizationChecks += 1;
+            if (authorizationChecks === 3) {
+              const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
+              const preimageRoot = path.join(dataDir, "backups", ".restore-preimages", coordinator.transactionId);
+              fs.rmSync = function failPreimageCleanup(pathname, ...options) {
+                if (!cleanupFailureInjected && path.resolve(pathname) === path.resolve(preimageRoot)) {
+                  cleanupFailureInjected = true;
+                  throw Object.assign(new Error("injected coordinator cleanup failure"), { code: "EIO" });
+                }
+                return originalRmSync.call(this, pathname, ...options);
+              };
+              throw Object.assign(new Error("authorization revoked"), { code: "RESTORE_AUTHORIZATION_REVOKED" });
+            }
+          },
+        });
+      } catch (error) { restoreError = error; }
+      finally { fs.rmSync = originalRmSync; }
+
+      assert.equal(restoreError?.code, "RESTORE_AUTHORIZATION_REVOKED");
+      assert.equal(restoreError?.statusCode, 503);
+      assert.match(restoreError?.message || "", /recuperacao do restore esta pendente/i);
+      assert.equal(cleanupFailureInjected, true);
+      assert.equal(restoreService.getWholeRestorePhase(), "cancelled");
+      assert.equal(fs.readFileSync(runtimePath, "utf8"), "current-live-state");
+      let preRestoreBackup = backupService.listBackups().find((entry) => entry.type === "pre-restore");
+      assert.ok(preRestoreBackup, "the recovery snapshot must remain registered when the coordinator cannot be cleared");
+      assert.ok(fs.existsSync(backupService.getArchivePath(preRestoreBackup.filename)), "the retained recovery snapshot must keep its archive");
+
+      assert.equal(restoreService.assertNoPendingWholeRestore().recovered, true);
+      assert.equal(restoreService.getWholeRestorePhase(), null);
+      assert.equal(fs.readFileSync(runtimePath, "utf8"), "current-live-state");
+      preRestoreBackup = backupService.listBackups().find((entry) => entry.type === "pre-restore");
+      assert.ok(preRestoreBackup);
+      assert.ok(fs.existsSync(backupService.getArchivePath(preRestoreBackup.filename)));
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("process restart resumes canceled restore cleanup after pre-image removal", { timeout: 30_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-cancelled-crash-"));
+  const quarantineDir = path.join(runtime, "quarantine");
+  const env = {
+    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(AWS_|GOOGLE_|CLOUD_STORAGE_|S3_|GDRIVE_|DRIVE_)/i.test(key))),
+    NODE_ENV: "test",
+    DB_ENABLED: "false",
+    BACKUP_ENABLED: "true",
+    BACKUP_INCLUDE_UPLOADS: "true",
+    BACKUP_INCLUDE_TEMP: "false",
+    BACKUP_RETENTION_COUNT: "20",
+    ROOTARK_RESTORE_INSTANCE_COUNT: "1",
+    ROOTARK_INSTANCE_ID: "fixture-cancelled-crash",
+    UPLOAD_QUARANTINE_DIR: quarantineDir,
+  };
+  const restoreScript = `
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+    const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+    const dataDir = path.join(process.cwd(), "data");
+    const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+    const runtimePath = path.join(dataDir, "runtime.json");
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.mkdirSync(process.env.UPLOAD_QUARANTINE_DIR, { recursive: true });
+    fs.writeFileSync(runtimePath, "selected-backup-state");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      fs.writeFileSync(runtimePath, "current-live-state");
+      const originalRmSync = fs.rmSync;
+      fs.rmSync = function stopAfterPreimageRemoval(pathname, ...options) {
+        const coordinator = fs.existsSync(coordinatorPath) ? JSON.parse(fs.readFileSync(coordinatorPath, "utf8")) : null;
+        const preimageRoot = coordinator && path.join(dataDir, "backups", ".restore-preimages", coordinator.transactionId);
+        const matchesPreimageRoot = preimageRoot && path.resolve(pathname) === path.resolve(preimageRoot);
+        const removed = originalRmSync.call(this, pathname, ...options);
+        if (matchesPreimageRoot) process.exit(86);
+        return removed;
+      };
+      let authorizationChecks = 0;
+      await restoreService.restoreBackup(backup.id, {
+        confirmation: "RESTORE",
+        async waitForRequestQuiescence() {},
+        async revalidateAuthorization() {
+          authorizationChecks += 1;
+          if (authorizationChecks === 3) throw Object.assign(new Error("authorization revoked"), { code: "RESTORE_AUTHORIZATION_REVOKED" });
+        },
+      });
+      process.exit(0);
+    })().catch((error) => { console.error(error); process.exit(1); });
+  `;
+  const startupScript = `
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+    const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+    const recovery = restoreService.assertNoPendingWholeRestore();
+    assert.equal(recovery.recovered, true);
+    assert.equal(recovery.reason, "cancelled_restore_cleanup");
+    assert.equal(restoreService.getWholeRestorePhase(), null);
+    assert.equal(fs.readFileSync(path.join("data", "runtime.json"), "utf8"), "current-live-state");
+    const preRestoreBackup = backupService.listBackups().find((entry) => entry.type === "pre-restore");
+    assert.ok(preRestoreBackup);
+    assert.ok(fs.existsSync(backupService.getArchivePath(preRestoreBackup.filename)));
+    assert.equal(fs.existsSync(path.join("data", ".rootark-restore-coordinator.json")), false);
+    console.log(JSON.stringify({ ok: true }));
+  `;
+  try {
+    const interrupted = spawnSync(process.execPath, ["-e", restoreScript], { cwd: runtime, env, encoding: "utf8", timeout: 15_000 });
+    assert.equal(interrupted.status, 86, interrupted.stderr || interrupted.stdout);
+    const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
+    const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
+    assert.equal(coordinator.phase, "cancelled");
+    assert.equal(fs.readFileSync(path.join(runtime, "data", "runtime.json"), "utf8"), "current-live-state");
+    assert.equal(fs.existsSync(path.join(runtime, "data", "backups", ".restore-preimages", coordinator.transactionId)), false);
+
+    const restarted = spawnSync(process.execPath, ["-e", startupScript], { cwd: runtime, env, encoding: "utf8", timeout: 15_000 });
+    assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+  } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
+});
+
 test("restore failure after quarantine commit rolls quarantine, JSON, and uploads back to the pre-restore state", () => {
   runFixture(`
     const metadata = path.join(dataDir, "quarantine.json");
