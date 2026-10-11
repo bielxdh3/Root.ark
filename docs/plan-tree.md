@@ -432,7 +432,7 @@ All items below are candidates, not commitments.
 
 - `[ACCEPTED-LOCAL]` `PHASE_11_BACKLOG_RECONCILED` is recorded in `docs/roadmap/phase-11-backlog-reconciliation.md` for the exact accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
 - `[DO NOT IMPLEMENT YET]` The canonical nine-item matrix maps current evidence, status, prerequisites, security boundaries, owner decisions, implementation boundaries, acceptance, validation, dependencies, and the required separate future issue for every candidate.
-- `[DO NOT IMPLEMENT YET]` TOTP is reconciled to accepted Phase 10; bidirectional sync and WebDAV mutations target Phase 12; search, previews, PWA/clients, groups, and admin UX target Phase 13; deployment prerequisites target Phase 14; naming and branding remain an owner/product decision.
+- `[DO NOT IMPLEMENT YET]` TOTP is reconciled to accepted Phase 10; bidirectional sync and WebDAV mutations target Phase 12; search, previews, PWA/clients, groups, and admin UX target Phase 13; deployment prerequisites target Phase 14; the product name `Root.ark` is decided, while a future visual rebrand or UI direction remains a separate owner/product decision.
 - `[HISTORICAL SCOPE]` No Phase 12+ source, test, migration, UI, dependency, synchronization, WebDAV, deployment, or product implementation was authorized by that reconciliation turn; later phase-specific authorizations and evidence are recorded below.
 
 ### Phase 12: ZK sync and local WebDAV bridge — 2026-08-16
