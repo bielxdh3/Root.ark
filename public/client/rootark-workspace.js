@@ -931,14 +931,16 @@
         acceptedFiles.push(file);
       }
       if (filesOverride) {
-        const versionCommentField = formElement.querySelector('[name="versionComment"]');
-        if (versionCommentField) versionCommentField.value = "";
-        const encryptionLevelField = formElement.querySelector('[name="encryptionLevel"]');
-        if (encryptionLevelField) encryptionLevelField.value = "none";
-        const passwordField = formElement.querySelector('[name="password"]');
-        if (passwordField) passwordField.value = "";
-        const expirationField = formElement.querySelector('[name="expiresInDays"]');
-        if (expirationField) expirationField.value = "";
+        if (!independentPickerFiles.length) {
+          const versionCommentField = formElement.querySelector('[name="versionComment"]');
+          if (versionCommentField) versionCommentField.value = "";
+          const encryptionLevelField = formElement.querySelector('[name="encryptionLevel"]');
+          if (encryptionLevelField) encryptionLevelField.value = "none";
+          const passwordField = formElement.querySelector('[name="password"]');
+          if (passwordField) passwordField.value = "";
+          const expirationField = formElement.querySelector('[name="expiresInDays"]');
+          if (expirationField) expirationField.value = "";
+        }
         syncDirtyForm(formElement);
       } else formElement.reset();
       syncUploadEncryptionControls(formElement);

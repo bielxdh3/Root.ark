@@ -233,7 +233,7 @@ test("workspace version and upload flows preserve state and explain upload retri
     post: async () => ({}),
     postForm: async (_pathname, form) => {
       uploadRequestCount += 1;
-      observedUploadSettings.push({ encryptionLevel: form.get("encryptionLevel"), versionComment: form.get("versionComment") });
+      observedUploadSettings.push({ encryptionLevel: form.get("encryptionLevel"), password: form.get("password"), expiresInDays: form.get("expiresInDays"), versionComment: form.get("versionComment") });
       if (partialUploadSuccessesBeforeFailure !== null) {
         if (partialUploadSuccessesBeforeFailure > 0) {
           partialUploadSuccessesBeforeFailure -= 1;
@@ -529,6 +529,11 @@ test("workspace version and upload flows preserve state and explain upload retri
   const independentPickerFile = { name: "independent-picker-selection.txt", size: 10 };
   const successfulDropFile = { name: "successful-drop.txt", size: 10 };
   uploadFileInput.files = [independentPickerFile];
+  uploadEncryptionLevel.value = "server-key";
+  rootListeners.get("change")({ target: uploadEncryptionLevel });
+  uploadVersionComment.value = "settings for retained picker";
+  uploadExpiration.value = "7";
+  const dropSettingsStart = observedUploadSettings.length;
   const uploadFormBeforeSuccessfulDrop = uploadForm;
   rootListeners.get("drop")({
     target: { closest(selector) { return selector === "#upload-dropzone" ? dropzone : null; } },
@@ -540,6 +545,14 @@ test("workspace version and upload flows preserve state and explain upload retri
   assert.equal(uploadFileInput.files[0], independentPickerFile, "a successful dropped batch preserves a separate picker selection");
   assert.match(pendingMarkup, /successful-drop\.txt/, "the successful dropped file appears in pending approvals");
   assert.match(uploadProgress.textContent, /A seleção do campo foi mantida; ela não fez parte deste envio/);
+  assert.equal(uploadEncryptionLevel.value, "server-key", "a successful drop preserves encryption for the separate picker selection");
+  assert.equal(uploadVersionComment.value, "settings for retained picker", "a successful drop preserves the version comment for the separate picker selection");
+  assert.equal(uploadExpiration.value, "7", "a successful drop preserves expiry for the separate picker selection");
+  const retainedPickerSettingsStart = observedUploadSettings.length;
+  await rootListeners.get("submit")({ target: uploadForm, preventDefault() {} });
+  assert.equal(observedUploadSettings[retainedPickerSettingsStart].encryptionLevel, "server-key", "the retained picker file is submitted with its configured encryption");
+  assert.equal(observedUploadSettings[retainedPickerSettingsStart].versionComment, "settings for retained picker");
+  assert.equal(observedUploadSettings[retainedPickerSettingsStart].expiresInDays, "7");
 
   const preselectedFile = { name: "already-selected-in-input.txt", size: 10 };
   uploadFileInput.files = [preselectedFile];
