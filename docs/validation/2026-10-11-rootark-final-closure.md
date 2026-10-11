@@ -1,6 +1,6 @@
 # Root.ark closure snapshot — 2026-10-11
 
-**Status: PARTIAL.** The merged security corrections and broad disposable-browser work are recorded below. The final documentation candidate still requires exact-head CI, merge, validation of the resulting exact Root/main SHA, and a fresh independent review. The repository-wide Codex Security Deep Scan could not start because this runtime did not provide the managed filesystem permission profile required by its read-only worker; no scan result is claimed.
+**Historical status: PARTIAL at the prepublication b3 snapshot.** This record is superseded for later application evidence by the [post-#164 validation snapshot](2026-10-11-rootark-post-164.md); all evidence below remains scoped to the SHAs and GitHub state stated here. The merged security corrections and broad disposable-browser work are recorded below. The final documentation candidate still requires exact-head CI, merge, validation of the resulting exact Root/main SHA, and a fresh independent review. The repository-wide Codex Security Deep Scan could not start because this runtime did not provide the managed filesystem permission profile required by its read-only worker; no scan result is claimed.
 
 ## Source and GitHub snapshot
 

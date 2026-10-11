@@ -1,11 +1,11 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Last live application reconciliation: 2026-10-11 after PRs #160, #161, and #162; application source SHA e0cf2f59b5a51594ed5d744d18d2829bb07db51b and prepublication Root/main SHA b3a8aff4c218d4fa522c22a4c12d1f2bbd5f3cd8.
+Last application/security reconciliation: 2026-10-11 after PR #164; Root/main application SHA 12e511ccc036b00664e0513b872bdabad56aa941.
 
 Repository: bielxdh3/root.ark
 
-PR #161 merged the upload-setting preservation behavior at c402ec16219b68cbe5fd425f863a63182d56d94a. PR #162 merged anonymous login-audit actor handling at e0cf2f59b5a51594ed5d744d18d2829bb07db51b. PR #160 reconciled documentation and merged at b3a8aff4c218d4fa522c22a4c12d1f2bbd5f3cd8. Exact push-triggered Security Regression, CodeQL, Dependency Review, and Pages checks passed on b3. See the [2026-10-11 closure snapshot](validation/2026-10-11-rootark-final-closure.md) and [issue ledger](issue-ledger.md) for exact evidence, current-at-query PR/issue state, browser scope, restore limits, and open acceptance boundaries. This prepublication snapshot does not predict the following documentation PR or its merged-SHA checks.
+PR #164 merged restore-authorization revalidation and cancellation-cleanup recovery at 12e511ccc036b00664e0513b872bdabad56aa941. Its exact-SHA Security Regression, CodeQL, Dependency Review, Pages, and local release gate passed. See the [post-#164 validation snapshot](validation/2026-10-11-rootark-post-164.md) and [issue ledger](issue-ledger.md) for the dated GitHub inventory, test counts, browser scope, restore limits, and remaining acceptance boundaries. A later documentation-only SHA has its own validation boundary.
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Re-query GitHub before relying on issue, PR, or check state after this snapshot.
 
@@ -62,7 +62,7 @@ A feature is not `[DONE]` merely because files, routes, UI, or documentation exi
 5. GitHub issues for executable scope.
 6. Historical chat context only as input, never as proof.
 
-The latest verified full issue reconciliation in `docs/issue-ledger.md` is the historical post-PR-#156 snapshot, queried against GitHub on 2026-10-10 at application SHA `c49fee7997580edb7868ecd7cb739aa1f173245f`, before this documentation publication. Earlier post-#152 SHA `738d9412cdb577e0b3cc7887e129391c72dd3ed5`, post-#142 SHA `8771d87084e458202d77ab956e3d341c0fe4868f`, post-#129 SHA `f543f0f4045d12ecbaf6f8b793d3d24aecb98e25`, post-#127 SHA `25e50cbaa26062202d470330e93d7beb4575693a`, and source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a` are older historical points. Later closure PRs can make point-in-time issue, PR, and check state stale; re-query GitHub before relying on it. The canonical Phase 11 Issue #6 reconciliation remains historical evidence: `docs/roadmap/phase-11-backlog-reconciliation.md` records `PHASE_11_BACKLOG_RECONCILED` at the accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
+The issue ledger begins with the post-#164 GitHub snapshot and labels later changes as point-in-time evidence. Re-query GitHub for live state after that snapshot; older dated reconciliations below remain historical evidence.
 
 Master Phase 0-16 ledger and independent local blocker taxonomy: `docs/issue-ledger.md`. The governing continuation supplies the original meanings for all phases; local statuses and evidence are reconciled there without converting design or historical evidence into acceptance.
 
