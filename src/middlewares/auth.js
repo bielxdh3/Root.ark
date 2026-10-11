@@ -27,6 +27,10 @@ function verifyClaims(jwt, token, jwtSecret) {
   return claims;
 }
 
+function isAuthTokenExpired(req, now = Date.now()) {
+  return Number.isFinite(req?.authExpiresAt) && now >= req.authExpiresAt;
+}
+
 function getExpectedOrigin(req, trustProxyFn = null) {
   let protocol = req.protocol || (req.socket?.encrypted ? "https" : "http");
   if (!req.protocol && typeof trustProxyFn === "function" && trustProxyFn(req.socket?.remoteAddress, 0)) {
@@ -67,6 +71,7 @@ function createAuthenticate({ jwt, jwtSecret, loadUser, normalizeUserPermissions
         totpEnabled: Boolean(user.totpEnabled),
         enrollmentOnly: Boolean(claims.totpEnrollment),
       };
+      req.authExpiresAt = Number.isFinite(claims.exp) ? claims.exp * 1000 : null;
       req.totpPolicy = totpPolicy;
       if ((claims.totpEnrollment || enrollmentRequired) && !isTotpEnrollmentPath(req.path)) {
         return res.status(403).json({ error: "2FA enrollment required." });
@@ -83,6 +88,7 @@ function createAuthenticate({ jwt, jwtSecret, loadUser, normalizeUserPermissions
       next();
     } catch (error) {
       if (isTotpPolicyError(error)) return res.status(503).json({ error: TOTP_POLICY_ERROR_MESSAGE });
+      if (error?.code === "AUTHORIZATION_STORE_UNAVAILABLE") return res.status(503).json({ error: "Autorizacao indisponivel" });
       res.status(401).json({ error: "Token invalido ou expirado" });
     }
   };
@@ -114,6 +120,7 @@ function createRealtimeAuthenticator({ jwt, jwtSecret, loadUser, normalizeUserPe
 
 module.exports = {
   getExpectedOrigin,
+  isAuthTokenExpired,
   parseCookies,
   verifyClaims,
   createAuthenticate,

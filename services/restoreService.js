@@ -2305,6 +2305,7 @@ async function restoreBackup(id, options = {}) {
   let restoreDir = null;
   const injectFailure = restoreFailureHook(options);
   let coordinator = null;
+  let preRestore = null;
   let mutationStarted = false;
   try {
     const { backup, archivePath } = backupService.getBackupOrThrow(id);
@@ -2326,7 +2327,7 @@ async function restoreBackup(id, options = {}) {
     }
     const { zip, manifest } = await validateBackupArchive(backup, archivePath);
     await options.revalidateAuthorization?.();
-    const preRestore = await backupService.createBackup({
+    preRestore = await backupService.createBackup({
       lockHeld: true,
       type: "pre-restore",
       createdBy: options.username || null,
@@ -2442,6 +2443,16 @@ async function restoreBackup(id, options = {}) {
       cloudSync,
     };
   } catch (error) {
+    if (!mutationStarted && error.code === "RESTORE_AUTHORIZATION_REVOKED" && preRestore) {
+      try {
+        await backupService.deleteBackup(preRestore.id, { lockHeld: true });
+      } catch (cleanupError) {
+        error.authorizationCleanupPending = true;
+        error.statusCode = 503;
+        error.message = "Autorizacao revogada; a limpeza do backup temporario esta pendente";
+        error.authorizationCleanupErrorCode = String(cleanupError.code || "BACKUP_CLEANUP_FAILED").slice(0, 80);
+      }
+    }
     if (!mutationStarted && pathExists(WHOLE_RESTORE_COORDINATOR_PATH)) {
       try { completeWholeRestoreCoordinator(); } catch (cleanupError) { error.coordinatorCleanupError = cleanupError; }
     }

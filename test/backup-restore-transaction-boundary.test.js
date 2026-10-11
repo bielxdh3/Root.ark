@@ -2496,6 +2496,43 @@ test("restore revalidates authorization immediately before local commit after pr
       assert.equal(authorizationChecks, 3, "authorization is checked after quiescence, before the pre-restore backup, and at the local commit boundary");
       assert.equal(fs.readFileSync(runtimePath, "utf8"), "current-live-state");
       assert.equal(fs.readFileSync(uploadPath, "utf8"), "current-live-upload");
+      const retainedBackups = backupService.listBackups();
+      assert.deepEqual(retainedBackups.map((entry) => entry.id), [backup.id], "a cancelled restore must remove its pre-restore backup archive and history record");
+      assert.equal(fs.existsSync(path.join(dataDir, ".rootark-restore-coordinator.json")), false);
+      assert.equal(restoreService.isWholeRestoreBlocked(), false);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore preserves the pre-restore backup and surfaces pending cleanup if compensation fails", () => {
+  runFixture(`
+    const runtimePath = path.join(dataDir, "runtime.json");
+    write(runtimePath, "selected-backup-state");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(runtimePath, "current-live-state");
+      backupService.deleteBackup = async () => { throw Object.assign(new Error("private cleanup failure"), { code: "EIO" }); };
+      let authorized = true;
+      let restoreError;
+      try {
+        await restoreService.restoreBackup(backup.id, {
+          confirmation: "RESTORE",
+          async waitForRequestQuiescence() {},
+          async revalidateAuthorization() {
+            if (!authorized) throw Object.assign(new Error("authorization revoked"), { code: "RESTORE_AUTHORIZATION_REVOKED" });
+          },
+          failureInjector(step) { if (step === "restore.before-local-commit") authorized = false; },
+        });
+      } catch (error) { restoreError = error; }
+
+      assert.equal(restoreError?.code, "RESTORE_AUTHORIZATION_REVOKED");
+      assert.equal(restoreError?.statusCode, 503);
+      assert.equal(restoreError?.authorizationCleanupPending, true);
+      assert.match(restoreError?.message || "", /backup temporario esta pendente/i);
+      assert.doesNotMatch(restoreError?.message || "", /private cleanup failure|EIO/i);
+      assert.equal(fs.readFileSync(runtimePath, "utf8"), "current-live-state");
+      assert.equal(backupService.listBackups().length, 2, "the recovery backup remains available if its transactional removal fails");
       assert.equal(fs.existsSync(path.join(dataDir, ".rootark-restore-coordinator.json")), false);
       assert.equal(restoreService.isWholeRestoreBlocked(), false);
       console.log(JSON.stringify({ ok: true }));

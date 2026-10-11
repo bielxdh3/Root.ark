@@ -118,6 +118,7 @@ function registerBackupRoutes(app, context) {
       auditLog("backup.restore.failed", getAuditActor(req), { type: "backup", id: req.params.id }, "restore", "failure", {
         error: restorePhase ? "restore_recovery_pending" : error.code === "RESTORE_AUTHORIZATION_REVOKED" ? error.code : error.message,
         phase: restorePhase,
+        cleanupPending: Boolean(error.authorizationCleanupPending),
       });
       if (restorePhase === "restart_required") {
         res.status(503).json({
@@ -131,7 +132,10 @@ function registerBackupRoutes(app, context) {
           recoveryRequired: true,
         });
       } else if (error.code === "RESTORE_AUTHORIZATION_REVOKED") {
-        res.status(error.statusCode).json({ error: error.message });
+        res.status(error.statusCode).json({
+          error: error.message,
+          ...(error.authorizationCleanupPending ? { cleanupPending: true } : {}),
+        });
       } else {
         res.status(error.code === "BACKUP_LOCKED" ? 409 : 400).json({ error: error.message });
       }

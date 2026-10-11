@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const jwt = require("jsonwebtoken");
 const test = require("node:test");
-const { createAuthenticate, parseCookies, verifyClaims } = require("../src/middlewares/auth");
+const { createAuthenticate, isAuthTokenExpired, parseCookies, verifyClaims } = require("../src/middlewares/auth");
 
 const SECRET = "a".repeat(48);
 const valid = (claims = {}, options = {}) => jwt.sign({ username: "alice", sessionVersion: 2, ...claims }, SECRET, { algorithm: "HS256", ...options });
@@ -43,6 +43,40 @@ test("cookie parsing fails closed on duplicates and bearer remains deliberate pr
 test("middleware suppresses token parsing detail", () => {
   const denied = auth({ authorization: "Bearer token" }, { username: "alice", sessionVersion: "bad" });
   assert.deepEqual(denied, { code: 401, body: { error: "Token invalido ou expirado" } });
+});
+
+test("HTTP authentication preserves the verified JWT expiry for later authorization checks", () => {
+  const exp = Math.floor(Date.now() / 1000) + 60;
+  const claims = { username: "alice", sessionVersion: 2, exp };
+  const req = { headers: { authorization: "Bearer token" }, method: "GET", protocol: "http", get: () => "localhost" };
+  let result;
+  createAuthenticate({
+    jwt: { verify: () => claims },
+    jwtSecret: SECRET,
+    loadUser: () => ({ username: "alice", sessionVersion: 2, permissions: {} }),
+    normalizeUserPermissions: (user) => user.permissions,
+  })(req, { status: (code) => ({ json: (body) => { result = { code, body }; } }) }, () => { result = { ok: true }; });
+
+  assert.equal(result.ok, true);
+  assert.equal(req.authExpiresAt, exp * 1000);
+  assert.equal(isAuthTokenExpired(req, exp * 1000 - 1), false);
+  assert.equal(isAuthTokenExpired(req, exp * 1000), true);
+  assert.equal(isAuthTokenExpired({ authExpiresAt: null }, exp * 1000), false);
+});
+
+test("an unavailable authentication store returns generic service unavailable", () => {
+  let result;
+  const middleware = createAuthenticate({
+    jwt: { verify: () => ({ username: "alice", sessionVersion: 2 }) },
+    jwtSecret: SECRET,
+    loadUser() { throw Object.assign(new Error("private database detail"), { code: "AUTHORIZATION_STORE_UNAVAILABLE" }); },
+    normalizeUserPermissions: (user) => user.permissions,
+  });
+  middleware({ headers: { authorization: "Bearer token" }, method: "GET" }, {
+    status(code) { return { json(body) { result = { code, body }; } }; },
+  }, () => { result = { ok: true }; });
+
+  assert.deepEqual(result, { code: 503, body: { error: "Autorizacao indisponivel" } });
 });
 
 test("enrollment-only sessions cannot reach application routes or realtime", () => {

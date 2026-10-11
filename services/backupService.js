@@ -1534,8 +1534,8 @@ async function deleteBackupTransaction(backup, archivePath, mutationLease) {
   }
 }
 
-async function deleteBackup(id) {
-  const release = acquireLock("delete");
+async function deleteBackup(id, options = {}) {
+  const release = options.lockHeld ? null : acquireLock("delete");
   let inventoryLease = null;
   try {
     if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
@@ -1549,7 +1549,7 @@ async function deleteBackup(id) {
     return backup;
   } finally {
     inventoryLease?.release();
-    release();
+    release?.();
   }
 }
 

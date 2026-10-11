@@ -200,6 +200,51 @@ test("backup restore revalidates current authorization after request quiescence"
   }
 });
 
+test("backup restore reports a sanitized 503 when authorization cleanup is pending", async () => {
+  let restoreHandler;
+  const auditEvents = [];
+  registerBackupRoutes({
+    get() {},
+    post(route, ...handlers) { if (route === "/backups/:id/restore") restoreHandler = handlers.at(-1); },
+    delete() {},
+  }, {
+    auditLog(...event) { auditEvents.push(event); },
+    authenticate() {},
+    backupService: {},
+    getAuditActor() { return { username: "fixture-manager" }; },
+    requireBackupAccess() {},
+    revalidateBackupAccess() { return null; },
+    restoreService: {
+      async restoreBackup() {
+        throw Object.assign(new Error("Autorizacao revogada; a limpeza do backup temporario esta pendente"), {
+          code: "RESTORE_AUTHORIZATION_REVOKED",
+          statusCode: 503,
+          authorizationCleanupPending: true,
+        });
+      },
+      getWholeRestorePhase() { return null; },
+    },
+    waitForRequestQuiescence: async () => {},
+  });
+
+  const response = {
+    statusCode: null,
+    body: null,
+    status(code) { this.statusCode = code; return this; },
+    json(body) { this.body = body; return this; },
+  };
+  await restoreHandler({ params: { id: "selected-backup" }, body: { confirmation: "RESTORE" }, user: { username: "fixture-manager" } }, response);
+
+  assert.equal(response.statusCode, 503);
+  assert.deepEqual(response.body, {
+    error: "Autorizacao revogada; a limpeza do backup temporario esta pendente",
+    cleanupPending: true,
+  });
+  assert.equal(auditEvents.at(-1)[5].error, "RESTORE_AUTHORIZATION_REVOKED");
+  assert.equal(auditEvents.at(-1)[5].cleanupPending, true);
+  assert.doesNotMatch(JSON.stringify(auditEvents), /private cleanup failure|EIO/i);
+});
+
 test("backup HEAD metadata checks do not create download audit events", async () => {
   let downloadHandler;
   const auditEvents = [];
