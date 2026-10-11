@@ -290,6 +290,9 @@ test("public-share audit logs correlate by token digest without storing the bear
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-share-audit-"));
   const token = crypto.randomBytes(24).toString("hex");
   const expiredViewerToken = crypto.randomBytes(24).toString("hex");
+  const expiredPasswordViewerId = crypto.randomBytes(16).toString("hex");
+  const expiredViewerPasswordHash = bcrypt.hashSync("synthetic-viewer-password", 4);
+  const expiredViewerShareExpiresAt = new Date(Date.now() + 60_000).toISOString();
   const port = await getUnusedPort();
   const dataDir = path.join(sandbox, "data");
   const fileName = "shared-audit-fixture.txt";
@@ -314,13 +317,16 @@ test("public-share audit logs correlate by token digest without storing the bear
     [expiredViewerToken]: {
       folderId: "root",
       fileName: previewFileName,
-      passwordHash: bcrypt.hashSync("synthetic-viewer-password", 4),
-      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      passwordHash: expiredViewerPasswordHash,
+      expiresAt: expiredViewerShareExpiresAt,
       views: 0,
       maxViews: 0,
       downloads: 0,
       maxDownloads: 2,
       viewers: {},
+      activeViewers: {
+        [expiredPasswordViewerId]: { expiresAt: new Date(Date.now() - 60_000).toISOString() },
+      },
     },
   }));
 
@@ -329,6 +335,7 @@ test("public-share audit logs correlate by token digest without storing the bear
     env: {
       ...process.env,
       PORT: String(port),
+      ROUTE_RATE_LIMIT_MAX: "128",
       DB_ENABLED: "false",
       CLOUD_STORAGE_PROVIDER: "local",
       NODE_ENV: "test",
@@ -351,8 +358,20 @@ test("public-share audit logs correlate by token digest without storing the bear
   });
 
   assert.equal((await waitForServer(port)).status, 200);
+  const expiredViewerPasswordAccess = await request(port, `/share/${expiredViewerToken}/password`, "POST", {
+    origin: `http://127.0.0.1:${port}`,
+    "content-type": "application/json",
+  }, JSON.stringify({ password: "synthetic-viewer-password" }));
+  assert.equal(expiredViewerPasswordAccess.status, 200, "valid password access establishes the signed session used by the viewer-expiry regression");
+  const expiredViewerPasswordSetCookies = Array.isArray(expiredViewerPasswordAccess.headers["set-cookie"])
+    ? expiredViewerPasswordAccess.headers["set-cookie"]
+    : [expiredViewerPasswordAccess.headers["set-cookie"] || ""];
+  const expiredViewerPasswordCookie = expiredViewerPasswordSetCookies
+    .map((cookie) => String(cookie).split(";", 1)[0])
+    .find((cookie) => cookie.startsWith(`rootark_share_pwd_${expiredViewerToken}=`));
+  assert.ok(expiredViewerPasswordCookie);
   const expiredViewerPreview = await request(port, `/share/${expiredViewerToken}/preview`, "POST", {
-    cookie: `rootark_share_pwd_${expiredViewerToken}=ok`,
+    cookie: `${expiredViewerPasswordCookie}; rootark_share_${expiredViewerToken}=${expiredPasswordViewerId}`,
     origin: `http://127.0.0.1:${port}`,
   });
   assert.equal(expiredViewerPreview.status, 403, "an expired viewer cookie is rejected even while the password session remains valid");
@@ -434,6 +453,9 @@ test("public-share audit logs correlate by token digest without storing the bear
   const unboundPreviewToken = crypto.randomBytes(24).toString("hex");
   const rangedPreviewToken = crypto.randomBytes(24).toString("hex");
   const protectedPreviewToken = crypto.randomBytes(24).toString("hex");
+  const crossTokenPasswordToken = crypto.randomBytes(24).toString("hex");
+  const protectedPreviewPasswordHash = bcrypt.hashSync("preview-fixture-password", 4);
+  const protectedPreviewExpiresAt = new Date(Date.now() + 60_000).toISOString();
   const prototypeViewerToken = crypto.randomBytes(24).toString("hex");
   const prototypeUnmeteredViewerToken = crypto.randomBytes(24).toString("hex");
   const rangedFileToken = crypto.randomBytes(24).toString("hex");
@@ -448,7 +470,8 @@ test("public-share audit logs correlate by token digest without storing the bear
     [unsupportedPreviewToken]: { folderId: "root", fileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
     [unboundPreviewToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 2, activeViewers: {} },
     [rangedPreviewToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
-    [protectedPreviewToken]: { folderId: "root", fileName: previewFileName, passwordHash: bcrypt.hashSync("preview-fixture-password", 4), expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
+    [protectedPreviewToken]: { folderId: "root", fileName: previewFileName, passwordHash: protectedPreviewPasswordHash, expiresAt: protectedPreviewExpiresAt, views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
+    [crossTokenPasswordToken]: { folderId: "root", fileName: previewFileName, passwordHash: protectedPreviewPasswordHash, expiresAt: protectedPreviewExpiresAt, views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
     [prototypeViewerToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
     [prototypeUnmeteredViewerToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 0, activeViewers: {} },
     [rangedFileToken]: { folderId: "root", fileName: previewFileName, expiresAt: new Date(Date.now() + 60_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 1, activeViewers: {} },
@@ -761,6 +784,37 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.equal(previewFirst.status, 200);
   assert.equal(previewFirst.body, "disposable preview fixture\n");
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[previewFirstToken].downloads, 1, "preview delivery consumes the shared download budget");
+  const forgedPasswordCookie = `rootark_share_pwd_${protectedPreviewToken}=ok`;
+  const forgedPasswordChallenge = await request(port, "/share/" + protectedPreviewToken + "/password", "POST", {
+    origin: "http://127.0.0.1:" + port,
+    cookie: forgedPasswordCookie,
+    "content-type": "application/json",
+  }, JSON.stringify({ password: "" }));
+  const forgedChallengeSetCookies = Array.isArray(forgedPasswordChallenge.headers["set-cookie"])
+    ? forgedPasswordChallenge.headers["set-cookie"]
+    : [forgedPasswordChallenge.headers["set-cookie"] || ""];
+  const forgedChallengeCookies = forgedChallengeSetCookies.map((cookie) => String(cookie).split(";", 1)[0]).filter(Boolean);
+  const forgedBypassCookie = [forgedPasswordCookie, ...forgedChallengeCookies].join("; ");
+  const forgedPasswordFileAccess = await request(port, "/share/" + protectedPreviewToken + "/file", "POST", {
+    origin: "http://127.0.0.1:" + port,
+    cookie: forgedBypassCookie,
+  });
+  const forgedPasswordSiblingAccess = [];
+  for (const [action, method] of [["view", "POST"], ["download", "POST"], ["preview", "GET"], ["preview", "POST"]]) {
+    forgedPasswordSiblingAccess.push(await request(port, "/share/" + protectedPreviewToken + "/" + action, method, {
+      origin: "http://127.0.0.1:" + port,
+      "sec-fetch-site": "same-origin",
+      cookie: forgedBypassCookie,
+    }));
+  }
+  const afterForgedPasswordChallenge = JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[protectedPreviewToken];
+  const malformedPasswordCookieAccess = await request(port, "/share/" + protectedPreviewToken + "/password", "POST", {
+    origin: "http://127.0.0.1:" + port,
+    cookie: `rootark_share_pwd_${protectedPreviewToken}=%`,
+    "content-type": "application/json",
+  }, JSON.stringify({ password: "" }));
+  assert.equal(malformedPasswordCookieAccess.status, 401, "malformed password-session cookies fail closed without escaping cookie parsing errors");
+
   const protectedPreviewAccess = await request(port, "/share/" + protectedPreviewToken + "/password", "POST", {
     origin: "http://127.0.0.1:" + port,
     "content-type": "application/json",
@@ -773,6 +827,30 @@ test("public-share audit logs correlate by token digest without storing the bear
   const protectedPreviewCookie = protectedPreviewCookies.join("; ");
   assert.ok(protectedPreviewCookies.some((cookie) => cookie.startsWith("rootark_share_" + protectedPreviewToken + "=")), "password access establishes a viewer session");
   assert.ok(protectedPreviewCookies.some((cookie) => cookie.startsWith("rootark_share_pwd_" + protectedPreviewToken + "=")), "password access establishes a password session");
+  const protectedPasswordCookie = protectedPreviewCookies.find((cookie) => cookie.startsWith("rootark_share_pwd_" + protectedPreviewToken + "="));
+  const protectedPasswordSetCookie = protectedPreviewSetCookies.find((cookie) => String(cookie).startsWith("rootark_share_pwd_" + protectedPreviewToken + "="));
+  assert.match(protectedPasswordSetCookie, /HttpOnly/i);
+  assert.match(protectedPasswordSetCookie, /SameSite=Lax/i);
+  const passwordCookieExpiresAt = Date.parse(String(protectedPasswordSetCookie).match(/Expires=([^;]+)/i)?.[1] || "");
+  assert.ok(Number.isFinite(passwordCookieExpiresAt) && passwordCookieExpiresAt <= Date.parse(protectedPreviewExpiresAt), "password-session cookie cannot outlive its share link");
+  const protectedPasswordCookieValue = protectedPasswordCookie.slice(protectedPasswordCookie.indexOf("=") + 1);
+  const crossTokenPasswordAttempt = await request(port, "/share/" + crossTokenPasswordToken + "/password", "POST", {
+    origin: "http://127.0.0.1:" + port,
+    cookie: "rootark_share_pwd_" + crossTokenPasswordToken + "=" + protectedPasswordCookieValue,
+    "content-type": "application/json",
+  }, JSON.stringify({ password: "" }));
+  assert.equal(crossTokenPasswordAttempt.status, 401, "a valid password session for one share cannot authorize a different share with the same password hash");
+  const crossTokenLinkAfterAttempt = JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[crossTokenPasswordToken];
+  assert.equal(crossTokenLinkAfterAttempt.views, 0);
+  assert.deepEqual(crossTokenLinkAfterAttempt.activeViewers, {});
+  assert.equal(forgedPasswordFileAccess.status, 401, "a client-forged password cookie cannot obtain protected share content");
+  assert.equal(forgedPasswordFileAccess.body.includes("disposable preview fixture"), false, "forged password access never returns protected file bytes");
+  assert.equal(forgedPasswordChallenge.status, 401, "a client-forged fixed password cookie cannot satisfy a protected share password challenge");
+  assert.deepEqual(forgedPasswordSiblingAccess.map((response) => response.status), [401, 401, 401, 401], "forged password cookies fail closed on view, download, and both preview methods");
+  assert.ok(forgedPasswordSiblingAccess.every((response) => !response.body.includes("disposable preview fixture")), "no sibling share route returns protected bytes for a forged password cookie");
+  assert.equal(afterForgedPasswordChallenge.views, 0, "a forged password session cannot create a share viewer or consume a view");
+  assert.equal(afterForgedPasswordChallenge.downloads, 0, "a forged password session cannot consume a download");
+  assert.deepEqual(afterForgedPasswordChallenge.activeViewers, {});
   assert.ok(protectedPreviewSetCookies.some((cookie) => cookie.includes("rootark_share_" + protectedPreviewToken + "=") && /SameSite=Strict/i.test(cookie)), "viewer cookies are withheld on cross-site top-level navigation");
   const crossSiteProtectedPreview = await request(port, "/share/" + protectedPreviewToken + "/preview", "GET", {
     cookie: protectedPreviewCookie,
@@ -806,6 +884,16 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.equal(protectedSameOriginPreview.status, 200);
   assert.equal(protectedSameOriginPreview.body, "disposable preview fixture\n");
   assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[protectedPreviewToken].downloads, 1, "same-origin preview remains available and consumes the quota");
+  const changedSharePasswordHash = bcrypt.hashSync("rotated-fixture-password", 4);
+  const linksAfterPasswordRotation = JSON.parse(fs.readFileSync(publicLinksPath, "utf8"));
+  linksAfterPasswordRotation[protectedPreviewToken].passwordHash = changedSharePasswordHash;
+  fs.writeFileSync(publicLinksPath, JSON.stringify(linksAfterPasswordRotation));
+  const stalePasswordSessionAccess = await request(port, "/share/" + protectedPreviewToken + "/password", "POST", {
+    origin: "http://127.0.0.1:" + port,
+    cookie: protectedPasswordCookie,
+    "content-type": "application/json",
+  }, JSON.stringify({ password: "" }));
+  assert.equal(stalePasswordSessionAccess.status, 401, "changing the current share password invalidates sessions signed against the previous password hash");
   const secondPreviewView = await request(port, `/share/${previewFirstToken}/view`, "POST", {
     origin: `http://127.0.0.1:${port}`,
   });

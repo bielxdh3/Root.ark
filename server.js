@@ -155,6 +155,7 @@ const MAX_SHARE_EXPIRATION_MINUTES = 60 * 24 * 30;
 const MAX_SHARE_VIEWS = 1000;
 const MAX_SHARE_DOWNLOADS = 1000;
 const SHARE_VIEW_SESSION_MS = 10 * 60 * 1000;
+const SHARE_PASSWORD_SESSION_MS = 60 * 60 * 1000;
 const MAX_TEMPORARY_EXPIRATION_MS = 1000 * 60 * 60 * 24 * 365;
 const OPEN_FILE_TOKEN_TTL_MS = 10 * 60 * 1000;
 const MAX_ACTION_HISTORY_ENTRIES = 500;
@@ -1576,18 +1577,57 @@ function getSharePasswordCookieName(token) {
   return `rootark_share_pwd_${token}`;
 }
 
-function setSharePasswordCookie(req, res, token) {
-  res.cookie(getSharePasswordCookieName(token), "ok", {
+function getSharePasswordSessionMac(token, passwordHash, expiresAtMs) {
+  return crypto.createHmac("sha256", JWT_SECRET)
+    .update("rootark:share-password-session:v1\0", "utf8")
+    .update(token, "utf8")
+    .update("\0", "utf8")
+    .update(String(passwordHash), "utf8")
+    .update("\0", "utf8")
+    .update(String(expiresAtMs), "utf8")
+    .digest();
+}
+
+function setSharePasswordCookie(req, res, token, link) {
+  const passwordHash = link?.passwordHash || link?.password_hash || null;
+  const linkExpiresAtMs = new Date(link?.expiresAt).getTime();
+  const expiresAtMs = Math.min(Date.now() + SHARE_PASSWORD_SESSION_MS, linkExpiresAtMs);
+  if (!passwordHash || !Number.isFinite(linkExpiresAtMs) || expiresAtMs <= Date.now()) return;
+
+  const mac = getSharePasswordSessionMac(token, passwordHash, expiresAtMs).toString("base64url");
+  res.cookie(getSharePasswordCookieName(token), `v1.${expiresAtMs}.${mac}`, {
     httpOnly: true,
     sameSite: "lax",
     secure: req.secure,
-    maxAge: 1000 * 60 * 60,
+    expires: new Date(expiresAtMs),
   });
 }
 
 function hasValidSharePasswordSession(req, token, link) {
   if (!hasSharePassword(link)) return true;
-  return getCookieValue(req, getSharePasswordCookieName(token)) === "ok";
+
+  let cookieValue = "";
+  try {
+    cookieValue = getCookieValue(req, getSharePasswordCookieName(token));
+  } catch {
+    return false;
+  }
+
+  const match = /^v1\.(\d{1,16})\.([A-Za-z0-9_-]{43})$/.exec(cookieValue);
+  if (!match) return false;
+
+  const expiresAtMs = Number(match[1]);
+  const linkExpiresAtMs = new Date(link.expiresAt).getTime();
+  if (!Number.isSafeInteger(expiresAtMs) || expiresAtMs <= Date.now() || !Number.isFinite(linkExpiresAtMs) || expiresAtMs > linkExpiresAtMs) {
+    return false;
+  }
+
+  const providedMac = Buffer.from(match[2], "base64url");
+  if (providedMac.length !== 32 || providedMac.toString("base64url") !== match[2]) return false;
+
+  const passwordHash = link.passwordHash || link.password_hash;
+  const expectedMac = getSharePasswordSessionMac(token, passwordHash, expiresAtMs);
+  return crypto.timingSafeEqual(providedMac, expectedMac);
 }
 
 function getShareFailurePage(message = "Este link nao esta disponivel.") {
@@ -2271,7 +2311,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
       logShareAudit(req, "share.password.failed", token, link, "password", "failure");
       return { status: 401, error: "Nao foi possivel acessar este link.", passwordRequired: true };
     }
-    setSharePasswordCookie(req, res, token);
+    setSharePasswordCookie(req, res, token, link);
     verifiedPasswordHash = passwordHash;
   }
 
