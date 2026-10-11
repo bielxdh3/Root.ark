@@ -111,16 +111,32 @@ function getRequestIp(req) {
   return String(resolveClientIp(req) || "unknown");
 }
 
-function verificationRateLimit(req, username) {
+function verificationRateLimit(req, username, onFirstRejection) {
   const now = Date.now();
   const maxAttempts = Math.max(5, Math.min(100, Number(process.env.TOTP_CHALLENGE_MAX_ATTEMPTS) || 10));
   cleanupVerificationRateStore(verificationAttemptsByIp, now, 5 * 60 * 1000);
   cleanupVerificationRateStore(verificationAttemptsByUsername, now, 5 * 60 * 1000);
   const ipState = getChallengeRateState(verificationAttemptsByIp, getRequestIp(req), now);
   const userState = username ? getChallengeRateState(verificationAttemptsByUsername, String(username).toLowerCase(), now) : null;
-  if (ipState.attempts >= maxAttempts || userState?.attempts >= maxAttempts) return false;
+  const limitedStates = [ipState, userState].filter((state) => state?.attempts >= maxAttempts);
+  if (limitedStates.length) {
+    if (onFirstRejection && limitedStates.some((state) => !state.rateLimitAuditLogged)) {
+      limitedStates.forEach((state) => { state.rateLimitAuditLogged = true; });
+      onFirstRejection();
+    }
+    return false;
+  }
   ipState.attempts += 1;
   if (userState) userState.attempts += 1;
+  return true;
+}
+
+function claimLoginChallengeAudit(req, field) {
+  const now = Date.now();
+  cleanupVerificationRateStore(verificationAttemptsByIp, now, 5 * 60 * 1000);
+  const state = getChallengeRateState(verificationAttemptsByIp, getRequestIp(req), now);
+  if (state[field]) return false;
+  state[field] = true;
   return true;
 }
 
@@ -243,18 +259,36 @@ function registerAuthRoutes(app, context) {
     const challengeId = typeof req.body?.challengeId === "string" ? req.body.challengeId : "";
     const code = req.body?.code;
     const challenge = loginChallenges.get(challengeId);
-    if (!verificationRateLimit(req, challenge?.username)) return genericTotpFailure(res, 429);
+    if (!verificationRateLimit(req, challenge?.username, () => {
+      auditLog("auth.login.challenge.failed", getAuditActor(req, "anonymous"), { type: "auth", id: "login/2fa" }, "attempted", "failure", {
+        reason: "rate_limited",
+        ip: getRequestIp(req),
+      });
+    })) return genericTotpFailure(res, 429);
     if (!challenge || challenge.expiresAt <= Date.now() || challenge.attempts >= 5) {
       loginChallenges.delete(challengeId);
+      if (claimLoginChallengeAudit(req, "invalidChallengeAuditLogged")) {
+        auditLog("auth.login.challenge.failed", getAuditActor(req, "anonymous"), { type: "auth", id: "login/2fa" }, "attempted", "failure", {
+          reason: "invalid_challenge",
+          ip: getRequestIp(req),
+        });
+      }
       return genericTotpFailure(res);
     }
     challenge.attempts += 1;
     const user = loadUsers().find((entry) => entry.username === challenge.username && !entry.disabled && (entry.sessionVersion || 0) === challenge.sessionVersion);
-    if (!user) return genericTotpFailure(res);
+    if (!user) {
+      loginChallenges.delete(challengeId);
+      auditLog("auth.login.challenge.failed", getAuditActor(req, "anonymous"), { type: "user", id: challenge.username }, "challenge", "failure", {
+        reason: "account_unavailable",
+        ip: getRequestIp(req),
+      });
+      return genericTotpFailure(res);
+    }
     let proof;
     try { proof = consumeTotpProof(user, code, totpKey()); } catch { proof = null; }
     if (!proof) {
-      auditLog("auth.login.challenge.failed", getAuditActor(req, challenge.username), { type: "user", id: challenge.username }, "challenge", "failure", { reason: "invalid_proof" });
+      auditLog("auth.login.challenge.failed", getAuditActor(req, "anonymous"), { type: "user", id: challenge.username }, "challenge", "failure", { reason: "invalid_proof" });
       if (challenge.attempts >= 5) loginChallenges.delete(challengeId);
       return genericTotpFailure(res);
     }

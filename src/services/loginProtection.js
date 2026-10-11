@@ -53,7 +53,7 @@ function pruneLoginStore(store, now, config) {
 function getLoginSecurityState(req, username, getAuditActor) {
   const config = getLoginSecurityConfig();
   const now = Date.now();
-  const actor = getAuditActor(req, username || "unknown_user");
+  const actor = getAuditActor(req, "anonymous");
   const ip = actor?.ip || resolveClientIp(req) || "unknown";
   const normalizedUsername = normalizeLoginUsername(username);
   pruneLoginStore(loginAttemptsByIp, now, config);
