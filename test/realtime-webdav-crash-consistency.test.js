@@ -62,6 +62,7 @@ function childSource(localCrash = false) {
     const path=require("path");
     const crypto=require("crypto");
     if(process.env.CLAIM_TIMER_DELAY_MS){const expectedDelay=Number(process.env.CLAIM_TIMER_DELAY_MS);const originalSetInterval=global.setInterval;global.setInterval=function(callback,delay,...args){if(delay!==expectedDelay)return originalSetInterval(callback,delay,...args);return originalSetInterval(function(...callbackArgs){const result=callback.apply(this,callbackArgs);if(fs.existsSync(process.env.CLAIM_SWAP_COMPLETED))fs.writeFileSync(process.env.CLAIM_TIMER_SIGNAL,"tick");return result;},delay,...args);};}
+    if(process.env.WEBDAV_TIMER_DELAY_MS&&process.env.WEBDAV_TIMER_SIGNAL){const expectedDelay=Number(process.env.WEBDAV_TIMER_DELAY_MS);const originalSetInterval=global.setInterval;global.setInterval=function(callback,delay,...args){if(delay!==expectedDelay)return originalSetInterval(callback,delay,...args);return originalSetInterval(function(...callbackArgs){const result=callback.apply(this,callbackArgs);Promise.resolve(result).then(()=>fs.writeFileSync(process.env.WEBDAV_TIMER_SIGNAL,"tick"));return result;},delay,...args);};}
     const cloudPath=${JSON.stringify(CLOUD)};
     const logPath=process.env.FAKE_PROVIDER_LOG;
     const statePath=process.env.FAKE_PROVIDER_STATE;
@@ -70,8 +71,9 @@ function childSource(localCrash = false) {
     const call=(operation,folderId,fileName)=>{const id=crypto.randomUUID();const target=path.join(logPath,id+".json");const temporary=path.join(logPath,"."+id+".tmp");fs.writeFileSync(temporary,JSON.stringify({operation,folderId,fileName,identity:operation+":"+folderId+":"+fileName}),{flag:"wx"});fs.renameSync(temporary,target);};
     const waitFor=(file)=>{const signal=new Int32Array(new SharedArrayBuffer(4)); while(!fs.existsSync(file)) Atomics.wait(signal,0,0,20);};
     let installPause=null; if(process.env.CLAIM_PAUSE_LOCK_PATH){let installed=false; installPause=()=>{if(installed)return; installed=true; let paused=false; const pause=()=>{if(paused)return; paused=true; fs.writeFileSync(process.env.CLAIM_PAUSE_OBSERVED,"observed"); waitFor(process.env.CLAIM_PAUSE_RESUME);}; const originalMkdir=fs.mkdirSync; const originalOpen=fs.openSync; fs.mkdirSync=(target,options)=>{if(path.resolve(String(target))===path.resolve(process.env.CLAIM_PAUSE_LOCK_PATH+".takeover")) pause(); return originalMkdir(target,options);}; fs.openSync=(target,flags,...args)=>{if(String(target).startsWith(process.env.CLAIM_PAUSE_LOCK_PATH+".takeover-")) pause(); return originalOpen(target,flags,...args);};};}
+    if(process.env.CLAIM_CRASH_AFTER_LOCK==="true"){const originalOpen=fs.openSync;const originalClose=fs.closeSync;const lockFds=new Set();fs.openSync=(target,...args)=>{const fd=originalOpen(target,...args);if(/^rootark-webdav-move-[a-f0-9-]{36}\.lock$/i.test(path.basename(String(target))))lockFds.add(fd);return fd;};fs.closeSync=(fd)=>{const shouldCrash=lockFds.delete(fd);const result=originalClose(fd);if(shouldCrash)process.kill(process.pid,"SIGKILL");return result;};}
     const fake={
-      enabled:()=>true,
+      enabled:()=>["s3","gdrive"].includes(String(process.env.CLOUD_STORAGE_PROVIDER||"local").toLowerCase()),
       status:()=>({provider:"fake",enabled:true}),
       key:(folderId,fileName,area)=>[area,folderId,fileName].join("/"),
       inventory:async()=>[],
@@ -180,6 +182,94 @@ function calls(dir) {
     .sort()
     .map((name) => JSON.parse(fs.readFileSync(path.join(logDirectory, name), "utf8")));
 }
+
+test("restart resumes a queued MOVE after a crash immediately after its first claim lock is written", async () => {
+  const f = fixture();
+  let crashed;
+  let recovered;
+  try {
+    crashed = await startServer(f.dir, { CLAIM_CRASH_AFTER_LOCK: "true" });
+    try { await move(f.dir, crashed.port); } catch {}
+    await waitFor(() => crashed.child.exitCode !== null || crashed.child.signalCode !== null);
+    const journal = readJournal(f.dir);
+    assert.ok(journal, "the durable MOVE journal remains after the claim-lock crash");
+    assert.equal(journal.phase, "metadata_installed");
+    assert.equal(journal.cloud?.state, "queued");
+    assert.equal(calls(f.dir).filter((entry) => entry.operation === "upload").length, 0, "the crash happens before any provider effect");
+
+    recovered = await startServer(f.dir);
+    await waitFor(() => !journalPaths(f.dir));
+    assert.equal(fs.existsSync(f.source), false, "restart continues the committed local MOVE");
+    assert.equal(fs.readFileSync(f.target, "utf8"), "source bytes");
+    const providerCalls = calls(f.dir);
+    assert.equal(providerCalls.filter((entry) => entry.operation === "upload").length, 1, "queued recovery performs one provider upload");
+    assert.equal(providerCalls.filter((entry) => entry.operation === "remove").length, 1, "queued recovery removes the remote source after upload");
+  } finally {
+    if (crashed?.child.exitCode === null && crashed?.child.signalCode === null) await stop(crashed.child);
+    if (recovered?.child.exitCode === null && recovered?.child.signalCode === null) await stop(recovered.child);
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("restart rolls back a queued local MOVE after a crash before reconciliation", async () => {
+  const f = fixture();
+  let crashed;
+  let recovered;
+  try {
+    crashed = await startServer(f.dir, { CLOUD_STORAGE_PROVIDER: "local", CLAIM_CRASH_AFTER_LOCK: "true" });
+    try { await move(f.dir, crashed.port); } catch {}
+    await waitFor(() => crashed.child.exitCode !== null || crashed.child.signalCode !== null);
+    const journal = readJournal(f.dir);
+    assert.ok(journal, "the durable local MOVE journal remains after the claim-lock crash");
+    assert.equal(journal.phase, "metadata_installed");
+    assert.equal(journal.cloud?.state, "queued");
+    assert.equal(journal.cloud?.provider, "local");
+    assert.equal(calls(f.dir).length, 0, "local-only recovery has no provider effects");
+
+    recovered = await startServer(f.dir, { CLOUD_STORAGE_PROVIDER: "local" });
+    await waitFor(() => !journalPaths(f.dir));
+    assert.equal(fs.readFileSync(f.source, "utf8"), "source bytes", "restart rolls the local MOVE back");
+    assert.equal(fs.readFileSync(f.target, "utf8"), "old destination");
+    assert.equal(calls(f.dir).length, 0, "local-only recovery does not call cloud operations");
+  } finally {
+    if (crashed?.child.exitCode === null && crashed?.child.signalCode === null) await stop(crashed.child);
+    if (recovered?.child.exitCode === null && recovered?.child.signalCode === null) await stop(recovered.child);
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("queued MOVE waits when the restart provider differs from the journal provider", async () => {
+  const f = fixture();
+  let crashed;
+  let mismatched;
+  let recovered;
+  try {
+    crashed = await startServer(f.dir, { CLOUD_STORAGE_PROVIDER: "s3", CLAIM_CRASH_AFTER_LOCK: "true" });
+    try { await move(f.dir, crashed.port); } catch {}
+    await waitFor(() => crashed.child.exitCode !== null || crashed.child.signalCode !== null);
+    assert.equal(readJournal(f.dir)?.cloud?.provider, "s3");
+
+    mismatched = await startServer(f.dir, { CLOUD_STORAGE_PROVIDER: "gdrive" });
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const journal = readJournal(f.dir);
+    assert.equal(journal?.cloud?.provider, "s3", "the durable provider identity is retained");
+    assert.equal(journal?.cloud?.state, "queued", "a mismatched provider cannot claim or advance the journal");
+    assert.equal(calls(f.dir).length, 0, "a mismatched provider performs no remote operations");
+    await stop(mismatched.child);
+    mismatched = null;
+
+    recovered = await startServer(f.dir, { CLOUD_STORAGE_PROVIDER: "s3" });
+    await waitFor(() => !journalPaths(f.dir));
+    const providerCalls = calls(f.dir);
+    assert.equal(providerCalls.filter((entry) => entry.operation === "upload").length, 1);
+    assert.equal(providerCalls.filter((entry) => entry.operation === "remove").length, 1);
+  } finally {
+    if (crashed?.child.exitCode === null && crashed?.child.signalCode === null) await stop(crashed.child);
+    if (mismatched?.child.exitCode === null && mismatched?.child.signalCode === null) await stop(mismatched.child);
+    if (recovered?.child.exitCode === null && recovered?.child.signalCode === null) await stop(recovered.child);
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
 
 test("WebDAV MOVE persists remote intent before provider effects", { timeout: 90_000 }, async (t) => {
   await t.test("uncertain upload is retained and reconciled without local rollback", async () => {
@@ -401,4 +491,145 @@ test("WebDAV MOVE persists remote intent before provider effects", { timeout: 90
       fs.rmSync(f.dir, { recursive: true, force: true });
     }
   });
+});
+
+test("server startup tolerates a live WebDAV takeover owned by another worker", async () => {
+  const f = fixture();
+  let crashed;
+  let server;
+  try {
+    crashed = await startServer(f.dir, { CLAIM_CRASH_AFTER_LOCK: "true" });
+    try { await move(f.dir, crashed.port); } catch {}
+    await waitFor(() => crashed.child.exitCode !== null || crashed.child.signalCode !== null);
+    await stop(crashed.child);
+
+    const journal = readJournal(f.dir);
+    assert.equal(journal?.phase, "metadata_installed");
+    assert.equal(journal?.cloud?.state, "queued");
+    assert.equal(calls(f.dir).filter((entry) => entry.operation === "upload").length, 0, "the live takeover fixture starts before any provider effect");
+    const lockPath = path.join(f.dir, "temp", ".incoming", `rootark-webdav-move-${journal.transactionId}.lock`);
+    const takeoverDir = `${lockPath}.takeover`;
+    const evidencePath = path.join(takeoverDir, "evidence");
+    const takeoverMetaPath = path.join(takeoverDir, "authority.json");
+    const previousToken = "live-takeover-previous-token";
+    const observedContents = JSON.stringify({
+      version: 1,
+      token: previousToken,
+      transactionId: journal.transactionId,
+      pid: process.pid,
+      claimedAt: new Date().toISOString(),
+    });
+    fs.writeFileSync(lockPath, observedContents);
+    fs.mkdirSync(takeoverDir);
+    fs.writeFileSync(evidencePath, observedContents, { flag: "wx" });
+    const evidenceStat = fs.lstatSync(evidencePath);
+    const authority = {
+      version: 1,
+      transactionId: journal.transactionId,
+      lockPath,
+      evidencePath,
+      token: "live-takeover-owner-token",
+      previousToken,
+      pid: process.pid,
+      claimedAt: new Date().toISOString(),
+      observed: {
+        sha256: crypto.createHash("sha256").update(observedContents).digest("hex"),
+        size: Buffer.byteLength(observedContents),
+        stat: {
+          dev: evidenceStat.dev,
+          ino: evidenceStat.ino,
+          size: evidenceStat.size,
+          mtimeMs: evidenceStat.mtimeMs,
+          ctimeMs: evidenceStat.ctimeMs,
+          birthtimeMs: evidenceStat.birthtimeMs,
+        },
+      },
+    };
+    fs.writeFileSync(takeoverMetaPath, JSON.stringify(authority), { flag: "wx" });
+
+    const timerSignal = path.join(f.dir, "reconciliation-timer-completed");
+    server = await startServer(f.dir, { FAKE_PROVIDER_MODE: "wait-upload", FAKE_PROVIDER_RELEASE: path.join(f.dir, "release-upload"), WEBDAV_TIMER_DELAY_MS: "1379", WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS: "1379", WEBDAV_TIMER_SIGNAL: timerSignal });
+    await waitFor(() => fs.existsSync(timerSignal));
+    assert.equal(server.child.exitCode, null, "an active takeover owned by another worker must not prevent this server from starting");
+    assert.equal(readJournal(f.dir)?.phase, "metadata_installed", "startup must defer recovery for a queued journal owned by a live takeover");
+    assert.equal(readJournal(f.dir)?.cloud?.state, "queued", "the live claimant's queued state must remain intact until it finalizes its claim");
+    assert.equal(fs.existsSync(f.source), false, "startup must not roll back the live claimant's source path");
+    assert.equal(fs.readFileSync(f.target, "utf8"), "source bytes", "startup must not roll back the live claimant's destination path");
+    assert.equal(fs.readFileSync(takeoverMetaPath, "utf8"), JSON.stringify(authority), "startup must preserve the live owner's takeover authority");
+    assert.equal(calls(f.dir).filter((entry) => entry.operation === "upload").length, 0, "startup must not run a provider upload while the active takeover is finalizing its claim");
+  } finally {
+    if (crashed?.child.exitCode === null) await stop(crashed.child);
+    if (server?.child.exitCode === null) await stop(server.child);
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("server startup defers recovery while a fresh WebDAV takeover marker is incomplete", async () => {
+  const f = fixture();
+  let crashed;
+  let server;
+  try {
+    crashed = await startServer(f.dir, { FAKE_PROVIDER_MODE: "crash-after-upload" });
+    try { await move(f.dir, crashed.port); } catch {}
+    await waitFor(() => readJournal(f.dir)?.cloud?.state === "destination_upload_uncertain");
+    await stop(crashed.child);
+
+    const journal = readJournal(f.dir);
+    const journalPath = path.join(f.dir, "temp", ".incoming", `rootark-webdav-move-${journal.transactionId}.json`);
+    const expiredJournal = { ...journal, cloud: { ...journal.cloud, leaseUntil: new Date(Date.now() - 5000).toISOString(), nextAttemptAt: null } };
+    fs.writeFileSync(journalPath, JSON.stringify(expiredJournal));
+    const lockPath = path.join(f.dir, "temp", ".incoming", `rootark-webdav-move-${journal.transactionId}.lock`);
+    const takeoverDir = `${lockPath}.takeover`;
+    fs.mkdirSync(takeoverDir);
+    fs.writeFileSync(path.join(takeoverDir, "authority.json.partial"), "in-progress");
+
+    const timerSignal = path.join(f.dir, "reconciliation-timer-completed");
+    server = await startServer(f.dir, { WEBDAV_TIMER_DELAY_MS: "1379", WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS: "1379", WEBDAV_MOVE_RECONCILIATION_LEASE_MS: "30000", WEBDAV_TIMER_SIGNAL: timerSignal });
+    await waitFor(() => fs.existsSync(timerSignal));
+    assert.equal(server.child.exitCode, null, "a fresh incomplete takeover must defer that transaction without preventing startup");
+    assert.equal(readJournal(f.dir)?.cloud?.state, "destination_upload_uncertain", "the remote-intent journal remains pending while takeover evidence is incomplete");
+    assert.equal(fs.existsSync(path.join(takeoverDir, "authority.json.partial")), true, "ambiguous in-progress takeover evidence is preserved");
+    assert.equal(calls(f.dir).filter((entry) => entry.operation === "upload").length, 1, "startup must not issue a competing provider upload");
+  } finally {
+    if (crashed?.child.exitCode === null) await stop(crashed.child);
+    if (server?.child.exitCode === null) await stop(server.child);
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("server startup preserves stale ambiguous takeover evidence without blocking other service", async () => {
+  const f = fixture();
+  let crashed;
+  let server;
+  try {
+    crashed = await startServer(f.dir, { FAKE_PROVIDER_MODE: "crash-after-upload" });
+    try { await move(f.dir, crashed.port); } catch {}
+    await waitFor(() => readJournal(f.dir)?.cloud?.state === "destination_upload_uncertain");
+    await stop(crashed.child);
+
+    const journal = readJournal(f.dir);
+    const journalPath = path.join(f.dir, "temp", ".incoming", `rootark-webdav-move-${journal.transactionId}.json`);
+    const expiredJournal = { ...journal, cloud: { ...journal.cloud, leaseUntil: new Date(Date.now() - 5000).toISOString(), nextAttemptAt: null } };
+    fs.writeFileSync(journalPath, JSON.stringify(expiredJournal));
+    const lockPath = path.join(f.dir, "temp", ".incoming", `rootark-webdav-move-${journal.transactionId}.lock`);
+    const takeoverDir = `${lockPath}.takeover`;
+    fs.mkdirSync(takeoverDir);
+    const partialMarker = path.join(takeoverDir, "authority.json.partial");
+    fs.writeFileSync(partialMarker, "in-progress");
+    const staleTime = new Date(Date.now() - 5000);
+    fs.utimesSync(takeoverDir, staleTime, staleTime);
+    assert.ok(Date.now() - fs.statSync(takeoverDir).mtimeMs > 1000, "the ambiguous marker must be older than the test lease");
+
+    const timerSignal = path.join(f.dir, "reconciliation-timer-completed");
+    server = await startServer(f.dir, { WEBDAV_TIMER_DELAY_MS: "1379", WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS: "1379", WEBDAV_MOVE_RECONCILIATION_LEASE_MS: "1000", WEBDAV_TIMER_SIGNAL: timerSignal });
+    await waitFor(() => fs.existsSync(timerSignal));
+    assert.equal(server.child.exitCode, null, "stale ambiguous takeover evidence must defer only its transaction, not prevent server startup");
+    assert.equal(readJournal(f.dir)?.cloud?.state, "destination_upload_uncertain", "stale ambiguous takeover evidence must preserve the remote-intent journal");
+    assert.equal(fs.existsSync(partialMarker), true, "ambiguous takeover evidence must remain for explicit recovery");
+    assert.equal(calls(f.dir).filter((entry) => entry.operation === "upload").length, 1, "ambiguous takeover evidence must not trigger a competing provider upload");
+  } finally {
+    if (crashed?.child.exitCode === null) await stop(crashed.child);
+    if (server?.child.exitCode === null) await stop(server.child);
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
 });
