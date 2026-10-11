@@ -74,7 +74,7 @@ This product inventory was reconstructed before the 2026-10-07 live-state snapsh
 
 - `[IMPLEMENTED-UNVERIFIED]` Independent Node.js/Express file-management application currently exists in this repository.
 - `[DECIDED]` D-001 keeps this repository actively developed as Root.ark while allowing only a future, explicitly designed and approved migration or selective reuse into BielOS. Track remaining relationship consequences in issue #10.
-- `[DECISION REQUIRED]` Confirm final spelling and branding: `Root.ark`, `root.ark`, `root.arc`, or another approved name. Track in issue #4.
+- `[HISTORICAL DECISION REQUIRED AS OF 2026-08-13; RESOLVED 2026-08-17]` Issue #4 later resolved the final product name as `Root.ark`; any future visual rebrand remains a separate owner/product decision.
 - `[RECONCILED — historical 2026-08-13]` At that local reconciliation, GitHub reported `Root/main` and `origin/HEAD` resolved to `28747c6ebdac873650e2d5a3c6193824e7cc9985`. That SHA is historical; the current default-branch SHA is recorded in `docs/issue-ledger.md`. The `codex/folders-acl` references remain historical provenance. Issue #14 was locally closure-ready at that time; remote issue closure was not claimed.
 
 ### Verified code-level capabilities
@@ -432,7 +432,7 @@ All items below are candidates, not commitments.
 
 - `[ACCEPTED-LOCAL]` `PHASE_11_BACKLOG_RECONCILED` is recorded in `docs/roadmap/phase-11-backlog-reconciliation.md` for the exact accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
 - `[DO NOT IMPLEMENT YET]` The canonical nine-item matrix maps current evidence, status, prerequisites, security boundaries, owner decisions, implementation boundaries, acceptance, validation, dependencies, and the required separate future issue for every candidate.
-- `[DO NOT IMPLEMENT YET]` TOTP is reconciled to accepted Phase 10; bidirectional sync and WebDAV mutations target Phase 12; search, previews, PWA/clients, groups, and admin UX target Phase 13; deployment prerequisites target Phase 14; the product name `Root.ark` is decided, while a future visual rebrand or UI direction remains a separate owner/product decision.
+- `[DO NOT IMPLEMENT YET]` TOTP is reconciled to accepted Phase 10; bidirectional sync and WebDAV mutations target Phase 12; search, previews, PWA/clients, groups, and admin UX target Phase 13; deployment prerequisites target Phase 14. At the 2026-08-16 reconciliation, naming and branding remained an owner decision; Issue #4 resolved the product name as `Root.ark` on 2026-08-17, and any future visual rebrand remains a separate owner/product decision.
 - `[HISTORICAL SCOPE]` No Phase 12+ source, test, migration, UI, dependency, synchronization, WebDAV, deployment, or product implementation was authorized by that reconciliation turn; later phase-specific authorizations and evidence are recorded below.
 
 ### Phase 12: ZK sync and local WebDAV bridge — 2026-08-16
@@ -489,7 +489,7 @@ All items below are candidates, not commitments.
 
 ### Product and interface
 
-- `[DO NOT IMPLEMENT YET]` Final rename and branding migration.
+- `[DO NOT IMPLEMENT YET]` Future visual rebrand or route/branding migration; none is authorized by the product-name decision alone.
 - `[ACCEPTED-LOCAL]` Minimal groups admin section and protected-search/offline status panel are wired into the existing UI; no redesign was performed.
 - `[DO NOT IMPLEMENT YET]` New product features proposed casually in chat without discovery and issue creation.
 
