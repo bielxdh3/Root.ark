@@ -2,6 +2,8 @@
 
 Whole restore uses a durable, local rollback protocol. It does **not** provide instantaneous atomic visibility across JSON files, quarantine, uploads, SQLite, and cloud providers. Before replacing local state, Root.ark stages and verifies preimages for every locally controlled destination the archive can change. If the process stops before the local commit boundary, startup restores those preimages before migrations or request handling. Cloud-provider effects remain outside that local rollback domain.
 
+The latest exact-SHA validation and tested failure boundaries are recorded in the [2026-10-11 closure snapshot](validation/2026-10-11-rootark-final-closure.md). That dated evidence does not expand the transaction guarantee or establish live cloud-provider interoperability.
+
 ## Admission and service barrier
 
 Restore takes the shared backup-operation lock, validates the full staging-root and backup-ID path (including symlink/junction checks), then writes a `preparing` coordinator at `data/.rootark-restore-coordinator.json` and drains active work before creating the pre-restore backup. The HTTP gate runs before body parsing, static files, and routes. Each admitted HTTP request holds a lease in `data/.rootark-active-requests/`. Long-running cloud trash, cloud restore-sync, WebDAV reconciliation, fire-and-forget cloud writes, and cleanup workers use the same gate. A restore waits for their leases. A lease-directory error or bounded quiescence timeout aborts before restore destinations change.
