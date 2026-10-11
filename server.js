@@ -217,7 +217,7 @@ const WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS = parseBoundedNumber("WEBDAV_MOVE_R
 const WEBDAV_MOVE_RECONCILIATION_MAX_ATTEMPTS = parseBoundedNumber("WEBDAV_MOVE_RECONCILIATION_MAX_ATTEMPTS", 5, 1, 100);
 const WEBDAV_MOVE_RECONCILIATION_LEASE_MS = parseBoundedNumber("WEBDAV_MOVE_RECONCILIATION_LEASE_MS", 60 * 1000, 1000, 60 * 60 * 1000);
 const WEBDAV_MOVE_RECONCILIATION_MAX_BACKOFF_MS = parseBoundedNumber("WEBDAV_MOVE_RECONCILIATION_MAX_BACKOFF_MS", 60 * 60 * 1000, 1000, 24 * 60 * 60 * 1000);
-const WEBDAV_MOVE_REMOTE_INTENT_STATES = new Set([
+const WEBDAV_MOVE_PRESERVE_STATES = new Set([
   "claimed",
   "destination_upload_intent",
   "destination_upload_uncertain",
@@ -8189,6 +8189,20 @@ function isDurablyCompletedWebDavMove(journal) {
   return ["committed", "cloud_complete", "completed", "cleanup_intent", "cleanup_completed"].includes(journal.phase) || journal.cloud?.state === "completed";
 }
 
+function webDavMoveProviderMatchesRuntime(journal) {
+  const recordedProvider = String(journal?.cloud?.provider || "").toLowerCase();
+  if (!journal?.cloud) return true;
+  if (!recordedProvider || recordedProvider !== CLOUD_STORAGE_PROVIDER) return false;
+  if (recordedProvider === "local") return true;
+  return ["s3", "gdrive"].includes(recordedProvider) && isCloudStorageEnabled();
+}
+
+function shouldPreserveWebDavMoveForCloud(journal) {
+  const states = [journal.phase, journal.cloud?.state];
+  if (states.some((state) => WEBDAV_MOVE_PRESERVE_STATES.has(state))) return true;
+  return states.includes("queued") && ["s3", "gdrive"].includes(String(journal.cloud?.provider || "").toLowerCase());
+}
+
 function finalizeWebDavMoveJournal(journal) {
   if (!isSafeWebDavMoveJournal(journal)) throw new Error("Journal WebDAV invalido");
   journal.phase = "committed";
@@ -8235,18 +8249,19 @@ function cleanupOrphanWebDavMoveArtifacts() {
 
 function recoverWebDavMoveJournals() {
   if (!fs.existsSync(WEBDAV_MOVE_JOURNAL_DIR)) return;
-  recoverWebDavMoveClaimTakeovers();
+  const busyTakeovers = recoverWebDavMoveClaimTakeovers();
   for (const name of fs.readdirSync(WEBDAV_MOVE_JOURNAL_DIR).filter((entry) => /^rootark-webdav-move-[a-f0-9-]{36}\.json$/i.test(entry))) {
     const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, name);
     let journal;
     try { journal = readWebDavMoveJournal(journalPath); } catch { throw new Error("Journal WebDAV invalido"); }
     if (!isSafeWebDavMoveJournal(journal)) throw new Error("Journal WebDAV ambiguo");
+    if (busyTakeovers.has(journal.transactionId)) continue;
     if (isDurablyCompletedWebDavMove(journal)) {
       finalizeWebDavMoveJournal(journal);
       continue;
     }
     if (journal.phase === "terminal_reconciliation_failure" || journal.cloud?.state === "terminal_reconciliation_failure") continue;
-    if (WEBDAV_MOVE_REMOTE_INTENT_STATES.has(journal.phase) || WEBDAV_MOVE_REMOTE_INTENT_STATES.has(journal.cloud?.state)) continue;
+    if (shouldPreserveWebDavMoveForCloud(journal)) continue;
     restoreWebDavMoveMetadata(journal.metadata);
     rollbackWebDavMoveJournal(journal);
   }
@@ -8431,7 +8446,11 @@ function recoverWebDavMoveClaimTakeovers() {
       busyTakeovers.add(match[1]);
       continue;
     }
-    webDavMoveRecoverTakeoverAuthority(lockPath, match[1]);
+    try { webDavMoveRecoverTakeoverAuthority(lockPath, match[1]); } catch (error) {
+      if (error.code !== "WEBDAV_MOVE_CLAIM_BUSY") throw error;
+      // Preserve ambiguous evidence and defer only this transaction.
+      busyTakeovers.add(match[1]);
+    }
   }
   return busyTakeovers;
 }
@@ -8475,6 +8494,7 @@ function releaseWebDavMoveClaim(claim) {
 function claimWebDavMoveJournal(journal, now = Date.now(), workerId = crypto.randomUUID()) {
   const cloud = journal.cloud || {};
   if (!journal || !["queued", "destination_upload_intent", "destination_upload_uncertain", "source_delete_intent", "source_delete_uncertain", "retry_wait", "destination_uploaded", "claimed"].includes(cloud.state)) return null;
+  if (!webDavMoveProviderMatchesRuntime(journal)) return null;
   if (cloud.nextAttemptAt && new Date(cloud.nextAttemptAt).getTime() > now) return null;
   if (cloud.leaseToken && new Date(cloud.leaseUntil || 0).getTime() > now) return null;
   const busyTakeovers = recoverWebDavMoveClaimTakeovers();
@@ -8542,7 +8562,13 @@ function markWebDavMoveRetry(journal, error, now = Date.now()) {
 }
 
 async function reconcileWebDavMoveCloud(journal, { claimToken = null, now = Date.now() } = {}) {
-  if (!journal.cloud || !isCloudStorageEnabled()) {
+  if (!journal.cloud) {
+    webDavCloudTransition(journal, "completed", new Date(now).toISOString(), { completedAt: new Date(now).toISOString(), leaseToken: null, leaseUntil: null });
+    writeWebDavMoveJournal(journal);
+    return { pending: false };
+  }
+  if (!webDavMoveProviderMatchesRuntime(journal)) return { pending: true, providerMismatch: true };
+  if (journal.cloud.provider === "local") {
     webDavCloudTransition(journal, "completed", new Date(now).toISOString(), { completedAt: new Date(now).toISOString(), leaseToken: null, leaseUntil: null });
     writeWebDavMoveJournal(journal);
     return { pending: false };
@@ -8759,7 +8785,7 @@ async function handleWebDavMove(req, res, segments) {
     auditLog("webdav.move", getAuditActor(req), { type: "file", id: destination.fileName }, "move", "success", { folderId: source.folder.id, overwrite });
     return res.status(destinationExists ? 204 : 201).end();
   } catch (error) {
-    const cloudReconciliationPending = Boolean(journal.cloud?.destinationUploaded && !journal.cloud?.sourceRemoved) || WEBDAV_MOVE_REMOTE_INTENT_STATES.has(journal.phase) || WEBDAV_MOVE_REMOTE_INTENT_STATES.has(journal.cloud?.state);
+    const cloudReconciliationPending = Boolean(journal.cloud?.destinationUploaded && !journal.cloud?.sourceRemoved) || shouldPreserveWebDavMoveForCloud(journal);
     if (!cloudReconciliationPending && !["committed", "cloud_source_removal_pending", "cloud_complete", "terminal_reconciliation_failure"].includes(journal.phase)) {
       try { journal.phase = "rolling_back"; writeWebDavMoveJournal(journal); } catch {}
       try { restoreWebDavMoveMetadata(metadataSnapshot); } catch {}
