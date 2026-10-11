@@ -2312,6 +2312,7 @@ async function restoreBackup(id, options = {}) {
     restoreDir = staging.restoreDir;
     coordinator = persistWholeRestoreCoordinator({ backupId: backup.id, requiredRestartInstances });
     await options.waitForRequestQuiescence?.();
+    await options.revalidateAuthorization?.();
     let providerInventory = null;
     if (cloudStorage?.enabled()) {
       if (typeof cloudStorage.inventory !== "function") throw new Error("Cloud provider inventory is required before restore can protect unarchived objects");
@@ -2324,6 +2325,7 @@ async function restoreBackup(id, options = {}) {
         .map(({ area, folderId, name }) => ({ area, folderId, name })));
     }
     const { zip, manifest } = await validateBackupArchive(backup, archivePath);
+    await options.revalidateAuthorization?.();
     const preRestore = await backupService.createBackup({
       lockHeld: true,
       type: "pre-restore",
@@ -2374,6 +2376,7 @@ async function restoreBackup(id, options = {}) {
     injectFailure("restore.coordinator.persisted");
     if (providerInventory !== null) await assertProviderContext(cloudStorage, providerInventoryContext);
     injectFailure("restore.before-local-commit");
+    await options.revalidateAuthorization?.();
     mutationStarted = true;
     restoreQuarantine(quarantinePlan, (step, details) => injectFailure(step, details));
     if (quarantinePlan) {

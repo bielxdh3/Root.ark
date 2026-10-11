@@ -2470,6 +2470,39 @@ test("restore quiescence timeout fails before creating pre-restore state or muta
   `);
 });
 
+test("restore revalidates authorization immediately before local commit after preparation", () => {
+  runFixture(`
+    const runtimePath = path.join(dataDir, "runtime.json");
+    const uploadPath = path.join(uploadsDir, "file.txt");
+    write(runtimePath, "selected-backup-state");
+    write(uploadPath, "selected-backup-upload");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(runtimePath, "current-live-state");
+      write(uploadPath, "current-live-upload");
+      let authorized = true;
+      let authorizationChecks = 0;
+      await assert.rejects(restoreService.restoreBackup(backup.id, {
+        confirmation: "RESTORE",
+        async waitForRequestQuiescence() {},
+        async revalidateAuthorization() {
+          authorizationChecks += 1;
+          if (!authorized) throw Object.assign(new Error("authorization revoked"), { code: "RESTORE_AUTHORIZATION_REVOKED" });
+        },
+        failureInjector(step) {
+          if (step === "restore.before-local-commit") authorized = false;
+        },
+      }), { code: "RESTORE_AUTHORIZATION_REVOKED" });
+      assert.equal(authorizationChecks, 3, "authorization is checked after quiescence, before the pre-restore backup, and at the local commit boundary");
+      assert.equal(fs.readFileSync(runtimePath, "utf8"), "current-live-state");
+      assert.equal(fs.readFileSync(uploadPath, "utf8"), "current-live-upload");
+      assert.equal(fs.existsSync(path.join(dataDir, ".rootark-restore-coordinator.json")), false);
+      assert.equal(restoreService.isWholeRestoreBlocked(), false);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("restore failure after quarantine commit rolls quarantine, JSON, and uploads back to the pre-restore state", () => {
   runFixture(`
     const metadata = path.join(dataDir, "quarantine.json");

@@ -5,6 +5,7 @@ function registerBackupRoutes(app, context) {
     backupService,
     getAuditActor,
     requireBackupAccess,
+    revalidateBackupAccess,
     restoreService,
     waitForRequestQuiescence,
   } = context;
@@ -92,6 +93,15 @@ function registerBackupRoutes(app, context) {
         confirmation: req.body?.confirmation,
         username: req.user.username,
         waitForRequestQuiescence: () => waitForRequestQuiescence(req.rootarkRestoreRequestLease),
+        revalidateAuthorization: async () => {
+          const authorizationFailure = await revalidateBackupAccess(req);
+          if (authorizationFailure) {
+            throw Object.assign(new Error(authorizationFailure.error), {
+              code: "RESTORE_AUTHORIZATION_REVOKED",
+              statusCode: authorizationFailure.status,
+            });
+          }
+        },
       });
       auditLog("backup.restore.completed", getAuditActor(req), { type: "backup", id: result.backup.id }, "restore", "success", {
         preRestoreBackupId: result.preRestore.id,
@@ -106,7 +116,7 @@ function registerBackupRoutes(app, context) {
     } catch (error) {
       const restorePhase = restoreService.getWholeRestorePhase?.() || null;
       auditLog("backup.restore.failed", getAuditActor(req), { type: "backup", id: req.params.id }, "restore", "failure", {
-        error: restorePhase ? "restore_recovery_pending" : error.message,
+        error: restorePhase ? "restore_recovery_pending" : error.code === "RESTORE_AUTHORIZATION_REVOKED" ? error.code : error.message,
         phase: restorePhase,
       });
       if (restorePhase === "restart_required") {
@@ -120,6 +130,8 @@ function registerBackupRoutes(app, context) {
           error: "A restauração permanece bloqueada para recuperação. Reinicie todas as instâncias e revise o estado antes de tentar novamente.",
           recoveryRequired: true,
         });
+      } else if (error.code === "RESTORE_AUTHORIZATION_REVOKED") {
+        res.status(error.statusCode).json({ error: error.message });
       } else {
         res.status(error.code === "BACKUP_LOCKED" ? 409 : 400).json({ error: error.message });
       }

@@ -5551,18 +5551,16 @@ const loadCurrentUser = (username) => loadUsers().find((user) => user.username =
 const authenticate = createAuthenticate({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
 const authenticateRealtimeToken = createRealtimeAuthenticator({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
 
-function refreshAuthenticatedUser(req, res) {
+function refreshAuthenticatedUserState(req) {
   let user;
   try {
     user = loadCurrentUser(req.user?.username);
   } catch {
-    res.status(503).json({ error: "Autorizacao indisponivel" });
-    return false;
+    return { status: 503, error: "Autorizacao indisponivel" };
   }
 
   if (!user || user.disabled || (user.sessionVersion || 0) !== req.user?.sessionVersion) {
-    res.status(401).json({ error: "Sessao invalida ou expirada" });
-    return false;
+    return { status: 401, error: "Sessao invalida ou expirada" };
   }
 
   req.user = {
@@ -5573,7 +5571,23 @@ function refreshAuthenticatedUser(req, res) {
     sessionVersion: user.sessionVersion || 0,
     totpEnabled: Boolean(user.totpEnabled),
   };
+  return null;
+}
+
+function refreshAuthenticatedUser(req, res) {
+  const failure = refreshAuthenticatedUserState(req);
+  if (failure) {
+    res.status(failure.status).json({ error: failure.error });
+    return false;
+  }
   return true;
+}
+
+function revalidateBackupAccess(req) {
+  const failure = refreshAuthenticatedUserState(req);
+  if (failure) return failure;
+  if (!canManageBackups(req)) return { status: 403, error: "Permissao negada: manageBackups" };
+  return null;
 }
 
 function revalidateTrashManageAccess(req, res) {
@@ -9413,6 +9427,7 @@ registerBackupRoutes(app, {
   backupService,
   getAuditActor,
   requireBackupAccess,
+  revalidateBackupAccess,
   restoreService,
   waitForRequestQuiescence: (requestLeasePath) => restoreRequestGate.waitForQuiescence(requestLeasePath),
 });
