@@ -4,11 +4,17 @@ O sistema de backup protege metadados, banco SQLite local e arquivos enviados se
 
 ## Local
 
-Backups, o lock, o histórico JSON e os temporários de restore ficam no diretório de runtime do processo:
+Os arquivos de backup e o staging de restore ficam no diretório de runtime do processo:
 
 ```text
 <runtime-root>/data/backups
 ```
+
+O histórico JSON e o lock de metadados ficam em `<runtime-root>/data`; o staging de restore fica em `<runtime-root>/data/backups/.restore-tmp`.
+
+O catálogo de backups fica em `data/backup-history.json` quando a persistência JSON está ativa; com SQLite, as entradas usam a tabela `backup_history`. No modo JSON, as mutações são serializadas entre processos cooperantes Root.ark e o arquivo é substituído por um temporário exclusivo no mesmo diretório, com flush antes do rename. Em POSIX, o diretório também é sincronizado; o Node.js não oferece esse flush de diretório de forma portável no Windows, então não há garantia equivalente contra perda súbita de energia nessa plataforma. Histórico corrompido ou ilegível falha fechado e não é sobrescrito. Os arquivos de lock, claims e coordenação ficam no runtime e não são estado restaurável.
+
+Locks de backup e restore registram PID, identidade da instância e UUID exclusivo do processo; em Linux também registram a identidade de início do processo em `/proc`. O UUID distingue o processo atual de outro processo que use o mesmo PID local. Em Linux, a identidade `/proc` pode detectar que um processo local diferente reutilizou o PID quando a identidade da instância do lock coincide com a configurada. Locks de outra instância permanecem ativos sem essa comparação. Onde o sistema não oferece uma identidade de início portável, um PID vivo com proprietário ambíguo continua considerado ativo; locks legados sem identidade suficiente para provar que o processo vivo terminou também falham fechados. Um PID do mesmo host comprovadamente ausente pode ser recuperado. Se a recuperação ficar bloqueada, pare todas as instâncias que compartilham o runtime e confirme que nenhuma operação está ativa antes de remover apenas um lock comprovadamente obsoleto. Não apague o diretório de locks nem os journals de restore.
 
 Formato:
 
