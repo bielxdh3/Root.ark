@@ -1,13 +1,13 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Last branch reconciliation: 2026-10-11 (after PRs #158 and #159; `Root/main` `d2d5f387b52241efc981108c79a21bbf7f27a5c9`; application source `1041b1b1c2116c593c223dac9508e0d70ac61fb4`)
+Last live application reconciliation: 2026-10-11 after PRs #161 and #162; `Root/main` at query `e0cf2f59b5a51594ed5d744d18d2829bb07db51b` (application source SHA `e0cf2f59b5a51594ed5d744d18d2829bb07db51b`; prepublication snapshot)
 
 Repository: `bielxdh3/root.ark`
 
-The latest reconciled application code is pinned to PR #159 merge SHA `1041b1b1c2116c593c223dac9508e0d70ac61fb4`; PR #158 added roadmap/product documentation only, producing current `Root/main` SHA `d2d5f387b52241efc981108c79a21bbf7f27a5c9`. See the [post-#159 closure snapshot](validation/2026-10-11-rootark-post-159.md) for live issues/PRs, exact-SHA runs, browser evidence, and remaining gates. PR #159 fixes public-share password-session authentication; its link remains a bearer link. Earlier PRs #153–#156 cover whitespace, WebDAV takeover recovery, restore archive identity, and deferred restore acknowledgement/provider reconciliation. Whole restore remains rollback/restart recoverable rather than globally atomic; provider interoperability and deployed proxy topology remain unverified. This snapshot is before the final documentation publication and final merged-SHA validation.
+PR #161 merged the upload settings preservation behavior at `c402ec16219b68cbe5fd425f863a63182d56d94a`; PR #162 merged anonymous login-audit actor handling at application SHA `e0cf2f59b5a51594ed5d744d18d2829bb07db51b`. Exact push-triggered Security Regression, CodeQL, Dependency Review, and Pages checks passed on e0cf2f5. See the [post-#162 closure snapshot](validation/2026-10-11-rootark-post-162.md) and [issue ledger](issue-ledger.md) for the prepublication live state, exact-SHA evidence, browser scope, incomplete issue acceptance, and restore limits. This record is pinned before documentation publication; a doc-only merge does not change the application SHA, and its own merged-SHA checks are tracked separately.
 
-The post-#129 and earlier sections below are historical snapshots. Their recorded issue, PR, browser, and release-gate states are not current live state; use the post-#159 snapshot above and the live issue ledger for the 2026-10-11 reconciliation.
+The post-#129 and earlier sections below are historical snapshots. Their recorded issue, PR, browser, and release-gate states are not current live state; use the post-#162 snapshot above and re-query GitHub for the latest publication state.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
