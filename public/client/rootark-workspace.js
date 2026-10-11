@@ -863,7 +863,13 @@
       await loadFiles();
       ui.toast("Arquivos enviados para aprovação.", "success");
     } catch (error) {
-      progress.textContent = error.message || "O envio não foi concluído.";
+      const detail = !error.message || error.message === "Não foi possível concluir a solicitação."
+        ? "Falha no envio."
+        : error.message;
+      const nextStep = filesOverride
+        ? " Arraste os arquivos novamente para tentar. Confira os arquivos pendentes antes de reenviar."
+        : " A seleção foi mantida. Confira os arquivos pendentes antes de tentar novamente.";
+      progress.textContent = detail + nextStep;
       ui.toast(progress.textContent, "error");
     } finally {
       uploadInProgress = false;

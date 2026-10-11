@@ -6,7 +6,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const test = require("node:test");
 
-test("opening and closing the inline versions panel preserve keyboard focus", async () => {
+test("workspace version and upload flows preserve state and explain upload retries", async () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-workspace.js"), "utf8");
   const rootListeners = new Map();
   const documentListeners = new Map();
@@ -27,6 +27,7 @@ test("opening and closing the inline versions panel preserve keyboard focus", as
   let uploadDelay = false;
   let resolveUpload;
   let uploadRequestCount = 0;
+  let uploadFailureMessage = "";
   let uploadForm;
   let uploadFileInput;
   let uploadProgress;
@@ -91,6 +92,7 @@ test("opening and closing the inline versions panel preserve keyboard focus", as
     addEventListener(name, listener) { documentListeners.set(name, listener); },
     getElementById(id) {
       if (id === "app-root") return root;
+      if (id === "upload-form") return uploadForm;
       if (id === "upload-files") return uploadFileInput;
       if (id === "upload-progress") return uploadProgress;
       return null;
@@ -120,6 +122,11 @@ test("opening and closing the inline versions panel preserve keyboard focus", as
     post: async () => ({}),
     postForm: async () => {
       uploadRequestCount += 1;
+      if (uploadFailureMessage) {
+        const message = uploadFailureMessage;
+        uploadFailureMessage = "";
+        throw new Error(message);
+      }
       return uploadDelay ? new Promise((resolve) => { resolveUpload = resolve; }) : {};
     },
   };
@@ -251,4 +258,29 @@ test("opening and closing the inline versions panel preserve keyboard focus", as
   resolveUpload({});
   await uploadPromise;
   await duplicateUpload;
+
+  uploadDelay = false;
+  const selectedFile = { name: "retry-upload.txt", size: 10 };
+  uploadFileInput.files = [selectedFile];
+  uploadFailureMessage = "Não foi possível concluir a solicitação.";
+  await rootListeners.get("submit")({ target: uploadForm, preventDefault() {} });
+  assert.equal(uploadFileInput.files[0], selectedFile, "a failed file-input upload keeps the selected file available");
+  assert.match(uploadProgress.textContent, /^Falha no envio\. A seleção foi mantida\./);
+  assert.equal(uploadSubmitButton.disabled, false, "the submit button is re-enabled after a failed upload");
+
+  await rootListeners.get("submit")({ target: uploadForm, preventDefault() {} });
+  assert.equal(uploadRequestCount, 3, "retrying the retained file starts a new upload");
+  assert.equal(uploadFileInput.files.length, 0, "the file selection is cleared only after the retry succeeds");
+
+  uploadFailureMessage = "Não foi possível concluir a solicitação.";
+  const dropzone = { classList: { remove() {} } };
+  let dropPrevented = false;
+  rootListeners.get("drop")({
+    target: { closest(selector) { return selector === "#upload-dropzone" ? dropzone : null; } },
+    dataTransfer: { files: [{ name: "dropzone-retry.txt", size: 10 }] },
+    preventDefault() { dropPrevented = true; },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(dropPrevented, true);
+  assert.match(uploadProgress.textContent, /Arraste os arquivos novamente para tentar\. Confira os arquivos pendentes antes de reenviar\./);
 });
