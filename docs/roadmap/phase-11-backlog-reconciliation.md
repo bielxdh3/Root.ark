@@ -6,6 +6,8 @@ Date: 2026-08-16
 Branch: `cdx/rootark-phase11-backlog-reconciliation`
 Starting SHA: `76f2a02cf6e3872ab2d7b61ff617021daf893c61`
 
+This is a historical snapshot of the backlog and issue state as of 2026-08-16. The final product-name decision was added to row 9 after Issue #4 closed on 2026-08-17; Issues #63 and #64 were subsequently created as approved future trackers, but neither authorizes implementation. Use the live issues and current plan-tree status for present-day state; the earlier matrix requirements remain historical.
+
 ## Scope and governing rule
 
 This document is the canonical local reconciliation of Issue #6. The Issue #6 candidate list is not a commitment or implementation authorization. A candidate may proceed only after its prerequisites and owner decisions are complete, a separate future issue defines one coherent scope, and that issue receives explicit approval. This Phase 11 task changes documentation only; it does not implement Phase 12, 13, or 14 work.
