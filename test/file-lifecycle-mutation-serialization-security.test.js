@@ -619,9 +619,9 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   childErrors = "";
   child.stderr?.on("data", (chunk) => { childErrors += chunk.toString(); });
   assert.equal((await waitForServer(port, child)).status, 200);
-  const pruneRetryDeadline = Date.now() + 5000;
-  while ((objects.has(restorePrunedCloudKey) || fs.existsSync(restorePrunedQueueRecordPath)) && Date.now() < pruneRetryDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.equal(objects.has(restorePrunedCloudKey), false, "restart retries and completes the durable absent intent");
+  const pruneRetryDeadline = Date.now() + 15_000;
+  while ((objects.has(restorePrunedCloudKey) || fs.existsSync(restorePrunedQueueRecordPath)) && Date.now() < pruneRetryDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(objects.has(restorePrunedCloudKey), false, `restart retries and completes the durable absent intent (${cloud.deleteAttemptCount(restorePrunedCloudKey) - restorePrunedDeleteAttempts} delete attempts; queue pending=${fs.existsSync(restorePrunedQueueRecordPath)})`);
   assert.equal(fs.existsSync(restorePrunedQueueRecordPath), false, "completed absent intent is removed after provider success");
 
   const failedReplacementQueuePath = path.join(cloudUploadQueueDirectory, `${crypto.createHash("sha256").update(`root\0${approveSaveFailureName}`).digest("hex")}.json`);

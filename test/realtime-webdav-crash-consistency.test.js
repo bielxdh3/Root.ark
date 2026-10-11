@@ -62,6 +62,7 @@ function childSource(localCrash = false) {
     const path=require("path");
     const crypto=require("crypto");
     if(process.env.CLAIM_TIMER_DELAY_MS){const expectedDelay=Number(process.env.CLAIM_TIMER_DELAY_MS);const originalSetInterval=global.setInterval;global.setInterval=function(callback,delay,...args){if(delay!==expectedDelay)return originalSetInterval(callback,delay,...args);return originalSetInterval(function(...callbackArgs){const result=callback.apply(this,callbackArgs);if(fs.existsSync(process.env.CLAIM_SWAP_COMPLETED))fs.writeFileSync(process.env.CLAIM_TIMER_SIGNAL,"tick");return result;},delay,...args);};}
+    if(process.env.WEBDAV_TIMER_DELAY_MS&&process.env.WEBDAV_TIMER_SIGNAL){const expectedDelay=Number(process.env.WEBDAV_TIMER_DELAY_MS);const originalSetInterval=global.setInterval;global.setInterval=function(callback,delay,...args){if(delay!==expectedDelay)return originalSetInterval(callback,delay,...args);return originalSetInterval(function(...callbackArgs){const result=callback.apply(this,callbackArgs);Promise.resolve(result).then(()=>fs.writeFileSync(process.env.WEBDAV_TIMER_SIGNAL,"tick"));return result;},delay,...args);};}
     const cloudPath=${JSON.stringify(CLOUD)};
     const logPath=process.env.FAKE_PROVIDER_LOG;
     const statePath=process.env.FAKE_PROVIDER_STATE;
@@ -401,4 +402,104 @@ test("WebDAV MOVE persists remote intent before provider effects", { timeout: 90
       fs.rmSync(f.dir, { recursive: true, force: true });
     }
   });
+});
+
+test("server startup tolerates a live WebDAV takeover owned by another worker", async () => {
+  const f = fixture();
+  let crashed;
+  let server;
+  try {
+    crashed = await startServer(f.dir, { FAKE_PROVIDER_MODE: "crash-after-upload" });
+    try { await move(f.dir, crashed.port); } catch {}
+    await waitFor(() => readJournal(f.dir)?.cloud?.state === "destination_upload_uncertain");
+    await stop(crashed.child);
+
+    const journal = readJournal(f.dir);
+    const lockPath = path.join(f.dir, "temp", ".incoming", `rootark-webdav-move-${journal.transactionId}.lock`);
+    const journalPath = path.join(f.dir, "temp", ".incoming", `rootark-webdav-move-${journal.transactionId}.json`);
+    fs.writeFileSync(journalPath, JSON.stringify({ ...journal, cloud: { ...journal.cloud, leaseUntil: new Date(Date.now() - 5000).toISOString(), nextAttemptAt: null } }));
+    const takeoverDir = `${lockPath}.takeover`;
+    const evidencePath = path.join(takeoverDir, "evidence");
+    const takeoverMetaPath = path.join(takeoverDir, "authority.json");
+    const previousToken = "live-takeover-previous-token";
+    const observedContents = JSON.stringify({
+      version: 1,
+      token: previousToken,
+      transactionId: journal.transactionId,
+      pid: process.pid,
+      claimedAt: new Date().toISOString(),
+    });
+    fs.writeFileSync(lockPath, observedContents);
+    fs.mkdirSync(takeoverDir);
+    fs.writeFileSync(evidencePath, observedContents, { flag: "wx" });
+    const evidenceStat = fs.lstatSync(evidencePath);
+    const authority = {
+      version: 1,
+      transactionId: journal.transactionId,
+      lockPath,
+      evidencePath,
+      token: "live-takeover-owner-token",
+      previousToken,
+      pid: process.pid,
+      claimedAt: new Date().toISOString(),
+      observed: {
+        sha256: crypto.createHash("sha256").update(observedContents).digest("hex"),
+        size: Buffer.byteLength(observedContents),
+        stat: {
+          dev: evidenceStat.dev,
+          ino: evidenceStat.ino,
+          size: evidenceStat.size,
+          mtimeMs: evidenceStat.mtimeMs,
+          ctimeMs: evidenceStat.ctimeMs,
+          birthtimeMs: evidenceStat.birthtimeMs,
+        },
+      },
+    };
+    fs.writeFileSync(takeoverMetaPath, JSON.stringify(authority), { flag: "wx" });
+
+    const timerSignal = path.join(f.dir, "reconciliation-timer-completed");
+    server = await startServer(f.dir, { FAKE_PROVIDER_MODE: "wait-upload", FAKE_PROVIDER_RELEASE: path.join(f.dir, "release-upload"), WEBDAV_TIMER_DELAY_MS: "1379", WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS: "1379", WEBDAV_TIMER_SIGNAL: timerSignal });
+    await waitFor(() => fs.existsSync(timerSignal));
+    assert.equal(server.child.exitCode, null, "an active takeover owned by another worker must not prevent this server from starting");
+    assert.equal(readJournal(f.dir)?.cloud?.state, "destination_upload_uncertain", "the active owner's journal remains pending");
+    assert.equal(fs.readFileSync(takeoverMetaPath, "utf8"), JSON.stringify(authority), "startup must preserve the live owner's takeover authority");
+    assert.equal(calls(f.dir).filter((entry) => entry.operation === "upload").length, 1, "startup must not run a competing provider upload");
+  } finally {
+    if (crashed?.child.exitCode === null) await stop(crashed.child);
+    if (server?.child.exitCode === null) await stop(server.child);
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("server startup defers recovery while a fresh WebDAV takeover marker is incomplete", async () => {
+  const f = fixture();
+  let crashed;
+  let server;
+  try {
+    crashed = await startServer(f.dir, { FAKE_PROVIDER_MODE: "crash-after-upload" });
+    try { await move(f.dir, crashed.port); } catch {}
+    await waitFor(() => readJournal(f.dir)?.cloud?.state === "destination_upload_uncertain");
+    await stop(crashed.child);
+
+    const journal = readJournal(f.dir);
+    const journalPath = path.join(f.dir, "temp", ".incoming", `rootark-webdav-move-${journal.transactionId}.json`);
+    const expiredJournal = { ...journal, cloud: { ...journal.cloud, leaseUntil: new Date(Date.now() - 5000).toISOString(), nextAttemptAt: null } };
+    fs.writeFileSync(journalPath, JSON.stringify(expiredJournal));
+    const lockPath = path.join(f.dir, "temp", ".incoming", `rootark-webdav-move-${journal.transactionId}.lock`);
+    const takeoverDir = `${lockPath}.takeover`;
+    fs.mkdirSync(takeoverDir);
+    fs.writeFileSync(path.join(takeoverDir, "authority.json.partial"), "in-progress");
+
+    const timerSignal = path.join(f.dir, "reconciliation-timer-completed");
+    server = await startServer(f.dir, { WEBDAV_TIMER_DELAY_MS: "1379", WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS: "1379", WEBDAV_TIMER_SIGNAL: timerSignal });
+    await waitFor(() => fs.existsSync(timerSignal));
+    assert.equal(server.child.exitCode, null, "a fresh incomplete takeover must defer that transaction without preventing startup");
+    assert.equal(readJournal(f.dir)?.cloud?.state, "destination_upload_uncertain", "the remote-intent journal remains pending while takeover evidence is incomplete");
+    assert.equal(fs.existsSync(path.join(takeoverDir, "authority.json.partial")), true, "ambiguous in-progress takeover evidence is preserved");
+    assert.equal(calls(f.dir).filter((entry) => entry.operation === "upload").length, 1, "startup must not issue a competing provider upload");
+  } finally {
+    if (crashed?.child.exitCode === null) await stop(crashed.child);
+    if (server?.child.exitCode === null) await stop(server.child);
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
 });

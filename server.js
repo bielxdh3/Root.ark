@@ -8419,14 +8419,21 @@ function writeWebDavMoveClaimLock(lockPath, record) {
 }
 
 function recoverWebDavMoveClaimTakeovers() {
-  if (!fs.existsSync(WEBDAV_MOVE_JOURNAL_DIR)) return;
+  const busyTakeovers = new Set();
+  if (!fs.existsSync(WEBDAV_MOVE_JOURNAL_DIR)) return busyTakeovers;
   const names = fs.readdirSync(WEBDAV_MOVE_JOURNAL_DIR).filter((entry) => /^rootark-webdav-move-[a-f0-9-]{36}\.lock\.takeover$/i.test(entry));
   for (const name of names) {
     const match = name.match(/^rootark-webdav-move-([a-f0-9-]{36})\.lock\.takeover$/i);
     if (!match) continue;
     const lockPath = webDavMoveLockPath(match[1]);
+    const state = webDavMoveReadTakeoverAuthority(lockPath, match[1]);
+    if ((state.kind === "valid" && state.live) || (state.kind === "malformed" && Date.now() - state.mtimeMs <= WEBDAV_MOVE_RECONCILIATION_LEASE_MS)) {
+      busyTakeovers.add(match[1]);
+      continue;
+    }
     webDavMoveRecoverTakeoverAuthority(lockPath, match[1]);
   }
+  return busyTakeovers;
 }
 
 function takeoverWebDavMoveClaim(lockPath, transactionId, previousToken, observed, now) {
@@ -8470,7 +8477,8 @@ function claimWebDavMoveJournal(journal, now = Date.now(), workerId = crypto.ran
   if (!journal || !["queued", "destination_upload_intent", "destination_upload_uncertain", "source_delete_intent", "source_delete_uncertain", "retry_wait", "destination_uploaded", "claimed"].includes(cloud.state)) return null;
   if (cloud.nextAttemptAt && new Date(cloud.nextAttemptAt).getTime() > now) return null;
   if (cloud.leaseToken && new Date(cloud.leaseUntil || 0).getTime() > now) return null;
-  recoverWebDavMoveClaimTakeovers();
+  const busyTakeovers = recoverWebDavMoveClaimTakeovers();
+  if (busyTakeovers.has(journal.transactionId)) return null;
   const token = `${workerId}:${crypto.randomUUID()}`;
   const lockPath = webDavMoveLockPath(journal.transactionId);
   fs.mkdirSync(WEBDAV_MOVE_JOURNAL_DIR, { recursive: true });
@@ -8781,7 +8789,7 @@ function registerWebDavRoutes() {
   recoverWebDavMoveJournals();
   resumeWebDavMoveCloudJournals().catch((error) => console.error("[webdav] cloud reconciliation: ", error.message));
   if (!webDavReconciliationTimer) {
-    webDavReconciliationTimer = setInterval(() => { void resumeWebDavMoveCloudJournals().catch((error) => console.error("[webdav] cloud reconciliation: ", error.message)); }, WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS);
+    webDavReconciliationTimer = setInterval(() => resumeWebDavMoveCloudJournals().catch((error) => console.error("[webdav] cloud reconciliation: ", error.message)), WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS);
     server.once("close", () => clearInterval(webDavReconciliationTimer));
   }
   app.get("/webdav/moves/:transactionId/status", authenticate, requirePermission("upload"), (req, res) => {
