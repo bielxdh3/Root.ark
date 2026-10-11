@@ -1,8 +1,36 @@
 # Root.ark current validation and GitHub snapshot — 2026-10-10
 
-## Verdict and scope
+## Latest exact-SHA application validation — `Root/main` `738d9412cdb577e0b3cc7887e129391c72dd3ed5`
 
-**Status at this code milestone: PARTIAL.** The application-code state recorded here is exact `Root/main` SHA `6d4548808bf7090fc0ae13b238ab6cf948f67d5a`. The mission baseline is `1df5e4640d4aea7dc700f2088059f489c2e51af0`; the live branch before PR #147 merged was `a6bfefc93c545ecc40ec5129206a2695fed2713a`. This is a dated source-code and GitHub snapshot. The documentation-only reconciliation has its own commit and exact-SHA checks, which are recorded in the final engineering report rather than this pre-documentation code snapshot.
+**Status: PARTIAL.** The latest application-code baseline in this record is the exact `Root/main` SHA `738d9412cdb577e0b3cc7887e129391c72dd3ed5`, after PR #152. This is a milestone snapshot queried on 2026-10-10 before publishing the documentation refresh in PR #149. The final PR head and post-merge SHA require their own evidence; this file does not predict its own merge commit.
+
+### Checks on the exact merged SHA
+
+| Check | Result |
+|---|---|
+| Security Regression, [run #38095278915](https://github.com/bielxdh3/Root.ark/actions/runs/38095278915) | Ubuntu Node 22: 1,138 tests, 1,127 passed, 11 skipped, 0 failed. Windows Node 22: 1,138 tests, 1,123 passed, 15 skipped, 0 failed. Syntax and runtime-artifact checks passed on both; configured high-severity dependency audit passed. |
+| CodeQL, [run #38095278850](https://github.com/bielxdh3/Root.ark/actions/runs/38095278850) | Passed on `738d941`. |
+| Default-branch Dependency Review, [run #38095278908](https://github.com/bielxdh3/Root.ark/actions/runs/38095278908) | Passed on `738d941`. |
+| Pages, [run #38095278345](https://github.com/bielxdh3/Root.ark/actions/runs/38095278345) | Build, report, and deploy jobs passed on `738d941`. |
+| Detached local `npm run validate:release-gate` | 21 passed, 0 blocked, 0 failed on exact `738d941`. |
+
+PR #150 merged at `aad68d09853603b427e7c1636d727132b6a867f4`, PR #151 at `59877d2a74601022ad38a17ff10f8794e63fb504`, and PR #152 at `738d9412cdb577e0b3cc7887e129391c72dd3ed5`. PR #152 records per-process UUIDs for restore locks and Linux process-start identity where available. The live open issues remain #63–#68 and #94. At the pre-publication GitHub query, PR #95 and #97 remained open on stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`, and PR #149 remained open at old head `57b0f14eade56337ae03519948a0dd450cb44df7` on base `6d4548808bf7090fc0ae13b238ab6cf948f67d5a`. The old PR #149 Windows run failed in `failed-temp-delete-retries-after-restart`; PR #150 later extended the test wait, and the current main Windows run above passed. The refreshed PR #149 head still requires exact-head checks and review. See the [issue ledger](../issue-ledger.md) for the point-in-time reasons those PRs and feature issues remain open.
+
+### Browser and UI acceptance on application SHA `738d941`
+
+Real-browser checks ran in the isolated disposable app at desktop 1440×900, intermediate 768×900, and compact 390×844. Covered login/TOTP; file list and folder navigation; small and 9 MiB chunk uploads including an offline failure and retry; encryption and encrypted download; approval/rejection; preview/download; password-protected share flows; versions and restore; rename/move; file/folder permissions; expiry; trash restore; admin accounts/groups; audit/export; backup creation/manifest and restore confirmation/cancel; session revocation; mobile navigation; realtime refresh with a dirty upload form; keyboard navigation and dialog focus. The tested views had no horizontal overflow, and the main browser page reported no console errors or warnings after the flows.
+
+The exact-SHA quarantine panel was reviewed and showed its empty state. Two browser file-control attempts could not retain the selected disposable fixture, so quarantine ingestion was not verified on this exact app tree. An earlier supplemental run on a different application tree did verify quarantining a disposable upload; it is not a substitute for exact-SHA evidence. The permanent-delete modal clearly labeled the action irreversible and required typing `DELETE`; it was cancelled, and `closure-ui-small.txt` remains recoverable in the disposable app's trash. The irreversible purge was not executed. A fresh share tab and read-only account access were verified during the browser run. Live cloud-provider interoperability was not exercised.
+
+### Restore semantics and remaining boundary
+
+Restore stages and verifies local preimages, persists a durable coordinator, commits local domains in order, and rolls back or resumes from durable evidence after injected failure or restart. Provider reconciliation is durably queued and idempotent, but external providers are not part of a distributed atomic transaction. Cross-domain instantaneous visibility, power-loss durability for directory entries on Windows, protection from external writers bypassing the app barrier, and live S3/Google interoperability remain unproven. See [the restore transaction boundary](../backup-restore-transaction-boundary.md). Do not call the restore path globally atomic.
+
+The documentation candidate's exact-head CI, its final `Root/main` push checks, the full UI quarantine/purge acceptance, and a fresh independent review of the final merged SHA remain outstanding. Therefore the overall status stays **PARTIAL**.
+
+## Historical code milestone — after PR #148
+
+**Status at that historical code milestone: PARTIAL.** The application-code state recorded here is exact `Root/main` SHA `6d4548808bf7090fc0ae13b238ab6cf948f67d5a`. The mission baseline is `1df5e4640d4aea7dc700f2088059f489c2e51af0`; the live branch before PR #147 merged was `a6bfefc93c545ecc40ec5129206a2695fed2713a`. This is a dated source-code and GitHub snapshot. The documentation-only reconciliation has its own commit and exact-SHA checks, which are recorded in the final engineering report rather than this pre-documentation code snapshot.
 
 The supported restore path now has a durable, restart-recoverable local commit boundary and idempotent, durable provider reconciliation. It is not a simultaneous atomic switch across quarantine, files, JSON/SQLite, and cloud providers. A supplemental browser run on the same application tree later proved quarantine ingestion and applied local restore flows with disposable data. Provider interoperability and deployed proxy/provider topology remain unverified.
 
@@ -98,7 +126,7 @@ The merged source enforces fail-closed production bootstrap, explicit trusted-pr
 
 ## Remaining gates
 
-- The final engineering report must cite the exact post-documentation `Root/main` SHA and its push-triggered Security Regression on Ubuntu and Windows, CodeQL, Dependency Review, Pages where configured, release gate, full tests, artifact/secret checks, and clean checkout. The checks above apply only to `6d454…`.
+- The final engineering report must cite the exact post-documentation `Root/main` SHA and its push-triggered Security Regression on Ubuntu and Windows, CodeQL, Dependency Review, Pages where configured, release gate, full tests, artifact/secret checks, and clean checkout. The historical checks in the section above apply only to `6d454…`; they do not validate a later documentation merge SHA.
 - The fresh independent final review must use that exact post-documentation SHA, including auth/session/TOTP, CSRF/proxy, mutation routes, upload/storage, backup/restore, sync/WebDAV, sharing/ZK boundaries, CI, docs, and remaining issues/PRs. This dated snapshot predates that review.
 - Keep live cloud-provider interoperability and deployed proxy/provider topology unverified; they were not exercised against a real deployment.
 - Keep issues #63–68 and #94 and incomplete PRs #95/#97 open until their actual acceptance criteria pass.
