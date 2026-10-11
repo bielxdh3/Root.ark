@@ -126,4 +126,3 @@ test("upload queue rejects a record replaced between descriptor open and path va
     fs.lstatSync = originalLstatSync;
   }
 });
-
