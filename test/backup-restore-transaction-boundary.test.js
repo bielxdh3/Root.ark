@@ -2087,9 +2087,10 @@ test("startup download fences include every active restore queue and release onl
   `);
 });
 
-test("cloud startup keeps the listener closed when selected archive uploads fail", () => {
+test("cloud startup defers provider reconciliation until restore restart acknowledgement", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const restoreServicePath = ${JSON.stringify(path.join(ROOT, "services", "restoreService"))};
     backupService.setCloudStorage({ enabled: () => true, inventory: async () => [] });
     restoreService.setCloudStorage({ enabled: () => false });
     (async () => {
@@ -2099,14 +2100,20 @@ test("cloud startup keeps the listener closed when selected archive uploads fail
       providerOrphans.initialize();
 
       const childProcess = require("node:child_process");
-      const marker = path.join(process.cwd(), "unexpected-cloud-listener");
+      const sequencePath = path.join(dataDir, "startup-provider-sequence.txt");
+      const portPath = path.join(dataDir, "startup-provider-port.txt");
       const serverPath = ${JSON.stringify(path.join(ROOT, "server.js"))};
       const cloudPath = ${JSON.stringify(path.join(ROOT, "services", "cloudStorage"))};
       const script = [
         'const fs=require("node:fs");const net=require("node:net");',
+        'const restore=require(' + JSON.stringify(restoreServicePath) + ');',
+        'const sequencePath=' + JSON.stringify(sequencePath) + ';',
+        'const portPath=' + JSON.stringify(portPath) + ';',
+        'const append=(value)=>fs.appendFileSync(sequencePath,value+"\\\\n");',
+        'const acknowledge=restore.acknowledgeWholeRestoreInstance;restore.acknowledgeWholeRestoreInstance=(...args)=>{const result=acknowledge(...args);append(result.allAcknowledged?"ack:all":result.complete?"ack:complete":"ack:partial");return result;};',
         'const cloud=require(' + JSON.stringify(cloudPath) + ');',
-        'cloud.createCloudStorage=()=>({provider:"fixture",enabled:()=>true,status:()=>({provider:"fixture",enabled:true}),key:()=>"",inventory:async()=>[],list:async()=>[],download:async()=>false,upload:async()=>{throw new Error("injected startup upload failure")},remove:async()=>{},removePrefix:async()=>{},resolveUploadId:async()=>"id"});',
-        'const original=net.Server.prototype.listen;net.Server.prototype.listen=function(...args){fs.writeFileSync(' + JSON.stringify(marker) + ',"listened");return original.apply(this,args)};',
+        'cloud.createCloudStorage=()=>({provider:"fixture",enabled:()=>true,status:()=>({provider:"fixture",enabled:true}),key:()=>"",inventory:async()=>{append(fs.readFileSync(' + JSON.stringify(sequencePath) + ',"utf8").includes("ack:all")?"inventory:acked":"inventory:unacked");return[]},list:async()=>[],download:async()=>false,upload:async()=>{append(fs.readFileSync(' + JSON.stringify(sequencePath) + ',"utf8").includes("ack:all")?"upload:acked:blocked="+restore.isWholeRestoreBlocked():"upload:unacked");const port=Number(fs.readFileSync(portPath,"utf8"));const response=await fetch("http://127.0.0.1:"+port+"/");append("http-status:"+response.status);throw new Error("injected startup upload failure")},remove:async()=>{},removePrefix:async()=>{},resolveUploadId:async()=>"id"});',
+        'const original=net.Server.prototype.listen;net.Server.prototype.listen=function(...args){const callbackIndex=args.findIndex((arg)=>typeof arg==="function");if(callbackIndex>=0){const callback=args[callbackIndex];args[callbackIndex]=function(...callbackArgs){append("listener-bound");fs.writeFileSync(portPath,String(this.address().port));return callback.apply(this,callbackArgs)}}return original.apply(this,args)};',
         'require(' + JSON.stringify(serverPath) + ');',
       ].join("\\n");
       const result = childProcess.spawnSync(process.execPath, ["-e", script], {
@@ -2116,11 +2123,43 @@ test("cloud startup keeps the listener closed when selected archive uploads fail
         timeout: 30_000,
       });
       assert.equal(result.status, 1, result.stderr || result.stdout);
-      assert.match(result.stderr, /backup history recovery or provider inventory initialization failed; startup blocked/);
-      assert.equal(fs.existsSync(marker), false);
+      assert.match(result.stderr, /startup acknowledgement or provider inventory initialization failed; startup blocked/);
+      assert.deepEqual(fs.readFileSync(sequencePath, "utf8").trim().split(/\\r?\\n/), [
+        "listener-bound", "ack:all", "upload:acked:blocked=true", "http-status:503",
+      ]);
       assert.equal(providerOrphans.isInventoryUnknown(), true);
+      assert.equal(restoreService.isWholeRestoreBlocked(), true,
+        "the restart barrier remains durable when provider reconciliation fails after all instances acknowledge");
       const queued = backupService.listBackups().find((entry) => entry.id === backup.id);
       assert.equal(queued.metadata.restoreSync.entries[0].state, "retry_wait");
+
+      const restartSequencePath = path.join(dataDir, "startup-provider-restart-sequence.txt");
+      const restartScript = [
+        'const fs=require("node:fs");const net=require("node:net");',
+        'const restore=require(' + JSON.stringify(restoreServicePath) + ');',
+        'const sequencePath=' + JSON.stringify(restartSequencePath) + ';',
+        'const append=(value)=>fs.appendFileSync(sequencePath,value+"|");',
+        'const acknowledge=restore.acknowledgeWholeRestoreInstance;restore.acknowledgeWholeRestoreInstance=(...args)=>{const result=acknowledge(...args);append(result.allAcknowledged?"ack:all":result.complete?"ack:complete":"ack:partial");return result;};',
+        'const cloud=require(' + JSON.stringify(cloudPath) + ');',
+        'const context="' + "c".repeat(64) + '";',
+        'cloud.createCloudStorage=()=>({provider:"fixture",enabled:()=>true,status:()=>({provider:"fixture",enabled:true}),key:()=>"",resolveInventoryContext:async()=>context,inventoryContext:()=>context,inventory:async()=>{append("inventory:blocked="+restore.isWholeRestoreBlocked());return[{area:"uploads",folderId:"root",name:"startup.txt"}]},list:async()=>[],download:async()=>false,upload:async()=>{append("upload:blocked="+restore.isWholeRestoreBlocked());return true},remove:async()=>{},removePrefix:async()=>{},resolveUploadId:async()=>"id"});',
+        'const original=net.Server.prototype.listen;net.Server.prototype.listen=function(...args){const callbackIndex=args.findIndex((arg)=>typeof arg==="function");if(callbackIndex>=0){const callback=args[callbackIndex];args[callbackIndex]=function(...callbackArgs){append("listener-bound");return callback.apply(this,callbackArgs)}}return original.apply(this,args)};',
+        'const poll=setInterval(()=>{if(!restore.isWholeRestoreBlocked()){clearInterval(poll);append("barrier:cleared");process.exit(0)}},10);setTimeout(()=>process.exit(2),20000);',
+        'require(' + JSON.stringify(serverPath) + ');',
+      ].join("\\n");
+      const restarted = childProcess.spawnSync(process.execPath, ["-e", restartScript], {
+        cwd: process.cwd(),
+        env: { ...process.env, PORT: "0", NODE_ENV: "test", JWT_SECRET: "j".repeat(48), ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", CLOUD_STORAGE_PROVIDER: "fixture" },
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+      assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+      assert.deepEqual(fs.readFileSync(restartSequencePath, "utf8").split("|").filter(Boolean), [
+        "listener-bound", "ack:all", "upload:blocked=true", "inventory:blocked=true", "ack:complete", "barrier:cleared",
+      ]);
+      assert.equal(restoreService.isWholeRestoreBlocked(), false);
+      const reconciled = backupService.listBackups().find((entry) => entry.id === backup.id);
+      assert.equal(reconciled.metadata.restoreSync.entries[0].state, "completed");
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);
@@ -2287,6 +2326,36 @@ test("multi-instance restore remains blocked until each stable instance acknowle
       assert.equal(fs.existsSync(coordinatorPath), false);
       assert.equal(restoreService.isWholeRestoreBlocked(), false);
       assert.equal(result.restartRecommended, true);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("deferred multi-instance restore acknowledgement keeps the barrier until provider reconciliation finishes", () => {
+  runFixture(`
+    process.env.ROOTARK_RESTORE_INSTANCE_COUNT = "2";
+    write(path.join(dataDir, "runtime.json"), "backup-state");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      restoreService.prepareWholeRestoreStartup();
+
+      const first = restoreService.acknowledgeWholeRestoreInstance("replica-a", { deferCompletion: true });
+      assert.deepEqual(first, {
+        acknowledgedInstances: 1, requiredInstances: 2, complete: false, allAcknowledged: false,
+      });
+      assert.equal(restoreService.isWholeRestoreBlocked(), true);
+
+      const finalInstance = restoreService.acknowledgeWholeRestoreInstance("replica-b", { deferCompletion: true });
+      assert.deepEqual(finalInstance, {
+        acknowledgedInstances: 2, requiredInstances: 2, complete: false, allAcknowledged: true,
+      });
+      assert.equal(restoreService.isWholeRestoreBlocked(), true,
+        "provider reconciliation runs only after all acknowledgements while the durable barrier remains active");
+
+      const completed = restoreService.acknowledgeWholeRestoreInstance("replica-b");
+      assert.deepEqual(completed, { acknowledgedInstances: 2, requiredInstances: 2, complete: true });
+      assert.equal(restoreService.isWholeRestoreBlocked(), false);
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);
