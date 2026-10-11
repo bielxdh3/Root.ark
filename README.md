@@ -69,7 +69,13 @@ The repository currently contains working foundations for:
 - [x] bounded provider retry/cancellation, idempotency, ciphertext-only attestation, and secret-safe observability helpers;
 - [x] automated syntax, test, dependency, and artifact validation.
 
-### Verified application and default-branch snapshot — 2026-10-11 (prepublication; application code e0cf2f59b5a51594ed5d744d18d2829bb07db51b; Root/main b3a8aff4c218d4fa522c22a4c12d1f2bbd5f3cd8)
+### Verified application snapshot after PR #164 — 2026-10-11 (Root/main application SHA 12e511ccc036b00664e0513b872bdabad56aa941)
+
+PR #164, fix(restore): revalidate authorization and preserve cancellation recovery, merged from b1f0b0eb079dfb1badd75183d1bc7cb880e5b070 at 12e511ccc036b00664e0513b872bdabad56aa941. Its PR-head tree and merge tree are identical (3dd893fd8e5f54e86948eac592a8bacc29216079). On that exact merge SHA, push-triggered Security Regression run [38184047635](https://github.com/bielxdh3/Root.ark/actions/runs/38184047635), CodeQL [38184048677](https://github.com/bielxdh3/Root.ark/actions/runs/38184048677), Dependency Review [38184047652](https://github.com/bielxdh3/Root.ark/actions/runs/38184047652), and Pages [38184047362](https://github.com/bielxdh3/Root.ark/actions/runs/38184047362) passed. The local release gate reported 21 passed, 0 blocked, 0 failed. Linux/Windows test counts, browser scope, current-at-query issues and PRs, security corrections, and the restore boundary are recorded in the [post-#164 validation snapshot](docs/validation/2026-10-11-rootark-post-164.md).
+
+This dated record is scoped to application SHA 12e511c. The later documentation-only commit is a separate validation scope; check that commit's exact-SHA results independently. It does not claim production readiness, end-to-end Zero-Knowledge behavior, or global restore atomicity.
+
+### Historical application and default-branch snapshot — 2026-10-11 (prepublication; application code e0cf2f59b5a51594ed5d744d18d2829bb07db51b; Root/main b3a8aff4c218d4fa522c22a4c12d1f2bbd5f3cd8)
 
 PR #161 preserved upload settings during drag-and-drop updates; PR #162 improved anonymous login/TOTP failure audit attribution; PR #160 reconciled the post-#162 documentation. On exact Root/main SHA b3a8aff, push-triggered Security Regression run 38131294264 passed on Ubuntu and Windows, CodeQL run 38131294305 passed, default-branch Dependency Review run 38131294272 passed, and Pages run 38131294251 passed. The local exact-SHA release gate reported 21 passed, 0 blocked, and 0 failed. Test counts, browser evidence, remaining acceptance limits, and the restore boundary are recorded in the [2026-10-11 closure snapshot](docs/validation/2026-10-11-rootark-final-closure.md).
 

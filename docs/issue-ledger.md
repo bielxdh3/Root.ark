@@ -1,6 +1,21 @@
 # Root.ark Issue Ledger
 
-## Latest verified prepublication snapshot — after PR #160 (2026-10-11; Root/main b3a8aff4c218d4fa522c22a4c12d1f2bbd5f3cd8)
+## GitHub and application snapshot after PR #164 — 2026-10-11 (Root/main 12e511ccc036b00664e0513b872bdabad56aa941)
+
+This point-in-time query was made after PR #164 merged and before the documentation-only reconciliation containing this snapshot. PR #164 head b1f0b0eb079dfb1badd75183d1bc7cb880e5b070 merged at 12e511ccc036b00664e0513b872bdabad56aa941; its four review threads are resolved. Exact-SHA checks and limits are detailed in the [post-#164 validation record](validation/2026-10-11-rootark-post-164.md). Re-query GitHub for later PR, issue, alert, and check state.
+
+Issues #63 protected search, #64 native Android, #65 Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change protection, #68 operation-scoped capability sharing, and #94 deployment-wide chunk-upload limits were open and incomplete at this query.
+
+| Open PR at query | Head and base | GitHub merge state and review threads | Remaining acceptance boundary |
+|---|---|---|---|
+| #95 | Head 95d99e4a934384fcfa2101dfc210741cd791a3d1; based on stale d2ae0eb1c2fc87c1131a73c2a324c695b71664c1 | DIRTY; four threads resolved; latest successful checks were from 2026-10-01 | Keep open for a fresh-base scoped port. Process-local rate limits do not prove deployment-wide enforcement for #94. |
+| #97 | Head a6a33a92cd6902f303254e60031da4bdc04cec04; based on stale d2ae0eb1c2fc87c1131a73c2a324c695b71664c1 | CLEAN at query; five threads resolved; latest successful checks were from 2026-10-01 | Keep open as a partial #66 foundation. Metadata-only pagination, network-selective transfer, native Files On-Demand, external-writer-safe eviction, and deterministic restart/reconnect remain incomplete. |
+
+Dependabot alert #1 was open at medium severity for GHSA-hp3w-g68c-fv3c in transitive dependency sprintf-js; GitHub reported no patched version. The configured high-severity dependency gate passing does not clear this alert.
+
+Whole restore has local pre-images, durable coordination, compensating rollback, startup recovery, and durable provider reconciliation; it is not a global atomic visibility switch across quarantine, filesystem, JSON/SQLite, and cloud providers. Provider interoperability, deployed proxy topology, and Windows directory-entry power-loss durability remain unverified. Root.ark is not production-ready or an end-to-end Zero-Knowledge runtime. No repository-wide Codex Security Deep Scan result is claimed for application SHA 12e511c.
+
+## Historical GitHub snapshot — after PR #160 (2026-10-11; Root/main b3a8aff4c218d4fa522c22a4c12d1f2bbd5f3cd8)
 
 This live query was made after PRs #161 and #162 and the documentation reconciliation in PR #160 merged. Application code remains at e0cf2f59b5a51594ed5d744d18d2829bb07db51b; PR #160 is documentation-only and merged at b3a8aff4c218d4fa522c22a4c12d1f2bbd5f3cd8. The exact b3 SHA passed its own push-triggered Security Regression, CodeQL, default-branch Dependency Review, Pages, and local release gate. Details, test counts, browser coverage, remaining acceptance limits, and the restore boundary are in the [2026-10-11 closure snapshot](validation/2026-10-11-rootark-final-closure.md). This is a dated point-in-time record and does not predict the following documentation PR or its merge SHA.
 
