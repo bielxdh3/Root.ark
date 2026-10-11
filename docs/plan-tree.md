@@ -1,13 +1,13 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Last branch reconciliation: 2026-10-10 (after PR #156; application source `c49fee7997580edb7868ecd7cb739aa1f173245f`)
+Last branch reconciliation: 2026-10-11 (after PRs #158 and #159; `Root/main` `d2d5f387b52241efc981108c79a21bbf7f27a5c9`; application source `1041b1b1c2116c593c223dac9508e0d70ac61fb4`)
 
 Repository: `bielxdh3/root.ark`
 
-The application-code snapshot after PR #156 is pinned to `Root/main` SHA `c49fee7997580edb7868ecd7cb739aa1f173245f`; see [the post-#156 closure snapshot](validation/2026-10-10-rootark-post-156.md). Push-triggered Security Regression, CodeQL, default-branch Dependency Review, and Pages passed on that exact SHA. PR #153 removes trailing test whitespace; #154 fixes startup recovery during WebDAV takeover; #155 binds restore archives to the selected backup; #156 holds the restore request barrier through restart acknowledgement and provider reconciliation. Earlier browser evidence from `738d941` is historical; the linked post-#156 snapshot identifies flows freshly exercised on c49. Whole restore is not globally atomic, and provider interoperability and deployed proxy topology remain unverified. At this snapshot, documentation publication and final default-branch validation were still pending.
+The latest reconciled application code is pinned to PR #159 merge SHA `1041b1b1c2116c593c223dac9508e0d70ac61fb4`; PR #158 added roadmap/product documentation only, producing current `Root/main` SHA `d2d5f387b52241efc981108c79a21bbf7f27a5c9`. See the [post-#159 closure snapshot](validation/2026-10-11-rootark-post-159.md) for live issues/PRs, exact-SHA runs, browser evidence, and remaining gates. PR #159 fixes public-share password-session authentication; its link remains a bearer link. Earlier PRs #153–#156 cover whitespace, WebDAV takeover recovery, restore archive identity, and deferred restore acknowledgement/provider reconciliation. Whole restore remains rollback/restart recoverable rather than globally atomic; provider interoperability and deployed proxy topology remain unverified. This snapshot is before the final documentation publication and final merged-SHA validation.
 
-The post-#129 and earlier sections below are historical snapshots. Their recorded issue, PR, browser, and release-gate states are not current live state; use the post-#156 snapshot above and the linked closure record for the 2026-10-10 reconciliation.
+The post-#129 and earlier sections below are historical snapshots. Their recorded issue, PR, browser, and release-gate states are not current live state; use the post-#159 snapshot above and the live issue ledger for the 2026-10-11 reconciliation.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 

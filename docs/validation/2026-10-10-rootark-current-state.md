@@ -1,5 +1,7 @@
 # Root.ark current validation and GitHub snapshot — 2026-10-10
 
+This is a historical 2026-10-10 milestone snapshot. It is superseded for current application, PR, issue, and validation status by [the post-#159 snapshot](2026-10-11-rootark-post-159.md); its run IDs and browser evidence remain scoped to the exact SHAs stated below.
+
 ## Latest exact-SHA application validation — `Root/main` `738d9412cdb577e0b3cc7887e129391c72dd3ed5`
 
 **Status: PARTIAL.** The latest application-code baseline in this record is the exact `Root/main` SHA `738d9412cdb577e0b3cc7887e129391c72dd3ed5`, after PR #152. This is a milestone snapshot queried on 2026-10-10 before publishing the documentation refresh in PR #149. The final PR head and post-merge SHA require their own evidence; this file does not predict its own merge commit.
