@@ -208,6 +208,39 @@ test("invalid restore ids cannot delete paths outside the restore temp directory
   `);
 });
 
+test("restore rejects a mismatched manifest before creating a pre-restore backup", () => {
+  runFixture(`
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      const target = path.join(dataDir, "runtime.json");
+      write(target, "archive state");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const stored = backupService.getBackupOrThrow(backup.id);
+      const entries = [{ path: "data/runtime.json", contents: Buffer.from("archive state") }];
+      fs.rmSync(stored.archivePath);
+      await backupService.createZipArchive(stored.archivePath, {
+        backup_id: "11111111-1111-4111-8111-111111111111",
+        included_files: entries.map(({ path: entryPath, contents }) => ({ path: entryPath, size: contents.length })),
+        cloud_complete: true,
+      }, entries.map(({ path: entryPath, contents }) => ({ entryPath, contents, size: contents.length })));
+      await backupRepository.saveBackup({ ...backup, checksum: null });
+      write(target, "live state");
+      const backupCountBefore = backupService.listBackups().length;
+
+      await assert.rejects(
+        restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }),
+        /manifest.*identity|identity.*manifest|selected backup|manifest.*selecionado/i,
+      );
+      assert.equal(fs.readFileSync(target, "utf8"), "live state", "a mismatched snapshot must fail before changing restore targets");
+      assert.equal(backupService.listBackups().length, backupCountBefore, "rejected archives must not create an extra pre-restore backup");
+      assert.equal(restoreService.assertNoPendingWholeRestore().reason, "no_pending_restore");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("restore does not persist restart-required until restored files are flushed", () => {
   runFixture(`
     write(path.join(dataDir, "runtime.json"), "archived-state");

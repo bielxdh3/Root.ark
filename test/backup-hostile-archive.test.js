@@ -94,7 +94,7 @@ test("hostile backup archives are rejected without side effects", async (t) => {
   await t.test("valid control archive", async () => {
     const valid = path.join(sandbox, "valid.zip");
     writeZip(valid, [manifest(), { name: "data/config.json", bytes: "{}" }, { name: "uploads/folder/file.bin", bytes: Buffer.from([0, 1, 2, 255]) }]);
-    const accepted = await validateBackupArchive({}, valid);
+    const accepted = await validateBackupArchive({ id: "fixture-backup" }, valid);
     assert.equal(accepted.manifest.backup_id, "fixture-backup");
   });
 
@@ -131,7 +131,7 @@ test("hostile backup archives are rejected without side effects", async (t) => {
         assert.equal(raw.externalFileAttributes, 0xa1ff0000);
         assert.equal(raw.type, "File");
       }
-      await assert.rejects(validateBackupArchive(backup, archive), (error) => error.message.startsWith(category));
+      await assert.rejects(validateBackupArchive({ id: "fixture-backup", ...backup }, archive), (error) => error.message.startsWith(category));
       assert.equal(state(path.join(sandbox, "extracted")), "absent");
       assert.equal(state(path.join(sandbox, "runtime", "data", "backups", ".restore-tmp")), "absent");
       assert.deepEqual(protectedPaths.map(state), before);

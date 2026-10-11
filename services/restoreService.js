@@ -593,9 +593,6 @@ async function localReconciliationPlan(manifest) {
 async function validatedProviderBaseline(backupId) {
   const { backup, archivePath } = backupService.getBackupOrThrow(backupId);
   const { manifest } = await validateBackupArchive(backup, archivePath);
-  if (String(manifest.backup_id).toLowerCase() !== String(backup.id).toLowerCase()) {
-    throw new Error("Selected provider inventory baseline manifest identity does not match the selected backup");
-  }
   return { backup, archivePath, manifest };
 }
 
@@ -1229,7 +1226,12 @@ async function validateBackupArchive(backup, archivePath) {
     if (destinations.has(destinationKey)) throw new Error(`Entrada duplicada no backup: ${entry.path}`);
     destinations.add(destinationKey);
   }
-  if (!manifest.backup_id) throw new Error("Manifest invalido");
+  const manifestBackupId = String(manifest.backup_id || "");
+  const selectedBackupId = String(backup?.id || "");
+  if (!manifestBackupId) throw new Error("Manifest invalido");
+  if (!selectedBackupId || manifestBackupId.toLowerCase() !== selectedBackupId.toLowerCase()) {
+    throw new Error("Manifest do backup nao corresponde ao backup selecionado");
+  }
   await attestCiphertextOnlyArchive(zip);
   return { zip, manifest };
 }
@@ -2319,6 +2321,7 @@ async function restoreBackup(id, options = {}) {
         .filter((entry) => ["uploads", "temp"].includes(entry.area))
         .map(({ area, folderId, name }) => ({ area, folderId, name })));
     }
+    const { zip, manifest } = await validateBackupArchive(backup, archivePath);
     const preRestore = await backupService.createBackup({
       lockHeld: true,
       type: "pre-restore",
@@ -2330,7 +2333,6 @@ async function restoreBackup(id, options = {}) {
       selectedBackup: backup,
       preRestoreBackup: preRestore,
     });
-    const { zip, manifest } = await validateBackupArchive(backup, archivePath);
     await extractArchive(zip, restoreDir);
     const hasQuarantineState = validateQuarantineArchive(restoreDir, manifest);
     const quarantinePlan = hasQuarantineState ? prepareQuarantineRestore(restoreDir) : null;
