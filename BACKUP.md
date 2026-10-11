@@ -2,6 +2,8 @@
 
 O sistema de backup protege metadados, banco SQLite local e arquivos enviados sem incluir segredos.
 
+A restauração usa rollback local durável e reconciliação persistente de provedores, mas não é atomicamente visível em todos os armazenamentos ao mesmo tempo. Consulte os [limites da transação de restore](docs/backup-restore-transaction-boundary.md) e o [snapshot de validação de 2026-10-11](docs/validation/2026-10-11-rootark-final-closure.md) antes de planejar recuperação.
+
 ## Local
 
 Os arquivos de backup e o staging de restore ficam no diretório de runtime do processo:

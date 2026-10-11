@@ -1,13 +1,13 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Last live application reconciliation: 2026-10-11 after PRs #161 and #162; `Root/main` at query `e0cf2f59b5a51594ed5d744d18d2829bb07db51b` (application source SHA `e0cf2f59b5a51594ed5d744d18d2829bb07db51b`; prepublication snapshot)
+Last live application reconciliation: 2026-10-11 after PRs #160, #161, and #162; application source SHA e0cf2f59b5a51594ed5d744d18d2829bb07db51b and prepublication Root/main SHA b3a8aff4c218d4fa522c22a4c12d1f2bbd5f3cd8.
 
-Repository: `bielxdh3/root.ark`
+Repository: bielxdh3/root.ark
 
-PR #161 merged the upload settings preservation behavior at `c402ec16219b68cbe5fd425f863a63182d56d94a`; PR #162 merged anonymous login-audit actor handling at application SHA `e0cf2f59b5a51594ed5d744d18d2829bb07db51b`. Exact push-triggered Security Regression, CodeQL, Dependency Review, and Pages checks passed on e0cf2f5. See the [post-#162 closure snapshot](validation/2026-10-11-rootark-post-162.md) and [issue ledger](issue-ledger.md) for the prepublication live state, exact-SHA evidence, browser scope, incomplete issue acceptance, and restore limits. This record is pinned before documentation publication; a doc-only merge does not change the application SHA, and its own merged-SHA checks are tracked separately.
+PR #161 merged the upload-setting preservation behavior at c402ec16219b68cbe5fd425f863a63182d56d94a. PR #162 merged anonymous login-audit actor handling at e0cf2f59b5a51594ed5d744d18d2829bb07db51b. PR #160 reconciled documentation and merged at b3a8aff4c218d4fa522c22a4c12d1f2bbd5f3cd8. Exact push-triggered Security Regression, CodeQL, Dependency Review, and Pages checks passed on b3. See the [2026-10-11 closure snapshot](validation/2026-10-11-rootark-final-closure.md) and [issue ledger](issue-ledger.md) for exact evidence, current-at-query PR/issue state, browser scope, restore limits, and open acceptance boundaries. This prepublication snapshot does not predict the following documentation PR or its merged-SHA checks.
 
-The post-#129 and earlier sections below are historical snapshots. Their recorded issue, PR, browser, and release-gate states are not current live state; use the post-#162 snapshot above and re-query GitHub for the latest publication state.
+Historical sections below preserve their original evidence and claims; they are not current live status. Re-query GitHub before relying on issue, PR, or check state after this snapshot.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 

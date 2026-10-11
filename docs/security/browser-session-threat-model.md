@@ -1,5 +1,7 @@
 # Browser session threat model
 
+The current repository proxy-trust contract and deployment evidence boundary are summarized in [Security Status](current-findings.md) and the [2026-10-11 closure snapshot](../validation/2026-10-11-rootark-final-closure.md). Repository policy does not prove the live proxy hop order, Cloudflare source-range restriction, header replacement, or origin isolation of a particular deployment.
+
 ## Scope and non-scope
 
 This document covers Root.ark browser login/logout, the `rootark_session` HttpOnly cookie, CSRF handling, authenticated HTTP requests, the authenticated `/auth/session.js` identity endpoint, authenticated WebSocket upgrades, current-user/session-version revalidation, disabled or deleted users, and permission freshness. The tracked frontend does not load `/auth/session.js`; the current session UI uses `/auth/me`. It excludes WebDAV Basic Auth, sync-client bearer authentication (a separate trust boundary), public-share routes, 2FA, password-reset design, and unrelated application features.
