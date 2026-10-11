@@ -1,8 +1,8 @@
 # Root.ark Product Discovery
 
-Status: discovery open; Round 1 through Round 3 decisions recorded
+Status: core product discovery closed on 2026-08-17 (issues #4 and #10); future capabilities remain separately scoped
 
-Related issues: #4 and #10
+Related issues: #4 and #10 (closed 2026-08-17); future work #63 and #64
 
 ## Purpose
 
@@ -44,7 +44,7 @@ Future discovery should work like the AIP planning process: ask a small number o
 - `[DECIDED]` D-008 defines 30-day normal deletion and backup retention, 30-day operational logs, 180-day security logs, immediate access revocation, and cryptographic erasure that cannot be declared complete while service-controlled backup key material remains usable.
 - `[DECIDED]` D-009 defines quarantined unverified external uploads, encrypted client-generated previews and indexes, server-blind public links, local-bridge-only zero-knowledge WebDAV, and eventual mandatory bidirectional synchronization.
 - `[CONFLICT]` Existing server-readable, metadata-dependent, preview, scanning, WebDAV, sync, and backup behaviors require reconciliation with D-003; implementation is not itself product approval.
-- `[OPEN]` The final product name and spelling are not confirmed.
+- `[DECIDED]` D-010 confirms the final product name and spelling as `Root.ark`; any broader visual rebrand requires a separate owner/product decision.
 - `[FROZEN TECHNICAL PROFILE]` Algorithms, library policy, KDF domain separation, nonce construction, and envelope serialization are specified in `docs/architecture/zero-knowledge-migration-contract.md` section 2.1 for bounded Phase 9 foundation work. This does not establish implementation, interoperability, or runtime acceptance.
 - `[OPEN]` Recovery authority, migration scope/window, backup key invalidation mechanics, quarantine workflow, sync conflict authority/protocol implementation, WebDAV bridge deployment, and detailed client behavior remain unresolved or unimplemented as documented in the architecture and owner-decision packet.
 
@@ -388,7 +388,7 @@ Concrete answer options:
 
 ### Q2. Final name
 
-- Status: `[OPEN]`
+- Status: `[RESOLVED by D-010 on 2026-08-17]`
 - Question: What is the exact canonical spelling and capitalization?
 - Existing variants:
   - `Root.ark`
@@ -744,5 +744,22 @@ Round 3 questions are resolved locally in D-007 through D-009. The next discover
 1. `[DECIDED]` D-007: cryptographic architecture and recovery policy; the frozen technical profile is in `docs/architecture/zero-knowledge-migration-contract.md`, while vectors, interoperability, implementation, and owner-directed recovery/migration choices remain open.
 2. `[DECIDED]` D-008: retention, audit, deletion, backup, and offline-copy limits; detailed mechanics remain `[OPEN]`.
 3. `[DECIDED]` D-009: zero-knowledge compatibility for scanning, previews, search, sharing, WebDAV, synchronization, and restore; the architecture baseline is recorded, while runtime implementation and owner-directed sharing/migration/sync choices remain open.
+
+## Final product-discovery closeout — 2026-08-17
+
+### D-010: Final product name
+
+- Status: `[DECIDED]`
+- Date: 2026-08-17
+- Decision: The final product name and spelling is `Root.ark`.
+- Reason: The owner recorded this explicit closeout decision on Issue #4.
+- Consequences:
+  - Current repository naming remains `Root.ark`.
+  - A future visual rebrand, route migration, or broader product-name change requires a new explicit owner decision and a separately scoped issue.
+  - Approved future protected search and native Android work remain tracked separately in Issues #63 and #64; this closeout does not authorize implementation.
+- Affected plan-tree phases:
+  - Phase 5.0: Product identity and repository relationship.
+- Required follow-up issues:
+  - No open naming issue remains; any future naming or visual-brand change requires a new decision record.
 
 Do not ask all remaining questions at once. Each round must preserve explicit decisions, inferred consequences, and unresolved details separately.

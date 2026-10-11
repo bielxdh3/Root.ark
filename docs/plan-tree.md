@@ -74,7 +74,7 @@ This product inventory was reconstructed before the 2026-10-07 live-state snapsh
 
 - `[IMPLEMENTED-UNVERIFIED]` Independent Node.js/Express file-management application currently exists in this repository.
 - `[DECIDED]` D-001 keeps this repository actively developed as Root.ark while allowing only a future, explicitly designed and approved migration or selective reuse into BielOS. Track remaining relationship consequences in issue #10.
-- `[DECISION REQUIRED]` Confirm final spelling and branding: `Root.ark`, `root.ark`, `root.arc`, or another approved name. Track in issue #4.
+- `[HISTORICAL DECISION REQUIRED AS OF 2026-08-13; RESOLVED 2026-08-17]` Issue #4 later resolved the final product name as `Root.ark`; any future visual rebrand remains a separate owner/product decision.
 - `[RECONCILED — historical 2026-08-13]` At that local reconciliation, GitHub reported `Root/main` and `origin/HEAD` resolved to `28747c6ebdac873650e2d5a3c6193824e7cc9985`. That SHA is historical; the current default-branch SHA is recorded in `docs/issue-ledger.md`. The `codex/folders-acl` references remain historical provenance. Issue #14 was locally closure-ready at that time; remote issue closure was not claimed.
 
 ### Verified code-level capabilities
@@ -367,10 +367,10 @@ This track may proceed conversationally in parallel with stabilization. Runtime 
 
 ### Phase 5.0: Product identity and repository relationship
 
-- `[PARALLEL-DISCOVERY]` Final product name and branding.
+- `[DECIDED]` The final product name is `Root.ark`; any future visual rebrand or broader branding direction requires a separate owner/product decision.
 - `[DECIDED]` D-001 keeps Root.ark active in this repository; future migration or selective reuse into BielOS requires a dedicated architecture, security, and contract phase.
 - `[DECIDED]` Root.ark runtime, data, sessions, and authentication remain independent until an explicit integration is designed and approved.
-- `[DONE]` Document the current independent Root.ark/BielOS boundary in `docs/architecture/rootark-bielos-relationship-contract.md`; Issue #10 is closure-ready locally, while future integration, migration, identity, and key relationships remain owner-dependent and the remote issue was not changed.
+- `[DONE]` Document the current independent Root.ark/BielOS boundary in `docs/architecture/rootark-bielos-relationship-contract.md`; Issue #10 was closed on 2026-08-17. Future integration, migration, identity, and key relationships remain owner-dependent and require separate approval.
 - `[PARALLEL-DISCOVERY]` Existing features to preserve, redesign, or retire.
 
 ### Phase 5.1: Users and trust model
@@ -415,11 +415,13 @@ This track may proceed conversationally in parallel with stabilization. Runtime 
 
 ### Phase 5.4: Approved product brief
 
-- `[DONE]` Record approved Round 1 decisions D-001 through D-003 with consequences and follow-up dependencies; keep Issue #4 open.
-- `[DONE]` Record approved Round 2 decisions D-004 through D-006 with consequences and explicitly open deferred details; keep Issue #4 open, while Issue #10's independent relationship is closure-ready locally and future integration remains owner-dependent.
-- `[DONE]` Record approved Round 3 decisions D-007 through D-009 with consequences and explicitly open expert architecture and implementation details; keep Issue #4 open, while Issue #10's independent relationship is closure-ready locally and future integration remains owner-dependent.
+The Round 1–3 status notes below preserve the local decision state at those checkpoints. Issues #4 and #10 were later closed in GitHub on 2026-08-17; the current issue status and remaining implementation gates are recorded in section 8.
+
+- `[DONE]` Record approved Round 1 decisions D-001 through D-003 with consequences and follow-up dependencies; this checkpoint kept Issue #4 open pending final closeout.
+- `[DONE]` Record approved Round 2 decisions D-004 through D-006 with consequences and explicitly open deferred details; this checkpoint kept Issue #4 open, while Issue #10's independent relationship was closure-ready locally and future integration remained owner-dependent.
+- `[DONE]` Record approved Round 3 decisions D-007 through D-009 with consequences and explicitly open expert architecture and implementation details; this checkpoint kept Issue #4 open, while Issue #10's independent relationship was closure-ready locally and future integration remained owner-dependent.
 - `[DONE]` Add `docs/architecture/rootark-bielos-relationship-contract.md` and `docs/architecture/zero-knowledge-migration-contract.md` for the high-risk relationship and zero-knowledge boundaries; these are architecture/threat-model deliverables, not runtime implementation or product acceptance.
-- `[DONE]` Synchronize this plan tree with the accepted relationship, zero-knowledge, and parity documents while preserving owner-dependent choices, current implementation limitations, and no-remote-closure language.
+- `[DONE]` Synchronize this plan tree with the accepted relationship, zero-knowledge, and parity documents while preserving owner-dependent choices, current implementation limitations, and dated local decision states as historical evidence.
 - `[BLOCKED]` Do not silently reinterpret old implementation as the final product contract.
 
 ## 6. Feature backlog
@@ -432,7 +434,7 @@ All items below are candidates, not commitments.
 
 - `[ACCEPTED-LOCAL]` `PHASE_11_BACKLOG_RECONCILED` is recorded in `docs/roadmap/phase-11-backlog-reconciliation.md` for the exact accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
 - `[DO NOT IMPLEMENT YET]` The canonical nine-item matrix maps current evidence, status, prerequisites, security boundaries, owner decisions, implementation boundaries, acceptance, validation, dependencies, and the required separate future issue for every candidate.
-- `[DO NOT IMPLEMENT YET]` TOTP is reconciled to accepted Phase 10; bidirectional sync and WebDAV mutations target Phase 12; search, previews, PWA/clients, groups, and admin UX target Phase 13; deployment prerequisites target Phase 14; naming and branding remain an owner/product decision.
+- `[DO NOT IMPLEMENT YET]` TOTP is reconciled to accepted Phase 10; bidirectional sync and WebDAV mutations target Phase 12; search, previews, PWA/clients, groups, and admin UX target Phase 13; deployment prerequisites target Phase 14. At the 2026-08-16 reconciliation, naming and branding remained an owner decision; Issue #4 resolved the product name as `Root.ark` on 2026-08-17, and any future visual rebrand remains a separate owner/product decision.
 - `[HISTORICAL SCOPE]` No Phase 12+ source, test, migration, UI, dependency, synchronization, WebDAV, deployment, or product implementation was authorized by that reconciliation turn; later phase-specific authorizations and evidence are recorded below.
 
 ### Phase 12: ZK sync and local WebDAV bridge — 2026-08-16
@@ -489,7 +491,7 @@ All items below are candidates, not commitments.
 
 ### Product and interface
 
-- `[DO NOT IMPLEMENT YET]` Final rename and branding migration.
+- `[DO NOT IMPLEMENT YET]` Future visual rebrand or route/branding migration; none is authorized by the product-name decision alone.
 - `[ACCEPTED-LOCAL]` Minimal groups admin section and protected-search/offline status panel are wired into the existing UI; no redesign was performed.
 - `[DO NOT IMPLEMENT YET]` New product features proposed casually in chat without discovery and issue creation.
 
@@ -517,11 +519,11 @@ All items below are candidates, not commitments.
 
 ## 8. Immediate execution order
 
-Historical completed checkpoints, retained as evidence rather than future work: Issues #11, #1, #2, #3, and #7 are closed/completed in the live repository state.
+Issues #1, #2, #3, #4, #6, #7, #9, #10, and #11 were closed in the live repository state by 2026-08-17; their dated checkpoint notes remain historical evidence and do not imply that separately tracked future features are implemented.
 
 1. `[NEXT]` Measure JSON/SQLite parity and migration/restart behavior with disposable fixtures; native binding availability and final SQLite production policy remain open.
-2. `[PARALLEL-DISCOVERY]` Continue structured product discovery; Rounds 1 through 3 are recorded, Issue #4 remains open, and Issue #10's current independent relationship is closure-ready locally while future integration remains owner-dependent; the remote issue was not changed.
-3. `[BLOCKED]` Approve individual future features only after stabilization and discovery. Issue #6 is reconciled locally, but every candidate remains gated by its prerequisites, owner decisions, and a separate approved issue; Issue #9 remains separately gated.
+2. `[DONE]` Structured product discovery Rounds 1 through 3 and decision D-010 are recorded; Issues #4 and #10 were closed on 2026-08-17. Future implementation still requires a separate approved issue and its prerequisites; Issues #63 and #64 do not authorize implementation.
+3. `[BLOCKED]` Approve individual future features only after stabilization and discovery. Issues #6 and #9 were closed on 2026-08-17; any remaining or new feature work still requires its prerequisites, owner decisions, and a separate approved issue.
 
 ## 9. Plan-tree update rule
 
