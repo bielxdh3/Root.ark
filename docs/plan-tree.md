@@ -367,7 +367,7 @@ This track may proceed conversationally in parallel with stabilization. Runtime 
 
 ### Phase 5.0: Product identity and repository relationship
 
-- `[PARALLEL-DISCOVERY]` Final product name and branding.
+- `[DECIDED]` The final product name is `Root.ark`; any future visual rebrand or broader branding direction requires a separate owner/product decision.
 - `[DECIDED]` D-001 keeps Root.ark active in this repository; future migration or selective reuse into BielOS requires a dedicated architecture, security, and contract phase.
 - `[DECIDED]` Root.ark runtime, data, sessions, and authentication remain independent until an explicit integration is designed and approved.
 - `[DONE]` Document the current independent Root.ark/BielOS boundary in `docs/architecture/rootark-bielos-relationship-contract.md`; Issue #10 is closure-ready locally, while future integration, migration, identity, and key relationships remain owner-dependent and the remote issue was not changed.
