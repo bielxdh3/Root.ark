@@ -467,7 +467,7 @@ function prepareWholeRestoreStartup() {
   return coordinator;
 }
 
-function acknowledgeWholeRestoreInstance(explicitInstanceId) {
+function acknowledgeWholeRestoreInstance(explicitInstanceId, { deferCompletion = false } = {}) {
   const coordinator = readWholeRestoreCoordinator();
   if (!coordinator) return { acknowledgedInstances: 0, requiredInstances: 0, complete: true };
   if (![2, LEGACY_WHOLE_RESTORE_COORDINATOR_VERSION, WHOLE_RESTORE_COORDINATOR_VERSION].includes(coordinator.version) || coordinator.phase !== "restart_required") {
@@ -508,8 +508,10 @@ function acknowledgeWholeRestoreInstance(explicitInstanceId) {
   }
   const acknowledgedInstances = acknowledgedIds.size;
   const complete = acknowledgedInstances >= requiredInstances;
-  if (complete) completeWholeRestoreCoordinator(coordinator);
-  return { acknowledgedInstances, requiredInstances, complete: complete && !isWholeRestoreBlocked() };
+  if (complete && !deferCompletion) completeWholeRestoreCoordinator(coordinator);
+  const result = { acknowledgedInstances, requiredInstances, complete: complete && !isWholeRestoreBlocked() };
+  if (deferCompletion) result.allAcknowledged = complete;
+  return result;
 }
 
 function isWholeRestoreBlocked() {

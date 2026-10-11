@@ -10279,25 +10279,36 @@ setInterval(() => { void processPendingCloudRestoreSync().catch(() => {}); }, 60
 setInterval(() => { void restoreRequestGate.run(() => cleanupIncomingUploads()); }, 60 * 1000);
 const listenForRequests = () => {
   server.listen(PORT, () => {
-    try {
-      if (startupRestoreCoordinator) {
-        const acknowledgement = restoreService.acknowledgeWholeRestoreInstance();
-        console.log(`[restore] startup acknowledgement ${acknowledgement.acknowledgedInstances}/${acknowledgement.requiredInstances}`);
+    void (async () => {
+      try {
+        if (startupRestoreCoordinator) {
+          const acknowledgement = restoreService.acknowledgeWholeRestoreInstance(undefined, { deferCompletion: true });
+          console.log(`[restore] startup acknowledgement ${acknowledgement.acknowledgedInstances}/${acknowledgement.requiredInstances}`);
+          if (acknowledgement.allAcknowledged) {
+            await restoreService.reconcileUnknownProviderInventory();
+            const completed = restoreService.acknowledgeWholeRestoreInstance();
+            if (!completed.complete) throw new Error("Whole-restore startup acknowledgement did not complete");
+          }
+        }
+      } catch (error) {
+        console.error("[restore] startup acknowledgement or provider inventory initialization failed; startup blocked:", sanitizeLogValue(error.message));
+        server.close();
+        process.exit(1);
+        return;
       }
-    } catch (error) {
-      console.error("[restore] startup acknowledgement failed:", sanitizeLogValue(error.message));
-    } finally {
       startupRestoreLease();
-    }
-    console.log(`Servidor rodando em http://localhost:${PORT}`);
+      console.log(`Servidor rodando em http://localhost:${PORT}`);
+    })();
   });
 };
 void (async () => {
   await backupService.recoverRetentionAtStartup();
   restoreService.recoverQuarantineRestore();
   if (typeof cloudStorage.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
-  await restoreService.reconcileUnknownProviderInventory();
-  void processPendingCloudRestoreSync().catch(() => {});
+  if (!startupRestoreCoordinator) {
+    await restoreService.reconcileUnknownProviderInventory();
+    void processPendingCloudRestoreSync().catch(() => {});
+  }
   listenForRequests();
 })().catch((error) => {
   startupRestoreLease();
