@@ -26,12 +26,12 @@ function unusedPort() {
   });
 }
 
-function request(port, requestPath, headers = {}) {
+function request(port, requestPath, headers = {}, method = "GET") {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, path: requestPath, method: "GET", headers }, (res) => {
+    const req = http.request({ host: "127.0.0.1", port, path: requestPath, method, headers }, (res) => {
       const chunks = [];
       res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString() }));
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString() }));
     });
     req.once("error", reject);
     req.end();
@@ -51,7 +51,7 @@ async function waitForServer(port, child) {
   throw new Error("disposable server did not listen");
 }
 
-async function runStoreOutageScenario(t, { fallbackEnabled, expectedStatus }) {
+async function runStoreOutageScenario(t, { fallbackEnabled, expectedStatus, emptyDatabase = false }) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-auth-store-outage-"));
   const dataDirectory = path.join(directory, "data");
   const databasePath = path.join(dataDirectory, "rootark.sqlite");
@@ -105,7 +105,7 @@ async function runStoreOutageScenario(t, { fallbackEnabled, expectedStatus }) {
 
   await waitForServer(port, child);
   const db = new Database(databasePath);
-  try { db.exec("DROP TABLE users"); }
+  try { emptyDatabase ? db.exec("DELETE FROM users") : db.exec("DROP TABLE users"); }
   finally { db.close(); }
 
   const token = jwt.sign({ username: user.username, sessionVersion: user.sessionVersion }, secret, { algorithm: "HS256", expiresIn: "1h" });
@@ -113,6 +113,16 @@ async function runStoreOutageScenario(t, { fallbackEnabled, expectedStatus }) {
   assert.equal(response.status, expectedStatus, response.body);
   if (fallbackEnabled) {
     assert.equal(JSON.parse(response.body).username, user.username);
+
+    const csrf = crypto.randomBytes(18).toString("base64url");
+    const logout = await request(port, "/auth/logout", {
+      cookie: `rootark_session=${token}; rootark_csrf=${csrf}`,
+      origin: `http://127.0.0.1:${port}`,
+      "x-csrf-token": csrf,
+    }, "POST");
+    assert.equal(logout.status, 503, logout.body);
+    assert.deepEqual(logout.headers["set-cookie"] || [], []);
+    assert.deepEqual(JSON.parse(logout.body), { error: "Sessao nao pode ser revogada agora." });
   } else {
     assert.deepEqual(JSON.parse(response.body), { error: "Autorizacao indisponivel" });
     assert.doesNotMatch(response.body, /no such table|sqlite|database/i);
@@ -125,5 +135,8 @@ test("SQLite authentication failures remain distinct from revoked users and pres
   });
   await t.test("explicit JSON read fallback still authenticates", async (t) => {
     await runStoreOutageScenario(t, { fallbackEnabled: true, expectedStatus: 200 });
+  });
+  await t.test("empty SQLite user table cannot fall back to stale JSON during logout", async (t) => {
+    await runStoreOutageScenario(t, { fallbackEnabled: true, expectedStatus: 200, emptyDatabase: true });
   });
 });

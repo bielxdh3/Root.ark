@@ -518,14 +518,25 @@ function broadcastDataChanged(source, payload = {}) {
   broadcastRealtime("data:changed", { source, ...payload });
 }
 
-function loadUsers({ failOnDatabaseError = false } = {}) {
+function loadUsers({ failOnDatabaseError = false, allowJsonFallback = true } = {}) {
   if (shouldUseDatabase()) {
+    const jsonFallbackEnabled = shouldReadJsonFallback();
+    let users;
     try {
-      const users = usersRepository.loadUsers();
-      if (users.length || !shouldReadJsonFallback()) return users;
+      users = usersRepository.loadUsers();
     } catch (error) {
       console.error("Falha ao ler usuarios do SQLite:", error.message);
-      if (!shouldReadJsonFallback()) {
+      if (!jsonFallbackEnabled || !allowJsonFallback) {
+        if (failOnDatabaseError) {
+          throw Object.assign(new Error("Authorization store unavailable"), { code: "AUTHORIZATION_STORE_UNAVAILABLE" });
+        }
+        return [];
+      }
+    }
+
+    if (users) {
+      if (users.length || !jsonFallbackEnabled) return users;
+      if (!allowJsonFallback) {
         if (failOnDatabaseError) {
           throw Object.assign(new Error("Authorization store unavailable"), { code: "AUTHORIZATION_STORE_UNAVAILABLE" });
         }
