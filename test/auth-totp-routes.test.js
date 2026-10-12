@@ -10,11 +10,13 @@ function response() {
     code: 200,
     body: undefined,
     cookies: {},
+    clearedCookies: [],
     headers: {},
     status(code) { this.code = code; return this; },
     json(body) { this.body = body; return this; },
+    end() { return this; },
     cookie(name, value) { this.cookies[name] = value; return this; },
-    clearCookie(name) { delete this.cookies[name]; return this; },
+    clearCookie(name) { this.clearedCookies.push(name); delete this.cookies[name]; return this; },
     setHeader(name, value) { this.headers[name.toLowerCase()] = String(value); return this; },
   };
 }
@@ -52,7 +54,7 @@ function createHarness(users, options = {}) {
     getTotpKey: options.getTotpKey || (() => key),
     jwt,
     jwtSecret: "s".repeat(48),
-    loadUsers: () => users,
+    loadUsers: options.loadUsers || (() => users),
     saveUsers: (nextUsers) => { users.splice(0, users.length, ...JSON.parse(JSON.stringify(nextUsers))); },
     logAnalyticsEvent() {},
     normalizeUserPermissions: (user) => user.permissions || {},
@@ -77,6 +79,52 @@ function createHarness(users, options = {}) {
 function user(username, role = "user") {
   return { username, password: bcrypt.hashSync("password", 4), role, permissions: role === "admin" ? { manageUsers: true } : {}, sessionVersion: 0 };
 }
+
+test("logout fails closed when the auth store is unavailable after authentication", async () => {
+  const alice = user("alice");
+  const harness = createHarness([alice], {
+    loadUsers: ({ failOnDatabaseError = false } = {}) => {
+      if (failOnDatabaseError) throw Object.assign(new Error("Authorization store unavailable"), { code: "AUTHORIZATION_STORE_UNAVAILABLE" });
+      return [];
+    },
+  });
+
+  const result = await harness.call("POST", "/auth/logout", {}, "alice");
+
+  assert.equal(result.code, 503);
+  assert.deepEqual(result.body, { error: "Sessao nao pode ser revogada agora." });
+  assertNoStore(result);
+  assert.deepEqual(result.clearedCookies, []);
+  assert.equal(alice.sessionVersion, 0);
+});
+
+test("logout persists session revocation before clearing cookies", async () => {
+  const alice = user("alice");
+  const harness = createHarness([alice]);
+
+  const result = await harness.call("POST", "/auth/logout", {}, "alice");
+
+  assert.equal(result.code, 204);
+  assert.equal(alice.sessionVersion, 1);
+  assert.deepEqual(result.clearedCookies, ["rootark_session", "rootark_csrf"]);
+});
+
+test("logout does not trust an empty JSON fallback after an authoritative SQLite read failure", async () => {
+  const alice = user("alice");
+  const harness = createHarness([alice], {
+    loadUsers: ({ allowJsonFallback = true } = {}) => {
+      if (!allowJsonFallback) throw Object.assign(new Error("Authorization store unavailable"), { code: "AUTHORIZATION_STORE_UNAVAILABLE" });
+      return [];
+    },
+  });
+
+  const result = await harness.call("POST", "/auth/logout", {}, "alice");
+
+  assert.equal(result.code, 503);
+  assert.deepEqual(result.body, { error: "Sessao nao pode ser revogada agora." });
+  assert.deepEqual(result.clearedCookies, []);
+  assert.equal(alice.sessionVersion, 0);
+});
 
 test("TOTP enrollment, challenge, recovery single-use, disable, and admin reset preserve revocation", async () => {
   const originalPolicy = process.env.TOTP_POLICY;

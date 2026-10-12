@@ -421,7 +421,7 @@ function registerAuthRoutes(app, context) {
 
   app.post("/auth/logout", authenticate, (req, res) => {
     try {
-      const users = loadUsers();
+      const users = loadUsers({ failOnDatabaseError: true, allowJsonFallback: false });
       const user = users.find((entry) => entry.username === req.user.username);
       if (user && !user.disabled && (user.sessionVersion || 0) === req.user.sessionVersion) {
         user.sessionVersion = (user.sessionVersion || 0) + 1;
