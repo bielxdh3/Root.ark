@@ -348,7 +348,9 @@ function recoverWholeRestorePreimages(coordinator, options = {}) {
       const databasePath = getDatabasePath();
       if (pathExists(path.dirname(databasePath))) recoverDatabaseRollback(databasePath, { lockHeld: true });
     }
-    recoverQuarantineRestore({ lockHeld: true });
+    const quarantinePreimage = manifest.domains.find((domain) => domain.name === "quarantine-tree");
+    const priorPayloadHashes = buildQuarantinePreimagePayloadHashes(quarantinePreimage?.snapshot?.entries || []);
+    recoverQuarantineRestore({ lockHeld: true, priorPayloadHashes });
     let recovering = updateWholeRestoreCoordinator(current, { phase: "rolling_back", rollbackProgress: [] });
     for (const domain of [...manifest.domains].reverse()) {
       recovering = updateWholeRestoreCoordinator(recovering, { rollbackDomain: domain.name });
@@ -1602,20 +1604,26 @@ function quarantineStagePath(destination, transactionId) {
   return stage;
 }
 
-function validQuarantineRestoreJournal(value) {
+function validQuarantineRestoreJournal(value, { caseInsensitive = process.platform === "win32" } = {}) {
   if (!value || value.version !== 1 || !/^[a-f0-9-]{36}$/i.test(value.transactionId || "")) return false;
   if (typeof value.destination !== "string" || !sameRuntimeRoot(value.destination, getUploadQuarantineDir())) return false;
   if (typeof value.oldMetadataExists !== "boolean" || !/^[a-f0-9]{64}$/.test(value.metadataHash || "")) return false;
   if (!Array.isArray(value.oldPayloads) || !Array.isArray(value.newPayloads)) return false;
+  if (value.oldPayloadHashes !== undefined && (!Array.isArray(value.oldPayloadHashes)
+    || value.oldPayloadHashes.length !== value.oldPayloads.length
+    || value.oldPayloadHashes.some((hash) => !/^[a-f0-9]{64}$/.test(hash || "")))) return false;
   const oldNames = new Set();
   for (const filename of value.oldPayloads) {
-    if (!isSafeQuarantineFilename(filename) || oldNames.has(filename)) return false;
-    oldNames.add(filename);
+    const key = quarantinePayloadFilenameKey(filename, caseInsensitive);
+    if (!isSafeQuarantineFilename(filename) || oldNames.has(key)) return false;
+    oldNames.add(key);
   }
   const newNames = new Set();
   for (const payload of value.newPayloads) {
-    if (!payload || !isSafeQuarantineFilename(payload.filename) || !/^[a-f0-9]{64}$/.test(payload.sha256 || "") || newNames.has(payload.filename)) return false;
-    newNames.add(payload.filename);
+    if (!payload || !isSafeQuarantineFilename(payload.filename) || !/^[a-f0-9]{64}$/.test(payload.sha256 || "")) return false;
+    const key = quarantinePayloadFilenameKey(payload.filename, caseInsensitive);
+    if (newNames.has(key)) return false;
+    newNames.add(key);
   }
   return true;
 }
@@ -1639,7 +1647,7 @@ function writeQuarantineJournal(journalPath, journal) {
   }
 }
 
-function readQuarantineJournal(journalPath) {
+function readQuarantineJournal(journalPath, options = {}) {
   let journal;
   let contents;
   try { contents = readQuarantineRegularFile(journalPath, "utf8"); }
@@ -1649,7 +1657,7 @@ function readQuarantineJournal(journalPath) {
   }
   try { journal = JSON.parse(contents); }
   catch { throw new Error("Quarantine restore journal is invalid"); }
-  if (!validQuarantineRestoreJournal(journal)) throw new Error("Quarantine restore journal is invalid");
+  if (!validQuarantineRestoreJournal(journal, options)) throw new Error("Quarantine restore journal is invalid");
   return journal;
 }
 
@@ -1668,7 +1676,41 @@ function expectedFileHash(pathname, expectedHash) {
   return fileSha256(pathname) === expectedHash;
 }
 
-function rollbackQuarantineRestore(journal, stage) {
+function assertQuarantineRestoreStagedFile(pathname) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(pathname, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const descriptorStat = fs.fstatSync(descriptor);
+    const pathStat = fs.lstatSync(pathname);
+    if (!descriptorStat.isFile() || !pathStat.isFile() || pathStat.isSymbolicLink()
+      || descriptorStat.dev !== pathStat.dev || descriptorStat.ino !== pathStat.ino) {
+      throw new Error("Quarantine staged payload is not a regular file");
+    }
+  } catch (error) {
+    if (error.message === "Quarantine staged payload is not a regular file") throw error;
+    throw new Error("Quarantine staged payload is not a regular file");
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
+
+function quarantinePayloadFilenameKey(filename, caseInsensitive = process.platform === "win32") {
+  return caseInsensitive ? filename.toLowerCase() : filename;
+}
+
+function buildQuarantinePreimagePayloadHashes(entries, { caseInsensitive = process.platform === "win32" } = {}) {
+  const hashes = new Map();
+  for (const entry of entries) {
+    if (entry.type !== "file" || entry.path.includes("/") || !isSafeQuarantineFilename(entry.path)
+      || !/^[a-f0-9]{64}$/.test(entry.sha256 || "")) continue;
+    const key = quarantinePayloadFilenameKey(entry.path, caseInsensitive);
+    if (hashes.has(key)) throw new Error("Quarantine pre-image contains ambiguous payload filenames");
+    hashes.set(key, entry.sha256);
+  }
+  return hashes;
+}
+
+function rollbackQuarantineRestore(journal, stage, priorPayloadHashes = null) {
   const destination = journal.destination;
   for (let index = 0; index < journal.newPayloads.length; index += 1) {
     const payload = journal.newPayloads[index];
@@ -1676,6 +1718,10 @@ function rollbackQuarantineRestore(journal, stage) {
     if (pathExists(stagedNew)) continue;
     const target = path.join(destination, payload.filename);
     if (pathExists(target)) {
+      const payloadKey = quarantinePayloadFilenameKey(payload.filename);
+      const oldPayloadIndex = journal.oldPayloads.findIndex((filename) => quarantinePayloadFilenameKey(filename) === payloadKey);
+      const expectedOldHash = oldPayloadIndex >= 0 ? priorQuarantinePayloadHash(journal, oldPayloadIndex, priorPayloadHashes) : null;
+      if (expectedOldHash && expectedFileHash(target, expectedOldHash)) continue;
       if (!expectedFileHash(target, payload.sha256)) throw new Error("Quarantine rollback found a changed destination payload");
       fs.rmSync(target, { force: false });
     }
@@ -1683,10 +1729,18 @@ function rollbackQuarantineRestore(journal, stage) {
   for (let index = journal.oldPayloads.length - 1; index >= 0; index -= 1) {
     const filename = journal.oldPayloads[index];
     const stagedOld = path.join(stage, `old-${index}`);
-    if (!pathExists(stagedOld)) continue;
     const target = path.join(destination, filename);
+    const expectedOldHash = priorQuarantinePayloadHash(journal, index, priorPayloadHashes);
+    if (!pathExists(stagedOld)) {
+      if (!expectedOldHash) throw new Error("Quarantine rollback could not verify prior payload");
+      if (!expectedFileHash(target, expectedOldHash)) throw new Error("Quarantine rollback could not find prior payload");
+      continue;
+    }
+    assertQuarantineRestoreStagedFile(stagedOld);
+    if (expectedOldHash && !expectedFileHash(stagedOld, expectedOldHash)) throw new Error("Quarantine rollback found a changed staged payload");
     if (pathExists(target)) {
-      const newPayload = journal.newPayloads.find((payload) => payload.filename === filename);
+      const filenameKey = quarantinePayloadFilenameKey(filename);
+      const newPayload = journal.newPayloads.find((payload) => quarantinePayloadFilenameKey(payload.filename) === filenameKey);
       if (!newPayload || !expectedFileHash(target, newPayload.sha256)) throw new Error("Quarantine rollback found a changed destination payload");
       fs.rmSync(target, { force: false });
     }
@@ -1711,6 +1765,14 @@ function rollbackQuarantineRestore(journal, stage) {
   if (pathExists(stagedNewMetadata)) fs.rmSync(stagedNewMetadata, { force: false });
   fsyncDirectory(destination);
   fsyncDirectory(path.dirname(metadataDestination));
+}
+
+function priorQuarantinePayloadHash(journal, index, priorPayloadHashes) {
+  const recordedHash = journal.oldPayloadHashes?.[index];
+  if (recordedHash) return recordedHash;
+  const filename = journal.oldPayloads[index];
+  const fallbackHash = priorPayloadHashes?.get(quarantinePayloadFilenameKey(filename));
+  return /^[a-f0-9]{64}$/.test(fallbackHash || "") ? fallbackHash : null;
 }
 
 function cleanupOrphanQuarantineStages(destination) {
@@ -1747,7 +1809,7 @@ function recoverQuarantineRestore(options = {}) {
   try {
     const destination = validateQuarantineDestination(getUploadQuarantineDir());
     const journalPath = quarantineJournalPath();
-    const journal = readQuarantineJournal(journalPath);
+    const journal = readQuarantineJournal(journalPath, options);
     if (!journal) {
       cleanupOrphanQuarantineStages(destination);
       cleanupOrphanQuarantineMetadataStages(path.dirname(journalPath));
@@ -1764,7 +1826,7 @@ function recoverQuarantineRestore(options = {}) {
       fs.rmSync(stage, { recursive: true, force: true });
       return true;
     }
-    rollbackQuarantineRestore(journal, stage);
+    rollbackQuarantineRestore(journal, stage, options.priorPayloadHashes);
     cleanupQuarantineMetadataStages(journal.transactionId);
     fs.rmSync(journalPath, { force: false });
     fsyncDirectory(path.dirname(journalPath));
@@ -1790,6 +1852,7 @@ function restoreQuarantine(plan, onProgress = null) {
     oldMetadataExists: plan.oldMetadataExists,
     metadataHash: crypto.createHash("sha256").update(plan.metadataContents).digest("hex"),
     oldPayloads: plan.currentPayloads.map((payload) => payload.filename),
+    oldPayloadHashes: plan.currentPayloads.map((payload) => fileSha256(payload.absolutePath)),
     newPayloads: plan.restoredPayloads.map((payload) => ({ filename: payload.filename, sha256: fileSha256(payload.absolutePath) })),
   };
   let journalWritten = false;
@@ -1814,6 +1877,7 @@ function restoreQuarantine(plan, onProgress = null) {
       const stagedOldPath = path.join(stagingDirectory, `old-${index}`);
       fsyncFile(payload.absolutePath);
       fs.renameSync(payload.absolutePath, stagedOldPath);
+      if (!expectedFileHash(stagedOldPath, journal.oldPayloadHashes[index])) throw new Error("Quarantine payload changed during restore");
       onProgress?.("restore.quarantine.old-payload.moved", { filename: payload.filename, index });
     });
     fsyncDirectory(destination);
@@ -2519,6 +2583,7 @@ module.exports = {
   requiresProviderOrphanPolicyAtStartup,
   getWholeRestorePhase,
   restoreDatabaseFiles,
+  buildQuarantinePreimagePayloadHashes,
   databaseJournalPath,
   SQLITE_SUFFIXES,
 };
