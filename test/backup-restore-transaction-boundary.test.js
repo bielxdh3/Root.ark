@@ -165,7 +165,7 @@ test("legacy quarantine recovery rejects a symlinked staged prior payload", { sk
 
     assert.throws(() => restoreService.recoverQuarantineRestore({ lockHeld: true }), /not a regular file/);
     assert.equal(fs.existsSync(path.join(quarantineDir, "prior.bin")), false, "the symlink is not installed as a payload");
-    assert.equal(fs.readFileSync(externalPayload, "utf8"), "external bytes must not be changed");
+    assert.equal(fs.readFileSync(externalPayload, "utf8"), "external bytes must not be restored as quarantine data");
     assert.equal(fs.lstatSync(stagedPayload).isSymbolicLink(), true, "the staged symlink remains for manual recovery");
     assert.equal(fs.existsSync(journalPath), true, "journal retains the recovery barrier");
     console.log(JSON.stringify({ ok: true }));
@@ -3257,7 +3257,7 @@ test("restart resumes quarantine compensation after restoring an overwritten old
         const crashed = require("node:child_process").spawnSync(process.execPath, ["-e", crashScript], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 20_000 });
         assert.equal(crashed.status, 86, crashed.stderr || crashed.stdout);
         assert.equal(fs.readFileSync(payloadPath, "utf8"), "live payload", "the old bytes are in place when the process exits");
-        if (${JSON.stringify(caseVariantOrphan)}) assert.equal(fs.readFileSync(path.join(quarantineDir, ${JSON.stringify(caseVariantOrphan)}), "utf8"), "unrelated case-variant orphan");
+        if (${JSON.stringify(caseVariantOrphan)}) assert.equal(fs.readFileSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, ${JSON.stringify(caseVariantOrphan)}), "utf8"), "unrelated case-variant orphan");
         const recoveryScript = [
           "const assert=require('node:assert/strict'),fs=require('node:fs'),restore=require(" + JSON.stringify(restorePath) + ");",
           "const lockPath=" + JSON.stringify(lockPath) + ",ownerPidPath=" + JSON.stringify(ownerPidPath) + ";",
