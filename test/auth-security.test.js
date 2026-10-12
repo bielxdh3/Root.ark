@@ -637,6 +637,18 @@ async function runLogoutRevocationScenario(t, useDatabase) {
   assert.equal(missingCsrf.status, 403);
   assert.equal((await request(port, "/auth/me", { headers: { authorization: `Bearer ${firstToken}` } })).status, 200);
 
+  const foreignOrigin = await request(port, "/auth/logout", {
+    method: "POST",
+    headers: {
+      cookie: firstSession.cookie,
+      origin: "https://attacker.example",
+      "x-csrf-token": firstSession.csrf,
+    },
+  });
+  assert.equal(foreignOrigin.status, 403);
+  assert.equal(foreignOrigin.headers["set-cookie"], undefined);
+  assert.equal((await request(port, "/auth/me", { headers: { cookie: firstSession.cookie } })).status, 200);
+
   const logout = await request(port, "/auth/logout", {
     method: "POST",
     headers: { cookie: firstSession.cookie, origin, "x-csrf-token": firstSession.csrf },
