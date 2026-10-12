@@ -1,5 +1,22 @@
 # Root.ark Issue Ledger
 
+## Latest verified live-state snapshot after PR #165 — 2026-10-11 (`Root/main` `c5e904fd7625c50c74f40280e8ae329906485d74`)
+
+This snapshot was queried after PR #165 merged. It supersedes the post-#164 snapshot below for the GitHub state and exact-SHA validation recorded here; earlier entries remain historical. The [post-#165 validation record](validation/2026-10-11-rootark-post-165.md) records checks on exact `Root/main` SHA `c5e904f`, current open work, browser evidence, the independent final review, and remaining boundaries. If a later documentation-only commit changes `Root/main`, its own merge SHA and push-triggered checks are a separate point-in-time record and must be reported without rewriting this snapshot.
+
+Issues #63 protected search, #64 native Android, #65 end-to-end Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change protection, #68 operation-scoped capability sharing, and #94 deployment-wide chunk-upload limits remain open and incomplete.
+
+| PR | Live state at this query | Remaining acceptance boundary |
+|---|---|---|
+| #95 | Open, `DIRTY`; head `95d99e4a934384fcfa2101dfc210741cd791a3d1`; four review threads resolved; listed head checks pass but do not establish validation on the current base | Keep open for a fresh-base scoped port. Process-local upload limits do not prove deployment-wide enforcement for #94. |
+| #97 | Open, `CLEAN`; head `a6a33a92cd6902f303254e60031da4bdc04cec04`; five review threads resolved; listed head checks pass but do not complete #66 | Keep open as partial selective-sync work. Metadata-only pagination, selective network transfer, native Files On-Demand, safe eviction around external open-handle writers, and deterministic restart/reconnect remain incomplete. |
+
+PR #164 is merged at `12e511ccc036b00664e0513b872bdabad56aa941` and PR #165 is merged at `c5e904fd7625c50c74f40280e8ae329906485d74`; the four review threads on #164 are resolved and #165 had no review threads. Dependabot alert #1 remains open at medium severity for `GHSA-hp3w-g68c-fv3c` in transitive `sprintf-js`; GitHub reports no first patched version. The full `npm audit` reports three moderate findings and exits nonzero; the configured high-severity gate passes. Exact DOCX preview-path review found no reachable attacker-controlled `sprintf` format string, but the dependency alert remains open and must not be represented as cleared.
+
+Whole restore has durable local pre-images, a coordinator, rollback/restart recovery, and retryable provider reconciliation. It is not globally atomic across quarantine, filesystem, JSON/SQLite, and cloud providers. External writers can bypass application barriers, remote APIs cannot participate in a local transaction, and portable Windows directory-entry power-loss durability remains limited. Root.ark is not an end-to-end Zero-Knowledge runtime and production deployment topology/provider interoperability remain unverified.
+
+The exact-SHA checks, test counts, browser scope, fresh independent review, and security-scan limitation for this query are in the linked validation record. Re-query GitHub before relying on this dated snapshot after later merges.
+
 ## GitHub and application snapshot after PR #164 — 2026-10-11 (Root/main 12e511ccc036b00664e0513b872bdabad56aa941)
 
 This point-in-time query was made after PR #164 merged and before the documentation-only reconciliation containing this snapshot. PR #164 head b1f0b0eb079dfb1badd75183d1bc7cb880e5b070 merged at 12e511ccc036b00664e0513b872bdabad56aa941; its four review threads are resolved. Exact-SHA checks and limits are detailed in the [post-#164 validation record](validation/2026-10-11-rootark-post-164.md). Re-query GitHub for later PR, issue, alert, and check state.
