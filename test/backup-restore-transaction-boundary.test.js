@@ -21,6 +21,157 @@ test("pre-image copy preserves a pre-existing destination when exclusive staging
   } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
 });
 
+test("quarantine pre-image hashes preserve exact names and reject ambiguous folded names", () => {
+  const { buildQuarantinePreimagePayloadHashes } = require("../services/restoreService");
+  const entries = [
+    { type: "file", path: "shared.bin", sha256: "a".repeat(64) },
+    { type: "file", path: "Shared.bin", sha256: "b".repeat(64) },
+  ];
+  const caseSensitiveHashes = buildQuarantinePreimagePayloadHashes(entries, { caseInsensitive: false });
+  assert.equal(caseSensitiveHashes.get("shared.bin"), "a".repeat(64));
+  assert.equal(caseSensitiveHashes.get("Shared.bin"), "b".repeat(64));
+  assert.throws(
+    () => buildQuarantinePreimagePayloadHashes(entries, { caseInsensitive: true }),
+    /ambiguous payload filenames/,
+  );
+});
+
+test("quarantine recovery rejects case-aliased journal names before changing payloads", () => {
+  runFixture(`
+    const transactionId = "11111111-1111-4111-8111-111111111111";
+    const stage = path.join(quarantineDir, ".rootark-quarantine-restore-" + transactionId);
+    const journalPath = path.join(dataDir, ".rootark-quarantine-restore-journal.json");
+    fs.mkdirSync(backupService.BACKUPS_DIR, { recursive: true });
+    const hash = (value) => require("node:crypto").createHash("sha256").update(value).digest("hex");
+    const originalWrite = (pathname, value) => write(pathname, value);
+    for (const duplicateList of ["old", "new"]) {
+      fs.rmSync(stage, { recursive: true, force: true });
+      fs.mkdirSync(stage, { recursive: true });
+      const journal = {
+        version: 1,
+        transactionId,
+        destination: quarantineDir,
+        oldMetadataExists: false,
+        metadataHash: hash("prior metadata"),
+        oldPayloads: duplicateList === "old" ? ["shared.bin", "Shared.bin"] : ["prior.bin"],
+        oldPayloadHashes: duplicateList === "old" ? [hash("old lower"), hash("old upper")] : [hash("prior")],
+        newPayloads: duplicateList === "new"
+          ? [{ filename: "shared.bin", sha256: hash("new lower") }, { filename: "Shared.bin", sha256: hash("new upper") }]
+          : [],
+      };
+      originalWrite(path.join(quarantineDir, "shared.bin"), "destination bytes");
+      if (process.platform !== "win32") originalWrite(path.join(quarantineDir, "Shared.bin"), "case variant destination bytes");
+      if (duplicateList === "old") {
+        originalWrite(path.join(stage, "old-0"), "old lower");
+        originalWrite(path.join(stage, "old-1"), "old upper");
+      } else {
+        originalWrite(path.join(stage, "old-0"), "prior");
+        originalWrite(path.join(stage, "new-0"), "new lower");
+        originalWrite(path.join(stage, "new-1"), "new upper");
+      }
+      originalWrite(journalPath, JSON.stringify(journal));
+      const beforeFiles = new Map();
+      for (const root of [quarantineDir, stage]) {
+        for (const name of fs.readdirSync(root)) {
+          const pathname = path.join(root, name);
+          if (fs.statSync(pathname).isFile()) beforeFiles.set(pathname, fs.readFileSync(pathname));
+        }
+      }
+
+      assert.throws(() => restoreService.recoverQuarantineRestore({ lockHeld: true, caseInsensitive: true }), /journal is invalid/);
+      assert.ok(fs.existsSync(journalPath), "invalid recovery journal remains for manual recovery");
+      for (const [pathname, contents] of beforeFiles) {
+        assert.deepEqual(fs.readFileSync(pathname), contents, duplicateList + ": " + path.basename(pathname) + " must remain unchanged");
+      }
+    }
+    console.log(JSON.stringify({ ok: true }));
+  `);
+});
+
+test("legacy quarantine recovery preserves its journal when a prior payload is missing and unverifiable", () => {
+  runFixture(`
+    const transactionId = "22222222-2222-4222-8222-222222222222";
+    const stage = path.join(quarantineDir, ".rootark-quarantine-restore-" + transactionId);
+    const journalPath = path.join(dataDir, ".rootark-quarantine-restore-journal.json");
+    fs.mkdirSync(backupService.BACKUPS_DIR, { recursive: true });
+    fs.mkdirSync(stage, { recursive: true });
+    const journal = {
+      version: 1,
+      transactionId,
+      destination: quarantineDir,
+      oldMetadataExists: false,
+      metadataHash: require("node:crypto").createHash("sha256").update("prior metadata").digest("hex"),
+      oldPayloads: ["missing.bin"],
+      newPayloads: [],
+    };
+    write(journalPath, JSON.stringify(journal));
+
+    assert.throws(() => restoreService.recoverQuarantineRestore({ lockHeld: true }), /could not verify prior payload/);
+    assert.equal(fs.existsSync(path.join(quarantineDir, "missing.bin")), false, "missing destination remains untouched");
+    assert.equal(fs.existsSync(path.join(stage, "old-0")), false, "no staged prior payload is fabricated or removed");
+    assert.equal(fs.existsSync(journalPath), true, "journal retains the recovery barrier");
+    assert.equal(fs.existsSync(stage), true, "stage remains available for manual recovery");
+    console.log(JSON.stringify({ ok: true }));
+  `);
+});
+
+test("legacy quarantine recovery rejects a non-file staged prior payload", () => {
+  runFixture(`
+    const transactionId = "33333333-3333-4333-8333-333333333333";
+    const stage = path.join(quarantineDir, ".rootark-quarantine-restore-" + transactionId);
+    const journalPath = path.join(dataDir, ".rootark-quarantine-restore-journal.json");
+    fs.mkdirSync(backupService.BACKUPS_DIR, { recursive: true });
+    fs.mkdirSync(path.join(stage, "old-0"), { recursive: true });
+    const journal = {
+      version: 1,
+      transactionId,
+      destination: quarantineDir,
+      oldMetadataExists: false,
+      metadataHash: require("node:crypto").createHash("sha256").update("prior metadata").digest("hex"),
+      oldPayloads: ["prior.bin"],
+      newPayloads: [],
+    };
+    write(journalPath, JSON.stringify(journal));
+
+    assert.throws(() => restoreService.recoverQuarantineRestore({ lockHeld: true }), /not a regular file/);
+    assert.equal(fs.existsSync(path.join(quarantineDir, "prior.bin")), false, "the directory is not installed as a payload");
+    assert.equal(fs.existsSync(journalPath), true, "journal retains the recovery barrier");
+    assert.equal(fs.statSync(path.join(stage, "old-0")).isDirectory(), true, "the staged artifact remains for manual recovery");
+    console.log(JSON.stringify({ ok: true }));
+  `);
+});
+
+test("legacy quarantine recovery rejects a symlinked staged prior payload", { skip: process.platform === "win32" }, () => {
+  runFixture(`
+    const transactionId = "44444444-4444-4444-8444-444444444444";
+    const stage = path.join(quarantineDir, ".rootark-quarantine-restore-" + transactionId);
+    const stagedPayload = path.join(stage, "old-0");
+    const externalPayload = path.join(dataDir, "external-prior.bin");
+    const journalPath = path.join(dataDir, ".rootark-quarantine-restore-journal.json");
+    fs.mkdirSync(backupService.BACKUPS_DIR, { recursive: true });
+    fs.mkdirSync(stage, { recursive: true });
+    write(externalPayload, "external bytes must not be restored as quarantine data");
+    fs.symlinkSync(externalPayload, stagedPayload);
+    const journal = {
+      version: 1,
+      transactionId,
+      destination: quarantineDir,
+      oldMetadataExists: false,
+      metadataHash: require("node:crypto").createHash("sha256").update("prior metadata").digest("hex"),
+      oldPayloads: ["prior.bin"],
+      newPayloads: [],
+    };
+    write(journalPath, JSON.stringify(journal));
+
+    assert.throws(() => restoreService.recoverQuarantineRestore({ lockHeld: true }), /not a regular file/);
+    assert.equal(fs.existsSync(path.join(quarantineDir, "prior.bin")), false, "the symlink is not installed as a payload");
+    assert.equal(fs.readFileSync(externalPayload, "utf8"), "external bytes must not be restored as quarantine data");
+    assert.equal(fs.lstatSync(stagedPayload).isSymbolicLink(), true, "the staged symlink remains for manual recovery");
+    assert.equal(fs.existsSync(journalPath), true, "journal retains the recovery barrier");
+    console.log(JSON.stringify({ ok: true }));
+  `);
+});
+
 test("pre-image copy rejects a source replaced after open but before path validation", () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-preimage-open-race-runtime-"));
   const source = path.join(runtime, "source.bin");
@@ -3047,6 +3198,90 @@ test("restart rolls back crashes inside quarantine journal and commit boundaries
   }
 });
 
+test("restart resumes quarantine compensation after restoring an overwritten old payload", { timeout: 60_000 }, () => {
+  for (const legacyJournal of [false, true]) {
+    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-rollback-retry-"));
+    const quarantineDir = path.join(runtime, "quarantine");
+    const env = {
+      ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(AWS_|GOOGLE_|CLOUD_STORAGE_|S3_|GDRIVE_|DRIVE_)/i.test(key))),
+      NODE_ENV: "test",
+      DB_ENABLED: "false",
+      BACKUP_ENABLED: "true",
+      BACKUP_INCLUDE_UPLOADS: "true",
+      BACKUP_INCLUDE_TEMP: "false",
+      BACKUP_RETENTION_COUNT: "20",
+      ROOTARK_RESTORE_INSTANCE_COUNT: "1",
+      ROOTARK_INSTANCE_ID: `quarantine-rollback-retry-${legacyJournal ? "legacy" : "hashed"}`,
+      UPLOAD_QUARANTINE_DIR: quarantineDir,
+      QUARANTINE_JOURNAL_LEGACY: String(legacyJournal),
+    };
+    const restorePath = path.join(ROOT, "services", "restoreService");
+    const backupPath = path.join(ROOT, "services", "backupService");
+    const payloadPath = path.join(quarantineDir, "shared.bin");
+    const archivedFilename = process.platform === "win32" ? "Shared.bin" : "shared.bin";
+    const liveFilename = "shared.bin";
+    const caseVariantOrphan = process.platform === "win32" ? null : "Shared.bin";
+    const metadataPath = path.join(runtime, "data", "quarantine.json");
+    const lockPath = path.join(runtime, "data", "backups", ".backup.lock");
+    const ownerPidPath = path.join(runtime, "data", "restore-crash-owner.pid");
+    const restoreScript = `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const backupService = require(${JSON.stringify(backupPath)});
+      const restorePath = ${JSON.stringify(restorePath)};
+      const lockPath = path.join(process.cwd(), "data", "backups", ".backup.lock");
+      const ownerPidPath = path.join(process.cwd(), "data", "restore-crash-owner.pid");
+      const payloadPath = path.join(process.env.UPLOAD_QUARANTINE_DIR, "shared.bin");
+      const metadataPath = path.join(process.cwd(), "data", "quarantine.json");
+      const write = (pathname, value) => { fs.mkdirSync(path.dirname(pathname), { recursive: true }); fs.writeFileSync(pathname, value); };
+      fs.mkdirSync(process.env.UPLOAD_QUARANTINE_DIR, { recursive: true });
+      write("data/runtime.json", "archived state");
+      write("data/quarantine.json", JSON.stringify({ items: [{ id: "archived", storedQuarantineFilename: ${JSON.stringify(archivedFilename)} }] }));
+      write(path.join(process.env.UPLOAD_QUARANTINE_DIR, ${JSON.stringify(archivedFilename)}), "archived payload");
+      (async () => {
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        write("data/runtime.json", "live state");
+        write("data/quarantine.json", JSON.stringify({ items: [{ id: "live", storedQuarantineFilename: ${JSON.stringify(liveFilename)} }] }));
+        write(path.join(process.env.UPLOAD_QUARANTINE_DIR, ${JSON.stringify(liveFilename)}), "live payload");
+        if (${JSON.stringify(caseVariantOrphan)}) write(path.join(process.env.UPLOAD_QUARANTINE_DIR, ${JSON.stringify(caseVariantOrphan)}), "unrelated case-variant orphan");
+        const crashScript = [
+          "const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');",
+          "const journalPath=path.join(process.cwd(),'data','.rootark-quarantine-restore-journal.json');",
+          "if(process.env.QUARANTINE_JOURNAL_LEGACY==='true'){const writeFileSync=fs.writeFileSync;fs.writeFileSync=function(pathname,data,...args){const name=path.basename(String(pathname));if(name.startsWith('.rootark-quarantine-restore-journal.json.')&&name.endsWith('.tmp')){const journal=JSON.parse(String(data));delete journal.oldPayloadHashes;data=JSON.stringify(journal);}return writeFileSync.call(this,pathname,data,...args);};}",
+          "fs.writeFileSync(" + JSON.stringify(ownerPidPath) + ",String(process.pid));",
+          "const payloadPath=" + JSON.stringify(payloadPath) + ",restore=require(" + JSON.stringify(restorePath) + ");",
+          "let rollbackStarted=false;const renameSync=fs.renameSync;",
+          "fs.renameSync=function(source,target,...args){const result=renameSync.call(this,source,target,...args);if(rollbackStarted&&path.basename(source)==='old-0'&&target===payloadPath)process.exit(86);return result;};",
+          "restore.restoreBackup(" + JSON.stringify(backup.id) + ",{confirmation:'RESTORE',failureInjector(step){if(step==='restore.quarantine.new-payload.installed'){if(process.env.QUARANTINE_JOURNAL_LEGACY==='true')assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(journalPath,'utf8')),'oldPayloadHashes'),false,'legacy hashes must be absent before compensation');rollbackStarted=true;throw new Error('start compensation')}}}).then(()=>process.exit(0)).catch(()=>process.exit(1));",
+        ].join(" ");
+        const crashed = require("node:child_process").spawnSync(process.execPath, ["-e", crashScript], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 20_000 });
+        assert.equal(crashed.status, 86, crashed.stderr || crashed.stdout);
+        assert.equal(fs.readFileSync(payloadPath, "utf8"), "live payload", "the old bytes are in place when the process exits");
+        if (${JSON.stringify(caseVariantOrphan)}) assert.equal(fs.readFileSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, ${JSON.stringify(caseVariantOrphan)}), "utf8"), "unrelated case-variant orphan");
+        const recoveryScript = [
+          "const assert=require('node:assert/strict'),fs=require('node:fs'),restore=require(" + JSON.stringify(restorePath) + ");",
+          "const lockPath=" + JSON.stringify(lockPath) + ",ownerPidPath=" + JSON.stringify(ownerPidPath) + ";",
+          "const lockRecord=JSON.parse(fs.readFileSync(lockPath,'utf8'));assert.equal(lockRecord.pid,Number(fs.readFileSync(ownerPidPath,'utf8')));",
+          "lockRecord.pid=process.pid;lockRecord.processInstanceId='stale-crashed-owner-instance';fs.writeFileSync(lockPath,JSON.stringify(lockRecord));",
+          "const result=restore.assertNoPendingWholeRestore();assert.equal(result.recovered,true);",
+          "assert.equal(fs.readFileSync('data/runtime.json','utf8'),'live state');",
+          "assert.deepEqual(JSON.parse(fs.readFileSync(" + JSON.stringify(metadataPath) + ",'utf8')),{items:[{id:'live',storedQuarantineFilename:'${liveFilename}'}]});",
+          "assert.equal(fs.readFileSync(" + JSON.stringify(payloadPath) + ",'utf8'),'live payload');",
+          "assert.equal(fs.existsSync('data/.rootark-quarantine-restore-journal.json'),false);",
+          "assert.equal(fs.existsSync('data/.rootark-restore-coordinator.json'),false);",
+        ].join(" ");
+        const recovered = require("node:child_process").spawnSync(process.execPath, ["-e", recoveryScript], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 20_000 });
+        assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+        console.log(JSON.stringify({ ok: true }));
+      })().catch(error => { console.error(error); process.exitCode = 1; });
+    `;
+    try {
+      const interrupted = spawnSync(process.execPath, ["-e", restoreScript], { cwd: runtime, env, encoding: "utf8", timeout: 50_000 });
+      assert.equal(interrupted.status, 0, interrupted.stderr || interrupted.stdout);
+    } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
+  }
+});
+
 test("restore failure after uploads are cleared rolls JSON and uploads back to the pre-restore state", () => {
   runFixture(`
     write(path.join(dataDir, "runtime.json"), "archived-json");
@@ -3742,9 +3977,12 @@ test("process exit after a partial restore data or upload copy recovers the prio
       const path = require("node:path");
       const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
       const target = path.join(process.cwd(), ${JSON.stringify(domain)}, "crash-copy.json");
+      const samePath = (left, right) => process.platform === "win32"
+        ? path.win32.normalize(left).toLowerCase() === path.win32.normalize(right).toLowerCase()
+        : path.resolve(left) === path.resolve(right);
       const originalCopyFileSync = fs.copyFileSync;
       fs.copyFileSync = function (source, destination, ...args) {
-        if (destination === target) {
+        if (samePath(destination, target)) {
           assert.equal(fs.readFileSync(source, "utf8"), ${JSON.stringify(archivedBytes)});
           fs.writeFileSync(destination, ${JSON.stringify(partialBytes)});
           process.exit(71);
@@ -3831,10 +4069,13 @@ test("process exit after the first restored pre-image tree entry keeps the barri
     const path = require("node:path");
     const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
     const target = path.join(process.cwd(), "uploads", "a.txt");
+    const samePath = (left, right) => process.platform === "win32"
+      ? path.win32.normalize(left).toLowerCase() === path.win32.normalize(right).toLowerCase()
+      : path.resolve(left) === path.resolve(right);
     const originalRenameSync = fs.renameSync;
     fs.renameSync = function (source, destination, ...args) {
       const result = originalRenameSync.call(this, source, destination, ...args);
-      if (destination === target && source.endsWith(".restore-preimage")) {
+      if (samePath(destination, target) && source.endsWith(".restore-preimage")) {
         assert.equal(fs.readFileSync(target, "utf8"), "prior tree a");
         process.exit(72);
       }
