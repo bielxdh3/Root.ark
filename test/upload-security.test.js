@@ -325,12 +325,10 @@ const CHUNK_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 test("chunk-session sweep retries leftover parts after a tombstone unlink failure", { timeout: 45_000 }, async (t) => {
   const uploadId = "expired-part-unlink-retry";
-  const failurePath = path.join(os.tmpdir(), `rootark-chunk-unlink-failure-${crypto.randomUUID()}`);
-  const retrySweepPath = path.join(os.tmpdir(), `rootark-chunk-unlink-retry-${crypto.randomUUID()}`);
-  t.after(() => {
-    fs.rmSync(failurePath, { force: true });
-    fs.rmSync(retrySweepPath, { force: true });
-  });
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-chunk-unlink-markers-"));
+  const failurePath = path.join(markerDir, "failure");
+  const retrySweepPath = path.join(markerDir, "retry");
+  t.after(() => fs.rmSync(markerDir, { recursive: true, force: true }));
   const harness = await createHarness(t, {
     envOverrides: { CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS: "60000" },
     chunkSessions: [{
@@ -372,7 +370,7 @@ test("chunk-session sweep retries leftover parts after a tombstone unlink failur
   assert.deepEqual(Object.keys(firstMarker), ["__expiredAt"]);
   assert.equal(fs.existsSync(partPath), true, "part remains after the failed first sweep");
 
-  fs.writeFileSync(retrySweepPath, "run");
+  fs.writeFileSync(retrySweepPath, "run", { flag: "wx", mode: 0o600 });
   const retryDeadline = Date.now() + 3000;
   while (fs.existsSync(partPath) && Date.now() < retryDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(fs.existsSync(partPath), false, "a later sweep removes the leftover part promptly");
@@ -831,13 +829,11 @@ test("chunk-session expiry sweep yields to requests and eventually reaches later
   const sweepCount = 128;
   const sweepDelayMs = 50;
   const lastUploadId = `sweep-yield-${sweepCount - 1}`;
-  const delayEnabledPath = path.join(os.tmpdir(), `rootark-chunk-sweep-delay-${crypto.randomUUID()}`);
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-chunk-sweep-markers-"));
+  const delayEnabledPath = path.join(markerDir, "delay-enabled");
   const sweepStartedPath = `${delayEnabledPath}.started`;
-  t.after(() => {
-    fs.rmSync(delayEnabledPath, { force: true });
-    fs.rmSync(sweepStartedPath, { force: true });
-  });
-  fs.writeFileSync(delayEnabledPath, "enabled");
+  t.after(() => fs.rmSync(markerDir, { recursive: true, force: true }));
+  fs.writeFileSync(delayEnabledPath, "enabled", { flag: "wx", mode: 0o600 });
   const chunkSessions = Array.from({ length: sweepCount }, (_, index) => {
     const uploadId = `sweep-yield-${index}`;
     const isLast = index === sweepCount - 1;
