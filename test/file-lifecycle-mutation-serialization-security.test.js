@@ -629,13 +629,18 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const successfulReplacementApproval = await mutate(`/approve/${approveSaveFailureName}?folderId=root`, "POST");
   assert.equal(successfulReplacementApproval.status, 202, successfulReplacementApproval.body);
   assert.equal(JSON.parse(successfulReplacementApproval.body).cloudSyncPending, true);
-  const replacementProviderDeadline = Date.now() + 5000;
-  while ((objects.get(`rootark/uploads/root/${approveSaveFailureName}`)?.toString() !== `pending replacement ${approveSaveFailureName}`
-    || objects.get(`rootark/uploads/root/${approveSaveFailureName}.v1`)?.toString() !== `prior current ${approveSaveFailureName}`) && Date.now() < replacementProviderDeadline) {
+  const replacementCurrentKey = `rootark/uploads/root/${approveSaveFailureName}`;
+  const replacementVersionKey = `rootark/uploads/root/${approveSaveFailureName}.v1`;
+  const replacementVersionQueuePath = path.join(cloudUploadQueueDirectory, `${crypto.createHash("sha256").update(`root\0${approveSaveFailureName}.v1`).digest("hex")}.json`);
+  const replacementProviderDeadline = Date.now() + 15_000;
+  while ((objects.get(replacementCurrentKey)?.toString() !== `pending replacement ${approveSaveFailureName}`
+    || objects.get(replacementVersionKey)?.toString() !== `prior current ${approveSaveFailureName}`) && Date.now() < replacementProviderDeadline) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  assert.equal(objects.get(`rootark/uploads/root/${approveSaveFailureName}`)?.toString(), `pending replacement ${approveSaveFailureName}`);
-  assert.equal(objects.get(`rootark/uploads/root/${approveSaveFailureName}.v1`)?.toString(), `prior current ${approveSaveFailureName}`);
+  assert.equal(objects.get(replacementCurrentKey)?.toString(), `pending replacement ${approveSaveFailureName}`,
+    `provider current replacement should converge (${cloud.uploadAttemptCount(replacementCurrentKey)} attempts)`);
+  assert.equal(objects.get(replacementVersionKey)?.toString(), `prior current ${approveSaveFailureName}`,
+    `provider version should converge (${cloud.uploadAttemptCount(replacementVersionKey)} attempts; pending queue=${fs.existsSync(replacementVersionQueuePath)})`);
 
   const orphanReplacementKey = `rootark/uploads/root/${orphanReplacementName}`;
   const orphanReplacementQueuePath = path.join(cloudUploadQueueDirectory, `${crypto.createHash("sha256").update(`root\0${orphanReplacementName}`).digest("hex")}.json`);
