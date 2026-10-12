@@ -306,6 +306,7 @@ function legacyChunkMetadata(uploadId, overrides = {}) {
     fileName: "encrypted.txt",
     totalChunks: 2,
     uploadedBy: "uploader",
+    uploaderSessionVersion: 0,
     versionComment: "",
     encryptionLevel: "password",
     expiresInDays: "",
@@ -315,7 +316,73 @@ function legacyChunkMetadata(uploadId, overrides = {}) {
   };
 }
 
+function auditLogs(dir) {
+  const file = path.join(dir, "data", "audit-logs.json");
+  return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")).logs : [];
+}
+
 const CHUNK_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+test("chunk-session sweep retries leftover parts after a tombstone unlink failure", { timeout: 45_000 }, async (t) => {
+  const uploadId = "expired-part-unlink-retry";
+  const failurePath = path.join(os.tmpdir(), `rootark-chunk-unlink-failure-${crypto.randomUUID()}`);
+  const retrySweepPath = path.join(os.tmpdir(), `rootark-chunk-unlink-retry-${crypto.randomUUID()}`);
+  t.after(() => {
+    fs.rmSync(failurePath, { force: true });
+    fs.rmSync(retrySweepPath, { force: true });
+  });
+  const harness = await createHarness(t, {
+    envOverrides: { CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS: "60000" },
+    chunkSessions: [{
+      uploadId,
+      files: {
+        "metadata.json": legacyChunkMetadata(uploadId, { lastActivityAt: new Date(Date.now() - CHUNK_SESSION_TTL_MS - 60_000).toISOString() }),
+        "0.part": "expired plaintext",
+      },
+    }],
+    preloadSource: `
+      const fs = require("node:fs");
+      const unlinkSync = fs.unlinkSync;
+      const originalSetInterval = global.setInterval;
+      let failedOnce = false;
+      fs.unlinkSync = function (target, ...args) {
+        if (!failedOnce && String(target).includes(${JSON.stringify(uploadId)}) && String(target).endsWith("0.part")) {
+          failedOnce = true;
+          fs.writeFileSync(${JSON.stringify(failurePath)}, "injected");
+          throw Object.assign(new Error("injected one-time unlink failure"), { code: "EIO" });
+        }
+        return unlinkSync.call(this, target, ...args);
+      };
+      global.setInterval = (callback, delay, ...args) => {
+        if (String(callback).includes("cleanupExpiredChunkSessions")) {
+          return originalSetInterval((...callbackArgs) => {
+            if (fs.existsSync(${JSON.stringify(retrySweepPath)})) callback(...callbackArgs);
+          }, 25, ...args);
+        }
+        return originalSetInterval(callback, delay, ...args);
+      };
+    `,
+  });
+
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  const metadataPath = path.join(sessionDir, "metadata.json");
+  const partPath = path.join(sessionDir, "0.part");
+  assert.equal(await waitForFile(failurePath), true, "startup sweep injected one unlink failure");
+  const firstMarker = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+  assert.deepEqual(Object.keys(firstMarker), ["__expiredAt"]);
+  assert.equal(fs.existsSync(partPath), true, "part remains after the failed first sweep");
+
+  fs.writeFileSync(retrySweepPath, "run");
+  const retryDeadline = Date.now() + 3000;
+  while (fs.existsSync(partPath) && Date.now() < retryDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(fs.existsSync(partPath), false, "a later sweep removes the leftover part promptly");
+  assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), firstMarker, "retry preserves the original tombstone and its seven-day TTL");
+  const expiryEvents = auditLogs(harness.dir).filter((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId);
+  assert.deepEqual(expiryEvents.map((entry) => ({ result: entry.result, details: entry.details })), [
+    { result: "failure", details: { source: "sweeper" } },
+    { result: "success", details: { source: "sweeper" } },
+  ], "audit records the failed initial deletion and successful retry without payload data");
+});
 
 test("expired chunk sessions are removed at seven days while recent and unsafe sessions are preserved", { timeout: 45_000 }, async (t) => {
   const expiredId = "seven-day-expired";
@@ -471,6 +538,390 @@ test("a different uploader cannot overwrite or finish another user's chunk sessi
   assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part"), "utf8"), originalPart);
   assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "1.part")), false);
   assert.deepEqual(pending(harness.dir), {});
+});
+
+test("case-folded account aliases cannot resume another exact uploader identity", { timeout: 45_000 }, async (t) => {
+  const uploadId = "case-alias-session-owner";
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId, { encryptionLevel: "none" }), "0.part": "original chunk" } }],
+  });
+  const usersPath = path.join(harness.dir, "data", "users.local.json");
+  const users = JSON.parse(fs.readFileSync(usersPath, "utf8"));
+  users.push({ username: "UPLOADER", password: bcrypt.hashSync(harness.password, 10), role: "user", permissions: { upload: true, listFiles: true }, sessionVersion: 0 });
+  fs.writeFileSync(usersPath, JSON.stringify(users));
+  const foldersPath = path.join(harness.dir, "data", "folders.json");
+  const folders = JSON.parse(fs.readFileSync(foldersPath, "utf8"));
+  folders.find((folder) => folder.id === FOLDER_ID).allowedUsers.push("UPLOADER");
+  fs.writeFileSync(foldersPath, JSON.stringify(folders));
+  const alias = await login(harness.port, "UPLOADER", harness.password);
+  const response = await uploadChunk(harness.port, alias, {
+    uploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    bytes: Buffer.from("alias chunk"),
+  });
+  assert.equal(response.status, 409, response.body);
+  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part"), "utf8"), "original chunk");
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "1.part")), false);
+});
+
+test("a recreated uploader account with a newer session generation cannot resume old chunks", { timeout: 45_000 }, async (t) => {
+  const uploadId = "recreated-uploader-generation";
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId, { encryptionLevel: "none" }), "0.part": "old account chunk" } }],
+  });
+  const usersPath = path.join(harness.dir, "data", "users.local.json");
+  const users = JSON.parse(fs.readFileSync(usersPath, "utf8"));
+  users[0].sessionVersion = 1;
+  fs.writeFileSync(usersPath, JSON.stringify(users));
+  const recreatedAccount = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, recreatedAccount, {
+    uploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    bytes: Buffer.from("new account chunk"),
+  });
+  assert.equal(response.status, 409, response.body);
+  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part"), "utf8"), "old account chunk");
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "1.part")), false);
+});
+
+test("unbound pre-migration chunk sessions fail closed and preserve their parts", { timeout: 45_000 }, async (t) => {
+  const uploadId = "legacy-unbound-session";
+  const legacyMetadata = legacyChunkMetadata(uploadId, { encryptionLevel: "none" });
+  delete legacyMetadata.uploaderSessionVersion;
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyMetadata, "0.part": "unbound legacy chunk" } }],
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    bytes: Buffer.from("must not bind legacy data"),
+  });
+  assert.equal(response.status, 409, response.body);
+  const metadata = JSON.parse(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "metadata.json"), "utf8"));
+  assert.equal(metadata.__resumeBlocked, true);
+  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part"), "utf8"), "unbound legacy chunk");
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "1.part")), false);
+});
+
+test("recent unbound legacy sessions retain only validated expiry data and remain non-resumable", { timeout: 45_000 }, async (t) => {
+  const uploadId = "recent-unbound-legacy-session";
+  const legacyMetadata = legacyChunkMetadata(uploadId, { encryptionLevel: "none", lastActivityAt: new Date().toISOString() });
+  delete legacyMetadata.uploaderSessionVersion;
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyMetadata, "0.part": "retain recent legacy chunk" } }],
+  });
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  const metadata = JSON.parse(fs.readFileSync(path.join(sessionDir, "metadata.json"), "utf8"));
+  assert.deepEqual(Object.keys(metadata).sort(), ["__resumeBlocked", "folderId", "lastActivityAt", "totalChunks", "uploadId"]);
+  assert.equal(metadata.__resumeBlocked, true);
+  assert.equal(metadata.uploadId, uploadId);
+  assert.equal(metadata.folderId, FOLDER_ID);
+  assert.equal(fs.readFileSync(path.join(sessionDir, "0.part"), "utf8"), "retain recent legacy chunk");
+
+  const session = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    bytes: Buffer.from("never attach to old data"),
+  });
+  assert.equal(response.status, 409, response.body);
+  assert.equal(fs.readFileSync(path.join(sessionDir, "0.part"), "utf8"), "retain recent legacy chunk");
+  assert.equal(fs.existsSync(path.join(sessionDir, "1.part")), false);
+});
+
+test("startup gives an unbound legacy session without activity a fresh blocked retention window", { timeout: 45_000 }, async (t) => {
+  const uploadId = "startup-unbound-legacy-no-activity";
+  const legacyMetadata = legacyChunkMetadata(uploadId, { encryptionLevel: "none" });
+  delete legacyMetadata.uploaderSessionVersion;
+  delete legacyMetadata.lastActivityAt;
+  const migrationStartedAt = Date.now();
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyMetadata, "0.part": "retain legacy chunk" } }],
+  });
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  const metadata = JSON.parse(fs.readFileSync(path.join(sessionDir, "metadata.json"), "utf8"));
+  assert.deepEqual(Object.keys(metadata).sort(), ["__resumeBlocked", "folderId", "lastActivityAt", "totalChunks", "uploadId"]);
+  assert.equal(metadata.__resumeBlocked, true);
+  assert.ok(Date.parse(metadata.lastActivityAt) >= migrationStartedAt);
+  assert.ok(Date.now() - Date.parse(metadata.lastActivityAt) < 5_000);
+  const session = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    bytes: Buffer.from("cannot resume old data"),
+  });
+  assert.equal(response.status, 409, response.body);
+  assert.equal(fs.readFileSync(path.join(sessionDir, "0.part"), "utf8"), "retain legacy chunk");
+});
+
+test("request blocks and timestamps an unbound legacy session created without activity metadata", { timeout: 45_000 }, async (t) => {
+  const uploadId = "request-unbound-legacy-no-activity";
+  const harness = await createHarness(t);
+  const legacyMetadata = legacyChunkMetadata(uploadId, { encryptionLevel: "none" });
+  delete legacyMetadata.uploaderSessionVersion;
+  delete legacyMetadata.lastActivityAt;
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(path.join(sessionDir, "metadata.json"), JSON.stringify(legacyMetadata));
+  fs.writeFileSync(path.join(sessionDir, "0.part"), "retain runtime legacy chunk");
+  const conversionStartedAt = Date.now();
+  const session = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    bytes: Buffer.from("cannot bind runtime legacy data"),
+  });
+  assert.equal(response.status, 409, response.body);
+  const metadata = JSON.parse(fs.readFileSync(path.join(sessionDir, "metadata.json"), "utf8"));
+  assert.deepEqual(Object.keys(metadata).sort(), ["__resumeBlocked", "folderId", "lastActivityAt", "totalChunks", "uploadId"]);
+  assert.equal(metadata.__resumeBlocked, true);
+  assert.ok(Date.parse(metadata.lastActivityAt) >= conversionStartedAt);
+  assert.ok(Date.now() - Date.parse(metadata.lastActivityAt) < 5_000);
+  assert.equal(fs.readFileSync(path.join(sessionDir, "0.part"), "utf8"), "retain runtime legacy chunk");
+  assert.equal(fs.existsSync(path.join(sessionDir, "1.part")), false);
+});
+
+test("stale unbound legacy sessions expire safely while remaining non-resumable", { timeout: 45_000 }, async (t) => {
+  const uploadId = "stale-unbound-legacy-session";
+  const legacyMetadata = legacyChunkMetadata(uploadId, {
+    encryptionLevel: "none",
+    lastActivityAt: new Date(Date.now() - CHUNK_SESSION_TTL_MS - 60_000).toISOString(),
+  });
+  delete legacyMetadata.uploaderSessionVersion;
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyMetadata, "0.part": "expire stale legacy chunk" } }],
+  });
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  const marker = JSON.parse(fs.readFileSync(path.join(sessionDir, "metadata.json"), "utf8"));
+  assert.deepEqual(Object.keys(marker), ["__expiredAt"]);
+  assert.equal(typeof marker.__expiredAt, "string");
+  assert.equal(fs.existsSync(path.join(sessionDir, "0.part")), false);
+  const event = auditLogs(harness.dir).find((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId);
+  assert.ok(event);
+  assert.deepEqual(event.details, { source: "sweeper" });
+
+  const session = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    bytes: Buffer.from("cannot resume expired data"),
+  });
+  assert.equal(response.status, 409, response.body);
+  assert.equal(fs.existsSync(path.join(sessionDir, "0.part")), false);
+});
+
+test("malformed blocked legacy sessions preserve their data instead of being swept", { timeout: 45_000 }, async (t) => {
+  const uploadId = "malformed-blocked-legacy-session";
+  const malformedBlockedMetadata = {
+    __resumeBlocked: true,
+    uploadId,
+    folderId: FOLDER_ID,
+    totalChunks: 2,
+    lastActivityAt: "not-a-timestamp",
+  };
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId, files: { "metadata.json": malformedBlockedMetadata, "0.part": "preserve malformed blocked data" } }],
+  });
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sessionDir, "metadata.json"), "utf8")), malformedBlockedMetadata);
+  assert.equal(fs.readFileSync(path.join(sessionDir, "0.part"), "utf8"), "preserve malformed blocked data");
+  assert.equal(auditLogs(harness.dir).some((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId), false);
+});
+
+test("periodic expiry audits successful deletion with safe session identifiers", { timeout: 45_000 }, async (t) => {
+  const uploadId = "audited-expired-session";
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId, { lastActivityAt: new Date(Date.now() - CHUNK_SESSION_TTL_MS - 1).toISOString() }), "0.part": "sensitive uploaded bytes" } }],
+  });
+  const events = auditLogs(harness.dir).filter((entry) => entry.eventType === "upload.chunk_session.expired");
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0].actor, { username: "system", role: "system", ip: null, userAgent: null });
+  assert.deepEqual(events[0].target, { type: "chunk_session", id: uploadId, folderId: FOLDER_ID });
+  assert.equal(events[0].action, "expired");
+  assert.equal(events[0].result, "success");
+  assert.deepEqual(events[0].details, { source: "sweeper" });
+  assert.equal(JSON.stringify(events[0]).includes("sensitive uploaded bytes"), false);
+});
+
+test("request-triggered expiry audits successful deletion", { timeout: 45_000 }, async (t) => {
+  const uploadId = "request-audited-expired-session";
+  const harness = await createHarness(t);
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(path.join(sessionDir, "metadata.json"), JSON.stringify(legacyChunkMetadata(uploadId)));
+  fs.writeFileSync(path.join(sessionDir, "0.part"), "request-triggered sensitive bytes");
+  const metadataPath = path.join(sessionDir, "metadata.json");
+  const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+  metadata.lastActivityAt = new Date(Date.now() - CHUNK_SESSION_TTL_MS - 1).toISOString();
+  fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+  const session = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    bytes: Buffer.from("new chunk"),
+  });
+  assert.equal(response.status, 409, response.body);
+  const event = auditLogs(harness.dir).find((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId);
+  assert.ok(event);
+  assert.equal(event.actor.username, "system");
+  assert.deepEqual(event.target, { type: "chunk_session", id: uploadId, folderId: FOLDER_ID });
+  assert.deepEqual(event.details, { source: "request" });
+  assert.equal(JSON.stringify(event).includes("request-triggered sensitive bytes"), false);
+});
+
+test("non-expired sessions are inspected without acquiring durable filesystem locks", { timeout: 45_000 }, async (t) => {
+  const uploadId = "recent-session-no-lock";
+  const harness = await createHarness(t, {
+    envOverrides: { CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS: "1000" },
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId, { lastActivityAt: new Date().toISOString() }), "0.part": "recent chunk" } }],
+  });
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  assert.equal(fs.existsSync(path.join(harness.dir, "data", ".rootark-cloud-file-locks")), false);
+  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part"), "utf8"), "recent chunk");
+});
+
+test("overlapping expiry sweep ticks do not start competing session-lock work", { timeout: 45_000 }, async (t) => {
+  const uploadId = "overlapping-sweep-session";
+  const lockAttemptsPath = path.join(os.tmpdir(), `rootark-chunk-sweep-lock-attempts-${crypto.randomUUID()}.txt`);
+  t.after(() => fs.rmSync(lockAttemptsPath, { force: true }));
+  const lockModulePath = path.join(ROOT, "services", "fileLifecycleLock.js");
+  const harness = await createHarness(t, {
+    waitForReady: false,
+    envOverrides: { CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS: "1000" },
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId, { lastActivityAt: new Date(Date.now() - CHUNK_SESSION_TTL_MS - 60_000).toISOString() }), "0.part": "expired chunk" } }],
+    preloadSource: `
+      const fs = require("node:fs");
+      const lifecycle = require(${JSON.stringify(lockModulePath)});
+      const create = lifecycle.createFileLifecycleLock;
+      lifecycle.createFileLifecycleLock = (options) => {
+        const lock = create(options);
+        const runFolder = lock.runFolder;
+        lock.runFolder = async (...args) => {
+          fs.appendFileSync(${JSON.stringify(lockAttemptsPath)}, "attempt\\n");
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          return runFolder(...args);
+        };
+        return lock;
+      };
+    `,
+  });
+  assert.equal(await waitForFile(lockAttemptsPath), true);
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  assert.equal(fs.readFileSync(lockAttemptsPath, "utf8").trim().split(/\r?\n/).length, 1);
+});
+
+test("chunk-session expiry sweep yields to requests and eventually reaches later sessions", { timeout: 45_000 }, async (t) => {
+  const sweepCount = 128;
+  const sweepDelayMs = 50;
+  const lastUploadId = `sweep-yield-${sweepCount - 1}`;
+  const delayEnabledPath = path.join(os.tmpdir(), `rootark-chunk-sweep-delay-${crypto.randomUUID()}`);
+  const sweepStartedPath = `${delayEnabledPath}.started`;
+  t.after(() => {
+    fs.rmSync(delayEnabledPath, { force: true });
+    fs.rmSync(sweepStartedPath, { force: true });
+  });
+  fs.writeFileSync(delayEnabledPath, "enabled");
+  const chunkSessions = Array.from({ length: sweepCount }, (_, index) => {
+    const uploadId = `sweep-yield-${index}`;
+    const isLast = index === sweepCount - 1;
+    return {
+      uploadId,
+      files: {
+        "metadata.json": legacyChunkMetadata(uploadId, {
+          lastActivityAt: new Date().toISOString(),
+        }),
+        "0.part": isLast ? "late expired chunk" : "recent chunk",
+      },
+    };
+  });
+  const metadataPrefix = path.join(os.tmpdir(), "rootark-upload-safety-");
+  const harness = await createHarness(t, {
+    envOverrides: { CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS: "1000" },
+    waitForReady: false,
+    chunkSessions,
+    preloadSource: `
+      const fs = require("node:fs");
+      const open = fs.promises.open.bind(fs.promises);
+      let metadataOpens = 0;
+      let delayedMetadataOpens = 0;
+      fs.promises.open = async (target, ...args) => {
+        const handle = await open(target, ...args);
+        if (String(target).startsWith(${JSON.stringify(metadataPrefix)}) && String(target).endsWith("metadata.json")) {
+          metadataOpens += 1;
+          if (metadataOpens > ${sweepCount}) {
+            await new Promise((resolve) => setTimeout(resolve, ${sweepDelayMs}));
+            delayedMetadataOpens += 1;
+            if (delayedMetadataOpens === 8) fs.writeFileSync(${JSON.stringify(sweepStartedPath)}, "8 delayed reads complete");
+          }
+        }
+        return handle;
+      };
+    `,
+  });
+
+  assert.equal(await waitForFile(sweepStartedPath), true, "the periodic sweep completed eight delayed metadata reads after startup scanning");
+  const lastMetadataPath = path.join(harness.chunkRoot, FOLDER_ID, lastUploadId, "metadata.json");
+  const lastMetadata = JSON.parse(fs.readFileSync(lastMetadataPath, "utf8"));
+  lastMetadata.lastActivityAt = new Date(Date.now() - CHUNK_SESSION_TTL_MS - 60_000).toISOString();
+  fs.writeFileSync(lastMetadataPath, JSON.stringify(lastMetadata));
+  const finalPartPath = path.join(harness.chunkRoot, FOLDER_ID, lastUploadId, "0.part");
+  assert.equal(fs.existsSync(finalPartPath), true, "the final session remains intact until the periodic sweep runs");
+  const requestStartedAt = Date.now();
+  const response = await request(harness.port, "/login.html");
+  const requestDuration = Date.now() - requestStartedAt;
+  assert.equal(response.status, 200);
+  const remainingSweepDelayMs = (sweepCount - 8) * sweepDelayMs;
+  assert.ok(requestDuration < remainingSweepDelayMs / 2, `normal request took ${requestDuration}ms with at least ${remainingSweepDelayMs}ms of sequential metadata delays still queued`);
+
+  const cleanupDeadline = Date.now() + 10_000;
+  while (fs.existsSync(finalPartPath) && Date.now() < cleanupDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(fs.existsSync(finalPartPath), false, "the sweep eventually processes the last expired session");
+});
+
+test("failed chunk rename does not refresh accepted activity", { timeout: 45_000 }, async (t) => {
+  const uploadId = "failed-chunk-rename-preserves-activity";
+  const previousActivity = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId, { lastActivityAt: previousActivity, totalChunks: 3, originalName: "encrypted.txt", encryptionLevel: "none" }), "0.part": "already accepted chunk" } }],
+    preloadSource: `
+      const fs = require("node:fs");
+      const renameSync = fs.renameSync;
+      fs.renameSync = (source, destination) => {
+        if (String(destination).endsWith(".part")) throw Object.assign(new Error("fixture rename failure"), { code: "EIO" });
+        return renameSync.call(fs, source, destination);
+      };
+    `,
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 3,
+    bytes: Buffer.from("rename must fail"),
+  });
+  assert.equal(response.status, 500, response.body);
+  const metadata = JSON.parse(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "metadata.json"), "utf8"));
+  assert.equal(metadata.lastActivityAt, previousActivity);
+  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part"), "utf8"), "already accepted chunk");
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "1.part")), false);
 });
 
 function filesUnder(dir) {
