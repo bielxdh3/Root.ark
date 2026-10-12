@@ -167,10 +167,15 @@ const MAX_TEXT_PREVIEW_BYTES = 1024 * 1024;
 const CHUNK_UPLOAD_DIR = path.resolve("./temp/.chunks");
 const CHUNK_UPLOAD_INCOMING_DIR = path.join(CHUNK_UPLOAD_DIR, "incoming");
 const CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY = "__resumeBlocked";
+const CHUNK_UPLOAD_EXPIRED_METADATA_KEY = "__expiredAt";
 const CHUNK_UPLOAD_INCOMING_FILE_PATH = Symbol("rootarkChunkUploadIncomingFilePath");
 const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
 const UPLOAD_STAGING_PATH = Symbol("rootarkUploadStagingPath");
 const MAX_UPLOAD_CHUNKS = 2000;
+const CHUNK_UPLOAD_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const CHUNK_UPLOAD_EXPIRED_TOMBSTONE_TTL_MS = CHUNK_UPLOAD_SESSION_TTL_MS;
+const CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS = parseBoundedNumber("CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS", 60 * 1000, 1000, 60 * 60 * 1000);
+let chunkSessionExpirySweepRunning = false;
 const CHUNK_PART_FILENAMES = Array.from({ length: MAX_UPLOAD_CHUNKS }, (_, index) => `${index}.part`);
 const SINGLE_UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
 const UPLOAD_SCAN_ENABLED = parseEnvBoolean(process.env.UPLOAD_SCAN_ENABLED, true);
@@ -462,6 +467,15 @@ function runCloudFolderLifecycleMutation(folderId, work, res, onTimeout) {
   return handleCloudLifecycleMutation(cloudFileLifecycleLock.runFolder(folderId, work), res, "Pasta", onTimeout);
 }
 
+function getChunkUploadSessionLockIdentity(sessionDir) {
+  const resolved = path.resolve(sessionDir);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function runChunkUploadSessionLock(sessionDir, work) {
+  return cloudFileLifecycleLock.runFolder(`chunk-upload:${getChunkUploadSessionLockIdentity(sessionDir)}`, work);
+}
+
 function withChunkUploadSessionLock(handler) {
   return (req, res, next) => {
     const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
@@ -469,9 +483,7 @@ function withChunkUploadSessionLock(handler) {
     const sessionDir = getChunkSessionDir(folderId, uploadId);
     if (!sessionDir) return handler(req, res, next);
 
-    const sessionIdentity = path.resolve(sessionDir);
-    const lockIdentity = process.platform === "win32" ? sessionIdentity.toLowerCase() : sessionIdentity;
-    const operation = cloudFileLifecycleLock.runFolder(`chunk-upload:${lockIdentity}`, () => handler(req, res, next));
+    const operation = runChunkUploadSessionLock(sessionDir, () => handler(req, res, next));
     return handleCloudLifecycleMutation(operation, res, "Upload", () => removeChunkUploadIncomingFile(req.file));
   };
 }
@@ -7142,15 +7154,199 @@ function replaceChunkMetadataFile(sessionDir, metadataPath, metadata) {
   }
 }
 
+function migrateChunkSessionMetadata(sessionDir, metadata) {
+  const migrated = { ...metadata };
+  let changed = false;
+  if (!Object.hasOwn(migrated, "lastActivityAt")) {
+    migrated.lastActivityAt = new Date().toISOString();
+    changed = true;
+  }
+  if (Object.hasOwn(migrated, "password")) {
+    delete migrated.password;
+    changed = true;
+  }
+  if (changed) replaceChunkMetadataFile(sessionDir, path.join(sessionDir, "metadata.json"), migrated);
+  return migrated;
+}
+
+function touchChunkSessionActivity(sessionDir, metadata, now = Date.now()) {
+  const updated = { ...metadata, lastActivityAt: new Date(now).toISOString() };
+  replaceChunkMetadataFile(sessionDir, path.join(sessionDir, "metadata.json"), updated);
+  return updated;
+}
+
+function isChunkSessionExpired(metadata, now = Date.now()) {
+  const lastActivityAt = Date.parse(metadata?.lastActivityAt || "");
+  return Number.isFinite(lastActivityAt) && now - lastActivityAt >= CHUNK_UPLOAD_SESSION_TTL_MS;
+}
+
+function isChunkSessionExpiredMarker(metadata) {
+  return Boolean(
+    metadata &&
+    typeof metadata === "object" &&
+    !Array.isArray(metadata) &&
+    Object.keys(metadata).length === 1 &&
+    typeof metadata[CHUNK_UPLOAD_EXPIRED_METADATA_KEY] === "string" &&
+    Number.isFinite(Date.parse(metadata[CHUNK_UPLOAD_EXPIRED_METADATA_KEY]))
+  );
+}
+
+function isExpiredChunkSessionMarker(metadata, now = Date.now()) {
+  if (!isChunkSessionExpiredMarker(metadata)) return false;
+  return now - Date.parse(metadata[CHUNK_UPLOAD_EXPIRED_METADATA_KEY]) >= CHUNK_UPLOAD_EXPIRED_TOMBSTONE_TTL_MS;
+}
+
+function auditChunkSessionExpiry(uploadId, folderId, result, source) {
+  if (!/^[a-zA-Z0-9_-]{1,80}$/.test(uploadId || "") || !/^[a-zA-Z0-9_-]{1,80}$/.test(folderId || "")) return;
+  auditLog(
+    "upload.chunk_session.expired",
+    { username: "system", role: "system" },
+    { type: "chunk_session", id: uploadId, folderId },
+    "expired",
+    result,
+    { source }
+  );
+}
+
+async function readChunkExpiryCandidate(sessionDir, uploadId, folderId, now = Date.now()) {
+  assertSafeChunkSessionDirectory(sessionDir);
+  const entries = await fs.promises.readdir(sessionDir, { withFileTypes: true });
+  if (!chunkSessionEntriesAreSafe(entries)) return null;
+  const metadataPath = path.join(sessionDir, "metadata.json");
+  let handle;
+  try {
+    handle = await fs.promises.open(metadataPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+
+  let file;
+  try {
+    const descriptorStats = await handle.stat();
+    const pathStats = await fs.promises.lstat(metadataPath);
+    if (
+      !descriptorStats.isFile() ||
+      pathStats.isSymbolicLink() ||
+      !pathStats.isFile() ||
+      descriptorStats.dev !== pathStats.dev ||
+      descriptorStats.ino !== pathStats.ino
+    ) {
+      throw new Error("Chunk-upload metadata changed during read");
+    }
+    const contents = await handle.readFile("utf8");
+    const finalPathStats = await fs.promises.lstat(metadataPath);
+    if (
+      finalPathStats.isSymbolicLink() ||
+      !finalPathStats.isFile() ||
+      descriptorStats.dev !== finalPathStats.dev ||
+      descriptorStats.ino !== finalPathStats.ino
+    ) {
+      throw new Error("Chunk-upload metadata changed during read");
+    }
+    file = { contents, links: descriptorStats.nlink };
+  } finally {
+    await handle.close();
+  }
+  if (!file || file.links !== 1) return null;
+
+  let metadata;
+  try {
+    metadata = JSON.parse(file.contents);
+  } catch {
+    return null;
+  }
+  if (isRetainedBlockedLegacyChunkMetadata(metadata, uploadId, folderId)) {
+    return chunkSessionEntriesAreSafe(entries, metadata.totalChunks) ? metadata : null;
+  }
+  if (!isValidChunkSessionMetadata(metadata, uploadId, folderId)) return null;
+  if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true) return null;
+  if (isChunkSessionExpiredMarker(metadata)) return entries.length > 1 || isExpiredChunkSessionMarker(metadata, now) ? metadata : null;
+  if (!chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return null;
+  return metadata;
+}
+
+function expireChunkSession(sessionDir, metadata, now = Date.now(), source = "sweeper") {
+  const entries = fs.readdirSync(sessionDir, { withFileTypes: true });
+  if (!chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) {
+    auditChunkSessionExpiry(metadata.uploadId, metadata.folderId, "failure", source);
+    return false;
+  }
+  try {
+    const metadataPath = path.join(sessionDir, "metadata.json");
+    replaceChunkMetadataFile(sessionDir, metadataPath, { [CHUNK_UPLOAD_EXPIRED_METADATA_KEY]: new Date(now).toISOString() });
+    for (const entry of entries) {
+      if (entry.name === "metadata.json") continue;
+      fs.unlinkSync(path.join(sessionDir, entry.name));
+    }
+    auditChunkSessionExpiry(metadata.uploadId, metadata.folderId, "success", source);
+    return true;
+  } catch (error) {
+    auditChunkSessionExpiry(metadata.uploadId, metadata.folderId, "failure", source);
+    throw error;
+  }
+}
+
+function cleanupChunkSessionExpiredMarker(sessionDir, metadata, now = Date.now(), source = "sweeper", uploadId = path.basename(sessionDir), folderId = path.basename(path.dirname(sessionDir))) {
+  const entries = fs.readdirSync(sessionDir, { withFileTypes: true });
+  if (!chunkSessionEntriesAreSafe(entries)) return false;
+  const hasLeftoverParts = entries.some((entry) => entry.name !== "metadata.json");
+  for (const entry of entries) {
+    if (entry.name !== "metadata.json") fs.unlinkSync(path.join(sessionDir, entry.name));
+  }
+  if (hasLeftoverParts) auditChunkSessionExpiry(uploadId, folderId, "success", source);
+  const expiredAt = Date.parse(metadata[CHUNK_UPLOAD_EXPIRED_METADATA_KEY]);
+  if (now - expiredAt < CHUNK_UPLOAD_EXPIRED_TOMBSTONE_TTL_MS) return true;
+  assertSafeChunkSessionDirectory(sessionDir);
+  fs.rmSync(sessionDir, { recursive: true, force: false });
+  return true;
+}
+
 function blockChunkSessionResume(sessionDir) {
   const metadataPath = path.join(sessionDir, "metadata.json");
   replaceChunkMetadataFile(sessionDir, metadataPath, { [CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY]: true });
   return { [CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY]: true };
 }
 
+function isRetainedBlockedLegacyChunkMetadata(metadata, expectedUploadId = "", expectedFolderId = "") {
+  const expectedKeys = [CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY, "folderId", "lastActivityAt", "totalChunks", "uploadId"];
+  return Boolean(
+    metadata &&
+    typeof metadata === "object" &&
+    !Array.isArray(metadata) &&
+    metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true &&
+    !Object.hasOwn(metadata, "uploaderSessionVersion") &&
+    Object.keys(metadata).length === expectedKeys.length &&
+    expectedKeys.every((key) => Object.hasOwn(metadata, key)) &&
+    /^[a-zA-Z0-9_-]{1,80}$/.test(metadata.uploadId) &&
+    (!expectedUploadId || metadata.uploadId === expectedUploadId) &&
+    typeof metadata.folderId === "string" &&
+    /^[a-zA-Z0-9_-]{1,80}$/.test(metadata.folderId) &&
+    (!expectedFolderId || metadata.folderId === expectedFolderId) &&
+    Number.isInteger(metadata.totalChunks) &&
+    metadata.totalChunks >= 1 &&
+    metadata.totalChunks <= MAX_UPLOAD_CHUNKS &&
+    typeof metadata.lastActivityAt === "string" &&
+    Number.isFinite(Date.parse(metadata.lastActivityAt))
+  );
+}
+
+function blockLegacyChunkSessionResume(sessionDir, metadata) {
+  const blocked = {
+    [CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY]: true,
+    uploadId: metadata.uploadId,
+    folderId: metadata.folderId,
+    totalChunks: metadata.totalChunks,
+    lastActivityAt: Object.hasOwn(metadata, "lastActivityAt") ? metadata.lastActivityAt : new Date().toISOString(),
+  };
+  replaceChunkMetadataFile(sessionDir, path.join(sessionDir, "metadata.json"), blocked);
+  return blocked;
+}
+
 function isValidChunkSessionMetadata(metadata, expectedUploadId = "", expectedFolderId = "") {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
   if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true) return true;
+  if (isChunkSessionExpiredMarker(metadata)) return true;
   const encryptionLevel = metadata.encryptionLevel === undefined ? "none" : metadata.encryptionLevel;
   return (
     typeof metadata.uploadId === "string" &&
@@ -7168,16 +7364,30 @@ function isValidChunkSessionMetadata(metadata, expectedUploadId = "", expectedFo
     path.basename(metadata.fileName) === metadata.fileName &&
     typeof metadata.uploadedBy === "string" &&
     Boolean(metadata.uploadedBy) &&
+    Number.isSafeInteger(metadata.uploaderSessionVersion) &&
+    metadata.uploaderSessionVersion >= 0 &&
     typeof metadata.versionComment === "string" &&
     metadata.versionComment.length <= 500 &&
     typeof metadata.expiresInDays === "string" &&
     typeof metadata.createdAt === "string" &&
     Number.isFinite(Date.parse(metadata.createdAt)) &&
+    (!Object.hasOwn(metadata, "lastActivityAt") || (typeof metadata.lastActivityAt === "string" && Number.isFinite(Date.parse(metadata.lastActivityAt)))) &&
     Number.isInteger(metadata.totalChunks) &&
     metadata.totalChunks >= 1 &&
     metadata.totalChunks <= MAX_UPLOAD_CHUNKS &&
     ["none", "server-key", "user-key", "password", "dual"].includes(encryptionLevel)
   );
+}
+
+function isValidLegacyChunkSessionMetadata(metadata, expectedUploadId = "", expectedFolderId = "") {
+  if (
+    !metadata ||
+    typeof metadata !== "object" ||
+    Array.isArray(metadata) ||
+    Object.hasOwn(metadata, CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY) ||
+    (Object.hasOwn(metadata, "lastActivityAt") && (typeof metadata.lastActivityAt !== "string" || !Number.isFinite(Date.parse(metadata.lastActivityAt))))
+  ) return false;
+  return isValidChunkSessionMetadata({ ...metadata, uploaderSessionVersion: 0 }, expectedUploadId, expectedFolderId);
 }
 
 function loadChunkMetadata(sessionDir, expectedUploadId, expectedFolderId) {
@@ -7187,27 +7397,27 @@ function loadChunkMetadata(sessionDir, expectedUploadId, expectedFolderId) {
   if (!chunkSessionEntriesAreSafe(entries)) return blockChunkSessionResume(sessionDir);
 
   let file;
+  let metadata;
   try {
     file = readChunkMetadataFile(metadataPath);
+    if (file) metadata = JSON.parse(file.contents);
   } catch {
     return blockChunkSessionResume(sessionDir);
   }
   if (!file) return null;
 
-  let metadata;
-  try {
-    metadata = JSON.parse(file.contents);
-  } catch {
-    return blockChunkSessionResume(sessionDir);
+  if (
+    isValidLegacyChunkSessionMetadata(metadata, expectedUploadId, expectedFolderId) &&
+    !Object.hasOwn(metadata, "uploaderSessionVersion")
+  ) {
+    if (file.links !== 1 || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return blockChunkSessionResume(sessionDir);
+    return blockLegacyChunkSessionResume(sessionDir, metadata);
   }
+
   if (!isValidChunkSessionMetadata(metadata, expectedUploadId, expectedFolderId)) return blockChunkSessionResume(sessionDir);
   if (file.links !== 1 || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return blockChunkSessionResume(sessionDir);
-  if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true) return metadata;
-  if (Object.prototype.hasOwnProperty.call(metadata, "password")) {
-    delete metadata.password;
-    replaceChunkMetadataFile(sessionDir, metadataPath, metadata);
-  }
-  return metadata;
+  if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true || isChunkSessionExpiredMarker(metadata)) return metadata;
+  return migrateChunkSessionMetadata(sessionDir, metadata);
 }
 
 function scrubLegacyChunkPasswords() {
@@ -7241,18 +7451,104 @@ function scrubLegacyChunkPasswords() {
         file = readChunkMetadataFile(metadataPath);
         if (!file) throw new Error("Missing chunk-upload metadata");
         metadata = JSON.parse(file.contents);
+        if (
+          !Object.hasOwn(metadata, "uploaderSessionVersion") &&
+          isValidLegacyChunkSessionMetadata(metadata, sessionEntry.name, folderEntry.name)
+        ) {
+          if (file.links !== 1 || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unsafe chunk-upload session contents");
+          blockLegacyChunkSessionResume(sessionDir, metadata);
+          continue;
+        }
         if (!isValidChunkSessionMetadata(metadata, sessionEntry.name, folderEntry.name)) throw new Error("Invalid chunk-upload metadata");
         if (file.links !== 1 || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unsafe chunk-upload session contents");
       } catch {
         blockChunkSessionResume(sessionDir);
         continue;
       }
-      if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true) continue;
-      if (Object.prototype.hasOwnProperty.call(metadata, "password")) {
-        delete metadata.password;
-        replaceChunkMetadataFile(sessionDir, metadataPath, metadata);
+      if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true || isChunkSessionExpiredMarker(metadata)) continue;
+      migrateChunkSessionMetadata(sessionDir, metadata);
+    }
+  }
+}
+
+async function cleanupExpiredChunkSessions(now = Date.now()) {
+  if (chunkSessionExpirySweepRunning) return;
+  chunkSessionExpirySweepRunning = true;
+
+  try {
+    let folderEntries;
+    try {
+      assertSafeChunkStorageRoot();
+      folderEntries = await fs.promises.readdir(CHUNK_UPLOAD_DIR, { withFileTypes: true });
+    } catch (error) {
+      console.error("[chunk-upload] expiry sweep skipped:", sanitizeLogValue(error.message));
+      return;
+    }
+
+    let scannedEntries = 0;
+    const yieldIfNeeded = async () => {
+      scannedEntries += 1;
+      if (scannedEntries % 32 === 0) await new Promise((resolve) => setImmediate(resolve));
+    };
+    for (const folderEntry of folderEntries) {
+      await yieldIfNeeded();
+      if (folderEntry.name === "incoming" || folderEntry.isSymbolicLink() || !folderEntry.isDirectory() || !/^[a-zA-Z0-9_-]{1,80}$/.test(folderEntry.name)) continue;
+      const folderPath = path.join(CHUNK_UPLOAD_DIR, folderEntry.name);
+      let sessionEntries;
+      try {
+        assertSafeChunkSessionDirectory(folderPath);
+        sessionEntries = await fs.promises.readdir(folderPath, { withFileTypes: true });
+      } catch (error) {
+        console.error("[chunk-upload] expiry sweep preserved unsafe folder:", sanitizeLogValue(error.message));
+        continue;
+      }
+
+      for (const sessionEntry of sessionEntries) {
+        await yieldIfNeeded();
+        if (sessionEntry.isSymbolicLink() || !sessionEntry.isDirectory() || !/^[a-zA-Z0-9_-]{1,80}$/.test(sessionEntry.name)) continue;
+        const sessionDir = path.join(folderPath, sessionEntry.name);
+        try {
+          const candidate = await readChunkExpiryCandidate(sessionDir, sessionEntry.name, folderEntry.name, now);
+          if (!candidate) continue;
+          if (!isChunkSessionExpired(candidate, now) && !isExpiredChunkSessionMarker(candidate, now) && !isChunkSessionExpiredMarker(candidate)) continue;
+          await runChunkUploadSessionLock(sessionDir, () => {
+            try {
+              assertSafeChunkSessionDirectory(sessionDir);
+              const metadata = loadChunkMetadata(sessionDir, sessionEntry.name, folderEntry.name);
+              if (!metadata) return;
+              if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true) {
+                if (!isRetainedBlockedLegacyChunkMetadata(metadata, sessionEntry.name, folderEntry.name) || !isChunkSessionExpired(metadata, now)) return;
+                const currentEntries = fs.readdirSync(sessionDir, { withFileTypes: true });
+                if (!chunkSessionEntriesAreSafe(currentEntries, metadata.totalChunks)) return;
+                assertSafeChunkSessionDirectory(sessionDir);
+                expireChunkSession(sessionDir, metadata, now, "sweeper");
+                return;
+              }
+              if (isChunkSessionExpiredMarker(metadata)) {
+                const currentEntries = fs.readdirSync(sessionDir, { withFileTypes: true });
+                if (!chunkSessionEntriesAreSafe(currentEntries)) return;
+                assertSafeChunkSessionDirectory(sessionDir);
+                cleanupChunkSessionExpiredMarker(sessionDir, metadata, now, "sweeper", sessionEntry.name, folderEntry.name);
+                return;
+              }
+              if (!isChunkSessionExpired(metadata, now)) return;
+              const currentEntries = fs.readdirSync(sessionDir, { withFileTypes: true });
+              if (!chunkSessionEntriesAreSafe(currentEntries, metadata.totalChunks)) return;
+              assertSafeChunkSessionDirectory(sessionDir);
+              expireChunkSession(sessionDir, metadata, now, "sweeper");
+            } catch (error) {
+              console.error("[chunk-upload] expiry sweep preserved session:", sanitizeLogValue(error.message));
+            }
+          });
+        } catch (error) {
+          if (error.code !== "FILE_LIFECYCLE_LOCK_TIMEOUT") {
+            console.error("[chunk-upload] expiry sweep could not lock session:", sanitizeLogValue(error.message));
+          }
+        }
       }
     }
+  } finally {
+    chunkSessionExpirySweepRunning = false;
   }
 }
 
@@ -7348,13 +7644,32 @@ app.post("/upload-chunk", authenticate, uploadChunkRateLimit, requirePermission(
       return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
     }
 
+    if (isChunkSessionExpiredMarker(metadata)) {
+      cleanupChunkSessionExpiredMarker(sessionDir, metadata, Date.now(), "request", uploadId, folderId);
+      removeChunkUploadIncomingFile(req.file);
+      return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
+    }
+
+    if (metadata && (metadata.uploadedBy !== req.user?.username || metadata.uploaderSessionVersion !== req.user?.sessionVersion)) {
+      removeChunkUploadIncomingFile(req.file);
+      return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
+    }
+
+    if (metadata && isChunkSessionExpired(metadata)) {
+      expireChunkSession(sessionDir, metadata, Date.now(), "request");
+      removeChunkUploadIncomingFile(req.file);
+      return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
+    }
+
     if (!metadata) {
-      if (fs.readdirSync(sessionDir, { withFileTypes: true }).length) {
+      const existingEntries = fs.readdirSync(sessionDir, { withFileTypes: true });
+      if (existingEntries.length) {
         blockChunkSessionResume(sessionDir);
         removeChunkUploadIncomingFile(req.file);
         return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
       }
       const fileName = getAvailableUploadFileName(originalName, folderId, true);
+      const createdAt = new Date().toISOString();
       metadata = {
         uploadId,
         folderId,
@@ -7362,10 +7677,12 @@ app.post("/upload-chunk", authenticate, uploadChunkRateLimit, requirePermission(
         fileName,
         totalChunks,
         uploadedBy: req.user.username,
+        uploaderSessionVersion: req.user.sessionVersion,
         versionComment: typeof req.body.versionComment === "string" ? req.body.versionComment.slice(0, 500) : "",
         encryptionLevel: requestedEncryptionLevel,
         expiresInDays: typeof req.body.expiresInDays === "string" ? req.body.expiresInDays : "",
-        createdAt: new Date().toISOString(),
+        createdAt,
+        lastActivityAt: createdAt,
       };
       saveChunkMetadata(sessionDir, metadata);
     }
@@ -7385,6 +7702,7 @@ app.post("/upload-chunk", authenticate, uploadChunkRateLimit, requirePermission(
     const chunkPath = path.join(sessionDir, CHUNK_PART_FILENAMES[chunkIndex]);
     fs.rmSync(chunkPath, { force: true });
     fs.renameSync(incomingChunkPath, chunkPath);
+    metadata = touchChunkSessionActivity(sessionDir, metadata);
 
     if (!hasAllChunks(sessionDir, totalChunks)) {
       return res.json({
@@ -10349,6 +10667,11 @@ setInterval(() => {
 }, 60 * 60 * 1000);
 setInterval(() => { void processPendingCloudTrashItems(); }, 60 * 1000);
 setInterval(() => { void processPendingCloudRestoreSync().catch(() => {}); }, 60 * 1000);
+setInterval(() => {
+  void restoreRequestGate.run(() => cleanupExpiredChunkSessions()).catch((error) => {
+    console.error("[chunk-upload] expiry sweep failed:", sanitizeLogValue(error.message));
+  });
+}, CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS);
 setInterval(() => { void restoreRequestGate.run(() => cleanupIncomingUploads()); }, 60 * 1000);
 const listenForRequests = () => {
   server.listen(PORT, () => {
@@ -10380,6 +10703,7 @@ void (async () => {
   if (typeof cloudStorage.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
   if (!startupRestoreCoordinator) {
     await restoreService.reconcileUnknownProviderInventory();
+    await cleanupExpiredChunkSessions();
     void processPendingCloudRestoreSync().catch(() => {});
   }
   listenForRequests();
