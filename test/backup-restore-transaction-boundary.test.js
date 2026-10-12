@@ -3700,6 +3700,183 @@ test("post-migration startup failure keeps the whole-restore barrier until a lat
   }
 });
 
+test("process exit after a partial restore data or upload copy recovers the prior bytes", { timeout: 60_000 }, () => {
+  for (const domain of ["data", "uploads"]) {
+    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), `rootark-restore-${domain}-copy-crash-`));
+    const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-copy-crash-quarantine-"));
+    const target = path.join(runtime, domain, "crash-copy.json");
+    const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
+    const backupIdPath = path.join(runtime, "data", "restore-backup-id.txt");
+    const archivedBytes = `${domain} bytes from selected backup`;
+    const priorBytes = `${domain} bytes before restore`;
+    const partialBytes = archivedBytes.slice(0, Math.ceil(archivedBytes.length / 2));
+    const env = {
+      ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(AWS_|GOOGLE_|CLOUD_STORAGE_|S3_|GDRIVE_|DRIVE_)/i.test(key))),
+      NODE_ENV: "test",
+      DB_ENABLED: "false",
+      BACKUP_ENABLED: "true",
+      BACKUP_INCLUDE_UPLOADS: "true",
+      BACKUP_INCLUDE_TEMP: "false",
+      BACKUP_RETENTION_COUNT: "20",
+      ROOTARK_RESTORE_INSTANCE_COUNT: "1",
+      ROOTARK_INSTANCE_ID: `copy-crash-${domain}`,
+      UPLOAD_QUARANTINE_DIR: quarantineDir,
+    };
+    const setupScript = `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const target = path.join(process.cwd(), ${JSON.stringify(domain)}, "crash-copy.json");
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.mkdirSync(path.join(process.cwd(), "data"), { recursive: true });
+      fs.writeFileSync(target, ${JSON.stringify(archivedBytes)});
+      (async () => {
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        fs.writeFileSync(${JSON.stringify(backupIdPath)}, backup.id);
+        fs.writeFileSync(target, ${JSON.stringify(priorBytes)});
+      })().catch((error) => { console.error(error); process.exit(1); });
+    `;
+    const crashScript = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const target = path.join(process.cwd(), ${JSON.stringify(domain)}, "crash-copy.json");
+      const originalCopyFileSync = fs.copyFileSync;
+      fs.copyFileSync = function (source, destination, ...args) {
+        if (destination === target) {
+          assert.equal(fs.readFileSync(source, "utf8"), ${JSON.stringify(archivedBytes)});
+          fs.writeFileSync(destination, ${JSON.stringify(partialBytes)});
+          process.exit(71);
+        }
+        return originalCopyFileSync.call(this, source, destination, ...args);
+      };
+      restoreService.restoreBackup(fs.readFileSync(${JSON.stringify(backupIdPath)}, "utf8"), { confirmation: "RESTORE" })
+        .then(() => process.exit(0), (error) => { console.error(error); process.exit(1); });
+    `;
+    const recoveryScript = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const target = path.join(process.cwd(), ${JSON.stringify(domain)}, "crash-copy.json");
+      const coordinatorPath = path.join(process.cwd(), "data", ".rootark-restore-coordinator.json");
+      const result = restoreService.assertNoPendingWholeRestore();
+      assert.equal(result.recovered, true);
+      assert.equal(fs.readFileSync(target, "utf8"), ${JSON.stringify(priorBytes)});
+      assert.equal(fs.existsSync(coordinatorPath), false, "successful startup recovery clears the restore barrier");
+    `;
+    try {
+      const setup = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+      assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+      const crashedCopy = spawnSync(process.execPath, ["-e", crashScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+      assert.equal(crashedCopy.status, 71, crashedCopy.stderr || crashedCopy.stdout);
+      assert.equal(fs.readFileSync(target, "utf8"), partialBytes, "the child must terminate after writing only a prefix");
+      assert.equal(JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).phase, "prepared");
+      const recovered = spawnSync(process.execPath, ["-e", recoveryScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+      assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+      assert.equal(fs.existsSync(coordinatorPath), false);
+    } finally {
+      fs.rmSync(runtime, { recursive: true, force: true });
+      fs.rmSync(quarantineDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("process exit after the first restored pre-image tree entry keeps the barrier for restart recovery", { timeout: 60_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-tree-rollback-crash-"));
+  const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-tree-crash-quarantine-"));
+  const uploadsDir = path.join(runtime, "uploads");
+  const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
+  const backupIdPath = path.join(runtime, "data", "restore-backup-id.txt");
+  const env = {
+    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(AWS_|GOOGLE_|CLOUD_STORAGE_|S3_|GDRIVE_|DRIVE_)/i.test(key))),
+    NODE_ENV: "test",
+    DB_ENABLED: "false",
+    BACKUP_ENABLED: "true",
+    BACKUP_INCLUDE_UPLOADS: "true",
+    BACKUP_INCLUDE_TEMP: "false",
+    BACKUP_RETENTION_COUNT: "20",
+    ROOTARK_RESTORE_INSTANCE_COUNT: "1",
+    ROOTARK_INSTANCE_ID: "tree-rollback-crash",
+    UPLOAD_QUARANTINE_DIR: quarantineDir,
+  };
+  const setupScript = `
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+    const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+    const uploadsDir = path.join(process.cwd(), "uploads");
+    const write = (pathname, value) => { fs.mkdirSync(path.dirname(pathname), { recursive: true }); fs.writeFileSync(pathname, value); };
+    fs.mkdirSync(path.join(process.cwd(), "data"), { recursive: true });
+    write(path.join(uploadsDir, "a.txt"), "selected archive a");
+    write(path.join(uploadsDir, "selected-only.txt"), "selected archive only");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      fs.writeFileSync(${JSON.stringify(backupIdPath)}, backup.id);
+      fs.rmSync(uploadsDir, { recursive: true, force: true });
+      write(path.join(uploadsDir, "a.txt"), "prior tree a");
+      write(path.join(uploadsDir, "nested", "b.txt"), "prior tree nested b");
+      await assert.rejects(restoreService.restoreBackup(backup.id, {
+        confirmation: "RESTORE",
+        failureInjector(step) { if (step === "restore.uploads.copied") throw new Error("injected rollback entry failure"); },
+      }), /injected rollback entry failure/);
+      assert.equal(JSON.parse(fs.readFileSync(path.join(process.cwd(), "data", ".rootark-restore-coordinator.json"), "utf8")).phase, "prepared");
+    })().catch((error) => { console.error(error); process.exit(1); });
+  `;
+  const crashScript = `
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+    const target = path.join(process.cwd(), "uploads", "a.txt");
+    const originalRenameSync = fs.renameSync;
+    fs.renameSync = function (source, destination, ...args) {
+      const result = originalRenameSync.call(this, source, destination, ...args);
+      if (destination === target && source.endsWith(".restore-preimage")) {
+        assert.equal(fs.readFileSync(target, "utf8"), "prior tree a");
+        process.exit(72);
+      }
+      return result;
+    };
+    restoreService.assertNoPendingWholeRestore();
+    process.exit(0);
+  `;
+  const recoveryScript = `
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+    const uploadsDir = path.join(process.cwd(), "uploads");
+    const result = restoreService.assertNoPendingWholeRestore();
+    assert.equal(result.recovered, true);
+    assert.deepEqual(fs.readdirSync(uploadsDir).sort(), ["a.txt", "nested"]);
+    assert.equal(fs.readFileSync(path.join(uploadsDir, "a.txt"), "utf8"), "prior tree a");
+    assert.deepEqual(fs.readdirSync(path.join(uploadsDir, "nested")), ["b.txt"]);
+    assert.equal(fs.readFileSync(path.join(uploadsDir, "nested", "b.txt"), "utf8"), "prior tree nested b");
+    assert.equal(fs.existsSync(path.join(uploadsDir, "selected-only.txt")), false);
+    assert.equal(fs.existsSync(path.join(process.cwd(), "data", ".rootark-restore-coordinator.json")), false, "successful recovery clears the retained barrier");
+  `;
+  try {
+    const setup = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+    const crashedRollback = spawnSync(process.execPath, ["-e", crashScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(crashedRollback.status, 72, crashedRollback.stderr || crashedRollback.stdout);
+    const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
+    assert.equal(coordinator.phase, "rolling_back");
+    assert.equal(coordinator.rollbackDomain, "uploads-tree");
+    assert.equal(fs.readFileSync(path.join(uploadsDir, "a.txt"), "utf8"), "prior tree a");
+    assert.equal(fs.existsSync(path.join(uploadsDir, "nested")), false, "the process must stop after only the first pre-image file is restored");
+    const recovered = spawnSync(process.execPath, ["-e", recoveryScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+    assert.equal(fs.existsSync(coordinatorPath), false);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+    fs.rmSync(quarantineDir, { recursive: true, force: true });
+  }
+});
+
 test("successful migrations before listener acknowledgement preserve the restore barrier and provider queue across restart", { timeout: 60_000 }, () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-migration-before-ack-"));
   const databasePath = path.join(runtime, "data", "rootark.sqlite");
