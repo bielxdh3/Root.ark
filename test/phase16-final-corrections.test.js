@@ -179,6 +179,47 @@ test("sync object history retains encrypted versions and tombstones across resta
   }
 });
 
+test("sync journal retries transient Windows rename EPERM without replacing committed state on exhaustion", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-journal-rename-retry-"));
+  const filePath = path.join(dir, "journal.json");
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const journal = await new SyncJournal(filePath).open();
+  const originalRename = fsp.rename;
+  const renameCalls = [];
+  let failEveryRename = false;
+  if (process.platform === "win32") {
+    fsp.rename = async (source, destination) => {
+      renameCalls.push([source, destination]);
+      if (renameCalls.length === 1 || failEveryRename) {
+        const error = new Error("injected Windows journal rename EPERM");
+        error.code = "EPERM";
+        throw error;
+      }
+      return originalRename(source, destination);
+    };
+  }
+  try {
+    await journal.enqueue({ operationId: "journal-retry-ok", kind: "put", path: "retry.txt" });
+    assert.deepEqual(journal.pending().map((operation) => operation.operationId), ["journal-retry-ok"]);
+    if (process.platform === "win32") {
+      assert.equal(renameCalls.length, 2);
+      assert.deepEqual(renameCalls[1], renameCalls[0]);
+      const committedState = await fsp.readFile(filePath, "utf8");
+      const callsBeforePermanentFailure = renameCalls.length;
+      failEveryRename = true;
+      await assert.rejects(journal.enqueue({ operationId: "journal-retry-failed", kind: "put", path: "failed.txt" }), { code: "EPERM" });
+      const failedCalls = renameCalls.slice(callsBeforePermanentFailure);
+      assert.equal(failedCalls.length, 3);
+      assert.ok(failedCalls.every(([source, destination]) => source === failedCalls[0][0] && destination === filePath));
+      assert.equal(await fsp.readFile(filePath, "utf8"), committedState);
+      assert.deepEqual(journal.pending().map((operation) => operation.operationId), ["journal-retry-ok"]);
+      assert.deepEqual((await fsp.readdir(dir)).filter((name) => name.startsWith("journal.json.tmp-")), []);
+    }
+  } finally {
+    if (process.platform === "win32") fsp.rename = originalRename;
+  }
+});
+
 test("WebDAV mutation journal translates into v2 move and reaches a second client", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-sync-"));
   const rootA = path.join(dir, "a");
