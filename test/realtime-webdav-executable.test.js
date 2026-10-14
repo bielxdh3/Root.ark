@@ -313,3 +313,65 @@ test("configured WebSocket rate boundary is enforced at runtime", { timeout: 20_
   socket.send(JSON.stringify({ event: "ping" }));
   assert.equal(await closed, 1008);
 });
+
+test("file rename notifies active workspace sessions over WebSocket", { timeout: 45_000 }, async (t) => {
+  const dir = createWebDavFixture("rootark-rename-realtime-");
+  const port = await freePort();
+  const oldPath = path.join(dir, "uploads", "before.txt");
+  const newPath = path.join(dir, "uploads", "after.txt");
+  fs.writeFileSync(oldPath, "disposable realtime fixture");
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port, { WEBDAV_ENABLED: "false" }), stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  let socket;
+  t.after(async () => {
+    socket?.terminate();
+    await stop(child);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  try {
+    await ready(port);
+  } catch (error) {
+    throw new Error(`${error.message}: ${stderr}`);
+  }
+
+  const loginBody = JSON.stringify({ username: "agent", password: "password" });
+  const login = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(loginBody) }, body: loginBody });
+  assert.equal(login.status, 200);
+  const cookies = login.headers["set-cookie"].map((item) => item.split(";", 1)[0]);
+  const cookie = cookies.join("; ");
+  const csrf = cookies.find((item) => item.startsWith("rootark_csrf=")).slice("rootark_csrf=".length);
+  const origin = `http://127.0.0.1:${port}`;
+  socket = new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { cookie }, origin });
+  await new Promise((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  let onMessage;
+  const changedEvent = new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      socket.off("message", onMessage);
+      resolve(null);
+    }, 30_000);
+    onMessage = (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.event !== "data:changed") return;
+      clearTimeout(timer);
+      socket.off("message", onMessage);
+      resolve(message);
+    };
+    socket.on("message", onMessage);
+  });
+
+  const renameBody = JSON.stringify({ oldName: "before.txt", newName: "after.txt", folderId: "root" });
+  const rename = await request(port, "/rename", {
+    method: "PUT",
+    headers: { cookie, origin, "x-csrf-token": csrf, "content-type": "application/json", "content-length": Buffer.byteLength(renameBody) },
+    body: renameBody,
+  });
+  assert.equal(rename.status, 200, rename.body);
+  const message = await changedEvent;
+  assert.ok(message, "successful file rename should trigger a realtime workspace refresh");
+  assert.equal(message.event, "data:changed");
+  assert.ok(fs.existsSync(newPath));
+});
