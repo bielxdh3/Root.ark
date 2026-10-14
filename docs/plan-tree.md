@@ -1,11 +1,11 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Latest live GitHub and application/security reconciliation: 2026-10-11 after PR #165; `Root/main` SHA `c5e904fd7625c50c74f40280e8ae329906485d74`.
+Latest live GitHub and application/security reconciliation: 2026-10-14 after PR #174; `Root/main` SHA `35cb76228729a0271d4661ebec293a50c7f863df`.
 
 Repository: bielxdh3/root.ark
 
-PR #164 merged the restore authorization and cancellation recovery corrections at `12e511ccc036b00664e0513b872bdabad56aa941`; PR #165 reconciled the post-#164 documentation. The exact merged `Root/main` SHA after PR #165 is `c5e904fd7625c50c74f40280e8ae329906485d74`. Its push-triggered Security Regression, CodeQL, Dependency Review, Pages, and local release gate passed. See the [post-#165 validation record](validation/2026-10-11-rootark-post-165.md), [issue ledger](issue-ledger.md), and [post-#164 correction record](validation/2026-10-11-rootark-post-164.md) for live issue/PR state, test counts, browser scope, restore limits, and remaining acceptance boundaries. The older snapshots below preserve their original evidence dates.
+PR #170 merged the selected seven-day inactive chunk-session expiry, PR #171 merged quarantine rollback recovery, and PR #174 added a test-only realtime rename notification regression at `35cb76228729a0271d4661ebec293a50c7f863df`. Exact-SHA Security Regression passed on Ubuntu and Windows; Dependency Review, CodeQL, and Pages succeeded. See the [post-#174 validation record](validation/2026-10-14-rootark-post-174.md) and [issue ledger](issue-ledger.md) for exact checks, live issue/PR state, restore limits, and remaining acceptance boundaries. The post-#171, post-#169, and earlier snapshots below preserve their original evidence dates.
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Re-query GitHub before relying on issue, PR, or check state after this snapshot.
 
@@ -62,7 +62,7 @@ A feature is not `[DONE]` merely because files, routes, UI, or documentation exi
 5. GitHub issues for executable scope.
 6. Historical chat context only as input, never as proof.
 
-The issue ledger begins with the post-#165 GitHub snapshot and labels later changes as point-in-time evidence. Re-query GitHub for live state after that snapshot; older dated reconciliations below remain historical evidence.
+The issue ledger begins with the post-#174 GitHub snapshot and labels later changes as point-in-time evidence. Re-query GitHub for live state after that snapshot; older dated reconciliations below remain historical evidence.
 
 Master Phase 0-16 ledger and independent local blocker taxonomy: `docs/issue-ledger.md`. The governing continuation supplies the original meanings for all phases; local statuses and evidence are reconciled there without converting design or historical evidence into acceptance.
 

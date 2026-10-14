@@ -1,6 +1,26 @@
 # Root.ark Issue Ledger
 
-## Latest verified live-state snapshot after PR #165 — 2026-10-11 (`Root/main` `c5e904fd7625c50c74f40280e8ae329906485d74`)
+## GitHub snapshot after test-only PR #174 — 2026-10-14 (`Root/main` `35cb76228729a0271d4661ebec293a50c7f863df`)
+
+This point-in-time snapshot records the live state after PRs #170, #171, and #174 merged and before this documentation-only reconciliation is published. It supersedes the post-#171 snapshot below for GitHub state and application validation. PR #170 implements the user-selected seven-day inactive chunk-session expiry; PR #171 adds quarantine rollback recovery; PR #174 adds a test-only realtime rename notification regression. Exact-SHA checks are recorded in the [post-#174 validation snapshot](validation/2026-10-14-rootark-post-174.md). The documentation PR that carries this snapshot is intentionally excluded from its pre-publication PR inventory; it will require its own exact-push CI, and these application checks do not transfer to that SHA.
+
+Issues #63 protected search, #64 native Android, #65 end-to-end Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change protection, #68 operation-scoped capability sharing, and #94 deployment-wide chunk-upload limits remain open and incomplete.
+
+| PR | Live state at this query | Remaining acceptance boundary |
+|---|---|---|
+| #95 | Open | Keep open while deployment-wide chunk-upload enforcement remains unresolved; process-local limits do not establish a deployment-wide budget. |
+| #97 | Open | Keep open as incomplete selective-sync work; acceptance gaps remain. |
+| #170 | Merge commit `bd9656c792735031b6cb933792fefc340d59961c`; this is also the post-#170 application SHA | Implements the user-selected seven-day inactive chunk-session expiry. |
+| #171 | Merge commit `d0edfb52732e0c38186a480efd9afa54b89f9868`, included in the later post-#170 application SHA `bd9656c792735031b6cb933792fefc340d59961c` | Adds quarantine rollback recovery; this does not establish global restore atomicity. |
+| #174 | Merged into `Root/main` at `35cb76228729a0271d4661ebec293a50c7f863df` | Adds the test-only realtime rename notification regression; no product runtime behavior changed. |
+| #172 | Open; Dependabot checks green | Remains open. |
+| #173 | Open; Dependabot checks green | Remains open. |
+
+Dependabot alert #1 remains open at moderate severity for `GHSA-hp3w-g68c-fv3c` in transitive `sprintf-js`; no patched version is available. The green checks on PRs #172 and #173 do not close this separate alert.
+
+Whole restore includes quarantine rollback recovery but is not globally atomic across quarantine, filesystem, JSON/SQLite, and cloud APIs. External writers, provider APIs outside local transactions, and portable Windows directory-entry power-loss durability remain outside the guarantee. Root.ark is not an end-to-end Zero-Knowledge runtime or production-ready. See the linked validation record for exact checks and remaining boundaries.
+
+## Historical verified live-state snapshot after PR #165 — 2026-10-11 (`Root/main` `c5e904fd7625c50c74f40280e8ae329906485d74`)
 
 This snapshot was queried after PR #165 merged. It supersedes the post-#164 snapshot below for the GitHub state and exact-SHA validation recorded here; earlier entries remain historical. The [post-#165 validation record](validation/2026-10-11-rootark-post-165.md) records checks on exact `Root/main` SHA `c5e904f`, current open work, browser evidence, the independent final review, and remaining boundaries. If a later documentation-only commit changes `Root/main`, its own merge SHA and push-triggered checks are a separate point-in-time record and must be reported without rewriting this snapshot.
 
