@@ -279,13 +279,28 @@ test("WebDAV MOVE persists remote intent before provider effects", { timeout: 90
     try {
       first = await startServer(f.dir, { FAKE_PROVIDER_MODE: "crash-after-upload" });
       try { await move(f.dir, first.port); } catch {}
-      await waitFor(() => readJournal(f.dir)?.cloud?.state === "destination_upload_uncertain");
+      await waitFor(() => {
+        const journal = readJournal(f.dir);
+        let providerState;
+        try { providerState = JSON.parse(fs.readFileSync(path.join(f.dir, "provider-state.json"), "utf8")); } catch { return false; }
+        const uploadCalls = calls(f.dir).filter((entry) => entry.operation === "upload");
+        return journal?.cloud?.state === "destination_upload_uncertain" && providerState.destination === true && uploadCalls.length === 1;
+      });
       await stop(first.child);
       const journalPath = journalPaths(f.dir);
       assert.ok(journalPath);
       const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
       assert.equal(journal.cloud.state, "destination_upload_uncertain");
-      assert.equal(fs.readFileSync(f.target, "utf8"), "source bytes");
+      const preRestartEvidence = {
+        phase: journal.phase,
+        pendingOperation: journal.pendingOperation,
+        completedOperations: journal.completedOperations,
+        uploads: fs.readdirSync(path.join(f.dir, "uploads")),
+      };
+      assert.equal(journal.phase, "cloud_destination_upload_uncertain", JSON.stringify(preRestartEvidence));
+      assert.ok(journal.completedOperations.includes("replacement.install"), JSON.stringify(preRestartEvidence));
+      assert.equal(fs.existsSync(f.target), true, JSON.stringify(preRestartEvidence));
+      assert.equal(fs.readFileSync(f.target, "utf8"), "source bytes", JSON.stringify(preRestartEvidence));
       assert.equal(fs.existsSync(f.source), false);
       second = await startServer(f.dir);
       await waitFor(() => !journalPaths(f.dir)).catch((error) => { throw new Error(`${error.message}; stderr=${second.stderr()}`); });
