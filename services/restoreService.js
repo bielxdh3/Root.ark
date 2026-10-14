@@ -32,24 +32,66 @@ function setCloudStorage(storage) {
 }
 
 function writeWholeRestoreCoordinator(coordinator) {
-  fs.mkdirSync(path.dirname(WHOLE_RESTORE_COORDINATOR_PATH), { recursive: true });
+  const directory = path.dirname(WHOLE_RESTORE_COORDINATOR_PATH);
+  fs.mkdirSync(directory, { recursive: true });
+  let previousBytes = null;
+  try { previousBytes = fs.readFileSync(WHOLE_RESTORE_COORDINATOR_PATH); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
   const persisted = {
     ...coordinator,
     directorySync: process.platform === "win32" ? "unsupported" : "fsync",
   };
   const temporary = `${WHOLE_RESTORE_COORDINATOR_PATH}.${crypto.randomUUID()}.tmp`;
-  const fd = fs.openSync(temporary, "wx", 0o600);
+  let renamed = false;
   try {
-    fs.writeFileSync(fd, `${JSON.stringify(persisted, null, 2)}\n`);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  try {
+    const fd = fs.openSync(temporary, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, `${JSON.stringify(persisted, null, 2)}\n`);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
     fs.renameSync(temporary, WHOLE_RESTORE_COORDINATOR_PATH);
-    fsyncCoordinatorDirectory(path.dirname(WHOLE_RESTORE_COORDINATOR_PATH));
+    renamed = true;
+    fsyncCoordinatorDirectory(directory);
   } catch (error) {
-    fs.rmSync(temporary, { force: true });
+    if (!renamed) {
+      try { fs.rmSync(temporary, { force: true }); }
+      catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], `Whole-restore coordinator publication failed: ${error.message}; temporary cleanup failed: ${cleanupError.message}`);
+      }
+      throw error;
+    }
+    if (!previousBytes) {
+      error.coordinatorBarrierMustRemain = true;
+      throw error;
+    }
+
+    const rollbackTemporary = `${WHOLE_RESTORE_COORDINATOR_PATH}.${crypto.randomUUID()}.tmp`;
+    let rollbackRenamed = false;
+    try {
+      const rollbackFd = fs.openSync(rollbackTemporary, "wx", 0o600);
+      try {
+        fs.writeFileSync(rollbackFd, previousBytes);
+        fs.fsyncSync(rollbackFd);
+      } finally {
+        fs.closeSync(rollbackFd);
+      }
+      fs.renameSync(rollbackTemporary, WHOLE_RESTORE_COORDINATOR_PATH);
+      rollbackRenamed = true;
+      fsyncCoordinatorDirectory(directory);
+    } catch (rollbackError) {
+      const errors = [error, rollbackError];
+      let cleanupError = null;
+      if (!rollbackRenamed) {
+        try { fs.rmSync(rollbackTemporary, { force: true }); }
+        catch (failure) { cleanupError = failure; errors.push(failure); }
+      }
+      const cleanupMessage = cleanupError ? `; rollback temporary cleanup failed: ${cleanupError.message}` : "";
+      const combinedError = new AggregateError(errors, `Whole-restore coordinator directory sync failed: ${error.message}; restoring prior coordinator failed: ${rollbackError.message}${cleanupMessage}`);
+      combinedError.coordinatorBarrierMustRemain = true;
+      throw combinedError;
+    }
     throw error;
   }
   return persisted;
@@ -2519,7 +2561,7 @@ async function restoreBackup(id, options = {}) {
     };
   } catch (error) {
     let coordinatorCleanupFailed = false;
-    if (!mutationStarted && pathExists(WHOLE_RESTORE_COORDINATOR_PATH)) {
+    if (!mutationStarted && !error.coordinatorBarrierMustRemain && pathExists(WHOLE_RESTORE_COORDINATOR_PATH)) {
       try {
         const activeCoordinator = readWholeRestoreCoordinator();
         if (!activeCoordinator || (coordinator && activeCoordinator.transactionId !== coordinator.transactionId)) {
