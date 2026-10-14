@@ -595,7 +595,10 @@ function getCreatedUserSessionVersion(username) {
 }
 
 function saveUsers(users) {
-  if (NODE_ENV !== "test" && hasPublishedSampleCredentials(users)) {
+  const passwordHashesToValidate = trustedUserPasswordHashes === null
+    ? users
+    : users.filter((user) => trustedUserPasswordHashes.get(String(user?.username || "")) !== String(user?.password || ""));
+  if (NODE_ENV !== "test" && hasPublishedSampleCredentials(passwordHashesToValidate)) {
     throw new Error("Published sample credentials are not allowed outside NODE_ENV=test.");
   }
   if (shouldUseDatabase()) usersRepository.saveUsers(users);
@@ -610,6 +613,7 @@ function saveUsers(users) {
       throw error;
     }
   }
+  trustedUserPasswordHashes = snapshotUserPasswordHashes(users);
 }
 
 function getBasePermissions() {
@@ -688,6 +692,11 @@ function getDefaultUsers() {
 }
 
 let publishedSampleCredentialsPresent = false;
+let trustedUserPasswordHashes = null;
+
+function snapshotUserPasswordHashes(users) {
+  return new Map(users.map((user) => [String(user?.username || ""), String(user?.password || "")]));
+}
 
 function loadSeedUsers() {
   if (!fs.existsSync(USERS_SEED_FILE)) return null;
@@ -5522,10 +5531,12 @@ function initData() {
     console.log(seedUsers ? "User seed imported from data/users.json." : "Explicit local development users created.");
   }
 
-  publishedSampleCredentialsPresent = hasPublishedSampleCredentials(loadUsers());
+  const persistedUsers = loadUsers();
+  publishedSampleCredentialsPresent = hasPublishedSampleCredentials(persistedUsers);
   if (NODE_ENV !== "test" && publishedSampleCredentialsPresent) {
     throw new Error("Published sample credentials must be changed before startup outside NODE_ENV=test.");
   }
+  trustedUserPasswordHashes = snapshotUserPasswordHashes(persistedUsers);
 }
 
 app.set("trust proxy", TRUSTED_PROXIES);

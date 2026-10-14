@@ -1,5 +1,6 @@
 const assert = require("node:assert/strict");
 const bcrypt = require("bcryptjs");
+const Database = require("better-sqlite3");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
@@ -45,7 +46,7 @@ function waitForExit(child, timeoutMs, secrets) {
   });
 }
 
-function startServer({ cwd, port, jwtSecret, envOverrides = {} }) {
+function startServer({ cwd, port, jwtSecret, envOverrides = {}, preloadPath }) {
   const env = { ...process.env, PORT: String(port), DB_ENABLED: "false" };
   delete env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS;
   delete env.ROOTARK_BOOTSTRAP_USERS_FROM_SEED;
@@ -54,7 +55,7 @@ function startServer({ cwd, port, jwtSecret, envOverrides = {} }) {
   Object.assign(env, envOverrides);
   if (jwtSecret === undefined) delete env.JWT_SECRET;
   else env.JWT_SECRET = jwtSecret;
-  const child = spawn(process.execPath, [SERVER], {
+  const child = spawn(process.execPath, [...(preloadPath ? ["--require", preloadPath] : []), SERVER], {
     cwd,
     env,
     stdio: ["ignore", "pipe", "pipe"],
@@ -200,6 +201,63 @@ test("persisted development bootstrap accounts remain usable after the opt-in is
   await stop(restartedServer.child, secrets);
 });
 
+test("session-only user saves do not recheck every bcrypt password hash", { timeout: 45_000 }, async (t) => {
+  const cwd = createSandbox();
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const adminPassword = crypto.randomBytes(24).toString("base64url");
+  const userPassword = crypto.randomBytes(24).toString("base64url");
+  const secrets = [strongSecret, adminPassword, userPassword];
+  const port = await getUnusedPort();
+  const comparisonLog = path.join(cwd, "bcrypt-comparisons.log");
+  const preloadPath = path.join(cwd, "bcrypt-compare-counter.js");
+  fs.writeFileSync(preloadPath, [
+    '"use strict";',
+    'const fs = require("node:fs");',
+    'const Module = require("node:module");',
+    'const originalLoad = Module._load;',
+    'Module._load = function (request, parent, isMain) {',
+    '  const loaded = Reflect.apply(originalLoad, this, [request, parent, isMain]);',
+    '  if (request === "bcryptjs" && loaded && !loaded.__rootarkCompareCounter) {',
+    '    const originalCompareSync = loaded.compareSync;',
+    '    loaded.compareSync = function (...args) {',
+    '      fs.appendFileSync(process.env.ROOTARK_TEST_BCRYPT_COMPARE_LOG, "compare\\n");',
+    '      return Reflect.apply(originalCompareSync, this, args);',
+    '    };',
+    '    Object.defineProperty(loaded, "__rootarkCompareCounter", { value: true });',
+    '  }',
+    '  return loaded;',
+    '};',
+  ].join("\n"));
+  const launched = startServer({
+    cwd,
+    port,
+    jwtSecret: strongSecret,
+    preloadPath,
+    envOverrides: {
+      NODE_ENV: "development",
+      ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true",
+      ROOTARK_DEV_BOOTSTRAP_ADMIN_PASSWORD: adminPassword,
+      ROOTARK_DEV_BOOTSTRAP_USER_PASSWORD: userPassword,
+      ROOTARK_TEST_BCRYPT_COMPARE_LOG: comparisonLog,
+      TOTP_POLICY: "optional",
+    },
+  });
+  t.after(async () => {
+    await stop(launched.child, secrets);
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  assert.equal(await waitForServer(port, secrets), 200);
+  assert.ok(fs.readFileSync(comparisonLog, "utf8").trim().length > 0, "startup should validate persisted password hashes");
+  const login = await requestJson(port, "POST", "/auth/login", { username: "admin", password: adminPassword });
+  assert.equal(login.status, 200);
+  fs.writeFileSync(comparisonLog, "");
+
+  const logout = await requestJson(port, "POST", "/auth/logout", {}, { authorization: `Bearer ${login.body.token}` });
+  assert.equal(logout.status, 204);
+  assert.equal(fs.readFileSync(comparisonLog, "utf8"), "", "session revocation must not bcrypt-scan unchanged accounts");
+});
+
 test("startup loads .env from the working directory and preserves explicit environment values", { timeout: 45_000 }, async (t) => {
   const fileSecret = crypto.randomBytes(48).toString("base64url");
   const explicitSecret = crypto.randomBytes(48).toString("base64url");
@@ -340,6 +398,50 @@ test("production rejects plaintext or malformed seed credentials", { timeout: 30
   assert.notEqual(result.code, 0);
   assert.match(launched.output(), /The configured user seed is invalid/);
   assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), false);
+});
+
+test("production rejects a seeded published sample password before persisting users", { timeout: 60_000 }, async (t) => {
+  for (const useDatabase of [false, true]) {
+    await t.test(useDatabase ? "SQLite store" : "JSON store", { timeout: 30_000 }, async (subtest) => {
+      const cwd = createSandbox();
+      fs.mkdirSync(path.join(cwd, "data"), { recursive: true });
+      fs.writeFileSync(path.join(cwd, "data", "users.json"), JSON.stringify([
+        { username: "seed-admin", password: bcrypt.hashSync("admin123", 10), role: "admin", permissions: {} },
+      ]));
+      const strongSecret = crypto.randomBytes(48).toString("base64url");
+      const port = await getUnusedPort();
+      const databasePath = path.join(cwd, "data", "rootark.sqlite");
+      const launched = startServer({
+        cwd,
+        port,
+        jwtSecret: strongSecret,
+        envOverrides: {
+          NODE_ENV: "production",
+          ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
+          DB_ENABLED: String(useDatabase),
+          DATABASE_URL: databasePath,
+        },
+      });
+      subtest.after(async () => { await stop(launched.child, [strongSecret]); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+      const result = await waitForExit(launched.child, TIMEOUT_MS, [strongSecret]);
+      assert.notEqual(result.code, 0);
+      assert.match(launched.output(), /Published sample credentials are not allowed/i);
+      assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), false, "rejected seed must not be copied into the active JSON user store");
+      assert.equal(fs.existsSync(path.join(cwd, "data", "users.json")), true, "operator seed must remain available for recovery");
+
+      if (useDatabase) {
+        assert.equal(fs.existsSync(databasePath), true, "SQLite startup path should have initialized the disposable database");
+        const db = new Database(databasePath, { readonly: true });
+        try {
+          const rows = db.prepare("SELECT username FROM users WHERE deleted_at IS NULL").all();
+          assert.deepEqual(rows, [], "rejected seed must not create an active SQLite user");
+        } finally {
+          db.close();
+        }
+      }
+    });
+  }
 });
 
 test("default fixture accounts are available only in test with explicit opt-in", { timeout: 30_000 }, async (t) => {
