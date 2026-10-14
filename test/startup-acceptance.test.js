@@ -77,6 +77,30 @@ async function request(port) {
   });
 }
 
+async function requestJson(port, method, pathname, body, headers = {}) {
+  const serialized = body === undefined ? null : JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: "127.0.0.1",
+      port,
+      path: pathname,
+      method,
+      headers: {
+        ...(serialized ? { "content-type": "application/json", "content-length": Buffer.byteLength(serialized) } : {}),
+        ...headers,
+      },
+    }, (res) => {
+      let response = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => { response += chunk; });
+      res.on("end", () => resolve({ status: res.statusCode, body: response ? JSON.parse(response) : null }));
+    });
+    req.once("error", reject);
+    if (serialized) req.write(serialized);
+    req.end();
+  });
+}
+
 async function waitForServer(port, secrets) {
   const deadline = Date.now() + TIMEOUT_MS;
   let lastError;
@@ -303,7 +327,7 @@ test("production rejects plaintext or malformed seed credentials", { timeout: 30
   assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), false);
 });
 
-test("default accounts require explicit non-production development/test opt-in", { timeout: 30_000 }, async (t) => {
+test("default fixture accounts are available only in test with explicit opt-in", { timeout: 30_000 }, async (t) => {
   const sandboxes = [];
   const launches = [];
   t.after(async () => {
@@ -311,19 +335,57 @@ test("default accounts require explicit non-production development/test opt-in",
     for (const cwd of sandboxes) fs.rmSync(cwd, { recursive: true, force: true });
   });
 
-  for (const nodeEnv of ["development", "test"]) {
-    const cwd = createSandbox();
-    sandboxes.push(cwd);
-    const strongSecret = crypto.randomBytes(48).toString("base64url");
-    const port = await getUnusedPort();
-    const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: nodeEnv, ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" } });
-    launches.push(launched);
-    assert.equal(await waitForServer(port, [strongSecret]), 200, nodeEnv);
-    const users = JSON.parse(fs.readFileSync(path.join(cwd, "data", "users.local.json"), "utf8"));
-    assert.deepEqual(users.map((user) => user.username), ["admin", "user"], nodeEnv);
-    assert.equal(bcrypt.compareSync("admin123", users[0].password), true, nodeEnv);
-    assert.equal(bcrypt.compareSync("user123", users[1].password), true, nodeEnv);
-  }
+  const cwd = createSandbox();
+  sandboxes.push(cwd);
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "test", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" } });
+  launches.push(launched);
+  assert.equal(await waitForServer(port, [strongSecret]), 200);
+  const users = JSON.parse(fs.readFileSync(path.join(cwd, "data", "users.local.json"), "utf8"));
+  assert.deepEqual(users.map((user) => user.username), ["admin", "user"]);
+  assert.equal(bcrypt.compareSync("admin123", users[0].password), true);
+  assert.equal(bcrypt.compareSync("user123", users[1].password), true);
+});
+
+test("development bootstrap requires explicit strong non-sample passwords", { timeout: 45_000 }, async (t) => {
+  const secret = crypto.randomBytes(48).toString("base64url");
+  const rejectedCwd = createSandbox();
+  const acceptedCwd = createSandbox();
+  const rejectedPort = await getUnusedPort();
+  const acceptedPort = await getUnusedPort();
+  const rejected = startServer({ cwd: rejectedCwd, port: rejectedPort, jwtSecret: secret, envOverrides: { NODE_ENV: "development", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" } });
+  const adminPassword = crypto.randomBytes(24).toString("base64url");
+  const userPassword = crypto.randomBytes(24).toString("base64url");
+  const accepted = startServer({
+    cwd: acceptedCwd,
+    port: acceptedPort,
+    jwtSecret: secret,
+    envOverrides: {
+      NODE_ENV: "development",
+      ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true",
+      ROOTARK_DEV_BOOTSTRAP_ADMIN_PASSWORD: adminPassword,
+      ROOTARK_DEV_BOOTSTRAP_USER_PASSWORD: userPassword,
+    },
+  });
+  t.after(async () => {
+    await stop(rejected.child, [secret, adminPassword, userPassword]);
+    await stop(accepted.child, [secret, adminPassword, userPassword]);
+    fs.rmSync(rejectedCwd, { recursive: true, force: true });
+    fs.rmSync(acceptedCwd, { recursive: true, force: true });
+  });
+
+  const rejectedResult = await waitForExit(rejected.child, TIMEOUT_MS, [secret]);
+  assert.notEqual(rejectedResult.code, 0);
+  assert.match(rejected.output(), /requires distinct passwords of at least 16 characters/i);
+  assert.equal(fs.existsSync(path.join(rejectedCwd, "data", "users.local.json")), false);
+  assert.equal(await waitForServer(acceptedPort, [secret, adminPassword, userPassword]), 200);
+  const users = JSON.parse(fs.readFileSync(path.join(acceptedCwd, "data", "users.local.json"), "utf8"));
+  assert.deepEqual(users.map((user) => user.username), ["admin", "user"]);
+  assert.equal(bcrypt.compareSync(adminPassword, users[0].password), true);
+  assert.equal(bcrypt.compareSync(userPassword, users[1].password), true);
+  assert.equal(bcrypt.compareSync("admin123", users[0].password), false);
+  assert.equal(bcrypt.compareSync("user123", users[1].password), false);
 });
 
 test("production refuses a persisted development bootstrap account until its password is changed", { timeout: 30_000 }, async (t) => {
@@ -339,8 +401,79 @@ test("production refuses a persisted development bootstrap account until its pas
 
   const result = await waitForExit(launched.child, TIMEOUT_MS, [strongSecret]);
   assert.notEqual(result.code, 0);
-  assert.match(launched.output(), /development bootstrap credentials must be changed/i);
+  assert.match(launched.output(), /published sample credentials must be changed/i);
   assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), true, "the existing account store is preserved for operator recovery");
+});
+
+test("production refuses crossed sample passwords regardless of username pairing", { timeout: 30_000 }, async (t) => {
+  const cwd = createSandbox();
+  fs.mkdirSync(path.join(cwd, "data"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "data", "users.local.json"), JSON.stringify([
+    { username: "admin", password: bcrypt.hashSync("user123", 10), role: "admin", permissions: {} },
+    { username: "user", password: bcrypt.hashSync("admin123", 10), role: "user", permissions: {} },
+  ]));
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "production" } });
+  t.after(async () => { await stop(launched.child, [strongSecret]); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+  const result = await waitForExit(launched.child, TIMEOUT_MS, [strongSecret]);
+  assert.notEqual(result.code, 0);
+  assert.match(launched.output(), /sample credentials must be changed before startup/i);
+  assert.equal(fs.existsSync(path.join(cwd, "data", "users.local.json")), true);
+});
+
+test("published sample passwords cannot authenticate or be installed through a local reverse proxy", { timeout: 45_000 }, async (t) => {
+  const cwd = createSandbox();
+  const adminPassword = crypto.randomBytes(24).toString("base64url");
+  const userPassword = crypto.randomBytes(24).toString("base64url");
+  const jwtSecret = crypto.randomBytes(48).toString("base64url");
+  const port = await getUnusedPort();
+  const launched = startServer({
+    cwd,
+    port,
+    jwtSecret,
+    envOverrides: {
+      NODE_ENV: "development",
+      ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true",
+      ROOTARK_DEV_BOOTSTRAP_ADMIN_PASSWORD: adminPassword,
+      ROOTARK_DEV_BOOTSTRAP_USER_PASSWORD: userPassword,
+    },
+  });
+  let proxy;
+  t.after(async () => {
+    if (proxy?.listening) await new Promise((resolve) => proxy.close(resolve));
+    await stop(launched.child, [adminPassword, userPassword, jwtSecret]);
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+  assert.equal(await waitForServer(port, [adminPassword, userPassword, jwtSecret]), 200);
+
+  proxy = http.createServer((req, res) => {
+    const upstream = http.request({ host: "127.0.0.1", port, path: req.url, method: req.method, headers: req.headers }, (response) => {
+      res.writeHead(response.statusCode, response.headers);
+      response.pipe(res);
+    });
+    upstream.on("error", () => { res.writeHead(502).end(); });
+    req.pipe(upstream);
+  });
+  await new Promise((resolve, reject) => {
+    proxy.once("error", reject);
+    proxy.listen(0, "127.0.0.1", resolve);
+  });
+  const proxyPort = proxy.address().port;
+  const exposedSampleLogin = await requestJson(proxyPort, "POST", "/auth/login", { username: "admin", password: "admin123" });
+  assert.equal(exposedSampleLogin.status, 401);
+
+  const login = await requestJson(proxyPort, "POST", "/auth/login", { username: "admin", password: adminPassword });
+  assert.equal(login.status, 200);
+  const headers = { authorization: `Bearer ${login.body.token}` };
+  const update = await requestJson(proxyPort, "PUT", "/users/admin", { password: "user123" }, headers);
+  const create = await requestJson(proxyPort, "POST", "/users", { username: "proxy-sample", password: "admin123", role: "user" }, headers);
+  assert.equal(update.status, 400);
+  assert.equal(create.status, 400);
+  const users = JSON.parse(fs.readFileSync(path.join(cwd, "data", "users.local.json"), "utf8"));
+  assert.equal(bcrypt.compareSync(adminPassword, users.find((user) => user.username === "admin").password), true);
+  assert.equal(users.some((user) => user.username === "proxy-sample"), false);
 });
 
 test("production startup fails when session cookies are explicitly configured without Secure", { timeout: 30_000 }, async (t) => {
