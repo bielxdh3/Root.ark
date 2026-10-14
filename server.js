@@ -637,8 +637,12 @@ function normalizeUserPermissions(user = {}) {
   return permissions;
 }
 
+function developmentBootstrapDefaultsEnabled() {
+  return ["development", "test"].includes(process.env.NODE_ENV) && process.env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS === "true";
+}
+
 function getDefaultUsers() {
-  if (!["development", "test"].includes(process.env.NODE_ENV) || process.env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS !== "true") {
+  if (!developmentBootstrapDefaultsEnabled()) {
     throw new Error("No users are configured. Provide an explicit user seed or enable local development bootstrap.");
   }
 
@@ -668,6 +672,8 @@ function hasDevelopmentBootstrapCredentials(users) {
     return Boolean(password && bcrypt.compareSync(password, String(user.password || "")));
   });
 }
+
+let developmentBootstrapCredentialsPresent = false;
 
 function loadSeedUsers() {
   if (!fs.existsSync(USERS_SEED_FILE)) return null;
@@ -5502,7 +5508,8 @@ function initData() {
     console.log(seedUsers ? "User seed imported from data/users.json." : "Explicit local development users created.");
   }
 
-  if (process.env.NODE_ENV === "production" && hasDevelopmentBootstrapCredentials(loadUsers())) {
+  developmentBootstrapCredentialsPresent = hasDevelopmentBootstrapCredentials(loadUsers());
+  if (process.env.NODE_ENV === "production" && developmentBootstrapCredentialsPresent) {
     throw new Error("Development bootstrap credentials must be changed before production startup.");
   }
 }
@@ -10674,7 +10681,7 @@ setInterval(() => {
 }, CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS);
 setInterval(() => { void restoreRequestGate.run(() => cleanupIncomingUploads()); }, 60 * 1000);
 const listenForRequests = () => {
-  server.listen(PORT, () => {
+  const onListening = () => {
     void (async () => {
       try {
         if (startupRestoreCoordinator) {
@@ -10693,9 +10700,21 @@ const listenForRequests = () => {
         return;
       }
       startupRestoreLease();
-      console.log(`Servidor rodando em http://localhost:${PORT}`);
+      const address = server.address();
+      const host = address && typeof address === "object" ? address.address : "localhost";
+      const port = address && typeof address === "object" ? address.port : PORT;
+      const displayHost = host.includes(":") ? `[${host}]` : host;
+      console.log(`Servidor rodando em http://${displayHost}:${port}`);
     })();
-  });
+  };
+
+  // Persisted sample credentials stay local even after the bootstrap opt-in is removed.
+  if (developmentBootstrapCredentialsPresent) {
+    server.listen(PORT, "127.0.0.1", onListening);
+    return;
+  }
+
+  server.listen(PORT, onListening);
 };
 void (async () => {
   await backupService.recoverRetentionAtStartup();

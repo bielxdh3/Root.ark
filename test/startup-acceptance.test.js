@@ -133,7 +133,32 @@ test("startup accepts only an explicit strong JWT_SECRET", { timeout: 45_000 }, 
   running = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "test", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" } });
   assert.equal(await waitForServer(port, secrets), 200);
   await stop(running.child, secrets);
-  assert.equal(sanitize(running.output(), secrets).includes("[redacted]"), false, "strong secret was echoed");
+  const output = sanitize(running.output(), secrets);
+  assert.match(output, new RegExp(`Servidor rodando em http://127\\.0\\.0\\.1:${port}`), "development-default credentials must bind the listener to IPv4 loopback");
+  assert.equal(output.includes("[redacted]"), false, "strong secret was echoed");
+});
+
+test("persisted development bootstrap accounts remain loopback-bound after the opt-in is removed", { timeout: 45_000 }, async (t) => {
+  const cwd = createSandbox();
+  const strongSecret = crypto.randomBytes(48).toString("base64url");
+  const secrets = [strongSecret];
+  const port = await getUnusedPort();
+  let bootstrapServer;
+  let restartedServer;
+  t.after(async () => {
+    await stop(restartedServer?.child, secrets);
+    await stop(bootstrapServer?.child, secrets);
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  bootstrapServer = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "development", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" } });
+  assert.equal(await waitForServer(port, secrets), 200);
+  await stop(bootstrapServer.child, secrets);
+
+  restartedServer = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "development" } });
+  assert.equal(await waitForServer(port, secrets), 200);
+  await stop(restartedServer.child, secrets);
+  assert.match(sanitize(restartedServer.output(), secrets), new RegExp(`Servidor rodando em http://127\\.0\\.0\\.1:${port}`));
 });
 
 test("startup loads .env from the working directory and preserves explicit environment values", { timeout: 45_000 }, async (t) => {
