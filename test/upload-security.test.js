@@ -1294,6 +1294,34 @@ test("upload chunk route limit rejects requests before Multer writes staging fil
   assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
 });
 
+test("chunk uploads accept the 8 MiB contract and reject larger parts without staging artifacts", { timeout: 45_000 }, async (t) => {
+  const harness = await createHarness(t);
+  const session = await login(harness.port, "uploader", harness.password);
+  const maxPartBytes = 8 * 1024 * 1024;
+  const acceptedId = "max-size-chunk-accepted";
+  const accepted = await uploadChunk(harness.port, session, {
+    uploadId: acceptedId,
+    originalName: "large-client-file.bin",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.alloc(maxPartBytes, 0x61),
+  });
+  assert.equal(accepted.status, 200, accepted.body);
+  assert.equal(fs.statSync(path.join(harness.chunkRoot, FOLDER_ID, acceptedId, "0.part")).size, maxPartBytes);
+
+  const rejectedId = "oversize-chunk-rejected";
+  const rejected = await uploadChunk(harness.port, session, {
+    uploadId: rejectedId,
+    originalName: "oversized-client-part.bin",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.alloc(maxPartBytes + 1, 0x62),
+  });
+  assert.equal(rejected.status, 413, rejected.body);
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, rejectedId)), false);
+  assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
+});
+
 test("Multer rejects malformed or disallowed multipart bodies without artifacts", { timeout: 30_000 }, async (t) => {
   const harness = await createHarness(t);
   const session = await login(harness.port, "uploader", harness.password);
