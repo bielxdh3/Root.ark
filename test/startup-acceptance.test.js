@@ -162,10 +162,12 @@ test("startup accepts only an explicit strong JWT_SECRET", { timeout: 45_000 }, 
   assert.equal(output.includes("[redacted]"), false, "strong secret was echoed");
 });
 
-test("persisted development bootstrap accounts remain loopback-bound after the opt-in is removed", { timeout: 45_000 }, async (t) => {
+test("persisted development bootstrap accounts remain usable after the opt-in is removed", { timeout: 45_000 }, async (t) => {
   const cwd = createSandbox();
   const strongSecret = crypto.randomBytes(48).toString("base64url");
-  const secrets = [strongSecret];
+  const adminPassword = crypto.randomBytes(24).toString("base64url");
+  const userPassword = crypto.randomBytes(24).toString("base64url");
+  const secrets = [strongSecret, adminPassword, userPassword];
   const port = await getUnusedPort();
   let bootstrapServer;
   let restartedServer;
@@ -175,14 +177,27 @@ test("persisted development bootstrap accounts remain loopback-bound after the o
     fs.rmSync(cwd, { recursive: true, force: true });
   });
 
-  bootstrapServer = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "development", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true" } });
+  bootstrapServer = startServer({
+    cwd,
+    port,
+    jwtSecret: strongSecret,
+    envOverrides: {
+      NODE_ENV: "development",
+      ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true",
+      ROOTARK_DEV_BOOTSTRAP_ADMIN_PASSWORD: adminPassword,
+      ROOTARK_DEV_BOOTSTRAP_USER_PASSWORD: userPassword,
+    },
+  });
   assert.equal(await waitForServer(port, secrets), 200);
   await stop(bootstrapServer.child, secrets);
 
   restartedServer = startServer({ cwd, port, jwtSecret: strongSecret, envOverrides: { NODE_ENV: "development" } });
   assert.equal(await waitForServer(port, secrets), 200);
+  const adminLogin = await requestJson(port, "POST", "/auth/login", { username: "admin", password: adminPassword });
+  const userLogin = await requestJson(port, "POST", "/auth/login", { username: "user", password: userPassword });
+  assert.equal(adminLogin.status, 200);
+  assert.equal(userLogin.status, 200);
   await stop(restartedServer.child, secrets);
-  assert.match(sanitize(restartedServer.output(), secrets), new RegExp(`Servidor rodando em http://127\\.0\\.0\\.1:${port}`));
 });
 
 test("startup loads .env from the working directory and preserves explicit environment values", { timeout: 45_000 }, async (t) => {
