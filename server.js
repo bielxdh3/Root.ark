@@ -6138,7 +6138,7 @@ const chunkUpload = multer({
     },
   }),
   defParamCharset: "utf8",
-  limits: { files: 1, fields: 10, fieldNestingDepth: 0 },
+  limits: { fileSize: SINGLE_UPLOAD_MAX_BYTES, files: 1, fields: 10, fieldNestingDepth: 0 },
 });
 
 function rejectLargeSingleUpload(req, res, next) {
@@ -6198,7 +6198,7 @@ function handleChunkUploadSingle(req, res, next) {
     }
     removeChunkUploadIncomingFile(req.file);
 
-    res.status(400).json({ error: error.message || "Upload do bloco nao concluido" });
+    res.status(error.code === "LIMIT_FILE_SIZE" ? 413 : 400).json({ error: error.message || "Upload do bloco nao concluido" });
   });
 }
 
