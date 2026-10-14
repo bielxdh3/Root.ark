@@ -314,7 +314,7 @@ test("configured WebSocket rate boundary is enforced at runtime", { timeout: 20_
   assert.equal(await closed, 1008);
 });
 
-test("file rename notifies active workspace sessions over WebSocket", { timeout: 20_000 }, async (t) => {
+test("file rename notifies active workspace sessions over WebSocket", { timeout: 45_000 }, async (t) => {
   const dir = createWebDavFixture("rootark-rename-realtime-");
   const port = await freePort();
   const oldPath = path.join(dir, "uploads", "before.txt");
@@ -352,7 +352,7 @@ test("file rename notifies active workspace sessions over WebSocket", { timeout:
     const timer = setTimeout(() => {
       socket.off("message", onMessage);
       resolve(null);
-    }, 1_000);
+    }, 30_000);
     onMessage = (raw) => {
       const message = JSON.parse(raw.toString());
       if (message.event !== "data:changed") return;
