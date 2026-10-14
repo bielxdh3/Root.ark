@@ -194,6 +194,7 @@ const UPLOAD_SUSPICIOUS_EXTENSIONS = new Set(
 );
 const NODE_ENV = String(process.env.NODE_ENV || "").trim().toLowerCase();
 const IS_PRODUCTION = NODE_ENV === "production";
+const PUBLISHED_SAMPLE_PASSWORDS = ["admin123", "user123"];
 if (!new Set(["clamav", "disabled"]).has(UPLOAD_SCAN_PROVIDER)) {
   throw new Error("UPLOAD_SCAN_PROVIDER must be 'clamav' or the explicit development-only value 'disabled'");
 }
@@ -594,6 +595,12 @@ function getCreatedUserSessionVersion(username) {
 }
 
 function saveUsers(users) {
+  const passwordHashesToValidate = trustedUserPasswordHashes === null
+    ? users
+    : users.filter((user) => trustedUserPasswordHashes.get(String(user?.username || "")) !== String(user?.password || ""));
+  if (NODE_ENV !== "test" && hasPublishedSampleCredentials(passwordHashesToValidate)) {
+    throw new Error("Published sample credentials are not allowed outside NODE_ENV=test.");
+  }
   if (shouldUseDatabase()) usersRepository.saveUsers(users);
   if (shouldWriteLegacyJson()) {
     rememberUserGenerations(users);
@@ -606,6 +613,7 @@ function saveUsers(users) {
       throw error;
     }
   }
+  trustedUserPasswordHashes = snapshotUserPasswordHashes(users);
 }
 
 function getBasePermissions() {
@@ -637,21 +645,43 @@ function normalizeUserPermissions(user = {}) {
   return permissions;
 }
 
+function developmentBootstrapDefaultsEnabled() {
+  return ["development", "test"].includes(process.env.NODE_ENV) && process.env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS === "true";
+}
+
+function hasPublishedSampleCredentials(users) {
+  return users.some((user) => PUBLISHED_SAMPLE_PASSWORDS.some((password) => bcrypt.compareSync(password, String(user?.password || ""))));
+}
+
+function isPublishedSamplePassword(password) {
+  return typeof password === "string" && PUBLISHED_SAMPLE_PASSWORDS.includes(password);
+}
+
 function getDefaultUsers() {
-  if (!["development", "test"].includes(process.env.NODE_ENV) || process.env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS !== "true") {
+  if (!developmentBootstrapDefaultsEnabled()) {
     throw new Error("No users are configured. Provide an explicit user seed or enable local development bootstrap.");
+  }
+
+  let adminPassword = "admin123";
+  let userPassword = "user123";
+  if (NODE_ENV === "development") {
+    adminPassword = process.env.ROOTARK_DEV_BOOTSTRAP_ADMIN_PASSWORD || "";
+    userPassword = process.env.ROOTARK_DEV_BOOTSTRAP_USER_PASSWORD || "";
+    if ([adminPassword, userPassword].some((password) => password.length < 16 || isPublishedSamplePassword(password)) || adminPassword === userPassword) {
+      throw new Error("Development bootstrap requires distinct passwords of at least 16 characters that are not published samples.");
+    }
   }
 
   return [
     {
       username: "admin",
-      password: bcrypt.hashSync("admin123", 10),
+      password: bcrypt.hashSync(adminPassword, 10),
       role: "admin",
       permissions: normalizeUserPermissions({ role: "admin" }),
     },
     {
       username: "user",
-      password: bcrypt.hashSync("user123", 10),
+      password: bcrypt.hashSync(userPassword, 10),
       role: "user",
       permissions: {
         ...getBasePermissions(),
@@ -661,12 +691,11 @@ function getDefaultUsers() {
   ];
 }
 
-function hasDevelopmentBootstrapCredentials(users) {
-  const defaults = new Map([["admin", "admin123"], ["user", "user123"]]);
-  return users.some((user) => {
-    const password = defaults.get(String(user?.username || "").trim().toLowerCase());
-    return Boolean(password && bcrypt.compareSync(password, String(user.password || "")));
-  });
+let publishedSampleCredentialsPresent = false;
+let trustedUserPasswordHashes = null;
+
+function snapshotUserPasswordHashes(users) {
+  return new Map(users.map((user) => [String(user?.username || ""), String(user?.password || "")]));
 }
 
 function loadSeedUsers() {
@@ -5502,9 +5531,12 @@ function initData() {
     console.log(seedUsers ? "User seed imported from data/users.json." : "Explicit local development users created.");
   }
 
-  if (process.env.NODE_ENV === "production" && hasDevelopmentBootstrapCredentials(loadUsers())) {
-    throw new Error("Development bootstrap credentials must be changed before production startup.");
+  const persistedUsers = loadUsers();
+  publishedSampleCredentialsPresent = hasPublishedSampleCredentials(persistedUsers);
+  if (NODE_ENV !== "test" && publishedSampleCredentialsPresent) {
+    throw new Error("Published sample credentials must be changed before startup outside NODE_ENV=test.");
   }
+  trustedUserPasswordHashes = snapshotUserPasswordHashes(persistedUsers);
 }
 
 app.set("trust proxy", TRUSTED_PROXIES);
@@ -5784,6 +5816,9 @@ app.post("/users", authenticate, requirePermission("manageUsers"), (req, res) =>
   if (!username || !password) {
     return res.status(400).json({ error: "username e password obrigatorios" });
   }
+  if (isPublishedSamplePassword(password)) {
+    return res.status(400).json({ error: "Senha de amostra publicada nao permitida" });
+  }
 
   const users = loadUsers();
   if (users.find((u) => u.username === username)) {
@@ -5827,6 +5862,9 @@ app.put("/users/:username", authenticate, requirePermission("manageUsers"), (req
 
   const before = JSON.parse(JSON.stringify(users[idx]));
   const { password, role, permissions } = req.body;
+  if (isPublishedSamplePassword(password)) {
+    return res.status(400).json({ error: "Senha de amostra publicada nao permitida" });
+  }
   const sessionChanged = Boolean(password || (role && role !== users[idx].role) || (permissions && Object.entries(permissions).some(([key, value]) => users[idx].permissions?.[key] !== value)) || req.body.disabled !== undefined && Boolean(req.body.disabled) !== Boolean(users[idx].disabled));
   if (password) users[idx].password = bcrypt.hashSync(password, 10);
   if (role) users[idx].role = role;
@@ -10674,7 +10712,7 @@ setInterval(() => {
 }, CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS);
 setInterval(() => { void restoreRequestGate.run(() => cleanupIncomingUploads()); }, 60 * 1000);
 const listenForRequests = () => {
-  server.listen(PORT, () => {
+  const onListening = () => {
     void (async () => {
       try {
         if (startupRestoreCoordinator) {
@@ -10693,9 +10731,21 @@ const listenForRequests = () => {
         return;
       }
       startupRestoreLease();
-      console.log(`Servidor rodando em http://localhost:${PORT}`);
+      const address = server.address();
+      const host = address && typeof address === "object" ? address.address : "localhost";
+      const port = address && typeof address === "object" ? address.port : PORT;
+      const displayHost = host.includes(":") ? `[${host}]` : host;
+      console.log(`Servidor rodando em http://${displayHost}:${port}`);
     })();
-  });
+  };
+
+  // Test fixture credentials stay local even after the bootstrap opt-in is removed.
+  if (publishedSampleCredentialsPresent) {
+    server.listen(PORT, "127.0.0.1", onListening);
+    return;
+  }
+
+  server.listen(PORT, onListening);
 };
 void (async () => {
   await backupService.recoverRetentionAtStartup();

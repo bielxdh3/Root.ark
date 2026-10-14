@@ -753,6 +753,281 @@ test("successful whole restore preserves both recovery records and blocks servic
   `);
 });
 
+test("coordinator fsync failure removes the temporary file and preserves the prior coordinator", () => {
+  runFixture(`
+    write(path.join(dataDir, "runtime.json"), "selected-backup-state");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "runtime.json"), "live-state");
+      const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+      const originalOpenSync = fs.openSync;
+      const originalFsyncSync = fs.fsyncSync;
+      const coordinatorTempFds = new Set();
+      let tempWrites = 0;
+      let previousCoordinatorBytes = null;
+      fs.openSync = function trackCoordinatorTemp(pathname, flags, ...args) {
+        const fd = originalOpenSync.call(this, pathname, flags, ...args);
+        if (typeof pathname === "string" && pathname.startsWith(coordinatorPath + ".") && pathname.endsWith(".tmp")) {
+          tempWrites += 1;
+          coordinatorTempFds.add(fd);
+        }
+        return fd;
+      };
+      fs.fsyncSync = function failCoordinatorUpdate(fd) {
+        if (coordinatorTempFds.has(fd) && tempWrites >= 2) {
+          previousCoordinatorBytes ||= originalReadFileSync(coordinatorPath);
+          throw Object.assign(new Error("injected coordinator fsync failure"), { code: "EIO" });
+        }
+        return originalFsyncSync.call(this, fd);
+      };
+      const originalReadFileSync = fs.readFileSync;
+      try {
+        await assert.rejects(restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }), /injected coordinator fsync failure/);
+      } finally {
+        fs.openSync = originalOpenSync;
+        fs.fsyncSync = originalFsyncSync;
+      }
+
+      assert.ok(previousCoordinatorBytes, "the first durable coordinator remains as the recovery barrier");
+      assert.deepEqual(fs.readFileSync(coordinatorPath), previousCoordinatorBytes, "failed update must leave the valid prior coordinator intact");
+      assert.equal(JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).phase, "preparing");
+      assert.deepEqual(fs.readdirSync(dataDir).filter((name) => name.startsWith(".rootark-restore-coordinator.json.") && name.endsWith(".tmp")), []);
+      assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "live-state");
+      assert.equal(restoreService.isWholeRestoreBlocked(), true, "a failed coordinator update keeps restore startup blocked");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("coordinator directory fsync failure after replacement restores the prior record", {
+  skip: process.platform === "win32" ? "Node.js does not expose directory fsync on Windows" : false,
+}, () => {
+  runFixture(`
+    write(path.join(dataDir, "runtime.json"), "selected-backup-state");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "runtime.json"), "live-state");
+      const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+      const originalOpenSync = fs.openSync;
+      const originalFsyncSync = fs.fsyncSync;
+      const originalRenameSync = fs.renameSync;
+      const directoryFds = new Map();
+      let coordinatorUpdates = 0;
+      let previousCoordinatorBytes = null;
+      let failNextCoordinatorDirectorySync = false;
+      let priorCoordinatorRestored = false;
+      fs.openSync = function trackDirectory(pathname, ...args) {
+        const fd = originalOpenSync.call(this, pathname, ...args);
+        if (typeof pathname === "string" && path.resolve(pathname) === path.resolve(dataDir)) directoryFds.set(fd, pathname);
+        return fd;
+      };
+      fs.renameSync = function armAfterCoordinatorReplacement(source, destination) {
+        if (path.resolve(String(destination)) === path.resolve(coordinatorPath)
+          && String(source).startsWith(coordinatorPath + ".") && String(source).endsWith(".tmp")) {
+          const replacingExistingCoordinator = fs.existsSync(coordinatorPath);
+          if (replacingExistingCoordinator) {
+            coordinatorUpdates += 1;
+            previousCoordinatorBytes ||= originalReadFileSync(coordinatorPath);
+          }
+          const result = originalRenameSync.call(this, source, destination);
+          if (previousCoordinatorBytes && originalReadFileSync(coordinatorPath).equals(previousCoordinatorBytes)) priorCoordinatorRestored = true;
+          if (replacingExistingCoordinator && coordinatorUpdates === 1) failNextCoordinatorDirectorySync = true;
+          return result;
+        }
+        return originalRenameSync.call(this, source, destination);
+      };
+      const originalReadFileSync = fs.readFileSync;
+      fs.fsyncSync = function failPostRenameDirectorySync(fd) {
+        if (failNextCoordinatorDirectorySync && directoryFds.has(fd)) {
+          failNextCoordinatorDirectorySync = false;
+          throw Object.assign(new Error("injected coordinator directory fsync failure"), { code: "EIO" });
+        }
+        return originalFsyncSync.call(this, fd);
+      };
+      try {
+        await assert.rejects(restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }), /injected coordinator directory fsync failure/);
+      } finally {
+        fs.openSync = originalOpenSync;
+        fs.fsyncSync = originalFsyncSync;
+        fs.renameSync = originalRenameSync;
+      }
+
+      assert.ok(coordinatorUpdates >= 1, "the failure must be injected while replacing an existing recovery barrier");
+      assert.equal(priorCoordinatorRestored, true, "the prior bytes must be atomically restored before restore rollback continues");
+      assert.ok(previousCoordinatorBytes, "the update must begin with an existing recovery barrier");
+      assert.deepEqual(fs.readdirSync(dataDir).filter((name) => name.startsWith(".rootark-restore-coordinator.json.") && name.endsWith(".tmp")), []);
+      assert.equal(restoreService.isWholeRestoreBlocked(), false, "the outer restore rollback may then remove its recovered barrier");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("first coordinator directory fsync failure keeps the newly published barrier", {
+  skip: process.platform === "win32" ? "Node.js does not expose directory fsync on Windows" : false,
+}, () => {
+  runFixture(`
+    write(path.join(dataDir, "runtime.json"), "selected-backup-state");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+      const originalOpenSync = fs.openSync;
+      const originalFsyncSync = fs.fsyncSync;
+      const originalRenameSync = fs.renameSync;
+      const directoryFds = new Set();
+      let failNextDirectorySync = false;
+      fs.openSync = function trackDirectory(pathname, ...args) {
+        const fd = originalOpenSync.call(this, pathname, ...args);
+        if (typeof pathname === "string" && path.resolve(pathname) === path.resolve(dataDir)) directoryFds.add(fd);
+        return fd;
+      };
+      fs.renameSync = function armAfterFirstPublication(source, destination) {
+        if (!failNextDirectorySync && path.resolve(String(destination)) === path.resolve(coordinatorPath)
+          && !fs.existsSync(coordinatorPath)) {
+          const result = originalRenameSync.call(this, source, destination);
+          failNextDirectorySync = true;
+          return result;
+        }
+        return originalRenameSync.call(this, source, destination);
+      };
+      fs.fsyncSync = function failFirstDirectorySync(fd) {
+        if (failNextDirectorySync && directoryFds.has(fd)) {
+          failNextDirectorySync = false;
+          throw Object.assign(new Error("injected first coordinator directory fsync failure"), { code: "EIO" });
+        }
+        return originalFsyncSync.call(this, fd);
+      };
+      try {
+        await assert.rejects(restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }), /injected first coordinator directory fsync failure/);
+      } finally {
+        fs.openSync = originalOpenSync;
+        fs.fsyncSync = originalFsyncSync;
+        fs.renameSync = originalRenameSync;
+      }
+
+      assert.equal(JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).phase, "preparing", "the only barrier must remain after publication durability fails");
+      assert.equal(restoreService.isWholeRestoreBlocked(), true);
+      assert.deepEqual(fs.readdirSync(dataDir).filter((name) => name.startsWith(".rootark-restore-coordinator.json.") && name.endsWith(".tmp")), []);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("failed coordinator rollback preserves a valid barrier and reports both fsync errors", {
+  skip: process.platform === "win32" ? "Node.js does not expose directory fsync on Windows" : false,
+}, () => {
+  runFixture(`
+    write(path.join(dataDir, "runtime.json"), "selected-backup-state");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "runtime.json"), "live-state");
+      const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+      const originalOpenSync = fs.openSync;
+      const originalFsyncSync = fs.fsyncSync;
+      const originalRenameSync = fs.renameSync;
+      const directoryFds = new Set();
+      const coordinatorTempFds = new Set();
+      let failDirectorySync = false;
+      let failRollbackFileSync = false;
+      fs.openSync = function trackCoordinatorAndDirectory(pathname, flags, ...args) {
+        const fd = originalOpenSync.call(this, pathname, flags, ...args);
+        if (typeof pathname === "string" && path.resolve(pathname) === path.resolve(dataDir)) directoryFds.add(fd);
+        if (typeof pathname === "string" && pathname.startsWith(coordinatorPath + ".") && pathname.endsWith(".tmp")) coordinatorTempFds.add(fd);
+        return fd;
+      };
+      fs.renameSync = function armAfterCoordinatorUpdate(source, destination) {
+        if (!failDirectorySync && path.resolve(String(destination)) === path.resolve(coordinatorPath)
+          && fs.existsSync(coordinatorPath)) {
+          const result = originalRenameSync.call(this, source, destination);
+          failDirectorySync = true;
+          return result;
+        }
+        return originalRenameSync.call(this, source, destination);
+      };
+      fs.fsyncSync = function failUpdateAndRollbackFsync(fd) {
+        if (failDirectorySync && directoryFds.has(fd)) {
+          failDirectorySync = false;
+          failRollbackFileSync = true;
+          throw Object.assign(new Error("injected coordinator directory fsync failure"), { code: "EIO" });
+        }
+        if (failRollbackFileSync && coordinatorTempFds.has(fd)) {
+          failRollbackFileSync = false;
+          throw Object.assign(new Error("injected prior coordinator file fsync failure"), { code: "EIO" });
+        }
+        return originalFsyncSync.call(this, fd);
+      };
+      try {
+        await assert.rejects(
+          restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }),
+          (error) => {
+            assert.ok(error instanceof AggregateError);
+            assert.match(error.message, /injected coordinator directory fsync failure/);
+            assert.match(error.message, /injected prior coordinator file fsync failure/);
+            assert.equal(error.errors.length, 2);
+            return true;
+          },
+        );
+      } finally {
+        fs.openSync = originalOpenSync;
+        fs.fsyncSync = originalFsyncSync;
+        fs.renameSync = originalRenameSync;
+      }
+
+      assert.ok(JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).phase, "the replacement coordinator remains a valid recovery barrier");
+      assert.equal(restoreService.isWholeRestoreBlocked(), true);
+      assert.deepEqual(fs.readdirSync(dataDir).filter((name) => name.startsWith(".rootark-restore-coordinator.json.") && name.endsWith(".tmp")), []);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restart completes whole-restore cleanup after final coordinator removal fails", () => {
+  runFixture(`
+    const { spawnSync } = require("node:child_process");
+    write(path.join(dataDir, "runtime.json"), "selected-backup-state");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "runtime.json"), "live-state");
+      const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+      await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+      restoreService.prepareWholeRestoreStartup();
+      const originalRmSync = fs.rmSync;
+      let removalFailureInjected = false;
+      fs.rmSync = function failFinalCoordinatorRemoval(pathname, ...args) {
+        if (!removalFailureInjected && path.resolve(String(pathname)) === path.resolve(coordinatorPath)) {
+          removalFailureInjected = true;
+          throw Object.assign(new Error("injected final coordinator removal failure"), { code: "EIO" });
+        }
+        return originalRmSync.call(this, pathname, ...args);
+      };
+      try {
+        assert.throws(() => restoreService.acknowledgeWholeRestoreInstance(), /injected final coordinator removal failure/);
+      } finally { fs.rmSync = originalRmSync; }
+
+      assert.equal(removalFailureInjected, true);
+      assert.equal(fs.existsSync(coordinatorPath), true, "failed final removal retains the restore barrier");
+      const restartScript = [
+        'const assert = require("node:assert/strict");',
+        'const fs = require("node:fs");',
+        'const restore = require(process.env.RESTORE_SERVICE_MODULE);',
+        'restore.prepareWholeRestoreStartup();',
+        'const result = restore.acknowledgeWholeRestoreInstance();',
+        'assert.equal(result.complete, true);',
+        'assert.equal(fs.existsSync("data/.rootark-restore-coordinator.json"), false);',
+        'assert.equal(fs.readFileSync("data/runtime.json", "utf8"), "selected-backup-state");',
+      ].join(String.fromCharCode(10));
+      const restarted = spawnSync(process.execPath, ["-e", restartScript], {
+        cwd: process.cwd(),
+        env: { ...process.env, RESTORE_SERVICE_MODULE: ${JSON.stringify(path.join(ROOT, "services", "restoreService"))} },
+        encoding: "utf8",
+        timeout: 15_000,
+      });
+      assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+      assert.equal(fs.existsSync(coordinatorPath), false);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("local-only restore keeps cloud inventory unknown until selected-archive reconciliation succeeds", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});

@@ -404,6 +404,28 @@ test("opening compact navigation closes the account details popover and focuses 
   assert.equal(document.activeElement, firstLink, "focus enters the open drawer");
 });
 
+test("account summary keeps an accessible name when compact CSS hides the username", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-ui.js"), "utf8");
+  let markup = "";
+  const root = {
+    set innerHTML(value) { markup = value; },
+    querySelector() { return null; },
+  };
+  const context = {
+    document: {
+      addEventListener() {},
+      removeEventListener() {},
+      getElementById(id) { return id === "app-root" ? root : null; },
+    },
+    window: { addEventListener() {}, matchMedia() { return { matches: true }; } },
+  };
+  vm.runInNewContext(source, context);
+
+  context.window.RootarkUI.mount({ user: { username: "ana & bob", role: "user", permissions: {} } });
+
+  assert.match(markup, /<summary aria-label="Conta de ana &amp; bob">/);
+});
+
 test("compact drawer keeps geometry and stacking declarations stable while it animates", () => {
   const css = fs.readFileSync(path.join(__dirname, "..", "public", "styles", "app.css"), "utf8");
   const compactRules = css.match(/@media\s*\(max-width:\s*860px\)\s*\{([\s\S]*?)\n\}/);
