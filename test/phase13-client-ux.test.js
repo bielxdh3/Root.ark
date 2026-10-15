@@ -244,7 +244,75 @@ test("mobile navigation backdrop close restores focus to the menu button", () =>
   assert.equal(document.activeElement, menuButton);
 });
 
-test("skip-link fragment keeps the route mounted while history and trash hashes still load", async () => {
+test("mobile navigation closes after a sidebar link is activated", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-ui.js"), "utf8");
+  const listeners = new Map();
+  const menuButton = { attributes: new Map(), setAttribute(name, value) { this.attributes.set(name, value); }, focus() { document.activeElement = this; } };
+  const sidebarLink = { focus() { document.activeElement = this; } };
+  const sidebar = {
+    inert: false,
+    contains(element) { return element === sidebarLink; },
+    setAttribute() {},
+    removeAttribute() {},
+  };
+  const root = {
+    navOpen: true,
+    classList: {
+      contains(name) { return name === "nav-open" && root.navOpen; },
+      toggle(name, value) { if (name === "nav-open") root.navOpen = Boolean(value); },
+      remove(name) { if (name === "nav-open") root.navOpen = false; },
+    },
+    querySelector(selector) { return selector === ".sidebar" ? sidebar : selector === ".mobile-menu" ? menuButton : null; },
+  };
+  const document = {
+    activeElement: sidebarLink,
+    documentElement: { dataset: {} },
+    addEventListener(name, listener) { listeners.set(name, listener); },
+    getElementById(id) { return id === "app-root" ? root : null; },
+  };
+  const context = {
+    document,
+    localStorage: { getItem() { return null; } },
+    window: { addEventListener() {}, matchMedia() { return { matches: true }; }, setTimeout },
+  };
+  vm.runInNewContext(source, context);
+
+  const activationEvent = {
+    defaultPrevented: false,
+    propagationStopped: false,
+    preventDefault() { this.defaultPrevented = true; },
+    stopPropagation() { this.propagationStopped = true; },
+    target: { closest(selector) {
+      if (selector === ".sidebar .nav-link") return sidebarLink;
+      if (selector === ".sidebar, .mobile-menu") return sidebar;
+      return null;
+    } },
+  };
+  listeners.get("click")(activationEvent);
+
+  assert.equal(root.classList.contains("nav-open"), false);
+  assert.equal(menuButton.attributes.get("aria-expanded"), "false");
+  assert.equal(document.activeElement, menuButton, "closing the drawer moves focus out of the now unavailable sidebar");
+  assert.equal(activationEvent.defaultPrevented, false, "closing the drawer preserves the link's default navigation");
+  assert.equal(activationEvent.propagationStopped, false, "closing the drawer allows router listeners to process the link");
+
+  root.navOpen = true;
+  menuButton.attributes.set("aria-expanded", "true");
+  document.activeElement = sidebarLink;
+  const blockedNavigationEvent = {
+    defaultPrevented: true,
+    target: { closest(selector) {
+      if (selector === ".sidebar .nav-link") return sidebarLink;
+      return null;
+    } },
+  };
+  listeners.get("click")(blockedNavigationEvent);
+  assert.equal(root.classList.contains("nav-open"), true, "a route change blocked by the active upload keeps the drawer open");
+  assert.equal(menuButton.attributes.get("aria-expanded"), "true");
+  assert.equal(document.activeElement, sidebarLink, "the canceled route attempt keeps keyboard focus in the navigation");
+});
+
+test("skip-link fragment keeps the route mounted and workspace navigation focuses main", async () => {
   const workspaceSource = fs.readFileSync(path.join(__dirname, "..", "public", "client", "rootark-workspace.js"), "utf8");
   const hashListeners = new Map();
   const requests = [];
@@ -274,7 +342,8 @@ test("skip-link fragment keeps the route mounted while history and trash hashes 
     setTimeout,
     clearTimeout,
   };
-  const document = { getElementById() { return root; }, addEventListener() {} };
+  const main = { focus() { document.activeElement = this; } };
+  const document = { activeElement: null, getElementById(id) { return id === "main" ? main : root; }, addEventListener() {} };
   vm.runInNewContext(workspaceSource, { window, document, Event, setTimeout, clearTimeout, FormData });
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -291,6 +360,7 @@ test("skip-link fragment keeps the route mounted while history and trash hashes 
   window.location.hash = "#/history";
   await routeHandler();
   assert.ok(requests.includes("/history"));
+  assert.equal(document.activeElement, main, "route changes move focus to the newly rendered main content");
 
   window.location.hash = "#/trash";
   await routeHandler();
