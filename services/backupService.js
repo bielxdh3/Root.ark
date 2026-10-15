@@ -237,6 +237,12 @@ function createVerifiedArchiveStream(file) {
   let source;
   const stream = Readable.from((async function* readVerifiedArchiveSource() {
     const { absolutePath, archiveRoot: root, sourceStat } = file;
+    const sourceSize = Number(sourceStat.size);
+    const expectedSize = file.size === undefined ? sourceSize : file.size;
+    if (!Number.isSafeInteger(sourceSize) || sourceSize < 0 || !Number.isSafeInteger(expectedSize)
+      || expectedSize !== sourceSize) {
+      throw new Error("Backup source size metadata is invalid");
+    }
     assertArchiveRootUnchanged(root);
     const pathStat = assertArchiveSourcePath(root, absolutePath);
     if (!sameFileSnapshot(sourceStat, pathStat) || pathStat.nlink !== 1n) {
@@ -258,7 +264,28 @@ function createVerifiedArchiveStream(file) {
       }
       source = fs.createReadStream(null, { fd, autoClose: true });
       fd = undefined;
-      for await (const chunk of source) yield chunk;
+      let bytesRead = 0;
+      for await (const chunk of source) {
+        if (chunk.length > expectedSize - bytesRead) throw new Error("Backup source size changed during archive creation");
+        bytesRead += chunk.length;
+        yield chunk;
+      }
+      if (bytesRead !== expectedSize) throw new Error("Backup source size changed during archive creation");
+
+      const streamedFd = fs.openSync(absolutePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      try {
+        const streamedStat = fs.fstatSync(streamedFd, { bigint: true });
+        assertArchiveRootUnchanged(root);
+        const streamedPathStat = assertArchiveSourcePath(root, absolutePath);
+        const streamedRealPath = fs.realpathSync.native(absolutePath);
+        // Stat snapshots detect normal app writes and path replacements; external writers that can rewrite bytes while restoring all compared metadata are outside this guarantee.
+        if (!sameFileSnapshot(sourceStat, streamedStat) || !sameFileSnapshot(streamedStat, streamedPathStat)
+          || !isPathWithin(root.realPath, streamedRealPath)) {
+          throw new Error("Backup source changed during archive creation");
+        }
+      } finally {
+        fs.closeSync(streamedFd);
+      }
     } finally {
       if (source) source.destroy();
       if (fd !== undefined) fs.closeSync(fd);
@@ -318,6 +345,9 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
 }
 
 async function collectBackupFiles(options = {}) {
+  if (options.persistenceMode && options.persistenceMode !== (isDbEnabled() ? "sqlite" : "json")) {
+    throw new Error("Persistence mode changed while collecting backup files");
+  }
   const files = [];
   const suppressionSnapshot = options.suppressionSnapshot || restoreProviderOrphans.createSnapshot();
   const dataDir = resolveRuntimePath("data");
@@ -374,11 +404,12 @@ async function collectBackupFiles(options = {}) {
 
   if (isDbEnabled()) {
     const snapshotPath = options.sqliteSnapshotPath;
-    if (snapshotPath && fs.existsSync(snapshotPath)) {
-      const sourceStat = fs.lstatSync(snapshotPath, { bigint: true });
-      if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("SQLite backup snapshot is not a regular file");
-      files.push({ absolutePath: snapshotPath, entryPath: "data/rootark.sqlite", size: Number(sourceStat.size), archiveRoot: dataRootInfo, sourceStat });
-    }
+    if (!snapshotPath || !fs.existsSync(snapshotPath)) throw new Error("SQLite database snapshot is required for backup");
+    const sourceStat = fs.lstatSync(snapshotPath, { bigint: true });
+    if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("SQLite backup snapshot is not a regular file");
+    files.push({ absolutePath: snapshotPath, entryPath: "data/rootark.sqlite", size: Number(sourceStat.size), archiveRoot: dataRootInfo, sourceStat });
+  } else if (options.sqliteSnapshotPath) {
+    throw new Error("SQLite database snapshot cannot be included in a JSON backup");
   }
 
   if (includeUploads) {
@@ -451,8 +482,12 @@ async function collectBackupFiles(options = {}) {
   return [...known.values()].sort((a, b) => a.entryPath.localeCompare(b.entryPath));
 }
 
-async function createSqliteSnapshot() {
-  if (!isDbEnabled() || !fs.existsSync(getDatabasePath())) return null;
+async function createSqliteSnapshot(persistenceMode = isDbEnabled() ? "sqlite" : "json") {
+  if (persistenceMode !== (isDbEnabled() ? "sqlite" : "json")) {
+    throw new Error("Persistence mode changed while creating backup");
+  }
+  if (persistenceMode === "json") return null;
+  if (!fs.existsSync(getDatabasePath())) throw new Error("SQLite database is missing; backup cannot be created");
   const stageDir = resolveRuntimePath("data", `.sqlite-backup-${crypto.randomUUID()}`);
   const snapshotPath = path.join(stageDir, "rootark.sqlite");
   fs.mkdirSync(stageDir, { recursive: true });
@@ -1390,14 +1425,16 @@ async function createBackup(options = {}) {
     if (options.backupId != null && backupRepository.getBackup(id)) {
       throw Object.assign(new Error("Backup ID already exists"), { code: "BACKUP_ID_COLLISION" });
     }
-    sqliteSnapshot = await createSqliteSnapshot();
-    const collectionOptions = { stageDir, sqliteSnapshotPath: sqliteSnapshot?.snapshotPath, suppressionSnapshot: restoreProviderOrphans.createSnapshot() };
+    const persistenceMode = isDbEnabled() ? "sqlite" : "json";
+    sqliteSnapshot = await createSqliteSnapshot(persistenceMode);
+    const collectionOptions = { stageDir, sqliteSnapshotPath: sqliteSnapshot?.snapshotPath, persistenceMode, suppressionSnapshot: restoreProviderOrphans.createSnapshot() };
     const files = await collectBackupFiles(collectionOptions);
     const totalSize = files.reduce((sum, file) => sum + file.size, 0);
     const manifest = {
       backup_id: id,
       created_at: createdAt,
       type: backupType,
+      persistence_mode: persistenceMode,
       created_by: options.createdBy || null,
       total_size: totalSize,
       included_files: files.map((file) => ({ path: file.entryPath, size: file.size })),

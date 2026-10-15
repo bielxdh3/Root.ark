@@ -1,6 +1,8 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { Transform } = require("node:stream");
+const { pipeline } = require("node:stream/promises");
 const Database = require("better-sqlite3");
 const unzipper = require("unzipper");
 const { closeDb, getDatabasePath, isDbEnabled } = require("../db");
@@ -127,6 +129,16 @@ function requiresProviderOrphanPolicyAtStartup(startupState) {
   if (!startupState?.restartRequired) return false;
   const coordinator = startupState.coordinator || {};
   return coordinator.providerPolicyRequired !== false;
+}
+
+function assertWholeRestorePersistenceMode(coordinator) {
+  const persistenceMode = coordinator.persistenceMode;
+  if (persistenceMode !== "json" && persistenceMode !== "sqlite") {
+    throw new Error("Whole-restore persistence mode is missing or invalid; startup blocked for manual recovery");
+  }
+  if (persistenceMode !== (isDbEnabled() ? "sqlite" : "json")) {
+    throw new Error("Whole-restore persistence mode does not match active runtime; startup blocked for manual recovery");
+  }
 }
 
 function persistWholeRestoreCoordinator({ backupId, requiredRestartInstances, preRestoreBackupId = null, providerReconciliation = [], providerPolicyRequired = false, phase = "preparing" }) {
@@ -437,6 +449,7 @@ function assertNoPendingWholeRestore(options = {}) {
     throw new Error("Whole-restore coordinator is ambiguous; startup blocked for manual recovery");
   }
   if (coordinator.phase === "restart_required" && coordinator.preRestoreBackupId) {
+    assertWholeRestorePersistenceMode(coordinator);
     return { recovered: false, restartRequired: true, coordinator };
   }
   if (coordinator.phase === "cancelled") {
@@ -510,6 +523,7 @@ function prepareWholeRestoreStartup() {
     || coordinator.requiredRestartInstances > 128) {
     throw new Error("Whole-restore recovery is pending; startup blocked for manual recovery");
   }
+  assertWholeRestorePersistenceMode(coordinator);
   if (configuredRestartInstanceCount() !== coordinator.requiredRestartInstances) {
     throw new Error("ROOTARK_RESTORE_INSTANCE_COUNT does not match the pending restore coordinator instance count");
   }
@@ -529,6 +543,7 @@ function acknowledgeWholeRestoreInstance(explicitInstanceId, { deferCompletion =
   if (![2, LEGACY_WHOLE_RESTORE_COORDINATOR_VERSION, WHOLE_RESTORE_COORDINATOR_VERSION].includes(coordinator.version) || coordinator.phase !== "restart_required") {
     throw new Error("Whole-restore recovery is pending; startup blocked for manual recovery");
   }
+  assertWholeRestorePersistenceMode(coordinator);
   const requiredInstances = Number(coordinator.requiredRestartInstances);
   if (configuredRestartInstanceCount() !== requiredInstances) {
     throw new Error("ROOTARK_RESTORE_INSTANCE_COUNT does not match the pending restore coordinator instance count");
@@ -1267,6 +1282,95 @@ async function readManifest(archivePath) {
   return { zip, manifest };
 }
 
+function zipEntryUncompressedSize(entry) {
+  const size = Number(entry.uncompressedSize);
+  if (!Number.isSafeInteger(size) || size < 0) throw new Error("ZIP payload size is invalid for included_files reconciliation");
+  return size;
+}
+
+async function verifyZipEntrySize(entry, expectedSize) {
+  const stream = entry.stream();
+  let bytesRead = 0;
+  try {
+    for await (const chunk of stream) {
+      if (chunk.length > expectedSize - bytesRead) throw new Error("ZIP payload inflated size exceeds its declared size");
+      bytesRead += chunk.length;
+    }
+  } finally {
+    if (!stream.destroyed) stream.destroy();
+  }
+  if (bytesRead !== expectedSize) throw new Error("ZIP payload inflated size does not match its declared size");
+}
+
+async function validateIncludedFiles(zip, manifest) {
+  const hasIncludedFiles = Object.prototype.hasOwnProperty.call(manifest, "included_files");
+  if (hasIncludedFiles && !Array.isArray(manifest.included_files)) throw new Error("Manifest included_files is invalid");
+
+  const expected = new Map();
+  for (const item of hasIncludedFiles ? manifest.included_files : []) {
+    if (!item || typeof item.path !== "string" || !item.path || !Number.isSafeInteger(item.size) || item.size < 0) {
+      throw new Error("Manifest included_files entry is invalid");
+    }
+    let safePath;
+    try { safePath = assertSafeZipPath(item.path); }
+    catch { throw new Error("Manifest included_files contains an invalid path"); }
+    if (safePath !== item.path || safePath === "backup-manifest.json" || safePath.endsWith("/")) {
+      throw new Error("Manifest included_files path is not canonical");
+    }
+    const key = safePath.toLowerCase();
+    if (expected.has(key)) throw new Error("Manifest included_files contains a duplicate path");
+    expected.set(key, { path: safePath, size: item.size });
+  }
+
+  const actual = new Map();
+  const payloadEntries = [];
+  for (const entry of zip.files) {
+    if (entry.type === "Directory") continue;
+    const safePath = assertSafeZipPath(entry.path);
+    if (safePath === "backup-manifest.json") continue;
+    const key = safePath.toLowerCase();
+    const size = zipEntryUncompressedSize(entry);
+    actual.set(key, { path: safePath, size });
+    payloadEntries.push({ entry, key, size });
+  }
+
+  if (hasIncludedFiles) {
+    if (expected.size !== actual.size) throw new Error("Manifest included_files does not match ZIP payload members");
+    for (const [key, expectedEntry] of expected) {
+      const actualEntry = actual.get(key);
+      if (!actualEntry || actualEntry.path !== expectedEntry.path || actualEntry.size !== expectedEntry.size) {
+        throw new Error("Manifest included_files does not match ZIP payload members or sizes");
+      }
+    }
+  }
+
+  for (const { entry, key, size } of payloadEntries) {
+    await verifyZipEntrySize(entry, expected.get(key)?.size ?? size);
+  }
+}
+
+function validatePersistenceMode(manifest, hasSqlitePrimary) {
+  const activeMode = isDbEnabled() ? "sqlite" : "json";
+  const hasDeclaredMode = Object.prototype.hasOwnProperty.call(manifest, "persistence_mode");
+  let archiveMode;
+
+  if (hasDeclaredMode) {
+    archiveMode = manifest.persistence_mode;
+    if (archiveMode !== "sqlite" && archiveMode !== "json") throw new Error("Backup persistence mode is invalid");
+    if (archiveMode !== activeMode) throw new Error("Backup persistence mode does not match active runtime");
+    if (archiveMode === "sqlite" && !hasSqlitePrimary) throw new Error("SQLite database payload is missing from backup");
+    if (archiveMode === "json" && hasSqlitePrimary) throw new Error("JSON backup cannot contain a SQLite database payload");
+    return archiveMode;
+  }
+
+  archiveMode = hasSqlitePrimary ? "sqlite" : "json";
+  if (archiveMode !== activeMode) {
+    if (archiveMode === "sqlite") throw new Error("Legacy JSON runtime cannot restore a SQLite database payload");
+    throw new Error("Legacy SQLite backup is missing its database payload");
+  }
+  return archiveMode;
+}
+
 async function validateBackupArchive(backup, archivePath) {
   if (backup.checksum) {
     const checksum = await backupService.calculateFileHash(archivePath);
@@ -1276,13 +1380,23 @@ async function validateBackupArchive(backup, archivePath) {
   }
 
   const { zip, manifest } = await readManifest(archivePath);
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) throw new Error("Manifest invalido");
   const destinations = new Set();
+  let hasSqlitePrimary = false;
   for (const entry of zip.files) {
     if (isZipSymlink(entry)) throw new Error(`Symlink bloqueado no backup: ${entry.path}`);
     const safePath = assertSafeZipPath(entry.path);
     const destinationKey = safePath.replace(/\/+$/, "").toLowerCase();
     if (destinations.has(destinationKey)) throw new Error(`Entrada duplicada no backup: ${entry.path}`);
     destinations.add(destinationKey);
+    const foldedPath = safePath.toLowerCase();
+    if (foldedPath.startsWith("data/rootark.sqlite")) {
+      if (safePath !== "data/rootark.sqlite") {
+        throw new Error(`Non-canonical SQLite database or sidecar entry: ${entry.path}`);
+      }
+      if (entry.type === "Directory") throw new Error("SQLite database payload must be a regular file");
+      hasSqlitePrimary = true;
+    }
   }
   const manifestBackupId = String(manifest.backup_id || "");
   const selectedBackupId = String(backup?.id || "");
@@ -1290,8 +1404,10 @@ async function validateBackupArchive(backup, archivePath) {
   if (!selectedBackupId || manifestBackupId.toLowerCase() !== selectedBackupId.toLowerCase()) {
     throw new Error("Manifest do backup nao corresponde ao backup selecionado");
   }
+  const persistenceMode = validatePersistenceMode(manifest, hasSqlitePrimary);
+  await validateIncludedFiles(zip, manifest);
   await attestCiphertextOnlyArchive(zip);
-  return { zip, manifest };
+  return { zip, manifest, persistenceMode };
 }
 
 async function extractArchive(zip, targetDir) {
@@ -1314,7 +1430,25 @@ async function extractArchive(zip, targetDir) {
       throw new Error(`Path traversal bloqueado: ${entry.path}`);
     }
     restorePreimage.ensureSafeDirectory(path.dirname(destination), { create: true });
-    fs.writeFileSync(destination, await entry.buffer(), { flag: "wx", mode: 0o600 });
+    const expectedSize = zipEntryUncompressedSize(entry);
+    let bytesWritten = 0;
+    const sizeGuard = new Transform({
+      transform(chunk, _encoding, callback) {
+        if (chunk.length > expectedSize - bytesWritten) {
+          callback(new Error("ZIP payload inflated size exceeds its declared size"));
+          return;
+        }
+        bytesWritten += chunk.length;
+        callback(null, chunk);
+      },
+    });
+    try {
+      await pipeline(entry.stream(), sizeGuard, fs.createWriteStream(destination, { flags: "wx", mode: 0o600 }));
+      if (bytesWritten !== expectedSize) throw new Error("ZIP payload inflated size does not match its declared size");
+    } catch (error) {
+      try { fs.rmSync(destination, { force: true }); } catch {}
+      throw error;
+    }
   }
 }
 
@@ -2443,10 +2577,10 @@ async function restoreBackup(id, options = {}) {
         .filter((entry) => ["uploads", "temp"].includes(entry.area))
         .map(({ area, folderId, name }) => ({ area, folderId, name })));
     }
-    const { zip, manifest } = await validateBackupArchive(backup, archivePath);
+    const { zip, manifest, persistenceMode } = await validateBackupArchive(backup, archivePath);
     await options.revalidateAuthorization?.();
     const preRestoreBackupId = crypto.randomUUID();
-    coordinator = updateWholeRestoreCoordinator(coordinator, { preRestoreBackupId });
+    coordinator = updateWholeRestoreCoordinator(coordinator, { preRestoreBackupId, persistenceMode });
     preRestore = await backupService.createBackup({
       lockHeld: true,
       backupId: preRestoreBackupId,
@@ -2499,6 +2633,9 @@ async function restoreBackup(id, options = {}) {
     if (providerInventory !== null) await assertProviderContext(cloudStorage, providerInventoryContext);
     injectFailure("restore.before-local-commit");
     await options.revalidateAuthorization?.();
+    if (persistenceMode !== (isDbEnabled() ? "sqlite" : "json")) {
+      throw new Error("Restore persistence mode changed before local commit");
+    }
     mutationStarted = true;
     restoreQuarantine(quarantinePlan, (step, details) => injectFailure(step, details));
     if (quarantinePlan) {
@@ -2518,13 +2655,19 @@ async function restoreBackup(id, options = {}) {
     });
     if (pathExists(path.join(restoreDir, "uploads"))) restorePreimage.syncTree(resolveRuntimePath("uploads"));
     coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "uploads" });
-    injectFailure("restore.sqlite.before-replacement");
-    const restoredDatabase = restoreDatabaseFiles(restoreDir, {
-      lockHeld: true,
-      failureInjector(step, details) { injectFailure(`restore.sqlite.${step}`, details); },
-    });
-    coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "sqlite" });
-    if (restoredDatabase) injectFailure("restore.sqlite.committed");
+    if (persistenceMode === "sqlite") {
+      if (!isDbEnabled()) throw new Error("SQLite database restoration is unavailable in the active runtime");
+      injectFailure("restore.sqlite.before-replacement");
+      const restoredDatabase = restoreDatabaseFiles(restoreDir, {
+        lockHeld: true,
+        failureInjector(step, details) { injectFailure(`restore.sqlite.${step}`, details); },
+      });
+      if (!restoredDatabase) throw new Error("SQLite database was not restored; restore cannot advance");
+      coordinator = updateWholeRestoreCoordinator(coordinator, { lastCompletedStage: "sqlite" });
+      injectFailure("restore.sqlite.committed");
+    } else if (isDbEnabled()) {
+      throw new Error("Restore persistence mode changed before database replacement");
+    }
     if (providerOrphans !== null) {
       injectFailure("restore.provider-orphans.before-persist");
       await restoreProviderOrphans.write(providerOrphans, providerInventoryContext
