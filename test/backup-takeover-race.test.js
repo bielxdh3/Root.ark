@@ -145,3 +145,72 @@ test("stale takeover contenders preserve a newer live lock", { timeout: 30_000 }
     fs.rmSync(runtime, { recursive: true, force: true });
   }
 });
+
+test("malformed takeover tokens fail closed without moving evidence", { timeout: 30_000 }, async () => {
+  const runtime = newRuntime();
+  const backupDir = path.join(runtime, "data", "backups");
+  const takeoverDir = path.join(backupDir, ".backup.lock.takeover");
+  const evidencePath = path.join(takeoverDir, "evidence");
+  const authorityPath = path.join(takeoverDir, "authority.json");
+  const attemptPath = path.join(runtime, "rename-attempt.json");
+  const evidence = Buffer.from("disposable stale lock evidence");
+  fs.mkdirSync(takeoverDir, { recursive: true });
+  fs.writeFileSync(evidencePath, evidence);
+  const observedStat = fs.statSync(evidencePath, { bigint: true });
+  const statIdentity = {
+    dev: observedStat.dev.toString(),
+    ino: observedStat.ino.toString(),
+    size: Number(observedStat.size),
+    mtimeMs: Number(observedStat.mtimeMs),
+    ctimeMs: Number(observedStat.ctimeMs),
+    birthtimeMs: Number(observedStat.birthtimeMs),
+  };
+  const instanceId = String(process.env.ROOTARK_INSTANCE_ID || process.env.HOSTNAME || process.env.COMPUTERNAME || os.hostname() || "default").trim();
+  const tokens = ["../../../../escaped", "..\\..\\..\\..\\escaped"];
+
+  try {
+    for (const token of tokens) {
+      fs.writeFileSync(authorityPath, JSON.stringify({
+        version: 1,
+        token,
+        operation: "backup",
+        pid: 2_147_483_647,
+        instanceId,
+        claimedAt: new Date(0).toISOString(),
+        runtimeRoot: fs.realpathSync(runtime),
+        lockPath: path.join(backupDir, ".backup.lock"),
+        evidencePath,
+        observed: {
+          sha256: require("node:crypto").createHash("sha256").update(evidence).digest("hex"),
+          size: evidence.length,
+          stat: statIdentity,
+        },
+      }));
+
+      const childSource = `
+        const fs = require("node:fs");
+        const path = require("node:path");
+        const service = require(${JSON.stringify(SERVICE)});
+        const attemptPath = ${JSON.stringify(attemptPath)};
+        const evidencePath = path.resolve(service.LOCK_FILE + ".takeover" + path.sep + "evidence");
+        const renameSync = fs.renameSync;
+        fs.renameSync = function(source, destination, ...args) {
+          if (path.resolve(String(source)) === evidencePath) fs.writeFileSync(attemptPath, JSON.stringify({ destination: String(destination) }));
+          return renameSync.call(this, source, destination, ...args);
+        };
+        try { const release = service.acquireLock("backup"); release(); process.exit(12); }
+        catch (error) { process.exit(error.code === "BACKUP_LOCKED" ? 10 : 11); }
+      `;
+      const child = startChild(runtime, childSource);
+      const result = await child.result;
+      assert.equal(result.code, 10, result.stderr || result.stdout);
+      assert.equal(fs.existsSync(attemptPath), false, `token ${JSON.stringify(token)} must not reach the evidence rename`);
+      assert.equal(fs.existsSync(authorityPath), true, "ambiguous authority remains available for safe recovery");
+      assert.deepEqual(fs.readFileSync(evidencePath), evidence, "stale lock evidence remains in its protected directory");
+      fs.rmSync(authorityPath, { force: true });
+      fs.rmSync(attemptPath, { force: true });
+    }
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});

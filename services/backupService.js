@@ -630,8 +630,12 @@ function authorityPathIsSafe(target) {
   return path.dirname(path.resolve(target)) === path.resolve(BACKUPS_DIR) && path.basename(target) === path.basename(LOCK_TAKEOVER_DIR);
 }
 
+function validTakeoverToken(token) {
+  return typeof token === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token);
+}
+
 function validTakeoverAuthority(record) {
-  return record && record.version === OPERATION_LOCK_FORMAT_VERSION && typeof record.token === "string" && record.token && Number.isInteger(record.pid) && record.pid > 0 && (record.processInstanceId === undefined || (typeof record.processInstanceId === "string" && Boolean(record.processInstanceId))) && typeof record.instanceId === "string" && Boolean(record.instanceId) && typeof record.claimedAt === "string" && Number.isFinite(Date.parse(record.claimedAt)) && typeof record.runtimeRoot === "string" && sameRuntimeRoot(record.runtimeRoot, runtimeRootIdentity()) && record.lockPath === LOCK_FILE && record.evidencePath === LOCK_TAKEOVER_EVIDENCE && record.observed && typeof record.observed.sha256 === "string" && Number.isInteger(record.observed.size) && record.observed.stat;
+  return record && record.version === OPERATION_LOCK_FORMAT_VERSION && validTakeoverToken(record.token) && Number.isInteger(record.pid) && record.pid > 0 && (record.processInstanceId === undefined || (typeof record.processInstanceId === "string" && Boolean(record.processInstanceId))) && typeof record.instanceId === "string" && Boolean(record.instanceId) && typeof record.claimedAt === "string" && Number.isFinite(Date.parse(record.claimedAt)) && typeof record.runtimeRoot === "string" && sameRuntimeRoot(record.runtimeRoot, runtimeRootIdentity()) && record.lockPath === LOCK_FILE && record.evidencePath === LOCK_TAKEOVER_EVIDENCE && record.observed && typeof record.observed.sha256 === "string" && Number.isInteger(record.observed.size) && record.observed.stat;
 }
 
 function readTakeoverAuthority() {
