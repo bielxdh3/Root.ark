@@ -9,6 +9,7 @@ const backupRepository = require("../repositories/backupRepository");
 const backupService = require("./backupService");
 const restorePreimage = require("./restorePreimage");
 const restoreProviderOrphans = require("./restoreProviderOrphans");
+const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
 const { attestCiphertextOnlyArchive } = require("../src/services/deploymentResilience");
 const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, readQuarantineRegularFile, validateQuarantinePayloads } = require("../src/quarantine-paths");
 
@@ -32,24 +33,66 @@ function setCloudStorage(storage) {
 }
 
 function writeWholeRestoreCoordinator(coordinator) {
-  fs.mkdirSync(path.dirname(WHOLE_RESTORE_COORDINATOR_PATH), { recursive: true });
+  const directory = path.dirname(WHOLE_RESTORE_COORDINATOR_PATH);
+  fs.mkdirSync(directory, { recursive: true });
+  let previousBytes = null;
+  try { previousBytes = fs.readFileSync(WHOLE_RESTORE_COORDINATOR_PATH); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
   const persisted = {
     ...coordinator,
     directorySync: process.platform === "win32" ? "unsupported" : "fsync",
   };
   const temporary = `${WHOLE_RESTORE_COORDINATOR_PATH}.${crypto.randomUUID()}.tmp`;
-  const fd = fs.openSync(temporary, "wx", 0o600);
+  let renamed = false;
   try {
-    fs.writeFileSync(fd, `${JSON.stringify(persisted, null, 2)}\n`);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  try {
-    fs.renameSync(temporary, WHOLE_RESTORE_COORDINATOR_PATH);
-    fsyncCoordinatorDirectory(path.dirname(WHOLE_RESTORE_COORDINATOR_PATH));
+    const fd = fs.openSync(temporary, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, `${JSON.stringify(persisted, null, 2)}\n`);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    renameSyncWithWindowsEpermRetry(temporary, WHOLE_RESTORE_COORDINATOR_PATH);
+    renamed = true;
+    fsyncCoordinatorDirectory(directory);
   } catch (error) {
-    fs.rmSync(temporary, { force: true });
+    if (!renamed) {
+      try { fs.rmSync(temporary, { force: true }); }
+      catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], `Whole-restore coordinator publication failed: ${error.message}; temporary cleanup failed: ${cleanupError.message}`);
+      }
+      throw error;
+    }
+    if (!previousBytes) {
+      error.coordinatorBarrierMustRemain = true;
+      throw error;
+    }
+
+    const rollbackTemporary = `${WHOLE_RESTORE_COORDINATOR_PATH}.${crypto.randomUUID()}.tmp`;
+    let rollbackRenamed = false;
+    try {
+      const rollbackFd = fs.openSync(rollbackTemporary, "wx", 0o600);
+      try {
+        fs.writeFileSync(rollbackFd, previousBytes);
+        fs.fsyncSync(rollbackFd);
+      } finally {
+        fs.closeSync(rollbackFd);
+      }
+      renameSyncWithWindowsEpermRetry(rollbackTemporary, WHOLE_RESTORE_COORDINATOR_PATH);
+      rollbackRenamed = true;
+      fsyncCoordinatorDirectory(directory);
+    } catch (rollbackError) {
+      const errors = [error, rollbackError];
+      let cleanupError = null;
+      if (!rollbackRenamed) {
+        try { fs.rmSync(rollbackTemporary, { force: true }); }
+        catch (failure) { cleanupError = failure; errors.push(failure); }
+      }
+      const cleanupMessage = cleanupError ? `; rollback temporary cleanup failed: ${cleanupError.message}` : "";
+      const combinedError = new AggregateError(errors, `Whole-restore coordinator directory sync failed: ${error.message}; restoring prior coordinator failed: ${rollbackError.message}${cleanupMessage}`);
+      combinedError.coordinatorBarrierMustRemain = true;
+      throw combinedError;
+    }
     throw error;
   }
   return persisted;
@@ -504,7 +547,7 @@ function acknowledgeWholeRestoreInstance(explicitInstanceId, { deferCompletion =
     fs.fsyncSync(fd);
   } finally { fs.closeSync(fd); }
   try {
-    fs.renameSync(temporary, ackPath);
+    renameSyncWithWindowsEpermRetry(temporary, ackPath);
     fsyncCoordinatorDirectory(ackDirectory);
   } catch (error) {
     fs.rmSync(temporary, { force: true });
@@ -1639,7 +1682,7 @@ function writeQuarantineJournal(journalPath, journal) {
   try {
     fs.writeFileSync(temporary, `${JSON.stringify(journal)}\n`, { encoding: "utf8", flag: "wx" });
     fsyncFile(temporary);
-    fs.renameSync(temporary, journalPath);
+    renameSyncWithWindowsEpermRetry(temporary, journalPath);
     fsyncDirectory(path.dirname(journalPath));
   } catch (error) {
     fs.rmSync(temporary, { force: true });
@@ -1680,8 +1723,8 @@ function assertQuarantineRestoreStagedFile(pathname) {
   let descriptor;
   try {
     descriptor = fs.openSync(pathname, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    const descriptorStat = fs.fstatSync(descriptor);
-    const pathStat = fs.lstatSync(pathname);
+    const descriptorStat = fs.fstatSync(descriptor, { bigint: true });
+    const pathStat = fs.lstatSync(pathname, { bigint: true });
     if (!descriptorStat.isFile() || !pathStat.isFile() || pathStat.isSymbolicLink()
       || descriptorStat.dev !== pathStat.dev || descriptorStat.ino !== pathStat.ino) {
       throw new Error("Quarantine staged payload is not a regular file");
@@ -2002,7 +2045,7 @@ function writeRestoreJournal(journal) {
   try {
     fs.writeFileSync(temporary, `${JSON.stringify(journal, null, 2)}\n`, { flag: "wx" });
     fsyncFile(temporary);
-    fs.renameSync(temporary, pathname);
+    renameSyncWithWindowsEpermRetry(temporary, pathname);
     fsyncDirectory(path.dirname(pathname));
   } catch (error) {
     try { fs.rmSync(temporary, { force: true }); } catch {}
@@ -2519,7 +2562,7 @@ async function restoreBackup(id, options = {}) {
     };
   } catch (error) {
     let coordinatorCleanupFailed = false;
-    if (!mutationStarted && pathExists(WHOLE_RESTORE_COORDINATOR_PATH)) {
+    if (!mutationStarted && !error.coordinatorBarrierMustRemain && pathExists(WHOLE_RESTORE_COORDINATOR_PATH)) {
       try {
         const activeCoordinator = readWholeRestoreCoordinator();
         if (!activeCoordinator || (coordinator && activeCoordinator.transactionId !== coordinator.transactionId)) {

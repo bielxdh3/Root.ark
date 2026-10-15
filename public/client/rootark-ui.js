@@ -148,7 +148,7 @@
       '      <button type="button" class="icon-button mobile-menu" data-action="menu" aria-label="Abrir navegação" aria-controls="app-sidebar" aria-expanded="false"><span aria-hidden="true">☰</span></button>',
       '      <div class="topbar-context"><span class="topbar-kicker">ROOT.ARK</span><span class="topbar-divider" aria-hidden="true">/</span><span>' + title + "</span></div>",
       '      <div class="topbar-actions"><span class="topbar-secure"><span aria-hidden="true">●</span> Sessão protegida</span>',
-      '        <details class="account-menu"><summary><span class="avatar" aria-hidden="true">' + escape(name.slice(0, 1).toUpperCase()) + '</span><span class="account-name">' + name + '</span><span class="chevron" aria-hidden="true">⌄</span></summary>',
+      '        <details class="account-menu"><summary aria-label="Conta de ' + name + '"><span class="avatar" aria-hidden="true">' + escape(name.slice(0, 1).toUpperCase()) + '</span><span class="account-name">' + name + '</span><span class="chevron" aria-hidden="true">⌄</span></summary>',
       '          <div class="account-popover"><strong>' + name + '</strong><span>' + escape(roleLabel(user.role)) + '</span><button type="button" data-action="logout">Sair da conta</button></div>',
       "        </details>",
       "      </div>",
@@ -193,7 +193,12 @@
   function closeMobileNav(event) {
     const root = document.getElementById("app-root");
     const target = event.target && event.target.closest ? event.target : null;
-    if (!root || !isCompactViewport() || !root.classList.contains("nav-open") || target && target.closest(".sidebar, .mobile-menu")) return;
+    if (!root || !isCompactViewport() || !root.classList.contains("nav-open") || event.defaultPrevented || target && target.closest(".mobile-menu")) return;
+    if (target && target.closest(".sidebar .nav-link")) {
+      setMobileNavigation(root, false, true);
+      return;
+    }
+    if (target && target.closest(".sidebar")) return;
     const topbarAction = target && target.closest('.topbar button, .topbar a[href], .topbar input:not([disabled]), .topbar select:not([disabled]), .topbar textarea:not([disabled]), .topbar summary, .topbar [role="button"], .topbar [tabindex]:not([tabindex="-1"])');
     setMobileNavigation(root, false, !topbarAction, topbarAction);
   }

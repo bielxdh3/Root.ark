@@ -27,9 +27,9 @@ function getUnusedPort() {
   });
 }
 
-function request(port, requestPath, { method = "GET", headers = {}, body } = {}) {
+function request(port, requestPath, { method = "GET", headers = {}, body, agent } = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, path: requestPath, method, headers }, (res) => {
+    const req = http.request({ host: "127.0.0.1", port, path: requestPath, method, headers, agent }, (res) => {
       let responseBody = "";
       res.on("data", (chunk) => { responseBody += chunk; });
       res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: responseBody }));
@@ -241,7 +241,7 @@ async function uploadPayload(port, session, payload) {
   });
 }
 
-async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, totalChunks, bytes, encryptionLevel, password, versionComment, expiresInDays }) {
+async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, totalChunks, bytes, encryptionLevel, password, versionComment, expiresInDays, forwardedFor, agent }) {
   const parts = [
     { field: "uploadId", bytes: uploadId },
     { field: "originalName", bytes: originalName },
@@ -259,9 +259,11 @@ async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, 
       cookie: session.cookie,
       origin: `http://127.0.0.1:${port}`,
       "x-csrf-token": session.csrf,
+      ...(forwardedFor ? { "x-forwarded-for": forwardedFor } : {}),
       "content-type": payload.contentType,
       "content-length": payload.body.length,
     },
+    agent,
     body: payload.body,
   });
 }
@@ -321,6 +323,73 @@ function auditLogs(dir) {
   return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")).logs : [];
 }
 
+function auditLogFileSignature(file) {
+  const stat = fs.statSync(file, { bigint: true });
+  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+}
+
+async function waitForAuditLogs(dir, predicate, timeout = 3000, onTransientSyntaxError) {
+  const file = path.join(dir, "data", "audit-logs.json");
+  const deadline = Date.now() + timeout;
+  let lastSignature = auditLogFileSignature(file);
+  let activeWriteUntil = 0;
+
+  while (Date.now() < deadline) {
+    const before = auditLogFileSignature(file);
+    if (before !== lastSignature) activeWriteUntil = Date.now() + 100;
+    try {
+      const logs = JSON.parse(fs.readFileSync(file, "utf8")).logs;
+      if (predicate(logs)) return logs;
+    } catch (error) {
+      const after = auditLogFileSignature(file);
+      if (after !== before) activeWriteUntil = Date.now() + 100;
+      if (!(error instanceof SyntaxError) || Date.now() >= activeWriteUntil) throw error;
+      if (typeof onTransientSyntaxError === "function") onTransientSyntaxError(error);
+      lastSignature = after;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      continue;
+    }
+
+    const after = auditLogFileSignature(file);
+    if (after !== before) activeWriteUntil = Date.now() + 100;
+    lastSignature = after;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  throw new Error("timed out waiting for expected audit logs");
+}
+
+test("waits for audit logs to finish an observed rewrite before parsing", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-audit-write-race-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, "data"));
+  const file = path.join(dir, "data", "audit-logs.json");
+  fs.writeFileSync(file, JSON.stringify({ logs: [] }));
+
+  const expected = [{ id: "first" }, { id: "second" }];
+  let resolveTransientSyntaxError;
+  const transientSyntaxError = new Promise((resolve) => { resolveTransientSyntaxError = resolve; });
+  const waiting = waitForAuditLogs(
+    dir,
+    (logs) => logs.length === expected.length,
+    250,
+    () => resolveTransientSyntaxError()
+  );
+  fs.writeFileSync(file, "{\"logs\":[");
+  const observation = await Promise.race([
+    transientSyntaxError.then(() => "observed"),
+    waiting.then(() => "completed", () => "timed out")
+  ]);
+  assert.equal(observation, "observed", "the helper read malformed JSON during the observed-rewrite retry window");
+  fs.writeFileSync(file, JSON.stringify({ logs: expected }));
+  assert.deepEqual(await waiting, expected);
+
+  fs.writeFileSync(file, "{\"logs\":[");
+  await assert.rejects(waitForAuditLogs(dir, () => true), SyntaxError, "stable malformed JSON fails without a retry window");
+  fs.rmSync(file);
+  await assert.rejects(waitForAuditLogs(dir, () => true), { code: "ENOENT" }, "non-JSON file errors fail immediately");
+});
+
 const CHUNK_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 test("chunk-session sweep retries leftover parts after a tombstone unlink failure", { timeout: 45_000 }, async (t) => {
@@ -370,12 +439,15 @@ test("chunk-session sweep retries leftover parts after a tombstone unlink failur
   assert.deepEqual(Object.keys(firstMarker), ["__expiredAt"]);
   assert.equal(fs.existsSync(partPath), true, "part remains after the failed first sweep");
 
+  const expiryEventsPromise = waitForAuditLogs(harness.dir, (logs) => logs.filter((entry) =>
+    entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId
+  ).length >= 2);
   fs.writeFileSync(retrySweepPath, "run", { flag: "wx", mode: 0o600 });
   const retryDeadline = Date.now() + 3000;
   while (fs.existsSync(partPath) && Date.now() < retryDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(fs.existsSync(partPath), false, "a later sweep removes the leftover part promptly");
   assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), firstMarker, "retry preserves the original tombstone and its seven-day TTL");
-  const expiryEvents = auditLogs(harness.dir).filter((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId);
+  const expiryEvents = (await expiryEventsPromise).filter((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId);
   assert.deepEqual(expiryEvents.map((entry) => ({ result: entry.result, details: entry.details })), [
     { result: "failure", details: { source: "sweeper" } },
     { result: "success", details: { source: "sweeper" } },
@@ -891,6 +963,88 @@ test("chunk-session expiry sweep yields to requests and eventually reaches later
   assert.equal(fs.existsSync(finalPartPath), false, "the sweep eventually processes the last expired session");
 });
 
+test("transient EPERM while refreshing chunk activity retries the atomic metadata rename", { timeout: 45_000 }, async (t) => {
+  const uploadId = "activity-rename-retries-eperm";
+  const previousActivity = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  let attemptsPath;
+  const metadata = legacyChunkMetadata(uploadId, { lastActivityAt: previousActivity, totalChunks: 3 });
+  delete metadata.password;
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId, files: { "metadata.json": metadata, "0.part": "existing accepted chunk" } }],
+    preloadSource: ({ dir }) => {
+      attemptsPath = path.join(dir, "metadata-rename-attempts.txt");
+      return `
+      const fs = require("node:fs");
+      const renameSync = fs.renameSync;
+      let metadataRenameAttempts = 0;
+      fs.renameSync = (source, destination) => {
+        if (String(source).includes(".metadata-scrub-") && String(destination).endsWith("metadata.json")) {
+          metadataRenameAttempts += 1;
+          fs.writeFileSync(${JSON.stringify(attemptsPath)}, String(metadataRenameAttempts));
+          if (metadataRenameAttempts === 1) throw Object.assign(new Error("transient metadata rename failure"), { code: "EPERM" });
+        }
+        return renameSync.call(fs, source, destination);
+      };
+      `;
+    },
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 3,
+    bytes: Buffer.from("second chunk"),
+  });
+  assert.equal(response.status, 200, response.body);
+  assert.equal(fs.readFileSync(attemptsPath, "utf8"), "2", "one EPERM is retried exactly once before success");
+  const updatedMetadata = JSON.parse(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "metadata.json"), "utf8"));
+  assert.ok(Date.parse(updatedMetadata.lastActivityAt) > Date.parse(previousActivity));
+  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part"), "utf8"), "existing accepted chunk");
+  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "1.part"), "utf8"), "second chunk");
+});
+
+test("persistent EPERM while refreshing chunk activity fails closed and preserves prior metadata and part", { timeout: 45_000 }, async (t) => {
+  const uploadId = "activity-rename-persistent-eperm";
+  const previousActivity = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  let attemptsPath;
+  const metadata = legacyChunkMetadata(uploadId, { lastActivityAt: previousActivity, totalChunks: 3 });
+  delete metadata.password;
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId, files: { "metadata.json": metadata, "0.part": "existing accepted chunk" } }],
+    preloadSource: ({ dir }) => {
+      attemptsPath = path.join(dir, "metadata-rename-attempts.txt");
+      return `
+      const fs = require("node:fs");
+      const renameSync = fs.renameSync;
+      let metadataRenameAttempts = 0;
+      fs.renameSync = (source, destination) => {
+        if (String(source).includes(".metadata-scrub-") && String(destination).endsWith("metadata.json")) {
+          metadataRenameAttempts += 1;
+          fs.writeFileSync(${JSON.stringify(attemptsPath)}, String(metadataRenameAttempts));
+          throw Object.assign(new Error("persistent metadata rename failure"), { code: "EPERM" });
+        }
+        return renameSync.call(fs, source, destination);
+      };
+      `;
+    },
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 3,
+    bytes: Buffer.from("second chunk"),
+  });
+  assert.equal(response.status, 500, response.body);
+  assert.equal(fs.readFileSync(attemptsPath, "utf8"), "3", "persistent EPERM stops after three total attempts");
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "metadata.json"), "utf8")), metadata);
+  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part"), "utf8"), "existing accepted chunk");
+  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "1.part"), "utf8"), "second chunk");
+  assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId)).filter((name) => name.startsWith(".metadata-scrub-")), []);
+});
+
 test("failed chunk rename does not refresh accepted activity", { timeout: 45_000 }, async (t) => {
   const uploadId = "failed-chunk-rename-preserves-activity";
   const previousActivity = new Date(Date.now() - 60 * 60 * 1000).toISOString();
@@ -1269,7 +1423,7 @@ test("dot-segment upload IDs are rejected without touching sibling chunk session
 });
 
 test("upload chunk route limit rejects requests before Multer writes staging files", { timeout: 30_000 }, async (t) => {
-  const harness = await createHarness(t, { envOverrides: { ROUTE_RATE_LIMIT_MAX: "1" } });
+  const harness = await createHarness(t, { envOverrides: { API_RATE_LIMIT_MAX: "1000", UPLOAD_CHUNK_RATE_LIMIT_MAX: "1" } });
   const session = await login(harness.port, "uploader", harness.password);
   const first = await uploadChunk(harness.port, session, {
     uploadId: "rate-limited-first",
@@ -1292,6 +1446,136 @@ test("upload chunk route limit rejects requests before Multer writes staging fil
   assert.match(rejected.headers["retry-after"] || "", /^\d+$/);
   assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, rejectedId)), false);
   assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
+});
+
+test("chunk upload quota is per account across upload IDs and proxy-reported client IPs", { timeout: 45_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    secondUploaderHasFolderAccess: true,
+    envOverrides: {
+      API_RATE_LIMIT_MAX: "1000",
+      TRUSTED_PROXIES: "127.0.0.1",
+      UPLOAD_CHUNK_RATE_LIMIT_MAX: "1",
+    },
+  });
+  const uploaderSession = await login(harness.port, "uploader", harness.password);
+  const otherUploaderSession = await login(harness.port, "other-uploader", harness.password);
+
+  const firstAccountFirstUpload = await uploadChunk(harness.port, uploaderSession, {
+    uploadId: "account-limit-uploader-first",
+    originalName: "first.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: "first account chunk",
+    forwardedFor: "198.51.100.10",
+  });
+  assert.equal(firstAccountFirstUpload.status, 200, firstAccountFirstUpload.body);
+
+  const secondAccountFirstUpload = await uploadChunk(harness.port, otherUploaderSession, {
+    uploadId: "account-limit-other-first",
+    originalName: "other.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: "second account chunk",
+    forwardedFor: "198.51.100.10",
+  });
+  assert.equal(secondAccountFirstUpload.status, 200, secondAccountFirstUpload.body);
+
+  const sameAccountSecondUpload = await uploadChunk(harness.port, uploaderSession, {
+    uploadId: "account-limit-uploader-second",
+    originalName: "second.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: "must not be staged",
+    forwardedFor: "203.0.113.77",
+  });
+  assert.equal(sameAccountSecondUpload.status, 429, sameAccountSecondUpload.body);
+  assert.match(sameAccountSecondUpload.headers["retry-after"] || "", /^\d+$/);
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, "account-limit-uploader-second")), false);
+  assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
+});
+
+test("chunk upload bypasses the generic API ceiling only when the dedicated peer guard is active", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    envOverrides: { API_RATE_LIMIT_MAX: "1", UPLOAD_CHUNK_IP_RATE_LIMIT_MAX: "10" },
+  });
+  const exhaustedApiQuota = await request(harness.port, "/auth/me");
+  assert.equal(exhaustedApiQuota.status, 401, exhaustedApiQuota.body);
+
+  const malformedChunkRequest = await request(harness.port, "/upload-chunk", {
+    method: "POST",
+    headers: { "content-type": "application/json", "content-length": "1" },
+    body: "{",
+  });
+  assert.equal(malformedChunkRequest.status, 400, malformedChunkRequest.body);
+});
+
+test("chunk upload peer guard limits requests before JSON parsing and returns Retry-After", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    envOverrides: { API_RATE_LIMIT_MAX: "1000", UPLOAD_CHUNK_IP_RATE_LIMIT_MAX: "2" },
+  });
+  const sendMalformed = () => request(harness.port, "/upload-chunk", {
+    method: "POST",
+    headers: { "content-type": "application/json", "content-length": "1" },
+    body: "{",
+  });
+
+  assert.equal((await sendMalformed()).status, 400);
+  assert.equal((await sendMalformed()).status, 400);
+  const limited = await sendMalformed();
+  assert.equal(limited.status, 429, limited.body);
+  assert.match(limited.headers["retry-after"] || "", /^\d+$/);
+  assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
+});
+
+test("a valid upload can send all 2,000 allowed chunks within the configured window", { timeout: 180_000 }, async (t) => {
+  const harness = await createHarness(t, { envOverrides: { API_RATE_LIMIT_MAX: "1" } });
+  const session = await login(harness.port, "uploader", harness.password);
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  t.after(() => agent.destroy());
+  const uploadId = "two-thousand-chunk-window";
+
+  let completed;
+  for (let chunkIndex = 0; chunkIndex < 2000; chunkIndex += 1) {
+    completed = await uploadChunk(harness.port, session, {
+      uploadId,
+      originalName: "two-thousand-parts.txt",
+      chunkIndex,
+      totalChunks: 2000,
+      bytes: Buffer.from([chunkIndex % 256]),
+      agent,
+    });
+    assert.equal(completed.status, 200, `chunk ${chunkIndex}: ${completed.body}\n${harness.stderr.join("")}`);
+  }
+
+  assert.equal(JSON.parse(completed.body).complete, true);
+});
+
+test("chunk uploads accept the 8 MiB contract and reject larger parts without staging artifacts", { timeout: 45_000 }, async (t) => {
+  const harness = await createHarness(t);
+  const session = await login(harness.port, "uploader", harness.password);
+  const maxPartBytes = 8 * 1024 * 1024;
+  const acceptedId = "max-size-chunk-accepted";
+  const accepted = await uploadChunk(harness.port, session, {
+    uploadId: acceptedId,
+    originalName: "large-client-file.bin",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.alloc(maxPartBytes, 0x61),
+  });
+  assert.equal(accepted.status, 200, accepted.body);
+  assert.equal(fs.statSync(path.join(harness.chunkRoot, FOLDER_ID, acceptedId, "0.part")).size, maxPartBytes);
+
+  const rejectedId = "oversize-chunk-rejected";
+  const rejected = await uploadChunk(harness.port, session, {
+    uploadId: rejectedId,
+    originalName: "oversized-client-part.bin",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.alloc(maxPartBytes + 1, 0x62),
+  });
+  assert.equal(rejected.status, 413, rejected.body);
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, rejectedId)), false);
+  assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
 });
 
 test("Multer rejects malformed or disallowed multipart bodies without artifacts", { timeout: 30_000 }, async (t) => {
@@ -1451,6 +1735,104 @@ test("chunk session ids and numeric chunk indexes remain contained at their boun
   });
   assert.equal(rejectedBoundary.status, 400, rejectedBoundary.body);
   assert.equal(fs.existsSync(path.join(sessionDir, "2000.part")), false);
+});
+
+test("chunk metadata rejects path swaps with adjacent 64-bit file IDs", { timeout: 45_000 }, async (t) => {
+  const uploadId = "file-id-precision";
+  const adjacent = 9_007_199_254_740_992n;
+  const harness = await createHarness(t, {
+    waitForReady: false,
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId), "0.part": "original first part" } }],
+    preloadSource: [
+      'const fs = require("node:fs");',
+      'const path = require("node:path");',
+      'const adjacent = 9007199254740992n;',
+      'const matches = (target) => path.resolve(String(target)).split(path.sep).join("/").endsWith("/file-id-precision/metadata.json");',
+      'const originalOpen = fs.openSync;',
+      'const originalFstat = fs.fstatSync;',
+      'const originalLstat = fs.lstatSync;',
+      'const originalClose = fs.closeSync;',
+      'const originalPromisesOpen = fs.promises.open;',
+      'const originalPromisesLstat = fs.promises.lstat;',
+      'const descriptors = new Set();',
+      'const identify = (stats, args, ino) => new Proxy(stats, { get(target, key, receiver) { if (key === "dev") return args[0]?.bigint === true ? 1n : 1; if (key === "ino") return args[0]?.bigint === true ? ino : Number(ino); return Reflect.get(target, key, receiver); } });',
+      'fs.openSync = function (target, ...args) { const fd = originalOpen.call(this, target, ...args); if (matches(target)) descriptors.add(fd); return fd; };',
+      'fs.fstatSync = function (fd, ...args) { const stats = originalFstat.call(this, fd, ...args); return descriptors.has(fd) ? identify(stats, args, adjacent) : stats; };',
+      'fs.closeSync = function (fd) { descriptors.delete(fd); return originalClose.call(this, fd); };',
+      'fs.lstatSync = function (target, ...args) { const stats = originalLstat.call(this, target, ...args); return matches(target) ? identify(stats, args, adjacent + 1n) : stats; };',
+      'fs.promises.open = async function (target, ...args) { const handle = await originalPromisesOpen.call(this, target, ...args); if (matches(target)) { const stat = handle.stat.bind(handle); handle.stat = async (...statArgs) => identify(await stat(...statArgs), statArgs, adjacent); } return handle; };',
+      'fs.promises.lstat = async function (target, ...args) { const stats = await originalPromisesLstat.call(this, target, ...args); return matches(target) ? identify(stats, args, adjacent + 1n) : stats; };'
+    ].join("\n"),
+  });
+  try { await waitForServer(harness.port); } catch (error) { throw new Error(error.message + "\n" + harness.stderr.join("")); }
+  const session = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    bytes: Buffer.from("second part"),
+    password: "disposable-final-password",
+  });
+  assert.equal(Number(adjacent), Number(adjacent + 1n), "the injected adjacent file IDs collide as Numbers");
+  assert.notEqual(response.status, 200, response.body);
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  assert.equal(fs.readFileSync(path.join(sessionDir, "0.part"), "utf8"), "original first part");
+  assert.equal(fs.existsSync(path.join(sessionDir, "1.part")), false);
+});
+
+test("chunk-session expiry sweep rejects path swaps with adjacent 64-bit file IDs", { timeout: 45_000 }, async (t) => {
+  const uploadId = "async-file-id-precision";
+  let metadataPath;
+  let enablePath;
+  let observedPath;
+  const harness = await createHarness(t, {
+    envOverrides: { CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS: "1000" },
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId), "0.part": "original first part" } }],
+    preloadSource: ({ dir, chunkRoot }) => {
+      metadataPath = path.join(chunkRoot, FOLDER_ID, uploadId, "metadata.json");
+      enablePath = path.join(dir, "enable-async-file-id-injection");
+      observedPath = path.join(dir, "async-file-id-injection-observations");
+      return [
+        'const fs = require("node:fs");',
+        'const path = require("node:path");',
+        `const target = ${JSON.stringify(metadataPath)};`,
+        `const enable = ${JSON.stringify(enablePath)};`,
+        `const observed = ${JSON.stringify(observedPath)};`,
+        'const adjacent = 9007199254740992n;',
+        'const matches = (candidate) => path.resolve(String(candidate)) === path.resolve(target);',
+        'const identify = (stats, args, ino) => new Proxy(stats, { get(value, key, receiver) { if (key === "dev") return args[0]?.bigint === true ? 1n : 1; if (key === "ino") return args[0]?.bigint === true ? ino : Number(ino); return Reflect.get(value, key, receiver); } });',
+        'const originalOpen = fs.promises.open.bind(fs.promises);',
+        'const originalLstat = fs.promises.lstat.bind(fs.promises);',
+        'fs.promises.open = async function (candidate, ...args) { const handle = await originalOpen(candidate, ...args); if (matches(candidate)) { const stat = handle.stat.bind(handle); handle.stat = async (...statArgs) => { const value = await stat(...statArgs); return fs.existsSync(enable) ? identify(value, statArgs, adjacent) : value; }; } return handle; };',
+        'fs.promises.lstat = async function (candidate, ...args) { const value = await originalLstat(candidate, ...args); if (!matches(candidate) || !fs.existsSync(enable)) return value; fs.appendFileSync(observed, "x"); return identify(value, args, adjacent + 1n); };',
+      ].join("\n");
+    },
+  });
+
+  fs.writeFileSync(enablePath, "enabled", { flag: "wx" });
+  const firstSweepDeadline = Date.now() + 5_000;
+  while ((!fs.existsSync(observedPath) || fs.readFileSync(observedPath, "utf8").length < 1) && Date.now() < firstSweepDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(fs.existsSync(observedPath), true, "the async expiry reader inspected the metadata after injection was enabled");
+
+  const expiredAt = new Date(Date.now() - CHUNK_SESSION_TTL_MS - 60_000).toISOString();
+  const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+  metadata.lastActivityAt = expiredAt;
+  fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+  const secondSweepDeadline = Date.now() + 5_000;
+  while (fs.readFileSync(observedPath, "utf8").length < 2 && Date.now() < secondSweepDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(fs.readFileSync(observedPath, "utf8").length >= 2, "the async expiry reader reached a second sweep after the fixture became expired");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const sessionDir = path.dirname(metadataPath);
+  assert.equal(fs.readFileSync(path.join(sessionDir, "0.part"), "utf8"), "original first part");
+  const preservedMetadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+  assert.equal(preservedMetadata.lastActivityAt, expiredAt);
+  assert.equal(Object.hasOwn(preservedMetadata, "__expiredAt"), false, "an identity-mismatched session is not expired or rewritten");
 });
 
 test("malformed, unreadable, and orphan chunk sessions cannot overwrite retained parts", { timeout: 45_000 }, async (t) => {

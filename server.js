@@ -11,6 +11,7 @@ if (String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim() !== "1") {
 }
 const express = require("express");
 const { rateLimit } = require("express-rate-limit");
+const UploadChunkSlidingWindowStore = require("./src/middlewares/uploadChunkSlidingWindowStore");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
@@ -172,6 +173,8 @@ const CHUNK_UPLOAD_INCOMING_FILE_PATH = Symbol("rootarkChunkUploadIncomingFilePa
 const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
 const UPLOAD_STAGING_PATH = Symbol("rootarkUploadStagingPath");
 const MAX_UPLOAD_CHUNKS = 2000;
+const UPLOAD_CHUNK_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS, 1, MAX_UPLOAD_CHUNKS * 10);
+const UPLOAD_CHUNK_IP_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_IP_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS * 10, 1, MAX_UPLOAD_CHUNKS * 100);
 const CHUNK_UPLOAD_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CHUNK_UPLOAD_EXPIRED_TOMBSTONE_TTL_MS = CHUNK_UPLOAD_SESSION_TTL_MS;
 const CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS = parseBoundedNumber("CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS", 60 * 1000, 1000, 60 * 60 * 1000);
@@ -194,6 +197,7 @@ const UPLOAD_SUSPICIOUS_EXTENSIONS = new Set(
 );
 const NODE_ENV = String(process.env.NODE_ENV || "").trim().toLowerCase();
 const IS_PRODUCTION = NODE_ENV === "production";
+const PUBLISHED_SAMPLE_PASSWORDS = ["admin123", "user123"];
 if (!new Set(["clamav", "disabled"]).has(UPLOAD_SCAN_PROVIDER)) {
   throw new Error("UPLOAD_SCAN_PROVIDER must be 'clamav' or the explicit development-only value 'disabled'");
 }
@@ -594,6 +598,12 @@ function getCreatedUserSessionVersion(username) {
 }
 
 function saveUsers(users) {
+  const passwordHashesToValidate = trustedUserPasswordHashes === null
+    ? users
+    : users.filter((user) => trustedUserPasswordHashes.get(String(user?.username || "")) !== String(user?.password || ""));
+  if (NODE_ENV !== "test" && hasPublishedSampleCredentials(passwordHashesToValidate)) {
+    throw new Error("Published sample credentials are not allowed outside NODE_ENV=test.");
+  }
   if (shouldUseDatabase()) usersRepository.saveUsers(users);
   if (shouldWriteLegacyJson()) {
     rememberUserGenerations(users);
@@ -606,6 +616,7 @@ function saveUsers(users) {
       throw error;
     }
   }
+  trustedUserPasswordHashes = snapshotUserPasswordHashes(users);
 }
 
 function getBasePermissions() {
@@ -637,21 +648,43 @@ function normalizeUserPermissions(user = {}) {
   return permissions;
 }
 
+function developmentBootstrapDefaultsEnabled() {
+  return ["development", "test"].includes(process.env.NODE_ENV) && process.env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS === "true";
+}
+
+function hasPublishedSampleCredentials(users) {
+  return users.some((user) => PUBLISHED_SAMPLE_PASSWORDS.some((password) => bcrypt.compareSync(password, String(user?.password || ""))));
+}
+
+function isPublishedSamplePassword(password) {
+  return typeof password === "string" && PUBLISHED_SAMPLE_PASSWORDS.includes(password);
+}
+
 function getDefaultUsers() {
-  if (!["development", "test"].includes(process.env.NODE_ENV) || process.env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS !== "true") {
+  if (!developmentBootstrapDefaultsEnabled()) {
     throw new Error("No users are configured. Provide an explicit user seed or enable local development bootstrap.");
+  }
+
+  let adminPassword = "admin123";
+  let userPassword = "user123";
+  if (NODE_ENV === "development") {
+    adminPassword = process.env.ROOTARK_DEV_BOOTSTRAP_ADMIN_PASSWORD || "";
+    userPassword = process.env.ROOTARK_DEV_BOOTSTRAP_USER_PASSWORD || "";
+    if ([adminPassword, userPassword].some((password) => password.length < 16 || isPublishedSamplePassword(password)) || adminPassword === userPassword) {
+      throw new Error("Development bootstrap requires distinct passwords of at least 16 characters that are not published samples.");
+    }
   }
 
   return [
     {
       username: "admin",
-      password: bcrypt.hashSync("admin123", 10),
+      password: bcrypt.hashSync(adminPassword, 10),
       role: "admin",
       permissions: normalizeUserPermissions({ role: "admin" }),
     },
     {
       username: "user",
-      password: bcrypt.hashSync("user123", 10),
+      password: bcrypt.hashSync(userPassword, 10),
       role: "user",
       permissions: {
         ...getBasePermissions(),
@@ -661,12 +694,11 @@ function getDefaultUsers() {
   ];
 }
 
-function hasDevelopmentBootstrapCredentials(users) {
-  const defaults = new Map([["admin", "admin123"], ["user", "user123"]]);
-  return users.some((user) => {
-    const password = defaults.get(String(user?.username || "").trim().toLowerCase());
-    return Boolean(password && bcrypt.compareSync(password, String(user.password || "")));
-  });
+let publishedSampleCredentialsPresent = false;
+let trustedUserPasswordHashes = null;
+
+function snapshotUserPasswordHashes(users) {
+  return new Map(users.map((user) => [String(user?.username || ""), String(user?.password || "")]));
 }
 
 function loadSeedUsers() {
@@ -5502,9 +5534,12 @@ function initData() {
     console.log(seedUsers ? "User seed imported from data/users.json." : "Explicit local development users created.");
   }
 
-  if (process.env.NODE_ENV === "production" && hasDevelopmentBootstrapCredentials(loadUsers())) {
-    throw new Error("Development bootstrap credentials must be changed before production startup.");
+  const persistedUsers = loadUsers();
+  publishedSampleCredentialsPresent = hasPublishedSampleCredentials(persistedUsers);
+  if (NODE_ENV !== "test" && publishedSampleCredentialsPresent) {
+    throw new Error("Published sample credentials must be changed before startup outside NODE_ENV=test.");
   }
+  trustedUserPasswordHashes = snapshotUserPasswordHashes(persistedUsers);
 }
 
 app.set("trust proxy", TRUSTED_PROXIES);
@@ -5516,13 +5551,37 @@ const createRouteRateLimit = () => rateLimit({
   legacyHeaders: false,
   message: { error: "Muitas solicitações. Tente novamente mais tarde." },
 });
+const uploadChunkRateLimit = rateLimit({
+  windowMs: ROUTE_RATE_LIMIT_WINDOW_MS,
+  limit: UPLOAD_CHUNK_RATE_LIMIT_MAX,
+  store: new UploadChunkSlidingWindowStore(ROUTE_RATE_LIMIT_WINDOW_MS, UPLOAD_CHUNK_RATE_LIMIT_MAX),
+  keyGenerator: (req) => String(req.user?.username || ""),
+  standardHeaders: false,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    const resetAt = req.rateLimit?.resetTime?.getTime() ?? Date.now() + ROUTE_RATE_LIMIT_WINDOW_MS;
+    res.setHeader("Retry-After", String(Math.max(1, Math.ceil((resetAt - Date.now()) / 1000))));
+    return res.status(429).json({ error: "Limite temporario de envios em blocos atingido. Tente novamente mais tarde." });
+  },
+});
+const uploadChunkPeerRateLimit = rateLimit({
+  windowMs: ROUTE_RATE_LIMIT_WINDOW_MS,
+  limit: UPLOAD_CHUNK_IP_RATE_LIMIT_MAX,
+  keyGenerator: (req) => rateLimit.ipKeyGenerator(req.socket?.remoteAddress || "unknown"),
+  standardHeaders: false,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    const resetAt = req.rateLimit?.resetTime?.getTime() ?? Date.now() + ROUTE_RATE_LIMIT_WINDOW_MS;
+    res.setHeader("Retry-After", String(Math.max(1, Math.ceil((resetAt - Date.now()) / 1000))));
+    return res.status(429).json({ error: "Limite temporario de requisicoes em blocos atingido. Tente novamente mais tarde." });
+  },
+});
 const versionsRateLimit = createRouteRateLimit();
 const fileOpenTokenRateLimit = createRouteRateLimit();
 const openFileRedemptionRateLimit = createRouteRateLimit();
 const versionOpenTokenRateLimit = createRouteRateLimit();
 const shareRateLimit = createRouteRateLimit();
 const pendingRepairRateLimit = createRouteRateLimit();
-const uploadChunkRateLimit = createRouteRateLimit();
 const approveRateLimit = createRouteRateLimit();
 const rejectRateLimit = createRouteRateLimit();
 const deleteRateLimit = createRouteRateLimit();
@@ -5544,6 +5603,7 @@ const apiRequestRateLimit = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Muitas solicitações. Tente novamente mais tarde." },
+  skip: (req) => req.method === "POST" && req.path === "/upload-chunk",
 });
 const restoreRequestGate = createRestoreRequestGate({
   directory: RESTORE_ACTIVE_REQUESTS_DIR,
@@ -5569,6 +5629,7 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.static("./public"));
+app.post("/upload-chunk", uploadChunkPeerRateLimit);
 app.use(apiRequestRateLimit);
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
@@ -5784,6 +5845,9 @@ app.post("/users", authenticate, requirePermission("manageUsers"), (req, res) =>
   if (!username || !password) {
     return res.status(400).json({ error: "username e password obrigatorios" });
   }
+  if (isPublishedSamplePassword(password)) {
+    return res.status(400).json({ error: "Senha de amostra publicada nao permitida" });
+  }
 
   const users = loadUsers();
   if (users.find((u) => u.username === username)) {
@@ -5827,6 +5891,9 @@ app.put("/users/:username", authenticate, requirePermission("manageUsers"), (req
 
   const before = JSON.parse(JSON.stringify(users[idx]));
   const { password, role, permissions } = req.body;
+  if (isPublishedSamplePassword(password)) {
+    return res.status(400).json({ error: "Senha de amostra publicada nao permitida" });
+  }
   const sessionChanged = Boolean(password || (role && role !== users[idx].role) || (permissions && Object.entries(permissions).some(([key, value]) => users[idx].permissions?.[key] !== value)) || req.body.disabled !== undefined && Boolean(req.body.disabled) !== Boolean(users[idx].disabled));
   if (password) users[idx].password = bcrypt.hashSync(password, 10);
   if (role) users[idx].role = role;
@@ -6100,7 +6167,7 @@ const chunkUpload = multer({
     },
   }),
   defParamCharset: "utf8",
-  limits: { files: 1, fields: 10, fieldNestingDepth: 0 },
+  limits: { fileSize: SINGLE_UPLOAD_MAX_BYTES, files: 1, fields: 10, fieldNestingDepth: 0 },
 });
 
 function rejectLargeSingleUpload(req, res, next) {
@@ -6160,7 +6227,7 @@ function handleChunkUploadSingle(req, res, next) {
     }
     removeChunkUploadIncomingFile(req.file);
 
-    res.status(400).json({ error: error.message || "Upload do bloco nao concluido" });
+    res.status(error.code === "LIMIT_FILE_SIZE" ? 413 : 400).json({ error: error.message || "Upload do bloco nao concluido" });
   });
 }
 
@@ -7093,8 +7160,8 @@ function readChunkMetadataFile(metadataPath) {
   }
 
   try {
-    const descriptorStats = fs.fstatSync(descriptor);
-    const pathStats = fs.lstatSync(metadataPath);
+    const descriptorStats = fs.fstatSync(descriptor, { bigint: true });
+    const pathStats = fs.lstatSync(metadataPath, { bigint: true });
     if (
       !descriptorStats.isFile() ||
       pathStats.isSymbolicLink() ||
@@ -7105,7 +7172,7 @@ function readChunkMetadataFile(metadataPath) {
       throw new Error("Chunk-upload metadata changed during read");
     }
     const contents = fs.readFileSync(descriptor, "utf8");
-    const finalPathStats = fs.lstatSync(metadataPath);
+    const finalPathStats = fs.lstatSync(metadataPath, { bigint: true });
     if (
       finalPathStats.isSymbolicLink() ||
       !finalPathStats.isFile() ||
@@ -7120,34 +7187,43 @@ function readChunkMetadataFile(metadataPath) {
   }
 }
 
-function replaceChunkMetadataFile(sessionDir, metadataPath, metadata) {
+function replaceChunkMetadataFile(sessionDir, metadataPath, metadata, retryActivityRename = false) {
   assertSafeChunkSessionDirectory(sessionDir);
   const replacementPath = path.join(sessionDir, `.metadata-scrub-${crypto.randomUUID()}.tmp`);
   let originalStats = null;
   try {
-    originalStats = fs.lstatSync(metadataPath);
-    if (originalStats.isDirectory() || originalStats.nlink > 1) throw new Error("Chunk-upload metadata cannot be safely replaced");
+    originalStats = fs.lstatSync(metadataPath, { bigint: true });
+    if (originalStats.isDirectory() || originalStats.nlink > 1n) throw new Error("Chunk-upload metadata cannot be safely replaced");
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
 
   try {
     fs.writeFileSync(replacementPath, JSON.stringify(metadata, null, 2), { flag: "wx", mode: 0o600 });
-    assertSafeChunkSessionDirectory(sessionDir);
-    let currentStats = null;
-    try {
-      currentStats = fs.lstatSync(metadataPath);
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
+    const renameAttempts = retryActivityRename ? 3 : 1;
+    for (let attempt = 0; attempt < renameAttempts; attempt += 1) {
+      assertSafeChunkSessionDirectory(sessionDir);
+      let currentStats = null;
+      try {
+        currentStats = fs.lstatSync(metadataPath, { bigint: true });
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      if (
+        (originalStats && (!currentStats || originalStats.dev !== currentStats.dev || originalStats.ino !== currentStats.ino)) ||
+        (!originalStats && currentStats)
+      ) {
+        throw new Error("Chunk-upload metadata changed during replacement");
+      }
+      try {
+        fs.renameSync(replacementPath, metadataPath);
+        break;
+      } catch (error) {
+        if (!retryActivityRename || error.code !== "EPERM" || attempt === renameAttempts - 1) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, attempt === 0 ? 10 : 25);
+      }
     }
-    if (
-      (originalStats && (!currentStats || originalStats.dev !== currentStats.dev || originalStats.ino !== currentStats.ino)) ||
-      (!originalStats && currentStats)
-    ) {
-      throw new Error("Chunk-upload metadata changed during replacement");
-    }
-    fs.renameSync(replacementPath, metadataPath);
-    const installedStats = fs.lstatSync(metadataPath);
+    const installedStats = fs.lstatSync(metadataPath, { bigint: true });
     if (installedStats.isSymbolicLink() || !installedStats.isFile()) throw new Error("Chunk-upload metadata replacement is unsafe");
   } finally {
     fs.rmSync(replacementPath, { force: true });
@@ -7171,7 +7247,7 @@ function migrateChunkSessionMetadata(sessionDir, metadata) {
 
 function touchChunkSessionActivity(sessionDir, metadata, now = Date.now()) {
   const updated = { ...metadata, lastActivityAt: new Date(now).toISOString() };
-  replaceChunkMetadataFile(sessionDir, path.join(sessionDir, "metadata.json"), updated);
+  replaceChunkMetadataFile(sessionDir, path.join(sessionDir, "metadata.json"), updated, true);
   return updated;
 }
 
@@ -7223,8 +7299,8 @@ async function readChunkExpiryCandidate(sessionDir, uploadId, folderId, now = Da
 
   let file;
   try {
-    const descriptorStats = await handle.stat();
-    const pathStats = await fs.promises.lstat(metadataPath);
+    const descriptorStats = await handle.stat({ bigint: true });
+    const pathStats = await fs.promises.lstat(metadataPath, { bigint: true });
     if (
       !descriptorStats.isFile() ||
       pathStats.isSymbolicLink() ||
@@ -7235,7 +7311,7 @@ async function readChunkExpiryCandidate(sessionDir, uploadId, folderId, now = Da
       throw new Error("Chunk-upload metadata changed during read");
     }
     const contents = await handle.readFile("utf8");
-    const finalPathStats = await fs.promises.lstat(metadataPath);
+    const finalPathStats = await fs.promises.lstat(metadataPath, { bigint: true });
     if (
       finalPathStats.isSymbolicLink() ||
       !finalPathStats.isFile() ||
@@ -7248,7 +7324,7 @@ async function readChunkExpiryCandidate(sessionDir, uploadId, folderId, now = Da
   } finally {
     await handle.close();
   }
-  if (!file || file.links !== 1) return null;
+  if (!file || file.links !== 1n) return null;
 
   let metadata;
   try {
@@ -7410,12 +7486,12 @@ function loadChunkMetadata(sessionDir, expectedUploadId, expectedFolderId) {
     isValidLegacyChunkSessionMetadata(metadata, expectedUploadId, expectedFolderId) &&
     !Object.hasOwn(metadata, "uploaderSessionVersion")
   ) {
-    if (file.links !== 1 || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return blockChunkSessionResume(sessionDir);
+    if (file.links !== 1n || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return blockChunkSessionResume(sessionDir);
     return blockLegacyChunkSessionResume(sessionDir, metadata);
   }
 
   if (!isValidChunkSessionMetadata(metadata, expectedUploadId, expectedFolderId)) return blockChunkSessionResume(sessionDir);
-  if (file.links !== 1 || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return blockChunkSessionResume(sessionDir);
+  if (file.links !== 1n || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return blockChunkSessionResume(sessionDir);
   if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true || isChunkSessionExpiredMarker(metadata)) return metadata;
   return migrateChunkSessionMetadata(sessionDir, metadata);
 }
@@ -7455,12 +7531,12 @@ function scrubLegacyChunkPasswords() {
           !Object.hasOwn(metadata, "uploaderSessionVersion") &&
           isValidLegacyChunkSessionMetadata(metadata, sessionEntry.name, folderEntry.name)
         ) {
-          if (file.links !== 1 || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unsafe chunk-upload session contents");
+          if (file.links !== 1n || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unsafe chunk-upload session contents");
           blockLegacyChunkSessionResume(sessionDir, metadata);
           continue;
         }
         if (!isValidChunkSessionMetadata(metadata, sessionEntry.name, folderEntry.name)) throw new Error("Invalid chunk-upload metadata");
-        if (file.links !== 1 || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unsafe chunk-upload session contents");
+        if (file.links !== 1n || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unsafe chunk-upload session contents");
       } catch {
         blockChunkSessionResume(sessionDir);
         continue;
@@ -7560,10 +7636,17 @@ function saveChunkMetadata(sessionDir, metadata) {
 }
 
 function hasAllChunks(sessionDir, totalChunks) {
-  for (let index = 0; index < totalChunks; index += 1) {
-    if (!isExistingFile(path.join(sessionDir, `${index}.part`))) return false;
+  let received = 0;
+  for (const entry of fs.readdirSync(sessionDir, { withFileTypes: true })) {
+    const match = /^(0|[1-9]\d{0,3})\.part$/.exec(entry.name);
+    if (!match || Number(match[1]) >= totalChunks) continue;
+    if (entry.isSymbolicLink()) {
+      if (isExistingFile(path.join(sessionDir, entry.name))) received += 1;
+    } else if (entry.isFile()) {
+      received += 1;
+    }
   }
-  return true;
+  return received === totalChunks;
 }
 
 async function assembleChunkedUpload(sessionDir, destinationPath, totalChunks) {
@@ -7593,7 +7676,7 @@ async function assembleChunkedUpload(sessionDir, destinationPath, totalChunks) {
   }
 }
 
-app.post("/upload-chunk", authenticate, uploadChunkRateLimit, requirePermission("upload"), prepareUploadFolder, handleChunkUploadSingle, withChunkUploadSessionLock(async (req, res) => {
+app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunkRateLimit, prepareUploadFolder, handleChunkUploadSingle, withChunkUploadSessionLock(async (req, res) => {
   const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
   const uploadId = String(req.body.uploadId || "");
   const originalName = path.basename(String(req.body.originalName || ""));
@@ -8720,16 +8803,38 @@ function validWebDavMoveClaimRecord(record, transactionId) {
   return record && record.version === 1 && typeof record.token === "string" && record.token && record.transactionId === transactionId && Number.isInteger(Number(record.pid)) && Number(record.pid) > 0 && typeof record.claimedAt === "string" && Number.isFinite(Date.parse(record.claimedAt));
 }
 
+function webDavMoveExactFileId(value) {
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "string" && /^(0|[1-9]\d*)$/.test(value)) return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return String(value);
+  return null;
+}
+
 function webDavMoveFileStatIdentity(stat) {
-  return stat ? { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, birthtimeMs: stat.birthtimeMs } : null;
+  if (!stat) return null;
+  return {
+    dev: typeof stat.dev === "bigint" ? stat.dev.toString() : stat.dev,
+    ino: typeof stat.ino === "bigint" ? stat.ino.toString() : stat.ino,
+    size: typeof stat.size === "bigint" ? Number(stat.size) : stat.size,
+    mtimeMs: typeof stat.mtimeMs === "bigint" ? Number(stat.mtimeMs) : stat.mtimeMs,
+    ctimeMs: typeof stat.ctimeMs === "bigint" ? Number(stat.ctimeMs) : stat.ctimeMs,
+    birthtimeMs: typeof stat.birthtimeMs === "bigint" ? Number(stat.birthtimeMs) : stat.birthtimeMs,
+  };
+}
+
+function webDavMoveSameFileIdentity(left, right) {
+  if (!left || !right) return false;
+  const leftDev = webDavMoveExactFileId(left.dev);
+  const leftIno = webDavMoveExactFileId(left.ino);
+  return leftDev !== null && leftIno !== null && leftDev === webDavMoveExactFileId(right.dev) && leftIno === webDavMoveExactFileId(right.ino);
 }
 
 function webDavMoveSameStatIdentity(left, right) {
-  return Boolean(left && right && ["dev", "ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"].every((key) => left[key] === right[key]));
+  return Boolean(webDavMoveSameFileIdentity(left, right) && ["size", "mtimeMs", "ctimeMs", "birthtimeMs"].every((key) => left[key] === right[key]));
 }
 
 function webDavMoveSameRenamedIdentity(left, right) {
-  return Boolean(left && right && ["dev", "ino", "size", "mtimeMs", "birthtimeMs"].every((key) => left[key] === right[key]));
+  return Boolean(webDavMoveSameFileIdentity(left, right) && ["size", "mtimeMs", "birthtimeMs"].every((key) => left[key] === right[key]));
 }
 
 function webDavMoveClaimObservation(contents, stat) {
@@ -8771,17 +8876,13 @@ function webDavMoveReadTakeoverAuthority(lockPath, transactionId) {
 }
 
 function webDavMoveEvidenceMatchesAuthority(lockPath, authority) {
-  let stat;
-  let contents;
+  let evidence;
   try {
-    const link = fs.lstatSync(webDavMoveTakeoverEvidence(lockPath));
-    if (!link.isFile() || link.isSymbolicLink()) return false;
-    stat = link;
-    contents = readBoundedRegularFile(webDavMoveTakeoverEvidence(lockPath), WEBDAV_MOVE_MAX_CLAIM_BYTES).contents;
+    evidence = readBoundedRegularFile(webDavMoveTakeoverEvidence(lockPath), WEBDAV_MOVE_MAX_CLAIM_BYTES);
   } catch (error) {
     return error.code === "ENOENT";
   }
-  return sha256Buffer(contents) === authority.observed.sha256 && contents.length === authority.observed.size && webDavMoveSameRenamedIdentity(webDavMoveFileStatIdentity(stat), authority.observed.stat) && webDavMoveClaimToken(contents.toString()) === authority.previousToken;
+  return sha256Buffer(evidence.contents) === authority.observed.sha256 && evidence.contents.length === authority.observed.size && webDavMoveSameRenamedIdentity(webDavMoveFileStatIdentity(evidence.stat), authority.observed.stat) && webDavMoveClaimToken(evidence.contents.toString()) === authority.previousToken;
 }
 
 function webDavMoveRemoveTakeoverAuthority(lockPath, transactionId, token) {
@@ -10674,7 +10775,7 @@ setInterval(() => {
 }, CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS);
 setInterval(() => { void restoreRequestGate.run(() => cleanupIncomingUploads()); }, 60 * 1000);
 const listenForRequests = () => {
-  server.listen(PORT, () => {
+  const onListening = () => {
     void (async () => {
       try {
         if (startupRestoreCoordinator) {
@@ -10693,9 +10794,21 @@ const listenForRequests = () => {
         return;
       }
       startupRestoreLease();
-      console.log(`Servidor rodando em http://localhost:${PORT}`);
+      const address = server.address();
+      const host = address && typeof address === "object" ? address.address : "localhost";
+      const port = address && typeof address === "object" ? address.port : PORT;
+      const displayHost = host.includes(":") ? `[${host}]` : host;
+      console.log(`Servidor rodando em http://${displayHost}:${port}`);
     })();
-  });
+  };
+
+  // Test fixture credentials stay local even after the bootstrap opt-in is removed.
+  if (publishedSampleCredentialsPresent) {
+    server.listen(PORT, "127.0.0.1", onListening);
+    return;
+  }
+
+  server.listen(PORT, onListening);
 };
 void (async () => {
   await backupService.recoverRetentionAtStartup();

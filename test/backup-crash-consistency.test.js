@@ -203,10 +203,10 @@ test("backup operation lock is exclusive across real child processes", { timeout
     } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
   });
 
-  await t.test("a crash after replacement leaves a recoverable takeover authority", async () => {
+  await t.test("a crash after evidence cleanup staging leaves a recoverable takeover authority", async () => {
     const runtime = newRuntime("rootark-lock-owner-crash-");
     try {
-      const action = "crash-after-takeover-authority-removal";
+      const action = "crash-after-takeover-evidence-cleanup-stage";
       const lock = path.join(runtime, "data", "backups", ".backup.lock");
       fs.writeFileSync(lock, JSON.stringify({ token: "stale", operation: "backup", pid: 99999999 }));
       fs.utimesSync(lock, new Date(0), new Date(0));

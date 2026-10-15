@@ -55,18 +55,18 @@ function assertNoSymlinkComponents(targetPath) {
 function readRegularFile(filePath, maximumBytes) {
   let before;
   try {
-    before = fs.lstatSync(filePath);
+    before = fs.lstatSync(filePath, { bigint: true });
   } catch {
     refuse("required fixture file is unavailable");
   }
   if (before.isSymbolicLink() || !before.isFile()) refuse("fixture files must be regular files");
-  if (before.size > maximumBytes) refuse("fixture file exceeds the size limit");
+  if (before.size > BigInt(maximumBytes)) refuse("fixture file exceeds the size limit");
 
   const noFollow = fs.constants.O_NOFOLLOW || 0;
   let descriptor;
   try {
     descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
-    const opened = fs.fstatSync(descriptor);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
     if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
       refuse("fixture file changed while opening");
     }
