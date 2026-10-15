@@ -5445,6 +5445,85 @@ test("abrupt exit after provider-orphan policy persistence restores pre-restore 
   `);
 });
 
+test("abrupt exit after provider-orphan policy rename restores the prior pair before provider work and listener resume", () => {
+  runFixture(`
+    const childProcess = require("node:child_process");
+    const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
+    const statePath = path.join(dataDir, ".rootark-restore-provider-orphans-state.json");
+    const priorPolicy = JSON.stringify({ version: 1, objects: [{ area: "uploads", folderId: "root", name: "prior-orphan.txt" }], providerInventory: { state: "known" } });
+    const priorState = JSON.stringify({ version: 1, initializedAt: "2026-01-01T00:00:00.000Z", providerInventory: { state: "known" } });
+    write(policyPath, priorPolicy);
+    write(statePath, priorState);
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      write(path.join(dataDir, "restore-state.json"), "backup state");
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "restore-state.json"), "live state");
+      const restoreCode = [
+        'const fs=require("node:fs");const path=require("node:path");',
+        'const policyPath=path.resolve("data/.rootark-restore-provider-orphans.json");',
+        'const rename=fs.renameSync;fs.renameSync=function(source,destination){const result=rename.call(this,source,destination);if(path.resolve(destination)===policyPath)process.exit(86);return result;};',
+        "const backupService=require(" + JSON.stringify(${JSON.stringify(path.join(ROOT, "services", "backupService"))}) + ");",
+        "const restoreService=require(" + JSON.stringify(${JSON.stringify(path.join(ROOT, "services", "restoreService"))}) + ");",
+        'const cloud={enabled:()=>true,provider:"fixture",inventory:async()=>[{area:"temp",folderId:"root",name:"post-backup-pending.txt"}]};',
+        'backupService.setCloudStorage(cloud);restoreService.setCloudStorage(cloud);',
+        'restoreService.restoreBackup(' + JSON.stringify(backup.id) + ',{confirmation:"RESTORE"}).catch(()=>process.exit(87));',
+      ].join("\\n");
+      const crashed = childProcess.spawnSync(process.execPath, ["-e", restoreCode], {
+        cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000,
+      });
+      assert.equal(crashed.status, 86, crashed.stderr || crashed.stdout);
+      assert.notEqual(fs.readFileSync(policyPath, "utf8"), priorPolicy,
+        "the policy rename completed before the injected process exit");
+      assert.equal(fs.readFileSync(statePath, "utf8"), priorState,
+        "the child exits before publishing the matching state file");
+
+      const serverPath = ${JSON.stringify(path.join(ROOT, "server.js"))};
+      const cloudPath = ${JSON.stringify(path.join(ROOT, "services", "cloudStorage"))};
+      const restoreServicePath = ${JSON.stringify(path.join(ROOT, "services", "restoreService"))};
+      const sequencePath = path.join(dataDir, "restore-provider-pair-recovery-sequence.jsonl");
+      const recoveryCode = [
+        'const fs=require("node:fs");const net=require("node:net");',
+        'const policyPath="data/.rootark-restore-provider-orphans.json";const statePath="data/.rootark-restore-provider-orphans-state.json";',
+        'const sequencePath=' + JSON.stringify(sequencePath) + ';',
+        'const observe=(event)=>fs.appendFileSync(sequencePath,JSON.stringify({event,policy:fs.readFileSync(policyPath,"utf8"),state:fs.readFileSync(statePath,"utf8")})+"\\\\n");',
+        'const restore=require(' + JSON.stringify(restoreServicePath) + ');const recover=restore.assertNoPendingWholeRestore;restore.assertNoPendingWholeRestore=(...args)=>{const result=recover(...args);observe("recovery");return result};',
+        'const cloud=require(' + JSON.stringify(cloudPath) + ');',
+        'let provider;cloud.createCloudStorage=()=>provider={provider:"fixture",enabled:()=>true,status:()=>({provider:"fixture",enabled:true}),key:()=>"",resolveInventoryContext:async()=>{observe("provider-context");return "c".repeat(64)},inventory:async()=>{observe("provider-probe");return[]},list:async()=>[],download:async()=>false,upload:async()=>true,remove:async()=>{},removePrefix:async()=>{},resolveUploadId:async()=>"id"};',
+        'const listen=net.Server.prototype.listen;net.Server.prototype.listen=function(...args){const index=args.findIndex((value)=>typeof value==="function");if(index>=0){const callback=args[index];args[index]=function(...callbackArgs){observe("listener");const result=callback.apply(this,callbackArgs);setImmediate(async()=>{try{await provider.inventory();process.exit(0)}catch(error){console.error(error);process.exit(2)}});return result}}return listen.apply(this,args)};',
+        'require(' + JSON.stringify(serverPath) + ');',
+      ].join("\\n");
+      const restarted = childProcess.spawnSync(process.execPath, ["-e", recoveryCode], {
+        cwd: process.cwd(), env: { ...process.env, PORT: "0", NODE_ENV: "test", JWT_SECRET: "j".repeat(48), ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", CLOUD_STORAGE_PROVIDER: "fixture" },
+        encoding: "utf8", timeout: 30_000,
+      });
+      assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+      const events = fs.readFileSync(sequencePath, "utf8").trim().split(/\\r?\\n/).map((line) => JSON.parse(line));
+      const eventNames = events.map((entry) => entry.event);
+      const listenerIndex = eventNames.indexOf("listener");
+      assert.equal(eventNames[0], "recovery");
+      assert.ok(listenerIndex > 1 && eventNames.slice(1, listenerIndex).every((event) => event === "provider-context"),
+        "provider identity resolution runs after recovery and before listener resume");
+      assert.deepEqual(eventNames.slice(listenerIndex), ["listener", "provider-probe"],
+        "the manual provider probe remains distinct and happens after listener resume");
+      for (const entry of events) {
+        const restoredPolicy = JSON.parse(entry.policy);
+        const restoredState = JSON.parse(entry.state);
+        assert.deepEqual(restoredPolicy.objects, [{ area: "uploads", folderId: "root", name: "prior-orphan.txt" }],
+          entry.event + " resumes only after the prior policy is restored");
+        assert.deepEqual(restoredPolicy.providerInventory, { state: "known" });
+        assert.equal(restoredState.initializedAt, "2026-01-01T00:00:00.000Z",
+          entry.event + " resumes only after the prior state file is restored");
+        assert.deepEqual(restoredState.providerInventory, { state: "known" });
+      }
+      assert.equal(events[0].policy, priorPolicy, "recovery restores the exact policy pre-image before provider initialization");
+      assert.equal(events[0].state, priorState, "recovery restores the exact state pre-image before provider initialization");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("provider reconciliation waits for the final distinct restore startup acknowledgement", () => {
   runFixture(`
     const { createRestoreRequestGate } = require(${JSON.stringify(path.join(ROOT, "services", "restoreRequestGate"))});
