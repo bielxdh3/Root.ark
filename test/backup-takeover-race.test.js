@@ -193,6 +193,15 @@ test("malformed takeover tokens fail closed without moving evidence", { timeout:
         const service = require(${JSON.stringify(SERVICE)});
         const attemptPath = ${JSON.stringify(attemptPath)};
         const evidencePath = path.resolve(service.LOCK_FILE + ".takeover" + path.sep + "evidence");
+        const processKill = process.kill;
+        process.kill = function(pid, signal) {
+          if (pid === 2147483647 && signal === 0) {
+            const error = new Error("No such process");
+            error.code = "ESRCH";
+            throw error;
+          }
+          return processKill.call(process, pid, signal);
+        };
         const renameSync = fs.renameSync;
         fs.renameSync = function(source, destination, ...args) {
           if (path.resolve(String(source)) === evidencePath) fs.writeFileSync(attemptPath, JSON.stringify({ destination: String(destination) }));
