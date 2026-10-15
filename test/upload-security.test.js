@@ -321,6 +321,73 @@ function auditLogs(dir) {
   return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")).logs : [];
 }
 
+function auditLogFileSignature(file) {
+  const stat = fs.statSync(file, { bigint: true });
+  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+}
+
+async function waitForAuditLogs(dir, predicate, timeout = 3000, onTransientSyntaxError) {
+  const file = path.join(dir, "data", "audit-logs.json");
+  const deadline = Date.now() + timeout;
+  let lastSignature = auditLogFileSignature(file);
+  let activeWriteUntil = 0;
+
+  while (Date.now() < deadline) {
+    const before = auditLogFileSignature(file);
+    if (before !== lastSignature) activeWriteUntil = Date.now() + 100;
+    try {
+      const logs = JSON.parse(fs.readFileSync(file, "utf8")).logs;
+      if (predicate(logs)) return logs;
+    } catch (error) {
+      const after = auditLogFileSignature(file);
+      if (after !== before) activeWriteUntil = Date.now() + 100;
+      if (!(error instanceof SyntaxError) || Date.now() >= activeWriteUntil) throw error;
+      if (typeof onTransientSyntaxError === "function") onTransientSyntaxError(error);
+      lastSignature = after;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      continue;
+    }
+
+    const after = auditLogFileSignature(file);
+    if (after !== before) activeWriteUntil = Date.now() + 100;
+    lastSignature = after;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  throw new Error("timed out waiting for expected audit logs");
+}
+
+test("waits for audit logs to finish an observed rewrite before parsing", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-audit-write-race-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, "data"));
+  const file = path.join(dir, "data", "audit-logs.json");
+  fs.writeFileSync(file, JSON.stringify({ logs: [] }));
+
+  const expected = [{ id: "first" }, { id: "second" }];
+  let resolveTransientSyntaxError;
+  const transientSyntaxError = new Promise((resolve) => { resolveTransientSyntaxError = resolve; });
+  const waiting = waitForAuditLogs(
+    dir,
+    (logs) => logs.length === expected.length,
+    250,
+    () => resolveTransientSyntaxError()
+  );
+  fs.writeFileSync(file, "{\"logs\":[");
+  const observation = await Promise.race([
+    transientSyntaxError.then(() => "observed"),
+    waiting.then(() => "completed", () => "timed out")
+  ]);
+  assert.equal(observation, "observed", "the helper read malformed JSON during the observed-rewrite retry window");
+  fs.writeFileSync(file, JSON.stringify({ logs: expected }));
+  assert.deepEqual(await waiting, expected);
+
+  fs.writeFileSync(file, "{\"logs\":[");
+  await assert.rejects(waitForAuditLogs(dir, () => true), SyntaxError, "stable malformed JSON fails without a retry window");
+  fs.rmSync(file);
+  await assert.rejects(waitForAuditLogs(dir, () => true), { code: "ENOENT" }, "non-JSON file errors fail immediately");
+});
+
 const CHUNK_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 test("chunk-session sweep retries leftover parts after a tombstone unlink failure", { timeout: 45_000 }, async (t) => {
@@ -370,12 +437,15 @@ test("chunk-session sweep retries leftover parts after a tombstone unlink failur
   assert.deepEqual(Object.keys(firstMarker), ["__expiredAt"]);
   assert.equal(fs.existsSync(partPath), true, "part remains after the failed first sweep");
 
+  const expiryEventsPromise = waitForAuditLogs(harness.dir, (logs) => logs.filter((entry) =>
+    entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId
+  ).length >= 2);
   fs.writeFileSync(retrySweepPath, "run", { flag: "wx", mode: 0o600 });
   const retryDeadline = Date.now() + 3000;
   while (fs.existsSync(partPath) && Date.now() < retryDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(fs.existsSync(partPath), false, "a later sweep removes the leftover part promptly");
   assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, "utf8")), firstMarker, "retry preserves the original tombstone and its seven-day TTL");
-  const expiryEvents = auditLogs(harness.dir).filter((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId);
+  const expiryEvents = (await expiryEventsPromise).filter((entry) => entry.eventType === "upload.chunk_session.expired" && entry.target?.id === uploadId);
   assert.deepEqual(expiryEvents.map((entry) => ({ result: entry.result, details: entry.details })), [
     { result: "failure", details: { source: "sweeper" } },
     { result: "success", details: { source: "sweeper" } },
