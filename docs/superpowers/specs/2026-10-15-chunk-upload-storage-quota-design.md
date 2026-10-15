@@ -1,0 +1,140 @@
+# Chunk Upload Aggregate Storage Quota Design
+
+- **Status:** Draft for owner review
+- **Issue:** [#186](https://github.com/bielxdh3/Root.ark/issues/186)
+- **Design baseline:** `Root/main` SHA `2a3fea8b151302de73be755775e4ca8ca54d1c14`
+- **Scope:** Aggregate temporary-storage accounting for chunked uploads under `temp/.chunks`.
+
+## Problem and evidence
+
+The chunk endpoint limits an individual uploaded part to 8 MiB and a session to 2,000 parts. It does not currently impose an aggregate storage budget. A full session can therefore occupy 15.625 GiB in parts. Assembly creates a second copy before the parts are removed, so one completing session can require about 31.25 GiB of staging space. Multiple sessions and concurrent accounts have no shared storage ceiling.
+
+On the design baseline, `/upload-chunk` runs Multer before the handler validates multipart session fields. Multer writes each part into `temp/.chunks/incoming`; accepted parts are later moved into a session directory. When all parts are present, `assembled.upload` is created while the parts still exist. Existing cleanup deletes old incoming files by age without a durable quota record. The current session expiry is seven days of inactivity. The app may use JSON persistence or its own SQLite database, so quota accounting must not depend on either application data mode.
+
+The existing per-process rate limits are a separate control. This design limits temporary bytes and does not claim deployment-wide request-rate enforcement for issue #94.
+
+## Goals
+
+- Bound committed chunk parts, incoming writes, replacement backups, and assembly scratch together, both per account and system-wide.
+- Reserve capacity atomically before Multer can write the request body.
+- Preserve previously accepted parts when a new part cannot be accepted or safely promoted.
+- Fail closed for chunk uploads when limits or trustworthy accounting are unavailable, while leaving unrelated application functions available.
+- Recover conservatively after process interruption and preserve data whenever the ledger and filesystem cannot be reconciled safely.
+- Retain seven-day inactive-session expiry and avoid evicting another account's work to make room.
+- Support multiple application processes only when they run on one host and share the same local filesystem and SQLite ledger with reliable SQLite locking.
+
+## Non-goals
+
+- This does not limit final stored file bytes, database growth, normal (non-chunked) uploads, or the host's total disk usage.
+- This does not add a deployment-wide rate limiter or close issue #94.
+- This does not support multi-host workers, NFS, SMB, or other filesystems where SQLite locking/durability semantics are not established.
+- This does not promise protection from a full disk, filesystem corruption, external processes modifying staging files, or power-loss durability beyond the guarantees of the host filesystem and SQLite configuration.
+- This does not change Root.ark's JSON/SQLite application persistence mode or its cloud-provider commit semantics.
+
+## Considered approaches
+
+1. **Separate local SQLite ledger (selected).** SQLite `BEGIN IMMEDIATE` transactions serialize reservations across same-host processes. Durable rows make interrupted writes and quota ownership reconcilable without changing application persistence. This depends on a trustworthy local filesystem and safe ledger file.
+2. **JSON ledger with a lock.** This adds a lock protocol and crash-recovery rules around JSON replacement, and provides a weaker basis for coordinating concurrent processes. It is not selected.
+3. **Disable chunk uploads permanently.** This is safe from chunk-staging exhaustion but removes an existing capability even when an operator can configure an appropriate budget. It remains the fail-closed behavior when the selected mechanism cannot operate.
+
+## Configuration and fail-closed behavior
+
+Add two required positive byte limits, with no defaults and no sample capacity values:
+
+- `CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES`
+- `CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES`
+
+Values must be strict base-10 positive integers within JavaScript's safe-integer range; the per-account limit must not exceed the system limit. Missing, empty, malformed, unsafe, or contradictory values disable only chunk uploads. They must not prevent the rest of the server from starting. Configuration is read at process start and takes effect after restart.
+
+If the quota ledger cannot be safely opened, validated, migrated, or reconciled, chunk uploads return HTTP `503` with a stable machine-readable code and a generic operator-facing message. Capacity exhaustion returns HTTP `507` with a stable code and retry guidance. Preserve the existing JSON `error` field for client compatibility and add a stable `code` field. Do not set a fixed `Retry-After`: available capacity depends on concurrent sessions and cleanup. Do not expose paths, SQL errors, or ledger contents to clients.
+
+Use disposable, small byte limits in tests only. Do not publish an assumed production capacity in code or deployment examples; operators must choose values that fit their host's actual staging and disk budget.
+
+## Ledger and accounting model
+
+Place a dedicated SQLite database inside `temp/.chunks` (proposed filename `.quota.sqlite`), on the same local volume as incoming, session, and assembly files. It is separate from the app database. The database and all SQLite journal files must be excluded from downloads and backup/restore payloads, and skipped by generic temp cleanup. Existing backup policy already excludes `temp/.chunks`; keep that boundary explicit. Apply restrictive file permissions and reject symlinks, non-regular files, unsafe parent directories, failed SQLite integrity checks, and unsupported storage topology. Do not store credentials, file contents, or request secrets in the ledger.
+
+The ledger records, at minimum, a server-generated operation ID, canonical authenticated account identity, upload/session identity once known, validated relative staging path, operation state, reserved byte count, owner process instance/PID, and timestamps. A stable server-side user ID is preferred; do not trust account identity supplied in multipart fields. If the existing auth model only exposes usernames, the implementation must first verify canonicalization and account-recreation behavior and choose a stable, conservative bucket key.
+
+Each account/system total is the sum of all live ledger charges, including:
+
+- **Incoming reservation:** maximum bytes reserved for an in-progress Multer write.
+- **Committed part:** actual bytes in a validated numbered part.
+- **Replacement backup:** old part bytes retained while a replacement is being promoted or recovered.
+- **Assembly scratch:** reserved bytes for `assembled.upload` or a temporary assembly file.
+
+The ledger itself, SQLite journal files, metadata JSON, and directory overhead are not charged as chunk payload bytes, but they remain subject to filesystem safety checks. A budget is an application-level cap, not a guarantee that the underlying filesystem has that much free space.
+
+Every reserve, release, ownership transfer, and state transition affecting totals runs in a short SQLite write transaction (`BEGIN IMMEDIATE` or equivalent). Check both account and system budgets in that same transaction, then commit before starting the filesystem write. Set a bounded SQLite busy timeout. If a transaction fails or accounting is ambiguous, do not proceed with the write.
+
+## Request and promotion flow
+
+1. Authenticate and authorize the request using the existing middleware. Create a cryptographically random server-side operation ID and reserve up to the existing 8 MiB file limit against both budgets before Multer writes. Do not trust multipart fields or a client-supplied byte count. If no safe reservation is possible, reject before Multer and write no file.
+2. Write only to the existing safe incoming area using the ledger-linked random operation path. Preserve Multer's existing per-file byte cap. After parsing, validate all existing fields, session ownership, session version, chunk index, and encryption inputs as today.
+3. Convert the incoming reservation from its upper bound to the actual staged file size only after verifying the file is a regular file within the incoming root. For a rejected or failed upload, remove the exact validated temporary file and release the reservation only after deletion is confirmed. If deletion cannot be confirmed, retain the charge and mark the operation for recovery.
+4. Before promoting a part, reserve/transition enough ledger charge for the actual incoming part and any replacement backup that must coexist. Keep an existing part until the new part is safely installed. Use a recoverable same-volume promotion protocol so a rename failure or process interruption can restore the prior part; do not delete the old part first. Count the prior part until it is physically removed and confirmed.
+5. If this part would complete the session, calculate the assembled size from verified part sizes plus the incoming part, accounting for replacement of any old part. Reserve that entire assembly scratch amount before committing the final part. If either budget would be exceeded, reject the new part with `507`, remove its incoming temporary file if safe, and leave all previously accepted parts unchanged.
+6. Assemble to a controlled temporary path while all source parts remain charged and intact. Only mark assembly ready after its file is verified. Keep the parts and assembly simultaneously charged and intact through scanning, in-place encryption, and the handoff below; this is the peak-capacity case the configured budgets must cover. Immediately before `encryptFileInPlace` begins writing, durably commit the `encrypting` ledger state so restart recovery can classify any partial overwrite. If assembly, scan, or encryption fails, preserve source parts until safe cleanup is confirmed; keep charges for any files that remain. On a scan rejection, remove parts and scratch through validated paths and release each charge only after deletion is confirmed.
+7. Before moving `assembled.upload` from its session directory into the existing folder `tempDir`, persist a `handoff_pending` ledger state with the validated destination, folder/file identity, and expected size. Keep the assembly charge until the same-volume rename is verified and the existing pending-upload record (plus encrypted-file metadata, when applicable) and cloud intent are durably confirmed. Then mark the handoff complete and release the assembly charge exactly once. After that durable registration, remove the retained source parts one by one and release each part charge only after deletion is verified. Pending files that have completed this handoff are governed by the existing pending-upload lifecycle and are outside this chunk-staging quota; this quota does not bound total `temp/` storage. If rename returns `EXDEV` or any other error, do not copy around the quota or release the charge.
+8. On restart during handoff, reconcile the exact recorded source/destination pair. If the source remains and destination is absent, do not trust or reuse the source: it may have been partly overwritten during encryption. When intact source parts remain, delete only the exact validated assembly scratch, release its scratch charge after confirmed deletion, and permit a later authenticated request to reassemble, rescan, and re-encrypt; a required password must be supplied again by the client. If source is absent and the exact destination is present with the recorded size and matching durable pending metadata, complete the handoff, release the assembly charge, and safely remove any remaining charged parts. If no pending record exists but intact source parts remain, remove only the verified destination and allow reassembly from those parts while retaining their charges. If registration is partial/ambiguous, both paths exist unexpectedly, neither path exists, source parts are unavailable, or the destination is unsafe, preserve files and the charge and fail closed for chunk uploads until repaired. Never interpret a missing source alone as proof of successful handoff.
+9. On other rejection or cleanup paths, remove staging files through the existing safe path checks. Release assembly/incoming charges only after confirmed removal. On cleanup failure, retain the charge and recoverable operation record; conservative over-counting is preferable to under-counting.
+
+Implementation must preserve authorization, audit events, scanning, encryption, pending approval, cloud lifecycle, and existing response compatibility. Chunk-session metadata and the new `assembled.upload`/temporary assembly names must be reconciled with the existing safe-entry allowlist deliberately; never broaden it to arbitrary files.
+
+## Concurrency and crash recovery
+
+Use explicit durable operation states such as `reserved`, `writing`, `staged`, `promoting`, `part_committed`, `assembling`, `assembled`, `encrypting`, `handoff_pending`, `handed_off`, and `cleanup_pending`. Exact names may change during implementation, but each filesystem transition must have a corresponding recoverable ledger state. Persist the reservation before any body bytes are written. Persist intent before rename/delete boundaries, and record completion only after validating the resulting path and size.
+
+Register each server process with a random process-instance ID and PID. At startup, inspect only ledger operations whose owning process is no longer present on the same host. Never sweep or rewrite an operation owned by a live process: another worker may be receiving or promoting it. A PID that appears live may conservatively retain a stale reservation; this can reduce availability but cannot create extra capacity. Do not reclaim by TTL alone.
+
+Serialize first-time schema setup and import of existing sessions using a SQLite write lock and a durable ready/schema-version marker. No process may accept chunk writes until it observes the completed marker. The import must be idempotent if the importing process stops before committing the marker. For recovery work after initialization, atomically claim each dead-owner operation for the recovering process before touching files; another live process must skip that claim. If the recovering process stops, its claim becomes recoverable by the same dead-owner protocol. Keep filesystem recovery steps idempotent across a crash between the filesystem action and its ledger update.
+
+For a dead owner, validate all paths against the expected roots, reject links and unexpected entries, and reconcile each known state deterministically. Preserve source parts through durable pending-upload registration. For a known partial or pre-handoff assembly with intact parts, verify that the exact recorded assembly path is a regular file in the session root, delete it rather than attempting to reuse it, release its scratch charge only after deletion is confirmed, and allow a later authorized request to reassemble and rescan from the intact parts. This is required because `encryptFileInPlace` overwrites the assembly file: a process interruption can leave plaintext, complete ciphertext, or partial ciphertext, and encryption metadata/password input may not be recoverable. Never store passwords in the ledger; the client must resupply a password on a retry when the selected encryption mode requires one. Recover a part replacement by restoring the prior part or completing the new promotion only when the recorded state and both files prove which action is safe.
+
+If the ledger is corrupt, an incoming/session file is untracked, a path is unsafe, byte counts contradict files, or a transition cannot be determined, preserve all affected files, keep any known charges, and disable chunk uploads until operator repair. Do not auto-delete unexplained files. The subsystem may expose a sanitized readiness reason to administrators/logs, but must not leak the staging path to ordinary users.
+
+Initial rollout with existing sessions requires all old application processes to be stopped before enabling the new code. Under the new process, import only metadata-valid sessions and regular numbered parts whose ownership can be attributed safely; charge their actual sizes before accepting new requests. Preserve and quarantine from service any ambiguous or unsafe state, and disable the chunk endpoint if accounting cannot be proven. Rolling mixed-version upgrades are unsupported because old processes do not participate in the quota ledger.
+
+## Expiry and cleanup
+
+Keep the existing seven-day inactivity policy. The current multipart upload ID is unavailable until Multer parses the request, so a request that is still receiving its body cannot yet hold that session's existing lock. Define the ordering explicitly: only a validated request that has acquired the session lock and recorded its session operation counts as live activity. Expiry may win before that point; it must write/retain the expired marker, and the parsed request must then acquire the lock, observe the marker, remove its own incoming file, return `409`, and never recreate or overwrite that session. If the upload handler acquires the lock first, it records the operation/touches activity; the expiry worker must re-read metadata under the same lock and preserve the active session.
+
+Under a serialized ledger transition, mark an expired session, safely validate its entries, remove each part/scratch file, and release each charge only after confirmed deletion. Retain the existing tombstone/restart behavior for longer than the bounded HTTP request lifetime so an in-flight stale request cannot race marker removal. If cleanup fails, retain the bytes as charged and retry through the recovery path; never evict another account's session to satisfy a limit.
+
+Replace age-only deletion of incoming files with ledger-aware cleanup. A stale timestamp alone is not authority to delete an incoming file. Cleanup may release an abandoned operation only after its owner is confirmed dead, the exact ledger-linked path is verified, and the file is successfully removed. Untracked incoming files are preserved and cause fail-closed behavior until reconciled.
+
+For a live request, release an incoming reservation on a terminal request outcome (`finish`, `aborted`, or error) only after safe cleanup is confirmed. Do not reclaim it by an arbitrary lease TTL while the owning process/request may still be writing. Verify that the HTTP server's bounded request timeout terminates clients that reserve space but never complete the body, and test that timeout/abort cleanup does not race an active write.
+
+## Deployment boundary
+
+Supported: multiple Root.ark processes on one host, using the same local filesystem paths and one SQLite ledger with working local SQLite locks. Each process must use the same configured byte budgets and compatible code version. Filesystem type cannot be reliably identified portably by this application, so single-host/local-volume placement is an operator deployment precondition; do not enable this feature where that precondition cannot be established.
+
+Unsupported: multiple hosts, NFS, SMB, or a topology where a process can write staging data without consulting this ledger. Document this boundary in setup/deployment guidance. Do not call the control distributed or production-ready without deployment-specific evidence. A failed capacity check is a temporary refusal; the client can retry after existing sessions are completed or safely expire, without losing previously committed chunks.
+
+## Acceptance and regression tests
+
+Use disposable runtime directories and small test budgets. Do not run destructive tests against user staging data. Add focused tests covering:
+
+1. Missing, empty, malformed, zero, unsafe, and contradictory configuration: server remains usable, chunk endpoint returns the expected `503` code, and no incoming file is created.
+2. Per-account and system caps, exact-boundary success, one-byte-over rejection, and concurrent reservations from multiple server processes: no budget can be oversubscribed.
+3. Reservation occurs before Multer writes; an oversized/aborted/malformed multipart request releases only after safe cleanup, or conservatively retains the charge when cleanup fails.
+4. Retry/replacement preserves the previous part when quota is exhausted or rename/promotion fails; replacement backup bytes are counted during the transition.
+5. Completing a session reserves the full assembly size before final-part commit; rejected assembly reservation preserves prior parts. Successful assembly and all accepted source parts remain charged together through scan/encryption until the durable pending-upload handoff is verified; source-part charges are released only after their post-handoff deletion succeeds.
+6. Scan rejection, encryption/publish failure, deletion failure, and process interruption at reservation, Multer write, part promotion, assembly, in-place encryption write (including a partially overwritten assembly), and cleanup boundaries. After interruption during encryption, verify recovery deletes only the exact assembly scratch and rebuilds/rescans from retained parts; it must not double-encrypt or require a password from the ledger.
+7. Startup reconciliation with a live second process, a dead process, a stale but apparently live PID, an orphan incoming file, corrupt SQLite, symlinked/unsafe paths, mismatched byte counts, and valid pre-ledger sessions. Exercise simultaneous first startup and interruption during first-time import; retry must not double-charge safe legacy parts. Include a restart after interruption while writing `assembled.upload`: the exact ledger-linked partial assembly is recognized, reconciled only while its source parts remain intact, and its charge is released only after safe deletion; an unknown assembly-like entry remains preserved and fails closed. Ambiguous data is preserved and chunk uploads fail closed.
+8. Handoff failure before rename, process interruption after rename but before pending registration, interruption after pending and encrypted-file metadata/cloud-intent registration but before ledger release, and restart recovery of the exact destination. Verify that quota is released once, only after verified handoff; if registration is absent but source parts remain, recovery can discard the exact unregistered destination and retry from the parts; uncertain destination or partial registration preserves data and charge and disables chunk uploads.
+9. Seven-day expiry, restart with a tombstone, cleanup retry, and no release of quota while the file still exists. Pause an in-flight multipart request before its fields are parsed, let expiry win, then resume the body; the request must receive `409`, its incoming file must be safely removed, and the expired session must not be recreated. Exercise the opposite lock ordering as well: a validated in-flight operation touches activity before expiry rechecks, so the session survives.
+10. SQLite busy/locking behavior across same-host processes; unsupported or unverified deployment topology is documented as an enablement blocker, and unsafe ledger permissions fail closed.
+11. Existing upload authorization, CSRF/method behavior, audit, scanning/quarantine, encryption, JSON/SQLite app-storage modes, cloud-provider staging, frontend error display, and ordinary non-chunked upload behavior remain unchanged.
+
+Run focused regressions while implementing. Run the complete supported validation matrix on each published PR head and again on the exact final `Root/main` SHA; never reuse results from a different SHA.
+
+## Documentation and remaining issue state
+
+Update `.env.example` and deployment/setup guidance with the required variable names, no capacity defaults, the fail-closed behavior, the same-host/local-volume limit, and the operator's responsibility to choose limits from actual disk capacity. Document that temporary staging capacity is distinct from final storage and from request-rate controls.
+
+Issue #186 remains open until the code, tests, deployment documentation, exact-head CI, and exact-final-branch validation satisfy its acceptance criteria. Before completion, record the operator-selected per-account/system byte values and the deployment topology actually supported; this design intentionally invents no capacity values. Issues #63–#68 and #94 remain independently open unless their own criteria are met. Do not represent this design document as an implemented quota or as production deployment evidence.
+
+## Owner approval gate
+
+This document records the selected design from the approved discussion. Implementation may begin only after the owner reviews and approves this written specification. Any material design change discovered during implementation must be returned for review before expanding scope.
