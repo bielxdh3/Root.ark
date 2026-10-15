@@ -195,6 +195,67 @@ test("backup creation fails when source contents change in place without changin
   `);
 });
 
+test("backup source swapped for a FIFO before descriptor open fails without blocking", { skip: process.platform === "win32" }, () => {
+  runFixture(`
+    const filePath = path.join(dataDir, "settings.json");
+    fs.writeFileSync(filePath, "disposable source bytes");
+    const { spawnSync } = require("node:child_process");
+    const originalOpenSync = fs.openSync;
+    let fifoInstalled = false;
+    fs.openSync = function (target, ...args) {
+      if (target === filePath && !fifoInstalled) {
+        fs.unlinkSync(filePath);
+        const fifo = spawnSync("mkfifo", [filePath], { encoding: "utf8" });
+        assert.equal(fifo.status, 0, fifo.stderr || "mkfifo failed");
+        fifoInstalled = true;
+      }
+      return originalOpenSync.call(this, target, ...args);
+    };
+    try {
+      await assert.rejects(
+        backupService.createBackup({ createdBy: "fixture", backupId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" }),
+        /Backup source/,
+      );
+    } finally {
+      fs.openSync = originalOpenSync;
+    }
+    assert.equal(fifoInstalled, true);
+  `, {}, 5_000);
+});
+
+test("backup source swapped for a FIFO after streaming fails without reopening the path", { skip: process.platform === "win32" }, () => {
+  runFixture(`
+    const filePath = path.join(dataDir, "settings.json");
+    fs.writeFileSync(filePath, "disposable source bytes");
+    const { spawnSync } = require("node:child_process");
+    const { Readable } = require("node:stream");
+    const originalCreateReadStream = fs.createReadStream;
+    let fifoInstalled = false;
+    fs.createReadStream = function (file, options) {
+      if (file === null && options?.fd !== undefined && !fifoInstalled) {
+        const source = originalCreateReadStream.call(this, file, options);
+        return Readable.from((async function* replaceAfterSourceRead() {
+          for await (const chunk of source) yield chunk;
+          fs.unlinkSync(filePath);
+          const fifo = spawnSync("mkfifo", [filePath], { encoding: "utf8" });
+          assert.equal(fifo.status, 0, fifo.stderr || "mkfifo failed");
+          fifoInstalled = true;
+        })());
+      }
+      return originalCreateReadStream.apply(this, arguments);
+    };
+    try {
+      await assert.rejects(
+        backupService.createBackup({ createdBy: "fixture", backupId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" }),
+        /Backup source/,
+      );
+    } finally {
+      fs.createReadStream = originalCreateReadStream;
+    }
+    assert.equal(fifoInstalled, true);
+  `, {}, 5_000);
+});
+
 test("restore rejects inflated ZIP payload bytes beyond the manifest and central-directory size", () => {
   runFixture(`
     const backupId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
