@@ -27,9 +27,9 @@ function getUnusedPort() {
   });
 }
 
-function request(port, requestPath, { method = "GET", headers = {}, body } = {}) {
+function request(port, requestPath, { method = "GET", headers = {}, body, agent } = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, path: requestPath, method, headers }, (res) => {
+    const req = http.request({ host: "127.0.0.1", port, path: requestPath, method, headers, agent }, (res) => {
       let responseBody = "";
       res.on("data", (chunk) => { responseBody += chunk; });
       res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: responseBody }));
@@ -241,7 +241,7 @@ async function uploadPayload(port, session, payload) {
   });
 }
 
-async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, totalChunks, bytes, encryptionLevel, password, versionComment, expiresInDays }) {
+async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, totalChunks, bytes, encryptionLevel, password, versionComment, expiresInDays, forwardedFor, agent }) {
   const parts = [
     { field: "uploadId", bytes: uploadId },
     { field: "originalName", bytes: originalName },
@@ -259,9 +259,11 @@ async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, 
       cookie: session.cookie,
       origin: `http://127.0.0.1:${port}`,
       "x-csrf-token": session.csrf,
+      ...(forwardedFor ? { "x-forwarded-for": forwardedFor } : {}),
       "content-type": payload.contentType,
       "content-length": payload.body.length,
     },
+    agent,
     body: payload.body,
   });
 }
@@ -1421,7 +1423,7 @@ test("dot-segment upload IDs are rejected without touching sibling chunk session
 });
 
 test("upload chunk route limit rejects requests before Multer writes staging files", { timeout: 30_000 }, async (t) => {
-  const harness = await createHarness(t, { envOverrides: { ROUTE_RATE_LIMIT_MAX: "1" } });
+  const harness = await createHarness(t, { envOverrides: { API_RATE_LIMIT_MAX: "1000", UPLOAD_CHUNK_RATE_LIMIT_MAX: "1" } });
   const session = await login(harness.port, "uploader", harness.password);
   const first = await uploadChunk(harness.port, session, {
     uploadId: "rate-limited-first",
@@ -1444,6 +1446,108 @@ test("upload chunk route limit rejects requests before Multer writes staging fil
   assert.match(rejected.headers["retry-after"] || "", /^\d+$/);
   assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, rejectedId)), false);
   assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
+});
+
+test("chunk upload quota is per account across upload IDs and proxy-reported client IPs", { timeout: 45_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    secondUploaderHasFolderAccess: true,
+    envOverrides: {
+      API_RATE_LIMIT_MAX: "1000",
+      TRUSTED_PROXIES: "127.0.0.1",
+      UPLOAD_CHUNK_RATE_LIMIT_MAX: "1",
+    },
+  });
+  const uploaderSession = await login(harness.port, "uploader", harness.password);
+  const otherUploaderSession = await login(harness.port, "other-uploader", harness.password);
+
+  const firstAccountFirstUpload = await uploadChunk(harness.port, uploaderSession, {
+    uploadId: "account-limit-uploader-first",
+    originalName: "first.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: "first account chunk",
+    forwardedFor: "198.51.100.10",
+  });
+  assert.equal(firstAccountFirstUpload.status, 200, firstAccountFirstUpload.body);
+
+  const secondAccountFirstUpload = await uploadChunk(harness.port, otherUploaderSession, {
+    uploadId: "account-limit-other-first",
+    originalName: "other.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: "second account chunk",
+    forwardedFor: "198.51.100.10",
+  });
+  assert.equal(secondAccountFirstUpload.status, 200, secondAccountFirstUpload.body);
+
+  const sameAccountSecondUpload = await uploadChunk(harness.port, uploaderSession, {
+    uploadId: "account-limit-uploader-second",
+    originalName: "second.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: "must not be staged",
+    forwardedFor: "203.0.113.77",
+  });
+  assert.equal(sameAccountSecondUpload.status, 429, sameAccountSecondUpload.body);
+  assert.match(sameAccountSecondUpload.headers["retry-after"] || "", /^\d+$/);
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, "account-limit-uploader-second")), false);
+  assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
+});
+
+test("chunk upload bypasses the generic API ceiling only when the dedicated peer guard is active", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    envOverrides: { API_RATE_LIMIT_MAX: "1", UPLOAD_CHUNK_IP_RATE_LIMIT_MAX: "10" },
+  });
+  const exhaustedApiQuota = await request(harness.port, "/auth/me");
+  assert.equal(exhaustedApiQuota.status, 401, exhaustedApiQuota.body);
+
+  const malformedChunkRequest = await request(harness.port, "/upload-chunk", {
+    method: "POST",
+    headers: { "content-type": "application/json", "content-length": "1" },
+    body: "{",
+  });
+  assert.equal(malformedChunkRequest.status, 400, malformedChunkRequest.body);
+});
+
+test("chunk upload peer guard limits requests before JSON parsing and returns Retry-After", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    envOverrides: { API_RATE_LIMIT_MAX: "1000", UPLOAD_CHUNK_IP_RATE_LIMIT_MAX: "2" },
+  });
+  const sendMalformed = () => request(harness.port, "/upload-chunk", {
+    method: "POST",
+    headers: { "content-type": "application/json", "content-length": "1" },
+    body: "{",
+  });
+
+  assert.equal((await sendMalformed()).status, 400);
+  assert.equal((await sendMalformed()).status, 400);
+  const limited = await sendMalformed();
+  assert.equal(limited.status, 429, limited.body);
+  assert.match(limited.headers["retry-after"] || "", /^\d+$/);
+  assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
+});
+
+test("a valid upload can send all 2,000 allowed chunks within the configured window", { timeout: 180_000 }, async (t) => {
+  const harness = await createHarness(t, { envOverrides: { API_RATE_LIMIT_MAX: "1" } });
+  const session = await login(harness.port, "uploader", harness.password);
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  t.after(() => agent.destroy());
+  const uploadId = "two-thousand-chunk-window";
+
+  let completed;
+  for (let chunkIndex = 0; chunkIndex < 2000; chunkIndex += 1) {
+    completed = await uploadChunk(harness.port, session, {
+      uploadId,
+      originalName: "two-thousand-parts.txt",
+      chunkIndex,
+      totalChunks: 2000,
+      bytes: Buffer.from([chunkIndex % 256]),
+      agent,
+    });
+    assert.equal(completed.status, 200, `chunk ${chunkIndex}: ${completed.body}\n${harness.stderr.join("")}`);
+  }
+
+  assert.equal(JSON.parse(completed.body).complete, true);
 });
 
 test("chunk uploads accept the 8 MiB contract and reject larger parts without staging artifacts", { timeout: 45_000 }, async (t) => {
