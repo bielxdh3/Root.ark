@@ -35,6 +35,7 @@ test("JSON migration preserves trash and backup history in SQLite across restart
     }
     fs.mkdirSync(path.join(fixtureRoot, "src"), { recursive: true });
     fs.copyFileSync(path.join(ROOT, "src", "runtime-paths.js"), path.join(fixtureRoot, "src", "runtime-paths.js"));
+    fs.copyFileSync(path.join(ROOT, "src", "fs-atomic-rename.js"), path.join(fixtureRoot, "src", "fs-atomic-rename.js"));
     fs.mkdirSync(path.join(fixtureRoot, "data"), { recursive: true });
 
     const trashItem = {

@@ -208,8 +208,9 @@ test("rejects malformed, unsupported, oversized, and over-count metadata", (t) =
 
 test("rejects a fixture path swap when adjacent 64-bit file IDs collide as Numbers", (t) => {
   const fixture = createFixture(t, { "opaque-fixture": { encryptionLevel: "server-key" } });
-  const preloadPath = path.join(os.tmpdir(), "rootark-zk-id-precision-" + process.pid + ".cjs");
-  t.after(() => fs.rmSync(preloadPath, { force: true }));
+  const preloadDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-id-precision-"));
+  const preloadPath = path.join(preloadDirectory, "identity.cjs");
+  t.after(() => fs.rmSync(preloadDirectory, { recursive: true, force: true }));
   fs.writeFileSync(preloadPath, String.raw`const fs = require("node:fs");
 const path = require("node:path");
 const target = path.resolve(process.env.ROOTARK_ZK_IDENTITY_TARGET);
@@ -241,7 +242,7 @@ fs.closeSync = function (descriptor) {
   descriptors.delete(descriptor);
   return originalClose.call(this, descriptor);
 };
-`);
+`, { flag: "wx", mode: 0o600 });
   const result = runInventory(fixture, {
     preloadPath,
     env: { ROOTARK_ZK_IDENTITY_TARGET: path.join(fixture, "encrypted-files.json") },

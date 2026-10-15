@@ -59,6 +59,7 @@ test("backup takeover preserves exact adjacent 64-bit file IDs in durable author
     const ownerResult = await owner.result;
     assert.equal(ownerResult.code, 0, ownerResult.stderr);
     assert.equal(fs.existsSync(lockPath), true, "the disposable child leaves its lock as a stale recovery fixture");
+    const staleLockBytes = fs.readFileSync(lockPath);
 
     const id = 9_007_199_254_740_992n;
     const contenderSource = [
@@ -68,18 +69,27 @@ test("backup takeover preserves exact adjacent 64-bit file IDs in durable author
       'const lock=path.resolve(service.LOCK_FILE);',
       'const evidence=path.resolve(service.LOCK_FILE + ".takeover" + path.sep + "evidence");',
       'const adjacent=9007199254740992n;',
+      'const opened=new Map();',
+      'const open=fs.openSync;',
+      'const fstat=fs.fstatSync;',
       'const stat=fs.statSync;',
       'const lstat=fs.lstatSync;',
       'const identify=(value,args,ino)=>new Proxy(value,{get(target,key,receiver){if(key==="dev")return args[0]?.bigint===true?1n:1;if(key==="ino")return args[0]?.bigint===true?ino:Number(ino);return Reflect.get(target,key,receiver);}});',
+      'fs.openSync=function(target,...args){const fd=open.call(this,target,...args);opened.set(fd,path.resolve(String(target)));return fd;};',
+      'fs.fstatSync=function(fd,...args){const value=fstat.call(this,fd,...args);const resolved=opened.get(fd);const staged=resolved&&path.dirname(resolved)===path.dirname(evidence)&&path.basename(resolved).startsWith(".evidence-cleanup-");return resolved===lock?identify(value,args,adjacent):(resolved===evidence||staged)?identify(value,args,adjacent+1n):value;};',
       'fs.statSync=function(target,...args){const value=stat.call(this,target,...args);return path.resolve(String(target))===lock?identify(value,args,adjacent):value;};',
-      'fs.lstatSync=function(target,...args){const value=lstat.call(this,target,...args);const resolved=path.resolve(String(target));return resolved===lock?identify(value,args,adjacent):resolved===evidence?identify(value,args,adjacent+1n):value;};',
+      'fs.lstatSync=function(target,...args){const value=lstat.call(this,target,...args);const resolved=path.resolve(String(target));const staged=path.dirname(resolved)===path.dirname(evidence)&&path.basename(resolved).startsWith(".evidence-cleanup-");return resolved===lock?identify(value,args,adjacent):(resolved===evidence||staged)?identify(value,args,adjacent+1n):value;};',
       'try{const release=service.acquireLock("backup");release();process.exit(12);}catch(error){process.exit(error.code==="BACKUP_LOCKED"?10:11);}'
     ].join('');
     const contender = startChild(runtime, contenderSource);
     const result = await contender.result;
     assert.equal(result.code, 10, result.stderr || result.stdout);
     assert.equal(Number(id), Number(id + 1n), "the injected adjacent IDs collide under Number conversion");
-    assert.equal(fs.existsSync(evidencePath), true, "ambiguous renamed evidence remains available for safe recovery");
+    const takeoverDir = path.dirname(authorityPath);
+    const retainedEvidence = fs.readdirSync(takeoverDir)
+      .filter((entry) => entry === path.basename(evidencePath) || entry.startsWith(".evidence-cleanup-"));
+    assert.equal(retainedEvidence.length, 1, "ambiguous renamed evidence remains available for safe recovery");
+    assert.deepEqual(fs.readFileSync(path.join(takeoverDir, retainedEvidence[0])), staleLockBytes, "retained evidence preserves the exact stale lock bytes");
     const authority = JSON.parse(fs.readFileSync(authorityPath, "utf8"));
     assert.equal(authority.observed.stat.ino, id.toString(), "durable takeover evidence stores the exact decimal file ID");
   } finally {

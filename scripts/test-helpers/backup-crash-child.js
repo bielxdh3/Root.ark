@@ -174,12 +174,16 @@ async function main() {
       service.acquireLock("backup");
       break;
     }
-    case "crash-after-takeover-authority-removal": {
-      const target = path.join(path.dirname(service.LOCK_FILE), ".backup.lock.takeover", "evidence");
-      const original = fs.rmSync;
-      fs.rmSync = function (candidate, options) {
-        if (path.resolve(String(candidate)) === path.resolve(target)) process.kill(process.pid, "SIGKILL");
-        return original.call(this, candidate, options);
+    case "crash-after-takeover-evidence-cleanup-stage": {
+      const evidence = path.join(path.dirname(service.LOCK_FILE), ".backup.lock.takeover", "evidence");
+      const original = fs.renameSync;
+      fs.renameSync = function (source, destination) {
+        const result = original.call(this, source, destination);
+        if (path.resolve(String(source)) === path.resolve(evidence)
+          && path.basename(String(destination)).startsWith(".evidence-cleanup-")) {
+          process.kill(process.pid, "SIGKILL");
+        }
+        return result;
       };
       const release = service.acquireLock("backup");
       release();
