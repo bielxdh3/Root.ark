@@ -251,7 +251,9 @@ function createVerifiedArchiveStream(file) {
 
     let fd;
     try {
-      fd = fs.openSync(absolutePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      fd = fs.openSync(absolutePath, fs.constants.O_RDONLY
+        | (fs.constants.O_NOFOLLOW || 0)
+        | (fs.constants.O_NONBLOCK || 0));
       const openedStat = fs.fstatSync(fd, { bigint: true });
       if (!openedStat.isFile() || openedStat.nlink !== 1n || !sameFileSnapshot(sourceStat, openedStat)) {
         throw new Error("Backup source changed or is aliased during archive creation");
@@ -262,8 +264,7 @@ function createVerifiedArchiveStream(file) {
       if (!isPathWithin(root.realPath, realPath) || !sameFileSnapshot(openedStat, finalPathStat)) {
         throw new Error("Backup source escaped its collected root");
       }
-      source = fs.createReadStream(null, { fd, autoClose: true });
-      fd = undefined;
+      source = fs.createReadStream(null, { fd, autoClose: false });
       let bytesRead = 0;
       for await (const chunk of source) {
         if (chunk.length > expectedSize - bytesRead) throw new Error("Backup source size changed during archive creation");
@@ -272,22 +273,18 @@ function createVerifiedArchiveStream(file) {
       }
       if (bytesRead !== expectedSize) throw new Error("Backup source size changed during archive creation");
 
-      const streamedFd = fs.openSync(absolutePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-      try {
-        const streamedStat = fs.fstatSync(streamedFd, { bigint: true });
-        assertArchiveRootUnchanged(root);
-        const streamedPathStat = assertArchiveSourcePath(root, absolutePath);
-        const streamedRealPath = fs.realpathSync.native(absolutePath);
-        // Stat snapshots detect normal app writes and path replacements; external writers that can rewrite bytes while restoring all compared metadata are outside this guarantee.
-        if (!sameFileSnapshot(sourceStat, streamedStat) || !sameFileSnapshot(streamedStat, streamedPathStat)
-          || !isPathWithin(root.realPath, streamedRealPath)) {
-          throw new Error("Backup source changed during archive creation");
-        }
-      } finally {
-        fs.closeSync(streamedFd);
+      const streamedStat = fs.fstatSync(fd, { bigint: true });
+      assertArchiveRootUnchanged(root);
+      const streamedPathStat = assertArchiveSourcePath(root, absolutePath);
+      const streamedRealPath = fs.realpathSync.native(absolutePath);
+      // Stat snapshots detect normal app writes and path replacements; external writers that can rewrite bytes while restoring all compared metadata are outside this guarantee.
+      if (!streamedStat.isFile() || streamedStat.nlink !== 1n || streamedPathStat.nlink !== 1n
+        || !sameFileSnapshot(sourceStat, streamedStat) || !sameFileSnapshot(streamedStat, streamedPathStat)
+        || !isPathWithin(root.realPath, streamedRealPath)) {
+        throw new Error("Backup source changed during archive creation");
       }
     } finally {
-      if (source) source.destroy();
+      if (source && !source.readableEnded && !source.destroyed) source.destroy();
       if (fd !== undefined) fs.closeSync(fd);
     }
   })());
