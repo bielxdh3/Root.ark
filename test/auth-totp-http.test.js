@@ -31,18 +31,19 @@ function request(port, requestPath, options = {}) {
   });
 }
 
-async function waitForServer(port, child) {
+async function waitForServer(child, getStartupOutput) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error("disposable server exited");
-    try { return await request(port, "/login.html"); } catch { await new Promise((resolve) => setTimeout(resolve, 50)); }
+    const match = getStartupOutput().match(/Servidor rodando em http:\/\/(?:\[[^\]]+\]|[^:\s]+):(\d+)/);
+    if (match) return Number(match[1]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error("disposable server did not start");
 }
 
 test("bounded HTTP login challenge preserves cookie session and CSRF boundaries", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-totp-http-"));
-  const port = 30_000 + Math.floor(Math.random() * 10_000);
   const key = crypto.randomBytes(32);
   const secret = generateSecret();
   const user = {
@@ -63,7 +64,7 @@ test("bounded HTTP login challenge preserves cookie session and CSRF boundaries"
     cwd: directory,
     env: {
       ...process.env,
-      PORT: String(port),
+      PORT: "0",
       JWT_SECRET: crypto.randomBytes(32).toString("hex"),
       SERVER_MASTER_KEY: key.toString("hex"),
       DB_ENABLED: "false",
@@ -72,9 +73,11 @@ test("bounded HTTP login challenge preserves cookie session and CSRF boundaries"
       LOGIN_DELAY_BASE: "0",
       NODE_ENV: "test",
     },
-    stdio: ["ignore", "ignore", "pipe"],
+    stdio: ["ignore", "pipe", "pipe"],
   });
+  let startupOutput = "";
   let startupError = "";
+  child.stdout.on("data", (chunk) => { startupOutput = (startupOutput + chunk.toString()).slice(-4_096); });
   child.stderr.on("data", (chunk) => { startupError += chunk.toString().slice(0, 500); });
   t.after(async () => {
     if (child.exitCode === null) {
@@ -84,10 +87,11 @@ test("bounded HTTP login challenge preserves cookie session and CSRF boundaries"
     fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
+  let port;
   try {
-    await waitForServer(port, child);
+    port = await waitForServer(child, () => startupOutput);
   } catch (error) {
-    throw new Error(`${error.message}: ${startupError.replace(/\r?\n/g, " ").slice(0, 300)}`);
+    throw new Error(`${error.message}: ${startupError.replace(/\r?\n/g, " ").slice(0, 300)} ${startupOutput.replace(/\r?\n/g, " ").slice(-300)}`);
   }
   const primary = await request(port, "/auth/login", { method: "POST", body: { username: "alice", password: "disposable-password" } });
   assert.equal(primary.status, 200);
