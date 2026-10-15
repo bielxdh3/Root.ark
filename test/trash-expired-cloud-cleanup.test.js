@@ -374,7 +374,28 @@ test("expired folder cleanup continues after one provider prefix fails", { timeo
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
+
+  let finalFolders = null;
+  let previousSnapshot = null;
+  const finalReadDeadline = Date.now() + 2_000;
+  while (Date.now() < finalReadDeadline) {
+    try {
+      const serialized = fs.readFileSync(foldersPath, "utf8");
+      const snapshot = JSON.parse(serialized);
+      assert.ok(Array.isArray(snapshot), "folder metadata remains an array");
+      if (serialized === previousSnapshot && !snapshot.some((folder) => folder.id === "expired-success")) {
+        finalFolders = snapshot;
+        break;
+      }
+      previousSnapshot = serialized;
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      previousSnapshot = null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(finalFolders, "folder metadata is parseable and stable on disk after cleanup");
   assert.match(output, /Provider operation failed/, "the first folder's provider failure is observed");
-  assert.equal(folders.some((folder) => folder.id === "expired-fail"), true, "failed folder remains expired and unavailable for a later retry");
-  assert.equal(folders.some((folder) => folder.id === "expired-success"), false, "later expired folders are still cleaned in the same sweep");
+  assert.equal(finalFolders.some((folder) => folder.id === "expired-fail"), true, "failed folder remains expired and unavailable for a later retry");
+  assert.equal(finalFolders.some((folder) => folder.id === "expired-success"), false, "later expired folders are still cleaned in the same sweep");
 });
