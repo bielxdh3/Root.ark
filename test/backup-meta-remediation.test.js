@@ -181,49 +181,62 @@ test("scheduler, lock, filename, and retention meta-remediation matrix", async (
     reset();
     const authorityPath = path.join(backupService.LOCK_TAKEOVER_DIR, "authority.json");
     const priorPath = `${authorityPath}.prior`;
+    const replacementPath = path.join(backupService.BACKUPS_DIR, "authority-replacement.fixture");
     const replacementBytes = Buffer.from("replacement authority must not be followed");
     const originalRelease = backupService.acquireLock("backup");
     const originalRecord = JSON.parse(fs.readFileSync(backupService.LOCK_FILE, "utf8"));
     originalRelease();
     fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify({ ...originalRecord, token: "stale-authority-read", pid: 99999999, processInstanceId: "prior-process-instance", startedAt: new Date(0).toISOString() }));
     fs.utimesSync(backupService.LOCK_FILE, new Date(0), new Date(0));
+    fs.writeFileSync(replacementPath, replacementBytes, { flag: "wx", mode: 0o600 });
     let replaced = false;
+    let authorityFd;
+    let authorityWasRead = false;
     let lease;
     let failure;
+    const originalOpen = fs.openSync;
     const originalRead = fs.readFileSync;
-    const originalFstat = fs.fstatSync;
-    const originalLstat = fs.lstatSync;
+    const originalClose = fs.closeSync;
     const originalRename = fs.renameSync;
+    fs.openSync = function (target, ...args) {
+      const fd = originalOpen.call(this, target, ...args);
+      if (!replaced && target === authorityPath) {
+        authorityFd = fd;
+        originalRename.call(fs, authorityPath, priorPath);
+        originalRename.call(fs, replacementPath, authorityPath);
+        replaced = true;
+      }
+      return fd;
+    };
     fs.readFileSync = function (target, ...args) {
-      if (!replaced && typeof target === "number") {
-        try {
-          const opened = originalFstat.call(fs, target, { bigint: true });
-          const current = originalLstat.call(fs, authorityPath, { bigint: true });
-          if (opened.isFile() && opened.dev === current.dev && opened.ino === current.ino) {
-            originalRename.call(fs, authorityPath, priorPath);
-            fs.writeFileSync(authorityPath, replacementBytes, { flag: "wx", mode: 0o600 });
-            replaced = true;
-          }
-        } catch (error) {
-          if (error.code !== "ENOENT") throw error;
-        }
+      if (target === authorityFd) {
+        authorityWasRead = true;
+        authorityFd = undefined;
       }
       return originalRead.call(this, target, ...args);
+    };
+    fs.closeSync = function (target, ...args) {
+      if (target === authorityFd) authorityFd = undefined;
+      return originalClose.call(this, target, ...args);
     };
     try {
       try { lease = backupService.acquireLock("backup"); } catch (error) { failure = error; }
     } finally {
+      fs.openSync = originalOpen;
       fs.readFileSync = originalRead;
+      fs.closeSync = originalClose;
       if (lease) lease();
     }
     try {
       assert.equal(replaced, true, `authority descriptor read hook was not reached (${failure?.code || "no error"})`);
       assert.equal(failure?.code, "BACKUP_LOCKED");
+      assert.equal(authorityWasRead, false, "a replaced authority pathname must be rejected before consuming descriptor bytes");
       assert.deepEqual(fs.readFileSync(authorityPath), replacementBytes);
     } finally {
       fs.rmSync(backupService.LOCK_FILE, { force: true });
       fs.rmSync(backupService.LOCK_TAKEOVER_DIR, { recursive: true, force: true });
       fs.rmSync(priorPath, { force: true });
+      fs.rmSync(replacementPath, { force: true });
     }
   });
   await t.test("takeover cleanup preserves a replacement installed at the removal boundary", () => {
@@ -426,7 +439,7 @@ test("scheduler, lock, filename, and retention meta-remediation matrix", async (
   await t.test("stale age", () => { reset(); fs.writeFileSync(backupService.LOCK_FILE, "broken"); fs.utimesSync(backupService.LOCK_FILE, new Date(0), new Date(0)); const release = backupService.acquireLock("backup"); release(); });
   await t.test("malformed recent lock", () => { reset(); fs.writeFileSync(backupService.LOCK_FILE, "broken"); assert.throws(() => backupService.acquireLock("backup"), { code: "BACKUP_LOCKED" }); fs.rmSync(backupService.LOCK_FILE, { force: true }); });
   await t.test("malformed stale lock", () => { reset(); fs.writeFileSync(backupService.LOCK_FILE, "broken"); fs.utimesSync(backupService.LOCK_FILE, new Date(0), new Date(0)); const release = backupService.acquireLock("backup"); release(); });
-  await t.test("lock-write failure", () => { reset(); const original = fs.openSync; fs.openSync = (target, flags) => { if (target === backupService.LOCK_FILE) throw Object.assign(new Error("denied"), { code: "EACCES" }); return original(target, flags); }; try { assert.throws(() => backupService.acquireLock("backup"), { code: "BACKUP_LOCK_WRITE_FAILED" }); } finally { fs.openSync = original; } });
+  await t.test("lock-write failure", () => { reset(); const original = fs.openSync; let lockPathOpenAttempts = 0; fs.openSync = (target, ...args) => { if (target === backupService.LOCK_FILE && ++lockPathOpenAttempts === 2) throw Object.assign(new Error("denied"), { code: "EACCES" }); return original.call(fs, target, ...args); }; try { assert.throws(() => backupService.acquireLock("backup"), { code: "BACKUP_LOCK_WRITE_FAILED" }); } finally { fs.openSync = original; } });
   await t.test("release token mismatch", () => { reset(); const release = backupService.acquireLock("backup"); fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify({ token: "other" })); release(); assert.equal(fs.existsSync(backupService.LOCK_FILE), true); fs.rmSync(backupService.LOCK_FILE, { force: true }); });
   await t.test("retention count", async () => { reset(); const now = new Date().toISOString(); const entries = [entry("1", "rootark-backup-2020-01-01-00-00-00.zip", now), entry("2", "rootark-backup-2020-01-01-00-00-01.zip", now)]; saveHistory(entries); process.env.BACKUP_RETENTION_COUNT = "1"; process.env.BACKUP_RETENTION_DAYS = "0"; await backupService.cleanupRetention(); assert.equal(backupRepository.getBackup("1"), null); });
   await t.test("retention age", async () => { reset(); const entries = [entry("1", "rootark-backup-2020-01-01-00-00-00.zip", "2020-01-01T00:00:00.000Z")]; saveHistory(entries); process.env.BACKUP_RETENTION_COUNT = "0"; process.env.BACKUP_RETENTION_DAYS = "1"; await backupService.cleanupRetention(); assert.equal(backupRepository.getBackup("1"), null); });

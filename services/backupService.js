@@ -592,11 +592,12 @@ function sameRenamedFileIdentity(left, right) {
 function readFileSnapshot(filePath, encoding) {
   let fd;
   try {
-    const pathStat = fs.lstatSync(filePath, { bigint: true });
-    if (!pathStat.isFile() || pathStat.isSymbolicLink()) return { stat: pathStat, contents: "", stable: false };
-    fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
     const openedStat = fs.fstatSync(fd, { bigint: true });
-    if (!sameFileIdentity(pathStat, openedStat)) return { stat: openedStat, contents: "", stable: false };
+    if (!openedStat.isFile()) return { stat: openedStat, contents: "", stable: false };
+    let pathStat;
+    try { pathStat = fs.lstatSync(filePath, { bigint: true }); } catch { return { stat: openedStat, contents: "", stable: false }; }
+    if (!pathStat.isFile() || pathStat.isSymbolicLink() || !sameFileIdentity(pathStat, openedStat)) return { stat: openedStat, contents: "", stable: false };
     let contents;
     try { contents = fs.readFileSync(fd, encoding); } catch { return { stat: openedStat, contents: "", stable: false }; }
     const finalStat = fs.fstatSync(fd, { bigint: true });
