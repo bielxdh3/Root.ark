@@ -327,6 +327,7 @@ test("expired folder cleanup continues after one provider prefix fails", { timeo
     { id: "expired-fail", name: "Fails", createdBy: "tester", allowedUsers: ["tester"], isRoot: false, expiresAt: oldExpiry },
     { id: "expired-success", name: "Succeeds", createdBy: "tester", allowedUsers: ["tester"], isRoot: false, expiresAt: oldExpiry },
   ]));
+  const initialFolders = JSON.parse(fs.readFileSync(foldersPath, "utf8"));
   let output = "";
   const child = spawn(process.execPath, [SERVER], {
     cwd: directory,
@@ -361,10 +362,16 @@ test("expired folder cleanup continues after one provider prefix fails", { timeo
 
   await waitForServer(port, child, () => output);
   const deadline = Date.now() + 2_000;
-  let folders = [];
+  let folders = initialFolders;
   while (Date.now() < deadline) {
-    folders = JSON.parse(fs.readFileSync(foldersPath, "utf8"));
-    if (!folders.some((folder) => folder.id === "expired-success")) break;
+    try {
+      const snapshot = JSON.parse(fs.readFileSync(foldersPath, "utf8"));
+      assert.ok(Array.isArray(snapshot), "folder metadata remains an array");
+      folders = snapshot;
+      if (!folders.some((folder) => folder.id === "expired-success")) break;
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+    }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assert.match(output, /Provider operation failed/, "the first folder's provider failure is observed");
