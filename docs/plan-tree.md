@@ -1,13 +1,13 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Latest live GitHub and application/security reconciliation: 2026-10-14 after PR #174; `Root/main` SHA `35cb76228729a0271d4661ebec293a50c7f863df`.
+Latest application and pre-publication GitHub/security snapshot: 2026-10-15 after PR #189; application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`. It records the state queried before documentation PR #175 was published.
 
 Repository: bielxdh3/root.ark
 
-PR #170 merged the selected seven-day inactive chunk-session expiry, PR #171 merged quarantine rollback recovery, and PR #174 added a test-only realtime rename notification regression at `35cb76228729a0271d4661ebec293a50c7f863df`. Exact-SHA Security Regression passed on Ubuntu and Windows; Dependency Review, CodeQL, and Pages succeeded. See the [post-#174 validation record](validation/2026-10-14-rootark-post-174.md) and [issue ledger](issue-ledger.md) for exact checks, live issue/PR state, restore limits, and remaining acceptance boundaries. The post-#171, post-#169, and earlier snapshots below preserve their original evidence dates.
+PR #188 merged chunk-upload request limits at `a557bfec762d45ceb574146841b9dffbe1b7757e`. PR #189 merged at `bde6c54bee7a015822aa5463618bdf985ddf805d` and adds a test-only interrupted restore provider-policy pair recovery regression. Exact-SHA checks and browser evidence for this application revision are recorded in the [post-#189 validation snapshot](validation/2026-10-15-rootark-post-189.md). See the [issue ledger](issue-ledger.md) for the pre-publication issue/PR query and the restore limitation. The [post-#171 snapshot](validation/2026-10-14-rootark-post-171.md), [post-#169 snapshot](validation/2026-10-12-rootark-post-169.md), and earlier records link directly to their historical evidence.
 
-Historical sections below preserve their original evidence and claims; they are not current live status. Re-query GitHub before relying on issue, PR, or check state after this snapshot.
+Historical sections below preserve their original evidence and claims; they are not current live status. The application checks in this pre-publication snapshot do not transfer to the separate documentation publication or its resulting default-branch SHA.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
