@@ -1350,7 +1350,10 @@
       ui.toast("Aguarde o envio terminar antes de sair do espaço de arquivos.", "error");
       return;
     }
-    return loadRoute();
+    return loadRoute().then(() => {
+      const main = document.getElementById("main");
+      if (main && typeof main.focus === "function") main.focus();
+    });
   });
 
   async function start() {

@@ -193,7 +193,12 @@
   function closeMobileNav(event) {
     const root = document.getElementById("app-root");
     const target = event.target && event.target.closest ? event.target : null;
-    if (!root || !isCompactViewport() || !root.classList.contains("nav-open") || target && target.closest(".sidebar, .mobile-menu")) return;
+    if (!root || !isCompactViewport() || !root.classList.contains("nav-open") || event.defaultPrevented || target && target.closest(".mobile-menu")) return;
+    if (target && target.closest(".sidebar .nav-link")) {
+      setMobileNavigation(root, false, true);
+      return;
+    }
+    if (target && target.closest(".sidebar")) return;
     const topbarAction = target && target.closest('.topbar button, .topbar a[href], .topbar input:not([disabled]), .topbar select:not([disabled]), .topbar textarea:not([disabled]), .topbar summary, .topbar [role="button"], .topbar [tabindex]:not([tabindex="-1"])');
     setMobileNavigation(root, false, !topbarAction, topbarAction);
   }
