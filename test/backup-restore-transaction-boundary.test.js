@@ -2420,6 +2420,52 @@ test("cloud-complete selected archives upload selected bytes before opening same
   `);
 });
 
+test("legacy cloud-complete archives derive provider coverage from their validated ZIP payloads", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      const uploadPath = path.join(uploadsDir, "root", "legacy.txt");
+      const archivedBytes = "ARCHIVED legacy bytes";
+      write(uploadPath, archivedBytes);
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const stored = backupService.getBackupOrThrow(backup.id);
+      fs.rmSync(stored.archivePath);
+      await backupService.createZipArchive(stored.archivePath, {
+        backup_id: backup.id,
+        cloud_complete: true,
+      }, [{ absolutePath: uploadPath, entryPath: "uploads/root/legacy.txt", size: Buffer.byteLength(archivedBytes) }]);
+      await backupRepository.saveBackup({ ...backup, checksum: null });
+      write(uploadPath, "live bytes");
+
+      const inventory = [
+        { provider: "fixture", providerIdentity: "archived", area: "uploads", folderId: "root", name: "legacy.txt" },
+        { provider: "fixture", providerIdentity: "orphan", area: "uploads", folderId: "root", name: "orphan.txt" },
+      ];
+      restoreService.setCloudStorage({
+        enabled: () => true,
+        provider: "fixture",
+        inventory: async () => inventory,
+        upload: async () => true,
+      });
+      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+
+      assert.equal(restored.cloudSync.state, "pending", "the restored archive member must be queued for provider reconciliation");
+      assert.deepEqual(restored.cloudSync.entries.map(({ area, folderId, name }) => ({ area, folderId, name })), [
+        { area: "uploads", folderId: "root", name: "legacy.txt" },
+      ]);
+      assert.deepEqual(providerOrphans.read(), [
+        { area: "uploads", folderId: "root", name: "orphan.txt" },
+      ], "only provider objects absent from the validated ZIP payload remain suppressed");
+      assert.equal(providerOrphans.isSuppressed("root", "legacy.txt"), false);
+      assert.equal(fs.readFileSync(uploadPath, "utf8"), archivedBytes);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("pending cloud restore sync blocks stale provider downloads until selected bytes are uploaded", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});

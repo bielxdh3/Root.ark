@@ -602,8 +602,11 @@ function syncNow(clock) {
   return new Date(typeof clock === "function" ? clock() : clock?.now ? clock.now() : Date.now()).toISOString();
 }
 
-function syncEntries(manifest) {
-  return (manifest?.included_files || [])
+function syncEntries(manifest, validatedArchivePayloads = null) {
+  const archiveFiles = Array.isArray(manifest?.included_files)
+    ? manifest.included_files
+    : (Array.isArray(validatedArchivePayloads) ? validatedArchivePayloads : []);
+  return archiveFiles
     .map((entry) => String(entry.path || "").replace(/\\/g, "/"))
     .filter((entryPath) => entryPath.startsWith("uploads/") && !backupService.isBackupExcludedPath(entryPath))
     .map((entryPath) => {
@@ -669,9 +672,12 @@ async function validatedProviderBaseline(backupId) {
   return { backup, archivePath, manifest };
 }
 
-function archivedProviderObjects(manifest) {
+function archivedProviderObjects(manifest, validatedArchivePayloads = null) {
   if (manifest?.cloud_complete !== true) return new Set();
-  return new Set((manifest?.included_files || [])
+  const archiveFiles = Array.isArray(manifest?.included_files)
+    ? manifest.included_files
+    : (Array.isArray(validatedArchivePayloads) ? validatedArchivePayloads : []);
+  return new Set(archiveFiles
     .map((entry) => String(entry.path || "").replace(/\\/g, "/"))
     .filter((entryPath) => entryPath.startsWith("uploads/") && !backupService.isBackupExcludedPath(entryPath))
     .map((entryPath) => {
@@ -1347,6 +1353,7 @@ async function validateIncludedFiles(zip, manifest) {
   for (const { entry, key, size } of payloadEntries) {
     await verifyZipEntrySize(entry, expected.get(key)?.size ?? size);
   }
+  return [...actual.values()];
 }
 
 function validatePersistenceMode(manifest, hasSqlitePrimary) {
@@ -1405,9 +1412,9 @@ async function validateBackupArchive(backup, archivePath) {
     throw new Error("Manifest do backup nao corresponde ao backup selecionado");
   }
   const persistenceMode = validatePersistenceMode(manifest, hasSqlitePrimary);
-  await validateIncludedFiles(zip, manifest);
+  const archivePayloads = await validateIncludedFiles(zip, manifest);
   await attestCiphertextOnlyArchive(zip);
-  return { zip, manifest, persistenceMode };
+  return { zip, manifest, persistenceMode, archivePayloads };
 }
 
 async function extractArchive(zip, targetDir) {
@@ -2577,7 +2584,7 @@ async function restoreBackup(id, options = {}) {
         .filter((entry) => ["uploads", "temp"].includes(entry.area))
         .map(({ area, folderId, name }) => ({ area, folderId, name })));
     }
-    const { zip, manifest, persistenceMode } = await validateBackupArchive(backup, archivePath);
+    const { zip, manifest, persistenceMode, archivePayloads } = await validateBackupArchive(backup, archivePath);
     await options.revalidateAuthorization?.();
     const preRestoreBackupId = crypto.randomUUID();
     coordinator = updateWholeRestoreCoordinator(coordinator, { preRestoreBackupId, persistenceMode });
@@ -2599,13 +2606,14 @@ async function restoreBackup(id, options = {}) {
     const preimagePlan = wholePreimagePlan(restoreDir, quarantinePlan);
     let providerOrphans = null;
     if (providerInventory !== null) {
-      const archivedObjects = archivedProviderObjects(manifest);
+      const archivedObjects = archivedProviderObjects(manifest, archivePayloads);
       providerOrphans = restoreProviderOrphans.normalizeObjects(providerInventory
         .filter((entry) => ["uploads", "temp"].includes(entry.area) && !archivedObjects.has(`${entry.area}\0${entry.folderId}\0${entry.name}`))
         .map(({ area, folderId, name }) => ({ area, folderId, name })));
     }
-    const cloudSync = providerInventory !== null && syncEntries(manifest).length > 0
-      ? createRestoreSync(manifest)
+    const restoreUploadEntries = syncEntries(manifest, archivePayloads);
+    const cloudSync = providerInventory !== null && restoreUploadEntries.length > 0
+      ? createRestoreSync(manifest, undefined, restoreUploadEntries)
       : { state: "not_required" };
     if (providerInventoryContext) cloudSync.providerContext = providerInventoryContext;
     const providerReconciliation = cloudSync.state === "pending"
