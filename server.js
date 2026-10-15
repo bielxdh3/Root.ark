@@ -11,6 +11,7 @@ if (String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim() !== "1") {
 }
 const express = require("express");
 const { rateLimit } = require("express-rate-limit");
+const UploadChunkSlidingWindowStore = require("./src/middlewares/uploadChunkSlidingWindowStore");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
@@ -172,6 +173,8 @@ const CHUNK_UPLOAD_INCOMING_FILE_PATH = Symbol("rootarkChunkUploadIncomingFilePa
 const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
 const UPLOAD_STAGING_PATH = Symbol("rootarkUploadStagingPath");
 const MAX_UPLOAD_CHUNKS = 2000;
+const UPLOAD_CHUNK_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS, 1, MAX_UPLOAD_CHUNKS * 10);
+const UPLOAD_CHUNK_IP_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_IP_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS * 10, 1, MAX_UPLOAD_CHUNKS * 100);
 const CHUNK_UPLOAD_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CHUNK_UPLOAD_EXPIRED_TOMBSTONE_TTL_MS = CHUNK_UPLOAD_SESSION_TTL_MS;
 const CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS = parseBoundedNumber("CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS", 60 * 1000, 1000, 60 * 60 * 1000);
@@ -5548,13 +5551,37 @@ const createRouteRateLimit = () => rateLimit({
   legacyHeaders: false,
   message: { error: "Muitas solicitações. Tente novamente mais tarde." },
 });
+const uploadChunkRateLimit = rateLimit({
+  windowMs: ROUTE_RATE_LIMIT_WINDOW_MS,
+  limit: UPLOAD_CHUNK_RATE_LIMIT_MAX,
+  store: new UploadChunkSlidingWindowStore(ROUTE_RATE_LIMIT_WINDOW_MS, UPLOAD_CHUNK_RATE_LIMIT_MAX),
+  keyGenerator: (req) => String(req.user?.username || ""),
+  standardHeaders: false,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    const resetAt = req.rateLimit?.resetTime?.getTime() ?? Date.now() + ROUTE_RATE_LIMIT_WINDOW_MS;
+    res.setHeader("Retry-After", String(Math.max(1, Math.ceil((resetAt - Date.now()) / 1000))));
+    return res.status(429).json({ error: "Limite temporario de envios em blocos atingido. Tente novamente mais tarde." });
+  },
+});
+const uploadChunkPeerRateLimit = rateLimit({
+  windowMs: ROUTE_RATE_LIMIT_WINDOW_MS,
+  limit: UPLOAD_CHUNK_IP_RATE_LIMIT_MAX,
+  keyGenerator: (req) => rateLimit.ipKeyGenerator(req.socket?.remoteAddress || "unknown"),
+  standardHeaders: false,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    const resetAt = req.rateLimit?.resetTime?.getTime() ?? Date.now() + ROUTE_RATE_LIMIT_WINDOW_MS;
+    res.setHeader("Retry-After", String(Math.max(1, Math.ceil((resetAt - Date.now()) / 1000))));
+    return res.status(429).json({ error: "Limite temporario de requisicoes em blocos atingido. Tente novamente mais tarde." });
+  },
+});
 const versionsRateLimit = createRouteRateLimit();
 const fileOpenTokenRateLimit = createRouteRateLimit();
 const openFileRedemptionRateLimit = createRouteRateLimit();
 const versionOpenTokenRateLimit = createRouteRateLimit();
 const shareRateLimit = createRouteRateLimit();
 const pendingRepairRateLimit = createRouteRateLimit();
-const uploadChunkRateLimit = createRouteRateLimit();
 const approveRateLimit = createRouteRateLimit();
 const rejectRateLimit = createRouteRateLimit();
 const deleteRateLimit = createRouteRateLimit();
@@ -5576,6 +5603,7 @@ const apiRequestRateLimit = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Muitas solicitações. Tente novamente mais tarde." },
+  skip: (req) => req.method === "POST" && req.path === "/upload-chunk",
 });
 const restoreRequestGate = createRestoreRequestGate({
   directory: RESTORE_ACTIVE_REQUESTS_DIR,
@@ -5601,6 +5629,7 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.static("./public"));
+app.post("/upload-chunk", uploadChunkPeerRateLimit);
 app.use(apiRequestRateLimit);
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
@@ -7607,10 +7636,17 @@ function saveChunkMetadata(sessionDir, metadata) {
 }
 
 function hasAllChunks(sessionDir, totalChunks) {
-  for (let index = 0; index < totalChunks; index += 1) {
-    if (!isExistingFile(path.join(sessionDir, `${index}.part`))) return false;
+  let received = 0;
+  for (const entry of fs.readdirSync(sessionDir, { withFileTypes: true })) {
+    const match = /^(0|[1-9]\d{0,3})\.part$/.exec(entry.name);
+    if (!match || Number(match[1]) >= totalChunks) continue;
+    if (entry.isSymbolicLink()) {
+      if (isExistingFile(path.join(sessionDir, entry.name))) received += 1;
+    } else if (entry.isFile()) {
+      received += 1;
+    }
   }
-  return true;
+  return received === totalChunks;
 }
 
 async function assembleChunkedUpload(sessionDir, destinationPath, totalChunks) {
@@ -7640,7 +7676,7 @@ async function assembleChunkedUpload(sessionDir, destinationPath, totalChunks) {
   }
 }
 
-app.post("/upload-chunk", authenticate, uploadChunkRateLimit, requirePermission("upload"), prepareUploadFolder, handleChunkUploadSingle, withChunkUploadSessionLock(async (req, res) => {
+app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunkRateLimit, prepareUploadFolder, handleChunkUploadSingle, withChunkUploadSessionLock(async (req, res) => {
   const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
   const uploadId = String(req.body.uploadId || "");
   const originalName = path.basename(String(req.body.originalName || ""));
