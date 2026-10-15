@@ -28,6 +28,9 @@ const OPERATION_LOCK_FORMAT_VERSION = 1;
 const MALFORMED_LOCK_TTL_MS = 60 * 1000;
 const MALFORMED_TAKEOVER_TTL_MS = 60 * 1000;
 const MAX_LOCK_TTL_MS = 24 * 60 * 60 * 1000;
+const WINDOWS_DURABLE_RENAME_MAX_ATTEMPTS = 3;
+const WINDOWS_DURABLE_RENAME_RETRY_DELAY_MS = 10;
+const durableRenameRetryWait = new Int32Array(new SharedArrayBuffer(4));
 const PROCESS_INSTANCE_ID_SYMBOL = Symbol.for("rootark.backup.process-instance-id");
 if (!globalThis[PROCESS_INSTANCE_ID_SYMBOL]) {
   Object.defineProperty(globalThis, PROCESS_INSTANCE_ID_SYMBOL, { value: crypto.randomUUID() });
@@ -707,12 +710,25 @@ function writeDurableFile(filePath, contents) {
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;
-    fs.renameSync(temporary, filePath);
+    renameDurableFileWithWindowsEpermRetry(temporary, filePath);
     syncDirectory(path.dirname(filePath));
   } catch (error) {
     try { if (fd !== undefined) fs.closeSync(fd); } catch {}
     try { fs.rmSync(temporary, { force: true }); } catch {}
     throw error;
+  }
+}
+
+function renameDurableFileWithWindowsEpermRetry(source, destination) {
+  for (let attempt = 1; attempt <= WINDOWS_DURABLE_RENAME_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      fs.renameSync(source, destination);
+      return;
+    } catch (error) {
+      // Keep publication atomic: never delete or replace the destination after a failed rename.
+      if (process.platform !== "win32" || error.code !== "EPERM" || attempt === WINDOWS_DURABLE_RENAME_MAX_ATTEMPTS) throw error;
+      Atomics.wait(durableRenameRetryWait, 0, 0, WINDOWS_DURABLE_RENAME_RETRY_DELAY_MS);
+    }
   }
 }
 

@@ -5,6 +5,8 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 
 const JOURNAL_VERSION = 1;
+const WINDOWS_RENAME_MAX_ATTEMPTS = 3;
+const WINDOWS_RENAME_RETRY_DELAY_MS = 10;
 
 function isUnsupportedDirectorySync(error) {
   return ["EINVAL", "ENOTSUP"].includes(error?.code)
@@ -23,6 +25,18 @@ async function syncDirectory(directory) {
   }
 }
 
+async function renameWithRetry(source, destination) {
+  for (let attempt = 1; attempt <= WINDOWS_RENAME_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await fsp.rename(source, destination);
+      return;
+    } catch (error) {
+      if (process.platform !== "win32" || error?.code !== "EPERM" || attempt === WINDOWS_RENAME_MAX_ATTEMPTS) throw error;
+      await new Promise((resolve) => setTimeout(resolve, WINDOWS_RENAME_RETRY_DELAY_MS));
+    }
+  }
+}
+
 async function durableWrite(filePath, value) {
   const directory = path.dirname(filePath);
   await fsp.mkdir(directory, { recursive: true });
@@ -34,7 +48,12 @@ async function durableWrite(filePath, value) {
   } finally {
     await handle.close();
   }
-  await fsp.rename(temporary, filePath);
+  try {
+    await renameWithRetry(temporary, filePath);
+  } catch (error) {
+    await fsp.unlink(temporary).catch(() => {});
+    throw error;
+  }
   try {
     await syncDirectory(directory);
   } catch (error) {
