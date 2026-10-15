@@ -30,7 +30,11 @@ const cron = require("node-cron");
 const { Transform } = require("node:stream");
 const { scheduleAutomaticBackups } = require("./services/backupScheduler");
 const { getServerMasterKey: readServerMasterKey } = require("./services/serverMasterKey");
-const { createChunkUploadQuota, parseChunkUploadQuotaConfig } = require("./services/chunkUploadQuota");
+const {
+  assertSafeChunkUploadAncestors,
+  createChunkUploadQuota,
+  parseChunkUploadQuotaConfig,
+} = require("./services/chunkUploadQuota");
 const dbConfig = require("./db");
 const { runMigrations } = require("./db/migrations");
 const usersRepository = require("./repositories/usersRepository");
@@ -7334,18 +7338,22 @@ function assertChunkStorageDirectory(directory, expectedPath) {
 }
 
 function ensureSafeChunkStorageDirectory(directory, expectedPath) {
+  if (process.platform !== "win32") assertSafeChunkUploadAncestors(directory);
   try {
     fs.lstatSync(directory);
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
-    fs.mkdirSync(directory);
+    if (process.platform === "win32") fs.mkdirSync(directory);
+    else fs.mkdirSync(directory, { mode: 0o700 });
   }
   assertChunkStorageDirectory(directory, expectedPath);
   if (process.platform !== "win32") fs.chmodSync(directory, 0o700);
+  if (process.platform !== "win32") assertSafeChunkUploadAncestors(directory);
 }
 
 function ensureSafeChunkUploadStorage() {
   const runtimeRoot = fs.realpathSync.native(process.cwd());
+  if (process.platform !== "win32") assertSafeChunkUploadAncestors(runtimeRoot);
   const expectedTempPath = path.join(runtimeRoot, "temp");
   const expectedChunkPath = path.join(expectedTempPath, ".chunks");
   ensureSafeChunkStorageDirectory(path.resolve("./temp"), expectedTempPath);
@@ -7362,6 +7370,7 @@ function assertSafeChunkStorageRoot() {
   const expectedChunkPath = path.join(expectedTempPath, ".chunks");
   assertChunkStorageDirectory(CHUNK_UPLOAD_DIR, expectedChunkPath);
   assertChunkStorageDirectory(CHUNK_UPLOAD_INCOMING_DIR, path.join(expectedChunkPath, "incoming"));
+  if (process.platform !== "win32") assertSafeChunkUploadAncestors(CHUNK_UPLOAD_INCOMING_DIR);
 }
 
 function initializeChunkUploadQuota() {

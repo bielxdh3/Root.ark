@@ -5,7 +5,12 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFileSync, spawn } = require("node:child_process");
 const test = require("node:test");
-const { createChunkUploadQuota, parseChunkUploadQuotaConfig } = require("../services/chunkUploadQuota");
+const {
+  assertSafeChunkUploadAncestors,
+  assertSupportedChunkUploadFilesystem,
+  createChunkUploadQuota,
+  parseChunkUploadQuotaConfig,
+} = require("../services/chunkUploadQuota");
 const { ensureWindowsChunkUploadRoot, getWindowsChunkAclDescriptor } = require("../services/chunkUploadWindowsAcl");
 const QUOTA_TEST_TEMP = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
 
@@ -52,7 +57,86 @@ test("chunk quota configuration requires positive safe integer byte caps without
   assert.deepEqual(parseChunkUploadQuotaConfig({
     CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: "80",
     CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: "100",
+    CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
   }), { enabled: true, perAccountBytes: 80, systemBytes: 100 });
+});
+
+test("chunk quota fails closed unless the operator attests single-host local-volume placement", () => {
+  const limits = {
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: "80",
+    CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: "100",
+  };
+  for (const topology of [undefined, "", "multi-host", "nfs", "smb", "single-host-local-volume "]) {
+    const env = { ...limits };
+    if (topology !== undefined) env.CHUNK_UPLOAD_STORAGE_TOPOLOGY = topology;
+    assert.equal(parseChunkUploadQuotaConfig(env).enabled, false, `topology ${String(topology)} must fail closed`);
+  }
+  assert.equal(parseChunkUploadQuotaConfig({
+    ...limits,
+    CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
+  }).enabled, true);
+});
+
+test("chunk staging rejects a group- or world-writable non-sticky ancestor", { skip: process.platform === "win32" }, () => {
+  const parent = fs.mkdtempSync(path.join(QUOTA_TEST_TEMP, "rootark-chunk-unsafe-parent-"));
+  const untrusted = path.join(parent, "untrusted");
+  const staging = path.join(untrusted, "app", "temp", ".chunks");
+  try {
+    fs.mkdirSync(staging, { recursive: true });
+    fs.chmodSync(untrusted, 0o777);
+    assert.throws(() => assertSafeChunkUploadAncestors(staging), /unsafe|writable|owner/i);
+  } finally {
+    fs.chmodSync(untrusted, 0o700);
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("chunk staging rejects a sticky but writable staging directory itself", { skip: process.platform === "win32" }, () => {
+  const parent = fs.mkdtempSync(path.join(QUOTA_TEST_TEMP, "rootark-chunk-sticky-target-"));
+  try {
+    fs.chmodSync(parent, 0o1777);
+    assert.throws(() => assertSafeChunkUploadAncestors(parent), /writable/i);
+  } finally {
+    fs.chmodSync(parent, 0o700);
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("quota ledger refuses a writable staging root before creating SQLite state", { skip: process.platform === "win32" }, () => {
+  const parent = fs.mkdtempSync(path.join(QUOTA_TEST_TEMP, "rootark-chunk-writable-root-"));
+  try {
+    fs.chmodSync(parent, 0o777);
+    assert.throws(() => createChunkUploadQuota({ rootDir: parent, perAccountBytes: 10, systemBytes: 10 }), /writable/i);
+    assert.equal(fs.existsSync(path.join(parent, ".quota.sqlite")), false);
+  } finally {
+    fs.chmodSync(parent, 0o700);
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("chunk staging rejects known remote Linux filesystems even with topology attestation", () => {
+  const remoteFilesystemTypes = [0x6969, 0x517b, 0xff534d42, 0xfe534d42, 0x65735546, 0x01021997, 0x00c36400, 0x5346414f, 0x6b414653, 0x564c];
+  for (const type of remoteFilesystemTypes) {
+    assert.throws(() => assertSupportedChunkUploadFilesystem("/disposable/chunk-root", {
+      platform: "linux",
+      statfs: () => ({ type }),
+    }), /unsupported.*filesystem|remote.*filesystem/i);
+  }
+  assert.doesNotThrow(() => assertSupportedChunkUploadFilesystem("/disposable/chunk-root", {
+    platform: "linux",
+    statfs: () => ({ type: 0xef53 }),
+  }));
+  assert.throws(() => assertSupportedChunkUploadFilesystem("/disposable/chunk-root", {
+    platform: "linux",
+    statfs: () => { throw new Error("mount information unavailable"); },
+  }), /unable to verify.*filesystem/i);
+  assert.throws(() => assertSupportedChunkUploadFilesystem("/disposable/chunk-root", {
+    platform: "linux",
+    statfs: () => ({}),
+  }), /unable to verify.*filesystem/i);
+  assert.throws(() => assertSupportedChunkUploadFilesystem("\\\\fileserver\\share\\chunks", {
+    platform: "win32",
+  }), /unsupported network filesystem/i);
 });
 
 test("chunk quota writes use WAL for durable local state transitions", () => {

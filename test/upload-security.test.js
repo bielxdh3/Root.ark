@@ -163,6 +163,7 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
       UPLOAD_QUARANTINE_DIR: quarantineDir,
       CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024),
       CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024),
+      CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
       JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
       ...envOverrides,
     },
@@ -2105,6 +2106,7 @@ test("a failed handed-off ledger transition preserves registered publication for
       UPLOAD_QUARANTINE_DIR: harness.quarantineDir,
       CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024),
       CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024),
+      CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
       JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -2186,7 +2188,7 @@ test("partial encrypted handoff registration preserves publication and charge wh
   const recoveryPort = await getUnusedPort();
   const recoveryChild = spawn(process.execPath, [SERVER], {
     cwd: harness.dir,
-    env: { ...process.env, NODE_ENV: "test", PORT: String(recoveryPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    env: { ...process.env, NODE_ENV: "test", PORT: String(recoveryPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -4041,6 +4043,25 @@ test("chunk quota exhaustion rejects before creating a Multer incoming file", { 
   }
 });
 
+test("chunk uploads fail closed before Multer when local single-host topology is unverified", { timeout: 30_000 }, async (t) => {
+  const harness = await createHarness(t, { envOverrides: {
+    CHUNK_UPLOAD_STORAGE_TOPOLOGY: "",
+  } });
+  const session = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, session, {
+    uploadId: "unverified-chunk-topology",
+    originalName: "unverified-chunk-topology.txt",
+    chunkIndex: 0,
+    totalChunks: 1,
+    bytes: Buffer.from("must not be staged"),
+  });
+  assert.equal(response.status, 503, response.body);
+  assert.equal(JSON.parse(response.body).code, "CHUNK_QUOTA_UNAVAILABLE");
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, "incoming")), false, "the disabled endpoint never creates its staging directory");
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, ".quota.sqlite")), false);
+  assert.equal((await request(harness.port, "/login.html")).status, 200);
+});
+
 test("chunk completion reserves assembly capacity before committing the final part", { timeout: 45_000 }, async (t) => {
   const harness = await createHarness(t, { envOverrides: {
     CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(8 * 1024 * 1024),
@@ -4225,7 +4246,7 @@ test("restart reconciles a replacement when restoring its prior part fails", { t
   const recoveryPort = await getUnusedPort();
   const recoveryChild = spawn(process.execPath, [SERVER], {
     cwd: harness.dir,
-    env: { ...process.env, NODE_ENV: "test", PORT: String(recoveryPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    env: { ...process.env, NODE_ENV: "test", PORT: String(recoveryPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });

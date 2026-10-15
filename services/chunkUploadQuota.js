@@ -7,6 +7,19 @@ const { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree } = require("
 const MAX_SAFE_BYTES = Number.MAX_SAFE_INTEGER;
 const DATABASE_NAME = ".quota.sqlite";
 const BUSY_TIMEOUT_MS = 3000;
+const REQUIRED_TOPOLOGY_ACK = "single-host-local-volume";
+const KNOWN_REMOTE_LINUX_FILESYSTEM_TYPES = new Set([
+  0x6969, // NFS
+  0x517b, // SMB
+  0xff534d42, // CIFS / SMB
+  0xfe534d42, // SMB2
+  0x65735546, // FUSE (including common network mounts such as SSHFS)
+  0x01021997, // 9p
+  0x00c36400, // Ceph
+  0x5346414f, // AFS
+  0x6b414653, // AFS (alternate magic)
+  0x564c, // NCP
+]);
 const activeQuotaInstances = new Set();
 const STATES = new Set([
   "reserved", "writing", "staged", "promoting", "part_committed", "assembling",
@@ -26,7 +39,54 @@ function parseChunkUploadQuotaConfig(env = process.env) {
   if (perAccountBytes === null || systemBytes === null || perAccountBytes > systemBytes) {
     return { enabled: false, reason: "invalid_configuration" };
   }
+  if (env.CHUNK_UPLOAD_STORAGE_TOPOLOGY !== REQUIRED_TOPOLOGY_ACK) {
+    return { enabled: false, reason: "topology_not_acknowledged" };
+  }
   return { enabled: true, perAccountBytes, systemBytes };
+}
+
+function assertSafeChunkUploadAncestors(directory, { platform = process.platform, uid = process.getuid?.() } = {}) {
+  if (platform === "win32") return;
+  if (!Number.isInteger(uid)) throw new Error("Unable to verify chunk-upload storage owner");
+
+  const resolved = path.resolve(directory);
+  const pathRoot = path.parse(resolved).root;
+  const segments = resolved.slice(pathRoot.length).split(path.sep).filter(Boolean);
+  let current = pathRoot;
+  for (let index = 0; index < segments.length; index += 1) {
+    current = path.join(current, segments[index]);
+    let stats;
+    try {
+      stats = fs.lstatSync(current);
+    } catch (error) {
+      if (error.code === "ENOENT" && index === segments.length - 1) return;
+      throw error;
+    }
+    if (stats.isSymbolicLink() || !stats.isDirectory()) throw new Error("Unsafe chunk-upload storage ancestor");
+    if (stats.uid !== 0 && stats.uid !== uid) throw new Error("Untrusted chunk-upload storage ancestor owner");
+    const writableByGroupOrOther = (stats.mode & 0o022) !== 0;
+    const sticky = (stats.mode & 0o1000) !== 0;
+    const isTargetDirectory = index === segments.length - 1;
+    if (writableByGroupOrOther && (!sticky || isTargetDirectory)) throw new Error("Writable chunk-upload storage ancestor");
+  }
+}
+
+function assertSupportedChunkUploadFilesystem(rootDir, { platform = process.platform, statfs = fs.statfsSync } = {}) {
+  if (platform === "win32") {
+    if (/^(?:\\\\|\/\/)/.test(rootDir)) throw new Error("Unsupported network filesystem for chunk uploads");
+    return;
+  }
+  if (platform !== "linux") return;
+  if (typeof statfs !== "function") throw new Error("Unable to verify chunk-upload filesystem type");
+  let type;
+  try {
+    const rawType = statfs(rootDir).type;
+    if (typeof rawType !== "number" || !Number.isSafeInteger(rawType)) throw new Error("Filesystem type is unavailable");
+    type = rawType >>> 0;
+  } catch {
+    throw new Error("Unable to verify chunk-upload filesystem type");
+  }
+  if (KNOWN_REMOTE_LINUX_FILESYSTEM_TYPES.has(type)) throw new Error("Unsupported remote filesystem for chunk uploads");
 }
 
 function canonicalAccountKey(username) {
@@ -86,6 +146,8 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
     throw new TypeError("Invalid chunk upload quota limits");
   }
   const resolvedRoot = path.resolve(rootDir);
+  assertSafeChunkUploadAncestors(resolvedRoot);
+  assertSupportedChunkUploadFilesystem(resolvedRoot);
   ensureWindowsChunkUploadRoot(resolvedRoot);
   verifyWindowsChunkUploadTree(resolvedRoot);
   const rootStats = fs.lstatSync(resolvedRoot);
@@ -447,4 +509,10 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
   }
 }
 
-module.exports = { canonicalAccountKey, createChunkUploadQuota, parseChunkUploadQuotaConfig };
+module.exports = {
+  assertSafeChunkUploadAncestors,
+  assertSupportedChunkUploadFilesystem,
+  canonicalAccountKey,
+  createChunkUploadQuota,
+  parseChunkUploadQuotaConfig,
+};

@@ -44,6 +44,8 @@ Add two required positive byte limits, with no defaults and no sample capacity v
 - `CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES`
 - `CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES`
 
+Also require `CHUNK_UPLOAD_STORAGE_TOPOLOGY=single-host-local-volume` as an explicit operator attestation before the server enables chunk uploads. Missing or different values fail closed. This is a deployment assertion, not automatic replica or mount discovery. On Linux, reject known remote filesystem types (including NFS, SMB/CIFS, FUSE, 9p, Ceph, AFS, and NCP) and fail closed if filesystem type cannot be checked. On Windows, reject UNC paths; mapped drives and non-Linux mount topology still require operator verification.
+
 Values must be strict base-10 positive integers within JavaScript's safe-integer range; the per-account limit must not exceed the system limit. Missing, empty, malformed, unsafe, or contradictory values disable only chunk uploads. They must not prevent the rest of the server from starting. Configuration is read at process start and takes effect after restart.
 
 If the quota ledger cannot be safely opened, validated, migrated, or reconciled, chunk uploads return HTTP `503` with a stable machine-readable code and a generic operator-facing message. Capacity exhaustion returns HTTP `507` with a stable code and retry guidance. Preserve the existing JSON `error` field for client compatibility and add a stable `code` field. Do not set a fixed `Retry-After`: available capacity depends on concurrent sessions and cleanup. Do not expose paths, SQL errors, or ledger contents to clients.
@@ -107,7 +109,7 @@ For a live request, release an incoming reservation on a terminal request outcom
 
 ## Deployment boundary
 
-Supported: multiple Root.ark processes on one host, using the same local filesystem paths and one SQLite ledger with working local SQLite locks. Each process must use the same configured byte budgets and compatible code version. Filesystem type cannot be reliably identified portably by this application, so single-host/local-volume placement is an operator deployment precondition; do not enable this feature where that precondition cannot be established.
+Supported quota coordination: multiple Root.ark processes on one host, using the same local filesystem paths and one SQLite ledger with working local SQLite locks. Each process must use the same configured byte budgets and compatible code version. The required topology setting attests this placement but cannot detect unreported replicas, container placement, bind mounts, or all mapped/network drives. Linux known remote filesystem types and Windows UNC paths are rejected; operators must verify other platform/mount configurations and must not enable the feature when local single-host placement cannot be established. The application as a whole still has process-local authentication state and requires one process unless that separate boundary is changed.
 
 Unsupported: multiple hosts, NFS, SMB, or a topology where a process can write staging data without consulting this ledger. Document this boundary in setup/deployment guidance. Do not call the control distributed or production-ready without deployment-specific evidence. A failed capacity check is a temporary refusal; the client can retry after existing sessions are completed or safely expire, without losing previously committed chunks.
 
