@@ -148,7 +148,7 @@
       '      <button type="button" class="icon-button mobile-menu" data-action="menu" aria-label="Abrir navegação" aria-controls="app-sidebar" aria-expanded="false"><span aria-hidden="true">☰</span></button>',
       '      <div class="topbar-context"><span class="topbar-kicker">ROOT.ARK</span><span class="topbar-divider" aria-hidden="true">/</span><span>' + title + "</span></div>",
       '      <div class="topbar-actions"><span class="topbar-secure"><span aria-hidden="true">●</span> Sessão protegida</span>',
-      '        <details class="account-menu"><summary><span class="avatar" aria-hidden="true">' + escape(name.slice(0, 1).toUpperCase()) + '</span><span class="account-name">' + name + '</span><span class="chevron" aria-hidden="true">⌄</span></summary>',
+      '        <details class="account-menu"><summary aria-label="Conta de ' + name + '"><span class="avatar" aria-hidden="true">' + escape(name.slice(0, 1).toUpperCase()) + '</span><span class="account-name">' + name + '</span><span class="chevron" aria-hidden="true">⌄</span></summary>',
       '          <div class="account-popover"><strong>' + name + '</strong><span>' + escape(roleLabel(user.role)) + '</span><button type="button" data-action="logout">Sair da conta</button></div>',
       "        </details>",
       "      </div>",

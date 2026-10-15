@@ -132,18 +132,92 @@ test("sync object history retains encrypted versions and tombstones across resta
   const filePath = path.join(dir, "objects.json");
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
   const store = await new SyncObjectStore(filePath).open();
+  const originalRename = fsp.rename;
+  const renameCalls = [];
+  let failEveryRename = false;
   const key = crypto.randomBytes(32);
   const make = (operation, versionId, operationId, counter, baseRevision, plaintext = "x") => protocol.createOperation({ operation, objectId: "history-object", fileId: "history-file", versionId, operationId, deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", revision: { counter, deviceId: "device-a" }, baseRevision, metadata: { path: "history.txt" }, plaintext: Buffer.from(plaintext), fileKey: key });
   const first = make("create", "history-v1", "history-op-1", 1, null, "one");
   const second = make("update", "history-v2", "history-op-2", 2, first.revision, "two");
   const tombstone = make("delete", "history-v3", "history-op-3", 3, second.revision, "");
-  await store.put("alice", first); await store.put("alice", second); await store.put("alice", tombstone);
-  assert.equal(store.history("alice", "history-object").length, 3);
-  assert.equal(store.list("alice")[0].tombstone, true);
-  const reopened = await new SyncObjectStore(filePath).open();
-  assert.equal(reopened.history("alice", "history-object").length, 3);
-  await reopened.transact((next) => { delete next.users.alice.seen["history-op-1"]; });
-  assert.ok(["stale", "conflict"].includes((await reopened.put("alice", first)).kind));
+  if (process.platform === "win32") {
+    fsp.rename = async (source, destination) => {
+      renameCalls.push([source, destination]);
+      if (renameCalls.length === 1 || failEveryRename) {
+        const error = new Error("injected Windows rename EPERM");
+        error.code = "EPERM";
+        throw error;
+      }
+      return originalRename(source, destination);
+    };
+  }
+  try {
+    await store.put("alice", first); await store.put("alice", second); await store.put("alice", tombstone);
+    if (process.platform === "win32") {
+      assert.equal(renameCalls.length, 4);
+      assert.deepEqual(renameCalls[1], renameCalls[0]);
+    }
+    assert.equal(store.history("alice", "history-object").length, 3);
+    assert.equal(store.list("alice")[0].tombstone, true);
+    const reopened = await new SyncObjectStore(filePath).open();
+    assert.equal(reopened.history("alice", "history-object").length, 3);
+    await reopened.transact((next) => { delete next.users.alice.seen["history-op-1"]; });
+    assert.ok(["stale", "conflict"].includes((await reopened.put("alice", first)).kind));
+    if (process.platform === "win32") {
+      const committedState = await fsp.readFile(filePath, "utf8");
+      const callsBeforePermanentFailure = renameCalls.length;
+      failEveryRename = true;
+      await assert.rejects(reopened.transact((next) => { next.users.alice.failedWrite = true; }), { code: "EPERM" });
+      const failedCalls = renameCalls.slice(callsBeforePermanentFailure);
+      assert.equal(failedCalls.length, 3);
+      assert.ok(failedCalls.every(([source, destination]) => source === failedCalls[0][0] && destination === filePath));
+      assert.equal(await fsp.readFile(filePath, "utf8"), committedState);
+      assert.deepEqual((await fsp.readdir(dir)).filter((name) => name.startsWith("objects.json.tmp-")), []);
+    }
+  } finally {
+    if (process.platform === "win32") fsp.rename = originalRename;
+  }
+});
+
+test("sync journal retries transient Windows rename EPERM without replacing committed state on exhaustion", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-journal-rename-retry-"));
+  const filePath = path.join(dir, "journal.json");
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const journal = await new SyncJournal(filePath).open();
+  const originalRename = fsp.rename;
+  const renameCalls = [];
+  let failEveryRename = false;
+  if (process.platform === "win32") {
+    fsp.rename = async (source, destination) => {
+      renameCalls.push([source, destination]);
+      if (renameCalls.length === 1 || failEveryRename) {
+        const error = new Error("injected Windows journal rename EPERM");
+        error.code = "EPERM";
+        throw error;
+      }
+      return originalRename(source, destination);
+    };
+  }
+  try {
+    await journal.enqueue({ operationId: "journal-retry-ok", kind: "put", path: "retry.txt" });
+    assert.deepEqual(journal.pending().map((operation) => operation.operationId), ["journal-retry-ok"]);
+    if (process.platform === "win32") {
+      assert.equal(renameCalls.length, 2);
+      assert.deepEqual(renameCalls[1], renameCalls[0]);
+      const committedState = await fsp.readFile(filePath, "utf8");
+      const callsBeforePermanentFailure = renameCalls.length;
+      failEveryRename = true;
+      await assert.rejects(journal.enqueue({ operationId: "journal-retry-failed", kind: "put", path: "failed.txt" }), { code: "EPERM" });
+      const failedCalls = renameCalls.slice(callsBeforePermanentFailure);
+      assert.equal(failedCalls.length, 3);
+      assert.ok(failedCalls.every(([source, destination]) => source === failedCalls[0][0] && destination === filePath));
+      assert.equal(await fsp.readFile(filePath, "utf8"), committedState);
+      assert.deepEqual(journal.pending().map((operation) => operation.operationId), ["journal-retry-ok"]);
+      assert.deepEqual((await fsp.readdir(dir)).filter((name) => name.startsWith("journal.json.tmp-")), []);
+    }
+  } finally {
+    if (process.platform === "win32") fsp.rename = originalRename;
+  }
 });
 
 test("WebDAV mutation journal translates into v2 move and reaches a second client", async (t) => {

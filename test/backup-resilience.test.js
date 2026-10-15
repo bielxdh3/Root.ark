@@ -184,6 +184,182 @@ test("JSON metadata lock rejection keeps the backup archive and history entry to
   assert.equal(result.historyExists, true, "a failed metadata deletion must preserve the history entry");
 });
 
+test("Windows retention transaction publication retries only transient EPERM", { skip: process.platform !== "win32" }, () => {
+  const result = run(`
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const service = require(${JSON.stringify(servicePath)});
+    const repository = require(${JSON.stringify(path.join(__dirname, "..", "repositories", "backupRepository"))});
+    const id = "00000000-0000-4000-8000-000000000091";
+    const filename = "rootark-backup-2026-10-09-00-00-11.zip";
+    const archivePath = path.join(service.BACKUPS_DIR, filename);
+    fs.mkdirSync(service.BACKUPS_DIR, { recursive: true });
+    fs.writeFileSync(archivePath, "disposable Windows retry fixture");
+    repository.saveBackup({ id, filename, status: "success", metadata: {} });
+    const originalRenameSync = fs.renameSync;
+    const originalDeleteBackup = repository.deleteBackup;
+    let transactionRenameCalls = 0;
+    let injectedFailures = 0;
+    let deleteCalled = false;
+    fs.renameSync = function (source, destination, ...args) {
+      if (path.basename(destination) === "transaction.json" && String(source).endsWith(".tmp")) {
+        transactionRenameCalls += 1;
+        if (injectedFailures === 0) {
+          injectedFailures += 1;
+          throw Object.assign(new Error("injected transient Windows rename EPERM"), { code: "EPERM" });
+        }
+      }
+      return originalRenameSync.call(this, source, destination, ...args);
+    };
+    repository.deleteBackup = () => {
+      deleteCalled = true;
+      throw Object.assign(new Error("injected metadata lock rejection"), { code: "BACKUP_METADATA_LOCK_BUSY" });
+    };
+    (async () => {
+      let failureCode = null;
+      try { await service.deleteBackup(id); } catch (error) { failureCode = error.code; }
+      fs.renameSync = originalRenameSync;
+      repository.deleteBackup = originalDeleteBackup;
+      console.log(JSON.stringify({
+        failureCode,
+        transactionRenameCalls,
+        injectedFailures,
+        deleteCalled,
+        archiveExists: fs.existsSync(archivePath),
+        historyExists: Boolean(repository.getBackup(id)),
+        pendingTransactionCount: fs.existsSync(service.RETENTION_TRANSACTIONS_DIR) ? fs.readdirSync(service.RETENTION_TRANSACTIONS_DIR).length : 0,
+      }));
+      require(${JSON.stringify(path.join(__dirname, "..", "db"))}).closeDb();
+    })().catch((error) => { fs.renameSync = originalRenameSync; repository.deleteBackup = originalDeleteBackup; console.error(error); process.exitCode = 1; });
+  `);
+  assert.equal(result.injectedFailures, 1);
+  assert.ok(result.transactionRenameCalls >= 2, "the same atomic rename is retried after a transient Windows EPERM");
+  assert.equal(result.failureCode, "BACKUP_METADATA_LOCK_BUSY");
+  assert.equal(result.deleteCalled, true);
+  assert.equal(result.archiveExists, true);
+  assert.equal(result.historyExists, true);
+  assert.equal(result.pendingTransactionCount, 0);
+});
+
+test("Windows retention transaction rename exhaustion keeps the prior commit intact", { skip: process.platform !== "win32" }, () => {
+  const result = run(`
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const service = require(${JSON.stringify(servicePath)});
+    const repository = require(${JSON.stringify(path.join(__dirname, "..", "repositories", "backupRepository"))});
+    const id = "00000000-0000-4000-8000-000000000092";
+    const filename = "rootark-backup-2026-10-09-00-00-12.zip";
+    const archivePath = path.join(service.BACKUPS_DIR, filename);
+    fs.mkdirSync(service.BACKUPS_DIR, { recursive: true });
+    fs.writeFileSync(archivePath, "disposable Windows retry exhaustion fixture");
+    repository.saveBackup({ id, filename, status: "success", metadata: {} });
+    const originalRenameSync = fs.renameSync;
+    const originalRmSync = fs.rmSync;
+    let transactionPath = null;
+    let initialTransactionContents = null;
+    let transactionRenameCalls = 0;
+    let failedRenameCalls = 0;
+    let destinationRemovalObserved = false;
+    fs.renameSync = function (source, destination, ...args) {
+      if (path.basename(destination) === "transaction.json" && String(source).endsWith(".tmp")) {
+        transactionRenameCalls += 1;
+        transactionPath = destination;
+        if (transactionRenameCalls === 1) {
+          const renamed = originalRenameSync.call(this, source, destination, ...args);
+          initialTransactionContents = fs.readFileSync(destination, "utf8");
+          return renamed;
+        }
+        failedRenameCalls += 1;
+        throw Object.assign(new Error("injected persistent Windows rename EPERM"), { code: "EPERM" });
+      }
+      return originalRenameSync.call(this, source, destination, ...args);
+    };
+    fs.rmSync = function (target, ...args) {
+      if (transactionPath && path.resolve(target) === path.resolve(transactionPath)) destinationRemovalObserved = true;
+      return originalRmSync.call(this, target, ...args);
+    };
+    (async () => {
+      let failureCode = null;
+      let rollbackErrorCode = null;
+      try { await service.deleteBackup(id); } catch (error) { failureCode = error.code; rollbackErrorCode = error.rollbackError?.code || null; }
+      fs.renameSync = originalRenameSync;
+      fs.rmSync = originalRmSync;
+      const transactionContents = fs.readFileSync(transactionPath, "utf8");
+      const transaction = JSON.parse(transactionContents);
+      const beforeRecovery = {
+        failureCode,
+        rollbackErrorCode,
+        transactionRenameCalls,
+        failedRenameCalls,
+        transactionUnchanged: transactionContents === initialTransactionContents,
+        transactionPhase: transaction.phase,
+        destinationRemovalObserved,
+        archiveExists: fs.existsSync(archivePath),
+        tombstoneExists: fs.existsSync(archivePath + ".retention-tombstone"),
+        historyExists: Boolean(repository.getBackup(id)),
+      };
+      service.recoverRetentionTombstones();
+      console.log(JSON.stringify({
+        ...beforeRecovery,
+        pendingTransactionCountAfterRecovery: fs.existsSync(service.RETENTION_TRANSACTIONS_DIR) ? fs.readdirSync(service.RETENTION_TRANSACTIONS_DIR).length : 0,
+      }));
+      require(${JSON.stringify(path.join(__dirname, "..", "db"))}).closeDb();
+    })().catch((error) => { fs.renameSync = originalRenameSync; fs.rmSync = originalRmSync; console.error(error); process.exitCode = 1; });
+  `);
+  assert.equal(result.failureCode, "EPERM");
+  assert.equal(result.rollbackErrorCode, "EPERM");
+  assert.equal(result.failedRenameCalls, 6, "each of the two failed journal publications is bounded to three attempts");
+  assert.equal(result.transactionRenameCalls, 7);
+  assert.equal(result.transactionUnchanged, true, "exhaustion must leave the previously committed journal untouched");
+  assert.equal(result.transactionPhase, "prepared");
+  assert.equal(result.destinationRemovalObserved, false, "retry exhaustion must not delete the committed destination as a fallback");
+  assert.equal(result.archiveExists, true);
+  assert.equal(result.tombstoneExists, false);
+  assert.equal(result.historyExists, true);
+  assert.equal(result.pendingTransactionCountAfterRecovery, 0, "restart recovery can consume the preserved prepared journal");
+});
+
+test("Windows retention transaction rename does not retry non-EPERM errors", { skip: process.platform !== "win32" }, () => {
+  const result = run(`
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const service = require(${JSON.stringify(servicePath)});
+    const repository = require(${JSON.stringify(path.join(__dirname, "..", "repositories", "backupRepository"))});
+    const id = "00000000-0000-4000-8000-000000000093";
+    const filename = "rootark-backup-2026-10-09-00-00-13.zip";
+    const archivePath = path.join(service.BACKUPS_DIR, filename);
+    fs.mkdirSync(service.BACKUPS_DIR, { recursive: true });
+    fs.writeFileSync(archivePath, "disposable Windows non-EPERM fixture");
+    repository.saveBackup({ id, filename, status: "success", metadata: {} });
+    const originalRenameSync = fs.renameSync;
+    let transactionRenameCalls = 0;
+    fs.renameSync = function (source, destination, ...args) {
+      if (path.basename(destination) === "transaction.json" && String(source).endsWith(".tmp")) {
+        transactionRenameCalls += 1;
+        throw Object.assign(new Error("injected Windows rename EACCES"), { code: "EACCES" });
+      }
+      return originalRenameSync.call(this, source, destination, ...args);
+    };
+    (async () => {
+      let failureCode = null;
+      try { await service.deleteBackup(id); } catch (error) { failureCode = error.code; }
+      fs.renameSync = originalRenameSync;
+      service.recoverRetentionTombstones();
+      console.log(JSON.stringify({
+        failureCode,
+        transactionRenameCalls,
+        archiveExists: fs.existsSync(archivePath),
+        historyExists: Boolean(repository.getBackup(id)),
+      }));
+      require(${JSON.stringify(path.join(__dirname, "..", "db"))}).closeDb();
+    })().catch((error) => { fs.renameSync = originalRenameSync; console.error(error); process.exitCode = 1; });
+  `);
+  assert.equal(result.failureCode, "EACCES");
+  assert.equal(result.transactionRenameCalls, 1);
+  assert.equal(result.archiveExists, true);
+  assert.equal(result.historyExists, true);
+});
+
 test("archive removal failure restores backup history so explicit deletion can be retried", () => {
   const result = run(`
     const fs = require("node:fs");
