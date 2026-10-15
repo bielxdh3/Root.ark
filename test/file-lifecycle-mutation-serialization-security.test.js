@@ -185,7 +185,8 @@ function stop(child) {
 }
 
 test("version and pending mutations serialize with cache hydration", { timeout: 90_000 }, async (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-lifecycle-mutation-"));
+  const fixtureBase = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
+  const directory = fs.mkdtempSync(path.join(fixtureBase, "rootark-lifecycle-mutation-"));
   const dataDir = path.join(directory, "data");
   fs.mkdirSync(dataDir, { recursive: true });
   fs.mkdirSync(path.join(directory, "uploads"), { recursive: true });
@@ -396,6 +397,8 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     AWS_ENDPOINT_URL: `http://127.0.0.1:${cloud.port}`, AWS_FORCE_PATH_STYLE: "true", AWS_ACCESS_KEY_ID: "fixture-access-key",
     AWS_S3_PRINCIPAL_ID: "fixture-account",
     AWS_SECRET_ACCESS_KEY: "fixture-secret-key", TRASH_ENABLED: "true", TRASH_AUTO_CLEANUP_ENABLED: "false", CLOUD_TEMP_RECONCILIATION_INTERVAL_MS: "1000", CLOUD_UPLOAD_RECONCILIATION_INTERVAL_MS: "1000",
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024),
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
     WEBDAV_ENABLED: "true",
     WEBDAV_ALLOW_MOVE: "true",
     NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${preloadFile}`].filter(Boolean).join(" "),
@@ -966,8 +969,8 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const encryptedAfterChunkFailure = JSON.parse(fs.readFileSync(path.join(dataDir, "encrypted-files.json"), "utf8"));
   results.push({
     case: "failed-cloud-queue-write-rolls-back-chunk-upload-metadata",
-    actual: { status: chunkFailureResponse.status, localTempExists: fs.existsSync(path.join(directory, "temp", failedChunkName)), pendingMetadataExists: Boolean(pendingAfterChunkFailure[`root/${failedChunkName}`]), encryptedMetadataExists: Boolean(encryptedAfterChunkFailure[`root/${failedChunkName}`]) },
-    expected: { status: 400, localTempExists: false, pendingMetadataExists: false, encryptedMetadataExists: false },
+    actual: { status: chunkFailureResponse.status, code: JSON.parse(chunkFailureResponse.body).code, localTempExists: fs.existsSync(path.join(directory, "temp", failedChunkName)), pendingMetadataExists: Boolean(pendingAfterChunkFailure[`root/${failedChunkName}`]), encryptedMetadataExists: Boolean(encryptedAfterChunkFailure[`root/${failedChunkName}`]) },
+    expected: { status: 503, code: "CHUNK_QUOTA_UNAVAILABLE", localTempExists: true, pendingMetadataExists: false, encryptedMetadataExists: false },
   });
 
   const failedWebDavName = "webdav-queue-write-failed.txt";

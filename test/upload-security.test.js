@@ -3187,6 +3187,9 @@ test("chunk uploads stay disabled without explicit quota limits while the server
   const harness = await createHarness(t, { envOverrides: {
     CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: "",
     CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: "",
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "",
+    CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "",
+    CHUNK_UPLOAD_STORAGE_TOPOLOGY: "",
   } });
   const session = await login(harness.port, "uploader", harness.password);
   const response = await uploadChunk(harness.port, session, {
@@ -3307,7 +3310,8 @@ test("startup removes a dead-owner incoming reservation only after reconciling i
       fs.mkdirSync(path.join(root, "incoming"), { recursive: true });
       fs.writeFileSync(path.join(root, "incoming", ${JSON.stringify(operationId)}), ${JSON.stringify(bytes)});
       const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
-      quota.initialize([{ operationId: ${JSON.stringify(operationId)}, accountKey: "uploader", relativePath: path.join("incoming", ${JSON.stringify(operationId)}), state: "reserved", chargeBytes: 8 * 1024 * 1024 }]);
+      quota.initialize();
+      quota.reserve({ operationId: ${JSON.stringify(operationId)}, accountKey: "uploader", relativePath: path.join("incoming", ${JSON.stringify(operationId)}), reservedBytes: 8 * 1024 * 1024 });
       quota.close();
     `,
   });

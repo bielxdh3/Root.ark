@@ -51,7 +51,8 @@ function stop(child) {
 }
 
 function createWebDavFixture(prefix) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const fixtureBase = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
+  const dir = fs.mkdtempSync(path.join(fixtureBase, prefix));
   fs.mkdirSync(path.join(dir, "data"));
   fs.mkdirSync(path.join(dir, "uploads"));
   fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([{ username: "agent", password: bcrypt.hashSync("password", 10), role: "admin", permissions: { upload: true }, sessionVersion: 0 }]));
@@ -60,7 +61,7 @@ function createWebDavFixture(prefix) {
 }
 
 function serverEnv(port, extra = {}) {
-  return { ...process.env, NODE_ENV: "test", PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", JWT_SECRET: crypto.randomBytes(48).toString("base64url"), ...extra };
+  return { ...process.env, NODE_ENV: "test", PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", UPLOAD_SCAN_ENABLED: "false", CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url"), ...extra };
 }
 
 test("PROPFIND rejects malformed and unsupported non-empty bodies while empty requests succeed", { timeout: 20_000 }, async (t) => {
@@ -167,11 +168,20 @@ test("startup incoming cleanup preserves an aged pending WebDAV MOVE journal", {
   const webDavPutStagingPath = path.join(incoming, `${Date.now()}-${"c".repeat(16)}.webdav`);
   fs.writeFileSync(webDavPutStagingPath, "partial WebDAV upload");
   fs.utimesSync(webDavPutStagingPath, staleTime, staleTime);
-  const chunkIncoming = path.join(dir, "temp", ".chunks", "incoming");
+  const chunkRoot = path.join(dir, "temp", ".chunks");
+  const { ensureWindowsChunkUploadRoot } = require(path.join(ROOT, "services", "chunkUploadWindowsAcl.js"));
+  ensureWindowsChunkUploadRoot(chunkRoot);
+  const chunkIncoming = path.join(chunkRoot, "incoming");
   fs.mkdirSync(chunkIncoming, { recursive: true });
-  const chunkStagingPath = path.join(chunkIncoming, "b".repeat(32));
+  const chunkOperationId = "b".repeat(32);
+  const chunkStagingPath = path.join(chunkIncoming, chunkOperationId);
   fs.writeFileSync(chunkStagingPath, "partial chunk");
   fs.utimesSync(chunkStagingPath, staleTime, staleTime);
+  const { createChunkUploadQuota } = require(path.join(ROOT, "services", "chunkUploadQuota.js"));
+  const quota = createChunkUploadQuota({ rootDir: chunkRoot, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483647 });
+  quota.initialize();
+  quota.reserve({ operationId: chunkOperationId, accountKey: "agent", relativePath: path.join("incoming", chunkOperationId), reservedBytes: 8 * 1024 * 1024 });
+  quota.close();
   const port = await freePort();
   const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: "ignore", windowsHide: true });
   t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
