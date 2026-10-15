@@ -2445,8 +2445,11 @@ async function restoreBackup(id, options = {}) {
     }
     const { zip, manifest } = await validateBackupArchive(backup, archivePath);
     await options.revalidateAuthorization?.();
+    const preRestoreBackupId = crypto.randomUUID();
+    coordinator = updateWholeRestoreCoordinator(coordinator, { preRestoreBackupId });
     preRestore = await backupService.createBackup({
       lockHeld: true,
+      backupId: preRestoreBackupId,
       type: "pre-restore",
       createdBy: options.username || null,
       notes: `Backup automatico antes de restaurar ${id}`,
