@@ -48,6 +48,45 @@ function acquireSource(servicePath, enteredPath, resultCode = 0, afterAcquire = 
   return `const fs=require("fs"); const service=require(${JSON.stringify(servicePath)}); let release; try { release=service.acquireLock("backup"); ${afterAcquire} ${resultCode === 0 ? "release(); process.exit(0);" : "process.exit(12);"} } catch (error) { if (release) release(); process.exit(error.code === "BACKUP_LOCKED" ? 10 : 11); }`;
 }
 
+test("backup takeover preserves exact adjacent 64-bit file IDs in durable authority", { timeout: 30_000 }, async () => {
+  const runtime = newRuntime();
+  const lockPath = path.join(runtime, "data", "backups", ".backup.lock");
+  const evidencePath = lockPath + ".takeover" + path.sep + "evidence";
+  const authorityPath = lockPath + ".takeover" + path.sep + "authority.json";
+  try {
+    const ownerSource = 'const service=require(' + JSON.stringify(SERVICE) + '); service.acquireLock("backup"); process.exit(0);';
+    const owner = startChild(runtime, ownerSource);
+    const ownerResult = await owner.result;
+    assert.equal(ownerResult.code, 0, ownerResult.stderr);
+    assert.equal(fs.existsSync(lockPath), true, "the disposable child leaves its lock as a stale recovery fixture");
+
+    const id = 9_007_199_254_740_992n;
+    const contenderSource = [
+      'const fs=require("node:fs");',
+      'const path=require("node:path");',
+      'const service=require(' + JSON.stringify(SERVICE) + ');',
+      'const lock=path.resolve(service.LOCK_FILE);',
+      'const evidence=path.resolve(service.LOCK_FILE + ".takeover" + path.sep + "evidence");',
+      'const adjacent=9007199254740992n;',
+      'const stat=fs.statSync;',
+      'const lstat=fs.lstatSync;',
+      'const identify=(value,args,ino)=>new Proxy(value,{get(target,key,receiver){if(key==="dev")return args[0]?.bigint===true?1n:1;if(key==="ino")return args[0]?.bigint===true?ino:Number(ino);return Reflect.get(target,key,receiver);}});',
+      'fs.statSync=function(target,...args){const value=stat.call(this,target,...args);return path.resolve(String(target))===lock?identify(value,args,adjacent):value;};',
+      'fs.lstatSync=function(target,...args){const value=lstat.call(this,target,...args);const resolved=path.resolve(String(target));return resolved===lock?identify(value,args,adjacent):resolved===evidence?identify(value,args,adjacent+1n):value;};',
+      'try{const release=service.acquireLock("backup");release();process.exit(12);}catch(error){process.exit(error.code==="BACKUP_LOCKED"?10:11);}'
+    ].join('');
+    const contender = startChild(runtime, contenderSource);
+    const result = await contender.result;
+    assert.equal(result.code, 10, result.stderr || result.stdout);
+    assert.equal(Number(id), Number(id + 1n), "the injected adjacent IDs collide under Number conversion");
+    assert.equal(fs.existsSync(evidencePath), true, "ambiguous renamed evidence remains available for safe recovery");
+    const authority = JSON.parse(fs.readFileSync(authorityPath, "utf8"));
+    assert.equal(authority.observed.stat.ino, id.toString(), "durable takeover evidence stores the exact decimal file ID");
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("stale takeover contenders preserve a newer live lock", { timeout: 30_000 }, async () => {
   const runtime = newRuntime();
   const backupDir = path.join(runtime, "data", "backups");

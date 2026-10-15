@@ -7131,8 +7131,8 @@ function readChunkMetadataFile(metadataPath) {
   }
 
   try {
-    const descriptorStats = fs.fstatSync(descriptor);
-    const pathStats = fs.lstatSync(metadataPath);
+    const descriptorStats = fs.fstatSync(descriptor, { bigint: true });
+    const pathStats = fs.lstatSync(metadataPath, { bigint: true });
     if (
       !descriptorStats.isFile() ||
       pathStats.isSymbolicLink() ||
@@ -7143,7 +7143,7 @@ function readChunkMetadataFile(metadataPath) {
       throw new Error("Chunk-upload metadata changed during read");
     }
     const contents = fs.readFileSync(descriptor, "utf8");
-    const finalPathStats = fs.lstatSync(metadataPath);
+    const finalPathStats = fs.lstatSync(metadataPath, { bigint: true });
     if (
       finalPathStats.isSymbolicLink() ||
       !finalPathStats.isFile() ||
@@ -7163,8 +7163,8 @@ function replaceChunkMetadataFile(sessionDir, metadataPath, metadata) {
   const replacementPath = path.join(sessionDir, `.metadata-scrub-${crypto.randomUUID()}.tmp`);
   let originalStats = null;
   try {
-    originalStats = fs.lstatSync(metadataPath);
-    if (originalStats.isDirectory() || originalStats.nlink > 1) throw new Error("Chunk-upload metadata cannot be safely replaced");
+    originalStats = fs.lstatSync(metadataPath, { bigint: true });
+    if (originalStats.isDirectory() || originalStats.nlink > 1n) throw new Error("Chunk-upload metadata cannot be safely replaced");
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
@@ -7174,7 +7174,7 @@ function replaceChunkMetadataFile(sessionDir, metadataPath, metadata) {
     assertSafeChunkSessionDirectory(sessionDir);
     let currentStats = null;
     try {
-      currentStats = fs.lstatSync(metadataPath);
+      currentStats = fs.lstatSync(metadataPath, { bigint: true });
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
@@ -7185,7 +7185,7 @@ function replaceChunkMetadataFile(sessionDir, metadataPath, metadata) {
       throw new Error("Chunk-upload metadata changed during replacement");
     }
     fs.renameSync(replacementPath, metadataPath);
-    const installedStats = fs.lstatSync(metadataPath);
+    const installedStats = fs.lstatSync(metadataPath, { bigint: true });
     if (installedStats.isSymbolicLink() || !installedStats.isFile()) throw new Error("Chunk-upload metadata replacement is unsafe");
   } finally {
     fs.rmSync(replacementPath, { force: true });
@@ -7261,8 +7261,8 @@ async function readChunkExpiryCandidate(sessionDir, uploadId, folderId, now = Da
 
   let file;
   try {
-    const descriptorStats = await handle.stat();
-    const pathStats = await fs.promises.lstat(metadataPath);
+    const descriptorStats = await handle.stat({ bigint: true });
+    const pathStats = await fs.promises.lstat(metadataPath, { bigint: true });
     if (
       !descriptorStats.isFile() ||
       pathStats.isSymbolicLink() ||
@@ -7273,7 +7273,7 @@ async function readChunkExpiryCandidate(sessionDir, uploadId, folderId, now = Da
       throw new Error("Chunk-upload metadata changed during read");
     }
     const contents = await handle.readFile("utf8");
-    const finalPathStats = await fs.promises.lstat(metadataPath);
+    const finalPathStats = await fs.promises.lstat(metadataPath, { bigint: true });
     if (
       finalPathStats.isSymbolicLink() ||
       !finalPathStats.isFile() ||
@@ -7286,7 +7286,7 @@ async function readChunkExpiryCandidate(sessionDir, uploadId, folderId, now = Da
   } finally {
     await handle.close();
   }
-  if (!file || file.links !== 1) return null;
+  if (!file || file.links !== 1n) return null;
 
   let metadata;
   try {
@@ -7448,12 +7448,12 @@ function loadChunkMetadata(sessionDir, expectedUploadId, expectedFolderId) {
     isValidLegacyChunkSessionMetadata(metadata, expectedUploadId, expectedFolderId) &&
     !Object.hasOwn(metadata, "uploaderSessionVersion")
   ) {
-    if (file.links !== 1 || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return blockChunkSessionResume(sessionDir);
+    if (file.links !== 1n || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return blockChunkSessionResume(sessionDir);
     return blockLegacyChunkSessionResume(sessionDir, metadata);
   }
 
   if (!isValidChunkSessionMetadata(metadata, expectedUploadId, expectedFolderId)) return blockChunkSessionResume(sessionDir);
-  if (file.links !== 1 || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return blockChunkSessionResume(sessionDir);
+  if (file.links !== 1n || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return blockChunkSessionResume(sessionDir);
   if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true || isChunkSessionExpiredMarker(metadata)) return metadata;
   return migrateChunkSessionMetadata(sessionDir, metadata);
 }
@@ -7493,12 +7493,12 @@ function scrubLegacyChunkPasswords() {
           !Object.hasOwn(metadata, "uploaderSessionVersion") &&
           isValidLegacyChunkSessionMetadata(metadata, sessionEntry.name, folderEntry.name)
         ) {
-          if (file.links !== 1 || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unsafe chunk-upload session contents");
+          if (file.links !== 1n || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unsafe chunk-upload session contents");
           blockLegacyChunkSessionResume(sessionDir, metadata);
           continue;
         }
         if (!isValidChunkSessionMetadata(metadata, sessionEntry.name, folderEntry.name)) throw new Error("Invalid chunk-upload metadata");
-        if (file.links !== 1 || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unsafe chunk-upload session contents");
+        if (file.links !== 1n || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unsafe chunk-upload session contents");
       } catch {
         blockChunkSessionResume(sessionDir);
         continue;
@@ -8758,16 +8758,38 @@ function validWebDavMoveClaimRecord(record, transactionId) {
   return record && record.version === 1 && typeof record.token === "string" && record.token && record.transactionId === transactionId && Number.isInteger(Number(record.pid)) && Number(record.pid) > 0 && typeof record.claimedAt === "string" && Number.isFinite(Date.parse(record.claimedAt));
 }
 
+function webDavMoveExactFileId(value) {
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "string" && /^(0|[1-9]\d*)$/.test(value)) return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return String(value);
+  return null;
+}
+
 function webDavMoveFileStatIdentity(stat) {
-  return stat ? { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, birthtimeMs: stat.birthtimeMs } : null;
+  if (!stat) return null;
+  return {
+    dev: typeof stat.dev === "bigint" ? stat.dev.toString() : stat.dev,
+    ino: typeof stat.ino === "bigint" ? stat.ino.toString() : stat.ino,
+    size: typeof stat.size === "bigint" ? Number(stat.size) : stat.size,
+    mtimeMs: typeof stat.mtimeMs === "bigint" ? Number(stat.mtimeMs) : stat.mtimeMs,
+    ctimeMs: typeof stat.ctimeMs === "bigint" ? Number(stat.ctimeMs) : stat.ctimeMs,
+    birthtimeMs: typeof stat.birthtimeMs === "bigint" ? Number(stat.birthtimeMs) : stat.birthtimeMs,
+  };
+}
+
+function webDavMoveSameFileIdentity(left, right) {
+  if (!left || !right) return false;
+  const leftDev = webDavMoveExactFileId(left.dev);
+  const leftIno = webDavMoveExactFileId(left.ino);
+  return leftDev !== null && leftIno !== null && leftDev === webDavMoveExactFileId(right.dev) && leftIno === webDavMoveExactFileId(right.ino);
 }
 
 function webDavMoveSameStatIdentity(left, right) {
-  return Boolean(left && right && ["dev", "ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"].every((key) => left[key] === right[key]));
+  return Boolean(webDavMoveSameFileIdentity(left, right) && ["size", "mtimeMs", "ctimeMs", "birthtimeMs"].every((key) => left[key] === right[key]));
 }
 
 function webDavMoveSameRenamedIdentity(left, right) {
-  return Boolean(left && right && ["dev", "ino", "size", "mtimeMs", "birthtimeMs"].every((key) => left[key] === right[key]));
+  return Boolean(webDavMoveSameFileIdentity(left, right) && ["size", "mtimeMs", "birthtimeMs"].every((key) => left[key] === right[key]));
 }
 
 function webDavMoveClaimObservation(contents, stat) {
@@ -8809,17 +8831,13 @@ function webDavMoveReadTakeoverAuthority(lockPath, transactionId) {
 }
 
 function webDavMoveEvidenceMatchesAuthority(lockPath, authority) {
-  let stat;
-  let contents;
+  let evidence;
   try {
-    const link = fs.lstatSync(webDavMoveTakeoverEvidence(lockPath));
-    if (!link.isFile() || link.isSymbolicLink()) return false;
-    stat = link;
-    contents = readBoundedRegularFile(webDavMoveTakeoverEvidence(lockPath), WEBDAV_MOVE_MAX_CLAIM_BYTES).contents;
+    evidence = readBoundedRegularFile(webDavMoveTakeoverEvidence(lockPath), WEBDAV_MOVE_MAX_CLAIM_BYTES);
   } catch (error) {
     return error.code === "ENOENT";
   }
-  return sha256Buffer(contents) === authority.observed.sha256 && contents.length === authority.observed.size && webDavMoveSameRenamedIdentity(webDavMoveFileStatIdentity(stat), authority.observed.stat) && webDavMoveClaimToken(contents.toString()) === authority.previousToken;
+  return sha256Buffer(evidence.contents) === authority.observed.sha256 && evidence.contents.length === authority.observed.size && webDavMoveSameRenamedIdentity(webDavMoveFileStatIdentity(evidence.stat), authority.observed.stat) && webDavMoveClaimToken(evidence.contents.toString()) === authority.previousToken;
 }
 
 function webDavMoveRemoveTakeoverAuthority(lockPath, transactionId, token) {

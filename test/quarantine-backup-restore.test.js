@@ -14,6 +14,7 @@ test("quarantine metadata is read from the validated file descriptor and rejects
   const replacementPath = path.join(directory, "replacement.json");
   const metadata = { items: [] };
   const originalReadFileSync = fs.readFileSync;
+  const originalFstatSync = fs.fstatSync;
   const originalLstatSync = fs.lstatSync;
   let openedDescriptor;
   try {
@@ -26,13 +27,38 @@ test("quarantine metadata is read from the validated file descriptor and rejects
     const quarantinePaths = require("../src/quarantine-paths");
     assert.deepEqual(quarantinePaths.readQuarantineMetadata(metadataPath), metadata);
     assert.equal(typeof openedDescriptor, "number");
+    const adjacentFileIds = 9_007_199_254_740_992n;
+    assert.equal(Number(adjacentFileIds), Number(adjacentFileIds + 1n), "adjacent Windows file IDs above Number precision collide when rounded");
+    const withIdentity = (stats, dev, ino) => new Proxy(stats, {
+      get(target, property, receiver) {
+        if (property === "dev") return dev;
+        if (property === "ino") return ino;
+        return Reflect.get(target, property, receiver);
+      }
+    });
+    fs.fstatSync = function fstatWithAdjacentFileId(descriptor, ...args) {
+      const bigint = args[0]?.bigint === true;
+      return withIdentity(
+        originalFstatSync.call(this, descriptor, ...args),
+        bigint ? 1n : 1,
+        bigint ? adjacentFileIds : Number(adjacentFileIds)
+      );
+    };
     fs.lstatSync = function lstatAfterPathSwap(file, ...args) {
-      if (path.resolve(file) === path.resolve(metadataPath)) return originalLstatSync.call(this, replacementPath, ...args);
+      if (path.resolve(file) === path.resolve(metadataPath)) {
+        const bigint = args[0]?.bigint === true;
+        return withIdentity(
+          originalLstatSync.call(this, replacementPath, ...args),
+          bigint ? 1n : 1,
+          bigint ? adjacentFileIds + 1n : Number(adjacentFileIds + 1n)
+        );
+      }
       return originalLstatSync.call(this, file, ...args);
     };
     assert.throws(() => quarantinePaths.readQuarantineMetadata(metadataPath), /not a regular file/);
   } finally {
     fs.readFileSync = originalReadFileSync;
+    fs.fstatSync = originalFstatSync;
     fs.lstatSync = originalLstatSync;
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -1528,6 +1554,48 @@ test("quarantine restore recovers after each payload and metadata rename boundar
         const payloadDir = process.env.UPLOAD_QUARANTINE_DIR;
         const metadataPath = path.join(process.cwd(), "data", "quarantine.json");
         const committed = boundary === "committed-marker";
+        if (boundary === "old-payload-1") {
+          const adjacent = 9007199254740992n;
+          const originalOpen = fs.openSync;
+          const originalFstat = fs.fstatSync;
+          const originalLstat = fs.lstatSync;
+          const originalClose = fs.closeSync;
+          const descriptors = new Set();
+          const isStagedPayload = (target) => path.resolve(String(target)).endsWith(path.sep + "old-0");
+          const identify = (stats, args, ino) => new Proxy(stats, {
+            get(target, key, receiver) {
+              if (key === "dev") return args[0]?.bigint === true ? 1n : 1;
+              if (key === "ino") return args[0]?.bigint === true ? ino : Number(ino);
+              return Reflect.get(target, key, receiver);
+            }
+          });
+          fs.openSync = function (target, ...args) {
+            const descriptor = originalOpen.call(this, target, ...args);
+            if (isStagedPayload(target)) descriptors.add(descriptor);
+            return descriptor;
+          };
+          fs.fstatSync = function (descriptor, ...args) {
+            const stats = originalFstat.call(this, descriptor, ...args);
+            return descriptors.has(descriptor) ? identify(stats, args, adjacent) : stats;
+          };
+          fs.lstatSync = function (target, ...args) {
+            const stats = originalLstat.call(this, target, ...args);
+            return isStagedPayload(target) ? identify(stats, args, adjacent + 1n) : stats;
+          };
+          fs.closeSync = function (descriptor) {
+            descriptors.delete(descriptor);
+            return originalClose.call(this, descriptor);
+          };
+          try {
+            assert.throws(() => restoreService.recoverQuarantineRestore(), /Quarantine staged payload is not a regular file/);
+            assert.equal(restoreService.hasPendingQuarantineRestore(), true);
+          } finally {
+            fs.openSync = originalOpen;
+            fs.fstatSync = originalFstat;
+            fs.lstatSync = originalLstat;
+            fs.closeSync = originalClose;
+          }
+        }
         restoreService.recoverQuarantineRestore();
         const expectedNames = committed ? ["archive-1.bin", "archive-2.bin"] : ["current-1.bin", "current-2.bin"];
         const absentNames = committed ? ["current-1.bin", "current-2.bin"] : ["archive-1.bin", "archive-2.bin"];

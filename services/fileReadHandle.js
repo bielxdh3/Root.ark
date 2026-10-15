@@ -79,7 +79,7 @@ function readBoundedRegularFile(filePath, maxBytes) {
       chunks.push(Buffer.from(buffer.subarray(0, count)));
     }
 
-    const stat = fs.fstatSync(descriptor);
+    const stat = fs.fstatSync(descriptor, { bigint: true });
     const afterRead = fs.fstatSync(descriptor, { bigint: true });
     const afterReadPath = fs.lstatSync(filePath, { bigint: true });
     if (!afterRead.isFile() || afterRead.size > BigInt(maxBytes)

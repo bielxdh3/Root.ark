@@ -50,10 +50,10 @@ function withDifferentLockFileIdentity(callback) {
     const stat = originalLstatSync.call(this, target, ...args);
     if (path.resolve(String(target)) !== path.resolve(backupRepository.MUTATION_LOCK_FILE)) return stat;
     const altered = Object.assign(Object.create(Object.getPrototypeOf(stat)), stat);
-    altered.dev += 1;
-    altered.ino += 1;
-    altered.birthtimeMs += 1;
-    altered.ctimeMs += 1;
+    altered.dev += 1n;
+    altered.ino += 1n;
+    altered.birthtimeMs += 1n;
+    altered.ctimeMs += 1n;
     return altered;
   };
   try { return callback(); }
@@ -577,10 +577,10 @@ test("a same-token JSON lock with a different file identity cannot renew the old
       // Simulate a same-token replacement with a different inode without relying on
       // platform-specific rename semantics for an open lock descriptor.
       const altered = Object.assign(Object.create(Object.getPrototypeOf(stat)), stat);
-      altered.dev += 1;
-      altered.ino += 1;
-      altered.birthtimeMs += 1;
-      altered.ctimeMs += 1;
+      altered.dev += 1n;
+      altered.ino += 1n;
+      altered.birthtimeMs += 1n;
+      altered.ctimeMs += 1n;
       return altered;
     };
     assert.throws(() => lease.renew(), { code: "BACKUP_METADATA_LOCK_INVALID" });
@@ -590,6 +590,48 @@ test("a same-token JSON lock with a different file identity cannot renew the old
     lease?.release();
     if (originalTtl === undefined) delete process.env.ROOTARK_JSON_LOCK_TTL_MS;
     else process.env.ROOTARK_JSON_LOCK_TTL_MS = originalTtl;
+  }
+});
+
+test("JSON lock identity rejects adjacent 64-bit file IDs that Number rounds together", () => {
+  reset();
+  const originalOpenSync = fs.openSync;
+  const originalFstatSync = fs.fstatSync;
+  const originalLstatSync = fs.lstatSync;
+  const descriptors = new Set();
+  const adjacentFileIds = 9_007_199_254_740_992n;
+  const withIdentity = (stats, bigint, ino) => new Proxy(stats, {
+    get(target, property, receiver) {
+      if (property === "dev") return bigint ? 1n : 1;
+      if (property === "ino") return bigint ? ino : Number(ino);
+      return Reflect.get(target, property, receiver);
+    }
+  });
+  let lease;
+  try {
+    lease = backupRepository.acquireJsonMutationLock("adjacent-file-ids");
+    fs.openSync = function trackMutationLock(target, ...args) {
+      const descriptor = originalOpenSync.call(this, target, ...args);
+      if (path.resolve(String(target)) === path.resolve(backupRepository.MUTATION_LOCK_FILE)) descriptors.add(descriptor);
+      return descriptor;
+    };
+    fs.fstatSync = function fstatAdjacentFileId(descriptor, ...args) {
+      const stats = originalFstatSync.call(this, descriptor, ...args);
+      if (!descriptors.has(descriptor)) return stats;
+      return withIdentity(stats, args[0]?.bigint === true, adjacentFileIds);
+    };
+    fs.lstatSync = function lstatAdjacentFileId(target, ...args) {
+      const stats = originalLstatSync.call(this, target, ...args);
+      if (path.resolve(String(target)) !== path.resolve(backupRepository.MUTATION_LOCK_FILE)) return stats;
+      return withIdentity(stats, args[0]?.bigint === true, adjacentFileIds + 1n);
+    };
+    assert.equal(Number(adjacentFileIds), Number(adjacentFileIds + 1n));
+    assert.throws(() => lease.renew(), { code: "BACKUP_METADATA_LOCK_INVALID" });
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.fstatSync = originalFstatSync;
+    fs.lstatSync = originalLstatSync;
+    lease?.release();
   }
 });
 
@@ -615,10 +657,10 @@ test("lock snapshot rejects a path identity change after opening the lock descri
       // Model replacement after open without relying on platform-specific rename
       // behavior for a descriptor that is already open.
       const altered = Object.assign(Object.create(Object.getPrototypeOf(stat)), stat);
-      altered.dev += 1;
-      altered.ino += 1;
-      altered.birthtimeMs += 1;
-      altered.ctimeMs += 1;
+      altered.dev += 1n;
+      altered.ino += 1n;
+      altered.birthtimeMs += 1n;
+      altered.ctimeMs += 1n;
       return altered;
     };
 
@@ -657,10 +699,10 @@ test("lease renewal rechecks path identity after writing through the descriptor"
       // Model a replacement at the descriptor-write boundary without relying on
       // platform-specific rename semantics for an open lock file.
       const altered = Object.assign(Object.create(Object.getPrototypeOf(stat)), stat);
-      altered.dev += 1;
-      altered.ino += 1;
-      altered.birthtimeMs += 1;
-      altered.ctimeMs += 1;
+      altered.dev += 1n;
+      altered.ino += 1n;
+      altered.birthtimeMs += 1n;
+      altered.ctimeMs += 1n;
       return altered;
     };
 
@@ -689,10 +731,10 @@ test("a stale JSON lease release preserves a same-token replacement file", () =>
       if (path.resolve(String(target)) !== path.resolve(backupRepository.MUTATION_LOCK_FILE)) return stat;
       // Model the path now naming a distinct file while its contents reuse the old token.
       const altered = Object.assign(Object.create(Object.getPrototypeOf(stat)), stat);
-      altered.dev += 1;
-      altered.ino += 1;
-      altered.birthtimeMs += 1;
-      altered.ctimeMs += 1;
+      altered.dev += 1n;
+      altered.ino += 1n;
+      altered.birthtimeMs += 1n;
+      altered.ctimeMs += 1n;
       return altered;
     };
 

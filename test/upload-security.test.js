@@ -1481,6 +1481,104 @@ test("chunk session ids and numeric chunk indexes remain contained at their boun
   assert.equal(fs.existsSync(path.join(sessionDir, "2000.part")), false);
 });
 
+test("chunk metadata rejects path swaps with adjacent 64-bit file IDs", { timeout: 45_000 }, async (t) => {
+  const uploadId = "file-id-precision";
+  const adjacent = 9_007_199_254_740_992n;
+  const harness = await createHarness(t, {
+    waitForReady: false,
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId), "0.part": "original first part" } }],
+    preloadSource: [
+      'const fs = require("node:fs");',
+      'const path = require("node:path");',
+      'const adjacent = 9007199254740992n;',
+      'const matches = (target) => path.resolve(String(target)).split(path.sep).join("/").endsWith("/file-id-precision/metadata.json");',
+      'const originalOpen = fs.openSync;',
+      'const originalFstat = fs.fstatSync;',
+      'const originalLstat = fs.lstatSync;',
+      'const originalClose = fs.closeSync;',
+      'const originalPromisesOpen = fs.promises.open;',
+      'const originalPromisesLstat = fs.promises.lstat;',
+      'const descriptors = new Set();',
+      'const identify = (stats, args, ino) => new Proxy(stats, { get(target, key, receiver) { if (key === "dev") return args[0]?.bigint === true ? 1n : 1; if (key === "ino") return args[0]?.bigint === true ? ino : Number(ino); return Reflect.get(target, key, receiver); } });',
+      'fs.openSync = function (target, ...args) { const fd = originalOpen.call(this, target, ...args); if (matches(target)) descriptors.add(fd); return fd; };',
+      'fs.fstatSync = function (fd, ...args) { const stats = originalFstat.call(this, fd, ...args); return descriptors.has(fd) ? identify(stats, args, adjacent) : stats; };',
+      'fs.closeSync = function (fd) { descriptors.delete(fd); return originalClose.call(this, fd); };',
+      'fs.lstatSync = function (target, ...args) { const stats = originalLstat.call(this, target, ...args); return matches(target) ? identify(stats, args, adjacent + 1n) : stats; };',
+      'fs.promises.open = async function (target, ...args) { const handle = await originalPromisesOpen.call(this, target, ...args); if (matches(target)) { const stat = handle.stat.bind(handle); handle.stat = async (...statArgs) => identify(await stat(...statArgs), statArgs, adjacent); } return handle; };',
+      'fs.promises.lstat = async function (target, ...args) { const stats = await originalPromisesLstat.call(this, target, ...args); return matches(target) ? identify(stats, args, adjacent + 1n) : stats; };'
+    ].join("\n"),
+  });
+  try { await waitForServer(harness.port); } catch (error) { throw new Error(error.message + "\n" + harness.stderr.join("")); }
+  const session = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    bytes: Buffer.from("second part"),
+    password: "disposable-final-password",
+  });
+  assert.equal(Number(adjacent), Number(adjacent + 1n), "the injected adjacent file IDs collide as Numbers");
+  assert.notEqual(response.status, 200, response.body);
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  assert.equal(fs.readFileSync(path.join(sessionDir, "0.part"), "utf8"), "original first part");
+  assert.equal(fs.existsSync(path.join(sessionDir, "1.part")), false);
+});
+
+test("chunk-session expiry sweep rejects path swaps with adjacent 64-bit file IDs", { timeout: 45_000 }, async (t) => {
+  const uploadId = "async-file-id-precision";
+  let metadataPath;
+  let enablePath;
+  let observedPath;
+  const harness = await createHarness(t, {
+    envOverrides: { CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS: "1000" },
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId), "0.part": "original first part" } }],
+    preloadSource: ({ dir, chunkRoot }) => {
+      metadataPath = path.join(chunkRoot, FOLDER_ID, uploadId, "metadata.json");
+      enablePath = path.join(dir, "enable-async-file-id-injection");
+      observedPath = path.join(dir, "async-file-id-injection-observations");
+      return [
+        'const fs = require("node:fs");',
+        'const path = require("node:path");',
+        `const target = ${JSON.stringify(metadataPath)};`,
+        `const enable = ${JSON.stringify(enablePath)};`,
+        `const observed = ${JSON.stringify(observedPath)};`,
+        'const adjacent = 9007199254740992n;',
+        'const matches = (candidate) => path.resolve(String(candidate)) === path.resolve(target);',
+        'const identify = (stats, args, ino) => new Proxy(stats, { get(value, key, receiver) { if (key === "dev") return args[0]?.bigint === true ? 1n : 1; if (key === "ino") return args[0]?.bigint === true ? ino : Number(ino); return Reflect.get(value, key, receiver); } });',
+        'const originalOpen = fs.promises.open.bind(fs.promises);',
+        'const originalLstat = fs.promises.lstat.bind(fs.promises);',
+        'fs.promises.open = async function (candidate, ...args) { const handle = await originalOpen(candidate, ...args); if (matches(candidate)) { const stat = handle.stat.bind(handle); handle.stat = async (...statArgs) => { const value = await stat(...statArgs); return fs.existsSync(enable) ? identify(value, statArgs, adjacent) : value; }; } return handle; };',
+        'fs.promises.lstat = async function (candidate, ...args) { const value = await originalLstat(candidate, ...args); if (!matches(candidate) || !fs.existsSync(enable)) return value; fs.appendFileSync(observed, "x"); return identify(value, args, adjacent + 1n); };',
+      ].join("\n");
+    },
+  });
+
+  fs.writeFileSync(enablePath, "enabled", { flag: "wx" });
+  const firstSweepDeadline = Date.now() + 5_000;
+  while ((!fs.existsSync(observedPath) || fs.readFileSync(observedPath, "utf8").length < 1) && Date.now() < firstSweepDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(fs.existsSync(observedPath), true, "the async expiry reader inspected the metadata after injection was enabled");
+
+  const expiredAt = new Date(Date.now() - CHUNK_SESSION_TTL_MS - 60_000).toISOString();
+  const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+  metadata.lastActivityAt = expiredAt;
+  fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+  const secondSweepDeadline = Date.now() + 5_000;
+  while (fs.readFileSync(observedPath, "utf8").length < 2 && Date.now() < secondSweepDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(fs.readFileSync(observedPath, "utf8").length >= 2, "the async expiry reader reached a second sweep after the fixture became expired");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const sessionDir = path.dirname(metadataPath);
+  assert.equal(fs.readFileSync(path.join(sessionDir, "0.part"), "utf8"), "original first part");
+  const preservedMetadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+  assert.equal(preservedMetadata.lastActivityAt, expiredAt);
+  assert.equal(Object.hasOwn(preservedMetadata, "__expiredAt"), false, "an identity-mismatched session is not expired or rewritten");
+});
+
 test("malformed, unreadable, and orphan chunk sessions cannot overwrite retained parts", { timeout: 45_000 }, async (t) => {
   let unreadableMetadataPath;
   let markerPath;
