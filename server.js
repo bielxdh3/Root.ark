@@ -195,6 +195,7 @@ const SINGLE_UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
 const CHUNK_UPLOAD_QUOTA_CONFIG = parseChunkUploadQuotaConfig(process.env);
 let chunkUploadQuota = null;
 let chunkUploadQuotaUnavailableReason = CHUNK_UPLOAD_QUOTA_CONFIG.enabled ? "ledger_unavailable" : CHUNK_UPLOAD_QUOTA_CONFIG.reason;
+let chunkExpiryFallbackTreeValidated = false;
 const UPLOAD_SCAN_ENABLED = parseEnvBoolean(process.env.UPLOAD_SCAN_ENABLED, true);
 const UPLOAD_SCAN_PROVIDER = String(process.env.UPLOAD_SCAN_PROVIDER || "clamav").toLowerCase();
 const CLAMAV_HOST = process.env.CLAMAV_HOST || "127.0.0.1";
@@ -7427,7 +7428,7 @@ function initializeChunkUploadQuota() {
   }
 }
 
-function readLegacyChunkQuotaOperations({ includeOperations = true } = {}) {
+function readLegacyChunkQuotaOperations({ includeOperations = true, applyDeferredMutations = true } = {}) {
   const rows = [];
   const sessions = new Map();
   const rootEntries = fs.readdirSync(CHUNK_UPLOAD_DIR, { withFileTypes: true }).sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
@@ -7532,7 +7533,16 @@ function readLegacyChunkQuotaOperations({ includeOperations = true } = {}) {
     return true;
   };
   for (const entry of rootEntries) {
-    if (knownFiles.has(entry.name)) continue;
+    if (knownFiles.has(entry.name)) {
+      if (entry.name !== "incoming") {
+        const ledgerPath = path.join(CHUNK_UPLOAD_DIR, entry.name);
+        const stats = fs.lstatSync(ledgerPath, { bigint: true });
+        if (entry.isSymbolicLink() || !entry.isFile() || stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1n) {
+          throw new Error("Unsafe chunk quota ledger file");
+        }
+      }
+      continue;
+    }
     if (entry.isSymbolicLink() || !entry.isDirectory() || !/^[a-zA-Z0-9_-]{1,80}$/.test(entry.name)) throw new Error("Untracked chunk staging entry");
     const folderPath = path.join(CHUNK_UPLOAD_DIR, entry.name);
     rememberDirectory(folderPath);
@@ -7597,7 +7607,13 @@ function readLegacyChunkQuotaOperations({ includeOperations = true } = {}) {
     }
   }
   if (includeOperations) {
-    const incomingEntries = fs.readdirSync(CHUNK_UPLOAD_INCOMING_DIR, { withFileTypes: true });
+    let incomingEntries;
+    try {
+      incomingEntries = fs.readdirSync(CHUNK_UPLOAD_INCOMING_DIR, { withFileTypes: true });
+    } catch (error) {
+      if (error.code !== "ENOENT" || chunkUploadQuota) throw error;
+      incomingEntries = [];
+    }
     if (incomingEntries.length) throw new Error("Untracked legacy incoming chunk files");
   }
 
@@ -7624,29 +7640,31 @@ function readLegacyChunkQuotaOperations({ includeOperations = true } = {}) {
       }
     }
 
-    for (const directory of directoriesToSecure.values()) assertSafeChunkSessionDirectory(directory.path);
-    if (process.platform !== "win32") {
-      for (const file of filesToSecure.values()) {
-        const descriptor = fs.openSync(file.path, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-        try {
-          const stats = fs.fstatSync(descriptor, { bigint: true });
-          if (!stats.isFile() || stats.nlink !== 1n || stats.dev !== file.dev || stats.ino !== file.ino) {
-            throw new Error("Legacy chunk session file changed before permission repair");
+    if (applyDeferredMutations) {
+      for (const directory of directoriesToSecure.values()) assertSafeChunkSessionDirectory(directory.path);
+      if (process.platform !== "win32") {
+        for (const file of filesToSecure.values()) {
+          const descriptor = fs.openSync(file.path, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+          try {
+            const stats = fs.fstatSync(descriptor, { bigint: true });
+            if (!stats.isFile() || stats.nlink !== 1n || stats.dev !== file.dev || stats.ino !== file.ino) {
+              throw new Error("Legacy chunk session file changed before permission repair");
+            }
+            fs.fchmodSync(descriptor, 0o600);
+          } finally {
+            fs.closeSync(descriptor);
           }
-          fs.fchmodSync(descriptor, 0o600);
-        } finally {
-          fs.closeSync(descriptor);
         }
       }
-    }
-    // Expired tombstones are durable cleanup intent. Delete their validated
-    // numbered parts only after the complete legacy tree has passed validation.
-    for (const part of expiredPartsToRemove.values()) {
-      const stats = fs.lstatSync(part.path, { bigint: true });
-      if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1n || stats.dev !== part.dev || stats.ino !== part.ino) {
-        throw new Error("Expired legacy chunk part changed before cleanup");
+      // Expired tombstones are durable cleanup intent. Delete their validated
+      // numbered parts only after the complete legacy tree has passed validation.
+      for (const part of expiredPartsToRemove.values()) {
+        const stats = fs.lstatSync(part.path, { bigint: true });
+        if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1n || stats.dev !== part.dev || stats.ino !== part.ino) {
+          throw new Error("Expired legacy chunk part changed before cleanup");
+        }
+        fs.unlinkSync(part.path);
       }
-      fs.unlinkSync(part.path);
     }
   }
   return { operations: rows, sessions: [...sessions].map(([sessionKey, accountKey]) => ({ sessionKey, accountKey })) };
@@ -8538,6 +8556,10 @@ async function cleanupExpiredChunkSessions(now = Date.now()) {
     let folderEntries;
     try {
       assertSafeChunkStorageRoot();
+      if (!chunkUploadQuota && !chunkExpiryFallbackTreeValidated) {
+        readLegacyChunkQuotaOperations({ includeOperations: true, applyDeferredMutations: false });
+        chunkExpiryFallbackTreeValidated = true;
+      }
       folderEntries = await fs.promises.readdir(CHUNK_UPLOAD_DIR, { withFileTypes: true });
     } catch (error) {
       console.error("[chunk-upload] expiry sweep skipped:", sanitizeLogValue(error.message));

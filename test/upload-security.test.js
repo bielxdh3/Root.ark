@@ -538,7 +538,7 @@ test("seven-day expiry still cleans validated sessions when the configured quota
   const expiredDir = path.join(harness.chunkRoot, FOLDER_ID, expiredId);
   const recentDir = path.join(harness.chunkRoot, FOLDER_ID, recentId);
   assert.match(harness.stderr.join(""), /quota initialization unavailable/);
-  assert.equal(fs.existsSync(path.join(expiredDir, "0.part")), false, "a validated seven-day-old part is removed under the shared lifecycle lock");
+  assert.equal(fs.existsSync(path.join(expiredDir, "0.part")), false, `a validated seven-day-old part is removed under the shared lifecycle lock; ${harness.stderr.join("")}`);
   assert.equal(typeof JSON.parse(fs.readFileSync(path.join(expiredDir, "metadata.json"), "utf8")).__expiredAt, "string", "the expiry tombstone remains available to reject stale resumptions");
   assert.equal(fs.readFileSync(path.join(recentDir, "0.part"), "utf8"), "recent plaintext", "recent data is preserved while the quota ledger is unavailable");
 
@@ -839,7 +839,7 @@ test("the chunk-session sweeper shares the cross-process session lock when quota
   fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
   const cleanupDeadline = Date.now() + 5_000;
   while (fs.existsSync(sessionDir) && Date.now() < cleanupDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(fs.existsSync(path.join(sessionDir, "0.part")), false, "the periodic sweeper deletes expired chunk data");
+  assert.equal(fs.existsSync(path.join(sessionDir, "0.part")), false, `the periodic sweeper deletes expired chunk data; ${harness.stderr.join("")}`);
   assert.equal(typeof JSON.parse(fs.readFileSync(metadataPath, "utf8")).__expiredAt, "string");
 });
 
