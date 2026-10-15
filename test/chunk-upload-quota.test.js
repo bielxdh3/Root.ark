@@ -8,7 +8,9 @@ const test = require("node:test");
 const {
   assertSafeChunkUploadAncestors,
   assertSupportedChunkUploadFilesystem,
+  classifyProcessOwner,
   createChunkUploadQuota: createChunkUploadQuotaService,
+  getCurrentProcessIdentity,
   parseChunkUploadQuotaConfig,
 } = require("../services/chunkUploadQuota");
 const { ensureWindowsChunkUploadRoot, getWindowsChunkAclDescriptor } = require("../services/chunkUploadWindowsAcl");
@@ -255,7 +257,7 @@ test("ledger path lookup uses its index and rejects duplicate operation paths", 
   });
 });
 
-test("schema 1 ledgers migrate usage counters without changing existing charges", () => {
+test("legacy ledgers preserve charges and never reclaim session locks without verified ownership", async () => {
   const { parent, root } = createQuotaTestRoot("rootark-chunk-quota-v1-migration-");
   const databasePath = path.join(root, ".quota.sqlite");
   const oldDatabase = new Database(databasePath);
@@ -279,6 +281,7 @@ test("schema 1 ledgers migrate usage counters without changing existing charges"
     oldDatabase.prepare(`
       INSERT INTO quota_operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run("existing-part", "alice", "folder/upload", "folder/upload/0.part", "part_committed", 5, "prior", 1, 1, 1);
+    oldDatabase.prepare("INSERT INTO quota_session_locks VALUES (?, ?, ?, ?)").run("handoff-folder/folder", "prior-lock", process.pid, 1);
   } finally {
     oldDatabase.close();
   }
@@ -289,11 +292,85 @@ test("schema 1 ledgers migrate usage counters without changing existing charges"
       assert.deepEqual(quota.initialize(), { alreadyReady: true, entryCapacityExceeded: false });
       assert.deepEqual(quota.totals(), { systemBytes: 5, accounts: { alice: 5 } });
       assert.deepEqual(quota.sessions().map((session) => ({ sessionKey: session.sessionKey, accountKey: session.accountKey })), [{ sessionKey: "folder/upload", accountKey: "alice" }]);
+      const legacyOperation = quota.operations()[0];
+      assert.equal(legacyOperation.ownerProcessIdentity, null, "legacy rows do not invent a process identity during migration");
+      assert.equal(quota.ownerStatus(legacyOperation), "unknown", "legacy owners remain unrecoverable without verifiable identity");
+      assert.equal(quota.claim(legacyOperation), false, "legacy operations cannot be claimed without verified death");
+      let legacyLockEntered = false;
+      await assert.rejects(quota.withSessionLock("handoff-folder/folder", async () => { legacyLockEntered = true; }, { waitMs: 0 }), { code: "CHUNK_SESSION_LOCK_BUSY" });
+      assert.equal(legacyLockEntered, false, "an unverifiable migrated lock continues to protect its session");
+      const migrated = new Database(databasePath, { readonly: true });
+      try {
+        assert.equal(migrated.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get().value, "4");
+        assert.ok(migrated.pragma("table_info(quota_operations)").some((column) => column.name === "owner_process_identity"));
+        assert.ok(migrated.pragma("table_info(quota_session_locks)").some((column) => column.name === "owner_process_identity"));
+        assert.equal(migrated.prepare("SELECT owner_process_identity FROM quota_session_locks WHERE session_key = ?").get("handoff-folder/folder").owner_process_identity, null);
+      } finally {
+        migrated.close();
+      }
       quota.reserve({ operationId: "new-part", accountKey: "alice", reservedBytes: 5, relativePath: "incoming/new-part" });
       assert.throws(() => quota.reserve({ operationId: "over-account", accountKey: "alice", reservedBytes: 1, relativePath: "incoming/over-account" }), { code: "CHUNK_QUOTA_EXCEEDED" });
       assert.throws(() => quota.reserve({ operationId: "over-system", accountKey: "bob", reservedBytes: 3, relativePath: "incoming/over-system" }), { code: "CHUNK_QUOTA_EXCEEDED" });
       assert.equal(quota.release("new-part"), true);
       assert.deepEqual(quota.totals(), { systemBytes: 5, accounts: { alice: 5 } });
+    } finally {
+      quota.close();
+    }
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("schema v3 migration adds nullable process identities without changing existing quota state", () => {
+  const { parent, root } = createQuotaTestRoot("rootark-chunk-quota-v3-migration-");
+  const databasePath = path.join(root, ".quota.sqlite");
+  const oldDatabase = new Database(databasePath);
+  try {
+    oldDatabase.pragma("journal_mode = DELETE");
+    oldDatabase.pragma("synchronous = FULL");
+    oldDatabase.exec(`
+      CREATE TABLE quota_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE quota_operations (
+        operation_id TEXT PRIMARY KEY, account_key TEXT NOT NULL, session_key TEXT, relative_path TEXT NOT NULL,
+        state TEXT NOT NULL, charge_bytes INTEGER NOT NULL CHECK (charge_bytes >= 0),
+        owner_instance_id TEXT NOT NULL, owner_pid INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE quota_session_locks (
+        session_key TEXT PRIMARY KEY, owner_instance_id TEXT NOT NULL, owner_pid INTEGER NOT NULL, created_at INTEGER NOT NULL
+      );
+      CREATE TABLE quota_usage (account_key TEXT PRIMARY KEY, charge_bytes INTEGER NOT NULL CHECK (charge_bytes >= 0));
+      CREATE TABLE quota_sessions (session_key TEXT PRIMARY KEY, account_key TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+    `);
+    oldDatabase.prepare("INSERT INTO quota_meta(key, value) VALUES (?, ?)").run("schema_version", "3");
+    oldDatabase.prepare("INSERT INTO quota_meta(key, value) VALUES (?, ?)").run("ready", "1");
+    oldDatabase.prepare("INSERT INTO quota_meta(key, value) VALUES (?, ?)").run("usage_version", "1");
+    oldDatabase.prepare("INSERT INTO quota_meta(key, value) VALUES (?, ?)").run("system_charge_bytes", "5");
+    oldDatabase.prepare("INSERT INTO quota_operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run("existing-part", "alice", "folder/upload", "folder/upload/0.part", "part_committed", 5, "prior", 4321, 1, 1);
+    oldDatabase.prepare("INSERT INTO quota_usage(account_key, charge_bytes) VALUES (?, ?)").run("alice", 5);
+    oldDatabase.prepare("INSERT INTO quota_sessions VALUES (?, ?, ?, ?)").run("folder/upload", "alice", 1, 1);
+  } finally {
+    oldDatabase.close();
+  }
+
+  try {
+    const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 10, systemBytes: 12 });
+    try {
+      assert.deepEqual(quota.initialize(), { alreadyReady: true, entryCapacityExceeded: false });
+      assert.deepEqual(quota.totals(), { systemBytes: 5, accounts: { alice: 5 } });
+      const migratedOperation = quota.operations()[0];
+      assert.equal(migratedOperation.operationId, "existing-part");
+      assert.equal(migratedOperation.ownerProcessIdentity, null);
+      assert.equal(quota.ownerStatus(migratedOperation), "unknown");
+      assert.equal(quota.claim(migratedOperation), false);
+      const migrated = new Database(databasePath, { readonly: true });
+      try {
+        assert.equal(migrated.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get().value, "4");
+        assert.ok(migrated.pragma("table_info(quota_operations)").some((column) => column.name === "owner_process_identity"));
+        assert.ok(migrated.pragma("table_info(quota_session_locks)").some((column) => column.name === "owner_process_identity"));
+      } finally {
+        migrated.close();
+      }
     } finally {
       quota.close();
     }
@@ -643,8 +720,8 @@ test("ledger rejects a symlinked database before opening its target", (t) => {
 
 test("dead operation claims are compare-and-set and session locks serialize ledger clients", async () => {
   const { parent, root: directory } = createQuotaTestRoot("rootark-chunk-quota-lock-");
-  const stale = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "stale", processId: 2147483000 });
-  const active = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "active" });
+  const stale = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "stale", processId: 2147483000, processIdentity: getCurrentProcessIdentity() });
+  const active = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "active", classifyOwner: () => "dead" });
   try {
     stale.initialize([{ operationId: "dead-op", accountKey: "alice", relativePath: "incoming/dead-op", state: "reserved", chargeBytes: 4 }]);
     const row = active.operations()[0];
@@ -670,15 +747,21 @@ test("dead operation claims are compare-and-set and session locks serialize ledg
   }
 });
 
-test("a same-PID quota session lock from a prior instance is recoverable after PID reuse", async () => {
+test("a same-namespace quota session lock is recoverable after verified PID reuse", { skip: process.platform !== "linux" }, async (t) => {
   const { parent, root: directory } = createQuotaTestRoot("rootark-chunk-quota-pid-reuse-");
+  const currentIdentity = getCurrentProcessIdentity();
+  if (!currentIdentity) {
+    fs.rmSync(parent, { recursive: true, force: true });
+    return t.skip("the host process identity is unavailable");
+  }
   const previous = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "previous-instance", processId: process.pid });
   try {
     previous.initialize();
     previous.close();
     const database = new Database(path.join(directory, ".quota.sqlite"));
     try {
-      database.prepare("INSERT INTO quota_session_locks(session_key, owner_instance_id, owner_pid, created_at) VALUES (?, ?, ?, ?)").run("handoff-folder/folder", "previous-instance", process.pid, Date.now());
+      const reusedIdentity = { ...currentIdentity, processStartTime: "0" };
+      database.prepare("INSERT INTO quota_session_locks(session_key, owner_instance_id, owner_pid, owner_process_identity, created_at) VALUES (?, ?, ?, ?, ?)").run("handoff-folder/folder", "previous-instance", process.pid, JSON.stringify(reusedIdentity), Date.now());
     } finally {
       database.close();
     }
@@ -722,6 +805,72 @@ test("a live same-PID quota instance cannot have its session lock stolen", async
     contender.close();
     fs.rmSync(parent, { recursive: true, force: true });
   }
+});
+
+test("a same-numbered PID in a different namespace cannot steal a quota session lock", { skip: process.platform !== "linux" }, async () => {
+  const { parent, root: directory } = createQuotaTestRoot("rootark-chunk-quota-pid-namespace-lock-");
+  const ownerIdentity = { version: 1, platform: "linux", hostId: "a".repeat(64), bootId: "00000000-0000-0000-0000-000000000001", pidNamespace: "pid:[100]", processStartTime: "10" };
+  const contenderIdentity = { version: 1, platform: "linux", hostId: "a".repeat(64), bootId: "00000000-0000-0000-0000-000000000001", pidNamespace: "pid:[200]", processStartTime: "20" };
+  const owner = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, processInstanceId: "namespace-owner", processId: 4242, processIdentity: ownerIdentity });
+  const contender = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, processInstanceId: "namespace-contender", processId: 4242, processIdentity: contenderIdentity });
+  try {
+    owner.initialize();
+    contender.initialize();
+    let releaseOwner;
+    let ownerEntered;
+    const ownerEnteredPromise = new Promise((resolve) => { ownerEntered = resolve; });
+    const ownerTask = owner.withSessionLock("shared-pid-session", async () => {
+      ownerEntered();
+      await new Promise((resolve) => { releaseOwner = resolve; });
+    });
+    await ownerEnteredPromise;
+
+    let contenderEntered = false;
+    await assert.rejects(contender.withSessionLock("shared-pid-session", async () => { contenderEntered = true; }, { waitMs: 40 }), { code: "CHUNK_SESSION_LOCK_BUSY" });
+    assert.equal(contenderEntered, false, "an unverifiable owner from another PID namespace keeps its lock");
+    assert.equal(owner.operations().length, 0);
+    releaseOwner();
+    await ownerTask;
+  } finally {
+    owner.close();
+    contender.close();
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("operation ownership is unknown when a matching PID belongs to another namespace", { skip: process.platform !== "linux" }, () => {
+  const { parent, root: directory } = createQuotaTestRoot("rootark-chunk-quota-pid-namespace-operation-");
+  const ownerIdentity = { version: 1, platform: "linux", hostId: "a".repeat(64), bootId: "00000000-0000-0000-0000-000000000001", pidNamespace: "pid:[100]", processStartTime: "10" };
+  const otherNamespaceIdentity = { version: 1, platform: "linux", hostId: "a".repeat(64), bootId: "00000000-0000-0000-0000-000000000001", pidNamespace: "pid:[200]", processStartTime: "20" };
+  const owner = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, processInstanceId: "operation-owner", processId: 4242, processIdentity: ownerIdentity });
+  const contender = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, processInstanceId: "operation-contender", processId: 4242, processIdentity: otherNamespaceIdentity });
+  try {
+    owner.initialize([{ operationId: "preserve-foreign-owner", accountKey: "alice", relativePath: "incoming/preserve-foreign-owner", state: "reserved", chargeBytes: 4 }]);
+    contender.initialize();
+    const operation = contender.operations()[0];
+    assert.equal(operation.ownerProcessIdentity, JSON.stringify(ownerIdentity));
+    assert.equal(contender.ownerStatus(operation), "unknown", "ambiguous ownership must block startup recovery");
+    assert.equal(contender.claim(operation), false, "unknown ownership cannot be claimed for recovery");
+    assert.equal(contender.operations()[0].state, "reserved", "the durable reservation remains untouched");
+  } finally {
+    owner.close();
+    contender.close();
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("malformed Linux owner identity is ambiguous instead of being treated as PID reuse", { skip: process.platform !== "linux" }, (t) => {
+  const current = getCurrentProcessIdentity();
+  if (!current) return t.skip("the host process identity is unavailable");
+  const malformed = JSON.stringify({ ...current, processStartTime: "not-a-process-start-time" });
+  assert.equal(classifyProcessOwner(process.pid, malformed, current, { platform: "linux" }), "unknown");
+});
+
+test("PID probing without process-start support never reclaims a present or ambiguous owner", () => {
+  const identity = { version: 1, platform: "win32" };
+  assert.equal(classifyProcessOwner(4242, identity, identity, { platform: "win32", kill: () => {} }), "live");
+  assert.equal(classifyProcessOwner(4242, identity, identity, { platform: "win32", kill: () => { throw Object.assign(new Error("denied"), { code: "EPERM" }); } }), "unknown");
+  assert.equal(classifyProcessOwner(4242, identity, identity, { platform: "win32", kill: () => { throw Object.assign(new Error("missing"), { code: "ESRCH" }); } }), "dead");
 });
 
 test("session locks serialize across separate Node processes", async () => {

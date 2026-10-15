@@ -10,7 +10,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
 const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
-const { createChunkUploadQuota: createChunkUploadQuotaService } = require("../services/chunkUploadQuota");
+const { createChunkUploadQuota: createChunkUploadQuotaService, getCurrentProcessIdentity } = require("../services/chunkUploadQuota");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -140,7 +140,17 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
     require(${JSON.stringify(path.join(ROOT, "repositories", "usersRepository.js"))}).saveUsers(JSON.parse(require("node:fs").readFileSync(${JSON.stringify(path.join(dir, "data", "users.json"))}, "utf8")));
     require(${JSON.stringify(path.join(ROOT, "repositories", "foldersRepository.js"))}).saveFolders(JSON.parse(require("node:fs").readFileSync(${JSON.stringify(path.join(dir, "data", "folders.json"))}, "utf8")));
   ` : "";
-  const preloadContents = [sqliteSetup, customPreload].filter(Boolean).join("\n");
+  const quotaFixtureShim = customPreload ? `
+    const quotaFixtureModule = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
+    const createQuotaFixtureService = quotaFixtureModule.createChunkUploadQuota;
+    const classifyQuotaFixtureOwner = quotaFixtureModule.classifyProcessOwner;
+    quotaFixtureModule.createChunkUploadQuota = (options) => createQuotaFixtureService({
+      ...options,
+      classifyOwner: options.classifyOwner || ((pid, identity, current) =>
+        [2147483000, 2147483647].includes(pid) ? "dead" : classifyQuotaFixtureOwner(pid, identity, current)),
+    });
+  ` : "";
+  const preloadContents = [sqliteSetup, quotaFixtureShim, customPreload].filter(Boolean).join("\n");
   const preloadPath = preloadContents ? path.join(dir, "test-preload.js") : "";
   if (preloadPath) fs.writeFileSync(preloadPath, preloadContents);
   const port = await getUnusedPort();
@@ -3315,7 +3325,7 @@ test("startup removes a dead-owner incoming reservation only after reconciling i
       quota.close();
     `,
   });
-  assert.equal(fs.existsSync(path.join(harness.chunkRoot, "incoming", operationId)), false);
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, "incoming", operationId)), false, [...harness.stdout, ...harness.stderr].join(""));
   const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
   try {
     assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0);
@@ -3324,29 +3334,65 @@ test("startup removes a dead-owner incoming reservation only after reconciling i
   }
 });
 
-test("startup recovers an incoming reservation from a prior instance with a reused PID", { timeout: 30_000 }, async (t) => {
+test("startup recovers a reused PID only when process-start identity proves it is stale", { timeout: 30_000 }, async (t) => {
   const operationId = "b".repeat(32);
   const bytes = "live incoming";
   const harness = await createHarness(t, {
     preloadSource: ({ chunkRoot }) => [
       'const fs = require("node:fs");',
       'const path = require("node:path");',
-      'const { createChunkUploadQuota } = require(' + JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js")) + ');',
+      'const quotaModule = require(' + JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js")) + ');',
+      'const { createChunkUploadQuota, getCurrentProcessIdentity } = quotaModule;',
       'const root = ' + JSON.stringify(chunkRoot) + ';',
+      'const currentIdentity = getCurrentProcessIdentity();',
+      'const oldIdentity = process.platform === "linux" && currentIdentity ? { ...currentIdentity, processStartTime: "0" } : currentIdentity;',
       'fs.mkdirSync(path.join(root, "incoming"), { recursive: true });',
       'fs.writeFileSync(path.join(root, "incoming", ' + JSON.stringify(operationId) + '), ' + JSON.stringify(bytes) + ');',
-      'const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "live-owner", processId: process.pid });',
+      'const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "prior-owner", processId: process.pid, processIdentity: oldIdentity });',
       'quota.initialize([{ operationId: ' + JSON.stringify(operationId) + ', accountKey: "uploader", relativePath: path.join("incoming", ' + JSON.stringify(operationId) + '), state: "writing", chargeBytes: Buffer.byteLength(' + JSON.stringify(bytes) + ') }]);',
       'quota.close();',
     ].join("\n"),
   });
-  assert.equal(fs.existsSync(path.join(harness.chunkRoot, "incoming", operationId)), false, harness.stderr.join(""));
+  const shouldRecover = process.platform === "linux" && Boolean(getCurrentProcessIdentity());
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, "incoming", operationId)), !shouldRecover, harness.stderr.join(""));
   const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
   try {
-    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations WHERE operation_id = ?").get(operationId).count, 0);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations WHERE operation_id = ?").get(operationId).count, shouldRecover ? 0 : 1);
   } finally {
     database.close();
   }
+});
+
+test("startup preserves incoming bytes and disables chunk uploads when an operation owner is from another host", { timeout: 30_000 }, async (t) => {
+  const operationId = "d".repeat(32);
+  const bytes = "preserve ambiguous owner";
+  const foreignIdentity = { version: 1, platform: "linux", hostId: "b".repeat(64), bootId: "00000000-0000-0000-0000-000000000002", pidNamespace: "pid:[999999]", processStartTime: "1" };
+  const harness = await createHarness(t, {
+    preloadSource: ({ chunkRoot }) => `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const { createChunkUploadQuota } = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
+      const root = ${JSON.stringify(chunkRoot)};
+      fs.mkdirSync(path.join(root, "incoming"), { recursive: true });
+      fs.writeFileSync(path.join(root, "incoming", ${JSON.stringify(operationId)}), ${JSON.stringify(bytes)});
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "foreign-owner", processId: 4242, processIdentity: ${JSON.stringify(foreignIdentity)} });
+      quota.initialize([{ operationId: ${JSON.stringify(operationId)}, accountKey: "uploader", relativePath: path.join("incoming", ${JSON.stringify(operationId)}), state: "writing", chargeBytes: Buffer.byteLength(${JSON.stringify(bytes)}) }]);
+      quota.close();
+    `,
+  });
+  assert.match(harness.stderr.join(""), /quota initialization unavailable/);
+  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, "incoming", operationId), "utf8"), bytes, "ambiguous ownership leaves the incoming payload untouched");
+  const session = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, session, {
+    uploadId: "ambiguous-owner-blocked",
+    originalName: "ambiguous-owner.txt",
+    chunkIndex: 0,
+    totalChunks: 1,
+    bytes: Buffer.from("must remain blocked"),
+  });
+  assert.equal(response.status, 503, response.body);
+  assert.equal(JSON.parse(response.body).code, "CHUNK_QUOTA_UNAVAILABLE");
+  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, "incoming", operationId), "utf8"), bytes);
 });
 
 test("startup preserves an old incoming file owned by the exact live instance", { timeout: 30_000 }, async (t) => {

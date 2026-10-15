@@ -116,6 +116,97 @@ function safeByteCount(value) {
   return bytes;
 }
 
+function normalizeProcessIdentity(identity) {
+  if (!identity || typeof identity !== "object" || identity.version !== 1 || typeof identity.platform !== "string") return null;
+  const stringOrNull = (value) => typeof value === "string" && value.length > 0 ? value : null;
+  const normalized = {
+    version: 1,
+    platform: identity.platform,
+    hostId: stringOrNull(identity.hostId),
+    bootId: stringOrNull(identity.bootId),
+    pidNamespace: stringOrNull(identity.pidNamespace),
+    processStartTime: stringOrNull(identity.processStartTime),
+  };
+  if (normalized.platform === "linux" &&
+      (!/^[a-f0-9]{64}$/.test(normalized.hostId || "") ||
+       !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(normalized.bootId || "") ||
+       !/^pid:\[\d+\]$/.test(normalized.pidNamespace || "") ||
+       !/^\d+$/.test(normalized.processStartTime || ""))) return null;
+  return normalized;
+}
+
+function serializeProcessIdentity(identity) {
+  const normalized = normalizeProcessIdentity(identity);
+  return normalized ? JSON.stringify(normalized) : null;
+}
+
+function parseProcessIdentity(value) {
+  if (typeof value !== "string" || !value || value.length > 1024) return null;
+  try { return normalizeProcessIdentity(JSON.parse(value)); }
+  catch { return null; }
+}
+
+function readLinuxProcessStartTime(pid) {
+  const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+  const commandEnd = stat.lastIndexOf(")");
+  if (commandEnd < 0) throw new Error("Malformed Linux process stat");
+  const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
+  const startTime = fields[19]; // Field 22; the suffix begins at field 3.
+  if (!/^\d+$/.test(startTime || "")) throw new Error("Malformed Linux process start time");
+  return startTime;
+}
+
+function getCurrentProcessIdentity(pid = process.pid) {
+  if (pid !== process.pid) return null;
+  if (process.platform !== "linux") {
+    return normalizeProcessIdentity({ version: 1, platform: process.platform });
+  }
+  try {
+    const machineId = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+      .map((filePath) => {
+        try { return fs.readFileSync(filePath, "utf8").trim(); }
+        catch { return ""; }
+      })
+      .find(Boolean);
+    const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    const pidNamespace = fs.readlinkSync("/proc/self/ns/pid");
+    const processStartTime = readLinuxProcessStartTime(pid);
+    if (!machineId || !bootId || !pidNamespace || !processStartTime) return null;
+    const hostId = crypto.createHash("sha256").update(`rootark-chunk-quota-host\0${machineId}`).digest("hex");
+    return normalizeProcessIdentity({ version: 1, platform: "linux", hostId, bootId, pidNamespace, processStartTime });
+  } catch {
+    return null;
+  }
+}
+
+function classifyProcessOwner(ownerPid, ownerIdentity, currentIdentity, { platform = process.platform, kill = process.kill } = {}) {
+  if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return "unknown";
+  const owner = typeof ownerIdentity === "string" ? parseProcessIdentity(ownerIdentity) : normalizeProcessIdentity(ownerIdentity);
+  const current = normalizeProcessIdentity(currentIdentity);
+  if (!owner || !current || owner.platform !== platform || current.platform !== platform) return "unknown";
+
+  if (platform === "linux") {
+    if (owner.hostId !== current.hostId || owner.bootId !== current.bootId || owner.pidNamespace !== current.pidNamespace) return "unknown";
+    try {
+      const namespace = fs.readlinkSync(`/proc/${ownerPid}/ns/pid`);
+      if (namespace !== owner.pidNamespace) return "unknown";
+      return readLinuxProcessStartTime(ownerPid) === owner.processStartTime ? "live" : "dead";
+    } catch (error) {
+      if (error.code === "ENOENT" || error.code === "ESRCH") return "dead";
+      return "unknown";
+    }
+  }
+
+  // Other platforms lack a portable process-start identity here. A present PID is
+  // therefore treated as live, including a potentially reused PID.
+  try {
+    kill(ownerPid, 0);
+    return "live";
+  } catch (error) {
+    return error.code === "ESRCH" ? "dead" : "unknown";
+  }
+}
+
 function ensureSafeDatabaseFile(databasePath) {
   let stats;
   try {
@@ -167,11 +258,13 @@ function ensureSafeSidecarFile(filePath) {
   if (process.platform !== "win32" && (stats.mode & 0o077) !== 0) fs.chmodSync(filePath, 0o600);
 }
 
-function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAccountEntries, systemEntries, processInstanceId = crypto.randomUUID(), processId = process.pid }) {
+function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAccountEntries, systemEntries, processInstanceId = crypto.randomUUID(), processId = process.pid, processIdentity = undefined, classifyOwner = classifyProcessOwner }) {
   if (!Number.isSafeInteger(perAccountBytes) || perAccountBytes <= 0 || !Number.isSafeInteger(systemBytes) || systemBytes <= 0 || perAccountBytes > systemBytes ||
       !Number.isSafeInteger(perAccountEntries) || perAccountEntries <= 0 || !Number.isSafeInteger(systemEntries) || systemEntries <= 0 || perAccountEntries > systemEntries) {
     throw new TypeError("Invalid chunk upload quota limits");
   }
+  if (typeof classifyOwner !== "function") throw new TypeError("Invalid chunk process owner classifier");
+  const ownerProcessIdentity = serializeProcessIdentity(processIdentity === undefined ? getCurrentProcessIdentity() : processIdentity);
   const resolvedRoot = path.resolve(rootDir);
   assertSafeChunkUploadAncestors(resolvedRoot);
   assertSupportedChunkUploadFilesystem(resolvedRoot);
@@ -192,7 +285,8 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
     database.pragma("foreign_keys = ON");
     const integrity = database.pragma("integrity_check", { simple: true });
     if (integrity !== "ok") throw new Error("Chunk quota database integrity check failed");
-    database.transaction(() => database.exec(`
+    database.transaction(() => {
+      database.exec(`
       CREATE TABLE IF NOT EXISTS quota_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -206,6 +300,7 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
         charge_bytes INTEGER NOT NULL CHECK (charge_bytes >= 0),
         owner_instance_id TEXT NOT NULL,
         owner_pid INTEGER NOT NULL,
+        owner_process_identity TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -216,6 +311,7 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
         session_key TEXT PRIMARY KEY,
         owner_instance_id TEXT NOT NULL,
         owner_pid INTEGER NOT NULL,
+        owner_process_identity TEXT,
         created_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS quota_usage (
@@ -229,12 +325,17 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
         updated_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS quota_sessions_account ON quota_sessions(account_key);
-    `)).immediate();
+      `);
+      const operationColumns = new Set(database.pragma("table_info(quota_operations)").map((column) => column.name));
+      const lockColumns = new Set(database.pragma("table_info(quota_session_locks)").map((column) => column.name));
+      if (!operationColumns.has("owner_process_identity")) database.exec("ALTER TABLE quota_operations ADD COLUMN owner_process_identity TEXT");
+      if (!lockColumns.has("owner_process_identity")) database.exec("ALTER TABLE quota_session_locks ADD COLUMN owner_process_identity TEXT");
+    }).immediate();
     const insert = database.prepare(`
       INSERT INTO quota_operations (
         operation_id, account_key, session_key, relative_path, state, charge_bytes,
-        owner_instance_id, owner_pid, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        owner_instance_id, owner_pid, owner_process_identity, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const selectOperation = database.prepare("SELECT * FROM quota_operations WHERE operation_id = ?");
     const selectOperationByPath = database.prepare("SELECT * FROM quota_operations WHERE relative_path = ?");
@@ -249,10 +350,10 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
     const selectAccountUsageTotals = database.prepare("SELECT account_key, SUM(charge_bytes) AS bytes FROM quota_operations GROUP BY account_key ORDER BY account_key");
     const selectSessionUsageTotals = database.prepare("SELECT account_key, SUM(charge_bytes) AS bytes FROM quota_operations WHERE session_key = ? GROUP BY account_key ORDER BY account_key");
     const selectAccountHasOperations = database.prepare("SELECT 1 FROM quota_operations WHERE account_key = ? LIMIT 1");
-    const updateOwner = database.prepare("UPDATE quota_operations SET owner_instance_id = ?, owner_pid = ?, updated_at = ? WHERE operation_id = ? AND owner_instance_id = ? AND owner_pid = ?");
+    const updateOwner = database.prepare("UPDATE quota_operations SET owner_instance_id = ?, owner_pid = ?, owner_process_identity = ?, updated_at = ? WHERE operation_id = ? AND owner_instance_id = ? AND owner_pid = ? AND owner_process_identity IS ?");
     const selectSessionLock = database.prepare("SELECT * FROM quota_session_locks WHERE session_key = ?");
-    const insertSessionLock = database.prepare("INSERT INTO quota_session_locks(session_key, owner_instance_id, owner_pid, created_at) VALUES (?, ?, ?, ?)");
-    const deleteSessionLock = database.prepare("DELETE FROM quota_session_locks WHERE session_key = ? AND owner_instance_id = ? AND owner_pid = ?");
+    const insertSessionLock = database.prepare("INSERT INTO quota_session_locks(session_key, owner_instance_id, owner_pid, owner_process_identity, created_at) VALUES (?, ?, ?, ?, ?)");
+    const deleteSessionLock = database.prepare("DELETE FROM quota_session_locks WHERE session_key = ? AND owner_instance_id = ? AND owner_pid = ? AND owner_process_identity IS ?");
     const updateOperation = database.prepare(`
       UPDATE quota_operations
       SET session_key = ?, relative_path = ?, state = ?, charge_bytes = ?, updated_at = ?
@@ -343,7 +444,7 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
       const now = Date.now();
       insert.run(
         operation.operationId, operation.accountKey, operation.sessionKey, operation.relativePath,
-        operation.state, operation.chargeBytes, processInstanceId, processId, now, now,
+        operation.state, operation.chargeBytes, processInstanceId, processId, ownerProcessIdentity, now, now,
       );
       adjustUsage(operation.accountKey, operation.chargeBytes);
     });
@@ -421,13 +522,17 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
       return { systemEntries, accounts };
     });
     const migrateUsageTransaction = database.transaction(() => {
+      const operationColumns = new Set(database.pragma("table_info(quota_operations)").map((column) => column.name));
+      const lockColumns = new Set(database.pragma("table_info(quota_session_locks)").map((column) => column.name));
+      if (!operationColumns.has("owner_process_identity")) database.exec("ALTER TABLE quota_operations ADD COLUMN owner_process_identity TEXT");
+      if (!lockColumns.has("owner_process_identity")) database.exec("ALTER TABLE quota_session_locks ADD COLUMN owner_process_identity TEXT");
       const version = database.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get();
       const ready = database.prepare("SELECT value FROM quota_meta WHERE key = 'ready'").get();
       if (!version) {
         if (ready?.value === "1") throw new Error("Chunk quota schema version is missing");
         return false;
       }
-      if (!["1", "2", "3"].includes(version.value)) throw new Error("Unsupported chunk quota schema version");
+      if (!["1", "2", "3", "4"].includes(version.value)) throw new Error("Unsupported chunk quota schema version");
       if (ready && !["0", "1"].includes(ready.value)) throw new Error("Invalid chunk quota readiness marker");
 
       let schemaVersion = version.value;
@@ -477,17 +582,21 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
           LIMIT 1
         `).get();
         if (missingSession) throw new Error("Chunk quota session entries do not match the operation ledger");
+        setQuotaMetaValue.run("schema_version", "4");
+        schemaVersion = "4";
+      }
+      if (schemaVersion === "4") {
         return entryCapacityExceeded();
       }
       return false;
     });
     const initializeTransaction = database.transaction((importOperations = [], importSessions = []) => {
       const version = database.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get();
-      if (version && version.value !== "3") throw new Error("Unsupported chunk quota schema version");
+      if (version && version.value !== "4") throw new Error("Unsupported chunk quota schema version");
       const ready = database.prepare("SELECT value FROM quota_meta WHERE key = 'ready'").get();
       if (ready?.value === "1") return { alreadyReady: true, entryCapacityExceeded: entryCapacityExceeded() };
       if (ready && ready.value !== "0") throw new Error("Invalid chunk quota readiness marker");
-      setQuotaMetaValue.run("schema_version", "3");
+      setQuotaMetaValue.run("schema_version", "4");
       setQuotaMetaValue.run("ready", "0");
       setQuotaMetaValue.run("system_charge_bytes", "0");
       deleteAllUsage.run();
@@ -516,7 +625,7 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
           importedSessions.set(normalized.sessionKey, normalized.accountKey);
         }
         const now = Date.now();
-        insert.run(normalized.operationId, normalized.accountKey, normalized.sessionKey, normalized.relativePath, normalized.state, normalized.chargeBytes, processInstanceId, processId, now, now);
+        insert.run(normalized.operationId, normalized.accountKey, normalized.sessionKey, normalized.relativePath, normalized.state, normalized.chargeBytes, processInstanceId, processId, ownerProcessIdentity, now, now);
       }
       for (const [sessionKey, accountKey] of importedSessions) registerSessionInTransaction(sessionKey, accountKey);
       const importedSystemBytes = safeByteCount(totalSystem.get().bytes);
@@ -556,6 +665,7 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
           chargeBytes: Number(row.charge_bytes),
           ownerInstanceId: row.owner_instance_id,
           ownerPid: Number(row.owner_pid),
+          ownerProcessIdentity: row.owner_process_identity,
           createdAt: Number(row.created_at),
           updatedAt: Number(row.updated_at),
         }));
@@ -571,6 +681,7 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
           chargeBytes: Number(row.charge_bytes),
           ownerInstanceId: row.owner_instance_id,
           ownerPid: Number(row.owner_pid),
+          ownerProcessIdentity: row.owner_process_identity,
           createdAt: Number(row.created_at),
           updatedAt: Number(row.updated_at),
         }));
@@ -581,9 +692,16 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
       isCurrentOwner(operation) {
         return Boolean(operation && operation.ownerPid === processId && operation.ownerInstanceId === processInstanceId);
       },
+      ownerStatus(operation) {
+        if (!operation || !Number.isSafeInteger(operation.ownerPid) || typeof operation.ownerInstanceId !== "string") return "unknown";
+        if (service.isCurrentOwner(operation)) return "current";
+        if (activeQuotaInstances.has(`${operation.ownerPid}\u0000${operation.ownerInstanceId}`)) return "live";
+        return classifyOwner(operation.ownerPid, operation.ownerProcessIdentity, ownerProcessIdentity);
+      },
       claim(operation) {
         if (!operation || typeof operation.operationId !== "string" || typeof operation.ownerInstanceId !== "string" || !Number.isSafeInteger(operation.ownerPid)) throw new TypeError("Invalid chunk quota claim");
-        return database.transaction(() => updateOwner.run(processInstanceId, processId, Date.now(), operation.operationId, operation.ownerInstanceId, operation.ownerPid).changes === 1).immediate();
+        if (service.ownerStatus(operation) !== "dead") return false;
+        return database.transaction(() => updateOwner.run(processInstanceId, processId, ownerProcessIdentity, Date.now(), operation.operationId, operation.ownerInstanceId, operation.ownerPid, operation.ownerProcessIdentity ?? null).changes === 1).immediate();
       },
       async withSessionLock(sessionKey, callback, { waitMs = 30_000 } = {}) {
         if (typeof sessionKey !== "string" || !sessionKey || typeof callback !== "function" || !Number.isSafeInteger(waitMs) || waitMs < 0) throw new TypeError("Invalid chunk session lock request");
@@ -592,17 +710,15 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
           const acquired = database.transaction(() => {
             const current = selectSessionLock.get(sessionKey);
             if (current) {
-              const sameProcess = Number(current.owner_pid) === processId;
-              if (activeQuotaInstances.has(`${current.owner_pid}\u0000${current.owner_instance_id}`)) return false;
-              if (!sameProcess) {
-                let alive = true;
-                try { process.kill(Number(current.owner_pid), 0); }
-                catch (error) { alive = error.code !== "ESRCH"; }
-                if (alive) return false;
-              }
-              deleteSessionLock.run(sessionKey, current.owner_instance_id, current.owner_pid);
+              const status = service.ownerStatus({
+                ownerInstanceId: current.owner_instance_id,
+                ownerPid: Number(current.owner_pid),
+                ownerProcessIdentity: current.owner_process_identity,
+              });
+              if (status !== "dead") return false;
+              deleteSessionLock.run(sessionKey, current.owner_instance_id, current.owner_pid, current.owner_process_identity ?? null);
             }
-            insertSessionLock.run(sessionKey, processInstanceId, processId, Date.now());
+            insertSessionLock.run(sessionKey, processInstanceId, processId, ownerProcessIdentity, Date.now());
             return true;
           }).immediate();
           if (acquired) break;
@@ -616,7 +732,7 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
         try {
           return await callback();
         } finally {
-          database.transaction(() => deleteSessionLock.run(sessionKey, processInstanceId, processId)).immediate();
+          database.transaction(() => deleteSessionLock.run(sessionKey, processInstanceId, processId, ownerProcessIdentity)).immediate();
         }
       },
       reserve({ operationId = crypto.randomUUID(), accountKey, sessionKey = null, relativePath, reservedBytes, allowZeroBytes = false }) {
@@ -685,6 +801,8 @@ module.exports = {
   assertSafeChunkUploadAncestors,
   assertSupportedChunkUploadFilesystem,
   canonicalAccountKey,
+  classifyProcessOwner,
   createChunkUploadQuota,
+  getCurrentProcessIdentity,
   parseChunkUploadQuotaConfig,
 };

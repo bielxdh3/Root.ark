@@ -7670,17 +7670,6 @@ function readLegacyChunkQuotaOperations({ includeOperations = true, applyDeferre
   return { operations: rows, sessions: [...sessions].map(([sessionKey, accountKey]) => ({ sessionKey, accountKey })) };
 }
 
-function chunkQuotaOwnerIsAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    if (error.code === "ESRCH") return false;
-    return true;
-  }
-}
-
 function getChunkQuotaOperationFile(operation, { repairPermissions = true } = {}) {
   const relative = operation.relativePath.split(/[\\/]/);
   if (!relative.length || relative.some((part) => !part || part === "." || part === "..")) throw new Error("Unsafe chunk quota operation path");
@@ -7870,8 +7859,9 @@ function recoverDeadChunkQuotaOperations() {
   // Validate every ledger row before recovery performs any filesystem mutation.
   validateChunkQuotaOperationsBeforeRecovery(operations);
   for (const operation of operations) {
-    if (chunkUploadQuota.isCurrentOwner(operation)) continue;
-    if (operation.ownerPid !== process.pid && chunkQuotaOwnerIsAlive(operation.ownerPid)) continue;
+    const ownerStatus = chunkUploadQuota.ownerStatus(operation);
+    if (ownerStatus === "current" || ownerStatus === "live") continue;
+    if (ownerStatus !== "dead") throw new Error("Chunk quota operation owner identity is ambiguous; recovery is blocked");
     if (!chunkUploadQuota.claim(operation)) continue;
     if (["handoff_pending", "handoff_published", "handed_off"].includes(operation.state)) {
       recoverChunkUploadHandoff(operation);
