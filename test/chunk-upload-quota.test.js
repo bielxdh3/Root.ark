@@ -8,11 +8,12 @@ const test = require("node:test");
 const {
   assertSafeChunkUploadAncestors,
   assertSupportedChunkUploadFilesystem,
-  createChunkUploadQuota,
+  createChunkUploadQuota: createChunkUploadQuotaService,
   parseChunkUploadQuotaConfig,
 } = require("../services/chunkUploadQuota");
 const { ensureWindowsChunkUploadRoot, getWindowsChunkAclDescriptor } = require("../services/chunkUploadWindowsAcl");
 const QUOTA_TEST_TEMP = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
+const createChunkUploadQuota = (options) => createChunkUploadQuotaService({ perAccountEntries: 5000, systemEntries: 10000, ...options });
 
 function withTempDir(callback) {
   const parent = fs.mkdtempSync(path.join(QUOTA_TEST_TEMP, "rootark-chunk-quota-"));
@@ -57,8 +58,35 @@ test("chunk quota configuration requires positive safe integer byte caps without
   assert.deepEqual(parseChunkUploadQuotaConfig({
     CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: "80",
     CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: "100",
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "8",
+    CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10",
     CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
-  }), { enabled: true, perAccountBytes: 80, systemBytes: 100 });
+  }), { enabled: true, perAccountBytes: 80, systemBytes: 100, perAccountEntries: 8, systemEntries: 10 });
+});
+
+test("chunk quota configuration requires positive safe integer entry caps without defaults", () => {
+  const byteAndTopologyLimits = {
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: "80",
+    CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: "100",
+    CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
+  };
+  for (const entries of [
+    {},
+    { CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10" },
+    { CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "0", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10" },
+    { CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "1.5", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10" },
+    { CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "01", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10" },
+    { CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "9007199254740992", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "9007199254740992" },
+    { CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "11", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10" },
+  ]) {
+    assert.equal(parseChunkUploadQuotaConfig({ ...byteAndTopologyLimits, ...entries }).enabled, false);
+  }
+
+  assert.deepEqual(parseChunkUploadQuotaConfig({
+    ...byteAndTopologyLimits,
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "4",
+    CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "6",
+  }), { enabled: true, perAccountBytes: 80, systemBytes: 100, perAccountEntries: 4, systemEntries: 6 });
 });
 
 test("chunk quota fails closed unless the operator attests single-host local-volume placement", () => {
@@ -73,6 +101,8 @@ test("chunk quota fails closed unless the operator attests single-host local-vol
   }
   assert.equal(parseChunkUploadQuotaConfig({
     ...limits,
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "8",
+    CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10",
     CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
   }).enabled, true);
 });
@@ -256,8 +286,9 @@ test("schema 1 ledgers migrate usage counters without changing existing charges"
   try {
     const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 10, systemBytes: 12 });
     try {
-      assert.deepEqual(quota.initialize(), { alreadyReady: true });
+      assert.deepEqual(quota.initialize(), { alreadyReady: true, entryCapacityExceeded: false });
       assert.deepEqual(quota.totals(), { systemBytes: 5, accounts: { alice: 5 } });
+      assert.deepEqual(quota.sessions().map((session) => ({ sessionKey: session.sessionKey, accountKey: session.accountKey })), [{ sessionKey: "folder/upload", accountKey: "alice" }]);
       quota.reserve({ operationId: "new-part", accountKey: "alice", reservedBytes: 5, relativePath: "incoming/new-part" });
       assert.throws(() => quota.reserve({ operationId: "over-account", accountKey: "alice", reservedBytes: 1, relativePath: "incoming/over-account" }), { code: "CHUNK_QUOTA_EXCEEDED" });
       assert.throws(() => quota.reserve({ operationId: "over-system", accountKey: "bob", reservedBytes: 3, relativePath: "incoming/over-system" }), { code: "CHUNK_QUOTA_EXCEEDED" });
@@ -355,6 +386,117 @@ test("ledger reserves exact per-account and system boundaries atomically across 
   });
 });
 
+test("zero-byte operations and session entries share atomic account and system entry limits", () => {
+  withTempDir((directory) => {
+    const first = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 12, perAccountEntries: 3, systemEntries: 4 });
+    const second = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 12, perAccountEntries: 3, systemEntries: 4 });
+    let firstOpen = true;
+    try {
+      first.initialize();
+      second.initialize();
+      first.reserve({ operationId: "empty-part-1", accountKey: "alice", sessionKey: "folder/upload-one", reservedBytes: 0, allowZeroBytes: true, relativePath: "folder/upload-one/0.part" });
+      second.reserve({ operationId: "empty-part-2", accountKey: "ALICE", sessionKey: "folder/upload-one", reservedBytes: 0, allowZeroBytes: true, relativePath: "folder/upload-one/1.part" });
+      assert.deepEqual(first.entryTotals(), { systemEntries: 3, accounts: { alice: 3 } });
+      assert.throws(() => second.reserve({ operationId: "empty-part-3", accountKey: "alice", reservedBytes: 0, allowZeroBytes: true, relativePath: "incoming/empty-part-3" }), { code: "CHUNK_QUOTA_EXCEEDED" });
+      assert.throws(() => second.reserve({ operationId: "bob-part", accountKey: "bob", sessionKey: "folder/upload-bob", reservedBytes: 0, allowZeroBytes: true, relativePath: "folder/upload-bob/0.part" }), { code: "CHUNK_QUOTA_EXCEEDED" });
+      assert.deepEqual(first.entryTotals(), { systemEntries: 3, accounts: { alice: 3 } });
+
+      first.close();
+      firstOpen = false;
+      const reopened = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 12, perAccountEntries: 3, systemEntries: 4 });
+      try {
+        assert.equal(reopened.isReady(), true);
+        assert.deepEqual(reopened.entryTotals(), { systemEntries: 3, accounts: { alice: 3 } });
+        assert.equal(reopened.releaseSessionOperations("folder/upload-one"), 2);
+        assert.deepEqual(reopened.entryTotals(), { systemEntries: 1, accounts: { alice: 1 } }, "expiry releases part rows but retains its tombstone session entry");
+        reopened.reserve({ operationId: "after-expiry", accountKey: "alice", sessionKey: "folder/after-expiry", reservedBytes: 0, allowZeroBytes: true, relativePath: "folder/after-expiry/0.part" });
+        assert.throws(() => reopened.reserve({ operationId: "system-blocked", accountKey: "bob", sessionKey: "folder/system-blocked", reservedBytes: 0, allowZeroBytes: true, relativePath: "folder/system-blocked/0.part" }), { code: "CHUNK_QUOTA_EXCEEDED" });
+        assert.equal(reopened.releaseSession("folder/upload-one"), 0, "removing an expired session frees its retained entry after its tombstone expires");
+        reopened.reserve({ operationId: "after-tombstone", accountKey: "bob", sessionKey: "folder/after-tombstone", reservedBytes: 0, allowZeroBytes: true, relativePath: "folder/after-tombstone/0.part" });
+        assert.deepEqual(reopened.entryTotals(), { systemEntries: 4, accounts: { alice: 2, bob: 2 } });
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      second.close();
+      if (firstOpen) first.close();
+    }
+  });
+});
+
+test("migration and restart detect over-cap entries while keeping cleanup available", () => {
+  const scenarios = [
+    {
+      accountCap: 2,
+      systemCap: 3,
+      sessions: ["folder/upload"],
+      prepare(quota) {
+        quota.reserve({ operationId: "account-cap-part-1", accountKey: "alice", sessionKey: "folder/upload", reservedBytes: 1, relativePath: "folder/upload/0.part" });
+        quota.reserve({ operationId: "account-cap-part-2", accountKey: "alice", sessionKey: "folder/upload", reservedBytes: 1, relativePath: "folder/upload/1.part" });
+      },
+      blockedAccount: "alice",
+      blockedId: "account-cap-blocked",
+    },
+    {
+      accountCap: 3,
+      systemCap: 3,
+      sessions: ["folder/upload-one", "folder/upload-two"],
+      prepare(quota) {
+        quota.reserve({ operationId: "system-cap-part-1", accountKey: "alice", sessionKey: "folder/upload-one", reservedBytes: 1, relativePath: "folder/upload-one/0.part" });
+        quota.reserve({ operationId: "system-cap-part-2", accountKey: "bob", sessionKey: "folder/upload-two", reservedBytes: 1, relativePath: "folder/upload-two/0.part" });
+      },
+      blockedAccount: "carol",
+      blockedId: "system-cap-blocked",
+    },
+  ];
+
+  for (const mode of ["migration", "restart"]) {
+    for (const scenario of scenarios) {
+      withTempDir((directory) => {
+        const original = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 20, systemBytes: 20, perAccountEntries: 5, systemEntries: 5 });
+        try {
+          original.initialize();
+          scenario.prepare(original);
+        } finally {
+          original.close();
+        }
+
+        if (mode === "migration") {
+          const database = new Database(path.join(directory, ".quota.sqlite"));
+          try {
+            database.prepare("UPDATE quota_meta SET value = '2' WHERE key = 'schema_version'").run();
+            database.prepare("DELETE FROM quota_sessions").run();
+          } finally {
+            database.close();
+          }
+        }
+
+        const reopened = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 20, systemBytes: 20, perAccountEntries: scenario.accountCap, systemEntries: scenario.systemCap });
+        try {
+          assert.deepEqual(reopened.initialize(), { alreadyReady: true, entryCapacityExceeded: true });
+          const entriesBefore = reopened.entryTotals();
+          assert.throws(() => reopened.reserve({
+            operationId: scenario.blockedId,
+            accountKey: scenario.blockedAccount,
+            sessionKey: `folder/${scenario.blockedId}`,
+            reservedBytes: 0,
+            allowZeroBytes: true,
+            relativePath: `folder/${scenario.blockedId}/0.part`,
+          }), { code: "CHUNK_QUOTA_EXCEEDED" });
+          assert.deepEqual(reopened.entryTotals(), entriesBefore, "a restart over configured entry capacity must not admit another row");
+
+          for (const sessionKey of scenario.sessions) reopened.releaseSession(sessionKey);
+          assert.deepEqual(reopened.entryTotals(), { systemEntries: 0, accounts: {} });
+          reopened.reserve({ operationId: `${mode}-${scenario.blockedId}`, accountKey: scenario.blockedAccount, sessionKey: `folder/${scenario.blockedId}`, reservedBytes: 0, allowZeroBytes: true, relativePath: `folder/${scenario.blockedId}/0.part` });
+          assert.equal(reopened.entryTotals().systemEntries, 2, "cleanup restores admission once the retained entries fit the configured caps");
+        } finally {
+          reopened.close();
+        }
+      });
+    }
+  }
+});
+
 test("ledger can adjust and release a charge only by its operation identity", () => {
   withTempDir((directory) => {
     const quota = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10 });
@@ -396,7 +538,7 @@ test("first startup imports operations and publishes readiness in one idempotent
       assert.throws(() => first.reserve({ operationId: "before-ready", accountKey: "alice", reservedBytes: 1, relativePath: "incoming/x" }), /not ready/);
       first.initialize([{ operationId: "legacy-part-1", accountKey: "Alice", sessionKey: "folder/upload", relativePath: "folder/upload/0.part", state: "part_committed", chargeBytes: 4 }]);
       assert.equal(first.isReady(), true);
-      assert.deepEqual(second.initialize([{ operationId: "duplicate-import", accountKey: "alice", relativePath: "incoming/x", state: "reserved", chargeBytes: 1 }]), { alreadyReady: true });
+      assert.deepEqual(second.initialize([{ operationId: "duplicate-import", accountKey: "alice", relativePath: "incoming/x", state: "reserved", chargeBytes: 1 }]), { alreadyReady: true, entryCapacityExceeded: false });
       assert.deepEqual(second.totals(), { systemBytes: 4, accounts: { alice: 4 } });
     } finally {
       first.close();
@@ -421,7 +563,7 @@ test("concurrent processes publish only one first legacy import", async () => {
     const fs = require("node:fs");
     const { createChunkUploadQuota } = require(${JSON.stringify(require.resolve("../services/chunkUploadQuota"))});
     const [root, readyDir, id, startPath] = process.argv.slice(2);
-    const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 10, systemBytes: 10 });
+    const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000 });
     fs.writeFileSync(require("node:path").join(readyDir, id), "ready");
     const wait = () => new Promise((resolve) => setTimeout(resolve, 5));
     (async () => {
@@ -501,8 +643,8 @@ test("ledger rejects a symlinked database before opening its target", (t) => {
 
 test("dead operation claims are compare-and-set and session locks serialize ledger clients", async () => {
   const { parent, root: directory } = createQuotaTestRoot("rootark-chunk-quota-lock-");
-  const stale = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, processInstanceId: "stale", processId: 2147483000 });
-  const active = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, processInstanceId: "active" });
+  const stale = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "stale", processId: 2147483000 });
+  const active = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "active" });
   try {
     stale.initialize([{ operationId: "dead-op", accountKey: "alice", relativePath: "incoming/dead-op", state: "reserved", chargeBytes: 4 }]);
     const row = active.operations()[0];
@@ -530,7 +672,7 @@ test("dead operation claims are compare-and-set and session locks serialize ledg
 
 test("a same-PID quota session lock from a prior instance is recoverable after PID reuse", async () => {
   const { parent, root: directory } = createQuotaTestRoot("rootark-chunk-quota-pid-reuse-");
-  const previous = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, processInstanceId: "previous-instance", processId: process.pid });
+  const previous = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "previous-instance", processId: process.pid });
   try {
     previous.initialize();
     previous.close();
@@ -540,7 +682,7 @@ test("a same-PID quota session lock from a prior instance is recoverable after P
     } finally {
       database.close();
     }
-    const current = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, processInstanceId: "current-instance", processId: process.pid });
+    const current = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "current-instance", processId: process.pid });
     try {
       let entered = false;
       await current.withSessionLock("handoff-folder/folder", async () => { entered = true; }, { waitMs: 100 });
@@ -555,8 +697,8 @@ test("a same-PID quota session lock from a prior instance is recoverable after P
 
 test("a live same-PID quota instance cannot have its session lock stolen", async () => {
   const { parent, root: directory } = createQuotaTestRoot("rootark-chunk-quota-same-pid-lock-");
-  const owner = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, processInstanceId: "active-owner", processId: process.pid });
-  const contender = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, processInstanceId: "active-contender", processId: process.pid });
+  const owner = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "active-owner", processId: process.pid });
+  const contender = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "active-contender", processId: process.pid });
   try {
     owner.initialize();
     contender.initialize();
@@ -584,7 +726,7 @@ test("a live same-PID quota instance cannot have its session lock stolen", async
 
 test("session locks serialize across separate Node processes", async () => {
   const { parent, root: directory } = createQuotaTestRoot("rootark-chunk-quota-process-lock-");
-  const owner = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, processInstanceId: "parent-owner" });
+  const owner = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "parent-owner" });
   try {
     owner.initialize();
     let releaseOwner;
@@ -598,7 +740,7 @@ test("session locks serialize across separate Node processes", async () => {
 
     const workerSource = `
       const { createChunkUploadQuota } = require(${JSON.stringify(require.resolve("../services/chunkUploadQuota"))});
-      const quota = createChunkUploadQuota({ rootDir: process.argv[1], perAccountBytes: 10, systemBytes: 10 });
+      const quota = createChunkUploadQuota({ rootDir: process.argv[1], perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000 });
       quota.initialize();
       (async () => {
         try {
@@ -628,6 +770,75 @@ test("session locks serialize across separate Node processes", async () => {
   }
 });
 
+test("concurrent first startup reopens a database file created by another process", async () => {
+  const { parent, root: directory } = createQuotaTestRoot("rootark-chunk-quota-first-startup-");
+  const modulePath = path.resolve(__dirname, "../services/chunkUploadQuota.js");
+  const gatePath = path.join(directory, "release-db-create");
+  const workerSource = `
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const root = process.argv[1];
+    const readyPath = path.join(root, 'lstat-ready-' + process.argv[2]);
+    const gatePath = path.join(root, 'release-db-create');
+    const databasePath = path.join(root, '.quota.sqlite');
+    const originalLstat = fs.lstatSync;
+    fs.lstatSync = function(target, ...args) {
+      if (path.resolve(target) === path.resolve(databasePath)) {
+        try { return originalLstat.call(this, target, ...args); }
+        catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+          fs.writeFileSync(readyPath, 'ready');
+          while (!fs.existsSync(gatePath)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+          throw error;
+        }
+      }
+      return originalLstat.call(this, target, ...args);
+    };
+    const { createChunkUploadQuota } = require(${JSON.stringify(modulePath)});
+    const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 20, systemBytes: 20, perAccountEntries: 4, systemEntries: 8 });
+    try { quota.initialize(); process.stdout.write('ready'); }
+    catch (error) { process.stderr.write(error.code || error.message); process.exitCode = 1; }
+    finally { quota.close(); }
+  `;
+  const children = [];
+  const workers = [];
+  try {
+    for (let index = 0; index < 4; index += 1) {
+      const child = spawn(process.execPath, ["-e", workerSource, directory, String(index)], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+      children.push(child);
+      workers.push(new Promise((resolve, reject) => {
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => { stdout += chunk; });
+        child.stderr.on("data", (chunk) => { stderr += chunk; });
+        child.once("error", reject);
+        child.once("exit", (code) => code === 0 ? resolve(stdout) : reject(new Error(`startup worker exited ${code}: ${stderr}`)));
+      }));
+    }
+
+    const barrierDeadline = Date.now() + 10000;
+    while (fs.readdirSync(directory).filter((name) => name.startsWith("lstat-ready-")).length < children.length && Date.now() < barrierDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(fs.readdirSync(directory).filter((name) => name.startsWith("lstat-ready-")).length, children.length, "all processes observe the fresh database as missing before any process creates it");
+    fs.writeFileSync(gatePath, "go");
+    assert.deepEqual(await Promise.all(workers), Array(children.length).fill("ready"));
+
+    const verify = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 20, systemBytes: 20, perAccountEntries: 4, systemEntries: 8 });
+    try {
+      assert.deepEqual(verify.initialize(), { alreadyReady: true, entryCapacityExceeded: false });
+      assert.equal(verify.isReady(), true);
+    } finally {
+      verify.close();
+    }
+  } finally {
+    fs.writeFileSync(gatePath, "go");
+    for (const child of children) if (child.exitCode === null) child.kill();
+    await Promise.allSettled(workers);
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
 test("separate Node processes cannot oversubscribe the shared system quota", async () => {
   const { parent, root: directory } = createQuotaTestRoot("rootark-chunk-quota-processes-");
   const setup = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10 });
@@ -636,7 +847,7 @@ test("separate Node processes cannot oversubscribe the shared system quota", asy
   const modulePath = path.resolve(__dirname, "../services/chunkUploadQuota.js");
   const childSource = `
     const { createChunkUploadQuota } = require(${JSON.stringify(modulePath)});
-    const quota = createChunkUploadQuota({ rootDir: process.argv[1], perAccountBytes: 10, systemBytes: 10 });
+    const quota = createChunkUploadQuota({ rootDir: process.argv[1], perAccountBytes: 10, systemBytes: 10, perAccountEntries: 5000, systemEntries: 10000 });
     try {
       quota.initialize();
       quota.reserve({ operationId: process.argv[2], accountKey: process.argv[2], relativePath: 'incoming/' + process.argv[2], reservedBytes: 6 });

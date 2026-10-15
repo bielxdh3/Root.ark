@@ -39,14 +39,18 @@ The existing per-process rate limits are a separate control. This design limits 
 
 ## Configuration and fail-closed behavior
 
-Add two required positive byte limits, with no defaults and no sample capacity values:
+Add two required positive byte limits and two required positive entry limits, with no defaults and no sample capacity values:
 
 - `CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES`
 - `CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES`
+- `CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES`
+- `CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES`
 
 Also require `CHUNK_UPLOAD_STORAGE_TOPOLOGY=single-host-local-volume` as an explicit operator attestation before the server enables chunk uploads. Missing or different values fail closed. This is a deployment assertion, not automatic replica or mount discovery. On Linux, reject known remote filesystem types (including NFS, SMB/CIFS, FUSE, 9p, Ceph, AFS, and NCP) and fail closed if filesystem type cannot be checked. On Windows, reject UNC paths; mapped drives and non-Linux mount topology still require operator verification.
 
 Values must be strict base-10 positive integers within JavaScript's safe-integer range; the per-account limit must not exceed the system limit. Missing, empty, malformed, unsafe, or contradictory values disable only chunk uploads. They must not prevent the rest of the server from starting. Configuration is read at process start and takes effect after restart.
+
+The entry limits follow the same strict integer and per-account-versus-system rules. An entry is either one live SQLite operation row or one unique upload-session directory/tombstone row. Entry capacity is tracked and checked in the same SQLite write transaction as each row insertion or removal, separately from the byte charge.
 
 If the quota ledger cannot be safely opened, validated, migrated, or reconciled, chunk uploads return HTTP `503` with a stable machine-readable code and a generic operator-facing message. Capacity exhaustion returns HTTP `507` with a stable code and retry guidance. Preserve the existing JSON `error` field for client compatibility and add a stable `code` field. Do not set a fixed `Retry-After`: available capacity depends on concurrent sessions and cleanup. Do not expose paths, SQL errors, or ledger contents to clients.
 
@@ -65,7 +69,7 @@ Each account/system total is the sum of all live ledger charges, including:
 - **Replacement backup:** old part bytes retained while a replacement is being promoted or recovered.
 - **Assembly scratch:** reserved bytes for `assembled.upload` or a temporary assembly file.
 
-The ledger itself, SQLite journal files, metadata JSON, and directory overhead are not charged as chunk payload bytes, but they remain subject to filesystem safety checks. A budget is an application-level cap, not a guarantee that the underlying filesystem has that much free space.
+The ledger itself, SQLite journal files, metadata JSON, and directory overhead are not charged as chunk payload bytes, but they remain subject to filesystem safety checks. The separate entry limits bound operation rows and session directories, including empty, metadata-only, and expired-tombstone sessions. Each committed or in-progress operation row counts even when its byte charge is zero. A budget is an application-level cap, not a guarantee that the underlying filesystem has that much free space.
 
 Every reserve, release, ownership transfer, and state transition affecting totals runs in a short SQLite write transaction (`BEGIN IMMEDIATE` or equivalent). Check both account and system budgets in that same transaction, then commit before starting the filesystem write. Set a bounded SQLite busy timeout. If a transaction fails or accounting is ambiguous, do not proceed with the write.
 
@@ -103,6 +107,8 @@ Keep the existing seven-day inactivity policy. The current multipart upload ID i
 
 Under a serialized ledger transition, mark an expired session, safely validate its entries, remove each part/scratch file, and release each charge only after confirmed deletion. Retain the existing tombstone/restart behavior for longer than the bounded HTTP request lifetime so an in-flight stale request cannot race marker removal. If cleanup fails, retain the bytes as charged and retry through the recovery path; never evict another account's session to satisfy a limit.
 
+Expiry releases the session's operation rows after the numbered parts are removed, but retains its unique session entry until the seven-day tombstone directory is removed. This keeps metadata-only and tombstone directories within both entry limits across restart. Cleanup must remain safely serialized when chunk uploads are disabled or the quota ledger is unavailable; the upload endpoint still fails closed in that state.
+
 Replace age-only deletion of incoming files with ledger-aware cleanup. A stale timestamp alone is not authority to delete an incoming file. Cleanup may release an abandoned operation only after its owner is confirmed dead, the exact ledger-linked path is verified, and the file is successfully removed. Untracked incoming files are preserved and cause fail-closed behavior until reconciled.
 
 For a live request, release an incoming reservation on a terminal request outcome (`finish`, `aborted`, or error) only after safe cleanup is confirmed. Do not reclaim it by an arbitrary lease TTL while the owning process/request may still be writing. Verify that the HTTP server's bounded request timeout terminates clients that reserve space but never complete the body, and test that timeout/abort cleanup does not race an active write.
@@ -118,7 +124,7 @@ Unsupported: multiple hosts, NFS, SMB, or a topology where a process can write s
 Use disposable runtime directories and small test budgets. Do not run destructive tests against user staging data. Add focused tests covering:
 
 1. Missing, empty, malformed, zero, unsafe, and contradictory configuration: server remains usable, chunk endpoint returns the expected `503` code, and no incoming file is created.
-2. Per-account and system caps, exact-boundary success, one-byte-over rejection, and concurrent reservations from multiple server processes: no budget can be oversubscribed.
+2. Per-account and system byte and entry caps, exact-boundary success, over-cap rejection, and concurrent reservations from multiple server processes: no budget can be oversubscribed. Include zero-byte operations, unique sessions, and retained tombstones across restart; preserve a valid one-part empty file when configured capacity is available.
 3. Reservation occurs before Multer writes; an oversized/aborted/malformed multipart request releases only after safe cleanup, or conservatively retains the charge when cleanup fails.
 4. Retry/replacement preserves the previous part when quota is exhausted or rename/promotion fails; replacement backup bytes are counted during the transition.
 5. Completing a session reserves the full assembly size before final-part commit; rejected assembly reservation preserves prior parts. Successful assembly and all accepted source parts remain charged together through scan/encryption until the durable pending-upload handoff is verified; source-part charges are released only after their post-handoff deletion succeeds.
@@ -140,3 +146,7 @@ Issue #186 remains open until the code, tests, deployment documentation, exact-h
 ## Owner approval gate
 
 The owner approved this written specification on 2026-10-15. Implementation may proceed within this design. Any material design change discovered during implementation must be returned for review before expanding scope.
+
+## Evidence-backed amendment: bound metadata-only session growth (2026-10-15)
+
+The original byte-ledger design bounded payload bytes but left SQLite row count, metadata files, and session-directory count outside the byte accounting. Route inspection and the disposable zero-byte upload regression confirmed that an incomplete session can retain a zero-byte part and metadata while creating an operation row and directory; therefore repeated unique IDs could consume unbounded metadata and filesystem entries while staying under either byte limit. The approved correction adds required per-account and system entry caps, with no invented numeric defaults. SQLite counts operation rows and unique session rows in the same immediate transaction as reserve, register, transition, and release decisions. One session entry covers its directory, metadata, and retained expiry tombstone; each operation row is counted regardless of byte charge. Expiry removes operation entries only after file deletion and retains the session entry until the tombstone directory is removed. A legacy tombstone or empty directory without a provable owner is charged to one shared conservative account bucket and still counts against the system limit. The filesystem still supplies exact directory/SQLite byte overhead, which the byte ledger does not measure, while entry caps bound the number of such allocations. A one-part empty upload remains valid whenever the operator-configured byte and entry budgets have capacity. Initialization checks existing entry counts transactionally on migration and restart. If a valid ledger exceeds a newly lowered cap, cleanup remains available while atomic reservations refuse new entries until cleanup brings the counts within the configured limits.

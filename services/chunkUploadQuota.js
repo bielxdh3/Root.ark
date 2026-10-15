@@ -29,6 +29,8 @@ const STATES = new Set([
 function parseChunkUploadQuotaConfig(env = process.env) {
   const perAccountText = env.CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES;
   const systemText = env.CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES;
+  const perAccountEntriesText = env.CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES;
+  const systemEntriesText = env.CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES;
   const parse = (value) => {
     if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value)) return null;
     const parsed = Number(value);
@@ -36,13 +38,16 @@ function parseChunkUploadQuotaConfig(env = process.env) {
   };
   const perAccountBytes = parse(perAccountText);
   const systemBytes = parse(systemText);
-  if (perAccountBytes === null || systemBytes === null || perAccountBytes > systemBytes) {
+  const perAccountEntries = parse(perAccountEntriesText);
+  const systemEntries = parse(systemEntriesText);
+  if (perAccountBytes === null || systemBytes === null || perAccountBytes > systemBytes ||
+      perAccountEntries === null || systemEntries === null || perAccountEntries > systemEntries) {
     return { enabled: false, reason: "invalid_configuration" };
   }
   if (env.CHUNK_UPLOAD_STORAGE_TOPOLOGY !== REQUIRED_TOPOLOGY_ACK) {
     return { enabled: false, reason: "topology_not_acknowledged" };
   }
-  return { enabled: true, perAccountBytes, systemBytes };
+  return { enabled: true, perAccountBytes, systemBytes, perAccountEntries, systemEntries };
 }
 
 function assertSafeChunkUploadAncestors(directory, { platform = process.platform, uid = process.getuid?.() } = {}) {
@@ -117,8 +122,12 @@ function ensureSafeDatabaseFile(databasePath) {
     stats = fs.lstatSync(databasePath);
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
-    const descriptor = fs.openSync(databasePath, "wx", 0o600);
-    fs.closeSync(descriptor);
+    try {
+      const descriptor = fs.openSync(databasePath, "wx", 0o600);
+      fs.closeSync(descriptor);
+    } catch (createError) {
+      if (createError.code !== "EEXIST") throw createError;
+    }
     stats = fs.lstatSync(databasePath);
   }
   if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1) {
@@ -126,6 +135,23 @@ function ensureSafeDatabaseFile(databasePath) {
   }
   if (process.platform !== "win32" && (stats.mode & 0o077) !== 0) {
     fs.chmodSync(databasePath, 0o600);
+  }
+}
+
+function enableChunkQuotaWal(database) {
+  const deadline = Date.now() + BUSY_TIMEOUT_MS;
+  const waitCell = new Int32Array(new SharedArrayBuffer(4));
+  while (true) {
+    try {
+      const journalMode = database.pragma("journal_mode = WAL", { simple: true });
+      if (typeof journalMode !== "string" || journalMode.toLowerCase() !== "wal") {
+        throw new Error("Chunk quota database did not enter WAL mode");
+      }
+      return;
+    } catch (error) {
+      if (error.code !== "SQLITE_BUSY" || Date.now() >= deadline) throw error;
+      Atomics.wait(waitCell, 0, 0, 10);
+    }
   }
 }
 
@@ -141,8 +167,9 @@ function ensureSafeSidecarFile(filePath) {
   if (process.platform !== "win32" && (stats.mode & 0o077) !== 0) fs.chmodSync(filePath, 0o600);
 }
 
-function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, processInstanceId = crypto.randomUUID(), processId = process.pid }) {
-  if (!Number.isSafeInteger(perAccountBytes) || perAccountBytes <= 0 || !Number.isSafeInteger(systemBytes) || systemBytes <= 0 || perAccountBytes > systemBytes) {
+function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAccountEntries, systemEntries, processInstanceId = crypto.randomUUID(), processId = process.pid }) {
+  if (!Number.isSafeInteger(perAccountBytes) || perAccountBytes <= 0 || !Number.isSafeInteger(systemBytes) || systemBytes <= 0 || perAccountBytes > systemBytes ||
+      !Number.isSafeInteger(perAccountEntries) || perAccountEntries <= 0 || !Number.isSafeInteger(systemEntries) || systemEntries <= 0 || perAccountEntries > systemEntries) {
     throw new TypeError("Invalid chunk upload quota limits");
   }
   const resolvedRoot = path.resolve(rootDir);
@@ -160,7 +187,7 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
   const database = new Database(databasePath, { timeout: BUSY_TIMEOUT_MS });
   try {
     database.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
-    database.pragma("journal_mode = WAL");
+    enableChunkQuotaWal(database);
     database.pragma("synchronous = FULL");
     database.pragma("foreign_keys = ON");
     const integrity = database.pragma("integrity_check", { simple: true });
@@ -195,6 +222,13 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
         account_key TEXT PRIMARY KEY,
         charge_bytes INTEGER NOT NULL CHECK (charge_bytes >= 0)
       );
+      CREATE TABLE IF NOT EXISTS quota_sessions (
+        session_key TEXT PRIMARY KEY,
+        account_key TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS quota_sessions_account ON quota_sessions(account_key);
     `)).immediate();
     const insert = database.prepare(`
       INSERT INTO quota_operations (
@@ -206,6 +240,8 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
     const selectOperationByPath = database.prepare("SELECT * FROM quota_operations WHERE relative_path = ?");
     const selectAllOperations = database.prepare("SELECT * FROM quota_operations ORDER BY operation_id");
     const selectSessionOperations = database.prepare("SELECT * FROM quota_operations WHERE session_key = ?");
+    const selectQuotaSession = database.prepare("SELECT * FROM quota_sessions WHERE session_key = ?");
+    const selectAllQuotaSessions = database.prepare("SELECT * FROM quota_sessions ORDER BY session_key");
     const selectActiveHandoff = database.prepare("SELECT 1 FROM quota_operations WHERE session_key = ? AND state IN ('handoff_pending', 'handoff_published', 'handed_off') LIMIT 1");
     const selectSystemUsage = database.prepare("SELECT value FROM quota_meta WHERE key = 'system_charge_bytes'");
     const selectAccountUsage = database.prepare("SELECT charge_bytes FROM quota_usage WHERE account_key = ?");
@@ -224,12 +260,49 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
     `);
     const deleteOperation = database.prepare("DELETE FROM quota_operations WHERE operation_id = ?");
     const deleteSessionOperations = database.prepare("DELETE FROM quota_operations WHERE session_key = ?");
+    const insertQuotaSession = database.prepare("INSERT INTO quota_sessions(session_key, account_key, created_at, updated_at) VALUES (?, ?, ?, ?)");
+    const deleteQuotaSession = database.prepare("DELETE FROM quota_sessions WHERE session_key = ?");
+    const countSystemEntries = database.prepare("SELECT (SELECT COUNT(*) FROM quota_operations) + (SELECT COUNT(*) FROM quota_sessions) AS entries");
+    const countAccountEntries = database.prepare("SELECT (SELECT COUNT(*) FROM quota_operations WHERE account_key = ?) + (SELECT COUNT(*) FROM quota_sessions WHERE account_key = ?) AS entries");
+    const selectAccountEntryTotals = database.prepare("SELECT account_key, COUNT(*) AS entries FROM (SELECT account_key FROM quota_operations UNION ALL SELECT account_key FROM quota_sessions) GROUP BY account_key ORDER BY account_key");
     const deleteAllUsage = database.prepare("DELETE FROM quota_usage");
     const deleteAccountUsage = database.prepare("DELETE FROM quota_usage WHERE account_key = ?");
     const setQuotaMetaValue = database.prepare("INSERT INTO quota_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
     const setAccountUsage = database.prepare("INSERT INTO quota_usage(account_key, charge_bytes) VALUES (?, ?) ON CONFLICT(account_key) DO UPDATE SET charge_bytes = excluded.charge_bytes");
     const totalSystem = database.prepare("SELECT COALESCE(SUM(charge_bytes), 0) AS bytes FROM quota_operations");
     const totalAccount = database.prepare("SELECT COALESCE(SUM(charge_bytes), 0) AS bytes FROM quota_operations WHERE account_key = ?");
+
+    const normalizeSessionKey = (sessionKey) => {
+      if (typeof sessionKey !== "string") throw new TypeError("Invalid chunk quota session identity");
+      const parts = sessionKey.split(/[\\/]/);
+      if (parts.length !== 2 || parts.some((part) => !/^[a-zA-Z0-9_-]{1,80}$/.test(part))) throw new TypeError("Invalid chunk quota session identity");
+      return parts.join("/");
+    };
+    const getSystemEntries = () => safeByteCount(countSystemEntries.get().entries);
+    const getAccountEntries = (accountKey) => safeByteCount(countAccountEntries.get(accountKey, accountKey).entries);
+    const throwEntryQuotaExceeded = () => {
+      const error = new Error("Chunk upload entry quota exceeded");
+      error.code = "CHUNK_QUOTA_EXCEEDED";
+      throw error;
+    };
+    const registerSessionInTransaction = (sessionKey, accountKey) => {
+      const normalizedSession = normalizeSessionKey(sessionKey);
+      const existing = selectQuotaSession.get(normalizedSession);
+      if (existing) {
+        if (existing.account_key !== accountKey) {
+          const error = new Error("Chunk quota session has conflicting owners");
+          error.code = "CHUNK_QUOTA_SESSION_OWNER_MISMATCH";
+          throw error;
+        }
+        return false;
+      }
+      if (getSystemEntries() >= systemEntries || getAccountEntries(accountKey) >= perAccountEntries) throwEntryQuotaExceeded();
+      const now = Date.now();
+      insertQuotaSession.run(normalizedSession, accountKey, now, now);
+      return true;
+    };
+    const entryCapacityExceeded = () => getSystemEntries() > systemEntries ||
+      selectAccountEntryTotals.all().some((row) => safeByteCount(row.entries) > perAccountEntries);
 
     const readUsageNumber = (value, label) => {
       if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) throw new Error(`Invalid chunk quota ${label}`);
@@ -258,6 +331,8 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
     const reserveTransaction = database.transaction((operation) => {
       const ready = database.prepare("SELECT value FROM quota_meta WHERE key = 'ready'").get();
       if (ready?.value !== "1") throw new Error("Chunk quota ledger is not ready");
+      if (operation.sessionKey) registerSessionInTransaction(operation.sessionKey, operation.accountKey);
+      if (getSystemEntries() >= systemEntries || getAccountEntries(operation.accountKey) >= perAccountEntries) throwEntryQuotaExceeded();
       const systemTotal = getSystemUsage();
       const accountTotal = getAccountUsage(operation.accountKey);
       if (operation.chargeBytes > systemBytes - systemTotal || operation.chargeBytes > perAccountBytes - accountTotal) {
@@ -278,6 +353,11 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
       if (ready?.value !== "1") throw new Error("Chunk quota ledger is not ready");
       const previous = selectOperation.get(operation.operationId);
       if (!previous) throw new Error("Unknown chunk quota operation");
+      const nextSessionKey = operation.sessionKey === undefined
+        ? previous.session_key
+        : normalizeSessionKey(operation.sessionKey);
+      if (previous.session_key && nextSessionKey !== previous.session_key) throw new Error("Chunk quota operation cannot change sessions");
+      if (nextSessionKey) registerSessionInTransaction(nextSessionKey, previous.account_key);
       const previousCharge = safeByteCount(previous.charge_bytes);
       const systemTotal = getSystemUsage();
       const accountTotal = getAccountUsage(previous.account_key);
@@ -290,7 +370,7 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
         throw error;
       }
       updateOperation.run(
-        operation.sessionKey ?? previous.session_key,
+        nextSessionKey,
         operation.relativePath ?? previous.relative_path,
         operation.state,
         operation.chargeBytes,
@@ -312,24 +392,46 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
       const accountTotals = selectSessionUsageTotals.all(sessionKey);
       const deleted = deleteSessionOperations.run(sessionKey).changes;
       for (const row of accountTotals) adjustUsage(row.account_key, -safeByteCount(row.bytes), { removeIfUnused: true });
+      deleteQuotaSession.run(sessionKey);
       return deleted;
+    });
+    const releaseSessionOperationsTransaction = database.transaction((sessionKey) => {
+      const accountTotals = selectSessionUsageTotals.all(sessionKey);
+      const deleted = deleteSessionOperations.run(sessionKey).changes;
+      for (const row of accountTotals) adjustUsage(row.account_key, -safeByteCount(row.bytes), { removeIfUnused: true });
+      return deleted;
+    });
+    const registerSessionsTransaction = database.transaction((sessions) => {
+      const ready = database.prepare("SELECT value FROM quota_meta WHERE key = 'ready'").get();
+      if (ready?.value !== "1") throw new Error("Chunk quota ledger is not ready");
+      for (const session of sessions) {
+        if (!session || typeof session !== "object") throw new TypeError("Invalid chunk quota session import");
+        registerSessionInTransaction(session.sessionKey, canonicalAccountKey(session.accountKey));
+      }
+      return sessions.length;
     });
     const totalsTransaction = database.transaction(() => {
       const systemBytes = safeByteCount(totalSystem.get().bytes);
       const accounts = Object.fromEntries(database.prepare("SELECT account_key, SUM(charge_bytes) AS bytes FROM quota_operations GROUP BY account_key ORDER BY account_key").all().map((row) => [row.account_key, safeByteCount(row.bytes)]));
       return { systemBytes, accounts };
     });
+    const entryTotalsTransaction = database.transaction(() => {
+      const systemEntries = getSystemEntries();
+      const accounts = Object.fromEntries(selectAccountEntryTotals.all().map((row) => [row.account_key, safeByteCount(row.entries)]));
+      return { systemEntries, accounts };
+    });
     const migrateUsageTransaction = database.transaction(() => {
       const version = database.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get();
       const ready = database.prepare("SELECT value FROM quota_meta WHERE key = 'ready'").get();
       if (!version) {
         if (ready?.value === "1") throw new Error("Chunk quota schema version is missing");
-        return;
+        return false;
       }
-      if (!["1", "2"].includes(version.value)) throw new Error("Unsupported chunk quota schema version");
+      if (!["1", "2", "3"].includes(version.value)) throw new Error("Unsupported chunk quota schema version");
       if (ready && !["0", "1"].includes(ready.value)) throw new Error("Invalid chunk quota readiness marker");
 
-      if (version.value === "1") {
+      let schemaVersion = version.value;
+      if (schemaVersion === "1") {
         if (ready?.value === "1") {
           deleteAllUsage.run();
           for (const row of selectAccountUsageTotals.all()) setAccountUsage.run(row.account_key, safeByteCount(row.bytes));
@@ -337,7 +439,7 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
           setQuotaMetaValue.run("usage_version", "1");
         }
         setQuotaMetaValue.run("schema_version", "2");
-        return;
+        schemaVersion = "2";
       }
 
       if (ready?.value === "1") {
@@ -348,30 +450,75 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
         const actual = selectAllUsage.all().map((row) => [row.account_key, safeByteCount(row.charge_bytes)]);
         if (JSON.stringify(expected) !== JSON.stringify(actual)) throw new Error("Chunk quota account usage does not match its ledger");
       }
+
+      if (schemaVersion === "2") {
+        const sessions = database.prepare(`
+          SELECT session_key, MIN(account_key) AS account_key, COUNT(DISTINCT account_key) AS account_count
+          FROM quota_operations
+          WHERE session_key IS NOT NULL
+          GROUP BY session_key
+          ORDER BY session_key
+        `).all();
+        for (const session of sessions) {
+          if (safeByteCount(session.account_count) !== 1) throw new Error("Chunk quota session has conflicting owners");
+          const existing = selectQuotaSession.get(session.session_key);
+          if (existing && existing.account_key !== session.account_key) throw new Error("Chunk quota session has conflicting owners");
+          if (!existing) insertQuotaSession.run(session.session_key, session.account_key, Date.now(), Date.now());
+        }
+        setQuotaMetaValue.run("schema_version", "3");
+        schemaVersion = "3";
+      }
+
+      if (schemaVersion === "3") {
+        const missingSession = database.prepare(`
+          SELECT 1 FROM quota_operations operations
+          LEFT JOIN quota_sessions sessions ON sessions.session_key = operations.session_key
+          WHERE operations.session_key IS NOT NULL AND (sessions.session_key IS NULL OR sessions.account_key <> operations.account_key)
+          LIMIT 1
+        `).get();
+        if (missingSession) throw new Error("Chunk quota session entries do not match the operation ledger");
+        return entryCapacityExceeded();
+      }
+      return false;
     });
-    const initializeTransaction = database.transaction((importOperations = []) => {
+    const initializeTransaction = database.transaction((importOperations = [], importSessions = []) => {
       const version = database.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get();
-      if (version && version.value !== "2") throw new Error("Unsupported chunk quota schema version");
+      if (version && version.value !== "3") throw new Error("Unsupported chunk quota schema version");
       const ready = database.prepare("SELECT value FROM quota_meta WHERE key = 'ready'").get();
-      if (ready?.value === "1") return { alreadyReady: true };
+      if (ready?.value === "1") return { alreadyReady: true, entryCapacityExceeded: entryCapacityExceeded() };
       if (ready && ready.value !== "0") throw new Error("Invalid chunk quota readiness marker");
-      setQuotaMetaValue.run("schema_version", "2");
+      setQuotaMetaValue.run("schema_version", "3");
       setQuotaMetaValue.run("ready", "0");
       setQuotaMetaValue.run("system_charge_bytes", "0");
       deleteAllUsage.run();
+      const importedSessions = new Map();
+      for (const session of importSessions) {
+        if (!session || typeof session !== "object") throw new TypeError("Invalid chunk quota session import");
+        const sessionKey = normalizeSessionKey(session.sessionKey);
+        const accountKey = canonicalAccountKey(session.accountKey);
+        const previous = importedSessions.get(sessionKey);
+        if (previous && previous !== accountKey) throw new Error("Chunk quota session has conflicting owners");
+        importedSessions.set(sessionKey, accountKey);
+      }
       for (const operation of importOperations) {
         const normalized = {
           operationId: operation.operationId,
           accountKey: canonicalAccountKey(operation.accountKey),
-          sessionKey: operation.sessionKey ?? null,
+          sessionKey: operation.sessionKey == null ? null : normalizeSessionKey(operation.sessionKey),
           relativePath: validateRelativePath(operation.relativePath),
           state: operation.state,
           chargeBytes: safeByteCount(operation.chargeBytes),
         };
         if (!/^[a-zA-Z0-9_-]{1,120}$/.test(normalized.operationId) || !STATES.has(normalized.state)) throw new Error("Invalid imported chunk quota operation");
+        if (normalized.sessionKey) {
+          const previous = importedSessions.get(normalized.sessionKey);
+          if (previous && previous !== normalized.accountKey) throw new Error("Chunk quota session has conflicting owners");
+          importedSessions.set(normalized.sessionKey, normalized.accountKey);
+        }
         const now = Date.now();
         insert.run(normalized.operationId, normalized.accountKey, normalized.sessionKey, normalized.relativePath, normalized.state, normalized.chargeBytes, processInstanceId, processId, now, now);
       }
+      for (const [sessionKey, accountKey] of importedSessions) registerSessionInTransaction(sessionKey, accountKey);
       const importedSystemBytes = safeByteCount(totalSystem.get().bytes);
       const importedAccounts = database.prepare("SELECT account_key, SUM(charge_bytes) AS bytes FROM quota_operations GROUP BY account_key").all();
       if (importedSystemBytes > systemBytes || importedAccounts.some((row) => safeByteCount(row.bytes) > perAccountBytes)) {
@@ -380,15 +527,20 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
       for (const row of importedAccounts) setAccountUsage.run(row.account_key, safeByteCount(row.bytes));
       setQuotaMetaValue.run("system_charge_bytes", String(importedSystemBytes));
       setQuotaMetaValue.run("usage_version", "1");
+      const hasEntryCapacityExceeded = entryCapacityExceeded();
       setQuotaMetaValue.run("ready", "1");
-      return { alreadyReady: false };
+      return { alreadyReady: false, entryCapacityExceeded: hasEntryCapacityExceeded };
+    });
+    const initializeAndMigrateTransaction = database.transaction((importOperations, importSessions) => {
+      const migrationEntryCapacityExceeded = migrateUsageTransaction();
+      const result = initializeTransaction(importOperations, importSessions);
+      return { ...result, entryCapacityExceeded: result.entryCapacityExceeded || migrationEntryCapacityExceeded };
     });
 
     const service = {
-      initialize(importOperations = []) {
-        if (!Array.isArray(importOperations)) throw new TypeError("Invalid chunk quota import");
-        migrateUsageTransaction.immediate();
-        return initializeTransaction.immediate(importOperations);
+      initialize(importOperations = [], importSessions = []) {
+        if (!Array.isArray(importOperations) || !Array.isArray(importSessions)) throw new TypeError("Invalid chunk quota import");
+        return initializeAndMigrateTransaction.immediate(importOperations, importSessions);
       },
       isReady() {
         const ready = database.prepare("SELECT value FROM quota_meta WHERE key = 'ready'").get();
@@ -409,8 +561,8 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
         }));
       },
       operationsForSession(sessionKey) {
-        if (typeof sessionKey !== "string" || !sessionKey) throw new TypeError("Invalid chunk quota session identity");
-        return selectSessionOperations.all(sessionKey).map((row) => ({
+        const normalizedSessionKey = normalizeSessionKey(sessionKey);
+        return selectSessionOperations.all(normalizedSessionKey).map((row) => ({
           operationId: row.operation_id,
           accountKey: row.account_key,
           sessionKey: row.session_key,
@@ -424,8 +576,7 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
         }));
       },
       hasActiveHandoff(sessionKey) {
-        if (typeof sessionKey !== "string" || !sessionKey) throw new TypeError("Invalid chunk quota session identity");
-        return Boolean(selectActiveHandoff.get(sessionKey));
+        return Boolean(selectActiveHandoff.get(normalizeSessionKey(sessionKey)));
       },
       isCurrentOwner(operation) {
         return Boolean(operation && operation.ownerPid === processId && operation.ownerInstanceId === processInstanceId);
@@ -470,15 +621,16 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
       },
       reserve({ operationId = crypto.randomUUID(), accountKey, sessionKey = null, relativePath, reservedBytes, allowZeroBytes = false }) {
         const normalizedAccount = canonicalAccountKey(accountKey);
+        const normalizedSession = sessionKey == null ? null : normalizeSessionKey(sessionKey);
         if (typeof operationId !== "string" || !operationId || !Number.isSafeInteger(reservedBytes) || reservedBytes < 0 || (reservedBytes === 0 && allowZeroBytes !== true)) {
           throw new TypeError("Invalid chunk quota reservation");
         }
-        reserveTransaction.immediate({ operationId, accountKey: normalizedAccount, sessionKey, relativePath: validateRelativePath(relativePath), state: "reserved", chargeBytes: reservedBytes });
+        reserveTransaction.immediate({ operationId, accountKey: normalizedAccount, sessionKey: normalizedSession, relativePath: validateRelativePath(relativePath), state: "reserved", chargeBytes: reservedBytes });
         return operationId;
       },
       transition({ operationId, state, chargeBytes, sessionKey, relativePath }) {
         if (!STATES.has(state) || !Number.isSafeInteger(chargeBytes) || chargeBytes < 0) throw new TypeError("Invalid chunk quota transition");
-        transitionTransaction.immediate({ operationId, state, chargeBytes, sessionKey, relativePath: relativePath === undefined ? undefined : validateRelativePath(relativePath) });
+        transitionTransaction.immediate({ operationId, state, chargeBytes, sessionKey: sessionKey === undefined ? undefined : normalizeSessionKey(sessionKey), relativePath: relativePath === undefined ? undefined : validateRelativePath(relativePath) });
       },
       operationForPath(relativePath) {
         const rows = selectOperationByPath.all(validateRelativePath(relativePath));
@@ -490,11 +642,31 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, process
         return releaseTransaction.immediate(operationId);
       },
       releaseSession(sessionKey) {
-        if (typeof sessionKey !== "string" || !sessionKey) throw new TypeError("Invalid chunk quota session identity");
-        return releaseSessionTransaction.immediate(sessionKey);
+        return releaseSessionTransaction.immediate(normalizeSessionKey(sessionKey));
+      },
+      releaseSessionOperations(sessionKey) {
+        return releaseSessionOperationsTransaction.immediate(normalizeSessionKey(sessionKey));
+      },
+      registerSession({ sessionKey, accountKey }) {
+        return registerSessionsTransaction.immediate([{ sessionKey, accountKey }]);
+      },
+      registerSessions(sessions) {
+        if (!Array.isArray(sessions)) throw new TypeError("Invalid chunk quota session import");
+        return registerSessionsTransaction.immediate(sessions);
+      },
+      sessions() {
+        return selectAllQuotaSessions.all().map((row) => ({
+          sessionKey: row.session_key,
+          accountKey: row.account_key,
+          createdAt: Number(row.created_at),
+          updatedAt: Number(row.updated_at),
+        }));
       },
       totals() {
         return totalsTransaction.immediate();
+      },
+      entryTotals() {
+        return entryTotalsTransaction.immediate();
       },
       close() {
         database.close();

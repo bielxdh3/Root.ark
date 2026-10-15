@@ -180,6 +180,7 @@ const CHUNK_UPLOAD_QUOTA_OPERATION_ID = Symbol("rootarkChunkUploadQuotaOperation
 const CHUNK_UPLOAD_QUOTA_ASSEMBLY_ID = Symbol("rootarkChunkUploadQuotaAssemblyId");
 const CHUNK_UPLOAD_QUOTA_BACKUP_ID = Symbol("rootarkChunkUploadQuotaBackupId");
 const CHUNK_UPLOAD_QUOTA_BACKUP_PATH = Symbol("rootarkChunkUploadQuotaBackupPath");
+const CHUNK_UPLOAD_UNATTRIBUTED_ACCOUNT_KEY = "__unattributed_session__";
 const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
 const UPLOAD_STAGING_PATH = Symbol("rootarkUploadStagingPath");
 const MAX_UPLOAD_CHUNKS = 2000;
@@ -494,6 +495,15 @@ function runChunkUploadSessionLock(sessionDir, work) {
   const sessionKey = path.relative(CHUNK_UPLOAD_DIR, sessionDir).split(path.sep).join("/");
   return cloudFileLifecycleLock.runFolder(localIdentity, () => {
     if (!chunkUploadQuota) throw new Error("Chunk upload quota ledger is unavailable");
+    return chunkUploadQuota.withSessionLock(sessionKey, work);
+  });
+}
+
+function runChunkUploadCleanupSessionLock(sessionDir, work) {
+  const localIdentity = `chunk-upload:${getChunkUploadSessionLockIdentity(sessionDir)}`;
+  const sessionKey = path.relative(CHUNK_UPLOAD_DIR, sessionDir).split(path.sep).join("/");
+  return cloudFileLifecycleLock.runFolder(localIdentity, () => {
+    if (!chunkUploadQuota) return work();
     return chunkUploadQuota.withSessionLock(sessionKey, work);
   });
 }
@@ -6377,9 +6387,11 @@ function removeChunkSessionAfterQuotaHandoff(sessionDir, folderId, uploadId, han
     fs.unlinkSync(partPath);
     if (!chunkUploadQuota.release(operation.operationId)) throw new Error("Unable to release handed-off chunk part");
   }
+  const handoff = chunkUploadQuota.operationsForSession(`${folderId}/${uploadId}`).find((operation) => operation.state === "handed_off");
+  if (!handoff || handoff.operationId !== handoffOperationId) throw new Error("Handed-off session marker is unavailable");
   fs.unlinkSync(path.join(sessionDir, "metadata.json"));
   fs.rmdirSync(sessionDir);
-  if (!chunkUploadQuota.release(handoffOperationId)) throw new Error("Unable to release handed-off assembly marker");
+  if (chunkUploadQuota.releaseSession(`${folderId}/${uploadId}`) !== 1) throw new Error("Unable to release handed-off assembly marker");
 }
 
 function getChunkAssemblySizeIfCompleting(sessionDir, totalChunks, incomingIndex, incomingSize, accountKey, sessionKey) {
@@ -7369,7 +7381,13 @@ function assertSafeChunkStorageRoot() {
   assertChunkStorageDirectory(tempPath, expectedTempPath);
   const expectedChunkPath = path.join(expectedTempPath, ".chunks");
   assertChunkStorageDirectory(CHUNK_UPLOAD_DIR, expectedChunkPath);
-  assertChunkStorageDirectory(CHUNK_UPLOAD_INCOMING_DIR, path.join(expectedChunkPath, "incoming"));
+  let incomingExists = true;
+  try { fs.lstatSync(CHUNK_UPLOAD_INCOMING_DIR); }
+  catch (error) {
+    if (error.code !== "ENOENT" || chunkUploadQuota) throw error;
+    incomingExists = false;
+  }
+  if (incomingExists) assertChunkStorageDirectory(CHUNK_UPLOAD_INCOMING_DIR, path.join(expectedChunkPath, "incoming"));
   if (process.platform !== "win32") assertSafeChunkUploadAncestors(CHUNK_UPLOAD_INCOMING_DIR);
 }
 
@@ -7383,12 +7401,21 @@ function initializeChunkUploadQuota() {
       rootDir: CHUNK_UPLOAD_DIR,
       perAccountBytes: CHUNK_UPLOAD_QUOTA_CONFIG.perAccountBytes,
       systemBytes: CHUNK_UPLOAD_QUOTA_CONFIG.systemBytes,
+      perAccountEntries: CHUNK_UPLOAD_QUOTA_CONFIG.perAccountEntries,
+      systemEntries: CHUNK_UPLOAD_QUOTA_CONFIG.systemEntries,
     });
     if (process.platform === "win32") {
       ensureSafeChunkStorageDirectory(CHUNK_UPLOAD_INCOMING_DIR, path.join(CHUNK_UPLOAD_DIR, "incoming"));
       assertSafeChunkStorageRoot();
     }
-    if (!chunkUploadQuota.isReady()) chunkUploadQuota.initialize(readLegacyChunkQuotaOperations());
+    const ledgerWasReady = chunkUploadQuota.isReady();
+    const legacyState = readLegacyChunkQuotaOperations({ includeOperations: !ledgerWasReady });
+    const initialization = chunkUploadQuota.initialize(legacyState.operations, legacyState.sessions);
+    if (initialization.entryCapacityExceeded) {
+      console.error("[chunk-upload] existing entries exceed configured limits; new reservations remain blocked until cleanup reduces usage");
+    }
+    const knownSessions = new Set(chunkUploadQuota.sessions().map((session) => session.sessionKey));
+    chunkUploadQuota.registerSessions(legacyState.sessions.filter((session) => !knownSessions.has(session.sessionKey)));
     if (!chunkUploadQuota.isReady()) throw new Error("Chunk quota ledger readiness was not committed");
     recoverDeadChunkQuotaOperations();
     assertChunkQuotaFilesystemTracked();
@@ -7400,8 +7427,9 @@ function initializeChunkUploadQuota() {
   }
 }
 
-function readLegacyChunkQuotaOperations() {
+function readLegacyChunkQuotaOperations({ includeOperations = true } = {}) {
   const rows = [];
+  const sessions = new Map();
   const rootEntries = fs.readdirSync(CHUNK_UPLOAD_DIR, { withFileTypes: true }).sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
   const knownFiles = new Set(["incoming", ".quota.sqlite", ".quota.sqlite-journal", ".quota.sqlite-wal", ".quota.sqlite-shm"]);
   const directoriesToSecure = new Map();
@@ -7442,13 +7470,20 @@ function readLegacyChunkQuotaOperations() {
       const sessionPath = path.join(folderPath, sessionEntry.name);
       rememberDirectory(sessionPath);
       const entries = fs.readdirSync(sessionPath, { withFileTypes: true });
-      if (!entries.length) continue;
+      const sessionKey = `${entry.name}/${sessionEntry.name}`;
+      if (!entries.length) {
+        const existingOperation = chunkUploadQuota?.operationsForSession(sessionKey)[0];
+        sessions.set(sessionKey, existingOperation?.accountKey || CHUNK_UPLOAD_UNATTRIBUTED_ACCOUNT_KEY);
+        continue;
+      }
       const metadataPath = path.join(sessionPath, "metadata.json");
       const metadataFile = readChunkMetadataFile(metadataPath);
       if (!metadataFile || metadataFile.links !== 1n) throw new Error("Unsafe chunk session metadata");
       rememberFile(metadataPath, metadataFile.links, metadataFile);
       const metadata = JSON.parse(metadataFile.contents);
       if (isChunkSessionExpiredMarker(metadata)) {
+        const existingOperation = chunkUploadQuota?.operationsForSession(sessionKey)[0];
+        sessions.set(sessionKey, existingOperation?.accountKey || CHUNK_UPLOAD_UNATTRIBUTED_ACCOUNT_KEY);
         if (!chunkSessionEntriesAreSafe(entries)) throw new Error("Unsafe expired chunk tombstone contents");
         for (const part of entries) {
           if (part.name === "metadata.json") continue;
@@ -7462,6 +7497,7 @@ function readLegacyChunkQuotaOperations() {
       const valid = isValidChunkSessionMetadata(metadata, sessionEntry.name, entry.name) || isValidLegacyChunkSessionMetadata(metadata, sessionEntry.name, entry.name);
       if (!valid || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unattributable legacy chunk session");
       if (!metadata.uploadedBy || typeof metadata.uploadedBy !== "string") throw new Error("Unattributable legacy chunk owner");
+      sessions.set(sessionKey, metadata.uploadedBy);
       for (const part of entries) {
         if (part.name === "metadata.json") continue;
         const partPath = path.join(sessionPath, part.name);
@@ -7471,67 +7507,73 @@ function readLegacyChunkQuotaOperations() {
         if (identity.size !== stats.size) throw new Error("Legacy chunk part changed during validation");
         const relativePath = path.relative(CHUNK_UPLOAD_DIR, partPath);
         const operationId = crypto.createHash("sha256").update(`legacy:${relativePath}`).digest("hex");
-        rows.push({
-          operationId,
-          accountKey: metadata.uploadedBy,
-          sessionKey: `${entry.name}/${sessionEntry.name}`,
-          relativePath,
-          state: "part_committed",
-          chargeBytes: Number(stats.size),
-        });
+        if (includeOperations) {
+          rows.push({
+            operationId,
+            accountKey: metadata.uploadedBy,
+            sessionKey: `${entry.name}/${sessionEntry.name}`,
+            relativePath,
+            state: "part_committed",
+            chargeBytes: Number(stats.size),
+          });
+        }
       }
     }
   }
-  const incomingEntries = fs.readdirSync(CHUNK_UPLOAD_INCOMING_DIR, { withFileTypes: true });
-  if (incomingEntries.length) throw new Error("Untracked legacy incoming chunk files");
+  if (includeOperations) {
+    const incomingEntries = fs.readdirSync(CHUNK_UPLOAD_INCOMING_DIR, { withFileTypes: true });
+    if (incomingEntries.length) throw new Error("Untracked legacy incoming chunk files");
+  }
 
   // Revalidate every deferred mutation target before changing any existing
   // session. An invalid later session must leave earlier sessions untouched.
-  for (const directory of directoriesToSecure.values()) {
-    assertSafeChunkSessionDirectory(directory.path, { repairPermissions: false });
-    const stats = fs.lstatSync(directory.path, { bigint: true });
-    if (stats.isSymbolicLink() || !stats.isDirectory() || stats.dev !== directory.dev || stats.ino !== directory.ino) {
-      throw new Error("Legacy chunk session directory changed before finalization");
-    }
-  }
-  for (const file of filesToSecure.values()) {
-    const stats = fs.lstatSync(file.path, { bigint: true });
-    if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1n || stats.dev !== file.dev || stats.ino !== file.ino) {
-      throw new Error("Legacy chunk session file changed before finalization");
-    }
-  }
-  for (const part of expiredPartsToRemove.values()) {
-    const stats = fs.lstatSync(part.path, { bigint: true });
-    if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1n || stats.dev !== part.dev || stats.ino !== part.ino) {
-      throw new Error("Expired legacy chunk part changed before cleanup");
-    }
-  }
-
-  for (const directory of directoriesToSecure.values()) assertSafeChunkSessionDirectory(directory.path);
-  if (process.platform !== "win32") {
-    for (const file of filesToSecure.values()) {
-      const descriptor = fs.openSync(file.path, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-      try {
-        const stats = fs.fstatSync(descriptor, { bigint: true });
-        if (!stats.isFile() || stats.nlink !== 1n || stats.dev !== file.dev || stats.ino !== file.ino) {
-          throw new Error("Legacy chunk session file changed before permission repair");
-        }
-        fs.fchmodSync(descriptor, 0o600);
-      } finally {
-        fs.closeSync(descriptor);
+  if (includeOperations) {
+    for (const directory of directoriesToSecure.values()) {
+      assertSafeChunkSessionDirectory(directory.path, { repairPermissions: false });
+      const stats = fs.lstatSync(directory.path, { bigint: true });
+      if (stats.isSymbolicLink() || !stats.isDirectory() || stats.dev !== directory.dev || stats.ino !== directory.ino) {
+        throw new Error("Legacy chunk session directory changed before finalization");
       }
     }
-  }
-  // Expired tombstones are durable cleanup intent. Delete their validated
-  // numbered parts only after the complete legacy tree has passed validation.
-  for (const part of expiredPartsToRemove.values()) {
-    const stats = fs.lstatSync(part.path, { bigint: true });
-    if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1n || stats.dev !== part.dev || stats.ino !== part.ino) {
-      throw new Error("Expired legacy chunk part changed before cleanup");
+    for (const file of filesToSecure.values()) {
+      const stats = fs.lstatSync(file.path, { bigint: true });
+      if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1n || stats.dev !== file.dev || stats.ino !== file.ino) {
+        throw new Error("Legacy chunk session file changed before finalization");
+      }
     }
-    fs.unlinkSync(part.path);
+    for (const part of expiredPartsToRemove.values()) {
+      const stats = fs.lstatSync(part.path, { bigint: true });
+      if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1n || stats.dev !== part.dev || stats.ino !== part.ino) {
+        throw new Error("Expired legacy chunk part changed before cleanup");
+      }
+    }
+
+    for (const directory of directoriesToSecure.values()) assertSafeChunkSessionDirectory(directory.path);
+    if (process.platform !== "win32") {
+      for (const file of filesToSecure.values()) {
+        const descriptor = fs.openSync(file.path, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+        try {
+          const stats = fs.fstatSync(descriptor, { bigint: true });
+          if (!stats.isFile() || stats.nlink !== 1n || stats.dev !== file.dev || stats.ino !== file.ino) {
+            throw new Error("Legacy chunk session file changed before permission repair");
+          }
+          fs.fchmodSync(descriptor, 0o600);
+        } finally {
+          fs.closeSync(descriptor);
+        }
+      }
+    }
+    // Expired tombstones are durable cleanup intent. Delete their validated
+    // numbered parts only after the complete legacy tree has passed validation.
+    for (const part of expiredPartsToRemove.values()) {
+      const stats = fs.lstatSync(part.path, { bigint: true });
+      if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1n || stats.dev !== part.dev || stats.ino !== part.ino) {
+        throw new Error("Expired legacy chunk part changed before cleanup");
+      }
+      fs.unlinkSync(part.path);
+    }
   }
-  return rows;
+  return { operations: rows, sessions: [...sessions].map(([sessionKey, accountKey]) => ({ sessionKey, accountKey })) };
 }
 
 function chunkQuotaOwnerIsAlive(pid) {
@@ -7671,8 +7713,13 @@ function validateChunkQuotaOperationsBeforeRecovery(operations) {
     }
     if (sessionStats.isSymbolicLink() || !sessionStats.isDirectory()) throw new Error("Unsafe chunk quota session directory");
     assertSafeChunkSessionDirectory(sessionDir, { repairPermissions: false });
+    const sessionEntries = fs.readdirSync(sessionDir, { withFileTypes: true });
     const metadataFile = readChunkMetadataFile(path.join(sessionDir, "metadata.json"));
-    if (!metadataFile || metadataFile.links !== 1n) throw new Error("Chunk quota session metadata is missing or unsafe");
+    if (!metadataFile) {
+      if (!sessionEntries.length && handoffRows.length === 1 && handoffRows[0].state === "handed_off" && sessionRows.length === 1) continue;
+      throw new Error("Chunk quota session metadata is missing or unsafe");
+    }
+    if (metadataFile.links !== 1n) throw new Error("Chunk quota session metadata is missing or unsafe");
     const metadata = JSON.parse(metadataFile.contents);
     if (isChunkSessionExpiredMarker(metadata)) {
       if (sessionRows.some((operation) => operation.state !== "part_committed")) {
@@ -7793,7 +7840,16 @@ function recoverChunkUploadHandoff(operation) {
   if (!fileName || path.basename(fileName) !== fileName || /[\\/]/.test(fileName)) throw new Error("Unsafe chunk handoff filename");
   const sessionDir = getChunkSessionDir(folderId, uploadId);
   assertSafeChunkSessionDirectory(sessionDir, { allowMissing: true });
-  if (!fs.existsSync(sessionDir) && operation.state === "handed_off") {
+  let sessionExists = true;
+  try { fs.lstatSync(sessionDir); }
+  catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    sessionExists = false;
+  }
+  const emptySessionAfterMetadataUnlink = sessionExists && fs.readdirSync(sessionDir).length === 0;
+  if ((!sessionExists || emptySessionAfterMetadataUnlink) && operation.state === "handed_off") {
+    const sessionOperations = chunkUploadQuota.operationsForSession(operation.sessionKey);
+    if (sessionOperations.length !== 1 || sessionOperations[0].operationId !== operation.operationId) throw new Error("Completed chunk handoff has unexpected session operations");
     const completedFolder = getFolderById(folderId);
     if (!completedFolder || !isFolderAvailable(folderId)) throw new Error("Completed chunk handoff folder is unavailable");
     const completedPaths = ensureFolderDirectories(folderId);
@@ -7801,7 +7857,11 @@ function recoverChunkUploadHandoff(operation) {
     const completedStats = inspectChunkQuotaFile(completedDestination);
     const completedPending = loadPendingUploads()[getPendingKey(folderId, fileName)];
     if (!completedStats || completedStats.size !== expectedSize || !completedPending || completedPending.folderId !== folderId || String(completedPending.uploadedBy || "").trim().toLowerCase() !== operation.accountKey) throw new Error("Completed chunk handoff cannot be confirmed");
-    if (!chunkUploadQuota.release(operation.operationId)) throw new Error("Unable to release completed handoff marker");
+    if (sessionExists) {
+      fs.rmdirSync(sessionDir);
+      if (fs.existsSync(sessionDir)) throw new Error("Empty chunk handoff session directory remains");
+    }
+    if (chunkUploadQuota.releaseSession(operation.sessionKey) !== 1) throw new Error("Unable to release completed handoff marker");
     return;
   }
   const metadataPath = path.join(sessionDir, "metadata.json");
@@ -7865,7 +7925,7 @@ function recoverChunkUploadHandoff(operation) {
     if (currentEntries.some((entry) => entry.name !== "metadata.json" || entry.isSymbolicLink() || !entry.isFile())) throw new Error("Unexpected chunk handoff session content");
     fs.unlinkSync(metadataPath);
     fs.rmdirSync(sessionDir);
-    if (!chunkUploadQuota.release(operation.operationId)) throw new Error("Unable to release handed-off assembly charge");
+    if (chunkUploadQuota.releaseSession(operation.sessionKey) !== 1) throw new Error("Unable to release handed-off assembly charge");
     return;
   }
   if (["handoff_pending", "handoff_published"].includes(operation.state) && destinationStats && !pending && !encryptedIntent && !cloudIntent && !sourceStats && destinationStats.size === expectedSize) {
@@ -7937,6 +7997,7 @@ function recoverChunkPartPromotion(operation) {
 
 function assertChunkQuotaFilesystemTracked() {
   const operations = chunkUploadQuota.operations();
+  const sessions = new Map(chunkUploadQuota.sessions().map((session) => [session.sessionKey, session]));
   const tracked = new Map(operations.map((operation) => [path.resolve(CHUNK_UPLOAD_DIR, operation.relativePath), operation]));
   for (const operation of operations) {
     if (operation.state !== "part_committed") continue;
@@ -7961,6 +8022,7 @@ function assertChunkQuotaFilesystemTracked() {
     for (const sessionEntry of fs.readdirSync(folderPath, { withFileTypes: true })) {
       if (sessionEntry.isSymbolicLink() || !sessionEntry.isDirectory() || !/^[a-zA-Z0-9_-]{1,80}$/.test(sessionEntry.name)) throw new Error("Unsafe chunk quota session entry");
       const sessionPath = path.join(folderPath, sessionEntry.name);
+      if (!sessions.has(`${entry.name}/${sessionEntry.name}`)) throw new Error("Untracked chunk quota session directory");
       for (const fileEntry of fs.readdirSync(sessionPath, { withFileTypes: true })) {
         const filePath = path.join(sessionPath, fileEntry.name);
         if (fileEntry.name === "metadata.json") {
@@ -8197,7 +8259,7 @@ function expireChunkSession(sessionDir, metadata, now = Date.now(), source = "sw
       if (entry.name === "metadata.json") continue;
       fs.unlinkSync(path.join(sessionDir, entry.name));
     }
-    if (chunkUploadQuota) chunkUploadQuota.releaseSession(`${metadata.folderId}/${metadata.uploadId}`);
+    if (chunkUploadQuota) chunkUploadQuota.releaseSessionOperations(`${metadata.folderId}/${metadata.uploadId}`);
     auditChunkSessionExpiry(metadata.uploadId, metadata.folderId, "success", source);
     return true;
   } catch (error) {
@@ -8213,12 +8275,13 @@ function cleanupChunkSessionExpiredMarker(sessionDir, metadata, now = Date.now()
   for (const entry of entries) {
     if (entry.name !== "metadata.json") fs.unlinkSync(path.join(sessionDir, entry.name));
   }
-  if (chunkUploadQuota) chunkUploadQuota.releaseSession(`${folderId}/${uploadId}`);
+  if (chunkUploadQuota) chunkUploadQuota.releaseSessionOperations(`${folderId}/${uploadId}`);
   if (hasLeftoverParts) auditChunkSessionExpiry(uploadId, folderId, "success", source);
   const expiredAt = Date.parse(metadata[CHUNK_UPLOAD_EXPIRED_METADATA_KEY]);
   if (now - expiredAt < CHUNK_UPLOAD_EXPIRED_TOMBSTONE_TTL_MS) return true;
   assertSafeChunkSessionDirectory(sessionDir);
   fs.rmSync(sessionDir, { recursive: true, force: false });
+  if (chunkUploadQuota) chunkUploadQuota.releaseSession(`${folderId}/${uploadId}`);
   return true;
 }
 
@@ -8410,6 +8473,7 @@ async function cleanupExpiredChunkSessions(now = Date.now()) {
       scannedEntries += 1;
       if (scannedEntries % 32 === 0) await new Promise((resolve) => setImmediate(resolve));
     };
+    const scannedSessionKeys = new Set();
     for (const folderEntry of folderEntries) {
       await yieldIfNeeded();
       if (folderEntry.name === "incoming" || folderEntry.isSymbolicLink() || !folderEntry.isDirectory() || !/^[a-zA-Z0-9_-]{1,80}$/.test(folderEntry.name)) continue;
@@ -8427,11 +8491,12 @@ async function cleanupExpiredChunkSessions(now = Date.now()) {
         await yieldIfNeeded();
         if (sessionEntry.isSymbolicLink() || !sessionEntry.isDirectory() || !/^[a-zA-Z0-9_-]{1,80}$/.test(sessionEntry.name)) continue;
         const sessionDir = path.join(folderPath, sessionEntry.name);
+        scannedSessionKeys.add(`${folderEntry.name}/${sessionEntry.name}`);
         try {
           const candidate = await readChunkExpiryCandidate(sessionDir, sessionEntry.name, folderEntry.name, now);
           if (!candidate) continue;
           if (!isChunkSessionExpired(candidate, now) && !isExpiredChunkSessionMarker(candidate, now) && !isChunkSessionExpiredMarker(candidate)) continue;
-          await runChunkUploadSessionLock(sessionDir, () => {
+          await runChunkUploadCleanupSessionLock(sessionDir, () => {
             try {
               assertSafeChunkSessionDirectory(sessionDir);
               const metadata = loadChunkMetadata(sessionDir, sessionEntry.name, folderEntry.name);
@@ -8467,8 +8532,35 @@ async function cleanupExpiredChunkSessions(now = Date.now()) {
         }
       }
     }
+    await releaseOrphanedChunkQuotaSessions(scannedSessionKeys);
   } finally {
     chunkSessionExpirySweepRunning = false;
+  }
+}
+
+async function releaseOrphanedChunkQuotaSessions(existingSessionKeys) {
+  if (!chunkUploadQuota) return;
+  for (const session of chunkUploadQuota.sessions()) {
+    if (existingSessionKeys.has(session.sessionKey)) continue;
+    const [folderId, uploadId] = session.sessionKey.split("/");
+    const sessionDir = getChunkSessionDir(folderId, uploadId);
+    if (!sessionDir) continue;
+    try {
+      await runChunkUploadCleanupSessionLock(sessionDir, () => {
+        try {
+          fs.lstatSync(sessionDir);
+          return;
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+        if (chunkUploadQuota.operationsForSession(session.sessionKey).length) return;
+        chunkUploadQuota.releaseSession(session.sessionKey);
+      });
+    } catch (error) {
+      if (error.code !== "FILE_LIFECYCLE_LOCK_TIMEOUT") {
+        console.error("[chunk-upload] orphaned session entry retained:", sanitizeLogValue(error.message));
+      }
+    }
   }
 }
 
@@ -8566,6 +8658,18 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
   }
   if (chunkUploadQuota.hasActiveHandoff(`${folderId}/${uploadId}`)) {
     removeAndReleaseChunkUploadIncoming(req);
+    return res.status(503).json({ error: "O armazenamento temporario de blocos esta indisponivel.", code: "CHUNK_QUOTA_UNAVAILABLE" });
+  }
+
+  try {
+    chunkUploadQuota.registerSession({ sessionKey: `${folderId}/${uploadId}`, accountKey: req.user.username });
+  } catch (error) {
+    removeAndReleaseChunkUploadIncoming(req);
+    if (error.code === "CHUNK_QUOTA_EXCEEDED") {
+      return res.status(507).json({ error: "Espaco temporario de upload insuficiente. Tente novamente depois que outros envios forem concluídos.", code: "CHUNK_QUOTA_EXCEEDED" });
+    }
+    if (error.code === "CHUNK_QUOTA_SESSION_OWNER_MISMATCH") return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
+    console.error("[chunk-upload] session reservation failed:", error.code || error.name || "operation_failed");
     return res.status(503).json({ error: "O armazenamento temporario de blocos esta indisponivel.", code: "CHUNK_QUOTA_UNAVAILABLE" });
   }
 

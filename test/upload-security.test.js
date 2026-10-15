@@ -10,7 +10,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
 const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
-const { createChunkUploadQuota } = require("../services/chunkUploadQuota");
+const { createChunkUploadQuota: createChunkUploadQuotaService } = require("../services/chunkUploadQuota");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -18,6 +18,7 @@ const SERVER = process.env.ROOTARK_TEST_SERVER || path.join(ROOT, "server.js");
 const PUBLIC = path.join(ROOT, "public");
 const TIMEOUT_MS = 10_000;
 const FOLDER_ID = "upload-safety";
+const createChunkUploadQuota = (options) => createChunkUploadQuotaService({ perAccountEntries: 5000, systemEntries: 10000, ...options });
 
 function getUnusedPort() {
   return new Promise((resolve, reject) => {
@@ -163,6 +164,8 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
       UPLOAD_QUARANTINE_DIR: quarantineDir,
       CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024),
       CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024),
+      CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000",
+      CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000",
       CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
       JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
       ...envOverrides,
@@ -183,7 +186,13 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
     fs.rmSync(dir, { recursive: true, force: true });
     assert.equal(fs.existsSync(dir), false);
   });
-  if (waitForReady) assert.equal((await waitForServer(port)).status, 200);
+  if (waitForReady) {
+    try {
+      assert.equal((await waitForServer(port)).status, 200);
+    } catch (error) {
+      throw new Error(`${error.message}\nserver exit: ${child.exitCode}\nserver stdout:\n${stdout.join("")}\nserver stderr:\n${stderr.join("")}`);
+    }
+  }
   return { dir, port, quarantineDir, password, chunkRoot, child, stdout, stderr };
 }
 
@@ -504,6 +513,107 @@ test("expired chunk sessions are removed at seven days while recent sessions are
   assert.equal(fs.existsSync(path.join(expiredDir, "0.part")), false, "all chunk plaintext is removed at seven days");
   assert.equal(fs.existsSync(markerExpiredDir), false, "old metadata-only tombstones are eventually removed");
   assert.equal(fs.readFileSync(path.join(recentDir, "0.part"), "utf8"), "recent plaintext");
+  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  try {
+    assert.deepEqual(database.prepare("SELECT session_key FROM quota_sessions ORDER BY session_key").all().map((row) => row.session_key), [`${FOLDER_ID}/${expiredId}`, `${FOLDER_ID}/${recentId}`]);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 1, "expiry releases its part operation while retaining the active recent part");
+  } finally {
+    database.close();
+  }
+});
+
+test("zero-byte multipart sessions are bounded per account and system", { timeout: 45_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    secondUploaderHasFolderAccess: true,
+    envOverrides: {
+      CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "4",
+      CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "6",
+    },
+  });
+  const uploader = await login(harness.port, "uploader", harness.password);
+  for (const uploadId of ["empty-part-one", "empty-part-two"]) {
+    const response = await uploadChunk(harness.port, uploader, {
+      uploadId,
+      originalName: uploadId + ".txt",
+      chunkIndex: 0,
+      totalChunks: 2,
+      bytes: Buffer.alloc(0),
+    });
+    assert.equal(response.status, 200, response.body);
+    assert.equal(JSON.parse(response.body).complete, false);
+  }
+  const accountOverflow = await uploadChunk(harness.port, uploader, {
+    uploadId: "empty-part-account-overflow",
+    originalName: "empty-part-account-overflow.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.alloc(0),
+  });
+  assert.equal(accountOverflow.status, 507, accountOverflow.body);
+  assert.equal(JSON.parse(accountOverflow.body).code, "CHUNK_QUOTA_EXCEEDED");
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, "empty-part-account-overflow")), false);
+
+  const otherUploader = await login(harness.port, "other-uploader", harness.password);
+  const systemLastEntry = await uploadChunk(harness.port, otherUploader, {
+    uploadId: "empty-part-system-last-entry",
+    originalName: "empty-part-system-last-entry.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.alloc(0),
+  });
+  assert.equal(systemLastEntry.status, 200, systemLastEntry.body);
+  const systemOverflow = await uploadChunk(harness.port, otherUploader, {
+    uploadId: "empty-part-system-overflow",
+    originalName: "empty-part-system-overflow.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: Buffer.alloc(0),
+  });
+  assert.equal(systemOverflow.status, 507, systemOverflow.body);
+  assert.equal(JSON.parse(systemOverflow.body).code, "CHUNK_QUOTA_EXCEEDED");
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, "empty-part-system-overflow")), false);
+
+  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  try {
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 3);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_sessions").get().count, 3);
+    assert.equal(database.prepare("SELECT SUM(charge_bytes) AS bytes FROM quota_operations").get().bytes, 0);
+  } finally {
+    database.close();
+  }
+});
+
+test("expired chunk cleanup remains serialized and runs when quota configuration is unavailable", { timeout: 45_000 }, async (t) => {
+  const expiredId = "expired-without-quota";
+  const recentId = "recent-without-quota";
+  const harness = await createHarness(t, {
+    chunkSessions: [
+      { uploadId: expiredId, files: { "metadata.json": legacyChunkMetadata(expiredId, { lastActivityAt: new Date(Date.now() - CHUNK_SESSION_TTL_MS - 60_000).toISOString() }), "0.part": "expired disposable part" } },
+      { uploadId: recentId, files: { "metadata.json": legacyChunkMetadata(recentId, { lastActivityAt: new Date().toISOString() }), "0.part": "recent disposable part" } },
+    ],
+    envOverrides: {
+      CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: "",
+      CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: "",
+      CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "",
+      CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "",
+    },
+  });
+  const expiredDir = path.join(harness.chunkRoot, FOLDER_ID, expiredId);
+  const recentDir = path.join(harness.chunkRoot, FOLDER_ID, recentId);
+  assert.equal(fs.existsSync(path.join(expiredDir, "0.part")), false, harness.stderr.join(""));
+  assert.equal(typeof JSON.parse(fs.readFileSync(path.join(expiredDir, "metadata.json"), "utf8")).__expiredAt, "string");
+  assert.equal(fs.readFileSync(path.join(recentDir, "0.part"), "utf8"), "recent disposable part");
+
+  const session = await login(harness.port, "uploader", harness.password);
+  const blocked = await uploadChunk(harness.port, session, {
+    uploadId: "quota-disabled-still-blocks-upload",
+    originalName: "quota-disabled.txt",
+    chunkIndex: 0,
+    totalChunks: 1,
+    bytes: Buffer.from("must not stage"),
+  });
+  assert.equal(blocked.status, 503, blocked.body);
+  assert.equal(JSON.parse(blocked.body).code, "CHUNK_QUOTA_UNAVAILABLE");
 });
 
 test("an expired upload cannot resume from its old chunks after restart cleanup", { timeout: 45_000 }, async (t) => {
@@ -639,7 +749,7 @@ test("an active incoming chunk does not defer cleanup of unrelated expired sessi
   const quota = createChunkUploadQuota({
     rootDir: harness.chunkRoot,
     perAccountBytes: 64 * 1024 * 1024,
-    systemBytes: 128 * 1024 * 1024,
+    systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000,
   });
   const incomingBytes = Buffer.from("active upload staging data");
   quota.reserve({ operationId: incomingFile, accountKey: "uploader", relativePath: `incoming/${incomingFile}`, reservedBytes: incomingBytes.length });
@@ -1896,7 +2006,7 @@ test("ambiguous encrypted handoff without pending metadata preserves destination
       fs.writeFileSync(path.join(cloudQueue, digest + ".json"), JSON.stringify({ version: 1, folderId: ${JSON.stringify(FOLDER_ID)}, fileName: ${JSON.stringify(fileName)}, desired: "present", generation: "partial-cloud-intent", updatedAt: new Date().toISOString() }));
       const root = ${JSON.stringify(chunkRoot)};
       const session = path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)});
-      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "dead-owner", processId: 2147483000 });
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
       quota.initialize([
         { operationId: "part-charge", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "0.part"), state: "part_committed", chargeBytes: bytes.length },
         { operationId: "published-charge", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: ${JSON.stringify(`handoff/${FOLDER_ID}/${fileName}#${bytes.length}`)}, state: "handoff_published", chargeBytes: bytes.length },
@@ -3084,7 +3194,7 @@ test("a committed chunk whose file size disagrees with its live ledger charge fa
     preloadSource: ({ chunkRoot }) => `
       const path = require("node:path");
       const { createChunkUploadQuota } = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
-      const quota = createChunkUploadQuota({ rootDir: ${JSON.stringify(chunkRoot)}, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "live-owner", processId: process.pid });
+      const quota = createChunkUploadQuota({ rootDir: ${JSON.stringify(chunkRoot)}, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "live-owner", processId: process.pid });
       quota.initialize([{ operationId: "mismatched-charge", accountKey: "uploader", sessionKey: ${JSON.stringify(`${FOLDER_ID}/${uploadId}`)}, relativePath: path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "0.part"), state: "part_committed", chargeBytes: ${payload.length + 1} }]);
       quota.close();
     `,
@@ -3151,7 +3261,7 @@ test("startup removes a dead-owner incoming reservation only after reconciling i
       const root = ${JSON.stringify(chunkRoot)};
       fs.mkdirSync(path.join(root, "incoming"), { recursive: true });
       fs.writeFileSync(path.join(root, "incoming", ${JSON.stringify(operationId)}), ${JSON.stringify(bytes)});
-      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "dead-owner", processId: 2147483000 });
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
       quota.initialize([{ operationId: ${JSON.stringify(operationId)}, accountKey: "uploader", relativePath: path.join("incoming", ${JSON.stringify(operationId)}), state: "reserved", chargeBytes: 8 * 1024 * 1024 }]);
       quota.close();
     `,
@@ -3176,7 +3286,7 @@ test("startup recovers an incoming reservation from a prior instance with a reus
       'const root = ' + JSON.stringify(chunkRoot) + ';',
       'fs.mkdirSync(path.join(root, "incoming"), { recursive: true });',
       'fs.writeFileSync(path.join(root, "incoming", ' + JSON.stringify(operationId) + '), ' + JSON.stringify(bytes) + ');',
-      'const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "live-owner", processId: process.pid });',
+      'const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "live-owner", processId: process.pid });',
       'quota.initialize([{ operationId: ' + JSON.stringify(operationId) + ', accountKey: "uploader", relativePath: path.join("incoming", ' + JSON.stringify(operationId) + '), state: "writing", chargeBytes: Buffer.byteLength(' + JSON.stringify(bytes) + ') }]);',
       'quota.close();',
     ].join("\n"),
@@ -3208,7 +3318,7 @@ test("startup preserves an old incoming file owned by the exact live instance", 
       fs.writeFileSync(incomingPath, ${JSON.stringify(bytes)});
       const old = new Date(Date.now() - 10 * 60 * 1000);
       fs.utimesSync(incomingPath, old, old);
-      const quota = createQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "exact-live-instance", processId: process.pid });
+      const quota = createQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "exact-live-instance", processId: process.pid });
       quota.initialize([{ operationId: ${JSON.stringify(operationId)}, accountKey: "uploader", relativePath: path.join("incoming", ${JSON.stringify(operationId)}), state: "writing", chargeBytes: Buffer.byteLength(${JSON.stringify(bytes)}) }]);
       quota.close();
       const simpleDir = path.join(${JSON.stringify(dir)}, "temp", ".incoming");
@@ -3246,7 +3356,7 @@ test("startup removes an interrupted assembly and preserves charged source parts
       const { createChunkUploadQuota } = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
       const root = ${JSON.stringify(chunkRoot)};
       const session = path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)});
-      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "dead-owner", processId: 2147483000 });
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
       quota.initialize([
         { operationId: "part-zero", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "0.part"), state: "part_committed", chargeBytes: ${first.length} },
         { operationId: "part-one", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "1.part"), state: "part_committed", chargeBytes: ${second.length} },
@@ -3332,7 +3442,7 @@ test("startup recovers an assembly interrupted during scanning from intact sourc
       'const { createChunkUploadQuota } = require(' + JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js")) + ');',
       'const root = ' + JSON.stringify(chunkRoot) + ';',
       'const session = path.join(' + JSON.stringify(FOLDER_ID) + ', ' + JSON.stringify(uploadId) + ');',
-      'const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "dead-owner", processId: 2147483000 });',
+      'const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });',
       'quota.initialize([',
       '  { operationId: "scan-source", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "0.part"), state: "part_committed", chargeBytes: ' + source.length + ' },',
       '  { operationId: "scan-assembly", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "assembled.upload"), state: "assembled", chargeBytes: ' + assembly.length + ' },',
@@ -3369,7 +3479,7 @@ test("startup finishes a replacement only when target, backup, incoming file, an
       const session = path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)});
       fs.mkdirSync(path.join(root, "incoming"), { recursive: true });
       fs.writeFileSync(path.join(root, "incoming", ${JSON.stringify(newOperationId)}), ${JSON.stringify(newBytes.toString())});
-      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "dead-owner", processId: 2147483000 });
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
       quota.initialize([
         { operationId: "old-replacement-operation", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, ${JSON.stringify(backupName)}), state: "promoting", chargeBytes: ${oldBytes.length} },
         { operationId: ${JSON.stringify(newOperationId)}, accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "0.part"), state: "promoting", chargeBytes: ${newBytes.length} },
@@ -3409,7 +3519,7 @@ test("replacement recovery preserves session data when quota ownership disagrees
       const session = ${JSON.stringify(sessionKey)};
       fs.mkdirSync(path.join(root, "incoming"), { recursive: true });
       fs.writeFileSync(path.join(root, "incoming", ${JSON.stringify(newOperationId)}), ${JSON.stringify(newBytes.toString())});
-      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "dead-owner", processId: 2147483000 });
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
       quota.initialize([
         { operationId: "old-replacement-operation", accountKey: "different-account", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, ${JSON.stringify(backupName)}), state: "promoting", chargeBytes: ${oldBytes.length} },
         { operationId: ${JSON.stringify(newOperationId)}, accountKey: "different-account", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "0.part"), state: "promoting", chargeBytes: ${newBytes.length} },
@@ -3456,7 +3566,7 @@ test("startup releases a deleted part only when its seven-day expiry tombstone p
       const { createChunkUploadQuota } = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
       const root = ${JSON.stringify(chunkRoot)};
       const relative = path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "0.part");
-      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "dead-owner", processId: 2147483000 });
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
       quota.initialize([{ operationId: "expired-part", accountKey: "uploader", sessionKey: ${JSON.stringify(`${FOLDER_ID}/${uploadId}`)}, relativePath: relative, state: "part_committed", chargeBytes: 10 }]);
       quota.close();
     `,
@@ -3483,7 +3593,7 @@ test("startup completes a durable handoff only with matching pending record and 
       const root = ${JSON.stringify(chunkRoot)};
       const session = path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)});
       const parts = [{ operationId: "part-zero", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "0.part"), state: "part_committed", chargeBytes: ${bytes.length} }];
-      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "dead-owner", processId: 2147483000 });
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
       quota.initialize([...parts, { operationId: "handoff-operation", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: ${JSON.stringify(`handoff/${FOLDER_ID}/${fileName}#${bytes.length}`)}, state: "handoff_pending", chargeBytes: ${bytes.length} }]);
       quota.close();
       fs.mkdirSync(path.join(${JSON.stringify(dir)}, "temp", ${JSON.stringify(FOLDER_ID)}), { recursive: true });
@@ -3503,6 +3613,79 @@ test("startup completes a durable handoff only with matching pending record and 
   }
 });
 
+test("startup completes an injected metadata-unlink handoff interruption with an empty session directory", { timeout: 30_000 }, async (t) => {
+  const uploadId = "handoff-empty-session-crash";
+  const fileName = "handoff-empty-session.txt";
+  const bytes = Buffer.from("durably published bytes");
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId, { totalChunks: 1, encryptionLevel: "none", originalName: fileName, fileName }) } }],
+    preloadSource: ({ dir, chunkRoot }) => `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const { createChunkUploadQuota } = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
+      const root = ${JSON.stringify(chunkRoot)};
+      const session = ${JSON.stringify(FOLDER_ID + "/" + uploadId)};
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
+      quota.initialize([{ operationId: "handed-off-marker", accountKey: "uploader", sessionKey: session, relativePath: ${JSON.stringify("handoff/" + FOLDER_ID + "/" + encodeURIComponent(fileName) + "#" + bytes.length)}, state: "handed_off", chargeBytes: 0 }]);
+      quota.close();
+      // Inject the crash boundary after metadata unlink and before session rmdir.
+      fs.unlinkSync(path.join(root, ${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "metadata.json"));
+      fs.mkdirSync(path.join(${JSON.stringify(dir)}, "temp", ${JSON.stringify(FOLDER_ID)}), { recursive: true });
+      fs.writeFileSync(path.join(${JSON.stringify(dir)}, "temp", ${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(fileName)}), ${JSON.stringify(bytes.toString())});
+      fs.writeFileSync(path.join(${JSON.stringify(dir)}, "data", "pending-uploads.json"), JSON.stringify({ ${JSON.stringify(FOLDER_ID + "/" + fileName)}: { folderId: ${JSON.stringify(FOLDER_ID)}, uploadedBy: "uploader" } }));
+    `,
+  });
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  assert.equal(fs.existsSync(sessionDir), false, harness.stderr.join(""));
+  assert.deepEqual(fs.readFileSync(path.join(harness.dir, "temp", FOLDER_ID, fileName)), bytes);
+  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  try {
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_sessions").get().count, 0);
+  } finally {
+    database.close();
+  }
+});
+
+test("startup rejects unexpected contents in an empty-metadata handoff session directory", { timeout: 30_000 }, async (t) => {
+  const uploadId = "handoff-unexpected-session-content";
+  const fileName = "handoff-unexpected-content.txt";
+  const bytes = Buffer.from("durably published bytes");
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId, files: {
+      "metadata.json": legacyChunkMetadata(uploadId, { totalChunks: 1, encryptionLevel: "none", originalName: fileName, fileName }),
+      "unexpected.bin": "must be preserved",
+    } }],
+    preloadSource: ({ dir, chunkRoot }) => `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const { createChunkUploadQuota } = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
+      const root = ${JSON.stringify(chunkRoot)};
+      const session = ${JSON.stringify(FOLDER_ID + "/" + uploadId)};
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
+      quota.initialize([{ operationId: "handed-off-marker", accountKey: "uploader", sessionKey: session, relativePath: ${JSON.stringify("handoff/" + FOLDER_ID + "/" + encodeURIComponent(fileName) + "#" + bytes.length)}, state: "handed_off", chargeBytes: 0 }]);
+      quota.close();
+      fs.unlinkSync(path.join(root, ${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "metadata.json"));
+      fs.mkdirSync(path.join(${JSON.stringify(dir)}, "temp", ${JSON.stringify(FOLDER_ID)}), { recursive: true });
+      fs.writeFileSync(path.join(${JSON.stringify(dir)}, "temp", ${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(fileName)}), ${JSON.stringify(bytes.toString())});
+      fs.writeFileSync(path.join(${JSON.stringify(dir)}, "data", "pending-uploads.json"), JSON.stringify({ ${JSON.stringify(FOLDER_ID + "/" + fileName)}: { folderId: ${JSON.stringify(FOLDER_ID)}, uploadedBy: "uploader" } }));
+    `,
+  });
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  assert.deepEqual(fs.readFileSync(path.join(sessionDir, "unexpected.bin"), "utf8"), "must be preserved", harness.stderr.join(""));
+  assert.deepEqual(fs.readFileSync(path.join(harness.dir, "temp", FOLDER_ID, fileName)), bytes);
+  const session = await login(harness.port, "uploader", harness.password);
+  const blocked = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: fileName,
+    chunkIndex: 0,
+    totalChunks: 1,
+    bytes,
+  });
+  assert.equal(blocked.status, 503, blocked.body);
+  assert.equal(JSON.parse(blocked.body).code, "CHUNK_QUOTA_UNAVAILABLE");
+});
+
 test("startup removes an unregistered published handoff and keeps charged parts retryable", { timeout: 30_000 }, async (t) => {
   const uploadId = "handoff-published-no-pending";
   const fileName = "unregistered-published.txt";
@@ -3515,7 +3698,7 @@ test("startup removes an unregistered published handoff and keeps charged parts 
       const { createChunkUploadQuota } = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
       const root = ${JSON.stringify(chunkRoot)};
       const session = path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)});
-      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "dead-owner", processId: 2147483000 });
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
       quota.initialize([
         { operationId: "part-zero", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "0.part"), state: "part_committed", chargeBytes: ${bytes.length} },
         { operationId: "published-output", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: ${JSON.stringify(`handoff/${FOLDER_ID}/${fileName}#${bytes.length}`)}, state: "handoff_published", chargeBytes: ${bytes.length} },
@@ -3574,7 +3757,7 @@ test("startup cleans an interrupted hard-link handoff and keeps its accepted par
       const destination = path.join(${JSON.stringify(dir)}, "temp", ${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(fileName)});
       fs.mkdirSync(path.dirname(destination), { recursive: true });
       fs.linkSync(source, destination);
-      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "dead-owner", processId: 2147483000 });
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
       quota.initialize([
         { operationId: "a-part", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "0.part"), state: "part_committed", chargeBytes: ${bytes.length} },
         { operationId: "z-handoff", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: ${JSON.stringify(`handoff/${FOLDER_ID}/${fileName}#${bytes.length}`)}, state: "handoff_pending", chargeBytes: ${bytes.length} },
@@ -3619,7 +3802,7 @@ test("startup resumes per-part cleanup after a durable handoff crash", { timeout
       const { createChunkUploadQuota } = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
       const root = ${JSON.stringify(chunkRoot)};
       const session = path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)});
-      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "dead-owner", processId: 2147483000 });
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
       quota.initialize([
         { operationId: "part-zero", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "0.part"), state: "part_committed", chargeBytes: 8 },
         { operationId: "part-one", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "1.part"), state: "part_committed", chargeBytes: ${remainingPart.length} },
@@ -3782,7 +3965,7 @@ test("semantically invalid quota rows fail closed before startup recovery mutate
       'fs.mkdirSync(path.join(chunkRoot, "incoming"), { recursive: true });',
       `if (process.platform !== "win32") fs.chmodSync(path.join(chunkRoot, ${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}), 0o755);`,
       'ensureWindowsChunkUploadRoot(chunkRoot);',
-      'const quota = createChunkUploadQuota({ rootDir: chunkRoot, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "stale-fixture", processId: 2147483647 });',
+      'const quota = createChunkUploadQuota({ rootDir: chunkRoot, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "stale-fixture", processId: 2147483647 });',
       'quota.initialize();',
       `const staleIncomingId = ${JSON.stringify(staleIncomingId)};`,
       'quota.reserve({ operationId: staleIncomingId, accountKey: "uploader", relativePath: path.join("incoming", staleIncomingId), reservedBytes: 12 });',
@@ -3911,7 +4094,7 @@ test("ownerless blocked legacy metadata cannot authorize quota recovery", { time
         fs.chmodSync(path.join(sessionDir, "metadata.json"), 0o644);
         fs.chmodSync(path.join(sessionDir, "0.part"), 0o644);
       }
-      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "stale-owner", processId: 2147483647 });
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "stale-owner", processId: 2147483647 });
       quota.initialize([{ operationId: "blocked-part", accountKey: "different-account", sessionKey: ${JSON.stringify(sessionKey)}, relativePath: path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "0.part"), state: "part_committed", chargeBytes: ${partBytes.length} }]);
       quota.close();
     `,
@@ -3965,7 +4148,7 @@ test("handoff recovery preserves session data when quota ownership disagrees wit
       fs.writeFileSync(path.join(${JSON.stringify(dir)}, "data", "pending-uploads.json"), JSON.stringify({
         ${JSON.stringify(`${FOLDER_ID}/${fileName}`)}: { folderId: ${JSON.stringify(FOLDER_ID)}, uploadedBy: "uploader" },
       }));
-      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, processInstanceId: "dead-owner", processId: 2147483647 });
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483647 });
       quota.initialize([
         { operationId: "a-part", accountKey: "different-account", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "0.part"), state: "part_committed", chargeBytes: ${bytes.length} },
         { operationId: "z-handoff", accountKey: "different-account", sessionKey: session.replace(path.sep, "/"), relativePath: ${JSON.stringify(`handoff/${FOLDER_ID}/${encodeURIComponent(fileName)}#${bytes.length}`)}, state: "handoff_pending", chargeBytes: ${bytes.length} },
