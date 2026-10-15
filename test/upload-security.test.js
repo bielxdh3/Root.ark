@@ -522,6 +522,40 @@ test("expired chunk sessions are removed at seven days while recent sessions are
   }
 });
 
+test("seven-day expiry still cleans validated sessions when the configured quota ledger is unavailable", { timeout: 45_000 }, async (t) => {
+  const expiredId = "expiry-ledger-unavailable";
+  const recentId = "recent-ledger-unavailable";
+  const harness = await createHarness(t, {
+    chunkSessions: [
+      { uploadId: expiredId, files: { "metadata.json": legacyChunkMetadata(expiredId, { lastActivityAt: new Date(Date.now() - CHUNK_SESSION_TTL_MS - 60_000).toISOString() }), "0.part": "expired plaintext" } },
+      { uploadId: recentId, files: { "metadata.json": legacyChunkMetadata(recentId, { lastActivityAt: new Date(Date.now() - CHUNK_SESSION_TTL_MS + 60_000).toISOString() }), "0.part": "recent plaintext" } },
+    ],
+    preloadSource: ({ chunkRoot }) => `
+      require("node:fs").writeFileSync(${JSON.stringify(path.join(chunkRoot, ".quota.sqlite"))}, "not a SQLite database");
+    `,
+  });
+
+  const expiredDir = path.join(harness.chunkRoot, FOLDER_ID, expiredId);
+  const recentDir = path.join(harness.chunkRoot, FOLDER_ID, recentId);
+  assert.match(harness.stderr.join(""), /quota initialization unavailable/);
+  assert.equal(fs.existsSync(path.join(expiredDir, "0.part")), false, "a validated seven-day-old part is removed under the shared lifecycle lock");
+  assert.equal(typeof JSON.parse(fs.readFileSync(path.join(expiredDir, "metadata.json"), "utf8")).__expiredAt, "string", "the expiry tombstone remains available to reject stale resumptions");
+  assert.equal(fs.readFileSync(path.join(recentDir, "0.part"), "utf8"), "recent plaintext", "recent data is preserved while the quota ledger is unavailable");
+
+  const session = await login(harness.port, "uploader", harness.password);
+  const rejected = await uploadChunk(harness.port, session, {
+    uploadId: "quota-ledger-unavailable-request",
+    originalName: "quota-ledger-unavailable-request.txt",
+    chunkIndex: 0,
+    totalChunks: 1,
+    bytes: Buffer.from("must not be staged"),
+  });
+  assert.equal(rejected.status, 503, rejected.body);
+  assert.equal(JSON.parse(rejected.body).code, "CHUNK_QUOTA_UNAVAILABLE");
+  const incomingDir = path.join(harness.chunkRoot, "incoming");
+  assert.ok(!fs.existsSync(incomingDir) || fs.readdirSync(incomingDir).length === 0, "upload still fails closed before writing a new part");
+});
+
 test("zero-byte multipart sessions are bounded per account and system", { timeout: 45_000 }, async (t) => {
   const harness = await createHarness(t, {
     secondUploaderHasFolderAccess: true,
@@ -763,9 +797,14 @@ test("an active incoming chunk does not defer cleanup of unrelated expired sessi
   assert.equal(fs.readFileSync(path.join(harness.chunkRoot, "incoming", incomingFile), "utf8"), incomingBytes.toString(), "the sweeper leaves incoming upload staging files untouched");
 });
 
-test("the chunk-session sweeper shares the session lock and preserves activity committed before unlock", { timeout: 45_000 }, async (t) => {
+test("the chunk-session sweeper shares the cross-process session lock when quota is unavailable", { timeout: 45_000 }, async (t) => {
   const uploadId = "sweeper-session-lock";
-  const harness = await createHarness(t, { envOverrides: { CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS: "1000" } });
+  const harness = await createHarness(t, {
+    envOverrides: { CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS: "1000" },
+    preloadSource: ({ chunkRoot }) => `
+      require("node:fs").writeFileSync(${JSON.stringify(path.join(chunkRoot, ".quota.sqlite"))}, "not a SQLite database");
+    `,
+  });
   const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
   fs.mkdirSync(sessionDir, { recursive: true });
   fs.writeFileSync(path.join(sessionDir, "metadata.json"), JSON.stringify(legacyChunkMetadata(uploadId, {
@@ -779,6 +818,7 @@ test("the chunk-session sweeper shares the session lock and preserves activity c
   let releaseLock;
   let markLockHeld;
   const lockHeld = new Promise((resolve) => { markLockHeld = resolve; });
+  assert.match(harness.stderr.join(""), /quota initialization unavailable/);
   const heldOperation = lock.runFolder(`chunk-upload:${lockIdentity}`, async () => {
     markLockHeld();
     await new Promise((resolve) => { releaseLock = resolve; });
@@ -2216,6 +2256,8 @@ test("a failed handed-off ledger transition preserves registered publication for
       UPLOAD_QUARANTINE_DIR: harness.quarantineDir,
       CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024),
       CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024),
+      CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000",
+      CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000",
       CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
       JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
     },
@@ -2228,7 +2270,7 @@ test("a failed handed-off ledger transition preserves registered publication for
     assert.equal((await waitForServer(recoveryPort)).status, 200, recoveryStderr.join(""));
     assert.deepEqual(fs.readFileSync(destinationPath), bytes);
     assert.ok(JSON.parse(fs.readFileSync(pendingPath, "utf8"))[`${FOLDER_ID}/${fileName}`]);
-    assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId)), false);
+    assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId)), false, recoveryStderr.join(""));
     const recoveredLedger = new Database(quotaPath, { readonly: true });
     try {
       assert.equal(recoveredLedger.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0);
@@ -2298,7 +2340,7 @@ test("partial encrypted handoff registration preserves publication and charge wh
   const recoveryPort = await getUnusedPort();
   const recoveryChild = spawn(process.execPath, [SERVER], {
     cwd: harness.dir,
-    env: { ...process.env, NODE_ENV: "test", PORT: String(recoveryPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    env: { ...process.env, NODE_ENV: "test", PORT: String(recoveryPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -2616,10 +2658,13 @@ test("chunk-session expiry sweep rejects path swaps with adjacent 64-bit file ID
         'const adjacent = 9007199254740992n;',
         'const matches = (candidate) => path.resolve(String(candidate)) === path.resolve(target);',
         'const identify = (stats, args, ino) => new Proxy(stats, { get(value, key, receiver) { if (key === "dev") return args[0]?.bigint === true ? 1n : 1; if (key === "ino") return args[0]?.bigint === true ? ino : Number(ino); return Reflect.get(value, key, receiver); } });',
-        'const originalOpen = fs.promises.open.bind(fs.promises);',
-        'const originalLstat = fs.promises.lstat.bind(fs.promises);',
-        'fs.promises.open = async function (candidate, ...args) { const handle = await originalOpen(candidate, ...args); if (matches(candidate)) { const stat = handle.stat.bind(handle); handle.stat = async (...statArgs) => { const value = await stat(...statArgs); return fs.existsSync(enable) ? identify(value, statArgs, adjacent) : value; }; } return handle; };',
-        'fs.promises.lstat = async function (candidate, ...args) { const value = await originalLstat(candidate, ...args); if (!matches(candidate) || !fs.existsSync(enable)) return value; fs.appendFileSync(observed, "x"); return identify(value, args, adjacent + 1n); };',
+        'const originalOpenSync = fs.openSync;',
+        'const originalFstatSync = fs.fstatSync;',
+        'const originalLstatSync = fs.lstatSync;',
+        'const targetDescriptors = new Set();',
+        'fs.openSync = function (candidate, ...args) { const descriptor = originalOpenSync.call(this, candidate, ...args); if (matches(candidate)) targetDescriptors.add(descriptor); return descriptor; };',
+        'fs.fstatSync = function (descriptor, ...args) { const value = originalFstatSync.call(this, descriptor, ...args); return targetDescriptors.has(descriptor) && fs.existsSync(enable) ? identify(value, args, adjacent) : value; };',
+        'fs.lstatSync = function (candidate, ...args) { const value = originalLstatSync.call(this, candidate, ...args); if (!matches(candidate) || !fs.existsSync(enable)) return value; fs.appendFileSync(observed, "x"); return identify(value, args, adjacent + 1n); };',
       ].join("\n");
     },
   });
@@ -2629,7 +2674,7 @@ test("chunk-session expiry sweep rejects path swaps with adjacent 64-bit file ID
   while ((!fs.existsSync(observedPath) || fs.readFileSync(observedPath, "utf8").length < 1) && Date.now() < firstSweepDeadline) {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  assert.equal(fs.existsSync(observedPath), true, "the async expiry reader inspected the metadata after injection was enabled");
+  assert.equal(fs.existsSync(observedPath), true, "the expiry reader inspected the metadata after injection was enabled");
 
   const expiredAt = new Date(Date.now() - CHUNK_SESSION_TTL_MS - 60_000).toISOString();
   const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
@@ -2639,7 +2684,7 @@ test("chunk-session expiry sweep rejects path swaps with adjacent 64-bit file ID
   while (fs.readFileSync(observedPath, "utf8").length < 2 && Date.now() < secondSweepDeadline) {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  assert.ok(fs.readFileSync(observedPath, "utf8").length >= 2, "the async expiry reader reached a second sweep after the fixture became expired");
+  assert.ok(fs.readFileSync(observedPath, "utf8").length >= 2, "the expiry reader reached a second sweep after the fixture became expired");
   await new Promise((resolve) => setTimeout(resolve, 100));
 
   const sessionDir = path.dirname(metadataPath);
@@ -4429,7 +4474,7 @@ test("restart reconciles a replacement when restoring its prior part fails", { t
   const recoveryPort = await getUnusedPort();
   const recoveryChild = spawn(process.execPath, [SERVER], {
     cwd: harness.dir,
-    env: { ...process.env, NODE_ENV: "test", PORT: String(recoveryPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    env: { ...process.env, NODE_ENV: "test", PORT: String(recoveryPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -4437,7 +4482,7 @@ test("restart reconciles a replacement when restoring its prior part fails", { t
   recoveryChild.stderr.on("data", (chunk) => recoveryStderr.push(chunk.toString()));
   try {
     assert.equal((await waitForServer(recoveryPort)).status, 200, recoveryStderr.join(""));
-    assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), replacementBytes, "recovery resolves the charged incoming payload into the accepted part");
+    assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), replacementBytes, `recovery resolves the charged incoming payload into the accepted part; startup: ${recoveryStderr.join("")}`);
     assert.deepEqual(fs.readdirSync(incomingDir), []);
     assert.equal(fs.readdirSync(sessionDir).some((name) => name.startsWith(".replacement-")), false);
     const recovered = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });

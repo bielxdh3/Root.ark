@@ -7459,6 +7459,78 @@ function readLegacyChunkQuotaOperations({ includeOperations = true } = {}) {
     filesToSecure.set(resolved, identity);
     return identity;
   };
+  const readyLedgerSessionEntriesAreSafe = (entries, sessionPath, sessionKey, totalChunks) => {
+    const operations = chunkUploadQuota?.operationsForSession(sessionKey) || [];
+    const normalizeRelativePath = (relativePath) => {
+      const normalized = relativePath.split(/[\\/]/).join("/");
+      return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    };
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) return false;
+      if (entry.name === "metadata.json") {
+        if (!entry.isFile()) return false;
+        continue;
+      }
+      if (!entry.isFile()) return false;
+      const filePath = path.join(sessionPath, entry.name);
+      const relativePath = path.relative(CHUNK_UPLOAD_DIR, filePath);
+      const matches = operations.filter((operation) => normalizeRelativePath(operation.relativePath) === normalizeRelativePath(relativePath));
+      let operation = matches.length === 1 ? matches[0] : null;
+      let pendingHandoffScratch = false;
+      if (!operation && matches.length === 0 && entry.name === "assembled.upload") {
+        const pendingHandoffs = operations.filter((candidate) => candidate.state === "handoff_pending");
+        if (pendingHandoffs.length !== 1) return false;
+        operation = pendingHandoffs[0];
+        pendingHandoffScratch = true;
+      }
+      if (!operation || matches.length > 1) return false;
+      const partMatch = /^(0|[1-9]\d{0,3})\.part$/.exec(entry.name);
+      const backupMatch = /^\.replacement-[a-zA-Z0-9_-]{1,120}\.part$/.test(entry.name);
+      const allowed =
+        (operation.state === "part_committed" && partMatch && Number(partMatch[1]) < Math.min(totalChunks, MAX_UPLOAD_CHUNKS)) ||
+        (operation.state === "promoting" && ((partMatch && Number(partMatch[1]) < Math.min(totalChunks, MAX_UPLOAD_CHUNKS)) || backupMatch)) ||
+        (["reserved", "assembling", "assembled", "encrypting"].includes(operation.state) && entry.name === "assembled.upload") ||
+        (pendingHandoffScratch && operation.state === "handoff_pending");
+      if (!allowed) return false;
+      if (pendingHandoffScratch) {
+        const segments = operation.relativePath.split(/[\\/]/);
+        if (segments.length !== 3 || segments[0] !== "handoff" || segments[1] !== sessionKey.split("/")[0]) return false;
+        const encodedNameAndSize = segments[2];
+        const sizeSeparator = encodedNameAndSize.lastIndexOf("#");
+        const encodedName = sizeSeparator > 0 ? encodedNameAndSize.slice(0, sizeSeparator) : "";
+        const sizeText = sizeSeparator > 0 ? encodedNameAndSize.slice(sizeSeparator + 1) : "";
+        if (!encodedName || !/^(0|[1-9]\d*)$/.test(sizeText)) return false;
+        const expectedSize = Number(sizeText);
+        if (!Number.isSafeInteger(expectedSize) || expectedSize !== operation.chargeBytes) return false;
+        let fileName;
+        try { fileName = decodeURIComponent(encodedName); }
+        catch { return false; }
+        if (!fileName || path.basename(fileName) !== fileName || /[\\/]/.test(fileName) || encodeURIComponent(fileName) !== encodedName) return false;
+
+        const stagedStats = fs.lstatSync(filePath, { bigint: true });
+        if (stagedStats.isSymbolicLink() || !stagedStats.isFile() || stagedStats.size !== BigInt(expectedSize) || (stagedStats.nlink !== 1n && stagedStats.nlink !== 2n)) return false;
+        if (stagedStats.nlink === 2n) {
+          const tempRoot = path.resolve("./temp");
+          const destinationPath = path.resolve(getFolderStoragePath("./temp", segments[1]), fileName);
+          if (!isSafeChildPath(tempRoot, destinationPath)) return false;
+          let destinationStats;
+          try { destinationStats = fs.lstatSync(destinationPath, { bigint: true }); }
+          catch (error) { if (error.code === "ENOENT") return false; throw error; }
+          if (destinationStats.isSymbolicLink() || !destinationStats.isFile() || destinationStats.nlink !== 2n ||
+              destinationStats.dev !== stagedStats.dev || destinationStats.ino !== stagedStats.ino || destinationStats.size !== BigInt(expectedSize)) return false;
+        }
+        continue;
+      }
+      const identity = rememberFile(filePath);
+      if ((operation.state === "part_committed" || (operation.state === "promoting" && backupMatch)) && identity.size !== BigInt(operation.chargeBytes)) {
+        return false;
+      }
+      if (["reserved", "assembling", "assembled", "encrypting", "handoff_pending"].includes(operation.state) && identity.size > BigInt(operation.chargeBytes)) {
+        return false;
+      }
+    }
+    return true;
+  };
   for (const entry of rootEntries) {
     if (knownFiles.has(entry.name)) continue;
     if (entry.isSymbolicLink() || !entry.isDirectory() || !/^[a-zA-Z0-9_-]{1,80}$/.test(entry.name)) throw new Error("Untracked chunk staging entry");
@@ -7495,9 +7567,13 @@ function readLegacyChunkQuotaOperations({ includeOperations = true } = {}) {
         continue;
       }
       const valid = isValidChunkSessionMetadata(metadata, sessionEntry.name, entry.name) || isValidLegacyChunkSessionMetadata(metadata, sessionEntry.name, entry.name);
-      if (!valid || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unattributable legacy chunk session");
+      const safeEntries = includeOperations
+        ? chunkSessionEntriesAreSafe(entries, metadata.totalChunks)
+        : readyLedgerSessionEntriesAreSafe(entries, sessionPath, sessionKey, metadata.totalChunks);
+      if (!valid || !safeEntries) throw new Error("Unattributable legacy chunk session");
       if (!metadata.uploadedBy || typeof metadata.uploadedBy !== "string") throw new Error("Unattributable legacy chunk owner");
       sessions.set(sessionKey, metadata.uploadedBy);
+      if (!includeOperations) continue;
       for (const part of entries) {
         if (part.name === "metadata.json") continue;
         const partPath = path.join(sessionPath, part.name);
