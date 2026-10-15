@@ -1354,9 +1354,12 @@ async function createBackup(options = {}) {
     throw new Error("Backups desativados por BACKUP_ENABLED=false");
   }
 
+  const id = options.backupId == null ? crypto.randomUUID() : String(options.backupId);
+  if (!/^[a-f0-9-]{36}$/i.test(id)) {
+    throw Object.assign(new Error("Backup ID is invalid"), { code: "BACKUP_ID_INVALID" });
+  }
   const release = options.lockHeld ? null : acquireLock("backup");
   const startedAt = Date.now();
-  const id = crypto.randomUUID();
   const createdAt = new Date().toISOString();
   const backupType = options.type || "manual";
   const filenameBase = `rootark-${backupType === "pre-restore" ? "pre-restore" : "backup"}-${timestampForName()}`;
@@ -1384,6 +1387,9 @@ async function createBackup(options = {}) {
   let outcomeError = null;
 
   try {
+    if (options.backupId != null && backupRepository.getBackup(id)) {
+      throw Object.assign(new Error("Backup ID already exists"), { code: "BACKUP_ID_COLLISION" });
+    }
     sqliteSnapshot = await createSqliteSnapshot();
     const collectionOptions = { stageDir, sqliteSnapshotPath: sqliteSnapshot?.snapshotPath, suppressionSnapshot: restoreProviderOrphans.createSnapshot() };
     const files = await collectBackupFiles(collectionOptions);
@@ -1450,6 +1456,7 @@ async function createBackup(options = {}) {
     return saved;
   } catch (error) {
     outcomeError = error;
+    if (error.code === "BACKUP_ID_COLLISION") throw error;
     if (successEntry && (saved?.status === "success" || error.historyRenameVisible)) {
       // Once a success row is visible, compensating cleanup could leave it
       // pointing at a missing archive if later persistence also fails.

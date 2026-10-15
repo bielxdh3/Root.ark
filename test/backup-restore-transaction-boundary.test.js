@@ -753,6 +753,72 @@ test("successful whole restore preserves both recovery records and blocks servic
   `);
 });
 
+const crashAfterPreRestoreBackupScript = `
+  const backup = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+  const restore = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+  const createBackup = backup.createBackup;
+  backup.createBackup = async (options) => {
+    const created = await createBackup(options);
+    process.stdout.write(JSON.stringify({ preRestoreBackupId: created.id }) + "\\n");
+    process.exit(86);
+  };
+  restore.restoreBackup(process.argv[1], { confirmation: "RESTORE" })
+    .catch((error) => { console.error(error); process.exit(1); });
+`;
+const restartAfterPreRestoreBackupScript = `
+  const assert = require("node:assert/strict");
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const backup = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+  const restore = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+  const coordinatorPath = path.resolve("data", ".rootark-restore-coordinator.json");
+  const recovered = restore.assertNoPendingWholeRestore();
+  assert.equal(recovered.recovered, true);
+  assert.equal(fs.existsSync(coordinatorPath), false);
+  const retained = backup.getBackupOrThrow(process.argv[1]);
+  assert.equal(retained.backup.type, "pre-restore");
+  assert.equal(fs.existsSync(retained.archivePath), true);
+  assert.equal(backup.listBackups().find((entry) => entry.id === process.argv[2]).status, "success");
+  console.log(JSON.stringify({ ok: true }));
+`;
+
+test("invalid backup ID cannot direct staging cleanup outside the cloud-stage root", () => {
+  runFixture(`
+    const marker = path.join(dataDir, "marker", "keep.txt");
+    write(marker, "preserve this unrelated file");
+    (async () => {
+      await assert.rejects(backupService.createBackup({ backupId: "../../marker" }), { code: "BACKUP_ID_INVALID" });
+      assert.equal(fs.readFileSync(marker, "utf8"), "preserve this unrelated file");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("preparing restore coordinator identifies a pre-restore backup after a process exit", () => {
+  runFixture(`
+    const { spawnSync } = require("node:child_process");
+    write(path.join(dataDir, "runtime.json"), "selected-backup-state");
+    (async () => {
+      const selected = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "runtime.json"), "live-state");
+      const interrupted = spawnSync(process.execPath, ["-e", ${JSON.stringify(crashAfterPreRestoreBackupScript)}, selected.id], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 15_000 });
+      assert.equal(interrupted.status, 86, interrupted.stderr || interrupted.stdout);
+      const created = JSON.parse(interrupted.stdout.trim());
+      const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+      const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
+      assert.equal(coordinator.phase, "preparing");
+      assert.equal(coordinator.preRestoreBackupId, created.preRestoreBackupId);
+
+      const restarted = spawnSync(process.execPath, ["-e", ${JSON.stringify(restartAfterPreRestoreBackupScript)}, created.preRestoreBackupId, selected.id], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 15_000 });
+      assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+      assert.equal(JSON.parse(restarted.stdout.trim()).ok, true);
+      await assert.rejects(backupService.createBackup({ backupId: selected.id }), { code: "BACKUP_ID_COLLISION" });
+      assert.equal(backupService.listBackups().find((entry) => entry.id === selected.id).filename, selected.filename, "an ID collision cannot replace unrelated backup history");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("coordinator fsync failure removes the temporary file and preserves the prior coordinator", () => {
   runFixture(`
     write(path.join(dataDir, "runtime.json"), "selected-backup-state");
