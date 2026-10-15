@@ -226,7 +226,7 @@ test("bounded reader returns the stat from the validated read snapshot", (t) => 
   const filePath = path.join(directory, "state.json");
   const contents = "original";
   fs.writeFileSync(filePath, contents);
-  const originalStat = fs.statSync(filePath);
+  const originalStat = fs.statSync(filePath, { bigint: true });
   const changedTime = new Date("2040-01-01T00:00:00.000Z");
   const originalLstatSync = fs.lstatSync;
   let pathSnapshots = 0;
@@ -244,10 +244,11 @@ test("bounded reader returns the stat from the validated read snapshot", (t) => 
     const result = readBoundedRegularFile(filePath, 64);
     assert.equal(mutated, true);
     assert.equal(result.contents.toString("utf8"), contents);
-    const changedStat = fs.statSync(filePath);
+    const changedStat = fs.statSync(filePath, { bigint: true });
+    assert.equal(typeof result.stat.ino, "bigint");
     assert.equal(result.stat.size, originalStat.size);
-    assert.equal(result.stat.mtimeMs, originalStat.mtimeMs);
-    assert.notEqual(result.stat.mtimeMs, changedStat.mtimeMs);
+    assert.equal(result.stat.mtimeNs, originalStat.mtimeNs);
+    assert.notEqual(result.stat.mtimeNs, changedStat.mtimeNs);
   } finally {
     fs.lstatSync = originalLstatSync;
   }

@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const Database = require("better-sqlite3");
 const { getDb, isDbEnabled, jsonStringify, safeJsonParse } = require("../db");
 const { RUNTIME_ROOT, resolveRuntimePath } = require("../src/runtime-paths");
+const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
 
 const HISTORY_FILE = resolveRuntimePath("data", "backup-history.json");
 const MUTATION_LOCK_FILE = resolveRuntimePath("data", ".backup-metadata.lock");
@@ -111,18 +112,18 @@ function readLockSnapshot() {
     throw error;
   }
   try {
-    const descriptorStat = fs.fstatSync(fd);
+    const descriptorStat = fs.fstatSync(fd, { bigint: true });
     if (!descriptorStat.isFile()) return { kind: "unsafe" };
     let pathStat;
     try {
-      pathStat = fs.lstatSync(MUTATION_LOCK_FILE);
+      pathStat = fs.lstatSync(MUTATION_LOCK_FILE, { bigint: true });
     } catch (error) {
       if (error.code === "ENOENT") return { kind: "changed" };
       throw error;
     }
     if (pathStat.isSymbolicLink() || !pathStat.isFile()) return { kind: "unsafe" };
     if (!sameFileIdentity(pathStat, descriptorStat)) return { kind: "changed" };
-    return { kind: "file", fileIdentity: descriptorStat, mtimeMs: descriptorStat.mtimeMs, contents: fs.readFileSync(fd, "utf8") };
+    return { kind: "file", fileIdentity: descriptorStat, mtimeMs: Number(descriptorStat.mtimeMs), contents: fs.readFileSync(fd, "utf8") };
   } finally {
     try { fs.closeSync(fd); } catch {}
   }
@@ -232,7 +233,7 @@ function acquireJsonMutationLock(operationName = "restore-sync") {
     const token = crypto.randomUUID();
     try {
       fd = fs.openSync(MUTATION_LOCK_FILE, "wx");
-      descriptorStat = fs.fstatSync(fd);
+      descriptorStat = fs.fstatSync(fd, { bigint: true });
       const record = {
         formatVersion: MUTATION_LOCK_FORMAT_VERSION,
         token,
@@ -391,7 +392,7 @@ function saveJsonHistory(entries) {
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;
-    fs.renameSync(temporary, HISTORY_FILE);
+    renameSyncWithWindowsEpermRetry(temporary, HISTORY_FILE);
     ownsTemporary = false;
     renamedIntoPlace = true;
     if (process.platform !== "win32") {

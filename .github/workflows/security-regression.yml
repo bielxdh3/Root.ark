@@ -25,6 +25,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -61,6 +63,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -75,14 +79,8 @@ jobs:
         shell: pwsh
         run: "'TZ=UTC' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append; 'LC_ALL=C' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append"
 
-      - name: Run syntax validation
-        run: npm run validate:syntax
-
-      - name: Run automated tests
-        run: npm test
-
-      - name: Guard runtime artifacts
-        run: npm run validate:artifacts
+      - name: Run repository release gate
+        run: npm run validate:release-gate
 
       - name: Confirm clean checkout
         shell: pwsh
