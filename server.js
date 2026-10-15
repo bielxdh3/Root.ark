@@ -7158,7 +7158,7 @@ function readChunkMetadataFile(metadataPath) {
   }
 }
 
-function replaceChunkMetadataFile(sessionDir, metadataPath, metadata) {
+function replaceChunkMetadataFile(sessionDir, metadataPath, metadata, retryActivityRename = false) {
   assertSafeChunkSessionDirectory(sessionDir);
   const replacementPath = path.join(sessionDir, `.metadata-scrub-${crypto.randomUUID()}.tmp`);
   let originalStats = null;
@@ -7171,20 +7171,29 @@ function replaceChunkMetadataFile(sessionDir, metadataPath, metadata) {
 
   try {
     fs.writeFileSync(replacementPath, JSON.stringify(metadata, null, 2), { flag: "wx", mode: 0o600 });
-    assertSafeChunkSessionDirectory(sessionDir);
-    let currentStats = null;
-    try {
-      currentStats = fs.lstatSync(metadataPath, { bigint: true });
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
+    const renameAttempts = retryActivityRename ? 3 : 1;
+    for (let attempt = 0; attempt < renameAttempts; attempt += 1) {
+      assertSafeChunkSessionDirectory(sessionDir);
+      let currentStats = null;
+      try {
+        currentStats = fs.lstatSync(metadataPath, { bigint: true });
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      if (
+        (originalStats && (!currentStats || originalStats.dev !== currentStats.dev || originalStats.ino !== currentStats.ino)) ||
+        (!originalStats && currentStats)
+      ) {
+        throw new Error("Chunk-upload metadata changed during replacement");
+      }
+      try {
+        fs.renameSync(replacementPath, metadataPath);
+        break;
+      } catch (error) {
+        if (!retryActivityRename || error.code !== "EPERM" || attempt === renameAttempts - 1) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, attempt === 0 ? 10 : 25);
+      }
     }
-    if (
-      (originalStats && (!currentStats || originalStats.dev !== currentStats.dev || originalStats.ino !== currentStats.ino)) ||
-      (!originalStats && currentStats)
-    ) {
-      throw new Error("Chunk-upload metadata changed during replacement");
-    }
-    fs.renameSync(replacementPath, metadataPath);
     const installedStats = fs.lstatSync(metadataPath, { bigint: true });
     if (installedStats.isSymbolicLink() || !installedStats.isFile()) throw new Error("Chunk-upload metadata replacement is unsafe");
   } finally {
@@ -7209,7 +7218,7 @@ function migrateChunkSessionMetadata(sessionDir, metadata) {
 
 function touchChunkSessionActivity(sessionDir, metadata, now = Date.now()) {
   const updated = { ...metadata, lastActivityAt: new Date(now).toISOString() };
-  replaceChunkMetadataFile(sessionDir, path.join(sessionDir, "metadata.json"), updated);
+  replaceChunkMetadataFile(sessionDir, path.join(sessionDir, "metadata.json"), updated, true);
   return updated;
 }
 
