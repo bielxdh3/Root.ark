@@ -1,6 +1,27 @@
 # Root.ark Issue Ledger
 
-## Latest verified live-state snapshot after PR #165 — 2026-10-11 (`Root/main` `c5e904fd7625c50c74f40280e8ae329906485d74`)
+## GitHub snapshot after PR #189 — 2026-10-15 (application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`; pre-publication query)
+
+This point-in-time snapshot was queried after PR #189 merged and before documentation PR #175 was updated and published. It supersedes the post-#174 snapshot below for application and GitHub state at this query. PR #188 merged at `a557bfec762d45ceb574146841b9dffbe1b7757e` with chunk-upload limits; PR #189 merged at `bde6c54bee7a015822aa5463618bdf985ddf805d` with a disposable restore crash-injection regression. Exact checks are in the [post-#189 validation snapshot](validation/2026-10-15-rootark-post-189.md). The documentation publication itself is excluded from this pre-publication inventory and requires separate exact-head and final-`Root/main` validation.
+
+Issues #63 protected search, #64 native Android, #65 end-to-end Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change protection, #68 operation-scoped capability sharing, #94 deployment-wide chunk-upload limits, and #186 aggregate chunk-storage budgets remain open and incomplete.
+
+| PR | Live state at this query | Remaining acceptance boundary |
+|---|---|---|
+| #95 | Closed as superseded by #188 | No separate PR change remains to merge; #94 remains open for deployment-wide enforcement. |
+| #97 | Open; head `a6a33a92cd6902f303254e60031da4bdc04cec04`, base last recorded as `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; GitHub reported CLEAN | Keep open as partial #66 work. Metadata-only paginated catalog, selective network transfer, native Files On-Demand integration, safe eviction around external open-handle writers, and deterministic restart/reconnect remain incomplete. |
+| #175 | Open at this pre-publication query; documentation-publication vehicle | The update still needed to resolve two review threads and pass exact-head CI before merge. The resulting merge SHA and current state are separate from this snapshot. |
+| #179 | Merged at `2f3c8b04a8ef79cf6ea378e274ee3c051a3251c0` | Adds a bounded Windows-only `EPERM` retry for sync-journal atomic rename; it does not unlink the committed destination as a fallback. |
+| #188 | Merged at `a557bfec762d45ceb574146841b9dffbe1b7757e` | Adds per-account rolling limits before Multer and a socket-peer cap before the global JSON parser; it does not provide deployment-wide shared quota. |
+| #189 | Merged at `bde6c54bee7a015822aa5463618bdf985ddf805d` | Adds a disposable process-interruption test for provider-policy/state pair recovery before provider work and listener resume; it does not make all restore domains globally atomic. |
+| #172 | Merged at `31b288cc9241fc6fa2c1c9ea460fcff4e800c380` | Dependency update; its merge does not clear the separate open Dependabot alert. |
+| #173 | Merged at `87b2c8ccbb71512cb53d1cb1aa45e9238690d191` | Dependency update; its merge does not clear the separate open Dependabot alert. |
+
+Dependabot alert #1 remains open at medium severity for `GHSA-hp3w-g68c-fv3c` in transitive `sprintf-js`; GitHub reports no patched version. PRs #172 and #173 are merged, not open, and do not close this alert.
+
+Whole restore has verified local preimages, rollback journals, startup recovery, and durable provider reconciliation, but is not globally atomic across quarantine, filesystem, JSON/SQLite, and cloud APIs. External writers and provider APIs cannot join the local rollback transaction; Windows lacks a portable Node.js directory-entry flush; migrations use forward retry after a committed restore. The new PR #189 test covers one interrupted provider-policy pair rename boundary only. Root.ark is not an end-to-end Zero-Knowledge runtime or production-ready. See the linked validation record for exact checks, browser scope, and residual boundaries.
+
+## Historical verified live-state snapshot after PR #165 — 2026-10-11 (`Root/main` `c5e904fd7625c50c74f40280e8ae329906485d74`)
 
 This snapshot was queried after PR #165 merged. It supersedes the post-#164 snapshot below for the GitHub state and exact-SHA validation recorded here; earlier entries remain historical. The [post-#165 validation record](validation/2026-10-11-rootark-post-165.md) records checks on exact `Root/main` SHA `c5e904f`, current open work, browser evidence, the independent final review, and remaining boundaries. If a later documentation-only commit changes `Root/main`, its own merge SHA and push-triggered checks are a separate point-in-time record and must be reported without rewriting this snapshot.
 

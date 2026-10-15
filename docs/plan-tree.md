@@ -1,13 +1,13 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Latest live GitHub and application/security reconciliation: 2026-10-11 after PR #165; `Root/main` SHA `c5e904fd7625c50c74f40280e8ae329906485d74`.
+Latest application and pre-publication GitHub/security snapshot: 2026-10-15 after PR #189; application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`. It records the state queried before documentation PR #175 was published.
 
 Repository: bielxdh3/root.ark
 
-PR #164 merged the restore authorization and cancellation recovery corrections at `12e511ccc036b00664e0513b872bdabad56aa941`; PR #165 reconciled the post-#164 documentation. The exact merged `Root/main` SHA after PR #165 is `c5e904fd7625c50c74f40280e8ae329906485d74`. Its push-triggered Security Regression, CodeQL, Dependency Review, Pages, and local release gate passed. See the [post-#165 validation record](validation/2026-10-11-rootark-post-165.md), [issue ledger](issue-ledger.md), and [post-#164 correction record](validation/2026-10-11-rootark-post-164.md) for live issue/PR state, test counts, browser scope, restore limits, and remaining acceptance boundaries. The older snapshots below preserve their original evidence dates.
+PR #188 merged chunk-upload request limits at `a557bfec762d45ceb574146841b9dffbe1b7757e`. PR #189 merged at `bde6c54bee7a015822aa5463618bdf985ddf805d` and adds a test-only interrupted restore provider-policy pair recovery regression. Exact-SHA checks and browser evidence for this application revision are recorded in the [post-#189 validation snapshot](validation/2026-10-15-rootark-post-189.md). See the [issue ledger](issue-ledger.md) for the pre-publication issue/PR query and the restore limitation. The [post-#171 snapshot](validation/2026-10-14-rootark-post-171.md), [post-#169 snapshot](validation/2026-10-12-rootark-post-169.md), and earlier records link directly to their historical evidence.
 
-Historical sections below preserve their original evidence and claims; they are not current live status. Re-query GitHub before relying on issue, PR, or check state after this snapshot.
+Historical sections below preserve their original evidence and claims; they are not current live status. The application checks in this pre-publication snapshot do not transfer to the separate documentation publication or its resulting default-branch SHA.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
@@ -62,7 +62,7 @@ A feature is not `[DONE]` merely because files, routes, UI, or documentation exi
 5. GitHub issues for executable scope.
 6. Historical chat context only as input, never as proof.
 
-The issue ledger begins with the post-#165 GitHub snapshot and labels later changes as point-in-time evidence. Re-query GitHub for live state after that snapshot; older dated reconciliations below remain historical evidence.
+The issue ledger begins with the post-#174 GitHub snapshot and labels later changes as point-in-time evidence. Re-query GitHub for live state after that snapshot; older dated reconciliations below remain historical evidence.
 
 Master Phase 0-16 ledger and independent local blocker taxonomy: `docs/issue-ledger.md`. The governing continuation supplies the original meanings for all phases; local statuses and evidence are reconciled there without converting design or historical evidence into acceptance.
 

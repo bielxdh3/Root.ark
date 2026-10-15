@@ -69,7 +69,19 @@ The repository currently contains working foundations for:
 - [x] bounded provider retry/cancellation, idempotency, ciphertext-only attestation, and secret-safe observability helpers;
 - [x] automated syntax, test, dependency, and artifact validation.
 
-### Verified application snapshot after PR #164 — 2026-10-11 (Root/main application SHA 12e511ccc036b00664e0513b872bdabad56aa941)
+### Latest application validation snapshot after PR #189 — 2026-10-15 (`Root/main` application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`)
+
+PR #179 adds a bounded Windows `EPERM` retry for sync-journal rename; PR #188 adds chunk-upload request limits before body parsing and staging; PR #189 adds disposable crash-recovery coverage for the restore provider-policy pair. The [post-#189 validation snapshot](docs/validation/2026-10-15-rootark-post-189.md) records exact-SHA CI, browser coverage, the live issue/PR query, and remaining acceptance limits for application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`.
+
+This is an application-code snapshot. At the pre-publication query, PR #175 was open as the vehicle for this reconciliation; the locally prepared update still required its own exact-head and resulting-`Root/main` validation. The application checks above do not transfer to that publication. Restore remains recoverable rather than globally atomic, and Root.ark is not production-ready or an end-to-end Zero-Knowledge runtime.
+
+### Historical application snapshot after PR #169 — 2026-10-12 (`Root/main` application SHA `b62da94b236c046ae3251b632067072616587342`)
+
+PR #169 added disposable process-interruption restore tests and a bounded provider-convergence test wait, then merged at `b62da94b236c046ae3251b632067072616587342`. On that exact SHA, push-triggered Security Regression [run 38198318484](https://github.com/bielxdh3/Root.ark/actions/runs/38198318484) passed: Ubuntu Node 22 ran 1,172 tests (1,161 passed, 11 skipped, 0 failed); Windows Node 22 ran 1,172 tests (1,157 passed, 15 skipped, 0 failed). CodeQL [38198318488](https://github.com/bielxdh3/Root.ark/actions/runs/38198318488), Dependency Review [38198318447](https://github.com/bielxdh3/Root.ark/actions/runs/38198318447), Pages [38198317998](https://github.com/bielxdh3/Root.ark/actions/runs/38198317998), and the local release gate (21 passed, 0 blocked, 0 failed) also passed. The full npm audit still reports three moderate findings; the open `sprintf-js` Dependabot alert is not cleared by the high-severity gate. See the [post-#169 closure snapshot](docs/validation/2026-10-12-rootark-post-169.md) for browser evidence, issue/PR state, security boundaries, and restore semantics.
+
+This application snapshot is pinned to `b62da94`. A documentation-only publication changes `Root/main` separately and requires its own exact-SHA validation; those checks do not transfer from this application SHA.
+
+### Historical application snapshot after PR #164 — 2026-10-11 (Root/main application SHA 12e511ccc036b00664e0513b872bdabad56aa941)
 
 PR #164, fix(restore): revalidate authorization and preserve cancellation recovery, merged from b1f0b0eb079dfb1badd75183d1bc7cb880e5b070 at 12e511ccc036b00664e0513b872bdabad56aa941. Its PR-head tree and merge tree are identical (3dd893fd8e5f54e86948eac592a8bacc29216079). On that exact merge SHA, push-triggered Security Regression run [38184047635](https://github.com/bielxdh3/Root.ark/actions/runs/38184047635), CodeQL [38184048677](https://github.com/bielxdh3/Root.ark/actions/runs/38184048677), Dependency Review [38184047652](https://github.com/bielxdh3/Root.ark/actions/runs/38184047652), and Pages [38184047362](https://github.com/bielxdh3/Root.ark/actions/runs/38184047362) passed. The local release gate reported 21 passed, 0 blocked, 0 failed. Linux/Windows test counts, browser scope, current-at-query issues and PRs, security corrections, and the restore boundary are recorded in the [post-#164 validation snapshot](docs/validation/2026-10-11-rootark-post-164.md).
 
