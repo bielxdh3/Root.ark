@@ -2420,6 +2420,52 @@ test("cloud-complete selected archives upload selected bytes before opening same
   `);
 });
 
+test("legacy cloud-complete archives derive provider coverage from their validated ZIP payloads", () => {
+  runFixture(`
+    const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
+    const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
+    backupService.setCloudStorage({ enabled: () => false });
+    restoreService.setCloudStorage({ enabled: () => false });
+    (async () => {
+      const uploadPath = path.join(uploadsDir, "root", "legacy.txt");
+      const archivedBytes = "ARCHIVED legacy bytes";
+      write(uploadPath, archivedBytes);
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      const stored = backupService.getBackupOrThrow(backup.id);
+      fs.rmSync(stored.archivePath);
+      await backupService.createZipArchive(stored.archivePath, {
+        backup_id: backup.id,
+        cloud_complete: true,
+      }, [{ absolutePath: uploadPath, entryPath: "uploads/root/legacy.txt", size: Buffer.byteLength(archivedBytes) }]);
+      await backupRepository.saveBackup({ ...backup, checksum: null });
+      write(uploadPath, "live bytes");
+
+      const inventory = [
+        { provider: "fixture", providerIdentity: "archived", area: "uploads", folderId: "root", name: "legacy.txt" },
+        { provider: "fixture", providerIdentity: "orphan", area: "uploads", folderId: "root", name: "orphan.txt" },
+      ];
+      restoreService.setCloudStorage({
+        enabled: () => true,
+        provider: "fixture",
+        inventory: async () => inventory,
+        upload: async () => true,
+      });
+      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
+
+      assert.equal(restored.cloudSync.state, "pending", "the restored archive member must be queued for provider reconciliation");
+      assert.deepEqual(restored.cloudSync.entries.map(({ area, folderId, name }) => ({ area, folderId, name })), [
+        { area: "uploads", folderId: "root", name: "legacy.txt" },
+      ]);
+      assert.deepEqual(providerOrphans.read(), [
+        { area: "uploads", folderId: "root", name: "orphan.txt" },
+      ], "only provider objects absent from the validated ZIP payload remain suppressed");
+      assert.equal(providerOrphans.isSuppressed("root", "legacy.txt"), false);
+      assert.equal(fs.readFileSync(uploadPath, "utf8"), archivedBytes);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("pending cloud restore sync blocks stale provider downloads until selected bytes are uploaded", () => {
   runFixture(`
     const providerOrphans = require(${JSON.stringify(path.join(ROOT, "services", "restoreProviderOrphans"))});
@@ -5047,16 +5093,18 @@ test("cloud restore leaves newer local and provider pending bytes unchanged when
   `, { BACKUP_INCLUDE_TEMP: "true" });
 });
 
-test("manifest-only temp paths cannot exempt live provider temp objects from restore suppression", () => {
+test("manifest-only temp paths are rejected before they can alter live provider restore policy", () => {
   runFixture(`
     const backupRepository = require(${JSON.stringify(path.join(ROOT, "repositories", "backupRepository"))});
     let providerBytes = "newer provider pending bytes";
+    let providerDownloads = 0;
+    let providerUploads = 0;
     const cloud = {
       enabled: () => true,
       provider: "fixture",
       inventory: async () => [{ provider: "fixture", providerIdentity: "pending-object", area: "temp", folderId: "root", name: "pending.txt" }],
-      download: async (_folderId, _name, target) => { write(target, providerBytes); return true; },
-      upload: async () => ({ provider: "fixture" }),
+      download: async (_folderId, _name, target) => { providerDownloads += 1; write(target, providerBytes); return true; },
+      upload: async () => { providerUploads += 1; return { provider: "fixture" }; },
     };
     backupService.setCloudStorage({ enabled: () => false });
     restoreService.setCloudStorage({ enabled: () => false });
@@ -5074,11 +5122,16 @@ test("manifest-only temp paths cannot exempt live provider temp objects from res
 
       backupService.setCloudStorage(cloud);
       restoreService.setCloudStorage(cloud);
-      const restored = await restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" });
-      assert.equal(restored.cloudSync.state, "not_required");
-      const policy = JSON.parse(fs.readFileSync(path.join(dataDir, ".rootark-restore-provider-orphans.json"), "utf8"));
-      assert.deepEqual(policy.objects, [{ area: "temp", folderId: "root", name: "pending.txt" }]);
+      await assert.rejects(
+        restoreService.restoreBackup(backup.id, { confirmation: "RESTORE" }),
+        /Manifest included_files contains an invalid path/,
+      );
+      assert.equal(fs.readFileSync(path.join(dataDir, "restore-state.json"), "utf8"), "selected archive state");
+      assert.equal(fs.existsSync(path.join(dataDir, ".rootark-restore-provider-orphans.json")), false);
       assert.equal(providerBytes, "newer provider pending bytes");
+      assert.equal(providerDownloads, 0);
+      assert.equal(providerUploads, 0);
+      assert.equal(restoreService.assertNoPendingWholeRestore().reason, "no_pending_restore");
       console.log(JSON.stringify({ ok: true }));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `);
