@@ -871,6 +871,8 @@ test("PID probing without process-start support never reclaims a present or ambi
   assert.equal(classifyProcessOwner(4242, identity, identity, { platform: "win32", kill: () => {} }), "live");
   assert.equal(classifyProcessOwner(4242, identity, identity, { platform: "win32", kill: () => { throw Object.assign(new Error("denied"), { code: "EPERM" }); } }), "unknown");
   assert.equal(classifyProcessOwner(4242, identity, identity, { platform: "win32", kill: () => { throw Object.assign(new Error("missing"), { code: "ESRCH" }); } }), "dead");
+  const persistedIdentity = JSON.stringify(identity);
+  assert.equal(classifyProcessOwner(4242, persistedIdentity, persistedIdentity, { platform: "win32", kill: () => { throw Object.assign(new Error("missing"), { code: "ESRCH" }); } }), "dead", "serialized current and persisted identities must support conservative absent-PID recovery");
 });
 
 test("session locks serialize across separate Node processes", async () => {

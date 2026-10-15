@@ -1424,12 +1424,37 @@ test("failed chunk rename does not refresh accepted activity", { timeout: 45_000
 });
 
 function filesUnder(dir) {
-  if (!fs.existsSync(dir)) return [];
-  if (fs.statSync(dir).isFile()) return [crypto.createHash("sha256").update(fs.readFileSync(dir)).digest("hex")];
-  return fs.readdirSync(dir, { recursive: true, withFileTypes: true })
-    .filter((entry) => entry.isFile())
-    .map((entry) => entry.name)
-    .sort();
+  let descriptor;
+  try {
+    descriptor = fs.openSync(dir, "r");
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    // Windows may reject opening directories; listing remains the directory path.
+    if (["EACCES", "EISDIR", "EPERM"].includes(error.code)) return directoryEntries(dir);
+    throw error;
+  }
+
+  try {
+    if (fs.fstatSync(descriptor).isFile()) {
+      return [crypto.createHash("sha256").update(fs.readFileSync(descriptor)).digest("hex")];
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+
+  return directoryEntries(dir);
+}
+
+function directoryEntries(dir) {
+  try {
+    return fs.readdirSync(dir, { recursive: true, withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name)
+      .sort();
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
 }
 
 function assertRejectedClean(harness, response, expectedStatus = 400) {

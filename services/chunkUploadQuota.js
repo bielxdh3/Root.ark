@@ -182,7 +182,7 @@ function getCurrentProcessIdentity(pid = process.pid) {
 function classifyProcessOwner(ownerPid, ownerIdentity, currentIdentity, { platform = process.platform, kill = process.kill } = {}) {
   if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return "unknown";
   const owner = typeof ownerIdentity === "string" ? parseProcessIdentity(ownerIdentity) : normalizeProcessIdentity(ownerIdentity);
-  const current = normalizeProcessIdentity(currentIdentity);
+  const current = typeof currentIdentity === "string" ? parseProcessIdentity(currentIdentity) : normalizeProcessIdentity(currentIdentity);
   if (!owner || !current || owner.platform !== platform || current.platform !== platform) return "unknown";
 
   if (platform === "linux") {
