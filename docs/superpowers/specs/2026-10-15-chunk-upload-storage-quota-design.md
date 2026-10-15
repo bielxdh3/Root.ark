@@ -1,6 +1,6 @@
 # Chunk Upload Aggregate Storage Quota Design
 
-- **Status:** Draft for owner review
+- **Status:** Owner approved for implementation (2026-10-15)
 - **Issue:** [#186](https://github.com/bielxdh3/Root.ark/issues/186)
 - **Design baseline:** `Root/main` SHA `2a3fea8b151302de73be755775e4ca8ca54d1c14`
 - **Scope:** Aggregate temporary-storage accounting for chunked uploads under `temp/.chunks`.
@@ -137,4 +137,4 @@ Issue #186 remains open until the code, tests, deployment documentation, exact-h
 
 ## Owner approval gate
 
-This document records the selected design from the approved discussion. Implementation may begin only after the owner reviews and approves this written specification. Any material design change discovered during implementation must be returned for review before expanding scope.
+The owner approved this written specification on 2026-10-15. Implementation may proceed within this design. Any material design change discovered during implementation must be returned for review before expanding scope.
