@@ -326,7 +326,7 @@ function auditLogFileSignature(file) {
   return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
 }
 
-async function waitForAuditLogs(dir, predicate, timeout = 3000) {
+async function waitForAuditLogs(dir, predicate, timeout = 3000, onTransientSyntaxError) {
   const file = path.join(dir, "data", "audit-logs.json");
   const deadline = Date.now() + timeout;
   let lastSignature = auditLogFileSignature(file);
@@ -342,6 +342,7 @@ async function waitForAuditLogs(dir, predicate, timeout = 3000) {
       const after = auditLogFileSignature(file);
       if (after !== before) activeWriteUntil = Date.now() + 100;
       if (!(error instanceof SyntaxError) || Date.now() >= activeWriteUntil) throw error;
+      if (typeof onTransientSyntaxError === "function") onTransientSyntaxError(error);
       lastSignature = after;
       await new Promise((resolve) => setTimeout(resolve, 10));
       continue;
@@ -364,10 +365,20 @@ test("waits for audit logs to finish an observed rewrite before parsing", async 
   fs.writeFileSync(file, JSON.stringify({ logs: [] }));
 
   const expected = [{ id: "first" }, { id: "second" }];
-  const waiting = waitForAuditLogs(dir, (logs) => logs.length === expected.length);
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  let resolveTransientSyntaxError;
+  const transientSyntaxError = new Promise((resolve) => { resolveTransientSyntaxError = resolve; });
+  const waiting = waitForAuditLogs(
+    dir,
+    (logs) => logs.length === expected.length,
+    250,
+    () => resolveTransientSyntaxError()
+  );
   fs.writeFileSync(file, "{\"logs\":[");
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  const observation = await Promise.race([
+    transientSyntaxError.then(() => "observed"),
+    waiting.then(() => "completed", () => "timed out")
+  ]);
+  assert.equal(observation, "observed", "the helper read malformed JSON during the observed-rewrite retry window");
   fs.writeFileSync(file, JSON.stringify({ logs: expected }));
   assert.deepEqual(await waiting, expected);
 
