@@ -11,6 +11,7 @@ const { resolveRuntimePath } = require("../src/runtime-paths");
 const { attestCiphertextOnlyFile } = require("../src/services/deploymentResilience");
 const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, validateQuarantinePayloads } = require("../src/quarantine-paths");
 const restoreProviderOrphans = require("./restoreProviderOrphans");
+const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
 
 const BACKUPS_DIR = resolveRuntimePath("data", "backups");
 const SQLITE_BACKUP_STAGE_PREFIX = ".sqlite-backup-";
@@ -28,9 +29,6 @@ const OPERATION_LOCK_FORMAT_VERSION = 1;
 const MALFORMED_LOCK_TTL_MS = 60 * 1000;
 const MALFORMED_TAKEOVER_TTL_MS = 60 * 1000;
 const MAX_LOCK_TTL_MS = 24 * 60 * 60 * 1000;
-const WINDOWS_DURABLE_RENAME_MAX_ATTEMPTS = 3;
-const WINDOWS_DURABLE_RENAME_RETRY_DELAY_MS = 10;
-const durableRenameRetryWait = new Int32Array(new SharedArrayBuffer(4));
 const PROCESS_INSTANCE_ID_SYMBOL = Symbol.for("rootark.backup.process-instance-id");
 if (!globalThis[PROCESS_INSTANCE_ID_SYMBOL]) {
   Object.defineProperty(globalThis, PROCESS_INSTANCE_ID_SYMBOL, { value: crypto.randomUUID() });
@@ -533,46 +531,83 @@ function lockError(code, message) {
 }
 
 function readLockState() {
-  let stat;
-  try { stat = fs.statSync(LOCK_FILE); } catch (error) {
+  let snapshot;
+  try { snapshot = readFileSnapshot(LOCK_FILE, "utf8"); } catch (error) {
     if (error.code === "ENOENT") return { kind: "missing" };
     throw error;
   }
-  let contents = "";
-  try {
-    contents = fs.readFileSync(LOCK_FILE, "utf8");
-    const record = JSON.parse(contents);
-    if (!validLockRecord(record)) return { kind: "malformed", mtimeMs: stat.mtimeMs, contents, stat };
-    if (record.runtimeRoot && !sameRuntimeRoot(record.runtimeRoot, runtimeRootIdentity())) return { kind: "mismatch", record };
-    const createdAtMs = Date.parse(record.startedAt || "");
-    const ageMs = Math.max(Date.now() - stat.mtimeMs, Number.isFinite(createdAtMs) ? Date.now() - createdAtMs : 0);
-    const live = ownerIsLive(record);
-    const staleMs = boundedLockDuration("BACKUP_LOCK_STALE_MS", 6 * 60 * 60 * 1000);
-    return { kind: "valid", record, contents, stat, ageMs, live, stale: !live && (record.formatVersion === OPERATION_LOCK_FORMAT_VERSION || ageMs >= staleMs) };
-  } catch {
-    return { kind: "malformed", mtimeMs: stat.mtimeMs, contents, stat };
-  }
+  const { stat, contents } = snapshot;
+  if (!snapshot.stable) return { kind: "malformed", mtimeMs: Number(stat.mtimeMs), contents, stat };
+  let record;
+  try { record = JSON.parse(contents); } catch { return { kind: "malformed", mtimeMs: Number(stat.mtimeMs), contents, stat }; }
+  if (!validLockRecord(record)) return { kind: "malformed", mtimeMs: Number(stat.mtimeMs), contents, stat };
+  if (record.runtimeRoot && !sameRuntimeRoot(record.runtimeRoot, runtimeRootIdentity())) return { kind: "mismatch", record };
+  const createdAtMs = Date.parse(record.startedAt || "");
+  const ageMs = Math.max(Date.now() - Number(stat.mtimeMs), Number.isFinite(createdAtMs) ? Date.now() - createdAtMs : 0);
+  const live = ownerIsLive(record);
+  const staleMs = boundedLockDuration("BACKUP_LOCK_STALE_MS", 6 * 60 * 60 * 1000);
+  return { kind: "valid", record, contents, stat, mtimeMs: Number(stat.mtimeMs), ageMs, live, stale: !live && (record.formatVersion === OPERATION_LOCK_FORMAT_VERSION || ageMs >= staleMs) };
 }
 
 function statIdentity(stat) {
   return stat ? {
-    dev: stat.dev,
-    ino: stat.ino,
-    size: stat.size,
-    mtimeMs: stat.mtimeMs,
-    ctimeMs: stat.ctimeMs,
-    birthtimeMs: stat.birthtimeMs,
+    dev: typeof stat.dev === "bigint" ? stat.dev.toString() : stat.dev,
+    ino: typeof stat.ino === "bigint" ? stat.ino.toString() : stat.ino,
+    size: typeof stat.size === "bigint" ? Number(stat.size) : stat.size,
+    mtimeMs: typeof stat.mtimeMs === "bigint" ? Number(stat.mtimeMs) : stat.mtimeMs,
+    ctimeMs: typeof stat.ctimeMs === "bigint" ? Number(stat.ctimeMs) : stat.ctimeMs,
+    birthtimeMs: typeof stat.birthtimeMs === "bigint" ? Number(stat.birthtimeMs) : stat.birthtimeMs,
   } : null;
+}
+
+function exactFileId(value) {
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "string" && /^(0|[1-9]\d*)$/.test(value)) return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return String(value);
+  return null;
+}
+
+function sameFileIdentity(left, right) {
+  if (!left || !right) return false;
+  const leftDev = exactFileId(left.dev);
+  const leftIno = exactFileId(left.ino);
+  return leftDev !== null && leftIno !== null && leftDev === exactFileId(right.dev) && leftIno === exactFileId(right.ino)
+    && (left.birthtimeMs === right.birthtimeMs || left.ctimeMs === right.ctimeMs);
 }
 
 function sameStatIdentity(left, right) {
   if (!left || !right) return false;
-  return ["dev", "ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"].every((key) => left[key] === right[key]);
+  return exactFileId(left.dev) !== null && exactFileId(left.ino) !== null
+    && exactFileId(left.dev) === exactFileId(right.dev) && exactFileId(left.ino) === exactFileId(right.ino)
+    && ["size", "mtimeMs", "ctimeMs", "birthtimeMs"].every((key) => left[key] === right[key]);
 }
 
 function sameRenamedFileIdentity(left, right) {
   if (!left || !right) return false;
-  return ["dev", "ino", "size", "mtimeMs", "birthtimeMs"].every((key) => left[key] === right[key]);
+  return exactFileId(left.dev) !== null && exactFileId(left.ino) !== null
+    && exactFileId(left.dev) === exactFileId(right.dev) && exactFileId(left.ino) === exactFileId(right.ino)
+    && ["size", "mtimeMs", "birthtimeMs"].every((key) => left[key] === right[key]);
+}
+
+function readFileSnapshot(filePath, encoding) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+    const openedStat = fs.fstatSync(fd, { bigint: true });
+    if (!openedStat.isFile()) return { stat: openedStat, contents: "", stable: false };
+    let pathStat;
+    try { pathStat = fs.lstatSync(filePath, { bigint: true }); } catch { return { stat: openedStat, contents: "", stable: false }; }
+    if (!pathStat.isFile() || pathStat.isSymbolicLink() || !sameFileIdentity(pathStat, openedStat)) return { stat: openedStat, contents: "", stable: false };
+    let contents;
+    try { contents = fs.readFileSync(fd, encoding); } catch { return { stat: openedStat, contents: "", stable: false }; }
+    const finalStat = fs.fstatSync(fd, { bigint: true });
+    let finalPathStat;
+    try { finalPathStat = fs.lstatSync(filePath, { bigint: true }); } catch { return { stat: finalStat, contents, stable: false }; }
+    const pathStillMatches = finalPathStat.isFile() && !finalPathStat.isSymbolicLink() && sameFileIdentity(finalStat, finalPathStat);
+    return { stat: finalStat, contents, stable: pathStillMatches && sameStatIdentity(statIdentity(openedStat), statIdentity(finalStat)) };
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+  }
 }
 
 function lockObservation(state) {
@@ -595,38 +630,46 @@ function authorityPathIsSafe(target) {
   return path.dirname(path.resolve(target)) === path.resolve(BACKUPS_DIR) && path.basename(target) === path.basename(LOCK_TAKEOVER_DIR);
 }
 
+function validTakeoverToken(token) {
+  return typeof token === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token);
+}
+
 function validTakeoverAuthority(record) {
-  return record && record.version === OPERATION_LOCK_FORMAT_VERSION && typeof record.token === "string" && record.token && Number.isInteger(record.pid) && record.pid > 0 && (record.processInstanceId === undefined || (typeof record.processInstanceId === "string" && Boolean(record.processInstanceId))) && typeof record.instanceId === "string" && Boolean(record.instanceId) && typeof record.claimedAt === "string" && Number.isFinite(Date.parse(record.claimedAt)) && typeof record.runtimeRoot === "string" && sameRuntimeRoot(record.runtimeRoot, runtimeRootIdentity()) && record.lockPath === LOCK_FILE && record.evidencePath === LOCK_TAKEOVER_EVIDENCE && record.observed && typeof record.observed.sha256 === "string" && Number.isInteger(record.observed.size) && record.observed.stat;
+  return record && record.version === OPERATION_LOCK_FORMAT_VERSION && validTakeoverToken(record.token) && Number.isInteger(record.pid) && record.pid > 0 && (record.processInstanceId === undefined || (typeof record.processInstanceId === "string" && Boolean(record.processInstanceId))) && typeof record.instanceId === "string" && Boolean(record.instanceId) && typeof record.claimedAt === "string" && Number.isFinite(Date.parse(record.claimedAt)) && typeof record.runtimeRoot === "string" && sameRuntimeRoot(record.runtimeRoot, runtimeRootIdentity()) && record.lockPath === LOCK_FILE && record.evidencePath === LOCK_TAKEOVER_EVIDENCE && record.observed && typeof record.observed.sha256 === "string" && Number.isInteger(record.observed.size) && record.observed.stat;
 }
 
 function readTakeoverAuthority() {
   let stat;
   try {
-    const link = fs.lstatSync(LOCK_TAKEOVER_DIR);
+    const link = fs.lstatSync(LOCK_TAKEOVER_DIR, { bigint: true });
     if (!link.isDirectory() || link.isSymbolicLink() || !authorityPathIsSafe(LOCK_TAKEOVER_DIR)) return { kind: "ambiguous" };
     stat = link;
   } catch (error) {
     if (error.code === "ENOENT") return { kind: "missing" };
     throw error;
   }
+  let snapshot;
+  try { snapshot = readFileSnapshot(LOCK_TAKEOVER_META, "utf8"); } catch { return { kind: "malformed", mtimeMs: Number(stat.mtimeMs) }; }
+  if (!snapshot.stable) return { kind: "ambiguous" };
+  let currentDirectory;
+  try { currentDirectory = fs.lstatSync(LOCK_TAKEOVER_DIR, { bigint: true }); } catch { return { kind: "ambiguous" }; }
+  if (!currentDirectory.isDirectory() || currentDirectory.isSymbolicLink() || !sameFileIdentity(stat, currentDirectory)) return { kind: "ambiguous" };
   let record;
-  try { record = JSON.parse(fs.readFileSync(LOCK_TAKEOVER_META, "utf8")); } catch { return { kind: "malformed", mtimeMs: stat.mtimeMs }; }
+  try { record = JSON.parse(snapshot.contents); } catch { return { kind: "malformed", mtimeMs: Number(stat.mtimeMs) }; }
   if (!validTakeoverAuthority(record)) return { kind: "mismatch", record };
-  const ageMs = Math.max(Date.now() - stat.mtimeMs, Date.now() - Date.parse(record.claimedAt));
+  const ageMs = Math.max(Date.now() - Number(stat.mtimeMs), Date.now() - Date.parse(record.claimedAt));
   return { kind: "valid", record, live: ownerIsLive(record), stale: ageMs > MAX_LOCK_TTL_MS };
 }
 
-function evidenceMatchesAuthority(record) {
-  let stat;
-  let bytes;
+function evidenceMatchesAuthority(record, evidencePath = LOCK_TAKEOVER_EVIDENCE) {
+  let snapshot;
   try {
-    const link = fs.lstatSync(LOCK_TAKEOVER_EVIDENCE);
-    if (!link.isFile() || link.isSymbolicLink()) return false;
-    stat = link;
-    bytes = fs.readFileSync(LOCK_TAKEOVER_EVIDENCE);
+    snapshot = readFileSnapshot(evidencePath);
   } catch (error) {
-    return error.code === "ENOENT";
+    return evidencePath === LOCK_TAKEOVER_EVIDENCE && error.code === "ENOENT";
   }
+  if (!snapshot.stable) return false;
+  const { stat, contents: bytes } = snapshot;
   return crypto.createHash("sha256").update(bytes).digest("hex") === record.observed.sha256 && bytes.length === record.observed.size && sameRenamedFileIdentity(statIdentity(stat), record.observed.stat);
 }
 
@@ -634,8 +677,29 @@ function removeTakeoverAuthority(token) {
   const state = readTakeoverAuthority();
   if (state.kind === "missing") return;
   if (state.kind !== "valid" || state.record.token !== token) throw lockError("BACKUP_LOCKED", "Evidence de takeover de lock ambigua");
-  if (!evidenceMatchesAuthority(state.record)) throw lockError("BACKUP_LOCKED", "Evidence de takeover de lock ambigua");
-  try { fs.rmSync(LOCK_TAKEOVER_EVIDENCE, { force: false }); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  const authorityName = path.basename(LOCK_TAKEOVER_META);
+  const evidenceName = path.basename(LOCK_TAKEOVER_EVIDENCE);
+  const cleanupPrefix = `.evidence-cleanup-${token}-`;
+  const entries = fs.readdirSync(LOCK_TAKEOVER_DIR);
+  const cleanupEntries = entries.filter((entry) => entry.startsWith(cleanupPrefix));
+  if (cleanupEntries.length > 1 || entries.some((entry) => entry !== authorityName && entry !== evidenceName && !cleanupEntries.includes(entry))) {
+    throw lockError("BACKUP_LOCKED", "Evidence de takeover de lock ambigua");
+  }
+  let cleanupPath;
+  if (cleanupEntries.length) {
+    if (entries.includes(evidenceName)) throw lockError("BACKUP_LOCKED", "Evidence de takeover de lock ambigua");
+    cleanupPath = path.join(LOCK_TAKEOVER_DIR, cleanupEntries[0]);
+    if (!evidenceMatchesAuthority(state.record, cleanupPath)) throw lockError("BACKUP_LOCKED", "Evidence de takeover de lock ambigua");
+    fs.rmSync(cleanupPath, { force: false });
+  } else if (entries.includes(evidenceName)) {
+    cleanupPath = path.join(LOCK_TAKEOVER_DIR, `${cleanupPrefix}${crypto.randomUUID()}`);
+    try { fs.renameSync(LOCK_TAKEOVER_EVIDENCE, cleanupPath); } catch (error) { if (error.code !== "ENOENT") throw error; cleanupPath = undefined; }
+    if (cleanupPath) {
+      if (!evidenceMatchesAuthority(state.record, cleanupPath)) throw lockError("BACKUP_LOCKED", "Evidence de takeover de lock ambigua");
+      fs.rmSync(cleanupPath, { force: false });
+    }
+  }
+  if (fs.readdirSync(LOCK_TAKEOVER_DIR).some((entry) => entry !== authorityName)) throw lockError("BACKUP_LOCKED", "Evidence de takeover de lock ambigua");
   try { fs.rmSync(LOCK_TAKEOVER_META, { force: false }); } catch (error) { if (error.code !== "ENOENT") throw error; }
   try { fs.rmdirSync(LOCK_TAKEOVER_DIR); } catch (error) { if (error.code !== "ENOENT") throw error; }
 }
@@ -672,10 +736,10 @@ function acquireTakeoverAuthority(observed, operation) {
     evidencePath: LOCK_TAKEOVER_EVIDENCE,
     observed: takeoverObservation(observed),
   };
-  try { fs.mkdirSync(LOCK_TAKEOVER_DIR, { recursive: false }); } catch (error) {
+  try { fs.mkdirSync(LOCK_TAKEOVER_DIR, { recursive: false, mode: 0o700 }); } catch (error) {
     if (error.code !== "EEXIST") throw error;
     recoverTakeoverAuthority();
-    fs.mkdirSync(LOCK_TAKEOVER_DIR, { recursive: false });
+    fs.mkdirSync(LOCK_TAKEOVER_DIR, { recursive: false, mode: 0o700 });
   }
   try {
     writeDurableFile(LOCK_TAKEOVER_META, JSON.stringify(authority));
@@ -710,25 +774,12 @@ function writeDurableFile(filePath, contents) {
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;
-    renameDurableFileWithWindowsEpermRetry(temporary, filePath);
+    renameSyncWithWindowsEpermRetry(temporary, filePath);
     syncDirectory(path.dirname(filePath));
   } catch (error) {
     try { if (fd !== undefined) fs.closeSync(fd); } catch {}
     try { fs.rmSync(temporary, { force: true }); } catch {}
     throw error;
-  }
-}
-
-function renameDurableFileWithWindowsEpermRetry(source, destination) {
-  for (let attempt = 1; attempt <= WINDOWS_DURABLE_RENAME_MAX_ATTEMPTS; attempt += 1) {
-    try {
-      fs.renameSync(source, destination);
-      return;
-    } catch (error) {
-      // Keep publication atomic: never delete or replace the destination after a failed rename.
-      if (process.platform !== "win32" || error.code !== "EPERM" || attempt === WINDOWS_DURABLE_RENAME_MAX_ATTEMPTS) throw error;
-      Atomics.wait(durableRenameRetryWait, 0, 0, WINDOWS_DURABLE_RENAME_RETRY_DELAY_MS);
-    }
   }
 }
 
@@ -764,22 +815,21 @@ function lockRecord(operation, token, claimToken = null) {
   };
 }
 
-function cleanupOwnedIncompleteLock(descriptorStat, token) {
+function failClosedLockDescriptor(fd) {
+  if (fd === undefined) return;
   try {
-    const currentStat = fs.statSync(LOCK_FILE);
-    const contents = fs.readFileSync(LOCK_FILE, "utf8");
-    const sameFile = descriptorStat && currentStat.dev === descriptorStat.dev && currentStat.ino === descriptorStat.ino && (currentStat.birthtimeMs === descriptorStat.birthtimeMs || currentStat.ctimeMs === descriptorStat.ctimeMs);
-    if (sameFile && contents.includes(`"token":"${token}"`)) fs.rmSync(LOCK_FILE, { force: false });
+    fs.ftruncateSync(fd, 0);
+    const expiredAt = new Date(0);
+    fs.futimesSync(fd, expiredAt, expiredAt);
+    fs.fsyncSync(fd);
   } catch {}
 }
 
 function writeLock(operation, token = crypto.randomUUID(), claimToken = null) {
   const record = lockRecord(operation, token, claimToken);
   let fd;
-  let descriptorStat;
   try {
     fd = fs.openSync(LOCK_FILE, "wx");
-    descriptorStat = fs.fstatSync(fd);
     const contents = Buffer.from(JSON.stringify(record));
     let offset = 0;
     while (offset < contents.length) {
@@ -792,8 +842,9 @@ function writeLock(operation, token = crypto.randomUUID(), claimToken = null) {
     fd = undefined;
     return token;
   } catch (error) {
+    failClosedLockDescriptor(fd);
     try { if (fd !== undefined) fs.closeSync(fd); } catch {}
-    cleanupOwnedIncompleteLock(descriptorStat, token);
+    // Keep partial records fail-closed; stale malformed locks are reclaimed through the takeover protocol.
     throw error;
   }
 }

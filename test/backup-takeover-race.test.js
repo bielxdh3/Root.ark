@@ -48,6 +48,55 @@ function acquireSource(servicePath, enteredPath, resultCode = 0, afterAcquire = 
   return `const fs=require("fs"); const service=require(${JSON.stringify(servicePath)}); let release; try { release=service.acquireLock("backup"); ${afterAcquire} ${resultCode === 0 ? "release(); process.exit(0);" : "process.exit(12);"} } catch (error) { if (release) release(); process.exit(error.code === "BACKUP_LOCKED" ? 10 : 11); }`;
 }
 
+test("backup takeover preserves exact adjacent 64-bit file IDs in durable authority", { timeout: 30_000 }, async () => {
+  const runtime = newRuntime();
+  const lockPath = path.join(runtime, "data", "backups", ".backup.lock");
+  const evidencePath = lockPath + ".takeover" + path.sep + "evidence";
+  const authorityPath = lockPath + ".takeover" + path.sep + "authority.json";
+  try {
+    const ownerSource = 'const service=require(' + JSON.stringify(SERVICE) + '); service.acquireLock("backup"); process.exit(0);';
+    const owner = startChild(runtime, ownerSource);
+    const ownerResult = await owner.result;
+    assert.equal(ownerResult.code, 0, ownerResult.stderr);
+    assert.equal(fs.existsSync(lockPath), true, "the disposable child leaves its lock as a stale recovery fixture");
+    const staleLockBytes = fs.readFileSync(lockPath);
+
+    const id = 9_007_199_254_740_992n;
+    const contenderSource = [
+      'const fs=require("node:fs");',
+      'const path=require("node:path");',
+      'const service=require(' + JSON.stringify(SERVICE) + ');',
+      'const lock=path.resolve(service.LOCK_FILE);',
+      'const evidence=path.resolve(service.LOCK_FILE + ".takeover" + path.sep + "evidence");',
+      'const adjacent=9007199254740992n;',
+      'const opened=new Map();',
+      'const open=fs.openSync;',
+      'const fstat=fs.fstatSync;',
+      'const stat=fs.statSync;',
+      'const lstat=fs.lstatSync;',
+      'const identify=(value,args,ino)=>new Proxy(value,{get(target,key,receiver){if(key==="dev")return args[0]?.bigint===true?1n:1;if(key==="ino")return args[0]?.bigint===true?ino:Number(ino);return Reflect.get(target,key,receiver);}});',
+      'fs.openSync=function(target,...args){const fd=open.call(this,target,...args);opened.set(fd,path.resolve(String(target)));return fd;};',
+      'fs.fstatSync=function(fd,...args){const value=fstat.call(this,fd,...args);const resolved=opened.get(fd);const staged=resolved&&path.dirname(resolved)===path.dirname(evidence)&&path.basename(resolved).startsWith(".evidence-cleanup-");return resolved===lock?identify(value,args,adjacent):(resolved===evidence||staged)?identify(value,args,adjacent+1n):value;};',
+      'fs.statSync=function(target,...args){const value=stat.call(this,target,...args);return path.resolve(String(target))===lock?identify(value,args,adjacent):value;};',
+      'fs.lstatSync=function(target,...args){const value=lstat.call(this,target,...args);const resolved=path.resolve(String(target));const staged=path.dirname(resolved)===path.dirname(evidence)&&path.basename(resolved).startsWith(".evidence-cleanup-");return resolved===lock?identify(value,args,adjacent):(resolved===evidence||staged)?identify(value,args,adjacent+1n):value;};',
+      'try{const release=service.acquireLock("backup");release();process.exit(12);}catch(error){process.exit(error.code==="BACKUP_LOCKED"?10:11);}'
+    ].join('');
+    const contender = startChild(runtime, contenderSource);
+    const result = await contender.result;
+    assert.equal(result.code, 10, result.stderr || result.stdout);
+    assert.equal(Number(id), Number(id + 1n), "the injected adjacent IDs collide under Number conversion");
+    const takeoverDir = path.dirname(authorityPath);
+    const retainedEvidence = fs.readdirSync(takeoverDir)
+      .filter((entry) => entry === path.basename(evidencePath) || entry.startsWith(".evidence-cleanup-"));
+    assert.equal(retainedEvidence.length, 1, "ambiguous renamed evidence remains available for safe recovery");
+    assert.deepEqual(fs.readFileSync(path.join(takeoverDir, retainedEvidence[0])), staleLockBytes, "retained evidence preserves the exact stale lock bytes");
+    const authority = JSON.parse(fs.readFileSync(authorityPath, "utf8"));
+    assert.equal(authority.observed.stat.ino, id.toString(), "durable takeover evidence stores the exact decimal file ID");
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("stale takeover contenders preserve a newer live lock", { timeout: 30_000 }, async () => {
   const runtime = newRuntime();
   const backupDir = path.join(runtime, "data", "backups");
@@ -93,6 +142,90 @@ test("stale takeover contenders preserve a newer live lock", { timeout: 30_000 }
   } finally {
     if (contender?.exitCode === null) contender.kill("SIGKILL");
     if (owner?.exitCode === null) owner.kill("SIGKILL");
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("malformed takeover tokens fail closed without moving evidence", { timeout: 30_000 }, async () => {
+  const runtime = newRuntime();
+  const backupDir = path.join(runtime, "data", "backups");
+  const takeoverDir = path.join(backupDir, ".backup.lock.takeover");
+  const evidencePath = path.join(takeoverDir, "evidence");
+  const authorityPath = path.join(takeoverDir, "authority.json");
+  const attemptPath = path.join(runtime, "rename-attempt.json");
+  const evidence = Buffer.from("disposable stale lock evidence");
+  fs.mkdirSync(takeoverDir, { recursive: true });
+  fs.writeFileSync(evidencePath, evidence);
+  const instanceId = String(process.env.ROOTARK_INSTANCE_ID || process.env.HOSTNAME || process.env.COMPUTERNAME || os.hostname() || "default").trim();
+  const tokens = ["../../../../escaped", "..\\..\\..\\..\\escaped"];
+
+  try {
+    for (const token of tokens) {
+      const evidenceDescriptor = fs.openSync(evidencePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      try {
+        const observedStat = fs.fstatSync(evidenceDescriptor, { bigint: true });
+        const statIdentity = {
+          dev: observedStat.dev.toString(),
+          ino: observedStat.ino.toString(),
+          size: Number(observedStat.size),
+          mtimeMs: Number(observedStat.mtimeMs),
+          ctimeMs: Number(observedStat.ctimeMs),
+          birthtimeMs: Number(observedStat.birthtimeMs),
+        };
+        fs.writeFileSync(authorityPath, JSON.stringify({
+          version: 1,
+          token,
+          operation: "backup",
+          pid: 2_147_483_647,
+          instanceId,
+          claimedAt: new Date(0).toISOString(),
+          runtimeRoot: fs.realpathSync(runtime),
+          lockPath: path.join(backupDir, ".backup.lock"),
+          evidencePath,
+          observed: {
+            sha256: require("node:crypto").createHash("sha256").update(evidence).digest("hex"),
+            size: evidence.length,
+            stat: statIdentity,
+          },
+        }));
+
+        const childSource = `
+        const fs = require("node:fs");
+        const path = require("node:path");
+        const service = require(${JSON.stringify(SERVICE)});
+        const attemptPath = ${JSON.stringify(attemptPath)};
+        const evidencePath = path.resolve(service.LOCK_FILE + ".takeover" + path.sep + "evidence");
+        const processKill = process.kill;
+        process.kill = function(pid, signal) {
+          if (pid === 2147483647 && signal === 0) {
+            const error = new Error("No such process");
+            error.code = "ESRCH";
+            throw error;
+          }
+          return processKill.call(process, pid, signal);
+        };
+        const renameSync = fs.renameSync;
+        fs.renameSync = function(source, destination, ...args) {
+          if (path.resolve(String(source)) === evidencePath) fs.writeFileSync(attemptPath, JSON.stringify({ destination: String(destination) }));
+          return renameSync.call(this, source, destination, ...args);
+        };
+        try { const release = service.acquireLock("backup"); release(); process.exit(12); }
+        catch (error) { process.exit(error.code === "BACKUP_LOCKED" ? 10 : 11); }
+      `;
+        const child = startChild(runtime, childSource);
+        const result = await child.result;
+        assert.equal(result.code, 10, result.stderr || result.stdout);
+        assert.equal(fs.existsSync(attemptPath), false, `token ${JSON.stringify(token)} must not reach the evidence rename`);
+        assert.equal(fs.existsSync(authorityPath), true, "ambiguous authority remains available for safe recovery");
+        assert.equal(fs.existsSync(evidencePath), true, "stale lock evidence remains at its protected path");
+        assert.deepEqual(fs.readFileSync(evidenceDescriptor), evidence, "stale lock evidence contents remain unchanged");
+        fs.rmSync(authorityPath, { force: true });
+        fs.rmSync(attemptPath, { force: true });
+      } finally {
+        fs.closeSync(evidenceDescriptor);
+      }
+    }
+  } finally {
     fs.rmSync(runtime, { recursive: true, force: true });
   }
 });

@@ -26,11 +26,12 @@ function createFixture(t, records, options = {}) {
   return directory;
 }
 
-function runInventory(directory) {
-  const args = [scriptPath];
+function runInventory(directory, { preloadPath, env = {} } = {}) {
+  const args = [...(preloadPath ? ["--require", preloadPath] : []), scriptPath];
   if (directory !== undefined) args.push("--source-dir", directory);
   return spawnSync(process.execPath, args, {
     cwd: repositoryRoot,
+    env: { ...process.env, ...env },
     encoding: "utf8",
     windowsHide: true,
   });
@@ -203,4 +204,51 @@ test("rejects malformed, unsupported, oversized, and over-count metadata", (t) =
   assert.equal(result.status, 2);
   assert.equal(result.stdout, "");
   assert.match(result.stderr, /record count exceeds the limit/);
+});
+
+test("rejects a fixture path swap when adjacent 64-bit file IDs collide as Numbers", (t) => {
+  const fixture = createFixture(t, { "opaque-fixture": { encryptionLevel: "server-key" } });
+  const preloadDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-id-precision-"));
+  const preloadPath = path.join(preloadDirectory, "identity.cjs");
+  t.after(() => fs.rmSync(preloadDirectory, { recursive: true, force: true }));
+  fs.writeFileSync(preloadPath, String.raw`const fs = require("node:fs");
+const path = require("node:path");
+const target = path.resolve(process.env.ROOTARK_ZK_IDENTITY_TARGET);
+const adjacent = 9_007_199_254_740_992n;
+const originalOpen = fs.openSync;
+const originalFstat = fs.fstatSync;
+const originalLstat = fs.lstatSync;
+const originalClose = fs.closeSync;
+const descriptors = new Set();
+const sameType = (stats, bigint, ino) => new Proxy(stats, { get(object, property, receiver) {
+  if (property === "dev") return bigint ? 1n : 1;
+  if (property === "ino") return bigint ? ino : Number(ino);
+  return Reflect.get(object, property, receiver);
+} });
+fs.openSync = function (file, ...args) {
+  const descriptor = originalOpen.call(this, file, ...args);
+  if (path.resolve(String(file)) === target) descriptors.add(descriptor);
+  return descriptor;
+};
+fs.fstatSync = function (descriptor, ...args) {
+  const stats = originalFstat.call(this, descriptor, ...args);
+  return descriptors.has(descriptor) ? sameType(stats, args[0]?.bigint === true, adjacent) : stats;
+};
+fs.lstatSync = function (file, ...args) {
+  const stats = originalLstat.call(this, file, ...args);
+  return path.resolve(String(file)) === target ? sameType(stats, args[0]?.bigint === true, adjacent + 1n) : stats;
+};
+fs.closeSync = function (descriptor) {
+  descriptors.delete(descriptor);
+  return originalClose.call(this, descriptor);
+};
+`, { flag: "wx", mode: 0o600 });
+  const result = runInventory(fixture, {
+    preloadPath,
+    env: { ROOTARK_ZK_IDENTITY_TARGET: path.join(fixture, "encrypted-files.json") },
+  });
+  assert.equal(Number(9_007_199_254_740_992n), Number(9_007_199_254_740_993n));
+  assert.equal(result.status, 2, result.stderr || result.stdout);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /fixture file changed while opening/);
 });
