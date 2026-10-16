@@ -859,6 +859,22 @@ test("operation ownership is unknown when a matching PID belongs to another name
   }
 });
 
+test("process ownership stays unknown when procfs exposes another PID namespace", () => {
+  const identity = { version: 1, platform: "linux", hostId: "a".repeat(64), bootId: "00000000-0000-0000-0000-000000000001", pidNamespace: "pid:[200]", processStartTime: "10" };
+  let ownerPidRead = false;
+  const status = classifyProcessOwner(4242, identity, identity, {
+    platform: "linux",
+    readlinkSync: (filePath) => {
+      if (filePath === "/proc/1/ns/pid") return "pid:[100]";
+      ownerPidRead = true;
+      throw Object.assign(new Error("no such process in this procfs view"), { code: "ENOENT" });
+    },
+  });
+
+  assert.equal(status, "unknown", "an out-of-namespace /proc view cannot prove that the owner PID is dead");
+  assert.equal(ownerPidRead, false, "the classifier rejects the procfs view before interpreting a missing numeric PID");
+});
+
 test("malformed Linux owner identity is ambiguous instead of being treated as PID reuse", { skip: process.platform !== "linux" }, (t) => {
   const current = getCurrentProcessIdentity();
   if (!current) return t.skip("the host process identity is unavailable");

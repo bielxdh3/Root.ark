@@ -156,6 +156,11 @@ function readLinuxProcessStartTime(pid) {
   return startTime;
 }
 
+function linuxProcfsMatchesPidNamespace(pidNamespace, readlinkSync = fs.readlinkSync) {
+  try { return readlinkSync("/proc/1/ns/pid") === pidNamespace; }
+  catch { return false; }
+}
+
 function getCurrentProcessIdentity(pid = process.pid) {
   if (pid !== process.pid) return null;
   if (process.platform !== "linux") {
@@ -170,6 +175,7 @@ function getCurrentProcessIdentity(pid = process.pid) {
       .find(Boolean);
     const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
     const pidNamespace = fs.readlinkSync("/proc/self/ns/pid");
+    if (!linuxProcfsMatchesPidNamespace(pidNamespace)) return null;
     const processStartTime = readLinuxProcessStartTime(pid);
     if (!machineId || !bootId || !pidNamespace || !processStartTime) return null;
     const hostId = crypto.createHash("sha256").update(`rootark-chunk-quota-host\0${machineId}`).digest("hex");
@@ -179,7 +185,7 @@ function getCurrentProcessIdentity(pid = process.pid) {
   }
 }
 
-function classifyProcessOwner(ownerPid, ownerIdentity, currentIdentity, { platform = process.platform, kill = process.kill } = {}) {
+function classifyProcessOwner(ownerPid, ownerIdentity, currentIdentity, { platform = process.platform, kill = process.kill, readlinkSync = fs.readlinkSync } = {}) {
   if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return "unknown";
   const owner = typeof ownerIdentity === "string" ? parseProcessIdentity(ownerIdentity) : normalizeProcessIdentity(ownerIdentity);
   const current = typeof currentIdentity === "string" ? parseProcessIdentity(currentIdentity) : normalizeProcessIdentity(currentIdentity);
@@ -187,8 +193,9 @@ function classifyProcessOwner(ownerPid, ownerIdentity, currentIdentity, { platfo
 
   if (platform === "linux") {
     if (owner.hostId !== current.hostId || owner.bootId !== current.bootId || owner.pidNamespace !== current.pidNamespace) return "unknown";
+    if (!linuxProcfsMatchesPidNamespace(current.pidNamespace, readlinkSync)) return "unknown";
     try {
-      const namespace = fs.readlinkSync(`/proc/${ownerPid}/ns/pid`);
+      const namespace = readlinkSync(`/proc/${ownerPid}/ns/pid`);
       if (namespace !== owner.pidNamespace) return "unknown";
       return readLinuxProcessStartTime(ownerPid) === owner.processStartTime ? "live" : "dead";
     } catch (error) {

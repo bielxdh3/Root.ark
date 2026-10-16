@@ -812,7 +812,11 @@ test("the chunk-session sweeper shares the cross-process session lock when quota
   const harness = await createHarness(t, {
     envOverrides: { CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS: "1000" },
     preloadSource: ({ chunkRoot }) => `
-      require("node:fs").writeFileSync(${JSON.stringify(path.join(chunkRoot, ".quota.sqlite"))}, "not a SQLite database");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const databasePath = ${JSON.stringify(path.join(chunkRoot, ".quota.sqlite"))};
+      fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+      fs.writeFileSync(databasePath, "not a SQLite database");
     `,
   });
   const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
@@ -2122,19 +2126,29 @@ test("chunk multipart without a file or with a parser error releases the pre-Mul
       { field: "chunkIndex", bytes: "0" },
       { field: "totalChunks", bytes: "1" },
     ]);
-    const noFileResponse = await request(harness.port, `/upload-chunk?folderId=${FOLDER_ID}`, {
-      method: "POST",
-      headers: { cookie: session.cookie, origin: `http://127.0.0.1:${harness.port}`, "x-csrf-token": session.csrf, "content-type": noFile.contentType, "content-length": noFile.body.length },
-      body: noFile.body,
-    });
+    let noFileResponse;
+    try {
+      noFileResponse = await request(harness.port, `/upload-chunk?folderId=${FOLDER_ID}`, {
+        method: "POST",
+        headers: { cookie: session.cookie, origin: `http://127.0.0.1:${harness.port}`, "x-csrf-token": session.csrf, "content-type": noFile.contentType, "content-length": noFile.body.length },
+        body: noFile.body,
+      });
+    } catch (error) {
+      throw new Error(`file-less multipart request failed: ${error.code || error.name}: ${error.message}`, { cause: error });
+    }
     assert.equal(noFileResponse.status, 400, noFileResponse.body);
     assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0, "file-less multipart releases its reservation");
 
-    const malformed = await request(harness.port, `/upload-chunk?folderId=${FOLDER_ID}`, {
-      method: "POST",
-      headers: { cookie: session.cookie, origin: `http://127.0.0.1:${harness.port}`, "x-csrf-token": session.csrf, "content-type": "multipart/form-data; boundary=missing-boundary", "content-length": Buffer.byteLength("not multipart data") },
-      body: "not multipart data",
-    });
+    let malformed;
+    try {
+      malformed = await request(harness.port, `/upload-chunk?folderId=${FOLDER_ID}`, {
+        method: "POST",
+        headers: { cookie: session.cookie, origin: `http://127.0.0.1:${harness.port}`, "x-csrf-token": session.csrf, "content-type": "multipart/form-data; boundary=missing-boundary", "content-length": Buffer.byteLength("not multipart data") },
+        body: "not multipart data",
+      });
+    } catch (error) {
+      throw new Error(`malformed multipart request failed: ${error.code || error.name}: ${error.message}`, { cause: error });
+    }
     assert.equal(malformed.status, 400, malformed.body);
     assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0, "parser failure before a filename path releases its reservation");
     assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
@@ -2189,7 +2203,7 @@ test("failed handoff destination cleanup retains its charge and blocks retries f
     const handoff = database.prepare("SELECT operation_id, state, charge_bytes, relative_path FROM quota_operations WHERE state = 'handoff_published'").get();
     assert.ok(handoff, JSON.stringify({ rows: database.prepare("SELECT operation_id, state, charge_bytes, relative_path FROM quota_operations").all(), stderr: harness.stderr }));
     assert.equal(handoff.charge_bytes, fs.statSync(destinationPath).size);
-    assert.match(handoff.relative_path, /^handoff\\/);
+    assert.match(handoff.relative_path.replace(/\\/g, "/"), /^handoff\//);
 
     const retry = await uploadChunk(harness.port, session, {
       uploadId,
@@ -3855,7 +3869,8 @@ test("startup removes an unregistered published handoff and keeps charged parts 
   assert.deepEqual(fs.readFileSync(destinationPath), bytes);
   const finalLedger = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
   try {
-    assert.equal(finalLedger.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0);
+    const remainingOperations = finalLedger.prepare("SELECT operation_id, account_key, session_key, relative_path, state, charge_bytes FROM quota_operations ORDER BY operation_id").all();
+    assert.deepEqual(remainingOperations, [], `unexpected operations after successful retry: ${JSON.stringify(remainingOperations)}`);
   } finally {
     finalLedger.close();
   }
@@ -4068,10 +4083,10 @@ test("a corrupt chunk quota ledger disables only chunk uploads at startup", { ti
   assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
 });
 
-test("semantically invalid quota rows fail closed before startup recovery mutates session files", { timeout: 45_000 }, async (t) => {
+test("semantically invalid quota rows preserve session payloads while startup scrubs legacy passwords", { timeout: 45_000 }, async (t) => {
   const uploadId = "invalid-quota-state-path";
   const partBytes = Buffer.from("accepted disposable chunk data");
-  const metadata = legacyChunkMetadata(uploadId, { totalChunks: 1, encryptionLevel: "none" });
+  const metadata = legacyChunkMetadata(uploadId, { totalChunks: 1, encryptionLevel: "none", password: "disposable-legacy-encryption-password" });
   const staleIncomingId = "a".repeat(32);
   const sessionKey = `${FOLDER_ID}/${uploadId}`;
   const harness = await createHarness(t, {
@@ -4098,7 +4113,7 @@ test("semantically invalid quota rows fail closed before startup recovery mutate
 
   if (process.platform !== "win32") {
     const sessionMode = fs.statSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId)).mode & 0o777;
-    assert.equal(sessionMode, 0o755, "read-only ledger prevalidation must not chmod a session before rejecting the ledger");
+    assert.equal(sessionMode, 0o700, "startup keeps legacy chunk sessions private while validating an invalid ledger");
   }
   assert.deepEqual(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part")), partBytes);
   const preservedMetadata = JSON.parse(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "metadata.json"), "utf8"));
@@ -4107,7 +4122,7 @@ test("semantically invalid quota rows fail closed before startup recovery mutate
   assert.equal(preservedMetadata.uploadedBy, "uploader");
   assert.equal(preservedMetadata.totalChunks, 1);
   assert.equal(preservedMetadata.encryptionLevel, "none");
-  assert.equal(Object.hasOwn(preservedMetadata, "password"), false);
+  assert.equal(Object.hasOwn(preservedMetadata, "password"), false, "invalid-ledger startup still scrubs legacy plaintext upload passwords");
   assert.equal(fs.readFileSync(path.join(harness.chunkRoot, "incoming", staleIncomingId), "utf8"), "retain during fail-closed validation");
   const session = await login(harness.port, "uploader", harness.password);
   assert.equal((await request(harness.port, "/login.html")).status, 200);
@@ -4360,7 +4375,7 @@ test("chunk uploads fail closed before Multer when local single-host topology is
   });
   assert.equal(response.status, 503, response.body);
   assert.equal(JSON.parse(response.body).code, "CHUNK_QUOTA_UNAVAILABLE");
-  assert.equal(fs.existsSync(path.join(harness.chunkRoot, "incoming")), false, "the disabled endpoint never creates its staging directory");
+  assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), [], "the disabled endpoint creates no incoming staged file");
   assert.equal(fs.existsSync(path.join(harness.chunkRoot, ".quota.sqlite")), false);
   assert.equal((await request(harness.port, "/login.html")).status, 200);
 });
