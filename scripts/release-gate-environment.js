@@ -64,6 +64,16 @@ function getMissingModuleFailures(text) {
   });
 }
 
+function getNpmInvocation(args, { platform = process.platform, comSpec = process.env.ComSpec } = {}) {
+  if (platform === "win32") {
+    return {
+      executable: comSpec || "cmd.exe",
+      args: ["/d", "/s", "/c", `npm.cmd ${args.join(" ")}`],
+    };
+  }
+  return { executable: "npm", args };
+}
+
 function isDependencyOrNetworkUnavailable(output, { resolvePackage = isResolvablePackage } = {}) {
   const text = String(output || "");
   const missingFailures = getMissingModuleFailures(text);
@@ -86,4 +96,4 @@ function isDependencyOrNetworkUnavailable(output, { resolvePackage = isResolvabl
     || /(?:^|\n)npm (?:ERR!|error) network request to .+ failed/im.test(text));
 }
 
-module.exports = { isDependencyOrNetworkUnavailable };
+module.exports = { getNpmInvocation, isDependencyOrNetworkUnavailable };
