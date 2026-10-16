@@ -1,5 +1,6 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
@@ -66,6 +67,13 @@ async function waitForServer(child, readyPromise, getDiagnostics = () => "", tim
   }
 }
 
+async function stopChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  if (child.exitCode === null && child.signalCode === null) child.kill();
+  if (child.exitCode === null && child.signalCode === null) await exited;
+}
+
 test("server readiness does not accept an unrelated listener on the selected port", async (t) => {
   const unrelated = http.createServer((req, res) => {
     res.statusCode = req.url === "/login.html" ? 200 : 405;
@@ -84,6 +92,34 @@ test("server readiness does not accept an unrelated listener on the selected por
     await new Promise((resolve) => unrelated.close(resolve));
   });
   await assert.rejects(waitForServer(child, new Promise(() => {}), () => "", 250), /server readiness timed out/);
+});
+
+test("server child cleanup does not wait after a signal exit", async () => {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = "SIGTERM";
+  let killCalls = 0;
+  child.kill = () => { killCalls += 1; };
+
+  await stopChild(child);
+
+  assert.equal(killCalls, 0);
+});
+
+test("server child cleanup observes the exit caused by its own kill", async () => {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+  let killCalls = 0;
+  child.kill = () => {
+    killCalls += 1;
+    child.signalCode = "SIGTERM";
+    child.emit("exit", null, child.signalCode);
+  };
+
+  await stopChild(child);
+
+  assert.equal(killCalls, 1);
 });
 
 test("realtime and WebDAV meta-remediation matrix", async (t) => {
@@ -159,7 +195,7 @@ test("realtime and WebDAV meta-remediation matrix", async (t) => {
     const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: "0", DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", WEBDAV_ALLOW_MOVE: "true", WEBDAV_MOVE_FAIL_AFTER: "replacement.install", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let childStderr = "";
     child.stderr.on("data", (chunk) => { childStderr = `${childStderr}${chunk.toString()}`.slice(-4096); });
-    t2.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
+    t2.after(async () => { await stopChild(child); fs.rmSync(dir, { recursive: true, force: true }); });
     const port = await waitForServer(child, waitForServerReadyAnnouncement(child), () => childStderr);
     const authorization = `Basic ${Buffer.from("agent:password").toString("base64")}`;
     const result = await request(port, "/dav/source.txt", { method: "MOVE", headers: { authorization, destination: "/dav/target.txt", overwrite: "T" } });
