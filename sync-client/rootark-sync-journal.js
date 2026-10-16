@@ -144,4 +144,4 @@ class SyncJournal {
   async recover() { return this.pending(); }
 }
 
-module.exports = { SyncJournal, durableWrite };
+module.exports = { SyncJournal, durableWrite, renameWithRetry };
