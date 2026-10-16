@@ -8175,8 +8175,29 @@ function assertChunkQuotaFilesystemTracked() {
       for (const incoming of fs.readdirSync(CHUNK_UPLOAD_INCOMING_DIR, { withFileTypes: true })) {
         const incomingPath = path.join(CHUNK_UPLOAD_INCOMING_DIR, incoming.name);
         const operation = tracked.get(path.resolve(incomingPath));
-        if (incoming.isSymbolicLink() || !incoming.isFile() || !operation) throw new Error("Untracked incoming chunk file");
-        const stats = fs.lstatSync(incomingPath);
+        if (incoming.isSymbolicLink() || !incoming.isFile()) throw new Error("Untracked incoming chunk file");
+        let stats;
+        try { stats = fs.lstatSync(incomingPath); }
+        catch (error) {
+          if (error.code !== "ENOENT" || operation) throw error;
+          const promotingOperation = operations.find((candidate) => candidate.operationId === incoming.name && candidate.state === "promoting");
+          if (!promotingOperation || !["current", "live"].includes(chunkUploadQuota.ownerStatus(promotingOperation))) {
+            throw new Error("Untracked incoming chunk file", { cause: error });
+          }
+          const promotedStats = inspectChunkQuotaFile(getChunkQuotaOperationFile(promotingOperation));
+          if (!promotedStats || promotedStats.size !== promotingOperation.chargeBytes) {
+            throw new Error("Live chunk promotion destination does not match its charge", { cause: error });
+          }
+          continue;
+        }
+        if (!operation) {
+          const promotingOperation = operations.find((candidate) => candidate.operationId === incoming.name && candidate.state === "promoting");
+          if (!promotingOperation || !["current", "live"].includes(chunkUploadQuota.ownerStatus(promotingOperation)) ||
+              stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1 || stats.size !== promotingOperation.chargeBytes) {
+            throw new Error("Untracked incoming chunk file");
+          }
+          continue;
+        }
         if (stats.nlink !== 1 || stats.size > operation.chargeBytes || (operation.state === "staged" && stats.size !== operation.chargeBytes)) throw new Error("Incoming chunk file does not match its charge");
       }
       continue;

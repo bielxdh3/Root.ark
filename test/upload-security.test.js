@@ -55,8 +55,8 @@ function request(port, requestPath, { method = "GET", headers = {}, body, agent 
   });
 }
 
-async function waitForServer(port) {
-  const deadline = Date.now() + TIMEOUT_MS;
+async function waitForServer(port, timeout = TIMEOUT_MS) {
+  const deadline = Date.now() + timeout;
   let lastError;
   while (Date.now() < deadline) {
     try {
@@ -114,7 +114,7 @@ function testDeadQuotaOwnerEnv(...processIds) {
   return { ROOTARK_TEST_DEAD_QUOTA_OWNER_PIDS: ids.join(",") };
 }
 
-async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, uploaderPermissions = {}, secondUploaderHasFolderAccess = false, appDataMode = "json", envOverrides = {}, deterministicQuotaRecovery = false } = {}) {
+async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, readyTimeout = TIMEOUT_MS, uploaderPermissions = {}, secondUploaderHasFolderAccess = false, appDataMode = "json", envOverrides = {}, deterministicQuotaRecovery = false } = {}) {
   const password = crypto.randomBytes(24).toString("base64url");
   const fixtureBase = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
   const dir = fs.mkdtempSync(path.join(fixtureBase, "rootark-upload-safety-"));
@@ -217,7 +217,7 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
   });
   if (waitForReady) {
     try {
-      assert.equal((await waitForServer(port)).status, 200);
+      assert.equal((await waitForServer(port, readyTimeout)).status, 200);
     } catch (error) {
       throw new Error(`${error.message}\nserver exit: ${child.exitCode}\nserver stdout:\n${stdout.join("")}\nserver stderr:\n${stderr.join("")}`);
     }
@@ -583,6 +583,257 @@ test("seven-day expiry still cleans validated sessions when the configured quota
   assert.equal(JSON.parse(rejected.body).code, "CHUNK_QUOTA_UNAVAILABLE");
   const incomingDir = path.join(harness.chunkRoot, "incoming");
   assert.ok(!fs.existsSync(incomingDir) || fs.readdirSync(incomingDir).length === 0, "upload still fails closed before writing a new part");
+});
+
+test("a second startup preserves a live chunk promotion before its incoming rename", { timeout: 45_000 }, async (t) => {
+  const uploadId = "live-promotion-startup";
+  let promotionGate;
+  const harness = await createHarness(t, {
+    readyTimeout: 30_000,
+    preloadSource: ({ dir }) => {
+      promotionGate = {
+        entered: path.join(dir, "promotion-entered"),
+        release: path.join(dir, "promotion-release"),
+      };
+      return `
+        const fs = require("node:fs");
+        const path = require("node:path");
+        const renameSync = fs.renameSync;
+        fs.renameSync = function (source, destination, ...args) {
+          const target = path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "0.part");
+          if (String(source).includes(path.join(".chunks", "incoming")) && String(destination).endsWith(target)) {
+            fs.writeFileSync(${JSON.stringify(promotionGate.entered)}, "entered");
+            const signal = new Int32Array(new SharedArrayBuffer(4));
+            const deadline = Date.now() + 30000;
+            while (!fs.existsSync(${JSON.stringify(promotionGate.release)}) && Date.now() < deadline) Atomics.wait(signal, 0, 0, 10);
+            if (!fs.existsSync(${JSON.stringify(promotionGate.release)})) throw new Error("promotion test gate timed out");
+          }
+          return renameSync.call(this, source, destination, ...args);
+        };
+      `;
+    },
+  });
+  const originalSession = await login(harness.port, "uploader", harness.password);
+  const originalBytes = Buffer.from("still owned by the active promotion");
+  const originalCompletion = uploadChunk(harness.port, originalSession, {
+    uploadId,
+    originalName: `${uploadId}.txt`,
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: originalBytes,
+  }).then((value) => ({ value }), (error) => ({ error }));
+  assert.equal(await waitForFile(promotionGate.entered), true, "the original process pauses after the promoting ledger transition and before rename");
+
+  const incomingPath = path.join(harness.chunkRoot, "incoming", fs.readdirSync(path.join(harness.chunkRoot, "incoming"))[0]);
+  const sessionPartPath = path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part");
+  assert.equal(fs.existsSync(sessionPartPath), false);
+  assert.deepEqual(fs.readFileSync(incomingPath), originalBytes);
+  const beforeStartup = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  try {
+    assert.deepEqual(beforeStartup.prepare("SELECT state, charge_bytes, relative_path, owner_pid FROM quota_operations").get(), {
+      state: "promoting",
+      charge_bytes: originalBytes.length,
+      relative_path: path.join(FOLDER_ID, uploadId, "0.part"),
+      owner_pid: harness.child.pid,
+    });
+  } finally {
+    beforeStartup.close();
+  }
+
+  const secondPort = await getUnusedPort();
+  const secondChild = spawn(process.execPath, [SERVER], {
+    cwd: harness.dir,
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      PORT: String(secondPort),
+      DB_ENABLED: "false",
+      DB_READ_FALLBACK_JSON: "true",
+      DB_WRITE_LEGACY_JSON: "true",
+      ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
+      CLOUD_STORAGE_PROVIDER: "local",
+      UPLOAD_SCAN_ENABLED: "true",
+      UPLOAD_SCAN_PROVIDER: "disabled",
+      UPLOAD_BLOCK_EXECUTABLES: "true",
+      UPLOAD_QUARANTINE_DIR: harness.quarantineDir,
+      CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024),
+      CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024),
+      CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000",
+      CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000",
+      CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
+      JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const secondStderr = [];
+  secondChild.stderr.on("data", (chunk) => secondStderr.push(chunk.toString()));
+  try {
+    assert.equal((await waitForServer(secondPort, 30_000)).status, 200, secondStderr.join(""));
+    assert.doesNotMatch(secondStderr.join(""), /quota initialization unavailable/);
+    const secondSession = await login(secondPort, "uploader", harness.password);
+    const secondUpload = await uploadChunk(secondPort, secondSession, {
+      uploadId: "second-process-quota-check",
+      originalName: "second-process-quota-check.txt",
+      chunkIndex: 0,
+      totalChunks: 2,
+      bytes: Buffer.from("quota remains ready"),
+    });
+    assert.equal(secondUpload.status, 200, secondUpload.body);
+    assert.deepEqual(fs.readFileSync(incomingPath), originalBytes, "startup leaves the live operation's incoming file untouched");
+    const duringStartup = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+    try {
+      assert.deepEqual(duringStartup.prepare("SELECT state, charge_bytes, relative_path, owner_pid FROM quota_operations WHERE relative_path = ?").get(path.join(FOLDER_ID, uploadId, "0.part")), {
+        state: "promoting",
+        charge_bytes: originalBytes.length,
+        relative_path: path.join(FOLDER_ID, uploadId, "0.part"),
+        owner_pid: harness.child.pid,
+      });
+      assert.equal(duringStartup.prepare("SELECT SUM(charge_bytes) AS bytes FROM quota_operations").get().bytes, originalBytes.length + Buffer.byteLength("quota remains ready"));
+    } finally {
+      duringStartup.close();
+    }
+  } finally {
+    fs.writeFileSync(promotionGate.release, "release");
+    if (secondChild.exitCode === null) {
+      secondChild.kill();
+      await waitForExit(secondChild);
+    }
+  }
+  const originalResult = await originalCompletion;
+  if (originalResult.error) throw originalResult.error;
+  assert.equal(originalResult.value.status, 200, originalResult.value.body);
+});
+
+test("a second startup revalidates a live promotion renamed after incoming enumeration", { timeout: 45_000 }, async (t) => {
+  const uploadId = "live-promotion-after-enumeration";
+  let gates;
+  const harness = await createHarness(t, {
+    readyTimeout: 30_000,
+    preloadSource: ({ dir }) => {
+      gates = Object.fromEntries(["beforeRename", "allowRename", "renamed", "finishPromotion", "lstatEntered", "finishLstat"]
+        .map((name) => [name, path.join(dir, name)]));
+      return `
+        const fs = require("node:fs");
+        const path = require("node:path");
+        const renameSync = fs.renameSync;
+        fs.renameSync = function (source, destination, ...args) {
+          const target = path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "0.part");
+          if (String(source).includes(path.join(".chunks", "incoming")) && String(destination).endsWith(target)) {
+            const signal = new Int32Array(new SharedArrayBuffer(4));
+            fs.writeFileSync(${JSON.stringify(gates.beforeRename)}, "entered");
+            const beforeDeadline = Date.now() + 30000;
+            while (!fs.existsSync(${JSON.stringify(gates.allowRename)}) && Date.now() < beforeDeadline) Atomics.wait(signal, 0, 0, 10);
+            if (!fs.existsSync(${JSON.stringify(gates.allowRename)})) throw new Error("promotion test gate timed out before rename");
+            const result = renameSync.call(this, source, destination, ...args);
+            fs.writeFileSync(${JSON.stringify(gates.renamed)}, "renamed");
+            const afterDeadline = Date.now() + 30000;
+            while (!fs.existsSync(${JSON.stringify(gates.finishPromotion)}) && Date.now() < afterDeadline) Atomics.wait(signal, 0, 0, 10);
+            if (!fs.existsSync(${JSON.stringify(gates.finishPromotion)})) throw new Error("promotion test gate timed out after rename");
+            return result;
+          }
+          return renameSync.call(this, source, destination, ...args);
+        };
+      `;
+    },
+  });
+  const originalSession = await login(harness.port, "uploader", harness.password);
+  const originalBytes = Buffer.from("the live rename remains charged");
+  const originalCompletion = uploadChunk(harness.port, originalSession, {
+    uploadId,
+    originalName: `${uploadId}.txt`,
+    chunkIndex: 0,
+    totalChunks: 2,
+    bytes: originalBytes,
+  }).then((value) => ({ value }), (error) => ({ error }));
+  assert.equal(await waitForFile(gates.beforeRename), true);
+
+  const incomingDir = path.join(harness.chunkRoot, "incoming");
+  const incomingPath = path.join(incomingDir, fs.readdirSync(incomingDir)[0]);
+  const sessionPartPath = path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part");
+  const lstatPreloadPath = path.join(harness.dir, "pause-incoming-lstat.js");
+  fs.writeFileSync(lstatPreloadPath, `
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const lstatSync = fs.lstatSync;
+    fs.lstatSync = function (target, ...args) {
+      if (path.resolve(String(target)) === path.resolve(${JSON.stringify(incomingPath)})) {
+        fs.writeFileSync(${JSON.stringify(gates.lstatEntered)}, "entered");
+        const signal = new Int32Array(new SharedArrayBuffer(4));
+        const deadline = Date.now() + 30000;
+        while (!fs.existsSync(${JSON.stringify(gates.finishLstat)}) && Date.now() < deadline) Atomics.wait(signal, 0, 0, 10);
+        if (!fs.existsSync(${JSON.stringify(gates.finishLstat)})) throw new Error("lstat test gate timed out");
+      }
+      return lstatSync.call(this, target, ...args);
+    };
+  `);
+  const secondPort = await getUnusedPort();
+  const secondChild = spawn(process.execPath, ["--require", lstatPreloadPath, SERVER], {
+    cwd: harness.dir,
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      PORT: String(secondPort),
+      DB_ENABLED: "false",
+      DB_READ_FALLBACK_JSON: "true",
+      DB_WRITE_LEGACY_JSON: "true",
+      ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
+      CLOUD_STORAGE_PROVIDER: "local",
+      UPLOAD_SCAN_ENABLED: "true",
+      UPLOAD_SCAN_PROVIDER: "disabled",
+      UPLOAD_BLOCK_EXECUTABLES: "true",
+      UPLOAD_QUARANTINE_DIR: harness.quarantineDir,
+      CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024),
+      CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024),
+      CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000",
+      CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000",
+      CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
+      JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const secondStderr = [];
+  secondChild.stderr.on("data", (chunk) => secondStderr.push(chunk.toString()));
+  try {
+    assert.equal(await waitForFile(gates.lstatEntered), true, "the second process pauses after enumerating the incoming file");
+    fs.writeFileSync(gates.allowRename, "allow");
+    assert.equal(await waitForFile(gates.renamed), true, "the live owner atomically moves the incoming file while startup is paused");
+    assert.equal(fs.existsSync(incomingPath), false);
+    assert.deepEqual(fs.readFileSync(sessionPartPath), originalBytes);
+    const duringRename = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+    try {
+      assert.deepEqual(duringRename.prepare("SELECT state, charge_bytes, relative_path, owner_pid FROM quota_operations").get(), {
+        state: "promoting",
+        charge_bytes: originalBytes.length,
+        relative_path: path.join(FOLDER_ID, uploadId, "0.part"),
+        owner_pid: harness.child.pid,
+      });
+    } finally {
+      duringRename.close();
+    }
+    fs.writeFileSync(gates.finishLstat, "resume");
+    assert.equal((await waitForServer(secondPort, 30_000)).status, 200, secondStderr.join(""));
+    assert.doesNotMatch(secondStderr.join(""), /quota initialization unavailable/);
+    const secondSession = await login(secondPort, "uploader", harness.password);
+    const secondUpload = await uploadChunk(secondPort, secondSession, {
+      uploadId: "second-process-after-rename",
+      originalName: "second-process-after-rename.txt",
+      chunkIndex: 0,
+      totalChunks: 2,
+      bytes: Buffer.from("quota remains ready"),
+    });
+    assert.equal(secondUpload.status, 200, secondUpload.body);
+  } finally {
+    for (const gate of [gates.allowRename, gates.finishPromotion, gates.finishLstat]) fs.writeFileSync(gate, "release");
+    if (secondChild.exitCode === null) {
+      secondChild.kill();
+      await waitForExit(secondChild);
+    }
+  }
+  const originalResult = await originalCompletion;
+  if (originalResult.error) throw originalResult.error;
+  assert.equal(originalResult.value.status, 200, originalResult.value.body);
 });
 
 test("zero-byte multipart sessions are bounded per account and system", { timeout: 45_000 }, async (t) => {
