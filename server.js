@@ -1821,6 +1821,16 @@ function setShareViewerCookie(req, res, token, viewerId, expiresAt) {
   });
 }
 
+function setShareDownloadReceiptCookie(req, res, token) {
+  res.cookie(`rootark_share_dl_${token}`, crypto.randomBytes(16).toString("base64url"), {
+    httpOnly: false,
+    sameSite: "strict",
+    secure: req.secure,
+    maxAge: 5 * 60 * 1000,
+    path: `/share/${token}`,
+  });
+}
+
 function renderPublicSharePage(token) {
   const safeToken = String(token).replace(/[^a-f0-9]/gi, "");
 
@@ -2051,7 +2061,7 @@ function renderPublicSharePage(token) {
         <div id="contentBox" class="hidden">
           <div class="meta" id="meta"></div>
           <div class="actions">
-            <form method="post" action="/share/${safeToken}/download">
+            <form id="shareDownloadForm" method="post" action="/share/${safeToken}/download">
               <button class="primary" id="downloadButton" type="submit">Download</button>
             </form>
             <button type="button" id="previewButton">Preview</button>
@@ -2070,6 +2080,7 @@ function renderPublicSharePage(token) {
       const passwordBox = document.getElementById("passwordBox");
       const contentBox = document.getElementById("contentBox");
       const passwordForm = document.getElementById("sharePasswordForm");
+      const downloadForm = document.getElementById("shareDownloadForm");
       const passwordInput = document.getElementById("sharePassword");
       const passwordButton = document.getElementById("passwordButton");
       const downloadButton = document.getElementById("downloadButton");
@@ -2080,6 +2091,14 @@ function renderPublicSharePage(token) {
       const qrBox = document.getElementById("qrBox");
       const copyButton = document.getElementById("copyButton");
       let accessRequestPending = false;
+      let currentShareAccess = null;
+      let downloadReceiptPending = false;
+
+      function readDownloadReceipt() {
+        const prefix = "rootark_share_dl_" + token + "=";
+        return String(document.cookie || "").split(";").map((cookie) => cookie.trim())
+          .find((cookie) => cookie.startsWith(prefix))?.slice(prefix.length) || "";
+      }
 
       function formatSize(bytes) {
         const size = Number(bytes) || 0;
@@ -2090,6 +2109,7 @@ function renderPublicSharePage(token) {
       }
 
       function renderAccess(data) {
+        currentShareAccess = data;
         passwordInput.value = "";
         passwordBox.classList.add("hidden");
         contentBox.classList.remove("hidden");
@@ -2110,10 +2130,10 @@ function renderPublicSharePage(token) {
         downloadButton.disabled = true;
         status.textContent = "Atualizando os limites de acesso...";
         try {
-          const response = await fetch("/share/" + token + "/password", {
+          const response = await fetch("/share/" + token + "/status", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ password: "" })
+            body: "{}"
           });
           const data = await response.json();
           if (!response.ok) {
@@ -2131,7 +2151,7 @@ function renderPublicSharePage(token) {
             }
             throw new Error("Share access refresh failed");
           }
-          renderAccess(data);
+          renderAccess({ ...currentShareAccess, ...data });
           if (data.remainingDownloads === 0) status.textContent = "Limite de downloads atingido.";
         } catch {
           downloadButton.disabled = true;
@@ -2191,6 +2211,32 @@ function renderPublicSharePage(token) {
       passwordForm.addEventListener("submit", (event) => {
         event.preventDefault();
         accessShare(passwordInput.value);
+      });
+
+      downloadForm.addEventListener("submit", (event) => {
+        if (downloadReceiptPending) {
+          event.preventDefault();
+          return;
+        }
+        downloadReceiptPending = true;
+        const previousReceipt = readDownloadReceipt();
+        let attempts = 0;
+        downloadButton.disabled = true;
+        status.textContent = "Download solicitado. Atualizando os limites...";
+        const waitForDownloadReceipt = () => {
+          const receipt = readDownloadReceipt();
+          if (receipt && receipt !== previousReceipt) {
+            refreshShareAccess().finally(() => { downloadReceiptPending = false; });
+            return;
+          }
+          attempts += 1;
+          if (attempts >= 80) {
+            status.textContent = "O servidor ainda nao confirmou o download. Recarregue a pagina para atualizar os limites.";
+            return;
+          }
+          setTimeout(waitForDownloadReceipt, 250);
+        };
+        setTimeout(waitForDownloadReceipt, 250);
       });
 
       previewButton.addEventListener("click", () => {
@@ -11340,6 +11386,33 @@ app.post("/share/:token/password", shareRateLimit, requireSameOriginPublicShareM
   res.json(getSharePublicPayload(access.link, access.fileInfo, access.limits));
 });
 
+app.get("/share/:token/status", shareRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).type("text/plain").send("Metodo nao permitido"));
+
+app.post("/share/:token/status", shareRateLimit, requireSameOriginPublicShareMutation, (req, res) => {
+  const shareToken = validateShareToken(req.params.token);
+  if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
+
+  const link = loadPublicLinks()[shareToken];
+  if (!link) return res.status(404).json({ error: "Link indisponivel." });
+
+  const expiresAt = new Date(link.expiresAt).getTime();
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+    logShareAudit(req, "share.expired", shareToken, link, "expired", "failure");
+    return res.status(410).json({ error: "Link indisponivel." });
+  }
+
+  const passwordHash = link.passwordHash || link.password_hash || null;
+  if (passwordHash && !hasValidSharePasswordSession(req, shareToken, link)) {
+    return res.status(401).json({ error: "Senha obrigatoria.", passwordRequired: true });
+  }
+  if (getShareAccessCookieRequired(link, true) && !getActiveShareViewer(req, shareToken, link)) {
+    return res.status(403).json({ error: "Abra a pagina do compartilhamento novamente." });
+  }
+
+  const limits = getShareLimitState(link);
+  return res.json({ remainingViews: limits.remainingViews, remainingDownloads: limits.remainingDownloads });
+});
+
 app.post("/share/:token/view", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
@@ -11369,7 +11442,11 @@ app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareM
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "attachment", {
     cacheControl: "private, max-age=600",
-    beforeSend: access.reserveDownload,
+    beforeSend: () => {
+      const rejection = access.reserveDownload();
+      if (!rejection) setShareDownloadReceiptCookie(req, res, shareToken);
+      return rejection;
+    },
     onBeforeSendReject: (failure) => res.status(failure.status || 400).type("html").send(getShareFailurePage(failure.error)),
   });
 });
