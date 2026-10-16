@@ -175,54 +175,63 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
   const port = await getUnusedPort();
   const stdout = [];
   const stderr = [];
-  const child = spawn(process.execPath, [...(preloadPath ? ["--require", preloadPath] : []), SERVER], {
-    cwd: dir,
-    env: {
-      ...process.env,
-      NODE_ENV: "test",
-      PORT: String(port),
-      DB_ENABLED: appDataMode === "sqlite" ? "true" : "false",
-      DB_READ_FALLBACK_JSON: appDataMode === "sqlite" ? "false" : "true",
-      DB_WRITE_LEGACY_JSON: appDataMode === "sqlite" ? "false" : "true",
-      ...(appDataMode === "sqlite" ? { DATABASE_URL: path.join(dir, "data", "rootark.sqlite") } : {}),
-      ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
-      CLOUD_STORAGE_PROVIDER: "local",
-      UPLOAD_SCAN_ENABLED: "true",
-      UPLOAD_SCAN_PROVIDER: "disabled",
-      UPLOAD_BLOCK_EXECUTABLES: "true",
-      UPLOAD_QUARANTINE_DIR: quarantineDir,
-      CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024),
-      CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024),
-      CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000",
-      CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000",
-      CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
-      JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
-      ...envOverrides,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-  });
-  child.stdout.on("data", (chunk) => stdout.push(chunk.toString()));
-  child.stderr.on("data", (chunk) => stderr.push(chunk.toString()));
-  t.after(async () => {
-    if (child.exitCode === null) {
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, TIMEOUT_MS);
-        child.once("exit", () => { clearTimeout(timer); resolve(); });
-        child.kill();
-      });
+  let child = null;
+  const serverEnv = {
+    ...process.env,
+    NODE_ENV: "test",
+    PORT: String(port),
+    DB_ENABLED: appDataMode === "sqlite" ? "true" : "false",
+    DB_READ_FALLBACK_JSON: appDataMode === "sqlite" ? "false" : "true",
+    DB_WRITE_LEGACY_JSON: appDataMode === "sqlite" ? "false" : "true",
+    ...(appDataMode === "sqlite" ? { DATABASE_URL: path.join(dir, "data", "rootark.sqlite") } : {}),
+    ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true",
+    CLOUD_STORAGE_PROVIDER: "local",
+    UPLOAD_SCAN_ENABLED: "true",
+    UPLOAD_SCAN_PROVIDER: "disabled",
+    UPLOAD_BLOCK_EXECUTABLES: "true",
+    UPLOAD_QUARANTINE_DIR: quarantineDir,
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024),
+    CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024),
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000",
+    CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000",
+    CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
+    JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
+    ...envOverrides,
+  };
+  const serverArgs = [...(preloadPath ? ["--require", preloadPath] : []), SERVER];
+  const startServer = async ({ waitUntilReady = true } = {}) => {
+    assert.ok(!child || child.exitCode !== null || child.signalCode !== null, "stop the current server before restarting the fixture");
+    child = spawn(process.execPath, serverArgs, {
+      cwd: dir,
+      env: serverEnv,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    child.stdout.on("data", (chunk) => stdout.push(chunk.toString()));
+    child.stderr.on("data", (chunk) => stderr.push(chunk.toString()));
+    if (waitUntilReady) {
+      try {
+        assert.equal((await waitForServer(port)).status, 200);
+      } catch (error) {
+        throw new Error(`${error.message}\nserver exit: ${child.exitCode}\nserver stdout:\n${stdout.join("")}\nserver stderr:\n${stderr.join("")}`);
+      }
     }
+    return child;
+  };
+  const stopServer = async () => {
+    const runningChild = child;
+    if (!runningChild || runningChild.exitCode !== null || runningChild.signalCode !== null) return;
+    const exited = waitForExit(runningChild);
+    runningChild.kill();
+    await exited;
+  };
+  t.after(async () => {
+    await stopServer();
     fs.rmSync(dir, { recursive: true, force: true });
     assert.equal(fs.existsSync(dir), false);
   });
-  if (waitForReady) {
-    try {
-      assert.equal((await waitForServer(port)).status, 200);
-    } catch (error) {
-      throw new Error(`${error.message}\nserver exit: ${child.exitCode}\nserver stdout:\n${stdout.join("")}\nserver stderr:\n${stderr.join("")}`);
-    }
-  }
-  return { dir, port, quarantineDir, password, chunkRoot, child, stdout, stderr, quotaRecoveryPreloadPath };
+  await startServer({ waitUntilReady: waitForReady });
+  return { dir, port, quarantineDir, password, chunkRoot, get child() { return child; }, startServer, stopServer, stdout, stderr, quotaRecoveryPreloadPath };
 }
 
 async function startGatedClamAv() {
@@ -2137,43 +2146,46 @@ test("ambiguous encrypted handoff without pending metadata preserves destination
 test("chunk multipart without a file or with a parser error releases the pre-Multer reservation", { timeout: 30_000 }, async (t) => {
   const harness = await createHarness(t);
   const session = await login(harness.port, "uploader", harness.password);
-  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  const readOperationCount = () => {
+    const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+    try {
+      return database.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count;
+    } finally {
+      database.close();
+    }
+  };
+  const noFile = multipartParts([
+    { field: "uploadId", bytes: "missing-file" },
+    { field: "originalName", bytes: "missing-file.txt" },
+    { field: "chunkIndex", bytes: "0" },
+    { field: "totalChunks", bytes: "1" },
+  ]);
+  let noFileResponse;
   try {
-    const noFile = multipartParts([
-      { field: "uploadId", bytes: "missing-file" },
-      { field: "originalName", bytes: "missing-file.txt" },
-      { field: "chunkIndex", bytes: "0" },
-      { field: "totalChunks", bytes: "1" },
-    ]);
-    let noFileResponse;
-    try {
-      noFileResponse = await request(harness.port, `/upload-chunk?folderId=${FOLDER_ID}`, {
-        method: "POST",
-        headers: { cookie: session.cookie, origin: `http://127.0.0.1:${harness.port}`, "x-csrf-token": session.csrf, "content-type": noFile.contentType, "content-length": noFile.body.length },
-        body: noFile.body,
-      });
-    } catch (error) {
-      throw new Error(`file-less multipart request failed: ${error.code || error.name}: ${error.message}`, { cause: error });
-    }
-    assert.equal(noFileResponse.status, 400, noFileResponse.body);
-    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0, "file-less multipart releases its reservation");
-
-    let malformed;
-    try {
-      malformed = await request(harness.port, `/upload-chunk?folderId=${FOLDER_ID}`, {
-        method: "POST",
-        headers: { cookie: session.cookie, origin: `http://127.0.0.1:${harness.port}`, "x-csrf-token": session.csrf, "content-type": "multipart/form-data; boundary=missing-boundary", "content-length": Buffer.byteLength("not multipart data") },
-        body: "not multipart data",
-      });
-    } catch (error) {
-      throw new Error(`malformed multipart request failed: ${error.code || error.name}: ${error.message}`, { cause: error });
-    }
-    assert.equal(malformed.status, 400, malformed.body);
-    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0, "parser failure before a filename path releases its reservation");
-    assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
-  } finally {
-    database.close();
+    noFileResponse = await request(harness.port, `/upload-chunk?folderId=${FOLDER_ID}`, {
+      method: "POST",
+      headers: { cookie: session.cookie, origin: `http://127.0.0.1:${harness.port}`, "x-csrf-token": session.csrf, "content-type": noFile.contentType, "content-length": noFile.body.length },
+      body: noFile.body,
+    });
+  } catch (error) {
+    throw new Error(`file-less multipart request failed: ${error.code || error.name}: ${error.message}`, { cause: error });
   }
+  assert.equal(noFileResponse.status, 400, noFileResponse.body);
+  assert.equal(readOperationCount(), 0, "file-less multipart releases its reservation");
+
+  let malformed;
+  try {
+    malformed = await request(harness.port, `/upload-chunk?folderId=${FOLDER_ID}`, {
+      method: "POST",
+      headers: { cookie: session.cookie, origin: `http://127.0.0.1:${harness.port}`, "x-csrf-token": session.csrf, "content-type": "multipart/form-data; boundary=missing-boundary", "content-length": Buffer.byteLength("not multipart data") },
+      body: "not multipart data",
+    });
+  } catch (error) {
+    throw new Error(`malformed multipart request failed: ${error.code || error.name}: ${error.message}`, { cause: error });
+  }
+  assert.equal(malformed.status, 400, malformed.body);
+  assert.equal(readOperationCount(), 0, "parser failure before a filename path releases its reservation");
+  assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
 });
 
 test("failed handoff destination cleanup retains its charge and blocks retries from creating orphan files", { timeout: 30_000 }, async (t) => {
@@ -3957,7 +3969,8 @@ test("startup removes an unregistered published handoff and keeps charged parts 
   const destinationPath = path.join(harness.dir, "temp", FOLDER_ID, fileName);
   assert.equal(fs.existsSync(destinationPath), false, harness.stderr.join(""));
   assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), bytes);
-  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"));
+  await harness.stopServer();
+  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
   try {
     assert.deepEqual(database.prepare("SELECT operation_id, state, charge_bytes FROM quota_operations").all(), [
       { operation_id: "part-zero", state: "part_committed", charge_bytes: bytes.length },
@@ -3966,6 +3979,7 @@ test("startup removes an unregistered published handoff and keeps charged parts 
     database.close();
   }
 
+  await harness.startServer();
   const session = await login(harness.port, "uploader", harness.password);
   const retry = await uploadChunk(harness.port, session, {
     uploadId,
@@ -3978,6 +3992,7 @@ test("startup removes an unregistered published handoff and keeps charged parts 
   assert.equal(retry.status, 200, retry.body);
   assert.equal(JSON.parse(retry.body).complete, true);
   assert.deepEqual(fs.readFileSync(destinationPath), bytes);
+  await harness.stopServer();
   const finalLedger = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
   try {
     const remainingOperations = finalLedger.prepare("SELECT operation_id, account_key, session_key, relative_path, state, charge_bytes FROM quota_operations ORDER BY operation_id").all();
