@@ -12,6 +12,26 @@ const backupService = require("../services/backupService");
 const backupRepository = require("../repositories/backupRepository");
 const { isValidTimezone, parseBackupTime, scheduleAutomaticBackups } = require("../services/backupScheduler");
 
+function hasVerifiableLinuxProcessIdentity() {
+  if (process.platform !== "linux") return false;
+  try {
+    const pidNamespaceId = fs.readlinkSync("/proc/self/ns/pid");
+    const selfStat = fs.readFileSync("/proc/self/stat", "utf8");
+    const selfPidDelimiter = selfStat.indexOf(" (");
+    if (selfPidDelimiter < 1 || Number(selfStat.slice(0, selfPidDelimiter)) !== process.pid) return false;
+    if (fs.readlinkSync(`/proc/${process.pid}/ns/pid`) !== pidNamespaceId) return false;
+    const status = fs.readFileSync("/proc/self/status", "utf8");
+    const namespacePids = /^NSpid:\s*([0-9]+(?:\s+[0-9]+)*)\s*$/m.exec(status)?.[1];
+    if (!namespacePids || Number(namespacePids.trim().split(/\s+/).at(-1)) !== process.pid) return false;
+    const startIdentity = selfStat.slice(selfStat.lastIndexOf(")") + 1).trim().split(/\s+/)[19];
+    return Boolean(fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() && startIdentity);
+  } catch {
+    return false;
+  }
+}
+
+const CAN_VERIFY_LINUX_PROCESS_IDENTITY = hasVerifiableLinuxProcessIdentity();
+
 function findDefinitelyDeadPid() {
   const highestValidPid = 0x7fffffff;
   for (let pid = highestValidPid; pid > highestValidPid - 1024; pid -= 1) {
@@ -125,7 +145,7 @@ test("scheduler, lock, filename, and retention meta-remediation matrix", async (
       fs.rmSync(backupService.LOCK_TAKEOVER_DIR, { recursive: true, force: true });
     }
   });
-  await t.test("takeover evidence path replacement fails closed and preserves the replacement", () => {
+  await t.test("takeover evidence path replacement fails closed and preserves the replacement", { skip: !CAN_VERIFY_LINUX_PROCESS_IDENTITY ? "requires verifiable Linux /proc process identity" : false }, () => {
     reset();
     const evidencePath = path.join(backupService.LOCK_TAKEOVER_DIR, "evidence");
     const replacementPath = `${evidencePath}.prior`;
@@ -177,7 +197,7 @@ test("scheduler, lock, filename, and retention meta-remediation matrix", async (
     fs.rmSync(backupService.LOCK_FILE, { force: true });
     fs.rmSync(replacementPath, { force: true });
   });
-  await t.test("takeover authority snapshot fails closed when its pathname is replaced after opening", () => {
+  await t.test("takeover authority snapshot fails closed when its pathname is replaced after opening", { skip: !CAN_VERIFY_LINUX_PROCESS_IDENTITY ? "requires verifiable Linux /proc process identity" : false }, () => {
     reset();
     const authorityPath = path.join(backupService.LOCK_TAKEOVER_DIR, "authority.json");
     const priorPath = `${authorityPath}.prior`;
@@ -239,7 +259,7 @@ test("scheduler, lock, filename, and retention meta-remediation matrix", async (
       fs.rmSync(replacementPath, { force: true });
     }
   });
-  await t.test("takeover cleanup preserves a replacement installed at the removal boundary", () => {
+  await t.test("takeover cleanup preserves a replacement installed at the removal boundary", { skip: !CAN_VERIFY_LINUX_PROCESS_IDENTITY ? "requires verifiable Linux /proc process identity" : false }, () => {
     reset();
     const evidencePath = path.join(backupService.LOCK_TAKEOVER_DIR, "evidence");
     const priorPath = `${evidencePath}.prior`;
@@ -295,7 +315,7 @@ test("scheduler, lock, filename, and retention meta-remediation matrix", async (
       fs.rmSync(backupService.LOCK_TAKEOVER_DIR, { recursive: true, force: true });
     }
   });
-  await t.test("restart recovery resumes cleanup after evidence was durably staged", () => {
+  await t.test("restart recovery resumes cleanup after evidence was durably staged", { skip: !CAN_VERIFY_LINUX_PROCESS_IDENTITY ? "requires verifiable Linux /proc process identity" : false }, () => {
     reset();
     const authorityPath = path.join(backupService.LOCK_TAKEOVER_DIR, "authority.json");
     const deadPid = findDefinitelyDeadPid();
@@ -334,7 +354,7 @@ test("scheduler, lock, filename, and retention meta-remediation matrix", async (
       fs.rmSync(backupService.LOCK_FILE, { force: true });
     }
   });
-  await t.test("partial lock write remains fail-closed and recovers by stale takeover", () => {
+  await t.test("partial lock write remains fail-closed until operator recovery", () => {
     reset();
     const originalWrite = fs.writeSync;
     let writes = 0;
@@ -355,11 +375,13 @@ test("scheduler, lock, filename, and retention meta-remediation matrix", async (
     } finally {
       fs.writeSync = originalWrite;
     }
-    assert.equal(fs.readFileSync(backupService.LOCK_FILE, "utf8"), "");
-    const lease = backupService.acquireLock("backup");
-    lease();
+    const partialBytes = fs.readFileSync(backupService.LOCK_FILE);
+    assert.equal(partialBytes.length, 0);
+    assert.throws(() => backupService.acquireLock("backup"), { code: "BACKUP_LOCKED" });
+    assert.deepEqual(fs.readFileSync(backupService.LOCK_FILE), partialBytes);
+    fs.rmSync(backupService.LOCK_FILE, { force: true });
   });
-  await t.test("failed lock fsync leaves a recoverable malformed record without unlinking", () => {
+  await t.test("failed lock fsync leaves an ambiguous malformed record without unlinking", () => {
     reset();
     const originalFsync = fs.fsyncSync;
     let failOnce = true;
@@ -375,9 +397,11 @@ test("scheduler, lock, filename, and retention meta-remediation matrix", async (
     } finally {
       fs.fsyncSync = originalFsync;
     }
-    assert.equal(fs.readFileSync(backupService.LOCK_FILE, "utf8"), "");
-    const lease = backupService.acquireLock("backup");
-    lease();
+    const malformedBytes = fs.readFileSync(backupService.LOCK_FILE);
+    assert.equal(malformedBytes.length, 0);
+    assert.throws(() => backupService.acquireLock("backup"), { code: "BACKUP_LOCKED" });
+    assert.deepEqual(fs.readFileSync(backupService.LOCK_FILE), malformedBytes);
+    fs.rmSync(backupService.LOCK_FILE, { force: true });
   });
   await t.test("same-process versioned lock identity remains live", () => {
     reset();
@@ -388,14 +412,193 @@ test("scheduler, lock, filename, and retention meta-remediation matrix", async (
     assert.throws(() => backupService.acquireLock("restore"), { code: "BACKUP_LOCKED" });
     fs.rmSync(backupService.LOCK_FILE, { force: true });
   });
-  await t.test("reused PID does not keep a prior process lock alive", () => {
+  await t.test("same PID from a distinct PID namespace remains live", () => {
     reset();
     const release = backupService.acquireLock("backup");
     const record = JSON.parse(fs.readFileSync(backupService.LOCK_FILE, "utf8"));
     release();
-    fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify({ ...record, pid: process.pid, processInstanceId: "prior-process-instance" }));
+    const foreignNamespace = {
+      ...record,
+      processInstanceId: "prior-process-instance",
+      ownerIdentity: { ...record.ownerIdentity, pidNamespaceId: "foreign-pid-namespace" },
+    };
+    fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify(foreignNamespace));
+    let lease;
+    try {
+      assert.throws(() => { lease = backupService.acquireLock("restore"); }, { code: "BACKUP_LOCKED" });
+      assert.equal(fs.readFileSync(backupService.LOCK_FILE, "utf8"), JSON.stringify(foreignNamespace));
+    } finally {
+      lease?.();
+      fs.rmSync(backupService.LOCK_FILE, { force: true });
+    }
+  });
+  await t.test("procfs PID numbering mismatch cannot reclaim a live lock", { skip: !CAN_VERIFY_LINUX_PROCESS_IDENTITY ? "requires verified Linux procfs identity" : false }, () => {
+    reset();
+    const release = backupService.acquireLock("backup");
+    const record = JSON.parse(fs.readFileSync(backupService.LOCK_FILE, "utf8"));
+    release();
+    const mismatchedView = {
+      ...record,
+      processInstanceId: "prior-process-instance",
+      ownerIdentity: { ...record.ownerIdentity, processStartIdentity: "different-start-time" },
+    };
+    fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify(mismatchedView));
+    const originalReadFileSync = fs.readFileSync;
+    const ownerStatPath = `/proc/${record.pid}/stat`;
+    let lease;
+    fs.readFileSync = function (target, ...args) {
+      if (target === "/proc/self/stat") {
+        const stat = originalReadFileSync.call(fs, target, ...args);
+        const delimiter = stat.indexOf(" (");
+        const mismatchedPid = process.pid + 1;
+        return `${mismatchedPid}${stat.slice(delimiter)}`;
+      }
+      if (target === ownerStatPath) {
+        const stat = originalReadFileSync.call(fs, target, ...args);
+        const delimiter = stat.lastIndexOf(")") + 1;
+        const fields = stat.slice(delimiter).trim().split(/\s+/);
+        fields[19] = String(Number(fields[19]) + 1);
+        return `${stat.slice(0, delimiter)} ${fields.join(" ")}`;
+      }
+      return originalReadFileSync.call(fs, target, ...args);
+    };
+    try {
+      assert.throws(() => { lease = backupService.acquireLock("restore"); }, { code: "BACKUP_LOCKED" });
+      assert.equal(fs.readFileSync(backupService.LOCK_FILE, "utf8"), JSON.stringify(mismatchedView));
+    } finally {
+      fs.readFileSync = originalReadFileSync;
+      lease?.();
+      fs.rmSync(backupService.LOCK_FILE, { force: true });
+    }
+  });
+  await t.test("procfs mounted for a different PID namespace cannot reclaim a live lock", { skip: !CAN_VERIFY_LINUX_PROCESS_IDENTITY ? "requires verified Linux procfs identity" : false }, () => {
+    reset();
+    const release = backupService.acquireLock("backup");
+    const record = JSON.parse(fs.readFileSync(backupService.LOCK_FILE, "utf8"));
+    release();
+    const mismatchedView = {
+      ...record,
+      processInstanceId: "prior-process-instance",
+      ownerIdentity: { ...record.ownerIdentity, processStartIdentity: "different-start-time" },
+    };
+    fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify(mismatchedView));
+    const originalReadFileSync = fs.readFileSync;
+    const originalReadlinkSync = fs.readlinkSync;
+    const ownerStatPath = `/proc/${record.pid}/stat`;
+    const ownerNamespacePath = `/proc/${record.pid}/ns/pid`;
+    let lease;
+    fs.readFileSync = function (target, ...args) {
+      if (target === ownerStatPath) {
+        const stat = originalReadFileSync.call(fs, target, ...args);
+        const delimiter = stat.lastIndexOf(")") + 1;
+        const fields = stat.slice(delimiter).trim().split(/\s+/);
+        fields[19] = String(Number(fields[19]) + 1);
+        return `${stat.slice(0, delimiter)} ${fields.join(" ")}`;
+      }
+      return originalReadFileSync.call(fs, target, ...args);
+    };
+    fs.readlinkSync = function (target, ...args) {
+      if (target === ownerNamespacePath) return "pid:[foreign-namespace]";
+      return originalReadlinkSync.call(fs, target, ...args);
+    };
+    try {
+      assert.throws(() => { lease = backupService.acquireLock("restore"); }, { code: "BACKUP_LOCKED" });
+      assert.equal(fs.readFileSync(backupService.LOCK_FILE, "utf8"), JSON.stringify(mismatchedView));
+    } finally {
+      fs.readFileSync = originalReadFileSync;
+      fs.readlinkSync = originalReadlinkSync;
+      lease?.();
+      fs.rmSync(backupService.LOCK_FILE, { force: true });
+    }
+  });
+  await t.test("procfs PID translation must match the recorded namespace PID", { skip: !CAN_VERIFY_LINUX_PROCESS_IDENTITY ? "requires verified Linux procfs identity" : false }, () => {
+    reset();
+    const release = backupService.acquireLock("backup");
+    const record = JSON.parse(fs.readFileSync(backupService.LOCK_FILE, "utf8"));
+    release();
+    const mismatchedView = {
+      ...record,
+      processInstanceId: "prior-process-instance",
+      ownerIdentity: { ...record.ownerIdentity, processStartIdentity: "different-start-time" },
+    };
+    fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify(mismatchedView));
+    const originalReadFileSync = fs.readFileSync;
+    const ownerStatPath = `/proc/${record.pid}/stat`;
+    const ownerStatusPath = `/proc/${record.pid}/status`;
+    let lease;
+    fs.readFileSync = function (target, ...args) {
+      if (target === ownerStatusPath) {
+        const status = originalReadFileSync.call(fs, target, ...args);
+        return status.replace(/^NSpid:\s*(.*)$/m, (_match, pids) => {
+          const values = pids.trim().split(/\s+/);
+          values[values.length - 1] = String(record.pid + 1);
+          return `NSpid:\t${values.join("\t")}`;
+        });
+      }
+      if (target === ownerStatPath) {
+        const stat = originalReadFileSync.call(fs, target, ...args);
+        const delimiter = stat.lastIndexOf(")") + 1;
+        const fields = stat.slice(delimiter).trim().split(/\s+/);
+        fields[19] = String(Number(fields[19]) + 1);
+        return `${stat.slice(0, delimiter)} ${fields.join(" ")}`;
+      }
+      return originalReadFileSync.call(fs, target, ...args);
+    };
+    try {
+      assert.throws(() => { lease = backupService.acquireLock("restore"); }, { code: "BACKUP_LOCKED" });
+      assert.equal(fs.readFileSync(backupService.LOCK_FILE, "utf8"), JSON.stringify(mismatchedView));
+    } finally {
+      fs.readFileSync = originalReadFileSync;
+      lease?.();
+      fs.rmSync(backupService.LOCK_FILE, { force: true });
+    }
+  });
+  await t.test("PID reuse is reclaimable only with a different verified start identity", { skip: !CAN_VERIFY_LINUX_PROCESS_IDENTITY ? "requires verifiable Linux /proc process identity" : false }, () => {
+    reset();
+    const release = backupService.acquireLock("backup");
+    const record = JSON.parse(fs.readFileSync(backupService.LOCK_FILE, "utf8"));
+    release();
+    assert.ok(record.ownerIdentity?.processStartIdentity, "Linux lock must persist a verifiable process start identity");
+    const reused = {
+      ...record,
+      processInstanceId: "prior-process-instance",
+      ownerIdentity: { ...record.ownerIdentity, processStartIdentity: "different-start-time" },
+    };
+    fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify(reused));
     const recovered = backupService.acquireLock("restore");
     recovered();
+  });
+  await t.test("same host and PID with unverifiable owner identity remains live", () => {
+    reset();
+    const release = backupService.acquireLock("backup");
+    const record = JSON.parse(fs.readFileSync(backupService.LOCK_FILE, "utf8"));
+    release();
+    const ambiguous = { ...record, processInstanceId: "prior-process-instance", ownerIdentity: null };
+    fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify(ambiguous));
+    try {
+      assert.throws(() => backupService.acquireLock("restore"), { code: "BACKUP_LOCKED" });
+      assert.equal(fs.readFileSync(backupService.LOCK_FILE, "utf8"), JSON.stringify(ambiguous));
+    } finally {
+      fs.rmSync(backupService.LOCK_FILE, { force: true });
+    }
+  });
+  await t.test("colliding host name and PID do not let a nonce mismatch prove reuse", () => {
+    reset();
+    const release = backupService.acquireLock("backup");
+    const record = JSON.parse(fs.readFileSync(backupService.LOCK_FILE, "utf8"));
+    release();
+    const collision = {
+      ...record,
+      processInstanceId: "same-host-colliding-instance",
+      ownerIdentity: { ...record.ownerIdentity, bootId: null, pidNamespaceId: null, processStartIdentity: null },
+    };
+    fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify(collision));
+    try {
+      assert.throws(() => backupService.acquireLock("restore"), { code: "BACKUP_LOCKED" });
+      assert.equal(fs.readFileSync(backupService.LOCK_FILE, "utf8"), JSON.stringify(collision));
+    } finally {
+      fs.rmSync(backupService.LOCK_FILE, { force: true });
+    }
   });
   await t.test("legacy versioned lock without process identity remains fail-closed", () => {
     reset();
@@ -435,10 +638,34 @@ test("scheduler, lock, filename, and retention meta-remediation matrix", async (
       fs.rmSync(backupService.LOCK_FILE, { force: true });
     }
   });
-  await t.test("stale dead PID", () => { reset(); fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify({ token: "dead", pid: 99999999 })); fs.utimesSync(backupService.LOCK_FILE, new Date(0), new Date(0)); const release = backupService.acquireLock("backup"); release(); });
-  await t.test("stale age", () => { reset(); fs.writeFileSync(backupService.LOCK_FILE, "broken"); fs.utimesSync(backupService.LOCK_FILE, new Date(0), new Date(0)); const release = backupService.acquireLock("backup"); release(); });
+  await t.test("same-namespace dead PID is reclaimable with positive ESRCH proof", { skip: !CAN_VERIFY_LINUX_PROCESS_IDENTITY ? "requires verifiable Linux /proc process identity" : false }, () => {
+    reset();
+    const release = backupService.acquireLock("backup");
+    const record = JSON.parse(fs.readFileSync(backupService.LOCK_FILE, "utf8"));
+    release();
+    const dead = { ...record, pid: findDefinitelyDeadPid(), processInstanceId: "prior-process-instance" };
+    fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify(dead));
+    const recovered = backupService.acquireLock("backup");
+    recovered();
+  });
   await t.test("malformed recent lock", () => { reset(); fs.writeFileSync(backupService.LOCK_FILE, "broken"); assert.throws(() => backupService.acquireLock("backup"), { code: "BACKUP_LOCKED" }); fs.rmSync(backupService.LOCK_FILE, { force: true }); });
-  await t.test("malformed stale lock", () => { reset(); fs.writeFileSync(backupService.LOCK_FILE, "broken"); fs.utimesSync(backupService.LOCK_FILE, new Date(0), new Date(0)); const release = backupService.acquireLock("backup"); release(); });
+  await t.test("malformed stale lock stays byte-for-byte and fails closed", () => {
+    reset();
+    const bytes = Buffer.from("broken\u0000ambiguous-lock\n");
+    fs.writeFileSync(backupService.LOCK_FILE, bytes);
+    fs.utimesSync(backupService.LOCK_FILE, new Date(0), new Date(0));
+    assert.throws(() => backupService.acquireLock("backup"), { code: "BACKUP_LOCKED" });
+    assert.deepEqual(fs.readFileSync(backupService.LOCK_FILE), bytes);
+  });
+  await t.test("stale malformed takeover authority directory is preserved", () => {
+    reset();
+    fs.mkdirSync(backupService.LOCK_TAKEOVER_DIR);
+    fs.utimesSync(backupService.LOCK_TAKEOVER_DIR, new Date(0), new Date(0));
+    assert.throws(() => backupService.acquireLock("backup"), { code: "BACKUP_LOCKED" });
+    assert.equal(fs.existsSync(backupService.LOCK_TAKEOVER_DIR), true);
+    assert.deepEqual(fs.readdirSync(backupService.LOCK_TAKEOVER_DIR), []);
+    fs.rmdirSync(backupService.LOCK_TAKEOVER_DIR);
+  });
   await t.test("lock-write failure", () => { reset(); const original = fs.openSync; let lockPathOpenAttempts = 0; fs.openSync = (target, ...args) => { if (target === backupService.LOCK_FILE && ++lockPathOpenAttempts === 2) throw Object.assign(new Error("denied"), { code: "EACCES" }); return original.call(fs, target, ...args); }; try { assert.throws(() => backupService.acquireLock("backup"), { code: "BACKUP_LOCK_WRITE_FAILED" }); } finally { fs.openSync = original; } });
   await t.test("release token mismatch", () => { reset(); const release = backupService.acquireLock("backup"); fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify({ token: "other" })); release(); assert.equal(fs.existsSync(backupService.LOCK_FILE), true); fs.rmSync(backupService.LOCK_FILE, { force: true }); });
   await t.test("retention count", async () => { reset(); const now = new Date().toISOString(); const entries = [entry("1", "rootark-backup-2020-01-01-00-00-00.zip", now), entry("2", "rootark-backup-2020-01-01-00-00-01.zip", now)]; saveHistory(entries); process.env.BACKUP_RETENTION_COUNT = "1"; process.env.BACKUP_RETENTION_DAYS = "0"; await backupService.cleanupRetention(); assert.equal(backupRepository.getBackup("1"), null); });

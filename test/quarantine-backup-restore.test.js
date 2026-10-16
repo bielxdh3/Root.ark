@@ -8,6 +8,24 @@ const test = require("node:test");
 
 const ROOT = path.resolve(__dirname, "..");
 
+function operatorRecoverExitedRestoreLock(runtime, childPid) {
+  const lockPath = path.join(runtime, "data", "backups", ".backup.lock");
+  const record = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+  assert.equal(record.operation, "restore");
+  assert.equal(record.pid, childPid, "recovery is limited to the confirmed exited restore child");
+  assert.equal(record.runtimeRoot, fs.realpathSync(runtime));
+  const identity = record.ownerIdentity;
+  const canRecoverAutomatically = process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]);
+  assert.equal(canRecoverAutomatically, process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]), "the selected recovery path must match verifiable owner identity");
+  if (canRecoverAutomatically) {
+    assert.equal(fs.existsSync(lockPath), true, "Linux keeps a verifiable crashed-owner lock for automatic recovery");
+    return "automatic";
+  }
+  fs.unlinkSync(lockPath);
+  assert.equal(fs.existsSync(lockPath), false, "operator recovery removes only an unverifiable lock after child exit");
+  return "operator";
+}
+
 test("quarantine metadata is read from the validated file descriptor and rejects path swaps", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-metadata-read-"));
   const metadataPath = path.join(directory, "quarantine.json");
@@ -1347,17 +1365,13 @@ test("quarantine restore recovers its prior state after process interruption", {
     const env = { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false", BACKUP_RETENTION_COUNT: "20" };
     const interrupted = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8" });
     assert.equal(interrupted.status, 73, interrupted.stderr || interrupted.stdout);
+    operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
 
     const recoveryScript = `
       const assert = require("node:assert/strict");
       const fs = require("node:fs");
       const path = require("node:path");
-      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
       const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
-      const staleLock = JSON.parse(fs.readFileSync(backupService.LOCK_FILE, "utf8"));
-      staleLock.pid = process.pid;
-      staleLock.processInstanceId = "interrupted-process-instance";
-      fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify(staleLock));
       restoreService.recoverQuarantineRestore();
       assert.deepEqual(JSON.parse(fs.readFileSync(path.join(process.cwd(), "data", "quarantine.json"), "utf8")), { items: [{ id: "current", storedQuarantineFilename: "current.bin" }] });
       assert.equal(fs.readFileSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "current.bin"), "utf8"), "current-payload");
@@ -1406,6 +1420,7 @@ test("quarantine restore recovery preserves missing metadata state across startu
     const env = { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false", BACKUP_RETENTION_COUNT: "20" };
     const interrupted = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8" });
     assert.equal(interrupted.status, 73, interrupted.stderr || interrupted.stdout);
+    operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
 
     const recoveryScript = `
       const assert = require("node:assert/strict");
@@ -1422,6 +1437,118 @@ test("quarantine restore recovery preserves missing metadata state across startu
     `;
     const recovered = spawnSync(process.execPath, ["-e", recoveryScript], { cwd: runtime, env, encoding: "utf8" });
     assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+    fs.rmSync(quarantineDir, { recursive: true, force: true });
+  }
+});
+
+test("quarantine journal directory fsync failure preserves the published journal stage for startup recovery", { timeout: 30_000 }, () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-journal-fsync-runtime-"));
+  const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-journal-fsync-payloads-"));
+  const archiverModulePath = require.resolve("archiver");
+  const env = { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false", BACKUP_RETENTION_COUNT: "20" };
+  try {
+    const setupScript = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const archiver = require(${JSON.stringify(archiverModulePath)});
+      if (typeof archiver.ZipArchive !== "function") {
+        require.cache[${JSON.stringify(archiverModulePath)}].exports = { ...archiver, ZipArchive: function ZipArchive(options) { return archiver.create("zip", options); } };
+      }
+      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      const metadataPath = path.join(process.cwd(), "data", "quarantine.json");
+      const journalPath = path.join(process.cwd(), "data", ".rootark-quarantine-restore-journal.json");
+      const archivePayload = path.join(process.env.UPLOAD_QUARANTINE_DIR, "archive.bin");
+      const currentPayload = path.join(process.env.UPLOAD_QUARANTINE_DIR, "current.bin");
+      fs.mkdirSync(path.dirname(metadataPath), { recursive: true });
+      fs.mkdirSync(process.env.UPLOAD_QUARANTINE_DIR, { recursive: true });
+      fs.writeFileSync(metadataPath, JSON.stringify({ items: [{ id: "archive", storedQuarantineFilename: "archive.bin" }] }));
+      fs.writeFileSync(archivePayload, "archived-payload");
+      (async () => {
+        const backup = await backupService.createBackup({ createdBy: "fixture" });
+        fs.writeFileSync(metadataPath, JSON.stringify({ items: [{ id: "current", storedQuarantineFilename: "current.bin" }] }));
+        fs.rmSync(archivePayload);
+        fs.writeFileSync(currentPayload, "current-payload");
+        const nativeRename = fs.renameSync;
+        const nativeOpen = fs.openSync;
+        const nativeClose = fs.closeSync;
+        const nativeFsync = fs.fsyncSync;
+        const directoryDescriptors = new Map();
+        let journalPublished = false;
+        fs.renameSync = function (source, destination) {
+          const result = nativeRename.call(this, source, destination);
+          if (path.resolve(String(destination)) === path.resolve(journalPath)) journalPublished = true;
+          return result;
+        };
+        fs.fsyncSync = function (descriptor) {
+          if (directoryDescriptors.has(descriptor) && journalPublished && directoryDescriptors.get(descriptor) === path.dirname(journalPath)) {
+            const error = new Error("injected quarantine journal parent directory fsync failure");
+            error.code = "EIO";
+            throw error;
+          }
+          if (directoryDescriptors.has(descriptor)) return 0;
+          try { return nativeFsync.call(this, descriptor); }
+          catch (error) { if (error.code === "EPERM") return 0; throw error; }
+        };
+        const nativeAcquireLock = backupService.acquireLock;
+        backupService.acquireLock = function (...args) {
+          const release = nativeAcquireLock.apply(this, args);
+          if (args[0] === "restore") {
+            Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+            fs.openSync = function (target, ...openArgs) {
+              if (typeof target === "string" && fs.existsSync(target) && fs.statSync(target).isDirectory()) {
+                const descriptor = nativeOpen.call(this, metadataPath, "r");
+                directoryDescriptors.set(descriptor, path.resolve(target));
+                return descriptor;
+              }
+              return nativeOpen.call(this, target, ...openArgs);
+            };
+            fs.closeSync = function (descriptor) {
+              directoryDescriptors.delete(descriptor);
+              return nativeClose.call(this, descriptor);
+            };
+          }
+          return release;
+        };
+        await assert.rejects(restoreService.restoreBackup(backup.id, { confirmation: "RESTORE", username: "fixture" }), /injected quarantine journal parent directory fsync failure/);
+        const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+        const stagePath = path.join(process.env.UPLOAD_QUARANTINE_DIR, ".rootark-quarantine-restore-" + journal.transactionId);
+        assert.equal(journalPublished, true);
+        process.stdout.write(JSON.stringify({ journalExists: fs.existsSync(journalPath), stageExists: fs.existsSync(stagePath) }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const setup = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8" });
+    assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+    const published = JSON.parse(setup.stdout);
+
+    const startupScript = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+      try {
+        restoreService.recoverQuarantineRestore();
+        const recovery = restoreService.assertNoPendingWholeRestore();
+        assert.equal(recovery.recovered, true);
+        assert.equal(fs.existsSync(path.join(process.cwd(), "data", ".rootark-restore-coordinator.json")), false);
+        assert.equal(fs.readFileSync(path.join(process.cwd(), "data", "quarantine.json"), "utf8"), JSON.stringify({ items: [{ id: "current", storedQuarantineFilename: "current.bin" }] }));
+        assert.equal(fs.readFileSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "current.bin"), "utf8"), "current-payload");
+        assert.equal(fs.existsSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "archive.bin")), false);
+        assert.equal(fs.readdirSync(process.env.UPLOAD_QUARANTINE_DIR).some((name) => name.startsWith(".rootark-quarantine-restore-")), false);
+      } catch (error) {
+        console.error(error);
+        process.exitCode = 1;
+      }
+    `;
+    const startup = spawnSync(process.execPath, ["-e", startupScript], { cwd: runtime, env, encoding: "utf8" });
+    const failures = [];
+    if (!published.journalExists) failures.push("the journal must remain published after the parent directory fsync error");
+    if (!published.stageExists) failures.push("the journal's stage must remain available for recovery after the writer throws");
+    if (startup.status !== 0) failures.push(`startup recovery failed: ${startup.stderr || startup.stdout}`);
+    assert.deepEqual(failures, []);
   } finally {
     fs.rmSync(runtime, { recursive: true, force: true });
     fs.rmSync(quarantineDir, { recursive: true, force: true });
@@ -1465,6 +1592,7 @@ test("quarantine restore startup finalizes a committed transaction after interru
     const env = { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false", BACKUP_RETENTION_COUNT: "20" };
     const interrupted = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8" });
     assert.equal(interrupted.status, 74, interrupted.stderr || interrupted.stdout);
+    operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
 
     const recoveryScript = `
       const assert = require("node:assert/strict");
@@ -1544,6 +1672,7 @@ test("quarantine restore recovers after each payload and metadata rename boundar
       const env = { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false", BACKUP_RETENTION_COUNT: "20" };
       const interrupted = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8" });
       assert.equal(interrupted.status, 75, `${boundary}: ${interrupted.stderr || interrupted.stdout}`);
+      operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
 
       const recoveryScript = `
         const assert = require("node:assert/strict");

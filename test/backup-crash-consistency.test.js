@@ -31,6 +31,50 @@ function assertPidIsDead(pid) {
   throw new Error("crash-recovery fixture PID became live");
 }
 
+function currentLinuxOwnerIdentity() {
+  if (process.platform !== "linux") return null;
+  try {
+    const pidNamespaceId = fs.readlinkSync("/proc/self/ns/pid");
+    const selfStat = fs.readFileSync("/proc/self/stat", "utf8");
+    const selfPidDelimiter = selfStat.indexOf(" (");
+    if (selfPidDelimiter < 1 || Number(selfStat.slice(0, selfPidDelimiter)) !== process.pid) return null;
+    if (fs.readlinkSync(`/proc/${process.pid}/ns/pid`) !== pidNamespaceId) return null;
+    const status = fs.readFileSync("/proc/self/status", "utf8");
+    const namespacePids = /^NSpid:\s*([0-9]+(?:\s+[0-9]+)*)\s*$/m.exec(status)?.[1];
+    if (!namespacePids || Number(namespacePids.trim().split(/\s+/).at(-1)) !== process.pid) return null;
+    const processStartIdentity = selfStat.slice(selfStat.lastIndexOf(")") + 1).trim().split(/\s+/)[19];
+    const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    if (!processStartIdentity || !bootId) return null;
+    return { hostId: os.hostname(), bootId, pidNamespaceId, processStartIdentity };
+  } catch {
+    return null;
+  }
+}
+
+const CURRENT_TEST_OWNER_IDENTITY = currentLinuxOwnerIdentity();
+
+function identifiedDeadOwnerLock(runtime) {
+  const pid = findDefinitelyDeadPid();
+  if (!CURRENT_TEST_OWNER_IDENTITY) throw new Error("verified Linux process identity is unavailable for this fixture");
+  const ownerIdentity = {
+    ...CURRENT_TEST_OWNER_IDENTITY,
+    processStartIdentity: "dead-process-fixture",
+  };
+  const instanceId = String(process.env.ROOTARK_INSTANCE_ID || process.env.HOSTNAME || process.env.COMPUTERNAME || os.hostname() || "default").trim();
+  return {
+    formatVersion: 1,
+    token: crypto.randomUUID(),
+    operation: "backup",
+    pid,
+    processInstanceId: crypto.randomUUID(),
+    instanceId,
+    ownerIdentity,
+    startedAt: new Date(0).toISOString(),
+    runtimeRoot: fs.realpathSync(runtime),
+    takeoverClaimToken: null,
+  };
+}
+
 function startChild(runtime, mode, data = {}, env = {}) {
   const child = spawn(process.execPath, [CHILD_HELPER, JSON.stringify({ mode, data })], {
     cwd: runtime,
@@ -86,7 +130,7 @@ async function assertOneCriticalSection(runtime, stale = false) {
   const critical = path.join(runtime, "critical");
   if (stale) {
     const lock = path.join(runtime, "data", "backups", ".backup.lock");
-    fs.writeFileSync(lock, JSON.stringify({ token: "stale", operation: "backup", pid: 99999999 }));
+    fs.writeFileSync(lock, JSON.stringify(identifiedDeadOwnerLock(runtime)));
     fs.utimesSync(lock, new Date(0), new Date(0));
   }
   const action = criticalAction(entered, critical);
@@ -157,7 +201,7 @@ test("backup operation lock is exclusive across real child processes", { timeout
     }
   });
 
-  await t.test("dead stale lock has one owner", async () => {
+  await t.test("verified same-host dead-owner lock has one owner", { skip: !CURRENT_TEST_OWNER_IDENTITY ? "verified /proc owner identities are unavailable on this platform" : false }, async () => {
     const runtime = newRuntime("rootark-lock-stale-race-");
     try { await assertOneCriticalSection(runtime, true); } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
   });
@@ -186,12 +230,12 @@ test("backup operation lock is exclusive across real child processes", { timeout
     } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
   });
 
-  await t.test("a crash after stale evidence quarantine is recoverable", async () => {
+  await t.test("a crash after verified stale evidence quarantine is recoverable", { skip: !CURRENT_TEST_OWNER_IDENTITY ? "verified /proc owner identities are unavailable on this platform" : false }, async () => {
     const runtime = newRuntime("rootark-lock-quarantine-");
     try {
       const action = "crash-after-stale-evidence-quarantine";
       const lock = path.join(runtime, "data", "backups", ".backup.lock");
-      fs.writeFileSync(lock, JSON.stringify({ token: "stale", operation: "backup", pid: 99999999 }));
+      fs.writeFileSync(lock, JSON.stringify(identifiedDeadOwnerLock(runtime)));
       fs.utimesSync(lock, new Date(0), new Date(0));
       const crashed = await runChild(runtime, action);
       assert.notEqual(crashed.code, 0);
@@ -203,12 +247,12 @@ test("backup operation lock is exclusive across real child processes", { timeout
     } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
   });
 
-  await t.test("a crash after evidence cleanup staging leaves a recoverable takeover authority", async () => {
+  await t.test("a crash after evidence cleanup staging leaves a recoverable takeover authority", { skip: !CURRENT_TEST_OWNER_IDENTITY ? "verified /proc owner identities are unavailable on this platform" : false }, async () => {
     const runtime = newRuntime("rootark-lock-owner-crash-");
     try {
       const action = "crash-after-takeover-evidence-cleanup-stage";
       const lock = path.join(runtime, "data", "backups", ".backup.lock");
-      fs.writeFileSync(lock, JSON.stringify({ token: "stale", operation: "backup", pid: 99999999 }));
+      fs.writeFileSync(lock, JSON.stringify(identifiedDeadOwnerLock(runtime)));
       fs.utimesSync(lock, new Date(0), new Date(0));
       const crashed = await runChild(runtime, action);
       assert.notEqual(crashed.code, 0);
@@ -220,7 +264,7 @@ test("backup operation lock is exclusive across real child processes", { timeout
     } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
   });
 
-  await t.test("recent malformed evidence fails closed and old malformed evidence recovers", async () => {
+  await t.test("recent and old malformed lock evidence fail closed and remain preserved", async () => {
     const runtime = newRuntime("rootark-lock-malformed-");
     const lock = path.join(runtime, "data", "backups", ".backup.lock");
     try {
@@ -229,9 +273,9 @@ test("backup operation lock is exclusive across real child processes", { timeout
       assert.equal(recent.code, 0, recent.stderr);
       const old = new Date(Date.now() - 120_000);
       fs.utimesSync(lock, old, old);
-      const recoveredAction = criticalAction(path.join(runtime, "entered.log"), path.join(runtime, "critical"));
-      const recovered = await runChild(runtime, recoveredAction.mode, recoveredAction.data);
-      assert.equal(recovered.code, 0, recovered.stderr);
+      const oldMalformed = await runChild(runtime, "expect-lock-error", { operation: "backup", expectedCode: "BACKUP_LOCKED" });
+      assert.equal(oldMalformed.code, 0, oldMalformed.stderr);
+      assert.equal(fs.readFileSync(lock, "utf8"), "broken");
     } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
   });
 

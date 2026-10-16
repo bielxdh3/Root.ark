@@ -2090,6 +2090,11 @@ function restoreQuarantine(plan, onProgress = null) {
     fsyncDirectory(stagingDirectory);
     onProgress?.("restore.quarantine.committed-marker.persisted", { transactionId });
   } catch (error) {
+    let publishedJournal = false;
+    if (!journalWritten && pathExists(journalPath)) {
+      try { publishedJournal = readQuarantineJournal(journalPath)?.transactionId === transactionId; }
+      catch { publishedJournal = true; }
+    }
     if (journalWritten) {
       try {
         const activeJournal = readQuarantineJournal(journalPath);
@@ -2110,7 +2115,7 @@ function restoreQuarantine(plan, onProgress = null) {
       } catch (recoveryError) {
         error.recoveryError = recoveryError;
       }
-    } else {
+    } else if (!publishedJournal) {
       fs.rmSync(stagingDirectory, { recursive: true, force: true });
     }
     throw error;

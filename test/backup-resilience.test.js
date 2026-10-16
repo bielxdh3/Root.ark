@@ -21,9 +21,9 @@ test("backup names and lock recovery remain safe", async (t) => {
     assert.notEqual(result[0], result[1]);
   });
 
-  await t.test("dead stale locks are recovered", () => {
-    const result = run(`const fs = require("fs"); const service = require(${JSON.stringify(servicePath)}); fs.mkdirSync(service.BACKUPS_DIR, { recursive: true }); fs.writeFileSync(service.LOCK_FILE, JSON.stringify({ pid: 99999999 })); fs.utimesSync(service.LOCK_FILE, new Date(0), new Date(0)); const release = service.acquireLock("backup"); release(); console.log(JSON.stringify({ exists: fs.existsSync(service.LOCK_FILE) }));`);
-    assert.equal(result.exists, false);
+  await t.test("legacy stale locks without owner identity fail closed and remain untouched", () => {
+    const result = run(`const fs = require("fs"); const service = require(${JSON.stringify(servicePath)}); fs.mkdirSync(service.BACKUPS_DIR, { recursive: true }); const contents = JSON.stringify({ pid: 99999999 }); fs.writeFileSync(service.LOCK_FILE, contents); fs.utimesSync(service.LOCK_FILE, new Date(0), new Date(0)); try { service.acquireLock("backup"); console.log(JSON.stringify({ error: null, preserved: fs.readFileSync(service.LOCK_FILE, "utf8") === contents })); } catch (error) { console.log(JSON.stringify({ error: error.code, preserved: fs.readFileSync(service.LOCK_FILE, "utf8") === contents })); }`);
+    assert.deepEqual(result, { error: "BACKUP_LOCKED", preserved: true });
   });
 
   await t.test("a live PID lock remains authoritative even when old", () => {
@@ -31,10 +31,10 @@ test("backup names and lock recovery remain safe", async (t) => {
     assert.equal(result, "BACKUP_LOCKED");
   });
 
-  await t.test("old malformed locks recover but recent malformed locks do not", () => {
-    for (const [age, expected] of [[0, true], [Date.now(), false]]) {
-      const result = run(`const fs = require("fs"); const service = require(${JSON.stringify(servicePath)}); fs.mkdirSync(service.BACKUPS_DIR, { recursive: true }); fs.writeFileSync(service.LOCK_FILE, "broken"); fs.utimesSync(service.LOCK_FILE, new Date(${age}), new Date(${age})); try { const release = service.acquireLock("backup"); release(); console.log(JSON.stringify(true)); } catch { console.log(JSON.stringify(false)); }`);
-      assert.equal(result, expected);
+  await t.test("old and recent malformed locks fail closed without using age as ownership evidence", () => {
+    for (const age of [0, Date.now()]) {
+      const result = run(`const fs = require("fs"); const service = require(${JSON.stringify(servicePath)}); fs.mkdirSync(service.BACKUPS_DIR, { recursive: true }); fs.writeFileSync(service.LOCK_FILE, "broken"); fs.utimesSync(service.LOCK_FILE, new Date(${age}), new Date(${age})); try { service.acquireLock("backup"); console.log(JSON.stringify({ error: null, preserved: fs.readFileSync(service.LOCK_FILE, "utf8") === "broken" })); } catch (error) { console.log(JSON.stringify({ error: error.code, preserved: fs.readFileSync(service.LOCK_FILE, "utf8") === "broken" })); }`);
+      assert.deepEqual(result, { error: "BACKUP_LOCKED", preserved: true });
     }
   });
 });

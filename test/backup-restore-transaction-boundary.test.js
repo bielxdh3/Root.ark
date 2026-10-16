@@ -8,6 +8,24 @@ require("./isolated-runtime")(test, "rootark-backup-restore-runtime-");
 
 const ROOT = path.resolve(__dirname, "..");
 
+function operatorRecoverExitedRestoreLock(runtime, childPid) {
+  const lockPath = path.join(runtime, "data", "backups", ".backup.lock");
+  const record = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+  assert.ok(["restore", "restore-recovery"].includes(record.operation));
+  assert.equal(record.pid, childPid, "recovery is limited to the confirmed exited restore child");
+  assert.equal(record.runtimeRoot, fs.realpathSync(runtime));
+  const identity = record.ownerIdentity;
+  const canRecoverAutomatically = process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]);
+  assert.equal(canRecoverAutomatically, process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]), "the selected recovery path must match verifiable owner identity");
+  if (canRecoverAutomatically) {
+    assert.equal(fs.existsSync(lockPath), true, "Linux keeps a verifiable crashed-owner lock for automatic recovery");
+    return "automatic";
+  }
+  fs.unlinkSync(lockPath);
+  assert.equal(fs.existsSync(lockPath), false, "operator recovery removes only an unverifiable lock after child exit");
+  return "operator";
+}
+
 test("pre-image copy preserves a pre-existing destination when exclusive staging fails", () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-preimage-copy-runtime-"));
   const source = path.join(runtime, "source.bin");
@@ -312,6 +330,24 @@ function runFixture(body, envOverrides = {}, timeoutMs = 30_000) {
     const uploadsDir = path.join(process.cwd(), "uploads");
     const quarantineDir = process.env.UPLOAD_QUARANTINE_DIR;
     const write = (pathname, value) => { fs.mkdirSync(path.dirname(pathname), { recursive: true }); fs.writeFileSync(pathname, value); };
+    const operatorRecoverExitedRestoreLock = (lockPath, childPid) => {
+      assert.ok(Number.isInteger(childPid) && childPid > 0, "the crashed restore child must have exited");
+      const record = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+      assert.equal(record.operation, "restore");
+      assert.equal(record.pid, childPid, "operator recovery is limited to the exact exited restore child");
+      assert.equal(record.runtimeRoot, fs.realpathSync(process.cwd()));
+      assert.equal(record.instanceId, process.env.ROOTARK_INSTANCE_ID);
+      const identity = record.ownerIdentity;
+      const canRecoverAutomatically = process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]);
+      assert.equal(canRecoverAutomatically, process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]), "the selected recovery path must match verifiable owner identity");
+      if (canRecoverAutomatically) {
+        assert.equal(fs.existsSync(lockPath), true, "Linux keeps a verifiable crashed-owner lock for automatic recovery");
+        return "automatic";
+      }
+      fs.unlinkSync(lockPath);
+      assert.equal(fs.existsSync(lockPath), false, "operator recovery removes only an unverifiable lock after child exit");
+      return "operator";
+    };
     fs.mkdirSync(dataDir, { recursive: true });
     fs.mkdirSync(uploadsDir, { recursive: true });
     fs.mkdirSync(quarantineDir, { recursive: true });
@@ -803,6 +839,7 @@ test("preparing restore coordinator identifies a pre-restore backup after a proc
       write(path.join(dataDir, "runtime.json"), "live-state");
       const interrupted = spawnSync(process.execPath, ["-e", ${JSON.stringify(crashAfterPreRestoreBackupScript)}, selected.id], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 15_000 });
       assert.equal(interrupted.status, 86, interrupted.stderr || interrupted.stdout);
+      operatorRecoverExitedRestoreLock(path.join(dataDir, "backups", ".backup.lock"), interrupted.pid);
       const created = JSON.parse(interrupted.stdout.trim());
       const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
       const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
@@ -3263,6 +3300,7 @@ test("process restart resumes canceled restore cleanup after pre-image removal",
   try {
     const interrupted = spawnSync(process.execPath, ["-e", restoreScript], { cwd: runtime, env, encoding: "utf8", timeout: 15_000 });
     assert.equal(interrupted.status, 86, interrupted.stderr || interrupted.stdout);
+    operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
     const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
     const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
     assert.equal(coordinator.phase, "cancelled");
@@ -3406,6 +3444,7 @@ test("abrupt whole-restore interruptions automatically roll back before startup 
     try {
       const interrupted = spawnSync(process.execPath, ["-e", restoreScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
       assert.equal(interrupted.status, 86, `${crashStep}: ${interrupted.stderr || interrupted.stdout}`);
+      operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
       const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
       assert.ok(fs.existsSync(coordinatorPath), `${crashStep}: durable restore intent must remain`);
       const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
@@ -3444,6 +3483,7 @@ test("abrupt exit after the restart-required marker preserves committed state an
       ].join("\\n");
       const interrupted = childProcess.spawnSync(process.execPath, ["-e", restoreScript], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
       assert.equal(interrupted.status, 86, interrupted.stderr || interrupted.stdout);
+      operatorRecoverExitedRestoreLock(path.join(dataDir, "backups", ".backup.lock"), interrupted.pid);
       const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
       assert.equal(coordinator.phase, "restart_required", "the process exits only after the durable commit marker is written");
       assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "archive-state");
@@ -3529,6 +3569,7 @@ test("abrupt exit during partial whole-restore pre-image creation cleans prepari
   try {
     const interrupted = spawnSync(process.execPath, ["-e", runScript], { cwd: runtime, env, encoding: "utf8", timeout: 20_000 });
     assert.equal(interrupted.status, 86, interrupted.stderr || interrupted.stdout);
+    operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
     const coordinator = JSON.parse(fs.readFileSync(path.join(runtime, "data", ".rootark-restore-coordinator.json"), "utf8"));
     assert.equal(coordinator.phase, "preparing");
     assert.deepEqual(coordinator.preimageProgress, ["quarantine-files"]);
@@ -3559,16 +3600,25 @@ test("restart rolls back crashes inside quarantine journal and commit boundaries
         const crashScript = "const fs=require('node:fs');fs.writeFileSync(" + JSON.stringify(ownerPidPath) + ",String(process.pid));const restore=require(" + JSON.stringify(restorePath) + ");restore.restoreBackup(" + JSON.stringify(backup.id) + ",{confirmation:'RESTORE',failureInjector(step){if(step===" + JSON.stringify(process.env.CRASH_STEP) + ")process.exit(86)}}).then(()=>process.exit(0)).catch(error=>{console.error(error);process.exit(1)});";
         const crashed = spawnSync(process.execPath, ["-e", crashScript], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 20_000 });
         assert.equal(crashed.status, 86, crashed.stderr || crashed.stdout);
+        assert.equal(crashed.pid, Number(fs.readFileSync(ownerPidPath, "utf8")), "spawnSync confirmed the lock owner child has exited");
         const crashedOwnerPid = Number(fs.readFileSync(ownerPidPath, "utf8"));
         assert.ok(Number.isInteger(crashedOwnerPid) && crashedOwnerPid > 0, "the interrupted restore owner must be recorded");
         const lockRecord = JSON.parse(fs.readFileSync(lockPath, "utf8"));
         assert.equal(lockRecord.pid, crashedOwnerPid, "the persisted backup lock must belong to the interrupted child");
         assert.equal(typeof lockRecord.processInstanceId, "string", "the crashed lock must retain its process identity");
+        assert.equal(lockRecord.operation, "restore");
+        assert.equal(lockRecord.runtimeRoot, fs.realpathSync(process.cwd()));
+        const identity = lockRecord.ownerIdentity;
+        const canRecoverAutomatically = process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]);
+        assert.equal(canRecoverAutomatically, process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]), "the selected recovery path must match verifiable owner identity");
+        if (canRecoverAutomatically) {
+          assert.equal(fs.existsSync(lockPath), true, "Linux keeps a verifiable crashed-owner lock for automatic recovery");
+        } else {
+          fs.unlinkSync(lockPath);
+          assert.equal(fs.existsSync(lockPath), false, "operator recovery removes only an unverifiable lock after child exit");
+        }
         const recoveryScript = [
           "const assert=require('node:assert/strict'),fs=require('node:fs'),restore=require(" + JSON.stringify(restorePath) + ");",
-          "const lockPath=" + JSON.stringify(lockPath) + ",ownerPidPath=" + JSON.stringify(ownerPidPath) + ";",
-          "const lockRecord=JSON.parse(fs.readFileSync(lockPath,'utf8'));assert.equal(lockRecord.pid,Number(fs.readFileSync(ownerPidPath,'utf8')));",
-          "lockRecord.pid=process.pid;lockRecord.processInstanceId='stale-crashed-owner-instance';fs.writeFileSync(lockPath,JSON.stringify(lockRecord));",
           "const result=restore.assertNoPendingWholeRestore();assert.equal(result.recovered,true);",
           "assert.deepEqual(JSON.parse(fs.readFileSync(" + JSON.stringify(metadataPath) + ",'utf8')),{items:[{id:'live',storedQuarantineFilename:'live.bin'}]});",
           "assert.equal(fs.readFileSync(" + JSON.stringify(currentPayload) + ",'utf8'),'live payload');",
@@ -3632,7 +3682,7 @@ test("restart resumes quarantine compensation after restoring an overwritten old
         write(path.join(process.env.UPLOAD_QUARANTINE_DIR, ${JSON.stringify(liveFilename)}), "live payload");
         if (${JSON.stringify(caseVariantOrphan)}) write(path.join(process.env.UPLOAD_QUARANTINE_DIR, ${JSON.stringify(caseVariantOrphan)}), "unrelated case-variant orphan");
         const crashScript = [
-          "const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');",
+        "const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');",
           "const journalPath=path.join(process.cwd(),'data','.rootark-quarantine-restore-journal.json');",
           "if(process.env.QUARANTINE_JOURNAL_LEGACY==='true'){const writeFileSync=fs.writeFileSync;fs.writeFileSync=function(pathname,data,...args){const name=path.basename(String(pathname));if(name.startsWith('.rootark-quarantine-restore-journal.json.')&&name.endsWith('.tmp')){const journal=JSON.parse(String(data));delete journal.oldPayloadHashes;data=JSON.stringify(journal);}return writeFileSync.call(this,pathname,data,...args);};}",
           "fs.writeFileSync(" + JSON.stringify(ownerPidPath) + ",String(process.pid));",
@@ -3643,13 +3693,24 @@ test("restart resumes quarantine compensation after restoring an overwritten old
         ].join(" ");
         const crashed = require("node:child_process").spawnSync(process.execPath, ["-e", crashScript], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 20_000 });
         assert.equal(crashed.status, 86, crashed.stderr || crashed.stdout);
+        assert.equal(crashed.pid, Number(fs.readFileSync(ownerPidPath, "utf8")), "spawnSync confirmed the lock owner child has exited");
         assert.equal(fs.readFileSync(payloadPath, "utf8"), "live payload", "the old bytes are in place when the process exits");
         if (${JSON.stringify(caseVariantOrphan)}) assert.equal(fs.readFileSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, ${JSON.stringify(caseVariantOrphan)}), "utf8"), "unrelated case-variant orphan");
+        const lockRecord = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+        assert.equal(lockRecord.operation, "restore");
+        assert.equal(lockRecord.pid, crashed.pid);
+        assert.equal(lockRecord.runtimeRoot, fs.realpathSync(process.cwd()));
+        const identity = lockRecord.ownerIdentity;
+        const canRecoverAutomatically = process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]);
+        assert.equal(canRecoverAutomatically, process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]), "the selected recovery path must match verifiable owner identity");
+        if (canRecoverAutomatically) {
+          assert.equal(fs.existsSync(lockPath), true, "Linux keeps a verifiable crashed-owner lock for automatic recovery");
+        } else {
+          fs.unlinkSync(lockPath);
+          assert.equal(fs.existsSync(lockPath), false, "operator recovery removes only an unverifiable lock after child exit");
+        }
         const recoveryScript = [
           "const assert=require('node:assert/strict'),fs=require('node:fs'),restore=require(" + JSON.stringify(restorePath) + ");",
-          "const lockPath=" + JSON.stringify(lockPath) + ",ownerPidPath=" + JSON.stringify(ownerPidPath) + ";",
-          "const lockRecord=JSON.parse(fs.readFileSync(lockPath,'utf8'));assert.equal(lockRecord.pid,Number(fs.readFileSync(ownerPidPath,'utf8')));",
-          "lockRecord.pid=process.pid;lockRecord.processInstanceId='stale-crashed-owner-instance';fs.writeFileSync(lockPath,JSON.stringify(lockRecord));",
           "const result=restore.assertNoPendingWholeRestore();assert.equal(result.recovered,true);",
           "assert.equal(fs.readFileSync('data/runtime.json','utf8'),'live state');",
           "assert.deepEqual(JSON.parse(fs.readFileSync(" + JSON.stringify(metadataPath) + ",'utf8')),{items:[{id:'live',storedQuarantineFilename:'${liveFilename}'}]});",
@@ -3746,6 +3807,7 @@ test("startup rejects mismatched whole-restore coordinator and pre-image schema 
     try {
       const interrupted = spawnSync(process.execPath, ["-e", interruptScript], { cwd: runtime, env, encoding: "utf8", timeout: 15_000 });
       assert.equal(interrupted.status, 86, interrupted.stderr || interrupted.stdout);
+      operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
       const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
       const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
       const manifestPath = path.join(runtime, "data", "backups", ".restore-preimages", coordinator.transactionId, "manifest.json");
@@ -3971,6 +4033,7 @@ test("restart resumes rollback interrupted after one local domain", { timeout: 3
     assert.equal(first.status, 0, first.stderr || first.stdout);
     const interrupted = spawnSync(process.execPath, ["-e", interruptRollback], { cwd: runtime, env, encoding: "utf8", timeout: 15_000 });
     assert.equal(interrupted.status, 87, interrupted.stderr || interrupted.stdout);
+    operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
     const coordinator = JSON.parse(fs.readFileSync(path.join(runtime,"data",".rootark-restore-coordinator.json"),"utf8"));
     assert.equal(coordinator.phase,"rolling_back");
     assert.equal(coordinator.rollbackDomain, "uploads-tree");
@@ -4128,6 +4191,7 @@ test("restart recovers whole-restore pre-images after an interrupted SQLite jour
   try {
     const interrupted = spawnSync(process.execPath, ["-e", interruptDuringSqliteJournalUpdate], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
     assert.equal(interrupted.status, 87, interrupted.stderr || interrupted.stdout);
+    operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
     const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
     assert.equal(coordinator.phase, "prepared");
     const restarted = spawnSync(process.execPath, ["-e", restart], { cwd: runtime, env, encoding: "utf8", timeout: 25_000 });
@@ -4396,6 +4460,7 @@ test("process exit after a partial restore data or upload copy recovers the prio
       assert.equal(setup.status, 0, setup.stderr || setup.stdout);
       const crashedCopy = spawnSync(process.execPath, ["-e", crashScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
       assert.equal(crashedCopy.status, 71, crashedCopy.stderr || crashedCopy.stdout);
+      operatorRecoverExitedRestoreLock(runtime, crashedCopy.pid);
       assert.equal(fs.readFileSync(target, "utf8"), partialBytes, "the child must terminate after writing only a prefix");
       assert.equal(JSON.parse(fs.readFileSync(coordinatorPath, "utf8")).phase, "prepared");
       const recovered = spawnSync(process.execPath, ["-e", recoveryScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
@@ -4491,6 +4556,7 @@ test("process exit after the first restored pre-image tree entry keeps the barri
     assert.equal(setup.status, 0, setup.stderr || setup.stdout);
     const crashedRollback = spawnSync(process.execPath, ["-e", crashScript], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
     assert.equal(crashedRollback.status, 72, crashedRollback.stderr || crashedRollback.stdout);
+    operatorRecoverExitedRestoreLock(runtime, crashedRollback.pid);
     const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
     assert.equal(coordinator.phase, "rolling_back");
     assert.equal(coordinator.rollbackDomain, "uploads-tree");
@@ -4688,6 +4754,57 @@ test("application startup recovers an interrupted SQLite restore before migratio
   } finally {
     fs.rmSync(runtime, { recursive: true, force: true });
   }
+});
+
+test("Windows restore startup fails closed and preserves journals behind an unverifiable lock", { skip: process.platform !== "win32", timeout: 60_000 }, () => {
+  runFixture(`
+    const { spawnSync } = require("node:child_process");
+    const backupDir = path.join(dataDir, "backups");
+    const lockPath = path.join(backupDir, ".backup.lock");
+    const coordinatorPath = path.join(dataDir, ".rootark-restore-coordinator.json");
+    const journalPath = path.join(dataDir, ".rootark-quarantine-restore-journal.json");
+    const archivedPayload = path.join(quarantineDir, "archived.bin");
+    const livePayload = path.join(quarantineDir, "live.bin");
+    write(path.join(dataDir, "quarantine.json"), JSON.stringify({ items: [{ id: "archived", storedQuarantineFilename: "archived.bin" }] }));
+    write(archivedPayload, "archived payload bytes");
+    (async () => {
+      const backup = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "quarantine.json"), JSON.stringify({ items: [{ id: "live", storedQuarantineFilename: "live.bin" }] }));
+      fs.rmSync(archivedPayload, { force: true });
+      write(livePayload, "live payload bytes");
+      const crashScript = [
+        "const fs=require('node:fs');",
+        "fs.writeFileSync(" + JSON.stringify(path.join(dataDir, "restore-crash-owner.pid")) + ",String(process.pid));",
+        "const restore=require(" + JSON.stringify(${JSON.stringify(path.join(ROOT, "services", "restoreService"))}) + ");",
+        "restore.restoreBackup(" + JSON.stringify(backup.id) + ",{confirmation:'RESTORE',failureInjector(step){if(step==='restore.quarantine.journal.persisted')process.exit(86)}}).then(()=>process.exit(0)).catch(error=>{console.error(error);process.exit(1)});",
+      ].join(" ");
+      const interrupted = spawnSync(process.execPath, ["-e", crashScript], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
+      assert.equal(interrupted.status, 86, interrupted.stderr || interrupted.stdout);
+      assert.equal(interrupted.pid, Number(fs.readFileSync(path.join(dataDir, "restore-crash-owner.pid"), "utf8")));
+      assert.equal(fs.existsSync(lockPath), true);
+      assert.equal(fs.existsSync(coordinatorPath), true);
+      assert.equal(fs.existsSync(journalPath), true);
+      const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
+      const manifestPath = path.join(backupDir, ".restore-preimages", coordinator.transactionId, "manifest.json");
+      assert.equal(fs.existsSync(manifestPath), true);
+      const lockRecord = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+      assert.equal(lockRecord.pid, interrupted.pid);
+      assert.equal(lockRecord.operation, "restore");
+      const artifacts = [lockPath, coordinatorPath, journalPath, manifestPath].map((pathname) => [pathname, fs.readFileSync(pathname)]);
+
+      const recoveryScript = [
+        "const assert=require('node:assert/strict');",
+        "const restore=require(" + JSON.stringify(${JSON.stringify(path.join(ROOT, "services", "restoreService"))}) + ");",
+        "assert.throws(()=>restore.assertNoPendingWholeRestore(),{code:'BACKUP_LOCKED'});",
+      ].join(" ");
+      const recovery = spawnSync(process.execPath, ["-e", recoveryScript], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 20_000 });
+      assert.equal(recovery.status, 0, recovery.stderr || recovery.stdout);
+      for (const [pathname, bytes] of artifacts) assert.deepEqual(fs.readFileSync(pathname), bytes, path.basename(pathname) + " must remain byte-for-byte unchanged");
+      assert.equal(fs.existsSync(lockPath + ".takeover"), false, "unverifiable ownership creates no takeover artifacts");
+      assert.equal(fs.readdirSync(backupDir).some((entry) => entry.startsWith(".backup.lock.claim-")), false);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch(error => { console.error(error); process.exitCode = 1; });
+  `);
 });
 
 test("startup checks whole-restore coordinator before WebDAV journal recovery", { timeout: 30_000 }, () => {
@@ -5539,6 +5656,7 @@ test("abrupt exit after provider-orphan policy persistence restores pre-restore 
       ].join("\\n");
       const crashed = childProcess.spawnSync(process.execPath, ["-e", restoreCode], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000 });
       assert.equal(crashed.status, 86, crashed.stderr || crashed.stdout);
+      operatorRecoverExitedRestoreLock(path.join(dataDir, "backups", ".backup.lock"), crashed.pid);
       const policyPath = path.join(dataDir, ".rootark-restore-provider-orphans.json");
       const policyStatePath = path.join(dataDir, ".rootark-restore-provider-orphans-state.json");
       assert.equal(JSON.parse(fs.readFileSync(policyPath, "utf8")).objects.some((entry) => entry.area === "temp" && entry.name === "post-backup-pending.txt"), true, "the abrupt exit occurs after the new suppression policy is durable");
@@ -5593,6 +5711,7 @@ test("abrupt exit after provider-orphan policy rename restores the prior pair be
         cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30_000,
       });
       assert.equal(crashed.status, 86, crashed.stderr || crashed.stdout);
+      operatorRecoverExitedRestoreLock(path.join(dataDir, "backups", ".backup.lock"), crashed.pid);
       assert.notEqual(fs.readFileSync(policyPath, "utf8"), priorPolicy,
         "the policy rename completed before the injected process exit");
       assert.equal(fs.readFileSync(statePath, "utf8"), priorState,

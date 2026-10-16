@@ -8,6 +8,24 @@ const test = require("node:test");
 const ROOT = path.resolve(__dirname, "..");
 const modulePath = (relative) => JSON.stringify(path.join(ROOT, relative));
 
+function operatorRecoverExitedRestoreLock(runtime, childPid) {
+  const lockPath = path.join(runtime, "data", "backups", ".backup.lock");
+  const record = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+  assert.ok(["restore", "restore-recovery"].includes(record.operation));
+  assert.equal(record.pid, childPid, "recovery is limited to the confirmed exited restore child");
+  assert.equal(record.runtimeRoot, fs.realpathSync(runtime));
+  const identity = record.ownerIdentity;
+  const canRecoverAutomatically = process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]);
+  assert.equal(canRecoverAutomatically, process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]), "the selected recovery path must match verifiable owner identity");
+  if (canRecoverAutomatically) {
+    assert.equal(fs.existsSync(lockPath), true, "Linux keeps a verifiable crashed-owner lock for automatic recovery");
+    return "automatic";
+  }
+  fs.unlinkSync(lockPath);
+  assert.equal(fs.existsSync(lockPath), false, "operator recovery removes only an unverifiable lock after child exit");
+  return "operator";
+}
+
 test("restart removes file-set pre-image temps after interrupted copy and replacement", { timeout: 60_000 }, () => {
   for (const boundary of ["copy", "delete", "rename"]) {
     const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-preimage-recovery-"));
@@ -72,6 +90,7 @@ test("restart removes file-set pre-image temps after interrupted copy and replac
     try {
       const first = spawnSync(process.execPath, ["-e", prepare], { cwd: runtime, env, encoding: "utf8", timeout: 20_000 });
       assert.equal(first.status, 86, boundary + ": " + (first.stderr || first.stdout));
+      operatorRecoverExitedRestoreLock(runtime, first.pid);
       const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
       const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
       const unlistedPath = path.join(runtime, "data", "unlisted." + coordinator.transactionId + ".restore-preimage");
@@ -84,6 +103,7 @@ test("restart removes file-set pre-image temps after interrupted copy and replac
       fs.writeFileSync(legacyPath, "legacy transaction temp");
       const interrupted = spawnSync(process.execPath, ["-e", interruptLines.join("\n")], { cwd: runtime, env, encoding: "utf8", timeout: 15_000 });
       assert.equal(interrupted.status, 87, boundary + ": " + (interrupted.stderr || interrupted.stdout));
+      operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
       const listedTemps = fs.readdirSync(path.join(runtime, "data")).filter((name) => !name.startsWith("unlisted.") && name.endsWith(".restore-preimage"));
       assert.equal(listedTemps.filter((name) => name.includes(coordinator.transactionId)).length, boundary === "rename" ? 0 : 1, boundary + ": interruption must leave only the expected transaction temp");
       const restarted = spawnSync(process.execPath, ["-e", recover], { cwd: runtime, env, encoding: "utf8", timeout: 20_000 });
