@@ -188,6 +188,7 @@ const UPLOAD_CHUNK_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_
 const UPLOAD_CHUNK_IP_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_IP_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS * 10, 1, MAX_UPLOAD_CHUNKS * 100);
 const CHUNK_UPLOAD_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CHUNK_UPLOAD_EXPIRED_TOMBSTONE_TTL_MS = CHUNK_UPLOAD_SESSION_TTL_MS;
+const CHUNK_ACTIVITY_RENAME_RETRY_DELAYS_MS = Object.freeze([10, 25, 50, 100]);
 const CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS = parseBoundedNumber("CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS", 60 * 1000, 1000, 60 * 60 * 1000);
 let chunkSessionExpirySweepRunning = false;
 const CHUNK_PART_FILENAMES = Array.from({ length: MAX_UPLOAD_CHUNKS }, (_, index) => `${index}.part`);
@@ -8369,7 +8370,8 @@ function replaceChunkMetadataFile(sessionDir, metadataPath, metadata, retryActiv
 
   try {
     fs.writeFileSync(replacementPath, JSON.stringify(metadata, null, 2), { flag: "wx", mode: 0o600 });
-    const renameAttempts = retryActivityRename ? 3 : 1;
+    const retryActivityRenameOnWindows = retryActivityRename && process.platform === "win32";
+    const renameAttempts = retryActivityRenameOnWindows ? CHUNK_ACTIVITY_RENAME_RETRY_DELAYS_MS.length + 1 : 1;
     for (let attempt = 0; attempt < renameAttempts; attempt += 1) {
       assertSafeChunkSessionDirectory(sessionDir);
       let currentStats = null;
@@ -8388,8 +8390,8 @@ function replaceChunkMetadataFile(sessionDir, metadataPath, metadata, retryActiv
         fs.renameSync(replacementPath, metadataPath);
         break;
       } catch (error) {
-        if (!retryActivityRename || error.code !== "EPERM" || attempt === renameAttempts - 1) throw error;
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, attempt === 0 ? 10 : 25);
+        if (!retryActivityRenameOnWindows || error.code !== "EPERM" || attempt === renameAttempts - 1) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, CHUNK_ACTIVITY_RENAME_RETRY_DELAYS_MS[attempt]);
       }
     }
     const installedStats = fs.lstatSync(metadataPath, { bigint: true });
@@ -8974,6 +8976,7 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
     }
 
     const chunkPath = path.join(sessionDir, CHUNK_PART_FILENAMES[chunkIndex]);
+    const previousMetadata = metadata;
     let previousPartStats = null;
     try {
       previousPartStats = fs.lstatSync(chunkPath);
@@ -9017,15 +9020,18 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
         throw error;
       }
     }
-    chunkUploadQuota.transition({
-      operationId: req[CHUNK_UPLOAD_QUOTA_OPERATION_ID],
-      sessionKey: `${folderId}/${uploadId}`,
-      relativePath: path.relative(CHUNK_UPLOAD_DIR, chunkPath),
-      state: "promoting",
-      chargeBytes: req.file.size,
-    });
     let previousPartBackedUp = false;
+    let activityUpdated = false;
     try {
+      chunkUploadQuota.transition({
+        operationId: req[CHUNK_UPLOAD_QUOTA_OPERATION_ID],
+        sessionKey: `${folderId}/${uploadId}`,
+        relativePath: path.relative(CHUNK_UPLOAD_DIR, chunkPath),
+        state: "promoting",
+        chargeBytes: req.file.size,
+      });
+      metadata = touchChunkSessionActivity(sessionDir, metadata);
+      activityUpdated = true;
       if (previousPartStats) {
         chunkUploadQuota.transition({
           operationId: req[CHUNK_UPLOAD_QUOTA_BACKUP_ID],
@@ -9051,21 +9057,36 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
           previousPartBackedUp = false;
         } catch {}
       }
-      if (!previousPartBackedUp && req[CHUNK_UPLOAD_QUOTA_BACKUP_ID]) {
-        chunkUploadQuota.transition({
-          operationId: req[CHUNK_UPLOAD_QUOTA_BACKUP_ID],
-          state: "part_committed",
-          chargeBytes: previousPartStats.size,
-          relativePath: path.relative(CHUNK_UPLOAD_DIR, chunkPath),
-        });
-        const incomingStats = fs.lstatSync(incomingChunkPath);
-        if (!incomingStats.isSymbolicLink() && incomingStats.isFile() && incomingStats.nlink === 1 && incomingStats.size === req.file.size) {
+      if (!previousPartBackedUp) {
+        if (req[CHUNK_UPLOAD_QUOTA_BACKUP_ID]) {
+          chunkUploadQuota.transition({
+            operationId: req[CHUNK_UPLOAD_QUOTA_BACKUP_ID],
+            state: "part_committed",
+            chargeBytes: previousPartStats.size,
+            relativePath: path.relative(CHUNK_UPLOAD_DIR, chunkPath),
+          });
+        }
+        let incomingStats = null;
+        try {
+          incomingStats = fs.lstatSync(incomingChunkPath);
+        } catch (incomingError) {
+          if (incomingError.code !== "ENOENT") throw incomingError;
+        }
+        if (incomingStats && !incomingStats.isSymbolicLink() && incomingStats.isFile() && incomingStats.nlink === 1 && incomingStats.size === req.file.size) {
           chunkUploadQuota.transition({
             operationId: req[CHUNK_UPLOAD_QUOTA_OPERATION_ID],
             state: "staged",
             chargeBytes: incomingStats.size,
             relativePath: path.relative(CHUNK_UPLOAD_DIR, incomingChunkPath),
           });
+        }
+      }
+      if (activityUpdated) {
+        try {
+          replaceChunkMetadataFile(sessionDir, path.join(sessionDir, "metadata.json"), previousMetadata, true);
+          metadata = previousMetadata;
+        } catch (rollbackError) {
+          error.metadataRollbackError = rollbackError;
         }
       }
       throw error;
@@ -9075,7 +9096,6 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
       chunkUploadQuota.release(req[CHUNK_UPLOAD_QUOTA_BACKUP_ID]);
     }
     chunkUploadQuota.transition({ operationId: req[CHUNK_UPLOAD_QUOTA_OPERATION_ID], state: "part_committed", chargeBytes: req.file.size });
-    metadata = touchChunkSessionActivity(sessionDir, metadata);
 
     if (assemblySize === null || !hasAllChunks(sessionDir, totalChunks)) {
       return res.json({
