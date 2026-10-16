@@ -7,7 +7,7 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 
 const protocol = require("./rootark-sync-protocol");
-const { SyncJournal } = require("./rootark-sync-journal");
+const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 
 const SNAPSHOT_VERSION = 1;
@@ -160,7 +160,7 @@ async function durableJson(filePath, value) {
     await handle.sync();
     await handle.close();
     handle = null;
-    await fsp.rename(temporary, filePath);
+    await renameWithRetry(temporary, filePath);
     // Node cannot reliably fsync directory handles on Windows. Flush the
     // containing directory where the platform supports it; the file itself
     // is opened with O_SYNC and explicitly synced before the atomic rename.
