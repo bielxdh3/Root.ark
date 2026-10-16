@@ -421,11 +421,36 @@ test("WebDAV enabled MOVE preserves same-folder files and fails closed for hosti
   fs.writeFileSync(path.join(dir, "uploads", "replace.txt"), "replacement");
   fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction");
   const portNumber = await port();
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", WEBDAV_ALLOW_MOVE: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
+  const journalRenameRetryMarker = path.join(dir, "journal-rename-retry-injected.txt");
+  const childBootstrap = `
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const originalRenameSync = fs.renameSync;
+    let injectedTransientEperm = false;
+    fs.renameSync = function (source, destination, ...args) {
+      const sourceName = path.basename(String(source));
+      const destinationName = path.basename(String(destination));
+      const isJournalReplacement = /^rootark-webdav-move-[0-9a-f-]+\\.json\\.[0-9a-f-]+\\.tmp$/i.test(sourceName)
+        && /^rootark-webdav-move-[0-9a-f-]+\\.json$/i.test(destinationName)
+        && fs.existsSync(destination);
+      if (process.platform === "win32" && !injectedTransientEperm && isJournalReplacement) {
+        injectedTransientEperm = true;
+        fs.writeFileSync(${JSON.stringify(journalRenameRetryMarker)}, "injected");
+        const error = new Error("injected transient WebDAV journal rename EPERM");
+        error.code = "EPERM";
+        throw error;
+      }
+      return originalRenameSync.call(this, source, destination, ...args);
+    };
+    require(${JSON.stringify(path.join(ROOT, "server.js"))});
+  `;
+  const child = spawn(process.execPath, ["-e", childBootstrap], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", WEBDAV_ALLOW_MOVE: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
   t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
   await ready(portNumber);
   const basic = `Basic ${Buffer.from("agent:password").toString("base64")}`;
   assert.equal((await request(portNumber, "/dav/source.txt", { method: "MOVE", headers: { authorization: basic, destination: "/dav/target.txt" } })).status, 201);
+  if (process.platform === "win32") assert.equal(fs.readFileSync(journalRenameRetryMarker, "utf8"), "injected", "WebDAV retries a transient Windows EPERM while atomically replacing its journal");
+  else assert.equal(fs.existsSync(journalRenameRetryMarker), false, "the Windows-specific EPERM injection is inactive on other platforms");
   assert.equal(fs.readFileSync(path.join(dir, "uploads", "target.txt"), "utf8"), "source");
   assert.equal((await request(portNumber, "/dav/target.txt", { method: "MOVE", headers: { authorization: basic, destination: "/dav/target.txt" } })).status, 403);
   assert.equal((await request(portNumber, "/dav/replace.txt", { method: "MOVE", headers: { authorization: basic, destination: "/dav/target.txt" } })).status, 412);
