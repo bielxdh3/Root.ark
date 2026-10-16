@@ -97,6 +97,17 @@ async function runChild(runtime, mode, data = {}, env = {}) {
   return startChild(runtime, mode, data, env).result;
 }
 
+async function waitForFile(filePath, childResult, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  const childExit = childResult.then((result) => ({ result }), (error) => ({ error }));
+  while (!fs.existsSync(filePath)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for child marker: ${path.basename(filePath)}`);
+    const outcome = await Promise.race([childExit, new Promise((resolve) => setTimeout(() => resolve(null), 10))]);
+    if (outcome?.error) throw outcome.error;
+    if (outcome?.result) throw new Error(`child exited before writing marker: ${outcome.result.code}:${outcome.result.stderr}`);
+  }
+}
+
 function newRuntime(prefix) {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   fs.mkdirSync(path.join(runtime, "data", "backups"), { recursive: true });
@@ -128,19 +139,24 @@ function criticalAction(enteredPath, criticalPath) {
 async function assertOneCriticalSection(runtime, stale = false) {
   const entered = path.join(runtime, "entered.log");
   const critical = path.join(runtime, "critical");
+  const releaseOwner = path.join(runtime, "release-critical-owner");
   if (stale) {
     const lock = path.join(runtime, "data", "backups", ".backup.lock");
     fs.writeFileSync(lock, JSON.stringify(identifiedDeadOwnerLock(runtime)));
     fs.utimesSync(lock, new Date(0), new Date(0));
   }
   const action = criticalAction(entered, critical);
-  const first = runChild(runtime, action.mode, action.data);
-  const second = runChild(runtime, action.mode, action.data);
-  const results = await Promise.all([first, second]);
-  const owners = results.filter((item) => item.code === 0);
-  const locked = results.filter((item) => item.code === 10);
-  assert.equal(owners.length, 1, results.map((item) => `${item.code}:${item.stderr}`).join(" | "));
-  assert.equal(locked.length, 1, results.map((item) => `${item.code}:${item.stderr}`).join(" | "));
+  const owner = startChild(runtime, action.mode, { ...action.data, releasePath: releaseOwner });
+  let ownerResult;
+  try {
+    await waitForFile(entered, owner.result);
+    const contender = await runChild(runtime, action.mode, action.data);
+    assert.equal(contender.code, 10, `${contender.code}:${contender.stderr}`);
+  } finally {
+    fs.writeFileSync(releaseOwner, "release\n");
+    ownerResult = await owner.result;
+  }
+  assert.equal(ownerResult.code, 0, `${ownerResult.code}:${ownerResult.stderr}`);
   assert.equal(fs.readFileSync(entered, "utf8").trim().split(/\r?\n/).length, 1);
   assert.equal(fs.existsSync(path.join(runtime, "data", "backups", ".backup.lock")), false);
 }
