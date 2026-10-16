@@ -26,8 +26,6 @@ const LOCK_TAKEOVER_META = path.join(LOCK_TAKEOVER_DIR, "authority.json");
 const LOCK_TAKEOVER_EVIDENCE = path.join(LOCK_TAKEOVER_DIR, "evidence");
 const RETENTION_TRANSACTIONS_DIR = path.join(BACKUPS_DIR, ".retention-transactions");
 const OPERATION_LOCK_FORMAT_VERSION = 1;
-const MALFORMED_LOCK_TTL_MS = 60 * 1000;
-const MALFORMED_TAKEOVER_TTL_MS = 60 * 1000;
 const MAX_LOCK_TTL_MS = 24 * 60 * 60 * 1000;
 const PROCESS_INSTANCE_ID_SYMBOL = Symbol.for("rootark.backup.process-instance-id");
 if (!globalThis[PROCESS_INSTANCE_ID_SYMBOL]) {
@@ -43,17 +41,43 @@ function boundedLockDuration(name, fallback) {
   return Math.max(1000, Math.min(MAX_LOCK_TTL_MS, value));
 }
 
-function processStartIdentity(pid) {
-  if (process.platform !== "linux") return null;
+function processStartIdentity(pid, expectedPidNamespaceId) {
+  if (process.platform !== "linux" || typeof expectedPidNamespaceId !== "string" || !expectedPidNamespaceId) return null;
   try {
+    const selfStat = fs.readFileSync("/proc/self/stat", "utf8");
+    const selfPidDelimiter = selfStat.indexOf(" (");
+    const selfPid = Number(selfStat.slice(0, selfPidDelimiter));
+    if (selfPidDelimiter < 1 || selfPid !== process.pid) return null;
+    if (fs.readlinkSync(`/proc/${pid}/ns/pid`) !== expectedPidNamespaceId) return null;
+    const status = fs.readFileSync(`/proc/${pid}/status`, "utf8");
+    const namespacePids = /^NSpid:\s*([0-9]+(?:\s+[0-9]+)*)\s*$/m.exec(status)?.[1];
+    if (!namespacePids || Number(namespacePids.trim().split(/\s+/).at(-1)) !== pid) return null;
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const pidDelimiter = stat.indexOf(" (");
+    if (pidDelimiter < 1 || Number(stat.slice(0, pidDelimiter)) !== pid) return null;
     return stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/)[19] || null;
   } catch {
     return null;
   }
 }
 
-const CURRENT_PROCESS_START_IDENTITY = processStartIdentity(process.pid);
+function processBootIdentity() {
+  if (process.platform !== "linux") return null;
+  try { return fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || null; } catch { return null; }
+}
+
+function processPidNamespaceIdentity() {
+  if (process.platform !== "linux") return null;
+  try { return fs.readlinkSync("/proc/self/ns/pid") || null; } catch { return null; }
+}
+
+const CURRENT_PROCESS_PID_NAMESPACE_ID = processPidNamespaceIdentity();
+const CURRENT_PROCESS_IDENTITY = Object.freeze({
+  hostId: os.hostname() || null,
+  bootId: processBootIdentity(),
+  pidNamespaceId: CURRENT_PROCESS_PID_NAMESPACE_ID,
+  processStartIdentity: processStartIdentity(process.pid, CURRENT_PROCESS_PID_NAMESPACE_ID),
+});
 
 function setCloudStorage(storage) {
   cloudStorage = storage || null;
@@ -533,17 +557,22 @@ function lockOwnerInstanceId() {
 }
 
 function ownerIsLive(record) {
-  if (!Number.isInteger(record?.pid) || record.pid <= 0) return false;
+  if (!Number.isInteger(record?.pid) || record.pid <= 0) return true;
   const hasVersionedOwner = record.formatVersion === OPERATION_LOCK_FORMAT_VERSION || record.version === OPERATION_LOCK_FORMAT_VERSION;
   if (hasVersionedOwner && (!record.instanceId || record.instanceId !== lockOwnerInstanceId())) return true;
-  if (record.pid === process.pid && typeof record.processInstanceId === "string" && record.processInstanceId) {
-    return record.processInstanceId === CURRENT_PROCESS_INSTANCE_ID;
+  const owner = record.ownerIdentity;
+  const requiredIdentity = ["hostId", "bootId", "pidNamespaceId"];
+  if (!owner || requiredIdentity.some((key) => typeof owner[key] !== "string" || !owner[key]) ||
+      requiredIdentity.some((key) => typeof CURRENT_PROCESS_IDENTITY[key] !== "string" || !CURRENT_PROCESS_IDENTITY[key])) return true;
+  if (owner.hostId !== CURRENT_PROCESS_IDENTITY.hostId || owner.bootId !== CURRENT_PROCESS_IDENTITY.bootId || owner.pidNamespaceId !== CURRENT_PROCESS_IDENTITY.pidNamespaceId) return true;
+  try {
+    process.kill(record.pid, 0);
+  } catch (error) {
+    return error.code === "ESRCH" ? false : true;
   }
-  try { process.kill(record.pid, 0); } catch (error) { return error.code === "EPERM"; }
-  if (record.processStartIdentity && processStartIdentity(record.pid)) {
-    return record.processStartIdentity === processStartIdentity(record.pid);
-  }
-  return true;
+  const currentStartIdentity = processStartIdentity(record.pid, CURRENT_PROCESS_IDENTITY.pidNamespaceId);
+  if (typeof owner.processStartIdentity !== "string" || !owner.processStartIdentity || !currentStartIdentity) return true;
+  return owner.processStartIdentity === currentStartIdentity;
 }
 
 function validLockRecord(record) {
@@ -740,13 +769,7 @@ function recoverTakeoverAuthority() {
   const state = readTakeoverAuthority();
   if (state.kind === "missing") return;
   if (state.kind === "valid" && state.live) throw lockError("BACKUP_LOCKED", "Reivindicacao de takeover de lock de backup em andamento");
-  if (state.kind === "malformed") {
-    if (Date.now() - state.mtimeMs <= boundedLockDuration("BACKUP_LOCK_MALFORMED_TTL_MS", MALFORMED_TAKEOVER_TTL_MS)) throw lockError("BACKUP_LOCKED", "Autoridade de takeover de lock recente e invalida");
-    const entries = fs.readdirSync(LOCK_TAKEOVER_DIR);
-    if (entries.length) throw lockError("BACKUP_LOCKED", "Autoridade de takeover de lock ambigua");
-    fs.rmdirSync(LOCK_TAKEOVER_DIR);
-    return;
-  }
+  if (state.kind === "malformed") throw lockError("BACKUP_LOCKED", "Autoridade de takeover de lock invalida");
   if (state.kind !== "valid") throw lockError("BACKUP_LOCKED", "Autoridade de takeover de lock ambigua");
   removeTakeoverAuthority(state.record.token);
 }
@@ -761,7 +784,7 @@ function acquireTakeoverAuthority(observed, operation) {
     pid: process.pid,
     processInstanceId: CURRENT_PROCESS_INSTANCE_ID,
     instanceId: lockOwnerInstanceId(),
-    processStartIdentity: CURRENT_PROCESS_START_IDENTITY,
+    ownerIdentity: CURRENT_PROCESS_IDENTITY,
     claimedAt: new Date().toISOString(),
     runtimeRoot: runtimeRootIdentity(),
     lockPath: LOCK_FILE,
@@ -840,7 +863,7 @@ function lockRecord(operation, token, claimToken = null) {
     pid: process.pid,
     processInstanceId: CURRENT_PROCESS_INSTANCE_ID,
     instanceId: lockOwnerInstanceId(),
-    processStartIdentity: CURRENT_PROCESS_START_IDENTITY,
+    ownerIdentity: CURRENT_PROCESS_IDENTITY,
     startedAt: new Date().toISOString(),
     runtimeRoot: runtimeRootIdentity(),
     takeoverClaimToken: claimToken,
@@ -876,7 +899,7 @@ function writeLock(operation, token = crypto.randomUUID(), claimToken = null) {
   } catch (error) {
     failClosedLockDescriptor(fd);
     try { if (fd !== undefined) fs.closeSync(fd); } catch {}
-    // Keep partial records fail-closed; stale malformed locks are reclaimed through the takeover protocol.
+    // Keep partial records fail-closed; ambiguous ownership requires operator recovery.
     throw error;
   }
 }
@@ -905,7 +928,7 @@ function acquireLock(operation) {
     const state = readLockState();
     if (state.kind === "mismatch") throw lockError("BACKUP_LOCKED", "Lock de backup pertence a outra raiz de runtime");
     if (state.kind === "valid" && !state.stale) throw lockError("BACKUP_LOCKED", "Outra operacao de backup/restauracao esta em andamento");
-    if (state.kind === "malformed" && Date.now() - state.mtimeMs <= boundedLockDuration("BACKUP_LOCK_MALFORMED_TTL_MS", MALFORMED_LOCK_TTL_MS)) throw lockError("BACKUP_LOCKED", "Lock de backup recente e invalido");
+    if (state.kind === "malformed") throw lockError("BACKUP_LOCKED", "Lock de backup invalido");
 
     if (state.kind === "missing") {
       try {
