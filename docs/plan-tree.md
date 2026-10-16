@@ -1,13 +1,13 @@
 # Root.ark Plan Tree
 
 Last reconstructed: 2026-07-25 (historical baseline)
-Latest live application and pre-publication GitHub/security snapshot: 2026-10-16 after PR #199 merged; `Root/main` SHA `18d45696e9c07d706de1e9ab161d1b642cbd3d87`. The [2026-10-16 closure snapshot](validation/2026-10-16-rootark-prepublication-closure.md) records the open issue/PR state, exact-head local gates, remote check outcomes, and remaining acceptance limits as queried before this documentation update was published.
+Latest application-code snapshot for this closure: 2026-10-16 after PR #201 merged at `341804fa2bfd02dcd50f2d1bde560cb677fc27fd`. The [2026-10-16 pre-publication snapshot](validation/2026-10-16-rootark-prepublication-closure.md) records GitHub state and validation evidence queried after PR #199; it is historical and does not describe PR #201 or later commits. The final exact `Root/main` SHA and local validation for the documentation-only closure publication are reported in the mission's final engineering report.
 
 Repository: bielxdh3/root.ark
 
-PRs #195–#200 are merged. This milestone includes the aggregate chunk-upload quota follow-up test (#199) and the Windows WebDAV journal rename retry (#200); their exact branch-head local release-gate results and canceled remote Windows jobs are separated in the [closure snapshot](validation/2026-10-16-rootark-prepublication-closure.md). PR #97 is merged as partial selective-sync work; issue #66 remains open. The exact final default-branch SHA after this documentation PR and its local validation are separate from this pre-publication snapshot and are recorded in the final closure report.
+PRs #195–#201 are merged. This milestone includes the aggregate chunk-upload quota follow-up test (#199), the Windows WebDAV journal rename retry (#200), and the closure ledger/evidence reconciliation (#201). The [pre-publication snapshot](validation/2026-10-16-rootark-prepublication-closure.md) contains exact branch-head release-gate results and the remote Windows-job outcomes for #199–#200; those results do not transfer to later SHAs. PR #97 is merged as partial selective-sync work; issue #66 remains open. The mission's final engineering report records the exact final default-branch SHA and validation for this documentation update.
 
-Historical sections below preserve their original evidence and claims; they are not current live status. The application checks in this pre-publication snapshot do not transfer to this documentation publication or its resulting default-branch SHA.
+Historical sections below preserve their original evidence and claims; they are not current live status. Validation statements are tied to their named SHA and do not transfer to later commits.
 
 Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 

@@ -69,11 +69,11 @@ The repository currently contains working foundations for:
 - [x] bounded provider retry/cancellation, idempotency, ciphertext-only attestation, and secret-safe observability helpers;
 - [x] automated syntax, test, dependency, and artifact validation.
 
-### Latest application validation snapshot after PR #189 — 2026-10-15 (`Root/main` application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`)
+### Historical application validation snapshot after PR #189 — 2026-10-15 (application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`)
 
 PR #179 adds a bounded Windows `EPERM` retry for sync-journal rename; PR #188 adds chunk-upload request limits before body parsing and staging; PR #189 adds disposable crash-recovery coverage for the restore provider-policy pair. The [post-#189 validation snapshot](docs/validation/2026-10-15-rootark-post-189.md) records exact-SHA CI, browser coverage, the live issue/PR query, and remaining acceptance limits for application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`.
 
-This is an application-code snapshot. At the pre-publication query, PR #175 was open as the vehicle for this reconciliation; the locally prepared update still required its own exact-head and resulting-`Root/main` validation. The application checks above do not transfer to that publication. Restore remains recoverable rather than globally atomic, and Root.ark is not production-ready or an end-to-end Zero-Knowledge runtime.
+This is a historical application-code snapshot, not the latest validation state. PR #175 was open when this snapshot was written and later merged on 2026-10-15 at `2a3fea8b151302de73be755775e4ca8ca54d1c14`. The 2026-10-16 closure work is summarized in [the plan tree](docs/plan-tree.md); its final exact `Root/main` SHA and local validation are reported in the mission's final engineering report. Checks listed here apply only to application SHA `bde6c54`. Restore remains recoverable rather than globally atomic, and Root.ark is not production-ready or an end-to-end Zero-Knowledge runtime.
 
 ### Historical application snapshot after PR #169 — 2026-10-12 (`Root/main` application SHA `b62da94b236c046ae3251b632067072616587342`)
 
