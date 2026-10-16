@@ -710,6 +710,10 @@ function createChunkUploadQuota({ rootDir, perAccountBytes, systemBytes, perAcco
         if (service.ownerStatus(operation) !== "dead") return false;
         return database.transaction(() => updateOwner.run(processInstanceId, processId, ownerProcessIdentity, Date.now(), operation.operationId, operation.ownerInstanceId, operation.ownerPid, operation.ownerProcessIdentity ?? null).changes === 1).immediate();
       },
+      restoreOwner(operation) {
+        if (!operation || typeof operation.operationId !== "string" || typeof operation.ownerInstanceId !== "string" || !Number.isSafeInteger(operation.ownerPid)) throw new TypeError("Invalid chunk quota owner restoration");
+        return database.transaction(() => updateOwner.run(operation.ownerInstanceId, operation.ownerPid, operation.ownerProcessIdentity ?? null, Date.now(), operation.operationId, processInstanceId, processId, ownerProcessIdentity).changes === 1).immediate();
+      },
       async withSessionLock(sessionKey, callback, { waitMs = 30_000 } = {}) {
         if (typeof sessionKey !== "string" || !sessionKey || typeof callback !== "function" || !Number.isSafeInteger(waitMs) || waitMs < 0) throw new TypeError("Invalid chunk session lock request");
         const deadline = Date.now() + waitMs;

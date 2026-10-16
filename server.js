@@ -4683,22 +4683,57 @@ function cleanupOrphanTempUploads(directory = path.resolve("./temp")) {
 }
 
 function cleanupIncomingUploads() {
-  for (const directory of [SIMPLE_UPLOAD_INCOMING_DIR]) {
+  for (const directory of [SIMPLE_UPLOAD_INCOMING_DIR, CHUNK_UPLOAD_INCOMING_DIR]) {
     if (!fs.existsSync(directory)) continue;
 
     const now = Date.now();
+    const chunkOperations = directory === CHUNK_UPLOAD_INCOMING_DIR && chunkUploadQuota
+      ? new Map(chunkUploadQuota.operations().map((operation) => [path.resolve(CHUNK_UPLOAD_DIR, operation.relativePath), operation]))
+      : null;
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const fullPath = path.join(directory, entry.name);
       if (!entry.isFile()) continue;
-      const isUploadStagingFile = directory === SIMPLE_UPLOAD_INCOMING_DIR
-        ? /^\d+-[a-f0-9]{16}\.(?:upload|webdav)$/i.test(entry.name)
-        : /^[a-f0-9]{32}$/i.test(entry.name);
-      if (!isUploadStagingFile) continue;
+      const isChunkStagingFile = directory === CHUNK_UPLOAD_INCOMING_DIR && /^[a-f0-9]{32}$/i.test(entry.name);
+      const isSimpleStagingFile = directory === SIMPLE_UPLOAD_INCOMING_DIR && /^\d+-[a-f0-9]{16}\.(?:upload|webdav)$/i.test(entry.name);
+      if (!isSimpleStagingFile && !isChunkStagingFile) continue;
 
-      const stats = fs.statSync(fullPath);
-      if (now - stats.mtimeMs > 5 * 60 * 1000) {
-        fs.rmSync(fullPath, { force: true });
+      let stats;
+      try { stats = fs.lstatSync(fullPath); }
+      catch (error) { if (error.code === "ENOENT") continue; else throw error; }
+      if (isChunkStagingFile && (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1)) continue;
+      if (now - stats.mtimeMs <= 5 * 60 * 1000) continue;
+      if (isChunkStagingFile) {
+        if (!chunkOperations) continue;
+        const operation = chunkOperations.get(path.resolve(fullPath));
+        if (!operation || !["reserved", "writing", "staged"].includes(operation.state)) continue;
+        if (stats.size > operation.chargeBytes) continue;
+        if (chunkUploadQuota.ownerStatus(operation) !== "dead" || !chunkUploadQuota.claim(operation)) continue;
+        const claimedPath = getChunkQuotaOperationFile(operation);
+        let currentStats;
+        try { currentStats = fs.lstatSync(claimedPath); }
+        catch (error) {
+          if (error.code === "ENOENT") currentStats = null;
+          else {
+            if (!chunkUploadQuota.restoreOwner(operation)) throw new Error("Unable to restore stale incoming operation ownership after validation error", { cause: error });
+            throw error;
+          }
+        }
+        const changedOrUnsafe = currentStats && (currentStats.isSymbolicLink() || !currentStats.isFile() || currentStats.nlink !== 1 || currentStats.size > operation.chargeBytes || currentStats.dev !== stats.dev || currentStats.ino !== stats.ino || currentStats.size !== stats.size);
+        if (changedOrUnsafe) {
+          if (!chunkUploadQuota.restoreOwner(operation)) throw new Error("Unable to restore stale incoming operation ownership after file changed");
+          continue;
+        }
+        if (currentStats) {
+          try { fs.unlinkSync(claimedPath); }
+          catch (error) {
+            if (error.code !== "ENOENT" && !chunkUploadQuota.restoreOwner(operation)) throw new Error("Unable to restore stale incoming operation ownership after unlink failure", { cause: error });
+            if (error.code !== "ENOENT") throw error;
+          }
+        }
+        if (!chunkUploadQuota.release(operation.operationId)) throw new Error("Unable to release stale chunk incoming operation");
+        continue;
       }
+      fs.rmSync(fullPath, { force: true });
     }
   }
 }
@@ -6279,7 +6314,7 @@ function handleChunkUploadSingle(req, res, next) {
       Object.defineProperty(req.file, CHUNK_UPLOAD_INCOMING_FILE_PATH, { value: req[CHUNK_UPLOAD_INCOMING_FILE_PATH] });
     }
     removeAndReleaseChunkUploadIncoming(req);
-
+    req.resume();
     res.status(error.code === "LIMIT_FILE_SIZE" ? 413 : 400).json({ error: error.message || "Upload do bloco nao concluido" });
   });
 }
@@ -7476,7 +7511,15 @@ function readLegacyChunkQuotaOperations({ includeOperations = true, applyDeferre
       const filePath = path.join(sessionPath, entry.name);
       const relativePath = path.relative(CHUNK_UPLOAD_DIR, filePath);
       const matches = operations.filter((operation) => normalizeRelativePath(operation.relativePath) === normalizeRelativePath(relativePath));
-      let operation = matches.length === 1 ? matches[0] : null;
+      const committed = matches.filter((operation) => operation.state === "part_committed");
+      const promoting = matches.filter((operation) => operation.state === "promoting");
+      let interruptedRollback = false;
+      if (matches.length === 2 && committed.length === 1 && promoting.length === 1 &&
+          committed[0].sessionKey === promoting[0].sessionKey && committed[0].accountKey === promoting[0].accountKey) {
+        const fileStats = fs.lstatSync(filePath);
+        interruptedRollback = fileStats.isFile() && !fileStats.isSymbolicLink() && fileStats.nlink === 1 && fileStats.size === committed[0].chargeBytes;
+      }
+      let operation = matches.length === 1 ? matches[0] : interruptedRollback ? committed[0] : null;
       let pendingHandoffScratch = false;
       if (!operation && matches.length === 0 && entry.name === "assembled.upload") {
         const pendingHandoffs = operations.filter((candidate) => candidate.state === "handoff_pending");
@@ -7484,7 +7527,7 @@ function readLegacyChunkQuotaOperations({ includeOperations = true, applyDeferre
         operation = pendingHandoffs[0];
         pendingHandoffScratch = true;
       }
-      if (!operation || matches.length > 1) return false;
+      if (!operation || (matches.length > 1 && !interruptedRollback)) return false;
       const partMatch = /^(0|[1-9]\d{0,3})\.part$/.exec(entry.name);
       const backupMatch = /^\.replacement-[a-zA-Z0-9_-]{1,120}\.part$/.test(entry.name);
       const allowed =
@@ -7685,7 +7728,7 @@ function getChunkQuotaOperationFile(operation, { repairPermissions = true } = {}
 }
 
 function validateChunkQuotaOperationsBeforeRecovery(operations) {
-  const seenPaths = new Set();
+  const seenPaths = new Map();
   const sessionAccounts = new Map();
   const operationsById = new Map(operations.map((operation) => [operation?.operationId, operation]));
   const replacementBackups = [];
@@ -7759,8 +7802,16 @@ function validateChunkQuotaOperationsBeforeRecovery(operations) {
 
     const filePath = getChunkQuotaOperationFile(operation, { repairPermissions: false });
     const pathKey = process.platform === "win32" ? filePath.toLowerCase() : filePath;
-    if (seenPaths.has(pathKey)) throw new Error("Duplicate chunk quota operation path");
-    seenPaths.add(pathKey);
+    const existingAtPath = seenPaths.get(pathKey) || [];
+    if (existingAtPath.length) {
+      const prior = existingAtPath[0];
+      const isInterruptedReplacementRollback = existingAtPath.length === 1 && hasValidSession &&
+        ((prior.state === "part_committed" && operation.state === "promoting") ||
+          (prior.state === "promoting" && operation.state === "part_committed")) &&
+        prior.sessionKey === operation.sessionKey && prior.accountKey === operation.accountKey;
+      if (!isInterruptedReplacementRollback) throw new Error("Duplicate chunk quota operation path");
+    }
+    seenPaths.set(pathKey, [...existingAtPath, operation]);
 
     if (hasValidSession) {
       const sessionKey = sessionParts.join("/");
@@ -7856,15 +7907,22 @@ function inspectChunkQuotaFile(filePath) {
 
 function recoverDeadChunkQuotaOperations() {
   const operations = chunkUploadQuota.operations();
+  const recoveredOperationIds = new Set();
   // Validate every ledger row before recovery performs any filesystem mutation.
   validateChunkQuotaOperationsBeforeRecovery(operations);
   for (const operation of operations) {
+    if (recoveredOperationIds.has(operation.operationId)) continue;
     const ownerStatus = chunkUploadQuota.ownerStatus(operation);
     if (ownerStatus === "current" || ownerStatus === "live") continue;
     if (ownerStatus !== "dead") throw new Error("Chunk quota operation owner identity is ambiguous; recovery is blocked");
     if (!chunkUploadQuota.claim(operation)) continue;
     if (["handoff_pending", "handoff_published", "handed_off"].includes(operation.state)) {
+      const sessionOperationIds = chunkUploadQuota.operationsForSession(operation.sessionKey).map((item) => item.operationId);
       recoverChunkUploadHandoff(operation);
+      const remainingOperationIds = new Set(chunkUploadQuota.operationsForSession(operation.sessionKey).map((item) => item.operationId));
+      for (const operationId of sessionOperationIds) {
+        if (!remainingOperationIds.has(operationId)) recoveredOperationIds.add(operationId);
+      }
       continue;
     }
     const filePath = getChunkQuotaOperationFile(operation);
@@ -8048,7 +8106,17 @@ function recoverChunkPartPromotion(operation) {
   if (backupStats && !targetStats) {
     if (!backupOperation) throw new Error("Replacement backup is not charged");
     if (incomingStats && incomingStats.size === operation.chargeBytes) {
-      fs.renameSync(incomingPath, targetPath);
+      try {
+        fs.renameSync(incomingPath, targetPath);
+      } catch (error) {
+        const targetAfterFailure = inspectChunkQuotaFile(targetPath);
+        if (targetAfterFailure || !inspectChunkQuotaFile(backupPath)) throw error;
+        fs.renameSync(backupPath, targetPath);
+        if (incomingStats) fs.unlinkSync(incomingPath);
+        chunkUploadQuota.transition({ operationId: backupOperation.operationId, state: "part_committed", chargeBytes: backupStats.size, relativePath: path.relative(CHUNK_UPLOAD_DIR, targetPath) });
+        if (!chunkUploadQuota.release(operation.operationId)) throw new Error("Unable to release failed replacement after restoring its accepted part");
+        return;
+      }
       fs.unlinkSync(backupPath);
       if (!chunkUploadQuota.release(backupOperation.operationId)) throw new Error("Unable to release recovered replacement backup");
       chunkUploadQuota.transition({ operationId: operation.operationId, state: "part_committed", chargeBytes: incomingStats.size });
@@ -8071,6 +8139,18 @@ function recoverChunkPartPromotion(operation) {
     return;
   }
   if (!backupStats && targetStats && !incomingStats) {
+    const acceptedPart = backupOperation?.state === "promoting"
+      ? backupOperation
+      : chunkUploadQuota.operationsForSession(operation.sessionKey).find((candidate) =>
+        candidate.state === "part_committed" && candidate.relativePath === path.relative(CHUNK_UPLOAD_DIR, targetPath));
+    if (acceptedPart) {
+      if (targetStats.size !== acceptedPart.chargeBytes) throw new Error("Restored replacement part does not match its accepted charge");
+      if (backupOperation?.state === "promoting") {
+        chunkUploadQuota.transition({ operationId: backupOperation.operationId, state: "part_committed", chargeBytes: targetStats.size, relativePath: path.relative(CHUNK_UPLOAD_DIR, targetPath) });
+      }
+      if (!chunkUploadQuota.release(operation.operationId)) throw new Error("Unable to release failed replacement");
+      return;
+    }
     if (targetStats.size !== operation.chargeBytes) throw new Error("Promoted chunk size is ambiguous");
     if (backupOperation && !chunkUploadQuota.release(backupOperation.operationId)) throw new Error("Unable to release removed replacement backup");
     chunkUploadQuota.transition({ operationId: operation.operationId, state: "part_committed", chargeBytes: targetStats.size });

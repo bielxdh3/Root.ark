@@ -10,7 +10,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
 const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
-const { createChunkUploadQuota: createChunkUploadQuotaService, getCurrentProcessIdentity } = require("../services/chunkUploadQuota");
+const { classifyProcessOwner, createChunkUploadQuota: createChunkUploadQuotaService, getCurrentProcessIdentity } = require("../services/chunkUploadQuota");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -3373,6 +3373,75 @@ test("startup removes a dead-owner incoming reservation only after reconciling i
   }
 });
 
+test("startup does not claim a suspicious stale incoming file it cannot safely remove", { timeout: 30_000 }, async (t) => {
+  const operationId = "e".repeat(32);
+  const bytes = "suspicious incoming with a hard link";
+  const originalOwnerPid = 2147483000;
+  const harness = await createHarness(t, {
+    preloadSource: ({ dir, chunkRoot }) => `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const quotaModule = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
+      const createChunkUploadQuota = quotaModule.createChunkUploadQuota;
+      const root = ${JSON.stringify(chunkRoot)};
+      const incomingPath = path.join(root, "incoming", ${JSON.stringify(operationId)});
+      fs.mkdirSync(path.dirname(incomingPath), { recursive: true });
+      fs.writeFileSync(incomingPath, ${JSON.stringify(bytes)});
+      const oldTime = new Date(Date.now() - 10 * 60 * 1000);
+      fs.utimesSync(incomingPath, oldTime, oldTime);
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: ${originalOwnerPid} });
+      quota.initialize();
+      quota.reserve({ operationId: ${JSON.stringify(operationId)}, accountKey: "uploader", relativePath: path.join("incoming", ${JSON.stringify(operationId)}), reservedBytes: 8 * 1024 * 1024 });
+      quota.close();
+      quotaModule.createChunkUploadQuota = function (...args) {
+        const service = createChunkUploadQuota(...args);
+        const ownerStatus = service.ownerStatus.bind(service);
+        const claim = service.claim.bind(service);
+        const lstatSync = fs.lstatSync;
+        let checks = 0;
+        let operationClaimed = false;
+        let injectedHardLink = false;
+        service.claim = function (operation) {
+          const result = claim(operation);
+          if (operation.operationId === ${JSON.stringify(operationId)} && result) operationClaimed = true;
+          return result;
+        };
+        fs.lstatSync = function (filePath, ...statArgs) {
+          if (operationClaimed && !injectedHardLink && path.resolve(filePath) === path.resolve(incomingPath)) {
+            fs.linkSync(incomingPath, path.join(${JSON.stringify(dir)}, "suspicious-alias"));
+            injectedHardLink = true;
+          }
+          return lstatSync.call(this, filePath, ...statArgs);
+        };
+        service.ownerStatus = function (operation) {
+          if (operation.operationId === ${JSON.stringify(operationId)}) {
+            checks += 1;
+            if (checks === 1) return "live";
+            if (checks <= 3) return "dead";
+          }
+          return ownerStatus(operation);
+        };
+        return service;
+      };
+    `,
+  });
+
+  const incomingPath = path.join(harness.chunkRoot, "incoming", operationId);
+  assert.equal(fs.readFileSync(incomingPath, "utf8"), bytes);
+  assert.equal(fs.statSync(incomingPath).nlink, 2);
+  const aliasPath = path.join(harness.dir, "suspicious-alias");
+  assert.equal(fs.readFileSync(aliasPath, "utf8"), bytes);
+  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  try {
+    const operation = database.prepare("SELECT owner_pid, state, charge_bytes FROM quota_operations WHERE operation_id = ?").get(operationId);
+    assert.equal(operation.owner_pid, originalOwnerPid, "invalid file state must leave the claim with the dead owner for restart recovery");
+    assert.equal(operation.state, "reserved");
+    assert.equal(operation.charge_bytes, 8 * 1024 * 1024);
+  } finally {
+    database.close();
+  }
+});
+
 test("startup recovers a reused PID only when process-start identity proves it is stale", { timeout: 30_000 }, async (t) => {
   const operationId = "b".repeat(32);
   const bytes = "live incoming";
@@ -3432,6 +3501,27 @@ test("startup preserves incoming bytes and disables chunk uploads when an operat
   assert.equal(response.status, 503, response.body);
   assert.equal(JSON.parse(response.body).code, "CHUNK_QUOTA_UNAVAILABLE");
   assert.equal(fs.readFileSync(path.join(harness.chunkRoot, "incoming", operationId), "utf8"), bytes);
+});
+
+test("chunk quota fails closed when a persisted owner PID belongs to another PID namespace", () => {
+  const currentIdentity = {
+    version: 1,
+    platform: "linux",
+    hostId: "a".repeat(64),
+    bootId: "00000000-0000-0000-0000-000000000001",
+    pidNamespace: "pid:[100]",
+    processStartTime: "500",
+  };
+  const ownerIdentity = { ...currentIdentity, pidNamespace: "pid:[200]", processStartTime: "1" };
+  let signaled = false;
+
+  const status = classifyProcessOwner(4242, ownerIdentity, currentIdentity, {
+    platform: "linux",
+    kill() { signaled = true; },
+  });
+
+  assert.equal(status, "unknown", "a numeric PID from a different namespace is ambiguous even when host and boot match");
+  assert.equal(signaled, false, "namespace ambiguity must not be resolved by probing the colliding PID");
 });
 
 test("startup preserves an old incoming file owned by the exact live instance", { timeout: 30_000 }, async (t) => {
@@ -4516,6 +4606,46 @@ test("a failed replacement rename restores the prior accepted part and its ledge
   }
 });
 
+async function prepareFailedReplacement(t, uploadId) {
+  const original = Buffer.from("accepted part before failed replacement");
+  const replacementBytes = Buffer.from("replacement remains charged for recovery");
+  const harness = await createHarness(t, {
+    preloadSource: ({ chunkRoot }) => `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const renameSync = fs.renameSync;
+      let incomingPromotions = 0;
+      fs.renameSync = function (source, destination, ...args) {
+        const isPartTarget = String(destination).endsWith(path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "0.part"));
+        if (isPartTarget && String(source).includes(path.join(".chunks", "incoming")) && ++incomingPromotions === 2) {
+          throw Object.assign(new Error("injected replacement promotion failure"), { code: "EIO" });
+        }
+        if (isPartTarget && path.basename(String(source)).startsWith(".replacement-")) {
+          throw Object.assign(new Error("injected prior-part rollback failure"), { code: "EIO" });
+        }
+        return renameSync.call(this, source, destination, ...args);
+      };
+    `,
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  assert.equal((await uploadChunk(harness.port, session, { uploadId, originalName: `${uploadId}.txt`, chunkIndex: 0, totalChunks: 2, bytes: original })).status, 200);
+  assert.equal((await uploadChunk(harness.port, session, { uploadId, originalName: `${uploadId}.txt`, chunkIndex: 0, totalChunks: 2, bytes: replacementBytes })).status, 500);
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  const rows = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  let operations;
+  try { operations = rows.prepare("SELECT operation_id, relative_path FROM quota_operations ORDER BY relative_path").all(); }
+  finally { rows.close(); }
+  const backupOperation = operations.find((row) => row.relative_path.includes(".replacement-"));
+  return {
+    harness,
+    original,
+    replacementBytes,
+    sessionDir,
+    backupOperationId: backupOperation.operation_id,
+    backupFileName: path.basename(backupOperation.relative_path),
+  };
+}
+
 test("restart reconciles a replacement when restoring its prior part fails", { timeout: 45_000 }, async (t) => {
   const uploadId = "replacement-rollback-recovery";
   const original = Buffer.from("accepted part before failed replacement");
@@ -4562,7 +4692,32 @@ test("restart reconciles a replacement when restoring its prior part fails", { t
   harness.child.kill();
   await waitForExit(harness.child);
   const recoveryPort = await getUnusedPort();
-  const recoveryChild = spawn(process.execPath, [SERVER], {
+  const recoveryPreloadPath = path.join(harness.dir, "replacement-recovery-preload.js");
+  fs.writeFileSync(recoveryPreloadPath, `
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const renameSync = fs.renameSync;
+    const unlinkSync = fs.unlinkSync;
+    let failedPromotion = false;
+    let failedAfterIncomingUnlink = false;
+    fs.renameSync = function (source, destination, ...args) {
+      if (!failedPromotion && String(source).includes(path.join(".chunks", "incoming")) && String(destination).endsWith(path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "0.part"))) {
+        failedPromotion = true;
+        throw Object.assign(new Error("injected recovery promotion failure"), { code: "EIO" });
+      }
+      return renameSync.call(this, source, destination, ...args);
+    };
+    fs.unlinkSync = function (target, ...args) {
+      const isIncoming = String(target).includes(path.join(".chunks", "incoming"));
+      const result = unlinkSync.call(this, target, ...args);
+      if (isIncoming && !failedAfterIncomingUnlink) {
+        failedAfterIncomingUnlink = true;
+        throw Object.assign(new Error("injected crash after incoming unlink"), { code: "EIO" });
+      }
+      return result;
+    };
+  `);
+  const recoveryChild = spawn(process.execPath, ["--require", recoveryPreloadPath, SERVER], {
     cwd: harness.dir,
     env: { ...process.env, NODE_ENV: "test", PORT: String(recoveryPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: ["ignore", "pipe", "pipe"],
@@ -4572,16 +4727,13 @@ test("restart reconciles a replacement when restoring its prior part fails", { t
   recoveryChild.stderr.on("data", (chunk) => recoveryStderr.push(chunk.toString()));
   try {
     assert.equal((await waitForServer(recoveryPort)).status, 200, recoveryStderr.join(""));
-    assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), replacementBytes, `recovery resolves the charged incoming payload into the accepted part; startup: ${recoveryStderr.join("")}`);
-    assert.deepEqual(fs.readdirSync(incomingDir), []);
-    assert.equal(fs.readdirSync(sessionDir).some((name) => name.startsWith(".replacement-")), false);
-    const recovered = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+    assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), original);
+    assert.deepEqual(fs.readdirSync(incomingDir), [], "the injected boundary leaves the restored part but no replacement incoming file");
+    const interrupted = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
     try {
-      assert.deepEqual(recovered.prepare("SELECT state, charge_bytes, relative_path FROM quota_operations").all(), [
-        { state: "part_committed", charge_bytes: replacementBytes.length, relative_path: path.join(FOLDER_ID, uploadId, "0.part") },
-      ]);
+      assert.equal(interrupted.prepare("SELECT COUNT(*) AS count FROM quota_operations WHERE state = 'promoting'").get().count, 2);
     } finally {
-      recovered.close();
+      interrupted.close();
     }
   } finally {
     if (recoveryChild.exitCode === null) {
@@ -4589,4 +4741,186 @@ test("restart reconciles a replacement when restoring its prior part fails", { t
       await waitForExit(recoveryChild);
     }
   }
+
+  const finalRecoveryPort = await getUnusedPort();
+  const finalRecoveryChild = spawn(process.execPath, [SERVER], {
+    cwd: harness.dir,
+    env: { ...process.env, NODE_ENV: "test", PORT: String(finalRecoveryPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const finalRecoveryStderr = [];
+  finalRecoveryChild.stderr.on("data", (chunk) => finalRecoveryStderr.push(chunk.toString()));
+  try {
+    assert.equal((await waitForServer(finalRecoveryPort)).status, 200, finalRecoveryStderr.join(""));
+    assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), original, `second restart preserves the accepted part after an interruption between filesystem and ledger recovery: ${finalRecoveryStderr.join("")}`);
+    assert.deepEqual(fs.readdirSync(incomingDir), []);
+    const recovered = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+    try {
+      assert.deepEqual(recovered.prepare("SELECT state, charge_bytes, relative_path FROM quota_operations").all(), [
+        { state: "part_committed", charge_bytes: original.length, relative_path: path.join(FOLDER_ID, uploadId, "0.part") },
+      ]);
+    } finally {
+      recovered.close();
+    }
+  } finally {
+    if (finalRecoveryChild.exitCode === null) {
+      finalRecoveryChild.kill();
+      await waitForExit(finalRecoveryChild);
+    }
+  }
+});
+
+test("restart reconciles a replacement after the restored-part ledger transition", { timeout: 45_000 }, async (t) => {
+  const uploadId = "replacement-transition-recovery";
+  const fixture = await prepareFailedReplacement(t, uploadId);
+  const { harness, original, sessionDir, backupOperationId } = fixture;
+  harness.child.kill();
+  await waitForExit(harness.child);
+  const failedPort = await getUnusedPort();
+  const preloadPath = path.join(harness.dir, "replacement-transition-preload.js");
+  fs.writeFileSync(preloadPath, `
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const renameSync = fs.renameSync;
+    let failedPromotion = false;
+    fs.renameSync = function (source, destination, ...args) {
+      if (!failedPromotion && String(source).includes(path.join(".chunks", "incoming")) && String(destination).endsWith(path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "0.part"))) {
+        failedPromotion = true;
+        throw Object.assign(new Error("injected recovery promotion failure"), { code: "EIO" });
+      }
+      return renameSync.call(this, source, destination, ...args);
+    };
+    const quotaPath = path.join(${JSON.stringify(ROOT)}, "services", "chunkUploadQuota.js");
+    const quota = require(quotaPath);
+    const create = quota.createChunkUploadQuota;
+    quota.createChunkUploadQuota = function (...args) {
+      const service = create.apply(this, args);
+      const transition = service.transition.bind(service);
+      let failedTransition = false;
+      service.transition = function (input) {
+        const result = transition(input);
+        if (!failedTransition && input.operationId === ${JSON.stringify(backupOperationId)} && input.state === "part_committed") {
+          failedTransition = true;
+          throw Object.assign(new Error("injected crash after backup transition"), { code: "EIO" });
+        }
+        return result;
+      };
+      return service;
+    };
+  `);
+  const failedChild = spawn(process.execPath, ["--require", preloadPath, SERVER], {
+    cwd: harness.dir,
+    env: { ...process.env, NODE_ENV: "test", PORT: String(failedPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const failedStderr = [];
+  failedChild.stderr.on("data", (chunk) => failedStderr.push(chunk.toString()));
+  try {
+    assert.equal((await waitForServer(failedPort)).status, 200, failedStderr.join(""));
+    assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), original);
+    const rows = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+    try {
+      assert.deepEqual(rows.prepare("SELECT state, charge_bytes FROM quota_operations ORDER BY state").all(), [
+        { state: "part_committed", charge_bytes: original.length },
+        { state: "promoting", charge_bytes: fixture.replacementBytes.length },
+      ]);
+    } finally { rows.close(); }
+  } finally {
+    if (failedChild.exitCode === null) { failedChild.kill(); await waitForExit(failedChild); }
+  }
+
+  const finalPort = await getUnusedPort();
+  const finalChild = spawn(process.execPath, [SERVER], {
+    cwd: harness.dir,
+    env: { ...process.env, NODE_ENV: "test", PORT: String(finalPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const finalStderr = [];
+  finalChild.stderr.on("data", (chunk) => finalStderr.push(chunk.toString()));
+  try {
+    assert.equal((await waitForServer(finalPort)).status, 200, finalStderr.join(""));
+    assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), original);
+    const rows = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+    try {
+      assert.deepEqual(rows.prepare("SELECT state, charge_bytes, relative_path FROM quota_operations").all(), [
+        { state: "part_committed", charge_bytes: original.length, relative_path: path.join(FOLDER_ID, uploadId, "0.part") },
+      ], finalStderr.join(""));
+    } finally { rows.close(); }
+  } finally {
+    if (finalChild.exitCode === null) { finalChild.kill(); await waitForExit(finalChild); }
+  }
+});
+
+test("restart reconciles a replacement after restoring the original target", { timeout: 45_000 }, async (t) => {
+  const uploadId = "replacement-restore-boundary";
+  const { harness, original, replacementBytes, sessionDir, backupFileName } = await prepareFailedReplacement(t, uploadId);
+  harness.child.kill();
+  await waitForExit(harness.child);
+  const failedPort = await getUnusedPort();
+  const preloadPath = path.join(harness.dir, "replacement-restore-preload.js");
+  const restoreMarkerPath = path.join(harness.dir, "replacement-restore-hook-fired");
+  fs.writeFileSync(preloadPath, `
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const markerPath = ${JSON.stringify(restoreMarkerPath)};
+    const renameSync = fs.renameSync;
+    let failedPromotion = false;
+    let failedAfterRestore = false;
+    fs.renameSync = function (source, destination, ...args) {
+      if (!failedPromotion && String(source).includes(path.join(".chunks", "incoming")) && String(destination).endsWith(path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "0.part"))) {
+        failedPromotion = true;
+        throw Object.assign(new Error("injected recovery promotion failure"), { code: "EIO" });
+      }
+      const result = renameSync.call(this, source, destination, ...args);
+      if (!failedAfterRestore && path.basename(String(source)) === ${JSON.stringify(backupFileName)} && String(destination).endsWith(path.join(${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "0.part"))) {
+        failedAfterRestore = true;
+        fs.writeFileSync(markerPath, "fired");
+        throw Object.assign(new Error("injected interruption after target restore"), { code: "EIO" });
+      }
+      return result;
+    };
+  `);
+  const failedChild = spawn(process.execPath, ["--require", preloadPath, SERVER], {
+    cwd: harness.dir,
+    env: { ...process.env, NODE_ENV: "test", PORT: String(failedPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+  });
+  const failedStderr = [];
+  failedChild.stderr.on("data", (chunk) => failedStderr.push(chunk.toString()));
+  try {
+    assert.equal((await waitForServer(failedPort)).status, 200, failedStderr.join(""));
+    assert.equal(fs.existsSync(restoreMarkerPath), true, "the injected interruption must occur after the original target is restored");
+  }
+  finally { if (failedChild.exitCode === null) { failedChild.kill(); await waitForExit(failedChild); } }
+  const incomingDir = path.join(harness.chunkRoot, "incoming");
+  const incomingName = fs.readdirSync(incomingDir)[0];
+  assert.ok(incomingName, "the replacement remains at its charged incoming path after the interruption");
+  assert.deepEqual(fs.readFileSync(path.join(incomingDir, incomingName)), replacementBytes);
+  assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), original);
+  assert.equal(fs.readdirSync(sessionDir).some((name) => name === backupFileName), false);
+  const interruptedRows = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  try {
+    assert.deepEqual(interruptedRows.prepare("SELECT state, charge_bytes FROM quota_operations ORDER BY charge_bytes").all(), [
+      { state: "promoting", charge_bytes: original.length },
+      { state: "promoting", charge_bytes: replacementBytes.length },
+    ]);
+  } finally { interruptedRows.close(); }
+  const finalPort = await getUnusedPort();
+  const finalChild = spawn(process.execPath, [SERVER], {
+    cwd: harness.dir,
+    env: { ...process.env, NODE_ENV: "test", PORT: String(finalPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+  });
+  const finalStderr = [];
+  finalChild.stderr.on("data", (chunk) => finalStderr.push(chunk.toString()));
+  try {
+    assert.equal((await waitForServer(finalPort)).status, 200);
+    assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), original);
+    const rows = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+    try { assert.deepEqual(rows.prepare("SELECT state, charge_bytes FROM quota_operations").all(), [{ state: "part_committed", charge_bytes: original.length }], finalStderr.join("")); }
+    finally { rows.close(); }
+  } finally { if (finalChild.exitCode === null) { finalChild.kill(); await waitForExit(finalChild); } }
 });
