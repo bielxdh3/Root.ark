@@ -177,6 +177,7 @@ const UPLOAD_CHUNK_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_
 const UPLOAD_CHUNK_IP_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_IP_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS * 10, 1, MAX_UPLOAD_CHUNKS * 100);
 const CHUNK_UPLOAD_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CHUNK_UPLOAD_EXPIRED_TOMBSTONE_TTL_MS = CHUNK_UPLOAD_SESSION_TTL_MS;
+const CHUNK_ACTIVITY_RENAME_RETRY_DELAYS_MS = Object.freeze([10, 25, 50, 100]);
 const CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS = parseBoundedNumber("CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS", 60 * 1000, 1000, 60 * 60 * 1000);
 let chunkSessionExpirySweepRunning = false;
 const CHUNK_PART_FILENAMES = Array.from({ length: MAX_UPLOAD_CHUNKS }, (_, index) => `${index}.part`);
@@ -7200,7 +7201,7 @@ function replaceChunkMetadataFile(sessionDir, metadataPath, metadata, retryActiv
 
   try {
     fs.writeFileSync(replacementPath, JSON.stringify(metadata, null, 2), { flag: "wx", mode: 0o600 });
-    const renameAttempts = retryActivityRename ? 3 : 1;
+    const renameAttempts = retryActivityRename ? CHUNK_ACTIVITY_RENAME_RETRY_DELAYS_MS.length + 1 : 1;
     for (let attempt = 0; attempt < renameAttempts; attempt += 1) {
       assertSafeChunkSessionDirectory(sessionDir);
       let currentStats = null;
@@ -7220,7 +7221,7 @@ function replaceChunkMetadataFile(sessionDir, metadataPath, metadata, retryActiv
         break;
       } catch (error) {
         if (!retryActivityRename || error.code !== "EPERM" || attempt === renameAttempts - 1) throw error;
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, attempt === 0 ? 10 : 25);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, CHUNK_ACTIVITY_RENAME_RETRY_DELAYS_MS[attempt]);
       }
     }
     const installedStats = fs.lstatSync(metadataPath, { bigint: true });
