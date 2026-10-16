@@ -48,7 +48,7 @@ function acquireSource(servicePath, enteredPath, resultCode = 0, afterAcquire = 
   return `const fs=require("fs"); const service=require(${JSON.stringify(servicePath)}); let release; try { release=service.acquireLock("backup"); ${afterAcquire} ${resultCode === 0 ? "release(); process.exit(0);" : "process.exit(12);"} } catch (error) { if (release) release(); process.exit(error.code === "BACKUP_LOCKED" ? 10 : 11); }`;
 }
 
-test("backup takeover preserves exact adjacent 64-bit file IDs in durable authority", { timeout: 30_000 }, async () => {
+test("backup takeover preserves exact adjacent 64-bit file IDs in durable authority", { timeout: 30_000 }, async (t) => {
   const runtime = newRuntime();
   const lockPath = path.join(runtime, "data", "backups", ".backup.lock");
   const evidencePath = lockPath + ".takeover" + path.sep + "evidence";
@@ -60,6 +60,11 @@ test("backup takeover preserves exact adjacent 64-bit file IDs in durable author
     assert.equal(ownerResult.code, 0, ownerResult.stderr);
     assert.equal(fs.existsSync(lockPath), true, "the disposable child leaves its lock as a stale recovery fixture");
     const staleLockBytes = fs.readFileSync(lockPath);
+    const ownerIdentity = JSON.parse(staleLockBytes.toString("utf8")).ownerIdentity;
+    if (process.platform !== "linux" || !ownerIdentity || [ownerIdentity.hostId, ownerIdentity.bootId, ownerIdentity.pidNamespaceId, ownerIdentity.processStartIdentity].some((value) => typeof value !== "string" || !value)) {
+      t.skip("64-bit stale takeover evidence requires verifiable Linux host, boot, PID namespace, and process-start identity");
+      return;
+    }
 
     const id = 9_007_199_254_740_992n;
     const contenderSource = [
@@ -155,6 +160,36 @@ test("stale takeover contenders preserve a newer live lock", { timeout: 30_000 }
     if (contender?.child.exitCode === null) contender.child.kill("SIGKILL");
     if (owner?.child.exitCode === null) owner.child.kill("SIGKILL");
     if (c?.child.exitCode === null) c.child.kill("SIGKILL");
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("Windows cannot take over a lock whose exited owner identity is unverifiable", { skip: process.platform !== "win32", timeout: 30_000 }, async () => {
+  const runtime = newRuntime();
+  const lockPath = path.join(runtime, "data", "backups", ".backup.lock");
+  let owner;
+  let contender;
+  try {
+    owner = startChild(runtime, `const service=require(${JSON.stringify(SERVICE)}); service.acquireLock("restore"); process.exit(0);`);
+    const ownerResult = await owner.result;
+    assert.equal(ownerResult.code, 0, ownerResult.stderr);
+    const lockBytes = fs.readFileSync(lockPath);
+    const lock = JSON.parse(lockBytes.toString("utf8"));
+    assert.equal(lock.operation, "restore");
+    assert.equal(typeof lock.ownerIdentity?.hostId, "string");
+    assert.equal(lock.ownerIdentity.bootId, null);
+    assert.equal(lock.ownerIdentity.pidNamespaceId, null);
+    assert.equal(lock.ownerIdentity.processStartIdentity, null);
+
+    contender = startChild(runtime, `const service=require(${JSON.stringify(SERVICE)}); try { const release=service.acquireLock("restore"); release(); process.exit(12); } catch (error) { process.exit(error.code === "BACKUP_LOCKED" ? 10 : 11); }`);
+    const contenderResult = await contender.result;
+    assert.equal(contenderResult.code, 10, contenderResult.stderr);
+    assert.deepEqual(fs.readFileSync(lockPath), lockBytes, "the unverifiable owner record remains byte-for-byte unchanged");
+    assert.equal(fs.existsSync(`${lockPath}.takeover`), false, "unverifiable ownership creates no takeover artifacts");
+    assert.equal(fs.readdirSync(path.dirname(lockPath)).some((entry) => entry.startsWith(".backup.lock.claim-")), false);
+  } finally {
+    if (owner?.child.exitCode === null) owner.child.kill("SIGKILL");
+    if (contender?.child.exitCode === null) contender.child.kill("SIGKILL");
     fs.rmSync(runtime, { recursive: true, force: true });
   }
 });

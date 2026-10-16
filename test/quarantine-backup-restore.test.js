@@ -8,6 +8,24 @@ const test = require("node:test");
 
 const ROOT = path.resolve(__dirname, "..");
 
+function operatorRecoverExitedRestoreLock(runtime, childPid) {
+  const lockPath = path.join(runtime, "data", "backups", ".backup.lock");
+  const record = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+  assert.equal(record.operation, "restore");
+  assert.equal(record.pid, childPid, "recovery is limited to the confirmed exited restore child");
+  assert.equal(record.runtimeRoot, fs.realpathSync(runtime));
+  const identity = record.ownerIdentity;
+  const canRecoverAutomatically = process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]);
+  assert.equal(canRecoverAutomatically, process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]), "the selected recovery path must match verifiable owner identity");
+  if (canRecoverAutomatically) {
+    assert.equal(fs.existsSync(lockPath), true, "Linux keeps a verifiable crashed-owner lock for automatic recovery");
+    return "automatic";
+  }
+  fs.unlinkSync(lockPath);
+  assert.equal(fs.existsSync(lockPath), false, "operator recovery removes only an unverifiable lock after child exit");
+  return "operator";
+}
+
 test("quarantine metadata is read from the validated file descriptor and rejects path swaps", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-metadata-read-"));
   const metadataPath = path.join(directory, "quarantine.json");
@@ -1347,17 +1365,13 @@ test("quarantine restore recovers its prior state after process interruption", {
     const env = { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false", BACKUP_RETENTION_COUNT: "20" };
     const interrupted = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8" });
     assert.equal(interrupted.status, 73, interrupted.stderr || interrupted.stdout);
+    operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
 
     const recoveryScript = `
       const assert = require("node:assert/strict");
       const fs = require("node:fs");
       const path = require("node:path");
-      const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
       const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
-      const staleLock = JSON.parse(fs.readFileSync(backupService.LOCK_FILE, "utf8"));
-      staleLock.pid = process.pid;
-      staleLock.processInstanceId = "interrupted-process-instance";
-      fs.writeFileSync(backupService.LOCK_FILE, JSON.stringify(staleLock));
       restoreService.recoverQuarantineRestore();
       assert.deepEqual(JSON.parse(fs.readFileSync(path.join(process.cwd(), "data", "quarantine.json"), "utf8")), { items: [{ id: "current", storedQuarantineFilename: "current.bin" }] });
       assert.equal(fs.readFileSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "current.bin"), "utf8"), "current-payload");
@@ -1406,6 +1420,7 @@ test("quarantine restore recovery preserves missing metadata state across startu
     const env = { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false", BACKUP_RETENTION_COUNT: "20" };
     const interrupted = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8" });
     assert.equal(interrupted.status, 73, interrupted.stderr || interrupted.stdout);
+    operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
 
     const recoveryScript = `
       const assert = require("node:assert/strict");
@@ -1465,6 +1480,7 @@ test("quarantine restore startup finalizes a committed transaction after interru
     const env = { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false", BACKUP_RETENTION_COUNT: "20" };
     const interrupted = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8" });
     assert.equal(interrupted.status, 74, interrupted.stderr || interrupted.stdout);
+    operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
 
     const recoveryScript = `
       const assert = require("node:assert/strict");
@@ -1544,6 +1560,7 @@ test("quarantine restore recovers after each payload and metadata rename boundar
       const env = { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false", BACKUP_RETENTION_COUNT: "20" };
       const interrupted = spawnSync(process.execPath, ["-e", setupScript], { cwd: runtime, env, encoding: "utf8" });
       assert.equal(interrupted.status, 75, `${boundary}: ${interrupted.stderr || interrupted.stdout}`);
+      operatorRecoverExitedRestoreLock(runtime, interrupted.pid);
 
       const recoveryScript = `
         const assert = require("node:assert/strict");
