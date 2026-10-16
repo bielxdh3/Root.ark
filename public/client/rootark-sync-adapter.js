@@ -26,7 +26,8 @@
     move: new Set(["fileId", "versionId", "path", "sourcePath", "keyEpoch", "compartmentId", "deviceId"]),
     delete: new Set(["fileId", "versionId", "path", "keyEpoch", "compartmentId", "deviceId"]),
   };
-  const RESERVED = new Set([".rootark-trash", ".rootark-sync", ".rootark-sync-state.json", ".rootark-sync.json", ".rootark-sync-journal.json", ".rootark-sync-index.json"]);
+  const RESERVED = new Set([".rootark-trash", ".rootark-sync", ".rootark-sync-state.json", ".rootark-sync.json", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock"]);
+  const RESERVED_PREFIXES = [".rootark-sync-lock-init-"];
 
   function fail(message) { throw new Error(message); }
 
@@ -56,7 +57,7 @@
     const text = String(value || "");
     if (!text || text.includes("%") || text.includes("\\") || text.includes(":") || text.startsWith("/") || /[\u0000-\u001f\u007f]/.test(text)) fail("Invalid metadata path");
     const dos = /^(?:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9])(?:\..*)?$/i;
-    if (text.split("/").some((part) => !part || part === "." || part === ".." || RESERVED.has(part.toLowerCase()) || dos.test(part) || /[. ]$/.test(part))) fail("Invalid metadata path");
+    if (text.split("/").some((part) => !part || part === "." || part === ".." || RESERVED.has(part.toLowerCase()) || RESERVED_PREFIXES.some((prefix) => part.toLowerCase().startsWith(prefix)) || dos.test(part) || /[. ]$/.test(part))) fail("Invalid metadata path");
     return text;
   }
 

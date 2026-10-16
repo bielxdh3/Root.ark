@@ -43,7 +43,7 @@ function request(port, requestPath, method = "GET", headers = {}, body = "", opt
   });
 }
 
-function runSharePageScript(page, fetchImpl) {
+function runSharePageScript(page, fetchImpl, setTimeoutImpl = setTimeout) {
   const isHtmlWhitespace = (character) => [" ", "\t", "\r", "\n", "\f"].includes(character);
   const elements = new Map();
   const createdElements = [];
@@ -85,6 +85,7 @@ function runSharePageScript(page, fetchImpl) {
     }
     return elements.get(id);
   };
+  let cookie = "";
   const lowerPage = page.toLowerCase();
   let openingStart = lowerPage.indexOf("<script");
   while (openingStart >= 0) {
@@ -113,6 +114,8 @@ function runSharePageScript(page, fetchImpl) {
   assert.ok(script, "share page has an inline client script");
   const document = {
     get activeElement() { return activeElement; },
+    get cookie() { return cookie; },
+    set cookie(value) { cookie = String(value || "").split(";", 1)[0]; },
     getElementById,
     createElement(tagName) {
       const element = createMockElement(`created-${createdElements.length}`, tagName);
@@ -123,10 +126,12 @@ function runSharePageScript(page, fetchImpl) {
   vm.runInNewContext(script, {
     document,
     fetch: fetchImpl,
+    setTimeout: setTimeoutImpl,
     navigator: { clipboard: { writeText: async () => {} } },
     window: { location: { href: "https://rootark.test/share/example" } },
   });
   elements.createdElements = createdElements;
+  elements.setCookie = (value) => { cookie = String(value || ""); };
   Object.defineProperty(elements, "activeElement", { get: () => document.activeElement });
   return elements;
 }
@@ -611,7 +616,7 @@ test("public-share audit logs correlate by token digest without storing the bear
   const previewRefreshCalls = [];
   const previewRefreshResponses = [
     { fileName: "preview.pdf", expiresAt: new Date(Date.now() + 60_000).toISOString(), remainingViews: null, remainingDownloads: 1, canPreview: true, size: 12 },
-    { fileName: "preview.pdf", expiresAt: new Date(Date.now() + 60_000).toISOString(), remainingViews: null, remainingDownloads: 0, canPreview: true, size: 12 },
+    { remainingViews: null, remainingDownloads: 0 },
   ];
   const previewRefreshElements = runSharePageScript(sharePage.body, (url, options) => {
     previewRefreshCalls.push({ url, options });
@@ -646,10 +651,76 @@ test("public-share audit logs correlate by token digest without storing the bear
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(previewRefreshCalls.length, 2, "preview completion reloads the current share limits");
+  assert.equal(previewRefreshCalls[1].url, `/share/${token}/status`, "limit refreshes use the read-only status endpoint");
   assert.equal(previewRefreshCalls[1].options.method, "POST");
   assert.equal(previewRefreshElements.get("meta").innerHTML.includes("0 downloads restantes"), true);
   assert.equal(previewRefreshElements.get("downloadButton").disabled, true);
   assert.match(previewRefreshElements.get("status").textContent, /limite de downloads atingido/i);
+
+  const downloadRefreshCalls = [];
+  const downloadRefreshResponses = [
+    { status: 200, ok: true, json: async () => ({ fileName: "shared-audit-fixture.txt", expiresAt: new Date(Date.now() + 60_000).toISOString(), remainingViews: null, remainingDownloads: 1, canPreview: false, size: 24 }) },
+    { status: 200, ok: true, json: async () => ({ remainingViews: null, remainingDownloads: 0 }) },
+  ];
+  const scheduledDownloadRefreshes = [];
+  const downloadRefreshElements = runSharePageScript(sharePage.body, (url, options) => {
+    downloadRefreshCalls.push({ url, options });
+    return Promise.resolve(downloadRefreshResponses.shift());
+  }, (callback, delayMs) => {
+    scheduledDownloadRefreshes.push({ callback, delayMs });
+    return scheduledDownloadRefreshes.length;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(downloadRefreshElements.get("downloadButton").disabled, false);
+  assert.match(sharePage.body, new RegExp(`<form id="shareDownloadForm" method="post" action="/share/${token}/download">`));
+  const downloadSubmit = downloadRefreshElements.get("shareDownloadForm").listeners.submit;
+  assert.equal(typeof downloadSubmit, "function", "submitting a public-share download schedules a limit refresh");
+  const downloadSubmitEvent = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+  downloadSubmit(downloadSubmitEvent);
+  assert.equal(downloadSubmitEvent.defaultPrevented, false, "the browser still performs the native file-download POST");
+  assert.equal(downloadRefreshElements.get("downloadButton").disabled, true, "the download button is disabled while the counter refresh is pending");
+  assert.equal(scheduledDownloadRefreshes.length, 1);
+  const duplicateDownloadSubmitEvent = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+  downloadSubmit(duplicateDownloadSubmitEvent);
+  assert.equal(duplicateDownloadSubmitEvent.defaultPrevented, true, "a second submit is blocked while the first download receipt is pending");
+  assert.equal(scheduledDownloadRefreshes.length, 1, "a duplicate submit does not start another receipt wait");
+  assert.ok(scheduledDownloadRefreshes[0].delayMs > 0 && scheduledDownloadRefreshes[0].delayMs <= 1000, "the state query is scheduled shortly after the download POST");
+  await scheduledDownloadRefreshes[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(downloadRefreshCalls.length, 1, "the status endpoint is not queried before the download response confirms quota reservation");
+  assert.equal(scheduledDownloadRefreshes.length, 2, "the client waits locally for the download receipt without polling the server");
+  downloadRefreshElements.setCookie(`rootark_share_dl_${token}=receipt-v2; Path=/share/${token}`);
+  await scheduledDownloadRefreshes[1].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(downloadRefreshCalls.length, 2, "the download uses one short status query without fetching the file body");
+  assert.equal(downloadRefreshCalls[1].url, `/share/${token}/status`);
+  assert.equal(downloadRefreshCalls[1].options.method, "POST");
+  assert.equal(downloadRefreshElements.get("meta").innerHTML.includes("0 downloads restantes"), true);
+  assert.equal(downloadRefreshElements.get("downloadButton").disabled, true, "the exhausted limit remains disabled after refresh");
+
+  const timedOutDownloadCalls = [];
+  const timedOutDownloadTimers = [];
+  const timedOutDownloadElements = runSharePageScript(sharePage.body, (url, options) => {
+    timedOutDownloadCalls.push({ url, options });
+    return Promise.resolve({ status: 200, ok: true, json: async () => ({ fileName: "shared-audit-fixture.txt", expiresAt: new Date(Date.now() + 60_000).toISOString(), remainingViews: null, remainingDownloads: 1, canPreview: false, size: 24 }) });
+  }, (callback, delayMs) => {
+    timedOutDownloadTimers.push({ callback, delayMs });
+    return timedOutDownloadTimers.length;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  timedOutDownloadElements.get("shareDownloadForm").listeners.submit({ preventDefault() { assert.fail("the first download must remain a native POST"); } });
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    assert.ok(timedOutDownloadTimers[attempt].delayMs > 0, "receipt polling uses a positive bounded delay");
+    await timedOutDownloadTimers[attempt].callback();
+  }
+  assert.equal(timedOutDownloadTimers.length, 80, "the receipt wait stops after the configured 20-second bound");
+  assert.equal(timedOutDownloadCalls.length, 1, "a missing receipt never triggers a stale status query");
+  assert.equal(timedOutDownloadElements.get("downloadButton").disabled, true, "the download button remains disabled until a page reload after timeout");
+  assert.match(timedOutDownloadElements.get("status").textContent, /recarregue a pagina para atualizar os limites/i);
 
   const expiredRefreshResponses = [
     { status: 401, ok: false, json: async () => ({ passwordRequired: true, error: "Senha necessaria." }) },
@@ -682,7 +753,9 @@ test("public-share audit logs correlate by token digest without storing the bear
   expiredPreviewFrame.listeners.load();
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
-  assertPasswordPost(expiredRefreshCalls[2], "", "expired preview refresh");
+  assert.equal(expiredRefreshCalls[2].url, `/share/${token}/status`, "preview refresh checks the viewer session without resubmitting a password");
+  assert.equal(expiredRefreshCalls[2].options.method, "POST");
+  assert.deepEqual(JSON.parse(expiredRefreshCalls[2].options.body), {});
   assert.equal(expiredRefreshElements.get("passwordBox").classList.contains("hidden"), false);
   assert.equal(expiredRefreshElements.get("contentBox").classList.contains("hidden"), true);
   assert.equal(expiredRefreshElements.activeElement, expiredRefreshElements.get("sharePassword"), "expired preview sessions return keyboard focus to the password field");
@@ -921,6 +994,39 @@ test("public-share audit logs correlate by token digest without storing the bear
   assert.equal(view.status, 200);
   assert.deepEqual(JSON.parse(view.body).url, `/share/${token}/file`);
   assert.equal(JSON.parse(view.body).urlMethod, "POST", "the returned file URL identifies its required safe method");
+  const shareViewCookies = Array.isArray(view.headers["set-cookie"]) ? view.headers["set-cookie"] : [view.headers["set-cookie"] || ""];
+  const shareViewerCookie = shareViewCookies.map((cookie) => String(cookie).split(";", 1)[0])
+    .find((cookie) => cookie.startsWith(`rootark_share_${token}=`));
+  assert.ok(shareViewerCookie, "opening the share establishes the scoped viewer session used by status queries");
+  const viewsBeforeStatusQuery = JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[token].views;
+  const missingOriginStatus = await request(port, `/share/${token}/status`, "POST", { cookie: shareViewerCookie, "content-type": "application/json" }, "{}");
+  assert.equal(missingOriginStatus.status, 403, "public-share status POST requires a same-origin request");
+  const crossOriginStatus = await request(port, `/share/${token}/status`, "POST", {
+    cookie: shareViewerCookie,
+    origin: "https://attacker.example",
+    "content-type": "application/json",
+  }, "{}");
+  assert.equal(crossOriginStatus.status, 403, "cross-origin status queries are rejected");
+  const missingViewerStatus = await request(port, `/share/${token}/status`, "POST", {
+    origin: `http://127.0.0.1:${port}`,
+    "content-type": "application/json",
+  }, "{}");
+  assert.equal(missingViewerStatus.status, 403, "limited share status requires its scoped viewer session");
+  const statusBeforeDownload = await request(port, `/share/${token}/status`, "POST", {
+    cookie: shareViewerCookie,
+    origin: `http://127.0.0.1:${port}`,
+    "content-type": "application/json",
+  }, "{}");
+  assert.equal(statusBeforeDownload.status, 200, statusBeforeDownload.body);
+  const statusBeforeDownloadPayload = JSON.parse(statusBeforeDownload.body);
+  assert.deepEqual(Object.keys(statusBeforeDownloadPayload).sort(), ["remainingDownloads", "remainingViews"]);
+  assert.equal(statusBeforeDownloadPayload.remainingDownloads, 1);
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[token].views, viewsBeforeStatusQuery, "reading share status does not consume another view");
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[token].downloads, 0);
+  const statusGet = await request(port, `/share/${token}/status`, "GET", { cookie: shareViewerCookie });
+  assert.equal(statusGet.status, 405, "GET cannot access or mutate share status");
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[token].views, viewsBeforeStatusQuery);
+  assert.equal(JSON.parse(fs.readFileSync(publicLinksPath, "utf8"))[token].downloads, 0);
   assert.equal((await request(port, `/share/${token}/view`, "POST", shareHeaders)).status, 200);
   assert.equal((await request(port, `/share/${token}/view`, "POST", {
     ...shareHeaders,
@@ -973,10 +1079,23 @@ test("public-share audit logs correlate by token digest without storing the bear
   });
   assert.equal(download.status, 200);
   assert.equal(download.body, "disposable share fixture\n");
+  const downloadCookies = Array.isArray(download.headers["set-cookie"]) ? download.headers["set-cookie"] : [download.headers["set-cookie"] || ""];
+  const downloadReceipt = downloadCookies.find((cookie) => cookie.startsWith(`rootark_share_dl_${token}=`));
+  assert.ok(downloadReceipt, "a successful quota reservation emits the page's download receipt");
+  assert.match(downloadReceipt, new RegExp(`Path=/share/${token}(?:;|$)`), "the download receipt cookie is scoped to this share page");
+  assert.match(downloadReceipt, /SameSite=Strict/i, "the download receipt is not sent in cross-site contexts");
+  assert.doesNotMatch(downloadReceipt, /HttpOnly/i, "the page can read the non-sensitive refresh receipt");
   assert.equal((await request(port, `/share/${token}/download`, "POST", {
     ...shareHeaders,
     origin: `http://127.0.0.1:${port}`,
   })).status, 410);
+  const statusAfterDownload = await request(port, `/share/${token}/status`, "POST", {
+    cookie: shareViewerCookie,
+    origin: `http://127.0.0.1:${port}`,
+    "content-type": "application/json",
+  }, "{}");
+  assert.equal(statusAfterDownload.status, 200, statusAfterDownload.body);
+  assert.equal(JSON.parse(statusAfterDownload.body).remainingDownloads, 0, "the status query reports the consumed download allowance");
   const publicLink = JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"))[token];
   assert.equal(publicLink.downloads, 1);
 
