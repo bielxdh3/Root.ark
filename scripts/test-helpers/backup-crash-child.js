@@ -13,6 +13,14 @@ function readInput() {
   return input;
 }
 
+async function waitForFile(filePath, timeoutMs = 35_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(filePath)) {
+    if (Date.now() >= deadline) throw new Error("critical-section release marker timed out");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 function killAfterRename(source, destination) {
   const original = fs.renameSync;
   fs.renameSync = function (from, to) {
@@ -139,10 +147,21 @@ async function main() {
         release = service.acquireLock("backup");
         fs.appendFileSync(data.enteredPath, `${process.pid}\n`);
         const fd = fs.openSync(data.criticalPath, "wx");
-        setTimeout(() => {
+        const finish = () => {
           fs.closeSync(fd);
           fs.rmSync(data.criticalPath, { force: true });
           release();
+        };
+        if (data.releasePath) {
+          try {
+            await waitForFile(data.releasePath);
+          } finally {
+            finish();
+          }
+          process.exit(0);
+        }
+        setTimeout(() => {
+          finish();
           process.exit(0);
         }, 250);
       } catch (error) {
