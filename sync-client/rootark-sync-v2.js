@@ -48,6 +48,7 @@ async function start(options = {}) {
   const engine = await new SyncEngine({
     rootDir: config.localFolder,
     adapter,
+    selectedPaths: config.selectedPaths,
     deviceId: config.deviceId,
     keyEpoch: config.keyEpoch,
     compartmentId: config.compartmentId || "private",
