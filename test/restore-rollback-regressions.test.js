@@ -87,6 +87,20 @@ function interruptWholeRestore() {
   `;
   const interrupted = spawnSync(process.execPath, ["-e", script], { cwd: runtime, env, encoding: "utf8", timeout: 30_000 });
   assert.equal(interrupted.status, 86, interrupted.stderr || interrupted.stdout);
+  const lockPath = path.join(runtime, "data", "backups", ".backup.lock");
+  const lockRecord = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+  assert.equal(lockRecord.operation, "restore");
+  assert.equal(lockRecord.pid, interrupted.pid, "recovery is limited to the confirmed exited restore child");
+  assert.equal(lockRecord.runtimeRoot, fs.realpathSync(runtime));
+  const identity = lockRecord.ownerIdentity;
+  const canRecoverAutomatically = process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]);
+  assert.equal(canRecoverAutomatically, process.platform === "linux" && ["hostId", "bootId", "pidNamespaceId", "processStartIdentity"].every((key) => typeof identity?.[key] === "string" && identity[key]), "the selected recovery path must match verifiable owner identity");
+  if (canRecoverAutomatically) {
+    assert.equal(fs.existsSync(lockPath), true, "Linux keeps a verifiable crashed-owner lock for automatic recovery");
+  } else {
+    fs.unlinkSync(lockPath);
+    assert.equal(fs.existsSync(lockPath), false, "operator recovery removes only an unverifiable lock after child exit");
+  }
   const coordinatorPath = path.join(runtime, "data", ".rootark-restore-coordinator.json");
   const coordinator = JSON.parse(fs.readFileSync(coordinatorPath, "utf8"));
   const manifestPath = path.join(runtime, "data", "backups", ".restore-preimages", coordinator.transactionId, "manifest.json");
