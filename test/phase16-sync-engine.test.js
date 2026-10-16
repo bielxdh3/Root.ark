@@ -200,6 +200,128 @@ test("selective sync removes a clean local source after a remote move leaves sel
   assert.equal(store.list("alice")[0].operationId, move.operationId);
 });
 
+test("selective sync reconciles an out-of-scope tombstone after an offline move and delete", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-selective-offline-move-delete-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const state = { offline: false };
+  const adapter = await adapterFor(store, "alice", state);
+  const ownerRoot = path.join(dir, "owner");
+  await fsp.mkdir(path.join(ownerRoot, "selected"), { recursive: true });
+  await fsp.writeFile(path.join(ownerRoot, "selected", "file.txt"), "remote move payload");
+  await (await engine(ownerRoot, adapter, key)).syncOnce();
+  const prior = store.list("alice")[0];
+
+  const cleanRoot = path.join(dir, "clean-device");
+  const cleanDevice = await engine(cleanRoot, adapter, key, { deviceId: "device-clean", selectedPaths: ["selected"] });
+  await cleanDevice.syncOnce();
+  const editedRoot = path.join(dir, "edited-device");
+  const editedDevice = await engine(editedRoot, adapter, key, { deviceId: "device-edited", selectedPaths: ["selected"] });
+  await editedDevice.syncOnce();
+  await fsp.writeFile(path.join(editedRoot, "selected", "file.txt"), "local edit to preserve");
+  const pendingEdit = protocol.createOperation({
+    operation: "update", objectId: prior.objectId, fileId: prior.fileId, versionId: "offline-move-delete-pending-v1",
+    operationId: "offline-move-delete-pending-op", deviceId: "device-edited", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: prior.revision, revision: { counter: prior.revision.counter + 1, deviceId: "device-edited" },
+    metadata: { path: "selected/file.txt" }, plaintext: Buffer.from("pending edit to preserve"), fileKey: key,
+  });
+  await editedDevice.journal.enqueue(pendingEdit);
+
+  state.offline = true;
+  const move = protocol.createOperation({
+    operation: "move", objectId: prior.objectId, fileId: prior.fileId, versionId: "offline-move-delete-v2",
+    operationId: "offline-move-delete-v2-op", deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: prior.revision, revision: { counter: prior.revision.counter + 1, deviceId: "device-b" },
+    metadata: { path: "excluded/file.txt", sourcePath: "selected/file.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("remote move payload"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", move)).kind, "stored");
+  const tombstone = protocol.createOperation({
+    operation: "delete", objectId: prior.objectId, fileId: prior.fileId, versionId: "offline-move-delete-v3",
+    operationId: "offline-move-delete-v3-op", deviceId: "device-c", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: move.revision, revision: { counter: move.revision.counter + 1, deviceId: "device-c" },
+    metadata: { path: "excluded/file.txt" }, plaintext: Buffer.alloc(0), fileKey: key,
+  });
+  assert.equal((await store.put("alice", tombstone)).kind, "stored");
+  assert.deepEqual(store.list("alice").map((record) => record.operationId), [tombstone.operationId]);
+  state.offline = false;
+
+  const cleanSummary = { conflicts: [] };
+  await cleanDevice.pullRemote(cleanSummary);
+  const editedSummary = { conflicts: [] };
+  await editedDevice.pullRemote(editedSummary);
+
+  assert.equal(await fsp.stat(path.join(cleanRoot, "selected", "file.txt")).then(() => true, () => false), false);
+  assert.equal(cleanDevice.snapshot.files["selected/file.txt"], undefined);
+  assert.equal(cleanDevice.snapshot.remoteOnly[prior.objectId].deleted, true);
+  const trashed = await fsp.readdir(path.join(cleanRoot, ".rootark-trash"));
+  assert.equal(trashed.length, 1);
+  assert.equal(await fsp.readFile(path.join(cleanRoot, ".rootark-trash", trashed[0]), "utf8"), "remote move payload");
+
+  assert.equal(await fsp.stat(path.join(editedRoot, "selected", "file.txt")).then(() => true, () => false), false);
+  assert.equal(editedDevice.snapshot.files["selected/file.txt"], undefined);
+  assert.equal(editedDevice.snapshot.remoteOnly[prior.objectId].deleted, true);
+  assert.equal(editedSummary.conflicts.length, 1);
+  const conflicts = await fsp.readdir(path.join(editedRoot, ".rootark-conflicts"));
+  const conflictContents = await Promise.all(conflicts.map((name) => fsp.readFile(path.join(editedRoot, ".rootark-conflicts", name), "utf8")));
+  assert.deepEqual(conflictContents.sort(), ["local edit to preserve", "pending edit to preserve"]);
+  assert.deepEqual(await editedDevice.journal.recover(), []);
+
+  const restartedCleanDevice = await engine(cleanRoot, adapter, key, { deviceId: "device-clean", selectedPaths: ["selected"] });
+  assert.equal(restartedCleanDevice.snapshot.files["selected/file.txt"], undefined);
+  assert.equal(restartedCleanDevice.snapshot.remoteOnly[prior.objectId].deleted, true);
+});
+
+test("selective sync reconciles an out-of-scope directory tombstone after an offline move and delete", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-selective-offline-directory-delete-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const state = { offline: false };
+  const adapter = await adapterFor(store, "alice", state);
+  const ownerRoot = path.join(dir, "owner");
+  await fsp.mkdir(path.join(ownerRoot, "selected", "empty"), { recursive: true });
+  await (await engine(ownerRoot, adapter, key)).syncOnce();
+  const prior = store.list("alice").find((record) => record.metadata.path === "selected/empty");
+  assert.equal(prior.metadata.contentType, "inode/directory");
+
+  const deviceRoot = path.join(dir, "device");
+  const device = await engine(deviceRoot, adapter, key, { selectedPaths: ["selected"] });
+  await device.syncOnce();
+  assert.equal(await fsp.stat(path.join(deviceRoot, "selected", "empty")).then((stats) => stats.isDirectory(), () => false), true);
+
+  state.offline = true;
+  const move = protocol.createOperation({
+    operation: "update", objectId: prior.objectId, fileId: prior.fileId, versionId: "offline-directory-delete-v2",
+    operationId: "offline-directory-delete-v2-op", deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: prior.revision, revision: { counter: prior.revision.counter + 1, deviceId: "device-b" },
+    metadata: { path: "excluded/empty", name: "empty", size: 0, contentType: "inode/directory" },
+    plaintext: Buffer.alloc(0), fileKey: key,
+  });
+  assert.equal((await store.put("alice", move)).kind, "stored");
+  const tombstone = protocol.createOperation({
+    operation: "delete", objectId: prior.objectId, fileId: prior.fileId, versionId: "offline-directory-delete-v3",
+    operationId: "offline-directory-delete-v3-op", deviceId: "device-c", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: move.revision, revision: { counter: move.revision.counter + 1, deviceId: "device-c" },
+    metadata: { path: "excluded/empty" },
+    plaintext: Buffer.alloc(0), fileKey: key,
+  });
+  assert.equal((await store.put("alice", tombstone)).kind, "stored");
+  assert.deepEqual(store.list("alice").map((record) => record.operationId), [tombstone.operationId]);
+  state.offline = false;
+
+  await device.pullRemote({ conflicts: [] });
+
+  assert.equal(await fsp.stat(path.join(deviceRoot, "selected", "empty")).then(() => true, () => false), false);
+  assert.equal(device.snapshot.files["selected/empty"], undefined);
+  assert.equal(device.snapshot.remoteOnly[prior.objectId].deleted, true);
+  assert.equal(device.snapshot.remoteOnly[prior.objectId].directory, true);
+  const trashed = await fsp.readdir(path.join(deviceRoot, ".rootark-trash"));
+  assert.equal(trashed.length, 1);
+  assert.equal(await fsp.stat(path.join(deviceRoot, ".rootark-trash", trashed[0])).then((stats) => stats.isDirectory(), () => false), true);
+});
+
 test("selective sync moves a clean directory to trash after it leaves selected scope", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-selective-directory-move-out-clean-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));

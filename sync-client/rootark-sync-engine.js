@@ -370,7 +370,7 @@ class SyncEngine {
     return typeof operation.metadata?.path === "string" && this.isSelected(operation.metadata.path);
   }
 
-  rememberRemoteOnly(operation, reason) {
+  rememberRemoteOnly(operation, reason, options = {}) {
     const pathName = operation.metadata?.path;
     if (!pathName) return;
     const prior = this.snapshot.remoteOnly[operation.objectId] || {};
@@ -381,31 +381,39 @@ class SyncEngine {
       revision: operation.revision,
       path: pathName,
       ...(operation.metadata.sourcePath ? { sourcePath: operation.metadata.sourcePath } : {}),
-      directory: operation.metadata.contentType === "inode/directory" || prior.directory === true,
-      deleted: Boolean(operation.tombstone),
+      directory: operation.metadata.contentType === "inode/directory" || options.directory === true || prior.directory === true,
+      deleted: Boolean(operation.tombstone || operation.operation === "delete"),
       reason: prior.reason === "evicted" ? "evicted" : reason,
       ...(prior.hash ? { hash: prior.hash } : {}),
     };
   }
 
   async reconcileOutOfScopeMove(operation, summary, options = {}) {
+    const tombstone = Boolean(operation.tombstone || operation.operation === "delete");
     const directoryMove = operation.operation === "update" && operation.metadata?.contentType === "inode/directory";
-    if ((operation.operation !== "move" && !directoryMove) || operation.tombstone
+    if ((operation.operation !== "move" && !directoryMove && !tombstone)
       || typeof operation.metadata?.path !== "string" || this.isSelected(operation.metadata.path)) return false;
-    if (!directoryMove && !operation.metadata?.sourcePath) return false;
+    if (!tombstone && !directoryMove && !operation.metadata?.sourcePath) return false;
 
-    const sourcePath = directoryMove
-      ? activeIdentityPath(this.snapshot.files, operation, operation.metadata.path)
-      : activeFileIdentityPath(this.snapshot.files, operation, operation.metadata.path)
+    let sourcePath;
+    if (tombstone) {
+      sourcePath = activeIdentityPath(this.snapshot.files, operation, operation.metadata.path)
+        || activeFileIdentityPath(this.snapshot.files, operation, operation.metadata.path);
+    } else if (directoryMove) {
+      sourcePath = activeIdentityPath(this.snapshot.files, operation, operation.metadata.path);
+    } else {
+      sourcePath = activeFileIdentityPath(this.snapshot.files, operation, operation.metadata.path)
         || (this.snapshot.files[operation.metadata.sourcePath]?.objectId === operation.objectId
         && this.snapshot.files[operation.metadata.sourcePath]?.fileId === operation.fileId
         && !this.snapshot.files[operation.metadata.sourcePath]?.deleted
         && !this.snapshot.files[operation.metadata.sourcePath]?.directory
         ? operation.metadata.sourcePath : null);
+    }
     if (!sourcePath || !this.isSelected(sourcePath)) return false;
 
     const prior = this.snapshot.files[sourcePath];
-    if (!prior || prior.deleted || Boolean(prior.directory) !== directoryMove
+    const directoryRecord = directoryMove || (tombstone && Boolean(prior?.directory));
+    if (!prior || prior.deleted || Boolean(prior.directory) !== directoryRecord
       || prior.objectId !== operation.objectId || prior.fileId !== operation.fileId) return false;
 
     const pending = (await this.journal.recover()).filter((item) => item.protocolVersion && item.objectId === operation.objectId);
@@ -414,10 +422,10 @@ class SyncEngine {
     let changedLocally = false;
     if (sourceExists) {
       const stats = await fsp.lstat(target, { bigint: true });
-      if (stats.isSymbolicLink() || (directoryMove ? !stats.isDirectory() : !stats.isFile())) {
+      if (stats.isSymbolicLink() || (directoryRecord ? !stats.isDirectory() : !stats.isFile())) {
         fail("Tracked sync source has an unexpected type", "unsafe_path");
       }
-      if (directoryMove) {
+      if (directoryRecord) {
         const currentFiles = await this.scanFiles();
         const trackedEntries = Object.entries(this.snapshot.files).filter(([relativePath, item]) => !item.deleted
           && pathWithin(relativePath, sourcePath));
@@ -441,7 +449,7 @@ class SyncEngine {
       for (const item of pending) {
         if (item.protocolVersion && !(options.preservedOperationIds || []).includes(item.operationId)) await this.recoverConflict(item, summary);
       }
-      if (sourceExists && !directoryMove) {
+      if (sourceExists && !directoryRecord) {
         const conflictRoot = path.join(this.rootDir, ".rootark-conflicts");
         await fsp.mkdir(conflictRoot, { recursive: true });
         await containedAbsolute(this.rootDir, conflictRoot, false);
@@ -450,13 +458,14 @@ class SyncEngine {
         await containedAbsolute(this.rootDir, conflictPath, true);
         await fsp.rename(target, conflictPath);
       }
-      if (!directoryMove && !options.preservedOperationIds?.includes(operation.operationId)) await this.recoverConflict(operation, summary);
+      if (!directoryRecord && !options.preservedOperationIds?.includes(operation.operationId)) await this.recoverConflict(operation, summary);
       summary.conflicts ||= [];
       if (!options.conflictAlreadyRecorded && !summary.conflicts.some((conflict) => conflict.operationId === operation.operationId)) {
-        summary.conflicts.push({ operationId: operation.operationId, policy: "preserve-local-and-remote", reason: "remote-move-outside-selected-scope" });
+        summary.conflicts.push({ operationId: operation.operationId, policy: "preserve-local-and-remote", reason: tombstone
+          ? "remote-delete-outside-selected-scope" : "remote-move-outside-selected-scope" });
       }
     } else if (sourceExists) {
-      if (!directoryMove) {
+      if (!directoryRecord) {
         await this.stageExisting(target);
       } else if ((await fsp.readdir(target)).length === 0) {
         const hasActiveDescendant = Object.entries(this.snapshot.files).some(([relativePath, item]) => relativePath !== sourcePath
@@ -468,7 +477,7 @@ class SyncEngine {
     for (const relativePath of Object.keys(this.snapshot.files)) {
       if (pathsEqual(relativePath, sourcePath)) delete this.snapshot.files[relativePath];
     }
-    this.rememberRemoteOnly(operation, "excluded");
+    this.rememberRemoteOnly(operation, "excluded", { directory: directoryRecord });
     for (const item of pending) await this.journal.markSeen(item.operationId);
     await this.pruneEmptyUntrackedParents(path.dirname(target));
     await this.persistSnapshot();
