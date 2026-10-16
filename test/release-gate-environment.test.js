@@ -1,6 +1,23 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { isDependencyOrNetworkUnavailable } = require("../scripts/release-gate-environment");
+const { getNpmInvocation, isDependencyOrNetworkUnavailable } = require("../scripts/release-gate-environment");
+
+test("release gate uses native npm instead of inherited Windows cmd on Linux", () => {
+  assert.deepEqual(getNpmInvocation(["test"], { platform: "linux", comSpec: "C:\\Windows\\System32\\cmd.exe" }), {
+    executable: "npm",
+    args: ["test"],
+  });
+});
+
+test("release gate runs npm.cmd through cmd.exe on Windows", () => {
+  assert.deepEqual(getNpmInvocation(["audit", "--package-lock-only", "--audit-level=high"], {
+    platform: "win32",
+    comSpec: "C:\\Windows\\System32\\cmd.exe",
+  }), {
+    executable: "C:\\Windows\\System32\\cmd.exe",
+    args: ["/d", "/s", "/c", "npm.cmd audit --package-lock-only --audit-level=high"],
+  });
+});
 
 test("release gate ignores advisory and test output words that resemble environment errors", () => {
   assert.equal(isDependencyOrNetworkUnavailable("✔ rootark-zk-1 registry fails closed\n✔ retry handles ETIMEDOUT\nhttps://registry.npmjs.org/package"), false);

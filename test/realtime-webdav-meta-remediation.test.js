@@ -1,8 +1,8 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const http = require("node:http");
-const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
@@ -11,14 +11,7 @@ const bcrypt = require("bcryptjs");
 
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = fs.readFileSync(path.join(ROOT, "server.js"), "utf8");
-
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const listener = net.createServer();
-    listener.once("error", reject);
-    listener.listen(0, "127.0.0.1", () => { const port = listener.address().port; listener.close(() => resolve(port)); });
-  });
-}
+const SERVER_START_TIMEOUT_MS = 10_000;
 
 function request(port, requestPath, options = {}) {
   return new Promise((resolve, reject) => {
@@ -32,12 +25,102 @@ function request(port, requestPath, options = {}) {
   });
 }
 
-async function waitForServer(port) {
-  for (let index = 0; index < 100; index += 1) {
-    try { await request(port, "/login.html"); return; } catch { await new Promise((resolve) => setTimeout(resolve, 40)); }
-  }
-  throw new Error("server did not start");
+function waitForServerReadyAnnouncement(child) {
+  return new Promise((resolve) => {
+    let output = "";
+    child.stdout.on("data", (chunk) => {
+      output = `${output}${chunk.toString()}`.slice(-4096);
+      for (const line of output.split(/\r?\n/)) {
+        const match = line.trim().match(/Servidor rodando em http:\/\/.*:(\d+)$/);
+        const port = match ? Number(match[1]) : null;
+        if (Number.isInteger(port) && port > 0 && port <= 65535) resolve(port);
+      }
+    });
+  });
 }
+
+async function waitForServer(child, readyPromise, getDiagnostics = () => "", timeoutMs = SERVER_START_TIMEOUT_MS) {
+  let timeout;
+  let onExit;
+  const exited = new Promise((_, reject) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      reject(new Error(`server exited before readiness: ${getDiagnostics()}`));
+      return;
+    }
+    onExit = (code, signal) => reject(new Error(`server exited before readiness (${code ?? signal}): ${getDiagnostics()}`));
+    child.once("exit", onExit);
+  });
+  try {
+    const port = await Promise.race([
+      readyPromise,
+      exited,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`server readiness timed out: ${getDiagnostics()}`)), timeoutMs);
+      }),
+    ]);
+    const response = await request(port, "/login.html");
+    if (response.status !== 200) throw new Error(`unexpected readiness response: ${response.status}`);
+    return port;
+  } finally {
+    clearTimeout(timeout);
+    if (onExit) child.removeListener("exit", onExit);
+  }
+}
+
+async function stopChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  if (child.exitCode === null && child.signalCode === null) child.kill();
+  if (child.exitCode === null && child.signalCode === null) await exited;
+}
+
+test("server readiness does not accept an unrelated listener on the selected port", async (t) => {
+  const unrelated = http.createServer((req, res) => {
+    res.statusCode = req.url === "/login.html" ? 200 : 405;
+    res.setHeader("Connection", "close");
+    res.end();
+  });
+  await new Promise((resolve, reject) => {
+    unrelated.once("error", reject);
+    unrelated.listen(0, "127.0.0.1", resolve);
+  });
+  const port = unrelated.address().port;
+  assert.equal((await request(port, "/login.html")).status, 200, "the unrelated listener is healthy");
+  const child = { exitCode: null, signalCode: null, once() {}, removeListener() {} };
+  t.after(async () => {
+    unrelated.closeAllConnections();
+    await new Promise((resolve) => unrelated.close(resolve));
+  });
+  await assert.rejects(waitForServer(child, new Promise(() => {}), () => "", 250), /server readiness timed out/);
+});
+
+test("server child cleanup does not wait after a signal exit", async () => {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = "SIGTERM";
+  let killCalls = 0;
+  child.kill = () => { killCalls += 1; };
+
+  await stopChild(child);
+
+  assert.equal(killCalls, 0);
+});
+
+test("server child cleanup observes the exit caused by its own kill", async () => {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+  let killCalls = 0;
+  child.kill = () => {
+    killCalls += 1;
+    child.signalCode = "SIGTERM";
+    child.emit("exit", null, child.signalCode);
+  };
+
+  await stopChild(child);
+
+  assert.equal(killCalls, 1);
+});
 
 test("realtime and WebDAV meta-remediation matrix", async (t) => {
   const cases = [
@@ -109,10 +192,11 @@ test("realtime and WebDAV meta-remediation matrix", async (t) => {
     fs.writeFileSync(path.join(dir, "uploads", "source.txt"), "source");
     fs.writeFileSync(path.join(dir, "uploads", "target.txt"), "target");
     try { fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction"); } catch {}
-    const port = await freePort();
-    const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", WEBDAV_ALLOW_MOVE: "true", WEBDAV_MOVE_FAIL_AFTER: "replacement.install", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
-    t2.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
-    await waitForServer(port);
+    const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: "0", DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", WEBDAV_ALLOW_MOVE: "true", WEBDAV_MOVE_FAIL_AFTER: "replacement.install", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let childStderr = "";
+    child.stderr.on("data", (chunk) => { childStderr = `${childStderr}${chunk.toString()}`.slice(-4096); });
+    t2.after(async () => { await stopChild(child); fs.rmSync(dir, { recursive: true, force: true }); });
+    const port = await waitForServer(child, waitForServerReadyAnnouncement(child), () => childStderr);
     const authorization = `Basic ${Buffer.from("agent:password").toString("base64")}`;
     const result = await request(port, "/dav/source.txt", { method: "MOVE", headers: { authorization, destination: "/dav/target.txt", overwrite: "T" } });
     assert.equal(result.status, 500);

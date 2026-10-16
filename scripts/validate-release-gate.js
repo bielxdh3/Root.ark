@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
-const { isDependencyOrNetworkUnavailable } = require("./release-gate-environment");
+const { getNpmInvocation, isDependencyOrNetworkUnavailable } = require("./release-gate-environment");
 
 const root = path.resolve(__dirname, "..");
 const results = [];
@@ -111,9 +111,11 @@ for (const [name, files] of [
   ["Phase 14 backup/restore evidence", ["test/backup-restore-security.test.js"]],
 ]) command(name, process.execPath, ["--test", ...files], { blockedOnMissing: true });
 
-command("final-head canonical npm test", process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", "npm.cmd test"], { blockedOnMissing: true });
+const npmTest = getNpmInvocation(["test"]);
+command("final-head canonical npm test", npmTest.executable, npmTest.args, { blockedOnMissing: true });
 
-command("high-severity dependency audit", process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", "npm.cmd audit --package-lock-only --audit-level=high"], { blockedOnMissing: true });
+const npmAudit = getNpmInvocation(["audit", "--package-lock-only", "--audit-level=high"]);
+command("high-severity dependency audit", npmAudit.executable, npmAudit.args, { blockedOnMissing: true });
 const status = spawnSync("git", ["status", "--porcelain=v1"], { cwd: root, encoding: "utf8" }).stdout.trim();
 if (status) record("clean worktree gate", "BLOCKED", "local changes remain; run after the required coherent commit");
 else record("clean worktree gate", "PASS", "no tracked or untracked changes");
