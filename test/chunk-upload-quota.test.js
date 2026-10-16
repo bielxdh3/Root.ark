@@ -875,6 +875,24 @@ test("process ownership stays unknown when procfs exposes another PID namespace"
   assert.equal(ownerPidRead, false, "the classifier rejects the procfs view before interpreting a missing numeric PID");
 });
 
+test("inaccessible PID 1 procfs view cannot prove an absent owner is dead", { skip: process.platform !== "linux" }, () => {
+  const currentNamespace = fs.readlinkSync("/proc/self/ns/pid");
+  const identity = { version: 1, platform: "linux", hostId: "a".repeat(64), bootId: "00000000-0000-0000-0000-000000000001", pidNamespace: currentNamespace, processStartTime: "10" };
+  const readPaths = [];
+  const status = classifyProcessOwner(4242, identity, identity, {
+    platform: "linux",
+    readlinkSync: (filePath) => {
+      readPaths.push(filePath);
+      if (filePath === "/proc/1/ns/pid") throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+      if (filePath === "/proc/self/ns/pid") return currentNamespace;
+      throw Object.assign(new Error("no such process in this procfs view"), { code: "ENOENT" });
+    },
+  });
+
+  assert.equal(status, "unknown", "matching self namespace does not prove the numeric PID view");
+  assert.deepEqual(readPaths, ["/proc/1/ns/pid"], "the classifier must reject before interpreting the absent owner PID");
+});
+
 test("malformed Linux owner identity is ambiguous instead of being treated as PID reuse", { skip: process.platform !== "linux" }, (t) => {
   const current = getCurrentProcessIdentity();
   if (!current) return t.skip("the host process identity is unavailable");
