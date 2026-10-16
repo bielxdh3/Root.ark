@@ -2224,25 +2224,25 @@ test("failed handoff destination cleanup retains its charge and blocks retries f
 
   const destinationPath = path.join(harness.dir, "temp", FOLDER_ID, "handoff-cleanup-failure.txt");
   assert.equal(fs.existsSync(destinationPath), true, "the injected failed cleanup leaves the published destination present");
-  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"));
+  const retry = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "handoff-cleanup-failure.txt",
+    chunkIndex: 0,
+    totalChunks: 1,
+    encryptionLevel: "none",
+    bytes: Buffer.from("retry must not publish another orphan"),
+  });
+  assert.equal(retry.status, 503, retry.body);
+  assert.equal(JSON.parse(retry.body).code, "CHUNK_QUOTA_UNAVAILABLE");
+  assert.equal(fs.existsSync(destinationPath), true);
+  assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
+  await harness.stopServer();
+  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
   try {
     const handoff = database.prepare("SELECT operation_id, state, charge_bytes, relative_path FROM quota_operations WHERE state = 'handoff_published'").get();
     assert.ok(handoff, JSON.stringify({ rows: database.prepare("SELECT operation_id, state, charge_bytes, relative_path FROM quota_operations").all(), stderr: harness.stderr }));
     assert.equal(handoff.charge_bytes, fs.statSync(destinationPath).size);
     assert.match(handoff.relative_path.replace(/\\/g, "/"), /^handoff\//);
-
-    const retry = await uploadChunk(harness.port, session, {
-      uploadId,
-      originalName: "handoff-cleanup-failure.txt",
-      chunkIndex: 0,
-      totalChunks: 1,
-      encryptionLevel: "none",
-      bytes: Buffer.from("retry must not publish another orphan"),
-    });
-    assert.equal(retry.status, 503, retry.body);
-    assert.equal(JSON.parse(retry.body).code, "CHUNK_QUOTA_UNAVAILABLE");
-    assert.equal(fs.existsSync(destinationPath), true);
-    assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
     assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations WHERE state = 'handoff_published'").get().count, 1);
   } finally {
     database.close();
@@ -2288,38 +2288,38 @@ test("a failed handed-off ledger transition preserves registered publication for
   const destinationPath = path.join(harness.dir, "temp", FOLDER_ID, fileName);
   const pendingPath = path.join(harness.dir, "data", "pending-uploads.json");
   const quotaPath = path.join(harness.chunkRoot, ".quota.sqlite");
+  const originalServerPid = harness.child.pid;
   assert.deepEqual(fs.readFileSync(destinationPath), bytes);
   assert.ok(JSON.parse(fs.readFileSync(pendingPath, "utf8"))[`${FOLDER_ID}/${fileName}`]);
-  const database = new Database(quotaPath);
+  const retry = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: fileName,
+    chunkIndex: 0,
+    totalChunks: 1,
+    encryptionLevel: "none",
+    bytes: Buffer.from("must not create another published copy"),
+  });
+  assert.equal(retry.status, 503, retry.body);
+  assert.equal(JSON.parse(retry.body).code, "CHUNK_QUOTA_UNAVAILABLE");
+  assert.deepEqual(fs.readFileSync(destinationPath), bytes);
+  await harness.stopServer();
+  const database = new Database(quotaPath, { readonly: true });
   try {
     const operation = database.prepare("SELECT state, charge_bytes, relative_path FROM quota_operations WHERE state = 'handoff_published'").get();
     assert.ok(operation);
     assert.equal(operation.charge_bytes, bytes.length);
     assert.equal(operation.relative_path.replaceAll("\\", "/"), `handoff/${FOLDER_ID}/${encodeURIComponent(fileName)}#${bytes.length}`);
-    const retry = await uploadChunk(harness.port, session, {
-      uploadId,
-      originalName: fileName,
-      chunkIndex: 0,
-      totalChunks: 1,
-      encryptionLevel: "none",
-      bytes: Buffer.from("must not create another published copy"),
-    });
-    assert.equal(retry.status, 503, retry.body);
-    assert.equal(JSON.parse(retry.body).code, "CHUNK_QUOTA_UNAVAILABLE");
-    assert.deepEqual(fs.readFileSync(destinationPath), bytes);
     assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations WHERE state = 'handoff_published'").get().count, 1);
   } finally {
     database.close();
   }
 
-  harness.child.kill();
-  await waitForExit(harness.child);
   const recoveryPort = await getUnusedPort();
   const recoveryChild = spawn(process.execPath, ["--require", harness.quotaRecoveryPreloadPath, SERVER], {
     cwd: harness.dir,
     env: {
       ...process.env,
-      ...testDeadQuotaOwnerEnv(harness.child.pid),
+      ...testDeadQuotaOwnerEnv(originalServerPid),
       NODE_ENV: "test",
       PORT: String(recoveryPort),
       DB_ENABLED: "false",
@@ -2348,17 +2348,17 @@ test("a failed handed-off ledger transition preserves registered publication for
     assert.deepEqual(fs.readFileSync(destinationPath), bytes);
     assert.ok(JSON.parse(fs.readFileSync(pendingPath, "utf8"))[`${FOLDER_ID}/${fileName}`]);
     assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId)), false, recoveryStderr.join(""));
-    const recoveredLedger = new Database(quotaPath, { readonly: true });
-    try {
-      assert.equal(recoveredLedger.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0);
-    } finally {
-      recoveredLedger.close();
-    }
   } finally {
     if (recoveryChild.exitCode === null) {
       recoveryChild.kill();
       await waitForExit(recoveryChild);
     }
+  }
+  const recoveredLedger = new Database(quotaPath, { readonly: true });
+  try {
+    assert.equal(recoveredLedger.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0);
+  } finally {
+    recoveredLedger.close();
   }
 });
 
@@ -3016,17 +3016,6 @@ test("folder lifecycle lock timeouts reject uploads, remove transient staging, a
     assert.equal(fs.readFileSync(path.join(existingSessionDir, "1.part"), "utf8"), "disposable final chunk");
     assert.equal(fs.readFileSync(timeoutResponseMarker, "utf8"), "present", "the existing session remains present when the 503 response is sent");
     assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
-    const quotaDatabase = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
-    try {
-      const sessionOperations = quotaDatabase.prepare("SELECT state, relative_path FROM quota_operations WHERE session_key = ? ORDER BY relative_path").all(`${FOLDER_ID}/${uploadId}`);
-      assert.deepEqual(sessionOperations.map((operation) => [operation.state, operation.relative_path]), [
-        ["part_committed", path.join(FOLDER_ID, uploadId, "0.part")],
-        ["part_committed", path.join(FOLDER_ID, uploadId, "1.part")],
-      ]);
-    } finally {
-      quotaDatabase.close();
-    }
-
     const webDavBody = Buffer.from("disposable WebDAV upload");
     const webDav = await request(harness.port, "/dav/" + FOLDER_ID + "/timeout-webdav.txt", {
       method: "PUT",
@@ -3040,6 +3029,17 @@ test("folder lifecycle lock timeouts reject uploads, remove transient staging, a
   } finally {
     releaseLock();
     await heldOperation;
+  }
+  await harness.stopServer();
+  const quotaDatabase = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  try {
+    const sessionOperations = quotaDatabase.prepare("SELECT state, relative_path FROM quota_operations WHERE session_key = ? ORDER BY relative_path").all(`${FOLDER_ID}/${uploadId}`);
+    assert.deepEqual(sessionOperations.map((operation) => [operation.state, operation.relative_path]), [
+      ["part_committed", path.join(FOLDER_ID, uploadId, "0.part")],
+      ["part_committed", path.join(FOLDER_ID, uploadId, "1.part")],
+    ]);
+  } finally {
+    quotaDatabase.close();
   }
 });
 
