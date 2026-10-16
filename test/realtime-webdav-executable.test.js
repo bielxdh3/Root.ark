@@ -178,14 +178,19 @@ test("startup incoming cleanup preserves an aged pending WebDAV MOVE journal", {
   fs.writeFileSync(chunkStagingPath, "partial chunk");
   fs.utimesSync(chunkStagingPath, staleTime, staleTime);
   const { createChunkUploadQuota } = require(path.join(ROOT, "services", "chunkUploadQuota.js"));
-  const quota = createChunkUploadQuota({ rootDir: chunkRoot, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483647 });
+  const quota = createChunkUploadQuota({ rootDir: chunkRoot, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
   quota.initialize();
   quota.reserve({ operationId: chunkOperationId, accountKey: "agent", relativePath: path.join("incoming", chunkOperationId), reservedBytes: 8 * 1024 * 1024 });
   quota.close();
   const port = await freePort();
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: "ignore", windowsHide: true });
+  const child = spawn(process.execPath, ["--require", path.join(ROOT, "test", "fixtures", "chunk-quota-dead-owner-preload.js"), path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port, { ROOTARK_TEST_DEAD_QUOTA_OWNER_PIDS: "2147483000" }), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  const serverStdout = [];
+  const serverStderr = [];
+  child.stdout.on("data", (chunk) => serverStdout.push(chunk.toString()));
+  child.stderr.on("data", (chunk) => serverStderr.push(chunk.toString()));
   t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
-  await ready(port);
+  try { await ready(port); }
+  catch (error) { throw new Error(`${error.message}\nserver stdout:\n${serverStdout.join("")}\nserver stderr:\n${serverStderr.join("")}`); }
   assert.equal(fs.existsSync(journalPath), true, "generic incoming cleanup must preserve durable retry journals");
   assert.equal(fs.existsSync(uploadStagingPath), false, "stale simple-upload staging files should still be cleaned");
   assert.equal(fs.existsSync(webDavPutStagingPath), false, "stale WebDAV PUT staging files should still be cleaned");

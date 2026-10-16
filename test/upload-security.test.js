@@ -7,7 +7,7 @@ const http = require("node:http");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const test = require("node:test");
 const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
 const { classifyProcessOwner, createChunkUploadQuota: createChunkUploadQuotaService, getCurrentProcessIdentity } = require("../services/chunkUploadQuota");
@@ -19,6 +19,17 @@ const PUBLIC = path.join(ROOT, "public");
 const TIMEOUT_MS = 10_000;
 const FOLDER_ID = "upload-safety";
 const createChunkUploadQuota = (options) => createChunkUploadQuotaService({ perAccountEntries: 5000, systemEntries: 10000, ...options });
+
+test("dead-owner quota test preload is inert outside the test environment", () => {
+  const quotaModulePath = path.join(ROOT, "services", "chunkUploadQuota.js");
+  const preloadPath = path.join(ROOT, "test", "fixtures", "chunk-quota-dead-owner-preload.js");
+  const script = `const quota = require(${JSON.stringify(quotaModulePath)}); const original = quota.createChunkUploadQuota; require(${JSON.stringify(preloadPath)}); if (quota.createChunkUploadQuota !== original) process.exitCode = 1;`;
+  const result = spawnSync(process.execPath, ["-e", script], {
+    env: { ...process.env, NODE_ENV: "production", ROOTARK_TEST_DEAD_QUOTA_OWNER_PIDS: String(process.pid) },
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr || "production preload changed the quota factory");
+});
 
 function getUnusedPort() {
   return new Promise((resolve, reject) => {
@@ -98,7 +109,12 @@ function isContained(parent, candidate) {
   return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
 }
 
-async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, uploaderPermissions = {}, secondUploaderHasFolderAccess = false, appDataMode = "json", envOverrides = {} } = {}) {
+function testDeadQuotaOwnerEnv(...processIds) {
+  const ids = [...new Set(processIds.filter((id) => Number.isSafeInteger(id) && id !== process.pid))];
+  return { ROOTARK_TEST_DEAD_QUOTA_OWNER_PIDS: ids.join(",") };
+}
+
+async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, uploaderPermissions = {}, secondUploaderHasFolderAccess = false, appDataMode = "json", envOverrides = {}, deterministicQuotaRecovery = false } = {}) {
   const password = crypto.randomBytes(24).toString("base64url");
   const fixtureBase = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
   const dir = fs.mkdtempSync(path.join(fixtureBase, "rootark-upload-safety-"));
@@ -131,6 +147,9 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
     }
   }
   const customPreload = typeof preloadSource === "function" ? preloadSource({ dir, chunkRoot }) : preloadSource;
+  const quotaRecoveryPreloadPath = deterministicQuotaRecovery
+    ? path.join(ROOT, "test", "fixtures", "chunk-quota-dead-owner-preload.js")
+    : "";
   const sqliteSetup = appDataMode === "sqlite" ? `
     process.env.DB_ENABLED = "true";
     process.env.DB_READ_FALLBACK_JSON = "false";
@@ -203,7 +222,7 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
       throw new Error(`${error.message}\nserver exit: ${child.exitCode}\nserver stdout:\n${stdout.join("")}\nserver stderr:\n${stderr.join("")}`);
     }
   }
-  return { dir, port, quarantineDir, password, chunkRoot, child, stdout, stderr };
+  return { dir, port, quarantineDir, password, chunkRoot, child, stdout, stderr, quotaRecoveryPreloadPath };
 }
 
 async function startGatedClamAv() {
@@ -2227,6 +2246,7 @@ test("a failed handed-off ledger transition preserves registered publication for
   const uploadId = "handoff-transition-failure";
   const fileName = "handoff-transition-failure.txt";
   const harness = await createHarness(t, {
+    deterministicQuotaRecovery: true,
     preloadSource: () => `
       const quotaModule = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
       const createQuota = quotaModule.createChunkUploadQuota;
@@ -2288,10 +2308,11 @@ test("a failed handed-off ledger transition preserves registered publication for
   harness.child.kill();
   await waitForExit(harness.child);
   const recoveryPort = await getUnusedPort();
-  const recoveryChild = spawn(process.execPath, [SERVER], {
+  const recoveryChild = spawn(process.execPath, ["--require", harness.quotaRecoveryPreloadPath, SERVER], {
     cwd: harness.dir,
     env: {
       ...process.env,
+      ...testDeadQuotaOwnerEnv(harness.child.pid),
       NODE_ENV: "test",
       PORT: String(recoveryPort),
       DB_ENABLED: "false",
@@ -4610,6 +4631,7 @@ async function prepareFailedReplacement(t, uploadId) {
   const original = Buffer.from("accepted part before failed replacement");
   const replacementBytes = Buffer.from("replacement remains charged for recovery");
   const harness = await createHarness(t, {
+    deterministicQuotaRecovery: true,
     preloadSource: ({ chunkRoot }) => `
       const fs = require("node:fs");
       const path = require("node:path");
@@ -4651,6 +4673,7 @@ test("restart reconciles a replacement when restoring its prior part fails", { t
   const original = Buffer.from("accepted part before failed replacement");
   const replacementBytes = Buffer.from("replacement remains charged for recovery");
   const harness = await createHarness(t, {
+    deterministicQuotaRecovery: true,
     preloadSource: ({ chunkRoot }) => `
       const fs = require("node:fs");
       const path = require("node:path");
@@ -4717,9 +4740,9 @@ test("restart reconciles a replacement when restoring its prior part fails", { t
       return result;
     };
   `);
-  const recoveryChild = spawn(process.execPath, ["--require", recoveryPreloadPath, SERVER], {
+  const recoveryChild = spawn(process.execPath, ["--require", harness.quotaRecoveryPreloadPath, "--require", recoveryPreloadPath, SERVER], {
     cwd: harness.dir,
-    env: { ...process.env, NODE_ENV: "test", PORT: String(recoveryPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    env: { ...process.env, ...testDeadQuotaOwnerEnv(harness.child.pid), NODE_ENV: "test", PORT: String(recoveryPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -4743,9 +4766,9 @@ test("restart reconciles a replacement when restoring its prior part fails", { t
   }
 
   const finalRecoveryPort = await getUnusedPort();
-  const finalRecoveryChild = spawn(process.execPath, [SERVER], {
+  const finalRecoveryChild = spawn(process.execPath, ["--require", harness.quotaRecoveryPreloadPath, SERVER], {
     cwd: harness.dir,
-    env: { ...process.env, NODE_ENV: "test", PORT: String(finalRecoveryPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    env: { ...process.env, ...testDeadQuotaOwnerEnv(harness.child.pid, recoveryChild.pid), NODE_ENV: "test", PORT: String(finalRecoveryPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -4809,9 +4832,9 @@ test("restart reconciles a replacement after the restored-part ledger transition
       return service;
     };
   `);
-  const failedChild = spawn(process.execPath, ["--require", preloadPath, SERVER], {
+  const failedChild = spawn(process.execPath, ["--require", harness.quotaRecoveryPreloadPath, "--require", preloadPath, SERVER], {
     cwd: harness.dir,
-    env: { ...process.env, NODE_ENV: "test", PORT: String(failedPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    env: { ...process.env, ...testDeadQuotaOwnerEnv(harness.child.pid), NODE_ENV: "test", PORT: String(failedPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -4832,9 +4855,9 @@ test("restart reconciles a replacement after the restored-part ledger transition
   }
 
   const finalPort = await getUnusedPort();
-  const finalChild = spawn(process.execPath, [SERVER], {
+  const finalChild = spawn(process.execPath, ["--require", harness.quotaRecoveryPreloadPath, SERVER], {
     cwd: harness.dir,
-    env: { ...process.env, NODE_ENV: "test", PORT: String(finalPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    env: { ...process.env, ...testDeadQuotaOwnerEnv(harness.child.pid, failedChild.pid), NODE_ENV: "test", PORT: String(finalPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -4883,9 +4906,9 @@ test("restart reconciles a replacement after restoring the original target", { t
       return result;
     };
   `);
-  const failedChild = spawn(process.execPath, ["--require", preloadPath, SERVER], {
+  const failedChild = spawn(process.execPath, ["--require", harness.quotaRecoveryPreloadPath, "--require", preloadPath, SERVER], {
     cwd: harness.dir,
-    env: { ...process.env, NODE_ENV: "test", PORT: String(failedPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    env: { ...process.env, ...testDeadQuotaOwnerEnv(harness.child.pid), NODE_ENV: "test", PORT: String(failedPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
   });
   const failedStderr = [];
@@ -4909,9 +4932,9 @@ test("restart reconciles a replacement after restoring the original target", { t
     ]);
   } finally { interruptedRows.close(); }
   const finalPort = await getUnusedPort();
-  const finalChild = spawn(process.execPath, [SERVER], {
+  const finalChild = spawn(process.execPath, ["--require", harness.quotaRecoveryPreloadPath, SERVER], {
     cwd: harness.dir,
-    env: { ...process.env, NODE_ENV: "test", PORT: String(finalPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
+    env: { ...process.env, ...testDeadQuotaOwnerEnv(harness.child.pid, failedChild.pid), NODE_ENV: "test", PORT: String(finalPort), DB_ENABLED: "false", DB_READ_FALLBACK_JSON: "true", DB_WRITE_LEGACY_JSON: "true", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", UPLOAD_SCAN_ENABLED: "true", UPLOAD_BLOCK_EXECUTABLES: "true", UPLOAD_QUARANTINE_DIR: harness.quarantineDir, CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(64 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(128 * 1024 * 1024), CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "5000", CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10000", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") },
     stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
   });
   const finalStderr = [];
