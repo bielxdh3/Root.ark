@@ -2,7 +2,7 @@
 
 Whole restore uses a durable, local rollback protocol. It does **not** provide instantaneous atomic visibility across JSON files, quarantine, uploads, SQLite, and cloud providers. Before replacing local state, Root.ark stages and verifies preimages for every locally controlled destination the archive can change. If the process stops before the local commit boundary, startup restores those preimages before migrations or request handling. Cloud-provider effects remain outside that local rollback domain.
 
-The latest exact application-SHA validation and tested failure boundaries are recorded in the [post-#189 validation snapshot](validation/2026-10-15-rootark-post-189.md). That evidence does not expand the transaction guarantee or establish live cloud-provider interoperability.
+The 2026-10-16 pre-publication closure snapshot records the current `Root/main` application SHA and distinguishes branch-head local gates from default-branch checks. Restore remains rollback/restart recoverable for locally controlled state, not globally atomic across quarantine, filesystem, JSON/SQLite, and cloud providers. See [the closure snapshot](validation/2026-10-16-rootark-prepublication-closure.md) and [current findings](security/current-findings.md) for the dated validation boundary; neither establishes live cloud-provider interoperability.
 
 ## Admission and service barrier
 

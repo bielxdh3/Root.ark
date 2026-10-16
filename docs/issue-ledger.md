@@ -1,5 +1,33 @@
 # Root.ark Issue Ledger
 
+## Live GitHub snapshot before the 2026-10-16 closure documentation publication
+
+Queried against `Root/main` SHA `18d45696e9c07d706de1e9ab161d1b642cbd3d87` at 2026-10-16 21:52 UTC, after PRs #199 and #200 merged and before this documentation PR was published. There were no open PRs at the query. This is a point-in-time snapshot; the final post-publication SHA and checks must be verified separately.
+
+| Issue | State at query | Current acceptance boundary |
+|---|---|---|
+| #63 | Open | Protected search remains incomplete: UI/index lifecycle, leakage analysis, and FTS/search acceptance remain. |
+| #64 | Open | Architecture/future-client work does not provide a functioning native Android client. |
+| #65 | Open | Cryptographic building blocks do not make all supported runtime flows end-to-end Zero-Knowledge. |
+| #66 | Open | PR #97 is merged partial selective-sync work, including out-of-scope tombstone reconciliation. Metadata-only paginated catalog, network-selective transfer, native Files On-Demand, open-handle-safe eviction, and deterministic restart/reconnect remain incomplete. |
+| #67 | Open | Backups and revision history do not provide destructive-change detection, a review barrier, and adversarially validated recovery. |
+| #68 | Open | Existing bearer links do not provide least-privilege operation-scoped capabilities. |
+| #94 | Open | Per-process request limits do not prove deployment-wide enforcement across workers/replicas. |
+| #186 | Open | PR #192 implements explicit per-account/system byte and entry limits through a local SQLite quota ledger for a single host/shared local volume; PR #199 adds maximum-size assembly accounting regression coverage. Operators must configure capacity values. Multi-host, NFS, SMB, and unverified storage are unsupported. This issue remained open at this snapshot pending closure validation/review. |
+
+| Mission PR | Live state at query | Merge SHA |
+|---|---|---|
+| #195 | Merged | `2f8f135865ac068cc80a062adf87793ec1e4df91` |
+| #196 | Merged | `3334236f6e36db11488777d701810ae19eaa1546` |
+| #197 | Merged | `6df9423a51c48b1ccd429374ec7bd57ad222046b` |
+| #198 | Merged | `4e32c411f45d18e47388a4c60deb783f1f4daccb` |
+| #199 | Merged | `18d45696e9c07d706de1e9ab161d1b642cbd3d87` |
+| #200 | Merged | `7a23f4f7cff77ff6ce8a6c43282c0792a34ec123` |
+
+PRs #199 and #200 had no unresolved review threads when queried. Their exact branch-head local release gates passed 21/21 with 0 blocked and 0 failed on Windows. GitHub CodeQL, Dependency Review, and Ubuntu validation passed on both; the GitHub Windows jobs were cancelled. At this snapshot, Dependency Review and CodeQL passed on `Root/main` SHA `18d4569`, while its Security Regression run was still in progress. See the [exact evidence and boundaries](validation/2026-10-16-rootark-prepublication-closure.md); none of these results substitutes for validation of the post-documentation final SHA.
+
+Whole restore remains rollback/restart recoverable across locally controlled domains but is not a globally atomic switch across quarantine, filesystem, JSON/SQLite, and cloud-provider state. Root.ark is not production-ready or an end-to-end Zero-Knowledge runtime. The dated snapshots below remain historical evidence and must not be read as current GitHub state.
+
 ## GitHub snapshot after PR #189 — 2026-10-15 (application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`; pre-publication query)
 
 This point-in-time snapshot was queried after PR #189 merged and before documentation PR #175 was updated and published. It supersedes the post-#174 snapshot below for application and GitHub state at this query. PR #188 merged at `a557bfec762d45ceb574146841b9dffbe1b7757e` with chunk-upload limits; PR #189 merged at `bde6c54bee7a015822aa5463618bdf985ddf805d` with a disposable restore crash-injection regression. Exact checks are in the [post-#189 validation snapshot](validation/2026-10-15-rootark-post-189.md). The documentation publication itself is excluded from this pre-publication inventory and requires separate exact-head and final-`Root/main` validation.

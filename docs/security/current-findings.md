@@ -6,9 +6,9 @@ This public document intentionally does not retain exploit-ready reproduction st
 
 ## Current position
 
-- The latest application-code checks are for exact `Root/main` SHA `bde6c54bee7a015822aa5463618bdf985ddf805d` after PR #189. Security Regression, CodeQL, Dependency Review, and Pages evidence is linked in the [post-#189 validation snapshot](../validation/2026-10-15-rootark-post-189.md). Documentation PR #175 and its resulting default-branch SHA are separate validation scopes; the application checks do not transfer to that publication.
+- The latest live application snapshot was queried at exact `Root/main` SHA `18d45696e9c07d706de1e9ab161d1b642cbd3d87` after PR #199 merged and before the 2026-10-16 closure documentation publication. At query time, CodeQL and Dependency Review succeeded and Security Regression was still running. Exact-head local release gates for PR #199 (`0db94c2a00aa61f6cbbf3c8e9c7dbf77caa9b77e`) and PR #200 (`59165d4ccf3cfb1f618b1ec5ff98fd5b6a7e0df6`) each reported 21 passed, 0 blocked, 0 failed on Windows; the corresponding GitHub Windows jobs were cancelled. See the [2026-10-16 closure snapshot](../validation/2026-10-16-rootark-prepublication-closure.md). Those checks do not transfer to the post-documentation final SHA.
 - Root.ark is still under active development and is not production-ready.
-- At the 2026-10-15 GitHub query, Dependabot alert #1 remained open at medium severity (`GHSA-hp3w-g68c-fv3c`) for transitive runtime dependency `sprintf-js` in `package-lock.json`; GitHub reports no patched version. Dependabot PRs #172 and #173 are merged and do not clear the alert.
+- At the 2026-10-16 GitHub query, Dependabot alert #1 remained open at medium severity (`GHSA-hp3w-g68c-fv3c`) for transitive runtime dependency `sprintf-js` in `package-lock.json`; GitHub reports no patched version. Dependabot PRs #172 and #173 are merged and do not clear the alert.
 - The default expectation is a private, administrator-controlled deployment on a trusted network.
 - A strong explicit `JWT_SECRET` is required; no public fallback secret should be used.
 - Browser authentication uses server-controlled session boundaries rather than persistent browser bearer-token storage.
@@ -26,7 +26,7 @@ Production rejects persisted default development bootstrap credentials at startu
 
 ## Abandoned chunk-upload retention
 
-PR #170 implements the user-selected seven-day inactivity expiry for valid chunk sessions. PR #95 was closed as superseded by #188; issue #94 remains open because its in-memory per-process limiter and local-disk staging do not prove deployment-wide enforcement. Issue #186 separately tracks the missing aggregate byte/storage reservation. Malformed or unsafe chunk metadata is preserved and blocks unsafe resume/deletion; request-local `temp/.incoming/` staging cleanup remains a separate path.
+PR #170 implements the user-selected seven-day inactivity expiry for valid chunk sessions. PR #95 was closed as superseded by #188; issue #94 remains open because its in-memory per-process limiter and local-disk staging do not prove deployment-wide enforcement. PR #192 implements aggregate per-account/system byte and entry reservations in a separate local SQLite ledger, with no capacity defaults and a fail-closed one-host/shared-local-volume topology; PR #199 adds the maximum-assembly quota regression. Operators must provide their real capacity limits. Issue #186 was still open pending final closure validation at the 2026-10-16 snapshot. Malformed or unsafe chunk metadata is preserved and blocks unsafe resume/deletion; request-local `temp/.incoming/` staging cleanup remains a separate path.
 
 ## Cloud file lifecycle boundary
 
