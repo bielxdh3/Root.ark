@@ -156,9 +156,18 @@ function readLinuxProcessStartTime(pid) {
   return startTime;
 }
 
-function linuxProcfsMatchesPidNamespace(pidNamespace, readlinkSync = fs.readlinkSync) {
-  try { return readlinkSync("/proc/1/ns/pid") === pidNamespace; }
-  catch { return false; }
+function linuxProcfsMatchesPidNamespace(pidNamespace, readlinkSync = fs.readlinkSync, readFileSync = fs.readFileSync, currentPid = process.pid) {
+  try {
+    // PID 1's namespace link may be hidden from unprivileged services; validate procfs through self and its visible PID instead.
+    if (readlinkSync("/proc/self/ns/pid") !== pidNamespace) return false;
+    const stat = readFileSync("/proc/self/stat", "utf8");
+    const pidSeparator = stat.indexOf(" ");
+    if (pidSeparator <= 0) return false;
+    const visiblePid = Number(stat.slice(0, pidSeparator));
+    return Number.isSafeInteger(visiblePid) && visiblePid === currentPid;
+  } catch {
+    return false;
+  }
 }
 
 function getCurrentProcessIdentity(pid = process.pid) {
@@ -175,7 +184,7 @@ function getCurrentProcessIdentity(pid = process.pid) {
       .find(Boolean);
     const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
     const pidNamespace = fs.readlinkSync("/proc/self/ns/pid");
-    if (!linuxProcfsMatchesPidNamespace(pidNamespace)) return null;
+    if (!linuxProcfsMatchesPidNamespace(pidNamespace, fs.readlinkSync, fs.readFileSync, pid)) return null;
     const processStartTime = readLinuxProcessStartTime(pid);
     if (!machineId || !bootId || !pidNamespace || !processStartTime) return null;
     const hostId = crypto.createHash("sha256").update(`rootark-chunk-quota-host\0${machineId}`).digest("hex");
@@ -185,7 +194,7 @@ function getCurrentProcessIdentity(pid = process.pid) {
   }
 }
 
-function classifyProcessOwner(ownerPid, ownerIdentity, currentIdentity, { platform = process.platform, kill = process.kill, readlinkSync = fs.readlinkSync } = {}) {
+function classifyProcessOwner(ownerPid, ownerIdentity, currentIdentity, { platform = process.platform, kill = process.kill, readlinkSync = fs.readlinkSync, readFileSync = fs.readFileSync } = {}) {
   if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return "unknown";
   const owner = typeof ownerIdentity === "string" ? parseProcessIdentity(ownerIdentity) : normalizeProcessIdentity(ownerIdentity);
   const current = typeof currentIdentity === "string" ? parseProcessIdentity(currentIdentity) : normalizeProcessIdentity(currentIdentity);
@@ -193,7 +202,7 @@ function classifyProcessOwner(ownerPid, ownerIdentity, currentIdentity, { platfo
 
   if (platform === "linux") {
     if (owner.hostId !== current.hostId || owner.bootId !== current.bootId || owner.pidNamespace !== current.pidNamespace) return "unknown";
-    if (!linuxProcfsMatchesPidNamespace(current.pidNamespace, readlinkSync)) return "unknown";
+    if (!linuxProcfsMatchesPidNamespace(current.pidNamespace, readlinkSync, readFileSync, process.pid)) return "unknown";
     try {
       const namespace = readlinkSync(`/proc/${ownerPid}/ns/pid`);
       if (namespace !== owner.pidNamespace) return "unknown";

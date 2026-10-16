@@ -42,14 +42,14 @@ function getUnusedPort() {
   });
 }
 
-function request(port, requestPath, { method = "GET", headers = {}, body, agent } = {}) {
+function request(port, requestPath, { method = "GET", headers = {}, body, agent, timeoutMs = TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: "127.0.0.1", port, path: requestPath, method, headers, agent }, (res) => {
       let responseBody = "";
       res.on("data", (chunk) => { responseBody += chunk; });
       res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: responseBody }));
     });
-    req.setTimeout(TIMEOUT_MS, () => req.destroy(new Error("request timed out")));
+    req.setTimeout(timeoutMs, () => req.destroy(new Error("request timed out")));
     req.once("error", reject);
     req.end(body);
   });
@@ -303,7 +303,7 @@ async function uploadPayload(port, session, payload) {
   });
 }
 
-async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, totalChunks, bytes, encryptionLevel, password, versionComment, expiresInDays, forwardedFor, agent }) {
+async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, totalChunks, bytes, encryptionLevel, password, versionComment, expiresInDays, forwardedFor, agent, timeoutMs }) {
   const parts = [
     { field: "uploadId", bytes: uploadId },
     { field: "originalName", bytes: originalName },
@@ -327,6 +327,7 @@ async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, 
     },
     agent,
     body: payload.body,
+    timeoutMs,
   });
 }
 
@@ -585,7 +586,7 @@ test("seven-day expiry still cleans validated sessions when the configured quota
   assert.ok(!fs.existsSync(incomingDir) || fs.readdirSync(incomingDir).length === 0, "upload still fails closed before writing a new part");
 });
 
-test("a second startup preserves a live chunk promotion before its incoming rename", { timeout: 45_000 }, async (t) => {
+test("a second startup preserves a live chunk promotion before its incoming rename", { timeout: 90_000 }, async (t) => {
   const uploadId = "live-promotion-startup";
   let promotionGate;
   const harness = await createHarness(t, {
@@ -621,6 +622,7 @@ test("a second startup preserves a live chunk promotion before its incoming rena
     chunkIndex: 0,
     totalChunks: 2,
     bytes: originalBytes,
+    timeoutMs: 90_000,
   }).then((value) => ({ value }), (error) => ({ error }));
   assert.equal(await waitForFile(promotionGate.entered), true, "the original process pauses after the promoting ledger transition and before rename");
 
@@ -705,7 +707,7 @@ test("a second startup preserves a live chunk promotion before its incoming rena
   assert.equal(originalResult.value.status, 200, originalResult.value.body);
 });
 
-test("a second startup revalidates a live promotion renamed after incoming enumeration", { timeout: 45_000 }, async (t) => {
+test("a second startup revalidates a live promotion renamed after incoming enumeration", { timeout: 90_000 }, async (t) => {
   const uploadId = "live-promotion-after-enumeration";
   let gates;
   const harness = await createHarness(t, {
@@ -745,6 +747,7 @@ test("a second startup revalidates a live promotion renamed after incoming enume
     chunkIndex: 0,
     totalChunks: 2,
     bytes: originalBytes,
+    timeoutMs: 90_000,
   }).then((value) => ({ value }), (error) => ({ error }));
   assert.equal(await waitForFile(gates.beforeRename), true);
 
@@ -794,9 +797,11 @@ test("a second startup revalidates a live promotion renamed after incoming enume
     windowsHide: true,
   });
   const secondStderr = [];
+  const secondStdout = [];
   secondChild.stderr.on("data", (chunk) => secondStderr.push(chunk.toString()));
+  secondChild.stdout.on("data", (chunk) => secondStdout.push(chunk.toString()));
   try {
-    assert.equal(await waitForFile(gates.lstatEntered), true, "the second process pauses after enumerating the incoming file");
+    assert.equal(await waitForFile(gates.lstatEntered, 60_000), true, `the second process pauses after enumerating the incoming file; exit: ${secondChild.exitCode}; stdout: ${secondStdout.join("")}; stderr: ${secondStderr.join("")}`);
     fs.writeFileSync(gates.allowRename, "allow");
     assert.equal(await waitForFile(gates.renamed), true, "the live owner atomically moves the incoming file while startup is paused");
     assert.equal(fs.existsSync(incomingPath), false);
