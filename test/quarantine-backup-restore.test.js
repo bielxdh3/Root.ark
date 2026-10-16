@@ -1431,15 +1431,16 @@ test("quarantine restore recovery preserves missing metadata state across startu
 test("quarantine journal directory fsync failure preserves the published journal stage for startup recovery", { timeout: 30_000 }, () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-journal-fsync-runtime-"));
   const quarantineDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-quarantine-journal-fsync-payloads-"));
+  const archiverModulePath = require.resolve("archiver");
   const env = { ...process.env, DB_ENABLED: "false", UPLOAD_QUARANTINE_DIR: quarantineDir, BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "false", BACKUP_RETENTION_COUNT: "20" };
   try {
     const setupScript = `
       const assert = require("node:assert/strict");
       const fs = require("node:fs");
       const path = require("node:path");
-      const archiver = require("archiver");
+      const archiver = require(${JSON.stringify(archiverModulePath)});
       if (typeof archiver.ZipArchive !== "function") {
-        require.cache[require.resolve("archiver")].exports = { ...archiver, ZipArchive: function ZipArchive(options) { return archiver.create("zip", options); } };
+        require.cache[${JSON.stringify(archiverModulePath)}].exports = { ...archiver, ZipArchive: function ZipArchive(options) { return archiver.create("zip", options); } };
       }
       const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
       const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
