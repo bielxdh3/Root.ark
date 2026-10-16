@@ -220,6 +220,56 @@ test("sync journal retries transient Windows rename EPERM without replacing comm
   }
 });
 
+test("sync snapshot retries a transient Windows rename EPERM", { skip: process.platform !== "win32" }, async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-snapshot-rename-retry-"));
+  const rootDir = path.join(dir, "root");
+  await fsp.mkdir(rootDir, { recursive: true });
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const snapshotPath = path.join(rootDir, ".rootark-sync-index.json");
+  const originalRename = fsp.rename;
+  let attempts = 0;
+  let failEveryRename = false;
+  let failureCode = "EPERM";
+  fsp.rename = async (source, destination) => {
+    if (destination === snapshotPath) {
+      attempts += 1;
+      if (failEveryRename || attempts === 1) throw Object.assign(new Error("injected sync snapshot rename failure"), { code: failureCode });
+    }
+    return originalRename(source, destination);
+  };
+  try {
+    const engine = await new SyncEngine({
+      rootDir,
+      adapter: { async push() {}, async list() { return []; } },
+      deviceId: "device-snapshot-retry",
+      keyEpoch: "epoch-1",
+      compartmentId: "private",
+      fileKeyResolver: () => Buffer.alloc(32),
+    }).open();
+    assert.equal(attempts, 2, "the snapshot rename is retried once after transient EPERM");
+    assert.deepEqual(JSON.parse(await fsp.readFile(snapshotPath, "utf8")), { version: 1, files: {}, remoteOnly: {} });
+    assert.deepEqual((await fsp.readdir(rootDir)).filter((name) => name.startsWith(".rootark-sync-index.json.tmp-")), []);
+
+    const committedSnapshot = await fsp.readFile(snapshotPath, "utf8");
+    engine.snapshot.files["failed-update.txt"] = { objectId: "failed-update" };
+    const attemptsBeforeFailure = attempts;
+    failEveryRename = true;
+    await assert.rejects(engine.persistSnapshot(), { code: "EPERM" });
+    assert.equal(attempts - attemptsBeforeFailure, 3, "persistent Windows EPERM stops after the bounded retry count");
+    assert.equal(await fsp.readFile(snapshotPath, "utf8"), committedSnapshot, "exhaustion preserves the previously committed snapshot");
+    assert.deepEqual((await fsp.readdir(rootDir)).filter((name) => name.startsWith(".rootark-sync-index.json.tmp-")), []);
+
+    failureCode = "EIO";
+    const attemptsBeforeNonEperm = attempts;
+    await assert.rejects(engine.persistSnapshot(), { code: "EIO" });
+    assert.equal(attempts - attemptsBeforeNonEperm, 1, "non-EPERM failures are not retried");
+    assert.equal(await fsp.readFile(snapshotPath, "utf8"), committedSnapshot);
+    assert.deepEqual((await fsp.readdir(rootDir)).filter((name) => name.startsWith(".rootark-sync-index.json.tmp-")), []);
+  } finally {
+    fsp.rename = originalRename;
+  }
+});
+
 test("WebDAV mutation journal translates into v2 move and reaches a second client", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-webdav-sync-"));
   const rootA = path.join(dir, "a");
