@@ -11,6 +11,8 @@ const MAX_HISTORY_PER_OBJECT = 32;
 const MAX_SEEN_OPERATIONS = 10000;
 const MAX_REQUEST_BYTES = 9 * 1024 * 1024;
 const MAX_CIPHERTEXT_BYTES = 8 * 1024 * 1024;
+const WINDOWS_RENAME_MAX_ATTEMPTS = 3;
+const WINDOWS_RENAME_RETRY_DELAY_MS = 10;
 
 function isUnsupportedDirectorySync(error) {
   return ["EINVAL", "ENOTSUP"].includes(error?.code)
@@ -29,6 +31,18 @@ async function syncDirectory(directory) {
   }
 }
 
+async function renameWithRetry(source, destination) {
+  for (let attempt = 1; attempt <= WINDOWS_RENAME_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await fs.rename(source, destination);
+      return;
+    } catch (error) {
+      if (process.platform !== "win32" || error?.code !== "EPERM" || attempt === WINDOWS_RENAME_MAX_ATTEMPTS) throw error;
+      await new Promise((resolve) => setTimeout(resolve, WINDOWS_RENAME_RETRY_DELAY_MS));
+    }
+  }
+}
+
 function errorResponse(res, status, error, extra = {}) {
   return res.status(status).json({ error, ...extra });
 }
@@ -44,7 +58,12 @@ async function durableWrite(filePath, value) {
   } finally {
     await handle.close();
   }
-  await fs.rename(temporary, filePath);
+  try {
+    await renameWithRetry(temporary, filePath);
+  } catch (error) {
+    await fs.unlink(temporary).catch(() => {});
+    throw error;
+  }
   await syncDirectory(directory);
 }
 

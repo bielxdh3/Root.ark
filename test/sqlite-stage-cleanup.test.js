@@ -23,14 +23,34 @@ test("SQLite stage cleanup failure is observable without invalidating a complete
         ? (() => { throw Object.assign(new Error("locked stage"), { code: "EBUSY" }); })()
         : originalRemove(target, options);
       (async () => {
-        const backup = await service.createBackup();
-        console.log(JSON.stringify({ status: backup.status, cleanup: backup.metadata.sqliteStageCleanup, archive: fs.existsSync(service.getArchivePath(backup.filename)) }));
+        try { await service.createBackup(); }
+        catch (error) {
+          const backup = error.backup;
+          console.log(JSON.stringify({
+            status: backup?.status,
+            cleanup: backup?.metadata?.sqliteStageCleanup,
+            archive: Boolean(backup && fs.existsSync(service.getArchivePath(backup.filename))),
+            code: error.code,
+            historyState: error.backupHistoryState,
+            operationState: error.backupOperationState,
+            cleanupFailureCodes: error.cleanupFailureCodes,
+          }));
+        }
+        finally { db.closeDb(); }
       })().catch((error) => { console.error(error); process.exitCode = 1; });
     `], { encoding: "utf8", env: process.env });
     assert.equal(result.status, 0, result.stderr);
     const output = JSON.parse(result.stdout.trim().split(/\r?\n/).pop());
     assert.equal(output.status, "success");
-    assert.deepEqual(output.cleanup, { code: "SQLITE_STAGE_CLEANUP_FAILED", message: "SQLite staging cleanup failed" });
+    assert.deepEqual(output, {
+      status: "success",
+      cleanup: { code: "SQLITE_STAGE_CLEANUP_FAILED", message: "SQLite staging cleanup failed" },
+      archive: true,
+      code: "BACKUP_STAGE_CLEANUP_FAILED",
+      historyState: "durable",
+      operationState: "created-post-processing-failed",
+      cleanupFailureCodes: ["SQLITE_STAGE_CLEANUP_FAILED"],
+    });
     assert.equal(output.archive, true);
   } finally {
     fs.rmSync(runtime, { recursive: true, force: true });

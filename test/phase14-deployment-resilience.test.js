@@ -12,7 +12,7 @@ const resilience = require("../src/services/deploymentResilience");
 
 function validConfig(masterKeyFile) {
   return resilience.getDeploymentReadiness({
-    env: { JWT_SECRET: crypto.randomBytes(32).toString("hex"), TOTP_POLICY: "optional" },
+    env: { NODE_ENV: "production", JWT_SECRET: crypto.randomBytes(32).toString("hex"), TOTP_POLICY: "optional" },
     masterKeyFile,
     cloudStatus: { provider: "local", enabled: false },
     validateTotp: () => ({ mode: "optional" }),
@@ -26,7 +26,7 @@ test("readiness fails closed for missing critical configuration and accepts a co
     validateTotp: () => ({ mode: "optional" }),
   });
   assert.equal(missing.ok, false);
-  assert.deepEqual(missing.checks, { jwt: "missing_or_invalid", totp: "missing_or_invalid", masterKey: "missing_or_invalid", provider: "ok" });
+  assert.deepEqual(missing.checks, { jwt: "missing_or_invalid", totp: "missing_or_invalid", sessionCookie: "missing_or_invalid", masterKey: "missing_or_invalid", provider: "ok" });
 
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-phase14-config-"));
   try {
@@ -34,6 +34,21 @@ test("readiness fails closed for missing critical configuration and accepts a co
     fs.writeFileSync(masterKeyFile, "a".repeat(64));
     assert.equal(validConfig(masterKeyFile).ok, true);
     assert.equal(resilience.getDeploymentReadiness({ env: { JWT_SECRET: "x".repeat(32), TOTP_POLICY: "optional" }, masterKeyFile, cloudStatus: { provider: "s3", enabled: true, s3: {} }, validateTotp: () => ({}) }).checks.provider, "missing_or_invalid");
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("deployment readiness fails when the session cookie would not be Secure", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-session-cookie-readiness-"));
+  try {
+    const masterKeyFile = path.join(directory, "master.key");
+    fs.writeFileSync(masterKeyFile, "b".repeat(64));
+    const env = { NODE_ENV: "development", JWT_SECRET: crypto.randomBytes(32).toString("hex"), TOTP_POLICY: "optional" };
+    const insecure = resilience.getDeploymentReadiness({ env, masterKeyFile, cloudStatus: { provider: "local", enabled: false }, validateTotp: () => ({ mode: "optional" }) });
+    assert.equal(insecure.ok, false);
+    assert.equal(insecure.checks.sessionCookie, "missing_or_invalid");
+    assert.equal(resilience.getDeploymentReadiness({ env: { ...env, SESSION_COOKIE_SECURE: "true" }, masterKeyFile, cloudStatus: { provider: "local", enabled: false }, validateTotp: () => ({ mode: "optional" }) }).checks.sessionCookie, "ok");
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

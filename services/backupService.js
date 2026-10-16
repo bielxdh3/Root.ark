@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const crypto = require("crypto");
 const { Readable } = require("stream");
 const Database = require("better-sqlite3");
@@ -9,17 +10,28 @@ const { getDatabasePath, getDb, isDbEnabled } = require("../db");
 const { resolveRuntimePath } = require("../src/runtime-paths");
 const { attestCiphertextOnlyFile } = require("../src/services/deploymentResilience");
 const { getUploadQuarantineDir, isSensitiveQuarantineItem, quarantineDirContainsUploads, readQuarantineMetadata, validateQuarantinePayloads } = require("../src/quarantine-paths");
+const restoreProviderOrphans = require("./restoreProviderOrphans");
+const { renameSyncWithWindowsEpermRetry } = require("../src/fs-atomic-rename");
 
 const BACKUPS_DIR = resolveRuntimePath("data", "backups");
+const SQLITE_BACKUP_STAGE_PREFIX = ".sqlite-backup-";
+const MAX_ORPHAN_SQLITE_BACKUP_STAGES = 128;
+const SQLITE_BACKUP_STAGE_FILES = new Set(["rootark.sqlite", "rootark.sqlite-wal", "rootark.sqlite-shm"]);
+const BACKUP_METADATA_LOCK_NAME = path.basename(backupRepository.MUTATION_LOCK_FILE).toLowerCase();
+const BACKUP_METADATA_LOCK_CLAIM_PREFIX = `${BACKUP_METADATA_LOCK_NAME}.claim-`;
+const BACKUP_METADATA_COORDINATION_DB_PREFIX = path.basename(backupRepository.MUTATION_COORDINATION_DB_FILE).toLowerCase();
 const LOCK_FILE = path.join(BACKUPS_DIR, ".backup.lock");
 const LOCK_TAKEOVER_DIR = `${LOCK_FILE}.takeover`;
 const LOCK_TAKEOVER_META = path.join(LOCK_TAKEOVER_DIR, "authority.json");
 const LOCK_TAKEOVER_EVIDENCE = path.join(LOCK_TAKEOVER_DIR, "evidence");
 const RETENTION_TRANSACTIONS_DIR = path.join(BACKUPS_DIR, ".retention-transactions");
 const OPERATION_LOCK_FORMAT_VERSION = 1;
-const MALFORMED_LOCK_TTL_MS = 60 * 1000;
-const MALFORMED_TAKEOVER_TTL_MS = 60 * 1000;
 const MAX_LOCK_TTL_MS = 24 * 60 * 60 * 1000;
+const PROCESS_INSTANCE_ID_SYMBOL = Symbol.for("rootark.backup.process-instance-id");
+if (!globalThis[PROCESS_INSTANCE_ID_SYMBOL]) {
+  Object.defineProperty(globalThis, PROCESS_INSTANCE_ID_SYMBOL, { value: crypto.randomUUID() });
+}
+const CURRENT_PROCESS_INSTANCE_ID = globalThis[PROCESS_INSTANCE_ID_SYMBOL];
 let operationLock = null;
 let cloudStorage = null;
 
@@ -29,17 +41,43 @@ function boundedLockDuration(name, fallback) {
   return Math.max(1000, Math.min(MAX_LOCK_TTL_MS, value));
 }
 
-function processStartIdentity(pid) {
-  if (process.platform !== "linux") return null;
+function processStartIdentity(pid, expectedPidNamespaceId) {
+  if (process.platform !== "linux" || typeof expectedPidNamespaceId !== "string" || !expectedPidNamespaceId) return null;
   try {
+    const selfStat = fs.readFileSync("/proc/self/stat", "utf8");
+    const selfPidDelimiter = selfStat.indexOf(" (");
+    const selfPid = Number(selfStat.slice(0, selfPidDelimiter));
+    if (selfPidDelimiter < 1 || selfPid !== process.pid) return null;
+    if (fs.readlinkSync(`/proc/${pid}/ns/pid`) !== expectedPidNamespaceId) return null;
+    const status = fs.readFileSync(`/proc/${pid}/status`, "utf8");
+    const namespacePids = /^NSpid:\s*([0-9]+(?:\s+[0-9]+)*)\s*$/m.exec(status)?.[1];
+    if (!namespacePids || Number(namespacePids.trim().split(/\s+/).at(-1)) !== pid) return null;
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const pidDelimiter = stat.indexOf(" (");
+    if (pidDelimiter < 1 || Number(stat.slice(0, pidDelimiter)) !== pid) return null;
     return stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/)[19] || null;
   } catch {
     return null;
   }
 }
 
-const CURRENT_PROCESS_START_IDENTITY = processStartIdentity(process.pid);
+function processBootIdentity() {
+  if (process.platform !== "linux") return null;
+  try { return fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || null; } catch { return null; }
+}
+
+function processPidNamespaceIdentity() {
+  if (process.platform !== "linux") return null;
+  try { return fs.readlinkSync("/proc/self/ns/pid") || null; } catch { return null; }
+}
+
+const CURRENT_PROCESS_PID_NAMESPACE_ID = processPidNamespaceIdentity();
+const CURRENT_PROCESS_IDENTITY = Object.freeze({
+  hostId: os.hostname() || null,
+  bootId: processBootIdentity(),
+  pidNamespaceId: CURRENT_PROCESS_PID_NAMESPACE_ID,
+  processStartIdentity: processStartIdentity(process.pid, CURRENT_PROCESS_PID_NAMESPACE_ID),
+});
 
 function setCloudStorage(storage) {
   cloudStorage = storage || null;
@@ -73,17 +111,26 @@ function collisionKey(value) {
 
 function isSensitivePath(relativePath) {
   const normalized = normalizeEntryPath(relativePath);
-  const base = path.basename(normalized).toLowerCase();
+  const lowerPath = normalized.toLowerCase();
+  const segments = lowerPath.split("/").filter(Boolean);
   if (!normalized) return true;
-  if (normalized.startsWith(".git/") || normalized === ".git") return true;
-  if (normalized.startsWith("node_modules/") || normalized === "node_modules") return true;
-  if (normalized.startsWith("data/backups/") || normalized === "data/backups") return true;
-  if (normalized.startsWith("temp/.chunks/") || normalized.startsWith("temp/.incoming/")) return true;
-  if (base === ".env" || base.startsWith(".env.") || base.endsWith(".env")) return true;
-  if (base.includes("credentials") || base.includes("service-account")) return true;
-  if (base.endsWith(".key") || base.endsWith(".pem") || base.endsWith(".p12")) return true;
-  if (base === "server-master.key") return true;
-  if (base === ".rootark-quarantine-restore-journal.json" || base.startsWith(".rootark-quarantine-restore-metadata-")) return true;
+  if (lowerPath.startsWith(".git/") || lowerPath === ".git") return true;
+  if (lowerPath.startsWith("node_modules/") || lowerPath === "node_modules") return true;
+  if (lowerPath.startsWith("data/backups/") || lowerPath === "data/backups") return true;
+  if (lowerPath === `data/${BACKUP_METADATA_LOCK_NAME}` || lowerPath.startsWith(`data/${BACKUP_METADATA_LOCK_CLAIM_PREFIX}`)) return true;
+  if (lowerPath.startsWith(`data/${BACKUP_METADATA_COORDINATION_DB_PREFIX}`)) return true;
+  if (lowerPath.startsWith("data/.rootark-cloud-")) return true;
+  if (lowerPath.startsWith("temp/.chunks/") || lowerPath.startsWith("temp/.incoming/")) return true;
+  if (lowerPath.startsWith("data/.rootark-active-requests/")) return true;
+  if (lowerPath.startsWith("data/.rootark-restore-restart-acks/")) return true;
+  if (segments.some((segment) => segment === ".env" || segment.startsWith(".env.") || segment.endsWith(".env"))) return true;
+  if (segments.some((segment) => segment.includes("credentials") || segment.includes("service-account"))) return true;
+  if (segments.some((segment) => segment.endsWith(".key") || segment.endsWith(".pem") || segment.endsWith(".p12"))) return true;
+  if (segments.some((segment) => segment.startsWith(".rootark-cloud-cache-"))) return true;
+  if (segments.some((segment) => segment === ".rootark-quarantine-restore-journal.json" || segment.startsWith(".rootark-quarantine-restore-metadata-"))) return true;
+  if (segments.some((segment) => segment === ".rootark-restore-provider-orphans.json")) return true;
+  if (segments.some((segment) => segment === ".rootark-restore-provider-orphans-state.json")) return true;
+  if (segments.some((segment) => segment.startsWith(".rootark-restore-coordinator.json"))) return true;
   return false;
 }
 
@@ -103,6 +150,42 @@ function pathIdentityKey(value) {
 
 function fileIdentity(stat) {
   return stat?.isFile?.() && stat.ino ? `${stat.dev}:${stat.ino}` : null;
+}
+
+function getQuarantineExclusionState() {
+  const directory = getUploadQuarantineDir();
+  if (quarantineDirContainsUploads(resolveRuntimePath("uploads"), directory)) {
+    throw new Error("Backup is not supported when the quarantine directory equals or contains uploads");
+  }
+  const metadata = readQuarantineMetadata(resolveRuntimePath("data", "quarantine.json"));
+  const payloads = metadata ? validateQuarantinePayloads(metadata.items, directory) : [];
+  const pathIdentities = new Set();
+  const fileIdentities = new Set();
+  for (const payload of payloads) {
+    pathIdentities.add(pathIdentityKey(payload.absolutePath));
+    try { pathIdentities.add(pathIdentityKey(fs.realpathSync(payload.absolutePath))); } catch {}
+    const identity = fileIdentity(fs.lstatSync(payload.absolutePath, { bigint: true }));
+    if (identity) fileIdentities.add(identity);
+  }
+  let directoryReal = null;
+  try { directoryReal = fs.realpathSync(directory); } catch {}
+  const isPayloadPath = (candidatePath, stat) => {
+    const identity = fileIdentity(stat);
+    if (identity && fileIdentities.has(identity)) return true;
+    if (pathIdentities.has(pathIdentityKey(candidatePath))) return true;
+    try { return pathIdentities.has(pathIdentityKey(fs.realpathSync(candidatePath))); } catch { return false; }
+  };
+  const isExcludedPath = (candidatePath, stat) => {
+    const absolute = path.resolve(candidatePath);
+    if (isPathWithin(directory, absolute)) return true;
+    if (directoryReal) {
+      try {
+        if (isPathWithin(directoryReal, fs.realpathSync(absolute))) return true;
+      } catch {}
+    }
+    return isPayloadPath(absolute, stat);
+  };
+  return { directory, metadata, payloads, fileIdentities, isPayloadPath, isExcludedPath };
 }
 
 function sameFileIdentity(left, right) {
@@ -178,6 +261,12 @@ function createVerifiedArchiveStream(file) {
   let source;
   const stream = Readable.from((async function* readVerifiedArchiveSource() {
     const { absolutePath, archiveRoot: root, sourceStat } = file;
+    const sourceSize = Number(sourceStat.size);
+    const expectedSize = file.size === undefined ? sourceSize : file.size;
+    if (!Number.isSafeInteger(sourceSize) || sourceSize < 0 || !Number.isSafeInteger(expectedSize)
+      || expectedSize !== sourceSize) {
+      throw new Error("Backup source size metadata is invalid");
+    }
     assertArchiveRootUnchanged(root);
     const pathStat = assertArchiveSourcePath(root, absolutePath);
     if (!sameFileSnapshot(sourceStat, pathStat) || pathStat.nlink !== 1n) {
@@ -186,7 +275,9 @@ function createVerifiedArchiveStream(file) {
 
     let fd;
     try {
-      fd = fs.openSync(absolutePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      fd = fs.openSync(absolutePath, fs.constants.O_RDONLY
+        | (fs.constants.O_NOFOLLOW || 0)
+        | (fs.constants.O_NONBLOCK || 0));
       const openedStat = fs.fstatSync(fd, { bigint: true });
       if (!openedStat.isFile() || openedStat.nlink !== 1n || !sameFileSnapshot(sourceStat, openedStat)) {
         throw new Error("Backup source changed or is aliased during archive creation");
@@ -197,11 +288,27 @@ function createVerifiedArchiveStream(file) {
       if (!isPathWithin(root.realPath, realPath) || !sameFileSnapshot(openedStat, finalPathStat)) {
         throw new Error("Backup source escaped its collected root");
       }
-      source = fs.createReadStream(null, { fd, autoClose: true });
-      fd = undefined;
-      for await (const chunk of source) yield chunk;
+      source = fs.createReadStream(null, { fd, autoClose: false });
+      let bytesRead = 0;
+      for await (const chunk of source) {
+        if (chunk.length > expectedSize - bytesRead) throw new Error("Backup source size changed during archive creation");
+        bytesRead += chunk.length;
+        yield chunk;
+      }
+      if (bytesRead !== expectedSize) throw new Error("Backup source size changed during archive creation");
+
+      const streamedStat = fs.fstatSync(fd, { bigint: true });
+      assertArchiveRootUnchanged(root);
+      const streamedPathStat = assertArchiveSourcePath(root, absolutePath);
+      const streamedRealPath = fs.realpathSync.native(absolutePath);
+      // Stat snapshots detect normal app writes and path replacements; external writers that can rewrite bytes while restoring all compared metadata are outside this guarantee.
+      if (!streamedStat.isFile() || streamedStat.nlink !== 1n || streamedPathStat.nlink !== 1n
+        || !sameFileSnapshot(sourceStat, streamedStat) || !sameFileSnapshot(streamedStat, streamedPathStat)
+        || !isPathWithin(root.realPath, streamedRealPath)) {
+        throw new Error("Backup source changed during archive creation");
+      }
     } finally {
-      if (source) source.destroy();
+      if (source && !source.readableEnded && !source.destroyed) source.destroy();
       if (fd !== undefined) fs.closeSync(fd);
     }
   })());
@@ -221,25 +328,27 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
     const absolute = path.resolve(excludedPath);
     return { absolute, real: fs.existsSync(absolute) ? fs.realpathSync(absolute) : null };
   });
-  const isExcluded = (candidatePath) => {
-    if (!excludedPaths.length) return false;
+  const isExcluded = (candidatePath, stat) => {
     const absolute = path.resolve(candidatePath);
     if (excludedPaths.some((excluded) => isPathWithin(excluded.absolute, absolute))) return true;
-    if (!excludedPaths.some((excluded) => excluded.real)) return false;
-    let real;
-    try { real = fs.realpathSync(absolute); } catch { return false; }
-    return excludedPaths.some((excluded) => excluded.real && isPathWithin(excluded.real, real));
+    if (excludedPaths.some((excluded) => excluded.real && (() => {
+      try { return isPathWithin(excluded.real, fs.realpathSync(absolute)); } catch { return false; }
+    })())) return true;
+    const identity = fileIdentity(stat);
+    if (identity && options.excludeFileIdentities?.has(identity)) return true;
+    return Boolean(options.excludePredicate?.(absolute, stat));
   };
-  if (isExcluded(rootAbsolute)) return [];
+  const rootStat = fs.lstatSync(rootAbsolute, { bigint: true });
+  if (rootStat.isSymbolicLink() || isExcluded(rootAbsolute, rootStat)) return [];
   const files = [];
   const stack = [{ absolutePath: rootAbsolute, entryPath: entryPrefix }];
   while (stack.length) {
     const current = stack.pop();
-    if (isExcluded(current.absolutePath)) continue;
     const stat = fs.lstatSync(current.absolutePath, { bigint: true });
-    if (stat.isSymbolicLink()) continue;
+    if (stat.isSymbolicLink() || isExcluded(current.absolutePath, stat)) continue;
     if (stat.isDirectory()) {
       for (const name of fs.readdirSync(current.absolutePath)) {
+        if (options.excludeNamePrefixes?.some((prefix) => name.startsWith(prefix))) continue;
         const absolutePath = path.join(current.absolutePath, name);
         if (isExcluded(absolutePath)) continue;
         const entryPath = normalizeEntryPath(path.posix.join(current.entryPath, name));
@@ -250,7 +359,6 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
     }
     if (!stat.isFile()) continue;
     const identity = fileIdentity(stat);
-    if (identity && options.excludeFileIdentities?.has(identity)) continue;
     if (options.maxBytes && stat.size > options.maxBytes) continue;
     files.push({ absolutePath: current.absolutePath, entryPath: normalizeEntryPath(current.entryPath), size: Number(stat.size), archiveRoot, sourceStat: stat });
   }
@@ -258,7 +366,11 @@ function collectFilesRecursive(rootPath, entryPrefix, options = {}) {
 }
 
 async function collectBackupFiles(options = {}) {
+  if (options.persistenceMode && options.persistenceMode !== (isDbEnabled() ? "sqlite" : "json")) {
+    throw new Error("Persistence mode changed while collecting backup files");
+  }
   const files = [];
+  const suppressionSnapshot = options.suppressionSnapshot || restoreProviderOrphans.createSnapshot();
   const dataDir = resolveRuntimePath("data");
   let dataRootInfo = null;
   try {
@@ -271,27 +383,9 @@ async function collectBackupFiles(options = {}) {
   const includeUploads = envBool("BACKUP_INCLUDE_UPLOADS", true);
   const includeTemp = envBool("BACKUP_INCLUDE_TEMP", false);
   const includePending = envBool("BACKUP_INCLUDE_PENDING", false);
-  const quarantineDir = getUploadQuarantineDir();
-  if (quarantineDirContainsUploads(resolveRuntimePath("uploads"), quarantineDir)) {
-    throw new Error("Backup is not supported when the quarantine directory equals or contains uploads");
-  }
-  const quarantineMetadata = readQuarantineMetadata(resolveRuntimePath("data", "quarantine.json"));
-  const quarantinePayloads = quarantineMetadata ? validateQuarantinePayloads(quarantineMetadata.items, quarantineDir) : [];
+  const quarantineExclusions = getQuarantineExclusionState();
+  const { directory: quarantineDir, metadata: quarantineMetadata, payloads: quarantinePayloads } = quarantineExclusions;
   const quarantineRootInfo = quarantinePayloads.length ? archiveRootInfo(quarantineDir, { allowRootSymlink: true }) : null;
-  const quarantinePathIdentities = new Set();
-  const quarantineFileIdentities = new Set();
-  for (const payload of quarantinePayloads) {
-    quarantinePathIdentities.add(pathIdentityKey(payload.absolutePath));
-    try { quarantinePathIdentities.add(pathIdentityKey(fs.realpathSync(payload.absolutePath))); } catch {}
-    const identity = fileIdentity(fs.lstatSync(payload.absolutePath, { bigint: true }));
-    if (identity) quarantineFileIdentities.add(identity);
-  }
-  const isQuarantinePayloadPath = (candidatePath, stat) => {
-    const identity = fileIdentity(stat);
-    if (identity && quarantineFileIdentities.has(identity)) return true;
-    if (quarantinePathIdentities.has(pathIdentityKey(candidatePath))) return true;
-    try { return quarantinePathIdentities.has(pathIdentityKey(fs.realpathSync(candidatePath))); } catch { return false; }
-  };
 
   for (const name of fs.existsSync(dataDir) ? fs.readdirSync(dataDir) : []) {
     if (name.toLowerCase() === "quarantine.json") continue;
@@ -303,7 +397,7 @@ async function collectBackupFiles(options = {}) {
     if (stat.isFile() && (
       name.endsWith(".json") ||
       name === "README.md"
-    ) && !isQuarantinePayloadPath(absolutePath, stat)) {
+    ) && !quarantineExclusions.isPayloadPath(absolutePath, stat)) {
       files.push({ absolutePath, entryPath, size: Number(stat.size), archiveRoot: dataRootInfo, sourceStat: stat });
     }
   }
@@ -331,31 +425,41 @@ async function collectBackupFiles(options = {}) {
 
   if (isDbEnabled()) {
     const snapshotPath = options.sqliteSnapshotPath;
-    if (snapshotPath && fs.existsSync(snapshotPath)) {
-      const sourceStat = fs.lstatSync(snapshotPath, { bigint: true });
-      if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("SQLite backup snapshot is not a regular file");
-      files.push({ absolutePath: snapshotPath, entryPath: "data/rootark.sqlite", size: Number(sourceStat.size), archiveRoot: dataRootInfo, sourceStat });
-    }
+    if (!snapshotPath || !fs.existsSync(snapshotPath)) throw new Error("SQLite database snapshot is required for backup");
+    const sourceStat = fs.lstatSync(snapshotPath, { bigint: true });
+    if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("SQLite backup snapshot is not a regular file");
+    files.push({ absolutePath: snapshotPath, entryPath: "data/rootark.sqlite", size: Number(sourceStat.size), archiveRoot: dataRootInfo, sourceStat });
+  } else if (options.sqliteSnapshotPath) {
+    throw new Error("SQLite database snapshot cannot be included in a JSON backup");
   }
 
   if (includeUploads) {
-    files.push(...collectFilesRecursive(resolveRuntimePath("uploads"), "uploads", { excludePaths: [quarantineDir], excludeFileIdentities: quarantineFileIdentities }));
+    files.push(...collectFilesRecursive(resolveRuntimePath("uploads"), "uploads", { excludePredicate: quarantineExclusions.isExcludedPath, excludeNamePrefixes: [".rootark-cloud-cache-"] }));
   }
 
   if (includeTemp || includePending) {
-    files.push(...collectFilesRecursive(resolveRuntimePath("temp"), "temp", { excludePaths: [quarantineDir], excludeFileIdentities: quarantineFileIdentities }));
+    files.push(...collectFilesRecursive(resolveRuntimePath("temp"), "temp", { excludePredicate: quarantineExclusions.isExcludedPath, excludeNamePrefixes: [".rootark-cloud-cache-"] }));
   }
 
-  const syncFile = files.find((file) => file.entryPath === "data/sync-objects.json");
+  const unsuppressedFiles = files.filter((file) => {
+    const parts = file.entryPath.split("/");
+    const area = parts.shift();
+    if (!["uploads", "temp"].includes(area)) return true;
+    const name = parts.pop();
+    const folderId = parts.pop() || "root";
+    return parts.length > 0 || !restoreProviderOrphans.isSuppressed(folderId, name, area, suppressionSnapshot);
+  });
+
+  const syncFile = unsuppressedFiles.find((file) => file.entryPath === "data/sync-objects.json");
   if (syncFile) attestCiphertextOnlyFile(syncFile.absolutePath);
 
-  if (!cloudStorage?.enabled()) return files.sort((a, b) => a.entryPath.localeCompare(b.entryPath));
+  if (!cloudStorage?.enabled()) return unsuppressedFiles.sort((a, b) => a.entryPath.localeCompare(b.entryPath));
 
   const stageDir = options.stageDir;
   if (!stageDir) throw new Error("Cloud backup staging is required");
   const known = new Map();
   const collisions = new Map();
-  for (const file of files) {
+  for (const file of unsuppressedFiles) {
     const key = collisionKey(file.entryPath);
     if (collisions.has(key) && collisions.get(key) !== file.entryPath) throw new Error("Backup entry collision");
     collisions.set(key, file.entryPath);
@@ -376,6 +480,7 @@ async function collectBackupFiles(options = {}) {
     if (!folderId || folderId === "." || folderId === ".." || /[\\\\/]/.test(folderId)) throw new Error("Cloud backup inventory contains an unsafe folder");
     if (!name || name !== path.basename(name) || /[\\/]/.test(name) || isSensitivePath(`${remote.area}/${folderId}/${name}`)) throw new Error("Cloud backup inventory contains an unsafe path");
     const entryPath = normalizeEntryPath(path.posix.join(remote.area, folderId === "root" ? "" : folderId, name));
+    if (restoreProviderOrphans.isSuppressed(folderId, name, remote.area, suppressionSnapshot)) continue;
     const key = collisionKey(entryPath);
     if (collisions.has(key) && collisions.get(key) !== entryPath) throw new Error("Backup entry collision");
     collisions.set(key, entryPath);
@@ -398,8 +503,12 @@ async function collectBackupFiles(options = {}) {
   return [...known.values()].sort((a, b) => a.entryPath.localeCompare(b.entryPath));
 }
 
-async function createSqliteSnapshot() {
-  if (!isDbEnabled() || !fs.existsSync(getDatabasePath())) return null;
+async function createSqliteSnapshot(persistenceMode = isDbEnabled() ? "sqlite" : "json") {
+  if (persistenceMode !== (isDbEnabled() ? "sqlite" : "json")) {
+    throw new Error("Persistence mode changed while creating backup");
+  }
+  if (persistenceMode === "json") return null;
+  if (!fs.existsSync(getDatabasePath())) throw new Error("SQLite database is missing; backup cannot be created");
   const stageDir = resolveRuntimePath("data", `.sqlite-backup-${crypto.randomUUID()}`);
   const snapshotPath = path.join(stageDir, "rootark.sqlite");
   fs.mkdirSync(stageDir, { recursive: true });
@@ -443,18 +552,33 @@ function sameRuntimeRoot(left, right) {
   return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
+function lockOwnerInstanceId() {
+  return String(process.env.ROOTARK_INSTANCE_ID || process.env.HOSTNAME || process.env.COMPUTERNAME || os.hostname() || "default").trim();
+}
+
 function ownerIsLive(record) {
-  if (!Number.isInteger(record?.pid) || record.pid <= 0) return false;
-  try { process.kill(record.pid, 0); } catch (error) { return error.code === "EPERM"; }
-  if (record.processStartIdentity && processStartIdentity(record.pid)) {
-    return record.processStartIdentity === processStartIdentity(record.pid);
+  if (!Number.isInteger(record?.pid) || record.pid <= 0) return true;
+  const hasVersionedOwner = record.formatVersion === OPERATION_LOCK_FORMAT_VERSION || record.version === OPERATION_LOCK_FORMAT_VERSION;
+  if (hasVersionedOwner && (!record.instanceId || record.instanceId !== lockOwnerInstanceId())) return true;
+  const owner = record.ownerIdentity;
+  const requiredIdentity = ["hostId", "bootId", "pidNamespaceId"];
+  if (!owner || requiredIdentity.some((key) => typeof owner[key] !== "string" || !owner[key]) ||
+      requiredIdentity.some((key) => typeof CURRENT_PROCESS_IDENTITY[key] !== "string" || !CURRENT_PROCESS_IDENTITY[key])) return true;
+  if (owner.hostId !== CURRENT_PROCESS_IDENTITY.hostId || owner.bootId !== CURRENT_PROCESS_IDENTITY.bootId || owner.pidNamespaceId !== CURRENT_PROCESS_IDENTITY.pidNamespaceId) return true;
+  try {
+    process.kill(record.pid, 0);
+  } catch (error) {
+    return error.code === "ESRCH" ? false : true;
   }
-  return true;
+  const currentStartIdentity = processStartIdentity(record.pid, CURRENT_PROCESS_IDENTITY.pidNamespaceId);
+  if (typeof owner.processStartIdentity !== "string" || !owner.processStartIdentity || !currentStartIdentity) return true;
+  return owner.processStartIdentity === currentStartIdentity;
 }
 
 function validLockRecord(record) {
   if (!record || typeof record !== "object") return false;
   if (!Number.isInteger(record.pid) || record.pid <= 0) return false;
+  if (record.processInstanceId !== undefined && (typeof record.processInstanceId !== "string" || !record.processInstanceId)) return false;
   if (record.formatVersion === OPERATION_LOCK_FORMAT_VERSION) {
     return typeof record.token === "string" && Boolean(record.token) && typeof record.operation === "string" && Boolean(record.operation) && typeof record.startedAt === "string" && Number.isFinite(Date.parse(record.startedAt)) && typeof record.runtimeRoot === "string" && Boolean(record.runtimeRoot);
   }
@@ -468,46 +592,83 @@ function lockError(code, message) {
 }
 
 function readLockState() {
-  let stat;
-  try { stat = fs.statSync(LOCK_FILE); } catch (error) {
+  let snapshot;
+  try { snapshot = readFileSnapshot(LOCK_FILE, "utf8"); } catch (error) {
     if (error.code === "ENOENT") return { kind: "missing" };
     throw error;
   }
-  let contents = "";
-  try {
-    contents = fs.readFileSync(LOCK_FILE, "utf8");
-    const record = JSON.parse(contents);
-    if (!validLockRecord(record)) return { kind: "malformed", mtimeMs: stat.mtimeMs, contents, stat };
-    if (record.runtimeRoot && !sameRuntimeRoot(record.runtimeRoot, runtimeRootIdentity())) return { kind: "mismatch", record };
-    const createdAtMs = Date.parse(record.startedAt || "");
-    const ageMs = Math.max(Date.now() - stat.mtimeMs, Number.isFinite(createdAtMs) ? Date.now() - createdAtMs : 0);
-    const live = ownerIsLive(record);
-    const staleMs = boundedLockDuration("BACKUP_LOCK_STALE_MS", 6 * 60 * 60 * 1000);
-    return { kind: "valid", record, contents, stat, ageMs, live, stale: !live && (record.formatVersion === OPERATION_LOCK_FORMAT_VERSION || ageMs >= staleMs) };
-  } catch {
-    return { kind: "malformed", mtimeMs: stat.mtimeMs, contents, stat };
-  }
+  const { stat, contents } = snapshot;
+  if (!snapshot.stable) return { kind: "malformed", mtimeMs: Number(stat.mtimeMs), contents, stat };
+  let record;
+  try { record = JSON.parse(contents); } catch { return { kind: "malformed", mtimeMs: Number(stat.mtimeMs), contents, stat }; }
+  if (!validLockRecord(record)) return { kind: "malformed", mtimeMs: Number(stat.mtimeMs), contents, stat };
+  if (record.runtimeRoot && !sameRuntimeRoot(record.runtimeRoot, runtimeRootIdentity())) return { kind: "mismatch", record };
+  const createdAtMs = Date.parse(record.startedAt || "");
+  const ageMs = Math.max(Date.now() - Number(stat.mtimeMs), Number.isFinite(createdAtMs) ? Date.now() - createdAtMs : 0);
+  const live = ownerIsLive(record);
+  const staleMs = boundedLockDuration("BACKUP_LOCK_STALE_MS", 6 * 60 * 60 * 1000);
+  return { kind: "valid", record, contents, stat, mtimeMs: Number(stat.mtimeMs), ageMs, live, stale: !live && (record.formatVersion === OPERATION_LOCK_FORMAT_VERSION || ageMs >= staleMs) };
 }
 
 function statIdentity(stat) {
   return stat ? {
-    dev: stat.dev,
-    ino: stat.ino,
-    size: stat.size,
-    mtimeMs: stat.mtimeMs,
-    ctimeMs: stat.ctimeMs,
-    birthtimeMs: stat.birthtimeMs,
+    dev: typeof stat.dev === "bigint" ? stat.dev.toString() : stat.dev,
+    ino: typeof stat.ino === "bigint" ? stat.ino.toString() : stat.ino,
+    size: typeof stat.size === "bigint" ? Number(stat.size) : stat.size,
+    mtimeMs: typeof stat.mtimeMs === "bigint" ? Number(stat.mtimeMs) : stat.mtimeMs,
+    ctimeMs: typeof stat.ctimeMs === "bigint" ? Number(stat.ctimeMs) : stat.ctimeMs,
+    birthtimeMs: typeof stat.birthtimeMs === "bigint" ? Number(stat.birthtimeMs) : stat.birthtimeMs,
   } : null;
+}
+
+function exactFileId(value) {
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "string" && /^(0|[1-9]\d*)$/.test(value)) return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return String(value);
+  return null;
+}
+
+function sameFileIdentity(left, right) {
+  if (!left || !right) return false;
+  const leftDev = exactFileId(left.dev);
+  const leftIno = exactFileId(left.ino);
+  return leftDev !== null && leftIno !== null && leftDev === exactFileId(right.dev) && leftIno === exactFileId(right.ino)
+    && (left.birthtimeMs === right.birthtimeMs || left.ctimeMs === right.ctimeMs);
 }
 
 function sameStatIdentity(left, right) {
   if (!left || !right) return false;
-  return ["dev", "ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"].every((key) => left[key] === right[key]);
+  return exactFileId(left.dev) !== null && exactFileId(left.ino) !== null
+    && exactFileId(left.dev) === exactFileId(right.dev) && exactFileId(left.ino) === exactFileId(right.ino)
+    && ["size", "mtimeMs", "ctimeMs", "birthtimeMs"].every((key) => left[key] === right[key]);
 }
 
 function sameRenamedFileIdentity(left, right) {
   if (!left || !right) return false;
-  return ["dev", "ino", "size", "mtimeMs", "birthtimeMs"].every((key) => left[key] === right[key]);
+  return exactFileId(left.dev) !== null && exactFileId(left.ino) !== null
+    && exactFileId(left.dev) === exactFileId(right.dev) && exactFileId(left.ino) === exactFileId(right.ino)
+    && ["size", "mtimeMs", "birthtimeMs"].every((key) => left[key] === right[key]);
+}
+
+function readFileSnapshot(filePath, encoding) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+    const openedStat = fs.fstatSync(fd, { bigint: true });
+    if (!openedStat.isFile()) return { stat: openedStat, contents: "", stable: false };
+    let pathStat;
+    try { pathStat = fs.lstatSync(filePath, { bigint: true }); } catch { return { stat: openedStat, contents: "", stable: false }; }
+    if (!pathStat.isFile() || pathStat.isSymbolicLink() || !sameFileIdentity(pathStat, openedStat)) return { stat: openedStat, contents: "", stable: false };
+    let contents;
+    try { contents = fs.readFileSync(fd, encoding); } catch { return { stat: openedStat, contents: "", stable: false }; }
+    const finalStat = fs.fstatSync(fd, { bigint: true });
+    let finalPathStat;
+    try { finalPathStat = fs.lstatSync(filePath, { bigint: true }); } catch { return { stat: finalStat, contents, stable: false }; }
+    const pathStillMatches = finalPathStat.isFile() && !finalPathStat.isSymbolicLink() && sameFileIdentity(finalStat, finalPathStat);
+    return { stat: finalStat, contents, stable: pathStillMatches && sameStatIdentity(statIdentity(openedStat), statIdentity(finalStat)) };
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+  }
 }
 
 function lockObservation(state) {
@@ -530,38 +691,46 @@ function authorityPathIsSafe(target) {
   return path.dirname(path.resolve(target)) === path.resolve(BACKUPS_DIR) && path.basename(target) === path.basename(LOCK_TAKEOVER_DIR);
 }
 
+function validTakeoverToken(token) {
+  return typeof token === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token);
+}
+
 function validTakeoverAuthority(record) {
-  return record && record.version === OPERATION_LOCK_FORMAT_VERSION && typeof record.token === "string" && record.token && Number.isInteger(record.pid) && record.pid > 0 && typeof record.claimedAt === "string" && Number.isFinite(Date.parse(record.claimedAt)) && typeof record.runtimeRoot === "string" && sameRuntimeRoot(record.runtimeRoot, runtimeRootIdentity()) && record.lockPath === LOCK_FILE && record.evidencePath === LOCK_TAKEOVER_EVIDENCE && record.observed && typeof record.observed.sha256 === "string" && Number.isInteger(record.observed.size) && record.observed.stat;
+  return record && record.version === OPERATION_LOCK_FORMAT_VERSION && validTakeoverToken(record.token) && Number.isInteger(record.pid) && record.pid > 0 && (record.processInstanceId === undefined || (typeof record.processInstanceId === "string" && Boolean(record.processInstanceId))) && typeof record.instanceId === "string" && Boolean(record.instanceId) && typeof record.claimedAt === "string" && Number.isFinite(Date.parse(record.claimedAt)) && typeof record.runtimeRoot === "string" && sameRuntimeRoot(record.runtimeRoot, runtimeRootIdentity()) && record.lockPath === LOCK_FILE && record.evidencePath === LOCK_TAKEOVER_EVIDENCE && record.observed && typeof record.observed.sha256 === "string" && Number.isInteger(record.observed.size) && record.observed.stat;
 }
 
 function readTakeoverAuthority() {
   let stat;
   try {
-    const link = fs.lstatSync(LOCK_TAKEOVER_DIR);
+    const link = fs.lstatSync(LOCK_TAKEOVER_DIR, { bigint: true });
     if (!link.isDirectory() || link.isSymbolicLink() || !authorityPathIsSafe(LOCK_TAKEOVER_DIR)) return { kind: "ambiguous" };
     stat = link;
   } catch (error) {
     if (error.code === "ENOENT") return { kind: "missing" };
     throw error;
   }
+  let snapshot;
+  try { snapshot = readFileSnapshot(LOCK_TAKEOVER_META, "utf8"); } catch { return { kind: "malformed", mtimeMs: Number(stat.mtimeMs) }; }
+  if (!snapshot.stable) return { kind: "ambiguous" };
+  let currentDirectory;
+  try { currentDirectory = fs.lstatSync(LOCK_TAKEOVER_DIR, { bigint: true }); } catch { return { kind: "ambiguous" }; }
+  if (!currentDirectory.isDirectory() || currentDirectory.isSymbolicLink() || !sameFileIdentity(stat, currentDirectory)) return { kind: "ambiguous" };
   let record;
-  try { record = JSON.parse(fs.readFileSync(LOCK_TAKEOVER_META, "utf8")); } catch { return { kind: "malformed", mtimeMs: stat.mtimeMs }; }
+  try { record = JSON.parse(snapshot.contents); } catch { return { kind: "malformed", mtimeMs: Number(stat.mtimeMs) }; }
   if (!validTakeoverAuthority(record)) return { kind: "mismatch", record };
-  const ageMs = Math.max(Date.now() - stat.mtimeMs, Date.now() - Date.parse(record.claimedAt));
+  const ageMs = Math.max(Date.now() - Number(stat.mtimeMs), Date.now() - Date.parse(record.claimedAt));
   return { kind: "valid", record, live: ownerIsLive(record), stale: ageMs > MAX_LOCK_TTL_MS };
 }
 
-function evidenceMatchesAuthority(record) {
-  let stat;
-  let bytes;
+function evidenceMatchesAuthority(record, evidencePath = LOCK_TAKEOVER_EVIDENCE) {
+  let snapshot;
   try {
-    const link = fs.lstatSync(LOCK_TAKEOVER_EVIDENCE);
-    if (!link.isFile() || link.isSymbolicLink()) return false;
-    stat = link;
-    bytes = fs.readFileSync(LOCK_TAKEOVER_EVIDENCE);
+    snapshot = readFileSnapshot(evidencePath);
   } catch (error) {
-    return error.code === "ENOENT";
+    return evidencePath === LOCK_TAKEOVER_EVIDENCE && error.code === "ENOENT";
   }
+  if (!snapshot.stable) return false;
+  const { stat, contents: bytes } = snapshot;
   return crypto.createHash("sha256").update(bytes).digest("hex") === record.observed.sha256 && bytes.length === record.observed.size && sameRenamedFileIdentity(statIdentity(stat), record.observed.stat);
 }
 
@@ -569,8 +738,29 @@ function removeTakeoverAuthority(token) {
   const state = readTakeoverAuthority();
   if (state.kind === "missing") return;
   if (state.kind !== "valid" || state.record.token !== token) throw lockError("BACKUP_LOCKED", "Evidence de takeover de lock ambigua");
-  if (!evidenceMatchesAuthority(state.record)) throw lockError("BACKUP_LOCKED", "Evidence de takeover de lock ambigua");
-  try { fs.rmSync(LOCK_TAKEOVER_EVIDENCE, { force: false }); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  const authorityName = path.basename(LOCK_TAKEOVER_META);
+  const evidenceName = path.basename(LOCK_TAKEOVER_EVIDENCE);
+  const cleanupPrefix = `.evidence-cleanup-${token}-`;
+  const entries = fs.readdirSync(LOCK_TAKEOVER_DIR);
+  const cleanupEntries = entries.filter((entry) => entry.startsWith(cleanupPrefix));
+  if (cleanupEntries.length > 1 || entries.some((entry) => entry !== authorityName && entry !== evidenceName && !cleanupEntries.includes(entry))) {
+    throw lockError("BACKUP_LOCKED", "Evidence de takeover de lock ambigua");
+  }
+  let cleanupPath;
+  if (cleanupEntries.length) {
+    if (entries.includes(evidenceName)) throw lockError("BACKUP_LOCKED", "Evidence de takeover de lock ambigua");
+    cleanupPath = path.join(LOCK_TAKEOVER_DIR, cleanupEntries[0]);
+    if (!evidenceMatchesAuthority(state.record, cleanupPath)) throw lockError("BACKUP_LOCKED", "Evidence de takeover de lock ambigua");
+    fs.rmSync(cleanupPath, { force: false });
+  } else if (entries.includes(evidenceName)) {
+    cleanupPath = path.join(LOCK_TAKEOVER_DIR, `${cleanupPrefix}${crypto.randomUUID()}`);
+    try { fs.renameSync(LOCK_TAKEOVER_EVIDENCE, cleanupPath); } catch (error) { if (error.code !== "ENOENT") throw error; cleanupPath = undefined; }
+    if (cleanupPath) {
+      if (!evidenceMatchesAuthority(state.record, cleanupPath)) throw lockError("BACKUP_LOCKED", "Evidence de takeover de lock ambigua");
+      fs.rmSync(cleanupPath, { force: false });
+    }
+  }
+  if (fs.readdirSync(LOCK_TAKEOVER_DIR).some((entry) => entry !== authorityName)) throw lockError("BACKUP_LOCKED", "Evidence de takeover de lock ambigua");
   try { fs.rmSync(LOCK_TAKEOVER_META, { force: false }); } catch (error) { if (error.code !== "ENOENT") throw error; }
   try { fs.rmdirSync(LOCK_TAKEOVER_DIR); } catch (error) { if (error.code !== "ENOENT") throw error; }
 }
@@ -579,13 +769,7 @@ function recoverTakeoverAuthority() {
   const state = readTakeoverAuthority();
   if (state.kind === "missing") return;
   if (state.kind === "valid" && state.live) throw lockError("BACKUP_LOCKED", "Reivindicacao de takeover de lock de backup em andamento");
-  if (state.kind === "malformed") {
-    if (Date.now() - state.mtimeMs <= boundedLockDuration("BACKUP_LOCK_MALFORMED_TTL_MS", MALFORMED_TAKEOVER_TTL_MS)) throw lockError("BACKUP_LOCKED", "Autoridade de takeover de lock recente e invalida");
-    const entries = fs.readdirSync(LOCK_TAKEOVER_DIR);
-    if (entries.length) throw lockError("BACKUP_LOCKED", "Autoridade de takeover de lock ambigua");
-    fs.rmdirSync(LOCK_TAKEOVER_DIR);
-    return;
-  }
+  if (state.kind === "malformed") throw lockError("BACKUP_LOCKED", "Autoridade de takeover de lock invalida");
   if (state.kind !== "valid") throw lockError("BACKUP_LOCKED", "Autoridade de takeover de lock ambigua");
   removeTakeoverAuthority(state.record.token);
 }
@@ -598,17 +782,19 @@ function acquireTakeoverAuthority(observed, operation) {
     token,
     operation,
     pid: process.pid,
-    processStartIdentity: CURRENT_PROCESS_START_IDENTITY,
+    processInstanceId: CURRENT_PROCESS_INSTANCE_ID,
+    instanceId: lockOwnerInstanceId(),
+    ownerIdentity: CURRENT_PROCESS_IDENTITY,
     claimedAt: new Date().toISOString(),
     runtimeRoot: runtimeRootIdentity(),
     lockPath: LOCK_FILE,
     evidencePath: LOCK_TAKEOVER_EVIDENCE,
     observed: takeoverObservation(observed),
   };
-  try { fs.mkdirSync(LOCK_TAKEOVER_DIR, { recursive: false }); } catch (error) {
+  try { fs.mkdirSync(LOCK_TAKEOVER_DIR, { recursive: false, mode: 0o700 }); } catch (error) {
     if (error.code !== "EEXIST") throw error;
     recoverTakeoverAuthority();
-    fs.mkdirSync(LOCK_TAKEOVER_DIR, { recursive: false });
+    fs.mkdirSync(LOCK_TAKEOVER_DIR, { recursive: false, mode: 0o700 });
   }
   try {
     writeDurableFile(LOCK_TAKEOVER_META, JSON.stringify(authority));
@@ -643,12 +829,30 @@ function writeDurableFile(filePath, contents) {
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;
-    fs.renameSync(temporary, filePath);
+    renameSyncWithWindowsEpermRetry(temporary, filePath);
+    syncDirectory(path.dirname(filePath));
   } catch (error) {
     try { if (fd !== undefined) fs.closeSync(fd); } catch {}
     try { fs.rmSync(temporary, { force: true }); } catch {}
     throw error;
   }
+}
+
+function syncDirectory(directory) {
+  // Windows Node does not expose a supported parent-directory fsync path; directory-entry power-loss durability remains platform-dependent there.
+  if (process.platform === "win32") return;
+  const fd = fs.openSync(directory, "r");
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+}
+
+function renameDurably(source, destination) {
+  fs.renameSync(source, destination);
+  syncDirectory(path.dirname(destination));
+}
+
+function removeDurably(target, options = { force: false }) {
+  fs.rmSync(target, options);
+  syncDirectory(path.dirname(target));
 }
 
 function lockRecord(operation, token, claimToken = null) {
@@ -657,29 +861,30 @@ function lockRecord(operation, token, claimToken = null) {
     token,
     operation,
     pid: process.pid,
-    processStartIdentity: CURRENT_PROCESS_START_IDENTITY,
+    processInstanceId: CURRENT_PROCESS_INSTANCE_ID,
+    instanceId: lockOwnerInstanceId(),
+    ownerIdentity: CURRENT_PROCESS_IDENTITY,
     startedAt: new Date().toISOString(),
     runtimeRoot: runtimeRootIdentity(),
     takeoverClaimToken: claimToken,
   };
 }
 
-function cleanupOwnedIncompleteLock(descriptorStat, token) {
+function failClosedLockDescriptor(fd) {
+  if (fd === undefined) return;
   try {
-    const currentStat = fs.statSync(LOCK_FILE);
-    const contents = fs.readFileSync(LOCK_FILE, "utf8");
-    const sameFile = descriptorStat && currentStat.dev === descriptorStat.dev && currentStat.ino === descriptorStat.ino && (currentStat.birthtimeMs === descriptorStat.birthtimeMs || currentStat.ctimeMs === descriptorStat.ctimeMs);
-    if (sameFile && contents.includes(`"token":"${token}"`)) fs.rmSync(LOCK_FILE, { force: false });
+    fs.ftruncateSync(fd, 0);
+    const expiredAt = new Date(0);
+    fs.futimesSync(fd, expiredAt, expiredAt);
+    fs.fsyncSync(fd);
   } catch {}
 }
 
 function writeLock(operation, token = crypto.randomUUID(), claimToken = null) {
   const record = lockRecord(operation, token, claimToken);
   let fd;
-  let descriptorStat;
   try {
     fd = fs.openSync(LOCK_FILE, "wx");
-    descriptorStat = fs.fstatSync(fd);
     const contents = Buffer.from(JSON.stringify(record));
     let offset = 0;
     while (offset < contents.length) {
@@ -692,8 +897,9 @@ function writeLock(operation, token = crypto.randomUUID(), claimToken = null) {
     fd = undefined;
     return token;
   } catch (error) {
+    failClosedLockDescriptor(fd);
     try { if (fd !== undefined) fs.closeSync(fd); } catch {}
-    cleanupOwnedIncompleteLock(descriptorStat, token);
+    // Keep partial records fail-closed; ambiguous ownership requires operator recovery.
     throw error;
   }
 }
@@ -722,7 +928,7 @@ function acquireLock(operation) {
     const state = readLockState();
     if (state.kind === "mismatch") throw lockError("BACKUP_LOCKED", "Lock de backup pertence a outra raiz de runtime");
     if (state.kind === "valid" && !state.stale) throw lockError("BACKUP_LOCKED", "Outra operacao de backup/restauracao esta em andamento");
-    if (state.kind === "malformed" && Date.now() - state.mtimeMs <= boundedLockDuration("BACKUP_LOCK_MALFORMED_TTL_MS", MALFORMED_LOCK_TTL_MS)) throw lockError("BACKUP_LOCKED", "Lock de backup recente e invalido");
+    if (state.kind === "malformed") throw lockError("BACKUP_LOCKED", "Lock de backup invalido");
 
     if (state.kind === "missing") {
       try {
@@ -932,7 +1138,15 @@ function validRetentionTransaction(transaction) {
 
 function persistRetentionTransaction(transaction) {
   const transactionPath = retentionTransactionPath(transaction.transactionId);
-  fs.mkdirSync(path.dirname(transactionPath), { recursive: true });
+  const transactionDirectory = path.dirname(transactionPath);
+  for (const [directory, parent] of [[RETENTION_TRANSACTIONS_DIR, BACKUPS_DIR], [transactionDirectory, RETENTION_TRANSACTIONS_DIR]]) {
+    try {
+      fs.mkdirSync(directory);
+      syncDirectory(parent);
+    } catch (error) {
+      if (error.code !== "EEXIST" || !fs.statSync(directory).isDirectory()) throw error;
+    }
+  }
   writeDurableFile(transactionPath, JSON.stringify(transaction));
   return transactionPath;
 }
@@ -945,7 +1159,7 @@ function listRetentionTransactions() {
     if (!name.startsWith("tx-") || !fs.statSync(directory).isDirectory()) throw new Error("Malformed retention transaction directory");
     const transactionPath = path.join(directory, "transaction.json");
     if (!fs.existsSync(transactionPath)) {
-      if (fs.readdirSync(directory).length === 0) { fs.rmSync(directory, { recursive: true, force: false }); continue; }
+      if (fs.readdirSync(directory).length === 0) { removeDurably(directory, { recursive: true, force: false }); continue; }
       throw new Error("Retention transaction metadata is missing");
     }
     let transaction;
@@ -964,8 +1178,8 @@ function listRetentionTransactions() {
 }
 
 function removeRetentionTransaction(record) {
-  fs.rmSync(record.transactionPath, { force: false });
-  fs.rmSync(record.directory, { recursive: true, force: false });
+  removeDurably(record.transactionPath, { force: false });
+  removeDurably(record.directory, { recursive: true, force: false });
 }
 
 function sameArchiveBytes(left, right) {
@@ -990,24 +1204,24 @@ function recoverRetentionTransactions() {
 
     if (transaction.phase === "prepared" || transaction.phase === "archive_moved") {
       if (history.length === 1) {
-        if (originalExists && tombstoneExists) fs.rmSync(tombstone, { force: false });
-        else if (!originalExists && tombstoneExists) fs.renameSync(tombstone, original);
+        if (originalExists && tombstoneExists) removeDurably(tombstone, { force: false });
+        else if (!originalExists && tombstoneExists) renameDurably(tombstone, original);
         else if (!originalExists) throw new Error("Retention history points to a missing archive");
         if (awaitableChecksum(original, transaction.checksum) === false) throw new Error("Retention archive checksum mismatch");
         removeRetentionTransaction(record);
         continue;
       }
       if (transaction.phase === "prepared") throw new Error("Prepared retention transaction lost repository history");
-      if (originalExists && tombstoneExists) { fs.rmSync(original, { force: false }); fs.rmSync(tombstone, { force: false }); }
-      else if (tombstoneExists) fs.rmSync(tombstone, { force: false });
+      if (originalExists && tombstoneExists) { removeDurably(original, { force: false }); removeDurably(tombstone, { force: false }); }
+      else if (tombstoneExists) removeDurably(tombstone, { force: false });
       else if (originalExists) throw new Error("Retention cleanup found an unowned archive");
       removeRetentionTransaction(record);
       continue;
     }
 
     if (history.length > 0) throw new Error("Retention history survived repository-delete phase");
-    if (originalExists && tombstoneExists) { fs.rmSync(original, { force: false }); fs.rmSync(tombstone, { force: false }); }
-    else if (tombstoneExists) fs.rmSync(tombstone, { force: false });
+    if (originalExists && tombstoneExists) { removeDurably(original, { force: false }); removeDurably(tombstone, { force: false }); }
+    else if (tombstoneExists) removeDurably(tombstone, { force: false });
     else if (originalExists) throw new Error("Retention cleanup found an unowned archive");
     removeRetentionTransaction(record);
   }
@@ -1049,16 +1263,16 @@ function recoverLegacyRetentionTombstones() {
     if (matches.length > 1) throw new Error("Ambiguous retention tombstone history");
     if (fs.existsSync(original)) {
       if (matches.length === 0 || (matches[0].checksum && matches[0].checksum !== metadata.checksum) || (metadata.checksum && matches[0].checksum !== metadata.checksum)) throw new Error("Conflicting retention archive evidence");
-      if (sameArchiveBytes(original, tombstone)) { fs.rmSync(tombstone, { force: false }); fs.rmSync(metadataPath, { force: false }); }
+      if (sameArchiveBytes(original, tombstone)) { removeDurably(tombstone, { force: false }); removeDurably(metadataPath, { force: false }); }
       else throw new Error("Conflicting retention archive bytes");
     } else if (matches.length === 1) {
       if (metadata.checksum !== null && metadata.checksum !== undefined && matches[0].checksum !== metadata.checksum) throw new Error("Retention checksum mismatch");
       if (matches[0].checksum && !metadata.checksum) throw new Error("Retention checksum evidence missing");
-      fs.renameSync(tombstone, original);
-      fs.rmSync(metadataPath, { force: false });
+      renameDurably(tombstone, original);
+      removeDurably(metadataPath, { force: false });
     } else {
-      fs.rmSync(tombstone, { force: false });
-      fs.rmSync(metadataPath, { force: false });
+      removeDurably(tombstone, { force: false });
+      removeDurably(metadataPath, { force: false });
     }
   }
 }
@@ -1068,15 +1282,93 @@ function recoverRetentionTombstones() {
   recoverLegacyRetentionTombstones();
 }
 
+function cleanupOrphanCloudBackupStages() {
+  const stageRoot = path.join(BACKUPS_DIR, ".cloud-stage");
+  let rootStat;
+  try { rootStat = fs.lstatSync(stageRoot); }
+  catch (error) { if (error.code === "ENOENT") return false; throw error; }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error("Backup cloud staging directory is unsafe");
+  const backupsReal = fs.realpathSync(BACKUPS_DIR);
+  const stageRootReal = fs.realpathSync(stageRoot);
+  if (!isPathWithin(backupsReal, stageRootReal) || stageRootReal === backupsReal) throw new Error("Backup cloud staging directory escaped its boundary");
+
+  for (const name of fs.readdirSync(stageRoot)) {
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(name)) {
+      throw new Error("Backup cloud staging contains an unrecognized entry");
+    }
+    const stagePath = path.resolve(stageRoot, name);
+    if (path.dirname(stagePath) !== path.resolve(stageRoot)) throw new Error("Backup cloud staging entry escaped its boundary");
+    const stageStat = fs.lstatSync(stagePath);
+    if (stageStat.isSymbolicLink() || !stageStat.isDirectory()) throw new Error("Backup cloud staging entry is unsafe");
+    const stageReal = fs.realpathSync(stagePath);
+    if (!isPathWithin(stageRootReal, stageReal) || stageReal === stageRootReal) throw new Error("Backup cloud staging entry escaped its boundary");
+    removeDurably(stagePath, { recursive: true, force: false });
+  }
+
+  fs.rmdirSync(stageRoot);
+  syncDirectory(BACKUPS_DIR);
+  return true;
+}
+
+function cleanupOrphanSqliteBackupStages() {
+  const dataDir = resolveRuntimePath("data");
+  let names;
+  try { names = fs.readdirSync(dataDir); }
+  catch (error) { if (error.code === "ENOENT") return false; throw error; }
+  const stageNames = names.filter((name) => name.startsWith(SQLITE_BACKUP_STAGE_PREFIX));
+  if (stageNames.length > MAX_ORPHAN_SQLITE_BACKUP_STAGES) throw new Error("Too many SQLite backup staging directories require recovery");
+  if (!stageNames.length) return false;
+
+  const dataReal = fs.realpathSync(dataDir);
+  for (const name of stageNames) {
+    if (!/^\.sqlite-backup-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(name)) {
+      throw new Error("SQLite backup staging contains an unrecognized entry");
+    }
+    const stagePath = path.resolve(dataDir, name);
+    if (path.dirname(stagePath) !== path.resolve(dataDir)) throw new Error("SQLite backup staging entry escaped its boundary");
+    const stageStat = fs.lstatSync(stagePath);
+    if (stageStat.isSymbolicLink() || !stageStat.isDirectory()) throw new Error("SQLite backup staging directory is unsafe");
+    const stageReal = fs.realpathSync(stagePath);
+    if (!isPathWithin(dataReal, stageReal) || stageReal === dataReal) throw new Error("SQLite backup staging directory escaped its boundary");
+    for (const entry of fs.readdirSync(stagePath)) {
+      if (!SQLITE_BACKUP_STAGE_FILES.has(entry)) throw new Error("SQLite backup staging contains an unrecognized file");
+      const entryStat = fs.lstatSync(path.join(stagePath, entry));
+      if (entryStat.isSymbolicLink() || !entryStat.isFile()) throw new Error("SQLite backup staging contains an unsafe file");
+    }
+    removeDurably(stagePath, { recursive: true, force: false });
+  }
+  return true;
+}
+
+async function recoverRetentionAtStartup() {
+  const release = acquireLock("backup-history-recovery");
+  let inventoryLease = null;
+  try {
+    if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
+    inventoryLease = await restoreProviderOrphans.acquireInventoryLock();
+    recoverRetentionTombstones();
+    cleanupOrphanCloudBackupStages();
+    cleanupOrphanSqliteBackupStages();
+  } finally {
+    inventoryLease?.release();
+    release();
+  }
+}
+
 async function cleanupRetention(options = {}) {
   const release = options.lockHeld ? null : acquireLock("backup");
+  let inventoryLease = null;
   try {
+  if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
+  inventoryLease = await restoreProviderOrphans.acquireInventoryLock();
   const count = Math.max(0, Math.floor(envNumber("BACKUP_RETENTION_COUNT", 10)));
   const days = Math.max(0, Math.floor(envNumber("BACKUP_RETENTION_DAYS", 30)));
   const cutoff = days ? Date.now() - days * 24 * 60 * 60 * 1000 : null;
   recoverRetentionTombstones();
+  const inventory = restoreProviderOrphans.getInventoryStatus(cloudStorage);
+  const unresolvedBaselineId = inventory.state === "unknown" ? inventory.backupId : null;
   const backups = backupRepository.listBackups()
-    .filter((item) => item.status === "success" && item.type !== "pre-restore")
+    .filter((item) => item.status === "success" && item.type !== "pre-restore" && item.id !== unresolvedBaselineId)
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt) || String(b.id).localeCompare(String(a.id)));
 
   const toDelete = backups.filter((item, index) => (count > 0 && index >= count) || (cutoff && new Date(item.createdAt).getTime() < cutoff));
@@ -1088,24 +1380,26 @@ async function cleanupRetention(options = {}) {
     const transaction = { version: 1, transactionId, phase: "prepared", backupId: String(backup.id), filename: path.basename(archivePath), archivePath, tombstonePath: tombstone, checksum: await calculateFileHash(archivePath), createdAt: new Date().toISOString() };
     const record = { transaction, transactionPath: persistRetentionTransaction(transaction), directory: path.dirname(retentionTransactionPath(transactionId)) };
     try {
-      fs.renameSync(archivePath, tombstone);
+      renameDurably(archivePath, tombstone);
       transaction.phase = "archive_moved";
       persistRetentionTransaction(transaction);
-      backupRepository.deleteBackup(backup.id);
+      inventoryLease.renew();
+      backupRepository.deleteBackup(backup.id, { mutationLease: inventoryLease });
       transaction.phase = "history_removed";
       persistRetentionTransaction(transaction);
-      fs.rmSync(tombstone, { force: false });
+      removeDurably(tombstone, { force: false });
       transaction.phase = "cleanup_committed";
       persistRetentionTransaction(transaction);
       removeRetentionTransaction(record);
     } catch (error) {
       if (fs.existsSync(tombstone) && !fs.existsSync(archivePath) && backupRepository.getBackup(backup.id)) {
-        try { fs.renameSync(tombstone, archivePath); transaction.phase = "prepared"; persistRetentionTransaction(transaction); removeRetentionTransaction(record); } catch (rollbackError) { error.rollbackError = rollbackError; }
+        try { renameDurably(tombstone, archivePath); transaction.phase = "prepared"; persistRetentionTransaction(transaction); removeRetentionTransaction(record); } catch (rollbackError) { error.rollbackError = rollbackError; }
       }
       throw error;
     }
   }
   } finally {
+    inventoryLease?.release();
     if (release) release();
   }
 }
@@ -1115,9 +1409,12 @@ async function createBackup(options = {}) {
     throw new Error("Backups desativados por BACKUP_ENABLED=false");
   }
 
-  const release = acquireLock("backup");
+  const id = options.backupId == null ? crypto.randomUUID() : String(options.backupId);
+  if (!/^[a-f0-9-]{36}$/i.test(id)) {
+    throw Object.assign(new Error("Backup ID is invalid"), { code: "BACKUP_ID_INVALID" });
+  }
+  const release = options.lockHeld ? null : acquireLock("backup");
   const startedAt = Date.now();
-  const id = crypto.randomUUID();
   const createdAt = new Date().toISOString();
   const backupType = options.type || "manual";
   const filenameBase = `rootark-${backupType === "pre-restore" ? "pre-restore" : "backup"}-${timestampForName()}`;
@@ -1141,17 +1438,23 @@ async function createBackup(options = {}) {
   };
   let sqliteSnapshot = null;
   let saved = null;
+  let successEntry = null;
   let outcomeError = null;
 
   try {
-    sqliteSnapshot = await createSqliteSnapshot();
-    const collectionOptions = { stageDir, sqliteSnapshotPath: sqliteSnapshot?.snapshotPath };
+    if (options.backupId != null && backupRepository.getBackup(id)) {
+      throw Object.assign(new Error("Backup ID already exists"), { code: "BACKUP_ID_COLLISION" });
+    }
+    const persistenceMode = isDbEnabled() ? "sqlite" : "json";
+    sqliteSnapshot = await createSqliteSnapshot(persistenceMode);
+    const collectionOptions = { stageDir, sqliteSnapshotPath: sqliteSnapshot?.snapshotPath, persistenceMode, suppressionSnapshot: restoreProviderOrphans.createSnapshot() };
     const files = await collectBackupFiles(collectionOptions);
     const totalSize = files.reduce((sum, file) => sum + file.size, 0);
     const manifest = {
       backup_id: id,
       created_at: createdAt,
       type: backupType,
+      persistence_mode: persistenceMode,
       created_by: options.createdBy || null,
       total_size: totalSize,
       included_files: files.map((file) => ({ path: file.entryPath, size: file.size })),
@@ -1188,24 +1491,41 @@ async function createBackup(options = {}) {
     const durationMs = Date.now() - startedAt;
     const sizeBytes = fs.statSync(archivePath).size;
 
-    saved = backupRepository.saveBackup({
-      ...baseEntry,
-      status: "success",
-      finishedAt,
-      sizeBytes,
-      checksum,
-      metadata: {
-        ...baseEntry.metadata,
-        manifest: { ...manifest, duration_ms: durationMs },
-        includedFiles: files.length,
-        cloudComplete: Boolean(collectionOptions.cloudComplete),
-      },
-    });
+    const releaseSuppressionSnapshot = await restoreProviderOrphans.lockSnapshot(collectionOptions.suppressionSnapshot);
+    try {
+      successEntry = {
+        ...baseEntry,
+        status: "success",
+        finishedAt,
+        sizeBytes,
+        checksum,
+        metadata: {
+          ...baseEntry.metadata,
+          manifest: { ...manifest, duration_ms: durationMs },
+          includedFiles: files.length,
+          cloudComplete: Boolean(collectionOptions.cloudComplete),
+        },
+      };
+      saved = backupRepository.saveBackup(successEntry, { mutationLease: releaseSuppressionSnapshot.mutationLease });
+    } finally { releaseSuppressionSnapshot(); }
 
     await cleanupRetention({ lockHeld: true });
     return saved;
   } catch (error) {
     outcomeError = error;
+    if (error.code === "BACKUP_ID_COLLISION") throw error;
+    if (successEntry && (saved?.status === "success" || error.historyRenameVisible)) {
+      // Once a success row is visible, compensating cleanup could leave it
+      // pointing at a missing archive if later persistence also fails.
+      const historyDurable = saved?.status === "success";
+      error.backup = saved || successEntry;
+      error.backupHistoryState = historyDurable ? "durable" : "visible-durability-uncertain";
+      error.backupOperationState = historyDurable ? "created-post-processing-failed" : "created-history-durability-uncertain";
+      error.message = historyDurable
+        ? `Backup was created, but post-create processing failed: ${error.message}`
+        : `Backup history is visible, but its directory durability could not be confirmed: ${error.message}`;
+      throw error;
+    }
     let cleanupError = null;
     if (archiveCreated) {
       try { fs.rmSync(archivePath, { force: false }); } catch (cleanupFailure) { cleanupError = cleanupFailure; }
@@ -1225,21 +1545,44 @@ async function createBackup(options = {}) {
     if (cleanupError) error.archiveCleanupError = cleanupError;
     throw Object.assign(error, { backup: failed });
   } finally {
-    fs.rmSync(stageDir, { recursive: true, force: true });
+    const cleanupFailureCodes = [];
+    let postCreateCleanupError = null;
+    try { fs.rmSync(stageDir, { recursive: true, force: true }); }
+    catch { cleanupFailureCodes.push("BACKUP_STAGE_CLEANUP_FAILED"); }
     try { fs.rmdirSync(path.dirname(stageDir)); } catch {}
     if (sqliteSnapshot?.stageDir) {
       try { fs.rmSync(sqliteSnapshot.stageDir, { recursive: true, force: true }); }
-      catch (error) {
+      catch {
         const evidence = { code: "SQLITE_STAGE_CLEANUP_FAILED", message: "SQLite staging cleanup failed" };
+        cleanupFailureCodes.push(evidence.code);
         if (outcomeError) outcomeError.sqliteStageCleanupFailure = evidence;
         if (saved?.status === "success") {
           saved.metadata = { ...saved.metadata, sqliteStageCleanup: evidence };
-          try { backupRepository.saveBackup(saved); } catch (persistError) { outcomeError = outcomeError || persistError; }
+          try { backupRepository.saveBackup(saved); }
+          catch (persistError) {
+            cleanupFailureCodes.push(persistError.code || "BACKUP_HISTORY_CLEANUP_STATE_FAILED");
+            if (outcomeError) outcomeError.sqliteStageCleanupPersistenceFailure = { code: persistError.code || null };
+          }
         }
         console.error(`[backup] ${evidence.code}`);
       }
     }
-    release();
+    if (cleanupFailureCodes.length) {
+      const uniqueCleanupFailureCodes = [...new Set(cleanupFailureCodes)];
+      if (outcomeError) outcomeError.postCreateCleanupFailureCodes = uniqueCleanupFailureCodes;
+      else if (saved?.status === "success") {
+        postCreateCleanupError = Object.assign(new Error("Backup was created, but post-create staging cleanup failed"), {
+          code: "BACKUP_STAGE_CLEANUP_FAILED",
+          backup: saved,
+          backupHistoryState: "durable",
+          backupOperationState: "created-post-processing-failed",
+          cleanupFailureCodes: uniqueCleanupFailureCodes,
+        });
+      }
+      console.error("[backup] BACKUP_STAGE_CLEANUP_FAILED");
+    }
+    release?.();
+    if (postCreateCleanupError) throw postCreateCleanupError;
   }
 }
 
@@ -1259,15 +1602,85 @@ function getBackupOrThrow(id) {
   return { backup, archivePath };
 }
 
-function deleteBackup(id) {
-  const release = acquireLock("delete");
+function compensateFailedBackupDeletion(backup, mutationLease, originalError) {
   try {
+    if (!backupRepository.getBackup(backup.id)) {
+      mutationLease?.renew?.();
+      backupRepository.saveBackup(backup, { mutationLease });
+    }
+  } catch (compensationError) {
+    originalError.historyRecoveryRequired = true;
+    originalError.historyCompensationError = {
+      code: compensationError.code || null,
+      message: "Backup history could not be restored after deletion failed",
+    };
+  }
+}
+
+async function deleteBackupTransaction(backup, archivePath, mutationLease) {
+  const transactionId = crypto.randomUUID();
+  const tombstone = retentionTombstone(archivePath);
+  const transaction = {
+    version: 1,
+    transactionId,
+    phase: "prepared",
+    backupId: String(backup.id),
+    filename: path.basename(archivePath),
+    archivePath,
+    tombstonePath: tombstone,
+    checksum: await calculateFileHash(archivePath),
+    createdAt: new Date().toISOString(),
+  };
+  const record = {
+    transaction,
+    transactionPath: persistRetentionTransaction(transaction),
+    directory: path.dirname(retentionTransactionPath(transactionId)),
+  };
+  let removedBackup = null;
+  try {
+    renameDurably(archivePath, tombstone);
+    transaction.phase = "archive_moved";
+    persistRetentionTransaction(transaction);
+    mutationLease?.renew?.();
+    removedBackup = backupRepository.deleteBackup(backup.id, { mutationLease }) || backup;
+    transaction.phase = "history_removed";
+    persistRetentionTransaction(transaction);
+    removeDurably(tombstone, { force: false });
+    removeRetentionTransaction(record);
+  } catch (error) {
+    if (fs.existsSync(tombstone)) {
+      compensateFailedBackupDeletion(removedBackup || backup, mutationLease, error);
+      if (backupRepository.getBackup(backup.id)) {
+        try {
+          if (!fs.existsSync(archivePath)) renameDurably(tombstone, archivePath);
+          transaction.phase = "prepared";
+          persistRetentionTransaction(transaction);
+          removeRetentionTransaction(record);
+        } catch (rollbackError) {
+          error.rollbackError = rollbackError;
+        }
+      }
+    }
+    throw error;
+  }
+}
+
+async function deleteBackup(id, options = {}) {
+  const release = options.lockHeld ? null : acquireLock("delete");
+  let inventoryLease = null;
+  try {
+    if (typeof cloudStorage?.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
+    inventoryLease = await restoreProviderOrphans.acquireInventoryLock();
+    const inventory = restoreProviderOrphans.getInventoryStatus(cloudStorage);
+    if (inventory.state === "unknown" && inventory.backupId === String(id)) {
+      throw new Error("Backup is the unresolved provider inventory baseline and cannot be deleted");
+    }
     const { backup, archivePath } = getBackupOrThrow(id);
-    fs.rmSync(archivePath, { force: true });
-    backupRepository.deleteBackup(backup.id);
+    await deleteBackupTransaction(backup, archivePath, inventoryLease);
     return backup;
   } finally {
-    release();
+    inventoryLease?.release();
+    release?.();
   }
 }
 
@@ -1286,10 +1699,13 @@ module.exports = {
   createBackup,
   createZipArchive,
   deleteBackup,
+  getQuarantineExclusionState,
   getArchivePath,
   getBackupOrThrow,
+  isBackupExcludedPath: isSensitivePath,
   latestStatus,
   listBackups,
   setCloudStorage,
   recoverRetentionTombstones,
+  recoverRetentionAtStartup,
 };

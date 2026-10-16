@@ -59,9 +59,9 @@ function readQuarantineRegularFile(filePath, encoding) {
       }
       throw error;
     }
-    const descriptorStat = fs.fstatSync(descriptor);
+    const descriptorStat = fs.fstatSync(descriptor, { bigint: true });
     let pathStat;
-    try { pathStat = fs.lstatSync(filePath); }
+    try { pathStat = fs.lstatSync(filePath, { bigint: true }); }
     catch (error) {
       if (error.code !== "ENOENT") throw error;
       const changed = new Error("Quarantine file changed while it was being opened");

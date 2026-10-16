@@ -1,5 +1,354 @@
 # Root.ark Issue Ledger
 
+## GitHub snapshot after PR #189 — 2026-10-15 (application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`; pre-publication query)
+
+This point-in-time snapshot was queried after PR #189 merged and before documentation PR #175 was updated and published. It supersedes the post-#174 snapshot below for application and GitHub state at this query. PR #188 merged at `a557bfec762d45ceb574146841b9dffbe1b7757e` with chunk-upload limits; PR #189 merged at `bde6c54bee7a015822aa5463618bdf985ddf805d` with a disposable restore crash-injection regression. Exact checks are in the [post-#189 validation snapshot](validation/2026-10-15-rootark-post-189.md). The documentation publication itself is excluded from this pre-publication inventory and requires separate exact-head and final-`Root/main` validation.
+
+Issues #63 protected search, #64 native Android, #65 end-to-end Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change protection, #68 operation-scoped capability sharing, #94 deployment-wide chunk-upload limits, and #186 aggregate chunk-storage budgets remain open and incomplete.
+
+| PR | Live state at this query | Remaining acceptance boundary |
+|---|---|---|
+| #95 | Closed as superseded by #188 | No separate PR change remains to merge; #94 remains open for deployment-wide enforcement. |
+| #97 | Open; head `a6a33a92cd6902f303254e60031da4bdc04cec04`, base last recorded as `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; GitHub reported CLEAN | Keep open as partial #66 work. Metadata-only paginated catalog, selective network transfer, native Files On-Demand integration, safe eviction around external open-handle writers, and deterministic restart/reconnect remain incomplete. |
+| #175 | Open at this pre-publication query; documentation-publication vehicle | The update still needed to resolve two review threads and pass exact-head CI before merge. The resulting merge SHA and current state are separate from this snapshot. |
+| #179 | Merged at `2f3c8b04a8ef79cf6ea378e274ee3c051a3251c0` | Adds a bounded Windows-only `EPERM` retry for sync-journal atomic rename; it does not unlink the committed destination as a fallback. |
+| #188 | Merged at `a557bfec762d45ceb574146841b9dffbe1b7757e` | Adds per-account rolling limits before Multer and a socket-peer cap before the global JSON parser; it does not provide deployment-wide shared quota. |
+| #189 | Merged at `bde6c54bee7a015822aa5463618bdf985ddf805d` | Adds a disposable process-interruption test for provider-policy/state pair recovery before provider work and listener resume; it does not make all restore domains globally atomic. |
+| #172 | Merged at `31b288cc9241fc6fa2c1c9ea460fcff4e800c380` | Dependency update; its merge does not clear the separate open Dependabot alert. |
+| #173 | Merged at `87b2c8ccbb71512cb53d1cb1aa45e9238690d191` | Dependency update; its merge does not clear the separate open Dependabot alert. |
+
+Dependabot alert #1 remains open at medium severity for `GHSA-hp3w-g68c-fv3c` in transitive `sprintf-js`; GitHub reports no patched version. PRs #172 and #173 are merged, not open, and do not close this alert.
+
+Whole restore has verified local preimages, rollback journals, startup recovery, and durable provider reconciliation, but is not globally atomic across quarantine, filesystem, JSON/SQLite, and cloud APIs. External writers and provider APIs cannot join the local rollback transaction; Windows lacks a portable Node.js directory-entry flush; migrations use forward retry after a committed restore. The new PR #189 test covers one interrupted provider-policy pair rename boundary only. Root.ark is not an end-to-end Zero-Knowledge runtime or production-ready. See the linked validation record for exact checks, browser scope, and residual boundaries.
+
+## Historical verified live-state snapshot after PR #165 — 2026-10-11 (`Root/main` `c5e904fd7625c50c74f40280e8ae329906485d74`)
+
+This snapshot was queried after PR #165 merged. It supersedes the post-#164 snapshot below for the GitHub state and exact-SHA validation recorded here; earlier entries remain historical. The [post-#165 validation record](validation/2026-10-11-rootark-post-165.md) records checks on exact `Root/main` SHA `c5e904f`, current open work, browser evidence, the independent final review, and remaining boundaries. If a later documentation-only commit changes `Root/main`, its own merge SHA and push-triggered checks are a separate point-in-time record and must be reported without rewriting this snapshot.
+
+Issues #63 protected search, #64 native Android, #65 end-to-end Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change protection, #68 operation-scoped capability sharing, and #94 deployment-wide chunk-upload limits remain open and incomplete.
+
+| PR | Live state at this query | Remaining acceptance boundary |
+|---|---|---|
+| #95 | Open, `DIRTY`; head `95d99e4a934384fcfa2101dfc210741cd791a3d1`; four review threads resolved; listed head checks pass but do not establish validation on the current base | Keep open for a fresh-base scoped port. Process-local upload limits do not prove deployment-wide enforcement for #94. |
+| #97 | Open, `CLEAN`; head `a6a33a92cd6902f303254e60031da4bdc04cec04`; five review threads resolved; listed head checks pass but do not complete #66 | Keep open as partial selective-sync work. Metadata-only pagination, selective network transfer, native Files On-Demand, safe eviction around external open-handle writers, and deterministic restart/reconnect remain incomplete. |
+
+PR #164 is merged at `12e511ccc036b00664e0513b872bdabad56aa941` and PR #165 is merged at `c5e904fd7625c50c74f40280e8ae329906485d74`; the four review threads on #164 are resolved and #165 had no review threads. Dependabot alert #1 remains open at medium severity for `GHSA-hp3w-g68c-fv3c` in transitive `sprintf-js`; GitHub reports no first patched version. The full `npm audit` reports three moderate findings and exits nonzero; the configured high-severity gate passes. Exact DOCX preview-path review found no reachable attacker-controlled `sprintf` format string, but the dependency alert remains open and must not be represented as cleared.
+
+Whole restore has durable local pre-images, a coordinator, rollback/restart recovery, and retryable provider reconciliation. It is not globally atomic across quarantine, filesystem, JSON/SQLite, and cloud providers. External writers can bypass application barriers, remote APIs cannot participate in a local transaction, and portable Windows directory-entry power-loss durability remains limited. Root.ark is not an end-to-end Zero-Knowledge runtime and production deployment topology/provider interoperability remain unverified.
+
+The exact-SHA checks, test counts, browser scope, fresh independent review, and security-scan limitation for this query are in the linked validation record. Re-query GitHub before relying on this dated snapshot after later merges.
+
+## GitHub and application snapshot after PR #164 — 2026-10-11 (Root/main 12e511ccc036b00664e0513b872bdabad56aa941)
+
+This point-in-time query was made after PR #164 merged and before the documentation-only reconciliation containing this snapshot. PR #164 head b1f0b0eb079dfb1badd75183d1bc7cb880e5b070 merged at 12e511ccc036b00664e0513b872bdabad56aa941; its four review threads are resolved. Exact-SHA checks and limits are detailed in the [post-#164 validation record](validation/2026-10-11-rootark-post-164.md). Re-query GitHub for later PR, issue, alert, and check state.
+
+Issues #63 protected search, #64 native Android, #65 Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change protection, #68 operation-scoped capability sharing, and #94 deployment-wide chunk-upload limits were open and incomplete at this query.
+
+| Open PR at query | Head and base | GitHub merge state and review threads | Remaining acceptance boundary |
+|---|---|---|---|
+| #95 | Head 95d99e4a934384fcfa2101dfc210741cd791a3d1; based on stale d2ae0eb1c2fc87c1131a73c2a324c695b71664c1 | DIRTY; four threads resolved; latest successful checks were from 2026-10-01 | Keep open for a fresh-base scoped port. Process-local rate limits do not prove deployment-wide enforcement for #94. |
+| #97 | Head a6a33a92cd6902f303254e60031da4bdc04cec04; based on stale d2ae0eb1c2fc87c1131a73c2a324c695b71664c1 | CLEAN at query; five threads resolved; latest successful checks were from 2026-10-01 | Keep open as a partial #66 foundation. Metadata-only pagination, network-selective transfer, native Files On-Demand, external-writer-safe eviction, and deterministic restart/reconnect remain incomplete. |
+
+Dependabot alert #1 was open at medium severity for GHSA-hp3w-g68c-fv3c in transitive dependency sprintf-js; GitHub reported no patched version. The configured high-severity dependency gate passing does not clear this alert.
+
+Whole restore has local pre-images, durable coordination, compensating rollback, startup recovery, and durable provider reconciliation; it is not a global atomic visibility switch across quarantine, filesystem, JSON/SQLite, and cloud providers. Provider interoperability, deployed proxy topology, and Windows directory-entry power-loss durability remain unverified. Root.ark is not production-ready or an end-to-end Zero-Knowledge runtime. No repository-wide Codex Security Deep Scan result is claimed for application SHA 12e511c.
+
+## Historical GitHub snapshot — after PR #160 (2026-10-11; Root/main b3a8aff4c218d4fa522c22a4c12d1f2bbd5f3cd8)
+
+This live query was made after PRs #161 and #162 and the documentation reconciliation in PR #160 merged. Application code remains at e0cf2f59b5a51594ed5d744d18d2829bb07db51b; PR #160 is documentation-only and merged at b3a8aff4c218d4fa522c22a4c12d1f2bbd5f3cd8. The exact b3 SHA passed its own push-triggered Security Regression, CodeQL, default-branch Dependency Review, Pages, and local release gate. Details, test counts, browser coverage, remaining acceptance limits, and the restore boundary are in the [2026-10-11 closure snapshot](validation/2026-10-11-rootark-final-closure.md). This is a dated point-in-time record and does not predict the following documentation PR or its merge SHA.
+
+Open issues remain #63 protected search, #64 native Android, #65 end-to-end Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change recovery protection, #68 operation-scoped capability sharing, and #94 deployment-wide chunk-upload limits. Their implementation and acceptance criteria remain incomplete.
+
+| Open PR at query | Current head/base and checks | Remaining boundary |
+|---|---|---|
+| #95 | Head 95d99e4a934384fcfa2101dfc210741cd791a3d1; base d2ae0eb1c2fc87c1131a73c2a324c695b71664c1; DIRTY. Its latest successful checks are from 2026-10-01, not the current base. All 4 review threads are resolved. | Keep open for a fresh-base scoped port. Current process-local limits/local staging do not prove deployment-wide enforcement for #94. |
+| #97 | Head a6a33a92cd6902f303254e60031da4bdc04cec04; same stale base; CLEAN. Its latest successful checks are from 2026-10-01, not the current base. All 5 review threads are resolved. | Keep open as a partial #66 foundation. Metadata-only pagination, selective network transfer, native Files On-Demand, external-writer-safe eviction, and deterministic restart/reconnect remain incomplete. |
+
+PRs #160, #161, and #162 are merged at b3a8aff, c402ec1, and e0cf2f5 respectively. There were no unresolved review threads on those merged PRs at this query. Dependabot alert #1 remained open at medium severity for GHSA-hp3w-g68c-fv3c in sprintf-js; GitHub listed no first patched version.
+
+Whole restore remains recoverable through local pre-images, a durable coordinator, reverse-order compensation, startup recovery, and a durable provider-reconciliation queue, but it is not an instantaneous atomic switch across quarantine, filesystem, JSON/SQLite, and cloud providers. Live provider interoperability and deployed proxy topology remain unverified. The current browser run exercised quarantine ingestion against an isolated loopback fake ClamAV service, verified that the UI blocked the upload, and confirmed the `clamav_infected` quarantine entry in the admin UI; real ClamAV-engine behavior and quarantine approve/reject actions remain untested. Root.ark is not production-ready or an end-to-end Zero-Knowledge runtime.
+
+The repository-wide Codex Security Deep Scan was blocked before it started because the required managed filesystem permission profile was unavailable. No scan result is claimed.
+
+## Historical snapshot — after PRs #158 and #159 (2026-10-11; `Root/main` `d2d5f387b52241efc981108c79a21bbf7f27a5c9`; application SHA `1041b1b1c2116c593c223dac9508e0d70ac61fb4`)
+
+This historical record was queried after PR #158 and #159 merged. The post-#162 snapshot above supersedes its live issue, PR, and branch claims; the evidence below remains scoped to the earlier SHA.
+
+Queried live after PR #158 merged. PR #159 merged from head `cb10d2ab1e342f59369bd25bd72279ea208f24fe` at application SHA `1041b1b1c2116c593c223dac9508e0d70ac61fb4`, correcting public-share password-session authentication. PR #158 merged from head `32e3a3dd6bc45fe3fcd6ab036a1cdb5277af63fa` at `Root/main` SHA `d2d5f387b52241efc981108c79a21bbf7f27a5c9`; it reconciles product decisions and roadmap tracking. The application tree did not change in #158. This snapshot predates the final documentation publication and its exact merged-SHA checks; the final report must identify those separately.
+
+At the exact #159 application merge SHA `1041b1b1c2116c593c223dac9508e0d70ac61fb4`, push-triggered Security Regression passed on Ubuntu and Windows, CodeQL passed, and default-branch Dependency Review passed. At exact current `Root/main` SHA `d2d5f387b52241efc981108c79a21bbf7f27a5c9`, Security Regression [run #38118453055](https://github.com/bielxdh3/Root.ark/actions/runs/38118453055) passed on Ubuntu and Windows, CodeQL [#38118452872](https://github.com/bielxdh3/Root.ark/actions/runs/38118452872) passed, default-branch Dependency Review [#38118452961](https://github.com/bielxdh3/Root.ark/actions/runs/38118452961) passed, and Pages [#38118452733](https://github.com/bielxdh3/Root.ark/actions/runs/38118452733) passed. These checks apply to d2d5 only; the final documentation merge requires its own exact-SHA validation.
+
+Live open issues remain #63 protected search, #64 native Android, #65 end-to-end Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change recovery protection, #68 operation-scoped capability sharing, and #94 deployment-wide chunk-upload limits. Their acceptance criteria remain unmet: protected UI/index/FTS lifecycle and privacy review; a functioning native Android client; runtime flows that prevent server plaintext access; complete paginated selective transfer and provider integration with safe external-writer eviction; destructive-change detection/review and authorized recovery; operation-scoped least-privilege capabilities; and deployment-wide upload enforcement or verified single-process topology.
+
+Open PR #95 remains at head `95d99e4a934384fcfa2101dfc210741cd791a3d1` on stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; GitHub currently reports it as conflicting. Its checks are from 2026-10-01 and all four review threads are resolved. Keep it open for a scoped fresh-base port of useful account/raw-peer limits and chunk/session protections; do not merge its current head because it diverges from current main and changes proxy-trust/session-lock behavior. Issue #94 remains open because current process-local limits do not establish deployment-wide enforcement or a verified single-process deployment. Open PR #97 remains at head `a6a33a92cd6902f303254e60031da4bdc04cec04` on the same stale base; it is currently mergeable, but its checks are also from 2026-10-01 and all five review threads are resolved. Keep it open as a partial foundation for #66; metadata-only remote catalog, pagination, native Files On-Demand/provider integration, external-writer-safe eviction, and deterministic reconnect acceptance remain incomplete. No other PRs were open at this query. Dependabot alert #1 remains open at medium severity (`GHSA-hp3w-g68c-fv3c`) for transitive `sprintf-js`; GitHub lists no first patched version.
+
+The PR #159 fix replaces the forgeable public-share password flag with an expiring HMAC-authenticated cookie bound to the share token, current password hash, and link expiry. Legacy forged cookies are rejected, password rotation invalidates prior sessions, and the cookie is HttpOnly/SameSite with Secure enabled for secure requests. The share remains a bearer-link feature and does not satisfy capability-based sharing or Zero-Knowledge acceptance. The fresh browser evidence for 2FA, password-protected shares, public preview, old mutation GETs, and disposable deletion is recorded in [the post-#159 validation snapshot](validation/2026-10-11-rootark-post-159.md). The broader unchanged UI flow matrix is recorded in the preceding [post-#156 snapshot](validation/2026-10-10-rootark-post-156.md); the #159 PR diff changes only server code and its security tests.
+
+Whole restore remains recoverable through local preimages, a durable coordinator, reverse-order rollback, startup recovery, and a durable provider-reconciliation queue. It is not an instantaneous atomic switch across quarantine, filesystem, JSON/SQLite, and cloud providers. Provider writes occur beyond the local commit boundary and are retried idempotently; Windows lacks portable Node.js directory-entry `fsync`, and external writers that bypass application barriers remain outside the guarantee. Live S3/Google interoperability and deployed proxy topology remain unverified. Root.ark is not production-ready. See [the whole-restore transaction boundary](backup-restore-transaction-boundary.md). Re-query GitHub before relying on this point-in-time snapshot after its date.
+
+## Historical snapshot — immediately after PR #156 and before the 2026-10-11 closure work (2026-10-10; source SHA `c49fee7997580edb7868ecd7cb739aa1f173245f`)
+
+Queried live immediately after PR #156 merged to `Root/main`. This historical point-in-time record is anchored to source SHA `c49fee7997580edb7868ecd7cb739aa1f173245f`; its push-triggered checks completed on that exact merge SHA. The mission baseline remains `1df5e4640d4aea7dc700f2088059f489c2e51af0`. Later PRs #158 and #159 and the 2026-10-11 validation supersede its current-state claims; the evidence below remains scoped to its original SHA.
+
+PR #153 merged from head `09b817c978972d148e0baca28d8a66ab044759fe` at `4dc8510058718dc5aaab7e2c425b0bf4622b6d4a`; #154 from `b189c9d51d57ae30c6f0e98108ef478bd0d2aafb` at `5464d050c40c3ff5ea70a67e2314231cef0c9595`; #155 from `ab8e9b5c711ef323f926ebbf2a2ddd0811307226` at `2913db3da7708afb46132395e16482907618c158`; and #156 from `f274cfb902f09b503049852bb73d708e3258a00c` at current `Root/main` SHA `c49fee7997580edb7868ecd7cb739aa1f173245f`. PR #154 hardens WebDAV takeover startup recovery; #155 binds restore input to the selected backup manifest; #156 defers final restore acknowledgement until provider reconciliation succeeds while retaining the durable request barrier.
+
+On exact merged SHA `c49fee7997580edb7868ecd7cb739aa1f173245f`, push-triggered Security Regression [run #38107020584](https://github.com/bielxdh3/Root.ark/actions/runs/38107020584), CodeQL [run #38107020730](https://github.com/bielxdh3/Root.ark/actions/runs/38107020730), default-branch Dependency Review [run #38107020836](https://github.com/bielxdh3/Root.ark/actions/runs/38107020836), and Pages [run #38107019648](https://github.com/bielxdh3/Root.ark/actions/runs/38107019648) passed. GitHub also lists open medium Dependabot alert #1 (`GHSA-hp3w-g68c-fv3c`) for transitive `sprintf-js` `<=1.1.3` with no first patched version; the configured high-severity gate does not resolve it. The earlier browser run on `738d941` is historical context and is not treated as proof of backend behavior on c49; [the closure record](validation/2026-10-10-rootark-post-156.md) scopes the exact-c49 browser evidence separately.
+
+Issues #63 protected search, #64 native Android, #65 end-to-end Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change recovery protection, #68 operation-scoped capability sharing, and #94 deployment-wide chunk-upload limits remain open. Their acceptance criteria remain unmet: protected UI/index/FTS lifecycle and privacy review; a functioning native Android client; runtime flows that prevent server plaintext access; complete paginated selective transfer and provider integration with safe external-writer eviction; destructive-change detection/review and authorized recovery; operation-scoped least-privilege capabilities; and deployment-wide upload enforcement or verified single-process topology.
+
+Open PR #95 remains at head `95d99e4a934384fcfa2101dfc210741cd791a3d1` on stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; GitHub reports its merge state as `DIRTY`, its checks are from 2026-10-01, and all four review threads are resolved. Keep it open for a scoped fresh-base port of its useful account/raw-peer limits and chunk/session protections; do not merge the current head, which diverges from current main and changes proxy trust/session-lock behavior. Issue #94 remains open because current process-local limits do not establish deployment-wide enforcement or a verified single-process deployment. Open PR #97 remains at head `a6a33a92cd6902f303254e60031da4bdc04cec04` on the same stale base; GitHub reports its merge state as `CLEAN`, but its checks are also from 2026-10-01 and all five review threads are resolved. Keep it open as a partial foundation for #66; paginated metadata-only remote catalog, native Files On-Demand/provider integration, external-writer-safe eviction, and deterministic reconnect acceptance remain incomplete. No other PRs were open at this query.
+
+Whole restore remains durable and rollback/restart recoverable across locally controlled domains, not an instantaneous atomic switch across quarantine, filesystem, JSON/SQLite, and cloud providers. PR #156 holds request/upgrade handling behind the restore barrier until all configured instances acknowledge restored startup and cloud reconciliation succeeds; a provider failure leaves the durable coordinator and recovery material for restart retry. Cloud effects cannot join a portable local filesystem/SQLite transaction. Node.js does not provide portable Windows directory-entry `fsync`; live S3/Google interoperability and deployed proxy topology remain unverified. Root.ark is not production-ready. Re-query GitHub before relying on this snapshot after its date.
+
+## Historical snapshot — after PR #152 (2026-10-10; source SHA `738d9412cdb577e0b3cc7887e129391c72dd3ed5`)
+
+Queried live after PR #152 merged to `Root/main` and before publishing this documentation refresh. This point-in-time record is anchored to application-code SHA `738d9412cdb577e0b3cc7887e129391c72dd3ed5`; it does not predict the head or merge SHA of the documentation PR that updates it. The mission baseline remains `1df5e4640d4aea7dc700f2088059f489c2e51af0`. Re-query GitHub before relying on issue, PR, or check state after this snapshot.
+
+PR #150 merged from head `852455e38ef81a871b382bcbb9805a1afc6cbbc7` at `aad68d09853603b427e7c1636d727132b6a867f4`; PR #151 merged from head `81353f09579df1c6be48b95e4e377e96e0bf4417` at `59877d2a74601022ad38a17ff10f8794e63fb504`; and PR #152 merged from head `924f871bcd16d95d3a3b26145bc08f16bf675b17` at current source SHA `738d9412cdb577e0b3cc7887e129391c72dd3ed5`. PR #150 makes cloud lifecycle lock publication atomic and its restart-retry test wait for asynchronous startup reconciliation; #151 preserves unsaved admin group-member edits across stale refreshes; #152 adds per-process identity to restore locks and detects Linux process-start identity where available.
+
+On exact merged `Root/main` SHA `738d9412cdb577e0b3cc7887e129391c72dd3ed5`, push-triggered Security Regression [run #38095278915](https://github.com/bielxdh3/Root.ark/actions/runs/38095278915) passed: Ubuntu Node 22 ran 1,138 tests (1,127 passed, 11 skipped, 0 failed), and Windows Node 22 ran 1,138 tests (1,123 passed, 15 skipped, 0 failed). Syntax and runtime-artifact checks passed on both; the configured high-severity dependency audit passed. CodeQL [run #38095278850](https://github.com/bielxdh3/Root.ark/actions/runs/38095278850), default-branch Dependency Review [run #38095278908](https://github.com/bielxdh3/Root.ark/actions/runs/38095278908), and Pages [run #38095278345](https://github.com/bielxdh3/Root.ark/actions/runs/38095278345) passed. The detached local release gate on exact `738d941` passed 21, blocked 0, failed 0. The open moderate `sprintf-js` alert was last verified as `GHSA-hp3w-g68c-fv3c` / `CVE-2026-97058` with no first patched version; recheck it before relying on this snapshot.
+
+Open issues remain #63 protected search, #64 native Android, #65 end-to-end Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change recovery protection, #68 operation-scoped capability sharing, and #94 deployment-wide chunk-upload limits. Their acceptance criteria remain unmet: no complete protected-search UI/index/FTS lifecycle; no native Android app; supported flows still permit server plaintext access; selective transfer/provider integration and safe external-writer eviction remain incomplete; ransomware-style pause/review and authorized recovery are absent; bearer links are not operation-scoped capabilities; and process-local chunk limits do not prove deployment-wide enforcement.
+
+Open PR #95 remains at head `95d99e4a934384fcfa2101dfc210741cd791a3d1` on stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; its checks are from 2026-10-01, four review threads are resolved, and GitHub reported it not mergeable at the live query. A source-and-diff review against `738d941` found that the branch cannot be merged as a unit: it predates substantial current changes, sets `trust proxy` to `true`, removes the current chunk-session lock wrapper, and has substantial divergence from current main even though its changed files are scoped to chunk uploads. Current main already rate-limits `/upload-chunk` before Multer at the default 60 requests per 15 minutes, but after global JSON parsing and with a process-local store. The old PR has useful distinct pieces—an account rolling window, a raw-peer cap before body parsing, an 8 MiB chunk cap, and inactive-session expiry—but its expiry cleanup must respect current session-lock semantics. Keep #95 open for a scoped fresh-base port and review; do not merge its current head. Issue #94 remains open because this does not establish deployment-wide enforcement or a verified single-process topology. Open PR #97 remains at head `a6a33a92cd6902f303254e60031da4bdc04cec04` on the same stale base; its checks are from 2026-10-01, all five threads are resolved, and it remains partial for Issue #66. Open PR #149 was at head `57b0f14eade56337ae03519948a0dd450cb44df7` on base `6d4548808bf7090fc0ae13b238ab6cf948f67d5a`, with no review threads. Its old Windows run failed in `failed-temp-delete-retries-after-restart`: after the old 15-second observation window the provider object remained and the retry count had not advanced; the logs did not distinguish delayed startup scheduling from a failed retry. PR #150 extended the bounded test wait, and the exact current main Windows suite now passes; that does not substitute for checks on PR #149's updated head. PRs #147, #148, #150, #151, and #152 are merged. Review threads were 9/9 resolved on #147, 0 on #148, 2/2 resolved on #150, 0 on #151, and 1/1 resolved on #152. The subsequent publication and exact-head check for the documentation refresh remain pending in the linked validation snapshot.
+
+Restore remains rollback-recoverable across the locally controlled commit and restart boundary, with durable, retryable provider reconciliation. It is not an atomic visibility switch across filesystem, quarantine, JSON/SQLite, and external providers. Windows directory-entry power-loss durability is weaker because Node.js lacks a portable directory flush; external writers can bypass the app barrier, and live S3/Google interoperability is unverified. Browser validation on the exact `738d941` app tree covered the main authenticated flows and responsive states; on this tree the quarantine ingestion fixture could not be retained in the browser file control, and permanent deletion was not executed. An earlier disposable app-tree run proved quarantine ingestion, but is not exact-SHA evidence. Closure remains **PARTIAL** pending exact checks for the updated documentation PR, final `Root/main` validation, complete browser acceptance, and fresh independent final review. Deployed proxy/provider topology remains unverified.
+
+## Historical closure snapshot — after PR #129 (2026-10-08)
+
+The exact post-#129 `Root/main` state and closure evidence are recorded in [the final closure snapshot](validation/2026-10-08-rootark-final-closure-post-129.md), at `f543f0f4045d12ecbaf6f8b793d3d24aecb98e25`. This and the older PR #127 reconciliation below are historical snapshots, not current live GitHub state. Re-query GitHub before relying on issue, PR, alert, or check status after those snapshots.
+
+## Verified GitHub snapshot used for this documentation follow-up — after PR #127 (2026-10-08, `Root/main` `25e50cbaa26062202d470330e93d7beb4575693a`)
+
+Queried live after PR #127 merged and push-triggered checks completed on this exact SHA. This is a point-in-time snapshot; re-query GitHub before relying on its issue, PR, or check state after later changes.
+
+PR #127, `fix(restore): preserve provider inventory baseline`, merged from head `2334bf0cd02125d316b3ff083cf784b3e9f82abb` at this SHA. On exact `Root/main` SHA `25e50cbaa26062202d470330e93d7beb4575693a`, Security Regression [run #37787160598](https://github.com/bielxdh3/Root.ark/actions/runs/37787160598) passed: Ubuntu Node 22 ran 987 tests (976 passed, 11 skipped, 0 failed), and Windows Node 22 ran 987 tests (983 passed, 4 skipped, 0 failed). Syntax passed on both; Ubuntu also passed the runtime-artifact guard and configured high-severity dependency audit. CodeQL [run #37787160551](https://github.com/bielxdh3/Root.ark/actions/runs/37787160551), default-branch Dependency Review [run #37787160662](https://github.com/bielxdh3/Root.ark/actions/runs/37787160662), and Pages [run #37787159434](https://github.com/bielxdh3/Root.ark/actions/runs/37787159434) passed. The candidate release gate passed 21 checks on PR head `2334bf0…`; it has not yet run on this merged SHA.
+
+Issues #63 protected search, #64 native Android, #65 Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change protection, #68 capability sharing, and #94 deployment-wide chunk-upload limits remain open. PRs #95 and #97 remain open. PR #95 is `DIRTY`; PR #97 is `CLEAN`; both target stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`. Their latest checks passed on 2026-10-01, before the current base, and all 4 threads on #95 and all 5 on #97 are resolved. PR #102 is closed. PRs #123–127 are merged, with #127 at `25e50c…`.
+
+| Open PR | Live head/base at query | Checks and review state | Remaining boundary |
+|---|---|---|---|
+| #95 | Head `95d99e4a934384fcfa2101dfc210741cd791a3d1`; base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; merge state `DIRTY`. | Listed checks passed on 2026-10-01, not on current base; 4 review threads, all resolved. | #94 still lacks verified deployment-wide enforcement or proven single-process deployment topology. |
+| #97 | Head `a6a33a92cd6902f303254e60031da4bdc04cec04`; base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; merge state `CLEAN`. | Listed checks passed on 2026-10-01, not on current base; 5 review threads, all resolved. | Selective network transfer, metadata-only paginated listing, native Files On-Demand, and external-writer-safe eviction/restart behavior remain incomplete. |
+
+There are no unresolved review threads on these two open PRs. The moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` for `sprintf-js` remains open; GitHub lists no first patched version. Restore uses verified local preimages/compensation and restart recovery with durable provider reconciliation, but is not atomic across local storage and external providers. PR #127 adds provider-context validation, deterministic recovery of a single legacy queue from an explicit validated baseline, and fail-closed handling of ambiguous queues. Provider API interoperability remains unverified. The current browser acceptance matrix is partial; the closure-validation addendum lists exercised and untested flows.
+
+## Historical GitHub snapshot — after PR #120 (2026-10-08, `Root/main` `acbdd721ac49fdd5d01d17817f723168ee53a57b`)
+
+Queried after PR #120 merged and the push-triggered checks completed for this exact SHA. The following is a dated snapshot; re-query GitHub before relying on its PR and issue states.
+
+PR #119, `docs: reconcile Root.ark issue and roadmap state`, merged at `edd97681c71d70b75c915c0dd8c04540eede11f3`. PR #120, `Fix Windows WebDAV test cleanup race`, merged at this SHA from head `0c51980ef9815f7d2c21fce8067dc4119df2923b`. On exact `Root/main` SHA `acbdd721ac49fdd5d01d17817f723168ee53a57b`, Security Regression [run #37737256757](https://github.com/bielxdh3/Root.ark/actions/runs/37737256757) passed: Ubuntu Node 22 ran 939 tests (928 passed, 11 skipped, 0 failed) and Windows Node 22 ran 939 tests (935 passed, 4 skipped, 0 failed). CodeQL [run #37737256839](https://github.com/bielxdh3/Root.ark/actions/runs/37737256839), default-branch Dependency Review [run #37737256816](https://github.com/bielxdh3/Root.ark/actions/runs/37737256816), and Pages [run #37737256170](https://github.com/bielxdh3/Root.ark/actions/runs/37737256170) passed. The Windows release gate on this exact SHA reported 21 passed, 0 blocked, and 0 failed; the checkout was clean.
+
+Issues #63 protected search, #64 native Android, #65 Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change protection, #68 capability sharing, and #94 deployment-wide chunk-upload limits remained open. PRs #95, #97, and #102 remained open and based on older `Root/main` SHAs:
+
+| Open PR | Live head/base at query | Checks and review state | Remaining boundary |
+|---|---|---|---|
+| #95 | Head `95d99e4a934384fcfa2101dfc210741cd791a3d1`; base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` | Listed head checks passed; all review threads resolved. | #94 still lacked verified deployment-wide limits or proven single-process topology. |
+| #97 | Head `a6a33a92cd6902f303254e60031da4bdc04cec04`; base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` | Listed head checks passed; all review threads resolved. | Selective transfer, metadata-only paginated listing, native Files On-Demand, and external-writer-safe eviction remained incomplete. |
+| #102 | Head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`; base `9de3c85ab59aa16fc46916abc0cf638c539086ef` | Listed head CodeQL check failed; one unresolved review thread remained at `services/internalFile.js:31`. | Resolve the finding/thread, update the base, and pass exact-head checks. |
+
+The moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` for `sprintf-js` remained open; GitHub listed no first patched version. Restore was locally rollback-recoverable with durable provider reconciliation, not atomic across all storage domains. The browser acceptance matrix remained incomplete.
+
+## Historical GitHub snapshot — after PR #116 (2026-10-08, `Root/main` `fd995b2ae587140db8ea1ba9de62cf7557ee0516`)
+
+Queried from GitHub after PR #116 merged and the push-triggered checks completed for this exact `Root/main` SHA, before this documentation-only reconciliation. This is a dated snapshot; re-query GitHub before relying on it after later repository changes.
+
+PR #116 (`docs: record final Root.ark closure evidence`) merged at `fd995b2ae587140db8ea1ba9de62cf7557ee0516` from head `73f3c67fde4817772544866aaa311141d137ebba`. Its exact-head Security Regression [#37731031635](https://github.com/bielxdh3/Root.ark/actions/runs/37731031635), CodeQL [#37731031725](https://github.com/bielxdh3/Root.ark/actions/runs/37731031725), and Dependency Review [#37731031741](https://github.com/bielxdh3/Root.ark/actions/runs/37731031741) passed; the default-branch-only Dependency Review job was skipped for the PR event. No unresolved review thread remained on #116. On that resulting exact main SHA, Security Regression [#37731545082](https://github.com/bielxdh3/Root.ark/actions/runs/37731545082) passed: Ubuntu Node 22 ran 938 tests (927 passed, 11 skipped, 0 failed) and Windows Node 22 ran 938 tests (934 passed, 4 skipped, 0 failed). CodeQL [#37731545119](https://github.com/bielxdh3/Root.ark/actions/runs/37731545119), default-branch Dependency Review [#37731544965](https://github.com/bielxdh3/Root.ark/actions/runs/37731544965), and Pages [#37731544171](https://github.com/bielxdh3/Root.ark/actions/runs/37731544171) also passed. The mission execution record reports a clean Windows `node scripts/validate-release-gate.js` run on this SHA with 21 passed, 0 blocked, and 0 failed; exact stdout was not retained in the repository.
+
+The seven feature/security issues remain open: #63 protected search, #64 native Android, #65 Zero-Knowledge runtime, #66 selective sync / Files On-Demand, #67 destructive-change protection, #68 capability sharing, and #94 deployment-wide chunk-upload limits. Their acceptance boundaries remain as recorded below; no partial foundation is being marked complete.
+
+| Open PR | State at query | Remaining boundary |
+|---|---|---|
+| #95 | Open at head `95d99e4a934384fcfa2101dfc210741cd791a3d1`, stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`, merge state `DIRTY`; old-head checks passed on 2026-10-01; all 4 review threads are resolved. | #94 still lacks verified deployment-wide limits or proven single-process topology. |
+| #97 | Open at head `a6a33a92cd6902f303254e60031da4bdc04cec04`, stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`, merge state `CLEAN`; old-head checks passed on 2026-10-01; all 5 review threads are resolved. | Selective transfer, metadata-only paginated listing, native Files On-Demand, and external-writer-safe eviction remain incomplete. |
+| #102 | Open at head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`, base `9de3c85ab59aa16fc46916abc0cf638c539086ef`, merge state `DIRTY`; its last CodeQL check failed while its other listed checks passed; one unresolved review thread remains at `services/internalFile.js:31`. | Resolve the thread/finding, update the base, and pass exact-head checks. |
+
+The moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` for transitive `sprintf-js` remains open; GitHub lists no first patched version. The only unresolved review thread among the open PRs is on #102. PRs #95, #97, and #102 remain open; merged mission PRs #99, #101, #103, #114, #115, #116, #117, and #118 remain merged.
+
+## Historical GitHub snapshot — after PR #118 (2026-10-08, `Root/main` `1c2f7a8b276e63e53555f5de824afc9b7a9aa55e`)
+
+This snapshot predates publication and merge of PR #116. At that query PR #116 was still pending publication; current state is recorded in the latest snapshot above. PR #118's merge SHA and exact-SHA checks remain historical evidence only.
+
+PR #118 (`test: cover restore migration failure recovery`) merged at `1c2f7a8…` from head `5ed55e4a1f2509aea939c6a89dda7d0bef87cd99`. Its exact-head Security Regression, CodeQL, and Dependency Review passed. On resulting exact `Root/main` SHA `1c2f7a8…`, push Security Regression [#37729789854](https://github.com/bielxdh3/Root.ark/actions/runs/37729789854) passed: Ubuntu Node 22 938 total (927 passed, 11 skipped, 0 failed), Windows Node 22 938 total (934 passed, 4 skipped, 0 failed); CodeQL [#37729789865](https://github.com/bielxdh3/Root.ark/actions/runs/37729789865), default-branch Dependency Review [#37729789780](https://github.com/bielxdh3/Root.ark/actions/runs/37729789780), and Pages [#37729789584](https://github.com/bielxdh3/Root.ark/actions/runs/37729789584) passed.
+
+## Historical live snapshot — 2026-10-08 (after PR #117, source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`)
+
+This point-in-time snapshot was queried from GitHub after PR #117 merged and before the PR #116 branch was updated to the current base. The follow-up candidate snapshot below records the later PR state; the table here applies only to `1442869…` at the original query time.
+
+### Open issues and pull requests at source SHA `14428690bef7c02648fd0be9570aabb17ae6de1a` before the PR #116 update
+
+| Item | Live state at query | Remaining acceptance boundary |
+|---|---|---|
+| #63 | `open` | Protected-index primitives do not complete search: UI population, FTS/advanced search, encrypted-index lifecycle, metadata-leakage acceptance, and full search acceptance remain open. |
+| #64 | `open` | No functioning native Android client or Android CI. |
+| #65 | `open` | Root.ark is not an end-to-end Zero-Knowledge runtime; supported server paths can access plaintext in legacy flows. |
+| #66 / PR #97 | `open` / `open` | Metadata-only listing/pagination, native Files On-Demand, external open-handle-safe eviction, and restart/reconnect acceptance remain incomplete. |
+| #67 | `open` | Burst detection, pause/review barrier, protected history, recovery authorization, and deterministic recovery UX remain incomplete. |
+| #68 | `open` | Existing bearer links are not operation-scoped capabilities. |
+| #94 / PR #95 | `open` / `open` | Process-local limits do not prove deployment-wide enforcement; topology remains unverified. |
+| PR #95 | `open`, head `95d99e4a934384fcfa2101dfc210741cd791a3d1`, stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; listed checks pass; 4 threads resolved. | Update to current base and provide shared/edge limits or verified single-process topology before merge. |
+| PR #97 | `open`, head `a6a33a92cd6902f303254e60031da4bdc04cec04`, stale base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; listed checks pass; 5 threads resolved. | Selective-sync acceptance gaps above remain. |
+| PR #102 | `open`, head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`, base `9de3c85ab59aa16fc46916abc0cf638c539086ef`; CodeQL fails, other listed checks pass; one unresolved thread at `services/internalFile.js:31`. | Update, resolve the finding/thread, and revalidate. |
+| PR #116 | `open` at head `daa6025e0c08c29a4d4cc0b55ec9fbb31b7e4fca`, base `9e070823f2ee6372521a53d2fc130701ed074aab`; no review threads. Earlier Ubuntu run failed on an async cloud-restore test race. | PR #117 corrected the race on main; the candidate was later updated to current base and validated as recorded in the follow-up snapshot. |
+
+## Historical follow-up PR snapshot — 2026-10-08 (candidate head `a72d2f21db25363dc3f13d8816e3db3bd1ee2d93`, base `Root/main` `14428690bef7c02648fd0be9570aabb17ae6de1a`)
+
+At that historical query after the initial PR #116 update, issues #63 protected search, #64 native Android, #65 Zero-Knowledge, #66 selective sync/Files On-Demand, #67 destructive-change protection, #68 capability sharing, and #94 deployment-wide chunk-upload limits were open. PR #116 was then at candidate head `a72d2f2…` with clean merge state. PR #102 had a CodeQL failure and one unresolved thread at `services/internalFile.js:31`; PR #97 and #95 had stale bases, with #95 also dirty. PR #116 had zero submitted GitHub reviews and zero review threads at that query; its Security Regression, CodeQL, and Dependency Review checks passed on `a72d2f2…`. At that time, the subsequently published wording correction still required fresh checks. The moderate `sprintf-js` alert `GHSA-hp3w-g68c-fv3c` remained open.
+
+## Historical PR #116 candidate snapshot before merge — 2026-10-08 (head `448d1c1ecd2cd3a1391dd741027dc146be3735b6`, base `Root/main` `14428690bef7c02648fd0be9570aabb17ae6de1a`)
+
+This point-in-time candidate snapshot predates the final PR #116 head and merge; use the latest GitHub snapshot at the top of this ledger for the current state.
+
+At this query, issues #63 protected search, #64 native Android, #65 Zero-Knowledge, #66 selective sync/Files On-Demand, #67 destructive-change protection, #68 capability sharing, and #94 deployment-wide chunk-upload limits were open. PR #116 was open with `CLEAN` merge state at the head/base above; PRs #95, #97, and #102 were also open. PR #95 remained `DIRTY` on stale base `d2ae0eb…`; PR #97 remained open on stale base `d2ae0eb…`; PR #102 remained `DIRTY` with a CodeQL failure and one unresolved thread at `services/internalFile.js:31`. PR #116 had no submitted GitHub reviews or unresolved review threads at query time.
+
+Exact-head checks on PR #116 head `448d1c1…` passed: Security Regression [run `37725263473`](https://github.com/bielxdh3/Root.ark/actions/runs/37725263473), Ubuntu Node 22 938 total (927 passed, 11 skipped, 0 failed) and Windows Node 22 938 total (934 passed, 4 skipped, 0 failed); CodeQL [run `37725263468`](https://github.com/bielxdh3/Root.ark/actions/runs/37725263468); and PR Dependency Review [run `37725263466`](https://github.com/bielxdh3/Root.ark/actions/runs/37725263466). The default-branch dependency-review job was skipped for this PR event. The local release gate passed on prior docs-only candidate head `a72d2f2…` (21 passed, 0 blocked, 0 failed); the 448d1c1 update changed documentation only.
+
+This snapshot is time-scoped to the query above. A subsequent documentation correction updates the record; its own PR head requires exact-head validation. The moderate `sprintf-js` Dependabot alert `GHSA-hp3w-g68c-fv3c` remained open.
+
+### Merged PRs and exact-SHA validation
+
+| PR | State | Merge commit |
+|---|---|---|
+| #114 | Merged — bootstrap, CSRF/mutation methods, proxy trust, main-push validation, restore recovery | `566a3d24591423c624ef3bcb82290a77ff359210` |
+| #115 | Merged — Windows lock-recovery test timeout | `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1` |
+| #99 | Merged — roadmap and issue reconciliation | `9e070823f2ee6372521a53d2fc130701ed074aab` |
+| #117 | Merged — waits for cloud-restore mutation records before test baseline | `14428690bef7c02648fd0be9570aabb17ae6de1a` |
+
+On exact `Root/main` SHA `14428690bef7c02648fd0be9570aabb17ae6de1a`, Security Regression [#37720151580](https://github.com/bielxdh3/Root.ark/actions/runs/37720151580) succeeded: Ubuntu 938 total (927 passed, 11 skipped, 0 failed); Windows 938 total (934 passed, 4 skipped, 0 failed). CodeQL [#37720151634](https://github.com/bielxdh3/Root.ark/actions/runs/37720151634), dependency review [#37720151454](https://github.com/bielxdh3/Root.ark/actions/runs/37720151454), and Pages [#37720150655](https://github.com/bielxdh3/Root.ark/actions/runs/37720150655) succeeded. The moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` for transitive `sprintf-js` remains open; no first patched version is listed.
+
+Restore is rollback-recoverable for local domains with durable provider reconciliation, not globally atomic. See [the restore transaction boundary](backup-restore-transaction-boundary.md) and [closure report](validation/2026-10-08-rootark-mission-closure.md).
+
+---
+
+## Historical live snapshot — 2026-10-08 (source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`)
+
+GitHub was queried after PR #115 merged into `Root/main` at `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`. This remains a timestamped historical snapshot, not a claim about the current default branch. The later mission state and exact-SHA validation are recorded in the [2026-10-08 closure validation report](validation/2026-10-08-rootark-mission-closure.md).
+
+### Open issues and pull requests at source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1`
+
+| Item | Live state at query | Remaining acceptance boundary |
+|---|---|---|
+| #63 | `open` | Protected-index primitives do not complete search: UI population, FTS/advanced search, encrypted-index lifecycle, metadata leakage acceptance, and full search acceptance remain open. |
+| #64 | `open` | Architecture and threat-model material exists; there is no functioning native Android client or Android CI. |
+| #65 | `open` | Root.ark is not an end-to-end Zero-Knowledge runtime; supported server paths can access plaintext. Upload, preview, scanning, sync/WebDAV, backup/restore, sharing, migration, recovery, authorization, and key lifecycle remain to be accepted. |
+| #66 / PR #97 | `open` / `open` | PR #97 remains partial: remote listing transfers full records before filtering; metadata-only listing, pagination, native Files On-Demand integration, safe eviction around external open-handle writers, and restart/reconnect acceptance remain incomplete. |
+| #67 | `open` | Backups and revision history do not provide burst detection, a pause/review barrier, protected history, recovery authorization, or deterministic recovery UX. |
+| #68 | `open` | Existing bearer links are not operation-scoped capabilities; least-privilege enforcement and recipient-key delivery remain incomplete. |
+| #94 / PR #95 | `open` / `open` | The process-local limiter does not establish shared/edge enforcement for multi-process deployments; production topology is unverified. |
+| PR #95 | `open`, head `95d99e4a934384fcfa2101dfc210741cd791a3d1`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` | CodeQL, Analyze, dependency-review, Ubuntu, and Windows checks pass on that exact head; 0 unresolved review threads. Its base is stale and issue #94 remains open pending shared/edge enforcement and deployment-topology evidence. |
+| PR #97 | `open`, head `a6a33a92cd6902f303254e60031da4bdc04cec04`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` | CodeQL, Analyze, dependency-review, Ubuntu, and Windows checks pass on that exact head; 0 unresolved review threads. Its base is stale and selective-sync acceptance gaps remain. |
+| PR #99 | `open` at the query, remote head `e8aebd34413e5172498065d602e1a7fc48742b54`, base `566a3d24591423c624ef3bcb82290a77ff359210`; 0 unresolved review threads | The old head's Windows suite failed only in `file lifecycle lock reclaims only a provably dead same-host owner` with `FILE_LIFECYCLE_LOCK_TIMEOUT` (run `37713856506`). The 40 ms test-only timeout was increased to 5 seconds in PR #115, now merged at this source SHA; at the query, PR #99 still needed updating to this base and exact-head checks. |
+| PR #102 | `open`, head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`, base `9de3c85ab59aa16fc46916abc0cf638c539086ef`; 1 unresolved review thread at `services/internalFile.js:31` | CodeQL fails with 74 high and 5 medium alerts (run `112556673970`); Analyze, dependency-review, Ubuntu, and Windows pass on that head. The base is stale; triage and review resolution remain before merge. |
+
+### Relevant merged pull requests
+
+| PR | State | Merge commit |
+|---|---|---|
+| #114 | merged — cloud lifecycle, backup/restore, and security regressions; PR head `3c113718d421c4bccbd09e9163f079031248142d` | `566a3d24591423c624ef3bcb82290a77ff359210` |
+| #115 | merged — Windows lock-recovery test timeout; PR head `87ec6c23c7c62b56aa72bce6c61575968fe1bb3c` | `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1` |
+
+At this query, source SHA `b12d6286a867f1562ea6a9c557f8bd93fadfd5c1` passed the push-triggered Security Regression workflow (Linux full validation and Windows syntax/tests; run `37715043302`), CodeQL (`37715043209`), default-branch dependency review (`37715043243`), and Pages build/deployment (`37715042929`). The PR-only dependency-review job was skipped on the push. The open moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` affects transitive `sprintf-js` via `package-lock.json`; GitHub reports no first patched version. These results apply only to this exact SHA.
+
+The restore model uses compensating rollback for locally controlled domains and a durable, retryable provider-reconciliation queue; it is not a single atomic transaction across storage domains or external providers. If startup migration fails after local commit, the restored state and restart barrier remain for retry or operator recovery; restore is not automatically rolled back to its prior state. See [the whole-restore transaction boundary](backup-restore-transaction-boundary.md).
+
+## Historical live snapshot — 2026-10-08 (after PR #114, source SHA `566a3d24591423c624ef3bcb82290a77ff359210`)
+
+This earlier 2026-10-08 snapshot records state after PR #114 and before PR #115 merged. It is retained as historical evidence; the latest snapshot above supersedes it. Its run results apply only to its stated source SHA.
+
+### Open issues and pull requests at historical source SHA `566a3d24591423c624ef3bcb82290a77ff359210`
+
+| Item | Live state at query | Remaining acceptance boundary |
+|---|---|---|
+| #63 | `open` | Protected-index primitives do not complete search: UI population, FTS/advanced search, encrypted-index lifecycle, metadata leakage acceptance, and full search acceptance remain open. |
+| #64 | `open` | Architecture and threat-model material exists; there is no functioning native Android client or Android CI. |
+| #65 | `open` | Root.ark is not an end-to-end Zero-Knowledge runtime; supported server paths can access plaintext. Upload, preview, scanning, sync/WebDAV, backup/restore, sharing, migration, recovery, authorization, and key lifecycle remain to be accepted. |
+| #66 / PR #97 | `open` / `open` | PR #97 remains partial: remote listing transfers full records before filtering; metadata-only listing, pagination, native Files On-Demand integration, safe eviction around external open-handle writers, and restart/reconnect acceptance remain incomplete. |
+| #67 | `open` | Backups and revision history do not provide burst detection, a pause/review barrier, protected history, recovery authorization, or deterministic recovery UX. |
+| #68 | `open` | Existing bearer links are not operation-scoped capabilities; least-privilege enforcement and recipient-key delivery remain incomplete. |
+| #94 / PR #95 | `open` / `open` | The process-local limiter does not establish shared/edge enforcement for multi-process deployments; production topology is unverified. |
+| PR #95 | `open`, head `95d99e4a934384fcfa2101dfc210741cd791a3d1`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; merge state `DIRTY` | CodeQL, Analyze, dependency-review, Ubuntu, and Windows checks pass on that head; 0 unresolved review threads. The base is stale; update/rebase and exact-head validation are required. Issue #94 remains open pending shared or edge enforcement and deployment-topology evidence. |
+| PR #97 | `open`, head `a6a33a92cd6902f303254e60031da4bdc04cec04`, base `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; merge state `CLEAN` | CodeQL, Analyze, dependency-review, Ubuntu, and Windows checks pass on that head; 0 unresolved review threads. The base is stale and selective-sync acceptance gaps remain. |
+| PR #99 | `open`, remote head `dfd3d3b58426e06b5cc2bc20d31cf5ff9e049bd7`, base `964f820417baf44f059a04e5363a2a172dccdc7a`; merge state `DIRTY` at query; 0 unresolved review threads | The remote branch had not yet published its merge of current SHA `566a3d24591423c624ef3bcb82290a77ff359210` or the updated snapshot. The local candidate was resolving that merge; publication and exact-head checks were pending. |
+| PR #102 | `open`, head `e4dac5fb6527f36a3a8193f545d5c00753adafcd`, base `9de3c85ab59aa16fc46916abc0cf638c539086ef`; merge state `DIRTY` | CodeQL alert gate fails (check run `112556673970`): 74 high and 5 medium alerts. Analyze, dependency-review, Ubuntu, and Windows checks pass on that head. One review thread remains unresolved at `services/internalFile.js:31`. Update against current main, triage alerts, and resolve review before merge. |
+
+### Relevant merged restore PRs
+
+| PR | State | Merge commit |
+|---|---|---|
+| #101 | merged — authentication, CSRF, and proxy trust | `5c86bd2a9844fdf21921f08cf2bf9d9a7253d652` |
+| #103 | merged — validate every Root/main push | `f85cb389f3152191d612fb36b1ad97bde89ba99a` |
+| #104 | merged — restart-safe local restore rollback | `5ee044b628ed55f34e007e7d16c9c57e38a4ae27` |
+| #110 | merged — restore provider startup gate regression | `7bc9e81a1496041b3d75c5bd3cd359a603c6f6a8` |
+| #111 | merged — restore migration restart boundary regression | `2259f3d76ae51bbc03ebaae1213f1328c30fbb52` |
+| #112 | merged — atomic server master-key publication | `9de3c85ab59aa16fc46916abc0cf638c539086ef` |
+| #113 | merged — restore focus after closing Versions panel | `964f820417baf44f059a04e5363a2a172dccdc7a` |
+| #114 | merged — cloud lifecycle, backup/restore, and security regressions; PR head `3c113718d421c4bccbd09e9163f079031248142d` | `566a3d24591423c624ef3bcb82290a77ff359210` |
+
+The restore model uses compensating rollback for locally controlled domains and a durable, retryable provider-reconciliation queue; it is not a single atomic transaction across storage domains or external providers. If startup migration fails after local commit, the restored state and restart barrier remain for retry or operator recovery; restore is not automatically rolled back to its prior state.
+
+At this query, exact source SHA `566a3d24591423c624ef3bcb82290a77ff359210` had successful Security Regression, CodeQL analysis, default-branch dependency review, and GitHub Pages build/deployment runs (run IDs `37712454578`, `37712454551`, `37712454481`, and `37712453703`). Ubuntu full validation and Windows syntax/tests passed in Security Regression; the PR-only dependency-review job was skipped on this push. The open moderate Dependabot alert `GHSA-hp3w-g68c-fv3c` affects transitive `sprintf-js` via `package-lock.json`; GitHub reports no first patched version. These results apply only to the stated SHA and do not replace validation of a later final SHA.
+
+## Historical live snapshot — 2026-10-06 (source SHA `1955eab3d05f72632396eff62ef96d39eedd634b`)
+
+GitHub was queried after PR #109 merged. The following snapshot was accurate for its stated source SHA and is retained as history; it is superseded by the newer snapshot above. PR #99 carried that earlier documentation update and did not change feature-issue state.
+
+### Open issues and pull requests at historical source SHA `1955eab3d05f72632396eff62ef96d39eedd634b`
+
+| Item | Live state | Remaining acceptance boundary |
+|---|---|---|
+| #63 | `open` | Protected-index primitives do not complete search: UI population, FTS/advanced search, encrypted-index lifecycle, metadata-leakage acceptance, and full search acceptance remain open. |
+| #64 | `open` | Architecture and threat-model material exists; there is no functioning native Android client or Android CI. |
+| #65 | `open` | The runtime is not end-to-end Zero-Knowledge; supported server paths can access plaintext. Upload, preview, scanning, sync/WebDAV, backup/restore, sharing, migration, recovery, authorization, and key lifecycle require full runtime acceptance. |
+| #66 / PR #97 | `open` / `open` | PR #97 is partial. The remote catalog still transfers complete records before filtering; metadata-only listing, pagination, native Files On-Demand integration, safe eviction around external open-handle writers, and restart/reconnect acceptance remain incomplete. |
+| #67 | `open` | Backups and revision history do not provide burst detection, a pause/review barrier, protected history, recovery authorization, or deterministic recovery UX. |
+| #68 | `open` | Existing bearer links are not operation-scoped capabilities; least-privilege enforcement and recipient-key delivery remain incomplete. |
+| #94 / PR #95 | `open` / `open` | Exact PR-head checks pass, but production replica topology is unverified. The process-local limiter does not establish shared/edge enforcement for multi-process deployments. |
+| PR #95 | `open` at `95d99e4a934384fcfa2101dfc210741cd791a3d1` | CodeQL, Analyze, dependency review, Ubuntu, and Windows checks passed on that head. Its base is stale and GitHub reports a dirty merge state; update and revalidate before merge. |
+| PR #97 | `open` at `a6a33a92cd6902f303254e60031da4bdc04cec04` | Exact-head checks passed. Its base is stale; keep open until the selective-sync acceptance gaps above are closed and the updated head is reviewed and validated. |
+| PR #102 | `open` at `dc219c14e6ace0e83b1ff46511395899ec59ba4e` | Authorization-before-hydration is directionally sound, but this branch predates PR #109, is stale, and its exact-head CodeQL run failed with 92 alerts (reported as 88 high and 4 medium; three annotations were in unchanged files and the remaining alerts were not all individually validated). PR #109 adds list/search metadata rate limits to current `Root/main`; PR #102 still requires current-base validation and triage of changed-code alerts before merge. |
+| Dependabot alert `GHSA-hp3w-g68c-fv3c` | `open`, moderate | `sprintf-js` is reported through `argparse@1.0.10`; GitHub currently reports no first patched version. Do not describe dependency risk as entirely clear until an upstream fix or reachability-based disposition is recorded. |
+
+### Merged correction PRs at source SHA `1955eab3d05f72632396eff62ef96d39eedd634b`
+
+| PR | Merge commit |
+|---|---|
+| #100 | `71a53ce36757a3958ab3bbea2f527a1f3cd96ae3` |
+| #101 | `5c86bd2a9844fdf21921f08cf2bf9d9a7253d652` |
+| #103 | `f85cb389f3152191d612fb36b1ad97bde89ba99a` |
+| #104 | `5ee044b628ed55f34e007e7d16c9c57e38a4ae27` |
+| #105 | `9b4019427f2864257677caa420c07043c7ef6437` |
+| #106 | `88404142edb9a5e9612e78b92706a6770eca4793` |
+| #107 | `4bd7d46675001538663e49337d237f63fb8cf826` |
+| #108 | `e7ac1c5ed9957478ddeb597fb41f9936a1a3af73` |
+| #110 | `7bc9e81a1496041b3d75c5bd3cd359a603c6f6a8` |
+| #109 | `1955eab3d05f72632396eff62ef96d39eedd634b` |
+
+This older table records the state at SHA `1955eab3d05f72632396eff62ef96d39eedd634b`; the newer snapshot above records later observed state.
+
+## Historical live roadmap snapshot — 2026-10-01
+
+The reconciliation began from `Root/main` at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; after PR #98 merged, the latest verified default-branch head was `1df5e4640d4aea7dc700f2088059f489c2e51af0`. The dated PR status addenda below preserve the evidence available then; they are not the current live state.
+
+| Item | Live state | Evidence / boundary |
+|---|---|---|
+| #83 | `closed` | Closed 2026-09-30 after PRs #86 and #90. The accepted sensitive-name exclusion remains in force for `.env`, credential/service-account names, and `.key`, `.pem`, and `.p12` files; excluded payload references are omitted from quarantine metadata in backup archives. |
+| #63 | `open; future tracker` | Protected-index crypto primitives exist, but no current UI path populates them. FTS5/advanced search is not implementation-authorized until searchable fields, lifecycle, privacy leakage, threat model, and acceptance are specified. |
+| #64 | `open; future tracker` | No native Android project or Android CI exists. The issue explicitly requires an architecture/threat-model and protocol-compatibility plan before implementation. |
+| #65 | `open; foundational direction approved` | Versioned cryptographic foundation and vectors exist, but current upload/server paths remain server-readable. A fixture-only, read-only migration inventory prototype and migration contract exist; runtime migration, authorized-client proof, recovery authority, migration window, and backup/restore acceptance remain open. |
+| #66 | `open; partial implementation in PR #97` | PR #97 implements selected-path reconciliation, remote-only state, and guarded cache/materialization flows. Its process-lock marker fails closed if already present; after a crash, manual cleanup may be needed once all sync processes using that root are stopped. Metadata-only listing, pagination, Files On-Demand provider/UI, and safe eviction under concurrent open-handle writers remain incomplete. |
+| #67 | `open; implementation gap` | Existing whole-instance backups and bounded sync revisions are not an anomaly-triggered ransomware shield. Bulk-change detection, pause/review, protected per-object history, and audited restore remain unimplemented. |
+| #68 | `open; implementation gap and product choices` | Current public links are single-file bearer links with expiry/limits, not operation-scoped capabilities. Capability enforcement and protected recipient-key delivery remain open; link UX, expiry defaults, and recipient recovery require owner direction. |
+| #94 / PR #95 | `open; implementation checks pass, deployment gate remains` | Exact head `95d99e4a934384fcfa2101dfc210741cd791a3d1` passes CodeQL, Analyze JavaScript / TypeScript, dependency review, and Ubuntu/Windows Node 22 CI; focused upload-security tests pass 26/26. The account limiter runs before Multer and a direct-peer cap runs before JSON parsing. Deployment process/replica topology remains unknown; do not close #94 until single-process deployment is confirmed or shared/edge enforcement is provided. |
+| PR #96 | `merged` | Merged 2026-10-01 at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; reported exact-head checks passed. |
+| PR #97 | `open; selective-sync implementation is partial` | Exact head `a6a33a92cd6902f303254e60031da4bdc04cec04`. The branch reconciles moves outside selected paths while preserving dirty/untracked files and conflicts. Exact-head CodeQL, Analyze JavaScript / TypeScript, dependency review, and Ubuntu/Windows CI pass; focused suite passes 31 tests with one platform skip; targeted independent move-out review found no actionable issues. The list API still transfers complete remote records including ciphertext before filtering; metadata-only listing, pagination, a Files On-Demand provider/UI, and portable open-handle quiescence for eviction are missing. |
+| PR #98 | `merged` | Documentation/contract reconciliation merged into `Root/main` at `1df5e4640d4aea7dc700f2088059f489c2e51af0`. It did not close issues #63–68 or #94. |
+
+### Historical PR work after the live baseline — 2026-10-01
+
+PR #97 remains open and unmerged; its exact-head CodeQL, dependency-review, Linux/Windows CI, and targeted move-out review passed. PR #98 merged the previous documentation reconciliation at `1df5e4640d4aea7dc700f2088059f489c2e51af0`; this update adds later PR status evidence and did not close any issue. This section records implementation boundaries, not issue completion. Issue #64 has architecture/threat-model documentation only. Issue #65 has a fixture-only, read-only migration-inventory prototype and contract, but no live-data inventory or runtime migration. Issue #66 has a selective-sync implementation in PR #97; its current list API transfers full remote records including ciphertext before local filtering, so network payload transfer is not selective. Windows Files On-Demand UI/provider integration, a metadata-only catalog, and paginated remote listing are absent. Safe eviction under concurrent open-handle writes remains unresolved. Issues #67–68 have design/acceptance contracts only; conservative recommendations are documented, while owner-dependent UX and policy choices remain unapproved. Issue #94 / PR #95 passes exact-head checks but remains open until production replica topology is confirmed or distributed enforcement is added.
+
+The older Phase 9–16 statuses below are evidence for their stated local scope, not acceptance of issues #63–68 or release approval. The historical statement that an unnamed associated PR remained Draft is superseded by the current PR state above; PRs #95 and #97 are open, while PRs #96 and #98 are merged.
+
 ## Fresh control evidence addendum — 2026-08-13
 
 Fresh exact-attachment evidence is linked at `docs/validation/2026-08-13-rootark-fresh-control-evidence.md`. The attachment is verified as 468 lines with SHA-256 `31822A11CACDC5B2693861F2CA945F0A895673F08E925EF1E66CBF4BE73B56DB`. Control-plane provenance is App Server thread `019ffb95-e675-76e1-ae22-a3129af79b5a`, latest fresh completed bounded turn `019ffcfa-d41d-7fc2-a80b-f8790578b6c1`, request `rootark-exact-attachment-20260813-fresh-c`; prior turn `019ffcf0-0977-7e43-a8a8-70065bb1f937` was an incomplete timed-out attempt only.
@@ -201,7 +550,7 @@ These are independent local execution classifications. None is a publication aut
 
 | Boundary | Classification | Safe evidence | Meaning and next action |
 |---|---|---|---|
-| Linked-worktree Git metadata | `BLOCKED_ENVIRONMENT_LOCAL_GIT_ACL` | `E:\servidor-roadmap\.git` points to `E:\servidor\.git\worktrees\servidor-roadmap`; the common object store is `E:\servidor\.git`. `git worktree list --porcelain` shows no live lock files; `git cat-file -e HEAD` succeeds. Read-only ACL inspection found no deny entry for the active `codexsandboxoffline` account, but metadata/object write behavior remains unsafe to change. | No safe ACL repair was applied because no active-account deny was proven and broad ownership/permission changes are prohibited. Preserve the worktree and classify the write boundary as environment-blocked. |
+| Linked-worktree Git metadata | `BLOCKED_ENVIRONMENT_LOCAL_GIT_ACL` | The linked worktree `.git` file points to the repository common Git metadata store. `git worktree list --porcelain` shows no live lock files; `git cat-file -e HEAD` succeeds. Read-only ACL inspection found no deny entry for the active sandbox account, but metadata/object write behavior remains unsafe to change. | No safe ACL repair was applied because no active-account deny was proven and broad ownership/permission changes are prohibited. Preserve the worktree and classify the write boundary as environment-blocked. |
 | npm install/toolchain | `BLOCKED_TOOLCHAIN_DEPENDENCY_INSTALL` | Node `v24.14.1`, npm `11.11.0`, lockfile version 3 with 378 locked packages, absent `node_modules`, and missing `bcryptjs`, `@aws-sdk/client-s3`, and `better-sqlite3`. DNS resolves `registry.npmjs.org`, but TCP/HTTPS 443 connectivity fails. A disposable cache/install was attempted; `npm.cmd ci` timed out after 120 seconds and did not produce usable dependencies. | The dependency tree is incomplete. This is an environment/network boundary, not a source regression; retry only with a functioning disposable install path. |
 | Native SQLite dependency | `BLOCKED_NATIVE_DEPENDENCY` | The existing continuation evidence records `npm.cmd rebuild better-sqlite3` exiting 0 while package contents remained incomplete and `require()` still failed. | A successful rebuild exit code is insufficient evidence of a usable native binding; do not claim SQLite runtime validation. |
 | npm audit and lockfile repair | `SECURITY_DEPENDENCY_ADVISORY` plus `BLOCKED_ENVIRONMENT_TOOLCHAIN_REPAIR` | The unmerged source baseline audit returned exit 1 with one high GHSA-rgw5-rvv9-x895 advisory in brace-expansion 5.0.8 via archiver -> readdir-glob -> minimatch 10.2.6; PR #50 separately hardens the lockfile to 5.0.9 and its branch audit is clean. | The unmerged source baseline remains advisory-affected; remote CI is confirmed partial and advisory-blocked, while independent provider/browser/production/cryptographic validation remains unconfirmed or blocked. |

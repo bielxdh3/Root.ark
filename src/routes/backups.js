@@ -5,7 +5,9 @@ function registerBackupRoutes(app, context) {
     backupService,
     getAuditActor,
     requireBackupAccess,
+    revalidateBackupAccess,
     restoreService,
+    waitForRequestQuiescence,
   } = context;
 
   app.get("/backups", authenticate, requireBackupAccess, (req, res) => {
@@ -30,19 +32,45 @@ function registerBackupRoutes(app, context) {
       });
       res.status(201).json({ backup });
     } catch (error) {
+      if (error.backupOperationState && error.backup) {
+        const warning = error.backupOperationState === "created-history-durability-uncertain"
+          ? "Backup criado e mantido, mas a gravação durável do histórico não foi confirmada. Confira a lista e a auditoria antes de repetir a operação."
+          : "Backup criado, mas uma etapa de manutenção automática falhou. Confira a lista e a auditoria antes de repetir a operação.";
+        auditLog("backup.created", getAuditActor(req), { type: "backup", id: error.backup.id }, "created", "partial", {
+          filename: error.backup.filename,
+          sizeBytes: error.backup.sizeBytes,
+          checksum: error.backup.checksum,
+          postCreateState: error.backupOperationState,
+          errorCode: error.code || null,
+        });
+        res.status(201).json({
+          backup: error.backup,
+          backupOperationState: error.backupOperationState,
+          warning,
+        });
+        return;
+      }
+      const errorCode = typeof error.code === "string" && /^[A-Z0-9_]{1,64}$/.test(error.code)
+        ? error.code
+        : "BACKUP_CREATE_FAILED";
+      const locked = errorCode === "BACKUP_LOCKED";
       auditLog("backup.failed", getAuditActor(req), { type: "backup", id: error.backup?.id || null }, "created", "failure", {
-        error: error.message,
+        errorCode,
       });
-      res.status(error.code === "BACKUP_LOCKED" ? 409 : 500).json({ error: error.message });
+      res.status(locked ? 409 : 500).json({
+        error: locked ? "Já existe uma operação de backup em andamento. Tente novamente." : "Não foi possível criar o backup.",
+      });
     }
   });
 
   app.get("/backups/:id/download", authenticate, requireBackupAccess, (req, res) => {
     try {
       const { backup, archivePath } = backupService.getBackupOrThrow(req.params.id);
-      auditLog("backup.downloaded", getAuditActor(req), { type: "backup", id: backup.id }, "downloaded", "success", {
-        filename: backup.filename,
-      });
+      if (req.method !== "HEAD") {
+        auditLog("backup.downloaded", getAuditActor(req), { type: "backup", id: backup.id }, "downloaded", "success", {
+          filename: backup.filename,
+        });
+      }
       res.download(archivePath, backup.filename);
     } catch (error) {
       res.status(404).json({ error: error.message });
@@ -64,6 +92,16 @@ function registerBackupRoutes(app, context) {
       const result = await restoreService.restoreBackup(req.params.id, {
         confirmation: req.body?.confirmation,
         username: req.user.username,
+        waitForRequestQuiescence: () => waitForRequestQuiescence(req.rootarkRestoreRequestLease),
+        revalidateAuthorization: async () => {
+          const authorizationFailure = await revalidateBackupAccess(req);
+          if (authorizationFailure) {
+            throw Object.assign(new Error(authorizationFailure.error), {
+              code: "RESTORE_AUTHORIZATION_REVOKED",
+              statusCode: authorizationFailure.status,
+            });
+          }
+        },
       });
       auditLog("backup.restore.completed", getAuditActor(req), { type: "backup", id: result.backup.id }, "restore", "success", {
         preRestoreBackupId: result.preRestore.id,
@@ -76,16 +114,37 @@ function registerBackupRoutes(app, context) {
         restartRecommended: result.restartRecommended,
       });
     } catch (error) {
+      const restorePhase = restoreService.getWholeRestorePhase?.() || null;
       auditLog("backup.restore.failed", getAuditActor(req), { type: "backup", id: req.params.id }, "restore", "failure", {
-        error: error.message,
+        error: restorePhase ? "restore_recovery_pending" : error.code === "RESTORE_AUTHORIZATION_REVOKED" ? error.code : error.message,
+        phase: restorePhase,
+        cleanupPending: Boolean(error.authorizationCleanupPending),
       });
-      res.status(error.code === "BACKUP_LOCKED" ? 409 : 400).json({ error: error.message });
+      if (restorePhase === "restart_required") {
+        res.status(503).json({
+          error: "Backup restaurado, mas a limpeza temporária falhou. Reinicie todas as instâncias; o serviço tentará remover a área temporária antes de aceitar novas solicitações.",
+          restartRequired: true,
+          cleanupPending: true,
+        });
+      } else if (restorePhase) {
+        res.status(503).json({
+          error: "A restauração permanece bloqueada para recuperação. Reinicie todas as instâncias e revise o estado antes de tentar novamente.",
+          recoveryRequired: true,
+        });
+      } else if (error.code === "RESTORE_AUTHORIZATION_REVOKED") {
+        res.status(error.statusCode).json({
+          error: error.message,
+          ...(error.authorizationCleanupPending ? { cleanupPending: true } : {}),
+        });
+      } else {
+        res.status(error.code === "BACKUP_LOCKED" ? 409 : 400).json({ error: error.message });
+      }
     }
   });
 
-  app.delete("/backups/:id", authenticate, requireBackupAccess, (req, res) => {
+  app.delete("/backups/:id", authenticate, requireBackupAccess, async (req, res) => {
     try {
-      const backup = backupService.deleteBackup(req.params.id);
+      const backup = await backupService.deleteBackup(req.params.id);
       auditLog("backup.deleted", getAuditActor(req), { type: "backup", id: backup.id }, "deleted", "success", {
         filename: backup.filename,
       });

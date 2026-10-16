@@ -5,7 +5,13 @@ try {
 } catch (error) {
   if (error?.code !== "ENOENT") throw error;
 }
+
+if (String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim() !== "1") {
+  throw new Error("Multiple server instances are unsupported while authentication state is process-local.");
+}
 const express = require("express");
+const { rateLimit } = require("express-rate-limit");
+const UploadChunkSlidingWindowStore = require("./src/middlewares/uploadChunkSlidingWindowStore");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
@@ -23,6 +29,7 @@ const WebSocket = require("ws");
 const cron = require("node-cron");
 const { Transform } = require("node:stream");
 const { scheduleAutomaticBackups } = require("./services/backupScheduler");
+const { getServerMasterKey: readServerMasterKey } = require("./services/serverMasterKey");
 const dbConfig = require("./db");
 const { runMigrations } = require("./db/migrations");
 const usersRepository = require("./repositories/usersRepository");
@@ -38,10 +45,16 @@ const auditRepository = require("./repositories/auditRepository");
 const actionHistoryRepository = require("./repositories/actionHistoryRepository");
 const backupService = require("./services/backupService");
 const restoreService = require("./services/restoreService");
+const restoreProviderOrphans = require("./services/restoreProviderOrphans");
 const { getUploadQuarantineDir } = require("./src/quarantine-paths");
+const { createRestoreRequestGate } = require("./services/restoreRequestGate");
 const trashRepository = require("./repositories/trashRepository");
 const trashService = require("./services/trashService");
 const { createCloudStorage } = require("./services/cloudStorage");
+const { createFileLifecycleLock } = require("./services/fileLifecycleLock");
+const { openReadHandle, readBoundedRegularFile } = require("./services/fileReadHandle");
+const { createCloudTempMutationQueue } = require("./services/cloudTempMutationQueue");
+const { resolveRuntimePath } = require("./src/runtime-paths");
 const registerAuthRoutes = require("./src/routes/auth");
 const registerAnalyticsRoutes = require("./src/routes/analytics");
 const registerAuditRoutes = require("./src/routes/audit");
@@ -49,10 +62,13 @@ const registerBackupRoutes = require("./src/routes/backups");
 const registerTrashRoutes = require("./src/routes/trash");
 const { registerSyncRoutes } = require("./src/routes/sync");
 const { registerGroupRoutes } = require("./src/routes/groups");
-const { createAuthenticate, createRealtimeAuthenticator, getExpectedOrigin, parseCookies } = require("./src/middlewares/auth");
+const { createAuthenticate, createRealtimeAuthenticator, getClientIp, getExpectedOrigin, isAuthTokenExpired, parseCookies } = require("./src/middlewares/auth");
+const { getTrustedClientIp, parseTrustedProxies } = require("./src/middlewares/trustedProxies");
+const { createRealtimeUpgradeGuard } = require("./src/realtime/upgradeGuard");
 const { createRequirePermission } = require("./src/middlewares/permissions");
-const { validateTotpPolicy } = require("./src/services/totpPolicy");
-const { getDeploymentReadiness, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
+const { isTotpRequired, validateTotpPolicy } = require("./src/services/totpPolicy");
+const { getDeploymentReadiness, isSessionCookieSecure, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
+const { getLoginRejection, getLoginSecurityState, registerFailedLoginAttempt, resetLoginUsernameState } = require("./src/services/loginProtection");
 
 const app = express();
 const server = http.createServer(app);
@@ -62,13 +78,39 @@ function parseBoundedNumber(name, fallback, minimum, maximum) {
   return Number.isFinite(value) && Number.isInteger(value) && value >= minimum && value <= maximum ? value : fallback;
 }
 
+function parsePositiveIntegerEnv(name, fallback, maximum) {
+  if (process.env[name] === undefined) return fallback;
+  const value = Number(process.env[name]);
+  if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+    throw new Error(`${name} deve ser um inteiro positivo menor ou igual a ${maximum}.`);
+  }
+  return value;
+}
+
 const REALTIME_MAX_PAYLOAD_BYTES = parseBoundedNumber("REALTIME_MAX_PAYLOAD_BYTES", 16 * 1024, 1024, 1024 * 1024);
 const REALTIME_MAX_BUFFERED_BYTES = parseBoundedNumber("REALTIME_MAX_BUFFERED_BYTES", 64 * 1024, 1024, 16 * 1024 * 1024);
 const REALTIME_MAX_MESSAGES_PER_WINDOW = parseBoundedNumber("REALTIME_MAX_MESSAGES_PER_WINDOW", 30, 1, 10_000);
 const REALTIME_RATE_WINDOW_MS = parseBoundedNumber("REALTIME_RATE_WINDOW_MS", 10 * 1000, 1000, 10 * 60 * 1000);
 const REALTIME_HEARTBEAT_MS = parseBoundedNumber("REALTIME_HEARTBEAT_MS", 30 * 1000, 1000, 10 * 60 * 1000);
 const REALTIME_IDLE_TIMEOUT_MS = parseBoundedNumber("REALTIME_IDLE_TIMEOUT_MS", 2 * REALTIME_HEARTBEAT_MS, REALTIME_HEARTBEAT_MS, 60 * 60 * 1000);
-const wss = new WebSocket.Server({ server, path: "/ws", maxPayload: REALTIME_MAX_PAYLOAD_BYTES, perMessageDeflate: false });
+const REALTIME_UPGRADE_MAX_PER_WINDOW = parseBoundedNumber("REALTIME_UPGRADE_MAX_PER_WINDOW", 120, 1, 100_000);
+const REALTIME_UPGRADE_RATE_WINDOW_MS = parseBoundedNumber("REALTIME_UPGRADE_RATE_WINDOW_MS", 60_000, 1000, 10 * 60 * 1000);
+const REALTIME_MAX_CONNECTIONS_PER_PEER = parseBoundedNumber("REALTIME_MAX_CONNECTIONS_PER_PEER", 100, 1, 10_000);
+const ROUTE_RATE_LIMIT_MAX = parsePositiveIntegerEnv("ROUTE_RATE_LIMIT_MAX", 60, 1_000_000);
+const ROUTE_RATE_LIMIT_WINDOW_MS = parsePositiveIntegerEnv("ROUTE_RATE_LIMIT_WINDOW_MS", 15 * 60 * 1000, 2_147_483_647);
+const realtimeUpgradeGuard = createRealtimeUpgradeGuard({
+  getPeerKey: (req) => getTrustedClientIp(req, app.get("trust proxy fn")),
+  authorize: (req) => {
+    if (restoreService.isWholeRestoreBlocked()) return { statusCode: 503, message: "Restore recovery required" };
+    if (req.headers.origin !== getExpectedOrigin(req, app.get("trust proxy fn"))) return { statusCode: 403, message: "Origin denied" };
+    const user = authenticateRealtimeToken(parseCookies(req.headers.cookie).get("rootark_session"));
+    return user ? { user } : { statusCode: 401, message: "WebSocket authentication required" };
+  },
+  maxAttempts: REALTIME_UPGRADE_MAX_PER_WINDOW,
+  windowMs: REALTIME_UPGRADE_RATE_WINDOW_MS,
+  maxConnections: REALTIME_MAX_CONNECTIONS_PER_PEER,
+});
+const wss = new WebSocket.Server({ server, path: "/ws", maxPayload: REALTIME_MAX_PAYLOAD_BYTES, perMessageDeflate: false, verifyClient: realtimeUpgradeGuard.verifyClient });
 const realtimeHeartbeat = setInterval(() => {
   for (const socket of wss.clients) {
     if (socket.isAlive === false || Date.now() - socket.lastActivityAt > REALTIME_IDLE_TIMEOUT_MS) socket.terminate();
@@ -82,7 +124,11 @@ if (JWT_SECRET.length < 32 || JWT_SECRET === "rootark_secret_change_in_productio
 }
 validateTotpPolicy();
 const PORT = Number(process.env.PORT || 3000);
-const SESSION_COOKIE_OPTIONS = { httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production", path: "/" };
+const TRUSTED_PROXIES = parseTrustedProxies(process.env.TRUSTED_PROXIES);
+const SESSION_COOKIE_OPTIONS = { httpOnly: true, sameSite: "lax", secure: isSessionCookieSecure(process.env), path: "/" };
+if (process.env.NODE_ENV === "production" && !SESSION_COOKIE_OPTIONS.secure) {
+  throw new Error("Production session cookies must use the Secure attribute.");
+}
 const USERS_SEED_FILE = "./data/users.json";
 const USERS_FILE = "./data/users.local.json";
 const USER_GENERATIONS_FILE = "./data/user-generations.local.json";
@@ -100,6 +146,7 @@ const AUDIT_LOGS_FILE = "./data/audit-logs.json";
 const AUDIT_ARCHIVE_FILE = "./data/audit-logs-archive.json";
 const QUARANTINE_FILE = "./data/quarantine.json";
 const GROUPS_FILE = "./data/groups.json";
+const RESTORE_ACTIVE_REQUESTS_DIR = resolveRuntimePath("data", ".rootark-active-requests");
 const CLOUD_STORAGE_PROVIDER = String(process.env.CLOUD_STORAGE_PROVIDER || "local").toLowerCase();
 const CLOUD_STORAGE_PREFIX = String(process.env.CLOUD_STORAGE_PREFIX || "rootark").replace(/^\/+|\/+$/g, "") || "rootark";
 const ROOT_FOLDER_ID = "root";
@@ -109,6 +156,7 @@ const MAX_SHARE_EXPIRATION_MINUTES = 60 * 24 * 30;
 const MAX_SHARE_VIEWS = 1000;
 const MAX_SHARE_DOWNLOADS = 1000;
 const SHARE_VIEW_SESSION_MS = 10 * 60 * 1000;
+const SHARE_PASSWORD_SESSION_MS = 60 * 60 * 1000;
 const MAX_TEMPORARY_EXPIRATION_MS = 1000 * 60 * 60 * 24 * 365;
 const OPEN_FILE_TOKEN_TTL_MS = 10 * 60 * 1000;
 const MAX_ACTION_HISTORY_ENTRIES = 500;
@@ -120,8 +168,18 @@ const MAX_TEXT_PREVIEW_BYTES = 1024 * 1024;
 const CHUNK_UPLOAD_DIR = path.resolve("./temp/.chunks");
 const CHUNK_UPLOAD_INCOMING_DIR = path.join(CHUNK_UPLOAD_DIR, "incoming");
 const CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY = "__resumeBlocked";
+const CHUNK_UPLOAD_EXPIRED_METADATA_KEY = "__expiredAt";
+const CHUNK_UPLOAD_INCOMING_FILE_PATH = Symbol("rootarkChunkUploadIncomingFilePath");
 const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
+const UPLOAD_STAGING_PATH = Symbol("rootarkUploadStagingPath");
 const MAX_UPLOAD_CHUNKS = 2000;
+const UPLOAD_CHUNK_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS, 1, MAX_UPLOAD_CHUNKS * 10);
+const UPLOAD_CHUNK_IP_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_IP_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS * 10, 1, MAX_UPLOAD_CHUNKS * 100);
+const CHUNK_UPLOAD_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const CHUNK_UPLOAD_EXPIRED_TOMBSTONE_TTL_MS = CHUNK_UPLOAD_SESSION_TTL_MS;
+const CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS = parseBoundedNumber("CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS", 60 * 1000, 1000, 60 * 60 * 1000);
+let chunkSessionExpirySweepRunning = false;
+const CHUNK_PART_FILENAMES = Array.from({ length: MAX_UPLOAD_CHUNKS }, (_, index) => `${index}.part`);
 const SINGLE_UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
 const UPLOAD_SCAN_ENABLED = parseEnvBoolean(process.env.UPLOAD_SCAN_ENABLED, true);
 const UPLOAD_SCAN_PROVIDER = String(process.env.UPLOAD_SCAN_PROVIDER || "clamav").toLowerCase();
@@ -129,24 +187,47 @@ const CLAMAV_HOST = process.env.CLAMAV_HOST || "127.0.0.1";
 const CLAMAV_PORT = Number(process.env.CLAMAV_PORT || 3310);
 const UPLOAD_BLOCK_EXECUTABLES = parseEnvBoolean(process.env.UPLOAD_BLOCK_EXECUTABLES, true);
 const UPLOAD_QUARANTINE_DIR = getUploadQuarantineDir();
-const UPLOAD_FAIL_CLOSED = parseEnvBoolean(process.env.UPLOAD_FAIL_CLOSED, false);
+const UPLOAD_FAIL_CLOSED = parseEnvBoolean(process.env.UPLOAD_FAIL_CLOSED, true);
+const DEFAULT_UPLOAD_SUSPICIOUS_EXTENSIONS = [".exe", ".bat", ".cmd", ".scr", ".msi", ".ps1", ".vbs", ".jar", ".com"];
 const UPLOAD_SUSPICIOUS_EXTENSIONS = new Set(
-  String(process.env.UPLOAD_SUSPICIOUS_EXTENSIONS || ".exe,.bat,.cmd,.scr,.msi,.ps1,.vbs,.jar,.com")
+  String(process.env.UPLOAD_SUSPICIOUS_EXTENSIONS || DEFAULT_UPLOAD_SUSPICIOUS_EXTENSIONS.join(","))
     .split(",")
     .map((extension) => extension.trim().toLowerCase())
     .filter(Boolean)
 );
+const NODE_ENV = String(process.env.NODE_ENV || "").trim().toLowerCase();
+const IS_PRODUCTION = NODE_ENV === "production";
+const PUBLISHED_SAMPLE_PASSWORDS = ["admin123", "user123"];
+if (!new Set(["clamav", "disabled"]).has(UPLOAD_SCAN_PROVIDER)) {
+  throw new Error("UPLOAD_SCAN_PROVIDER must be 'clamav' or the explicit development-only value 'disabled'");
+}
+if (IS_PRODUCTION && (!UPLOAD_SCAN_ENABLED || UPLOAD_SCAN_PROVIDER !== "clamav" || !UPLOAD_FAIL_CLOSED)) {
+  throw new Error("Production requires enabled ClamAV upload scanning with fail-closed behavior");
+}
+if (IS_PRODUCTION && !UPLOAD_BLOCK_EXECUTABLES) {
+  throw new Error("Production requires executable extension blocking");
+}
+if (IS_PRODUCTION && DEFAULT_UPLOAD_SUSPICIOUS_EXTENSIONS.some((extension) => !UPLOAD_SUSPICIOUS_EXTENSIONS.has(extension))) {
+  throw new Error("Production requires the default suspicious-extension denylist");
+}
+if ((!UPLOAD_SCAN_ENABLED || UPLOAD_SCAN_PROVIDER === "disabled" || !UPLOAD_FAIL_CLOSED) && !["development", "test"].includes(NODE_ENV)) {
+  throw new Error("Upload scan bypass requires NODE_ENV=development or test");
+}
 const WEBDAV_ENABLED = parseEnvBoolean(process.env.WEBDAV_ENABLED, false);
 const WEBDAV_PATH = normalizeWebDavMountPath(process.env.WEBDAV_PATH || "/dav");
 const WEBDAV_ALLOW_DELETE = parseEnvBoolean(process.env.WEBDAV_ALLOW_DELETE, false);
 const WEBDAV_ALLOW_MOVE = parseEnvBoolean(process.env.WEBDAV_ALLOW_MOVE, false);
 const WEBDAV_MOVE_JOURNAL_DIR = path.resolve("./temp/.incoming");
+const WEBDAV_MOVE_MAX_JOURNAL_BYTES = 1024 * 1024;
+const WEBDAV_MOVE_MAX_CLAIM_BYTES = 64 * 1024;
+// A 16 MiB per-file ceiling leaves room for large metadata indexes while bounding recovery reads.
+const WEBDAV_MOVE_MAX_METADATA_SNAPSHOT_BYTES = 16 * 1024 * 1024;
 const WEBDAV_MOVE_METADATA_FILES = [PUBLIC_LINKS_FILE, FILE_PERMISSIONS_FILE, FILE_EXPIRATIONS_FILE, FILE_VERSIONS_FILE, ENCRYPTED_FILES_FILE];
 const WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS = parseBoundedNumber("WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS", 60 * 1000, 1000, 60 * 60 * 1000);
 const WEBDAV_MOVE_RECONCILIATION_MAX_ATTEMPTS = parseBoundedNumber("WEBDAV_MOVE_RECONCILIATION_MAX_ATTEMPTS", 5, 1, 100);
 const WEBDAV_MOVE_RECONCILIATION_LEASE_MS = parseBoundedNumber("WEBDAV_MOVE_RECONCILIATION_LEASE_MS", 60 * 1000, 1000, 60 * 60 * 1000);
 const WEBDAV_MOVE_RECONCILIATION_MAX_BACKOFF_MS = parseBoundedNumber("WEBDAV_MOVE_RECONCILIATION_MAX_BACKOFF_MS", 60 * 60 * 1000, 1000, 24 * 60 * 60 * 1000);
-const WEBDAV_MOVE_REMOTE_INTENT_STATES = new Set([
+const WEBDAV_MOVE_PRESERVE_STATES = new Set([
   "claimed",
   "destination_upload_intent",
   "destination_upload_uncertain",
@@ -176,10 +257,32 @@ const cloudStorage = createCloudStorage({
   provider: CLOUD_STORAGE_PROVIDER,
   prefix: CLOUD_STORAGE_PREFIX,
   rootFolderId: ROOT_FOLDER_ID,
-  s3: { bucket: process.env.AWS_S3_BUCKET, region: process.env.AWS_REGION, endpoint: process.env.AWS_ENDPOINT_URL, forcePathStyle: process.env.AWS_FORCE_PATH_STYLE === "true" },
+  s3: { bucket: process.env.AWS_S3_BUCKET, region: process.env.AWS_REGION, endpoint: process.env.AWS_ENDPOINT_URL, forcePathStyle: process.env.AWS_FORCE_PATH_STYLE === "true", principalId: process.env.AWS_S3_PRINCIPAL_ID },
   gdrive: { folderId: process.env.GOOGLE_DRIVE_FOLDER_ID, credentials: process.env.GOOGLE_SERVICE_ACCOUNT_JSON, credentialsPath: process.env.GOOGLE_APPLICATION_CREDENTIALS },
 });
-backupService.setCloudStorage(cloudStorage);
+const guardedCloudStorage = restoreProviderOrphans.guardProvider(cloudStorage);
+const cloudFileLifecycleLock = createFileLifecycleLock({
+  directory: resolveRuntimePath("data", ".rootark-cloud-file-locks"),
+});
+const cloudTempMutationQueue = createCloudTempMutationQueue({
+  directory: resolveRuntimePath("data", ".rootark-cloud-temp-mutations"),
+  lifecycleLock: cloudFileLifecycleLock,
+  localPathFor: (folderId, fileName) => path.join(getFolderStoragePath("./temp", folderId), fileName),
+  upload: uploadFileToCloud,
+  remove: deleteFileFromCloud,
+  isSuppressed: restoreProviderOrphans.isSuppressed,
+  isEnabled: isCloudStorageEnabled,
+});
+const cloudUploadMutationQueue = createCloudTempMutationQueue({
+  area: "uploads",
+  directory: resolveRuntimePath("data", ".rootark-cloud-upload-mutations"),
+  lifecycleLock: cloudFileLifecycleLock,
+  localPathFor: (folderId, fileName) => path.join(getFolderStoragePath("./uploads", folderId), fileName),
+  upload: uploadFileToCloud,
+  remove: deleteFileFromCloud,
+  isEnabled: isCloudStorageEnabled,
+});
+backupService.setCloudStorage(guardedCloudStorage);
 restoreService.setCloudStorage(cloudStorage);
 registerReadinessRoutes(app, {
   getReadiness: () => getDeploymentReadiness({
@@ -229,11 +332,15 @@ const ENCRYPTION_LEVELS = {
 function isCloudStorageEnabled() { return cloudStorage.enabled(); }
 function getCloudStorageStatus() { return cloudStorage.status(); }
 function getCloudKey(folderId = ROOT_FOLDER_ID, fileName = "", area = "uploads") { return cloudStorage.key(folderId, fileName, area); }
-async function uploadFileToCloud(localPath, folderId, fileName, area = "uploads") { return cloudStorage.upload(localPath, folderId, fileName, area); }
-async function downloadFileFromCloud(folderId, fileName, localPath, area = "uploads") { return cloudStorage.download(folderId, fileName, localPath, area); }
-async function deleteFileFromCloud(folderId, fileName, area = "uploads") { return cloudStorage.remove(folderId, fileName, area); }
-async function deleteCloudPrefix(prefix) { return cloudStorage.removePrefix(prefix); }
-async function listCloudFiles(folderId, area = "uploads") { return cloudStorage.list(folderId, area); }
+async function uploadFileToCloud(localPath, folderId, fileName, area = "uploads") {
+  const result = await guardedCloudStorage.upload(localPath, folderId, fileName, area);
+  if (result) await restoreProviderOrphans.clear(folderId, fileName, area, cloudStorage);
+  return result;
+}
+async function downloadFileFromCloud(folderId, fileName, localPath, area = "uploads", canPublish) { return guardedCloudStorage.download(folderId, fileName, localPath, area, canPublish); }
+async function deleteFileFromCloud(folderId, fileName, area = "uploads") { return guardedCloudStorage.remove(folderId, fileName, area); }
+async function deleteCloudPrefix(prefix) { return guardedCloudStorage.removePrefix(prefix); }
+async function listCloudFiles(folderId, area = "uploads") { return guardedCloudStorage.list(folderId, area); }
 
 async function syncFolderCacheFromCloud(folderId, area = "uploads") {
   if (!isCloudStorageEnabled()) return;
@@ -252,38 +359,152 @@ async function syncFolderCacheFromCloud(folderId, area = "uploads") {
   }
 }
 
-function syncCloudFireAndForget(promise, label) {
+function syncCloudFireAndForget(operation, label) {
   if (!isCloudStorageEnabled()) return;
-  Promise.resolve(promise).catch((error) => {
+  const work = typeof operation === "function" ? operation : () => operation;
+  restoreRequestGate.run(work).catch((error) => {
     console.error("[cloud-storage] operation failed:", sanitizeLogValue(error.message));
   });
 }
 
-function syncFileToCloud(folderId, fileName, area = "uploads") {
-  const baseDir = area === "temp" ? "./temp" : "./uploads";
-  const localPath = path.join(getFolderStoragePath(baseDir, folderId), path.basename(fileName));
-  syncCloudFireAndForget(uploadFileToCloud(localPath, folderId, fileName, area), `sync ${area}/${folderId}/${fileName}`);
+let cloudUploadMutationDrainScheduled = false;
+let cloudUploadMutationDrainRunning = false;
+let cloudUploadMutationDrainRequested = false;
+
+function requestCloudUploadMutationDrain(label) {
+  if (!isCloudStorageEnabled()) return;
+  cloudUploadMutationDrainRequested = true;
+  if (cloudUploadMutationDrainScheduled || cloudUploadMutationDrainRunning) return;
+
+  cloudUploadMutationDrainScheduled = true;
+  cloudFileLifecycleLock.runDetached(() => {
+    setImmediate(() => {
+      cloudUploadMutationDrainScheduled = false;
+      if (cloudUploadMutationDrainRunning) return;
+      cloudUploadMutationDrainRunning = true;
+      void (async () => {
+        try {
+          do {
+            cloudUploadMutationDrainRequested = false;
+            await restoreRequestGate.run(() => cloudUploadMutationQueue.processAll());
+          } while (cloudUploadMutationDrainRequested);
+        } catch (error) {
+          cloudUploadMutationDrainRequested = false;
+          console.error(`[cloud-upload] ${label} pending:`, sanitizeLogValue(error.message));
+        } finally {
+          cloudUploadMutationDrainRunning = false;
+          if (cloudUploadMutationDrainRequested) requestCloudUploadMutationDrain(label);
+        }
+      })();
+    });
+  });
+}
+
+function processCloudUploadMutationsLater() {
+  requestCloudUploadMutationDrain("reconciliation");
 }
 
 function deleteCloudFileLater(folderId, fileName, area = "uploads") {
-  syncCloudFireAndForget(deleteFileFromCloud(folderId, fileName, area), `delete ${area}/${folderId}/${fileName}`);
+  if (area === "temp") {
+    cloudTempMutationQueue.enqueue(folderId, path.basename(fileName), "absent").catch((error) => {
+      console.error("[cloud-temp] reconciliation pending:", sanitizeLogValue(error.message));
+    });
+    return;
+  }
+  syncCloudFireAndForget(() => deleteFileFromCloud(folderId, fileName, area), `delete ${area}/${folderId}/${fileName}`);
 }
 
-function deleteCloudFolderLater(folderId) {
-  syncCloudFireAndForget(deleteCloudPrefix(getCloudKey(folderId, "", "uploads")), `delete uploads folder ${folderId}`);
-  syncCloudFireAndForget(deleteCloudPrefix(getCloudKey(folderId, "", "temp")), `delete temp folder ${folderId}`);
+async function deleteCloudTempFile(folderId, fileName) {
+  if (!isCloudStorageEnabled()) return true;
+  await cloudTempMutationQueue.enqueue(folderId, path.basename(fileName), "absent");
+  return true;
 }
 
-async function ensureCloudFileCached(folderId, fileName, localPath, area = "uploads") {
-  if (isExistingFile(localPath)) return true;
-  if (!isCloudStorageEnabled()) return false;
+async function deleteCloudFolder(folderId) {
+  if (!isCloudStorageEnabled()) return;
+  await Promise.all([
+    deleteCloudPrefix(getCloudKey(folderId, "", "uploads")),
+    deleteCloudPrefix(getCloudKey(folderId, "", "temp")),
+  ]);
+}
 
+async function ensureCloudFileCached(folderId, fileName, localPath, area = "uploads", canPublish, logicalFileName = fileName) {
   try {
-    return await downloadFileFromCloud(folderId, fileName, localPath, area);
+    return await cloudFileLifecycleLock.run(folderId, logicalFileName, async () => {
+      if (!isFolderAvailable(folderId)) return false;
+      if (area === "temp" && restoreProviderOrphans.isSuppressed(folderId, fileName, area)) return false;
+      if (area === "uploads" && isFileExpired(folderId, logicalFileName)) return false;
+      if (isExistingFile(localPath)) return true;
+      if (!isCloudStorageEnabled()) return false;
+      const publishAllowed = () => (
+        (typeof canPublish !== "function" || canPublish()) &&
+        isFolderAvailable(folderId) &&
+        (area !== "temp" || !restoreProviderOrphans.isSuppressed(folderId, fileName, area)) &&
+        (area !== "uploads" || !isFileExpired(folderId, logicalFileName)) &&
+        (area !== "temp" || Boolean(getPendingUploadEntry(folderId, logicalFileName))) &&
+        (typeof canPublish === "function" || area !== "uploads" || !isFileInTrash(folderId, logicalFileName))
+      );
+      return await downloadFileFromCloud(folderId, fileName, localPath, area, publishAllowed);
+    });
   } catch (error) {
     console.error("[cloud-storage] restore cache failed:", sanitizeLogValue(error.message));
     return false;
   }
+}
+
+function handleCloudLifecycleMutation(operation, res, itemType, onTimeout) {
+  return operation.catch((error) => {
+    if (["FILE_LIFECYCLE_LOCK_TIMEOUT", "FILE_LIFECYCLE_LOCK_UNAVAILABLE"].includes(error?.code)) {
+      onTimeout?.();
+      if (!res || res.headersSent) throw error;
+      return res.status(503).set("Retry-After", "5").json({ error: itemType + " temporariamente indisponivel" });
+    }
+    throw error;
+  });
+}
+
+function runCloudFileLifecycleMutation(folderId, fileName, work, res) {
+  return handleCloudLifecycleMutation(cloudFileLifecycleLock.run(folderId, fileName, work), res, "Arquivo");
+}
+
+function runCloudFolderLifecycleMutation(folderId, work, res, onTimeout) {
+  return handleCloudLifecycleMutation(cloudFileLifecycleLock.runFolder(folderId, work), res, "Pasta", onTimeout);
+}
+
+function getChunkUploadSessionLockIdentity(sessionDir) {
+  const resolved = path.resolve(sessionDir);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function runChunkUploadSessionLock(sessionDir, work) {
+  return cloudFileLifecycleLock.runFolder(`chunk-upload:${getChunkUploadSessionLockIdentity(sessionDir)}`, work);
+}
+
+function withChunkUploadSessionLock(handler) {
+  return (req, res, next) => {
+    const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
+    const uploadId = String(req.body?.uploadId || "");
+    const sessionDir = getChunkSessionDir(folderId, uploadId);
+    if (!sessionDir) return handler(req, res, next);
+
+    const operation = runChunkUploadSessionLock(sessionDir, () => handler(req, res, next));
+    return handleCloudLifecycleMutation(operation, res, "Upload", () => removeChunkUploadIncomingFile(req.file));
+  };
+}
+
+function processCloudTempMutationAfterLifecycle(folderId, fileName) {
+  if (!isCloudStorageEnabled()) return;
+  cloudFileLifecycleLock.runDetached(() => {
+    setImmediate(() => {
+      cloudTempMutationQueue.process(folderId, fileName).catch((error) => {
+        console.error("[cloud-temp] reconciliation pending:", sanitizeLogValue(error.message));
+      });
+    });
+  });
+}
+
+function runCloudMoveLifecycleMutation(fromFolderId, toFolderId, fileName, work, res) {
+  return handleCloudLifecycleMutation(cloudFileLifecycleLock.runAcrossFolders([fromFolderId, toFolderId], fromFolderId, fileName, work), res, "Arquivo");
 }
 
 function refreshRealtimeUser(socket) {
@@ -313,21 +534,37 @@ function broadcastDataChanged(source, payload = {}) {
   broadcastRealtime("data:changed", { source, ...payload });
 }
 
-function loadUsers() {
+function loadUsers({ failOnDatabaseError = false, allowJsonFallback = true } = {}) {
   if (shouldUseDatabase()) {
+    const jsonFallbackEnabled = shouldReadJsonFallback();
+    let users;
     try {
-      const users = usersRepository.loadUsers();
-      if (users.length || !shouldReadJsonFallback()) return users;
+      users = usersRepository.loadUsers();
     } catch (error) {
       console.error("Falha ao ler usuarios do SQLite:", error.message);
-      if (!shouldReadJsonFallback()) return [];
+      if (!jsonFallbackEnabled || !allowJsonFallback) {
+        if (failOnDatabaseError) {
+          throw Object.assign(new Error("Authorization store unavailable"), { code: "AUTHORIZATION_STORE_UNAVAILABLE" });
+        }
+        return [];
+      }
+    }
+
+    if (users) {
+      if (users.length || !jsonFallbackEnabled) return users;
+      if (!allowJsonFallback) {
+        if (failOnDatabaseError) {
+          throw Object.assign(new Error("Authorization store unavailable"), { code: "AUTHORIZATION_STORE_UNAVAILABLE" });
+        }
+        return [];
+      }
     }
   }
   return JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
 }
 
 function loadUserGenerations() {
-  if (!fs.existsSync(USER_GENERATIONS_FILE)) return {};
+  if (!fs.existsSync(USER_GENERATIONS_FILE)) return Object.create(null);
 
   let generations;
   try {
@@ -339,19 +576,19 @@ function loadUserGenerations() {
   if (!generations || typeof generations !== "object" || Array.isArray(generations) || Object.values(generations).some((version) => !Number.isSafeInteger(version) || version < 0)) {
     throw new Error("Historico de geracoes de usuario invalido");
   }
-  return generations;
+  return Object.assign(Object.create(null), generations);
 }
 
 function rememberUserGenerations(users) {
-  const generations = loadUserGenerations();
+  const generations = new Map(Object.entries(loadUserGenerations()));
   for (const user of users) {
     const username = String(user?.username || "").trim();
     const version = user?.sessionVersion || 0;
     if (username && Number.isSafeInteger(version) && version >= 0) {
-      generations[username] = Math.max(generations[username] ?? 0, version);
+      generations.set(username, Math.max(generations.get(username) ?? 0, version));
     }
   }
-  fs.writeFileSync(USER_GENERATIONS_FILE, JSON.stringify(generations, null, 2));
+  fs.writeFileSync(USER_GENERATIONS_FILE, JSON.stringify(Object.fromEntries(generations), null, 2));
 }
 
 function getCreatedUserSessionVersion(username) {
@@ -361,6 +598,12 @@ function getCreatedUserSessionVersion(username) {
 }
 
 function saveUsers(users) {
+  const passwordHashesToValidate = trustedUserPasswordHashes === null
+    ? users
+    : users.filter((user) => trustedUserPasswordHashes.get(String(user?.username || "")) !== String(user?.password || ""));
+  if (NODE_ENV !== "test" && hasPublishedSampleCredentials(passwordHashesToValidate)) {
+    throw new Error("Published sample credentials are not allowed outside NODE_ENV=test.");
+  }
   if (shouldUseDatabase()) usersRepository.saveUsers(users);
   if (shouldWriteLegacyJson()) {
     rememberUserGenerations(users);
@@ -373,6 +616,7 @@ function saveUsers(users) {
       throw error;
     }
   }
+  trustedUserPasswordHashes = snapshotUserPasswordHashes(users);
 }
 
 function getBasePermissions() {
@@ -404,17 +648,43 @@ function normalizeUserPermissions(user = {}) {
   return permissions;
 }
 
+function developmentBootstrapDefaultsEnabled() {
+  return ["development", "test"].includes(process.env.NODE_ENV) && process.env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS === "true";
+}
+
+function hasPublishedSampleCredentials(users) {
+  return users.some((user) => PUBLISHED_SAMPLE_PASSWORDS.some((password) => bcrypt.compareSync(password, String(user?.password || ""))));
+}
+
+function isPublishedSamplePassword(password) {
+  return typeof password === "string" && PUBLISHED_SAMPLE_PASSWORDS.includes(password);
+}
+
 function getDefaultUsers() {
+  if (!developmentBootstrapDefaultsEnabled()) {
+    throw new Error("No users are configured. Provide an explicit user seed or enable local development bootstrap.");
+  }
+
+  let adminPassword = "admin123";
+  let userPassword = "user123";
+  if (NODE_ENV === "development") {
+    adminPassword = process.env.ROOTARK_DEV_BOOTSTRAP_ADMIN_PASSWORD || "";
+    userPassword = process.env.ROOTARK_DEV_BOOTSTRAP_USER_PASSWORD || "";
+    if ([adminPassword, userPassword].some((password) => password.length < 16 || isPublishedSamplePassword(password)) || adminPassword === userPassword) {
+      throw new Error("Development bootstrap requires distinct passwords of at least 16 characters that are not published samples.");
+    }
+  }
+
   return [
     {
       username: "admin",
-      password: bcrypt.hashSync("admin123", 10),
+      password: bcrypt.hashSync(adminPassword, 10),
       role: "admin",
       permissions: normalizeUserPermissions({ role: "admin" }),
     },
     {
       username: "user",
-      password: bcrypt.hashSync("user123", 10),
+      password: bcrypt.hashSync(userPassword, 10),
       role: "user",
       permissions: {
         ...getBasePermissions(),
@@ -424,14 +694,34 @@ function getDefaultUsers() {
   ];
 }
 
+let publishedSampleCredentialsPresent = false;
+let trustedUserPasswordHashes = null;
+
+function snapshotUserPasswordHashes(users) {
+  return new Map(users.map((user) => [String(user?.username || ""), String(user?.password || "")]));
+}
+
 function loadSeedUsers() {
   if (!fs.existsSync(USERS_SEED_FILE)) return null;
 
   try {
     const users = JSON.parse(fs.readFileSync(USERS_SEED_FILE, "utf-8"));
-    return Array.isArray(users) && users.length ? users : null;
+    if (!Array.isArray(users) || !users.length) throw new Error("invalid seed");
+    const usernames = new Set();
+    for (const user of users) {
+      if (!user || typeof user !== "object" || Array.isArray(user)) throw new Error("invalid seed user");
+      const normalizedUsername = typeof user.username === "string" ? user.username.trim().toLowerCase() : "";
+      if (!normalizedUsername || usernames.has(normalizedUsername)) {
+        throw new Error("invalid seed user");
+      }
+      usernames.add(normalizedUsername);
+      let rounds;
+      try { rounds = bcrypt.getRounds(user.password); } catch { throw new Error("invalid password hash"); }
+      if (!Number.isInteger(rounds) || rounds < 10) throw new Error("password hash is not sufficiently hardened");
+    }
+    return users;
   } catch {
-    return null;
+    throw new Error("The configured user seed is invalid.");
   }
 }
 
@@ -586,9 +876,16 @@ function loadFileVersions() {
   }
 }
 
-function saveFileVersions(entries) {
+function saveFileVersions(entries, { tolerateLegacyJsonMirrorFailure = false } = {}) {
   if (shouldUseDatabase()) fileVersionsRepository.saveFileVersions(entries);
-  if (shouldWriteLegacyJson()) fs.writeFileSync(FILE_VERSIONS_FILE, JSON.stringify(entries, null, 2));
+  if (shouldWriteLegacyJson()) {
+    try {
+      fs.writeFileSync(FILE_VERSIONS_FILE, JSON.stringify(entries, null, 2));
+    } catch (error) {
+      if (!shouldUseDatabase() || !tolerateLegacyJsonMirrorFailure) throw error;
+      console.error("Falha ao atualizar espelho JSON das versoes:", sanitizeLogValue(error.message));
+    }
+  }
   broadcastDataChanged("versions");
 }
 
@@ -797,19 +1094,49 @@ function loadPublicLinks() {
   if (shouldUseDatabase()) {
     try {
       const entries = publicLinksRepository.loadPublicLinks();
-      if (Object.keys(entries).length || !shouldReadJsonFallback()) return entries;
+      if (!shouldReadJsonFallback() || !fs.existsSync(PUBLIC_LINKS_FILE)) return entries;
+
+      let fallbackEntries;
+      try {
+        fallbackEntries = JSON.parse(fs.readFileSync(PUBLIC_LINKS_FILE, "utf-8"));
+      } catch (error) {
+        console.error("Falha ao ler links publicos JSON de fallback:", error.message);
+        return entries;
+      }
+
+      let recordedTokens;
+      try {
+        recordedTokens = publicLinksRepository.getRecordedPublicLinkTokens(Object.keys(fallbackEntries || {}));
+      } catch (error) {
+        console.error("Falha ao reconciliar links publicos JSON com SQLite:", error.message);
+        return entries;
+      }
+      const unrecordedFallbackEntries = Object.fromEntries(
+        Object.entries(fallbackEntries || {}).filter(([token]) => /^[a-f0-9]{48}$/i.test(token) && !recordedTokens.has(token))
+      );
+      return { ...unrecordedFallbackEntries, ...entries };
     } catch (error) {
       console.error("Falha ao ler links publicos do SQLite:", error.message);
-      if (!shouldReadJsonFallback()) return {};
+      return {};
     }
   }
   if (!fs.existsSync(PUBLIC_LINKS_FILE)) return {};
   return JSON.parse(fs.readFileSync(PUBLIC_LINKS_FILE, "utf-8"));
 }
 
-function savePublicLinks(entries) {
-  if (shouldUseDatabase()) publicLinksRepository.savePublicLinks(entries);
-  if (shouldWriteLegacyJson()) fs.writeFileSync(PUBLIC_LINKS_FILE, JSON.stringify(entries, null, 2));
+function savePublicLinks(entries = {}) {
+  const nextEntries = entries && typeof entries === "object" ? entries : {};
+  let removedFallbackEntries = {};
+  if (shouldUseDatabase() && shouldReadJsonFallback() && fs.existsSync(PUBLIC_LINKS_FILE)) {
+    const priorFallbackEntries = JSON.parse(fs.readFileSync(PUBLIC_LINKS_FILE, "utf-8"));
+    removedFallbackEntries = Object.fromEntries(
+      Object.entries(priorFallbackEntries || {}).filter(([token]) => !Object.prototype.hasOwnProperty.call(nextEntries, token))
+    );
+  }
+  if (shouldUseDatabase()) {
+    publicLinksRepository.savePublicLinks(nextEntries, { removedEntries: removedFallbackEntries });
+  }
+  if (shouldWriteLegacyJson()) fs.writeFileSync(PUBLIC_LINKS_FILE, JSON.stringify(nextEntries, null, 2));
   broadcastDataChanged("shares");
 }
 
@@ -964,23 +1291,10 @@ function saveAuditLogs(entries, file = AUDIT_LOGS_FILE) {
 }
 
 function getAuditActor(req, fallbackUsername = "system") {
-  const forwardedFor = String(req?.headers?.["x-forwarded-for"] || "")
-    .split(",")
-    .map((ip) => ip.trim())
-    .filter(Boolean);
-  const rawIp =
-    req?.headers?.["cf-connecting-ip"] ||
-    req?.headers?.["x-real-ip"] ||
-    forwardedFor[0] ||
-    req?.ip ||
-    req?.socket?.remoteAddress ||
-    null;
-  const ip = rawIp === "::1" || rawIp === "::ffff:127.0.0.1" ? "127.0.0.1" : rawIp;
-
   return {
     username: req?.user?.username || fallbackUsername || "system",
     role: req?.user?.role || null,
-    ip,
+    ip: getClientIp(req),
     userAgent: req?.headers?.["user-agent"] || null,
   };
 }
@@ -994,8 +1308,9 @@ function getSafeWebDavAuditPath(req) {
   }
 }
 
-function sendWebDavUnauthorized(req, res, reason = "invalid_credentials") {
+function sendWebDavUnauthorized(req, res, reason = "invalid_credentials", status = 401, retryAfter) {
   res.setHeader("WWW-Authenticate", 'Basic realm="Root.ark WebDAV", charset="UTF-8"');
+  if (retryAfter) res.setHeader("Retry-After", String(retryAfter));
   auditLog(
     "webdav.login.failed",
     getAuditActor(req, "anonymous"),
@@ -1004,37 +1319,78 @@ function sendWebDavUnauthorized(req, res, reason = "invalid_credentials") {
     "failure",
     { reason, method: req.method, path: getSafeWebDavAuditPath(req) }
   );
-  res.status(401).send("Authentication required");
+  res.status(status).send(status === 429 ? "Too many authentication attempts" : "Authentication required");
   return false;
 }
 
 function authenticateWebDavRequest(req, res) {
   const header = String(req.headers.authorization || "");
-  if (!header.toLowerCase().startsWith("basic ")) {
-    return sendWebDavUnauthorized(req, res, "missing_basic_auth");
-  }
-
   let username = "";
   let password = "";
-  try {
-    const decoded = Buffer.from(header.slice(6), "base64").toString("utf-8");
-    const separator = decoded.indexOf(":");
-    if (separator === -1) return sendWebDavUnauthorized(req, res, "malformed_basic_auth");
-    username = decoded.slice(0, separator).trim();
-    password = decoded.slice(separator + 1);
-  } catch {
-    return sendWebDavUnauthorized(req, res, "malformed_basic_auth");
+  let parseFailure = "";
+  if (!header.toLowerCase().startsWith("basic ")) {
+    parseFailure = "missing_basic_auth";
+  } else {
+    try {
+      const decoded = Buffer.from(header.slice(6), "base64").toString("utf-8");
+      const separator = decoded.indexOf(":");
+      if (separator === -1) parseFailure = "malformed_basic_auth";
+      else {
+        username = decoded.slice(0, separator).trim();
+        password = decoded.slice(separator + 1);
+      }
+    } catch {
+      parseFailure = "malformed_basic_auth";
+    }
+  }
+
+  const security = getLoginSecurityState(req, username, getAuditActor);
+  const rejection = getLoginRejection(security);
+  if (rejection) return sendWebDavUnauthorized(req, res, rejection.reason, 429, rejection.retryAfter);
+  if (parseFailure) {
+    security.ipState.attempts += 1;
+    registerFailedLoginAttempt(security.ipState, security.now, security.config);
+    registerFailedLoginAttempt(security.usernameState, security.now, security.config);
+    return sendWebDavUnauthorized(req, res, parseFailure);
   }
 
   const user = loadUsers().find((entry) => sameUsername(entry.username, username));
-  if (!user || !bcrypt.compareSync(password, user.password)) {
+  if (!user || user.disabled || !bcrypt.compareSync(password, user.password)) {
+    security.ipState.attempts += 1;
+    registerFailedLoginAttempt(security.ipState, security.now, security.config);
+    registerFailedLoginAttempt(security.usernameState, security.now, security.config);
+    const failureRejection = getLoginRejection(security);
+    if (failureRejection && failureRejection.reason !== "rate_limit") {
+      return sendWebDavUnauthorized(req, res, failureRejection.reason, 429, failureRejection.retryAfter);
+    }
     return sendWebDavUnauthorized(req, res, "invalid_credentials");
+  }
+  resetLoginUsernameState(security);
+
+  let totpPolicy;
+  try {
+    totpPolicy = validateTotpPolicy();
+  } catch {
+    auditLog(
+      "webdav.login.failed",
+      getAuditActor(req, "anonymous"),
+      { type: "webdav", id: WEBDAV_PATH },
+      "authenticate",
+      "failure",
+      { reason: "totp_policy_unavailable", method: req.method, path: getSafeWebDavAuditPath(req) }
+    );
+    res.status(503).send("Authentication policy unavailable");
+    return false;
+  }
+  if (user.totpEnabled || isTotpRequired(user, totpPolicy)) {
+    return sendWebDavUnauthorized(req, res, "totp_required");
   }
 
   req.user = {
     username: user.username,
     role: user.role,
     permissions: normalizeUserPermissions(user),
+    sessionVersion: user.sessionVersion || 0,
   };
   return true;
 }
@@ -1113,7 +1469,13 @@ function auditLog(eventType, actor, target, action, result, details = {}) {
 
   appendAuditLog(log);
   if (log.severity === "critical" || log.severity === "error") {
-    console.error(`[AUDIT ${log.severity.toUpperCase()}]`, log);
+    console.error(`[AUDIT ${log.severity.toUpperCase()}]`, {
+      id: log.id,
+      timestamp: log.timestamp,
+      eventType: log.eventType,
+      severity: log.severity,
+      result: log.result,
+    });
   }
   return log.id;
 }
@@ -1251,11 +1613,11 @@ function getShareMaxDownloads(rawValue) {
   return rounded;
 }
 
-function getSharePasswordHash(password) {
+function getSharePassword(password) {
   const value = typeof password === "string" ? password.trim() : "";
   if (!value) return null;
   if (value.length < 4 || value.length > 128) return undefined;
-  return bcrypt.hashSync(value, 10);
+  return value;
 }
 
 function escapeHtml(value) {
@@ -1275,18 +1637,57 @@ function getSharePasswordCookieName(token) {
   return `rootark_share_pwd_${token}`;
 }
 
-function setSharePasswordCookie(req, res, token) {
-  res.cookie(getSharePasswordCookieName(token), "ok", {
+function getSharePasswordSessionMac(token, passwordHash, expiresAtMs) {
+  return crypto.createHmac("sha256", JWT_SECRET)
+    .update("rootark:share-password-session:v1\0", "utf8")
+    .update(token, "utf8")
+    .update("\0", "utf8")
+    .update(String(passwordHash), "utf8")
+    .update("\0", "utf8")
+    .update(String(expiresAtMs), "utf8")
+    .digest();
+}
+
+function setSharePasswordCookie(req, res, token, link) {
+  const passwordHash = link?.passwordHash || link?.password_hash || null;
+  const linkExpiresAtMs = new Date(link?.expiresAt).getTime();
+  const expiresAtMs = Math.min(Date.now() + SHARE_PASSWORD_SESSION_MS, linkExpiresAtMs);
+  if (!passwordHash || !Number.isFinite(linkExpiresAtMs) || expiresAtMs <= Date.now()) return;
+
+  const mac = getSharePasswordSessionMac(token, passwordHash, expiresAtMs).toString("base64url");
+  res.cookie(getSharePasswordCookieName(token), `v1.${expiresAtMs}.${mac}`, {
     httpOnly: true,
     sameSite: "lax",
-    secure: req.secure || req.get("x-forwarded-proto") === "https",
-    maxAge: 1000 * 60 * 60,
+    secure: req.secure,
+    expires: new Date(expiresAtMs),
   });
 }
 
 function hasValidSharePasswordSession(req, token, link) {
   if (!hasSharePassword(link)) return true;
-  return getCookieValue(req, getSharePasswordCookieName(token)) === "ok";
+
+  let cookieValue = "";
+  try {
+    cookieValue = getCookieValue(req, getSharePasswordCookieName(token));
+  } catch {
+    return false;
+  }
+
+  const match = /^v1\.(\d{1,16})\.([A-Za-z0-9_-]{43})$/.exec(cookieValue);
+  if (!match) return false;
+
+  const expiresAtMs = Number(match[1]);
+  const linkExpiresAtMs = new Date(link.expiresAt).getTime();
+  if (!Number.isSafeInteger(expiresAtMs) || expiresAtMs <= Date.now() || !Number.isFinite(linkExpiresAtMs) || expiresAtMs > linkExpiresAtMs) {
+    return false;
+  }
+
+  const providedMac = Buffer.from(match[2], "base64url");
+  if (providedMac.length !== 32 || providedMac.toString("base64url") !== match[2]) return false;
+
+  const passwordHash = link.passwordHash || link.password_hash;
+  const expectedMac = getSharePasswordSessionMac(token, passwordHash, expiresAtMs);
+  return crypto.timingSafeEqual(providedMac, expectedMac);
 }
 
 function getShareFailurePage(message = "Este link nao esta disponivel.") {
@@ -1296,6 +1697,7 @@ function getShareFailurePage(message = "Este link nao esta disponivel.") {
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/assets/logo.svg" type="image/svg+xml" />
     <meta name="robots" content="noindex, nofollow, noarchive" />
     <title>Root.ark - Link indisponivel</title>
     <style>
@@ -1342,11 +1744,20 @@ function getTemporaryExpirationFromBody(body = {}) {
   return new Date(Date.now() + durationMs).toISOString();
 }
 
+function isShareViewerId(viewerId) {
+  return typeof viewerId === "string" && /^[a-f0-9]{32}$/.test(viewerId);
+}
+
 function cleanupShareViewers(link, now = Date.now()) {
   const viewers = link.activeViewers && typeof link.activeViewers === "object" ? link.activeViewers : {};
   let changed = false;
 
   for (const [viewerId, viewer] of Object.entries(viewers)) {
+    if (!isShareViewerId(viewerId)) {
+      delete viewers[viewerId];
+      changed = true;
+      continue;
+    }
     const expiresAt = new Date(viewer?.expiresAt).getTime();
     if (!Number.isFinite(expiresAt) || expiresAt <= now) {
       delete viewers[viewerId];
@@ -1375,9 +1786,19 @@ function setShareViewerCookie(req, res, token, viewerId, expiresAt) {
   const maxAge = Math.max(1, Math.min(SHARE_VIEW_SESSION_MS, expiresAt - Date.now()));
   res.cookie(`rootark_share_${token}`, viewerId, {
     httpOnly: true,
-    sameSite: "lax",
-    secure: req.secure || req.get("x-forwarded-proto") === "https",
+    sameSite: "strict",
+    secure: req.secure,
     maxAge,
+  });
+}
+
+function setShareDownloadReceiptCookie(req, res, token) {
+  res.cookie(`rootark_share_dl_${token}`, crypto.randomBytes(16).toString("base64url"), {
+    httpOnly: false,
+    sameSite: "strict",
+    secure: req.secure,
+    maxAge: 5 * 60 * 1000,
+    path: `/share/${token}`,
   });
 }
 
@@ -1392,6 +1813,7 @@ function renderPublicSharePage(token) {
     <meta name="robots" content="noindex, nofollow, noarchive" />
     <meta property="og:title" content="Root.ark - Compartilhamento" />
     <meta property="og:description" content="Acesse um arquivo compartilhado com segurança pelo Root.ark." />
+    <link rel="icon" href="/assets/logo.svg" type="image/svg+xml" />
     <title>Root.ark - Compartilhamento</title>
     <style>
       :root {
@@ -1525,6 +1947,13 @@ function renderPublicSharePage(token) {
         color: white;
       }
 
+      .password-label {
+        display: block;
+        margin-top: 10px;
+        color: var(--muted);
+        font-weight: 700;
+      }
+
       .hidden { display: none !important; }
 
       .preview {
@@ -1587,20 +2016,25 @@ function renderPublicSharePage(token) {
       </div>
       <section class="file-box">
         <h2 id="fileName">Validando link...</h2>
-        <p class="status" id="status">Aguarde um instante.</p>
+        <p class="status" id="status" role="status" aria-live="polite" aria-atomic="true">Aguarde um instante.</p>
 
         <div id="passwordBox" class="hidden">
           <p>Este link esta protegido. Digite a senha para continuar.</p>
-          <input type="password" id="sharePassword" placeholder="Senha do link" autocomplete="current-password" />
-          <div class="actions">
-            <button type="button" class="primary" id="passwordButton">Acessar</button>
-          </div>
+          <form id="sharePasswordForm">
+            <label class="password-label" for="sharePassword">Senha do link</label>
+            <input type="password" id="sharePassword" placeholder="Digite a senha" aria-label="Senha do link" autocomplete="current-password" />
+            <div class="actions">
+              <button type="submit" class="primary" id="passwordButton">Acessar</button>
+            </div>
+          </form>
         </div>
 
         <div id="contentBox" class="hidden">
           <div class="meta" id="meta"></div>
           <div class="actions">
-            <a class="primary" id="downloadButton" href="/share/${safeToken}/download">Download</a>
+            <form id="shareDownloadForm" method="post" action="/share/${safeToken}/download">
+              <button class="primary" id="downloadButton" type="submit">Download</button>
+            </form>
             <button type="button" id="previewButton">Preview</button>
             <button type="button" id="copyButton">Copiar link</button>
             <button type="button" id="qrButton">QR Code</button>
@@ -1616,14 +2050,26 @@ function renderPublicSharePage(token) {
       const status = document.getElementById("status");
       const passwordBox = document.getElementById("passwordBox");
       const contentBox = document.getElementById("contentBox");
+      const passwordForm = document.getElementById("sharePasswordForm");
+      const downloadForm = document.getElementById("shareDownloadForm");
       const passwordInput = document.getElementById("sharePassword");
       const passwordButton = document.getElementById("passwordButton");
+      const downloadButton = document.getElementById("downloadButton");
       const meta = document.getElementById("meta");
       const previewButton = document.getElementById("previewButton");
       const previewBox = document.getElementById("previewBox");
       const qrButton = document.getElementById("qrButton");
       const qrBox = document.getElementById("qrBox");
       const copyButton = document.getElementById("copyButton");
+      let accessRequestPending = false;
+      let currentShareAccess = null;
+      let downloadReceiptPending = false;
+
+      function readDownloadReceipt() {
+        const prefix = "rootark_share_dl_" + token + "=";
+        return String(document.cookie || "").split(";").map((cookie) => cookie.trim())
+          .find((cookie) => cookie.startsWith(prefix))?.slice(prefix.length) || "";
+      }
 
       function formatSize(bytes) {
         const size = Number(bytes) || 0;
@@ -1634,6 +2080,8 @@ function renderPublicSharePage(token) {
       }
 
       function renderAccess(data) {
+        currentShareAccess = data;
+        passwordInput.value = "";
         passwordBox.classList.add("hidden");
         contentBox.classList.remove("hidden");
         fileName.textContent = data.fileName || "Arquivo compartilhado";
@@ -1645,46 +2093,148 @@ function renderPublicSharePage(token) {
           data.remainingDownloads !== null ? '<span class="pill">' + data.remainingDownloads + ' downloads restantes</span>' : '<span class="pill">Downloads ilimitados</span>'
         ].filter(Boolean).join("");
         previewButton.hidden = !data.canPreview;
+        previewButton.classList.toggle("hidden", !data.canPreview);
+        downloadButton.disabled = data.remainingDownloads === 0;
+      }
+
+      async function refreshShareAccess() {
+        downloadButton.disabled = true;
+        status.textContent = "Atualizando os limites de acesso...";
+        try {
+          const response = await fetch("/share/" + token + "/status", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}"
+          });
+          const data = await response.json();
+          if (!response.ok) {
+            if (response.status === 401 && data.passwordRequired) {
+              fileName.textContent = "Link protegido";
+              status.textContent = "A sessao do link expirou. Informe a senha novamente.";
+              passwordInput.value = "";
+              passwordBox.classList.remove("hidden");
+              contentBox.classList.add("hidden");
+              previewBox.replaceChildren();
+              delete previewBox.dataset.loaded;
+              previewBox.classList.add("hidden");
+              passwordInput.focus();
+              return;
+            }
+            throw new Error("Share access refresh failed");
+          }
+          renderAccess({ ...currentShareAccess, ...data });
+          if (data.remainingDownloads === 0) status.textContent = "Limite de downloads atingido.";
+        } catch {
+          downloadButton.disabled = true;
+          status.textContent = "Nao foi possivel atualizar os limites. Recarregue a pagina.";
+        }
       }
 
       async function accessShare(password = "") {
+        if (accessRequestPending) return;
+        accessRequestPending = true;
         status.textContent = "Validando link...";
-        const response = await fetch("/share/" + token + "/password", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ password })
-        });
-        const data = await response.json().catch(() => ({}));
+        passwordButton.disabled = true;
+        passwordButton.textContent = "Validando...";
+        try {
+          const response = await fetch("/share/" + token + "/password", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ password })
+          });
+          const data = await response.json();
 
-        if (response.status === 401 && data.passwordRequired) {
-          fileName.textContent = "Link protegido";
-          status.textContent = "Informe a senha para continuar.";
-          passwordBox.classList.remove("hidden");
-          contentBox.classList.add("hidden");
-          return;
+          if (response.status === 401 && data.passwordRequired) {
+            fileName.textContent = "Link protegido";
+            status.textContent = password
+              ? "Nao foi possivel validar a senha. Verifique se ela esta correta e tente novamente."
+              : "Informe a senha para continuar.";
+            passwordInput.value = "";
+            passwordBox.classList.remove("hidden");
+            contentBox.classList.add("hidden");
+            passwordInput.focus();
+            return;
+          }
+
+          if (!response.ok) {
+            fileName.textContent = "Link indisponivel";
+            status.textContent = data.error || "Nao foi possivel acessar este compartilhamento.";
+            passwordBox.classList.add("hidden");
+            contentBox.classList.add("hidden");
+            return;
+          }
+
+          renderAccess(data);
+          if (password) {
+            const nextControl = data.canPreview ? previewButton : downloadButton;
+            if (!nextControl.hidden && !nextControl.disabled) nextControl.focus();
+          }
+        } catch {
+          fileName.textContent = "Validacao indisponivel";
+          status.textContent = "Nao foi possivel validar o link. Tente novamente ou recarregue a pagina.";
+        } finally {
+          accessRequestPending = false;
+          passwordButton.disabled = false;
+          passwordButton.textContent = "Acessar";
         }
-
-        if (!response.ok) {
-          fileName.textContent = "Link indisponivel";
-          status.textContent = data.error || "Nao foi possivel acessar este compartilhamento.";
-          passwordBox.classList.add("hidden");
-          contentBox.classList.add("hidden");
-          return;
-        }
-
-        renderAccess(data);
       }
 
-      passwordButton.addEventListener("click", () => accessShare(passwordInput.value));
-      passwordInput.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") accessShare(passwordInput.value);
+      passwordForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        accessShare(passwordInput.value);
+      });
+
+      downloadForm.addEventListener("submit", (event) => {
+        if (downloadReceiptPending) {
+          event.preventDefault();
+          return;
+        }
+        downloadReceiptPending = true;
+        const previousReceipt = readDownloadReceipt();
+        let attempts = 0;
+        downloadButton.disabled = true;
+        status.textContent = "Download solicitado. Atualizando os limites...";
+        const waitForDownloadReceipt = () => {
+          const receipt = readDownloadReceipt();
+          if (receipt && receipt !== previousReceipt) {
+            refreshShareAccess().finally(() => { downloadReceiptPending = false; });
+            return;
+          }
+          attempts += 1;
+          if (attempts >= 80) {
+            status.textContent = "O servidor ainda nao confirmou o download. Recarregue a pagina para atualizar os limites.";
+            return;
+          }
+          setTimeout(waitForDownloadReceipt, 250);
+        };
+        setTimeout(waitForDownloadReceipt, 250);
       });
 
       previewButton.addEventListener("click", () => {
         previewBox.classList.toggle("hidden");
         if (!previewBox.dataset.loaded) {
-          previewBox.innerHTML = '<iframe src="/share/' + token + '/preview" title="Preview"></iframe>';
+          const previewFrame = document.createElement("iframe");
+          previewFrame.title = "Preview";
+          previewFrame.name = "rootark-share-preview-" + token;
+          previewFrame.addEventListener("load", () => {
+            try {
+              if (previewFrame.contentDocument?.location?.href === "about:blank") return;
+              if (previewFrame.contentDocument?.body?.textContent?.trim() === "Abra a pagina do compartilhamento novamente.") {
+                previewBox.replaceChildren();
+                delete previewBox.dataset.loaded;
+                previewBox.classList.add("hidden");
+              }
+            } catch {}
+            refreshShareAccess();
+          });
+          const previewForm = document.createElement("form");
+          previewForm.method = "POST";
+          previewForm.action = "/share/" + token + "/preview";
+          previewForm.target = previewFrame.name;
+          previewForm.hidden = true;
+          previewBox.replaceChildren(previewFrame, previewForm);
           previewBox.dataset.loaded = "1";
+          previewForm.requestSubmit();
         }
       });
 
@@ -1765,10 +2315,13 @@ function getShareFileInfo(link) {
 async function ensureShareFileAvailable(link) {
   const info = getShareFileInfo(link);
   if (!info) return null;
-  if (isFileInTrash(info.folderId, info.fileName)) return null;
-  await ensureCloudFileCached(info.folderId, info.fileName, info.filePath, "uploads");
-  if (!isExistingFile(info.filePath)) return null;
+  if (!isFolderAvailable(info.folderId) || isFileInTrash(info.folderId, info.fileName) || isFileExpired(info.folderId, info.fileName)) return null;
+  if (restoreProviderOrphans.isSuppressed(info.folderId, info.fileName)) return null;
   if (getEncryptedFileMetadata(info.folderId, info.fileName)) return null;
+  await ensureCloudFileCached(info.folderId, info.fileName, info.filePath, "uploads", () => !isFileInTrash(info.folderId, info.fileName));
+  if (!isFolderAvailable(info.folderId) || isFileInTrash(info.folderId, info.fileName) || isFileExpired(info.folderId, info.fileName)
+    || restoreProviderOrphans.isSuppressed(info.folderId, info.fileName)) return null;
+  if (!isExistingFile(info.filePath)) return null;
   return info;
 }
 
@@ -1781,10 +2334,11 @@ function getPublicShareCanPreview(fileName) {
   return ["image", "pdf", "audio", "video"].includes(getPreviewKind(fileName));
 }
 
-function isShareViewerActive(req, token, link) {
+function getActiveShareViewer(req, token, link) {
   const { viewers } = cleanupShareViewers(link);
   const viewerId = getCookieValue(req, `rootark_share_${token}`);
-  return Boolean(viewerId && viewers[viewerId]);
+  if (!isShareViewerId(viewerId) || !Object.prototype.hasOwnProperty.call(viewers, viewerId)) return null;
+  return { id: viewerId, viewer: viewers[viewerId] };
 }
 
 function createShareViewer(req, res, token, link, expiresAt) {
@@ -1819,8 +2373,29 @@ function validateShareToken(rawToken) {
   return /^[a-f0-9]{48}$/i.test(token) ? token : "";
 }
 
-function getShareAccessCookieRequired(link) {
-  return hasSharePassword(link) || (Number(link.maxViews) || 0) > 0;
+function requireSameOriginPublicShareMutation(req, res, next) {
+  const origin = req.headers.origin;
+  if (!origin || origin !== getExpectedOrigin(req, app.get("trust proxy fn"))) {
+    return res.status(403).type("text/plain").send("Origem negada");
+  }
+  return next();
+}
+
+function requireSameOriginPublicSharePreview(req, res, next) {
+  const fetchSite = String(req.headers["sec-fetch-site"] || "").toLowerCase();
+  const origin = req.headers.origin;
+  if ((!fetchSite && !origin)
+    || (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none")
+    || (origin && origin !== getExpectedOrigin(req, app.get("trust proxy fn")))) {
+    return res.status(403).type("text/plain").send("Origem negada");
+  }
+  return next();
+}
+
+function getShareAccessCookieRequired(link, countDownloadOncePerViewer = false) {
+  return hasSharePassword(link)
+    || (Number(link.maxViews) || 0) > 0
+    || (countDownloadOncePerViewer && (Number(link.maxDownloads) || 0) > 0);
 }
 
 async function resolveShareAccess(req, res, token, options = {}) {
@@ -1830,34 +2405,39 @@ async function resolveShareAccess(req, res, token, options = {}) {
 
   const expiresAt = new Date(link.expiresAt).getTime();
   if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
-    delete links[token];
-    savePublicLinks(links);
     logShareAudit(req, "share.expired", token, link, "expired", "failure");
     return { status: 410, error: "Link indisponivel." };
   }
 
   const passwordHash = link.passwordHash || link.password_hash || null;
+  let verifiedPasswordHash = null;
   if (passwordHash && !hasValidSharePasswordSession(req, token, link)) {
     if (!options.password) return { status: 401, error: "Senha obrigatoria.", passwordRequired: true };
     if (!bcrypt.compareSync(String(options.password), passwordHash)) {
       logShareAudit(req, "share.password.failed", token, link, "password", "failure");
       return { status: 401, error: "Nao foi possivel acessar este link.", passwordRequired: true };
     }
-    setSharePasswordCookie(req, res, token);
+    setSharePasswordCookie(req, res, token, link);
+    verifiedPasswordHash = passwordHash;
   }
 
   const limits = getShareLimitState(link);
-  const viewerAlreadyActive = isShareViewerActive(req, token, link);
+  const activeShareViewer = getActiveShareViewer(req, token, link);
+  const viewerAlreadyActive = Boolean(activeShareViewer);
+  let downloadAlreadyCounted = Boolean(options.countDownloadOncePerViewer && activeShareViewer?.viewer.downloadCounted);
   if (options.countView && !viewerAlreadyActive && limits.maxViews > 0 && limits.views >= limits.maxViews) {
     logShareAudit(req, "share.limit_reached", token, link, "view", "failure", { limit: "views" });
     return { status: 410, error: "Link indisponivel." };
   }
 
-  if (options.requireViewer && getShareAccessCookieRequired(link) && !viewerAlreadyActive && !options.countView) {
+  if (options.requireViewer && getShareAccessCookieRequired(link, options.countDownloadOncePerViewer) && !viewerAlreadyActive && !options.countView) {
+    return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
+  }
+  if (options.requireDownloadCountedViewer && (Number(link.maxDownloads) || 0) > 0 && !downloadAlreadyCounted) {
     return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
   }
 
-  if (options.countDownload && limits.maxDownloads > 0 && limits.downloads >= limits.maxDownloads) {
+  if (options.countDownload && !downloadAlreadyCounted && limits.maxDownloads > 0 && limits.downloads >= limits.maxDownloads) {
     logShareAudit(req, "share.limit_reached", token, link, "download", "failure", { limit: "downloads" });
     return { status: 410, error: "Link indisponivel." };
   }
@@ -1865,25 +2445,140 @@ async function resolveShareAccess(req, res, token, options = {}) {
   const fileInfo = await ensureShareFileAvailable(link);
   if (!fileInfo) return { status: 404, error: "Link indisponivel." };
 
-  if (options.countView && !viewerAlreadyActive) {
-    createShareViewer(req, res, token, link, expiresAt);
-    link.lastViewedAt = new Date().toISOString();
-    link.views = incrementPublicLinkViews(token, link, links);
-    logShareAudit(req, "share.opened", token, link, "opened", "success");
-  } else {
-    const cleaned = cleanupShareViewers(link);
-    if (cleaned.changed) savePublicLinks(links);
+  // Provider hydration yields the event loop. Reload and revalidate the link so
+  // concurrent requests cannot consume the same final view/download allowance
+  // or overwrite link metadata saved while this request was waiting.
+  const currentLinks = loadPublicLinks();
+  let currentLink = currentLinks[token];
+  if (!currentLink || currentLink.fileName !== link.fileName || (currentLink.folderId || ROOT_FOLDER_ID) !== (link.folderId || ROOT_FOLDER_ID)) {
+    return { status: 404, error: "Link indisponivel." };
+  }
+  const currentExpiresAt = new Date(currentLink.expiresAt).getTime();
+  if (!Number.isFinite(currentExpiresAt) || currentExpiresAt <= Date.now()) {
+    logShareAudit(req, "share.expired", token, currentLink, "expired", "failure");
+    return { status: 410, error: "Link indisponivel." };
+  }
+  const currentPasswordHash = currentLink.passwordHash || currentLink.password_hash || null;
+  if (currentPasswordHash && !hasValidSharePasswordSession(req, token, currentLink) && currentPasswordHash !== verifiedPasswordHash) {
+    return { status: 401, error: "Senha obrigatoria.", passwordRequired: true };
+  }
+  if (options.requirePreview && !getPublicShareCanPreview(fileInfo.fileName)) {
+    return { status: 415, error: "Preview indisponivel" };
+  }
+  const currentLimits = getShareLimitState(currentLink);
+  const currentShareViewer = getActiveShareViewer(req, token, currentLink);
+  const currentViewerAlreadyActive = Boolean(currentShareViewer);
+  downloadAlreadyCounted = Boolean(options.countDownloadOncePerViewer && currentShareViewer?.viewer.downloadCounted);
+  if (options.countView && !currentViewerAlreadyActive && currentLimits.maxViews > 0 && currentLimits.views >= currentLimits.maxViews) {
+    logShareAudit(req, "share.limit_reached", token, currentLink, "view", "failure", { limit: "views" });
+    return { status: 410, error: "Link indisponivel." };
+  }
+  if (options.requireViewer && getShareAccessCookieRequired(currentLink, options.countDownloadOncePerViewer) && !currentViewerAlreadyActive && !options.countView) {
+    return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
+  }
+  if (options.requireDownloadCountedViewer && (Number(currentLink.maxDownloads) || 0) > 0 && !downloadAlreadyCounted) {
+    return { status: 403, error: "Abra a pagina do compartilhamento novamente." };
+  }
+  if (options.countDownload && !downloadAlreadyCounted && currentLimits.maxDownloads > 0 && currentLimits.downloads >= currentLimits.maxDownloads) {
+    logShareAudit(req, "share.limit_reached", token, currentLink, "download", "failure", { limit: "downloads" });
+    return { status: 410, error: "Link indisponivel." };
   }
 
-  if (options.countDownload) {
-    link.downloads = (Number(link.downloads) || 0) + 1;
-    link.lastDownloadedAt = new Date().toISOString();
-    links[token] = link;
-    savePublicLinks(links);
-    logShareAudit(req, "share.downloaded", token, link, "downloaded", "success");
+  let databaseViewReserved = false;
+  let databaseDownloadReserved = false;
+  const reserveDatabaseShareQuota = (kind, viewer, downloadViewerId) => {
+    const reservation = publicLinksRepository.consumePublicLinkQuota(token, {
+      kind,
+      expectedFileName: currentLink.fileName,
+      expectedFolderId: currentLink.folderId || ROOT_FOLDER_ID,
+      expectedPasswordHash: currentLink.passwordHash || currentLink.password_hash || null,
+      ...(shouldReadJsonFallback() ? { fallbackLinks: { [token]: currentLink } } : {}),
+      ...(viewer ? { viewer } : {}),
+      ...(downloadViewerId ? { downloadViewerId } : {}),
+    });
+    if (reservation.status !== "ok") {
+      if (reservation.status === "limit") {
+        logShareAudit(req, "share.limit_reached", token, currentLink, "limit", "failure", { limit: reservation.limit || (kind === "view" ? "views" : "downloads") });
+        return { status: 410, error: "Link indisponivel." };
+      }
+      if (reservation.status === "expired") {
+        logShareAudit(req, "share.expired", token, currentLink, "expired", "failure");
+        return { status: 410, error: "Link indisponivel." };
+      }
+      if (reservation.status === "password_changed") {
+        return { status: 401, error: "Senha obrigatoria.", passwordRequired: true };
+      }
+      return { status: 404, error: "Link indisponivel." };
+    }
+
+    currentLink = reservation.link;
+    currentLinks[token] = currentLink;
+    if (kind === "download") {
+      downloadAlreadyCounted = Boolean(reservation.alreadyConsumed);
+    }
+    if (shouldWriteLegacyJson()) fs.writeFileSync(PUBLIC_LINKS_FILE, JSON.stringify(currentLinks, null, 2));
+    broadcastDataChanged("shares");
+    return null;
+  };
+
+  if (shouldUseDatabase() && options.countView && !currentViewerAlreadyActive) {
+    const viewerId = crypto.randomBytes(16).toString("hex");
+    const viewerCreatedAt = new Date().toISOString();
+    const viewerExpiresAt = new Date(Math.min(Date.now() + SHARE_VIEW_SESSION_MS, currentExpiresAt)).toISOString();
+    const failure = reserveDatabaseShareQuota("view", { id: viewerId, createdAt: viewerCreatedAt, expiresAt: viewerExpiresAt });
+    if (failure) return failure;
+    setShareViewerCookie(req, res, token, viewerId, new Date(currentLink.expiresAt).getTime());
+    databaseViewReserved = true;
   }
 
-  return { link, fileInfo, limits: getShareLimitState(link), expiresAt };
+  if (options.countView && !currentViewerAlreadyActive) {
+    if (!databaseViewReserved) {
+      createShareViewer(req, res, token, currentLink, currentExpiresAt);
+      currentLink.lastViewedAt = new Date().toISOString();
+      currentLink.views = incrementPublicLinkViews(token, currentLink, currentLinks);
+    }
+    logShareAudit(req, "share.opened", token, currentLink, "opened", "success");
+  }
+
+  const reserveDownloadQuota = () => {
+    if (!options.countDownload || downloadAlreadyCounted) return null;
+    if (shouldUseDatabase()) {
+      const failure = reserveDatabaseShareQuota(
+        "download",
+        null,
+        options.countDownloadOncePerViewer ? currentShareViewer?.id : undefined
+      );
+      if (failure) return failure;
+      databaseDownloadReserved = true;
+    }
+    if (!databaseDownloadReserved) {
+      currentLink.downloads = (Number(currentLink.downloads) || 0) + 1;
+      currentLink.lastDownloadedAt = new Date().toISOString();
+      if (options.countDownloadOncePerViewer && currentShareViewer) {
+        currentShareViewer.viewer.downloadCounted = true;
+        currentLink.activeViewers = currentLink.activeViewers || {};
+      }
+      currentLinks[token] = currentLink;
+      savePublicLinks(currentLinks);
+    }
+    if (downloadAlreadyCounted) return null;
+    downloadAlreadyCounted = true;
+    logShareAudit(req, "share.downloaded", token, currentLink, "downloaded", "success");
+    return null;
+  };
+
+  if (options.countDownload && !options.deferDownloadReservation) {
+    const failure = reserveDownloadQuota();
+    if (failure) return failure;
+  }
+
+  return {
+    link: currentLink,
+    fileInfo,
+    limits: getShareLimitState(currentLink),
+    expiresAt: currentExpiresAt,
+    ...(options.deferDownloadReservation ? { reserveDownload: reserveDownloadQuota } : {}),
+  };
 }
 
 function getSharePublicPayload(link, fileInfo, limits) {
@@ -1908,7 +2603,7 @@ function getFolderById(folderId = ROOT_FOLDER_ID) {
 }
 
 function hasFolderAccess(req, folder) {
-  if (!folder) return false;
+  if (!folder || !isFolderAvailable(folder.id)) return false;
   if (folder.isRoot || folder.id === ROOT_FOLDER_ID) return true;
   if (req.user?.role === "admin" || req.user?.permissions?.manageUsers) return true;
   if (folder.createdBy === req.user?.username) return true;
@@ -1919,6 +2614,10 @@ function hasFolderAccess(req, folder) {
 
 function canManageAccess(req) {
   return req.user?.role === "admin" || req.user?.permissions?.manageUsers;
+}
+
+function isRestoreProviderOrphanDenied(req, folderId, fileName) {
+  return Boolean(fileName) && restoreProviderOrphans.isSuppressed(folderId, fileName) && !canManageAccess(req);
 }
 
 function sameUsername(left, right) {
@@ -2048,6 +2747,24 @@ function getFileExpirationEntry(folderId, fileName, entries = loadFileExpiration
   return entries[getFileExpirationKey(folderId, fileName)] || null;
 }
 
+function isFileExpired(folderId, fileName, entries = loadFileExpirations()) {
+  const expiresAt = new Date(getFileExpirationEntry(folderId, fileName, entries)?.expiresAt).getTime();
+  return Number.isFinite(expiresAt) && expiresAt <= Date.now();
+}
+
+function isFolderExpired(folder) {
+  const rawExpiresAt = folder?.expiresAt;
+  if (rawExpiresAt === null || rawExpiresAt === undefined || rawExpiresAt === "") return false;
+  const expiresAt = new Date(rawExpiresAt).getTime();
+  return Number.isFinite(expiresAt) && expiresAt <= Date.now();
+}
+
+function isFolderAvailable(folderId, folders = loadFolders()) {
+  if (folderId === ROOT_FOLDER_ID) return true;
+  const folder = folders.find((item) => item.id === folderId);
+  return Boolean(folder && !isFolderExpired(folder));
+}
+
 function getFileVersionKey(folderId, fileName) {
   return `${folderId || ROOT_FOLDER_ID}/${path.basename(fileName || "")}`;
 }
@@ -2102,7 +2819,7 @@ function getVersionHistory(folderId, fileName, entries = loadFileVersions()) {
   return normalizeVersionHistory(entries[getFileVersionKey(folderId, fileName)]);
 }
 
-function ensureVersionHistory(folder, fileName, uploadedBy = "sistema", comment = "Versao inicial") {
+function ensureVersionHistory(folder, fileName, uploadedBy = "sistema", comment = "Versao inicial", { persist = true } = {}) {
   const entries = loadFileVersions();
   const key = getFileVersionKey(folder.id, fileName);
   const history = normalizeVersionHistory(entries[key]);
@@ -2130,12 +2847,13 @@ function ensureVersionHistory(folder, fileName, uploadedBy = "sistema", comment 
   };
 
   entries[key] = createdHistory;
-  saveFileVersions(entries);
+  if (persist) saveFileVersions(entries);
   return { entries, key, history: createdHistory };
 }
 
-function pruneFileVersions(entries, key, folder) {
+function pruneFileVersions(entries, key) {
   const history = normalizeVersionHistory(entries[key]);
+  const prunedStoredNames = [];
   let changed = false;
 
   while (history.versions.length > MAX_FILE_VERSIONS) {
@@ -2145,64 +2863,159 @@ function pruneFileVersions(entries, key, folder) {
 
     if (!removable) break;
 
-    const storedPath = path.join(folder.uploadDir, removable.storedAs);
-    if (removable.storedAs && removable.storedAs !== path.basename(key) && fs.existsSync(storedPath)) {
-      fs.unlinkSync(storedPath);
-    }
-    if (removable.storedAs) deleteCloudFileLater(folder.id, removable.storedAs, "uploads");
+    if (removable.storedAs) prunedStoredNames.push(removable.storedAs);
 
     history.versions = history.versions.filter((version) => version.version !== removable.version);
     changed = true;
   }
 
   if (changed) entries[key] = history;
+  return prunedStoredNames;
+}
+
+function prepareCloudUploadAbsenceMutations(folderId, currentFileName, storedNames) {
+  const cloudEnabled = isCloudStorageEnabled();
+  const snapshots = [];
+  const rollback = () => {
+    for (const snapshot of [...snapshots].reverse()) {
+      try { cloudUploadMutationQueue.restoreRecord(folderId, snapshot.fileName, snapshot.record); }
+      catch (error) { console.error("[cloud-upload] pruned-version queue rollback failed:", sanitizeLogValue(error.message)); }
+    }
+  };
+  try {
+    for (const fileName of new Set(storedNames.filter((value) => typeof value === "string" && value === path.basename(value) && value !== path.basename(currentFileName)))) {
+      const record = cloudUploadMutationQueue.getRecord(folderId, fileName);
+      if (!cloudEnabled && !record) continue;
+      snapshots.push({ fileName, record });
+      cloudUploadMutationQueue.setDesired(folderId, fileName, "absent");
+    }
+  } catch (error) {
+    rollback();
+    throw error;
+  }
+  return { queued: snapshots.length > 0, rollback };
+}
+
+function deletePrunedFileVersions(folder, key, storedNames, cloudQueuePrepared = false) {
+  for (const storedAs of storedNames) {
+    if (typeof storedAs !== "string" || storedAs !== path.basename(storedAs) || storedAs === path.basename(key)) continue;
+
+    const storedPath = path.join(folder.uploadDir, storedAs);
+    try {
+      if (fs.existsSync(storedPath)) fs.rmSync(storedPath, { force: true });
+    } catch (error) {
+      console.error("Erro ao remover versao antiga local:", sanitizeLogValue(error.message));
+    }
+
+  }
+  if (cloudQueuePrepared) processCloudUploadMutationsLater();
+}
+
+function restoreFileVersionsJsonSnapshot(snapshot) {
+  if (!shouldWriteLegacyJson()) return;
+  const target = path.resolve(FILE_VERSIONS_FILE);
+  if (snapshot === null) {
+    fs.rmSync(target, { force: true });
+    return;
+  }
+
+  const rollbackPath = `${target}.rollback-${crypto.randomBytes(8).toString("hex")}.tmp`;
+  try {
+    fs.writeFileSync(rollbackPath, snapshot, { flag: "wx", mode: 0o600 });
+    fs.renameSync(rollbackPath, target);
+  } finally {
+    fs.rmSync(rollbackPath, { force: true });
+  }
 }
 
 function recordApprovedFileVersion(folder, fileName, pendingPath, uploadedBy, comment = "") {
   const currentPath = path.join(folder.uploadDir, fileName);
   const exists = isExistingFile(currentPath);
   const initialComment = comment || "Versao inicial";
+  let historySnapshot = null;
+  if (shouldWriteLegacyJson()) {
+    try { historySnapshot = fs.readFileSync(FILE_VERSIONS_FILE); }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+  }
 
   if (!exists) {
-    fs.renameSync(pendingPath, currentPath);
-    ensureVersionHistory(folder, fileName, uploadedBy || "sistema", initialComment);
+    let promoted = false;
+    try {
+      fs.renameSync(pendingPath, currentPath);
+      promoted = true;
+      const { entries } = ensureVersionHistory(folder, fileName, uploadedBy || "sistema", initialComment, { persist: false });
+      saveFileVersions(entries, { tolerateLegacyJsonMirrorFailure: true });
+    } catch (error) {
+      try {
+        if (promoted && isExistingFile(currentPath) && !isExistingFile(pendingPath)) fs.renameSync(currentPath, pendingPath);
+        restoreFileVersionsJsonSnapshot(historySnapshot);
+      } catch (rollbackError) {
+        console.error("Erro ao reverter aprovacao inicial:", sanitizeLogValue(rollbackError.message));
+      }
+      throw error;
+    }
     return { currentVersion: 1, replaced: false };
   }
 
-  const currentOwner = normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, fileName)).owner;
-  const { entries, key, history } = ensureVersionHistory(folder, fileName, currentOwner, "Versao inicial");
-  const oldCurrentVersion = history.currentVersion || 1;
-  const archivedName = getStoredVersionName(fileName, oldCurrentVersion);
-  const archivedPath = path.join(folder.uploadDir, archivedName);
+  let archivedPath = null;
+  let currentArchived = false;
+  let pendingPromoted = false;
+  let entries;
+  let key;
+  let history;
+  let cloudPrunePreparation = null;
+  try {
+    const currentOwner = normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, fileName)).owner;
+    ({ entries, key, history } = ensureVersionHistory(folder, fileName, currentOwner, "Versao inicial", { persist: false }));
+    const oldCurrentVersion = history.currentVersion || 1;
+    const archivedName = getStoredVersionName(fileName, oldCurrentVersion);
+    archivedPath = path.join(folder.uploadDir, archivedName);
+    if (fs.existsSync(archivedPath)) throw new Error("Arquivo de versao atual ja existe");
 
-  fs.renameSync(currentPath, archivedPath);
-  for (const version of history.versions) {
-    if (version.version === oldCurrentVersion) {
-      version.storedAs = archivedName;
-      version.size = fs.statSync(archivedPath).size;
+    fs.renameSync(currentPath, archivedPath);
+    currentArchived = true;
+    for (const version of history.versions) {
+      if (version.version === oldCurrentVersion) {
+        version.storedAs = archivedName;
+        version.size = fs.statSync(archivedPath).size;
+      }
     }
+
+    fs.renameSync(pendingPath, currentPath);
+    pendingPromoted = true;
+    const stats = fs.statSync(currentPath);
+    const newVersion = oldCurrentVersion + 1;
+    history.currentVersion = newVersion;
+    history.versions.push({
+      version: newVersion,
+      storedAs: fileName,
+      uploadedBy: uploadedBy || "sistema",
+      uploadedAt: new Date().toISOString(),
+      size: stats.size,
+      comment: comment || "",
+    });
+
+    entries[key] = history;
+    const prunedStoredNames = pruneFileVersions(entries, key);
+    cloudPrunePreparation = prepareCloudUploadAbsenceMutations(folder.id, fileName, prunedStoredNames);
+    saveFileVersions(entries, { tolerateLegacyJsonMirrorFailure: true });
+    deletePrunedFileVersions(folder, key, prunedStoredNames, cloudPrunePreparation?.queued);
+    return { currentVersion: newVersion, replaced: true };
+  } catch (error) {
+    if (cloudPrunePreparation) cloudPrunePreparation.rollback();
+    try {
+      if (pendingPromoted && isExistingFile(currentPath) && !isExistingFile(pendingPath)) fs.renameSync(currentPath, pendingPath);
+      if (currentArchived && archivedPath && isExistingFile(archivedPath) && !isExistingFile(currentPath)) fs.renameSync(archivedPath, currentPath);
+      restoreFileVersionsJsonSnapshot(historySnapshot);
+    } catch (rollbackError) {
+      console.error("Erro ao reverter aprovacao de versao:", sanitizeLogValue(rollbackError.message));
+    }
+    throw error;
   }
-
-  fs.renameSync(pendingPath, currentPath);
-  const stats = fs.statSync(currentPath);
-  const newVersion = oldCurrentVersion + 1;
-  history.currentVersion = newVersion;
-  history.versions.push({
-    version: newVersion,
-    storedAs: fileName,
-    uploadedBy: uploadedBy || "sistema",
-    uploadedAt: new Date().toISOString(),
-    size: stats.size,
-    comment: comment || "",
-  });
-
-  entries[key] = history;
-  pruneFileVersions(entries, key, folder);
-  saveFileVersions(entries);
-  return { currentVersion: newVersion, replaced: true };
 }
 
 function syncFileVersionsToCloud(folderId, fileName) {
+  if (!isCloudStorageEnabled()) return false;
   const folder = {
     id: folderId || ROOT_FOLDER_ID,
     uploadDir: getFolderStoragePath("./uploads", folderId || ROOT_FOLDER_ID),
@@ -2213,12 +3026,86 @@ function syncFileVersionsToCloud(folderId, fileName) {
     ...history.versions.map((version) => path.basename(version.storedAs || "")).filter(Boolean),
   ]);
 
+  let queued = false;
   for (const storedName of storedNames) {
     const storedPath = path.join(folder.uploadDir, storedName);
     if (isExistingFile(storedPath)) {
-      syncCloudFireAndForget(uploadFileToCloud(storedPath, folder.id, storedName, "uploads"), `sync version ${folder.id}/${storedName}`);
+      cloudUploadMutationQueue.setDesired(folder.id, storedName, "present");
+      queued = true;
     }
   }
+  if (queued) processCloudUploadMutationsLater();
+  return queued;
+}
+
+function getApprovedFileCloudMutationNames(folder, fileName, pendingPath) {
+  const names = new Set([path.basename(fileName || "")]);
+  const currentPath = path.join(folder.uploadDir, fileName);
+  const entries = loadFileVersions();
+  const key = getFileVersionKey(folder.id, fileName);
+  if (!isExistingFile(currentPath)) {
+    for (const version of getVersionHistory(folder.id, fileName, entries).versions) {
+      const storedName = path.basename(version.storedAs || "");
+      if (storedName && isExistingFile(path.join(folder.uploadDir, storedName))) names.add(storedName);
+    }
+    return [...names];
+  }
+
+  const owner = normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, fileName)).owner;
+  const ensured = ensureVersionHistory(folder, fileName, owner, "Versao inicial", { persist: false });
+  const history = normalizeVersionHistory(ensured.history);
+  const oldCurrentVersion = history.currentVersion || 1;
+  const archivedName = getStoredVersionName(fileName, oldCurrentVersion);
+  const nextVersion = oldCurrentVersion + 1;
+  const versions = history.versions.map((version) => version.version === oldCurrentVersion
+    ? { ...version, storedAs: archivedName, size: fs.statSync(currentPath).size }
+    : { ...version });
+  versions.push({ version: nextVersion, storedAs: path.basename(fileName), size: fs.statSync(pendingPath).size });
+  entries[key] = { currentVersion: nextVersion, versions };
+  pruneFileVersions(entries, key);
+  for (const version of normalizeVersionHistory(entries[key]).versions) {
+    const storedName = path.basename(version.storedAs || "");
+    if (storedName && (storedName === path.basename(fileName) || storedName === archivedName || isExistingFile(path.join(folder.uploadDir, storedName)))) names.add(storedName);
+  }
+  return [...names];
+}
+
+function getRestoredVersionCloudMutationNames(folder, fileName, key, history, archivedName, newVersion, restoredSize, archivedSize) {
+  const projected = {
+    currentVersion: newVersion,
+    versions: history.versions.map((version) => version.version === history.currentVersion
+      ? { ...version, storedAs: archivedName, size: archivedSize }
+      : { ...version }),
+  };
+  projected.versions.push({ version: newVersion, storedAs: fileName, size: restoredSize });
+  const projectedEntries = { [key]: projected };
+  pruneFileVersions(projectedEntries, key);
+  return [...new Set([
+    fileName,
+    ...normalizeVersionHistory(projectedEntries[key]).versions.map((version) => path.basename(version.storedAs || "")).filter(Boolean),
+  ])].filter((storedName) => storedName === fileName || storedName === archivedName || isExistingFile(path.join(folder.uploadDir, storedName)));
+}
+
+function prepareCloudUploadMutations(folderId, fileNames) {
+  if (!isCloudStorageEnabled()) return { queued: false, rollback() {} };
+  const snapshots = [];
+  const rollback = () => {
+    for (const snapshot of [...snapshots].reverse()) {
+      try { cloudUploadMutationQueue.restoreRecord(folderId, snapshot.fileName, snapshot.record); }
+      catch (error) { console.error("[cloud-upload] approval queue rollback failed:", sanitizeLogValue(error.message)); }
+    }
+  };
+  try {
+    for (const fileName of new Set(fileNames.map((value) => path.basename(value || "")).filter(Boolean))) {
+      const record = cloudUploadMutationQueue.getRecord(folderId, fileName);
+      snapshots.push({ fileName, record });
+      cloudUploadMutationQueue.setDesired(folderId, fileName, "present");
+    }
+  } catch (error) {
+    rollback();
+    throw error;
+  }
+  return { queued: snapshots.length > 0, rollback };
 }
 
 function getVersionFilePath(folder, fileName, versionNumber) {
@@ -2247,10 +3134,20 @@ function isStoredVersionFile(folderId, fileName, entries = loadFileVersions()) {
     }
   }
 
-  return false;
+  const suffix = name.match(/\.v\d+$/i);
+  if (!suffix) return false;
+  if (entries[getFileVersionKey(folderId, name)]) return false;
+
+  const permissions = loadFilePermissions();
+  if (getFilePermissionEntry(folderId, name, permissions)) return false;
+  const primaryName = name.slice(0, -suffix[0].length);
+  return Boolean(
+    getFilePermissionEntry(folderId, primaryName, permissions) ||
+    entries[getFileVersionKey(folderId, primaryName)]
+  );
 }
 
-function removeFileVersions(folderId, fileName) {
+async function removeFileVersions(folderId, fileName, { remoteAlreadyDeleted = false } = {}) {
   const entries = loadFileVersions();
   const key = getFileVersionKey(folderId, fileName);
   const history = normalizeVersionHistory(entries[key]);
@@ -2258,8 +3155,10 @@ function removeFileVersions(folderId, fileName) {
 
   for (const version of history.versions) {
     if (version.storedAs && version.storedAs !== fileName) {
+      if (!remoteAlreadyDeleted && isCloudStorageEnabled()) {
+        await deleteFileFromCloud(folderId, version.storedAs, "uploads");
+      }
       fs.rmSync(path.join(uploadDir, version.storedAs), { force: true });
-      deleteCloudFileLater(folderId, version.storedAs, "uploads");
     }
   }
 
@@ -2384,6 +3283,7 @@ function createOpenFileToken(folderId, fileName, options = {}) {
     filePath: options.filePath || null,
     downloadName: options.downloadName || fileName,
     cloudFileName: options.cloudFileName || path.basename(options.filePath || fileName),
+    managerReviewUsername: options.managerReviewUsername || null,
     expiresAt: Date.now() + OPEN_FILE_TOKEN_TTL_MS,
   });
   return token;
@@ -2467,27 +3367,7 @@ function isInlinePreviewFile(fileName) {
 }
 
 function getServerMasterKey(options = {}) {
-  const createIfMissing = options.createIfMissing !== false;
-  const envKey = process.env.SERVER_MASTER_KEY;
-  if (envKey) {
-    const cleanKey = envKey.trim();
-    if (/^[a-f0-9]{64}$/i.test(cleanKey)) return Buffer.from(cleanKey, "hex");
-    const decoded = Buffer.from(cleanKey, "base64");
-    if (decoded.length === 32) return decoded;
-    throw new Error("SERVER_MASTER_KEY precisa ter 32 bytes em hex ou base64");
-  }
-
-  if (!fs.existsSync(SERVER_MASTER_KEY_FILE)) {
-    if (!createIfMissing) throw new Error("SERVER_MASTER_KEY ausente");
-    const masterKey = crypto.randomBytes(32);
-    fs.writeFileSync(SERVER_MASTER_KEY_FILE, masterKey.toString("hex"), { mode: 0o600 });
-    console.warn("[security] Nova chave mestra gerada em data/server-master.key. Faca backup seguro imediatamente.");
-    return masterKey;
-  }
-
-  const fileKey = fs.readFileSync(SERVER_MASTER_KEY_FILE, "utf-8").trim();
-  if (!/^[a-f0-9]{64}$/i.test(fileKey)) throw new Error("SERVER_MASTER_KEY invalida");
-  return Buffer.from(fileKey, "hex");
+  return readServerMasterKey({ ...options, filePath: SERVER_MASTER_KEY_FILE });
 }
 
 function deriveKeyFromPassword(password, salt = null) {
@@ -2786,7 +3666,16 @@ function parseRangeHeader(rangeHeader, size) {
 }
 
 function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "inline", options = {}) {
-  const stats = fs.statSync(filePath);
+  let readHandle;
+  try {
+    readHandle = openReadHandle(filePath);
+  } catch (error) {
+    const unavailable = new Set(["ENOENT", "ENOTDIR", "ELOOP", "FILE_NOT_REGULAR", "FILE_HANDLE_CHANGED"]);
+    if (unavailable.has(error.code)) return res.status(404).send("Arquivo nao encontrado");
+    console.error("Erro ao abrir arquivo para transmissao:", error.message);
+    return res.status(500).send("Nao foi possivel abrir o arquivo");
+  }
+  const { fd, stats } = readHandle;
   const size = stats.size;
   const safeName = path.basename(downloadName || path.basename(filePath));
   const range = parseRangeHeader(req.headers.range, size);
@@ -2794,12 +3683,28 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
   const highWaterMark = Number(options.highWaterMark) || 1024 * 1024;
 
   if (range?.invalid) {
+    try { fs.closeSync(fd); } catch {}
     res.writeHead(416, {
       "Content-Range": `bytes */${size}`,
       "Accept-Ranges": "bytes",
     });
     res.end();
     return;
+  }
+
+  if (typeof options.beforeSend === "function") {
+    let rejection;
+    try {
+      rejection = options.beforeSend();
+    } catch {
+      try { fs.closeSync(fd); } catch {}
+      return res.status(500).send("Erro ao autorizar transmissao");
+    }
+    if (rejection) {
+      try { fs.closeSync(fd); } catch {}
+      if (typeof options.onBeforeSendReject === "function") return options.onBeforeSendReject(rejection);
+      return res.status(rejection.status || 403).type("text/plain").send(rejection.error || "Link indisponivel.");
+    }
   }
 
   const commonHeaders = {
@@ -2828,8 +3733,15 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
     };
   }
 
-  res.writeHead(statusCode, headers);
-  const stream = fs.createReadStream(filePath, streamOptions);
+  let stream;
+  try {
+    res.writeHead(statusCode, headers);
+    stream = fs.createReadStream(null, { ...streamOptions, fd, autoClose: true });
+  } catch (error) {
+    try { fs.closeSync(fd); } catch {}
+    if (!res.headersSent) return res.status(500).send("Erro ao transmitir arquivo");
+    return res.destroy(error);
+  }
 
   stream.on("error", (error) => {
     console.error("Erro ao transmitir arquivo:", error.message);
@@ -2955,8 +3867,9 @@ function normalizeFolderGroupIds(value, allowMissing = true) {
   return groupsStore?.validateIds(value);
 }
 
-function hasFileAccess(req, folder, fileName, entries = loadFilePermissions()) {
-  if (!hasFolderAccess(req, folder)) return false;
+function hasFileAccess(req, folder, fileName, entries = loadFilePermissions(), expirationEntries = loadFileExpirations(), orphanSnapshot = null) {
+  if (!hasFolderAccess(req, folder) || isFileExpired(folder.id, fileName, expirationEntries)) return false;
+  if (restoreProviderOrphans.isSuppressed(folder.id, fileName, "uploads", orphanSnapshot)) return canManageAccess(req);
   if (canManageAccess(req)) return true;
 
   const entry = getFilePermissionEntry(folder.id, fileName, entries);
@@ -2971,8 +3884,9 @@ function hasFileAccess(req, folder, fileName, entries = loadFilePermissions()) {
   );
 }
 
-function hasFileEditAccess(req, folder, fileName, entries = loadFilePermissions()) {
+function hasFileEditAccess(req, folder, fileName, entries = loadFilePermissions(), orphanSnapshot = null) {
   if (!hasFolderAccess(req, folder)) return false;
+  if (restoreProviderOrphans.isSuppressed(folder.id, fileName, "uploads", orphanSnapshot)) return canManageAccess(req);
   if (canManageAccess(req)) return true;
 
   const entry = getFilePermissionEntry(folder.id, fileName, entries);
@@ -2987,6 +3901,14 @@ function hasFileEditAccess(req, folder, fileName, entries = loadFilePermissions(
   return Boolean(permissions.users[req.user?.username]?.edit);
 }
 
+function hasPublicShareAccess(req, folder, fileName, entries = loadFilePermissions(), expirationEntries = loadFileExpirations(), orphanSnapshot = null) {
+  if (!hasFolderAccess(req, folder) || isFileExpired(folder.id, fileName, expirationEntries)) return false;
+  if (restoreProviderOrphans.isSuppressed(folder.id, fileName, "uploads", orphanSnapshot)) return canManageAccess(req);
+  if (canManageAccess(req)) return true;
+  const owner = getFilePermissionEntry(folder.id, fileName, entries)?.owner;
+  return typeof owner === "string" && owner.trim() !== "" && !sameUsername(owner, "sistema") && sameUsername(owner, req.user?.username);
+}
+
 function hasReadableFolderAccess(req, folder) {
   return hasFolderAccess(req, folder);
 }
@@ -2995,7 +3917,7 @@ function getReadableFolderOrRespond(req, res, rawFolderId = ROOT_FOLDER_ID) {
   const folderId = String(rawFolderId || ROOT_FOLDER_ID);
   const folder = getFolderById(folderId);
 
-  if (!folder) {
+  if (!folder || !isFolderAvailable(folderId)) {
     res.status(404).json({ error: "Pasta nao encontrada" });
     return null;
   }
@@ -3097,10 +4019,13 @@ function removeUserFromFilePermissions(username) {
       }
     }
 
-    if (entry.users && typeof entry.users === "object" && entry.users[username]) {
-      delete entry.users[username];
-      entry.updatedAt = new Date().toISOString();
-      changed = true;
+    if (entry.users && typeof entry.users === "object") {
+      const matchingUser = Object.entries(entry.users).find(([candidate]) => candidate === username);
+      if (matchingUser?.[1]) {
+        entry.users = Object.fromEntries(Object.entries(entry.users).filter(([candidate]) => candidate !== username));
+        entry.updatedAt = new Date().toISOString();
+        changed = true;
+      }
     }
   }
 
@@ -3120,17 +4045,20 @@ function removeUserFromFolderPermissions(username) {
       }
     }
 
-    if (folder.users && typeof folder.users === "object" && folder.users[username]) {
-      delete folder.users[username];
-      folder.updatedAt = new Date().toISOString();
-      changed = true;
+    if (folder.users && typeof folder.users === "object") {
+      const matchingUser = Object.entries(folder.users).find(([candidate]) => candidate === username);
+      if (matchingUser?.[1]) {
+        folder.users = Object.fromEntries(Object.entries(folder.users).filter(([candidate]) => candidate !== username));
+        folder.updatedAt = new Date().toISOString();
+        changed = true;
+      }
     }
   }
 
   if (changed) saveFolders(folders);
 }
 
-function deleteFolderContents(folder) {
+async function deleteFolderContents(folder) {
   const folderId = folder.id;
   const uploadDir = getFolderStoragePath("./uploads", folderId);
   const tempDir = getFolderStoragePath("./temp", folderId);
@@ -3139,6 +4067,7 @@ function deleteFolderContents(folder) {
     throw new Error("Caminho de pasta invalido");
   }
 
+  await deleteCloudFolder(folderId);
   removePendingEntriesForFolder(folderId);
   removePublicLinksForFolder(folderId);
   removeFilePermissionsForFolder(folderId);
@@ -3147,7 +4076,6 @@ function deleteFolderContents(folder) {
   removeEncryptedMetadataForFolder(folderId);
   fs.rmSync(uploadDir, { recursive: true, force: true });
   fs.rmSync(tempDir, { recursive: true, force: true });
-  deleteCloudFolderLater(folderId);
 }
 
 function shouldAutoCleanupTrash() {
@@ -3163,7 +4091,7 @@ function getTrashRetentionDays() {
   return Number.isFinite(days) && days > 0 ? days : 30;
 }
 
-function cleanupExpiredTrashItems() {
+async function cleanupExpiredTrashItems() {
   if (!isTrashEnabled()) return;
   if (!shouldAutoCleanupTrash()) return;
 
@@ -3173,35 +4101,72 @@ function cleanupExpiredTrashItems() {
     return Number.isFinite(deletedAt) && deletedAt <= cutoff;
   });
 
+  let cleanedCount = 0;
   for (const item of items) {
+    const cleanupItem = async () => {
+      let current;
+      try {
+        current = trashRepository.getTrashItem(item.id);
+      } catch (error) {
+        auditLog("trash.delete.failed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "auto_cleanup", "failure", { error: error.message });
+        return false;
+      }
+      const currentDeletedAt = new Date(current?.deletedAt).getTime();
+      if (
+        !current || current.status !== "trashed" || current.itemType !== item.itemType ||
+        current.originalFolderId !== item.originalFolderId || current.originalFileName !== item.originalFileName ||
+        current.trashPath !== item.trashPath || current.deletedAt !== item.deletedAt ||
+        !Number.isFinite(currentDeletedAt) || currentDeletedAt > cutoff
+      ) return false;
+
+      try {
+        if (!isCloudStorageEnabled()) {
+          trashService.permanentlyDelete({ item: current, deletedBy: "system", loaders: getTrashLoaders() });
+        } else {
+          const pending = trashService.queueRemoteDeletion({ item: current, deletedBy: "system", loaders: getTrashLoaders(), provider: getCloudStorageStatus().provider });
+          if (pending.status === "remote_delete_pending" && pending.metadata?.remoteDeletion) {
+            auditLog("trash.remote_delete.queued", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "success", {});
+            try {
+              const result = await processCloudTrashDeletion(pending);
+              const persisted = trashRepository.getTrashItem(current.id) || result;
+              const state = persisted.metadata?.remoteDeletion?.state;
+              if (state === "completed") auditLog("trash.remote_delete.completed", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "success", {});
+              else if (state === "cancelled") auditLog("trash.remote_delete.cancelled", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "success", { reason: persisted.metadata?.remoteDeletion?.cancellationReason });
+              else if (state === "terminal_failure") auditLog("trash.remote_delete.failed", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "failure", { category: persisted.metadata?.remoteDeletion?.failureCategory });
+              else return false;
+            } catch (error) {
+              auditLog("trash.remote_delete.operational_failure", { username: "system", role: "system" }, { type: "trash", id: current.id }, "remote_delete", "failure", { category: error.code || "persistence_error" });
+              console.error("[cloud-trash] remote deletion state could not be persisted:", error.code || "persistence_error");
+              return false;
+            }
+          }
+        }
+        if (!isCloudStorageEnabled()) {
+          auditLog(
+            current.itemType === "file" ? "trash.file.permanently_deleted" : "trash.folder.permanently_deleted",
+            { username: "system", role: "system" },
+            { type: "trash", id: current.id },
+            "auto_cleanup",
+            "success",
+            { retentionDays: getTrashRetentionDays(), itemType: current.itemType }
+          );
+        }
+        return true;
+      } catch (error) {
+        auditLog("trash.delete.failed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "auto_cleanup", "failure", {
+          error: error.message,
+        });
+        return false;
+      }
+    };
+
     try {
-      if (!isCloudStorageEnabled()) {
-        trashService.permanentlyDelete({ item, deletedBy: "system", loaders: getTrashLoaders() });
-      } else {
-        const pending = trashService.queueRemoteDeletion({ item, deletedBy: "system", loaders: getTrashLoaders(), provider: getCloudStorageStatus().provider });
-        auditLog("trash.remote_delete.queued", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "success", {});
-        void trashService.processRemoteDeletion({ item: pending, provider: deleteCloudTrashItem })
-          .then((result) => {
-            const persisted = trashRepository.getTrashItem(item.id) || result;
-            const state = persisted.metadata?.remoteDeletion?.state;
-            if (state === "completed") auditLog("trash.remote_delete.completed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "success", {});
-            else if (state === "terminal_failure") auditLog("trash.remote_delete.failed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "failure", { category: persisted.metadata?.remoteDeletion?.failureCategory });
-          })
-          .catch((error) => {
-            auditLog("trash.remote_delete.operational_failure", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "failure", { category: error.code || "persistence_error" });
-            console.error("[cloud-trash] remote deletion state could not be persisted:", error.code || "persistence_error");
-          });
-      }
-      if (!isCloudStorageEnabled()) {
-        auditLog(
-          item.itemType === "file" ? "trash.file.permanently_deleted" : "trash.folder.permanently_deleted",
-          { username: "system", role: "system" },
-          { type: "trash", id: item.id },
-          "auto_cleanup",
-          "success",
-          { retentionDays: getTrashRetentionDays(), itemType: item.itemType }
-        );
-      }
+      const cleaned = item.itemType === "file"
+        ? await cloudFileLifecycleLock.run(item.originalFolderId, item.originalFileName, cleanupItem)
+        : item.itemType === "folder"
+          ? await cloudFileLifecycleLock.runFolder(item.originalFolderId, cleanupItem)
+          : await cleanupItem();
+      if (cleaned) cleanedCount += 1;
     } catch (error) {
       auditLog("trash.delete.failed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "auto_cleanup", "failure", {
         error: error.message,
@@ -3209,71 +4174,72 @@ function cleanupExpiredTrashItems() {
     }
   }
 
-  if (items.length) broadcastDataChanged("trash", { action: "auto_cleanup", count: items.length });
+  if (cleanedCount) broadcastDataChanged("trash", { action: "auto_cleanup", count: cleanedCount });
 }
 
-function cleanupExpiredTemporaryItems() {
+async function cleanupExpiredTemporaryItems() {
   const now = Date.now();
 
-  try {
-    const folders = loadFolders();
-    const remainingFolders = [];
-    let foldersChanged = false;
-
-    for (const folder of folders) {
-      const expiresAt = folder.expiresAt ? new Date(folder.expiresAt).getTime() : null;
-      if (
-        folder.id !== ROOT_FOLDER_ID &&
-        Number.isFinite(expiresAt) &&
-        expiresAt <= now
-      ) {
-        deleteFolderContents(folder);
-        addActionHistory("folder_expired", folder.name, "sistema", {
-          folderId: folder.id,
-          folderName: folder.name,
-          expiresAt: folder.expiresAt,
+  for (const folder of loadFolders()) {
+    const expiresAt = folder.expiresAt ? new Date(folder.expiresAt).getTime() : null;
+    if (folder.id === ROOT_FOLDER_ID || !Number.isFinite(expiresAt) || expiresAt > now) continue;
+    try {
+      await cloudFileLifecycleLock.runFolder(folder.id, async () => {
+        const currentFolders = loadFolders();
+        const currentFolder = currentFolders.find((item) => item.id === folder.id);
+        const currentExpiry = new Date(currentFolder?.expiresAt).getTime();
+        if (!currentFolder || !Number.isFinite(currentExpiry) || currentExpiry > now) return;
+        await deleteFolderContents(currentFolder);
+        saveFolders(currentFolders.filter((item) => item.id !== currentFolder.id));
+        addActionHistory("folder_expired", currentFolder.name, "sistema", {
+          folderId: currentFolder.id,
+          folderName: currentFolder.name,
+          expiresAt: currentFolder.expiresAt,
         });
-        foldersChanged = true;
-        continue;
-      }
-
-      remainingFolders.push(folder);
+      });
+    } catch (error) {
+      console.error("Falha ao limpar pasta temporaria:", sanitizeLogValue(error.message));
     }
-
-    if (foldersChanged) saveFolders(remainingFolders);
-  } catch (error) {
-    console.error("Falha ao limpar pastas temporarias:", error.message);
   }
 
   try {
-    const expirations = loadFileExpirations();
-    let filesChanged = false;
-
-    for (const [key, entry] of Object.entries(expirations)) {
+    for (const [key, entry] of Object.entries(loadFileExpirations())) {
       const expiresAt = new Date(entry?.expiresAt).getTime();
       if (!Number.isFinite(expiresAt) || expiresAt > now) continue;
 
       const folderId = entry.folderId || ROOT_FOLDER_ID;
       const fileName = path.basename(entry.fileName || "");
-      const filePath = path.join(getFolderStoragePath("./uploads", folderId), fileName);
+      if (!fileName) continue;
+      await cloudFileLifecycleLock.run(folderId, fileName, async () => {
+        const expirations = loadFileExpirations();
+        const current = expirations[key];
+        const currentExpiry = new Date(current?.expiresAt).getTime();
+        if (
+          !current || (current.folderId || ROOT_FOLDER_ID) !== folderId || path.basename(current.fileName || "") !== fileName ||
+          !Number.isFinite(currentExpiry) || currentExpiry > now
+        ) return;
 
-      if (fileName && isExistingFile(filePath)) {
-        fs.unlinkSync(filePath);
-      }
-
-      deleteCloudFileLater(folderId, fileName, "uploads");
-      removePublicLinksForFile(fileName, folderId);
-      removeFilePermission(folderId, fileName);
-      removeFileVersions(folderId, fileName);
-      delete expirations[key];
-      addActionHistory("file_expired", fileName, "sistema", {
-        folderId,
-        expiresAt: entry.expiresAt,
+        const filePath = path.join(getFolderStoragePath("./uploads", folderId), fileName);
+        const versionNames = getVersionHistory(folderId, fileName).versions
+          .map((version) => path.basename(version.storedAs || ""))
+          .filter(Boolean);
+        if (isCloudStorageEnabled()) {
+          for (const storedName of new Set([fileName, ...versionNames])) {
+            await deleteFileFromCloud(folderId, storedName, "uploads");
+          }
+        }
+        if (isExistingFile(filePath)) fs.unlinkSync(filePath);
+        removePublicLinksForFile(fileName, folderId);
+        removeFilePermission(folderId, fileName);
+        await removeFileVersions(folderId, fileName, { remoteAlreadyDeleted: isCloudStorageEnabled() });
+        delete expirations[key];
+        saveFileExpirations(expirations);
+        addActionHistory("file_expired", fileName, "sistema", {
+          folderId,
+          expiresAt: current.expiresAt,
+        });
       });
-      filesChanged = true;
     }
-
-    if (filesChanged) saveFileExpirations(expirations);
   } catch (error) {
     console.error("Falha ao limpar arquivos temporarios:", error.message);
   }
@@ -3353,7 +4319,7 @@ function scanFileWithClamAv(filePath) {
     socket.on("error", (error) => finish(error));
     socket.on("data", (chunk) => chunks.push(chunk));
     socket.on("end", () => {
-      const response = Buffer.concat(chunks).toString("utf-8").trim();
+      const response = Buffer.concat(chunks).toString("utf-8").replace(/\0+$/g, "").trim();
       if (/FOUND$/i.test(response)) {
         const virus = response.replace(/^stream:\s*/i, "").replace(/\s+FOUND$/i, "");
         return finish(null, { status: "infected", provider: "clamav", virus, raw: response.slice(0, 300) });
@@ -3423,13 +4389,15 @@ function quarantineUploadedFile(req, options) {
 }
 
 async function scanUploadBeforePending(req, options) {
-  if (!UPLOAD_SCAN_ENABLED) {
-    return { allowed: true, scanResult: { status: "skipped", provider: "disabled" } };
-  }
-
   const fileName = path.basename(options.fileName || options.originalName || "");
   const folderId = options.folderId || ROOT_FOLDER_ID;
-  const extension = path.extname(fileName).toLowerCase();
+  let extensionNameEnd = fileName.length;
+  while (extensionNameEnd > 0) {
+    const lastCharacter = fileName[extensionNameEnd - 1];
+    if (lastCharacter !== "." && lastCharacter !== " ") break;
+    extensionNameEnd -= 1;
+  }
+  const extension = path.extname(fileName.slice(0, extensionNameEnd)).toLowerCase();
   const auditTarget = { type: "file", id: fileName };
 
   if (UPLOAD_BLOCK_EXECUTABLES && UPLOAD_SUSPICIOUS_EXTENSIONS.has(extension)) {
@@ -3452,6 +4420,10 @@ async function scanUploadBeforePending(req, options) {
       quarantine,
       scanResult,
     };
+  }
+
+  if (!UPLOAD_SCAN_ENABLED) {
+    return { allowed: true, scanResult: { status: "skipped", provider: "disabled" } };
   }
 
   if (UPLOAD_SCAN_PROVIDER !== "clamav") {
@@ -3538,10 +4510,17 @@ function removePendingEntriesForFolder(folderId) {
 }
 
 function getAccessibleFolderOrRespond(req, res, rawFolderId = ROOT_FOLDER_ID) {
+  const folder = getAccessibleFolderRecordOrRespond(req, res, rawFolderId);
+  if (!folder) return null;
+  const paths = ensureFolderDirectories(folder.id);
+  return { ...folder, ...paths };
+}
+
+function getAccessibleFolderRecordOrRespond(req, res, rawFolderId = ROOT_FOLDER_ID) {
   const folderId = String(rawFolderId || ROOT_FOLDER_ID);
   const folder = getFolderById(folderId);
 
-  if (!folder) {
+  if (!folder || !isFolderAvailable(folderId)) {
     res.status(404).json({ error: "Pasta nao encontrada" });
     return null;
   }
@@ -3551,8 +4530,7 @@ function getAccessibleFolderOrRespond(req, res, rawFolderId = ROOT_FOLDER_ID) {
     return null;
   }
 
-  const paths = ensureFolderDirectories(folder.id);
-  return { ...folder, ...paths };
+  return folder;
 }
 
 function getPendingKey(folderId, fileName) {
@@ -3619,10 +4597,11 @@ function isGzipFile(filePath) {
 
 async function decompressUploadedFileIfNeeded(req) {
   const compression = String(req.body?.rootarkCompression || req.query?.rootarkCompression || "").toLowerCase();
-  if (!req.file?.path) return false;
+  const trustedPath = getTrustedUploadStagingPath(req.file);
+  if (!trustedPath) return false;
 
   const extension = path.extname(req.file.originalname || req.file.filename || "").toLowerCase();
-  const hasGzipHeader = isGzipFile(req.file.path);
+  const hasGzipHeader = isGzipFile(trustedPath);
   const shouldDecompress = compression === "gzip" || (hasGzipHeader && extension !== ".gz");
   if (!shouldDecompress) return false;
 
@@ -3630,7 +4609,7 @@ async function decompressUploadedFileIfNeeded(req) {
     throw new Error("Upload marcado como compactado, mas o arquivo nao esta em gzip");
   }
 
-  const compressedPath = req.file.path;
+  const compressedPath = trustedPath;
   const outputPath = `${compressedPath}.decompressed`;
 
   try {
@@ -3728,6 +4707,10 @@ function cleanupIncomingUploads() {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const fullPath = path.join(directory, entry.name);
       if (!entry.isFile()) continue;
+      const isUploadStagingFile = directory === SIMPLE_UPLOAD_INCOMING_DIR
+        ? /^\d+-[a-f0-9]{16}\.(?:upload|webdav)$/i.test(entry.name)
+        : /^[a-f0-9]{32}$/i.test(entry.name);
+      if (!isUploadStagingFile) continue;
 
       const stats = fs.statSync(fullPath);
       if (now - stats.mtimeMs > 5 * 60 * 1000) {
@@ -3737,9 +4720,11 @@ function cleanupIncomingUploads() {
   }
 }
 
-function getPendingUploadEntry(folderId, fileName) {
-  const entries = loadPendingUploads();
-  return entries[getPendingKey(folderId, fileName)] || entries[fileName] || null;
+function getPendingUploadEntry(folderId, fileName, entries = loadPendingUploads()) {
+  const key = getPendingKey(folderId, fileName);
+  if (Object.hasOwn(entries, key)) return entries[key] || null;
+  if (Object.hasOwn(entries, fileName)) return entries[fileName] || null;
+  return null;
 }
 
 function getPendingUploadOwner(folderId, fileName) {
@@ -3752,7 +4737,7 @@ function getApprovalFolderById(folderId) {
   return { ...folder, ...ensureFolderDirectories(folder.id) };
 }
 
-async function findPendingApprovalTarget(req, requestedFolder, fileName) {
+async function findPendingApprovalTarget(req, requestedFolder, fileName, { allowRestoreOrphan = false } = {}) {
   const name = path.basename(fileName || "");
   if (!name) return null;
 
@@ -3783,6 +4768,12 @@ async function findPendingApprovalTarget(req, requestedFolder, fileName) {
   }
 
   for (const candidate of candidates) {
+    const pendingEntry = getPendingUploadEntry(candidate.folder.id, name, pendingUploads);
+    if (!pendingEntry) continue;
+    if (restoreProviderOrphans.isSuppressed(candidate.folder.id, name, "temp")) {
+      if (allowRestoreOrphan) return { ...candidate, restoreOrphan: true };
+      continue;
+    }
     await ensureCloudFileCached(candidate.folder.id, name, candidate.pendingPath, "temp");
     if (isExistingFile(candidate.pendingPath)) return candidate;
   }
@@ -3791,11 +4782,9 @@ async function findPendingApprovalTarget(req, requestedFolder, fileName) {
 }
 
 function canAccessPendingFile(req, folderId, fileName) {
-  return (
-    req.user?.permissions?.listPending ||
-    getPendingUploadOwner(folderId, fileName) === req.user?.username ||
-    !getPendingUploadOwner(folderId, fileName)
-  );
+  if (req.user?.permissions?.listPending) return true;
+  const owner = getPendingUploadOwner(folderId, fileName);
+  return Boolean(owner && sameUsername(owner, req.user?.username));
 }
 
 function resolveScopedFile(scope, rawName, rawFolderId = ROOT_FOLDER_ID) {
@@ -3807,7 +4796,7 @@ function resolveScopedFile(scope, rawName, rawFolderId = ROOT_FOLDER_ID) {
   }
 
   const folder = getFolderById(folderId);
-  if (!folder) return null;
+  if (!folder || !isFolderAvailable(folderId)) return null;
 
   if (scope === "public") {
     return {
@@ -3839,8 +4828,18 @@ async function ensurePreviewAccess(req, res, scope, rawName, rawFolderId = ROOT_
     return null;
   }
 
+  if (!target.isPending && isFileExpired(target.folderId, target.name)) {
+    res.status(410).json({ error: "Arquivo expirado" });
+    return null;
+  }
+
   if (target.isPending && !hasFolderAccess(req, target.folder)) {
     res.status(403).json({ error: "Acesso negado a esta pasta" });
+    return null;
+  }
+
+  if (target.isPending && restoreProviderOrphans.isSuppressed(target.folderId, target.name, "temp")) {
+    res.status(409).json({ error: "Payload pendente nao consta no backup restaurado; rejeite ou envie novamente" });
     return null;
   }
 
@@ -3871,6 +4870,43 @@ async function ensurePreviewAccess(req, res, scope, rawName, rawFolderId = ROOT_
   }
 
   await ensureCloudFileCached(target.folderId, target.name, target.filePath, target.isPending ? "temp" : "uploads");
+  if (!refreshAuthenticatedUser(req, res)) return null;
+  if (target.isPending && restoreProviderOrphans.isSuppressed(target.folderId, target.name, "temp")) {
+    res.status(409).json({ error: "Payload pendente nao consta no backup restaurado; rejeite ou envie novamente" });
+    return null;
+  }
+  const currentFolder = getFolderById(target.folderId);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder)) {
+    res.status(403).json({ error: "Acesso negado a esta pasta" });
+    return null;
+  }
+  if (target.isPending) {
+    if (!req.user?.permissions?.listPending && !req.user?.permissions?.upload) {
+      res.status(403).json({ error: "Permissao negada: listPending" });
+      return null;
+    }
+    if (!canAccessPendingFile(req, target.folderId, target.name) || !getPendingUploadEntry(target.folderId, target.name)) {
+      res.status(403).json({ error: "Permissao negada para esse arquivo" });
+      return null;
+    }
+  } else {
+    if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, target.name)) {
+      res.status(403).json({ error: "Acesso negado a este arquivo" });
+      return null;
+    }
+    if (isFileInTrash(target.folderId, target.name)) {
+      res.status(410).json({ error: "Arquivo esta na lixeira" });
+      return null;
+    }
+    if (getEncryptedFileMetadata(target.folderId, target.name)) {
+      res.status(403).json({ error: "Preview indisponivel para arquivos criptografados" });
+      return null;
+    }
+  }
+  if (!isFolderAvailable(target.folderId) || (!target.isPending && isFileExpired(target.folderId, target.name))) {
+    res.status(410).json({ error: "Arquivo expirado" });
+    return null;
+  }
   if (!fs.existsSync(target.filePath)) {
     res.status(404).json({ error: "Arquivo nao encontrado" });
     return null;
@@ -3923,6 +4959,73 @@ function listFilesWithDetailsAsync(directory) {
       else resolve(files);
     });
   });
+}
+
+async function listFilesWithCloudDetails(directory, folderId, area = "uploads") {
+  const files = await listFilesWithDetailsAsync(directory);
+  if (!isCloudStorageEnabled()) return files;
+
+  try {
+    const localNames = new Set(files.map((file) => file.name));
+    const cloudFiles = await listCloudFiles(folderId, area);
+    for (const cloudFile of cloudFiles) {
+      const name = path.basename(String(cloudFile.name || ""));
+      if (!name || name !== cloudFile.name || localNames.has(name)) continue;
+      const size = Number(cloudFile.size);
+      const modifiedAt = cloudFile.modifiedAt || cloudFile.uploadedAt || null;
+      files.push({
+        name,
+        size: Number.isFinite(size) ? size : 0,
+        uploadedAt: cloudFile.uploadedAt || modifiedAt,
+        modifiedAt,
+      });
+      localNames.add(name);
+    }
+  } catch (error) {
+    console.error("[cloud-storage] list metadata failed:", sanitizeLogValue(error.message));
+  }
+
+  return files;
+}
+
+async function getListedFileDetails(folder, fileName) {
+  if (isStoredVersionFile(folder.id, fileName)) return null;
+  if (isFileInTrash(folder.id, fileName)) return null;
+  const files = await listFilesWithCloudDetails(folder.uploadDir, folder.id, "uploads");
+  return files.find((file) => file.name === fileName) || null;
+}
+
+// Process-local account windows bound one server instance; coordinated limits across replicas need shared storage, as does issue #94.
+const cloudMetadataRateLimits = new Map();
+const CLOUD_METADATA_RATE_LIMIT_MAX = 30;
+const CLOUD_METADATA_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+let cloudMetadataRateLimitCleanupAt = 0;
+
+function consumeCloudMetadataRateLimit(req, res) {
+  const now = Date.now();
+  if (now >= cloudMetadataRateLimitCleanupAt) {
+    for (const [key, state] of cloudMetadataRateLimits) {
+      if (now - state.windowStart >= CLOUD_METADATA_RATE_LIMIT_WINDOW_MS) cloudMetadataRateLimits.delete(key);
+    }
+    cloudMetadataRateLimitCleanupAt = now + CLOUD_METADATA_RATE_LIMIT_WINDOW_MS;
+  }
+
+  const username = String(req.user?.username || "").trim().toLowerCase();
+  const route = req.route?.path || req.path;
+  const method = req.method === "HEAD" ? "GET" : req.method;
+  const key = `${username}\0${method}\0${route}`;
+  let state = cloudMetadataRateLimits.get(key);
+  if (!state || now - state.windowStart >= CLOUD_METADATA_RATE_LIMIT_WINDOW_MS) {
+    state = { attempts: 0, windowStart: now };
+    cloudMetadataRateLimits.set(key, state);
+  }
+  if (state.attempts >= CLOUD_METADATA_RATE_LIMIT_MAX) {
+    res.setHeader("Retry-After", String(Math.max(1, Math.ceil((state.windowStart + CLOUD_METADATA_RATE_LIMIT_WINDOW_MS - now) / 1000))));
+    res.status(429).json({ error: "Muitas requisicoes. Tente novamente em instantes." });
+    return false;
+  }
+  state.attempts += 1;
+  return true;
 }
 
 function getDirectorySize(directory) {
@@ -4277,7 +5380,12 @@ function canRestoreTrashItem(req, item) {
 }
 
 function isFileInTrash(folderId, fileName) {
-  return trashRepository.isFileTrashed(folderId || ROOT_FOLDER_ID, path.basename(fileName || ""));
+  const normalizedFolderId = folderId || ROOT_FOLDER_ID;
+  const normalizedName = path.basename(fileName || "");
+  if (!trashRepository.isFileTrashed(normalizedFolderId, normalizedName)) return false;
+  const pendingReplacement = trashRepository.listPendingFileRemoteDeletions(normalizedFolderId, normalizedName)
+    .some(isTrashReplacementActive);
+  return !pendingReplacement;
 }
 
 function hydrateFolderForWebDav(folder) {
@@ -4315,7 +5423,16 @@ function isWebDavEncryptedFile(folderId, fileName) {
 
 function isWebDavInternalStoredFile(folderId, fileName) {
   const name = path.basename(fileName || "");
-  return isStoredVersionFile(folderId, name) || /\.v\d+$/i.test(name);
+  if (isStoredVersionFile(folderId, name)) return true;
+
+  // With the version manifest missing, an unmarked `.vN` object is ambiguous:
+  // it may be an ordinary file or orphaned historical bytes. WebDAV requires
+  // file-local metadata to expose that ambiguous name; ordinary files that
+  // have their own ACL or version history remain available.
+  if (!/\.v\d+$/i.test(name)) return false;
+  const versionEntries = loadFileVersions();
+  if (versionEntries[getFileVersionKey(folderId, name)]) return false;
+  return !getFilePermissionEntry(folderId, name, loadFilePermissions());
 }
 
 async function deleteCloudTrashItem(item) {
@@ -4334,23 +5451,49 @@ async function deleteCloudTrashItem(item) {
   return true;
 }
 
-async function processPendingCloudTrashItems() {
-  if (!isCloudStorageEnabled()) return;
-  try {
-    for (const item of trashRepository.listTrashItems({ status: "remote_delete_pending" })) {
-      try {
-        const result = await trashService.processRemoteDeletion({ item, provider: deleteCloudTrashItem });
-        const state = result.metadata?.remoteDeletion?.state;
-        if (state === "completed") auditLog("trash.remote_delete.completed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "success", {});
-        else if (state === "terminal_failure") auditLog("trash.remote_delete.failed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "failure", { category: result.metadata?.remoteDeletion?.failureCategory });
-      } catch (error) {
-        auditLog("trash.remote_delete.operational_failure", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "failure", { category: error.code || "persistence_error" });
-        console.error("[cloud-trash] pending remote deletion failed:", error.code || "persistence_error");
-      }
-    }
-  } catch (error) {
-    console.error("[cloud-trash] pending retry failed:", error.code || "persistence_error");
+function isTrashReplacementActive(item) {
+  if (item.itemType === "file") {
+    const fileName = path.basename(item.originalFileName || "");
+    if (!fileName) return false;
+    const localPath = path.join(getFolderStoragePath("./uploads", item.originalFolderId || ROOT_FOLDER_ID), fileName);
+    return isExistingFile(localPath);
   }
+  if (item.itemType === "folder") {
+    return loadFolders().some((folder) => folder.id === item.originalFolderId && !folder.deletedAt);
+  }
+  return false;
+}
+
+function processCloudTrashDeletion(item) {
+  return trashService.processRemoteDeletion({
+    item,
+    provider: deleteCloudTrashItem,
+    runFileLifecycleMutation: (folderId, fileName, work) => cloudFileLifecycleLock.run(folderId, fileName, work),
+    runFolderLifecycleMutation: (folderId, work) => cloudFileLifecycleLock.runFolder(folderId, work),
+    isReplacementActive: isTrashReplacementActive,
+  });
+}
+
+async function processPendingCloudTrashItems() {
+  return restoreRequestGate.run(async () => {
+    if (!isCloudStorageEnabled()) return;
+    try {
+      for (const item of trashRepository.listTrashItems({ status: "remote_delete_pending" })) {
+        try {
+          const result = await processCloudTrashDeletion(item);
+          const state = result.metadata?.remoteDeletion?.state;
+          if (state === "completed") auditLog("trash.remote_delete.completed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "success", {});
+          else if (state === "cancelled") auditLog("trash.remote_delete.cancelled", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "success", { reason: result.metadata?.remoteDeletion?.cancellationReason });
+          else if (state === "terminal_failure") auditLog("trash.remote_delete.failed", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "failure", { category: result.metadata?.remoteDeletion?.failureCategory });
+        } catch (error) {
+          auditLog("trash.remote_delete.operational_failure", { username: "system", role: "system" }, { type: "trash", id: item.id }, "remote_delete", "failure", { category: error.code || "persistence_error" });
+          console.error("[cloud-trash] pending remote deletion failed:", error.code || "persistence_error");
+        }
+      }
+    } catch (error) {
+      console.error("[cloud-trash] pending retry failed:", error.code || "persistence_error");
+    }
+  });
 }
 
 function deleteCloudTrashItemLater(item) {
@@ -4372,16 +5515,21 @@ function deleteCloudTrashItemLater(item) {
 }
 
 async function processPendingCloudRestoreSync() {
-  if (!isCloudStorageEnabled()) return;
-  for (const backup of backupService.listBackups()) {
-    const state = backup.metadata?.restoreSync?.state;
-    if (!["pending", "retry_wait"].includes(state)) continue;
-    try {
-      await restoreService.processRestoreSync({ backupId: backup.id });
-    } catch {
-      // The durable entry remains retryable; never create an unhandled rejection.
+  return restoreRequestGate.run(async () => {
+    if (!isCloudStorageEnabled()) return;
+    for (const backup of backupService.listBackups()) {
+      const state = backup.metadata?.restoreSync?.state;
+      if (!["pending", "retry_wait", "terminal_failure"].includes(state)) continue;
+      try {
+        await restoreService.processRestoreSync({
+          backupId: backup.id,
+          runFileLifecycleMutation: (folderId, fileName, work) => cloudFileLifecycleLock.run(folderId, fileName, work),
+        });
+      } catch {
+        // The durable entry remains retryable; never create an unhandled rejection.
+      }
     }
-  }
+  });
 }
 
 function initData() {
@@ -4394,6 +5542,7 @@ function initData() {
   if (!fs.existsSync("./uploads")) fs.mkdirSync("./uploads");
 
   if (shouldUseDatabase()) {
+      restoreService.recoverDatabaseRollback(dbConfig.getDatabasePath());
     runMigrations({ backup: String(process.env.DB_AUTO_BACKUP_ON_START || "false").toLowerCase() === "true" });
   }
 
@@ -4423,23 +5572,100 @@ function initData() {
 
   if (!hasUsers) {
     const seedUsers = loadSeedUsers();
+    const seedOptIn = process.env.ROOTARK_BOOTSTRAP_USERS_FROM_SEED === "true";
+    if (seedUsers && !seedOptIn) throw new Error("User seed import requires ROOTARK_BOOTSTRAP_USERS_FROM_SEED=true.");
+    if (seedOptIn && !seedUsers) throw new Error("ROOTARK_BOOTSTRAP_USERS_FROM_SEED is enabled but data/users.json is missing or invalid.");
     const users = seedUsers || getDefaultUsers();
-
     saveUsers(users);
-    console.log(
-      seedUsers
-        ? "Usuarios locais restaurados a partir de data/users.json"
-        : "Usuarios padrao criados -> admin:admin123 / user:user123"
-    );
+    console.log(seedUsers ? "User seed imported from data/users.json." : "Explicit local development users created.");
   }
+
+  const persistedUsers = loadUsers();
+  publishedSampleCredentialsPresent = hasPublishedSampleCredentials(persistedUsers);
+  if (NODE_ENV !== "test" && publishedSampleCredentialsPresent) {
+    throw new Error("Published sample credentials must be changed before startup outside NODE_ENV=test.");
+  }
+  trustedUserPasswordHashes = snapshotUserPasswordHashes(persistedUsers);
 }
 
-app.set("trust proxy", true);
-app.use((req, res, next) => {
-  if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
-  if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
-  return express.json()(req, res, next);
+app.set("trust proxy", TRUSTED_PROXIES);
+// Uses Express's default process-local store; deployments needing cross-process quotas must configure a shared store.
+const createRouteRateLimit = () => rateLimit({
+  windowMs: ROUTE_RATE_LIMIT_WINDOW_MS,
+  limit: ROUTE_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas solicitações. Tente novamente mais tarde." },
 });
+const uploadChunkRateLimit = rateLimit({
+  windowMs: ROUTE_RATE_LIMIT_WINDOW_MS,
+  limit: UPLOAD_CHUNK_RATE_LIMIT_MAX,
+  store: new UploadChunkSlidingWindowStore(ROUTE_RATE_LIMIT_WINDOW_MS, UPLOAD_CHUNK_RATE_LIMIT_MAX),
+  keyGenerator: (req) => String(req.user?.username || ""),
+  standardHeaders: false,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    const resetAt = req.rateLimit?.resetTime?.getTime() ?? Date.now() + ROUTE_RATE_LIMIT_WINDOW_MS;
+    res.setHeader("Retry-After", String(Math.max(1, Math.ceil((resetAt - Date.now()) / 1000))));
+    return res.status(429).json({ error: "Limite temporario de envios em blocos atingido. Tente novamente mais tarde." });
+  },
+});
+const uploadChunkPeerRateLimit = rateLimit({
+  windowMs: ROUTE_RATE_LIMIT_WINDOW_MS,
+  limit: UPLOAD_CHUNK_IP_RATE_LIMIT_MAX,
+  keyGenerator: (req) => rateLimit.ipKeyGenerator(req.socket?.remoteAddress || "unknown"),
+  standardHeaders: false,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    const resetAt = req.rateLimit?.resetTime?.getTime() ?? Date.now() + ROUTE_RATE_LIMIT_WINDOW_MS;
+    res.setHeader("Retry-After", String(Math.max(1, Math.ceil((resetAt - Date.now()) / 1000))));
+    return res.status(429).json({ error: "Limite temporario de requisicoes em blocos atingido. Tente novamente mais tarde." });
+  },
+});
+const versionsRateLimit = createRouteRateLimit();
+const fileOpenTokenRateLimit = createRouteRateLimit();
+const openFileRedemptionRateLimit = createRouteRateLimit();
+const versionOpenTokenRateLimit = createRouteRateLimit();
+const shareRateLimit = createRouteRateLimit();
+const pendingRepairRateLimit = createRouteRateLimit();
+const approveRateLimit = createRouteRateLimit();
+const rejectRateLimit = createRouteRateLimit();
+const deleteRateLimit = createRouteRateLimit();
+const renameRateLimit = createRouteRateLimit();
+const moveRateLimit = createRouteRateLimit();
+const fileAccessRateLimit = createRouteRateLimit();
+const fileTemporaryRateLimit = createRouteRateLimit();
+const fileListRateLimit = createRouteRateLimit();
+const fileSearchRateLimit = createRouteRateLimit();
+const webDavPropfindRateLimit = createRouteRateLimit();
+const API_RATE_LIMIT_MAX = parsePositiveIntegerEnv(
+  "API_RATE_LIMIT_MAX",
+  Math.min(ROUTE_RATE_LIMIT_MAX * 10, 1_000_000),
+  1_000_000,
+);
+const apiRequestRateLimit = rateLimit({
+  windowMs: ROUTE_RATE_LIMIT_WINDOW_MS,
+  limit: API_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas solicitações. Tente novamente mais tarde." },
+  skip: (req) => req.method === "POST" && req.path === "/upload-chunk",
+});
+const restoreRequestGate = createRestoreRequestGate({
+  directory: RESTORE_ACTIVE_REQUESTS_DIR,
+  isBlocked: restoreService.isWholeRestoreBlocked,
+});
+const startupRestoreLease = restoreRequestGate.acquire({ allowBlocked: true });
+process.once("exit", startupRestoreLease);
+let startupRestoreState;
+try {
+  startupRestoreState = restoreService.assertNoPendingWholeRestore();
+  restoreProviderOrphans.initialize({ requirePolicy: restoreService.requiresProviderOrphanPolicyAtStartup(startupRestoreState) });
+} catch (error) {
+  startupRestoreLease();
+  throw error;
+}
+app.use(restoreRequestGate.middleware);
 app.use((req, res, next) => {
   if (req.path === "/" || req.path.endsWith(".html")) {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
@@ -4449,31 +5675,88 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.static("./public"));
+app.post("/upload-chunk", uploadChunkPeerRateLimit);
+app.use(apiRequestRateLimit);
 app.use((req, res, next) => {
-  cleanupExpiredTemporaryItems();
-  next();
+  if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
+  if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
+  return express.json()(req, res, next);
 });
-
 const loadCurrentUser = (username) => loadUsers().find((user) => user.username === username);
-const authenticate = createAuthenticate({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
+const loadCurrentAuthenticatedUser = (username) => loadUsers({ failOnDatabaseError: true }).find((user) => user.username === username);
+const authenticate = createAuthenticate({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentAuthenticatedUser, normalizeUserPermissions });
 const authenticateRealtimeToken = createRealtimeAuthenticator({ jwt, jwtSecret: JWT_SECRET, loadUser: loadCurrentUser, normalizeUserPermissions });
 
+function refreshAuthenticatedUserState(req) {
+  if (isAuthTokenExpired(req)) return { status: 401, error: "Sessao invalida ou expirada" };
+  let user;
+  try {
+    user = loadCurrentAuthenticatedUser(req.user?.username);
+  } catch {
+    return { status: 503, error: "Autorizacao indisponivel" };
+  }
+
+  if (!user || user.disabled || (user.sessionVersion || 0) !== req.user?.sessionVersion) {
+    return { status: 401, error: "Sessao invalida ou expirada" };
+  }
+
+  req.user = {
+    ...req.user,
+    username: user.username,
+    role: user.role,
+    permissions: normalizeUserPermissions(user),
+    sessionVersion: user.sessionVersion || 0,
+    totpEnabled: Boolean(user.totpEnabled),
+  };
+  return null;
+}
+
+function refreshAuthenticatedUser(req, res) {
+  const failure = refreshAuthenticatedUserState(req);
+  if (failure) {
+    res.status(failure.status).json({ error: failure.error });
+    return false;
+  }
+  return true;
+}
+
+function revalidateBackupAccess(req) {
+  const failure = refreshAuthenticatedUserState(req);
+  if (failure) return failure;
+  if (!canManageBackups(req)) return { status: 403, error: "Permissao negada: manageBackups" };
+  return null;
+}
+
+function revalidateTrashManageAccess(req, res) {
+  if (!refreshAuthenticatedUser(req, res)) return false;
+  if (!canManageTrash(req)) {
+    res.status(403).json({ error: "Permissao negada: manageTrash" });
+    return false;
+  }
+  return true;
+}
+
 app.get("/auth/session.js", authenticate, (req, res) => {
-  res.type("application/javascript").set("Cache-Control", "no-store");
+  res.set({
+    "Cache-Control": "no-store",
+    "Cross-Origin-Resource-Policy": "same-origin",
+  });
+  const requestOrigin = req.get("origin");
+  if (requestOrigin && requestOrigin !== getExpectedOrigin(req, app.get("trust proxy fn"))) {
+    return res.status(403).json({ error: "Origin denied" });
+  }
+  res.type("application/javascript");
   const identity = JSON.stringify({ username: req.user.username, role: req.user.role, permissions: req.user.permissions }).replace(/</g, "\\u003c");
   res.send(`window.ROOTARK_AUTH=${identity};`);
 });
 
 wss.on("connection", (socket, req) => {
-  const origin = req.headers.origin;
-  const expectedOrigin = getExpectedOrigin(req);
-  const user = origin === expectedOrigin && authenticateRealtimeToken(parseCookies(req.headers.cookie).rootark_session);
-
-  if (!user) {
-    socket.close(1008, "Token invalido");
+  realtimeUpgradeGuard.trackConnection(socket, req);
+  if (restoreService.isWholeRestoreBlocked()) {
+    socket.close(1012, "Restore recovery required");
     return;
   }
-
+  const user = req.rootarkRealtimeUser;
   socket.user = user;
   socket.isAlive = true;
   socket.lastActivityAt = Date.now();
@@ -4484,6 +5767,7 @@ wss.on("connection", (socket, req) => {
 
   socket.on("message", (rawMessage, isBinary) => {
     socket.lastActivityAt = Date.now();
+    if (restoreService.isWholeRestoreBlocked()) return socket.close(1012, "Restore recovery required");
     if (!refreshRealtimeUser(socket)) return;
     if (isBinary) return socket.close(1003, "Quadro binario nao suportado");
     const now = Date.now();
@@ -4607,6 +5891,9 @@ app.post("/users", authenticate, requirePermission("manageUsers"), (req, res) =>
   if (!username || !password) {
     return res.status(400).json({ error: "username e password obrigatorios" });
   }
+  if (isPublishedSamplePassword(password)) {
+    return res.status(400).json({ error: "Senha de amostra publicada nao permitida" });
+  }
 
   const users = loadUsers();
   if (users.find((u) => u.username === username)) {
@@ -4650,6 +5937,9 @@ app.put("/users/:username", authenticate, requirePermission("manageUsers"), (req
 
   const before = JSON.parse(JSON.stringify(users[idx]));
   const { password, role, permissions } = req.body;
+  if (isPublishedSamplePassword(password)) {
+    return res.status(400).json({ error: "Senha de amostra publicada nao permitida" });
+  }
   const sessionChanged = Boolean(password || (role && role !== users[idx].role) || (permissions && Object.entries(permissions).some(([key, value]) => users[idx].permissions?.[key] !== value)) || req.body.disabled !== undefined && Boolean(req.body.disabled) !== Boolean(users[idx].disabled));
   if (password) users[idx].password = bcrypt.hashSync(password, 10);
   if (role) users[idx].role = role;
@@ -4706,7 +5996,7 @@ app.delete("/users/:username", authenticate, requirePermission("manageUsers"), (
   res.json({ message: "Usuario excluido" });
 });
 
-app.get("/file-access", authenticate, (req, res) => {
+app.get("/file-access", fileAccessRateLimit, authenticate, async (req, res) => {
   const rawName = typeof req.query.name === "string" ? req.query.name.trim() : "";
   const name = path.basename(rawName);
   const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
@@ -4716,12 +6006,16 @@ app.get("/file-access", authenticate, (req, res) => {
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
 
-  const filePath = path.join(folder.uploadDir, name);
-  if (!isExistingFile(filePath)) {
+  if (!canManageAccess(req) && !hasFileEditAccess(req, folder, name)) {
+    return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+  }
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
+  if (!await getListedFileDetails(folder, name)) {
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
-
-  if (!canManageAccess(req) && !hasFileEditAccess(req, folder, name)) {
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !hasFileEditAccess(req, currentFolder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
 
@@ -4733,15 +6027,15 @@ app.get("/file-access", authenticate, (req, res) => {
     owner: normalizedEntry.owner,
     public: normalizedEntry.public,
     users: normalizedEntry.users,
-    eligibleUsers: getFolderEligibleUsers(folder),
+    eligibleUsers: getFolderEligibleUsers(currentFolder),
     allowedUsers: Object.entries(normalizedEntry.users)
       .filter(([, access]) => access.read || access.edit)
       .map(([username]) => username),
-    inherited: !entry,
+    inherited: !entry || Boolean(entry.inheritFolderAccess),
   });
 });
 
-app.put("/file-access", authenticate, (req, res) => {
+app.put("/file-access", fileAccessRateLimit, authenticate, async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const folder = getAccessibleFolderOrRespond(req, res, req.body.folderId);
@@ -4751,16 +6045,22 @@ app.put("/file-access", authenticate, (req, res) => {
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
 
-  const filePath = path.join(folder.uploadDir, name);
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
-
+  return runCloudFileLifecycleMutation(folder.id, name, async () => {
   if (!canManageAccess(req) && !hasFileEditAccess(req, folder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
+  if (!await getListedFileDetails(folder, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolderRecord = getFolderById(folder.id);
+  const currentFolder = currentFolderRecord && { ...currentFolderRecord, ...ensureFolderDirectories(currentFolderRecord.id) };
+  if (!currentFolder || !hasFileEditAccess(req, currentFolder, name)) {
+    return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+  }
 
-  const eligibleUsers = getFolderEligibleUsers(folder);
+  const eligibleUsers = getFolderEligibleUsers(currentFolder);
   const validUsernames = new Set(eligibleUsers.map((user) => user.username));
   const publicAccess = Boolean(req.body.public);
   const requestedUsers = req.body.users && typeof req.body.users === "object"
@@ -4794,12 +6094,43 @@ app.put("/file-access", authenticate, (req, res) => {
     });
   }
 
+  if (!await getListedFileDetails(currentFolder, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const finalFolderRecord = getFolderById(folder.id);
+  const finalFolder = finalFolderRecord && { ...finalFolderRecord, ...ensureFolderDirectories(finalFolderRecord.id) };
+  if (!finalFolder || !hasFileEditAccess(req, finalFolder, name)) {
+    return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+  }
+  const finalEligibleUsers = getFolderEligibleUsers(finalFolder);
+  const finalEligibleUsernames = new Set(finalEligibleUsers.map((user) => user.username));
+  const noLongerEligibleUsers = Object.keys(userAccess).filter((username) => !finalEligibleUsernames.has(username));
+  if (noLongerEligibleUsers.length) {
+    return res.status(400).json({
+      error: `Usuarios sem acesso a pasta ou invalidos: ${noLongerEligibleUsers.join(", ")}`,
+    });
+  }
   const entries = loadFilePermissions();
   const key = getFilePermissionKey(folder.id, name);
   const hasSpecificUsers = Object.keys(userAccess).length > 0;
 
   if (publicAccess && !hasSpecificUsers) {
-    delete entries[key];
+    if (entries[key]) {
+      const previous = normalizeFilePermissionEntry(entries[key]);
+      entries[key] = {
+        folderId: folder.id,
+        fileName: name,
+        owner: previous.owner,
+        public: true,
+        users: {},
+        inheritFolderAccess: true,
+        updatedAt: new Date().toISOString(),
+        updatedBy: req.user.username,
+      };
+    } else {
+      delete entries[key];
+    }
   } else {
     const previous = normalizeFilePermissionEntry(entries[key]);
     entries[key] = {
@@ -4829,10 +6160,11 @@ app.put("/file-access", authenticate, (req, res) => {
     owner: entries[key]?.owner || "sistema",
     public: publicAccess,
     users: userAccess,
-    eligibleUsers,
+    eligibleUsers: finalEligibleUsers,
     allowedUsers: Object.keys(userAccess),
     inherited: publicAccess && !hasSpecificUsers,
   });
+  }, res);
 });
 
 const storage = multer.diskStorage({
@@ -4843,7 +6175,9 @@ const storage = multer.diskStorage({
   filename: (req, file, cb) => {
     try {
       req.uploadFinalFileName = getAvailableUploadFileName(file.originalname, req.uploadFolder?.id || ROOT_FOLDER_ID, true);
-      cb(null, `${Date.now()}-${crypto.randomBytes(8).toString("hex")}.upload`);
+      const filename = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}.upload`;
+      req[UPLOAD_STAGING_PATH] = path.join(SIMPLE_UPLOAD_INCOMING_DIR, filename);
+      cb(null, filename);
     } catch (error) {
       cb(error);
     }
@@ -4866,11 +6200,20 @@ const chunkUpload = multer({
       }
     },
     filename: (req, file, callback) => {
-      crypto.randomBytes(16, (error, bytes) => callback(error, error ? undefined : bytes.toString("hex")));
+      crypto.randomBytes(16, (error, bytes) => {
+        if (error) return callback(error);
+        const filename = bytes.toString("hex");
+        try {
+          req[CHUNK_UPLOAD_INCOMING_FILE_PATH] = path.join(CHUNK_UPLOAD_INCOMING_DIR, filename);
+          callback(null, filename);
+        } catch (definitionError) {
+          callback(definitionError);
+        }
+      });
     },
   }),
   defParamCharset: "utf8",
-  limits: { files: 1, fields: 10, fieldNestingDepth: 0 },
+  limits: { fileSize: SINGLE_UPLOAD_MAX_BYTES, files: 1, fields: 10, fieldNestingDepth: 0 },
 });
 
 function rejectLargeSingleUpload(req, res, next) {
@@ -4889,35 +6232,58 @@ function rejectLargeSingleUpload(req, res, next) {
 function handleUploadSingle(req, res, next) {
   upload.single("file")(req, res, (error) => {
     if (!error) {
+      const trustedPath = getTrustedUploadStagingPath(req);
+      if (!req.file || !trustedPath || req.file.path !== trustedPath) {
+        if (trustedPath) fs.rmSync(trustedPath, { force: true });
+        res.status(400).json({ error: "Upload nao concluido" });
+        return;
+      }
+
+      Object.defineProperty(req.file, UPLOAD_STAGING_PATH, { value: trustedPath, writable: true });
       next();
       return;
     }
 
-    if (req.file?.path) {
-      fs.rmSync(req.file.path, { force: true });
-    }
+    const trustedPath = getTrustedUploadStagingPath(req);
+    if (trustedPath) fs.rmSync(trustedPath, { force: true });
 
     res.status(400).json({ error: error.message || "Upload nao concluido" });
   });
 }
 
+function getTrustedUploadStagingPath(valueHolder) {
+  const value = valueHolder?.[UPLOAD_STAGING_PATH];
+  if (typeof value !== "string") return null;
+  const resolved = path.resolve(value);
+  return isSafeChildPath(SIMPLE_UPLOAD_INCOMING_DIR, resolved) ? resolved : null;
+}
+
 function handleChunkUploadSingle(req, res, next) {
   chunkUpload.single("chunk")(req, res, (error) => {
     if (!error) {
+      if (req.file && typeof req[CHUNK_UPLOAD_INCOMING_FILE_PATH] === "string") {
+        Object.defineProperty(req.file, CHUNK_UPLOAD_INCOMING_FILE_PATH, { value: req[CHUNK_UPLOAD_INCOMING_FILE_PATH] });
+      }
       next();
       return;
     }
 
+    if (req.file && typeof req[CHUNK_UPLOAD_INCOMING_FILE_PATH] === "string") {
+      Object.defineProperty(req.file, CHUNK_UPLOAD_INCOMING_FILE_PATH, { value: req[CHUNK_UPLOAD_INCOMING_FILE_PATH] });
+    }
     removeChunkUploadIncomingFile(req.file);
 
-    res.status(400).json({ error: error.message || "Upload do bloco nao concluido" });
+    res.status(error.code === "LIMIT_FILE_SIZE" ? 413 : 400).json({ error: error.message || "Upload do bloco nao concluido" });
   });
 }
 
 function getChunkUploadIncomingFilePath(file) {
+  const trustedPath = file?.[CHUNK_UPLOAD_INCOMING_FILE_PATH];
   const filename = typeof file?.filename === "string" ? file.filename : "";
   if (!/^[a-f0-9]{32}$/.test(filename)) return null;
-  const incomingPath = path.join(CHUNK_UPLOAD_INCOMING_DIR, filename);
+  if (typeof trustedPath !== "string") return null;
+  const incomingPath = path.resolve(trustedPath);
+  if (path.basename(incomingPath) !== filename) return null;
   return isSafeChildPath(CHUNK_UPLOAD_INCOMING_DIR, incomingPath) ? incomingPath : null;
 }
 
@@ -5162,24 +6528,31 @@ app.put("/folders/:id/temporary", authenticate, (req, res) => {
     return res.status(400).json({ error: "Expiracao temporaria invalida" });
   }
 
-  const folders = loadFolders();
-  const folder = folders.find((item) => item.id === folderId);
+  const folder = loadFolders().find((item) => item.id === folderId);
   if (!folder) return res.status(404).json({ error: "Pasta nao encontrada" });
   if (!hasFolderEditAccess(req, folder)) {
     return res.status(403).json({ error: "Permissao negada para editar esta pasta" });
   }
-
-  folder.expiresAt = expiresAt;
-  folder.updatedAt = new Date().toISOString();
-  saveFolders(folders);
-  addActionHistory("folder_temporary_updated", folder.name, req.user.username, {
-    folderId,
-    folderName: folder.name,
-    expiresAt,
-    temporary: Boolean(expiresAt),
-  });
-
-  res.json(serializeFolderForUser(req, folder));
+  return runCloudFolderLifecycleMutation(folderId, () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const currentFolders = loadFolders();
+    const currentFolder = currentFolders.find((item) => item.id === folderId);
+    if (!currentFolder) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderEditAccess(req, currentFolder)) return res.status(403).json({ error: "Permissao negada para editar esta pasta" });
+    if (isFolderExpired(currentFolder) && (!expiresAt || new Date(expiresAt).getTime() > Date.now())) {
+      return res.status(409).json({ error: "Pasta expirada aguardando limpeza e nao pode ser reativada" });
+    }
+    currentFolder.expiresAt = expiresAt;
+    currentFolder.updatedAt = new Date().toISOString();
+    saveFolders(currentFolders);
+    addActionHistory("folder_temporary_updated", currentFolder.name, req.user.username, {
+      folderId,
+      folderName: currentFolder.name,
+      expiresAt,
+      temporary: Boolean(expiresAt),
+    });
+    return res.json(serializeFolderForUser(req, currentFolder));
+  }, res);
 });
 
 app.delete("/folders/:id", authenticate, (req, res) => {
@@ -5196,49 +6569,68 @@ app.delete("/folders/:id", authenticate, (req, res) => {
   if (!canMoveToTrash(req)) {
     return res.status(403).json({ error: "Permissao negada: delete" });
   }
-  if (!hasFolderEditAccess(req, folder)) {
-    return res.status(403).json({ error: "Permissao negada para excluir esta pasta" });
-  }
-
-  try {
-    const paths = ensureFolderDirectories(folder.id);
-    const trashItem = trashService.moveFolderToTrash({
-      folder: { ...folder, ...paths },
-      deletedBy: req.user.username,
-      loaders: getTrashLoaders(),
-    });
-    auditLog("trash.folder.moved", getAuditActor(req), { type: "trash", id: trashItem.id }, "moved", "success", {
-      itemType: "folder",
-      originalFolderId: folderId,
-      folderName: folder.name,
-    });
-    addActionHistory("folder_deleted", folder.name, req.user.username, { folderId, trashId: trashItem.id });
-    broadcastDataChanged("trash", { folderId, itemType: "folder" });
-    return res.json({ message: "Pasta movida para lixeira", trashItem: serializeTrashItemForUser(trashItem) });
-  } catch (error) {
-    auditLog("trash.delete.failed", getAuditActor(req), { type: "folder", id: folderId }, "move_to_trash", "failure", {
-      error: error.message,
-    });
-    return res.status(500).json({ error: "Erro ao mover pasta para lixeira" });
-  }
-
+  return runCloudFolderLifecycleMutation(folderId, () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    if (!canMoveToTrash(req)) return res.status(403).json({ error: "Permissao negada: delete" });
+    const currentFolder = loadFolders().find((item) => item.id === folderId);
+    if (!currentFolder) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderEditAccess(req, currentFolder)) return res.status(403).json({ error: "Permissao negada para excluir esta pasta" });
+    try {
+      const paths = ensureFolderDirectories(currentFolder.id);
+      const trashItem = trashService.moveFolderToTrash({
+        folder: { ...currentFolder, ...paths },
+        deletedBy: req.user.username,
+        loaders: getTrashLoaders(),
+      });
+      auditLog("trash.folder.moved", getAuditActor(req), { type: "trash", id: trashItem.id }, "moved", "success", {
+        itemType: "folder",
+        originalFolderId: folderId,
+        folderName: currentFolder.name,
+      });
+      addActionHistory("folder_deleted", currentFolder.name, req.user.username, { folderId, trashId: trashItem.id });
+      broadcastDataChanged("trash", { folderId, itemType: "folder" });
+      return res.json({ message: "Pasta movida para lixeira", trashItem: serializeTrashItemForUser(trashItem) });
+    } catch (error) {
+      auditLog("trash.delete.failed", getAuditActor(req), { type: "folder", id: folderId }, "move_to_trash", "failure", {
+        error: error.message,
+      });
+      return res.status(500).json({ error: "Erro ao mover pasta para lixeira" });
+    }
+  }, res);
 });
 
-app.get("/files/search", authenticate, requirePermission("listFiles"), handleFileSearch);
+// These per-IP listing limits run before authentication so they also bound anonymous requests; NAT clients share the configured quota.
+app.get("/files/search", fileSearchRateLimit, authenticate, requirePermission("listFiles"), handleFileSearch);
 
 app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req, res) => {
+  if (req.authType === "cookie") {
+    const expectedOrigin = getExpectedOrigin(req, app.get("trust proxy fn"));
+    const origin = req.headers.origin;
+    const fetchSite = String(req.headers["sec-fetch-site"] || "").toLowerCase();
+    const referer = req.headers.referer;
+    let refererOrigin = "";
+    if (!fetchSite && referer) {
+      try { refererOrigin = new URL(referer).origin; } catch {}
+    }
+    if ((origin && origin !== expectedOrigin)
+      || (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none")
+      || (!fetchSite && referer && refererOrigin !== expectedOrigin)
+      || (!origin && !fetchSite && !referer)) {
+      return res.status(403).json({ error: "Origem negada" });
+    }
+  }
+
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
   if (!folder) return;
 
   const name = path.basename(req.params.name);
+  if (isStoredVersionFile(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
   if (isFileInTrash(folder.id, name)) {
     return res.status(410).json({ error: "Arquivo esta na lixeira" });
   }
-  const filePath = path.join(folder.uploadDir, name);
-  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
+  if (isFileExpired(folder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
 
   if (!hasFileAccess(req, folder, name)) {
     auditLog("file.access.denied", getAuditActor(req), { type: "file", id: name }, "download", "failure", {
@@ -5252,21 +6644,40 @@ app.get("/files/:name", authenticate, requirePermission("listFiles"), async (req
     return res.status(403).json({ error: "Use a rota de download criptografado para este arquivo" });
   }
 
-  logAnalyticsEvent("download", {
-    filename: name,
-    downloadedBy: req.user.username,
-    folderId: folder.id,
-    folderName: folder.name,
-  });
-  auditLog("file.download", getAuditActor(req), { type: "file", id: name }, "downloaded", "success", {
-    folderId: folder.id,
-    folderName: folder.name,
-  });
+  const filePath = path.join(folder.uploadDir, name);
+  if (isCloudStorageEnabled() && !isExistingFile(filePath) && !consumeCloudMetadataRateLimit(req, res)) return;
+  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name)) {
+    return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  }
+  if (isFileInTrash(folder.id, name)) return res.status(410).json({ error: "Arquivo esta na lixeira" });
+  if (getEncryptedFileMetadata(folder.id, name)) return res.status(403).json({ error: "Use a rota de download criptografado para este arquivo" });
+  if (!isFolderAvailable(folder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (isFileExpired(folder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+  if (!isExistingFile(filePath)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+
+  if (req.method !== "HEAD") {
+    logAnalyticsEvent("download", {
+      filename: name,
+      downloadedBy: req.user.username,
+      folderId: folder.id,
+      folderName: folder.name,
+    });
+    auditLog("file.download", getAuditActor(req), { type: "file", id: name }, "downloaded", "success", {
+      folderId: folder.id,
+      folderName: folder.name,
+    });
+  }
 
   sendOptimizedFile(req, res, filePath, name, "attachment");
 });
 
-app.post("/file-open-token", authenticate, requirePermission("listFiles"), async (req, res) => {
+app.post("/file-open-token", fileOpenTokenRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const folder = getReadableFolderOrRespond(req, res, req.body.folderId);
@@ -5275,15 +6686,13 @@ app.post("/file-open-token", authenticate, requirePermission("listFiles"), async
   if (!rawName || name !== rawName) {
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
+  if (isStoredVersionFile(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
   if (isFileInTrash(folder.id, name)) {
     return res.status(410).json({ error: "Arquivo esta na lixeira" });
   }
-
-  const filePath = path.join(folder.uploadDir, name);
-  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
+  if (isFileExpired(folder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
 
   if (!hasFileAccess(req, folder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
@@ -5293,7 +6702,27 @@ app.post("/file-open-token", authenticate, requirePermission("listFiles"), async
     return res.status(403).json({ error: "Arquivo criptografado. Use Download para informar a senha quando necessario." });
   }
 
-  const openToken = createOpenFileToken(folder.id, name);
+  const filePath = path.join(folder.uploadDir, name);
+  if (isCloudStorageEnabled() && !isExistingFile(filePath) && !consumeCloudMetadataRateLimit(req, res)) return;
+  await ensureCloudFileCached(folder.id, name, filePath, "uploads", () => !isFileInTrash(folder.id, name));
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name)) {
+    return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  }
+  if (getEncryptedFileMetadata(folder.id, name)) return res.status(403).json({ error: "Arquivo criptografado. Use Download para informar a senha quando necessario." });
+  if (!isFolderAvailable(folder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (isFileExpired(folder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+  if (isFileInTrash(folder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (!isExistingFile(filePath)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+
+  const managerReviewUsername = restoreProviderOrphans.isSuppressed(folder.id, name, "uploads")
+    ? req.user.username
+    : null;
+  const openToken = createOpenFileToken(folder.id, name, { managerReviewUsername });
   if (req.body.download === true) {
     logAnalyticsEvent("download", {
       filename: name,
@@ -5315,7 +6744,11 @@ app.post("/file-open-token", authenticate, requirePermission("listFiles"), async
   });
 });
 
-app.get("/open-file/:token/:name", async (req, res) => {
+app.get("/open-file/:token/:name", openFileRedemptionRateLimit, (req, res, next) => {
+  const entry = openFileTokens.get(String(req.params.token || ""));
+  if (!entry?.managerReviewUsername) return next();
+  return authenticate(req, res, next);
+}, async (req, res) => {
   cleanupOpenFileTokens();
 
   const openToken = String(req.params.token || "");
@@ -5329,9 +6762,45 @@ app.get("/open-file/:token/:name", async (req, res) => {
   if (!name || name !== entry.fileName) {
     return res.status(400).send("Nome de arquivo invalido");
   }
+  if (isFileInTrash(entry.folderId, entry.fileName)) {
+    openFileTokens.delete(openToken);
+    return res.status(404).send("Arquivo nao encontrado");
+  }
+  if (!isFolderAvailable(entry.folderId) || isFileExpired(entry.folderId, entry.fileName)) {
+    openFileTokens.delete(openToken);
+    return res.status(404).send("Arquivo nao encontrado");
+  }
 
   const filePath = entry.filePath || path.join(getFolderStoragePath("./uploads", entry.folderId), name);
-  await ensureCloudFileCached(entry.folderId, entry.cloudFileName || entry.downloadName || name, filePath, "uploads");
+  const cloudFileName = entry.cloudFileName || entry.downloadName || name;
+  const canRedeemManagerReviewToken = () => {
+    if (!entry.managerReviewUsername) return !restoreProviderOrphans.isSuppressed(entry.folderId, cloudFileName);
+    return Boolean(
+      req.user &&
+      req.user.username === entry.managerReviewUsername &&
+      refreshAuthenticatedUser(req, res) &&
+      canManageAccess(req)
+    );
+  };
+  if (!canRedeemManagerReviewToken()) {
+    if (res.headersSent) return;
+    if (!entry.managerReviewUsername) openFileTokens.delete(openToken);
+    return res.status(404).send("Arquivo nao encontrado");
+  }
+  await ensureCloudFileCached(entry.folderId, cloudFileName, filePath, "uploads", () => !isFileInTrash(entry.folderId, entry.fileName), entry.fileName);
+  if (!canRedeemManagerReviewToken()) {
+    if (res.headersSent) return;
+    openFileTokens.delete(openToken);
+    return res.status(404).send("Arquivo nao encontrado");
+  }
+  if (!isFolderAvailable(entry.folderId) || isFileExpired(entry.folderId, entry.fileName)) {
+    openFileTokens.delete(openToken);
+    return res.status(404).send("Arquivo nao encontrado");
+  }
+  if (isFileInTrash(entry.folderId, entry.fileName)) {
+    openFileTokens.delete(openToken);
+    return res.status(404).send("Arquivo nao encontrado");
+  }
   if (!isExistingFile(filePath)) {
     openFileTokens.delete(openToken);
     return res.status(404).send("Arquivo nao encontrado");
@@ -5373,7 +6842,7 @@ app.post("/encrypted-download/:filename", authenticate, requirePermission("listF
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
 
-  const metadata = getEncryptedFileMetadata(folder.id, name);
+  let metadata = getEncryptedFileMetadata(folder.id, name);
   if (!metadata) return res.status(404).json({ error: "Arquivo criptografado nao encontrado" });
   if (isFileInTrash(folder.id, name)) {
     return res.status(410).json({ error: "Arquivo esta na lixeira" });
@@ -5392,11 +6861,28 @@ app.post("/encrypted-download/:filename", authenticate, requirePermission("listF
   }
 
   if (metadata.accessControl?.requiresPassword && !req.body?.password) {
-    return res.status(401).json({ error: "Senha obrigatoria para este arquivo" });
+    return res.status(422).json({ error: "Senha obrigatoria para este arquivo" });
   }
 
   const filePath = path.join(folder.uploadDir, name);
-  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
+  await ensureCloudFileCached(folder.id, name, filePath, "uploads", () => !isFileInTrash(folder.id, name));
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolder = getFolderById(folder.id);
+  const currentMetadata = getEncryptedFileMetadata(folder.id, name);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name) || !currentMetadata || !canAccessEncryptedFile(req, currentMetadata)) {
+    return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  }
+  if (currentMetadata.accessControl?.expiresAt && new Date(currentMetadata.accessControl.expiresAt).getTime() <= Date.now()) {
+    return res.status(410).json({ error: "Arquivo criptografado expirado" });
+  }
+  if (currentMetadata.accessControl?.requiresPassword && !req.body?.password) {
+    return res.status(422).json({ error: "Senha obrigatoria para este arquivo" });
+  }
+  metadata = currentMetadata;
+  if (!isFolderAvailable(folder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (isFileExpired(folder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+  if (isFileInTrash(folder.id, name)) return res.status(410).json({ error: "Arquivo esta na lixeira" });
   if (!isExistingFile(filePath)) return res.status(404).json({ error: "Arquivo nao encontrado" });
 
   try {
@@ -5420,7 +6906,7 @@ app.post("/encrypted-download/:filename", authenticate, requirePermission("listF
       folderId: folder.id,
       reason: "bad_key_or_corrupt_file",
     });
-    res.status(401).json({ error: "Falha na descriptografia: senha incorreta ou arquivo corrompido" });
+    res.status(422).json({ error: "Falha na descriptografia: senha incorreta ou arquivo corrompido" });
   }
 });
 
@@ -5429,8 +6915,25 @@ app.post("/encrypted/:filename/grant-access", authenticate, (req, res) => {
   const name = path.basename(rawName);
   const folder = getAccessibleFolderOrRespond(req, res, req.body.folderId || req.query.folderId);
   if (!folder) return;
+  return runCloudFileLifecycleMutation(folder.id, name, async () => {
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolderRecord = getFolderById(folder.id);
+  const currentFolder = currentFolderRecord && { ...currentFolderRecord, ...ensureFolderDirectories(currentFolderRecord.id) };
+  if (!currentFolder || !isFolderAvailable(currentFolder.id) || !hasFolderAccess(req, currentFolder)) {
+    return res.status(404).json({ error: "Pasta nao encontrada" });
+  }
   const username = String(req.body.username || "").trim();
-  const metadata = getEncryptedFileMetadata(folder.id, name);
+  const listedFile = await getListedFileDetails(currentFolder, name);
+  if (!listedFile || isFileExpired(currentFolder.id, name)) {
+    return res.status(404).json({ error: "Arquivo criptografado nao encontrado" });
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const firstFolderRecord = getFolderById(folder.id);
+  const firstFolder = firstFolderRecord && { ...firstFolderRecord, ...ensureFolderDirectories(firstFolderRecord.id) };
+  if (!firstFolder || !isFolderAvailable(firstFolder.id) || !hasFolderAccess(req, firstFolder)) {
+    return res.status(404).json({ error: "Pasta nao encontrada" });
+  }
+  const metadata = getEncryptedFileMetadata(firstFolder.id, name);
   if (!metadata) return res.status(404).json({ error: "Arquivo criptografado nao encontrado" });
   if (metadata.accessControl?.owner !== req.user.username && req.user.role !== "admin") {
     return res.status(403).json({ error: "Apenas o dono ou admin pode conceder acesso" });
@@ -5438,8 +6941,23 @@ app.post("/encrypted/:filename/grant-access", authenticate, (req, res) => {
   if (!loadUsers().some((user) => user.username === username)) {
     return res.status(404).json({ error: "Usuario nao encontrado" });
   }
+  if (!await getListedFileDetails(currentFolder, name) || isFileExpired(currentFolder.id, name)) {
+    return res.status(404).json({ error: "Arquivo criptografado nao encontrado" });
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const finalFolderRecord = getFolderById(folder.id);
+  const finalFolder = finalFolderRecord && { ...finalFolderRecord, ...ensureFolderDirectories(finalFolderRecord.id) };
+  if (!finalFolder || !isFolderAvailable(finalFolder.id) || !hasFolderAccess(req, finalFolder) || isFileExpired(finalFolder.id, name)) {
+    return res.status(404).json({ error: "Arquivo criptografado nao encontrado" });
+  }
+  const finalMetadata = getEncryptedFileMetadata(finalFolder.id, name);
+  if (!finalMetadata) return res.status(404).json({ error: "Arquivo criptografado nao encontrado" });
+  if (finalMetadata.accessControl?.owner !== req.user.username && req.user.role !== "admin") {
+    return res.status(403).json({ error: "Apenas o dono ou admin pode conceder acesso" });
+  }
   const entries = loadEncryptedFiles();
-  const key = getEncryptedFileKey(folder.id, name);
+  const key = getEncryptedFileKey(finalFolder.id, name);
+  if (!entries[key]?.accessControl) return res.status(404).json({ error: "Arquivo criptografado nao encontrado" });
   const users = new Set(entries[key].accessControl.authorizedUsers || []);
   users.add(username);
   entries[key].accessControl.authorizedUsers = [...users];
@@ -5449,6 +6967,7 @@ app.post("/encrypted/:filename/grant-access", authenticate, (req, res) => {
     username,
   });
   res.json({ message: `Acesso concedido para ${username}` });
+  }, res);
 });
 
 app.delete("/encrypted/:filename/revoke-access", authenticate, (req, res) => {
@@ -5474,7 +6993,7 @@ app.delete("/encrypted/:filename/revoke-access", authenticate, (req, res) => {
   res.json({ message: `Acesso revogado para ${username}` });
 });
 
-function registerPendingUpload(req, options) {
+async function registerPendingUpload(req, options) {
   const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
   const fileName = path.basename(options.fileName || "");
   const originalName = path.basename(options.originalName || fileName);
@@ -5485,17 +7004,55 @@ function registerPendingUpload(req, options) {
   const encryptionMetadata = options.encryptionMetadata || null;
 
   const pendingUploads = loadPendingUploads();
-  pendingUploads[getPendingKey(folderId, fileName)] = {
-    uploadedBy: req.user.username,
-    uploadedAt,
-    originalName: originalName !== fileName ? originalName : undefined,
-    versionComment,
-    compressedUpload,
-    folderId,
-  };
-  savePendingUploads(pendingUploads);
-  if (encryptionMetadata) saveEncryptedMetadata(folderId, fileName, encryptionMetadata);
-  syncFileToCloud(folderId, fileName, "temp");
+  const pendingKey = getPendingKey(folderId, fileName);
+  const previousPending = pendingUploads[pendingKey];
+  const encryptedKey = encryptionMetadata ? getEncryptedFileKey(folderId, fileName) : null;
+  const previousEncryptedValue = encryptionMetadata ? loadEncryptedFiles()[encryptedKey] : undefined;
+  const cloudEnabled = isCloudStorageEnabled();
+  const previousCloudIntent = cloudEnabled ? cloudTempMutationQueue.getRecord(folderId, fileName) : null;
+  const wasSuppressed = restoreProviderOrphans.isSuppressed(folderId, fileName, "temp");
+  try {
+    pendingUploads[pendingKey] = {
+      uploadedBy: req.user.username,
+      uploadedAt,
+      originalName: originalName !== fileName ? originalName : undefined,
+      versionComment,
+      compressedUpload,
+      folderId,
+    };
+    savePendingUploads(pendingUploads);
+    if (encryptionMetadata) saveEncryptedMetadata(folderId, fileName, encryptionMetadata);
+    if (cloudEnabled) cloudTempMutationQueue.setDesired(folderId, fileName, "present");
+    await restoreProviderOrphans.clear(folderId, fileName, "temp", cloudStorage);
+  } catch (error) {
+    try {
+      const rollbackPending = loadPendingUploads();
+      if (previousPending === undefined) delete rollbackPending[pendingKey];
+      else rollbackPending[pendingKey] = previousPending;
+      savePendingUploads(rollbackPending);
+    } catch (rollbackError) {
+      console.error("[upload] pending rollback failed:", sanitizeLogValue(rollbackError.message));
+    }
+    if (encryptionMetadata) {
+      try {
+        const rollbackEncrypted = loadEncryptedFiles();
+        if (previousEncryptedValue === undefined) delete rollbackEncrypted[encryptedKey];
+        else rollbackEncrypted[encryptedKey] = previousEncryptedValue;
+        saveEncryptedFiles(rollbackEncrypted);
+      } catch (rollbackError) {
+        console.error("[upload] encryption rollback failed:", sanitizeLogValue(rollbackError.message));
+      }
+    }
+    if (cloudEnabled) {
+      try { cloudTempMutationQueue.restoreRecord(folderId, fileName, previousCloudIntent); }
+      catch (rollbackError) { console.error("[upload] cloud queue rollback failed:", sanitizeLogValue(rollbackError.message)); }
+    }
+    if (wasSuppressed) {
+      try { await restoreProviderOrphans.suppress(folderId, fileName, "temp"); }
+      catch (rollbackError) { console.error("[upload] restore visibility rollback failed:", sanitizeLogValue(rollbackError.message)); }
+    }
+    throw error;
+  }
   logAnalyticsEvent("upload", {
     filename: fileName,
     uploadedBy: req.user.username,
@@ -5649,8 +7206,8 @@ function readChunkMetadataFile(metadataPath) {
   }
 
   try {
-    const descriptorStats = fs.fstatSync(descriptor);
-    const pathStats = fs.lstatSync(metadataPath);
+    const descriptorStats = fs.fstatSync(descriptor, { bigint: true });
+    const pathStats = fs.lstatSync(metadataPath, { bigint: true });
     if (
       !descriptorStats.isFile() ||
       pathStats.isSymbolicLink() ||
@@ -5661,7 +7218,7 @@ function readChunkMetadataFile(metadataPath) {
       throw new Error("Chunk-upload metadata changed during read");
     }
     const contents = fs.readFileSync(descriptor, "utf8");
-    const finalPathStats = fs.lstatSync(metadataPath);
+    const finalPathStats = fs.lstatSync(metadataPath, { bigint: true });
     if (
       finalPathStats.isSymbolicLink() ||
       !finalPathStats.isFile() ||
@@ -5676,38 +7233,195 @@ function readChunkMetadataFile(metadataPath) {
   }
 }
 
-function replaceChunkMetadataFile(sessionDir, metadataPath, metadata) {
+function replaceChunkMetadataFile(sessionDir, metadataPath, metadata, retryActivityRename = false) {
   assertSafeChunkSessionDirectory(sessionDir);
   const replacementPath = path.join(sessionDir, `.metadata-scrub-${crypto.randomUUID()}.tmp`);
   let originalStats = null;
   try {
-    originalStats = fs.lstatSync(metadataPath);
-    if (originalStats.isDirectory() || originalStats.nlink > 1) throw new Error("Chunk-upload metadata cannot be safely replaced");
+    originalStats = fs.lstatSync(metadataPath, { bigint: true });
+    if (originalStats.isDirectory() || originalStats.nlink > 1n) throw new Error("Chunk-upload metadata cannot be safely replaced");
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
 
   try {
     fs.writeFileSync(replacementPath, JSON.stringify(metadata, null, 2), { flag: "wx", mode: 0o600 });
-    assertSafeChunkSessionDirectory(sessionDir);
-    let currentStats = null;
-    try {
-      currentStats = fs.lstatSync(metadataPath);
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
+    const renameAttempts = retryActivityRename ? 3 : 1;
+    for (let attempt = 0; attempt < renameAttempts; attempt += 1) {
+      assertSafeChunkSessionDirectory(sessionDir);
+      let currentStats = null;
+      try {
+        currentStats = fs.lstatSync(metadataPath, { bigint: true });
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      if (
+        (originalStats && (!currentStats || originalStats.dev !== currentStats.dev || originalStats.ino !== currentStats.ino)) ||
+        (!originalStats && currentStats)
+      ) {
+        throw new Error("Chunk-upload metadata changed during replacement");
+      }
+      try {
+        fs.renameSync(replacementPath, metadataPath);
+        break;
+      } catch (error) {
+        if (!retryActivityRename || error.code !== "EPERM" || attempt === renameAttempts - 1) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, attempt === 0 ? 10 : 25);
+      }
     }
-    if (
-      (originalStats && (!currentStats || originalStats.dev !== currentStats.dev || originalStats.ino !== currentStats.ino)) ||
-      (!originalStats && currentStats)
-    ) {
-      throw new Error("Chunk-upload metadata changed during replacement");
-    }
-    fs.renameSync(replacementPath, metadataPath);
-    const installedStats = fs.lstatSync(metadataPath);
+    const installedStats = fs.lstatSync(metadataPath, { bigint: true });
     if (installedStats.isSymbolicLink() || !installedStats.isFile()) throw new Error("Chunk-upload metadata replacement is unsafe");
   } finally {
     fs.rmSync(replacementPath, { force: true });
   }
+}
+
+function migrateChunkSessionMetadata(sessionDir, metadata) {
+  const migrated = { ...metadata };
+  let changed = false;
+  if (!Object.hasOwn(migrated, "lastActivityAt")) {
+    migrated.lastActivityAt = new Date().toISOString();
+    changed = true;
+  }
+  if (Object.hasOwn(migrated, "password")) {
+    delete migrated.password;
+    changed = true;
+  }
+  if (changed) replaceChunkMetadataFile(sessionDir, path.join(sessionDir, "metadata.json"), migrated);
+  return migrated;
+}
+
+function touchChunkSessionActivity(sessionDir, metadata, now = Date.now()) {
+  const updated = { ...metadata, lastActivityAt: new Date(now).toISOString() };
+  replaceChunkMetadataFile(sessionDir, path.join(sessionDir, "metadata.json"), updated, true);
+  return updated;
+}
+
+function isChunkSessionExpired(metadata, now = Date.now()) {
+  const lastActivityAt = Date.parse(metadata?.lastActivityAt || "");
+  return Number.isFinite(lastActivityAt) && now - lastActivityAt >= CHUNK_UPLOAD_SESSION_TTL_MS;
+}
+
+function isChunkSessionExpiredMarker(metadata) {
+  return Boolean(
+    metadata &&
+    typeof metadata === "object" &&
+    !Array.isArray(metadata) &&
+    Object.keys(metadata).length === 1 &&
+    typeof metadata[CHUNK_UPLOAD_EXPIRED_METADATA_KEY] === "string" &&
+    Number.isFinite(Date.parse(metadata[CHUNK_UPLOAD_EXPIRED_METADATA_KEY]))
+  );
+}
+
+function isExpiredChunkSessionMarker(metadata, now = Date.now()) {
+  if (!isChunkSessionExpiredMarker(metadata)) return false;
+  return now - Date.parse(metadata[CHUNK_UPLOAD_EXPIRED_METADATA_KEY]) >= CHUNK_UPLOAD_EXPIRED_TOMBSTONE_TTL_MS;
+}
+
+function auditChunkSessionExpiry(uploadId, folderId, result, source) {
+  if (!/^[a-zA-Z0-9_-]{1,80}$/.test(uploadId || "") || !/^[a-zA-Z0-9_-]{1,80}$/.test(folderId || "")) return;
+  auditLog(
+    "upload.chunk_session.expired",
+    { username: "system", role: "system" },
+    { type: "chunk_session", id: uploadId, folderId },
+    "expired",
+    result,
+    { source }
+  );
+}
+
+async function readChunkExpiryCandidate(sessionDir, uploadId, folderId, now = Date.now()) {
+  assertSafeChunkSessionDirectory(sessionDir);
+  const entries = await fs.promises.readdir(sessionDir, { withFileTypes: true });
+  if (!chunkSessionEntriesAreSafe(entries)) return null;
+  const metadataPath = path.join(sessionDir, "metadata.json");
+  let handle;
+  try {
+    handle = await fs.promises.open(metadataPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+
+  let file;
+  try {
+    const descriptorStats = await handle.stat({ bigint: true });
+    const pathStats = await fs.promises.lstat(metadataPath, { bigint: true });
+    if (
+      !descriptorStats.isFile() ||
+      pathStats.isSymbolicLink() ||
+      !pathStats.isFile() ||
+      descriptorStats.dev !== pathStats.dev ||
+      descriptorStats.ino !== pathStats.ino
+    ) {
+      throw new Error("Chunk-upload metadata changed during read");
+    }
+    const contents = await handle.readFile("utf8");
+    const finalPathStats = await fs.promises.lstat(metadataPath, { bigint: true });
+    if (
+      finalPathStats.isSymbolicLink() ||
+      !finalPathStats.isFile() ||
+      descriptorStats.dev !== finalPathStats.dev ||
+      descriptorStats.ino !== finalPathStats.ino
+    ) {
+      throw new Error("Chunk-upload metadata changed during read");
+    }
+    file = { contents, links: descriptorStats.nlink };
+  } finally {
+    await handle.close();
+  }
+  if (!file || file.links !== 1n) return null;
+
+  let metadata;
+  try {
+    metadata = JSON.parse(file.contents);
+  } catch {
+    return null;
+  }
+  if (isRetainedBlockedLegacyChunkMetadata(metadata, uploadId, folderId)) {
+    return chunkSessionEntriesAreSafe(entries, metadata.totalChunks) ? metadata : null;
+  }
+  if (!isValidChunkSessionMetadata(metadata, uploadId, folderId)) return null;
+  if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true) return null;
+  if (isChunkSessionExpiredMarker(metadata)) return entries.length > 1 || isExpiredChunkSessionMarker(metadata, now) ? metadata : null;
+  if (!chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return null;
+  return metadata;
+}
+
+function expireChunkSession(sessionDir, metadata, now = Date.now(), source = "sweeper") {
+  const entries = fs.readdirSync(sessionDir, { withFileTypes: true });
+  if (!chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) {
+    auditChunkSessionExpiry(metadata.uploadId, metadata.folderId, "failure", source);
+    return false;
+  }
+  try {
+    const metadataPath = path.join(sessionDir, "metadata.json");
+    replaceChunkMetadataFile(sessionDir, metadataPath, { [CHUNK_UPLOAD_EXPIRED_METADATA_KEY]: new Date(now).toISOString() });
+    for (const entry of entries) {
+      if (entry.name === "metadata.json") continue;
+      fs.unlinkSync(path.join(sessionDir, entry.name));
+    }
+    auditChunkSessionExpiry(metadata.uploadId, metadata.folderId, "success", source);
+    return true;
+  } catch (error) {
+    auditChunkSessionExpiry(metadata.uploadId, metadata.folderId, "failure", source);
+    throw error;
+  }
+}
+
+function cleanupChunkSessionExpiredMarker(sessionDir, metadata, now = Date.now(), source = "sweeper", uploadId = path.basename(sessionDir), folderId = path.basename(path.dirname(sessionDir))) {
+  const entries = fs.readdirSync(sessionDir, { withFileTypes: true });
+  if (!chunkSessionEntriesAreSafe(entries)) return false;
+  const hasLeftoverParts = entries.some((entry) => entry.name !== "metadata.json");
+  for (const entry of entries) {
+    if (entry.name !== "metadata.json") fs.unlinkSync(path.join(sessionDir, entry.name));
+  }
+  if (hasLeftoverParts) auditChunkSessionExpiry(uploadId, folderId, "success", source);
+  const expiredAt = Date.parse(metadata[CHUNK_UPLOAD_EXPIRED_METADATA_KEY]);
+  if (now - expiredAt < CHUNK_UPLOAD_EXPIRED_TOMBSTONE_TTL_MS) return true;
+  assertSafeChunkSessionDirectory(sessionDir);
+  fs.rmSync(sessionDir, { recursive: true, force: false });
+  return true;
 }
 
 function blockChunkSessionResume(sessionDir) {
@@ -5716,9 +7430,45 @@ function blockChunkSessionResume(sessionDir) {
   return { [CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY]: true };
 }
 
+function isRetainedBlockedLegacyChunkMetadata(metadata, expectedUploadId = "", expectedFolderId = "") {
+  const expectedKeys = [CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY, "folderId", "lastActivityAt", "totalChunks", "uploadId"];
+  return Boolean(
+    metadata &&
+    typeof metadata === "object" &&
+    !Array.isArray(metadata) &&
+    metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true &&
+    !Object.hasOwn(metadata, "uploaderSessionVersion") &&
+    Object.keys(metadata).length === expectedKeys.length &&
+    expectedKeys.every((key) => Object.hasOwn(metadata, key)) &&
+    /^[a-zA-Z0-9_-]{1,80}$/.test(metadata.uploadId) &&
+    (!expectedUploadId || metadata.uploadId === expectedUploadId) &&
+    typeof metadata.folderId === "string" &&
+    /^[a-zA-Z0-9_-]{1,80}$/.test(metadata.folderId) &&
+    (!expectedFolderId || metadata.folderId === expectedFolderId) &&
+    Number.isInteger(metadata.totalChunks) &&
+    metadata.totalChunks >= 1 &&
+    metadata.totalChunks <= MAX_UPLOAD_CHUNKS &&
+    typeof metadata.lastActivityAt === "string" &&
+    Number.isFinite(Date.parse(metadata.lastActivityAt))
+  );
+}
+
+function blockLegacyChunkSessionResume(sessionDir, metadata) {
+  const blocked = {
+    [CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY]: true,
+    uploadId: metadata.uploadId,
+    folderId: metadata.folderId,
+    totalChunks: metadata.totalChunks,
+    lastActivityAt: Object.hasOwn(metadata, "lastActivityAt") ? metadata.lastActivityAt : new Date().toISOString(),
+  };
+  replaceChunkMetadataFile(sessionDir, path.join(sessionDir, "metadata.json"), blocked);
+  return blocked;
+}
+
 function isValidChunkSessionMetadata(metadata, expectedUploadId = "", expectedFolderId = "") {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
   if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true) return true;
+  if (isChunkSessionExpiredMarker(metadata)) return true;
   const encryptionLevel = metadata.encryptionLevel === undefined ? "none" : metadata.encryptionLevel;
   return (
     typeof metadata.uploadId === "string" &&
@@ -5736,16 +7486,30 @@ function isValidChunkSessionMetadata(metadata, expectedUploadId = "", expectedFo
     path.basename(metadata.fileName) === metadata.fileName &&
     typeof metadata.uploadedBy === "string" &&
     Boolean(metadata.uploadedBy) &&
+    Number.isSafeInteger(metadata.uploaderSessionVersion) &&
+    metadata.uploaderSessionVersion >= 0 &&
     typeof metadata.versionComment === "string" &&
     metadata.versionComment.length <= 500 &&
     typeof metadata.expiresInDays === "string" &&
     typeof metadata.createdAt === "string" &&
     Number.isFinite(Date.parse(metadata.createdAt)) &&
+    (!Object.hasOwn(metadata, "lastActivityAt") || (typeof metadata.lastActivityAt === "string" && Number.isFinite(Date.parse(metadata.lastActivityAt)))) &&
     Number.isInteger(metadata.totalChunks) &&
     metadata.totalChunks >= 1 &&
     metadata.totalChunks <= MAX_UPLOAD_CHUNKS &&
     ["none", "server-key", "user-key", "password", "dual"].includes(encryptionLevel)
   );
+}
+
+function isValidLegacyChunkSessionMetadata(metadata, expectedUploadId = "", expectedFolderId = "") {
+  if (
+    !metadata ||
+    typeof metadata !== "object" ||
+    Array.isArray(metadata) ||
+    Object.hasOwn(metadata, CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY) ||
+    (Object.hasOwn(metadata, "lastActivityAt") && (typeof metadata.lastActivityAt !== "string" || !Number.isFinite(Date.parse(metadata.lastActivityAt))))
+  ) return false;
+  return isValidChunkSessionMetadata({ ...metadata, uploaderSessionVersion: 0 }, expectedUploadId, expectedFolderId);
 }
 
 function loadChunkMetadata(sessionDir, expectedUploadId, expectedFolderId) {
@@ -5755,27 +7519,27 @@ function loadChunkMetadata(sessionDir, expectedUploadId, expectedFolderId) {
   if (!chunkSessionEntriesAreSafe(entries)) return blockChunkSessionResume(sessionDir);
 
   let file;
+  let metadata;
   try {
     file = readChunkMetadataFile(metadataPath);
+    if (file) metadata = JSON.parse(file.contents);
   } catch {
     return blockChunkSessionResume(sessionDir);
   }
   if (!file) return null;
 
-  let metadata;
-  try {
-    metadata = JSON.parse(file.contents);
-  } catch {
-    return blockChunkSessionResume(sessionDir);
+  if (
+    isValidLegacyChunkSessionMetadata(metadata, expectedUploadId, expectedFolderId) &&
+    !Object.hasOwn(metadata, "uploaderSessionVersion")
+  ) {
+    if (file.links !== 1n || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return blockChunkSessionResume(sessionDir);
+    return blockLegacyChunkSessionResume(sessionDir, metadata);
   }
+
   if (!isValidChunkSessionMetadata(metadata, expectedUploadId, expectedFolderId)) return blockChunkSessionResume(sessionDir);
-  if (file.links !== 1 || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return blockChunkSessionResume(sessionDir);
-  if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true) return metadata;
-  if (Object.prototype.hasOwnProperty.call(metadata, "password")) {
-    delete metadata.password;
-    replaceChunkMetadataFile(sessionDir, metadataPath, metadata);
-  }
-  return metadata;
+  if (file.links !== 1n || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) return blockChunkSessionResume(sessionDir);
+  if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true || isChunkSessionExpiredMarker(metadata)) return metadata;
+  return migrateChunkSessionMetadata(sessionDir, metadata);
 }
 
 function scrubLegacyChunkPasswords() {
@@ -5809,18 +7573,104 @@ function scrubLegacyChunkPasswords() {
         file = readChunkMetadataFile(metadataPath);
         if (!file) throw new Error("Missing chunk-upload metadata");
         metadata = JSON.parse(file.contents);
+        if (
+          !Object.hasOwn(metadata, "uploaderSessionVersion") &&
+          isValidLegacyChunkSessionMetadata(metadata, sessionEntry.name, folderEntry.name)
+        ) {
+          if (file.links !== 1n || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unsafe chunk-upload session contents");
+          blockLegacyChunkSessionResume(sessionDir, metadata);
+          continue;
+        }
         if (!isValidChunkSessionMetadata(metadata, sessionEntry.name, folderEntry.name)) throw new Error("Invalid chunk-upload metadata");
-        if (file.links !== 1 || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unsafe chunk-upload session contents");
+        if (file.links !== 1n || !chunkSessionEntriesAreSafe(entries, metadata.totalChunks)) throw new Error("Unsafe chunk-upload session contents");
       } catch {
         blockChunkSessionResume(sessionDir);
         continue;
       }
-      if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true) continue;
-      if (Object.prototype.hasOwnProperty.call(metadata, "password")) {
-        delete metadata.password;
-        replaceChunkMetadataFile(sessionDir, metadataPath, metadata);
+      if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true || isChunkSessionExpiredMarker(metadata)) continue;
+      migrateChunkSessionMetadata(sessionDir, metadata);
+    }
+  }
+}
+
+async function cleanupExpiredChunkSessions(now = Date.now()) {
+  if (chunkSessionExpirySweepRunning) return;
+  chunkSessionExpirySweepRunning = true;
+
+  try {
+    let folderEntries;
+    try {
+      assertSafeChunkStorageRoot();
+      folderEntries = await fs.promises.readdir(CHUNK_UPLOAD_DIR, { withFileTypes: true });
+    } catch (error) {
+      console.error("[chunk-upload] expiry sweep skipped:", sanitizeLogValue(error.message));
+      return;
+    }
+
+    let scannedEntries = 0;
+    const yieldIfNeeded = async () => {
+      scannedEntries += 1;
+      if (scannedEntries % 32 === 0) await new Promise((resolve) => setImmediate(resolve));
+    };
+    for (const folderEntry of folderEntries) {
+      await yieldIfNeeded();
+      if (folderEntry.name === "incoming" || folderEntry.isSymbolicLink() || !folderEntry.isDirectory() || !/^[a-zA-Z0-9_-]{1,80}$/.test(folderEntry.name)) continue;
+      const folderPath = path.join(CHUNK_UPLOAD_DIR, folderEntry.name);
+      let sessionEntries;
+      try {
+        assertSafeChunkSessionDirectory(folderPath);
+        sessionEntries = await fs.promises.readdir(folderPath, { withFileTypes: true });
+      } catch (error) {
+        console.error("[chunk-upload] expiry sweep preserved unsafe folder:", sanitizeLogValue(error.message));
+        continue;
+      }
+
+      for (const sessionEntry of sessionEntries) {
+        await yieldIfNeeded();
+        if (sessionEntry.isSymbolicLink() || !sessionEntry.isDirectory() || !/^[a-zA-Z0-9_-]{1,80}$/.test(sessionEntry.name)) continue;
+        const sessionDir = path.join(folderPath, sessionEntry.name);
+        try {
+          const candidate = await readChunkExpiryCandidate(sessionDir, sessionEntry.name, folderEntry.name, now);
+          if (!candidate) continue;
+          if (!isChunkSessionExpired(candidate, now) && !isExpiredChunkSessionMarker(candidate, now) && !isChunkSessionExpiredMarker(candidate)) continue;
+          await runChunkUploadSessionLock(sessionDir, () => {
+            try {
+              assertSafeChunkSessionDirectory(sessionDir);
+              const metadata = loadChunkMetadata(sessionDir, sessionEntry.name, folderEntry.name);
+              if (!metadata) return;
+              if (metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true) {
+                if (!isRetainedBlockedLegacyChunkMetadata(metadata, sessionEntry.name, folderEntry.name) || !isChunkSessionExpired(metadata, now)) return;
+                const currentEntries = fs.readdirSync(sessionDir, { withFileTypes: true });
+                if (!chunkSessionEntriesAreSafe(currentEntries, metadata.totalChunks)) return;
+                assertSafeChunkSessionDirectory(sessionDir);
+                expireChunkSession(sessionDir, metadata, now, "sweeper");
+                return;
+              }
+              if (isChunkSessionExpiredMarker(metadata)) {
+                const currentEntries = fs.readdirSync(sessionDir, { withFileTypes: true });
+                if (!chunkSessionEntriesAreSafe(currentEntries)) return;
+                assertSafeChunkSessionDirectory(sessionDir);
+                cleanupChunkSessionExpiredMarker(sessionDir, metadata, now, "sweeper", sessionEntry.name, folderEntry.name);
+                return;
+              }
+              if (!isChunkSessionExpired(metadata, now)) return;
+              const currentEntries = fs.readdirSync(sessionDir, { withFileTypes: true });
+              if (!chunkSessionEntriesAreSafe(currentEntries, metadata.totalChunks)) return;
+              assertSafeChunkSessionDirectory(sessionDir);
+              expireChunkSession(sessionDir, metadata, now, "sweeper");
+            } catch (error) {
+              console.error("[chunk-upload] expiry sweep preserved session:", sanitizeLogValue(error.message));
+            }
+          });
+        } catch (error) {
+          if (error.code !== "FILE_LIFECYCLE_LOCK_TIMEOUT") {
+            console.error("[chunk-upload] expiry sweep could not lock session:", sanitizeLogValue(error.message));
+          }
+        }
       }
     }
+  } finally {
+    chunkSessionExpirySweepRunning = false;
   }
 }
 
@@ -5832,10 +7682,17 @@ function saveChunkMetadata(sessionDir, metadata) {
 }
 
 function hasAllChunks(sessionDir, totalChunks) {
-  for (let index = 0; index < totalChunks; index += 1) {
-    if (!isExistingFile(path.join(sessionDir, `${index}.part`))) return false;
+  let received = 0;
+  for (const entry of fs.readdirSync(sessionDir, { withFileTypes: true })) {
+    const match = /^(0|[1-9]\d{0,3})\.part$/.exec(entry.name);
+    if (!match || Number(match[1]) >= totalChunks) continue;
+    if (entry.isSymbolicLink()) {
+      if (isExistingFile(path.join(sessionDir, entry.name))) received += 1;
+    } else if (entry.isFile()) {
+      received += 1;
+    }
   }
-  return true;
+  return received === totalChunks;
 }
 
 async function assembleChunkedUpload(sessionDir, destinationPath, totalChunks) {
@@ -5865,7 +7722,7 @@ async function assembleChunkedUpload(sessionDir, destinationPath, totalChunks) {
   }
 }
 
-app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUploadFolder, handleChunkUploadSingle, async (req, res) => {
+app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunkRateLimit, prepareUploadFolder, handleChunkUploadSingle, withChunkUploadSessionLock(async (req, res) => {
   const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
   const uploadId = String(req.body.uploadId || "");
   const originalName = path.basename(String(req.body.originalName || ""));
@@ -5916,13 +7773,32 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
       return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
     }
 
+    if (isChunkSessionExpiredMarker(metadata)) {
+      cleanupChunkSessionExpiredMarker(sessionDir, metadata, Date.now(), "request", uploadId, folderId);
+      removeChunkUploadIncomingFile(req.file);
+      return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
+    }
+
+    if (metadata && (metadata.uploadedBy !== req.user?.username || metadata.uploaderSessionVersion !== req.user?.sessionVersion)) {
+      removeChunkUploadIncomingFile(req.file);
+      return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
+    }
+
+    if (metadata && isChunkSessionExpired(metadata)) {
+      expireChunkSession(sessionDir, metadata, Date.now(), "request");
+      removeChunkUploadIncomingFile(req.file);
+      return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
+    }
+
     if (!metadata) {
-      if (fs.readdirSync(sessionDir, { withFileTypes: true }).length) {
+      const existingEntries = fs.readdirSync(sessionDir, { withFileTypes: true });
+      if (existingEntries.length) {
         blockChunkSessionResume(sessionDir);
         removeChunkUploadIncomingFile(req.file);
         return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
       }
       const fileName = getAvailableUploadFileName(originalName, folderId, true);
+      const createdAt = new Date().toISOString();
       metadata = {
         uploadId,
         folderId,
@@ -5930,10 +7806,12 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
         fileName,
         totalChunks,
         uploadedBy: req.user.username,
+        uploaderSessionVersion: req.user.sessionVersion,
         versionComment: typeof req.body.versionComment === "string" ? req.body.versionComment.slice(0, 500) : "",
         encryptionLevel: requestedEncryptionLevel,
         expiresInDays: typeof req.body.expiresInDays === "string" ? req.body.expiresInDays : "",
-        createdAt: new Date().toISOString(),
+        createdAt,
+        lastActivityAt: createdAt,
       };
       saveChunkMetadata(sessionDir, metadata);
     }
@@ -5950,9 +7828,10 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
       return res.status(400).json({ error: "A senha de criptografia deve ter pelo menos 8 caracteres no bloco final. Reinicie o envio com o cliente atualizado." });
     }
 
-    const chunkPath = path.join(sessionDir, `${chunkIndex}.part`);
+    const chunkPath = path.join(sessionDir, CHUNK_PART_FILENAMES[chunkIndex]);
     fs.rmSync(chunkPath, { force: true });
     fs.renameSync(incomingChunkPath, chunkPath);
+    metadata = touchChunkSessionActivity(sessionDir, metadata);
 
     if (!hasAllChunks(sessionDir, totalChunks)) {
       return res.json({
@@ -5968,65 +7847,91 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), prepareUplo
       return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
     }
 
-    const finalPath = path.join(req.uploadFolder.tempDir, metadata.fileName);
-    await assembleChunkedUpload(sessionDir, finalPath, totalChunks);
-    const stats = fs.statSync(finalPath);
+    const stagedPath = path.join(sessionDir, "assembled.upload");
+    await assembleChunkedUpload(sessionDir, stagedPath, totalChunks);
+    const stats = fs.statSync(stagedPath);
     const scan = await scanUploadBeforePending(req, {
-      filePath: finalPath,
+      filePath: stagedPath,
       fileName: metadata.fileName,
       originalName: metadata.originalName,
       folderId,
       size: stats.size,
     });
     if (!scan.allowed) {
+      fs.rmSync(stagedPath, { force: true });
       fs.rmSync(sessionDir, { recursive: true, force: true });
       return res.status(scan.status || 400).json({ error: scan.error || "Upload bloqueado por seguranca" });
     }
 
     let encryptionMetadata = null;
+    let payload;
+    let finalFileName = metadata.fileName;
+    let publishedPath = null;
     try {
-      encryptionMetadata = encryptFileInPlace(finalPath, {
-        req,
-        fileName: metadata.fileName,
-        originalName: metadata.originalName,
-        folderId,
-        originalSize: stats.size,
-        mimeType: req.file.mimetype,
-        encryptionLevel: metadata.encryptionLevel || "none",
-        password: finalPassword,
-        expiresInDays: metadata.expiresInDays || "",
+      await runCloudFolderLifecycleMutation(folderId, async () => {
+        if (!refreshAuthenticatedUser(req, res)) return;
+        const currentFolder = getFolderById(folderId);
+        if (!currentFolder || !isFolderAvailable(folderId)) return res.status(404).json({ error: "Pasta nao encontrada" });
+        if (!req.user?.permissions?.upload || !hasFolderAccess(req, currentFolder)) return res.status(403).json({ error: "Permissao negada para upload nesta pasta" });
+        req.uploadFolder = { ...currentFolder, ...ensureFolderDirectories(folderId) };
+        finalFileName = getAvailableUploadFileName(metadata.fileName, folderId, true);
+        encryptionMetadata = encryptFileInPlace(stagedPath, {
+          req,
+          fileName: finalFileName,
+          originalName: metadata.originalName,
+          folderId,
+          originalSize: stats.size,
+          mimeType: req.file.mimetype,
+          encryptionLevel: metadata.encryptionLevel || "none",
+          password: finalPassword,
+          expiresInDays: metadata.expiresInDays || "",
+        });
+        const finalPath = path.join(req.uploadFolder.tempDir, finalFileName);
+        publishedPath = finalPath;
+        fs.renameSync(stagedPath, finalPath);
+        payload = await registerPendingUpload(req, {
+          fileName: finalFileName,
+          originalName: metadata.originalName,
+          versionComment: metadata.versionComment,
+          size: stats.size,
+          mimeType: req.file.mimetype,
+          chunkedUpload: true,
+          encryptionMetadata,
+        });
+      }, res, () => {
+        fs.rmSync(stagedPath, { force: true });
+        if (publishedPath) fs.rmSync(publishedPath, { force: true });
+        fs.rmSync(sessionDir, { recursive: true, force: true });
       });
     } catch (error) {
-      fs.rmSync(finalPath, { force: true });
+      fs.rmSync(stagedPath, { force: true });
+      if (publishedPath) fs.rmSync(publishedPath, { force: true });
       fs.rmSync(sessionDir, { recursive: true, force: true });
       return res.status(400).json({ error: error.message || "Falha ao criptografar arquivo" });
     }
+    if (res.headersSent) {
+      fs.rmSync(stagedPath, { force: true });
+      if (publishedPath) fs.rmSync(publishedPath, { force: true });
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+      return;
+    }
     fs.rmSync(sessionDir, { recursive: true, force: true });
-
-    const payload = registerPendingUpload(req, {
-      fileName: metadata.fileName,
-      originalName: metadata.originalName,
-      versionComment: metadata.versionComment,
-      size: stats.size,
-      mimeType: req.file.mimetype,
-      chunkedUpload: true,
-      encryptionMetadata,
-    });
-
+    processCloudTempMutationAfterLifecycle(folderId, finalFileName);
     res.json({ ...payload, complete: true, totalChunks });
   } catch (error) {
     removeChunkUploadIncomingFile(req.file);
     console.error("Erro no upload em blocos:", error.code || error.name || "operation_failed");
     res.status(500).json({ error: "Upload em blocos nao concluido" });
   }
-});
+}));
 
 app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFolder, rejectLargeSingleUpload, handleUploadSingle, async (req, res) => {
   const originalName = path.basename(req.file?.originalname || "");
-  const fileName = path.basename(req.uploadFinalFileName || "");
+  const requestedFileName = path.basename(req.uploadFinalFileName || "");
+  const incomingPath = getTrustedUploadStagingPath(req.file);
 
-  if (!req.file || !fileName) {
-    if (req.file?.path) fs.rmSync(req.file.path, { force: true });
+  if (!req.file || !requestedFileName || !incomingPath) {
+    if (incomingPath) fs.rmSync(incomingPath, { force: true });
     return res.status(400).json({ error: "Arquivo obrigatorio" });
   }
 
@@ -6034,63 +7939,94 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
   try {
     uploadWasCompressed = await decompressUploadedFileIfNeeded(req);
   } catch (error) {
-    fs.rmSync(req.file.path, { force: true });
+    fs.rmSync(incomingPath, { force: true });
     return res.status(400).json({ error: error.message || "Upload compactado invalido" });
   }
 
-  const finalTempPath = path.join(req.uploadFolder.tempDir, fileName);
+  const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
+  let finalTempPath = null;
+  let fileName = requestedFileName;
+  let payload;
   try {
-    fs.renameSync(req.file.path, finalTempPath);
-    req.file.path = finalTempPath;
+    await runCloudFolderLifecycleMutation(folderId, async () => {
+      if (!refreshAuthenticatedUser(req, res)) return;
+      let currentFolder = getFolderById(folderId);
+      if (!currentFolder || !isFolderAvailable(folderId)) return res.status(404).json({ error: "Pasta nao encontrada" });
+      if (!req.user?.permissions?.upload || !hasFolderAccess(req, currentFolder)) return res.status(403).json({ error: "Permissao negada para upload nesta pasta" });
+      req.uploadFolder = { ...currentFolder, ...ensureFolderDirectories(folderId) };
+      fileName = getAvailableUploadFileName(originalName, folderId, true);
+      const scan = await scanUploadBeforePending(req, {
+        filePath: incomingPath,
+        fileName,
+        originalName,
+        folderId,
+        size: req.file.size,
+      });
+      if (!scan.allowed) {
+        payload = { rejected: true, status: scan.status || 400, error: scan.error || "Upload bloqueado por seguranca" };
+        return;
+      }
+
+      if (!refreshAuthenticatedUser(req, res)) return;
+      currentFolder = getFolderById(folderId);
+      if (!currentFolder || !isFolderAvailable(folderId)) return res.status(404).json({ error: "Pasta nao encontrada" });
+      if (!req.user?.permissions?.upload || !hasFolderAccess(req, currentFolder)) return res.status(403).json({ error: "Permissao negada para upload nesta pasta" });
+      req.uploadFolder = { ...currentFolder, ...ensureFolderDirectories(folderId) };
+
+      let encryptionMetadata;
+      try {
+        encryptionMetadata = encryptFileInPlace(incomingPath, {
+          req,
+          fileName,
+          originalName,
+          folderId,
+          originalSize: req.file.size,
+          mimeType: req.file.mimetype,
+          encryptionLevel: req.body.encryptionLevel || "none",
+          password: req.body.password || "",
+          expiresInDays: req.body.expiresInDays || "",
+        });
+      } catch (error) {
+        payload = { rejected: true, status: 400, error: error.message || "Falha ao criptografar arquivo" };
+        return;
+      }
+      finalTempPath = path.join(req.uploadFolder.tempDir, fileName);
+      fs.renameSync(incomingPath, finalTempPath);
+      req.file.path = finalTempPath;
+      payload = await registerPendingUpload(req, {
+        fileName,
+        originalName,
+        versionComment: req.body.versionComment,
+        size: req.file.size,
+        mimeType: req.file.mimetype,
+        compressedUpload: uploadWasCompressed,
+        encryptionMetadata,
+      });
+    }, res);
   } catch (error) {
-    fs.rmSync(req.file.path, { force: true });
-    return res.status(500).json({ error: "Nao foi possivel finalizar o upload" });
+    fs.rmSync(incomingPath, { force: true });
+    if (finalTempPath) fs.rmSync(finalTempPath, { force: true });
+    return res.status(500).json({ error: error.message || "Nao foi possivel finalizar o upload" });
   }
 
-  const scan = await scanUploadBeforePending(req, {
-    filePath: finalTempPath,
-    fileName,
-    originalName,
-    folderId: req.uploadFolder?.id || ROOT_FOLDER_ID,
-    size: req.file.size,
-  });
-  if (!scan.allowed) {
-    return res.status(scan.status || 400).json({ error: scan.error || "Upload bloqueado por seguranca" });
+  if (res.headersSent) {
+    fs.rmSync(incomingPath, { force: true });
+    if (finalTempPath) fs.rmSync(finalTempPath, { force: true });
+    return;
   }
 
-  let encryptionMetadata = null;
-  try {
-    encryptionMetadata = encryptFileInPlace(finalTempPath, {
-      req,
-      fileName,
-      originalName,
-      folderId: req.uploadFolder?.id || ROOT_FOLDER_ID,
-      originalSize: req.file.size,
-      mimeType: req.file.mimetype,
-      encryptionLevel: req.body.encryptionLevel || "none",
-      password: req.body.password || "",
-      expiresInDays: req.body.expiresInDays || "",
-    });
-  } catch (error) {
-    fs.rmSync(finalTempPath, { force: true });
-    return res.status(400).json({ error: error.message || "Falha ao criptografar arquivo" });
+  if (payload?.rejected) {
+    fs.rmSync(incomingPath, { force: true });
+    return res.status(payload.status).json({ error: payload.error });
   }
-
-  res.json(registerPendingUpload(req, {
-    fileName,
-    originalName,
-    versionComment: req.body.versionComment,
-    size: req.file.size,
-    mimeType: req.file.mimetype,
-    compressedUpload: uploadWasCompressed,
-    encryptionMetadata,
-  }));
+  processCloudTempMutationAfterLifecycle(folderId, fileName);
+  res.json(payload);
 });
 
-app.put("/file-temporary", authenticate, (req, res) => {
+app.put("/file-temporary", fileTemporaryRateLimit, authenticate, async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
-  const folder = getAccessibleFolderOrRespond(req, res, req.body.folderId);
+  const folder = getAccessibleFolderRecordOrRespond(req, res, req.body.folderId);
   if (!folder) return;
 
   if (!rawName || name !== rawName) {
@@ -6101,46 +8037,49 @@ app.put("/file-temporary", authenticate, (req, res) => {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
 
-  const filePath = path.join(folder.uploadDir, name);
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
 
   const expiresAt = getTemporaryExpirationFromBody(req.body);
   if (expiresAt === undefined) {
     return res.status(400).json({ error: "Expiracao temporaria invalida" });
   }
 
-  const expirations = loadFileExpirations();
-  const key = getFileExpirationKey(folder.id, name);
-
-  if (!expiresAt) {
-    delete expirations[key];
-  } else {
-    expirations[key] = {
+  return runCloudFileLifecycleMutation(folder.id, name, async () => {
+    const currentFolder = getFolderById(folder.id);
+    if (!currentFolder || !isFolderAvailable(folder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderAccess(req, currentFolder) || !hasFileEditAccess(req, currentFolder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (!await getListedFileDetails({ ...currentFolder, ...ensureFolderDirectories(currentFolder.id) }, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const revalidatedFolder = getFolderById(folder.id);
+    if (!revalidatedFolder || !hasFileEditAccess(req, revalidatedFolder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    const expirations = loadFileExpirations();
+    const key = getFileExpirationKey(folder.id, name);
+    if (!expiresAt) {
+      delete expirations[key];
+    } else {
+      expirations[key] = {
+        folderId: folder.id,
+        fileName: name,
+        expiresAt,
+        updatedAt: new Date().toISOString(),
+        updatedBy: req.user.username,
+      };
+    }
+    saveFileExpirations(expirations);
+    addActionHistory("file_temporary_updated", name, req.user.username, {
+      folderId: folder.id,
+      folderName: currentFolder.name,
+      expiresAt,
+      temporary: Boolean(expiresAt),
+    });
+    return res.json({
+      message: "Temporariedade do arquivo atualizada",
       folderId: folder.id,
       fileName: name,
       expiresAt,
-      updatedAt: new Date().toISOString(),
-      updatedBy: req.user.username,
-    };
-  }
-
-  saveFileExpirations(expirations);
-  addActionHistory("file_temporary_updated", name, req.user.username, {
-    folderId: folder.id,
-    folderName: folder.name,
-    expiresAt,
-    temporary: Boolean(expiresAt),
-  });
-
-  res.json({
-    message: "Temporariedade do arquivo atualizada",
-    folderId: folder.id,
-    fileName: name,
-    expiresAt,
-    temporary: Boolean(expiresAt),
-  });
+      temporary: Boolean(expiresAt),
+    });
+  }, res);
 });
 
 function getFileListCaches() {
@@ -6149,7 +8088,8 @@ function getFileListCaches() {
     fileExpirations: loadFileExpirations(),
     fileVersions: loadFileVersions(),
     encryptedFiles: loadEncryptedFiles(),
-    publicLinks: cleanupExpiredPublicLinks(),
+    publicLinks: loadPublicLinks(),
+    restoreProviderOrphanSnapshot: restoreProviderOrphans.createSnapshot(),
   };
 }
 
@@ -6163,7 +8103,7 @@ function hasPublicLinkForFile(folderId, fileName, publicLinks = {}) {
 function buildVisibleFileEntry(req, folder, file, caches = getFileListCaches()) {
   if (isStoredVersionFile(folder.id, file.name, caches.fileVersions)) return null;
   if (isFileInTrash(folder.id, file.name)) return null;
-  if (!hasFileAccess(req, folder, file.name, caches.filePermissions)) return null;
+  if (!hasFileAccess(req, folder, file.name, caches.filePermissions, caches.fileExpirations, caches.restoreProviderOrphanSnapshot)) return null;
 
   const encryption = getEncryptedFileMetadata(folder.id, file.name, caches.encryptedFiles);
   if (!canAccessEncryptedFile(req, encryption)) return null;
@@ -6192,14 +8132,15 @@ function buildVisibleFileEntry(req, folder, file, caches = getFileListCaches()) 
     currentVersion: versions.currentVersion || 0,
     versionCount: versions.versions.length,
     encryption: getPublicEncryptionMetadata(encryption),
-    canEdit: hasFileEditAccess(req, folder, file.name, caches.filePermissions),
-    canManageAccess: canManageAccess(req) || hasFileEditAccess(req, folder, file.name, caches.filePermissions),
+    canEdit: hasFileEditAccess(req, folder, file.name, caches.filePermissions, caches.restoreProviderOrphanSnapshot),
+    canManageAccess: canManageAccess(req) || hasFileEditAccess(req, folder, file.name, caches.filePermissions, caches.restoreProviderOrphanSnapshot),
+    canShare: hasPublicShareAccess(req, folder, file.name, caches.filePermissions, caches.fileExpirations, caches.restoreProviderOrphanSnapshot),
   };
 }
 
 async function listVisibleFilesForFolder(req, folder, caches = getFileListCaches()) {
-  await syncFolderCacheFromCloud(folder.id, "uploads");
-  const files = await listFilesWithDetailsAsync(folder.uploadDir);
+  const files = await listFilesWithCloudDetails(folder.uploadDir, folder.id, "uploads");
+  caches.fileExpirations = loadFileExpirations();
   return files
     .map((file) => buildVisibleFileEntry(req, folder, file, caches))
     .filter(Boolean);
@@ -6210,7 +8151,7 @@ async function getWebDavVisibleFiles(req, folder) {
   return visible.filter((file) => !isWebDavEncryptedFile(folder.id, file.name) && !isWebDavInternalStoredFile(folder.id, file.name));
 }
 
-async function resolveWebDavFile(req, folder, fileName) {
+async function resolveWebDavFile(req, res, folder, fileName) {
   const name = path.basename(String(fileName || ""));
   if (!name || name !== fileName) return null;
   if (!folder || !hasFolderAccess(req, folder)) return null;
@@ -6223,19 +8164,24 @@ async function resolveWebDavFile(req, folder, fileName) {
   if (!hasFileAccess(req, folder, name)) return null;
 
   const filePath = path.join(folder.uploadDir, name);
-  await ensureCloudFileCached(folder.id, name, filePath, "uploads");
+  await ensureCloudFileCached(folder.id, name, filePath, "uploads", () => !isFileInTrash(folder.id, name));
+  if (!refreshAuthenticatedUser(req, res)) return null;
+  const currentFolder = getFolderById(folder.id);
+  if (!req.user?.permissions?.listFiles || !currentFolder || !hasFolderAccess(req, currentFolder) || !hasFileAccess(req, currentFolder, name)) return null;
+  if (isWebDavFileExpired(folder.id, name) || isWebDavEncryptedFile(folder.id, name) || isWebDavInternalStoredFile(folder.id, name)) return null;
+  if (!isFolderAvailable(folder.id) || isFileInTrash(folder.id, name) || isFileExpired(folder.id, name)) return null;
   if (!isExistingFile(filePath)) return null;
 
   return {
     type: "file",
-    folder,
+    folder: hydrateFolderForWebDav(currentFolder),
     name,
     filePath,
     stats: fs.statSync(filePath),
   };
 }
 
-async function resolveWebDavTarget(req, segments) {
+async function resolveWebDavTarget(req, res, segments) {
   const rootFolder = getWebDavRootFolder();
 
   if (!segments.length) {
@@ -6245,13 +8191,13 @@ async function resolveWebDavTarget(req, segments) {
   if (segments.length === 1) {
     const folder = findWebDavFolderByName(req, segments[0]);
     if (folder) return { type: "folder", folder: hydrateFolderForWebDav(folder) };
-    return resolveWebDavFile(req, rootFolder, segments[0]);
+    return resolveWebDavFile(req, res, rootFolder, segments[0]);
   }
 
   if (segments.length === 2) {
     const folder = findWebDavFolderByName(req, segments[0]);
     if (!folder) return null;
-    return resolveWebDavFile(req, hydrateFolderForWebDav(folder), segments[1]);
+    return resolveWebDavFile(req, res, hydrateFolderForWebDav(folder), segments[1]);
   }
 
   return null;
@@ -6288,7 +8234,7 @@ function escapeXml(value) {
 }
 
 function encodeWebDavHrefSegment(segment) {
-  return encodeURIComponent(segment).replace(/%20/g, "%20");
+  return encodeURIComponent(segment);
 }
 
 function getWebDavHref(segments = [], isCollection = false) {
@@ -6350,7 +8296,8 @@ async function sendWebDavPropfind(req, res, segments) {
   }
   const depth = String(req.headers.depth || "1");
   if (!["0", "1"].includes(depth)) return res.status(400).send("Unsupported WebDAV depth");
-  const target = await resolveWebDavTarget(req, segments);
+  const target = await resolveWebDavTarget(req, res, segments);
+  if (res.headersSent) return;
   if (!target || target.blocked) return res.status(target?.status || 404).send(target?.message || "Not found");
 
   const responses = [];
@@ -6429,14 +8376,17 @@ async function sendWebDavPropfind(req, res, segments) {
 }
 
 async function sendWebDavFile(req, res, segments, headOnly = false) {
-  const target = await resolveWebDavTarget(req, segments);
+  const target = await resolveWebDavTarget(req, res, segments);
+  if (res.headersSent) return;
   if (!target || target.type !== "file") return res.status(target?.status || 404).send(target?.message || "Not found");
 
-  auditLog("webdav.download", getAuditActor(req), { type: "file", id: target.name }, "download", "success", {
-    folderId: target.folder.id,
-    method: req.method,
-    path: getSafeWebDavAuditPath(req),
-  });
+  if (!headOnly) {
+    auditLog("webdav.download", getAuditActor(req), { type: "file", id: target.name }, "download", "success", {
+      folderId: target.folder.id,
+      method: req.method,
+      path: getSafeWebDavAuditPath(req),
+    });
+  }
 
   if (headOnly) {
     res.setHeader("Content-Type", getMimeType(target.name));
@@ -6489,29 +8439,51 @@ async function handleWebDavPut(req, res, segments) {
       return res.status(written > SINGLE_UPLOAD_MAX_BYTES ? 413 : 400).send(written > SINGLE_UPLOAD_MAX_BYTES ? "File too large for WebDAV MVP upload" : "Content-Length mismatch");
     }
 
-    const finalFileName = getAvailableUploadFileName(target.fileName, target.folder.id, true);
-    finalPath = path.join(target.folder.tempDir, finalFileName);
-    fs.mkdirSync(target.folder.tempDir, { recursive: true });
-    fs.renameSync(incomingPath, finalPath);
-    const scan = await scanUploadBeforePending(req, {
-      filePath: finalPath,
-      fileName: finalFileName,
-      originalName: target.fileName,
-      folderId: target.folder.id,
-      size: written,
-    });
-    if (!scan.allowed) {
-      fs.rmSync(finalPath, { force: true });
-      return res.status(scan.status || 400).send(scan.error || "Upload bloqueado por seguranca");
-    }
-
     req.uploadFolder = target.folder;
-    registerPendingUpload(req, {
-      fileName: finalFileName,
-      originalName: target.fileName,
-      size: written,
-      mimeType: getMimeType(target.fileName),
-    });
+    let finalFileName;
+    let scanFailure;
+    await runCloudFolderLifecycleMutation(target.folder.id, async () => {
+      if (!refreshAuthenticatedUser(req, res)) return;
+      const currentFolder = getFolderById(target.folder.id);
+      if (!currentFolder || !isFolderAvailable(currentFolder.id)) return res.status(404).send("Folder not found");
+      if (!hasFolderAccess(req, currentFolder) || !req.user.permissions?.upload) return res.status(403).send("Upload permission required");
+      req.uploadFolder = { ...currentFolder, ...ensureFolderDirectories(currentFolder.id) };
+      finalFileName = getAvailableUploadFileName(target.fileName, target.folder.id, true);
+      const scan = await scanUploadBeforePending(req, {
+        filePath: incomingPath,
+        fileName: finalFileName,
+        originalName: target.fileName,
+        folderId: target.folder.id,
+        size: written,
+      });
+      if (!scan.allowed) {
+        scanFailure = { status: scan.status || 400, error: scan.error || "Upload bloqueado por seguranca" };
+        return;
+      }
+      if (!refreshAuthenticatedUser(req, res)) return;
+      const publishFolder = getFolderById(target.folder.id);
+      if (!publishFolder || !isFolderAvailable(publishFolder.id)) return res.status(404).send("Folder not found");
+      if (!hasFolderAccess(req, publishFolder) || !req.user.permissions?.upload) return res.status(403).send("Upload permission required");
+      req.uploadFolder = { ...publishFolder, ...ensureFolderDirectories(publishFolder.id) };
+      finalPath = path.join(req.uploadFolder.tempDir, finalFileName);
+      fs.mkdirSync(req.uploadFolder.tempDir, { recursive: true });
+      fs.renameSync(incomingPath, finalPath);
+      await registerPendingUpload(req, {
+        fileName: finalFileName,
+        originalName: target.fileName,
+        size: written,
+        mimeType: getMimeType(target.fileName),
+      });
+    }, res);
+    if (res.headersSent) {
+      fs.rmSync(incomingPath, { force: true });
+      return;
+    }
+    if (scanFailure) {
+      fs.rmSync(incomingPath, { force: true });
+      return res.status(scanFailure.status).send(scanFailure.error);
+    }
+    processCloudTempMutationAfterLifecycle(target.folder.id, finalFileName);
 
     auditLog("webdav.upload", getAuditActor(req), { type: "file", id: finalFileName }, "upload", "success", {
       folderId: target.folder.id,
@@ -6626,6 +8598,9 @@ function persistWebDavMoveMetadataSnapshot(transactionId, snapshot) {
     if (contents === null) {
       files[file] = { present: false, path: snapshotPath, checksum: null };
     } else {
+      if (!Buffer.isBuffer(contents) || contents.length > WEBDAV_MOVE_MAX_METADATA_SNAPSHOT_BYTES) {
+        throw new Error("WebDAV metadata snapshot exceeds its size limit");
+      }
       writeWebDavMoveFileAtomically(snapshotPath, contents);
       files[file] = { present: true, path: snapshotPath, checksum: sha256Buffer(contents) };
     }
@@ -6645,7 +8620,7 @@ function restoreWebDavMoveMetadata(snapshot) {
         fs.rmSync(target, { force: true });
         continue;
       }
-      const contents = fs.readFileSync(snapshotPath);
+      const { contents } = readBoundedRegularFile(snapshotPath, WEBDAV_MOVE_MAX_METADATA_SNAPSHOT_BYTES);
       if (sha256Buffer(contents) !== value.checksum) throw new Error("WebDAV metadata snapshot checksum mismatch");
       writeWebDavMoveFileAtomically(target, contents);
       continue;
@@ -6668,9 +8643,23 @@ function writeWebDavMoveJournal(journal) {
   fs.renameSync(temporary, journal.journalPath);
 }
 
+function canonicalWebDavMoveTransactionId(value) {
+  const transactionId = String(value || "").toLowerCase();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(transactionId)
+    ? transactionId
+    : null;
+}
+
+function webDavMoveJournalPath(transactionId) {
+  const canonicalId = canonicalWebDavMoveTransactionId(transactionId);
+  if (!canonicalId) return null;
+  return path.join(WEBDAV_MOVE_JOURNAL_DIR, path.basename(`rootark-webdav-move-${canonicalId}.json`));
+}
+
 function isSafeWebDavMoveJournal(journal) {
-  if (!journal || journal.version !== 1 || !/^[a-f0-9-]{36}$/i.test(String(journal.transactionId || ""))) return false;
-  const expectedJournal = path.resolve(WEBDAV_MOVE_JOURNAL_DIR, `rootark-webdav-move-${journal.transactionId}.json`);
+  if (!journal || journal.version !== 1) return false;
+  const expectedJournal = webDavMoveJournalPath(journal.transactionId);
+  if (!expectedJournal) return false;
   if (path.resolve(journal.journalPath || "") !== expectedJournal) return false;
   if ([journal.sourcePath, journal.destinationPath, journal.stagePath, journal.destinationBackupPath].some((target) => typeof target !== "string" || !isSafeChildPath(path.resolve("."), target))) return false;
   const sourceDir = path.dirname(path.resolve(journal.sourcePath));
@@ -6719,6 +8708,20 @@ function isDurablyCompletedWebDavMove(journal) {
   return ["committed", "cloud_complete", "completed", "cleanup_intent", "cleanup_completed"].includes(journal.phase) || journal.cloud?.state === "completed";
 }
 
+function webDavMoveProviderMatchesRuntime(journal) {
+  const recordedProvider = String(journal?.cloud?.provider || "").toLowerCase();
+  if (!journal?.cloud) return true;
+  if (!recordedProvider || recordedProvider !== CLOUD_STORAGE_PROVIDER) return false;
+  if (recordedProvider === "local") return true;
+  return ["s3", "gdrive"].includes(recordedProvider) && isCloudStorageEnabled();
+}
+
+function shouldPreserveWebDavMoveForCloud(journal) {
+  const states = [journal.phase, journal.cloud?.state];
+  if (states.some((state) => WEBDAV_MOVE_PRESERVE_STATES.has(state))) return true;
+  return states.includes("queued") && ["s3", "gdrive"].includes(String(journal.cloud?.provider || "").toLowerCase());
+}
+
 function finalizeWebDavMoveJournal(journal) {
   if (!isSafeWebDavMoveJournal(journal)) throw new Error("Journal WebDAV invalido");
   journal.phase = "committed";
@@ -6765,18 +8768,19 @@ function cleanupOrphanWebDavMoveArtifacts() {
 
 function recoverWebDavMoveJournals() {
   if (!fs.existsSync(WEBDAV_MOVE_JOURNAL_DIR)) return;
-  recoverWebDavMoveClaimTakeovers();
+  const busyTakeovers = recoverWebDavMoveClaimTakeovers();
   for (const name of fs.readdirSync(WEBDAV_MOVE_JOURNAL_DIR).filter((entry) => /^rootark-webdav-move-[a-f0-9-]{36}\.json$/i.test(entry))) {
     const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, name);
     let journal;
-    try { journal = JSON.parse(fs.readFileSync(journalPath, "utf8")); } catch { throw new Error("Journal WebDAV invalido"); }
+    try { journal = readWebDavMoveJournal(journalPath); } catch { throw new Error("Journal WebDAV invalido"); }
     if (!isSafeWebDavMoveJournal(journal)) throw new Error("Journal WebDAV ambiguo");
+    if (busyTakeovers.has(journal.transactionId)) continue;
     if (isDurablyCompletedWebDavMove(journal)) {
       finalizeWebDavMoveJournal(journal);
       continue;
     }
     if (journal.phase === "terminal_reconciliation_failure" || journal.cloud?.state === "terminal_reconciliation_failure") continue;
-    if (WEBDAV_MOVE_REMOTE_INTENT_STATES.has(journal.phase) || WEBDAV_MOVE_REMOTE_INTENT_STATES.has(journal.cloud?.state)) continue;
+    if (shouldPreserveWebDavMoveForCloud(journal)) continue;
     restoreWebDavMoveMetadata(journal.metadata);
     rollbackWebDavMoveJournal(journal);
   }
@@ -6810,6 +8814,16 @@ function webDavMoveClaimToken(contents) {
   try { return JSON.parse(contents).token || null; } catch { return String(contents || ""); }
 }
 
+function readWebDavMoveJournal(journalPath) {
+  const { contents } = readBoundedRegularFile(journalPath, WEBDAV_MOVE_MAX_JOURNAL_BYTES);
+  return JSON.parse(contents.toString("utf8"));
+}
+
+function readWebDavMoveClaimFile(lockPath) {
+  const { contents, stat } = readBoundedRegularFile(lockPath, WEBDAV_MOVE_MAX_CLAIM_BYTES);
+  return { contents: contents.toString("utf8"), stat };
+}
+
 function webDavMoveClaimRecord(token, transactionId, now) {
   return { version: 1, token, transactionId, pid: process.pid, processStartIdentity: webDavMoveProcessStartIdentity(process.pid), claimedAt: new Date(now).toISOString() };
 }
@@ -6835,16 +8849,38 @@ function validWebDavMoveClaimRecord(record, transactionId) {
   return record && record.version === 1 && typeof record.token === "string" && record.token && record.transactionId === transactionId && Number.isInteger(Number(record.pid)) && Number(record.pid) > 0 && typeof record.claimedAt === "string" && Number.isFinite(Date.parse(record.claimedAt));
 }
 
+function webDavMoveExactFileId(value) {
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "string" && /^(0|[1-9]\d*)$/.test(value)) return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return String(value);
+  return null;
+}
+
 function webDavMoveFileStatIdentity(stat) {
-  return stat ? { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, birthtimeMs: stat.birthtimeMs } : null;
+  if (!stat) return null;
+  return {
+    dev: typeof stat.dev === "bigint" ? stat.dev.toString() : stat.dev,
+    ino: typeof stat.ino === "bigint" ? stat.ino.toString() : stat.ino,
+    size: typeof stat.size === "bigint" ? Number(stat.size) : stat.size,
+    mtimeMs: typeof stat.mtimeMs === "bigint" ? Number(stat.mtimeMs) : stat.mtimeMs,
+    ctimeMs: typeof stat.ctimeMs === "bigint" ? Number(stat.ctimeMs) : stat.ctimeMs,
+    birthtimeMs: typeof stat.birthtimeMs === "bigint" ? Number(stat.birthtimeMs) : stat.birthtimeMs,
+  };
+}
+
+function webDavMoveSameFileIdentity(left, right) {
+  if (!left || !right) return false;
+  const leftDev = webDavMoveExactFileId(left.dev);
+  const leftIno = webDavMoveExactFileId(left.ino);
+  return leftDev !== null && leftIno !== null && leftDev === webDavMoveExactFileId(right.dev) && leftIno === webDavMoveExactFileId(right.ino);
 }
 
 function webDavMoveSameStatIdentity(left, right) {
-  return Boolean(left && right && ["dev", "ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"].every((key) => left[key] === right[key]));
+  return Boolean(webDavMoveSameFileIdentity(left, right) && ["size", "mtimeMs", "ctimeMs", "birthtimeMs"].every((key) => left[key] === right[key]));
 }
 
 function webDavMoveSameRenamedIdentity(left, right) {
-  return Boolean(left && right && ["dev", "ino", "size", "mtimeMs", "birthtimeMs"].every((key) => left[key] === right[key]));
+  return Boolean(webDavMoveSameFileIdentity(left, right) && ["size", "mtimeMs", "birthtimeMs"].every((key) => left[key] === right[key]));
 }
 
 function webDavMoveClaimObservation(contents, stat) {
@@ -6879,24 +8915,20 @@ function webDavMoveReadTakeoverAuthority(lockPath, transactionId) {
     throw error;
   }
   let record;
-  try { record = JSON.parse(fs.readFileSync(webDavMoveTakeoverMeta(lockPath), "utf8")); } catch { return { kind: "malformed", mtimeMs: stat.mtimeMs }; }
+  try { record = JSON.parse(readBoundedRegularFile(webDavMoveTakeoverMeta(lockPath), WEBDAV_MOVE_MAX_CLAIM_BYTES).contents.toString("utf8")); } catch { return { kind: "malformed", mtimeMs: stat.mtimeMs }; }
   const expectedLock = webDavMoveLockPath(transactionId);
   if (record?.version !== 1 || typeof record.token !== "string" || !record.token || record.transactionId !== transactionId || path.resolve(record.lockPath || "") !== path.resolve(expectedLock) || path.resolve(record.evidencePath || "") !== path.resolve(webDavMoveTakeoverEvidence(lockPath)) || !Number.isInteger(Number(record.pid)) || Number(record.pid) <= 0 || !Number.isFinite(Date.parse(record.claimedAt || "")) || !record.observed?.sha256 || !Number.isInteger(record.observed.size) || !record.observed.stat) return { kind: "mismatch", record };
   return { kind: "valid", record, live: webDavMoveOwnerIsLive(record), mtimeMs: stat.mtimeMs };
 }
 
 function webDavMoveEvidenceMatchesAuthority(lockPath, authority) {
-  let stat;
-  let contents;
+  let evidence;
   try {
-    const link = fs.lstatSync(webDavMoveTakeoverEvidence(lockPath));
-    if (!link.isFile() || link.isSymbolicLink()) return false;
-    stat = link;
-    contents = fs.readFileSync(webDavMoveTakeoverEvidence(lockPath));
+    evidence = readBoundedRegularFile(webDavMoveTakeoverEvidence(lockPath), WEBDAV_MOVE_MAX_CLAIM_BYTES);
   } catch (error) {
     return error.code === "ENOENT";
   }
-  return sha256Buffer(contents) === authority.observed.sha256 && contents.length === authority.observed.size && webDavMoveSameRenamedIdentity(webDavMoveFileStatIdentity(stat), authority.observed.stat) && webDavMoveClaimToken(contents.toString()) === authority.previousToken;
+  return sha256Buffer(evidence.contents) === authority.observed.sha256 && evidence.contents.length === authority.observed.size && webDavMoveSameRenamedIdentity(webDavMoveFileStatIdentity(evidence.stat), authority.observed.stat) && webDavMoveClaimToken(evidence.contents.toString()) === authority.previousToken;
 }
 
 function webDavMoveRemoveTakeoverAuthority(lockPath, transactionId, token) {
@@ -6939,14 +8971,25 @@ function writeWebDavMoveClaimLock(lockPath, record) {
 }
 
 function recoverWebDavMoveClaimTakeovers() {
-  if (!fs.existsSync(WEBDAV_MOVE_JOURNAL_DIR)) return;
+  const busyTakeovers = new Set();
+  if (!fs.existsSync(WEBDAV_MOVE_JOURNAL_DIR)) return busyTakeovers;
   const names = fs.readdirSync(WEBDAV_MOVE_JOURNAL_DIR).filter((entry) => /^rootark-webdav-move-[a-f0-9-]{36}\.lock\.takeover$/i.test(entry));
   for (const name of names) {
     const match = name.match(/^rootark-webdav-move-([a-f0-9-]{36})\.lock\.takeover$/i);
     if (!match) continue;
     const lockPath = webDavMoveLockPath(match[1]);
-    webDavMoveRecoverTakeoverAuthority(lockPath, match[1]);
+    const state = webDavMoveReadTakeoverAuthority(lockPath, match[1]);
+    if ((state.kind === "valid" && state.live) || (state.kind === "malformed" && Date.now() - state.mtimeMs <= WEBDAV_MOVE_RECONCILIATION_LEASE_MS)) {
+      busyTakeovers.add(match[1]);
+      continue;
+    }
+    try { webDavMoveRecoverTakeoverAuthority(lockPath, match[1]); } catch (error) {
+      if (error.code !== "WEBDAV_MOVE_CLAIM_BUSY") throw error;
+      // Preserve ambiguous evidence and defer only this transaction.
+      busyTakeovers.add(match[1]);
+    }
   }
+  return busyTakeovers;
 }
 
 function takeoverWebDavMoveClaim(lockPath, transactionId, previousToken, observed, now) {
@@ -6959,12 +9002,16 @@ function takeoverWebDavMoveClaim(lockPath, transactionId, previousToken, observe
     writeWebDavMoveFileAtomically(webDavMoveTakeoverMeta(lockPath), JSON.stringify(authority));
     let currentStat;
     let currentContents;
-    try { currentStat = fs.statSync(lockPath); currentContents = fs.readFileSync(lockPath, "utf8"); } catch (error) { if (error.code === "ENOENT") return null; throw error; }
+    try {
+      const current = readWebDavMoveClaimFile(lockPath);
+      currentStat = current.stat;
+      currentContents = current.contents;
+    } catch (error) { if (error.code === "ENOENT") return null; throw error; }
     if (currentContents !== observed.contents || !webDavMoveSameStatIdentity(webDavMoveFileStatIdentity(currentStat), webDavMoveFileStatIdentity(observed.stat)) || webDavMoveClaimToken(currentContents) !== previousToken) { webDavMoveRemoveTakeoverAuthority(lockPath, transactionId, ownerToken); return null; }
     fs.renameSync(lockPath, webDavMoveTakeoverEvidence(lockPath));
     if (!webDavMoveEvidenceMatchesAuthority(lockPath, authority)) throw new Error("WebDAV claim evidence changed during takeover");
     writeWebDavMoveClaimLock(lockPath, webDavMoveClaimRecord(ownerToken, transactionId, now));
-    if (webDavMoveClaimToken(fs.readFileSync(lockPath, "utf8")) !== ownerToken) throw new Error("WebDAV replacement claim was not confirmed");
+    if (webDavMoveClaimToken(readWebDavMoveClaimFile(lockPath).contents) !== ownerToken) throw new Error("WebDAV replacement claim was not confirmed");
     webDavMoveRemoveTakeoverAuthority(lockPath, transactionId, ownerToken);
     return ownerToken;
   } catch (error) {
@@ -6978,15 +9025,17 @@ function takeoverWebDavMoveClaim(lockPath, transactionId, previousToken, observe
 
 function releaseWebDavMoveClaim(claim) {
   if (!claim?.path) return;
-  try { if (webDavMoveClaimToken(fs.readFileSync(claim.path, "utf8")) === claim.token) fs.rmSync(claim.path, { force: true }); } catch {}
+  try { if (webDavMoveClaimToken(readWebDavMoveClaimFile(claim.path).contents) === claim.token) fs.rmSync(claim.path, { force: true }); } catch {}
 }
 
 function claimWebDavMoveJournal(journal, now = Date.now(), workerId = crypto.randomUUID()) {
   const cloud = journal.cloud || {};
   if (!journal || !["queued", "destination_upload_intent", "destination_upload_uncertain", "source_delete_intent", "source_delete_uncertain", "retry_wait", "destination_uploaded", "claimed"].includes(cloud.state)) return null;
+  if (!webDavMoveProviderMatchesRuntime(journal)) return null;
   if (cloud.nextAttemptAt && new Date(cloud.nextAttemptAt).getTime() > now) return null;
   if (cloud.leaseToken && new Date(cloud.leaseUntil || 0).getTime() > now) return null;
-  recoverWebDavMoveClaimTakeovers();
+  const busyTakeovers = recoverWebDavMoveClaimTakeovers();
+  if (busyTakeovers.has(journal.transactionId)) return null;
   const token = `${workerId}:${crypto.randomUUID()}`;
   const lockPath = webDavMoveLockPath(journal.transactionId);
   fs.mkdirSync(WEBDAV_MOVE_JOURNAL_DIR, { recursive: true });
@@ -6995,11 +9044,12 @@ function claimWebDavMoveJournal(journal, now = Date.now(), workerId = crypto.ran
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
     try {
-      const existingStat = fs.statSync(lockPath);
-      const existing = fs.readFileSync(lockPath, "utf8");
+      const existingRead = readWebDavMoveClaimFile(lockPath);
+      const existingStat = existingRead.stat;
+      const existing = existingRead.contents;
       const existingRecord = (() => { try { return JSON.parse(existing); } catch { return null; } })();
       if (!validWebDavMoveClaimRecord(existingRecord, journal.transactionId) || webDavMoveOwnerIsLive(existingRecord)) return null;
-      const leaseExpired = existingRecord?.claimedAt ? Date.parse(existingRecord.claimedAt) + WEBDAV_MOVE_RECONCILIATION_LEASE_MS <= now : fs.statSync(lockPath).mtimeMs + WEBDAV_MOVE_RECONCILIATION_LEASE_MS <= now;
+      const leaseExpired = existingRecord?.claimedAt ? Date.parse(existingRecord.claimedAt) + WEBDAV_MOVE_RECONCILIATION_LEASE_MS <= now : existingStat.mtimeMs + WEBDAV_MOVE_RECONCILIATION_LEASE_MS <= now;
       if (!leaseExpired) return null;
       const takeover = takeoverWebDavMoveClaim(lockPath, journal.transactionId, existingRecord.token, webDavMoveClaimObservation(existing, existingStat), now);
       if (!takeover) return null;
@@ -7011,7 +9061,7 @@ function claimWebDavMoveJournal(journal, now = Date.now(), workerId = crypto.ran
 
 function finalizeWebDavMoveClaim(journal, lockPath, ownerToken, workerId, now) {
   try {
-    const current = JSON.parse(fs.readFileSync(journal.journalPath, "utf8"));
+    const current = readWebDavMoveJournal(journal.journalPath);
     if (current.cloud?.leaseToken && new Date(current.cloud.leaseUntil || 0).getTime() > now) { releaseWebDavMoveClaim({ path: lockPath, token: ownerToken }); return null; }
     const at = new Date(now).toISOString();
     const claimed = webDavCloudTransition(current, "claimed", at, {
@@ -7049,7 +9099,13 @@ function markWebDavMoveRetry(journal, error, now = Date.now()) {
 }
 
 async function reconcileWebDavMoveCloud(journal, { claimToken = null, now = Date.now() } = {}) {
-  if (!journal.cloud || !isCloudStorageEnabled()) {
+  if (!journal.cloud) {
+    webDavCloudTransition(journal, "completed", new Date(now).toISOString(), { completedAt: new Date(now).toISOString(), leaseToken: null, leaseUntil: null });
+    writeWebDavMoveJournal(journal);
+    return { pending: false };
+  }
+  if (!webDavMoveProviderMatchesRuntime(journal)) return { pending: true, providerMismatch: true };
+  if (journal.cloud.provider === "local") {
     webDavCloudTransition(journal, "completed", new Date(now).toISOString(), { completedAt: new Date(now).toISOString(), leaseToken: null, leaseUntil: null });
     writeWebDavMoveJournal(journal);
     return { pending: false };
@@ -7109,7 +9165,7 @@ async function resumeWebDavMoveCloudJournals() {
     for (const name of fs.readdirSync(WEBDAV_MOVE_JOURNAL_DIR).filter((entry) => /^rootark-webdav-move-[a-f0-9-]{36}\.json$/i.test(entry))) {
       const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, name);
       let journal;
-      try { journal = JSON.parse(fs.readFileSync(journalPath, "utf8")); } catch { continue; }
+      try { journal = readWebDavMoveJournal(journalPath); } catch { continue; }
       if (!isSafeWebDavMoveJournal(journal)) continue;
       const claim = claimWebDavMoveJournal(journal);
       if (!claim) continue;
@@ -7124,7 +9180,7 @@ async function resumeWebDavMoveCloudJournals() {
           auditLog("webdav.move.reconciliation.retry", { username: "system", role: "system" }, { type: "webdav_move", id: claim.journal.transactionId }, "reconcile", "pending", { category: claim.journal.cloud.failureCategory, attempts: claim.journal.cloud.attempts });
         }
       } catch (error) {
-        try { markWebDavMoveRetry(JSON.parse(fs.readFileSync(journalPath, "utf8")), error); } catch {}
+        try { markWebDavMoveRetry(readWebDavMoveJournal(journalPath), error); } catch {}
       } finally {
         releaseWebDavMoveClaim(claim);
       }
@@ -7137,10 +9193,16 @@ async function resumeWebDavMoveCloudJournals() {
 async function handleWebDavMove(req, res, segments) {
   if (!WEBDAV_ALLOW_MOVE) return res.status(405).send("MOVE is disabled for WebDAV MVP");
   if (!req.user?.permissions?.upload) return res.status(403).send("Upload permission required");
-  const source = await resolveWebDavTarget(req, segments);
+  const source = await resolveWebDavTarget(req, res, segments);
+  if (res.headersSent) return;
   const destinationSegments = getWebDavMoveDestination(req);
   const destination = destinationSegments && getWebDavUploadTarget(req, destinationSegments);
   if (!source || source.type !== "file" || !destination) return res.status(409).send("Invalid MOVE target");
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentSource = getFolderById(source.folder.id);
+  const currentDestination = getFolderById(destination.folder.id);
+  if (!currentSource || !currentDestination || !hasFolderAccess(req, currentSource) || !hasFolderAccess(req, currentDestination) || !hasFileEditAccess(req, currentSource, source.name)) return res.status(403).send("Permission denied");
+  if (!req.user.permissions?.upload || !isFolderAvailable(currentSource.id) || !isFolderAvailable(currentDestination.id) || isFileInTrash(currentSource.id, source.name)) return res.status(404).send("Not found");
   if (source.folder.id !== destination.folder.id) return res.status(403).send("Cross-folder MOVE is not supported");
   if (!hasFileEditAccess(req, source.folder, source.name)) return res.status(403).send("Permission denied");
   if (source.name === destination.fileName) return res.status(403).send("Source and destination are identical");
@@ -7260,7 +9322,7 @@ async function handleWebDavMove(req, res, segments) {
     auditLog("webdav.move", getAuditActor(req), { type: "file", id: destination.fileName }, "move", "success", { folderId: source.folder.id, overwrite });
     return res.status(destinationExists ? 204 : 201).end();
   } catch (error) {
-    const cloudReconciliationPending = Boolean(journal.cloud?.destinationUploaded && !journal.cloud?.sourceRemoved) || WEBDAV_MOVE_REMOTE_INTENT_STATES.has(journal.phase) || WEBDAV_MOVE_REMOTE_INTENT_STATES.has(journal.cloud?.state);
+    const cloudReconciliationPending = Boolean(journal.cloud?.destinationUploaded && !journal.cloud?.sourceRemoved) || shouldPreserveWebDavMoveForCloud(journal);
     if (!cloudReconciliationPending && !["committed", "cloud_source_removal_pending", "cloud_complete", "terminal_reconciliation_failure"].includes(journal.phase)) {
       try { journal.phase = "rolling_back"; writeWebDavMoveJournal(journal); } catch {}
       try { restoreWebDavMoveMetadata(metadataSnapshot); } catch {}
@@ -7290,15 +9352,16 @@ function registerWebDavRoutes() {
   recoverWebDavMoveJournals();
   resumeWebDavMoveCloudJournals().catch((error) => console.error("[webdav] cloud reconciliation: ", error.message));
   if (!webDavReconciliationTimer) {
-    webDavReconciliationTimer = setInterval(() => { void resumeWebDavMoveCloudJournals().catch((error) => console.error("[webdav] cloud reconciliation: ", error.message)); }, WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS);
+    webDavReconciliationTimer = setInterval(() => resumeWebDavMoveCloudJournals().catch((error) => console.error("[webdav] cloud reconciliation: ", error.message)), WEBDAV_MOVE_RECONCILIATION_INTERVAL_MS);
     server.once("close", () => clearInterval(webDavReconciliationTimer));
   }
   app.get("/webdav/moves/:transactionId/status", authenticate, requirePermission("upload"), (req, res) => {
-    if (!/^[a-f0-9-]{36}$/i.test(String(req.params.transactionId || ""))) return res.status(404).send("Not found");
-    const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, `rootark-webdav-move-${req.params.transactionId}.json`);
+    const transactionId = canonicalWebDavMoveTransactionId(req.params.transactionId);
+    if (!transactionId) return res.status(404).send("Not found");
+    const journalPath = webDavMoveJournalPath(transactionId);
     if (!fs.existsSync(journalPath)) return res.status(404).send("Not found");
     let journal;
-    try { journal = JSON.parse(fs.readFileSync(journalPath, "utf8")); } catch { return res.status(409).send("Status unavailable"); }
+    try { journal = readWebDavMoveJournal(journalPath); } catch { return res.status(409).send("Status unavailable"); }
     if (!isSafeWebDavMoveJournal(journal)) return res.status(409).send("Status unavailable");
     const cloud = journal.cloud || {};
     return res.json({ transactionId: journal.transactionId, phase: journal.phase, state: cloud.state || journal.phase, provider: cloud.provider || null, attempts: cloud.attempts || 0, maxAttempts: cloud.maxAttempts || WEBDAV_MOVE_RECONCILIATION_MAX_ATTEMPTS, lastAttemptAt: cloud.lastAttemptAt || null, nextAttemptAt: cloud.nextAttemptAt || null, failureCategory: cloud.failureCategory || null, completedAt: cloud.completedAt || null, terminalAt: cloud.terminalAt || null, transitions: Array.isArray(cloud.transitions) ? cloud.transitions : [] });
@@ -7312,7 +9375,17 @@ function registerWebDavRoutes() {
       const segments = parseWebDavSegments(req);
       if (!segments) return res.status(404).send("Not found");
 
-      if (req.method === "PROPFIND") return sendWebDavPropfind(req, res, segments);
+      if (req.method === "PROPFIND") return webDavPropfindRateLimit(req, res, (error) => {
+        const sendFailure = (failure) => {
+          auditLog("webdav.error", getAuditActor(req), { type: "webdav", id: getSafeWebDavAuditPath(req) }, req.method, "failure", {
+            error: failure.message,
+            path: getSafeWebDavAuditPath(req),
+          });
+          return res.status(failure.message.includes("Caminho WebDAV") ? 400 : 500).send("WebDAV request failed");
+        };
+        if (error) return sendFailure(error);
+        return sendWebDavPropfind(req, res, segments).catch(sendFailure);
+      });
       if (req.method === "GET") return sendWebDavFile(req, res, segments, false);
       if (req.method === "HEAD") return sendWebDavFile(req, res, segments, true);
       if (req.method === "PUT") return handleWebDavPut(req, res, segments);
@@ -7421,7 +9494,7 @@ function sortSearchResults(files, sortBy, sortOrder) {
   return sorted;
 }
 
-app.get("/list", authenticate, requirePermission("listFiles"), async (req, res) => {
+app.get("/list", fileListRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
   if (!folder) return;
 
@@ -7461,7 +9534,7 @@ async function handleFileSearch(req, res) {
   }
 }
 
-app.get("/versions/:filename", authenticate, requirePermission("listFiles"), (req, res) => {
+app.get("/versions/:filename", versionsRateLimit, authenticate, requirePermission("listFiles"), (req, res) => {
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
@@ -7469,6 +9542,10 @@ app.get("/versions/:filename", authenticate, requirePermission("listFiles"), (re
 
   if (!rawName || name !== rawName) {
     return res.status(400).json({ error: "Nome de arquivo invalido" });
+  }
+
+  if (isFileInTrash(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
   const filePath = path.join(folder.uploadDir, name);
@@ -7480,7 +9557,7 @@ app.get("/versions/:filename", authenticate, requirePermission("listFiles"), (re
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
 
-  const { history } = ensureVersionHistory(folder, name, normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, name)).owner, "Versao inicial");
+  const history = getVersionHistory(folder.id, name);
   const owner = normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, name)).owner;
   res.json({
     folderId: folder.id,
@@ -7491,6 +9568,33 @@ app.get("/versions/:filename", authenticate, requirePermission("listFiles"), (re
     versions: history.versions.slice().sort((a, b) => b.version - a.version),
     actionHistory: getActionHistoryForFile(folder.id, name),
   });
+});
+
+
+app.post("/versions/:filename/initialize", versionsRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
+  const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
+  const name = path.basename(rawName);
+  const folder = getReadableFolderOrRespond(req, res, req.query.folderId);
+  if (!folder) return;
+  if (!rawName || name !== rawName) return res.status(400).json({ error: "Nome de arquivo invalido" });
+  if (isFileInTrash(folder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (!hasFileAccess(req, folder, name)) return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  const filePath = path.join(folder.uploadDir, name);
+  if (!isExistingFile(filePath)) {
+    if (!isCloudStorageEnabled()) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (!consumeCloudMetadataRateLimit(req, res)) return;
+    await ensureCloudFileCached(folder.id, name, filePath, "uploads", () => !isFileInTrash(folder.id, name));
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name)) return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  if (!isFolderAvailable(currentFolder.id) || isFileInTrash(currentFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (isFileExpired(currentFolder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+  if (!isExistingFile(filePath)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  const currentFolderWithPaths = { ...currentFolder, ...ensureFolderDirectories(currentFolder.id) };
+  const { history } = ensureVersionHistory(currentFolderWithPaths, name, normalizeFilePermissionEntry(getFilePermissionEntry(currentFolder.id, name)).owner, "Versao inicial");
+  return res.json({ folderId: folder.id, fileName: name, currentVersion: history.currentVersion });
 });
 
 app.get("/download/:filename/v/:version", authenticate, requirePermission("listFiles"), async (req, res) => {
@@ -7504,26 +9608,42 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
     return res.status(400).json({ error: "Versao invalida" });
   }
 
-  if (!hasFileAccess(req, folder, name)) {
-    return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  if (isFileInTrash(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
 
-  const target = getVersionFilePath(folder, name, versionNumber);
-  if (target?.version?.storedAs) {
-    await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads");
-  }
-  if (!target || !isExistingFile(target.filePath)) {
-    return res.status(404).json({ error: "Versao nao encontrada" });
+  if (!hasFileAccess(req, folder, name)) {
+    return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
 
   if (getEncryptedFileMetadata(folder.id, name)) {
     return res.status(403).json({ error: "Download de versoes criptografadas exige a versao atual da rota segura" });
   }
 
+  const target = getVersionFilePath(folder, name, versionNumber);
+  if (target?.version?.storedAs) {
+    if (isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+    await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads", () => !isFileInTrash(folder.id, name), name);
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  if (target?.version?.storedAs && isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name)) return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  if (getEncryptedFileMetadata(folder.id, name)) return res.status(403).json({ error: "Download de versoes criptografadas exige a versao atual da rota segura" });
+  if (!isFolderAvailable(folder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (isFileExpired(folder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+  if (isFileInTrash(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+  if (!target || !isExistingFile(target.filePath)) {
+    return res.status(404).json({ error: "Versao nao encontrada" });
+  }
+
   sendOptimizedFile(req, res, target.filePath, name, "attachment");
 });
 
-app.post("/version-open-token", authenticate, requirePermission("listFiles"), async (req, res) => {
+app.post("/version-open-token", versionOpenTokenRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const versionNumber = Number(req.body.version);
@@ -7534,22 +9654,47 @@ app.post("/version-open-token", authenticate, requirePermission("listFiles"), as
     return res.status(400).json({ error: "Versao invalida" });
   }
 
+  if (isFileInTrash(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+
   if (!hasFileAccess(req, folder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
 
+  if (getEncryptedFileMetadata(folder.id, name)) {
+    return res.status(403).json({ error: "Download de versoes criptografadas exige a versao atual da rota segura" });
+  }
+
   const target = getVersionFilePath(folder, name, versionNumber);
   if (target?.version?.storedAs) {
-    await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads");
+    if (restoreProviderOrphans.isSuppressed(folder.id, target.version.storedAs) && !canManageAccess(req)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+    if (isCloudStorageEnabled() && !isExistingFile(target.filePath) && !consumeCloudMetadataRateLimit(req, res)) return;
+    await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads", () => !isFileInTrash(folder.id, name), name);
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  if (target?.version?.storedAs && restoreProviderOrphans.isSuppressed(folder.id, target.version.storedAs) && !canManageAccess(req)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+  const currentFolder = getFolderById(folder.id);
+  if (!currentFolder || !hasFolderAccess(req, currentFolder)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name)) return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  if (getEncryptedFileMetadata(folder.id, name)) return res.status(403).json({ error: "Download de versoes criptografadas exige a versao atual da rota segura" });
+  if (!isFolderAvailable(folder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+  if (isFileExpired(folder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+  if (isFileInTrash(folder.id, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
   if (!target || !isExistingFile(target.filePath)) {
     return res.status(404).json({ error: "Versao nao encontrada" });
   }
 
+  const managerReviewUsername = target?.version?.storedAs && restoreProviderOrphans.isSuppressed(folder.id, target.version.storedAs)
+    ? req.user.username
+    : null;
   const openToken = createOpenFileToken(folder.id, name, {
     filePath: target.filePath,
     downloadName: name,
     cloudFileName: target.version.storedAs,
+    managerReviewUsername,
   });
 
   res.json({
@@ -7569,88 +9714,120 @@ app.post("/restore/:filename/v/:version", authenticate, async (req, res) => {
     return res.status(400).json({ error: "Versao invalida" });
   }
 
-  if (!hasFileEditAccess(req, folder, name)) {
-    return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
-  }
+  if (isFileInTrash(folder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (!hasFileEditAccess(req, folder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
 
-  const entries = loadFileVersions();
-  const key = getFileVersionKey(folder.id, name);
-  const history = normalizeVersionHistory(entries[key]);
-  const target = history.versions.find((item) => item.version === versionNumber);
+  return runCloudFileLifecycleMutation(folder.id, name, async () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    let currentFolder = getReadableFolderOrRespond(req, res, folder.id);
+    if (!currentFolder) return;
+    if (isFileInTrash(currentFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (isFileExpired(currentFolder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+    if (!hasFileEditAccess(req, currentFolder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
 
-  if (!target) {
-    return res.status(404).json({ error: "Versao nao encontrada" });
-  }
+    const entries = loadFileVersions();
+    const key = getFileVersionKey(currentFolder.id, name);
+    const history = normalizeVersionHistory(entries[key]);
+    const target = history.versions.find((item) => item.version === versionNumber);
+    if (!target) return res.status(404).json({ error: "Versao nao encontrada" });
+    if (versionNumber === history.currentVersion) return res.status(400).json({ error: "Esta versao ja e a atual" });
+    if (isRestoreProviderOrphanDenied(req, currentFolder.id, target.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+    if (isCloudStorageEnabled() && !consumeCloudMetadataRateLimit(req, res)) return;
 
-  if (versionNumber === history.currentVersion) {
-    return res.status(400).json({ error: "Esta versao ja e a atual" });
-  }
+    const currentPath = path.join(currentFolder.uploadDir, name);
+    const targetPath = path.join(currentFolder.uploadDir, target.storedAs);
+    await ensureCloudFileCached(currentFolder.id, name, currentPath, "uploads", () => !isFileInTrash(currentFolder.id, name));
+    if (isRestoreProviderOrphanDenied(req, currentFolder.id, target.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+    await ensureCloudFileCached(currentFolder.id, target.storedAs, targetPath, "uploads", () => !isFileInTrash(currentFolder.id, name), name);
+    if (isRestoreProviderOrphanDenied(req, currentFolder.id, target.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
+    if (!refreshAuthenticatedUser(req, res)) return;
+    currentFolder = getReadableFolderOrRespond(req, res, currentFolder.id);
+    if (!currentFolder) return;
+    if (!req.user?.permissions?.listFiles || !hasFileEditAccess(req, currentFolder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (!isFolderAvailable(currentFolder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (isFileExpired(currentFolder.id, name)) return res.status(410).json({ error: "Arquivo expirado" });
+    if (isFileInTrash(currentFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (!isExistingFile(currentPath) || !isExistingFile(targetPath)) return res.status(404).json({ error: "Arquivo da versao nao encontrado" });
 
-  const currentPath = path.join(folder.uploadDir, name);
-  const targetPath = path.join(folder.uploadDir, target.storedAs);
-  await ensureCloudFileCached(folder.id, name, currentPath, "uploads");
-  await ensureCloudFileCached(folder.id, target.storedAs, targetPath, "uploads");
-  if (!isExistingFile(currentPath) || !isExistingFile(targetPath)) {
-    return res.status(404).json({ error: "Arquivo da versao nao encontrado" });
-  }
-
-  try {
-    const oldCurrentVersion = history.currentVersion;
-    const archivedName = getStoredVersionName(name, oldCurrentVersion);
-    const archivedPath = path.join(folder.uploadDir, archivedName);
-
-    fs.renameSync(currentPath, archivedPath);
-    for (const version of history.versions) {
-      if (version.version === oldCurrentVersion) {
-        version.storedAs = archivedName;
-        version.size = fs.statSync(archivedPath).size;
+    let restoreStagePath = null;
+    let archivedPath = null;
+    let currentArchived = false;
+    let restoredCurrentInstalled = false;
+    let localRestoreCommitted = false;
+    let cloudMutationPreparation = null;
+    let cloudPrunePreparation = null;
+    try {
+      const oldCurrentVersion = history.currentVersion;
+      const archivedName = getStoredVersionName(name, oldCurrentVersion);
+      archivedPath = path.join(currentFolder.uploadDir, archivedName);
+      if (fs.existsSync(archivedPath)) return res.status(409).json({ error: "Arquivo de versao atual ja existe" });
+      const projectedNewVersion = oldCurrentVersion + 1;
+      if (isCloudStorageEnabled()) {
+        cloudMutationPreparation = prepareCloudUploadMutations(currentFolder.id, getRestoredVersionCloudMutationNames(
+          currentFolder,
+          name,
+          key,
+          history,
+          archivedName,
+          projectedNewVersion,
+          fs.statSync(targetPath).size,
+          fs.statSync(currentPath).size,
+        ));
       }
+      restoreStagePath = path.join(currentFolder.uploadDir, `.rootark-restore-${crypto.randomBytes(12).toString("hex")}.tmp`);
+      fs.copyFileSync(targetPath, restoreStagePath, fs.constants.COPYFILE_EXCL);
+      fs.renameSync(currentPath, archivedPath);
+      currentArchived = true;
+      fs.renameSync(restoreStagePath, currentPath);
+      restoreStagePath = null;
+      restoredCurrentInstalled = true;
+      for (const version of history.versions) {
+        if (version.version === oldCurrentVersion) {
+          version.storedAs = archivedName;
+          version.size = fs.statSync(archivedPath).size;
+        }
+      }
+      const stats = fs.statSync(currentPath);
+      const newVersion = projectedNewVersion;
+      history.currentVersion = newVersion;
+      history.versions.push({
+        version: newVersion,
+        storedAs: name,
+        uploadedBy: req.user.username,
+        uploadedAt: new Date().toISOString(),
+        size: stats.size,
+        comment: `Restaurado da versao ${versionNumber}`,
+      });
+      entries[key] = history;
+      const prunedStoredNames = pruneFileVersions(entries, key);
+      cloudPrunePreparation = prepareCloudUploadAbsenceMutations(currentFolder.id, name, prunedStoredNames);
+      saveFileVersions(entries, { tolerateLegacyJsonMirrorFailure: true });
+      localRestoreCommitted = true;
+      deletePrunedFileVersions(currentFolder, key, prunedStoredNames, cloudPrunePreparation?.queued);
+      if (cloudMutationPreparation?.queued) processCloudUploadMutationsLater();
+      addActionHistory("version_restored", name, req.user.username, { folderId: currentFolder.id, folderName: currentFolder.name, restoredVersion: versionNumber, newVersion });
+      logAnalyticsEvent("restore", { filename: name, restoredBy: req.user.username, restoredVersion: versionNumber, newVersion, folderId: currentFolder.id, folderName: currentFolder.name });
+      auditLog("file.version.restore", getAuditActor(req), { type: "file", id: name }, "restored", "success", { folderId: currentFolder.id, restoredVersion: versionNumber, newVersion });
+      return res.json({ message: "Versao restaurada", version: newVersion, restoredVersion: versionNumber });
+    } catch (error) {
+      if (!localRestoreCommitted && cloudMutationPreparation) cloudMutationPreparation.rollback();
+      if (!localRestoreCommitted && cloudPrunePreparation) cloudPrunePreparation.rollback();
+      if (!localRestoreCommitted && currentArchived) {
+        try {
+          if (restoredCurrentInstalled && isExistingFile(currentPath)) fs.rmSync(currentPath, { force: true });
+          if (!isExistingFile(currentPath)) fs.renameSync(archivedPath, currentPath);
+        } catch (rollbackError) {
+          console.error("Erro ao restaurar arquivo apos falha de versao:", sanitizeLogValue(rollbackError.message));
+        }
+      }
+      if (restoreStagePath) fs.rmSync(restoreStagePath, { force: true });
+      console.error("Erro ao restaurar versao:", error.message);
+      return res.status(500).json({ error: "Erro ao restaurar versao" });
     }
-
-    fs.copyFileSync(targetPath, currentPath);
-    const stats = fs.statSync(currentPath);
-    const newVersion = oldCurrentVersion + 1;
-    history.currentVersion = newVersion;
-    history.versions.push({
-      version: newVersion,
-      storedAs: name,
-      uploadedBy: req.user.username,
-      uploadedAt: new Date().toISOString(),
-      size: stats.size,
-      comment: `Restaurado da versao ${versionNumber}`,
-    });
-
-    entries[key] = history;
-    pruneFileVersions(entries, key, folder);
-    saveFileVersions(entries);
-    syncFileVersionsToCloud(folder.id, name);
-    addActionHistory("version_restored", name, req.user.username, {
-      folderId: folder.id,
-      folderName: folder.name,
-      restoredVersion: versionNumber,
-      newVersion,
-    });
-    logAnalyticsEvent("restore", {
-      filename: name,
-      restoredBy: req.user.username,
-      restoredVersion: versionNumber,
-      newVersion,
-      folderId: folder.id,
-      folderName: folder.name,
-    });
-    auditLog("file.version.restore", getAuditActor(req), { type: "file", id: name }, "restored", "success", {
-      folderId: folder.id,
-      restoredVersion: versionNumber,
-      newVersion,
-    });
-    res.json({ message: "Versao restaurada", version: newVersion, restoredVersion: versionNumber });
-  } catch (error) {
-    console.error("Erro ao restaurar versao:", error.message);
-    res.status(500).json({ error: "Erro ao restaurar versao" });
-  }
+  }, res);
 });
 
-app.delete("/versions/:filename/v/:version", authenticate, requirePermission("delete"), (req, res) => {
+app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, requirePermission("delete"), async (req, res) => {
   const rawName = typeof req.params.filename === "string" ? req.params.filename.trim() : "";
   const name = path.basename(rawName);
   const versionNumber = Number(req.params.version);
@@ -7661,46 +9838,38 @@ app.delete("/versions/:filename/v/:version", authenticate, requirePermission("de
     return res.status(400).json({ error: "Versao invalida" });
   }
 
-  const owner = normalizeFilePermissionEntry(getFilePermissionEntry(folder.id, name)).owner;
-  if (!canManageAccess(req) && owner !== req.user?.username) {
-    return res.status(403).json({ error: "Apenas o dono ou admin pode deletar versoes" });
-  }
+  return runCloudFileLifecycleMutation(folder.id, name, async () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    if (!req.user?.permissions?.delete) return res.status(403).json({ error: "Permissao negada: delete" });
+    const currentFolder = getReadableFolderOrRespond(req, res, folder.id);
+    if (!currentFolder) return;
+    if (isFileInTrash(currentFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    const owner = normalizeFilePermissionEntry(getFilePermissionEntry(currentFolder.id, name)).owner;
+    if (!canManageAccess(req) && owner !== req.user?.username) return res.status(403).json({ error: "Apenas o dono ou admin pode deletar versoes" });
 
-  const entries = loadFileVersions();
-  const key = getFileVersionKey(folder.id, name);
-  const history = normalizeVersionHistory(entries[key]);
-  const target = history.versions.find((item) => item.version === versionNumber);
+    const entries = loadFileVersions();
+    const key = getFileVersionKey(currentFolder.id, name);
+    const history = normalizeVersionHistory(entries[key]);
+    const target = history.versions.find((item) => item.version === versionNumber);
+    if (!target) return res.status(404).json({ error: "Versao nao encontrada" });
+    if (versionNumber === history.currentVersion) return res.status(400).json({ error: "A versao atual nao pode ser deletada" });
 
-  if (!target) {
-    return res.status(404).json({ error: "Versao nao encontrada" });
-  }
-
-  if (versionNumber === history.currentVersion) {
-    return res.status(400).json({ error: "A versao atual nao pode ser deletada" });
-  }
-
-  fs.rmSync(path.join(folder.uploadDir, target.storedAs), { force: true });
-  deleteCloudFileLater(folder.id, target.storedAs, "uploads");
-  history.versions = history.versions.filter((item) => item.version !== versionNumber);
-  entries[key] = history;
-  saveFileVersions(entries);
-  addActionHistory("version_deleted", name, req.user.username, {
-    folderId: folder.id,
-    folderName: folder.name,
-    version: versionNumber,
-  });
-  logAnalyticsEvent("versionDeletion", {
-    filename: name,
-    deletedBy: req.user.username,
-    version: versionNumber,
-    folderId: folder.id,
-    folderName: folder.name,
-  });
-  auditLog("file.version.delete", getAuditActor(req), { type: "file", id: name }, "deleted", "success", {
-    folderId: folder.id,
-    version: versionNumber,
-  });
-  res.json({ message: "Versao deletada" });
+    const cloudDeletePreparation = prepareCloudUploadAbsenceMutations(currentFolder.id, name, [target.storedAs]);
+    try {
+      fs.rmSync(path.join(currentFolder.uploadDir, target.storedAs), { force: true });
+    } catch (error) {
+      cloudDeletePreparation.rollback();
+      throw error;
+    }
+    history.versions = history.versions.filter((item) => item.version !== versionNumber);
+    entries[key] = history;
+    saveFileVersions(entries);
+    if (cloudDeletePreparation.queued) processCloudUploadMutationsLater();
+    addActionHistory("version_deleted", name, req.user.username, { folderId: currentFolder.id, folderName: currentFolder.name, version: versionNumber });
+    logAnalyticsEvent("versionDeletion", { filename: name, deletedBy: req.user.username, version: versionNumber, folderId: currentFolder.id, folderName: currentFolder.name });
+    auditLog("file.version.delete", getAuditActor(req), { type: "file", id: name }, "deleted", "success", { folderId: currentFolder.id, version: versionNumber });
+    return res.json({ message: "Versao deletada" });
+  }, res);
 });
 
 app.get("/history", authenticate, requirePermission("listFiles"), (req, res) => {
@@ -7741,7 +9910,9 @@ registerBackupRoutes(app, {
   backupService,
   getAuditActor,
   requireBackupAccess,
+  revalidateBackupAccess,
   restoreService,
+  waitForRequestQuiescence: (requestLeasePath) => restoreRequestGate.waitForQuiescence(requestLeasePath),
 });
 
 registerTrashRoutes(app, {
@@ -7753,6 +9924,7 @@ registerTrashRoutes(app, {
   canRestoreTrashItem,
   deleteCloudTrashItem,
   deleteCloudTrashItemLater,
+  processCloudTrashDeletion,
   ensureFolderDirectories,
   getAuditActor,
   getCloudStorageStatus,
@@ -7762,19 +9934,23 @@ registerTrashRoutes(app, {
   isCloudStorageEnabled,
   requirePermission,
   requireTrashManageAccess,
+  refreshAuthenticatedUser,
+  revalidateTrashManageAccess,
+  runCloudFileLifecycleMutation,
+  runCloudFolderLifecycleMutation,
   rootFolderId: ROOT_FOLDER_ID,
   serializeTrashItemForUser,
   trashRepository,
   trashService,
 });
 
-app.post("/share", authenticate, requirePermission("listFiles"), (req, res) => {
+app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const expiresInMinutes = getShareExpirationMinutes(req.body.expiresInMinutes);
   const maxViews = getShareMaxViews(req.body.maxViews);
   const maxDownloads = getShareMaxDownloads(req.body.maxDownloads);
-  const passwordHash = getSharePasswordHash(req.body.password);
+  const sharePassword = getSharePassword(req.body.password);
   const folder = getReadableFolderOrRespond(req, res, req.body.folderId);
   if (!folder) return;
 
@@ -7804,30 +9980,54 @@ app.post("/share", authenticate, requirePermission("listFiles"), (req, res) => {
     });
   }
 
-  if (passwordHash === undefined) {
+  if (sharePassword === undefined) {
     return res.status(400).json({ error: "Senha do link deve ter entre 4 e 128 caracteres." });
   }
 
-  const filePath = path.join(folder.uploadDir, name);
-  if (!isExistingFile(filePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (!hasPublicShareAccess(req, folder, name)) {
+    return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
 
-  if (!hasFileAccess(req, folder, name)) {
+  return runCloudFileLifecycleMutation(folder.id, name, async () => {
+  if (!hasPublicShareAccess(req, folder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
 
   if (getEncryptedFileMetadata(folder.id, name)) {
     return res.status(403).json({ error: "Links publicos nao estao disponiveis para arquivos criptografados" });
   }
-
+  if (!consumeCloudMetadataRateLimit(req, res)) return;
+  if (!await getListedFileDetails(folder, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const currentFolderRecord = getFolderById(folder.id);
+  const currentFolder = currentFolderRecord && { ...currentFolderRecord, ...ensureFolderDirectories(currentFolderRecord.id) };
+  if (!currentFolder || !req.user?.permissions?.listFiles || !hasPublicShareAccess(req, currentFolder, name)) {
+    return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  }
+  if (getEncryptedFileMetadata(folder.id, name)) {
+    return res.status(403).json({ error: "Links publicos nao estao disponiveis para arquivos criptografados" });
+  }
+  const passwordHash = sharePassword ? bcrypt.hashSync(sharePassword, 10) : null;
+  if (!await getListedFileDetails(currentFolder, name) || !hasPublicShareAccess(req, currentFolder, name)) {
+    return res.status(404).json({ error: "Arquivo nao encontrado" });
+  }
+  if (!refreshAuthenticatedUser(req, res)) return;
+  const finalFolderRecord = getFolderById(folder.id);
+  const finalFolder = finalFolderRecord && { ...finalFolderRecord, ...ensureFolderDirectories(finalFolderRecord.id) };
+  if (!finalFolder || !isFolderAvailable(finalFolder.id) || !req.user?.permissions?.listFiles || !hasPublicShareAccess(req, finalFolder, name)) {
+    return res.status(403).json({ error: "Acesso negado a este arquivo" });
+  }
+  if (getEncryptedFileMetadata(finalFolder.id, name)) {
+    return res.status(403).json({ error: "Links publicos nao estao disponiveis para arquivos criptografados" });
+  }
   const links = cleanupExpiredPublicLinks();
   const shareToken = crypto.randomBytes(24).toString("hex");
   const expiresAt = new Date(Date.now() + expiresInMinutes * 60 * 1000).toISOString();
-
   links[shareToken] = {
     fileName: name,
-    folderId: folder.id,
+    folderId: finalFolder.id,
     createdAt: new Date().toISOString(),
     expiresAt,
     createdBy: req.user.username,
@@ -7838,18 +10038,17 @@ app.post("/share", authenticate, requirePermission("listFiles"), (req, res) => {
     passwordHash,
     activeViewers: {},
   };
-
   savePublicLinks(links);
   addActionHistory("share_created", name, req.user.username, {
     expiresAt,
-    folderId: folder.id,
-    folderName: folder.name,
+    folderId: currentFolder.id,
+    folderName: currentFolder.name,
     maxViews,
     maxDownloads,
     passwordProtected: Boolean(passwordHash),
   });
   auditLog("share.created", getAuditActor(req), { type: "file", id: name }, "created", "success", {
-    folderId: folder.id,
+    folderId: currentFolder.id,
     token: shareToken,
     expiresAt,
     maxViews,
@@ -7869,9 +10068,10 @@ app.post("/share", authenticate, requirePermission("listFiles"), (req, res) => {
     remainingViews: maxViews > 0 ? maxViews : null,
     remainingDownloads: maxDownloads > 0 ? maxDownloads : null,
   });
+  }, res);
 });
 
-app.get("/share/:token", (req, res) => {
+app.get("/share/:token", shareRateLimit, (req, res) => {
   const shareToken = String(req.params.token || "");
   if (!/^[a-f0-9]{48}$/i.test(shareToken)) {
     return res.status(404).type("html").send(getShareFailurePage("Este link nao esta disponivel."));
@@ -7885,15 +10085,13 @@ app.get("/share/:token", (req, res) => {
 
   const expiresAt = new Date(link.expiresAt).getTime();
   if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
-    delete links[shareToken];
-    savePublicLinks(links);
     return res.status(410).type("html").send(getShareFailurePage("Este link nao esta disponivel."));
   }
 
   res.type("html").send(renderPublicSharePage(shareToken));
 });
 
-app.post("/share/:token/password", async (req, res) => {
+app.post("/share/:token/password", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
 
@@ -7912,7 +10110,34 @@ app.post("/share/:token/password", async (req, res) => {
   res.json(getSharePublicPayload(access.link, access.fileInfo, access.limits));
 });
 
-app.post("/share/:token/view", async (req, res) => {
+app.get("/share/:token/status", shareRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).type("text/plain").send("Metodo nao permitido"));
+
+app.post("/share/:token/status", shareRateLimit, requireSameOriginPublicShareMutation, (req, res) => {
+  const shareToken = validateShareToken(req.params.token);
+  if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
+
+  const link = loadPublicLinks()[shareToken];
+  if (!link) return res.status(404).json({ error: "Link indisponivel." });
+
+  const expiresAt = new Date(link.expiresAt).getTime();
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+    logShareAudit(req, "share.expired", shareToken, link, "expired", "failure");
+    return res.status(410).json({ error: "Link indisponivel." });
+  }
+
+  const passwordHash = link.passwordHash || link.password_hash || null;
+  if (passwordHash && !hasValidSharePasswordSession(req, shareToken, link)) {
+    return res.status(401).json({ error: "Senha obrigatoria.", passwordRequired: true });
+  }
+  if (getShareAccessCookieRequired(link, true) && !getActiveShareViewer(req, shareToken, link)) {
+    return res.status(403).json({ error: "Abra a pagina do compartilhamento novamente." });
+  }
+
+  const limits = getShareLimitState(link);
+  return res.json({ remainingViews: limits.remainingViews, remainingDownloads: limits.remainingDownloads });
+});
+
+app.post("/share/:token/view", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
 
@@ -7922,38 +10147,72 @@ app.post("/share/:token/view", async (req, res) => {
   res.json({
     ...getSharePublicPayload(access.link, access.fileInfo, access.limits),
     url: `/share/${shareToken}/file`,
+    urlMethod: "POST",
   });
 });
 
-app.get("/share/:token/download", async (req, res) => {
+app.get("/share/:token/download", shareRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).type("text/plain").send("Metodo nao permitido"));
+
+app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).type("html").send(getShareFailurePage("Este link nao esta disponivel."));
 
   const access = await resolveShareAccess(req, res, shareToken, {
     requireViewer: true,
     countDownload: true,
+    deferDownloadReservation: true,
   });
   if (access.error) return res.status(access.status || 400).type("html").send(getShareFailurePage(access.error));
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "attachment", {
     cacheControl: "private, max-age=600",
+    beforeSend: () => {
+      const rejection = access.reserveDownload();
+      if (!rejection) setShareDownloadReceiptCookie(req, res, shareToken);
+      return rejection;
+    },
+    onBeforeSendReject: (failure) => res.status(failure.status || 400).type("html").send(getShareFailurePage(failure.error)),
   });
 });
 
-app.get("/share/:token/preview", async (req, res) => {
+app.get("/share/:token/preview", shareRateLimit, requireSameOriginPublicSharePreview, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
+  if (req.method === "HEAD") return res.setHeader("Allow", "GET, POST").status(405).type("text/plain").send("Metodo nao permitido");
 
-  const access = await resolveShareAccess(req, res, shareToken, { requireViewer: true });
+  const access = await resolveShareAccess(req, res, shareToken, {
+    requireViewer: true,
+    requirePreview: true,
+    countDownloadOncePerViewer: true,
+    requireDownloadCountedViewer: true,
+  });
   if (access.error) return res.status(access.status || 400).send(access.error);
-  if (!getPublicShareCanPreview(access.fileInfo.fileName)) return res.status(415).send("Preview indisponivel");
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "inline", {
     cacheControl: "private, max-age=600",
   });
 });
 
-app.get("/share/:token/qr", async (req, res) => {
+app.post("/share/:token/preview", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
+  const shareToken = validateShareToken(req.params.token);
+  if (!shareToken) return res.status(404).send("Link indisponivel.");
+
+  const access = await resolveShareAccess(req, res, shareToken, {
+    requireViewer: true,
+    requirePreview: true,
+    countDownload: true,
+    countDownloadOncePerViewer: true,
+    deferDownloadReservation: true,
+  });
+  if (access.error) return res.status(access.status || 400).send(access.error);
+
+  sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "inline", {
+    cacheControl: "private, max-age=600",
+    beforeSend: access.reserveDownload,
+  });
+});
+
+app.get("/share/:token/qr", shareRateLimit, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
 
@@ -7972,16 +10231,35 @@ app.get("/share/:token/qr", async (req, res) => {
   }
 });
 
-app.get("/share/:token/file", async (req, res) => {
+app.get("/share/:token/file", shareRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).type("text/plain").send("Metodo nao permitido"));
+
+app.post("/share/:token/file", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).send("Link indisponivel.");
 
-  const access = await resolveShareAccess(req, res, shareToken, { requireViewer: true });
+  const access = await resolveShareAccess(req, res, shareToken, {
+    requireViewer: true,
+    countDownload: true,
+    deferDownloadReservation: true,
+  });
   if (access.error) return res.status(access.status || 400).send(access.error);
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "inline", {
     cacheControl: "private, max-age=600",
+    beforeSend: access.reserveDownload,
+    onBeforeSendReject: (failure) => res.status(failure.status || 400).send(failure.error),
   });
+});
+
+app.post("/pending/repair", pendingRepairRateLimit, authenticate, async (req, res) => {
+  if (!req.user?.permissions?.listPending && !req.user?.permissions?.upload) {
+    return res.status(403).json({ error: "Permissao negada: listPending" });
+  }
+  const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
+  if (!folder) return;
+  await repairCompressedTempUploads(folder.tempDir);
+  cleanupOrphanTempUploads(folder.tempDir);
+  return res.json({ message: "Uploads pendentes verificados" });
 });
 
 app.get("/pending", authenticate, async (req, res) => {
@@ -7992,14 +10270,24 @@ app.get("/pending", authenticate, async (req, res) => {
   const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!folder) return;
 
-  await repairCompressedTempUploads(folder.tempDir);
-  cleanupOrphanTempUploads(folder.tempDir);
-  await syncFolderCacheFromCloud(folder.id, "temp");
   listFilesWithDetails(folder.tempDir, (err, files) => {
     if (err) return res.status(500).json({ error: "Erro ao listar" });
     const encryptedFiles = loadEncryptedFiles();
 
-    const visibleFiles = files
+    const byName = new Map(files.map((file) => [file.name, file]));
+    try {
+      for (const [key, entry] of Object.entries(loadPendingUploads())) {
+        const name = path.basename(entry?.fileName || key);
+        const entryFolderId = entry?.folderId || (String(key).includes("/") ? String(key).split("/")[0] : ROOT_FOLDER_ID);
+        if (entryFolderId !== folder.id || !name || !restoreProviderOrphans.isSuppressed(folder.id, name, "temp")) continue;
+        const existing = byName.get(name);
+        byName.set(name, { ...(existing || { name, size: 0, modified: null }), restoreOrphan: true, availability: "recovery_required" });
+      }
+    } catch {
+      return res.status(503).set("Retry-After", "5").json({ error: "Pending files temporarily unavailable" });
+    }
+
+    const visibleFiles = [...byName.values()]
       .map((file) => ({
         ...file,
         folderId: folder.id,
@@ -8039,62 +10327,132 @@ app.get("/preview/text/:scope/:name", authenticate, async (req, res) => {
   }
 });
 
-app.get("/approve/:name", authenticate, requirePermission("approve"), async (req, res) => {
+app.get("/approve/:name", approveRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
+app.post("/approve/:name", approveRateLimit, authenticate, requirePermission("approve"), async (req, res) => {
   const name = path.basename(req.params.name);
   const requestedFolder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!requestedFolder) return;
+  if (!refreshAuthenticatedUser(req, res)) return;
+  if (!req.user.permissions?.approve) return res.status(403).json({ error: "Permissao negada: approve" });
+  const target = await findPendingApprovalTarget(req, requestedFolder, name, { allowRestoreOrphan: true });
+  if (!target) return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
+  if (target.restoreOrphan) return res.status(409).json({ error: "Payload pendente nao consta no backup restaurado; rejeite ou envie novamente" });
 
   try {
-    const target = await findPendingApprovalTarget(req, requestedFolder, name);
-    if (!target) {
-      return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
-    }
+    return runCloudFileLifecycleMutation(target.folder.id, name, async () => {
+      if (!refreshAuthenticatedUser(req, res)) return;
+      if (!req.user.permissions?.approve) return res.status(403).json({ error: "Permissao negada: approve" });
+      let folder = getApprovalFolderById(target.folder.id);
+      if (!folder || !isFolderAvailable(folder.id) || (!canManageAccess(req) && !hasFolderAccess(req, folder))) {
+        return res.status(403).json({ error: "Permissao negada para aprovar nesta pasta" });
+      }
 
-    const { folder, pendingPath } = target;
-    const pendingUploads = loadPendingUploads();
-    const key = getPendingKey(folder.id, name);
-    const pendingEntry = pendingUploads[key] || pendingUploads[name] || {};
-    const uploadedBy = pendingEntry.uploadedBy || null;
-    const versionInfo = recordApprovedFileVersion(
-      folder,
-      name,
-      pendingPath,
-      uploadedBy || req.user.username,
-      pendingEntry.versionComment || ""
-    );
-    promoteEncryptedMetadataAfterApproval(folder.id, name, uploadedBy || req.user.username);
-    syncFileVersionsToCloud(folder.id, name);
-    deleteCloudFileLater(folder.id, name, "temp");
+      const pendingUploads = loadPendingUploads();
+      const key = getPendingKey(folder.id, name);
+      const pendingEntry = getPendingUploadEntry(folder.id, name, pendingUploads);
+      if (!pendingEntry) return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
+      if (restoreProviderOrphans.isSuppressed(folder.id, name, "temp")) {
+        return res.status(409).json({ error: "Payload pendente nao consta no backup restaurado; rejeite ou envie novamente" });
+      }
+      const pendingPath = path.join(folder.tempDir, name);
+      if (!isExistingFile(pendingPath)) await ensureCloudFileCached(folder.id, name, pendingPath, "temp");
+      if (!refreshAuthenticatedUser(req, res)) return;
+      if (!req.user.permissions?.approve) return res.status(403).json({ error: "Permissao negada: approve" });
+      folder = getApprovalFolderById(target.folder.id);
+      if (!folder || !isFolderAvailable(folder.id) || (!canManageAccess(req) && !hasFolderAccess(req, folder))) {
+        return res.status(403).json({ error: "Permissao negada para aprovar nesta pasta" });
+      }
+      const refreshedPendingEntry = getPendingUploadEntry(folder.id, name);
+      if (restoreProviderOrphans.isSuppressed(folder.id, name, "temp")) {
+        return res.status(409).json({ error: "Payload pendente nao consta no backup restaurado; rejeite ou envie novamente" });
+      }
+      if (!isExistingFile(path.join(folder.tempDir, name)) || !refreshedPendingEntry) {
+        return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
+      }
 
-    delete pendingUploads[key];
-    if (folder.id === ROOT_FOLDER_ID) delete pendingUploads[name];
-    savePendingUploads(pendingUploads);
-    setFileOwner(folder.id, name, uploadedBy);
-    logAnalyticsEvent("approval", {
-      filename: name,
-      approvedBy: req.user.username,
-      folderId: folder.id,
-      folderName: folder.name,
-    });
-    auditLog("file.approve", getAuditActor(req), { type: "file", id: name }, "approved", "success", {
-      from: "temp",
-      to: "uploads",
-      folderId: folder.id,
-      version: versionInfo.currentVersion,
-    });
-    addActionHistory("approved", name, req.user.username, {
-      uploadedBy,
-      folderId: folder.id,
-      folderName: folder.name,
-      version: versionInfo.currentVersion,
-      replaced: versionInfo.replaced,
-    });
-    res.json({
-      message: "Aprovado",
-      fileName: name,
-      folderId: folder.id,
-      version: versionInfo.currentVersion,
-      replaced: versionInfo.replaced,
+      const uploadedBy = refreshedPendingEntry.uploadedBy || null;
+      const pendingTempPath = path.join(folder.tempDir, name);
+      const cloudMutations = isCloudStorageEnabled()
+        ? prepareCloudUploadMutations(folder.id, getApprovedFileCloudMutationNames(folder, name, pendingTempPath))
+        : { queued: false, rollback() {} };
+      let versionInfo;
+      try {
+        versionInfo = recordApprovedFileVersion(
+          folder,
+          name,
+          pendingTempPath,
+          uploadedBy || req.user.username,
+          refreshedPendingEntry.versionComment || ""
+        );
+      } catch (error) {
+        cloudMutations.rollback();
+        throw error;
+      }
+      let trashCancellationPending = false;
+      for (const pendingDeletion of trashRepository.listPendingFileRemoteDeletions(folder.id, name)) {
+        const remoteDeletion = pendingDeletion.metadata?.remoteDeletion;
+        try {
+          const retired = remoteDeletion?.state === "cancelled"
+            ? trashRepository.saveTrashItem({ ...pendingDeletion, status: "permanently_deleted" })
+            : trashService.cancelRemoteDeletion(pendingDeletion, "replacement_active", { status: "permanently_deleted" });
+          if (retired.metadata?.remoteDeletion?.state === "cancelled") {
+            auditLog("trash.remote_delete.cancelled", getAuditActor(req), { type: "trash", id: retired.id }, "remote_delete", "success", {
+              reason: "replacement_active",
+            });
+          }
+        } catch (error) {
+          trashCancellationPending = true;
+          auditLog("trash.remote_delete.cancellation_pending", getAuditActor(req), { type: "trash", id: pendingDeletion.id }, "remote_delete", "failure", {
+            reason: "replacement_active",
+            category: error.code || "persistence_error",
+          });
+          console.error("[cloud-trash] replacement cancellation remains pending:", error.code || "persistence_error");
+        }
+      }
+      promoteEncryptedMetadataAfterApproval(folder.id, name, uploadedBy || req.user.username);
+      const cloudSyncPending = cloudMutations.queued;
+      if (cloudSyncPending) processCloudUploadMutationsLater();
+      let cloudCleanupPending = false;
+      try {
+        await deleteCloudTempFile(folder.id, name);
+      } catch (error) {
+        cloudCleanupPending = true;
+        console.error("[cloud-temp] approval cleanup pending:", sanitizeLogValue(error.message));
+      }
+
+      delete pendingUploads[key];
+      if (folder.id === ROOT_FOLDER_ID && Object.hasOwn(pendingUploads, name)) delete pendingUploads[name];
+      savePendingUploads(pendingUploads);
+      setFileOwner(folder.id, name, uploadedBy);
+      logAnalyticsEvent("approval", {
+        filename: name,
+        approvedBy: req.user.username,
+        folderId: folder.id,
+        folderName: folder.name,
+      });
+      auditLog("file.approve", getAuditActor(req), { type: "file", id: name }, "approved", "success", {
+        from: "temp",
+        to: "uploads",
+        folderId: folder.id,
+        version: versionInfo.currentVersion,
+      });
+      addActionHistory("approved", name, req.user.username, {
+        uploadedBy,
+        folderId: folder.id,
+        folderName: folder.name,
+        version: versionInfo.currentVersion,
+        replaced: versionInfo.replaced,
+      });
+      return res.status(cloudCleanupPending || cloudSyncPending || trashCancellationPending ? 202 : 200).json({
+        message: "Aprovado",
+        fileName: name,
+        folderId: folder.id,
+        version: versionInfo.currentVersion,
+        replaced: versionInfo.replaced,
+        cloudCleanupPending,
+        cloudSyncPending,
+        trashCancellationPending,
+      });
     });
   } catch (error) {
     console.error("Erro ao aprovar arquivo:", error.message);
@@ -8102,27 +10460,65 @@ app.get("/approve/:name", authenticate, requirePermission("approve"), async (req
   }
 });
 
-app.get("/reject/:name", authenticate, requirePermission("approve"), async (req, res) => {
+app.get("/reject/:name", rejectRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
+app.post("/reject/:name", rejectRateLimit, authenticate, requirePermission("approve"), async (req, res) => {
   const name = path.basename(req.params.name);
   const requestedFolder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
   if (!requestedFolder) return;
+  if (!refreshAuthenticatedUser(req, res)) return;
+  if (!req.user.permissions?.approve) return res.status(403).json({ error: "Permissao negada: approve" });
+  const target = await findPendingApprovalTarget(req, requestedFolder, name, { allowRestoreOrphan: true });
+  if (!target) return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
 
-  const target = await findPendingApprovalTarget(req, requestedFolder, name);
-  if (!target) {
-    return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
-  }
+  return runCloudFileLifecycleMutation(target.folder.id, name, async () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    if (!req.user.permissions?.approve) return res.status(403).json({ error: "Permissao negada: approve" });
+    let folder = getApprovalFolderById(target.folder.id);
+    if (!folder || !isFolderAvailable(folder.id) || (!canManageAccess(req) && !hasFolderAccess(req, folder))) {
+      return res.status(403).json({ error: "Permissao negada para rejeitar nesta pasta" });
+    }
 
-  const { folder, pendingPath } = target;
-  fs.unlink(pendingPath, (err) => {
-    if (err) return res.status(500).json({ error: "Erro ao rejeitar" });
-
-    const pendingUploads = loadPendingUploads();
+    let pendingUploads = loadPendingUploads();
     const key = getPendingKey(folder.id, name);
-    const uploadedBy = pendingUploads[key]?.uploadedBy || pendingUploads[name]?.uploadedBy || null;
+    let pendingEntry = getPendingUploadEntry(folder.id, name, pendingUploads);
+    if (!pendingEntry) return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
+    let pendingPath = path.join(folder.tempDir, name);
+    let restoreOrphan = restoreProviderOrphans.isSuppressed(folder.id, name, "temp");
+    if (!restoreOrphan && !isExistingFile(pendingPath)) await ensureCloudFileCached(folder.id, name, pendingPath, "temp");
+    if (!refreshAuthenticatedUser(req, res)) return;
+    if (!req.user.permissions?.approve) return res.status(403).json({ error: "Permissao negada: approve" });
+    folder = getApprovalFolderById(target.folder.id);
+    if (!folder || !isFolderAvailable(folder.id) || (!canManageAccess(req) && !hasFolderAccess(req, folder))) {
+      return res.status(403).json({ error: "Permissao negada para rejeitar nesta pasta" });
+    }
+    pendingPath = path.join(folder.tempDir, name);
+    restoreOrphan = restoreProviderOrphans.isSuppressed(folder.id, name, "temp");
+    pendingUploads = loadPendingUploads();
+    pendingEntry = getPendingUploadEntry(folder.id, name, pendingUploads);
+    if ((!restoreOrphan && !isExistingFile(pendingPath)) || !pendingEntry) {
+      return res.status(404).json({ error: "Arquivo pendente nao encontrado" });
+    }
+
+    if (isExistingFile(pendingPath)) {
+      try {
+        await fs.promises.unlink(pendingPath);
+      } catch {
+        return res.status(500).json({ error: "Erro ao rejeitar" });
+      }
+    }
+
+    const uploadedBy = pendingEntry.uploadedBy || null;
     delete pendingUploads[key];
-    if (folder.id === ROOT_FOLDER_ID) delete pendingUploads[name];
+    if (folder.id === ROOT_FOLDER_ID && Object.hasOwn(pendingUploads, name)) delete pendingUploads[name];
     savePendingUploads(pendingUploads);
-    deleteCloudFileLater(folder.id, name, "temp");
+    let cloudCleanupPending = false;
+    try {
+      await deleteCloudTempFile(folder.id, name);
+      if (restoreOrphan) await restoreProviderOrphans.clear(folder.id, name, "temp", cloudStorage);
+    } catch (error) {
+      cloudCleanupPending = true;
+      console.error("[cloud-temp] rejection cleanup pending:", sanitizeLogValue(error.message));
+    }
     logAnalyticsEvent("rejection", {
       filename: name,
       rejectedBy: req.user.username,
@@ -8134,11 +10530,12 @@ app.get("/reject/:name", authenticate, requirePermission("approve"), async (req,
       uploadedBy,
     });
     addActionHistory("rejected", name, req.user.username, { uploadedBy, folderId: folder.id, folderName: folder.name });
-    res.json({ message: "Rejeitado" });
+    return res.status(cloudCleanupPending ? 202 : 200).json({ message: "Rejeitado", cloudCleanupPending });
   });
 });
 
-app.get("/delete/:name", authenticate, (req, res) => {
+app.get("/delete/:name", deleteRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).json({ error: "Metodo nao permitido" }));
+app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
   if (!isTrashEnabled()) return res.status(503).json({ error: "Lixeira desativada" });
   const name = path.basename(req.params.name);
   const folder = getAccessibleFolderOrRespond(req, res, req.query.folderId);
@@ -8152,12 +10549,27 @@ app.get("/delete/:name", authenticate, (req, res) => {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
 
-  const filePath = path.join(folder.uploadDir, name);
-  const fileSize = isExistingFile(filePath) ? fs.statSync(filePath).size : 0;
+  return runCloudFileLifecycleMutation(folder.id, name, async () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const currentFolderRecord = getFolderById(folder.id);
+    if (!currentFolderRecord || !isFolderAvailable(currentFolderRecord.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderAccess(req, currentFolderRecord)) return res.status(403).json({ error: "Acesso negado a esta pasta" });
+    if (!canMoveToTrash(req)) return res.status(403).json({ error: "Permissao negada: delete" });
+    if (!hasFileEditAccess(req, currentFolderRecord, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (isFileInTrash(currentFolderRecord.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    const currentFolder = { ...currentFolderRecord, ...ensureFolderDirectories(currentFolderRecord.id) };
+    const filePath = path.join(currentFolder.uploadDir, name);
+    await ensureCloudFileCached(folder.id, name, filePath, "uploads");
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const publishFolder = getFolderById(folder.id);
+    if (!publishFolder || !isFolderAvailable(publishFolder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderAccess(req, publishFolder) || !canMoveToTrash(req) || !hasFileEditAccess(req, publishFolder, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (isFileInTrash(publishFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    const fileSize = isExistingFile(filePath) ? fs.statSync(filePath).size : 0;
 
-  try {
+    try {
     const trashItem = trashService.moveFileToTrash({
-      folder,
+      folder: currentFolder,
       fileName: name,
       deletedBy: req.user.username,
       loaders: getTrashLoaders(),
@@ -8179,16 +10591,17 @@ app.get("/delete/:name", authenticate, (req, res) => {
     addActionHistory("deleted", name, req.user.username, { folderId: folder.id, folderName: folder.name, trashId: trashItem.id });
     broadcastDataChanged("trash", { folderId: folder.id, fileName: name, itemType: "file" });
     res.json({ message: "Movido para lixeira", trashItem: serializeTrashItemForUser(trashItem) });
-  } catch (error) {
-    auditLog("trash.delete.failed", getAuditActor(req), { type: "file", id: name }, "move_to_trash", "failure", {
-      folderId: folder.id,
-      error: error.message,
-    });
-    res.status(500).json({ error: "Erro ao mover arquivo para lixeira" });
-  }
+    } catch (error) {
+      auditLog("trash.delete.failed", getAuditActor(req), { type: "file", id: name }, "move_to_trash", "failure", {
+        folderId: folder.id,
+        error: error.message,
+      });
+      res.status(500).json({ error: "Erro ao mover arquivo para lixeira" });
+    }
+  }, res);
 });
 
-app.put("/rename", authenticate, (req, res) => {
+app.put("/rename", renameRateLimit, authenticate, async (req, res) => {
   const rawOldName = typeof req.body.oldName === "string" ? req.body.oldName.trim() : "";
   const rawNewName = typeof req.body.newName === "string" ? req.body.newName.trim() : "";
   const oldName = path.basename(rawOldName);
@@ -8212,56 +10625,74 @@ app.put("/rename", authenticate, (req, res) => {
     return res.status(400).json({ error: `O nome do arquivo deve ter no maximo ${MAX_FILE_NAME_LENGTH} caracteres` });
   }
 
-  const oldPath = path.join(folder.uploadDir, oldName);
-  const newPath = path.join(folder.uploadDir, newName);
-  const oldStoredNames = getVersionHistory(folder.id, oldName).versions
-    .map((version) => path.basename(version.storedAs || ""))
-    .filter(Boolean);
-
-  if (!fs.existsSync(oldPath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
-
   if (!hasFileEditAccess(req, folder, oldName)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
+  if (isFileInTrash(folder.id, oldName)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (isCloudStorageEnabled()) return res.status(503).json({ error: "Renomeacao em nuvem indisponivel ate a reconciliacao segura estar ativa" });
+  return runCloudFileLifecycleMutation(folder.id, oldName, async () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const currentFolderRecord = getFolderById(folder.id);
+    if (!currentFolderRecord || !isFolderAvailable(currentFolderRecord.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderAccess(req, currentFolderRecord) || !hasFileEditAccess(req, currentFolderRecord, oldName)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (isFileInTrash(currentFolderRecord.id, oldName)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    const currentFolder = { ...currentFolderRecord, ...ensureFolderDirectories(currentFolderRecord.id) };
+    const oldPath = path.join(currentFolder.uploadDir, oldName);
+    const newPath = path.join(currentFolder.uploadDir, newName);
+    await ensureCloudFileCached(folder.id, oldName, oldPath, "uploads");
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const publishFolder = getFolderById(folder.id);
+    if (!publishFolder || !isFolderAvailable(publishFolder.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderAccess(req, publishFolder) || !hasFileEditAccess(req, publishFolder, oldName)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (isFileInTrash(publishFolder.id, oldName)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (!fs.existsSync(oldPath)) return res.status(404).json({ error: "Arquivo nao encontrado" });
 
-  if (fs.existsSync(newPath)) {
-    return res.status(409).json({ error: "Ja existe um arquivo com esse nome" });
-  }
+    const oldStoredNames = getVersionHistory(currentFolder.id, oldName).versions
+      .map((version) => path.basename(version.storedAs || ""))
+      .filter(Boolean);
+    if (fs.existsSync(newPath)) return res.status(409).json({ error: "Ja existe um arquivo com esse nome" });
 
-  fs.rename(oldPath, newPath, (err) => {
-    if (err) return res.status(500).json({ error: "Erro ao renomear arquivo" });
-    renamePublicLinksForFile(oldName, newName, folder.id);
-    renameFilePermission(folder.id, oldName, newName);
-    renameFileExpiration(folder.id, oldName, newName);
-    renameFileVersions(folder.id, oldName, newName);
-    renameEncryptedMetadata(folder.id, oldName, newName);
-    for (const storedName of new Set([oldName, ...oldStoredNames])) {
-      deleteCloudFileLater(folder.id, storedName, "uploads");
+    try {
+      await fs.promises.rename(oldPath, newPath);
+    } catch {
+      return res.status(500).json({ error: "Erro ao renomear arquivo" });
     }
-    syncFileVersionsToCloud(folder.id, newName);
+    try {
+      for (const storedName of new Set([oldName, ...oldStoredNames])) {
+        await deleteFileFromCloud(folder.id, storedName, "uploads");
+      }
+    } catch {
+      try { await fs.promises.rename(newPath, oldPath); } catch {}
+      syncFileVersionsToCloud(folder.id, oldName);
+      return res.status(500).json({ error: "Erro ao renomear arquivo" });
+    }
+    renamePublicLinksForFile(oldName, newName, currentFolder.id);
+    renameFilePermission(currentFolder.id, oldName, newName);
+    renameFileExpiration(currentFolder.id, oldName, newName);
+    renameFileVersions(currentFolder.id, oldName, newName);
+    renameEncryptedMetadata(currentFolder.id, oldName, newName);
+    syncFileVersionsToCloud(currentFolder.id, newName);
     auditLog("file.rename", getAuditActor(req), { type: "file", id: newName }, "renamed", "success", {
       oldName,
       newName,
-      folderId: folder.id,
+      folderId: currentFolder.id,
     });
     addActionHistory("renamed", newName, req.user.username, {
       oldName,
       newName,
-      folderId: folder.id,
-      folderName: folder.name,
+      folderId: currentFolder.id,
+      folderName: currentFolder.name,
     });
     res.json({ message: "Arquivo renomeado" });
-  });
+  }, res);
 });
 
-app.put("/move", authenticate, (req, res) => {
+app.put("/move", moveRateLimit, authenticate, async (req, res) => {
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
-  const fromFolder = getAccessibleFolderOrRespond(req, res, req.body.fromFolderId);
+  const fromFolder = getAccessibleFolderRecordOrRespond(req, res, req.body.fromFolderId);
   if (!fromFolder) return;
-  const toFolder = getAccessibleFolderOrRespond(req, res, req.body.toFolderId);
+  const toFolder = getAccessibleFolderRecordOrRespond(req, res, req.body.toFolderId);
   if (!toFolder) return;
 
   if (!rawName || name !== rawName) {
@@ -8272,67 +10703,202 @@ app.put("/move", authenticate, (req, res) => {
     return res.status(400).json({ error: "Escolha uma pasta diferente da atual" });
   }
 
-  const sourcePath = path.join(fromFolder.uploadDir, name);
-  if (!isExistingFile(sourcePath)) {
-    return res.status(404).json({ error: "Arquivo nao encontrado" });
-  }
-
   if (!hasFileEditAccess(req, fromFolder, name)) {
     return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
   }
-
-  const finalName = getAvailableUploadFileName(name, toFolder.id);
-  const destinationPath = path.join(toFolder.uploadDir, finalName);
-  const oldStoredNames = getVersionHistory(fromFolder.id, name).versions
-    .map((version) => path.basename(version.storedAs || ""))
-    .filter(Boolean);
-
-  fs.rename(sourcePath, destinationPath, (err) => {
-    if (err) return res.status(500).json({ error: "Erro ao mover arquivo" });
-
-    movePublicLinksForFile(name, finalName, fromFolder.id, toFolder.id);
-    moveFilePermission(fromFolder.id, name, toFolder.id, finalName);
-    moveFileExpiration(fromFolder.id, name, toFolder.id, finalName);
-    moveFileVersions(fromFolder.id, name, toFolder.id, finalName);
-    moveEncryptedMetadata(fromFolder.id, name, toFolder.id, finalName);
-    for (const storedName of new Set([name, ...oldStoredNames])) {
-      deleteCloudFileLater(fromFolder.id, storedName, "uploads");
+  if (isFileInTrash(fromFolder.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (isCloudStorageEnabled()) return res.status(503).json({ error: "Movimentacao em nuvem indisponivel ate a reconciliacao segura estar ativa" });
+  return runCloudMoveLifecycleMutation(fromFolder.id, toFolder.id, name, async () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const currentSource = getFolderById(fromFolder.id);
+    const currentDestination = getFolderById(toFolder.id);
+    if (!currentSource || !currentDestination || !isFolderAvailable(currentSource.id) || !isFolderAvailable(currentDestination.id)) {
+      return res.status(404).json({ error: "Pasta nao encontrada" });
     }
-    syncFileVersionsToCloud(toFolder.id, finalName);
+    if (!hasFolderAccess(req, currentSource) || !hasFolderAccess(req, currentDestination)) return res.status(403).json({ error: "Acesso negado a esta pasta" });
+    if (!hasFileEditAccess(req, currentSource, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (isFileInTrash(currentSource.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    const sourceFolder = { ...currentSource, ...ensureFolderDirectories(currentSource.id) };
+    const destinationFolder = { ...currentDestination, ...ensureFolderDirectories(currentDestination.id) };
+    const sourcePath = path.join(sourceFolder.uploadDir, name);
+    await ensureCloudFileCached(sourceFolder.id, name, sourcePath, "uploads");
+    if (!refreshAuthenticatedUser(req, res)) return;
+    const publishSource = getFolderById(fromFolder.id);
+    const publishDestination = getFolderById(toFolder.id);
+    if (!publishSource || !publishDestination || !isFolderAvailable(publishSource.id) || !isFolderAvailable(publishDestination.id)) return res.status(404).json({ error: "Pasta nao encontrada" });
+    if (!hasFolderAccess(req, publishSource) || !hasFolderAccess(req, publishDestination) || !hasFileEditAccess(req, publishSource, name)) return res.status(403).json({ error: "Permissao negada para editar este arquivo" });
+    if (isFileInTrash(publishSource.id, name)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+    if (!isExistingFile(sourcePath)) return res.status(404).json({ error: "Arquivo nao encontrado" });
+
+    const finalName = getAvailableUploadFileName(name, destinationFolder.id);
+    const destinationPath = path.join(destinationFolder.uploadDir, finalName);
+    const oldStoredNames = getVersionHistory(sourceFolder.id, name).versions
+      .map((version) => path.basename(version.storedAs || ""))
+      .filter(Boolean);
+    try {
+      await fs.promises.rename(sourcePath, destinationPath);
+    } catch {
+      return res.status(500).json({ error: "Erro ao mover arquivo" });
+    }
+    try {
+      for (const storedName of new Set([name, ...oldStoredNames])) {
+        await deleteFileFromCloud(sourceFolder.id, storedName, "uploads");
+      }
+    } catch {
+      try { await fs.promises.rename(destinationPath, sourcePath); } catch {}
+      syncFileVersionsToCloud(sourceFolder.id, name);
+      return res.status(500).json({ error: "Erro ao mover arquivo" });
+    }
+
+    movePublicLinksForFile(name, finalName, sourceFolder.id, destinationFolder.id);
+    moveFilePermission(sourceFolder.id, name, destinationFolder.id, finalName);
+    moveFileExpiration(sourceFolder.id, name, destinationFolder.id, finalName);
+    moveFileVersions(sourceFolder.id, name, destinationFolder.id, finalName);
+    moveEncryptedMetadata(sourceFolder.id, name, destinationFolder.id, finalName);
+    syncFileVersionsToCloud(destinationFolder.id, finalName);
     auditLog("file.move", getAuditActor(req), { type: "file", id: finalName }, "moved", "success", {
       oldName: name,
       newName: finalName,
-      fromFolderId: fromFolder.id,
-      toFolderId: toFolder.id,
+      fromFolderId: sourceFolder.id,
+      toFolderId: destinationFolder.id,
     });
     addActionHistory("moved", finalName, req.user.username, {
       oldName: name,
       newName: finalName,
       fromFolderId: fromFolder.id,
-      fromFolderName: fromFolder.name,
-      toFolderId: toFolder.id,
-      toFolderName: toFolder.name,
+      fromFolderName: sourceFolder.name,
+      toFolderId: destinationFolder.id,
+      toFolderName: destinationFolder.name,
     });
-    res.json({ message: "Arquivo movido", fileName: finalName, folderId: toFolder.id });
-  });
+    res.json({ message: "Arquivo movido", fileName: finalName, folderId: destinationFolder.id });
+  }, res);
 });
 
 initData();
-restoreService.recoverQuarantineRestore();
 if (!fs.existsSync(QUARANTINE_FILE)) saveQuarantine(getDefaultQuarantine());
-scheduleAutomaticBackups({ cron, createBackup: backupService.createBackup, auditLog, onInvalid: console.error });
-cleanupExpiredTemporaryItems();
-cleanupExpiredTrashItems();
-void processPendingCloudTrashItems();
-void processPendingCloudRestoreSync().catch(() => {});
-repairCompressedTempUploads().catch((error) => {
-  console.error("Falha ao reparar uploads temporarios:", error.message);
+const startupRestoreCoordinator = startupRestoreState.restartRequired
+  ? restoreService.prepareWholeRestoreStartup()
+  : null;
+if (!startupRestoreCoordinator) {
+  cleanupExpiredPublicLinks();
+  void cleanupExpiredTemporaryItems().catch((error) => {
+    console.error("Falha ao limpar expiracoes temporarias:", sanitizeLogValue(error.message));
+  });
+  void cleanupExpiredTrashItems().catch((error) => {
+    console.error("Falha ao limpar lixeira expirada:", sanitizeLogValue(error.message));
+  });
+  restoreRequestGate.run(() => repairCompressedTempUploads()).catch((error) => {
+    console.error("Falha ao reparar uploads temporarios:", error.message);
+  });
+  cleanupOrphanTempUploads();
+  cleanupIncomingUploads();
+}
+scheduleAutomaticBackups({
+  cron,
+  createBackup: (...args) => {
+    if (restoreService.isWholeRestoreBlocked()) return Promise.reject(new Error("Backup pausado durante recuperacao de restore"));
+    return backupService.createBackup(...args);
+  },
+  auditLog,
+  onInvalid: console.error,
 });
-cleanupOrphanTempUploads();
-cleanupIncomingUploads();
-setInterval(cleanupExpiredTemporaryItems, 60 * 1000);
-setInterval(cleanupExpiredTrashItems, 60 * 60 * 1000);
+void processPendingCloudTrashItems();
+const cloudTempReconciliationIntervalMs = parseBoundedNumber("CLOUD_TEMP_RECONCILIATION_INTERVAL_MS", 30_000, 1_000, 60 * 60 * 1000);
+const recoverCloudTempMutations = () => restoreRequestGate.run(async () => {
+  if (!isCloudStorageEnabled()) return;
+  let pendingUploads = {};
+  try { pendingUploads = loadPendingUploads(); }
+  catch (error) { console.error("[cloud-temp] pending registry unavailable:", sanitizeLogValue(error.message)); }
+  for (const [key, entry] of Object.entries(pendingUploads)) {
+    const fileName = path.basename(entry?.fileName || key);
+    const folderId = entry?.folderId || (String(key).includes("/") ? String(key).split("/")[0] : ROOT_FOLDER_ID);
+    const localPath = path.join(getFolderStoragePath("./temp", folderId), fileName);
+    if (fileName && isExistingFile(localPath) && !cloudTempMutationQueue.hasPending(folderId, fileName)) {
+      try { await cloudTempMutationQueue.enqueue(folderId, fileName, "present"); }
+      catch (error) { console.error("[cloud-temp] pending upload reconciliation failed:", sanitizeLogValue(error.message)); }
+    }
+  }
+  await cloudTempMutationQueue.processAll();
+}).catch((error) => {
+  console.error("[cloud-temp] startup reconciliation failed:", sanitizeLogValue(error.message));
+});
+const retryCloudTempMutations = () => restoreRequestGate.run(() => cloudTempMutationQueue.processAll()).catch((error) => {
+  console.error("[cloud-temp] retry reconciliation failed:", sanitizeLogValue(error.message));
+});
+setTimeout(() => { void recoverCloudTempMutations(); }, 0);
+setInterval(() => { void retryCloudTempMutations(); }, cloudTempReconciliationIntervalMs);
+const cloudUploadReconciliationIntervalMs = parseBoundedNumber("CLOUD_UPLOAD_RECONCILIATION_INTERVAL_MS", 30_000, 1_000, 60 * 60 * 1000);
+const recoverCloudUploadMutations = () => requestCloudUploadMutationDrain("startup reconciliation");
+const retryCloudUploadMutations = () => requestCloudUploadMutationDrain("retry reconciliation");
+setTimeout(() => { void recoverCloudUploadMutations(); }, 0);
+setInterval(() => { void retryCloudUploadMutations(); }, cloudUploadReconciliationIntervalMs);
+setInterval(() => {
+  void restoreRequestGate.run(() => cleanupExpiredTemporaryItems()).catch((error) => {
+    console.error("Falha ao limpar expiracoes temporarias:", sanitizeLogValue(error.message));
+  });
+}, 60 * 1000);
+setInterval(() => { void restoreRequestGate.run(() => cleanupExpiredPublicLinks()); }, 60 * 1000);
+setInterval(() => {
+  void restoreRequestGate.run(() => cleanupExpiredTrashItems()).catch((error) => {
+    console.error("Falha ao limpar lixeira expirada:", sanitizeLogValue(error.message));
+  });
+}, 60 * 60 * 1000);
 setInterval(() => { void processPendingCloudTrashItems(); }, 60 * 1000);
 setInterval(() => { void processPendingCloudRestoreSync().catch(() => {}); }, 60 * 1000);
-setInterval(cleanupIncomingUploads, 60 * 1000);
-server.listen(PORT, () => console.log(`Servidor rodando em http://localhost:${PORT}`));
+setInterval(() => {
+  void restoreRequestGate.run(() => cleanupExpiredChunkSessions()).catch((error) => {
+    console.error("[chunk-upload] expiry sweep failed:", sanitizeLogValue(error.message));
+  });
+}, CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS);
+setInterval(() => { void restoreRequestGate.run(() => cleanupIncomingUploads()); }, 60 * 1000);
+const listenForRequests = () => {
+  const onListening = () => {
+    void (async () => {
+      try {
+        if (startupRestoreCoordinator) {
+          const acknowledgement = restoreService.acknowledgeWholeRestoreInstance(undefined, { deferCompletion: true });
+          console.log(`[restore] startup acknowledgement ${acknowledgement.acknowledgedInstances}/${acknowledgement.requiredInstances}`);
+          if (acknowledgement.allAcknowledged) {
+            await restoreService.reconcileUnknownProviderInventory();
+            const completed = restoreService.acknowledgeWholeRestoreInstance();
+            if (!completed.complete) throw new Error("Whole-restore startup acknowledgement did not complete");
+          }
+        }
+      } catch (error) {
+        console.error("[restore] startup acknowledgement or provider inventory initialization failed; startup blocked:", sanitizeLogValue(error.message));
+        server.close();
+        process.exit(1);
+        return;
+      }
+      startupRestoreLease();
+      const address = server.address();
+      const host = address && typeof address === "object" ? address.address : "localhost";
+      const port = address && typeof address === "object" ? address.port : PORT;
+      const displayHost = host.includes(":") ? `[${host}]` : host;
+      console.log(`Servidor rodando em http://${displayHost}:${port}`);
+    })();
+  };
+
+  // Test fixture credentials stay local even after the bootstrap opt-in is removed.
+  if (publishedSampleCredentialsPresent) {
+    server.listen(PORT, "127.0.0.1", onListening);
+    return;
+  }
+
+  server.listen(PORT, onListening);
+};
+void (async () => {
+  await backupService.recoverRetentionAtStartup();
+  restoreService.recoverQuarantineRestore();
+  if (typeof cloudStorage.resolveInventoryContext === "function") await cloudStorage.resolveInventoryContext();
+  if (!startupRestoreCoordinator) {
+    await restoreService.reconcileUnknownProviderInventory();
+    await cleanupExpiredChunkSessions();
+    void processPendingCloudRestoreSync().catch(() => {});
+  }
+  listenForRequests();
+})().catch((error) => {
+  startupRestoreLease();
+  console.error("[restore] backup history recovery or provider inventory initialization failed; startup blocked:", sanitizeLogValue(error.message));
+  process.exit(1);
+});

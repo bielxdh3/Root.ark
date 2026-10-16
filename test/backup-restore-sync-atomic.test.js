@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
 
 const originalCwd = process.cwd();
 const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-atomic-"));
@@ -19,7 +20,7 @@ function reset() {
   fs.mkdirSync(path.join(runtime, "uploads"), { recursive: true });
 }
 
-function seed() {
+function seed(entries) {
   const id = `00000000-0000-4000-8000-${String(++sequence).padStart(12, "0")}`;
   return backupRepository.saveBackup({
     id,
@@ -30,7 +31,7 @@ function seed() {
         operationId: `operation-${id}`,
         revision: 0,
         state: "pending",
-        entries: [
+        entries: entries || [
           { entryId: "a", path: "uploads/a.txt", area: "uploads", folderId: "root", name: "a.txt", state: "pending", attempts: 0, maxAttempts: 5, leaseToken: null, leaseUntil: null, nextAttemptAt: null },
           { entryId: "b", path: "uploads/b.txt", area: "uploads", folderId: "root", name: "b.txt", state: "pending", attempts: 0, maxAttempts: 5, leaseToken: null, leaseUntil: null, nextAttemptAt: null },
         ],
@@ -52,6 +53,72 @@ function mutate(id, entryId, expectedState, expectedLeaseToken, expectedRevision
     mutate: (entry) => ({ entry: update(entry), at: "2026-08-01T00:00:00.000Z" }),
   });
 }
+
+test("restore provider reconciliation waits for a file mutation and uploads the current bytes", async () => {
+  reset();
+  const localPath = path.join(runtime, "uploads", "a.txt");
+  fs.writeFileSync(localPath, "restored bytes");
+  const saved = seed([{
+    entryId: "only",
+    path: "uploads/a.txt",
+    area: "uploads",
+    folderId: "root",
+    name: "a.txt",
+    state: "pending",
+    attempts: 0,
+    maxAttempts: 5,
+    leaseToken: null,
+    leaseUntil: null,
+    nextAttemptAt: null,
+  }]);
+  const lifecycleLock = createFileLifecycleLock({ directory: path.join(runtime, "data", "file-lifecycle-locks") });
+  let releaseRestoreUpload;
+  const userMutationReleased = new Promise((resolve) => { releaseRestoreUpload = resolve; });
+  let userMutationCommitted = false;
+  let uploadStartedBeforeUserCommit = false;
+  let remoteObject = "restored bytes";
+  const uploader = {
+    enabled: () => true,
+    provider: "s3",
+    upload: async (sourcePath) => {
+      const snapshot = fs.readFileSync(sourcePath, "utf8");
+      if (!userMutationCommitted) {
+        uploadStartedBeforeUserCommit = true;
+        await userMutationReleased;
+      }
+      remoteObject = snapshot;
+      return { provider: "s3" };
+    },
+  };
+
+  let markUserLockAcquired;
+  let allowUserMutation;
+  const userLockAcquired = new Promise((resolve) => { markUserLockAcquired = resolve; });
+  const userMutationAllowed = new Promise((resolve) => { allowUserMutation = resolve; });
+  const userOperation = lifecycleLock.run("root", "a.txt", async () => {
+    markUserLockAcquired();
+    await userMutationAllowed;
+    fs.writeFileSync(localPath, "newer user bytes");
+    remoteObject = "newer user bytes";
+  });
+  await userLockAcquired;
+  const restoring = restoreService.processRestoreSync({
+    backupId: saved.id,
+    workerId: "restore-worker",
+    uploader,
+    runFileLifecycleMutation: (folderId, fileName, work) => lifecycleLock.run(folderId, fileName, work),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  allowUserMutation();
+  await userOperation;
+  userMutationCommitted = true;
+  releaseRestoreUpload();
+  await restoring;
+
+  assert.equal(uploadStartedBeforeUserCommit, false, "restore upload must wait until the user mutation releases the shared lifecycle lock");
+  assert.equal(remoteObject, "newer user bytes", "the queued restore upload must not replace newer provider content");
+  assert.equal(backupRepository.getBackup(saved.id).metadata.restoreSync.entries[0].state, "completed");
+});
 
 test("restore-sync mutations preserve both entries across deterministic interleavings", async (t) => {
   for (let interleaving = 0; interleaving < 20; interleaving += 1) {
@@ -94,7 +161,7 @@ test("overlapping provider uploads and sibling retry/terminal transitions are lo
   let releaseA;
   const gate = new Promise((resolve) => { releaseA = resolve; });
   const calls = [];
-  const provider = { enabled: () => true, upload: async (filePath) => { calls.push(path.basename(filePath)); if (path.basename(filePath) === "a.txt") await gate; } };
+  const provider = { enabled: () => true, upload: async (filePath) => { calls.push(path.basename(filePath)); if (path.basename(filePath) === "a.txt") await gate; return { provider: "fixture" }; } };
   const first = restoreService.processRestoreSync({ backupId: saved.id, workerId: "worker-a", clock: { now: () => Date.parse("2026-08-01T00:00:00.000Z") }, uploader: provider });
   await new Promise((resolve) => setImmediate(resolve));
   const second = restoreService.processRestoreSync({ backupId: saved.id, workerId: "worker-b", clock: { now: () => Date.parse("2026-08-01T00:00:00.000Z") }, uploader: provider });

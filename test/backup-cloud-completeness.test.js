@@ -30,6 +30,69 @@ test("cloud-only files are staged into the archive without changing the live cac
   assert.equal(fs.existsSync(path.join(runtime, "data", "backups", ".cloud-stage")), false);
 });
 
+test("cold cloud cache staging files under uploads and temp are never archived", async () => {
+  const previousIncludeTemp = process.env.BACKUP_INCLUDE_TEMP;
+  process.env.BACKUP_INCLUDE_TEMP = "true";
+  try {
+    for (const area of ["uploads", "temp"]) {
+      fs.mkdirSync(path.join(runtime, area), { recursive: true });
+      fs.writeFileSync(path.join(runtime, area, ".rootark-cloud-cache-cold-file"), "cold provider cache");
+      const directory = path.join(runtime, area, ".rootark-cloud-cache-cold-test");
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, "staged.bin"), "cold provider cache");
+    }
+    backupService.setCloudStorage({ enabled: () => false });
+    const backup = await backupService.createBackup({ createdBy: "tester" });
+    const archive = await unzipper.Open.file(path.join(runtime, "data", "backups", backup.filename));
+    const entries = archive.files.map((entry) => entry.path);
+    assert.equal(entries.some((entry) => entry.includes(".rootark-cloud-cache-")), false);
+  } finally {
+    if (previousIncludeTemp === undefined) delete process.env.BACKUP_INCLUDE_TEMP;
+    else process.env.BACKUP_INCLUDE_TEMP = previousIncludeTemp;
+  }
+});
+
+test("cloud coordination records under data are excluded while ordinary data remains backed up", async () => {
+  const dataDir = path.join(runtime, "data");
+  fs.mkdirSync(path.join(dataDir, ".rootark-cloud-file-locks"), { recursive: true });
+  fs.mkdirSync(path.join(dataDir, ".rootark-cloud-temp-mutations"), { recursive: true });
+  fs.mkdirSync(path.join(dataDir, ".rootark-cloud-upload-mutations"), { recursive: true });
+  fs.writeFileSync(path.join(dataDir, ".rootark-cloud-file-locks", "active.json"), "lock state");
+  fs.writeFileSync(path.join(dataDir, ".rootark-cloud-temp-mutations", "pending.json"), "temp queue state");
+  fs.writeFileSync(path.join(dataDir, ".rootark-cloud-upload-mutations", "pending.json"), "upload queue state");
+  fs.writeFileSync(path.join(dataDir, ".rootark-cloud-coordination.json"), "transient coordination state");
+  fs.writeFileSync(path.join(dataDir, "settings.json"), JSON.stringify({ keep: true }));
+
+  backupService.setCloudStorage({ enabled: () => false });
+  const backup = await backupService.createBackup({ createdBy: "tester" });
+  const archive = await unzipper.Open.file(path.join(dataDir, "backups", backup.filename));
+  const entries = archive.files.map((entry) => entry.path);
+
+  assert.ok(entries.includes("data/settings.json"));
+  assert.equal(entries.some((entry) => entry.includes(".rootark-cloud-")), false);
+});
+
+test("a changed provider suppression policy cannot be recorded as a successful backup", async () => {
+  const policy = require("../services/restoreProviderOrphans");
+  const backupsDir = path.join(runtime, "data", "backups");
+  const archivesBefore = fs.readdirSync(backupsDir).filter((name) => name.endsWith(".zip")).sort();
+  const historyBefore = backupService.listBackups();
+  await policy.write([]);
+  backupService.setCloudStorage({
+    enabled: () => true,
+    inventory: async () => {
+      await policy.write([{ area: "uploads", folderId: "root", name: "changed-during-backup.txt" }]);
+      return [{ provider: "s3", providerIdentity: "changed", area: "uploads", folderId: "root", name: "changed-during-backup.txt" }];
+    },
+    download: async (_folderId, _name, target) => { fs.writeFileSync(target, "provider bytes"); return true; },
+  });
+  await assert.rejects(backupService.createBackup({ createdBy: "tester" }), /suppression policy changed/i);
+  assert.deepEqual(fs.readdirSync(backupsDir).filter((name) => name.endsWith(".zip")).sort(), archivesBefore);
+  const historyAfter = backupService.listBackups();
+  assert.equal(historyAfter.filter((entry) => entry.status === "success").length, historyBefore.filter((entry) => entry.status === "success").length);
+  assert.equal(historyAfter.filter((entry) => entry.status === "failed").length, historyBefore.filter((entry) => entry.status === "failed").length + 1);
+});
+
 test("divergent cloud collisions fail closed and leave no archive", () => {
   const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-backup-fail-"));
   const servicePath = path.join(__dirname, "..", "services", "backupService");
@@ -126,6 +189,34 @@ test("a cloud-only object survives SQLite backup and restore", () => {
   assert.equal(JSON.parse(result.stdout.trim()).ok, true);
 });
 
+test("an incomplete backup does not claim a same-path provider object was archived", () => {
+  const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-incomplete-cloud-restore-"));
+  const servicePath = path.join(__dirname, "..", "services", "backupService");
+  const restorePath = path.join(__dirname, "..", "services", "restoreService");
+  const orphanPolicyPath = path.join(isolated, "data", ".rootark-restore-provider-orphans.json");
+  const script = [
+    `process.chdir(${JSON.stringify(isolated)}); process.env.DB_ENABLED = "false";`,
+    'const assert = require("node:assert/strict"); const fs = require("node:fs");',
+    `const backup = require(${JSON.stringify(servicePath)}); const restore = require(${JSON.stringify(restorePath)});`,
+    'fs.mkdirSync("uploads", { recursive: true }); fs.writeFileSync("uploads/same.txt", "archived local bytes");',
+    'backup.setCloudStorage({ enabled: () => false });',
+    'backup.createBackup({ createdBy: "test" }).then(async (saved) => {',
+    '  let inventoryCalls = 0;',
+    '  const cloud = { enabled: () => true, inventory: async () => ++inventoryCalls === 1 ? [{ provider: "s3", providerIdentity: "uncaptured", area: "uploads", folderId: "root", name: "same.txt" }] : [], download: async (_folder, _name, target) => { fs.writeFileSync(target, "provider bytes not in the backup"); return true; } };',
+    '  backup.setCloudStorage(cloud); restore.setCloudStorage(cloud);',
+    '  const result = await restore.restoreBackup(saved.id, { confirmation: "RESTORE", username: "test" });',
+    '  assert.equal(result.manifest.cloud_complete, false);',
+    `  const policy = JSON.parse(fs.readFileSync(${JSON.stringify(orphanPolicyPath)}, "utf8"));`,
+    '  assert.deepEqual(policy.objects, [{ area: "uploads", folderId: "root", name: "same.txt" }], "provider content absent from an incomplete archive remains suppressed even when its logical path matches");',
+    '  process.stdout.write(JSON.stringify({ ok: true }));',
+    '}).catch((error) => { console.error(error); process.exitCode = 1; });',
+  ].join(" ");
+  const result = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 20_000 });
+  fs.rmSync(isolated, { recursive: true, force: true });
+  assert.equal(result.status, 0, result.stderr || result.stdout || result.error?.message);
+  assert.equal(JSON.parse(result.stdout.trim()).ok, true);
+});
+
 test("cloud backup object matrix", async (t) => {
   const servicePath = path.join(__dirname, "..", "services", "backupService");
   const unzipperPath = path.join(__dirname, "..", "node_modules", "unzipper");
@@ -155,6 +246,34 @@ test("cloud backup object matrix", async (t) => {
     const result = run({ failList: true });
     assert.deepEqual({ ok: result.ok, zips: result.zips, failed: result.failed, stage: result.stage }, { ok: false, zips: 0, failed: true, stage: false });
   });
+});
+
+test("restore-suppressed provider objects are not downloaded or archived", () => {
+  const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cloud-backup-suppressed-"));
+  const servicePath = path.join(__dirname, "..", "services", "backupService");
+  const unzipperPath = path.join(__dirname, "..", "node_modules", "unzipper");
+  const script = [
+    `process.chdir(${JSON.stringify(isolated)}); process.env.DB_ENABLED = "false"; process.env.BACKUP_INCLUDE_PENDING = "true";`,
+    'const fs = require("node:fs"); const path = require("node:path");',
+    `const service = require(${JSON.stringify(servicePath)}); const unzipper = require(${JSON.stringify(unzipperPath)});`,
+    'fs.mkdirSync("uploads", { recursive: true }); fs.mkdirSync("temp", { recursive: true }); fs.writeFileSync("uploads/local.txt", "local upload"); fs.writeFileSync("temp/local-pending.txt", "local pending"); fs.writeFileSync("uploads/suppressed-upload.txt", "stale local upload"); fs.writeFileSync("temp/suppressed-pending.txt", "stale local pending");',
+    'fs.mkdirSync("data", { recursive: true }); fs.writeFileSync("data/.rootark-restore-provider-orphans.json", JSON.stringify({ version: 1, objects: [{ area: "uploads", folderId: "root", name: "suppressed-upload.txt" }, { area: "temp", folderId: "root", name: "suppressed-pending.txt" }] }));',
+    'const remotes = [{ area: "uploads", folderId: "root", name: "suppressed-upload.txt" }, { area: "temp", folderId: "root", name: "suppressed-pending.txt" }, { area: "uploads", folderId: "root", name: "cloud.txt" }, { area: "temp", folderId: "root", name: "cloud-pending.txt" }]; const downloads = [];',
+    'service.setCloudStorage({ enabled: () => true, inventory: async () => remotes.map((remote) => ({ provider: "s3", providerIdentity: remote.name, ...remote })), download: async (folderId, name, target, area) => { downloads.push(`${area}/${name}`); fs.writeFileSync(target, `${area}:${name}`); return true; } });',
+    'service.createBackup().then(async (backup) => { const archive = await unzipper.Open.file(path.join("data", "backups", backup.filename)); console.log(JSON.stringify({ entries: archive.files.filter((entry) => entry.type !== "Directory").map((entry) => entry.path), downloads })); }).catch((error) => { console.error(error); process.exitCode = 1; });',
+  ].join(" ");
+  const result = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" });
+  fs.rmSync(isolated, { recursive: true, force: true });
+  assert.equal(result.status, 0, result.stderr);
+  const { entries, downloads } = JSON.parse(result.stdout.trim());
+  assert.equal(downloads.includes("uploads/suppressed-upload.txt"), false);
+  assert.equal(downloads.includes("temp/suppressed-pending.txt"), false);
+  assert.ok(entries.includes("uploads/local.txt"));
+  assert.ok(entries.includes("temp/local-pending.txt"));
+  assert.equal(entries.includes("uploads/suppressed-upload.txt"), false);
+  assert.equal(entries.includes("temp/suppressed-pending.txt"), false);
+  assert.ok(entries.includes("uploads/cloud.txt"));
+  assert.ok(entries.includes("temp/cloud-pending.txt"));
 });
 
 test.after(() => {

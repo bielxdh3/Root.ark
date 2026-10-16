@@ -10,11 +10,11 @@ const {
 } = require("../services/totpPolicy");
 
 function parseCookies(header = "") {
-  const cookies = {};
+  const cookies = new Map();
   for (const part of String(header).split(";")) {
     const [key, value] = part.trim().split(/=(.*)/s, 2);
-    if (!key || Object.hasOwn(cookies, key)) cookies[key] = undefined;
-    else cookies[key] = value;
+    if (!key || cookies.has(key)) cookies.set(key, undefined);
+    else cookies.set(key, value);
   }
   return cookies;
 }
@@ -27,10 +27,24 @@ function verifyClaims(jwt, token, jwtSecret) {
   return claims;
 }
 
-function getExpectedOrigin(req) {
-  const forwardedProto = String(req.headers?.["x-forwarded-proto"] || "").split(",")[0].trim();
-  const protocol = forwardedProto || (req.socket?.encrypted ? "https" : "http");
-  return `${protocol}://${req.headers.host}`;
+function isAuthTokenExpired(req, now = Date.now()) {
+  return Number.isFinite(req?.authExpiresAt) && now >= req.authExpiresAt;
+}
+
+function getExpectedOrigin(req, trustProxyFn = null) {
+  let protocol = req.protocol || (req.socket?.encrypted ? "https" : "http");
+  if (!req.protocol && typeof trustProxyFn === "function" && trustProxyFn(req.socket?.remoteAddress, 0)) {
+    const forwardedProtocol = String(req.headers?.["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+    if (forwardedProtocol === "http" || forwardedProtocol === "https") protocol = forwardedProtocol;
+  }
+  const host = typeof req.get === "function" ? req.get("host") : req.headers?.host;
+  return `${protocol}://${host}`;
+}
+
+function getClientIp(req) {
+  const address = req?.ip || req?.socket?.remoteAddress || null;
+  if (address === "::1" || address === "::ffff:127.0.0.1") return "127.0.0.1";
+  return address;
 }
 
 function createAuthenticate({ jwt, jwtSecret, loadUser, normalizeUserPermissions, cookieName = "rootark_session" }) {
@@ -38,7 +52,7 @@ function createAuthenticate({ jwt, jwtSecret, loadUser, normalizeUserPermissions
     const auth = req.headers.authorization;
     const cookies = parseCookies(req.headers.cookie);
     const bearer = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
-    const token = bearer || cookies[cookieName];
+    const token = bearer || cookies.get(cookieName);
     if (!token) {
       return res.status(401).json({ error: "Token ausente" });
     }
@@ -57,6 +71,7 @@ function createAuthenticate({ jwt, jwtSecret, loadUser, normalizeUserPermissions
         totpEnabled: Boolean(user.totpEnabled),
         enrollmentOnly: Boolean(claims.totpEnrollment),
       };
+      req.authExpiresAt = Number.isFinite(claims.exp) ? claims.exp * 1000 : null;
       req.totpPolicy = totpPolicy;
       if ((claims.totpEnrollment || enrollmentRequired) && !isTotpEnrollmentPath(req.path)) {
         return res.status(403).json({ error: "2FA enrollment required." });
@@ -64,14 +79,16 @@ function createAuthenticate({ jwt, jwtSecret, loadUser, normalizeUserPermissions
       req.authType = bearer ? "bearer" : "cookie";
       if (req.authType === "cookie" && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
         const origin = req.headers.origin;
-        const expectedOrigin = `${req.protocol}://${req.get("host")}`;
-        if ((origin && origin !== expectedOrigin) || !cookies.rootark_csrf || req.headers["x-csrf-token"] !== cookies.rootark_csrf) {
+        const expectedOrigin = getExpectedOrigin(req);
+        const csrfCookie = cookies.get("rootark_csrf");
+        if ((origin && origin !== expectedOrigin) || !csrfCookie || req.headers["x-csrf-token"] !== csrfCookie) {
           return res.status(403).json({ error: "CSRF invalido" });
         }
       }
       next();
     } catch (error) {
       if (isTotpPolicyError(error)) return res.status(503).json({ error: TOTP_POLICY_ERROR_MESSAGE });
+      if (error?.code === "AUTHORIZATION_STORE_UNAVAILABLE") return res.status(503).json({ error: "Autorizacao indisponivel" });
       res.status(401).json({ error: "Token invalido ou expirado" });
     }
   };
@@ -103,8 +120,10 @@ function createRealtimeAuthenticator({ jwt, jwtSecret, loadUser, normalizeUserPe
 
 module.exports = {
   getExpectedOrigin,
+  isAuthTokenExpired,
   parseCookies,
   verifyClaims,
   createAuthenticate,
   createRealtimeAuthenticator,
+  getClientIp,
 };

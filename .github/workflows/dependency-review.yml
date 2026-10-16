@@ -1,6 +1,9 @@
 name: Dependency Review
 
 on:
+  push:
+    branches:
+      - Root/main
   pull_request:
     branches:
       - Root/main
@@ -10,6 +13,7 @@ permissions:
 
 jobs:
   dependency-review:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
 
     steps:
@@ -19,4 +23,19 @@ jobs:
       - name: Review dependency changes
         uses: actions/dependency-review-action@v5
         with:
+          fail-on-severity: high
+
+  default-branch-dependency-review:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Review dependencies introduced by this main commit
+        uses: actions/dependency-review-action@v5
+        with:
+          base-ref: ${{ github.event.before }}
+          head-ref: ${{ github.sha }}
           fail-on-severity: high

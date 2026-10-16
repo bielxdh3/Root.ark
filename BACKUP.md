@@ -2,13 +2,21 @@
 
 O sistema de backup protege metadados, banco SQLite local e arquivos enviados sem incluir segredos.
 
+A restauração usa rollback local durável e reconciliação persistente de provedores, mas não é atomicamente visível em todos os armazenamentos ao mesmo tempo. Consulte os [limites da transação de restore](docs/backup-restore-transaction-boundary.md) e o [snapshot de validação de 2026-10-11](docs/validation/2026-10-11-rootark-final-closure.md) antes de planejar recuperação.
+
 ## Local
 
-Backups, o lock, o histórico JSON e os temporários de restore ficam no diretório de runtime do processo:
+Os arquivos de backup e o staging de restore ficam no diretório de runtime do processo:
 
 ```text
 <runtime-root>/data/backups
 ```
+
+O histórico JSON e o lock de metadados ficam em `<runtime-root>/data`; o staging de restore fica em `<runtime-root>/data/backups/.restore-tmp`.
+
+O catálogo de backups fica em `data/backup-history.json` quando a persistência JSON está ativa; com SQLite, as entradas usam a tabela `backup_history`. No modo JSON, as mutações são serializadas entre processos cooperantes Root.ark e o arquivo é substituído por um temporário exclusivo no mesmo diretório, com flush antes do rename. Em POSIX, o diretório também é sincronizado; o Node.js não oferece esse flush de diretório de forma portável no Windows, então não há garantia equivalente contra perda súbita de energia nessa plataforma. Histórico corrompido ou ilegível falha fechado e não é sobrescrito. Os arquivos de lock, claims e coordenação ficam no runtime e não são estado restaurável.
+
+Locks de backup e restore registram PID, identidade da instância e UUID exclusivo do processo; em Linux também registram a identidade de início do processo em `/proc`. O UUID distingue o processo atual de outro processo que use o mesmo PID local. Em Linux, a identidade `/proc` pode detectar que um processo local diferente reutilizou o PID quando a identidade da instância do lock coincide com a configurada. Locks de outra instância permanecem ativos sem essa comparação. Onde o sistema não oferece uma identidade de início verificável — incluindo o caminho atual no Windows — o proprietário é tratado como ativo e o lock não é recuperado automaticamente, mesmo quando o PID parece ausente. Locks legados sem identidade suficiente para provar que o processo terminou também falham fechados. Se a recuperação ficar bloqueada, pare todas as instâncias que compartilham o runtime e confirme que nenhuma operação está ativa antes de remover apenas um lock comprovadamente obsoleto como ação de operador. Não apague o diretório de locks nem os journals de restore.
 
 Formato:
 
@@ -43,12 +51,16 @@ BACKUP_COMPRESS=true
 
 - `node_modules`
 - `.git`
-- `.env`
-- credenciais AWS/GDrive
-- arquivos `.key`, `.pem`, `.p12`
+- `.env`, `.env.*` e arquivos terminados em `.env`, em qualquer caminho incluído
+- caminhos com nomes que contenham `credentials` ou `service-account`
+- arquivos `.key`, `.pem` e `.p12`, em qualquer caminho incluído
+- arquivos e diretórios `.rootark-cloud-cache-*` e arquivos de controle internos do runtime
 - `data/server-master.key`
 - `data/backups`
+- a árvore de quarentena configurada, seus aliases de caminho real e hardlinks para payloads em quarentena
 - uploads temporários incompletos em `temp/.chunks` e `temp/.incoming`
+
+Essas exclusões são por caminho/nome; o backup não inspeciona o conteúdo de arquivos arbitrários em busca de credenciais. A criação do backup e a reconciliação do inventário cloud falham fechadas se um arquivo elegível tiver hardlinks, para impedir que um nome comum contorne a exclusão de outro caminho.
 
 ## Backup manual
 
@@ -87,6 +99,34 @@ Pelo painel:
 
 Antes da restauração, o servidor cria um backup `pre-restore`.
 
+### Restore em implantação de instância única
+
+Execute exatamente um processo do servidor por runtime. `ROOTARK_RESTORE_INSTANCE_COUNT` deve permanecer em `1` (padrão); o servidor encerra a inicialização para qualquer outro valor porque limites de autenticação, desafios de login e proteção contra replay de TOTP ainda são mantidos por processo. Essa variável declara a topologia e não detecta réplicas ocultas; configure o orquestrador para manter uma única réplica. O protocolo de confirmação entre várias instâncias existe no serviço de restore, mas não torna a aplicação multi-instância segura para autenticação. Não escale horizontalmente até existir estado de autenticação compartilhado e transacional.
+
+Após restaurar, reinicie o único processo do servidor. O serviço recupera ou confirma o coordenador antes de liberar requisições. Se o processo não iniciar e a barreira permanecer ativa, preserve o coordenador e os arquivos de recuperação e siga o procedimento de recuperação documentado; não os apague manualmente.
+
+### Restore local e armazenamento cloud
+
+Um restore feito com o cloud desativado mantém a aplicação local disponível, mas marca o inventário do provider como desconhecido. Se o cloud for habilitado depois, o servidor exige um backup selecionado com `cloud_complete: true` como baseline e planeja uploads a partir da árvore `uploads/` local atual: arquivos novos ou alterados são enviados, enquanto objetos remotos de arquivos apagados ou renomeados continuam suprimidos. Um backup incompleto não é certificado; selecione um backup completo por `ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID`. Na inicialização, a reconciliação e o worker agendado atualizam a identidade do provider antes dos uploads e conferem que ela continua igual depois; se ela mudar durante uma tentativa, a entrada permanece pendente para retry e a supressão não é limpa. A inicialização aguarda o menor prazo persistido de lease/backoff e retoma os itens vencidos; o atraso de retry pode chegar a uma hora. Se uma tentativa cloud falhar, o listener permanece fechado e a fila durável fica para a próxima inicialização. Para estado legado sem marcador de inventário, configure explicitamente `ROOTARK_PROVIDER_INVENTORY_BASELINE_BACKUP_ID` com o ID do backup que deve servir de baseline; não escolha o backup mais recente automaticamente.
+
+Em endpoints S3 compatíveis sem identidade STS, configure `AWS_S3_PRINCIPAL_ID` com um identificador estável, não secreto, da conta/principal. A inicialização falha fechada se esse identificador estiver ausente; o access key ID não substitui esse vínculo.
+
+Filas de reconciliação antigas sem contexto do provider não são reaproveitadas automaticamente. Na inicialização, o servidor valida o backup da fila antes de reconstruir uma única fila pendente; se houver mais de uma fila ambígua, falta de backup completo ou falha de identidade/inventário, mantém o acesso cloud bloqueado. A fila substituta registra de forma durável qual fila antiga deve aposentar, respeita um lease ativo e retoma a aposentadoria após reinício. Se necessário, selecione um baseline completo explicitamente; o servidor nunca escolhe o backup mais recente por conta própria. Os detalhes e a cobertura de falha estão em [limites da transação de restore](docs/backup-restore-transaction-boundary.md).
+
+Mesmo quando o manifesto tem `cloud_complete: true`, um restore pode deixar uploads selecionados em uma fila durável enquanto os bytes locais são enviados ao provider. Durante esse intervalo, downloads dos mesmos objetos são bloqueados antes de hidratar o cache local, para que uma cópia remota antiga não substitua os bytes escolhidos no restore. A política guarda essas chaves pendentes e a inicialização as reconstrói a partir das filas de restore ainda não concluídas antes de abrir o listener, inclusive ao atualizar uma política antiga sem esse campo. Falhas ou retries mantêm a trava; ela só é removida após a fila registrar a conclusão do envio. Essa trava de downloads é separada da supressão de objetos remotos que não pertencem ao backup.
+
+O provider externo não participa do rollback local. Restore oferece recuperação local por pre-images e reconciliação cloud retomável, não uma transação atômica entre filesystem, bancos e provider. Uma falha cloud após o commit local pode atrasar a disponibilidade dos arquivos até a fila ser concluída.
+
+### Proteção dos diretórios no host
+
+Execute Root.ark com uma conta de serviço dedicada. Os diretórios de runtime usados como origem ou destino de restore — incluindo `data`, `uploads`, quarentena, extração/pre-images de backup, o lock `.backup.lock` e seu diretório `.backup.lock.takeover`, e os diretórios-pai dos caminhos SQLite ou de outros armazenamentos configurados — devem pertencer ao domínio de confiança do serviço/operador. Nenhum usuário ou processo não confiável do host pode renomear, substituir ou gravar nesses diretórios ou em qualquer ancestral deles enquanto o servidor estiver ativo. Configure caminhos de armazenamento absolutos e protegidos por permissões do sistema operacional; não use diretórios compartilhados graváveis por usuários não confiáveis. A limpeza da evidência de takeover usa operações por caminho e falha fechada quando detecta inconsistência, mas não é atômica contra um escritor local externo com acesso ao diretório. Em POSIX, a criação privada usa modo `0700`; no Windows, o modo `0700` do Node.js não configura a DACL, então confirme que as ACLs efetivas herdadas negam modificação e exclusão a principals não confiáveis.
+
+O restore rejeita symlinks e compara a identidade do arquivo aberto com a identidade do caminho antes de copiar bytes. Ainda assim, as APIs portáveis de caminhos do Node.js não mantêm handles de diretório para cada componente ancestral; portanto, essa verificação não elimina corridas se um ator local puder substituir um ancestral por symlink/junction durante a operação. Restrinja essa autoridade por ACL/permissões do host e pare o serviço antes de alterar os caminhos configurados.
+
+Restore interrompido em versões anteriores pode deixar um arquivo como `runtime.json.<uuid>.restore-preimage`. O coordenador antigo não registrava esse caminho; por isso, a recuperação atual não o remove automaticamente, pois não consegue provar que seja um temporário e não dado do usuário. Verifique esse resíduo manualmente após preservar um backup; não apague arquivos apenas pelo sufixo.
+
+Cada atualização do journal SQLite é gravada em um temporário exclusivo no mesmo diretório, sincronizada e publicada por rename atômico; temporários abandonados não substituem o journal válido. No POSIX, falhas ao sincronizar o diretório são propagadas e mantêm o restore em falha/recuperação, em vez de serem ignoradas. O Node.js não oferece sincronização portável de diretórios no Windows; a persistência contra perda súbita de energia nesse sistema continua limitada pelas garantias do sistema de arquivos e da plataforma.
+
 O restore:
 
 - valida o ZIP;
@@ -94,6 +134,7 @@ O restore:
 - verifica checksum quando disponível;
 - bloqueia path traversal;
 - rejeita paths absolutos e symlinks;
+- exclui locks de coordenação do histórico de backup e rejeita arquivos de lock/claims ou o SQLite de coordenação e seus sidecars antes de alterar dados;
 - extrai em `<runtime-root>/data/backups/.restore-tmp`;
 - restaura JSON em `<runtime-root>/data` e uploads em `<runtime-root>/uploads`;
 - limpa temporários.

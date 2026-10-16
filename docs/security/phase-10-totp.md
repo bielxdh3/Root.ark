@@ -20,6 +20,8 @@ Disable requires the current password and a current TOTP or unused recovery code
 
 The policy evaluator is shared by password login, HTTP authentication, and realtime authentication and reads the current policy on every check. A full token for a newly required but unenrolled user is denied on application routes and realtime; only the explicit enrollment, status, policy, and logout paths remain available. Optional mode, enrolled required users, disabled/deleted-user rejection, session-version checks, CSRF, and enrollment-only tokens remain unchanged. Sensitive enrollment, confirmation, challenge, and token responses set `Cache-Control: no-store` and `Pragma: no-cache`.
 
+WebDAV uses HTTP Basic credentials and cannot complete a TOTP challenge. The server rejects Basic authentication for every account with TOTP enrolled and every account covered by `role-required` or `global-required`. Under `optional` policy, WebDAV Basic authentication remains available only to accounts without enrolled TOTP. Deployments requiring TOTP must not treat a WebDAV password as a second-factor-capable credential.
+
 ## Persistence and migration
 
 Migration 5 adds `totp_enabled`, encrypted active/pending secret JSON, recovery hashes, last-used TOTP step, and enrollment timestamp to SQLite. The JSON user representation uses the same fields. Legacy users with absent fields resolve to disabled/no pending material. The focused SQLite test applies migrations 1–5 and round-trips the encrypted fields and hashes without exposing plaintext.

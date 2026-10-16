@@ -18,6 +18,9 @@
   function publicError(error, fallback) {
     if (error && error.status === 401) { ui.redirectToLogin(); return ""; }
     if (error && error.status === 403) return "Sua conta não tem permissão para esta ação.";
+    if (error && error.status === 503 && error.payload?.cleanupPending) return "Backup restaurado, mas a limpeza temporária falhou. Reinicie todas as instâncias; o serviço tentará remover a área temporária antes de aceitar novas solicitações.";
+    if (error && error.status === 503 && error.payload?.restartRequired) return "Backup restaurado. Reinicie todas as instâncias do servidor para liberar o acesso.";
+    if (error && error.status === 503 && error.payload?.recoveryRequired) return "O servidor está bloqueado durante a recuperação do backup. Reinicie todas as instâncias e revise o estado antes de tentar novamente.";
     const message = String(error && error.message || "");
     if (!message || error.status >= 500 || /[A-Za-z]:[\\/]|(?:^|[\s"'(])\/(?:[^/\s]+\/){2,}/.test(message)) return fallback;
     return message;
@@ -27,7 +30,7 @@
     const text = String(message || "");
     element.textContent = text;
     element.hidden = !text;
-    element.className = tone === "error" ? "feedback feedback-error" : "feedback";
+    element.className = tone === "error" ? "feedback feedback-error" : tone === "warning" ? "feedback feedback-warning" : "feedback";
     element.setAttribute("role", tone === "error" ? "alert" : "status");
   }
   function tableState(colspan, message, kind) {
@@ -110,6 +113,8 @@
     }
     target.innerHTML = adminMarkup();
     let users = [], groups = [], quarantine = [], folders = [], eligibleUsers = [], allowedUsers = [];
+    const groupMemberDrafts = new Map();
+    let groupLoadGeneration = 0;
     const usersBody = document.getElementById("users-body");
     const groupsBody = document.getElementById("groups-body");
     const quarantineBody = document.getElementById("quarantine-body");
@@ -141,7 +146,9 @@
       if (!groups.length) { groupsBody.innerHTML = tableState(4, "Nenhum grupo cadastrado.", "empty"); return; }
       groupsBody.innerHTML = groups.map((group, index) => {
         const members = asArray(group.members).map(String);
-        return `<tr><th scope="row">${esc(group.name)}</th><td>${members.length ? esc(members.join(", ")) : '<span class="muted">Sem membros</span>'}</td><td><input class="field" type="text" data-group-members="${index}" value="${esc(members.join(", "))}" aria-label="Membros de ${esc(group.name)}" /></td><td><div class="row-actions"><button type="button" class="button button-primary button-small" data-action="save-group" data-group-index="${index}">Salvar</button><button type="button" class="button button-danger button-small" data-action="delete-group" data-group-index="${index}">Excluir</button></div></td></tr>`;
+        const groupId = String(group.id || "");
+        const draft = groupMemberDrafts.has(groupId) ? groupMemberDrafts.get(groupId) : members.join(", ");
+        return `<tr><th scope="row">${esc(group.name)}</th><td>${members.length ? esc(members.join(", ")) : '<span class="muted">Sem membros</span>'}</td><td><input class="field" type="text" data-group-members="${index}" data-group-id="${esc(groupId)}" value="${esc(draft)}" aria-label="Membros de ${esc(group.name)}" /></td><td><div class="row-actions"><button type="button" class="button button-primary button-small" data-action="save-group" data-group-index="${index}">Salvar</button><button type="button" class="button button-danger button-small" data-action="delete-group" data-group-index="${index}">Excluir</button></div></td></tr>`;
       }).join("");
     }
     function renderQuarantine() {
@@ -174,9 +181,20 @@
       catch (error) { users = []; usersBody.innerHTML = tableState(4, publicError(error, "Não foi possível carregar as contas."), "error"); }
     }
     async function loadGroups() {
+      const generation = ++groupLoadGeneration;
       groupsBody.innerHTML = tableState(4, "Carregando grupos…", "loading");
-      try { groups = asArray(await api.get("/groups")); renderGroups(); }
-      catch (error) { groups = []; groupsBody.innerHTML = tableState(4, publicError(error, "Não foi possível carregar os grupos."), "error"); }
+      try {
+        const loadedGroups = asArray(await api.get("/groups"));
+        if (generation !== groupLoadGeneration) return;
+        groups = loadedGroups;
+        const liveGroupIds = new Set(groups.map((group) => String(group.id || "")));
+        for (const groupId of groupMemberDrafts.keys()) if (!liveGroupIds.has(groupId)) groupMemberDrafts.delete(groupId);
+        renderGroups();
+      }
+      catch (error) {
+        if (generation !== groupLoadGeneration) return;
+        groups = []; groupsBody.innerHTML = tableState(4, publicError(error, "Não foi possível carregar os grupos."), "error");
+      }
     }
     async function loadQuarantine() {
       quarantineBody.innerHTML = tableState(6, "Carregando quarentena…", "loading");
@@ -273,7 +291,18 @@
         form.reset(); setFeedback(feedback, "Grupo criado.", "success"); ui.toast("Grupo criado.", "success"); await loadGroups();
       } catch (error) { const message = publicError(error, "Não foi possível criar o grupo."); if (message) setFeedback(feedback, message, "error"); }
       finally { button.disabled = false; }
-    });    folderSelect.addEventListener("change", loadFiles);
+    });
+    target.addEventListener("input", (event) => {
+      const input = event.target, groupId = String(input && input.dataset && input.dataset.groupId || "");
+      if (!groupId) return;
+      const group = groups.find((item) => String(item.id || "") === groupId);
+      if (!group) return;
+      const persistedValue = asArray(group.members).map(String).join(", ");
+      const draftValue = String(input.value == null ? "" : input.value);
+      if (draftValue === persistedValue) groupMemberDrafts.delete(groupId);
+      else groupMemberDrafts.set(groupId, draftValue);
+    });
+    folderSelect.addEventListener("change", loadFiles);
     fileSelect.addEventListener("change", loadSelectedFileAccess);
     saveAccess.addEventListener("click", async () => {
       const folderId = folderSelect.value, name = fileSelect.value;
@@ -320,7 +349,7 @@
         if (!group || !input) return;
         const members = input.value.split(",").map((item) => item.trim()).filter(Boolean);
         button.disabled = true;
-        try { await api.put(`/groups/${encodeURIComponent(group.id)}/members`, { members }); setFeedback(document.getElementById("group-feedback"), "Membros atualizados.", "success"); ui.toast("Membros do grupo atualizados.", "success"); await loadGroups(); }
+        try { await api.put(`/groups/${encodeURIComponent(group.id)}/members`, { members }); groupMemberDrafts.delete(String(group.id || "")); setFeedback(document.getElementById("group-feedback"), "Membros atualizados.", "success"); ui.toast("Membros do grupo atualizados.", "success"); await loadGroups(); }
         catch (error) { const message = publicError(error, "Não foi possível atualizar os membros."); if (message) setFeedback(document.getElementById("group-feedback"), message, "error"); button.disabled = false; }
         return;
       }
@@ -442,7 +471,7 @@
         <section class="grid grid-3 metric-grid" aria-label="Resumo da auditoria"><article class="panel metric-card"><span class="metric-label">Total de registros</span><strong class="metric-value" id="audit-total">—</strong></article><article class="panel metric-card"><span class="metric-label">Eventos críticos</span><strong class="metric-value" id="audit-critical">—</strong></article><article class="panel metric-card"><span class="metric-label">Logins falhos</span><strong class="metric-value" id="audit-failed-logins">—</strong></article></section>
         <section class="panel section-card" aria-labelledby="audit-table-title">
           <div class="section-heading"><div><h2 id="audit-table-title">Registros</h2><p id="audit-page-info" aria-live="polite">Carregando…</p></div><button type="button" class="button button-quiet" data-action="refresh-audit">Atualizar</button></div>
-          <div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">Data e hora</th><th scope="col">Evento</th><th scope="col">Severidade</th><th scope="col">Usuário</th><th scope="col">IP</th><th scope="col">Alvo</th><th scope="col">Resultado</th><th scope="col">Detalhes</th></tr></thead><tbody id="audit-body">${tableState(8, "Carregando registros…", "loading")}</tbody></table></div>
+          <div class="table-wrap"><table class="data-table audit-table"><thead><tr><th scope="col">Data e hora</th><th scope="col">Evento</th><th scope="col">Severidade</th><th scope="col">Usuário</th><th scope="col">IP</th><th scope="col">Alvo</th><th scope="col">Resultado</th><th scope="col">Detalhes</th></tr></thead><tbody id="audit-body">${tableState(8, "Carregando registros…", "loading")}</tbody></table></div>
           <nav class="toolbar" aria-label="Paginação dos registros de auditoria"><button type="button" class="button button-quiet" data-action="audit-previous" disabled>Anterior</button><button type="button" class="button button-quiet" data-action="audit-next" disabled>Próxima</button></nav>
         </section>
         <dialog id="audit-detail-dialog" class="preview-dialog" aria-labelledby="audit-detail-title"><div class="preview-dialog-heading"><h2 id="audit-detail-title">Detalhes do registro</h2><form method="dialog"><button type="submit" class="button button-quiet">Fechar</button></form></div><div class="preview-dialog-body"><pre id="audit-detail-content" class="preview-text-content"></pre></div></dialog>
@@ -471,7 +500,7 @@
         const rawIp = log.actor && log.actor.ip;
         const ip = ["::1", "::ffff:127.0.0.1", "127.0.0.1"].includes(rawIp) ? "localhost" : rawIp || "—";
         const targetLabel = log.target ? `${String(log.target.type || "alvo")}: ${String(log.target.id || "—")}` : "—";
-        return `<tr><td><time datetime="${esc(log.timestamp || "")}">${esc(ui.formatDate(log.timestamp))}</time></td><td>${esc(log.eventType || "—")}</td><td><span class="badge ${severityBadge}">${esc(log.severity || "—")}</span></td><td>${esc(log.actor && log.actor.username || "Sistema")}</td><td>${esc(ip)}</td><td>${esc(targetLabel)}</td><td><span class="badge ${resultBadge}">${esc(log.result || "—")}</span></td><td><button type="button" class="button button-quiet button-small" data-action="audit-details" data-log-index="${index}">Ver detalhes</button></td></tr>`;
+        return `<tr><td data-label="Data e hora"><time datetime="${esc(log.timestamp || "")}">${esc(ui.formatDate(log.timestamp))}</time></td><td data-label="Evento">${esc(log.eventType || "—")}</td><td data-label="Severidade"><span class="badge ${severityBadge}">${esc(log.severity || "—")}</span></td><td data-label="Usuário">${esc(log.actor && log.actor.username || "Sistema")}</td><td data-label="IP">${esc(ip)}</td><td data-label="Alvo">${esc(targetLabel)}</td><td data-label="Resultado"><span class="badge ${resultBadge}">${esc(log.result || "—")}</span></td><td data-label="Detalhes"><button type="button" class="button button-quiet button-small" data-action="audit-details" data-log-index="${index}">Ver detalhes</button></td></tr>`;
       }).join("");
     }
     async function loadSummary() {
@@ -503,7 +532,7 @@
     document.getElementById("audit-export").addEventListener("click", async (event) => {
       const button = event.currentTarget; button.disabled = true;
       const feedback = document.getElementById("audit-filter-feedback"); setFeedback(feedback, "Preparando CSV…");
-      try { await api.download(api.query("/audit/export", Object.assign({ format: "csv" }, currentFilters)), "rootark-audit.csv"); setFeedback(feedback, "Exportação iniciada.", "success"); }
+      try { await api.download(api.query("/audit/export", Object.assign({ format: "csv" }, currentFilters)), "rootark-audit.csv", { method: "POST" }); setFeedback(feedback, "Exportação iniciada.", "success"); }
       catch (error) { const message = publicError(error, "Não foi possível exportar os registros."); if (message) setFeedback(feedback, message, "error"); }
       finally { button.disabled = false; }
     });
@@ -537,8 +566,23 @@
     if (!canManage) { noAccess(target, "Backups exigem a permissão manageBackups."); return; }
     target.innerHTML = backupsMarkup();
     let backups = [];
+    let recoveryBlocked = false;
     const body = document.getElementById("backups-body"), warning = document.getElementById("backup-warning");
     const manifestPanel = document.getElementById("manifest-panel"), manifestContent = document.getElementById("manifest-content");
+    function blockForRestoreRecovery(message) {
+      recoveryBlocked = true;
+      warning.textContent = message;
+      warning.hidden = false;
+      warning.setAttribute("role", "alert");
+      target.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+    }
+    function blockOnRestoreRecovery(error, message) {
+      if (error?.status === 503 && (error.payload?.restartRequired || error.payload?.recoveryRequired)) {
+        blockForRestoreRecovery(message);
+        return true;
+      }
+      return false;
+    }
     function renderBackups() {
       if (!backups.length) { body.innerHTML = tableState(5, "Nenhum backup encontrado.", "empty"); return; }
       const labels = { success: "Concluído", completed: "Concluído", failed: "Falhou", creating: "Criando", running: "Em andamento" };
@@ -559,38 +603,64 @@
       } catch (error) {
         const message = publicError(error, "Não foi possível consultar o resultado do backup mais recente.");
         warning.textContent = message; warning.hidden = !message;
+        blockOnRestoreRecovery(error, message);
       }
     }
     async function loadBackups() {
       body.innerHTML = tableState(5, "Carregando backups…", "loading");
       await loadLatestStatus();
       try { backups = asArray((await api.get("/backups")).backups); renderBackups(); }
-      catch (error) { backups = []; body.innerHTML = tableState(5, publicError(error, "Não foi possível carregar os backups."), "error"); }
+      catch (error) {
+        backups = [];
+        const message = publicError(error, "Não foi possível carregar os backups.");
+        body.innerHTML = tableState(5, message, "error");
+        blockOnRestoreRecovery(error, message);
+      }
     }
     document.getElementById("create-backup").addEventListener("click", async (event) => {
       const button = event.currentTarget, feedback = document.getElementById("backup-feedback");
       button.disabled = true; setFeedback(feedback, "Criando backup…");
-      try { await api.post("/backups", { notes: "Backup manual via painel" }); setFeedback(feedback, "Backup criado.", "success"); ui.toast("Backup criado.", "success"); await loadBackups(); }
-      catch (error) { const message = publicError(error, "Não foi possível criar o backup."); if (message) setFeedback(feedback, message, "error"); }
-      finally { button.disabled = false; }
+      try {
+        const result = await api.post("/backups", { notes: "Backup manual via painel" });
+        if (result?.backupOperationState) {
+          setFeedback(feedback, result.warning || "Backup criado com uma etapa de manutenção pendente. Confira a lista antes de repetir a operação.", "warning");
+          await loadBackups();
+          return;
+        }
+        setFeedback(feedback, "Backup criado.", "success"); ui.toast("Backup criado.", "success"); await loadBackups();
+      }
+      catch (error) {
+        const message = publicError(error, "Não foi possível criar o backup.");
+        if (message) setFeedback(feedback, message, "error");
+        blockOnRestoreRecovery(error, message);
+      }
+      finally { button.disabled = recoveryBlocked; }
     });
     target.addEventListener("click", async (event) => {
       const button = event.target.closest("button[data-action]"); if (!button) return;
       const action = button.dataset.action;
-      if (action === "refresh-backups") { button.disabled = true; await loadBackups(); button.disabled = false; return; }
+      if (action === "refresh-backups") { button.disabled = true; await loadBackups(); button.disabled = recoveryBlocked; return; }
       if (action === "close-manifest") { manifestPanel.hidden = true; manifestContent.textContent = ""; return; }
       const backup = backups[Number(button.dataset.backupIndex)]; if (!backup) return;
       if (action === "download-backup") {
         button.disabled = true;
         try { await api.download(`/backups/${encodeURIComponent(backup.id)}/download`, String(backup.filename || "rootark-backup.zip")); ui.toast("Download iniciado.", "success"); }
-        catch (error) { const message = publicError(error, "Não foi possível baixar o backup."); if (message) ui.toast(message, "error"); }
-        finally { button.disabled = false; }
+        catch (error) {
+          const message = publicError(error, "Não foi possível baixar o backup.");
+          blockOnRestoreRecovery(error, message);
+          if (message) ui.toast(message, "error");
+        }
+        finally { button.disabled = recoveryBlocked; }
         return;
       }
       if (action === "show-manifest") {
         manifestPanel.hidden = false; manifestContent.textContent = "Carregando manifesto…";
         try { manifestContent.textContent = JSON.stringify(await api.get(`/backups/${encodeURIComponent(backup.id)}/manifest`), null, 2); }
-        catch (error) { manifestContent.textContent = publicError(error, "Não foi possível carregar o manifesto."); }
+        catch (error) {
+          const message = publicError(error, "Não foi possível carregar o manifesto.");
+          manifestContent.textContent = message;
+          blockOnRestoreRecovery(error, message);
+        }
         manifestPanel.scrollIntoView({ block: "nearest" });
         return;
       }
@@ -604,12 +674,20 @@
         const confirmation = String(result.get("confirmation") || "");
         if (confirmation !== "RESTORE") { ui.toast("Digite RESTORE exatamente para confirmar.", "error"); return; }
         button.disabled = true;
+        let restartRequired = false;
         try {
           const restored = await api.post(`/backups/${encodeURIComponent(backup.id)}/restore`, { confirmation });
-          ui.toast(restored && restored.restartRecommended ? "Backup restaurado. O serviço recomenda reiniciar a aplicação." : "Backup restaurado.", "success");
-          await loadBackups();
-        } catch (error) { const message = publicError(error, "Não foi possível restaurar o backup."); if (message) ui.toast(message, "error"); }
-        finally { button.disabled = false; }
+          restartRequired = Boolean(restored && restored.restartRecommended);
+          ui.toast(restartRequired ? "Backup restaurado. Reinicie todas as instâncias do servidor para liberar o acesso." : "Backup restaurado.", "success");
+          if (restartRequired) blockForRestoreRecovery("Backup restaurado. Reinicie todas as instâncias do servidor para liberar o acesso.");
+          if (!restartRequired) await loadBackups();
+        } catch (error) {
+          restartRequired = error?.status === 503 && Boolean(error.payload?.restartRequired || error.payload?.recoveryRequired);
+          const message = publicError(error, "Não foi possível restaurar o backup.");
+          if (restartRequired) blockForRestoreRecovery(message);
+          if (message) ui.toast(message, "error");
+        }
+        finally { button.disabled = restartRequired || recoveryBlocked; }
         return;
       }
       if (action === "delete-backup") {
@@ -617,7 +695,12 @@
         if (!accepted) return;
         button.disabled = true;
         try { await api.delete(`/backups/${encodeURIComponent(backup.id)}`); ui.toast("Backup excluído.", "success"); await loadBackups(); }
-        catch (error) { const message = publicError(error, "Não foi possível excluir o backup."); if (message) ui.toast(message, "error"); button.disabled = false; }
+        catch (error) {
+          const message = publicError(error, "Não foi possível excluir o backup.");
+          blockOnRestoreRecovery(error, message);
+          if (message) ui.toast(message, "error");
+          button.disabled = recoveryBlocked;
+        }
       }
     });
     await loadBackups();
@@ -637,6 +720,10 @@
     try { user = await ui.getSession(); }
     catch (error) {
       if (error && error.status === 401) { ui.redirectToLogin(); return; }
+      if (error?.status === 503 && (error.payload?.restartRequired || error.payload?.recoveryRequired)) {
+        root.innerHTML = `<main class="standalone-state" role="alert"><h1>Servidor em recuperação</h1><p>${esc(publicError(error, "O servidor está bloqueado para recuperação do backup."))}</p></main>`;
+        return;
+      }
       root.innerHTML = `<main class="standalone-state" role="alert"><h1>Não foi possível abrir esta página</h1><p>${esc(publicError(error, "A sessão não pôde ser validada. Tente novamente."))}</p><a class="button button-primary" href="/login.html">Ir para entrar</a></main>`;
       return;
     }

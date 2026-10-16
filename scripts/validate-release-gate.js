@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { isDependencyOrNetworkUnavailable } = require("./release-gate-environment");
 
 const root = path.resolve(__dirname, "..");
 const results = [];
@@ -15,12 +16,12 @@ function record(name, status, details) {
 
 function command(name, executable, args, { blockedOnMissing = false, shell = false } = {}) {
   const result = spawnSync(executable, args, { cwd: root, encoding: "utf8", windowsHide: true, shell });
-  const output = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
+  const output = `${result.stdout || ""}\n${result.stderr || ""}\n${result.error?.message || ""}`.trim();
   if (result.status === 0) {
     record(name, "PASS", "exit 0");
     return true;
   }
-  if (blockedOnMissing && /MODULE_NOT_FOUND|Cannot find module|better-sqlite3|network|ECONN|ENET|ETIMEDOUT|EAI_AGAIN|registry/i.test(output)) {
+  if (blockedOnMissing && (result.error?.code === "ENOENT" || isDependencyOrNetworkUnavailable(output))) {
     record(name, "BLOCKED", "dependency or network environment unavailable");
     return false;
   }
@@ -37,9 +38,9 @@ function checkLock() {
     assert.equal(lock.lockfileVersion, 3);
     assert.deepEqual(Object.keys(rootPackage.dependencies).sort(), Object.keys(manifest.dependencies).sort());
     assert.deepEqual(rootPackage.dependencies, manifest.dependencies);
-    assert.equal(brace.version, "5.0.9");
-    assert.equal(brace.resolved, "https://registry.npmjs.org/brace-expansion/-/brace-expansion-5.0.9.tgz");
-    assert.equal(brace.integrity, "sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg==");
+    assert.equal(brace.version, "5.0.12");
+    assert.equal(brace.resolved, "https://registry.npmjs.org/brace-expansion/-/brace-expansion-5.0.12.tgz");
+    assert.equal(brace.integrity, "sha512-YovQ3rzhaLMIrDjNDMkNS01tea93qhEhG5xy8f6+R0l+dw3Ki+5sCoIoI942iuLZTHWogWktgwVDhU09iNEimQ==");
     record("dependency lock/provenance", "PASS", `${Object.keys(lock.packages).length - 1} transitive package records; manifest parity preserved`);
   } catch (error) {
     record("dependency lock/provenance", "FAIL", error.message);

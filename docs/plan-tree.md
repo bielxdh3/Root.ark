@@ -1,15 +1,42 @@
 # Root.ark Plan Tree
 
-Last reconstructed: 2026-07-25
-Last branch reconciliation: 2026-08-13
+Last reconstructed: 2026-07-25 (historical baseline)
+Latest application and pre-publication GitHub/security snapshot: 2026-10-15 after PR #189; application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`. It records the state queried before documentation PR #175 was published.
 
-Repository: `bielxdh3/root.ark`
+Repository: bielxdh3/root.ark
 
-Current default branch verified: `Root/main` (GitHub repository settings and `git ls-remote --symref origin HEAD` verified 2026-08-13).
+PR #188 merged chunk-upload request limits at `a557bfec762d45ceb574146841b9dffbe1b7757e`. PR #189 merged at `bde6c54bee7a015822aa5463618bdf985ddf805d` and adds a test-only interrupted restore provider-policy pair recovery regression. Exact-SHA checks and browser evidence for this application revision are recorded in the [post-#189 validation snapshot](validation/2026-10-15-rootark-post-189.md). See the [issue ledger](issue-ledger.md) for the pre-publication issue/PR query and the restore limitation. The [post-#171 snapshot](validation/2026-10-14-rootark-post-171.md), [post-#169 snapshot](validation/2026-10-12-rootark-post-169.md), and earlier records link directly to their historical evidence.
 
-Current canonical baseline HEAD verified: `28747c6ebdac873650e2d5a3c6193824e7cc9985` (`origin/HEAD` and `refs/heads/Root/main`).
+Historical sections below preserve their original evidence and claims; they are not current live status. The application checks in this pre-publication snapshot do not transfer to the separate documentation publication or its resulting default-branch SHA.
+
+Historical canonical baseline HEAD at the 2026-10-01 reconciliation start: `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (`refs/heads/Root/main`). It is not the current default-branch SHA.
 
 Historical reconstruction baseline retained for provenance: `4062f4c67bfda9d144aceb6dbbed539b8a917e4a` (2026-07-25).
+
+## Historical live GitHub reconciliation — 2026-10-01
+
+This dated section superseded older statements at the time it was written. Its issue, branch, and PR states are historical; use the current snapshot linked above for live state. Historical phase reports below retain their original dates and evidence boundaries.
+
+- The live default branch was `Root/main` at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`. At that snapshot GitHub had seven open issues (#63–68 and #94) and one open PR (#95).
+- Issue #83 is closed. Its sensitive-name policy remains active: `.env`, credential/service-account names, and private-key/certificate extensions remain excluded from backup content and quarantine payload references. PRs #86 and #90 contain its completion evidence.
+- PR #96 is merged at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1`; its exact-head CodeQL analysis, dependency review, Ubuntu validation, Windows validation, and GHAS scan passed. This does not authorize a release.
+- Issue #94 is represented by PR #95, which remains open. Exact head `95d99e4a934384fcfa2101dfc210741cd791a3d1` passes CodeQL, Analyze JavaScript / TypeScript, dependency review, Ubuntu Node 22 full validation, and Windows Node 22 syntax/tests. The focused upload-security suite passes 26/26, and targeted independent reviews approve parser ordering and server-generated staging-path identity/cleanup. Production replica topology is still unknown; the in-memory limiter and local-disk staging need shared/edge enforcement or confirmed single-process deployment before #94 can close.
+- Issue #63 is an approved future feature tracker, not implementation authorization. The protected-index primitive exists, but the UI does not populate it; FTS5 and advanced search remain deferred until the searchable corpus, encrypted-index lifecycle, privacy leakage, and acceptance criteria are defined.
+- Issue #64 is a future Android-client tracker, not implementation authorization. There is no Android/Gradle project or Android CI. A native implementation remains gated on a separate architecture/threat-model and protocol-compatibility test plan.
+- Issue #65 approves the Zero-Knowledge direction and bounded cryptographic foundation; it does not establish a Zero-Knowledge runtime. Current uploads and server-side operations can still expose plaintext. Migration inventory, client authorization, recovery authority, mixed-mode window, and exact-head runtime/backup acceptance remain open.
+- Issue #66 is approved but not complete. PR #97 implements selected-path reconciliation, remote-only state, and guarded cache/materialization flows. Metadata-only remote listing and pagination, a Files On-Demand native provider/UI, and a portable guarantee that eviction cannot race an external writer with an open handle remain missing.
+- Issue #67 is approved but not complete: existing backups and sync revisions are recovery prerequisites, not a ransomware shield. Burst detection, a recoverable pause/review barrier, protected per-object recovery history, and authorized restore are absent.
+- Issue #68 is approved but not complete: existing public links are single-file bearer links with expiry/limits, not operation-scoped capabilities. Protected-link delivery remains gated on least-privilege capability enforcement and owner choices for link UX, expiry, and recipient recovery.
+
+## Historical reconciliation work after the live baseline — 2026-10-01
+
+This addendum records the published work after the live GitHub baseline above. PR #97 remains open and unmerged; PR #98 was merged into `Root/main` at `1df5e4640d4aea7dc700f2088059f489c2e51af0`. Neither PR changes issue state or marks an issue complete. PR #95 remains open after all exact-head checks passed because production replica topology is still unverified.
+
+- Issue #64 has a native-client architecture and threat-model document only. No Android application, Gradle project, build, or CI exists.
+- Issue #65 has a Zero-Knowledge migration contract and a read-only inventory prototype limited to explicitly selected fixture files under an operating-system temporary directory. The prototype reports recognized legacy encryption modes using run-scoped opaque references; it does not inspect live application storage or establish migration readiness. Its four focused tests pass. Runtime migration, authorization, recovery authority, mixed-mode window, backup/restore acceptance, and the remaining owner decisions are still open.
+- Issue #66 has a selective-sync implementation in PR #97 at `a6a33a92cd6902f303254e60031da4bdc04cec04`, including selected-path tracking, remote-only state, move-out reconciliation, and guarded cache/materialization flows. The focused `test/phase16-sync-engine.test.js` run records 31 passing tests and one platform-skipped test. The current list API still transfers complete remote records including ciphertext before local path filtering, so network payload transfer is not selective. Exact-head CodeQL, Analyze JavaScript / TypeScript, dependency review, and Ubuntu/Windows CI pass; an independent targeted review of the move-out change found no actionable findings. There is no Windows Files On-Demand provider/UI, metadata-only catalog, or paginated remote listing, and portable open-handle quiescence for eviction is unresolved. PR #97 and the issue remain open.
+- Issues #67 and #68 have architecture/acceptance contracts only. No runtime protection or capability-sharing feature is implemented; the owner choices recorded in those contracts remain unresolved.
+- PR #98 merged the previous documentation reconciliation. This update records the later #95/#97 checks and open acceptance gates above.
 
 ## Status labels
 
@@ -29,23 +56,26 @@ A feature is not `[DONE]` merely because files, routes, UI, or documentation exi
 ## Source-of-truth order
 
 1. Current code and tests on the actual branch.
-2. This plan tree for phase order and state.
-3. Dedicated security, architecture, operations, and validation documents.
-4. GitHub issues for executable scope.
-5. Historical chat context only as input, never as proof.
+2. `docs/issue-ledger.md` for the latest verified live GitHub issue, PR, and default-branch snapshot.
+3. This plan tree for phase order and historical acceptance evidence.
+4. Dedicated security, architecture, operations, and validation documents.
+5. GitHub issues for executable scope.
+6. Historical chat context only as input, never as proof.
 
-Issue reconciliation ledger: `docs/issue-ledger.md` (locally reconciled 2026-08-13; remote issue state was not mutated). The canonical Phase 11 Issue #6 reconciliation is `docs/roadmap/phase-11-backlog-reconciliation.md` and records `PHASE_11_BACKLOG_RECONCILED` at the accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
+The issue ledger begins with the post-#174 GitHub snapshot and labels later changes as point-in-time evidence. Re-query GitHub for live state after that snapshot; older dated reconciliations below remain historical evidence.
 
 Master Phase 0-16 ledger and independent local blocker taxonomy: `docs/issue-ledger.md`. The governing continuation supplies the original meanings for all phases; local statuses and evidence are reconciled there without converting design or historical evidence into acceptance.
 
-## 0. Current product snapshot
+## 0. Historical product snapshot
+
+This product inventory was reconstructed before the 2026-10-07 live-state snapshot above. Treat its implementation labels as dated evidence rather than current release acceptance.
 
 ### Application identity
 
 - `[IMPLEMENTED-UNVERIFIED]` Independent Node.js/Express file-management application currently exists in this repository.
 - `[DECIDED]` D-001 keeps this repository actively developed as Root.ark while allowing only a future, explicitly designed and approved migration or selective reuse into BielOS. Track remaining relationship consequences in issue #10.
-- `[DECISION REQUIRED]` Confirm final spelling and branding: `Root.ark`, `root.ark`, `root.arc`, or another approved name. Track in issue #4.
-- `[DONE]` Root/main is the verified canonical/default branch: GitHub reports `Root/main`, and `origin/HEAD` plus `refs/heads/Root/main` resolve to `28747c6ebdac873650e2d5a3c6193824e7cc9985` (verified 2026-08-13). The `codex/folders-acl` references remain historical provenance; CI now targets `Root/main`, with no history rewrite or remote mutation performed. Issue #14 is locally closure-ready; remote issue closure is not claimed here.
+- `[HISTORICAL DECISION REQUIRED AS OF 2026-08-13; RESOLVED 2026-08-17]` Issue #4 later resolved the final product name as `Root.ark`; any future visual rebrand remains a separate owner/product decision.
+- `[RECONCILED — historical 2026-08-13]` At that local reconciliation, GitHub reported `Root/main` and `origin/HEAD` resolved to `28747c6ebdac873650e2d5a3c6193824e7cc9985`. That SHA is historical; the current default-branch SHA is recorded in `docs/issue-ledger.md`. The `codex/folders-acl` references remain historical provenance. Issue #14 was locally closure-ready at that time; remote issue closure was not claimed.
 
 ### Verified code-level capabilities
 
@@ -239,7 +269,7 @@ Prerequisites: critical security fixes complete and disposable local workspace a
 - `[BLOCKED]` Verify safe file upload.
 - `[BLOCKED]` Verify suspicious extension handling.
 - `[BLOCKED]` Verify quarantine invisibility and access denial.
-- `[BLOCKED]` Verify ClamAV-unavailable fail-open/fail-closed behavior.
+- `[DONE]` Verify unavailable ClamAV fails closed by default: simple, final-chunk, and WebDAV PUT uploads are quarantined with 503 before pending registration or approval; unknown providers fail startup; production rejects disabled or fail-open scanner configuration. Focused disposable regressions passed 4/4 in the follow-up worktree based on `dec7ef02f86adc07c7f17f7d834c7bed92026ca4`.
 - `[BLOCKED]` Run live ClamAV validation only when the daemon is actually available.
 - `[BLOCKED]` Verify simple, chunked, pending, preview, download, share, cloud-sync, and audit boundaries.
 
@@ -295,10 +325,10 @@ Prerequisites: phases 2.1 through 2.3 complete and relevant tests covering each 
 - `[DONE]` Extract the realtime transport and notification fan-out boundary into `src/realtime/server.js`; retain thin compatibility adapters in `server.js`, preserve the shared `parseBoundedNumber` helper used by WebDAV, and leave producer call sites and public contracts unchanged.
 - `[DONE]` Validate the extracted working tree with realtime transport 7/7 twice, auth-security 13/13, realtime/WebDAV meta-remediation 62/62, combined realtime/auth 20/20, syntax checks, and `git diff --check` at local base `28747c6ebdac873650e2d5a3c6193824e7cc9985`.
 - `[IMPLEMENTED-UNVERIFIED]` Buffered-client close is not directly covered; browser, CI, provider, production, and remote-closure behavior remain outside this local phase.
-- `[DONE]` Add disposable upload-scanning contract coverage for ClamAV-unavailable fail-open, fail-closed quarantine, clean INSTREAM parsing, infected INSTREAM quarantine, suspicious extensions, and path containment in `test/upload-security.test.js`; the focused suite passed 16/16 twice locally.
-- `[IMPLEMENTED-UNVERIFIED]` Live ClamAV daemon behavior, chunked/WebDAV/provider/production scan-entry parity, and zero-knowledge client-side scanning remain unverified or architecturally open.
-- `[DONE]` Extract the current upload scanning/quarantine boundary into deliverable `src/upload-scanning.js`; preserve the thin `server.js` adapter, all three entry points, fail-open/fail-closed semantics, quarantine/audit contracts, and D-009's unverified-quarantine limitation.
-- `[DONE]` Validate the extracted working tree with upload-security 16/16 twice, realtime transport 7/7, auth-security 13/13, realtime/WebDAV meta-remediation 62/62, syntax checks, and `git diff --check` at local base `28747c6ebdac873650e2d5a3c6193824e7cc9985`.
+- `[HISTORICAL]` Earlier disposable upload-scanning coverage included ClamAV-unavailable fail-open, fail-closed quarantine, clean INSTREAM parsing, infected INSTREAM quarantine, suspicious extensions, and path containment; the recorded focused suite passed 16/16 twice in that earlier working tree. The fail-open expectation is not the current safe default.
+- `[IMPLEMENTED-UNVERIFIED]` Live ClamAV daemon/provider behavior and zero-knowledge client-side scanning remain unverified; current route regressions cover unavailable-scanner fail-closed behavior across simple, final-chunk, and WebDAV PUT entry points.
+- `[HISTORICAL]` An earlier working-tree note recorded extraction to `src/upload-scanning.js` at local base `28747c6ebdac873650e2d5a3c6193824e7cc9985`. That module is absent at current base `dec7ef02f86adc07c7f17f7d834c7bed92026ca4`; upload scanning and quarantine are inline in `server.js` here.
+- `[HISTORICAL]` The earlier extraction validation record remains attached to its local base `28747c6ebdac873650e2d5a3c6193824e7cc9985`; it is not evidence for the current implementation.
 - `[DONE]` Validate the existing `services/cloudStorage.js` boundary with mock-only inventory contracts for S3/Drive prefix, parent, metadata, and duplicate-identity containment; `test/cloud-storage.test.js` passed 27/27 twice without provider credentials.
 - `[IMPLEMENTED-UNVERIFIED]` No redundant cloud runtime extraction was made; external provider behavior and D-003/D-009 compatibility remain unverified.
 - `[DONE]` Validate the existing direct-protocol WebDAV boundary with executable/oversize/abort, completed-journal recovery, crash-consistency, and meta-remediation suites (90/90 combined); no OS mount or runtime extraction was claimed.
@@ -337,10 +367,10 @@ This track may proceed conversationally in parallel with stabilization. Runtime 
 
 ### Phase 5.0: Product identity and repository relationship
 
-- `[PARALLEL-DISCOVERY]` Final product name and branding.
+- `[DECIDED]` The final product name is `Root.ark`; any future visual rebrand or broader branding direction requires a separate owner/product decision.
 - `[DECIDED]` D-001 keeps Root.ark active in this repository; future migration or selective reuse into BielOS requires a dedicated architecture, security, and contract phase.
 - `[DECIDED]` Root.ark runtime, data, sessions, and authentication remain independent until an explicit integration is designed and approved.
-- `[DONE]` Document the current independent Root.ark/BielOS boundary in `docs/architecture/rootark-bielos-relationship-contract.md`; Issue #10 is closure-ready locally, while future integration, migration, identity, and key relationships remain owner-dependent and the remote issue was not changed.
+- `[DONE]` Document the current independent Root.ark/BielOS boundary in `docs/architecture/rootark-bielos-relationship-contract.md`; Issue #10 was closed on 2026-08-17. Future integration, migration, identity, and key relationships remain owner-dependent and require separate approval.
 - `[PARALLEL-DISCOVERY]` Existing features to preserve, redesign, or retire.
 
 ### Phase 5.1: Users and trust model
@@ -385,11 +415,13 @@ This track may proceed conversationally in parallel with stabilization. Runtime 
 
 ### Phase 5.4: Approved product brief
 
-- `[DONE]` Record approved Round 1 decisions D-001 through D-003 with consequences and follow-up dependencies; keep Issue #4 open.
-- `[DONE]` Record approved Round 2 decisions D-004 through D-006 with consequences and explicitly open deferred details; keep Issue #4 open, while Issue #10's independent relationship is closure-ready locally and future integration remains owner-dependent.
-- `[DONE]` Record approved Round 3 decisions D-007 through D-009 with consequences and explicitly open expert architecture and implementation details; keep Issue #4 open, while Issue #10's independent relationship is closure-ready locally and future integration remains owner-dependent.
+The Round 1–3 status notes below preserve the local decision state at those checkpoints. Issues #4 and #10 were later closed in GitHub on 2026-08-17; the current issue status and remaining implementation gates are recorded in section 8.
+
+- `[DONE]` Record approved Round 1 decisions D-001 through D-003 with consequences and follow-up dependencies; this checkpoint kept Issue #4 open pending final closeout.
+- `[DONE]` Record approved Round 2 decisions D-004 through D-006 with consequences and explicitly open deferred details; this checkpoint kept Issue #4 open, while Issue #10's independent relationship was closure-ready locally and future integration remained owner-dependent.
+- `[DONE]` Record approved Round 3 decisions D-007 through D-009 with consequences and explicitly open expert architecture and implementation details; this checkpoint kept Issue #4 open, while Issue #10's independent relationship was closure-ready locally and future integration remained owner-dependent.
 - `[DONE]` Add `docs/architecture/rootark-bielos-relationship-contract.md` and `docs/architecture/zero-knowledge-migration-contract.md` for the high-risk relationship and zero-knowledge boundaries; these are architecture/threat-model deliverables, not runtime implementation or product acceptance.
-- `[DONE]` Synchronize this plan tree with the accepted relationship, zero-knowledge, and parity documents while preserving owner-dependent choices, current implementation limitations, and no-remote-closure language.
+- `[DONE]` Synchronize this plan tree with the accepted relationship, zero-knowledge, and parity documents while preserving owner-dependent choices, current implementation limitations, and dated local decision states as historical evidence.
 - `[BLOCKED]` Do not silently reinterpret old implementation as the final product contract.
 
 ## 6. Feature backlog
@@ -402,7 +434,7 @@ All items below are candidates, not commitments.
 
 - `[ACCEPTED-LOCAL]` `PHASE_11_BACKLOG_RECONCILED` is recorded in `docs/roadmap/phase-11-backlog-reconciliation.md` for the exact accepted Phase 10 starting SHA `76f2a02cf6e3872ab2d7b61ff617021daf893c61`.
 - `[DO NOT IMPLEMENT YET]` The canonical nine-item matrix maps current evidence, status, prerequisites, security boundaries, owner decisions, implementation boundaries, acceptance, validation, dependencies, and the required separate future issue for every candidate.
-- `[DO NOT IMPLEMENT YET]` TOTP is reconciled to accepted Phase 10; bidirectional sync and WebDAV mutations target Phase 12; search, previews, PWA/clients, groups, and admin UX target Phase 13; deployment prerequisites target Phase 14; naming and branding remain an owner/product decision.
+- `[DO NOT IMPLEMENT YET]` TOTP is reconciled to accepted Phase 10; bidirectional sync and WebDAV mutations target Phase 12; search, previews, PWA/clients, groups, and admin UX target Phase 13; deployment prerequisites target Phase 14. At the 2026-08-16 reconciliation, naming and branding remained an owner decision; Issue #4 resolved the product name as `Root.ark` on 2026-08-17, and any future visual rebrand remains a separate owner/product decision.
 - `[HISTORICAL SCOPE]` No Phase 12+ source, test, migration, UI, dependency, synchronization, WebDAV, deployment, or product implementation was authorized by that reconciliation turn; later phase-specific authorizations and evidence are recorded below.
 
 ### Phase 12: ZK sync and local WebDAV bridge — 2026-08-16
@@ -433,7 +465,7 @@ All items below are candidates, not commitments.
 - `[ACCEPTED-LOCAL]` Protocol v2 metadata AAD/schema enforcement, recoverable WebDAV overwrite journaling, bidirectional encrypted sync, strict client/offline boundaries, protected index/preview identity binding, and approved `rootark-zk-1` opaque group wraps are implemented and locally reviewed.
 - `[ACCEPTED-LOCAL]` The controlled final-head cross-phase matrix recorded 66/66 tests passed, with separate realtime transport 4/4 and upload-security 12/12 boundary runs; syntax validation recorded 116/116 passed. WebDAV PUT has a distinct durable mutation event and explicit protocol-v2 translation, and the browser protected store now has an in-memory session hook.
 - `[BLOCKED]` Canonical full `npm test` was attempted but remains blocked by the unavailable `better-sqlite3` native binding in the disposable install; remote CI, browser/provider/live-production/TLS, owner approval, and release evidence remain external.
-- `[NOT_AUTHORIZED]` The associated PR remains Draft and release authorization is `NOT_AUTHORIZED`; no Phase 17 item is created or inferred.
+- `[RECONCILED — 2026-10-06]` The previously unnamed Draft-PR statement cannot be mapped to a current live PR. PR #96 is merged; PR #95 remains open with its current CodeQL and Security Regression checks passing, while Issue #94's multi-process/replica enforcement gate remains unresolved. Merge state is not release authorization; no Phase 17 item is created or inferred.
 
 ### Authentication and administration
 
@@ -459,7 +491,7 @@ All items below are candidates, not commitments.
 
 ### Product and interface
 
-- `[DO NOT IMPLEMENT YET]` Final rename and branding migration.
+- `[DO NOT IMPLEMENT YET]` Future visual rebrand or route/branding migration; none is authorized by the product-name decision alone.
 - `[ACCEPTED-LOCAL]` Minimal groups admin section and protected-search/offline status panel are wired into the existing UI; no redesign was performed.
 - `[DO NOT IMPLEMENT YET]` New product features proposed casually in chat without discovery and issue creation.
 
@@ -487,11 +519,11 @@ All items below are candidates, not commitments.
 
 ## 8. Immediate execution order
 
-Historical completed checkpoints, retained as evidence rather than future work: Issues #11, #1, #2, #3, and #7 are closed/completed in the live repository state.
+Issues #1, #2, #3, #4, #6, #7, #9, #10, and #11 were closed in the live repository state by 2026-08-17; their dated checkpoint notes remain historical evidence and do not imply that separately tracked future features are implemented.
 
 1. `[NEXT]` Measure JSON/SQLite parity and migration/restart behavior with disposable fixtures; native binding availability and final SQLite production policy remain open.
-2. `[PARALLEL-DISCOVERY]` Continue structured product discovery; Rounds 1 through 3 are recorded, Issue #4 remains open, and Issue #10's current independent relationship is closure-ready locally while future integration remains owner-dependent; the remote issue was not changed.
-3. `[BLOCKED]` Approve individual future features only after stabilization and discovery. Issue #6 is reconciled locally, but every candidate remains gated by its prerequisites, owner decisions, and a separate approved issue; Issue #9 remains separately gated.
+2. `[DONE]` Structured product discovery Rounds 1 through 3 and decision D-010 are recorded; Issues #4 and #10 were closed on 2026-08-17. Future implementation still requires a separate approved issue and its prerequisites; Issues #63 and #64 do not authorize implementation.
+3. `[BLOCKED]` Approve individual future features only after stabilization and discovery. Issues #6 and #9 were closed on 2026-08-17; any remaining or new feature work still requires its prerequisites, owner decisions, and a separate approved issue.
 
 ## 9. Plan-tree update rule
 

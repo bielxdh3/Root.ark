@@ -5,6 +5,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const Database = require("better-sqlite3");
 const test = require("node:test");
+require("./isolated-runtime")(test, "rootark-sqlite-meta-runtime-");
 
 const restoreService = require("../services/restoreService");
 
@@ -117,7 +118,16 @@ test("SQLite disaster-recovery meta-remediation matrix", async (t) => {
       const f = makeFixture(); try { assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "replacement.move.primary", simulateCrash: true })); assert.equal(restoreService.recoverDatabaseRestore(f.destinationPath).phase, "rolled_back"); assert.equal(restoreService.recoverDatabaseRestore(f.destinationPath).reason, "no_journal"); assert.equal(readValue(f.destinationPath), "old"); } finally { f.cleanup(); }
     }],
     ["21 committed journal cleanup is safe", () => {
-      const f = makeFixture(); try { assert.equal(restoreService.restoreDatabaseFiles(f.sourceRoot), true); const journalPath = restoreService.databaseJournalPath(f.destinationPath); const transactionId = crypto.randomUUID(); const journal = { version: 1, transactionId, destination: path.resolve(f.destinationPath), journalPath, stagePrefix: `${f.destinationPath}.restore-stage-${transactionId}`, rollbackPrefix: `${f.destinationPath}.restore-rollback-${transactionId}`, phase: "committed", originalPresent: { "": true, "-wal": false, "-shm": false }, stagedPresent: { "": true, "-wal": false, "-shm": false }, completedOperations: [] }; fs.writeFileSync(journalPath, JSON.stringify(journal)); assert.equal(restoreService.recoverDatabaseRestore(f.destinationPath).phase, "committed"); assert.equal(readValue(f.destinationPath), "new"); } finally { f.cleanup(); }
+      const f = makeFixture(); try {
+        const originalSha256 = { "": crypto.createHash("sha256").update(fs.readFileSync(f.destinationPath)).digest("hex"), "-wal": null, "-shm": null };
+        assert.equal(restoreService.restoreDatabaseFiles(f.sourceRoot), true);
+        const journalPath = restoreService.databaseJournalPath(f.destinationPath);
+        const transactionId = crypto.randomUUID();
+        const journal = { version: 1, transactionId, destination: path.resolve(f.destinationPath), journalPath, stagePrefix: `${f.destinationPath}.restore-stage-${transactionId}`, rollbackPrefix: `${f.destinationPath}.restore-rollback-${transactionId}`, phase: "committed", originalPresent: { "": true, "-wal": false, "-shm": false }, stagedPresent: { "": true, "-wal": false, "-shm": false }, originalSha256, completedOperations: [] };
+        fs.writeFileSync(journalPath, JSON.stringify(journal));
+        assert.equal(restoreService.recoverDatabaseRestore(f.destinationPath).phase, "committed");
+        assert.equal(readValue(f.destinationPath), "new");
+      } finally { f.cleanup(); }
     }],
     ["22 malformed journal fails closed", () => {
       const f = makeFixture(); try { fs.writeFileSync(restoreService.databaseJournalPath(f.destinationPath), "{"); assert.throws(() => restoreService.recoverDatabaseRestore(f.destinationPath), /Journal SQLite invalido/); assert.equal(readValue(f.destinationPath), "old"); } finally { f.cleanup(); }
@@ -147,7 +157,7 @@ test("SQLite disaster-recovery meta-remediation matrix", async (t) => {
       const f = makeFixture(); try { restoreService.restoreDatabaseFiles(f.sourceRoot); assert.equal(readValue(f.destinationPath), "new"); assert.equal(fs.existsSync(path.join(f.dir, "data", "rootark.sqlite")), false); } finally { f.cleanup(); }
     }],
     ["31 no raw failure text is persisted in journal", () => {
-      const f = makeFixture(); try { assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "replacement.move.primary", simulateCrash: true })); const raw = fs.readFileSync(restoreService.databaseJournalPath(f.destinationPath), "utf8"); assert.equal(raw.includes("Error"), false); restoreService.recoverDatabaseRestore(f.destinationPath); } finally { f.cleanup(); }
+      const f = makeFixture(); try { assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "replacement.move.primary", simulateCrash: true }), /Falha injetada.*replacement\.move\.primary/i); const raw = fs.readFileSync(restoreService.databaseJournalPath(f.destinationPath), "utf8"); assert.equal(raw.includes("Error"), false); restoreService.recoverDatabaseRestore(f.destinationPath); } finally { f.cleanup(); }
     }],
     ["32 successful commit leaves no stage artifacts", () => {
       const f = makeFixture(); try { restoreService.restoreDatabaseFiles(f.sourceRoot); assert.deepEqual(artifactNames(f), []); } finally { f.cleanup(); }
@@ -182,11 +192,41 @@ test("SQLite disaster-recovery meta-remediation matrix", async (t) => {
     ["42 rollback restores after primary move crash", () => {
       const f = makeFixture(); try { assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "original.move.primary", simulateCrash: true })); restoreService.recoverDatabaseRestore(f.destinationPath); assert.equal(readValue(f.destinationPath), "old"); } finally { f.cleanup(); }
     }],
+    ["SQLite journal hashing streams database artifacts through interrupted restore recovery", () => {
+      const f = makeFixture();
+      const originalReadFileSync = fs.readFileSync;
+      const databasePath = path.resolve(f.destinationPath);
+      const databaseArtifacts = new Set([databasePath, `${databasePath}-wal`, `${databasePath}-shm`]);
+      fs.readFileSync = function rejectWholeDatabaseReads(pathname, ...args) {
+        const candidate = path.resolve(String(pathname));
+        if (databaseArtifacts.has(candidate) || candidate.startsWith(`${databasePath}.restore-rollback-`)) {
+          throw new Error("SQLite database artifacts must not be loaded into one Buffer");
+        }
+        return originalReadFileSync.call(this, pathname, ...args);
+      };
+      try {
+        assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "replacement.move.primary", simulateCrash: true }), /replacement.move.primary/);
+        assert.equal(restoreService.recoverDatabaseRestore(f.destinationPath).recovered, true);
+        assert.equal(readValue(f.destinationPath), "old");
+      } finally {
+        fs.readFileSync = originalReadFileSync;
+        f.cleanup();
+      }
+    }],
     ["43 recovery refuses multiple legacy rollback candidates", () => {
       const f = makeFixture(); try { fs.rmSync(f.destinationPath); fs.writeFileSync(`${f.destinationPath}.restore-rollback-a`, "a"); fs.writeFileSync(`${f.destinationPath}.restore-rollback-b`, "b"); assert.throws(() => restoreService.recoverDatabaseRollback(f.destinationPath), /ambiguos/); } finally { f.cleanup(); }
     }],
-    ["44 legacy rollback restores primary and sidecar", () => {
-      const f = makeFixture(); try { fs.rmSync(f.destinationPath); const legacy = `${f.destinationPath}.restore-rollback-legacy`; fs.copyFileSync(f.sourcePath, legacy); fs.writeFileSync(`${legacy}-wal`, "sidecar"); restoreService.recoverDatabaseRollback(f.destinationPath); assert.equal(fs.existsSync(f.destinationPath), true); assert.equal(fs.readFileSync(`${f.destinationPath}-wal`, "utf8"), "sidecar"); } finally { f.cleanup(); }
+    ["44 legacy rollback preserves a candidate with an aliased WAL sidecar", () => {
+      const f = makeFixture(); const legacy = `${f.destinationPath}.restore-rollback-${crypto.randomUUID()}`;
+      try {
+        fs.rmSync(f.destinationPath);
+        fs.copyFileSync(f.sourcePath, legacy);
+        fs.linkSync(f.sourcePath, `${legacy}-wal`);
+        assert.throws(() => restoreService.recoverDatabaseRollback(f.destinationPath), /aliased|legacy SQLite rollback candidate|manual recovery/i);
+        assert.equal(fs.existsSync(f.destinationPath), false);
+        assert.equal(fs.existsSync(legacy), true);
+        assert.equal(fs.existsSync(`${legacy}-wal`), true);
+      } finally { f.cleanup(); }
     }],
     ["45 missing rollback with moved original fails closed", () => {
       const f = makeFixture(); try { assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "original.move.primary", simulateCrash: true })); const journalPath = restoreService.databaseJournalPath(f.destinationPath); const journal = JSON.parse(fs.readFileSync(journalPath)); fs.rmSync(`${f.destinationPath}.restore-rollback-${journal.transactionId}`, { force: true }); assert.throws(() => restoreService.recoverDatabaseRestore(f.destinationPath), /perdeu o original/); } finally { try { fs.rmSync(restoreService.databaseJournalPath(f.destinationPath), { force: true }); } catch {} f.cleanup(); }
@@ -202,6 +242,62 @@ test("SQLite disaster-recovery meta-remediation matrix", async (t) => {
     }],
     ["49 retry after failed restore succeeds", () => {
       const f = makeFixture(); try { assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "replacement.move.primary" })); assert.equal(restoreService.restoreDatabaseFiles(f.sourceRoot), true); assert.equal(readValue(f.destinationPath), "new"); } finally { f.cleanup(); }
+    }],
+    ["interrupted SQLite journal update preserves the prior recovery journal", () => {
+      const f = makeFixture();
+      const journalPath = restoreService.databaseJournalPath(f.destinationPath);
+      const originalWriteFileSync = fs.writeFileSync;
+      let temporaryWrites = 0;
+      let abandonedTemporary;
+      fs.writeFileSync = function interruptJournalUpdate(pathname, data, options) {
+        const candidate = path.resolve(String(pathname));
+        if (candidate.startsWith(`${path.resolve(journalPath)}.`) && candidate.endsWith(".tmp") && ++temporaryWrites === 2) {
+          abandonedTemporary = candidate;
+          originalWriteFileSync.call(this, pathname, String(data).slice(0, 12), options);
+          throw Object.assign(new Error("injected interrupted journal update"), { code: "EIO" });
+        }
+        return originalWriteFileSync.call(this, pathname, data, options);
+      };
+      try {
+        assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { simulateCrash: true }), /interrupted journal update/);
+      } finally { fs.writeFileSync = originalWriteFileSync; }
+      try {
+        assert.ok(abandonedTemporary, "the interrupted update leaves only its unique temporary journal");
+        assert.doesNotThrow(() => JSON.parse(fs.readFileSync(journalPath, "utf8")), "the previously committed recovery journal must remain intact");
+        originalWriteFileSync(abandonedTemporary, "partial abandoned journal", { flag: "wx" });
+        const recoveryWrites = [];
+        fs.writeFileSync = function recordRecoveryJournalWrites(pathname, data, options) {
+          if (path.resolve(String(pathname)).startsWith(`${path.resolve(journalPath)}.`) && String(pathname).endsWith(".tmp")) {
+            recoveryWrites.push({ pathname: path.resolve(String(pathname)), flag: options?.flag });
+          }
+          return originalWriteFileSync.call(this, pathname, data, options);
+        };
+        assert.doesNotThrow(() => restoreService.recoverDatabaseRestore(f.destinationPath));
+        assert.ok(recoveryWrites.length > 0);
+        assert.ok(recoveryWrites.every((entry) => entry.pathname !== abandonedTemporary && entry.flag === "wx"), "recovery must use fresh exclusive journal temporaries");
+        assert.equal(fs.readFileSync(abandonedTemporary, "utf8"), "partial abandoned journal", "restart recovery must not reuse an abandoned temporary");
+        assert.equal(readValue(f.destinationPath), "old");
+        assert.equal(fs.existsSync(journalPath), false);
+        fs.rmSync(abandonedTemporary, { force: true });
+        assert.deepEqual(artifactNames(f), []);
+      } finally { fs.writeFileSync = originalWriteFileSync; f.cleanup(); }
+    }],
+    ["directory fsync EIO fails restore closed and permits later recovery", (t) => {
+      if (process.platform === "win32") return t.skip("Node does not expose portable directory fsync on Windows");
+      const f = makeFixture();
+      const originalFsyncSync = fs.fsyncSync;
+      fs.fsyncSync = function failDirectorySync(fd) {
+        if (fs.fstatSync(fd).isDirectory()) throw Object.assign(new Error("injected directory fsync failure"), { code: "EIO" });
+        return originalFsyncSync.call(this, fd);
+      };
+      try {
+        assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot), { code: "EIO" });
+        assert.equal(readValue(f.destinationPath), "old", "failed directory durability must not replace the original database");
+      } finally { fs.fsyncSync = originalFsyncSync; }
+      try {
+        restoreService.recoverDatabaseRestore(f.destinationPath);
+        assertOriginalSafe(f);
+      } finally { f.cleanup(); }
     }],
     ["50 retry after crash recovery succeeds", () => {
       const f = makeFixture(); try { assert.throws(() => restoreService.restoreDatabaseFiles(f.sourceRoot, { failAt: "replacement.move.primary", simulateCrash: true })); restoreService.recoverDatabaseRestore(f.destinationPath); assert.equal(restoreService.restoreDatabaseFiles(f.sourceRoot), true); assert.equal(readValue(f.destinationPath), "new"); } finally { f.cleanup(); }
@@ -220,5 +316,5 @@ test("SQLite disaster-recovery meta-remediation matrix", async (t) => {
     if (originalEnv.DB_ENABLED === undefined) delete process.env.DB_ENABLED; else process.env.DB_ENABLED = originalEnv.DB_ENABLED;
     if (originalEnv.DATABASE_URL === undefined) delete process.env.DATABASE_URL; else process.env.DATABASE_URL = originalEnv.DATABASE_URL;
   }
-  assert.equal(cases.length, 52);
+  assert.equal(cases.length, 55);
 });

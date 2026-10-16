@@ -8,6 +8,7 @@ function registerTrashRoutes(app, context) {
     canRestoreTrashItem,
     deleteCloudTrashItem,
     deleteCloudTrashItemLater,
+    processCloudTrashDeletion,
     ensureFolderDirectories,
     getAuditActor,
     getCloudStorageStatus,
@@ -17,6 +18,10 @@ function registerTrashRoutes(app, context) {
     isCloudStorageEnabled,
     requirePermission,
     requireTrashManageAccess,
+    refreshAuthenticatedUser,
+    revalidateTrashManageAccess,
+    runCloudFileLifecycleMutation,
+    runCloudFolderLifecycleMutation,
     rootFolderId,
     serializeTrashItemForUser,
     trashRepository,
@@ -68,33 +73,47 @@ function registerTrashRoutes(app, context) {
     if (!item || item.status !== "trashed") return res.status(404).json({ error: "Item nao encontrado na lixeira" });
     if (!canRestoreTrashItem(req, item)) return res.status(403).json({ error: "Permissao negada para restaurar" });
 
+    const restoreTrashItem = async () => {
+    if (!refreshAuthenticatedUser(req, res)) return;
+    if (!req.user?.permissions?.listFiles) return res.status(403).json({ error: "Permissao negada: listFiles" });
+    let currentItem;
+    try {
+      currentItem = trashRepository.getTrashItem(id);
+    } catch (error) {
+      auditLog("trash.restore.failed", getAuditActor(req), { type: "trash", id }, "restore", "failure", { error: error.message });
+      return res.status(500).json({ error: "Erro ao restaurar item" });
+    }
+    if (currentItem?.status === "remote_delete_pending") return res.status(409).json({ error: "Exclusao remota pendente", remoteDeletion: remoteStatus(currentItem) });
+    if (!currentItem || currentItem.status !== "trashed" || currentItem.itemType !== item.itemType || currentItem.originalFolderId !== item.originalFolderId || currentItem.originalFileName !== item.originalFileName || currentItem.trashPath !== item.trashPath) return res.status(404).json({ error: "Item nao encontrado na lixeira" });
+    if (!canRestoreTrashItem(req, currentItem)) return res.status(403).json({ error: "Permissao negada para restaurar" });
+
     try {
       let restored;
-      if (item.itemType === "file") {
-        const folder = getFolderById(item.originalFolderId) || getFolderById(rootFolderId);
+      if (currentItem.itemType === "file") {
+        const folder = getFolderById(currentItem.originalFolderId) || getFolderById(rootFolderId);
         const paths = ensureFolderDirectories(folder.id);
         restored = trashService.restoreFile({
-          item,
+          item: currentItem,
           folder: { ...folder, ...paths },
           restoredBy: req.user.username,
           loaders: getTrashLoaders(),
         });
         auditLog("trash.file.restored", getAuditActor(req), { type: "trash", id }, "restored", "success", {
-          originalFolderId: item.originalFolderId,
-          fileName: item.originalFileName,
+          originalFolderId: currentItem.originalFolderId,
+          fileName: currentItem.originalFileName,
         });
       } else {
         restored = trashService.restoreFolder({
-          item,
+          item: currentItem,
           restoredBy: req.user.username,
           loaders: getTrashLoaders(),
         });
         auditLog("trash.folder.restored", getAuditActor(req), { type: "trash", id }, "restored", "success", {
-          originalFolderId: item.originalFolderId,
-          folderName: item.originalFolderName,
+          originalFolderId: currentItem.originalFolderId,
+          folderName: currentItem.originalFolderName,
         });
       }
-      addActionHistory(item.itemType === "file" ? "trash_file_restored" : "trash_folder_restored", item.originalFileName || item.originalFolderName, req.user.username, { trashId: id });
+      addActionHistory(currentItem.itemType === "file" ? "trash_file_restored" : "trash_folder_restored", currentItem.originalFileName || currentItem.originalFolderName, req.user.username, { trashId: id });
       broadcastDataChanged("trash", { id, action: "restored" });
       res.json({ message: "Item restaurado", item: serializeTrashItemForUser(restored) });
     } catch (error) {
@@ -104,6 +123,10 @@ function registerTrashRoutes(app, context) {
       });
       res.status(500).json({ error: "Erro ao restaurar item" });
     }
+    };
+    if (item.itemType === "file") return runCloudFileLifecycleMutation(item.originalFolderId, item.originalFileName, restoreTrashItem, res);
+    if (item.itemType === "folder") return runCloudFolderLifecycleMutation(item.originalFolderId, restoreTrashItem, res);
+    return restoreTrashItem();
   });
 
   app.delete("/trash/:id", authenticate, requireTrashManageAccess, async (req, res) => {
@@ -113,14 +136,25 @@ function registerTrashRoutes(app, context) {
     const item = trashRepository.getTrashItem(id);
     if (!item || item.status !== "trashed") return res.status(404).json({ error: "Item nao encontrado na lixeira" });
 
+    const permanentlyDeleteItem = async () => {
+    if (!revalidateTrashManageAccess(req, res)) return;
+    let currentItem;
+    try {
+      currentItem = trashRepository.getTrashItem(id);
+    } catch (error) {
+      return persistenceFailure(req, id, error, res);
+    }
+    if (!currentItem || currentItem.status !== "trashed" || currentItem.itemType !== item.itemType || currentItem.originalFolderId !== item.originalFolderId || currentItem.originalFileName !== item.originalFileName || currentItem.trashPath !== item.trashPath) {
+      return res.status(404).json({ error: "Item nao encontrado na lixeira" });
+    }
     try {
       const remoteRequired = isCloudStorageEnabled();
       let operationError = null;
       try {
         let deleted = remoteRequired
-          ? trashService.queueRemoteDeletion({ item, deletedBy: req.user.username, loaders: getTrashLoaders(), provider: getCloudStorageStatus?.().provider })
-          : trashService.permanentlyDelete({ item, deletedBy: req.user.username, loaders: getTrashLoaders() });
-        if (remoteRequired) await trashService.processRemoteDeletion({ item: deleted, provider: deleteCloudTrashItem });
+          ? trashService.queueRemoteDeletion({ item: currentItem, deletedBy: req.user.username, loaders: getTrashLoaders(), provider: getCloudStorageStatus?.().provider })
+          : trashService.permanentlyDelete({ item: currentItem, deletedBy: req.user.username, loaders: getTrashLoaders() });
+        if (remoteRequired) await (processCloudTrashDeletion ? processCloudTrashDeletion(deleted) : trashService.processRemoteDeletion({ item: deleted, provider: deleteCloudTrashItem }));
       } catch (error) {
         operationError = error;
       }
@@ -131,7 +165,7 @@ function registerTrashRoutes(app, context) {
         return persistenceFailure(req, id, error, res);
       }
       const persistedRemoteState = deleted.metadata?.remoteDeletion?.state;
-      if (operationError && (!remoteRequired || !["pending", "retry_wait", "completed", "terminal_failure"].includes(persistedRemoteState))) {
+      if (operationError && (!remoteRequired || !["pending", "retry_wait", "completed", "cancelled", "terminal_failure"].includes(persistedRemoteState))) {
         if (!remoteRequired && deleted.status === "trashed") {
           auditLog("trash.delete.failed", getAuditActor(req), { type: "trash", id }, "permanently_delete", "failure", {
             category: operationError.code || "operational_failure",
@@ -145,27 +179,33 @@ function registerTrashRoutes(app, context) {
         auditLog("trash.remote_delete.queued", getAuditActor(req), { type: "trash", id }, "remote_delete", "success", {});
       } else if (remoteDeletion === "completed") {
         auditLog("trash.remote_delete.completed", getAuditActor(req), { type: "trash", id }, "remote_delete", "success", {});
+      } else if (remoteDeletion === "cancelled") {
+        auditLog("trash.remote_delete.cancelled", getAuditActor(req), { type: "trash", id }, "remote_delete", "success", { reason: deleted.metadata.remoteDeletion.cancellationReason });
       } else if (remoteDeletion === "terminal_failure") {
         auditLog("trash.remote_delete.failed", getAuditActor(req), { type: "trash", id }, "remote_delete", "failure", { category: deleted.metadata.remoteDeletion.failureCategory });
       }
-      if (["completed", "not_required"].includes(remoteDeletion)) {
+      if (["completed", "cancelled", "not_required"].includes(remoteDeletion)) {
         auditLog(
-          item.itemType === "file" ? "trash.file.permanently_deleted" : "trash.folder.permanently_deleted",
+          currentItem.itemType === "file" ? "trash.file.permanently_deleted" : "trash.folder.permanently_deleted",
           getAuditActor(req),
           { type: "trash", id },
           "permanently_deleted",
           "success",
-          { itemType: item.itemType, originalFolderId: item.originalFolderId, name: item.originalFileName }
+          { itemType: currentItem.itemType, originalFolderId: currentItem.originalFolderId, name: currentItem.originalFileName }
         );
       }
-      broadcastDataChanged("trash", { id, action: remoteDeletion === "completed" || remoteDeletion === "not_required" ? "permanently_deleted" : "remote_delete_pending" });
-      res.json({ message: remoteDeletion === "completed" || remoteDeletion === "not_required" ? "Item excluido permanentemente" : remoteDeletion === "terminal_failure" ? "Falha terminal na exclusao remota" : "Exclusao remota pendente", remoteDeletion, item: serializeTrashItemForUser(deleted) });
+      broadcastDataChanged("trash", { id, action: ["completed", "cancelled", "not_required"].includes(remoteDeletion) ? "permanently_deleted" : "remote_delete_pending" });
+      res.json({ message: ["completed", "cancelled", "not_required"].includes(remoteDeletion) ? "Item excluido permanentemente" : remoteDeletion === "terminal_failure" ? "Falha terminal na exclusao remota" : "Exclusao remota pendente", remoteDeletion, item: serializeTrashItemForUser(deleted) });
     } catch (error) {
       auditLog("trash.delete.failed", getAuditActor(req), { type: "trash", id }, "permanently_delete", "failure", {
         error: error.message,
       });
       res.status(500).json({ error: "Erro ao excluir permanentemente" });
     }
+    };
+    if (item.itemType === "file") return runCloudFileLifecycleMutation(item.originalFolderId, item.originalFileName, permanentlyDeleteItem, res);
+    if (item.itemType === "folder") return runCloudFolderLifecycleMutation(item.originalFolderId, permanentlyDeleteItem, res);
+    return permanentlyDeleteItem();
   });
 
   app.delete("/trash", authenticate, requireTrashManageAccess, async (req, res) => {
@@ -179,30 +219,42 @@ function registerTrashRoutes(app, context) {
     let terminalCount = 0;
     let persistenceFailed = false;
     for (const item of items) {
+      const deleteTrashItem = async () => {
+      if (!revalidateTrashManageAccess(req, res)) return;
+      let currentItem;
+      try {
+        currentItem = trashRepository.getTrashItem(item.id);
+      } catch (error) {
+        persistenceFailed = true;
+        recordPersistenceFailure(req, item.id, error);
+        return;
+      }
+      if (!currentItem || !["trashed", "remote_delete_pending"].includes(currentItem.status)) return;
+      if (currentItem.itemType !== item.itemType || currentItem.originalFolderId !== item.originalFolderId || currentItem.originalFileName !== item.originalFileName || currentItem.trashPath !== item.trashPath) return;
       try {
         let operationError = null;
         if (!isCloudStorageEnabled()) {
-          try { trashService.permanentlyDelete({ item, deletedBy: req.user.username, loaders: getTrashLoaders() }); } catch (error) { operationError = error; }
+          try { trashService.permanentlyDelete({ item: currentItem, deletedBy: req.user.username, loaders: getTrashLoaders() }); } catch (error) { operationError = error; }
         } else {
           try {
-            const queued = trashService.queueRemoteDeletion({ item, deletedBy: req.user.username, loaders: getTrashLoaders(), provider: getCloudStorageStatus?.().provider });
-            await trashService.processRemoteDeletion({ item: queued, provider: deleteCloudTrashItem });
+            const queued = trashService.queueRemoteDeletion({ item: currentItem, deletedBy: req.user.username, loaders: getTrashLoaders(), provider: getCloudStorageStatus?.().provider });
+            await (processCloudTrashDeletion ? processCloudTrashDeletion(queued) : trashService.processRemoteDeletion({ item: queued, provider: deleteCloudTrashItem }));
           } catch (error) { operationError = error; }
         }
         let persisted;
         try { persisted = loadPersistedItem(item.id); } catch (error) {
           persistenceFailed = true;
           recordPersistenceFailure(req, item.id, error);
-          continue;
+          return;
         }
         const state = isCloudStorageEnabled() ? remoteStatus(persisted) : "not_required";
         if (operationError && isCloudStorageEnabled() && !["pending", "retry_wait", "completed", "terminal_failure"].includes(state)) {
           persistenceFailed = true;
           recordPersistenceFailure(req, item.id, operationError);
-          continue;
+          return;
         }
-        if (operationError && !isCloudStorageEnabled()) continue;
-        if (state === "completed" || state === "not_required") deletedCount += 1;
+        if (operationError && !isCloudStorageEnabled()) return;
+        if (state === "completed" || state === "cancelled" || state === "not_required") deletedCount += 1;
         else if (state === "terminal_failure") terminalCount += 1;
         else pendingCount += 1;
       } catch (error) {
@@ -210,6 +262,11 @@ function registerTrashRoutes(app, context) {
           category: error.code || "operational_failure",
         });
       }
+      };
+      if (item.itemType === "file") await runCloudFileLifecycleMutation(item.originalFolderId, item.originalFileName, deleteTrashItem, res);
+      else if (item.itemType === "folder") await runCloudFolderLifecycleMutation(item.originalFolderId, deleteTrashItem, res);
+      else await deleteTrashItem();
+      if (res.headersSent) return;
     }
     const persistedItems = listVisibleItems();
     terminalCount = persistedItems.filter((entry) => remoteStatus(entry) === "terminal_failure").length;

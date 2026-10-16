@@ -52,13 +52,15 @@
     menuButton.setAttribute("aria-label", open ? "Fechar navegação" : "Abrir navegação");
   }
 
-  function setMobileNavigation(root, open, restoreFocus) {
+  function setMobileNavigation(root, open, restoreFocus, focusTarget) {
     root.classList.toggle("nav-open", Boolean(open));
     syncMobileNavigation(root);
     if (open && isCompactViewport()) {
       const sidebar = root.querySelector(".sidebar");
       const firstLink = sidebar && (sidebar.querySelector(".nav-link") || sidebar.querySelector("a[href], button:not([disabled])"));
       if (firstLink) firstLink.focus();
+    } else if (!open && focusTarget && typeof focusTarget.focus === "function") {
+      focusTarget.focus();
     } else if (restoreFocus) {
       const menuButton = root.querySelector(".mobile-menu");
       if (menuButton) menuButton.focus();
@@ -146,7 +148,7 @@
       '      <button type="button" class="icon-button mobile-menu" data-action="menu" aria-label="Abrir navegação" aria-controls="app-sidebar" aria-expanded="false"><span aria-hidden="true">☰</span></button>',
       '      <div class="topbar-context"><span class="topbar-kicker">ROOT.ARK</span><span class="topbar-divider" aria-hidden="true">/</span><span>' + title + "</span></div>",
       '      <div class="topbar-actions"><span class="topbar-secure"><span aria-hidden="true">●</span> Sessão protegida</span>',
-      '        <details class="account-menu"><summary><span class="avatar" aria-hidden="true">' + escape(name.slice(0, 1).toUpperCase()) + '</span><span class="account-name">' + name + '</span><span class="chevron" aria-hidden="true">⌄</span></summary>',
+      '        <details class="account-menu"><summary aria-label="Conta de ' + name + '"><span class="avatar" aria-hidden="true">' + escape(name.slice(0, 1).toUpperCase()) + '</span><span class="account-name">' + name + '</span><span class="chevron" aria-hidden="true">⌄</span></summary>',
       '          <div class="account-popover"><strong>' + name + '</strong><span>' + escape(roleLabel(user.role)) + '</span><button type="button" data-action="logout">Sair da conta</button></div>',
       "        </details>",
       "      </div>",
@@ -175,7 +177,12 @@
 
     const menuButton = root.querySelector('[data-action="menu"]');
     if (menuButton) menuButton.addEventListener("click", () => {
-      setMobileNavigation(root, !root.classList.contains("nav-open"));
+      const opening = !root.classList.contains("nav-open");
+      if (opening && isCompactViewport()) {
+        const accountMenu = root.querySelector(".account-menu");
+        if (accountMenu) accountMenu.open = false;
+      }
+      setMobileNavigation(root, opening);
     });
     const themeButton = root.querySelector('[data-action="theme"]');
     if (themeButton) themeButton.addEventListener("click", toggleTheme);
@@ -186,17 +193,45 @@
   function closeMobileNav(event) {
     const root = document.getElementById("app-root");
     const target = event.target && event.target.closest ? event.target : null;
-    if (!root || !isCompactViewport() || !root.classList.contains("nav-open") || target && target.closest(".sidebar, .mobile-menu")) return;
-    setMobileNavigation(root, false);
+    if (!root || !isCompactViewport() || !root.classList.contains("nav-open") || event.defaultPrevented || target && target.closest(".mobile-menu")) return;
+    if (target && target.closest(".sidebar .nav-link")) {
+      setMobileNavigation(root, false, true);
+      return;
+    }
+    if (target && target.closest(".sidebar")) return;
+    const topbarAction = target && target.closest('.topbar button, .topbar a[href], .topbar input:not([disabled]), .topbar select:not([disabled]), .topbar textarea:not([disabled]), .topbar summary, .topbar [role="button"], .topbar [tabindex]:not([tabindex="-1"])');
+    setMobileNavigation(root, false, !topbarAction, topbarAction);
   }
 
   document.addEventListener("click", closeMobileNav);
   document.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape" || document.querySelector("dialog[open]")) return;
     const root = document.getElementById("app-root");
     if (!root || !isCompactViewport() || !root.classList.contains("nav-open")) return;
-    event.preventDefault();
-    setMobileNavigation(root, false, true);
+    if (event.key === "Escape") {
+      if (document.querySelector("dialog[open]")) return;
+      event.preventDefault();
+      setMobileNavigation(root, false, true);
+      return;
+    }
+    if (event.key !== "Tab" || document.querySelector("dialog[open]")) return;
+    const sidebar = root.querySelector(".sidebar");
+    if (!sidebar) return;
+    const focusable = Array.from(sidebar.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+      .filter((element) => !element.disabled && !element.hidden && element.getClientRects().length > 0);
+    if (!focusable.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const focusOutsideSidebar = !sidebar.contains(document.activeElement);
+    if (event.shiftKey && (document.activeElement === first || focusOutsideSidebar)) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (document.activeElement === last || focusOutsideSidebar)) {
+      event.preventDefault();
+      first.focus();
+    }
   });
 
   function toggleTheme() {
@@ -228,6 +263,8 @@
     const opts = options || {};
     const element = document.getElementById("app-dialog");
     if (!element) return Promise.resolve(null);
+    const opener = document.activeElement;
+    const focusFallback = document.getElementById("main");
     element.innerHTML = [
       '<form method="dialog" class="dialog-card">',
       '  <div class="dialog-heading"><div><p class="eyebrow">' + escape(opts.eyebrow || "CONFIRMAÇÃO") + '</p><h2 id="dialog-title">' + escape(opts.title || "Confirmar ação") + "</h2></div>",
@@ -243,10 +280,29 @@
       const outsideClick = (event) => {
         if (event.target === element) element.close("cancel");
       };
+      const trapTab = (event) => {
+        if (event.key !== "Tab" || !element.open) return;
+        const focusable = Array.from(element.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+          .filter((control) => !control.disabled && !control.hidden && control.getClientRects().length > 0);
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const focusOutsideDialog = !element.contains(document.activeElement);
+        if (event.shiftKey && (document.activeElement === first || focusOutsideDialog)) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && (document.activeElement === last || focusOutsideDialog)) {
+          event.preventDefault();
+          first.focus();
+        }
+      };
       const finish = () => {
         const result = element.returnValue === "confirm" ? new FormData(form) : null;
+        document.removeEventListener("keydown", trapTab, true);
         element.removeEventListener("click", outsideClick);
         element.innerHTML = "";
+        if (opener && opener.isConnected) opener.focus();
+        else if (focusFallback && focusFallback.isConnected) focusFallback.focus();
         resolve(result);
       };
       element.addEventListener("close", finish, { once: true });
@@ -259,6 +315,7 @@
       });
       element.addEventListener("click", outsideClick);
       element.showModal();
+      document.addEventListener("keydown", trapTab, true);
       const focusTarget = element.querySelector("input, select, textarea") || element.querySelector("[data-dialog-cancel]");
       if (focusTarget) focusTarget.focus();
     });

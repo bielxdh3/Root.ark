@@ -1,0 +1,22 @@
+PASS: dependency lock/provenance — 270 transitive package records; manifest parity preserved
+PASS: syntax gate — exit 0
+PASS: runtime artifact gate — exit 0
+PASS: diff gate — exit 0
+PASS: secret-material pattern scan — 254 repository files scanned; no material pattern matches
+PASS: ciphertext-only release evidence — positive attestation and plaintext/key rejection passed
+PASS: Phase 9 crypto vectors — exit 0
+PASS: Phase 10 auth/TOTP — exit 0
+PASS: Phase 12 sync/WebDAV — exit 0
+PASS: Phase 13 client/groups — exit 0
+PASS: Phase 16 bidirectional sync engine — exit 0
+PASS: Phase 16 opaque group sharing — exit 0
+PASS: Phase 16 final correction boundary — exit 0
+PASS: Realtime transport boundary — exit 0
+PASS: Upload security boundary — exit 0
+PASS: Cloud inventory containment — exit 0
+PASS: Phase 14 readiness/attestation — exit 0
+PASS: Phase 14 backup/restore evidence — exit 0
+PASS: final-head canonical npm test — exit 0
+PASS: high-severity dependency audit — exit 0
+PASS: clean worktree gate — no tracked or untracked changes
+Release gate summary: 21 passed, 0 blocked, 0 failed.

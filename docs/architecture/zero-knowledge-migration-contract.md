@@ -1,10 +1,10 @@
 # Zero-knowledge architecture and migration contract
 
-Status: architecture and threat-model proposal for review; not implementation, acceptance evidence, or owner approval.
+Status: Issue #65 records owner approval of the foundational Zero-Knowledge direction. This contract is accepted as the architecture and threat-model baseline for bounded Phase 9 foundation work (`PHASE_8_ACCEPTED_FOR_BOUNDED_PHASE_9_FOUNDATION`); it does not establish runtime/migration acceptance, close the owner-dependent product choices below, or claim release readiness.
 
 Repository: `bielxdh3/root.ark`
-Branch: `cdx/rootark-roadmap`
-Local baseline: `28747c6ebdac873650e2d5a3c6193824e7cc9985`
+Historical architecture provenance: branch `cdx/rootark-roadmap`, local baseline `28747c6ebdac873650e2d5a3c6193824e7cc9985` (2026-08-13)
+Current reconciliation baseline: `Root/main` at `d2ae0eb1c2fc87c1131a73c2a324c695b71664c1` (2026-10-01). This baseline identifies the reviewed source state; later local or unmerged edits do not change its status.
 Policy sources: D-003, D-006, D-007, D-008, and D-009 in `docs/product-discovery.md`
 
 ## 1. Acceptance boundary first
@@ -92,6 +92,18 @@ The trusted WebDAV bridge is a local client process, not a server route: loopbac
 Migration uses an explicit state machine and a monotonic envelope/version registry. It is opt-in, compartment-scoped, inventory-first, client-authorized, dual-read/target-write only during an owner-approved window, and never silently downgrades. Each object has an authenticated manifest, idempotency key, checkpoint, and client decrypt-and-verify proof before legacy key destruction. Rollback may restore a deliberately retained prior envelope/state, but cannot restore destroyed keys or external copies; partial or uncertain coordination remains `mixed`, `blocked`, or `migration-failed`.
 
 Phase 9+ implementation and release work must ship RFC/NIST and suite-specific vectors, fixed deterministic fixtures with test-only keys/nonces, cross-language envelope fixtures, round-trip and wrong-key tests, AAD/tag/truncation/duplicate-field tests, replay/downgrade/unknown-suite tests, device/recovery/rotation/compromise tests, migration checkpoint/rollback tests, and fuzz/property tests. Interoperability requires at least two independent implementations or a reviewed reference plus a second client; production acceptance requires reproducible vector results and no plaintext/key leakage in errors or logs. These are not additional Phase 8 design blockers.
+
+### Bounded migration-inventory prototype — 2026-10-01
+
+The reconciliation branch includes a read-only prototype at `scripts/zk-migration-inventory.js`. It accepts only an explicitly supplied child directory of the operating system's temporary directory that is outside the repository. The directory must contain `.rootark-disposable-fixture` with the expected marker value (surrounding whitespace is trimmed) and an `encrypted-files.json`; the command is:
+
+```text
+node scripts/zk-migration-inventory.js --source-dir <absolute-disposable-fixture-directory>
+```
+
+The tool reads only the marker and that one metadata file. It does not start the application, connect to a database, inspect uploads or content, or mutate the fixture. It cannot determine whether a caller-supplied temporary directory contains synthetic data or copied runtime data; the marker is an operator-supplied sentinel, not proof that its contents are disposable. Use only a newly created synthetic fixture, never production or user runtime data. Path-based symlink checks reject components that are symlinks when checked, but are not atomic against concurrent path replacement; use a trusted fixture directory that is not being changed while the tool runs. The tool rejects oversized or malformed metadata, duplicate fields/references, unsupported encryption modes, and oversized record counts. Its JSON output reports legacy encryption mode labels with per-run opaque references; it does not emit filenames, paths, usernames, credentials, keys, or payloads. It explicitly marks migration eligibility and joins to versions, links, derived data, backups, cloud copies, devices, and keys as unknown or not assessed.
+
+This prototype is not a complete migration inventory and does not authorize migration or data rewriting. The temporary-directory and marker checks reduce accidental use but do not make a copied production dataset safe; there is no production inventory mode until a separately approved and reviewed design exists.
 
 ### Failure classification
 
@@ -277,7 +289,7 @@ The following decomposition records a bounded Phase 9 foundation authorized by t
 | Metadata classification and leakage register | **No owner decision required** | Can inventory required/optional/forbidden fields and document operational leakage before implementation |
 | Client test-vector harness | **No owner decision required for harness** | Can build fixture format and negative-test structure; suite-specific vectors are Phase 9 implementation work |
 | Key lifecycle state model | **No owner decision required for state model** | Can model device authorization, removal, recovery, rotation, migration, and erasure states without implementing crypto |
-| Migration inventory tooling | **No owner decision required for read-only tooling** | Can enumerate current modes, references, derived data, backups, and labels without rewriting data |
+| Migration inventory tooling | **No owner decision required for read-only tooling** | Bounded metadata-only tooling can report only allowlisted source fields; references and joins to derived data, backups, devices, or keys remain unknown until their sources and privacy boundaries are separately defined |
 | Local bridge threat model | **No owner decision required for threat model** | Can define process, filesystem, key-cache, local-auth, and crash boundaries before selecting platforms |
 | Exact algorithm/KDF/library/suite, nonce construction, and envelope serialization | **Frozen technical architecture; not an owner-packet item** | Section 2.1 freezes primitive composition, library policy, KDF domain separation, nonce construction, and serialization; Phase 9 verifies the implementation and provenance, while product owners decide only compatibility and migration policy |
 | Sharing-link UX, expiry, and recipient recovery | **Owner-dependent** | Determines consent, usability, revocation expectations, and recipient-held-copy warnings |

@@ -101,17 +101,28 @@ test("backup and restore stay in the child runtime root", { timeout: 45_000 }, a
   fs.writeFileSync(path.join(sandbox, "data", "folders.json"), JSON.stringify([]));
 
   const port = await getUnusedPort();
-  const child = spawn(process.execPath, [SERVER], { cwd: sandbox, env: { ...process.env, PORT: String(port), DB_ENABLED: "false", CLOUD_STORAGE_PROVIDER: "local", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_INCLUDE_TEMP: "false", BACKUP_RETENTION_COUNT: "20", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
-  t.after(async () => {
+  const childEnv = { ...process.env, PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", CLOUD_STORAGE_PROVIDER: "local", BACKUP_ENABLED: "true", BACKUP_INCLUDE_UPLOADS: "true", BACKUP_INCLUDE_TEMP: "false", BACKUP_RETENTION_COUNT: "20", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
+  let child = spawn(process.execPath, [SERVER], { cwd: sandbox, env: childEnv, stdio: "ignore", windowsHide: true });
+  const stopChild = async () => {
     if (child.exitCode === null) await new Promise((resolve) => {
       const timer = setTimeout(resolve, TIMEOUT_MS);
       child.once("exit", () => { clearTimeout(timer); resolve(); });
       child.kill();
     });
+  };
+  t.after(async () => {
+    await stopChild();
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
   assert.equal((await waitForServer(port)).status, 200);
+  const backupDirectory = path.join(sandbox, "data", "backups");
+  const backupHistory = path.join(sandbox, "data", "backup-history.json");
+  const backupDirectoryState = () => fs.existsSync(backupDirectory) ? fs.readdirSync(backupDirectory).sort() : null;
+  const beforeDeniedRequests = { directory: backupDirectoryState(), history: checkoutState(backupHistory) };
+  assert.ok(beforeDeniedRequests.directory === null || beforeDeniedRequests.directory.length === 0,
+    "startup recovery may leave an empty backup directory, but must release its lock before serving requests");
+  assert.equal(beforeDeniedRequests.history.type, "absent");
   const manager = await login(port, "manager", password);
   const ordinary = await login(port, "ordinary", password);
   const deniedGet = await request(port, "/backups", { headers: { cookie: ordinary.cookie } });
@@ -119,8 +130,8 @@ test("backup and restore stay in the child runtime root", { timeout: 45_000 }, a
   const deniedPost = await request(port, "/backups", { method: "POST", headers: { ...headers(port, ordinary), "content-type": "application/json", "content-length": Buffer.byteLength(deniedPostBody) }, body: deniedPostBody });
   assert.equal(deniedGet.status, 403); assert.equal(JSON.parse(deniedGet.body).error, "Permissao negada: manageBackups");
   assert.equal(deniedPost.status, 403); assert.equal(JSON.parse(deniedPost.body).error, "Permissao negada: manageBackups");
-  assert.equal(fs.existsSync(path.join(sandbox, "data", "backups")), false);
-  assert.equal(fs.existsSync(path.join(sandbox, "data", "backup-history.json")), false);
+  assert.deepEqual(backupDirectoryState(), beforeDeniedRequests.directory, "denied backup requests must not create archive or lock artifacts");
+  assert.deepEqual(checkoutState(backupHistory), beforeDeniedRequests.history);
 
   const createBody = JSON.stringify({ notes: "runtime root" });
   const created = await request(port, "/backups", { method: "POST", headers: { ...headers(port, manager), "content-type": "application/json", "content-length": Buffer.byteLength(createBody) }, body: createBody });
@@ -158,11 +169,19 @@ test("backup and restore stay in the child runtime root", { timeout: 45_000 }, a
   const restored = await request(port, `/backups/${backup.id}/restore`, { method: "POST", headers: { ...headers(port, manager), "content-type": "application/json", "content-length": Buffer.byteLength(validBody) }, body: validBody });
   assert.equal(restored.status, 200, restored.body);
   const restoredBody = JSON.parse(restored.body);
-  assert.equal(restoredBody.message, "Backup restaurado"); assert.equal(restoredBody.backup.id, backup.id); assert.equal(restoredBody.preRestoreBackup.type, "pre-restore"); assert.equal(restoredBody.restartRecommended, false);
+  assert.equal(restoredBody.message, "Backup restaurado"); assert.equal(restoredBody.backup.id, backup.id); assert.equal(restoredBody.preRestoreBackup.type, "pre-restore"); assert.equal(restoredBody.restartRecommended, true);
   assert.deepEqual(fs.readFileSync(path.join(sandbox, "data", "runtime-only.json")), runtimeJson); assert.deepEqual(fs.readFileSync(path.join(sandbox, "uploads", "runtime-folder", "runtime-upload.txt")), runtimeUpload);
-  assert.equal(fs.existsSync(path.join(sandbox, "data", "backups", ".restore-tmp")), false); assert.equal((await request(port, "/backups", { headers: { cookie: manager.cookie } })).status, 200);
+  assert.equal(fs.existsSync(path.join(sandbox, "data", "backups", ".restore-tmp")), false);
+  assert.equal((await request(port, "/backups", { headers: { cookie: manager.cookie } })).status, 503);
+  await stopChild();
+  child = spawn(process.execPath, [SERVER], { cwd: sandbox, env: childEnv, stdio: "ignore", windowsHide: true });
+  assert.equal((await waitForServer(port)).status, 200);
+  assert.equal((await request(port, "/backups", { headers: { cookie: manager.cookie } })).status, 200);
   const removed = await request(port, `/backups/${backup.id}`, { method: "DELETE", headers: headers(port, manager) });
-  assert.equal(removed.status, 200, removed.body); assert.equal(fs.existsSync(archivePath), false); assert.equal(fs.existsSync(path.join(sandbox, "data", "backups", restoredBody.preRestoreBackup.filename)), true);
+  assert.equal(removed.status, 400, removed.body);
+  assert.match(JSON.parse(removed.body).error, /unresolved provider inventory baseline/i);
+  assert.equal(fs.existsSync(archivePath), true, "the selected baseline remains available until provider reconciliation completes");
+  assert.equal(fs.existsSync(path.join(sandbox, "data", "backups", restoredBody.preRestoreBackup.filename)), true);
   assert.deepEqual(checkoutState(path.join(ROOT, "data", "backups")), checkoutBefore.backups);
   assert.deepEqual(checkoutState(path.join(ROOT, "data", "backup-history.json")), checkoutBefore.history);
   assert.deepEqual(checkoutState(path.join(ROOT, "data", "backups", ".restore-tmp")), checkoutBefore.restoreTemp);

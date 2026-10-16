@@ -8,8 +8,10 @@ authentication, TOTP, master-key, and cloud-provider boundaries:
 
 - `GET /health` is an unauthenticated liveness response.
 - `GET /ready` is an unauthenticated readiness response and returns `503` when
-  JWT, explicit TOTP policy, master-key, or selected-provider configuration is
-  missing or invalid. It returns only safe status codes and provider names;
+  JWT, explicit TOTP policy, Secure session-cookie, master-key, or
+  selected-provider configuration is missing or invalid. `NODE_ENV=production`
+  enables the cookie `Secure` attribute by default; an explicit insecure
+  production cookie setting aborts startup. It returns only safe status codes and provider names;
   paths, credentials, keys, and raw provider errors are not exposed.
 - Provider failures normalize to bounded categories. Retry/backoff and
   cancellation helpers cap attempts and delays, while idempotency helpers

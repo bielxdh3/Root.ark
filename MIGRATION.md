@@ -14,7 +14,7 @@ DB_AUTO_BACKUP_ON_START=false
 ```
 
 - `DB_ENABLED=false` mantém o comportamento antigo em JSON.
-- `DB_READ_FALLBACK_JSON=true` permite ler JSON antigo se o SQLite ainda estiver vazio.
+- `DB_READ_FALLBACK_JSON` fica desativado por padrão. Ative-o explicitamente só depois de revisar os JSON antigos; links removidos por uma versão anterior podem não ter tombstones no SQLite e não podem ser distinguidos de links ainda não importados.
 - `DB_WRITE_LEGACY_JSON=false` evita dual-write por padrão.
 
 ## Rodar migrations

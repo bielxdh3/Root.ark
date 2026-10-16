@@ -186,6 +186,7 @@ async function listRemoteFiles(config, configPath, passwordProvider) {
 
 async function approveRemoteFile(config, configPath, fileName, passwordProvider) {
   const response = await authFetch(config, configPath, `/approve/${encodeURIComponent(fileName)}?folderId=${encodeURIComponent(config.targetFolderId)}`, {
+    method: "POST",
     passwordProvider,
   });
   const payload = await response.json().catch(() => ({}));
