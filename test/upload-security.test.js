@@ -963,14 +963,14 @@ test("chunk-session expiry sweep yields to requests and eventually reaches later
   assert.equal(fs.existsSync(finalPartPath), false, "the sweep eventually processes the last expired session");
 });
 
-test("transient EPERM beyond the initial retry window preserves chunk activity", { timeout: 45_000 }, async (t) => {
+test("chunk activity metadata retries transient EPERM only on Windows", { timeout: 45_000 }, async (t) => {
   const uploadId = "activity-rename-retries-eperm";
   const previousActivity = new Date(Date.now() - 60 * 60 * 1000).toISOString();
   let attemptsPath;
   const metadata = legacyChunkMetadata(uploadId, { lastActivityAt: previousActivity, totalChunks: 3 });
   delete metadata.password;
   const harness = await createHarness(t, {
-    chunkSessions: [{ uploadId, files: { "metadata.json": metadata, "0.part": "existing accepted chunk" } }],
+    chunkSessions: [{ uploadId, files: { "metadata.json": metadata, "0.part": "existing accepted chunk", "1.part": "previously accepted second chunk" } }],
     preloadSource: ({ dir }) => {
       attemptsPath = path.join(dir, "metadata-rename-attempts.txt");
       return `
@@ -996,22 +996,25 @@ test("transient EPERM beyond the initial retry window preserves chunk activity",
     totalChunks: 3,
     bytes: Buffer.from("second chunk"),
   });
-  assert.equal(response.status, 200, response.body);
-  assert.equal(fs.readFileSync(attemptsPath, "utf8"), "4", "three EPERM results are retried before the atomic replacement succeeds");
-  const updatedMetadata = JSON.parse(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "metadata.json"), "utf8"));
-  assert.ok(Date.parse(updatedMetadata.lastActivityAt) > Date.parse(previousActivity));
-  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part"), "utf8"), "existing accepted chunk");
-  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "1.part"), "utf8"), "second chunk");
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  assert.equal(response.status, process.platform === "win32" ? 200 : 500, response.body);
+  assert.equal(fs.readFileSync(attemptsPath, "utf8"), process.platform === "win32" ? "4" : "1", "only Windows retries transient EPERM");
+  const metadataAfter = JSON.parse(fs.readFileSync(path.join(sessionDir, "metadata.json"), "utf8"));
+  if (process.platform === "win32") assert.ok(Date.parse(metadataAfter.lastActivityAt) > Date.parse(previousActivity));
+  else assert.equal(metadataAfter.lastActivityAt, previousActivity, "non-Windows EPERM preserves prior metadata");
+  assert.equal(fs.readFileSync(path.join(sessionDir, "0.part"), "utf8"), "existing accepted chunk");
+  assert.equal(fs.readFileSync(path.join(sessionDir, "1.part"), "utf8"), process.platform === "win32" ? "second chunk" : "previously accepted second chunk", "metadata failure must not commit a replacement chunk");
+  assert.deepEqual(fs.readdirSync(sessionDir).filter((name) => name.startsWith(".metadata-scrub-")), []);
 });
 
-test("persistent EPERM while refreshing chunk activity fails closed and preserves prior metadata and part", { timeout: 45_000 }, async (t) => {
+test("persistent EPERM prevents chunk commit and preserves prior activity metadata", { timeout: 45_000 }, async (t) => {
   const uploadId = "activity-rename-persistent-eperm";
   const previousActivity = new Date(Date.now() - 60 * 60 * 1000).toISOString();
   let attemptsPath;
   const metadata = legacyChunkMetadata(uploadId, { lastActivityAt: previousActivity, totalChunks: 3 });
   delete metadata.password;
   const harness = await createHarness(t, {
-    chunkSessions: [{ uploadId, files: { "metadata.json": metadata, "0.part": "existing accepted chunk" } }],
+    chunkSessions: [{ uploadId, files: { "metadata.json": metadata, "0.part": "existing accepted chunk", "1.part": "previously accepted second chunk" } }],
     preloadSource: ({ dir }) => {
       attemptsPath = path.join(dir, "metadata-rename-attempts.txt");
       return `
@@ -1038,10 +1041,10 @@ test("persistent EPERM while refreshing chunk activity fails closed and preserve
     bytes: Buffer.from("second chunk"),
   });
   assert.equal(response.status, 500, response.body);
-  assert.equal(fs.readFileSync(attemptsPath, "utf8"), "5", "persistent EPERM stops after five total attempts");
+  assert.equal(fs.readFileSync(attemptsPath, "utf8"), process.platform === "win32" ? "5" : "1", "persistent EPERM uses the bounded Windows retry schedule and fails immediately elsewhere");
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "metadata.json"), "utf8")), metadata);
   assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part"), "utf8"), "existing accepted chunk");
-  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "1.part"), "utf8"), "second chunk");
+  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "1.part"), "utf8"), "previously accepted second chunk", "persistent metadata failure preserves the accepted replacement target");
   assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId)).filter((name) => name.startsWith(".metadata-scrub-")), []);
 });
 
@@ -1083,7 +1086,7 @@ test("non-EPERM while refreshing chunk activity fails immediately and preserves 
   assert.equal(fs.readFileSync(attemptsPath, "utf8"), "1", "non-EPERM metadata rename failures are not retried");
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sessionDir, "metadata.json"), "utf8")), metadata);
   assert.equal(fs.readFileSync(path.join(sessionDir, "0.part"), "utf8"), "existing accepted chunk");
-  assert.equal(fs.readFileSync(path.join(sessionDir, "1.part"), "utf8"), "second chunk");
+  assert.equal(fs.existsSync(path.join(sessionDir, "1.part")), false, "metadata failure leaves a previously absent part uncommitted");
   assert.deepEqual(fs.readdirSync(sessionDir).filter((name) => name.startsWith(".metadata-scrub-")), []);
 });
 
@@ -1091,7 +1094,7 @@ test("failed chunk rename does not refresh accepted activity", { timeout: 45_000
   const uploadId = "failed-chunk-rename-preserves-activity";
   const previousActivity = new Date(Date.now() - 60 * 60 * 1000).toISOString();
   const harness = await createHarness(t, {
-    chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId, { lastActivityAt: previousActivity, totalChunks: 3, originalName: "encrypted.txt", encryptionLevel: "none" }), "0.part": "already accepted chunk" } }],
+    chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId, { lastActivityAt: previousActivity, totalChunks: 3, originalName: "encrypted.txt", encryptionLevel: "none" }), "0.part": "already accepted chunk", "1.part": "previously accepted replacement target" } }],
     preloadSource: `
       const fs = require("node:fs");
       const renameSync = fs.renameSync;
@@ -1113,7 +1116,38 @@ test("failed chunk rename does not refresh accepted activity", { timeout: 45_000
   const metadata = JSON.parse(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "metadata.json"), "utf8"));
   assert.equal(metadata.lastActivityAt, previousActivity);
   assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part"), "utf8"), "already accepted chunk");
-  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "1.part")), false);
+  assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "1.part"), "utf8"), "previously accepted replacement target");
+});
+
+test("chunk metadata failure leaves a previously absent part uncommitted", { timeout: 45_000 }, async (t) => {
+  const uploadId = "metadata-failure-no-prior-part";
+  const metadata = legacyChunkMetadata(uploadId, { lastActivityAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(), totalChunks: 3, originalName: "encrypted.txt", encryptionLevel: "none" });
+  delete metadata.password;
+  const harness = await createHarness(t, {
+    chunkSessions: [{ uploadId, files: { "metadata.json": metadata, "0.part": "already accepted chunk" } }],
+    preloadSource: `
+      const fs = require("node:fs");
+      const renameSync = fs.renameSync;
+      fs.renameSync = (source, destination) => {
+        if (String(source).includes(".metadata-scrub-") && String(destination).endsWith("metadata.json")) throw Object.assign(new Error("metadata rename failure"), { code: "EIO" });
+        return renameSync.call(fs, source, destination);
+      };
+    `,
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const response = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "encrypted.txt",
+    chunkIndex: 1,
+    totalChunks: 3,
+    bytes: Buffer.from("must not commit"),
+  });
+  assert.equal(response.status, 500, response.body);
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sessionDir, "metadata.json"), "utf8")), metadata);
+  assert.equal(fs.readFileSync(path.join(sessionDir, "0.part"), "utf8"), "already accepted chunk");
+  assert.equal(fs.existsSync(path.join(sessionDir, "1.part")), false);
+  assert.deepEqual(fs.readdirSync(sessionDir).filter((name) => name.startsWith(".metadata-scrub-")), []);
 });
 
 function filesUnder(dir) {

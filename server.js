@@ -7201,7 +7201,8 @@ function replaceChunkMetadataFile(sessionDir, metadataPath, metadata, retryActiv
 
   try {
     fs.writeFileSync(replacementPath, JSON.stringify(metadata, null, 2), { flag: "wx", mode: 0o600 });
-    const renameAttempts = retryActivityRename ? CHUNK_ACTIVITY_RENAME_RETRY_DELAYS_MS.length + 1 : 1;
+    const retryActivityRenameOnWindows = retryActivityRename && process.platform === "win32";
+    const renameAttempts = retryActivityRenameOnWindows ? CHUNK_ACTIVITY_RENAME_RETRY_DELAYS_MS.length + 1 : 1;
     for (let attempt = 0; attempt < renameAttempts; attempt += 1) {
       assertSafeChunkSessionDirectory(sessionDir);
       let currentStats = null;
@@ -7220,7 +7221,7 @@ function replaceChunkMetadataFile(sessionDir, metadataPath, metadata, retryActiv
         fs.renameSync(replacementPath, metadataPath);
         break;
       } catch (error) {
-        if (!retryActivityRename || error.code !== "EPERM" || attempt === renameAttempts - 1) throw error;
+        if (!retryActivityRenameOnWindows || error.code !== "EPERM" || attempt === renameAttempts - 1) throw error;
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, CHUNK_ACTIVITY_RENAME_RETRY_DELAYS_MS[attempt]);
       }
     }
@@ -7784,9 +7785,14 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
     }
 
     const chunkPath = path.join(sessionDir, CHUNK_PART_FILENAMES[chunkIndex]);
-    fs.rmSync(chunkPath, { force: true });
-    fs.renameSync(incomingChunkPath, chunkPath);
+    const previousMetadata = metadata;
     metadata = touchChunkSessionActivity(sessionDir, metadata);
+    try {
+      fs.renameSync(incomingChunkPath, chunkPath);
+    } catch (error) {
+      replaceChunkMetadataFile(sessionDir, path.join(sessionDir, "metadata.json"), previousMetadata);
+      throw error;
+    }
 
     if (!hasAllChunks(sessionDir, totalChunks)) {
       return res.json({
