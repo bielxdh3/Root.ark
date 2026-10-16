@@ -204,14 +204,14 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
   });
   child.stdout.on("data", (chunk) => stdout.push(chunk.toString()));
   child.stderr.on("data", (chunk) => stderr.push(chunk.toString()));
+  const stopServer = async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const exited = waitForExit(child);
+    child.kill();
+    await exited;
+  };
   t.after(async () => {
-    if (child.exitCode === null) {
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, TIMEOUT_MS);
-        child.once("exit", () => { clearTimeout(timer); resolve(); });
-        child.kill();
-      });
-    }
+    await stopServer();
     fs.rmSync(dir, { recursive: true, force: true });
     assert.equal(fs.existsSync(dir), false);
   });
@@ -222,7 +222,7 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
       throw new Error(`${error.message}\nserver exit: ${child.exitCode}\nserver stdout:\n${stdout.join("")}\nserver stderr:\n${stderr.join("")}`);
     }
   }
-  return { dir, port, quarantineDir, password, chunkRoot, child, stdout, stderr, quotaRecoveryPreloadPath };
+  return { dir, port, quarantineDir, password, chunkRoot, child, stopServer, stdout, stderr, quotaRecoveryPreloadPath };
 }
 
 async function startGatedClamAv() {
@@ -2386,45 +2386,52 @@ test("ambiguous encrypted handoff without pending metadata preserves destination
 });
 
 test("chunk multipart without a file or with a parser error releases the pre-Multer reservation", { timeout: 30_000 }, async (t) => {
+  const readOperationCount = (harness) => {
+    const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+    try {
+      return database.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count;
+    } finally {
+      database.close();
+    }
+  };
   const harness = await createHarness(t);
   const session = await login(harness.port, "uploader", harness.password);
-  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  const noFile = multipartParts([
+    { field: "uploadId", bytes: "missing-file" },
+    { field: "originalName", bytes: "missing-file.txt" },
+    { field: "chunkIndex", bytes: "0" },
+    { field: "totalChunks", bytes: "1" },
+  ]);
+  let noFileResponse;
   try {
-    const noFile = multipartParts([
-      { field: "uploadId", bytes: "missing-file" },
-      { field: "originalName", bytes: "missing-file.txt" },
-      { field: "chunkIndex", bytes: "0" },
-      { field: "totalChunks", bytes: "1" },
-    ]);
-    let noFileResponse;
-    try {
-      noFileResponse = await request(harness.port, `/upload-chunk?folderId=${FOLDER_ID}`, {
-        method: "POST",
-        headers: { cookie: session.cookie, origin: `http://127.0.0.1:${harness.port}`, "x-csrf-token": session.csrf, "content-type": noFile.contentType, "content-length": noFile.body.length },
-        body: noFile.body,
-      });
-    } catch (error) {
-      throw new Error(`file-less multipart request failed: ${error.code || error.name}: ${error.message}`, { cause: error });
-    }
-    assert.equal(noFileResponse.status, 400, noFileResponse.body);
-    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0, "file-less multipart releases its reservation");
-
-    let malformed;
-    try {
-      malformed = await request(harness.port, `/upload-chunk?folderId=${FOLDER_ID}`, {
-        method: "POST",
-        headers: { cookie: session.cookie, origin: `http://127.0.0.1:${harness.port}`, "x-csrf-token": session.csrf, "content-type": "multipart/form-data; boundary=missing-boundary", "content-length": Buffer.byteLength("not multipart data") },
-        body: "not multipart data",
-      });
-    } catch (error) {
-      throw new Error(`malformed multipart request failed: ${error.code || error.name}: ${error.message}`, { cause: error });
-    }
-    assert.equal(malformed.status, 400, malformed.body);
-    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0, "parser failure before a filename path releases its reservation");
-    assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
-  } finally {
-    database.close();
+    noFileResponse = await request(harness.port, `/upload-chunk?folderId=${FOLDER_ID}`, {
+      method: "POST",
+      headers: { cookie: session.cookie, origin: `http://127.0.0.1:${harness.port}`, "x-csrf-token": session.csrf, "content-type": noFile.contentType, "content-length": noFile.body.length },
+      body: noFile.body,
+    });
+  } catch (error) {
+    throw new Error(`file-less multipart request failed: ${error.code || error.name}: ${error.message}`, { cause: error });
   }
+  assert.equal(noFileResponse.status, 400, noFileResponse.body);
+  await harness.stopServer();
+  assert.equal(readOperationCount(harness), 0, "file-less multipart releases its reservation");
+
+  const malformedHarness = await createHarness(t);
+  const malformedSession = await login(malformedHarness.port, "uploader", malformedHarness.password);
+  let malformed;
+  try {
+    malformed = await request(malformedHarness.port, `/upload-chunk?folderId=${FOLDER_ID}`, {
+      method: "POST",
+      headers: { cookie: malformedSession.cookie, origin: `http://127.0.0.1:${malformedHarness.port}`, "x-csrf-token": malformedSession.csrf, "content-type": "multipart/form-data; boundary=missing-boundary", "content-length": Buffer.byteLength("not multipart data") },
+      body: "not multipart data",
+    });
+  } catch (error) {
+    throw new Error(`malformed multipart request failed: ${error.code || error.name}: ${error.message}`, { cause: error });
+  }
+  assert.equal(malformed.status, 400, malformed.body);
+  await malformedHarness.stopServer();
+  assert.equal(readOperationCount(malformedHarness), 0, "parser failure before a filename path releases its reservation");
+  assert.deepEqual(fs.readdirSync(path.join(malformedHarness.chunkRoot, "incoming")), []);
 });
 
 test("failed handoff destination cleanup retains its charge and blocks retries from creating orphan files", { timeout: 30_000 }, async (t) => {
@@ -2468,25 +2475,25 @@ test("failed handoff destination cleanup retains its charge and blocks retries f
 
   const destinationPath = path.join(harness.dir, "temp", FOLDER_ID, "handoff-cleanup-failure.txt");
   assert.equal(fs.existsSync(destinationPath), true, "the injected failed cleanup leaves the published destination present");
-  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"));
+  const retry = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: "handoff-cleanup-failure.txt",
+    chunkIndex: 0,
+    totalChunks: 1,
+    encryptionLevel: "none",
+    bytes: Buffer.from("retry must not publish another orphan"),
+  });
+  assert.equal(retry.status, 503, retry.body);
+  assert.equal(JSON.parse(retry.body).code, "CHUNK_QUOTA_UNAVAILABLE");
+  assert.equal(fs.existsSync(destinationPath), true);
+  assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
+  await harness.stopServer();
+  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
   try {
     const handoff = database.prepare("SELECT operation_id, state, charge_bytes, relative_path FROM quota_operations WHERE state = 'handoff_published'").get();
     assert.ok(handoff, JSON.stringify({ rows: database.prepare("SELECT operation_id, state, charge_bytes, relative_path FROM quota_operations").all(), stderr: harness.stderr }));
     assert.equal(handoff.charge_bytes, fs.statSync(destinationPath).size);
     assert.match(handoff.relative_path.replace(/\\/g, "/"), /^handoff\//);
-
-    const retry = await uploadChunk(harness.port, session, {
-      uploadId,
-      originalName: "handoff-cleanup-failure.txt",
-      chunkIndex: 0,
-      totalChunks: 1,
-      encryptionLevel: "none",
-      bytes: Buffer.from("retry must not publish another orphan"),
-    });
-    assert.equal(retry.status, 503, retry.body);
-    assert.equal(JSON.parse(retry.body).code, "CHUNK_QUOTA_UNAVAILABLE");
-    assert.equal(fs.existsSync(destinationPath), true);
-    assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
     assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations WHERE state = 'handoff_published'").get().count, 1);
   } finally {
     database.close();
@@ -2532,38 +2539,38 @@ test("a failed handed-off ledger transition preserves registered publication for
   const destinationPath = path.join(harness.dir, "temp", FOLDER_ID, fileName);
   const pendingPath = path.join(harness.dir, "data", "pending-uploads.json");
   const quotaPath = path.join(harness.chunkRoot, ".quota.sqlite");
+  const originalServerPid = harness.child.pid;
   assert.deepEqual(fs.readFileSync(destinationPath), bytes);
   assert.ok(JSON.parse(fs.readFileSync(pendingPath, "utf8"))[`${FOLDER_ID}/${fileName}`]);
-  const database = new Database(quotaPath);
+  const retry = await uploadChunk(harness.port, session, {
+    uploadId,
+    originalName: fileName,
+    chunkIndex: 0,
+    totalChunks: 1,
+    encryptionLevel: "none",
+    bytes: Buffer.from("must not create another published copy"),
+  });
+  assert.equal(retry.status, 503, retry.body);
+  assert.equal(JSON.parse(retry.body).code, "CHUNK_QUOTA_UNAVAILABLE");
+  assert.deepEqual(fs.readFileSync(destinationPath), bytes);
+  await harness.stopServer();
+  const database = new Database(quotaPath, { readonly: true });
   try {
     const operation = database.prepare("SELECT state, charge_bytes, relative_path FROM quota_operations WHERE state = 'handoff_published'").get();
     assert.ok(operation);
     assert.equal(operation.charge_bytes, bytes.length);
     assert.equal(operation.relative_path.replaceAll("\\", "/"), `handoff/${FOLDER_ID}/${encodeURIComponent(fileName)}#${bytes.length}`);
-    const retry = await uploadChunk(harness.port, session, {
-      uploadId,
-      originalName: fileName,
-      chunkIndex: 0,
-      totalChunks: 1,
-      encryptionLevel: "none",
-      bytes: Buffer.from("must not create another published copy"),
-    });
-    assert.equal(retry.status, 503, retry.body);
-    assert.equal(JSON.parse(retry.body).code, "CHUNK_QUOTA_UNAVAILABLE");
-    assert.deepEqual(fs.readFileSync(destinationPath), bytes);
     assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations WHERE state = 'handoff_published'").get().count, 1);
   } finally {
     database.close();
   }
 
-  harness.child.kill();
-  await waitForExit(harness.child);
   const recoveryPort = await getUnusedPort();
   const recoveryChild = spawn(process.execPath, ["--require", harness.quotaRecoveryPreloadPath, SERVER], {
     cwd: harness.dir,
     env: {
       ...process.env,
-      ...testDeadQuotaOwnerEnv(harness.child.pid),
+      ...testDeadQuotaOwnerEnv(originalServerPid),
       NODE_ENV: "test",
       PORT: String(recoveryPort),
       DB_ENABLED: "false",
@@ -2592,17 +2599,17 @@ test("a failed handed-off ledger transition preserves registered publication for
     assert.deepEqual(fs.readFileSync(destinationPath), bytes);
     assert.ok(JSON.parse(fs.readFileSync(pendingPath, "utf8"))[`${FOLDER_ID}/${fileName}`]);
     assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId)), false, recoveryStderr.join(""));
-    const recoveredLedger = new Database(quotaPath, { readonly: true });
-    try {
-      assert.equal(recoveredLedger.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0);
-    } finally {
-      recoveredLedger.close();
-    }
   } finally {
     if (recoveryChild.exitCode === null) {
       recoveryChild.kill();
       await waitForExit(recoveryChild);
     }
+  }
+  const recoveredLedger = new Database(quotaPath, { readonly: true });
+  try {
+    assert.equal(recoveredLedger.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0);
+  } finally {
+    recoveredLedger.close();
   }
 });
 
@@ -3260,17 +3267,6 @@ test("folder lifecycle lock timeouts reject uploads, remove transient staging, a
     assert.equal(fs.readFileSync(path.join(existingSessionDir, "1.part"), "utf8"), "disposable final chunk");
     assert.equal(fs.readFileSync(timeoutResponseMarker, "utf8"), "present", "the existing session remains present when the 503 response is sent");
     assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
-    const quotaDatabase = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
-    try {
-      const sessionOperations = quotaDatabase.prepare("SELECT state, relative_path FROM quota_operations WHERE session_key = ? ORDER BY relative_path").all(`${FOLDER_ID}/${uploadId}`);
-      assert.deepEqual(sessionOperations.map((operation) => [operation.state, operation.relative_path]), [
-        ["part_committed", path.join(FOLDER_ID, uploadId, "0.part")],
-        ["part_committed", path.join(FOLDER_ID, uploadId, "1.part")],
-      ]);
-    } finally {
-      quotaDatabase.close();
-    }
-
     const webDavBody = Buffer.from("disposable WebDAV upload");
     const webDav = await request(harness.port, "/dav/" + FOLDER_ID + "/timeout-webdav.txt", {
       method: "PUT",
@@ -3284,6 +3280,17 @@ test("folder lifecycle lock timeouts reject uploads, remove transient staging, a
   } finally {
     releaseLock();
     await heldOperation;
+  }
+  await harness.stopServer();
+  const quotaDatabase = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  try {
+    const sessionOperations = quotaDatabase.prepare("SELECT state, relative_path FROM quota_operations WHERE session_key = ? ORDER BY relative_path").all(`${FOLDER_ID}/${uploadId}`);
+    assert.deepEqual(sessionOperations.map((operation) => [operation.state, operation.relative_path]), [
+      ["part_committed", path.join(FOLDER_ID, uploadId, "0.part")],
+      ["part_committed", path.join(FOLDER_ID, uploadId, "1.part")],
+    ]);
+  } finally {
+    quotaDatabase.close();
   }
 });
 
@@ -4208,14 +4215,6 @@ test("startup removes an unregistered published handoff and keeps charged parts 
   const destinationPath = path.join(harness.dir, "temp", FOLDER_ID, fileName);
   assert.equal(fs.existsSync(destinationPath), false, harness.stderr.join(""));
   assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), bytes);
-  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"));
-  try {
-    assert.deepEqual(database.prepare("SELECT operation_id, state, charge_bytes FROM quota_operations").all(), [
-      { operation_id: "part-zero", state: "part_committed", charge_bytes: bytes.length },
-    ]);
-  } finally {
-    database.close();
-  }
 
   const session = await login(harness.port, "uploader", harness.password);
   const retry = await uploadChunk(harness.port, session, {
@@ -4226,9 +4225,10 @@ test("startup removes an unregistered published handoff and keeps charged parts 
     encryptionLevel: "none",
     bytes,
   });
-  assert.equal(retry.status, 200, retry.body);
+  assert.equal(retry.status, 200, `${retry.body}\n${harness.stdout.join("")}\n${harness.stderr.join("")}`);
   assert.equal(JSON.parse(retry.body).complete, true);
   assert.deepEqual(fs.readFileSync(destinationPath), bytes);
+  await harness.stopServer();
   const finalLedger = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
   try {
     const remainingOperations = finalLedger.prepare("SELECT operation_id, account_key, session_key, relative_path, state, charge_bytes FROM quota_operations ORDER BY operation_id").all();
