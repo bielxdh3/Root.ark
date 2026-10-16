@@ -60,6 +60,7 @@ const { createFileLifecycleLock } = require("./services/fileLifecycleLock");
 const { openReadHandle, readBoundedRegularFile } = require("./services/fileReadHandle");
 const { createCloudTempMutationQueue } = require("./services/cloudTempMutationQueue");
 const { resolveRuntimePath } = require("./src/runtime-paths");
+const { renameSyncWithWindowsEpermRetry } = require("./src/fs-atomic-rename");
 const registerAuthRoutes = require("./src/routes/auth");
 const registerAnalyticsRoutes = require("./src/routes/analytics");
 const registerAuditRoutes = require("./src/routes/audit");
@@ -9901,7 +9902,7 @@ function writeWebDavMoveFileAtomically(filePath, contents) {
   } finally {
     fs.closeSync(descriptor);
   }
-  fs.renameSync(temporary, filePath);
+  renameSyncWithWindowsEpermRetry(temporary, filePath);
 }
 
 function persistWebDavMoveMetadataSnapshot(transactionId, snapshot) {
@@ -9957,7 +9958,7 @@ function writeWebDavMoveJournal(journal) {
   } finally {
     fs.closeSync(descriptor);
   }
-  fs.renameSync(temporary, journal.journalPath);
+  renameSyncWithWindowsEpermRetry(temporary, journal.journalPath);
 }
 
 function canonicalWebDavMoveTransactionId(value) {
