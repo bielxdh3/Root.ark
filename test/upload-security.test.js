@@ -4910,6 +4910,80 @@ test("verified incoming reservations shrink before exact-capacity final assembly
   }
 });
 
+test("maximum-size parts reserve and release the full bounded assembly charge", { timeout: 120_000 }, async (t) => {
+  const partBytes = 8 * 1024 * 1024;
+  const partCount = 3;
+  const assemblyBytes = partBytes * partCount;
+  const peakBytes = assemblyBytes * 2;
+  const originalName = "bounded-maximum-assembly.txt";
+  const part = Buffer.alloc(partBytes, 0x61);
+
+  const deniedHarness = await createHarness(t, { envOverrides: {
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(peakBytes - 1),
+    CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(peakBytes - 1),
+  } });
+  const deniedSession = await login(deniedHarness.port, "uploader", deniedHarness.password);
+  for (let chunkIndex = 0; chunkIndex < partCount - 1; chunkIndex += 1) {
+    const response = await uploadChunk(deniedHarness.port, deniedSession, {
+      uploadId: "bounded-assembly-under-cap",
+      originalName,
+      chunkIndex,
+      totalChunks: partCount,
+      bytes: part,
+    });
+    assert.equal(response.status, 200, response.body);
+    assert.equal(JSON.parse(response.body).complete, false);
+  }
+
+  const rejectedFinalPart = await uploadChunk(deniedHarness.port, deniedSession, {
+    uploadId: "bounded-assembly-under-cap",
+    originalName,
+    chunkIndex: partCount - 1,
+    totalChunks: partCount,
+    bytes: part,
+  });
+  assert.equal(rejectedFinalPart.status, 507, rejectedFinalPart.body);
+  assert.equal(JSON.parse(rejectedFinalPart.body).code, "CHUNK_QUOTA_EXCEEDED");
+  const deniedSessionDir = path.join(deniedHarness.chunkRoot, FOLDER_ID, "bounded-assembly-under-cap");
+  assert.deepEqual(fs.readFileSync(path.join(deniedSessionDir, "0.part")), part);
+  assert.deepEqual(fs.readFileSync(path.join(deniedSessionDir, "1.part")), part);
+  assert.equal(fs.existsSync(path.join(deniedSessionDir, "2.part")), false);
+  assert.deepEqual(fs.readdirSync(path.join(deniedHarness.chunkRoot, "incoming")), []);
+  const deniedDatabase = new Database(path.join(deniedHarness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  try {
+    assert.equal(deniedDatabase.prepare("SELECT value FROM quota_meta WHERE key = 'system_charge_bytes'").get().value, String(partBytes * 2));
+    assert.equal(deniedDatabase.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 2);
+  } finally {
+    deniedDatabase.close();
+  }
+
+  const exactHarness = await createHarness(t, { envOverrides: {
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: String(peakBytes),
+    CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: String(peakBytes),
+  } });
+  const exactSession = await login(exactHarness.port, "uploader", exactHarness.password);
+  for (let chunkIndex = 0; chunkIndex < partCount; chunkIndex += 1) {
+    const response = await uploadChunk(exactHarness.port, exactSession, {
+      uploadId: "bounded-assembly-exact-cap",
+      originalName,
+      chunkIndex,
+      totalChunks: partCount,
+      bytes: part,
+    });
+    assert.equal(response.status, 200, response.body);
+    assert.equal(JSON.parse(response.body).complete, chunkIndex === partCount - 1);
+  }
+  assert.deepEqual(fs.readdirSync(path.join(exactHarness.chunkRoot, "incoming")), []);
+  assert.equal(fs.existsSync(path.join(exactHarness.chunkRoot, FOLDER_ID, "bounded-assembly-exact-cap", "assembled.upload")), false);
+  const exactDatabase = new Database(path.join(exactHarness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  try {
+    assert.equal(exactDatabase.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0);
+    assert.equal(exactDatabase.prepare("SELECT value FROM quota_meta WHERE key = 'system_charge_bytes'").get().value, "0");
+  } finally {
+    exactDatabase.close();
+  }
+});
+
 test("an incoming reservation that exceeds the quota preserves the previously accepted part", { timeout: 45_000 }, async (t) => {
   const cap = 8 * 1024 * 1024;
   const harness = await createHarness(t, { envOverrides: {
