@@ -5,6 +5,29 @@ const BetterSqlite3 = require("better-sqlite3");
 const BUSY_TIMEOUT_MS = 3000;
 const TABLE = "upload_chunk_rate_hits";
 
+function assertSafeDirectory(directory) {
+  let stats;
+  try {
+    stats = fs.lstatSync(directory);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  if (stats.isSymbolicLink() || !stats.isDirectory()) throw new Error("Unsafe rate-limit store directory");
+}
+
+// Mirrors ensureSafeSidecarFile in services/chunkUploadQuota.js: regular files only, no hard links.
+function assertSafeSqliteFile(filePath) {
+  let stats;
+  try {
+    stats = fs.lstatSync(filePath);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1) throw new Error("Unsafe rate-limit SQLite file");
+}
+
 // Host-shared sliding-window store for express-rate-limit. Every process on one host that opens the
 // same database file shares the counts. It is not a multi-host store.
 class SqliteSlidingWindowStore {
@@ -31,15 +54,9 @@ class SqliteSlidingWindowStore {
     if (this.database) return this.database;
     const directory = path.dirname(this.databasePath);
     fs.mkdirSync(directory, { recursive: true });
-    for (const candidate of [directory, this.databasePath]) {
-      let stats;
-      try {
-        stats = fs.lstatSync(candidate);
-      } catch (error) {
-        if (error.code === "ENOENT") continue;
-        throw error;
-      }
-      if (stats.isSymbolicLink()) throw new Error("Unsafe rate-limit store path");
+    assertSafeDirectory(directory);
+    for (const filePath of [this.databasePath, `${this.databasePath}-wal`, `${this.databasePath}-shm`]) {
+      assertSafeSqliteFile(filePath);
     }
 
     const database = new this.Database(this.databasePath, { timeout: BUSY_TIMEOUT_MS });

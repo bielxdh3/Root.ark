@@ -103,3 +103,15 @@ test("sqlite chunk rate store expires hits after the window and sweeps them from
   const rows = writer.open().prepare("SELECT COUNT(*) AS count FROM upload_chunk_rate_hits").get();
   assert.equal(rows.count, 0);
 });
+
+test("sqlite chunk rate store refuses a WAL sidecar that is hard-linked elsewhere", (t) => {
+  withClock(t, 0);
+  const { directory, databasePath } = createTempDatabase(t);
+  const outside = path.join(directory, "outside.bin");
+  fs.writeFileSync(outside, "x");
+  fs.mkdirSync(directory, { recursive: true });
+  fs.linkSync(outside, `${databasePath}-wal`);
+  const store = new SqliteSlidingWindowStore(databasePath, 1000, 2);
+  removeAfterStores(t, directory, [store]);
+  assert.throws(() => store.increment("account"), /Unsafe rate-limit SQLite file/);
+});

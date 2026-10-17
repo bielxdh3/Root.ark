@@ -27,7 +27,7 @@ const STATES = new Set([
   "assembled", "encrypting", "handoff_pending", "handoff_published", "handed_off", "cleanup_pending",
 ]);
 
-// The per-account chunk limiter and session locks are process-local, so chunk uploads
+// The per-account chunk limiter is process-local unless UPLOAD_CHUNK_RATE_LIMIT_STORE=sqlite; session locks are SQLite-backed. Chunk uploads
 // fail closed when this process is a cluster worker or a non-primary PM2 instance.
 function detectMultiProcessRuntime(env = process.env, { isWorker = cluster.isWorker } = {}) {
   if (isWorker) return true;
