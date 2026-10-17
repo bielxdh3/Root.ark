@@ -69,8 +69,10 @@ Por padrao o arquivo fica pendente, respeitando o fluxo atual do Root.ark. Para 
 
 ## Phase 12: protocolo bidirecional protegido
 
-O modulo `sync-client/rootark-sync-protocol.js` define a versao 1 do protocolo
-client-side. Objetos usam `objectId`, `fileId` e `versionId` estaveis; revisoes
+O modulo `sync-client/rootark-sync-protocol.js` define a versao 2 do protocolo
+client-side (`PROTOCOL_VERSION = 2`, enviado como `protocolVersion: 2` em cada
+operacao). O prefixo HTTP da rota continua `/sync/v1/objects`; o numero `v1`
+do caminho nao e a versao do payload. Objetos usam `objectId`, `fileId` e `versionId` estaveis; revisoes
 sao ordenadas por Lamport (`counter` + `deviceId`) e nao por relogio de parede.
 Operacoes suportadas sao `create`, `update`, `move` e `delete` (tombstone), com
 `baseRevision` para detectar conflito e rejeicao de replay/stale update no
