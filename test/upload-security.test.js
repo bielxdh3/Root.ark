@@ -31,6 +31,40 @@ test("dead-owner quota test preload is inert outside the test environment", () =
   assert.equal(result.status, 0, result.stderr || "production preload changed the quota factory");
 });
 
+test("release gate reports a sanitized failing test and skips redundant full tests after a required failure", () => {
+  const vm = require("node:vm");
+  const { createRequire } = require("node:module");
+  const gatePath = path.join(ROOT, "scripts", "validate-release-gate.js");
+  const gateRequire = createRequire(gatePath);
+  const calls = [];
+  const printed = [];
+  const simulatedSpawnSync = (executable, args) => {
+    calls.push({ executable, args });
+    if (args.some((value) => String(value).endsWith("upload-security.test.js"))) {
+      return {
+        status: 1,
+        stdout: "not ok 7 - a second startup rejects ambiguous quota owner\n  failureType: 'testCodeFailure'\n  error: Upload denied password=synthetic-sensitive-fixture\n",
+        stderr: "Synthetic diagnostic: bearer test-secret-value\n",
+      };
+    }
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  const simulatedProcess = { execPath: process.execPath, exitCode: 0 };
+  vm.runInNewContext(fs.readFileSync(gatePath, "utf8"), {
+    __dirname: path.dirname(gatePath),
+    process: simulatedProcess,
+    console: { log: (value) => printed.push(String(value)) },
+    require: (name) => name === "node:child_process" ? { spawnSync: simulatedSpawnSync } : gateRequire(name),
+  }, { filename: gatePath });
+  const output = printed.join("\n");
+  assert.match(output, /FAIL: Upload security boundary — exit 1/);
+  assert.match(output, /a second startup rejects ambiguous quota owner/, "the exact failing test is visible in CI");
+  assert.doesNotMatch(output, /synthetic-sensitive-fixture|test-secret-value/, "raw test output cannot leak fixture secrets");
+  assert.match(output, /\[REDACTED\]/, "sensitive diagnostic text is redacted rather than silently dropped");
+  assert.equal(calls.some(({ args }) => args.includes("test")), false, "no expensive canonical npm test after an earlier hard failure");
+  assert.equal(simulatedProcess.exitCode, 1, "the gate still fails closed");
+});
+
 function getUnusedPort() {
   return new Promise((resolve, reject) => {
     const probe = net.createServer();

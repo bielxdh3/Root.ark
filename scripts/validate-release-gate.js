@@ -14,6 +14,19 @@ function record(name, status, details) {
   console.log(`${status}: ${name}${details ? ` — ${details}` : ""}`);
 }
 
+function failedTestDiagnostics(output) {
+  return String(output || "").split(/\r?\n/)
+    .map((line) => line.replace(/\x1b\[[\d;]*m/g, "").trim())
+    .filter((line) => /^(?:not ok \d+ - |[✖✗×] |error:|failureType:|location:)/.test(line))
+    .slice(-20)
+    .map((line) => line
+      .replace(/\bBearer\s+\S+/gi, "Bearer [REDACTED]")
+      .replace(/\b(?:password|secret|token|cookie|authorization|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s;,]+)/gi, "[REDACTED]")
+      .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[REDACTED]")
+      .slice(0, 240))
+    .join("\n").slice(0, 3000);
+}
+
 function command(name, executable, args, { blockedOnMissing = false, shell = false } = {}) {
   const result = spawnSync(executable, args, { cwd: root, encoding: "utf8", windowsHide: true, shell });
   const output = `${result.stdout || ""}\n${result.stderr || ""}\n${result.error?.message || ""}`.trim();
@@ -26,6 +39,8 @@ function command(name, executable, args, { blockedOnMissing = false, shell = fal
     return false;
   }
   record(name, "FAIL", `exit ${result.status ?? "unknown"}`);
+  const diagnostics = failedTestDiagnostics(output);
+  if (diagnostics) console.log(`FAIL diagnostics (${name}):\n${diagnostics}`);
   return false;
 }
 
@@ -112,7 +127,11 @@ for (const [name, files] of [
 ]) command(name, process.execPath, ["--test", ...files], { blockedOnMissing: true });
 
 const npmTest = getNpmInvocation(["test"]);
-command("final-head canonical npm test", npmTest.executable, npmTest.args, { blockedOnMissing: true });
+if (results.some((result) => result.status === "FAIL")) {
+  record("final-head canonical npm test", "SKIPPED", "earlier mandatory gate failed; run after correction");
+} else {
+  command("final-head canonical npm test", npmTest.executable, npmTest.args, { blockedOnMissing: true });
+}
 
 const npmAudit = getNpmInvocation(["audit", "--package-lock-only", "--audit-level=high"]);
 command("high-severity dependency audit", npmAudit.executable, npmAudit.args, { blockedOnMissing: true });
