@@ -1095,3 +1095,17 @@ test("chunk quota fails closed in cluster workers and non-primary PM2 instances"
   assert.equal(parseChunkUploadQuotaConfig({ ...env, NODE_APP_INSTANCE: "0" }, { isWorker: false }).enabled, true);
   assert.equal(parseChunkUploadQuotaConfig(env, { isWorker: false }).enabled, true);
 });
+
+test("chunk quota stays enabled in multi-process runtimes only when the host-shared SQLite rate store is selected", () => {
+  const env = {
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: "80",
+    CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: "100",
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "8",
+    CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10",
+    CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
+    UPLOAD_CHUNK_RATE_LIMIT_STORE: "sqlite",
+  };
+  assert.equal(parseChunkUploadQuotaConfig(env, { isWorker: true }).enabled, true);
+  assert.equal(parseChunkUploadQuotaConfig({ ...env, NODE_APP_INSTANCE: "1" }, { isWorker: false }).enabled, true);
+  assert.equal(parseChunkUploadQuotaConfig({ ...env, UPLOAD_CHUNK_RATE_LIMIT_STORE: "memory" }, { isWorker: true }).reason, "multi_process_runtime");
+});
