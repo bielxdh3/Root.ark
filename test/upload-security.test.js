@@ -20,6 +20,27 @@ const TIMEOUT_MS = 10_000;
 const FOLDER_ID = "upload-safety";
 const createChunkUploadQuota = (options) => createChunkUploadQuotaService({ perAccountEntries: 5000, systemEntries: 10000, ...options });
 
+function chunkBoundaryRequestTimeout(chunkIndex, totalChunks) {
+  // Only the final supported 2,000-part boundary assembles 2,000 files on this response.
+  // Keep the other 1,999 socket deadlines strict and the overall 180s test budget intact.
+  return totalChunks === 2000 && chunkIndex === totalChunks - 1 ? 30_000 : TIMEOUT_MS;
+}
+
+function isCanonicalNpmTestInvocation(executable, args) {
+  // Linux invokes `npm test -- ...`; Windows invokes cmd.exe with a single
+  // `npm.cmd test -- ...` command argument. Neither is `node --test`.
+  const command = args.map(String).join(" ");
+  return (/(?:^|[\\/])npm(?:\.cmd)?$/i.test(String(executable)) && args[0] === "test")
+    || /(?:^|\s)npm(?:\.cmd)?\s+test(?:\s|$)/i.test(command);
+}
+
+test("release gate mock identifies native Windows and POSIX npm test calls", () => {
+  assert.equal(isCanonicalNpmTestInvocation("npm", ["test", "--", "--test-reporter=tap"]), true);
+  assert.equal(isCanonicalNpmTestInvocation("C:\\Windows\\System32\\cmd.exe", ["/d", "/s", "/c", "npm.cmd test -- --test-reporter=tap"]), true);
+  assert.equal(isCanonicalNpmTestInvocation(process.execPath, ["--test", "test/upload-security.test.js"]), false);
+  assert.equal(isCanonicalNpmTestInvocation("npm", ["audit", "--package-lock-only"]), false);
+});
+
 test("dead-owner quota test preload is inert outside the test environment", () => {
   const quotaModulePath = path.join(ROOT, "services", "chunkUploadQuota.js");
   const preloadPath = path.join(ROOT, "test", "fixtures", "chunk-quota-dead-owner-preload.js");
@@ -29,6 +50,105 @@ test("dead-owner quota test preload is inert outside the test environment", () =
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr || "production preload changed the quota factory");
+});
+
+test("release gate reports a sanitized failing test and skips redundant full tests after a required failure", () => {
+  const vm = require("node:vm");
+  const { createRequire } = require("node:module");
+  const gatePath = path.join(ROOT, "scripts", "validate-release-gate.js");
+  const gateRequire = createRequire(gatePath);
+  const calls = [];
+  const printed = [];
+  const simulatedSpawnSync = (executable, args) => {
+    calls.push({ executable, args });
+    if (args.some((value) => String(value).endsWith("upload-security.test.js"))) {
+      return {
+        status: 1,
+        stdout: "not ok 7 - a second startup rejects ambiguous quota owner\n  failureType: 'testCodeFailure'\n  error: Upload denied password=synthetic-sensitive-fixture Authorization: Basic c2Vuc2l0aXZl refresh_token=synthetic-refresh-key access_token=synthetic-access-key\n",
+        stderr: "Synthetic diagnostic: bearer test-secret-value\n",
+      };
+    }
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  const simulatedProcess = { execPath: process.execPath, exitCode: 0 };
+  vm.runInNewContext(fs.readFileSync(gatePath, "utf8"), {
+    __dirname: path.dirname(gatePath),
+    process: simulatedProcess,
+    console: { log: (value) => printed.push(String(value)) },
+    require: (name) => name === "node:child_process" ? { spawnSync: simulatedSpawnSync } : gateRequire(name),
+  }, { filename: gatePath });
+  const output = printed.join("\n");
+  assert.match(output, /FAIL: Upload security boundary — exit 1/);
+  assert.match(output, /a second startup rejects ambiguous quota owner/, "the exact failing test is visible in CI");
+  assert.doesNotMatch(output, /synthetic-sensitive-fixture|test-secret-value|c2Vuc2l0aXZl|synthetic-refresh-key|synthetic-access-key/, "raw test output cannot leak any fixture secrets");
+  assert.match(output, /\[REDACTED\]/, "sensitive diagnostic text is redacted rather than silently dropped");
+  assert.equal(calls.some(({ args }) => /(?:^|\s)(?:npm(?:\.cmd)?\s+test|test(?:\s|$))/.test(args.join(" "))), false, "no expensive canonical npm test after an earlier hard failure on Windows or POSIX");
+  assert.equal(simulatedProcess.exitCode, 1, "the gate still fails closed");
+});
+
+test("release gate emits a bounded redacted TAP failure from canonical npm test on Windows", () => {
+  const vm = require("node:vm");
+  const { createRequire } = require("node:module");
+  const gatePath = path.join(ROOT, "scripts", "validate-release-gate.js");
+  const gateRequire = createRequire(gatePath);
+  const printed = [];
+  const commands = [];
+  const simulatedProcess = { execPath: process.execPath, exitCode: 0 };
+  const secret = "synthetic-canonical-npm-secret";
+  const simulatedSpawnSync = (executable, args) => {
+    commands.push(args.map(String).join(" "));
+    if (isCanonicalNpmTestInvocation(executable, args)) {
+      return {
+        status: 1,
+        stdout: `TAP version 13\nnot ok 327 - a concurrent upload boundary failed token=${secret}\n  error: expected success password=${secret}\n# tests 1411\n# pass 1410\n# fail 1\n`,
+        stderr: `npm error code 1\nnpm error stderr=${secret}`,
+      };
+    }
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  vm.runInNewContext(fs.readFileSync(gatePath, "utf8"), {
+    __dirname: path.dirname(gatePath),
+    process: simulatedProcess,
+    console: { log: (line) => printed.push(String(line)) },
+    require: (name) => name === "node:child_process" ? { spawnSync: simulatedSpawnSync } : gateRequire(name),
+  }, { filename: gatePath });
+  const output = printed.join("\n");
+  assert.ok(commands.some((line) => /(?:^|\s)(?:npm(?:\.cmd)?\s+)?test -- --test-reporter=tap(?:\s|$)/.test(line)), "canonical npm still runs every test with a deterministic TAP reporter");
+  assert.match(output, /FAIL diagnostics \(final-head canonical npm test\):/);
+  assert.match(output, /not ok 327 - a concurrent upload boundary failed/);
+  assert.match(output, /# fail 1/);
+  assert.doesNotMatch(output, new RegExp(secret), "TAP and stderr secrets are not printed");
+  assert.ok(output.length < 5000, "CI failure log stays bounded");
+  assert.equal(simulatedProcess.exitCode, 1);
+});
+
+test("release gate prints metadata-only failure diagnostics for unknown npm output", () => {
+  const vm = require("node:vm");
+  const { createRequire } = require("node:module");
+  const gatePath = path.join(ROOT, "scripts", "validate-release-gate.js");
+  const gateRequire = createRequire(gatePath);
+  const printed = [];
+  const secret = "synthetic-unknown-sensitive-stdout";
+  vm.runInNewContext(fs.readFileSync(gatePath, "utf8"), {
+    __dirname: path.dirname(gatePath),
+    process: { execPath: process.execPath, exitCode: 0 },
+    console: { log: (line) => printed.push(String(line)) },
+    require: (name) => name === "node:child_process" ? { spawnSync: (executable, args) => isCanonicalNpmTestInvocation(executable, args)
+      ? { status: 1, stdout: `unknown-format ${secret}\n`, stderr: "", error: { code: "ENOBUFS" } }
+      : { status: 0, stdout: "", stderr: "" } } : gateRequire(name),
+  }, { filename: gatePath });
+  const output = printed.join("\n");
+  assert.match(output, /FAIL diagnostics \(final-head canonical npm test\):/);
+  assert.match(output, /ENOBUFS/);
+  assert.match(output, /stdoutBytes=/);
+  assert.doesNotMatch(output, new RegExp(secret), "fallback cannot expose arbitrary child stdout");
+});
+
+test("2,000-chunk boundary keeps ordinary socket timeout strict and bounds final assembly separately", () => {
+  assert.equal(chunkBoundaryRequestTimeout(0, 2000), TIMEOUT_MS);
+  assert.equal(chunkBoundaryRequestTimeout(1998, 2000), TIMEOUT_MS);
+  assert.equal(chunkBoundaryRequestTimeout(1999, 2000), 30_000);
+  assert.equal(chunkBoundaryRequestTimeout(1999, 2001), TIMEOUT_MS, "test-only final assembly allowance is restricted to the supported 2,000 part boundary");
 });
 
 function getUnusedPort() {
@@ -2381,15 +2501,27 @@ test("a valid upload can send all 2,000 allowed chunks within the configured win
   const uploadId = "two-thousand-chunk-window";
 
   let completed;
+  const startedAt = Date.now();
+  let slowestMs = 0;
+  let slowestIndex = -1;
   for (let chunkIndex = 0; chunkIndex < 2000; chunkIndex += 1) {
-    completed = await uploadChunk(harness.port, session, {
-      uploadId,
-      originalName: "two-thousand-parts.txt",
-      chunkIndex,
-      totalChunks: 2000,
-      bytes: Buffer.from([chunkIndex % 256]),
-      agent,
-    });
+    const chunkStartedAt = Date.now();
+    try {
+      completed = await uploadChunk(harness.port, session, {
+        uploadId,
+        originalName: "two-thousand-parts.txt",
+        chunkIndex,
+        totalChunks: 2000,
+        bytes: Buffer.from([chunkIndex % 256]),
+        agent,
+        timeoutMs: chunkBoundaryRequestTimeout(chunkIndex, 2000),
+      });
+    } catch (error) {
+      throw new Error(`chunk ${chunkIndex}/2000: ${error.message}; elapsedMs=${Date.now() - chunkStartedAt}; totalElapsedMs=${Date.now() - startedAt}; previousSlowestMs=${slowestMs} at index ${slowestIndex}; serverExit=${harness.child.exitCode ?? "running"}`, { cause: error });
+    }
+    const elapsedMs = Date.now() - chunkStartedAt;
+    if (elapsedMs > slowestMs) { slowestMs = elapsedMs; slowestIndex = chunkIndex; }
+    if (chunkIndex === 0 || (chunkIndex + 1) % 250 === 0) t.diagnostic(`chunk progress ${chunkIndex + 1}/2000 elapsedMs=${Date.now() - startedAt} mostSlowMs=${slowestMs} index=${slowestIndex}`);
     assert.equal(completed.status, 200, `chunk ${chunkIndex}: ${completed.body}\n${harness.stderr.join("")}`);
   }
 

@@ -1509,7 +1509,8 @@ async function createBackup(options = {}) {
       saved = backupRepository.saveBackup(successEntry, { mutationLease: releaseSuppressionSnapshot.mutationLease });
     } finally { releaseSuppressionSnapshot(); }
 
-    await cleanupRetention({ lockHeld: true });
+    // A pre-restore backup runs while its selected archive is held for extraction.
+    if (backupType !== "pre-restore") await cleanupRetention({ lockHeld: true });
     return saved;
   } catch (error) {
     outcomeError = error;

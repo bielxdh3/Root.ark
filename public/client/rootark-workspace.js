@@ -748,12 +748,6 @@
     } catch (error) { reportError(error); }
   }
 
-  function closePreview(dialog, objectUrl) {
-    if (dialog.open) dialog.close();
-    dialog.remove();
-    if (objectUrl) URL.revokeObjectURL(objectUrl);
-  }
-
   async function previewFile(name, scope, folderId) {
     const dialog = document.createElement("dialog");
     dialog.className = "preview-dialog";
@@ -775,17 +769,31 @@
     dialog.append(header, body);
     document.body.append(dialog);
     let objectUrl = "";
-    close.addEventListener("click", () => closePreview(dialog, objectUrl));
-    dialog.addEventListener("click", (event) => { if (event.target === dialog) closePreview(dialog, objectUrl); });
-    dialog.addEventListener("close", () => {
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    let closed = false;
+    const controller = new AbortController();
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      controller.abort();
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+        objectUrl = "";
+      }
       dialog.remove();
-    }, { once: true });
+    };
+    const dismiss = () => {
+      if (dialog.open) dialog.close();
+      cleanup();
+    };
+    close.addEventListener("click", dismiss);
+    dialog.addEventListener("click", (event) => { if (event.target === dialog) dismiss(); });
+    dialog.addEventListener("close", cleanup, { once: true });
     dialog.showModal();
     try {
       const ext = (name.match(/\.[^.]+$/) || [""])[0].toLowerCase();
       if ([".png", ".jpg", ".jpeg", ".gif", ".webp"].includes(ext)) {
-        const blob = await api.get(api.query("/preview/file/" + encodeURIComponent(scope) + "/" + encodeURIComponent(name), { folderId }), { responseType: "blob" });
+        const blob = await api.get(api.query("/preview/file/" + encodeURIComponent(scope) + "/" + encodeURIComponent(name), { folderId }), { responseType: "blob", signal: controller.signal });
+        if (closed || !dialog.open) return;
         objectUrl = URL.createObjectURL(blob);
         const image = document.createElement("img");
         image.className = "file-preview-image";
@@ -793,7 +801,8 @@
         image.src = objectUrl;
         body.replaceChildren(image);
       } else if (ext === ".pdf") {
-        const blob = await api.get(api.query("/preview/file/" + encodeURIComponent(scope) + "/" + encodeURIComponent(name), { folderId }), { responseType: "blob" });
+        const blob = await api.get(api.query("/preview/file/" + encodeURIComponent(scope) + "/" + encodeURIComponent(name), { folderId }), { responseType: "blob", signal: controller.signal });
+        if (closed || !dialog.open) return;
         objectUrl = URL.createObjectURL(blob);
         const frame = document.createElement("iframe");
         frame.title = "Pré-visualização de " + name;
@@ -801,14 +810,15 @@
         frame.src = objectUrl;
         body.replaceChildren(frame);
       } else {
-        const result = await api.get(api.query("/preview/text/" + encodeURIComponent(scope) + "/" + encodeURIComponent(name), { folderId }));
+        const result = await api.get(api.query("/preview/text/" + encodeURIComponent(scope) + "/" + encodeURIComponent(name), { folderId }), { signal: controller.signal });
+        if (closed || !dialog.open) return;
         const pre = document.createElement("pre");
         pre.className = "preview-text-content";
         pre.textContent = result.content || "Sem conteúdo disponível para pré-visualização.";
         body.replaceChildren(pre);
       }
     } catch (error) {
-      body.textContent = error.message || "Não foi possível gerar a pré-visualização. Baixe o arquivo para abrir.";
+      if (!closed && dialog.open) body.textContent = error.message || "Não foi possível gerar a pré-visualização. Baixe o arquivo para abrir.";
     }
   }
 

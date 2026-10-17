@@ -9,7 +9,8 @@
   <link rel="icon" href="/assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles/app.css?v=19">
   <script defer src="/client/rootark-api.js?v=17"></script>
-  <script defer src="/client/rootark-login.js?v=16"></script>
+  <script defer src="/client/rootark-login.js?v=17"></script>
+  <script defer src="/client/rootark-offline-shell.js?v=16"></script>
 </head>
 <body class="auth-body">
   <main class="auth-page">
@@ -47,11 +48,12 @@
 
         <form class="auth-form auth-step" id="totp-form" hidden>
           <div class="field-row">
-            <label for="totp-code">Código de autenticação</label>
-            <input class="field" id="totp-code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required>
-            <p class="field-help">Digite o código atual do seu aplicativo de autenticação.</p>
+            <label for="totp-code" id="totp-code-label">Código de autenticação</label>
+            <input class="field" id="totp-code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" aria-describedby="totp-code-help" required>
+            <p class="field-help" id="totp-code-help" aria-live="polite">Digite o código atual do seu aplicativo de autenticação.</p>
           </div>
           <button class="button button-primary" type="submit">Verificar código</button>
+          <button class="button button-quiet" id="use-recovery-code" type="button" aria-controls="totp-code">Usar código de recuperação</button>
           <button class="button button-quiet" id="back-to-login" type="button">Voltar</button>
         </form>
 

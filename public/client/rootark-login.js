@@ -11,9 +11,14 @@
   const loginIntro = document.getElementById("login-intro");
   const eyebrow = document.getElementById("login-eyebrow");
   const loginButton = document.getElementById("login-submit");
+  const totpCode = document.getElementById("totp-code");
+  const totpLabel = document.getElementById("totp-code-label");
+  const totpHelp = document.getElementById("totp-code-help");
+  const recoverySwitch = document.getElementById("use-recovery-code");
   let challengeId = null;
   let enrollmentToken = null;
   let busy = false;
+  let challengeMode = "totp";
 
   try {
     const theme = localStorage.getItem("rootark-theme");
@@ -33,6 +38,7 @@
 
   function setBusy(form, value, label) {
     busy = value;
+    if (form === totpForm) recoverySwitch.disabled = value;
     const button = form.querySelector('button[type="submit"]');
     if (!button) return;
     button.disabled = value;
@@ -43,6 +49,23 @@
       button.textContent = button.dataset.originalLabel;
       delete button.dataset.originalLabel;
     }
+  }
+
+  function setChallengeMode(mode, focus = true) {
+    const recovery = mode === "recovery";
+    challengeMode = recovery ? "recovery" : "totp";
+    totpCode.value = "";
+    totpLabel.textContent = recovery ? "Código de recuperação" : "Código de autenticação";
+    totpHelp.textContent = recovery
+      ? "Digite um dos seus códigos de recuperação de uso único."
+      : "Digite o código atual do seu aplicativo de autenticação.";
+    recoverySwitch.textContent = recovery ? "Usar código do aplicativo" : "Usar código de recuperação";
+    totpCode.setAttribute("inputmode", recovery ? "text" : "numeric");
+    totpCode.setAttribute("autocomplete", recovery ? "off" : "one-time-code");
+    totpCode.setAttribute("maxlength", recovery ? "64" : "6");
+    if (recovery) totpCode.removeAttribute("pattern");
+    else totpCode.setAttribute("pattern", "[0-9]{6}");
+    if (focus) totpCode.focus();
   }
 
   function showStep(step) {
@@ -57,6 +80,7 @@
       loginIntro.textContent = "Use suas credenciais para acessar seu espaço.";
       document.getElementById("username").focus();
     } else if (step === "totp") {
+      setChallengeMode("totp", false);
       eyebrow.textContent = "VERIFICAÇÃO ADICIONAL";
       loginTitle.textContent = "Confirme sua identidade";
       loginIntro.textContent = "Sua conta usa autenticação de dois fatores.";
@@ -161,12 +185,20 @@
       const code = new FormData(totpForm).get("code");
       await api.post("/auth/login/2fa", { challengeId, code });
       challengeId = null;
+      totpCode.value = "";
       finishLogin();
     } catch (error) {
       message(friendlyError(error, "Código inválido ou expirado. Confira o aplicativo e tente novamente."));
       document.getElementById("totp-code").select();
     } finally {
       setBusy(totpForm, false);
+    }
+  });
+
+  recoverySwitch.addEventListener("click", () => {
+    if (!busy && challengeId) {
+      message("");
+      setChallengeMode(challengeMode === "totp" ? "recovery" : "totp");
     }
   });
 
@@ -198,6 +230,7 @@
   document.getElementById("back-to-login").addEventListener("click", () => {
     challengeId = null;
     totpForm.reset();
+    setChallengeMode("totp", false);
     showStep("login");
   });
   document.getElementById("cancel-enroll").addEventListener("click", () => {

@@ -382,6 +382,212 @@ function runFixture(body, envOverrides = {}, timeoutMs = 30_000) {
   }
 }
 
+test("pre-restore snapshot never prunes its selected source under retention count one", () => {
+  runFixture(`
+    (async () => {
+      write(path.join(dataDir, "runtime.json"), "archive-A");
+      const selected = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "runtime.json"), "archive-B");
+      await backupService.createBackup({ createdBy: "fixture" });
+      process.env.BACKUP_RETENTION_COUNT = "1";
+      process.env.BACKUP_RETENTION_DAYS = "0";
+      const result = await restoreService.restoreBackup(selected.id, { confirmation: "RESTORE" });
+      assert.equal(result.restartRecommended, true);
+      assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "archive-A");
+      assert.equal(fs.existsSync(path.join(backupService.BACKUPS_DIR, selected.filename)), true);
+      assert.ok(backupService.listBackups().some((item) => item.id === selected.id));
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("failed restore leaves its source intact and defers retention until recovery finishes", () => {
+  runFixture(`
+    (async () => {
+      write(path.join(dataDir, "runtime.json"), "archive-A");
+      const selected = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "runtime.json"), "archive-B");
+      const newer = await backupService.createBackup({ createdBy: "fixture" });
+      const source = path.join(backupService.BACKUPS_DIR, selected.filename);
+      process.env.BACKUP_RETENTION_COUNT = "1";
+      process.env.BACKUP_RETENTION_DAYS = "0";
+      await assert.rejects(restoreService.restoreBackup(selected.id, {
+        confirmation: "RESTORE",
+        failureInjector(step) {
+          if (step === "restore.data.copied") throw new Error("injected restore failure");
+        },
+      }), /injected restore failure/);
+      assert.equal(fs.existsSync(source), true);
+      assert.equal(restoreService.assertNoPendingWholeRestore().recovered, true);
+      assert.equal(fs.existsSync(source), true);
+      await backupService.cleanupRetention();
+      assert.equal(fs.existsSync(source), false, "retention resumes once restore recovery releases its source");
+      assert.ok(backupService.listBackups().some((item) => item.id === newer.id));
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("older JSON backup removes post-snapshot groups without deleting excluded or unrelated files", () => {
+  runFixture(`
+    const { AtomicGroupsStore } = require(${JSON.stringify(path.join(ROOT, "src", "routes", "groups"))});
+    (async () => {
+      write(path.join(dataDir, "runtime.json"), "snapshot");
+      const selected = await backupService.createBackup({ createdBy: "fixture" });
+      const store = new AtomicGroupsStore(path.join(dataDir, "groups.json"));
+      store.create("post-snapshot", ["alice"]);
+      write(path.join(dataDir, "unrelated-not-app.json"), "keep this unrelated file");
+      write(path.join(dataDir, "server-master.key"), "untouched fixture marker");
+      await restoreService.restoreBackup(selected.id, { confirmation: "RESTORE" });
+      assert.equal(fs.existsSync(path.join(dataDir, "groups.json")), false,
+        "post-snapshot group membership must not survive a whole restore");
+      assert.equal(fs.readFileSync(path.join(dataDir, "unrelated-not-app.json"), "utf8"), "keep this unrelated file");
+      assert.equal(fs.readFileSync(path.join(dataDir, "server-master.key"), "utf8"), "untouched fixture marker");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("JSON restore without archived data files still removes post-snapshot recognized state", () => {
+  runFixture(`
+    const { AtomicGroupsStore } = require(${JSON.stringify(path.join(ROOT, "src", "routes", "groups"))});
+    (async () => {
+      const selected = await backupService.createBackup({ createdBy: "fixture" });
+      assert.equal(selected.metadata.manifest.included_files.some((file) => file.path.startsWith("data/")), false,
+        JSON.stringify(selected.metadata.manifest.included_files.map((file) => file.path)));
+      new AtomicGroupsStore(path.join(dataDir, "groups.json")).create("new-group", ["alice"]);
+      await restoreService.restoreBackup(selected.id, { confirmation: "RESTORE" });
+      assert.equal(fs.existsSync(path.join(dataDir, "groups.json")), false);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore refuses a JSON state file created after durable preimages without erasing it", () => {
+  runFixture(`
+    const { AtomicGroupsStore } = require(${JSON.stringify(path.join(ROOT, "src", "routes", "groups"))});
+    (async () => {
+      write(path.join(dataDir, "runtime.json"), "snapshot");
+      const selected = await backupService.createBackup({ createdBy: "fixture" });
+      const groupsPath = path.join(dataDir, "groups.json");
+      await assert.rejects(restoreService.restoreBackup(selected.id, {
+        confirmation: "RESTORE",
+        failureInjector(step) {
+          if (step === "restore.preimage.completed") {
+            new AtomicGroupsStore(groupsPath).create("late-group", ["alice"]);
+          }
+        },
+      }), /JSON state changed after pre-image|JSON state was not staged/);
+      assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "snapshot");
+      assert.equal(new AtomicGroupsStore(groupsPath).list().length, 1);
+      assert.equal(restoreService.assertNoPendingWholeRestore().reason, "no_pending_restore");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore refuses same-content replacement of a staged obsolete JSON file", () => {
+  runFixture(`
+    const { AtomicGroupsStore } = require(${JSON.stringify(path.join(ROOT, "src", "routes", "groups"))});
+    (async () => {
+      write(path.join(dataDir, "runtime.json"), "snapshot");
+      const selected = await backupService.createBackup({ createdBy: "fixture" });
+      const groupsPath = path.join(dataDir, "groups.json");
+      new AtomicGroupsStore(groupsPath).create("preimaged-group", ["alice"]);
+      const original = fs.readFileSync(groupsPath);
+      await assert.rejects(restoreService.restoreBackup(selected.id, {
+        confirmation: "RESTORE",
+        failureInjector(step) {
+          if (step === "restore.preimage.completed") {
+            fs.unlinkSync(groupsPath);
+            write(groupsPath, original);
+          }
+        },
+      }), /JSON state changed after pre-image/);
+      assert.deepEqual(fs.readFileSync(groupsPath), original);
+      assert.equal(restoreService.assertNoPendingWholeRestore().reason, "no_pending_restore");
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("post-preimage JSON creation during local copy survives later restore rollback", () => {
+  runFixture(`
+    const { AtomicGroupsStore } = require(${JSON.stringify(path.join(ROOT, "src", "routes", "groups"))});
+    (async () => {
+      write(path.join(dataDir, "runtime.json"), "snapshot");
+      const selected = await backupService.createBackup({ createdBy: "fixture" });
+      write(path.join(dataDir, "runtime.json"), "live");
+      const groupsPath = path.join(dataDir, "groups.json");
+      await assert.rejects(restoreService.restoreBackup(selected.id, {
+        confirmation: "RESTORE",
+        failureInjector(step) {
+          if (step === "restore.data.copied") {
+            new AtomicGroupsStore(groupsPath).create("mid-copy", ["alice"]);
+          }
+        },
+      }), /JSON state changed after pre-image|JSON state was not staged/);
+      assert.equal(restoreService.assertNoPendingWholeRestore().recovered, true);
+      assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "live");
+      assert.equal(new AtomicGroupsStore(groupsPath).list().length, 1);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("restore rechecks each obsolete JSON identity just before its own removal", () => {
+  runFixture(`
+    const { AtomicGroupsStore } = require(${JSON.stringify(path.join(ROOT, "src", "routes", "groups"))});
+    (async () => {
+      write(path.join(dataDir, "runtime.json"), "snapshot");
+      const selected = await backupService.createBackup({ createdBy: "fixture" });
+      const groupsPath = path.join(dataDir, "groups.json");
+      new AtomicGroupsStore(groupsPath).create("original", ["alice"]);
+      const original = fs.readFileSync(groupsPath);
+      write(path.join(dataDir, "folders.json"), JSON.stringify({ folders: [] }));
+      let replaced = false;
+      await assert.rejects(restoreService.restoreBackup(selected.id, {
+        confirmation: "RESTORE",
+        failureInjector(step, details) {
+          if (step === "restore.data.obsolete-removed" && path.basename(details.destinationPath) === "folders.json") {
+            replaced = true;
+            fs.unlinkSync(groupsPath);
+            write(groupsPath, original);
+          }
+        },
+      }), /JSON state changed after pre-image/);
+      assert.equal(replaced, true);
+      assert.equal(restoreService.assertNoPendingWholeRestore().recovered, true);
+      assert.deepEqual(fs.readFileSync(groupsPath), original);
+      assert.equal(fs.existsSync(path.join(dataDir, "folders.json")), true);
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
+test("rollback restores post-snapshot group state after obsolete JSON removal fails", () => {
+  runFixture(`
+    const { AtomicGroupsStore } = require(${JSON.stringify(path.join(ROOT, "src", "routes", "groups"))});
+    (async () => {
+      write(path.join(dataDir, "runtime.json"), "snapshot");
+      const selected = await backupService.createBackup({ createdBy: "fixture" });
+      const store = new AtomicGroupsStore(path.join(dataDir, "groups.json"));
+      const group = store.create("still-here", ["alice"]);
+      write(path.join(dataDir, "runtime.json"), "current");
+      await assert.rejects(restoreService.restoreBackup(selected.id, {
+        confirmation: "RESTORE",
+        failureInjector(step) {
+          if (step === "restore.data.obsolete-removed") throw new Error("injected after JSON removal");
+        },
+      }), /injected after JSON removal/);
+      assert.equal(restoreService.assertNoPendingWholeRestore().recovered, true);
+      assert.equal(fs.readFileSync(path.join(dataDir, "runtime.json"), "utf8"), "current");
+      assert.ok(new AtomicGroupsStore(path.join(dataDir, "groups.json")).get(group.id));
+      console.log(JSON.stringify({ ok: true }));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `);
+});
+
 test("invalid restore ids cannot delete paths outside the restore temp directory", () => {
   runFixture(`
     const victimDir = path.join(process.cwd(), "victim");
@@ -3344,8 +3550,8 @@ test("restore failure after quarantine commit rolls quarantine, JSON, and upload
   `);
 });
 
-test("abrupt whole-restore interruptions automatically roll back before startup migrations", { timeout: 60_000 }, () => {
-  for (const crashStep of ["restore.coordinator.persisted", "restore.before-local-commit", "restore.quarantine.committed", "restore.data.copied", "restore.uploads.copied", "restore.uploads.cleared", "restore.sqlite.before-replacement", "restore.sqlite.committed", "restore.backup-history.reconciled", "restore.cloud-sync.persisted"]) {
+test("abrupt whole-restore interruptions automatically roll back before startup migrations", { timeout: 90_000 }, () => {
+  for (const crashStep of ["restore.coordinator.persisted", "restore.before-local-commit", "restore.quarantine.committed", "restore.data.copied", "restore.data.obsolete-removed", "restore.uploads.copied", "restore.uploads.cleared", "restore.sqlite.before-replacement", "restore.sqlite.committed", "restore.backup-history.reconciled", "restore.cloud-sync.persisted"]) {
     const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-restore-coordinator-runtime-"));
     const quarantineDir = path.join(runtime, "quarantine");
     const env = {
@@ -3369,6 +3575,7 @@ test("abrupt whole-restore interruptions automatically roll back before startup 
     const path = require("node:path");
     const backupService = require(${JSON.stringify(path.join(ROOT, "services", "backupService"))});
     const restoreService = require(${JSON.stringify(path.join(ROOT, "services", "restoreService"))});
+    const { AtomicGroupsStore } = require(${JSON.stringify(path.join(ROOT, "src", "routes", "groups"))});
     const Database = require(${JSON.stringify(path.join(ROOT, "node_modules", "better-sqlite3"))});
     const cloud = {
       enabled: () => true,
@@ -3394,6 +3601,7 @@ test("abrupt whole-restore interruptions automatically roll back before startup 
     write(path.join(process.env.UPLOAD_QUARANTINE_DIR, "archived.bin"), "archived-quarantine");
     (async () => {
       const backup = await backupService.createBackup({ createdBy: "fixture" });
+      new AtomicGroupsStore(path.join(dataDir, "groups.json")).create("post-snapshot", ["alice"]);
       write(path.join(dataDir, "runtime.json"), "live-state");
       write(path.join(uploadsDir, "file.txt"), "live-upload");
       fs.rmSync(path.join(process.env.UPLOAD_QUARANTINE_DIR, "archived.bin"), { force: true });
@@ -3419,6 +3627,8 @@ test("abrupt whole-restore interruptions automatically roll back before startup 
     const runMigrations=migrations.runMigrations;
     migrations.runMigrations=(options)=>{
       assert.equal(fs.readFileSync("data/runtime.json", "utf8"), "live-state", "whole-restore recovery completes before startup migrations");
+      assert.equal(Object.values(JSON.parse(fs.readFileSync("data/groups.json", "utf8")).groups).length, 1,
+        "post-snapshot group state is rolled back before migrations");
       assert.equal(fs.readFileSync("uploads/file.txt", "utf8"), "live-upload");
       assert.equal(fs.readFileSync("quarantine/live.bin", "utf8"), "live-quarantine");
       assert.equal(fs.existsSync("data/.rootark-restore-coordinator.json"), false);
@@ -3430,6 +3640,7 @@ test("abrupt whole-restore interruptions automatically roll back before startup 
     setTimeout(() => {
       try {
         assert.equal(fs.readFileSync("data/runtime.json", "utf8"), "live-state");
+        assert.equal(Object.values(JSON.parse(fs.readFileSync("data/groups.json", "utf8")).groups).length, 1);
         assert.equal(fs.readFileSync("uploads/file.txt", "utf8"), "live-upload");
         assert.equal(fs.readFileSync("quarantine/live.bin", "utf8"), "live-quarantine");
         assert.equal(fs.existsSync("quarantine/archived.bin"), false);
