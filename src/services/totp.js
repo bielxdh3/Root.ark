@@ -169,6 +169,17 @@ function verifyRecoveryCode(code, stored) {
   return crypto.timingSafeEqual(digest, Buffer.from(digestText, "hex"));
 }
 
+const scryptAsync = require("node:util").promisify(crypto.scrypt);
+
+async function verifyRecoveryCodeAsync(code, stored) {
+  const normalized = normalizeRecoveryCode(code);
+  if (!normalized || typeof stored !== "string") return false;
+  const [prefix, saltText, digestText] = stored.split("$");
+  if (prefix !== RECOVERY_HASH_PREFIX || !/^[0-9a-f]{32}$/.test(saltText) || !/^[0-9a-f]{64}$/.test(digestText)) return false;
+  const digest = await scryptAsync(normalized, Buffer.from(saltText, "hex"), 32, { N: 16_384, r: 8, p: 1, maxmem: 32 * 1024 * 1024 });
+  return crypto.timingSafeEqual(digest, Buffer.from(digestText, "hex"));
+}
+
 function generateRecoveryCodes(count = RECOVERY_CODE_COUNT, randomBytes = crypto.randomBytes) {
   if (!Number.isInteger(count) || count < 1 || count > 20) throw new Error("Invalid recovery code count");
   const codes = Array.from({ length: count }, () => {
@@ -198,5 +209,6 @@ module.exports = {
   normalizeOtp,
   normalizeRecoveryCode,
   verifyRecoveryCode,
+  verifyRecoveryCodeAsync,
   verifyTotp,
 };
