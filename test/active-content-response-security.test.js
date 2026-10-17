@@ -10,6 +10,7 @@ const { spawn } = require("node:child_process");
 const test = require("node:test");
 let chromium;
 try { ({ chromium } = require("playwright")); } catch {}
+const chromiumInstalled = Boolean(chromium && fs.existsSync(chromium.executablePath()));
 
 const ROOT = path.resolve(__dirname, "..");
 
@@ -167,7 +168,7 @@ test("HSTS is emitted only when request originated over trusted HTTPS", { timeou
   assert.equal(trustedHttps.headers["strict-transport-security"], "max-age=31536000");
 });
 
-test("browser loads static login scripts and same-origin public-share image preview under CSP", { skip: !chromium, timeout: 45_000 }, async (t) => {
+test("browser loads static login scripts and same-origin public-share image preview under CSP", { skip: !chromiumInstalled, timeout: 45_000 }, async (t) => {
   const { port, shares } = await startFixture(t);
   const token = Object.entries(shares).find(([, link]) => link.fileName === "safe.png")[0];
   const browser = await chromium.launch({ headless: true, executablePath: chromium.executablePath() });
