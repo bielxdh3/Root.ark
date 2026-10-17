@@ -109,7 +109,7 @@ test("issue 66: switching a folder to excluded evicts the clean local copy and k
   const sync = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
   const summary = await sync.syncOnce();
 
-  assert.deepEqual(summary.excluded, { evicted: 1, released: 0, kept: [] });
+  assert.deepEqual(summary.excluded, { evicted: 1, released: 0, kept: [], failed: [] });
   assert.equal(await exists(path.join(root, "private", "secret.txt")), false);
   assert.equal(await fsp.readFile(path.join(root, "shared", "open.txt"), "utf8"), "open");
   const after = recordFor(store, "private/secret.txt");
@@ -136,7 +136,7 @@ test("issue 66: a locally edited file in a newly excluded folder is kept and rep
   const summary = await sync.syncOnce();
 
   assert.equal(await fsp.readFile(path.join(root, "private", "secret.txt"), "utf8"), "local edit");
-  assert.deepEqual(summary.excluded, { evicted: 0, released: 0, kept: [{ path: "private/secret.txt", code: "local_changes_pending" }] });
+  assert.deepEqual(summary.excluded, { evicted: 0, released: 0, kept: [{ path: "private/secret.txt", code: "local_changes_pending" }], failed: [] });
   assert.equal(summary.pushed, 0);
   assert.equal(recordFor(store, "private/secret.txt").operationId, before.operationId);
   assert.equal(recordFor(store, "private/secret.txt").tombstone, false);
@@ -157,7 +157,7 @@ test("issue 66: a folder excluded while its local copy is absent is released wit
 
   const sync = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
   const summary = await sync.syncOnce();
-  assert.deepEqual(summary.excluded, { evicted: 0, released: 1, kept: [] });
+  assert.deepEqual(summary.excluded, { evicted: 0, released: 1, kept: [], failed: [] });
   assert.equal(summary.pushed, 0);
   assert.equal(recordFor(store, "private/secret.txt").tombstone, false);
   assert.equal(sync.snapshot.remoteOnly[before.objectId].reason, "excluded");
@@ -185,4 +185,85 @@ test("issue 66: excluded paths are validated and match whole path segments only"
   await seed(dir, adapter, key, { "private/secret.txt": "secret" });
   await (await engine(rootDir, adapter, key, { deviceId: "device-b", excludedPaths: ["priv"] })).syncOnce();
   assert.equal(await fsp.readFile(path.join(rootDir, "private", "secret.txt"), "utf8"), "secret");
+});
+
+async function exclusionFixture(t, name) {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), `rootark-issue66-${name}-`));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", { offline: false });
+  await seed(dir, adapter, key, { "private/secret.txt": "secret" });
+  const root = path.join(dir, "device");
+  await (await engine(root, adapter, key, { deviceId: "device-b" })).syncOnce();
+  const before = recordFor(store, "private/secret.txt");
+  return { key, store, adapter, root, before, localPath: path.join(root, "private", "secret.txt") };
+}
+
+function blockTrashRenames(t, failures) {
+  const originalRename = fsp.rename;
+  const state = { count: 0 };
+  fsp.rename = async function injectedRename(from, to, ...rest) {
+    if (String(to).includes(`${path.sep}.rootark-trash${path.sep}`)) {
+      state.count += 1;
+      if (state.count <= failures) throw Object.assign(new Error("injected EBUSY"), { code: "EBUSY" });
+    }
+    return originalRename.call(fsp, from, to, ...rest);
+  };
+  const restore = () => { fsp.rename = originalRename; };
+  t.after(restore);
+  return { state, restore };
+}
+
+test("issue 66: a transient eviction failure is retried on a later sync after restart", async (t) => {
+  const { key, store, adapter, root, before, localPath } = await exclusionFixture(t, "retry-transient");
+  const blocker = blockTrashRenames(t, 1);
+  const first = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  const firstSummary = await first.syncOnce();
+  blocker.restore();
+  assert.deepEqual(firstSummary.excluded, { evicted: 0, released: 0, kept: [{ path: "private/secret.txt", code: "EBUSY" }], failed: [] });
+  assert.equal(first.snapshot.pendingEvictions[before.objectId].attempts, 1);
+  assert.equal(await fsp.readFile(localPath, "utf8"), "secret");
+
+  const second = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  const secondSummary = await second.syncOnce();
+  assert.deepEqual(secondSummary.excluded, { evicted: 1, released: 0, kept: [], failed: [] });
+  assert.equal(await exists(localPath), false);
+  assert.equal(second.snapshot.pendingEvictions, undefined);
+  assert.equal(recordFor(store, "private/secret.txt").tombstone, false);
+});
+
+test("issue 66: a permanent eviction failure stops after the attempt bound and is reported, not looped", async (t) => {
+  const { key, store, adapter, root, before, localPath } = await exclusionFixture(t, "retry-permanent");
+  const blocker = blockTrashRenames(t, Number.POSITIVE_INFINITY);
+  const reports = [];
+  for (let cycle = 0; cycle < 6; cycle += 1) {
+    const sync = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+    reports.push((await sync.syncOnce()).excluded);
+  }
+  blocker.restore();
+  assert.equal(blocker.state.count, 3);
+  assert.deepEqual(reports[0].kept, [{ path: "private/secret.txt", code: "EBUSY" }]);
+  assert.deepEqual(reports[2].failed, [{ path: "private/secret.txt", code: "EBUSY" }]);
+  assert.deepEqual(reports[5].failed, [{ path: "private/secret.txt", code: "EBUSY" }]);
+  assert.equal(await fsp.readFile(localPath, "utf8"), "secret");
+  assert.equal(recordFor(store, "private/secret.txt").tombstone, false);
+  assert.equal(recordFor(store, "private/secret.txt").operationId, before.operationId);
+});
+
+test("issue 66: a locally edited excluded file is reported once and never retried", async (t) => {
+  const { key, store, adapter, root, localPath } = await exclusionFixture(t, "retry-local-edit");
+  await fsp.writeFile(localPath, "local edit");
+  const blocker = blockTrashRenames(t, 0);
+  const first = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  const firstSummary = await first.syncOnce();
+  const second = await engine(root, adapter, key, { deviceId: "device-b", excludedPaths: ["private"] });
+  const secondSummary = await second.syncOnce();
+  blocker.restore();
+  assert.deepEqual(firstSummary.excluded.kept, [{ path: "private/secret.txt", code: "local_changes_pending" }]);
+  assert.equal(first.snapshot.pendingEvictions, undefined);
+  assert.equal(secondSummary.excluded, undefined);
+  assert.equal(blocker.state.count, 0);
+  assert.equal(await fsp.readFile(localPath, "utf8"), "local edit");
+  assert.equal(recordFor(store, "private/secret.txt").tombstone, false);
 });

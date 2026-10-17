@@ -78,6 +78,7 @@ Comportamento de `excludedPaths`:
 - Arquivo excluido sem copia local vira registro remoto (`reason: "excluded"`) e nenhum delete e enviado.
 - Ao reincluir a pasta, os arquivos liberados sao baixados no proximo sync. Arquivos apenas despejados (`reason: "evicted"`) continuam remotos ate `materializeRemote(caminho)`.
 - A lista aplicada fica persistida no indice do sync (`excludedPaths`) e a reconciliacao so roda quando a lista muda.
+- Falha transitoria de despejo (`EBUSY`, `EPERM`, `EAGAIN`, por exemplo arquivo aberto no Windows) e registrada em `pendingEvictions` no indice e tentada de novo nos syncs seguintes, no maximo 3 vezes. Depois disso o item aparece em `summary.excluded.failed` sem novas tentativas. Arquivos com alteracao local nunca entram nessa fila; nenhuma tentativa envia delete remoto.
 
 Limitacoes: nao ha comando CLI dedicado (a configuracao e o ponto de controle); nao ha placeholder nativo nem Files On-Demand; pastas vazias excluidas nao sao removidas localmente; metadados remotos ainda sao listados completos antes do filtro local.
 

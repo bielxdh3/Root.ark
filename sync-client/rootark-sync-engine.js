@@ -15,6 +15,8 @@ const SNAPSHOT_VERSION = 1;
 const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock"]);
 const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-"];
 const ROOT_MUTATION_QUEUES = new Map();
+const MAX_EVICTION_ATTEMPTS = 3;
+const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
 const ROOT_MUTATION_CONTEXT = new AsyncLocalStorage();
 
 function fail(message, code = "sync_engine_error") {
@@ -334,6 +336,13 @@ class SyncEngine {
       if (!parsed.remoteOnly || typeof parsed.remoteOnly !== "object" || Array.isArray(parsed.remoteOnly)) fail("Invalid remote-only sync state", "invalid_snapshot");
       if (parsed.excludedPaths !== undefined) {
         try { parsed.excludedPaths = normalizeExcludedPaths(parsed.excludedPaths); } catch { fail("Invalid excluded sync paths", "invalid_snapshot"); }
+      }
+      if (parsed.pendingEvictions !== undefined) {
+        if (!parsed.pendingEvictions || typeof parsed.pendingEvictions !== "object" || Array.isArray(parsed.pendingEvictions)) fail("Invalid pending evictions", "invalid_snapshot");
+        for (const entry of Object.values(parsed.pendingEvictions)) {
+          if (!entry || typeof entry !== "object" || typeof entry.code !== "string" || !Number.isInteger(entry.attempts) || entry.attempts < 0) fail("Invalid pending eviction", "invalid_snapshot");
+          try { protocol.safeRelativePath(entry.path, "path"); } catch { fail("Invalid pending eviction path", "invalid_snapshot"); }
+        }
       }
       for (const [objectId, item] of Object.entries(parsed.remoteOnly)) {
         if (!item || typeof item !== "object" || item.objectId !== objectId || typeof item.path !== "string") fail("Invalid remote-only sync entry", "invalid_snapshot");
@@ -1415,11 +1424,23 @@ class SyncEngine {
   // records so that no remote delete can ever be pushed for them. Remote objects are never deleted.
   async _applyExcludedPaths() {
     const applied = this.snapshot.excludedPaths || [];
-    if (JSON.stringify(applied) === JSON.stringify(this.excludedPaths)) return null;
-    const report = { evicted: 0, released: 0, kept: [] };
+    const listChanged = JSON.stringify(applied) !== JSON.stringify(this.excludedPaths);
+    this.snapshot.pendingEvictions = this.snapshot.pendingEvictions || {};
+    const pendingEvictions = this.snapshot.pendingEvictions;
+    if (!listChanged && !Object.keys(pendingEvictions).length) return null;
+    const report = { evicted: 0, released: 0, kept: [], failed: [] };
     const pending = await this.journal.recover();
+    const excludedObjectIds = new Set();
     for (const [relative, prior] of Object.entries(this.snapshot.files)) {
       if (prior.deleted || prior.directory || !this.isExcluded(relative)) continue;
+      const retry = pendingEvictions[prior.objectId];
+      if (!listChanged && !retry) continue;
+      excludedObjectIds.add(prior.objectId);
+      if (retry && retry.attempts >= MAX_EVICTION_ATTEMPTS) {
+        report.failed.push({ path: relative, code: retry.code });
+        continue;
+      }
+      delete pendingEvictions[prior.objectId];
       if (pending.some((operation) => operation.objectId === prior.objectId
         || operation.metadata?.path === relative || operation.metadata?.sourcePath === relative)) {
         report.kept.push({ path: relative, code: "sync_operation_pending" });
@@ -1439,9 +1460,25 @@ class SyncEngine {
         await this._evictLocal(relative);
         report.evicted += 1;
       } catch (error) {
-        report.kept.push({ path: relative, code: error?.code || "unknown" });
+        const code = error?.code || "unknown";
+        // Transient failures (for example a file held open on Windows) are retried on later cycles, up to a bound.
+        // Other failures, including local edits, are reported once and never retried.
+        if (TRANSIENT_EVICTION_CODES.has(code)) {
+          const attempts = (retry?.attempts || 0) + 1;
+          pendingEvictions[prior.objectId] = { path: relative, code, attempts };
+          if (attempts >= MAX_EVICTION_ATTEMPTS) report.failed.push({ path: relative, code });
+          else report.kept.push({ path: relative, code });
+        } else {
+          report.kept.push({ path: relative, code });
+        }
       }
     }
+    // Drop retry records for objects that are no longer tracked as excluded local files.
+    for (const objectId of Object.keys(pendingEvictions)) {
+      if (!excludedObjectIds.has(objectId)) delete pendingEvictions[objectId];
+    }
+    if (Object.keys(pendingEvictions).length) this.snapshot.pendingEvictions = pendingEvictions;
+    else delete this.snapshot.pendingEvictions;
     // The applied list is stored only when exclusions are configured, so snapshots of devices that never use them keep their existing shape.
     if (this.excludedPaths.length) this.snapshot.excludedPaths = [...this.excludedPaths];
     else delete this.snapshot.excludedPaths;
