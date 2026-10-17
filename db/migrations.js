@@ -239,6 +239,20 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 6,
+    name: "file_search_fts",
+    up(db) {
+      // Non-protected file names only. Encrypted/protected names are never inserted by the repository.
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS file_search_index USING fts5(
+          folder_id UNINDEXED,
+          file_name,
+          tokenize = 'unicode61 remove_diacritics 2'
+        );
+      `);
+    },
+  },
 ];
 
 function ensureMigrationTable(db) {
