@@ -192,6 +192,10 @@ function pathsEqual(left, right) {
   return pathWithin(left, right) && pathWithin(right, left);
 }
 
+function evictionError(code, message, cause, rollbackCause) {
+  return Object.assign(new Error(message), { code, cause, ...(rollbackCause ? { rollbackCause } : {}) });
+}
+
 function normalizeExcludedPaths(value) {
   if (value == null) return [];
   if (!Array.isArray(value)) fail("Excluded paths must be an array", "invalid_excluded_paths");
@@ -1249,12 +1253,48 @@ class SyncEngine {
       fail("Local file changed during cache verification", "local_changes_pending");
     }
 
-    const staged = await this.stageExisting(target);
-    if (!staged) fail("Local cache entry disappeared during eviction", "cache_entry_unavailable");
     const hadPriorMarker = Object.prototype.hasOwnProperty.call(this.snapshot.remoteOnly, prior.objectId);
     const priorMarker = hadPriorMarker ? this.snapshot.remoteOnly[prior.objectId] : undefined;
+    const restoreMemoryMarker = () => {
+      if (hadPriorMarker) this.snapshot.remoteOnly[prior.objectId] = priorMarker;
+      else delete this.snapshot.remoteOnly[prior.objectId];
+    };
+    // Only used while the file is back at its path, so a failed rollback persist leaves a state the
+    // next reconcile resolves (the file is local and the stale marker is dropped) without a remote delete.
+    const rollbackEviction = async (cause) => {
+      restoreMemoryMarker();
+      try {
+        await this.persistSnapshot();
+      } catch (persistError) {
+        throw evictionError("eviction_rollback_failed", "Eviction rollback could not be persisted; the next sync reconciles this file", cause, persistError);
+      }
+      throw cause;
+    };
+
+    // The marker is committed before the file leaves its path, so the file is never outside its path
+    // without a durable record that the remote object is the only copy.
+    this.snapshot.remoteOnly[prior.objectId] = {
+      objectId: remote.objectId, fileId: remote.fileId, versionId: remote.versionId,
+      revision: remote.revision, path: safePath, directory: false, deleted: false, reason: "evicted", hash,
+    };
+    try {
+      await this.persistSnapshot();
+    } catch (error) {
+      await rollbackEviction(error);
+    }
+
+    let staged;
+    try {
+      staged = await this.stageExisting(target);
+      if (!staged) fail("Local cache entry disappeared during eviction", "cache_entry_unavailable");
+    } catch (error) {
+      await rollbackEviction(error);
+    }
+    // Renames the staged copy back only if nothing now occupies the path. Never deletes the staged copy.
     const restoreStagedFile = async () => {
-      if (!(await exists(target))) await fsp.rename(staged, target);
+      if (await exists(target)) return false;
+      await fsp.rename(staged, target);
+      return true;
     };
     try {
       const stagedStats = await fsp.lstat(staged, { bigint: true });
@@ -1262,21 +1302,20 @@ class SyncEngine {
         || stagedStats.mtimeNs !== beforeStage.mtimeNs || stagedStats.mode !== beforeStage.mode) {
         fail("Local file changed during cache eviction", "unsafe_path");
       }
-      // The marker is persisted only after the staged file is verified and before it is removed,
-      // so a crash after removal still records that the remote object is the only copy.
-      this.snapshot.remoteOnly[prior.objectId] = {
-        objectId: remote.objectId, fileId: remote.fileId, versionId: remote.versionId,
-        revision: remote.revision, path: safePath, directory: false, deleted: false, reason: "evicted", hash,
-      };
-      await this.persistSnapshot();
-      await fsp.unlink(staged);
     } catch (error) {
-      if (hadPriorMarker) this.snapshot.remoteOnly[prior.objectId] = priorMarker;
-      else delete this.snapshot.remoteOnly[prior.objectId];
-      await restoreStagedFile();
-      await this.persistSnapshot().catch(() => {});
-      throw error;
+      // The marker is committed and the file is out of its path. Restore the file when possible; otherwise
+      // keep the eviction (marker stays) and the staged copy, so reconciliation never pushes a delete.
+      let restored;
+      try {
+        restored = await restoreStagedFile();
+      } catch (restoreError) {
+        throw evictionError("eviction_restore_failed", "Eviction could not restore the local file; the staged copy is kept in the trash folder", error, restoreError);
+      }
+      if (!restored) throw evictionError("eviction_restore_failed", "The local path was recreated during eviction; the staged copy is kept in the trash folder", error);
+      await rollbackEviction(error);
     }
+    // The eviction is committed and the file is out of its path, so a failed cleanup only leaves the staged copy in the trash folder.
+    await fsp.unlink(staged).catch(() => {});
     if (this.snapshot.files[safePath]?.objectId === prior.objectId) delete this.snapshot.files[safePath];
     await this.persistSnapshot();
     return true;
