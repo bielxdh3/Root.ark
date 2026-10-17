@@ -5,6 +5,7 @@ const path = require("node:path");
 const { PROTOCOL_VERSION, compareRevisions, validateOperation } = require("../../sync-client/rootark-sync-protocol");
 const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
 const { attestCiphertextOnlySyncState } = require("../services/deploymentResilience");
+const { createSyncBurstGuard } = require("../services/syncBurstGuard");
 
 const STORE_VERSION = 2;
 const MAX_HISTORY_PER_OBJECT = 32;
@@ -91,10 +92,11 @@ function publicRecord(record) {
 }
 
 class SyncObjectStore {
-  constructor(filePath) {
+  constructor(filePath, { burstGuard = createSyncBurstGuard() } = {}) {
     this.filePath = path.resolve(filePath);
     this.state = { version: STORE_VERSION, users: {} };
     this.queue = Promise.resolve();
+    this.burstGuard = burstGuard;
   }
 
   async open() {
@@ -149,11 +151,22 @@ class SyncObjectStore {
       const user = this.user(next, username);
       if (user.seen[input.operationId]) return { kind: "replay", record: null };
       const current = user.objects[input.objectId] || null;
+      // Destructive = delete, or any non-create operation that replaces an existing object's state.
+      const destructive = Boolean(input.tombstone) || input.operation === "delete" || (input.operation !== "create" && Boolean(current));
+      if (destructive && user.pausedDevices?.[input.deviceId]) return { kind: "paused", newlyPaused: false, deviceId: input.deviceId };
       if (input.operation === "create" && current) return { kind: "conflict", current };
       if (input.operation !== "create" && !current) return { kind: "conflict", current: null };
       if (current && input.baseRevision && compareRevisions(input.baseRevision, current.revision) !== 0) return { kind: "conflict", current };
       if (current && !input.baseRevision) return { kind: "conflict", current };
       if (current && compareRevisions(input.revision, current.revision) <= 0) return { kind: "stale", current };
+      if (destructive) {
+        const burst = this.burstGuard.recordDestructive(username, input.deviceId);
+        if (burst.exceeded) {
+          user.pausedDevices ||= {};
+          user.pausedDevices[input.deviceId] = { pausedAt: new Date().toISOString(), reason: "destructive_burst", limit: burst.limit, windowMs: burst.windowMs };
+          return { kind: "paused", newlyPaused: true, deviceId: input.deviceId, limit: burst.limit, windowMs: burst.windowMs };
+        }
+      }
       const record = publicRecord(input);
       user.objects[input.objectId] = record;
       user.versions[input.objectId] = [...(user.versions[input.objectId] || []), record].slice(-MAX_HISTORY_PER_OBJECT);
@@ -163,6 +176,22 @@ class SyncObjectStore {
       for (const oldId of seenIds.slice(0, Math.max(0, seenIds.length - MAX_SEEN_OPERATIONS))) delete user.seen[oldId];
       return { kind: "stored", record };
     });
+  }
+
+  async resumeDevice(username, deviceId) {
+    let wasPaused = false;
+    await this.transact((next) => {
+      const user = this.user(next, username);
+      wasPaused = Boolean(user.pausedDevices?.[deviceId]);
+      if (wasPaused) delete user.pausedDevices[deviceId];
+      return wasPaused;
+    });
+    this.burstGuard.reset(username, deviceId);
+    return { wasPaused };
+  }
+
+  isDevicePaused(username, deviceId) {
+    return Boolean(this.state.users[username]?.pausedDevices?.[deviceId]);
   }
 
   list(username, objectId = null) {
@@ -177,7 +206,13 @@ class SyncObjectStore {
   }
 }
 
-function registerSyncRoutes({ app, authenticate, requirePermission, storagePath = process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json", deviceAuthorization = null, requireDeviceAuthorization = false, deviceRegistryPath = process.env.SYNC_DEVICE_REGISTRY || "" }) {
+const MAX_DEVICE_ID_LENGTH = 256;
+
+function registerSyncRoutes({ app, authenticate, requirePermission, storagePath = process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json", deviceAuthorization = null, requireDeviceAuthorization = false, deviceRegistryPath = process.env.SYNC_DEVICE_REGISTRY || "", burstGuard = null, auditLog = null }) {
+  const audit = (eventType, req, deviceId, action, result, details = {}) => {
+    if (typeof auditLog !== "function") return;
+    auditLog(eventType, { username: req.user?.username, role: req.user?.role }, { type: "sync_device", id: String(deviceId).slice(0, 200) }, action, result, details);
+  };
   const verifyRegisteredDevice = deviceAuthorization || (deviceRegistryPath ? async ({ username, operation, proof }) => {
     let registry;
     try { registry = JSON.parse(await fs.readFile(deviceRegistryPath, "utf8")); } catch { return false; }
@@ -185,7 +220,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (!record || record.username !== username || record.revoked || record.active === false || record.publicKey !== proof.publicKey) return false;
     return verifyAuthorizationProof(proof, operation, { username });
   } : null);
-  const store = new SyncObjectStore(storagePath);
+  const store = new SyncObjectStore(storagePath, { burstGuard: burstGuard || createSyncBurstGuard() });
   const ready = store.open();
   const sizeGuard = (req, res, next) => {
     const length = Number(req.headers["content-length"]);
@@ -207,6 +242,10 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       } catch { return errorResponse(res, 403, "Sync device authorization rejected"); }
     }
     const result = await store.put(req.user.username, operation);
+    if (result.kind === "paused") {
+      if (result.newlyPaused) audit("sync.burst.paused", req, result.deviceId, "paused", "partial", { limit: result.limit, windowMs: result.windowMs });
+      return errorResponse(res, 423, "sync_burst_paused", { code: "sync_burst_paused", deviceId: result.deviceId });
+    }
     if (result.kind === "replay") return errorResponse(res, 409, "Replay rejected");
     if (result.kind === "stale") return errorResponse(res, 409, "Stale revision rejected", { currentRevision: result.current.revision, current: publicRecord(result.current) });
     if (result.kind === "conflict") return errorResponse(res, 409, "Base revision conflict", { currentRevision: result.current?.revision || null, current: result.current ? publicRecord(result.current) : null });
@@ -231,6 +270,14 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
   app.delete("/sync/v1/objects/:objectId", sizeGuard, authenticate, requirePermission("upload"), (req, res) => {
     if (req.body?.objectId && req.body.objectId !== req.params.objectId) return errorResponse(res, 400, "Object id mismatch");
     return write(req, res, { ...req.body, objectId: req.params.objectId, operation: "delete", tombstone: true });
+  });
+  app.post("/sync/v1/devices/:deviceId/resume", authenticate, requirePermission("upload"), async (req, res) => {
+    await ready;
+    const deviceId = req.params.deviceId;
+    if (!deviceId || deviceId.length > MAX_DEVICE_ID_LENGTH) return errorResponse(res, 400, "Invalid sync device id");
+    const { wasPaused } = await store.resumeDevice(req.user.username, deviceId);
+    if (wasPaused) audit("sync.device.resumed", req, deviceId, "resumed", "success", {});
+    res.json({ protocolVersion: PROTOCOL_VERSION, deviceId, paused: false, wasPaused });
   });
   return { store, ready };
 }

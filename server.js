@@ -1228,6 +1228,8 @@ const AUDIT_EVENTS = {
   "upload.scan.infected": { severity: "critical" },
   "upload.scan.suspicious": { severity: "warning" },
   "upload.quarantined": { severity: "warning" },
+  "sync.burst.paused": { severity: "warning" },
+  "sync.device.resumed": { severity: "info" },
   "quarantine.deleted": { severity: "critical" },
   "file.download": { severity: "info" },
   "file.delete": { severity: "warning" },
@@ -5915,6 +5917,7 @@ registerSyncRoutes({
   storagePath: process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json",
   requireDeviceAuthorization: true,
   deviceRegistryPath: process.env.SYNC_DEVICE_REGISTRY || "",
+  auditLog,
 });
 
 groupsStore = registerGroupRoutes({
