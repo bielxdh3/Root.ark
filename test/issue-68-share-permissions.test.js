@@ -13,6 +13,8 @@ const ROOT = path.resolve(__dirname, "..");
 const SERVER = path.join(ROOT, "server.js");
 const FILE_NAME = "permission-fixture.txt";
 const FILE_CONTENT = "disposable share permission fixture\n";
+const PNG_NAME = "permission-fixture.png";
+const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLytQAAAABJRU5ErkJggg==";
 const DENIED = "Operacao nao permitida por este link.";
 const ALL_OPERATIONS = ["view", "preview", "download"];
 
@@ -46,6 +48,7 @@ async function startFixture(t, mode) {
   fs.mkdirSync(path.join(sandbox, "uploads"), { recursive: true });
   fs.cpSync(path.join(ROOT, "public"), path.join(sandbox, "public"), { recursive: true });
   fs.writeFileSync(path.join(sandbox, "uploads", FILE_NAME), FILE_CONTENT);
+  fs.writeFileSync(path.join(sandbox, "uploads", PNG_NAME), Buffer.from(PNG_BASE64, "base64"));
 
   const password = crypto.randomBytes(24).toString("base64url");
   fs.writeFileSync(path.join(dataDir, "users.local.json"), JSON.stringify([
@@ -56,6 +59,7 @@ async function startFixture(t, mode) {
   ]));
   fs.writeFileSync(path.join(dataDir, "file-permissions.json"), JSON.stringify({
     [`root/${FILE_NAME}`]: { public: true, owner: "tester", users: {} },
+    [`root/${PNG_NAME}`]: { public: true, owner: "tester", users: {} },
   }));
 
   // A legacy link created before the permissions capability existed: no permissions field at all.
@@ -134,6 +138,15 @@ async function startFixture(t, mode) {
 
 function viewerCookieFrom(response) {
   return (response.headers["set-cookie"] || []).map((value) => value.split(";", 1)[0]).join("; ");
+}
+
+function passwordPost(port, origin, token, password) {
+  const payload = JSON.stringify({ password });
+  return request(port, `/share/${token}/password`, {
+    method: "POST",
+    headers: { origin, "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
+    body: payload,
+  });
 }
 
 for (const mode of ["json", "sqlite"]) {
@@ -215,33 +228,73 @@ for (const mode of ["json", "sqlite"]) {
       const { token } = JSON.parse(created.body);
       assert.deepEqual(JSON.parse(created.body).permissions, ["download"]);
 
-      const denied = await publicPost(token, "view");
-      assert.equal(denied.status, 403, "view is denied before the password step");
-      assert.ok(denied.body.includes(DENIED));
+      const locked = await publicPost(token, "view");
+      assert.equal(locked.status, 401, "password is required before any operation is revealed");
+      assert.equal(locked.body.includes(DENIED), false);
 
-      const payload = JSON.stringify({ password: sharePassword });
-      const unlock = await request(port, `/share/${token}/password`, {
-        method: "POST",
-        headers: { origin, "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
-        body: payload,
-      });
+      const wrong = await passwordPost(port, origin, token, "wrong-pass-68");
+      assert.equal(wrong.status, 401, "wrong password on a download-only link returns 401, not 403");
+      assert.equal(wrong.body.includes(DENIED), false);
+
+      const unlock = await passwordPost(port, origin, token, sharePassword);
       assert.equal(unlock.status, 200, unlock.body);
-      assert.deepEqual(JSON.parse(unlock.body).permissions, ["download"]);
+      const unlocked = JSON.parse(unlock.body);
+      assert.deepEqual(unlocked.permissions, ["download"]);
+      assert.equal(unlocked.passwordAccepted, true);
+      assert.equal("fileName" in unlocked, false, "minimal payload omits the file name");
+      assert.equal("size" in unlocked, false, "minimal payload omits the file size");
       const sessionCookie = viewerCookieFrom(unlock);
       assert.ok(sessionCookie.length > 0, "unlock issues a share session");
 
       const download = await publicPost(token, "download", sessionCookie);
       assert.equal(download.status, 200, download.body);
       assert.equal(download.body, FILE_CONTENT);
+      const viewAfterUnlock = await publicPost(token, "view", sessionCookie);
+      assert.equal(viewAfterUnlock.status, 200, "view endpoint still establishes a session for a download-only link");
+      assert.equal("fileName" in JSON.parse(viewAfterUnlock.body), false);
     });
 
-    await t.test("download-only link denies view without leaking the file", async () => {
-      const created = await authed("/share", { name: FILE_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["download"] });
+    await t.test("download-only link with maxViews=1 works through the session flow without consuming a view", async () => {
+      const created = await authed("/share", { name: FILE_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["download"], maxViews: 1 });
       assert.equal(created.status, 201, created.body);
       const { token } = JSON.parse(created.body);
-      const denied = await publicPost(token, "view");
-      assert.equal(denied.status, 403);
-      assert.ok(denied.body.includes(DENIED));
+
+      const session = await publicPost(token, "view");
+      assert.equal(session.status, 200, session.body);
+      assert.deepEqual(JSON.parse(session.body).permissions, ["download"]);
+      assert.equal("fileName" in JSON.parse(session.body), false);
+      const download = await publicPost(token, "download", viewerCookieFrom(session));
+      assert.equal(download.status, 200, download.body);
+      assert.equal(download.body, FILE_CONTENT);
+
+      const sessionAgain = await publicPost(token, "view");
+      assert.equal(sessionAgain.status, 200, "a second session is not blocked by maxViews of a non-view link");
+    });
+
+    await t.test("preview-only link with maxDownloads=1 works through the session flow and denies download", async () => {
+      const created = await authed("/share", { name: PNG_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["preview"], maxDownloads: 1 });
+      assert.equal(created.status, 201, created.body);
+      const { token } = JSON.parse(created.body);
+
+      const session = await publicPost(token, "view");
+      assert.equal(session.status, 200, session.body);
+      const viewerCookie = viewerCookieFrom(session);
+      const preview = await publicPost(token, "preview", viewerCookie);
+      assert.equal(preview.status, 200, preview.body);
+      assert.equal(preview.headers["content-type"], "image/png");
+
+      const download = await publicPost(token, "download", viewerCookie);
+      assert.equal(download.status, 403, "download is denied for a preview-only link");
+      assert.ok(download.body.includes(DENIED));
+    });
+
+    await t.test("download-only link without a session cookie is not usable for download", async () => {
+      const created = await authed("/share", { name: FILE_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["download"], maxViews: 1 });
+      assert.equal(created.status, 201, created.body);
+      const { token } = JSON.parse(created.body);
+      const download = await publicPost(token, "download");
+      assert.notEqual(download.status, 200, "download needs a session");
+      assert.equal(download.body.includes(FILE_CONTENT), false);
     });
   });
 }

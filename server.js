@@ -2135,15 +2135,15 @@ function renderPublicSharePage(token, scriptNonce) {
         passwordInput.value = "";
         passwordBox.classList.add("hidden");
         contentBox.classList.remove("hidden");
+        const allowedOperations = Array.isArray(data.permissions) ? data.permissions : ["view", "preview", "download"];
         fileName.textContent = data.fileName || "Arquivo compartilhado";
         status.textContent = "Link valido ate " + new Date(data.expiresAt).toLocaleString("pt-BR") + ".";
         meta.innerHTML = [
           data.fileType ? '<span class="pill">' + String(data.fileType).replace(/[&<>"']/g, (char) => "&#" + char.charCodeAt(0) + ";") + '</span>' : "",
-          '<span class="pill">' + formatSize(data.size) + '</span>',
-          data.remainingViews !== null ? '<span class="pill">' + data.remainingViews + ' visualizacoes restantes</span>' : '<span class="pill">Visualizacoes ilimitadas</span>',
+          typeof data.size === "number" ? '<span class="pill">' + formatSize(data.size) + '</span>' : "",
+          !allowedOperations.includes("view") ? "" : data.remainingViews !== null ? '<span class="pill">' + data.remainingViews + ' visualizacoes restantes</span>' : '<span class="pill">Visualizacoes ilimitadas</span>',
           data.remainingDownloads !== null ? '<span class="pill">' + data.remainingDownloads + ' downloads restantes</span>' : '<span class="pill">Downloads ilimitados</span>'
         ].filter(Boolean).join("");
-        const allowedOperations = Array.isArray(data.permissions) ? data.permissions : ["view", "preview", "download"];
         downloadForm.hidden = !allowedOperations.includes("download");
         previewButton.hidden = !data.canPreview || !allowedOperations.includes("preview");
         previewButton.classList.toggle("hidden", previewButton.hidden);
@@ -2462,15 +2462,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
     return { status: 410, error: "Link indisponivel." };
   }
 
-  if (options.requireAnyOperation && getShareLinkPermissions(link).length === 0) {
-    logShareAudit(req, "share.operation_denied", token, link, "password", "failure", { operation: "any" });
-    return { status: 403, error: "Operacao nao permitida por este link." };
-  }
-
-  if (options.operation && !getShareLinkPermissions(link).includes(options.operation)) {
-    logShareAudit(req, "share.operation_denied", token, link, options.operation, "failure", { operation: options.operation });
-    return { status: 403, error: "Operacao nao permitida por este link." };
-  }
+  const viewPermitted = getShareLinkPermissions(link).includes("view");
 
   const passwordHash = link.passwordHash || link.password_hash || null;
   let verifiedPasswordHash = null;
@@ -2484,11 +2476,21 @@ async function resolveShareAccess(req, res, token, options = {}) {
     verifiedPasswordHash = passwordHash;
   }
 
+  // Operation checks run only after the password is verified, so callers cannot learn the permissions without it.
+  if (options.requireAnyOperation && getShareLinkPermissions(link).length === 0) {
+    logShareAudit(req, "share.operation_denied", token, link, "password", "failure", { operation: "any" });
+    return { status: 403, error: "Operacao nao permitida por este link." };
+  }
+  if (options.operation && !getShareLinkPermissions(link).includes(options.operation)) {
+    logShareAudit(req, "share.operation_denied", token, link, options.operation, "failure", { operation: options.operation });
+    return { status: 403, error: "Operacao nao permitida por este link." };
+  }
+
   const limits = getShareLimitState(link);
   const activeShareViewer = getActiveShareViewer(req, token, link);
   const viewerAlreadyActive = Boolean(activeShareViewer);
   let downloadAlreadyCounted = Boolean(options.countDownloadOncePerViewer && activeShareViewer?.viewer.downloadCounted);
-  if (options.countView && !viewerAlreadyActive && limits.maxViews > 0 && limits.views >= limits.maxViews) {
+  if (options.countView && viewPermitted && !viewerAlreadyActive && limits.maxViews > 0 && limits.views >= limits.maxViews) {
     logShareAudit(req, "share.limit_reached", token, link, "view", "failure", { limit: "views" });
     return { status: 410, error: "Link indisponivel." };
   }
@@ -2532,7 +2534,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
   const currentShareViewer = getActiveShareViewer(req, token, currentLink);
   const currentViewerAlreadyActive = Boolean(currentShareViewer);
   downloadAlreadyCounted = Boolean(options.countDownloadOncePerViewer && currentShareViewer?.viewer.downloadCounted);
-  if (options.countView && !currentViewerAlreadyActive && currentLimits.maxViews > 0 && currentLimits.views >= currentLimits.maxViews) {
+  if (options.countView && viewPermitted && !currentViewerAlreadyActive && currentLimits.maxViews > 0 && currentLimits.views >= currentLimits.maxViews) {
     logShareAudit(req, "share.limit_reached", token, currentLink, "view", "failure", { limit: "views" });
     return { status: 410, error: "Link indisponivel." };
   }
@@ -2588,7 +2590,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
     const viewerId = crypto.randomBytes(16).toString("hex");
     const viewerCreatedAt = new Date().toISOString();
     const viewerExpiresAt = new Date(Math.min(Date.now() + SHARE_VIEW_SESSION_MS, currentExpiresAt)).toISOString();
-    const failure = reserveDatabaseShareQuota("view", { id: viewerId, createdAt: viewerCreatedAt, expiresAt: viewerExpiresAt });
+    const failure = reserveDatabaseShareQuota(viewPermitted ? "view" : "session", { id: viewerId, createdAt: viewerCreatedAt, expiresAt: viewerExpiresAt });
     if (failure) return failure;
     setShareViewerCookie(req, res, token, viewerId, new Date(currentLink.expiresAt).getTime());
     databaseViewReserved = true;
@@ -2597,10 +2599,15 @@ async function resolveShareAccess(req, res, token, options = {}) {
   if (options.countView && !currentViewerAlreadyActive) {
     if (!databaseViewReserved) {
       createShareViewer(req, res, token, currentLink, currentExpiresAt);
-      currentLink.lastViewedAt = new Date().toISOString();
-      currentLink.views = incrementPublicLinkViews(token, currentLink, currentLinks);
+      if (viewPermitted) {
+        currentLink.lastViewedAt = new Date().toISOString();
+        currentLink.views = incrementPublicLinkViews(token, currentLink, currentLinks);
+      } else {
+        currentLinks[token] = currentLink;
+        savePublicLinks(currentLinks);
+      }
     }
-    logShareAudit(req, "share.opened", token, currentLink, "opened", "success");
+    if (viewPermitted) logShareAudit(req, "share.opened", token, currentLink, "opened", "success");
   }
 
   const reserveDownloadQuota = () => {
@@ -2642,6 +2649,24 @@ async function resolveShareAccess(req, res, token, options = {}) {
     expiresAt: currentExpiresAt,
     ...(options.deferDownloadReservation ? { reserveDownload: reserveDownloadQuota } : {}),
   };
+}
+
+// Session-only payload for links without the view permission: no file name or size.
+function getShareSessionPayload(link, fileInfo, limits) {
+  return {
+    permissions: getShareLinkPermissions(link),
+    expiresAt: link.expiresAt,
+    remainingViews: null,
+    remainingDownloads: limits.remainingDownloads,
+    canPreview: getPublicShareCanPreview(fileInfo.fileName),
+  };
+}
+
+function getShareAccessPayload(access, extra = {}) {
+  if (getShareLinkPermissions(access.link).includes("view")) {
+    return { ...getSharePublicPayload(access.link, access.fileInfo, access.limits), ...extra };
+  }
+  return { ...getShareSessionPayload(access.link, access.fileInfo, access.limits), ...extra };
 }
 
 function getSharePublicPayload(link, fileInfo, limits) {
@@ -11565,7 +11590,7 @@ app.post("/share/:token/password", shareRateLimit, requireSameOriginPublicShareM
     });
   }
 
-  res.json(getSharePublicPayload(access.link, access.fileInfo, access.limits));
+  res.json(getShareAccessPayload(access, { passwordAccepted: true }));
 });
 
 app.get("/share/:token/status", shareRateLimit, (_req, res) => res.setHeader("Allow", "POST").status(405).type("text/plain").send("Metodo nao permitido"));
@@ -11599,8 +11624,12 @@ app.post("/share/:token/view", shareRateLimit, requireSameOriginPublicShareMutat
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
 
-  const access = await resolveShareAccess(req, res, shareToken, { countView: true, operation: "view" });
+  const access = await resolveShareAccess(req, res, shareToken, { countView: true, requireAnyOperation: true });
   if (access.error) return res.status(access.status || 400).json({ error: access.error, passwordRequired: Boolean(access.passwordRequired) });
+
+  if (!getShareLinkPermissions(access.link).includes("view")) {
+    return res.json(getShareSessionPayload(access.link, access.fileInfo, access.limits));
+  }
 
   res.json({
     ...getSharePublicPayload(access.link, access.fileInfo, access.limits),

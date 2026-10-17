@@ -189,7 +189,7 @@ function incrementPublicLinkViews(token, link) {
 function consumePublicLinkQuota(token, options = {}) {
   const db = getDb();
   const kind = options.kind;
-  if (kind !== "view" && kind !== "download") throw new TypeError("Invalid public link quota kind");
+  if (kind !== "view" && kind !== "download" && kind !== "session") throw new TypeError("Invalid public link quota kind");
 
   return db.transaction(() => {
     const fallbackLinks = options.fallbackLinks && typeof options.fallbackLinks === "object" ? options.fallbackLinks : {};
@@ -239,14 +239,14 @@ function consumePublicLinkQuota(token, options = {}) {
     const expiresAt = new Date(link.expiresAt).getTime();
     if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return { status: "expired" };
 
-    if (kind === "view") {
+    if (kind === "view" || kind === "session") {
       const views = Number(row.views) || 0;
       const maxViews = Number(row.max_views) || 0;
       if (process.env.NODE_ENV === "test" && typeof options.afterQuotaRead === "function") options.afterQuotaRead();
-      if (maxViews > 0 && views >= maxViews) return { status: "limit", limit: "views" };
+      if (kind === "view" && maxViews > 0 && views >= maxViews) return { status: "limit", limit: "views" };
 
-      link.views = views + 1;
-      link.lastViewedAt = now;
+      link.views = kind === "view" ? views + 1 : views;
+      if (kind === "view") link.lastViewedAt = now;
       if (isPublicLinkViewerId(options.viewer?.id) && options.viewer?.expiresAt) {
         const viewers = link.activeViewers && typeof link.activeViewers === "object" ? link.activeViewers : {};
         for (const [viewerId, viewer] of Object.entries(viewers)) {
