@@ -1310,7 +1310,8 @@ function isZipSymlink(entry) {
 
 function assertSafeZipPath(entryPath) {
   const archivePath = String(entryPath || "").replace(/\\/g, "/");
-  if (!archivePath || archivePath.startsWith("/") || /^[a-zA-Z]:/.test(archivePath)) {
+  if (!archivePath || archivePath.startsWith("/") || /^[a-zA-Z]:/.test(archivePath) || archivePath.includes("\0")
+    || (process.platform === "win32" && archivePath.includes(":"))) {
     throw new Error(`Caminho invalido no backup: ${entryPath}`);
   }
   const parts = archivePath.split("/");
