@@ -56,7 +56,8 @@ function parseChunkUploadQuotaConfig(env = process.env, runtime = {}) {
   if (env.CHUNK_UPLOAD_STORAGE_TOPOLOGY !== REQUIRED_TOPOLOGY_ACK) {
     return { enabled: false, reason: "topology_not_acknowledged" };
   }
-  if (detectMultiProcessRuntime(env, runtime)) {
+  // The SQLite rate-limit store is host-shared, so multi-process runtimes stay enabled for it.
+  if (detectMultiProcessRuntime(env, runtime) && env.UPLOAD_CHUNK_RATE_LIMIT_STORE !== "sqlite") {
     return { enabled: false, reason: "multi_process_runtime" };
   }
   return { enabled: true, perAccountBytes, systemBytes, perAccountEntries, systemEntries };

@@ -12,6 +12,7 @@ if (String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim() !== "1") {
 const express = require("express");
 const { rateLimit } = require("express-rate-limit");
 const UploadChunkSlidingWindowStore = require("./src/middlewares/uploadChunkSlidingWindowStore");
+const SqliteSlidingWindowStore = require("./src/middlewares/sqliteSlidingWindowStore");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
@@ -5693,10 +5694,14 @@ const createRouteRateLimit = () => rateLimit({
   legacyHeaders: false,
   message: { error: "Muitas solicitações. Tente novamente mais tarde." },
 });
+// UPLOAD_CHUNK_RATE_LIMIT_STORE=sqlite shares the chunk limiter across processes on one host only.
+const uploadChunkRateLimitStore = process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE === "sqlite"
+  ? new SqliteSlidingWindowStore(path.join(CHUNK_UPLOAD_DIR, ".rate-limit.sqlite"), ROUTE_RATE_LIMIT_WINDOW_MS, UPLOAD_CHUNK_RATE_LIMIT_MAX)
+  : new UploadChunkSlidingWindowStore(ROUTE_RATE_LIMIT_WINDOW_MS, UPLOAD_CHUNK_RATE_LIMIT_MAX);
 const uploadChunkRateLimit = rateLimit({
   windowMs: ROUTE_RATE_LIMIT_WINDOW_MS,
   limit: UPLOAD_CHUNK_RATE_LIMIT_MAX,
-  store: new UploadChunkSlidingWindowStore(ROUTE_RATE_LIMIT_WINDOW_MS, UPLOAD_CHUNK_RATE_LIMIT_MAX),
+  store: uploadChunkRateLimitStore,
   keyGenerator: (req) => String(req.user?.username || ""),
   standardHeaders: false,
   legacyHeaders: false,
