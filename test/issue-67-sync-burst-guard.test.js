@@ -100,14 +100,14 @@ function resumeRequest(port, body = { password: PASSWORD }) {
   return jsonRequest(port, "/sync/v1/devices/device-a/resume", "POST", body);
 }
 
-async function startServer(t, { storagePath, burstGuard, auditEvents = [] }) {
+async function startServer(t, { storagePath, burstGuard, auditEvents = [], bcryptImpl = bcrypt }) {
   const app = express();
   app.use("/sync/v1", express.json({ limit: "9mb" }));
   const authenticate = (req, _res, next) => { req.user = { username: "alice", role: "user" }; next(); };
   const requirePermission = () => (_req, _res, next) => next();
   const auditLog = (eventType, actor, target, action, result, details) => auditEvents.push({ eventType, actor, target, action, result, details });
   const loadUsers = () => [{ username: "alice", password: ALICE_HASH }];
-  const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath, burstGuard, auditLog, bcrypt, loadUsers });
+  const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath, burstGuard, auditLog, bcrypt: bcryptImpl, loadUsers });
   const server = await new Promise((resolve) => { const value = app.listen(0, "127.0.0.1", () => resolve(value)); });
   t.after(async () => { await new Promise((resolve) => server.close(resolve)); });
   await route.ready;
@@ -238,6 +238,21 @@ test("issue 67 resume: five wrong passwords in 15 minutes lock resume for the us
   for (let i = 0; i < 5; i += 1) assert.equal((await resumeRequest(port, { password: "wrong" })).status, 401);
   const limited = await resumeRequest(port, { password: PASSWORD });
   assert.equal(limited.status, 429);
+});
+
+test("issue 67 resume: parallel wrong passwords start at most five password checks", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-race-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  let checks = 0;
+  const countingBcrypt = { compare: async (...args) => { checks += 1; return bcrypt.compare(...args); } };
+  const { port } = await startServer(t, { storagePath: path.join(dir, "objects.json"), burstGuard: createSyncBurstGuard({ env: {} }), bcryptImpl: countingBcrypt });
+  const responses = await Promise.all(Array.from({ length: 20 }, () => resumeRequest(port, { password: "wrong" })));
+  const statuses = responses.map((response) => response.status);
+  assert.equal(statuses.filter((status) => status === 401).length, 5);
+  assert.equal(statuses.filter((status) => status === 429).length, 15);
+  assert.equal(checks, 5);
+  // The lockout also holds for the correct password after the burst.
+  assert.equal((await resumeRequest(port, { password: PASSWORD })).status, 429);
 });
 
 test("issue 67 store: a paused device is blocked at the store boundary and history is not trimmed by rejected operations", async (t) => {

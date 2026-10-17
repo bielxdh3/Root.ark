@@ -218,27 +218,25 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (typeof auditLog !== "function") return;
     auditLog(eventType, { username: req.user?.username, role: req.user?.role }, { type: "sync_device", id: String(deviceId).slice(0, 200) }, action, result, details);
   };
-  // In-memory, per-user failed re-authentication counter for resume. Returns retry seconds when limited.
+  // In-memory, per-user resume re-authentication limiter. `count` is confirmed wrong passwords;
+  // `pending` is password checks in flight. Both count toward the limit, and a reservation is taken
+  // synchronously before any await, so parallel requests cannot all pass the check.
   const resumeFailures = new Map();
-  const resumeLimitState = (username) => {
-    const state = resumeFailures.get(username);
-    if (!state) return 0;
+  const reserveResumeAttempt = (username) => {
     const now = Date.now();
-    if (now - state.windowStart >= RESUME_ATTEMPT_WINDOW_MS) { resumeFailures.delete(username); return 0; }
-    if (state.count < RESUME_MAX_FAILED_ATTEMPTS) return 0;
-    return Math.ceil((state.windowStart + RESUME_ATTEMPT_WINDOW_MS - now) / 1000);
-  };
-  const recordResumeFailure = (username) => {
-    const now = Date.now();
-    const state = resumeFailures.get(username);
-    if (!state || now - state.windowStart >= RESUME_ATTEMPT_WINDOW_MS) {
-      if (!resumeFailures.has(username) && resumeFailures.size >= RESUME_TRACKED_USERS_MAX) resumeFailures.delete(resumeFailures.keys().next().value);
-      resumeFailures.set(username, { count: 1, windowStart: now });
-    } else {
-      state.count += 1;
+    let state = resumeFailures.get(username);
+    if (state && now - state.windowStart >= RESUME_ATTEMPT_WINDOW_MS) { resumeFailures.delete(username); state = null; }
+    if (state && state.count + state.pending >= RESUME_MAX_FAILED_ATTEMPTS) {
+      return { state: null, retryAfter: Math.ceil((state.windowStart + RESUME_ATTEMPT_WINDOW_MS - now) / 1000) };
     }
+    if (!state) {
+      if (resumeFailures.size >= RESUME_TRACKED_USERS_MAX) resumeFailures.delete(resumeFailures.keys().next().value);
+      state = { count: 0, pending: 0, windowStart: now };
+      resumeFailures.set(username, state);
+    }
+    state.pending += 1;
+    return { state, retryAfter: 0 };
   };
-  const clearResumeFailures = (username) => resumeFailures.delete(username);
   const verifyRegisteredDevice = deviceAuthorization || (deviceRegistryPath ? async ({ username, operation, proof }) => {
     let registry;
     try { registry = JSON.parse(await fs.readFile(deviceRegistryPath, "utf8")); } catch { return false; }
@@ -303,31 +301,39 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (!deviceId || deviceId.length > MAX_DEVICE_ID_LENGTH) return errorResponse(res, 400, "Invalid sync device id");
     const username = req.user.username;
     const body = req.body && typeof req.body === "object" ? req.body : {};
-    // A device cannot lift its own pause: the caller declares its device the same way operations do (body deviceId).
+    // Convenience check only, NOT a security boundary: the caller declares its device in the body, which a
+    // compromised device can omit or forge. The password re-authentication below is the actual barrier.
     if (typeof body.deviceId === "string" && body.deviceId === deviceId) {
       audit("sync.device.resume.failed", req, deviceId, "resume", "failure", { reason: "self_resume" });
       return errorResponse(res, 403, "Paused device cannot resume itself");
     }
     if (!bcrypt || typeof loadUsers !== "function") return errorResponse(res, 503, "Sync re-authentication unavailable");
-    const limited = resumeLimitState(username);
-    if (limited) {
-      res.setHeader("Retry-After", String(limited));
+    if (typeof body.password !== "string" || !body.password) return errorResponse(res, 400, "Password required");
+    // Reserve synchronously (no await since the limit check): concurrent requests see this reservation.
+    const reservation = reserveResumeAttempt(username);
+    if (reservation.retryAfter) {
+      res.setHeader("Retry-After", String(reservation.retryAfter));
       return errorResponse(res, 429, "Too many failed re-authentication attempts");
     }
-    if (typeof body.password !== "string" || !body.password) return errorResponse(res, 400, "Password required");
-    const users = await loadUsers();
-    const user = Array.isArray(users) ? users.find((entry) => entry?.username === username) : null;
-    const hasPassword = Boolean(user && !user.disabled && typeof user.password === "string" && user.password);
-    const matches = await bcrypt.compare(body.password, hasPassword ? user.password : DUMMY_PASSWORD_HASH);
-    if (!hasPassword || !matches) {
-      recordResumeFailure(username);
-      audit("sync.device.resume.failed", req, deviceId, "resume", "failure", { reason: "reauth_failed" });
-      return errorResponse(res, 401, "Re-authentication failed");
+    const state = reservation.state;
+    try {
+      const users = await loadUsers();
+      const user = Array.isArray(users) ? users.find((entry) => entry?.username === username) : null;
+      const hasPassword = Boolean(user && !user.disabled && typeof user.password === "string" && user.password);
+      const matches = await bcrypt.compare(body.password, hasPassword ? user.password : DUMMY_PASSWORD_HASH);
+      if (!hasPassword || !matches) {
+        state.count += 1;
+        audit("sync.device.resume.failed", req, deviceId, "resume", "failure", { reason: "reauth_failed" });
+        return errorResponse(res, 401, "Re-authentication failed");
+      }
+      state.count = 0;
+      const { wasPaused } = await store.resumeDevice(username, deviceId);
+      if (wasPaused) audit("sync.device.resumed", req, deviceId, "resumed", "success", {});
+      return res.json({ protocolVersion: PROTOCOL_VERSION, deviceId, paused: false, wasPaused });
+    } finally {
+      // Releases the reservation. An internal error is not counted as a wrong password.
+      state.pending -= 1;
     }
-    clearResumeFailures(username);
-    const { wasPaused } = await store.resumeDevice(username, deviceId);
-    if (wasPaused) audit("sync.device.resumed", req, deviceId, "resumed", "success", {});
-    res.json({ protocolVersion: PROTOCOL_VERSION, deviceId, paused: false, wasPaused });
   });
   return { store, ready };
 }
