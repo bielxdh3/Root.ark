@@ -23,6 +23,12 @@ const BACKUP_METADATA_LOCK_NAME = path.basename(backupRepository.MUTATION_LOCK_F
 const BACKUP_METADATA_LOCK_CLAIM_PREFIX = `${BACKUP_METADATA_LOCK_NAME}.claim-`;
 const BACKUP_METADATA_COORDINATION_DB_PREFIX = path.basename(backupRepository.MUTATION_COORDINATION_DB_FILE).toLowerCase();
 const RESTORABLE_ROOTS = new Set(["data", "uploads"]);
+const RESTORABLE_JSON_STATE_FILES = new Set([
+  "users.json", "users.local.json", "user-generations.local.json", "pending-uploads.json",
+  "public-links.json", "actions-history.json", "folders.json", "file-permissions.json",
+  "file-expirations.json", "file-versions.json", "encrypted-files.json", "analytics.json",
+  "audit-logs.json", "audit-logs-archive.json", "groups.json", "sync-objects.json",
+]);
 const LEGACY_WHOLE_RESTORE_COORDINATOR_VERSION = 3;
 const WHOLE_RESTORE_COORDINATOR_VERSION = 4;
 const MAX_RESTORE_SYNC_RETRY_DELAY_MS = 60 * 60 * 1000;
@@ -232,13 +238,58 @@ function restorableDataNames(extractedRoot) {
   return [...names].sort();
 }
 
+function obsoleteJsonStateNames(extractedRoot) {
+  const extractedData = path.join(extractedRoot, "data");
+  const dataRoot = resolveRuntimePath("data");
+  if (!fs.existsSync(dataRoot)) return [];
+  return [...RESTORABLE_JSON_STATE_FILES].filter((name) => {
+    if (fs.existsSync(path.join(extractedData, name))) return false;
+    const destination = path.join(dataRoot, name);
+    let stat;
+    try { stat = fs.lstatSync(destination); }
+    catch (error) { if (error.code === "ENOENT") return false; throw error; }
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+      throw new Error("Restore cannot remove an unsafe application JSON state file");
+    }
+    return true;
+  }).sort();
+}
+
+function jsonStateFileIdentity(pathname) {
+  const stat = fs.lstatSync(pathname, { bigint: true });
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n) {
+    throw new Error("Restore JSON state changed after pre-image: unsafe file");
+  }
+  return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].map(String).join(":");
+}
+
+function verifyObsoleteJsonState(extractedRoot, staged) {
+  const stagedByName = new Map(staged.map((entry) => [entry.name, entry]));
+  for (const name of obsoleteJsonStateNames(extractedRoot)) {
+    if (!stagedByName.has(name)) throw new Error("Restore JSON state was not staged in durable pre-images");
+  }
+  for (const entry of staged) verifyStagedObsoleteJson(entry);
+}
+
+function verifyStagedObsoleteJson(entry) {
+  const pathname = resolveRuntimePath("data", entry.name);
+  try {
+    if (jsonStateFileIdentity(pathname) !== entry.identity || restorePreimage.hashFile(pathname) !== entry.sha256) {
+      throw new Error("Restore JSON state changed after pre-image");
+    }
+  } catch (error) {
+    if (error.code === "ENOENT") throw new Error("Restore JSON state changed after pre-image: file missing", { cause: error });
+    throw error;
+  }
+}
+
 function wholePreimagePlan(extractedRoot, quarantinePlan) {
   const domains = [];
   if (quarantinePlan) domains.push("quarantine-files", "quarantine-tree");
   domains.push("data-files");
   if (pathExists(path.join(extractedRoot, "uploads"))) domains.push("uploads-tree");
   if (isDbEnabled()) domains.push("database-files");
-  return { domains, dataFiles: [...new Set([...restorableDataNames(extractedRoot), path.basename(restoreProviderOrphans.POLICY_PATH), path.basename(restoreProviderOrphans.STATE_PATH)])].sort() };
+  return { domains, dataFiles: [...new Set([...restorableDataNames(extractedRoot), ...obsoleteJsonStateNames(extractedRoot), path.basename(restoreProviderOrphans.POLICY_PATH), path.basename(restoreProviderOrphans.STATE_PATH)])].sort() };
 }
 
 function syncPreimageDirectories(root) {
@@ -269,6 +320,9 @@ function createWholeRestorePreimages(coordinator, extractedRoot, quarantinePlan,
   fs.mkdirSync(preimageRoot, { mode: 0o700 });
   syncPreimageParentDirectory(preimageRoot);
   const dataRoot = resolveRuntimePath("data");
+  const archivedDataNames = new Set(restorableDataNames(extractedRoot));
+  const obsoleteNames = plan.dataFiles.filter((name) => RESTORABLE_JSON_STATE_FILES.has(name) && !archivedDataNames.has(name));
+  const obsoleteIdentities = new Map(obsoleteNames.map((name) => [name, jsonStateFileIdentity(path.join(dataRoot, name))]));
   const domains = [];
   const stagePath = (name) => path.join(preimageRoot, name);
   if (plan.domains.includes("quarantine-files")) {
@@ -296,6 +350,14 @@ function createWholeRestorePreimages(coordinator, extractedRoot, quarantinePlan,
     files: restorePreimage.snapshotFileSet(plan.dataFiles.map((name) => path.join(dataRoot, name)), stagePath("data-files")),
   });
   onDomainComplete("data-files");
+  const dataPreimages = domains.find((domain) => domain.name === "data-files").files;
+  const obsoleteJsonPreimages = obsoleteNames.map((name) => {
+    const entry = dataPreimages[plan.dataFiles.indexOf(name)];
+    if (!entry.existed || jsonStateFileIdentity(path.join(dataRoot, name)) !== obsoleteIdentities.get(name)) {
+      throw new Error("Restore JSON state changed after pre-image");
+    }
+    return { name, identity: obsoleteIdentities.get(name), sha256: entry.sha256 };
+  });
 
   if (plan.domains.includes("uploads-tree")) {
     const uploadsRoot = path.resolve(resolveRuntimePath("uploads"));
@@ -320,7 +382,7 @@ function createWholeRestorePreimages(coordinator, extractedRoot, quarantinePlan,
   const manifestHash = restorePreimage.writeManifest(path.join(preimageRoot, "manifest.json"), manifest);
   syncPreimageDirectories(preimageRoot);
   syncPreimageParentDirectory(preimageRoot);
-  return { preimagePlan: plan, preimageHash: manifestHash };
+  return { preimagePlan: plan, preimageHash: manifestHash, obsoleteJsonPreimages };
 }
 
 function validateWholeRestorePreimages(coordinator, manifest) {
@@ -1628,13 +1690,12 @@ function copyDirectoryContents(source, destination, protectedPath = null, onFile
   }
 }
 
-function restoreDataFiles(extractedRoot, onFile = null) {
+function restoreDataFiles(extractedRoot, obsoleteJsonPreimages, onFile = null) {
   const extractedData = path.join(extractedRoot, "data");
-  if (!fs.existsSync(extractedData)) return;
-
+  if (!fs.existsSync(extractedData) && !obsoleteJsonPreimages.length) return;
   closeDb();
   fs.mkdirSync(resolveRuntimePath("data"), { recursive: true });
-  for (const name of fs.readdirSync(extractedData)) {
+  for (const name of fs.existsSync(extractedData) ? fs.readdirSync(extractedData) : []) {
     const foldedName = name.toLowerCase();
     if (foldedName === "backups" || foldedName === "quarantine.json" || foldedName === ".rootark-quarantine-restore-journal.json" || foldedName.startsWith(".rootark-quarantine-restore-metadata-") || foldedName.startsWith(".rootark-restore-coordinator.json") || foldedName === BACKUP_METADATA_LOCK_NAME || foldedName.startsWith(BACKUP_METADATA_LOCK_CLAIM_PREFIX) || foldedName.startsWith(BACKUP_METADATA_COORDINATION_DB_PREFIX) || foldedName === path.basename(restoreProviderOrphans.POLICY_PATH) || foldedName === path.basename(restoreProviderOrphans.STATE_PATH) || foldedName === "server-master.key" || foldedName.endsWith(".key") || foldedName.startsWith("rootark.sqlite")) continue;
     const sourcePath = path.join(extractedData, name);
@@ -1644,6 +1705,15 @@ function restoreDataFiles(extractedRoot, onFile = null) {
       fs.copyFileSync(sourcePath, destinationPath);
       onFile?.(sourcePath, destinationPath, "copied");
     }
+  }
+  verifyObsoleteJsonState(extractedRoot, obsoleteJsonPreimages);
+  for (const entry of obsoleteJsonPreimages) {
+    verifyStagedObsoleteJson(entry);
+    const { name } = entry;
+    const destinationPath = resolveRuntimePath("data", name);
+    fs.rmSync(destinationPath);
+    fsyncDirectory(path.dirname(destinationPath));
+    onFile?.(null, destinationPath, "obsolete-removed");
   }
 }
 
@@ -2636,7 +2706,7 @@ async function restoreBackup(id, options = {}) {
         ? { ...backup, metadata: { ...backup.metadata, restoreSync: cloudSync } }
         : backup,
     });
-    const preimage = createWholeRestorePreimages(coordinator, restoreDir, quarantinePlan, (domain) => {
+    const { obsoleteJsonPreimages, ...preimage } = createWholeRestorePreimages(coordinator, restoreDir, quarantinePlan, (domain) => {
       coordinator = updateWholeRestoreCoordinator(coordinator, { preimageProgress: [...coordinator.preimageProgress, domain] });
       injectFailure(`restore.preimage.${domain}.verified`);
     });
@@ -2649,6 +2719,7 @@ async function restoreBackup(id, options = {}) {
     if (persistenceMode !== (isDbEnabled() ? "sqlite" : "json")) {
       throw new Error("Restore persistence mode changed before local commit");
     }
+    verifyObsoleteJsonState(restoreDir, obsoleteJsonPreimages);
     mutationStarted = true;
     restoreQuarantine(quarantinePlan, (step, details) => injectFailure(step, details));
     if (quarantinePlan) {
@@ -2657,7 +2728,7 @@ async function restoreBackup(id, options = {}) {
     }
     const restoredDataNames = restorableDataNames(restoreDir)
       .filter((name) => pathExists(path.join(restoreDir, "data", name)));
-    restoreDataFiles(restoreDir, (sourcePath, destinationPath, phase) => {
+    restoreDataFiles(restoreDir, obsoleteJsonPreimages, (sourcePath, destinationPath, phase) => {
       injectFailure(`restore.data.${phase}`, { sourcePath, destinationPath });
     });
     restorePreimage.syncFileSet(restoredDataNames.map((name) => resolveRuntimePath("data", name)));
