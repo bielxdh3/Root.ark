@@ -7,6 +7,7 @@ const test = require("node:test");
 require("./isolated-runtime")(test, "rootark-backup-restore-runtime-");
 
 const ROOT = path.resolve(__dirname, "..");
+const ALL_MIGRATION_VERSIONS = require("../db/migrations").MIGRATIONS.map((migration) => migration.version);
 
 function operatorRecoverExitedRestoreLock(runtime, childPid) {
   const lockPath = path.join(runtime, "data", "backups", ".backup.lock");
@@ -4477,7 +4478,7 @@ test("post-migration startup failure keeps the whole-restore barrier until a lat
     const db = new Database(process.env.DATABASE_URL, { readonly: true });
     try {
       const versions = db.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map((row) => row.version);
-      assert.deepEqual(versions, [1, 2, 3, 4, 5]);
+      assert.deepEqual(versions, ${JSON.stringify(ALL_MIGRATION_VERSIONS)});
       const columns = new Set(db.prepare("PRAGMA table_info(users)").all().map((row) => row.name));
       assert.equal(columns.has("totp_enabled"), true);
       assert.equal(columns.has("session_version"), true);
@@ -4512,7 +4513,7 @@ test("post-migration startup failure keeps the whole-restore barrier until a lat
     const db = new Database(process.env.DATABASE_URL, { readonly: true });
     try {
       const versions = db.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map((row) => row.version);
-      assert.deepEqual(versions, [1, 2, 3, 4], "the failed migration transaction must not record version 5");
+      assert.deepEqual(versions, ${JSON.stringify(ALL_MIGRATION_VERSIONS.filter((version) => version !== 5))}, "the failed migration transaction must not record version 5");
       const columns = new Set(db.prepare("PRAGMA table_info(users)").all().map((row) => row.name));
       assert.equal(columns.has("totp_enabled"), false, "the failed migration's schema changes must roll back");
       assert.equal(db.prepare("SELECT value FROM proof").get().value, "archive-before-migration");
@@ -4861,7 +4862,7 @@ test("successful migrations before listener acknowledgement preserve the restore
         assert.equal(backup.metadata.restoreSync.entries.length, 1);
         const db = new Database(process.env.DATABASE_URL, { readonly: true });
         try {
-          assert.deepEqual(db.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map((row) => row.version), [1, 2, 3, 4, 5]);
+          assert.deepEqual(db.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map((row) => row.version), ${JSON.stringify(ALL_MIGRATION_VERSIONS)});
           assert.equal(db.prepare("SELECT value FROM proof").get().value, "archive-before-migration");
         } finally { db.close(); }
         net.Server.prototype.listen = originalListen;
