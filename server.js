@@ -1833,7 +1833,7 @@ function setShareDownloadReceiptCookie(req, res, token) {
   });
 }
 
-function renderPublicSharePage(token) {
+function renderPublicSharePage(token, scriptNonce) {
   const safeToken = String(token).replace(/[^a-f0-9]/gi, "");
 
   return `<!doctype html>
@@ -2075,7 +2075,7 @@ function renderPublicSharePage(token) {
         </div>
       </section>
     </main>
-    <script>
+    <script nonce="${scriptNonce}">
       const token = "${safeToken}";
       const fileName = document.getElementById("fileName");
       const status = document.getElementById("status");
@@ -3320,11 +3320,15 @@ function createOpenFileToken(folderId, fileName, options = {}) {
   return token;
 }
 
+function isActiveContentFile(fileName) {
+  return [".html", ".htm", ".svg", ".xml", ".xhtml", ".xht", ".mhtml", ".mht", ".js", ".mjs", ".cjs"].includes(path.extname(fileName || "").toLowerCase());
+}
+
 function getFileContentDisposition(fileName, dispositionType = "inline") {
   const fallbackName = path.basename(fileName || "arquivo")
     .replace(/[^\x20-\x7E]/g, "_")
     .replace(/["\\]/g, "_");
-  const safeDisposition = dispositionType === "attachment" ? "attachment" : "inline";
+  const safeDisposition = dispositionType === "attachment" || isActiveContentFile(fileName) ? "attachment" : "inline";
 
   return `${safeDisposition}; filename="${fallbackName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
@@ -3379,7 +3383,7 @@ function getMimeType(fileName) {
 
 function getPreviewKind(fileName) {
   const extension = path.extname(fileName || "").toLowerCase();
-  if ([".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp"].includes(extension)) return "image";
+  if ([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"].includes(extension)) return "image";
   if (extension === ".pdf") return "pdf";
   if ([".mp3", ".wav", ".ogg", ".oga", ".flac", ".m4a"].includes(extension)) return "audio";
   if ([".mp4", ".webm", ".mov", ".m4v"].includes(extension)) return "video";
@@ -3745,6 +3749,7 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
     "Content-Disposition": getFileContentDisposition(safeName, dispositionType),
     "X-Content-Type-Options": "nosniff",
   };
+  if (isActiveContentFile(safeName)) commonHeaders["Content-Security-Policy"] = "sandbox; default-src 'none'";
 
   const streamOptions = { highWaterMark };
   let statusCode = 200;
@@ -5744,6 +5749,29 @@ try {
   startupRestoreLease();
   throw error;
 }
+const APP_CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "media-src 'self' blob:",
+  "font-src 'self' data:",
+  "connect-src 'self' ws: wss:",
+  "frame-src 'self' blob:",
+  "worker-src 'self' blob:",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'self'",
+].join("; ");
+app.use((req, res, next) => {
+  res.setHeader("Content-Security-Policy", APP_CONTENT_SECURITY_POLICY);
+  res.setHeader("X-Frame-Options", "SAMEORIGIN");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "same-origin");
+  if (req.secure) res.setHeader("Strict-Transport-Security", "max-age=31536000");
+  next();
+});
 app.use(restoreRequestGate.middleware);
 app.use((req, res, next) => {
   if (req.path === "/" || req.path.endsWith(".html")) {
@@ -11406,7 +11434,9 @@ app.get("/share/:token", shareRateLimit, (req, res) => {
     return res.status(410).type("html").send(getShareFailurePage("Este link nao esta disponivel."));
   }
 
-  res.type("html").send(renderPublicSharePage(shareToken));
+  const scriptNonce = crypto.randomBytes(16).toString("base64");
+  res.setHeader("Content-Security-Policy", APP_CONTENT_SECURITY_POLICY.replace("script-src 'self'", `script-src 'self' 'nonce-${scriptNonce}'`));
+  res.type("html").send(renderPublicSharePage(shareToken, scriptNonce));
 });
 
 app.post("/share/:token/password", shareRateLimit, requireSameOriginPublicShareMutation, async (req, res) => {
