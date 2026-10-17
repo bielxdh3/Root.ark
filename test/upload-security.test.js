@@ -20,6 +20,12 @@ const TIMEOUT_MS = 10_000;
 const FOLDER_ID = "upload-safety";
 const createChunkUploadQuota = (options) => createChunkUploadQuotaService({ perAccountEntries: 5000, systemEntries: 10000, ...options });
 
+function chunkBoundaryRequestTimeout(chunkIndex, totalChunks) {
+  // Only the final supported 2,000-part boundary assembles 2,000 files on this response.
+  // Keep the other 1,999 socket deadlines strict and the overall 180s test budget intact.
+  return totalChunks === 2000 && chunkIndex === totalChunks - 1 ? 30_000 : TIMEOUT_MS;
+}
+
 test("dead-owner quota test preload is inert outside the test environment", () => {
   const quotaModulePath = path.join(ROOT, "services", "chunkUploadQuota.js");
   const preloadPath = path.join(ROOT, "test", "fixtures", "chunk-quota-dead-owner-preload.js");
@@ -63,6 +69,13 @@ test("release gate reports a sanitized failing test and skips redundant full tes
   assert.match(output, /\[REDACTED\]/, "sensitive diagnostic text is redacted rather than silently dropped");
   assert.equal(calls.some(({ args }) => /(?:^|\s)(?:npm(?:\.cmd)?\s+test|test(?:\s|$))/.test(args.join(" "))), false, "no expensive canonical npm test after an earlier hard failure on Windows or POSIX");
   assert.equal(simulatedProcess.exitCode, 1, "the gate still fails closed");
+});
+
+test("2,000-chunk boundary keeps ordinary socket timeout strict and bounds final assembly separately", () => {
+  assert.equal(chunkBoundaryRequestTimeout(0, 2000), TIMEOUT_MS);
+  assert.equal(chunkBoundaryRequestTimeout(1998, 2000), TIMEOUT_MS);
+  assert.equal(chunkBoundaryRequestTimeout(1999, 2000), 30_000);
+  assert.equal(chunkBoundaryRequestTimeout(1999, 2001), TIMEOUT_MS, "test-only final assembly allowance is restricted to the supported 2,000 part boundary");
 });
 
 function getUnusedPort() {
@@ -2415,15 +2428,27 @@ test("a valid upload can send all 2,000 allowed chunks within the configured win
   const uploadId = "two-thousand-chunk-window";
 
   let completed;
+  const startedAt = Date.now();
+  let slowestMs = 0;
+  let slowestIndex = -1;
   for (let chunkIndex = 0; chunkIndex < 2000; chunkIndex += 1) {
-    completed = await uploadChunk(harness.port, session, {
-      uploadId,
-      originalName: "two-thousand-parts.txt",
-      chunkIndex,
-      totalChunks: 2000,
-      bytes: Buffer.from([chunkIndex % 256]),
-      agent,
-    });
+    const chunkStartedAt = Date.now();
+    try {
+      completed = await uploadChunk(harness.port, session, {
+        uploadId,
+        originalName: "two-thousand-parts.txt",
+        chunkIndex,
+        totalChunks: 2000,
+        bytes: Buffer.from([chunkIndex % 256]),
+        agent,
+        timeoutMs: chunkBoundaryRequestTimeout(chunkIndex, 2000),
+      });
+    } catch (error) {
+      throw new Error(`chunk ${chunkIndex}/2000: ${error.message}; elapsedMs=${Date.now() - chunkStartedAt}; totalElapsedMs=${Date.now() - startedAt}; previousSlowestMs=${slowestMs} at index ${slowestIndex}; serverExit=${harness.child.exitCode ?? "running"}`, { cause: error });
+    }
+    const elapsedMs = Date.now() - chunkStartedAt;
+    if (elapsedMs > slowestMs) { slowestMs = elapsedMs; slowestIndex = chunkIndex; }
+    if (chunkIndex === 0 || (chunkIndex + 1) % 250 === 0) t.diagnostic(`chunk progress ${chunkIndex + 1}/2000 elapsedMs=${Date.now() - startedAt} mostSlowMs=${slowestMs} index=${slowestIndex}`);
     assert.equal(completed.status, 200, `chunk ${chunkIndex}: ${completed.body}\n${harness.stderr.join("")}`);
   }
 
