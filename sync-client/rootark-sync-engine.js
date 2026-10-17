@@ -7,6 +7,7 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 
 const protocol = require("./rootark-sync-protocol");
+const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 
@@ -191,6 +192,12 @@ function pathsEqual(left, right) {
   return pathWithin(left, right) && pathWithin(right, left);
 }
 
+function normalizeExcludedPaths(value) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) fail("Excluded paths must be an array", "invalid_excluded_paths");
+  return [...new Set(value.map((item) => validatePortableRelativePath(item, "excludedPath")))].sort();
+}
+
 function pathKey(relativePath) {
   return process.platform === "win32" ? relativePath.toLowerCase() : relativePath;
 }
@@ -234,6 +241,7 @@ class SyncEngine {
     this.maxRetries = Math.max(1, Math.min(5, Number(options.maxRetries || 3)));
     if (options.selectedPaths != null && !Array.isArray(options.selectedPaths)) fail("Selected paths must be an array", "invalid_selected_paths");
     this.selectedPaths = options.selectedPaths == null ? null : [...new Set(options.selectedPaths.map((value) => protocol.safeRelativePath(value, "selectedPath")))].sort();
+    this.excludedPaths = normalizeExcludedPaths(options.excludedPaths);
     this.snapshot = { version: SNAPSHOT_VERSION, files: {}, remoteOnly: {} };
     this.snapshotDiskRevision = null;
     this.opened = false;
@@ -320,6 +328,9 @@ class SyncEngine {
       if (parsed.version !== SNAPSHOT_VERSION || !parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) fail("Invalid sync snapshot", "invalid_snapshot");
       if (parsed.remoteOnly === undefined) parsed.remoteOnly = {};
       if (!parsed.remoteOnly || typeof parsed.remoteOnly !== "object" || Array.isArray(parsed.remoteOnly)) fail("Invalid remote-only sync state", "invalid_snapshot");
+      if (parsed.excludedPaths !== undefined) {
+        try { parsed.excludedPaths = normalizeExcludedPaths(parsed.excludedPaths); } catch { fail("Invalid excluded sync paths", "invalid_snapshot"); }
+      }
       for (const [objectId, item] of Object.entries(parsed.remoteOnly)) {
         if (!item || typeof item !== "object" || item.objectId !== objectId || typeof item.path !== "string") fail("Invalid remote-only sync entry", "invalid_snapshot");
         try {
@@ -352,11 +363,20 @@ class SyncEngine {
     if (this.verifyIncoming && await this.verifyIncoming(operation) !== true) fail("Remote sync authorization rejected", "remote_authorization_rejected");
   }
 
-  isSelected(relativePath) {
+  isInScope(relativePath) {
     return this.selectedPaths === null || this.selectedPaths.some((selected) => pathWithin(relativePath, selected));
   }
 
+  isExcluded(relativePath) {
+    return this.excludedPaths.some((excluded) => pathWithin(relativePath, excluded));
+  }
+
+  isSelected(relativePath) {
+    return this.isInScope(relativePath) && !this.isExcluded(relativePath);
+  }
+
   needsTraversal(relativePath) {
+    if (this.isExcluded(relativePath)) return false;
     return this.selectedPaths === null || this.isSelected(relativePath)
       || this.selectedPaths.some((selected) => pathWithin(selected, relativePath));
   }
@@ -1186,7 +1206,7 @@ class SyncEngine {
   async _evictLocal(relativePath) {
     if (!this.opened) await this._open();
     const safePath = await canonicalRelativePath(this.rootDir, relativePath);
-    if (!this.isSelected(safePath)) fail("Only selected paths can be evicted", "path_not_selected");
+    if (!this.isInScope(safePath)) fail("Only selected paths can be evicted", "path_not_selected");
     const prior = this.snapshot.files[safePath];
     if (!prior || prior.deleted || prior.directory || !/^[a-f0-9]{64}$/.test(prior.hash || "")) fail("Only a tracked file can be evicted", "cache_entry_unavailable");
     const pending = await this.journal.recover();
@@ -1229,20 +1249,34 @@ class SyncEngine {
       fail("Local file changed during cache verification", "local_changes_pending");
     }
 
-    this.snapshot.remoteOnly[prior.objectId] = {
-      objectId: remote.objectId, fileId: remote.fileId, versionId: remote.versionId,
-      revision: remote.revision, path: safePath, directory: false, deleted: false, reason: "evicted", hash,
-    };
-    await this.persistSnapshot();
     const staged = await this.stageExisting(target);
     if (!staged) fail("Local cache entry disappeared during eviction", "cache_entry_unavailable");
-    const stagedStats = await fsp.lstat(staged, { bigint: true });
-    if (!stagedStats.isFile() || !sameFileIdentity(beforeStage, stagedStats) || stagedStats.size !== beforeStage.size
-      || stagedStats.mtimeNs !== beforeStage.mtimeNs || stagedStats.mode !== beforeStage.mode) {
+    const hadPriorMarker = Object.prototype.hasOwnProperty.call(this.snapshot.remoteOnly, prior.objectId);
+    const priorMarker = hadPriorMarker ? this.snapshot.remoteOnly[prior.objectId] : undefined;
+    const restoreStagedFile = async () => {
       if (!(await exists(target))) await fsp.rename(staged, target);
-      fail("Local file changed during cache eviction", "unsafe_path");
+    };
+    try {
+      const stagedStats = await fsp.lstat(staged, { bigint: true });
+      if (!stagedStats.isFile() || !sameFileIdentity(beforeStage, stagedStats) || stagedStats.size !== beforeStage.size
+        || stagedStats.mtimeNs !== beforeStage.mtimeNs || stagedStats.mode !== beforeStage.mode) {
+        fail("Local file changed during cache eviction", "unsafe_path");
+      }
+      // The marker is persisted only after the staged file is verified and before it is removed,
+      // so a crash after removal still records that the remote object is the only copy.
+      this.snapshot.remoteOnly[prior.objectId] = {
+        objectId: remote.objectId, fileId: remote.fileId, versionId: remote.versionId,
+        revision: remote.revision, path: safePath, directory: false, deleted: false, reason: "evicted", hash,
+      };
+      await this.persistSnapshot();
+      await fsp.unlink(staged);
+    } catch (error) {
+      if (hadPriorMarker) this.snapshot.remoteOnly[prior.objectId] = priorMarker;
+      else delete this.snapshot.remoteOnly[prior.objectId];
+      await restoreStagedFile();
+      await this.persistSnapshot().catch(() => {});
+      throw error;
     }
-    await fsp.unlink(staged);
     if (this.snapshot.files[safePath]?.objectId === prior.objectId) delete this.snapshot.files[safePath];
     await this.persistSnapshot();
     return true;
@@ -1328,12 +1362,52 @@ class SyncEngine {
         remoteOnlyChanged = true;
         continue;
       }
-      if (this.journal.hasSeen(operation.operationId)) continue;
+      // A folder re-included after an exclusion must hydrate even if this operation was seen before.
+      if (this.journal.hasSeen(operation.operationId) && remoteOnly?.reason !== "excluded") continue;
       await this._apply(operation, summary);
       await this.journal.markSeen(operation.operationId);
       summary.pulled += 1;
     }
     if (remoteOnlyChanged) await this.persistSnapshot();
+  }
+
+  // Applies the configured exclusions once per change. Excluded tracked files are evicted
+  // through the guarded _evictLocal path; excluded files with no local copy become remote-only
+  // records so that no remote delete can ever be pushed for them. Remote objects are never deleted.
+  async _applyExcludedPaths() {
+    const applied = this.snapshot.excludedPaths || [];
+    if (JSON.stringify(applied) === JSON.stringify(this.excludedPaths)) return null;
+    const report = { evicted: 0, released: 0, kept: [] };
+    const pending = await this.journal.recover();
+    for (const [relative, prior] of Object.entries(this.snapshot.files)) {
+      if (prior.deleted || prior.directory || !this.isExcluded(relative)) continue;
+      if (pending.some((operation) => operation.objectId === prior.objectId
+        || operation.metadata?.path === relative || operation.metadata?.sourcePath === relative)) {
+        report.kept.push({ path: relative, code: "sync_operation_pending" });
+        continue;
+      }
+      const target = await contained(this.rootDir, relative, true);
+      if (!(await exists(target))) {
+        this.snapshot.remoteOnly[prior.objectId] = {
+          objectId: prior.objectId, fileId: prior.fileId, versionId: prior.versionId, revision: prior.revision,
+          path: relative, directory: false, deleted: false, reason: "excluded", ...(prior.hash ? { hash: prior.hash } : {}),
+        };
+        delete this.snapshot.files[relative];
+        report.released += 1;
+        continue;
+      }
+      try {
+        await this._evictLocal(relative);
+        report.evicted += 1;
+      } catch (error) {
+        report.kept.push({ path: relative, code: error?.code || "unknown" });
+      }
+    }
+    // The applied list is stored only when exclusions are configured, so snapshots of devices that never use them keep their existing shape.
+    if (this.excludedPaths.length) this.snapshot.excludedPaths = [...this.excludedPaths];
+    else delete this.snapshot.excludedPaths;
+    await this.persistSnapshot();
+    return report;
   }
 
   async syncOnce() {
@@ -1343,6 +1417,8 @@ class SyncEngine {
   async _syncOnce() {
     if (!this.opened) await this._open();
     const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
+    const excluded = await this._applyExcludedPaths();
+    if (excluded) summary.excluded = excluded;
     await this._reconcileLocal();
     await this._pushPending(summary);
     if (!summary.offline) await this._pullRemote(summary);
@@ -1350,4 +1426,4 @@ class SyncEngine {
   }
 }
 
-module.exports = { SyncEngine, contained, containedAbsolute };
+module.exports = { SyncEngine, contained, containedAbsolute, normalizeExcludedPaths };

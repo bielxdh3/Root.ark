@@ -49,6 +49,7 @@ async function start(options = {}) {
     rootDir: config.localFolder,
     adapter,
     selectedPaths: config.selectedPaths,
+    excludedPaths: config.excludedPaths,
     deviceId: config.deviceId,
     keyEpoch: config.keyEpoch,
     compartmentId: config.compartmentId || "private",

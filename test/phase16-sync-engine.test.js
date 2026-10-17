@@ -750,6 +750,41 @@ test("cache eviction fails closed when the remote object is missing, deleted, or
   assert.equal(sync.snapshot.remoteOnly[current.objectId], undefined);
 });
 
+test("cache eviction leaves the snapshot and local file unchanged when the post-stage identity check fails", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-evict-rollback-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const state = { offline: false };
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", state);
+  const source = path.join(dir, "source");
+  await fsp.mkdir(source, { recursive: true });
+  await fsp.writeFile(path.join(source, "cached.txt"), "remote cache payload");
+  await (await engine(source, adapter, key)).syncOnce();
+  const root = path.join(dir, "device");
+  const sync = await engine(root, adapter, key);
+  await sync.syncOnce();
+  const localPath = path.join(root, "cached.txt");
+  const memoryBefore = JSON.stringify(sync.snapshot);
+  const diskBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"), "utf8");
+
+  const originalLstat = fsp.lstat;
+  fsp.lstat = async function injectedLstat(target, options) {
+    if (String(target).includes(`${path.sep}.rootark-trash${path.sep}`)) {
+      throw Object.assign(new Error("injected identity check failure"), { code: "EIO" });
+    }
+    return originalLstat.call(fsp, target, options);
+  };
+  t.after(() => { fsp.lstat = originalLstat; });
+  await assert.rejects(() => sync.evictLocal("cached.txt"), { code: "EIO" });
+  fsp.lstat = originalLstat;
+
+  assert.equal(await fsp.readFile(localPath, "utf8"), "remote cache payload");
+  assert.equal(JSON.stringify(sync.snapshot), memoryBefore);
+  assert.equal(await fsp.readFile(path.join(root, ".rootark-sync-index.json"), "utf8"), diskBefore);
+  assert.equal(sync.snapshot.remoteOnly[store.list("alice")[0].objectId], undefined);
+});
+
 test("selective remote-only state survives restart and reconnect with a changed scope", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-selective-restart-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
