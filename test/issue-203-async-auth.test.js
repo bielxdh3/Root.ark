@@ -138,3 +138,77 @@ test("two concurrent 2FA logins with the same recovery code cannot both succeed"
     assert.equal(harness.stats.compareSyncCalls, 0);
   });
 });
+
+// ---- WebDAV verified-credential cache / coalescing (real server process) ----
+const fs = require("node:fs");
+const http = require("node:http");
+const net = require("node:net");
+const os = require("node:os");
+const path = require("node:path");
+const { spawn } = require("node:child_process");
+const crypto = require("node:crypto");
+const ROOT = path.resolve(__dirname, "..");
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const l = net.createServer();
+    l.once("error", reject);
+    l.listen(0, "127.0.0.1", () => { const p = l.address().port; l.close(() => resolve(p)); });
+  });
+}
+function dav(port, authorization) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port, path: "/dav", method: "PROPFIND", headers: { authorization, depth: "0" }, agent: false }, (res) => {
+      res.resume(); res.on("end", () => resolve(res.statusCode));
+    });
+    req.once("error", reject);
+    req.end();
+  });
+}
+const basic = (u, p) => `Basic ${Buffer.from(`${u}:${p}`).toString("base64")}`;
+
+async function withDavServer(fn) {
+  const base = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
+  const dir = fs.mkdtempSync(path.join(base, "rootark-203-dav-"));
+  fs.mkdirSync(path.join(dir, "data")); fs.mkdirSync(path.join(dir, "uploads"));
+  const usersFile = path.join(dir, "data", "users.json");
+  const writeUsers = (patch = {}, password = "password", file = usersFile) => fs.writeFileSync(file, JSON.stringify([{ username: "agent", password: bcrypt.hashSync(password, 10), role: "admin", permissions: { upload: true }, sessionVersion: 0, ...patch }]));
+  writeUsers();
+  try { fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction"); } catch {}
+  const port = await freePort();
+  const env = { ...process.env, NODE_ENV: "test", PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", LOGIN_DELAY_BASE: "0", UPLOAD_SCAN_ENABLED: "false", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env, stdio: "ignore", windowsHide: true });
+  try {
+    for (let i = 0; i < 150; i += 1) {
+      try { await new Promise((res, rej) => { http.get({ host: "127.0.0.1", port, path: "/login.html", agent: false }, (r) => { r.resume(); r.on("end", res); }).once("error", rej); }); break; } catch { await new Promise((r) => setTimeout(r, 40)); }
+    }
+    await fn({ port, writeUsers, localUsers: path.join(dir, "data", "users.local.json") });
+  } finally {
+    await new Promise((resolve) => { if (child.exitCode !== null) return resolve(); child.once("exit", resolve); child.kill(); });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("20 concurrent WebDAV requests with the correct password all succeed; wrong passwords stay limited", { timeout: 60_000 }, async () => {
+  await withDavServer(async ({ port }) => {
+    const ok = await Promise.all(Array.from({ length: 20 }, () => dav(port, basic("agent", "password"))));
+    assert.deepEqual(ok, Array(20).fill(207));
+    // Cached now: still fine in parallel again.
+    assert.deepEqual(await Promise.all(Array.from({ length: 20 }, () => dav(port, basic("agent", "password")))), Array(20).fill(207));
+    // Distinct wrong passwords cannot all be checked: at most 5 get 401, the rest 429.
+    const bad = await Promise.all(Array.from({ length: 20 }, (_, i) => dav(port, basic("agent", `wrong-${i}`))));
+    assert.ok(bad.filter((c) => c === 401).length <= 5, JSON.stringify(bad));
+    assert.ok(bad.includes(429));
+  });
+});
+
+test("WebDAV credential cache is invalidated immediately by password change and by disabling the user", { timeout: 60_000 }, async () => {
+  await withDavServer(async ({ port, writeUsers, localUsers }) => {
+    assert.equal(await dav(port, basic("agent", "password")), 207);
+    writeUsers({}, "new-password-value", localUsers);
+    assert.equal(await dav(port, basic("agent", "password")), 401);
+    assert.equal(await dav(port, basic("agent", "new-password-value")), 207);
+    writeUsers({ disabled: true }, "new-password-value", localUsers);
+    assert.equal(await dav(port, basic("agent", "new-password-value")), 401);
+  });
+});

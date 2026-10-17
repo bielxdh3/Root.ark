@@ -74,6 +74,7 @@ const { createRealtimeUpgradeGuard } = require("./src/realtime/upgradeGuard");
 const { createRequirePermission } = require("./src/middlewares/permissions");
 const { isTotpRequired, validateTotpPolicy } = require("./src/services/totpPolicy");
 const { getDeploymentReadiness, isSessionCookieSecure, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
+const { createWebDavCredentialCache } = require("./src/services/webdavCredentialCache");
 const { reserveLoginAttempt, getLoginRejection, getLoginSecurityState, registerFailedLoginAttempt, resetLoginUsernameState } = require("./src/services/loginProtection");
 
 const app = express();
@@ -1354,6 +1355,8 @@ function sendWebDavUnauthorized(req, res, reason = "invalid_credentials", status
   return false;
 }
 
+const webDavCredentialCache = createWebDavCredentialCache();
+
 async function authenticateWebDavRequest(req, res) {
   const header = String(req.headers.authorization || "");
   let username = "";
@@ -1376,8 +1379,21 @@ async function authenticateWebDavRequest(req, res) {
   }
 
   const security = getLoginSecurityState(req, username, getAuditActor);
-  const rejection = getLoginRejection(security);
-  if (rejection) return sendWebDavUnauthorized(req, res, rejection.reason, 429, rejection.retryAfter);
+  // Recently verified credentials (same hash/sessionVersion, user still enabled) skip bcrypt and the attempt reservation.
+  let credentialKey = null;
+  let cachedUser = null;
+  let credentialVerified = false;
+  if (!parseFailure) {
+    credentialKey = webDavCredentialCache.keyFor(username, password);
+    cachedUser = loadUsers().find((entry) => sameUsername(entry.username, username));
+    credentialVerified = webDavCredentialCache.isVerified(credentialKey, cachedUser);
+  }
+  const rejection = credentialVerified ? null : getLoginRejection(security);
+  if (rejection) {
+    // A compare for the same credentials may already be in flight (parallel client requests): share its result.
+    const pending = !parseFailure ? webDavCredentialCache.getInflight(credentialKey) : null;
+    if (!pending) return sendWebDavUnauthorized(req, res, rejection.reason, 429, rejection.retryAfter);
+  }
   if (parseFailure) {
     security.ipState.attempts += 1;
     registerFailedLoginAttempt(security.ipState, security.now, security.config);
@@ -1385,23 +1401,34 @@ async function authenticateWebDavRequest(req, res) {
     return sendWebDavUnauthorized(req, res, parseFailure);
   }
 
-  const user = loadUsers().find((entry) => sameUsername(entry.username, username));
-  // Reserve the attempt synchronously before the async compare so concurrent requests count toward the limits.
-  const reservation = reserveLoginAttempt(security);
-  let passwordOk = false;
-  if (user && !user.disabled) {
-    try { passwordOk = await bcrypt.compare(password, String(user.password || "")); } catch { passwordOk = false; }
+  const user = cachedUser;
+  let reservation = null;
+  let passwordOk = credentialVerified;
+  if (!credentialVerified) {
+    const pending = webDavCredentialCache.getInflight(credentialKey);
+    if (pending && user && !user.disabled) {
+      // Coalesce with the in-flight compare for identical credentials; no extra reservation.
+      passwordOk = await pending.catch(() => false) && webDavCredentialCache.isVerified(credentialKey, user);
+    } else {
+      // Reserve the attempt synchronously before the async compare so concurrent requests count toward the limits.
+      reservation = reserveLoginAttempt(security);
+      if (user && !user.disabled) {
+        const compare = bcrypt.compare(password, String(user.password || "")).then(Boolean, () => false);
+        webDavCredentialCache.setInflight(credentialKey, compare.then((ok) => { if (ok) webDavCredentialCache.remember(credentialKey, user); return ok; }));
+        passwordOk = await webDavCredentialCache.getInflight(credentialKey);
+      }
+    }
   }
   if (!user || user.disabled || !passwordOk) {
-    reservation.failure();
+    reservation?.failure();
     const failureRejection = getLoginRejection(security);
     if (failureRejection && failureRejection.reason !== "rate_limit") {
       return sendWebDavUnauthorized(req, res, failureRejection.reason, 429, failureRejection.retryAfter);
     }
     return sendWebDavUnauthorized(req, res, "invalid_credentials");
   }
-  reservation.success();
-  resetLoginUsernameState(security);
+  reservation?.success();
+  if (reservation) resetLoginUsernameState(security);
 
   let totpPolicy;
   try {
