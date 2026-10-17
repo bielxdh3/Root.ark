@@ -7,15 +7,32 @@ function isPublicLinkViewerId(viewerId) {
 
 const SHARE_OPERATIONS = ["view", "preview", "download"];
 
-// NULL column = legacy link without an explicit permissions capability (treated as all operations by the server).
+// Only a link with no permissions field at all (pre-migration legacy) maps to NULL, which reads back as all operations.
+// Every other non-array value is stored as an empty list and fails closed.
 function permissionsToColumn(permissions) {
-  if (!Array.isArray(permissions)) return null;
+  if (permissions === undefined) return null;
+  if (!Array.isArray(permissions)) return "[]";
   return JSON.stringify(SHARE_OPERATIONS.filter((operation) => permissions.includes(operation)));
+}
+
+// NULL column = legacy link (no permissions field, all operations). Malformed stored values and NULL rows that carry
+// permissions metadata fail closed to no operations.
+function rowPermissions(row, metadata) {
+  if (row.permissions_json === null || row.permissions_json === undefined) {
+    return Object.prototype.hasOwnProperty.call(metadata, "permissions") ? [] : undefined;
+  }
+  const parsed = safeJsonParse(row.permissions_json, null);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function linkAllowsOperation(link, operation) {
+  if (link.permissions === undefined) return SHARE_OPERATIONS.includes(operation);
+  return Array.isArray(link.permissions) && link.permissions.includes(operation);
 }
 
 function rowToLink(row) {
   const metadata = safeJsonParse(row.metadata_json, {});
-  const storedPermissions = row.permissions_json ? safeJsonParse(row.permissions_json, null) : null;
+  const permissions = rowPermissions(row, metadata);
   return {
     ...metadata,
     fileName: row.file_name,
@@ -26,7 +43,7 @@ function rowToLink(row) {
     maxViews: Number(row.max_views) || 0,
     views: Number(row.views) || 0,
     passwordHash: row.password_hash || metadata.passwordHash || null,
-    ...(Array.isArray(storedPermissions) ? { permissions: storedPermissions } : {}),
+    ...(permissions === undefined ? {} : { permissions }),
   };
 }
 
@@ -238,6 +255,7 @@ function consumePublicLinkQuota(token, options = {}) {
     }
     const expiresAt = new Date(link.expiresAt).getTime();
     if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return { status: "expired" };
+    if (options.requiredOperation && !linkAllowsOperation(link, options.requiredOperation)) return { status: "operation_denied" };
 
     if (kind === "view" || kind === "session") {
       const views = Number(row.views) || 0;

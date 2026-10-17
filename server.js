@@ -1627,9 +1627,11 @@ function normalizeSharePermissionsInput(rawValue) {
   return SHARE_OPERATIONS.filter((operation) => rawValue.includes(operation));
 }
 
-// Stored links without a permissions capability keep the legacy behaviour (all operations); malformed values fail closed.
+// Links with no permissions field are pre-migration legacy links (all operations). Every new link stores an explicit array,
+// and null or any other non-array value fails closed as no operations.
 function getShareLinkPermissions(link) {
-  if (link?.permissions === undefined || link?.permissions === null) return [...SHARE_OPERATIONS];
+  if (!link || typeof link !== "object") return [];
+  if (link.permissions === undefined) return [...SHARE_OPERATIONS];
   if (!Array.isArray(link.permissions)) return [];
   return link.permissions.filter((operation) => SHARE_OPERATIONS.includes(operation));
 }
@@ -2451,6 +2453,12 @@ function getShareAccessCookieRequired(link, countDownloadOncePerViewer = false) 
     || (countDownloadOncePerViewer && (Number(link.maxDownloads) || 0) > 0);
 }
 
+// Test-only pause points (NODE_ENV=test) used to race a permission change against an in-flight request.
+async function pauseShareAccessForTest(point) {
+  if (process.env.NODE_ENV !== "test" || process.env.ROOTARK_TEST_SHARE_PAUSE_POINT !== point) return;
+  await new Promise((resolve) => setTimeout(resolve, Number(process.env.ROOTARK_TEST_SHARE_PAUSE_MS) || 0));
+}
+
 async function resolveShareAccess(req, res, token, options = {}) {
   const links = loadPublicLinks();
   const link = links[token];
@@ -2462,7 +2470,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
     return { status: 410, error: "Link indisponivel." };
   }
 
-  const viewPermitted = getShareLinkPermissions(link).includes("view");
+  let viewPermitted = getShareLinkPermissions(link).includes("view");
 
   const passwordHash = link.passwordHash || link.password_hash || null;
   let verifiedPasswordHash = null;
@@ -2513,6 +2521,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
   // Provider hydration yields the event loop. Reload and revalidate the link so
   // concurrent requests cannot consume the same final view/download allowance
   // or overwrite link metadata saved while this request was waiting.
+  await pauseShareAccessForTest("reload");
   const currentLinks = loadPublicLinks();
   let currentLink = currentLinks[token];
   if (!currentLink || currentLink.fileName !== link.fileName || (currentLink.folderId || ROOT_FOLDER_ID) !== (link.folderId || ROOT_FOLDER_ID)) {
@@ -2527,6 +2536,16 @@ async function resolveShareAccess(req, res, token, options = {}) {
   if (currentPasswordHash && !hasValidSharePasswordSession(req, token, currentLink) && currentPasswordHash !== verifiedPasswordHash) {
     return { status: 401, error: "Senha obrigatoria.", passwordRequired: true };
   }
+  // Re-authorize against the freshly reloaded link: permissions may have changed while the file was being resolved.
+  if (options.requireAnyOperation && getShareLinkPermissions(currentLink).length === 0) {
+    logShareAudit(req, "share.operation_denied", token, currentLink, "password", "failure", { operation: "any" });
+    return { status: 403, error: "Operacao nao permitida por este link." };
+  }
+  if (options.operation && !getShareLinkPermissions(currentLink).includes(options.operation)) {
+    logShareAudit(req, "share.operation_denied", token, currentLink, options.operation, "failure", { operation: options.operation });
+    return { status: 403, error: "Operacao nao permitida por este link." };
+  }
+  viewPermitted = getShareLinkPermissions(currentLink).includes("view");
   if (options.requirePreview && !getPublicShareCanPreview(fileInfo.fileName)) {
     return { status: 415, error: "Preview indisponivel" };
   }
@@ -2560,7 +2579,12 @@ async function resolveShareAccess(req, res, token, options = {}) {
       ...(shouldReadJsonFallback() ? { fallbackLinks: { [token]: currentLink } } : {}),
       ...(viewer ? { viewer } : {}),
       ...(downloadViewerId ? { downloadViewerId } : {}),
+      ...(options.operation ? { requiredOperation: options.operation } : {}),
     });
+    if (reservation.status === "operation_denied") {
+      logShareAudit(req, "share.operation_denied", token, currentLink, options.operation || "operation", "failure", { operation: options.operation || null });
+      return { status: 403, error: "Operacao nao permitida por este link." };
+    }
     if (reservation.status !== "ok") {
       if (reservation.status === "limit") {
         logShareAudit(req, "share.limit_reached", token, currentLink, "limit", "failure", { limit: reservation.limit || (kind === "view" ? "views" : "downloads") });
@@ -2642,6 +2666,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
     if (failure) return failure;
   }
 
+  await pauseShareAccessForTest("reserve");
   return {
     link: currentLink,
     fileInfo,

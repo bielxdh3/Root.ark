@@ -41,7 +41,7 @@ function request(port, requestPath, { method = "GET", headers = {}, body = "" } 
   });
 }
 
-async function startFixture(t, mode) {
+async function startFixture(t, mode, extraEnv = {}) {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), `rootark-share-permissions-${mode}-`));
   const dataDir = path.join(sandbox, "data");
   fs.mkdirSync(dataDir, { recursive: true });
@@ -89,7 +89,7 @@ async function startFixture(t, mode) {
       DB_AUTO_BACKUP_ON_START: "false",
     }
     : { DB_ENABLED: "false" };
-  const env = { ...process.env, ...dbEnv, NODE_ENV: "test", CLOUD_STORAGE_PROVIDER: "local", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
+  const env = { ...process.env, ...dbEnv, ...extraEnv, NODE_ENV: "test", CLOUD_STORAGE_PROVIDER: "local", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
   for (const key of Object.keys(env)) if (/^(AWS_|GOOGLE_DRIVE_)/.test(key)) delete env[key];
   delete env.TRUSTED_PROXIES;
   const port = await getUnusedPort();
@@ -133,12 +133,32 @@ async function startFixture(t, mode) {
     headers: viewerCookie ? { origin, cookie: viewerCookie } : { origin },
   });
 
-  return { port, origin, authed, publicPost, legacyToken };
+  return { port, origin, authed, publicPost, legacyToken, dataDir };
 }
 
 function viewerCookieFrom(response) {
   return (response.headers["set-cookie"] || []).map((value) => value.split(";", 1)[0]).join("; ");
 }
+
+// Changes stored permissions directly, simulating an admin edit that lands while a request is in flight.
+function setLinkPermissions(mode, dataDir, token, permissions) {
+  if (mode === "sqlite") {
+    const Database = require("better-sqlite3");
+    const db = new Database(path.join(dataDir, "rootark.sqlite"));
+    try {
+      db.prepare("UPDATE public_links SET permissions_json = ? WHERE token = ?").run(JSON.stringify(permissions), token);
+    } finally {
+      db.close();
+    }
+    return;
+  }
+  const file = path.join(dataDir, "public-links.json");
+  const links = JSON.parse(fs.readFileSync(file, "utf8"));
+  links[token].permissions = permissions;
+  fs.writeFileSync(file, JSON.stringify(links, null, 2));
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function passwordPost(port, origin, token, password) {
   const payload = JSON.stringify({ password });
@@ -298,3 +318,54 @@ for (const mode of ["json", "sqlite"]) {
     });
   });
 }
+
+for (const mode of ["json", "sqlite"]) {
+  test(`an in-flight download is re-authorized after the file check reloads the link (${mode} storage)`, { timeout: 60_000 }, async (t) => {
+    const { authed, publicPost, dataDir } = await startFixture(t, mode, { ROOTARK_TEST_SHARE_PAUSE_POINT: "reload", ROOTARK_TEST_SHARE_PAUSE_MS: "1500" });
+    const created = await authed("/share", { name: FILE_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["download"] });
+    assert.equal(created.status, 201, created.body);
+    const { token } = JSON.parse(created.body);
+
+    const pending = publicPost(token, "download");
+    await sleep(500);
+    setLinkPermissions(mode, dataDir, token, ["view"]);
+    const result = await pending;
+    assert.equal(result.status, 403, result.body);
+    assert.ok(result.body.includes(DENIED));
+    assert.equal(result.body.includes(FILE_CONTENT), false, "no content is served after the permission change");
+  });
+}
+
+test("an in-flight download is re-authorized inside the quota transaction (sqlite storage)", { timeout: 60_000 }, async (t) => {
+  const { authed, publicPost, dataDir } = await startFixture(t, "sqlite", { ROOTARK_TEST_SHARE_PAUSE_POINT: "reserve", ROOTARK_TEST_SHARE_PAUSE_MS: "1500" });
+  const created = await authed("/share", { name: FILE_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["download"] });
+  assert.equal(created.status, 201, created.body);
+  const { token } = JSON.parse(created.body);
+
+  const pending = publicPost(token, "download");
+  await sleep(500);
+  setLinkPermissions("sqlite", dataDir, token, ["view"]);
+  const result = await pending;
+  assert.equal(result.status, 403, result.body);
+  assert.ok(result.body.includes(DENIED));
+  assert.equal(result.body.includes(FILE_CONTENT), false);
+});
+
+test("permissions null and malformed stored values fail closed, legacy absence stays all operations", { timeout: 60_000 }, async (t) => {
+  const { publicPost, dataDir, legacyToken } = await startFixture(t, "json");
+  const nullToken = crypto.randomBytes(24).toString("hex");
+  const badToken = crypto.randomBytes(24).toString("hex");
+  const links = JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"));
+  const base = { folderId: "root", fileName: FILE_NAME, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3_600_000).toISOString(), views: 0, maxViews: 0, downloads: 0, maxDownloads: 0, activeViewers: {} };
+  links[nullToken] = { ...base, permissions: null };
+  links[badToken] = { ...base, permissions: "download" };
+  fs.writeFileSync(path.join(dataDir, "public-links.json"), JSON.stringify(links, null, 2));
+
+  for (const token of [nullToken, badToken]) {
+    const view = await publicPost(token, "view");
+    assert.equal(view.status, 403, `${token.slice(0, 6)} with malformed permissions grants nothing`);
+    assert.ok(view.body.includes(DENIED));
+  }
+  const legacy = await publicPost(legacyToken, "view");
+  assert.equal(legacy.status, 200, "legacy link without permissions field still works");
+});
