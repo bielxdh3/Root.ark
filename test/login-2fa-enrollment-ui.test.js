@@ -19,6 +19,7 @@ function createElement(id, document) {
     focus() { document.activeElement = this; },
     select() { this.selected = true; },
     removeAttribute(name) { delete this.attributes[name]; },
+    setAttribute(name, value) { this.attributes[name] = String(value); },
   };
 }
 
@@ -28,7 +29,7 @@ test("2FA enrollment asks for a new login after the server revokes the setup ses
   const ids = [
     ...formIds,
     "auth-error", "login-title", "login-intro", "login-eyebrow", "login-submit",
-    "username", "password", "totp-code", "enroll-code", "enroll-secret", "enroll-qr",
+    "username", "password", "totp-code", "totp-code-label", "totp-code-help", "use-recovery-code", "enroll-code", "enroll-secret", "enroll-qr",
     "back-to-login", "cancel-enroll", "recovery-step", "recovery-step-title", "recovery-codes",
     "continue-after-enroll",
   ];
@@ -127,7 +128,7 @@ test("failed 2FA enrollment keeps the setup error visible", async () => {
   const ids = [
     ...formIds,
     "auth-error", "login-title", "login-intro", "login-eyebrow", "login-submit",
-    "username", "password", "totp-code", "enroll-code", "enroll-secret", "enroll-qr",
+    "username", "password", "totp-code", "totp-code-label", "totp-code-help", "use-recovery-code", "enroll-code", "enroll-secret", "enroll-qr",
     "back-to-login", "cancel-enroll", "recovery-step", "recovery-step-title", "recovery-codes",
     "continue-after-enroll",
   ];
