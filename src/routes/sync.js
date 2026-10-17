@@ -91,12 +91,47 @@ function publicRecord(record) {
   };
 }
 
+const DEFAULT_RECOVERY_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+function positiveEnvInteger(value, fallback) {
+  const number = Number(value);
+  return value !== undefined && value !== "" && Number.isSafeInteger(number) && number > 0 ? number : fallback;
+}
+
+// Pause keys carry a prefix so client-supplied device ids (e.g. "constructor", "__proto__") never hit Object.prototype.
+function pausedKey(deviceId) {
+  return `d:${String(deviceId)}`;
+}
+
+function isPausedDevice(user, deviceId) {
+  return Boolean(user?.pausedDevices && Object.hasOwn(user.pausedDevices, pausedKey(deviceId)));
+}
+
+// Keeps the newest cap-1 versions plus the newest pre-window checkpoint (the last version whose store time is
+// older than the retention cutoff). Versions created by a currently paused device are never pruned.
+// `times` is a parallel array of store timestamps kept outside the records (records are attested strictly).
+function pruneObjectHistory(history, times, cutoff, pausedDevices) {
+  if (history.length <= MAX_HISTORY_PER_OBJECT) return { versions: history, times };
+  const recentStart = history.length - (MAX_HISTORY_PER_OBJECT - 1);
+  let checkpoint = -1;
+  for (let index = recentStart - 1; index >= 0; index -= 1) {
+    if (times[index] < cutoff) { checkpoint = index; break; }
+  }
+  const keep = (index) => index >= recentStart || index === checkpoint || Object.hasOwn(pausedDevices, pausedKey(history[index].deviceId));
+  return {
+    versions: history.filter((_, index) => keep(index)),
+    times: times.filter((_, index) => keep(index)),
+  };
+}
+
 class SyncObjectStore {
-  constructor(filePath, { burstGuard = createSyncBurstGuard() } = {}) {
+  constructor(filePath, { burstGuard = createSyncBurstGuard(), retentionMs = DEFAULT_RECOVERY_RETENTION_MS, now = () => Date.now() } = {}) {
     this.filePath = path.resolve(filePath);
     this.state = { version: STORE_VERSION, users: {} };
     this.queue = Promise.resolve();
     this.burstGuard = burstGuard;
+    this.retentionMs = retentionMs;
+    this.now = now;
   }
 
   async open() {
@@ -142,34 +177,43 @@ class SyncObjectStore {
     current.versions ||= {};
     current.revisions ||= {};
     current.seen ||= {};
+    current.versionTimes ||= {};
     next.users[username] = current;
     return current;
   }
 
   async put(username, input) {
     return this.transact((next) => {
+      const at = this.now();
       const user = this.user(next, username);
       if (user.seen[input.operationId]) return { kind: "replay", record: null };
       const current = user.objects[input.objectId] || null;
       // Destructive = delete, or any non-create operation that replaces an existing object's state.
       const destructive = Boolean(input.tombstone) || input.operation === "delete" || (input.operation !== "create" && Boolean(current));
-      if (destructive && user.pausedDevices?.[input.deviceId]) return { kind: "paused", newlyPaused: false, deviceId: input.deviceId };
+      if (destructive && isPausedDevice(user, input.deviceId)) return { kind: "paused", newlyPaused: false, deviceId: input.deviceId };
       if (input.operation === "create" && current) return { kind: "conflict", current };
       if (input.operation !== "create" && !current) return { kind: "conflict", current: null };
       if (current && input.baseRevision && compareRevisions(input.baseRevision, current.revision) !== 0) return { kind: "conflict", current };
       if (current && !input.baseRevision) return { kind: "conflict", current };
       if (current && compareRevisions(input.revision, current.revision) <= 0) return { kind: "stale", current };
       if (destructive) {
-        const burst = this.burstGuard.recordDestructive(username, input.deviceId);
+        const burst = this.burstGuard.recordDestructive(username, input.deviceId, input.objectId, at);
         if (burst.exceeded) {
           user.pausedDevices ||= {};
-          user.pausedDevices[input.deviceId] = { pausedAt: new Date().toISOString(), reason: "destructive_burst", limit: burst.limit, windowMs: burst.windowMs };
-          return { kind: "paused", newlyPaused: true, deviceId: input.deviceId, limit: burst.limit, windowMs: burst.windowMs };
+          user.pausedDevices[pausedKey(input.deviceId)] = { pausedAt: new Date(at).toISOString(), reason: burst.objectExceeded ? "object_burst" : "destructive_burst", limit: burst.limit, windowMs: burst.windowMs };
+          return { kind: "paused", newlyPaused: true, deviceId: input.deviceId, limit: burst.limit, windowMs: burst.windowMs, objectLimit: burst.objectLimit };
         }
       }
       const record = publicRecord(input);
       user.objects[input.objectId] = record;
-      user.versions[input.objectId] = [...(user.versions[input.objectId] || []), record].slice(-MAX_HISTORY_PER_OBJECT);
+      // Legacy history without timestamps is padded with 0 (treated as older than any retention cutoff).
+      const previousVersions = user.versions[input.objectId] || [];
+      const previousTimes = user.versionTimes?.[input.objectId] || [];
+      const padding = Array(Math.max(0, previousVersions.length - previousTimes.length)).fill(0);
+      const pruned = pruneObjectHistory([...previousVersions, record], [...padding, ...previousTimes, at], at - this.retentionMs, user.pausedDevices || {});
+      user.versions[input.objectId] = pruned.versions;
+      user.versionTimes ||= {};
+      user.versionTimes[input.objectId] = pruned.times;
       user.revisions[input.objectId] = input.revision;
       user.seen[input.operationId] = true;
       const seenIds = Object.keys(user.seen);
@@ -182,8 +226,8 @@ class SyncObjectStore {
     let wasPaused = false;
     await this.transact((next) => {
       const user = this.user(next, username);
-      wasPaused = Boolean(user.pausedDevices?.[deviceId]);
-      if (wasPaused) delete user.pausedDevices[deviceId];
+      wasPaused = isPausedDevice(user, deviceId);
+      if (wasPaused) delete user.pausedDevices[pausedKey(deviceId)];
       return wasPaused;
     });
     this.burstGuard.reset(username, deviceId);
@@ -191,7 +235,7 @@ class SyncObjectStore {
   }
 
   isDevicePaused(username, deviceId) {
-    return Boolean(this.state.users[username]?.pausedDevices?.[deviceId]);
+    return isPausedDevice(this.state.users[username] || {}, deviceId);
   }
 
   list(username, objectId = null) {
@@ -244,7 +288,8 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (!record || record.username !== username || record.revoked || record.active === false || record.publicKey !== proof.publicKey) return false;
     return verifyAuthorizationProof(proof, operation, { username });
   } : null);
-  const store = new SyncObjectStore(storagePath, { burstGuard: burstGuard || createSyncBurstGuard() });
+  const retentionMs = positiveEnvInteger(process.env.SYNC_RECOVERY_RETENTION_MS, DEFAULT_RECOVERY_RETENTION_MS);
+  const store = new SyncObjectStore(storagePath, { burstGuard: burstGuard || createSyncBurstGuard(), retentionMs });
   const ready = store.open();
   const sizeGuard = (req, res, next) => {
     const length = Number(req.headers["content-length"]);

@@ -31,39 +31,39 @@ test("issue 67 guard: defaults and env overrides", () => {
 
 test("issue 67 guard: trips on the operation after the limit inside the window", () => {
   const guard = createSyncBurstGuard({ maxDestructive: 3, windowMs: 1000, env: {} });
-  assert.equal(guard.recordDestructive("alice", "dev", 0).exceeded, false);
-  assert.equal(guard.recordDestructive("alice", "dev", 1).exceeded, false);
-  assert.equal(guard.recordDestructive("alice", "dev", 2).exceeded, false);
-  const tripped = guard.recordDestructive("alice", "dev", 3);
+  assert.equal(guard.recordDestructive("alice", "dev", null, 0).exceeded, false);
+  assert.equal(guard.recordDestructive("alice", "dev", null, 1).exceeded, false);
+  assert.equal(guard.recordDestructive("alice", "dev", null, 2).exceeded, false);
+  const tripped = guard.recordDestructive("alice", "dev", null, 3);
   assert.equal(tripped.exceeded, true);
   assert.equal(tripped.limit, 3);
 });
 
 test("issue 67 guard: old entries leave the sliding window", () => {
   const guard = createSyncBurstGuard({ maxDestructive: 2, windowMs: 100, env: {} });
-  guard.recordDestructive("alice", "dev", 0);
-  guard.recordDestructive("alice", "dev", 10);
+  guard.recordDestructive("alice", "dev", null, 0);
+  guard.recordDestructive("alice", "dev", null, 10);
   // At t=200 the first two entries are outside (100, 200], so a new burst starts fresh.
-  assert.equal(guard.recordDestructive("alice", "dev", 200).exceeded, false);
-  assert.equal(guard.recordDestructive("alice", "dev", 201).exceeded, false);
-  assert.equal(guard.recordDestructive("alice", "dev", 202).exceeded, true);
+  assert.equal(guard.recordDestructive("alice", "dev", null, 200).exceeded, false);
+  assert.equal(guard.recordDestructive("alice", "dev", null, 201).exceeded, false);
+  assert.equal(guard.recordDestructive("alice", "dev", null, 202).exceeded, true);
 });
 
 test("issue 67 guard: counters are isolated per user and per device", () => {
   const guard = createSyncBurstGuard({ maxDestructive: 1, windowMs: 1000, env: {} });
-  guard.recordDestructive("alice", "dev-a", 0);
-  assert.equal(guard.recordDestructive("alice", "dev-b", 1).exceeded, false);
-  assert.equal(guard.recordDestructive("bob", "dev-a", 2).exceeded, false);
-  assert.equal(guard.recordDestructive("alice", "dev-a", 3).exceeded, true);
+  guard.recordDestructive("alice", "dev-a", null, 0);
+  assert.equal(guard.recordDestructive("alice", "dev-b", null, 1).exceeded, false);
+  assert.equal(guard.recordDestructive("bob", "dev-a", null, 2).exceeded, false);
+  assert.equal(guard.recordDestructive("alice", "dev-a", null, 3).exceeded, true);
 });
 
 test("issue 67 guard: reset clears a device counter and memory stays bounded", () => {
   const guard = createSyncBurstGuard({ maxDestructive: 2, windowMs: 1000, maxKeys: 4, env: {} });
-  for (let i = 0; i < 50; i += 1) guard.recordDestructive("alice", "dev", i);
-  assert.equal(guard.recordDestructive("alice", "dev", 50).exceeded, true);
+  for (let i = 0; i < 50; i += 1) guard.recordDestructive("alice", "dev", null, i);
+  assert.equal(guard.recordDestructive("alice", "dev", null, 50).exceeded, true);
   guard.reset("alice", "dev");
-  assert.equal(guard.recordDestructive("alice", "dev", 51).exceeded, false);
-  for (let i = 0; i < 100; i += 1) guard.recordDestructive(`user-${i}`, "dev", 60);
+  assert.equal(guard.recordDestructive("alice", "dev", null, 51).exceeded, false);
+  for (let i = 0; i < 100; i += 1) guard.recordDestructive(`user-${i}`, "dev", null, 60);
   assert.ok(guard.trackedKeys() <= 4);
 });
 
@@ -253,6 +253,120 @@ test("issue 67 resume: parallel wrong passwords start at most five password chec
   assert.equal(checks, 5);
   // The lockout also holds for the correct password after the burst.
   assert.equal((await resumeRequest(port, { password: PASSWORD })).status, 429);
+});
+
+test("issue 67 guard: repeated overwrites of one object trip the per-object limit before the device total", () => {
+  const guard = createSyncBurstGuard({ maxDestructive: 200, maxPerObject: 16, windowMs: 600000, env: {} });
+  let last = null;
+  for (let i = 0; i < 16; i += 1) last = guard.recordDestructive("alice", "dev", "object-1", i);
+  assert.equal(last.objectExceeded, false);
+  last = guard.recordDestructive("alice", "dev", "object-1", 16);
+  assert.equal(last.exceeded, true);
+  assert.equal(last.objectExceeded, true);
+  assert.equal(last.deviceExceeded, false);
+});
+
+test("issue 67 route: rapid overwrites of one object pause the device before the pre-attack version is pruned", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-object-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const { port, route } = await startServer(t, { storagePath: path.join(dir, "objects.json"), burstGuard: createSyncBurstGuard({ env: {} }) });
+  const key = crypto.randomBytes(32);
+  const created = createFor(1, key);
+  assert.equal((await jsonRequest(port, "/sync/v1/objects", "POST", created)).status, 201);
+  let previous = created;
+  const statuses = [];
+  for (let counter = 2; counter <= 101; counter += 1) {
+    const update = protocol.createOperation({
+      operation: "update", objectId: "object-1", fileId: "file-1", versionId: `version-1-${counter}`, operationId: `update-${counter}`,
+      deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", revision: { counter, deviceId: "device-a" },
+      baseRevision: previous.revision, metadata: { path: "f1.txt", name: "f1.txt", size: 4 }, plaintext: Buffer.from(`v${counter}`), fileKey: key,
+    });
+    const response = await jsonRequest(port, "/sync/v1/objects", "POST", update);
+    statuses.push(response.status);
+    if (response.status === 201) previous = update;
+  }
+  // 16 overwrites are accepted; the 17th trips the per-object pause and every later attempt is refused.
+  assert.equal(statuses.filter((status) => status === 201).length, 16);
+  assert.equal(statuses[16], 423);
+  assert.ok(statuses.slice(16).every((status) => status === 423));
+  // The pre-attack version is still retained with its ciphertext and crypto metadata; history stays within cap + 1.
+  const history = route.store.history("alice", "object-1");
+  assert.ok(history.length <= 33);
+  assert.equal(history[0].versionId, created.versionId);
+  assert.equal(history[0].ciphertext, created.ciphertext);
+  assert.equal(history[0].nonce, created.nonce);
+  assert.equal(history[0].tag, created.tag);
+});
+
+test("issue 67 store: pre-window checkpoint survives pruning and history stays bounded", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-checkpoint-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  let clock = 1700000000000;
+  const store = await new SyncObjectStore(path.join(dir, "objects.json"), {
+    burstGuard: createSyncBurstGuard({ maxDestructive: 100000, maxPerObject: 100000, env: {} }),
+    retentionMs: 24 * 60 * 60 * 1000,
+    now: () => clock,
+  }).open();
+  const key = crypto.randomBytes(32);
+  const created = createFor(1, key);
+  assert.equal((await store.put("alice", created)).kind, "stored");
+  clock += 25 * 60 * 60 * 1000;
+  let previous = created;
+  for (let counter = 2; counter <= 80; counter += 1) {
+    const update = protocol.createOperation({
+      operation: "update", objectId: "object-1", fileId: "file-1", versionId: `version-1-${counter}`, operationId: `update-${counter}`,
+      deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", revision: { counter, deviceId: "device-a" },
+      baseRevision: previous.revision, metadata: { path: "f1.txt", name: "f1.txt", size: 4 }, plaintext: Buffer.from(`v${counter}`), fileKey: key,
+    });
+    assert.equal((await store.put("alice", update)).kind, "stored");
+    previous = update;
+  }
+  const history = store.history("alice", "object-1");
+  assert.equal(history.length, 32);
+  assert.equal(history[0].versionId, created.versionId);
+  assert.equal(history[history.length - 1].versionId, previous.versionId);
+});
+
+test("issue 67 store: versions created by a paused device are not pruned while it stays paused", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-paused-prune-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const store = await new SyncObjectStore(path.join(dir, "objects.json"), {
+    burstGuard: createSyncBurstGuard({ maxDestructive: 100000, maxPerObject: 100000, env: {} }),
+    now: () => 1700000000000,
+  }).open();
+  const key = crypto.randomBytes(32);
+  const created = createFor(1, key);
+  assert.equal((await store.put("alice", created)).kind, "stored");
+  let previous = created;
+  for (let counter = 2; counter <= 3; counter += 1) {
+    const update = protocol.createOperation({
+      operation: "update", objectId: "object-1", fileId: "file-1", versionId: `version-1-${counter}`, operationId: `update-${counter}`,
+      deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", revision: { counter, deviceId: "device-a" },
+      baseRevision: previous.revision, metadata: { path: "f1.txt", name: "f1.txt", size: 4 }, plaintext: Buffer.from(`v${counter}`), fileKey: key,
+    });
+    assert.equal((await store.put("alice", update)).kind, "stored");
+    previous = update;
+  }
+  // Pause device-a directly (the same persisted pause record the guard writes).
+  await store.transact((next) => {
+    const user = store.user(next, "alice");
+    user.pausedDevices = { "d:device-a": { pausedAt: new Date().toISOString(), reason: "test", limit: 1, windowMs: 1 } };
+  });
+  // Device-b keeps overwriting the object far past the history cap.
+  let prior = previous;
+  for (let counter = 4; counter <= 60; counter += 1) {
+    const update = protocol.createOperation({
+      operation: "update", objectId: "object-1", fileId: "file-1", versionId: `version-1-${counter}`, operationId: `update-b-${counter}`,
+      deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private", revision: { counter, deviceId: "device-b" },
+      baseRevision: prior.revision, metadata: { path: "f1.txt", name: "f1.txt", size: 4 }, plaintext: Buffer.from(`b${counter}`), fileKey: key,
+    });
+    assert.equal((await store.put("alice", update)).kind, "stored");
+    prior = update;
+  }
+  const versionIds = store.history("alice", "object-1").map((entry) => entry.versionId);
+  assert.ok(versionIds.includes("version-1-1"));
+  assert.ok(versionIds.includes("version-1-2"));
+  assert.ok(versionIds.includes("version-1-3"));
 });
 
 test("issue 67 store: a paused device is blocked at the store boundary and history is not trimmed by rejected operations", async (t) => {
