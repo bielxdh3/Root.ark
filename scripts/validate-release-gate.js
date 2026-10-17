@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const { Buffer } = require("node:buffer");
 const { spawnSync } = require("node:child_process");
 const { getNpmInvocation, isDependencyOrNetworkUnavailable } = require("./release-gate-environment");
 
@@ -17,7 +18,7 @@ function record(name, status, details) {
 function failedTestDiagnostics(output) {
   return String(output || "").split(/\r?\n/)
     .map((line) => line.replace(/\x1b\[[\d;]*m/g, "").trim())
-    .filter((line) => /^(?:not ok \d+ - |[✖✗×] |error:|failureType:|location:)/.test(line))
+    .filter((line) => /^(?:not ok \d+ - |[✖✗×] |error:|failureType:|location:|(?:#\s*|ℹ\s*)(?:tests|pass|fail|cancelled|skipped|todo|suites|duration_ms)\s+\d+(?:\.\d+)?\s*$|npm (?:error|ERR!) (?:code|signal|exit)\s+[A-Z0-9_]+\s*$)/i.test(line))
     .slice(-20)
     .map((line) => line
       .replace(/\b(?:Bearer|Basic)\s+\S+/gi, "[REDACTED]")
@@ -28,7 +29,7 @@ function failedTestDiagnostics(output) {
 }
 
 function command(name, executable, args, { blockedOnMissing = false, shell = false } = {}) {
-  const result = spawnSync(executable, args, { cwd: root, encoding: "utf8", windowsHide: true, shell });
+  const result = spawnSync(executable, args, { cwd: root, encoding: "utf8", windowsHide: true, shell, maxBuffer: 16 * 1024 * 1024 });
   const output = `${result.stdout || ""}\n${result.stderr || ""}\n${result.error?.message || ""}`.trim();
   if (result.status === 0) {
     record(name, "PASS", "exit 0");
@@ -41,6 +42,11 @@ function command(name, executable, args, { blockedOnMissing = false, shell = fal
   record(name, "FAIL", `exit ${result.status ?? "unknown"}`);
   const diagnostics = failedTestDiagnostics(output);
   if (diagnostics) console.log(`FAIL diagnostics (${name}):\n${diagnostics}`);
+  else {
+    const code = String(result.error?.code || "none");
+    const safeCode = /^[A-Z][A-Z0-9_]{1,30}$/.test(code) ? code : "unknown";
+    console.log(`FAIL diagnostics (${name}): unrecognized child output; stdoutBytes=${Buffer.byteLength(result.stdout || "", "utf8")} stderrBytes=${Buffer.byteLength(result.stderr || "", "utf8")} spawnError=${safeCode}; raw output withheld`);
+  }
   return false;
 }
 
@@ -126,7 +132,9 @@ for (const [name, files] of [
   ["Phase 14 backup/restore evidence", ["test/backup-restore-security.test.js"]],
 ]) command(name, process.execPath, ["--test", ...files], { blockedOnMissing: true });
 
-const npmTest = getNpmInvocation(["test"]);
+// npm forwards args after `--` to the unchanged `node --test` script. Stable TAP
+// reporting makes failing test names and counts parseable across Windows/CI.
+const npmTest = getNpmInvocation(["test", "--", "--test-reporter=tap"]);
 if (results.some((result) => result.status === "FAIL")) {
   record("final-head canonical npm test", "SKIPPED", "earlier mandatory gate failed; run after correction");
 } else {
