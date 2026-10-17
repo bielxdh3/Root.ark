@@ -88,6 +88,10 @@ test("browser login accepts single-use recovery proof and retains six-digit TOTP
 
   async function enterChallenge() {
     await page.goto(baseUrl + "/login.html");
+    await page.waitForFunction(async () => {
+      const registration = await navigator.serviceWorker?.getRegistration("/");
+      return Boolean(registration?.active?.scriptURL.endsWith("/service-worker.js"));
+    }, null, { timeout: 15_000 });
     await page.locator("#username").fill("recovery-fixture");
     await page.locator("#password").fill("disposable-password");
     await page.locator("#login-submit").click();

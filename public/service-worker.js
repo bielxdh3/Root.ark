@@ -4,7 +4,6 @@ const CACHE_NAME = "rootark-public-shell-v26";
 const SHELL_ASSETS = [
   "/",
   "/index.html",
-  "/login.html",
   "/dashboard.html",
   "/audit.html",
   "/admin.html",
@@ -12,7 +11,6 @@ const SHELL_ASSETS = [
   "/styles/app.css",
   "/client/rootark-api.js",
   "/client/rootark-ui.js",
-  "/client/rootark-login.js",
   "/client/rootark-workspace.js",
   "/client/rootark-management.js",
   "/client/rootark-offline-shell.js",
@@ -41,6 +39,11 @@ self.addEventListener("fetch", (event) => {
   const request = event.request;
   const url = new URL(request.url);
   if (request.method !== "GET" || url.origin !== self.location.origin || BLOCKED_PATHS.some((pattern) => pattern.test(url.pathname))) return;
+  // Authentication requires the server. Never serve cached login markup or code, including across deployments.
+  if (url.pathname === "/login.html" || url.pathname === "/client/rootark-login.js") {
+    event.respondWith(fetch(request, { cache: "no-store" }));
+    return;
+  }
   if (!SHELL_ASSETS.some((asset) => new URL(asset, self.location.origin).pathname === url.pathname)) return;
   event.respondWith(caches.match(request, { ignoreSearch: true }).then((cached) => cached || fetch(request).then((response) => {
     if (response.ok) caches.open(CACHE_NAME).then((cache) => cache.put(request, response.clone()));

@@ -865,6 +865,10 @@ test("offline queue and sync adapter reject plaintext, keys, and search terms", 
 
 test("service worker caches only the public shell and bypasses protected paths", async () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "public", "service-worker.js"), "utf8");
+  const loginHtml = fs.readFileSync(path.join(__dirname, "..", "public", "login.html"), "utf8");
+  assert.match(loginHtml, /<script defer src="\/client\/rootark-offline-shell\.js\?v=16"><\/script>/, "logged-out login page also requests service worker installation and updates");
+  assert.doesNotMatch(source, /^  "\/login\.html",?$/m, "login markup is not precached when login is impossible offline");
+  assert.doesNotMatch(source, /^  "\/client\/rootark-login\.js",?$/m, "authentication script is not precached");
   const handlers = {};
   const caches = new Map([["rootark-public-shell-v20", new Map()], ["rootark-public-shell-v25", new Map()]]);
   const cacheValue = (asset) => ({ asset });
@@ -876,6 +880,8 @@ test("service worker caches only the public shell and bypasses protected paths",
   caches.get("rootark-public-shell-v25").set("https://rootark.test/client/rootark-login.js", cacheValue("stale recovery-blocked login js"));
   let skippedWaiting = 0;
   let claimedClients = 0;
+  let online = true;
+  const networkRequests = [];
   const context = {
     URL,
     Promise,
@@ -906,7 +912,12 @@ test("service worker caches only the public shell and bypasses protected paths",
       keys: async () => [...caches.keys()],
       delete: async (name) => caches.delete(name),
     },
-    fetch: async () => { throw new Error("offline cache miss"); },
+    fetch: async (request, options) => {
+      const pathname = new URL(request.url).pathname;
+      networkRequests.push({ pathname, cache: options && options.cache });
+      if (!online) throw new Error("offline cache miss");
+      return cacheValue("network:" + pathname);
+    },
   };
   assert.match(source, /const CACHE_NAME = "rootark-public-shell-v26";/, "new login recovery form and workspace preview evict the previously cached shell");
   const pageAssets = {
@@ -932,7 +943,8 @@ test("service worker caches only the public shell and bypasses protected paths",
   assert.equal(skippedWaiting, 1, "a new worker must activate without waiting for old tabs to close");
   assert.ok(caches.get("rootark-public-shell-v26").has("https://rootark.test/"));
   assert.ok(caches.get("rootark-public-shell-v26").has("https://rootark.test/client/rootark-api.js"));
-  assert.ok(caches.get("rootark-public-shell-v26").has("https://rootark.test/client/rootark-login.js"));
+  assert.equal(caches.get("rootark-public-shell-v26").has("https://rootark.test/login.html"), false);
+  assert.equal(caches.get("rootark-public-shell-v26").has("https://rootark.test/client/rootark-login.js"), false);
   assert.ok(caches.get("rootark-public-shell-v26").has("https://rootark.test/client/rootark-workspace.js"));
   assert.ok(caches.get("rootark-public-shell-v26").has("https://rootark.test/client/rootark-bootstrap.js"));
   assert.ok(caches.get("rootark-public-shell-v26").has("https://rootark.test/client/rootark-protected-index.js"));
@@ -940,6 +952,19 @@ test("service worker caches only the public shell and bypasses protected paths",
   assert.ok(caches.get("rootark-public-shell-v26").has("https://rootark.test/client/rootark-protected-session.js"));
   assert.ok(caches.get("rootark-public-shell-v26").has("https://rootark.test/client/rootark-ui.js"));
   assert.equal([...caches.get("rootark-public-shell-v26").keys()].some((asset) => /^https:\/\/rootark\.test\/(?:auth|api|files|preview|sync|encrypted|groups|folders)(?:\/|$)/i.test(new URL(asset).pathname)), false);
+  for (const requestPath of ["/login.html?returnTo=%2Ffiles", "/client/rootark-login.js?v=17"]) {
+    let fetchResponse;
+    handlers.fetch({ request: { method: "GET", url: "https://rootark.test" + requestPath }, respondWith: (promise) => { fetchResponse = promise; } });
+    assert.ok(fetchResponse, requestPath + " must not fall through to an old cached version");
+    assert.equal((await fetchResponse).asset, "network:" + new URL(requestPath, "https://rootark.test").pathname, "v26 must not read stale login content from v25");
+    online = false;
+    let offlineResponse;
+    handlers.fetch({ request: { method: "GET", url: "https://rootark.test" + requestPath }, respondWith: (promise) => { offlineResponse = promise; } });
+    assert.ok(offlineResponse, requestPath + " must remain network-only offline");
+    await assert.rejects(offlineResponse, /offline cache miss/, requestPath + " must never display cached login forms offline");
+    online = true;
+  }
+  assert.deepEqual(networkRequests, ["/login.html", "/login.html", "/client/rootark-login.js", "/client/rootark-login.js"].map((pathname) => ({ pathname, cache: "no-store" })), "authentication surface fetches bypass CacheStorage and HTTP disk cache");
   let activateWait;
   handlers.activate({ waitUntil: (promise) => { activateWait = promise; } });
   await activateWait;
@@ -949,7 +974,7 @@ test("service worker caches only the public shell and bypasses protected paths",
   const versionedAssets = [...new Set(shellPages.flatMap((page) => {
     const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
     return [...html.matchAll(/<(?:script|link)\b[^>]*(?:src|href)="([^\"]+\?v=\d+)"[^>]*>/g)].map((match) => match[1]);
-  }))];
+  }))].filter((asset) => !asset.startsWith("/client/rootark-login.js?"));
   for (const asset of versionedAssets) {
     let response;
     handlers.fetch({ request: { method: "GET", url: "https://rootark.test" + asset }, respondWith: (promise) => { response = promise; } });
