@@ -5,8 +5,17 @@ function isPublicLinkViewerId(viewerId) {
   return typeof viewerId === "string" && /^[a-f0-9]{32}$/.test(viewerId);
 }
 
+const SHARE_OPERATIONS = ["view", "preview", "download"];
+
+// NULL column = legacy link without an explicit permissions capability (treated as all operations by the server).
+function permissionsToColumn(permissions) {
+  if (!Array.isArray(permissions)) return null;
+  return JSON.stringify(SHARE_OPERATIONS.filter((operation) => permissions.includes(operation)));
+}
+
 function rowToLink(row) {
   const metadata = safeJsonParse(row.metadata_json, {});
+  const storedPermissions = row.permissions_json ? safeJsonParse(row.permissions_json, null) : null;
   return {
     ...metadata,
     fileName: row.file_name,
@@ -17,12 +26,13 @@ function rowToLink(row) {
     maxViews: Number(row.max_views) || 0,
     views: Number(row.views) || 0,
     passwordHash: row.password_hash || metadata.passwordHash || null,
+    ...(Array.isArray(storedPermissions) ? { permissions: storedPermissions } : {}),
   };
 }
 
 function loadPublicLinks() {
   const rows = getDb().prepare(`
-    SELECT token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json
+    SELECT token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json, permissions_json
     FROM public_links
     WHERE revoked_at IS NULL
   `).all();
@@ -49,15 +59,15 @@ function savePublicLinks(entries = {}, options = {}) {
     ensureRootFolder(db);
     const existingRows = db.prepare(`
       SELECT token, folder_id, file_name, created_by, created_at, expires_at,
-        max_views, views, password_hash, metadata_json
+        max_views, views, password_hash, metadata_json, permissions_json
       FROM public_links
       WHERE revoked_at IS NULL
     `).all();
     const existingByToken = new Map(existingRows.map((row) => [row.token, row]));
     const activeTokens = new Set();
     const insert = db.prepare(`
-      INSERT INTO public_links (token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json, revoked_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      INSERT INTO public_links (token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json, permissions_json, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
       ON CONFLICT(token) DO UPDATE SET
         folder_id = excluded.folder_id,
         file_name = excluded.file_name,
@@ -67,6 +77,7 @@ function savePublicLinks(entries = {}, options = {}) {
         views = excluded.views,
         password_hash = excluded.password_hash,
         metadata_json = excluded.metadata_json,
+        permissions_json = excluded.permissions_json,
         revoked_at = NULL
       WHERE public_links.revoked_at IS NULL
     `);
@@ -118,7 +129,8 @@ function savePublicLinks(entries = {}, options = {}) {
         Number(link.maxViews) || 0,
         views,
         link.passwordHash || link.password_hash || null,
-        jsonStringify(mergedLink)
+        jsonStringify(mergedLink),
+        permissionsToColumn(Object.prototype.hasOwnProperty.call(link, "permissions") ? link.permissions : existingLink?.permissions)
       );
     }
 
@@ -129,8 +141,8 @@ function savePublicLinks(entries = {}, options = {}) {
     }
 
     const insertRevoked = db.prepare(`
-      INSERT OR IGNORE INTO public_links (token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json, revoked_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO public_links (token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json, permissions_json, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     for (const [token, link] of Object.entries(options.removedEntries || {})) {
       const fileName = basename(link?.fileName);
@@ -147,6 +159,7 @@ function savePublicLinks(entries = {}, options = {}) {
         Number(link.views) || 0,
         link.passwordHash || link.password_hash || null,
         jsonStringify(link),
+        permissionsToColumn(link.permissions),
         now
       );
     }
@@ -181,8 +194,8 @@ function consumePublicLinkQuota(token, options = {}) {
   return db.transaction(() => {
     const fallbackLinks = options.fallbackLinks && typeof options.fallbackLinks === "object" ? options.fallbackLinks : {};
     const insertFallback = db.prepare(`
-      INSERT OR IGNORE INTO public_links (token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json, revoked_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      INSERT OR IGNORE INTO public_links (token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json, permissions_json, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
     `);
     const now = nowIso();
     for (const [fallbackToken, fallbackLink] of Object.entries(fallbackLinks)) {
@@ -199,13 +212,14 @@ function consumePublicLinkQuota(token, options = {}) {
         Number(fallbackLink.maxViews) || 0,
         Number(fallbackLink.views) || 0,
         fallbackLink.passwordHash || fallbackLink.password_hash || null,
-        jsonStringify(fallbackLink)
+        jsonStringify(fallbackLink),
+        permissionsToColumn(fallbackLink.permissions)
       );
     }
 
     const row = db.prepare(`
       SELECT token, folder_id, file_name, created_by, created_at, expires_at,
-        max_views, views, password_hash, metadata_json
+        max_views, views, password_hash, metadata_json, permissions_json
       FROM public_links
       WHERE token = ? AND revoked_at IS NULL
     `).get(token);

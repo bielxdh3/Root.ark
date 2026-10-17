@@ -1616,6 +1616,24 @@ function removePublicLinksForFolder(folderId) {
   if (changed) savePublicLinks(entries);
 }
 
+const SHARE_OPERATIONS = ["view", "preview", "download"];
+
+// Creation input: absent means all operations (backward compatible); present must be a non-empty, unique subset.
+function normalizeSharePermissionsInput(rawValue) {
+  if (rawValue === undefined || rawValue === null) return [...SHARE_OPERATIONS];
+  if (!Array.isArray(rawValue) || rawValue.length === 0) return null;
+  if (!rawValue.every((item) => typeof item === "string" && SHARE_OPERATIONS.includes(item))) return null;
+  if (new Set(rawValue).size !== rawValue.length) return null;
+  return SHARE_OPERATIONS.filter((operation) => rawValue.includes(operation));
+}
+
+// Stored links without a permissions capability keep the legacy behaviour (all operations); malformed values fail closed.
+function getShareLinkPermissions(link) {
+  if (link?.permissions === undefined || link?.permissions === null) return [...SHARE_OPERATIONS];
+  if (!Array.isArray(link.permissions)) return [];
+  return link.permissions.filter((operation) => SHARE_OPERATIONS.includes(operation));
+}
+
 function getShareExpirationMinutes(rawValue) {
   const minutes = Number(rawValue);
   if (!Number.isFinite(minutes)) return null;
@@ -2125,8 +2143,10 @@ function renderPublicSharePage(token, scriptNonce) {
           data.remainingViews !== null ? '<span class="pill">' + data.remainingViews + ' visualizacoes restantes</span>' : '<span class="pill">Visualizacoes ilimitadas</span>',
           data.remainingDownloads !== null ? '<span class="pill">' + data.remainingDownloads + ' downloads restantes</span>' : '<span class="pill">Downloads ilimitados</span>'
         ].filter(Boolean).join("");
-        previewButton.hidden = !data.canPreview;
-        previewButton.classList.toggle("hidden", !data.canPreview);
+        const allowedOperations = Array.isArray(data.permissions) ? data.permissions : ["view", "preview", "download"];
+        downloadForm.hidden = !allowedOperations.includes("download");
+        previewButton.hidden = !data.canPreview || !allowedOperations.includes("preview");
+        previewButton.classList.toggle("hidden", previewButton.hidden);
         downloadButton.disabled = data.remainingDownloads === 0;
       }
 
@@ -2442,6 +2462,11 @@ async function resolveShareAccess(req, res, token, options = {}) {
     return { status: 410, error: "Link indisponivel." };
   }
 
+  if (options.operation && !getShareLinkPermissions(link).includes(options.operation)) {
+    logShareAudit(req, "share.operation_denied", token, link, options.operation, "failure", { operation: options.operation });
+    return { status: 403, error: "Operacao nao permitida por este link." };
+  }
+
   const passwordHash = link.passwordHash || link.password_hash || null;
   let verifiedPasswordHash = null;
   if (passwordHash && !hasValidSharePasswordSession(req, token, link)) {
@@ -2628,6 +2653,7 @@ function getSharePublicPayload(link, fileInfo, limits) {
     remainingViews: limits.remainingViews,
     remainingDownloads: limits.remainingDownloads,
     canPreview: getPublicShareCanPreview(fileInfo.fileName),
+    permissions: getShareLinkPermissions(link),
   };
 }
 
@@ -11366,6 +11392,7 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
   const maxViews = getShareMaxViews(req.body.maxViews);
   const maxDownloads = getShareMaxDownloads(req.body.maxDownloads);
   const sharePassword = getSharePassword(req.body.password);
+  const sharePermissions = normalizeSharePermissionsInput(req.body.permissions);
   const folder = getReadableFolderOrRespond(req, res, req.body.folderId);
   if (!folder) return;
 
@@ -11397,6 +11424,10 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
 
   if (sharePassword === undefined) {
     return res.status(400).json({ error: "Senha do link deve ter entre 4 e 128 caracteres." });
+  }
+
+  if (!sharePermissions) {
+    return res.status(400).json({ error: "Permissoes do link invalidas. Use uma lista sem repeticao de: view, preview, download." });
   }
 
   if (!hasPublicShareAccess(req, folder, name)) {
@@ -11451,6 +11482,7 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     downloads: 0,
     maxDownloads,
     passwordHash,
+    permissions: sharePermissions,
     activeViewers: {},
   };
   savePublicLinks(links);
@@ -11461,6 +11493,7 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     maxViews,
     maxDownloads,
     passwordProtected: Boolean(passwordHash),
+    permissions: sharePermissions,
   });
   auditLog("share.created", getAuditActor(req), { type: "file", id: name }, "created", "success", {
     folderId: currentFolder.id,
@@ -11469,6 +11502,7 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     maxViews,
     maxDownloads,
     passwordProtected: Boolean(passwordHash),
+    permissions: sharePermissions,
   });
   res.status(201).json({
     token: shareToken,
@@ -11480,6 +11514,7 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     downloads: 0,
     maxDownloads,
     passwordProtected: Boolean(passwordHash),
+    permissions: sharePermissions,
     remainingViews: maxViews > 0 ? maxViews : null,
     remainingDownloads: maxDownloads > 0 ? maxDownloads : null,
   });
@@ -11515,6 +11550,7 @@ app.post("/share/:token/password", shareRateLimit, requireSameOriginPublicShareM
   const access = await resolveShareAccess(req, res, shareToken, {
     password: req.body?.password || "",
     countView: true,
+    operation: "view",
   });
 
   if (access.error) {
@@ -11558,7 +11594,7 @@ app.post("/share/:token/view", shareRateLimit, requireSameOriginPublicShareMutat
   const shareToken = validateShareToken(req.params.token);
   if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
 
-  const access = await resolveShareAccess(req, res, shareToken, { countView: true });
+  const access = await resolveShareAccess(req, res, shareToken, { countView: true, operation: "view" });
   if (access.error) return res.status(access.status || 400).json({ error: access.error, passwordRequired: Boolean(access.passwordRequired) });
 
   res.json({
@@ -11578,6 +11614,7 @@ app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareM
     requireViewer: true,
     countDownload: true,
     deferDownloadReservation: true,
+    operation: "download",
   });
   if (access.error) return res.status(access.status || 400).type("html").send(getShareFailurePage(access.error));
 
@@ -11602,6 +11639,7 @@ app.get("/share/:token/preview", shareRateLimit, requireSameOriginPublicSharePre
     requirePreview: true,
     countDownloadOncePerViewer: true,
     requireDownloadCountedViewer: true,
+    operation: "preview",
   });
   if (access.error) return res.status(access.status || 400).send(access.error);
 
@@ -11620,6 +11658,7 @@ app.post("/share/:token/preview", shareRateLimit, requireSameOriginPublicShareMu
     countDownload: true,
     countDownloadOncePerViewer: true,
     deferDownloadReservation: true,
+    operation: "preview",
   });
   if (access.error) return res.status(access.status || 400).send(access.error);
 
@@ -11658,6 +11697,7 @@ app.post("/share/:token/file", shareRateLimit, requireSameOriginPublicShareMutat
     requireViewer: true,
     countDownload: true,
     deferDownloadReservation: true,
+    operation: "download",
   });
   if (access.error) return res.status(access.status || 400).send(access.error);
 
