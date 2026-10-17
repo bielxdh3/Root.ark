@@ -43,7 +43,7 @@ test("release gate reports a sanitized failing test and skips redundant full tes
     if (args.some((value) => String(value).endsWith("upload-security.test.js"))) {
       return {
         status: 1,
-        stdout: "not ok 7 - a second startup rejects ambiguous quota owner\n  failureType: 'testCodeFailure'\n  error: Upload denied password=synthetic-sensitive-fixture\n",
+        stdout: "not ok 7 - a second startup rejects ambiguous quota owner\n  failureType: 'testCodeFailure'\n  error: Upload denied password=synthetic-sensitive-fixture Authorization: Basic c2Vuc2l0aXZl refresh_token=synthetic-refresh-key access_token=synthetic-access-key\n",
         stderr: "Synthetic diagnostic: bearer test-secret-value\n",
       };
     }
@@ -59,9 +59,9 @@ test("release gate reports a sanitized failing test and skips redundant full tes
   const output = printed.join("\n");
   assert.match(output, /FAIL: Upload security boundary — exit 1/);
   assert.match(output, /a second startup rejects ambiguous quota owner/, "the exact failing test is visible in CI");
-  assert.doesNotMatch(output, /synthetic-sensitive-fixture|test-secret-value/, "raw test output cannot leak fixture secrets");
+  assert.doesNotMatch(output, /synthetic-sensitive-fixture|test-secret-value|c2Vuc2l0aXZl|synthetic-refresh-key|synthetic-access-key/, "raw test output cannot leak any fixture secrets");
   assert.match(output, /\[REDACTED\]/, "sensitive diagnostic text is redacted rather than silently dropped");
-  assert.equal(calls.some(({ args }) => args.includes("test")), false, "no expensive canonical npm test after an earlier hard failure");
+  assert.equal(calls.some(({ args }) => /(?:^|\s)(?:npm(?:\.cmd)?\s+test|test(?:\s|$))/.test(args.join(" "))), false, "no expensive canonical npm test after an earlier hard failure on Windows or POSIX");
   assert.equal(simulatedProcess.exitCode, 1, "the gate still fails closed");
 });
 

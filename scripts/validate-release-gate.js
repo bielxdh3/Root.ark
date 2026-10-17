@@ -20,8 +20,8 @@ function failedTestDiagnostics(output) {
     .filter((line) => /^(?:not ok \d+ - |[✖✗×] |error:|failureType:|location:)/.test(line))
     .slice(-20)
     .map((line) => line
-      .replace(/\bBearer\s+\S+/gi, "Bearer [REDACTED]")
-      .replace(/\b(?:password|secret|token|cookie|authorization|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s;,]+)/gi, "[REDACTED]")
+      .replace(/\b(?:Bearer|Basic)\s+\S+/gi, "[REDACTED]")
+      .replace(/\b(?:password|passphrase|client_secret|refresh_token|access_token|id_token|secret|token|cookie|authorization|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s;,]+)/gi, "[REDACTED]")
       .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[REDACTED]")
       .slice(0, 240))
     .join("\n").slice(0, 3000);
