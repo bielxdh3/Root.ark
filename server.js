@@ -2462,6 +2462,11 @@ async function resolveShareAccess(req, res, token, options = {}) {
     return { status: 410, error: "Link indisponivel." };
   }
 
+  if (options.requireAnyOperation && getShareLinkPermissions(link).length === 0) {
+    logShareAudit(req, "share.operation_denied", token, link, "password", "failure", { operation: "any" });
+    return { status: 403, error: "Operacao nao permitida por este link." };
+  }
+
   if (options.operation && !getShareLinkPermissions(link).includes(options.operation)) {
     logShareAudit(req, "share.operation_denied", token, link, options.operation, "failure", { operation: options.operation });
     return { status: 403, error: "Operacao nao permitida por este link." };
@@ -11550,7 +11555,7 @@ app.post("/share/:token/password", shareRateLimit, requireSameOriginPublicShareM
   const access = await resolveShareAccess(req, res, shareToken, {
     password: req.body?.password || "",
     countView: true,
-    operation: "view",
+    requireAnyOperation: true,
   });
 
   if (access.error) {

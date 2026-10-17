@@ -208,6 +208,33 @@ for (const mode of ["json", "sqlite"]) {
       assert.equal(getPreview.body.includes(FILE_CONTENT), false);
     });
 
+    await t.test("password-protected download-only link unlocks via /password, allows download and denies view", async () => {
+      const sharePassword = "unlock-pass-68";
+      const created = await authed("/share", { name: FILE_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["download"], password: sharePassword });
+      assert.equal(created.status, 201, created.body);
+      const { token } = JSON.parse(created.body);
+      assert.deepEqual(JSON.parse(created.body).permissions, ["download"]);
+
+      const denied = await publicPost(token, "view");
+      assert.equal(denied.status, 403, "view is denied before the password step");
+      assert.ok(denied.body.includes(DENIED));
+
+      const payload = JSON.stringify({ password: sharePassword });
+      const unlock = await request(port, `/share/${token}/password`, {
+        method: "POST",
+        headers: { origin, "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
+        body: payload,
+      });
+      assert.equal(unlock.status, 200, unlock.body);
+      assert.deepEqual(JSON.parse(unlock.body).permissions, ["download"]);
+      const sessionCookie = viewerCookieFrom(unlock);
+      assert.ok(sessionCookie.length > 0, "unlock issues a share session");
+
+      const download = await publicPost(token, "download", sessionCookie);
+      assert.equal(download.status, 200, download.body);
+      assert.equal(download.body, FILE_CONTENT);
+    });
+
     await t.test("download-only link denies view without leaking the file", async () => {
       const created = await authed("/share", { name: FILE_NAME, folderId: "root", expiresInMinutes: 60, permissions: ["download"] });
       assert.equal(created.status, 201, created.body);
