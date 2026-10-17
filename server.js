@@ -1401,21 +1401,33 @@ async function authenticateWebDavRequest(req, res) {
     return sendWebDavUnauthorized(req, res, parseFailure);
   }
 
-  const user = cachedUser;
+  let user = cachedUser;
+  const snapshot = user ? { password: String(user.password || ""), sessionVersion: user.sessionVersion || 0 } : null;
   let reservation = null;
   let passwordOk = credentialVerified;
   if (!credentialVerified) {
     const pending = webDavCredentialCache.getInflight(credentialKey);
     if (pending && user && !user.disabled) {
       // Coalesce with the in-flight compare for identical credentials; no extra reservation.
-      passwordOk = await pending.catch(() => false) && webDavCredentialCache.isVerified(credentialKey, user);
+      passwordOk = await pending;
     } else {
       // Reserve the attempt synchronously before the async compare so concurrent requests count toward the limits.
       reservation = reserveLoginAttempt(security);
       if (user && !user.disabled) {
-        const compare = bcrypt.compare(password, String(user.password || "")).then(Boolean, () => false);
-        webDavCredentialCache.setInflight(credentialKey, compare.then((ok) => { if (ok) webDavCredentialCache.remember(credentialKey, user); return ok; }));
-        passwordOk = await webDavCredentialCache.getInflight(credentialKey);
+        const compare = bcrypt.compare(password, snapshot.password).then(Boolean, () => false);
+        webDavCredentialCache.setInflight(credentialKey, compare);
+        passwordOk = await compare;
+      }
+    }
+    // Re-validate against fresh data after every await: still exists, enabled, same password hash and sessionVersion.
+    if (passwordOk) {
+      const current = loadUsers().find((entry) => sameUsername(entry.username, username));
+      const unchanged = Boolean(current) && !current.disabled && String(current.password || "") === snapshot.password && (current.sessionVersion || 0) === snapshot.sessionVersion;
+      if (unchanged) {
+        user = current;
+        webDavCredentialCache.remember(credentialKey, current);
+      } else {
+        passwordOk = false;
       }
     }
   }
@@ -6043,6 +6055,13 @@ function isAdminEscalationBlocked(req, role, targetUser = null) {
   return role === "admin" || targetUser?.role === "admin";
 }
 
+// Fresh-record re-check of the acting user after an async step: exists, enabled, same sessionVersion, still manageUsers.
+function getFreshUserManager(req, users) {
+  const actor = users.find((entry) => entry.username === req.user?.username);
+  if (!actor || actor.disabled || (actor.sessionVersion || 0) !== (req.user?.sessionVersion || 0)) return null;
+  return normalizeUserPermissions(actor).manageUsers ? actor : null;
+}
+
 app.post("/users", authenticate, requirePermission("manageUsers"), async (req, res) => {
   const { username, password, role, permissions } = req.body;
   if (!username || !password) {
@@ -6059,8 +6078,13 @@ app.post("/users", authenticate, requirePermission("manageUsers"), async (req, r
     return res.status(409).json({ error: "Usuario ja existe" });
   }
   const passwordHash = await bcrypt.hash(String(password), 10);
-  // Re-load after the async hash so concurrent user changes are not lost.
+  // Re-load after the async hash so concurrent user changes are not lost, and re-check the actor.
   const users = loadUsers();
+  const freshActor = getFreshUserManager(req, users);
+  if (!freshActor) return res.status(403).json({ error: "Permissao negada" });
+  if (freshActor.role !== "admin" && role === "admin") {
+    return res.status(403).json({ error: "Somente administradores podem criar administradores" });
+  }
   if (users.find((u) => u.username === username)) {
     return res.status(409).json({ error: "Usuario ja existe" });
   }
@@ -6112,9 +6136,11 @@ app.put("/users/:username", authenticate, requirePermission("manageUsers"), asyn
     passwordHash = await bcrypt.hash(String(password), 10);
     // Re-load after the async hash and re-validate so concurrent user changes are not lost.
     users = loadUsers();
+    const freshActor = getFreshUserManager(req, users);
+    if (!freshActor) return res.status(403).json({ error: "Permissao negada" });
     idx = users.findIndex((u) => u.username === req.params.username);
     if (idx === -1) return res.status(404).json({ error: "Usuario nao encontrado" });
-    if (isAdminEscalationBlocked(req, req.body.role, users[idx])) {
+    if (freshActor.role !== "admin" && (req.body.role === "admin" || users[idx].role === "admin")) {
       return res.status(403).json({ error: "Somente administradores podem alterar administradores" });
     }
   }

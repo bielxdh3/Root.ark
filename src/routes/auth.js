@@ -222,12 +222,20 @@ function registerAuthRoutes(app, context) {
     }
 
     const users = loadUsers();
-    const user = users.find((u) => u.username === username && !u.disabled);
+    let user = users.find((u) => u.username === username && !u.disabled);
     const passwordHash = user?.password || DUMMY_PASSWORD_HASH;
     // Reserve the attempt synchronously (no await since getLoginRejection) so concurrent requests count toward the limits.
     const reservation = reserveLoginAttempt(security);
+    const verifiedSessionVersion = user ? (user.sessionVersion || 0) : 0;
     let passwordMatches = false;
     try { passwordMatches = await bcrypt.compare(String(password), passwordHash); } catch { passwordMatches = false; }
+
+    // Re-validate against fresh data after the await: the account must still exist, be enabled and keep the same credentials.
+    if (user && passwordMatches) {
+      const current = loadUsers().find((u) => u.username === username && !u.disabled);
+      passwordMatches = Boolean(current) && current.password === passwordHash && (current.sessionVersion || 0) === verifiedSessionVersion;
+      user = passwordMatches ? current : null;
+    }
 
     if (!user || !passwordMatches) {
       reservation.failure();
@@ -387,6 +395,8 @@ function registerAuthRoutes(app, context) {
     let users = loadUsers();
     let user = users.find((entry) => entry.username === req.user.username);
     if (!verificationRateLimit(req, user?.username)) return genericTotpFailure(res, 429);
+    const verifiedHash = user?.password;
+    const verifiedVersion = user?.sessionVersion || 0;
     let passwordOk = false;
     try { passwordOk = await bcrypt.compare(String(req.body?.password || ""), user?.password || DUMMY_PASSWORD_HASH); } catch { passwordOk = false; }
     if (!user?.totpEnabled || !passwordOk) return genericTotpFailure(res);
@@ -396,7 +406,7 @@ function registerAuthRoutes(app, context) {
       if (!proof) return genericTotpFailure(res);
       const freshUsers = loadUsers();
       const freshUser = freshUsers.find((entry) => entry.username === user.username);
-      if (!freshUser?.totpEnabled || !commitTotpProof(freshUser, proof)) return genericTotpFailure(res);
+      if (!freshUser?.totpEnabled || freshUser.disabled || freshUser.password !== verifiedHash || (freshUser.sessionVersion || 0) !== verifiedVersion || !commitTotpProof(freshUser, proof)) return genericTotpFailure(res);
       user = freshUser;
       users = freshUsers;
       user.totpEnabled = false;
@@ -427,11 +437,19 @@ function registerAuthRoutes(app, context) {
     const totpPolicy = getRuntimeTotpPolicy(res);
     if (!totpPolicy) return;
     if (!verificationRateLimit(req, actor?.username)) return genericTotpFailure(res, 429);
+    const actorVersion = actor?.sessionVersion || 0;
     let proof;
     try { proof = await requireAdminReauthentication(actor, req.body, actor?.totpEnabled ? totpKey() : null, bcrypt); } catch { proof = null; }
     const freshUsers = loadUsers();
     const freshActor = freshUsers.find((entry) => entry.username === req.user.username);
     const freshTarget = freshUsers.find((entry) => entry.username === req.params.username);
+    // Re-check authorization on the fresh records after the async re-authentication.
+    if (proof && (!freshActor || freshActor.disabled || (freshActor.sessionVersion || 0) !== actorVersion || !normalizeUserPermissions(freshActor).manageUsers)) {
+      return sensitiveAuthResponse(res).status(403).json({ error: "Permissao negada" });
+    }
+    if (proof && freshTarget && freshTarget.role === "admin" && freshActor.role !== "admin") {
+      return sensitiveAuthResponse(res).status(403).json({ error: "Somente administradores podem alterar administradores" });
+    }
     if (!proof || !freshActor || !freshTarget || !commitTotpProof(freshActor, proof)) {
       auditLog("auth.2fa.admin_reset", getAuditActor(req), { type: "user", id: user.username }, "reset", "failure", { reason: "reauthentication_failed" });
       return genericTotpFailure(res);

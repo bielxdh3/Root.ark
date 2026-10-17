@@ -21,13 +21,13 @@ function response() {
   };
 }
 
-function createHarness(users) {
+function createHarness(users, { onCompare } = {}) {
   const routes = new Map();
   const app = { post(path, ...h) { routes.set(`POST ${path}`, h); }, get(path, ...h) { routes.set(`GET ${path}`, h); } };
   const key = Buffer.alloc(32, 7);
   const stats = { compareCalls: 0, compareSyncCalls: 0 };
   const countingBcrypt = {
-    compare: (...args) => { stats.compareCalls += 1; return bcrypt.compare(...args); },
+    compare: async (...args) => { stats.compareCalls += 1; const result = await bcrypt.compare(...args); if (onCompare) onCompare(); return result; },
     compareSync: (...args) => { stats.compareSyncCalls += 1; return bcrypt.compareSync(...args); },
   };
   registerAuthRoutes(app, {
@@ -47,8 +47,8 @@ function createHarness(users) {
     requirePermission: () => (_req, _res, next) => next(),
     sessionCookieOptions: { httpOnly: true },
   });
-  async function call(path, body, ip) {
-    const req = { body, headers: {}, method: "POST", path, ip, params: {} };
+  async function call(path, body, ip, extra = {}) {
+    const req = { body, headers: {}, method: "POST", path, ip, params: {}, ...extra };
     const res = response();
     for (const handler of routes.get(`POST ${path}`)) await handler(req, res, () => {});
     return res;
@@ -177,12 +177,14 @@ async function withDavServer(fn) {
   try { fs.symlinkSync(path.join(ROOT, "public"), path.join(dir, "public"), "junction"); } catch {}
   const port = await freePort();
   const env = { ...process.env, NODE_ENV: "test", PORT: String(port), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", WEBDAV_ENABLED: "true", LOGIN_DELAY_BASE: "0", UPLOAD_SCAN_ENABLED: "false", CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env, stdio: "ignore", windowsHide: true });
+  const hook = path.join(dir, "hook.js");
+  fs.writeFileSync(hook, `const fs=require("fs");const b=require(${JSON.stringify(path.join(ROOT, "node_modules", "bcryptjs"))});const c=b.compare;b.compare=async function(...a){const r=await c.apply(this,a);const t=${JSON.stringify(path.join(dir, "mutate.json"))};if(fs.existsSync(t)){fs.writeFileSync(${JSON.stringify(path.join(dir, "data", "users.local.json"))},fs.readFileSync(t));fs.unlinkSync(t);}return r;};`);
+  const child = spawn(process.execPath, ["-r", hook, path.join(ROOT, "server.js")], { cwd: dir, env, stdio: "ignore", windowsHide: true });
   try {
     for (let i = 0; i < 150; i += 1) {
       try { await new Promise((res, rej) => { http.get({ host: "127.0.0.1", port, path: "/login.html", agent: false }, (r) => { r.resume(); r.on("end", res); }).once("error", rej); }); break; } catch { await new Promise((r) => setTimeout(r, 40)); }
     }
-    await fn({ port, writeUsers, localUsers: path.join(dir, "data", "users.local.json") });
+    await fn({ port, writeUsers, localUsers: path.join(dir, "data", "users.local.json"), dir });
   } finally {
     await new Promise((resolve) => { if (child.exitCode !== null) return resolve(); child.once("exit", resolve); child.kill(); });
     fs.rmSync(dir, { recursive: true, force: true });
@@ -210,5 +212,76 @@ test("WebDAV credential cache is invalidated immediately by password change and 
     assert.equal(await dav(port, basic("agent", "new-password-value")), 207);
     writeUsers({ disabled: true }, "new-password-value", localUsers);
     assert.equal(await dav(port, basic("agent", "new-password-value")), 401);
+  });
+});
+
+// ---- Post-await revalidation regressions ----
+test("login: account disabled or password changed while bcrypt.compare is in flight is rejected", async () => {
+  await withEnv({ LOGIN_DELAY_BASE: "0", TOTP_POLICY: "optional" }, async () => {
+    for (const mutate of [(u) => { u.disabled = true; }, (u) => { u.password = bcrypt.hashSync("another-password", 4); }]) {
+      const name = `c203e${++counter}`;
+      const users = [{ username: name, password: bcrypt.hashSync("right-password", 4), role: "user", permissions: {}, sessionVersion: 0 }];
+      const harness = createHarness(users, { onCompare: () => mutate(users[0]) });
+      const res = await harness.call("/auth/login", { username: name, password: "right-password" }, `10.208.0.${counter}`);
+      assert.equal(res.code, 401);
+      assert.equal(res.body?.token, undefined);
+    }
+  });
+});
+
+function adminHarness(users, onCompare) {
+  const harness = createHarness(users, { onCompare });
+  const reset = (actorName, targetName) => harness.call("/users/:username/2fa/reset", { password: "password" }, `10.209.0.${++counter}`, {
+    user: { username: actorName, role: users.find((u) => u.username === actorName).role, sessionVersion: 0 },
+    params: { username: targetName },
+  });
+  return { harness, reset };
+}
+const mkUser = (username, role, permissions = {}) => ({ username, password: bcrypt.hashSync("password", 4), role, permissions, sessionVersion: 0 });
+
+test("2FA reset: actor losing manageUsers during reauthentication gets 403 and target is untouched", async () => {
+  await withEnv({ TOTP_POLICY: "optional" }, async () => {
+    const users = [mkUser("mgr203", "user", { manageUsers: true }), mkUser("target203", "user")];
+    users[1].totpEnabled = true; users[1].totpRecoveryHashes = ["x"];
+    const { reset } = adminHarness(users, () => { users[0].permissions = { manageUsers: false }; });
+    const res = await reset("mgr203", "target203");
+    assert.equal(res.code, 403);
+    assert.equal(users[1].totpEnabled, true);
+  });
+});
+
+test("2FA reset: target promoted to admin during reauthentication by a non-admin gets 403", async () => {
+  await withEnv({ TOTP_POLICY: "optional" }, async () => {
+    const users = [mkUser("mgr203b", "user", { manageUsers: true }), mkUser("target203b", "user")];
+    users[1].totpEnabled = true; users[1].totpRecoveryHashes = ["x"];
+    const { reset } = adminHarness(users, () => { users[1].role = "admin"; });
+    const res = await reset("mgr203b", "target203b");
+    assert.equal(res.code, 403);
+    assert.equal(users[1].totpEnabled, true);
+  });
+});
+
+test("2FA reset still succeeds when nothing changes during reauthentication", async () => {
+  await withEnv({ TOTP_POLICY: "optional" }, async () => {
+    const users = [mkUser("mgr203c", "user", { manageUsers: true }), mkUser("target203c", "user")];
+    users[1].totpEnabled = true; users[1].totpRecoveryHashes = ["x"];
+    const { reset } = adminHarness(users);
+    assert.equal((await reset("mgr203c", "target203c")).code, 200);
+    assert.equal(users[1].totpEnabled, false);
+  });
+});
+
+test("WebDAV: user disabled or password changed while bcrypt.compare is in flight is rejected and not cached", { timeout: 60_000 }, async () => {
+  await withDavServer(async ({ port, writeUsers, localUsers, dir }) => {
+    const trigger = path.join(dir, "mutate.json");
+    for (const mutated of [{ disabled: true }, { password: bcrypt.hashSync("changed-password", 4) }]) {
+      writeUsers({}, "password", localUsers);
+      fs.writeFileSync(trigger, JSON.stringify([{ username: "agent", role: "admin", permissions: { upload: true }, sessionVersion: 0, password: bcrypt.hashSync("password", 4), ...mutated }]));
+      assert.equal(await dav(port, basic("agent", "password")), 401);
+      assert.equal(fs.existsSync(trigger), false, "mutation hook must have fired");
+      // Not cached: with the original account restored the next request still needs (and passes) a fresh compare.
+      writeUsers({}, "password", localUsers);
+      assert.equal(await dav(port, basic("agent", "password")), 207);
+    }
   });
 });
