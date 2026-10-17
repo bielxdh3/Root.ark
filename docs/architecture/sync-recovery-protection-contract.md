@@ -71,11 +71,12 @@ Implemented: `src/services/syncBurstGuard.js` and the sync route in `src/routes/
 - Destructive operations are deletes/tombstones and any non-create operation that replaces an existing object (this includes `move`). The guard uses only username, opaque `deviceId`, and the operation kind.
 - Thresholds: `SYNC_BURST_MAX_DESTRUCTIVE` (default 200) per `SYNC_BURST_WINDOW_MS` (default 600000). Invalid values fall back to defaults. Memory is bounded by `SYNC_BURST_MAX_KEYS` (default 5000) and at most limit+1 timestamps per key.
 - The operation that exceeds the limit is not applied. The device is paused in the persisted sync store (`users[name].pausedDevices`), so the pause survives restart. Further destructive operations from that device return HTTP 423 with `error`/`code` `sync_burst_paused`. Reads and creates remain allowed. Replays do not clear the pause.
-- Resume: `POST /sync/v1/devices/:deviceId/resume`, using the same `authenticate` and `requirePermission("upload")` as sibling sync writes. It clears the pause and the device counter and emits `sync.device.resumed`. Pauses emit `sync.burst.paused`.
+- Resume: `POST /sync/v1/devices/:deviceId/resume` requires the account password in the body, checked with `bcrypt.compare` against the stored hash. Five failed attempts per user within 15 minutes (in-memory) return 429. A body `deviceId` equal to the paused device returns 403. A successful resume clears the pause and the device counter and emits `sync.device.resumed`. Pauses emit `sync.burst.paused`; failed re-auth emits `sync.device.resume.failed`.
 
 Known gaps (not implemented in step 1):
 - Protected recovery points are not implemented. Per-object history is still capped at 32 versions and trimmed by ordinary writes. A paused device cannot trigger that trimming, but there is no protected retention window, quota, or hold.
 - No device listing route exists in the sync router, so no `paused` field was added to a listing. The device registry is external (`SYNC_DEVICE_REGISTRY`).
 - The counter is in-memory and resets on restart. A pause is persisted. Device identity comes from the client-supplied `deviceId`, so it is only a boundary when device authorization is enabled.
-- Resume authority is the same session as sibling writes. The contract requires a decision on whether a compromised device could resume itself.
+- TOTP is not checked on resume. The auth route's 2FA helper is not exported, so resume uses password-only re-auth. Users with TOTP enabled are protected only by the password here. Adding a TOTP proof is a follow-up.
+- The self-resume check trusts the body `deviceId`. A compromised device that omits or forges it is not caught by that check. The password requirement is the real barrier.
 - Pause scope is per (user, device), not per the account-wide scope the contract describes.

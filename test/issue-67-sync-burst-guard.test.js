@@ -92,13 +92,22 @@ function jsonRequest(port, requestPath, method, value) {
   return request(port, requestPath, { method, headers, body });
 }
 
+const PASSWORD = "correct-horse-battery";
+const bcrypt = require("bcryptjs");
+const ALICE_HASH = bcrypt.hashSync(PASSWORD, 4);
+
+function resumeRequest(port, body = { password: PASSWORD }) {
+  return jsonRequest(port, "/sync/v1/devices/device-a/resume", "POST", body);
+}
+
 async function startServer(t, { storagePath, burstGuard, auditEvents = [] }) {
   const app = express();
   app.use("/sync/v1", express.json({ limit: "9mb" }));
   const authenticate = (req, _res, next) => { req.user = { username: "alice", role: "user" }; next(); };
   const requirePermission = () => (_req, _res, next) => next();
   const auditLog = (eventType, actor, target, action, result, details) => auditEvents.push({ eventType, actor, target, action, result, details });
-  const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath, burstGuard, auditLog });
+  const loadUsers = () => [{ username: "alice", password: ALICE_HASH }];
+  const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath, burstGuard, auditLog, bcrypt, loadUsers });
   const server = await new Promise((resolve) => { const value = app.listen(0, "127.0.0.1", () => resolve(value)); });
   t.after(async () => { await new Promise((resolve) => server.close(resolve)); });
   await route.ready;
@@ -180,17 +189,55 @@ test("issue 67 route: pause survives restart and resume lifts it without touchin
   assert.equal((await jsonRequest(restarted.port, "/sync/v1/objects/object-3", "DELETE", deleteFor(3, created[2], key))).status, 423);
   assert.equal((await request(restarted.port, "/sync/v1/objects/object-2", { method: "GET" })).status, 200);
 
-  // Resume is an owner action and leaves current data untouched.
-  const resumed = await jsonRequest(restarted.port, "/sync/v1/devices/device-a/resume", "POST");
+  // Resume needs re-authentication and leaves current data untouched.
+  const resumed = await resumeRequest(restarted.port);
   assert.equal(resumed.status, 200);
   assert.equal(resumed.body.paused, false);
   assert.equal(resumed.body.wasPaused, true);
   assert.equal(auditEvents.some((event) => event.eventType === "sync.device.resumed"), true);
   assert.equal((await request(restarted.port, "/sync/v1/objects/object-2", { method: "GET" })).status, 200);
   // Resume is idempotent.
-  assert.equal((await jsonRequest(restarted.port, "/sync/v1/devices/device-a/resume", "POST")).body.wasPaused, false);
+  assert.equal((await resumeRequest(restarted.port)).body.wasPaused, false);
   // After resume the device can perform destructive operations again.
   assert.equal((await jsonRequest(restarted.port, "/sync/v1/objects/object-3", "DELETE", deleteFor(3, created[2], key))).status, 200);
+});
+
+test("issue 67 resume: re-authentication is required and the paused device cannot resume itself", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-reauth-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const storagePath = path.join(dir, "objects.json");
+  const key = crypto.randomBytes(32);
+  const auditEvents = [];
+  const created = [1, 2].map((index) => createFor(index, key));
+  const { port } = await startServer(t, { storagePath, burstGuard: createSyncBurstGuard({ maxDestructive: 1, windowMs: 600000, env: {} }), auditEvents });
+  for (const operation of created) assert.equal((await jsonRequest(port, "/sync/v1/objects", "POST", operation)).status, 201);
+  assert.equal((await jsonRequest(port, "/sync/v1/objects/object-1", "DELETE", deleteFor(1, created[0], key))).status, 200);
+  assert.equal((await jsonRequest(port, "/sync/v1/objects/object-2", "DELETE", deleteFor(2, created[1], key))).status, 423);
+
+  // Missing password is a client error and does not change the pause.
+  assert.equal((await resumeRequest(port, {})).status, 400);
+  // Wrong password is rejected.
+  const wrong = await resumeRequest(port, { password: "not-the-password" });
+  assert.equal(wrong.status, 401);
+  // The paused device cannot resume itself, even with the correct password.
+  const self = await resumeRequest(port, { password: PASSWORD, deviceId: "device-a" });
+  assert.equal(self.status, 403);
+  assert.equal((await jsonRequest(port, "/sync/v1/objects/object-2", "DELETE", deleteFor(2, created[1], key))).status, 423);
+  // Correct password from another context (a different device identifies itself) succeeds.
+  const other = await resumeRequest(port, { password: PASSWORD, deviceId: "device-b" });
+  assert.equal(other.status, 200);
+  assert.equal(other.body.wasPaused, true);
+  assert.equal((await jsonRequest(port, "/sync/v1/objects/object-2", "DELETE", deleteFor(2, created[1], key))).status, 200);
+  assert.ok(auditEvents.some((event) => event.eventType === "sync.device.resume.failed"));
+});
+
+test("issue 67 resume: five wrong passwords in 15 minutes lock resume for the user", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-limit-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const { port } = await startServer(t, { storagePath: path.join(dir, "objects.json"), burstGuard: createSyncBurstGuard({ env: {} }) });
+  for (let i = 0; i < 5; i += 1) assert.equal((await resumeRequest(port, { password: "wrong" })).status, 401);
+  const limited = await resumeRequest(port, { password: PASSWORD });
+  assert.equal(limited.status, 429);
 });
 
 test("issue 67 store: a paused device is blocked at the store boundary and history is not trimmed by rejected operations", async (t) => {
