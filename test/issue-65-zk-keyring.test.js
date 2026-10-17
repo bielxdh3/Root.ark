@@ -9,10 +9,11 @@ const gen = () => z.hpkeSuite().kem.generateKeyPair();
 const ctx = (m, deviceId, epoch, extra = {}) => ({ accountId: m.account_id, deviceId, epoch, ...extra });
 const rejects = (promise, code) => assert.rejects(promise, (e) => e instanceof z.RootarkZkError && (!code || e.code === code));
 const throwsCode = (fn, code) => assert.throws(fn, (e) => e instanceof z.RootarkZkError && (!code || e.code === code));
+const opts = (m, extra = {}) => ({ expectedAccountId: m.account_id, ...extra });
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
 async function setup() {
-  const ring = k.createAccountKeyring();
+  const ring = await k.createAccountKeyring();
   const a = await gen();
   const b = await gen();
   const wa = await k.enrollDevice(ring, a.publicKey, "dev-a");
@@ -29,11 +30,11 @@ test("create and enroll: device opens epoch 1 key; manifest has no secrets", asy
   const json = JSON.stringify(m);
   assert.ok(!json.includes(ring.rootKey.toString("base64url")));
   assert.ok(!json.includes(ring.epochKeys[0].key.toString("base64url")));
-  assert.deepEqual(Object.keys(m).sort(), ["account_id", "current_epoch", "devices", "epochs", "suite", "type", "version", "wraps"]);
+  assert.deepEqual(Object.keys(m).sort(), ["account_id", "current_epoch", "devices", "epochs", "mac", "suite", "type", "version", "wraps"]);
 });
 
 test("enroll accepts raw 32-byte public key and rejects bad input and duplicates", async () => {
-  const ring = k.createAccountKeyring();
+  const ring = await k.createAccountKeyring();
   const a = await gen();
   const raw = Buffer.from(await z.hpkeSuite().kem.serializePublicKey(a.publicKey));
   const wrap = await k.enrollDevice(ring, raw, "dev-a");
@@ -53,7 +54,7 @@ test("openEpochKey rejects wrong key, device, epoch, account, and tampering", as
   // relabelled wrap: claims another epoch/device, AAD binding must still fail
   await rejects(k.openEpochKey({ ...wa, epoch: 2 }, a.privateKey, ctx(m, "dev-a", 2)));
   await rejects(k.openEpochKey({ ...wa, device_id: "dev-b" }, a.privateKey, ctx(m, "dev-b", 1)));
-  const other = k.createAccountKeyring();
+  const other = await k.createAccountKeyring();
   await rejects(k.openEpochKey(wa, a.privateKey, ctx(other.manifest, "dev-a", 1)));
   const ct = Buffer.from(wa.ciphertext, "base64url");
   ct[0] ^= 1;
@@ -75,14 +76,14 @@ test("revoke rotates epoch: revoked device cannot open new key, remaining opens 
   assert.deepEqual(m.epochs, [1, 2]);
   assert.equal(m.devices.find((d) => d.device_id === "dev-a").revoked_at_epoch, 2);
 
-  const newKey = await k.openEpochKeyFromManifest(m, b.privateKey, "dev-b", 2);
-  const oldKey = await k.openEpochKeyFromManifest(m, b.privateKey, "dev-b", 1);
+  const newKey = await k.openEpochKeyFromManifest(m, b.privateKey, "dev-b", 2, opts(m));
+  const oldKey = await k.openEpochKeyFromManifest(m, b.privateKey, "dev-b", 1, opts(m));
   assert.deepEqual(newKey, ring.epochKeys[1].key);
   assert.deepEqual(oldKey, ring.epochKeys[0].key);
   assert.notDeepEqual(newKey, oldKey);
 
   // revoked device: no epoch-2 wrap exists; reusing another device's wrap fails scope/AAD
-  await rejects(k.openEpochKeyFromManifest(m, a.privateKey, "dev-a", 2), "WRAP_NOT_FOUND");
+  await rejects(k.openEpochKeyFromManifest(m, a.privateKey, "dev-a", 2, opts(m)), "WRAP_NOT_FOUND");
   await rejects(k.openEpochKey(rev.wraps[0], a.privateKey, ctx(m, "dev-a", 2)), "WRAP_SCOPE_MISMATCH");
   await rejects(k.openEpochKey({ ...rev.wraps[0], device_id: "dev-a" }, a.privateKey, ctx(m, "dev-a", 2)));
   await rejects(k.openEpochKey({ ...rev.wraps[0], device_id: "dev-a" }, a.privateKey, ctx(m, "dev-a", 2, { revokedAtEpoch: 2 })), "DEVICE_REVOKED");
@@ -100,10 +101,10 @@ test("enrollment after rotation is non-retroactive; epoch list stays explicit", 
   await k.revokeDevice(ring, "dev-b");
   const m = k.exportManifest(ring);
   assert.deepEqual(m.epochs, [1, 2, 3]);
-  assert.deepEqual(await k.openEpochKeyFromManifest(m, c.privateKey, "dev-c", 3), ring.epochKeys[2].key);
-  await rejects(k.openEpochKeyFromManifest(m, c.privateKey, "dev-c", 1), "WRAP_NOT_FOUND");
-  await rejects(k.openEpochKeyFromManifest(m, b.privateKey, "dev-b", 3), "WRAP_NOT_FOUND");
-  assert.deepEqual(await k.openEpochKeyFromManifest(m, b.privateKey, "dev-b", 2), ring.epochKeys[1].key);
+  assert.deepEqual(await k.openEpochKeyFromManifest(m, c.privateKey, "dev-c", 3, opts(m)), ring.epochKeys[2].key);
+  await rejects(k.openEpochKeyFromManifest(m, c.privateKey, "dev-c", 1, opts(m)), "WRAP_NOT_FOUND");
+  await rejects(k.openEpochKeyFromManifest(m, b.privateKey, "dev-b", 3, opts(m)), "WRAP_NOT_FOUND");
+  await rejects(k.openEpochKeyFromManifest(m, b.privateKey, "dev-b", 2, opts(m)), "WRAP_NOT_FOUND");
 });
 
 test("validateManifest accepts a valid manifest and survives JSON round trip", async () => {
@@ -174,4 +175,73 @@ test("validateManifest rejects prototype-polluting keys at any depth", async () 
   const parsed = JSON.parse('{"__proto__":{"polluted":true},' + JSON.stringify(m).slice(1));
   throwsCode(() => k.validateManifest(parsed), "INVALID_MAP_KEY");
   assert.equal({}.polluted, undefined);
+});
+
+test("manifest MAC: injected device and modified wrap list fail verification", async () => {
+  const { ring, b } = await setup();
+  const m = k.exportManifest(ring);
+  assert.ok(await k.openEpochKeyFromManifest(m, b.privateKey, "dev-b", 1, opts(m)));
+  // server injects an attacker device with a structurally valid wrap
+  const evil = await gen();
+  const attacker = await k.createAccountKeyring();
+  const evilWrap = await k.enrollDevice(attacker, evil.publicKey, "evil");
+  const injected = clone(m);
+  injected.devices.push({ device_id: "evil", public_key: attacker.manifest.devices[0].public_key, enrolled_epoch: 1, revoked_at_epoch: null });
+  injected.wraps.push({ ...evilWrap });
+  assert.doesNotThrow(() => k.validateManifest(injected));
+  await rejects(k.openEpochKeyFromManifest(injected, b.privateKey, "dev-b", 1, opts(m)), "MANIFEST_MAC_INVALID");
+  // modified wrap list: swap a wrap ciphertext from another device
+  const c = await gen();
+  await k.enrollDevice(ring, c.publicKey, "dev-c");
+  const m2 = k.exportManifest(ring);
+  const swapped = clone(m2);
+  swapped.wraps = swapped.wraps.slice().reverse();
+  await rejects(k.openEpochKeyFromManifest(swapped, b.privateKey, "dev-b", 1, opts(m2)), "MANIFEST_MAC_INVALID");
+  const dropped = clone(m2);
+  dropped.wraps = dropped.wraps.filter((w) => w.device_id !== "dev-a");
+  dropped.devices = dropped.devices.filter((d) => d.device_id !== "dev-a");
+  await rejects(k.openEpochKeyFromManifest(dropped, b.privateKey, "dev-b", 1, opts(m2)), "MANIFEST_MAC_INVALID");
+  // keyring operating on a tampered in-memory manifest refuses to enroll/revoke
+  ring.manifest = injected;
+  await rejects(k.revokeDevice(ring, "dev-b"), "MANIFEST_MAC_INVALID");
+  await rejects(k.enrollDevice(ring, (await gen()).publicKey, "dev-z"), "MANIFEST_MAC_INVALID");
+});
+
+test("manifest MAC is rebound on rotation and loadManifest verifies it", async () => {
+  const { ring, b } = await setup();
+  await k.revokeDevice(ring, "dev-a");
+  const m = k.exportManifest(ring);
+  assert.ok(await k.loadManifest(m, { epochKey: ring.epochKeys[1].key, expectedAccountId: m.account_id, minEpoch: 2 }));
+  await rejects(k.loadManifest(m, { epochKey: ring.epochKeys[0].key, expectedAccountId: m.account_id }), "MANIFEST_MAC_INVALID");
+  assert.deepEqual(await k.openEpochKeyFromManifest(m, b.privateKey, "dev-b", 1, opts(m)), ring.epochKeys[0].key);
+});
+
+test("rollback below minEpoch and wrong accountId are rejected", async () => {
+  const { ring, b } = await setup();
+  const old = k.exportManifest(ring);
+  await k.revokeDevice(ring, "dev-a");
+  const cur = k.exportManifest(ring);
+  assert.ok(await k.openEpochKeyFromManifest(cur, b.privateKey, "dev-b", 2, opts(cur, { minEpoch: 2 })));
+  await rejects(k.openEpochKeyFromManifest(old, b.privateKey, "dev-b", 1, opts(old, { minEpoch: 2 })), "MANIFEST_ROLLBACK");
+  await rejects(k.loadManifest(old, { epochKey: ring.epochKeys[0].key, expectedAccountId: old.account_id, minEpoch: 2 }), "MANIFEST_ROLLBACK");
+  const other = await k.createAccountKeyring();
+  await rejects(k.openEpochKeyFromManifest(cur, b.privateKey, "dev-b", 2, opts(other.manifest)), "ACCOUNT_MISMATCH");
+  await rejects(k.openEpochKeyFromManifest(cur, b.privateKey, "dev-b", 2, {}), "INVALID_CONTEXT");
+  await rejects(k.openEpochKeyFromManifest(cur, b.privateKey, "dev-b", 2), "INVALID_CONTEXT");
+});
+
+test("duplicate device public keys and oversize manifests are rejected", async () => {
+  const { ring, a } = await setup();
+  await rejects(k.enrollDevice(ring, a.publicKey, "dev-dup"), "DUPLICATE_DEVICE_PUBLIC_KEY");
+  const m = k.exportManifest(ring);
+  const dup = clone(m);
+  dup.devices[1].public_key = dup.devices[0].public_key;
+  throwsCode(() => k.validateManifest(dup), "DUPLICATE_DEVICE_PUBLIC_KEY");
+  const tooManyEpochs = clone(m);
+  tooManyEpochs.epochs = Array.from({ length: 65 }, (_, i) => i + 1);
+  tooManyEpochs.current_epoch = 65;
+  throwsCode(() => k.validateManifest(tooManyEpochs), "INVALID_MANIFEST");
+  const tooManyDevices = clone(m);
+  tooManyDevices.devices = Array.from({ length: 257 }, (_, i) => ({ ...m.devices[0], device_id: "d" + i }));
+  throwsCode(() => k.validateManifest(tooManyDevices), "INVALID_MANIFEST");
 });
