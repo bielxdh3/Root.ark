@@ -1,3 +1,4 @@
+const cluster = require("node:cluster");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -26,7 +27,15 @@ const STATES = new Set([
   "assembled", "encrypting", "handoff_pending", "handoff_published", "handed_off", "cleanup_pending",
 ]);
 
-function parseChunkUploadQuotaConfig(env = process.env) {
+// The per-account chunk limiter and session locks are process-local, so chunk uploads
+// fail closed when this process is a cluster worker or a non-primary PM2 instance.
+function detectMultiProcessRuntime(env = process.env, { isWorker = cluster.isWorker } = {}) {
+  if (isWorker) return true;
+  const instance = env.NODE_APP_INSTANCE;
+  return typeof instance === "string" && instance !== "" && instance !== "0";
+}
+
+function parseChunkUploadQuotaConfig(env = process.env, runtime = {}) {
   const perAccountText = env.CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES;
   const systemText = env.CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES;
   const perAccountEntriesText = env.CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES;
@@ -46,6 +55,9 @@ function parseChunkUploadQuotaConfig(env = process.env) {
   }
   if (env.CHUNK_UPLOAD_STORAGE_TOPOLOGY !== REQUIRED_TOPOLOGY_ACK) {
     return { enabled: false, reason: "topology_not_acknowledged" };
+  }
+  if (detectMultiProcessRuntime(env, runtime)) {
+    return { enabled: false, reason: "multi_process_runtime" };
   }
   return { enabled: true, perAccountBytes, systemBytes, perAccountEntries, systemEntries };
 }
@@ -824,5 +836,6 @@ module.exports = {
   classifyProcessOwner,
   createChunkUploadQuota,
   getCurrentProcessIdentity,
+  detectMultiProcessRuntime,
   parseChunkUploadQuotaConfig,
 };

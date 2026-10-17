@@ -390,6 +390,9 @@ function registerAuthRoutes(app, context) {
     const actor = users.find((entry) => entry.username === req.user.username);
     const user = users.find((entry) => entry.username === req.params.username);
     if (!user) return sensitiveAuthResponse(res).status(404).json({ error: "Usuario nao encontrado" });
+    if (user.role === "admin" && req.user.role !== "admin") {
+      return sensitiveAuthResponse(res).status(403).json({ error: "Somente administradores podem alterar administradores" });
+    }
     const totpPolicy = getRuntimeTotpPolicy(res);
     if (!totpPolicy) return;
     if (!verificationRateLimit(req, actor?.username)) return genericTotpFailure(res, 429);

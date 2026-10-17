@@ -1081,3 +1081,17 @@ test("separate Node processes cannot oversubscribe the shared system quota", asy
     fs.rmSync(parent, { recursive: true, force: true });
   }
 });
+
+test("chunk quota fails closed in cluster workers and non-primary PM2 instances", () => {
+  const env = {
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_BYTES: "80",
+    CHUNK_UPLOAD_QUOTA_SYSTEM_BYTES: "100",
+    CHUNK_UPLOAD_QUOTA_PER_ACCOUNT_ENTRIES: "8",
+    CHUNK_UPLOAD_QUOTA_SYSTEM_ENTRIES: "10",
+    CHUNK_UPLOAD_STORAGE_TOPOLOGY: "single-host-local-volume",
+  };
+  assert.deepEqual(parseChunkUploadQuotaConfig(env, { isWorker: true }), { enabled: false, reason: "multi_process_runtime" });
+  assert.deepEqual(parseChunkUploadQuotaConfig({ ...env, NODE_APP_INSTANCE: "1" }, { isWorker: false }), { enabled: false, reason: "multi_process_runtime" });
+  assert.equal(parseChunkUploadQuotaConfig({ ...env, NODE_APP_INSTANCE: "0" }, { isWorker: false }).enabled, true);
+  assert.equal(parseChunkUploadQuotaConfig(env, { isWorker: false }).enabled, true);
+});
