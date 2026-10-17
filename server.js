@@ -10895,8 +10895,10 @@ async function listSearchVisibleFiles(req, folder, caches, q) {
   try {
     const isProtected = (name) => Boolean(getEncryptedFileMetadata(folder.id, name, caches.encryptedFiles));
     fileSearchIndexRepository.syncFolder(folder.id, files.map((file) => file.name), isProtected);
-    const hits = fileSearchIndexRepository.search(q, 5000, folder.id);
-    if (hits.length) {
+    const SEARCH_HIT_LIMIT = 50000;
+    const hits = fileSearchIndexRepository.search(q, SEARCH_HIT_LIMIT, folder.id);
+    // A truncated hit list could drop real matches, so fall back to the full scan.
+    if (hits.length && hits.length < SEARCH_HIT_LIMIT) {
       candidateNames = new Set(hits.map((hit) => hit.fileName));
       for (const file of files) {
         if (isProtected(file.name)) candidateNames.add(file.name);

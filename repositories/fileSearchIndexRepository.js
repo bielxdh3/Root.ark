@@ -1,23 +1,21 @@
 const path = require("path");
 const { getDb } = require("../db");
 
-const MAX_QUERY_TOKENS = 8;
-const TOKEN_HAS_WORD_CHAR = /[\p{L}\p{N}]/u;
+const MIN_TRIGRAM_LENGTH = 3;
 
 function basename(value) {
   return path.basename(String(value || ""));
 }
 
-// Builds a safe FTS5 MATCH expression. Every token becomes a quoted FTS5 string
-// (embedded double quotes doubled) with a prefix star, so operators such as
-// OR, NEAR( or * are treated as literal text. Returns null when no searchable token exists.
+// Builds a safe trigram MATCH expression: the whole query as one quoted FTS5 phrase
+// (embedded double quotes doubled). Trigram phrases match substrings, case-folded,
+// which is the same candidate semantics as the existing includes() search. Operators
+// such as OR, NEAR(, * or % are literal text inside the quotes. Returns null for
+// queries shorter than 3 characters (trigram cannot match them; callers use a full scan).
 function buildMatchQuery(rawQuery) {
-  const tokens = String(rawQuery || "")
-    .split(/\s+/)
-    .filter((token) => token && TOKEN_HAS_WORD_CHAR.test(token))
-    .slice(0, MAX_QUERY_TOKENS);
-  if (!tokens.length) return null;
-  return tokens.map((token) => `"${token.replace(/"/g, '""')}"*`).join(" ");
+  const text = String(rawQuery || "");
+  if ([...text].length < MIN_TRIGRAM_LENGTH) return null;
+  return `"${text.replace(/"/g, '""')}"`;
 }
 
 function upsert(folderId, fileName) {
