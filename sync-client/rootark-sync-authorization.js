@@ -14,6 +14,24 @@ function fail(message, code = "invalid_device_authorization") {
   throw Object.assign(new Error(message), { code });
 }
 
+// idempotencyKey is an opaque token: validated by charset and length only, never decoded as base64.
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+// Keys persisted before the canonical rule were operationIds (idempotencyKey defaulted to operationId).
+// They were accepted when they matched the old base64url charset check (length % 4 !== 1). The longest
+// such id is a WebDAV composite: "webdav-" + 160-char id + "-" + 24 hex = 192 characters.
+const LEGACY_IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_-]{1,192}$/;
+const GENERATED_IDEMPOTENCY_KEY_BYTES = 16;
+
+function isValidIdempotencyKey(value) {
+  if (typeof value !== "string") return false;
+  if (IDEMPOTENCY_KEY_PATTERN.test(value)) return true;
+  return LEGACY_IDEMPOTENCY_KEY_PATTERN.test(value) && value.length % 4 !== 1;
+}
+
+function generateIdempotencyKey() {
+  return crypto.randomBytes(GENERATED_IDEMPOTENCY_KEY_BYTES).toString("base64url");
+}
+
 function text(value, name) {
   if (typeof value !== "string" || !value || value.length > 512) fail(`Invalid authorization ${name}`);
   return value;
@@ -34,7 +52,8 @@ function proofCore(operation, options) {
   const expiresAt = Number(options.expiresAt || Date.now() + 5 * 60 * 1000);
   if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now()) fail("Authorization expired");
   const replayId = options.replayId || crypto.randomBytes(16).toString("base64url");
-  const idempotencyKey = options.idempotencyKey || operation.operationId;
+  const idempotencyKey = options.idempotencyKey === undefined ? generateIdempotencyKey() : options.idempotencyKey;
+  if (!isValidIdempotencyKey(idempotencyKey)) fail("Invalid device authorization");
   return {
     schemaVersion: 1,
     type: "rootark-sync-device-authorization-v1",
@@ -79,6 +98,7 @@ async function createAuthorizationProof(operation, options = {}) {
 async function verifyAuthorizationProof(proof, operation, expected = {}) {
   exact(proof);
   const normalized = { ...proof };
+  if (!isValidIdempotencyKey(normalized.idempotencyKey)) fail("Invalid device authorization");
   if (normalized.schemaVersion !== 1 || normalized.type !== "rootark-sync-device-authorization-v1" || normalized.suite !== zk.SUITE_ID) fail("Unsupported authorization proof");
   if (normalized.expiresAt < Date.now()) fail("Authorization expired", "authorization_expired");
   if (normalized.protocolVersion !== operation.protocolVersion || normalized.username !== expected.username || normalized.deviceId !== operation.deviceId) fail("Authorization scope mismatch", "authorization_scope");
@@ -91,4 +111,4 @@ async function verifyAuthorizationProof(proof, operation, expected = {}) {
   return true;
 }
 
-module.exports = { PROOF_FIELDS, createAuthorizationProof, verifyAuthorizationProof };
+module.exports = { PROOF_FIELDS, IDEMPOTENCY_KEY_PATTERN, createAuthorizationProof, generateIdempotencyKey, isValidIdempotencyKey, verifyAuthorizationProof };
