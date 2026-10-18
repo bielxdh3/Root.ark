@@ -8,7 +8,7 @@ const {
   generateRecoveryCodes,
   generateSecret,
   normalizeOtp,
-  verifyRecoveryCode,
+  verifyRecoveryCodeAsync,
   verifyTotp,
 } = require("../services/totp");
 const {
@@ -17,7 +17,7 @@ const {
   isTotpRequired,
   TOTP_POLICY_ERROR_MESSAGE,
 } = require("../services/totpPolicy");
-const { getLoginRejection, getLoginSecurityState, registerFailedLoginAttempt, resetLoginUsernameState, getRetryAfterSeconds } = require("../services/loginProtection");
+const { reserveLoginAttempt, getLoginRejection, getLoginSecurityState, registerFailedLoginAttempt, resetLoginUsernameState, getRetryAfterSeconds } = require("../services/loginProtection");
 
 const loginChallenges = new Map();
 const verificationAttemptsByIp = new Map();
@@ -50,22 +50,41 @@ function getEncryptedTotpSecret(user, key, pending = false) {
   return decryptSecret(record, key, `Root.ark/TOTP/${user.username}`);
 }
 
-function consumeTotpProof(user, code, key, allowRecovery = true) {
+// Async, non-mutating verification (recovery codes use async scrypt so the event loop is not blocked).
+// The returned proof must be applied with commitTotpProof() on freshly loaded user data, synchronously, right before saving.
+async function consumeTotpProof(user, code, key, allowRecovery = true) {
   const otp = normalizeOtp(code);
   if (otp) {
     let secret;
     try { secret = getEncryptedTotpSecret(user, key); } catch { return null; }
     const step = verifyTotp(secret, otp, { window: DEFAULT_WINDOW });
     if (step === null || Number.isSafeInteger(user.totpLastUsedStep) && step <= user.totpLastUsedStep) return null;
-    user.totpLastUsedStep = step;
     return { type: "totp", step };
   }
 
   if (!allowRecovery || !Array.isArray(user.totpRecoveryHashes)) return null;
-  const index = user.totpRecoveryHashes.findIndex((hash) => verifyRecoveryCode(code, hash));
-  if (index === -1) return null;
-  user.totpRecoveryHashes.splice(index, 1);
-  return { type: "recovery" };
+  for (const hash of [...user.totpRecoveryHashes]) {
+    if (await verifyRecoveryCodeAsync(code, hash)) return { type: "recovery", hash };
+  }
+  return null;
+}
+
+// Synchronous single-use enforcement on the fresh user record; returns false if the proof was already consumed.
+function commitTotpProof(target, proof) {
+  if (!target || !proof) return false;
+  if (proof.type === "totp") {
+    if (Number.isSafeInteger(target.totpLastUsedStep) && proof.step <= target.totpLastUsedStep) return false;
+    target.totpLastUsedStep = proof.step;
+    return true;
+  }
+  if (proof.type === "recovery") {
+    if (!Array.isArray(target.totpRecoveryHashes)) return false;
+    const index = target.totpRecoveryHashes.indexOf(proof.hash);
+    if (index === -1) return false;
+    target.totpRecoveryHashes.splice(index, 1);
+    return true;
+  }
+  return proof.type === "password";
 }
 
 function issueSession({ req, res, user, context, enrollmentOnly = false }) {
@@ -154,8 +173,8 @@ function getRuntimeTotpPolicy(res) {
   }
 }
 
-function requireAdminReauthentication(actor, body, key, bcrypt) {
-  if (!actor || !bcrypt.compareSync(String(body?.password || ""), actor.password || DUMMY_PASSWORD_HASH)) return null;
+async function requireAdminReauthentication(actor, body, key, bcrypt) {
+  if (!actor || !await bcrypt.compare(String(body?.password || ""), actor.password || DUMMY_PASSWORD_HASH)) return null;
   if (!actor.totpEnabled) return { type: "password" };
   return consumeTotpProof(actor, body?.code, key);
 }
@@ -182,7 +201,7 @@ function registerAuthRoutes(app, context) {
   const totpKey = () => getTotpKey();
   const challengeTtlMs = Math.max(60 * 1000, Math.min(10 * 60 * 1000, Number(process.env.TOTP_CHALLENGE_TTL_MS) || 5 * 60 * 1000));
 
-  app.post("/auth/login", (req, res) => {
+  app.post("/auth/login", async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) {
       return sensitiveAuthResponse(res).status(400).json({ error: "Usuario e senha obrigatorios" });
@@ -203,14 +222,23 @@ function registerAuthRoutes(app, context) {
     }
 
     const users = loadUsers();
-    const user = users.find((u) => u.username === username && !u.disabled);
+    let user = users.find((u) => u.username === username && !u.disabled);
     const passwordHash = user?.password || DUMMY_PASSWORD_HASH;
-    const passwordMatches = bcrypt.compareSync(password, passwordHash);
+    // Reserve the attempt synchronously (no await since getLoginRejection) so concurrent requests count toward the limits.
+    const reservation = reserveLoginAttempt(security);
+    const verifiedSessionVersion = user ? (user.sessionVersion || 0) : 0;
+    let passwordMatches = false;
+    try { passwordMatches = await bcrypt.compare(String(password), passwordHash); } catch { passwordMatches = false; }
+
+    // Re-validate against fresh data after the await: the account must still exist, be enabled and keep the same credentials.
+    if (user && passwordMatches) {
+      const current = loadUsers().find((u) => u.username === username && !u.disabled);
+      passwordMatches = Boolean(current) && current.password === passwordHash && (current.sessionVersion || 0) === verifiedSessionVersion;
+      user = passwordMatches ? current : null;
+    }
 
     if (!user || !passwordMatches) {
-      ipState.attempts += 1;
-      registerFailedLoginAttempt(ipState, now, config);
-      registerFailedLoginAttempt(usernameState, now, config);
+      reservation.failure();
       const retryAfter = getRetryAfterSeconds(ipState, usernameState);
       const blocked = Boolean(
         (ipState.blockedUntil && ipState.blockedUntil > now) ||
@@ -229,6 +257,7 @@ function registerAuthRoutes(app, context) {
       return sendLoginProtectionError(res, blocked ? 429 : 401, retryAfter);
     }
 
+    reservation.success();
     resetLoginUsernameState(security);
 
     const totpPolicy = getRuntimeTotpPolicy(res);
@@ -254,7 +283,7 @@ function registerAuthRoutes(app, context) {
     sensitiveAuthResponse(res).json({ token, username: user.username, role: user.role, permissions: normalizeUserPermissions(user) });
   });
 
-  app.post("/auth/login/2fa", (req, res) => {
+  app.post("/auth/login/2fa", async (req, res) => {
     cleanupChallenges();
     const challengeId = typeof req.body?.challengeId === "string" ? req.body.challengeId : "";
     const code = req.body?.code;
@@ -286,19 +315,22 @@ function registerAuthRoutes(app, context) {
       return genericTotpFailure(res);
     }
     let proof;
-    try { proof = consumeTotpProof(user, code, totpKey()); } catch { proof = null; }
-    if (!proof) {
+    try { proof = await consumeTotpProof(user, code, totpKey()); } catch { proof = null; }
+    // Re-load after the async work and enforce single use synchronously on the fresh record.
+    const allUsers = loadUsers();
+    const freshUser = allUsers.find((entry) => entry.username === challenge.username && !entry.disabled && (entry.sessionVersion || 0) === challenge.sessionVersion);
+    if (!proof || !freshUser || !commitTotpProof(freshUser, proof)) {
       auditLog("auth.login.challenge.failed", getAuditActor(req, "anonymous"), { type: "user", id: challenge.username }, "challenge", "failure", { reason: "invalid_proof" });
       if (challenge.attempts >= 5) loginChallenges.delete(challengeId);
       return genericTotpFailure(res);
     }
-    try { saveUsers(loadUsers().map((entry) => entry.username === user.username ? user : entry)); } catch {
+    try { saveUsers(allUsers); } catch {
       return sensitiveAuthResponse(res).status(503).json({ error: "Autenticacao indisponivel." });
     }
     loginChallenges.delete(challengeId);
-    const token = issueSession({ req, res, user, context });
+    const token = issueSession({ req, res, user: freshUser, context });
     auditLog("auth.login.challenge.success", getAuditActor(req, user.username), { type: "user", id: user.username }, "challenge", "success", { method: proof.type });
-    sensitiveAuthResponse(res).json({ token, username: user.username, role: user.role, permissions: normalizeUserPermissions(user) });
+    sensitiveAuthResponse(res).json({ token, username: freshUser.username, role: freshUser.role, permissions: normalizeUserPermissions(freshUser) });
   });
 
   app.get("/auth/2fa/policy", authenticate, (req, res) => {
@@ -359,15 +391,24 @@ function registerAuthRoutes(app, context) {
     }
   });
 
-  app.post("/auth/2fa/disable", authenticate, (req, res) => {
-    const users = loadUsers();
-    const user = users.find((entry) => entry.username === req.user.username);
+  app.post("/auth/2fa/disable", authenticate, async (req, res) => {
+    let users = loadUsers();
+    let user = users.find((entry) => entry.username === req.user.username);
     if (!verificationRateLimit(req, user?.username)) return genericTotpFailure(res, 429);
-    if (!user?.totpEnabled || !bcrypt.compareSync(String(req.body?.password || ""), user.password || DUMMY_PASSWORD_HASH)) return genericTotpFailure(res);
+    const verifiedHash = user?.password;
+    const verifiedVersion = user?.sessionVersion || 0;
+    let passwordOk = false;
+    try { passwordOk = await bcrypt.compare(String(req.body?.password || ""), user?.password || DUMMY_PASSWORD_HASH); } catch { passwordOk = false; }
+    if (!user?.totpEnabled || !passwordOk) return genericTotpFailure(res);
     try {
       const key = totpKey();
-      const proof = consumeTotpProof(user, req.body?.code, key);
+      const proof = await consumeTotpProof(user, req.body?.code, key);
       if (!proof) return genericTotpFailure(res);
+      const freshUsers = loadUsers();
+      const freshUser = freshUsers.find((entry) => entry.username === user.username);
+      if (!freshUser?.totpEnabled || freshUser.disabled || freshUser.password !== verifiedHash || (freshUser.sessionVersion || 0) !== verifiedVersion || !commitTotpProof(freshUser, proof)) return genericTotpFailure(res);
+      user = freshUser;
+      users = freshUsers;
       user.totpEnabled = false;
       user.totpSecret = null;
       user.totpPendingSecret = null;
@@ -385,7 +426,7 @@ function registerAuthRoutes(app, context) {
     }
   });
 
-  app.post("/users/:username/2fa/reset", authenticate, requirePermission("manageUsers"), (req, res) => {
+  app.post("/users/:username/2fa/reset", authenticate, requirePermission("manageUsers"), async (req, res) => {
     const users = loadUsers();
     const actor = users.find((entry) => entry.username === req.user.username);
     const user = users.find((entry) => entry.username === req.params.username);
@@ -396,22 +437,33 @@ function registerAuthRoutes(app, context) {
     const totpPolicy = getRuntimeTotpPolicy(res);
     if (!totpPolicy) return;
     if (!verificationRateLimit(req, actor?.username)) return genericTotpFailure(res, 429);
+    const actorVersion = actor?.sessionVersion || 0;
     let proof;
-    try { proof = requireAdminReauthentication(actor, req.body, actor?.totpEnabled ? totpKey() : null, bcrypt); } catch { proof = null; }
-    if (!proof) {
+    try { proof = await requireAdminReauthentication(actor, req.body, actor?.totpEnabled ? totpKey() : null, bcrypt); } catch { proof = null; }
+    const freshUsers = loadUsers();
+    const freshActor = freshUsers.find((entry) => entry.username === req.user.username);
+    const freshTarget = freshUsers.find((entry) => entry.username === req.params.username);
+    // Re-check authorization on the fresh records after the async re-authentication.
+    if (proof && (!freshActor || freshActor.disabled || (freshActor.sessionVersion || 0) !== actorVersion || !normalizeUserPermissions(freshActor).manageUsers)) {
+      return sensitiveAuthResponse(res).status(403).json({ error: "Permissao negada" });
+    }
+    if (proof && freshTarget && freshTarget.role === "admin" && freshActor.role !== "admin") {
+      return sensitiveAuthResponse(res).status(403).json({ error: "Somente administradores podem alterar administradores" });
+    }
+    if (!proof || !freshActor || !freshTarget || !commitTotpProof(freshActor, proof)) {
       auditLog("auth.2fa.admin_reset", getAuditActor(req), { type: "user", id: user.username }, "reset", "failure", { reason: "reauthentication_failed" });
       return genericTotpFailure(res);
     }
-    user.totpEnabled = false;
-    user.totpSecret = null;
-    user.totpPendingSecret = null;
-    user.totpRecoveryHashes = [];
-    user.totpLastUsedStep = null;
-    user.totpEnrolledAt = null;
-    user.sessionVersion = (user.sessionVersion || 0) + 1;
-    saveUsers(users);
-    auditLog("auth.2fa.admin_reset", getAuditActor(req), { type: "user", id: user.username }, "reset", "success", { resetBy: req.user.username, method: proof.type });
-    return sensitiveAuthResponse(res).json({ enabled: false, enrollmentRequired: isTotpRequired(user, totpPolicy), loginRequired: true });
+    freshTarget.totpEnabled = false;
+    freshTarget.totpSecret = null;
+    freshTarget.totpPendingSecret = null;
+    freshTarget.totpRecoveryHashes = [];
+    freshTarget.totpLastUsedStep = null;
+    freshTarget.totpEnrolledAt = null;
+    freshTarget.sessionVersion = (freshTarget.sessionVersion || 0) + 1;
+    saveUsers(freshUsers);
+    auditLog("auth.2fa.admin_reset", getAuditActor(req), { type: "user", id: freshTarget.username }, "reset", "success", { resetBy: req.user.username, method: proof.type });
+    return sensitiveAuthResponse(res).json({ enabled: false, enrollmentRequired: isTotpRequired(freshTarget, totpPolicy), loginRequired: true });
   });
 
   app.get("/auth/me", authenticate, (req, res) => {

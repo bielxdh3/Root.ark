@@ -74,7 +74,8 @@ const { createRealtimeUpgradeGuard } = require("./src/realtime/upgradeGuard");
 const { createRequirePermission } = require("./src/middlewares/permissions");
 const { isTotpRequired, validateTotpPolicy } = require("./src/services/totpPolicy");
 const { getDeploymentReadiness, isSessionCookieSecure, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
-const { getLoginRejection, getLoginSecurityState, registerFailedLoginAttempt, resetLoginUsernameState } = require("./src/services/loginProtection");
+const { createWebDavCredentialCache } = require("./src/services/webdavCredentialCache");
+const { reserveLoginAttempt, getLoginRejection, getLoginSecurityState, registerFailedLoginAttempt, resetLoginUsernameState } = require("./src/services/loginProtection");
 
 const app = express();
 const server = http.createServer(app);
@@ -1354,7 +1355,9 @@ function sendWebDavUnauthorized(req, res, reason = "invalid_credentials", status
   return false;
 }
 
-function authenticateWebDavRequest(req, res) {
+const webDavCredentialCache = createWebDavCredentialCache();
+
+async function authenticateWebDavRequest(req, res) {
   const header = String(req.headers.authorization || "");
   let username = "";
   let password = "";
@@ -1376,8 +1379,21 @@ function authenticateWebDavRequest(req, res) {
   }
 
   const security = getLoginSecurityState(req, username, getAuditActor);
-  const rejection = getLoginRejection(security);
-  if (rejection) return sendWebDavUnauthorized(req, res, rejection.reason, 429, rejection.retryAfter);
+  // Recently verified credentials (same hash/sessionVersion, user still enabled) skip bcrypt and the attempt reservation.
+  let credentialKey = null;
+  let cachedUser = null;
+  let credentialVerified = false;
+  if (!parseFailure) {
+    credentialKey = webDavCredentialCache.keyFor(username, password);
+    cachedUser = loadUsers().find((entry) => sameUsername(entry.username, username));
+    credentialVerified = webDavCredentialCache.isVerified(credentialKey, cachedUser);
+  }
+  const rejection = credentialVerified ? null : getLoginRejection(security);
+  if (rejection) {
+    // A compare for the same credentials may already be in flight (parallel client requests): share its result.
+    const pending = !parseFailure ? webDavCredentialCache.getInflight(credentialKey) : null;
+    if (!pending) return sendWebDavUnauthorized(req, res, rejection.reason, 429, rejection.retryAfter);
+  }
   if (parseFailure) {
     security.ipState.attempts += 1;
     registerFailedLoginAttempt(security.ipState, security.now, security.config);
@@ -1385,18 +1401,46 @@ function authenticateWebDavRequest(req, res) {
     return sendWebDavUnauthorized(req, res, parseFailure);
   }
 
-  const user = loadUsers().find((entry) => sameUsername(entry.username, username));
-  if (!user || user.disabled || !bcrypt.compareSync(password, user.password)) {
-    security.ipState.attempts += 1;
-    registerFailedLoginAttempt(security.ipState, security.now, security.config);
-    registerFailedLoginAttempt(security.usernameState, security.now, security.config);
+  let user = cachedUser;
+  const snapshot = user ? { password: String(user.password || ""), sessionVersion: user.sessionVersion || 0 } : null;
+  let reservation = null;
+  let passwordOk = credentialVerified;
+  if (!credentialVerified) {
+    const pending = webDavCredentialCache.getInflight(credentialKey);
+    if (pending && user && !user.disabled) {
+      // Coalesce with the in-flight compare for identical credentials; no extra reservation.
+      passwordOk = await pending;
+    } else {
+      // Reserve the attempt synchronously before the async compare so concurrent requests count toward the limits.
+      reservation = reserveLoginAttempt(security);
+      if (user && !user.disabled) {
+        const compare = bcrypt.compare(password, snapshot.password).then(Boolean, () => false);
+        webDavCredentialCache.setInflight(credentialKey, compare);
+        passwordOk = await compare;
+      }
+    }
+    // Re-validate against fresh data after every await: still exists, enabled, same password hash and sessionVersion.
+    if (passwordOk) {
+      const current = loadUsers().find((entry) => sameUsername(entry.username, username));
+      const unchanged = Boolean(current) && !current.disabled && String(current.password || "") === snapshot.password && (current.sessionVersion || 0) === snapshot.sessionVersion;
+      if (unchanged) {
+        user = current;
+        webDavCredentialCache.remember(credentialKey, current);
+      } else {
+        passwordOk = false;
+      }
+    }
+  }
+  if (!user || user.disabled || !passwordOk) {
+    reservation?.failure();
     const failureRejection = getLoginRejection(security);
     if (failureRejection && failureRejection.reason !== "rate_limit") {
       return sendWebDavUnauthorized(req, res, failureRejection.reason, 429, failureRejection.retryAfter);
     }
     return sendWebDavUnauthorized(req, res, "invalid_credentials");
   }
-  resetLoginUsernameState(security);
+  reservation?.success();
+  if (reservation) resetLoginUsernameState(security);
 
   let totpPolicy;
   try {
@@ -6011,7 +6055,14 @@ function isAdminEscalationBlocked(req, role, targetUser = null) {
   return role === "admin" || targetUser?.role === "admin";
 }
 
-app.post("/users", authenticate, requirePermission("manageUsers"), (req, res) => {
+// Fresh-record re-check of the acting user after an async step: exists, enabled, same sessionVersion, still manageUsers.
+function getFreshUserManager(req, users) {
+  const actor = users.find((entry) => entry.username === req.user?.username);
+  if (!actor || actor.disabled || (actor.sessionVersion || 0) !== (req.user?.sessionVersion || 0)) return null;
+  return normalizeUserPermissions(actor).manageUsers ? actor : null;
+}
+
+app.post("/users", authenticate, requirePermission("manageUsers"), async (req, res) => {
   const { username, password, role, permissions } = req.body;
   if (!username || !password) {
     return res.status(400).json({ error: "username e password obrigatorios" });
@@ -6023,7 +6074,17 @@ app.post("/users", authenticate, requirePermission("manageUsers"), (req, res) =>
     return res.status(400).json({ error: "Senha de amostra publicada nao permitida" });
   }
 
+  if (loadUsers().find((u) => u.username === username)) {
+    return res.status(409).json({ error: "Usuario ja existe" });
+  }
+  const passwordHash = await bcrypt.hash(String(password), 10);
+  // Re-load after the async hash so concurrent user changes are not lost, and re-check the actor.
   const users = loadUsers();
+  const freshActor = getFreshUserManager(req, users);
+  if (!freshActor) return res.status(403).json({ error: "Permissao negada" });
+  if (freshActor.role !== "admin" && role === "admin") {
+    return res.status(403).json({ error: "Somente administradores podem criar administradores" });
+  }
   if (users.find((u) => u.username === username)) {
     return res.status(409).json({ error: "Usuario ja existe" });
   }
@@ -6040,7 +6101,7 @@ app.post("/users", authenticate, requirePermission("manageUsers"), (req, res) =>
 
   users.push({
     username,
-    password: bcrypt.hashSync(password, 10),
+    password: passwordHash,
     role: role || "user",
     permissions: finalPermissions,
     sessionVersion: getCreatedUserSessionVersion(username),
@@ -6054,9 +6115,9 @@ app.post("/users", authenticate, requirePermission("manageUsers"), (req, res) =>
   res.status(201).json({ message: "Usuario criado" });
 });
 
-app.put("/users/:username", authenticate, requirePermission("manageUsers"), (req, res) => {
-  const users = loadUsers();
-  const idx = users.findIndex((u) => u.username === req.params.username);
+app.put("/users/:username", authenticate, requirePermission("manageUsers"), async (req, res) => {
+  let users = loadUsers();
+  let idx = users.findIndex((u) => u.username === req.params.username);
   if (idx === -1) return res.status(404).json({ error: "Usuario nao encontrado" });
   if (isAdminEscalationBlocked(req, req.body.role, users[idx])) {
     return res.status(403).json({ error: "Somente administradores podem alterar administradores" });
@@ -6066,13 +6127,26 @@ app.put("/users/:username", authenticate, requirePermission("manageUsers"), (req
     return res.status(400).json({ error: "Voce nao pode revogar sua propria permissao manageUsers" });
   }
 
-  const before = JSON.parse(JSON.stringify(users[idx]));
   const { password, role, permissions } = req.body;
   if (isPublishedSamplePassword(password)) {
     return res.status(400).json({ error: "Senha de amostra publicada nao permitida" });
   }
+  let passwordHash = null;
+  if (password) {
+    passwordHash = await bcrypt.hash(String(password), 10);
+    // Re-load after the async hash and re-validate so concurrent user changes are not lost.
+    users = loadUsers();
+    const freshActor = getFreshUserManager(req, users);
+    if (!freshActor) return res.status(403).json({ error: "Permissao negada" });
+    idx = users.findIndex((u) => u.username === req.params.username);
+    if (idx === -1) return res.status(404).json({ error: "Usuario nao encontrado" });
+    if (freshActor.role !== "admin" && (req.body.role === "admin" || users[idx].role === "admin")) {
+      return res.status(403).json({ error: "Somente administradores podem alterar administradores" });
+    }
+  }
+  const before = JSON.parse(JSON.stringify(users[idx]));
   const sessionChanged = Boolean(password || (role && role !== users[idx].role) || (permissions && Object.entries(permissions).some(([key, value]) => users[idx].permissions?.[key] !== value)) || req.body.disabled !== undefined && Boolean(req.body.disabled) !== Boolean(users[idx].disabled));
-  if (password) users[idx].password = bcrypt.hashSync(password, 10);
+  if (passwordHash) users[idx].password = passwordHash;
   if (role) users[idx].role = role;
   if (permissions) users[idx].permissions = { ...users[idx].permissions, ...permissions };
   if (req.body.disabled !== undefined) users[idx].disabled = Boolean(req.body.disabled);
@@ -10743,7 +10817,7 @@ function registerWebDavRoutes() {
     try {
       if (req.method === "OPTIONS") return sendWebDavOptions(req, res);
       if (req.headers.origin && req.headers.origin !== getExpectedOrigin(req)) return res.status(403).send("Origin denied");
-      if (!authenticateWebDavRequest(req, res)) return;
+      if (!await authenticateWebDavRequest(req, res)) return;
 
       const segments = parseWebDavSegments(req);
       if (!segments) return res.status(404).send("Not found");
