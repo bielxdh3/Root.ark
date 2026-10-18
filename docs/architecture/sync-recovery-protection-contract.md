@@ -63,3 +63,26 @@ The identity permitted to resume a paused scope or select a restore generation, 
 ## Explicit non-claims
 
 This proposal does not implement a ransomware detector, immutable archive, client review UI, restore workflow, or retention policy. It does not claim server-side content scanning, successful plaintext recovery based only on server checksums, cryptographic erasure, external backup coverage, or production provider behavior. Those claims require implementation, approved policy, and exact-head evidence.
+
+## Implementation status: step 1 (burst pause, issue #67)
+
+Implemented: `src/services/syncBurstGuard.js` and the sync route in `src/routes/sync.js`.
+
+- Destructive operations are deletes/tombstones and any non-create operation that replaces an existing object (this includes `move`). The guard uses only username, opaque `deviceId`, and the operation kind.
+- Thresholds: `SYNC_BURST_MAX_DESTRUCTIVE` (default 200) per device and `SYNC_BURST_MAX_PER_OBJECT` (default 16) per (device, object), both within `SYNC_BURST_WINDOW_MS` (default 600000). The per-object limit is below the 32-version history cap, so a single client overwriting one file is paused before its pre-attack version can be pruned by overwrites in that window. Invalid values fall back to defaults. Memory is bounded by `SYNC_BURST_MAX_KEYS` (default 5000) per counter and at most limit+1 timestamps per key.
+- History retention anchor: per-object history is kept to 32 versions. When pruning, the anchor is the newest version older than `SYNC_RECOVERY_RETENTION_MS` (default 86400000). If every version is inside the window, the anchor is the oldest version in history. The anchor is kept together with the newest 31 versions. Versions created by a currently paused device are never pruned. Store timestamps are kept in a parallel per-object array (`versionTimes`), not in the records, because records are attested strictly.
+- The pause key is prefixed (`d:<deviceId>`) so client-supplied device ids cannot collide with object prototype properties.
+- The operation that exceeds the limit is not applied. The device is paused in the persisted sync store (`users[name].pausedDevices`), so the pause survives restart. Further destructive operations from that device return HTTP 423 with `error`/`code` `sync_burst_paused`. Reads and creates remain allowed. Replays do not clear the pause.
+- Resume: `POST /sync/v1/devices/:deviceId/resume` requires the account password in the body, checked with `bcrypt.compare` against the stored hash. Five failed attempts per user within 15 minutes (in-memory) return 429. A body `deviceId` equal to the paused device returns 403; this is a convenience check, not a security boundary, since the body is self-declared. Password reservations are taken synchronously before any await, so parallel requests count toward the limit. A successful resume clears the pause and the device counter and emits `sync.device.resumed`. Pauses emit `sync.burst.paused`; failed re-auth emits `sync.device.resume.failed`.
+
+Known gaps (not implemented in step 1):
+- Protected recovery points are not fully implemented. The retention anchor above is a bounded checkpoint inside the existing 32-version history, not an immutable archive. There is no protected retention window with a quota or hold, and no expiry policy.
+- No restore route exists. The "restorable" guarantee is limited to the pre-attack record remaining in history with its ciphertext and crypto metadata intact. Restore and decryption proof are not implemented.
+- Slow attacks are bounded only by the checkpoint. Overwrites spread over more than the window (10 min) do not trip the per-object limit. Versions older than the checkpoint can still be pruned once the cap is exceeded, and the checkpoint is the newest version older than the retention window, not necessarily the pre-attack version.
+- Resume clears the device total and all per-object counters for that device, so the next normal overwrite is not refused by the pre-pause counters.
+- The per-object limit and the per-device limit apply within one window. A client that spreads overwrites across many devices is limited only by the per-device total.
+- No device listing route exists in the sync router, so no `paused` field was added to a listing. The device registry is external (`SYNC_DEVICE_REGISTRY`).
+- The counter is in-memory and resets on restart. A pause is persisted. Device identity comes from the client-supplied `deviceId`, so it is only a boundary when device authorization is enabled.
+- TOTP is not checked on resume. The auth route's 2FA helper is not exported, so resume uses password-only re-auth. Users with TOTP enabled are protected only by the password here. Adding a TOTP proof is a follow-up.
+- The self-resume check trusts the body `deviceId`. A compromised device that omits or forges it is not caught by that check. The password requirement is the real barrier.
+- Pause scope is per (user, device), not per the account-wide scope the contract describes.
