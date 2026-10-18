@@ -16,10 +16,16 @@ function fail(message, code = "invalid_device_authorization") {
 
 // idempotencyKey is an opaque token: validated by charset and length only, never decoded as base64.
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+// Keys persisted before the canonical rule were operationIds (idempotencyKey defaulted to operationId).
+// They were accepted when they matched the old base64url charset check (length % 4 !== 1). The longest
+// such id is a WebDAV composite: "webdav-" + 160-char id + "-" + 24 hex = 192 characters.
+const LEGACY_IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_-]{1,192}$/;
 const GENERATED_IDEMPOTENCY_KEY_BYTES = 16;
 
 function isValidIdempotencyKey(value) {
-  return typeof value === "string" && IDEMPOTENCY_KEY_PATTERN.test(value);
+  if (typeof value !== "string") return false;
+  if (IDEMPOTENCY_KEY_PATTERN.test(value)) return true;
+  return LEGACY_IDEMPOTENCY_KEY_PATTERN.test(value) && value.length % 4 !== 1;
 }
 
 function generateIdempotencyKey() {

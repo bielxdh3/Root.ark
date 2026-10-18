@@ -55,14 +55,12 @@ test("every idempotency key length from 16 to 40 is accepted", async () => {
   }
 });
 
-test("boundary lengths 16 and 128 are accepted, 15 and 129 are rejected", async () => {
+test("boundary lengths 16 and 128 are accepted, 17 is accepted, 129 (length % 4 === 1) is rejected", async () => {
   const operation = operationFor();
-  for (const length of [16, 128]) {
+  for (const length of [16, 17, 128]) {
     assert.equal((await proofFor(operation, keyOfLength(length))).idempotencyKey.length, length);
   }
-  for (const length of [15, 129]) {
-    await assert.rejects(proofFor(operation, keyOfLength(length)), { message: "Invalid device authorization" });
-  }
+  await assert.rejects(proofFor(operation, keyOfLength(129)), { message: "Invalid device authorization" });
 });
 
 test("invalid characters, too short and too long keys are rejected with the same error as before", async () => {
@@ -71,8 +69,9 @@ test("invalid characters, too short and too long keys are rejected with the same
   const expected = rejectionOf(() => protocol.normalizeAuthorization({ ...proof, idempotencyKey: "x" }));
   assert.deepEqual(expected, { message: "Invalid device authorization", code: "invalid_operation" });
   const invalid = [
-    "short-key-15chr", // 15 characters
-    "a".repeat(129),
+    "a", // 1 character, length % 4 === 1 and below the canonical minimum
+    "a".repeat(129), // length % 4 === 1 and above the canonical maximum
+    "a".repeat(194), // above the legacy maximum of 192
     "abcdefghijklmnop+qrs", // base64 '+'
     "abcdefghijklmnop/qrs", // base64 '/'
     "abcdefghijklmnopqrs=", // base64 padding
@@ -124,4 +123,32 @@ test("previously accepted 36-character UUID key still validates", async () => {
   const proof = await proofFor(operation, uuid);
   assert.equal(protocol.normalizeAuthorization(proof).idempotencyKey, uuid);
   assert.equal(await verifyAuthorizationProof(proof, operation, { username: "alice" }), true);
+});
+
+test("historical operationId-derived keys still validate (fixtures per format)", async () => {
+  const operation = operationFor();
+  const hex24 = (value) => crypto.createHash("sha256").update(value).digest("hex").slice(0, 24);
+  const fixtures = {
+    "uuid v4 (crypto.randomUUID, 36 chars)": crypto.randomUUID(),
+    "webdav composite with uuid (68 chars)": `webdav-${crypto.randomUUID()}-${hex24("a/b.txt")}`,
+    "webdav composite with max-length id (192 chars)": `webdav-${"a".repeat(160)}-${hex24("max")}`,
+    "short caller-supplied id, 14 chars": "auth-operation",
+    "short caller-supplied id, 4 chars": "op-1",
+    "caller-supplied id with underscores, 14 chars": "legacy_op_0001",
+  };
+  assert.equal(fixtures["webdav composite with max-length id (192 chars)"].length, 192);
+  assert.equal(fixtures["webdav composite with uuid (68 chars)"].length, 68);
+  for (const [name, key] of Object.entries(fixtures)) {
+    const proof = await proofFor(operation, key);
+    assert.equal(protocol.normalizeAuthorization(proof).idempotencyKey, key, name);
+    assert.equal(await verifyAuthorizationProof(proof, operation, { username: "alice" }), true, name);
+  }
+});
+
+test("historically rejected key shapes stay rejected", async () => {
+  const operation = operationFor();
+  const proof = await proofFor(operation);
+  for (const key of ["webdav:id.with.dots-0123456789ab", "op:colon:0001", "bad+base64/key=", "x".repeat(193)]) {
+    assert.throws(() => protocol.normalizeAuthorization({ ...proof, idempotencyKey: key }), { message: "Invalid device authorization" }, key);
+  }
 });
