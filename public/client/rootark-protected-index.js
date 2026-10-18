@@ -31,12 +31,19 @@
     return { ...item, metadata: payload.metadata };
   }
 
+  function searchableValues(value, output = []) {
+    if (Array.isArray(value)) value.forEach((item) => searchableValues(item, output));
+    else if (value && typeof value === "object") Object.values(value).forEach((item) => searchableValues(item, output));
+    else if (typeof value === "string" || typeof value === "number") output.push(String(value).toLocaleLowerCase());
+    return output;
+  }
+
   async function search(entries, term, key) {
     const query = String(term || "").trim().toLocaleLowerCase();
     const results = [];
     for (const entry of Array.isArray(entries) ? entries : []) {
       const decrypted = await decryptEntry(entry, key);
-      if (!query || crypto.canonicalJson(decrypted.metadata).toLocaleLowerCase().includes(query)) results.push(decrypted);
+      if (!query || searchableValues(decrypted.metadata).some((value) => value.includes(query))) results.push(decrypted);
     }
     return results;
   }

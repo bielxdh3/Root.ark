@@ -1446,7 +1446,8 @@ function parseWebDavSegments(req) {
       decoded === ".." ||
       decoded.includes("/") ||
       decoded.includes("\\") ||
-      decoded.includes("\0")
+      decoded.includes("\0") ||
+      hasWindowsStreamSyntax(decoded)
     ) {
       throw new Error("Caminho WebDAV invalido");
     }
@@ -2118,7 +2119,7 @@ function renderPublicSharePage(token, scriptNonce) {
         fileName.textContent = data.fileName || "Arquivo compartilhado";
         status.textContent = "Link valido ate " + new Date(data.expiresAt).toLocaleString("pt-BR") + ".";
         meta.innerHTML = [
-          data.fileType ? '<span class="pill">' + data.fileType + '</span>' : "",
+          data.fileType ? '<span class="pill">' + String(data.fileType).replace(/[&<>"']/g, (char) => "&#" + char.charCodeAt(0) + ";") + '</span>' : "",
           '<span class="pill">' + formatSize(data.size) + '</span>',
           data.remainingViews !== null ? '<span class="pill">' + data.remainingViews + ' visualizacoes restantes</span>' : '<span class="pill">Visualizacoes ilimitadas</span>',
           data.remainingDownloads !== null ? '<span class="pill">' + data.remainingDownloads + ' downloads restantes</span>' : '<span class="pill">Downloads ilimitados</span>'
@@ -2444,7 +2445,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
   let verifiedPasswordHash = null;
   if (passwordHash && !hasValidSharePasswordSession(req, token, link)) {
     if (!options.password) return { status: 401, error: "Senha obrigatoria.", passwordRequired: true };
-    if (!bcrypt.compareSync(String(options.password), passwordHash)) {
+    if (!await bcrypt.compare(String(options.password), passwordHash)) {
       logShareAudit(req, "share.password.failed", token, link, "password", "failure");
       return { status: 401, error: "Nao foi possivel acessar este link.", passwordRequired: true };
     }
@@ -3878,8 +3879,12 @@ function normalizeFilePermissionEntry(entry) {
   };
 }
 
+function toPublicUserRecord({ password, totpSecret, totpPendingSecret, totpRecoveryHashes, totpLastUsedStep, ...user }) {
+  return user;
+}
+
 function getFolderEligibleUsers(folder) {
-  const users = loadUsers().map(({ password, ...user }) => user);
+  const users = loadUsers().map(toPublicUserRecord);
 
   if (folder.isRoot || folder.id === ROOT_FOLDER_ID) {
     return users;
@@ -4577,8 +4582,15 @@ function isValidFileNameLength(fileName) {
   return fileName.length <= MAX_FILE_NAME_LENGTH;
 }
 
+// On Windows a colon selects an NTFS alternate data stream ("a.pdf:x", "a.pdf::$DATA"),
+// which would bypass name-keyed trash, expiry and encryption metadata.
+function hasWindowsStreamSyntax(fileName, platform = process.platform) {
+  return platform === "win32" && String(fileName || "").includes(":");
+}
+
 function shortenFileName(fileName) {
-  const safeName = path.basename(fileName || "");
+  const inputName = path.basename(fileName || "");
+  const safeName = hasWindowsStreamSyntax(inputName) ? inputName.replace(/:/g, "_") : inputName;
   if (safeName.length <= MAX_FILE_NAME_LENGTH) return safeName;
 
   const extension = path.extname(safeName);
@@ -5993,10 +6005,19 @@ app.get("/users", authenticate, requirePermission("manageUsers"), (req, res) => 
   res.json(users);
 });
 
+// Delegated user managers must not create admins or change admin accounts.
+function isAdminEscalationBlocked(req, role, targetUser = null) {
+  if (req.user?.role === "admin") return false;
+  return role === "admin" || targetUser?.role === "admin";
+}
+
 app.post("/users", authenticate, requirePermission("manageUsers"), (req, res) => {
   const { username, password, role, permissions } = req.body;
   if (!username || !password) {
     return res.status(400).json({ error: "username e password obrigatorios" });
+  }
+  if (isAdminEscalationBlocked(req, role)) {
+    return res.status(403).json({ error: "Somente administradores podem criar administradores" });
   }
   if (isPublishedSamplePassword(password)) {
     return res.status(400).json({ error: "Senha de amostra publicada nao permitida" });
@@ -6037,6 +6058,9 @@ app.put("/users/:username", authenticate, requirePermission("manageUsers"), (req
   const users = loadUsers();
   const idx = users.findIndex((u) => u.username === req.params.username);
   if (idx === -1) return res.status(404).json({ error: "Usuario nao encontrado" });
+  if (isAdminEscalationBlocked(req, req.body.role, users[idx])) {
+    return res.status(403).json({ error: "Somente administradores podem alterar administradores" });
+  }
 
   if (req.params.username === req.user.username && req.body.permissions?.manageUsers === false) {
     return res.status(400).json({ error: "Voce nao pode revogar sua propria permissao manageUsers" });
@@ -6091,6 +6115,9 @@ app.delete("/users/:username", authenticate, requirePermission("manageUsers"), (
   const filtered = users.filter((u) => u.username !== req.params.username);
   if (filtered.length === users.length) {
     return res.status(404).json({ error: "Usuario nao encontrado" });
+  }
+  if (isAdminEscalationBlocked(req, undefined, users.find((u) => u.username === req.params.username))) {
+    return res.status(403).json({ error: "Somente administradores podem alterar administradores" });
   }
 
   if (shouldWriteLegacyJson()) rememberUserGenerations(users);
@@ -6745,7 +6772,7 @@ app.get("/folders/:id/access", authenticate, (req, res) => {
     folderName: folder.name,
     owner: normalized.owner,
     users: normalized.users,
-    eligibleUsers: loadUsers().map(({ password, ...user }) => user),
+    eligibleUsers: loadUsers().map(toPublicUserRecord),
   });
 });
 
@@ -11218,9 +11245,17 @@ app.delete("/versions/:filename/v/:version", versionsRateLimit, authenticate, re
   }, res);
 });
 
+function canViewActionHistoryEntry(req, entry) {
+  if (canManageAccess(req)) return true;
+  if (entry?.actor === req.user?.username) return true;
+  const details = entry?.details || {};
+  const folderIds = [details.folderId, details.fromFolderId, details.toFolderId].filter((id) => typeof id === "string" && id);
+  return folderIds.length > 0 && folderIds.every((id) => hasFolderAccess(req, getFolderById(id)));
+}
+
 app.get("/history", authenticate, requirePermission("listFiles"), (req, res) => {
   try {
-    res.json({ items: loadActionHistory().slice(0, 200) });
+    res.json({ items: loadActionHistory().filter((entry) => canViewActionHistoryEntry(req, entry)).slice(0, 200) });
   } catch {
     res.status(500).json({ error: "Erro ao carregar historico" });
   }
@@ -11355,7 +11390,7 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
   if (getEncryptedFileMetadata(folder.id, name)) {
     return res.status(403).json({ error: "Links publicos nao estao disponiveis para arquivos criptografados" });
   }
-  const passwordHash = sharePassword ? bcrypt.hashSync(sharePassword, 10) : null;
+  const passwordHash = sharePassword ? await bcrypt.hash(sharePassword, 10) : null;
   if (!await getListedFileDetails(currentFolder, name) || !hasPublicShareAccess(req, currentFolder, name)) {
     return res.status(404).json({ error: "Arquivo nao encontrado" });
   }
@@ -11961,7 +11996,7 @@ app.put("/rename", renameRateLimit, authenticate, async (req, res) => {
     return res.status(400).json({ error: "Nome atual e novo nome sao obrigatorios" });
   }
 
-  if (oldName !== rawOldName || newName !== rawNewName) {
+  if (oldName !== rawOldName || newName !== rawNewName || hasWindowsStreamSyntax(newName)) {
     return res.status(400).json({ error: "Nome de arquivo invalido" });
   }
 
