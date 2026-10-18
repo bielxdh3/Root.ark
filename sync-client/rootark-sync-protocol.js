@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
+const { isValidIdempotencyKey } = require("./rootark-sync-authorization");
 
 const PROTOCOL_VERSION = 2;
 const MAX_ID_LENGTH = 160;
@@ -131,9 +132,10 @@ function normalizeAuthorization(value) {
   assertExactKeys(value, AUTHORIZATION_FIELDS, "authorization");
   if (AUTHORIZATION_FIELDS.some((field) => !Object.hasOwn(value, field)) || value.schemaVersion !== 1 || value.type !== "rootark-sync-device-authorization-v1" || value.suite !== "rootark-zk-1" || value.protocolVersion !== PROTOCOL_VERSION) fail("Invalid device authorization");
   if (!Number.isSafeInteger(value.expiresAt) || value.expiresAt <= Date.now()) fail("Expired device authorization", "authorization_expired");
-  for (const field of ["aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest", "replayId", "idempotencyKey", "publicKey", "signature"]) {
+  for (const field of ["aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest", "replayId", "publicKey", "signature"]) {
     if (typeof value[field] !== "string" || !/^[A-Za-z0-9_-]+$/.test(value[field]) || value[field].length % 4 === 1) fail("Invalid device authorization");
   }
+  if (!isValidIdempotencyKey(value.idempotencyKey)) fail("Invalid device authorization");
   return canonicalize(value);
 }
 
