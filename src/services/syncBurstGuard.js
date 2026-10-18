@@ -51,7 +51,14 @@ function createWindowCounter({ limit, windowMs, maxKeys, clock }) {
     return { exceeded: entries.length > limit, count: entries.length, limit, windowMs };
   }
 
-  return { record, size: () => buckets.size, clear: (key) => buckets.delete(key) };
+  // Removes every key starting with `prefix`. Iterates the bounded map once.
+  function clearPrefix(prefix) {
+    for (const key of buckets.keys()) {
+      if (key.startsWith(prefix)) buckets.delete(key);
+    }
+  }
+
+  return { record, size: () => buckets.size, clear: (key) => buckets.delete(key), clearPrefix };
 }
 
 function createSyncBurstGuard(options = {}) {
@@ -87,8 +94,12 @@ function createSyncBurstGuard(options = {}) {
     };
   }
 
+  // Clears the device total and every per-object counter for that device. The per-object key is the JSON
+  // array [user, device, object]; its prefix `["user","device",` is unambiguous because JSON strings are escaped.
   function reset(username, deviceId) {
-    perDevice.clear(deviceKey(username, deviceId));
+    const key = deviceKey(username, deviceId);
+    perDevice.clear(key);
+    perObject.clearPrefix(`${key.slice(0, -1)},`);
   }
 
   function trackedKeys() {

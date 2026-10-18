@@ -266,6 +266,67 @@ test("issue 67 guard: repeated overwrites of one object trip the per-object limi
   assert.equal(last.deviceExceeded, false);
 });
 
+test("issue 67 guard: reset clears per-object counters for that device only", () => {
+  const guard = createSyncBurstGuard({ maxDestructive: 200, maxPerObject: 2, windowMs: 600000, env: {} });
+  for (let i = 0; i < 3; i += 1) guard.recordDestructive("alice", "dev-a", "object-1", i);
+  for (let i = 0; i < 2; i += 1) guard.recordDestructive("alice", "dev-b", "object-1", i);
+  guard.reset("alice", "dev-a");
+  assert.equal(guard.recordDestructive("alice", "dev-a", "object-1", 10).objectExceeded, false);
+  assert.equal(guard.recordDestructive("alice", "dev-b", "object-1", 10).objectExceeded, true);
+});
+
+test("issue 67 route: after a per-object pause and password resume the next overwrite of that object succeeds", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-object-resume-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const { port } = await startServer(t, { storagePath: path.join(dir, "objects.json"), burstGuard: createSyncBurstGuard({ env: {} }) });
+  const key = crypto.randomBytes(32);
+  const created = createFor(1, key);
+  assert.equal((await jsonRequest(port, "/sync/v1/objects", "POST", created)).status, 201);
+  let previous = created;
+  const update = (counter) => protocol.createOperation({
+    operation: "update", objectId: "object-1", fileId: "file-1", versionId: `version-1-${counter}`, operationId: `update-${counter}`,
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", revision: { counter, deviceId: "device-a" },
+    baseRevision: previous.revision, metadata: { path: "f1.txt", name: "f1.txt", size: 4 }, plaintext: Buffer.from(`v${counter}`), fileKey: key,
+  });
+  for (let counter = 2; counter <= 17; counter += 1) {
+    const operation = update(counter);
+    assert.equal((await jsonRequest(port, "/sync/v1/objects", "POST", operation)).status, 201);
+    previous = operation;
+  }
+  assert.equal((await jsonRequest(port, "/sync/v1/objects", "POST", update(18))).status, 423);
+  assert.equal((await resumeRequest(port)).status, 200);
+  // The next normal overwrite of the same object is not refused by the pre-resume per-object counter.
+  assert.equal((await jsonRequest(port, "/sync/v1/objects", "POST", update(18))).status, 201);
+});
+
+test("issue 67 store: 40 edits within the retention window keep the first version and history at the cap", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-anchor-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const clock = 1700000000000;
+  const store = await new SyncObjectStore(path.join(dir, "objects.json"), {
+    burstGuard: createSyncBurstGuard({ maxDestructive: 100000, maxPerObject: 100000, env: {} }),
+    retentionMs: 24 * 60 * 60 * 1000,
+    now: () => clock,
+  }).open();
+  const key = crypto.randomBytes(32);
+  const created = createFor(1, key);
+  assert.equal((await store.put("alice", created)).kind, "stored");
+  let previous = created;
+  for (let counter = 2; counter <= 41; counter += 1) {
+    const update = protocol.createOperation({
+      operation: "update", objectId: "object-1", fileId: "file-1", versionId: `version-1-${counter}`, operationId: `update-${counter}`,
+      deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private", revision: { counter, deviceId: "device-a" },
+      baseRevision: previous.revision, metadata: { path: "f1.txt", name: "f1.txt", size: 4 }, plaintext: Buffer.from(`v${counter}`), fileKey: key,
+    });
+    assert.equal((await store.put("alice", update)).kind, "stored");
+    previous = update;
+  }
+  const history = store.history("alice", "object-1");
+  assert.equal(history.length, 32);
+  assert.equal(history[0].versionId, created.versionId);
+  assert.equal(history[history.length - 1].versionId, previous.versionId);
+});
+
 test("issue 67 route: rapid overwrites of one object pause the device before the pre-attack version is pruned", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-object-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));

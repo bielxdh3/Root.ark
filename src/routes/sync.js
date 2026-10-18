@@ -113,10 +113,13 @@ function isPausedDevice(user, deviceId) {
 function pruneObjectHistory(history, times, cutoff, pausedDevices) {
   if (history.length <= MAX_HISTORY_PER_OBJECT) return { versions: history, times };
   const recentStart = history.length - (MAX_HISTORY_PER_OBJECT - 1);
+  // Anchor: newest version older than the retention window; if every version is inside the window,
+  // the oldest version in history (so the earliest recovery point is never dropped).
   let checkpoint = -1;
   for (let index = recentStart - 1; index >= 0; index -= 1) {
     if (times[index] < cutoff) { checkpoint = index; break; }
   }
+  if (checkpoint === -1) checkpoint = 0;
   const keep = (index) => index >= recentStart || index === checkpoint || Object.hasOwn(pausedDevices, pausedKey(history[index].deviceId));
   return {
     versions: history.filter((_, index) => keep(index)),
