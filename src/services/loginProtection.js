@@ -27,7 +27,7 @@ function getLoginState(store, key, now, config) {
   const safeKey = key || "unknown";
   let state = store.get(safeKey);
   if (!state) {
-    state = { attempts: 0, failures: 0, windowStart: now, blockedUntil: 0, nextAllowedAt: 0 };
+    state = { attempts: 0, failures: 0, pending: 0, windowStart: now, blockedUntil: 0, nextAllowedAt: 0 };
     store.set(safeKey, state);
   }
   if (now - state.windowStart >= config.windowMs) {
@@ -46,7 +46,7 @@ function pruneLoginStore(store, now, config) {
   for (const [key, state] of store.entries()) {
     const latestActivity = Math.max(state.windowStart || 0, state.blockedUntil || 0, state.nextAllowedAt || 0);
     const inactiveFor = now - latestActivity;
-    if (!state.blockedUntil && inactiveFor > Math.max(config.windowMs * 4, config.blockDurationMs * 2, 5 * 60 * 1000)) store.delete(key);
+    if (!state.blockedUntil && !state.pending && inactiveFor > Math.max(config.windowMs * 4, config.blockDurationMs * 2, 5 * 60 * 1000)) store.delete(key);
   }
 }
 
@@ -72,8 +72,12 @@ function getLoginSecurityState(req, username, getAuditActor) {
 function getLoginRejection({ config, ipState, usernameState, now }) {
   const blockedState = [ipState, usernameState].find((state) => state?.blockedUntil && state.blockedUntil > now);
   if (blockedState) return { reason: "blocked", retryAfter: getRetryAfterSeconds(ipState, usernameState) };
-  if (ipState.attempts >= config.maxAttempts) {
+  // In-flight (reserved) attempts count toward the limits so concurrent async password checks cannot all pass before any failure is recorded.
+  if (ipState.attempts + (ipState.pending || 0) >= config.maxAttempts) {
     return { reason: "rate_limit", retryAfter: Math.max(1, Math.ceil(((ipState.windowStart + config.windowMs) - now) / 1000)) };
+  }
+  if (usernameState && (usernameState.pending || 0) > 0 && usernameState.failures + usernameState.pending >= config.blockThreshold) {
+    return { reason: "rate_limit", retryAfter: Math.max(1, Math.ceil(((usernameState.windowStart + config.windowMs) - now) / 1000)) };
   }
   const delayedState = [ipState, usernameState].find((state) => state?.nextAllowedAt && state.nextAllowedAt > now);
   if (delayedState) return { reason: "progressive_delay", retryAfter: getRetryAfterSeconds(ipState, usernameState) };
@@ -97,7 +101,40 @@ function registerFailedLoginAttempt(state, now, config) {
 }
 
 function resetLoginState(store, key) {
-  if (key) store.delete(key);
+  if (!key) return;
+  const state = store.get(key);
+  if (state && state.pending > 0) {
+    // Keep the object so in-flight reservations can still be released.
+    state.attempts = 0; state.failures = 0; state.blockedUntil = 0; state.nextAllowedAt = 0;
+    return;
+  }
+  store.delete(key);
+}
+
+// Reserve an attempt synchronously BEFORE awaiting an async password check.
+// failure() converts the reservation into a registered failure; success() just releases it.
+function reserveLoginAttempt(security) {
+  const states = [security.ipState, security.usernameState].filter(Boolean);
+  for (const state of states) state.pending = (state.pending || 0) + 1;
+  let settled = false;
+  const release = () => {
+    if (settled) return false;
+    settled = true;
+    for (const state of states) state.pending = Math.max(0, (state.pending || 0) - 1);
+    return true;
+  };
+  return {
+    release,
+    success() { release(); },
+    failure() {
+      if (!release()) return;
+      const now = Date.now();
+      security.now = now;
+      security.ipState.attempts += 1;
+      registerFailedLoginAttempt(security.ipState, now, security.config);
+      registerFailedLoginAttempt(security.usernameState, now, security.config);
+    },
+  };
 }
 
 function resetLoginUsernameState({ normalizedUsername }) {
@@ -113,4 +150,4 @@ function getRetryAfterSeconds(...states) {
   return retryAt ? Math.max(1, Math.ceil((retryAt - now) / 1000)) : 1;
 }
 
-module.exports = { getLoginRejection, getLoginSecurityState, getRetryAfterSeconds, registerFailedLoginAttempt, resetLoginUsernameState };
+module.exports = { reserveLoginAttempt, getLoginRejection, getLoginSecurityState, getRetryAfterSeconds, registerFailedLoginAttempt, resetLoginUsernameState };
