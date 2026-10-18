@@ -5,8 +5,34 @@ function isPublicLinkViewerId(viewerId) {
   return typeof viewerId === "string" && /^[a-f0-9]{32}$/.test(viewerId);
 }
 
+const SHARE_OPERATIONS = ["view", "preview", "download"];
+
+// Only a link with no permissions field at all (pre-migration legacy) maps to NULL, which reads back as all operations.
+// Every other non-array value is stored as an empty list and fails closed.
+function permissionsToColumn(permissions) {
+  if (permissions === undefined) return null;
+  if (!Array.isArray(permissions)) return "[]";
+  return JSON.stringify(SHARE_OPERATIONS.filter((operation) => permissions.includes(operation)));
+}
+
+// NULL column = legacy link (no permissions field, all operations). Malformed stored values and NULL rows that carry
+// permissions metadata fail closed to no operations.
+function rowPermissions(row, metadata) {
+  if (row.permissions_json === null || row.permissions_json === undefined) {
+    return Object.prototype.hasOwnProperty.call(metadata, "permissions") ? [] : undefined;
+  }
+  const parsed = safeJsonParse(row.permissions_json, null);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function linkAllowsOperation(link, operation) {
+  if (link.permissions === undefined) return SHARE_OPERATIONS.includes(operation);
+  return Array.isArray(link.permissions) && link.permissions.includes(operation);
+}
+
 function rowToLink(row) {
   const metadata = safeJsonParse(row.metadata_json, {});
+  const permissions = rowPermissions(row, metadata);
   return {
     ...metadata,
     fileName: row.file_name,
@@ -17,12 +43,13 @@ function rowToLink(row) {
     maxViews: Number(row.max_views) || 0,
     views: Number(row.views) || 0,
     passwordHash: row.password_hash || metadata.passwordHash || null,
+    ...(permissions === undefined ? {} : { permissions }),
   };
 }
 
 function loadPublicLinks() {
   const rows = getDb().prepare(`
-    SELECT token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json
+    SELECT token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json, permissions_json
     FROM public_links
     WHERE revoked_at IS NULL
   `).all();
@@ -49,15 +76,15 @@ function savePublicLinks(entries = {}, options = {}) {
     ensureRootFolder(db);
     const existingRows = db.prepare(`
       SELECT token, folder_id, file_name, created_by, created_at, expires_at,
-        max_views, views, password_hash, metadata_json
+        max_views, views, password_hash, metadata_json, permissions_json
       FROM public_links
       WHERE revoked_at IS NULL
     `).all();
     const existingByToken = new Map(existingRows.map((row) => [row.token, row]));
     const activeTokens = new Set();
     const insert = db.prepare(`
-      INSERT INTO public_links (token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json, revoked_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      INSERT INTO public_links (token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json, permissions_json, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
       ON CONFLICT(token) DO UPDATE SET
         folder_id = excluded.folder_id,
         file_name = excluded.file_name,
@@ -67,6 +94,7 @@ function savePublicLinks(entries = {}, options = {}) {
         views = excluded.views,
         password_hash = excluded.password_hash,
         metadata_json = excluded.metadata_json,
+        permissions_json = excluded.permissions_json,
         revoked_at = NULL
       WHERE public_links.revoked_at IS NULL
     `);
@@ -118,7 +146,8 @@ function savePublicLinks(entries = {}, options = {}) {
         Number(link.maxViews) || 0,
         views,
         link.passwordHash || link.password_hash || null,
-        jsonStringify(mergedLink)
+        jsonStringify(mergedLink),
+        permissionsToColumn(Object.prototype.hasOwnProperty.call(link, "permissions") ? link.permissions : existingLink?.permissions)
       );
     }
 
@@ -129,8 +158,8 @@ function savePublicLinks(entries = {}, options = {}) {
     }
 
     const insertRevoked = db.prepare(`
-      INSERT OR IGNORE INTO public_links (token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json, revoked_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO public_links (token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json, permissions_json, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     for (const [token, link] of Object.entries(options.removedEntries || {})) {
       const fileName = basename(link?.fileName);
@@ -147,6 +176,7 @@ function savePublicLinks(entries = {}, options = {}) {
         Number(link.views) || 0,
         link.passwordHash || link.password_hash || null,
         jsonStringify(link),
+        permissionsToColumn(link.permissions),
         now
       );
     }
@@ -176,13 +206,13 @@ function incrementPublicLinkViews(token, link) {
 function consumePublicLinkQuota(token, options = {}) {
   const db = getDb();
   const kind = options.kind;
-  if (kind !== "view" && kind !== "download") throw new TypeError("Invalid public link quota kind");
+  if (kind !== "view" && kind !== "download" && kind !== "session") throw new TypeError("Invalid public link quota kind");
 
   return db.transaction(() => {
     const fallbackLinks = options.fallbackLinks && typeof options.fallbackLinks === "object" ? options.fallbackLinks : {};
     const insertFallback = db.prepare(`
-      INSERT OR IGNORE INTO public_links (token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json, revoked_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      INSERT OR IGNORE INTO public_links (token, folder_id, file_name, created_by, created_at, expires_at, max_views, views, password_hash, metadata_json, permissions_json, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
     `);
     const now = nowIso();
     for (const [fallbackToken, fallbackLink] of Object.entries(fallbackLinks)) {
@@ -199,13 +229,14 @@ function consumePublicLinkQuota(token, options = {}) {
         Number(fallbackLink.maxViews) || 0,
         Number(fallbackLink.views) || 0,
         fallbackLink.passwordHash || fallbackLink.password_hash || null,
-        jsonStringify(fallbackLink)
+        jsonStringify(fallbackLink),
+        permissionsToColumn(fallbackLink.permissions)
       );
     }
 
     const row = db.prepare(`
       SELECT token, folder_id, file_name, created_by, created_at, expires_at,
-        max_views, views, password_hash, metadata_json
+        max_views, views, password_hash, metadata_json, permissions_json
       FROM public_links
       WHERE token = ? AND revoked_at IS NULL
     `).get(token);
@@ -224,15 +255,16 @@ function consumePublicLinkQuota(token, options = {}) {
     }
     const expiresAt = new Date(link.expiresAt).getTime();
     if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return { status: "expired" };
+    if (options.requiredOperation && !linkAllowsOperation(link, options.requiredOperation)) return { status: "operation_denied" };
 
-    if (kind === "view") {
+    if (kind === "view" || kind === "session") {
       const views = Number(row.views) || 0;
       const maxViews = Number(row.max_views) || 0;
       if (process.env.NODE_ENV === "test" && typeof options.afterQuotaRead === "function") options.afterQuotaRead();
-      if (maxViews > 0 && views >= maxViews) return { status: "limit", limit: "views" };
+      if (kind === "view" && maxViews > 0 && views >= maxViews) return { status: "limit", limit: "views" };
 
-      link.views = views + 1;
-      link.lastViewedAt = now;
+      link.views = kind === "view" ? views + 1 : views;
+      if (kind === "view") link.lastViewedAt = now;
       if (isPublicLinkViewerId(options.viewer?.id) && options.viewer?.expiresAt) {
         const viewers = link.activeViewers && typeof link.activeViewers === "object" ? link.activeViewers : {};
         for (const [viewerId, viewer] of Object.entries(viewers)) {
