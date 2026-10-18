@@ -55,6 +55,7 @@ const restoreProviderOrphans = require("./services/restoreProviderOrphans");
 const { getUploadQuarantineDir } = require("./src/quarantine-paths");
 const { createRestoreRequestGate } = require("./services/restoreRequestGate");
 const trashRepository = require("./repositories/trashRepository");
+const fileSearchIndexRepository = require("./repositories/fileSearchIndexRepository");
 const trashService = require("./services/trashService");
 const { createCloudStorage } = require("./services/cloudStorage");
 const { createFileLifecycleLock } = require("./services/fileLifecycleLock");
@@ -10958,6 +10959,39 @@ app.get("/list", fileListRateLimit, authenticate, requirePermission("listFiles")
   }
 });
 
+// Issue #63 step 1: with the database enabled, the FTS5 index narrows which listed files
+// go through the visibility pipeline. Protected (encrypted) names are never indexed; they
+// are always kept as candidates so they stay searchable exactly as before. Permission,
+// trash, expiry, encryption and the substring filter in filterSearchResults still apply.
+// Any index failure or zero FTS hits falls back to the full existing scan.
+async function listSearchVisibleFiles(req, folder, caches, q) {
+  if (!q || !shouldUseDatabase() || !fileSearchIndexRepository.buildMatchQuery(q)) {
+    return listVisibleFilesForFolder(req, folder, caches);
+  }
+
+  const files = await listFilesWithCloudDetails(folder.uploadDir, folder.id, "uploads");
+  let candidateNames = null;
+  try {
+    const isProtected = (name) => Boolean(getEncryptedFileMetadata(folder.id, name, caches.encryptedFiles));
+    fileSearchIndexRepository.syncFolder(folder.id, files.map((file) => file.name), isProtected);
+    const SEARCH_HIT_LIMIT = 50000;
+    const hits = fileSearchIndexRepository.search(q, SEARCH_HIT_LIMIT, folder.id);
+    // A truncated hit list could drop real matches, so fall back to the full scan.
+    if (hits.length && hits.length < SEARCH_HIT_LIMIT) {
+      candidateNames = new Set(hits.map((hit) => hit.fileName));
+      for (const file of files) {
+        if (isProtected(file.name)) candidateNames.add(file.name);
+      }
+    }
+  } catch {
+    candidateNames = null;
+  }
+
+  const selected = candidateNames ? files.filter((file) => candidateNames.has(file.name)) : files;
+  caches.fileExpirations = loadFileExpirations();
+  return selected.map((file) => buildVisibleFileEntry(req, folder, file, caches)).filter(Boolean);
+}
+
 async function handleFileSearch(req, res) {
   const foldersToSearch = getSearchFolders(req, req.query.folderId);
   if (!foldersToSearch) return res.status(403).json({ error: "Acesso negado a esta pasta" });
@@ -10978,7 +11012,7 @@ async function handleFileSearch(req, res) {
 
   try {
     const caches = getFileListCaches();
-    const lists = await Promise.all(foldersToSearch.map((folder) => listVisibleFilesForFolder(req, folder, caches).catch(() => [])));
+    const lists = await Promise.all(foldersToSearch.map((folder) => listSearchVisibleFiles(req, folder, caches, filters.q).catch(() => [])));
     const results = sortSearchResults(filterSearchResults(lists.flat(), filters), sortBy, sortOrder);
     res.json(results);
   } catch (error) {
