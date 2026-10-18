@@ -254,6 +254,13 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 7,
+    name: "public_link_permissions",
+    up(db) {
+      db.exec("ALTER TABLE public_links ADD COLUMN permissions_json TEXT;");
+    },
+  },
 ];
 
 function ensureMigrationTable(db) {
