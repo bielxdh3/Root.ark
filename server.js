@@ -12470,7 +12470,8 @@ const listenForRequests = () => {
       } catch (error) {
         console.error("[restore] startup acknowledgement or provider inventory initialization failed; startup blocked:", sanitizeLogValue(error.message));
         server.close();
-        process.exit(1);
+        // Node 24 on Windows can abort in libuv when exiting before async handles finish closing.
+        setTimeout(() => process.exit(1), 100);
         return;
       }
       startupRestoreLease();
