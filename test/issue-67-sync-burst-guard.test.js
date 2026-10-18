@@ -550,3 +550,48 @@ test("issue 67 store: a paused device is blocked at the store boundary and histo
   assert.equal((await store.put("alice", rejected)).kind, "paused");
   assert.equal(store.history("alice", "object-1").length, historyBefore);
 });
+
+async function raceTwoDeviceResumes(t, codeForAccount) {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-concurrent-resume-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const pending = [];
+  // Release both password checks together to exercise the stale-snapshot boundary.
+  const bcryptImpl = {
+    compare: () => new Promise((resolve) => {
+      pending.push(resolve);
+      if (pending.length === 2) pending.forEach((release) => release(true));
+    }),
+  };
+  const { port, route } = await startServer(t, {
+    storagePath: path.join(dir, "objects.json"),
+    bcryptImpl,
+    accountUsers: account.users,
+  });
+  await route.store.transact((next) => {
+    const user = route.store.user(next, "alice");
+    user.pausedDevices = {
+      "d:device-a": { pausedAt: new Date().toISOString(), reason: "test" },
+      "d:device-b": { pausedAt: new Date().toISOString(), reason: "test" },
+    };
+  });
+  const code = codeForAccount(account);
+  const body = { password: PASSWORD, code };
+  const results = await Promise.all([
+    resumeRequest(port, body),
+    jsonRequest(port, "/sync/v1/devices/device-b/resume", "POST", body),
+  ]);
+  assert.deepEqual(results.map((result) => result.status).sort((a, b) => a - b), [200, 401]);
+  assert.equal(["device-a", "device-b"].filter((device) => route.store.isDevicePaused("alice", device)).length, 1);
+  return { route, account };
+}
+
+test("issue 67 resume 2FA: concurrent requests cannot reuse the same TOTP step", { timeout: 30_000 }, async (t) => {
+  const { route } = await raceTwoDeviceResumes(t, (account) => codeAt(account.secret));
+  assert.equal(typeof route.accountState.users[0].totpLastUsedStep, "number");
+});
+
+test("issue 67 resume 2FA: concurrent requests cannot reuse the same recovery code", { timeout: 30_000 }, async (t) => {
+  const { route } = await raceTwoDeviceResumes(t, (account) => account.recoveryCodes[0]);
+  assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 1);
+});

@@ -401,7 +401,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       const checkedHash = snapshot.password;
       const checkedSessionVersion = snapshot.sessionVersion || 0;
       // Re-load after the awaits above and revalidate; the account may have changed meanwhile.
-      const users = await loadUsers();
+      const users = loadUsers();
       const user = Array.isArray(users) ? users.find((entry) => entry?.username === username) : null;
       if (!user || user.disabled || user.password !== checkedHash || (user.sessionVersion || 0) !== checkedSessionVersion) {
         return errorResponse(res, 401, "Re-authentication failed");
