@@ -750,6 +750,134 @@ test("cache eviction fails closed when the remote object is missing, deleted, or
   assert.equal(sync.snapshot.remoteOnly[current.objectId], undefined);
 });
 
+test("cache eviction leaves the snapshot and local file unchanged when the post-stage identity check fails", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-evict-rollback-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const state = { offline: false };
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", state);
+  const source = path.join(dir, "source");
+  await fsp.mkdir(source, { recursive: true });
+  await fsp.writeFile(path.join(source, "cached.txt"), "remote cache payload");
+  await (await engine(source, adapter, key)).syncOnce();
+  const root = path.join(dir, "device");
+  const sync = await engine(root, adapter, key);
+  await sync.syncOnce();
+  const localPath = path.join(root, "cached.txt");
+  const memoryBefore = JSON.stringify(sync.snapshot);
+  const diskBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"), "utf8");
+
+  const originalLstat = fsp.lstat;
+  fsp.lstat = async function injectedLstat(target, options) {
+    if (String(target).includes(`${path.sep}.rootark-trash${path.sep}`) && await originalLstat(localPath).then(() => false, () => true)) {
+      throw Object.assign(new Error("injected identity check failure"), { code: "EIO" });
+    }
+    return originalLstat.call(fsp, target, options);
+  };
+  t.after(() => { fsp.lstat = originalLstat; });
+  await assert.rejects(() => sync.evictLocal("cached.txt"), { code: "EIO" });
+  fsp.lstat = originalLstat;
+
+  assert.equal(await fsp.readFile(localPath, "utf8"), "remote cache payload");
+  assert.equal(JSON.stringify(sync.snapshot), memoryBefore);
+  assert.equal(await fsp.readFile(path.join(root, ".rootark-sync-index.json"), "utf8"), diskBefore);
+  assert.equal(sync.snapshot.remoteOnly[store.list("alice")[0].objectId], undefined);
+});
+
+async function evictionFixture(t, name) {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), `rootark-phase16-${name}-`));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const key = crypto.randomBytes(32);
+  const state = { offline: false };
+  const store = await new SyncObjectStore(path.join(dir, "objects.json")).open();
+  const adapter = await adapterFor(store, "alice", state);
+  const source = path.join(dir, "source");
+  await fsp.mkdir(source, { recursive: true });
+  await fsp.writeFile(path.join(source, "cached.txt"), "remote cache payload");
+  await (await engine(source, adapter, key)).syncOnce();
+  const before = store.list("alice")[0];
+  const root = path.join(dir, "device");
+  const sync = await engine(root, adapter, key);
+  await sync.syncOnce();
+  return { dir, key, store, adapter, root, sync, before, localPath: path.join(root, "cached.txt"), trash: path.join(root, ".rootark-trash") };
+}
+
+test("cache eviction keeps the committed eviction and the staged copy when unlink of the staged copy fails", async (t) => {
+  const { key, store, adapter, root, sync, before, localPath, trash } = await evictionFixture(t, "unlink-fail");
+  const originalUnlink = fsp.unlink;
+  fsp.unlink = async function injectedUnlink(target, ...rest) {
+    if (String(target).includes(`${path.sep}.rootark-trash${path.sep}`)) throw Object.assign(new Error("injected unlink failure"), { code: "EPERM" });
+    return originalUnlink.call(fsp, target, ...rest);
+  };
+  t.after(() => { fsp.unlink = originalUnlink; });
+  assert.equal(await sync.evictLocal("cached.txt"), true);
+  fsp.unlink = originalUnlink;
+
+  assert.equal(await fsp.stat(localPath).then(() => true, () => false), false);
+  assert.equal((await fsp.readdir(trash)).length, 1);
+  assert.equal(sync.snapshot.remoteOnly[before.objectId].reason, "evicted");
+  assert.equal(sync.snapshot.files["cached.txt"], undefined);
+
+  const fresh = await engine(root, adapter, key);
+  const summary = await fresh.syncOnce();
+  assert.equal(summary.pushed, 0);
+  assert.equal(store.list("alice")[0].tombstone, false);
+  assert.equal(store.list("alice")[0].operationId, before.operationId);
+});
+
+test("cache eviction rollback surfaces a failed rollback persist and the next sync heals without a remote delete", async (t) => {
+  const { key, store, adapter, root, sync, before, localPath } = await evictionFixture(t, "rollback-persist");
+  const originalPersist = sync.persistSnapshot.bind(sync);
+  let calls = 0;
+  sync.persistSnapshot = async function injectedPersist() {
+    calls += 1;
+    if (calls === 1) {
+      // The marker reaches disk, then the persist reports failure, so the disk holds the evicted marker.
+      await originalPersist();
+      throw Object.assign(new Error("injected persist failure"), { code: "EIO" });
+    }
+    throw Object.assign(new Error("injected rollback persist failure"), { code: "EIO2" });
+  };
+  await assert.rejects(() => sync.evictLocal("cached.txt"), (error) => error.code === "eviction_rollback_failed"
+    && error.cause?.code === "EIO" && error.rollbackCause?.code === "EIO2");
+  assert.equal(await fsp.readFile(localPath, "utf8"), "remote cache payload");
+
+  const fresh = await engine(root, adapter, key);
+  assert.equal(fresh.snapshot.remoteOnly[before.objectId].reason, "evicted");
+  const summary = await fresh.syncOnce();
+  assert.equal(fresh.snapshot.remoteOnly[before.objectId], undefined);
+  assert.equal(summary.pushed, 0);
+  assert.equal(await fsp.readFile(localPath, "utf8"), "remote cache payload");
+  assert.equal(store.list("alice")[0].tombstone, false);
+  assert.equal(store.list("alice")[0].operationId, before.operationId);
+});
+
+test("cache eviction keeps the staged copy and the marker when the local path is recreated before restore", async (t) => {
+  const { key, store, adapter, root, sync, before, localPath, trash } = await evictionFixture(t, "restore-recreated");
+  const originalLstat = fsp.lstat;
+  fsp.lstat = async function injectedLstat(target, options) {
+    if (String(target).includes(`${path.sep}.rootark-trash${path.sep}`) && await originalLstat(localPath).then(() => false, () => true)) {
+      await fsp.writeFile(localPath, "user recreated file");
+      throw Object.assign(new Error("injected identity check failure"), { code: "EIO" });
+    }
+    return originalLstat.call(fsp, target, options);
+  };
+  t.after(() => { fsp.lstat = originalLstat; });
+  await assert.rejects(() => sync.evictLocal("cached.txt"), (error) => error.code === "eviction_restore_failed"
+    && error.cause?.code === "EIO");
+  fsp.lstat = originalLstat;
+
+  assert.equal(await fsp.readFile(localPath, "utf8"), "user recreated file");
+  assert.equal((await fsp.readdir(trash)).length, 1);
+  assert.equal(sync.snapshot.remoteOnly[before.objectId].reason, "evicted");
+
+  const fresh = await engine(root, adapter, key);
+  await fresh.syncOnce();
+  assert.equal(await fsp.readFile(localPath, "utf8"), "user recreated file");
+  assert.equal(store.list("alice")[0].tombstone, false);
+});
+
 test("selective remote-only state survives restart and reconnect with a changed scope", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-phase16-selective-restart-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));

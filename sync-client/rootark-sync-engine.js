@@ -7,6 +7,7 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 
 const protocol = require("./rootark-sync-protocol");
+const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 
@@ -14,6 +15,8 @@ const SNAPSHOT_VERSION = 1;
 const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock"]);
 const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-"];
 const ROOT_MUTATION_QUEUES = new Map();
+const MAX_EVICTION_ATTEMPTS = 3;
+const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
 const ROOT_MUTATION_CONTEXT = new AsyncLocalStorage();
 
 function fail(message, code = "sync_engine_error") {
@@ -191,6 +194,16 @@ function pathsEqual(left, right) {
   return pathWithin(left, right) && pathWithin(right, left);
 }
 
+function evictionError(code, message, cause, rollbackCause) {
+  return Object.assign(new Error(message), { code, cause, ...(rollbackCause ? { rollbackCause } : {}) });
+}
+
+function normalizeExcludedPaths(value) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) fail("Excluded paths must be an array", "invalid_excluded_paths");
+  return [...new Set(value.map((item) => validatePortableRelativePath(item, "excludedPath")))].sort();
+}
+
 function pathKey(relativePath) {
   return process.platform === "win32" ? relativePath.toLowerCase() : relativePath;
 }
@@ -234,6 +247,7 @@ class SyncEngine {
     this.maxRetries = Math.max(1, Math.min(5, Number(options.maxRetries || 3)));
     if (options.selectedPaths != null && !Array.isArray(options.selectedPaths)) fail("Selected paths must be an array", "invalid_selected_paths");
     this.selectedPaths = options.selectedPaths == null ? null : [...new Set(options.selectedPaths.map((value) => protocol.safeRelativePath(value, "selectedPath")))].sort();
+    this.excludedPaths = normalizeExcludedPaths(options.excludedPaths);
     this.snapshot = { version: SNAPSHOT_VERSION, files: {}, remoteOnly: {} };
     this.snapshotDiskRevision = null;
     this.opened = false;
@@ -320,6 +334,16 @@ class SyncEngine {
       if (parsed.version !== SNAPSHOT_VERSION || !parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) fail("Invalid sync snapshot", "invalid_snapshot");
       if (parsed.remoteOnly === undefined) parsed.remoteOnly = {};
       if (!parsed.remoteOnly || typeof parsed.remoteOnly !== "object" || Array.isArray(parsed.remoteOnly)) fail("Invalid remote-only sync state", "invalid_snapshot");
+      if (parsed.excludedPaths !== undefined) {
+        try { parsed.excludedPaths = normalizeExcludedPaths(parsed.excludedPaths); } catch { fail("Invalid excluded sync paths", "invalid_snapshot"); }
+      }
+      if (parsed.pendingEvictions !== undefined) {
+        if (!parsed.pendingEvictions || typeof parsed.pendingEvictions !== "object" || Array.isArray(parsed.pendingEvictions)) fail("Invalid pending evictions", "invalid_snapshot");
+        for (const entry of Object.values(parsed.pendingEvictions)) {
+          if (!entry || typeof entry !== "object" || typeof entry.code !== "string" || !Number.isInteger(entry.attempts) || entry.attempts < 0) fail("Invalid pending eviction", "invalid_snapshot");
+          try { protocol.safeRelativePath(entry.path, "path"); } catch { fail("Invalid pending eviction path", "invalid_snapshot"); }
+        }
+      }
       for (const [objectId, item] of Object.entries(parsed.remoteOnly)) {
         if (!item || typeof item !== "object" || item.objectId !== objectId || typeof item.path !== "string") fail("Invalid remote-only sync entry", "invalid_snapshot");
         try {
@@ -352,11 +376,20 @@ class SyncEngine {
     if (this.verifyIncoming && await this.verifyIncoming(operation) !== true) fail("Remote sync authorization rejected", "remote_authorization_rejected");
   }
 
-  isSelected(relativePath) {
+  isInScope(relativePath) {
     return this.selectedPaths === null || this.selectedPaths.some((selected) => pathWithin(relativePath, selected));
   }
 
+  isExcluded(relativePath) {
+    return this.excludedPaths.some((excluded) => pathWithin(relativePath, excluded));
+  }
+
+  isSelected(relativePath) {
+    return this.isInScope(relativePath) && !this.isExcluded(relativePath);
+  }
+
   needsTraversal(relativePath) {
+    if (this.isExcluded(relativePath)) return false;
     return this.selectedPaths === null || this.isSelected(relativePath)
       || this.selectedPaths.some((selected) => pathWithin(selected, relativePath));
   }
@@ -1186,7 +1219,7 @@ class SyncEngine {
   async _evictLocal(relativePath) {
     if (!this.opened) await this._open();
     const safePath = await canonicalRelativePath(this.rootDir, relativePath);
-    if (!this.isSelected(safePath)) fail("Only selected paths can be evicted", "path_not_selected");
+    if (!this.isInScope(safePath)) fail("Only selected paths can be evicted", "path_not_selected");
     const prior = this.snapshot.files[safePath];
     if (!prior || prior.deleted || prior.directory || !/^[a-f0-9]{64}$/.test(prior.hash || "")) fail("Only a tracked file can be evicted", "cache_entry_unavailable");
     const pending = await this.journal.recover();
@@ -1229,20 +1262,69 @@ class SyncEngine {
       fail("Local file changed during cache verification", "local_changes_pending");
     }
 
+    const hadPriorMarker = Object.prototype.hasOwnProperty.call(this.snapshot.remoteOnly, prior.objectId);
+    const priorMarker = hadPriorMarker ? this.snapshot.remoteOnly[prior.objectId] : undefined;
+    const restoreMemoryMarker = () => {
+      if (hadPriorMarker) this.snapshot.remoteOnly[prior.objectId] = priorMarker;
+      else delete this.snapshot.remoteOnly[prior.objectId];
+    };
+    // Only used while the file is back at its path, so a failed rollback persist leaves a state the
+    // next reconcile resolves (the file is local and the stale marker is dropped) without a remote delete.
+    const rollbackEviction = async (cause) => {
+      restoreMemoryMarker();
+      try {
+        await this.persistSnapshot();
+      } catch (persistError) {
+        throw evictionError("eviction_rollback_failed", "Eviction rollback could not be persisted; the next sync reconciles this file", cause, persistError);
+      }
+      throw cause;
+    };
+
+    // The marker is committed before the file leaves its path, so the file is never outside its path
+    // without a durable record that the remote object is the only copy.
     this.snapshot.remoteOnly[prior.objectId] = {
       objectId: remote.objectId, fileId: remote.fileId, versionId: remote.versionId,
       revision: remote.revision, path: safePath, directory: false, deleted: false, reason: "evicted", hash,
     };
-    await this.persistSnapshot();
-    const staged = await this.stageExisting(target);
-    if (!staged) fail("Local cache entry disappeared during eviction", "cache_entry_unavailable");
-    const stagedStats = await fsp.lstat(staged, { bigint: true });
-    if (!stagedStats.isFile() || !sameFileIdentity(beforeStage, stagedStats) || stagedStats.size !== beforeStage.size
-      || stagedStats.mtimeNs !== beforeStage.mtimeNs || stagedStats.mode !== beforeStage.mode) {
-      if (!(await exists(target))) await fsp.rename(staged, target);
-      fail("Local file changed during cache eviction", "unsafe_path");
+    try {
+      await this.persistSnapshot();
+    } catch (error) {
+      await rollbackEviction(error);
     }
-    await fsp.unlink(staged);
+
+    let staged;
+    try {
+      staged = await this.stageExisting(target);
+      if (!staged) fail("Local cache entry disappeared during eviction", "cache_entry_unavailable");
+    } catch (error) {
+      await rollbackEviction(error);
+    }
+    // Renames the staged copy back only if nothing now occupies the path. Never deletes the staged copy.
+    const restoreStagedFile = async () => {
+      if (await exists(target)) return false;
+      await fsp.rename(staged, target);
+      return true;
+    };
+    try {
+      const stagedStats = await fsp.lstat(staged, { bigint: true });
+      if (!stagedStats.isFile() || !sameFileIdentity(beforeStage, stagedStats) || stagedStats.size !== beforeStage.size
+        || stagedStats.mtimeNs !== beforeStage.mtimeNs || stagedStats.mode !== beforeStage.mode) {
+        fail("Local file changed during cache eviction", "unsafe_path");
+      }
+    } catch (error) {
+      // The marker is committed and the file is out of its path. Restore the file when possible; otherwise
+      // keep the eviction (marker stays) and the staged copy, so reconciliation never pushes a delete.
+      let restored;
+      try {
+        restored = await restoreStagedFile();
+      } catch (restoreError) {
+        throw evictionError("eviction_restore_failed", "Eviction could not restore the local file; the staged copy is kept in the trash folder", error, restoreError);
+      }
+      if (!restored) throw evictionError("eviction_restore_failed", "The local path was recreated during eviction; the staged copy is kept in the trash folder", error);
+      await rollbackEviction(error);
+    }
+    // The eviction is committed and the file is out of its path, so a failed cleanup only leaves the staged copy in the trash folder.
+    await fsp.unlink(staged).catch(() => {});
     if (this.snapshot.files[safePath]?.objectId === prior.objectId) delete this.snapshot.files[safePath];
     await this.persistSnapshot();
     return true;
@@ -1328,12 +1410,80 @@ class SyncEngine {
         remoteOnlyChanged = true;
         continue;
       }
-      if (this.journal.hasSeen(operation.operationId)) continue;
+      // A folder re-included after an exclusion must hydrate even if this operation was seen before.
+      if (this.journal.hasSeen(operation.operationId) && remoteOnly?.reason !== "excluded") continue;
       await this._apply(operation, summary);
       await this.journal.markSeen(operation.operationId);
       summary.pulled += 1;
     }
     if (remoteOnlyChanged) await this.persistSnapshot();
+  }
+
+  // Applies the configured exclusions once per change. Excluded tracked files are evicted
+  // through the guarded _evictLocal path; excluded files with no local copy become remote-only
+  // records so that no remote delete can ever be pushed for them. Remote objects are never deleted.
+  async _applyExcludedPaths() {
+    const applied = this.snapshot.excludedPaths || [];
+    const listChanged = JSON.stringify(applied) !== JSON.stringify(this.excludedPaths);
+    this.snapshot.pendingEvictions = this.snapshot.pendingEvictions || {};
+    const pendingEvictions = this.snapshot.pendingEvictions;
+    if (!listChanged && !Object.keys(pendingEvictions).length) return null;
+    const report = { evicted: 0, released: 0, kept: [], failed: [] };
+    const pending = await this.journal.recover();
+    const excludedObjectIds = new Set();
+    for (const [relative, prior] of Object.entries(this.snapshot.files)) {
+      if (prior.deleted || prior.directory || !this.isExcluded(relative)) continue;
+      const retry = pendingEvictions[prior.objectId];
+      if (!listChanged && !retry) continue;
+      excludedObjectIds.add(prior.objectId);
+      if (retry && retry.attempts >= MAX_EVICTION_ATTEMPTS) {
+        report.failed.push({ path: relative, code: retry.code });
+        continue;
+      }
+      delete pendingEvictions[prior.objectId];
+      if (pending.some((operation) => operation.objectId === prior.objectId
+        || operation.metadata?.path === relative || operation.metadata?.sourcePath === relative)) {
+        report.kept.push({ path: relative, code: "sync_operation_pending" });
+        continue;
+      }
+      const target = await contained(this.rootDir, relative, true);
+      if (!(await exists(target))) {
+        this.snapshot.remoteOnly[prior.objectId] = {
+          objectId: prior.objectId, fileId: prior.fileId, versionId: prior.versionId, revision: prior.revision,
+          path: relative, directory: false, deleted: false, reason: "excluded", ...(prior.hash ? { hash: prior.hash } : {}),
+        };
+        delete this.snapshot.files[relative];
+        report.released += 1;
+        continue;
+      }
+      try {
+        await this._evictLocal(relative);
+        report.evicted += 1;
+      } catch (error) {
+        const code = error?.code || "unknown";
+        // Transient failures (for example a file held open on Windows) are retried on later cycles, up to a bound.
+        // Other failures, including local edits, are reported once and never retried.
+        if (TRANSIENT_EVICTION_CODES.has(code)) {
+          const attempts = (retry?.attempts || 0) + 1;
+          pendingEvictions[prior.objectId] = { path: relative, code, attempts };
+          if (attempts >= MAX_EVICTION_ATTEMPTS) report.failed.push({ path: relative, code });
+          else report.kept.push({ path: relative, code });
+        } else {
+          report.kept.push({ path: relative, code });
+        }
+      }
+    }
+    // Drop retry records for objects that are no longer tracked as excluded local files.
+    for (const objectId of Object.keys(pendingEvictions)) {
+      if (!excludedObjectIds.has(objectId)) delete pendingEvictions[objectId];
+    }
+    if (Object.keys(pendingEvictions).length) this.snapshot.pendingEvictions = pendingEvictions;
+    else delete this.snapshot.pendingEvictions;
+    // The applied list is stored only when exclusions are configured, so snapshots of devices that never use them keep their existing shape.
+    if (this.excludedPaths.length) this.snapshot.excludedPaths = [...this.excludedPaths];
+    else delete this.snapshot.excludedPaths;
+    await this.persistSnapshot();
+    return report;
   }
 
   async syncOnce() {
@@ -1343,6 +1493,8 @@ class SyncEngine {
   async _syncOnce() {
     if (!this.opened) await this._open();
     const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
+    const excluded = await this._applyExcludedPaths();
+    if (excluded) summary.excluded = excluded;
     await this._reconcileLocal();
     await this._pushPending(summary);
     if (!summary.offline) await this._pullRemote(summary);
@@ -1350,4 +1502,4 @@ class SyncEngine {
   }
 }
 
-module.exports = { SyncEngine, contained, containedAbsolute };
+module.exports = { SyncEngine, contained, containedAbsolute, normalizeExcludedPaths };
