@@ -1620,7 +1620,7 @@ const SHARE_OPERATIONS = ["view", "preview", "download"];
 
 // Creation input: absent means all operations (backward compatible); present must be a non-empty, unique subset.
 function normalizeSharePermissionsInput(rawValue) {
-  if (rawValue === undefined || rawValue === null) return [...SHARE_OPERATIONS];
+  if (rawValue === undefined) return [...SHARE_OPERATIONS];
   if (!Array.isArray(rawValue) || rawValue.length === 0) return null;
   if (!rawValue.every((item) => typeof item === "string" && SHARE_OPERATIONS.includes(item))) return null;
   if (new Set(rawValue).size !== rawValue.length) return null;

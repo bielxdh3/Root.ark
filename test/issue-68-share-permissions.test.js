@@ -369,3 +369,23 @@ test("permissions null and malformed stored values fail closed, legacy absence s
   const legacy = await publicPost(legacyToken, "view");
   assert.equal(legacy.status, 200, "legacy link without permissions field still works");
 });
+
+for (const mode of ["json", "sqlite"]) {
+  test(`explicit null permissions is rejected while an absent field stores the full explicit allowlist (${mode} storage)`, { timeout: 60_000 }, async (t) => {
+    const { authed, dataDir } = await startFixture(t, mode);
+    const base = { name: FILE_NAME, folderId: "root", expiresInMinutes: 60 };
+
+    const nullCreate = await authed("/share", { ...base, permissions: null });
+    assert.equal(nullCreate.status, 400, "explicit null is invalid, not a default");
+    assert.equal(nullCreate.body.includes("token"), false, "no link is created for null");
+
+    const absent = await authed("/share", base);
+    assert.equal(absent.status, 201, absent.body);
+    const { token } = JSON.parse(absent.body);
+    assert.deepEqual(JSON.parse(absent.body).permissions, ALL_OPERATIONS);
+    if (mode === "json") {
+      const stored = JSON.parse(fs.readFileSync(path.join(dataDir, "public-links.json"), "utf8"))[token];
+      assert.deepEqual(stored.permissions, ALL_OPERATIONS, "absent field stores an explicit full allowlist");
+    }
+  });
+}
