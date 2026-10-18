@@ -1,12 +1,17 @@
 package dev.rootark.core.sync
 
 /**
- * Data shapes for the Root.ark sync wire protocol (`protocolVersion = 2`).
+ * Wire shapes for the Root.ark sync protocol (`protocolVersion = 2`).
  *
- * Source of truth: `sync-client/rootark-sync-protocol.js` (operation fields,
- * metadata allow-list) and `src/routes/sync.js` (`publicRecord`, list/get
- * responses). Field names are the exact JSON names. Only ciphertext and the
- * allow-listed metadata travel to the server; keys and plaintext never do.
+ * Property names are the exact JSON names. Types follow the JSON values: integers are
+ * JSON numbers (Long/Int), ids and encrypted fields are strings, and `null` is only
+ * accepted where the property is nullable. The server sends no timestamps in these
+ * objects. Source of truth: `src/routes/sync.js` (`publicRecord`, list/conflict bodies)
+ * and `sync-client/rootark-sync-protocol.js` (operation fields, metadata allow-list).
+ *
+ * Checked by test/issue-64-android-contract.test.js against
+ * android/core/src/test/resources/server-responses.json, which is captured from the
+ * real handlers by scripts/issue-64-android-fixtures.js.
  */
 
 /** Wire value of `protocolVersion` in every sync operation and list response. */
@@ -24,17 +29,16 @@ enum class SyncOperationType(val wire: String) {
     }
 }
 
-/** Lamport-style revision. Ordering is by [counter] then [deviceId], never wall-clock time. */
+/** Lamport-style revision. Ordering is by `counter`, then `deviceId`; never wall-clock time. */
 data class SyncRevision(
     val counter: Long,
     val deviceId: String,
 )
 
 /**
- * Deterministic metadata allow-list. Each operation type uses a subset of these
- * keys (see `METADATA_KEYS_BY_OPERATION` in the Node protocol). Unused keys are null.
- * `path` and `name` are routing metadata visible to the server; they must be
- * validated with `PortablePathValidator` before being sent.
+ * Deterministic metadata allow-list. The server emits only the keys the operation
+ * type allows, so absent keys are null here. `path` and `name` are server-visible
+ * routing metadata and must pass `PortablePathValidator` before being sent.
  */
 data class SyncMetadata(
     val fileId: String? = null,
@@ -51,30 +55,62 @@ data class SyncMetadata(
 )
 
 /**
- * Operation body sent to `POST /sync/v1/objects` (create), `PUT .../:objectId`
- * (update, move) and `DELETE .../:objectId` (delete, tombstone). Ciphertext
- * fields are base64url strings produced client-side.
+ * Device authorization proof attached as `authorization` (schema from
+ * `PROOF_FIELDS` in `sync-client/rootark-sync-authorization.js`). Digests, keys and
+ * signatures are base64url strings. It carries no key material.
+ */
+data class SyncAuthorizationProof(
+    val schemaVersion: Int,
+    val type: String,
+    val suite: String,
+    val protocolVersion: Int,
+    val username: String,
+    val deviceId: String,
+    val operationId: String,
+    val objectId: String,
+    val fileId: String,
+    val versionId: String,
+    val operation: String,
+    val revision: SyncRevision,
+    val baseRevision: SyncRevision?,
+    val keyEpoch: String,
+    val compartmentId: String,
+    val metadata: SyncMetadata,
+    val aadDigest: String,
+    val ciphertextDigest: String,
+    val nonceDigest: String,
+    val tagDigest: String,
+    val expiresAt: Long,
+    val replayId: String,
+    val idempotencyKey: String,
+    val publicKey: String,
+    val signature: String,
+)
+
+/**
+ * Body of `POST /sync/v1/objects`, `PUT /sync/v1/objects/:objectId` and
+ * `DELETE /sync/v1/objects/:objectId`. `authorization` is optional and only sent when
+ * the server requires device authorization.
  */
 data class SyncOperationRequest(
-    val protocolVersion: Int = SYNC_PROTOCOL_VERSION,
+    val protocolVersion: Int,
     val operationId: String,
     val objectId: String,
     val fileId: String,
     val versionId: String,
     val operation: SyncOperationType,
     val revision: SyncRevision,
-    val baseRevision: SyncRevision? = null,
+    val baseRevision: SyncRevision?,
     val keyEpoch: String,
     val compartmentId: String,
     val deviceId: String,
     val metadata: SyncMetadata,
-    val tombstone: Boolean = false,
-    val ciphertext: String = "",
-    val nonce: String = "",
-    val tag: String = "",
-    val aad: String = "",
-    /** Raw JSON object of the device authorization proof, when the server requires one. */
-    val authorizationJson: String? = null,
+    val tombstone: Boolean,
+    val ciphertext: String,
+    val nonce: String,
+    val tag: String,
+    val aad: String,
+    val authorization: SyncAuthorizationProof? = null,
 )
 
 /** Stored record returned by the server (`publicRecord` in `src/routes/sync.js`). */
@@ -92,15 +128,27 @@ data class SyncRecord(
     val deviceId: String,
     val metadata: SyncMetadata,
     val tombstone: Boolean,
-    val ciphertext: String?,
-    val nonce: String?,
-    val tag: String?,
-    val aad: String?,
-    val authorizationJson: String?,
+    /** Empty string for tombstones (delete operations), not null. */
+    val ciphertext: String,
+    val nonce: String,
+    val tag: String,
+    val aad: String,
+    val authorization: SyncAuthorizationProof? = null,
 )
 
 /** Response of `GET /sync/v1/objects`. */
 data class SyncListResponse(
     val protocolVersion: Int,
     val objects: List<SyncRecord>,
+)
+
+/**
+ * Body of a 409 response from the write routes. `error` is the server's text. The
+ * revision and record are present for stale and base-revision conflicts, and absent
+ * for replay rejections.
+ */
+data class SyncConflict(
+    val error: String,
+    val currentRevision: SyncRevision? = null,
+    val current: SyncRecord? = null,
 )

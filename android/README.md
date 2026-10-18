@@ -34,17 +34,19 @@ Then:
 
 Set `ANDROID_HOME` or create `android/local.properties` with `sdk.dir=...` (not committed).
 
-## Contract test (runs in Node, no JDK needed)
+## Contract tests (run in Node, no JDK needed)
 
 ```
 node --test --test-reporter=tap test/issue-64-android-contract.test.js
 ```
 
-It checks that the JS validator (`sync-client/rootark-sync-paths.js`) gives the same accept/reject result as the Kotlin validator for every case in the shared fixture.
+- Path validator: the JS validator (`sync-client/rootark-sync-paths.js`) and the Kotlin validator must agree on every case in `portable-paths.json`.
+- Wire models: every field of the Kotlin data classes in `core/src/main/kotlin/dev/rootark/core/sync/` must match a real server response in `core/src/test/resources/server-responses.json` (names, nullability, JSON types).
+- The fixture is captured by calling the real route handlers in-process. Refresh it with `node scripts/issue-64-android-fixtures.js --write`. The contract test fails if the committed fixture drifts from a fresh capture.
 
 ## Not verified
 
 - Nothing in `android/` has been compiled. No JDK, Gradle, or Kotlin compiler was available when this scaffold was written, so the Kotlin sources and Gradle scripts are unverified until `./gradlew :core:test` passes on a machine with JDK 17.
 - The Kotlin tests have not been executed. Only the Node contract test has been run.
 - No secure key storage, cryptographic envelope, or metadata protocol is implemented. The protected-metadata protocol gap is documented in the architecture doc and is a blocker for protected Android content.
-- Login second-factor completion (`/auth/login/2fa`) is not modeled.
+- The HTTP client (`RootArkApi` implementation) and the 2FA UI flow are not implemented; only the wire models and interface exist.
