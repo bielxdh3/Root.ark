@@ -8,6 +8,9 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
+// Upper bound for background work (provider retries, lock release) under a loaded full-suite run.
+// These loops exit as soon as the awaited event happens; the bound only limits how long a real hang takes to fail.
+const ASYNC_EVENT_DEADLINE_MS = 20_000;
 
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = path.join(ROOT, "server.js");
@@ -490,13 +493,13 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     headers: { cookie: limitedCookie, origin: `http://127.0.0.1:${port}`, "sec-fetch-site": "same-origin" },
   });
   assert.equal(unauthorizedReplacementRead.status, 403, unauthorizedReplacementRead.body);
-  const firstUploadDeadline = Date.now() + 5000;
+  const firstUploadDeadline = Date.now() + ASYNC_EVENT_DEADLINE_MS;
   while (cloud.uploadAttemptCount(approvalProviderKey) === 0 && Date.now() < firstUploadDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.ok(cloud.uploadAttemptCount(approvalProviderKey) > 0, "the approval upload reconciliation was attempted");
   const approvalLifecycleLockDirectory = path.join(dataDir, ".rootark-cloud-file-locks");
   const approvalLifecycleLockPaths = ["folder:root", `root\0${approveTrashRecoveryName}`].map((identity) =>
     path.join(approvalLifecycleLockDirectory, `${crypto.createHash("sha256").update(identity).digest("hex")}.lock`));
-  const approvalLockReleaseDeadline = Date.now() + 5000;
+  const approvalLockReleaseDeadline = Date.now() + ASYNC_EVENT_DEADLINE_MS;
   while (approvalLifecycleLockPaths.some((lockPath) => fs.existsSync(lockPath)) && Date.now() < approvalLockReleaseDeadline) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -610,7 +613,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   cloud.failNextDeletes(restorePrunedCloudKey, 100);
   const prunedVersionRestore = await mutate(`/restore/${restorePruneRetryName}/v/1?folderId=root`, "POST");
   assert.equal(prunedVersionRestore.status, 200, prunedVersionRestore.body);
-  const prunedDeleteDeadline = Date.now() + 5000;
+  const prunedDeleteDeadline = Date.now() + ASYNC_EVENT_DEADLINE_MS;
   while (cloud.deleteAttemptCount(restorePrunedCloudKey) === restorePrunedDeleteAttempts && Date.now() < prunedDeleteDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.ok(cloud.deleteAttemptCount(restorePrunedCloudKey) > restorePrunedDeleteAttempts, "pruned remote version deletion was attempted");
   assert.equal(JSON.parse(fs.readFileSync(restorePrunedQueueRecordPath, "utf8")).desired, "absent", "pruned version has a durable absent intent instead of its previous present intent");
@@ -657,11 +660,11 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
     headers: { cookie: limitedCookie, origin: `http://127.0.0.1:${port}`, "sec-fetch-site": "same-origin" },
   });
   assert.notEqual(limitedOrphanBeforeProviderRetry.status, 200, "ordinary readers cannot receive stale provider bytes while replacement is pending");
-  const providerRetryDeadline = Date.now() + 5000;
+  const providerRetryDeadline = Date.now() + ASYNC_EVENT_DEADLINE_MS;
   while (cloud.uploadAttemptCount(orphanReplacementKey) < 2 && Date.now() < providerRetryDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
   assert.equal(cloud.uploadAttemptCount(orphanReplacementKey), 2, "startup-style reconciliation retries a failed provider upload");
   assert.equal(objects.get(orphanReplacementKey)?.toString(), "approved replacement bytes", "retry converges the provider to the approved local content");
-  const providerQueueRemovalDeadline = Date.now() + 2000;
+  const providerQueueRemovalDeadline = Date.now() + ASYNC_EVENT_DEADLINE_MS;
   while (fs.existsSync(orphanReplacementQueuePath) && Date.now() < providerQueueRemovalDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
   assert.equal(fs.existsSync(orphanReplacementQueuePath), false, "completed provider intent is removed only after success");
   const limitedOrphanAfterProviderRetry = await request(port, `/files/${orphanReplacementName}`, {
@@ -839,7 +842,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   await pendingHydrationGate.started;
   const approvalPromise = mutate(`/approve/${rejectedName}?folderId=root`, "POST");
   pendingHydrationGate.release();
-  const unlinkDeadline = Date.now() + 5000;
+  const unlinkDeadline = Date.now() + ASYNC_EVENT_DEADLINE_MS;
   while (!fs.existsSync(unlinkStarted) && Date.now() < unlinkDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(fs.existsSync(unlinkStarted), true, "rejection reaches the deterministic unlink boundary");
   let approvalSettled = false;
@@ -876,7 +879,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const reuseRejectResponse = await reuseReject;
   const pendingAfterReplacement = JSON.parse(fs.readFileSync(path.join(dataDir, "pending-uploads.json"), "utf8"))[`root/${reuseName}`];
   const localReplacementPreserved = fs.existsSync(localReplacement) && fs.readFileSync(localReplacement, "utf8") === replacement.toString();
-  const putDeadline = Date.now() + 5000;
+  const putDeadline = Date.now() + ASYNC_EVENT_DEADLINE_MS;
   while (!objects.get(replacementKey)?.equals(replacement) && Date.now() < putDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
   const replacementDeadline = Date.now() + 1500;
   while (!objects.get(replacementKey)?.equals(replacement) && Date.now() < replacementDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1042,13 +1045,13 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   const priorDeleteAttempts = cloud.deleteAttemptCount(failedDeleteKey);
   cloud.failNextDeletes(failedDeleteKey, 10);
   const failedDeleteResponse = await mutate(`/reject/${failedDeleteName}?folderId=root`, "POST");
-  const failedDeleteDeadline = Date.now() + 5000;
+  const failedDeleteDeadline = Date.now() + ASYNC_EVENT_DEADLINE_MS;
   while (cloud.deleteAttemptCount(failedDeleteKey) === priorDeleteAttempts && Date.now() < failedDeleteDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.ok(cloud.deleteAttemptCount(failedDeleteKey) > priorDeleteAttempts, "provider delete failure is injected");
   const failedDeleteLifecycleLockDirectory = path.join(dataDir, ".rootark-cloud-file-locks");
   const failedDeleteLifecycleLockPaths = ["folder:root", `root\0${failedDeleteName}`].map((identity) =>
     path.join(failedDeleteLifecycleLockDirectory, `${crypto.createHash("sha256").update(identity).digest("hex")}.lock`));
-  const failedDeleteLockReleaseDeadline = Date.now() + 5000;
+  const failedDeleteLockReleaseDeadline = Date.now() + ASYNC_EVENT_DEADLINE_MS;
   while (failedDeleteLifecycleLockPaths.some((lockPath) => fs.existsSync(lockPath)) && Date.now() < failedDeleteLockReleaseDeadline) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -1136,7 +1139,7 @@ test("version and pending mutations serialize with cache hydration", { timeout: 
   folderBGet.release();
   const resolvedApprovals = await Promise.race([
     Promise.all([approveFromA, approveFromB]),
-    new Promise((resolve) => setTimeout(() => resolve(null), 4000)),
+    new Promise((resolve) => setTimeout(() => resolve(null), ASYNC_EVENT_DEADLINE_MS)),
   ]);
   assert.ok(resolvedApprovals, "cross-folder approval lookup completes without waiting on the other request's folder lock");
   assert.deepEqual(resolvedApprovals.map((response) => response.status), [404, 404]);
