@@ -6,6 +6,7 @@ const { PROTOCOL_VERSION, compareRevisions, validateOperation } = require("../..
 const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
 const { attestCiphertextOnlySyncState } = require("../services/deploymentResilience");
 const { createSyncBurstGuard } = require("../services/syncBurstGuard");
+const { DEFAULT_WINDOW, decryptSecret, normalizeOtp, verifyRecoveryCode, verifyTotp } = require("../services/totp");
 
 const STORE_VERSION = 2;
 const MAX_HISTORY_PER_OBJECT = 32;
@@ -92,6 +93,25 @@ function publicRecord(record) {
 }
 
 const DEFAULT_RECOVERY_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+// Mirrors consumeTotpProof in src/routes/auth.js: a TOTP code must be newer than totpLastUsedStep (replay
+// protection) and a recovery code is removed on use. Returns "totp", "recovery", or null. Mutates `user`;
+// the caller must persist it.
+function consumeSecondFactor(user, code, key) {
+  const otp = normalizeOtp(code);
+  if (otp) {
+    const secret = decryptSecret(user.totpSecret, key, `Root.ark/TOTP/${user.username}`);
+    const step = verifyTotp(secret, otp, { window: DEFAULT_WINDOW });
+    if (step === null || (Number.isSafeInteger(user.totpLastUsedStep) && step <= user.totpLastUsedStep)) return null;
+    user.totpLastUsedStep = step;
+    return "totp";
+  }
+  if (!Array.isArray(user.totpRecoveryHashes)) return null;
+  const index = user.totpRecoveryHashes.findIndex((hash) => verifyRecoveryCode(code, hash));
+  if (index === -1) return null;
+  user.totpRecoveryHashes.splice(index, 1);
+  return "recovery";
+}
 
 function positiveEnvInteger(value, fallback) {
   const number = Number(value);
@@ -260,7 +280,7 @@ const RESUME_TRACKED_USERS_MAX = 10000;
 // Same public placeholder hash used by the auth route so unknown users cost one bcrypt compare too.
 const DUMMY_PASSWORD_HASH = "$2a$10$C8U56P8wZK.G7zWKmqF88e3f64PIxJ1xdTJN9WxiHcSVkYCfaSeDG";
 
-function registerSyncRoutes({ app, authenticate, requirePermission, storagePath = process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json", deviceAuthorization = null, requireDeviceAuthorization = false, deviceRegistryPath = process.env.SYNC_DEVICE_REGISTRY || "", burstGuard = null, auditLog = null, bcrypt = null, loadUsers = null }) {
+function registerSyncRoutes({ app, authenticate, requirePermission, storagePath = process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json", deviceAuthorization = null, requireDeviceAuthorization = false, deviceRegistryPath = process.env.SYNC_DEVICE_REGISTRY || "", burstGuard = null, auditLog = null, bcrypt = null, loadUsers = null, saveUsers = null, getTotpKey = null }) {
   const audit = (eventType, req, deviceId, action, result, details = {}) => {
     if (typeof auditLog !== "function") return;
     auditLog(eventType, { username: req.user?.username, role: req.user?.role }, { type: "sync_device", id: String(deviceId).slice(0, 200) }, action, result, details);
@@ -284,7 +304,11 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     state.pending += 1;
     return { state, retryAfter: 0 };
   };
-  const verifyRegisteredDevice = deviceAuthorization || (deviceRegistryPath ? async ({ username, operation, proof }) => {
+  const findUser = async (username) => {
+    const users = await loadUsers();
+    return Array.isArray(users) ? users.find((entry) => entry?.username === username) || null : null;
+  };
+  const verifyRegisteredDevice = deviceAuthorization ||(deviceRegistryPath ? async ({ username, operation, proof }) => {
     let registry;
     try { registry = JSON.parse(await fs.readFile(deviceRegistryPath, "utf8")); } catch { return false; }
     const record = registry?.devices?.[operation.deviceId];
@@ -364,15 +388,35 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       return errorResponse(res, 429, "Too many failed re-authentication attempts");
     }
     const state = reservation.state;
+    const fail = (reason) => {
+      state.count += 1;
+      audit("sync.device.resume.failed", req, deviceId, "resume", "failure", { reason });
+      return errorResponse(res, 401, "Re-authentication failed");
+    };
     try {
+      const snapshot = await findUser(username);
+      const hasPassword = Boolean(snapshot && !snapshot.disabled && typeof snapshot.password === "string" && snapshot.password);
+      const matches = await bcrypt.compare(body.password, hasPassword ? snapshot.password : DUMMY_PASSWORD_HASH);
+      if (!hasPassword || !matches) return fail("reauth_failed");
+      const checkedHash = snapshot.password;
+      const checkedSessionVersion = snapshot.sessionVersion || 0;
+      // Re-load after the awaits above and revalidate; the account may have changed meanwhile.
       const users = await loadUsers();
       const user = Array.isArray(users) ? users.find((entry) => entry?.username === username) : null;
-      const hasPassword = Boolean(user && !user.disabled && typeof user.password === "string" && user.password);
-      const matches = await bcrypt.compare(body.password, hasPassword ? user.password : DUMMY_PASSWORD_HASH);
-      if (!hasPassword || !matches) {
-        state.count += 1;
-        audit("sync.device.resume.failed", req, deviceId, "resume", "failure", { reason: "reauth_failed" });
+      if (!user || user.disabled || user.password !== checkedHash || (user.sessionVersion || 0) !== checkedSessionVersion) {
         return errorResponse(res, 401, "Re-authentication failed");
+      }
+      if (user.totpEnabled) {
+        // Fail closed: 2FA is required but the key or the persistence helper is not available.
+        if (typeof getTotpKey !== "function" || typeof saveUsers !== "function") return errorResponse(res, 503, "Sync re-authentication unavailable");
+        let key;
+        try { key = getTotpKey(); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
+        if (!Buffer.isBuffer(key) || key.length !== 32) return errorResponse(res, 503, "Sync re-authentication unavailable");
+        let factor;
+        try { factor = consumeSecondFactor(user, body.code, key); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
+        if (!factor) return fail("second_factor_failed");
+        // Persist replay state (totpLastUsedStep) or the consumed recovery code before resuming.
+        try { saveUsers(users); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
       }
       state.count = 0;
       const { wasPaused } = await store.resumeDevice(username, deviceId);

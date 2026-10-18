@@ -5921,6 +5921,8 @@ registerSyncRoutes({
   auditLog,
   bcrypt,
   loadUsers,
+  saveUsers,
+  getTotpKey: () => getServerMasterKey({ createIfMissing: false }),
 });
 
 groupsStore = registerGroupRoutes({

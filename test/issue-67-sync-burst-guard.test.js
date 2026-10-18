@@ -94,20 +94,55 @@ function jsonRequest(port, requestPath, method, value) {
 
 const PASSWORD = "correct-horse-battery";
 const bcrypt = require("bcryptjs");
+const { encryptSecret, generateRecoveryCodes, generateSecret, hotp } = require("../src/services/totp");
 const ALICE_HASH = bcrypt.hashSync(PASSWORD, 4);
 
 function resumeRequest(port, body = { password: PASSWORD }) {
   return jsonRequest(port, "/sync/v1/devices/device-a/resume", "POST", body);
 }
 
-async function startServer(t, { storagePath, burstGuard, auditEvents = [], bcryptImpl = bcrypt }) {
+// Builds a 2FA account: encrypted seed plus two single-use recovery codes.
+function twoFactorAccount() {
+  const secret = generateSecret();
+  const recovery = generateRecoveryCodes(2);
+  const user = {
+    username: "alice", password: ALICE_HASH, totpEnabled: true, sessionVersion: 0,
+    totpSecret: encryptSecret(secret, TEST_TOTP_KEY, "Root.ark/TOTP/alice"),
+    totpRecoveryHashes: recovery.hashes, totpLastUsedStep: null,
+  };
+  return { users: [user], secret, recoveryCodes: recovery.codes };
+}
+
+function codeAt(secret, stepOffset = 0) {
+  return hotp(secret, Math.floor(Date.now() / 1000 / 30) + stepOffset);
+}
+
+// Pauses device-a: with a per-device limit of 1, the second delete of a fresh pair trips the pause.
+async function pauseDeviceA(port, key, first, second) {
+  const a = createFor(first, key);
+  const b = createFor(second, key);
+  assert.equal((await jsonRequest(port, "/sync/v1/objects", "POST", a)).status, 201);
+  assert.equal((await jsonRequest(port, "/sync/v1/objects", "POST", b)).status, 201);
+  assert.equal((await jsonRequest(port, `/sync/v1/objects/object-${first}`, "DELETE", deleteFor(first, a, key))).status, 200);
+  assert.equal((await jsonRequest(port, `/sync/v1/objects/object-${second}`, "DELETE", deleteFor(second, b, key))).status, 423);
+}
+
+const TEST_TOTP_KEY = crypto.randomBytes(32);
+
+// Account state persists through load/save like the users file does, so replay state and consumed
+// recovery codes are real. Each load returns a fresh copy.
+async function startServer(t, { storagePath, burstGuard, auditEvents = [], bcryptImpl = bcrypt, accountUsers = null, totpKey = TEST_TOTP_KEY }) {
+  const accountState = { users: accountUsers || [{ username: "alice", password: ALICE_HASH }] };
   const app = express();
   app.use("/sync/v1", express.json({ limit: "9mb" }));
   const authenticate = (req, _res, next) => { req.user = { username: "alice", role: "user" }; next(); };
   const requirePermission = () => (_req, _res, next) => next();
   const auditLog = (eventType, actor, target, action, result, details) => auditEvents.push({ eventType, actor, target, action, result, details });
-  const loadUsers = () => [{ username: "alice", password: ALICE_HASH }];
-  const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath, burstGuard, auditLog, bcrypt: bcryptImpl, loadUsers });
+  const loadUsers = () => JSON.parse(JSON.stringify(accountState.users));
+  const saveUsers = (users) => { accountState.users = JSON.parse(JSON.stringify(users)); };
+  const getTotpKey = () => totpKey;
+  const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath, burstGuard, auditLog, bcrypt: bcryptImpl, loadUsers, saveUsers, getTotpKey });
+  route.accountState = accountState;
   const server = await new Promise((resolve) => { const value = app.listen(0, "127.0.0.1", () => resolve(value)); });
   t.after(async () => { await new Promise((resolve) => server.close(resolve)); });
   await route.ready;
@@ -428,6 +463,61 @@ test("issue 67 store: versions created by a paused device are not pruned while i
   assert.ok(versionIds.includes("version-1-1"));
   assert.ok(versionIds.includes("version-1-2"));
   assert.ok(versionIds.includes("version-1-3"));
+});
+
+test("issue 67 resume 2FA: password alone is refused, a wrong TOTP is refused, the correct TOTP resumes", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-2fa-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const { port, route } = await startServer(t, { storagePath: path.join(dir, "objects.json"), burstGuard: createSyncBurstGuard({ maxDestructive: 1, env: {} }), accountUsers: account.users });
+  const key = crypto.randomBytes(32);
+  await pauseDeviceA(port, key, 1, 2);
+  assert.equal((await resumeRequest(port)).status, 401);
+  assert.equal((await resumeRequest(port, { password: PASSWORD, code: "000000" })).status, 401);
+  assert.equal((await resumeRequest(port, { password: PASSWORD, code: codeAt(account.secret, 10) })).status, 401);
+  const ok = await resumeRequest(port, { password: PASSWORD, code: codeAt(account.secret) });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.wasPaused, true);
+  // The accepted TOTP step is persisted for replay protection.
+  assert.equal(typeof route.accountState.users[0].totpLastUsedStep, "number");
+});
+
+test("issue 67 resume 2FA: the same TOTP code cannot be replayed to resume again", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-2fa-replay-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const { port } = await startServer(t, { storagePath: path.join(dir, "objects.json"), burstGuard: createSyncBurstGuard({ maxDestructive: 1, env: {} }), accountUsers: account.users });
+  const key = crypto.randomBytes(32);
+  await pauseDeviceA(port, key, 1, 2);
+  const code = codeAt(account.secret);
+  assert.equal((await resumeRequest(port, { password: PASSWORD, code })).status, 200);
+  await pauseDeviceA(port, key, 3, 4);
+  assert.equal((await resumeRequest(port, { password: PASSWORD, code })).status, 401);
+});
+
+test("issue 67 resume 2FA: a recovery code works once", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-2fa-recovery-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const { port, route } = await startServer(t, { storagePath: path.join(dir, "objects.json"), burstGuard: createSyncBurstGuard({ maxDestructive: 1, env: {} }), accountUsers: account.users });
+  const key = crypto.randomBytes(32);
+  await pauseDeviceA(port, key, 1, 2);
+  const recovery = account.recoveryCodes[0];
+  assert.equal((await resumeRequest(port, { password: PASSWORD, code: recovery })).status, 200);
+  // Persisted removal: exactly one recovery hash remains.
+  assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 1);
+  await pauseDeviceA(port, key, 3, 4);
+  assert.equal((await resumeRequest(port, { password: PASSWORD, code: recovery })).status, 401);
+});
+
+test("issue 67 resume 2FA: without the TOTP key the resume fails closed with 503", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-2fa-nokey-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const { port } = await startServer(t, { storagePath: path.join(dir, "objects.json"), burstGuard: createSyncBurstGuard({ maxDestructive: 1, env: {} }), accountUsers: account.users, totpKey: null });
+  const key = crypto.randomBytes(32);
+  await pauseDeviceA(port, key, 1, 2);
+  assert.equal((await resumeRequest(port, { password: PASSWORD, code: codeAt(account.secret) })).status, 503);
 });
 
 test("issue 67 store: a paused device is blocked at the store boundary and history is not trimmed by rejected operations", async (t) => {
