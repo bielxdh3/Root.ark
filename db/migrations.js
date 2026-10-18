@@ -239,6 +239,28 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 6,
+    name: "file_search_fts",
+    up(db) {
+      // Non-protected file names only. Encrypted/protected names are never inserted by the repository.
+      // Trigram tokenizer gives substring candidates (same semantics as the existing includes() search).
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS file_search_index USING fts5(
+          folder_id UNINDEXED,
+          file_name,
+          tokenize = 'trigram case_sensitive 0'
+        );
+      `);
+    },
+  },
+  {
+    version: 7,
+    name: "public_link_permissions",
+    up(db) {
+      db.exec("ALTER TABLE public_links ADD COLUMN permissions_json TEXT;");
+    },
+  },
 ];
 
 function ensureMigrationTable(db) {
