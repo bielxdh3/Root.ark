@@ -67,6 +67,21 @@ Por padrao o arquivo fica pendente, respeitando o fluxo atual do Root.ark. Para 
 - Nao suporta arquivos acima de 8 MB neste MVP, porque usa a rota simples `/upload`.
 - Nao e um servico de background/startup.
 
+## Sincronizacao seletiva: pastas excluidas (issue #66)
+
+O arquivo de configuracao do `rootark-sync-v2` (`.rootark-sync.json`) aceita `selectedPaths` (lista de escopo) e `excludedPaths` (lista de prefixos de pasta a excluir, por dispositivo). Cada entrada e validada com `validatePortableRelativePath`: caminho relativo, sem `..`, barras invertidas, caminhos absolutos, nomes reservados do Windows ou arquivos internos do sync.
+
+Comportamento de `excludedPaths`:
+
+- Arquivos sob um prefixo excluido nao sao baixados no pull e nao sao enviados nem apagados remotamente no push.
+- Ao excluir uma pasta, copias locais limpas sao removidas com `_evictLocal`: o objeto remoto permanece, sem tombstone. Copias com alteracao local pendente sao mantidas e reportadas em `summary.excluded.kept`.
+- Arquivo excluido sem copia local vira registro remoto (`reason: "excluded"`) e nenhum delete e enviado.
+- Ao reincluir a pasta, os arquivos liberados sao baixados no proximo sync. Arquivos apenas despejados (`reason: "evicted"`) continuam remotos ate `materializeRemote(caminho)`.
+- A lista aplicada fica persistida no indice do sync (`excludedPaths`) e a reconciliacao so roda quando a lista muda.
+- Falha transitoria de despejo (`EBUSY`, `EPERM`, `EAGAIN`, por exemplo arquivo aberto no Windows) e registrada em `pendingEvictions` no indice e tentada de novo nos syncs seguintes, no maximo 3 vezes. Depois disso o item aparece em `summary.excluded.failed` sem novas tentativas. Arquivos com alteracao local nunca entram nessa fila; nenhuma tentativa envia delete remoto.
+
+Limitacoes: nao ha comando CLI dedicado (a configuracao e o ponto de controle); nao ha placeholder nativo nem Files On-Demand; pastas vazias excluidas nao sao removidas localmente; metadados remotos ainda sao listados completos antes do filtro local.
+
 ## Phase 12: protocolo bidirecional protegido
 
 O modulo `sync-client/rootark-sync-protocol.js` define a versao 2 do protocolo
