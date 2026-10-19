@@ -158,6 +158,8 @@ Do not repeatedly run identical broad validations after every small edit. Do not
 - Link the GitHub issue and plan-tree phase.
 - Do not force-push or rewrite published history.
 - Keep commits coherent and intentionally scoped.
+- Keep the Git author and committer identity tied to the authenticated repository contributor. For owner-authored work on this repository, use `bielxdh3 <bielxdh3@gmail.com>` unless the owner explicitly specifies another verified identity. Never invent placeholder bot/audit names or `@users.noreply.github.com` addresses, and never override an established identity via `git -c`, `GIT_AUTHOR_*`, or `GIT_COMMITTER_*` without explicit authorization.
+- Before publishing commits, check `git var GIT_AUTHOR_IDENT` and `git var GIT_COMMITTER_IDENT`; stop and report any unexpected identity instead of publishing misattributed commits.
 - Do not create empty commits.
 - After publishing, verify the remote branch and PR state.
 - Update `docs/plan-tree.md` only after implementation and validation evidence exist.
