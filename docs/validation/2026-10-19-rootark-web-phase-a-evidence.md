@@ -22,7 +22,30 @@
 
 ## Task 3 — Online/offline policy evidence
 
-Pending.
+The test-only fixture `test/fixtures/issue-65-web-offline-contract.json` uses schema `rootark-web-offline-contract/v1`. It separates user-controlled downloaded/exported files and already-held plaintext from new remote actions, and marks itself as policy evidence rather than runtime enforcement.
+
+### Read-only source observations
+
+Inspected at source HEAD `fe55dfa0907569e240a708e99b44d7a52b21c3cd`; no runtime source was changed.
+
+- `public/service-worker.js` caches the versioned public shell, including protected client scripts. It excludes `/auth` and `/api` (as well as file, preview, sync, and other sensitive paths) from cache handling; login paths use `cache: "no-store"`. Cached shell delivery is not fresh authorization or witness proof.
+- `public/client/rootark-offline-queue.js` stores normalized opaque envelopes in a local-storage queue and exposes a `drain()` operation that returns and clears them. This legacy queue does not itself establish Zero-Knowledge authorization.
+- `public/client/rootark-protected-store.js` encrypts IndexedDB records with Web Crypto using a caller-supplied key and exposes `drainQueue(key)`. `public/client/rootark-client-crypto.js` imports a raw key as AES-GCM with `extractable=false`; this describes local encryption behavior, not how the caller obtained or protected the key, rollback resistance, or device-bound custody.
+- `public/client/rootark-protected-session.js` receives its key through a caller-provided `getKey` callback. `public/client/rootark-bootstrap.js` invokes an optional `syncOnce` callback when connectivity returns; a scoped search of `public/client` found no `syncOnce` callback configuration, so actual queue publication/replay wiring was not established.
+- `public/client/rootark-bootstrap.js` describes offline index access as requiring a locally available index and an already-unlocked key. This is distinct from downloading new protected content from the service.
+- An actual test-generated signed-history fixture passed public history verification with `signedStateVerified=true`, while returning `authorizationVerified=false` and `freshnessProven=false`. Its synthetic pinned witness fixture is library-test input, not a deployed freshness service.
+
+| Case | Test-only policy | Current runtime evidence | Status |
+|---|---|---|---|
+| Read file already downloaded/exported | `allow-user-copy` | User-controlled copy is outside remote admission; not tested as a product journey | `PASS_TEST_ONLY` |
+| View already-held plaintext | `already-held-only` | Existing UI code describes local index/key requirements; plaintext revocation is not possible | `OBSERVED` |
+| New transfer or service download | `block`, fresh authority required | No independently verified admission gate | `BLOCKED` |
+| New authorization or device enrollment | `block`, fresh authority required | No CAS/status/witness admission path | `BLOCKED` |
+| Package/account/content recovery | `block`, fresh authority required | Public signed-history validation does not prove freshness or authorization | `BLOCKED` |
+| Offline legacy queued operation | `not-authorized-for-zk`, fresh authority required | Legacy queues can retain and drain ciphertext/envelopes; publication authorization is not established | `BLOCKED` |
+| Cached public shell | Not an authorization decision | Shell assets may be served from cache; `/auth` and `/api` are excluded | `OBSERVED` |
+
+Windows Node.js `v22.22.1`, 2026-10-19: `node --test test/issue-65-web-offline-evidence.test.js` first returned **2 failed** because the test-only policy fixture was absent (RED), then **5 passed, 0 failed, 0 skipped** (GREEN). These tests verify the fixture and read-only source/library facts only; they do not prove that production operations are blocked offline.
 
 ## Task 4 — Readiness and validation matrix
 
