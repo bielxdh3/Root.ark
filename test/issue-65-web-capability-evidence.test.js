@@ -69,10 +69,22 @@ test("restoredProfileAndDeletedCredentialDoNotClaimRecovery", () => {
     credentialSyncBehavior: "CREDENTIAL_DELETED",
     keyCopyOrRestoreTested: true,
   }));
-  assert.equal(restored.status, "UNVERIFIED");
-  assert.equal(deleted.status, "UNVERIFIED");
-  assertNoTrustedClaim(restored);
-  assertNoTrustedClaim(deleted);
+  const copied = assessWebRecoveryEvidence(evidence({
+    originKind: "HTTPS",
+    prfObserved: true,
+    credentialSyncBehavior: "COPIED",
+    keyCopyOrRestoreTested: true,
+  }));
+  const profileLost = assessWebRecoveryEvidence(evidence({
+    originKind: "HTTPS",
+    prfObserved: true,
+    credentialSyncBehavior: "PROFILE_LOST",
+    keyCopyOrRestoreTested: false,
+  }));
+  for (const result of [restored, deleted, copied, profileLost]) {
+    assert.equal(result.status, "UNVERIFIED");
+    assertNoTrustedClaim(result);
+  }
 });
 
 test("knownPrfStillRequiresIndependentReview", () => {
