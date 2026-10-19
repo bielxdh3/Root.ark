@@ -71,13 +71,12 @@ function identifiers(manifest) {
 }
 
 async function refreshVerifiedHistory(state) {
-  state.verifiedHistory = await history.verifyRecoveryHistoryV2({
+  state.verifiedHistory = await history.verifyTrustedDeviceRecoveryHistoryV2({
     expectedScope: state.scope,
     baseManifest: state.baseManifest,
     baseReceipt: state.baseReceipt,
     pinnedWitness: state.pinnedWitness,
     epochKeys: state.epochKeys,
-    recoveryPackageKeys: state.recoveryPackageKeys,
     transitions: state.transitions,
     packageEnvelopes: state.packageEnvelopes,
   });

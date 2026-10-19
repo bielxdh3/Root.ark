@@ -653,10 +653,13 @@ function coreOf(manifest) {
   return core;
 }
 
-async function checkHistoryHead(priorVerifiedHistory) {
+async function checkHistoryHead(priorVerifiedHistory, requiredVerificationMode) {
   const historyVerifier = require("./rootark-zk-recovery-history-v2");
-  if (!(await historyVerifier.isVerifiedRecoveryHistoryV2(priorVerifiedHistory))) fail("HISTORY_INVALID");
+  if (!(await historyVerifier.isVerifiedRecoveryHistoryV2(priorVerifiedHistory, requiredVerificationMode))) fail("HISTORY_INVALID");
   if (!priorVerifiedHistory || priorVerifiedHistory.complete !== true || !priorVerifiedHistory.headManifest
+    || priorVerifiedHistory.authorizationVerified !== true
+    || priorVerifiedHistory.verificationMode !== requiredVerificationMode
+    || priorVerifiedHistory.packageRecoverabilityVerified !== (requiredVerificationMode === "recovery-package")
     || !(priorVerifiedHistory.usedIdentifiers instanceof Set) || !Array.isArray(priorVerifiedHistory.epochKeys)) fail("HISTORY_INVALID");
   const head = priorVerifiedHistory.headManifest;
   validateManifestShape(head);
@@ -805,12 +808,18 @@ async function verifyRecoveryManifestMacV2(input) {
 }
 
 async function signRecoveryTransitionV2(input) {
-  if (!input || typeof input !== "object") fail();
+  if (!input || typeof input !== "object" || !input.proposedCore || typeof input.proposedCore !== "object"
+    || !input.proposedCore.operation || typeof input.proposedCore.operation !== "object") fail();
   let previousManifest = null;
   let priorIdentifiers = new Set();
   let priorEpochKeys = [];
   if (input.proposedCore.operation.operation_type !== "initialize") {
-    const prior = await checkHistoryHead(input.priorVerifiedHistory);
+    const verificationMode = input.proposedCore.operation.actor_type === "device"
+      ? "trusted-device"
+      : input.proposedCore.operation.actor_type === "recovery-package"
+        ? "recovery-package" : null;
+    if (!verificationMode) fail("UNAUTHORIZED_ACTOR");
+    const prior = await checkHistoryHead(input.priorVerifiedHistory, verificationMode);
     previousManifest = prior.headManifest;
     priorIdentifiers = prior.usedIdentifiers;
     priorEpochKeys = prior.epochKeys;

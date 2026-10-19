@@ -19,6 +19,7 @@ const WITNESS_RECEIPT_FIELDS = Object.freeze([
   "manifest_digest", "witness_sequence", "nonce", "observed_at", "status", "signature",
 ]);
 const verifiedHistories = new WeakMap();
+const publicHistories = new WeakMap();
 
 function fail(code = "HISTORY_INVALID") {
   throw new z.RootarkZkError(code);
@@ -153,9 +154,10 @@ async function verifyNewRecoveryWraps(previousManifest, nextManifest, scope, epo
   } else if (operationType === "revoke-device") {
     wraps = nextManifest.recovery_wraps.slice(previousManifest.recovery_wraps.length);
   }
-  if (wraps.length === 0) return;
+  if (wraps.length === 0) return new Map();
 
   const keys = recoveryPackageKeyMap(inputKeys);
+  const recovered = new Map();
   try {
     for (const wrap of wraps) {
       const packageId = bytes(wrap.package_id, 16);
@@ -164,8 +166,12 @@ async function verifyNewRecoveryWraps(previousManifest, nextManifest, scope, epo
       const keyRef = bytes(wrap.key_ref, 32);
       const epoch = Number(u64(wrap.epoch, 1n));
       const privateKeyBytes = keys.get(`${packageId.toString("hex")}:${hpkeKeyId.toString("hex")}`);
-      const expectedEpochKey = epochKeys.get(epoch);
-      if (!privateKeyBytes || !expectedEpochKey) fail("KEY_COVERAGE_INCOMPLETE");
+      const expectedEpochKey = epochKeys.get(epoch) || recovered.get(epoch);
+      const isFreshRotationKey = !expectedEpochKey
+        && ["revoke-device", "compromise-package"].includes(operationType)
+        && epoch === Number(u64(nextManifest.current_epoch, 1n))
+        && epoch === Number(u64(previousManifest.current_epoch, 1n)) + 1;
+      if (!privateKeyBytes || (!expectedEpochKey && !isFreshRotationKey)) fail("KEY_COVERAGE_INCOMPLETE");
       if (!sameBytes(recoveryPackagePublicKey(privateKeyBytes), nextManifest.recovery_authority.hpke_public_key)) {
         fail("KEY_COVERAGE_INCOMPLETE");
       }
@@ -193,14 +199,38 @@ async function verifyNewRecoveryWraps(previousManifest, nextManifest, scope, epo
           aad: Buffer.concat([WRAP_AAD_PREFIX, contextBytes]),
           ciphertext: wrap.ciphertext,
         });
-        if (plaintext.byteLength !== 32 || !sameBytes(plaintext, expectedEpochKey)) {
-          fail("KEY_COVERAGE_INCOMPLETE");
-        }
       } catch (_) {
         fail("KEY_COVERAGE_INCOMPLETE");
+      }
+      try {
+        if (plaintext.byteLength !== 32) fail("KEY_COVERAGE_INCOMPLETE");
+        if (expectedEpochKey) {
+          if (!sameBytes(plaintext, expectedEpochKey)) fail("KEY_COVERAGE_INCOMPLETE");
+        } else {
+          if (recovered.has(epoch)) fail("KEY_COVERAGE_INCOMPLETE");
+          recovered.set(epoch, Buffer.from(plaintext));
+        }
       } finally {
         if (plaintext) z.clearSecret(plaintext);
       }
+    }
+    return recovered;
+  } catch (error) {
+    for (const key of recovered.values()) z.clearSecret(key);
+    throw error;
+  } finally {
+    for (const key of keys.values()) z.clearSecret(key);
+  }
+}
+
+function verifyRecoveryPackageBaseKey(baseManifest, packageId, inputKeys) {
+  const authority = baseManifest.recovery_authority;
+  if (authority?.status !== "active" || !packageId || !sameBytes(authority.package_id, packageId)) return;
+  const keys = recoveryPackageKeyMap(inputKeys);
+  try {
+    const privateKey = keys.get(`${Buffer.from(authority.package_id).toString("hex")}:${Buffer.from(authority.hpke_key_id).toString("hex")}`);
+    if (!privateKey || !sameBytes(recoveryPackagePublicKey(privateKey), authority.hpke_public_key)) {
+      fail("KEY_COVERAGE_INCOMPLETE");
     }
   } finally {
     for (const key of keys.values()) z.clearSecret(key);
@@ -265,8 +295,22 @@ async function parseEnvelopeHeader(envelopeBytes, scope) {
   return parsed.envelope;
 }
 
-async function verifyRecoveryHistoryV2(input) {
+function validateHistoryInput(input, mode) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) fail();
+  const proto = Object.getPrototypeOf(input);
+  if (proto !== Object.prototype && proto !== null) fail();
+  const fields = [
+    "expectedScope", "baseManifest", "baseReceipt", "pinnedWitness", "transitions",
+    "packageEnvelopeBytes", "packageEnvelopes", "now",
+  ];
+  if (mode !== "public") fields.push("epochKeys");
+  if (mode === "recovery-package") fields.push("recoveryPackageKeys");
+  if (Reflect.ownKeys(input).some((field) => typeof field !== "string" || !fields.includes(field))) fail("HISTORY_INVALID");
+}
+
+async function verifyRecoveryHistoryInternal(input, mode) {
   try {
+    validateHistoryInput(input, mode);
     const scope = validateScope(input.expectedScope);
     const baseManifest = input.baseManifest;
     manifestV2.validateManifestShape(baseManifest);
@@ -274,10 +318,15 @@ async function verifyRecoveryHistoryV2(input) {
       || !sameBytes(baseManifest.compartment_id, scope.compartment_id)
       || !sameBytes(baseManifest.keyring_id, scope.keyring_id)) fail("SCOPE_MISMATCH");
     await verifyManifestKeyRefs(baseManifest);
-    const epochKeys = normalizeEpochKeys(input.epochKeys);
     const baseEpoch = Number(u64(baseManifest.current_epoch, 1n));
-    keysThrough(epochKeys, baseEpoch);
-    await manifestV2.verifyRecoveryManifestMacV2({ manifest: baseManifest, epochKey: epochKeys.get(baseEpoch) });
+    const epochKeys = mode === "public" ? null : normalizeEpochKeys(input.epochKeys);
+    if (mode === "recovery-package" && [...epochKeys.keys()].some((epoch) => epoch > baseEpoch)) {
+      fail("KEY_COVERAGE_INCOMPLETE");
+    }
+    if (epochKeys) {
+      keysThrough(epochKeys, baseEpoch);
+      await manifestV2.verifyRecoveryManifestMacV2({ manifest: baseManifest, epochKey: epochKeys.get(baseEpoch) });
+    }
     await verifyWitnessReceipt(input, scope, baseManifest);
 
     if (!Array.isArray(input.transitions)) fail();
@@ -317,7 +366,7 @@ async function verifyRecoveryHistoryV2(input) {
       capacityWarning ||= capacity.warning;
 
       const priorEpoch = Number(u64(headManifest.current_epoch, 1n));
-      const priorEpochKeys = keysThrough(epochKeys, priorEpoch);
+      const priorEpochKeys = epochKeys ? keysThrough(epochKeys, priorEpoch) : null;
       const publicProof = await manifestV2.verifyRecoveryTransitionPublicV2({
         previousManifest: headManifest,
         nextManifest,
@@ -341,31 +390,60 @@ async function verifyRecoveryHistoryV2(input) {
       }
 
       const nextEpoch = Number(u64(nextManifest.current_epoch, 1n));
-      keysThrough(epochKeys, nextEpoch);
-      await verifyNewRecoveryWraps(headManifest, nextManifest, scope, epochKeys, input.recoveryPackageKeys);
-      await manifestV2.verifyRecoveryTransitionMacV2({
-        publicTransitionProof: publicProof,
-        manifestMacKey: epochKeys.get(nextEpoch),
-        priorEpochKeys,
-      });
+      if (mode === "trusted-device") {
+        keysThrough(epochKeys, nextEpoch);
+        await manifestV2.verifyRecoveryTransitionMacV2({
+          publicTransitionProof: publicProof,
+          manifestMacKey: epochKeys.get(nextEpoch),
+          priorEpochKeys,
+        });
+      } else if (mode === "recovery-package") {
+        const recoveredKeys = await verifyNewRecoveryWraps(
+          headManifest, nextManifest, scope, epochKeys, input.recoveryPackageKeys,
+        );
+        const candidateEpochKeys = new Map(epochKeys);
+        for (const [epoch, key] of recoveredKeys) candidateEpochKeys.set(epoch, key);
+        try {
+          keysThrough(candidateEpochKeys, nextEpoch);
+          await manifestV2.verifyRecoveryTransitionMacV2({
+            publicTransitionProof: publicProof,
+            manifestMacKey: candidateEpochKeys.get(nextEpoch),
+            priorEpochKeys,
+          });
+          for (const [epoch, key] of recoveredKeys) epochKeys.set(epoch, key);
+        } catch (error) {
+          for (const key of recoveredKeys.values()) z.clearSecret(key);
+          throw error;
+        }
+      }
       headManifest = nextManifest;
       usedIdentifiers = new Set(publicProof.identifiers);
     }
 
+    if (epochKeys && epochKeys.size !== Number(u64(headManifest.current_epoch, 1n))) {
+      fail("KEY_COVERAGE_INCOMPLETE");
+    }
     const packageAuthorityStatus = packageId === null
       ? (headManifest.recovery_authority?.status === "active" ? "active" : "none")
       : headManifest.recovery_authority?.status === "active"
         && sameBytes(headManifest.recovery_authority.package_id, packageId)
         ? "active" : "revoked";
+    if (mode === "recovery-package") {
+      verifyRecoveryPackageBaseKey(baseManifest, packageId, input.recoveryPackageKeys);
+      if (packageId === null || packageAuthorityStatus !== "active") fail("INVALID_RECOVERY_PACKAGE");
+    }
     const headDigest = await manifestV2.recoveryManifestDigestV2(headManifest);
     const result = Object.freeze({
-      complete: true,
+      complete: mode !== "public",
+      signedStateVerified: true,
+      authorizationVerified: mode !== "public",
+      packageRecoverabilityVerified: mode === "recovery-package",
+      verificationMode: mode,
       baseManifest,
       headManifest,
       headDigest,
       revision: headManifest.revision,
       usedIdentifiers,
-      epochKeys: keysThrough(epochKeys, Number(u64(headManifest.current_epoch, 1n))),
       transitionCount,
       historyBytes,
       capacityWarning,
@@ -375,17 +453,24 @@ async function verifyRecoveryHistoryV2(input) {
       packageAuthorityStatus,
       packageEnvelopeBound: firstEnvelopeBytes !== null,
       freshnessProven: false,
+      ...(epochKeys ? { epochKeys: keysThrough(epochKeys, Number(u64(headManifest.current_epoch, 1n))) } : {}),
     });
-    verifiedHistories.set(result, {
+    const snapshot = {
+      verificationMode: mode,
       headManifest: await z.encodeDeterministic(headManifest),
       headDigest: Buffer.from(headDigest),
       revision: u64(headManifest.revision, 1n),
       usedIdentifiers: [...usedIdentifiers].sort(),
-      epochKeys: keysThrough(epochKeys, Number(u64(headManifest.current_epoch, 1n))).map((entry) => ({
+    };
+    if (epochKeys) {
+      snapshot.epochKeys = keysThrough(epochKeys, Number(u64(headManifest.current_epoch, 1n))).map((entry) => ({
         epoch: entry.epoch,
         key: Buffer.from(entry.key),
-      })),
-    });
+      }));
+      verifiedHistories.set(result, snapshot);
+    } else {
+      publicHistories.set(result, snapshot);
+    }
     return result;
   } catch (error) {
     if (error instanceof z.RootarkZkError) throw error;
@@ -393,10 +478,30 @@ async function verifyRecoveryHistoryV2(input) {
   }
 }
 
-async function isVerifiedRecoveryHistoryV2(history) {
+async function verifyRecoveryHistoryPublicV2(input) {
+  return verifyRecoveryHistoryInternal(input, "public");
+}
+
+async function verifyTrustedDeviceRecoveryHistoryV2(input) {
+  return verifyRecoveryHistoryInternal(input, "trusted-device");
+}
+
+async function verifyRecoveryPackageHistoryV2(input) {
+  return verifyRecoveryHistoryInternal(input, "recovery-package");
+}
+
+// Preserve the original entry point as device authorization; package-wrap verification is explicit.
+async function verifyRecoveryHistoryV2(input) {
+  return verifyTrustedDeviceRecoveryHistoryV2(input);
+}
+
+async function isVerifiedRecoveryHistoryV2(history, requiredMode) {
   const snapshot = history && verifiedHistories.get(history);
-  if (!snapshot) return false;
+  if (!snapshot || (requiredMode && snapshot.verificationMode !== requiredMode)) return false;
   try {
+    if (history.complete !== true || history.signedStateVerified !== true || history.authorizationVerified !== true
+      || history.verificationMode !== snapshot.verificationMode
+      || history.packageRecoverabilityVerified !== (snapshot.verificationMode === "recovery-package")) return false;
     const encodedHead = await z.encodeDeterministic(history.headManifest);
     const digestMatches = sameBytes(await manifestV2.recoveryManifestDigestV2(history.headManifest), snapshot.headDigest)
       && sameBytes(history.headDigest, snapshot.headDigest);
@@ -414,11 +519,45 @@ async function isVerifiedRecoveryHistoryV2(history) {
   }
 }
 
+async function isVerifiedPublicRecoveryHistoryV2(history) {
+  const snapshot = history && publicHistories.get(history);
+  if (!snapshot) return false;
+  try {
+    if (history.complete !== false || history.signedStateVerified !== true || history.authorizationVerified !== false
+      || history.packageRecoverabilityVerified !== false || history.verificationMode !== "public"
+      || Object.hasOwn(history, "epochKeys")) return false;
+    const encodedHead = await z.encodeDeterministic(history.headManifest);
+    const digestMatches = sameBytes(await manifestV2.recoveryManifestDigestV2(history.headManifest), snapshot.headDigest)
+      && sameBytes(history.headDigest, snapshot.headDigest);
+    const identifiers = [...history.usedIdentifiers].sort();
+    return sameBytes(encodedHead, snapshot.headManifest)
+      && digestMatches
+      && u64(history.revision, 1n) === snapshot.revision
+      && JSON.stringify(identifiers) === JSON.stringify(snapshot.usedIdentifiers);
+  } catch (_) {
+    return false;
+  }
+}
+
+async function isVerifiedTrustedDeviceRecoveryHistoryV2(history) {
+  return isVerifiedRecoveryHistoryV2(history, "trusted-device");
+}
+
+async function isVerifiedRecoveryPackageHistoryV2(history) {
+  return isVerifiedRecoveryHistoryV2(history, "recovery-package");
+}
+
 module.exports = {
   MAX_ENTRY_BYTES,
   MAX_HISTORY_BYTES,
   MAX_TRANSITIONS,
   checkRecoveryHistoryCapacity,
+  isVerifiedPublicRecoveryHistoryV2,
   isVerifiedRecoveryHistoryV2,
+  isVerifiedRecoveryPackageHistoryV2,
+  isVerifiedTrustedDeviceRecoveryHistoryV2,
+  verifyRecoveryHistoryPublicV2,
+  verifyRecoveryPackageHistoryV2,
   verifyRecoveryHistoryV2,
+  verifyTrustedDeviceRecoveryHistoryV2,
 };
