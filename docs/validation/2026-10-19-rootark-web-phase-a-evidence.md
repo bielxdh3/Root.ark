@@ -1,7 +1,7 @@
 # Root.ark Web-First Recovery Phase A Evidence
 
 **Evidence date:** 2026-10-19
-**Status:** `IN_PROGRESS` — evidence-only foundation; independent review pending.
+**Status:** `EVIDENCE_BASELINE_COMPLETE — BROWSER_ELIGIBILITY_UNVERIFIED` — evidence-only foundation; independent review pending.
 **Scope:** Owner-approved Phase A plan tasks 1–4. This document records test-only and read-only evidence. It does not establish production recovery, fresh authorization, or release readiness.
 
 ## Task 1 — Owner policy record
@@ -49,7 +49,48 @@ Windows Node.js `v22.22.1`, 2026-10-19: `node --test test/issue-65-web-offline-e
 
 ## Task 4 — Readiness and validation matrix
 
-Pending. The final report will bind the validation results to the exact tested source SHA and list remaining integration blocks.
+### Readiness classifier
+
+- Added test-only `assessWebRecoveryIntegrationReadiness(...)` at implementation SHA `914aceec0406987712a52e5a885c0b90e82124d2`.
+- Any missing prerequisite or any value other than literal `PASS` returns `BLOCKED_FOR_INTEGRATION`. A record where every input says `PASS` returns only `REQUIRES_SEPARATE_INTEGRATION_APPROVAL`. Neither result includes an authorization field, enrollment token, or trusted-device grant.
+- RED: the capability suite had **3 failing readiness tests** because the export did not exist. GREEN: the capability suite then had **9 passed, 0 failed, 0 skipped**.
+
+### Claim matrix
+
+Evidence for code and tests below was run against code/test SHA `914aceec0406987712a52e5a885c0b90e82124d2`, except the Task 3 source scan, which was read at `fe55dfa0907569e240a708e99b44d7a52b21c3cd`. Runtime source files were unchanged in Phase A.
+
+| Claim | Status | Evidence and limit |
+|---|---|---|
+| Owner-approved policy is recorded | `PASS_TEST_ONLY` | `test/issue-65-web-policy-record.test.js`; D-011 added while D-006/D-008/D-009 remain historical records. |
+| Offline/online policy matrix matches D-011 | `PASS_TEST_ONLY` | `test/issue-65-web-offline-evidence.test.js` and `test/fixtures/issue-65-web-offline-contract.json`; fixture explicitly says it is not runtime enforcement. |
+| Existing service-worker, queue, and protected-store behavior | `OBSERVED` | Read-only source assertions in `test/issue-65-web-offline-evidence.test.js`; stale public shell caching, auth/API cache exclusions, encrypted-envelope queue storage/drain, caller-provided keys, and optional sync callback are source observations only. |
+| Actual browser version, secure-origin behavior, and WebAuthn PRF result | `NOT_RUN` | The local probe was not run in a real browser or with an authenticator. No platform support is claimed. |
+| Browser key custody, sync/copy resistance, and profile-restore recovery | `BLOCKED` | Unit tests reject unsupported claims; no real browser/OS key-store or rollback-resistant high-water test was performed. |
+| Browser HPKE/Ed25519 interoperability and protected-content admission | `BLOCKED` | No browser crypto execution, online witness, or deployed admission gate was exercised. |
+| Node recovery package/history/KDF library focused suites | `PASS_TEST_ONLY` | The approved Node 22 focused suite passed on Windows and Ubuntu WSL; this is not browser or production evidence. |
+| Argon2id in a supported browser worker and minimum hardware profile | `BLOCKED` | Node worker tests pass, but no browser-worker compatibility, browser memory/latency, or minimum-device evidence was collected; the profile remains provisional. |
+| Independent witness and trusted fresh-head service | `BLOCKED` | No independently pinned, durable witness service exists or was tested. A generated unit-test witness is not deployment evidence. |
+| Shared linearizable CAS and terminal-status authority | `BLOCKED` | No provider was selected, verified, or deployed. |
+| New transfers, service downloads, enrollment, or recovery are runtime-blocked offline | `BLOCKED` | Desired policy is test-only. No production admission enforcement was added or validated. |
+| Transfer TTL | `BLOCKED` | D-008 retention remains separate; no transfer TTL was selected. |
+| Android interoperability/runtime | `BLOCKED` | No Android client or cross-client interoperability test was run. |
+| End-to-end protected-content recovery | `BLOCKED` | No real trusted-device/browser key custody, package retention, online freshness, file decryption, or user journey was exercised. |
+| Independent security review | `NOT_RUN` | Review is pending. No independent reviewer provenance is claimed. |
+
+### Validation evidence
+
+- **Windows:** Portable Node.js `v22.22.1`, executable SHA-256 `923A41F268AB49EDE2E3363FBDD9E790609E385C6F3CA880B4EE9A56A8133E5A`; focused five-suite command from the plan: **45 passed, 0 failed, 0 skipped**.
+- **Ubuntu WSL:** `/usr/bin/node`, Node.js `v22.22.1`; same five-suite command with `TMPDIR=/mnt/e/Chats/rootark-tests`: **45 passed, 0 failed, 0 skipped**.
+- `npm run validate:syntax`: **233 checked, 0 failed**.
+- `npm run validate:artifacts`: exit code **0**; the script emitted no summary line.
+- `git diff --check` and the exact changed-file allowlist check are recorded after the final evidence-only commit. Runtime code, dependencies, lockfiles, infrastructure, issue state, and remote refs are out of scope and unchanged.
+- Full repository `npm test`, release gate, hosted CI/CodeQL, and browser/authenticator runs were not performed. They are not represented as passing.
+
+### Review and next gate
+
+Independent security review remains `PENDING`; it must assess the exact final evidence commit and code/test SHA above. Phase A does not authorize merge, release, provider selection, or issue #65 closure.
+
+Recommended next separately approved design gate: Packet B feasibility and architecture for a real shared CAS, independently trusted terminal-status authority, durable witness/reservation service, and online protected-content admission. Verify candidate infrastructure and independent key bootstrap before implementation. Packet C transfer-lifetime policy and browser/device integration remain separate owner decisions.
 
 ## Current blocks
 
