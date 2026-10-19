@@ -71,7 +71,7 @@ The repository currently contains working foundations for:
 
 **Recent merged progress (2026-10-18–19; not a release-readiness claim):**
 
-- File-name FTS5 search for non-protected data, Android client scaffolding, selective-sync exclusion/rollback, ransomware-burst detection with device pause, and per-operation sharing permissions were merged in PRs [#211](https://github.com/bielxdh3/Root.ark/pull/211), [#212](https://github.com/bielxdh3/Root.ark/pull/212) and [#214–#216](https://github.com/bielxdh3/Root.ark/pull/214).
+- File-name FTS5 search for non-protected data, Android client scaffolding, selective-sync exclusion/rollback, ransomware-burst detection with device pause, and per-operation sharing permissions were merged in PRs [#211](https://github.com/bielxdh3/Root.ark/pull/211), [#212](https://github.com/bielxdh3/Root.ark/pull/212), [#214](https://github.com/bielxdh3/Root.ark/pull/214), [#215](https://github.com/bielxdh3/Root.ark/pull/215), and [#216](https://github.com/bielxdh3/Root.ark/pull/216).
 - The zero-knowledge work includes a **keyring library** for device enrollment/revocation and epoch rotation ([#213](https://github.com/bielxdh3/Root.ark/pull/213)) plus a v2 wire-format test fixture ([#221](https://github.com/bielxdh3/Root.ark/pull/221)). These are not an integrated, production-ready zero-knowledge storage flow.
 - Async cryptographic request handling was hardened ([#220](https://github.com/bielxdh3/Root.ark/pull/220)). The Mammoth transitive-dependency advisory has containment tests and documented review controls ([#223](https://github.com/bielxdh3/Root.ark/pull/223)), **not** a patched dependency or a resolved security finding.
 
