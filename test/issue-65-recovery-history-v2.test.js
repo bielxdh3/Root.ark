@@ -42,6 +42,7 @@ async function historyInput(scenario, transitions = scenario.transitions, packag
     packageEnvelopes,
     transitions: encodedTransitions,
     epochKeys: scenario.state.epochKeys,
+    recoveryPackageKeys: scenario.state.recoveryPackageKeys,
     now: 100_000,
   };
 }
@@ -65,6 +66,17 @@ async function resignCore(core, epochKey, actorPrivateKey) {
   return { ...core, mac, actor_signature: actorSignature };
 }
 
+async function resignFirstTransition(scenario, mutateCore) {
+  const core = await z.decodeDeterministic(await z.encodeDeterministic(scenario.transitions[0]));
+  delete core.mac;
+  delete core.actor_signature;
+  await mutateCore(core);
+  core.operation.request_digest = await m.expectedRecoveryRequestDigestV2(scenario.baseManifest, core);
+  const epochKey = scenario.state.epochKeys.find((entry) => entry.epoch === core.current_epoch).key;
+  const actorPrivateKey = scenario.state.actors.get(Buffer.from(core.operation.actor_key_id).toString("hex"));
+  return resignCore(core, epochKey, actorPrivateKey);
+}
+
 test("acceptsCompleteContiguousHistoryAndExpiredCommittedTransitions", async () => {
   const scenario = await createHistory();
   const result = await h.verifyRecoveryHistoryV2(await historyInput(scenario));
@@ -72,6 +84,114 @@ test("acceptsCompleteContiguousHistoryAndExpiredCommittedTransitions", async () 
   assert.equal(result.transitionCount, 4);
   assert.equal(result.packageAuthorityStatus, "active");
   assert.equal(result.freshnessProven, false);
+});
+
+test("rejectsFreshWitnessHeadInThePackageBaseReceiptSlot", async () => {
+  const scenario = await createHistory();
+  const input = await historyInput(scenario);
+  const base = input.baseReceipt;
+  const unsigned = {
+    type: "rootark-recovery-witness-head/v1",
+    witness_key_id: base.witness_key_id,
+    account_id: base.account_id,
+    compartment_id: base.compartment_id,
+    keyring_id: base.keyring_id,
+    current_revision: base.revision,
+    current_manifest_digest: base.manifest_digest,
+    witness_sequence: base.witness_sequence,
+    nonce: base.nonce,
+    observed_at: base.observed_at,
+    status: "committed",
+    pending_reservation_id: null,
+  };
+  input.baseReceipt = {
+    ...unsigned,
+    signature: crypto.sign(null, Buffer.concat([
+      Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0", "ascii"),
+      await z.encodeDeterministic(unsigned),
+    ]), scenario.baseAnchor.signingPrivateKey),
+  };
+
+  await assert.rejects(h.verifyRecoveryHistoryV2(input), (error) => error.code === "HISTORY_INVALID");
+});
+
+test("rejectsPendingBaseReceiptAsACommittedSnapshot", async () => {
+  const scenario = await createHistory();
+  const input = await historyInput(scenario);
+  const unsigned = { ...input.baseReceipt, status: "pending" };
+  delete unsigned.signature;
+  input.baseReceipt = {
+    ...unsigned,
+    signature: crypto.sign(null, Buffer.concat([
+      Buffer.from("Root.ark/zk-1/recovery-witness-base/v1\0", "ascii"),
+      await z.encodeDeterministic(unsigned),
+    ]), scenario.baseAnchor.signingPrivateKey),
+  };
+
+  await assert.rejects(h.verifyRecoveryHistoryV2(input), (error) => error.code === "HISTORY_INVALID");
+});
+
+test("requiresTheRecoveryPackagePrivateKeyToVerifyNewRecoveryWraps", async () => {
+  const scenario = await createHistory();
+  const input = await historyInput(scenario);
+  delete input.recoveryPackageKeys;
+
+  await assert.rejects(
+    h.verifyRecoveryHistoryV2(input),
+    (error) => error instanceof z.RootarkZkError && error.code === "KEY_COVERAGE_INCOMPLETE",
+  );
+});
+
+test("rejectsSignedSyntheticRecoveryWrapsThatCannotDecryptTheEpochKey", async () => {
+  const scenario = await createHistory();
+  const malformedActivation = await resignFirstTransition(scenario, (core) => {
+    core.recovery_wraps[0].enc = crypto.randomBytes(32);
+    core.recovery_wraps[0].ciphertext = crypto.randomBytes(48);
+  });
+  const input = await historyInput(scenario, [malformedActivation]);
+
+  await assert.rejects(
+    h.verifyRecoveryHistoryV2(input),
+    (error) => error instanceof z.RootarkZkError && error.code === "KEY_COVERAGE_INCOMPLETE",
+  );
+});
+
+test("rejectsMisboundRecoveryWrapsAfterTheTransitionIsResigned", async () => {
+  const scenario = await createHistory();
+  const mutations = [
+    (core) => {
+      core.recovery_wraps[0].enc = crypto.randomBytes(32);
+      core.recovery_wraps[0].ciphertext = crypto.randomBytes(48);
+    },
+    (core) => {
+      const enc = Buffer.from(core.recovery_wraps[0].enc);
+      enc[0] ^= 0xff;
+      core.recovery_wraps[0].enc = enc;
+    },
+    (core) => { core.recovery_wraps[0].package_id = Buffer.alloc(16, 0xff); },
+    (core) => { core.recovery_wraps[0].epoch = 2; },
+    (core) => { core.recovery_wraps[0].key_ref = Buffer.alloc(32, 0xff); },
+  ];
+
+  for (const mutateCore of mutations) {
+    const malformedActivation = await resignFirstTransition(scenario, mutateCore);
+    const input = await historyInput(scenario, [malformedActivation]);
+    await assert.rejects(
+      h.verifyRecoveryHistoryV2(input),
+      (error) => error instanceof z.RootarkZkError && error.code === "KEY_COVERAGE_INCOMPLETE",
+    );
+  }
+});
+
+test("requiresEveryHistoricalEpochKeyForRecoveryCoverage", async () => {
+  const scenario = await createHistory();
+  const input = await historyInput(scenario);
+  input.epochKeys = [];
+
+  await assert.rejects(
+    h.verifyRecoveryHistoryV2(input),
+    (error) => error instanceof z.RootarkZkError && error.code === "KEY_COVERAGE_INCOMPLETE",
+  );
 });
 
 test("rejectsAnEpochKeyAppendedToAHistoryVerifierResult", async () => {

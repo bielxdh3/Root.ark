@@ -21,6 +21,9 @@ const OPERATION_FIELDS = Object.freeze([
   "target_device_key_digest", "compromised_package_id", "recovery_policy_change",
   "target_epoch_coverage", "target_pop_proof", "issued_at", "expires_at", "request_digest",
 ]);
+const PUBLIC_TRANSITION_INPUT_FIELDS = Object.freeze([
+  "previousManifest", "nextManifest", "expectedScope", "retainedIdentifiers",
+]);
 const EPOCH_FIELDS = Object.freeze(["epoch", "key_ref"]);
 const DEVICE_FIELDS = Object.freeze([
   "device_id", "hpke_key_id", "hpke_public_key", "authorization_key_id",
@@ -546,7 +549,7 @@ async function assertRotationDeviceWraps(previous, next, freshEpoch) {
   }
 }
 
-async function assertPriorEpochKeyCoverage(priorEpochKeys, epochCount) {
+function assertPriorEpochKeyCoverage(priorEpochKeys, epochCount) {
   const entries = priorEpochKeys instanceof Map
     ? [...priorEpochKeys].map(([epoch, key]) => ({ epoch, key }))
     : priorEpochKeys;
@@ -561,7 +564,7 @@ async function assertPriorEpochKeyCoverage(priorEpochKeys, epochCount) {
   for (let epoch = 1; epoch <= epochCount; epoch += 1) if (!epochs.has(epoch)) fail("KEY_COVERAGE_INCOMPLETE");
 }
 
-async function assertOperationState(previousManifest, nextManifest, priorEpochKeys) {
+async function assertOperationState(previousManifest, nextManifest) {
   const operation = nextManifest.operation;
   const priorAuthority = previousManifest?.recovery_authority || null;
   const nextAuthority = nextManifest.recovery_authority;
@@ -591,7 +594,6 @@ async function assertOperationState(previousManifest, nextManifest, priorEpochKe
       const nextTarget = nextManifest.devices.find((device) => device.device_id === operation.target_device_id);
       if (!priorTarget || !isDeviceActive(priorTarget) || !nextTarget
         || u64(nextTarget.revoked_at_epoch, 1n) !== BigInt(nextEpoch)) fail();
-      await assertPriorEpochKeyCoverage(priorEpochKeys, previousManifest.epochs.length);
       await assertDeviceRevocation(previousManifest, nextManifest, operation.target_device_id, nextEpoch);
       await assertRotationDeviceWraps(previousManifest, nextManifest, nextEpoch);
       if (!await sameCanonical(previousManifest.recovery_authority, nextAuthority)) fail();
@@ -637,7 +639,7 @@ async function assertOperationState(previousManifest, nextManifest, priorEpochKe
       if (!previousManifest) fail();
       await assertDevicesUnchanged(previousManifest, nextManifest);
       await assertRotationDeviceWraps(previousManifest, nextManifest, nextEpoch);
-      assertCompromisePackageTransition({ previousManifest, nextManifestCore: coreOf(nextManifest), priorEpochKeys });
+      assertCompromisePackageTransitionShape({ previousManifest, nextManifestCore: coreOf(nextManifest) });
       break;
     default:
       fail("UNKNOWN_RECOVERY_OPERATION");
@@ -691,6 +693,8 @@ async function manifestMac(manifestCore, epochKey) {
 }
 
 async function verifyRecoveryTransitionPublicV2(input) {
+  plainMap(input);
+  if (Reflect.ownKeys(input).some((field) => !PUBLIC_TRANSITION_INPUT_FIELDS.includes(field))) fail("HISTORY_INVALID");
   const previousManifest = input.previousManifest === null ? null : input.previousManifest;
   const nextManifest = input.nextManifest;
   validateManifestShape(nextManifest);
@@ -744,7 +748,7 @@ async function verifyRecoveryTransitionPublicV2(input) {
   const signedCore = { ...core, mac: nextManifest.mac };
   const signatureInput = Buffer.concat([SIGNATURE_PREFIX, await z.encodeDeterministic(signedCore)]);
   if (!crypto.verify(null, signatureInput, publicKey, Buffer.from(nextManifest.actor_signature))) fail("HISTORY_INVALID");
-  await assertOperationState(previousManifest, nextManifest, input.priorEpochKeys || []);
+  await assertOperationState(previousManifest, nextManifest);
 
   const identifiers = ensureIdentifierInventory(previousManifest, nextManifest, input.retainedIdentifiers);
   const proof = Object.freeze({
@@ -774,6 +778,13 @@ async function verifyRecoveryTransitionMacV2(input) {
       ? [...input.priorEpochKeys.values()]
       : input.priorEpochKeys.map((entry) => entry.key);
     if (priorKeys.some((key) => sameBytes(key, input.manifestMacKey))) fail("HISTORY_INVALID");
+  }
+  if (proof.nextManifest.operation.operation_type === "compromise-package") {
+    assertCompromisePackageTransition({
+      previousManifest: proof.previousManifest,
+      nextManifestCore: coreOf(proof.nextManifest),
+      priorEpochKeys: input.priorEpochKeys,
+    });
   }
   const expected = await manifestMac(proof.core, input.manifestMacKey);
   try {
@@ -834,7 +845,6 @@ async function signRecoveryTransitionV2(input) {
       keyring_id: core.keyring_id,
     },
     retainedIdentifiers: { complete: true, values: priorIdentifiers },
-    priorEpochKeys,
   });
   await verifyRecoveryTransitionMacV2({
     publicTransitionProof: publicProof,
@@ -848,7 +858,7 @@ function wrapAsMap(value) {
   return exactMap(value, RECOVERY_WRAP_FIELDS);
 }
 
-function assertCompromisePackageTransition(input) {
+function assertCompromisePackageTransitionShape(input) {
   const previous = input.previousManifest;
   const next = input.nextManifestCore;
   if (!previous || !next) fail("COMPROMISE_RECOVERY_UNAVAILABLE");
@@ -867,13 +877,6 @@ function assertCompromisePackageTransition(input) {
   const freshEpoch = asNumber(next.current_epoch);
   if (freshEpoch !== oldEpoch + 1) fail("COMPROMISE_RECOVERY_UNAVAILABLE");
   const oldEpochs = previous.epochs.map((epoch) => asNumber(epoch.epoch));
-  const priorKeys = input.priorEpochKeys instanceof Map
-    ? [...input.priorEpochKeys].map(([epoch, key]) => ({ epoch, key }))
-    : input.priorEpochKeys;
-  if (!Array.isArray(priorKeys) || priorKeys.length !== oldEpochs.length
-    || oldEpochs.some((epoch) => !priorKeys.some((entry) => asNumber(entry.epoch) === epoch && isBytes(entry.key) && entry.key.byteLength === 32))) {
-    fail("KEY_COVERAGE_INCOMPLETE");
-  }
   const activeDevices = next.devices.filter(isDeviceActive);
   if (activeDevices.length === 0) fail("COMPROMISE_RECOVERY_UNAVAILABLE");
   if (!Array.isArray(next.recovery_wraps) || next.recovery_wraps.length !== oldEpochs.length + 1) fail("KEY_COVERAGE_INCOMPLETE");
@@ -893,6 +896,12 @@ function assertCompromisePackageTransition(input) {
     || activeDevices.some((device) => freshDeviceWraps.filter((wrap) => wrap.device_id === device.device_id).length !== 1)) {
     fail("KEY_COVERAGE_INCOMPLETE");
   }
+  return true;
+}
+
+function assertCompromisePackageTransition(input) {
+  assertCompromisePackageTransitionShape(input);
+  assertPriorEpochKeyCoverage(input.priorEpochKeys, input.previousManifest.epochs.length);
   return true;
 }
 

@@ -14,7 +14,7 @@ const {
 
 const ENVELOPE_DIGEST_PREFIX = Buffer.from("Root.ark/zk-1/recovery-package-envelope/v1\0", "ascii");
 const MANIFEST_DIGEST_PREFIX = Buffer.from("Root.ark/zk-1/recovery-manifest-digest/v1\0", "ascii");
-const WITNESS_PREFIX = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0", "ascii");
+const WITNESS_PREFIX = Buffer.from("Root.ark/zk-1/recovery-witness-base/v1\0", "ascii");
 
 const hash = (data) => crypto.createHash("sha256").update(data).digest();
 const domainHash = (prefix, data) => hash(Buffer.concat([prefix, data]));
@@ -57,7 +57,7 @@ async function fixture(extraPayload = {}) {
   const previousManifestBytes = await z.encodeDeterministic(previousManifest);
   const previousManifestDigest = domainHash(MANIFEST_DIGEST_PREFIX, previousManifestBytes);
   const witnessReceipt = {
-    type: "rootark-recovery-witness-head",
+    type: "rootark-recovery-witness-base/v1",
     witness_key_id: witnessKeyId,
     account_id: accountId,
     compartment_id: compartmentId,
@@ -125,7 +125,20 @@ async function fixture(extraPayload = {}) {
   return {
     payload,
     pinnedWitness,
+    witnessPrivateKey: witness.privateKey,
     expectedScope: { account_id: accountId, compartment_id: compartmentId, keyring_id: keyringId },
+  };
+}
+
+async function signWitnessReceipt(receipt, privateKey, domain) {
+  const unsigned = { ...receipt };
+  delete unsigned.signature;
+  return {
+    ...unsigned,
+    signature: crypto.sign(null, Buffer.concat([
+      Buffer.from(`${domain}\0`, "ascii"),
+      await z.encodeDeterministic(unsigned),
+    ]), privateKey),
   };
 }
 
@@ -198,6 +211,47 @@ test("roundTripsPackageUsingTheRealBoundedKdfWorker", async () => {
   const envelopeBytes = await createRecoveryPackageV1({ password: "phase-one-password", payload, pinnedWitness });
   const opened = await openRecoveryPackageV1({ password: "phase-one-password", envelopeBytes, expectedScope, pinnedWitness });
   assert.deepEqual(await z.encodeDeterministic(opened), await z.encodeDeterministic(payload));
+});
+
+test("rejectsFreshWitnessHeadInThePackageBaseReceiptSlotBeforeKdf", async (t) => {
+  const kdf = useTestKdf(t);
+  const { payload, pinnedWitness, witnessPrivateKey } = await fixture();
+  const base = payload.witness_base_receipt;
+  payload.witness_base_receipt = await signWitnessReceipt({
+    type: "rootark-recovery-witness-head/v1",
+    witness_key_id: base.witness_key_id,
+    account_id: base.account_id,
+    compartment_id: base.compartment_id,
+    keyring_id: base.keyring_id,
+    current_revision: base.revision,
+    current_manifest_digest: base.manifest_digest,
+    witness_sequence: base.witness_sequence,
+    nonce: base.nonce,
+    observed_at: base.observed_at,
+    status: "committed",
+    pending_reservation_id: null,
+  }, witnessPrivateKey, "Root.ark/zk-1/recovery-witness-head/v1");
+
+  await assert.rejects(
+    createRecoveryPackageV1({ password: "phase-one-password", payload, pinnedWitness }),
+    (error) => error.code === "INVALID_RECOVERY_PACKAGE",
+  );
+  assert.equal(kdf.calls(), 0);
+});
+
+test("rejectsPendingBaseReceiptBeforeKdf", async (t) => {
+  const kdf = useTestKdf(t);
+  const { payload, pinnedWitness, witnessPrivateKey } = await fixture();
+  payload.witness_base_receipt = await signWitnessReceipt({
+    ...payload.witness_base_receipt,
+    status: "pending",
+  }, witnessPrivateKey, "Root.ark/zk-1/recovery-witness-base/v1");
+
+  await assert.rejects(
+    createRecoveryPackageV1({ password: "phase-one-password", payload, pinnedWitness }),
+    (error) => error.code === "INVALID_RECOVERY_PACKAGE",
+  );
+  assert.equal(kdf.calls(), 0);
 });
 
 test("rejectsWrongPasswordTamperingAndScopeMismatch", async (t) => {

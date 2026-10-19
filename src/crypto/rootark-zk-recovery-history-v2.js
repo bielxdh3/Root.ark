@@ -9,7 +9,10 @@ const MAX_TRANSITIONS = 4096;
 const MAX_HISTORY_BYTES = 64 * 1024 * 1024;
 const MAX_ENTRY_BYTES = 8 * 1024 * 1024;
 const WARNING_PERCENT = 75;
-const WITNESS_HEAD_PREFIX = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0", "ascii");
+const WRAP_INFO_PREFIX = Buffer.from("Root.ark/zk-1/keyring-wrap-info/v2\0", "ascii");
+const WRAP_AAD_PREFIX = Buffer.from("Root.ark/zk-1/keyring-wrap-aad/v2\0", "ascii");
+const RECOVERY_PACKAGE_KEY_FIELDS = Object.freeze(["package_id", "hpke_key_id", "hpke_private_key"]);
+const WITNESS_BASE_PREFIX = Buffer.from("Root.ark/zk-1/recovery-witness-base/v1\0", "ascii");
 const WITNESS_RECEIPT_FIELDS = Object.freeze([
   "type", "witness_key_id", "account_id", "compartment_id", "keyring_id", "revision",
   "manifest_digest", "witness_sequence", "nonce", "observed_at", "status", "signature",
@@ -108,6 +111,85 @@ function keysThrough(epochKeys, epochCount) {
   return result;
 }
 
+function recoveryPackageKeyMap(input) {
+  if (!Array.isArray(input) || input.length > MAX_TRANSITIONS + 1) fail("KEY_COVERAGE_INCOMPLETE");
+  const result = new Map();
+  try {
+    for (const value of input) {
+      const entry = exactMap(value, RECOVERY_PACKAGE_KEY_FIELDS);
+      const packageId = bytes(entry.package_id, 16);
+      const hpkeKeyId = bytes(entry.hpke_key_id, 16);
+      const privateKey = bytes(entry.hpke_private_key, 32);
+      const token = `${packageId.toString("hex")}:${hpkeKeyId.toString("hex")}`;
+      if (result.has(token)) fail("KEY_COVERAGE_INCOMPLETE");
+      result.set(token, privateKey);
+    }
+  } catch (error) {
+    for (const key of result.values()) z.clearSecret(key);
+    throw error;
+  }
+  return result;
+}
+
+async function verifyNewRecoveryWraps(previousManifest, nextManifest, scope, epochKeys, inputKeys) {
+  const operationType = nextManifest.operation.operation_type;
+  let wraps = [];
+  if (["register-package", "replace-package", "compromise-package"].includes(operationType)) {
+    wraps = nextManifest.recovery_wraps;
+  } else if (operationType === "revoke-device") {
+    wraps = nextManifest.recovery_wraps.slice(previousManifest.recovery_wraps.length);
+  }
+  if (wraps.length === 0) return;
+
+  const keys = recoveryPackageKeyMap(inputKeys);
+  try {
+    for (const wrap of wraps) {
+      const packageId = bytes(wrap.package_id, 16);
+      const hpkeKeyId = bytes(wrap.hpke_key_id, 16);
+      const wrapId = bytes(wrap.wrap_id, 16);
+      const keyRef = bytes(wrap.key_ref, 32);
+      const epoch = Number(u64(wrap.epoch, 1n));
+      const privateKeyBytes = keys.get(`${packageId.toString("hex")}:${hpkeKeyId.toString("hex")}`);
+      const expectedEpochKey = epochKeys.get(epoch);
+      if (!privateKeyBytes || !expectedEpochKey) fail("KEY_COVERAGE_INCOMPLETE");
+
+      const context = {
+        suite: "rootark-zk-1",
+        account_id: Buffer.from(scope.account_id),
+        compartment_id: Buffer.from(scope.compartment_id),
+        purpose: "recovery-package",
+        recipient_type: "recovery-package",
+        recipient_id: packageId,
+        recipient_key_id: hpkeKeyId,
+        epoch,
+        key_ref: keyRef,
+        wrap_id: wrapId,
+      };
+      const contextBytes = await z.encodeDeterministic(context);
+      let plaintext;
+      try {
+        const recipientKey = await z.hpkeSuite().kem.deserializePrivateKey(privateKeyBytes);
+        plaintext = await z.hpkeOpen({
+          recipientKey,
+          enc: wrap.enc,
+          info: Buffer.concat([WRAP_INFO_PREFIX, contextBytes]),
+          aad: Buffer.concat([WRAP_AAD_PREFIX, contextBytes]),
+          ciphertext: wrap.ciphertext,
+        });
+        if (plaintext.byteLength !== 32 || !sameBytes(plaintext, expectedEpochKey)) {
+          fail("KEY_COVERAGE_INCOMPLETE");
+        }
+      } catch (_) {
+        fail("KEY_COVERAGE_INCOMPLETE");
+      } finally {
+        if (plaintext) z.clearSecret(plaintext);
+      }
+    }
+  } finally {
+    for (const key of keys.values()) z.clearSecret(key);
+  }
+}
+
 async function verifyManifestKeyRefs(manifest) {
   for (const entry of manifest.epochs) {
     const expected = await manifestV2.recoveryKeyRefV2(manifest, entry.epoch);
@@ -131,7 +213,7 @@ async function verifyWitnessReceipt(input, scope, manifest) {
   u64(receipt.revision, 1n);
   u64(receipt.witness_sequence, 1n);
   u64(receipt.observed_at);
-  if (receipt.type !== "rootark-recovery-witness-head" || receipt.status !== "committed"
+  if (receipt.type !== "rootark-recovery-witness-base/v1" || receipt.status !== "committed"
     || !sameBytes(receipt.witness_key_id, pinned.keyId)
     || !sameBytes(receipt.account_id, scope.account_id)
     || !sameBytes(receipt.compartment_id, scope.compartment_id)
@@ -140,7 +222,7 @@ async function verifyWitnessReceipt(input, scope, manifest) {
     || !sameBytes(receipt.manifest_digest, await manifestV2.recoveryManifestDigestV2(manifest))) fail();
   const unsigned = {};
   for (const field of WITNESS_RECEIPT_FIELDS) if (field !== "signature") unsigned[field] = receipt[field];
-  const signatureInput = Buffer.concat([WITNESS_HEAD_PREFIX, await z.encodeDeterministic(unsigned)]);
+  const signatureInput = Buffer.concat([WITNESS_BASE_PREFIX, await z.encodeDeterministic(unsigned)]);
   try {
     if (!crypto.verify(null, signatureInput, pinned.publicKey, Buffer.from(receipt.signature))) fail();
   } catch (_) {
@@ -224,7 +306,6 @@ async function verifyRecoveryHistoryV2(input) {
         nextManifest,
         expectedScope: scope,
         retainedIdentifiers: { complete: true, values: usedIdentifiers },
-        priorEpochKeys,
       });
 
       const nextAuthority = nextManifest.recovery_authority;
@@ -244,6 +325,7 @@ async function verifyRecoveryHistoryV2(input) {
 
       const nextEpoch = Number(u64(nextManifest.current_epoch, 1n));
       keysThrough(epochKeys, nextEpoch);
+      await verifyNewRecoveryWraps(headManifest, nextManifest, scope, epochKeys, input.recoveryPackageKeys);
       await manifestV2.verifyRecoveryTransitionMacV2({
         publicTransitionProof: publicProof,
         manifestMacKey: epochKeys.get(nextEpoch),

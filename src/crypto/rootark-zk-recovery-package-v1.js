@@ -38,7 +38,7 @@ const AAD_PREFIX = Buffer.from("Root.ark/zk-1/recovery-package/v1\0", "ascii");
 const ACTIVATION_CONTEXT_PREFIX = Buffer.from("Root.ark/zk-1/recovery-activation-context/v1\0", "ascii");
 const ENVELOPE_DIGEST_PREFIX = Buffer.from("Root.ark/zk-1/recovery-package-envelope/v1\0", "ascii");
 const MANIFEST_DIGEST_PREFIX = Buffer.from("Root.ark/zk-1/recovery-manifest-digest/v1\0", "ascii");
-const WITNESS_HEAD_PREFIX = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0", "ascii");
+const WITNESS_BASE_PREFIX = Buffer.from("Root.ark/zk-1/recovery-witness-base/v1\0", "ascii");
 const ED25519_PKCS8_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
 const X25519_PKCS8_PREFIX = Buffer.from("302e020100300506032b656e04220420", "hex");
 
@@ -176,7 +176,7 @@ async function verifyPinnedWitness(pinnedWitness, receipt) {
   for (const field of WITNESS_RECEIPT_FIELDS) {
     if (field !== "signature") unsigned[field] = receipt[field];
   }
-  const signingBytes = Buffer.concat([WITNESS_HEAD_PREFIX, await z.encodeDeterministic(unsigned)]);
+  const signingBytes = Buffer.concat([WITNESS_BASE_PREFIX, await z.encodeDeterministic(unsigned)]);
   let valid = false;
   try {
     valid = crypto.verify(null, signingBytes, pinnedWitness.publicKey, signature);
@@ -267,7 +267,7 @@ async function validatePayload(payload, pinnedWitness, expectedScope) {
   if (!sameBytes(computedContextDigest, payload.activation_context_digest)) fail();
 
   const receipt = exactMap(payload.witness_base_receipt, WITNESS_RECEIPT_FIELDS);
-  if (receipt.type !== "rootark-recovery-witness-head" || receipt.status !== "committed"
+  if (receipt.type !== "rootark-recovery-witness-base/v1" || receipt.status !== "committed"
     || !sameBytes(receipt.account_id, payload.account_id)
     || !sameBytes(receipt.compartment_id, payload.compartment_id)
     || !sameBytes(receipt.keyring_id, payload.keyring_id)

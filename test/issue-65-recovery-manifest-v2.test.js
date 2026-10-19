@@ -218,7 +218,6 @@ test("publicTransitionProofRequiresExpectedScopeEvenForInitialization", async ()
       previousManifest: null,
       nextManifest: state.headManifest,
       retainedIdentifiers: { complete: true, values: new Set() },
-      priorEpochKeys: [],
     }),
     (error) => error instanceof z.RootarkZkError && error.code === "SCOPE_MISMATCH",
   );
@@ -231,6 +230,131 @@ test("signsAValidPriorStateDeviceRevocationAtTheNextRevision", async () => {
   assert.equal(manifest.revision, previousRevision + 1);
   assert.equal(manifest.current_epoch, 2);
   assert.equal(manifest.devices.find((device) => device.device_id === "trusted-1").revoked_at_epoch, 2);
+});
+
+test("publicTransitionVerificationAcceptsRevocationWithoutEpochSecrets", async () => {
+  const state = await fixtures.createInitialState();
+  const previousManifest = state.headManifest;
+  const retainedIdentifiers = new Set(state.verifiedHistory.usedIdentifiers);
+  const nextManifest = await fixtures.appendDeviceRevocation(state, "trusted-1");
+
+  const proof = await m.verifyRecoveryTransitionPublicV2({
+    previousManifest,
+    nextManifest,
+    expectedScope: state.scope,
+    retainedIdentifiers: { complete: true, values: retainedIdentifiers },
+  });
+  assert.equal(proof.revision, nextManifest.revision);
+});
+
+test("publicTransitionVerificationAcceptsPackageCompromiseWithoutEpochSecrets", async () => {
+  const state = await fixtures.createInitialState(1);
+  const firstPackage = await fixtures.createPackageEnvelope(state);
+  await fixtures.appendPackageActivation(state, firstPackage.envelopeBytes);
+  const previousManifest = state.headManifest;
+  const retainedIdentifiers = new Set(state.verifiedHistory.usedIdentifiers);
+  const replacementPackage = await fixtures.createPackageEnvelope(state);
+  const nextManifest = await fixtures.appendPackageCompromise(state, replacementPackage.envelopeBytes);
+
+  const proof = await m.verifyRecoveryTransitionPublicV2({
+    previousManifest,
+    nextManifest,
+    expectedScope: state.scope,
+    retainedIdentifiers: { complete: true, values: retainedIdentifiers },
+  });
+  assert.equal(proof.revision, nextManifest.revision);
+});
+
+test("publicTransitionVerificationRejectsAnEpochKeyInput", async () => {
+  const state = await fixtures.createInitialState();
+  const previousManifest = state.headManifest;
+  const retainedIdentifiers = new Set(state.verifiedHistory.usedIdentifiers);
+  const nextManifest = await fixtures.appendDeviceRevocation(state, "trusted-1");
+
+  await assert.rejects(
+    m.verifyRecoveryTransitionPublicV2({
+      previousManifest,
+      nextManifest,
+      expectedScope: state.scope,
+      retainedIdentifiers: { complete: true, values: retainedIdentifiers },
+      priorEpochKeys: state.epochKeys,
+    }),
+    (error) => error instanceof z.RootarkZkError && error.code === "HISTORY_INVALID",
+  );
+});
+
+test("publicTransitionVerificationRejectsRecoveryPackagePrivateKeys", async () => {
+  const state = await fixtures.createInitialState();
+  const previousManifest = state.headManifest;
+  const retainedIdentifiers = new Set(state.verifiedHistory.usedIdentifiers);
+  const nextManifest = await fixtures.appendDeviceRevocation(state, "trusted-1");
+
+  await assert.rejects(
+    m.verifyRecoveryTransitionPublicV2({
+      previousManifest,
+      nextManifest,
+      expectedScope: state.scope,
+      retainedIdentifiers: { complete: true, values: retainedIdentifiers },
+      recoveryPackageKeys: [{
+        package_id: Buffer.alloc(16, 0x71),
+        hpke_key_id: Buffer.alloc(16, 0x72),
+        hpke_private_key: Buffer.alloc(32, 0x73),
+      }],
+    }),
+    (error) => error instanceof z.RootarkZkError && error.code === "HISTORY_INVALID",
+  );
+});
+
+test("publicTransitionVerificationRejectsAnUnauthorizedActorSignature", async () => {
+  const state = await fixtures.createInitialState(2);
+  const previousManifest = state.headManifest;
+  const retainedIdentifiers = new Set(state.verifiedHistory.usedIdentifiers);
+  const nextManifest = await fixtures.appendDeviceRevocation(state, "trusted-1");
+  const signedCore = { ...nextManifest };
+  delete signedCore.actor_signature;
+  const unauthorizedActor = state.actors.get(previousManifest.devices[1].authorization_key_id.toString("hex"));
+  const forged = {
+    ...nextManifest,
+    actor_signature: crypto.sign(null, Buffer.concat([
+      Buffer.from("Root.ark/zk-1/recovery-manifest/v1\0", "ascii"),
+      await z.encodeDeterministic(signedCore),
+    ]), unauthorizedActor),
+  };
+
+  await assert.rejects(
+    m.verifyRecoveryTransitionPublicV2({
+      previousManifest,
+      nextManifest: forged,
+      expectedScope: state.scope,
+      retainedIdentifiers: { complete: true, values: retainedIdentifiers },
+    }),
+    (error) => error instanceof z.RootarkZkError && error.code === "HISTORY_INVALID",
+  );
+});
+
+test("clientMacVerificationStillRequiresPriorEpochKeysAfterPublicVerification", async () => {
+  const state = await fixtures.createInitialState();
+  const previousManifest = state.headManifest;
+  const priorEpochKeys = state.verifiedHistory.epochKeys;
+  const retainedIdentifiers = new Set(state.verifiedHistory.usedIdentifiers);
+  const nextManifest = await fixtures.appendDeviceRevocation(state, "trusted-1");
+  const proof = await m.verifyRecoveryTransitionPublicV2({
+    previousManifest,
+    nextManifest,
+    expectedScope: state.scope,
+    retainedIdentifiers: { complete: true, values: retainedIdentifiers },
+  });
+  const nextEpochKey = state.epochKeys.at(-1).key;
+
+  await assert.rejects(
+    m.verifyRecoveryTransitionMacV2({ publicTransitionProof: proof, manifestMacKey: nextEpochKey, priorEpochKeys: [] }),
+    (error) => error instanceof z.RootarkZkError && error.code === "KEY_COVERAGE_INCOMPLETE",
+  );
+  assert.equal(await m.verifyRecoveryTransitionMacV2({
+    publicTransitionProof: proof,
+    manifestMacKey: nextEpochKey,
+    priorEpochKeys,
+  }), true);
 });
 
 test("rejectsAnEpochRotationThatReusesAnyPriorEpochKey", async () => {
@@ -282,7 +406,6 @@ test("rejectsAChangedActorSignatureScopeAndManifestMac", async () => {
     nextManifest: manifest,
     expectedScope: state.scope,
     retainedIdentifiers: { complete: true, values: new Set(state.usedIdentifiers) },
-    priorEpochKeys: state.epochKeys,
   };
   const proof = await m.verifyRecoveryTransitionPublicV2(verificationInput);
   await assert.rejects(
@@ -336,7 +459,7 @@ test("transitionRejectsAnOperationIdAlreadyConsumedByPriorHistory", async () => 
 test("rejectsReusedIdentifiersFromPriorHistoryInventory", async () => {
   const state = await fixtures.createInitialState(1);
   const id = (kind, value) => `${kind}:${Buffer.from(value).toString("hex")}`;
-  const assertCollisions = async (previous, next, priorIdentifiers, priorEpochKeys, candidates) => {
+  const assertCollisions = async (previous, next, priorIdentifiers, candidates) => {
     for (const candidate of candidates) {
       const values = new Set(priorIdentifiers);
       values.add(candidate);
@@ -346,7 +469,6 @@ test("rejectsReusedIdentifiersFromPriorHistoryInventory", async () => {
           nextManifest: next,
           expectedScope: state.scope,
           retainedIdentifiers: { complete: true, values },
-          priorEpochKeys,
         }),
         (error) => error instanceof z.RootarkZkError && error.code === "HISTORY_INVALID",
         `accepted reused identifier ${candidate}`,
@@ -356,11 +478,10 @@ test("rejectsReusedIdentifiersFromPriorHistoryInventory", async () => {
 
   const previousDeviceState = state.headManifest;
   const priorDeviceIdentifiers = new Set(state.verifiedHistory.usedIdentifiers);
-  const priorDeviceKeys = state.verifiedHistory.epochKeys;
   const enrollment = await fixtures.appendDeviceEnrollment(state, 1);
   const enrolledDevice = enrollment.devices.at(-1);
   const deviceWraps = enrollment.wraps.slice(previousDeviceState.wraps.length);
-  await assertCollisions(previousDeviceState, enrollment, priorDeviceIdentifiers, priorDeviceKeys, [
+  await assertCollisions(previousDeviceState, enrollment, priorDeviceIdentifiers, [
     id("operation", enrollment.operation.operation_id),
     `device-name:${enrolledDevice.device_id}`,
     id("key", enrolledDevice.hpke_key_id),
@@ -373,12 +494,11 @@ test("rejectsReusedIdentifiersFromPriorHistoryInventory", async () => {
 
   const previousPackageState = state.headManifest;
   const priorPackageIdentifiers = new Set(state.verifiedHistory.usedIdentifiers);
-  const priorPackageKeys = state.verifiedHistory.epochKeys;
   const packageFixture = await fixtures.createPackageEnvelope(state);
   const activation = await fixtures.appendPackageActivation(state, packageFixture.envelopeBytes);
   const authority = activation.manifest.recovery_authority;
   const recoveryWraps = activation.manifest.recovery_wraps.slice(previousPackageState.recovery_wraps.length);
-  await assertCollisions(previousPackageState, activation.manifest, priorPackageIdentifiers, priorPackageKeys, [
+  await assertCollisions(previousPackageState, activation.manifest, priorPackageIdentifiers, [
     id("operation", activation.manifest.operation.operation_id),
     id("package", authority.package_id),
     id("key", authority.hpke_key_id),

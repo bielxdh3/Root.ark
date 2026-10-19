@@ -15,6 +15,45 @@ function keyId(prefix, index) {
   return Buffer.alloc(16, prefix + index);
 }
 
+async function createRecoveryWrap(scope, authority, epoch, keyRef, epochKey) {
+  const wrapId = crypto.randomBytes(16);
+  const context = {
+    suite: "rootark-zk-1",
+    account_id: Buffer.from(scope.account_id),
+    compartment_id: Buffer.from(scope.compartment_id),
+    purpose: "recovery-package",
+    recipient_type: "recovery-package",
+    recipient_id: Buffer.from(authority.package_id),
+    recipient_key_id: Buffer.from(authority.hpke_key_id),
+    epoch,
+    key_ref: Buffer.from(keyRef),
+    wrap_id: wrapId,
+  };
+  const info = Buffer.concat([
+    Buffer.from("Root.ark/zk-1/keyring-wrap-info/v2\0", "ascii"),
+    await z.encodeDeterministic(context),
+  ]);
+  const aad = Buffer.concat([
+    Buffer.from("Root.ark/zk-1/keyring-wrap-aad/v2\0", "ascii"),
+    await z.encodeDeterministic(context),
+  ]);
+  const sealed = await z.hpkeSeal({
+    recipientPublicKey: await z.hpkeSuite().kem.deserializePublicKey(authority.hpke_public_key),
+    info,
+    aad,
+    plaintext: epochKey,
+  });
+  return {
+    package_id: Buffer.from(authority.package_id),
+    hpke_key_id: Buffer.from(authority.hpke_key_id),
+    epoch,
+    key_ref: Buffer.from(keyRef),
+    wrap_id: wrapId,
+    enc: sealed.enc,
+    ciphertext: sealed.ciphertext,
+  };
+}
+
 function identifiers(manifest) {
   const used = new Set();
   used.add(`operation:${Buffer.from(manifest.operation.operation_id).toString("hex")}`);
@@ -38,6 +77,7 @@ async function refreshVerifiedHistory(state) {
     baseReceipt: state.baseReceipt,
     pinnedWitness: state.pinnedWitness,
     epochKeys: state.epochKeys,
+    recoveryPackageKeys: state.recoveryPackageKeys,
     transitions: state.transitions,
     packageEnvelopes: state.packageEnvelopes,
   });
@@ -108,6 +148,7 @@ async function createInitialState(deviceCount = 3) {
     actors,
     headManifest: manifest,
     epochKeys: [{ epoch: 1, key: epochKey }],
+    recoveryPackageKeys: [],
     baseManifest: manifest,
     baseReceipt: null,
     pinnedWitness: null,
@@ -259,6 +300,9 @@ async function prepareDeviceRevocation(state, deviceId, operationId = crypto.ran
     enc: crypto.randomBytes(32),
     ciphertext: crypto.randomBytes(48),
   }));
+  const freshRecoveryWrap = previous.recovery_authority?.status === "active"
+    ? await createRecoveryWrap(state.scope, previous.recovery_authority, currentEpoch, newKeyRef, newKey)
+    : null;
   const core = {
     type: m.MANIFEST_TYPE,
     version: m.MANIFEST_VERSION,
@@ -273,15 +317,7 @@ async function prepareDeviceRevocation(state, deviceId, operationId = crypto.ran
     wraps: [...previous.wraps, ...newWraps],
     recovery_authority: previous.recovery_authority,
     recovery_wraps: previous.recovery_authority?.status === "active"
-      ? [...previous.recovery_wraps, {
-        package_id: previous.recovery_authority.package_id,
-        hpke_key_id: previous.recovery_authority.hpke_key_id,
-        epoch: currentEpoch,
-        key_ref: newKeyRef,
-        wrap_id: crypto.randomBytes(16),
-        enc: crypto.randomBytes(32),
-        ciphertext: crypto.randomBytes(48),
-      }]
+      ? [...previous.recovery_wraps, freshRecoveryWrap]
       : previous.recovery_wraps,
     previous_manifest_digest: await m.recoveryManifestDigestV2(previous),
     operation: {
@@ -355,10 +391,13 @@ async function appendPackageActivation(state, envelopeBytes, operationType = "re
   const existingAuthority = previous.recovery_authority;
   const signing = crypto.generateKeyPairSync("ed25519");
   const hpkeKeyId = crypto.randomBytes(16);
+  const hpkeKeyPair = await z.hpkeSuite().kem.generateKeyPair();
+  const hpkePublicKey = Buffer.from(await z.hpkeSuite().kem.serializePublicKey(hpkeKeyPair.publicKey));
+  const hpkePrivateKey = Buffer.from(await z.hpkeSuite().kem.serializePrivateKey(hpkeKeyPair.privateKey));
   const authorizationKeyId = crypto.randomBytes(16);
   const packagePublicKeys = {
     hpke_key_id: hpkeKeyId,
-    hpke_public_key: crypto.randomBytes(32),
+    hpke_public_key: hpkePublicKey,
     authorization_key_id: authorizationKeyId,
     authorization_public_key: rawPublic(signing.publicKey),
   };
@@ -373,15 +412,12 @@ async function appendPackageActivation(state, envelopeBytes, operationType = "re
     activation_context_digest: envelope.activation_context_digest,
     package_envelope_digest: packageV1.recoveryPackageEnvelopeDigest(envelopeBytes),
   };
-  const recoveryWraps = previous.epochs.map((epoch) => ({
-    package_id: authority.package_id,
-    hpke_key_id: authority.hpke_key_id,
-    epoch: epoch.epoch,
-    key_ref: epoch.key_ref,
-    wrap_id: crypto.randomBytes(16),
-    enc: crypto.randomBytes(32),
-    ciphertext: crypto.randomBytes(48),
-  }));
+  const recoveryWraps = [];
+  for (const epoch of previous.epochs) {
+    const epochKey = state.epochKeys.find((entry) => entry.epoch === epoch.epoch)?.key;
+    if (!epochKey) throw new Error("fixture epoch key missing");
+    recoveryWraps.push(await createRecoveryWrap(state.scope, authority, epoch.epoch, epoch.key_ref, epochKey));
+  }
   const core = {
     type: m.MANIFEST_TYPE,
     version: m.MANIFEST_VERSION,
@@ -427,8 +463,112 @@ async function appendPackageActivation(state, envelopeBytes, operationType = "re
   state.headManifest = next;
   state.transitions.push(await encodeManifest(next));
   state.packageEnvelopes.push({ activationRevision: Number(next.revision), envelopeBytes: Buffer.from(envelopeBytes) });
+  state.recoveryPackageKeys.push({
+    package_id: Buffer.from(authority.package_id),
+    hpke_key_id: Buffer.from(authority.hpke_key_id),
+    hpke_private_key: hpkePrivateKey,
+  });
   await refreshVerifiedHistory(state);
   return { manifest: next, envelopeBytes, packageSigningKey: signing.privateKey, existingAuthority };
+}
+
+async function appendPackageCompromise(state, envelopeBytes) {
+  const previous = state.headManifest;
+  const oldAuthority = previous.recovery_authority;
+  if (!oldAuthority || oldAuthority.status !== "active") throw new Error("fixture recovery authority missing");
+  const envelope = await z.decodeDeterministic(envelopeBytes);
+  const signing = crypto.generateKeyPairSync("ed25519");
+  const hpkeKeyId = crypto.randomBytes(16);
+  const hpkeKeyPair = await z.hpkeSuite().kem.generateKeyPair();
+  const hpkePublicKey = Buffer.from(await z.hpkeSuite().kem.serializePublicKey(hpkeKeyPair.publicKey));
+  const hpkePrivateKey = Buffer.from(await z.hpkeSuite().kem.serializePrivateKey(hpkeKeyPair.privateKey));
+  const authorizationKeyId = crypto.randomBytes(16);
+  const authority = {
+    package_id: Buffer.from(envelope.package_id),
+    hpke_key_id: hpkeKeyId,
+    hpke_public_key: hpkePublicKey,
+    authorization_key_id: authorizationKeyId,
+    authorization_public_key: rawPublic(signing.publicKey),
+    status: "active",
+    activation_revision: envelope.activation_revision,
+    previous_revision: envelope.base_revision,
+    previous_manifest_digest: envelope.base_manifest_digest,
+    operation_id: envelope.operation_id,
+    activation_context_digest: envelope.activation_context_digest,
+    package_envelope_digest: packageV1.recoveryPackageEnvelopeDigest(envelopeBytes),
+  };
+  const freshEpoch = Number(previous.current_epoch) + 1;
+  const freshKey = crypto.randomBytes(32);
+  const freshKeyRef = await m.recoveryKeyRefV2(state.scope, freshEpoch);
+  const epochs = [...previous.epochs, { epoch: freshEpoch, key_ref: freshKeyRef }];
+  const recoveryWraps = [];
+  for (const epoch of epochs) {
+    const epochKey = epoch.epoch === freshEpoch
+      ? freshKey
+      : state.epochKeys.find((entry) => entry.epoch === epoch.epoch)?.key;
+    if (!epochKey) throw new Error("fixture epoch key missing");
+    recoveryWraps.push(await createRecoveryWrap(state.scope, authority, epoch.epoch, epoch.key_ref, epochKey));
+  }
+  const deviceWraps = previous.devices.filter((device) => device.revoked_at_epoch === null).map((device) => ({
+    device_id: device.device_id,
+    epoch: freshEpoch,
+    key_ref: freshKeyRef,
+    wrap_id: crypto.randomBytes(16),
+    enc: crypto.randomBytes(32),
+    ciphertext: crypto.randomBytes(48),
+  }));
+  const core = {
+    type: m.MANIFEST_TYPE,
+    version: m.MANIFEST_VERSION,
+    suite: "rootark-zk-1",
+    account_id: previous.account_id,
+    compartment_id: previous.compartment_id,
+    keyring_id: previous.keyring_id,
+    revision: previous.revision + 1,
+    current_epoch: freshEpoch,
+    epochs,
+    devices: previous.devices,
+    wraps: [...previous.wraps, ...deviceWraps],
+    recovery_authority: authority,
+    recovery_wraps: recoveryWraps,
+    previous_manifest_digest: await m.recoveryManifestDigestV2(previous),
+    operation: {
+      operation_id: envelope.operation_id,
+      operation_type: "compromise-package",
+      actor_type: "device",
+      actor_key_id: previous.devices[0].authorization_key_id,
+      target_device_id: null,
+      target_device_key_digest: null,
+      compromised_package_id: Buffer.from(oldAuthority.package_id),
+      recovery_policy_change: null,
+      target_epoch_coverage: [],
+      target_pop_proof: null,
+      issued_at: 1000,
+      expires_at: 1300,
+      request_digest: Buffer.alloc(32),
+    },
+  };
+  core.operation.request_digest = await m.expectedRecoveryRequestDigestV2(previous, core);
+  const actor = state.actors.get(Buffer.from(previous.devices[0].authorization_key_id).toString("hex"));
+  const next = await m.signRecoveryTransitionV2({
+    proposedCore: core,
+    priorVerifiedHistory: state.verifiedHistory,
+    actorPrivateKey: actor,
+    manifestMacKey: freshKey,
+    now: 1100,
+    clockHealthy: true,
+  });
+  state.headManifest = next;
+  state.epochKeys.push({ epoch: freshEpoch, key: freshKey });
+  state.transitions.push(await encodeManifest(next));
+  state.packageEnvelopes.push({ activationRevision: Number(next.revision), envelopeBytes: Buffer.from(envelopeBytes) });
+  state.recoveryPackageKeys.push({
+    package_id: Buffer.from(authority.package_id),
+    hpke_key_id: Buffer.from(authority.hpke_key_id),
+    hpke_private_key: hpkePrivateKey,
+  });
+  await refreshVerifiedHistory(state);
+  return next;
 }
 
 async function createWitnessAnchor(state) {
@@ -436,7 +576,7 @@ async function createWitnessAnchor(state) {
   const keyIdBytes = crypto.randomBytes(16);
   const manifest = state.headManifest;
   const receipt = {
-    type: "rootark-recovery-witness-head",
+    type: "rootark-recovery-witness-base/v1",
     witness_key_id: keyIdBytes,
     account_id: manifest.account_id,
     compartment_id: manifest.compartment_id,
@@ -448,12 +588,13 @@ async function createWitnessAnchor(state) {
     observed_at: 1000,
     status: "committed",
   };
-  const prefix = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0", "ascii");
+  const prefix = Buffer.from("Root.ark/zk-1/recovery-witness-base/v1\0", "ascii");
   const signature = crypto.sign(null,
     Buffer.concat([prefix, await z.encodeDeterministic(receipt)]), signing.privateKey);
   return {
     receipt: { ...receipt, signature },
     pinnedWitness: { keyId: keyIdBytes, publicKey: signing.publicKey },
+    signingPrivateKey: signing.privateKey,
   };
 }
 
@@ -465,6 +606,7 @@ module.exports = {
   appendDeviceEnrollment,
   appendDeviceRevocation,
   appendPackageActivation,
+  appendPackageCompromise,
   createPackageEnvelope,
   createInitialState,
   createWitnessAnchor,
