@@ -157,4 +157,57 @@ function assessWebRecoveryEvidence(record) {
   return { status: "UNVERIFIED", reasons };
 }
 
-module.exports = { assessWebRecoveryEvidence };
+const READINESS_FIELDS = Object.freeze([
+  "browserEvidenceStatus",
+  "casStatus",
+  "witnessStatus",
+  "browserKdfStatus",
+  "keyCustodyStatus",
+  "cryptoInteropStatus",
+]);
+
+function assessWebRecoveryIntegrationReadiness(record) {
+  if (record === null || typeof record !== "object" || Array.isArray(record)) {
+    invalidEvidence("readiness record must be a plain object");
+  }
+  if (Object.getPrototypeOf(record) !== Object.prototype) {
+    invalidEvidence("unexpected readiness object prototype");
+  }
+
+  const keys = Reflect.ownKeys(record);
+  if (keys.some((key) => typeof key !== "string") || keys.some((key) => !READINESS_FIELDS.includes(key))) {
+    invalidEvidence("unexpected readiness field");
+  }
+
+  const reasons = [];
+  let allPassed = true;
+  for (const field of READINESS_FIELDS) {
+    const descriptor = Object.getOwnPropertyDescriptor(record, field);
+    if (!descriptor) {
+      allPassed = false;
+      reasons.push(`${field} is missing; this prerequisite remains blocked.`);
+      continue;
+    }
+    if (!Object.hasOwn(descriptor, "value")) {
+      invalidEvidence("readiness accessors are not allowed");
+    }
+    if (descriptor.value !== "PASS") {
+      allPassed = false;
+      reasons.push(`${field} is not independently verified as PASS.`);
+    }
+  }
+
+  if (allPassed) {
+    return {
+      status: "REQUIRES_SEPARATE_INTEGRATION_APPROVAL",
+      reasons: ["Reported PASS inputs do not grant authority; separate owner and independent security approval remains required."],
+    };
+  }
+
+  return { status: "BLOCKED_FOR_INTEGRATION", reasons };
+}
+
+module.exports = {
+  assessWebRecoveryEvidence,
+  assessWebRecoveryIntegrationReadiness,
+};

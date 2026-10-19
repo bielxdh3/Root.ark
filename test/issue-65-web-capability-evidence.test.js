@@ -2,7 +2,10 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
-const { assessWebRecoveryEvidence } = require("./support/issue-65-web-capability-evidence");
+const {
+  assessWebRecoveryEvidence,
+  assessWebRecoveryIntegrationReadiness,
+} = require("./support/issue-65-web-capability-evidence");
 
 function evidence(overrides = {}) {
   return {
@@ -108,4 +111,58 @@ test("localProbeIsManualAndNeverCreatesOrTransmitsCredentials", () => {
   assert.match(html, /addEventListener\(["']click["']/i);
   assert.match(html, /NOT_RUN|UNKNOWN/i);
   assert.doesNotMatch(html, /navigator\.credentials|fetch\s*\(|XMLHttpRequest|localStorage|indexedDB/i);
+});
+
+function readiness(overrides = {}) {
+  return {
+    browserEvidenceStatus: "PASS",
+    casStatus: "PASS",
+    witnessStatus: "PASS",
+    browserKdfStatus: "PASS",
+    keyCustodyStatus: "PASS",
+    cryptoInteropStatus: "PASS",
+    ...overrides,
+  };
+}
+
+function assertNoIntegrationAuthorization(result) {
+  assert.ok([
+    "BLOCKED_FOR_INTEGRATION",
+    "REQUIRES_SEPARATE_INTEGRATION_APPROVAL",
+  ].includes(result.status));
+  assert.deepEqual(Object.keys(result).sort(), ["reasons", "status"]);
+  assert.ok(Array.isArray(result.reasons));
+  assert.equal("authorized" in result, false);
+  assert.equal("enrollmentToken" in result, false);
+}
+
+test("unverifiedWitnessAndKdfNeverCountAsReady", () => {
+  for (const overrides of [
+    { witnessStatus: "NOT_RUN" },
+    { browserKdfStatus: "NOT_RUN" },
+    { casStatus: "BLOCKED" },
+    { keyCustodyStatus: "UNVERIFIED" },
+    { browserEvidenceStatus: "PASS_TEST_ONLY" },
+    { cryptoInteropStatus: "OBSERVED" },
+  ]) {
+    const result = assessWebRecoveryIntegrationReadiness(readiness(overrides));
+    assert.equal(result.status, "BLOCKED_FOR_INTEGRATION");
+    assertNoIntegrationAuthorization(result);
+  }
+});
+
+test("allReportedPassStillRequiresSeparateIntegrationApproval", () => {
+  const result = assessWebRecoveryIntegrationReadiness(readiness());
+  assert.equal(result.status, "REQUIRES_SEPARATE_INTEGRATION_APPROVAL");
+  assert.match(result.reasons.join(" "), /separate.*approval|test-only/i);
+  assertNoIntegrationAuthorization(result);
+});
+
+test("missingReadinessPrerequisitesRemainBlocked", () => {
+  const result = assessWebRecoveryIntegrationReadiness({
+    browserEvidenceStatus: "PASS",
+    casStatus: "PASS",
+  });
+  assert.equal(result.status, "BLOCKED_FOR_INTEGRATION");
+  assertNoIntegrationAuthorization(result);
 });
