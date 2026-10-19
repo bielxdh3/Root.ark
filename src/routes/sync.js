@@ -6,7 +6,7 @@ const { PROTOCOL_VERSION, compareRevisions, validateOperation } = require("../..
 const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
 const { attestCiphertextOnlySyncState } = require("../services/deploymentResilience");
 const { createSyncBurstGuard } = require("../services/syncBurstGuard");
-const { DEFAULT_WINDOW, decryptSecret, normalizeOtp, verifyRecoveryCode, verifyTotp } = require("../services/totp");
+const { DEFAULT_WINDOW, decryptSecret, normalizeOtp, verifyRecoveryCodeAsync, verifyTotp } = require("../services/totp");
 
 const STORE_VERSION = 2;
 const MAX_HISTORY_PER_OBJECT = 32;
@@ -94,23 +94,40 @@ function publicRecord(record) {
 
 const DEFAULT_RECOVERY_RETENTION_MS = 24 * 60 * 60 * 1000;
 
-// Mirrors consumeTotpProof in src/routes/auth.js: a TOTP code must be newer than totpLastUsedStep (replay
-// protection) and a recovery code is removed on use. Returns "totp", "recovery", or null. Mutates `user`;
-// the caller must persist it.
-function consumeSecondFactor(user, code, key) {
+// Async, non-mutating proof verification. The proof is committed against freshly loaded user data after
+// scrypt completes so concurrent resume requests cannot both consume the same TOTP step or recovery code.
+async function verifySecondFactor(user, code, key) {
   const otp = normalizeOtp(code);
   if (otp) {
     const secret = decryptSecret(user.totpSecret, key, `Root.ark/TOTP/${user.username}`);
     const step = verifyTotp(secret, otp, { window: DEFAULT_WINDOW });
     if (step === null || (Number.isSafeInteger(user.totpLastUsedStep) && step <= user.totpLastUsedStep)) return null;
-    user.totpLastUsedStep = step;
-    return "totp";
+    return { type: "totp", step, secretRecord: JSON.stringify(user.totpSecret) };
   }
   if (!Array.isArray(user.totpRecoveryHashes)) return null;
-  const index = user.totpRecoveryHashes.findIndex((hash) => verifyRecoveryCode(code, hash));
-  if (index === -1) return null;
-  user.totpRecoveryHashes.splice(index, 1);
-  return "recovery";
+  for (const hash of [...user.totpRecoveryHashes]) {
+    if (await verifyRecoveryCodeAsync(code, hash)) return { type: "recovery", hash };
+  }
+  return null;
+}
+
+// Synchronous single-use enforcement on the fresh user record immediately before persistence.
+function commitSecondFactorProof(target, proof) {
+  if (!target || !proof) return false;
+  if (proof.type === "totp") {
+    if (JSON.stringify(target.totpSecret) !== proof.secretRecord) return false;
+    if (Number.isSafeInteger(target.totpLastUsedStep) && proof.step <= target.totpLastUsedStep) return false;
+    target.totpLastUsedStep = proof.step;
+    return true;
+  }
+  if (proof.type === "recovery") {
+    if (!Array.isArray(target.totpRecoveryHashes)) return false;
+    const index = target.totpRecoveryHashes.indexOf(proof.hash);
+    if (index === -1) return false;
+    target.totpRecoveryHashes.splice(index, 1);
+    return true;
+  }
+  return false;
 }
 
 function positiveEnvInteger(value, fallback) {
@@ -412,11 +429,18 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
         let key;
         try { key = getTotpKey(); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
         if (!Buffer.isBuffer(key) || key.length !== 32) return errorResponse(res, 503, "Sync re-authentication unavailable");
-        let factor;
-        try { factor = consumeSecondFactor(user, body.code, key); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
-        if (!factor) return fail("second_factor_failed");
+        let proof;
+        try { proof = await verifySecondFactor(user, body.code, key); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
+        if (!proof) return fail("second_factor_failed");
+        // Re-load after async recovery-code verification and revalidate the account before committing replay state.
+        const freshUsers = loadUsers();
+        const freshUser = Array.isArray(freshUsers) ? freshUsers.find((entry) => entry?.username === username) : null;
+        if (!freshUser || freshUser.disabled || freshUser.password !== checkedHash || (freshUser.sessionVersion || 0) !== checkedSessionVersion || !freshUser.totpEnabled) {
+          return errorResponse(res, 401, "Re-authentication failed");
+        }
+        if (!commitSecondFactorProof(freshUser, proof)) return fail("second_factor_failed");
         // Persist replay state (totpLastUsedStep) or the consumed recovery code before resuming.
-        try { saveUsers(users); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
+        try { saveUsers(freshUsers); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
       }
       state.count = 0;
       const { wasPaused } = await store.resumeDevice(username, deviceId);

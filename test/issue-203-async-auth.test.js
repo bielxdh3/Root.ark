@@ -5,7 +5,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const test = require("node:test");
 const registerAuthRoutes = require("../src/routes/auth");
-const { encryptSecret, generateRecoveryCodes, generateSecret, verifyRecoveryCode, verifyRecoveryCodeAsync } = require("../src/services/totp");
+const { encryptSecret, generateRecoveryCodes, generateRecoveryCodesAsync, generateSecret, verifyRecoveryCode, verifyRecoveryCodeAsync } = require("../src/services/totp");
 
 let counter = 0;
 
@@ -70,6 +70,20 @@ test("async recovery verification matches the sync implementation", async () => 
   assert.equal(await verifyRecoveryCodeAsync(codes[0], hashes[1]), false);
   assert.equal(await verifyRecoveryCodeAsync("nonsense", hashes[0]), false);
   assert.equal(await verifyRecoveryCodeAsync(codes[0], "bad"), false);
+});
+
+test("async recovery-code generation preserves legacy encoding and scrypt hash bytes", async () => {
+  const makeDeterministicRandom = () => {
+    let nextByte = 0;
+    return (size) => {
+      const bytes = Buffer.alloc(size);
+      for (let index = 0; index < size; index += 1) bytes[index] = nextByte++ & 0xff;
+      return bytes;
+    };
+  };
+  const synchronous = generateRecoveryCodes(2, makeDeterministicRandom());
+  const asynchronous = await generateRecoveryCodesAsync(2, makeDeterministicRandom());
+  assert.deepEqual(asynchronous, synchronous);
 });
 
 test("concurrent wrong-password logins from one IP cannot exceed the rate limit before blocking", async () => {

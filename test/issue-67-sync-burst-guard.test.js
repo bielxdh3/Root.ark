@@ -510,6 +510,26 @@ test("issue 67 resume 2FA: a recovery code works once", async (t) => {
   assert.equal((await resumeRequest(port, { password: PASSWORD, code: recovery })).status, 401);
 });
 
+test("issue 203 sync resume: recovery verification does not call synchronous scrypt", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue203-sync-recovery-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const { port, route } = await startServer(t, { storagePath: path.join(dir, "objects.json"), burstGuard: createSyncBurstGuard({ maxDestructive: 1, env: {} }), accountUsers: account.users });
+  const key = crypto.randomBytes(32);
+  await pauseDeviceA(port, key, 1, 2);
+  const recovery = account.recoveryCodes[0];
+  const originalScryptSync = crypto.scryptSync;
+  crypto.scryptSync = () => { throw new Error("synchronous recovery-code scrypt is forbidden on the request path"); };
+  let response;
+  try {
+    response = await resumeRequest(port, { password: PASSWORD, code: recovery });
+  } finally {
+    crypto.scryptSync = originalScryptSync;
+  }
+  assert.equal(response.status, 200);
+  assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 1);
+});
+
 test("issue 67 resume 2FA: without the TOTP key the resume fails closed with 503", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue67-2fa-nokey-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));

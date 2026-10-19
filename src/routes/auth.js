@@ -5,7 +5,7 @@ const {
   PERIOD_SECONDS,
   decryptSecret,
   encryptSecret,
-  generateRecoveryCodes,
+  generateRecoveryCodesAsync,
   generateSecret,
   normalizeOtp,
   verifyRecoveryCodeAsync,
@@ -22,6 +22,7 @@ const { reserveLoginAttempt, getLoginRejection, getLoginSecurityState, registerF
 const loginChallenges = new Map();
 const verificationAttemptsByIp = new Map();
 const verificationAttemptsByUsername = new Map();
+const totpConfirmationsInProgress = new Set();
 const DUMMY_PASSWORD_HASH = "$2a$10$C8U56P8wZK.G7zWKmqF88e3f64PIxJ1xdTJN9WxiHcSVkYCfaSeDG";
 
 function sensitiveAuthResponse(res) {
@@ -365,29 +366,44 @@ function registerAuthRoutes(app, context) {
     }
   });
 
-  app.post("/auth/2fa/confirm", authenticate, (req, res) => {
+  app.post("/auth/2fa/confirm", authenticate, async (req, res) => {
     const users = loadUsers();
     const user = users.find((entry) => entry.username === req.user.username);
     if (!verificationRateLimit(req, user?.username)) return genericTotpFailure(res, 429);
     if (!user?.totpPendingSecret || !Number.isFinite(user.totpPendingSecret.createdAt) || Date.now() - user.totpPendingSecret.createdAt > 10 * 60 * 1000) return genericTotpFailure(res, 400);
+    let reservedUsername;
     try {
+      const verifiedHash = user.password;
+      const verifiedVersion = user.sessionVersion || 0;
+      const pendingSecretRecord = JSON.stringify(user.totpPendingSecret);
       const key = totpKey();
       const secret = getEncryptedTotpSecret(user, key, true);
       const step = verifyTotp(secret, req.body?.code, { window: DEFAULT_WINDOW });
       if (step === null) return genericTotpFailure(res, 400);
-      const recovery = generateRecoveryCodes();
-      user.totpSecret = user.totpPendingSecret;
-      user.totpPendingSecret = null;
-      user.totpEnabled = true;
-      user.totpRecoveryHashes = recovery.hashes;
-      user.totpLastUsedStep = step;
-      user.totpEnrolledAt = new Date().toISOString();
-      user.sessionVersion = (user.sessionVersion || 0) + 1;
-      saveUsers(users);
-      auditLog("auth.2fa.enabled", getAuditActor(req), { type: "user", id: user.username }, "enabled", "success", { recoveryCodeCount: recovery.codes.length });
+      const confirmationKey = String(user.username);
+      if (totpConfirmationsInProgress.has(confirmationKey)) return genericTotpFailure(res, 429);
+      totpConfirmationsInProgress.add(confirmationKey);
+      reservedUsername = confirmationKey;
+      const recovery = await generateRecoveryCodesAsync();
+      const freshUsers = loadUsers();
+      const freshUser = freshUsers.find((entry) => entry.username === user.username);
+      if (!freshUser || freshUser.disabled || freshUser.password !== verifiedHash || (freshUser.sessionVersion || 0) !== verifiedVersion || freshUser.totpEnabled || JSON.stringify(freshUser.totpPendingSecret) !== pendingSecretRecord || !Number.isFinite(freshUser.totpPendingSecret?.createdAt) || Date.now() - freshUser.totpPendingSecret.createdAt > 10 * 60 * 1000) {
+        return genericTotpFailure(res, 400);
+      }
+      freshUser.totpSecret = freshUser.totpPendingSecret;
+      freshUser.totpPendingSecret = null;
+      freshUser.totpEnabled = true;
+      freshUser.totpRecoveryHashes = recovery.hashes;
+      freshUser.totpLastUsedStep = step;
+      freshUser.totpEnrolledAt = new Date().toISOString();
+      freshUser.sessionVersion = (freshUser.sessionVersion || 0) + 1;
+      saveUsers(freshUsers);
+      auditLog("auth.2fa.enabled", getAuditActor(req), { type: "user", id: freshUser.username }, "enabled", "success", { recoveryCodeCount: recovery.codes.length });
       return sensitiveAuthResponse(res).json({ enabled: true, recoveryCodes: recovery.codes, loginRequired: true });
     } catch {
       return sensitiveAuthResponse(res).status(503).json({ error: "2FA indisponivel." });
+    } finally {
+      if (reservedUsername) totpConfirmationsInProgress.delete(reservedUsername);
     }
   });
 

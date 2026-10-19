@@ -1,9 +1,10 @@
 const assert = require("node:assert/strict");
 const bcrypt = require("bcryptjs");
+const crypto = require("node:crypto");
 const jwt = require("jsonwebtoken");
 const test = require("node:test");
 const registerAuthRoutes = require("../src/routes/auth");
-const { decryptSecret, encryptSecret, generateRecoveryCodes, generateSecret, verifyTotp } = require("../src/services/totp");
+const { decryptSecret, encryptSecret, generateRecoveryCodes, generateSecret, hotp, verifyRecoveryCodeAsync, verifyTotp } = require("../src/services/totp");
 
 function response() {
   return {
@@ -79,6 +80,32 @@ function createHarness(users, options = {}) {
 function user(username, role = "user") {
   return { username, password: bcrypt.hashSync("password", 4), role, permissions: role === "admin" ? { manageUsers: true } : {}, sessionVersion: 0 };
 }
+
+test("issue 203 2FA confirmation hashes recovery codes without synchronous scrypt", async () => {
+  const harness = createHarness([user("async-confirm")]);
+  await harness.call("POST", "/auth/2fa/enroll", {}, "async-confirm");
+  const account = harness.users.find((entry) => entry.username === "async-confirm");
+  const pendingSecret = decryptSecret(account.totpPendingSecret, harness.key, "Root.ark/TOTP/async-confirm");
+  const code = hotp(pendingSecret, Math.floor(Date.now() / 1000 / 30));
+  const originalScryptSync = crypto.scryptSync;
+  crypto.scryptSync = () => { throw new Error("synchronous recovery-code scrypt is forbidden on the request path"); };
+  let confirmations;
+  try {
+    confirmations = await Promise.all([
+      harness.call("POST", "/auth/2fa/confirm", { code }, "async-confirm"),
+      harness.call("POST", "/auth/2fa/confirm", { code }, "async-confirm"),
+    ]);
+  } finally {
+    crypto.scryptSync = originalScryptSync;
+  }
+  assert.equal(confirmations.filter((result) => result.code === 200).length, 1);
+  assert.equal(confirmations.filter((result) => result.code === 429).length, 1);
+  const confirmed = confirmations.find((result) => result.code === 200);
+  assert.equal(confirmed.code, 200);
+  assert.equal(confirmed.body.recoveryCodes.length, 10);
+  const enrolled = harness.users.find((entry) => entry.username === "async-confirm");
+  assert.equal(await verifyRecoveryCodeAsync(confirmed.body.recoveryCodes[0], enrolled.totpRecoveryHashes[0]), true);
+});
 
 test("logout fails closed when the auth store is unavailable after authentication", async () => {
   const alice = user("alice");
