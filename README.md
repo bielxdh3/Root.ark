@@ -69,6 +69,12 @@ The repository currently contains working foundations for:
 - [x] bounded provider retry/cancellation, idempotency, ciphertext-only attestation, and secret-safe observability helpers;
 - [x] automated syntax, test, dependency, and artifact validation.
 
+**Recent merged progress (2026-10-18–19; not a release-readiness claim):**
+
+- File-name FTS5 search for non-protected data, Android client scaffolding, selective-sync exclusion/rollback, ransomware-burst detection with device pause, and per-operation sharing permissions were merged in PRs [#211](https://github.com/bielxdh3/Root.ark/pull/211), [#212](https://github.com/bielxdh3/Root.ark/pull/212), [#214](https://github.com/bielxdh3/Root.ark/pull/214), [#215](https://github.com/bielxdh3/Root.ark/pull/215), and [#216](https://github.com/bielxdh3/Root.ark/pull/216).
+- The zero-knowledge work includes a **keyring library** for device enrollment/revocation and epoch rotation ([#213](https://github.com/bielxdh3/Root.ark/pull/213)) plus a v2 wire-format test fixture ([#221](https://github.com/bielxdh3/Root.ark/pull/221)). These are not an integrated, production-ready zero-knowledge storage flow.
+- Async cryptographic request handling was hardened ([#220](https://github.com/bielxdh3/Root.ark/pull/220)). The Mammoth transitive-dependency advisory has containment tests and documented review controls ([#223](https://github.com/bielxdh3/Root.ark/pull/223)), **not** a patched dependency or a resolved security finding.
+
 ### Historical application validation snapshot after PR #189 — 2026-10-15 (application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`)
 
 PR #179 adds a bounded Windows `EPERM` retry for sync-journal rename; PR #188 adds chunk-upload request limits before body parsing and staging; PR #189 adds disposable crash-recovery coverage for the restore provider-policy pair. The [post-#189 validation snapshot](docs/validation/2026-10-15-rootark-post-189.md) records exact-SHA CI, browser coverage, the live issue/PR query, and remaining acceptance limits for application SHA `bde6c54bee7a015822aa5463618bdf985ddf805d`.
@@ -142,7 +148,7 @@ Phase 16 evidence is recorded in [the Phase 16 security review](docs/security/ph
 The historical 2026-10-06 GitHub snapshot at `1955eab3d05f72632396eff62ef96d39eedd634b` is retained in [the issue ledger](docs/issue-ledger.md); it is not the current default-branch SHA.
 
 > [!IMPORTANT]
-> The approved long-term direction includes client-side zero-knowledge encryption. The current implementation predates that architecture and must not be described as zero-knowledge or treated as the final security model.
+> Client-side zero-knowledge encryption remains a long-term direction. Experimental keyring components and wire-format fixtures exist, but integrated end-to-end zero-knowledge storage, recovery, migration and production validation are **not** complete.
 
 ## Requirements
 
