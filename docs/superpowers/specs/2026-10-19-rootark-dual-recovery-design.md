@@ -1,11 +1,19 @@
 # Root.ark Dual Recovery: Draft Specification for Independent Review
 
-- **Status:** `DRAFT_FOR_INDEPENDENT_REVIEW` — not approved for implementation.
+- **Status:** `REVISED_DRAFT_FOR_INDEPENDENT_REVIEW` — revision 2; not approved for implementation.
 - **Architecture direction:** The owner approved shared compare-and-swap (CAS) as the target. No shared database, storage service, deployment topology, client keychain, or rollback witness is assumed to exist.
 - **Issue:** [#65 — Architecture: Zero-Knowledge v1](https://github.com/bielxdh3/Root.ark/issues/65).
 - **Baseline:** `Root/main` SHA `0636d638eee1ca5a75fde59936a9dbd3c66077cd`.
 - **Review boundary:** This document describes both recovery paths and their target guarantees. It authorizes no code, dependency, migration, UI, deployment, release, issue close, or PR merge.
-- **Independent review:** Not yet performed. Owner approval of this detailed specification is also pending.
+- **Independent review:** Revision 1 received a static architecture/security review; revision 2 awaits independent review. This is not a formal cryptographic audit. Owner approval of this detailed specification is pending.
+- **Revision 2 rule:** Section 12 is the normative revision for the reviewed findings and supersedes conflicting details in Sections 4–11. Earlier sections remain context only where they do not conflict. No runtime code or tests were changed or run for this revision.
+
+## Revision history
+
+| Revision | Date | Basis | Changes |
+|---|---|---|---|
+| 1 | 2026-10-19 | Initial draft at `64512a2f94444ef7d9380e6e525d48b9ceeddbae`, based on `Root/main` `0636d638eee1ca5a75fde59936a9dbd3c66077cd` | Initial shared-CAS target and explicitly blocked integrations. |
+| 2 | 2026-10-19 | Independent static review verdict `REVISIONS_REQUIRED_FOR_SPEC_APPROVAL` against revision 1; not a formal cryptographic audit | Adds authenticated transition history plus independent freshness witness protocol; actor/operation authorization matrix and HPKE+Ed25519 target proof; exact non-circular package-envelope binding and crash states; bounded KDF execution; rootKey compatibility evidence; complete epoch coverage; honest secure-storage rollback limits; TTL policy; proposed module/test ownership map. |
 
 ## 1. Purpose and guarantees
 
@@ -68,9 +76,9 @@ This uses the existing `rootark-zk-1` suite and its frozen primitives. The recov
 | Authorization | Distinct Ed25519 authorization key per device and one distinct Ed25519 recovery authorization key per active package registration. Never reuse an X25519 HPKE key as an Ed25519 signing key. |
 | Bounds | Reject a package larger than 8 MiB before parsing; accept only the exact v1 KDF parameter tuple before Argon2 runs; cap decrypted state to 7 MiB and enforce keyring limits (at most 256 devices and 64 epochs). |
 
-The proposed MODERATE Argon2id cost is deliberately explicit because an attacker-controlled header must not choose memory allocation. Libsodium documents the MODERATE memory profile as 256 MiB and the password-hashing API requires the algorithm and parameters to be stored for deterministic derivation ([official guidance](https://doc.libsodium.org/password_hashing/default_phf)); the pinned upstream Argon2id header defines MODERATE as 3 operations and 268435456 bytes ([libsodium 1.0.20 header](https://raw.githubusercontent.com/jedisct1/libsodium/1.0.20/src/libsodium/include/sodium/crypto_pwhash_argon2id.h)). The actual 0.8.4 wrapper artifact and cross-platform runtime cost still require verification. If a supported client cannot allocate the profile, recovery is blocked on that client; do not downgrade silently.
+The package lock currently pins both `libsodium-wrappers-sumo` and its resolved `libsodium-sumo` dependency at 0.8.4. The upstream 0.8.4 wrapper API exposes `crypto_pwhash` with explicit output length, salt, operation limit, memory limit, and algorithm; the upstream libsodium submodule header defines MODERATE as 3 operations and 268435456 bytes. These source facts support the candidate tuple only. They do not establish wall time, peak memory, worker behavior, or allocation-failure behavior on supported Node 22 builds. Keep the tuple provisional until the exact locked artifact passes the Node 22 verification in Section 12.1. If any supported client cannot allocate the profile, recovery is blocked on that client; do not downgrade silently.
 
-## 5. Recovery-package v1 proposal
+## 5. Recovery-package v1 proposal (initial draft; superseded where revised by Section 12)
 
 ### 5.1 Exact outer envelope
 
@@ -141,7 +149,7 @@ The current keyring creates a random 32-byte `rootKey`, but the keyring source h
 
 The format is a recovery snapshot for a new keyring v2 API, not a byte-for-byte serialization of the v1 JavaScript object. Before any implementation, deprecate or remove the unused v1 `rootKey` field from the v2 recovery API and verify there are no external consumers. Do not silently replace it with a new key and call the old key restored. If a real consumer is found or the owner requires preservation, stop and version a reviewed format that includes it; do not repurpose it as a derivation root without a separate cryptographic design.
 
-## 6. Manifest v2 and authorization signatures
+## 6. Manifest v2 and authorization signatures (initial draft; superseded where revised by Section 12)
 
 The proposed v2 manifest is compartment-scoped. Its exact deterministic-CBOR map has the following fields. `core` is the fields through `operation`; the MAC and actor signature are appended afterward:
 
@@ -204,7 +212,7 @@ Package activation is one atomic transition: the device prepares manifest revisi
 
 Existing manifest v1 remains read-only during a reviewed migration. No implicit v1/v2 fallback is permitted. Initializing v2 for an existing compartment requires an already authorized client, the expected compartment ID, current epoch material, and a successful CAS create from absent state. This migration and endpoint wiring are blocked until storage and product compatibility are reviewed.
 
-## 7. Independent recovery flows
+## 7. Independent recovery flows (initial draft; superseded where revised by Section 12)
 
 ### 7.1 Emergency package path
 
@@ -230,7 +238,7 @@ A device enrolled after an earlier epoch may not possess historical epoch keys. 
 
 Device lifecycle is `unregistered -> pending-request (client-local, expiring) -> active (after signed CAS) -> revoked`. No server-side pending request grants access. An approved device operation increments revision; enrollment alone does not increment epoch, while revocation increments both and produces new wraps only for remaining devices and any active recovery key. A pending request expires after the same proposed 300-second limit and cannot be replayed after its operation ID is committed.
 
-## 8. Shared CAS, monotonic revisions, and rollback guarantees
+## 8. Shared CAS, monotonic revisions, and rollback guarantees (initial draft; superseded where revised by Section 12)
 
 ### Logical stored record
 
@@ -259,7 +267,7 @@ Each trusted client must atomically persist `(account_id, compartment_id, max_re
 
 Shared CAS guarantees concurrency ordering and crash durability only if the chosen backend actually provides these semantics. It does not by itself make a malicious server or operator unable to replay an old database snapshot to a brand-new device with no prior high-water mark. Detecting that case requires a separately trusted rollback-resistant client anchor or independent transparency/witness service. Neither is identified or verified. Until one is approved and demonstrated, the design must report `ROLLBACK_RESISTANCE_INCOMPLETE` for first-use/package-only bootstrap and must not claim protection against malicious storage rollback. Backend backup restore must preserve/advance an independently durable revision watermark; if that cannot be proven, disable recovery CAS after restore and fail closed. No local SQLite fallback, per-process queue, or lower-revision acceptance is allowed.
 
-## 9. Explicitly blocked integrations
+## 9. Explicitly blocked integrations (retained; clarified by Section 12)
 
 | Integration | Current blocker | Evidence required to unblock |
 |---|---|---|
@@ -273,7 +281,7 @@ Shared CAS guarantees concurrency ordering and crash durability only if the chos
 
 No portion of this table is resolved by the shared-CAS architecture approval alone.
 
-## 10. Validation and acceptance required after separate approval
+## 10. Validation and acceptance required after separate approval (retained; mapped by Section 12)
 
 Tests use synthetic accounts, devices, packages, and content only. No production, user data, real secrets, migration, deployment, or issue closure is permitted by this specification.
 
@@ -296,11 +304,194 @@ The independent reviewer should assess the cryptographic profile, exact envelope
 
 Until those reviews and approvals occur, this document remains a draft and implementation must not begin.
 
+## 12. Revision 2 normative design
+
+This section is the normative design for the findings in the independent review. It replaces any conflicting package, authorization, history, CAS, freshness, client-storage, and recovery-flow details above. The selected dual-recovery design and shared-CAS target remain intact. The witness, bounds, formats, and protocol below are proposals for independent review; they are not approved or deployed.
+
+### 12.1 Cryptographic profile and bounded KDF work
+
+The only proposed package KDF tuple remains Argon2id v1.3 with a 16-byte random salt, 32-byte output, operation limit 3, and memory limit 268435456 bytes. The package header must contain this exact tuple and the explicit Argon2id13 algorithm identifier. Parsers reject any other tuple before invoking the KDF; there is no profile downgrade or attacker-selected allocation.
+
+The current lockfile pins both libsodium-wrappers-sumo 0.8.4 and libsodium-sumo 0.8.4. The upstream 0.8.4 wrapper API declares crypto_pwhash as a synchronous function returning its derived bytes. The matching upstream libsodium submodule header defines MODERATE as 3 operations and 268435456 bytes. This confirms the source constants, not acceptable latency, peak memory, or failure behavior on the target runtime. The only runtime observed here is Node 24.14.1; repository workflows use Node 22. Do not freeze this profile until the exact lockfile artifact is exercised on every supported Node 22 OS with:
+
+- fixed vectors checked against an independent Argon2id13 implementation;
+- wall time and peak resident memory measured on the minimum supported hardware;
+- allocation failure and worker termination behavior confirmed;
+- a proof that parsing rejects malformed or unsupported KDF fields before allocation.
+
+The Node foundation must run each derivation in a dedicated worker thread, with at most one active recovery KDF per process and no unbounded queue. If one derivation is already active, return a retryable KDF_BUSY result without starting more work. A worker error, timeout, memory failure, or unsupported platform fails closed; no fallback parameters are allowed. A synchronous call must not block the app or HTTP event loop. No browser or mobile profile is implied.
+
+### 12.2 Exact package commitment without a digest cycle
+
+For an existing signed manifest at revision r, the package activation transition is revision r+1. In the package envelope, base_revision and base_manifest_digest refer to the complete signed manifest at r, not the package activation manifest. The envelope adds activation_revision, operation_id, and activation_context_digest.
+
+Before encryption, the authorized source constructs this exact canonical activation_context map:
+
+| Field | Value |
+|---|---|
+| type, version, suite | rootark-recovery-activation-context, 1, rootark-zk-1 |
+| account_id, compartment_id, keyring_id | Exact scope and keyring identity from the previous manifest |
+| package_id | Newly generated 16-byte package ID |
+| previous_revision, previous_manifest_digest | r and SHA-256 digest of the complete signed manifest at r |
+| activation_revision, operation_id | r+1 and the 16-byte activation operation ID |
+| hpke_key_id, hpke_public_key | Newly generated recovery HPKE public key and its 16-byte ID |
+| authorization_key_id, authorization_public_key | Newly generated recovery Ed25519 public key and its 16-byte ID |
+| witness_base_receipt_digest | SHA-256 of the exact signed witness receipt for revision r |
+
+Compute activation_context_digest as SHA-256 of the domain string Root.ark/zk-1/recovery-activation-context/v1, one NUL byte, and deterministic CBOR of activation_context. The context excludes the final manifest digest, package-envelope digest, manifest MAC, and actor signature. The exact envelope header includes the context digest and the exact scope, package, base revision, activation revision, and operation ID. AES-GCM AAD is the recovery-package domain string, one NUL byte, and deterministic CBOR of that header with only ciphertext and tag omitted.
+
+The outer deterministic-CBOR envelope has exactly this field set; unknown, duplicate, missing, mistyped, or noncanonical fields fail before KDF allocation:
+
+| Field | Encoding and constraint |
+|---|---|
+| type, suite, version, purpose | Exact strings rootark-recovery-package, rootark-zk-1, and recovery-package; version 1 |
+| account_id | 16-byte string |
+| compartment_id | 1–128 bytes |
+| package_id | 16-byte string |
+| base_revision | Unsigned 64-bit integer r |
+| base_manifest_digest | 32-byte digest of the complete signed previous manifest at r |
+| activation_revision | Unsigned 64-bit integer exactly r+1 |
+| operation_id | 16-byte string |
+| activation_context_digest | 32-byte digest defined above |
+| kdf | Exact map: id argon2id13, salt 16 bytes, opslimit 3, memlimit 268435456, output_length 32 |
+| aead | Exact map: id AES-256-GCM, nonce 12 bytes |
+| ciphertext | Byte string; total envelope must not exceed 8 MiB |
+| tag | 16-byte string |
+
+The KDF map is not a negotiable input. The parser checks all lengths, total size, canonical encoding, account/compartment expectation, package purpose, and exact profile before deriving. Password bytes are the exact supplied UTF-8 string bytes, 1–1024 bytes, with no trimming, case folding, or Unicode normalization.
+
+The decrypted payload is deterministic CBOR with exactly these top-level fields: type rootark-recovery-state; version 1; account_id; compartment_id; keyring_id; package_id; previous_revision; previous_manifest_digest; activation_revision; operation_id; activation_context; activation_context_digest; witness_base_receipt; previous_manifest; current_epoch; epoch_keys; and recovery_authorization. The previous_manifest is the complete signed manifest at previous_revision. epoch_keys is a sorted list of exactly one 32-byte key for every epoch in that manifest, with no missing or duplicate epoch. recovery_authorization contains hpke_key_id (16 bytes), hpke_private_key (32 bytes), authorization_key_id (16 bytes), and ed25519_private_seed (32 bytes). The payload must not exceed 7 MiB. It does not contain the final signed manifest at r+1 or its digest. All keys remain client-only.
+
+The activation_context map contains exactly the fields in the table above. witness_base_receipt contains exactly type, witness_key_id, account_id, compartment_id, keyring_id, revision, manifest_digest, witness_sequence, nonce, observed_at, status, and signature. The status must be committed. The nonce is 32 bytes, the signature is 64 bytes, and all scope/head fields must match the previous manifest at r. The receipt is verified with the independently pinned witness key. The epoch_keys array contains entries with exactly epoch (unsigned integer) and key (32 bytes), sorted by epoch. The recovery_authorization map contains exactly hpke_key_id (16 bytes), hpke_private_key (32 bytes), authorization_key_id (16 bytes), and ed25519_private_seed (32 bytes). The final activation manifest at r+1 is obtained from the authenticated transition history, not copied into the package.
+
+After encrypting, compute package_envelope_digest as SHA-256 of the domain string Root.ark/zk-1/recovery-package-envelope/v1, one NUL byte, and the exact encoded envelope bytes. The final signed manifest at r+1 stores the exact envelope digest and the activation-context fields in its recovery-authority record. Its MAC and actor signature cover those fields. The server recomputes the digest from the exact submitted bytes; it does not authorize from a caller-supplied digest. Compute manifest_digest as SHA-256 of ASCII(Root.ark/zk-1/recovery-manifest-digest/v1), one NUL byte, and deterministic CBOR of the complete signed manifest including MAC and actor signature. Compute request_digest as SHA-256 of ASCII(Root.ark/zk-1/recovery-cas-request/v2), one NUL byte, and deterministic CBOR of request_core. request_core contains the exact expected prior revision/digest, operation ID/type/actor/target, issue/expiry, target_pop_proof, proposed manifest core including activation_context_digest and package_envelope_digest, and the post-transition active package-envelope digest or null. It excludes only request_digest, MAC, actor signature, and the external witness ticket. No separate request-body digest is a trust root.
+
+There is no cycle: the encrypted package commits to the prior manifest and an activation context; the final manifest commits to the exact ciphertext bytes; neither digest is included in the bytes whose digest it defines. On import, the client hashes the exact package bytes, compares that result to the signed activation manifest, recomputes the activation-context digest from the decrypted payload, checks the previous manifest digest, and then validates the revision r+1 activation transition. An alternate or earlier envelope for the same package ID fails this binding.
+
+Before CAS, the client must write and re-read the exact encrypted export bytes and reopen those exact bytes locally. This proves byte identity and cryptographic readability only; it does not prove long-term user retention. For package registration/replacement, a separate explicit user confirmation in the owner-approved retention UX is also required before CAS; that confirmation is the user's assertion of independent retention, not a cryptographic proof. If export, re-read, or that confirmation fails or is absent, the package remains unregistered and no CAS request is sent. User retention UX and activation confirmation remain separately blocked.
+
+### 12.3 Normative authorization matrix and target proof
+
+Every transition is checked against the previous validated manifest. A new key in the proposed manifest cannot authorize its own addition. The service checks the same matrix and signature using public state; clients independently re-check it and the manifest MAC.
+
+The manifest v2 field set in Section 6 is retained except for these normative additions and replacements. Add immutable keyring_id as a random 16-byte value at initialize. recovery_authority, when present, has the prior public key/status fields plus activation_revision, previous_revision, previous_manifest_digest, operation_id, activation_context_digest, and package_envelope_digest. All six activation fields are required while active and remain as a tombstone binding after revocation. The operation map is exactly operation_id (16 bytes), operation_type (registered value), actor_type, actor_key_id (16 bytes), target_device_id (text or null), target_device_key_digest (32 bytes or null), target_epoch_coverage (sorted unique epoch integers), target_pop_proof (exact proof map or null), issued_at, expires_at, and request_digest (32 bytes). The proof map is required only for enroll-device and recover-device and is null for other operations. A package activation's request_digest includes the exact package_envelope_digest and target proof. All prior deterministic-CBOR, MAC, signature, and suite rules remain, with the final actor signature covering the complete updated core and being checked against the prior manifest.
+
+| Operation | Active device actor | Recovery-package actor |
+|---|---|---|
+| initialize | Allow only when no keyring exists; first device proves both keys and signs an empty-compartment state. | Deny. |
+| enroll-device | Allow from an active device in the previous manifest. Require explicit scoped user consent, fresh target keys, target proof, and wraps only for source-held epochs. | Deny. |
+| revoke-device | Allow from an active device in the previous manifest. Target must currently be active; revocation is permanent and the same transition rotates the epoch and wraps the new key only to remaining active authorities. | Deny. |
+| register-package | Allow only if no package is active. Require the exact envelope binding in Section 12.2 and complete epoch coverage. | Deny. |
+| replace-package | Allow from an active device. Atomically revoke the prior package authority and activate the new package binding. | Deny. |
+| revoke-package | Allow from an active device. Mark the current package authority revoked and stop future wraps to it. | Deny. |
+| recover-device | Allow from an active device in the previous manifest. | Allow only when the signing key ID matches the active recovery authority in the previous manifest. This actor may perform recover-device only. |
+| Any other operation | Deny. | Deny. |
+
+For each operation, validate the actor type and key ID from the previous state, current non-revoked status, expected keyring/account/compartment, exact prior revision and manifest digest, transition-specific invariants, unique operation ID, and exact next revision. Device IDs and device key IDs/public keys, package IDs and recovery key IDs/public keys, and wrap IDs are never reused across retained history, including after revocation. A new key cannot authorize itself. A package signer cannot enroll through the ordinary operation, revoke a device, register/replace/revoke a package, rotate a key directly, or mutate unrelated state. It can only authorize the one named recover-device transition. Password login, account password reset, TOTP, and administrator status do not satisfy this check.
+
+Target proof binds both fresh target keypairs. The target generates a new HPKE keypair and Ed25519 keypair and a unique device ID. The target_device_key_digest is SHA-256 of ASCII(Root.ark/zk-1/target-device-keys/v1), one NUL byte, and deterministic CBOR containing device_id, hpke_key_id, hpke_public_key, authorization_key_id, and authorization_public_key. IDs and public keys must be unique across the current manifest and retained history; a previously revoked key or device ID cannot be reused.
+
+The authorizing device or recovery client generates a CSPRNG 32-byte challenge and 16-byte challenge_id. The exact deterministic-CBOR challenge context contains type Root.ark-recovery-target-pop, version 1, account_id, compartment_id, keyring_id, operation_id, target_device_id, target_device_key_digest, challenge_id, issued_at, and expires_at. It HPKE-encrypts the 32-byte challenge to the target HPKE public key using the frozen X25519/HKDF-SHA256/AES-256-GCM base suite. HPKE info is ASCII(Root.ark/zk-1/recovery-target-pop-info/v1), one NUL byte, and deterministic CBOR of the challenge context; HPKE AAD is ASCII(Root.ark/zk-1/recovery-target-pop-aad/v1), one NUL byte, and the same canonical context. The resulting encapsulated key is 32 bytes and ciphertext is 48 bytes.
+
+The target decrypts the challenge and returns the exact response map containing challenge_context, challenge, and target_signature. target_signature is Ed25519 over ASCII(Root.ark/zk-1/recovery-target-pop-response/v1), one NUL byte, and deterministic CBOR of {challenge_context, challenge}. The authorizer verifies the target signature, exact challenge equality, scope, key digest, and expiry before signing the state transition. target_pop_proof in the operation map contains exactly challenge_context, enc, ciphertext, challenge, and target_signature; the actor signature covers that complete proof transcript through the manifest core and request_digest. Clients can revalidate the target signature from the retained transcript. The challenge plaintext becomes public only after the target returns it; it contains no secret key material.
+
+In the trusted-device path the target response must return over the separately authenticated pairing channel. A server-relayed ID or public key alone is not consent or proof. The authorizing device is responsible for verifying HPKE decryption possession before it signs. The server verifies the actor signature, target Ed25519 response, key/scope binding, expiry, and one-time operation fields; it cannot infer HPKE possession from public data alone. A package-only recovery performs the same decrypt-then-sign and verification locally on the replacement client.
+
+The CAS transaction stores operation IDs and challenge IDs as consumed with the state transition. A replay, duplicate challenge with a different operation, expired challenge, or concurrent stale request fails. Only the identical operation ID, semantic request digest, manifest bytes, and package bytes may return the original committed result after a retry. This proves possession of both newly generated private keys; it does not protect a package whose ciphertext and password are both stolen.
+
+Every signed operation has issued_at and expires_at as unsigned UTC seconds. The proposed maximum lifetime is 300 seconds: issued_at <= expires_at and expires_at - issued_at <= 300. The server and witness use their authoritative clocks and accept only when issued_at - 300 <= now <= expires_at + 300; this deliberately allows up to 300 seconds of skew at either boundary. If clock health is unknown or skew exceeds that range, reject. The 300-second value remains a proposal. Expiry controls admission only; committed historical transitions remain verifiable after expiry.
+
+### 12.4 Authenticated history, shared CAS, and first-use freshness
+
+The stored logical record is keyed by account, compartment, and immutable keyring_id. It contains the current signed manifest and digest, immutable opaque package blobs addressed by their envelope digest, the active-package pointer from the manifest, a consumed-operation ledger, and an append-only contiguous signed-manifest history. Every successful mutation appends exactly one complete canonical signed manifest at revision r+1 while atomically replacing the head, active-package pointer, and operation result. A reservation names the new envelope digest when package bytes change, the current digest when the active package is unchanged, and null when no package remains active. History records contain no private keys, epoch keys, CEKs, password, or plaintext. Package blobs are immutable; revocation changes authority state and never claims backup erasure. History is retained without pruning; expiry of an old operation never deletes its transition proof.
+
+Verification begins from the package payload's complete signed manifest at revision r, then reads every transition from r+1 through the witnessed head. For each entry, the client requires the exact next revision, matching prior digest, canonical full manifest, valid transition under the matrix in Section 12.3, a signature from the authority active in the previous state, no previously consumed operation ID, valid package binding, and the recomputed next-manifest digest. Only after public signature and state checks pass may the client open newly added recovery wraps. It then verifies the manifest MAC using the corresponding epoch key and checks complete coverage. Missing, duplicate, reordered, truncated, altered, oversized, unknown, or unverifiable history fails closed. A current head alone, even if signed, is not sufficient to authorize the intervening state.
+
+Verification is bounded by proposed limits: 4096 transitions, 8 MiB per signed-manifest history entry, 64 MiB total history bytes, and at most 8 MiB returned per page while processing one manifest at a time. No pruning or checkpoint compaction is specified. A CAS that would exceed any limit returns HISTORY_CAPACITY_REACHED before committing; it does not drop older proofs or report successful recovery. A separate checkpoint protocol requires independent design and approval.
+
+Shared CAS remains the target. Every witness object is deterministic CBOR with an exact field set and a signature over ASCII(domain) || 0x00 || deterministic_cbor(all fields except signature). A fresh head receipt uses domain Root.ark/zk-1/recovery-witness-head/v1 and contains type, witness_key_id, account_id, compartment_id, keyring_id, revision, manifest_digest, witness_sequence, nonce, observed_at, status, and signature; status must be committed. A reservation ticket uses domain Root.ark/zk-1/recovery-witness-reservation/v1 and contains type, reservation_id, witness_key_id, account_id, compartment_id, keyring_id, expected_revision, expected_manifest_digest, proposed_revision, proposed_manifest_digest, operation_id, request_digest, package_envelope_digest, expires_at, and signature. Expected revision/digest are null only for initialize; package_envelope_digest is the post-transition active package digest or null when none is active. A commit receipt uses domain Root.ark/zk-1/recovery-witness-commit/v1 and contains type, reservation_id, account_id, compartment_id, keyring_id, committed_revision, committed_manifest_digest, operation_id, witness_sequence, status, and signature; status must be committed. Tickets and receipts are visible to and verified by both client and CAS.
+
+For initialize, the witness reservation's expected head is absent. It succeeds only if the witness has never recorded or tombstoned that account/compartment, and it binds the new keyring_id and revision 1 manifest digest. CAS uses create-if-absent. The first witness commit sets revision and witness_sequence to 1. A lost or deleted CAS row does not permit re-initialization because the witness retains the prior head/tombstone. For every later operation, revision and witness_sequence each increment by exactly one and never reset; in this generation witness_sequence equals revision.
+
+For each write, the client first obtains a signed reservation for the exact expected head, proposed next revision/digest, operation ID, request digest, package-envelope digest, and expiry. The shared CAS then validates the reservation, previous-state actor signature, operation matrix, time bounds, next revision, and exact envelope bytes. In one linearizable durable transaction it appends the history entry, advances the head, stores the opaque package pointer/bytes and operation result, and marks that reservation ID consumed. A separate blob may be written immutably before CAS; an orphan is harmless. The witness receipt is not a content-key authority and never supplies secret material.
+
+The witness is a separate logical trust service, not an existing Root.ark capability or selected vendor. Its Ed25519 verification key must be pinned in an independently authenticated client release/configuration; a key learned only from the Root.ark service is untrusted. For a fresh read, the client generates a new 32-byte nonce and asks the witness directly for account_id, compartment_id, keyring_id, current_revision, current_manifest_digest, witness_sequence, nonce, observed_at, and status, signed by the pinned witness key. The response must echo the nonce and scope, identify the committed head, and not be pending. The client compares that head byte-for-byte with the CAS response. The witness sequence and manifest revision are monotonic and may never reset or be learned from the application database. The base receipt for revision r is included in the encrypted package and its digest is in the activation context; a new client still needs a fresh nonce response before accepting current state.
+
+Witness reservations are single-use and serialized per compartment. They bind the existing committed head and exact proposed digest but grant no authorization. If CAS commits and the witness is unavailable, the state is COMMITTED_UNWITNESSED: clients do not report success or accept the new head. They reconcile by operation ID and exact bytes until the witness records that exact committed digest. A lost CAS response is retried or queried with the same ID and bytes; a lost witness response is recovered by a fresh nonce read that matches the committed operation and head. A pending witness reservation is never silently discarded after timeout. It blocks later writes until the exact CAS outcome is reconciled. It may be canceled only after reservation expiry plus clock-skew tolerance and a linearizable CAS status proves that the operation did not commit and that the expected head remains current; if that proof is unavailable, remain blocked. The witness returns an idempotent signed commit receipt only for the exact pending operation. Concurrent writers have one CAS winner; all others refetch, revalidate, and create a new operation.
+
+Every current-state use that can authorize or report recovery requires a direct fresh witness read and matching CAS history. If the Root.ark store is restored to a lower revision or a conflicting digest, fail with ROLLBACK_RESISTANCE_INCOMPLETE; restore the exact witnessed head and contiguous history or disable recovery. If the witness is unavailable, loses its monotonic state, has an unknown signing key, or returns an old/forked head, recovery and state mutation fail closed. Never bootstrap a lost witness from the application database or accept an older revision. Witness-key rotation must be signed by the currently pinned root; loss of that root blocks the feature pending a new owner-approved bootstrap procedure.
+
+The proposed witness is itself part of the trust model. A compromised or colluding witness can sign a stale head or split views; this single-witness profile does not claim to tolerate that. If protection against witness compromise is required, a multi-witness quorum or transparency/gossip design needs separate review. Until the owner identifies and approves the witness operator, key bootstrap, and durable store, first-use rollback resistance remains ROLLBACK_RESISTANCE_INCOMPLETE.
+
+### 12.5 Device high-water storage and crash/retry states
+
+The local high-water record is the tuple keyring_id, max_revision, manifest_digest, current_epoch, witness_sequence, and witness_receipt_digest, signed by the device authorization key. It must be stored atomically with the non-exportable device keys and pending/active status by an OS-backed provider that has been verified on that exact client runtime. The signature detects local modification but not rollback of the same signed snapshot. Non-exportable key storage alone does not provide a monotonic counter.
+
+The provider must expose and pass capability checks for atomic update, durability across restart, device backup/restore behavior, and either a hardware/OS rollback-resistant counter or mandatory online witness validation on every state-using operation. If the provider only offers a keychain without rollback-resistant metadata, the client must use the online witness before acting; it must not claim offline rollback resistance. Missing, unreadable, corrupt, lower, same-revision-conflicting, or unverifiable state fails closed. Environment variables, JSON files, ordinary local SQLite, and IndexedDB do not qualify. Browser and current Node environments remain blocked because no such provider was verified.
+
+Package registration and device recovery use these states:
+
+| State | Entry rule and recovery behavior |
+|---|---|
+| PREPARED | Keys, context, operation ID, and exact bytes exist only in the authorized client. No server authority changed. |
+| EXPORT_VERIFIED | Exact package bytes were written, re-read, and reopened locally. This is not proof of long-term retention. |
+| RETENTION_CONFIRMED | For package registration/replacement only, the user explicitly confirms independent retention through the separately approved UX. This is a user assertion and must not be inferred from file creation or reopen. Device recovery skips this state. |
+| PENDING_AUTHORITY | Before any authority-changing CAS, the exact signed request is durably stored; device recovery also stores the target's new private keys, and package registration stores the exact encrypted envelope. A failure here sends no CAS request. |
+| CAS_PENDING | Witness reservation exists and exact request is being submitted. Retry only the same operation ID and bytes. |
+| COMMITTED_UNWITNESSED | CAS committed but no final witness receipt is available. Do not report active or accept the head; reconcile the same request. |
+| COMMITTED_PENDING_LOCAL_ACTIVATION | Witness confirmed the exact CAS head, but atomic local promotion of target keys and high-water state has not succeeded. Retain the secure pending record and retry the same promotion; never create different keys or a new operation under the old ID. |
+| ACTIVE | Exact package commitment, CAS commit, witness receipt, atomic local key/high-water state, and (for package registration) prior RETENTION_CONFIRMED all verify. Only now may the client report recovered access. |
+| FAILED_CLOSED | A required artifact, key, receipt, history entry, or storage capability is missing or inconsistent. No lower revision, alternate bytes, or mock state may be accepted. |
+
+If a package export fails, do not send CAS. If CAS commits but its response is lost, query/retry the exact operation and exact package envelope. If CAS commits but witness finalization fails, remain COMMITTED_UNWITNESSED. Before a target enrollment CAS, persist pending target private keys and request bytes; after a witnessed CAS, promote those keys and the high-water record in one secure-store transaction. A local promotion failure remains COMMITTED_PENDING_LOCAL_ACTIVATION; if the pending key record is later lost or corrupt, the enrolled device cannot claim access and a still-available authorized recovery path is required. Backend restore to an old snapshot is detected by the witness mismatch and requires exact restoration or feature shutdown.
+
+### 12.6 Epoch coverage and rootKey compatibility
+
+At package registration, the source must possess or unwrap every epoch key listed in the previous manifest and create exactly one valid recovery wrap for each contiguous epoch. The source may use only keys it holds through its own authorized device wraps; it cannot request or fabricate a missing epoch. If any epoch is missing, reject the whole registration with KEY_COVERAGE_INCOMPLETE and do not advertise an active complete package. A later rotation with an active package must create the new epoch's recovery wrap in the same signed CAS transition as the epoch and revision update. If that wrap cannot be created, the rotation fails. On recovery, a missing or invalid wrap for any required epoch also fails the complete recovery with KEY_COVERAGE_INCOMPLETE; this spec does not define partial recovery.
+
+The bounded repository inventory found the v1 rootKey created and cleared only in src/crypto/rootark-zk-keyring.js; the keyring module is imported by its focused test but has no in-repository runtime caller. The v1 test asserts the 32-byte field and that the serialized manifest does not contain it. V1 epoch keys are independently random in the source inspected. This supports, but does not prove for external consumers, omission from a separate v2 recovery API. Do not alter or silently migrate v1 objects. The proposed v2 parser rejects a v1 object and any unexpected rootKey field; it never drops, regenerates, or overwrites that legacy value. Before implementation, repeat a bounded call-site and serialization inventory and add a negative compatibility test proving v1 behavior remains unchanged and v2 rejects implicit conversion. Any external importer or real rootKey consumer blocks the omission until a separately reviewed format is approved.
+
+### 12.7 Threat model, limitations, and blocked integrations
+
+| Threat or failure | Required outcome | Remaining limit |
+|---|---|---|
+| Root.ark server, database reader, backup reader, or administrator | Cannot decrypt opaque package/history or obtain private/content keys. A stale server head is rejected by the fresh independent witness plus authenticated history. | Can deny service, withhold data, or expose traffic size and timing. |
+| Malicious Root.ark service or restored old database | Cannot substitute a valid earlier package envelope undetected. CAS head, full chain, exact envelope digest, and witness head must match. | First-use protection is unavailable when the witness is missing, unknown, compromised, or unreachable; fail closed. |
+| Compromised witness | No false claim of freshness is made. Clients reject invalid signatures and still validate the entire authority chain. | A single witness can sign stale/forked heads; protection from this needs a separately approved quorum or transparency design. |
+| Package ciphertext theft | Bounded parsing and fixed Argon2 profile prevent attacker-controlled KDF cost. | A weak password permits offline guessing; password plus package exposes included keys. |
+| Compromised active device | Only transitions in the actor matrix are possible; revoke the device and rotate future keys from another valid authority. | Previously copied keys, plaintext, and ciphertext cannot be revoked retroactively. |
+| Local backup/restore or keychain rollback | Signed state detects modification; fresh witness or verified hardware counter detects rollback. | A signature alone accepts an old exact snapshot. No current client provider proves rollback-resistant metadata. |
+| Witness/store outage, missing history, or uncertain commit | Do not accept state or report successful recovery. Reconcile exact operation or remain blocked. | Availability is sacrificed to prevent rollback or conflicting recovery. |
+| Loss of every trusted device and usable package | No master key or admin recovery exists. | Protected content can remain unrecoverable. |
+
+The shared CAS adapter, deployment topology, independent witness service/key bootstrap, durable secure device storage/high-water provider, browser/mobile recovery, server endpoints, end-to-end protected-content recovery, user-facing export/retention/pairing UX, v1 migration, and production rollout are all still blocked. The confirmed repository has a process-local JSON sync store and opt-in local SQLite; neither is a shared CAS implementation. The current Node sync client reads device signing material from environment variables into memory; the browser uses caller-keyed IndexedDB and lacks the integrated recovery suite. This specification does not assume a database, cloud service, deployment, keychain, or witness exists.
+
+### 12.8 Proposed module, owner, and initial RED-test mapping
+
+These are proposed ownership boundaries and test names only. No listed module or test was created by this revision. After specification approval, each RED case must first be run and observed failing before its implementation. Pure tests never satisfy blocked infrastructure or product rows.
+
+| Invariant | Proposed module and logical owner | Initially failing test and first assertion | Required proof / current status |
+|---|---|---|---|
+| Fixed KDF profile, parse-before-allocation, one worker, no event-loop blocking | src/crypto/rootark-zk-recovery-kdf.js; crypto owner | test/issue-65-recovery-kdf.test.js: unsupported tuple is rejected before the worker is called; second concurrent request returns KDF_BUSY. | Pure Node test plus exact Node 22 cross-platform vector, memory, timing, and allocation-failure run; profile is not frozen. |
+| Exact envelope bytes bind to the signed activation without a digest cycle | src/crypto/rootark-zk-recovery-package-v1.js; crypto owner | test/issue-65-recovery-package.test.js: substitute one byte or an older valid envelope under the same package ID and require digest/binding rejection. | Pure round-trip and adversarial tests only; no server claim. |
+| V1 rootKey compatibility and no implicit v1-to-v2 conversion | src/crypto/rootark-zk-recovery-package-v1.js; crypto owner | test/issue-65-recovery-rootkey-compat.test.js: the v1 shape retains rootKey; a v1 object or extra v2 rootKey field is rejected by the v2 parser. | Repeat the bounded in-repo inventory and test before any v2 importer; external consumers remain unknown. |
+| Actor/operation matrix, prior-state signer, operation expiry | src/crypto/rootark-zk-recovery-manifest-v2.js; crypto owner | test/issue-65-recovery-manifest-v2.test.js: valid signature from the wrong actor for each denied matrix cell, unknown operation, or timestamp beyond the proposed skew window must fail. | Pure signature/state tests including delay boundaries; not server authorization proof. |
+| Target HPKE and Ed25519 proof, consent binding, one-time replay | src/crypto/rootark-zk-recovery-authorization.js; crypto owner | test/issue-65-recovery-authorization.test.js: wrong HPKE key cannot produce a response accepted by the authorizer; repeated challenge fails after the first committed operation. | Pure protocol tests; real paired-device UX remains blocked. |
+| Complete contiguous signed history and bounded verifier | src/crypto/rootark-zk-recovery-history-v2.js; crypto owner | test/issue-65-recovery-history-v2.test.js: remove, reorder, or alter one intermediate manifest and require failure despite a valid-looking later head. | Pure verifier/adversarial fixtures; never counted as a deployed witness or rollback guarantee. |
+| Linearizable shared CAS, append-only log, witness reservation/finalization, restart | Backend-specific CAS and witness adapters; exact module owner/path TBD until the owner confirms infrastructure | test/integration/issue-65-recovery-cas-witness.test.js: two processes race from one head and only one distinct request commits; crash after CAS remains COMMITTED_UNWITNESSED. | Must run against the selected real backend and witness across processes/restarts; currently blocked, no mock substitutes. |
+| Atomic device key/high-water persistence and restore behavior | Client-runtime secure-store adapter; exact runtime/module owner/path TBD | test/integration/issue-65-recovery-device-storage.test.js: restored lower high-water state is rejected or reconciled only with the fresh witness. | Must use the real OS provider on each supported device runtime; currently blocked. |
+| Both independent paths restore actual protected content | Authorized-client and content-key integration; module owner/path TBD after client boundary is selected | test/integration/issue-65-recovery-content-e2e.test.js: package-only recovery succeeds with no trusted device and device-only recovery succeeds with no package. | Synthetic content on an actual client; currently blocked. |
+
+### 12.9 Remaining approval gate
+
+Revision 2 remains a draft. Independent review must specifically confirm or revise the exact package activation context and envelope digest, the single-witness trust assumption and bootstrap, history size/count limits and capacity failure, actor matrix and proof-of-possession transcript, the conditional rootKey omission, the all-epoch coverage requirement, the online-witness fallback for local rollback risk, and the provisional KDF tuple/concurrency policy. Shared-CAS remains the chosen target, but no backend or deployment is assumed. The user has not approved this revised specification. Runtime code, test files, dependency changes, UI, migration, deployment, and production work remain prohibited until approval and prerequisites are confirmed.
+
 ## References
 
 - Existing contract: `docs/architecture/zero-knowledge-migration-contract.md`, especially Sections 2.1–2.3 and 4.
 - Existing crypto helpers: `src/crypto/rootark-zk-1.js`.
 - Existing unwired keyring: `src/crypto/rootark-zk-keyring.js`.
 - Existing persistence evidence: `db/index.js`, `server.js`, and the scoped `SyncObjectStore` implementation.
+- [Pinned libsodium.js 0.8.4 wrapper API](https://raw.githubusercontent.com/jedisct1/libsodium.js/0.8.4/API_sumo.md).
+- [The libsodium submodule Argon2id header used by libsodium.js 0.8.4](https://raw.githubusercontent.com/jedisct1/libsodium/33cc75ab1565d9dcbe808354191bd572ad6b64d0/src/libsodium/include/sodium/crypto_pwhash_argon2id.h).
 - [Libsodium password hashing guidance](https://doc.libsodium.org/password_hashing/default_phf).
-- [Libsodium Argon2id profile constants](https://raw.githubusercontent.com/jedisct1/libsodium/1.0.20/src/libsodium/include/sodium/crypto_pwhash_argon2id.h).
