@@ -93,7 +93,8 @@ test("document preview killable parser and route boundary matrix", async (t) => 
     ["42 worker process is launched without a shell", async () => { let options; await parseDocumentInChildProcess(docxPath, ".docx", { spawnImpl: (...args) => { options = args[2]; return fakeSpawn({ output: JSON.stringify({ ok: true, content: "ok" }) }); } }); assert.equal(options.shell, undefined); }],
     ["43 child process hides Windows window", async () => { let options; await parseDocumentInChildProcess(docxPath, ".docx", { spawnImpl: (...args) => { options = args[2]; return fakeSpawn({ output: JSON.stringify({ ok: true, content: "ok" }) }); } }); assert.equal(options.windowsHide, true); }],
     ["44 worker failure exits nonzero", () => { const worker = fs.readFileSync(workerPath, "utf8"); assert.match(worker, /process\.exitCode\s*=\s*1/); }],
+    ["45 main server does not load the document parser", () => assert.equal(serverSource.includes('require("mammoth")'), false)],
   ];
   for (const [name, body] of cases) await t.test(name, body);
-  assert.equal(cases.length, 44);
+  assert.equal(cases.length, 45);
 });

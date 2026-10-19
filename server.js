@@ -21,7 +21,6 @@ const { pbkdf2Async } = require("./services/pbkdf2Async");
 const zlib = require("zlib");
 const net = require("net");
 const { pipeline } = require("stream/promises");
-const mammoth = require("mammoth");
 const { previewText } = require("./services/documentPreviewService");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
