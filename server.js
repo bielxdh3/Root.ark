@@ -17,6 +17,7 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const { pbkdf2Async } = require("./services/pbkdf2Async");
 const zlib = require("zlib");
 const net = require("net");
 const { pipeline } = require("stream/promises");
@@ -3536,18 +3537,18 @@ function getServerMasterKey(options = {}) {
   return readServerMasterKey({ ...options, filePath: SERVER_MASTER_KEY_FILE });
 }
 
-function deriveKeyFromPassword(password, salt = null) {
+async function deriveKeyFromPassword(password, salt = null) {
   const effectiveSalt = salt || crypto.randomBytes(16);
   return {
-    key: crypto.pbkdf2Sync(String(password || ""), effectiveSalt, ENCRYPTION_ITERATIONS, 32, "sha256"),
+    key: await pbkdf2Async(String(password || ""), effectiveSalt, ENCRYPTION_ITERATIONS, 32, "sha256"),
     salt: effectiveSalt,
   };
 }
 
-function getUserEncryptionKey(username) {
+async function getUserEncryptionKey(username) {
   const serverSecret = getServerMasterKey();
   const userSalt = crypto.createHash("sha256").update(`${username || "sistema"}:rootark-user-key`).digest();
-  return crypto.pbkdf2Sync(serverSecret, userSalt, ENCRYPTION_ITERATIONS, 32, "sha256");
+  return pbkdf2Async(serverSecret, userSalt, ENCRYPTION_ITERATIONS, 32, "sha256");
 }
 
 function encryptBuffer(buffer, key) {
@@ -3563,20 +3564,20 @@ function decryptBuffer(buffer, key, iv, authTag) {
   return Buffer.concat([decipher.update(buffer), decipher.final()]);
 }
 
-function resolveEncryptionKeys(level, req, password, metadata = null) {
+async function resolveEncryptionKeys(level, req, password, metadata = null) {
   const owner = metadata?.accessControl?.owner || metadata?.uploadedBy || req.user?.username;
   if (level === "server-key") return [{ key: getServerMasterKey(), type: "server" }];
-  if (level === "user-key") return [{ key: getUserEncryptionKey(owner), type: "user" }];
+  if (level === "user-key") return [{ key: await getUserEncryptionKey(owner), type: "user" }];
   if (level === "password") {
     if (!password || String(password).length < 8) throw new Error("Senha obrigatoria com no minimo 8 caracteres");
     const salt = metadata?.salt ? Buffer.from(metadata.salt, "hex") : null;
-    const derived = deriveKeyFromPassword(password, salt);
+    const derived = await deriveKeyFromPassword(password, salt);
     return [{ key: derived.key, type: "password", salt: derived.salt }];
   }
   if (level === "dual") {
     if (!password || String(password).length < 8) throw new Error("Senha obrigatoria com no minimo 8 caracteres");
     const salt = metadata?.salt ? Buffer.from(metadata.salt, "hex") : null;
-    const derived = deriveKeyFromPassword(password, salt);
+    const derived = await deriveKeyFromPassword(password, salt);
     return [
       { key: getServerMasterKey(), type: "server" },
       { key: derived.key, type: "password", salt: derived.salt },
@@ -3585,7 +3586,7 @@ function resolveEncryptionKeys(level, req, password, metadata = null) {
   return [];
 }
 
-function encryptFileInPlace(filePath, options) {
+async function encryptFileInPlace(filePath, options) {
   const level = options.encryptionLevel || "none";
   if (level === "none") return null;
   if (!ENCRYPTION_LEVELS[level]) throw new Error("Nivel de criptografia invalido");
@@ -3596,7 +3597,7 @@ function encryptFileInPlace(filePath, options) {
 
   let buffer = fs.readFileSync(filePath);
   const layers = [];
-  const keys = resolveEncryptionKeys(level, options.req, options.password);
+  const keys = await resolveEncryptionKeys(level, options.req, options.password);
 
   for (const layer of keys) {
     const encrypted = encryptBuffer(buffer, layer.key);
@@ -3607,6 +3608,16 @@ function encryptFileInPlace(filePath, options) {
       authTag: encrypted.authTag.toString("hex"),
     });
     if (layer.salt) layers[layers.length - 1].salt = layer.salt.toString("hex");
+  }
+
+  if (typeof options.revalidateBeforeWrite !== "function") {
+    throw new Error("Encrypted upload requires an authorization revalidation callback");
+  }
+  const authorizedToWrite = await options.revalidateBeforeWrite();
+  if (!authorizedToWrite) {
+    const error = new Error("Encrypted upload authorization changed before encryption output was written");
+    error.code = "ENCRYPTED_UPLOAD_AUTHORIZATION_CHANGED";
+    throw error;
   }
 
   fs.writeFileSync(filePath, buffer);
@@ -3638,23 +3649,38 @@ function encryptFileInPlace(filePath, options) {
   };
 }
 
-function decryptEncryptedFileBuffer(encryptedBuffer, metadata, req, password) {
+async function decryptEncryptedFileBuffer(encryptedBuffer, metadata, req, password) {
   let buffer = encryptedBuffer;
   const layers = Array.isArray(metadata.layers) ? metadata.layers.slice().reverse() : [];
 
   for (const layer of layers) {
     let key;
     if (layer.type === "server") key = getServerMasterKey();
-    if (layer.type === "user") key = getUserEncryptionKey(metadata.accessControl?.owner || metadata.uploadedBy);
+    if (layer.type === "user") key = await getUserEncryptionKey(metadata.accessControl?.owner || metadata.uploadedBy);
     if (layer.type === "password") {
       if (!password) throw new Error("Senha obrigatoria");
-      key = deriveKeyFromPassword(password, Buffer.from(layer.salt || metadata.salt, "hex")).key;
+      key = (await deriveKeyFromPassword(password, Buffer.from(layer.salt || metadata.salt, "hex"))).key;
     }
     if (!key) throw new Error("Camada de criptografia invalida");
     buffer = decryptBuffer(buffer, key, layer.iv, layer.authTag);
   }
 
   return buffer;
+}
+
+function revalidateEncryptedUploadAuthorization(req, res, folderId) {
+  if (!refreshAuthenticatedUser(req, res)) return false;
+  const currentFolder = getFolderById(folderId);
+  if (!currentFolder || !isFolderAvailable(folderId)) {
+    res.status(404).json({ error: "Pasta nao encontrada" });
+    return false;
+  }
+  if (!req.user?.permissions?.upload || !hasFolderAccess(req, currentFolder)) {
+    res.status(403).json({ error: "Permissao negada para upload nesta pasta" });
+    return false;
+  }
+  req.uploadFolder = { ...currentFolder, ...ensureFolderDirectories(folderId) };
+  return true;
 }
 
 function getEncryptedAuthorizedUsers(metadata) {
@@ -7416,12 +7442,43 @@ app.post("/encrypted-download/:filename", authenticate, requirePermission("listF
   if (!isExistingFile(filePath)) return res.status(404).json({ error: "Arquivo nao encontrado" });
 
   try {
-    const decrypted = decryptEncryptedFileBuffer(fs.readFileSync(filePath), metadata, req, req.body?.password || "");
+    const decrypted = await decryptEncryptedFileBuffer(fs.readFileSync(filePath), metadata, req, req.body?.password || "");
+    const rejectPlaintext = (status, error) => {
+      decrypted.fill(0);
+      return res.status(status).json({ error });
+    };
+    if (!refreshAuthenticatedUser(req, res)) {
+      decrypted.fill(0);
+      return;
+    }
+    const currentFolder = getFolderById(folder.id);
+    const currentMetadata = getEncryptedFileMetadata(folder.id, name);
+    if (!currentFolder || !isFolderAvailable(folder.id) || !hasFolderAccess(req, currentFolder)) {
+      return rejectPlaintext(404, "Pasta nao encontrada");
+    }
+    if (!currentMetadata) return rejectPlaintext(404, "Arquivo criptografado nao encontrado");
+    if (!req.user?.permissions?.listFiles || !hasFileAccess(req, currentFolder, name) || !canAccessEncryptedFile(req, currentMetadata)) {
+      auditLog("file.access.denied", getAuditActor(req), { type: "file", id: name }, "decrypt", "failure", {
+        folderId: folder.id,
+        reason: "encrypted_access_denied_after_decryption",
+      });
+      return rejectPlaintext(403, "Acesso negado a este arquivo");
+    }
+    if (currentMetadata.accessControl?.expiresAt && new Date(currentMetadata.accessControl.expiresAt).getTime() <= Date.now()) {
+      return rejectPlaintext(410, "Arquivo criptografado expirado");
+    }
+    if (currentMetadata.accessControl?.requiresPassword && !req.body?.password) {
+      return rejectPlaintext(422, "Senha obrigatoria para este arquivo");
+    }
+    if (isFileExpired(folder.id, name)) return rejectPlaintext(410, "Arquivo expirado");
+    if (isFileInTrash(folder.id, name)) return rejectPlaintext(410, "Arquivo esta na lixeira");
+    if (!isExistingFile(filePath)) return rejectPlaintext(404, "Arquivo nao encontrado");
+    metadata = currentMetadata;
     logAnalyticsEvent("download", {
       filename: name,
       downloadedBy: req.user.username,
-      folderId: folder.id,
-      folderName: folder.name,
+      folderId: currentFolder.id,
+      folderName: currentFolder.name,
     });
     auditLog("file.decrypt", getAuditActor(req), { type: "file", id: name }, "decrypted", "success", {
       folderId: folder.id,
@@ -9374,7 +9431,7 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
         req.uploadFolder = { ...currentFolder, ...ensureFolderDirectories(folderId) };
         finalFileName = getAvailableUploadFileName(metadata.fileName, folderId, true);
         chunkUploadQuota.transition({ operationId: req[CHUNK_UPLOAD_QUOTA_ASSEMBLY_ID], state: "encrypting", chargeBytes: assemblyChargeBytes });
-        encryptionMetadata = encryptFileInPlace(stagedPath, {
+        encryptionMetadata = await encryptFileInPlace(stagedPath, {
           req,
           fileName: finalFileName,
           originalName: metadata.originalName,
@@ -9384,7 +9441,13 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
           encryptionLevel: metadata.encryptionLevel || "none",
           password: finalPassword,
           expiresInDays: metadata.expiresInDays || "",
+          revalidateBeforeWrite: () => revalidateEncryptedUploadAuthorization(req, res, folderId),
         });
+        if (!revalidateEncryptedUploadAuthorization(req, res, folderId)) {
+          const error = new Error("Encrypted upload authorization changed before handoff");
+          error.code = "ENCRYPTED_UPLOAD_AUTHORIZATION_CHANGED";
+          throw error;
+        }
         const encryptedStats = fs.lstatSync(stagedPath);
         if (encryptedStats.isSymbolicLink() || !encryptedStats.isFile() || encryptedStats.nlink !== 1 || encryptedStats.size > assemblyChargeBytes) {
           throw new Error("Chunk encryption output could not be verified");
@@ -9439,6 +9502,7 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
       fs.rmSync(stagedPath, { force: true });
       if (publishedPath) fs.rmSync(publishedPath, { force: true });
       removeAndReleaseChunkAssembly(req, sessionDir);
+      if (res.headersSent) return;
       return res.status(error.code === "EEXIST" ? 409 : 400).json({ error: error.code === "EEXIST" ? "O nome de destino mudou durante o envio; reenvie o bloco final." : error.message || "Falha ao criptografar arquivo" });
     }
     if (res.headersSent) {
@@ -9517,7 +9581,7 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
 
       let encryptionMetadata;
       try {
-        encryptionMetadata = encryptFileInPlace(incomingPath, {
+        encryptionMetadata = await encryptFileInPlace(incomingPath, {
           req,
           fileName,
           originalName,
@@ -9527,11 +9591,14 @@ app.post("/upload", authenticate, requirePermission("upload"), prepareUploadFold
           encryptionLevel: req.body.encryptionLevel || "none",
           password: req.body.password || "",
           expiresInDays: req.body.expiresInDays || "",
+          revalidateBeforeWrite: () => revalidateEncryptedUploadAuthorization(req, res, folderId),
         });
       } catch (error) {
+        if (res.headersSent) return;
         payload = { rejected: true, status: 400, error: error.message || "Falha ao criptografar arquivo" };
         return;
       }
+      if (!revalidateEncryptedUploadAuthorization(req, res, folderId)) return;
       finalTempPath = path.join(req.uploadFolder.tempDir, fileName);
       fs.renameSync(incomingPath, finalTempPath);
       req.file.path = finalTempPath;
