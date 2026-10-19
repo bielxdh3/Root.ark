@@ -1,0 +1,6 @@
+# Canonical Git identity for Root.ark commits.
+# Three commits from PR #207 were authored by an automated audit agent
+# with a mistakenly attributed Git identity, not by GitHub user @Audit.
+# This mapping corrects Git/mailmap-aware contributor statistics without
+# rewriting published history or modifying the original commit objects.
+bielxdh3 <bielxdh3@gmail.com> Rootark Audit <audit@users.noreply.github.com>
