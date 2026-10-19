@@ -47,6 +47,38 @@ async function historyInput(scenario, transitions = scenario.transitions, packag
   };
 }
 
+async function createRecoveryWrapForTest(scope, authority, epoch, keyRef, epochKey) {
+  const wrapId = crypto.randomBytes(16);
+  const context = {
+    suite: "rootark-zk-1",
+    account_id: Buffer.from(scope.account_id),
+    compartment_id: Buffer.from(scope.compartment_id),
+    purpose: "recovery-package",
+    recipient_type: "recovery-package",
+    recipient_id: Buffer.from(authority.package_id),
+    recipient_key_id: Buffer.from(authority.hpke_key_id),
+    epoch,
+    key_ref: Buffer.from(keyRef),
+    wrap_id: wrapId,
+  };
+  const contextBytes = await z.encodeDeterministic(context);
+  const sealed = await z.hpkeSeal({
+    recipientPublicKey: await z.hpkeSuite().kem.deserializePublicKey(authority.hpke_public_key),
+    info: Buffer.concat([Buffer.from("Root.ark/zk-1/keyring-wrap-info/v2\0", "ascii"), contextBytes]),
+    aad: Buffer.concat([Buffer.from("Root.ark/zk-1/keyring-wrap-aad/v2\0", "ascii"), contextBytes]),
+    plaintext: epochKey,
+  });
+  return {
+    package_id: Buffer.from(authority.package_id),
+    hpke_key_id: Buffer.from(authority.hpke_key_id),
+    epoch,
+    key_ref: Buffer.from(keyRef),
+    wrap_id: wrapId,
+    enc: sealed.enc,
+    ciphertext: sealed.ciphertext,
+  };
+}
+
 async function resignCore(core, epochKey, actorPrivateKey) {
   const macInfo = await z.encodeDeterministic({
     type: "rootark-keyring-manifest-mac-info-v2",
@@ -154,6 +186,43 @@ test("rejectsSignedSyntheticRecoveryWrapsThatCannotDecryptTheEpochKey", async ()
     h.verifyRecoveryHistoryV2(input),
     (error) => error instanceof z.RootarkZkError && error.code === "KEY_COVERAGE_INCOMPLETE",
   );
+});
+
+test("rejectsRecoveryWrapOpenedByKeyUnrelatedToManifestPackagePublicKey", async () => {
+  const scenario = await createHistory();
+  let alternatePrivateKey;
+  const mismatchedActivation = await resignFirstTransition(scenario, async (core) => {
+    const alternatePair = await z.hpkeSuite().kem.generateKeyPair();
+    alternatePrivateKey = Buffer.from(await z.hpkeSuite().kem.serializePrivateKey(alternatePair.privateKey));
+    const alternateAuthority = {
+      ...core.recovery_authority,
+      hpke_public_key: Buffer.from(await z.hpkeSuite().kem.serializePublicKey(alternatePair.publicKey)),
+    };
+    const epoch = core.recovery_wraps[0].epoch;
+    const epochKey = scenario.state.epochKeys.find((entry) => entry.epoch === epoch).key;
+    core.recovery_wraps[0] = await createRecoveryWrapForTest(
+      scenario.state.scope,
+      alternateAuthority,
+      epoch,
+      core.recovery_wraps[0].key_ref,
+      epochKey,
+    );
+  });
+  const input = await historyInput(scenario, [mismatchedActivation]);
+  input.recoveryPackageKeys = [{
+    package_id: Buffer.from(mismatchedActivation.recovery_authority.package_id),
+    hpke_key_id: Buffer.from(mismatchedActivation.recovery_authority.hpke_key_id),
+    hpke_private_key: alternatePrivateKey,
+  }];
+
+  try {
+    await assert.rejects(
+      h.verifyRecoveryHistoryV2(input),
+      (error) => error instanceof z.RootarkZkError && error.code === "KEY_COVERAGE_INCOMPLETE",
+    );
+  } finally {
+    z.clearSecret(alternatePrivateKey);
+  }
 });
 
 test("rejectsMisboundRecoveryWrapsAfterTheTransitionIsResigned", async () => {

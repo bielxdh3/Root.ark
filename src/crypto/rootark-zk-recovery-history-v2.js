@@ -13,6 +13,7 @@ const WRAP_INFO_PREFIX = Buffer.from("Root.ark/zk-1/keyring-wrap-info/v2\0", "as
 const WRAP_AAD_PREFIX = Buffer.from("Root.ark/zk-1/keyring-wrap-aad/v2\0", "ascii");
 const RECOVERY_PACKAGE_KEY_FIELDS = Object.freeze(["package_id", "hpke_key_id", "hpke_private_key"]);
 const WITNESS_BASE_PREFIX = Buffer.from("Root.ark/zk-1/recovery-witness-base/v1\0", "ascii");
+const X25519_PKCS8_PREFIX = Buffer.from("302e020100300506032b656e04220420", "hex");
 const WITNESS_RECEIPT_FIELDS = Object.freeze([
   "type", "witness_key_id", "account_id", "compartment_id", "keyring_id", "revision",
   "manifest_digest", "witness_sequence", "nonce", "observed_at", "status", "signature",
@@ -131,6 +132,19 @@ function recoveryPackageKeyMap(input) {
   return result;
 }
 
+function recoveryPackagePublicKey(privateKeyBytes) {
+  const privateKeyDer = Buffer.concat([X25519_PKCS8_PREFIX, privateKeyBytes]);
+  try {
+    const privateKey = crypto.createPrivateKey({ key: privateKeyDer, format: "der", type: "pkcs8" });
+    const publicKeyDer = crypto.createPublicKey(privateKey).export({ format: "der", type: "spki" });
+    return Buffer.from(publicKeyDer).subarray(-32);
+  } catch (_) {
+    fail("KEY_COVERAGE_INCOMPLETE");
+  } finally {
+    z.clearSecret(privateKeyDer);
+  }
+}
+
 async function verifyNewRecoveryWraps(previousManifest, nextManifest, scope, epochKeys, inputKeys) {
   const operationType = nextManifest.operation.operation_type;
   let wraps = [];
@@ -152,6 +166,9 @@ async function verifyNewRecoveryWraps(previousManifest, nextManifest, scope, epo
       const privateKeyBytes = keys.get(`${packageId.toString("hex")}:${hpkeKeyId.toString("hex")}`);
       const expectedEpochKey = epochKeys.get(epoch);
       if (!privateKeyBytes || !expectedEpochKey) fail("KEY_COVERAGE_INCOMPLETE");
+      if (!sameBytes(recoveryPackagePublicKey(privateKeyBytes), nextManifest.recovery_authority.hpke_public_key)) {
+        fail("KEY_COVERAGE_INCOMPLETE");
+      }
 
       const context = {
         suite: "rootark-zk-1",
