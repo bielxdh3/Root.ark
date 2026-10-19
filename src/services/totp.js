@@ -180,6 +180,14 @@ async function verifyRecoveryCodeAsync(code, stored) {
   return crypto.timingSafeEqual(digest, Buffer.from(digestText, "hex"));
 }
 
+async function hashRecoveryCodeAsync(code, randomBytes = crypto.randomBytes) {
+  const normalized = normalizeRecoveryCode(code);
+  if (normalized.length < 16) throw new Error("Invalid recovery code");
+  const salt = randomBytes(16);
+  const digest = await scryptAsync(normalized, salt, 32, { N: 16_384, r: 8, p: 1, maxmem: 32 * 1024 * 1024 });
+  return `${RECOVERY_HASH_PREFIX}$${salt.toString("hex")}$${digest.toString("hex")}`;
+}
+
 function generateRecoveryCodes(count = RECOVERY_CODE_COUNT, randomBytes = crypto.randomBytes) {
   if (!Number.isInteger(count) || count < 1 || count > 20) throw new Error("Invalid recovery code count");
   const codes = Array.from({ length: count }, () => {
@@ -187,6 +195,18 @@ function generateRecoveryCodes(count = RECOVERY_CODE_COUNT, randomBytes = crypto
     return `${raw.slice(0, 8)}-${raw.slice(8, 16)}-${raw.slice(16)}`;
   });
   return { codes, hashes: codes.map((code) => hashRecoveryCode(code, randomBytes)) };
+}
+
+async function generateRecoveryCodesAsync(count = RECOVERY_CODE_COUNT, randomBytes = crypto.randomBytes) {
+  if (!Number.isInteger(count) || count < 1 || count > 20) throw new Error("Invalid recovery code count");
+  const codes = Array.from({ length: count }, () => {
+    const raw = randomBytes(16).toString("hex");
+    return `${raw.slice(0, 8)}-${raw.slice(8, 16)}-${raw.slice(16)}`;
+  });
+  const hashes = [];
+  // Keep scrypt memory use bounded to one recovery hash at a time while yielding the event loop.
+  for (const code of codes) hashes.push(await hashRecoveryCodeAsync(code, randomBytes));
+  return { codes, hashes };
 }
 
 module.exports = {
@@ -203,6 +223,7 @@ module.exports = {
   decryptSecret,
   encryptSecret,
   generateRecoveryCodes,
+  generateRecoveryCodesAsync,
   generateSecret,
   hashRecoveryCode,
   hotp,

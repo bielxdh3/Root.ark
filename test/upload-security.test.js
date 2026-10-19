@@ -2144,6 +2144,13 @@ test("wrong encrypted-file password stays an input error and records failed decr
   const audit = JSON.parse(fs.readFileSync(path.join(harness.dir, "data", "audit-logs.json"), "utf8"));
   assert.ok(audit.logs.some((entry) => entry.eventType === "file.decrypt.failed" && entry.result === "failure"));
   assert.equal(audit.logs.some((entry) => entry.eventType === "file.decrypt" && entry.result === "success"), false);
+
+  // Real HTTP integration: a previously encrypted, approved upload must still decrypt
+  // to the exact original bytes after PBKDF2 became asynchronous.
+  const correctPasswordResponse = await postJson(harness.port, session, `/encrypted-download/password-check.txt?folderId=${FOLDER_ID}`, { password: correctPassword });
+  assert.equal(correctPasswordResponse.status, 200, correctPasswordResponse.body);
+  assert.equal(correctPasswordResponse.body, "disposable encrypted fixture");
+  assert.equal(correctPasswordResponse.headers["cache-control"], "no-store");
 });
 
 test("traversal-style multipart filenames stay contained in the selected folder", { timeout: 30_000 }, async (t) => {
