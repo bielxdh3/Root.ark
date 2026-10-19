@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const z = require("./rootark-zk-1");
 const recoveryKdf = require("./rootark-zk-recovery-kdf");
+const recoveryManifest = require("./rootark-zk-recovery-manifest-v2");
 
 const MAX_ENVELOPE_BYTES = 8 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES = 7 * 1024 * 1024;
@@ -397,9 +398,52 @@ function recoveryPackageEnvelopeDigest(envelopeBytes) {
   return domainHash(ENVELOPE_DIGEST_PREFIX, Buffer.from(envelopeBytes));
 }
 
+async function verifyRecoveryPackageActivation(input) {
+  try {
+    const proof = input?.publicTransitionProof;
+    if (!await recoveryManifest.isVerifiedRecoveryTransitionPublicProofV2(proof)
+      || !proof.previousManifest || !proof.nextManifest || !isBytes(input.envelopeBytes)) fail();
+    const previous = proof.previousManifest;
+    const next = proof.nextManifest;
+    const operation = next.operation;
+    const authority = next.recovery_authority;
+    if (!authority || authority.status !== "active"
+      || !["register-package", "replace-package", "compromise-package"].includes(operation.operation_type)) fail();
+
+    const parsed = await parseRecoveryPackageV1({
+      envelopeBytes: input.envelopeBytes,
+      expectedScope: {
+        account_id: next.account_id,
+        compartment_id: next.compartment_id,
+      },
+    });
+    const envelope = parsed.envelope;
+    const previousDigest = await recoveryManifest.recoveryManifestDigestV2(previous);
+    const packageDigest = recoveryPackageEnvelopeDigest(input.envelopeBytes);
+    if (!sameBytes(envelope.account_id, next.account_id)
+      || !sameBytes(envelope.compartment_id, next.compartment_id)
+      || !sameBytes(envelope.package_id, authority.package_id)
+      || u64(envelope.base_revision, 1n) !== u64(previous.revision, 1n)
+      || !sameBytes(envelope.base_manifest_digest, previousDigest)
+      || u64(envelope.activation_revision, 1n) !== u64(next.revision, 1n)
+      || !sameBytes(envelope.operation_id, operation.operation_id)
+      || !sameBytes(envelope.operation_id, authority.operation_id)
+      || !sameBytes(envelope.activation_context_digest, authority.activation_context_digest)
+      || !sameBytes(authority.package_envelope_digest, packageDigest)
+      || u64(authority.activation_revision, 1n) !== u64(next.revision, 1n)
+      || u64(authority.previous_revision, 1n) !== u64(previous.revision, 1n)
+      || !sameBytes(authority.previous_manifest_digest, previousDigest)) fail();
+    return true;
+  } catch (error) {
+    if (error instanceof z.RootarkZkError && error.code === "INVALID_RECOVERY_PACKAGE") throw error;
+    fail("INVALID_RECOVERY_PACKAGE");
+  }
+}
+
 module.exports = {
   parseRecoveryPackageV1,
   createRecoveryPackageV1,
   openRecoveryPackageV1,
   recoveryPackageEnvelopeDigest,
+  verifyRecoveryPackageActivation,
 };
