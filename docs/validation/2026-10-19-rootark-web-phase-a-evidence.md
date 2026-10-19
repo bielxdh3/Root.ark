@@ -16,9 +16,11 @@
 
 - Added the test-only `assessWebRecoveryEvidence(record)` classifier. Its only statuses are `UNVERIFIED` and `CANDIDATE_FOR_INDEPENDENT_REVIEW`; output contains only a status and bounded reason strings. It cannot return a production authorization, freshness result, trusted-device token, or approval.
 - The evaluator accepts only the documented evidence fields, requires a plain object with own data properties, rejects unexpected/missing fields and sensitive blobs, and retains unknown observations as `UNKNOWN`.
+- Adversarial cases cover unknown PRF, synchronized credentials, profile restoration/loss, deleted credentials, copied credentials, incomplete key-copy/restore testing, and an apparently positive PRF observation without independent review.
 - Added a local-only manual probe. A button click is required before it collects sanitized browser-family/platform and secure-origin observations. It does not invoke an authenticator operation, create or delete credentials, persist results, or transmit data. API presence is labeled as feature presence only and is not treated as a PRF result or proof of key custody.
 - Windows Node.js `v22.22.1`, 2026-10-19: the evaluator test first returned **1 failed** because the module was absent (RED). The probe-safety test first returned **1 failed** because the probe was absent (RED). After the implementation, `node --test test/issue-65-web-capability-evidence.test.js` returned **6 passed, 0 failed, 0 skipped** (GREEN).
 - **Real browser/authenticator evidence: `NOT_RUN`.** No browser version, browser OS/key-store behavior, WebAuthn PRF result, credential synchronization behavior, profile restore result, authenticator operation, or independent platform review was observed in this phase. The probe was created for a future explicit manual observation; its code and unit tests do not establish browser support.
+- Follow-up coverage RED: adding the explicit `PROFILE_LOST` case failed because that evidence label was not accepted. After adding it as a conservative non-candidate label, the targeted test passed. Copied credentials and profile loss remain `UNVERIFIED`.
 
 ## Task 3 — Online/offline policy evidence
 
@@ -51,13 +53,14 @@ Windows Node.js `v22.22.1`, 2026-10-19: `node --test test/issue-65-web-offline-e
 
 ### Readiness classifier
 
-- Added test-only `assessWebRecoveryIntegrationReadiness(...)` at implementation SHA `914aceec0406987712a52e5a885c0b90e82124d2`.
+- Added test-only `assessWebRecoveryIntegrationReadiness(...)` at `914aceec0406987712a52e5a885c0b90e82124d2`. The later coverage correction commit `4954d8d28d4d4656666f227d451e45d70ef632e8` adds explicit copied-credential and profile-loss cases without changing the readiness rules.
 - Any missing prerequisite or any value other than literal `PASS` returns `BLOCKED_FOR_INTEGRATION`. A record where every input says `PASS` returns only `REQUIRES_SEPARATE_INTEGRATION_APPROVAL`. Neither result includes an authorization field, enrollment token, or trusted-device grant.
 - RED: the capability suite had **3 failing readiness tests** because the export did not exist. GREEN: the capability suite then had **9 passed, 0 failed, 0 skipped**.
+- The profile-loss/copy coverage extension produced a targeted RED for the unsupported `PROFILE_LOST` label, then **1 passed, 0 failed, 0 skipped** after the helper classified it as unverified.
 
 ### Claim matrix
 
-Evidence for code and tests below was run against code/test SHA `914aceec0406987712a52e5a885c0b90e82124d2`, except the Task 3 source scan, which was read at `fe55dfa0907569e240a708e99b44d7a52b21c3cd`. Runtime source files were unchanged in Phase A.
+The final focused suite and validations below were run against code/test SHA `4954d8d28d4d4656666f227d451e45d70ef632e8`, except the Task 3 source scan, which was read at `fe55dfa0907569e240a708e99b44d7a52b21c3cd`. Runtime source files were unchanged in Phase A.
 
 | Claim | Status | Evidence and limit |
 |---|---|---|
