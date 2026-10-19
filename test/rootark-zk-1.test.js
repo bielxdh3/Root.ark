@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const z = require("../src/crypto/rootark-zk-1");
+const v2WireFixture = require("./fixtures/rootark-zk-1-v2-wire.json");
 
 const b = (value, length = 8) => Buffer.alloc(length, value);
 const sample = () => ({
@@ -194,6 +195,59 @@ test("v2 authorization profile has stable vectors and binds every static manifes
   await assert.rejects(z.buildAadBytes({ ...aadInput, profile: z.PROFILE.AAD, envelope_version: 2 }));
   await assert.rejects(z.buildManifestCoreBytes({ ...core, type: "rootark-authorization-manifest-v1" }));
   await assert.rejects(z.buildManifestCoreBytes({ ...core, envelope_version: 3 }));
+});
+
+test("published v2 wire fixture matches exact deterministic profile bytes", async () => {
+  const input = v2WireFixture.inputs;
+  const source = input.static_core;
+  const staticCore = {
+    type: source.type,
+    suite: source.suite,
+    envelope_version: source.envelope_version,
+    compartment_id: Buffer.from(source.compartment_id_hex, "hex"),
+    epoch: source.epoch,
+    purpose: source.purpose,
+    sender_key_id: Buffer.from(source.sender_key_id_hex, "hex"),
+    recipient_key_id: Buffer.from(source.recipient_key_id_hex, "hex"),
+    object_id: Buffer.from(source.object_id_hex, "hex"),
+    version_id: Buffer.from(source.version_id_hex, "hex"),
+    key_ref: Buffer.from(source.key_ref_hex, "hex"),
+    expiry: BigInt(source.expiry_unix_seconds),
+    replay_id: Buffer.from(source.replay_id_hex, "hex"),
+    idempotency_key: Buffer.from(source.idempotency_key_hex, "hex"),
+    wrap_id: Buffer.from(source.wrap_id_hex, "hex"),
+  };
+  const info = await z.buildAuthorizationHpkeInfoV2Bytes({ profile: z.PROFILE.HPKE_INFO_V2, ...staticCore });
+  const core = { ...staticCore, hpke_enc: Buffer.from(input.hpke_enc_hex, "hex") };
+  const coreDigest = await z.buildManifestCoreDigest(core);
+  const aad = await z.buildAadBytes({
+    profile: z.PROFILE.AAD_V2,
+    suite: staticCore.suite,
+    envelope_version: staticCore.envelope_version,
+    compartment_id: staticCore.compartment_id,
+    epoch: staticCore.epoch,
+    purpose: staticCore.purpose,
+    object_id: staticCore.object_id,
+    version_id: staticCore.version_id,
+    key_ref: staticCore.key_ref,
+    wrap_id: staticCore.wrap_id,
+    manifest_core_digest: coreDigest,
+  });
+  const manifest = {
+    ...core,
+    hpke_info_digest: Buffer.from(input.hpke_info_digest_hex, "hex"),
+    wrapped_key_digest: Buffer.from(input.wrapped_key_digest_hex, "hex"),
+    ciphertext_digest: Buffer.from(input.ciphertext_digest_hex, "hex"),
+  };
+  const manifestBytes = await z.buildManifestBytes(manifest);
+  const signatureInput = await z.buildAuthorizationSignatureInput(manifest);
+  const expected = v2WireFixture.expected;
+
+  assert.equal(info.toString("hex"), expected.hpke_info_v2_hex);
+  assert.equal(coreDigest.toString("hex"), expected.manifest_core_digest_hex);
+  assert.equal(aad.toString("hex"), expected.aad_v2_hex);
+  assert.equal(manifestBytes.toString("hex"), expected.manifest_v2_hex);
+  assert.equal(signatureInput.toString("hex"), expected.signature_input_v2_hex);
 });
 
 test("AES-GCM and HKDF wrapping bind exact context and wrap_id", async () => {
