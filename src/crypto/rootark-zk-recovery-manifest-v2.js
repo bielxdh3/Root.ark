@@ -701,12 +701,20 @@ async function verifyRecoveryTransitionPublicV2(input) {
   }
   const operation = nextManifest.operation;
   assertRecoveryActorOperation(operation.actor_type, operation.operation_type);
-  if (input.expectedScope) {
-    const scope = input.expectedScope;
-    if (!sameBytes(nextManifest.account_id, scope.account_id)
-      || !sameBytes(nextManifest.compartment_id, scope.compartment_id)
-      || !sameBytes(nextManifest.keyring_id, scope.keyring_id)) fail("SCOPE_MISMATCH");
+  let scope;
+  try {
+    const expectedScope = exactMap(input.expectedScope, ["account_id", "compartment_id", "keyring_id"]);
+    scope = {
+      account_id: checkBytes(expectedScope.account_id, 16),
+      compartment_id: checkBytes(expectedScope.compartment_id, undefined, 1, 128),
+      keyring_id: checkBytes(expectedScope.keyring_id, 16),
+    };
+  } catch (_) {
+    fail("SCOPE_MISMATCH");
   }
+  if (!sameBytes(nextManifest.account_id, scope.account_id)
+    || !sameBytes(nextManifest.compartment_id, scope.compartment_id)
+    || !sameBytes(nextManifest.keyring_id, scope.keyring_id)) fail("SCOPE_MISMATCH");
   if (previousManifest === null) {
     if (operation.operation_type !== "initialize") fail();
     if (!sameBytes(nextManifest.previous_manifest_digest, Buffer.alloc(32))) fail();
@@ -798,7 +806,7 @@ async function signRecoveryTransitionV2(input) {
   }
   const core = exactMap(input.proposedCore, CORE_FIELDS);
   if (["enroll-device", "recover-device"].includes(core.operation.operation_type)
-    && !await targetAuthorization.isVerifiedTargetPopResponse(core.operation.target_pop_proof)) {
+    && !await targetAuthorization.isVerifiedTargetPopResponse(core.operation.target_pop_proof, input.now)) {
     fail("INVALID_TARGET_POP");
   }
   assertRecoveryActorOperation(core.operation.actor_type, core.operation.operation_type);
@@ -848,7 +856,13 @@ function assertCompromisePackageTransition(input) {
   const newAuthority = next.recovery_authority;
   if (!authorityActive(oldAuthority) || !authorityActive(newAuthority)
     || !sameBytes(input.operation?.compromised_package_id ?? next.operation?.compromised_package_id, oldAuthority.package_id)
-    || sameBytes(oldAuthority.package_id, newAuthority.package_id)) fail("COMPROMISE_RECOVERY_UNAVAILABLE");
+    || sameBytes(oldAuthority.package_id, newAuthority.package_id)
+    || sameBytes(oldAuthority.hpke_key_id, newAuthority.hpke_key_id)
+    || sameBytes(oldAuthority.hpke_public_key, newAuthority.hpke_public_key)
+    || sameBytes(oldAuthority.authorization_key_id, newAuthority.authorization_key_id)
+    || sameBytes(oldAuthority.authorization_public_key, newAuthority.authorization_public_key)) {
+    fail("COMPROMISE_RECOVERY_UNAVAILABLE");
+  }
   const oldEpoch = asNumber(previous.current_epoch);
   const freshEpoch = asNumber(next.current_epoch);
   if (freshEpoch !== oldEpoch + 1) fail("COMPROMISE_RECOVERY_UNAVAILABLE");

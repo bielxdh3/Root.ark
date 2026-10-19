@@ -120,6 +120,11 @@ function validateLiveWindow(context, now) {
   if (current < context.issued_at - 30 || current > context.expires_at) fail();
 }
 
+function requireLiveWindow(context, now) {
+  if (now === undefined) fail();
+  validateLiveWindow(context, now);
+}
+
 function rawEd25519PublicKey(keyBytes) {
   try {
     return crypto.createPublicKey({
@@ -230,6 +235,7 @@ async function verifyTargetPopResponse(input) {
   try {
     const state = challengeState.get(input.challenge);
     if (!state || !await sameCanonical(input.challengeContext, state.challengeContext)) fail();
+    requireLiveWindow(state.context, input.now);
     const response = exactMap(input.response, RESPONSE_FIELDS);
     if (!await sameCanonical(response.challenge_context, state.challengeContext)
       || !sameBytes(response.challenge, state.challenge)) fail();
@@ -262,11 +268,13 @@ async function verifyTargetPopResponse(input) {
   }
 }
 
-async function isVerifiedTargetPopResponse(proof) {
+async function isVerifiedTargetPopResponse(proof, now) {
   const snapshot = proof && verifiedResponses.get(proof);
-  if (!snapshot) return false;
+  if (!snapshot || now === undefined) return false;
   try {
-    return sameBytes(snapshot, await z.encodeDeterministic(proof));
+    if (!sameBytes(snapshot, await z.encodeDeterministic(proof))) return false;
+    requireLiveWindow(proof.challenge_context, now);
+    return true;
   } catch (_) {
     return false;
   }

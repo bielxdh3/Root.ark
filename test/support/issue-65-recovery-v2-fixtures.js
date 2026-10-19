@@ -174,6 +174,7 @@ async function appendDeviceEnrollment(state, index) {
     expectedDeviceKeyDigest: challenge.challengeContext.target_device_key_digest,
     now: 1100,
   });
+  state.lastVerifiedTargetPopProof = targetPopProof;
   const targetDeviceKeyDigest = await targetAuthorization.recoveryTargetDeviceKeyDigest({
     deviceId: target.device_id,
     hpkeKeyId: target.hpke_key_id,

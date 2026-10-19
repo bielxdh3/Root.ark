@@ -183,6 +183,47 @@ test("signingRejectsMutationOfALocallyVerifiedTargetChallenge", async () => {
   );
 });
 
+test("signingRejectsTargetProofAfterItsChallengeExpiresEvenWithANewOperationWindow", async () => {
+  const state = await fixtures.createInitialState(1);
+  const prior = state.verifiedHistory;
+  const previous = prior.headManifest;
+  const next = await fixtures.appendDeviceEnrollment(state, 1);
+  const proposedCore = {
+    ...next,
+    operation: { ...next.operation, target_pop_proof: state.lastVerifiedTargetPopProof },
+  };
+  delete proposedCore.mac;
+  delete proposedCore.actor_signature;
+  proposedCore.operation.issued_at = 1400;
+  proposedCore.operation.expires_at = 1700;
+  proposedCore.operation.request_digest = await m.expectedRecoveryRequestDigestV2(previous, proposedCore);
+
+  await assert.rejects(
+    m.signRecoveryTransitionV2({
+      proposedCore,
+      priorVerifiedHistory: prior,
+      actorPrivateKey: state.actors.get(previous.devices[0].authorization_key_id.toString("hex")),
+      manifestMacKey: prior.epochKeys[0].key,
+      now: 1500,
+      clockHealthy: true,
+    }),
+    (error) => error instanceof z.RootarkZkError && error.code === "INVALID_TARGET_POP",
+  );
+});
+
+test("publicTransitionProofRequiresExpectedScopeEvenForInitialization", async () => {
+  const state = await fixtures.createInitialState(1);
+  await assert.rejects(
+    m.verifyRecoveryTransitionPublicV2({
+      previousManifest: null,
+      nextManifest: state.headManifest,
+      retainedIdentifiers: { complete: true, values: new Set() },
+      priorEpochKeys: [],
+    }),
+    (error) => error instanceof z.RootarkZkError && error.code === "SCOPE_MISMATCH",
+  );
+});
+
 test("signsAValidPriorStateDeviceRevocationAtTheNextRevision", async () => {
   const state = await fixtures.createInitialState();
   const previousRevision = state.headManifest.revision;
@@ -263,6 +304,13 @@ test("rejectsAChangedActorSignatureScopeAndManifestMac", async () => {
     m.verifyRecoveryTransitionPublicV2({
       ...verificationInput,
       expectedScope: { ...state.scope, account_id: Buffer.alloc(16, 0xff) },
+    }),
+    (error) => error instanceof z.RootarkZkError && error.code === "SCOPE_MISMATCH",
+  );
+  await assert.rejects(
+    m.verifyRecoveryTransitionPublicV2({
+      ...verificationInput,
+      expectedScope: { ...state.scope, keyring_id: Buffer.alloc(1) },
     }),
     (error) => error instanceof z.RootarkZkError && error.code === "SCOPE_MISMATCH",
   );

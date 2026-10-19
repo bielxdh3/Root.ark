@@ -10,6 +10,12 @@ function makeCompromiseTransition() {
   const newPackageId = Buffer.alloc(16, 0x20);
   const oldHpkeId = Buffer.alloc(16, 0x11);
   const newHpkeId = Buffer.alloc(16, 0x21);
+  const oldAuthorizationId = Buffer.alloc(16, 0x12);
+  const newAuthorizationId = Buffer.alloc(16, 0x22);
+  const oldHpkePublicKey = Buffer.alloc(32, 0x13);
+  const newHpkePublicKey = Buffer.alloc(32, 0x23);
+  const oldAuthorizationPublicKey = Buffer.alloc(32, 0x14);
+  const newAuthorizationPublicKey = Buffer.alloc(32, 0x24);
   const deviceId = "trusted-device";
   const previousManifest = {
     current_epoch: 2,
@@ -18,6 +24,9 @@ function makeCompromiseTransition() {
     recovery_authority: {
       package_id: oldPackageId,
       hpke_key_id: oldHpkeId,
+      hpke_public_key: oldHpkePublicKey,
+      authorization_key_id: oldAuthorizationId,
+      authorization_public_key: oldAuthorizationPublicKey,
       status: "active",
     },
   };
@@ -28,6 +37,9 @@ function makeCompromiseTransition() {
     recovery_authority: {
       package_id: newPackageId,
       hpke_key_id: newHpkeId,
+      hpke_public_key: newHpkePublicKey,
+      authorization_key_id: newAuthorizationId,
+      authorization_public_key: newAuthorizationPublicKey,
       status: "active",
     },
     recovery_wraps: [1, 2, 3].map((epoch) => ({
@@ -100,4 +112,22 @@ test("compromiseCannotKeepOrReceiveTheOldPackageAuthority", () => {
     () => m.assertCompromisePackageTransition(oldWrap),
     (error) => error instanceof z.RootarkZkError && error.code === "COMPROMISE_RECOVERY_UNAVAILABLE",
   );
+});
+
+test("compromiseReplacementCannotReuseAnyCompromisedRecoveryKeyIdOrPublicKey", () => {
+  const fields = [
+    "hpke_key_id",
+    "hpke_public_key",
+    "authorization_key_id",
+    "authorization_public_key",
+  ];
+  for (const field of fields) {
+    const input = makeCompromiseTransition();
+    input.nextManifestCore.recovery_authority[field] = Buffer.from(input.previousManifest.recovery_authority[field]);
+    assert.throws(
+      () => m.assertCompromisePackageTransition(input),
+      (error) => error instanceof z.RootarkZkError && error.code === "COMPROMISE_RECOVERY_UNAVAILABLE",
+      `accepted reuse of compromised recovery authority ${field}`,
+    );
+  }
 });

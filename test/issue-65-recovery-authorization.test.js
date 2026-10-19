@@ -112,6 +112,9 @@ test("acceptsOnlyMatchingChallengeAndTargetSignature", async () => {
   });
   assert.deepEqual(proof.challenge, plaintext);
   assert.deepEqual(proof.challenge_context, challenge.challengeContext);
+  assert.equal(await a.isVerifiedTargetPopResponse(proof, 1100), true);
+  assert.equal(await a.isVerifiedTargetPopResponse(proof), false);
+  assert.equal(await a.isVerifiedTargetPopResponse(proof, 1301), false);
 
   await assert.rejects(
     a.verifyTargetPopResponse({
@@ -129,6 +132,7 @@ test("acceptsOnlyMatchingChallengeAndTargetSignature", async () => {
     { expectedDeviceKeyDigest: Buffer.alloc(32, 0xff), expectedScope: scope, now: 1100 },
     { expectedDeviceKeyDigest: challenge.challengeContext.target_device_key_digest, expectedScope: { ...scope, keyring_id: Buffer.alloc(16, 0xff) }, now: 1100 },
     { expectedDeviceKeyDigest: challenge.challengeContext.target_device_key_digest, expectedScope: scope, now: 1301 },
+    { expectedDeviceKeyDigest: challenge.challengeContext.target_device_key_digest, expectedScope: scope },
   ]) {
     await assert.rejects(
       a.verifyTargetPopResponse({
