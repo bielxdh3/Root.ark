@@ -490,9 +490,9 @@ async function verifyRecoveryPackageHistoryV2(input) {
   return verifyRecoveryHistoryInternal(input, "recovery-package");
 }
 
-// Preserve the original entry point as device authorization; package-wrap verification is explicit.
+// Preserve the original entry point as strict package recovery; device-only authorization is explicit.
 async function verifyRecoveryHistoryV2(input) {
-  return verifyTrustedDeviceRecoveryHistoryV2(input);
+  return verifyRecoveryPackageHistoryV2(input);
 }
 
 async function isVerifiedRecoveryHistoryV2(history, requiredMode) {

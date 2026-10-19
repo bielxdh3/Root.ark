@@ -116,7 +116,7 @@ async function resignFirstTransition(scenario, mutateCore) {
 
 test("verifiesContiguousHistoryAndExpiredCommittedTransitionsForTrustedDevice", async () => {
   const scenario = await createHistory();
-  const result = await h.verifyRecoveryHistoryV2(await historyInput(scenario));
+  const result = await h.verifyTrustedDeviceRecoveryHistoryV2(await historyInput(scenario));
   assert.equal(result.revision, scenario.state.headManifest.revision);
   assert.equal(result.transitionCount, 4);
   assert.equal(result.packageAuthorityStatus, "active");
@@ -151,7 +151,7 @@ test("rejectsFreshWitnessHeadInThePackageBaseReceiptSlot", async () => {
     ]), scenario.baseAnchor.signingPrivateKey),
   };
 
-  await assert.rejects(h.verifyRecoveryHistoryV2(input), (error) => error.code === "HISTORY_INVALID");
+  await assert.rejects(h.verifyTrustedDeviceRecoveryHistoryV2(input), (error) => error.code === "HISTORY_INVALID");
 });
 
 test("rejectsPendingBaseReceiptAsACommittedSnapshot", async () => {
@@ -167,7 +167,7 @@ test("rejectsPendingBaseReceiptAsACommittedSnapshot", async () => {
     ]), scenario.baseAnchor.signingPrivateKey),
   };
 
-  await assert.rejects(h.verifyRecoveryHistoryV2(input), (error) => error.code === "HISTORY_INVALID");
+  await assert.rejects(h.verifyTrustedDeviceRecoveryHistoryV2(input), (error) => error.code === "HISTORY_INVALID");
 });
 
 test("packageRecoveryRequiresThePrivateKeyToVerifyNewRecoveryWraps", async () => {
@@ -265,14 +265,14 @@ test("requiresEveryHistoricalEpochKeyForRecoveryCoverage", async () => {
   input.epochKeys = [];
 
   await assert.rejects(
-    h.verifyRecoveryHistoryV2(input),
+    h.verifyTrustedDeviceRecoveryHistoryV2(input),
     (error) => error instanceof z.RootarkZkError && error.code === "KEY_COVERAGE_INCOMPLETE",
   );
 });
 
 test("rejectsAnEpochKeyAppendedToAHistoryVerifierResult", async () => {
   const scenario = await createHistory();
-  const result = await h.verifyRecoveryHistoryV2(await historyInput(scenario));
+  const result = await h.verifyTrustedDeviceRecoveryHistoryV2(await historyInput(scenario));
   result.epochKeys.push({ epoch: 99, key: Buffer.alloc(32, 0x99) });
   assert.equal(await h.isVerifiedRecoveryHistoryV2(result), false);
 });
@@ -280,7 +280,7 @@ test("rejectsAnEpochKeyAppendedToAHistoryVerifierResult", async () => {
 test("rejectsMissingReorderedDuplicateAlteredAndTruncatedTransitions", async () => {
   const scenario = await createHistory();
   const valid = await historyInput(scenario);
-  const failHistory = async (entries) => h.verifyRecoveryHistoryV2({ ...valid, transitions: entries });
+  const failHistory = async (entries) => h.verifyTrustedDeviceRecoveryHistoryV2({ ...valid, transitions: entries });
 
   await assert.rejects(failHistory(valid.transitions.slice(1)), (error) => error.code === "HISTORY_INVALID");
   await assert.rejects(failHistory([...valid.transitions].reverse()), (error) => error.code === "HISTORY_INVALID");
@@ -318,7 +318,7 @@ test("rejectsOperationIdentifierReuseEvenWhenTheAttackerResigns", async () => {
     delete core.actor_signature;
     return core;
   })(), epochKey, actor));
-  await assert.rejects(h.verifyRecoveryHistoryV2(valid), (error) => error.code === "HISTORY_INVALID");
+  await assert.rejects(h.verifyTrustedDeviceRecoveryHistoryV2(valid), (error) => error.code === "HISTORY_INVALID");
 });
 
 test("rejectsAValidButDifferentEnvelopeUnderTheSamePackageId", async () => {
@@ -332,12 +332,12 @@ test("rejectsAValidButDifferentEnvelopeUnderTheSamePackageId", async () => {
   const input = await historyInput(scenario);
   input.packageEnvelopeBytes = changed.envelopeBytes;
   input.packageEnvelopes = [{ activationRevision: scenario.transitions[0].revision, envelopeBytes: changed.envelopeBytes }];
-  await assert.rejects(h.verifyRecoveryHistoryV2(input), (error) => error.code === "INVALID_RECOVERY_PACKAGE");
+  await assert.rejects(h.verifyTrustedDeviceRecoveryHistoryV2(input), (error) => error.code === "INVALID_RECOVERY_PACKAGE");
 });
 
 test("marksTheOriginalRecoveryPackageRevokedAfterSignedReplacement", async () => {
   const scenario = await createHistory({ replacePackage: true });
-  const result = await h.verifyRecoveryHistoryV2(await historyInput(scenario));
+  const result = await h.verifyTrustedDeviceRecoveryHistoryV2(await historyInput(scenario));
   assert.equal(result.packageAuthorityStatus, "revoked");
   assert.equal(Buffer.from(result.headManifest.recovery_authority.package_id)
     .equals(Buffer.from(scenario.firstPackage.envelope.package_id)), false);
@@ -448,4 +448,14 @@ test("packageRecoveryRejectsFutureEpochKeysSuppliedInsteadOfOpeningWraps", async
     h.verifyRecoveryPackageHistoryV2(input),
     (error) => error instanceof z.RootarkZkError && error.code === "KEY_COVERAGE_INCOMPLETE",
   );
+});
+
+test("legacyHistoryEntryPointRetainsPackageWrapVerification", async () => {
+  const scenario = await createHistory();
+  const input = await packageHistoryInput(scenario);
+  input.epochKeys = scenario.state.epochKeys.filter((entry) => entry.epoch <= scenario.baseManifest.current_epoch);
+
+  const result = await h.verifyRecoveryHistoryV2(input);
+  assert.equal(result.verificationMode, "recovery-package");
+  assert.equal(result.packageRecoverabilityVerified, true);
 });
