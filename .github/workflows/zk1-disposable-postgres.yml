@@ -1,0 +1,66 @@
+name: ZK-1 Disposable PostgreSQL
+
+# No production database, provider credentials, or privileged GitHub tokens.
+# These suites create their own randomly labeled loopback-only PostgreSQL
+# containers and verify removal of each exact container AND anonymous volume.
+on:
+  pull_request:
+    branches:
+      - Root/main
+    paths:
+      - '.github/workflows/zk1-disposable-postgres.yml'
+      - 'db/zk1-gate-authority.sql'
+      - 'lab/issue-65-packet-b/**'
+      - 'src/services/zk1*'
+      - 'src/crypto/rootark-zk-*'
+      - 'test/issue-65-*'
+      - 'test/support/issue-65-*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zk1-disposable-postgres-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  disposable-pg18:
+    name: Node 22 - real disposable PostgreSQL 18 gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact PR HEAD
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Pull explicitly versioned disposable database image
+        run: docker pull postgres:18.6-alpine3.24
+
+      - name: Verify disposable cleanup boundary
+        run: node --test test/issue-65-disposable-pg-cleanup.test.js
+
+      - name: Validate cross-process GateAuthority and STOP proof
+        run: node lab/issue-65-packet-b/run-shared-gate-postgres.js
+
+      - name: Validate physical mTLS PUT and child-process STOP
+        run: node lab/issue-65-packet-b/run-supervised-mtls-bound-writer.js
+
+      - name: Validate physical GET/egress after quiescence
+        run: node lab/issue-65-packet-b/run-supervised-get-egress.js
+
+      - name: Validate signed approval and nonce replay ledger
+        run: node lab/issue-65-packet-b/run-approval-replay-postgres.js
+
+      - name: Verify checkout was not modified by disposable suites
+        run: git diff --exit-code && test -z "$(git status --porcelain)"
