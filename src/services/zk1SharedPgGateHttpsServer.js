@@ -130,6 +130,16 @@ function createZk1SharedPgGateHttpsServer({ key, cert, clientCa, gate,
       const body = await readJson(req, req.url === "/v1/chunk/put" ? 6 * 1024 * 1024 : 2048);
       const scope = normalizedScope(body.scope);
       if (!grant.scopes.has(scopeKey(scope))) return sendJson(res, 403, { error: "FORBIDDEN" });
+      // Even with an operator-prepared ChildProcess, mTLS handler bytes and
+      // PostgreSQL operations execute in THIS server, outside that process.
+      // A STOP for the child therefore cannot authorize remote strict IO.
+      // SQL's immutable require_stop_proof policy is independently consulted
+      // for every data-plane request (fail-closed when PG is unavailable).
+      if (["/v1/admission/start", "/v1/admission/finish",
+        "/v1/chunk/put", "/v1/chunk/seal"].includes(req.url)) {
+        if (typeof gate.requiresTrustedLocalStop !== "function") reject("ZK_GATE_UNAVAILABLE");
+        if (await gate.requiresTrustedLocalStop(scope)) reject("ZK_GATE_STRICT_IO_UNBOUND");
+      }
       if (req.url === "/v1/admission/start") {
         const io = authorizeWorker(body, scope, principal);
         // There is no safe ciphertext GET/EGRESS adapter yet. Do not issue a

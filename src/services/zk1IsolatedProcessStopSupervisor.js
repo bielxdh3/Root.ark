@@ -87,7 +87,8 @@ class Zk1IsolatedProcessStopSupervisor {
   bindAdmission({ processEpoch, admissionId, generation, scope,
     workerId, principal, processPid } = {}) {
     const session = this.sessions.get(bytes(processEpoch, 16).toString("hex"));
-    if (!session || session.bound || session.closed || session.aborted) deny();
+    if (!session || session.bound || session.exited || session.closed || session.aborted
+      || session.child.exitCode !== null || session.child.signalCode !== null) deny();
     const candidateScope = scopeOf(scope);
     if (scopeKey(candidateScope) !== scopeKey(session.scope)
       || !crypto.timingSafeEqual(bytes(workerId, 16), session.workerId)
@@ -96,6 +97,13 @@ class Zk1IsolatedProcessStopSupervisor {
     session.admissionId = bytes(admissionId, 16);
     session.generation = generation;
     session.bound = true;
+  }
+
+  assertLive({ processEpoch } = {}) {
+    const session = this.sessions.get(bytes(processEpoch, 16).toString("hex"));
+    if (!session || session.exited || session.closed || session.aborted
+      || session.child.exitCode !== null || session.child.signalCode !== null) deny();
+    return true;
   }
 
   async stop({ processEpoch } = {}) {

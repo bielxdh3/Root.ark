@@ -160,4 +160,5 @@ async function createZk1PhysicalStopRecorder({ pool, trustedHostKeyId,
     trustedHostPublicKey, nowSeconds });
 }
 
-module.exports = { verifyZk1StopRuntimePool, createZk1PhysicalStopRecorder };
+module.exports = { verifyZk1StopRuntimePool, createZk1PhysicalStopRecorder,
+  Zk1SharedPgPhysicalStopRecorder };

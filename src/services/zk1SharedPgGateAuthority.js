@@ -157,6 +157,18 @@ class Zk1SharedPgGateAuthority {
     return head;
   }
 
+  // Immutable, operator-provisioned scope policy. HTTPS must never treat a
+  // local supervisor child as the remote HTTP/PG data-plane executor.
+  async requiresTrustedLocalStop(scope) {
+    const s = scopeOf(scope);
+    try {
+      const { rows, rowCount } = await this.pool.query(`SELECT keyring_id,require_stop_proof
+        FROM zk1_gate.head WHERE scope_key=$1`, [s.key]);
+      if (rowCount !== 1 || !headMatches(rows[0], s)) deny();
+      return rows[0].require_stop_proof === true;
+    } catch (_) { deny("ZK_GATE_UNAVAILABLE"); }
+  }
+
   async beginIoAdmission(input) {
     const io = worker(input);
     return this.transaction(async (c) => {

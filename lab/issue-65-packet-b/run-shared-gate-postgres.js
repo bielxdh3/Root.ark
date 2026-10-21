@@ -88,6 +88,7 @@ async function main() {
     "test/issue-65-shared-pg-sealed-object.test.js",
     "test/issue-65-pg-sealed-sink.test.js",
     "test/issue-65-stop-recorder-postgres.test.js",
+    "test/issue-65-strict-stop-operator-postgres.test.js",
     "test/issue-65-shared-gate-real-witness.test.js"],
   { env: { ...process.env, ROOTARK_ZK1_TEST_PG_URL: uri,
     ROOTARK_ZK1_RUNTIME_PG_URL: runtimeUri,

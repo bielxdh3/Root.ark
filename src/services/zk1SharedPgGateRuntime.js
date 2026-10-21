@@ -7,6 +7,7 @@
 const { Zk1SharedPgGateAuthority } = require("./zk1SharedPgGateAuthority");
 const { createZk1SharedPgGateHttpsServer } = require("./zk1SharedPgGateHttpsServer");
 const { Zk1SharedPgSealedObjectStore } = require("./zk1SharedPgSealedObjectStore");
+const { Zk1SharedPgStrictStopOperator } = require("./zk1SharedPgStrictStopOperator");
 
 function refuse() {
   const error = new Error("ZK_GATE_RUNTIME_IDENTITY_INVALID");
@@ -45,15 +46,25 @@ async function verifyZk1SharedPgRuntimePool(pool) {
 }
 
 async function createIsolatedZk1SharedPgGateServer({ pool, key, cert, clientCa,
-  principals, enableSealing = false, stopPinned } = {}) {
+  principals, enableSealing = false, stopPinned, stopSupervisor, stopRecorder } = {}) {
   // No listener/socket exists until the live PostgreSQL login and permissions
   // have been reconciled from the same pool used by gate transactions.
   await verifyZk1SharedPgRuntimePool(pool);
   if (typeof enableSealing !== "boolean") refuse();
-  return createZk1SharedPgGateHttpsServer({ key, cert, clientCa,
-    gate: new Zk1SharedPgGateAuthority({ pool, stopPinned }),
+  if ((stopSupervisor === undefined) !== (stopRecorder === undefined)) refuse();
+  const gate = new Zk1SharedPgGateAuthority({ pool, stopPinned });
+  const strictStopOperator = stopSupervisor === undefined ? null
+    : new Zk1SharedPgStrictStopOperator({ gate,
+      supervisor: stopSupervisor, recorder: stopRecorder });
+  const server = createZk1SharedPgGateHttpsServer({ key, cert, clientCa,
+    gate,
     sealedStore: enableSealing ? new Zk1SharedPgSealedObjectStore({ pool }) : null,
     principals });
+  // Exposed only to local operator code with access to this JS server object;
+  // this is not an HTTP endpoint or grant for strict remote workers.
+  if (strictStopOperator) Object.defineProperty(server, "strictStopOperator", {
+    value: strictStopOperator, enumerable: false, writable: false });
+  return server;
 }
 
 module.exports = { verifyZk1SharedPgRuntimePool,
