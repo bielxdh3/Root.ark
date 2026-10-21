@@ -171,18 +171,56 @@ test("real mTLS CAS endpoint handles signed v2 commit, rejects alien scope, and 
     "manifest history bytes must be available for independent signed-chain verification");
   const originalForPages = cas.getCommittedHistoryPage.bind(cas);
   try {
-    cas.getCommittedHistoryPage = async ({ startRevision }) => ({
-      headRevision: 3,
-      headDigest: await v2.recoveryManifestDigestV2(manifest),
-      startRevision,
-      nextRevision: startRevision < 3 ? startRevision + 1 : null,
-      entries: [raw],
-    });
-    const downloaded = await manifestClient.getCommittedHistory({ scope: readScope });
+    const changingScope = Object.fromEntries(Object.entries(readScope)
+      .map(([key, value]) => [key, Buffer.from(value)]));
+    let pageRequests = 0;
+    cas.getCommittedHistoryPage = async ({ startRevision }) => {
+      pageRequests += 1;
+      if (pageRequests === 1) {
+        // Deliberately mutate the caller's input after the first authorized
+        // HTTP request is in flight but before page 2 can be dispatched.
+        changingScope.account_id.fill(0x11);
+        changingScope.compartment_id.fill(0x22);
+        changingScope.keyring_id.fill(0x33);
+      }
+      return {
+        headRevision: 3,
+        headDigest: await v2.recoveryManifestDigestV2(manifest),
+        startRevision,
+        nextRevision: startRevision < 3 ? startRevision + 1 : null,
+        entries: [raw],
+      };
+    };
+    const downloaded = await manifestClient.getCommittedHistory({ scope: changingScope });
     assert.equal(downloaded.headRevision, 3);
+    assert.equal(pageRequests, 3, "every page must use the original, pinned scope");
     assert.equal(downloaded.entries.length, 3,
       "a client may not silently interpret the first response as the complete signed history");
     assert.deepEqual(downloaded.entries, [raw, raw, raw]);
+    // Exercise a real >8 MiB transfer spread across two HTTP/TLS pages,
+    // not just three tiny manifests. The bytes are deliberately synthetic
+    // and untrusted; no signature/recovery authorization is implied.
+    const largeFirst = Buffer.alloc(5 * 1024 * 1024, 0x41);
+    const largeSecond = Buffer.alloc(4 * 1024 * 1024, 0x42);
+    cas.getCommittedHistoryPage = async ({ startRevision }) => ({
+      headRevision: 2,
+      headDigest: await v2.recoveryManifestDigestV2(manifest),
+      startRevision, nextRevision: startRevision === 1 ? 2 : null,
+      entries: [startRevision === 1 ? largeFirst : largeSecond],
+    });
+    const largePageChain = await manifestClient.getCommittedHistory({ scope: readScope });
+    assert.equal(largePageChain.entries.length, 2);
+    assert.deepEqual(largePageChain.entries[0], largeFirst);
+    assert.deepEqual(largePageChain.entries[1], largeSecond);
+    cas.getCommittedHistoryPage = async ({ startRevision }) => ({
+      headRevision: 1,
+      headDigest: await v2.recoveryManifestDigestV2(manifest),
+      startRevision, nextRevision: null,
+      entries: [Buffer.alloc(8 * 1024 * 1024 + 1)],
+    });
+    await assert.rejects(manifestClient.getCommittedHistory({ scope: readScope }),
+      /CAS_MANIFEST_TRANSPORT_UNAVAILABLE/,
+      "a trusted mTLS peer still cannot exceed the 8 MiB raw page limit");
     let pages = 0;
     cas.getCommittedHistoryPage = async ({ startRevision }) => {
       pages += 1;

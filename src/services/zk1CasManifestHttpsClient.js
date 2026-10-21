@@ -147,13 +147,22 @@ function createZk1CasManifestHttpsClient({
       // Transport convenience only: pages are still UNTRUSTED signed bytes.
       // A separate public-chain verifier and fresh witness must authenticate
       // the full chain before any dependent admission.
+      // All page requests MUST address exactly the same owner-selected scope.
+      // Snapshot caller-owned arrays before the first await so concurrent
+      // mutation cannot redirect later pages to a different keyring.
+      exact(scope, ["account_id", "compartment_id", "keyring_id"]);
+      const pinnedScope = {
+        account_id: Buffer.from(bytes(scope.account_id, 16), "base64url"),
+        compartment_id: Buffer.from(bytes(scope.compartment_id, 1, 128), "base64url"),
+        keyring_id: Buffer.from(bytes(scope.keyring_id, 16), "base64url"),
+      };
       let startRevision = 1;
       let headRevision;
       let headDigest;
       const entries = [];
       let total = 0;
       for (let pageCount = 0; pageCount <= 4096; pageCount += 1) {
-        const page = await fetchResource(scope, startRevision);
+        const page = await fetchResource(pinnedScope, startRevision);
         if (pageCount === 0) {
           headRevision = page.headRevision;
           headDigest = Buffer.from(page.headDigest);
