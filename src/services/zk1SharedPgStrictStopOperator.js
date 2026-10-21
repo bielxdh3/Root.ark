@@ -62,11 +62,15 @@ class Zk1SharedPgStrictStopOperator {
     if (!(gate instanceof Zk1SharedPgGateAuthority)
       || !(supervisor instanceof Zk1IsolatedProcessStopSupervisor)
       || !isVerifiedZk1PhysicalStopRecorder(recorder)
-      || !gate.stopPinned || !gate.stopPinned.hostKeyId.equals(supervisor.hostKeyId)
+      || !(gate.stopPinned
+        ? gate.stopPinned.hostKeyId.equals(supervisor.hostKeyId)
+        : gate.allowsActivePinnedStopHost(supervisor.hostKeyId,
+          crypto.createPublicKey(supervisor.hostPrivateKey)))
       || !recorder.hostKeyId.equals(supervisor.hostKeyId)
-      || !pinnedPublicEquals(gate.stopPinned.hostPublicKey,
-        crypto.createPublicKey(supervisor.hostPrivateKey))
-      || !pinnedPublicEquals(recorder.hostPublicKey, gate.stopPinned.hostPublicKey)) deny();
+      || (gate.stopPinned && !pinnedPublicEquals(gate.stopPinned.hostPublicKey,
+        crypto.createPublicKey(supervisor.hostPrivateKey)))
+      || !pinnedPublicEquals(recorder.hostPublicKey,
+        crypto.createPublicKey(supervisor.hostPrivateKey))) deny();
     this.gate = gate;
     this.supervisor = supervisor;
     this.recorder = recorder;

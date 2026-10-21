@@ -55,13 +55,14 @@ async function verifyZk1SharedPgRuntimePool(pool) {
 }
 
 async function createIsolatedZk1SharedPgGateServer({ pool, key, cert, clientCa,
-  principals, enableSealing = false, stopPinned, stopSupervisor, stopRecorder } = {}) {
+  principals, enableSealing = false, stopPinned, stopHostPolicy,
+  stopSupervisor, stopRecorder } = {}) {
   // No listener/socket exists until the live PostgreSQL login and permissions
   // have been reconciled from the same pool used by gate transactions.
   await verifyZk1SharedPgRuntimePool(pool);
   if (typeof enableSealing !== "boolean") refuse();
   if ((stopSupervisor === undefined) !== (stopRecorder === undefined)) refuse();
-  const gate = new Zk1SharedPgGateAuthority({ pool, stopPinned });
+  const gate = new Zk1SharedPgGateAuthority({ pool, stopPinned, stopHostPolicy });
   const strictStopOperator = stopSupervisor === undefined ? null
     : new Zk1SharedPgStrictStopOperator({ gate,
       supervisor: stopSupervisor, recorder: stopRecorder });

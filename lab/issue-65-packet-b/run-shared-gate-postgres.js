@@ -114,7 +114,9 @@ async function main() {
     "-U", "postgres", "-d", "gatefixture"], { input: provisionWriter });
   const writerUri = "postgresql://" + writerRoleName + ":" + writerRolePassword
     + "@127.0.0.1:" + match[1] + "/gatefixture";
-  run("node", ["--test", "--test-reporter=spec",
+  // Use the Node executable that launched this runner (Node 22 is required
+  // for the release reference), not a different node.exe found on PATH.
+  run(process.execPath, ["--test", "--test-reporter=spec",
     "test/issue-65-shared-gate-postgres.test.js",
     "test/issue-65-gate-runtime-role.test.js",
     "test/issue-65-gate-stop-hidden-role.test.js",
@@ -124,6 +126,7 @@ async function main() {
     "test/issue-65-browser-pg-ciphertext-seal-interop.test.js",
     "test/issue-65-pg-sealed-sink.test.js",
     "test/issue-65-stop-recorder-postgres.test.js",
+    "test/issue-65-multi-host-pinned-stop-postgres.test.js",
     "test/issue-65-strict-stop-operator-postgres.test.js",
     "test/issue-65-supervised-pg-writer-lab.test.js",
     "test/issue-65-shared-gate-real-witness.test.js"],

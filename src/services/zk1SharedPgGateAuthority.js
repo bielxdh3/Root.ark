@@ -10,6 +10,11 @@ const crypto = require("node:crypto");
 const { verifyZk1PhysicalStopProof } =
   require("../crypto/rootark-zk-physical-stop-proof-v1");
 
+// Only the local operator invokes this factory. The returned token carries no
+// mutable host/key/scope records; their deep snapshots live in this closure.
+// The token must never be accepted from HTTP, a manifest, or an IPC worker.
+const pinnedStopPolicySnapshots = new WeakMap();
+
 function deny(code = "ZK_GATE_DENIED") {
   const error = new Error(code);
   error.code = code;
@@ -40,6 +45,39 @@ function scopeOf(scope) {
 }
 function headMatches(row, expected) {
   return row && row.keyring_id.equals(expected.keyringId);
+}
+function hostPublicKeyDer(key) {
+  if (!(key instanceof crypto.KeyObject) || key.type !== "public"
+    || key.asymmetricKeyType !== "ed25519") deny("ZK_GATE_CONFIG_INVALID");
+  return Buffer.from(key.export({ type: "spki", format: "der" })).toString("base64");
+}
+function createZk1OperatorPinnedStopHostPolicy(config) {
+  exact(config, ["hosts"]);
+  if (!Array.isArray(config.hosts) || config.hosts.length < 2
+    || config.hosts.length > 128) deny("ZK_GATE_CONFIG_INVALID");
+  const ids = new Set();
+  const keys = new Set();
+  const hosts = config.hosts.map((entry) => {
+    exact(entry, ["hostKeyId", "hostPublicKey", "scopes", "status"]);
+    const id = bytes(entry.hostKeyId, 16).toString("hex");
+    const keyDer = hostPublicKeyDer(entry.hostPublicKey);
+    if (ids.has(id) || keys.has(keyDer)
+      || !["active", "verify-only", "revoked"].includes(entry.status)
+      || !Array.isArray(entry.scopes) || entry.scopes.length < 1
+      || entry.scopes.length > 1024) deny("ZK_GATE_CONFIG_INVALID");
+    ids.add(id);
+    keys.add(keyDer);
+    const allowed = entry.scopes.map((scope) => {
+      const s = scopeOf(scope);
+      return s.key + ":" + s.keyringId.toString("hex");
+    });
+    if (new Set(allowed).size !== allowed.length) deny("ZK_GATE_CONFIG_INVALID");
+    return Object.freeze({ id, keyDer, status: entry.status,
+      allowed: Object.freeze(allowed) });
+  });
+  const token = Object.freeze(Object.create(null));
+  pinnedStopPolicySnapshots.set(token, Object.freeze(hosts));
+  return token;
 }
 function positive(n) {
   if (!Number.isSafeInteger(n) || n < 1) deny();
@@ -79,9 +117,16 @@ function matchAdmission(record, input, requireProcess = false) {
 }
 
 class Zk1SharedPgGateAuthority {
-  constructor({ pool, stopPinned } = {}) {
+  #stopHostPolicy;
+  constructor({ pool, stopPinned, stopHostPolicy } = {}) {
     if (!pool || typeof pool.connect !== "function") deny("ZK_GATE_CONFIG_INVALID");
     this.pool = pool;
+    if (stopHostPolicy !== undefined) {
+      if (stopPinned !== undefined || !pinnedStopPolicySnapshots.has(stopHostPolicy)) {
+        deny("ZK_GATE_CONFIG_INVALID");
+      }
+      this.#stopHostPolicy = pinnedStopPolicySnapshots.get(stopHostPolicy);
+    }
     if (stopPinned !== undefined) {
       exact(stopPinned, ["hostKeyId", "hostPublicKey"]);
       if (!(stopPinned.hostPublicKey instanceof crypto.KeyObject)
@@ -93,6 +138,27 @@ class Zk1SharedPgGateAuthority {
       });
     }
   }
+  #policyHost(hostKeyId, scope, allowVerifyOnly = false) {
+    if (!this.#stopHostPolicy || !hostKeyId) return null;
+    const id = bytes(hostKeyId, 16).toString("hex");
+    const host = this.#stopHostPolicy.find((item) => item.id === id);
+    if (!host || (host.status !== "active"
+      && !(allowVerifyOnly && host.status === "verify-only"))) return null;
+    if (scope) {
+      const s = scopeOf(scope);
+      if (!host.allowed.includes(s.key + ":" + s.keyringId.toString("hex"))) return null;
+    }
+    return host;
+  }
+  // Read-only eligibility check for trusted local supervisor/recorder wiring.
+  // Scope admission is enforced separately under the authoritative head lock.
+  allowsActivePinnedStopHost(hostKeyId, hostPublicKey) {
+    if (!this.#stopHostPolicy) return false;
+    try {
+      const entry = this.#policyHost(hostKeyId);
+      return Boolean(entry && entry.keyDer === hostPublicKeyDer(hostPublicKey));
+    } catch (_) { return false; }
+  }
 
   async #verifyPhysicalStop(c, admission, scope) {
     // PostgreSQL cannot verify Ed25519 with its built-in SQL functions.
@@ -101,10 +167,13 @@ class Zk1SharedPgGateAuthority {
     // independent host's actual signature in the trusted gate process as
     // defense in depth; the DB trigger still independently rejects gate-only
     // FINISHED attempts without a durable STOP record.
-    if (!this.stopPinned || !admission?.host_key_id
+    if ((!this.stopPinned && !this.#stopHostPolicy) || !admission?.host_key_id
       || !admission?.process_epoch || !Number.isSafeInteger(Number(admission.process_pid))) {
       deny("ZK_GATE_STOP_PROOF_INVALID");
     }
+    const trusted = this.#stopHostPolicy
+      ? this.#policyHost(admission.host_key_id, scope, true) : null;
+    if (this.#stopHostPolicy && !trusted) deny("ZK_GATE_STOP_PROOF_INVALID");
     const result = await c.query(`SELECT signed_proof,proof_digest,stopped_at
       FROM zk1_gate.physical_stop_receipt WHERE admission_id=$1`, [admission.id]);
     const receipt = result.rows[0];
@@ -116,8 +185,10 @@ class Zk1SharedPgGateAuthority {
       // strand a valid worker after restart or a delayed ACK.
       const verified = await verifyZk1PhysicalStopProof({
         signedProof: receipt.signed_proof,
-        hostKeyId: this.stopPinned.hostKeyId,
-        hostPublicKey: this.stopPinned.hostPublicKey,
+        hostKeyId: trusted ? Buffer.from(trusted.id, "hex") : this.stopPinned.hostKeyId,
+        hostPublicKey: trusted ? crypto.createPublicKey({
+          key: Buffer.from(trusted.keyDer, "base64"), format: "der", type: "spki",
+        }) : this.stopPinned.hostPublicKey,
         expected: { scope, admissionId: admission.id, workerId: admission.worker_id,
           generation: Number(admission.generation), principal: admission.principal,
           processEpoch: admission.process_epoch, processPid: Number(admission.process_pid) },
@@ -174,6 +245,8 @@ class Zk1SharedPgGateAuthority {
     return this.transaction(async (c) => {
       const head = await this.lockedHead(c, io);
       if (head.require_stop_proof !== Boolean(io.hostKeyId)) deny();
+      if (head.require_stop_proof && this.#stopHostPolicy
+        && !this.#policyHost(io.hostKeyId, input.scope)) deny();
       const found = await c.query(
         "SELECT * FROM zk1_gate.admission WHERE scope_key=$1 AND worker_id=$2",
         [io.key, io.workerId]);
@@ -318,4 +391,4 @@ class Zk1SharedPgGateAuthority {
   }
 }
 
-module.exports = { Zk1SharedPgGateAuthority };
+module.exports = { Zk1SharedPgGateAuthority, createZk1OperatorPinnedStopHostPolicy };
