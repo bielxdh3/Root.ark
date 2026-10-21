@@ -288,9 +288,13 @@ CREATE TABLE IF NOT EXISTS zk1_gate.sealed_object (
 -- A trusted worker may still possess an ACTIVE admission after sealing.
 -- Physically forbid *all* later chunk INSERTs for that object, including
 -- direct SQL by the restricted gate role. Lock the same authoritative head
--- to serialize against seal() and gate quiescence across connections.
+-- to serialize against seal() and gate quiescence across connections. The
+-- physical fence also requires OPEN + a matching current-generation ACTIVE
+-- PUT admission; an unsealed object must not be a way around quiescence.
 CREATE OR REPLACE FUNCTION zk1_gate.reject_chunk_after_seal()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+DECLARE
+  current_head record;
 BEGIN
   -- A transaction that pinned a REPEATABLE READ/SERIALIZABLE MVCC snapshot
   -- *before* seal could otherwise acquire the head row lock *after* seal,
@@ -301,10 +305,28 @@ BEGIN
     RAISE EXCEPTION 'ciphertext chunk insertion requires READ COMMITTED isolation'
       USING ERRCODE='23514';
   END IF;
-  PERFORM 1 FROM zk1_gate.head WHERE scope_key=NEW.scope_key FOR UPDATE;
+  SELECT revision,digest,generation INTO current_head FROM zk1_gate.head
+    WHERE scope_key=NEW.scope_key AND phase='OPEN' FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'ciphertext chunk insertion requires current OPEN gate'
+      USING ERRCODE='23514';
+  END IF;
+  IF NEW.chunk_index > 4095 THEN
+    RAISE EXCEPTION 'ciphertext chunk index exceeds the committed format limit'
+      USING ERRCODE='23514';
+  END IF;
   IF EXISTS (SELECT 1 FROM zk1_gate.sealed_object
              WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id) THEN
     RAISE EXCEPTION 'sealed ciphertext object is immutable'
+      USING ERRCODE='23514';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM zk1_gate.admission
+                 WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id
+                   AND action='put' AND state='ACTIVE'
+                   AND revision=current_head.revision
+                   AND digest=current_head.digest
+                   AND generation=current_head.generation) THEN
+    RAISE EXCEPTION 'ciphertext chunk insertion requires active admission'
       USING ERRCODE='23514';
   END IF;
   RETURN NEW;
