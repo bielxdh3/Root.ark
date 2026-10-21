@@ -219,9 +219,17 @@ function recoverInterruptedInitialJournalLink(file, plan) {
   const escaped = path.basename(file).replaceAll(".", "\\.");
   const pattern = new RegExp("^\\." + escaped + "\\.[a-f0-9]{24}\\.tmp$");
   let found;
-  try { found = fs.readdirSync(dir, { withFileTypes: true }).filter((entry) => pattern.test(entry.name)); }
-  catch (_) { refuse(); }
-  if (found.length !== 1 || !found[0].isFile() || found[0].isSymbolicLink()) refuse();
+  try {
+    found = fs.readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => pattern.test(entry.name));
+    // An earlier crash before link() may leave another one-link .tmp with a
+    // similarly shaped filename. It is inert, not the published inode, and
+    // must not be removed or prevent recovery of this genuine two-link pair.
+    if (found.some((entry) => !entry.isFile() || entry.isSymbolicLink())) refuse();
+    found = found.filter((entry) =>
+      sameFile(published, fs.lstatSync(path.join(dir, entry.name))));
+  } catch (_) { refuse(); }
+  if (found.length !== 1) refuse();
   const temp = path.join(dir, found[0].name);
   const original = parseJournal(file, 2);
   if (original.phase !== "planned" || JSON.stringify(original.plan) !== JSON.stringify(plan)) refuse();

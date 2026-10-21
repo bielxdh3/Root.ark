@@ -50,4 +50,19 @@ GREEN: **17/17 PASS, 0 FAIL** with the exact recovery and hostile-hardlink
 regressions. This is still limited to trusted, non-concurrent disposable
 fixtures and does not guarantee Windows power-loss durability.
 
+Follow-up: two independent process deaths can leave a **different one-link
+temporary orphan** from a failed pre-link publication alongside the valid
+two-link journal/temp pair from a later post-link crash. The retry now
+selects the one temporary filename with the expected pattern **and matching
+journal inode**, while leaving unrelated orphan files untouched. The
+repeated-crash regression was RED (17 pass, 1 fail) before this correction.
+GREEN is **18/18 PASS** on Windows and on WSL Node 22.22.1, including a
+verified surviving unrelated orphan and the original synthetic source.
+The inode/name check only identifies a *structurally matching* link: it is
+**not an origin proof** against a privileged or malicious filesystem writer
+who fabricates an exact matching-pattern hardlink. Such an actor is explicitly
+outside this trusted, non-concurrent fixture boundary, and a release-quality
+journal would need an independently provisioned authority and stronger
+mutation isolation. Do not use this recovery helper on real user data.
+
 **Production blockers:** owner-authorized and client-decrypt-verified migration, independently trusted source and destination provider roles/freshness, signed object/manifest revisions, authoritative versions/backup/trash/links/derived/sync/WebDAV inventory, cross-provider transactional fencing/reconciliation, retention/erasure policy and validated real-provider recovery. Until those exist, every outcome here means **LOCAL fixture experiment only**, never `canMigrate:true`, release readiness or a ZK cutover.
