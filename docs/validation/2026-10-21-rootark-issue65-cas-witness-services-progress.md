@@ -199,6 +199,29 @@ and is **not** counted as a successful database-backed acceptance test.
   CAS transaction/anchor/witness-client files** after the latest fixes.
   This finding is not a full threat-model review or issue-level acceptance.
 
+### Local commit `aff7b3a`: latest admission gate evidence
+
+- Every discovered `test/issue-65-*.test.js` and Packet B mock lab:
+  **243 passed, 0 failed, 0 skipped**; exit 0. Log:
+  `rootark_issue65_admission_final_20261021.log` in the host temporary folder.
+- Independent bounded READ-ONLY review of the witness admission / mTLS / local
+  HTTP egress changes found **no confirmed P1/P2 in that scope**. A separate
+  certificate adversarial test refused a different mTLS principal's attempt
+  to finish a worker admission. The reviewer also verified START and FINISH
+  lost-ACK retries against the same durable admission identifiers. Unknown
+  ACTIVE admission reconciliation and unbounded historic completed rows remain
+  operational/liveness risks; no distributed protection is claimed.
+- PostgreSQL Packet B *disposable* Docker lab rerun on 2026-10-21 with the
+  locally cached official `postgres:18.6-alpine3.24` image: ten PostgreSQL
+  tests **PASS 10/10 on Windows Node**, and the same schema reinstalled into
+  the isolated lab database **PASS 10/10 on WSL Node**. Unsafe negative-control
+  SQL and corrected schema also exited 0. The runner verified the identities
+  and removed only its own labeled disposable container and volume. Log:
+  `rootark_issue65_pg_docker_lab_20261021.log` in the host temporary folder.
+  This supersedes the earlier statement that PostgreSQL was unprovisioned for
+  the previous `npm test` snapshot. The lab still does **not** establish
+  distributed linearizability, independent operators or physical I/O fencing.
+
 ## Conclusion
 
 **Partial implementation, issue #65 OPEN.** The signed protocol authorities
