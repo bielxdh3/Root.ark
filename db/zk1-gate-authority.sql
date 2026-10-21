@@ -35,6 +35,57 @@ CREATE TABLE IF NOT EXISTS zk1_gate.admission (
 );
 CREATE INDEX IF NOT EXISTS admission_unfinished
   ON zk1_gate.admission(scope_key,state);
+-- A restricted gate runtime is allowed to update ONLY phase/generation and
+-- reservation identity columns. Enforce one-way phase and monotonically
+-- increasing fencing generation in the DATABASE, not only in JavaScript.
+-- OPEN can be restored later ONLY by a separate independently verified CAS
+-- terminal-proof transition, which is intentionally NOT implemented yet.
+CREATE OR REPLACE FUNCTION zk1_gate.enforce_head_transition()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+BEGIN
+  IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'gate transition requires READ COMMITTED isolation'
+      USING ERRCODE='23514';
+  END IF;
+  IF NEW.scope_key IS DISTINCT FROM OLD.scope_key
+    OR NEW.keyring_id IS DISTINCT FROM OLD.keyring_id
+    OR NEW.revision IS DISTINCT FROM OLD.revision
+    OR NEW.digest IS DISTINCT FROM OLD.digest THEN
+    RAISE EXCEPTION 'gate head identity is immutable under runtime transition'
+      USING ERRCODE='23514';
+  END IF;
+  IF OLD.phase = 'OPEN' AND NEW.phase = 'QUIESCING'
+    AND NEW.generation = OLD.generation + 1
+    AND OLD.operation_id IS NULL AND OLD.reservation_id IS NULL
+    AND NEW.operation_id IS NOT NULL AND NEW.reservation_id IS NOT NULL THEN
+    RETURN NEW;
+  END IF;
+  IF OLD.phase = 'QUIESCING' AND NEW.phase = 'PENDING'
+    AND NEW.generation = OLD.generation
+    AND NEW.operation_id IS NOT DISTINCT FROM OLD.operation_id
+    AND NEW.reservation_id IS NOT DISTINCT FROM OLD.reservation_id THEN
+    IF EXISTS (SELECT 1 FROM zk1_gate.admission
+      WHERE scope_key=OLD.scope_key AND state <> 'FINISHED') THEN
+      RAISE EXCEPTION 'gate workers have not durably drained'
+        USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+  END IF;
+  RAISE EXCEPTION 'illegal non-monotonic gate transition'
+    USING ERRCODE='23514';
+END $$;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t
+    JOIN pg_catalog.pg_class AS c ON c.oid=t.tgrelid
+    JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+    WHERE n.nspname='zk1_gate' AND c.relname='head'
+      AND t.tgname='zk1_gate_enforce_head_transition' AND NOT t.tgisinternal) THEN
+    CREATE TRIGGER zk1_gate_enforce_head_transition
+      BEFORE UPDATE ON zk1_gate.head
+      FOR EACH ROW EXECUTE FUNCTION zk1_gate.enforce_head_transition();
+  END IF;
+END $$;
 -- This is a fully gated *physical PostgreSQL ciphertext provider*. Every
 -- SELECT/UPSERT is executed by the gate service inside the SAME transaction
 -- that holds head's FOR UPDATE lock and validates its generation.

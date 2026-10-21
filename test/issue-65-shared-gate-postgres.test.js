@@ -109,6 +109,45 @@ test("isolated GateAuthority PostgreSQL runtime role is non-login and denies raw
   }
 });
 
+test("restricted SQL runtime cannot reopen a quiesced or pending gate or skip workers", {
+  skip: !url || !process.env.ROOTARK_ZK1_RUNTIME_PG_URL
+    ? "requires isolated PG restricted runtime role" : false,
+}, async (t) => {
+  const admin = new Pool({ connectionString: url, max: 2, connectionTimeoutMillis: 3000 });
+  const restricted = new Pool({ connectionString: process.env.ROOTARK_ZK1_RUNTIME_PG_URL,
+    max: 2, connectionTimeoutMillis: 3000 });
+  t.after(async () => Promise.all([admin.end(), restricted.end()]));
+  const gate = new Zk1SharedPgGateAuthority({ pool: restricted });
+  const scope = randomScope();
+  const digest = crypto.randomBytes(32);
+  await admin.query("INSERT INTO zk1_gate.head(scope_key,keyring_id,revision,digest) VALUES($1,$2,1,$3)",
+    [key(scope), scope.keyring_id, digest]);
+  const io = context(scope, digest, "put", crypto.randomBytes(16).toString("base64url"));
+  const admitted = await gate.beginIoAdmission(io);
+  const op = { scope, operationId: crypto.randomBytes(16),
+    reservationId: crypto.randomBytes(16), revision: 1, digest };
+  assert.equal((await gate.beginQuiesce(op)).state, "QUIESCING");
+  await assert.rejects(restricted.query(`UPDATE zk1_gate.head SET phase='OPEN',
+    generation=1,operation_id=NULL,reservation_id=NULL WHERE scope_key=$1`,
+  [key(scope)]), /transition|generation|illegal|denied|immutable/i,
+  "a restricted operator may not reopen the old physical generation");
+  await assert.rejects(restricted.query(`UPDATE zk1_gate.head SET phase='PENDING'
+    WHERE scope_key=$1`, [key(scope)]), /drain|active|unfinished|transition|denied/i,
+  "a raw SQL UPDATE cannot bypass physical worker drain checks");
+  await gate.finishIoAdmission({ scope, admissionId: admitted.admissionId,
+    workerId: io.workerId, principal: io.principal });
+  assert.equal((await gate.markPending({ scope,
+    operationId: op.operationId, reservationId: op.reservationId })).status, "PENDING");
+  await assert.rejects(restricted.query(`UPDATE zk1_gate.head SET phase='OPEN',
+    generation=1,operation_id=NULL,reservation_id=NULL WHERE scope_key=$1`,
+  [key(scope)]), /transition|generation|illegal|denied|immutable/i,
+  "a raw SQL UPDATE must not release PENDING without CAS/witness terminal proof");
+  const after = await admin.query("SELECT phase,generation FROM zk1_gate.head WHERE scope_key=$1",
+    [key(scope)]);
+  assert.equal(after.rows[0].phase, "PENDING");
+  assert.equal(Number(after.rows[0].generation), 2);
+});
+
 test("shared PostgreSQL authority protects ciphertext chunk effect and closes all worker generations", {
   skip: !url && "requires isolated ROOTARK_ZK1_TEST_PG_URL",
 }, async (t) => {
