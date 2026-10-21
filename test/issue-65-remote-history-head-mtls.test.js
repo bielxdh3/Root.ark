@@ -22,6 +22,10 @@ const { createZk1WitnessHttpsClient } =
   require("../src/services/zk1WitnessHttpsClient");
 const { inspectZk1ExperimentalRemoteSignedHistory } =
   require("../src/services/zk1ExperimentalRemoteSignedHistory");
+const { createZk1SignedHistoryCasProofProvider } =
+  require("../src/services/zk1SignedHistoryCasProofProvider");
+const { Zk1ProtectedObjectStore, contentAuthorizationMessageV1 } =
+  require("../src/services/zk1ProtectedObjectStore");
 
 const deny = /ZK_REMOTE_HISTORY_UNVERIFIED/;
 
@@ -237,4 +241,56 @@ test("pending live witness reservation, unpinned TLS peer and switched client sc
     deny, "witness PENDING cannot be mistaken for a committed matching historical HEAD");
   const reread = await f.casClient.getCommittedHistory({ scope: f.scope });
   assert.equal(reread.headRevision, 2, "real CAS remains rev2 until an authorized commit");
+});
+
+test("real CAS and witness mTLS history authorizes local encrypted PUT/GET only for signed active devices", async (t) => {
+  const f = await fixture(t);
+  const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-signed-io-"));
+  const genesisDigest = await v2.recoveryManifestDigestV2(f.state.baseManifest);
+  const proofProvider = createZk1SignedHistoryCasProofProvider({
+    casClient: f.casClient, trustedScope: f.scope,
+    trustedGenesisDigest: genesisDigest,
+    baseReceipt: f.state.baseReceipt, pinnedBaseWitness: f.state.pinnedWitness,
+    packageEnvelopes: [], nowSeconds: () => 1100,
+  });
+  const store = new Zk1ProtectedObjectStore(path.join(contentDir, "content.sqlite"), {
+    bootstrapNew: true, trustedScope: f.scope,
+    minimumHead: { revision: 1, witnessSequence: 1, digest: genesisDigest },
+    witnessProvider: f.witnessClient, witnessPinned: f.anchor.pinnedWitness,
+    manifestProvider: (scope) => f.casClient.getCommittedManifest({ scope }),
+    signedHistoryRequired: true, signedHistoryGenesisDigest: genesisDigest,
+    verifiedHistoryProvider: proofProvider, nowSeconds: () => 1100,
+  });
+  t.after(() => {
+    store.close();
+    fs.rmSync(contentDir, { recursive: true, force: true, maxRetries: 10 });
+  });
+  const objectId = crypto.randomBytes(16).toString("base64url");
+  const ciphertext = crypto.randomBytes(700);
+  const signed = async (deviceName, operation) => {
+    const manifest = f.state.headManifest;
+    const device = manifest.devices.find((item) => item.device_id === deviceName);
+    const authorization = {
+      ...f.scope, device_id: deviceName, operation, object_id: objectId,
+      expected_object_revision: null, manifest_revision: Number(manifest.revision),
+      manifest_digest: await v2.recoveryManifestDigestV2(manifest),
+      epoch: Number(manifest.current_epoch), nonce: crypto.randomBytes(32),
+      issued_at: 1099, expires_at: 1130,
+      ciphertext_digest: operation === "put"
+        ? crypto.createHash("sha256").update(ciphertext).digest() : null,
+    };
+    const key = f.state.actors.get(Buffer.from(device.authorization_key_id).toString("hex"));
+    return { scope: f.scope, authorization,
+      signature: crypto.sign(null, await contentAuthorizationMessageV1(authorization), key),
+      ...(operation === "put" ? { ciphertext } : {}) };
+  };
+  assert.equal((await store.put(await signed("trusted-0", "put"))).revision, 1);
+  assert.deepEqual((await store.get(await signed("trusted-1", "get"))).ciphertext, ciphertext);
+  const before = f.state.headManifest;
+  await fixtures.appendDeviceRevocation(f.state, "trusted-1");
+  await f.append(f.state.headManifest, before);
+  await assert.rejects(store.get(await signed("trusted-1", "get")),
+    /ZK_CONTENT_DENIED/,
+    "a formerly trusted device must not read after revocation is signed and committed");
+  assert.deepEqual((await store.get(await signed("trusted-0", "get"))).ciphertext, ciphertext);
 });

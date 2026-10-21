@@ -11,6 +11,7 @@ const path = require("node:path");
 const Database = require("better-sqlite3");
 const z = require("../crypto/rootark-zk-1");
 const manifestV2 = require("../crypto/rootark-zk-recovery-manifest-v2");
+const signedHistoryV2 = require("../crypto/rootark-zk-recovery-history-v2");
 const { inspectVerifiedWitnessFreshHeadV1 } = require("../crypto/rootark-zk-witness-head-wire-v1");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/protected-object-operation/v1\0", "ascii");
@@ -26,6 +27,7 @@ const MAX_NONCES = 100_000;
 // No automatic archival pruning before a separately reviewed backup policy.
 const MAX_VERSION_RECORDS = 4096;
 const MAX_VERSION_ARCHIVE_BYTES = 256 * 1024 * 1024;
+const MAX_CONCURRENT_SIGNED_HISTORY_CHECKS = 2;
 
 function fail(code = "ZK_CONTENT_DENIED") {
   const error = new Error(code);
@@ -127,7 +129,10 @@ function verifyStoreIdentity(db, expected) {
     || !equal(row.witness_key_id, expected.keyId)
     || !equal(row.witness_fingerprint, expected.fingerprint)
     || row.floor_revision !== expected.revision
-    || !equal(row.floor_digest, expected.digest)) {
+    || !equal(row.floor_digest, expected.digest)
+    || (expected.signedGenesisDigest === null
+      ? row.signed_genesis_digest != null
+      : !equal(row.signed_genesis_digest, expected.signedGenesisDigest))) {
     fail("ZK_CONTENT_IDENTITY_MISMATCH");
   }
 }
@@ -144,6 +149,8 @@ class Zk1ProtectedObjectStore {
   constructor(filename, { witnessProvider, witnessPinned, manifestProvider,
     trustedScope, minimumHead, bootstrapNew = false,
     admissionRequired = false,
+    signedHistoryRequired = false, signedHistoryGenesisDigest,
+    verifiedHistoryProvider,
     nowSeconds = () => Math.floor(Date.now() / 1000) } = {}) {
     if (typeof filename !== "string" || !filename || !witnessProvider
       || typeof witnessProvider.freshHead !== "function"
@@ -152,6 +159,9 @@ class Zk1ProtectedObjectStore {
       || witnessPinned.publicKey.type !== "public"
       || witnessPinned.publicKey.asymmetricKeyType !== "ed25519"
       || typeof admissionRequired !== "boolean"
+      || typeof signedHistoryRequired !== "boolean"
+      || (signedHistoryRequired && typeof verifiedHistoryProvider !== "function")
+      || (!signedHistoryRequired && verifiedHistoryProvider !== undefined)
       || (admissionRequired && (typeof witnessProvider.beginIoAdmission !== "function"
         || typeof witnessProvider.finishIoAdmission !== "function"))) fail();
     // The external owner/account authentication boundary must select ONE
@@ -166,6 +176,13 @@ class Zk1ProtectedObjectStore {
     this.minimumHead = Object.freeze({ revision: minimumHead.revision,
       witnessSequence: minimumHead.witnessSequence, digest: bytes(minimumHead.digest, 32) });
     this.witnessProvider = witnessProvider;
+    // A verifier result is meaningful only under a trusted GENESIS digest:
+    // otherwise a compromised CAS could fabricate its own signed chain.
+    this.signedHistoryRequired = signedHistoryRequired;
+    this.signedHistoryGenesisDigest = signedHistoryRequired
+      ? bytes(signedHistoryGenesisDigest, 32) : null;
+    this.verifiedHistoryProvider = verifiedHistoryProvider;
+    this.inflightSignedHistoryChecks = 0;
     this.admissionRequired = admissionRequired;
     this.manifestProvider = manifestProvider;
     this.nowSeconds = nowSeconds;
@@ -181,6 +198,7 @@ class Zk1ProtectedObjectStore {
         this.witnessPinned.publicKey.export({ type: "spki", format: "der" })).digest(),
       revision: this.minimumHead.revision,
       digest: this.minimumHead.digest,
+      signedGenesisDigest: this.signedHistoryGenesisDigest,
     };
     let inspectedIdentity;
     if (existed) {
@@ -231,7 +249,9 @@ class Zk1ProtectedObjectStore {
       CREATE TABLE IF NOT EXISTS zk_content_identity (
         id INTEGER PRIMARY KEY CHECK(id=1), scope TEXT NOT NULL,
         witness_key_id BLOB NOT NULL, witness_fingerprint BLOB NOT NULL,
-        floor_revision INTEGER NOT NULL, floor_digest BLOB NOT NULL
+        floor_revision INTEGER NOT NULL, floor_digest BLOB NOT NULL,
+        signed_genesis_digest BLOB
+          CHECK(signed_genesis_digest IS NULL OR length(signed_genesis_digest)=32)
       );
       CREATE TABLE IF NOT EXISTS zk_content_head (
         scope TEXT PRIMARY KEY, revision INTEGER NOT NULL, digest BLOB NOT NULL
@@ -263,9 +283,11 @@ class Zk1ProtectedObjectStore {
     `);
     if (!existed) {
       this.db.prepare(`INSERT INTO zk_content_identity
-        (id,scope,witness_key_id,witness_fingerprint,floor_revision,floor_digest)
-        VALUES(1,?,?,?,?,?)`).run(expectedIdentity.scope, expectedIdentity.keyId,
-        expectedIdentity.fingerprint, expectedIdentity.revision, expectedIdentity.digest);
+        (id,scope,witness_key_id,witness_fingerprint,floor_revision,floor_digest,
+         signed_genesis_digest)
+        VALUES(1,?,?,?,?,?,?)`).run(expectedIdentity.scope, expectedIdentity.keyId,
+        expectedIdentity.fingerprint, expectedIdentity.revision, expectedIdentity.digest,
+        expectedIdentity.signedGenesisDigest);
     }
     // Upgrade earlier disposable/local content planes without erasing any
     // durable replay state. Unattributed legacy nonces remain permanently
@@ -347,20 +369,20 @@ class Zk1ProtectedObjectStore {
       request.ciphertext_digest)) fail();
     const now = currentTime(this.nowSeconds);
     if (now < request.issued_at - 5 || now > request.expires_at) fail();
-    let manifest, head;
+    let manifest, head, nonce, floor, rawManifest;
     try {
-      const nonce = crypto.randomBytes(32);
+      nonce = crypto.randomBytes(32);
       const rawHead = Buffer.from(await this.witnessProvider.freshHead({
         scope: canonicalScope, nonce: Buffer.from(nonce),
       }));
       const row = this.getHead.get(key);
-      const floor = row && row.revision >= this.minimumHead.revision
+      floor = row && row.revision >= this.minimumHead.revision
         ? { revision: row.revision, witnessSequence: row.revision, digest: row.digest }
         : this.minimumHead;
       await inspectVerifiedWitnessFreshHeadV1({ raw: rawHead, nonce,
         scope: canonicalScope, pinned: this.witnessPinned, minimumHead: floor });
       head = await z.decodeDeterministic(rawHead);
-      const rawManifest = bytes(await this.manifestProvider(canonicalScope), 1, 262144);
+      rawManifest = bytes(await this.manifestProvider(canonicalScope), 1, 262144);
       manifest = await z.decodeDeterministic(rawManifest);
       manifestV2.validateManifestShape(manifest);
       if (!equal(await manifestV2.recoveryManifestDigestV2(manifest),
@@ -374,6 +396,9 @@ class Zk1ProtectedObjectStore {
         || !equal(Buffer.from(manifest.keyring_id), canonicalScope.keyring_id)
         || Math.abs(Number(head.observed_at) - currentTime(this.nowSeconds)) > 30) fail();
     } catch (_) { fail("ZK_CONTENT_UNAVAILABLE"); }
+    // Rejection-only preflight. The latest manifest is UNTRUSTED here:
+    // an apparently active key and a valid signature do not authorize I/O
+    // until the full owner-rooted signed chain below has been verified.
     const device = manifest.devices.find((entry) => entry.device_id === request.device_id);
     if (!device || device.revoked_at_epoch !== null
       || Number(device.enrolled_epoch) > request.epoch) fail();
@@ -387,6 +412,37 @@ class Zk1ProtectedObjectStore {
         publicKey, proofSignature);
     } catch (_) { fail(); }
     if (!valid) fail();
+    if (this.signedHistoryRequired) {
+      // Bound pre-admission CPU/RAM/network amplification from signed, but
+      // ultimately invalid/stale requests. No admission or I/O starts here.
+      if (this.inflightSignedHistoryChecks >= MAX_CONCURRENT_SIGNED_HISTORY_CHECKS) {
+        fail("ZK_CONTENT_UNAVAILABLE");
+      }
+      this.inflightSignedHistoryChecks += 1;
+      try {
+        const proof = await this.verifiedHistoryProvider({
+          scope: canonicalScope,
+          minimumHead: { revision: floor.revision,
+            witnessSequence: floor.witnessSequence, digest: Buffer.from(floor.digest) },
+          nonce: Buffer.from(nonce),
+        });
+        // Unbranded JSON flags never grant approval. Require a privately
+        // branded full Ed25519 history, pinned at the trusted genesis and
+        // bound to exactly the current signed witness head and CAS manifest.
+        if (!await signedHistoryV2.isVerifiedPublicRecoveryHistoryV2(proof)
+          || !proof.headManifest || !proof.baseManifest
+          || Number(proof.revision) !== Number(head.current_revision)
+          || !equal(bytes(proof.headDigest, 32), Buffer.from(head.current_manifest_digest))
+          || !equal(await manifestV2.recoveryManifestDigestV2(proof.baseManifest),
+            this.signedHistoryGenesisDigest)
+          || !equal(Buffer.from(await z.encodeDeterministic(proof.headManifest)),
+            rawManifest)) fail();
+      } catch (_) {
+        fail("ZK_CONTENT_UNAVAILABLE");
+      } finally {
+        this.inflightSignedHistoryChecks -= 1;
+      }
+    }
     return { key, request, head, sealed };
   }
 

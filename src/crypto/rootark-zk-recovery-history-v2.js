@@ -469,6 +469,11 @@ async function verifyRecoveryHistoryInternal(input, mode) {
     });
     const snapshot = {
       verificationMode: mode,
+      // Private brand MUST bind the original genesis as well as the head.
+      // Consumers use baseManifest to compare an independently provisioned
+      // owner genesis pin. A mutated base with unchanged head must not retain
+      // the brand and be promoted to trusted device authorization.
+      baseManifest: await z.encodeDeterministic(baseManifest),
       headManifest: await z.encodeDeterministic(headManifest),
       headDigest: Buffer.from(headDigest),
       revision: u64(headManifest.revision, 1n),
@@ -515,12 +520,14 @@ async function isVerifiedRecoveryHistoryV2(history, requiredMode) {
       || history.verificationMode !== snapshot.verificationMode
       || history.packageRecoverabilityVerified !== (snapshot.verificationMode === "recovery-package")) return false;
     const encodedHead = await z.encodeDeterministic(history.headManifest);
+    const encodedBase = await z.encodeDeterministic(history.baseManifest);
     const digestMatches = sameBytes(await manifestV2.recoveryManifestDigestV2(history.headManifest), snapshot.headDigest)
       && sameBytes(history.headDigest, snapshot.headDigest);
     const identifiers = [...history.usedIdentifiers].sort();
     const epochKeys = normalizeEpochKeys(history.epochKeys);
     if (epochKeys.size !== snapshot.epochKeys.length) return false;
-    return sameBytes(encodedHead, snapshot.headManifest)
+    return sameBytes(encodedBase, snapshot.baseManifest)
+      && sameBytes(encodedHead, snapshot.headManifest)
       && digestMatches
       && u64(history.revision, 1n) === snapshot.revision
       && JSON.stringify(identifiers) === JSON.stringify(snapshot.usedIdentifiers)
@@ -539,10 +546,12 @@ async function isVerifiedPublicRecoveryHistoryV2(history) {
       || history.packageRecoverabilityVerified !== false || history.verificationMode !== "public"
       || Object.hasOwn(history, "epochKeys")) return false;
     const encodedHead = await z.encodeDeterministic(history.headManifest);
+    const encodedBase = await z.encodeDeterministic(history.baseManifest);
     const digestMatches = sameBytes(await manifestV2.recoveryManifestDigestV2(history.headManifest), snapshot.headDigest)
       && sameBytes(history.headDigest, snapshot.headDigest);
     const identifiers = [...history.usedIdentifiers].sort();
-    return sameBytes(encodedHead, snapshot.headManifest)
+    return sameBytes(encodedBase, snapshot.baseManifest)
+      && sameBytes(encodedHead, snapshot.headManifest)
       && digestMatches
       && u64(history.revision, 1n) === snapshot.revision
       && JSON.stringify(identifiers) === JSON.stringify(snapshot.usedIdentifiers);

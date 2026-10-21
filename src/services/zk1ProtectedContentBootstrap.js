@@ -9,6 +9,8 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { createZk1WitnessHttpsClient } = require("./zk1WitnessHttpsClient");
 const { createZk1CasManifestHttpsClient } = require("./zk1CasManifestHttpsClient");
+const { createZk1SignedHistoryCasProofProvider } =
+  require("./zk1SignedHistoryCasProofProvider");
 const { Zk1ProtectedObjectStore } = require("./zk1ProtectedObjectStore");
 const { registerZk1ProtectedObjectRoutes } = require("../routes/zk1ProtectedObjectRoutes");
 
@@ -17,6 +19,13 @@ const PIN = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
 const WITNESS_FIELDS = ["endpoint", "caPath", "clientKeyPath", "clientCertPath",
   "serverFingerprint256", "signingKeyId", "signingPublicKeyPath"];
 const CAS_FIELDS = WITNESS_FIELDS.slice(0, 5);
+const SIGNED_HISTORY_FIELDS = ["genesisDigest", "baseReceiptPath",
+  "baseWitnessKeyId", "baseWitnessPublicKeyPath", "packageEnvelopes"];
+const BASE_RECEIPT_FIELDS = ["type", "witness_key_id", "account_id",
+  "compartment_id", "keyring_id", "revision", "manifest_digest",
+  "witness_sequence", "nonce", "observed_at", "status", "signature"];
+const BASE_RECEIPT_BYTES = ["witness_key_id", "account_id", "compartment_id",
+  "keyring_id", "manifest_digest", "nonce", "signature"];
 function fail(code = "ZK_CONTENT_BOOTSTRAP_INVALID") {
   const error = new Error(code);
   error.code = code;
@@ -69,6 +78,57 @@ function clientTlsIdentity(settings) {
     return { key, certificate: cert.raw };
   } catch (_) { fail(); }
 }
+function trustedSignedHistory(config, scope, casClient) {
+  exact(config, SIGNED_HISTORY_FIELDS);
+  const genesisDigest = b64(config.genesisDigest, 32);
+  const baseKeyId = b64(config.baseWitnessKeyId, 16);
+  const basePublicKey = crypto.createPublicKey(readFile(config.baseWitnessPublicKeyPath));
+  if (basePublicKey.type !== "public" || basePublicKey.asymmetricKeyType !== "ed25519") fail();
+  let receipt;
+  try { receipt = JSON.parse(readFile(config.baseReceiptPath, 8192).toString("utf8")); }
+  catch (_) { fail(); }
+  exact(receipt, BASE_RECEIPT_FIELDS);
+  const copied = {};
+  for (const name of BASE_RECEIPT_FIELDS) {
+    if (BASE_RECEIPT_BYTES.includes(name)) {
+      copied[name] = b64(receipt[name], name === "signature" ? 64
+        : name === "compartment_id" ? 1
+          : ["manifest_digest", "nonce"].includes(name) ? 32 : 16,
+      name === "compartment_id" ? 128 : undefined);
+    } else {
+      copied[name] = receipt[name];
+    }
+  }
+  if (copied.type !== "rootark-recovery-witness-base/v1"
+    || copied.status !== "committed"
+    || !Number.isSafeInteger(copied.revision) || copied.revision !== 1
+    || !Number.isSafeInteger(copied.witness_sequence) || copied.witness_sequence !== 1
+    || !Number.isSafeInteger(copied.observed_at) || copied.observed_at < 0
+    || !copied.witness_key_id.equals(baseKeyId)
+    || !copied.manifest_digest.equals(genesisDigest)
+    || !["account_id", "compartment_id", "keyring_id"].every(
+      (name) => copied[name].equals(scope[name]))) fail();
+  if (!Array.isArray(config.packageEnvelopes) || config.packageEnvelopes.length > 4096) fail();
+  let envelopeBytes = 0;
+  const packageEnvelopes = config.packageEnvelopes.map((item) => {
+    exact(item, ["activationRevision", "envelopePath"]);
+    if (!Number.isSafeInteger(item.activationRevision)
+      || item.activationRevision < 2) fail();
+    const envelope = readFile(item.envelopePath, 8 * 1024 * 1024);
+    envelopeBytes += envelope.length;
+    if (envelopeBytes > 64 * 1024 * 1024) fail();
+    return { activationRevision: item.activationRevision, envelopeBytes: envelope };
+  });
+  return {
+    signedHistoryRequired: true, signedHistoryGenesisDigest: genesisDigest,
+    verifiedHistoryProvider: createZk1SignedHistoryCasProofProvider({
+      casClient, trustedScope: scope, trustedGenesisDigest: genesisDigest,
+      baseReceipt: copied, pinnedBaseWitness: { keyId: baseKeyId,
+        publicKey: basePublicKey },
+      packageEnvelopes,
+    }),
+  };
+}
 function registerZk1ProtectedContentFromConfig({
   app, authenticate, requirePermission, configPath, environment,
 }) {
@@ -80,8 +140,9 @@ function registerZk1ProtectedContentFromConfig({
   try { config = JSON.parse(configBytes.toString("utf8")); }
   catch (_) { fail(); }
   exact(config, ["version", "bootstrapNew", "username", "contentDbPath",
-    "scope", "minimumHead", "witness", "cas"]);
-  if (config.version !== 1 || ![true, false].includes(config.bootstrapNew)
+    "scope", "minimumHead", "witness", "cas",
+    ...(config.version === 2 ? ["signedHistory"] : [])]);
+  if (![1, 2].includes(config.version) || ![true, false].includes(config.bootstrapNew)
     || typeof config.username !== "string" || config.username.length < 1
     || config.username.length > 128 || /[\u0000-\u001f\u007f]/.test(config.username)) fail();
   exact(config.scope, ["account_id", "compartment_id", "keyring_id"]);
@@ -115,9 +176,14 @@ function registerZk1ProtectedContentFromConfig({
   if (publicKey.type !== "public" || publicKey.asymmetricKeyType !== "ed25519") fail();
   const witnessProvider = createZk1WitnessHttpsClient(witnessTransport);
   const manifestProvider = createZk1CasManifestHttpsClient(casTransport);
+  // Version 2 is opt-in only in development/test and requires independently
+  // provisioned public genesis/recovery witness roots, not CAS-provided ones.
+  const signedHistory = config.version === 2
+    ? trustedSignedHistory(config.signedHistory, scope, manifestProvider) : {};
   const store = new Zk1ProtectedObjectStore(absolute(config.contentDbPath), {
     bootstrapNew: config.bootstrapNew, trustedScope: scope, admissionRequired: true,
     minimumHead: floor, witnessProvider,
+    ...signedHistory,
     witnessPinned: { keyId: b64(config.witness.signingKeyId, 16), publicKey },
     manifestProvider: ({ account_id, compartment_id, keyring_id }) =>
       manifestProvider.getCommittedManifest({ scope: {

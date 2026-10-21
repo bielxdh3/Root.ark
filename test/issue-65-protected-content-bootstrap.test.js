@@ -9,6 +9,8 @@ const { execFileSync } = require("node:child_process");
 const test = require("node:test");
 const express = require("express");
 const Database = require("better-sqlite3");
+const fixtures = require("./support/issue-65-recovery-v2-fixtures");
+const manifestV2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const { registerZk1ProtectedContentFromConfig } = require("../src/services/zk1ProtectedContentBootstrap");
 
 test("app opt-in requires independently provisioned roots, explicit genesis and authenticated owner binding", async (t) => {
@@ -165,6 +167,42 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
   assert.equal(swapped, true, "fixture must actually swap SQLite files");
   assert.deepEqual(snapshot(raced), foreignSnapshot,
     "swapped foreign SQLite must remain bit-for-bit unchanged");
+  const signedState = await fixtures.createInitialState(1);
+  const signedGenesisDigest = await manifestV2.recoveryManifestDigestV2(signedState.baseManifest);
+  const signedBasePath = path.join(dir, "trusted-base-receipt.json");
+  const encodedBase = Object.fromEntries(Object.entries(signedState.baseReceipt).map(
+    ([name, value]) => [name, Buffer.isBuffer(value)
+      ? value.toString("base64url") : value]));
+  fs.writeFileSync(signedBasePath, JSON.stringify(encodedBase));
+  const basePublicKeyPath = path.join(dir, "trusted-base-witness.pem");
+  fs.writeFileSync(basePublicKeyPath, signedState.pinnedWitness.publicKey.export({
+    format: "pem", type: "spki",
+  }));
+  const v2Data = {
+    ...data, version: 2,
+    contentDbPath: path.join(dir, "strict-signed-history.sqlite"),
+    scope: Object.fromEntries(Object.entries(signedState.scope).map(
+      ([name, bytes]) => [name, bytes.toString("base64url")])),
+    minimumHead: { revision: 1, digest: signedGenesisDigest.toString("base64url") },
+    signedHistory: {
+      genesisDigest: signedGenesisDigest.toString("base64url"),
+      baseReceiptPath: signedBasePath,
+      baseWitnessKeyId: signedState.pinnedWitness.keyId.toString("base64url"),
+      baseWitnessPublicKeyPath: basePublicKeyPath,
+      packageEnvelopes: [],
+    },
+  };
+  assert.throws(() => configure({ ...v2Data, signedHistory: {
+    ...v2Data.signedHistory, baseReceiptPath: path.join(dir, "missing.json"),
+  } }), /ZK_CONTENT_BOOTSTRAP_INVALID/);
+  assert.equal(fs.existsSync(v2Data.contentDbPath), false,
+    "missing independently supplied signed-history roots may not create the store");
+  configure(v2Data);
+  assert.equal(objects.at(-1).signedHistoryRequired, true,
+    "versioned opt-in must require the owner-rooted signed chain on every operation");
+  assert.equal(typeof objects.at(-1).verifiedHistoryProvider, "function");
+  assert.equal(objects.at(-1).signedHistoryGenesisDigest.toString("hex"),
+    signedGenesisDigest.toString("hex"));
   const app = configure(data);
   const listener = await new Promise((resolve) => {
     const server = app.listen(0, "127.0.0.1", () => resolve(server));
