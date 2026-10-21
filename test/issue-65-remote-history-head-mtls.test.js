@@ -272,12 +272,12 @@ test("real CAS and witness mTLS history authorizes local encrypted PUT/GET only 
     const device = manifest.devices.find((item) => item.device_id === deviceName);
     const authorization = {
       ...f.scope, device_id: deviceName, operation, object_id: objectId,
-      expected_object_revision: null, manifest_revision: Number(manifest.revision),
+      expected_object_revision: operation === "put" ? null : 1,
+      manifest_revision: Number(manifest.revision),
       manifest_digest: await v2.recoveryManifestDigestV2(manifest),
       epoch: Number(manifest.current_epoch), nonce: crypto.randomBytes(32),
       issued_at: 1099, expires_at: 1130,
-      ciphertext_digest: operation === "put"
-        ? crypto.createHash("sha256").update(ciphertext).digest() : null,
+      ciphertext_digest: crypto.createHash("sha256").update(ciphertext).digest(),
     };
     const key = f.state.actors.get(Buffer.from(device.authorization_key_id).toString("hex"));
     return { scope: f.scope, authorization,

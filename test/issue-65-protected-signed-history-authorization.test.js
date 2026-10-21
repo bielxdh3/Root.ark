@@ -33,8 +33,10 @@ test("signed-history-required content denies forged approval and accepts ONLY in
   let clock = 1100;
   const liveSigner = crypto.generateKeyPairSync("ed25519");
   const liveKeyId = crypto.randomBytes(16);
+  let witnessReads = 0;
   const witnessProvider = {
     async freshHead({ nonce }) {
+      witnessReads++;
       const unsigned = {
         type: "rootark-recovery-witness-head/v1",
         witness_key_id: liveKeyId, ...scope,
@@ -127,10 +129,11 @@ test("signed-history-required content denies forged approval and accepts ONLY in
   "a forged Ed25519 operation must be rejected before any signed-history fetch");
   assert.equal(expensiveHistoryFetches, callsBeforeInvalidSignature,
     "invalid device keys must never trigger expensive full-history verification");
-  const makeRead = async () => {
+  const makeRead = async (unbound = false) => {
     const authorization = {
-      ...proposal.authorization, operation: "get", ciphertext_digest: null,
-      nonce: crypto.randomBytes(32), expected_object_revision: null,
+      ...proposal.authorization, operation: "get",
+      ciphertext_digest: unbound ? null : crypto.createHash("sha256").update(data).digest(),
+      nonce: crypto.randomBytes(32), expected_object_revision: unbound ? null : 1,
       manifest_revision: Number(manifest.revision),
       manifest_digest: await v2.recoveryManifestDigestV2(manifest),
     };
@@ -139,6 +142,16 @@ test("signed-history-required content denies forged approval and accepts ONLY in
     return { scope, authorization, signature: crypto.sign(null,
       await contentAuthorizationMessageV1(authorization), signing) };
   };
+  const providerBeforeUnbound = expensiveHistoryFetches;
+  const witnessBeforeUnbound = witnessReads;
+  await assert.rejects(store.get(await makeRead(true)), /ZK_CONTENT_DENIED/,
+    "owner-rooted mode must not trust mutable SQLite latest without a signed revision and ciphertext digest");
+  assert.equal(expensiveHistoryFetches, providerBeforeUnbound,
+    "unbound latest GET must fail before expensive owner-history verification");
+  assert.equal(witnessReads, witnessBeforeUnbound,
+    "unbound latest GET must fail before sending a witness network request");
+  assert.deepEqual((await store.get(await makeRead())).ciphertext, data,
+    "signed exact revision and original digest still permit authentic historical GET");
   const originalProvider = store.verifiedHistoryProvider;
   const awaitingHistory = [];
   let twoEntered;
@@ -164,6 +177,23 @@ test("signed-history-required content denies forged approval and accepts ONLY in
     await Promise.allSettled([firstRead, secondRead]);
     store.verifiedHistoryProvider = originalProvider;
   }
+  // Local SQLite digests are not provenance. A privileged SQL writer can
+  // INSERT a contiguous forged version and move the latest projection to it
+  // without disabling the archive's UPDATE/DELETE immutability triggers.
+  const forged = crypto.randomBytes(data.length);
+  const ownScope = store.db.prepare("SELECT scope FROM zk_content_object WHERE id=?")
+    .get(id).scope;
+  store.db.prepare(`INSERT INTO zk_content_version
+    (scope,id,revision,epoch,ciphertext,ciphertext_digest,provenance)
+    VALUES (?,?,?,?,?,?,'transactional')`).run(ownScope, id, 2,
+    Number(manifest.current_epoch), forged,
+    crypto.createHash("sha256").update(forged).digest());
+  store.db.prepare("UPDATE zk_content_object SET revision=2,ciphertext=? WHERE id=?")
+    .run(forged, id);
+  await assert.rejects(store.get(await makeRead(true)), /ZK_CONTENT_DENIED/,
+    "SQL-forged latest content cannot be selected via an unbound owner-rooted GET");
+  assert.deepEqual((await store.get(await makeRead())).ciphertext, data,
+    "owner-signed original revision/digest still select unchanged real ciphertext");
   // Once a strict owner genesis is installed, restart cannot silently open
   // this same SQLite identity in latest-manifest-only mode or switch roots.
   assert.throws(() => new Zk1ProtectedObjectStore(file, {
@@ -182,10 +212,10 @@ test("signed-history-required content denies forged approval and accepts ONLY in
   supplied = approved;
   await assert.rejects(store.get(await (async () => {
     const authorization = { ...proposal.authorization, device_id: "trusted-0",
-      operation: "get", ciphertext_digest: null,
+      operation: "get", ciphertext_digest: crypto.createHash("sha256").update(data).digest(),
       manifest_revision: Number(manifest.revision),
       manifest_digest: await v2.recoveryManifestDigestV2(manifest),
-      expected_object_revision: null, nonce: crypto.randomBytes(32) };
+      expected_object_revision: 1, nonce: crypto.randomBytes(32) };
     return { scope, authorization, signature: crypto.sign(null,
       await contentAuthorizationMessageV1(authorization),
       state.actors.get(Buffer.from(manifest.devices[0].authorization_key_id).toString("hex"))) };

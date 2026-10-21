@@ -369,6 +369,15 @@ class Zk1ProtectedObjectStore {
       || !equal(request.compartment_id, canonicalScope.compartment_id)
       || !equal(request.keyring_id, canonicalScope.keyring_id)
       || request.operation !== operation) fail();
+    // A complete owner-signed KEYRING history does not attest the latest
+    // ciphertext revision stored in this local SQLite database. In strict
+    // mode a mutable latest projection cannot select bytes on the owner's
+    // behalf: require the signer to bind the precise archived revision and
+    // ciphertext digest. Provenance/total-erasure still require an external
+    // independently authenticated per-object commitment ledger.
+    if (this.signedHistoryRequired && operation === "get"
+      && (request.expected_object_revision === null
+        || request.ciphertext_digest === null)) fail();
     const proofSignature = bytes(signature, 64);
     const sealed = operation === "put" ? bytes(ciphertext, 16, MAX_BYTES) : null;
     if (operation === "put" && !equal(crypto.createHash("sha256").update(sealed).digest(),
