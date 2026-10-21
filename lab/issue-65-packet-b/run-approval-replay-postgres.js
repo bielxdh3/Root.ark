@@ -59,7 +59,8 @@ async function main() {
     ROOTARK_ZK1_REPLAY_WRITER_PG_URL: "postgresql://" + user + ":" + secret
       + "@127.0.0.1:" + port[1] + "/gatefixture" };
   run("node", ["--test", "--test-reporter=spec",
-    "test/issue-65-approval-replay-postgres.test.js"],
+    "test/issue-65-approval-replay-postgres.test.js",
+    "test/issue-65-approval-crypto-replay-postgres.test.js"],
   { env: fixtureEnv, inherit: true });
   process.stdout.write("APPROVAL_REPLAY_PG18_NATIVE_PASS\n");
   if (process.platform === "win32") {
@@ -67,7 +68,7 @@ async function main() {
     const names = ["ROOTARK_ZK1_REPLAY_ADMIN_PG_URL", "ROOTARK_ZK1_REPLAY_WRITER_PG_URL"].join(":");
     run("wsl.exe", ["--exec", "bash", "-lc",
       "cd '" + linuxRoot.replaceAll("'", "'\\''")
-        + "' && node --test --test-reporter=spec test/issue-65-approval-replay-postgres.test.js"],
+      + "' && node --test --test-reporter=spec test/issue-65-approval-replay-postgres.test.js test/issue-65-approval-crypto-replay-postgres.test.js"],
     { env: { ...fixtureEnv, WSLENV: [process.env.WSLENV, names].filter(Boolean).join(":") },
       inherit: true });
     process.stdout.write("APPROVAL_REPLAY_PG18_WSL_NODE22_PASS\n");
@@ -84,7 +85,24 @@ async function main() {
         if (identity !== id + "|issue65-approval-replay|disposable-local") {
           throw new Error("disposable identity mismatch; cleanup refused");
         }
-        run("docker", ["rm", "-f", id]);
+        const mounts = JSON.parse(run("docker", ["container", "inspect", "--format",
+          "{{json .Mounts}}", name]));
+        if (!Array.isArray(mounts) || mounts.length !== 1
+          || mounts[0].Type !== "volume"
+          || mounts[0].Destination !== "/var/lib/postgresql"
+          || !/^[a-f0-9]{64}$/.test(mounts[0].Name)) {
+          throw new Error("unverified anonymous fixture data volume; cleanup refused");
+        }
+        const anonymousVolume = mounts[0].Name;
+        // `docker rm -f` alone leaves the official PostgreSQL image's
+        // anonymous data volume behind. Remove ONLY the exact verified
+        // container AND ITS anonymous VOLUME, never a named/shared volume.
+        run("docker", ["rm", "-f", "-v", id]);
+        const stillPresent = spawnSync("docker", ["volume", "inspect", anonymousVolume],
+          { encoding: "utf8", windowsHide: true, timeout: 5000 });
+        if (stillPresent.error || stillPresent.status === 0) {
+          throw new Error("disposable anonymous PG data volume not removed");
+        }
         process.stdout.write("APPROVAL_REPLAY_LAB_CLEANUP verified=true\n");
       } catch (error) {
         failed = true;
