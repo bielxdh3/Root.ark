@@ -14,12 +14,23 @@ CREATE TABLE IF NOT EXISTS zk1_gate.head (
   revision bigint NOT NULL CHECK (revision > 0),
   digest bytea NOT NULL CHECK (octet_length(digest)=32),
   generation bigint NOT NULL DEFAULT 1 CHECK (generation > 0),
+  -- Legacy reference scopes default to non-attested mode. Independently
+  -- operator-provisioned zk-1 scopes MUST explicitly enable strict STOP.
+  require_stop_proof boolean NOT NULL DEFAULT false,
+  -- Nominal dummy column permits PostgreSQL row-lock statements for a
+  -- separate STOP recorder role. The head trigger rejects EVERY attempted
+  -- UPDATE of this column, including no-op writes.
+  stop_lock bigint NOT NULL DEFAULT 0,
   phase text NOT NULL DEFAULT 'OPEN' CHECK (phase IN ('OPEN','QUIESCING','PENDING')),
   operation_id bytea CHECK (operation_id IS NULL OR octet_length(operation_id)=16),
   reservation_id bytea CHECK (reservation_id IS NULL OR octet_length(reservation_id)=16),
   CHECK ((phase='OPEN' AND operation_id IS NULL AND reservation_id IS NULL)
        OR (phase<>'OPEN' AND operation_id IS NOT NULL AND reservation_id IS NOT NULL))
 );
+ALTER TABLE zk1_gate.head ADD COLUMN IF NOT EXISTS
+  require_stop_proof boolean NOT NULL DEFAULT false;
+ALTER TABLE zk1_gate.head ADD COLUMN IF NOT EXISTS
+  stop_lock bigint NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS zk1_gate.admission (
   id bytea PRIMARY KEY CHECK (octet_length(id)=16),
   scope_key text NOT NULL REFERENCES zk1_gate.head(scope_key),
@@ -30,11 +41,164 @@ CREATE TABLE IF NOT EXISTS zk1_gate.admission (
   revision bigint NOT NULL CHECK (revision>0),
   digest bytea NOT NULL CHECK (octet_length(digest)=32),
   generation bigint NOT NULL CHECK (generation>0),
+  -- Strict physical-stop scopes pin the exact supervised OS process BEFORE
+  -- its first physical chunk. Legacy non-strict admissions keep all NULL.
+  host_key_id bytea CHECK(host_key_id IS NULL OR octet_length(host_key_id)=16),
+  process_epoch bytea CHECK(process_epoch IS NULL OR octet_length(process_epoch)=16),
+  process_pid bigint CHECK(process_pid IS NULL OR process_pid>0),
   state text NOT NULL CHECK (state IN ('ACTIVE','STOP_REQUESTED','FINISHED')),
+  CHECK ((host_key_id IS NULL AND process_epoch IS NULL AND process_pid IS NULL)
+      OR (host_key_id IS NOT NULL AND process_epoch IS NOT NULL AND process_pid IS NOT NULL)),
   UNIQUE(scope_key,worker_id)
 );
+ALTER TABLE zk1_gate.admission ADD COLUMN IF NOT EXISTS
+  host_key_id bytea CHECK(host_key_id IS NULL OR octet_length(host_key_id)=16);
+ALTER TABLE zk1_gate.admission ADD COLUMN IF NOT EXISTS
+  process_epoch bytea CHECK(process_epoch IS NULL OR octet_length(process_epoch)=16);
+ALTER TABLE zk1_gate.admission ADD COLUMN IF NOT EXISTS
+  process_pid bigint CHECK(process_pid IS NULL OR process_pid>0);
 CREATE INDEX IF NOT EXISTS admission_unfinished
   ON zk1_gate.admission(scope_key,state);
+-- Separate STOP-witness evidence channel: the data-plane gate SQL login is
+-- intentionally not allowed to INSERT here. A separate operator-owned
+-- runtime must independently validate trusted physical worker termination
+-- before depositing an immutable signed proof. A DB row alone does NOT attest
+-- to OS process termination unless that separate recorder is trustworthy.
+CREATE TABLE IF NOT EXISTS zk1_gate.physical_stop_receipt (
+  admission_id bytea PRIMARY KEY REFERENCES zk1_gate.admission(id)
+    CHECK(octet_length(admission_id)=16),
+  scope_key text NOT NULL REFERENCES zk1_gate.head(scope_key),
+  worker_id bytea NOT NULL CHECK(octet_length(worker_id)=16),
+  generation bigint NOT NULL CHECK(generation>0),
+  host_key_id bytea NOT NULL CHECK(octet_length(host_key_id)=16),
+  process_epoch bytea NOT NULL CHECK(octet_length(process_epoch)=16),
+  process_pid bigint NOT NULL CHECK(process_pid>0),
+  stopped_at bigint NOT NULL CHECK(stopped_at>0),
+  proof_digest bytea NOT NULL CHECK(octet_length(proof_digest)=32),
+  signed_proof bytea NOT NULL CHECK(octet_length(signed_proof) BETWEEN 100 AND 4096)
+);
+CREATE INDEX IF NOT EXISTS physical_stop_by_scope
+  ON zk1_gate.physical_stop_receipt(scope_key,generation);
+CREATE OR REPLACE FUNCTION zk1_gate.validate_physical_stop_receipt()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+BEGIN
+  IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'physical stop receipt requires READ COMMITTED isolation'
+      USING ERRCODE='23514';
+  END IF;
+  PERFORM 1 FROM zk1_gate.head WHERE scope_key=NEW.scope_key
+    AND require_stop_proof=TRUE AND phase IN ('OPEN','QUIESCING') FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'no strict trusted worker-stop authority for scope'
+      USING ERRCODE='23514';
+  END IF;
+  PERFORM 1 FROM zk1_gate.admission
+    WHERE id=NEW.admission_id AND scope_key=NEW.scope_key
+      AND worker_id=NEW.worker_id AND generation=NEW.generation
+      AND host_key_id=NEW.host_key_id AND process_epoch=NEW.process_epoch
+      AND process_pid=NEW.process_pid
+      AND state IN ('ACTIVE','STOP_REQUESTED');
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'STOP receipt is not bound to an unfinished admission'
+      USING ERRCODE='23514';
+  END IF;
+  IF pg_catalog.sha256(NEW.signed_proof) <> NEW.proof_digest THEN
+    RAISE EXCEPTION 'STOP receipt wire digest mismatch'
+      USING ERRCODE='23514';
+  END IF;
+  RETURN NEW;
+END $$;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t
+    JOIN pg_catalog.pg_class AS c ON c.oid=t.tgrelid
+    JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+    WHERE n.nspname='zk1_gate' AND c.relname='physical_stop_receipt'
+      AND t.tgname='zk1_gate_validate_physical_stop_receipt' AND NOT t.tgisinternal) THEN
+    CREATE TRIGGER zk1_gate_validate_physical_stop_receipt
+      BEFORE INSERT ON zk1_gate.physical_stop_receipt
+      FOR EACH ROW EXECUTE FUNCTION zk1_gate.validate_physical_stop_receipt();
+  END IF;
+END $$;
+CREATE OR REPLACE FUNCTION zk1_gate.validate_admission_transition()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+DECLARE
+  strict_mode boolean;
+BEGIN
+  IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'admission transition requires READ COMMITTED isolation'
+      USING ERRCODE='23514';
+  END IF;
+  IF TG_OP='INSERT' THEN
+    -- This lock fences direct restricted-role SQL INSERT during QUIESCING.
+    SELECT require_stop_proof INTO strict_mode FROM zk1_gate.head
+      WHERE scope_key=NEW.scope_key AND phase='OPEN'
+        AND generation=NEW.generation AND revision=NEW.revision
+        AND digest=NEW.digest FOR UPDATE;
+    IF NOT FOUND OR NEW.state <> 'ACTIVE' THEN
+      RAISE EXCEPTION 'admission requires a current OPEN gate head'
+        USING ERRCODE='23514';
+    END IF;
+    IF (strict_mode AND (NEW.host_key_id IS NULL
+      OR NEW.process_epoch IS NULL OR NEW.process_pid IS NULL))
+      OR (NOT strict_mode AND (NEW.host_key_id IS NOT NULL
+        OR NEW.process_epoch IS NOT NULL OR NEW.process_pid IS NOT NULL)) THEN
+      RAISE EXCEPTION 'worker process identity does not match STOP policy'
+        USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF NEW.id IS DISTINCT FROM OLD.id
+    OR NEW.scope_key IS DISTINCT FROM OLD.scope_key
+    OR NEW.worker_id IS DISTINCT FROM OLD.worker_id
+    OR NEW.principal IS DISTINCT FROM OLD.principal
+    OR NEW.action IS DISTINCT FROM OLD.action
+    OR NEW.object_id IS DISTINCT FROM OLD.object_id
+    OR NEW.revision IS DISTINCT FROM OLD.revision
+    OR NEW.digest IS DISTINCT FROM OLD.digest
+    OR NEW.generation IS DISTINCT FROM OLD.generation
+    OR NEW.host_key_id IS DISTINCT FROM OLD.host_key_id
+    OR NEW.process_epoch IS DISTINCT FROM OLD.process_epoch
+    OR NEW.process_pid IS DISTINCT FROM OLD.process_pid THEN
+    RAISE EXCEPTION 'worker identity and generation are immutable'
+      USING ERRCODE='23514';
+  END IF;
+  IF OLD.state='ACTIVE' AND NEW.state='STOP_REQUESTED' THEN
+    PERFORM 1 FROM zk1_gate.head WHERE scope_key=NEW.scope_key
+      AND phase='QUIESCING';
+    IF FOUND THEN RETURN NEW; END IF;
+  END IF;
+  IF OLD.state IN ('ACTIVE','STOP_REQUESTED') AND NEW.state='FINISHED' THEN
+    SELECT require_stop_proof INTO strict_mode
+      FROM zk1_gate.head WHERE scope_key=NEW.scope_key;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'missing gate scope for completion'
+        USING ERRCODE='23514';
+    END IF;
+    IF strict_mode AND NOT EXISTS (SELECT 1
+      FROM zk1_gate.physical_stop_receipt AS ack
+      WHERE ack.admission_id=NEW.id AND ack.scope_key=NEW.scope_key
+        AND ack.worker_id=NEW.worker_id AND ack.generation=NEW.generation) THEN
+      RAISE EXCEPTION 'independent physical STOP receipt required'
+        USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+  END IF;
+  RAISE EXCEPTION 'illegal worker admission state transition'
+    USING ERRCODE='23514';
+END $$;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t
+    JOIN pg_catalog.pg_class AS c ON c.oid=t.tgrelid
+    JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+    WHERE n.nspname='zk1_gate' AND c.relname='admission'
+      AND t.tgname='zk1_gate_validate_admission_transition' AND NOT t.tgisinternal) THEN
+    CREATE TRIGGER zk1_gate_validate_admission_transition
+      BEFORE INSERT OR UPDATE ON zk1_gate.admission
+      FOR EACH ROW EXECUTE FUNCTION zk1_gate.validate_admission_transition();
+  END IF;
+END $$;
 -- A restricted gate runtime is allowed to update ONLY phase/generation and
 -- reservation identity columns. Enforce one-way phase and monotonically
 -- increasing fencing generation in the DATABASE, not only in JavaScript.
@@ -50,7 +214,9 @@ BEGIN
   IF NEW.scope_key IS DISTINCT FROM OLD.scope_key
     OR NEW.keyring_id IS DISTINCT FROM OLD.keyring_id
     OR NEW.revision IS DISTINCT FROM OLD.revision
-    OR NEW.digest IS DISTINCT FROM OLD.digest THEN
+    OR NEW.digest IS DISTINCT FROM OLD.digest
+    OR NEW.require_stop_proof IS DISTINCT FROM OLD.require_stop_proof
+    OR NEW.stop_lock IS DISTINCT FROM OLD.stop_lock THEN
     RAISE EXCEPTION 'gate head identity is immutable under runtime transition'
       USING ERRCODE='23514';
   END IF;
@@ -67,6 +233,15 @@ BEGIN
     IF EXISTS (SELECT 1 FROM zk1_gate.admission
       WHERE scope_key=OLD.scope_key AND state <> 'FINISHED') THEN
       RAISE EXCEPTION 'gate workers have not durably drained'
+        USING ERRCODE='23514';
+    END IF;
+    IF OLD.require_stop_proof AND EXISTS (
+      SELECT 1 FROM zk1_gate.admission AS a
+      WHERE a.scope_key=OLD.scope_key AND NOT EXISTS (
+        SELECT 1 FROM zk1_gate.physical_stop_receipt AS ack
+        WHERE ack.admission_id=a.id AND ack.scope_key=a.scope_key
+          AND ack.worker_id=a.worker_id AND ack.generation=a.generation)) THEN
+      RAISE EXCEPTION 'independent physical STOP evidence is incomplete'
         USING ERRCODE='23514';
     END IF;
     RETURN NEW;
@@ -223,21 +398,32 @@ REVOKE ALL ON ALL TABLES IN SCHEMA zk1_gate FROM PUBLIC;
 -- it is not cryptographic isolation against a compromised gate operator.
 DO $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='zk1_gate_runtime') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='zk1_gate_runtime') THEN
     CREATE ROLE zk1_gate_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='zk1_stop_runtime') THEN
+    CREATE ROLE zk1_stop_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
   END IF;
 END $$;
 GRANT USAGE ON SCHEMA zk1_gate TO zk1_gate_runtime;
 GRANT SELECT ON zk1_gate.head, zk1_gate.admission,
-  zk1_gate.ciphertext_chunk, zk1_gate.sealed_object TO zk1_gate_runtime;
+  zk1_gate.ciphertext_chunk, zk1_gate.sealed_object,
+  zk1_gate.physical_stop_receipt TO zk1_gate_runtime;
 GRANT UPDATE (phase, generation, operation_id, reservation_id)
   ON zk1_gate.head TO zk1_gate_runtime;
 GRANT INSERT (id, scope_key, worker_id, principal, action, object_id,
-  revision, digest, generation, state)
+  revision, digest, generation, state, host_key_id, process_epoch, process_pid)
   ON zk1_gate.admission TO zk1_gate_runtime;
 GRANT UPDATE (state) ON zk1_gate.admission TO zk1_gate_runtime;
 GRANT INSERT (scope_key, object_id, chunk_index, ciphertext)
   ON zk1_gate.ciphertext_chunk TO zk1_gate_runtime;
 GRANT INSERT (scope_key,object_id,revision,digest,generation,admission_id,
   expected_chunks,root_hash) ON zk1_gate.sealed_object TO zk1_gate_runtime;
+GRANT USAGE ON SCHEMA zk1_gate TO zk1_stop_runtime;
+GRANT SELECT ON zk1_gate.head, zk1_gate.admission,
+  zk1_gate.physical_stop_receipt TO zk1_stop_runtime;
+GRANT UPDATE (stop_lock) ON zk1_gate.head TO zk1_stop_runtime;
+GRANT INSERT (admission_id,scope_key,worker_id,generation,host_key_id,
+  process_epoch,process_pid,stopped_at,proof_digest,signed_proof)
+  ON zk1_gate.physical_stop_receipt TO zk1_stop_runtime;
 COMMIT;

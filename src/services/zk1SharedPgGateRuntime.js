@@ -45,13 +45,13 @@ async function verifyZk1SharedPgRuntimePool(pool) {
 }
 
 async function createIsolatedZk1SharedPgGateServer({ pool, key, cert, clientCa,
-  principals, enableSealing = false } = {}) {
+  principals, enableSealing = false, stopPinned } = {}) {
   // No listener/socket exists until the live PostgreSQL login and permissions
   // have been reconciled from the same pool used by gate transactions.
   await verifyZk1SharedPgRuntimePool(pool);
   if (typeof enableSealing !== "boolean") refuse();
   return createZk1SharedPgGateHttpsServer({ key, cert, clientCa,
-    gate: new Zk1SharedPgGateAuthority({ pool }),
+    gate: new Zk1SharedPgGateAuthority({ pool, stopPinned }),
     sealedStore: enableSealing ? new Zk1SharedPgSealedObjectStore({ pool }) : null,
     principals });
 }

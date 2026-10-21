@@ -148,6 +148,44 @@ test("restricted SQL runtime cannot reopen a quiesced or pending gate or skip wo
   assert.equal(Number(after.rows[0].generation), 2);
 });
 
+test("strict physical-stop scopes reject forged FINISHED/PENDING from the gate SQL role", {
+  skip: !url || !process.env.ROOTARK_ZK1_RUNTIME_PG_URL
+    ? "requires real disposable PostgreSQL and restricted gate credentials" : false,
+}, async (t) => {
+  const admin = new Pool({ connectionString: url, max: 2, connectionTimeoutMillis: 3000 });
+  const restricted = new Pool({ connectionString: process.env.ROOTARK_ZK1_RUNTIME_PG_URL,
+    max: 2, connectionTimeoutMillis: 3000 });
+  t.after(async () => Promise.all([admin.end(), restricted.end()]));
+  const s = randomScope();
+  const digest = crypto.randomBytes(32);
+  await admin.query(`INSERT INTO zk1_gate.head
+    (scope_key,keyring_id,revision,digest,require_stop_proof)
+    VALUES($1,$2,1,$3,TRUE)`, [key(s), s.keyring_id, digest]);
+  const gate = new Zk1SharedPgGateAuthority({ pool: restricted });
+  const io = { ...context(s, digest, "put", crypto.randomBytes(16).toString("base64url")),
+    hostKeyId: crypto.randomBytes(16), processEpoch: crypto.randomBytes(16),
+    processPid: 18181 };
+  const admitted = await gate.beginIoAdmission(io);
+  const op = { scope: s, operationId: crypto.randomBytes(16),
+    reservationId: crypto.randomBytes(16), revision: 1, digest };
+  assert.equal((await gate.beginQuiesce(op)).activeCount, 1);
+  assert.equal((await admin.query("SELECT state FROM zk1_gate.admission WHERE id=$1",
+    [admitted.admissionId])).rows[0].state, "STOP_REQUESTED");
+  await assert.rejects(restricted.query(`UPDATE zk1_gate.admission SET state='FINISHED' WHERE id=$1`,
+    [admitted.admissionId]), /stop|attest|proof|denied|physical/i,
+  "the gate account itself must not forge an independent physical worker STOP receipt");
+  await assert.rejects(gate.finishIoAdmission({ scope: s, admissionId: admitted.admissionId,
+    workerId: io.workerId, principal: io.principal }),
+  /ZK_GATE_UNAVAILABLE|ZK_GATE_DENIED|ZK_GATE_STOP_PROOF_INVALID/,
+  "legacy cooperative FINISH without independent STOP evidence must fail closed in strict scope");
+  await assert.rejects(gate.markPending({ scope: s,
+    operationId: op.operationId, reservationId: op.reservationId }),
+  /ZK_GATE_DRAIN_INCOMPLETE/);
+  assert.equal((await admin.query("SELECT phase FROM zk1_gate.head WHERE scope_key=$1",
+    [key(s)])).rows[0].phase, "QUIESCING",
+  "no terminal transition may occur without a separate trusted STOP authority");
+});
+
 test("shared PostgreSQL authority protects ciphertext chunk effect and closes all worker generations", {
   skip: !url && "requires isolated ROOTARK_ZK1_TEST_PG_URL",
 }, async (t) => {
