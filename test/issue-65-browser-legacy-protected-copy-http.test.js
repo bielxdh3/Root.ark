@@ -21,6 +21,26 @@ const ID = () => crypto.randomBytes(16).toString("base64url");
 const b64 = (bytes) => Buffer.from(bytes).toString("base64url");
 const headDomain = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0", "ascii");
 
+test("legacy ciphertext copy rejects oversized manifest digest before reading source", async () => {
+  const scope = { account_id: ID(), compartment_id: b64(Buffer.from("lab")),
+    keyring_id: ID() };
+  const oversized = new Uint8Array(33);
+  let sliceCalls = 0;
+  oversized.buffer.slice = () => { sliceCalls++; throw Error("oversized clone attempted"); };
+  let reads = 0;
+  await assert.rejects(migrate.copyLegacyIntoProtectedCiphertext({
+    legacy: { name: "legacy.txt", folderId: "" },
+    metadata: { ...scope, object_id: ID(), version_id: ID(),
+      parent_version_id: null, epoch: 1, kind: "file" },
+    signer: { signerKey: null, scope, deviceId: "trusted", manifestRevision: 1,
+      manifestDigest: oversized, epoch: 1, nowSeconds: 1400 },
+    cek: null, origin: "http://127.0.0.1:1234/",
+    fetchImpl: () => { reads++; throw Error("should not read source"); },
+  }), /ZK_CLIENT_MIGRATION_UNVERIFIED/);
+  assert.equal(sliceCalls, 0, "oversized digest must be rejected before copying backing buffer");
+  assert.equal(reads, 0, "oversized digest must be rejected before a legacy plaintext read");
+});
+
 async function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-legacy-copy-"));
   const state = await fixtures.createInitialState(2);

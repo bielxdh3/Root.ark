@@ -35,9 +35,14 @@
   }
   function copy(raw, min, max = min) {
     if (!ArrayBuffer.isView(raw) && !(raw instanceof ArrayBuffer)) deny();
+    // Reject untrusted oversized bytes BEFORE cloning their backing storage.
+    // A caller must not force a multi-megabyte allocation for a 32-byte key
+    // digest or an oversized ciphertext that will be rejected anyway.
+    const length = raw.byteLength;
+    if (!Number.isSafeInteger(length) || length < min || length > max) deny();
     const output = raw instanceof ArrayBuffer ? new Uint8Array(raw.slice(0))
       : new Uint8Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
-    if (output.length < min || output.length > max) deny();
+    if (output.length !== length) deny();
     return output;
   }
   function b64(bytes) {

@@ -36,10 +36,12 @@
     }
     function copy(bytes, expected) {
       if (!ArrayBuffer.isView(bytes) && !(bytes instanceof ArrayBuffer)) refuse();
+      const length = bytes.byteLength;
+      if (!Number.isSafeInteger(length) || (expected !== undefined && length !== expected)) refuse();
       const result = bytes instanceof ArrayBuffer ? new Uint8Array(bytes.slice(0))
         : new Uint8Array(bytes.buffer.slice(bytes.byteOffset,
           bytes.byteOffset + bytes.byteLength));
-      if (expected !== undefined && result.length !== expected) refuse();
+      if (result.length !== length) refuse();
       return result;
     }
     function equal(left, right) {

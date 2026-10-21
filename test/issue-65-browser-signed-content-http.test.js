@@ -24,6 +24,40 @@ const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0", "asc
 const randomId = () => crypto.randomBytes(16).toString("base64url");
 const base64 = (bytes) => Buffer.from(bytes).toString("base64url");
 
+test("protected browser signer rejects oversized byte inputs before allocating clones", async () => {
+  const pair = crypto.generateKeyPairSync("ed25519");
+  const signerKey = await crypto.webcrypto.subtle.importKey("pkcs8",
+    pair.privateKey.export({ type: "pkcs8", format: "der" }),
+    "Ed25519", false, ["sign"]);
+  const scope = { account_id: randomId(), compartment_id: base64(Buffer.from("lab")),
+    keyring_id: randomId() };
+  const input = { signerKey, scope, deviceId: "trusted", operation: "put",
+    objectId: randomId(), expectedObjectRevision: null, manifestRevision: 1,
+    manifestDigest: crypto.randomBytes(32), epoch: 1, nowSeconds: 1400,
+    ciphertext: crypto.randomBytes(16) };
+  for (const [field, size, arrayBuffer] of [
+    ["manifestDigest", 33, false],
+    ["ciphertext", 4 * 1024 * 1024 + 1, false],
+    ["ciphertext", 4 * 1024 * 1024 + 1, true],
+  ]) {
+    const backing = new ArrayBuffer(size);
+    let sliceCalls = 0;
+    backing.slice = () => { sliceCalls++; throw Error("oversized clone attempted"); };
+    await assert.rejects(browser.signProtectedContentOperation({
+      ...input, [field]: arrayBuffer ? backing : new Uint8Array(backing),
+    }), /ZK_BROWSER_CONTENT_UNAVAILABLE/);
+    assert.equal(sliceCalls, 0, `${field} oversized ${arrayBuffer ? "ArrayBuffer" : "view"} must never be cloned`);
+  }
+  const digest = new ArrayBuffer(33);
+  let digestCloneCalls = 0;
+  digest.slice = () => { digestCloneCalls++; throw Error("oversized digest clone attempted"); };
+  await assert.rejects(browser.signProtectedContentOperation({
+    ...input, operation: "get", ciphertext: null, expectedObjectRevision: 1,
+    expectedCiphertextDigest: digest,
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/);
+  assert.equal(digestCloneCalls, 0);
+});
+
 test("browser UMD executes without Node require and refuses a cross-origin signed transfer", async () => {
   const origin = "https://rootark.example";
   const context = vm.createContext({ crypto: crypto.webcrypto, TextEncoder, TextDecoder,
