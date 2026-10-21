@@ -61,6 +61,28 @@ privileges: a compromised gate controller (or DB administrator) could mint
 admissions while OPEN. These privileges must never be delegated to a child
 or ordinary app. The new writer role limits the CHILD only; it cannot prove
 owner/device authenticity, a live CAS/witness head, or anti-rollback.
+
+### Additional restricted-login P2: dormant SET ROLE membership
+
+Independent PG18.6 adversarial review found that the original writer
+identity preflight tested only `pg_has_role(..., 'USAGE')` for gate/STOP
+membership. A login assigned writer privileges and also assigned gate
+`WITH INHERIT FALSE, SET TRUE` could pass because direct `USAGE` was false
+and then issue `SET ROLE zk1_gate_runtime`. This would restore authority
+to mint admissions and mutate the gate. A separate RED regression
+`writer preflight rejects NOINHERIT login with SET ROLE access to the gate`
+demonstrated an actual falsely accepted restricted login on disposable PG.
+The verifier now requires both `MEMBER` and `SET` to be false for the
+gate and STOP roles, even if inherited `USAGE` is false. Focused real PG
+regression **35/35 PASS**, 0 FAIL/0 SKIP, exact Docker cleanup verified.
+
+**Still unresolved at this milestone:** a writer-only login has
+unrestricted SQL SELECT access to other tenants' staging metadata/ciphertext
+and can insert a chunk against any other OPEN object with an ACTIVE PUT
+admission. An independent reviewer reproduced cross-scope read and physical
+chunk insertion in disposable PG. This requires per-login, immutable
+operator-authenticated admission/worker binding and removal of global SELECT
+grants before anyone can treat the writer role as a tenant boundary.
 The lab does NOT authorize existing strict remote HTTPS START/PUT/SEAL/FINISH,
 nor guarantee quiescence of remote cloud/S3/GDrive/WebDAV operations,
 download/GET egress, descendant processes, buffered sockets, multi-host

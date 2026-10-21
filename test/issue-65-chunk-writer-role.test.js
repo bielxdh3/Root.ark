@@ -72,3 +72,39 @@ test("independent physical chunk writer cannot forge admission, head or STOP", {
     " WHERE scope_key=$1 AND object_id=$2", [key, objectId]);
   assert.deepEqual(rows.rows.map((row) => row.chunk_index), [0]);
 });
+
+test("writer preflight rejects NOINHERIT login with SET ROLE access to the gate", {
+  skip: !enabled && "requires disposable PG fixture and independently provisioned logins",
+}, async (t) => {
+  const admin = new Pool({ connectionString: urls.admin, max: 1,
+    connectionTimeoutMillis: 3000 });
+  const user = "zkwriterfixture_" + random(6).toString("hex");
+  const password = random(24).toString("hex");
+  const url = new URL(urls.writer);
+  url.username = user;
+  url.password = password;
+  const extra = new Pool({ connectionString: url.toString(), max: 1,
+    connectionTimeoutMillis: 3000 });
+  let created = false;
+  t.after(async () => {
+    await extra.end();
+    if (created) {
+      // Disposable, randomly provisioned lab-only role; no shared login
+      // alterations or production credentials.
+      await admin.query("DROP ROLE IF EXISTS " + user);
+    }
+    await admin.end();
+  });
+  await admin.query("CREATE ROLE " + user + " LOGIN PASSWORD '" + password + "'");
+  created = true;
+  await admin.query("GRANT zk1_chunk_writer_runtime TO " + user);
+  await admin.query("GRANT zk1_gate_runtime TO " + user + " WITH INHERIT FALSE, SET TRUE");
+  const evidence = await extra.query("SELECT "
+    + "pg_catalog.pg_has_role(current_user,'zk1_gate_runtime','USAGE') AS inherited, "
+    + "pg_catalog.pg_has_role(current_user,'zk1_gate_runtime','SET') AS can_switch");
+  assert.equal(evidence.rows[0].inherited, false);
+  assert.equal(evidence.rows[0].can_switch, true);
+  await assert.rejects(verifyZk1ChunkWriterRuntimePool(extra),
+    /ZK_CHUNK_WRITER_RUNTIME_INVALID/,
+    "a child must not carry dormant gate privileges obtainable through SET ROLE");
+});

@@ -22,6 +22,10 @@ async function verifyZk1ChunkWriterRuntimePool(pool) {
       pg_catalog.pg_has_role(current_user,'zk1_chunk_writer_runtime','USAGE') AS writer_access,
       pg_catalog.pg_has_role(current_user,'zk1_gate_runtime','USAGE') AS gate_access,
       pg_catalog.pg_has_role(current_user,'zk1_stop_runtime','USAGE') AS stop_access,
+      pg_catalog.pg_has_role(current_user,'zk1_gate_runtime','MEMBER') AS gate_member,
+      pg_catalog.pg_has_role(current_user,'zk1_stop_runtime','MEMBER') AS stop_member,
+      pg_catalog.pg_has_role(current_user,'zk1_gate_runtime','SET') AS can_set_gate,
+      pg_catalog.pg_has_role(current_user,'zk1_stop_runtime','SET') AS can_set_stop,
       pg_catalog.has_schema_privilege(current_user,'zk1_gate','USAGE') AS schema_access,
       pg_catalog.has_schema_privilege(current_user,'zk1_gate','CREATE') AS schema_create,
       pg_catalog.has_table_privilege(current_user,'zk1_gate.head','SELECT') AS head_read,
@@ -46,6 +50,8 @@ async function verifyZk1ChunkWriterRuntimePool(pool) {
       || x.is_superuser !== false || x.can_create_db !== false
       || x.can_create_role !== false || x.writer_access !== true
       || x.gate_access !== false || x.stop_access !== false
+      || x.gate_member !== false || x.stop_member !== false
+      || x.can_set_gate !== false || x.can_set_stop !== false
       || x.schema_access !== true || x.schema_create !== false
       || x.head_read !== true || x.admission_read !== true || x.seal_read !== true
       || x.write_scope !== true || x.write_object !== true
