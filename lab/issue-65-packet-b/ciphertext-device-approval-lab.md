@@ -53,3 +53,43 @@ before enabling any release, sink, ordinary app or strict HTTPS endpoint.
 Run synthetic adversarial tests in Node 22 with
 `node --test test/issue-65-ciphertext-device-approval-v1.test.js`.
 No user data, real keys, production storage, release logic or deploy changed.
+
+## Isolated manifest/witness consistency inspector (experimental)
+
+`src/crypto/rootark-zk-ciphertext-approval-consistency-v1.js` exports
+`inspectZk1CiphertextApprovalConsistencyV1` for synthetic/local laboratory
+checks only. It requires the existing module's **MAC-verified complete v2
+history proof** (`verifyTrustedDeviceRecoveryHistoryV2` or
+`verifyRecoveryPackageHistoryV2`, subsequently checked with
+`isVerifiedRecoveryHistoryV2`). A plain signed manifest, a claimed verified
+boolean or a caller-owned manifest snapshot cannot replace that proof.
+
+The inspector snapshots all external byte inputs before its first await. It
+compares the history's actual v2 manifest digest and revision with the proposed
+approval's exact account/compartment/keyring, epoch and independently expected
+object revision, chunk count/root and nonce. The Ed25519 signer ID and raw
+public key must match an active device record with `revoked_at_epoch === null`
+inside the verified head manifest. The separate pinned device public `KeyObject`
+must agree byte-for-byte with that record; a sender-chosen public key is not a
+substitute. It verifies the witness's canonical signed **committed** head with
+the existing `inspectVerifiedWitnessFreshHeadV1`, then compares its signed
+manifest revision/digest with the same verified manifest. Detached signatures,
+stale revisions, scope swaps, changed keys, revoked devices, mutated buffers
+and mismatching commitments reject with a single consistency error.
+
+Even all-green local evidence returns `authorizesPublish: false`,
+`authorizesRecovery: false`, `liveFreshnessVerified: false` and
+`nonceConsumed: false`. `verifiedSignatureOnly` witness receipts cannot prove
+actual independent live CAS authority, persistent monotonic high-water across
+restarts/rollback, owner-pinned trust on first contact, or atomic one-use
+nonces. The approved v2 history does not itself bind the object's ciphertext
+root, so that field is checked only against a caller-supplied expected content
+tuple and must never be treated as storage authority. An attacker capable of
+substituting *both* bootstrap keys and historical evidence remains outside
+this inspector's security guarantees. The ciphertext-approval wire type and
+draft dual-recovery spec revision 3 remain unapproved; this code does not
+establish a released wire format, implement device revocation enforcement or
+authorize any normal sink/server route.
+
+Run `node --test test/issue-65-ciphertext-approval-consistency-v1.test.js`
+using Node 22 for the intended independent validation environment.
