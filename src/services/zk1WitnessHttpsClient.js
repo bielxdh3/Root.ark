@@ -91,6 +91,11 @@ function createZk1WitnessHttpsClient({
       };
       const request = https.request({
         hostname: url.hostname, port: url.port, path, method: "POST",
+        // Enforce this instance's certificate pin on EVERY TLS handshake.
+        // A shared keep-alive socket may have been authenticated by another
+        // client with a different serverFingerprint256; TLS does not
+        // re-run checkServerIdentity when reusing that existing socket.
+        agent: false,
         ca, key: clientKey, cert: clientCert, rejectUnauthorized: true,
         minVersion: "TLSv1.3", servername: url.hostname,
         checkServerIdentity(hostname, peer) {

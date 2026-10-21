@@ -49,6 +49,7 @@ function createZk1CasManifestHttpsClient({
         };
         const request = https.request({
           hostname: url.hostname, port: url.port, method: "POST", path: url.pathname,
+          agent: false, // do not reuse a socket authenticated under another TLS pin
           ca, cert: clientCert, key: clientKey, rejectUnauthorized: true,
           minVersion: "TLSv1.3", servername: url.hostname,
           checkServerIdentity(hostname, peer) {

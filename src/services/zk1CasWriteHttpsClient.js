@@ -52,6 +52,7 @@ function createZk1CasWriteHttpsClient({
       };
       const req = https.request({
         hostname: url.hostname, port: url.port, path, method: "POST",
+        agent: false, // never borrow a socket verified by another writer pin
         ca, key: clientKey, cert: clientCert, rejectUnauthorized: true,
         minVersion: "TLSv1.3", servername: url.hostname,
         checkServerIdentity(hostname, peer) {

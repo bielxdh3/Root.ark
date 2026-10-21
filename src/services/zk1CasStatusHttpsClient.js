@@ -73,6 +73,7 @@ function createZk1CasStatusHttpsClient({
         const request = https.request({
           hostname: url.hostname, port: url.port,
           path: url.pathname, method: "POST",
+          agent: false, // always recheck this CAS-status client's exact server pin
           ca, cert: clientCert, key: clientKey,
           rejectUnauthorized: true, minVersion: "TLSv1.3",
           servername: url.hostname,
