@@ -103,6 +103,19 @@ test("manifest device revocation, old head and mismatched device identity all fa
     keyring_epoch: f.state.headManifest.current_epoch });
   await assert.rejects(inspect({ ...current, rawApproval: freshlySignedRevoked }), invalid,
     "even correctly re-signed current-epoch ciphertext is denied for a revoked signer");
+  const revokedRecord = fresh.headManifest.devices.find((d) =>
+    d.device_id === f.signer.device_id);
+  const actualRevocation = revokedRecord.revoked_at_epoch;
+  assert.notEqual(actualRevocation, null);
+  // Mutation is restored just before the first verifier await completes:
+  // synchronous untrusted snapshots cannot turn a signed REVOKED device
+  // into an ACTIVE signer while the WeakMap history proof remains valid.
+  revokedRecord.revoked_at_epoch = null;
+  const concurrent = inspect({ ...current, rawApproval: freshlySignedRevoked });
+  revokedRecord.revoked_at_epoch = actualRevocation;
+  assert.equal(await h.isVerifiedPublicRecoveryHistoryV2(fresh), true);
+  await assert.rejects(concurrent, invalid,
+    "revocation must come from a stable digest-matched signed manifest snapshot");
   await assert.rejects(inspect({ ...f.input,
     minimumHead: current.minimumHead }), invalid,
   "signed old witness is below independently pinned high-water floor");

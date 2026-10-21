@@ -23,6 +23,18 @@ tampered object/root/chunk count, epoch, scope, digest or challenge. It checks
 that the signed witness `observed_at` is no more than 60 seconds old and not
 from the future relative to the verifier's supplied clock. Every caller-owned
 buffer and Ed25519 `KeyObject` pin is captured before asynchronous CBOR work.
+An independent adversarial review additionally proved a TOCTOU P2 in the
+first preflight version: transiently changing a revoked device entry to
+`revoked_at_epoch=null` before the first async history verification, then
+restoring it before the await resumed, could make the inspector report
+`signerListedActiveInSignedHead:true` for a *verified revoked* signed head.
+The corrected inspector synchronously snapshots the entire bounded head
+manifest and verifies **the snapshot's** SHA-256 manifest digest against the
+verified signed public history before examining device enrollment/revocation.
+New RED regression `manifest device revocation...` was 4/5 PASS (false
+acceptance reproduced) and GREEN Node 22 focused inspector suites were
+**9/9 PASS**, 0 FAIL. This remains non-authorizing history consistency
+evidence, not online revocation or release authority.
 
 **Security limits that are NOT closed:**
 

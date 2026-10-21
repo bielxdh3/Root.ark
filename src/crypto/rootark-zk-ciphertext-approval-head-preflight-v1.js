@@ -99,10 +99,19 @@ async function inspectZk1CiphertextApprovalHeadPreflightV1(input) {
     const minimumHead = { revision: positive(floor.revision),
       digest: bytes(floor.digest, 32), witnessSequence: positive(floor.witnessSequence) };
     const nowSeconds = positive(input.nowSeconds);
-    const head = history?.headManifest;
-    if (!head || !Array.isArray(head.devices)) fail();
-    // A signed-history WeakMap proof alone is acceptable as HISTORY evidence,
-    // not as an asserted current/recent state. Capture manifest fields early.
+    const liveHead = history?.headManifest;
+    if (!liveHead || !Array.isArray(liveHead.devices)
+      || liveHead.devices.length > 256) fail();
+    // A caller can temporarily mutate the WeakMap-backed history head before
+    // this async verifier's first await, then restore its authentic revoked
+    // state while the history verifier runs. A field-only pre-await copy
+    // could then falsely call the revoked signer ACTIVE. Snapshot the ENTIRE
+    // manifest synchronously, and bind *that snapshot* to the independently
+    // verified signed manifest digest; do not authenticate one live object
+    // then inspect values copied from a different transient object state.
+    const head = structuredClone(liveHead);
+    // A signed-history WeakMap proof establishes HISTORY authenticity, not
+    // online current state, retained nonce or actual device availability.
     const headScope = scopeOf({ account_id: head.account_id,
       compartment_id: head.compartment_id, keyring_id: head.keyring_id });
     const headRevision = positive(head.revision);
