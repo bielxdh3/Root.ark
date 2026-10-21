@@ -19,12 +19,27 @@ escalation (not a bypass of post-QUIESCING physical fencing).
 - `zk1_chunk_writer_runtime` is a new non-login, non-admin, non-inheriting
   PostgreSQL role. A separate operator-provisioned LOGIN is granted only
   its membership; the gate and STOP SQL logins remain separate.
-- This role can SELECT the head, admission and physical ciphertext tables
-  to check scope, revision, digest, generation, worker ID and process binding,
-  and INSERT limited ciphertext chunks. It cannot INSERT admissions, UPDATE
-  head/generation or admission, INSERT SEALED or physical STOP receipts, or
-  DELETE/TRUNCATE ciphertext. This is checked against `pg_catalog` by
-  `verifyZk1ChunkWriterRuntimePool` before any child write.
+- The original role could SELECT head/admission/ciphertext/SEALED globally
+  and INSERT chunks directly. A second independent P2 attack exploited this:
+  a writer credential enumerated two distinct tenants and inserted a staging
+  chunk in an unrelated OPEN object with a legitimate ACTIVE PUT admission.
+  The hardened role now has NO raw SELECT/INSERT/UPDATE/DELETE/TRUNCATE on
+  shared tables, and cannot mint admissions or STOP evidence.
+- A trusted gate operator inserts an immutable `writer_binding` tuple only
+  after verified START: one independently provisioned writer LOGIN maps to
+  exactly one admission, scope, object, worker, generation, epoch and process
+  PID. `session_user` from the actual PostgreSQL authenticated login, not
+  caller-provided scope/worker claims, selects this tuple. No binding table
+  SELECT is granted to writers. Unique constraints prevent rebinding.
+- The only physical writer effect is `zk1_gate.write_bound_chunk(index,bytes)`,
+  a fixed SECURITY DEFINER function with no scope/object/admission arguments.
+  It checks immutable binding, OPEN/ACTIVE and READ COMMITTED, locks the head
+  FOR UPDATE, and inserts into the physical table (which also fires the
+  independently maintained post-SEALED/OPEN trigger). An optional exact
+  boolean binding verifier leaks no broad table rows. Both routines pin
+  `search_path=pg_catalog`, use schema-qualified objects and revoke PUBLIC
+  execution. `verifyZk1ChunkWriterRuntimePool` checks this least-privilege
+  SQL identity before the child starts.
 - The operator-owned, schema-qualified, fixed `reject_chunk_after_seal`
   PostgreSQL trigger is `SECURITY DEFINER` with pinned
   `search_path=pg_catalog` and no dynamically interpolated SQL. It alone
@@ -76,13 +91,30 @@ The verifier now requires both `MEMBER` and `SET` to be false for the
 gate and STOP roles, even if inherited `USAGE` is false. Focused real PG
 regression **35/35 PASS**, 0 FAIL/0 SKIP, exact Docker cleanup verified.
 
-**Still unresolved at this milestone:** a writer-only login has
-unrestricted SQL SELECT access to other tenants' staging metadata/ciphertext
-and can insert a chunk against any other OPEN object with an ACTIVE PUT
-admission. An independent reviewer reproduced cross-scope read and physical
-chunk insertion in disposable PG. This requires per-login, immutable
-operator-authenticated admission/worker binding and removal of global SELECT
-grants before anyone can treat the writer role as a tenant boundary.
+### Cross-scope P2 — bounded local remediation
+
+The independently reproduced cross-tenant metadata enumeration/ciphertext
+poisoning attack above has a local SQL-specific mitigation: an unbound login
+cannot write, direct SELECT or INSERT of protected tables is denied, the
+operator cannot rebind the same login to a different active tenant, and the
+only delegated write function has no tenant identifier parameter. Physical
+post-quiesce fencing is still performed under the same SQL row lock and
+transaction as the actual INSERT. This does **not** stop an attacker who
+steals the already-bound writer credential from injecting ciphertext into
+the one legitimate object's staging area *while that admission is OPEN*.
+The separately authenticated owner/device root and sealing process must
+detect that manipulation before publication. A PostgreSQL login or signed
+STOP receipt does not attest a remote OS process or prove device integrity.
+
+Final local delta validation after the immutable per-login binding and
+function-only writer API: disposable PostgreSQL 18.6 **35/35 PASS, 0 FAIL,
+0 SKIP**, exact container identity/labels cleanup verified; syntax
+**338 checked, 0 failed**, artifact and whitespace checks PASS on the
+shared worktree at this point. The bounded test covers a simultaneously
+ACTIVE foreign PUT, no raw global SELECT or INSERT, no binding replay to
+another admission, the sole bound write, QUIESCING late denial, child
+SIGKILL rollback, and independently signed STOP. Tests run on Windows
+Node 24 for the PostgreSQL fixture; not a two-host/cloud acceptance claim.
 The lab does NOT authorize existing strict remote HTTPS START/PUT/SEAL/FINISH,
 nor guarantee quiescence of remote cloud/S3/GDrive/WebDAV operations,
 download/GET egress, descendant processes, buffered sockets, multi-host

@@ -59,6 +59,140 @@ ALTER TABLE zk1_gate.admission ADD COLUMN IF NOT EXISTS
   process_pid bigint CHECK(process_pid IS NULL OR process_pid>0);
 CREATE INDEX IF NOT EXISTS admission_unfinished
   ON zk1_gate.admission(scope_key,state);
+-- A separately provisioned physical writer LOGIN may be bound by the trusted
+-- gate to exactly ONE strict admission/object/process. This binding is
+-- operator-inserted and immutable; the writer login is never allowed to
+-- SELECT, INSERT, UPDATE or DELETE it. session_user (not mutable SET ROLE or
+-- caller-supplied application_name) identifies that exact authenticated
+-- PostgreSQL login inside the physical chunk trigger.
+CREATE TABLE IF NOT EXISTS zk1_gate.writer_binding (
+  writer_login name PRIMARY KEY,
+  admission_id bytea NOT NULL UNIQUE REFERENCES zk1_gate.admission(id),
+  scope_key text NOT NULL REFERENCES zk1_gate.head(scope_key),
+  object_id text NOT NULL,
+  worker_id bytea NOT NULL CHECK(octet_length(worker_id)=16),
+  generation bigint NOT NULL CHECK(generation>0),
+  process_epoch bytea NOT NULL CHECK(octet_length(process_epoch)=16),
+  process_pid bigint NOT NULL CHECK(process_pid>0)
+);
+CREATE OR REPLACE FUNCTION zk1_gate.validate_writer_binding()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+BEGIN
+  IF pg_catalog.current_setting('transaction_isolation') <> 'read committed'
+    OR NOT pg_catalog.pg_has_role(NEW.writer_login,'zk1_chunk_writer_runtime','USAGE')
+    OR pg_catalog.pg_has_role(NEW.writer_login,'zk1_gate_runtime','MEMBER')
+    OR pg_catalog.pg_has_role(NEW.writer_login,'zk1_stop_runtime','MEMBER') THEN
+    RAISE EXCEPTION 'writer identity requires independently restricted runtime'
+      USING ERRCODE='23514';
+  END IF;
+  PERFORM 1 FROM zk1_gate.head WHERE scope_key=NEW.scope_key
+    AND require_stop_proof=TRUE AND phase='OPEN' AND generation=NEW.generation FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'writer binding requires current strict OPEN generation'
+      USING ERRCODE='23514';
+  END IF;
+  PERFORM 1 FROM zk1_gate.admission WHERE id=NEW.admission_id
+    AND scope_key=NEW.scope_key AND worker_id=NEW.worker_id
+    AND object_id=NEW.object_id AND action='put' AND state='ACTIVE'
+    AND generation=NEW.generation AND process_epoch=NEW.process_epoch
+    AND process_pid=NEW.process_pid;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'writer binding requires exact active supervised admission'
+      USING ERRCODE='23514';
+  END IF;
+  RETURN NEW;
+END $$;
+REVOKE ALL ON FUNCTION zk1_gate.validate_writer_binding() FROM PUBLIC;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t
+    JOIN pg_catalog.pg_class AS c ON c.oid=t.tgrelid
+    JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+    WHERE n.nspname='zk1_gate' AND c.relname='writer_binding'
+      AND t.tgname='zk1_gate_validate_writer_binding' AND NOT t.tgisinternal) THEN
+    CREATE TRIGGER zk1_gate_validate_writer_binding
+      BEFORE INSERT ON zk1_gate.writer_binding
+      FOR EACH ROW EXECUTE FUNCTION zk1_gate.validate_writer_binding();
+  END IF;
+END $$;
+-- Only a yes/no check with an exact, independently pinned tuple crosses the
+-- privileged binding table boundary. A client-provided session claim has no
+-- authority because session_user is the authenticated PostgreSQL login.
+CREATE OR REPLACE FUNCTION zk1_gate.verify_chunk_writer_binding(
+  p_scope_key text, p_admission_id bytea, p_object_id text,
+  p_generation bigint, p_worker_id bytea, p_process_epoch bytea,
+  p_process_pid bigint, p_revision bigint, p_digest bytea,
+  p_keyring_id bytea, p_principal text)
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM zk1_gate.writer_binding AS b
+    JOIN zk1_gate.admission AS a ON a.id=b.admission_id
+    JOIN zk1_gate.head AS h ON h.scope_key=b.scope_key
+    WHERE b.writer_login=session_user
+      AND b.scope_key=p_scope_key AND b.admission_id=p_admission_id
+      AND b.object_id=p_object_id AND b.generation=p_generation
+      AND b.worker_id=p_worker_id AND b.process_epoch=p_process_epoch
+      AND b.process_pid=p_process_pid
+      AND h.phase='OPEN' AND h.require_stop_proof=TRUE
+      AND h.generation=p_generation AND h.revision=p_revision
+      AND h.digest=p_digest AND h.keyring_id=p_keyring_id
+      AND a.scope_key=b.scope_key AND a.worker_id=b.worker_id
+      AND a.object_id=b.object_id AND a.generation=b.generation
+      AND a.process_epoch=b.process_epoch AND a.process_pid=b.process_pid
+      AND a.principal=p_principal AND a.action='put' AND a.state='ACTIVE'
+      AND a.revision=p_revision AND a.digest=p_digest
+  )
+$$;
+REVOKE ALL ON FUNCTION zk1_gate.verify_chunk_writer_binding(
+  text,bytea,text,bigint,bytea,bytea,bigint,bigint,bytea,bytea,text) FROM PUBLIC;
+-- Only SQL physical effect exposed to a delegated child. Its authenticated
+-- PostgreSQL session_user resolves a single immutable operator-owned
+-- admission. No caller-provided scope, object or process identifier can
+-- select another tenant or admission.
+CREATE OR REPLACE FUNCTION zk1_gate.write_bound_chunk(
+  p_chunk_index integer, p_ciphertext bytea)
+RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+DECLARE
+  bound record;
+BEGIN
+  IF pg_catalog.current_setting('transaction_isolation') <> 'read committed'
+    OR p_chunk_index IS NULL OR p_chunk_index < 0 OR p_chunk_index > 4095
+    OR p_ciphertext IS NULL
+    OR pg_catalog.octet_length(p_ciphertext) NOT BETWEEN 1 AND 4194304
+    OR NOT pg_catalog.pg_has_role(session_user,'zk1_chunk_writer_runtime','USAGE')
+    OR pg_catalog.pg_has_role(session_user,'zk1_gate_runtime','MEMBER')
+    OR pg_catalog.pg_has_role(session_user,'zk1_stop_runtime','MEMBER') THEN
+    RAISE EXCEPTION 'physical writer runtime or chunk invalid'
+      USING ERRCODE='23514';
+  END IF;
+  SELECT writer_login,admission_id,scope_key,object_id,worker_id,generation,
+    process_epoch,process_pid INTO bound
+    FROM zk1_gate.writer_binding WHERE writer_login=session_user;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'physical writer has no trusted admission binding'
+      USING ERRCODE='23514';
+  END IF;
+  PERFORM 1 FROM zk1_gate.head WHERE scope_key=bound.scope_key
+    AND require_stop_proof=TRUE AND phase='OPEN'
+    AND generation=bound.generation FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'physical writer generation is closed'
+      USING ERRCODE='23514';
+  END IF;
+  PERFORM 1 FROM zk1_gate.admission
+    WHERE id=bound.admission_id AND scope_key=bound.scope_key
+    AND object_id=bound.object_id AND worker_id=bound.worker_id
+    AND generation=bound.generation AND process_epoch=bound.process_epoch
+    AND process_pid=bound.process_pid AND action='put' AND state='ACTIVE';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'physical writer admission is not ACTIVE'
+      USING ERRCODE='23514';
+  END IF;
+  INSERT INTO zk1_gate.ciphertext_chunk(scope_key,object_id,chunk_index,ciphertext)
+    VALUES(bound.scope_key,bound.object_id,p_chunk_index,p_ciphertext);
+  RETURN TRUE;
+END $$;
+REVOKE ALL ON FUNCTION zk1_gate.write_bound_chunk(integer,bytea) FROM PUBLIC;
 -- Separate STOP-witness evidence channel: the data-plane gate SQL login is
 -- intentionally not allowed to INSERT here. A separate operator-owned
 -- runtime must independently validate trusted physical worker termination
@@ -334,6 +468,35 @@ BEGIN
     RAISE EXCEPTION 'ciphertext chunk insertion requires active admission'
       USING ERRCODE='23514';
   END IF;
+  -- PostgreSQL superusers can appear to have every role privilege even
+  -- without ordinary membership. This dedicated-child branch must not
+  -- reinterpret an explicitly trusted DB administrator as a child login.
+  IF pg_catalog.pg_has_role(session_user,'zk1_chunk_writer_runtime','MEMBER')
+    AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles
+                    WHERE rolname=session_user AND rolsuper=TRUE) THEN
+    -- A delegated child cannot inherit either controller role or write to an
+    -- unrelated tenant's active object. The independently provisioned SQL
+    -- LOGIN, not caller-supplied WorkerId, indexes an immutable binding.
+    IF pg_catalog.pg_has_role(session_user,'zk1_gate_runtime','MEMBER')
+      OR pg_catalog.pg_has_role(session_user,'zk1_stop_runtime','MEMBER') THEN
+      RAISE EXCEPTION 'writer runtime cannot hold gate or STOP authority'
+        USING ERRCODE='23514';
+    END IF;
+    PERFORM 1 FROM zk1_gate.writer_binding AS b
+      JOIN zk1_gate.admission AS a ON a.id=b.admission_id
+      WHERE b.writer_login=session_user
+        AND b.scope_key=NEW.scope_key AND b.object_id=NEW.object_id
+        AND b.generation=current_head.generation
+        AND a.scope_key=b.scope_key AND a.object_id=b.object_id
+        AND a.worker_id=b.worker_id AND a.generation=b.generation
+        AND a.process_epoch=b.process_epoch AND a.process_pid=b.process_pid
+        AND a.action='put' AND a.state='ACTIVE'
+        AND a.revision=current_head.revision AND a.digest=current_head.digest;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'physical child writer lacks bound active admission'
+        USING ERRCODE='23514';
+    END IF;
+  END IF;
   RETURN NEW;
 END $$;
 REVOKE ALL ON FUNCTION zk1_gate.reject_chunk_after_seal() FROM PUBLIC;
@@ -448,6 +611,9 @@ GRANT INSERT (id, scope_key, worker_id, principal, action, object_id,
 GRANT UPDATE (state) ON zk1_gate.admission TO zk1_gate_runtime;
 GRANT INSERT (scope_key, object_id, chunk_index, ciphertext)
   ON zk1_gate.ciphertext_chunk TO zk1_gate_runtime;
+GRANT INSERT (writer_login,admission_id,scope_key,object_id,worker_id,
+  generation,process_epoch,process_pid)
+  ON zk1_gate.writer_binding TO zk1_gate_runtime;
 GRANT INSERT (scope_key,object_id,revision,digest,generation,admission_id,
   expected_chunks,root_hash) ON zk1_gate.sealed_object TO zk1_gate_runtime;
 GRANT USAGE ON SCHEMA zk1_gate TO zk1_stop_runtime;
@@ -462,9 +628,15 @@ GRANT INSERT (admission_id,scope_key,worker_id,generation,host_key_id,
 -- staging bytes. It MUST NOT mint admissions, advance head generation,
 -- publish SEALED, record STOP receipts or impersonate the gate controller.
 GRANT USAGE ON SCHEMA zk1_gate TO zk1_chunk_writer_runtime;
-GRANT SELECT ON zk1_gate.head, zk1_gate.admission,
-  zk1_gate.ciphertext_chunk, zk1_gate.sealed_object
+REVOKE SELECT ON zk1_gate.head,zk1_gate.admission,
+  zk1_gate.ciphertext_chunk,zk1_gate.sealed_object
+  FROM zk1_chunk_writer_runtime;
+REVOKE SELECT (chunk_index) ON zk1_gate.ciphertext_chunk
+  FROM zk1_chunk_writer_runtime;
+REVOKE INSERT ON zk1_gate.ciphertext_chunk FROM zk1_chunk_writer_runtime;
+GRANT EXECUTE ON FUNCTION zk1_gate.verify_chunk_writer_binding(
+  text,bytea,text,bigint,bytea,bytea,bigint,bigint,bytea,bytea,text)
   TO zk1_chunk_writer_runtime;
-GRANT INSERT (scope_key,object_id,chunk_index,ciphertext)
-  ON zk1_gate.ciphertext_chunk TO zk1_chunk_writer_runtime;
+GRANT EXECUTE ON FUNCTION zk1_gate.write_bound_chunk(integer,bytea)
+  TO zk1_chunk_writer_runtime;
 COMMIT;

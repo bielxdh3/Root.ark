@@ -31,10 +31,15 @@ async function verifyZk1ChunkWriterRuntimePool(pool) {
       pg_catalog.has_table_privilege(current_user,'zk1_gate.head','SELECT') AS head_read,
       pg_catalog.has_table_privilege(current_user,'zk1_gate.admission','SELECT') AS admission_read,
       pg_catalog.has_table_privilege(current_user,'zk1_gate.sealed_object','SELECT') AS seal_read,
+      pg_catalog.has_column_privilege(current_user,'zk1_gate.ciphertext_chunk','chunk_index','SELECT') AS read_index,
+      pg_catalog.has_column_privilege(current_user,'zk1_gate.ciphertext_chunk','ciphertext','SELECT') AS read_ciphertext,
+      pg_catalog.has_column_privilege(current_user,'zk1_gate.ciphertext_chunk','scope_key','SELECT') AS read_scope,
       pg_catalog.has_column_privilege(current_user,'zk1_gate.ciphertext_chunk','scope_key','INSERT') AS write_scope,
       pg_catalog.has_column_privilege(current_user,'zk1_gate.ciphertext_chunk','object_id','INSERT') AS write_object,
       pg_catalog.has_column_privilege(current_user,'zk1_gate.ciphertext_chunk','chunk_index','INSERT') AS write_index,
       pg_catalog.has_column_privilege(current_user,'zk1_gate.ciphertext_chunk','ciphertext','INSERT') AS write_bytes,
+      pg_catalog.has_function_privilege(current_user,
+        'zk1_gate.write_bound_chunk(integer,bytea)','EXECUTE') AS write_bound_effect,
       pg_catalog.has_column_privilege(current_user,'zk1_gate.head','phase','UPDATE') AS mutate_gate,
       pg_catalog.has_column_privilege(current_user,'zk1_gate.head','generation','UPDATE') AS mutate_generation,
       pg_catalog.has_column_privilege(current_user,'zk1_gate.admission','id','INSERT') AS mint_admission,
@@ -53,9 +58,11 @@ async function verifyZk1ChunkWriterRuntimePool(pool) {
       || x.gate_member !== false || x.stop_member !== false
       || x.can_set_gate !== false || x.can_set_stop !== false
       || x.schema_access !== true || x.schema_create !== false
-      || x.head_read !== true || x.admission_read !== true || x.seal_read !== true
-      || x.write_scope !== true || x.write_object !== true
-      || x.write_index !== true || x.write_bytes !== true
+      || x.head_read !== false || x.admission_read !== false || x.seal_read !== false
+      || x.read_index !== false || x.read_ciphertext !== false || x.read_scope !== false
+      || x.write_scope !== false || x.write_object !== false
+      || x.write_index !== false || x.write_bytes !== false
+      || x.write_bound_effect !== true
       || x.mutate_gate !== false || x.mutate_generation !== false
       || x.mint_admission !== false || x.mutate_admission !== false
       || x.forge_seal !== false || x.forge_stop !== false

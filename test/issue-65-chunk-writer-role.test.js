@@ -59,14 +59,63 @@ test("independent physical chunk writer cannot forge admission, head or STOP", {
   await assert.rejects(pools.writer.query("INSERT INTO zk1_gate.physical_stop_receipt (admission_id) VALUES($1)",
     [started.admissionId]), /permission|denied|42501/i,
   "writer must not forge STOP proof receipts");
-  const write = (index) => pools.writer.query("INSERT INTO zk1_gate.ciphertext_chunk" +
-    " (scope_key,object_id,chunk_index,ciphertext) VALUES($1,$2,$3,$4)",
-  [key, objectId, index, random(31)]);
-  assert.equal((await write(0)).rowCount, 1, "strict child may write while OPEN with a true admission");
+  const writerLogin = decodeURIComponent(new URL(urls.writer).username);
+  const write = (index) => pools.writer.query(
+    "SELECT zk1_gate.write_bound_chunk($1,$2) AS stored", [index, random(31)]);
+  await assert.rejects(write(0), /no trusted admission binding|23514/i,
+    "possession of a writer login is not itself an authorization to write");
+  for (const table of ["head", "admission", "sealed_object", "ciphertext_chunk"]) {
+    await assert.rejects(pools.writer.query("SELECT * FROM zk1_gate." + table),
+      /permission|denied|42501/i,
+      "writer credential must not enumerate global " + table);
+  }
+  await assert.rejects(pools.writer.query(
+    "SELECT chunk_index FROM zk1_gate.ciphertext_chunk"),
+  /permission|denied|42501/i,
+  "even index-only SELECT cannot reveal other tenants' staging counts");
+  await assert.rejects(pools.writer.query("INSERT INTO zk1_gate.ciphertext_chunk" +
+    " (scope_key,object_id,chunk_index,ciphertext) VALUES($1,$2,0,$3)",
+  [key, objectId, random(31)]), /permission|denied|42501/i,
+  "writer cannot bypass the scope-binding function with raw INSERT");
+  const victim = { account_id: random(16), compartment_id: random(8), keyring_id: random(16) };
+  const victimKey = scopeKey(victim);
+  const victimObject = random(16).toString("base64url");
+  const victimDigest = random(32);
+  await pools.admin.query("INSERT INTO zk1_gate.head" +
+    " (scope_key,keyring_id,revision,digest,require_stop_proof) VALUES($1,$2,1,$3,TRUE)",
+  [victimKey, victim.keyring_id, victimDigest]);
+  const victimAdmission = { scope: victim, workerId: random(16),
+    principal: "BB:".repeat(31) + "BB", action: "put",
+    objectId: victimObject, revision: 1, digest: victimDigest,
+    hostKeyId: random(16), processEpoch: random(16), processPid: process.pid };
+  const victimStarted = await gate.beginIoAdmission(victimAdmission);
+  await assert.rejects(pools.writer.query("INSERT INTO zk1_gate.ciphertext_chunk" +
+    " (scope_key,object_id,chunk_index,ciphertext) VALUES($1,$2,0,$3)",
+  [victimKey, victimObject, random(31)]), /permission|denied|42501/i,
+  "a still-OPEN victim admission never authorizes another child's raw SQL");
+  await pools.gate.query("INSERT INTO zk1_gate.writer_binding" +
+    " (writer_login,admission_id,scope_key,object_id,worker_id,generation,process_epoch,process_pid)" +
+    " VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+  [writerLogin, started.admissionId, key, objectId, admission.workerId,
+    started.generation, admission.processEpoch, admission.processPid]);
+  await assert.rejects(pools.gate.query("INSERT INTO zk1_gate.writer_binding" +
+    " (writer_login,admission_id,scope_key,object_id,worker_id,generation,process_epoch,process_pid)" +
+    " VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+  [writerLogin, victimStarted.admissionId, victimKey, victimObject,
+    victimAdmission.workerId, victimStarted.generation,
+    victimAdmission.processEpoch, victimAdmission.processPid]),
+  /duplicate|unique|23505/i,
+  "an authenticated writer login cannot be rebound to another active tenant");
+  const stored = await write(0);
+  assert.equal(stored.rows[0].stored, true,
+    "bound strict child may write its own object while OPEN");
+  const victimCount = await pools.admin.query("SELECT COUNT(*)::int AS n" +
+    " FROM zk1_gate.ciphertext_chunk WHERE scope_key=$1", [victimKey]);
+  assert.equal(victimCount.rows[0].n, 0, "unrelated victim ciphertext was untouched");
   const op = { scope, operationId: random(16), reservationId: random(16),
     revision: 1, digest };
   await gate.beginQuiesce(op);
-  await assert.rejects(write(1), /requires current OPEN|phase|23514/i,
+  await assert.rejects(write(1), /generation is closed|requires current OPEN|phase|23514/i,
     "writer-only login cannot write in revoked generation");
   const rows = await pools.admin.query("SELECT chunk_index FROM zk1_gate.ciphertext_chunk" +
     " WHERE scope_key=$1 AND object_id=$2", [key, objectId]);

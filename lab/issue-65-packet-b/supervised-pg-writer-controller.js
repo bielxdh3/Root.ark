@@ -34,6 +34,7 @@ class Zk1LabSupervisedPgWriter {
     if (!(operator instanceof Zk1SharedPgStrictStopOperator)) deny();
     this.operator = operator;
     this.pgUrl = validUrl(runtimePgUrl);
+    this.writerLogin = decodeURIComponent(new URL(this.pgUrl).username);
     this.session = null;
     this.entry = null;
     this.started = false;
@@ -63,6 +64,24 @@ class Zk1LabSupervisedPgWriter {
     if (!admitted.proceed || !entry.bound
       || !entry.bound.admissionId.equals(admitted.admissionId)
       || admitted.generation !== entry.bound.generation) deny();
+    // Exactly once after trusted START and before the IPC database credential
+    // is delivered, the *gate* SQL login binds this writer-only login to the
+    // precise supervisor-owned ChildProcess/admission. The child cannot
+    // inspect, forge, reuse or retarget the immutable operator-owned record.
+    const s = entry.io.scope;
+    const scopeKey = s.account_id.toString("hex") + ":"
+      + s.compartment_id.length.toString(16) + ":" + s.compartment_id.toString("hex");
+    let binding;
+    try {
+      binding = await this.operator.gate.pool.query(
+        "INSERT INTO zk1_gate.writer_binding" +
+        " (writer_login,admission_id,scope_key,object_id,worker_id,generation,process_epoch,process_pid)" +
+        " VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+      [this.writerLogin, admitted.admissionId, scopeKey, entry.io.objectId,
+        entry.io.workerId, admitted.generation, entry.process.processEpoch,
+        entry.process.processPid]);
+    } catch (_) { deny(); }
+    if (binding.rowCount !== 1) deny();
     const init = { kind: "init", pgUrl: this.pgUrl,
       scope: { account_id: b64(entry.io.scope.account_id),
         compartment_id: b64(entry.io.scope.compartment_id),

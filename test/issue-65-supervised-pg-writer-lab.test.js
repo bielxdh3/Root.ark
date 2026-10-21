@@ -27,6 +27,12 @@ async function context(t) {
   const runtime = new Pool({ connectionString: gateUrl, max: 3, connectionTimeoutMillis: 3000 });
   const stopPool = new Pool({ connectionString: stopUrl, max: 2, connectionTimeoutMillis: 3000 });
   let supervisor;
+  let writerCreated = false;
+  const writerName = "zkwriterfixture_" + crypto.randomBytes(6).toString("hex");
+  const writerPassword = crypto.randomBytes(24).toString("hex");
+  const individualWriterUrl = new URL(writerUrl);
+  individualWriterUrl.username = writerName;
+  individualWriterUrl.password = writerPassword;
   t.after(async () => {
     // Always terminate/observe ChildProcess handles BEFORE closing SQL pools;
     // especially important when an assertion interrupts a held transaction.
@@ -44,7 +50,13 @@ async function context(t) {
           })]);
         } finally { clearTimeout(timeout); }
       }
-    } finally { await Promise.all([admin.end(), runtime.end(), stopPool.end()]); }
+    } finally {
+      try {
+        if (writerCreated) {
+          await admin.query("DROP ROLE IF EXISTS " + writerName);
+        }
+      } finally { await Promise.all([admin.end(), runtime.end(), stopPool.end()]); }
+    }
   });
   const scope = { account_id: crypto.randomBytes(16), compartment_id: crypto.randomBytes(7),
     keyring_id: crypto.randomBytes(16) };
@@ -52,6 +64,11 @@ async function context(t) {
   await admin.query(`INSERT INTO zk1_gate.head
     (scope_key,keyring_id,revision,digest,require_stop_proof) VALUES($1,$2,1,$3,TRUE)`,
   [scopeKey(scope), scope.keyring_id, digest]);
+  // No two supervised processes are allowed to share a writer SQL login:
+  // operator binds exactly one login to exactly one admission/child epoch.
+  await admin.query("CREATE ROLE " + writerName + " LOGIN PASSWORD '" + writerPassword + "'");
+  writerCreated = true;
+  await admin.query("GRANT zk1_chunk_writer_runtime TO " + writerName);
   const keys = crypto.generateKeyPairSync("ed25519");
   const hostKeyId = crypto.randomBytes(16);
   supervisor = new Zk1IsolatedProcessStopSupervisor({
@@ -64,7 +81,8 @@ async function context(t) {
   const recorder = await createZk1PhysicalStopRecorder({ pool: stopPool,
     trustedHostKeyId: hostKeyId, trustedHostPublicKey: keys.publicKey });
   const operator = new Zk1SharedPgStrictStopOperator({ gate, supervisor, recorder });
-  const lab = new Zk1LabSupervisedPgWriter({ operator, runtimePgUrl: writerUrl });
+  const lab = new Zk1LabSupervisedPgWriter({ operator,
+    runtimePgUrl: individualWriterUrl.toString() });
   const io = { scope, workerId: crypto.randomBytes(16),
     principal: "AB:".repeat(31) + "AB", action: "put",
     objectId: crypto.randomBytes(16).toString("base64url"), revision: 1, digest };

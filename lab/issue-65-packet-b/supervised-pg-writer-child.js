@@ -58,34 +58,20 @@ async function hold(message) {
     state = "busy";
     c = await pool.connect();
     await c.query("BEGIN ISOLATION LEVEL READ COMMITTED");
-    // Preflight read alone is NOT the physical fence; the immediately
-    // following INSERT fires the trusted SECURITY DEFINER trigger that holds
-    // the authority head FOR UPDATE until COMMIT or rollback. This worker
-    // cannot UPDATE the head itself.
-    const { rows: heads, rowCount: hc } = await c.query(`SELECT keyring_id,phase,revision,digest,
-      generation,require_stop_proof FROM zk1_gate.head WHERE scope_key=$1`, [expected.key]);
-    const h = heads[0];
-    if (hc !== 1 || !h.keyring_id.equals(expected.scope.keyring_id)
-      || h.phase !== "OPEN" || h.require_stop_proof !== true
-      || Number(h.revision) !== expected.revision || !h.digest.equals(expected.digest)
-      || Number(h.generation) !== expected.generation) fail();
-    const { rows: admissions, rowCount: ac } = await c.query(`SELECT scope_key,worker_id,
-      principal,action,object_id,revision,digest,generation,host_key_id,
-      process_epoch,process_pid,state FROM zk1_gate.admission WHERE id=$1`, [expected.admissionId]);
-    const a = admissions[0];
-    if (ac !== 1 || a.scope_key !== expected.key
-      || !a.worker_id.equals(expected.workerId) || a.principal !== expected.principal
-      || a.action !== "put" || a.object_id !== expected.objectId
-      || Number(a.revision) !== expected.revision || !a.digest.equals(expected.digest)
-      || Number(a.generation) !== expected.generation || a.state !== "ACTIVE"
-      || !a.host_key_id?.equals(expected.hostKeyId)
-      || !a.process_epoch?.equals(expected.processEpoch)
-      || Number(a.process_pid) !== process.pid) fail();
-    const result = await c.query(`INSERT INTO zk1_gate.ciphertext_chunk
-      (scope_key,object_id,chunk_index,ciphertext) VALUES($1,$2,$3,$4)
-      ON CONFLICT DO NOTHING RETURNING chunk_index`,
-    [expected.key, expected.objectId, index, blob]);
-    if (result.rowCount !== 1) fail();
+    // A delegated child has ZERO raw SELECT or INSERT rights over shared
+    // tables. This boolean verifier examines only the immutable gate-owned
+    // tuple selected by authenticated PostgreSQL session_user, and the
+    // SECURITY DEFINER write function holds HEAD FOR UPDATE through COMMIT.
+    const preflight = await c.query(`SELECT zk1_gate.verify_chunk_writer_binding(
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) AS allowed`,
+    [expected.key, expected.admissionId, expected.objectId,
+      expected.generation, expected.workerId, expected.processEpoch,
+      process.pid, expected.revision, expected.digest,
+      expected.scope.keyring_id, expected.principal]);
+    if (preflight.rowCount !== 1 || preflight.rows[0]?.allowed !== true) fail();
+    const result = await c.query(
+      "SELECT zk1_gate.write_bound_chunk($1,$2) AS stored", [index, blob]);
+    if (result.rowCount !== 1 || result.rows[0]?.stored !== true) fail();
     indexHeld = index;
     state = "held";
     say("held");
