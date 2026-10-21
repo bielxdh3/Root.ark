@@ -23,6 +23,9 @@ const FIELDS = Object.freeze([
 const MAX_BYTES = 4 * 1024 * 1024;
 const MAX_LIFETIME_OBJECTS = 4096;
 const MAX_NONCES = 100_000;
+// No automatic archival pruning before a separately reviewed backup policy.
+const MAX_VERSION_RECORDS = 4096;
+const MAX_VERSION_ARCHIVE_BYTES = 256 * 1024 * 1024;
 
 function fail(code = "ZK_CONTENT_DENIED") {
   const error = new Error(code);
@@ -185,7 +188,14 @@ class Zk1ProtectedObjectStore {
       // Must complete the preflight on a read-only connection. Opening an
       // unknown SQLite in write mode / enabling WAL mutates foreign data.
       const readonly = new Database(absolute, { readonly: true, fileMustExist: true });
-      try { verifyStoreIdentity(readonly, expectedIdentity); }
+      try {
+        verifyStoreIdentity(readonly, expectedIdentity);
+        if (!readonly.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='zk_content_version'").get()) {
+          // An old opt-in store has already overwritten its previous content.
+          // Do not invent complete version history or silently mutate it.
+          fail("ZK_CONTENT_VERSION_HISTORY_REQUIRED");
+        }
+      }
       finally { readonly.close(); }
       if (fileIdentity(absolute) !== inspectedIdentity) {
         fail("ZK_CONTENT_BOOTSTRAP_REQUIRED");
@@ -211,6 +221,12 @@ class Zk1ProtectedObjectStore {
       }
       this.db.pragma("journal_mode = WAL");
       this.db.pragma("synchronous = FULL");
+      // SQLite REPLACE implicitly deletes its conflicting row. A DELETE
+      // trigger is skipped unless recursive_triggers is enabled per connection.
+      this.db.pragma("recursive_triggers = ON");
+      if (this.db.pragma("recursive_triggers", { simple: true }) !== 1) {
+        fail("ZK_CONTENT_VERSION_HISTORY_CORRUPT");
+      }
       this.db.exec(`
       CREATE TABLE IF NOT EXISTS zk_content_identity (
         id INTEGER PRIMARY KEY CHECK(id=1), scope TEXT NOT NULL,
@@ -231,6 +247,19 @@ class Zk1ProtectedObjectStore {
         scope TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL,
         epoch INTEGER NOT NULL, ciphertext BLOB NOT NULL, PRIMARY KEY(scope,id)
       );
+      CREATE TABLE IF NOT EXISTS zk_content_version (
+        scope TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>=1),
+        epoch INTEGER NOT NULL CHECK(epoch>=1), ciphertext BLOB NOT NULL,
+        ciphertext_digest BLOB NOT NULL CHECK(length(ciphertext_digest)=32),
+        provenance TEXT NOT NULL CHECK(provenance='transactional'),
+        PRIMARY KEY(scope,id,revision)
+      );
+      CREATE TRIGGER IF NOT EXISTS zk_content_version_no_update
+        BEFORE UPDATE ON zk_content_version
+        BEGIN SELECT RAISE(ABORT,'ZK_CONTENT_VERSION_IMMUTABLE'); END;
+      CREATE TRIGGER IF NOT EXISTS zk_content_version_no_delete
+        BEFORE DELETE ON zk_content_version
+        BEGIN SELECT RAISE(ABORT,'ZK_CONTENT_VERSION_IMMUTABLE'); END;
     `);
     if (!existed) {
       this.db.prepare(`INSERT INTO zk_content_identity
@@ -252,6 +281,47 @@ class Zk1ProtectedObjectStore {
     this.nonceCount = this.db.prepare("SELECT COUNT(*) AS n FROM zk_content_nonce WHERE scope=?");
     this.objectCount = this.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object WHERE scope=?");
     this.clockRow = this.db.prepare("SELECT last_at FROM zk_content_clock WHERE scope=?");
+    this.versionTotals = this.db.prepare("SELECT COUNT(*) AS n, "
+      + "COALESCE(SUM(length(ciphertext)),0) AS bytes FROM zk_content_version");
+    this.insertVersion = this.db.prepare("INSERT INTO zk_content_version "
+      + "(scope,id,revision,epoch,ciphertext,ciphertext_digest,provenance) "
+      + "VALUES(?,?,?,?,?,?,'transactional')");
+    const initialVersionTotals = this.versionTotals.get();
+    if (!initialVersionTotals
+      || initialVersionTotals.n > MAX_VERSION_RECORDS
+      || initialVersionTotals.bytes > MAX_VERSION_ARCHIVE_BYTES) {
+      fail("ZK_CONTENT_VERSION_HISTORY_CORRUPT");
+    }
+    const versionRows = this.db.prepare("SELECT scope,id,revision,epoch,ciphertext,"
+      + "ciphertext_digest FROM zk_content_version ORDER BY scope,id,revision").all();
+    let previous = null;
+    let totalVersionBytes = 0;
+    const latest = new Map();
+    for (const entry of versionRows) {
+      totalVersionBytes += entry.ciphertext.length;
+      if (entry.scope !== expectedIdentity.scope
+        || entry.ciphertext.length < 16 || entry.ciphertext.length > MAX_BYTES
+        || !equal(crypto.createHash("sha256").update(entry.ciphertext).digest(),
+          entry.ciphertext_digest)
+        || entry.revision !== (previous && previous.scope === entry.scope
+          && previous.id === entry.id ? previous.revision + 1 : 1)) {
+        fail("ZK_CONTENT_VERSION_HISTORY_CORRUPT");
+      }
+      previous = entry;
+      latest.set(JSON.stringify([entry.scope, entry.id]), entry);
+    }
+    if (versionRows.length !== initialVersionTotals.n
+      || totalVersionBytes !== initialVersionTotals.bytes) {
+      fail("ZK_CONTENT_VERSION_HISTORY_CORRUPT");
+    }
+    const currentObjects = this.db.prepare(
+      "SELECT scope,id,revision,epoch,ciphertext FROM zk_content_object").all();
+    if (latest.size !== currentObjects.length
+      || currentObjects.some((row) => {
+        const tail = latest.get(JSON.stringify([row.scope, row.id]));
+        return !tail || tail.revision !== row.revision || tail.epoch !== row.epoch
+          || !equal(tail.ciphertext, row.ciphertext);
+      })) fail("ZK_CONTENT_VERSION_HISTORY_CORRUPT");
     } catch (error) {
       this.db.close();
       throw error;
@@ -358,10 +428,20 @@ class Zk1ProtectedObjectStore {
         }
         const nextRevision = row ? row.revision + 1 : 1;
         if (!Number.isSafeInteger(nextRevision)) fail("ZK_CONTENT_UNAVAILABLE");
+        const totals = this.versionTotals.get();
+        if (totals.n >= MAX_VERSION_RECORDS
+          || totals.bytes > MAX_VERSION_ARCHIVE_BYTES - sealed.length) {
+          fail("ZK_CONTENT_UNAVAILABLE");
+        }
         this.db.prepare(`INSERT INTO zk_content_object(scope,id,revision,epoch,ciphertext)
           VALUES(?,?,?,?,?) ON CONFLICT(scope,id) DO UPDATE SET
           revision=excluded.revision, epoch=excluded.epoch, ciphertext=excluded.ciphertext`)
           .run(key, request.object_id, nextRevision, request.epoch, sealed);
+        // The historical ciphertext and the current projection advance under
+        // the same SQLite IMMEDIATE transaction. Any history INSERT failure
+        // rolls back the updated projection, nonce and head watermark as well.
+        this.insertVersion.run(key, request.object_id, nextRevision,
+          request.epoch, sealed, request.ciphertext_digest);
         result = { id: request.object_id, revision: nextRevision };
       }
       this.db.prepare("INSERT INTO zk_content_nonce(scope,nonce,expires_at) VALUES(?,?,?)")
