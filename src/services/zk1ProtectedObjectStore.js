@@ -140,13 +140,17 @@ function fileIdentity(filename) {
 class Zk1ProtectedObjectStore {
   constructor(filename, { witnessProvider, witnessPinned, manifestProvider,
     trustedScope, minimumHead, bootstrapNew = false,
+    admissionRequired = false,
     nowSeconds = () => Math.floor(Date.now() / 1000) } = {}) {
     if (typeof filename !== "string" || !filename || !witnessProvider
       || typeof witnessProvider.freshHead !== "function"
       || typeof manifestProvider !== "function" || typeof nowSeconds !== "function"
       || !(witnessPinned?.publicKey instanceof crypto.KeyObject)
       || witnessPinned.publicKey.type !== "public"
-      || witnessPinned.publicKey.asymmetricKeyType !== "ed25519") fail();
+      || witnessPinned.publicKey.asymmetricKeyType !== "ed25519"
+      || typeof admissionRequired !== "boolean"
+      || (admissionRequired && (typeof witnessProvider.beginIoAdmission !== "function"
+        || typeof witnessProvider.finishIoAdmission !== "function"))) fail();
     // The external owner/account authentication boundary must select ONE
     // immutable keyring scope. A watermark for a different account or
     // compartment is not interchangeable with this genesis floor.
@@ -159,6 +163,7 @@ class Zk1ProtectedObjectStore {
     this.minimumHead = Object.freeze({ revision: minimumHead.revision,
       witnessSequence: minimumHead.witnessSequence, digest: bytes(minimumHead.digest, 32) });
     this.witnessProvider = witnessProvider;
+    this.admissionRequired = admissionRequired;
     this.manifestProvider = manifestProvider;
     this.nowSeconds = nowSeconds;
     const absolute = path.resolve(filename);
@@ -370,8 +375,54 @@ class Zk1ProtectedObjectStore {
     }).immediate();
   }
 
-  async put(input) { return this.perform(await this.authorize(input, "put"), "put"); }
-  async get(input) { return this.perform(await this.authorize(input, "get"), "get"); }
+  async put(input) {
+    if (this.admissionRequired) fail("ZK_CONTENT_GATE_REQUIRED");
+    return this.perform(await this.authorize(input, "put"), "put");
+  }
+  async get(input) {
+    if (this.admissionRequired) fail("ZK_CONTENT_GATE_REQUIRED");
+    return this.perform(await this.authorize(input, "get"), "get");
+  }
+  async runWithAdmission(input, operation, emit) {
+    if (typeof emit !== "function" || !["put", "get"].includes(operation)) fail();
+    const authenticated = await this.authorize(input, operation);
+    if (!this.admissionRequired) {
+      return emit(this.perform(authenticated, operation));
+    }
+    const workerId = crypto.randomBytes(16);
+    let admissionId;
+    const start = { scope: this.trustedScope,
+      revision: authenticated.request.manifest_revision,
+      digest: authenticated.request.manifest_digest,
+      action: operation, objectId: authenticated.request.object_id, workerId };
+    try {
+      let receipt;
+      try { receipt = await this.witnessProvider.beginIoAdmission(start); }
+      catch (_) {
+        // A lost start ACK must retry with the exact SAME worker identifier:
+        // the witness returns the prior active admission idempotently. Never
+        // start an unrelated second worker after a transport failure.
+        receipt = await this.witnessProvider.beginIoAdmission(start);
+      }
+      admissionId = bytes(receipt.admissionId, 16);
+    } catch (_) { fail("ZK_CONTENT_UNAVAILABLE"); }
+    try {
+      // The caller's emit() must settle only when response bytes have crossed
+      // the trusted application egress boundary, or the socket was closed.
+      // The witness refuses to reserve while this admission is ACTIVE.
+      return await emit(this.perform(authenticated, operation));
+    } finally {
+      const finish = { scope: this.trustedScope, admissionId, workerId };
+      try {
+        try { await this.witnessProvider.finishIoAdmission(finish); }
+        catch (_) { await this.witnessProvider.finishIoAdmission(finish); }
+      } catch (_) {
+        // Never silently clear an unknown active worker. A lost finish ACK
+        // leaves the durable witness fence closed until reconciliation.
+        fail("ZK_CONTENT_UNAVAILABLE");
+      }
+    }
+  }
   close() { if (this.db.open) this.db.close(); }
 }
 

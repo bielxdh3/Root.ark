@@ -70,11 +70,27 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
         signature: b64(req.body.signatureBase64, 64),
         ...(operation === "put" ? { ciphertext: b64(req.body.ciphertextBase64, 4 * 1024 * 1024) } : {}),
       };
-      const result = await (operation === "put" ? store.put(request) : store.get(request));
-      if (operation === "put") return res.status(result.revision === 1 ? 201 : 200).json(result);
-      return res.status(200).json({ id: result.id, revision: result.revision,
-        epoch: result.epoch, ciphertextBase64: result.ciphertext.toString("base64url") });
+      await store.runWithAdmission(request, operation, (result) => new Promise((resolve, reject) => {
+        // Do not release the witness admission when res.json() merely queues
+        // bytes. Keep revocation closed until the socket has finished egress
+        // into the kernel or has been closed/aborted.
+        if (res.destroyed || res.writableEnded) return reject(new Error("ZK_CONTENT_UNAVAILABLE"));
+        const clear = () => {
+          res.off("finish", settled);
+          res.off("close", settled);
+        };
+        const settled = () => { clear(); resolve(); };
+        res.once("finish", settled);
+        res.once("close", settled);
+        try {
+          if (operation === "put") res.status(result.revision === 1 ? 201 : 200).json(result);
+          else res.status(200).json({ id: result.id, revision: result.revision,
+            epoch: result.epoch, ciphertextBase64: result.ciphertext.toString("base64url") });
+        } catch (error) { clear(); reject(error); }
+      }));
+      return;
     } catch (error) {
+      if (res.headersSent || res.destroyed) return;
       const status = error?.code === "ZK_CONTENT_NOT_FOUND" ? 404
         : ["ZK_CONTENT_REPLAY", "ZK_CONTENT_CONFLICT"].includes(error?.code) ? 409
           : error?.code === "ZK_CONTENT_DENIED" ? 403 : 503;

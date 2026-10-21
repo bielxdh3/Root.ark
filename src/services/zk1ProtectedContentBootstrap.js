@@ -92,7 +92,7 @@ function registerZk1ProtectedContentFromConfig({
   const witnessProvider = createZk1WitnessHttpsClient(witnessTransport);
   const manifestProvider = createZk1CasManifestHttpsClient(casTransport);
   const store = new Zk1ProtectedObjectStore(absolute(config.contentDbPath), {
-    bootstrapNew: config.bootstrapNew, trustedScope: scope,
+    bootstrapNew: config.bootstrapNew, trustedScope: scope, admissionRequired: true,
     minimumHead: floor, witnessProvider,
     witnessPinned: { keyId: b64(config.witness.signingKeyId, 16), publicKey },
     manifestProvider: ({ account_id, compartment_id, keyring_id }) =>

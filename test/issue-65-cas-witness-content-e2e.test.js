@@ -70,13 +70,27 @@ test("CAS+witness true signed genesis/enrollment/revocation fence cross-device c
   const floor = { revision: 1, witnessSequence: 1,
     digest: await v2.recoveryManifestDigestV2(initial) };
   const contentPath = path.join(dir, "content.sqlite");
-  const makeStore = (bootstrapNew = false) => {
+  let loseStartAckOnce = false;
+  const makeStore = (bootstrapNew = false, admissionRequired = false) => {
     const s = new Zk1ProtectedObjectStore(contentPath, {
       trustedScope: scope, minimumHead: floor, bootstrapNew,
-      witnessProvider: witness,
+      witnessProvider: {
+        freshHead: (...args) => witness.freshHead(...args),
+        beginIoAdmission: async (request) => {
+          const admitted = await witness.beginIoAdmission({ ...request,
+            principal: "AA:".repeat(31) + "AA" });
+          if (loseStartAckOnce) {
+            loseStartAckOnce = false;
+            throw new Error("synthetic lost admission ACK after durable start");
+          }
+          return admitted;
+        },
+        finishIoAdmission: (request) => witness.finishIoAdmission({ ...request,
+          principal: "AA:".repeat(31) + "AA" }),
+      },
       witnessPinned: { keyId: witnessKeyId, publicKey: witnessKeys.publicKey },
       manifestProvider: (selected) => cas.getCommittedManifest({ scope: selected }),
-      nowSeconds: () => 1100,
+      nowSeconds: () => 1100, admissionRequired,
     });
     ledgers.push(s);
     return s;
@@ -102,6 +116,28 @@ test("CAS+witness true signed genesis/enrollment/revocation fence cross-device c
   };
   const beforeEnroll = await authorize("trusted-0", "put", crypto.randomBytes(200));
   assert.equal((await content.put(beforeEnroll)).revision, 1);
+  const admittedStore = makeStore(false, true);
+  await assert.rejects(admittedStore.get(await authorize("trusted-0", "get")),
+    /ZK_CONTENT_GATE_REQUIRED/, "gate-required stores cannot bypass witness admission via direct get");
+  const heldRead = await authorize("trusted-0", "get");
+  let sendStarted;
+  const sending = new Promise((resolve) => { sendStarted = resolve; });
+  let completeEgress;
+  const egressHeld = new Promise((resolve) => { completeEgress = resolve; });
+  const inflight = admittedStore.runWithAdmission(heldRead, "get", async (result) => {
+    assert.deepEqual(result.ciphertext, beforeEnroll.ciphertext);
+    sendStarted();
+    await egressHeld;
+  });
+  await sending;
+  await assert.rejects(propose(enrolled, initial), /WITNESS_IO_ACTIVE/,
+    "revocation/enrollment cannot reserve while a response holds the same durable admission");
+  completeEgress();
+  await inflight;
+  loseStartAckOnce = true;
+  await admittedStore.runWithAdmission(await authorize("trusted-0", "get"), "get", (value) => {
+    assert.deepEqual(value.ciphertext, beforeEnroll.ciphertext);
+  });
   // A *real* randomly generated per-version CEK, bound to the compartment's
   // initial epoch CER via the frozen zk-1 HKDF+AES-GCM one-shot key wrapper.
   // Neither the authenticated HTTP store nor CAS nor witness receives CER,

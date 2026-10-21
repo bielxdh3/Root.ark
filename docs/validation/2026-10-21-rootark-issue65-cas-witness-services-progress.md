@@ -98,6 +98,36 @@ the checked regression. Never characterize this preflight as fully side-effect
 free against all foreign SQLite files, nor as protection against a compromised
 local filesystem operator.
 
+### Later 2026-10-21 witness I/O admission reference gate (local-host only)
+
+The witness engine now provides a durable `beginIoAdmission`/
+`finishIoAdmission` reference gate under the **same SQLite immediate write
+ordering** as `reserve`. A committed matching head, action/object identity,
+worker identifier and trusted mTLS principal are required. The start operation
+is idempotent only for the exact same active worker; a terminal worker ID
+cannot be reused. Reservations are rejected while a worker is ACTIVE, even
+after a witness restart. The witness's pinned mTLS endpoint provides
+`/v1/admission/start` and `/v1/admission/finish` scoped to an explicit `admit`
+role. The development-only protected HTTP content routes now hold admission
+through synchronous SQLite I/O and until Node signals response `finish` or
+`close`. Unknown/lost completion acknowledgement leaves the witness admission
+active and blocks revocation conservatively. Single lost start/finish ACKs are
+retried exactly once with the **same** worker/admission IDs; neither retry
+creates a replacement worker. Persistent outage after those attempts may
+strand an admission pending an independently verified recovery procedure.
+
+This is **not** the required independent, cross-host linearizable
+`GateAuthority`: one SQLite authority, a trusted single gateway and a
+cooperative Node egress boundary are assumed. Privileged filesystem control,
+multiple uncontrolled gateways, fake finish acknowledgements, lower-level
+provider reads/writes, OS/network buffering, application-process compromise,
+and existing normal upload/download/sync/backup/WebDAV/cloud paths are not
+fully fenced. A stalled worker deliberately blocks reservation; a future
+independent liveness/reconciliation design must prove its termination before
+release. The protocol's complete QUIESCING/STOP_REQUESTED and distributed
+fence acknowledgement phase is **still absent**. The two recovery paths and
+multi-provider migration remain incomplete as in the earlier sections.
+
 **Status hints in HTTP responses are not protection grants.** The Ed25519
 receipt/nonce/floor, exact signed public manifest history and current epoch
 must still be verified independently by a client or an actual protected-content

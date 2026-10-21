@@ -23,6 +23,8 @@ const RESERVE_FIELDS = Object.freeze([
 ]);
 const STATUS_FIELDS = RESERVE_FIELDS.filter((field) => field !== "expires_at");
 const MAX_EVENTS_PER_SCOPE = 8192;
+const PRINCIPAL_FINGERPRINT = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/;
+const OBJECT_ID = /^[A-Za-z0-9_-]{22}$/;
 function fail(code = "WITNESS_INVALID") {
   const e = new Error(code);
   e.code = code;
@@ -77,6 +79,34 @@ function normalizeScope(scope) {
     compartment_id: bytes(scope?.compartment_id, 1, 128),
     keyring_id: bytes(scope?.keyring_id, 16),
   };
+}
+function normalizeIoRequest(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)
+    || Reflect.ownKeys(input).length !== 7
+    || ["scope", "revision", "digest", "action", "objectId", "workerId", "principal"]
+      .some((field) => !Object.hasOwn(input, field))) fail("WITNESS_IO_DENIED");
+  const scope = normalizeScope(input.scope);
+  if (!Number.isSafeInteger(input.revision) || input.revision < 1
+    || !["get", "put"].includes(input.action)
+    || typeof input.objectId !== "string" || !OBJECT_ID.test(input.objectId)
+    || Buffer.from(input.objectId, "base64url").toString("base64url") !== input.objectId
+    || typeof input.principal !== "string" || !PRINCIPAL_FINGERPRINT.test(input.principal)) {
+    fail("WITNESS_IO_DENIED");
+  }
+  return { scope, revision: input.revision, digest: bytes(input.digest, 32),
+    action: input.action, objectId: input.objectId, workerId: bytes(input.workerId, 16),
+    principal: input.principal };
+}
+function normalizeIoFinish(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)
+    || Reflect.ownKeys(input).length !== 4
+    || ["scope", "admissionId", "workerId", "principal"]
+      .some((field) => !Object.hasOwn(input, field))
+    || typeof input.principal !== "string" || !PRINCIPAL_FINGERPRINT.test(input.principal)) {
+    fail("WITNESS_IO_DENIED");
+  }
+  return { scope: normalizeScope(input.scope), admissionId: bytes(input.admissionId, 16),
+    workerId: bytes(input.workerId, 16), principal: input.principal };
 }
 
 class Zk1DurableWitnessLedger {
@@ -178,6 +208,16 @@ class Zk1DurableWitnessLedger {
         ON witness_events(reservation_id) WHERE kind = 'reserved';
       CREATE UNIQUE INDEX IF NOT EXISTS witness_operation_unique
         ON witness_events(scope_key,operation_id) WHERE kind = 'reserved';
+      CREATE TABLE IF NOT EXISTS witness_io_admission (
+        admission_id BLOB PRIMARY KEY, scope_key TEXT NOT NULL, keyring_id BLOB NOT NULL,
+        worker_id BLOB NOT NULL, principal TEXT NOT NULL,
+        action TEXT NOT NULL CHECK(action IN ('get','put')),
+        object_id TEXT NOT NULL, revision INTEGER NOT NULL, digest BLOB NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('active','completed')),
+        UNIQUE(scope_key,worker_id),
+        FOREIGN KEY(scope_key) REFERENCES witness_scope(scope_key)
+      );
+      CREATE INDEX IF NOT EXISTS witness_io_active ON witness_io_admission(scope_key,state);
     `);
     this.db.pragma("foreign_keys = ON");
     if (!existed) {
@@ -198,6 +238,12 @@ class Zk1DurableWitnessLedger {
       "SELECT * FROM witness_events WHERE scope_key=? ORDER BY event_id LIMIT 8194");
     this.countEvents = this.db.prepare(
       "SELECT COUNT(*) AS count FROM witness_events WHERE scope_key=?");
+    this.activeIo = this.db.prepare(
+      "SELECT 1 FROM witness_io_admission WHERE scope_key=? AND state='active' LIMIT 1");
+    this.ioByWorker = this.db.prepare(
+      "SELECT * FROM witness_io_admission WHERE scope_key=? AND worker_id=?");
+    this.ioById = this.db.prepare(
+      "SELECT * FROM witness_io_admission WHERE admission_id=?");
     } catch (error) {
       this.db.close();
       throw error;
@@ -208,6 +254,57 @@ class Zk1DurableWitnessLedger {
     const canonical = await z.encodeDeterministic(unsigned);
     const signature = crypto.sign(null, Buffer.concat([domain, canonical]), this.witnessPrivateKey);
     return Buffer.from(await z.encodeDeterministic({ ...unsigned, signature }));
+  }
+
+  // Local-host reference admission fence. The same durable SQLite write lock
+  // serializes admission START/FINISH against reservation. It is NOT a
+  // distributed GateAuthority and cannot ensure untrusted workers actually
+  // stop before reporting finish. A crash deliberately leaves ACTIVE rows
+  // blocking revocation until a proved, authenticated completion.
+  async beginIoAdmission(input) {
+    const io = normalizeIoRequest(input);
+    const { row: checked } = await this.checkedScope(io.scope);
+    const key = compartmentKey(io.scope.account_id, io.scope.compartment_id);
+    const admissionId = crypto.randomBytes(16);
+    return this.db.transaction(() => {
+      const head = this.getScope.get(key);
+      if (!head || !equal(head.keyring_id, io.scope.keyring_id)
+        || head.tombstoned || head.pending_id !== null
+        || head.revision !== io.revision || !equal(head.digest, io.digest)
+        || head.revision !== checked.revision || !equal(head.digest, checked.digest)
+        || checked.pending_id !== null) fail("WITNESS_IO_DENIED");
+      const old = this.ioByWorker.get(key, io.workerId);
+      if (old) {
+        if (old.state !== "active" || old.principal !== io.principal
+          || old.action !== io.action || old.object_id !== io.objectId
+          || old.revision !== io.revision || !equal(old.digest, io.digest)
+          || !equal(old.keyring_id, io.scope.keyring_id)) fail("WITNESS_IO_DENIED");
+        return { admissionId: Buffer.from(old.admission_id) };
+      }
+      this.db.prepare(`INSERT INTO witness_io_admission
+        (admission_id,scope_key,keyring_id,worker_id,principal,action,object_id,revision,digest,state)
+        VALUES(?,?,?,?,?,?,?,?,?,'active')`).run(admissionId, key,
+        io.scope.keyring_id, io.workerId, io.principal, io.action,
+        io.objectId, io.revision, io.digest);
+      return { admissionId };
+    }).immediate();
+  }
+
+  async finishIoAdmission(input) {
+    const io = normalizeIoFinish(input);
+    const key = compartmentKey(io.scope.account_id, io.scope.compartment_id);
+    return this.db.transaction(() => {
+      const row = this.ioById.get(io.admissionId);
+      if (!row || row.scope_key !== key || !equal(row.keyring_id, io.scope.keyring_id)
+        || !equal(row.worker_id, io.workerId) || row.principal !== io.principal) {
+        fail("WITNESS_IO_DENIED");
+      }
+      if (row.state === "active") {
+        this.db.prepare(`UPDATE witness_io_admission SET state='completed'
+          WHERE admission_id=? AND state='active'`).run(io.admissionId);
+      }
+      return { status: "completed" };
+    }).immediate();
   }
 
   async reserve(input) {
@@ -253,6 +350,9 @@ class Zk1DurableWitnessLedger {
           && equal(pending.envelope, raw)) return;
         fail("WITNESS_PENDING");
       }
+      // A reservation cannot enter PENDING while an authenticated worker
+      // retains I/O authority. No timeout or restart silently clears it.
+      if (this.activeIo.get(key)) fail("WITNESS_IO_ACTIVE");
       // Reservation + terminal completion consume TWO immutable event
       // records. Leave room for the unavoidable resolution, even at cap.
       if (this.countEvents.get(key).count + 2 > this.maxEventsPerScope) {

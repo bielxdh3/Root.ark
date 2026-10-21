@@ -16,6 +16,8 @@ const ROLES = Object.freeze({
   "/v1/head": "head",
   "/v1/reserve": "reserve",
   "/v1/resolve": "resolve",
+  "/v1/admission/start": "admit",
+  "/v1/admission/finish": "admit",
 });
 const SCOPE_FIELDS = Object.freeze(["account_id", "compartment_id", "keyring_id"]);
 const OP_FIELDS = Object.freeze([
@@ -29,7 +31,10 @@ const BYTE_FIELDS = Object.freeze({
   expected_manifest_digest: [32, 32], proposed_manifest_digest: [32, 32],
   request_digest: [32, 32], package_envelope_digest: [32, 32],
   nonce: [32, 32],
+  workerId: [16, 16], admissionId: [16, 16], digest: [32, 32],
 });
+const IO_START = ["scope", "revision", "digest", "action", "objectId", "workerId"];
+const IO_FINISH = ["scope", "admissionId", "workerId"];
 function invalid() {
   const e = new Error("WITNESS_API_INVALID");
   e.code = "WITNESS_API_INVALID";
@@ -124,6 +129,8 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals }
   if (!key || !cert || !clientCa || !ledger
     || typeof ledger.reserve !== "function" || typeof ledger.freshHead !== "function"
     || typeof ledger.resolve !== "function"
+    || typeof ledger.beginIoAdmission !== "function"
+    || typeof ledger.finishIoAdmission !== "function"
     || !principals || typeof principals !== "object"
     || Object.keys(principals).length === 0) invalid();
   const authorized = new Map();
@@ -174,6 +181,36 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals }
         return write(res, 403, { error: "FORBIDDEN" });
       }
       const body = await readBoundedJson(req);
+      if (req.url === "/v1/admission/start" || req.url === "/v1/admission/finish") {
+        const starting = req.url.endsWith("/start");
+        exact(body, starting ? IO_START : IO_FINISH);
+        const scope = normalize(body.scope, SCOPE_FIELDS);
+        if (!granted.scopes.has(scopeKey(scope))) {
+          return write(res, 403, { error: "FORBIDDEN" });
+        }
+        const workerId = decode(body.workerId, BYTE_FIELDS.workerId);
+        // The authenticated mTLS principal is bound at the witness, never
+        // accepted as an untrusted JSON field from the gateway.
+        const principal = peer.fingerprint256.toUpperCase();
+        if (starting) {
+          if (!Number.isSafeInteger(body.revision) || body.revision < 1
+            || !["get", "put"].includes(body.action)
+            || typeof body.objectId !== "string"
+            || !/^[A-Za-z0-9_-]{22}$/.test(body.objectId)
+            || Buffer.from(body.objectId, "base64url").toString("base64url") !== body.objectId) {
+            invalid();
+          }
+          const receipt = await ledger.beginIoAdmission({ scope,
+            revision: body.revision, digest: decode(body.digest, BYTE_FIELDS.digest),
+            action: body.action, objectId: body.objectId, workerId, principal });
+          return write(res, 201, { admissionId: Buffer.from(receipt.admissionId).toString("base64url"),
+            authority: "WITNESS_IO_GATE_LOCAL_V1" });
+        }
+        const result = await ledger.finishIoAdmission({ scope,
+          admissionId: decode(body.admissionId, BYTE_FIELDS.admissionId),
+          workerId, principal });
+        return write(res, 200, { status: result.status, authority: "WITNESS_IO_GATE_LOCAL_V1" });
+      }
       if (req.url === "/v1/reserve") {
         const operation = normalize(body.operation, OP_FIELDS);
         if (!granted.scopes.has(scopeKey(operation))) {
@@ -236,10 +273,11 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals }
       if (res.headersSent || res.destroyed) return;
       const code = error?.code;
       const status = code === "WITNESS_API_INVALID" || code === "WITNESS_INVALID" ? 400
+        : code === "WITNESS_IO_DENIED" ? 403
         : code === "WITNESS_NO_HEAD" || code === "WITNESS_NO_PENDING" ? 404
           : code === "WITNESS_PENDING" || code === "WITNESS_CONFLICT"
             || code === "WITNESS_TOMBSTONED" || code === "WITNESS_EXPIRED"
-            || code === "WITNESS_CAPACITY_EXHAUSTED" ? 409 : 503;
+            || code === "WITNESS_CAPACITY_EXHAUSTED" || code === "WITNESS_IO_ACTIVE" ? 409 : 503;
       return write(res, status, {
         error: status === 503 ? "WITNESS_UNAVAILABLE"
           : status === 400 ? "WITNESS_INVALID_REQUEST"

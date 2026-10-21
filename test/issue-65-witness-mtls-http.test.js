@@ -94,7 +94,7 @@ test("mTLS standalone witness listener rejects unknown principals and returns si
   const processScopeJson = toScopeJson(processOp);
   const allowedScopes = [scopeJson, processScopeJson];
   const grant = {
-    roles: ["head", "reserve", "resolve"], scopes: allowedScopes,
+    roles: ["head", "reserve", "resolve", "admit"], scopes: allowedScopes,
     initializeKeys: allowedScopes.map((item) => ({
       scope: item,
       publicKeyPem: initializerKey.publicKey.export({ format: "pem", type: "spki" }).toString(),
@@ -269,6 +269,32 @@ test("mTLS standalone witness listener rejects unknown principals and returns si
   assert.equal((await send(port, tls, "/v1/reserve", {
     operation: opJson, initializeSignature,
   })).status, 409);
+
+  const workerId = crypto.randomBytes(16);
+  const ioRequest = { scope, revision: 1, digest: op.proposed_manifest_digest,
+    action: "get", objectId: crypto.randomBytes(16).toString("base64url"), workerId };
+  const alienIo = { ...ioRequest,
+    scope: { ...scope, keyring_id: crypto.randomBytes(16) } };
+  await assert.rejects(remoteWitness.beginIoAdmission(alienIo),
+    /WITNESS_TRANSPORT_UNAVAILABLE/, "mTLS gate cannot authorize alien scopes");
+  const admitted = await remoteWitness.beginIoAdmission(ioRequest);
+  assert.equal(admitted.admissionId.length, 16);
+  const retried = await remoteWitness.beginIoAdmission(ioRequest);
+  assert.deepEqual(retried, admitted, "lost admission ACK is idempotent across mTLS");
+  const nextOperation = {
+    ...op, reservation_id: crypto.randomBytes(16), operation_id: crypto.randomBytes(16),
+    expected_revision: 1, expected_manifest_digest: op.proposed_manifest_digest,
+    proposed_revision: 2, proposed_manifest_digest: crypto.randomBytes(32),
+    request_digest: crypto.randomBytes(32),
+  };
+  assert.equal((await send(port, tls, "/v1/reserve", {
+    operation: Object.fromEntries(Object.entries(nextOperation).map(([key, value]) =>
+      [key, value instanceof Uint8Array ? enc(value) : value])),
+  })).status, 409, "the witness must deny revocation while HTTP egress holds an active gate");
+  assert.deepEqual(await remoteWitness.finishIoAdmission({ scope,
+    admissionId: admitted.admissionId, workerId }), { status: "completed" });
+  await assert.rejects(remoteWitness.beginIoAdmission(ioRequest),
+    /WITNESS_TRANSPORT_UNAVAILABLE/, "completed admission cannot replay");
 
   // A valid mTLS client can send an incomplete POST. It must not hold the
   // listener (and consequently the standalone ledger) open indefinitely.

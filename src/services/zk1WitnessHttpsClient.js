@@ -19,6 +19,7 @@ const SIZES = Object.freeze({
   reservation_id: [16, 16], operation_id: [16, 16],
   expected_manifest_digest: [32, 32], proposed_manifest_digest: [32, 32],
   request_digest: [32, 32], package_envelope_digest: [32, 32], nonce: [32, 32],
+  workerId: [16, 16], admissionId: [16, 16], digest: [32, 32],
 });
 function fail() {
   const err = new Error("WITNESS_TRANSPORT_UNAVAILABLE");
@@ -121,9 +122,29 @@ function createZk1WitnessHttpsClient({
           try {
             if (completed) return;
             const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-            exact(parsed, path === "/v1/resolve"
-              ? ["status", "receiptBase64", "authority"]
-              : ["receiptBase64", "authority"]);
+            const ioStart = path === "/v1/admission/start";
+            const ioFinish = path === "/v1/admission/finish";
+            exact(parsed, ioStart ? ["admissionId", "authority"]
+              : ioFinish ? ["status", "authority"]
+                : path === "/v1/resolve" ? ["status", "receiptBase64", "authority"]
+                  : ["receiptBase64", "authority"]);
+            if (ioStart || ioFinish) {
+              if (parsed.authority !== "WITNESS_IO_GATE_LOCAL_V1") fail();
+              let result;
+              if (ioStart) {
+                if (typeof parsed.admissionId !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(parsed.admissionId)) fail();
+                const admissionId = Buffer.from(parsed.admissionId, "base64url");
+                if (admissionId.length !== 16
+                  || admissionId.toString("base64url") !== parsed.admissionId) fail();
+                result = { admissionId };
+              } else {
+                if (parsed.status !== "completed") fail();
+                result = { status: parsed.status };
+              }
+              completed = true;
+              resolve(result);
+              return;
+            }
             if (parsed.authority !== "WITNESS_ENGINE_ONLY") fail();
             if (path === "/v1/resolve" && !["committed", "cancelled"].includes(parsed.status)) fail();
             const receipt = canonicalReceipt(parsed.receiptBase64);
@@ -151,6 +172,20 @@ function createZk1WitnessHttpsClient({
       return send("/v1/reserve", body);
     },
     resolve({ scope }) { return send("/v1/resolve", { scope: normalize(scope, SCOPE) }); },
+    beginIoAdmission({ scope, revision, digest, action, objectId, workerId }) {
+      if (!Number.isSafeInteger(revision) || revision < 1
+        || !["get", "put"].includes(action) || typeof objectId !== "string"
+        || !/^[A-Za-z0-9_-]{22}$/.test(objectId)
+        || Buffer.from(objectId, "base64url").toString("base64url") !== objectId) fail();
+      return send("/v1/admission/start", { scope: normalize(scope, SCOPE), revision,
+        digest: b64(digest, SIZES.digest), action, objectId,
+        workerId: b64(workerId, SIZES.workerId) });
+    },
+    finishIoAdmission({ scope, admissionId, workerId }) {
+      return send("/v1/admission/finish", { scope: normalize(scope, SCOPE),
+        admissionId: b64(admissionId, SIZES.admissionId),
+        workerId: b64(workerId, SIZES.workerId) });
+    },
   });
 }
 
