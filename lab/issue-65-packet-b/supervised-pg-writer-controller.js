@@ -24,7 +24,7 @@ function validUrl(raw) {
   try { url = new URL(raw); } catch (_) { deny(); }
   if (url.protocol !== "postgresql:" || url.hostname !== "127.0.0.1"
     || url.pathname !== "/gatefixture" || !/^[0-9]+$/.test(url.port)
-    || !/^zkgatefixture_[a-f0-9]{12}$/.test(decodeURIComponent(url.username))
+    || !/^zkwriterfixture_[a-f0-9]{12}$/.test(decodeURIComponent(url.username))
     || !url.password || url.search || url.hash) deny();
   return raw;
 }

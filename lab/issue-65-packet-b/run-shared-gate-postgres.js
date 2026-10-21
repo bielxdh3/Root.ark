@@ -82,11 +82,21 @@ async function main() {
     "-U", "postgres", "-d", "gatefixture"], { input: provisionStop });
   const stopUri = "postgresql://" + stopRoleName + ":" + stopRolePassword
     + "@127.0.0.1:" + match[1] + "/gatefixture";
+  const writerRoleName = "zkwriterfixture_" + crypto.randomBytes(6).toString("hex");
+  const writerRolePassword = crypto.randomBytes(24).toString("hex");
+  const provisionWriter = "CREATE ROLE " + writerRoleName
+    + " LOGIN PASSWORD '" + writerRolePassword + "';\n"
+    + "GRANT zk1_chunk_writer_runtime TO " + writerRoleName + ";\n";
+  run("docker", ["exec", "-i", containerId, "psql", "-X", "-v", "ON_ERROR_STOP=1",
+    "-U", "postgres", "-d", "gatefixture"], { input: provisionWriter });
+  const writerUri = "postgresql://" + writerRoleName + ":" + writerRolePassword
+    + "@127.0.0.1:" + match[1] + "/gatefixture";
   run("node", ["--test", "--test-reporter=spec",
     "test/issue-65-shared-gate-postgres.test.js",
     "test/issue-65-gate-runtime-role.test.js",
     "test/issue-65-shared-pg-sealed-object.test.js",
     "test/issue-65-unsealed-sql-fence.test.js",
+    "test/issue-65-chunk-writer-role.test.js",
     "test/issue-65-pg-sealed-sink.test.js",
     "test/issue-65-stop-recorder-postgres.test.js",
     "test/issue-65-strict-stop-operator-postgres.test.js",
@@ -94,7 +104,8 @@ async function main() {
     "test/issue-65-shared-gate-real-witness.test.js"],
   { env: { ...process.env, ROOTARK_ZK1_TEST_PG_URL: uri,
     ROOTARK_ZK1_RUNTIME_PG_URL: runtimeUri,
-    ROOTARK_ZK1_STOP_PG_URL: stopUri }, inherit: true });
+    ROOTARK_ZK1_STOP_PG_URL: stopUri,
+    ROOTARK_ZK1_WRITER_PG_URL: writerUri }, inherit: true });
   process.stdout.write("SHARED_GATE_PG_REAL_PASS loopback=true cleanup=pending\n");
 }
 

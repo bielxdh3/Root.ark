@@ -14,7 +14,8 @@ const { Zk1LabSupervisedPgWriter } = require("../lab/issue-65-packet-b/supervise
 const adminUrl = process.env.ROOTARK_ZK1_TEST_PG_URL;
 const gateUrl = process.env.ROOTARK_ZK1_RUNTIME_PG_URL;
 const stopUrl = process.env.ROOTARK_ZK1_STOP_PG_URL;
-const enabled = Boolean(adminUrl && gateUrl && stopUrl);
+const writerUrl = process.env.ROOTARK_ZK1_WRITER_PG_URL;
+const enabled = Boolean(adminUrl && gateUrl && stopUrl && writerUrl);
 const hex = (bytes) => Buffer.from(bytes).toString("hex");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -63,7 +64,7 @@ async function context(t) {
   const recorder = await createZk1PhysicalStopRecorder({ pool: stopPool,
     trustedHostKeyId: hostKeyId, trustedHostPublicKey: keys.publicKey });
   const operator = new Zk1SharedPgStrictStopOperator({ gate, supervisor, recorder });
-  const lab = new Zk1LabSupervisedPgWriter({ operator, runtimePgUrl: gateUrl });
+  const lab = new Zk1LabSupervisedPgWriter({ operator, runtimePgUrl: writerUrl });
   const io = { scope, workerId: crypto.randomBytes(16),
     principal: "AB:".repeat(31) + "AB", action: "put",
     objectId: crypto.randomBytes(16).toString("base64url"), revision: 1, digest };
@@ -74,7 +75,7 @@ function quiesce(c) {
     reservationId: crypto.randomBytes(16), revision: 1, digest: c.digest };
 }
 
-test("real supervisor-owned CHILD commits physical ciphertext; gate quiesce cannot overtake held PG INSERT", {
+test("real supervisor-owned CHILD commits physical ciphertext; gate quiesce cannot overtake child row-lock INSERT", {
   skip: !enabled && "requires isolated disposable PG18 gate/STOP credentials",
 }, async (t) => {
   const c = await context(t);

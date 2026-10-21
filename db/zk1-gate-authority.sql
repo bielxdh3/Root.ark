@@ -292,7 +292,7 @@ CREATE TABLE IF NOT EXISTS zk1_gate.sealed_object (
 -- physical fence also requires OPEN + a matching current-generation ACTIVE
 -- PUT admission; an unsealed object must not be a way around quiescence.
 CREATE OR REPLACE FUNCTION zk1_gate.reject_chunk_after_seal()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
 DECLARE
   current_head record;
 BEGIN
@@ -305,6 +305,11 @@ BEGIN
     RAISE EXCEPTION 'ciphertext chunk insertion requires READ COMMITTED isolation'
       USING ERRCODE='23514';
   END IF;
+  -- This exact trigger is operator-owned SECURITY DEFINER so a restricted
+  -- physical writer can INSERT ciphertext without UPDATE privilege on the
+  -- gate head. It still acquires a real FOR UPDATE row lock before the
+  -- effect. Caller-controlled identifiers remain bound parameters and
+  -- every referenced object is schema-qualified with pinned search_path.
   SELECT revision,digest,generation INTO current_head FROM zk1_gate.head
     WHERE scope_key=NEW.scope_key AND phase='OPEN' FOR UPDATE;
   IF NOT FOUND THEN
@@ -331,6 +336,7 @@ BEGIN
   END IF;
   RETURN NEW;
 END $$;
+REVOKE ALL ON FUNCTION zk1_gate.reject_chunk_after_seal() FROM PUBLIC;
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t
@@ -426,6 +432,9 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='zk1_stop_runtime') THEN
     CREATE ROLE zk1_stop_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='zk1_chunk_writer_runtime') THEN
+    CREATE ROLE zk1_chunk_writer_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+  END IF;
 END $$;
 GRANT USAGE ON SCHEMA zk1_gate TO zk1_gate_runtime;
 GRANT SELECT ON zk1_gate.head, zk1_gate.admission,
@@ -448,4 +457,14 @@ GRANT UPDATE (stop_lock) ON zk1_gate.head TO zk1_stop_runtime;
 GRANT INSERT (admission_id,scope_key,worker_id,generation,host_key_id,
   process_epoch,process_pid,stopped_at,proof_digest,signed_proof)
   ON zk1_gate.physical_stop_receipt TO zk1_stop_runtime;
+-- A supervised physical writer gets a different credential from the gate
+-- controller: it may inspect *only ciphertext-side* state and insert bounded
+-- staging bytes. It MUST NOT mint admissions, advance head generation,
+-- publish SEALED, record STOP receipts or impersonate the gate controller.
+GRANT USAGE ON SCHEMA zk1_gate TO zk1_chunk_writer_runtime;
+GRANT SELECT ON zk1_gate.head, zk1_gate.admission,
+  zk1_gate.ciphertext_chunk, zk1_gate.sealed_object
+  TO zk1_chunk_writer_runtime;
+GRANT INSERT (scope_key,object_id,chunk_index,ciphertext)
+  ON zk1_gate.ciphertext_chunk TO zk1_chunk_writer_runtime;
 COMMIT;

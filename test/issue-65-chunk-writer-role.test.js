@@ -1,0 +1,74 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
+const { Pool } = require("pg");
+const { verifyZk1ChunkWriterRuntimePool } =
+  require("../src/services/zk1SharedPgChunkWriterRuntime");
+const { Zk1SharedPgGateAuthority } = require("../src/services/zk1SharedPgGateAuthority");
+
+const urls = Object.freeze({
+  admin: process.env.ROOTARK_ZK1_TEST_PG_URL,
+  gate: process.env.ROOTARK_ZK1_RUNTIME_PG_URL,
+  stop: process.env.ROOTARK_ZK1_STOP_PG_URL,
+  writer: process.env.ROOTARK_ZK1_WRITER_PG_URL,
+});
+const enabled = Object.values(urls).every(Boolean);
+const random = (length) => crypto.randomBytes(length);
+const scopeKey = (scope) => [
+  scope.account_id.toString("hex"),
+  scope.compartment_id.length.toString(16),
+  scope.compartment_id.toString("hex"),
+].join(":");
+
+test("independent physical chunk writer cannot forge admission, head or STOP", {
+  skip: !enabled && "requires disposable admin/gate/STOP/writer PG logins",
+}, async (t) => {
+  const pools = Object.fromEntries(Object.entries(urls).map(([name, url]) =>
+    [name, new Pool({ connectionString: url, max: 2, connectionTimeoutMillis: 3000 })]));
+  t.after(async () => Promise.all(Object.values(pools).map((pool) => pool.end())));
+  const verified = await verifyZk1ChunkWriterRuntimePool(pools.writer);
+  assert.equal(verified.verified, true);
+  for (const forbidden of ["admin", "gate", "stop"]) {
+    await assert.rejects(verifyZk1ChunkWriterRuntimePool(pools[forbidden]),
+      /ZK_CHUNK_WRITER_RUNTIME_INVALID/,
+      forbidden + " must never be delegated as a physical child writer");
+  }
+  const scope = { account_id: random(16), compartment_id: random(8), keyring_id: random(16) };
+  const key = scopeKey(scope);
+  const digest = random(32);
+  const objectId = random(16).toString("base64url");
+  await pools.admin.query("INSERT INTO zk1_gate.head" +
+    " (scope_key,keyring_id,revision,digest,require_stop_proof) VALUES($1,$2,1,$3,TRUE)",
+  [key, scope.keyring_id, digest]);
+  const admission = { scope, workerId: random(16), principal: "AA:".repeat(31) + "AA",
+    action: "put", objectId, revision: 1, digest,
+    hostKeyId: random(16), processEpoch: random(16), processPid: process.pid };
+  const gate = new Zk1SharedPgGateAuthority({ pool: pools.gate });
+  const started = await gate.beginIoAdmission(admission);
+  assert.equal(started.proceed, true);
+  await assert.rejects(pools.writer.query("INSERT INTO zk1_gate.admission" +
+    " (id,scope_key,worker_id,principal,action,object_id,revision,digest,generation,state)" +
+    " VALUES($1,$2,$3,'forged','put',$4,1,$5,1,'ACTIVE')",
+  [random(16), key, random(16), objectId, digest]), /permission|denied|42501/i,
+  "writer must not mint ACTIVE permits");
+  await assert.rejects(pools.writer.query("UPDATE zk1_gate.head SET phase='QUIESCING' WHERE scope_key=$1",
+    [key]), /permission|denied|42501/i,
+  "writer must not control GateAuthority phase");
+  await assert.rejects(pools.writer.query("INSERT INTO zk1_gate.physical_stop_receipt (admission_id) VALUES($1)",
+    [started.admissionId]), /permission|denied|42501/i,
+  "writer must not forge STOP proof receipts");
+  const write = (index) => pools.writer.query("INSERT INTO zk1_gate.ciphertext_chunk" +
+    " (scope_key,object_id,chunk_index,ciphertext) VALUES($1,$2,$3,$4)",
+  [key, objectId, index, random(31)]);
+  assert.equal((await write(0)).rowCount, 1, "strict child may write while OPEN with a true admission");
+  const op = { scope, operationId: random(16), reservationId: random(16),
+    revision: 1, digest };
+  await gate.beginQuiesce(op);
+  await assert.rejects(write(1), /requires current OPEN|phase|23514/i,
+    "writer-only login cannot write in revoked generation");
+  const rows = await pools.admin.query("SELECT chunk_index FROM zk1_gate.ciphertext_chunk" +
+    " WHERE scope_key=$1 AND object_id=$2", [key, objectId]);
+  assert.deepEqual(rows.rows.map((row) => row.chunk_index), [0]);
+});

@@ -38,6 +38,9 @@ Before *any* physical chunk INSERT (including raw restricted-role SQL):
 1. Require transaction isolation READ COMMITTED; stale MVCC snapshots from
    REPEATABLE READ/SERIALIZABLE must never weaken physical fencing.
 2. Hold the authoritative scope head `FOR UPDATE` and require `phase=OPEN`.
+   The fixed, operator-owned, schema-qualified SECURITY DEFINER trigger owns
+   this lock. The delegated chunk-writer login has SELECT and INSERT on its
+   ciphertext table but **no UPDATE grant** on the gate head.
 3. Reject already SEALED objects and chunk indices outside the versioned
    0–4095 range.
 4. Require a currently ACTIVE PUT admission for the exact scope/object,

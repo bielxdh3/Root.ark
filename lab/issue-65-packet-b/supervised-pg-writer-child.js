@@ -2,11 +2,12 @@
 
 // LAB ONLY: actual PostgreSQL ciphertext INSERT executes INSIDE the
 // supervisor-owned direct ChildProcess. No HTTP, S3, Drive, GET or descendants.
-// Restricted gate login arrives once over parent-owned local IPC after START;
+// Dedicated chunk-WRITER login arrives over parent-owned IPC after START;
 // neither PG credentials nor STOP signer key are inherited in environment.
 const crypto = require("node:crypto");
 const { Pool } = require("pg");
-const { verifyZk1SharedPgRuntimePool } = require("../../src/services/zk1SharedPgGateRuntime");
+const { verifyZk1ChunkWriterRuntimePool } =
+  require("../../src/services/zk1SharedPgChunkWriterRuntime");
 
 const fail = () => { throw new Error("LAB_WORKER_DENIED"); };
 const decode = (s, min, max = min) => {
@@ -24,7 +25,7 @@ function parse(init) {
     || typeof init.principal !== "string" || init.principal.length < 1) fail();
   const url = new URL(init.pgUrl);
   if (url.protocol !== "postgresql:" || url.hostname !== "127.0.0.1"
-    || !/^zkgatefixture_[a-f0-9]{12}$/.test(decodeURIComponent(url.username))
+    || !/^zkwriterfixture_[a-f0-9]{12}$/.test(decodeURIComponent(url.username))
     || url.pathname !== "/gatefixture" || !url.port || url.search || url.hash) fail();
   const scope = { account_id: decode(init.scope?.account_id, 16),
     compartment_id: decode(init.scope?.compartment_id, 1, 128),
@@ -57,10 +58,12 @@ async function hold(message) {
     state = "busy";
     c = await pool.connect();
     await c.query("BEGIN ISOLATION LEVEL READ COMMITTED");
-    // Physical row lock is held throughout real insertion and until COMMIT.
-    // No independent JS gateway callback or network effect escapes this lock.
+    // Preflight read alone is NOT the physical fence; the immediately
+    // following INSERT fires the trusted SECURITY DEFINER trigger that holds
+    // the authority head FOR UPDATE until COMMIT or rollback. This worker
+    // cannot UPDATE the head itself.
     const { rows: heads, rowCount: hc } = await c.query(`SELECT keyring_id,phase,revision,digest,
-      generation,require_stop_proof FROM zk1_gate.head WHERE scope_key=$1 FOR UPDATE`, [expected.key]);
+      generation,require_stop_proof FROM zk1_gate.head WHERE scope_key=$1`, [expected.key]);
     const h = heads[0];
     if (hc !== 1 || !h.keyring_id.equals(expected.scope.keyring_id)
       || h.phase !== "OPEN" || h.require_stop_proof !== true
@@ -104,7 +107,7 @@ process.on("message", async (message) => {
       expected = parse(message);
       pool = new Pool({ connectionString: expected.connectionString, max: 1,
         connectionTimeoutMillis: 3000 });
-      await verifyZk1SharedPgRuntimePool(pool);
+      await verifyZk1ChunkWriterRuntimePool(pool);
       state = "ready";
       process.send({ kind: "bootstrapped", restrictedRoleVerified: true,
         inheritedSecrets: Object.keys(process.env).some((k) =>
