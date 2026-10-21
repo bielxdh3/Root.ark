@@ -109,6 +109,38 @@ test("protected local PUT archives ciphertext revisions atomically and never rep
     crypto.createHash("sha256").update(firstBytes).digest()),
   /ZK_CONTENT_DENIED/,
   "digest with no historical revision is not an ambiguous latest read");
+  const latestRead = () => historicalGet(null, null);
+  const corruptProjection = rand(secondBytes.length);
+  store.db.prepare("UPDATE zk_content_object SET ciphertext=? WHERE id=?")
+    .run(corruptProjection, objectId);
+  await assert.rejects(store.get(await latestRead()),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT|ZK_CONTENT_CONFLICT/,
+    "the latest ciphertext projection cannot be sent if it disagrees with the immutable archive");
+  await assert.rejects(store.put(await signed(rand(302), 2)),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT|ZK_CONTENT_CONFLICT/,
+    "a legitimate PUT must not launder an unexpected modified current projection");
+  store.db.prepare("UPDATE zk_content_object SET ciphertext=? WHERE id=?")
+    .run(secondBytes, objectId);
+  assert.deepEqual((await store.get(await latestRead())).ciphertext, secondBytes,
+    "exact projection/archive parity restores the original authorized read");
+  store.db.prepare("UPDATE zk_content_object SET revision=?, epoch=?, ciphertext=? WHERE id=?")
+    .run(1, manifest.current_epoch, firstBytes, objectId);
+  await assert.rejects(store.get(await latestRead()),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT/,
+    "a rollback to a valid earlier archived revision is still a forged latest head");
+  await assert.rejects(store.put(await signed(rand(300), 1)),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT/,
+    "rollback to a valid archived revision must not allow a replayed sequential PUT");
+  store.db.prepare("UPDATE zk_content_object SET revision=?, epoch=?, ciphertext=? WHERE id=?")
+    .run(2, manifest.current_epoch, secondBytes, objectId);
+  store.db.prepare("DELETE FROM zk_content_object WHERE id=?").run(objectId);
+  await assert.rejects(store.get(await latestRead()),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT/,
+    "removing the current projection must not hide an intact historical object");
+  store.db.prepare("INSERT INTO zk_content_object(scope,id,revision,epoch,ciphertext) VALUES(?,?,?,?,?)")
+    .run(store.db.prepare("SELECT scope FROM zk_content_version WHERE id=? LIMIT 1")
+      .get(objectId).scope, objectId, 2, manifest.current_epoch, secondBytes);
+  assert.deepEqual((await store.get(await latestRead())).ciphertext, secondBytes);
   const failed = await signed(rand(100), 1);
   await assert.rejects(store.put(failed), /ZK_CONTENT_CONFLICT/);
   assert.equal(revisions().length, 2, "failed overwrite cannot create phantom immutable revisions");

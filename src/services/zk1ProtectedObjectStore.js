@@ -302,6 +302,8 @@ class Zk1ProtectedObjectStore {
     this.getObject = this.db.prepare("SELECT revision,epoch,ciphertext FROM zk_content_object WHERE scope=? AND id=?");
     this.getVersion = this.db.prepare("SELECT revision,epoch,ciphertext,ciphertext_digest "
       + "FROM zk_content_version WHERE scope=? AND id=? AND revision=?");
+    this.getLatestVersion = this.db.prepare("SELECT revision,epoch,ciphertext,ciphertext_digest "
+      + "FROM zk_content_version WHERE scope=? AND id=? ORDER BY revision DESC LIMIT 1");
     this.nonceCount = this.db.prepare("SELECT COUNT(*) AS n FROM zk_content_nonce WHERE scope=?");
     this.objectCount = this.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object WHERE scope=?");
     this.clockRow = this.db.prepare("SELECT last_at FROM zk_content_clock WHERE scope=?");
@@ -473,6 +475,20 @@ class Zk1ProtectedObjectStore {
         .get(key, request.nonce)) fail("ZK_CONTENT_REPLAY");
       if (this.nonceCount.get(key).n >= MAX_NONCES) fail("ZK_CONTENT_UNAVAILABLE");
       const row = this.getObject.get(key, request.object_id);
+      const tail = this.getLatestVersion.get(key, request.object_id);
+      if (Boolean(row) !== Boolean(tail)) fail("ZK_CONTENT_VERSION_HISTORY_CORRUPT");
+      if (row) {
+        // The mutable current projection is only an index; immutable version
+        // rows are the source of truth. A compromised local SQLite writer may
+        // alter/rewind/delete the projection after startup. Compare against
+        // the absolute LAST archived revision, not a historical row picked
+        // using the untrusted projection's current revision.
+        if (row.revision !== tail.revision || row.epoch !== tail.epoch
+          || row.ciphertext.length !== tail.ciphertext.length
+          || !equal(row.ciphertext, tail.ciphertext)
+          || !equal(crypto.createHash("sha256").update(tail.ciphertext).digest(),
+            tail.ciphertext_digest)) fail("ZK_CONTENT_VERSION_HISTORY_CORRUPT");
+      }
       let result;
       if (operation === "get") {
         if (!row) fail("ZK_CONTENT_NOT_FOUND");
