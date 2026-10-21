@@ -14,6 +14,11 @@ const { Zk1SharedPgGateAuthority } = require("../src/services/zk1SharedPgGateAut
 const { createZk1SharedPgGateHttpsServer } = require("../src/services/zk1SharedPgGateHttpsServer");
 const { createZk1SharedPgGateHttpsClient } = require("../src/services/zk1SharedPgGateHttpsClient");
 const { Zk1SharedPgCiphertextSink } = require("../src/services/zk1SharedPgCiphertextSink");
+const { Zk1SharedPgSealedObjectStore } = require("../src/services/zk1SharedPgSealedObjectStore");
+const { computeZk1CiphertextRoot } = require("../src/crypto/rootark-zk-chunk-root-v1");
+const { createIsolatedZk1SharedPgGateServer } = require("../src/services/zk1SharedPgGateRuntime");
+const { Zk1SharedGateWitnessCoordinator } = require("../src/services/zk1SharedGateWitnessCoordinator");
+const zkWire = require("../src/crypto/rootark-zk-1");
 
 const url = process.env.ROOTARK_ZK1_TEST_PG_URL;
 function randomScope() {
@@ -331,7 +336,9 @@ function sendTls(port, tls, pathName, body, permitted = true) {
     const request = https.request({ hostname: "localhost", port, path: pathName, method: "POST",
       ca: tls.ca, key: permitted ? tls.allowedKey : tls.deniedKey,
       cert: permitted ? tls.allowedCert : tls.deniedCert,
-      rejectUnauthorized: true, minVersion: "TLSv1.3", timeout: 4000,
+      // Test clients intentionally have distinct certificate identities and
+      // MUST NOT inherit a socket or pin state from the process-wide Agent.
+      agent: false, rejectUnauthorized: true, minVersion: "TLSv1.3", timeout: 4000,
       headers: { "content-type": "application/json", "content-length": String(bytes.length) },
     }, (res) => {
       const parts = [];
@@ -358,6 +365,7 @@ test("real mTLS independent gate listener binds every PostgreSQL chunk to scoped
   const pool = new Pool({ connectionString: url, max: 3, connectionTimeoutMillis: 3000 });
   t.after(async () => { await pool.end(); });
   const gate = new Zk1SharedPgGateAuthority({ pool });
+  const sealedStore = new Zk1SharedPgSealedObjectStore({ pool });
   const scope = randomScope();
   const other = randomScope();
   const digest = crypto.randomBytes(32);
@@ -367,8 +375,8 @@ test("real mTLS independent gate listener binds every PostgreSQL chunk to scoped
   const encodeScope = (s) => Object.fromEntries(Object.entries(s).map(([k, v]) => [k, encode(v)]));
   const allowedFingerprint = new crypto.X509Certificate(tls.allowedCert).fingerprint256;
   const server = createZk1SharedPgGateHttpsServer({
-    key: tls.serverKey, cert: tls.serverCert, clientCa: tls.ca, gate,
-    principals: { [allowedFingerprint]: { roles: ["admit", "put", "reserve"],
+    key: tls.serverKey, cert: tls.serverCert, clientCa: tls.ca, gate, sealedStore,
+    principals: { [allowedFingerprint]: { roles: ["admit", "put", "seal", "reserve"],
       scopes: [encodeScope(scope)] } },
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -388,6 +396,19 @@ test("real mTLS independent gate listener binds every PostgreSQL chunk to scoped
   const put = { ...base, admissionId: started.body.admissionId,
     generation: started.body.generation, chunkIndex: 0, ciphertextBase64: encode(chunk) };
   assert.deepEqual((await sendTls(port, tls, "/v1/chunk/put", put)).body, { stored: true });
+  const seal = { ...base, admissionId: started.body.admissionId,
+    generation: started.body.generation, expectedChunkCount: 1,
+    expectedRootHash: encode(computeZk1CiphertextRoot([chunk])) };
+  assert.equal((await sendTls(port, tls, "/v1/chunk/seal", seal, false)).status, 403,
+    "a different authenticated mTLS identity cannot seal another worker's object");
+  assert.notEqual((await sendTls(port, tls, "/v1/chunk/seal", { ...seal,
+    expectedRootHash: encode(crypto.randomBytes(32)) })).status, 200,
+  "the physical PG gate must reject a mismatching owner-authenticated ciphertext root");
+  assert.deepEqual(await sendTls(port, tls, "/v1/chunk/seal", seal),
+    { status: 200, body: { status: "SEALED", chunkCount: 1 } });
+  assert.notEqual((await sendTls(port, tls, "/v1/chunk/put", { ...put,
+    chunkIndex: 1 })).status, 200,
+  "late chunks cannot bypass an already finalized object");
   const getRequest = { ...base, action: "get", workerId: encode(crypto.randomBytes(16)) };
   assert.equal((await sendTls(port, tls, "/v1/admission/start", getRequest)).status, 400,
     "no GET admission is issued until egress has a connection-loss-safe physical fence");
@@ -419,14 +440,15 @@ test("pinned mTLS gate client holds exact physical write admission across remote
   const pool = new Pool({ connectionString: url, max: 3, connectionTimeoutMillis: 3000 });
   t.after(async () => pool.end());
   const gate = new Zk1SharedPgGateAuthority({ pool });
+  const sealedStore = new Zk1SharedPgSealedObjectStore({ pool });
   const scope = randomScope();
   const digest = crypto.randomBytes(32);
   await pool.query("INSERT INTO zk1_gate.head(scope_key,keyring_id,revision,digest) VALUES($1,$2,1,$3)",
     [key(scope), scope.keyring_id, digest]);
   const fingerprint = new crypto.X509Certificate(tls.allowedCert).fingerprint256;
   const server = createZk1SharedPgGateHttpsServer({ key: tls.serverKey,
-    cert: tls.serverCert, clientCa: tls.ca, gate,
-    principals: { [fingerprint]: { roles: ["admit", "put", "reserve"],
+    cert: tls.serverCert, clientCa: tls.ca, gate, sealedStore,
+    principals: { [fingerprint]: { roles: ["admit", "put", "seal", "reserve"],
       scopes: [Object.fromEntries(Object.entries(scope).map(([k, v]) => [k, Buffer.from(v).toString("base64url")]))] } },
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -451,6 +473,14 @@ test("pinned mTLS gate client holds exact physical write admission across remote
   const ciphertext = crypto.randomBytes(128);
   assert.deepEqual(await client.putCiphertextChunk(write, 0, ciphertext), { stored: true });
   assert.deepEqual(await client.putCiphertextChunk(write, 0, ciphertext), { stored: false });
+  const root = computeZk1CiphertextRoot([ciphertext]);
+  await assert.rejects(client.sealCiphertextObject(write, 1,
+    crypto.randomBytes(32)), /ZK_GATE_TRANSPORT_UNAVAILABLE/,
+  "a remote mTLS client cannot seal a different ciphertext commitment");
+  assert.deepEqual(await client.sealCiphertextObject(write, 1, root),
+    { status: "SEALED", chunkCount: 1 });
+  assert.deepEqual(await client.sealCiphertextObject(write, 1, root),
+    { status: "SEALED", chunkCount: 1 }, "lost seal ACK replays the exact root");
   const op = { scope, operationId: crypto.randomBytes(16),
     reservationId: crypto.randomBytes(16), revision: 1, digest };
   assert.equal((await client.beginQuiesce(op)).state, "QUIESCING");
@@ -466,6 +496,50 @@ test("pinned mTLS gate client holds exact physical write admission across remote
     [key(scope)]);
   assert.equal(rows.rowCount, 1);
   assert.deepEqual(rows.rows[0].ciphertext, ciphertext);
+});
+
+test("operator-verified restricted PostgreSQL runtime can opt in to physical mTLS ciphertext sealing", {
+  skip: !url || !process.env.ROOTARK_ZK1_RUNTIME_PG_URL
+    ? "requires disposable admin and restricted PG connections" : false,
+}, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-gate-runtime-seal-"));
+  const tls = tlsFixture(dir);
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const admin = new Pool({ connectionString: url, max: 2, connectionTimeoutMillis: 3000 });
+  const runtime = new Pool({ connectionString: process.env.ROOTARK_ZK1_RUNTIME_PG_URL,
+    max: 3, connectionTimeoutMillis: 3000 });
+  t.after(async () => { await Promise.all([admin.end(), runtime.end()]); });
+  const scope = randomScope();
+  const digest = crypto.randomBytes(32);
+  await admin.query("INSERT INTO zk1_gate.head(scope_key,keyring_id,revision,digest) VALUES($1,$2,1,$3)",
+    [key(scope), scope.keyring_id, digest]);
+  const fingerprint = new crypto.X509Certificate(tls.allowedCert).fingerprint256;
+  const grantScope = Object.fromEntries(Object.entries(scope)
+    .map(([name, value]) => [name, Buffer.from(value).toString("base64url")]));
+  const server = await createIsolatedZk1SharedPgGateServer({ pool: runtime,
+    key: tls.serverKey, cert: tls.serverCert, clientCa: tls.ca, enableSealing: true,
+    principals: { [fingerprint]: { roles: ["admit", "put", "seal"], scopes: [grantScope] } },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const client = createZk1SharedPgGateHttpsClient({ endpoint: "https://localhost:" + server.address().port,
+    ca: tls.ca, clientKey: tls.allowedKey, clientCert: tls.allowedCert,
+    serverFingerprint256: new crypto.X509Certificate(tls.serverCert).fingerprint256 });
+  const request = { scope, workerId: crypto.randomBytes(16), action: "put",
+    objectId: crypto.randomBytes(16).toString("base64url"), revision: 1, digest };
+  const receipt = await client.beginIoAdmission(request);
+  const authorized = { ...request, admissionId: receipt.admissionId,
+    generation: receipt.generation };
+  const chunk = crypto.randomBytes(71);
+  assert.deepEqual(await client.putCiphertextChunk(authorized, 0, chunk), { stored: true });
+  assert.deepEqual(await client.sealCiphertextObject(authorized, 1,
+    computeZk1CiphertextRoot([chunk])), { status: "SEALED", chunkCount: 1 });
+  await client.finishIoAdmission({ scope, workerId: request.workerId,
+    admissionId: receipt.admissionId });
+  const saved = await admin.query(`SELECT expected_chunks FROM zk1_gate.sealed_object
+    WHERE scope_key=$1 AND object_id=$2`, [key(scope), request.objectId]);
+  assert.equal(saved.rowCount, 1);
+  assert.equal(saved.rows[0].expected_chunks, 1);
 });
 
 test("ciphertext sink retries a lost START/PUT ACK identically and never writes after a concurrent gate close", {
@@ -515,4 +589,149 @@ test("ciphertext sink retries a lost START/PUT ACK identically and never writes 
   assert.equal((await gate.markPending({ scope, operationId: op.operationId,
     reservationId: op.reservationId })).status, "PENDING",
   "the sink has finished its original worker even on a denied second chunk");
+});
+
+test("PG shared gate and separately signed witness reserve only after both drain, with exact retry and fail closed", {
+  skip: !url && "requires isolated ROOTARK_ZK1_TEST_PG_URL",
+}, async (t) => {
+  const pool = new Pool({ connectionString: url, max: 3, connectionTimeoutMillis: 3000 });
+  t.after(async () => pool.end());
+  const gate = new Zk1SharedPgGateAuthority({ pool });
+  const scope = randomScope();
+  const digest = crypto.randomBytes(32);
+  await pool.query("INSERT INTO zk1_gate.head(scope_key,keyring_id,revision,digest) VALUES($1,$2,1,$3)",
+    [key(scope), scope.keyring_id, digest]);
+  const witnessKey = crypto.generateKeyPairSync("ed25519");
+  const witnessKeyId = crypto.randomBytes(16);
+  const op = { ...scope, reservation_id: crypto.randomBytes(16),
+    operation_id: crypto.randomBytes(16), expected_revision: 1,
+    expected_manifest_digest: digest, proposed_revision: 2,
+    proposed_manifest_digest: crypto.randomBytes(32), request_digest: crypto.randomBytes(32),
+    package_envelope_digest: null, expires_at: Math.floor(Date.now() / 1000) + 190 };
+  let witnessWorkers = 1;
+  let withholdDrainedStatus = false;
+  let invalidSignature = false;
+  let mismatchedSignedExpiry = false;
+  let mutateWitnessInput = true;
+  let signed;
+  const witness = {
+    prepareQuiesce: async ({ operation }) => {
+      assert.deepEqual(operation.operation_id, op.operation_id);
+      if (mutateWitnessInput) operation.proposed_manifest_digest.fill(0x5c);
+      return { status: witnessWorkers || withholdDrainedStatus ? "QUIESCING" : "DRAINED",
+        activeCount: witnessWorkers };
+    },
+    reserve: async ({ operation }) => {
+      assert.deepEqual(operation.operation_id, op.operation_id);
+      assert.deepEqual(operation.proposed_manifest_digest, op.proposed_manifest_digest,
+        "witness adapter cannot mutate previously owner-approved operation between awaits");
+      if (!signed) {
+        const body = { type: "rootark-recovery-witness-reservation/v1",
+          reservation_id: op.reservation_id, witness_key_id: witnessKeyId,
+          account_id: op.account_id, compartment_id: op.compartment_id,
+          keyring_id: op.keyring_id, expected_revision: 1,
+          expected_manifest_digest: digest, proposed_revision: 2,
+          proposed_manifest_digest: op.proposed_manifest_digest,
+          operation_id: op.operation_id, request_digest: op.request_digest,
+          package_envelope_digest: null, expires_at: op.expires_at };
+        const signature = crypto.sign(null, Buffer.concat([
+          Buffer.from("Root.ark/zk-1/recovery-witness-reservation/v1\0", "ascii"),
+          Buffer.from(await zkWire.encodeDeterministic(body))]), witnessKey.privateKey);
+        signed = Buffer.from(await zkWire.encodeDeterministic({ ...body, signature }));
+      }
+      if (invalidSignature) return Buffer.from(signed).fill(0);
+      if (mismatchedSignedExpiry) {
+        const original = await zkWire.decodeDeterministic(signed);
+        const { signature: _signature, ...mutated } = original;
+        mutated.expires_at = op.expires_at - 100;
+        const replacement = crypto.sign(null, Buffer.concat([
+          Buffer.from("Root.ark/zk-1/recovery-witness-reservation/v1\0", "ascii"),
+          Buffer.from(await zkWire.encodeDeterministic(mutated))]), witnessKey.privateKey);
+        return Buffer.from(await zkWire.encodeDeterministic({ ...mutated,
+          signature: replacement }));
+      }
+      return signed;
+    },
+  };
+  const coordinator = new Zk1SharedGateWitnessCoordinator({ gate, witness,
+    witnessPinned: { keyId: witnessKeyId, publicKey: witnessKey.publicKey },
+    verifyOwnerIntent: async ({ operation, ownerAuthorization }) =>
+      ownerAuthorization === "owner-approved" && operation.operation_id.equals(op.operation_id) });
+  const maliciousVerifier = new Zk1SharedGateWitnessCoordinator({ gate, witness,
+    witnessPinned: { keyId: witnessKeyId, publicKey: witnessKey.publicKey },
+    verifyOwnerIntent: async ({ operation }) => {
+      assert.deepEqual(operation.proposed_manifest_digest, op.proposed_manifest_digest);
+      operation.proposed_manifest_digest.fill(0x7f);
+      return true;
+    } });
+  await assert.rejects(maliciousVerifier.reserveAfterDrain({ operation: op,
+    ownerAuthorization: "owner-approved" }), /ZK_GATE_COORDINATION_UNAVAILABLE/,
+  "owner verifier must not mutate a request after authorization but before the PG fence");
+  assert.notDeepEqual(op.proposed_manifest_digest, Buffer.alloc(32, 0x7f),
+    "original caller-owned request remains unchanged by verifier");
+  await assert.rejects(coordinator.reserveAfterDrain({ operation: { ...op,
+    expires_at: Math.floor(Date.now() / 1000) - 1 },
+    ownerAuthorization: "owner-approved" }), /ZK_GATE_COORDINATION_UNAVAILABLE/,
+  "known-expired requests must fail BEFORE closing the durable scope");
+  await assert.rejects(coordinator.reserveAfterDrain({ operation: { ...op,
+    expires_at: Math.floor(Date.now() / 1000) + 500 },
+    ownerAuthorization: "owner-approved" }), /ZK_GATE_COORDINATION_UNAVAILABLE/,
+  "implausible future operations must not close the durable scope");
+  await assert.rejects(coordinator.reserveAfterDrain({ operation: op,
+    ownerAuthorization: "untrusted" }), /ZK_GATE_COORDINATION_UNAVAILABLE/);
+  const stillOpen = await pool.query("SELECT phase FROM zk1_gate.head WHERE scope_key=$1", [key(scope)]);
+  assert.equal(stillOpen.rows[0].phase, "OPEN");
+  const active = context(scope, digest, "put", crypto.randomBytes(16).toString("base64url"));
+  const admitted = await gate.beginIoAdmission(active);
+  const first = await coordinator.reserveAfterDrain({ operation: op,
+    ownerAuthorization: "owner-approved" });
+  assert.equal(first.status, "QUIESCING");
+  assert.notDeepEqual(op.proposed_manifest_digest, Buffer.alloc(32, 0x5c),
+    "adversarial witness callback did not mutate caller or coordinator authoritative bytes");
+  mutateWitnessInput = false;
+  assert.equal(first.pgActive, 1);
+  assert.equal(first.witnessActive, 1);
+  await assert.rejects(gate.beginIoAdmission(context(scope, digest, "put", active.objectId)),
+    /ZK_GATE_DENIED/);
+  await gate.finishIoAdmission({ scope, admissionId: admitted.admissionId,
+    workerId: active.workerId, principal: active.principal });
+  const stillWaiting = await coordinator.reserveAfterDrain({ operation: op,
+    ownerAuthorization: "owner-approved" });
+  assert.equal(stillWaiting.status, "QUIESCING");
+  assert.equal(stillWaiting.pgActive, 0);
+  assert.equal(stillWaiting.witnessActive, 1);
+  witnessWorkers = 0;
+  withholdDrainedStatus = true;
+  const withheld = await coordinator.reserveAfterDrain({ operation: op,
+    ownerAuthorization: "owner-approved" });
+  assert.equal(withheld.status, "QUIESCING",
+    "even with zero workers, witness must explicitly acknowledge DRAINED");
+  assert.equal((await pool.query("SELECT phase FROM zk1_gate.head WHERE scope_key=$1",
+    [key(scope)])).rows[0].phase, "QUIESCING",
+  "an unacknowledged witness drain must never advance shared PG into PENDING");
+  withholdDrainedStatus = false;
+  invalidSignature = true;
+  await assert.rejects(coordinator.reserveAfterDrain({ operation: op,
+    ownerAuthorization: "owner-approved" }), /ZK_GATE_COORDINATION_UNAVAILABLE/,
+  "forged witness receipt must never be returned as verified");
+  assert.equal((await pool.query("SELECT phase FROM zk1_gate.head WHERE scope_key=$1",
+    [key(scope)])).rows[0].phase, "PENDING",
+  "unverifiable witness ticket leaves PG gate durably closed");
+  invalidSignature = false;
+  mismatchedSignedExpiry = true;
+  await assert.rejects(coordinator.reserveAfterDrain({ operation: op,
+    ownerAuthorization: "owner-approved" }), /ZK_GATE_COORDINATION_UNAVAILABLE/,
+  "a correctly signed ticket with different expiry is still the wrong operation");
+  mismatchedSignedExpiry = false;
+  const reserved = await coordinator.reserveAfterDrain({ operation: op,
+    ownerAuthorization: "owner-approved" });
+  assert.equal(reserved.status, "PENDING");
+  assert.deepEqual(reserved.reservation, signed);
+  const retried = await coordinator.reserveAfterDrain({ operation: op,
+    ownerAuthorization: "owner-approved" });
+  assert.deepEqual(retried.reservation, reserved.reservation,
+    "same exact operation recovers witness ACK without reopening PG gate");
+  await assert.rejects(coordinator.reserveAfterDrain({ operation: { ...op,
+    operation_id: crypto.randomBytes(16) }, ownerAuthorization: "owner-approved" }),
+  /ZK_GATE_COORDINATION_UNAVAILABLE/);
 });

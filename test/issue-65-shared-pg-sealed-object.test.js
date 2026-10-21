@@ -159,3 +159,47 @@ test("restricted PostgreSQL stale snapshots cannot append chunks AFTER a committ
   assert.deepEqual(stored.rows.map((row) => row.chunk_index), [0],
     "sealed ciphertext object must not accumulate hidden chunks");
 });
+
+test("restricted SQL login cannot forge SEALED rows without exact live admission and full chunks", {
+  skip: !url || !restrictedUrl ? "requires disposable PG restricted runtime login" : false,
+}, async (t) => {
+  const f = await setup(t);
+  const direct = new Pool({ connectionString: restrictedUrl, max: 1,
+    connectionTimeoutMillis: 3000 });
+  t.after(async () => direct.end());
+  const insert = async (admissionId, count, rootHash = crypto.randomBytes(32)) => direct.query(`
+    INSERT INTO zk1_gate.sealed_object
+      (scope_key,object_id,revision,digest,generation,admission_id,expected_chunks,root_hash)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+  [key(f.scope), f.io.objectId, f.io.revision, f.digest,
+    f.worker.generation, admissionId, count, rootHash]);
+  await assert.rejects(insert(crypto.randomBytes(16), 1),
+    /seal|admission|chunk|deny|integrity|violat/i,
+    "a restricted role must not invent a sealed object with no admission/chunks");
+  const first = crypto.randomBytes(124);
+  await f.gate.putCiphertextChunk(f.worker, 0, first);
+  await assert.rejects(insert(f.worker.admissionId, 2),
+    /seal|admission|chunk|deny|integrity|violat/i,
+    "one stored chunk must not finalize an object claiming two chunks");
+  await assert.rejects(insert(f.worker.admissionId, 1),
+    /seal|admission|chunk|deny|integrity|violat/i,
+    "even matching live admission and complete chunks cannot authorize a forged ciphertext digest");
+  const correctHash = computeZk1CiphertextRoot([first]);
+  const c = await direct.connect();
+  try {
+    await c.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+    await assert.rejects(c.query(`INSERT INTO zk1_gate.sealed_object
+      (scope_key,object_id,revision,digest,generation,admission_id,expected_chunks,root_hash)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+    [key(f.scope), f.io.objectId, f.io.revision, f.digest,
+      f.worker.generation, f.worker.admissionId, 1, correctHash]),
+    /isolation|read committed/i,
+    "a snapshot-isolated direct SQL seal must never claim complete fresh ciphertext");
+  } finally { await c.query("ROLLBACK"); c.release(); }
+  assert.equal((await f.pool.query("SELECT COUNT(*)::int AS n FROM zk1_gate.sealed_object WHERE scope_key=$1",
+    [key(f.scope)])).rows[0].n, 0);
+  assert.deepEqual(await f.store.seal({ ...f.worker,
+    expectedChunkCount: 1, expectedRootHash: correctHash }),
+  { status: "SEALED", chunkCount: 1 },
+  "the fully validated trusted sealing path must remain available");
+});

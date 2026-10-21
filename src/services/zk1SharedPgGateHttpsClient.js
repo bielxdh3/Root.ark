@@ -155,6 +155,21 @@ function createZk1SharedPgGateHttpsClient({ endpoint, ca, clientKey, clientCert,
       if (typeof result.stored !== "boolean") unavailable();
       return result;
     },
+    async sealCiphertextObject(input, expectedChunkCount, expectedRootHash) {
+      const base = worker({ scope: input?.scope, workerId: input?.workerId,
+        action: input?.action, objectId: input?.objectId, revision: input?.revision,
+        digest: input?.digest });
+      if (!Number.isSafeInteger(expectedChunkCount)
+        || expectedChunkCount < 1 || expectedChunkCount > 4096) unavailable();
+      // expectedRootHash MUST have been independently authenticated by the
+      // owner/device. The storage service never self-signs this commitment.
+      const body = { ...base, admissionId: encode(input.admissionId, 16),
+        generation: positive(input.generation), expectedChunkCount,
+        expectedRootHash: encode(expectedRootHash, 32) };
+      const result = await send("/v1/chunk/seal", body, ["status", "chunkCount"]);
+      if (result.status !== "SEALED" || result.chunkCount !== expectedChunkCount) unavailable();
+      return { status: "SEALED", chunkCount: result.chunkCount };
+    },
     async finishIoAdmission(input) {
       exact(input, ["scope", "workerId", "admissionId"]);
       const result = await send("/v1/admission/finish", {

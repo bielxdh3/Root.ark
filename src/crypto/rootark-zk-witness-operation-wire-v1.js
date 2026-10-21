@@ -99,7 +99,7 @@ function validateReceipt(kind, proof, op, pinned, verifiedDigest) {
         && !bytesLen(proof.expected_manifest_digest, 32))) invalid();
     nextRevision(proof.expected_revision, proof.proposed_revision);
     u64(proof.expires_at);
-    for (const key of ["expected_revision", "expected_manifest_digest",
+    for (const key of ["expires_at", "expected_revision", "expected_manifest_digest",
       "proposed_revision", "proposed_manifest_digest", "request_digest",
       "package_envelope_digest"]) {
       if (!Object.hasOwn(op, key) || !exact(proof[key], op[key])) invalid();

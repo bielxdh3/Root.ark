@@ -23,6 +23,7 @@ function setup() {
     expected_revision: 1, expected_manifest_digest: Buffer.alloc(32, 0x16),
     proposed_revision: 2, proposed_manifest_digest: Buffer.alloc(32, 0x17),
     request_digest: Buffer.alloc(32, 0x18), package_envelope_digest: null,
+    expires_at: 1760000300,
   };
   const reservation = {
     type: "rootark-recovery-witness-reservation/v1", reservation_id: operation.reservation_id,
@@ -88,7 +89,8 @@ test("signed wrong operations, types, statuses, digests, and sequence fail close
       { extra: 1 },
       ...(kind === "reservation" ? [
         { proposed_revision: 3 }, { request_digest: Buffer.alloc(32, 0xee) },
-        { expires_at: -1 }, { witness_key_id: Buffer.alloc(16, 0xee) },
+        { expires_at: -1 }, { expires_at: 1760000350 },
+        { witness_key_id: Buffer.alloc(16, 0xee) },
       ] : kind === "commit" ? [
         { committed_revision: 3 }, { witness_sequence: 9 },
         { committed_manifest_digest: Buffer.alloc(32, 0xee) },

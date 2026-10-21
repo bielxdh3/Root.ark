@@ -95,6 +95,75 @@ BEGIN
       FOR EACH ROW EXECUTE FUNCTION zk1_gate.reject_chunk_after_seal();
   END IF;
 END $$;
+-- A restricted gate SQL login can run INSERT directly. The database must
+-- independently enforce SEALED completeness and the exact ciphertext root;
+-- JavaScript checks alone are insufficient under overprivileged-gateway
+-- compromise. PostgreSQL 18 supplies pg_catalog.sha256(bytea), requiring no
+-- untrusted extension or backend-generated device signing key.
+CREATE OR REPLACE FUNCTION zk1_gate.validate_sealed_object()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+DECLARE
+  item record;
+  next_index integer := 0;
+  transcript bytea;
+BEGIN
+  IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'sealed object requires READ COMMITTED isolation'
+      USING ERRCODE='23514';
+  END IF;
+  PERFORM 1 FROM zk1_gate.head
+    WHERE scope_key=NEW.scope_key AND phase='OPEN'
+      AND revision=NEW.revision AND digest=NEW.digest
+      AND generation=NEW.generation FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'sealed object requires the current OPEN gate head'
+      USING ERRCODE='23514';
+  END IF;
+  PERFORM 1 FROM zk1_gate.admission
+    WHERE id=NEW.admission_id AND scope_key=NEW.scope_key
+      AND action='put' AND object_id=NEW.object_id
+      AND revision=NEW.revision AND digest=NEW.digest
+      AND generation=NEW.generation AND state='ACTIVE';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'sealed object requires an active matching admission'
+      USING ERRCODE='23514';
+  END IF;
+  transcript := pg_catalog.convert_to('Root.ark/zk-1/ciphertext-chunk-root/v1', 'UTF8')
+    || pg_catalog.decode('00', 'hex') || pg_catalog.int4send(NEW.expected_chunks);
+  -- Only index/length/hash bytes enter the transcript, NOT the potentially
+  -- multi-GiB ciphertext itself. The domain/count/index/length ordering
+  -- exactly matches rootark-zk-chunk-root-v1.js.
+  FOR item IN SELECT chunk_index, ciphertext FROM zk1_gate.ciphertext_chunk
+    WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id
+    ORDER BY chunk_index LOOP
+    IF next_index >= NEW.expected_chunks OR item.chunk_index <> next_index THEN
+      RAISE EXCEPTION 'sealed object has missing or excess ciphertext chunks'
+        USING ERRCODE='23514';
+    END IF;
+    transcript := transcript || pg_catalog.int4send(item.chunk_index)
+      || pg_catalog.int4send(pg_catalog.octet_length(item.ciphertext))
+      || pg_catalog.sha256(item.ciphertext);
+    next_index := next_index + 1;
+  END LOOP;
+  IF next_index <> NEW.expected_chunks
+    OR pg_catalog.sha256(transcript) <> NEW.root_hash THEN
+    RAISE EXCEPTION 'sealed object ciphertext commitment mismatch'
+      USING ERRCODE='23514';
+  END IF;
+  RETURN NEW;
+END $$;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t
+    JOIN pg_catalog.pg_class AS c ON c.oid=t.tgrelid
+    JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+    WHERE n.nspname='zk1_gate' AND c.relname='sealed_object'
+      AND t.tgname='zk1_gate_validate_sealed_object' AND NOT t.tgisinternal) THEN
+    CREATE TRIGGER zk1_gate_validate_sealed_object
+      BEFORE INSERT ON zk1_gate.sealed_object
+      FOR EACH ROW EXECUTE FUNCTION zk1_gate.validate_sealed_object();
+  END IF;
+END $$;
 REVOKE ALL ON ALL TABLES IN SCHEMA zk1_gate FROM PUBLIC;
 -- Operator-only setup. The application account must NEVER hold membership
 -- in this role. A separately administered login can be granted membership

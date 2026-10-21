@@ -11,6 +11,7 @@ const ROUTES = Object.freeze({
   "/v1/admission/start": "admit",
   "/v1/admission/finish": "admit",
   "/v1/chunk/put": "put",
+  "/v1/chunk/seal": "seal",
   "/v1/quiesce": "reserve",
   "/v1/pending": "reserve",
 });
@@ -106,8 +107,10 @@ function makeGrants(principals) {
   }
   return grants;
 }
-function createZk1SharedPgGateHttpsServer({ key, cert, clientCa, gate, principals }) {
+function createZk1SharedPgGateHttpsServer({ key, cert, clientCa, gate,
+  sealedStore = null, principals }) {
   if (!key || !cert || !clientCa || !gate
+    || (sealedStore !== null && typeof sealedStore.seal !== "function")
     || ["beginIoAdmission", "finishIoAdmission", "putCiphertextChunk",
       "beginQuiesce", "markPending"].some((name) =>
       typeof gate[name] !== "function")) reject();
@@ -140,6 +143,26 @@ function createZk1SharedPgGateHttpsServer({ key, cert, clientCa, gate, principal
         exact(body, ["scope", "admissionId", "workerId"]);
         const result = await gate.finishIoAdmission({ scope,
           admissionId: decode(body.admissionId, 16), workerId: decode(body.workerId, 16), principal });
+        return sendJson(res, 200, result);
+      }
+      if (req.url === "/v1/chunk/seal") {
+        // Only a separately provisioned PostgreSQL-only sealed store can
+        // publish a bounded ciphertext root. This mTLS endpoint receives an
+        // already OWNER-validated commitment from its trusted gateway; it
+        // does not itself authorize any device or publish a ZK manifest.
+        if (!sealedStore) return sendJson(res, 503, { error: "ZK_GATE_UNAVAILABLE" });
+        exact(body, ["scope", "workerId", "action", "objectId", "revision",
+          "digest", "admissionId", "generation", "expectedChunkCount", "expectedRootHash"]);
+        const io = authorizeWorker({ scope: body.scope, workerId: body.workerId,
+          action: body.action, objectId: body.objectId, revision: body.revision,
+          digest: body.digest }, scope, principal);
+        if (io.action !== "put" || !Number.isSafeInteger(body.expectedChunkCount)
+          || body.expectedChunkCount < 1 || body.expectedChunkCount > 4096
+          || !Number.isSafeInteger(body.generation) || body.generation < 1) reject();
+        const result = await sealedStore.seal({ ...io,
+          admissionId: decode(body.admissionId, 16), generation: body.generation,
+          expectedChunkCount: body.expectedChunkCount,
+          expectedRootHash: decode(body.expectedRootHash, 32) });
         return sendJson(res, 200, result);
       }
       if (req.url === "/v1/quiesce" || req.url === "/v1/pending") {

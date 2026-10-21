@@ -76,7 +76,9 @@ async function main() {
     + "@127.0.0.1:" + match[1] + "/gatefixture";
   run("node", ["--test", "--test-reporter=spec",
     "test/issue-65-shared-gate-postgres.test.js",
-    "test/issue-65-gate-runtime-role.test.js"],
+    "test/issue-65-gate-runtime-role.test.js",
+    "test/issue-65-shared-pg-sealed-object.test.js",
+    "test/issue-65-shared-gate-real-witness.test.js"],
   { env: { ...process.env, ROOTARK_ZK1_TEST_PG_URL: uri,
     ROOTARK_ZK1_RUNTIME_PG_URL: runtimeUri }, inherit: true });
   process.stdout.write("SHARED_GATE_PG_REAL_PASS loopback=true cleanup=pending\n");

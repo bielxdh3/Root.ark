@@ -6,6 +6,7 @@
 // with inherited zk1_gate_runtime membership out of band.
 const { Zk1SharedPgGateAuthority } = require("./zk1SharedPgGateAuthority");
 const { createZk1SharedPgGateHttpsServer } = require("./zk1SharedPgGateHttpsServer");
+const { Zk1SharedPgSealedObjectStore } = require("./zk1SharedPgSealedObjectStore");
 
 function refuse() {
   const error = new Error("ZK_GATE_RUNTIME_IDENTITY_INVALID");
@@ -44,12 +45,15 @@ async function verifyZk1SharedPgRuntimePool(pool) {
 }
 
 async function createIsolatedZk1SharedPgGateServer({ pool, key, cert, clientCa,
-  principals } = {}) {
+  principals, enableSealing = false } = {}) {
   // No listener/socket exists until the live PostgreSQL login and permissions
   // have been reconciled from the same pool used by gate transactions.
   await verifyZk1SharedPgRuntimePool(pool);
+  if (typeof enableSealing !== "boolean") refuse();
   return createZk1SharedPgGateHttpsServer({ key, cert, clientCa,
-    gate: new Zk1SharedPgGateAuthority({ pool }), principals });
+    gate: new Zk1SharedPgGateAuthority({ pool }),
+    sealedStore: enableSealing ? new Zk1SharedPgSealedObjectStore({ pool }) : null,
+    principals });
 }
 
 module.exports = { verifyZk1SharedPgRuntimePool,

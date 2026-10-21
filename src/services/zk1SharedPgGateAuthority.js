@@ -178,7 +178,7 @@ class Zk1SharedPgGateAuthority {
       const head = await this.lockedHead(c, s);
       if (Number(head.revision) !== r || !head.digest.equals(d)) deny();
       if (head.phase !== "OPEN") {
-        if (head.phase !== "QUIESCING" || !head.operation_id.equals(op)
+        if (!["QUIESCING", "PENDING"].includes(head.phase) || !head.operation_id.equals(op)
           || !head.reservation_id.equals(res)) deny();
       } else {
         await c.query(`UPDATE zk1_gate.head SET phase='QUIESCING',
@@ -189,7 +189,7 @@ class Zk1SharedPgGateAuthority {
       }
       const count = await c.query(`SELECT COUNT(*)::int AS active FROM zk1_gate.admission
         WHERE scope_key=$1 AND state<>'FINISHED'`, [s.key]);
-      return { state: "QUIESCING", generation: Number(head.generation) +
+      return { state: head.phase === "PENDING" ? "PENDING" : "QUIESCING", generation: Number(head.generation) +
         (head.phase === "OPEN" ? 1 : 0), activeCount: count.rows[0].active };
     });
   }
@@ -218,8 +218,9 @@ class Zk1SharedPgGateAuthority {
     const res = bytes(reservationId, 16);
     return this.transaction(async (c) => {
       const head = await this.lockedHead(c, s);
-      if (head.phase !== "QUIESCING" || !head.operation_id.equals(op)
+      if (!["QUIESCING", "PENDING"].includes(head.phase) || !head.operation_id.equals(op)
         || !head.reservation_id.equals(res)) deny();
+      if (head.phase === "PENDING") return { status: "PENDING", generation: Number(head.generation) };
       const active = await c.query(`SELECT COUNT(*)::int AS n FROM zk1_gate.admission
         WHERE scope_key=$1 AND state<>'FINISHED'`, [s.key]);
       if (active.rows[0].n !== 0) deny("ZK_GATE_DRAIN_INCOMPLETE");
