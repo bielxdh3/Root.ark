@@ -45,6 +45,56 @@ CREATE TABLE IF NOT EXISTS zk1_gate.ciphertext_chunk (
   ciphertext bytea NOT NULL CHECK (octet_length(ciphertext) BETWEEN 1 AND 4194304),
   PRIMARY KEY(scope_key,object_id,chunk_index)
 );
+-- Physical chunk writes are STAGING until a trusted worker, while OPEN,
+-- seals the entire ordered ciphertext sequence against an independently
+-- supplied authenticated root. No automatic conversion of old objects.
+CREATE TABLE IF NOT EXISTS zk1_gate.sealed_object (
+  scope_key text NOT NULL REFERENCES zk1_gate.head(scope_key),
+  object_id text NOT NULL,
+  revision bigint NOT NULL CHECK(revision > 0),
+  digest bytea NOT NULL CHECK(octet_length(digest)=32),
+  generation bigint NOT NULL CHECK(generation>0),
+  admission_id bytea NOT NULL CHECK(octet_length(admission_id)=16),
+  expected_chunks integer NOT NULL CHECK(expected_chunks BETWEEN 1 AND 4096),
+  root_hash bytea NOT NULL CHECK(octet_length(root_hash)=32),
+  PRIMARY KEY(scope_key,object_id)
+);
+-- A trusted worker may still possess an ACTIVE admission after sealing.
+-- Physically forbid *all* later chunk INSERTs for that object, including
+-- direct SQL by the restricted gate role. Lock the same authoritative head
+-- to serialize against seal() and gate quiescence across connections.
+CREATE OR REPLACE FUNCTION zk1_gate.reject_chunk_after_seal()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+BEGIN
+  -- A transaction that pinned a REPEATABLE READ/SERIALIZABLE MVCC snapshot
+  -- *before* seal could otherwise acquire the head row lock *after* seal,
+  -- still see sealed_object as absent, and insert a hidden late ciphertext
+  -- chunk using the restricted runtime role. READ COMMITTED's fresh
+  -- per-statement predicate check is a required part of this physical fence.
+  IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'ciphertext chunk insertion requires READ COMMITTED isolation'
+      USING ERRCODE='23514';
+  END IF;
+  PERFORM 1 FROM zk1_gate.head WHERE scope_key=NEW.scope_key FOR UPDATE;
+  IF EXISTS (SELECT 1 FROM zk1_gate.sealed_object
+             WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id) THEN
+    RAISE EXCEPTION 'sealed ciphertext object is immutable'
+      USING ERRCODE='23514';
+  END IF;
+  RETURN NEW;
+END $$;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t
+    JOIN pg_catalog.pg_class AS c ON c.oid=t.tgrelid
+    JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+    WHERE n.nspname='zk1_gate' AND c.relname='ciphertext_chunk'
+      AND t.tgname='zk1_gate_enforce_sealed_chunks' AND NOT t.tgisinternal) THEN
+    CREATE TRIGGER zk1_gate_enforce_sealed_chunks
+      BEFORE INSERT ON zk1_gate.ciphertext_chunk
+      FOR EACH ROW EXECUTE FUNCTION zk1_gate.reject_chunk_after_seal();
+  END IF;
+END $$;
 REVOKE ALL ON ALL TABLES IN SCHEMA zk1_gate FROM PUBLIC;
 -- Operator-only setup. The application account must NEVER hold membership
 -- in this role. A separately administered login can be granted membership
@@ -59,7 +109,7 @@ BEGIN
 END $$;
 GRANT USAGE ON SCHEMA zk1_gate TO zk1_gate_runtime;
 GRANT SELECT ON zk1_gate.head, zk1_gate.admission,
-  zk1_gate.ciphertext_chunk TO zk1_gate_runtime;
+  zk1_gate.ciphertext_chunk, zk1_gate.sealed_object TO zk1_gate_runtime;
 GRANT UPDATE (phase, generation, operation_id, reservation_id)
   ON zk1_gate.head TO zk1_gate_runtime;
 GRANT INSERT (id, scope_key, worker_id, principal, action, object_id,
@@ -68,4 +118,6 @@ GRANT INSERT (id, scope_key, worker_id, principal, action, object_id,
 GRANT UPDATE (state) ON zk1_gate.admission TO zk1_gate_runtime;
 GRANT INSERT (scope_key, object_id, chunk_index, ciphertext)
   ON zk1_gate.ciphertext_chunk TO zk1_gate_runtime;
+GRANT INSERT (scope_key,object_id,revision,digest,generation,admission_id,
+  expected_chunks,root_hash) ON zk1_gate.sealed_object TO zk1_gate_runtime;
 COMMIT;
