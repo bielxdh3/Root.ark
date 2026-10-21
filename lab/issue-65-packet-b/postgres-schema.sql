@@ -171,6 +171,26 @@ CREATE TABLE p65_lab.active_effect (
   CHECK ((state = 'ACTIVE' AND stopped_at IS NULL) OR (state = 'STOPPED' AND stopped_at IS NOT NULL))
 );
 
+-- Test-only physical ciphertext store. Unlike allow_simulated_io(), writes
+-- happen within the same PostgreSQL transaction that locks keyring_head.
+-- Physical writes are therefore serializable in gate order across SQL
+-- sessions sharing this database. This does NOT fence external S3/filesystem
+-- writes or bytes already queued outside this PostgreSQL transaction.
+CREATE TABLE p65_lab.ciphertext_chunks (
+  account_id text NOT NULL,
+  compartment_id text NOT NULL,
+  keyring_id text NOT NULL,
+  object_id text NOT NULL CHECK (object_id ~ '^[A-Za-z0-9_-]{1,128}$'),
+  chunk_index integer NOT NULL CHECK (chunk_index BETWEEN 0 AND 4095),
+  ciphertext bytea NOT NULL CHECK (octet_length(ciphertext) BETWEEN 1 AND 1048576),
+  effect_id text NOT NULL,
+  generation bigint NOT NULL CHECK (generation > 0),
+  committed_at timestamptz NOT NULL,
+  PRIMARY KEY (account_id, compartment_id, keyring_id, object_id, chunk_index),
+  FOREIGN KEY (account_id, compartment_id, keyring_id, effect_id)
+    REFERENCES p65_lab.active_effect(account_id, compartment_id, keyring_id, effect_id)
+);
+
 CREATE TABLE p65_lab.stop_ack_requests (
   account_id text NOT NULL,
   compartment_id text NOT NULL,
@@ -525,6 +545,71 @@ BEGIN
 END
 $$;
 
+-- This is an actual PostgreSQL ciphertext write boundary for the lab, not
+-- merely a permission check. Caller-controlled scope/epoch/head/effect must
+-- all match durable state. Nothing is written once PENDING/QUIESCING wins the
+-- head row lock. A duplicate identical ciphertext is an immutable replay.
+CREATE FUNCTION p65_lab.write_ciphertext_chunk(
+  p_account text, p_compartment text, p_keyring text,
+  p_effect text, p_generation bigint, p_revision bigint, p_digest bytea,
+  p_epoch integer, p_object text, p_index integer, p_ciphertext bytea
+)
+RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, p65_lab
+AS $$
+DECLARE
+  h p65_lab.keyring_head%ROWTYPE;
+  e p65_lab.active_effect%ROWTYPE;
+  previous p65_lab.ciphertext_chunks%ROWTYPE;
+BEGIN
+  IF p_object IS NULL OR p_object !~ '^[A-Za-z0-9_-]{1,128}$'
+    OR p_index IS NULL OR p_index NOT BETWEEN 0 AND 4095
+    OR p_ciphertext IS NULL OR octet_length(p_ciphertext) NOT BETWEEN 1 AND 1048576 THEN
+    RETURN jsonb_build_object('status', 'INVALID_CHUNK');
+  END IF;
+  -- The head row is the authoritative ordering point for all scope writers
+  -- and revocation preparation in this experimental shared SQL backend.
+  SELECT * INTO h FROM p65_lab.keyring_head
+  WHERE account_id = p_account AND compartment_id = p_compartment AND keyring_id = p_keyring
+  FOR UPDATE;
+  IF NOT FOUND THEN RETURN jsonb_build_object('status', 'GATE_BINDING_MISMATCH'); END IF;
+  SELECT * INTO e FROM p65_lab.active_effect
+  WHERE account_id = p_account AND compartment_id = p_compartment AND keyring_id = p_keyring
+    AND effect_id = p_effect FOR UPDATE;
+  IF NOT FOUND OR e.generation IS DISTINCT FROM p_generation
+     OR e.expected_revision IS DISTINCT FROM p_revision
+     OR e.expected_digest IS DISTINCT FROM p_digest
+     OR e.expected_epoch IS DISTINCT FROM p_epoch THEN
+    RETURN jsonb_build_object('status', 'GATE_BINDING_MISMATCH');
+  END IF;
+  IF h.gate_state <> 'OPEN' THEN RETURN jsonb_build_object('status', 'GATE_CLOSED'); END IF;
+  IF h.generation IS DISTINCT FROM p_generation OR h.revision IS DISTINCT FROM p_revision
+     OR h.manifest_digest IS DISTINCT FROM p_digest OR h.active_epoch IS DISTINCT FROM p_epoch THEN
+    RETURN jsonb_build_object('status', 'STALE_HEAD_OR_GENERATION');
+  END IF;
+  IF e.state <> 'ACTIVE' THEN RETURN jsonb_build_object('status', 'EFFECT_STOPPED'); END IF;
+  SELECT * INTO previous FROM p65_lab.ciphertext_chunks
+  WHERE account_id = p_account AND compartment_id = p_compartment AND keyring_id = p_keyring
+    AND object_id = p_object AND chunk_index = p_index FOR UPDATE;
+  IF FOUND THEN
+    IF previous.effect_id = p_effect AND previous.generation = p_generation
+       AND previous.ciphertext = p_ciphertext THEN
+      RETURN jsonb_build_object('status', 'CHUNK_REPLAY_UNCHANGED');
+    END IF;
+    RETURN jsonb_build_object('status', 'CHUNK_CONFLICT');
+  END IF;
+  INSERT INTO p65_lab.ciphertext_chunks
+    (account_id, compartment_id, keyring_id, object_id, chunk_index,
+     ciphertext, effect_id, generation, committed_at)
+  VALUES (p_account, p_compartment, p_keyring, p_object, p_index,
+    p_ciphertext, p_effect, p_generation, p65_lab.lab_now());
+  RETURN jsonb_build_object('status', 'CHUNK_STORED');
+EXCEPTION WHEN unique_violation THEN
+  RETURN jsonb_build_object('status', 'CHUNK_CONFLICT');
+END
+$$;
+
 CREATE FUNCTION p65_lab.begin_quiesce(
   p_account text, p_compartment text, p_keyring text,
   p_operation text, p_reservation text, p_revision bigint, p_digest bytea, p_generation bigint
@@ -817,6 +902,7 @@ GRANT EXECUTE ON FUNCTION p65_lab.read_head(text, text, text) TO p65_cas, p65_ga
 GRANT EXECUTE ON FUNCTION p65_lab.issue_permit(text, text, text, text, text, bigint, bytea, integer, bigint, text) TO p65_gate;
 GRANT EXECUTE ON FUNCTION p65_lab.consume_permit(text, text, text, text, text, text, bigint, bytea, integer, bigint, text) TO p65_gate;
 GRANT EXECUTE ON FUNCTION p65_lab.allow_simulated_io(text, text, text, text, text, text, bigint) TO p65_gate;
+GRANT EXECUTE ON FUNCTION p65_lab.write_ciphertext_chunk(text, text, text, text, bigint, bigint, bytea, integer, text, integer, bytea) TO p65_gate;
 GRANT EXECUTE ON FUNCTION p65_lab.begin_quiesce(text, text, text, text, text, bigint, bytea, bigint) TO p65_gate;
 GRANT EXECUTE ON FUNCTION p65_lab.acknowledge_stop(text, text, text, text, text, text, text, bigint) TO p65_gate;
 GRANT EXECUTE ON FUNCTION p65_lab.seal_no_commit(p65_lab.request_input) TO p65_status;

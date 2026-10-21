@@ -846,6 +846,127 @@ pgTest('stale response fails closed against the simulated logical witness high-w
     + sqlBytea(request.expectedDigest) + ')', 'p65_test').status, 'WITNESS_HIGH_WATER_REGRESSION');
 });
 
+pgTest('real PostgreSQL ciphertext chunk write is physically fenced and idempotent', { concurrency: false }, () => {
+  const scope = scopeFor('physical-chunk');
+  const head = keyringDigest(scope);
+  const effect = 'effect-physical-chunk';
+  const operation = 'transfer-physical-chunk';
+  const reservation = 'transfer-reservation-physical-chunk';
+  const permit = 'permit-physical-chunk';
+  const object = 'object-physical-chunk';
+  const payload = Buffer.from('synthetic sealed ciphertext, never production plaintext');
+  assert.equal(seedKeyring(scope, head).status, 'SEEDED');
+  assert.equal(jsonRow('SELECT p65_lab.issue_permit(' + scopeSql(scope) + ', '
+    + [operation, reservation].map(sqlText).join(', ') + ', 0, ' + sqlBytea(head)
+    + ', 1, 1, ' + sqlText(permit) + ')', 'p65_gate').status, 'PERMIT_ISSUED');
+  assert.equal(jsonRow('SELECT p65_lab.consume_permit(' + scopeSql(scope) + ', '
+    + [permit, operation, reservation].map(sqlText).join(', ') + ', 0, '
+    + sqlBytea(head) + ', 1, 1, ' + sqlText(effect) + ')', 'p65_gate').status, 'CONSUMED');
+
+  const write = (bytes, overrides = {}) => 'SELECT p65_lab.write_ciphertext_chunk('
+    + scopeSql(overrides.scope || scope) + ', ' + sqlText(overrides.effect || effect)
+    + ', ' + (overrides.generation || 1) + ', 0, ' + sqlBytea(head) + ', 1, '
+    + sqlText(overrides.object || object) + ', ' + (overrides.index ?? 0) + ', '
+    + sqlBytea(bytes) + ')';
+
+  assert.equal(jsonRow(write(payload), 'p65_gate').status, 'CHUNK_STORED');
+  assert.equal(jsonRow(write(payload), 'p65_gate').status, 'CHUNK_REPLAY_UNCHANGED');
+  assert.equal(jsonRow(write(Buffer.from('tampered-other-ciphertext')), 'p65_gate').status,
+    'CHUNK_CONFLICT', 'same object and chunk index must never be overwritten');
+  assert.equal(jsonRow(write(payload, { generation: 2, index: 1 }), 'p65_gate').status,
+    'GATE_BINDING_MISMATCH');
+  assert.equal(jsonRow(write(payload, { effect: 'forged-worker', index: 1 }), 'p65_gate').status,
+    'GATE_BINDING_MISMATCH');
+  assert.equal(jsonRow(write(payload, { scope: { ...scope, keyringId: scope.keyringId + '-alien' }, index: 1 }),
+    'p65_gate').status, 'GATE_BINDING_MISMATCH');
+  assert.equal(jsonRow(write(Buffer.alloc(1048577), { index: 1 }), 'p65_gate').status,
+    'INVALID_CHUNK');
+  assert.throws(() => oneRow('SELECT count(*) FROM p65_lab.ciphertext_chunks', 'p65_gate'),
+    /permission denied/i, 'transport identity cannot bypass gate with raw table DML');
+  assert.equal(oneRow('SELECT encode(ciphertext, \'hex\') FROM p65_lab.ciphertext_chunks WHERE object_id = '
+    + sqlText(object)), payload.toString('hex'), 'the database must persist real ciphertext bytes');
+
+  const revocation = normalRequest('physical-chunk-rotate', scope, { expectedDigest: head });
+  assert.equal(reserve(revocation).status, 'RESERVED');
+  assert.equal(jsonRow(write(Buffer.from('post-pending effect'), { index: 1 }), 'p65_gate').status,
+    'GATE_CLOSED', 'after the actual committed reservation gate closes, physical writes are denied');
+  assert.equal(storedCount('ciphertext_chunks', 'account_id = ' + sqlText(scope.accountId)), '1');
+});
+
+pgTest('two PostgreSQL sessions serialize physical chunk write versus reservation', { concurrency: false }, async (t) => {
+  const scope = scopeFor('physical-serialize');
+  const head = keyringDigest(scope);
+  assert.equal(seedKeyring(scope, head).status, 'SEEDED');
+  const effect = 'effect-physical-serialize';
+  const transfer = 'transfer-physical-serialize';
+  const reservation = 'res-transfer-physical-serialize';
+  const permit = 'permit-physical-serialize';
+  assert.equal(jsonRow('SELECT p65_lab.issue_permit(' + scopeSql(scope) + ', '
+    + sqlText(transfer) + ', ' + sqlText(reservation) + ', 0, ' + sqlBytea(head)
+    + ', 1, 1, ' + sqlText(permit) + ')', 'p65_gate').status, 'PERMIT_ISSUED');
+  assert.equal(jsonRow('SELECT p65_lab.consume_permit(' + scopeSql(scope) + ', '
+    + [permit, transfer, reservation].map(sqlText).join(', ') + ', 0, '
+    + sqlBytea(head) + ', 1, 1, ' + sqlText(effect) + ')', 'p65_gate').status, 'CONSUMED');
+  const revocation = normalRequest('physical-serialize-revoke', scope, { expectedDigest: head });
+  const application = 'p65-physical-revoker';
+  const writer = startSqlSession('BEGIN; SET ROLE p65_gate; SELECT p65_lab.write_ciphertext_chunk('
+    + scopeSql(scope) + ', ' + sqlText(effect) + ', 1, 0, ' + sqlBytea(head)
+    + ', 1, ' + sqlText('physical-serialized-object') + ', 0, '
+    + sqlBytea(Buffer.from('sealed bytes in transaction'))
+    + '); RESET ROLE; \\echo P65_PHYSICAL_WRITE_READY\n');
+  await waitForOutput(writer, 'P65_PHYSICAL_WRITE_READY');
+  const revoker = startSqlSession('SET application_name = ' + sqlText(application)
+    + '; SET ROLE p65_cas; SELECT p65_lab.reserve_operation('
+    + requestExpr(revocation) + '); RESET ROLE; \\q\n');
+  const observed = await waitForLockWait(application);
+  t.diagnostic('Physical write lock held CAS reservation in a second PostgreSQL backend: ' + observed);
+  const writerExit = await finishSqlSession(writer, 'COMMIT;\n\\q\n');
+  const revokerExit = await finishSqlSession(revoker);
+  assert.equal(writerExit.exitCode, 0, writerExit.stderr);
+  assert.equal(revokerExit.exitCode, 0, revokerExit.stderr);
+  assert.match(revokerExit.stdout, /"status": "RESERVED"/);
+  assert.equal(storedCount('ciphertext_chunks', 'account_id = ' + sqlText(scope.accountId)), '1');
+  assert.equal(jsonRow('SELECT p65_lab.write_ciphertext_chunk(' + scopeSql(scope) + ', '
+    + sqlText(effect) + ', 1, 0, ' + sqlBytea(head) + ', 1, '
+    + sqlText('physical-serialized-object') + ', 1, '
+    + sqlBytea(Buffer.from('new sealed bytes after revocation')) + ')', 'p65_gate').status,
+    'GATE_CLOSED');
+});
+
+pgTest('a disconnected chunk writer cannot publish ciphertext without committing its gate transaction', { concurrency: false }, async () => {
+  const scope = scopeFor('physical-abort');
+  const head = keyringDigest(scope);
+  const effect = 'effect-physical-abort';
+  const permit = 'permit-physical-abort';
+  const op = 'transfer-physical-abort';
+  const res = 'res-transfer-physical-abort';
+  assert.equal(seedKeyring(scope, head).status, 'SEEDED');
+  assert.equal(jsonRow('SELECT p65_lab.issue_permit(' + scopeSql(scope) + ', '
+    + sqlText(op) + ', ' + sqlText(res) + ', 0, ' + sqlBytea(head)
+    + ', 1, 1, ' + sqlText(permit) + ')', 'p65_gate').status, 'PERMIT_ISSUED');
+  assert.equal(jsonRow('SELECT p65_lab.consume_permit(' + scopeSql(scope) + ', '
+    + [permit, op, res].map(sqlText).join(', ') + ', 0, '
+    + sqlBytea(head) + ', 1, 1, ' + sqlText(effect) + ')', 'p65_gate').status, 'CONSUMED');
+  const appName = 'p65-physical-abort-' + crypto.randomBytes(3).toString('hex');
+  const writer = startSqlSession('SET application_name = ' + sqlText(appName)
+    + '; BEGIN; SET ROLE p65_gate; SELECT p65_lab.write_ciphertext_chunk('
+    + scopeSql(scope) + ', ' + sqlText(effect) + ', 1, 0, ' + sqlBytea(head)
+    + ', 1, ' + sqlText('chunk-aborted-before-commit') + ', 0, '
+    + sqlBytea(Buffer.from('synthetic ciphertext in uncommitted transaction'))
+    + '); RESET ROLE; \\echo P65_PHYSICAL_UNCOMMITTED\nSELECT pg_sleep(60); COMMIT; \\q\n');
+  await waitForOutput(writer, 'P65_PHYSICAL_UNCOMMITTED');
+  assert.equal(oneRow('SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = '
+    + sqlText(appName) + ' AND datname = ' + sqlText(DATABASE)
+    + ' AND pid <> pg_backend_pid()'), 't');
+  const aborted = await finishSqlSession(writer);
+  assert.notEqual(aborted.exitCode, 0, 'forced disconnected transaction must roll back');
+  assert.equal(storedCount('ciphertext_chunks', 'account_id = ' + sqlText(scope.accountId)), '0');
+  const mutation = normalRequest('physical-abort-revoke', scope, { expectedDigest: head });
+  assert.equal(reserve(mutation).status, 'RESERVED',
+    'revocation may close the gate only after a disconnected writer is rolled back');
+  assert.equal(storedCount('ciphertext_chunks', 'account_id = ' + sqlText(scope.accountId)), '0');
+});
+
 pgTest('container restart preserves committed transition and final fence rows', { concurrency: false }, () => {
   const scope = scopeFor('restart-persistence');
   const committedRequest = normalRequest('restart-committed', scope);
