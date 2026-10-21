@@ -93,8 +93,8 @@ function normalizeAuthorization(value) {
     || !Number.isSafeInteger(result.issued_at) || result.issued_at < 0
     || !Number.isSafeInteger(result.expires_at) || result.expires_at <= result.issued_at
     || result.expires_at - result.issued_at > 60
-    || (result.operation === "get" && (result.ciphertext_digest !== null
-      || result.expected_object_revision !== null))
+    || (result.operation === "get"
+      && (result.ciphertext_digest === null) !== (result.expected_object_revision === null))
     || (result.operation === "put" && result.ciphertext_digest === null)) fail();
   return result;
 }
@@ -278,6 +278,8 @@ class Zk1ProtectedObjectStore {
       ON zk_content_nonce(scope, expires_at)`);
     this.getHead = this.db.prepare("SELECT revision,digest FROM zk_content_head WHERE scope=?");
     this.getObject = this.db.prepare("SELECT revision,epoch,ciphertext FROM zk_content_object WHERE scope=? AND id=?");
+    this.getVersion = this.db.prepare("SELECT revision,epoch,ciphertext,ciphertext_digest "
+      + "FROM zk_content_version WHERE scope=? AND id=? AND revision=?");
     this.nonceCount = this.db.prepare("SELECT COUNT(*) AS n FROM zk_content_nonce WHERE scope=?");
     this.objectCount = this.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object WHERE scope=?");
     this.clockRow = this.db.prepare("SELECT last_at FROM zk_content_clock WHERE scope=?");
@@ -418,8 +420,15 @@ class Zk1ProtectedObjectStore {
       let result;
       if (operation === "get") {
         if (!row) fail("ZK_CONTENT_NOT_FOUND");
-        result = { id: request.object_id, revision: row.revision,
-          epoch: row.epoch, ciphertext: Buffer.from(row.ciphertext) };
+        const archived = request.expected_object_revision === null ? null
+          : this.getVersion.get(key, request.object_id, request.expected_object_revision);
+        if (request.expected_object_revision !== null && !archived) fail("ZK_CONTENT_NOT_FOUND");
+        const selected = archived || row;
+        if (archived && (!equal(archived.ciphertext_digest, request.ciphertext_digest)
+          || !equal(crypto.createHash("sha256").update(archived.ciphertext).digest(),
+            archived.ciphertext_digest))) fail("ZK_CONTENT_CONFLICT");
+        result = { id: request.object_id, revision: selected.revision,
+          epoch: selected.epoch, ciphertext: Buffer.from(selected.ciphertext) };
       } else {
         if (row && row.revision !== request.expected_object_revision) fail("ZK_CONTENT_CONFLICT");
         if (!row && request.expected_object_revision !== null) fail("ZK_CONTENT_CONFLICT");

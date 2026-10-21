@@ -120,9 +120,10 @@
   }
   async function signProtectedContentOperation(input) {
     try {
+      const historicalDigestSupplied = Object.hasOwn(input || {}, "expectedCiphertextDigest");
       exact(input, ["signerKey", "scope", "deviceId", "operation", "objectId",
         "expectedObjectRevision", "manifestRevision", "manifestDigest", "epoch",
-        "nowSeconds", "ciphertext"]);
+        "nowSeconds", "ciphertext", ...(historicalDigestSupplied ? ["expectedCiphertextDigest"] : [])]);
       if (!webCrypto?.subtle || !webCrypto?.getRandomValues
         || input.signerKey?.type !== "private"
         || input.signerKey?.extractable !== false
@@ -150,6 +151,8 @@
         keyring_id: from64(input.scope.keyring_id, 16),
       };
       const manifestDigest = copy(input.manifestDigest, 32);
+      const historicDigest = historicalDigestSupplied
+        ? copy(input.expectedCiphertextDigest, 32) : null;
       const nonce = webCrypto.getRandomValues(new Uint8Array(32));
       if (typeof deviceId !== "string" || deviceId.length < 1
         || deviceId.length > 64 || /[\u0000-\u001f\u007f]/.test(deviceId)) deny();
@@ -158,10 +161,13 @@
       if (op === "put") {
         sealed = copy(input.ciphertext, 16, MAX_CIPHERTEXT);
         ciphertextDigest = new Uint8Array(await webCrypto.subtle.digest("SHA-256", sealed));
-      } else if (input.ciphertext !== null || expectedRevision !== null) deny();
+      } else if (input.ciphertext !== null
+        || (expectedRevision === null) !== (historicDigest === null)) deny();
+      if (op === "get") ciphertextDigest = historicDigest;
+      else if (historicalDigestSupplied) deny();
       const request = {
         ...trustedScope, device_id: deviceId, operation: op, object_id: objectId,
-        expected_object_revision: op === "put" ? expectedRevision : null,
+        expected_object_revision: expectedRevision,
         manifest_revision: revision,
         manifest_digest: manifestDigest, epoch,
         nonce, issued_at: now, expires_at: now + 45,
@@ -247,6 +253,8 @@
     try {
       const commitment = copy(expectedRoot, 32);
       const revision = positive(expectedObjectRevision);
+      const boundRevision = genuineSigned.get(request)?.request?.authorization?.expected_object_revision;
+      if (boundRevision !== null && boundRevision !== revision) deny();
       const response = await post(request, "get", origin, fetchImpl);
       exact(response, ["id", "revision", "epoch", "ciphertextBase64"]);
       if (response.id !== genuineSigned.get(request).objectId
@@ -254,6 +262,15 @@
         || response.epoch !== metadata?.epoch
         || metadata.object_id !== response.id) deny();
       const ciphertext = from64(response.ciphertextBase64, 16, MAX_CIPHERTEXT);
+      if (boundRevision !== null) {
+        const signedDigest = from64(genuineSigned.get(request).request.authorization.ciphertext_digest, 32);
+        const actualDigest = new Uint8Array(await webCrypto.subtle.digest("SHA-256", ciphertext));
+        let difference = 0;
+        for (let index = 0; index < 32; ++index) {
+          difference |= signedDigest[index] ^ actualDigest[index];
+        }
+        if (difference !== 0) deny();
+      }
       // Do not use a root supplied by the HTTP response. Caller must pass a
       // previously independently authenticated ciphertext commitment.
       const checked = await download.inspectCiphertextDownload({

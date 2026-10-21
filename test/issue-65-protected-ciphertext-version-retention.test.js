@@ -85,6 +85,30 @@ test("protected local PUT archives ciphertext revisions atomically and never rep
       crypto.createHash("sha256").update(row.ciphertext).digest());
     assert.equal(row.provenance, "transactional");
   }
+  const historicalGet = async (revision, expectedDigest) => {
+    const authorization = { ...scope, device_id: device.device_id, operation: "get",
+      object_id: objectId, expected_object_revision: revision,
+      manifest_revision: manifest.revision, manifest_digest: digest,
+      epoch: manifest.current_epoch, nonce: rand(32), issued_at: 1199,
+      expires_at: 1230, ciphertext_digest: expectedDigest };
+    return { scope, authorization, signature: crypto.sign(null,
+      await contentAuthorizationMessageV1(authorization), privateKey) };
+  };
+  assert.deepEqual((await store.get(await historicalGet(1,
+    crypto.createHash("sha256").update(firstBytes).digest()))).ciphertext,
+  firstBytes, "signed historical GET must return first committed ciphertext, not the current projection");
+  await assert.rejects(store.get(await historicalGet(1,
+    crypto.createHash("sha256").update(secondBytes).digest())),
+  /ZK_CONTENT_DENIED|ZK_CONTENT_CONFLICT/,
+  "signed digest for wrong historic revision may never access archived ciphertext");
+  await assert.rejects(store.get(await historicalGet(3,
+    crypto.createHash("sha256").update(firstBytes).digest())),
+  /ZK_CONTENT_DENIED|ZK_CONTENT_NOT_FOUND/,
+  "unknown revision is not silently substituted with the latest");
+  await assert.rejects(historicalGet(null,
+    crypto.createHash("sha256").update(firstBytes).digest()),
+  /ZK_CONTENT_DENIED/,
+  "digest with no historical revision is not an ambiguous latest read");
   const failed = await signed(rand(100), 1);
   await assert.rejects(store.put(failed), /ZK_CONTENT_CONFLICT/);
   assert.equal(revisions().length, 2, "failed overwrite cannot create phantom immutable revisions");
@@ -107,6 +131,9 @@ test("protected local PUT archives ciphertext revisions atomically and never rep
   store = make(false);
   assert.deepEqual(revisions().map((row) => row.ciphertext), [firstBytes, secondBytes],
     "restart must preserve all opaque revisions byte-for-byte");
+  assert.deepEqual((await store.get(await historicalGet(1,
+    crypto.createHash("sha256").update(firstBytes).digest()))).ciphertext, firstBytes,
+  "historical GET after restart still enforces independent signed revision and digest");
   await assert.rejects(store.put(second), /ZK_CONTENT_REPLAY/);
   assert.equal(revisions().length, 2);
   const third = await signed(rand(320), 2);

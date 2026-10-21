@@ -256,6 +256,136 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
     expectedRoot: wrongRoot, cek, metadata,
   }), /ZK_BROWSER_CONTENT_UNAVAILABLE/, "wrong independently supplied root denies before decrypt");
 
+  const secondMetadata = { ...metadata, version_id: randomId(),
+    parent_version_id: metadata.version_id };
+  const secondCek = await file.generateFileCek();
+  const secondPlaintext = crypto.randomBytes(340);
+  const secondCiphertext = await file.encryptFile({
+    cek: secondCek, metadata: secondMetadata, name: "updated-hidden-file.txt",
+    mediaType: "text/plain", data: secondPlaintext,
+  });
+  assert.equal((await browser.postProtectedCiphertextPut({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, operation: "put", objectId: metadata.object_id,
+      expectedObjectRevision: 1, ciphertext: secondCiphertext,
+    }), fetchImpl: sessionFetch,
+  })).revision, 2);
+  const historicalGet = await browser.signProtectedContentOperation({
+    ...parameters, operation: "get", objectId: metadata.object_id,
+    expectedObjectRevision: 1, expectedCiphertextDigest:
+      crypto.createHash("sha256").update(encrypted).digest(), ciphertext: null,
+  });
+  const historicalServerFormat = Object.fromEntries(Object.entries(historicalGet.authorization)
+    .map(([name, value]) => [name,
+      ["account_id", "compartment_id", "keyring_id", "manifest_digest", "nonce",
+        "ciphertext_digest"].includes(name) && value !== null
+        ? Buffer.from(value, "base64url") : value]));
+  assert.equal(crypto.verify(null, await contentAuthorizationMessageV1(historicalServerFormat),
+    crypto.createPublicKey(privateKey),
+    Buffer.from(historicalGet.signatureBase64, "base64url")), true,
+  "new signed historical GET must use the existing canonical CBOR domain with revision and digest");
+  const oldOpened = await browser.postProtectedCiphertextRead({
+    origin, request: historicalGet, fetchImpl: async (url, options) => {
+      const response = await sessionFetch(url, options);
+      assert.equal(response.status, 200, "historical signed HTTP GET must pass backend admission");
+      const actual = await response.clone().json();
+      assert.equal(actual.id, metadata.object_id);
+      assert.equal(actual.revision, 1);
+      assert.equal(actual.epoch, metadata.epoch);
+      assert.equal(crypto.createHash("sha256").update(Buffer.from(actual.ciphertextBase64, "base64url"))
+        .digest("base64url"), historicalGet.authorization.ciphertext_digest,
+      "historical HTTP ciphertext SHA must match the signed expected digest");
+      const assertBuilder = chunks.createCiphertextRootBuilder(1);
+      await assertBuilder.append(Buffer.from(actual.ciphertextBase64, "base64url"));
+      assert.deepEqual(Buffer.from(await assertBuilder.finish()), Buffer.from(expectedRoot),
+        "historical HTTP ciphertext root must equal independently held root");
+      return response;
+    },
+    expectedObjectRevision: 1, expectedRoot, cek, metadata,
+  });
+  assert.deepEqual(Buffer.from(oldOpened.data), plaintext,
+    "immutable version 1 remains available after signed overwrite with version 2");
+  oldOpened.data.fill(0);
+  const simultaneous = await Promise.all(Array.from({ length: 6 }, async () => {
+    const signed = await browser.signProtectedContentOperation({
+      ...parameters, operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: 1, expectedCiphertextDigest:
+        crypto.createHash("sha256").update(encrypted).digest(), ciphertext: null,
+    });
+    return browser.postProtectedCiphertextRead({
+      origin, request: signed, fetchImpl: sessionFetch,
+      expectedObjectRevision: 1, expectedRoot, cek, metadata,
+    });
+  }));
+  for (const openedCopy of simultaneous) {
+    assert.deepEqual(Buffer.from(openedCopy.data), plaintext,
+      "parallel authenticated HTTP readers cannot substitute the current ciphertext");
+    openedCopy.data.fill(0);
+  }
+  const secondBuilder = chunks.createCiphertextRootBuilder(1);
+  await secondBuilder.append(secondCiphertext);
+  const secondRoot = await secondBuilder.finish();
+  const newer = await browser.postProtectedCiphertextRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: 2, expectedCiphertextDigest:
+        crypto.createHash("sha256").update(secondCiphertext).digest(), ciphertext: null,
+    }), fetchImpl: sessionFetch, expectedObjectRevision: 2,
+    expectedRoot: secondRoot, cek: secondCek, metadata: secondMetadata,
+  });
+  assert.deepEqual(Buffer.from(newer.data), secondPlaintext);
+  newer.data.fill(0);
+  await assert.rejects(browser.postProtectedCiphertextRead({
+    origin, request: historicalGet, fetchImpl: sessionFetch,
+    expectedObjectRevision: 1, expectedRoot, cek, metadata,
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/, "signed historical GET nonce cannot replay");
+  const wrongHistoricalDigest = await browser.signProtectedContentOperation({
+    ...parameters, operation: "get", objectId: metadata.object_id,
+    expectedObjectRevision: 1, expectedCiphertextDigest:
+      crypto.createHash("sha256").update(secondCiphertext).digest(),
+    ciphertext: null,
+  });
+  const deniedHistoricResponse = await sessionFetch(origin + "/zk-1/v1/content/read", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(wrongHistoricalDigest),
+  });
+  assert.equal(deniedHistoricResponse.status, 409,
+    "signed mismatched ciphertext digest must be rejected by SQLite before network egress");
+  const historicWrongRevision = await browser.signProtectedContentOperation({
+    ...parameters, operation: "get", objectId: metadata.object_id,
+    expectedObjectRevision: 3, expectedCiphertextDigest:
+      crypto.createHash("sha256").update(encrypted).digest(), ciphertext: null,
+  });
+  await assert.rejects(browser.postProtectedCiphertextRead({
+    origin, request: historicWrongRevision, fetchImpl: sessionFetch,
+    expectedObjectRevision: 3, expectedRoot, cek, metadata,
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+  "no history fallback may serve the latest revision when signed revision is missing");
+  const mutableHistoricalDigest = crypto.createHash("sha256").update(encrypted).digest();
+  const signedPending = browser.signProtectedContentOperation({
+    ...parameters, operation: "get", objectId: metadata.object_id,
+    expectedObjectRevision: 1, expectedCiphertextDigest: mutableHistoricalDigest,
+    ciphertext: null,
+  });
+  mutableHistoricalDigest.fill(0);
+  const immutableSignedGet = await signedPending;
+  assert.equal(immutableSignedGet.authorization.ciphertext_digest,
+    crypto.createHash("sha256").update(encrypted).digest("base64url"),
+  "historiographically signed digest is a snapshot, not mutable caller memory");
+  await assert.rejects(browser.postProtectedCiphertextRead({
+    origin, request: immutableSignedGet, fetchImpl: sessionFetch,
+    expectedObjectRevision: 2, expectedRoot, cek, metadata,
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+  "the read API must reject a different revision before sending signed HTTP operation");
+  assert.equal((await browser.postProtectedCiphertextRead({
+    origin, request: immutableSignedGet, fetchImpl: sessionFetch,
+    expectedObjectRevision: 1, expectedRoot, cek, metadata,
+  })).name, "hidden-file.txt");
+  await assert.rejects(browser.signProtectedContentOperation({
+    ...parameters, operation: "get", objectId: metadata.object_id,
+    expectedObjectRevision: 1, ciphertext: null,
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/, "historical GET requires a matching signed digest");
+
   const forgedKey = crypto.generateKeyPairSync("ed25519");
   const forged = await crypto.webcrypto.subtle.importKey("pkcs8",
     forgedKey.privateKey.export({ format: "der", type: "pkcs8" }),
@@ -267,8 +397,56 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
     }), fetchImpl: sessionFetch, expectedObjectRevision: 1,
     expectedRoot, cek, metadata,
   }), /ZK_BROWSER_CONTENT_UNAVAILABLE/, "valid Ed25519 on untrusted device key denies");
+  gateOpen = false;
+  await assert.rejects(browser.postProtectedCiphertextRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: 1, expectedCiphertextDigest:
+        crypto.createHash("sha256").update(encrypted).digest(), ciphertext: null,
+    }), fetchImpl: sessionFetch, expectedObjectRevision: 1,
+    expectedRoot, cek, metadata,
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+  "a pending witness forbids historical ciphertext GET even with valid signer and digest");
+  gateOpen = true;
   await fixtures.appendDeviceRevocation(state, device.device_id);
   signedHead = state.headManifest;
+  const otherDevice = signedHead.devices.find((item) =>
+    item.device_id !== device.device_id && item.revoked_at_epoch === null);
+  assert.ok(otherDevice, "new signed manifest retains a separately trusted active device");
+  const otherPrivate = state.actors.get(Buffer.from(otherDevice.authorization_key_id).toString("hex"));
+  const otherWebKey = await crypto.webcrypto.subtle.importKey("pkcs8",
+    otherPrivate.export({ format: "der", type: "pkcs8" }),
+    "Ed25519", false, ["sign"]);
+  const currentEpochParameters = {
+    ...parameters, signerKey: otherWebKey, deviceId: otherDevice.device_id,
+    manifestRevision: signedHead.revision,
+    manifestDigest: await manifestDigest(), epoch: signedHead.current_epoch,
+  };
+  const olderEpochRead = await browser.postProtectedCiphertextRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...currentEpochParameters, operation: "get",
+      objectId: metadata.object_id, expectedObjectRevision: 1,
+      expectedCiphertextDigest: crypto.createHash("sha256").update(encrypted).digest(),
+      ciphertext: null,
+    }), fetchImpl: sessionFetch, expectedObjectRevision: 1,
+    expectedRoot, cek, metadata,
+  });
+  assert.deepEqual(Buffer.from(olderEpochRead.data), plaintext,
+    "newly active current-epoch signer can access retained old-epoch ciphertext with its separately held old CEK");
+  olderEpochRead.data.fill(0);
+  assert.notEqual(signedHead.current_epoch, metadata.epoch,
+    "test must prove real keyring epoch transition, not a same-epoch fixture");
+  await assert.rejects(browser.postProtectedCiphertextRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, manifestRevision: signedHead.revision,
+      manifestDigest: await manifestDigest(), epoch: signedHead.current_epoch,
+      operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: 1, expectedCiphertextDigest:
+        crypto.createHash("sha256").update(encrypted).digest(), ciphertext: null,
+    }), fetchImpl: sessionFetch, expectedObjectRevision: 1,
+    expectedRoot, cek, metadata,
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+  "signed revoked device cannot open archived old ciphertext under current live head");
   await assert.rejects(browser.postProtectedCiphertextRead({
     origin, request: await browser.signProtectedContentOperation({
       ...parameters, manifestRevision: signedHead.revision,
