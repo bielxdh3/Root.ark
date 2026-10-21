@@ -63,6 +63,29 @@ async function main() {
   const sql = fs.readFileSync(path.join(root, "db", "zk1-gate-authority.sql"), "utf8");
   run("docker", ["exec", "-i", containerId, "psql", "-X", "-v", "ON_ERROR_STOP=1",
     "-U", "postgres", "-d", "gatefixture"], { input: sql });
+  // Simulate legacy per-column writer ACLs left by the previous isolated
+  // physical-writer milestone, then reapply the schema to prove migration
+  // cleanup. Table-level REVOKE does NOT implicitly remove column grants.
+  const staleWriterGrants =
+    "GRANT INSERT(scope_key,object_id,chunk_index,ciphertext) ON "
+      + "zk1_gate.ciphertext_chunk TO zk1_chunk_writer_runtime;\n"
+      + "GRANT SELECT(chunk_index) ON zk1_gate.ciphertext_chunk TO zk1_chunk_writer_runtime;\n";
+  run("docker", ["exec", "-i", containerId, "psql", "-X", "-v", "ON_ERROR_STOP=1",
+    "-U", "postgres", "-d", "gatefixture"], { input: staleWriterGrants });
+  const directWriterAcl = () => run("docker", ["exec", containerId, "psql",
+    "-X", "-tA", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "gatefixture",
+    "-c", "SELECT pg_catalog.has_column_privilege(" +
+      "'zk1_chunk_writer_runtime','zk1_gate.ciphertext_chunk','scope_key','INSERT')" +
+      ",pg_catalog.has_column_privilege(" +
+      "'zk1_chunk_writer_runtime','zk1_gate.ciphertext_chunk','chunk_index','SELECT')"]);
+  if (directWriterAcl() !== "t|t") {
+    throw new Error("disposable legacy writer column grants were not reproduced");
+  }
+  run("docker", ["exec", "-i", containerId, "psql", "-X", "-v", "ON_ERROR_STOP=1",
+    "-U", "postgres", "-d", "gatefixture"], { input: sql });
+  if (directWriterAcl() !== "f|f") {
+    throw new Error("in-place operator DDL did not revoke legacy raw writer privileges");
+  }
   const roleName = "zkgatefixture_" + crypto.randomBytes(6).toString("hex");
   const rolePassword = crypto.randomBytes(24).toString("hex");
   // Test-only dedicated login is issued to the exact independently seeded
