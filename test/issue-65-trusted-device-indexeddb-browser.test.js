@@ -16,6 +16,10 @@ const SCRIPTS = new Map([
     path.join(ROOT, "public/client/rootark-dev-vault-crypto.js")],
   ["/client/rootark-dev-vault-trusted-device.js",
     path.join(ROOT, "public/client/rootark-dev-vault-trusted-device.js")],
+  ["/client/rootark-zk1-owner-signed-checkpoint.js",
+    path.join(ROOT, "public/client/rootark-zk1-owner-signed-checkpoint.js")],
+  ["/client/rootark-zk1-owner-checkpoint-indexeddb.js",
+    path.join(ROOT, "public/client/rootark-zk1-owner-checkpoint-indexeddb.js")],
 ]);
 const BROWSER_PROBE = [
   '(async () => {',
@@ -59,6 +63,144 @@ const BROWSER_PROBE = [
   ' return "BROWSER_TRUSTED_DEVICE_INDEXEDDB_PASS";',
   '})()',
 ].join("\n");
+const OWNER_CHECKPOINT_PROBE = `(async () => {
+  const cryptoClient = RootarkZk1OwnerSignedCheckpoint;
+  const idb = RootarkZk1OwnerCheckpointIndexedDb;
+  if (!cryptoClient || !idb) throw Error("CHECKPOINT_SCRIPT_MISSING");
+  const enc = bytes => btoa(String.fromCharCode(...bytes))
+    .replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/g,"");
+  const scope = {
+    account_id: enc(crypto.getRandomValues(new Uint8Array(16))),
+    compartment_id: enc(new TextEncoder().encode("fixture-independent-owner")),
+    keyring_id: enc(crypto.getRandomValues(new Uint8Array(16))),
+  };
+  const keys = await crypto.subtle.generateKey({ name:"Ed25519" }, false, ["sign","verify"]);
+  if (keys.privateKey.extractable) throw Error("EXTRACTABLE_OWNER_PRIVATE_KEY");
+  const keyId = crypto.getRandomValues(new Uint8Array(16));
+  const common = {scope, signerKey:keys.privateKey, signerPublicKey:keys.publicKey,
+    signerKeyId:keyId, deviceId:"edge-owner", issuedAt:1001};
+  const persistent = {scope, deviceId:common.deviceId,
+    signerKeyId:keyId, signerPublicKey:keys.publicKey};
+  const name = "rootark-zk1-owner-checkpoints-v1";
+  let store = await idb.openOwnerCheckpointStore({databaseName:name});
+  const firstWire = await cryptoClient.signOwnerCheckpoint({
+    ...common, revision:1,
+    manifestDigest:crypto.getRandomValues(new Uint8Array(32)), previous:null,
+  });
+  const first = await store.bootstrapOwnerCheckpoint({ ...persistent, checkpoint:firstWire });
+  if (!first.storedLocally || first.authorizesProtectedIo) throw Error("WRONG_LOCAL_BOOTSTRAP");
+  store.close();
+  store = await idb.openOwnerCheckpointStore({databaseName:name});
+  const afterRestart = await store.loadOwnerCheckpoint({
+    ...persistent, expectedExternalDigest:first.checkpointDigest,
+  });
+  if (afterRestart.checkpointDigest !== first.checkpointDigest
+    || afterRestart.verifiedCheckpoint.sequence !== 1) throw Error("RESTART_LOST_CHECKPOINT");
+  // Typed-array view variants have the same bytes but different JS object
+  // shapes; owner key IDs must be snapshotted as bytes, not array elements.
+  const keyIdView = new DataView(keyId.buffer.slice(
+    keyId.byteOffset, keyId.byteOffset + keyId.byteLength));
+  const loadedThroughView = await store.loadOwnerCheckpoint({
+    ...persistent, signerKeyId:keyIdView, expectedExternalDigest:first.checkpointDigest,
+  });
+  if (loadedThroughView?.checkpointDigest !== first.checkpointDigest)
+    throw Error("IDB_DATAVIEW_KEY_ID_REJECTED");
+  const secondWire = await cryptoClient.signOwnerCheckpoint({
+    ...common, revision:2, issuedAt:1002,
+    manifestDigest:crypto.getRandomValues(new Uint8Array(32)),
+    previous:afterRestart.verifiedCheckpoint,
+  });
+  await store.appendOwnerCheckpoint({ ...persistent, checkpoint:secondWire,
+    expectedHeadDigest:afterRestart.checkpointDigest });
+  const second = await store.loadOwnerCheckpoint({...persistent});
+  const candidateA = await cryptoClient.signOwnerCheckpoint({
+    ...common, revision:3, issuedAt:1003,
+    manifestDigest:crypto.getRandomValues(new Uint8Array(32)),
+    previous:second.verifiedCheckpoint,
+  });
+  const candidateB = await cryptoClient.signOwnerCheckpoint({
+    ...common, revision:3, issuedAt:1003,
+    manifestDigest:crypto.getRandomValues(new Uint8Array(32)),
+    previous:second.verifiedCheckpoint,
+  });
+  const outcomes = await Promise.allSettled([
+    store.appendOwnerCheckpoint({...persistent,
+      checkpoint:candidateA, expectedHeadDigest:second.checkpointDigest}),
+    store.appendOwnerCheckpoint({...persistent,
+      checkpoint:candidateB, expectedHeadDigest:second.checkpointDigest}),
+  ]);
+  if (outcomes.filter(x=>x.status==="fulfilled").length !== 1
+    || outcomes.filter(x=>x.status==="rejected").length !== 1)
+    throw Error("CHECKPOINT_CONCURRENT_CAS_NOT_SERIALIZED");
+  const committed = await store.loadOwnerCheckpoint({...persistent});
+  if (committed.verifiedCheckpoint.sequence !== 3) throw Error("CHECKPOINT_LOST_CONCURRENT_COMMIT");
+  const tamperDb = await new Promise((resolve,reject)=>{
+    const request=indexedDB.open(name,1);
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(request.error);
+  });
+  const key = JSON.stringify([scope.account_id,scope.compartment_id,
+    scope.keyring_id,common.deviceId,enc(keyId)]);
+  const rawRecord = await new Promise((resolve,reject)=>{
+    const tx=tamperDb.transaction("owner_checkpoints","readonly");
+    const request=tx.objectStore("owner_checkpoints").get(key);
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(request.error);
+  });
+  if (!rawRecord || rawRecord.records.length !== 3)
+    throw Error("TEST_OWNER_CHECKPOINT_LEDGER_NOT_CREATED");
+  const putTamper = value => new Promise((resolve,reject)=>{
+    const tx=tamperDb.transaction("owner_checkpoints","readwrite");
+    tx.objectStore("owner_checkpoints").put(value,key);
+    tx.oncomplete=resolve;
+    tx.onerror=()=>reject(tx.error);
+    tx.onabort=()=>reject(tx.error);
+  });
+  const corrupted=structuredClone(rawRecord);
+  corrupted.records[0].signature=enc(crypto.getRandomValues(new Uint8Array(64)));
+  await putTamper(corrupted);
+  let corruptDenied=false;
+  try { await store.loadOwnerCheckpoint({
+    ...persistent,expectedExternalDigest:committed.checkpointDigest,
+  }); } catch(e) {
+    corruptDenied=e.message==="ZK_OWNER_CHECKPOINT_STORAGE_UNVERIFIED";
+  }
+  if (!corruptDenied) throw Error("CHECKPOINT_INVALID_SIGNATURE_WAS_ACCEPTED");
+  await putTamper({schema:rawRecord.schema,records:[rawRecord.records[0]],
+    headDigest:first.checkpointDigest});
+  let rollbackDenied=false;
+  try { await store.loadOwnerCheckpoint({
+    ...persistent,expectedExternalDigest:committed.checkpointDigest,
+  }); } catch(e) {
+    rollbackDenied=e.message==="ZK_OWNER_CHECKPOINT_STORAGE_UNVERIFIED";
+  }
+  if (!rollbackDenied) throw Error("CHECKPOINT_COHERENT_ROLLBACK_WAS_ACCEPTED");
+  await putTamper(rawRecord);
+  tamperDb.close();
+  const recovered=await store.loadOwnerCheckpoint({
+    ...persistent,expectedExternalDigest:committed.checkpointDigest,
+  });
+  if (recovered.verifiedCheckpoint.sequence !== 3)
+    throw Error("CHECKPOINT_RESTORED_ORIGINAL_NOT_VERIFIABLE");
+  store.close();
+  // Malicious/silent deletion of the ENTIRE test-owned IndexedDB cannot be
+  // mistaken for a fresh owner identity when the caller retains its floor.
+  await new Promise((resolve,reject)=>{
+    const req=indexedDB.deleteDatabase(name);
+    req.onsuccess=resolve; req.onerror=()=>reject(req.error);
+    req.onblocked=()=>reject(Error("CHECKPOINT_DB_DELETE_BLOCKED"));
+  });
+  store = await idb.openOwnerCheckpointStore({databaseName:name});
+  let refused = false;
+  try { await store.loadOwnerCheckpoint({
+    ...persistent, expectedExternalDigest:committed.checkpointDigest,
+  }); } catch (error) {
+    refused = error.message === "ZK_OWNER_CHECKPOINT_STORAGE_UNVERIFIED";
+  }
+  store.close();
+  if (!refused) throw Error("MISSING_LOCAL_HIGH_WATER_ACCEPTED");
+  return "BROWSER_OWNER_CHECKPOINT_INDEXEDDB_PASS";
+})()`;
 
 async function waitFor(condition, timeoutMs = 15000) {
   const until = Date.now() + timeoutMs;
@@ -113,7 +255,7 @@ test("real Edge IndexedDB restores nonextractable trusted-device keys for indepe
     res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'; object-src 'none'");
     if (req.url === "/") {
       res.setHeader("Content-Type", "text/html; charset=utf-8");
-      res.end('<!doctype html><meta charset="utf-8"><script defer src="/client/rootark-dev-vault-crypto.js"></script><script defer src="/client/rootark-dev-vault-trusted-device.js"></script>');
+      res.end('<!doctype html><meta charset="utf-8"><script defer src="/client/rootark-dev-vault-crypto.js"></script><script defer src="/client/rootark-dev-vault-trusted-device.js"></script><script defer src="/client/rootark-zk1-owner-signed-checkpoint.js"></script><script defer src="/client/rootark-zk1-owner-checkpoint-indexeddb.js"></script>');
     } else if (SCRIPTS.has(req.url)) {
       res.setHeader("Content-Type", "application/javascript");
       fs.createReadStream(SCRIPTS.get(req.url)).pipe(res);
@@ -155,6 +297,12 @@ test("real Edge IndexedDB restores nonextractable trusted-device keys for indepe
     assert.equal(response.exceptionDetails, undefined,
       response.exceptionDetails?.text || "Device recovery crashed in browser");
     assert.equal(response.result?.value, "BROWSER_TRUSTED_DEVICE_INDEXEDDB_PASS");
+    const checkpoint = await client.send("Runtime.evaluate", {
+      expression: OWNER_CHECKPOINT_PROBE, awaitPromise: true, returnByValue: true,
+    });
+    assert.equal(checkpoint.exceptionDetails, undefined,
+      checkpoint.exceptionDetails?.text || "Owner checkpoint IndexedDB crashed in browser");
+    assert.equal(checkpoint.result?.value, "BROWSER_OWNER_CHECKPOINT_INDEXEDDB_PASS");
   } finally {
     client?.socket.close();
     // Only the unique test-owned browser process/tree is terminated.
