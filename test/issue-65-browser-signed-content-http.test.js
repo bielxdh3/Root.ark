@@ -14,6 +14,7 @@ const fixtures = require("./support/issue-65-recovery-v2-fixtures");
 const file = require("../public/client/rootark-zk1-file-content");
 const chunks = require("../public/client/rootark-zk1-ciphertext-chunk-root");
 const browser = require("../public/client/rootark-zk1-protected-http-client");
+const reconciliation = require("../public/client/rootark-zk1-uncertain-put-reconciliation");
 const { Zk1ProtectedObjectStore, contentAuthorizationMessageV1 } =
   require("../src/services/zk1ProtectedObjectStore");
 const { registerZk1ProtectedObjectRoutes } =
@@ -32,8 +33,14 @@ test("browser UMD executes without Node require and refuses a cross-origin signe
   const script = fs.readFileSync(path.join(__dirname,
     "../public/client/rootark-zk1-protected-http-client.js"), "utf8");
   vm.runInContext(script, context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-ciphertext-chunk-root.js"), "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-uncertain-put-reconciliation.js"), "utf8"), context);
   assert.equal(typeof context.RootarkZk1ProtectedHttpClient.signProtectedContentOperation,
     "function", "plain browser build must export a live WebCrypto API without CommonJS");
+  assert.equal(typeof context.RootarkZk1UncertainPutReconciliation.reconcileUncertainProtectedPut,
+    "function", "uncertain PUT verifier must load in a plain browser without require");
   const pkcs8 = crypto.generateKeyPairSync("ed25519").privateKey
     .export({ format: "der", type: "pkcs8" });
   context.signer = await crypto.webcrypto.subtle.importKey("pkcs8", pkcs8,
@@ -106,7 +113,8 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
     },
     async finishIoAdmission() { return { status: "completed" }; },
   };
-  const store = new Zk1ProtectedObjectStore(path.join(dir, "content.sqlite"), {
+  const storeFilename = path.join(dir, "content.sqlite");
+  const storeConfig = {
     trustedScope: scope, witnessPinned: {
       keyId: witnessKeyId, publicKey: witnessKeys.publicKey,
     }, minimumHead: { revision: 1,
@@ -114,13 +122,19 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
     manifestProvider: () => z.encodeDeterministic(signedHead),
     witnessProvider, bootstrapNew: true, admissionRequired: true,
     nowSeconds: () => 1400,
-  });
+  };
+  let store = new Zk1ProtectedObjectStore(storeFilename, storeConfig);
+  const liveStore = {
+    put: (...args) => store.put(...args),
+    get: (...args) => store.get(...args),
+    runWithAdmission: (...args) => store.runWithAdmission(...args),
+  };
   const app = express();
   const authenticate = (req, res, next) => {
     if (req.get("x-fixture-session") !== "owner") return res.sendStatus(401);
     req.user = { username: "owner" }; next();
   };
-  registerZk1ProtectedObjectRoutes({ app, store, authenticate,
+  registerZk1ProtectedObjectRoutes({ app, store: liveStore, authenticate,
     requirePermission: () => (_req, _res, next) => next(),
     resolveTrustedScope: () => scope });
   const server = await new Promise((resolve) => {
@@ -132,7 +146,11 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
     fs.rmSync(dir, { recursive: true, force: true });
   });
   const origin = `http://127.0.0.1:${server.address().port}`;
+  let allPutRequests = 0;
   const sessionFetch = (url, options) => {
+    if (url.endsWith("/zk-1/v1/content/put") && options?.method === "POST") {
+      allPutRequests++;
+    }
     emittedBody = String(options.body);
     return fetch(url, { ...options, headers: {
       ...options.headers, "x-fixture-session": "owner",
@@ -335,6 +353,147 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
   });
   assert.deepEqual(Buffer.from(newer.data), secondPlaintext);
   newer.data.fill(0);
+  const thirdMetadata = { ...metadata, version_id: randomId(),
+    parent_version_id: secondMetadata.version_id };
+  const thirdCek = await file.generateFileCek();
+  const thirdPlaintext = crypto.randomBytes(570);
+  const thirdCiphertext = await file.encryptFile({
+    cek: thirdCek, metadata: thirdMetadata, name: "uncertain-file.txt",
+    mediaType: "application/octet-stream", data: thirdPlaintext,
+  });
+  const thirdRootBuilder = chunks.createCiphertextRootBuilder(1);
+  await thirdRootBuilder.append(thirdCiphertext);
+  const thirdRoot = await thirdRootBuilder.finish();
+  const thirdPlaintextSha = crypto.createHash("sha256").update(thirdPlaintext).digest();
+  const uncertainPut = await browser.signProtectedContentOperation({
+    ...parameters, operation: "put", objectId: metadata.object_id,
+    expectedObjectRevision: 2, ciphertext: thirdCiphertext,
+  });
+  let sentPut = 0;
+  await assert.rejects(browser.postProtectedCiphertextPut({
+    origin, request: uncertainPut, fetchImpl: async (url, options) => {
+      const response = await sessionFetch(url, options);
+      sentPut++;
+      assert.equal(response.status, 200);
+      throw new Error("connection lost after server committed, before client read ACK");
+    },
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/);
+  assert.equal(sentPut, 1);
+  assert.equal(store.db.prepare("SELECT revision FROM zk_content_object WHERE id=?")
+    .get(metadata.object_id).revision, 3);
+  const putCountBeforeReconciliation = allPutRequests;
+  const snapshot = Buffer.from(thirdCiphertext);
+  const inputs = {
+    origin, fetchImpl: sessionFetch, signer: { ...parameters },
+    objectId: metadata.object_id, previousRevision: 2,
+    ciphertext: Buffer.from(thirdCiphertext), expectedRoot: Buffer.from(thirdRoot),
+    expectedPlaintextSha256: Buffer.from(thirdPlaintextSha),
+    cek: thirdCek, metadata: { ...thirdMetadata },
+  };
+  for (const [field, size] of [
+    ["ciphertext", 4 * 1024 * 1024 + 1],
+    ["expectedRoot", 33],
+    ["expectedPlaintextSha256", 33],
+  ]) {
+    const oversized = new Uint8Array(size);
+    const buffer = oversized.buffer;
+    const originalSlice = buffer.slice.bind(buffer);
+    let cloneCalls = 0;
+    buffer.slice = (...arguments_) => {
+      cloneCalls++;
+      return originalSlice(...arguments_);
+    };
+    await assert.rejects(reconciliation.reconcileUncertainProtectedPut({
+      ...inputs, [field]: oversized,
+    }), /ZK_UNCERTAIN_PUT_NOT_RECONCILED/);
+    assert.equal(cloneCalls, 0,
+      field + " must be rejected by byteLength BEFORE cloning or allocating an oversized buffer");
+  }
+  const oversizedArrayBuffer = new ArrayBuffer(33);
+  const savedSlice = oversizedArrayBuffer.slice.bind(oversizedArrayBuffer);
+  let arrayBufferCloneCalls = 0;
+  oversizedArrayBuffer.slice = (...args) => {
+    arrayBufferCloneCalls++;
+    return savedSlice(...args);
+  };
+  await assert.rejects(reconciliation.reconcileUncertainProtectedPut({
+    ...inputs, expectedRoot: oversizedArrayBuffer,
+  }), /ZK_UNCERTAIN_PUT_NOT_RECONCILED/);
+  assert.equal(arrayBufferCloneCalls, 0,
+    "raw ArrayBuffer inputs must also reject before allocation");
+  const uncertain = await reconciliation.reconcileUncertainProtectedPut(inputs);
+  assert.equal(uncertain.objectId, metadata.object_id);
+  assert.equal(uncertain.revision, 3);
+  assert.equal(uncertain.clientReadbackVerified, true);
+  assert.equal(uncertain.authorizesCutover, false);
+  assert.equal(uncertain.independentDurableCommitProven, false);
+  assert.equal(sentPut, 1, "reconciliation must never resend uncertain PUT");
+  assert.equal(allPutRequests, putCountBeforeReconciliation,
+    "all actual authenticated PUT HTTP calls are counted, not just the lost-ACK wrapper");
+  assert.deepEqual(Buffer.from(thirdCiphertext), snapshot, "helper never destroys caller ciphertext");
+  const mutableInputs = {
+    ...inputs, signer: { ...inputs.signer, scope: { ...scopeWire },
+      manifestDigest: Buffer.from(parameters.manifestDigest) },
+    metadata: { ...thirdMetadata }, ciphertext: Buffer.from(thirdCiphertext),
+    expectedRoot: Buffer.from(thirdRoot),
+    expectedPlaintextSha256: Buffer.from(thirdPlaintextSha),
+  };
+  const whileSigning = reconciliation.reconcileUncertainProtectedPut(mutableInputs);
+  mutableInputs.objectId = randomId();
+  mutableInputs.metadata.object_id = randomId();
+  mutableInputs.metadata.version_id = randomId();
+  mutableInputs.signer.scope.keyring_id = randomId();
+  mutableInputs.signer.manifestDigest.fill(0);
+  mutableInputs.ciphertext.fill(0);
+  mutableInputs.expectedRoot.fill(0);
+  mutableInputs.expectedPlaintextSha256.fill(0);
+  assert.equal((await whileSigning).clientReadbackVerified, true,
+    "all signed identity, content, root and digest inputs must be snapshotted before first await");
+  assert.equal(sentPut, 1, "a successful reconciliation never writes another PUT");
+  assert.equal(allPutRequests, putCountBeforeReconciliation,
+    "parallel or delayed reconciliation GET must not issue any HTTP PUT");
+  // Reopen the durable backend while retaining the SAME Express route and
+  // authenticated network boundary. A lost ACK cannot be treated as failure
+  // to persist, and an old PUT nonce cannot become valid after restart.
+  store.close();
+  store = new Zk1ProtectedObjectStore(storeFilename, {
+    ...storeConfig, bootstrapNew: false,
+  });
+  assert.equal(store.db.prepare("SELECT revision FROM zk_content_object WHERE id=?")
+    .get(metadata.object_id).revision, 3);
+  assert.equal((await reconciliation.reconcileUncertainProtectedPut(inputs))
+    .clientReadbackVerified, true,
+  "reconciliation must survive physical SQLite close/open with no synthetic rewrite");
+  await assert.rejects(browser.postProtectedCiphertextPut({
+    origin, request: uncertainPut, fetchImpl: sessionFetch,
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+  "lost-ACK PUT nonce remains tombstoned after physical SQLite restart");
+  assert.equal(allPutRequests, putCountBeforeReconciliation + 1,
+    "only the explicit adversarial replay attempt increments PUT calls");
+  await assert.rejects(reconciliation.reconcileUncertainProtectedPut({
+    ...inputs, previousRevision: 3,
+  }), /ZK_UNCERTAIN_PUT_NOT_RECONCILED/,
+  "unsigned future version is not fabricated after lost ACK");
+  await assert.rejects(reconciliation.reconcileUncertainProtectedPut({
+    ...inputs, expectedPlaintextSha256: crypto.randomBytes(32),
+  }), /ZK_UNCERTAIN_PUT_NOT_RECONCILED/,
+  "a ciphertext correct under AEAD with incorrect user plaintext digest still denies");
+  let tamperedFetchCalls = 0;
+  await assert.rejects(reconciliation.reconcileUncertainProtectedPut({
+    ...inputs, expectedRoot: crypto.randomBytes(32),
+    fetchImpl: async () => { tamperedFetchCalls++; throw Error("unexpected network"); },
+  }), /ZK_UNCERTAIN_PUT_NOT_RECONCILED/);
+  assert.equal(tamperedFetchCalls, 0, "local root mismatch must reject before GET");
+  await assert.rejects(reconciliation.reconcileUncertainProtectedPut({
+    ...inputs, fetchImpl: async (url, options) => {
+      const response = await sessionFetch(url, options);
+      const forged = await response.json();
+      forged.ciphertextBase64 = base64(crypto.randomBytes(190));
+      return new Response(JSON.stringify(forged), { status: 200,
+        headers: { "content-type": "application/json" } });
+    },
+  }), /ZK_UNCERTAIN_PUT_NOT_RECONCILED/,
+  "a compromised protected HTTP readback cannot turn a lost ACK into false verification");
   await assert.rejects(browser.postProtectedCiphertextRead({
     origin, request: historicalGet, fetchImpl: sessionFetch,
     expectedObjectRevision: 1, expectedRoot, cek, metadata,
@@ -410,6 +569,11 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
   gateOpen = true;
   await fixtures.appendDeviceRevocation(state, device.device_id);
   signedHead = state.headManifest;
+  await assert.rejects(reconciliation.reconcileUncertainProtectedPut({
+    ...inputs, signer: { ...parameters, manifestRevision: signedHead.revision,
+      manifestDigest: await manifestDigest(), epoch: signedHead.current_epoch },
+  }), /ZK_UNCERTAIN_PUT_NOT_RECONCILED/,
+  "revoked signer cannot reconcile old ciphertext merely because bytes remain in SQLite");
   const otherDevice = signedHead.devices.find((item) =>
     item.device_id !== device.device_id && item.revoked_at_epoch === null);
   assert.ok(otherDevice, "new signed manifest retains a separately trusted active device");
