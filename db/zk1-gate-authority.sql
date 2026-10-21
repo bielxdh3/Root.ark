@@ -46,4 +46,26 @@ CREATE TABLE IF NOT EXISTS zk1_gate.ciphertext_chunk (
   PRIMARY KEY(scope_key,object_id,chunk_index)
 );
 REVOKE ALL ON ALL TABLES IN SCHEMA zk1_gate FROM PUBLIC;
+-- Operator-only setup. The application account must NEVER hold membership
+-- in this role. A separately administered login can be granted membership
+-- only to the independently operated gate service (not to Root.ark web).
+-- This role still trusts the gate service for phase/generation transitions;
+-- it is not cryptographic isolation against a compromised gate operator.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='zk1_gate_runtime') THEN
+    CREATE ROLE zk1_gate_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+  END IF;
+END $$;
+GRANT USAGE ON SCHEMA zk1_gate TO zk1_gate_runtime;
+GRANT SELECT ON zk1_gate.head, zk1_gate.admission,
+  zk1_gate.ciphertext_chunk TO zk1_gate_runtime;
+GRANT UPDATE (phase, generation, operation_id, reservation_id)
+  ON zk1_gate.head TO zk1_gate_runtime;
+GRANT INSERT (id, scope_key, worker_id, principal, action, object_id,
+  revision, digest, generation, state)
+  ON zk1_gate.admission TO zk1_gate_runtime;
+GRANT UPDATE (state) ON zk1_gate.admission TO zk1_gate_runtime;
+GRANT INSERT (scope_key, object_id, chunk_index, ciphertext)
+  ON zk1_gate.ciphertext_chunk TO zk1_gate_runtime;
 COMMIT;

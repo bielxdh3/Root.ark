@@ -90,6 +90,11 @@ function createZk1SharedPgGateHttpsClient({ endpoint, ca, clientKey, clientCert,
       };
       const request = https.request({ hostname: url.hostname, port: url.port,
         path, method: "POST", ca, key: clientKey, cert: clientCert,
+        // A shared https.globalAgent can reuse a TLS socket authenticated
+        // under ANOTHER client's pin, skipping checkServerIdentity entirely.
+        // One socket per request makes verification of this exact pin
+        // unconditional (including after successful calls by other clients).
+        agent: false,
         rejectUnauthorized: true, minVersion: "TLSv1.3", servername: url.hostname,
         checkServerIdentity(host, cert) {
           const nameError = tls.checkServerIdentity(host, cert);

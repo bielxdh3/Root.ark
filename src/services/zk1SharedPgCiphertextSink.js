@@ -19,9 +19,11 @@ class Zk1SharedPgCiphertextSink {
     this.gate = gateClient;
   }
 
-  async put({ scope, objectId, revision, digest, chunks } = {}) {
+  async put({ scope, objectId, revision, digest, chunks, expectedChunkCount } = {}) {
     if (!chunks || !(typeof chunks[Symbol.iterator] === "function"
       || typeof chunks[Symbol.asyncIterator] === "function")
+      || !Number.isSafeInteger(expectedChunkCount)
+      || expectedChunkCount < 1 || expectedChunkCount > 4096
       || typeof objectId !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(objectId)
       || Buffer.from(objectId, "base64url").toString("base64url") !== objectId
       || !Number.isSafeInteger(revision) || revision < 1
@@ -48,23 +50,32 @@ class Zk1SharedPgCiphertextSink {
       let count = 0;
       for await (const data of chunks) {
         if ((!Buffer.isBuffer(data) && !(data instanceof Uint8Array))
-          || data.length < 1 || data.length > 4 * 1024 * 1024 || count >= 4096) fail();
+          || data.length < 1 || data.length > 4 * 1024 * 1024
+          || count >= expectedChunkCount) fail();
         const bytes = Buffer.from(data);
         try {
           // Physical PostgreSQL INSERT + head/generation check are one
           // transaction. A lost response may hide a committed chunk; retry
           // the exact bytes/index under the SAME admission, never a new one.
-          try { await this.gate.putCiphertextChunk(authorized, count, bytes); }
-          catch (_) { await this.gate.putCiphertextChunk(authorized, count, bytes); }
+          let result;
+          try { result = await this.gate.putCiphertextChunk(authorized, count, bytes); }
+          catch (_) { result = await this.gate.putCiphertextChunk(authorized, count, bytes); }
+          if (!result || typeof result.stored !== "boolean"
+            || Reflect.ownKeys(result).length !== 1) fail();
         } catch (_) { fail(); }
         count += 1;
       }
-      if (count === 0) fail();
+      // The gateway must provide expectedChunkCount from independently
+      // authenticated object metadata; partial streams are never successes.
+      if (count !== expectedChunkCount) fail();
       return { chunkCount: count };
     } finally {
       try {
-        try { await this.gate.finishIoAdmission(stop); }
-        catch (_) { await this.gate.finishIoAdmission(stop); }
+        let receipt;
+        try { receipt = await this.gate.finishIoAdmission(stop); }
+        catch (_) { receipt = await this.gate.finishIoAdmission(stop); }
+        if (!receipt || receipt.status !== "FINISHED"
+          || Reflect.ownKeys(receipt).length !== 1) fail();
       } catch (_) {
         // Never call an uncertain FINISH a success: the durable gate remains
         // closed until the trusted worker is independently reconciled.

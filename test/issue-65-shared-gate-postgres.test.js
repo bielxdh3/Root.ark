@@ -30,6 +30,27 @@ function context(scope, digest, action, id, principal = "gateway-a") {
     workerId: crypto.randomBytes(16), principal };
 }
 
+test("trusted sink rejects incomplete streams and fabricated gate acknowledgements", async () => {
+  const scope = randomScope();
+  const objectId = crypto.randomBytes(16).toString("base64url");
+  const digest = crypto.randomBytes(32);
+  const values = { scope, objectId, revision: 1, digest,
+    expectedChunkCount: 2, chunks: [crypto.randomBytes(32)] };
+  let completed = 0;
+  const make = (putResult, finishResult) => new Zk1SharedPgCiphertextSink({ gateClient: {
+    beginIoAdmission: async () => ({ admissionId: crypto.randomBytes(16), generation: 1, proceed: true }),
+    putCiphertextChunk: async () => putResult,
+    finishIoAdmission: async () => { completed++; return finishResult; },
+  } });
+  await assert.rejects(make({ stored: true }, { status: "FINISHED" }).put(values),
+    /ZK_GATE_SINK_UNAVAILABLE/, "a caller cannot claim success for a truncated ciphertext stream");
+  await assert.rejects(make(undefined, { status: "FINISHED" }).put({ ...values, expectedChunkCount: 1 }),
+    /ZK_GATE_SINK_UNAVAILABLE/, "a forged/miswired data-plane client cannot acknowledge a missing SQL write");
+  await assert.rejects(make({ stored: true }, undefined).put({ ...values, expectedChunkCount: 1 }),
+    /ZK_GATE_SINK_UNAVAILABLE/, "a missing durable completion confirmation cannot return success");
+  assert.equal(completed, 3, "all failure cases must attempt a trusted worker FINISH");
+});
+
 test("isolated GateAuthority PostgreSQL runtime role is non-login and denies raw destructive SQL", {
   skip: !url && "requires isolated ROOTARK_ZK1_TEST_PG_URL",
 }, async (t) => {
@@ -44,12 +65,43 @@ test("isolated GateAuthority PostgreSQL runtime role is non-login and denies raw
     has_schema_privilege('zk1_gate_runtime','zk1_gate','CREATE') AS schema_create,
     has_table_privilege('zk1_gate_runtime','zk1_gate.head','SELECT') AS head_select,
     has_table_privilege('zk1_gate_runtime','zk1_gate.head','UPDATE') AS head_update,
+    has_column_privilege('zk1_gate_runtime','zk1_gate.head','phase','UPDATE') AS phase_update,
+    has_column_privilege('zk1_gate_runtime','zk1_gate.head','revision','UPDATE') AS revision_update,
     has_table_privilege('zk1_gate_runtime','zk1_gate.ciphertext_chunk','INSERT') AS chunk_insert,
+    has_column_privilege('zk1_gate_runtime','zk1_gate.ciphertext_chunk','ciphertext','INSERT') AS ciphertext_insert,
     has_table_privilege('zk1_gate_runtime','zk1_gate.ciphertext_chunk','DELETE') AS chunk_delete,
     has_table_privilege('zk1_gate_runtime','zk1_gate.ciphertext_chunk','TRUNCATE') AS chunk_truncate`);
   assert.deepEqual(perms.rows[0], { schema_use: true, schema_create: false,
-    head_select: true, head_update: true, chunk_insert: true,
+    head_select: true, head_update: false, phase_update: true, revision_update: false,
+    chunk_insert: false, ciphertext_insert: true,
     chunk_delete: false, chunk_truncate: false });
+  const scope = randomScope();
+  const digest = crypto.randomBytes(32);
+  await pool.query("INSERT INTO zk1_gate.head(scope_key,keyring_id,revision,digest) VALUES($1,$2,1,$3)",
+    [key(scope), scope.keyring_id, digest]);
+  const c = await pool.connect();
+  try {
+    await c.query("BEGIN");
+    await c.query("SET LOCAL ROLE zk1_gate_runtime");
+    const locked = await c.query("SELECT revision FROM zk1_gate.head WHERE scope_key=$1 FOR UPDATE", [key(scope)]);
+    assert.equal(Number(locked.rows[0].revision), 1,
+      "legitimate gate role must still be able to acquire physical PostgreSQL head lock");
+    const values = [crypto.randomBytes(16), key(scope), crypto.randomBytes(16),
+      "trusted-gate", "put", crypto.randomBytes(16).toString("base64url"), 1, digest, 1];
+    await c.query(`INSERT INTO zk1_gate.admission
+      (id,scope_key,worker_id,principal,action,object_id,revision,digest,generation,state)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'ACTIVE')`, values);
+    await c.query("SAVEPOINT disallow");
+    await assert.rejects(c.query("UPDATE zk1_gate.head SET revision=999 WHERE scope_key=$1",
+      [key(scope)]), /permission denied/i);
+    await c.query("ROLLBACK TO SAVEPOINT disallow");
+    await assert.rejects(c.query("DELETE FROM zk1_gate.ciphertext_chunk WHERE scope_key=$1",
+      [key(scope)]), /permission denied/i);
+    await c.query("ROLLBACK TO SAVEPOINT disallow");
+  } finally {
+    await c.query("ROLLBACK");
+    c.release();
+  }
 });
 
 test("shared PostgreSQL authority protects ciphertext chunk effect and closes all worker generations", {
@@ -391,6 +443,8 @@ test("pinned mTLS gate client holds exact physical write admission across remote
   await assert.rejects(otherPin.beginIoAdmission(input), /ZK_GATE_TRANSPORT_UNAVAILABLE/);
   const admitted = await client.beginIoAdmission(input);
   assert.equal(admitted.proceed, true);
+  await assert.rejects(otherPin.beginIoAdmission(input), /ZK_GATE_TRANSPORT_UNAVAILABLE/,
+    "a pooled socket from the valid pinned client must not bypass another client's different pin");
   assert.deepEqual(await client.beginIoAdmission(input), admitted);
   const write = { ...input, admissionId: admitted.admissionId,
     generation: admitted.generation };
@@ -451,7 +505,7 @@ test("ciphertext sink retries a lost START/PUT ACK identically and never writes 
     yield second;
   }
   await assert.rejects(sink.put({ scope, objectId, revision: 1,
-    digest, chunks: payloads() }), /ZK_GATE_/,
+    digest, chunks: payloads(), expectedChunkCount: 2 }), /ZK_GATE_/,
   "the second chunk cannot cross physical PostgreSQL write boundary after QUIESCING");
   const counts = await pool.query("SELECT chunk_index,ciphertext FROM zk1_gate.ciphertext_chunk WHERE scope_key=$1 ORDER BY chunk_index",
     [key(scope)]);
