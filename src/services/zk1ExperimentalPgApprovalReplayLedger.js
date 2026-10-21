@@ -5,6 +5,10 @@
 // owner/device/witness transcript and gate before invoking this lab component.
 // PostgreSQL role + pool are pre-provisioned out-of-band for disposable tests.
 const crypto = require("node:crypto");
+// A matching prototype is not proof of a real SQL-backed ledger. Keep the
+// instance and its original pool binding inside this module's private custody.
+const mintedLedgers = new WeakSet();
+const mintedPools = new WeakMap();
 
 function deny() {
   const e = new Error("ZK_APPROVAL_REPLAY_LAB_DENIED");
@@ -104,17 +108,19 @@ async function verifyDisposableReplayWriterPool(pool) {
 class Zk1ExperimentalPgApprovalReplayLedger {
   constructor({ pool } = {}) {
     if (!pool || typeof pool.connect !== "function") deny();
-    this.pool = pool;
+    mintedLedgers.add(this);
+    mintedPools.set(this, pool);
   }
 
   async consumeCandidate(input) {
+    if (!mintedLedgers.has(this)) deny();
     // Snapshot all caller-owned bytes before the first network await.
     const record = normalize(input);
     let client;
     let inTransaction = false;
     let failed = true;
     try {
-      client = await this.pool.connect();
+      client = await mintedPools.get(this).connect();
       // Cannot run inside an inherited transaction. DISCARD ALL succeeds only
       // in idle sessions and rejects a client still in someone else's BEGIN.
       // Do not silently COMMIT or ROLLBACK another borrower's pending work.
@@ -153,5 +159,17 @@ class Zk1ExperimentalPgApprovalReplayLedger {
   }
 }
 
+// Never trust an injected instance's method property, even when instanceof
+// succeeds. The only acceptable implementation is this module's native
+// consumeCandidate with its privately captured PostgreSQL pool.
+const authenticConsumeCandidate = Zk1ExperimentalPgApprovalReplayLedger.prototype.consumeCandidate;
+function consumeAuthenticExperimentalReplayCandidate(ledger, input) {
+  if (!mintedLedgers.has(ledger)
+    || Object.getPrototypeOf(ledger) !== Zk1ExperimentalPgApprovalReplayLedger.prototype
+    || Object.hasOwn(ledger, "consumeCandidate")
+    || Zk1ExperimentalPgApprovalReplayLedger.prototype.consumeCandidate !== authenticConsumeCandidate) deny();
+  return authenticConsumeCandidate.call(ledger, input);
+}
+
 module.exports = { Zk1ExperimentalPgApprovalReplayLedger,
-  verifyDisposableReplayWriterPool };
+  verifyDisposableReplayWriterPool, consumeAuthenticExperimentalReplayCandidate };

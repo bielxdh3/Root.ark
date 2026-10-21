@@ -6,8 +6,10 @@ const crypto = require("node:crypto");
 const z = require("../crypto/rootark-zk-1");
 const { inspectZk1CiphertextApprovalHeadPreflightV1 } =
   require("../crypto/rootark-zk-ciphertext-approval-head-preflight-v1");
-const { Zk1ExperimentalPgApprovalReplayLedger } =
+const { Zk1ExperimentalPgApprovalReplayLedger,
+  consumeAuthenticExperimentalReplayCandidate } =
   require("./zk1ExperimentalPgApprovalReplayLedger");
+const { createZk1WitnessHttpsClient } = require("./zk1WitnessHttpsClient");
 
 const FIELDS = ["rawApproval", "verifiedPublicHistory", "rawWitnessHead",
   "witnessPinned", "witnessNonce", "minimumHead", "pinnedDevice",
@@ -90,7 +92,7 @@ async function inspectAndRecordExperimentalApproval({ ledger, preflight } = {}) 
     if (!Number.isSafeInteger(signed.expires_at)
       || !Number.isSafeInteger(witness.witness_sequence)
       || witness.witness_sequence < 1) deny();
-    const persisted = await ledger.consumeCandidate({
+    const persisted = await consumeAuthenticExperimentalReplayCandidate(ledger, {
       scope: input.expected.scope, nonce: input.expected.nonce,
       rawSignedApproval: input.rawApproval,
       deviceKeyId: input.pinnedDevice.signerKeyId,
@@ -107,4 +109,46 @@ async function inspectAndRecordExperimentalApproval({ ledger, preflight } = {}) 
   } catch (_) { deny(); }
 }
 
-module.exports = { inspectAndRecordExperimentalApproval };
+// An additive, still NON-AUTHORIZING experiment. Unlike the historical
+// caller-supplied receipt above, this makes a new challenge and fetches the
+// signed head from the configured, certificate-pinned mTLS witness endpoint.
+// Nothing here establishes independent operator custody, monotonic client
+// state, atomic authority with protected I/O or post-response non-revocation.
+async function inspectAndRecordExperimentalOnlineApproval({ ledger, preflight, witnessTls } = {}) {
+  try {
+    if (!(ledger instanceof Zk1ExperimentalPgApprovalReplayLedger)) deny();
+    const ONLINE_FIELDS = FIELDS.filter((field) =>
+      field !== "rawWitnessHead" && field !== "witnessNonce");
+    exact(preflight, ONLINE_FIELDS);
+    const checked = snapshot({ ...preflight, rawWitnessHead: Buffer.from([0]),
+      witnessNonce: crypto.randomBytes(32), nowSeconds: Math.floor(Date.now() / 1000) });
+    exact(witnessTls, Object.hasOwn(witnessTls || {}, "timeoutMs")
+      ? ["endpoint", "ca", "clientKey", "clientCert", "serverFingerprint256", "timeoutMs"]
+      : ["endpoint", "ca", "clientKey", "clientCert", "serverFingerprint256"]);
+    // Do not allow mutable caller TLS byte buffers to be retargeted while
+    // waiting for an asynchronous challenge response.
+    const tlsSettings = { ...witnessTls };
+    for (const name of ["ca", "clientKey", "clientCert"]) {
+      if (Buffer.isBuffer(tlsSettings[name]) || tlsSettings[name] instanceof Uint8Array) {
+        if (tlsSettings[name].byteLength === 0 || tlsSettings[name].byteLength > 65536) deny();
+        tlsSettings[name] = Buffer.from(tlsSettings[name]);
+      } else if (typeof tlsSettings[name] !== "string"
+        || tlsSettings[name].length === 0 || tlsSettings[name].length > 65536) deny();
+    }
+    const witness = createZk1WitnessHttpsClient(tlsSettings);
+    const fetched = await witness.freshHead({
+      scope: scope(checked.expected.scope),
+      nonce: Buffer.from(checked.witnessNonce),
+    });
+    // A healthy witness can sign in the next clock second while HTTPS is
+    // in flight. Refresh only the local verifier time, never caller bytes.
+    const receivedAtSeconds = Math.floor(Date.now() / 1000);
+    return await inspectAndRecordExperimentalApproval({ ledger, preflight: {
+      ...checked, nowSeconds: receivedAtSeconds,
+      rawWitnessHead: b(fetched, 1, 8 * 1024 * 1024),
+    } });
+  } catch (_) { deny(); }
+}
+
+module.exports = { inspectAndRecordExperimentalApproval,
+  inspectAndRecordExperimentalOnlineApproval };
