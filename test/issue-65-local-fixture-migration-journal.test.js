@@ -1,0 +1,201 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const {
+  runLocalFixtureCiphertextMigration,
+  verifyLocalFixtureCiphertextMigration,
+  rollbackLocalFixtureCiphertextMigration,
+} = require("../src/services/zk1LocalFixtureMigrationJournal");
+
+const digest = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
+const bytes = Buffer.from("synthetic encrypted ciphertext, never plaintext/user material\x00", "utf8");
+
+function fixture(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-local-fixture-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const sub of ["source", "target", "journal", "references/versions", "references/backups", "references/trash"])
+    fs.mkdirSync(path.join(dir, sub), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".rootark-disposable-fixture"), "rootark-zk-local-fixture-v1\n");
+  fs.writeFileSync(path.join(dir, "source", "object1.ct"), bytes);
+  const references = {};
+  for (const [kind, id] of [["versions", "version1"], ["backups", "backup1"], ["trash", "trash1"]]) {
+    const snapshot = Buffer.from(`${kind}-distinct-encrypted-reference`);
+    fs.writeFileSync(path.join(dir, "references", kind, `${id}.ct`), snapshot);
+    references[kind] = [{ id, digest: digest(snapshot) }];
+  }
+  const plan = {
+    fixtureDir: dir,
+    fixtureMode: "rootark-zk-local-fixture-only/v1",
+    operationId: "operation1",
+    objectId: "object1",
+    sourceDigest: digest(bytes),
+    sourceProvenance: { role: "source", provider: "fixture-source", identity: "source-1" },
+    targetProvenance: { role: "target", provider: "fixture-target", identity: "target-1" },
+    references,
+  };
+  return { dir, plan, source: path.join(dir, "source", "object1.ct"),
+    target: path.join(dir, "target", "object1.ct"), journal: path.join(dir, "journal", "operation1.json") };
+}
+
+test("opt-in disposable migration verifies independent ciphertext copy while preserving original and opaque report", (t) => {
+  const f = fixture(t);
+  const first = runLocalFixtureCiphertextMigration(f.plan);
+  assert.equal(first.state, "committed");
+  assert.equal(first.canMigrate, false);
+  assert.equal(first.localVerified, true);
+  assert.equal(first.rollbackScope, "local-fixture-only");
+  assert.deepEqual(fs.readFileSync(f.source), bytes);
+  assert.deepEqual(fs.readFileSync(f.target), bytes);
+  assert.equal(verifyLocalFixtureCiphertextMigration(f.plan).localVerified, true);
+  assert.equal(runLocalFixtureCiphertextMigration(f.plan).state, "committed");
+  assert.equal(JSON.stringify(first).includes(f.dir), false);
+  assert.equal(rollbackLocalFixtureCiphertextMigration(f.plan).state, "rolled-back");
+  assert.equal(fs.existsSync(f.target), false);
+  assert.deepEqual(fs.readFileSync(f.source), bytes);
+  assert.equal(rollbackLocalFixtureCiphertextMigration(f.plan).state, "rolled-back");
+  assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+});
+
+for (const checkpoint of ["journal-created", "staging-synced", "target-published", "target-verified", "commit-recorded"]) {
+  test(`durable crash replay after ${checkpoint} finishes with identical bytes`, (t) => {
+    const f = fixture(t);
+    assert.throws(() => runLocalFixtureCiphertextMigration({ ...f.plan,
+      onCheckpoint(phase) { if (phase === checkpoint) throw new Error("simulated interrupted process"); },
+    }), /simulated interrupted process/);
+    assert.deepEqual(fs.readFileSync(f.source), bytes);
+    assert.equal(runLocalFixtureCiphertextMigration(f.plan).state, "committed");
+    assert.deepEqual(fs.readFileSync(f.target), bytes);
+    assert.equal(rollbackLocalFixtureCiphertextMigration(f.plan).state, "rolled-back");
+    assert.deepEqual(fs.readFileSync(f.source), bytes);
+  });
+}
+
+for (const checkpoint of ["rollback-intent-recorded", "target-unlinked"]) {
+  test(`rollback resumes crash after ${checkpoint}`, (t) => {
+    const f = fixture(t);
+    runLocalFixtureCiphertextMigration(f.plan);
+    assert.throws(() => rollbackLocalFixtureCiphertextMigration({ ...f.plan,
+      onCheckpoint(phase) { if (phase === checkpoint) throw new Error("simulated interruption"); },
+    }), /simulated interruption/);
+    assert.equal(rollbackLocalFixtureCiphertextMigration(f.plan).state, "rolled-back");
+    assert.deepEqual(fs.readFileSync(f.source), bytes);
+    assert.equal(fs.existsSync(f.target), false);
+  });
+}
+
+test("missing or stale versions/backups/trash and missing source block before journal creation", (t) => {
+  for (const kind of ["versions", "backups", "trash"]) {
+    const f = fixture(t);
+    fs.rmSync(path.join(f.dir, "references", kind, `${f.plan.references[kind][0].id}.ct`));
+    assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+    assert.equal(fs.existsSync(f.target), false);
+    assert.equal(fs.existsSync(f.journal), false);
+    const stale = fixture(t);
+    fs.writeFileSync(path.join(stale.dir, "references", kind,
+      `${stale.plan.references[kind][0].id}.ct`), "stale provider copy");
+    assert.throws(() => runLocalFixtureCiphertextMigration(stale.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+    assert.equal(fs.existsSync(stale.journal), false);
+  }
+  const f = fixture(t);
+  fs.rmSync(f.source);
+  assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+});
+
+test("adulterated destination, source or journal blocks replay and rollback without destroying evidence", (t) => {
+  const f = fixture(t);
+  runLocalFixtureCiphertextMigration(f.plan);
+  fs.writeFileSync(f.target, "malicious ciphertext substitution");
+  assert.throws(() => verifyLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.throws(() => rollbackLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.equal(fs.existsSync(f.target), true);
+  fs.writeFileSync(f.target, bytes);
+  fs.writeFileSync(f.source, "source changed since plan");
+  assert.throws(() => rollbackLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.equal(fs.existsSync(f.target), true);
+  fs.writeFileSync(f.source, bytes);
+  const journal = JSON.parse(fs.readFileSync(f.journal, "utf8"));
+  journal.phase = "rolled-back";
+  fs.writeFileSync(f.journal, JSON.stringify(journal));
+  assert.throws(() => rollbackLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.equal(fs.existsSync(f.target), true);
+});
+
+test("replay with changed scope, provenance or digest fails closed and preserves committed bytes", (t) => {
+  const f = fixture(t);
+  runLocalFixtureCiphertextMigration(f.plan);
+  const changes = [
+    { sourceDigest: "0".repeat(64) },
+    { targetProvenance: { role: "target", provider: "fixture-target", identity: "other" } },
+    { objectId: "object2" },
+    { references: { ...f.plan.references, trash: [{ id: "trash1", digest: "0".repeat(64) }] } },
+  ];
+  for (const change of changes) assert.throws(() => runLocalFixtureCiphertextMigration({ ...f.plan, ...change }),
+    /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.deepEqual(fs.readFileSync(f.target), bytes);
+});
+
+test("rejects traversal, symlinks, hardlinks, reused target and non-disposable paths", (t) => {
+  const f = fixture(t);
+  for (const objectId of ["../object1", "..", "bad/name", "bad\\name", ".stage"])
+    assert.throws(() => runLocalFixtureCiphertextMigration({ ...f.plan, objectId }), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.throws(() => runLocalFixtureCiphertextMigration({ ...f.plan, fixtureDir: os.tmpdir() }),
+    /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  fs.writeFileSync(f.target, bytes);
+  assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  fs.rmSync(f.target);
+  const alias = path.join(f.dir, "source", "other.ct");
+  fs.linkSync(f.source, alias);
+  assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  fs.rmSync(alias);
+  const link = path.join(f.dir, "references", "versions", "version1.ct");
+  fs.rmSync(link);
+  try { fs.symlinkSync(f.source, link, "file"); } catch (error) {
+    if (["EPERM", "EACCES"].includes(error.code)) return;
+    throw error;
+  }
+  assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+});
+
+test("real child-process termination at publish and rollback intent replays durably", (t) => {
+  const f = fixture(t);
+  function stopAt(method, checkpoint) {
+    const script = `const api = require('./src/services/zk1LocalFixtureMigrationJournal');
+      const plan = JSON.parse(process.env.ROOTARK_SYNTHETIC_PLAN);
+      api[${JSON.stringify(method)}]({ ...plan,
+        onCheckpoint(phase) { if (phase === ${JSON.stringify(checkpoint)}) process.exit(71); }
+      });`;
+    return spawnSync(process.execPath, ["-e", script], {
+      cwd: path.resolve(__dirname, ".."),
+      env: { ...process.env, ROOTARK_SYNTHETIC_PLAN: JSON.stringify(f.plan) },
+      windowsHide: true, encoding: "utf8",
+    });
+  }
+  const first = stopAt("runLocalFixtureCiphertextMigration", "target-published");
+  assert.equal(first.status, 71, first.stderr);
+  assert.deepEqual(fs.readFileSync(f.source), bytes);
+  assert.equal(runLocalFixtureCiphertextMigration(f.plan).state, "committed");
+  const second = stopAt("rollbackLocalFixtureCiphertextMigration", "rollback-intent-recorded");
+  assert.equal(second.status, 71, second.stderr);
+  assert.equal(rollbackLocalFixtureCiphertextMigration(f.plan).state, "rolled-back");
+  assert.deepEqual(fs.readFileSync(f.source), bytes);
+});
+
+test("orphan and replacement symlinks and unexpected stage after commit block without deleting data", (t) => {
+  const f = fixture(t);
+  try { fs.symlinkSync(f.source, f.target, "file"); }
+  catch (error) { if (["EPERM", "EACCES"].includes(error.code)) return; throw error; }
+  assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.equal(fs.existsSync(f.journal), false);
+  fs.unlinkSync(f.target);
+  runLocalFixtureCiphertextMigration(f.plan);
+  fs.writeFileSync(path.join(f.dir, "target", ".operation1.stage"), bytes);
+  assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.throws(() => verifyLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.deepEqual(fs.readFileSync(f.source), bytes);
+});
