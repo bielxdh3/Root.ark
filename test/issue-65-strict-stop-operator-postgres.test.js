@@ -20,7 +20,7 @@ const adminUrl = process.env.ROOTARK_ZK1_TEST_PG_URL;
 const gateUrl = process.env.ROOTARK_ZK1_RUNTIME_PG_URL;
 const stopUrl = process.env.ROOTARK_ZK1_STOP_PG_URL;
 
-test("operator identity is pinned; dead child cannot obtain a strict admission", async (t) => {
+test("an unverified STOP recorder cannot be supplied directly by a trusted-looking object", (t) => {
   const host = crypto.generateKeyPairSync("ed25519");
   const foreign = crypto.generateKeyPairSync("ed25519");
   const hostKeyId = crypto.randomBytes(16);
@@ -43,26 +43,9 @@ test("operator identity is pinned; dead child cannot obtain a strict admission",
   assert.throws(() => new Zk1SharedPgStrictStopOperator({ gate,
     supervisor, recorder: untrusted }), /ZK_GATE_DENIED/,
   "the STOP recorder must trust the same independently pinned Ed25519 host");
-  const operator = new Zk1SharedPgStrictStopOperator({ gate, supervisor, recorder });
-  const io = { scope, workerId: crypto.randomBytes(16), principal,
-    action: "put", objectId: crypto.randomBytes(16).toString("base64url"),
-    revision: 1, digest: crypto.randomBytes(32) };
-  assert.throws(() => operator.prepare({ ...io,
-    processPid: 1 }), /ZK_GATE_DENIED/,
-  "even the local operator API refuses caller-supplied process identity");
-  operator.prepare(io);
-  assert.throws(() => operator.prepare(io), /ZK_GATE_DENIED/,
-    "replayed trusted provisioning must not spawn another process");
-  const entry = [...operator.entries.values()][0];
-  const session = supervisor.sessions.get(entry.process.processEpoch.toString("hex"));
-  const closed = new Promise((resolve) => session.child.once("close", resolve));
-  session.child.kill("SIGKILL");
-  await closed;
-  assert.throws(() => supervisor.assertLive({ processEpoch: entry.process.processEpoch }),
-    /ZK_STOP_SUPERVISOR_UNAVAILABLE/);
-  await assert.rejects(operator.beginTrustedLocalAdmission(io),
-    /ZK_STOP_SUPERVISOR_UNAVAILABLE/,
-  "an exited child cannot race into an admission or create a signed STOP proof");
+  assert.throws(() => new Zk1SharedPgStrictStopOperator({ gate,
+    supervisor, recorder }), /ZK_GATE_DENIED/,
+  "a raw recorder may use an unverified superuser or dual-role SQL pool");
 });
 
 function fixture(dir) {
@@ -132,6 +115,15 @@ test("STRICT mTLS route rejects forged process identity and remote IO; only the 
   t.after(() => supervisor.dispose());
   const recorder = await createZk1PhysicalStopRecorder({ pool: stopPool,
     trustedHostKeyId: hostKeyId, trustedHostPublicKey: signer.publicKey });
+  assert.throws(() => { recorder.pool = admin; }, TypeError,
+    "a preflighted recorder cannot swap its STOP SQL pool to a superuser");
+  assert.equal(recorder.pool, stopPool);
+  for (const forbidden of [admin, gatePool]) {
+    await assert.rejects(createZk1PhysicalStopRecorder({ pool: forbidden,
+      trustedHostKeyId: hostKeyId, trustedHostPublicKey: signer.publicKey }),
+    /ZK_STOP_RUNTIME_INVALID/,
+    "STOP identity may never use a superuser or shared gate SQL role");
+  }
   const principal = new crypto.X509Certificate(tls.allowedCert).fingerprint256;
   const server = await createIsolatedZk1SharedPgGateServer({ pool: gatePool,
     key: tls.serverKey, cert: tls.serverCert, clientCa: tls.ca,
@@ -152,6 +144,13 @@ test("STRICT mTLS route rejects forged process identity and remote IO; only the 
   workerId: io.workerId.toString("base64url"), action: io.action,
   objectId: io.objectId, revision: 1, digest: digest.toString("base64url") };
   const operator = server.strictStopOperator;
+  assert.throws(() => new Zk1SharedPgStrictStopOperator({
+    gate: operator.gate, supervisor,
+    recorder: new Zk1SharedPgPhysicalStopRecorder({ pool: admin,
+      trustedHostKeyId: hostKeyId, trustedHostPublicKey: signer.publicKey,
+      nowSeconds: () => Math.floor(Date.now() / 1000) }),
+  }), /ZK_GATE_DENIED/,
+  "a superuser recorder bypassing the verified factory is rejected");
   assert.equal(typeof operator.prepare, "function");
   assert.equal(typeof operator.beginIoAdmission, "undefined",
     "remote-facing admission hook must never exist on the operator");
@@ -195,4 +194,92 @@ test("STRICT mTLS route rejects forged process identity and remote IO; only the 
   const count = await admin.query(`SELECT COUNT(*)::int AS n FROM zk1_gate.ciphertext_chunk
     WHERE scope_key=$1`, [key]);
   assert.equal(count.rows[0].n, 0, "rejected remote writes had no physical effects");
+
+  // The SQL START can durably COMMIT just before its actual host-controlled
+  // child dies. The operator must still attach the returned exact admission
+  // to that observed handle for a signed STOP, while the caller sees no
+  // positive proceed authorization after death.
+  const scope2 = { account_id: crypto.randomBytes(16), compartment_id: crypto.randomBytes(7),
+    keyring_id: crypto.randomBytes(16) };
+  const key2 = scope2.account_id.toString("hex") + ":"
+    + scope2.compartment_id.length.toString(16) + ":" + scope2.compartment_id.toString("hex");
+  const digest2 = crypto.randomBytes(32);
+  await admin.query(`INSERT INTO zk1_gate.head
+    (scope_key,keyring_id,revision,digest,require_stop_proof) VALUES($1,$2,1,$3,TRUE)`,
+  [key2, scope2.keyring_id, digest2]);
+  const io2 = { scope: scope2, workerId: crypto.randomBytes(16), principal,
+    action: "put", objectId: crypto.randomBytes(16).toString("base64url"),
+    revision: 1, digest: digest2 };
+  operator.prepare(io2);
+  const entry2 = [...operator.entries.values()].find((candidate) =>
+    candidate.io.workerId.equals(io2.workerId));
+  const session2 = supervisor.sessions.get(entry2.process.processEpoch.toString("hex"));
+  const beginOriginal = operator.gate.beginIoAdmission.bind(operator.gate);
+  let killedAfterCommit = false;
+  operator.gate.beginIoAdmission = async (value) => {
+    const returned = await beginOriginal(value);
+    if (!killedAfterCommit) {
+      killedAfterCommit = true;
+      const row = await admin.query(`SELECT state FROM zk1_gate.admission WHERE id=$1`,
+        [returned.admissionId]);
+      assert.equal(row.rows[0].state, "ACTIVE", "SQL admission committed before OS death");
+      const closed = new Promise((resolve) => session2.child.once("close", resolve));
+      assert.equal(session2.child.kill("SIGKILL"), true);
+      await closed;
+    }
+    return returned;
+  };
+  await assert.rejects(operator.beginTrustedLocalAdmission(io2),
+    /ZK_STOP_SUPERVISOR_UNAVAILABLE/,
+  "caller must never receive proceed:true after the observed child dies");
+  operator.gate.beginIoAdmission = beginOriginal;
+  assert.equal(session2.exited && session2.closed, true);
+  assert.equal(entry2.bound?.admissionId.length, 16,
+    "the original committed admission remains bound for recovery STOP");
+  const op2 = { scope: scope2, operationId: crypto.randomBytes(16),
+    reservationId: crypto.randomBytes(16), revision: 1, digest: digest2 };
+  assert.equal((await operator.gate.beginQuiesce(op2)).activeCount, 1);
+  await operator.finishTrustedLocalAdmission({ scope: scope2,
+    workerId: io2.workerId, principal, admissionId: entry2.bound.admissionId });
+  assert.equal((await operator.gate.markPending({ scope: scope2,
+    operationId: op2.operationId, reservationId: op2.reservationId })).status, "PENDING",
+  "independently attested physical STOP must drain the committed orphan");
+
+  // Another adversarial order: START commits, remote QUIESCING closes the
+  // generation while the operator is awaiting the first admission receipt.
+  const scope3 = { account_id: crypto.randomBytes(16), compartment_id: crypto.randomBytes(7),
+    keyring_id: crypto.randomBytes(16) };
+  const key3 = scope3.account_id.toString("hex") + ":"
+    + scope3.compartment_id.length.toString(16) + ":" + scope3.compartment_id.toString("hex");
+  const digest3 = crypto.randomBytes(32);
+  await admin.query(`INSERT INTO zk1_gate.head
+    (scope_key,keyring_id,revision,digest,require_stop_proof) VALUES($1,$2,1,$3,TRUE)`,
+  [key3, scope3.keyring_id, digest3]);
+  const io3 = { scope: scope3, workerId: crypto.randomBytes(16), principal,
+    action: "put", objectId: crypto.randomBytes(16).toString("base64url"),
+    revision: 1, digest: digest3 };
+  const op3 = { scope: scope3, operationId: crypto.randomBytes(16),
+    reservationId: crypto.randomBytes(16), revision: 1, digest: digest3 };
+  operator.prepare(io3);
+  let quiescedAfterCommit = false;
+  operator.gate.beginIoAdmission = async (value) => {
+    const receipt = await beginOriginal(value);
+    if (!quiescedAfterCommit) {
+      quiescedAfterCommit = true;
+      await operator.gate.beginQuiesce(op3);
+    }
+    return receipt;
+  };
+  const replay = await operator.beginTrustedLocalAdmission(io3);
+  operator.gate.beginIoAdmission = beginOriginal;
+  assert.equal(replay.proceed, false,
+    "the original OPEN acknowledgment must not authorize IO after QUIESCING");
+  const entry3 = [...operator.entries.values()].find((candidate) =>
+    candidate.io.workerId.equals(io3.workerId));
+  assert.deepEqual(replay.admissionId, entry3.bound.admissionId);
+  await operator.finishTrustedLocalAdmission({ scope: scope3,
+    workerId: io3.workerId, admissionId: entry3.bound.admissionId, principal });
+  assert.equal((await operator.gate.markPending({ scope: scope3,
+    operationId: op3.operationId, reservationId: op3.reservationId })).status,
+  "PENDING", "QUIESCING before bind cannot strand a committed admission");
 });

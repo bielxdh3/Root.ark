@@ -10,6 +10,22 @@ epoch, PID and pinned Ed25519 host identity from the actual `ChildProcess`
 handle. `finishTrustedLocalAdmission()` stops that handle, awaits real OS
 `exit`/`close`, records the signed evidence through the independent restricted
 STOP SQL principal, and then invokes the gate's signature-verifying FINISH.
+Only `createZk1PhysicalStopRecorder()` can provision an acceptable recorder:
+it first verifies that the PostgreSQL login has the independent STOP-only
+privileges, then marks the actual instance as checked; a directly constructed
+recorder, a superuser/dual-role pool or a later attempt to replace its pool
+cannot serve as STOP authority.
+
+If the supervised child exits just **after** SQL START commits but **before**
+the operator binds the returned admission ID, the still-held original child
+handle can be bound to that exact returned ID/epoch/PID for reconciliation.
+This binding never makes a dead process live. The operator rechecks the gate
+head before returning any positive `proceed` result and denies a dead worker;
+it may still issue an independently signed STOP, finish and drain to PENDING.
+If QUIESCING commits in the same gap, the existing admission is bound but the
+reply is `proceed:false`. A crash/restart that loses the supervisor's original
+ChildProcess handle cannot fabricate this posthumous proof. Persistent OS
+supervision/recovery remains an unresolved separate design requirement.
 
 **This is a laboratory reference for a single local child process.** The child
 fixture does not execute ciphertext writes or own the HTTPS listener. Current

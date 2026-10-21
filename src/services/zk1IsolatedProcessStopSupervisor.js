@@ -87,8 +87,10 @@ class Zk1IsolatedProcessStopSupervisor {
   bindAdmission({ processEpoch, admissionId, generation, scope,
     workerId, principal, processPid } = {}) {
     const session = this.sessions.get(bytes(processEpoch, 16).toString("hex"));
-    if (!session || session.bound || session.exited || session.closed || session.aborted
-      || session.child.exitCode !== null || session.child.signalCode !== null) deny();
+    // The exact admission might have committed while the owned child exited.
+    // A dead but STILL host-owned ChildProcess must be bound for STOP recovery;
+    // subsequent assertLive() will refuse positive I/O admission.
+    if (!session || session.bound || session.aborted) deny();
     const candidateScope = scopeOf(scope);
     if (scopeKey(candidateScope) !== scopeKey(session.scope)
       || !crypto.timingSafeEqual(bytes(workerId, 16), session.workerId)

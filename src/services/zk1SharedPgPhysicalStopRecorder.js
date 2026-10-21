@@ -8,6 +8,9 @@
 const crypto = require("node:crypto");
 const { verifyZk1PhysicalStopProof } =
   require("../crypto/rootark-zk-physical-stop-proof-v1");
+// An instanceof check proves only JS class shape. Only the factory below
+// verifies the independently restricted STOP SQL identity before use.
+const preflightedRecorders = new WeakSet();
 
 function stopError(code = "ZK_STOP_LEDGER_UNAVAILABLE") {
   const error = new Error(code);
@@ -77,7 +80,10 @@ async function verifyZk1StopRuntimePool(pool) {
 
 class Zk1SharedPgPhysicalStopRecorder {
   constructor({ pool, trustedHostKeyId, trustedHostPublicKey, nowSeconds }) {
-    this.pool = pool;
+    // A verified factory result must not later be redirected to a privileged
+    // pool while retaining its private preflight credential brand.
+    Object.defineProperty(this, "pool", { value: pool,
+      writable: false, configurable: false, enumerable: false });
     this.hostKeyId = bytes(trustedHostKeyId, 16);
     if (!(trustedHostPublicKey instanceof crypto.KeyObject)
       || trustedHostPublicKey.type !== "public"
@@ -156,9 +162,16 @@ class Zk1SharedPgPhysicalStopRecorder {
 async function createZk1PhysicalStopRecorder({ pool, trustedHostKeyId,
   trustedHostPublicKey, nowSeconds = () => Math.floor(Date.now() / 1000) } = {}) {
   await verifyZk1StopRuntimePool(pool);
-  return new Zk1SharedPgPhysicalStopRecorder({ pool, trustedHostKeyId,
+  const recorder = new Zk1SharedPgPhysicalStopRecorder({ pool, trustedHostKeyId,
     trustedHostPublicKey, nowSeconds });
+  preflightedRecorders.add(recorder);
+  return recorder;
+}
+
+function isVerifiedZk1PhysicalStopRecorder(value) {
+  return value instanceof Zk1SharedPgPhysicalStopRecorder
+    && preflightedRecorders.has(value);
 }
 
 module.exports = { verifyZk1StopRuntimePool, createZk1PhysicalStopRecorder,
-  Zk1SharedPgPhysicalStopRecorder };
+  Zk1SharedPgPhysicalStopRecorder, isVerifiedZk1PhysicalStopRecorder };

@@ -7,7 +7,8 @@
 // No fixture child is represented as proof that TLS/provider IO has drained.
 const crypto = require("node:crypto");
 const { Zk1SharedPgGateAuthority } = require("./zk1SharedPgGateAuthority");
-const { Zk1SharedPgPhysicalStopRecorder } = require("./zk1SharedPgPhysicalStopRecorder");
+const { isVerifiedZk1PhysicalStopRecorder } =
+  require("./zk1SharedPgPhysicalStopRecorder");
 const { Zk1IsolatedProcessStopSupervisor } = require("./zk1IsolatedProcessStopSupervisor");
 
 function deny() {
@@ -60,7 +61,7 @@ class Zk1SharedPgStrictStopOperator {
   constructor({ gate, supervisor, recorder } = {}) {
     if (!(gate instanceof Zk1SharedPgGateAuthority)
       || !(supervisor instanceof Zk1IsolatedProcessStopSupervisor)
-      || !(recorder instanceof Zk1SharedPgPhysicalStopRecorder)
+      || !isVerifiedZk1PhysicalStopRecorder(recorder)
       || !gate.stopPinned || !gate.stopPinned.hostKeyId.equals(supervisor.hostKeyId)
       || !recorder.hostKeyId.equals(supervisor.hostKeyId)
       || !pinnedPublicEquals(gate.stopPinned.hostPublicKey,
@@ -104,7 +105,9 @@ class Zk1SharedPgStrictStopOperator {
         if (!entry.bound.admissionId.equals(admitted.admissionId)
           || entry.bound.generation !== admitted.generation) deny();
       } else {
-        if (!admitted.proceed) deny();
+        // A committed START may already be QUIESCING when its HTTP/SQL ACK
+        // arrives. Exact host-handle binding is still needed for a signed
+        // STOP receipt; no I/O is authorized by this reconciliation.
         this.supervisor.bindAdmission({ scope: entry.io.scope,
           workerId: entry.io.workerId, principal: entry.io.principal,
           processEpoch: entry.process.processEpoch, processPid: entry.process.processPid,
@@ -112,9 +115,18 @@ class Zk1SharedPgStrictStopOperator {
         entry.bound = { admissionId: Buffer.from(admitted.admissionId),
           generation: admitted.generation };
       }
-      if (admitted.proceed) this.supervisor.assertLive({ processEpoch: entry.process.processEpoch });
-      return { admissionId: Buffer.from(admitted.admissionId),
-        generation: admitted.generation, proceed: admitted.proceed };
+      // Recheck after binding: QUIESCING can commit in the gap between START
+      // and bind; the original positive receipt cannot be reused as authority.
+      const current = await this.gate.beginIoAdmission({ ...entry.io,
+        hostKeyId: entry.process.hostKeyId,
+        processEpoch: entry.process.processEpoch, processPid: entry.process.processPid });
+      if (!current || !Buffer.isBuffer(current.admissionId)
+        || !current.admissionId.equals(entry.bound.admissionId)
+        || current.generation !== entry.bound.generation
+        || typeof current.proceed !== "boolean") deny();
+      if (current.proceed) this.supervisor.assertLive({ processEpoch: entry.process.processEpoch });
+      return { admissionId: Buffer.from(entry.bound.admissionId),
+        generation: entry.bound.generation, proceed: current.proceed };
     })();
     try { return await entry.starting; }
     finally { entry.starting = null; }
