@@ -49,6 +49,11 @@ async function verifyZk1StopRuntimePool(pool) {
       r.rolcreatedb AS createdb, r.rolcreaterole AS createrole,
       pg_catalog.pg_has_role(current_user, 'zk1_stop_runtime', 'USAGE') AS stop_role,
       pg_catalog.pg_has_role(current_user, 'zk1_gate_runtime', 'USAGE') AS gate_role,
+      pg_catalog.pg_has_role(current_user, 'zk1_chunk_writer_runtime', 'USAGE') AS writer_role,
+      pg_catalog.pg_has_role(current_user, 'zk1_gate_runtime', 'MEMBER') AS gate_member,
+      pg_catalog.pg_has_role(current_user, 'zk1_chunk_writer_runtime', 'MEMBER') AS writer_member,
+      pg_catalog.pg_has_role(current_user, 'zk1_gate_runtime', 'SET') AS can_set_gate,
+      pg_catalog.pg_has_role(current_user, 'zk1_chunk_writer_runtime', 'SET') AS can_set_writer,
       pg_catalog.has_schema_privilege(current_user,'zk1_gate','USAGE') AS schema_use,
       pg_catalog.has_schema_privilege(current_user,'zk1_gate','CREATE') AS schema_create,
       pg_catalog.has_column_privilege(current_user,'zk1_gate.physical_stop_receipt',
@@ -69,6 +74,9 @@ async function verifyZk1StopRuntimePool(pool) {
       || row.login_ok !== true || row.superuser !== false
       || row.createdb !== false || row.createrole !== false
       || row.stop_role !== true || row.gate_role !== false
+      || row.writer_role !== false || row.gate_member !== false
+      || row.writer_member !== false || row.can_set_gate !== false
+      || row.can_set_writer !== false
       || row.schema_use !== true || row.schema_create !== false
       || row.can_record_stop !== true || row.can_update_phase !== false
       || row.can_update_worker !== false || row.can_write_ciphertext !== false

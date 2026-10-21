@@ -25,6 +25,12 @@ async function verifyZk1SharedPgRuntimePool(pool) {
       r.rolcanlogin AS can_login, r.rolsuper AS is_superuser,
       r.rolcreatedb AS can_create_db, r.rolcreaterole AS can_create_role,
       pg_catalog.pg_has_role(current_user, 'zk1_gate_runtime', 'USAGE') AS gate_access,
+      pg_catalog.pg_has_role(current_user, 'zk1_stop_runtime', 'USAGE') AS stop_access,
+      pg_catalog.pg_has_role(current_user, 'zk1_chunk_writer_runtime', 'USAGE') AS writer_access,
+      pg_catalog.pg_has_role(current_user, 'zk1_stop_runtime', 'MEMBER') AS stop_member,
+      pg_catalog.pg_has_role(current_user, 'zk1_chunk_writer_runtime', 'MEMBER') AS writer_member,
+      pg_catalog.pg_has_role(current_user, 'zk1_stop_runtime', 'SET') AS can_set_stop,
+      pg_catalog.pg_has_role(current_user, 'zk1_chunk_writer_runtime', 'SET') AS can_set_writer,
       pg_catalog.has_schema_privilege(current_user,'zk1_gate','USAGE') AS schema_access,
       pg_catalog.has_schema_privilege(current_user,'zk1_gate','CREATE') AS schema_create,
       pg_catalog.has_column_privilege(current_user,'zk1_gate.head','revision','UPDATE') AS can_change_revision,
@@ -37,6 +43,9 @@ async function verifyZk1SharedPgRuntimePool(pool) {
       || x.active_identity === "zk1_gate_runtime" || x.can_login !== true
       || x.is_superuser !== false || x.can_create_db !== false
       || x.can_create_role !== false || x.gate_access !== true
+      || x.stop_access !== false || x.writer_access !== false
+      || x.stop_member !== false || x.writer_member !== false
+      || x.can_set_stop !== false || x.can_set_writer !== false
       || x.schema_access !== true || x.schema_create !== false
       || x.can_change_revision !== false || x.can_change_phase !== true
       || x.can_delete_ciphertext !== false || x.can_truncate_ciphertext !== false) refuse();

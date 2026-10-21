@@ -117,6 +117,7 @@ async function main() {
   run("node", ["--test", "--test-reporter=spec",
     "test/issue-65-shared-gate-postgres.test.js",
     "test/issue-65-gate-runtime-role.test.js",
+    "test/issue-65-gate-stop-hidden-role.test.js",
     "test/issue-65-shared-pg-sealed-object.test.js",
     "test/issue-65-unsealed-sql-fence.test.js",
     "test/issue-65-chunk-writer-role.test.js",
