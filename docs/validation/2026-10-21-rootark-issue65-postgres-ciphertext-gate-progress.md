@@ -31,3 +31,9 @@ The second test holds a physical chunk write uncommitted in PostgreSQL session A
 - A compromised application/gateway or database administrator can bypass assumptions of the laboratory role isolation. This is **not** a claim of Zero-Knowledge production security, revocation of offline copies, or completion of issue #65.
 
 The experiment can inform a later selected, independently operated backend and a provider-neutral interface. Such an interface, physical stop protocol and actual protected content and storage integration must be implemented, independently reviewed and tested before release.
+
+## Independent review and repository-wide test snapshot
+
+- An independent, READ-ONLY bounded reviewer found **no confirmed P1/P2** in the new SQL physical-write function, role permissions or the three new adversarial tests. The reviewer did **not** separately provision/rerun the Docker lab; the Windows/WSL 13/13 counts above are the primary execution evidence.
+- `npm run validate:syntax` checked **298 files with 0 failures**; `npm run validate:artifacts` and `git diff --check` exited 0 (with the pre-existing line-ending conversion warning on a lab SQL file).
+- `npm test` returned **1,829 total, 1,757 passed, 0 failed, 72 skipped, exit 0**, log `rootark_issue65_pg_physical_full_20261021.log` in the host temporary folder. **Caveat:** a separate actor was concurrently adding untracked shared GateAuthority files and changing `package.json` / `package-lock.json` in the same worktree. The broad run therefore is not guaranteed to represent an immutable exact-commit snapshot, and skipped opt-in tests are not passed integration checks. None of those concurrent changes was modified, staged or committed as part of this milestone.
