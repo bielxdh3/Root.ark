@@ -160,6 +160,76 @@ test("real mTLS CAS endpoint handles signed v2 commit, rejects alien scope, and 
   assert.deepEqual(await writeClient.commit({ receipt: ticket, manifestBytes: raw }),
     { status: "committed", replay: false });
   assert.deepEqual(await manifestClient.getCommittedManifest({ scope: readScope }), raw);
+  const historyPage = await manifestClient.getCommittedHistoryPage({
+    scope: readScope, startRevision: 1,
+  });
+  assert.equal(historyPage.headRevision, 1);
+  assert.deepEqual(historyPage.headDigest, await v2.recoveryManifestDigestV2(manifest));
+  assert.equal(historyPage.startRevision, 1);
+  assert.equal(historyPage.nextRevision, null);
+  assert.deepEqual(historyPage.entries, [raw],
+    "manifest history bytes must be available for independent signed-chain verification");
+  const originalForPages = cas.getCommittedHistoryPage.bind(cas);
+  try {
+    cas.getCommittedHistoryPage = async ({ startRevision }) => ({
+      headRevision: 3,
+      headDigest: await v2.recoveryManifestDigestV2(manifest),
+      startRevision,
+      nextRevision: startRevision < 3 ? startRevision + 1 : null,
+      entries: [raw],
+    });
+    const downloaded = await manifestClient.getCommittedHistory({ scope: readScope });
+    assert.equal(downloaded.headRevision, 3);
+    assert.equal(downloaded.entries.length, 3,
+      "a client may not silently interpret the first response as the complete signed history");
+    assert.deepEqual(downloaded.entries, [raw, raw, raw]);
+    let pages = 0;
+    cas.getCommittedHistoryPage = async ({ startRevision }) => {
+      pages += 1;
+      return {
+        headRevision: 3,
+        headDigest: pages === 1
+          ? await v2.recoveryManifestDigestV2(manifest) : crypto.randomBytes(32),
+        startRevision,
+        nextRevision: startRevision < 3 ? startRevision + 1 : null,
+        entries: [raw],
+      };
+    };
+    await assert.rejects(manifestClient.getCommittedHistory({ scope: readScope }),
+      /CAS_MANIFEST_TRANSPORT_UNAVAILABLE/,
+      "a newer, forked or substituted CAS head across pages must fail closed");
+  } finally {
+    cas.getCommittedHistoryPage = originalForPages;
+  }
+  await assert.rejects(manifestClient.getCommittedHistoryPage({
+    scope: readScope, startRevision: 2,
+  }), /CAS_MANIFEST_TRANSPORT_UNAVAILABLE/,
+  "a client cannot request history beyond the committed head");
+  assert.equal((await send(port, tls, "/v1/history", {
+    scope: scopeJson, startRevision: 1,
+  })).status, 403, "CAS writer must not read signed history via another endpoint");
+  assert.equal((await send(port, tls, "/v1/history", {
+    scope: scopeJson, startRevision: 1,
+  }, "witness")).status, 403, "CAS status witness cannot read the manifest chain");
+  assert.equal((await send(port, tls, "/v1/history", {
+    scope: { ...scopeJson, keyring_id: enc(crypto.randomBytes(16)) },
+    startRevision: 1,
+  }, "denied")).status, 403, "manifest reader may not read a foreign keyring's history");
+  assert.equal((await send(port, tls, "/v1/history", {
+    scope: scopeJson, startRevision: 0,
+  }, "denied")).status, 400, "invalid revision cannot be truncated to an earlier manifest");
+  const originalPage = cas.getCommittedHistoryPage.bind(cas);
+  try {
+    cas.getCommittedHistoryPage = async (args) => ({
+      ...await originalPage(args), nextRevision: 2,
+    });
+    await assert.rejects(manifestClient.getCommittedHistoryPage({
+      scope: readScope, startRevision: 1,
+    }), /CAS_MANIFEST_TRANSPORT_UNAVAILABLE/,
+    "a valid mTLS peer's inconsistent page continuation is not accepted");
+  } finally {
+    cas.getCommittedHistoryPage = originalPage;
+  }
   assert.equal((await send(port, tls, "/v1/manifest", { scope: scopeJson })).status, 403,
     "the CAS writer certificate must not read protected manifest history");
   assert.equal((await send(port, tls, "/v1/manifest", { scope: scopeJson }, "witness")).status, 403,

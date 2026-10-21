@@ -11,7 +11,7 @@ const B64U = /^[A-Za-z0-9_-]+$/;
 const FINGERPRINT = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
 const ROUTE_ROLES = Object.freeze({
   "/v1/register": "register", "/v1/commit": "commit", "/v1/terminal": "terminal",
-  "/v1/manifest": "manifest",
+  "/v1/manifest": "manifest", "/v1/history": "manifest",
 });
 const SCOPE_FIELDS = Object.freeze(["account_id", "compartment_id", "keyring_id"]);
 const QUERY_FIELDS = Object.freeze([
@@ -97,6 +97,7 @@ function createZk1CasStatusHttpsServer({ key, cert, clientCa, ledger, principals
     || typeof ledger.registerReservation !== "function"
     || typeof ledger.commit !== "function" || typeof ledger.getTerminalProof !== "function"
     || typeof ledger.getCommittedManifest !== "function"
+    || typeof ledger.getCommittedHistoryPage !== "function"
     || !principals || typeof principals !== "object"
     || Object.keys(principals).length < 1 || Object.keys(principals).length > 128) invalid();
   const allowed = new Map();
@@ -131,6 +132,23 @@ function createZk1CasStatusHttpsServer({ key, cert, clientCa, ledger, principals
         if (!grant.scopes.has(scopeKey(scope))) return respond(res, 403, { error: "FORBIDDEN" });
         const manifest = await ledger.getCommittedManifest({ scope });
         return respond(res, 200, { manifestBase64: Buffer.from(manifest).toString("base64url") });
+      }
+      if (req.url === "/v1/history") {
+        exact(body, ["scope", "startRevision"]);
+        const scope = normalize(body.scope, SCOPE_FIELDS);
+        if (!grant.scopes.has(scopeKey(scope))) return respond(res, 403, { error: "FORBIDDEN" });
+        if (!Number.isSafeInteger(body.startRevision) || body.startRevision < 1
+          || body.startRevision > 4097) invalid();
+        const page = await ledger.getCommittedHistoryPage({
+          scope, startRevision: body.startRevision,
+        });
+        return respond(res, 200, {
+          headRevision: page.headRevision,
+          headDigest: page.headDigest.toString("base64url"),
+          startRevision: page.startRevision,
+          nextRevision: page.nextRevision,
+          entriesBase64: page.entries.map((item) => item.toString("base64url")),
+        });
       }
       if (req.url === "/v1/terminal") {
         exact(body, ["query", "nonce"]);

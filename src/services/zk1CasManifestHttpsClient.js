@@ -34,21 +34,24 @@ function createZk1CasManifestHttpsClient({
     || !ca || !clientKey || !clientCert || !PIN.test(serverFingerprint256)
     || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 10000) fail();
   const pin = serverFingerprint256.toUpperCase();
-  return Object.freeze({
-    getCommittedManifest({ scope } = {}) {
+  function fetchResource(scope, startRevision) {
+      const history = startRevision !== undefined;
+      if (history && (!Number.isSafeInteger(startRevision)
+        || startRevision < 1 || startRevision > 4097)) fail();
       exact(scope, ["account_id", "compartment_id", "keyring_id"]);
       const body = Buffer.from(JSON.stringify({ scope: {
         account_id: bytes(scope.account_id, 16),
         compartment_id: bytes(scope.compartment_id, 1, 128),
         keyring_id: bytes(scope.keyring_id, 16),
-      } }));
+      }, ...(history ? { startRevision } : {}) }));
       return new Promise((resolve, reject) => {
         let completed = false;
         const unavailable = () => {
           if (!completed) { completed = true; reject(new Error("CAS_MANIFEST_TRANSPORT_UNAVAILABLE")); }
         };
         const request = https.request({
-          hostname: url.hostname, port: url.port, method: "POST", path: url.pathname,
+          hostname: url.hostname, port: url.port, method: "POST",
+          path: history ? "/v1/history" : url.pathname,
           agent: false, // do not reuse a socket authenticated under another TLS pin
           ca, cert: clientCert, key: clientKey, rejectUnauthorized: true,
           minVersion: "TLSv1.3", servername: url.hostname,
@@ -80,6 +83,43 @@ function createZk1CasManifestHttpsClient({
             if (completed) return;
             try {
               const result = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+              if (history) {
+                exact(result, ["headRevision", "headDigest", "startRevision",
+                  "nextRevision", "entriesBase64"]);
+                if (!Number.isSafeInteger(result.headRevision)
+                  || result.headRevision < startRevision || result.headRevision > 4097
+                  || result.startRevision !== startRevision
+                  || (result.nextRevision !== null
+                    && (!Number.isSafeInteger(result.nextRevision)
+                      || result.nextRevision > result.headRevision
+                      || result.nextRevision <= startRevision))
+                  || typeof result.headDigest !== "string"
+                  || !B64.test(result.headDigest)
+                  || !Array.isArray(result.entriesBase64)
+                  || result.entriesBase64.length < 1
+                  || result.entriesBase64.length > 4097) fail();
+                const headDigest = Buffer.from(result.headDigest, "base64url");
+                if (headDigest.length !== 32
+                  || headDigest.toString("base64url") !== result.headDigest) fail();
+                let total = 0;
+                const entries = result.entriesBase64.map((entry) => {
+                  if (typeof entry !== "string" || !B64.test(entry)
+                    || entry.length > 11 * 1024 * 1024) fail();
+                  const raw = Buffer.from(entry, "base64url");
+                  total += raw.length;
+                  if (!raw.length || total > 8 * 1024 * 1024
+                    || raw.toString("base64url") !== entry) fail();
+                  return raw;
+                });
+                const end = startRevision + entries.length - 1;
+                if (end > result.headRevision
+                  || (result.nextRevision === null) !== (end === result.headRevision)
+                  || (result.nextRevision !== null && result.nextRevision !== end + 1)) fail();
+                completed = true;
+                resolve({ headRevision: result.headRevision, headDigest,
+                  startRevision, nextRevision: result.nextRevision, entries });
+                return;
+              }
               exact(result, ["manifestBase64"]);
               const value = result.manifestBase64;
               if (typeof value !== "string" || value.length > 11 * 1024 * 1024
@@ -97,6 +137,42 @@ function createZk1CasManifestHttpsClient({
         request.on("error", unavailable);
         request.end(body);
       });
+  }
+  return Object.freeze({
+    getCommittedManifest({ scope } = {}) { return fetchResource(scope); },
+    getCommittedHistoryPage({ scope, startRevision } = {}) {
+      return fetchResource(scope, startRevision);
+    },
+    async getCommittedHistory({ scope } = {}) {
+      // Transport convenience only: pages are still UNTRUSTED signed bytes.
+      // A separate public-chain verifier and fresh witness must authenticate
+      // the full chain before any dependent admission.
+      let startRevision = 1;
+      let headRevision;
+      let headDigest;
+      const entries = [];
+      let total = 0;
+      for (let pageCount = 0; pageCount <= 4096; pageCount += 1) {
+        const page = await fetchResource(scope, startRevision);
+        if (pageCount === 0) {
+          headRevision = page.headRevision;
+          headDigest = Buffer.from(page.headDigest);
+        } else if (page.headRevision !== headRevision
+          || !page.headDigest.equals(headDigest)) fail();
+        for (const item of page.entries) {
+          total += item.length;
+          if (total > 64 * 1024 * 1024 || entries.length >= 4097) fail();
+          entries.push(Buffer.from(item));
+        }
+        if (page.nextRevision === null) {
+          if (entries.length !== headRevision) fail();
+          return { headRevision, headDigest, entries };
+        }
+        if (page.nextRevision <= startRevision
+          || page.nextRevision !== entries.length + 1) fail();
+        startRevision = page.nextRevision;
+      }
+      fail();
     },
   });
 }

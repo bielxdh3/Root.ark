@@ -204,6 +204,27 @@ test("CAS+witness true signed genesis/enrollment/revocation fence cross-device c
   await assert.rejects(z.unwrapKey({ ...modifiedWrap, cer: state.epochKeys[0].key,
     wrapped, aad }), /AUTHENTICATION_FAILED/);
   await propose(enrolled, initial);
+  const historyAfterEnrollment = await cas.getCommittedHistoryPage({
+    scope, startRevision: 1,
+  });
+  assert.equal(historyAfterEnrollment.headRevision, 2);
+  assert.deepEqual(historyAfterEnrollment.entries,
+    [Buffer.from(await z.encodeDeterministic(initial)),
+      Buffer.from(await z.encodeDeterministic(enrolled))],
+    "untrusted CAS history pages expose every canonical signed transition");
+  assert.equal(historyAfterEnrollment.nextRevision, null);
+  assert.deepEqual(historyAfterEnrollment.headDigest,
+    await v2.recoveryManifestDigestV2(enrolled));
+  const expensiveAudit = cas.getCommittedManifest.bind(cas);
+  try {
+    cas.getCommittedManifest = async () => {
+      throw new Error("full ledger audit must not materialize at EVERY untrusted history page");
+    };
+    const fetched = await cas.getCommittedHistoryPage({ scope, startRevision: 2 });
+    assert.deepEqual(fetched.entries, [Buffer.from(await z.encodeDeterministic(enrolled))]);
+  } finally {
+    cas.getCommittedManifest = expensiveAudit;
+  }
   const readNew = await authorize("trusted-1", "get");
   assert.deepEqual((await content.get(readNew)).ciphertext, beforeEnroll.ciphertext);
 
@@ -213,10 +234,20 @@ test("CAS+witness true signed genesis/enrollment/revocation fence cross-device c
   await assert.rejects(content.get(await authorize("trusted-0", "get")),
     /ZK_CONTENT_UNAVAILABLE/, "a real unresolved witness reservation must freeze protected reads");
   await cas.registerReservation({ receipt: ticket });
+  await assert.rejects(cas.getCommittedHistoryPage({ scope, startRevision: 1 }),
+    /CAS_UNRESOLVED/, "CAS must withhold committed history while its reservation is pending");
   await cas.commit({ receipt: ticket, manifestBytes: Buffer.from(await z.encodeDeterministic(revoked)) });
   await assert.rejects(content.get(formerlyAuthorized), /ZK_CONTENT_UNAVAILABLE/,
     "before witness terminal acknowledgement, a new signed CAS manifest is insufficient");
   assert.equal((await witness.resolve({ scope })).status, "committed");
+  const historyAfterRevoke = await cas.getCommittedHistoryPage({
+    scope, startRevision: 2,
+  });
+  assert.equal(historyAfterRevoke.headRevision, 3);
+  assert.deepEqual(historyAfterRevoke.entries,
+    [Buffer.from(await z.encodeDeterministic(enrolled)),
+      Buffer.from(await z.encodeDeterministic(revoked))]);
+  assert.equal(historyAfterRevoke.nextRevision, null);
   await assert.rejects(content.get(formerlyAuthorized), /ZK_CONTENT_UNAVAILABLE/);
   await assert.rejects(content.get(await authorize("trusted-1", "get")),
     /ZK_CONTENT_DENIED/);

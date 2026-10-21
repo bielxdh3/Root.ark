@@ -550,11 +550,44 @@ class Zk1DurableCasStatusLedger {
       keyring_id: asBytes(scope.keyring_id, 16),
     };
     const key = compartmentKey(identity);
-    const state = this.db.transaction(() => ({
-      scope: this.scopeRow.get(key),
-      operations: this.db.prepare("SELECT * FROM cas_operation WHERE scope_key=?").all(key),
-      transitions: this.db.prepare("SELECT * FROM cas_transition WHERE scope_key=? ORDER BY revision").all(key),
-    }))();
+    const state = this.db.transaction(() => {
+      const current = this.scopeRow.get(key);
+      // Validate persisted size claims with SQL aggregates *before* .all().
+      // Otherwise one corrupted/restored SQLite row could allocate arbitrary
+      // RAM while merely requesting a bounded history page.
+      const manifestSize = this.db.prepare(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(manifest_bytes)),0) AS total,"
+        + " COALESCE(MAX(LENGTH(manifest_bytes)),0) AS largest FROM cas_transition"
+        + " WHERE scope_key=?",
+      ).get(key);
+      const operationSize = this.db.prepare(
+        "SELECT COUNT(*) AS n,"
+        + " COALESCE(SUM(LENGTH(signed_ticket)),0) AS ticket_bytes,"
+        + " COALESCE(MAX(LENGTH(signed_ticket)),0) AS largest_ticket,"
+        + " COALESCE(SUM(LENGTH(committed_manifest)),0) AS committed_bytes,"
+        + " COALESCE(MAX(LENGTH(committed_manifest)),0) AS largest_commit,"
+        + " COALESCE(SUM(LENGTH(terminal_seal)),0) AS seal_bytes,"
+        + " COALESCE(MAX(LENGTH(terminal_seal)),0) AS largest_seal"
+        + " FROM cas_operation WHERE scope_key=?",
+      ).get(key);
+      if (!current || current.revision === null || current.pending_id !== null
+        || manifestSize.n !== current.revision
+        || manifestSize.n > limits.MAX_TRANSITIONS + 1
+        || manifestSize.total > limits.MAX_HISTORY_BYTES
+        || manifestSize.largest > limits.MAX_ENTRY_BYTES
+        || operationSize.n > limits.MAX_TRANSITIONS + 1
+        || operationSize.ticket_bytes > (limits.MAX_TRANSITIONS + 1) * 4096
+        || operationSize.largest_ticket > 4096
+        || operationSize.committed_bytes > limits.MAX_HISTORY_BYTES
+        || operationSize.largest_commit > limits.MAX_ENTRY_BYTES
+        || operationSize.seal_bytes > (limits.MAX_TRANSITIONS + 1) * 4096
+        || operationSize.largest_seal > 4096) fail("CAS_UNRESOLVED");
+      return {
+        scope: current,
+        operations: this.db.prepare("SELECT * FROM cas_operation WHERE scope_key=?").all(key),
+        transitions: this.db.prepare("SELECT * FROM cas_transition WHERE scope_key=? ORDER BY revision").all(key),
+      };
+    })();
     if (!state.scope || !same(state.scope.keyring_id, identity.keyring_id)
       || state.scope.revision === null || state.scope.pending_id !== null
       || state.transitions.length !== state.scope.revision
@@ -597,6 +630,62 @@ class Zk1DurableCasStatusLedger {
     const head = state.transitions.at(-1);
     if (!same(state.scope.digest, head.digest)) fail("CAS_LEDGER_CORRUPT");
     return Buffer.from(head.manifest_bytes);
+  }
+
+  async getCommittedHistoryPage({ scope, startRevision }) {
+    // History bytes are NEVER an authorization response. In particular do
+    // NOT fully audit/materialize the 64 MiB CAS status ledger for EACH
+    // untrusted page: a small-page client would amplify work quadratically.
+    // The client MUST verify the full signature chain, independently pinned
+    // base receipt and fresh nonce-bound witness head before trusting bytes.
+    exact(scope, ["account_id", "compartment_id", "keyring_id"]);
+    if (!Number.isSafeInteger(startRevision)
+      || startRevision < 1 || startRevision > limits.MAX_TRANSITIONS + 1) fail();
+    const identity = {
+      account_id: asBytes(scope.account_id, 16),
+      compartment_id: asBytes(scope.compartment_id, 1, 128),
+      keyring_id: asBytes(scope.keyring_id, 16),
+    };
+    const key = compartmentKey(identity);
+    const snapshot = this.db.transaction(() => {
+      const current = this.scopeRow.get(key);
+      if (!current || current.pending_id !== null
+        || !same(current.keyring_id, identity.keyring_id)
+        || !Number.isSafeInteger(current.revision)
+        || current.revision < startRevision
+        || current.revision > limits.MAX_TRANSITIONS + 1
+        || !Number.isSafeInteger(current.history_bytes)
+        || current.history_bytes < 0 || current.history_bytes > limits.MAX_HISTORY_BYTES
+        || !Buffer.isBuffer(current.digest) || current.digest.length !== 32) {
+        fail("CAS_UNRESOLVED");
+      }
+      const entries = [];
+      let pageBytes = 0;
+      // Iterate lazily: .all() could materialize up to 4,097 x 8 MiB,
+      // exhausting process memory BEFORE the 8 MiB page bound is checked.
+      for (const row of this.db.prepare(
+        "SELECT revision,manifest_bytes FROM cas_transition"
+        + " WHERE scope_key=? AND revision>=? ORDER BY revision LIMIT 4097",
+      ).iterate(key, startRevision)) {
+        if (row.revision !== startRevision + entries.length) fail("CAS_LEDGER_CORRUPT");
+        const bytes = asBytes(row.manifest_bytes, 1, limits.MAX_ENTRY_BYTES);
+        if (pageBytes + bytes.length > limits.MAX_ENTRY_BYTES) break;
+        entries.push(bytes);
+        pageBytes += bytes.length;
+      }
+      return { current, entries };
+    })();
+    if (snapshot.entries.length > limits.MAX_TRANSITIONS + 1) fail("CAS_UNRESOLVED");
+    const entries = snapshot.entries;
+    if (!entries.length) fail("CAS_UNRESOLVED");
+    const nextRevision = startRevision + entries.length;
+    return {
+      headRevision: snapshot.current.revision,
+      headDigest: Buffer.from(snapshot.current.digest),
+      startRevision,
+      nextRevision: nextRevision <= snapshot.current.revision ? nextRevision : null,
+      entries,
+    };
   }
 
   close() { if (this.db.open) this.db.close(); }
