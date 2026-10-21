@@ -140,6 +140,8 @@ Gate state and active admissions survive authority and gateway restart. After re
 
 ### Receipt and terminal-proof contract
 
+**2026-10-20 normative clarification superseding this subsection's historical missing-`type` blockers:** the accepted Section 12.4 now defines exact `type` literals in `docs/superpowers/specs/2026-10-20-rootark-zk1-v1-wire-type-registry.json`. The CAS terminal proof, witness reservation, witness cancellation **and** previously overlooked witness commit receipt each have an unambiguous literal matching their unchanged Ed25519 signing domain. The withdrawn draft `rootark-cas-terminal-status/v1` remains forbidden. Statements below that these values are not assigned document the **previous state**, not an active protocol ambiguity. The type registry does not imply a provider, deployed signature verifier, independent trust roots, or production clearance.
+
 The fresh witness-head receipt retains its explicit v1 type, deterministic-CBOR field set, and signature domain from accepted dual-recovery Section 12.4. The reservation ticket retains its prior deterministic-CBOR field set and domain. Packet B does not extend or replace either contract; it does not assign a `type` literal where Section 12.4 supplied only a required `type` field. For committed status, a fresh head receipt binds the exact scope, current revision/digest, witness sequence, fresh 32-byte nonce, observation time, committed status, and null pending reservation. While a reservation is unresolved, the witness signs `pending`/unavailable and never supplies an acceptable earlier committed head.
 
 #### Normative terminal-status v1 compatibility

@@ -69,6 +69,9 @@ const registerAuditRoutes = require("./src/routes/audit");
 const registerBackupRoutes = require("./src/routes/backups");
 const registerTrashRoutes = require("./src/routes/trash");
 const { registerSyncRoutes } = require("./src/routes/sync");
+const { registerOpaqueDevVaultRoutes } = require("./src/routes/zkOpaqueDevVault");
+const { registerZk1LocalSignedHistoryRoutes } = require("./src/routes/zk1LocalSignedHistoryRoutes");
+const { registerZk1ProtectedContentFromConfig } = require("./src/services/zk1ProtectedContentBootstrap");
 const { registerGroupRoutes } = require("./src/routes/groups");
 const { createAuthenticate, createRealtimeAuthenticator, getClientIp, getExpectedOrigin, isAuthTokenExpired, parseCookies } = require("./src/middlewares/auth");
 const { getTrustedClientIp, parseTrustedProxies } = require("./src/middlewares/trustedProxies");
@@ -5936,7 +5939,15 @@ const APP_CONTENT_SECURITY_POLICY = [
   "frame-ancestors 'self'",
 ].join("; ");
 app.use((req, res, next) => {
-  res.setHeader("Content-Security-Policy", APP_CONTENT_SECURITY_POLICY);
+  // The opt-in development-only emergency package uses Argon2id from
+  // libsodium's WebAssembly build. Permit WASM compilation on that single
+  // page, not unrestricted JS eval and never on legacy application pages.
+  const devVaultWasm = process.env.ROOTARK_ZK_DEV_VAULT_ENABLED === "true"
+    && NODE_ENV !== "production" && req.path === "/zk-dev-vault.html";
+  res.setHeader("Content-Security-Policy", devVaultWasm
+    ? APP_CONTENT_SECURITY_POLICY.replace("script-src 'self'",
+      "script-src 'self' 'wasm-unsafe-eval'")
+    : APP_CONTENT_SECURITY_POLICY);
   res.setHeader("X-Frame-Options", "SAMEORIGIN");
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "same-origin");
@@ -5957,7 +5968,25 @@ app.post("/upload-chunk", uploadChunkPeerRateLimit);
 app.use(apiRequestRateLimit);
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
-  if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
+  if (req.method === "POST" && req.path === "/zk-dev/v1/zk1-history"
+    && process.env.ROOTARK_ZK_DEV_VAULT_ENABLED === "true"
+    && ["development", "test"].includes(NODE_ENV)) {
+    // Parsing the larger signed-manifest envelope happens inside its
+    // dedicated route, AFTER authentication and upload authorization.
+    return next();
+  }
+  if (process.env.ROOTARK_ZK1_CONTENT_CONFIG
+    && ["development", "test"].includes(NODE_ENV)
+    && req.method === "POST"
+    && ["/zk-1/v1/content/read", "/zk-1/v1/content/put"].includes(req.path)) {
+    // Defer JSON body parsing until AFTER the normal session and permissions
+    // have been checked by the isolated protected-content routes.
+    return next();
+  }
+  if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")
+    || req.path === "/zk-dev/v1/objects" || req.path.startsWith("/zk-dev/v1/objects/")) {
+    return syncJsonParser(req, res, next);
+  }
   return express.json()(req, res, next);
 });
 const loadCurrentUser = (username) => loadUsers().find((user) => user.username === username);
@@ -6066,6 +6095,37 @@ wss.on("connection", (socket, req) => {
 });
 
 const requirePermission = createRequirePermission();
+
+// Opt-in developer workflow: a browser-only encrypted file vault. This is
+// deliberately NOT integrated with legacy uploads or presented as zk-1.
+// Enabling it never creates a server-held recovery key.
+if (process.env.ROOTARK_ZK_DEV_VAULT_ENABLED === "true" && ["development", "test"].includes(NODE_ENV)) {
+  const devVaultDbPath = process.env.ROOTARK_ZK_DEV_VAULT_DB || "./data/zk-dev-vault.sqlite";
+  registerOpaqueDevVaultRoutes({
+    app, authenticate, requirePermission, auditLog,
+    dbPath: devVaultDbPath,
+  });
+  // An independent local archive of public SIGNED zk-1 v2 manifests.
+  // Do not use its unwitnessed head for protected content authorization.
+  registerZk1LocalSignedHistoryRoutes({
+    app, authenticate, requirePermission, auditLog,
+    dbPath: devVaultDbPath + ".zk1-history.sqlite",
+  });
+}
+
+// Opt-in authenticated ZK-1 ciphertext I/O with pinned remote CAS + witness.
+// This is an experimental single-scope integration, not a replacement for
+// legacy file, sync, cloud, backup or WebDAV routes and not complete ZK.
+if (process.env.ROOTARK_ZK1_CONTENT_CONFIG) {
+  if (!["development", "test"].includes(NODE_ENV)) {
+    throw new Error("ROOTARK_ZK1_CONTENT_CONFIG requires development or test mode");
+  }
+  const zk1ContentStore = registerZk1ProtectedContentFromConfig({
+    app, authenticate, requirePermission,
+    configPath: process.env.ROOTARK_ZK1_CONTENT_CONFIG, environment: NODE_ENV,
+  });
+  server.once("close", () => zk1ContentStore.close());
+}
 
 registerSyncRoutes({
   app,

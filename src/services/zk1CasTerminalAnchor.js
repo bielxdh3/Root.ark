@@ -1,0 +1,282 @@
+"use strict";
+
+// Durable *single-host* signed terminal continuity journal, stored OUTSIDE the
+// CAS database file and its database-writer authority. It closes the threat
+// where SQL rows alone are rewound/rewritten without the status signer key.
+// A privileged host operator restoring BOTH files can still rollback; real
+// cross-host anti-rollback requires an independently operated anchor/floor.
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const DOMAIN = Buffer.from("Root.ark/zk-1/cas-terminal-anchor/v1\0", "ascii");
+const INTENT_DOMAIN = Buffer.from("Root.ark/zk-1/cas-terminal-intent/v1\0", "ascii");
+const MAX_BYTES = 64 * 1024 * 1024;
+function fail() {
+  const error = new Error("CAS_ANCHOR_INVALID");
+  error.code = "CAS_ANCHOR_INVALID";
+  throw error;
+}
+function strict(obj, fields) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)
+    || Object.keys(obj).length !== fields.length
+    || fields.some((k) => !Object.hasOwn(obj, k))
+    || Object.keys(obj).some((k) => !fields.includes(k))) fail();
+}
+const FIELDS = Object.freeze([
+  "sequence", "reservation", "scope", "status", "ticketHash", "manifestHash",
+  "terminalSeal", "previousHash", "signature",
+]);
+const PAYLOAD = FIELDS.filter((field) => field !== "signature");
+const INTENT_FIELDS = Object.freeze([
+  "type", "keyId", "reservation", "scope", "status", "ticketHash", "manifestHash", "signature",
+]);
+function base64(value) { return Buffer.from(value).toString("base64url"); }
+function digest(value) { return crypto.createHash("sha256").update(value).digest("hex"); }
+function scopeKey(query) {
+  return query.account_id.toString("hex") + ":" + query.compartment_id.byteLength + ":"
+    + query.compartment_id.toString("hex") + ":" + query.keyring_id.toString("hex");
+}
+function signatureInput(record) {
+  return Buffer.concat([DOMAIN, Buffer.from(JSON.stringify(Object.fromEntries(
+    PAYLOAD.map((field) => [field, record[field]]))))]);
+}
+class Zk1CasTerminalAnchor {
+  constructor(filename, { bootstrapNew, statusKeyId, statusPrivateKey } = {}) {
+    if (typeof filename !== "string" || !path.isAbsolute(filename)
+      || !(statusPrivateKey instanceof crypto.KeyObject)
+      || statusPrivateKey.asymmetricKeyType !== "ed25519" || statusPrivateKey.type !== "private"
+      || !Buffer.isBuffer(statusKeyId) || statusKeyId.length !== 16) fail();
+    this.filename = filename;
+    this.privateKey = statusPrivateKey;
+    this.publicKey = crypto.createPublicKey(statusPrivateKey);
+    this.identity = { type: "rootark-zk1-cas-anchor/v1", keyId: base64(statusKeyId),
+      fingerprint: digest(this.publicKey.export({ type: "spki", format: "der" })) };
+    this.records = new Map();
+    this.anchoredScopes = new Set();
+    this.sequence = 0;
+    this.previousHash = "0".repeat(64);
+    if (!fs.existsSync(filename)) {
+      if (bootstrapNew !== true) fail();
+      // Do not create an implicit new anchor at an unexpected path on restart.
+      fs.mkdirSync(path.dirname(filename), { recursive: true });
+      const fd = fs.openSync(filename, "wx", 0o600);
+      try {
+        fs.writeSync(fd, JSON.stringify(this.identity) + "\n");
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
+    }
+    this.reload(true);
+  }
+
+  reload(force = false) {
+    const stat = fs.statSync(this.filename);
+    if (!force && this.lastSize === stat.size && this.lastModified === stat.mtimeMs) return;
+    this.records = new Map();
+    this.anchoredScopes = new Set();
+    this.sequence = 0;
+    this.previousHash = "0".repeat(64);
+    const raw = fs.readFileSync(this.filename);
+    if (!raw.length || raw.length > MAX_BYTES || raw.at(-1) !== 10) fail();
+    const lines = raw.toString("utf8").split("\n");
+    lines.pop();
+    let identity;
+    try { identity = JSON.parse(lines.shift()); }
+    catch (_) { fail(); }
+    strict(identity, ["type", "keyId", "fingerprint"]);
+    if (JSON.stringify(identity) !== JSON.stringify(this.identity)) fail();
+    for (const line of lines) {
+      let item;
+      try { item = JSON.parse(line); }
+      catch (_) { fail(); }
+      this.verify(item);
+      if (JSON.stringify(item) !== line) fail();
+      this.records.set(item.reservation, item);
+      this.anchoredScopes.add(item.scope);
+      this.sequence = item.sequence;
+      this.previousHash = digest(line);
+    }
+    this.lastSize = stat.size;
+    this.lastModified = stat.mtimeMs;
+  }
+
+  verify(item) {
+    strict(item, FIELDS);
+    if (!Number.isSafeInteger(item.sequence) || item.sequence !== this.sequence + 1
+      || typeof item.reservation !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(item.reservation)
+      || typeof item.scope !== "string" || !/^[a-f0-9:]{40,400}$/.test(item.scope)
+      || !["committed", "not-committed-final"].includes(item.status)
+      || typeof item.ticketHash !== "string" || !/^[0-9a-f]{64}$/.test(item.ticketHash)
+      || item.manifestHash !== null && (typeof item.manifestHash !== "string" || !/^[0-9a-f]{64}$/.test(item.manifestHash))
+      || (item.status === "committed") !== (item.manifestHash !== null)
+      || typeof item.terminalSeal !== "string" || !/^[A-Za-z0-9_-]{86}$/.test(item.terminalSeal)
+      || item.previousHash !== this.previousHash || this.records.has(item.reservation)
+      || typeof item.signature !== "string" || !/^[A-Za-z0-9_-]{86}$/.test(item.signature)) fail();
+    const signature = Buffer.from(item.signature, "base64url");
+    if (signature.length !== 64 || base64(signature) !== item.signature
+      || !crypto.verify(null, signatureInput(item), this.publicKey, signature)) fail();
+  }
+
+  get(reservationId) {
+    this.reload();
+    return this.records.get(base64(reservationId)) ?? null;
+  }
+
+  hasScope(query) {
+    this.reload();
+    return this.anchoredScopes.has(scopeKey(query));
+  }
+
+  scopeEvents(query) {
+    // Freshly revalidate the independent signed file, even when its timestamp
+    // and length appear unchanged, before using it as a read-side floor.
+    this.reload(true);
+    const key = scopeKey(query);
+    return [...this.records.values()].filter((event) => event.scope === key)
+      .map((event) => Object.freeze({ ...event }));
+  }
+
+  intentPath(query) { return this.filename + ".intent." + base64(query.reservation_id); }
+
+  intentPayload(query, signedTicket, status, manifestBytes) {
+    if (!["committed", "not-committed-final"].includes(status)
+      || (status === "committed") !== (manifestBytes !== null)) fail();
+    return {
+      type: "rootark-zk1-cas-terminal-intent/v1",
+      keyId: this.identity.keyId,
+      reservation: base64(query.reservation_id),
+      scope: scopeKey(query), status,
+      ticketHash: digest(signedTicket),
+      manifestHash: manifestBytes === null ? null : digest(manifestBytes),
+    };
+  }
+
+  getIntent(query) {
+    const pathname = this.intentPath(query);
+    if (!fs.existsSync(pathname)) return null;
+    const bytes = fs.readFileSync(pathname);
+    if (!bytes.length || bytes.length > 4096 || bytes.at(-1) !== 10) fail();
+    let intent;
+    try { intent = JSON.parse(bytes.toString("utf8")); }
+    catch (_) { fail(); }
+    strict(intent, INTENT_FIELDS);
+    const { signature, ...body } = intent;
+    if (typeof signature !== "string" || !/^[A-Za-z0-9_-]{86}$/.test(signature)
+      || JSON.stringify(intent) + "\n" !== bytes.toString("utf8")
+      || intent.type !== "rootark-zk1-cas-terminal-intent/v1"
+      || intent.keyId !== this.identity.keyId || intent.reservation !== base64(query.reservation_id)
+      || intent.scope !== scopeKey(query)
+      || !["committed", "not-committed-final"].includes(intent.status)) fail();
+    const signatureBytes = Buffer.from(signature, "base64url");
+    if (signatureBytes.length !== 64 || base64(signatureBytes) !== signature
+      || !crypto.verify(null, Buffer.concat([INTENT_DOMAIN, Buffer.from(JSON.stringify(body))]),
+        this.publicKey, signatureBytes)) fail();
+    return intent;
+  }
+
+  assertIntent(query, signedTicket, status, manifestBytes) {
+    const existing = this.getIntent(query);
+    const expected = this.intentPayload(query, signedTicket, status, manifestBytes);
+    if (!existing || Object.entries(expected).some(([field, value]) => existing[field] !== value)) fail();
+    return true;
+  }
+
+  prepare(query, signedTicket, status, manifestBytes) {
+    const payload = this.intentPayload(query, signedTicket, status, manifestBytes);
+    if (this.getIntent(query)) return this.assertIntent(query, signedTicket, status, manifestBytes);
+    const intent = {
+      ...payload,
+      signature: base64(crypto.sign(null,
+        Buffer.concat([INTENT_DOMAIN, Buffer.from(JSON.stringify(payload))]), this.privateKey)),
+    };
+    const filename = this.intentPath(query);
+    // Never expose a partially-written intent at its authoritative name.
+    // Stage and fsync a private complete file, then create its permanent name
+    // with an atomic no-overwrite hardlink on the same local filesystem.
+    // A crash before linking leaves only an ignorable, non-authoritative temp.
+    const temporary = filename + ".stage-" + crypto.randomBytes(16).toString("hex");
+    let fd;
+    try {
+      fd = fs.openSync(temporary, "wx", 0o600);
+      fs.writeSync(fd, JSON.stringify(intent) + "\n");
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = undefined;
+      try {
+        fs.linkSync(temporary, filename);
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+        return this.assertIntent(query, signedTicket, status, manifestBytes);
+      }
+      // fsyncing a directory is supported on Unix; Windows does not expose
+      // that portability guarantee in Node, so keep failure closed on write.
+      if (process.platform !== "win32") {
+        const parentFd = fs.openSync(path.dirname(filename), "r");
+        try { fs.fsyncSync(parentFd); } finally { fs.closeSync(parentFd); }
+      }
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+      try { fs.unlinkSync(temporary); } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
+    return true;
+  }
+
+  assertMatch(query, signedTicket, status, manifestBytes, terminalSeal) {
+    const event = this.get(query.reservation_id);
+    if (!event || event.scope !== scopeKey(query) || event.status !== status
+      || event.ticketHash !== digest(signedTicket)
+      || event.manifestHash !== (manifestBytes === null ? null : digest(manifestBytes))
+      || event.terminalSeal !== base64(terminalSeal)) fail();
+    return true;
+  }
+
+  async append(query, signedTicket, status, manifestBytes, terminalSeal) {
+    this.assertIntent(query, signedTicket, status, manifestBytes);
+    // All live handles/processes must reload the signed journal under the
+    // same exclusive file-create lock before assigning a new sequence.
+    // Never delete a lock created by someone else; stale locks fail closed
+    // until independently verified operator recovery.
+    const lockPath = this.filename + ".append.lock";
+    let lock;
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      try {
+        lock = fs.openSync(lockPath, "wx", 0o600);
+        break;
+      } catch (error) {
+        if (error?.code !== "EEXIST") fail();
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+    if (lock === undefined) fail();
+    try {
+      this.reload(true);
+      const previous = this.records.get(base64(query.reservation_id));
+      if (previous) return this.assertMatch(query, signedTicket, status, manifestBytes, terminalSeal);
+      const record = {
+        sequence: this.sequence + 1, reservation: base64(query.reservation_id),
+        scope: scopeKey(query), status, ticketHash: digest(signedTicket),
+        manifestHash: manifestBytes === null ? null : digest(manifestBytes),
+        terminalSeal: base64(terminalSeal), previousHash: this.previousHash,
+      };
+      record.signature = base64(crypto.sign(null, signatureInput(record), this.privateKey));
+      this.verify(record);
+      const line = JSON.stringify(record);
+      const current = fs.statSync(this.filename);
+      if (current.size + Buffer.byteLength(line) + 1 > MAX_BYTES) fail();
+      const fd = fs.openSync(this.filename, "a");
+      try {
+        fs.writeSync(fd, line + "\n");
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
+      this.reload(true);
+      return true;
+    } finally {
+      fs.closeSync(lock);
+      fs.unlinkSync(lockPath);
+    }
+  }
+}
+
+module.exports = { Zk1CasTerminalAnchor };

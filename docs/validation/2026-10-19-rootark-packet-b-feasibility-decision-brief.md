@@ -1,6 +1,8 @@
 # Root.ark Packet B — Technical Feasibility Decision Brief
 
 **Status:** FEASIBILITY_PLAN_READY_FOR_OWNER_DECISIONS
+
+**Historical baseline notice (2026-10-20):** This decision brief reports the earlier planning state. Later owner-authorized local mock/PostgreSQL results are recorded in separate reports. The previously missing v1 wire `type` literals (including the additionally identified witness commit receipt) are now clarified in the normative Section 12.4 registry `docs/superpowers/specs/2026-10-20-rootark-zk1-v1-wire-type-registry.json`. Real provider selection and production remain unapproved.
 **Review scope:** Documentation and read-only technical/pricing research. No runtime code, tests, packages, cloud resources, credentials, production data, migrations, or external state were changed.
 **Repository baseline:** ad2373b2a71feec6bb201f627038d93d12196047, branch cdx/rootark-dual-recovery-20261019.
 **Packet B source examined:** Corrected provider-neutral spec at that baseline; the previously reviewed Packet B SHA is aa19c72f831cd9e847b6d37b15f840a008c0901a.

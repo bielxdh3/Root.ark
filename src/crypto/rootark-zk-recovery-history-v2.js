@@ -342,14 +342,17 @@ async function verifyRecoveryHistoryInternal(input, mode) {
     if (firstEnvelopeBytes) {
       const firstEnvelope = await parseEnvelopeHeader(firstEnvelopeBytes, scope);
       packageId = Buffer.from(firstEnvelope.package_id);
-      if (u64(firstEnvelope.base_revision, 1n) !== u64(baseManifest.revision, 1n)
-        || !sameBytes(firstEnvelope.base_manifest_digest, baseDigest)) fail("INVALID_RECOVERY_PACKAGE");
+      // The user-selected package may activate AFTER enrollment or another
+      // signed transition. Its predecessor is checked at that actual
+      // activation below, never assumed to equal the initial base manifest.
       if (!envelopeBytesByRevision.has(Number(firstEnvelope.activation_revision))) {
         envelopeBytesByRevision.set(Number(firstEnvelope.activation_revision), firstEnvelopeBytes);
       } else if (!sameBytes(envelopeBytesByRevision.get(Number(firstEnvelope.activation_revision)), firstEnvelopeBytes)) {
         fail("INVALID_RECOVERY_PACKAGE");
       }
     }
+    let firstEnvelopeUsed = false;
+    let verifiedPackageActivations = 0;
 
     for (let index = 0; index < input.transitions.length; index += 1) {
       const entryBytes = bytes(input.transitions[index], undefined, 1, MAX_ENTRY_BYTES);
@@ -379,14 +382,19 @@ async function verifyRecoveryHistoryInternal(input, mode) {
       const activatesPackage = nextAuthority?.status === "active"
         && (!previousAuthority || previousAuthority.status !== "active"
           || !sameBytes(previousAuthority.package_id, nextAuthority.package_id));
-      if (activatesPackage && firstEnvelopeBytes) {
+      if (activatesPackage) {
         const activationRevision = Number(u64(nextAuthority.activation_revision, 1n));
         const envelopeBytes = envelopeBytesByRevision.get(activationRevision);
-        if (!envelopeBytes) fail("INVALID_RECOVERY_PACKAGE");
-        await packageV1.verifyRecoveryPackageActivation({ publicTransitionProof: publicProof, envelopeBytes });
-        if (index === 0 && (!firstEnvelopeBytes || !sameBytes(firstEnvelopeBytes, envelopeBytes))) fail("INVALID_RECOVERY_PACKAGE");
-      } else if (index === 0 && firstEnvelopeBytes && !activatesPackage) {
-        fail("INVALID_RECOVERY_PACKAGE");
+        if (!envelopeBytes && (mode === "public" || firstEnvelopeBytes || envelopeBytesByRevision.size)) {
+          fail("INVALID_RECOVERY_PACKAGE");
+        }
+        if (envelopeBytes) {
+          // This checks the actual previous signed manifest revision/digest,
+          // package ID, operation ID, activation revision and envelope hash.
+          await packageV1.verifyRecoveryPackageActivation({ publicTransitionProof: publicProof, envelopeBytes });
+          verifiedPackageActivations += 1;
+          if (firstEnvelopeBytes && sameBytes(firstEnvelopeBytes, envelopeBytes)) firstEnvelopeUsed = true;
+        }
       }
 
       const nextEpoch = Number(u64(nextManifest.current_epoch, 1n));
@@ -418,6 +426,10 @@ async function verifyRecoveryHistoryInternal(input, mode) {
       }
       headManifest = nextManifest;
       usedIdentifiers = new Set(publicProof.identifiers);
+    }
+    if ((firstEnvelopeBytes && !firstEnvelopeUsed)
+      || envelopeBytesByRevision.size !== verifiedPackageActivations) {
+      fail("INVALID_RECOVERY_PACKAGE");
     }
 
     if (epochKeys && epochKeys.size !== Number(u64(headManifest.current_epoch, 1n))) {
@@ -451,7 +463,7 @@ async function verifyRecoveryHistoryInternal(input, mode) {
       maxBytes: MAX_HISTORY_BYTES,
       maxEntryBytes: MAX_ENTRY_BYTES,
       packageAuthorityStatus,
-      packageEnvelopeBound: firstEnvelopeBytes !== null,
+      packageEnvelopeBound: firstEnvelopeUsed || verifiedPackageActivations > 0,
       freshnessProven: false,
       ...(epochKeys ? { epochKeys: keysThrough(epochKeys, Number(u64(headManifest.current_epoch, 1n))) } : {}),
     });
