@@ -22,14 +22,14 @@ async function verifyZk1SharedPgRuntimePool(pool) {
       session_user AS session_identity, current_user AS active_identity,
       r.rolcanlogin AS can_login, r.rolsuper AS is_superuser,
       r.rolcreatedb AS can_create_db, r.rolcreaterole AS can_create_role,
-      pg_has_role(current_user, 'zk1_gate_runtime', 'USAGE') AS gate_access,
-      has_schema_privilege(current_user,'zk1_gate','USAGE') AS schema_access,
-      has_schema_privilege(current_user,'zk1_gate','CREATE') AS schema_create,
-      has_column_privilege(current_user,'zk1_gate.head','revision','UPDATE') AS can_change_revision,
-      has_column_privilege(current_user,'zk1_gate.head','phase','UPDATE') AS can_change_phase,
-      has_table_privilege(current_user,'zk1_gate.ciphertext_chunk','DELETE') AS can_delete_ciphertext,
-      has_table_privilege(current_user,'zk1_gate.ciphertext_chunk','TRUNCATE') AS can_truncate_ciphertext
-      FROM pg_roles AS r WHERE r.rolname=current_user`);
+      pg_catalog.pg_has_role(current_user, 'zk1_gate_runtime', 'USAGE') AS gate_access,
+      pg_catalog.has_schema_privilege(current_user,'zk1_gate','USAGE') AS schema_access,
+      pg_catalog.has_schema_privilege(current_user,'zk1_gate','CREATE') AS schema_create,
+      pg_catalog.has_column_privilege(current_user,'zk1_gate.head','revision','UPDATE') AS can_change_revision,
+      pg_catalog.has_column_privilege(current_user,'zk1_gate.head','phase','UPDATE') AS can_change_phase,
+      pg_catalog.has_table_privilege(current_user,'zk1_gate.ciphertext_chunk','DELETE') AS can_delete_ciphertext,
+      pg_catalog.has_table_privilege(current_user,'zk1_gate.ciphertext_chunk','TRUNCATE') AS can_truncate_ciphertext
+      FROM pg_catalog.pg_roles AS r WHERE r.rolname=current_user`);
     const x = result.rows?.[0];
     if (result.rowCount !== 1 || !x || x.session_identity !== x.active_identity
       || x.active_identity === "zk1_gate_runtime" || x.can_login !== true

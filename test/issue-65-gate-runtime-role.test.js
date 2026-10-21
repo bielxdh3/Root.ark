@@ -23,6 +23,19 @@ test("real dedicated PG login uses shared gate without superuser privileges or d
   await assert.rejects(createIsolatedZk1SharedPgGateServer({ pool: admin }),
     /ZK_GATE_RUNTIME_IDENTITY_INVALID/,
   "no listener may be created when database identity is privileged");
+  // A PostgreSQL connection can shadow unqualified pg_roles with a TEMP
+  // relation; startup checks must consult pg_catalog, never a session path.
+  const shadowed = new Pool({ connectionString: adminUrl, max: 1, connectionTimeoutMillis: 3000 });
+  t.after(async () => shadowed.end());
+  const forged = await shadowed.connect();
+  try {
+    await forged.query("CREATE TEMP TABLE pg_roles AS SELECT * FROM pg_catalog.pg_roles WHERE rolname=current_user");
+    await forged.query("UPDATE pg_roles SET rolsuper=false, rolcreatedb=false, rolcreaterole=false");
+    await forged.query("SET search_path=pg_temp,public,pg_catalog");
+  } finally { forged.release(); }
+  await assert.rejects(verifyZk1SharedPgRuntimePool(shadowed),
+    /ZK_GATE_RUNTIME_IDENTITY_INVALID/,
+  "forged pg_temp.pg_roles must not make a superuser appear to be a trusted gate runtime");
   const identity = await verifyZk1SharedPgRuntimePool(restricted);
   assert.equal(identity.verified, true);
   assert.match(identity.runtimeRole, /^zkgatefixture_[0-9a-f]{12}$/);
