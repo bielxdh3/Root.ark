@@ -120,6 +120,7 @@ async function main() {
     "test/issue-65-shared-pg-sealed-object.test.js",
     "test/issue-65-unsealed-sql-fence.test.js",
     "test/issue-65-chunk-writer-role.test.js",
+    "test/issue-65-browser-pg-ciphertext-seal-interop.test.js",
     "test/issue-65-pg-sealed-sink.test.js",
     "test/issue-65-stop-recorder-postgres.test.js",
     "test/issue-65-strict-stop-operator-postgres.test.js",
