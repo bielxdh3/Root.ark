@@ -14,6 +14,7 @@ const { createZk1WitnessHttpsClient } = require("../src/services/zk1WitnessHttps
 const { createZk1CasManifestHttpsClient } = require("../src/services/zk1CasManifestHttpsClient");
 const { createZk1CasWriteHttpsClient } = require("../src/services/zk1CasWriteHttpsClient");
 const { createZk1CasStatusHttpsClient } = require("../src/services/zk1CasStatusHttpsClient");
+const { createZk1SharedPgGateHttpsClient } = require("../src/services/zk1SharedPgGateHttpsClient");
 
 function certificates(dir) {
   const cmds = [
@@ -205,4 +206,76 @@ test("pinned CAS responses and paginated history cannot monopolize verification 
   assert.equal(trustedTransportOnly.entries.length, 8,
     "the same eight syntactically valid pages must succeed given a sufficient total deadline");
   assert.equal(trustedTransportOnly.headRevision, 8);
+});
+
+test("mTLS PostgreSQL gate refuses a pinned peer trickling admission bytes indefinitely", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-pg-gate-deadline-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10 }));
+  const tls = certificates(dir);
+  let chunksSent = 0;
+  let requests = 0;
+  const sockets = new Set();
+  const server = https.createServer({ key: tls.key, cert: tls.cert, ca: tls.ca,
+    requestCert: true, rejectUnauthorized: true }, (request, response) => {
+    request.resume();
+    request.on("end", () => {
+      requests++;
+      if (requests === 2) {
+        response.writeHead(201, { "content-type": "application/json" });
+        response.end(JSON.stringify({ admissionId: crypto.randomBytes(16).toString("base64url"),
+          generation: 1, proceed: true }));
+        return;
+      }
+      response.writeHead(201, { "content-type": "application/json" });
+      response.write(" ");
+      chunksSent++;
+      const timer = setInterval(() => {
+        if (response.destroyed) return;
+        response.write(" ");
+        chunksSent++;
+      }, 25);
+      response.once("close", () => clearInterval(timer));
+    });
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  await new Promise((resolve) => server.listen(0, "localhost", resolve));
+  t.after(async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const client = createZk1SharedPgGateHttpsClient({
+    endpoint: `https://localhost:${server.address().port}`,
+    ca: tls.ca, clientKey: tls.clientKey, clientCert: tls.clientCert,
+    serverFingerprint256: new crypto.X509Certificate(tls.cert).fingerprint256,
+    timeoutMs: 160,
+  });
+  const admission = {
+    scope: { account_id: crypto.randomBytes(16),
+      compartment_id: crypto.randomBytes(12), keyring_id: crypto.randomBytes(16) },
+    workerId: crypto.randomBytes(16), action: "put",
+    objectId: crypto.randomBytes(16).toString("base64url"),
+    revision: 1, digest: crypto.randomBytes(32),
+  };
+  const request = client.beginIoAdmission(admission);
+  let watchdog;
+  const outcome = await Promise.race([
+    request.then(() => "unexpected-success", (error) => error.code),
+    new Promise((resolve) => {
+      watchdog = setTimeout(() => resolve("still-pending"), 650);
+    }),
+  ]);
+  clearTimeout(watchdog);
+  assert.equal(outcome, "ZK_GATE_TRANSPORT_UNAVAILABLE",
+    "slow trickling a valid mTLS response cannot keep gate admission occupied indefinitely");
+  assert.ok(chunksSent >= 2,
+    "fixture must stream multiple authenticated chunks before hard timeout");
+  const recovered = await client.beginIoAdmission(admission);
+  assert.equal(recovered.proceed, true,
+    "next independent mTLS admission must succeed after the stalled socket is destroyed");
+  assert.equal(recovered.generation, 1);
+  assert.equal(recovered.admissionId.length, 16);
+  assert.equal(requests, 2);
 });

@@ -65,14 +65,14 @@ function operation(input, pending) {
 }
 
 function createZk1SharedPgGateHttpsClient({ endpoint, ca, clientKey, clientCert,
-  serverFingerprint256, timeoutMs = 3000 } = {}) {
+  serverFingerprint256, timeoutMs = 15000 } = {}) {
   let url;
   try { url = new URL(endpoint); } catch (_) { unavailable(); }
   if (url.protocol !== "https:" || !url.hostname || !url.port
     || url.username || url.password || url.search || url.hash
     || !["", "/"].includes(url.pathname)
     || !ca || !clientKey || !clientCert || !FINGERPRINT.test(serverFingerprint256)
-    || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 10000) unavailable();
+    || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30000) unavailable();
   const pin = serverFingerprint256.toUpperCase();
 
   function send(path, body, fields, expectedStatus = 200) {
@@ -81,14 +81,18 @@ function createZk1SharedPgGateHttpsClient({ endpoint, ca, clientKey, clientCert,
     if (payload.length > 6 * 1024 * 1024 || payload.length < 1) unavailable();
     return new Promise((resolve, reject) => {
       let done = false;
+      let wallTimer;
+      let request;
       const fail = () => {
         if (done) return;
         done = true;
+        clearTimeout(wallTimer);
+        request?.destroy();
         const error = new Error("ZK_GATE_TRANSPORT_UNAVAILABLE");
         error.code = "ZK_GATE_TRANSPORT_UNAVAILABLE";
         reject(error);
       };
-      const request = https.request({ hostname: url.hostname, port: url.port,
+      request = https.request({ hostname: url.hostname, port: url.port,
         path, method: "POST", ca, key: clientKey, cert: clientCert,
         // A shared https.globalAgent can reuse a TLS socket authenticated
         // under ANOTHER client's pin, skipping checkServerIdentity entirely.
@@ -125,12 +129,18 @@ function createZk1SharedPgGateHttpsClient({ endpoint, ca, clientKey, clientCert,
             const result = JSON.parse(Buffer.concat(chunks).toString("utf8"));
             exact(result, fields);
             done = true;
+            clearTimeout(wallTimer);
             resolve(result);
           } catch (_) { fail(); }
         });
       });
+      // Node HTTPS timeout is a socket-IDLE timer: an authenticated peer
+      // sending one byte at a time can keep a gate operation pending forever.
+      // A separate hard deadline bounds the entire mTLS request/response,
+      // including TLS handshake, chunk streams and response parsing.
+      wallTimer = setTimeout(fail, timeoutMs);
       request.on("error", fail);
-      request.on("timeout", () => request.destroy());
+      request.on("timeout", fail);
       request.end(payload);
     });
   }
