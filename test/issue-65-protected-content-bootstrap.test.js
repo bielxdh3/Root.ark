@@ -203,6 +203,20 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
   assert.equal(typeof objects.at(-1).verifiedHistoryProvider, "function");
   assert.equal(objects.at(-1).signedHistoryGenesisDigest.toString("hex"),
     signedGenesisDigest.toString("hex"));
+  const tuned = { ...v2Data,
+    contentDbPath: path.join(dir, "strict-slow-link-history.sqlite"),
+    cas: { ...v2Data.cas, timeoutMs: 22000, historyDeadlineMs: 180000 } };
+  for (const [field, value] of [["timeoutMs", 30001],
+    ["historyDeadlineMs", 300001], ["timeoutMs", 0],
+    ["historyDeadlineMs", "180000"]]) {
+    assert.throws(() => configure({ ...tuned, cas: { ...tuned.cas, [field]: value } }),
+      /ZK_CONTENT_BOOTSTRAP_INVALID/,
+      "unbounded or mistyped CAS hard deadlines must fail before SQLite creation");
+  }
+  assert.equal(fs.existsSync(tuned.contentDbPath), false);
+  configure(tuned);
+  assert.equal(objects.at(-1).signedHistoryRequired, true,
+    "strict development opt-in must accept bounded CAS deadline tuning");
   const app = configure(data);
   const listener = await new Promise((resolve) => {
     const server = app.listen(0, "127.0.0.1", () => resolve(server));

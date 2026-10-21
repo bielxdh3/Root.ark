@@ -19,6 +19,9 @@ const PIN = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
 const WITNESS_FIELDS = ["endpoint", "caPath", "clientKeyPath", "clientCertPath",
   "serverFingerprint256", "signingKeyId", "signingPublicKeyPath"];
 const CAS_FIELDS = WITNESS_FIELDS.slice(0, 5);
+const CAS_DEADLINE_LIMITS = Object.freeze({
+  timeoutMs: [100, 30000], historyDeadlineMs: [100, 300000],
+});
 const SIGNED_HISTORY_FIELDS = ["genesisDigest", "baseReceiptPath",
   "baseWitnessKeyId", "baseWitnessPublicKeyPath", "packageEnvelopes"];
 const BASE_RECEIPT_FIELDS = ["type", "witness_key_id", "account_id",
@@ -55,14 +58,24 @@ function readFile(filename, max = 65536) {
   return fs.readFileSync(input);
 }
 function endpoint(config, witness) {
-  exact(config, witness ? WITNESS_FIELDS : CAS_FIELDS);
+  const tunedFields = witness ? [] : Object.keys(CAS_DEADLINE_LIMITS)
+    .filter((field) => Object.hasOwn(config || {}, field));
+  exact(config, witness ? WITNESS_FIELDS : [...CAS_FIELDS, ...tunedFields]);
   if (!PIN.test(config.serverFingerprint256)) fail();
+  const tuning = {};
+  for (const field of tunedFields) {
+    const value = config[field];
+    const [min, max] = CAS_DEADLINE_LIMITS[field];
+    if (!Number.isSafeInteger(value) || value < min || value > max) fail();
+    tuning[field] = value;
+  }
   return {
     endpoint: config.endpoint,
     ca: readFile(config.caPath),
     clientKey: readFile(config.clientKeyPath),
     clientCert: readFile(config.clientCertPath),
     serverFingerprint256: config.serverFingerprint256,
+    ...tuning,
   };
 }
 function clientTlsIdentity(settings) {

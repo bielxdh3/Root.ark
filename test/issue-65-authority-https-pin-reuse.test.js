@@ -115,3 +115,94 @@ test("every zk1 authority transport enforces its own TLS pin after previous same
     shared.destroy();
   }
 });
+
+test("pinned CAS responses and paginated history cannot monopolize verification with slow trickle", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cas-deadline-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10 }));
+  const tls = certificates(dir);
+  const headDigest = crypto.randomBytes(32).toString("base64url");
+  let completedHistoryPages = 0;
+  let trickleChunks = 0;
+  const sockets = new Set();
+  const server = https.createServer({ key: tls.key, cert: tls.cert, ca: tls.ca,
+    requestCert: true, rejectUnauthorized: true }, (request, response) => {
+    let payload = "";
+    request.on("data", (part) => { payload += part; });
+    request.on("end", () => {
+      response.writeHead(200, { "content-type": "application/json" });
+      if (request.url === "/v1/manifest") {
+        response.write(" ");
+        trickleChunks++;
+        const interval = setInterval(() => {
+          if (!response.destroyed) {
+            response.write(" ");
+            trickleChunks++;
+          }
+        }, 25);
+        response.once("close", () => clearInterval(interval));
+        return;
+      }
+      const startRevision = JSON.parse(payload).startRevision;
+      const timeout = setTimeout(() => {
+        if (!response.destroyed) {
+          response.end(JSON.stringify({
+            headRevision: 8, headDigest, startRevision,
+            nextRevision: startRevision === 8 ? null : startRevision + 1,
+            entriesBase64: [Buffer.from("x").toString("base64url")],
+          }));
+          completedHistoryPages++;
+        }
+      }, 110);
+      response.once("close", () => clearTimeout(timeout));
+    });
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  await new Promise((resolve) => server.listen(0, "localhost", resolve));
+  t.after(async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const client = createZk1CasManifestHttpsClient({
+    endpoint: `https://localhost:${server.address().port}/v1/manifest`,
+    ca: tls.ca, clientKey: tls.clientKey, clientCert: tls.clientCert,
+    serverFingerprint256: new crypto.X509Certificate(tls.cert).fingerprint256,
+    timeoutMs: 150, historyDeadlineMs: 350,
+  });
+  const scope = { account_id: crypto.randomBytes(16),
+    compartment_id: crypto.randomBytes(8), keyring_id: crypto.randomBytes(16) };
+  const trickle = client.getCommittedManifest({ scope });
+  let watchdog;
+  const settled = await Promise.race([
+    trickle.then(() => "unexpected-success", () => "denied"),
+    new Promise((resolve) => { watchdog = setTimeout(() => resolve("still-pending"), 500); }),
+  ]);
+  clearTimeout(watchdog);
+  assert.equal(settled, "denied",
+    "a pinned CAS sending a trickle forever must hit an absolute response deadline");
+  assert.ok(trickleChunks >= 2,
+    "a real pinned peer must have kept sending data before its wall deadline");
+  const boundedHistory = createZk1CasManifestHttpsClient({
+    endpoint: `https://localhost:${server.address().port}/v1/manifest`,
+    ca: tls.ca, clientKey: tls.clientKey, clientCert: tls.clientCert,
+    serverFingerprint256: new crypto.X509Certificate(tls.cert).fingerprint256,
+    timeoutMs: 400, historyDeadlineMs: 550,
+  });
+  await assert.rejects(boundedHistory.getCommittedHistory({ scope }),
+    /CAS_MANIFEST_TRANSPORT_UNAVAILABLE/,
+    "many individually timely history pages must not exceed the chain-wide deadline");
+  assert.ok(completedHistoryPages >= 2 && completedHistoryPages < 8,
+    "the test must serve several valid timed pages, then reject the whole chain before completion");
+  const relaxed = createZk1CasManifestHttpsClient({
+    endpoint: `https://localhost:${server.address().port}/v1/manifest`,
+    ca: tls.ca, clientKey: tls.clientKey, clientCert: tls.clientCert,
+    serverFingerprint256: new crypto.X509Certificate(tls.cert).fingerprint256,
+    timeoutMs: 400, historyDeadlineMs: 3000,
+  });
+  const trustedTransportOnly = await relaxed.getCommittedHistory({ scope });
+  assert.equal(trustedTransportOnly.entries.length, 8,
+    "the same eight syntactically valid pages must succeed given a sufficient total deadline");
+  assert.equal(trustedTransportOnly.headRevision, 8);
+});

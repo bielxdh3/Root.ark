@@ -4,6 +4,7 @@
 // UNTRUSTED until reconciled with the separately signed fresh witness head.
 const https = require("node:https");
 const tls = require("node:tls");
+const { performance } = require("node:perf_hooks");
 
 const PIN = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
 const B64 = /^[A-Za-z0-9_-]+$/;
@@ -25,16 +26,19 @@ function exact(value, names) {
     || Reflect.ownKeys(value).some((name) => !names.includes(name))) fail();
 }
 function createZk1CasManifestHttpsClient({
-  endpoint, ca, clientKey, clientCert, serverFingerprint256, timeoutMs = 3000,
+  endpoint, ca, clientKey, clientCert, serverFingerprint256, timeoutMs = 15000,
+  historyDeadlineMs = 120000,
 } = {}) {
   let url;
   try { url = new URL(endpoint); } catch (_) { fail(); }
   if (url.protocol !== "https:" || !url.hostname || !url.port
     || url.pathname !== "/v1/manifest" || url.username || url.password || url.search || url.hash
     || !ca || !clientKey || !clientCert || !PIN.test(serverFingerprint256)
-    || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 10000) fail();
+    || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30000
+    || !Number.isSafeInteger(historyDeadlineMs)
+    || historyDeadlineMs < 100 || historyDeadlineMs > 300000) fail();
   const pin = serverFingerprint256.toUpperCase();
-  function fetchResource(scope, startRevision) {
+  function fetchResource(scope, startRevision, absoluteDeadline) {
       const history = startRevision !== undefined;
       if (history && (!Number.isSafeInteger(startRevision)
         || startRevision < 1 || startRevision > 4097)) fail();
@@ -44,12 +48,32 @@ function createZk1CasManifestHttpsClient({
         compartment_id: bytes(scope.compartment_id, 1, 128),
         keyring_id: bytes(scope.keyring_id, 16),
       }, ...(history ? { startRevision } : {}) }));
+      // https.request's socket timeout is an IDLE timeout: receiving one byte
+      // before each interval can keep it alive forever. Bound real elapsed
+      // time and share a monotonic deadline across sequential history pages.
+      const remaining = absoluteDeadline === undefined
+        ? timeoutMs : Math.floor(absoluteDeadline - performance.now());
+      if (!Number.isSafeInteger(remaining) || remaining <= 0) fail();
+      const wallTimeout = Math.min(timeoutMs, remaining);
       return new Promise((resolve, reject) => {
         let completed = false;
+        let request;
+        let wallTimer;
         const unavailable = () => {
-          if (!completed) { completed = true; reject(new Error("CAS_MANIFEST_TRANSPORT_UNAVAILABLE")); }
+          if (!completed) {
+            completed = true;
+            clearTimeout(wallTimer);
+            request?.destroy();
+            reject(new Error("CAS_MANIFEST_TRANSPORT_UNAVAILABLE"));
+          }
         };
-        const request = https.request({
+        const complete = (value) => {
+          if (completed) return;
+          completed = true;
+          clearTimeout(wallTimer);
+          resolve(value);
+        };
+        request = https.request({
           hostname: url.hostname, port: url.port, method: "POST",
           path: history ? "/v1/history" : url.pathname,
           agent: false, // do not reuse a socket authenticated under another TLS pin
@@ -63,7 +87,7 @@ function createZk1CasManifestHttpsClient({
             }
             return undefined;
           },
-          timeout: timeoutMs,
+          timeout: wallTimeout,
           headers: { "content-type": "application/json", "accept": "application/json",
             "content-length": String(body.byteLength) },
         }, (response) => {
@@ -115,8 +139,7 @@ function createZk1CasManifestHttpsClient({
                 if (end > result.headRevision
                   || (result.nextRevision === null) !== (end === result.headRevision)
                   || (result.nextRevision !== null && result.nextRevision !== end + 1)) fail();
-                completed = true;
-                resolve({ headRevision: result.headRevision, headDigest,
+                complete({ headRevision: result.headRevision, headDigest,
                   startRevision, nextRevision: result.nextRevision, entries });
                 return;
               }
@@ -127,13 +150,13 @@ function createZk1CasManifestHttpsClient({
               const raw = Buffer.from(value, "base64url");
               if (raw.length < 1 || raw.length > 8 * 1024 * 1024
                 || raw.toString("base64url") !== value) fail();
-              completed = true;
-              resolve(raw);
+              complete(raw);
             } catch (_) { unavailable(); }
           });
           response.on("error", unavailable);
         });
-        request.on("timeout", () => request.destroy());
+        wallTimer = setTimeout(unavailable, wallTimeout);
+        request.on("timeout", unavailable);
         request.on("error", unavailable);
         request.end(body);
       });
@@ -161,8 +184,9 @@ function createZk1CasManifestHttpsClient({
       let headDigest;
       const entries = [];
       let total = 0;
+      const absoluteDeadline = performance.now() + historyDeadlineMs;
       for (let pageCount = 0; pageCount <= 4096; pageCount += 1) {
-        const page = await fetchResource(pinnedScope, startRevision);
+        const page = await fetchResource(pinnedScope, startRevision, absoluteDeadline);
         if (pageCount === 0) {
           headRevision = page.headRevision;
           headDigest = Buffer.from(page.headDigest);
