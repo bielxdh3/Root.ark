@@ -34,6 +34,7 @@ test("signed-history-required content denies forged approval and accepts ONLY in
   const liveSigner = crypto.generateKeyPairSync("ed25519");
   const liveKeyId = crypto.randomBytes(16);
   let witnessReads = 0;
+  let manifestReads = 0;
   const witnessProvider = {
     async freshHead({ nonce }) {
       witnessReads++;
@@ -59,7 +60,7 @@ test("signed-history-required content denies forged approval and accepts ONLY in
   const settings = {
     witnessProvider,
     witnessPinned: { keyId: liveKeyId, publicKey: liveSigner.publicKey },
-    manifestProvider: () => z.encodeDeterministic(manifest),
+    manifestProvider: () => { manifestReads++; return z.encodeDeterministic(manifest); },
     trustedScope: scope, minimumHead: floor, nowSeconds: () => clock,
     signedHistoryRequired: true,
     signedHistoryGenesisDigest: floor.digest,
@@ -144,12 +145,15 @@ test("signed-history-required content denies forged approval and accepts ONLY in
   };
   const providerBeforeUnbound = expensiveHistoryFetches;
   const witnessBeforeUnbound = witnessReads;
+  const manifestBeforeUnbound = manifestReads;
   await assert.rejects(store.get(await makeRead(true)), /ZK_CONTENT_DENIED/,
     "owner-rooted mode must not trust mutable SQLite latest without a signed revision and ciphertext digest");
   assert.equal(expensiveHistoryFetches, providerBeforeUnbound,
     "unbound latest GET must fail before expensive owner-history verification");
   assert.equal(witnessReads, witnessBeforeUnbound,
     "unbound latest GET must fail before sending a witness network request");
+  assert.equal(manifestReads, manifestBeforeUnbound,
+    "unbound latest GET must fail before fetching an untrusted CAS manifest");
   assert.deepEqual((await store.get(await makeRead())).ciphertext, data,
     "signed exact revision and original digest still permit authentic historical GET");
   const originalProvider = store.verifiedHistoryProvider;
