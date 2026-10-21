@@ -304,6 +304,10 @@ class Zk1ProtectedObjectStore {
       + "FROM zk_content_version WHERE scope=? AND id=? AND revision=?");
     this.getLatestVersion = this.db.prepare("SELECT revision,epoch,ciphertext,ciphertext_digest "
       + "FROM zk_content_version WHERE scope=? AND id=? ORDER BY revision DESC LIMIT 1");
+    this.getVersionSpan = this.db.prepare(`SELECT COUNT(*) AS count,
+      MIN(revision) AS first, MAX(revision) AS last,
+      SUM(CASE WHEN typeof(revision)='integer' THEN 0 ELSE 1 END) AS malformed
+      FROM zk_content_version WHERE scope=? AND id=?`);
     this.nonceCount = this.db.prepare("SELECT COUNT(*) AS n FROM zk_content_nonce WHERE scope=?");
     this.objectCount = this.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object WHERE scope=?");
     this.clockRow = this.db.prepare("SELECT last_at FROM zk_content_clock WHERE scope=?");
@@ -478,6 +482,15 @@ class Zk1ProtectedObjectStore {
       const tail = this.getLatestVersion.get(key, request.object_id);
       if (Boolean(row) !== Boolean(tail)) fail("ZK_CONTENT_VERSION_HISTORY_CORRUPT");
       if (row) {
+        // Under the unique (scope,id,revision) index, N distinct positive
+        // integer revisions with min=1/max=N form exactly the full sequence.
+        // Check this on each live effect so removal of an older archive row
+        // cannot evade the latest-projection/tail parity check until restart.
+        const span = this.getVersionSpan.get(key, request.object_id);
+        if (span.count !== row.revision || span.first !== 1
+          || span.last !== row.revision || span.malformed !== 0) {
+          fail("ZK_CONTENT_VERSION_HISTORY_CORRUPT");
+        }
         // The mutable current projection is only an index; immutable version
         // rows are the source of truth. A compromised local SQLite writer may
         // alter/rewind/delete the projection after startup. Compare against

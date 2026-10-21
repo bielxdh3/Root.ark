@@ -181,6 +181,49 @@ test("protected local PUT archives ciphertext revisions atomically and never rep
   assert.equal((await store.put(third)).revision, 3,
     "failed transaction must not consume nonce or poison a safe exact retry");
   assert.equal(revisions().length, 3);
+  // Adversarial live SQLite tampering: a privileged local writer can drop an
+  // immutability trigger and erase a non-tail revision while the latest
+  // projection and archive tail still agree. Ordinary reads/writes must
+  // reject the missing history BEFORE the next process restart.
+  store.db.exec("DROP TRIGGER zk_content_version_no_delete");
+  store.db.prepare("DELETE FROM zk_content_version WHERE id=? AND revision=1")
+    .run(objectId);
+  await assert.rejects(store.get(await latestRead()),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT/,
+    "live latest GET must detect an erased historical ciphertext revision");
+  await assert.rejects(store.put(await signed(rand(330), 3)),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT/,
+    "live PUT must never build on a truncated ciphertext version history");
+  store.db.prepare(`INSERT INTO zk_content_version
+    (scope,id,revision,epoch,ciphertext,ciphertext_digest,provenance)
+    VALUES(?,?,?,?,?,?,'transactional')`).run(currentScope, objectId, 1,
+    manifest.current_epoch, firstBytes,
+    crypto.createHash("sha256").update(firstBytes).digest());
+  // INTEGER affinity is not a STRICT type constraint in SQLite. A forged
+  // fractional revision can retain COUNT=3/MIN=1/MAX=3 while rev2 is absent.
+  store.db.prepare("DELETE FROM zk_content_version WHERE id=? AND revision=2")
+    .run(objectId);
+  store.db.prepare(`INSERT INTO zk_content_version
+    (scope,id,revision,epoch,ciphertext,ciphertext_digest,provenance)
+    VALUES(?,?,?,?,?,?,'transactional')`).run(currentScope, objectId, 1.5,
+    manifest.current_epoch, secondBytes,
+    crypto.createHash("sha256").update(secondBytes).digest());
+  assert.equal(store.db.prepare("SELECT typeof(revision) AS type FROM zk_content_version "
+    + "WHERE id=? AND revision=1.5").get(objectId).type, "real");
+  await assert.rejects(store.get(await latestRead()),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT/,
+    "fractional archive revision must not disguise a missing version");
+  store.db.prepare("DELETE FROM zk_content_version WHERE id=? AND revision=1.5")
+    .run(objectId);
+  store.db.prepare(`INSERT INTO zk_content_version
+    (scope,id,revision,epoch,ciphertext,ciphertext_digest,provenance)
+    VALUES(?,?,?,?,?,?,'transactional')`).run(currentScope, objectId, 2,
+    manifest.current_epoch, secondBytes,
+    crypto.createHash("sha256").update(secondBytes).digest());
+  store.db.exec(`CREATE TRIGGER zk_content_version_no_delete
+    BEFORE DELETE ON zk_content_version
+    BEGIN SELECT RAISE(ABORT,'ZK_CONTENT_VERSION_IMMUTABLE'); END`);
+  assert.deepEqual((await store.get(await latestRead())).ciphertext, third.ciphertext);
   // Intentional corruption of this disposable fixture, not customer data.
   // An attacker with direct file access can drop SQLite triggers; the next
   // startup must detect a corrupted historical digest and refuse future I/O.
