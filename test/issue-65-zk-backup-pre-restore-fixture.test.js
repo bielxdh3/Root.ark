@@ -1,0 +1,231 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { inspectZk1DisposableBackupPreRestore } = require("../src/services/zk1DisposableBackupPreRestore");
+
+const sha = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
+const encode = (value) => JSON.stringify(value);
+const version = (id) => Buffer.from([0x00, 0x83, 0xac, 0x67, 0x91, id.charCodeAt(1), 0x00, 0xff, 0x2b, 0x73, 0xe4, 0x8f, 0xb2, 0x12, 0xdf, 0x8e]);
+
+function fixture(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-backup-fixture-"));
+  t.after(() => fs.rmSync(dir, { force: true, recursive: true }));
+  for (const folder of ["versions", "copies", "envelopes"]) fs.mkdirSync(path.join(dir, folder));
+  fs.writeFileSync(path.join(dir, ".rootark-disposable-fixture"), "rootark-zk-backup-fixture-v1\n");
+  const records = [];
+  for (const [index, id] of ["vone", "vtwo"].entries()) {
+    const content = version(id);
+    const owner = Buffer.from(`\u0002fixture-owner-envelope-${id}\u00ff`, "utf8");
+    const recovery = Buffer.from(`\u0003fixture-recovery-envelope-${id}\u00fc`, "utf8");
+    fs.writeFileSync(path.join(dir, "versions", `${id}.ct`), content);
+    fs.writeFileSync(path.join(dir, "copies", `copy${id}.ct`), content);
+    fs.writeFileSync(path.join(dir, "envelopes", `own${id}.env`), owner);
+    fs.writeFileSync(path.join(dir, "envelopes", `rec${id}.env`), recovery);
+    records.push({ versionId: id, sequence: index + 1, parentVersionId: index ? "vone" : null,
+      ciphertextSha256: sha(content), copyId: `copy${id}`,
+      ownerEnvelopeId: `own${id}`, ownerEnvelopeSha256: sha(owner),
+      recoveryEnvelopeId: `rec${id}`, recoveryEnvelopeSha256: sha(recovery) });
+  }
+  const manifest = { schema: "rootark-zk1-backup-pre-restore-fixture/v1", backupId: "backupone",
+    compartmentId: "compartmentone", epoch: 4, revision: 7,
+    objects: [{ objectId: "objectone", versions: records }] };
+  const persist = () => {
+    fs.writeFileSync(path.join(dir, "manifest.json"), encode(manifest));
+    const index = { schema: "rootark-zk1-backup-index-fixture/v1",
+      backupId: manifest.backupId, manifestSha256: sha(Buffer.from(encode(manifest))),
+      versionIds: ["vone", "vtwo"], copyIds: ["copyvone", "copyvtwo"],
+      envelopeIds: ["ownvone", "recvone", "ownvtwo", "recvtwo"] };
+    fs.writeFileSync(path.join(dir, "backup-index.json"), encode(index));
+  };
+  persist();
+  const options = { fixtureDir: dir, expectedCompartmentId: "compartmentone",
+    checkpoint: { epoch: 3, revision: 20 } };
+  return { dir, manifest, persist, options };
+}
+const inspect = (f, extras = {}) => inspectZk1DisposableBackupPreRestore({ ...f.options, ...extras });
+function blocked(report, finding) {
+  assert.equal(report.restoreAuthorized, false);
+  assert.equal(report.readOnly, true);
+  assert.equal(report.fixtureVerified, false);
+  assert.ok(report.findings.includes(finding), JSON.stringify(report.findings));
+}
+
+test("a fully referenced synthetic backup is independently hashed but can never authorize restore", (t) => {
+  const f = fixture(t);
+  const before = new Map();
+  for (const folder of [".", "versions", "copies", "envelopes"])
+    for (const name of fs.readdirSync(path.join(f.dir, folder))) {
+      const file = path.join(f.dir, folder, name);
+      if (fs.statSync(file).isFile()) before.set(file, [sha(fs.readFileSync(file)), fs.statSync(file).mtimeMs]);
+    }
+  const report = inspect(f);
+  assert.equal(report.fixtureVerified, true, JSON.stringify(report.findings));
+  assert.equal(report.restoreAuthorized, false);
+  assert.equal(report.readOnly, true);
+  assert.deepEqual(report.findings, []);
+  assert.equal(report.checkedVersions, 2);
+  assert.equal(report.checkedCopies, 2);
+  assert.equal(report.checkedEnvelopes, 4);
+  assert.deepEqual(report.blockers, ["missing-trusted-cas-witness", "missing-owner-approved-recovery-policy",
+    "missing-authorized-client-decryption-proof", "missing-production-backup-restore-fence"]);
+  assert.equal(JSON.stringify(report).includes(f.dir), false);
+  for (const [file, state] of before) assert.deepEqual(
+    [sha(fs.readFileSync(file)), fs.statSync(file).mtimeMs], state);
+});
+
+test("stale epoch, replayed revision, wrong compartment and untrusted checkpoint are denied", (t) => {
+  const f = fixture(t);
+  blocked(inspect(f, { checkpoint: { epoch: 4, revision: 7 } }), "STALE_OR_REPLAYED_MANIFEST");
+  blocked(inspect(f, { checkpoint: { epoch: 4, revision: 9 } }), "STALE_OR_REPLAYED_MANIFEST");
+  blocked(inspect(f, { checkpoint: { epoch: 5, revision: 1 } }), "STALE_OR_REPLAYED_MANIFEST");
+  blocked(inspect(f, { checkpoint: null }), "CHECKPOINT_REQUIRED");
+  blocked(inspect(f, { expectedCompartmentId: "other" }), "COMPARTMENT_MISMATCH");
+  assert.equal(inspect(f).fixtureVerified, true);
+});
+
+test("changed manifest, index, replayed backup identity and duplicate fields are rejected", (t) => {
+  const f = fixture(t);
+  f.manifest.revision = 99;
+  fs.writeFileSync(path.join(f.dir, "manifest.json"), encode(f.manifest));
+  blocked(inspect(f), "MANIFEST_DIGEST_MISMATCH");
+  f.persist();
+  f.manifest.backupId = "backupother";
+  fs.writeFileSync(path.join(f.dir, "manifest.json"), encode(f.manifest));
+  blocked(inspect(f), "MANIFEST_DIGEST_MISMATCH");
+  f.persist();
+  const doubled = '{"schema":"rootark-zk1-backup-pre-restore-fixture/v1","backupId":"backupone","backupId":"duplicate"}';
+  fs.writeFileSync(path.join(f.dir, "manifest.json"), doubled);
+  const index = JSON.parse(fs.readFileSync(path.join(f.dir, "backup-index.json"), "utf8"));
+  index.manifestSha256 = sha(Buffer.from(doubled));
+  fs.writeFileSync(path.join(f.dir, "backup-index.json"), encode(index));
+  blocked(inspect(f), "MALFORMED_METADATA");
+});
+
+test("corrupted version, backup copy and recovery/owner envelope are refused", (t) => {
+  for (const [folder, filename, expected] of [
+    ["versions", "vone.ct", "VERSION_DIGEST_MISMATCH"],
+    ["copies", "copyvone.ct", "COPY_DIGEST_MISMATCH"],
+    ["envelopes", "ownvone.env", "ENVELOPE_DIGEST_MISMATCH"],
+    ["envelopes", "recvone.env", "ENVELOPE_DIGEST_MISMATCH"],
+  ]) {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.dir, folder, filename), "corrupted-synthetic-copy");
+    blocked(inspect(f), expected);
+  }
+});
+
+test("missing copy, missing versions, missing owner/recovery envelopes, and undeclared extra files refuse", (t) => {
+  for (const [folder, filename] of [
+    ["versions", "vone.ct"], ["copies", "copyvone.ct"],
+    ["envelopes", "ownvone.env"], ["envelopes", "recvone.env"],
+  ]) {
+    const f = fixture(t);
+    fs.rmSync(path.join(f.dir, folder, filename));
+    blocked(inspect(f), "INVENTORY_INCOMPLETE");
+  }
+  for (const folder of ["versions", "copies", "envelopes", "."]) {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.dir, folder, "undeclared.bin"), "synthetic");
+    blocked(inspect(f), "UNEXPECTED_FIXTURE_ENTRY");
+  }
+});
+
+test("version chain gaps, duplicate IDs, owner/recovery alias and archive manifest mismatch refuse", (t) => {
+  const changes = [
+    (m) => { m.objects[0].versions[1].sequence = 3; },
+    (m) => { m.objects[0].versions[1].parentVersionId = null; },
+    (m) => { m.objects[0].versions[1].versionId = "vone"; },
+    (m) => { m.objects[0].versions[1].ownerEnvelopeId = m.objects[0].versions[1].recoveryEnvelopeId; },
+    (m) => { m.objects[0].versions.length = 1; },
+    (m) => { m.objects[0].versions[1].copyId = m.objects[0].versions[0].copyId; },
+  ];
+  for (const change of changes) {
+    const f = fixture(t);
+    change(f.manifest);
+    f.persist();
+    const result = inspect(f);
+    assert.equal(result.restoreAuthorized, false);
+    assert.equal(result.fixtureVerified, false, "bad structural relationship must not pass");
+  }
+});
+
+test("plaintext and key-material indicators refuse without echoing payloads", (t) => {
+  for (const phrase of ["ROOTARK_TEST_PLAINTEXT_MARKER", "-----BEGIN PRIVATE KEY-----",
+    '"privateKey":"synthetic"', '"password":"synthetic"']) {
+    const f = fixture(t);
+    const pathname = path.join(f.dir, "copies", "copyvone.ct");
+    const content = Buffer.from(phrase);
+    fs.writeFileSync(pathname, content);
+    f.manifest.objects[0].versions[0].ciphertextSha256 = sha(content);
+    fs.writeFileSync(path.join(f.dir, "versions", "vone.ct"), content);
+    f.persist();
+    const report = inspect(f);
+    blocked(report, "POSSIBLE_PLAINTEXT_OR_KEY_LEAK");
+    assert.equal(JSON.stringify(report).includes(phrase), false);
+  }
+});
+
+test("fixture-only confinement: ZIP files, outside-temp folders, traversal and symlinks fail safely", (t) => {
+  const f = fixture(t);
+  blocked(inspect(f, { fixtureDir: path.join(f.dir, "backup.zip") }), "UNSAFE_FIXTURE");
+  blocked(inspect(f, { fixtureDir: path.resolve(f.dir, "..") }), "UNSAFE_FIXTURE");
+  const hostile = ["../escape", "back/track", "C:\\host", "__proto__"];
+  for (const value of hostile) {
+    const bad = fixture(t);
+    bad.manifest.objects[0].versions[0].versionId = value;
+    bad.persist();
+    blocked(inspect(bad), "MALFORMED_METADATA");
+  }
+  const bad = fixture(t);
+  fs.rmSync(path.join(bad.dir, "copies", "copyvone.ct"));
+  try { fs.symlinkSync(path.join(bad.dir, "versions", "vone.ct"), path.join(bad.dir, "copies", "copyvone.ct"), "file"); }
+  catch (error) { if (["EPERM", "EACCES"].includes(error.code)) return; throw error; }
+  blocked(inspect(bad), "UNEXPECTED_FIXTURE_ENTRY");
+});
+
+test("a symlinked container or hardlinked metadata/payload cannot serve as backup evidence", (t) => {
+  const hardlink = fixture(t);
+  fs.linkSync(path.join(hardlink.dir, "manifest.json"), path.join(hardlink.dir, "extra-manifest-link"));
+  blocked(inspect(hardlink), "UNEXPECTED_FIXTURE_ENTRY");
+  fs.rmSync(path.join(hardlink.dir, "extra-manifest-link"));
+  fs.linkSync(path.join(hardlink.dir, "versions", "vone.ct"),
+    path.join(hardlink.dir, "copies", "extra-hardlink.ct"));
+  blocked(inspect(hardlink), "UNEXPECTED_FIXTURE_ENTRY");
+  fs.rmSync(path.join(hardlink.dir, "copies", "extra-hardlink.ct"));
+  const sibling = path.join(hardlink.dir, "copies", "copyvone.ct");
+  fs.rmSync(sibling);
+  fs.linkSync(path.join(hardlink.dir, "versions", "vone.ct"), sibling);
+  blocked(inspect(hardlink), "INVENTORY_INCOMPLETE");
+  const symlink = fixture(t);
+  fs.rmSync(path.join(symlink.dir, "versions"), { force: true, recursive: true });
+  try { fs.symlinkSync(path.join(symlink.dir, "copies"), path.join(symlink.dir, "versions"), "junction"); }
+  catch (error) { if (["EPERM", "EACCES"].includes(error.code)) return; throw error; }
+  blocked(inspect(symlink), "UNEXPECTED_FIXTURE_ENTRY");
+});
+
+test("metadata leak patterns, unexpected fields and unsupported modes cannot be trusted", (t) => {
+  const f = fixture(t);
+  const raw = JSON.parse(fs.readFileSync(path.join(f.dir, "backup-index.json"), "utf8"));
+  raw.secretKey = "synthetic placeholder";
+  fs.writeFileSync(path.join(f.dir, "backup-index.json"), encode(raw));
+  blocked(inspect(f), "POSSIBLE_PLAINTEXT_OR_KEY_LEAK");
+  const extra = fixture(t);
+  extra.manifest.objects[0].versions[0].unsupportedSuite = "unencrypted";
+  extra.persist();
+  blocked(inspect(extra), "MALFORMED_METADATA");
+});
+
+test("incomplete directory roots and user-provided archive payload paths refuse before touching data", (t) => {
+  const f = fixture(t);
+  fs.rmSync(path.join(f.dir, "backup-index.json"));
+  blocked(inspect(f), "INVENTORY_INCOMPLETE");
+  const second = fixture(t);
+  blocked(inspect(second, { fixtureDir: path.join(second.dir, "copies", "copyvone.ct") }), "UNSAFE_FIXTURE");
+  blocked(inspect(second, { fixtureDir: "/definitely-not-a-rootark-temp-fixture" }), "UNSAFE_FIXTURE");
+  assert.equal(inspect(second).fixtureVerified, true);
+});
