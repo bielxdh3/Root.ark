@@ -70,6 +70,11 @@ hardware clock or an external high-water service.
   temporary folder. Earlier `npm run validate:syntax` checked **295** files
   with zero failures; a fresh final syntax run also checked **295** with zero
   failures, and artifact and diff checks exited zero.
+- The full repository `npm test` at the implementation commit `4152fa6`
+  (before this documentation-only addendum) finished with **1,824 tests,
+  1,757 passed, 0 failed, 67 skipped, exit 0**. Log:
+  `rootark_issue65_quiesce_final_full_20261021.log` in the host temporary
+  directory. Skipped tests do not establish runtime acceptance.
 - A bounded independent READ-ONLY reviewer reproduced two P2 availability
   issues (expired quiesce and START ACK loss during quiescence) and the clock
   rollback replay weakness. After the repairs, the reviewer returned **PASS:
