@@ -56,6 +56,19 @@ function endpoint(config, witness) {
     serverFingerprint256: config.serverFingerprint256,
   };
 }
+function clientTlsIdentity(settings) {
+  try {
+    // PEM file bytes are not identities: leading whitespace, line endings
+    // and equivalent key/certificate serialization may all change while
+    // TLS still authenticates the very same credential.
+    const key = crypto.createPublicKey(crypto.createPrivateKey(settings.clientKey))
+      .export({ type: "spki", format: "der" });
+    const cert = new crypto.X509Certificate(settings.clientCert);
+    const certKey = cert.publicKey.export({ type: "spki", format: "der" });
+    if (!key.equals(certKey)) fail();
+    return { key, certificate: cert.raw };
+  } catch (_) { fail(); }
+}
 function registerZk1ProtectedContentFromConfig({
   app, authenticate, requirePermission, configPath, environment,
 }) {
@@ -87,6 +100,17 @@ function registerZk1ProtectedContentFromConfig({
   };
   const witnessTransport = endpoint(config.witness, true);
   const casTransport = endpoint(config.cas, false);
+  // Separate logical endpoints are NOT independent trust roots if a single
+  // server certificate or mTLS client identity is accepted as both CAS and
+  // witness. Detect this unsafe alias at opt-in bootstrap, before opening or
+  // creating the protected-content SQLite file. This does not prove their
+  // actual operators or hosts are physically independent.
+  const witnessClient = clientTlsIdentity(witnessTransport);
+  const casClient = clientTlsIdentity(casTransport);
+  if (config.witness.serverFingerprint256.toUpperCase()
+    === config.cas.serverFingerprint256.toUpperCase()
+    || witnessClient.key.equals(casClient.key)
+    || witnessClient.certificate.equals(casClient.certificate)) fail();
   const publicKey = crypto.createPublicKey(readFile(config.witness.signingPublicKeyPath));
   if (publicKey.type !== "public" || publicKey.asymmetricKeyType !== "ed25519") fail();
   const witnessProvider = createZk1WitnessHttpsClient(witnessTransport);

@@ -5,6 +5,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { execFileSync } = require("node:child_process");
 const test = require("node:test");
 const express = require("express");
 const Database = require("better-sqlite3");
@@ -20,16 +21,38 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
   const witness = crypto.generateKeyPairSync("ed25519");
   const signing = path.join(dir, "witness-public.pem");
   fs.writeFileSync(signing, witness.publicKey.export({ format: "pem", type: "spki" }));
-  const dummyTlsPaths = ["ca.pem", "client.key", "client.crt"];
-  for (const name of dummyTlsPaths) fs.writeFileSync(path.join(dir, name), "test-fixture-only");
+  const dummyTlsPaths = ["ca.pem", "client.key", "client.crt",
+    "cas-client.key", "cas-client.crt"];
+  fs.writeFileSync(path.join(dir, "ca.pem"), "test-fixture-only-ca");
+  for (const basename of ["client", "cas-client"]) {
+    const pair = crypto.generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      publicKeyEncoding: { format: "pem", type: "spki" },
+      privateKeyEncoding: { format: "pem", type: "pkcs8" },
+    });
+    fs.writeFileSync(path.join(dir, basename + ".key"), pair.privateKey);
+    const args = ["req", "-new", "-x509", "-key", basename + ".key",
+      "-out", basename + ".crt", "-days", "1", "-subj", "/CN=" + basename];
+    if (process.platform === "win32") {
+      const wd = execFileSync("wsl.exe", ["-e", "wslpath", "-a", dir],
+        { encoding: "utf8" }).trim();
+      execFileSync("wsl.exe", ["-e", "bash", "-lc", "cd " + JSON.stringify(wd)
+        + "; openssl " + args.map((x) => JSON.stringify(x)).join(" ")],
+      { stdio: "pipe", timeout: 20000 });
+    } else {
+      execFileSync("openssl", args, { cwd: dir, stdio: "pipe", timeout: 20000 });
+    }
+  }
   const scope = { account_id: crypto.randomBytes(16).toString("base64url"),
     compartment_id: Buffer.from("test-compartment").toString("base64url"),
     keyring_id: crypto.randomBytes(16).toString("base64url") };
   const endpoint = (service) => ({
     endpoint: `https://localhost:4433${service === "cas" ? "/v1/manifest" : "/"}`,
-    caPath: path.join(dir, "ca.pem"), clientKeyPath: path.join(dir, "client.key"),
-    clientCertPath: path.join(dir, "client.crt"),
-    serverFingerprint256: "AA:".repeat(31) + "AA",
+    caPath: path.join(dir, "ca.pem"),
+    clientKeyPath: path.join(dir, service === "cas" ? "cas-client.key" : "client.key"),
+    clientCertPath: path.join(dir, service === "cas" ? "cas-client.crt" : "client.crt"),
+    serverFingerprint256: service === "cas" ? "BB:".repeat(31) + "BB"
+      : "AA:".repeat(31) + "AA",
     ...(service === "witness" ? { signingKeyId: crypto.randomBytes(16).toString("base64url"),
       signingPublicKeyPath: signing } : {}),
   });
@@ -64,6 +87,35 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
   }
   assert.throws(() => configure({ ...data, witness: { ...data.witness,
     signingPublicKeyPath: undefined } }), /ZK_CONTENT_BOOTSTRAP_INVALID/);
+  assert.throws(() => configure({ ...data, cas: { ...data.cas,
+    serverFingerprint256: data.witness.serverFingerprint256 } }),
+  /ZK_CONTENT_BOOTSTRAP_INVALID/, "same certificate pin cannot designate two independent authorities");
+  assert.throws(() => configure({ ...data, cas: { ...data.cas,
+    clientKeyPath: data.witness.clientKeyPath,
+    clientCertPath: data.witness.clientCertPath } }),
+  /ZK_CONTENT_BOOTSTRAP_INVALID/, "CAS and witness need separately provisioned client credentials");
+  assert.throws(() => configure({ ...data, cas: { ...data.cas,
+    clientKeyPath: data.witness.clientKeyPath } }), /ZK_CONTENT_BOOTSTRAP_INVALID/,
+  "reusing just the witness private key mismatches the CAS certificate");
+  assert.throws(() => configure({ ...data, cas: { ...data.cas,
+    clientCertPath: data.witness.clientCertPath } }), /ZK_CONTENT_BOOTSTRAP_INVALID/,
+  "reusing just the witness certificate mismatches the CAS private key");
+  const aliasedKey = path.join(dir, "cas-aliased-client.key");
+  const aliasedCert = path.join(dir, "cas-aliased-client.crt");
+  fs.writeFileSync(aliasedKey, "\n" + fs.readFileSync(data.witness.clientKeyPath, "utf8"));
+  fs.writeFileSync(aliasedCert, "\n" + fs.readFileSync(data.witness.clientCertPath, "utf8"));
+  assert.deepEqual(crypto.createPublicKey(crypto.createPrivateKey(
+    fs.readFileSync(aliasedKey))).export({ type: "spki", format: "der" }),
+  crypto.createPublicKey(crypto.createPrivateKey(
+    fs.readFileSync(data.witness.clientKeyPath))).export({ type: "spki", format: "der" }));
+  assert.deepEqual(new crypto.X509Certificate(fs.readFileSync(aliasedCert)).raw,
+    new crypto.X509Certificate(fs.readFileSync(data.witness.clientCertPath)).raw);
+  assert.throws(() => configure({ ...data, cas: { ...data.cas,
+    clientKeyPath: aliasedKey, clientCertPath: aliasedCert } }),
+  /ZK_CONTENT_BOOTSTRAP_INVALID/,
+  "semantically identical PEMs with distinct bytes/paths are still the SAME TLS principal");
+  assert.equal(fs.existsSync(data.contentDbPath), false,
+    "any invalid authority bootstrap must refuse before creating the content database");
   assert.throws(() => configure({ ...data, bootstrapNew: false }), /ZK_CONTENT_BOOTSTRAP_REQUIRED/);
   assert.throws(() => configure(data, { environment: "production" }), /ZK_CONTENT_BOOTSTRAP_INVALID/);
   const unrelated = path.join(dir, "unrelated.sqlite");

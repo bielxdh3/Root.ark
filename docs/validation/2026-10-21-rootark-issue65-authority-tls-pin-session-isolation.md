@@ -50,3 +50,29 @@ boundary, not a claim that a single machine emulates two truly independently
 operated services. It does not create a distributed linearizable rollback-safe
 witness, a production-pinned signer, atomic nonce + admission + I/O effect,
 remote provider fencing, or full user-facing device/recovery workflows.
+
+## Separate opt-in authority identities at bootstrap
+
+The normal application already mounts an experimental, development/test-only
+protected ciphertext route by explicit operator configuration. Its bootstrap
+now rejects configurations that try to designate CAS and witness using the
+**same SHA-256 TLS peer certificate pin**, the **same client private key** or
+the **same client certificate**, even if the credential files have different
+paths or equivalent PEM formatting. The guard parses the private key and X.509
+certificate, compares canonical SPKI/DER identities and requires that each
+configured certificate match its private key. Invalid PEM fails closed before
+the protected-content SQLite file is opened.
+It accepts a shared CA root where separate server certificates/client
+credentials are provisioned; sharing a CA is not evidence of sharing a
+service/operator. This negative control does **not** establish that CAS and
+witness execute on different physical hosts or have separately held signing
+keys. Separate operator-root attestation and deployment evidence remain
+mandatory for normative authorization.
+
+`test/issue-65-protected-content-bootstrap.test.js` reproduced a missing
+rejection (RED) for an identical server pin, then passed (GREEN) after the
+separation guard. Independent review found a P2 gap with raw PEM-byte
+comparison: a second RED regression used a real RSA private key and X.509
+certificate with equivalent valid leading whitespace, then passed once the
+decoded identities were compared. The existing content-route and signed
+CAS/witness recovery regression tests also passed (**3/3 PASS** native Node).
