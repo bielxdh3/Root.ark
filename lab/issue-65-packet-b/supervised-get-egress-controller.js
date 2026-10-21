@@ -50,6 +50,25 @@ function matchesScope(a, b) {
   return a.account_id.equals(b.account_id)
     && a.compartment_id.equals(b.compartment_id) && a.keyring_id.equals(b.keyring_id);
 }
+function quiesceTuple(operation, io) {
+  exact(operation, ["scope", "operationId", "reservationId", "revision", "digest"]);
+  exact(operation.scope, ["account_id", "compartment_id", "keyring_id"]);
+  const scope = { account_id: bytes(operation.scope.account_id, 16),
+    compartment_id: bytes(operation.scope.compartment_id, 1, 128),
+    keyring_id: bytes(operation.scope.keyring_id, 16) };
+  const digest = bytes(operation.digest, 32);
+  if (!matchesScope(scope, io.scope)
+    || operation.revision !== io.revision || !digest.equals(io.digest)) deny();
+  return { scope, operationId: bytes(operation.operationId, 16),
+    reservationId: bytes(operation.reservationId, 16),
+    revision: operation.revision, digest };
+}
+function sameQuiesce(a, b) {
+  return matchesScope(a.scope, b.scope)
+    && a.operationId.equals(b.operationId)
+    && a.reservationId.equals(b.reservationId)
+    && a.revision === b.revision && a.digest.equals(b.digest);
+}
 function pubkeyEquals(a, b) {
   return a?.type === "public" && b?.type === "public"
     && a.asymmetricKeyType === "ed25519" && b.asymmetricKeyType === "ed25519"
@@ -199,17 +218,24 @@ class Zk1LabSupervisedGetEgress {
   }
 
   async beginQuiesce(operation) {
-    if (this.phase !== "listening" || this.stopping
-      || !operation?.scope || !matchesScope(operation.scope, this.io.scope)
-      || operation.revision !== this.io.revision
-      || !bytes(operation.digest, 32).equals(this.io.digest)) deny();
+    if (this.phase !== "listening" && this.phase !== "quiescing") deny();
+    const frozen = quiesceTuple(operation, this.io);
+    if (this.quiesceInput && !sameQuiesce(this.quiesceInput, frozen)) deny();
+    if (!this.quiesceInput) this.quiesceInput = frozen;
     this.stopping = true;
     // The gate's durable transition can race a grant already sent to the
-    // child. FINISHED must still wait for ACTUAL exit+close of this listener.
-    const result = await this.gate.beginQuiesce(operation);
-    if (result.state !== "QUIESCING") deny();
-    this.phase = "quiescing";
-    return result;
+    // child. If COMMIT succeeds but its ACK is lost, remain fail-closed to all
+    // egress while allowing only the exact pinned operation/reservation to
+    // re-read the authoritative SQL state. Never change to a new reservation.
+    if (this.quiesceInFlight) return this.quiesceInFlight;
+    this.quiesceInFlight = (async () => {
+      const result = await this.gate.beginQuiesce(this.quiesceInput);
+      if (result.state !== "QUIESCING") deny();
+      this.phase = "quiescing";
+      return result;
+    })();
+    try { return await this.quiesceInFlight; }
+    finally { this.quiesceInFlight = null; }
   }
 
   async finishAfterQuiesce() {

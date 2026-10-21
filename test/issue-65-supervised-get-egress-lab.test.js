@@ -222,3 +222,41 @@ test("a live exact GET admits one further chunk, while response completion alone
   assert.equal((await c.controller.finishAfterQuiesce()).status, "FINISHED");
   assert.equal((await c.gate.markPending(c.reservation)).status, "PENDING");
 });
+
+test("lost ACK after durable QUIESCING retries exact reservation but never reopens egress", {
+  skip: !enabled && "disposable PostgreSQL fixture required",
+}, async (t) => {
+  const c = await context(t);
+  const { port, token } = await c.controller.begin(c.io);
+  const stream = await pausedRequest(port, token);
+  await c.controller.waitPartial();
+  const actual = c.gate.beginQuiesce.bind(c.gate);
+  let injected = false;
+  c.gate.beginQuiesce = async (operation) => {
+    const result = await actual(operation);
+    if (!injected) {
+      injected = true;
+      throw new Error("synthetic LOST_QUIESCE_ACK after PG COMMIT");
+    }
+    return result;
+  };
+  await assert.rejects(c.controller.beginQuiesce(c.reservation), /LOST_QUIESCE_ACK/,
+    "transaction may be committed even though its ACK is lost");
+  const durable = await c.admin.query("SELECT phase,operation_id,reservation_id FROM zk1_gate.head WHERE scope_key=$1",
+    [key(c.scope)]);
+  assert.equal(durable.rows[0].phase, "QUIESCING");
+  assert.deepEqual(durable.rows[0].operation_id, c.reservation.operationId);
+  await assert.rejects(c.controller.continueResponse(), /ZK_LAB_GET_DENIED/,
+    "no further GET bytes may be granted while quiesce ACK is missing");
+  assert.equal((await request(port, token)).status, 503,
+    "new GET requests must remain blocked until physical STOP");
+  await assert.rejects(c.controller.beginQuiesce({
+    ...c.reservation, reservationId: crypto.randomBytes(16),
+  }), /ZK_LAB_GET_DENIED/,
+  "retry with a new reservation must not claim a foreign transition");
+  assert.equal((await c.controller.beginQuiesce(c.reservation)).state, "QUIESCING",
+    "exact retry must re-read already committed authority state");
+  assert.equal((await c.controller.finishAfterQuiesce()).status, "FINISHED");
+  assert.equal((await c.gate.markPending(c.reservation)).status, "PENDING");
+  assert.ok((await stream.drain()).length > 0);
+});

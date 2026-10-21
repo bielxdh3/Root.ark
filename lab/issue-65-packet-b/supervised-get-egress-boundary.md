@@ -25,3 +25,26 @@ This proves only that, for this fixture, the exact directly supervised Node HTTP
 There is **no independently verified active/revoked device identity** here: the synthetic fingerprint is trusted fixture data, not authenticated device approval, fresh external witness authority or signed recovery status. The local SQL gate and separate SQL STOP role reside on one disposable PostgreSQL instance and are not independently administered availability domains. No production storage reads, signed client responses, browser security, TLS/mTLS, remote GET, migration, multi-host fencing, failover or transfer-provider acceptance is established. The fixture token is not a production authorization mechanism. The program is not imported by normal Root.ark server/storage routes.
 
 Production protected GET remains **blocked** until an independently accepted fresh-head and active-device admission is connected to a selected provider's actual content read and egress effect boundary. A production egress broker must close the write-vs-gate linearization gap, prove its worker/process and descendants or external effects have stopped, reconcile after host restart, and handle socket buffering honestly. If this cannot be proven, the protected endpoint must refuse transfer; this lab does not grant an exception.
+
+## Durable quiescence / lost-ACK reconciliation follow-up
+
+A real disposable PostgreSQL adversarial regression injects a lost reply
+**after** the scope's QUIESCING/generation transition committed. Before the
+fix, the parent set `stopping=true` but left `phase=listening`, rejecting
+even an identical retry and stranding its local STOP workflow. RED:
+4/5 PASS, 1 FAIL. The controller now copies and pins the full operator-only
+scope, revision, digest, operation ID and reservation ID on the first
+quiescence call. It continues to reject all new GET grants or response
+continuations while confirmation is uncertain. An identical retry
+re-reads the authoritative PostgreSQL transition idempotently; any changed
+reservation or operation ID is rejected. Successful reconciliation permits
+STOP of the *same* physically owned child, independently signed exit+close
+evidence, FINISHED and PENDING. Concurrent identical retries share the
+same in-flight request, never a new reservation. GREEN: real local PG18
+GET/egress lab **5/5 PASS** on native Windows and **5/5 PASS** on WSL
+Node 22; verified disposable container cleanup.
+
+This closes an availability/replay corner in the **local synthetic
+controller only**. It does not make a PostgreSQL gate-read and a TCP
+`response.write` atomic, authorize real protected GET, prove buffers were
+un-sent, or establish durable supervisor identity after a host restart.
