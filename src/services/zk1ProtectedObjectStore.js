@@ -391,6 +391,7 @@ class Zk1ProtectedObjectStore {
     }
     const workerId = crypto.randomBytes(16);
     let admissionId;
+    let mayProceed = false;
     const start = { scope: this.trustedScope,
       revision: authenticated.request.manifest_revision,
       digest: authenticated.request.manifest_digest,
@@ -405,8 +406,11 @@ class Zk1ProtectedObjectStore {
         receipt = await this.witnessProvider.beginIoAdmission(start);
       }
       admissionId = bytes(receipt.admissionId, 16);
+      if (typeof receipt.proceed !== "boolean") fail("ZK_CONTENT_UNAVAILABLE");
+      mayProceed = receipt.proceed;
     } catch (_) { fail("ZK_CONTENT_UNAVAILABLE"); }
     try {
+      if (!mayProceed) fail("ZK_CONTENT_UNAVAILABLE");
       // The caller's emit() must settle only when response bytes have crossed
       // the trusted application egress boundary, or the socket was closed.
       // The witness refuses to reserve while this admission is ACTIVE.

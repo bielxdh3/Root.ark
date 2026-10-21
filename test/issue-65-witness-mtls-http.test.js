@@ -148,11 +148,12 @@ test("mTLS standalone witness listener rejects unknown principals and returns si
     ca: tls.ca, clientKey: tls.clientKey, clientCert: tls.clientCert,
     serverFingerprint256: new crypto.X509Certificate(tls.serverCert).fingerprint256,
   });
+  let witnessNow = 950;
   const ledger = new Zk1DurableWitnessLedger(path.join(dir, "witness.sqlite"), {
     bootstrapNew: true, witnessKeyId, witnessPrivateKey: witnessKey.privateKey,
     statusPinned: { keyId: statusKeyId, publicKey: authorityKey.publicKey },
     statusProvider: casClient,
-    nowSeconds: () => 950,
+    nowSeconds: () => witnessNow,
   });
   const fingerprint = new crypto.X509Certificate(tls.clientCert).fingerprint256;
   const wrongPin = createZk1CasStatusHttpsClient({
@@ -291,8 +292,32 @@ test("mTLS standalone witness listener rejects unknown principals and returns si
     operation: Object.fromEntries(Object.entries(nextOperation).map(([key, value]) =>
       [key, value instanceof Uint8Array ? enc(value) : value])),
   })).status, 409, "the witness must deny revocation while HTTP egress holds an active gate");
+  assert.deepEqual(await remoteWitness.prepareQuiesce({ operation: nextOperation }),
+    { status: "QUIESCING", activeCount: 1 }, "mTLS reserve principal starts a durable pre-reservation gate");
+  await assert.rejects(remoteWitness.cancelExpiredQuiesce({ operation: nextOperation }),
+    /WITNESS_TRANSPORT_UNAVAILABLE/, "pre-expiry abort must never release quiescence");
+  await assert.rejects(remoteWitness.prepareQuiesce({ operation: {
+    ...nextOperation, keyring_id: crypto.randomBytes(16),
+  } }), /WITNESS_TRANSPORT_UNAVAILABLE/, "cross-keyring quiesce must fail at mTLS ACL");
+  await assert.rejects(remoteWitness.freshHead({ scope, nonce: crypto.randomBytes(32) }),
+    /WITNESS_TRANSPORT_UNAVAILABLE/, "no fresh committed head is exposed during quiescence");
+  await assert.rejects(remoteWitness.beginIoAdmission({ ...ioRequest,
+    workerId: crypto.randomBytes(16) }), /WITNESS_TRANSPORT_UNAVAILABLE/);
   assert.deepEqual(await remoteWitness.finishIoAdmission({ scope,
     admissionId: admitted.admissionId, workerId }), { status: "completed" });
+  assert.deepEqual(await remoteWitness.prepareQuiesce({ operation: nextOperation }),
+    { status: "DRAINED", activeCount: 0 });
+  witnessNow = nextOperation.expires_at + 30;
+  assert.deepEqual(await remoteWitness.cancelExpiredQuiesce({ operation: nextOperation }),
+    { status: "ABORTED_EXPIRED" }, "expired exact pre-ticket gate is explicitly releasable via mTLS");
+  const reopened = await z.decodeDeterministic(await remoteWitness.freshHead({
+    scope, nonce: crypto.randomBytes(32) }));
+  assert.equal(reopened.status, "committed");
+  const nextReceipt = await remoteWitness.reserve({ operation: {
+    ...nextOperation, operation_id: crypto.randomBytes(16),
+    reservation_id: crypto.randomBytes(16), expires_at: witnessNow + 120,
+  } });
+  assert.ok(nextReceipt.length > 64, "only a fresh operation can reserve after an expired abort");
   await assert.rejects(remoteWitness.beginIoAdmission(ioRequest),
     /WITNESS_TRANSPORT_UNAVAILABLE/, "completed admission cannot replay");
 

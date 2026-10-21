@@ -124,19 +124,40 @@ function createZk1WitnessHttpsClient({
             const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
             const ioStart = path === "/v1/admission/start";
             const ioFinish = path === "/v1/admission/finish";
-            exact(parsed, ioStart ? ["admissionId", "authority"]
+            const quiesce = path === "/v1/quiesce";
+            const quiesceCancel = path === "/v1/quiesce/cancel-expired";
+            exact(parsed, quiesceCancel ? ["status", "authority"]
+              : quiesce ? ["status", "activeCount", "authority"]
+              : ioStart ? ["admissionId", "proceed", "authority"]
               : ioFinish ? ["status", "authority"]
                 : path === "/v1/resolve" ? ["status", "receiptBase64", "authority"]
                   : ["receiptBase64", "authority"]);
+            if (quiesce) {
+              if (parsed.authority !== "WITNESS_IO_GATE_LOCAL_V1"
+                || !["QUIESCING", "DRAINED"].includes(parsed.status)
+                || !Number.isSafeInteger(parsed.activeCount) || parsed.activeCount < 0
+                || (parsed.status === "DRAINED") !== (parsed.activeCount === 0)) fail();
+              completed = true;
+              resolve({ status: parsed.status, activeCount: parsed.activeCount });
+              return;
+            }
+            if (quiesceCancel) {
+              if (parsed.authority !== "WITNESS_IO_GATE_LOCAL_V1"
+                || parsed.status !== "ABORTED_EXPIRED") fail();
+              completed = true;
+              resolve({ status: parsed.status });
+              return;
+            }
             if (ioStart || ioFinish) {
               if (parsed.authority !== "WITNESS_IO_GATE_LOCAL_V1") fail();
               let result;
               if (ioStart) {
                 if (typeof parsed.admissionId !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(parsed.admissionId)) fail();
+                if (typeof parsed.proceed !== "boolean") fail();
                 const admissionId = Buffer.from(parsed.admissionId, "base64url");
                 if (admissionId.length !== 16
                   || admissionId.toString("base64url") !== parsed.admissionId) fail();
-                result = { admissionId };
+                result = { admissionId, proceed: parsed.proceed };
               } else {
                 if (parsed.status !== "completed") fail();
                 result = { status: parsed.status };
@@ -170,6 +191,16 @@ function createZk1WitnessHttpsClient({
         body.initializeSignature = b64(initializeSignature, [64, 64]);
       } else if (initializeSignature !== undefined) fail();
       return send("/v1/reserve", body);
+    },
+    prepareQuiesce({ operation }) {
+      const normalized = normalize(operation, OPERATION);
+      if (normalized.expected_revision === null) fail();
+      return send("/v1/quiesce", { operation: normalized });
+    },
+    cancelExpiredQuiesce({ operation }) {
+      const normalized = normalize(operation, OPERATION);
+      if (normalized.expected_revision === null) fail();
+      return send("/v1/quiesce/cancel-expired", { operation: normalized });
     },
     resolve({ scope }) { return send("/v1/resolve", { scope: normalize(scope, SCOPE) }); },
     beginIoAdmission({ scope, revision, digest, action, objectId, workerId }) {

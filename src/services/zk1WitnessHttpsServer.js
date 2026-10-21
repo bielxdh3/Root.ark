@@ -16,6 +16,8 @@ const ROLES = Object.freeze({
   "/v1/head": "head",
   "/v1/reserve": "reserve",
   "/v1/resolve": "resolve",
+  "/v1/quiesce": "reserve",
+  "/v1/quiesce/cancel-expired": "reserve",
   "/v1/admission/start": "admit",
   "/v1/admission/finish": "admit",
 });
@@ -129,6 +131,8 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals }
   if (!key || !cert || !clientCa || !ledger
     || typeof ledger.reserve !== "function" || typeof ledger.freshHead !== "function"
     || typeof ledger.resolve !== "function"
+    || typeof ledger.prepareQuiesce !== "function"
+    || typeof ledger.cancelExpiredQuiesce !== "function"
     || typeof ledger.beginIoAdmission !== "function"
     || typeof ledger.finishIoAdmission !== "function"
     || !principals || typeof principals !== "object"
@@ -181,6 +185,26 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals }
         return write(res, 403, { error: "FORBIDDEN" });
       }
       const body = await readBoundedJson(req);
+      if (req.url === "/v1/quiesce" || req.url === "/v1/quiesce/cancel-expired") {
+        exact(body, ["operation"]);
+        const operation = normalize(body.operation, OP_FIELDS);
+        if (!granted.scopes.has(scopeKey(operation))) {
+          return write(res, 403, { error: "FORBIDDEN" });
+        }
+        // Genesis cannot quiesce a prior I/O worker. An operation may only
+        // transition to QUIESCING under the existing scoped reserve principal.
+        if (operation.expected_revision === null) {
+          return write(res, 403, { error: "FORBIDDEN" });
+        }
+        if (req.url === "/v1/quiesce/cancel-expired") {
+          const result = await ledger.cancelExpiredQuiesce(operation);
+          return write(res, 200, { status: result.status,
+            authority: "WITNESS_IO_GATE_LOCAL_V1" });
+        }
+        const result = await ledger.prepareQuiesce(operation);
+        return write(res, 200, { status: result.status,
+          activeCount: result.activeCount, authority: "WITNESS_IO_GATE_LOCAL_V1" });
+      }
       if (req.url === "/v1/admission/start" || req.url === "/v1/admission/finish") {
         const starting = req.url.endsWith("/start");
         exact(body, starting ? IO_START : IO_FINISH);
@@ -204,7 +228,7 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals }
             revision: body.revision, digest: decode(body.digest, BYTE_FIELDS.digest),
             action: body.action, objectId: body.objectId, workerId, principal });
           return write(res, 201, { admissionId: Buffer.from(receipt.admissionId).toString("base64url"),
-            authority: "WITNESS_IO_GATE_LOCAL_V1" });
+            proceed: receipt.proceed === true, authority: "WITNESS_IO_GATE_LOCAL_V1" });
         }
         const result = await ledger.finishIoAdmission({ scope,
           admissionId: decode(body.admissionId, BYTE_FIELDS.admissionId),
@@ -277,7 +301,9 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals }
         : code === "WITNESS_NO_HEAD" || code === "WITNESS_NO_PENDING" ? 404
           : code === "WITNESS_PENDING" || code === "WITNESS_CONFLICT"
             || code === "WITNESS_TOMBSTONED" || code === "WITNESS_EXPIRED"
-            || code === "WITNESS_CAPACITY_EXHAUSTED" || code === "WITNESS_IO_ACTIVE" ? 409 : 503;
+            || code === "WITNESS_CAPACITY_EXHAUSTED" || code === "WITNESS_IO_ACTIVE"
+            || code === "WITNESS_QUIESCING"
+            || code === "WITNESS_QUIESCE_NOT_EXPIRED" ? 409 : 503;
       return write(res, status, {
         error: status === 503 ? "WITNESS_UNAVAILABLE"
           : status === 400 ? "WITNESS_INVALID_REQUEST"

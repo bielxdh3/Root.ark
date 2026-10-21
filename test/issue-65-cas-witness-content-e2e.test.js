@@ -71,6 +71,7 @@ test("CAS+witness true signed genesis/enrollment/revocation fence cross-device c
     digest: await v2.recoveryManifestDigestV2(initial) };
   const contentPath = path.join(dir, "content.sqlite");
   let loseStartAckOnce = false;
+  let simulateStopAfterStart = false;
   const makeStore = (bootstrapNew = false, admissionRequired = false) => {
     const s = new Zk1ProtectedObjectStore(contentPath, {
       trustedScope: scope, minimumHead: floor, bootstrapNew,
@@ -83,7 +84,7 @@ test("CAS+witness true signed genesis/enrollment/revocation fence cross-device c
             loseStartAckOnce = false;
             throw new Error("synthetic lost admission ACK after durable start");
           }
-          return admitted;
+          return simulateStopAfterStart ? { ...admitted, proceed: false } : admitted;
         },
         finishIoAdmission: (request) => witness.finishIoAdmission({ ...request,
           principal: "AA:".repeat(31) + "AA" }),
@@ -117,6 +118,13 @@ test("CAS+witness true signed genesis/enrollment/revocation fence cross-device c
   const beforeEnroll = await authorize("trusted-0", "put", crypto.randomBytes(200));
   assert.equal((await content.put(beforeEnroll)).revision, 1);
   const admittedStore = makeStore(false, true);
+  simulateStopAfterStart = true;
+  let emittedAfterStop = false;
+  await assert.rejects(admittedStore.runWithAdmission(await authorize("trusted-0", "get"),
+    "get", () => { emittedAfterStop = true; }), /ZK_CONTENT_UNAVAILABLE/);
+  assert.equal(emittedAfterStop, false,
+    "reconciled START during quiescence may return an admission ID but never authorize egress");
+  simulateStopAfterStart = false;
   await assert.rejects(admittedStore.get(await authorize("trusted-0", "get")),
     /ZK_CONTENT_GATE_REQUIRED/, "gate-required stores cannot bypass witness admission via direct get");
   const heldRead = await authorize("trusted-0", "get");

@@ -218,6 +218,17 @@ class Zk1DurableWitnessLedger {
         FOREIGN KEY(scope_key) REFERENCES witness_scope(scope_key)
       );
       CREATE INDEX IF NOT EXISTS witness_io_active ON witness_io_admission(scope_key,state);
+      -- This pre-reservation gate is deliberately local-host only. It is not
+      -- a normative signed reservation or a cross-host STOP acknowledgement.
+      CREATE TABLE IF NOT EXISTS witness_quiesce (
+        scope_key TEXT PRIMARY KEY, operation BLOB NOT NULL,
+        started_at INTEGER NOT NULL,
+        FOREIGN KEY(scope_key) REFERENCES witness_scope(scope_key)
+      );
+      CREATE TABLE IF NOT EXISTS witness_clock_floor (
+        scope_key TEXT PRIMARY KEY, last_at INTEGER NOT NULL,
+        FOREIGN KEY(scope_key) REFERENCES witness_scope(scope_key)
+      );
     `);
     this.db.pragma("foreign_keys = ON");
     if (!existed) {
@@ -244,6 +255,12 @@ class Zk1DurableWitnessLedger {
       "SELECT * FROM witness_io_admission WHERE scope_key=? AND worker_id=?");
     this.ioById = this.db.prepare(
       "SELECT * FROM witness_io_admission WHERE admission_id=?");
+    this.quiesce = this.db.prepare(
+      "SELECT operation FROM witness_quiesce WHERE scope_key=?");
+    this.ioActiveCount = this.db.prepare(
+      "SELECT COUNT(*) AS n FROM witness_io_admission WHERE scope_key=? AND state='active'");
+    this.clockFloor = this.db.prepare(
+      "SELECT last_at FROM witness_clock_floor WHERE scope_key=?");
     } catch (error) {
       this.db.close();
       throw error;
@@ -254,6 +271,11 @@ class Zk1DurableWitnessLedger {
     const canonical = await z.encodeDeterministic(unsigned);
     const signature = crypto.sign(null, Buffer.concat([domain, canonical]), this.witnessPrivateKey);
     return Buffer.from(await z.encodeDeterministic({ ...unsigned, signature }));
+  }
+
+  assertClockFloor(key, now) {
+    const recorded = this.clockFloor.get(key);
+    if (recorded && now < recorded.last_at) fail("WITNESS_CLOCK_ROLLBACK");
   }
 
   // Local-host reference admission fence. The same durable SQLite write lock
@@ -273,20 +295,26 @@ class Zk1DurableWitnessLedger {
         || head.revision !== io.revision || !equal(head.digest, io.digest)
         || head.revision !== checked.revision || !equal(head.digest, checked.digest)
         || checked.pending_id !== null) fail("WITNESS_IO_DENIED");
+      this.assertClockFloor(key, number(this.nowSeconds()));
+      const quiescing = Boolean(this.quiesce.get(key));
       const old = this.ioByWorker.get(key, io.workerId);
       if (old) {
         if (old.state !== "active" || old.principal !== io.principal
           || old.action !== io.action || old.object_id !== io.objectId
           || old.revision !== io.revision || !equal(old.digest, io.digest)
           || !equal(old.keyring_id, io.scope.keyring_id)) fail("WITNESS_IO_DENIED");
-        return { admissionId: Buffer.from(old.admission_id) };
+        // A START ACK may be lost immediately before another principal
+        // quiesces. Return the identical active worker so it can be FINISHED,
+        // but explicitly forbid it from starting I/O after QUIESCING.
+        return { admissionId: Buffer.from(old.admission_id), proceed: !quiescing };
       }
+      if (quiescing) fail("WITNESS_IO_DENIED");
       this.db.prepare(`INSERT INTO witness_io_admission
         (admission_id,scope_key,keyring_id,worker_id,principal,action,object_id,revision,digest,state)
         VALUES(?,?,?,?,?,?,?,?,?,'active')`).run(admissionId, key,
         io.scope.keyring_id, io.workerId, io.principal, io.action,
         io.objectId, io.revision, io.digest);
-      return { admissionId };
+      return { admissionId, proceed: true };
     }).immediate();
   }
 
@@ -304,6 +332,75 @@ class Zk1DurableWitnessLedger {
           WHERE admission_id=? AND state='active'`).run(io.admissionId);
       }
       return { status: "completed" };
+    }).immediate();
+  }
+
+  async prepareQuiesce(input) {
+    const op = normalizeOperation(input);
+    if (op.expected_revision === null) fail("WITNESS_QUIESCING_INVALID");
+    const key = compartmentKey(op.account_id, op.compartment_id);
+    // Verify the existing signed event chain before accepting a request that
+    // will withhold all subsequent fresh committed-head receipts.
+    const { row: checked } = await this.checkedScope(op);
+    const raw = Buffer.from(await z.encodeDeterministic(op));
+    return this.db.transaction(() => {
+      const head = this.getScope.get(key);
+      if (!head || head.tombstoned || head.pending_id !== null
+        || !equal(head.keyring_id, op.keyring_id)
+        || head.revision !== op.expected_revision
+        || !equal(head.digest, op.expected_manifest_digest)
+        || checked.revision !== head.revision || !equal(checked.digest, head.digest)) {
+        fail("WITNESS_QUIESCING_INVALID");
+      }
+      const existing = this.quiesce.get(key);
+      this.assertClockFloor(key, number(this.nowSeconds()));
+      if (existing && !equal(existing.operation, raw)) fail("WITNESS_QUIESCING");
+      const activeCount = this.ioActiveCount.get(key).n;
+      if (existing) {
+        return { status: activeCount ? "QUIESCING" : "DRAINED", activeCount };
+      }
+      const now = number(this.nowSeconds());
+      if (op.expires_at <= now || op.expires_at > now + 360) {
+        fail("WITNESS_EXPIRED");
+      }
+      // Even an immediately drained scope must retain its gate. Otherwise a
+      // new worker could be admitted after DRAINED but before reserve().
+      this.db.prepare("INSERT INTO witness_quiesce(scope_key,operation,started_at) VALUES(?,?,?)")
+        .run(key, raw, now);
+      return { status: activeCount ? "QUIESCING" : "DRAINED", activeCount };
+    }).immediate();
+  }
+
+  async cancelExpiredQuiesce(input) {
+    const op = normalizeOperation(input);
+    if (op.expected_revision === null) fail("WITNESS_QUIESCING_INVALID");
+    const key = compartmentKey(op.account_id, op.compartment_id);
+    const { row: checked } = await this.checkedScope(op);
+    const raw = Buffer.from(await z.encodeDeterministic(op));
+    return this.db.transaction(() => {
+      const quiescing = this.quiesce.get(key);
+      if (!quiescing || !equal(quiescing.operation, raw)) fail("WITNESS_QUIESCING");
+      const head = this.getScope.get(key);
+      if (!head || head.pending_id !== null || head.tombstoned
+        || !equal(head.keyring_id, op.keyring_id)
+        || head.revision !== op.expected_revision
+        || !equal(head.digest, op.expected_manifest_digest)
+        || checked.revision !== head.revision || !equal(checked.digest, head.digest)) {
+        fail("WITNESS_QUIESCING_INVALID");
+      }
+      const now = number(this.nowSeconds());
+      this.assertClockFloor(key, now);
+      // A quiescing operation has NOT issued a signed witness reservation
+      // ticket. Once its deadline and 30s skew bound have passed, it cannot
+      // obtain one. Never reopen while a worker is still ACTIVE.
+      if (now - op.expires_at < 30) fail("WITNESS_QUIESCE_NOT_EXPIRED");
+      if (this.activeIo.get(key)) fail("WITNESS_IO_ACTIVE");
+      if (this.db.prepare("DELETE FROM witness_quiesce WHERE scope_key=? AND operation=?")
+        .run(key, raw).changes !== 1) fail("WITNESS_QUIESCING");
+      this.db.prepare(`INSERT INTO witness_clock_floor(scope_key,last_at) VALUES(?,?)
+        ON CONFLICT(scope_key) DO UPDATE SET last_at=excluded.last_at
+        WHERE excluded.last_at>witness_clock_floor.last_at`).run(key, now);
+      return { status: "ABORTED_EXPIRED" };
     }).immediate();
   }
 
@@ -330,10 +427,12 @@ class Zk1DurableWitnessLedger {
       expires_at: op.expires_at,
     };
     const raw = await this.sign(receipt, RESERVE_DOMAIN);
+    const rawOperation = Buffer.from(await z.encodeDeterministic(op));
     // Retain the exact signed reservation, not an unsigned editable copy of
     // the operation. Each later startup/read can validate the event ledger.
     this.db.transaction(() => {
       const commitTime = number(this.nowSeconds());
+      this.assertClockFloor(key, commitTime);
       if (op.expires_at <= commitTime || op.expires_at > commitTime + 360) {
         fail("WITNESS_EXPIRED");
       }
@@ -350,9 +449,16 @@ class Zk1DurableWitnessLedger {
           && equal(pending.envelope, raw)) return;
         fail("WITNESS_PENDING");
       }
+      const quiescing = this.quiesce.get(key);
+      if (quiescing && !equal(quiescing.operation, rawOperation)) {
+        fail("WITNESS_QUIESCING");
+      }
       // A reservation cannot enter PENDING while an authenticated worker
       // retains I/O authority. No timeout or restart silently clears it.
       if (this.activeIo.get(key)) fail("WITNESS_IO_ACTIVE");
+      // The exact drained operation atomically replaces its pre-reservation
+      // quiescence marker with the durable signed PENDING reservation.
+      if (quiescing) this.db.prepare("DELETE FROM witness_quiesce WHERE scope_key=?").run(key);
       // Reservation + terminal completion consume TWO immutable event
       // records. Leave room for the unavoidable resolution, even at cap.
       if (this.countEvents.get(key).count + 2 > this.maxEventsPerScope) {
@@ -456,6 +562,7 @@ class Zk1DurableWitnessLedger {
     const s = normalizeScope(scope);
     const challenge = bytes(nonce, 32);
     const { row: head, key } = await this.checkedScope(s);
+    if (this.quiesce.get(key)) fail("WITNESS_QUIESCING");
     const pending = Boolean(head.pending_id);
     // A tombstoned first initialize is deliberately not an acceptable
     // committed head and does not permit a second initialize.
@@ -474,6 +581,8 @@ class Zk1DurableWitnessLedger {
     // earlier asynchronous read. This still does NOT replace a physical
     // I/O admission fence or an independent witness transport.
     this.db.transaction(() => {
+      if (this.quiesce.get(key)) fail("WITNESS_QUIESCING");
+      this.assertClockFloor(key, number(this.nowSeconds()));
       const current = this.getScope.get(key);
       if (!current || !equal(current.keyring_id, head.keyring_id)
         || current.revision !== head.revision
