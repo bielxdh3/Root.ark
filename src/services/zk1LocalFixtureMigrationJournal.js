@@ -119,8 +119,8 @@ function storeJournal(file, record, initial) {
     if (pathPresent(temporary)) fs.unlinkSync(temporary);
   }
 }
-function parseJournal(file) {
-  const bytes = readRegular(file, 128 * 1024);
+function parseJournal(file, allowedLinks = 1) {
+  const bytes = readRegular(file, 128 * 1024, allowedLinks);
   let data;
   try { data = JSON.parse(bytes.toString("utf8")); } catch (_) { refuse(); }
   if (!keys(data, ["schema", "phase", "plan", "planDigest", "recordDigest"])
@@ -165,11 +165,31 @@ function paths(root, plan) {
     stage: path.join(root, "target", `.${plan.operationId}.stage`),
     journal: path.join(root, "journal", `${plan.operationId}.json`) };
 }
+function exactEntries(dir, names, type) {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch (_) { refuse(); }
+  if (entries.length !== names.length) refuse();
+  const expected = new Set(names);
+  for (const entry of entries) {
+    if (!expected.delete(entry.name)
+      || (type === "directory" ? !entry.isDirectory() : !entry.isFile())
+      || entry.isSymbolicLink()) refuse();
+  }
+  if (expected.size) refuse();
+}
 function verifyInventory(root, plan, locations) {
   if (!maybeRegular(locations.source, plan.sourceDigest)) refuse();
-  for (const kind of KINDS) for (const item of plan.references[kind]) {
-    const file = path.join(root, "references", kind, `${item.id}.ct`);
-    if (!maybeRegular(file, item.digest)) refuse();
+  // A caller-supplied list is not evidence that all version/backup/trash
+  // references were accounted for. This test-only fixture is explicit and
+  // closed-world: reject additional, omitted or unexpected directory entries.
+  exactEntries(path.join(root, "references"), KINDS, "directory");
+  for (const kind of KINDS) {
+    const folder = path.join(root, "references", kind);
+    exactEntries(folder, plan.references[kind].map((entry) => `${entry.id}.ct`), "file");
+    for (const item of plan.references[kind]) {
+      if (!maybeRegular(path.join(folder, `${item.id}.ct`), item.digest)) refuse();
+    }
   }
 }
 function checkpoint(input, name) { if (typeof input.onCheckpoint === "function") input.onCheckpoint(name); }
@@ -185,7 +205,40 @@ function readOperation(input) {
   const locations = paths(root, plan);
   return { root, plan, locations };
 }
+function recoverInterruptedInitialJournalLink(file, plan) {
+  let published;
+  try { published = fs.lstatSync(file); }
+  catch (_) { refuse(); }
+  if (!published.isFile() || published.isSymbolicLink()) refuse();
+  if (published.nlink === 1) return;
+  // The initial exclusive link() briefly creates two names for one synced
+  // inode. A process killed before temp unlink leaves exactly this state.
+  if (published.nlink !== 2) refuse();
+  const dir = path.dirname(file);
+  // Journal basenames consist of a validated opaque ID followed by '.json'.
+  const escaped = path.basename(file).replaceAll(".", "\\.");
+  const pattern = new RegExp("^\\." + escaped + "\\.[a-f0-9]{24}\\.tmp$");
+  let found;
+  try { found = fs.readdirSync(dir, { withFileTypes: true }).filter((entry) => pattern.test(entry.name)); }
+  catch (_) { refuse(); }
+  if (found.length !== 1 || !found[0].isFile() || found[0].isSymbolicLink()) refuse();
+  const temp = path.join(dir, found[0].name);
+  const original = parseJournal(file, 2);
+  if (original.phase !== "planned" || JSON.stringify(original.plan) !== JSON.stringify(plan)) refuse();
+  const journalBytes = readRegular(file, 128 * 1024, 2);
+  const tempBytes = readRegular(temp, 128 * 1024, 2);
+  const temporary = fs.lstatSync(temp);
+  if (!sameFile(published, temporary) || temporary.nlink !== 2
+    || !journalBytes.equals(tempBytes)) refuse();
+  // Unlink only the exact verified temporary name; never arbitrary links.
+  fs.unlinkSync(temp);
+  flushDirectory(dir);
+  const remaining = fs.lstatSync(file);
+  if (!remaining.isFile() || remaining.isSymbolicLink()
+    || !sameFile(published, remaining) || remaining.nlink !== 1) refuse();
+}
 function checkedJournal(file, plan) {
+  recoverInterruptedInitialJournalLink(file, plan);
   const stored = parseJournal(file);
   if (JSON.stringify(stored.plan) !== JSON.stringify(plan)) refuse();
   return stored;

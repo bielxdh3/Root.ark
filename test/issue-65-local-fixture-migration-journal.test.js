@@ -107,6 +107,30 @@ test("missing or stale versions/backups/trash and missing source block before jo
   assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
 });
 
+test("undeclared ciphertext versions, backups or trash cannot be silently omitted from local inventory", (t) => {
+  for (const kind of ["versions", "backups", "trash"]) {
+    const f = fixture(t);
+    const extra = path.join(f.dir, "references", kind, "unlisted.ct");
+    fs.writeFileSync(extra, Buffer.from("independent synthetic unlisted ciphertext"));
+    assert.throws(() => runLocalFixtureCiphertextMigration(f.plan),
+      /LOCAL_FIXTURE_MIGRATION_REFUSED/,
+      "an omitted " + kind + " entry must deny even when declared references are valid");
+    assert.equal(fs.existsSync(f.target), false);
+    assert.equal(fs.existsSync(f.journal), false);
+    fs.rmSync(extra);
+    assert.equal(runLocalFixtureCiphertextMigration(f.plan).state, "committed");
+    fs.writeFileSync(extra, Buffer.from("unexpected new synthetic reference"));
+    assert.throws(() => verifyLocalFixtureCiphertextMigration(f.plan),
+      /LOCAL_FIXTURE_MIGRATION_REFUSED/,
+      "post-commit discovery of unlisted " + kind + " must invalidate localVerified");
+    assert.throws(() => rollbackLocalFixtureCiphertextMigration(f.plan),
+      /LOCAL_FIXTURE_MIGRATION_REFUSED/,
+      "unlisted " + kind + " must not be silently skipped during rollback");
+    assert.equal(fs.existsSync(f.target), true,
+      "a blocked rollback must not destroy the validated target copy");
+  }
+});
+
 test("adulterated destination, source or journal blocks replay and rollback without destroying evidence", (t) => {
   const f = fixture(t);
   runLocalFixtureCiphertextMigration(f.plan);
@@ -184,6 +208,42 @@ test("real child-process termination at publish and rollback intent replays dura
   assert.equal(second.status, 71, second.stderr);
   assert.equal(rollbackLocalFixtureCiphertextMigration(f.plan).state, "rolled-back");
   assert.deepEqual(fs.readFileSync(f.source), bytes);
+});
+
+test("process death between exclusive initial journal link and temp unlink recovers only owned inode", (t) => {
+  const f = fixture(t);
+  const script = `const fs = require("node:fs");
+    const originalLink = fs.linkSync;
+    fs.linkSync = (...args) => { originalLink(...args); process.exit(71); };
+    const api = require("./src/services/zk1LocalFixtureMigrationJournal");
+    api.runLocalFixtureCiphertextMigration(JSON.parse(process.env.ROOTARK_SYNTHETIC_PLAN));`;
+  const child = spawnSync(process.execPath, ["-e", script], {
+    cwd: path.resolve(__dirname, ".."),
+    env: { ...process.env, ROOTARK_SYNTHETIC_PLAN: JSON.stringify(f.plan) },
+    windowsHide: true, encoding: "utf8",
+  });
+  assert.equal(child.status, 71, child.stderr);
+  const files = fs.readdirSync(path.join(f.dir, "journal"));
+  const orphan = files.find((name) => /^\.operation1\.json\.[a-f0-9]{24}\.tmp$/.test(name));
+  assert.ok(orphan, "interruption leaves one temporary hard link to the published journal");
+  assert.equal(fs.statSync(f.journal).nlink, 2);
+  assert.equal(fs.statSync(path.join(f.dir, "journal", orphan)).ino, fs.statSync(f.journal).ino);
+  assert.equal(runLocalFixtureCiphertextMigration(f.plan).state, "committed");
+  assert.equal(fs.statSync(f.journal).nlink, 1);
+  assert.equal(fs.existsSync(path.join(f.dir, "journal", orphan)), false);
+  assert.deepEqual(fs.readFileSync(f.target), bytes);
+  assert.deepEqual(fs.readFileSync(f.source), bytes);
+});
+
+test("unexpected hardlink to initial journal fails closed rather than removing foreign evidence", (t) => {
+  const f = fixture(t);
+  runLocalFixtureCiphertextMigration(f.plan);
+  const unexpected = path.join(f.dir, "journal", "untrusted-hardlink");
+  fs.linkSync(f.journal, unexpected);
+  assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.equal(fs.existsSync(unexpected), true);
+  assert.deepEqual(fs.readFileSync(f.source), bytes);
+  assert.deepEqual(fs.readFileSync(f.target), bytes);
 });
 
 test("orphan and replacement symlinks and unexpected stage after commit block without deleting data", (t) => {

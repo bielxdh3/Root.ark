@@ -21,4 +21,33 @@ Files are checked with no-follow descriptors where supported, inode/size/link-co
 
 The targeted Node tests exercise synthetic reference requirements, tamper/stale/replay rejection, path/symlink/hardlink protection, exclusive destination, no loss of the initial source, injected interruptions at every declared checkpoint, and actual child-process exit during publication and rollback. Tests use temporary fixtures and never invoke live storage.
 
+The fixture inventory now requires an **exact closed-world match** between
+the declared synthetic `versions`, `backups` and `trash` IDs and the
+filesystem directory entries. A previously unlisted reference file or other
+unexpected entry blocks initial copy, post-commit verification and rollback
+rather than quietly declaring a partial inventory complete. The regression
+`undeclared ciphertext versions, backups or trash cannot be silently omitted`
+was RED on the previous journal implementation (14 pass, 1 fail), then
+GREEN with the exact-directory check (15 pass, 0 fail). This is an ordinary
+local directory enumeration, **not** an authenticated remote provider
+inventory or a defense against a concurrent privileged filesystem actor;
+it does not make `canMigrate` true.
+
+An additional process-crash boundary is now covered: initial exclusive
+publication uses `link(temp, journal)`, which briefly gives the same journal
+inode **two hard links** before the temporary name is unlinked. Real
+`process.exit(71)` immediately after the link formerly left a valid planned
+journal that every replay rejected because its link count was 2. The replay
+path now reconciles only a `planned` journal matching the exact requested
+plan, canonical journal checksum, one expected randomly named same-directory
+temporary hard link (24 hexadecimal nonce), identical inode and identical
+content. It removes only that verified temporary name, flushes the directory
+where supported, and requires the original journal to remain on the same
+inode with exactly one link before continuing. An unknown journal hard link
+or mismatching artifact remains a hard refusal and is not deleted.
+RED: 16 PASS / 1 FAIL on actual child exit at this micro-window;
+GREEN: **17/17 PASS, 0 FAIL** with the exact recovery and hostile-hardlink
+regressions. This is still limited to trusted, non-concurrent disposable
+fixtures and does not guarantee Windows power-loss durability.
+
 **Production blockers:** owner-authorized and client-decrypt-verified migration, independently trusted source and destination provider roles/freshness, signed object/manifest revisions, authoritative versions/backup/trash/links/derived/sync/WebDAV inventory, cross-provider transactional fencing/reconciliation, retention/erasure policy and validated real-provider recovery. Until those exist, every outcome here means **LOCAL fixture experiment only**, never `canMigrate:true`, release readiness or a ZK cutover.
