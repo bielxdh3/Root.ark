@@ -6,6 +6,7 @@ const { spawnSync } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { removeVerifiedDisposablePg } = require("./verified-anonymous-pg-cleanup");
 
 const root = path.resolve(__dirname, "../..");
 const image = "postgres:18.6-alpine3.24";
@@ -96,12 +97,13 @@ async function main() {
   } finally {
     if (id) {
       try {
-        const identity = run("docker", ["container", "inspect", "--format",
-          "{{.Id}}|{{index .Config.Labels \"rootark.lab\"}}|{{index .Config.Labels \"rootark.owner\"}}", name]);
-        if (identity !== id + "|issue65-mtls-writer|disposable-local") {
-          throw new Error("unexpected fixture container identity; cleanup refused");
-        }
-        run("docker", ["rm", "-f", id]);
+        removeVerifiedDisposablePg({
+          docker: (args) => run("docker", args),
+          inspectVolume: (volume) => spawnSync("docker", ["volume", "inspect", volume],
+            { encoding: "utf8", windowsHide: true, timeout: 5000 }),
+          containerId: id, containerName: name,
+          labLabel: "issue65-mtls-writer",
+        });
         process.stdout.write("MTLS_WRITER_LAB_CLEANUP verified=true\n");
       } catch (error) {
         failed = true;

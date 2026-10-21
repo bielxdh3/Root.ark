@@ -7,6 +7,7 @@ const { spawnSync } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { removeVerifiedDisposablePg } = require("./verified-anonymous-pg-cleanup");
 
 const root = path.resolve(__dirname, "../..");
 const name = "rootark-zk65-gate-" + crypto.randomBytes(6).toString("hex");
@@ -145,12 +146,13 @@ async function main() {
   } finally {
     if (containerId) {
       try {
-        const identity = run("docker", ["container", "inspect", "--format",
-          "{{.Id}}|{{index .Config.Labels \"rootark.lab\"}}|{{index .Config.Labels \"rootark.owner\"}}", name]);
-        if (identity !== containerId + "|issue65-shared-gate|disposable-local") {
-          throw new Error("container identity/labels changed; cleanup refused");
-        }
-        run("docker", ["rm", "-f", containerId]);
+        removeVerifiedDisposablePg({
+          docker: (args) => run("docker", args),
+          inspectVolume: (volume) => spawnSync("docker", ["volume", "inspect", volume],
+            { encoding: "utf8", windowsHide: true, timeout: 5000 }),
+          containerId, containerName: name,
+          labLabel: "issue65-shared-gate",
+        });
         process.stdout.write("SHARED_GATE_PG_CLEANUP verified=true\n");
       } catch (error) {
         failed = true;
