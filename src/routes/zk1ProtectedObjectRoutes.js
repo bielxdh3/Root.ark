@@ -99,6 +99,16 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
     }
   };
   const parseSealedContent = express.json({ limit: "6mb", type: "application/json" });
+  // The normal workspace discovers this opt-in capability only through its
+  // authenticated session. Registration itself is dev/test-only (bootstrap).
+  // Never publish the configured owner's scope or authority pins to browsers.
+  app.get("/zk-1/v1/workspace-capability", fenceHeaders, authenticate,
+    requirePermission("listFiles"), requirePermission("upload"), (req, res) => {
+      try {
+        if (!resolveTrustedScope(req.user)) invalid();
+        res.json({ enabled: true });
+      } catch (_) { res.status(403).json({ error: "ZK_CONTENT_DENIED" }); }
+    });
   // POST-for-read prevents accidental caches and keeps signed nonces out of URLs.
   app.post("/zk-1/v1/content/read", fenceHeaders, authenticate,
     requirePermission("listFiles"), parseSealedContent, checked("get"));

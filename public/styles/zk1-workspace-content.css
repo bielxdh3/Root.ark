@@ -1,0 +1,16 @@
+.zk1-workspace-dialog {
+  box-sizing: border-box;
+  width: min(760px, 96vw);
+  max-height: 88vh;
+  overflow: auto;
+  border: 1px solid var(--line, #999);
+  border-radius: 16px;
+  padding: 24px;
+  background: var(--surface, #fff);
+  color: var(--text, #222);
+}
+.zk1-workspace-dialog::backdrop { background: rgb(0 0 0 / 60%); }
+.zk1-workspace-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.zk1-workspace-form label { display: grid; gap: 6px; font-size: .88rem; }
+.zk1-workspace-form input { box-sizing: border-box; width: 100%; min-width: 0; padding: 8px; }
+.zk1-workspace-actions { display: flex; flex-wrap: wrap; gap: 10px; grid-column: 1 / -1; }

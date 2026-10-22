@@ -8,6 +8,9 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn, execFileSync } = require("node:child_process");
 const express = require("express");
+const jwt = require("jsonwebtoken");
+const { createAuthenticate } = require("../src/middlewares/auth");
+const { createRequirePermission } = require("../src/middlewares/permissions");
 const z = require("../src/crypto/rootark-zk-1");
 const v2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const fixtures = require("./support/issue-65-recovery-v2-fixtures");
@@ -194,6 +197,78 @@ test("normal browser uploads ciphertext and confirms real localhost HTTP protect
     .get(args.metadata.object_id).ciphertext;
   assert.ok(!stored.includes(args.data));
   assert.ok(!stored.toString().includes(args.fileName));
+});
+
+test("normal workspace capability and protected PUT/GET enforce real cookie session, CSRF, permissions, owner scope and revocation", async (t) => {
+  const f = await setup(t);
+  const secret = crypto.randomBytes(32).toString("hex");
+  const people = new Map([
+    ["owner", { username: "owner", sessionVersion: 0,
+      permissions: { listFiles: true, upload: true } }],
+    ["outsider", { username: "outsider", sessionVersion: 0,
+      permissions: { listFiles: true, upload: true } }],
+    ["viewer", { username: "viewer", sessionVersion: 0,
+      permissions: { listFiles: true, upload: false } }],
+  ]);
+  const authenticate = createAuthenticate({ jwt, jwtSecret: secret,
+    loadUser: (username) => people.get(username),
+    normalizeUserPermissions: (user) => user.permissions });
+  const app = express();
+  registerZk1ProtectedObjectRoutes({ app, store: f.store, authenticate,
+    requirePermission: createRequirePermission(),
+    resolveTrustedScope: (user) => user?.username === "owner" ? f.state.scope : null });
+  const server = await new Promise((resolve) => {
+    const value = app.listen(0, "127.0.0.1", () => resolve(value));
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const cookie = (username, version = 0) =>
+    `rootark_session=${jwt.sign({ username, sessionVersion: version }, secret, { expiresIn: "10m" })}; rootark_csrf=workspace-fixture`;
+  const request = (name, pathname, options = {}) => fetch(origin + pathname, {
+    ...options, headers: { ...(options.headers || {}), ...(name ? { cookie: cookie(name) } : {}) },
+  });
+  const capabilityPath = "/zk-1/v1/workspace-capability";
+  assert.equal((await request(null, capabilityPath)).status, 401);
+  assert.equal((await request("outsider", capabilityPath)).status, 403);
+  assert.equal((await request("viewer", capabilityPath)).status, 403);
+  const ownerCapability = await request("owner", capabilityPath);
+  assert.equal(ownerCapability.status, 200);
+  assert.deepEqual(await ownerCapability.json(), { enabled: true });
+  assert.equal(ownerCapability.headers.get("cache-control"), "no-store");
+  assert.equal((await fetch(origin + capabilityPath, {
+    headers: { cookie: cookie("owner", 99) } })).status, 401);
+  for (const endpoint of ["put", "read"]) {
+    const name = endpoint === "put" ? "/zk-1/v1/content/put" : "/zk-1/v1/content/read";
+    const post = (who, csrf) => request(who, name, { method: "POST",
+      headers: { "content-type": "application/json", ...(csrf ? { "X-CSRF-Token": "workspace-fixture" } : {}) },
+      body: JSON.stringify({}),
+    });
+    assert.equal((await post(null, true)).status, 401);
+    assert.equal((await post("owner", false)).status, 403);
+    assert.equal((await post("outsider", true)).status, 403);
+    if (endpoint === "put") assert.equal((await post("viewer", true)).status, 403);
+    assert.equal((await post("owner", true)).status, 403, "invalid signed authorization rejected");
+  }
+  const options = await f.options();
+  options.origin = origin;
+  options.fetchImpl = (url, init) => fetch(url, {
+    ...init, headers: { ...init.headers, "X-CSRF-Token": "workspace-fixture",
+      cookie: cookie("owner") },
+  });
+  const verified = await normal.uploadAndVerify(options);
+  assert.equal(verified.protectedHttpReadbackVerified, true,
+    "real cookie-authenticated PUT + signed readback succeeded");
+  const stored = f.store.db.prepare("SELECT ciphertext FROM zk_content_object WHERE id=?")
+    .get(options.metadata.object_id).ciphertext;
+  assert.equal(stored.includes(options.data), false);
+  assert.equal(stored.toString().includes(options.fileName), false);
+  const count = f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n;
+  const revoked = await fixtures.appendDeviceRevocation(f.state, f.device.device_id);
+  f.setHead(revoked);
+  await assert.rejects(normal.uploadAndVerify({ ...options,
+    metadata: { ...options.metadata, object_id: id(), version_id: id() } }),
+    /ZK_NORMAL_BROWSER_AUTHORITY_UNVERIFIED/);
+  assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, count);
 });
 
 test("new browser session opens an owner-pinned ciphertext through real signed HTTP GET with only user-held secret", async (t) => {
@@ -655,5 +730,179 @@ if(!output.textContent)output.textContent="EDGE_NORMAL_HTTP_TIMEOUT";
       }
     }
     if (!removed) process.stderr.write("EDGE_NORMAL_TEST_PROFILE_CLEANUP_PENDING\n");
+  }
+});
+
+test("Edge normal authenticated workspace dialog provisions offline owner and PUT/GET through cookie CSRF", {
+  timeout: 65_000,
+}, async (t) => {
+  if (process.platform !== "win32" || !fs.existsSync(EDGE)) {
+    t.skip("Edge Windows browser unavailable");
+    return;
+  }
+  const f = await setup(t);
+  const opts = await f.options();
+  const secret = crypto.randomBytes(32).toString("hex");
+  const session = jwt.sign({ username: "owner", sessionVersion: 0 }, secret,
+    { expiresIn: "10m" });
+  const app = express();
+  let protectedPuts = 0;
+  app.use((req, _res, next) => {
+    if (req.path === "/zk-1/v1/content/put") protectedPuts++;
+    next();
+  });
+  const authenticate = createAuthenticate({ jwt, jwtSecret: secret,
+    loadUser: (name) => name === "owner" ? { username: name, sessionVersion: 0,
+      permissions: { listFiles: true, upload: true } } : null,
+    normalizeUserPermissions: (user) => user.permissions });
+  registerZk1ProtectedObjectRoutes({ app, store: f.store, authenticate,
+    requirePermission: createRequirePermission(),
+    resolveTrustedScope: (user) => user?.username === "owner" ? f.state.scope : null });
+  const scripts = new Set(["rootark-api", "rootark-zk1-authenticated-workspace",
+    ...scriptNames]);
+  app.get("/client/:asset", (req, res) => {
+    const name = req.params.asset.endsWith(".js") ? req.params.asset.slice(0, -3) : "";
+    if (!scripts.has(name)) return res.sendStatus(404);
+    return res.type("application/javascript").sendFile(path.join(
+      __dirname, "../public/client", name + ".js"), { dotfiles: "allow" });
+  });
+  app.get("/workspace-test", authenticate, (req, res) => res.type("html")
+    .set("Content-Security-Policy", "default-src 'self'; script-src 'self'; connect-src 'self'")
+    .send('<!doctype html><html><head><meta charset="utf-8">'
+      + '<script defer src="/client/rootark-api.js"></script>'
+      + '<script defer src="/client/rootark-zk1-authenticated-workspace.js"></script>'
+      + '<script defer src="/workspace-probe.js"></script></head><body>'
+      + '<section class="protected-client-panel"><p id="protectedClientStatus"></p></section>'
+      + '</body></html>'));
+  const values = { ownerRaw: b64(f.ownerRaw), ownerHash: b64(opts.pinnedOwnerKeyHash),
+    ownerSpkiHash: b64(crypto.createHash("sha256").update(Buffer.concat([
+      Buffer.from("302a300506032b6570032100", "hex"), f.ownerRaw])).digest()),
+    deviceRaw: b64(f.device.authorization_public_key), privateDer: b64(f.privateDer),
+    grant: opts.signedDeviceGrant,
+    head: { revision: opts.pinnedCurrentHead.revision,
+      digest: b64(opts.pinnedCurrentHead.digest), epoch: opts.pinnedCurrentHead.epoch },
+  };
+  app.get("/workspace-probe.js", (_req, res) => res.type("application/javascript")
+    .send(`window.addEventListener("load",async()=>{
+      const output=document.createElement("output"); output.id="edge-workspace-result";
+      document.body.append(output);
+      const values=${JSON.stringify(values)};
+      const wait=async(fn)=>{for(let i=0;i<200;i++){
+        const result=fn();if(result)return result;
+        await new Promise(resolve=>setTimeout(resolve,50));}throw Error("UI_TIMEOUT");};
+      const decode=(s)=>Uint8Array.from(atob(s.replace(/-/g,"+").replace(/_/g,"/")+"=".repeat((4-s.length%4)%4)),c=>c.charCodeAt(0));
+      const setFile=(name,data)=>{const dt=new DataTransfer();
+        dt.items.add(new File([data],"fixture.bin"));
+        document.querySelector('[data-zk1-field="'+name+'"]').files=dt.files;};
+      const field=(name)=>document.querySelector('[data-zk1-field="'+name+'"]');
+      try {
+        window.dispatchEvent(new Event("rootark:workspace-rendered"));
+        (await wait(()=>document.getElementById("zk1-workspace-open"))).click();
+        await wait(()=>document.querySelector("dialog[open]"));
+        setFile("owner",decode(values.ownerRaw));
+        field("owner-hash").value=values.ownerHash;
+        field("owner-spki").value=values.ownerSpkiHash;
+        field("revision").value=values.head.revision;
+        field("digest").value=values.head.digest;
+        field("epoch").value=values.head.epoch;
+        setFile("grant",new TextEncoder().encode(JSON.stringify(values.grant)));
+        document.querySelector('[data-zk1-action="provision"]').click();
+        await wait(()=>field("status").textContent.includes("Âncora offline provisionada"));
+        setFile("device",decode(values.deviceRaw));
+        setFile("private",decode(values.privateDer));
+        setFile("file",new TextEncoder().encode("Edge normal authenticated workspace plaintext"));
+        document.querySelector('[data-zk1-action="upload"]').click();
+        await wait(()=>field("status").textContent.includes("PUT/GET protegidos verificados")
+          || field("status").textContent.includes("Operação recusada"));
+        if(!field("status").textContent.includes("PUT/GET protegidos verificados"))throw Error("OP_DENIED");
+        if(field("private").files.length || field("file").files.length)throw Error("KEY_RETAINED");
+        field("digest").value=values.ownerHash;
+        setFile("private",decode(values.privateDer));
+        setFile("file",new TextEncoder().encode("Tampered browser pinned head"));
+        document.querySelector('[data-zk1-action="upload"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        output.textContent="EDGE_AUTH_WORKSPACE_PASS";
+      } catch(e){output.textContent="EDGE_AUTH_WORKSPACE_FAIL:"+e.message;}
+    });`));
+  const server = await new Promise((resolve) => {
+    const value = app.listen(0, "127.0.0.1", () => resolve(value));
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const origin = "http://127.0.0.1:" + server.address().port;
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-edge-auth-workspace-"));
+  const profile = path.join(folder, "profile");
+  let edge;
+  let socket;
+  try {
+    edge = spawn(EDGE, ["--headless=new", "--disable-gpu", "--no-first-run",
+      "--disable-extensions", "--remote-debugging-port=0",
+      "--user-data-dir=" + profile, "about:blank"],
+    { stdio: "ignore", windowsHide: true });
+    const wait = async (fn) => {
+      for (let count = 0; count < 200; count++) {
+        const value = await fn();
+        if (value) return value;
+        await new Promise((resolve) => setTimeout(resolve, 80));
+      }
+      throw new Error("Edge authenticated workspace timed out");
+    };
+    const port = await wait(() => {
+      const file = path.join(profile, "DevToolsActivePort");
+      if (!fs.existsSync(file)) return null;
+      return Number(fs.readFileSync(file, "utf8").split(/\r?\n/)[0]) || null;
+    });
+    const pages = await (await fetch("http://127.0.0.1:" + port + "/json/list")).json();
+    socket = new WebSocket(pages.find((item) => item.type === "page").webSocketDebuggerUrl);
+    await new Promise((resolve, reject) => {
+      socket.addEventListener("open", resolve, { once: true });
+      socket.addEventListener("error", reject, { once: true });
+    });
+    let counter = 0;
+    const pending = new Map();
+    socket.addEventListener("message", ({ data }) => {
+      const value = JSON.parse(data);
+      if (!pending.has(value.id)) return;
+      const { resolve, reject } = pending.get(value.id);
+      pending.delete(value.id);
+      if (value.error) reject(new Error(value.error.message));
+      else resolve(value.result);
+    });
+    const send = (method, params = {}) => new Promise((resolve, reject) => {
+      const requestId = ++counter;
+      pending.set(requestId, { resolve, reject });
+      socket.send(JSON.stringify({ id: requestId, method, params }));
+    });
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Network.enable");
+    await send("Network.setCookie", { name: "rootark_session", value: session,
+      url: origin, httpOnly: true, sameSite: "Strict" });
+    await send("Network.setCookie", { name: "rootark_csrf", value: "workspace-fixture",
+      url: origin, sameSite: "Strict" });
+    await send("Page.navigate", { url: origin + "/workspace-test" });
+    const observed = await wait(async () => {
+      const result = await send("Runtime.evaluate", {
+        expression: "document.getElementById('edge-workspace-result')?.textContent || null",
+        returnByValue: true,
+      });
+      const value = result.result?.value;
+      return typeof value === "string" && value.startsWith("EDGE_AUTH_WORKSPACE_") ? value : null;
+    });
+    assert.equal(observed, "EDGE_AUTH_WORKSPACE_PASS");
+    assert.equal(protectedPuts, 1, "forged external head must fail before PUT");
+    assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 1);
+  } finally {
+    socket?.close();
+    if (edge?.pid) {
+      try { execFileSync("taskkill", ["/PID", String(edge.pid), "/T", "/F"],
+        { stdio: "ignore", timeout: 10000 }); } catch (_) { edge.kill(); }
+    }
+    for (let i = 0; i < 20; i++) {
+      try { fs.rmSync(folder, { recursive: true, force: true }); break; }
+      catch (error) {
+        if (!["EPERM", "EBUSY", "ENOTEMPTY"].includes(error.code)) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 180));
+      }
+    }
   }
 });
