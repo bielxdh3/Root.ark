@@ -56,7 +56,8 @@ process.on("message", async (message) => {
       stage = "tls-listen";
       await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
       respond({ kind: "stage", step: "listening-ready" });
-      respond({ kind: "listening", port: server.address().port,
+      respond({ kind: "listening", host: server.address().address,
+        port: server.address().port,
         witnessSpki: witness.publicKey.export({ format: "der", type: "spki" }).toString("base64url"),
         witnessKeyId: witnessKeyId.toString("base64url"),
         statusKeyId: statusKeyId.toString("base64url") });

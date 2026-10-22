@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const http = require("node:http");
+const net = require("node:net");
 const path = require("node:path");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -155,8 +156,15 @@ async function isolatedWitness(t) {
   const ready = onceChild(child, "listening");
   child.send({ kind: "init", dir });
   const started = await ready;
+  assert.equal(started.host, "127.0.0.1", "independent mTLS witness binds IPv4 loopback only");
   const read = (name) => fs.readFileSync(path.join(dir, name));
-  const config = { endpoint: `https://localhost:${started.port}`,
+  // The child listens on IPv4 only. Node 22 resolves localhost as IPv6 first
+  // on Windows, wasting a failed connect attempt under a bounded TLS deadline.
+  // The fixture certificate explicitly contains IP:127.0.0.1 SAN, so using
+  // the numeric address keeps BOTH X.509 hostname and fingerprint checks.
+  assert.equal(new crypto.X509Certificate(read("server.pem")).checkIP(started.host),
+    started.host, "certificate must validate the exact loopback endpoint");
+  const config = { endpoint: `https://${started.host}:${started.port}`,
     ca: read("ca.pem"), clientKey: read("allowed.key"),
     clientCert: read("allowed.pem"),
     serverFingerprint256: new crypto.X509Certificate(read("server.pem")).fingerprint256,
@@ -218,6 +226,30 @@ test("separate OS witness signer retains real mTLS nonce-signed CAS floor and ex
   const root = crypto.randomBytes(32);
   const trust = await signedRootFor({ scope, io }, root);
   const witness = await isolatedWitness(t);
+  // All three failures must remain closed despite using a deterministic IPv4
+  // transport. A rejected attempt must not poison the valid pinned client.
+  const badTlsPin = new Zk1WitnessCasAnchorHttpsClient({ ...witness.config,
+    serverFingerprint256: "00:".repeat(31) + "00" });
+  await assert.rejects(badTlsPin.freshHead(), /CAS_WITNESS_FLOOR_UNAVAILABLE/,
+    "wrong X.509 peer fingerprint must never return a signed floor");
+  const badWitnessPin = new Zk1WitnessCasAnchorHttpsClient({ ...witness.config,
+    pinnedWitnessPublicKey: crypto.generateKeyPairSync("ed25519").publicKey });
+  await assert.rejects(badWitnessPin.freshHead(), /CAS_WITNESS_FLOOR_UNAVAILABLE/,
+    "a different Ed25519 witness authority cannot sign the pinned floor");
+  const unavailablePort = await new Promise((resolve, reject) => {
+    const listener = net.createServer();
+    listener.once("error", reject);
+    listener.listen(0, "127.0.0.1", () => {
+      const port = listener.address().port;
+      listener.close(() => resolve(port));
+    });
+  });
+  const partitioned = new Zk1WitnessCasAnchorHttpsClient({ ...witness.config,
+    endpoint: `https://127.0.0.1:${unavailablePort}`, headTimeoutMs: 1000 });
+  await assert.rejects(partitioned.freshHead(), /CAS_WITNESS_FLOOR_UNAVAILABLE/,
+    "partitioned loopback witness cannot admit a GET");
+  assert.deepEqual(await witness.client.freshHead(witness.genesis), witness.genesis,
+    "a valid pinned connection recovers only after a fresh nonce-signed floor");
   const config = { witness: witness.client, witnessFloor: witness.genesis, ...trust };
   const guard = await Zk1SharedPgWitnessCasEgressGuard.establish(config);
   assert.equal(await guard.authorize({ io, expectedRootHash: root }), true);
