@@ -4,10 +4,11 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
+const net = require("node:net");
 const path = require("node:path");
 const https = require("node:https");
 const { execFileSync, spawn } = require("node:child_process");
-const { generateNativeFixtureCertificates } =
+const { generateNativeFixtureCertificates, runNativeOpenSsl } =
   require("./support/issue-65-native-openssl-fixture");
 const test = require("node:test");
 const z = require("../src/crypto/rootark-zk-1");
@@ -43,12 +44,13 @@ function createCertificates(dir) {
     deniedKey: read("denied.key"), deniedCert: read("denied.pem"),
     witnessClientKey: read("witness.key"), witnessClientCert: read("witness.pem") };
 }
-function send(port, tls, route, body, identity = "allowed") {
+function send(port, tls, route, body, identity = "allowed", host = "127.0.0.1") {
   const data = Buffer.from(JSON.stringify(body));
   return new Promise((resolve, reject) => {
     const request = https.request({
-      host: "127.0.0.1", port, path: route, method: "POST",
-      ca: tls.ca, servername: "localhost", rejectUnauthorized: true,
+      host, port, path: route, method: "POST",
+      ca: tls.ca, servername: host === "127.0.0.1" ? "localhost" : "",
+      rejectUnauthorized: true,
       key: identity === "allowed" ? tls.allowedKey
         : identity === "denied" ? tls.deniedKey
           : identity === "witness" ? tls.witnessClientKey : undefined,
@@ -332,7 +334,10 @@ test("real mTLS CAS endpoint handles signed v2 commit, rejects alien scope, and 
     }, [witnessFingerprint]: { roles: ["terminal"], scopes: [scopeJson] },
     [manifestFingerprint]: { roles: ["manifest"], scopes: [scopeJson] } },
   };
-  async function launch() {
+  const cleanEnv = { ...process.env };
+  delete cleanEnv.ROOTARK_ZK1_CAS_PRIVATE_BIND_HOST;
+  delete cleanEnv.ROOTARK_ZK1_CAS_PRIVATE_BIND_INTERFACE;
+  async function launch(extraEnv = {}) {
     fs.writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
     const child = spawn(process.execPath, [
       path.resolve(__dirname, "../scripts/zk1-cas-status-standalone.js"),
@@ -340,6 +345,7 @@ test("real mTLS CAS endpoint handles signed v2 commit, rejects alien scope, and 
     ], {
       cwd: path.resolve(__dirname, ".."),
       stdio: ["ignore", "pipe", "pipe", "ipc"], windowsHide: true,
+      env: { ...cleanEnv, ...extraEnv },
     });
     ownedChildren.add(child);
     const newPort = await new Promise((resolve, reject) => {
@@ -380,4 +386,118 @@ test("real mTLS CAS endpoint handles signed v2 commit, rejects alien scope, and 
     serverFingerprint256: new crypto.X509Certificate(tls.serverCert).fingerprint256,
   }).getCommittedManifest({ scope: readScope }), raw);
   await restarted.stop();
+
+  // The rejected configurations start a REAL subprocess and must exit before
+  // opening a listener. Only disposable fixture files are used.
+  async function rejectBind(candidate, pins = {}) {
+    fs.writeFileSync(configPath, JSON.stringify(candidate), { mode: 0o600 });
+    const child = spawn(process.execPath, [
+      path.resolve(__dirname, "../scripts/zk1-cas-status-standalone.js"),
+      "--config", configPath,
+    ], { cwd: path.resolve(__dirname, ".."),
+      stdio: ["ignore", "ignore", "pipe", "ipc"], windowsHide: true,
+      env: { ...cleanEnv, ...pins },
+    });
+    ownedChildren.add(child);
+    let stderr = "";
+    child.stderr.on("data", (bytes) => { stderr += bytes.toString(); });
+    let timer;
+    try {
+      const result = await Promise.race([
+        new Promise((resolve) => {
+          child.once("exit", (code) => resolve({ type: "exit", code }));
+          child.once("message", () => resolve({ type: "ready" }));
+          child.once("error", () => resolve({ type: "error" }));
+        }),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve({ type: "timeout" }), 5000);
+        }),
+      ]);
+      assert.equal(result.type, "exit", "invalid bind cannot report ready");
+      assert.notEqual(result.code, 0);
+      assert.equal(stderr.trim(), "CAS_STATUS_STARTUP_FAILED");
+    } finally {
+      clearTimeout(timer);
+      if (child.exitCode === null) {
+        const stopped = new Promise((resolve) => child.once("exit", resolve));
+        child.kill("SIGTERM");
+        await stopped;
+      }
+      ownedChildren.delete(child);
+    }
+  }
+  const pinHost = "ROOTARK_ZK1_CAS_PRIVATE_BIND_HOST";
+  const pinInterface = "ROOTARK_ZK1_CAS_PRIVATE_BIND_INTERFACE";
+  for (const host of ["0.0.0.0", "::", "127.0.0.2", "169.254.10.20",
+    "100.64.1.1", "8.8.8.8", "224.0.0.1", "::ffff:10.0.0.1"]) {
+    await rejectBind({ ...config, listenHost: host }, {
+      [pinHost]: host, [pinInterface]: "not-a-real-interface",
+    });
+  }
+  await rejectBind(config, { [pinHost]: "10.0.0.1", [pinInterface]: "x" });
+  await rejectBind({ ...config, listenHost: "10.254.254.254" });
+  await rejectBind({ ...config, listenHost: "10.254.254.254" }, {
+    [pinHost]: "10.254.254.254", [pinInterface]: "not-a-real-interface",
+  });
+
+  // Prefer a private virtual adapter when present; otherwise an OS-assigned
+  // RFC1918 address is adequate for same-host transport validation only.
+  const privateEndpoint = Object.entries(os.networkInterfaces()).flatMap(([name, entries]) =>
+    (entries || []).map((entry) => ({ name, entry }))).find(({ entry }) => {
+      if ((entry.family !== "IPv4" && entry.family !== 4) || entry.internal
+        || net.isIP(entry.address) !== 4) return false;
+      const [a, b] = entry.address.split(".").map(Number);
+      return a === 10 || (a === 172 && b >= 16 && b <= 31)
+        || (a === 192 && b === 168);
+    });
+  if (!privateEndpoint) {
+    t.diagnostic("No assigned RFC1918 interface: remote bind transport not exercised");
+    return;
+  }
+  const privateHost = privateEndpoint.entry.address;
+  const privateConfig = { ...config, listenHost: privateHost };
+  const validPins = { [pinHost]: privateHost, [pinInterface]: privateEndpoint.name };
+  await rejectBind(privateConfig);
+  await rejectBind(privateConfig, { ...validPins, [pinHost]: "10.254.254.254" });
+  await rejectBind(privateConfig, { ...validPins, [pinInterface]: "absent-adapter" });
+  await rejectBind(privateConfig, validPins); // original server cert lacks remote IP SAN
+
+  fs.writeFileSync(path.join(dir, "server.ext"), [
+    "extendedKeyUsage=serverAuth", "keyUsage=digitalSignature,keyEncipherment",
+    "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:" + privateHost, "",
+  ].join("\n"));
+  runNativeOpenSsl(dir, ["x509", "-req", "-in", "server.csr",
+    "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
+    "-out", "server.pem", "-days", "1", "-extfile", "server.ext"]);
+  assert.ok(new crypto.X509Certificate(fs.readFileSync(path.join(dir, "server.pem")))
+    .checkIP(privateHost, { subject: "never" }));
+  const originalHost = config.listenHost;
+  let privatelyBound;
+  try {
+    config.listenHost = privateHost;
+    privatelyBound = await launch(validPins);
+  } finally { config.listenHost = originalHost; }
+  try {
+    const privatelyPinned = createZk1CasStatusHttpsClient({
+      endpoint: `https://${privateHost}:${privatelyBound.port}/v1/terminal`,
+      ca: tls.ca, clientKey: tls.witnessClientKey, clientCert: tls.witnessClientCert,
+      serverFingerprint256: new crypto.X509Certificate(
+        fs.readFileSync(path.join(dir, "server.pem"))).fingerprint256,
+    });
+    assert.equal((await z.decodeDeterministic(await privatelyPinned.getTerminalProof({
+      query, nonce: crypto.randomBytes(32),
+    }))).terminal_status, "committed");
+    assert.equal((await send(privatelyBound.port, tls, "/v1/terminal", {
+      query: queryJson(query), nonce: enc(crypto.randomBytes(32)),
+    }, "allowed", privateHost)).status, 403, "remote writer is not a witness");
+    assert.equal((await send(privatelyBound.port, tls, "/v1/terminal", {
+      query: queryJson(alienQuery), nonce: enc(crypto.randomBytes(32)),
+    }, "witness", privateHost)).status, 403, "remote witness cannot cross scope");
+    await assert.rejects(createZk1CasStatusHttpsClient({
+      endpoint: `https://${privateHost}:${privatelyBound.port}/v1/terminal`,
+      ca: tls.ca, clientKey: tls.witnessClientKey, clientCert: tls.witnessClientCert,
+      serverFingerprint256: "00:".repeat(31) + "00",
+    }).getTerminalProof({ query, nonce: crypto.randomBytes(32) }),
+    /CAS_STATUS_TRANSPORT_UNAVAILABLE/, "remote TLS identity pin still applies");
+  } finally { await privatelyBound.stop(); }
 });

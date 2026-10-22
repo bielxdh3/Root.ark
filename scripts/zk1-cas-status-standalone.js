@@ -6,6 +6,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const os = require("node:os");
+const net = require("node:net");
 const { Zk1DurableCasStatusLedger } = require("../src/services/zk1DurableCasStatusLedger");
 const { Zk1CasTerminalAnchor } = require("../src/services/zk1CasTerminalAnchor");
 const { Zk1WitnessCasAnchorHttpsClient } =
@@ -19,7 +21,34 @@ const FIELDS = Object.freeze([
 ]);
 const ANCHOR_FIELDS = Object.freeze(["endpoint", "caPath", "clientKeyPath",
   "clientCertPath", "serverFingerprint256"]);
+const BIND_HOST_ENV = "ROOTARK_ZK1_CAS_PRIVATE_BIND_HOST";
+const BIND_INTERFACE_ENV = "ROOTARK_ZK1_CAS_PRIVATE_BIND_INTERFACE";
 function fail() { throw new Error("CAS_STATUS_STARTUP_FAILED"); }
+function validateListenHost(host) {
+  const pinnedHost = process.env[BIND_HOST_ENV];
+  const pinnedInterface = process.env[BIND_INTERFACE_ENV];
+  if (host === "127.0.0.1" || host === "::1") {
+    // A stale/partial remote opt-in must never silently fall back to loopback.
+    if (pinnedHost !== undefined || pinnedInterface !== undefined) fail();
+    return;
+  }
+  // A literal, canonical RFC1918 IPv4 address is required: no wildcard,
+  // DNS resolution, IPv6 mapped/ULA, link-local, CGNAT or public endpoint.
+  if (typeof host !== "string" || net.isIP(host) !== 4
+    || pinnedHost !== host || typeof pinnedInterface !== "string"
+    || !pinnedInterface || pinnedInterface.length > 128) fail();
+  const [a, b] = host.split(".").map(Number);
+  if (!(a === 10 || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 168))) fail();
+  // The operator separately pins the exact OS interface. This cannot prove
+  // remote operator custody, firewall policy or network isolation.
+  const interfaces = os.networkInterfaces();
+  const addresses = Object.hasOwn(interfaces, pinnedInterface)
+    ? interfaces[pinnedInterface] : null;
+  if (!Array.isArray(addresses) || !addresses.some((address) =>
+    (address.family === "IPv4" || address.family === 4)
+    && address.internal === false && address.address === host)) fail();
+}
 function exact(value, fields) {
   if (!value || typeof value !== "object" || Array.isArray(value)
     || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
@@ -43,16 +72,23 @@ async function configure(config) {
   exact(config, Object.hasOwn(config || {}, "casAnchorWitness")
     ? [...FIELDS, "casAnchorWitness"] : FIELDS);
   if ((config.bootstrapNew !== true && config.bootstrapNew !== false)
-    || !["127.0.0.1", "::1"].includes(config.listenHost)
     || !Number.isSafeInteger(config.listenPort)
     || config.listenPort < 0 || config.listenPort > 65535
     || typeof config.dbPath !== "string" || !path.isAbsolute(config.dbPath)
     || typeof config.anchorPath !== "string" || !path.isAbsolute(config.anchorPath)
     || path.resolve(config.anchorPath) === path.resolve(config.dbPath)) fail();
+  validateListenHost(config.listenHost);
   const statusKeyId = id(config.statusKeyId);
   const statusPrivateKey = crypto.createPrivateKey(readFile(config.statusPrivateKeyPath));
   const witnessKeyId = id(config.witnessKeyId);
   const witnessPublicKey = crypto.createPublicKey(readFile(config.witnessPublicKeyPath));
+  const serverCert = readFile(config.serverCertPath);
+  if (config.listenHost !== "127.0.0.1" && config.listenHost !== "::1") {
+    // Remote clients must be able to authenticate the offered IP with their
+    // trusted CA, a SAN and their separately pinned server fingerprint.
+    const certificate = new crypto.X509Certificate(serverCert);
+    if (!certificate.checkIP(config.listenHost, { subject: "never" })) fail();
+  }
   let casAnchorWitness = null;
   let trustedAnchorMinimumHead;
   if (Object.hasOwn(config, "casAnchorWitness")) {
@@ -97,7 +133,7 @@ async function configure(config) {
       ledger,
       server: createZk1CasStatusHttpsServer({
         key: readFile(config.serverKeyPath),
-        cert: readFile(config.serverCertPath),
+        cert: serverCert,
         clientCa: readFile(config.clientCaPath),
         principals: config.principals,
         ledger,
@@ -129,6 +165,19 @@ async function main() {
     process.exitCode = 1;
   });
   server.listen(config.listenPort, config.listenHost, () => {
+    // Recheck after binding in case an interface was reconfigured during
+    // startup; the kernel bind alone does not establish operator identity.
+    try {
+      validateListenHost(config.listenHost);
+      if (server.address()?.address !== config.listenHost) fail();
+    } catch (_) {
+      void drainZk1CasStatusHttpsServer(server)
+        .catch(() => { server.closeAllConnections(); })
+        .finally(() => { try { ledger.close(); } catch (_) { /* fail closed */ } });
+      process.stderr.write("CAS_STATUS_STARTUP_FAILED\n");
+      process.exitCode = 1;
+      return;
+    }
     // Only disposable test supervisor receives the selected ephemeral port.
     if (typeof process.send === "function") {
       process.send({ type: "ready", port: server.address().port });

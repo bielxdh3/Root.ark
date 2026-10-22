@@ -6,6 +6,7 @@
 // HTTP 200 as proof of a committed operation.
 const https = require("node:https");
 const tls = require("node:tls");
+const net = require("node:net");
 
 const FINGERPRINT = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
 const B64U = /^[A-Za-z0-9_-]+$/;
@@ -76,7 +77,8 @@ function createZk1CasStatusHttpsClient({
           agent: false, // always recheck this CAS-status client's exact server pin
           ca, cert: clientCert, key: clientKey,
           rejectUnauthorized: true, minVersion: "TLSv1.3",
-          servername: url.hostname,
+          // IP SAN is verified below; SNI is only defined for DNS hostnames.
+          servername: net.isIP(url.hostname) ? "" : url.hostname,
           checkServerIdentity(hostname, peer) {
             const hostError = tls.checkServerIdentity(hostname, peer);
             if (hostError) return hostError;
