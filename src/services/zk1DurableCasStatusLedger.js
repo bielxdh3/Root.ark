@@ -95,7 +95,7 @@ function identityFingerprint(publicKey) {
 
 class Zk1DurableCasStatusLedger {
   constructor(filename, { bootstrapNew = false, statusKeyId, statusPrivateKey,
-    witnessPinned, nowSeconds, anchorPath } = {}) {
+    witnessPinned, nowSeconds, anchorPath, trustedAnchorMinimumHead } = {}) {
     if (typeof filename !== "string" || !filename
       || !(statusPrivateKey instanceof crypto.KeyObject)
       || statusPrivateKey.type !== "private" || statusPrivateKey.asymmetricKeyType !== "ed25519"
@@ -116,6 +116,10 @@ class Zk1DurableCasStatusLedger {
     const absolute = path.resolve(filename);
     const existed = fs.existsSync(absolute);
     if (!existed && !bootstrapNew) fail("CAS_BOOTSTRAP_REQUIRED");
+    // A nonempty external floor identifies an existing independently kept
+    // terminal history, never a reason to create an empty writable CAS.
+    // Reject malformed/bootstrap floor settings before creating either disk.
+    if (!existed && trustedAnchorMinimumHead !== undefined) fail("CAS_ANCHOR_REQUIRED");
     if (typeof anchorPath !== "string" || !path.isAbsolute(anchorPath)
       || path.resolve(anchorPath) === absolute) fail("CAS_ANCHOR_REQUIRED");
     const anchorExisted = fs.existsSync(anchorPath);
@@ -151,6 +155,7 @@ class Zk1DurableCasStatusLedger {
       // Refuse invalid foreign anchors before any SQLite write-mode open.
       new Zk1CasTerminalAnchor(anchorPath, {
         bootstrapNew: false, statusKeyId: this.statusKeyId, statusPrivateKey,
+        trustedMinimumHead: trustedAnchorMinimumHead,
       });
       if (fileIdentity() !== expectedFile) fail("CAS_STATE_MISSING");
     } else {
@@ -204,6 +209,7 @@ class Zk1DurableCasStatusLedger {
         bootstrapNew: !existed && bootstrapNew,
         statusKeyId: this.statusKeyId,
         statusPrivateKey,
+        trustedMinimumHead: trustedAnchorMinimumHead,
       });
       this.scopeRow = this.db.prepare("SELECT * FROM cas_scope WHERE scope_key=?");
       this.operationRow = this.db.prepare("SELECT * FROM cas_operation WHERE reservation_id=?");

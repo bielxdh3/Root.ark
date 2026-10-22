@@ -42,7 +42,11 @@ function signatureInput(record) {
     PAYLOAD.map((field) => [field, record[field]]))))]);
 }
 class Zk1CasTerminalAnchor {
-  constructor(filename, { bootstrapNew, statusKeyId, statusPrivateKey } = {}) {
+  #trustedMinimumHead;
+  #verifiedSnapshot = null;
+  #verifiedFileIdentity = null;
+  constructor(filename, { bootstrapNew, statusKeyId, statusPrivateKey,
+    trustedMinimumHead } = {}) {
     if (typeof filename !== "string" || !path.isAbsolute(filename)
       || !(statusPrivateKey instanceof crypto.KeyObject)
       || statusPrivateKey.asymmetricKeyType !== "ed25519" || statusPrivateKey.type !== "private"
@@ -56,7 +60,30 @@ class Zk1CasTerminalAnchor {
     this.anchoredScopes = new Set();
     this.sequence = 0;
     this.previousHash = "0".repeat(64);
+    // This floor MUST be provisioned from an independently retained owner /
+    // witness checkpoint, never copied from the same mutable anchor file on
+    // the next startup. A signed old history is still a rollback without it.
+    // Keep the bytes in a private slot: caller mutations cannot lower it.
+    if (trustedMinimumHead !== undefined) {
+      if (!trustedMinimumHead || typeof trustedMinimumHead !== "object"
+        || Array.isArray(trustedMinimumHead)
+        || ![Object.prototype, null].includes(Object.getPrototypeOf(trustedMinimumHead))
+        || Reflect.ownKeys(trustedMinimumHead).length !== 2) fail();
+      const seq = Object.getOwnPropertyDescriptor(trustedMinimumHead, "sequence");
+      const hash = Object.getOwnPropertyDescriptor(trustedMinimumHead, "lastHash");
+      if (!seq || !Object.hasOwn(seq, "value") || !hash
+        || !Object.hasOwn(hash, "value")
+        || !Number.isSafeInteger(seq.value) || seq.value < 0
+        || typeof hash.value !== "string" || !/^[0-9a-f]{64}$/.test(hash.value)
+        || (seq.value === 0 && hash.value !== "0".repeat(64))) fail();
+      this.#trustedMinimumHead = Object.freeze({
+        sequence: seq.value, lastHash: hash.value,
+      });
+    }
     if (!fs.existsSync(filename)) {
+      // A nonempty independently pinned floor means THIS IS A RESTART, not
+      // a bootstrap. Refuse before creating even a genesis anchor file.
+      if (this.#trustedMinimumHead !== undefined) fail();
       if (bootstrapNew !== true) fail();
       // Do not create an implicit new anchor at an unexpected path on restart.
       fs.mkdirSync(path.dirname(filename), { recursive: true });
@@ -70,13 +97,62 @@ class Zk1CasTerminalAnchor {
   }
 
   reload(force = false) {
-    const stat = fs.statSync(this.filename);
-    if (!force && this.lastSize === stat.size && this.lastModified === stat.mtimeMs) return;
+    let raw;
+    let stat;
+    try {
+      const namedBefore = fs.lstatSync(this.filename, { bigint: true });
+      if (!namedBefore.isFile() || namedBefore.isSymbolicLink()
+        || namedBefore.nlink !== 1n || namedBefore.size > BigInt(MAX_BYTES)) fail();
+      const fd = fs.openSync(this.filename,
+        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+        | (fs.constants.O_CLOEXEC || 0));
+      try {
+        const before = fs.fstatSync(fd, { bigint: true });
+        if (!before.isFile() || before.nlink !== 1n
+          || before.dev !== namedBefore.dev || before.ino !== namedBefore.ino
+          || before.size !== namedBefore.size || before.mtimeNs !== namedBefore.mtimeNs
+          || before.ctimeNs !== namedBefore.ctimeNs) fail();
+        // Never accept a cached signature on the strength of size/mtime.
+        // Reads use this fixed FD, not a pathname that can be retargeted
+        // between stat() and readFile().
+        raw = fs.readFileSync(fd);
+        const after = fs.fstatSync(fd, { bigint: true });
+        const namedAfter = fs.lstatSync(this.filename, { bigint: true });
+        if (raw.length !== Number(before.size)
+          || !namedAfter.isFile() || namedAfter.isSymbolicLink()
+          || namedAfter.nlink !== 1n || after.nlink !== 1n
+          || after.dev !== before.dev || after.ino !== before.ino
+          || after.size !== before.size || after.mtimeNs !== before.mtimeNs
+          || after.ctimeNs !== before.ctimeNs
+          || namedAfter.dev !== before.dev || namedAfter.ino !== before.ino
+          || namedAfter.size !== before.size || namedAfter.mtimeNs !== before.mtimeNs
+          || namedAfter.ctimeNs !== before.ctimeNs) fail();
+        stat = { size: raw.length, mtimeMs: Number(after.mtimeMs) };
+        this.#verifiedFileIdentity = { dev: before.dev, ino: before.ino,
+          size: before.size };
+      } finally { fs.closeSync(fd); }
+    } catch (_) { fail(); }
+    const currentDigest = crypto.createHash("sha256").update(raw).digest();
+    if (this.#verifiedSnapshot && crypto.timingSafeEqual(
+      currentDigest, this.#verifiedSnapshot.digest)) {
+      // Re-parse only if the CONTENT changed. The exact prior bytes were
+      // authenticated under the same pinned Ed25519 signer/floor. Rehydrate
+      // private immutable verified records so public map/head mutations
+      // cannot create a bypass or need a fresh O(n) Ed25519 scan per GET.
+      const cached = this.#verifiedSnapshot;
+      this.records = new Map(cached.records);
+      this.anchoredScopes = new Set(cached.anchoredScopes);
+      this.sequence = cached.sequence;
+      this.previousHash = cached.previousHash;
+      this.lastSize = stat.size;
+      this.lastModified = stat.mtimeMs;
+      return;
+    }
+    this.#verifiedSnapshot = null;
     this.records = new Map();
     this.anchoredScopes = new Set();
     this.sequence = 0;
     this.previousHash = "0".repeat(64);
-    const raw = fs.readFileSync(this.filename);
     if (!raw.length || raw.length > MAX_BYTES || raw.at(-1) !== 10) fail();
     const lines = raw.toString("utf8").split("\n");
     lines.pop();
@@ -91,13 +167,31 @@ class Zk1CasTerminalAnchor {
       catch (_) { fail(); }
       this.verify(item);
       if (JSON.stringify(item) !== line) fail();
-      this.records.set(item.reservation, item);
+      this.records.set(item.reservation, Object.freeze(item));
       this.anchoredScopes.add(item.scope);
       this.sequence = item.sequence;
       this.previousHash = digest(line);
+      if (this.#trustedMinimumHead?.sequence === item.sequence
+        && this.previousHash !== this.#trustedMinimumHead.lastHash) fail();
     }
+    if (this.#trustedMinimumHead
+      && (this.sequence < this.#trustedMinimumHead.sequence
+        || (this.#trustedMinimumHead.sequence === 0
+          && this.#trustedMinimumHead.lastHash !== "0".repeat(64)))) fail();
     this.lastSize = stat.size;
     this.lastModified = stat.mtimeMs;
+    this.#verifiedSnapshot = {
+      digest: currentDigest,
+      records: new Map(this.records), anchoredScopes: new Set(this.anchoredScopes),
+      sequence: this.sequence, previousHash: this.previousHash,
+    };
+  }
+
+  headCheckpoint() {
+    // This returns a candidate for the caller to pin OUTSIDE this file and
+    // outside this host/operator. It is not an independent anchor by itself.
+    this.reload(true);
+    return Object.freeze({ sequence: this.sequence, lastHash: this.previousHash });
   }
 
   verify(item) {
@@ -118,12 +212,14 @@ class Zk1CasTerminalAnchor {
   }
 
   get(reservationId) {
-    this.reload();
+    // A trusted read-side floor cannot rely on size + mtime. A malicious
+    // writer can change signed bytes and preserve both metadata fields.
+    this.reload(true);
     return this.records.get(base64(reservationId)) ?? null;
   }
 
   hasScope(query) {
-    this.reload();
+    this.reload(true);
     return this.anchoredScopes.has(scopeKey(query));
   }
 
@@ -263,13 +359,36 @@ class Zk1CasTerminalAnchor {
       record.signature = base64(crypto.sign(null, signatureInput(record), this.privateKey));
       this.verify(record);
       const line = JSON.stringify(record);
-      const current = fs.statSync(this.filename);
-      if (current.size + Buffer.byteLength(line) + 1 > MAX_BYTES) fail();
-      const fd = fs.openSync(this.filename, "a");
+      const written = Buffer.from(line + "\n");
+      const pinned = this.#verifiedFileIdentity;
+      if (!pinned || pinned.size + BigInt(written.length) > BigInt(MAX_BYTES)) fail();
+      let fd;
       try {
-        fs.writeSync(fd, line + "\n");
+        const before = fs.lstatSync(this.filename, { bigint: true });
+        if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
+          || before.dev !== pinned.dev || before.ino !== pinned.ino
+          || before.size !== pinned.size) fail();
+        fd = fs.openSync(this.filename,
+          fs.constants.O_WRONLY | fs.constants.O_APPEND
+          | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
+        const opened = fs.fstatSync(fd, { bigint: true });
+        const named = fs.lstatSync(this.filename, { bigint: true });
+        if (!opened.isFile() || opened.nlink !== 1n
+          || opened.dev !== pinned.dev || opened.ino !== pinned.ino
+          || opened.size !== pinned.size || named.isSymbolicLink()
+          || named.dev !== opened.dev || named.ino !== opened.ino
+          || named.nlink !== 1n) fail();
+        if (fs.writeSync(fd, written) !== written.length) fail();
         fs.fsyncSync(fd);
-      } finally { fs.closeSync(fd); }
+        const after = fs.fstatSync(fd, { bigint: true });
+        const namedAfter = fs.lstatSync(this.filename, { bigint: true });
+        if (after.dev !== opened.dev || after.ino !== opened.ino
+          || after.nlink !== 1n || after.size !== opened.size + BigInt(written.length)
+          || namedAfter.isSymbolicLink() || namedAfter.nlink !== 1n
+          || namedAfter.dev !== opened.dev || namedAfter.ino !== opened.ino
+          || namedAfter.size !== after.size) fail();
+      } catch (_) { fail(); }
+      finally { if (fd !== undefined) fs.closeSync(fd); }
       this.reload(true);
       return true;
     } finally {

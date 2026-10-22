@@ -311,6 +311,41 @@ test("CAS refuses bootstrap on a missing or tampered external terminal anchor", 
   assert.throws(() => f.openCas({ bootstrapNew: false }), /CAS_ANCHOR_STATE_MISMATCH/);
 });
 
+test("durable CAS refuses separately pinned signed anchor rollback before SQLite write-mode reopen", async (t) => {
+  const f = await setup(t);
+  const initialAnchor = fs.readFileSync(f.casOptions.anchorPath);
+  await f.cas.registerReservation({ receipt: f.ticket });
+  await f.cas.commit({ receipt: f.ticket, manifestBytes: f.manifestBytes });
+  const independentFloor = f.cas.anchor.headCheckpoint();
+  assert.equal(independentFloor.sequence, 1);
+  f.cas.close();
+  fs.writeFileSync(f.casOptions.anchorPath, initialAnchor);
+  assert.throws(() => f.openCas({ bootstrapNew: false,
+    trustedAnchorMinimumHead: independentFloor }), /CAS_ANCHOR_INVALID/,
+  "a signed valid genesis-only journal cannot erase an externally pinned terminal event");
+  // The digest pinned by the owner cannot be substituted for a forged hash at
+  // the same sequence even if the CAS database is otherwise untouched.
+  fs.writeFileSync(f.casOptions.anchorPath, initialAnchor);
+  const future = { ...independentFloor, lastHash: "a".repeat(64) };
+  assert.throws(() => f.openCas({ bootstrapNew: false,
+    trustedAnchorMinimumHead: future }), /CAS_ANCHOR_INVALID/);
+});
+
+test("a configured external CAS floor cannot create empty SQLite or anchor bootstrap files", async (t) => {
+  const f = await setup(t);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-no-floor-bootstrap-"));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const sqlite = path.join(outside, "cas.sqlite");
+  const journal = path.join(outside, "terminal.log");
+  const head = { sequence: 1, lastHash: "1".repeat(64) };
+  assert.throws(() => new Zk1DurableCasStatusLedger(sqlite, {
+    ...f.casOptions, anchorPath: journal, bootstrapNew: true,
+    trustedAnchorMinimumHead: head,
+  }), /CAS_ANCHOR_REQUIRED/);
+  assert.equal(fs.existsSync(sqlite), false);
+  assert.equal(fs.existsSync(journal), false);
+});
+
 test("crash after SQLite commit but before anchor finalization safely reconciles authentic lost ACK", async (t) => {
   const f = await setup(t);
   await f.cas.registerReservation({ receipt: f.ticket });
