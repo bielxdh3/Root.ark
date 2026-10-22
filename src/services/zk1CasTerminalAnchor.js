@@ -18,6 +18,37 @@ function fail() {
   error.code = "CAS_ANCHOR_INVALID";
   throw error;
 }
+// O_NOFOLLOW protects only the last pathname component. On both Unix and
+// Windows, an ancestor may instead be a symlink/junction to the SAME inode;
+// the journal's existing FD identity checks alone cannot detect that escape.
+// Anchor directories must be private to this service's OS principal. A
+// privileged actor able to rename trusted ancestors still needs an external
+// owner/witness floor for rollback protection.
+function assertPrivateDirectory(filename) {
+  let current = path.dirname(filename);
+  const containingDirectory = current;
+  try {
+    while (true) {
+      const stat = fs.lstatSync(current, { bigint: true });
+      if (!stat.isDirectory() || stat.isSymbolicLink()) fail();
+      if (process.platform !== "win32") {
+        const owner = BigInt(process.getuid());
+        const writableByOthers = (stat.mode & 0o022n) !== 0n;
+        const sticky = (stat.mode & 0o1000n) !== 0n;
+        if ((current === containingDirectory && (stat.uid !== owner || writableByOthers))
+          || (current !== containingDirectory && writableByOthers
+            && !(sticky && (stat.uid === 0n || stat.uid === owner)))) fail();
+      }
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  } catch (_) { fail(); }
+}
+function assertPrivateFile(stat) {
+  if (process.platform !== "win32"
+    && (stat.uid !== BigInt(process.getuid()) || (stat.mode & 0o077n) !== 0n)) fail();
+}
 function strict(obj, fields) {
   if (!obj || typeof obj !== "object" || Array.isArray(obj)
     || Object.keys(obj).length !== fields.length
@@ -102,12 +133,14 @@ class Zk1CasTerminalAnchor {
         && this.#trustedMinimumHead.sequence !== 0) fail();
       if (bootstrapNew !== true) fail();
       // Do not create an implicit new anchor at an unexpected path on restart.
-      fs.mkdirSync(path.dirname(filename), { recursive: true });
+      fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
+      assertPrivateDirectory(filename);
       const fd = fs.openSync(filename, "wx", 0o600);
       try {
         fs.writeSync(fd, JSON.stringify(this.identity) + "\n");
         fs.fsyncSync(fd);
       } finally { fs.closeSync(fd); }
+      assertPrivateDirectory(filename);
     }
     this.reload(true);
   }
@@ -116,9 +149,11 @@ class Zk1CasTerminalAnchor {
     let raw;
     let stat;
     try {
+      assertPrivateDirectory(this.filename);
       const namedBefore = fs.lstatSync(this.filename, { bigint: true });
       if (!namedBefore.isFile() || namedBefore.isSymbolicLink()
         || namedBefore.nlink !== 1n || namedBefore.size > BigInt(MAX_BYTES)) fail();
+      assertPrivateFile(namedBefore);
       const fd = fs.openSync(this.filename,
         fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
         | (fs.constants.O_CLOEXEC || 0));
@@ -128,12 +163,14 @@ class Zk1CasTerminalAnchor {
           || before.dev !== namedBefore.dev || before.ino !== namedBefore.ino
           || before.size !== namedBefore.size || before.mtimeNs !== namedBefore.mtimeNs
           || before.ctimeNs !== namedBefore.ctimeNs) fail();
+        assertPrivateFile(before);
         // Never accept a cached signature on the strength of size/mtime.
         // Reads use this fixed FD, not a pathname that can be retargeted
         // between stat() and readFile().
         raw = fs.readFileSync(fd);
         const after = fs.fstatSync(fd, { bigint: true });
         const namedAfter = fs.lstatSync(this.filename, { bigint: true });
+        assertPrivateDirectory(this.filename);
         if (raw.length !== Number(before.size)
           || !namedAfter.isFile() || namedAfter.isSymbolicLink()
           || namedAfter.nlink !== 1n || after.nlink !== 1n
@@ -143,6 +180,7 @@ class Zk1CasTerminalAnchor {
           || namedAfter.dev !== before.dev || namedAfter.ino !== before.ino
           || namedAfter.size !== before.size || namedAfter.mtimeNs !== before.mtimeNs
           || namedAfter.ctimeNs !== before.ctimeNs) fail();
+        assertPrivateFile(namedAfter);
         stat = { size: raw.length, mtimeMs: Number(after.mtimeMs) };
         this.#verifiedFileIdentity = { dev: before.dev, ino: before.ino,
           size: before.size };
@@ -278,8 +316,10 @@ class Zk1CasTerminalAnchor {
 
   getIntent(query) {
     const pathname = this.intentPath(query);
+    assertPrivateDirectory(pathname);
     if (!fs.existsSync(pathname)) return null;
     const bytes = fs.readFileSync(pathname);
+    assertPrivateDirectory(pathname);
     if (!bytes.length || bytes.length > 4096 || bytes.at(-1) !== 10) fail();
     let intent;
     try { intent = JSON.parse(bytes.toString("utf8")); }
@@ -307,6 +347,7 @@ class Zk1CasTerminalAnchor {
   }
 
   prepare(query, signedTicket, status, manifestBytes) {
+    assertPrivateDirectory(this.filename);
     const payload = this.intentPayload(query, signedTicket, status, manifestBytes);
     if (this.getIntent(query)) return this.assertIntent(query, signedTicket, status, manifestBytes);
     const intent = {
@@ -329,6 +370,7 @@ class Zk1CasTerminalAnchor {
       fd = undefined;
       try {
         fs.linkSync(temporary, filename);
+        assertPrivateDirectory(this.filename);
       } catch (error) {
         if (error?.code !== "EEXIST") throw error;
         return this.assertIntent(query, signedTicket, status, manifestBytes);
@@ -358,6 +400,7 @@ class Zk1CasTerminalAnchor {
   }
 
   async append(query, signedTicket, status, manifestBytes, terminalSeal) {
+    assertPrivateDirectory(this.filename);
     this.assertIntent(query, signedTicket, status, manifestBytes);
     // All live handles/processes must reload the signed journal under the
     // same exclusive file-create lock before assigning a new sequence.
@@ -367,6 +410,7 @@ class Zk1CasTerminalAnchor {
     let lock;
     for (let attempt = 0; attempt < 30; attempt += 1) {
       try {
+        assertPrivateDirectory(this.filename);
         lock = fs.openSync(lockPath, "wx", 0o600);
         break;
       } catch (error) {
@@ -393,6 +437,7 @@ class Zk1CasTerminalAnchor {
       if (!pinned || pinned.size + BigInt(written.length) > BigInt(MAX_BYTES)) fail();
       let fd;
       try {
+        assertPrivateDirectory(this.filename);
         const before = fs.lstatSync(this.filename, { bigint: true });
         if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
           || before.dev !== pinned.dev || before.ino !== pinned.ino
@@ -402,20 +447,26 @@ class Zk1CasTerminalAnchor {
           | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
         const opened = fs.fstatSync(fd, { bigint: true });
         const named = fs.lstatSync(this.filename, { bigint: true });
+        assertPrivateDirectory(this.filename);
         if (!opened.isFile() || opened.nlink !== 1n
           || opened.dev !== pinned.dev || opened.ino !== pinned.ino
           || opened.size !== pinned.size || named.isSymbolicLink()
           || named.dev !== opened.dev || named.ino !== opened.ino
           || named.nlink !== 1n) fail();
+        assertPrivateFile(opened);
+        assertPrivateFile(named);
         if (fs.writeSync(fd, written) !== written.length) fail();
         fs.fsyncSync(fd);
         const after = fs.fstatSync(fd, { bigint: true });
         const namedAfter = fs.lstatSync(this.filename, { bigint: true });
+        assertPrivateDirectory(this.filename);
         if (after.dev !== opened.dev || after.ino !== opened.ino
           || after.nlink !== 1n || after.size !== opened.size + BigInt(written.length)
           || namedAfter.isSymbolicLink() || namedAfter.nlink !== 1n
           || namedAfter.dev !== opened.dev || namedAfter.ino !== opened.ino
           || namedAfter.size !== after.size) fail();
+        assertPrivateFile(after);
+        assertPrivateFile(namedAfter);
       } catch (_) { fail(); }
       finally { if (fd !== undefined) fs.closeSync(fd); }
       this.reload(true);
