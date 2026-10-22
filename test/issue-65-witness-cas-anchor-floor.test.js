@@ -100,7 +100,8 @@ test("witness floor refuses forged credentials, bad canonical signatures, replay
   f.floor.advance({ records: [first, second] });
   const forkPath = path.join(path.dirname(f.casPath), "cas-fork.log");
   fs.writeFileSync(forkPath,
-    fs.readFileSync(f.casPath, "utf8").split("\n").slice(0, 2).join("\n") + "\n");
+    fs.readFileSync(f.casPath, "utf8").split("\n").slice(0, 2).join("\n") + "\n",
+    { mode: 0o600 });
   const alternative = new Zk1CasTerminalAnchor(forkPath,
     { ...f.anchorOptions, bootstrapNew: false });
   const changed = await f.append(alternative);
