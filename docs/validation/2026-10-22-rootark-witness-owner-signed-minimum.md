@@ -10,12 +10,16 @@ This change adds an **opt-in mandatory signed minimum** controlled by **two
 independently retained** environment pins: the owner signer fingerprint AND the
 exact current signed-checkpoint digest. With both pins present in the witness
 service environment, startup requires a separate Ed25519 owner signature over
-the exact witness/status identities, floor sequence/hash and issued/expiry
+the exact witness/status key IDs AND SHA-256 public SPKI fingerprints,
+floor sequence/hash and issued/expiry
 timestamps. Missing, altered, expired, key-swapped, old-but-authentic or
 re-signed-by-another-owner configuration fails closed **before floor or main
 witness SQLite is opened for writing**. It does not change legacy behavior when
 both explicit environment pins are absent, and a signature present without the
-pins is not silently ignored.
+pins is not silently ignored. The signed-owner profile is **v2 only**:
+a valid v1 owner signature with authentic v1 checkpoint pins must fail closed.
+Legacy **unsigned** `casAnchorFloor.trustedMinimumHead` remains a separate
+explicit opt-in when both owner pins and the `owner` object are absent.
 
 ## Operator-supplied trust inputs
 
@@ -49,17 +53,25 @@ The example timestamps/sequence are illustrative only, **not** valid for any
 real deployment. The owner signs the following exact UTF-8 input using Ed25519:
 
 ```
-ASCII("Root.ark/zk-1/cas-owner-floor/v1\0") ||
+ASCII("Root.ark/zk-1/cas-owner-floor/v2\0") ||
 UTF8(JSON.stringify({
-  type: "rootark-zk1-cas-owner-floor/v1",
+  type: "rootark-zk1-cas-owner-floor/v2",
   witnessKeyId: <witnessKeyId as base64url 16 bytes>,
   statusKeyId: <statusKeyId as base64url 16 bytes>,
+  witnessSpkiSha256: <64 lowercase hex SHA256 of actual witness Ed25519 SPKI DER>,
+  statusSpkiSha256: <64 lowercase hex SHA256 of actual status Ed25519 SPKI DER>,
   sequence: <independently observed integer high-water>,
   lastHash: <independently observed lowercase SHA256 hex>,
   issuedAt: <UNIX seconds>,
   expiresAt: <UNIX seconds>
 }))
 ```
+
+The witness reconstructs these **fingerprints from the currently loaded
+witness private key's public half and status public key**, before opening
+either SQLite database. The owner must obtain both independently of mutable
+witness configuration. Config editors cannot reuse correct 16-byte key IDs
+with impostor keys and still satisfy an original v2 signature and its pins.
 
 The signature is unpadded base64url, exactly 86 characters. Witness startup
 rejects an issued timestamp more than 120 seconds in the future or more than
@@ -70,7 +82,7 @@ signer and the witness signer.
 The `ROOTARK_ZK1_CAS_FLOOR_OWNER_CHECKPOINT_SHA256` value is computed by:
 
 ```
-SHA256(ASCII("Root.ark/zk-1/cas-owner-floor/v1\0") ||
+SHA256(ASCII("Root.ark/zk-1/cas-owner-floor/v2\0") ||
        UTF8(JSON.stringify(<exact signed statement above>)) ||
        BASE64URL_DECODE(owner.signature))
 ```
@@ -85,7 +97,10 @@ has changed. The key fingerprint alone would not provide this property.
 The standalone witness subprocess regression includes valid startup and
 negative cases for a false owner key pin, missing checkpoint pin, stale valid
 checkpoint replay, stripped owner signature, changed floor, forged owner
-private key, and expired signed checkpoint. The
+private key, and expired signed checkpoint. Real subprocess bootstraps also
+exercise authentic v1 signer+pins refusal, a valid v2 signed zero minimum, and
+same-ID substitute witness/status Ed25519 keys with both v1/v2 pins; refused
+bootstrap must not create floor/witness databases. The
 independent `casAnchorFloor` SQLite remains subject to signed journal and
 physical rollback validation. Run:
 
@@ -113,3 +128,5 @@ git diff --check
 * HTTP ACKs, a signed historical journal, and this owner minimum do not prove
   S3/Google Drive/WebDAV long-term durability or remote physical STOP.
 * This is a development increment only: PR #228 remains draft, no merge/deploy.
+* Existing signed v1 checkpoints must be regenerated and both pins reprovisioned
+  out of band for the v2 profile. No v1 signed-owner migration fallback exists.

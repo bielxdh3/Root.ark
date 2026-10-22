@@ -3,13 +3,20 @@
 const crypto = require("node:crypto");
 
 // Shared byte contract for the offline owner and the standalone witness.
-// Keep the property order stable: JSON.stringify is the wire encoding in v1.
-const DOMAIN = Buffer.from("Root.ark/zk-1/cas-owner-floor/v1\0", "ascii");
+// Keep the property order stable: JSON.stringify is the signed wire encoding.
+// v1 is intentionally not supported by the owner-authenticated validator.
+const DOMAIN = Buffer.from("Root.ark/zk-1/cas-owner-floor/v2\0", "ascii");
 
-function statement({ witnessKeyId, statusKeyId, sequence, lastHash, issuedAt, expiresAt }) {
+function statement({ witnessKeyId, statusKeyId, witnessSpkiSha256, statusSpkiSha256,
+  sequence, lastHash, issuedAt, expiresAt }) {
+  if (typeof witnessSpkiSha256 !== "string" || !/^[a-f0-9]{64}$/.test(witnessSpkiSha256)
+    || typeof statusSpkiSha256 !== "string" || !/^[a-f0-9]{64}$/.test(statusSpkiSha256)) {
+    throw new Error("OWNER_FLOOR_CHECKPOINT_INVALID");
+  }
   return {
-    type: "rootark-zk1-cas-owner-floor/v1",
-    witnessKeyId, statusKeyId, sequence, lastHash, issuedAt, expiresAt,
+    type: "rootark-zk1-cas-owner-floor/v2",
+    witnessKeyId, statusKeyId, witnessSpkiSha256, statusSpkiSha256,
+    sequence, lastHash, issuedAt, expiresAt,
   };
 }
 

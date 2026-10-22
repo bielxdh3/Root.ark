@@ -156,6 +156,8 @@ function run(argv, now = Math.floor(Date.now() / 1000)) {
 
   const signedStatement = checkpoint.statement({
     witnessKeyId: data.witnessKeyId, statusKeyId: data.statusKeyId,
+    witnessSpkiSha256: checkpoint.spkiFingerprint(witnessPub).toString("hex"),
+    statusSpkiSha256: checkpoint.spkiFingerprint(statusPub).toString("hex"),
     sequence, lastHash, issuedAt: data.issuedAt, expiresAt: data.expiresAt,
   });
   const signature = crypto.sign(null, checkpoint.signingBytes(signedStatement), ownerPriv);

@@ -134,15 +134,20 @@ test("actual standalone witness refuses signed-prefix floor rollback against sep
   const keySpki = owner.publicKey.export({ type: "spki", format: "der" });
   const keyPin = crypto.createHash("sha256").update(keySpki).digest("hex");
   const issuedAt = Math.floor(Date.now() / 1000);
+  const witnessSpkiSha256 = crypto.createHash("sha256")
+    .update(witness.publicKey.export({ type: "spki", format: "der" })).digest("hex");
+  const statusSpkiSha256 = crypto.createHash("sha256")
+    .update(status.publicKey.export({ type: "spki", format: "der" })).digest("hex");
   function ownerStatement(head, dates = {}) {
     return {
-      type: "rootark-zk1-cas-owner-floor/v1",
+      type: "rootark-zk1-cas-owner-floor/v2",
       witnessKeyId: config.witnessKeyId, statusKeyId: config.statusKeyId,
+      witnessSpkiSha256, statusSpkiSha256,
       sequence: head.sequence, lastHash: head.lastHash,
       issuedAt: dates.issuedAt ?? issuedAt, expiresAt: dates.expiresAt ?? issuedAt + 3600,
     };
   }
-  const signedDomain = Buffer.from("Root.ark/zk-1/cas-owner-floor/v1\0", "ascii");
+  const signedDomain = Buffer.from("Root.ark/zk-1/cas-owner-floor/v2\0", "ascii");
   function ownerSignature(head, signer = owner.privateKey, dates = {}) {
     return crypto.sign(null, Buffer.concat([
       signedDomain, Buffer.from(JSON.stringify(ownerStatement(head, dates))),
@@ -161,6 +166,74 @@ test("actual standalone witness refuses signed-prefix floor rollback against sep
       expiresAt: issuedAt + 3600, signature },
   } };
   await start(signedConfig, true, keyPin, checkpointPin);
+  // Adversarial bootstrap: zero is an authentic floor but must NOT allow an
+  // editor to replace both public authorities while reusing their key IDs.
+  // The owner keeps its original signed checkpoint and two environment pins.
+  const bootstrapHead = { sequence: 0, lastHash: "0".repeat(64) };
+  const bootstrapSignature = ownerSignature(bootstrapHead);
+  const bootstrapPin = ownerCheckpointPin(bootstrapHead, bootstrapSignature);
+  const newBootstrap = (prefix) => ({ ...config, bootstrapNew: true,
+    dbPath: path.join(dir, prefix + "-witness.sqlite"),
+    casAnchorFloor: {
+      dbPath: path.join(dir, prefix + "-floor.sqlite"),
+      trustedMinimumHead: bootstrapHead,
+      owner: { publicKeyPath: files.ownerPub, issuedAt,
+        expiresAt: issuedAt + 3600, signature: bootstrapSignature },
+    },
+  });
+  await start(newBootstrap("legitimate-v2"), true, keyPin, bootstrapPin);
+  // A previously authentic v1 owner+checkpoint pin is no longer accepted.
+  // Verify actual v1 bytes rather than merely changing the v2 pin.
+  const oldStatement = {
+    type: "rootark-zk1-cas-owner-floor/v1",
+    witnessKeyId: config.witnessKeyId, statusKeyId: config.statusKeyId,
+    sequence: 0, lastHash: "0".repeat(64), issuedAt, expiresAt: issuedAt + 3600,
+  };
+  const oldDomain = Buffer.from("Root.ark/zk-1/cas-owner-floor/v1\0", "ascii");
+  const oldPayload = Buffer.from(JSON.stringify(oldStatement));
+  const oldSig = crypto.sign(null, Buffer.concat([oldDomain, oldPayload]), owner.privateKey);
+  const oldCheckpointPin = crypto.createHash("sha256")
+    .update(oldDomain).update(oldPayload).update(oldSig).digest("hex");
+  const oldOwner = { publicKeyPath: files.ownerPub, issuedAt,
+    expiresAt: issuedAt + 3600, signature: oldSig.toString("base64url") };
+  const oldBootstrap = newBootstrap("legacy-owner-v1-replay");
+  oldBootstrap.casAnchorFloor.owner = oldOwner;
+  await start(oldBootstrap, false, keyPin, oldCheckpointPin);
+  assert.equal(fs.existsSync(oldBootstrap.dbPath), false);
+  assert.equal(fs.existsSync(oldBootstrap.casAnchorFloor.dbPath), false);
+  const forgedWitness = crypto.generateKeyPairSync("ed25519");
+  const forgedStatus = crypto.generateKeyPairSync("ed25519");
+  const forgedWitnessPath = path.join(dir, "impostor-witness-private.pem");
+  const forgedStatusPath = path.join(dir, "impostor-status-public.pem");
+  fs.writeFileSync(forgedWitnessPath, forgedWitness.privateKey.export({ type: "pkcs8", format: "pem" }));
+  fs.writeFileSync(forgedStatusPath, forgedStatus.publicKey.export({ type: "spki", format: "pem" }));
+  const forged = { ...newBootstrap("impostor-v2"),
+    witnessPrivateKeyPath: forgedWitnessPath,
+    statusPublicKeyPath: forgedStatusPath,
+    // The key IDs are intentionally unchanged from the legitimate service.
+  };
+  await start(forged, false, keyPin, bootstrapPin);
+  assert.equal(fs.existsSync(forged.dbPath), false,
+    "rejected signed bootstrap must not open a new witness DB");
+  assert.equal(fs.existsSync(forged.casAnchorFloor.dbPath), false,
+    "rejected signed bootstrap must not open a new floor DB");
+  for (const [label, paths] of [
+    ["witness-only", { witnessPrivateKeyPath: forgedWitnessPath }],
+    ["status-only", { statusPublicKeyPath: forgedStatusPath }],
+  ]) {
+    const changed = { ...newBootstrap("impostor-v2-" + label), ...paths };
+    await start(changed, false, keyPin, bootstrapPin);
+    assert.equal(fs.existsSync(changed.dbPath), false);
+    assert.equal(fs.existsSync(changed.casAnchorFloor.dbPath), false);
+  }
+  const oldForged = { ...newBootstrap("impostor-owner-v1-replay"),
+    witnessPrivateKeyPath: forgedWitnessPath,
+    statusPublicKeyPath: forgedStatusPath,
+  };
+  oldForged.casAnchorFloor.owner = oldOwner;
+  await start(oldForged, false, keyPin, oldCheckpointPin);
+  assert.equal(fs.existsSync(oldForged.dbPath), false);
+  assert.equal(fs.existsSync(oldForged.casAnchorFloor.dbPath), false);
   // Actual offline CLI artifact, then actual witness process startup: no
   // exported test helper can bypass the on-disk owner pin or signature check.
   const signerInput = path.join(dir, "operator-minimum.json");

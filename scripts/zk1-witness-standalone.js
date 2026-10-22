@@ -155,10 +155,16 @@ function configure(config) {
       const witnessSpki = crypto.createPublicKey(witnessPrivateKey)
         .export({ type: "spki", format: "der" });
       const statusSpki = statusPublicKey.export({ type: "spki", format: "der" });
-      if (ownerSpki.equals(witnessSpki) || ownerSpki.equals(statusSpki)) fail();
+      if (ownerSpki.equals(witnessSpki) || ownerSpki.equals(statusSpki)
+        || witnessSpki.equals(statusSpki)) fail();
+      const witnessSpkiSha256 = crypto.createHash("sha256").update(witnessSpki).digest("hex");
+      const statusSpkiSha256 = crypto.createHash("sha256").update(statusSpki).digest("hex");
+      // The v2 statement binds the *actual* loaded keys, not just editable
+      // 16-byte key IDs. Signature and independent digest reject key swaps.
       const ownerStatement = ownerFloorCheckpoint.statement({
         witnessKeyId: config.witnessKeyId,
         statusKeyId: config.statusKeyId,
+        witnessSpkiSha256, statusSpkiSha256,
         sequence: config.casAnchorFloor.trustedMinimumHead.sequence,
         lastHash: config.casAnchorFloor.trustedMinimumHead.lastHash,
         issuedAt: signed.issuedAt, expiresAt: signed.expiresAt,

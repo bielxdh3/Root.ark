@@ -1,10 +1,15 @@
 # Issue #65 — offline owner-side CAS witness minimum signer
 
-`scripts/zk1-owner-cas-floor-sign-offline.js` creates a version-1 Ed25519
+`scripts/zk1-owner-cas-floor-sign-offline.js` creates a version-2 Ed25519
 owner-authenticated CAS floor checkpoint without network access. It shares
 the *exact* domain, field order, signing bytes, signer fingerprint and
 checkpoint digest implementation with `scripts/zk1-witness-standalone.js` via
-`src/crypto/rootark-zk1-owner-cas-floor-checkpoint.js`.
+`src/crypto/rootark-zk1-owner-cas-floor-checkpoint.js`. Its signed statement
+includes `witnessSpkiSha256` and `statusSpkiSha256` in that exact order after
+the two 16-byte key IDs, computed from the independently provisioned public
+Ed25519 SPKI DER keys. It uses domain `Root.ark/zk-1/cas-owner-floor/v2\0`
+and type `rootark-zk1-cas-owner-floor/v2` exclusively. The prior signed v1
+domain/type is rejected by the standalone witness even with valid v1 pins.
 
 The owner must independently establish and retain the newest witnessed CAS
 `sequence` and `lastHash`. The CLI **does not inspect witness or CAS databases,
@@ -72,7 +77,11 @@ object consumed by the standalone service, and both independent `envPins`:
   canonical statement and raw 64-byte owner signature.
 
 The witness config additionally needs its independently selected
-`casAnchorFloor.dbPath`. Place the owner **public** PEM at an appropriate
+`casAnchorFloor.dbPath`. Keep **both witness/status public-key fingerprints**
+from the owner-provisioned checkpoint consistent with the actual witness
+private key's public half and CAS status public key. A config editor substituting
+either signer while preserving its 16-byte key ID fails before SQLite opens.
+Place the owner **public** PEM at an appropriate
 absolute path on the witness host and update only
 `casAnchorFloor.owner.publicKeyPath` if the path differs; that path itself is
 not in the signed statement. Provision the two pins **out of band** in the
@@ -98,7 +107,10 @@ git diff --check
 
 The standalone subprocess test signs with the offline CLI, starts the real
 witness against a disposable genuine signed CAS floor, and rejects altered
-minimum/key and old signed-checkpoint replay. The CLI test additionally
+minimum/key, authentic signed-v1 downgrade (including same-ID impostors),
+v2 signer substitution at floor zero, and old signed-checkpoint replay. The
+CLI test verifies the v2 Ed25519 signature binds both public fingerprints;
+it additionally
 rejects key reuse (including identical witness/status PEM contents at different
 paths), duplicate authority IDs, divergent PEM, forged source, bad timestamps,
 outside-owned paths and overwrite attempts without creating an artifact.
@@ -112,3 +124,5 @@ Windows ACL enforcement and clock integrity are operator responsibilities;
 an attacker controlling the host, owner key, pin environment or retained
 monotonic checkpoint can defeat the intended independent trust boundary.
 No production or multi-host attestation is claimed.
+Signed v1 installations require fresh owner-side v2 signing and independent
+reprovisioning of both pins; no downgrade mode exists under signed-owner policy.

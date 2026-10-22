@@ -7,6 +7,7 @@ const path = require("node:path");
 const os = require("node:os");
 const crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
+const checkpoint = require("../src/crypto/rootark-zk1-owner-cas-floor-checkpoint");
 
 const SCRIPT = path.resolve(__dirname, "../scripts/zk1-owner-cas-floor-sign-offline.js");
 const now = () => Math.floor(Date.now() / 1000);
@@ -55,6 +56,24 @@ test("owner offline signer enforces independent inputs, signer separation, custo
   assert.match(artifact.envPins.ROOTARK_ZK1_CAS_FLOOR_OWNER_SPKI_SHA256, /^[a-f0-9]{64}$/);
   assert.match(artifact.envPins.ROOTARK_ZK1_CAS_FLOOR_OWNER_CHECKPOINT_SHA256, /^[a-f0-9]{64}$/);
   assert.equal(JSON.stringify(artifact).includes("PRIVATE KEY"), false);
+  const v2Statement = checkpoint.statement({
+    witnessKeyId: minimum.witnessKeyId, statusKeyId: minimum.statusKeyId,
+    witnessSpkiSha256: checkpoint.spkiFingerprint(wit.publicKey).toString("hex"),
+    statusSpkiSha256: checkpoint.spkiFingerprint(sta.publicKey).toString("hex"),
+    sequence: minimum.trustedMinimumHead.sequence,
+    lastHash: minimum.trustedMinimumHead.lastHash,
+    issuedAt: minimum.issuedAt, expiresAt: minimum.expiresAt,
+  });
+  assert.equal(v2Statement.type, "rootark-zk1-cas-owner-floor/v2");
+  const signature = Buffer.from(artifact.casAnchorFloor.owner.signature, "base64url");
+  assert.equal(crypto.verify(null, checkpoint.signingBytes(v2Statement), own.publicKey,
+    signature), true, "owner CLI actually signs the exact v2 public-key identities");
+  assert.equal(checkpoint.checkpointDigest(v2Statement, signature).toString("hex"),
+    artifact.envPins.ROOTARK_ZK1_CAS_FLOOR_OWNER_CHECKPOINT_SHA256);
+  const wrongAuthorityStatement = { ...v2Statement,
+    statusSpkiSha256: checkpoint.spkiFingerprint(crypto.generateKeyPairSync("ed25519").publicKey).toString("hex") };
+  assert.equal(crypto.verify(null, checkpoint.signingBytes(wrongAuthorityStatement),
+    own.publicKey, signature), false);
   const original = fs.readFileSync(paths.output);
   function denied(input, changes) {
     const result = invoke(input, changes);
