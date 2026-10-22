@@ -532,6 +532,70 @@ test("one real signed PG operation requires independent S3 and Drive copy reread
   assert.equal(outcome.atomicCrossProviderCommitProven, false);
   assert.deepEqual(s3Bytes, expected);
   assert.deepEqual(driveBytes, expected);
+  let webdavBytes = null;
+  let webdavPuts = 0;
+  let corruptWebdavOnPut = false;
+  const webdavContext = crypto.createHash("sha256")
+    .update("disposable-three-provider-webdav-context").digest("hex");
+  const webdavKey = (folder, name, area) => {
+    assert.equal(area, "uploads");
+    return `zk1-three-provider-fixture/uploads/${folder}/${name}`;
+  };
+  const webdavPublisher = new Zk1CloudCiphertextCopyPublisher({
+    cloudWriter: {
+      enabled: () => true,
+      status: () => ({ provider: "webdav" }),
+      resolveInventoryContext: async () => webdavContext,
+      key: webdavKey,
+      async upload(staged, folder, name, area, opts) {
+        webdavPuts += 1;
+        assert.equal(opts.zk1BoundedBytes, expected.length);
+        webdavKey(folder, name, area);
+        webdavBytes = corruptWebdavOnPut
+          ? Buffer.alloc(expected.length, 0xaa) : fs.readFileSync(staged);
+        return { provider: "webdav", key: webdavKey(folder, name, area) };
+      },
+    },
+    expectedProvider: "webdav", expectedWriterContext: webdavContext,
+  });
+  const webdavVerifier = new Zk1CloudCiphertextReadbackVerifier({
+    cloudReader: {
+      enabled: () => true,
+      status: () => ({ provider: "webdav" }),
+      resolveInventoryContext: async () => webdavContext,
+      key: webdavKey,
+      async download(folder, name, destination, area, publish, opts) {
+        webdavKey(folder, name, area);
+        assert.ok(webdavBytes);
+        assert.equal(opts.maxBytes, expected.length);
+        if (!publish()) return false;
+        fs.writeFileSync(destination, webdavBytes, { flag: "wx", mode: 0o600 });
+        return true;
+      },
+    },
+    expectedProvider: "webdav", expectedReaderContext: webdavContext,
+  });
+  const webdav = { cloudPublisher: webdavPublisher, cloudVerifier: webdavVerifier };
+  await assert.rejects(bridge.publishAndReconcileCloudCopies({ ...args,
+    copies: [s3, drive, s3] }), /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+  "all third-provider identities must be prechecked before any writes");
+  assert.equal(webdavPuts, 0);
+  const allThree = { ...args, copies: [s3, drive, webdav] };
+  const combined = await bridge.publishAndReconcileCloudCopies(allThree);
+  assert.equal(combined.status, "PG_SIGNED_AND_THREE_CLOUD_COPIES_REREAD");
+  assert.deepEqual(combined.providers, ["s3", "gdrive", "webdav"]);
+  assert.equal(combined.providerCount, 3);
+  assert.equal(combined.authorizesIo, false);
+  assert.equal(combined.externalProviderDurabilityProven, false);
+  assert.equal(combined.independentRemoteIoFenceProven, false);
+  assert.equal(combined.atomicCrossProviderCommitProven, false);
+  assert.equal(webdavPuts, 1);
+  assert.deepEqual(webdavBytes, expected);
+  corruptWebdavOnPut = true;
+  await assert.rejects(bridge.publishAndReconcileCloudCopies(allThree),
+    /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+    "a remote provider that changes during reconciliation cannot be counted as a current copy");
+  corruptWebdavOnPut = false;
   const beforeFailure = s3Puts + drivePuts;
   await assert.rejects(bridge.publishAndReconcileCloudCopies({ ...args,
     chunks: [Buffer.alloc(f.chunks[0].length), f.chunks[1]] }),

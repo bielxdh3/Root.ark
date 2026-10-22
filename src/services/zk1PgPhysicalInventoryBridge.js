@@ -323,7 +323,7 @@ class Zk1PgPhysicalInventoryBridge {
       authorizesIo: false, externalProviderDurabilityProven: false,
       independentRemoteIoFenceProven: false });
   }
-  // An optional, deliberately NON-AUTHORIZING two-provider copy of one
+  // An optional, deliberately NON-AUTHORIZING multi-provider copy of one
   // historically signed physical operation. A late mutation/fault of the
   // first provider during the second provider's PUT is checked by a *second*
   // full readback of both providers. The two GETs are not an atomic snapshot;
@@ -332,10 +332,11 @@ class Zk1PgPhysicalInventoryBridge {
     const v = this.#request(physical);
     const detached = detachedChunks(chunks, v.expectedChunkCount,
       v.operation.ciphertext_sha256, v.expectedRootHash);
-    if (!Array.isArray(copies) || copies.length !== 2
-      || Reflect.ownKeys(copies).length !== 3) fail();
+    if (!Array.isArray(copies) || copies.length < 2 || copies.length > 3
+      || Reflect.ownKeys(copies).length !== copies.length + 1) fail();
     const targets = [];
-    for (let index = 0; index < 2; index += 1) {
+    const registeredProviders = new Set();
+    for (let index = 0; index < copies.length; index += 1) {
       const descriptor = Object.getOwnPropertyDescriptor(copies, String(index));
       if (!descriptor || !Object.hasOwn(descriptor, "value")) fail();
       const item = exact(descriptor.value, ["cloudPublisher", "cloudVerifier"]);
@@ -347,13 +348,14 @@ class Zk1PgPhysicalInventoryBridge {
       const readTarget = item.cloudVerifier.pinnedCopyTarget;
       if (pubTarget.provider !== readTarget.provider
         || pubTarget.driveFileId !== readTarget.driveFileId
-        || !["s3", "gdrive"].includes(pubTarget.provider)) fail();
+        || !["s3", "gdrive", "webdav"].includes(pubTarget.provider)
+        || registeredProviders.has(pubTarget.provider)
+        || targets.some((t) => t.publisher === item.cloudPublisher
+          || t.verifier === item.cloudVerifier)) fail();
+      registeredProviders.add(pubTarget.provider);
       targets.push({ publisher: item.cloudPublisher, verifier: item.cloudVerifier,
         configuredProvider: pubTarget.provider });
     }
-    if (targets[0].publisher === targets[1].publisher
-      || targets[0].verifier === targets[1].verifier
-      || targets[0].configuredProvider === targets[1].configuredProvider) fail();
     const fixed = { scope: v.scope, operation: v.operation,
       digest: v.digest, expectedRootHash: v.expectedRootHash,
       expectedChunkCount: v.expectedChunkCount };
@@ -394,10 +396,12 @@ class Zk1PgPhysicalInventoryBridge {
     const after = await this.reconcile(fixed);
     if (after.status !== signed.status || after.sequence !== signed.sequence
       || !same(after.root, signed.root)) fail();
-    return Object.freeze({ status: "PG_SIGNED_AND_TWO_CLOUD_COPIES_REREAD",
+    return Object.freeze({ status: targets.length === 2
+      ? "PG_SIGNED_AND_TWO_CLOUD_COPIES_REREAD"
+      : "PG_SIGNED_AND_THREE_CLOUD_COPIES_REREAD",
       operationId: Buffer.from(v.operation.operation_id),
       providers: Object.freeze([...providerSet]),
-      providerCount: 2, authorizesIo: false,
+      providerCount: targets.length, authorizesIo: false,
       externalProviderDurabilityProven: false,
       atomicCrossProviderCommitProven: false,
       independentRemoteIoFenceProven: false });
