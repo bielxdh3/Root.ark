@@ -18,6 +18,8 @@ const { Zk1CloudCiphertextReadbackVerifier, zk1CloudCopyAddress } =
   require("./zk1CloudCiphertextReadbackVerifier");
 const { Zk1CloudCiphertextCopyPublisher } =
   require("./zk1CloudCiphertextCopyPublisher");
+const { verifyOwnerInventoryEnrollment } =
+  require("../crypto/rootark-zk1-owner-inventory-trust-head");
 
 function fail() {
   const e = new Error("ZK_PHYSICAL_INVENTORY_UNAVAILABLE");
@@ -127,8 +129,9 @@ function cloudTargets(copies) {
 
 class Zk1PgPhysicalInventoryBridge {
   #trustedInventoryFloor;
+  #ownerInventoryEnrollment;
   constructor({ sink, verifier, intentAuthority, ledger, pinnedPublicKey, pinnedSignerKeyId,
-    trustedInventoryFloor } = {}) {
+    trustedInventoryFloor, ownerInventoryEnrollment } = {}) {
     if (!(sink instanceof Zk1SharedPgCiphertextSink)
       || !(verifier instanceof Zk1SharedPgPhysicalCiphertextVerifier)
       || !(intentAuthority instanceof Zk1SharedPgPhysicalInventoryIntent)
@@ -160,6 +163,36 @@ class Zk1PgPhysicalInventoryBridge {
         minimumSnapshot: Buffer.from(floor.minimumSnapshot),
       };
     }
+    if (ownerInventoryEnrollment !== undefined) {
+      const enrollment = exact(ownerInventoryEnrollment, ["checkpoints", "ownerPublicKey",
+        "independentOwnerSpkiSha256", "independentRetainedCheckpointDigest", "minimumSnapshot"]);
+      if (!(enrollment.ownerPublicKey instanceof crypto.KeyObject)
+        || enrollment.ownerPublicKey.type !== "public"
+        || enrollment.ownerPublicKey.asymmetricKeyType !== "ed25519"
+        || !Array.isArray(enrollment.checkpoints) || enrollment.checkpoints.length < 1
+        || enrollment.checkpoints.length > 64
+        || Reflect.ownKeys(enrollment.checkpoints).length !== enrollment.checkpoints.length + 1
+        || !Buffer.isBuffer(enrollment.minimumSnapshot)
+        || enrollment.minimumSnapshot.length < 1
+        || enrollment.minimumSnapshot.length > inventory.MAX_SNAPSHOT_BYTES) fail();
+      const copies = enrollment.checkpoints.map((checkpoint) => {
+        if (!checkpoint || typeof checkpoint !== "object" || Array.isArray(checkpoint)
+          || ![Object.prototype, null].includes(Object.getPrototypeOf(checkpoint))) fail();
+        const wire = Object.create(null);
+        for (const prop of Reflect.ownKeys(checkpoint)) {
+          const field = Object.getOwnPropertyDescriptor(checkpoint, prop);
+          if (typeof prop !== "string" || !field || !Object.hasOwn(field, "value")
+            || (field.value !== null && typeof field.value !== "string"
+              && typeof field.value !== "number")) fail();
+          wire[prop] = field.value;
+        }
+        return Object.freeze(wire);
+      });
+      this.#ownerInventoryEnrollment = Object.freeze({
+        ...enrollment, checkpoints: Object.freeze(copies),
+        minimumSnapshot: Buffer.from(enrollment.minimumSnapshot),
+      });
+    }
   }
   #request(input) {
     const v = copyRequest(input);
@@ -173,9 +206,20 @@ class Zk1PgPhysicalInventoryBridge {
   }
 
   async #verifiedInventoryFloor(v) {
-    if (!this.#trustedInventoryFloor) return null;
+    if (!this.#trustedInventoryFloor && !this.#ownerInventoryEnrollment) return null;
     try {
-      const { minimumHead, minimumSnapshot } = this.#trustedInventoryFloor;
+      const owner = this.#ownerInventoryEnrollment
+        ? await verifyOwnerInventoryEnrollment({
+          ...this.#ownerInventoryEnrollment, expectedScope: v.scope,
+          inventoryPublicKey: this.pinnedPublicKey,
+          inventorySignerKeyId: this.signerKeyId,
+          nowSeconds: Math.floor(Date.now() / 1000),
+        }) : null;
+      const { minimumHead, minimumSnapshot } = owner || this.#trustedInventoryFloor;
+      if (owner && this.#trustedInventoryFloor
+        && (this.#trustedInventoryFloor.minimumHead.sequence !== minimumHead.sequence
+          || !same(this.#trustedInventoryFloor.minimumHead.root, minimumHead.root)
+          || !same(this.#trustedInventoryFloor.minimumSnapshot, minimumSnapshot))) fail();
       const nonce = crypto.randomBytes(32);
       const current = await this.ledger.getSnapshot({ nonce });
       if (current.status !== "snapshot"
@@ -323,7 +367,9 @@ class Zk1PgPhysicalInventoryBridge {
       externalProviderDurabilityProven: false,
       // A caller-supplied floor is verified for chain consistency here, NOT
       // for independent owner custody. This must not become an owner pin.
-      callerSuppliedFloorConsistencyVerified: Boolean(this.#trustedInventoryFloor),
+      callerSuppliedFloorConsistencyVerified: Boolean(this.#trustedInventoryFloor
+        || this.#ownerInventoryEnrollment),
+      ownerSignedInventoryCheckpointVerified: Boolean(this.#ownerInventoryEnrollment),
       independentlyAnchoredFloorProven: false });
   }
   // Reconcile an already committed, physically immutable local ciphertext
@@ -444,7 +490,10 @@ class Zk1PgPhysicalInventoryBridge {
   // On partial failure callers may retry the identical request; the operation
   // ID, exact cloud object names and pinned Drive ID remain unchanged.
   async reconcileOrPublishAnchoredCloudCopies({ physical, chunks, copies } = {}) {
-    if (!this.#trustedInventoryFloor) fail();
+    // A mere caller-supplied minimumHead/snapshot can never activate a
+    // claim of owner-signed trust. The trusted signer and retained digest are
+    // checked before each provider operation, independently of the PG state.
+    if (!this.#ownerInventoryEnrollment) fail();
     const v = this.#request(physical);
     const detached = detachedChunks(chunks, v.expectedChunkCount,
       v.operation.ciphertext_sha256, v.expectedRootHash);
@@ -479,7 +528,7 @@ class Zk1PgPhysicalInventoryBridge {
       if (outcome.provider !== target.configuredProvider
         || outcome.providerFileId !== target.providerFileId
         || outcome.namespaceIdentity !== target.namespaceIdentity
-        || outcome.callerSuppliedFloorConsistencyVerified !== true
+        || outcome.ownerSignedInventoryCheckpointVerified !== true
         || outcome.inventorySequence !== signed.sequence
         || !same(outcome.inventoryRoot, signed.root)
         || !same(outcome.operationId, v.operation.operation_id)
@@ -503,7 +552,7 @@ class Zk1PgPhysicalInventoryBridge {
         || checked.inventorySequence !== signed.sequence
         || !same(checked.inventoryRoot, signed.root)
         || !same(checked.ciphertextSha256, v.operation.ciphertext_sha256)
-        || checked.callerSuppliedFloorConsistencyVerified !== true) fail();
+        || checked.ownerSignedInventoryCheckpointVerified !== true) fail();
     }
     const after = await this.reconcile(fixed);
     if (after.status !== signed.status || after.sequence !== signed.sequence
@@ -523,13 +572,22 @@ class Zk1PgPhysicalInventoryBridge {
     const observationDigest = crypto.createHash("sha256")
       .update("Root.ark/zk-1/multiprovider-observation/v1\0")
       .update(JSON.stringify(basis)).digest("hex");
-    return Object.freeze({ status: "PG_SIGNED_AND_CALLER_FLOOR_CLOUD_COPIES_REREAD",
+    const ownerHead = await verifyOwnerInventoryEnrollment({
+      ...this.#ownerInventoryEnrollment, expectedScope: v.scope,
+      inventoryPublicKey: this.pinnedPublicKey,
+      inventorySignerKeyId: this.signerKeyId,
+      nowSeconds: Math.floor(Date.now() / 1000),
+    });
+    return Object.freeze({ status: "PG_SIGNED_AND_OWNER_SIGNED_CLOUD_COPIES_REREAD",
       operationId: Buffer.from(v.operation.operation_id),
       signedInventorySequence: signed.sequence,
       signedInventoryRoot: Buffer.from(signed.root),
       ciphertextSha256: Buffer.from(v.operation.ciphertext_sha256),
       providerCount: receipts.length, providers: Object.freeze(receipts),
-      observationDigest, callerSuppliedFloorConsistencyVerified: true,
+      observationDigest, ownerSignedInventoryCheckpointVerified: true,
+      externallyPinnedCheckpointDigestMatched: true,
+      signedOwnerCounter: ownerHead.signedCounter,
+      ownerCheckpointDigest: ownerHead.ownerCheckpointDigest,
       independentlyAnchoredFloorProven: false,
       externalOwnerCustodyVerified: false,
       authorizesIo: false, externalProviderDurabilityProven: false,

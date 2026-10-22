@@ -8,6 +8,9 @@ const os = require("node:os");
 const path = require("node:path");
 const https = require("node:https");
 const { Readable } = require("node:stream");
+const { runOfflineSigner } =
+  require("./support/issue-65-owner-inventory-offline-runner");
+const { checkpointDigest } = require("../src/crypto/rootark-zk1-owner-inventory-trust-head");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 const { createZk1WebdavCiphertextAdapter } =
@@ -89,9 +92,37 @@ test("anchored signed operation reconciles lost ACK, partial three-provider copy
     object_id: crypto.randomBytes(16), revision: 1, epoch: 1,
     ciphertext_sha256: sha };
   assert.equal((await ledger.append(operation)).status, "committed");
+  const ownerCurrent = await ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+  const now = Math.floor(Date.now() / 1000);
+  const offline = await runOfflineSigner({
+    scope: Object.fromEntries(Object.entries(scope).map(([name, value]) =>
+      [name, value.toString("base64url")])),
+    inventorySignerKeyId: signerKeyId.toString("base64url"),
+    inventorySpkiSha256: crypto.createHash("sha256")
+      .update(keys.publicKey.export({ type: "spki", format: "der" })).digest("hex"),
+    heads: [
+      { sequence: genesis.sequence, root: genesis.root.toString("hex"),
+        snapshotSha256: crypto.createHash("sha256").update(genesis.bytes).digest("hex"),
+        issuedAt: now - 5, expiresAt: now + 600 },
+      { sequence: ownerCurrent.sequence, root: ownerCurrent.root.toString("hex"),
+        snapshotSha256: crypto.createHash("sha256").update(ownerCurrent.bytes).digest("hex"),
+        issuedAt: now - 4, expiresAt: now + 600 },
+    ],
+  });
+  const ownerPublicKey = crypto.createPublicKey({
+    key: Buffer.from(offline.ownerSpki, "base64url"), type: "spki", format: "der",
+  });
+  const ownerEnrollment = (raised = false) => ({
+    ownerPublicKey, independentOwnerSpkiSha256: offline.independentOwnerSpkiSha256,
+    independentRetainedCheckpointDigest: raised
+      ? offline.independentRetainedCheckpointDigest : checkpointDigest(offline.checkpoints[0]),
+    checkpoints: raised ? offline.checkpoints : [offline.checkpoints[0]],
+    minimumSnapshot: Buffer.from(raised ? ownerCurrent.bytes : genesis.bytes),
+  });
   const expected = { scope, operation, digest: crypto.randomBytes(32),
     expectedRootHash: root, expectedChunkCount: chunks.length };
-  const makeBridge = (pinned = floor) => {
+  const makeBridge = (pinned = floor, enrolled = pinned === false ? null
+    : ownerEnrollment(pinned !== floor)) => {
     // Disposable synthetic PG attestor only; the real Ed25519 SQLite ledger
     // and all remote GET/PUTs remain exercised in this isolated test.
     const verifier = Object.create(Zk1SharedPgPhysicalCiphertextVerifier.prototype);
@@ -107,6 +138,7 @@ test("anchored signed operation reconciles lost ACK, partial three-provider copy
       verifier, ledger, pinnedPublicKey: keys.publicKey,
       pinnedSignerKeyId: signerKeyId,
       ...(pinned === false ? {} : { trustedInventoryFloor: pinned }),
+      ...(enrolled === null ? {} : { ownerInventoryEnrollment: enrolled }),
     });
   };
 
@@ -189,7 +221,7 @@ test("anchored signed operation reconciles lost ACK, partial three-provider copy
     "partition retry does not needlessly rewrite independently verified copies");
   webdavPartitioned = false;
   const replayed = await makeBridge().reconcileOrPublishAnchoredCloudCopies(input);
-  assert.equal(replayed.status, "PG_SIGNED_AND_CALLER_FLOOR_CLOUD_COPIES_REREAD");
+  assert.equal(replayed.status, "PG_SIGNED_AND_OWNER_SIGNED_CLOUD_COPIES_REREAD");
   assert.deepEqual(replayed.providers.map((r) => r.mode), [
     "reused_verified_copy", "reused_verified_copy", "republished_and_verified"]);
   assert.deepEqual(counts, { s3: 1, gdrive: 1 }, "lost-ACK replay does not duplicate PUTs");
@@ -203,7 +235,9 @@ test("anchored signed operation reconciles lost ACK, partial three-provider copy
   assert.match(replayed.observationDigest, /^[a-f0-9]{64}$/);
   assert.equal(replayed.authorizesIo, false);
   assert.equal(replayed.externalProviderDurabilityProven, false);
-  assert.equal(replayed.callerSuppliedFloorConsistencyVerified, true);
+  assert.equal(replayed.ownerSignedInventoryCheckpointVerified, true);
+  assert.equal(replayed.externallyPinnedCheckpointDigestMatched, true);
+  assert.equal(replayed.signedOwnerCounter, 1);
   assert.equal(replayed.independentlyAnchoredFloorProven, false);
   assert.equal(replayed.externalOwnerCustodyVerified, false);
   assert.equal(Object.hasOwn(replayed, "ownerPinnedFloorChecked"), false);
@@ -219,7 +253,7 @@ test("anchored signed operation reconciles lost ACK, partial three-provider copy
   assert.equal(counts.s3, 2);
   assert.equal(repaired.observationDigest, replayed.observationDigest,
     "observation identity remains stable for exactly the same signed bytes and provider IDs");
-  const current = await ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+  const current = ownerCurrent;
   const raisedOwnerFloor = { minimumHead: { sequence: 1,
     root: Buffer.from(current.root) }, minimumSnapshot: Buffer.from(current.bytes) };
   const validRaised = await makeBridge(raisedOwnerFloor)

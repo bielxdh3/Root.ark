@@ -784,7 +784,7 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
     requirePermission: createRequirePermission(),
     resolveTrustedScope: (user) => user?.username === "owner" ? f.state.scope : null });
   const scripts = new Set(["rootark-api", "rootark-zk1-authenticated-workspace",
-    ...scriptNames]);
+    "rootark-zk1-owner-inventory-trust-head", ...scriptNames]);
   app.get("/client/:asset", (req, res) => {
     const name = req.params.asset.endsWith(".js") ? req.params.asset.slice(0, -3) : "";
     if (!scripts.has(name)) return res.sendStatus(404);

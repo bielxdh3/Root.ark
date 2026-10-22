@@ -11,6 +11,7 @@
     "rootark-zk1-ciphertext-download-integrity", "rootark-zk1-owner-signed-checkpoint",
     "rootark-zk1-protected-http-client", "rootark-zk1-uncertain-put-reconciliation",
     "rootark-zk1-normal-browser-trust-floor", "rootark-zk1-normal-browser-content",
+    "rootark-zk1-owner-inventory-trust-head",
   ];
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const base64 = /^[A-Za-z0-9_-]{43}$/;
@@ -47,6 +48,9 @@
       || btoa(check).replace(/\+/g, "-").replace(/\//g, "_")
         .replace(/=+$/g, "") !== value) fail();
     return result;
+  }
+  function hex(bytes) {
+    return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
   }
   function positive(name) {
     const raw = field(name)?.value;
@@ -169,10 +173,14 @@
       + '<label>Época atual confirmada fora do servidor<input type="number" min="1" step="1" data-zk1-field="epoch" required></label>'
       + '<label>Grant do dispositivo assinado (.json)<input type="file" data-zk1-field="grant" accept=".json,application/json" required></label>'
       + '<label>Histórico do proprietário assinado: checkpoint ou cadeia ordenada desde gênese (.json, até 64)<input type="file" data-zk1-field="history" accept=".json,application/json"></label>'
+      + '<label>Inventário owner-signed portátil (.json, offline)<input type="file" data-zk1-field="inventory-portable" accept=".json,application/json"></label>'
+      + '<label>Hash SHA-256 do checkpoint do inventário fixado fora do servidor (hex)<input type="text" data-zk1-field="inventory-pin" maxlength="64" spellcheck="false"></label>'
+      + '<label>Hash SHA-256 SPKI do signer do inventário (hex, externo)<input type="text" data-zk1-field="inventory-signer-spki" maxlength="64" spellcheck="false"></label>'
       + '<label>Chave pública do dispositivo (Ed25519 raw)<input type="file" data-zk1-field="device" required></label>'
       + '<label>Chave privada do dispositivo (PKCS#8, local)<input type="file" data-zk1-field="private" required></label>'
       + '<label>Arquivo descartável (até 2 MiB)<input type="file" data-zk1-field="file" required></label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="provision">Provisionar piso offline</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="verify-inventory">Verificar checkpoint owner-signed</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="upload">Cifrar, enviar e conferir GET</button></div>'
       + '</form><p class="muted" data-zk1-field="status" role="status" aria-live="polite">Nenhuma autoridade foi importada.</p>';
     document.body.append(dialog);
@@ -191,7 +199,7 @@
       status("Nenhuma autoridade foi importada.");
       return;
     }
-    if (action !== "provision" && action !== "upload") return;
+    if (action !== "provision" && action !== "upload" && action !== "verify-inventory") return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -202,6 +210,25 @@
       // Capability is checked again before every user-initiated operation.
       const available = await api.get("/zk-1/v1/workspace-capability");
       if (available?.enabled !== true) fail();
+      if (action === "verify-inventory") {
+        const raw = decoder.decode(await fileBytes("inventory-portable", 1, 400000));
+        const grant = JSON.parse(decoder.decode(await fileBytes("grant", 1, 8192)));
+        const report = await window.RootarkZk1OwnerInventoryTrustHead.importPortableEnrollment({
+          serialized: raw,
+          independentOwnerSpkiSha256: hex(from64(field("owner-spki").value.trim())),
+          independentCheckpointDigest: field("inventory-pin").value.trim(),
+          expectedInventorySpkiSha256: field("inventory-signer-spki").value.trim(),
+          expectedScope: [grant.account_id, grant.compartment_id, grant.keyring_id],
+          nowSeconds: Math.floor(Date.now() / 1000),
+        });
+        if (report.ownerSignatureVerified !== true
+          || report.independentlyPinnedDigestMatched !== true
+          || report.authorizesProtectedIo !== false) fail();
+        status("Checkpoint offline #" + report.ownerCheckpointCounter
+          + " e assinatura Ed25519 validados; raiz " + report.inventoryRoot
+          + ". A assinatura CBOR e a durabilidade externa exigem validação independente.");
+        return;
+      }
       const trust = await grantAndOwner();
       if (action === "provision") {
         const result = await window.RootarkZk1NormalBrowserTrustFloor.provisionOffline({
