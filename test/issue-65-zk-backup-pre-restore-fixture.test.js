@@ -10,11 +10,13 @@ const { inspectZk1DisposableBackupPreRestore } = require("../src/services/zk1Dis
 
 const sha = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
 const encode = (value) => JSON.stringify(value);
+const OWNER_DOMAIN = Buffer.from("Root.ark/zk-1/backup-owner-approval/v1\0", "ascii");
 const version = (id) => Buffer.from([0x00, 0x83, 0xac, 0x67, 0x91, id.charCodeAt(1), 0x00, 0xff, 0x2b, 0x73, 0xe4, 0x8f, 0xb2, 0x12, 0xdf, 0x8e]);
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-backup-fixture-"));
   t.after(() => fs.rmSync(dir, { force: true, recursive: true }));
+  const owner = crypto.generateKeyPairSync("ed25519");
   for (const folder of ["versions", "copies", "envelopes"]) fs.mkdirSync(path.join(dir, folder));
   fs.writeFileSync(path.join(dir, ".rootark-disposable-fixture"), "rootark-zk-backup-fixture-v1\n");
   const records = [];
@@ -35,23 +37,33 @@ function fixture(t) {
     compartmentId: "compartmentone", epoch: 4, revision: 7,
     objects: [{ objectId: "objectone", versions: records }] };
   const persist = () => {
-    fs.writeFileSync(path.join(dir, "manifest.json"), encode(manifest));
+    const manifestBytes = Buffer.from(encode(manifest));
+    fs.writeFileSync(path.join(dir, "manifest.json"), manifestBytes);
     const index = { schema: "rootark-zk1-backup-index-fixture/v1",
-      backupId: manifest.backupId, manifestSha256: sha(Buffer.from(encode(manifest))),
+      backupId: manifest.backupId, manifestSha256: sha(manifestBytes),
       versionIds: ["vone", "vtwo"], copyIds: ["copyvone", "copyvtwo"],
       envelopeIds: ["ownvone", "recvone", "ownvtwo", "recvtwo"] };
-    fs.writeFileSync(path.join(dir, "backup-index.json"), encode(index));
+    const indexBytes = Buffer.from(encode(index));
+    fs.writeFileSync(path.join(dir, "backup-index.json"), indexBytes);
+    const approval = { schema: "rootark-zk1-disposable-backup-owner-authorization/v1",
+      backupId: manifest.backupId, compartmentId: manifest.compartmentId,
+      epoch: manifest.epoch, revision: manifest.revision,
+      indexSha256: sha(indexBytes), manifestSha256: sha(manifestBytes) };
+    approval.signature = crypto.sign(null, Buffer.concat([OWNER_DOMAIN, Buffer.from(encode(approval))]),
+      owner.privateKey).toString("base64url");
+    fs.writeFileSync(path.join(dir, "owner-authorization.json"), encode(approval));
   };
   persist();
   const options = { fixtureDir: dir, expectedCompartmentId: "compartmentone",
-    checkpoint: { epoch: 3, revision: 20 } };
-  return { dir, manifest, persist, options };
+    checkpoint: { epoch: 3, revision: 20 }, trustedOwnerPublicKey: owner.publicKey };
+  return { dir, manifest, persist, options, owner };
 }
 const inspect = (f, extras = {}) => inspectZk1DisposableBackupPreRestore({ ...f.options, ...extras });
 function blocked(report, finding) {
   assert.equal(report.restoreAuthorized, false);
   assert.equal(report.readOnly, true);
   assert.equal(report.fixtureVerified, false);
+  assert.equal(report.ownerAuthorizationVerified, false);
   assert.ok(report.findings.includes(finding), JSON.stringify(report.findings));
 }
 
@@ -65,6 +77,7 @@ test("a fully referenced synthetic backup is independently hashed but can never 
     }
   const report = inspect(f);
   assert.equal(report.fixtureVerified, true, JSON.stringify(report.findings));
+  assert.equal(report.ownerAuthorizationVerified, true);
   assert.equal(report.restoreAuthorized, false);
   assert.equal(report.readOnly, true);
   assert.deepEqual(report.findings, []);
@@ -76,6 +89,65 @@ test("a fully referenced synthetic backup is independently hashed but can never 
   assert.equal(JSON.stringify(report).includes(f.dir), false);
   for (const [file, state] of before) assert.deepEqual(
     [sha(fs.readFileSync(file)), fs.statSync(file).mtimeMs], state);
+});
+
+test("owner approval requires an independently pinned Ed25519 public key", (t) => {
+  const f = fixture(t);
+  blocked(inspect(f, { trustedOwnerPublicKey: undefined }), "OWNER_BACKUP_AUTHORIZATION_INVALID");
+  blocked(inspect(f, { trustedOwnerPublicKey: crypto.generateKeyPairSync("ed25519").publicKey }),
+    "OWNER_BACKUP_AUTHORIZATION_INVALID");
+  blocked(inspect(f, { trustedOwnerPublicKey: f.owner.privateKey }), "OWNER_BACKUP_AUTHORIZATION_INVALID");
+  const approvalPath = path.join(f.dir, "owner-authorization.json");
+  const approval = JSON.parse(fs.readFileSync(approvalPath, "utf8"));
+  approval.signature = crypto.sign(null, Buffer.concat([OWNER_DOMAIN, Buffer.from(encode({
+    schema: approval.schema, backupId: approval.backupId, compartmentId: approval.compartmentId,
+    epoch: approval.epoch, revision: approval.revision, indexSha256: approval.indexSha256,
+    manifestSha256: approval.manifestSha256,
+  }))]), crypto.generateKeyPairSync("ed25519").privateKey).toString("base64url");
+  fs.writeFileSync(approvalPath, encode(approval));
+  blocked(inspect(f), "OWNER_BACKUP_AUTHORIZATION_INVALID");
+});
+
+test("attacker cannot forge owner-approved inventory by rehashing replaced ciphertext and manifest", (t) => {
+  const f = fixture(t);
+  const oldApproval = fs.readFileSync(path.join(f.dir, "owner-authorization.json"));
+  const replacement = Buffer.from("\u0001opaque-synthetic-replacement\u0081");
+  fs.writeFileSync(path.join(f.dir, "versions", "vone.ct"), replacement);
+  fs.writeFileSync(path.join(f.dir, "copies", "copyvone.ct"), replacement);
+  f.manifest.objects[0].versions[0].ciphertextSha256 = sha(replacement);
+  f.persist();
+  fs.writeFileSync(path.join(f.dir, "owner-authorization.json"), oldApproval);
+  blocked(inspect(f), "OWNER_BACKUP_AUTHORIZATION_INVALID");
+});
+
+test("missing approval, altered signature, stale signed identity and unapproved index changes fail closed", (t) => {
+  const f = fixture(t);
+  const approvalPath = path.join(f.dir, "owner-authorization.json");
+  const original = fs.readFileSync(approvalPath);
+  fs.rmSync(approvalPath);
+  blocked(inspect(f), "INVENTORY_INCOMPLETE");
+  fs.writeFileSync(approvalPath, original);
+
+  for (const mutate of [
+    (a) => { a.signature = "a".repeat(86); },
+    (a) => { a.epoch += 1; },
+    (a) => { a.revision += 1; },
+    (a) => { a.compartmentId = "compartmentother"; },
+    (a) => { a.backupId = "backupother"; },
+    (a) => { a.indexSha256 = "0".repeat(64); },
+    (a) => { a.manifestSha256 = "0".repeat(64); },
+  ]) {
+    const a = JSON.parse(original.toString("utf8"));
+    mutate(a);
+    fs.writeFileSync(approvalPath, encode(a));
+    blocked(inspect(f), "OWNER_BACKUP_AUTHORIZATION_INVALID");
+  }
+  fs.writeFileSync(approvalPath, original);
+  const indexPath = path.join(f.dir, "backup-index.json");
+  const modified = JSON.parse(fs.readFileSync(indexPath, "utf8"));
+  modified.copyIds.reverse(); // Same set and hashes, but exact signed index bytes have changed.
+  fs.writeFileSync(indexPath, encode(modified));
+  blocked(inspect(f), "OWNER_BACKUP_AUTHORIZATION_INVALID");
 });
 
 test("stale epoch, replayed revision, wrong compartment and untrusted checkpoint are denied", (t) => {

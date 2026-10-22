@@ -11,6 +11,8 @@ const { TextDecoder } = require("node:util");
 const REPORT_SCHEMA = "rootark-zk1-disposable-backup-pre-restore-report/v1";
 const MANIFEST_SCHEMA = "rootark-zk1-backup-pre-restore-fixture/v1";
 const INDEX_SCHEMA = "rootark-zk1-backup-index-fixture/v1";
+const OWNER_APPROVAL_SCHEMA = "rootark-zk1-disposable-backup-owner-authorization/v1";
+const OWNER_APPROVAL_DOMAIN = Buffer.from("Root.ark/zk-1/backup-owner-approval/v1\0", "ascii");
 const MAX_METADATA_BYTES = 256 * 1024;
 const MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const MAX_OBJECTS = 32;
@@ -73,7 +75,7 @@ function checkRootEntries(root) {
   catch (_) { deny("UNSAFE_FIXTURE"); }
   const allowed = new Map([
     [".rootark-disposable-fixture", "file"], ["manifest.json", "file"],
-    ["backup-index.json", "file"], ["versions", "directory"],
+    ["backup-index.json", "file"], ["owner-authorization.json", "file"], ["versions", "directory"],
     ["copies", "directory"], ["envelopes", "directory"],
   ]);
   for (const entry of entries) {
@@ -139,6 +141,33 @@ function validateIndex(index) {
       || index[label].some((entry) => !id(entry) || index[label].indexOf(entry) !== index[label].lastIndexOf(entry)))
       deny("MALFORMED_METADATA");
   }
+}
+function verifyOwnerBackupApproval(approvalBytes, trustedOwnerPublicKey, indexBytes, manifestBytes, manifest) {
+  // A key embedded in the backup would be attacker-controlled. The caller must
+  // pin the owner's Ed25519 public key independently of all fixture contents.
+  if (!trustedOwnerPublicKey || trustedOwnerPublicKey.type !== "public"
+    || trustedOwnerPublicKey.asymmetricKeyType !== "ed25519")
+    deny("OWNER_BACKUP_AUTHORIZATION_INVALID");
+  const approval = strictJson(approvalBytes);
+  if (!exactKeys(approval, ["schema", "backupId", "compartmentId", "epoch", "revision",
+    "indexSha256", "manifestSha256", "signature"])
+    || approval.schema !== OWNER_APPROVAL_SCHEMA || approval.backupId !== manifest.backupId
+    || approval.compartmentId !== manifest.compartmentId || approval.epoch !== manifest.epoch
+    || approval.revision !== manifest.revision || approval.indexSha256 !== sha(indexBytes)
+    || approval.manifestSha256 !== sha(manifestBytes)
+    || typeof approval.signature !== "string" || !/^[A-Za-z0-9_-]{86}$/.test(approval.signature))
+    deny("OWNER_BACKUP_AUTHORIZATION_INVALID");
+  const signature = Buffer.from(approval.signature, "base64url");
+  if (signature.length !== 64 || signature.toString("base64url") !== approval.signature)
+    deny("OWNER_BACKUP_AUTHORIZATION_INVALID");
+  const unsigned = { schema: approval.schema, backupId: approval.backupId,
+    compartmentId: approval.compartmentId, epoch: approval.epoch, revision: approval.revision,
+    indexSha256: approval.indexSha256, manifestSha256: approval.manifestSha256 };
+  const message = Buffer.concat([OWNER_APPROVAL_DOMAIN, Buffer.from(JSON.stringify(unsigned))]);
+  try {
+    if (!crypto.verify(null, message, trustedOwnerPublicKey, signature))
+      deny("OWNER_BACKUP_AUTHORIZATION_INVALID");
+  } catch (_) { deny("OWNER_BACKUP_AUTHORIZATION_INVALID"); }
 }
 function validateManifest(manifest, index, expectedCompartmentId, checkpoint) {
   if (!exactKeys(manifest, ["schema", "backupId", "compartmentId", "epoch", "revision", "objects"])
@@ -207,9 +236,11 @@ function verifyAll(root, manifest, catalog) {
     verifyPayload(root, "envelopes", v.recoveryEnvelopeId, "env", v.recoveryEnvelopeSha256, "ENVELOPE_DIGEST_MISMATCH");
   }
 }
-function inspectZk1DisposableBackupPreRestore({ fixtureDir, expectedCompartmentId, checkpoint } = {}) {
+function inspectZk1DisposableBackupPreRestore({ fixtureDir, expectedCompartmentId,
+  checkpoint, trustedOwnerPublicKey } = {}) {
   const report = { schema: REPORT_SCHEMA, readOnly: true, restoreAuthorized: false,
-    fixtureVerified: false, checkedVersions: 0, checkedCopies: 0, checkedEnvelopes: 0,
+    fixtureVerified: false, ownerAuthorizationVerified: false,
+    checkedVersions: 0, checkedCopies: 0, checkedEnvelopes: 0,
     findings: [], blockers: [...BLOCKERS] };
   try {
     const root = safeRoot(fixtureDir);
@@ -220,14 +251,18 @@ function inspectZk1DisposableBackupPreRestore({ fixtureDir, expectedCompartmentI
     if (!exactKeys(checkpoint, ["epoch", "revision"])
       || !nonNegInt(checkpoint.epoch) || !nonNegInt(checkpoint.revision))
       deny("CHECKPOINT_REQUIRED");
-    const index = strictJson(readRegular(path.join(root, "backup-index.json"), MAX_METADATA_BYTES));
+    const indexBytes = readRegular(path.join(root, "backup-index.json"), MAX_METADATA_BYTES);
+    const index = strictJson(indexBytes);
     validateIndex(index);
     const manifestBytes = readRegular(path.join(root, "manifest.json"), MAX_METADATA_BYTES);
     if (sha(manifestBytes) !== index.manifestSha256) deny("MANIFEST_DIGEST_MISMATCH");
     const manifest = strictJson(manifestBytes);
     const catalog = validateManifest(manifest, index, expectedCompartmentId, checkpoint);
+    verifyOwnerBackupApproval(readRegular(path.join(root, "owner-authorization.json"), 4096),
+      trustedOwnerPublicKey, indexBytes, manifestBytes, manifest);
     verifyAll(root, manifest, catalog);
     report.fixtureVerified = true;
+    report.ownerAuthorizationVerified = true;
     report.checkedVersions = catalog.versions.length;
     report.checkedCopies = catalog.copies.length;
     report.checkedEnvelopes = catalog.envelopes.length;
