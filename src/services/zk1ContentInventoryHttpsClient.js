@@ -5,6 +5,7 @@
 // independently checked with the separately pinned Ed25519 key.
 const https = require("node:https");
 const tls = require("node:tls");
+const net = require("node:net");
 const crypto = require("node:crypto");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
 
@@ -140,7 +141,7 @@ function requestJson({ url, ca, clientKey, clientCert, serverFingerprint, idleTi
         key: clientKey,
         rejectUnauthorized: true,
         minVersion: "TLSv1.3",
-        servername: url.hostname,
+        servername: net.isIP(url.hostname) ? "" : url.hostname,
         checkServerIdentity(hostname, peer) {
           const hostnameError = tls.checkServerIdentity(hostname, peer);
           if (hostnameError) return hostnameError;

@@ -6,6 +6,7 @@
 // emission would not fence bytes during PostgreSQL connection loss.
 const https = require("node:https");
 const tls = require("node:tls");
+const net = require("node:net");
 
 const FINGERPRINT = /^(?:[0-9a-f]{2}:){31}[0-9a-f]{2}$/i;
 const OBJECT_ID = /^[A-Za-z0-9_-]{22}$/;
@@ -99,7 +100,8 @@ function createZk1SharedPgGateHttpsClient({ endpoint, ca, clientKey, clientCert,
         // One socket per request makes verification of this exact pin
         // unconditional (including after successful calls by other clients).
         agent: false,
-        rejectUnauthorized: true, minVersion: "TLSv1.3", servername: url.hostname,
+        rejectUnauthorized: true, minVersion: "TLSv1.3",
+        servername: net.isIP(url.hostname) ? "" : url.hostname,
         checkServerIdentity(host, cert) {
           const nameError = tls.checkServerIdentity(host, cert);
           if (nameError) return nameError;
