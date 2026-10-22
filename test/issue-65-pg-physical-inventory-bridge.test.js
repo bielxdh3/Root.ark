@@ -83,8 +83,9 @@ async function fixture(t, { strictPhysicalIntent = true } = {}) {
   const verifier = new Zk1SharedPgPhysicalCiphertextVerifier({ pool: proofPool });
   const intentAuthority = new Zk1SharedPgPhysicalInventoryIntent({ pool: gatePool });
   const sink = new Zk1SharedPgCiphertextSink({ gateClient });
-  const bridge = () => new Zk1PgPhysicalInventoryBridge({ sink, verifier, intentAuthority, ledger,
-    pinnedPublicKey: keys.publicKey, pinnedSignerKeyId: signerKeyId });
+  const bridge = (trustedInventoryFloor) => new Zk1PgPhysicalInventoryBridge({
+    sink, verifier, intentAuthority, ledger, pinnedPublicKey: keys.publicKey,
+    pinnedSignerKeyId: signerKeyId, trustedInventoryFloor });
   t.after(async () => {
     try { ledger.close(); } catch (_) {}
     await Promise.all([admin.end(), gatePool.end(), proofPool.end()]);
@@ -170,6 +171,69 @@ test("non-strict legacy scopes refuse signed physical bridge before any physical
       FROM zk1_gate.${table} WHERE scope_key=$1 AND object_id=$2`, [f.key, objectId]);
     assert.equal(result.rows[0].count, 0, `non-strict scope must not create ${table}`);
   }
+});
+
+test("PG signed inventory bridge requires the pinned owner floor and complete signed intervening history", {
+  skip: !enabled && "requires real disposable PostgreSQL 18 and restricted attestor",
+}, async (t) => {
+  const f = await fixture(t);
+  const genesis = await f.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+  const trustedFloor = { minimumHead: { sequence: 0,
+    root: Buffer.from(f.op.expected_root) }, minimumSnapshot: Buffer.from(genesis.bytes) };
+  const bridge = f.bridge(trustedFloor);
+  // Floor is copied at construction; caller-owned arrays cannot be rewritten
+  // asynchronously to downgrade the pinned rollback boundary.
+  trustedFloor.minimumHead.root.fill(0xaa);
+  trustedFloor.minimumSnapshot.fill(0xbb);
+  bridge.trustedInventoryFloor = undefined;
+  bridge._trustedInventoryFloor = null;
+  assert.equal(Object.hasOwn(bridge, "trustedInventoryFloor"), true,
+    "a synthetic public shadow does not retarget the private trusted floor");
+  const first = await bridge.putAndAttest(f.physical);
+  assert.equal(first.status, "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+  const laterOp = { ...f.op, object_id: crypto.randomBytes(16),
+    operation_id: crypto.randomBytes(16), expected_sequence: first.sequence,
+    expected_root: Buffer.from(first.root) };
+  const later = await bridge.putAndAttest({ ...f.physical, operation: laterOp });
+  assert.equal(later.status, "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+  assert.equal(later.sequence, 2);
+  const originalPage = f.ledger.getCommittedProofPage.bind(f.ledger);
+  f.ledger.getCommittedProofPage = async (input) => {
+    const page = await originalPage(input);
+    if (page.status !== "chain_page" || page.proofs.length === 0) return page;
+    const forged = Buffer.from(page.proofs[0]);
+    forged[forged.length - 1] ^= 0x01;
+    return { ...page, proofs: [forged, ...page.proofs.slice(1)] };
+  };
+  await assert.rejects(bridge.reconcile({ scope: f.scope, operation: laterOp,
+    digest: f.digest, expectedRootHash: f.root, expectedChunkCount: f.chunks.length }),
+  /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+  "a gap or forged history cannot cross a pinned owner floor even if PG bytes match");
+  f.ledger.getCommittedProofPage = originalPage;
+  const recovered = await bridge.reconcile({ scope: f.scope, operation: laterOp,
+    digest: f.digest, expectedRootHash: f.root, expectedChunkCount: f.chunks.length });
+  assert.equal(recovered.status, "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+});
+
+test("PG owner floor refuses reverted or foreign inventory before any physical intent or PUT", {
+  skip: !enabled && "requires disposable PostgreSQL 18 and restricted attestor",
+}, async (t) => {
+  const f = await fixture(t);
+  const base = await f.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+  for (const head of [
+    { sequence: 1, root: crypto.randomBytes(32) },
+    { sequence: 0, root: crypto.randomBytes(32) },
+  ]) {
+    const bridge = f.bridge({ minimumHead: head,
+      minimumSnapshot: base.bytes });
+    await assert.rejects(bridge.putAndAttest(f.physical),
+      /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/);
+  }
+  assert.deepEqual(f.calls, [], "stale/foreign owner floor must deny before worker admission");
+  const count = await f.admin.query(`SELECT COUNT(*)::integer AS n
+    FROM zk1_gate.physical_inventory_intent WHERE scope_key=$1`, [f.key]);
+  assert.equal(count.rows[0].n, 0, "no physical reservation after floor denial");
+  assert.equal((await f.ledger.getOperationStatus(f.op.operation_id)).status, "unknown");
 });
 
 test("mTLS signed inventory append requires real strict physical PG readback and WAL", {

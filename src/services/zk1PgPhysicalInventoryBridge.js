@@ -93,7 +93,9 @@ function detachedChunks(chunks, count, expectedSha256, expectedRoot) {
 }
 
 class Zk1PgPhysicalInventoryBridge {
-  constructor({ sink, verifier, intentAuthority, ledger, pinnedPublicKey, pinnedSignerKeyId } = {}) {
+  #trustedInventoryFloor;
+  constructor({ sink, verifier, intentAuthority, ledger, pinnedPublicKey, pinnedSignerKeyId,
+    trustedInventoryFloor } = {}) {
     if (!(sink instanceof Zk1SharedPgCiphertextSink)
       || !(verifier instanceof Zk1SharedPgPhysicalCiphertextVerifier)
       || !(intentAuthority instanceof Zk1SharedPgPhysicalInventoryIntent)
@@ -107,6 +109,24 @@ class Zk1PgPhysicalInventoryBridge {
     this.ledgerScope = inventory.normalizeScope(ledger.scope);
     this.pinnedPublicKey = pinnedPublicKey;
     this.signerKeyId = bytes(pinnedSignerKeyId, 16);
+    // Optional, independently retained owner floor. Never derive this from
+    // the same mutable SQLite ledger whose rollback it is meant to detect.
+    // A caller that does not possess an independently kept floor must not
+    // claim rollback resistance from this reference bridge.
+    if (trustedInventoryFloor !== undefined) {
+      const floor = exact(trustedInventoryFloor, ["minimumHead", "minimumSnapshot"]);
+      const head = exact(floor.minimumHead, ["sequence", "root"]);
+      if (!Number.isSafeInteger(head.sequence) || head.sequence < 0
+        || head.sequence > inventory.MAX_ENTRIES
+        || (!Buffer.isBuffer(floor.minimumSnapshot)
+          && !(floor.minimumSnapshot instanceof Uint8Array))
+        || floor.minimumSnapshot.byteLength < 1
+        || floor.minimumSnapshot.byteLength > inventory.MAX_SNAPSHOT_BYTES) fail();
+      this.#trustedInventoryFloor = {
+        minimumHead: { sequence: head.sequence, root: bytes(head.root, 32) },
+        minimumSnapshot: Buffer.from(floor.minimumSnapshot),
+      };
+    }
   }
   #request(input) {
     const v = copyRequest(input);
@@ -119,7 +139,45 @@ class Zk1PgPhysicalInventoryBridge {
     return v;
   }
 
+  async #verifiedInventoryFloor(v) {
+    if (!this.#trustedInventoryFloor) return null;
+    try {
+      const { minimumHead, minimumSnapshot } = this.#trustedInventoryFloor;
+      const nonce = crypto.randomBytes(32);
+      const current = await this.ledger.getSnapshot({ nonce });
+      if (current.status !== "snapshot"
+        || !Number.isSafeInteger(current.sequence)
+        || current.sequence < minimumHead.sequence
+        || current.sequence - minimumHead.sequence > 64) fail();
+      let cursor = minimumHead.sequence;
+      const proofs = [];
+      while (cursor < current.sequence) {
+        const page = await this.ledger.getCommittedProofPage({
+          afterSequence: cursor, limit: Math.min(16, current.sequence - cursor),
+        });
+        if (page.status !== "chain_page" || page.afterSequence !== cursor
+          || !Array.isArray(page.proofs)
+          || page.proofs.length !== page.nextSequence - cursor
+          || page.nextSequence <= cursor || page.nextSequence > current.sequence
+          || page.headSequence !== current.sequence) fail();
+        proofs.push(...page.proofs);
+        cursor = page.nextSequence;
+      }
+      const verified = await inventory.verifySnapshot({
+        serialized: current.bytes, pinnedPublicKey: this.pinnedPublicKey,
+        pinnedSignerKeyId: this.signerKeyId, expectedScope: v.scope,
+        requested: { object_id: v.operation.object_id,
+          revision: v.operation.revision, epoch: v.operation.epoch,
+          ciphertext_sha256: v.operation.ciphertext_sha256 },
+        minimumHead, minimumSnapshot, committedProofChain: proofs, nonce,
+      });
+      if (verified.status !== "VERIFIED_NONAUTHORIZING") fail();
+      return verified;
+    } catch (_) { fail(); }
+  }
+
   async #checkedCommit(v) {
+    const head = await this.#verifiedInventoryFloor(v);
     const state = await this.ledger.getOperationStatus(v.operation.operation_id);
     if (state.status === "pending" || state.status === "unknown") return {
       status: state.status, authorizesIo: false };
@@ -130,7 +188,8 @@ class Zk1PgPhysicalInventoryBridge {
       operation: v.operation,
     });
     if (signed.outcome !== "COMMITTED_IN_SIGNED_LEDGER"
-      || state.sequence !== signed.sequence || !same(state.root, signed.root)) fail();
+      || state.sequence !== signed.sequence || !same(state.root, signed.root)
+      || (head && head.outcome !== "PRESENT")) fail();
     return { status: "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY",
       sequence: signed.sequence, root: Buffer.from(signed.root), verifiedReceipt: signed,
       authorizesIo: false, localPgWalFlushConfirmed: true,
@@ -168,6 +227,7 @@ class Zk1PgPhysicalInventoryBridge {
   }
   async publishExisting(input) {
     const v = this.#request(input);
+    await this.#verifiedInventoryFloor(v);
     await this.#verifiedPhysical(v);
     const before = await this.#checkedCommit(v);
     if (before.status === "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY") {
@@ -197,6 +257,10 @@ class Zk1PgPhysicalInventoryBridge {
     });
     const chunks = detachedChunks(r.chunks, v.expectedChunkCount,
       v.operation.ciphertext_sha256, v.expectedRootHash);
+    // On a reverted signed ledger, refuse BEFORE reserving a new immutable
+    // physical operation or calling any writer. Recovery must use the trusted
+    // owner floor and a verified full chain, not opportunistic re-signing.
+    await this.#verifiedInventoryFloor(v);
     // Exact signed retry must not invoke a new fenced writer against a
     // previously SEALED object. Physical readback is still mandatory.
     const previous = await this.ledger.getOperationStatus(v.operation.operation_id);
