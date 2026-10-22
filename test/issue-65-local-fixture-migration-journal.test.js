@@ -335,3 +335,103 @@ test("orphan and replacement symlinks and unexpected stage after commit block wi
   assert.throws(() => verifyLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
   assert.deepEqual(fs.readFileSync(f.source), bytes);
 });
+
+test("switching a validated target directory to a junction cannot publish outside the fixture", (t) => {
+  const f = fixture(t);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-fixture-journal-outside-"));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  assert.throws(() => runLocalFixtureCiphertextMigration({ ...f.plan,
+    onCheckpoint(phase) {
+      if (phase !== "journal-created") return;
+      fs.renameSync(path.join(f.dir, "target"), path.join(f.dir, "target-original"));
+      fs.symlinkSync(outside, path.join(f.dir, "target"), process.platform === "win32" ? "junction" : "dir");
+    },
+  }), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.equal(fs.existsSync(path.join(outside, "object1.ct")), false);
+  assert.equal(fs.existsSync(path.join(outside, ".operation1.stage")), false);
+  assert.deepEqual(fs.readFileSync(f.source), bytes);
+});
+
+test("switching target to an external junction during rollback cannot delete its copy", (t) => {
+  const f = fixture(t);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-fixture-rollback-outside-"));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  runLocalFixtureCiphertextMigration(f.plan);
+  const foreign = path.join(outside, "object1.ct");
+  fs.writeFileSync(foreign, bytes);
+  assert.throws(() => rollbackLocalFixtureCiphertextMigration({ ...f.plan,
+    onCheckpoint(phase) {
+      if (phase !== "rollback-intent-recorded") return;
+      fs.renameSync(path.join(f.dir, "target"), path.join(f.dir, "target-original"));
+      fs.symlinkSync(outside, path.join(f.dir, "target"), process.platform === "win32" ? "junction" : "dir");
+    },
+  }), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.deepEqual(fs.readFileSync(foreign), bytes);
+  assert.deepEqual(fs.readFileSync(path.join(f.dir, "target-original", "object1.ct")), bytes);
+});
+
+test("exclusive target publication keeps a racing EEXIST collision without overwriting", (t) => {
+  const f = fixture(t);
+  const originalLink = fs.linkSync;
+  let collision = false;
+  fs.linkSync = (from, to) => {
+    if (to === f.target) {
+      collision = true;
+      fs.writeFileSync(f.target, "synthetic foreign target");
+    }
+    return originalLink(from, to);
+  };
+  try {
+    assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /EEXIST/);
+  } finally { fs.linkSync = originalLink; }
+  assert.equal(collision, true);
+  assert.equal(fs.readFileSync(f.target, "utf8"), "synthetic foreign target");
+  assert.deepEqual(fs.readFileSync(f.source), bytes);
+});
+
+test("journal update refuses a replaced destination instead of overwriting it", (t) => {
+  const f = fixture(t);
+  const original = `${f.journal}.original`;
+  assert.throws(() => runLocalFixtureCiphertextMigration({ ...f.plan,
+    onCheckpoint(phase) {
+      if (phase !== "target-verified") return;
+      fs.renameSync(f.journal, original);
+      fs.writeFileSync(f.journal, "synthetic foreign journal");
+    },
+  }), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.equal(fs.readFileSync(f.journal, "utf8"), "synthetic foreign journal");
+  assert.equal(fs.existsSync(original), true);
+  assert.deepEqual(fs.readFileSync(f.source), bytes);
+});
+
+test("journal temp replacement after publication is preserved as foreign evidence", (t) => {
+  const f = fixture(t);
+  const originalLink = fs.linkSync;
+  let replacedTemp;
+  fs.linkSync = (from, to) => {
+    originalLink(from, to);
+    if (to === f.journal) {
+      fs.unlinkSync(from);
+      fs.writeFileSync(from, "synthetic foreign temp");
+      replacedTemp = from;
+    }
+  };
+  try {
+    assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  } finally { fs.linkSync = originalLink; }
+  assert.ok(replacedTemp);
+  assert.equal(fs.readFileSync(replacedTemp, "utf8"), "synthetic foreign temp");
+  assert.deepEqual(fs.readFileSync(f.source), bytes);
+});
+
+test("truncated staged ciphertext cannot be recorded as committed or rolled back destructively", (t) => {
+  const f = fixture(t);
+  assert.throws(() => runLocalFixtureCiphertextMigration({ ...f.plan,
+    onCheckpoint(phase) {
+      if (phase === "staging-synced") fs.truncateSync(path.join(f.dir, "target", ".operation1.stage"), 3);
+    },
+  }), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.throws(() => verifyLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.throws(() => rollbackLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.deepEqual(fs.readFileSync(f.source), bytes);
+});

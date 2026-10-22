@@ -48,6 +48,7 @@ function directory(dir) {
   try {
     const stat = fs.lstatSync(dir);
     if (!stat.isDirectory() || stat.isSymbolicLink()) refuse();
+    return stat;
   } catch (_) { refuse(); }
 }
 function safeRoot(dir, mode) {
@@ -55,18 +56,32 @@ function safeRoot(dir, mode) {
   const root = path.resolve(dir);
   const temporary = path.resolve(os.tmpdir());
   if (path.dirname(root) !== temporary || !path.basename(root).startsWith("rootark-zk-local-fixture-")) refuse();
-  // The whole path, including Windows reparse point ancestors, is checked. As
-  // with the inventory probe, this requires a trusted, non-concurrent fixture.
+  // Pin every directory identity (including Windows junction ancestors) so a
+  // checkpoint cannot redirect subsequent writes or rollback outside this
+  // disposable fixture. Native openat-style protection against a hostile
+  // concurrent writer is not available in portable Node; callers must still
+  // own and exclusively control the fixture for the operation's lifetime.
+  const pinned = [];
+  function remember(segment) { pinned.push([segment, directory(segment)]); }
   let segment = path.parse(root).root;
   for (const part of root.slice(segment.length).split(path.sep).filter(Boolean)) {
     segment = path.join(segment, part);
-    directory(segment);
+    remember(segment);
   }
+  const rootStat = pinned[pinned.length - 1][1];
+  if (process.platform !== "win32"
+    && (rootStat.uid !== process.getuid() || (rootStat.mode & 0o077) !== 0)) refuse();
   for (const sub of ["source", "target", "journal", "references", ...KINDS.map((k) => `references/${k}`)])
-    directory(path.join(root, sub));
+    remember(path.join(root, sub));
   const marker = readRegular(path.join(root, MARKER), 128).toString("utf8");
   if (marker !== "rootark-zk-local-fixture-v1\n") refuse();
-  return root;
+  function guard() {
+    for (const [name, identity] of pinned) {
+      if (!sameFile(directory(name), identity)) refuse();
+    }
+  }
+  guard();
+  return { root, guard };
 }
 function sameFile(first, second) {
   return first.dev === second.dev && first.ino === second.ino;
@@ -105,36 +120,81 @@ function flushDirectory(dir) {
   // Windows Node does not offer a portable durable directory-entry fsync.
   if (process.platform === "win32") return;
   let fd;
-  try { fd = fs.openSync(dir, fs.constants.O_RDONLY); fs.fsyncSync(fd); }
+  try {
+    const before = directory(dir);
+    fd = fs.openSync(dir, fs.constants.O_RDONLY
+      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_DIRECTORY || 0));
+    const opened = fs.fstatSync(fd);
+    if (!opened.isDirectory() || !sameFile(before, opened)) refuse();
+    fs.fsyncSync(fd);
+    if (!sameFile(opened, directory(dir))) refuse();
+  } catch (_) { refuse(); }
   finally { if (fd !== undefined) fs.closeSync(fd); }
 }
-function writeNew(file, bytes) {
+function writeNew(file, bytes, guard) {
   let fd;
+  let created;
   try {
+    guard();
     fd = fs.openSync(file, "wx", 0o600);
     fs.writeFileSync(fd, bytes);
     fs.fsyncSync(fd);
+    const opened = fs.fstatSync(fd);
+    const published = fs.lstatSync(file);
+    if (!opened.isFile() || opened.nlink !== 1 || published.isSymbolicLink()
+      || !sameFile(opened, published) || published.nlink !== 1) refuse();
+    created = opened;
+    guard();
   } finally { if (fd !== undefined) fs.closeSync(fd); }
   flushDirectory(path.dirname(file));
+  guard();
+  return created;
 }
 function journalData(plan, phase) {
   const body = { schema: SCHEMA, phase, plan, planDigest: sha(Buffer.from(JSON.stringify(plan))) };
   return { ...body, recordDigest: sha(Buffer.from(JSON.stringify(body))) };
 }
-function storeJournal(file, record, initial) {
+function storeJournal(file, record, initial, guard, expectedJournal) {
   // A fresh same-directory file is synced before atomic journal publication.
   // link() gives initial publication exclusive/no-clobber semantics; updates
   // rename over the old journal, which leaves either revision after a crash.
+  function checkExpectedJournal() {
+    if (initial) return;
+    if (!expectedJournal || !expectedJournal.isFile() || expectedJournal.nlink !== 1) refuse();
+    let current;
+    try { current = fs.lstatSync(file); } catch (_) { refuse(); }
+    if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1
+      || !sameFile(current, expectedJournal)) refuse();
+  }
+  guard();
+  checkExpectedJournal();
   const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${crypto.randomBytes(12).toString("hex")}.tmp`);
-  writeNew(temporary, JSON.stringify(record));
+  const tempIdentity = writeNew(temporary, JSON.stringify(record), guard);
   try {
+    guard();
+    checkExpectedJournal();
+    const staged = fs.lstatSync(temporary);
+    if (!staged.isFile() || staged.isSymbolicLink() || staged.nlink !== 1
+      || !sameFile(tempIdentity, staged)) refuse();
     if (initial) fs.linkSync(temporary, file);
     else fs.renameSync(temporary, file);
+    guard();
+    const published = fs.lstatSync(file);
+    if (!published.isFile() || published.isSymbolicLink()
+      || !sameFile(tempIdentity, published) || published.nlink !== (initial ? 2 : 1)) refuse();
     flushDirectory(path.dirname(file));
   } finally {
     // Orphans left by process termination are inert; never ingest them.
-    if (pathPresent(temporary)) fs.unlinkSync(temporary);
+    guard();
+    if (pathPresent(temporary)) {
+      const present = fs.lstatSync(temporary);
+      if (!present.isFile() || present.isSymbolicLink() || !sameFile(tempIdentity, present)
+        || present.nlink < 1 || present.nlink > 2) refuse();
+      fs.unlinkSync(temporary);
+    }
   }
+  guard();
+  if (JSON.stringify(parseJournal(file)) !== JSON.stringify(record)) refuse();
 }
 function parseJournal(file, allowedLinks = 1) {
   const bytes = readRegular(file, 128 * 1024, allowedLinks);
@@ -216,7 +276,11 @@ function verifyInventory(root, plan, locations) {
     }
   }
 }
-function checkpoint(input, name) { if (typeof input.onCheckpoint === "function") input.onCheckpoint(name); }
+function checkpoint(input, name, guard) {
+  guard();
+  if (typeof input.onCheckpoint === "function") input.onCheckpoint(name);
+  guard();
+}
 function report(phase, verified) {
   return Object.freeze({ schema: SCHEMA, canMigrate: false, rollbackScope: "local-fixture-only",
     state: phase, localVerified: verified,
@@ -224,12 +288,13 @@ function report(phase, verified) {
       "missing-client-decrypt-and-verify", "missing-live-version-backup-trash-sync-authority"] });
 }
 function readOperation(input) {
-  const root = safeRoot(input?.fixtureDir, input?.fixtureMode);
+  const { root, guard } = safeRoot(input?.fixtureDir, input?.fixtureMode);
   const plan = normalizedPlan(input);
   const locations = paths(root, plan);
-  return { root, plan, locations };
+  guard();
+  return { root, plan, locations, guard };
 }
-function recoverInterruptedInitialJournalLink(file, plan) {
+function recoverInterruptedInitialJournalLink(file, plan, guard) {
   let published;
   try { published = fs.lstatSync(file); }
   catch (_) { refuse(); }
@@ -263,31 +328,39 @@ function recoverInterruptedInitialJournalLink(file, plan) {
   if (!sameFile(published, temporary) || temporary.nlink !== 2
     || !journalBytes.equals(tempBytes)) refuse();
   // Unlink only the exact verified temporary name; never arbitrary links.
+  guard();
   fs.unlinkSync(temp);
   flushDirectory(dir);
+  guard();
   const remaining = fs.lstatSync(file);
   if (!remaining.isFile() || remaining.isSymbolicLink()
     || !sameFile(published, remaining) || remaining.nlink !== 1) refuse();
 }
-function checkedJournal(file, plan) {
-  recoverInterruptedInitialJournalLink(file, plan);
+function checkedJournal(file, plan, guard) {
+  guard();
+  recoverInterruptedInitialJournalLink(file, plan, guard);
   const stored = parseJournal(file);
   if (JSON.stringify(stored.plan) !== JSON.stringify(plan)) refuse();
+  guard();
   return stored;
 }
 function runLocalFixtureCiphertextMigration(input) {
-  const { root, plan, locations } = readOperation(input);
+  const { root, plan, locations, guard } = readOperation(input);
   verifyInventory(root, plan, locations);
+  guard();
   let record;
+  let journalIdentity;
   if (pathPresent(locations.journal)) {
-    record = checkedJournal(locations.journal, plan);
+    record = checkedJournal(locations.journal, plan, guard);
+    journalIdentity = fs.lstatSync(locations.journal);
     if (record.phase === "rollback-pending" || record.phase === "rolled-back") refuse();
   } else {
     // Prevent initial adoption/overwrite of any preexisting target or stage.
     if (pathPresent(locations.target) || pathPresent(locations.stage)) refuse();
     record = journalData(plan, "planned");
-    storeJournal(locations.journal, record, true);
-    checkpoint(input, "journal-created");
+    storeJournal(locations.journal, record, true, guard);
+    journalIdentity = fs.lstatSync(locations.journal);
+    checkpoint(input, "journal-created", guard);
   }
   if (record.phase === "committed") {
     if (pathPresent(locations.stage) || !maybeRegular(locations.target, plan.sourceDigest)) refuse();
@@ -307,39 +380,45 @@ function runLocalFixtureCiphertextMigration(input) {
     } else {
       const source = readRegular(locations.source);
       if (sha(source) !== plan.sourceDigest) refuse();
-      writeNew(locations.stage, source);
-      checkpoint(input, "staging-synced");
+      writeNew(locations.stage, source, guard);
+      checkpoint(input, "staging-synced", guard);
     }
     // Hard-linking the synced stage to an absent target is atomic/no-clobber.
     // It is never a rename that can silently overwrite an existing target.
+    guard();
     fs.linkSync(locations.stage, locations.target);
     flushDirectory(path.dirname(locations.target));
-    checkpoint(input, "target-published");
+    checkpoint(input, "target-published", guard);
   }
   if (pathPresent(locations.stage)) {
+    guard();
     fs.unlinkSync(locations.stage);
     flushDirectory(path.dirname(locations.stage));
+    guard();
   }
   // The verifier re-opens disk content independently of the staged buffer.
   verifyInventory(root, plan, locations);
   if (!maybeRegular(locations.target, plan.sourceDigest)) refuse();
-  checkpoint(input, "target-verified");
-  storeJournal(locations.journal, journalData(plan, "committed"), false);
-  checkpoint(input, "commit-recorded");
+  checkpoint(input, "target-verified", guard);
+  storeJournal(locations.journal, journalData(plan, "committed"), false, guard, journalIdentity);
+  checkpoint(input, "commit-recorded", guard);
   return report("committed", true);
 }
 function verifyLocalFixtureCiphertextMigration(input) {
-  const { root, plan, locations } = readOperation(input);
-  const record = checkedJournal(locations.journal, plan);
+  const { root, plan, locations, guard } = readOperation(input);
+  const record = checkedJournal(locations.journal, plan, guard);
   verifyInventory(root, plan, locations);
+  guard();
   if (record.phase !== "committed" || pathPresent(locations.stage)
     || !maybeRegular(locations.target, plan.sourceDigest)) refuse();
   return report(record.phase, true);
 }
 function rollbackLocalFixtureCiphertextMigration(input) {
-  const { root, plan, locations } = readOperation(input);
-  const record = checkedJournal(locations.journal, plan);
+  const { root, plan, locations, guard } = readOperation(input);
+  const record = checkedJournal(locations.journal, plan, guard);
+  let journalIdentity = fs.lstatSync(locations.journal);
   verifyInventory(root, plan, locations);
+  guard();
   if (record.phase === "rolled-back") {
     if (pathPresent(locations.target) || pathPresent(locations.stage)) refuse();
     return report("rolled-back", false);
@@ -352,8 +431,9 @@ function rollbackLocalFixtureCiphertextMigration(input) {
       && !maybeRegular(locations.target, plan.sourceDigest, stagePresent ? 2 : 1)) refuse();
     if (stagePresent && !maybeRegular(locations.stage, plan.sourceDigest,
       pathPresent(locations.target) ? 2 : 1)) refuse();
-    storeJournal(locations.journal, journalData(plan, "rollback-pending"), false);
-    checkpoint(input, "rollback-intent-recorded");
+    storeJournal(locations.journal, journalData(plan, "rollback-pending"), false, guard, journalIdentity);
+    journalIdentity = fs.lstatSync(locations.journal);
+    checkpoint(input, "rollback-intent-recorded", guard);
   }
   const stagePresent = pathPresent(locations.stage);
   const targetPresent = pathPresent(locations.target);
@@ -367,16 +447,20 @@ function rollbackLocalFixtureCiphertextMigration(input) {
   // unlinking, so the target never becomes the sole verified local copy.
   verifyInventory(root, plan, locations);
   if (targetPresent) {
+    guard();
     fs.unlinkSync(locations.target);
     flushDirectory(path.dirname(locations.target));
+    guard();
   }
-  checkpoint(input, "target-unlinked");
+  checkpoint(input, "target-unlinked", guard);
   if (stagePresent) {
     if (!maybeRegular(locations.stage, plan.sourceDigest)) refuse();
+    guard();
     fs.unlinkSync(locations.stage);
     flushDirectory(path.dirname(locations.stage));
+    guard();
   }
-  storeJournal(locations.journal, journalData(plan, "rolled-back"), false);
+  storeJournal(locations.journal, journalData(plan, "rolled-back"), false, guard, journalIdentity);
   return report("rolled-back", false);
 }
 
