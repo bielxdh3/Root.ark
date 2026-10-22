@@ -15,6 +15,8 @@ const file = require("../public/client/rootark-zk1-file-content");
 const roots = require("../public/client/rootark-zk1-ciphertext-chunk-root");
 const http = require("../public/client/rootark-zk1-protected-http-client");
 const importer = require("../public/client/rootark-zk1-owner-backup-import");
+const history = require("../public/client/rootark-zk1-owner-signed-checkpoint");
+const signedRoot = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
 const { Zk1ProtectedObjectStore } = require("../src/services/zk1ProtectedObjectStore");
 const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
 
@@ -93,6 +95,15 @@ async function scenario(t) {
   const ownerPublicKey = await crypto.webcrypto.subtle.importKey("spki",
     owner.publicKey.export({ format: "der", type: "spki" }),
     "Ed25519", false, ["verify"]);
+  const ownerSignerKey = await crypto.webcrypto.subtle.importKey("pkcs8",
+    owner.privateKey.export({ format: "der", type: "pkcs8" }),
+    "Ed25519", false, ["sign"]);
+  const ownerKeySpki = owner.publicKey.export({ format: "der", type: "spki" });
+  const ownerKeyId = crypto.randomBytes(16);
+  const ownerDeviceId = "independently-enrolled-owner";
+  const ownerIdentity = { scope: scopeWire, deviceId: ownerDeviceId,
+    signerKeyId: ownerKeyId, publicKeySpki: ownerKeySpki };
+  const independentOwnerSpkiSha256 = crypto.createHash("sha256").update(ownerKeySpki).digest();
   const device = head.devices[0];
   const devicePrivate = state.actors.get(Buffer.from(device.authorization_key_id).toString("hex"));
   const signerKey = await crypto.webcrypto.subtle.importKey("pkcs8",
@@ -121,11 +132,32 @@ async function scenario(t) {
   const signOwner = (unsigned = approvalUnsigned, key = owner.privateKey) => ({ ...unsigned,
     signatureBase64: b64(crypto.sign(null,
       Buffer.concat([ownerDomain, Buffer.from(JSON.stringify(unsigned))]), key)) });
-  const input = { approval: signOwner(), trustedOwnerPublicKey: ownerPublicKey,
-    trustedRoot: root, trustedEpoch: metadata.epoch,
-    ciphertextBase64: b64(sealed), signer, origin, fetchImpl };
+  const ownerHistoryCheckpoint = await history.signOwnerCheckpoint({
+    scope: scopeWire, signerKey: ownerSignerKey, signerPublicKey: ownerPublicKey,
+    signerKeyId: ownerKeyId, deviceId: ownerDeviceId,
+    revision: signer.manifestRevision, manifestDigest: signer.manifestDigest,
+    issuedAt: 1390, previous: null,
+  });
+  const ownerRootCheckpoint = await signedRoot.signOwnerCiphertextRootCheckpoint({
+    scope: scopeWire, signerKey: ownerSignerKey, signerKeyId: ownerKeyId,
+    deviceId: ownerDeviceId, manifestRevision: signer.manifestRevision,
+    manifestDigest: signer.manifestDigest, manifestEpoch: metadata.epoch,
+    objectId: metadata.object_id, objectRevision: 1,
+    ciphertextEpoch: metadata.epoch, ciphertextRoot: root, issuedAt: 1391,
+  });
+  const approval = signOwner();
+  const prepareTrust = (overrides = {}) => importer.prepareOwnerBackupImportTrust({
+    ownerIdentity, independentOwnerSpkiSha256, ownerHistoryCheckpoint,
+    previousHistoryProof: null, ownerRootCheckpoint, approval, ...overrides,
+  });
+  const ownerTrust = await prepareTrust();
+  const input = { approval, ownerTrust, ciphertextBase64: b64(sealed),
+    signer, origin, fetchImpl };
   return { input, signOwner, approvalUnsigned, scopeWire, metadata, cek,
     plaintext, sealed, root, origin, fetchImpl, store, state, head,
+    prepareTrust, ownerIdentity, independentOwnerSpkiSha256,
+    ownerHistoryCheckpoint, ownerRootCheckpoint, ownerPublicKey, ownerSignerKey,
+    ownerKeyId, ownerDeviceId,
     get countPut() { return countPut; }, get networkReads() { return networkReads; },
     get wire() { return wire; }, setGate: (value) => { gateOpen = value; },
     revoke: async () => { await fixtures.appendDeviceRevocation(state, device.device_id);
@@ -139,6 +171,8 @@ test("real protected HTTP import verifies owner signature and pinned root before
   const f = await scenario(t);
   const result = await importer.importOwnerSignedBackupCiphertext(f.input);
   assert.equal(result.ownerSignatureVerified, true);
+  assert.equal(result.signedHistoricalRootVerified, true);
+  assert.equal(result.externalPinSourceVerifiedByModule, false);
   assert.equal(result.ciphertextReadbackVerified, true);
   assert.equal(result.independentDurabilityProven, false);
   assert.equal(result.authorizesRestore, false);
@@ -176,10 +210,11 @@ test("real protected HTTP import verifies owner signature and pinned root before
 test("missing/forged owner, tampered ciphertext, scope, epoch, root and malformed envelope deny before network", async (t) => {
   const f = await scenario(t);
   const invalid = [
-    { ...f.input, trustedOwnerPublicKey: null },
+    { ...f.input, ownerTrust: null },
     { ...f.input, approval: { ...f.input.approval, signatureBase64: b64(crypto.randomBytes(64)) } },
-    { ...f.input, trustedRoot: crypto.randomBytes(32) },
-    { ...f.input, trustedEpoch: f.input.trustedEpoch + 1 },
+    { ...f.input, trustedOwnerPublicKey: f.ownerPublicKey },
+    { ...f.input, trustedRoot: f.root },
+    { ...f.input, trustedEpoch: f.metadata.epoch },
     { ...f.input, ciphertextBase64: b64(crypto.randomBytes(128)) },
     { ...f.input, approval: f.signOwner({ ...f.approvalUnsigned,
       account_id: id() }) },
@@ -201,7 +236,82 @@ test("missing/forged owner, tampered ciphertext, scope, epoch, root and malforme
     assert.equal(f.countPut, 0);
     assert.equal(f.networkReads, 0);
   }
+  await assert.rejects(f.prepareTrust({ approval: f.signOwner({
+    ...f.approvalUnsigned, ciphertext_root: b64(crypto.randomBytes(32)) }) }),
+  /ZK_OWNER_BACKUP_IMPORT_DENIED/, "signed root must bind the exact ciphertext root");
+  await assert.rejects(f.prepareTrust({ approval: f.signOwner({
+    ...f.approvalUnsigned, epoch: f.approvalUnsigned.epoch + 1 }) }),
+  /ZK_OWNER_BACKUP_IMPORT_DENIED/, "a higher claimed epoch is not owner root provenance");
   assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 0);
+});
+
+test("self-signed archive cannot replace external owner pin, signed root or historic floor", async (t) => {
+  const f = await scenario(t);
+  const attacker = crypto.generateKeyPairSync("ed25519");
+  const attackerSpki = attacker.publicKey.export({ format: "der", type: "spki" });
+  // The archive may carry its own complete key, signature and claimed root.
+  // Its SPKI is still not authorized by an independently retained fingerprint.
+  await assert.rejects(f.prepareTrust({ ownerIdentity: {
+    ...f.ownerIdentity, publicKeySpki: attackerSpki },
+  }), /ZK_OWNER_BACKUP_IMPORT_DENIED/);
+  await assert.rejects(f.prepareTrust({ independentOwnerSpkiSha256: crypto.randomBytes(32) }),
+    /ZK_OWNER_BACKUP_IMPORT_DENIED/);
+  await assert.rejects(f.prepareTrust({ ownerRootCheckpoint: {
+    ...f.ownerRootCheckpoint, ciphertext_root: b64(crypto.randomBytes(32)) },
+  }), /ZK_OWNER_BACKUP_IMPORT_DENIED/);
+  const substitutedSignedRoot = await signedRoot.signOwnerCiphertextRootCheckpoint({
+    scope: f.scopeWire, signerKey: f.ownerSignerKey,
+    signerKeyId: f.ownerKeyId, deviceId: f.ownerDeviceId,
+    manifestRevision: f.input.signer.manifestRevision,
+    manifestDigest: f.input.signer.manifestDigest,
+    manifestEpoch: f.metadata.epoch, objectId: id(), objectRevision: 1,
+    ciphertextEpoch: f.metadata.epoch, ciphertextRoot: f.root, issuedAt: 1391,
+  });
+  await assert.rejects(f.prepareTrust({ ownerRootCheckpoint: substitutedSignedRoot }),
+    /ZK_OWNER_BACKUP_IMPORT_DENIED/,
+    "even an authentic root for another object is not interchangeable");
+  await assert.rejects(f.prepareTrust({ ownerHistoryCheckpoint: {
+    ...f.ownerHistoryCheckpoint, manifest_digest: b64(crypto.randomBytes(32)) },
+  }), /ZK_OWNER_BACKUP_IMPORT_DENIED/);
+  // The local verified checkpoint is the minimum head: accepting the same
+  // archived earlier checkpoint as its own successor would roll history back.
+  const verifiedHead = await history.verifyOwnerCheckpoint({
+    checkpoint: f.ownerHistoryCheckpoint, scope: f.scopeWire,
+    signerPublicKey: f.ownerPublicKey, signerKeyId: f.ownerKeyId,
+    previous: null,
+  });
+  await assert.rejects(f.prepareTrust({ previousHistoryProof: verifiedHead }),
+    /ZK_OWNER_BACKUP_IMPORT_DENIED/);
+  await assert.rejects(importer.importOwnerSignedBackupCiphertext({
+    ...f.input, signer: { ...f.input.signer, epoch: f.metadata.epoch + 1 },
+  }), /ZK_OWNER_BACKUP_IMPORT_DENIED/,
+  "a valid old owner archive cannot override the signer's newer epoch");
+  await assert.rejects(importer.importOwnerSignedBackupCiphertext({
+    ...f.input, ownerTrust: { ...f.input.ownerTrust },
+  }), /ZK_OWNER_BACKUP_IMPORT_DENIED/, "a JSON clone cannot forge the trusted capability");
+  assert.equal(f.countPut, 0);
+  assert.equal(f.networkReads, 0);
+});
+
+test("signed historical read rejects a replayed ciphertext response and makes no restore claim", async (t) => {
+  const f = await scenario(t);
+  const replayFetch = async (url, options) => {
+    if (url.endsWith("/content/read")) return new Response(JSON.stringify({
+      id: f.metadata.object_id, revision: 1, epoch: f.metadata.epoch,
+      ciphertextBase64: b64(crypto.randomBytes(f.sealed.length)),
+    }), { status: 200, headers: { "content-type": "application/json" } });
+    return f.fetchImpl(url, options);
+  };
+  await assert.rejects(importer.importOwnerSignedBackupCiphertext({
+    ...f.input, fetchImpl: replayFetch,
+  }), /ZK_OWNER_BACKUP_IMPORT_DENIED/);
+  assert.equal(f.countPut, 1);
+  assert.equal(f.networkReads, 0, "replayed GET is intercepted before actual server read");
+  assert.deepEqual(Buffer.from(f.store.db.prepare(
+    "SELECT ciphertext FROM zk_content_object WHERE id=?").get(f.metadata.object_id).ciphertext),
+  Buffer.from(f.sealed), "ciphertext remains for a manual uncertain-write reconciliation");
+  await assert.rejects(importer.importOwnerSignedBackupCiphertext(f.input),
+    /ZK_OWNER_BACKUP_IMPORT_DENIED/, "same signed archive cannot replace the first write");
 });
 
 test("witness pending and revoked device refuse backup import without storing ciphertext", async (t) => {
@@ -243,9 +353,12 @@ test("browser standalone UMD loads signed backup importer without Node capabilit
   const context = vm.createContext({ crypto: crypto.webcrypto,
     TextEncoder, TextDecoder, URL, btoa, atob, Uint8Array, ArrayBuffer,
     RootarkZk1CiphertextRoot: roots,
-    RootarkZk1ProtectedHttpClient: http });
+    RootarkZk1ProtectedHttpClient: http,
+    RootarkZk1OwnerCiphertextRootCheckpoint: signedRoot });
   vm.runInContext(fs.readFileSync(path.join(__dirname,
     "../public/client/rootark-zk1-owner-backup-import.js"), "utf8"), context);
   assert.equal(typeof context.RootarkZk1OwnerBackupImport.importOwnerSignedBackupCiphertext,
+    "function");
+  assert.equal(typeof context.RootarkZk1OwnerBackupImport.prepareOwnerBackupImportTrust,
     "function");
 });
