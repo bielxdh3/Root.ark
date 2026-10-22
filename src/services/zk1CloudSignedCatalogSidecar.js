@@ -1,0 +1,200 @@
+"use strict";
+
+// Separate opaque signed-catalog backup in the existing bounded provider data
+// plane. A derived operation address prevents collision with the file copy.
+// The sidecar is NOT itself a signature: consumers MUST verify the embedded
+// Ed25519 committed proof, signed snapshot, owner root and monotonic floor.
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const inventory = require("../crypto/rootark-zk-content-inventory-v1");
+const { zk1CloudCopyAddress } = require("./zk1CloudCiphertextReadbackVerifier");
+
+const FORMAT = "rootark-zk1-signed-catalog-sidecar/v1";
+const DOMAIN = Buffer.from("Root.ark/zk-1/catalog-sidecar-operation/v1\0");
+const MAX = Math.min(4 * 1024 * 1024, inventory.MAX_SNAPSHOT_BYTES + 200000);
+function deny() { throw new Error("ZK_SIGNED_CATALOG_SIDECAR_DENIED"); }
+function bytes(value, length) {
+  if ((!Buffer.isBuffer(value) && !(value instanceof Uint8Array))
+    || value.byteLength !== length) deny();
+  return Buffer.from(value);
+}
+function keyIdentity(target, method) {
+  if (!target || typeof target !== "object" || Array.isArray(target)) deny();
+  const adapter = target[method];
+  if (!adapter || !["s3", "gdrive", "webdav"].includes(target.provider)
+    || adapter.status?.()?.provider !== target.provider
+    || adapter.enabled?.() !== true
+    || !["key", "resolveInventoryContext", "zk1StorageNamespace",
+      method === "cloudWriter" ? "upload" : "download"]
+      .every((name) => typeof adapter[name] === "function")
+    || !/^[a-f0-9]{64}$/.test(target.expectedContext)
+    || !/^[a-f0-9]{64}$/.test(adapter.zk1StorageNamespace())
+    || (target.provider === "gdrive"
+      ? !/^[A-Za-z0-9_-]{1,256}$/.test(target.pinnedDriveFileId)
+      : target.pinnedDriveFileId !== null)) deny();
+  return { adapter, provider: target.provider, context: target.expectedContext,
+    namespace: adapter.zk1StorageNamespace(), driveFileId: target.pinnedDriveFileId };
+}
+function copyAddress(scope, operationId) {
+  const id = crypto.createHash("sha256").update(DOMAIN)
+    .update(bytes(operationId, 16)).digest().subarray(0, 16);
+  return zk1CloudCopyAddress({ scope: inventory.normalizeScope(scope), operationId: id });
+}
+function encodeCatalog(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) deny();
+  const raw = {
+    format: FORMAT,
+    operationId: bytes(input.operationId, 16).toString("base64url"),
+    signedCommittedProof: Buffer.from(input.signedCommittedProof).toString("base64url"),
+    signedSnapshot: Buffer.from(input.signedSnapshot).toString("base64url"),
+    snapshotNonce: bytes(input.snapshotNonce, 32).toString("base64url"),
+    committedProofChain: input.committedProofChain.map((value) => Buffer.from(value).toString("base64url")),
+    ownerCheckpoint: input.ownerCheckpoint,
+    ownerHistoryCheckpoint: input.ownerHistoryCheckpoint,
+    previousOwnerHistoryProof: input.previousOwnerHistoryProof,
+    expectedCiphertextRoot: bytes(input.expectedCiphertextRoot, 32).toString("base64url"),
+    chunkLengths: input.chunkLengths,
+  };
+  if (!Array.isArray(raw.chunkLengths) || raw.chunkLengths.length < 1
+    || raw.chunkLengths.length > 16
+    || raw.chunkLengths.some((length) => !Number.isSafeInteger(length)
+      || length < 1 || length > 1024 * 1024)
+    || !Array.isArray(raw.committedProofChain) || raw.committedProofChain.length > 64) deny();
+  const data = Buffer.from(JSON.stringify(raw), "utf8");
+  if (data.length < 1 || data.length > MAX) deny();
+  return data;
+}
+function parseCatalog(data, expectedOperationId) {
+  if (!Buffer.isBuffer(data) || data.length < 1 || data.length > MAX) deny();
+  let wire;
+  try { wire = JSON.parse(data.toString("utf8")); } catch (_) { deny(); }
+  const fields = ["format", "operationId", "signedCommittedProof", "signedSnapshot",
+    "snapshotNonce", "committedProofChain", "ownerCheckpoint", "ownerHistoryCheckpoint",
+    "previousOwnerHistoryProof", "expectedCiphertextRoot", "chunkLengths"];
+  if (!wire || typeof wire !== "object" || Array.isArray(wire)
+    || Reflect.ownKeys(wire).length !== fields.length
+    || fields.some((field) => !Object.hasOwn(wire, field))
+    || wire.format !== FORMAT
+    || wire.operationId !== bytes(expectedOperationId, 16).toString("base64url")
+    || JSON.stringify(wire) !== data.toString("utf8")) deny();
+  const from64 = (value, max) => {
+    if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)
+      || value.length > Math.ceil(max * 4 / 3) + 4) deny();
+    const buffer = Buffer.from(value, "base64url");
+    if (buffer.length > max || buffer.toString("base64url") !== value) deny();
+    return buffer;
+  };
+  if (!Array.isArray(wire.committedProofChain) || wire.committedProofChain.length > 64
+    || !Array.isArray(wire.chunkLengths) || wire.chunkLengths.length < 1
+    || wire.chunkLengths.length > 16
+    || wire.chunkLengths.some((length) => !Number.isSafeInteger(length)
+      || length < 1 || length > 1024 * 1024)) deny();
+  const output = {
+    signedCommittedProof: from64(wire.signedCommittedProof, inventory.MAX_COMMITTED_PROOF_BYTES),
+    signedSnapshot: from64(wire.signedSnapshot, inventory.MAX_SNAPSHOT_BYTES),
+    snapshotNonce: from64(wire.snapshotNonce, 32),
+    committedProofChain: wire.committedProofChain.map((entry) =>
+      from64(entry, inventory.MAX_COMMITTED_PROOF_BYTES)),
+    ownerCheckpoint: wire.ownerCheckpoint,
+    ownerHistoryCheckpoint: wire.ownerHistoryCheckpoint,
+    previousOwnerHistoryProof: wire.previousOwnerHistoryProof,
+    expectedCiphertextRoot: from64(wire.expectedCiphertextRoot, 32),
+    chunkLengths: wire.chunkLengths,
+  };
+  if (output.snapshotNonce.length !== 32 || output.expectedCiphertextRoot.length !== 32) deny();
+  // roundtrip also rejects aliases, overlong encodings and unknown fields.
+  if (!data.equals(encodeCatalog({ ...output, operationId: expectedOperationId }))) deny();
+  return output;
+}
+async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog, writers } = {}) {
+  let dir;
+  try {
+    if (!Array.isArray(writers) || writers.length < 2 || writers.length > 3) deny();
+    const pinned = writers.map((target) => keyIdentity(target, "cloudWriter"));
+    if (new Set(pinned.map((target) => target.provider)).size !== pinned.length
+      || new Set(pinned.map((target) => target.namespace)).size !== pinned.length) deny();
+    const payload = encodeCatalog({ ...signedCatalog, operationId });
+    const address = copyAddress(scope, operationId);
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-write-"));
+    const staged = path.join(dir, "signed-catalog.ct");
+    fs.writeFileSync(staged, payload, { flag: "wx", mode: 0o600 });
+    const acknowledgements = [];
+    for (const target of pinned) {
+      if (await target.adapter.resolveInventoryContext() !== target.context) deny();
+      const expectedKey = target.adapter.key(address.folder, address.name, "uploads");
+      const result = await target.adapter.upload(staged, address.folder, address.name,
+        "uploads", { zk1BoundedBytes: payload.length,
+          ...(target.driveFileId === null ? {} : { providerFileId: target.driveFileId }) });
+      if (!result || result.provider !== target.provider || result.key !== expectedKey
+        || (target.driveFileId !== null && result.id !== target.driveFileId)
+        || await target.adapter.resolveInventoryContext() !== target.context) deny();
+      acknowledgements.push(Object.freeze({ provider: target.provider,
+        providerObjectKey: expectedKey, providerFileId: target.driveFileId }));
+    }
+    return Object.freeze({ status: "SIGNED_CATALOG_PUT_ACK_NONAUTHORITATIVE",
+      acknowledgements: Object.freeze(acknowledgements), remoteDurabilityProven: false });
+  } catch (_) { deny(); }
+  finally { if (dir) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); }
+}
+async function recoverSignedCatalogSidecar({ scope, operationId, readers,
+  minimumMatchingProviders = 2 } = {}) {
+  if (!Array.isArray(readers) || readers.length < 2 || readers.length > 3
+    || !Number.isSafeInteger(minimumMatchingProviders)
+    || minimumMatchingProviders < 2 || minimumMatchingProviders > readers.length) deny();
+  const pinned = readers.map((target) => keyIdentity(target, "cloudReader"));
+  if (new Set(pinned.map((target) => target.provider)).size !== pinned.length
+    || new Set(pinned.map((target) => target.namespace)).size !== pinned.length) deny();
+  const address = copyAddress(scope, operationId);
+  const recovered = [];
+  for (const target of pinned) {
+    let dir;
+    try {
+      if (await target.adapter.resolveInventoryContext() !== target.context) deny();
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-read-"));
+      const destination = path.join(dir, "catalog.ct");
+      const received = await target.adapter.download(address.folder, address.name,
+        destination, "uploads", () => true,
+        { maxBytes: MAX, ...(target.driveFileId === null ? {}
+          : { providerFileId: target.driveFileId }) });
+      if (received !== true || await target.adapter.resolveInventoryContext() !== target.context) deny();
+      const info = fs.lstatSync(destination, { bigint: true });
+      if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1n
+        || info.size < 1n || info.size > BigInt(MAX)) deny();
+      const fd = fs.openSync(destination,
+        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      let data;
+      try {
+        const opened = fs.fstatSync(fd, { bigint: true });
+        if (!opened.isFile() || opened.nlink !== 1n || opened.dev !== info.dev
+          || opened.ino !== info.ino || opened.size !== info.size) deny();
+        data = fs.readFileSync(fd);
+        const after = fs.fstatSync(fd, { bigint: true });
+        const now = fs.lstatSync(destination, { bigint: true });
+        if (data.length !== Number(info.size) || after.ino !== opened.ino
+          || after.dev !== opened.dev || after.size !== opened.size
+          || after.mtimeNs !== opened.mtimeNs || now.ino !== opened.ino
+          || now.dev !== opened.dev || now.nlink !== 1n || now.isSymbolicLink()) deny();
+      } finally { fs.closeSync(fd); }
+      const parsed = parseCatalog(data, operationId);
+      recovered.push({ data, parsed, provider: target.provider });
+    } catch (_) { /* unknown/missing/corrupt provider is excluded from quorum */ }
+    finally { if (dir) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); }
+  }
+  const groups = new Map();
+  for (const item of recovered) {
+    const hash = crypto.createHash("sha256").update(item.data).digest("hex");
+    if (!groups.has(hash)) groups.set(hash, []);
+    groups.get(hash).push(item);
+  }
+  const eligible = [...groups.values()].filter((group) => group.length >= minimumMatchingProviders);
+  if (eligible.length !== 1 || eligible[0].some((value) => !value.data.equals(eligible[0][0].data))) deny();
+  return Object.freeze({ signedCatalog: eligible[0][0].parsed,
+    providers: Object.freeze(eligible[0].map((item) => item.provider)),
+    matchingCount: eligible[0].length, remoteDurabilityProven: false,
+    signaturesVerifiedBySidecar: false });
+}
+
+module.exports = { publishSignedCatalogSidecars, recoverSignedCatalogSidecar,
+  zk1CatalogSidecarAddress: copyAddress };
