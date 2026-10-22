@@ -333,7 +333,7 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     "Ed25519", false, ["verify"]);
   const foreignHistory = await ownerHistory.signOwnerCheckpoint({
     scope: scopeClient, signerKey: attackerSigner, signerPublicKey: attackerVerifier,
-    signerKeyId: ownerSignerId, deviceId: "owner-device", revision: 9,
+    signerKeyId: ownerSignerId, deviceId: "owner-device", revision: ownerRevision,
     manifestDigest: ownerDigest, issuedAt: 1001, previous: null });
   const foreignBrandedProof = await ownerHistory.verifyOwnerCheckpoint({
     checkpoint: foreignHistory, scope: scopeClient,
@@ -344,7 +344,7 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   for (const sequence of [2, 3]) {
     const signedHistory = await ownerHistory.signOwnerCheckpoint({
       scope: scopeClient, signerKey: signer, signerPublicKey: verifier,
-      signerKeyId: ownerSignerId, deviceId: "owner-device", revision: 9,
+      signerKeyId: ownerSignerId, deviceId: "owner-device", revision: ownerRevision,
       manifestDigest: ownerDigest, issuedAt: 1001 + sequence, previous: predecessor });
     const verified = await historyVerify(signedHistory, predecessor);
     assert.equal(verified.sequence, sequence);
