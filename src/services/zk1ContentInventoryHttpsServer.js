@@ -10,6 +10,8 @@ const MAX_APPEND_REQUEST_BYTES = 8192;
 const MAX_SNAPSHOT_BASE64_BYTES = 3 * 1024 * 1024;
 const MAX_SNAPSHOT_RESPONSE_BYTES = MAX_SNAPSHOT_BASE64_BYTES + 16 * 1024;
 const MAX_SMALL_RESPONSE_BYTES = 16 * 1024;
+const MAX_CHAIN_RESPONSE_BYTES = 128 * 1024;
+const MAX_CHAIN_PAGE_RECEIPTS = 16;
 const B64U = /^[A-Za-z0-9_-]+$/;
 const FINGERPRINT = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
 const SCOPE_FIELDS = Object.freeze(["account_id", "compartment_id", "keyring_id"]);
@@ -21,6 +23,7 @@ const ROUTES = Object.freeze({
   "/v1/inventory/snapshot": { role: "read", kind: "snapshot" },
   "/v1/inventory/append": { role: "append", kind: "append" },
   "/v1/inventory/operation": { role: "status", kind: "operation" },
+  "/v1/inventory/chain": { role: "read", kind: "chain" },
 });
 const PENDING_REASONS = new Set([
   "EXPECTED_HEAD_CHANGED", "INVENTORY_LIMIT", "INVALID_CHRONOLOGY",
@@ -179,12 +182,43 @@ function createZk1ContentInventoryHttpsServer({ key, cert, clientCa, ledger, pri
 
       const body = await readJson(request,
         route.kind === "append" ? MAX_APPEND_REQUEST_BYTES : MAX_METADATA_REQUEST_BYTES);
-      const expectedFields = route.kind === "snapshot" ? ["scope", "nonce"] : ["scope", "operation"]
-        .concat(route.kind === "append" ? ["nonce"] : []);
+      const expectedFields = route.kind === "snapshot" ? ["scope", "nonce"]
+        : route.kind === "chain" ? ["scope", "afterSequence", "limit"]
+          : ["scope", "operation"].concat(route.kind === "append" ? ["nonce"] : []);
       const raw = exact(body, expectedFields);
       const scope = normalizeScope(raw.scope);
       const keyForScope = scopeKey(scope);
       if (!principal.scopes.has(keyForScope) || keyForScope !== ledgerScopeKey) forbidden();
+
+      if (route.kind === "chain") {
+        if (!Number.isSafeInteger(raw.afterSequence) || raw.afterSequence < 0
+          || raw.afterSequence > inventory.MAX_ENTRIES
+          || !Number.isSafeInteger(raw.limit) || raw.limit < 1
+          || raw.limit > MAX_CHAIN_PAGE_RECEIPTS) invalid();
+        const page = await ledger.getCommittedProofPage({
+          afterSequence: raw.afterSequence, limit: raw.limit,
+        });
+        if (page?.status === "pending" && page.reason === "UNRESOLVED_INTENT") {
+          return respond(response, 200, { status: "pending", reason: "UNRESOLVED_INTENT" });
+        }
+        if (page?.status !== "chain_page" || page.afterSequence !== raw.afterSequence
+          || !Number.isSafeInteger(page.headSequence) || page.headSequence < 0
+          || page.headSequence > inventory.MAX_ENTRIES
+          || !Number.isSafeInteger(page.nextSequence)
+          || page.nextSequence < page.afterSequence
+          || page.nextSequence > page.headSequence
+          || !Array.isArray(page.proofs)
+          || page.proofs.length !== page.nextSequence - page.afterSequence
+          || page.proofs.length > raw.limit
+          || (page.nextSequence < page.headSequence && page.proofs.length !== raw.limit)
+          || page.proofs.some((item) => !Buffer.isBuffer(item)
+            || item.length < 1 || item.length > inventory.MAX_COMMITTED_PROOF_BYTES)) invalid();
+        return respond(response, 200, {
+          status: "chain_page", afterSequence: page.afterSequence,
+          nextSequence: page.nextSequence, headSequence: page.headSequence,
+          proofsBase64: page.proofs.map((item) => item.toString("base64url")),
+        }, MAX_CHAIN_RESPONSE_BYTES);
+      }
 
       if (route.kind === "snapshot") {
         const nonce = decode(raw.nonce, 32, 32);

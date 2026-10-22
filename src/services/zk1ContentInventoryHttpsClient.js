@@ -15,6 +15,9 @@ const MAX_APPEND_REQUEST_BYTES = 8192;
 const MAX_SNAPSHOT_BASE64_BYTES = 3 * 1024 * 1024;
 const MAX_SNAPSHOT_RESPONSE_BYTES = MAX_SNAPSHOT_BASE64_BYTES + 16 * 1024;
 const MAX_SMALL_RESPONSE_BYTES = 16 * 1024;
+const MAX_CHAIN_RESPONSE_BYTES = 128 * 1024;
+const MAX_CHAIN_PAGE_RECEIPTS = 16;
+const MAX_AUTO_CHAIN_RECEIPTS = 64;
 const SCOPE_FIELDS = Object.freeze(["account_id", "compartment_id", "keyring_id"]);
 const OPERATION_FIELDS = Object.freeze([
   "operation_id", "expected_sequence", "expected_root", "object_id", "revision", "epoch",
@@ -286,7 +289,83 @@ function createZk1ContentInventoryHttpsClient({
     }).catch(() => fail());
   }
 
-  return Object.freeze({
+  const client = Object.freeze({
+    getProofPage(input) {
+      const raw = exact(input, ["scope", "afterSequence", "limit"]);
+      const scope = inventory.normalizeScope(raw.scope);
+      if (!Number.isSafeInteger(raw.afterSequence) || raw.afterSequence < 0
+        || raw.afterSequence > inventory.MAX_ENTRIES
+        || !Number.isSafeInteger(raw.limit) || raw.limit < 1
+        || raw.limit > MAX_CHAIN_PAGE_RECEIPTS) fail();
+      return call("/v1/inventory/chain", {
+        scope: Object.fromEntries(Object.entries(scope).map(([field, value]) =>
+          [field, value.toString("base64url")])),
+        afterSequence: raw.afterSequence, limit: raw.limit,
+      }, MAX_METADATA_REQUEST_BYTES, MAX_CHAIN_RESPONSE_BYTES).then((result) => {
+        try {
+          const pending = exact(result, ["status", "reason"]);
+          if (pending.status === "pending" && pending.reason === "UNRESOLVED_INTENT") {
+            return { status: "pending", reason: "UNRESOLVED_INTENT", authorizesIo: false };
+          }
+        } catch (_) { /* next check requires the exact chain page shape */ }
+        const page = exact(result, ["status", "afterSequence", "nextSequence",
+          "headSequence", "proofsBase64"]);
+        if (page.status !== "chain_page" || page.afterSequence !== raw.afterSequence
+          || !Number.isSafeInteger(page.nextSequence)
+          || page.nextSequence < raw.afterSequence
+          || !Number.isSafeInteger(page.headSequence)
+          || page.headSequence < page.nextSequence
+          || page.headSequence > inventory.MAX_ENTRIES
+          || !Array.isArray(page.proofsBase64)
+          || page.proofsBase64.length !== page.nextSequence - raw.afterSequence
+          || page.proofsBase64.length > raw.limit
+          || (page.nextSequence < page.headSequence && page.proofsBase64.length !== raw.limit)) fail();
+        const proofs = page.proofsBase64.map((item) =>
+          decode(item, 1, inventory.MAX_COMMITTED_PROOF_BYTES));
+        // Transport delivery is NOT a signed floor or a verified chain.
+        // Only verifySnapshot with a pinned minimumHead and complete signed
+        // minimumSnapshot can authenticate these bytes.
+        return {
+          status: "transport_unverified", afterSequence: raw.afterSequence,
+          nextSequence: page.nextSequence, headSequenceReported: page.headSequence,
+          proofs, authorizesIo: false,
+        };
+      }).catch(() => fail());
+    },
+
+    async getVerifiedSnapshotWithChain(input) {
+      const raw = exact(input, ["scope", "nonce", "requested", "minimumHead", "minimumSnapshot"]);
+      // Copy every user-controlled buffer before fetching the first page. The
+      // network's reported head is never accepted as an authenticated floor.
+      const scope = inventory.normalizeScope(raw.scope);
+      const nonce = inventory.normalizeNonce(raw.nonce);
+      const requested = inventory.normalizeRequested(raw.requested);
+      const minimumHead = inventory.normalizeMinimumHead(raw.minimumHead);
+      const minimumSnapshot = copyBytes(raw.minimumSnapshot, 1, inventory.MAX_SNAPSHOT_BYTES);
+      const committedProofChain = [];
+      let cursor = minimumHead.sequence;
+      for (;;) {
+        if (committedProofChain.length >= MAX_AUTO_CHAIN_RECEIPTS) fail();
+        const limit = Math.min(MAX_CHAIN_PAGE_RECEIPTS,
+          MAX_AUTO_CHAIN_RECEIPTS - committedProofChain.length);
+        const page = await client.getProofPage({ scope, afterSequence: cursor, limit });
+        if (page.status === "pending") {
+          return { status: "pending", reason: "UNRESOLVED_INTENT", authorizesIo: false };
+        }
+        if (page.status !== "transport_unverified" || page.afterSequence !== cursor
+          || page.nextSequence - cursor !== page.proofs.length
+          || (page.nextSequence === cursor && page.headSequenceReported !== cursor)) fail();
+        committedProofChain.push(...page.proofs);
+        cursor = page.nextSequence;
+        if (page.headSequenceReported === cursor) break;
+      }
+      // A malicious or racing peer may give a stale/partial chain. The
+      // separately pinned nonce-bound signed snapshot rejects it closed.
+      return client.getSnapshot({
+        scope, nonce, requested, minimumHead, minimumSnapshot, committedProofChain,
+      });
+    },
+
     getSnapshot(input) {
       const raw = exact(input, ["scope", "nonce", "requested", "minimumHead"],
         ["minimumSnapshot", "committedProofChain"]);
@@ -454,6 +533,7 @@ function createZk1ContentInventoryHttpsClient({
       }).catch(() => fail());
     },
   });
+  return client;
 }
 
 function sameOperationId(encoded, expected) {

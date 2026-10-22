@@ -241,6 +241,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       getSnapshot: (...args) => ledger.getSnapshot(...args),
       append: (...args) => ledger.append(...args),
       getOperationStatus: (...args) => ledger.getOperationStatus(...args),
+      getCommittedProofPage: (...args) => ledger.getCommittedProofPage(...args),
     };
     const scopes = [scopeJson(scopeBytes)];
     const principals = {
@@ -385,6 +386,141 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     assert.deepEqual(verified.root, head.root);
     await assert.rejects(reader.getSnapshot({
       ...query, nonce: crypto.randomBytes(32), committedProofChain: receipts.slice(1),
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
+  });
+
+  await t.test("bounded scope-authorized read pages reconstruct exact signed history over real mTLS", async (child) => {
+    const h = await harness(child);
+    const reader = h.makeClient("reader");
+    const floor = await h.ledger.readLocalHead();
+    const floorSnapshot = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+    let head = floor;
+    const operations = [];
+    for (let i = 0; i < 3; i += 1) {
+      const operation = newOperation({ sequence: head.sequence, root: head.root,
+        objectId: Buffer.alloc(16, 0xa0 + i) });
+      const committed = await h.ledger.append(operation);
+      assert.equal(committed.status, "committed");
+      head = { sequence: committed.sequence, root: committed.root };
+      operations.push(operation);
+    }
+    const pageOne = await reader.getProofPage({ scope: h.scope, afterSequence: 0, limit: 2 });
+    assert.equal(pageOne.status, "transport_unverified");
+    assert.equal(pageOne.authorizesIo, false);
+    assert.equal(pageOne.nextSequence, 2);
+    assert.equal(pageOne.proofs.length, 2);
+    const pageTwo = await reader.getProofPage({ scope: h.scope, afterSequence: 2, limit: 2 });
+    assert.equal(pageTwo.nextSequence, 3);
+    assert.equal(pageTwo.proofs.length, 1);
+    const chain = [...pageOne.proofs, ...pageTwo.proofs];
+    const verified = await reader.getSnapshot({
+      scope: h.scope, nonce: crypto.randomBytes(32),
+      requested: requested(operations[2]), minimumHead: floor,
+      minimumSnapshot: floorSnapshot.bytes, committedProofChain: chain,
+    });
+    assert.equal(verified.outcome, "PRESENT");
+    assert.equal(verified.verifiedInterveningReceipts, 3);
+    assert.equal(verified.authorizesIo, false);
+    const emptyPage = await reader.getProofPage({ scope: h.scope, afterSequence: 3, limit: 2 });
+    assert.equal(emptyPage.nextSequence, 3);
+    assert.equal(emptyPage.proofs.length, 0);
+    await assert.rejects(h.makeClient("writer").getProofPage({
+      scope: h.scope, afterSequence: 0, limit: 1,
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
+    await assert.rejects(reader.getProofPage({
+      scope: OTHER_SCOPE, afterSequence: 0, limit: 1,
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
+    await assert.rejects(async () => reader.getProofPage({
+      scope: h.scope, afterSequence: 0, limit: 9999,
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
+    await assert.rejects(async () => reader.getProofPage({
+      scope: h.scope, afterSequence: 9999, limit: 1,
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
+  });
+
+  await t.test("chain endpoint caps pages at 16 and never elevates tampered transport bytes into signed proof", async (child) => {
+    const h = await harness(child);
+    const reader = h.makeClient("reader");
+    const floor = await h.ledger.readLocalHead();
+    const base = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+    let head = floor;
+    let last;
+    for (let i = 0; i < 17; i += 1) {
+      last = newOperation({ sequence: head.sequence, root: head.root,
+        objectId: Buffer.alloc(16, i + 1) });
+      const commit = await h.ledger.append(last);
+      assert.equal(commit.status, "committed");
+      head = { sequence: commit.sequence, root: commit.root };
+    }
+    const first = await reader.getProofPage({ scope: h.scope, afterSequence: 0, limit: 16 });
+    assert.equal(first.proofs.length, 16);
+    assert.equal(first.nextSequence, 16);
+    const second = await reader.getProofPage({ scope: h.scope, afterSequence: 16, limit: 16 });
+    assert.equal(second.proofs.length, 1);
+    assert.equal(second.nextSequence, 17);
+    const autoVerified = await reader.getVerifiedSnapshotWithChain({
+      scope: h.scope, nonce: crypto.randomBytes(32), requested: requested(last),
+      minimumHead: floor, minimumSnapshot: base.bytes,
+    });
+    assert.equal(autoVerified.outcome, "PRESENT");
+    assert.equal(autoVerified.verifiedInterveningReceipts, 17);
+    assert.equal(autoVerified.authorizesIo, false);
+    const original = h.ledger.getCommittedProofPage.bind(h.ledger);
+    h.ledger.getCommittedProofPage = async (input) => {
+      const page = await original(input);
+      const proofs = page.proofs.map((proof) => Buffer.from(proof));
+      proofs[0][proofs[0].length - 1] ^= 1;
+      return { ...page, proofs };
+    };
+    const transported = await reader.getProofPage({ scope: h.scope, afterSequence: 16, limit: 1 });
+    assert.equal(transported.status, "transport_unverified");
+    assert.equal(transported.authorizesIo, false);
+    await assert.rejects(reader.getSnapshot({
+      scope: h.scope, nonce: crypto.randomBytes(32),
+      requested: requested(last), minimumHead: floor, minimumSnapshot: base.bytes,
+      committedProofChain: [...first.proofs, ...transported.proofs],
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
+  });
+
+  await t.test("forged early terminal cursor and append racing the final snapshot fail closed", async (child) => {
+    const h = await harness(child);
+    const reader = h.makeClient("reader");
+    const floor = await h.ledger.readLocalHead();
+    const genesis = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+    let head = floor;
+    let last;
+    for (let i = 0; i < 2; i += 1) {
+      last = newOperation({ sequence: head.sequence, root: head.root,
+        objectId: Buffer.alloc(16, 0xd0 + i) });
+      const committed = await h.ledger.append(last);
+      assert.equal(committed.status, "committed");
+      head = { sequence: committed.sequence, root: committed.root };
+    }
+    const input = {
+      scope: h.scope, nonce: crypto.randomBytes(32), requested: requested(last),
+      minimumHead: floor, minimumSnapshot: genesis.bytes,
+    };
+    const realPage = h.ledger.getCommittedProofPage.bind(h.ledger);
+    h.ledger.getCommittedProofPage = async (value) => {
+      const page = await realPage(value);
+      return { ...page, nextSequence: 1, headSequence: 1, proofs: page.proofs.slice(0, 1) };
+    };
+    await assert.rejects(reader.getVerifiedSnapshotWithChain(input),
+      { code: "INVENTORY_HTTP_UNAVAILABLE" });
+    h.ledger.getCommittedProofPage = realPage;
+    const realSnapshot = h.ledger.getSnapshot.bind(h.ledger);
+    let appendAtSnapshot = true;
+    h.ledger.getSnapshot = async (value) => {
+      if (appendAtSnapshot) {
+        appendAtSnapshot = false;
+        const raced = newOperation({ sequence: head.sequence, root: head.root,
+          objectId: Buffer.alloc(16, 0xdf) });
+        assert.equal((await h.ledger.append(raced)).status, "committed");
+      }
+      return realSnapshot(value);
+    };
+    await assert.rejects(reader.getVerifiedSnapshotWithChain({
+      ...input, nonce: crypto.randomBytes(32),
     }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
   });
 

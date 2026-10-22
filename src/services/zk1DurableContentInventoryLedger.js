@@ -986,6 +986,31 @@ class Zk1DurableContentInventoryLedger {
     return { status: "committed", sequence: operation.sequence, root: Buffer.from(operation.root), proof };
   }
 
+  async getCommittedProofPage(input) {
+    this.assertOpen();
+    const raw = exact(input, ["afterSequence", "limit"], "INVENTORY_PAGE_INPUT");
+    if (!Number.isSafeInteger(raw.afterSequence) || raw.afterSequence < 0
+      || raw.afterSequence > inventory.MAX_ENTRIES
+      || !Number.isSafeInteger(raw.limit) || raw.limit < 1 || raw.limit > 16) {
+      fail("INVENTORY_PAGE_INPUT");
+    }
+    const state = await this.loadState();
+    if (raw.afterSequence > state.sequence) fail("INVENTORY_PAGE_INPUT");
+    if (state.pending.length > 0) return { status: "pending", reason: "UNRESOLVED_INTENT" };
+    const last = Math.min(state.sequence, raw.afterSequence + raw.limit);
+    const proofs = [];
+    for (let sequence = raw.afterSequence + 1; sequence <= last; sequence += 1) {
+      const entry = [...state.operations.values()].find((operation) =>
+        operation.status === "committed" && operation.sequence === sequence);
+      if (!entry?.signedEntry) fail("INVENTORY_LEDGER_CORRUPT");
+      const proof = Buffer.from(await z.encodeDeterministic(entry.signedEntry));
+      if (proof.length < 1 || proof.length > inventory.MAX_COMMITTED_PROOF_BYTES) fail("INVENTORY_LIMIT");
+      proofs.push(proof);
+    }
+    return { status: "chain_page", afterSequence: raw.afterSequence,
+      nextSequence: last, headSequence: state.sequence, proofs };
+  }
+
   async readLocalHead() {
     const state = await this.loadState();
     return { sequence: state.sequence, root: Buffer.from(state.root) };
