@@ -316,11 +316,52 @@ class Zk1CasTerminalAnchor {
 
   getIntent(query) {
     const pathname = this.intentPath(query);
-    assertPrivateDirectory(pathname);
-    if (!fs.existsSync(pathname)) return null;
-    const bytes = fs.readFileSync(pathname);
-    assertPrivateDirectory(pathname);
-    if (!bytes.length || bytes.length > 4096 || bytes.at(-1) !== 10) fail();
+    let fd;
+    let bytes;
+    try {
+      assertPrivateDirectory(pathname);
+      let namedBefore;
+      try { namedBefore = fs.lstatSync(pathname, { bigint: true }); }
+      catch (error) { if (error?.code === "ENOENT") return null; throw error; }
+      // An on-disk intent is not yet trusted: do not follow a redirected name,
+      // load a foreign hardlink, or read an unbounded file/FIFO into memory.
+      if (!namedBefore.isFile() || namedBefore.isSymbolicLink()
+        || namedBefore.nlink !== 1n || namedBefore.size < 1n
+        || namedBefore.size > 4096n) fail();
+      assertPrivateFile(namedBefore);
+      fd = fs.openSync(pathname, fs.constants.O_RDONLY
+        | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
+      const opened = fs.fstatSync(fd, { bigint: true });
+      if (!opened.isFile() || opened.nlink !== 1n
+        || opened.dev !== namedBefore.dev || opened.ino !== namedBefore.ino
+        || opened.size !== namedBefore.size
+        || opened.mtimeNs !== namedBefore.mtimeNs
+        || opened.ctimeNs !== namedBefore.ctimeNs) fail();
+      assertPrivateFile(opened);
+      bytes = Buffer.alloc(Number(opened.size));
+      let offset = 0;
+      while (offset < bytes.length) {
+        const count = fs.readSync(fd, bytes, offset, bytes.length - offset, null);
+        if (count <= 0) fail();
+        offset += count;
+      }
+      if (fs.readSync(fd, Buffer.alloc(1), 0, 1, null) !== 0) fail();
+      const after = fs.fstatSync(fd, { bigint: true });
+      const namedAfter = fs.lstatSync(pathname, { bigint: true });
+      assertPrivateDirectory(pathname);
+      if (!namedAfter.isFile() || namedAfter.isSymbolicLink()
+        || namedAfter.nlink !== 1n || after.nlink !== 1n
+        || after.dev !== opened.dev || after.ino !== opened.ino
+        || after.size !== opened.size || after.mtimeNs !== opened.mtimeNs
+        || after.ctimeNs !== opened.ctimeNs
+        || namedAfter.dev !== opened.dev || namedAfter.ino !== opened.ino
+        || namedAfter.size !== opened.size || namedAfter.mtimeNs !== opened.mtimeNs
+        || namedAfter.ctimeNs !== opened.ctimeNs) fail();
+      assertPrivateFile(after);
+      assertPrivateFile(namedAfter);
+    } catch (_) { fail(); }
+    finally { if (fd !== undefined) fs.closeSync(fd); }
+    if (bytes.at(-1) !== 10) fail();
     let intent;
     try { intent = JSON.parse(bytes.toString("utf8")); }
     catch (_) { fail(); }

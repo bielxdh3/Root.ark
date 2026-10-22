@@ -111,3 +111,63 @@ test("CAS journal refuses a locally writable directory on Unix", (t) => {
   fs.chmodSync(f.parent, 0o777);
   assert.throws(() => f.anchor.headCheckpoint(), /CAS_ANCHOR_INVALID/);
 });
+
+test("CAS intent rejects oversized and hardlinked names before reading their bytes", (t) => {
+  const f = fixture(t);
+  const q = query();
+  const intent = f.anchor.intentPath(q);
+  const foreign = path.join(f.root, "attacker-file");
+  fs.writeFileSync(foreign, Buffer.alloc(128 * 1024, 0x61));
+  const nativeReadFile = fs.readFileSync;
+  let readUnsafeName = 0;
+  try {
+    fs.readFileSync = function (filename) {
+      if (filename === intent) readUnsafeName += 1;
+      return nativeReadFile.apply(this, arguments);
+    };
+    fs.linkSync(foreign, intent);
+    assert.throws(() => f.anchor.getIntent(q), /CAS_ANCHOR_INVALID/);
+    assert.equal(readUnsafeName, 0, "hardlinked foreign data must never be loaded");
+    fs.unlinkSync(intent);
+
+    fs.writeFileSync(intent, Buffer.alloc(128 * 1024, 0x62));
+    assert.throws(() => f.anchor.getIntent(q), /CAS_ANCHOR_INVALID/);
+    assert.equal(readUnsafeName, 0, "oversized intent must be rejected before allocation/read");
+  } finally { fs.readFileSync = nativeReadFile; }
+  assert.equal(fs.statSync(foreign).size, 128 * 1024);
+});
+
+test("CAS intent reads valid signed state through its pinned file descriptor", (t) => {
+  const f = fixture(t);
+  const q = query();
+  const ticket = crypto.randomBytes(80);
+  const manifest = crypto.randomBytes(64);
+  f.anchor.prepare(q, ticket, "committed", manifest);
+  const verified = f.anchor.getIntent(q);
+  assert.equal(verified.status, "committed");
+  assert.equal(verified.reservation, q.reservation_id.toString("base64url"));
+});
+
+test("CAS intent refuses a same-size inode swapped between checking the name and opening it", (t) => {
+  const f = fixture(t);
+  const q = query();
+  f.anchor.prepare(q, crypto.randomBytes(80), "committed", crypto.randomBytes(64));
+  const intent = f.anchor.intentPath(q);
+  const replacement = path.join(f.parent, "replacement-intent");
+  fs.writeFileSync(replacement, fs.readFileSync(intent));
+  const nativeOpen = fs.openSync;
+  let swapped = false;
+  try {
+    fs.openSync = function (filename, flags) {
+      if (!swapped && filename === intent && typeof flags === "number"
+        && !(flags & fs.constants.O_APPEND)) {
+        fs.renameSync(intent, `${intent}.before-race`);
+        fs.renameSync(replacement, intent);
+        swapped = true;
+      }
+      return nativeOpen.apply(this, arguments);
+    };
+    assert.throws(() => f.anchor.getIntent(q), /CAS_ANCHOR_INVALID/);
+  } finally { fs.openSync = nativeOpen; }
+  assert.equal(swapped, true, "the adversarial inode substitution must happen");
+});
