@@ -114,8 +114,13 @@ async function setup(t) {
     res.type("html").set("Content-Security-Policy", "default-src 'self'; script-src 'self'; connect-src 'self'").send(
       html.replace("</body>", '<script defer src="/__probe.js"></script></body>')));
   for (const script of scriptNames) {
+    // These exact test assets live inside an isolated .worktrees ancestor.
+    // Express sendFile defaults to ignoring dot-path segments and may return
+    // 404 even though the allowlisted JavaScript file exists on disk.
+    // Permit that ancestor only for each explicitly registered test route.
     app.get("/client/" + script + ".js", (_req, res) => res.type("application/javascript")
-      .sendFile(path.join(__dirname, "../public/client", script + ".js")));
+      .sendFile(path.join(__dirname, "../public/client", script + ".js"),
+        { dotfiles: "allow" }));
   }
   let probe = "";
   app.get("/__probe.js", (_req, res) => res.type("application/javascript").send(probe));
@@ -245,6 +250,14 @@ test("Edge WebCrypto executes normal file PUT/GET using actual localhost Express
   }
   const f = await setup(t);
   const opts = await f.options();
+  for (const script of scriptNames) {
+    const asset = await fetch(f.origin + "/client/" + script + ".js");
+    assert.equal(asset.status, 200, "explicit browser test script " + script);
+    assert.match(asset.headers.get("content-type") || "", /javascript/);
+    await asset.arrayBuffer();
+  }
+  assert.equal((await fetch(f.origin + "/client/unlisted-fixture.js")).status, 404,
+    "test Express routes expose only explicitly enumerated browser scripts");
   const values = {
     ownerRaw: b64(f.ownerRaw), ownerHash: b64(opts.pinnedOwnerKeyHash),
     deviceRaw: b64(f.device.authorization_public_key), privateDer: b64(f.privateDer),
