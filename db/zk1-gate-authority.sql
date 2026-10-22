@@ -419,6 +419,100 @@ CREATE TABLE IF NOT EXISTS zk1_gate.sealed_object (
   root_hash bytea NOT NULL CHECK(octet_length(root_hash)=32),
   PRIMARY KEY(scope_key,object_id)
 );
+-- The exact owner-authorized inventory operation must be recorded *before*
+-- the first ciphertext chunk. Without this prewrite immutable binding, a
+-- recovered SEALED object could be relabeled under an unrelated operation ID.
+CREATE TABLE IF NOT EXISTS zk1_gate.physical_inventory_intent (
+  scope_key text NOT NULL REFERENCES zk1_gate.head(scope_key),
+  object_id text NOT NULL,
+  operation_id bytea NOT NULL UNIQUE CHECK(octet_length(operation_id)=16),
+  expected_inventory_sequence bigint NOT NULL CHECK(expected_inventory_sequence>=0),
+  expected_inventory_root bytea NOT NULL CHECK(octet_length(expected_inventory_root)=32),
+  keyring_id bytea NOT NULL CHECK(octet_length(keyring_id)=16),
+  revision bigint NOT NULL CHECK(revision>0),
+  epoch bigint NOT NULL CHECK(epoch>=0),
+  digest bytea NOT NULL CHECK(octet_length(digest)=32),
+  generation bigint NOT NULL CHECK(generation>0),
+  ciphertext_sha256 bytea NOT NULL CHECK(octet_length(ciphertext_sha256)=32),
+  expected_root_hash bytea NOT NULL CHECK(octet_length(expected_root_hash)=32),
+  expected_chunks integer NOT NULL CHECK(expected_chunks BETWEEN 1 AND 16),
+  PRIMARY KEY(scope_key,object_id)
+);
+CREATE OR REPLACE FUNCTION zk1_gate.validate_physical_inventory_intent()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+DECLARE
+  h record;
+BEGIN
+  IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'physical inventory intent requires READ COMMITTED' USING ERRCODE='23514';
+  END IF;
+  SELECT generation,revision,digest,keyring_id INTO h FROM zk1_gate.head
+    WHERE scope_key=NEW.scope_key AND phase='OPEN' FOR UPDATE;
+  IF NOT FOUND OR h.generation<>NEW.generation OR h.revision<>NEW.revision
+    OR h.digest<>NEW.digest OR h.keyring_id<>NEW.keyring_id THEN
+    RAISE EXCEPTION 'physical inventory intent requires current OPEN generation'
+      USING ERRCODE='23514';
+  END IF;
+  IF EXISTS(SELECT 1 FROM zk1_gate.ciphertext_chunk
+    WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id)
+    OR EXISTS(SELECT 1 FROM zk1_gate.sealed_object
+    WHERE scope_key=NEW.scope_key AND object_id=NEW.object_id) THEN
+    RAISE EXCEPTION 'physical intent cannot relabel previously written bytes'
+      USING ERRCODE='23514';
+  END IF;
+  RETURN NEW;
+END $$;
+REVOKE ALL ON FUNCTION zk1_gate.validate_physical_inventory_intent() FROM PUBLIC;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t
+    JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+    WHERE n.nspname='zk1_gate' AND c.relname='physical_inventory_intent'
+      AND t.tgname='zk1_gate_validate_physical_inventory_intent' AND NOT t.tgisinternal) THEN
+    CREATE TRIGGER zk1_gate_validate_physical_inventory_intent
+      BEFORE INSERT ON zk1_gate.physical_inventory_intent
+      FOR EACH ROW EXECUTE FUNCTION zk1_gate.validate_physical_inventory_intent();
+  END IF;
+END $$;
+CREATE OR REPLACE FUNCTION zk1_gate.reject_physical_inventory_intent_mutation()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+BEGIN
+  RAISE EXCEPTION 'physical inventory intent is immutable' USING ERRCODE='23514';
+END $$;
+REVOKE ALL ON FUNCTION zk1_gate.reject_physical_inventory_intent_mutation() FROM PUBLIC;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t
+    JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+    WHERE n.nspname='zk1_gate' AND c.relname='physical_inventory_intent'
+      AND t.tgname='zk1_gate_physical_inventory_intent_immutable' AND NOT t.tgisinternal) THEN
+    CREATE TRIGGER zk1_gate_physical_inventory_intent_immutable
+      BEFORE UPDATE OR DELETE ON zk1_gate.physical_inventory_intent
+      FOR EACH ROW EXECUTE FUNCTION zk1_gate.reject_physical_inventory_intent_mutation();
+  END IF;
+END $$;
+-- Independently flush every WAL record up to the snapshot taken *after* the
+-- attestor observes a physically committed sealed row. A writer's own
+-- synchronous_commit setting cannot be trusted: it may be SET LOCAL off.
+-- Run as the operator-owned function, expose only a bounded boolean, and
+-- never expose WAL internals or a checkpoint/privileged SQL broker to callers.
+CREATE OR REPLACE FUNCTION zk1_gate.physical_inventory_wal_flush_barrier()
+RETURNS boolean LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog AS $$
+DECLARE
+  barrier pg_catalog.pg_lsn;
+  expires timestamptz;
+BEGIN
+  barrier := pg_catalog.pg_current_wal_insert_lsn();
+  expires := pg_catalog.clock_timestamp() + interval '2 seconds';
+  LOOP
+    IF pg_catalog.pg_current_wal_flush_lsn() >= barrier THEN RETURN true; END IF;
+    IF pg_catalog.clock_timestamp() > expires THEN RETURN false; END IF;
+    PERFORM pg_catalog.pg_sleep(0.025);
+  END LOOP;
+END $$;
+REVOKE ALL ON FUNCTION zk1_gate.physical_inventory_wal_flush_barrier() FROM PUBLIC;
 -- A trusted worker may still possess an ACTIVE admission after sealing.
 -- Physically forbid *all* later chunk INSERTs for that object, including
 -- direct SQL by the restricted gate role. Lock the same authoritative head
@@ -598,6 +692,9 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='zk1_chunk_writer_runtime') THEN
     CREATE ROLE zk1_chunk_writer_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='zk1_physical_attestor_runtime') THEN
+    CREATE ROLE zk1_physical_attestor_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+  END IF;
 END $$;
 GRANT USAGE ON SCHEMA zk1_gate TO zk1_gate_runtime;
 GRANT SELECT ON zk1_gate.head, zk1_gate.admission,
@@ -616,6 +713,11 @@ GRANT INSERT (writer_login,admission_id,scope_key,object_id,worker_id,
   ON zk1_gate.writer_binding TO zk1_gate_runtime;
 GRANT INSERT (scope_key,object_id,revision,digest,generation,admission_id,
   expected_chunks,root_hash) ON zk1_gate.sealed_object TO zk1_gate_runtime;
+GRANT SELECT ON zk1_gate.physical_inventory_intent TO zk1_gate_runtime;
+GRANT INSERT (scope_key,object_id,operation_id,expected_inventory_sequence,
+  expected_inventory_root,keyring_id,revision,epoch,digest,generation,
+  ciphertext_sha256,expected_root_hash,expected_chunks)
+  ON zk1_gate.physical_inventory_intent TO zk1_gate_runtime;
 GRANT USAGE ON SCHEMA zk1_gate TO zk1_stop_runtime;
 GRANT SELECT ON zk1_gate.head, zk1_gate.admission,
   zk1_gate.physical_stop_receipt TO zk1_stop_runtime;
@@ -639,4 +741,15 @@ GRANT EXECUTE ON FUNCTION zk1_gate.verify_chunk_writer_binding(
   TO zk1_chunk_writer_runtime;
 GRANT EXECUTE ON FUNCTION zk1_gate.write_bound_chunk(integer,bytea)
   TO zk1_chunk_writer_runtime;
+-- Separate, read-only physical readback identity. Never co-grant this with
+-- gate/stop/writer roles; the verifier rejects even latent SET ROLE access.
+GRANT USAGE ON SCHEMA zk1_gate TO zk1_physical_attestor_runtime;
+GRANT SELECT ON zk1_gate.head,zk1_gate.sealed_object,
+  zk1_gate.ciphertext_chunk,zk1_gate.physical_inventory_intent TO zk1_physical_attestor_runtime;
+GRANT EXECUTE ON FUNCTION zk1_gate.physical_inventory_wal_flush_barrier()
+  TO zk1_physical_attestor_runtime;
+REVOKE INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER
+  ON zk1_gate.head,zk1_gate.sealed_object,zk1_gate.ciphertext_chunk,
+    zk1_gate.physical_inventory_intent
+  FROM zk1_physical_attestor_runtime;
 COMMIT;

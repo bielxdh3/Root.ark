@@ -58,9 +58,9 @@ function fixture(dir) {
     'for name in allowed denied; do openssl req -newkey rsa:2048 -nodes -keyout "$name.key" -out "$name.csr" -subj "/CN=$name" >/dev/null 2>&1; printf "extendedKeyUsage=clientAuth\n" > "$name.ext"; openssl x509 -req -in "$name.csr" -CA ca.pem -CAkey ca.key -CAcreateserial -out "$name.pem" -days 1 -extfile "$name.ext" >/dev/null 2>&1; done',
   ].join("\n");
   if (process.platform === "win32") {
-    const unix = execFileSync("wsl.exe", ["-e", "wslpath", "-a", dir], { encoding: "utf8" }).trim();
-    execFileSync("wsl.exe", ["-e", "bash", "-lc", "cd " + JSON.stringify(unix) + "; " + shell],
-      { stdio: "pipe", timeout: 20000 });
+    require("./support/issue-65-native-openssl-fixture").generateNativeFixtureCertificates(dir, {
+      caSubject: "Local Test CA", servers: ["server"], clients: ["allowed", "denied"],
+    });
   } else {
     execFileSync("bash", ["-lc", shell], { cwd: dir, stdio: "pipe", timeout: 20000 });
   }

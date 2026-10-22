@@ -7,6 +7,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
+const { generateNativeFixtureCertificates } =
+  require("./support/issue-65-native-openssl-fixture");
 const z = require("../src/crypto/rootark-zk-1");
 const v2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const fixtures = require("./support/issue-65-recovery-v2-fixtures");
@@ -57,9 +59,10 @@ function certificates(dir) {
     'for name in casreader headreader; do openssl req -newkey rsa:2048 -nodes -keyout "$name.key" -out "$name.csr" -subj "/CN=$name" >/dev/null 2>&1; printf "extendedKeyUsage=clientAuth\n" > "$name.ext"; openssl x509 -req -in "$name.csr" -CA ca.pem -CAkey ca.key -CAcreateserial -out "$name.pem" -days 1 -extfile "$name.ext" >/dev/null 2>&1; done',
   ].join("\n");
   if (process.platform === "win32") {
-    const unix = execFileSync("wsl.exe", ["-e", "wslpath", "-a", dir], { encoding: "utf8" }).trim();
-    execFileSync("wsl.exe", ["-e", "bash", "-lc",
-      "cd " + JSON.stringify(unix) + "; " + commands], { timeout: 30000 });
+    generateNativeFixtureCertificates(dir, {
+      caSubject: "isolated fixture CA", servers: ["cas", "witness"],
+      clients: ["casreader", "headreader"],
+    });
   } else execFileSync("bash", ["-lc", commands], { cwd: dir, timeout: 30000 });
   const read = (n) => fs.readFileSync(path.join(dir, n));
   return { ca: read("ca.pem"), casKey: read("cas.key"), casCert: read("cas.pem"),

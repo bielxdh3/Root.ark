@@ -6,6 +6,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { execFileSync, spawn } = require("node:child_process");
+const { generateNativeFixtureCertificates } =
+  require("./support/issue-65-native-openssl-fixture");
 const https = require("node:https");
 const test = require("node:test");
 const { Zk1DurableWitnessLedger } = require("../src/services/zk1DurableWitnessLedger");
@@ -27,9 +29,9 @@ function createCertificates(dir) {
     'for name in allowed denied; do openssl req -newkey rsa:2048 -nodes -keyout "$name.key" -out "$name.csr" -subj "/CN=$name" >/dev/null 2>&1; printf "extendedKeyUsage=clientAuth\n" > "$name.ext"; openssl x509 -req -in "$name.csr" -CA ca.pem -CAkey ca.key -CAcreateserial -out "$name.pem" -days 1 -extfile "$name.ext" >/dev/null 2>&1; done',
   ].join("\n");
   if (process.platform === "win32") {
-    const unixDir = execFileSync("wsl.exe", ["-e", "wslpath", "-a", dir], { encoding: "utf8" }).trim();
-    execFileSync("wsl.exe", ["-e", "bash", "-lc", "cd " + JSON.stringify(unixDir) + "; " + commands],
-      { stdio: "pipe", timeout: 20000 });
+    generateNativeFixtureCertificates(dir, {
+      caSubject: "Rootark Test CA", servers: ["server"], clients: ["allowed", "denied"],
+    });
   } else {
     execFileSync("bash", ["-lc", commands], { cwd: dir, stdio: "pipe", timeout: 20000 });
   }

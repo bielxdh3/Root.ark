@@ -10,6 +10,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
+const { generateNativeFixtureCertificates } =
+  require("./support/issue-65-native-openssl-fixture");
 const { createZk1WitnessHttpsClient } = require("../src/services/zk1WitnessHttpsClient");
 const { createZk1CasManifestHttpsClient } = require("../src/services/zk1CasManifestHttpsClient");
 const { createZk1CasWriteHttpsClient } = require("../src/services/zk1CasWriteHttpsClient");
@@ -28,10 +30,9 @@ function certificates(dir) {
     'openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out client.pem -days 1 -extfile client.ext >/dev/null 2>&1',
   ].join("\n");
   if (process.platform === "win32") {
-    const unixDir = execFileSync("wsl.exe", ["-e", "wslpath", "-a", dir],
-      { encoding: "utf8" }).trim();
-    execFileSync("wsl.exe", ["-e", "bash", "-lc", "cd " + JSON.stringify(unixDir) + "; " + cmds],
-      { stdio: "pipe", timeout: 25000 });
+    generateNativeFixtureCertificates(dir, {
+      caSubject: "ZK1 Fixture CA", servers: ["server"], clients: ["client"],
+    });
   } else {
     execFileSync("bash", ["-lc", cmds], { cwd: dir, stdio: "pipe", timeout: 25000 });
   }

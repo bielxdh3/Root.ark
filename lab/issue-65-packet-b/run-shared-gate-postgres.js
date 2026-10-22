@@ -115,6 +115,15 @@ async function main() {
     "-U", "postgres", "-d", "gatefixture"], { input: provisionWriter });
   const writerUri = "postgresql://" + writerRoleName + ":" + writerRolePassword
     + "@127.0.0.1:" + match[1] + "/gatefixture";
+  const attestorName = "zkattestorfixture_" + crypto.randomBytes(6).toString("hex");
+  const attestorPassword = crypto.randomBytes(24).toString("hex");
+  const provisionAttestor = "CREATE ROLE " + attestorName
+    + " LOGIN PASSWORD '" + attestorPassword + "';\n"
+    + "GRANT zk1_physical_attestor_runtime TO " + attestorName + ";\n";
+  run("docker", ["exec", "-i", containerId, "psql", "-X", "-v", "ON_ERROR_STOP=1",
+    "-U", "postgres", "-d", "gatefixture"], { input: provisionAttestor });
+  const attestorUri = "postgresql://" + attestorName + ":" + attestorPassword
+    + "@127.0.0.1:" + match[1] + "/gatefixture";
   // Use the Node executable that launched this runner (Node 22 is required
   // for the release reference), not a different node.exe found on PATH.
   run(process.execPath, ["--test", "--test-reporter=spec",
@@ -126,6 +135,7 @@ async function main() {
     "test/issue-65-chunk-writer-role.test.js",
     "test/issue-65-browser-pg-ciphertext-seal-interop.test.js",
     "test/issue-65-pg-sealed-sink.test.js",
+    "test/issue-65-pg-physical-inventory-bridge.test.js",
     "test/issue-65-stop-recorder-postgres.test.js",
     "test/issue-65-multi-host-pinned-stop-postgres.test.js",
     "test/issue-65-strict-stop-operator-postgres.test.js",
@@ -133,6 +143,7 @@ async function main() {
     "test/issue-65-shared-gate-real-witness.test.js"],
   { env: { ...process.env, ROOTARK_ZK1_TEST_PG_URL: uri,
     ROOTARK_ZK1_RUNTIME_PG_URL: runtimeUri,
+    ROOTARK_ZK1_ATTESTOR_PG_URL: attestorUri,
     ROOTARK_ZK1_STOP_PG_URL: stopUri,
     ROOTARK_ZK1_WRITER_PG_URL: writerUri }, inherit: true });
   process.stdout.write("SHARED_GATE_PG_REAL_PASS loopback=true cleanup=pending\n");

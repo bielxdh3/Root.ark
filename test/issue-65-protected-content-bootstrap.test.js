@@ -36,11 +36,7 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
     const args = ["req", "-new", "-x509", "-key", basename + ".key",
       "-out", basename + ".crt", "-days", "1", "-subj", "/CN=" + basename];
     if (process.platform === "win32") {
-      const wd = execFileSync("wsl.exe", ["-e", "wslpath", "-a", dir],
-        { encoding: "utf8" }).trim();
-      execFileSync("wsl.exe", ["-e", "bash", "-lc", "cd " + JSON.stringify(wd)
-        + "; openssl " + args.map((x) => JSON.stringify(x)).join(" ")],
-      { stdio: "pipe", timeout: 20000 });
+      require("./support/issue-65-native-openssl-fixture").runNativeOpenSsl(dir, args);
     } else {
       execFileSync("openssl", args, { cwd: dir, stdio: "pipe", timeout: 20000 });
     }
