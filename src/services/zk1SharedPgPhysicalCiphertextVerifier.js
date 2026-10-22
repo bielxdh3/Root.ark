@@ -64,6 +64,66 @@ class Zk1SharedPgPhysicalCiphertextVerifier {
     if (!pool || typeof pool.connect !== "function") fail();
     this.pool = pool;
   }
+  // Resolve ONLY operator-persisted prewrite commitments; the mTLS caller
+  // cannot nominate its own root, digest or chunk count. This is a physical
+  // commit verifier, NOT an owner/device authorization or remote durability
+  // proof. verifyExact re-reads every byte under a distinct read-only PG role.
+  async verifyCommittedInventoryOperation({ scope, operation } = {}) {
+    let c;
+    try {
+      const fixed = inventory.normalizeScope(scope);
+      const op = exact(operation, ["operation_id", "expected_sequence",
+        "expected_root", "object_id", "revision", "epoch", "ciphertext_sha256"]);
+      const normalized = inventory.normalizeEntry({
+        object_id: bytes(op.object_id, 16),
+        revision: op.revision, epoch: op.epoch,
+        ciphertext_sha256: bytes(op.ciphertext_sha256, 32),
+      });
+      const operationId = bytes(op.operation_id, 16);
+      const expectedRoot = bytes(op.expected_root, 32);
+      if (!Number.isSafeInteger(op.expected_sequence)
+        || op.expected_sequence < 0 || op.expected_sequence >= inventory.MAX_ENTRIES) fail();
+      const scopeKey = fixed.account_id.toString("hex") + ":"
+        + fixed.compartment_id.length.toString(16) + ":"
+        + fixed.compartment_id.toString("hex");
+      const objectId = normalized.object_id.toString("base64url");
+      c = await this.pool.connect();
+      await c.query("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY");
+      await c.query("SET LOCAL statement_timeout = '8000ms'");
+      const result = await c.query(`SELECT digest,expected_root_hash,expected_chunks
+        FROM zk1_gate.physical_inventory_intent
+        WHERE scope_key=$1 AND object_id=$2 AND operation_id=$3
+          AND keyring_id=$4 AND revision=$5 AND epoch=$6
+          AND expected_inventory_sequence=$7 AND expected_inventory_root=$8
+          AND ciphertext_sha256=$9`, [
+        scopeKey, objectId, operationId, fixed.keyring_id, normalized.revision,
+        normalized.epoch, op.expected_sequence, expectedRoot,
+        normalized.ciphertext_sha256,
+      ]);
+      if (result.rowCount !== 1 || !result.rows[0]) fail();
+      const row = result.rows[0];
+      const digest = bytes(row.digest, 32);
+      const root = bytes(row.expected_root_hash, 32);
+      const count = row.expected_chunks;
+      if (!Number.isSafeInteger(count) || count < 1 || count > 16) fail();
+      await c.query("COMMIT");
+      c.release();
+      c = null;
+      return await this.verifyExact({
+        scope: fixed, objectId, revision: normalized.revision,
+        digest, expectedRootHash: root, expectedChunkCount: count,
+        expectedSha256: normalized.ciphertext_sha256, operationId,
+        expectedInventorySequence: op.expected_sequence,
+        expectedInventoryRoot: expectedRoot, epoch: normalized.epoch,
+      });
+    } catch (_) { fail(); }
+    finally {
+      if (c) {
+        try { await c.query("ROLLBACK"); } catch (_) { /* deny */ }
+        c.release();
+      }
+    }
+  }
   async verifyExact(input) {
     const v = checked(input); // detach all untrusted bytes before first await
     let client;

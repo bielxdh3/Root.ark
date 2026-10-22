@@ -4,6 +4,8 @@
 // intentionally not connected to protected content routes or storage I/O.
 const https = require("node:https");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
+const { Zk1SharedPgPhysicalCiphertextVerifier } =
+  require("./zk1SharedPgPhysicalCiphertextVerifier");
 
 const MAX_METADATA_REQUEST_BYTES = 4096;
 const MAX_APPEND_REQUEST_BYTES = 8192;
@@ -12,6 +14,14 @@ const MAX_SNAPSHOT_RESPONSE_BYTES = MAX_SNAPSHOT_BASE64_BYTES + 16 * 1024;
 const MAX_SMALL_RESPONSE_BYTES = 16 * 1024;
 const MAX_CHAIN_RESPONSE_BYTES = 128 * 1024;
 const MAX_CHAIN_PAGE_RECEIPTS = 16;
+// Physical verification re-reads up to 64 MiB from PostgreSQL twice per
+// successful append. A valid but compromised mTLS append certificate must
+// not fan out unbounded concurrent hash/readback work. Reject rather than
+// queue: pending callers must retry their exact operation independently.
+const MAX_ACTIVE_PHYSICAL_APPENDS = 2;
+const MAX_PHYSICAL_APPENDS_PER_PRINCIPAL_WINDOW = 4;
+const MAX_PHYSICAL_APPENDS_GLOBAL_WINDOW = 16;
+const PHYSICAL_WINDOW_NS = 60_000_000_000n;
 const B64U = /^[A-Za-z0-9_-]+$/;
 const FINGERPRINT = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
 const SCOPE_FIELDS = Object.freeze(["account_id", "compartment_id", "keyring_id"]);
@@ -139,16 +149,25 @@ function respond(response, status, object, limit = MAX_SMALL_RESPONSE_BYTES) {
   response.end(body);
 }
 
-function createZk1ContentInventoryHttpsServer({ key, cert, clientCa, ledger, principals }) {
+function createZk1ContentInventoryHttpsServer({
+  key, cert, clientCa, ledger, principals, physicalVerifier,
+}) {
   if (!key || !cert || !clientCa || !ledger
     || typeof ledger.getSnapshot !== "function" || typeof ledger.append !== "function"
     || typeof ledger.getOperationStatus !== "function" || !ledger.scope
     || !principals || typeof principals !== "object" || Array.isArray(principals)
-    || Object.keys(principals).length < 1 || Object.keys(principals).length > 128) invalid();
+    || Object.keys(principals).length < 1 || Object.keys(principals).length > 128
+    || (physicalVerifier !== undefined
+      && !(physicalVerifier instanceof Zk1SharedPgPhysicalCiphertextVerifier))) invalid();
 
   const ledgerScope = inventory.normalizeScope(ledger.scope);
   const ledgerScopeKey = scopeKey(ledgerScope);
   const allowed = new Map();
+  const activePhysicalPrincipals = new Set();
+  let activePhysicalAppends = 0;
+  const physicalPrincipalWindowCounts = new Map();
+  let physicalGlobalWindowStarted = process.hrtime.bigint();
+  let physicalGlobalWindowCount = 0;
   for (const [fingerprint, configuration] of Object.entries(principals)) {
     const grant = exact(configuration, ["roles", "scopes"]);
     if (!FINGERPRINT.test(fingerprint) || !Array.isArray(grant.roles)
@@ -171,6 +190,7 @@ function createZk1ContentInventoryHttpsServer({ key, cert, clientCa, ledger, pri
     maxHeaderSize: 8192,
     maxHeadersCount: 64,
   }, async (request, response) => {
+    let physicalLeasePrincipal;
     try {
       if (request.method !== "POST" || !Object.hasOwn(ROUTES, request.url)) {
         return respond(response, 404, { error: "NOT_FOUND" });
@@ -236,6 +256,35 @@ function createZk1ContentInventoryHttpsServer({ key, cert, clientCa, ledger, pri
       const operation = normalizeOperation(raw.operation);
       if (route.kind === "append") {
         const nonce = decode(raw.nonce, 32, 32);
+        // Opt-in strict physical publishing path. mTLS append authorization
+        // alone must not turn an arbitrary signed operation into a claim of
+        // durable ciphertext. Only a separately provisioned read-only
+        // PostgreSQL verifier may read the immutable intent and bytes.
+        if (physicalVerifier) {
+          const id = peer.fingerprint256.toUpperCase();
+          const now = process.hrtime.bigint();
+          if (now - physicalGlobalWindowStarted >= PHYSICAL_WINDOW_NS) {
+            physicalGlobalWindowStarted = now;
+            physicalGlobalWindowCount = 0;
+            physicalPrincipalWindowCounts.clear();
+          }
+          if (activePhysicalAppends >= MAX_ACTIVE_PHYSICAL_APPENDS
+            || activePhysicalPrincipals.has(id)
+            || physicalGlobalWindowCount >= MAX_PHYSICAL_APPENDS_GLOBAL_WINDOW
+            || (physicalPrincipalWindowCounts.get(id) || 0)
+              >= MAX_PHYSICAL_APPENDS_PER_PRINCIPAL_WINDOW) {
+            return respond(response, 503, { error: "INVENTORY_UNAVAILABLE" });
+          }
+          // Count failed verification attempts too: an attacker may send
+          // invalid operations repeatedly to consume finite PG scan work.
+          physicalGlobalWindowCount += 1;
+          physicalPrincipalWindowCounts.set(id,
+            (physicalPrincipalWindowCounts.get(id) || 0) + 1);
+          activePhysicalAppends += 1;
+          activePhysicalPrincipals.add(id);
+          physicalLeasePrincipal = id;
+          await physicalVerifier.verifyCommittedInventoryOperation({ scope, operation });
+        }
         const result = await ledger.append(operation);
         if (!result || typeof result.status !== "string") invalid();
         const operationId = operation.operation_id.toString("base64url");
@@ -271,6 +320,12 @@ function createZk1ContentInventoryHttpsServer({ key, cert, clientCa, ledger, pri
           || !Buffer.isBuffer(receipt.root) || !receipt.root.equals(result.root)
           || !Buffer.isBuffer(receipt.proof)
           || receipt.proof.length < 1 || receipt.proof.length > inventory.MAX_COMMITTED_PROOF_BYTES) invalid();
+        // A signature may already be durable before a physical corruption is
+        // detected. Never return positive transport success unless a fresh
+        // readback still passes. A historical receipt is not GET authority.
+        if (physicalVerifier) {
+          await physicalVerifier.verifyCommittedInventoryOperation({ scope, operation });
+        }
         const snapshotBase64 = snapshot.bytes.toString("base64url");
         if (snapshotBase64.length > MAX_SNAPSHOT_BASE64_BYTES) invalid();
         return respond(response, 200, {
@@ -322,6 +377,11 @@ function createZk1ContentInventoryHttpsServer({ key, cert, clientCa, ledger, pri
         return respond(response, 409, { error: "OPERATION_CONFLICT" });
       }
       return respond(response, 503, { error: "INVENTORY_UNAVAILABLE" });
+    } finally {
+      if (physicalLeasePrincipal !== undefined) {
+        activePhysicalAppends -= 1;
+        activePhysicalPrincipals.delete(physicalLeasePrincipal);
+      }
     }
   });
 

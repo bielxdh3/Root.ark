@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const https = require("node:https");
 const os = require("node:os");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -19,6 +20,11 @@ const { Zk1DurableContentInventoryLedger } =
   require("../src/services/zk1DurableContentInventoryLedger");
 const { Zk1PgPhysicalInventoryBridge } =
   require("../src/services/zk1PgPhysicalInventoryBridge");
+const { createZk1ContentInventoryHttpsServer,
+  drainZk1ContentInventoryHttpsServer } =
+  require("../src/services/zk1ContentInventoryHttpsServer");
+const { generateNativeFixtureCertificates } =
+  require("./support/issue-65-native-openssl-fixture");
 
 const enabled = Boolean(process.env.ROOTARK_ZK1_TEST_PG_URL
   && process.env.ROOTARK_ZK1_RUNTIME_PG_URL
@@ -162,6 +168,129 @@ test("non-strict legacy scopes refuse signed physical bridge before any physical
       FROM zk1_gate.${table} WHERE scope_key=$1 AND object_id=$2`, [f.key, objectId]);
     assert.equal(result.rows[0].count, 0, `non-strict scope must not create ${table}`);
   }
+});
+
+test("mTLS signed inventory append requires real strict physical PG readback and WAL", {
+  skip: !enabled && "requires disposable PostgreSQL 18 and native OpenSSL",
+}, async (t) => {
+  const f = await fixture(t);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-pg-mtls-"));
+  generateNativeFixtureCertificates(dir, {
+    caSubject: "Rootark physical pg lab", servers: ["inventory"], clients: ["writer"],
+  });
+  const read = (name) => fs.readFileSync(path.join(dir, name));
+  const cert = read("writer.pem");
+  const jsonScope = Object.fromEntries(Object.entries(f.scope).map(([name, value]) =>
+    [name, value.toString("base64url")]));
+  const server = createZk1ContentInventoryHttpsServer({
+    key: read("inventory.key"), cert: read("inventory.pem"), clientCa: read("ca.pem"),
+    ledger: f.ledger, physicalVerifier: f.verifier,
+    principals: {
+      [new crypto.X509Certificate(cert).fingerprint256]: {
+        roles: ["append"], scopes: [jsonScope],
+      },
+    },
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(async () => {
+    await drainZk1ContentInventoryHttpsServer(server);
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
+  });
+  const body = Buffer.from(JSON.stringify({
+    scope: jsonScope,
+    operation: Object.fromEntries(Object.entries(f.op).map(([name, value]) =>
+      [name, Buffer.isBuffer(value) ? value.toString("base64url") : value])),
+    nonce: crypto.randomBytes(32).toString("base64url"),
+  }));
+  const append = () => new Promise((resolve, reject) => {
+    const request = https.request({
+      hostname: "127.0.0.1", servername: "localhost", port: server.address().port,
+      path: "/v1/inventory/append", method: "POST", agent: false,
+      ca: read("ca.pem"), cert, key: read("writer.key"),
+      minVersion: "TLSv1.3", rejectUnauthorized: true,
+      headers: { "content-type": "application/json", "content-length": String(body.length) },
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve({
+        status: response.statusCode, body: JSON.parse(Buffer.concat(chunks).toString()),
+      }));
+      response.on("error", reject);
+    });
+    request.on("error", reject);
+    request.end(body);
+  });
+
+  const absent = await append();
+  assert.equal(absent.status, 503, "mTLS append cannot sign without physical bytes");
+  assert.equal((await f.ledger.getOperationStatus(f.op.operation_id)).status, "unknown");
+  assert.deepEqual(f.calls, [], "mTLS append must never self-provision a writer");
+
+  assert.equal((await f.intentAuthority.reserveExact(f.noChunks())).status,
+    "IMMUTABLE_PREWRITE_INTENT");
+  const stored = await f.bridge().sink.putSealed({
+    scope: f.scope, objectId: f.op.object_id.toString("base64url"),
+    revision: f.op.revision, digest: f.digest, chunks: f.chunks,
+    expectedRootHash: f.root, expectedChunkCount: f.chunks.length,
+  });
+  assert.equal(stored.status, "SEALED");
+  assert.equal((await f.ledger.getOperationStatus(f.op.operation_id)).status, "unknown");
+  // A legitimate but compromised append cert must not expand one operation
+  // into unbounded simultaneous physical readbacks of the same 64 MiB object.
+  // Delay the *real* verifier before it does PG I/O; the second request must
+  // fail promptly and never append/sign while the first owns the lease.
+  const originalVerify = f.verifier.verifyCommittedInventoryOperation.bind(f.verifier);
+  let signalEntered;
+  const entered = new Promise((resolve) => { signalEntered = resolve; });
+  let releaseFirst;
+  const holdFirst = new Promise((resolve) => { releaseFirst = resolve; });
+  let firstCall = true;
+  f.verifier.verifyCommittedInventoryOperation = async (input) => {
+    if (firstCall) {
+      firstCall = false;
+      signalEntered();
+      await holdFirst;
+    }
+    return originalVerify(input);
+  };
+  const firstAppend = append();
+  await entered;
+  try {
+    const refused = await append();
+    assert.equal(refused.status, 503,
+      "replaying a single mTLS certificate cannot fan out concurrent physical readbacks");
+    assert.equal((await f.ledger.getOperationStatus(f.op.operation_id)).status, "unknown",
+      "rejected parallel request must not sign anything while first is held");
+  } finally { releaseFirst(); }
+  const committed = await firstAppend;
+  f.verifier.verifyCommittedInventoryOperation = originalVerify;
+  assert.equal(committed.status, 200);
+  assert.equal(committed.body.status, "committed");
+  assert.equal(committed.body.operationId, f.op.operation_id.toString("base64url"));
+  assert.ok(committed.body.proofBase64?.length > 100);
+  assert.equal((await f.ledger.getOperationStatus(f.op.operation_id)).status, "committed");
+
+  await f.admin.query(`UPDATE zk1_gate.ciphertext_chunk SET ciphertext=$1
+    WHERE scope_key=$2 AND object_id=$3 AND chunk_index=0`,
+  [crypto.randomBytes(f.chunks[0].length), f.key, f.op.object_id.toString("base64url")]);
+  let physicalChecksAfterCorruption = 0;
+  f.verifier.verifyCommittedInventoryOperation = async (input) => {
+    physicalChecksAfterCorruption += 1;
+    return originalVerify(input);
+  };
+  assert.equal((await append()).status, 503,
+    "authentic earlier signed receipt cannot bypass a corrupted physical provider");
+  for (let i = 0; i < 8; i += 1) {
+    assert.equal((await append()).status, 503,
+      "rapid replay attempts never turn corrupted ciphertext into a valid receipt");
+  }
+  assert.equal(physicalChecksAfterCorruption, 2,
+    "bounded per-certificate minute budget rejects replay flooding before PG readback");
+  assert.equal((await f.ledger.getOperationStatus(f.op.operation_id)).status, "committed",
+    "failure preserves historical signed evidence instead of rewriting it");
 });
 
 test("unverified physical write, partial seal, and generation fencing never publish a signed success", {
