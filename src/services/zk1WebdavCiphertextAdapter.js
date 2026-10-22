@@ -5,6 +5,7 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const https = require("node:https");
+const path = require("node:path");
 const tls = require("node:tls");
 
 const MAX_BYTES = 16 * 1024 * 1024;
@@ -22,7 +23,30 @@ function unavailable() {
 
 function ensure(condition) { if (!condition) throw unavailable(); }
 
+function samePath(left, right) {
+  const a = path.resolve(left);
+  const b = path.resolve(right);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function pinParent(filename) {
+  ensure(typeof filename === "string" && path.isAbsolute(filename));
+  const directory = path.dirname(filename);
+  const stat = fs.lstatSync(directory, { bigint: true });
+  // O_NOFOLLOW only guards the leaf. A redirected ancestor can make a valid
+  // exclusive create publish bytes into a foreign directory on Windows/Unix.
+  ensure(stat.isDirectory() && !stat.isSymbolicLink()
+    && samePath(fs.realpathSync.native(directory), directory));
+  return { directory, dev: stat.dev, ino: stat.ino };
+}
+
+function verifyParent(pin) {
+  const current = pinParent(path.join(pin.directory, "_webdav_parent_pin"));
+  ensure(current.dev === pin.dev && current.ino === pin.ino);
+}
+
 function readBoundedFile(source, length) {
+  const parent = pinParent(source);
   const namedBefore = fs.lstatSync(source, { bigint: true });
   ensure(namedBefore.isFile() && !namedBefore.isSymbolicLink()
     && namedBefore.nlink === 1n && namedBefore.size === BigInt(length));
@@ -30,6 +54,7 @@ function readBoundedFile(source, length) {
     | (fs.constants.O_CLOEXEC || 0);
   const fd = fs.openSync(source, flags);
   try {
+    verifyParent(parent);
     const before = fs.fstatSync(fd, { bigint: true });
     ensure(before.isFile() && !before.isSymbolicLink() && before.nlink === 1n
       && before.size === BigInt(length) && before.dev === namedBefore.dev
@@ -43,6 +68,7 @@ function readBoundedFile(source, length) {
     }
     const after = fs.fstatSync(fd, { bigint: true });
     const namedAfter = fs.lstatSync(source, { bigint: true });
+    verifyParent(parent);
     ensure(after.dev === before.dev && after.ino === before.ino
       && after.size === before.size && after.mtimeNs === before.mtimeNs
       && after.nlink === 1n && namedAfter.dev === before.dev
@@ -52,12 +78,13 @@ function readBoundedFile(source, length) {
   } finally { fs.closeSync(fd); }
 }
 
-function writeExclusive(destination, data) {
+function writeExclusive(destination, data, parent) {
+  verifyParent(parent);
   const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
     | (fs.constants.O_NOFOLLOW || 0);
   const fd = fs.openSync(destination, flags, 0o600);
-  let ok = false;
   try {
+    verifyParent(parent);
     let offset = 0;
     while (offset < data.length) {
       const count = fs.writeSync(fd, data, offset, data.length - offset);
@@ -65,12 +92,12 @@ function writeExclusive(destination, data) {
       offset += count;
     }
     fs.fsyncSync(fd);
-    ok = true;
+    verifyParent(parent);
   } finally {
     fs.closeSync(fd);
-    if (!ok) {
-      try { fs.unlinkSync(destination); } catch (_) { /* retain generic failure */ }
-    }
+    // Never unlink by pathname after a failed write: a concurrent rename
+    // could replace that name with somebody else's file before cleanup.
+    // The caller owns cleanup of its private staging directory.
   }
 }
 
@@ -219,9 +246,10 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
             && Number.isSafeInteger(opts.maxBytes) && opts.maxBytes >= 1
             && opts.maxBytes <= MAX_BYTES && typeof destination === "string"
             && typeof allowWrite === "function" && allowWrite() === true);
+          const parent = pinParent(destination);
           const bytes = await transfer("GET", objectKey, null, opts.maxBytes);
           ensure(allowWrite() === true);
-          writeExclusive(destination, bytes);
+          writeExclusive(destination, bytes, parent);
           return true;
         } catch (_) { throw unavailable(); }
       },

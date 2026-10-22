@@ -14,7 +14,7 @@ const { createZk1WebdavCiphertextAdapter } =
 const { computeZk1CiphertextRoot } = require("../src/crypto/rootark-zk-chunk-root-v1");
 const { Zk1CloudCiphertextCopyPublisher } =
   require("../src/services/zk1CloudCiphertextCopyPublisher");
-const { Zk1CloudCiphertextReadbackVerifier } =
+const { Zk1CloudCiphertextReadbackVerifier, zk1CloudCopyAddress } =
   require("../src/services/zk1CloudCiphertextReadbackVerifier");
 
 async function fixture(t) {
@@ -211,6 +211,57 @@ test("WebDAV remote errors, redirect, truncated/oversized/corrupt data fail clos
   for (const failure of ["ZK_CLOUD_COPY_UNAVAILABLE", "ZK_CLOUD_READBACK_UNAVAILABLE"]) {
     assert.ok(!failure.includes(password));
   }
+});
+
+test("WebDAV must reject download parent replaced by a junction or fresh directory during GET", async (t) => {
+  const f = await fixture(t);
+  const { publisher, reader, writer } = await f.makePair();
+  await publisher.publishExact(f.pubInput);
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-webdav-parent-race-"));
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const foreign = path.join(scratch, "foreign");
+  fs.mkdirSync(foreign);
+  const marker = path.join(foreign, "keep.txt");
+  fs.writeFileSync(marker, "do not modify", { flag: "wx" });
+  const { folder, name } = zk1CloudCopyAddress({
+    scope: f.pubInput.scope, operationId: f.pubInput.operationId,
+  });
+  for (const replacement of ["junction", "ordinary-directory"]) {
+    const authorized = path.join(scratch, `authorized-${replacement}`);
+    fs.mkdirSync(authorized);
+    const destination = path.join(authorized, "ciphertext.ct");
+    let checked = 0;
+    await assert.rejects(reader.download(folder, name, destination, "uploads", () => {
+      checked += 1;
+      if (checked === 2) {
+        if (replacement === "junction") {
+          fs.rmdirSync(authorized);
+          fs.symlinkSync(foreign, authorized,
+            process.platform === "win32" ? "junction" : "dir");
+        } else {
+          fs.renameSync(authorized, path.join(scratch, "original-parent"));
+          fs.mkdirSync(authorized);
+        }
+      }
+      return true;
+    }, { maxBytes: f.ciphertext.length }), /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
+    assert.equal(checked, 2, "authorization must be rechecked after the network operation");
+    assert.equal(fs.existsSync(destination), false,
+      "a changed parent cannot redirect opaque ciphertext outside its pinned directory");
+  }
+  assert.equal(fs.existsSync(path.join(foreign, "ciphertext.ct")), false);
+  assert.equal(fs.readFileSync(marker, "utf8"), "do not modify");
+
+  const sourceJunction = path.join(scratch, "untrusted-source-link");
+  const foreignBytes = crypto.randomBytes(f.ciphertext.length);
+  fs.writeFileSync(path.join(foreign, "secret.ct"), foreignBytes, { flag: "wx" });
+  fs.symlinkSync(foreign, sourceJunction, process.platform === "win32" ? "junction" : "dir");
+  const sentBefore = f.requests.length;
+  await assert.rejects(writer.upload(path.join(sourceJunction, "secret.ct"),
+    folder, name, "uploads", { zk1BoundedBytes: f.ciphertext.length }),
+  /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
+  assert.equal(f.requests.length, sentBefore,
+    "source through foreign parent must be refused before any HTTPS PUT");
 });
 
 test("WebDAV stalled HTTPS peer is terminated at the 15-second deadline", async (t) => {
