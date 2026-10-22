@@ -677,6 +677,7 @@ class Zk1DurableContentInventoryLedger {
         ]), this.publicKey, signature);
       } catch (_) { fail("INVENTORY_LEDGER_CORRUPT"); }
       if (!valid) fail("INVENTORY_LEDGER_CORRUPT");
+      op.signedEntry = { ...unsigned, signature: Buffer.from(signature) };
       op.seen = true;
       op.entry = tuple;
       entries.push(tuple);
@@ -979,7 +980,10 @@ class Zk1DurableContentInventoryLedger {
       };
     }
     if (operation.status === "pending") return { status: "pending" };
-    return { status: "committed", sequence: operation.sequence, root: Buffer.from(operation.root) };
+    if (!operation.signedEntry) fail("INVENTORY_LEDGER_CORRUPT");
+    const proof = Buffer.from(await z.encodeDeterministic(operation.signedEntry));
+    if (proof.length > inventory.MAX_COMMITTED_PROOF_BYTES) fail("INVENTORY_LIMIT");
+    return { status: "committed", sequence: operation.sequence, root: Buffer.from(operation.root), proof };
   }
 
   async readLocalHead() {

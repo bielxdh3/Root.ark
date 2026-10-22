@@ -229,6 +229,14 @@ function createZk1ContentInventoryHttpsServer({ key, cert, clientCa, ledger, pri
           || snapshot.bytes.length < 1 || snapshot.bytes.length > inventory.MAX_SNAPSHOT_BYTES
           || !Number.isSafeInteger(snapshot.sequence) || snapshot.sequence < result.sequence
           || !Buffer.isBuffer(snapshot.root) || snapshot.root.length !== 32) invalid();
+        // The snapshot authenticates the tuple but not the operation ID.
+        // Attach the durable, independently signed per-operation entry.
+        const receipt = await ledger.getOperationStatus(operation.operation_id);
+        if (!receipt || receipt.status !== "committed"
+          || receipt.sequence !== result.sequence
+          || !Buffer.isBuffer(receipt.root) || !receipt.root.equals(result.root)
+          || !Buffer.isBuffer(receipt.proof)
+          || receipt.proof.length < 1 || receipt.proof.length > inventory.MAX_COMMITTED_PROOF_BYTES) invalid();
         const snapshotBase64 = snapshot.bytes.toString("base64url");
         if (snapshotBase64.length > MAX_SNAPSHOT_BASE64_BYTES) invalid();
         return respond(response, 200, {
@@ -238,6 +246,7 @@ function createZk1ContentInventoryHttpsServer({ key, cert, clientCa, ledger, pri
           headSequence: snapshot.sequence,
           headRootBase64: snapshot.root.toString("base64url"),
           snapshotBase64,
+          proofBase64: receipt.proof.toString("base64url"),
         }, MAX_SNAPSHOT_RESPONSE_BYTES);
       }
 
@@ -257,12 +266,15 @@ function createZk1ContentInventoryHttpsServer({ key, cert, clientCa, ledger, pri
         });
       }
       if (result.status !== "committed" || !Number.isSafeInteger(result.sequence)
-        || result.sequence < 1 || !Buffer.isBuffer(result.root) || result.root.length !== 32) invalid();
+        || result.sequence < 1 || !Buffer.isBuffer(result.root) || result.root.length !== 32
+        || !Buffer.isBuffer(result.proof) || result.proof.length < 1
+        || result.proof.length > inventory.MAX_COMMITTED_PROOF_BYTES) invalid();
       return respond(response, 200, {
         status: "committed",
         operationId,
         sequence: result.sequence,
         rootBase64: result.root.toString("base64url"),
+        proofBase64: result.proof.toString("base64url"),
       });
     } catch (error) {
       if (response.headersSent || response.destroyed) return;

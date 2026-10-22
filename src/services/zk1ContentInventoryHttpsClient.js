@@ -344,13 +344,14 @@ function createZk1ContentInventoryHttpsClient({
         } catch (_) { /* committed response is checked below */ }
         try {
           const committed = exact(result, ["status", "replay", "operationId", "headSequence",
-            "headRootBase64", "snapshotBase64"]);
+            "headRootBase64", "snapshotBase64", "proofBase64"]);
           if (committed.status !== "committed" || typeof committed.replay !== "boolean"
             || !sameOperationId(committed.operationId, operation.operation_id)
             || !Number.isSafeInteger(committed.headSequence) || committed.headSequence < 1) fail();
           const headRoot = decode(committed.headRootBase64, 32, 32);
           const snapshot = decode(committed.snapshotBase64, 1, inventory.MAX_SNAPSHOT_BYTES);
-          return inventory.verifySnapshot({
+          const receiptBytes = decode(committed.proofBase64, 1, inventory.MAX_COMMITTED_PROOF_BYTES);
+          return Promise.all([inventory.verifySnapshot({
             serialized: snapshot,
             pinnedPublicKey: inventoryPublicKey,
             pinnedSignerKeyId: signerKeyId,
@@ -359,18 +360,29 @@ function createZk1ContentInventoryHttpsClient({
             minimumHead,
             minimumSnapshot,
             nonce,
-          }).then((verification) => {
+          }), inventory.verifyCommittedEntryProof({
+            serialized: receiptBytes,
+            pinnedPublicKey: inventoryPublicKey,
+            pinnedSignerKeyId: signerKeyId,
+            expectedScope: scope,
+            operation,
+          })]).then(([verification, receipt]) => {
             if (verification.sequence !== committed.headSequence
               || !crypto.timingSafeEqual(verification.root, headRoot)
-              || verification.outcome !== "PRESENT") fail();
-            // A signed full inventory authenticates the version tuple, not
-            // which operation_id appended it. The alleged ACK/replay fields
-            // are only authenticated by the pinned transport, NOT Ed25519.
+              || verification.outcome !== "PRESENT"
+              || receipt.sequence > verification.sequence
+              || (receipt.sequence === verification.sequence
+                && !crypto.timingSafeEqual(receipt.root, verification.root))) fail();
+            // The entry proves the exact operation committed in this signed
+            // inventory ledger. It does NOT attest physical ciphertext I/O,
+            // independent operation, remote durability or release permission.
             return {
-              status: "present_unattributed",
+              status: "committed",
               transportReplayReported: committed.replay,
-              transportReportedCommittedOnly: true,
-              operationCommitProven: false,
+              transportReportedCommittedOnly: false,
+              signedLedgerOperationCommitted: true,
+              verifiedReceipt: receipt,
+              externalDurabilityProven: false,
               sequence: verification.sequence,
               root: Buffer.from(verification.root),
               verification,
@@ -407,17 +419,32 @@ function createZk1ContentInventoryHttpsClient({
           }
         } catch (_) { /* inspect committed form */ }
         try {
-          const committed = exact(result, ["status", "operationId", "sequence", "rootBase64"]);
+          const committed = exact(result, ["status", "operationId", "sequence", "rootBase64", "proofBase64"]);
           if (committed.status !== "committed"
             || !sameOperationId(committed.operationId, operation.operation_id)
             || !Number.isSafeInteger(committed.sequence) || committed.sequence < 1) fail();
-          return {
-            status: "committed",
-            sequence: committed.sequence,
-            root: decode(committed.rootBase64, 32, 32),
-            transportReportedCommittedOnly: true,
-            authorizesIo: false,
-          };
+          const expectedRoot = decode(committed.rootBase64, 32, 32);
+          const serialized = decode(committed.proofBase64, 1, inventory.MAX_COMMITTED_PROOF_BYTES);
+          return inventory.verifyCommittedEntryProof({
+            serialized,
+            pinnedPublicKey: inventoryPublicKey,
+            pinnedSignerKeyId: signerKeyId,
+            expectedScope: scope,
+            operation,
+          }).then((verified) => {
+            if (verified.sequence !== committed.sequence
+              || !crypto.timingSafeEqual(verified.root, expectedRoot)) fail();
+            return {
+              status: "committed",
+              sequence: verified.sequence,
+              root: Buffer.from(verified.root),
+              verifiedReceipt: verified,
+              signedLedgerOperationCommitted: true,
+              transportReportedCommittedOnly: false,
+              externalDurabilityProven: false,
+              authorizesIo: false,
+            };
+          });
         } catch (_) { return fail(); }
       }).catch(() => fail());
     },

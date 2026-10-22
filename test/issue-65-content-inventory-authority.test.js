@@ -1166,3 +1166,42 @@ test("sealAppend does not accept a raw committed row absent from its verified re
     tamper.close();
   }
 });
+test("committed inventory receipts bind the exact operation ID and signed version tuple", async (t) => {
+  const f = await testFixture(t);
+  const ledger = await f.openNew();
+  const genesis = await ledger.readLocalHead();
+  const operation = {
+    operation_id: crypto.randomBytes(16),
+    expected_sequence: 0, expected_root: genesis.root,
+    ...makeTuple(Buffer.alloc(16, 0x53), 1, 1),
+  };
+  const commit = await ledger.append(operation);
+  assert.equal(commit.status, "committed");
+  const receipt = await ledger.getOperationStatus(operation.operation_id);
+  assert.equal(receipt.status, "committed");
+  assert.ok(Buffer.isBuffer(receipt.proof));
+  const input = {
+    serialized: receipt.proof, pinnedPublicKey: f.keys.publicKey,
+    pinnedSignerKeyId: f.signerKeyId, expectedScope: f.scope,
+    operation,
+  };
+  const verified = await inventory.verifyCommittedEntryProof(input);
+  assert.equal(verified.outcome, "COMMITTED_IN_SIGNED_LEDGER");
+  assert.equal(verified.authorizesIo, false);
+  assert.deepEqual(verified.root, commit.root);
+  await assert.rejects(inventory.verifyCommittedEntryProof({
+    ...input, operation: { ...operation, operation_id: crypto.randomBytes(16) },
+  }));
+  await assert.rejects(inventory.verifyCommittedEntryProof({
+    ...input, operation: { ...operation, ciphertext_sha256: crypto.randomBytes(32) },
+  }));
+  const tampered = Buffer.from(receipt.proof);
+  tampered[tampered.length - 1] ^= 1;
+  await assert.rejects(inventory.verifyCommittedEntryProof({ ...input, serialized: tampered }));
+  f.close(ledger);
+  const reopened = await f.open();
+  const again = await reopened.getOperationStatus(operation.operation_id);
+  assert.deepEqual(again.proof, receipt.proof);
+  assert.deepEqual((await inventory.verifyCommittedEntryProof({ ...input, serialized: again.proof })).root,
+    commit.root);
+});

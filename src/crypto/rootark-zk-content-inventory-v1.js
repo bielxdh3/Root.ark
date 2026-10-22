@@ -12,6 +12,13 @@ const TERMINAL_DOMAIN = Buffer.from("Root.ark/zk-1/content-inventory-terminal/v1
 const MAX_ENTRIES = 4096;
 const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
 const MAX_TERMINAL_PROOF_BYTES = 4096;
+const MAX_COMMITTED_PROOF_BYTES = 4096;
+const ENTRY_TYPE = "rootark-content-inventory-entry/v1";
+const ENTRY_DOMAIN = Buffer.from("Root.ark/zk-1/content-inventory-entry/v1\0", "ascii");
+const COMMITTED_FIELDS = Object.freeze([
+  "type", "version", "signer_key_id", "scope", "sequence", "previous_root", "root",
+  "operation_id", "expected_sequence", "expected_root", "request_digest", "entry", "signature",
+]);
 const MAX_SEQUENCE = Number.MAX_SAFE_INTEGER;
 const SCOPE_FIELDS = Object.freeze(["account_id", "compartment_id", "keyring_id"]);
 const ENTRY_FIELDS = Object.freeze(["object_id", "revision", "epoch", "ciphertext_sha256"]);
@@ -327,6 +334,68 @@ function normalizeMinimumHead(value) {
   return { sequence: normalizeSequence(raw.sequence), root: copyBytes(raw.root, 32) };
 }
 
+async function verifyCommittedEntryProof(input) {
+  const raw = exactObject(input, [
+    "serialized", "pinnedPublicKey", "pinnedSignerKeyId", "expectedScope", "operation",
+  ], "INVENTORY_COMMIT_VERIFY_INPUT");
+  const serialized = copyBytes(raw.serialized, 1, MAX_COMMITTED_PROOF_BYTES);
+  const publicKey = validatePublicKey(raw.pinnedPublicKey);
+  const pinnedSignerKeyId = copyBytes(raw.pinnedSignerKeyId, 16);
+  const scope = normalizeScope(raw.expectedScope);
+  const operation = normalizeTerminalOperation(raw.operation);
+  let decoded;
+  try { decoded = await z.decodeDeterministic(serialized); }
+  catch (_) { fail("INVENTORY_ENCODING"); }
+  const proof = exactObject(decoded, COMMITTED_FIELDS, "INVENTORY_COMMIT_PROOF");
+  if (proof.type !== ENTRY_TYPE || proof.version !== VERSION) fail("INVENTORY_COMMIT_PROOF");
+  const signerKeyId = copyBytes(proof.signer_key_id, 16);
+  if (!sameBytes(signerKeyId, pinnedSignerKeyId)) fail("INVENTORY_SIGNER");
+  const signedScope = normalizeScope(proof.scope);
+  if (!sameBytes(signedScope.account_id, scope.account_id)
+    || !sameBytes(signedScope.compartment_id, scope.compartment_id)
+    || !sameBytes(signedScope.keyring_id, scope.keyring_id)) fail("INVENTORY_SCOPE");
+  const sequence = safeInteger(proof.sequence, 1, MAX_ENTRIES);
+  const expectedSequence = safeInteger(proof.expected_sequence, 0, MAX_ENTRIES - 1);
+  const previousRoot = copyBytes(proof.previous_root, 32);
+  const root = copyBytes(proof.root, 32);
+  const expectedRoot = copyBytes(proof.expected_root, 32);
+  const operationId = copyBytes(proof.operation_id, 16);
+  const requestDigest = copyBytes(proof.request_digest, 32);
+  const entry = normalizeEntry(proof.entry);
+  const signature = copyBytes(proof.signature, 64);
+  if (sequence !== expectedSequence + 1 || expectedSequence !== operation.expected_sequence
+    || !sameBytes(previousRoot, expectedRoot) || !sameBytes(expectedRoot, operation.expected_root)
+    || !sameBytes(operationId, operation.operation_id)
+    || !sameBytes(entry.object_id, operation.object_id)
+    || entry.revision !== operation.revision || entry.epoch !== operation.epoch
+    || !sameBytes(entry.ciphertext_sha256, operation.ciphertext_sha256)) {
+    fail("INVENTORY_COMMIT_OPERATION");
+  }
+  const operationBytes = await z.encodeDeterministic(operation);
+  if (!sameBytes(requestDigest, hash(operationBytes))) fail("INVENTORY_COMMIT_OPERATION");
+  const unsigned = {
+    type: ENTRY_TYPE, version: VERSION, signer_key_id: signerKeyId, scope: signedScope,
+    sequence, previous_root: previousRoot, root, operation_id: operationId,
+    expected_sequence: expectedSequence, expected_root: expectedRoot, request_digest: requestDigest, entry,
+  };
+  // Even a valid signature does not authorize noncanonical representations.
+  if (!sameBytes(serialized, await z.encodeDeterministic({ ...unsigned, signature }))) {
+    fail("INVENTORY_ENCODING");
+  }
+  if (!crypto.verify(null, Buffer.concat([ENTRY_DOMAIN,
+    await z.encodeDeterministic(unsigned),
+  ]), publicKey, signature)) fail("INVENTORY_SIGNATURE");
+  return {
+    status: "VERIFIED_NONAUTHORIZING",
+    outcome: "COMMITTED_IN_SIGNED_LEDGER",
+    operationId: Buffer.from(operationId),
+    sequence, root: Buffer.from(root),
+    tuple: { object_id: Buffer.from(entry.object_id), revision: entry.revision,
+      epoch: entry.epoch, ciphertext_sha256: Buffer.from(entry.ciphertext_sha256) },
+    authorizesIo: false,
+  };
+}
+
 function sameBytes(a, b) {
   return Buffer.isBuffer(a) && Buffer.isBuffer(b)
     && a.length === b.length && crypto.timingSafeEqual(a, b);
@@ -523,6 +592,7 @@ module.exports = {
   MAX_ENTRIES,
   MAX_SNAPSHOT_BYTES,
   MAX_TERMINAL_PROOF_BYTES,
+  MAX_COMMITTED_PROOF_BYTES,
   MAX_SEQUENCE,
   ContentInventoryError,
   normalizeScope,
@@ -535,5 +605,6 @@ module.exports = {
   createSignedSnapshot,
   createTerminalProof,
   verifyTerminalProof,
+  verifyCommittedEntryProof,
   verifySnapshot,
 };

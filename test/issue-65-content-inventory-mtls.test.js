@@ -317,9 +317,9 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       minimumHead: floor0,
       minimumSnapshot: absent.serializedSnapshot,
     });
-    assert.equal(first.status, "present_unattributed");
-    assert.equal(first.operationCommitProven, false);
-    assert.equal(first.transportReportedCommittedOnly, true);
+    assert.equal(first.status, "committed");
+    assert.equal(first.signedLedgerOperationCommitted, true);
+    assert.equal(first.authorizesIo, false);
     assert.equal(first.verification.outcome, "PRESENT");
     assert.equal(first.authorizesIo, false);
 
@@ -338,6 +338,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     });
     assert.equal(second.sequence, 2);
     assert.equal(second.verification.outcome, "PRESENT");
+    assert.equal(second.signedLedgerOperationCommitted, true);
     const historical = await reader.getSnapshot({
       scope: h.scope,
       nonce: crypto.randomBytes(32),
@@ -373,6 +374,9 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     });
     assert.equal(first.transportReplayReported, false);
     assert.equal(retry.transportReplayReported, true);
+    assert.equal(first.signedLedgerOperationCommitted, true);
+    assert.equal(retry.signedLedgerOperationCommitted, true);
+    assert.deepEqual(retry.verifiedReceipt.operationId, operation.operation_id);
     assert.equal(retry.sequence, first.sequence);
     assert.deepEqual(retry.root, first.root);
     assert.deepEqual(retry.verification.root, first.verification.root);
@@ -449,9 +453,9 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       scope: h.scope, operation, nonce: crypto.randomBytes(32), minimumHead: floor,
       minimumSnapshot: genesisSnapshot.serializedSnapshot,
     });
-    assert.equal(afterRestart.status, "present_unattributed");
+    assert.equal(afterRestart.status, "committed");
     assert.equal(afterRestart.transportReplayReported, true);
-    assert.equal(afterRestart.operationCommitProven, false);
+    assert.equal(afterRestart.signedLedgerOperationCommitted, true);
     assert.equal(afterRestart.sequence, first.sequence);
     assert.deepEqual(afterRestart.root, first.root);
     assert.equal(afterRestart.verification.outcome, "PRESENT");
@@ -643,7 +647,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     assert.equal(oversizedHeader.status, 431);
   });
 
-  await t.test("committed operation status is transport-reported only", async (child) => {
+  await t.test("committed operation status requires the exact independently signed ledger entry", async (child) => {
     const h = await harness(child);
     const genesis = await h.ledger.readLocalHead();
     const operation = newOperation({ root: genesis.root });
@@ -665,9 +669,29 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       operation,
     });
     assert.equal(status.status, "committed");
-    assert.equal(status.transportReportedCommittedOnly, true);
+    assert.equal(status.signedLedgerOperationCommitted, true);
+    assert.equal(status.transportReportedCommittedOnly, false);
     assert.equal(status.authorizesIo, false);
     assert.equal(status.sequence, 1);
+    assert.deepEqual(status.verifiedReceipt.operationId, operation.operation_id);
+    assert.equal(status.externalDurabilityProven, false);
+  });
+
+  await t.test("HTTP 200 status cannot reuse a valid receipt under another operation ID", async (child) => {
+    const h = await harness(child);
+    const genesis = await h.ledger.readLocalHead();
+    const genuine = newOperation({ root: genesis.root });
+    assert.equal((await h.ledger.append(genuine)).status, "committed");
+    const authentic = await h.ledger.getOperationStatus(genuine.operation_id);
+    h.ledger.getOperationStatus = async () => authentic;
+    await assert.rejects(h.makeClient("status-reader").getOperationStatus({
+      scope: h.scope,
+      operation: { ...genuine, operation_id: crypto.randomBytes(16) },
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
+    await assert.rejects(h.makeClient("status-reader").getOperationStatus({
+      scope: h.scope,
+      operation: { ...genuine, ciphertext_sha256: crypto.randomBytes(32) },
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
   });
 
   await t.test("forged append ACK cannot turn a signed ABSENT snapshot into a commit", async (child) => {
@@ -695,21 +719,41 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     const head = await h.ledger.readLocalHead();
     const genuine = newOperation({ root: head.root });
     assert.equal((await h.ledger.append(genuine)).status, "committed");
+    const authenticStatus = await h.ledger.getOperationStatus(genuine.operation_id);
     const floor = await h.ledger.readLocalHead();
     const forged = { ...genuine, operation_id: crypto.randomBytes(16) };
     h.ledger.append = async () => ({
       status: "committed", replay: true, sequence: floor.sequence, root: floor.root,
     });
-    const result = await h.makeClient("writer").append({
+    h.ledger.getOperationStatus = async () => authenticStatus;
+    await assert.rejects(h.makeClient("writer").append({
       scope: h.scope, operation: forged,
       nonce: crypto.randomBytes(32),
       minimumHead: { sequence: floor.sequence, root: floor.root },
-    });
-    assert.equal(result.status, "present_unattributed");
-    assert.equal(result.verification.outcome, "PRESENT");
-    assert.equal(result.operationCommitProven, false);
-    assert.equal(result.transportReportedCommittedOnly, true);
-    assert.equal(result.authorizesIo, false);
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
+  });
+
+  await t.test("altered signed append receipt fails while genuine signed snapshot remains valid", async (child) => {
+    const h = await harness(child);
+    const genesis = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: genesis.root });
+    const realAppend = h.ledger.append.bind(h.ledger);
+    const realStatus = h.ledger.getOperationStatus.bind(h.ledger);
+    h.ledger.append = async (value) => {
+      const result = await realAppend(value);
+      h.ledger.getOperationStatus = async (id) => {
+        const row = await realStatus(id);
+        if (row.status !== "committed") return row;
+        const proof = Buffer.from(row.proof);
+        proof[proof.length - 1] ^= 1;
+        return { ...row, proof };
+      };
+      return result;
+    };
+    await assert.rejects(h.makeClient("writer").append({
+      scope: h.scope, operation, nonce: crypto.randomBytes(32),
+      minimumHead: { sequence: 0, root: genesis.root },
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
   });
 
   await t.test("rejected HTTP status cannot keep a pinned TLS response streaming after client rejection", async (child) => {
