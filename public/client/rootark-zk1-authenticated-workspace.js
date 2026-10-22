@@ -16,6 +16,7 @@
     "rootark-zk1-portable-file-recovery", "rootark-zk1-browser-recovery-http",
     "rootark-zk1-recoverable-workspace",
     "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow",
+    "rootark-zk1-v2-device-approval",
   ];
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const base64 = /^[A-Za-z0-9_-]{43}$/;
@@ -178,7 +179,8 @@
       if (!window.RootarkZk1NormalBrowserContent?.uploadAndVerify
         || !window.RootarkZk1NormalBrowserTrustFloor?.provisionOffline
         || !window.RootarkZk1RecoverableWorkspace?.restoreOnNewDevice
-        || !window.RootarkZk1LegacyMigrationWorkflow?.openMigrationJournal) fail();
+        || !window.RootarkZk1LegacyMigrationWorkflow?.openMigrationJournal
+        || !window.RootarkZk1V2DeviceApproval?.verifyImportedApproval) fail();
     })();
     return loadingScripts;
   }
@@ -206,6 +208,8 @@
       + '<label>Hash SHA-256 SPKI do signer do inventário (hex, externo)<input type="text" data-zk1-field="inventory-signer-spki" maxlength="64" spellcheck="false"></label>'
       + '<label>Chave pública do dispositivo (Ed25519 raw)<input type="file" data-zk1-field="device" required></label>'
       + '<label>Chave privada do dispositivo (PKCS#8, local)<input type="file" data-zk1-field="private" required></label>'
+      + '<label>Pedido original emitido no dispositivo novo (.json)<input type="file" data-zk1-field="new-request" accept=".json,application/json"></label>'
+      + '<label>Autorização offline Ed25519 assinada pelo proprietário (.json)<input type="file" data-zk1-field="new-approval" accept=".json,application/json"></label>'
       + '<label>Arquivo descartável (até 2 MiB)<input type="file" data-zk1-field="file" required></label>'
       + '<label>Segredo de recuperação separado (arquivo binário de 32 bytes)<input type="file" data-zk1-field="secret"></label>'
       + '<label>Pacote cifrado exportado (.json, sem segredo)<input type="file" data-zk1-field="bundle" accept=".json,application/json"></label>'
@@ -217,6 +221,7 @@
       + '<button type="button" class="button button-quiet" data-zk1-action="verify-inventory">Verificar checkpoint owner-signed</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="new-secret">Gerar segredo de 256 bits</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="new-device">Solicitar novo dispositivo ao proprietário</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="import-approval">Verificar aprovação offline do novo dispositivo</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="upload">Cifrar, enviar e conferir GET</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="upload-recoverable">Enviar e exportar pacote recuperável</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="restore">Recuperar arquivo do novo dispositivo</button></div>'
@@ -252,7 +257,8 @@
       return;
     }
     if (!["provision", "verify-inventory", "upload", "upload-recoverable",
-      "restore", "new-secret", "new-device", "migrate", "migration-finalize"].includes(action)) return;
+      "restore", "new-secret", "new-device", "import-approval",
+      "migrate", "migration-finalize"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -314,6 +320,32 @@
         return;
       }
       const trust = await grantAndOwner();
+      if (action === "import-approval") {
+        // Never infer owner approval from an unsigned request or server data:
+        // current head, owner SPKI/raw pins and grant all arrive independently.
+        const request = JSON.parse(decoder.decode(await fileBytes("new-request", 1, 8192)));
+        const approval = JSON.parse(decoder.decode(await fileBytes("new-approval", 1, 8192)));
+        const publicRaw = await fileBytes("device", 32, 32);
+        const devicePublicKey = await crypto.subtle.importKey("raw", publicRaw,
+          "Ed25519", true, ["verify"]);
+        publicRaw.fill(0);
+        privateDer = await fileBytes("private", 1, 8192);
+        const devicePrivateKey = await crypto.subtle.importKey("pkcs8", privateDer,
+          "Ed25519", false, ["sign"]);
+        const result = await window.RootarkZk1V2DeviceApproval.verifyImportedApproval({
+          request, approval, signedDeviceGrant: trust.signedDeviceGrant,
+          ownerPublicKey: trust.ownerPublicKey,
+          independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+          pinnedOwnerKeyHash: trust.pinnedOwnerKeyHash,
+          pinnedCurrentHead: trust.pinnedCurrentHead,
+          devicePublicKey, devicePrivateKey, nowSeconds: Math.floor(Date.now() / 1000),
+        });
+        if (result.verifiedOwnerOfflineApproval !== true
+          || result.authorizesProductionIo !== false) fail();
+        // The independent pinning step stays explicit and separate.
+        status("Aprovação offline vinculada ao pedido, à chave nova, ao grant e ao head atual. Provisione o piso offline para este perfil; o V2/CAS deve ser conferido externamente.");
+        return;
+      }
       if (action === "provision") {
         const result = await window.RootarkZk1NormalBrowserTrustFloor.provisionOffline({
           ownerPublicKey: trust.ownerPublicKey,

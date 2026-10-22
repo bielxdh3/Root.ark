@@ -40,7 +40,8 @@ const scriptNames = ["rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-r
   "rootark-zk1-normal-browser-content", "rootark-zk1-portable-file-recovery",
   "rootark-zk1-browser-recovery-http", "rootark-zk1-recoverable-workspace",
   "rootark-zk1-normal-browser-lab-ui", "rootark-zk1-portable-recovery-lab-ui",
-  "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow"];
+  "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow",
+  "rootark-zk1-v2-device-approval"];
 
 test("production static paths cannot disclose the opt-in normal browser laboratory", async (t) => {
   const app = express();
