@@ -45,12 +45,16 @@ function createZk1CasWriteHttpsClient({
     if (encoded.byteLength > 12 * 1024 * 1024) fail();
     return new Promise((resolve, reject) => {
       let finished = false;
+      let req;
+      let deadline;
       const unavailable = () => {
         if (finished) return;
         finished = true;
+        clearTimeout(deadline);
+        req?.destroy();
         reject(new Error("CAS_WRITE_TRANSPORT_UNAVAILABLE"));
       };
-      const req = https.request({
+      req = https.request({
         hostname: url.hostname, port: url.port, path, method: "POST",
         agent: false, // never borrow a socket verified by another writer pin
         ca, key: clientKey, cert: clientCert, rejectUnauthorized: true,
@@ -94,13 +98,18 @@ function createZk1CasWriteHttpsClient({
             if (path === "/v1/commit"
               && (body.status !== "committed" || typeof body.replay !== "boolean")) fail();
             finished = true;
+            clearTimeout(deadline);
             resolve(path === "/v1/commit"
               ? { status: body.status, replay: body.replay } : { status: body.status });
           } catch (_) { unavailable(); }
         });
         res.on("error", unavailable);
       });
-      req.on("timeout", () => req.destroy());
+      // Socket timeout measures IDLE time, so a pinned peer can send a byte
+      // each interval and hold a recovery write open indefinitely. Bound the
+      // entire TLS handshake, request body, and response by one deadline.
+      deadline = setTimeout(unavailable, timeoutMs);
+      req.on("timeout", unavailable);
       req.on("error", unavailable);
       req.end(encoded);
     });
