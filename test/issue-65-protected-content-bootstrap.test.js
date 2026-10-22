@@ -83,6 +83,31 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
     objects.push(store);
     return app;
   }
+  {
+    const originalOpen = fs.openSync;
+    const replacement = path.join(dir, "replacement-config.json");
+    const prior = path.join(dir, "swapped-old-config.json");
+    fs.writeFileSync(replacement, JSON.stringify(data));
+    let swappedConfig = false;
+    try {
+      fs.openSync = (filename, flags, ...rest) => {
+        if (!swappedConfig && filename === configPath && typeof flags === "number") {
+          fs.renameSync(configPath, prior);
+          fs.renameSync(replacement, configPath);
+          swappedConfig = true;
+        }
+        return originalOpen(filename, flags, ...rest);
+      };
+      assert.throws(() => configure(data), /ZK_CONTENT_BOOTSTRAP_INVALID/,
+        "file identity changed between lstat and descriptor open must refuse");
+    } finally {
+      fs.openSync = originalOpen;
+    }
+    assert.equal(swappedConfig, true,
+      "adversarial fixture must replace a valid config with an equally valid different inode");
+    assert.equal(fs.existsSync(data.contentDbPath), false,
+      "file identity swap may not create the protected content database");
+  }
   assert.throws(() => configure({ ...data, witness: { ...data.witness,
     signingPublicKeyPath: undefined } }), /ZK_CONTENT_BOOTSTRAP_INVALID/);
   assert.throws(() => configure({ ...data, cas: { ...data.cas,

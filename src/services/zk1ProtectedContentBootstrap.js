@@ -51,11 +51,44 @@ function absolute(value) {
   if (typeof value !== "string" || !value || !path.isAbsolute(value)) fail();
   return value;
 }
+function sameFileIdentity(left, right) {
+  return left.isFile() && right.isFile()
+    && left.dev === right.dev && left.ino === right.ino
+    && left.mode === right.mode && left.nlink === right.nlink
+    && left.size === right.size && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
 function readFile(filename, max = 65536) {
   const input = absolute(filename);
-  const info = fs.lstatSync(input);
-  if (!info.isFile() || info.size < 1 || info.size > max) fail();
-  return fs.readFileSync(input);
+  let descriptor;
+  try {
+    // Path validation alone leaves a lstat -> readFile race. Pin the exact
+    // inode through an open descriptor before reading operator-provisioned
+    // pins and TLS keys. BigInt avoids adjacent 64-bit file-ID collisions.
+    const before = fs.lstatSync(input, { bigint: true });
+    if (!before.isFile() || before.nlink !== 1n
+      || before.size < 1n || before.size > BigInt(max)) fail();
+    descriptor = fs.openSync(input,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    if (!sameFileIdentity(before, opened)) fail();
+    const bytes = Buffer.alloc(Number(opened.size));
+    let consumed = 0;
+    while (consumed < bytes.length) {
+      const size = fs.readSync(descriptor, bytes, consumed,
+        bytes.length - consumed, null);
+      if (size < 1) fail();
+      consumed += size;
+    }
+    // Never trust a file that grew while being read, even within a pinned fd.
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0) fail();
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    const currentPath = fs.lstatSync(input, { bigint: true });
+    if (!sameFileIdentity(opened, after)
+      || !sameFileIdentity(opened, currentPath)) fail();
+    return bytes;
+  } catch (_) { fail(); }
+  finally { if (descriptor !== undefined) fs.closeSync(descriptor); }
 }
 function endpoint(config, witness) {
   const tunedFields = witness ? [] : Object.keys(CAS_DEADLINE_LIMITS)
