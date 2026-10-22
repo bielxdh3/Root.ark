@@ -1,12 +1,14 @@
 (function (root, factory) {
   if (typeof module === "object" && module.exports) {
     module.exports = factory(require("node:crypto").webcrypto,
-      require("./rootark-zk1-ciphertext-download-integrity"));
+      require("./rootark-zk1-ciphertext-download-integrity"),
+      require("./rootark-zk1-owner-ciphertext-root-checkpoint"));
   } else {
     root.RootarkZk1ProtectedHttpClient = factory(root.crypto,
-      root.RootarkZk1CiphertextDownloadIntegrity);
+      root.RootarkZk1CiphertextDownloadIntegrity,
+      root.RootarkZk1OwnerCiphertextRootCheckpoint);
   }
-}(typeof globalThis === "object" ? globalThis : this, function (webCrypto, download) {
+}(typeof globalThis === "object" ? globalThis : this, function (webCrypto, download, ownerRoot) {
   "use strict";
 
   // Explicitly opt-in browser client for the development-only protected
@@ -312,7 +314,30 @@
       // latest-version read. Signing the exact historical revision and digest
       // is required even when the storage server has a newer version.
       exact(input, ["origin", "request", "expectedObjectRevision", "expectedEpoch",
-        "expectedRoot", ...(Object.hasOwn(input, "fetchImpl") ? ["fetchImpl"] : [])]);
+        "expectedRoot", ...(Object.hasOwn(input, "fetchImpl") ? ["fetchImpl"] : []),
+        ...(Object.hasOwn(input, "ownerRootProof") ? ["ownerRootProof"] : [])]);
+      const ownerProvenance = Object.hasOwn(input, "ownerRootProof");
+      if (ownerProvenance) {
+        const signed = genuineSigned.get(input.request);
+        if (!signed || signed.op !== "get"
+          || signed.request.authorization.expected_object_revision !== input.expectedObjectRevision
+          || typeof ownerRoot?.assertOwnerCiphertextRootProof !== "function") deny();
+        const authorization = signed.request.authorization;
+        ownerRoot.assertOwnerCiphertextRootProof({
+          proof: input.ownerRootProof,
+          scope: { account_id: authorization.account_id,
+            compartment_id: authorization.compartment_id,
+            keyring_id: authorization.keyring_id },
+          deviceId: authorization.device_id,
+          manifestRevision: authorization.manifest_revision,
+          manifestDigest: from64(authorization.manifest_digest, 32),
+          manifestEpoch: authorization.epoch,
+          objectId: signed.objectId,
+          objectRevision: input.expectedObjectRevision,
+          ciphertextEpoch: input.expectedEpoch,
+          ciphertextRoot: input.expectedRoot,
+        });
+      }
       const inspected = await inspectProtectedCiphertextRead({
         origin: input.origin, request: input.request,
         fetchImpl: input.fetchImpl ?? fetch,
@@ -327,7 +352,7 @@
         // flag would allow later mutation to contradict the verification.
         ciphertextBase64: inspected.ciphertextBase64,
         integrityMatchesPinnedRoot: true,
-        trustedRootProvenanceVerified: false,
+        trustedRootProvenanceVerified: ownerProvenance,
         authorizesRecovery: false, authorizesRestore: false,
         durableBackupProven: false,
       });

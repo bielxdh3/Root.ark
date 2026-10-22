@@ -14,6 +14,8 @@ const fixtures = require("./support/issue-65-recovery-v2-fixtures");
 const file = require("../public/client/rootark-zk1-file-content");
 const chunks = require("../public/client/rootark-zk1-ciphertext-chunk-root");
 const browser = require("../public/client/rootark-zk1-protected-http-client");
+const ownerHistory = require("../public/client/rootark-zk1-owner-signed-checkpoint");
+const ownerRoot = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
 const reconciliation = require("../public/client/rootark-zk1-uncertain-put-reconciliation");
 const { Zk1ProtectedObjectStore, contentAuthorizationMessageV1 } =
   require("../src/services/zk1ProtectedObjectStore");
@@ -283,6 +285,51 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
   await expected.append(encrypted);
   const expectedRoot = await expected.finish();
   const historicalDigest = crypto.createHash("sha256").update(encrypted).digest();
+  const ownerPublic = await crypto.webcrypto.subtle.importKey("spki",
+    crypto.createPublicKey(privateKey).export({ format: "der", type: "spki" }),
+    "Ed25519", false, ["verify"]);
+  const ownerPin = { scope: scopeWire, deviceId: device.device_id,
+    signerKeyId: Buffer.from(device.authorization_key_id),
+    publicKey: ownerPublic };
+  const historyWire = await ownerHistory.signOwnerCheckpoint({
+    scope: scopeWire, signerKey: webKey, signerPublicKey: ownerPublic,
+    signerKeyId: ownerPin.signerKeyId, deviceId: device.device_id,
+    revision: parameters.manifestRevision,
+    manifestDigest: parameters.manifestDigest, issuedAt: 1400, previous: null,
+  });
+  const ownerRootInput = { scope: scopeWire, signerKey: webKey,
+    signerKeyId: ownerPin.signerKeyId, deviceId: device.device_id,
+    manifestRevision: parameters.manifestRevision,
+    manifestDigest: parameters.manifestDigest, manifestEpoch: parameters.epoch,
+    objectId: metadata.object_id, objectRevision: 1,
+    ciphertextEpoch: metadata.epoch, ciphertextRoot: expectedRoot, issuedAt: 1400 };
+  const rootWire = await ownerRoot.signOwnerCiphertextRootCheckpoint(ownerRootInput);
+  const rootExpected = { manifestRevision: parameters.manifestRevision,
+    manifestDigest: parameters.manifestDigest, manifestEpoch: parameters.epoch,
+    objectId: metadata.object_id, objectRevision: 1,
+    ciphertextEpoch: metadata.epoch, ciphertextRoot: expectedRoot };
+  const proofInput = { checkpoint: rootWire, ownerHistoryCheckpoint: historyWire,
+    previousHistoryProof: null, pinnedOwner: ownerPin, expected: rootExpected };
+  const rootProof = await ownerRoot.verifyOwnerCiphertextRootCheckpoint(proofInput);
+  assert.equal(rootProof.trustedOwnerSignatureVerified, true);
+  assert.equal(rootProof.liveDeviceRevocationVerified, false,
+    "signed owner root provenance alone does not claim live device revocation proof");
+  const foreignOwner = crypto.generateKeyPairSync("ed25519");
+  const foreignSigner = await crypto.webcrypto.subtle.importKey("pkcs8",
+    foreignOwner.privateKey.export({ format: "der", type: "pkcs8" }),
+    "Ed25519", false, ["sign"]);
+  await assert.rejects(ownerRoot.verifyOwnerCiphertextRootCheckpoint({
+    ...proofInput, checkpoint: await ownerRoot.signOwnerCiphertextRootCheckpoint({
+      ...ownerRootInput, signerKey: foreignSigner }),
+  }), /ZK_OWNER_CIPHERTEXT_ROOT_UNVERIFIED/,
+  "a forged owner root with a valid attacker's Ed25519 signature must fail");
+  await assert.rejects(ownerRoot.verifyOwnerCiphertextRootCheckpoint({
+    ...proofInput, expected: { ...rootExpected, manifestEpoch: rootExpected.manifestEpoch + 1 },
+  }), /ZK_OWNER_CIPHERTEXT_ROOT_UNVERIFIED/,
+  "an earlier owner epoch cannot be silently relabeled as the current epoch");
+  await assert.rejects(ownerRoot.verifyOwnerCiphertextRootCheckpoint({
+    ...proofInput, expected: { ...rootExpected, objectId: randomId() },
+  }), /ZK_OWNER_CIPHERTEXT_ROOT_UNVERIFIED/, "a signed root cannot replay across objects");
   let backupWire = "";
   const backupRequest = await browser.signProtectedContentOperation({
     ...parameters, operation: "get", objectId: metadata.object_id,
@@ -314,6 +361,80 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
   assert.equal(backupWire.includes("segredo local"), false);
   assert.equal(backupWire.includes("hidden-file.txt"), false);
   assert.equal(backupWire.includes("cek"), false);
+  const ownerBacked = await browser.postProtectedCiphertextBackupRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: 1, expectedCiphertextDigest: historicalDigest, ciphertext: null,
+    }), expectedObjectRevision: 1, expectedEpoch: metadata.epoch,
+    expectedRoot, ownerRootProof: rootProof, fetchImpl: sessionFetch,
+  });
+  assert.equal(ownerBacked.trustedRootProvenanceVerified, true,
+    "real signed HTTP ciphertext backup read accepts the verified owner root");
+  assert.deepEqual(Buffer.from(ownerBacked.ciphertextBase64, "base64url"), Buffer.from(encrypted));
+  assert.equal(ownerBacked.authorizesRecovery, false);
+  assert.equal(ownerBacked.durableBackupProven, false);
+  const liveBrowserContext = vm.createContext({
+    crypto: crypto.webcrypto, TextEncoder, TextDecoder, Uint8Array, ArrayBuffer,
+    URL, btoa, atob, location: { origin },
+    RootarkZk1CiphertextDownloadIntegrity:
+      require("../public/client/rootark-zk1-ciphertext-download-integrity"),
+  });
+  for (const name of ["rootark-zk1-owner-signed-checkpoint.js",
+    "rootark-zk1-owner-ciphertext-root-checkpoint.js",
+    "rootark-zk1-protected-http-client.js"]) {
+    vm.runInContext(fs.readFileSync(path.join(__dirname, "../public/client", name), "utf8"),
+      liveBrowserContext);
+  }
+  liveBrowserContext.external = { ownerPin, historyWire, rootWire,
+    rootExpected, webKey, parameters, objectId: metadata.object_id,
+    historicalDigest, root: expectedRoot, readFetch: sessionFetch, origin };
+  const umdBackup = await vm.runInContext(`(async () => {
+    const trustedOwner = { ...external.ownerPin,
+      scope: { ...external.ownerPin.scope } };
+    const proof = await RootarkZk1OwnerCiphertextRootCheckpoint
+      .verifyOwnerCiphertextRootCheckpoint({
+        checkpoint: { ...external.rootWire },
+        ownerHistoryCheckpoint: { ...external.historyWire },
+        previousHistoryProof: null, pinnedOwner: trustedOwner,
+        expected: { ...external.rootExpected },
+      });
+    const signed = await RootarkZk1ProtectedHttpClient.signProtectedContentOperation({
+      ...external.parameters, scope: { ...external.parameters.scope },
+      operation: "get", objectId: external.objectId,
+      expectedObjectRevision: 1, expectedCiphertextDigest: external.historicalDigest,
+      ciphertext: null,
+    });
+    return RootarkZk1ProtectedHttpClient.postProtectedCiphertextBackupRead({
+      origin: external.origin, request: signed, expectedObjectRevision: 1,
+      expectedEpoch: external.parameters.epoch,
+      expectedRoot: external.root, ownerRootProof: proof, fetchImpl: external.readFetch,
+    });
+  })()`, liveBrowserContext);
+  assert.equal(umdBackup.trustedRootProvenanceVerified, true,
+    "plain browser UMD with independent owner checkpoint must work against real signed HTTP route");
+  assert.deepEqual(Buffer.from(umdBackup.ciphertextBase64, "base64url"), Buffer.from(encrypted));
+  let ownerProofRejectedBeforeFetch = 0;
+  await assert.rejects(browser.postProtectedCiphertextBackupRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, operation: "get", objectId: randomId(),
+      expectedObjectRevision: 1, expectedCiphertextDigest: historicalDigest, ciphertext: null,
+    }), expectedObjectRevision: 1, expectedEpoch: metadata.epoch,
+    expectedRoot, ownerRootProof: rootProof, fetchImpl: () => {
+      ownerProofRejectedBeforeFetch++; throw Error("should not perform forged root HTTP GET");
+    },
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/, "cross-object replay must fail before HTTP");
+  assert.equal(ownerProofRejectedBeforeFetch, 0);
+  await assert.rejects(browser.postProtectedCiphertextBackupRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, epoch: parameters.epoch + 1,
+      operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: 1, expectedCiphertextDigest: historicalDigest, ciphertext: null,
+    }), expectedObjectRevision: 1, expectedEpoch: metadata.epoch + 1,
+    expectedRoot, ownerRootProof: rootProof, fetchImpl: () => {
+      ownerProofRejectedBeforeFetch++; throw Error("should not perform stale epoch HTTP GET");
+    },
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/, "a stale owner epoch must fail before HTTP");
+  assert.equal(ownerProofRejectedBeforeFetch, 0);
   let noFetchCount = 0;
   await assert.rejects(browser.postProtectedCiphertextBackupRead({
     origin, request: await browser.signProtectedContentOperation({
@@ -765,6 +886,22 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
   gateOpen = true;
   await fixtures.appendDeviceRevocation(state, device.device_id);
   signedHead = state.headManifest;
+  const freshManifestDigest = await manifestDigest();
+  let revokedEpochFetches = 0;
+  await assert.rejects(browser.postProtectedCiphertextBackupRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, manifestRevision: signedHead.revision,
+      manifestDigest: freshManifestDigest, epoch: signedHead.current_epoch,
+      operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: 1, expectedCiphertextDigest: historicalDigest,
+      ciphertext: null,
+    }), expectedObjectRevision: 1, expectedEpoch: metadata.epoch,
+    expectedRoot, ownerRootProof: rootProof, fetchImpl: () => {
+      revokedEpochFetches++; throw Error("stale revoked-owner checkpoint reached HTTP");
+    },
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+  "after signed keyring revocation, the old owner-root provenance cannot bind a newer manifest head");
+  assert.equal(revokedEpochFetches, 0, "revoked owner-root epoch is refused locally");
   await assert.rejects(browser.postProtectedCiphertextBackupRead({
     origin, request: await browser.signProtectedContentOperation({
       ...parameters, manifestRevision: signedHead.revision,
