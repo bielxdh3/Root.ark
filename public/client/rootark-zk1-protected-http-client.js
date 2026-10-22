@@ -247,10 +247,18 @@
   }
   async function postProtectedCiphertextPut({ origin, request, fetchImpl = fetch } = {}) {
     try {
+      const signed = genuineSigned.get(request);
+      if (!signed || signed.op !== "put") deny();
+      // The signed predecessor is the only valid reference for the ACK. An
+      // authenticated route or intermediary returning a stale or future
+      // revision must not move the browser's revision/checkpoint forward.
+      const previous = signed.request.authorization.expected_object_revision;
+      const expectedRevision = previous === null ? 1 : positive(previous) + 1;
+      if (!Number.isSafeInteger(expectedRevision)) deny();
       const decoded = await post(request, "put", origin, fetchImpl);
       exact(decoded, ["id", "revision"]);
-      if (decoded.id !== genuineSigned.get(request).objectId) deny();
-      return Object.freeze({ id: decoded.id, revision: positive(decoded.revision) });
+      if (decoded.id !== signed.objectId || positive(decoded.revision) !== expectedRevision) deny();
+      return Object.freeze({ id: decoded.id, revision: expectedRevision });
     } catch (_) { deny(); }
   }
   async function inspectProtectedCiphertextRead({ origin, request, fetchImpl,

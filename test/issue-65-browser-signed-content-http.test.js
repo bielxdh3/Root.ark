@@ -239,6 +239,46 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
   }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
   "insecure cross-origin HTTP must be rejected without a network call");
 
+  // A signed PUT binds its predecessor revision. A stale or fabricated HTTP
+  // success ACK cannot advance (or roll back) the client's revision tracking.
+  // Exercise the real authenticated route before modifying only the ACK.
+  const ackId = randomId();
+  for (const [previousRevision, forgedRevision] of [
+    [null, 2], [1, 1], [2, 4], [3, Number.MAX_SAFE_INTEGER], [4, 0],
+  ]) {
+    const signedAckPut = await browser.signProtectedContentOperation({
+      ...parameters, operation: "put", objectId: ackId,
+      expectedObjectRevision: previousRevision, ciphertext: crypto.randomBytes(128),
+    });
+    await assert.rejects(browser.postProtectedCiphertextPut({
+      origin, request: signedAckPut, fetchImpl: async (url, options) => {
+        const genuine = await sessionFetch(url, options);
+        assert.equal(genuine.status, previousRevision === null ? 201 : 200);
+        const responseBody = await genuine.json();
+        assert.equal(responseBody.revision, (previousRevision ?? 0) + 1);
+        responseBody.revision = forgedRevision;
+        return new Response(JSON.stringify(responseBody), { status: genuine.status,
+          headers: { "content-type": "application/json" } });
+      },
+    }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+    `a signed PUT with predecessor ${previousRevision} must reject forged revision ${forgedRevision}`);
+    assert.equal(store.db.prepare("SELECT revision FROM zk_content_object WHERE id=?")
+      .get(ackId).revision, (previousRevision ?? 0) + 1);
+  }
+  const overflowPut = await browser.signProtectedContentOperation({
+    ...parameters, operation: "put", objectId: ackId,
+    expectedObjectRevision: Number.MAX_SAFE_INTEGER, ciphertext: crypto.randomBytes(128),
+  });
+  let overflowNetworkCalls = 0;
+  await assert.rejects(browser.postProtectedCiphertextPut({
+    origin, request: overflowPut, fetchImpl: () => {
+      overflowNetworkCalls++;
+      throw new Error("unexpected network request for impossible revision");
+    },
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/);
+  assert.equal(overflowNetworkCalls, 0,
+    "a signed maximum-safe predecessor cannot overflow into an unverifiable HTTP ACK");
+
   const expected = chunks.createCiphertextRootBuilder(1);
   await expected.append(encrypted);
   const expectedRoot = await expected.finish();
