@@ -81,7 +81,8 @@
   }
   async function verifyExternalAnchor(input) {
     try {
-      exact(input, ANCHOR);
+      const priorProvided = Object.hasOwn(input || {}, "previousOwnerHistoryProof");
+      exact(input, priorProvided ? [...ANCHOR, "previousOwnerHistoryProof"] : ANCHOR);
       const key = input.ownerPublicKey;
       if (key?.type !== "public" || key.algorithm?.name !== "Ed25519"
         || !key.usages?.includes("verify") || !webCrypto?.subtle) deny();
@@ -124,14 +125,18 @@
 
       if (input.ownerHistoryCheckpoint !== null) {
         const checkpoint = input.ownerHistoryCheckpoint;
-        // This optional owner signature is checked against the same externally
-        // pinned SPKI, scope and digest. A lone non-genesis link is not trusted.
+        // A non-genesis checkpoint must present its *branded and verified*
+        // predecessor, which is tied recursively to a signed genesis. Never
+        // accept a self-reported prior hash or standalone sequence > 1.
         if (!ownerHistory?.verifyOwnerCheckpoint
-          || checkpoint?.sequence !== 1) deny();
+          || !Number.isSafeInteger(checkpoint?.sequence)
+          || checkpoint.sequence < 1
+          || (checkpoint.sequence !== 1 && (!priorProvided
+            || input.previousOwnerHistoryProof === null))) deny();
         const proof = await ownerHistory.verifyOwnerCheckpoint({
           checkpoint, scope: Object.fromEntries(SCOPE.map((name) => [name, grant[name]])),
           signerPublicKey: key, signerKeyId: from64(checkpoint.signer_key_id, 16),
-          previous: null,
+          previous: priorProvided ? input.previousOwnerHistoryProof : null,
         });
         if (proof.revision !== candidate.revision
           || proof.manifestDigest !== candidate.digest) deny();

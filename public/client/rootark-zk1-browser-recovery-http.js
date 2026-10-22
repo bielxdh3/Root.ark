@@ -63,7 +63,8 @@
     async function recoverFromProtectedGet(input) {
       let received, expectedCiphertext, digest, output;
       try {
-        exact(input, fields);
+        const hasHistory = Object.hasOwn(input || {}, "previousOwnerHistoryProof");
+        exact(input, hasHistory ? [...fields, "previousOwnerHistoryProof"] : fields);
         exact(input.expectedMetadata, metaFields);
         const meta = { ...input.expectedMetadata };
         const grant = input.signedDeviceGrant;
@@ -87,23 +88,19 @@
           || typeof input.origin !== "string"
           || typeof input.fetchImpl !== "function"
           || !Number.isSafeInteger(input.nowSeconds) || input.nowSeconds < 0) deny();
-        await floor.verifyExternalAnchor({
+        const ownerAnchor = {
           ownerPublicKey: input.ownerPublicKey,
           independentOwnerSpkiSha256: input.independentOwnerSpkiSha256,
           pinnedCurrentHead: input.pinnedCurrentHead,
           signedDeviceGrant: grant,
           ownerHistoryCheckpoint: input.ownerHistoryCheckpoint,
-        });
+          ...(hasHistory ? { previousOwnerHistoryProof: input.previousOwnerHistoryProof } : {}),
+        };
+        await floor.verifyExternalAnchor(ownerAnchor);
         // On browsers, no authenticated request may leave before a previously
         // provisioned local monotonic floor also agrees with the owner head.
         if (typeof window === "object") {
-          await floor.assertCurrent({
-            ownerPublicKey: input.ownerPublicKey,
-            independentOwnerSpkiSha256: input.independentOwnerSpkiSha256,
-            pinnedCurrentHead: input.pinnedCurrentHead,
-            signedDeviceGrant: grant,
-            ownerHistoryCheckpoint: input.ownerHistoryCheckpoint,
-          });
+          await floor.assertCurrent(ownerAnchor);
         }
         expectedCiphertext = from64(input.bundle?.ciphertextBase64,
           16, 4 * 1024 * 1024);
@@ -178,6 +175,7 @@
           || input.ownerHistoryCheckpoint === null
           || input.ownerRootCheckpoint === null) deny();
         const original = Object.fromEntries(fields.map((key) => [key, input[key]]));
+        original.previousOwnerHistoryProof = input.previousOwnerHistoryProof;
         const metadata = original.expectedMetadata;
         const grant = original.signedDeviceGrant;
         if (!metadata || !grant || scopes.some((name) =>
@@ -188,6 +186,7 @@
           pinnedCurrentHead: original.pinnedCurrentHead,
           signedDeviceGrant: grant,
           ownerHistoryCheckpoint: original.ownerHistoryCheckpoint,
+          previousOwnerHistoryProof: original.previousOwnerHistoryProof,
         });
         const signed = await ownerRoots.verifyOwnerCiphertextRootCheckpoint({
           checkpoint: input.ownerRootCheckpoint,

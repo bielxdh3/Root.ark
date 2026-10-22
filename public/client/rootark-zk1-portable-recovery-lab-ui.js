@@ -20,6 +20,18 @@
     if (bytes.length !== 32) deny();
     return bytes;
   }
+  function decodeSignerKeyId(value) {
+    if (typeof value !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(value)) deny();
+    let content;
+    try { content = atob(value.replace(/-/g, "+").replace(/_/g, "/") + "=="); }
+    catch (_) { deny(); }
+    const bytes = Uint8Array.from(content, (part) => part.charCodeAt(0));
+    let roundtrip = "";
+    for (const byte of bytes) roundtrip += String.fromCharCode(byte);
+    if (bytes.length !== 16 || btoa(roundtrip).replace(/\+/g, "-")
+      .replace(/\//g, "_").replace(/=+$/g, "") !== value) deny();
+    return bytes;
+  }
   function randomId() {
     const source = root.crypto.getRandomValues(new Uint8Array(16));
     let raw = "";
@@ -71,9 +83,32 @@
       const devicePrivateKey = await root.crypto.subtle.importKey(
         "pkcs8", privateDer, "Ed25519", false, ["sign"]);
       const grant = JSON.parse(text.decode(await fileBytes("device-grant", 1, 8192)));
-      const ownerHistoryCheckpoint = find("owner-history").files.length === 1
-        ? JSON.parse(text.decode(await fileBytes("owner-history", 1, 8192)))
-        : null;
+      let ownerHistoryCheckpoint = null;
+      let previousOwnerHistoryProof = null;
+      if (find("owner-history").files.length === 1) {
+        const imported = JSON.parse(text.decode(await fileBytes("owner-history", 1, 262144)));
+        // A portable JSON chain can be imported on a genuinely NEW device:
+        // private WeakMap proofs cannot be serialized, so verify genesis ->
+        // current in this browser session before using the final signed head.
+        const chain = Array.isArray(imported) ? imported : [imported];
+        if (chain.length < 1 || chain.length > 64
+          || !root.RootarkZk1OwnerSignedCheckpoint?.verifyOwnerCheckpoint) deny();
+        let prior = null;
+        for (let index = 0; index < chain.length; index++) {
+          const current = chain[index];
+          if (index === chain.length - 1) {
+            ownerHistoryCheckpoint = current;
+            previousOwnerHistoryProof = prior;
+          }
+          prior = await root.RootarkZk1OwnerSignedCheckpoint.verifyOwnerCheckpoint({
+            checkpoint: current,
+            scope: { account_id: grant.account_id, compartment_id: grant.compartment_id,
+              keyring_id: grant.keyring_id },
+            signerPublicKey: ownerPublicKey,
+            signerKeyId: decodeSignerKeyId(current.signer_key_id), previous: prior,
+          });
+        }
+      }
       return {
         ownerPublicKey,
         pinnedOwnerKeyHash: decode64(find("owner-hash").value.trim()),
@@ -81,6 +116,7 @@
         pinnedCurrentHead: { revision: count("head-revision"),
           digest: decode64(find("head-digest").value.trim()), epoch: count("head-epoch") },
         signedDeviceGrant: grant, ownerHistoryCheckpoint,
+        previousOwnerHistoryProof,
         devicePublicKey, devicePrivateKey,
         origin: root.location.origin + "/", fetchImpl: root.fetch.bind(root),
         nowSeconds: Math.floor(Date.now() / 1000),
@@ -105,6 +141,7 @@
       pinnedCurrentHead: ctx.pinnedCurrentHead,
       signedDeviceGrant: ctx.signedDeviceGrant,
       ownerHistoryCheckpoint: ctx.ownerHistoryCheckpoint,
+      previousOwnerHistoryProof: ctx.previousOwnerHistoryProof,
     });
   }
   function signer(ctx) {
@@ -207,7 +244,7 @@
         ownerRootCheckpoint,
         ownerSignerKeyId: ownerRootCheckpoint.signer_key_id,
         ownerDeviceId: ownerRootCheckpoint.device_id,
-        previousOwnerHistoryProof: null,
+        previousOwnerHistoryProof: ctx.previousOwnerHistoryProof,
       });
       download(opened.name, opened.data, opened.mediaType || "application/octet-stream");
       status.textContent = "GET protegido, assinatura da raiz do proprietário e abertura local concluídos. Nenhuma CEK foi enviada ao servidor.";

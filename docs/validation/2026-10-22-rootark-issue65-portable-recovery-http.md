@@ -25,6 +25,14 @@ not a production or release authorization. No merge, deploy, or data migration.
   local key release. A missing/forged owner checkpoint is rejected **before
   any network request**. The lower-level manual-root recovery helper remains
   explicitly non-authorizing for synthetic/controlled callers.
+- A recovered owner history may contain **1 to 64 successive signed
+  checkpoints** in a JSON array. The browser independently reconstructs
+  ephemeral branded proofs from signed genesis through each successor, pins
+  the same owner public key/signer identity and checks the latest checkpoint
+  against the currently provisioned manifest head. Missing predecessors,
+  forged intermediate signatures or a standalone sequence 2+ fail closed.
+  Signer key IDs have their own strict 16-byte canonical decoder; the 32-byte
+  trust-pin decoder is not relaxed.
 - Historical GET requests sign the **current** device grant/head/epoch while
   expecting exact object revision, old ciphertext epoch, SHA-256 and pinned
   ciphertext root. The protected store's latest signed witness/head and current
@@ -41,7 +49,8 @@ Tests: `test/issue-65-portable-file-recovery.test.js` and
 The latter includes real localhost Express protected PUT/GET, archived rev1
 after epoch rotation, rev2, subsequent revocation, invalid owner root/history
 signature rejection before HTTP, and a **real Microsoft Edge WebCrypto +
-IndexedDB + CSP** UI publish/restore sequence with signed owner root.
+IndexedDB + CSP** UI publish/restore sequence with a two-checkpoint signed
+owner-history chain and signed ciphertext root.
 Related tests cover owner-authorized ciphertext import and the owner-grant floor.
 
 ## Unresolved trust boundaries

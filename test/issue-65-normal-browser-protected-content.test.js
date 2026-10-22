@@ -285,6 +285,25 @@ test("new browser session opens an owner-pinned ciphertext through real signed H
   assert.equal(signedRecovery.ownerSignedHistoricalRootVerified, true);
   assert.equal(signedRecovery.externalOwnerKeyOriginVerifiedByModule, false);
   signedRecovery.data.fill(0);
+  const firstOwnerHistoryProof = await ownerHistory.verifyOwnerCheckpoint({
+    checkpoint: ownerHistoryCheckpoint, scope: signer.scope,
+    signerPublicKey: opts.ownerPublicKey, signerKeyId: rootSignerKeyId,
+    previous: null,
+  });
+  const secondOwnerHistoryCheckpoint = await ownerHistory.signOwnerCheckpoint({
+    scope: signer.scope, signerKey: ownerSigner, signerPublicKey: opts.ownerPublicKey,
+    signerKeyId: rootSignerKeyId, deviceId: ownerDeviceId,
+    revision: opts.pinnedCurrentHead.revision,
+    manifestDigest: opts.pinnedCurrentHead.digest,
+    issuedAt: opts.nowSeconds + 1, previous: firstOwnerHistoryProof,
+  });
+  const secondHistoryRequest = { ...signedRequest,
+    ownerHistoryCheckpoint: secondOwnerHistoryCheckpoint,
+    previousOwnerHistoryProof: firstOwnerHistoryProof };
+  const secondHistoryResult = await browserRestore.recoverFromOwnerSignedProtectedGet(
+    secondHistoryRequest);
+  assert.equal(secondHistoryResult.ownerSignedHistoricalRootVerified, true);
+  secondHistoryResult.data.fill(0);
   let badProofReachedNetwork = 0;
   const denySignedProof = (changes) => assert.rejects(
     browserRestore.recoverFromOwnerSignedProtectedGet({
@@ -296,6 +315,10 @@ test("new browser session opens an owner-pinned ciphertext through real signed H
   await denySignedProof({ ownerDeviceId: "forged-owner" });
   await denySignedProof({ ownerSignerKeyId: crypto.randomBytes(16).toString("base64url") });
   await denySignedProof({ ownerHistoryCheckpoint: null });
+  await denySignedProof({ ownerHistoryCheckpoint: secondOwnerHistoryCheckpoint,
+    previousOwnerHistoryProof: null });
+  await denySignedProof({ ownerHistoryCheckpoint: secondOwnerHistoryCheckpoint,
+    previousOwnerHistoryProof: { signedCheckpointVerified: true } });
   await denySignedProof({ independentlyPinnedCiphertextRoot: crypto.randomBytes(32) });
   assert.equal(badProofReachedNetwork, 0, "invalid owner history/root never contacts server");
   for (const bad of [
@@ -522,6 +545,13 @@ if(status.includes("Ciphertext conferido")){
     scope:v.scope,signerKey:signer,signerPublicKey:signedOwnerPublic,
     signerKeyId:ownerKeyId,deviceId:"test-independent-owner",revision:v.pin.revision,
     manifestDigest:decode(v.pin.digest),issuedAt:v.now,previous:null});
+  const proof1=await window.RootarkZk1OwnerSignedCheckpoint.verifyOwnerCheckpoint({
+    checkpoint:historyCheckpoint,scope:v.scope,signerPublicKey:signedOwnerPublic,
+    signerKeyId:ownerKeyId,previous:null});
+  const historyCheckpoint2=await window.RootarkZk1OwnerSignedCheckpoint.signOwnerCheckpoint({
+    scope:v.scope,signerKey:signer,signerPublicKey:signedOwnerPublic,
+    signerKeyId:ownerKeyId,deviceId:"test-independent-owner",revision:v.pin.revision,
+    manifestDigest:decode(v.pin.digest),issuedAt:v.now+1,previous:proof1});
   const checkpoint=await window.RootarkZk1OwnerCiphertextRootCheckpoint.signOwnerCiphertextRootCheckpoint({
     scope:v.scope,signerKey:signer,signerKeyId:ownerKeyId,deviceId:"test-independent-owner",
     manifestRevision:v.pin.revision,manifestDigest:decode(v.pin.digest),
@@ -532,7 +562,7 @@ if(status.includes("Ciphertext conferido")){
   inputFile("device-private",decode(v.privateDer),"device.pkcs8");
   inputFile("portable-secret",secret,"saved-secret.bin");
   inputFile("portable-bundle",new TextEncoder().encode(JSON.stringify(generatedBundle)),"bundle.json");
-  inputFile("owner-history",new TextEncoder().encode(JSON.stringify(historyCheckpoint)),"owner-history.json");
+  inputFile("owner-history",new TextEncoder().encode(JSON.stringify([historyCheckpoint,historyCheckpoint2])),"owner-history.json");
   inputFile("portable-owner-root",new TextEncoder().encode(JSON.stringify(checkpoint)),"owner-root.json");
   document.getElementById("portable-restore").click();
   let restored=false;
