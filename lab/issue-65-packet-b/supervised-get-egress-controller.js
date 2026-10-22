@@ -17,6 +17,8 @@ const { isVerifiedZk1PhysicalStopRecorder } =
   require("../../src/services/zk1SharedPgPhysicalStopRecorder");
 const { Zk1SharedPgSealedGetReader } =
   require("../../src/services/zk1SharedPgSealedGetReader");
+const { Zk1SharedPgWitnessCasEgressGuard } =
+  require("../../src/services/zk1SharedPgWitnessCasEgressGuard");
 
 function deny() {
   const error = new Error("ZK_LAB_GET_DENIED");
@@ -78,7 +80,8 @@ function pubkeyEquals(a, b) {
       b.export({ format: "der", type: "spki" }));
 }
 class Zk1LabSupervisedGetEgress {
-  constructor({ gate, supervisor, recorder, ciphertextReader, expectedRootHash } = {}) {
+  constructor({ gate, supervisor, recorder, ciphertextReader, expectedRootHash,
+    quorumGuard } = {}) {
     if (!(gate instanceof Zk1SharedPgGateAuthority)
       || !(supervisor instanceof Zk1IsolatedProcessStopSupervisor)
       || !isVerifiedZk1PhysicalStopRecorder(recorder)
@@ -91,10 +94,14 @@ class Zk1LabSupervisedGetEgress {
       || (ciphertextReader !== undefined && (
         !(ciphertextReader instanceof Zk1SharedPgSealedGetReader)
         || ciphertextReader.gate !== gate))) deny();
+    if (quorumGuard !== undefined && (
+      !(quorumGuard instanceof Zk1SharedPgWitnessCasEgressGuard)
+      || !ciphertextReader || !expectedRootHash)) deny();
     this.gate = gate;
     this.supervisor = supervisor;
     this.recorder = recorder;
     this.ciphertextReader = ciphertextReader;
+    this.quorumGuard = quorumGuard;
     this.expectedRootHash = expectedRootHash === undefined
       ? null : bytes(expectedRootHash, 32);
     this.phase = "new";
@@ -118,6 +125,10 @@ class Zk1LabSupervisedGetEgress {
     if (!Buffer.isBuffer(bytes) || bytes.length !== 16384) deny();
     return bytes;
   }
+  async #verifyQuorum() {
+    if (this.quorumGuard) await this.quorumGuard.authorize({
+      io: this.io, expectedRootHash: this.expectedRootHash });
+  }
 
   async #admitGet() {
     const allowed = () => this.phase === "listening" && !this.stopping
@@ -131,7 +142,9 @@ class Zk1LabSupervisedGetEgress {
         processPid: this.process.processPid });
       if (!allowed() || !decision.proceed || !decision.admissionId.equals(this.admissionId)
         || decision.generation !== this.generation) return this.#denyIncoming();
+      await this.#verifyQuorum();
       const ciphertext = await this.#readCiphertext(0);
+      await this.#verifyQuorum();
       if (!allowed()) return this.#denyIncoming();
       this.supervisor.assertLive({ processEpoch: this.process.processEpoch });
       this.#send({ kind: "grant-get", ciphertextBase64: ciphertext.toString("base64url") });
@@ -154,6 +167,7 @@ class Zk1LabSupervisedGetEgress {
     this.phase = "starting";
     this.io = io;
     try {
+      await this.#verifyQuorum();
       this.process = this.supervisor.launch({ scope: io.scope,
         workerId: io.workerId, principal: io.principal });
       this.session = this.supervisor.sessions.get(this.process.processEpoch.toString("hex"));
@@ -205,6 +219,7 @@ class Zk1LabSupervisedGetEgress {
         processPid: this.process.processPid });
       if (!current.proceed || !current.admissionId.equals(this.admissionId)
         || current.generation !== this.generation) deny();
+      await this.#verifyQuorum();
       this.supervisor.assertLive({ processEpoch: this.process.processEpoch });
       this.phase = "listening";
       return Object.freeze({ port, token: this.token,
@@ -235,7 +250,9 @@ class Zk1LabSupervisedGetEgress {
       processPid: this.process.processPid });
     if (this.stopping || !decision.proceed || !decision.admissionId.equals(this.admissionId)
       || decision.generation !== this.generation) deny();
+    await this.#verifyQuorum();
     const ciphertext = await this.#readCiphertext(1);
+    await this.#verifyQuorum();
     if (this.stopping) deny();
     this.supervisor.assertLive({ processEpoch: this.process.processEpoch });
     this.partial = false;

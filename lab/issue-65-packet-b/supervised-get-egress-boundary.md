@@ -86,3 +86,55 @@ PostgreSQL row-lock release happens before the socket write. A cross-host
 buffered TCP ciphertext can remain deliverable after physical STOP. There is
 no multi-host supervisor reconciliation, mTLS GET endpoint, remote provider
 read, foreign-host physical process attestation or failover guarantee.
+
+## 22 October — optional independently signed owner/CAS quorum on supervised GET
+
+The separately constructed `Zk1SharedPgWitnessCasEgressGuard` extends this
+disposable **development-only** GET experiment. Its authority inputs are an
+externally pinned SHA-256 of the owner's Ed25519 SPKI bytes, the matching
+owner-public SPKI, the exact owner-signed ciphertext-root checkpoint, the
+linked signed owner manifest-history checkpoint, the operator-pinned expected
+scope/revision/digest/epoch/root, and a fixed CAS witness floor.
+
+At setup the guard imports the operator-pinned public key, checks its digest,
+verifies the full owner history and ciphertext-root signatures using the
+existing browser-compatible verification helper, binds a snapshot of the
+signed root, and checks a fresh nonce-signed remote CAS witness head using
+an **independently configured mTLS client** with CA, TLS fingerprint, witness
+Ed25519 key and witness/status key IDs. Every GET launch and both physical
+ciphertext frames then require another pinned, fresh witness signed head plus
+the existing PostgreSQL `OPEN`/generation/admission/readback checks. Any CAS
+floor advance, wrong root, changed epoch-linked owner proof, wrong SPKI pin,
+TLS peer swap or disconnected witness closes authorization before the next
+frame. The gate's physical STOP, independently signed OS `exit`+`close`
+receipt and `PENDING` drain remain mandatory after a failed transfer.
+
+The adversarial test uses a **real separate Node OS process** running the
+existing `Zk1WitnessCasAnchorFloor` on a private SQLite journal and real
+mTLS listener. This process owns the witness signing key. It accepts only a
+separate scoped service certificate to request nonce-bound signed CAS heads;
+the principal is never granted a recovery/IO role. A legitimate CAS signed
+journal append advances that floor and fences the paused TCP GET response.
+Bad SPKI, tampered owner signature, wrong object/scope/revision/root, lost
+witness process and changed floor are tested. Fixture TLS certificates, owner
+keys and SQLite journals are temporary and deleted after the test.
+
+**Remaining security limits:** owner SPKI digest and expected CAS floor come
+from trusted fixture provisioning, not an established production owner
+enrollment or distributed key-rotation protocol. The test runs separate
+processes and distinct PostgreSQL roles/pools but not separately administered
+machines, TLS GET/PUT gateway nodes, or independent disaster-recovery zones.
+The witness floor is a **global monotonic change fence**, not a positive
+signature authorizing a specific device. Signed, active-device/revocation
+history, signer epoch membership, witness/CAS terminal-status agreement,
+external anchor persistence after compromise, bounded authorization lifetime
+and product GET/PUT routing are outside this step. The socket write still
+occurs after PG commits/row locks are released; a grant could race a STOP
+before the next mTLS/SQL check. Bytes already issued may remain buffered in
+the OS or network. **This does not establish zero-byte egress atomicity or
+authorize production use.**
+
+Local dependency limitation: the workstation's WSL Node 22 resolves the
+Windows-compiled `better-sqlite3` addon (`invalid ELF header`); the three
+new cross-process SQLite witness cases automatically skip if native SQLite
+cannot open. The original eight PostgreSQL egress/STOP cases remain active.

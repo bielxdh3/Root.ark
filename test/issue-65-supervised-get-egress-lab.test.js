@@ -5,6 +5,9 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const http = require("node:http");
 const path = require("node:path");
+const fs = require("node:fs");
+const os = require("node:os");
+const { fork } = require("node:child_process");
 const { Pool } = require("pg");
 const { Zk1SharedPgGateAuthority } = require("../src/services/zk1SharedPgGateAuthority");
 const { Zk1IsolatedProcessStopSupervisor } = require("../src/services/zk1IsolatedProcessStopSupervisor");
@@ -13,9 +16,24 @@ const { Zk1SharedPgSealedObjectStore } = require("../src/services/zk1SharedPgSea
 const { Zk1SharedPgSealedGetReader } = require("../src/services/zk1SharedPgSealedGetReader");
 const { computeZk1CiphertextRoot } = require("../src/crypto/rootark-zk-chunk-root-v1");
 const { Zk1LabSupervisedGetEgress } = require("../lab/issue-65-packet-b/supervised-get-egress-controller");
+const { Zk1SharedPgWitnessCasEgressGuard } =
+  require("../src/services/zk1SharedPgWitnessCasEgressGuard");
+const { Zk1WitnessCasAnchorHttpsClient } =
+  require("../src/services/zk1WitnessCasAnchorHttpsClient");
+const { generateNativeFixtureCertificates } =
+  require("./support/issue-65-native-openssl-fixture");
+const ownerRoots = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
+const ownerHistory = require("../public/client/rootark-zk1-owner-signed-checkpoint");
 
 const enabled = Boolean(process.env.ROOTARK_ZK1_TEST_PG_URL
   && process.env.ROOTARK_ZK1_RUNTIME_PG_URL && process.env.ROOTARK_ZK1_STOP_PG_URL);
+// The test requires a genuine native SQLite implementation in the separate
+// witness process. A Windows .node addon mounted into WSL cannot load as ELF.
+const nativeWitnessSqliteReady = (() => {
+  try { const Database = require("better-sqlite3");
+    const db = new Database(":memory:"); db.close(); return true; }
+  catch (_) { return false; }
+})();
 
 const key = (scope) => scope.account_id.toString("hex") + ":"
   + scope.compartment_id.length.toString(16) + ":" + scope.compartment_id.toString("hex");
@@ -95,6 +113,138 @@ async function seedActualSealedCiphertext(c) {
     admissionId: admitted.admissionId })).status, "FINISHED");
   return { chunks, rootHash };
 }
+
+function onceChild(child, kind, timeoutMs = 25000) {
+  return new Promise((resolve, reject) => {
+    let lastStage = "spawn";
+    const finish = () => { clearTimeout(timeout); child.off("message", onMessage);
+      child.off("exit", onExit); child.off("error", onExit); };
+    const onMessage = (message) => {
+      if (message?.kind === "stage") { lastStage = message.step; return; }
+      if (message?.kind === "failed") { finish(); reject(Error("fixture witness unavailable at " + message.stage)); }
+      if (message?.kind === kind) { finish(); resolve(message); }
+    };
+    const onExit = () => { finish(); reject(Error("fixture witness exited at " + lastStage)); };
+    const timeout = setTimeout(onExit, timeoutMs);
+    child.on("message", onMessage);
+    child.once("exit", onExit);
+    child.once("error", onExit);
+  });
+}
+
+async function isolatedWitness(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-quorum-witness-"));
+  generateNativeFixtureCertificates(dir, { caSubject: "Quorum Lab CA",
+    servers: ["server"], clients: ["allowed", "denied"] });
+  const child = fork(path.join(__dirname, "support/issue-65-mtls-quorum-child.js"), [], {
+    stdio: ["ignore", "ignore", "ignore", "ipc"],
+    windowsHide: true, execArgv: [],
+    env: { NODE_ENV: "test", NODE_PATH: process.env.NODE_PATH || "",
+      SystemRoot: process.env.SystemRoot || "" },
+  });
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    if (!child.killed) child.disconnect();
+    await new Promise((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) return resolve();
+      child.once("close", resolve);
+      setTimeout(resolve, 5000).unref();
+    });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  const ready = onceChild(child, "listening");
+  child.send({ kind: "init", dir });
+  const started = await ready;
+  const read = (name) => fs.readFileSync(path.join(dir, name));
+  const config = { endpoint: `https://localhost:${started.port}`,
+    ca: read("ca.pem"), clientKey: read("allowed.key"),
+    clientCert: read("allowed.pem"),
+    serverFingerprint256: new crypto.X509Certificate(read("server.pem")).fingerprint256,
+    pinnedWitnessPublicKey: crypto.createPublicKey({ key: Buffer.from(started.witnessSpki, "base64url"),
+      format: "der", type: "spki" }),
+    pinnedWitnessKeyId: Buffer.from(started.witnessKeyId, "base64url"),
+    pinnedStatusKeyId: Buffer.from(started.statusKeyId, "base64url"),
+    headTimeoutMs: 6000 };
+  const client = new Zk1WitnessCasAnchorHttpsClient(config);
+  const genesis = await client.freshHead();
+  assert.deepEqual(genesis, { sequence: 0, lastHash: "0".repeat(64) });
+  return { child, client, config, genesis,
+    async advance() { const progressed = onceChild(child, "advanced");
+      child.send({ kind: "advance" }); return progressed; } };
+}
+
+async function signedRootFor(c, root) {
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const ownerPublicSpki = signer.publicKey.export({ format: "der", type: "spki" });
+  const privateKey = await crypto.webcrypto.subtle.importKey("pkcs8",
+    signer.privateKey.export({ format: "der", type: "pkcs8" }),
+    "Ed25519", false, ["sign"]);
+  const publicKey = await crypto.webcrypto.subtle.importKey("spki",
+    ownerPublicSpki, "Ed25519", false, ["verify"]);
+  const scope = Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+    .map((name) => [name, c.scope[name].toString("base64url")]));
+  const signerKeyId = crypto.randomBytes(16);
+  const ownerHistoryCheckpoint = await ownerHistory.signOwnerCheckpoint({
+    scope, signerKey: privateKey, signerPublicKey: publicKey,
+    signerKeyId, deviceId: "fixture-owner", revision: c.io.revision,
+    manifestDigest: c.io.digest, issuedAt: 101, previous: null });
+  const checkpoint = await ownerRoots.signOwnerCiphertextRootCheckpoint({
+    scope, signerKey: privateKey, signerKeyId, deviceId: "fixture-owner",
+    manifestRevision: c.io.revision, manifestDigest: c.io.digest,
+    manifestEpoch: 2, objectId: c.io.objectId,
+    objectRevision: c.io.revision, ciphertextEpoch: 1,
+    ciphertextRoot: root, issuedAt: 102 });
+  return { ownerPublicSpki,
+    externallyPinnedOwnerSpkiSha256: crypto.createHash("sha256").update(ownerPublicSpki).digest(),
+    ownerProofInput: { checkpoint, ownerHistoryCheckpoint,
+      previousHistoryProof: null,
+      pinnedOwner: { scope, deviceId: "fixture-owner", signerKeyId,
+        publicKey },
+      expected: { manifestRevision: c.io.revision, manifestDigest: Buffer.from(c.io.digest),
+        manifestEpoch: 2, objectId: c.io.objectId,
+        objectRevision: c.io.revision, ciphertextEpoch: 1,
+        ciphertextRoot: Buffer.from(root) } } };
+}
+
+test("separate OS witness signer retains real mTLS nonce-signed CAS floor and exact external owner SPKI pin", {
+  skip: !nativeWitnessSqliteReady && "native witness SQLite addon unavailable in this Node environment",
+}, async (t) => {
+  const scope = { account_id: crypto.randomBytes(16),
+    compartment_id: Buffer.from("quorum-unit"), keyring_id: crypto.randomBytes(16) };
+  const io = { scope, workerId: crypto.randomBytes(16),
+    principal: "AB:".repeat(31) + "AB", action: "get",
+    objectId: crypto.randomBytes(16).toString("base64url"),
+    revision: 7, digest: crypto.randomBytes(32) };
+  const root = crypto.randomBytes(32);
+  const trust = await signedRootFor({ scope, io }, root);
+  const witness = await isolatedWitness(t);
+  const config = { witness: witness.client, witnessFloor: witness.genesis, ...trust };
+  const guard = await Zk1SharedPgWitnessCasEgressGuard.establish(config);
+  assert.equal(await guard.authorize({ io, expectedRootHash: root }), true);
+  const racingTrust = await signedRootFor({ scope, io }, root);
+  const changingClient = new Zk1WitnessCasAnchorHttpsClient(witness.config);
+  const originalFresh = changingClient.freshHead.bind(changingClient);
+  changingClient.freshHead = async (minimum) => {
+    const answer = await originalFresh(minimum);
+    racingTrust.ownerProofInput.expected.ciphertextRoot.fill(0);
+    racingTrust.ownerProofInput.expected.manifestDigest.fill(0);
+    racingTrust.ownerProofInput.pinnedOwner.scope.account_id = crypto.randomBytes(16).toString("base64url");
+    return answer;
+  };
+  const raceSafe = await Zk1SharedPgWitnessCasEgressGuard.establish({
+    ...racingTrust, witness: changingClient, witnessFloor: witness.genesis });
+  assert.equal(await raceSafe.authorize({ io, expectedRootHash: root }), true,
+    "caller mutation across a signed-head await cannot retarget verified owner ciphertext");
+  for (const attack of [
+    { io: { ...io, objectId: crypto.randomBytes(16).toString("base64url") }, expectedRootHash: root },
+    { io: { ...io, revision: 8 }, expectedRootHash: root },
+    { io: { ...io, scope: { ...scope, keyring_id: crypto.randomBytes(16) } }, expectedRootHash: root },
+    { io, expectedRootHash: crypto.randomBytes(32) },
+  ]) await assert.rejects(guard.authorize(attack), /ZK_LAB_QUORUM_UNAVAILABLE/);
+  assert.equal((await witness.advance()).sequence, 1);
+  await assert.rejects(guard.authorize({ io, expectedRootHash: root }),
+    /ZK_LAB_QUORUM_UNAVAILABLE/);
+});
 
 function request(port, token, method = "GET", url = "/fixture-ciphertext") {
   return new Promise((resolve, reject) => {
@@ -402,4 +552,72 @@ test("GET gate connection loss denies further physical ciphertext; surviving gat
   assert.equal((await c.gate.markPending(c.reservation)).status, "PENDING");
   assert.deepEqual(await stream.drain(), chunks[0],
     "a disconnected GET host cannot send its second SQL-validated physical frame");
+});
+
+test("independent witness/CAS mTLS process plus externally SPKI-pinned owner history gates real physical ciphertext", {
+  skip: !enabled ? "disposable PostgreSQL fixture required"
+    : !nativeWitnessSqliteReady && "native witness SQLite addon unavailable in this Node environment",
+}, async (t) => {
+  const c = await context(t);
+  const { chunks, rootHash } = await seedActualSealedCiphertext(c);
+  const trust = await signedRootFor(c, rootHash);
+  const witness = await isolatedWitness(t);
+  const pin = { witness: witness.client, witnessFloor: witness.genesis, ...trust };
+  const guard = await Zk1SharedPgWitnessCasEgressGuard.establish(pin);
+  await assert.rejects(Zk1SharedPgWitnessCasEgressGuard.establish({ ...pin,
+    externallyPinnedOwnerSpkiSha256: crypto.randomBytes(32) }), /ZK_LAB_QUORUM_UNAVAILABLE/,
+  "wrong operator SPKI fingerprint must reject before PG/HTTP GET");
+  await assert.rejects(Zk1SharedPgWitnessCasEgressGuard.establish({ ...pin,
+    ownerProofInput: { ...trust.ownerProofInput,
+      checkpoint: { ...trust.ownerProofInput.checkpoint, ciphertext_root:
+        crypto.randomBytes(32).toString("base64url") } } }),
+  /ZK_LAB_QUORUM_UNAVAILABLE/, "tampered signed historical root is rejected");
+  const controller = new Zk1LabSupervisedGetEgress({ gate: c.gate,
+    supervisor: c.supervisor, recorder: c.controller.recorder,
+    ciphertextReader: new Zk1SharedPgSealedGetReader({ gate: c.gate }),
+    expectedRootHash: rootHash, quorumGuard: guard });
+  const opened = await controller.begin(c.io);
+  assert.ok(opened.child.pid !== witness.child.pid, "GET and witness must have different real OS PIDs");
+  const stream = await pausedRequest(opened.port, opened.token);
+  await controller.waitPartial();
+  assert.deepEqual(stream.chunks[0], chunks[0]);
+  assert.equal((await witness.advance()).sequence, 1,
+    "real signed CAS append advances the independent SQLite witness floor");
+  await assert.rejects(guard.authorize({ io: c.io, expectedRootHash: rootHash }),
+    /ZK_LAB_QUORUM_UNAVAILABLE/, "floor change invalidates old trusted grants");
+  await assert.rejects(controller.continueResponse(), /ZK_LAB_QUORUM_UNAVAILABLE/,
+    "a current PG OPEN head is insufficient after independently signed witness advancement");
+  const q = await c.gate.beginQuiesce(c.reservation);
+  assert.equal(q.state, "QUIESCING");
+  await assert.rejects(c.gate.markPending(c.reservation), /ZK_GATE_DRAIN_INCOMPLETE/);
+  assert.equal((await controller.beginQuiesce(c.reservation)).state, "QUIESCING");
+  assert.equal((await controller.finishAfterQuiesce()).status, "FINISHED");
+  assert.equal((await c.gate.markPending(c.reservation)).status, "PENDING");
+  assert.deepEqual(await stream.drain(), chunks[0],
+    "no second ciphertext frame reaches a slow client after signed CAS floor changes");
+});
+
+test("independent witness mTLS partition and peer-pin substitution deny physical GET admission", {
+  skip: !enabled ? "disposable PostgreSQL fixture required"
+    : !nativeWitnessSqliteReady && "native witness SQLite addon unavailable in this Node environment",
+}, async (t) => {
+  const c = await context(t);
+  const { rootHash } = await seedActualSealedCiphertext(c);
+  const trust = await signedRootFor(c, rootHash);
+  const witness = await isolatedWitness(t);
+  const pin = { witness: witness.client, witnessFloor: witness.genesis, ...trust };
+  await assert.rejects(Zk1SharedPgWitnessCasEgressGuard.establish({ ...pin,
+    witness: new Zk1WitnessCasAnchorHttpsClient({ ...witness.config,
+      serverFingerprint256: "00:".repeat(31) + "00", headTimeoutMs: 1200 }) }),
+  /ZK_LAB_QUORUM_UNAVAILABLE/, "mTLS transport pin cannot be replaced by a valid-looking HTTP body");
+  const guard = await Zk1SharedPgWitnessCasEgressGuard.establish(pin);
+  witness.child.kill("SIGKILL");
+  await new Promise((resolve) => witness.child.once("close", resolve));
+  const controller = new Zk1LabSupervisedGetEgress({ gate: c.gate,
+    supervisor: c.supervisor, recorder: c.controller.recorder,
+    ciphertextReader: new Zk1SharedPgSealedGetReader({ gate: c.gate }),
+    expectedRootHash: rootHash, quorumGuard: guard });
+  await assert.rejects(controller.begin(c.io), /ZK_LAB_QUORUM_UNAVAILABLE|ZK_LAB_GET_DENIED/);
+  assert.equal(c.supervisor.sessions.size, 1,
+    "the only supervised process is the already stopped PUT; failed GET never launches socket child");
 });
