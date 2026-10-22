@@ -166,8 +166,11 @@
       let ciphertext = null;
       let checkedData = null;
       try {
+        const hasPreviousOwnerHistoryProof = Object.hasOwn(input || {},
+          "previousOwnerHistoryProof");
         exact(input, browserRuntime
-          ? [...inputFields, "independentOwnerSpkiSha256", "ownerHistoryCheckpoint"]
+          ? [...inputFields, "independentOwnerSpkiSha256", "ownerHistoryCheckpoint",
+            ...(hasPreviousOwnerHistoryProof ? ["previousOwnerHistoryProof"] : [])]
           : inputFields);
         exact(input.metadata, metadataFields);
         const metadata = { ...input.metadata };
@@ -212,6 +215,8 @@
             pinnedCurrentHead: input.pinnedCurrentHead,
             signedDeviceGrant: input.signedDeviceGrant,
             ownerHistoryCheckpoint: input.ownerHistoryCheckpoint,
+            ...(hasPreviousOwnerHistoryProof
+              ? { previousOwnerHistoryProof: input.previousOwnerHistoryProof } : {}),
           });
         };
         await checkFloor();

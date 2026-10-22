@@ -35,6 +35,19 @@
     if (bytes.length !== 32) fail();
     return bytes;
   }
+  function signerIdFrom64(value) {
+    if (typeof value !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(value)) fail();
+    let text;
+    try { text = atob(value.replace(/-/g, "+").replace(/_/g, "/") + "=="); }
+    catch (_) { fail(); }
+    const result = Uint8Array.from(text, (char) => char.charCodeAt(0));
+    let check = "";
+    for (const byte of result) check += String.fromCharCode(byte);
+    if (result.length !== 16
+      || btoa(check).replace(/\+/g, "-").replace(/\//g, "_")
+        .replace(/=+$/g, "") !== value) fail();
+    return result;
+  }
   function positive(name) {
     const raw = field(name)?.value;
     if (typeof raw !== "string" || !/^[1-9][0-9]*$/.test(raw)) fail();
@@ -60,8 +73,34 @@
     const signedDeviceGrant = JSON.parse(decoder.decode(await fileBytes("grant", 1, 8192)));
     const histories = field("history")?.files;
     if (!histories || histories.length > 1) fail();
-    const ownerHistoryCheckpoint = histories.length
-      ? JSON.parse(decoder.decode(await fileBytes("history", 1, 8192))) : null;
+    let ownerHistoryCheckpoint = null;
+    let previousOwnerHistoryProof = null;
+    if (histories.length) {
+      // Imported chain works on a completely new device. Verified predecessor
+      // proofs have private WeakMap state, so a deserialized "verified:true"
+      // flag is insufficient. Reverify every signature from genesis here.
+      const provided = JSON.parse(decoder.decode(await fileBytes("history", 1, 262144)));
+      const chain = Array.isArray(provided) ? provided : [provided];
+      if (chain.length < 1 || chain.length > 64
+        || !window.RootarkZk1OwnerSignedCheckpoint?.verifyOwnerCheckpoint) fail();
+      let prior = null;
+      for (let index = 0; index < chain.length; index++) {
+        const checkpoint = chain[index];
+        if (index === chain.length - 1) {
+          ownerHistoryCheckpoint = checkpoint;
+          previousOwnerHistoryProof = prior;
+        }
+        prior = await window.RootarkZk1OwnerSignedCheckpoint.verifyOwnerCheckpoint({
+          checkpoint,
+          scope: { account_id: signedDeviceGrant.account_id,
+            compartment_id: signedDeviceGrant.compartment_id,
+            keyring_id: signedDeviceGrant.keyring_id },
+          signerPublicKey: ownerPublicKey,
+          signerKeyId: signerIdFrom64(checkpoint.signer_key_id),
+          previous: prior,
+        });
+      }
+    }
     return {
       ownerPublicKey,
       pinnedOwnerKeyHash: from64(field("owner-hash").value.trim()),
@@ -73,6 +112,7 @@
       },
       signedDeviceGrant,
       ownerHistoryCheckpoint,
+      previousOwnerHistoryProof,
     };
   }
   function randomId() {
@@ -128,7 +168,7 @@
       + '<label>Digest da revisão (pin externo)<input type="text" data-zk1-field="digest" maxlength="43" required spellcheck="false"></label>'
       + '<label>Época atual confirmada fora do servidor<input type="number" min="1" step="1" data-zk1-field="epoch" required></label>'
       + '<label>Grant do dispositivo assinado (.json)<input type="file" data-zk1-field="grant" accept=".json,application/json" required></label>'
-      + '<label>Checkpoint histórico assinado (.json, opcional)<input type="file" data-zk1-field="history" accept=".json,application/json"></label>'
+      + '<label>Histórico do proprietário assinado: checkpoint ou cadeia ordenada desde gênese (.json, até 64)<input type="file" data-zk1-field="history" accept=".json,application/json"></label>'
       + '<label>Chave pública do dispositivo (Ed25519 raw)<input type="file" data-zk1-field="device" required></label>'
       + '<label>Chave privada do dispositivo (PKCS#8, local)<input type="file" data-zk1-field="private" required></label>'
       + '<label>Arquivo descartável (até 2 MiB)<input type="file" data-zk1-field="file" required></label>'
@@ -170,6 +210,7 @@
           pinnedCurrentHead: trust.pinnedCurrentHead,
           signedDeviceGrant: trust.signedDeviceGrant,
           ownerHistoryCheckpoint: trust.ownerHistoryCheckpoint,
+          previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
         });
         status(result.initialProvision ? "Âncora offline provisionada neste navegador."
           : "Piso local verificado/avançado. Confira os pins atuais fora do servidor.");

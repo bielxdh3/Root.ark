@@ -743,6 +743,31 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
   const f = await setup(t);
   const opts = await f.options();
   const secret = crypto.randomBytes(32).toString("hex");
+  const ownerPrivate = await crypto.webcrypto.subtle.importKey("pkcs8",
+    f.ownerPrivate.export({ type: "pkcs8", format: "der" }),
+    "Ed25519", false, ["sign"]);
+  const ownerHistoryKeyId = crypto.randomBytes(16);
+  const historicalScope = Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+    .map((key) => [key, opts.signedDeviceGrant[key]]));
+  const genesisCheckpoint = await ownerHistory.signOwnerCheckpoint({
+    scope: historicalScope, signerKey: ownerPrivate,
+    signerPublicKey: opts.ownerPublicKey, signerKeyId: ownerHistoryKeyId,
+    deviceId: "authenticated-workspace-owner", revision: opts.pinnedCurrentHead.revision,
+    manifestDigest: opts.pinnedCurrentHead.digest, issuedAt: opts.nowSeconds,
+    previous: null,
+  });
+  const trustedGenesis = await ownerHistory.verifyOwnerCheckpoint({
+    checkpoint: genesisCheckpoint, scope: historicalScope,
+    signerPublicKey: opts.ownerPublicKey, signerKeyId: ownerHistoryKeyId,
+    previous: null,
+  });
+  const successorCheckpoint = await ownerHistory.signOwnerCheckpoint({
+    scope: historicalScope, signerKey: ownerPrivate,
+    signerPublicKey: opts.ownerPublicKey, signerKeyId: ownerHistoryKeyId,
+    deviceId: "authenticated-workspace-owner", revision: opts.pinnedCurrentHead.revision,
+    manifestDigest: opts.pinnedCurrentHead.digest, issuedAt: opts.nowSeconds + 1,
+    previous: trustedGenesis,
+  });
   const session = jwt.sign({ username: "owner", sessionVersion: 0 }, secret,
     { expiresIn: "10m" });
   const app = express();
@@ -781,6 +806,7 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
     grant: opts.signedDeviceGrant,
     head: { revision: opts.pinnedCurrentHead.revision,
       digest: b64(opts.pinnedCurrentHead.digest), epoch: opts.pinnedCurrentHead.epoch },
+    ownerHistoryChain: [genesisCheckpoint, successorCheckpoint],
   };
   app.get("/workspace-probe.js", (_req, res) => res.type("application/javascript")
     .send(`window.addEventListener("load",async()=>{
@@ -806,6 +832,7 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
         field("digest").value=values.head.digest;
         field("epoch").value=values.head.epoch;
         setFile("grant",new TextEncoder().encode(JSON.stringify(values.grant)));
+        setFile("history",new TextEncoder().encode(JSON.stringify(values.ownerHistoryChain)));
         document.querySelector('[data-zk1-action="provision"]').click();
         await wait(()=>field("status").textContent.includes("Âncora offline provisionada"));
         setFile("device",decode(values.deviceRaw));
@@ -816,6 +843,14 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
           || field("status").textContent.includes("Operação recusada"));
         if(!field("status").textContent.includes("PUT/GET protegidos verificados"))throw Error("OP_DENIED");
         if(field("private").files.length || field("file").files.length)throw Error("KEY_RETAINED");
+        field("digest").value=values.head.digest;
+        setFile("history",new TextEncoder().encode(JSON.stringify([
+          values.ownerHistoryChain[0],
+          {...values.ownerHistoryChain[1],signature:values.ownerHistoryChain[0].signature}
+        ])));
+        document.querySelector('[data-zk1-action="provision"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        setFile("history",new TextEncoder().encode(JSON.stringify(values.ownerHistoryChain)));
         field("digest").value=values.ownerHash;
         setFile("private",decode(values.privateDer));
         setFile("file",new TextEncoder().encode("Tampered browser pinned head"));
