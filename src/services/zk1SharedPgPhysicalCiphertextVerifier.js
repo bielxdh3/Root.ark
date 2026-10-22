@@ -97,7 +97,31 @@ class Zk1SharedPgPhysicalCiphertextVerifier {
         pg_catalog.has_any_column_privilege(current_user,'zk1_gate.sealed_object','UPDATE') AS can_update_seal_column,
         pg_catalog.has_any_column_privilege(current_user,'zk1_gate.head','UPDATE') AS can_update_head_column,
         pg_catalog.has_any_column_privilege(current_user,'zk1_gate.physical_inventory_intent','INSERT') AS can_insert_intent,
-        pg_catalog.has_any_column_privilege(current_user,'zk1_gate.physical_inventory_intent','UPDATE') AS can_update_intent
+        pg_catalog.has_any_column_privilege(current_user,'zk1_gate.physical_inventory_intent','UPDATE') AS can_update_intent,
+        pg_catalog.has_table_privilege(current_user,'zk1_gate.physical_inventory_admission','SELECT') AS can_read_binding,
+        pg_catalog.has_any_column_privilege(current_user,'zk1_gate.physical_inventory_admission','INSERT') AS can_insert_binding,
+        pg_catalog.has_any_column_privilege(current_user,'zk1_gate.physical_inventory_admission','UPDATE') AS can_update_binding,
+        pg_catalog.has_table_privilege(current_user,'zk1_gate.head','DELETE, TRUNCATE, REFERENCES, TRIGGER') AS dangerous_head,
+        pg_catalog.has_table_privilege(current_user,'zk1_gate.admission','DELETE, TRUNCATE, REFERENCES, TRIGGER') AS dangerous_admission,
+        pg_catalog.has_table_privilege(current_user,'zk1_gate.sealed_object','DELETE, TRUNCATE, REFERENCES, TRIGGER') AS dangerous_seal,
+        pg_catalog.has_table_privilege(current_user,'zk1_gate.physical_inventory_intent','DELETE, TRUNCATE, REFERENCES, TRIGGER') AS dangerous_intent,
+        pg_catalog.has_table_privilege(current_user,'zk1_gate.physical_inventory_admission','DELETE, TRUNCATE, REFERENCES, TRIGGER') AS dangerous_binding,
+        pg_catalog.has_table_privilege(current_user,'zk1_gate.ciphertext_chunk','DELETE, TRUNCATE, REFERENCES, TRIGGER') AS dangerous_chunks,
+        pg_catalog.has_any_column_privilege(current_user,'zk1_gate.head','REFERENCES') AS refs_head,
+        pg_catalog.has_any_column_privilege(current_user,'zk1_gate.sealed_object','REFERENCES') AS refs_seal,
+        pg_catalog.has_any_column_privilege(current_user,'zk1_gate.physical_inventory_intent','REFERENCES') AS refs_intent,
+        pg_catalog.has_any_column_privilege(current_user,'zk1_gate.physical_inventory_admission','REFERENCES') AS refs_binding,
+        EXISTS (SELECT 1 FROM (VALUES
+          ('zk1_gate.head'), ('zk1_gate.admission'),
+          ('zk1_gate.writer_binding'), ('zk1_gate.physical_stop_receipt'),
+          ('zk1_gate.ciphertext_chunk'), ('zk1_gate.sealed_object'),
+          ('zk1_gate.physical_inventory_intent'),
+          ('zk1_gate.physical_inventory_admission')
+        ) AS protected_table(name)
+        WHERE pg_catalog.has_any_column_privilege(current_user,protected_table.name,
+          'INSERT, UPDATE, REFERENCES')
+          OR pg_catalog.has_table_privilege(current_user,protected_table.name,
+            'DELETE, TRUNCATE, TRIGGER')) AS any_protected_mutation
         FROM pg_catalog.pg_roles r WHERE r.rolname=current_user`);
       const r = role.rows?.[0];
       if (role.rowCount !== 1 || !r || r.login !== r.role || r.superuser !== false
@@ -111,7 +135,15 @@ class Zk1SharedPgPhysicalCiphertextVerifier {
         || r.can_truncate_chunks !== false || r.can_insert_chunk_column !== false
         || r.can_update_chunk_column !== false || r.can_insert_seal_column !== false
         || r.can_update_seal_column !== false || r.can_update_head_column !== false
-        || r.can_insert_intent !== false || r.can_update_intent !== false) fail();
+        || r.can_insert_intent !== false || r.can_update_intent !== false
+        || r.can_read_binding !== true || r.can_insert_binding !== false
+        || r.can_update_binding !== false
+        || r.dangerous_head !== false || r.dangerous_admission !== false
+        || r.dangerous_seal !== false || r.dangerous_intent !== false
+        || r.dangerous_binding !== false || r.dangerous_chunks !== false
+        || r.refs_head !== false || r.refs_seal !== false
+        || r.refs_intent !== false || r.refs_binding !== false
+        || r.any_protected_mutation !== false) fail();
       const settings = await client.query("SHOW fsync");
       const synchronous = await client.query("SHOW synchronous_commit");
       const full = await client.query("SHOW full_page_writes");
@@ -119,21 +151,32 @@ class Zk1SharedPgPhysicalCiphertextVerifier {
         || synchronous.rows?.[0]?.synchronous_commit !== "on"
         || full.rows?.[0]?.full_page_writes !== "on") fail();
       const state = await client.query(`SELECT s.revision,s.digest,s.root_hash,s.expected_chunks,
+        s.operation_id AS physically_sealed_operation_id,
         s.generation,s.admission_id,h.generation AS live_generation,
         h.phase,h.keyring_id,h.revision AS live_revision,h.digest AS live_digest,
+        h.require_physical_inventory_intent AS intent_required,
         i.operation_id,i.expected_inventory_sequence,i.expected_inventory_root,
         i.keyring_id AS intent_keyring,i.revision AS intent_revision,
         i.epoch AS intent_epoch,i.digest AS intent_digest,
         i.generation AS intent_generation,i.ciphertext_sha256 AS intent_sha256,
-        i.expected_root_hash AS intent_root,i.expected_chunks AS intent_count
+        i.expected_root_hash AS intent_root,i.expected_chunks AS intent_count,
+        b.operation_id AS admission_operation_id,
+        b.admission_id AS bound_admission_id,b.generation AS bound_generation
         FROM zk1_gate.sealed_object s
         JOIN zk1_gate.head h ON h.scope_key=s.scope_key
         JOIN zk1_gate.physical_inventory_intent i
           ON i.scope_key=s.scope_key AND i.object_id=s.object_id
+        JOIN zk1_gate.physical_inventory_admission b
+          ON b.scope_key=s.scope_key AND b.object_id=s.object_id
         WHERE s.scope_key=$1 AND s.object_id=$2`, [v.scopeKey, v.objectId]);
       if (state.rowCount !== 1) fail();
       const s = state.rows[0];
-      if (Number(s.revision) !== v.revision || !same(s.digest, v.digest)
+      if (s.intent_required !== true
+        || !same(s.physically_sealed_operation_id, v.operationId)
+        || !same(s.admission_operation_id, v.operationId)
+        || !same(s.bound_admission_id, s.admission_id)
+        || Number(s.bound_generation) !== Number(s.generation)
+        || Number(s.revision) !== v.revision || !same(s.digest, v.digest)
         || !same(s.root_hash, v.expectedRootHash)
         || s.expected_chunks !== v.expectedChunkCount
         || !same(s.operation_id, v.operationId)

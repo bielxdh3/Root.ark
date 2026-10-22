@@ -42,7 +42,9 @@ async function fixture(t) {
   const digest = crypto.randomBytes(32);
   const key = scope.account_id.toString("hex") + ":"
     + scope.compartment_id.length.toString(16) + ":" + scope.compartment_id.toString("hex");
-  await admin.query("INSERT INTO zk1_gate.head (scope_key,keyring_id,revision,digest) VALUES($1,$2,1,$3)",
+  await admin.query(`INSERT INTO zk1_gate.head
+    (scope_key,keyring_id,revision,digest,require_physical_inventory_intent)
+    VALUES($1,$2,1,$3,TRUE)`,
     [key, scope.keyring_id, digest]);
   let ledger = await Zk1DurableContentInventoryLedger.open(dbPath, {
     bootstrapNew: true, signerKeyId, signerPrivateKey: keys.privateKey, scope,
@@ -290,6 +292,99 @@ test("read-only attestor rejects a poisoned column-level INSERT grant hidden fro
   }
 });
 
+test("physical attestor rejects separately poisoned TRUNCATE/DELETE privileges before touching bytes", {
+  skip: !enabled && "requires disposable PostgreSQL attestor role",
+}, async (t) => {
+  const f = await fixture(t);
+  const login = "zkattestordestruct_" + crypto.randomBytes(6).toString("hex");
+  const password = crypto.randomBytes(24).toString("hex");
+  const objectId = f.op.object_id.toString("base64url");
+  assert.equal((await f.bridge().putAndAttest(f.physical)).status,
+    "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+  await f.admin.query(`CREATE ROLE ${login} LOGIN PASSWORD '${password}'`);
+  await f.admin.query(`GRANT zk1_physical_attestor_runtime TO ${login}`);
+  // Runtime-role REVOKE cannot erase a direct poisoned LOGIN grant. TRUNCATE
+  // bypasses BEFORE DELETE triggers and is more powerful than a read-only
+  // physical proof identity can ever possess.
+  await f.admin.query(`GRANT TRUNCATE ON zk1_gate.physical_inventory_intent TO ${login}`);
+  await f.admin.query(`GRANT DELETE ON zk1_gate.sealed_object TO ${login}`);
+  const url = new URL(process.env.ROOTARK_ZK1_ATTESTOR_PG_URL);
+  url.username = login;
+  url.password = password;
+  const poisonedPool = new Pool({ connectionString: url.toString(), max: 1,
+    connectionTimeoutMillis: 2500 });
+  try {
+    const check = await poisonedPool.query(`SELECT
+      pg_catalog.has_table_privilege(current_user,'zk1_gate.physical_inventory_intent','TRUNCATE') AS truncate_intent,
+      pg_catalog.has_table_privilege(current_user,'zk1_gate.sealed_object','DELETE') AS delete_seal`);
+    assert.deepEqual(check.rows[0], { truncate_intent: true, delete_seal: true });
+    const verifier = new Zk1SharedPgPhysicalCiphertextVerifier({ pool: poisonedPool });
+    await assert.rejects(verifier.verifyExact({
+      scope: f.scope, objectId, revision: 1, digest: f.digest,
+      expectedRootHash: f.root, expectedChunkCount: f.chunks.length,
+      expectedSha256: f.op.ciphertext_sha256, operationId: f.op.operation_id,
+      expectedInventorySequence: f.op.expected_sequence,
+      expectedInventoryRoot: f.op.expected_root, epoch: f.op.epoch,
+    }), /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+    "destructive powers must invalidate physical readback even if bytes are intact");
+    assert.equal((await f.admin.query(`SELECT COUNT(*)::integer AS n
+      FROM zk1_gate.physical_inventory_intent
+      WHERE scope_key=$1 AND object_id=$2`, [f.key, objectId])).rows[0].n, 1);
+  } finally {
+    await poisonedPool.end();
+    await f.admin.query(`REVOKE TRUNCATE ON zk1_gate.physical_inventory_intent FROM ${login}`);
+    await f.admin.query(`REVOKE DELETE ON zk1_gate.sealed_object FROM ${login}`);
+    await f.admin.query(`REVOKE zk1_physical_attestor_runtime FROM ${login}`);
+    await f.admin.query(`DROP ROLE ${login}`);
+  }
+});
+
+test("physical attestor separately rejects poisoned admission UPDATE and head INSERT grants", {
+  skip: !enabled && "requires disposable PostgreSQL attestor role",
+}, async (t) => {
+  const f = await fixture(t);
+  const login = "zkattestorgatepoison_" + crypto.randomBytes(6).toString("hex");
+  const password = crypto.randomBytes(24).toString("hex");
+  assert.equal((await f.bridge().putAndAttest(f.physical)).status,
+    "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+  await f.admin.query(`CREATE ROLE ${login} LOGIN PASSWORD '${password}'`);
+  await f.admin.query(`GRANT zk1_physical_attestor_runtime TO ${login}`);
+  const url = new URL(process.env.ROOTARK_ZK1_ATTESTOR_PG_URL);
+  url.username = login;
+  url.password = password;
+  const poisonedPool = new Pool({ connectionString: url.toString(), max: 1,
+    connectionTimeoutMillis: 2500 });
+  const verify = () => new Zk1SharedPgPhysicalCiphertextVerifier({ pool: poisonedPool })
+    .verifyExact({ scope: f.scope, objectId: f.op.object_id.toString("base64url"),
+      revision: 1, digest: f.digest, expectedRootHash: f.root,
+      expectedChunkCount: f.chunks.length, expectedSha256: f.op.ciphertext_sha256,
+      operationId: f.op.operation_id, expectedInventorySequence: f.op.expected_sequence,
+      expectedInventoryRoot: f.op.expected_root, epoch: f.op.epoch });
+  try {
+    await f.admin.query(`GRANT UPDATE(state) ON zk1_gate.admission TO ${login}`);
+    assert.equal((await poisonedPool.query(`SELECT
+      pg_catalog.has_any_column_privilege(current_user,'zk1_gate.admission','UPDATE') AS capability`))
+      .rows[0].capability, true);
+    await assert.rejects(verify(), /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+      "a login able to finish or alter admissions is not a read-only physical attestor");
+    await f.admin.query(`REVOKE UPDATE(state) ON zk1_gate.admission FROM ${login}`);
+    await f.admin.query(`GRANT INSERT(scope_key,keyring_id,revision,digest)
+      ON zk1_gate.head TO ${login}`);
+    assert.equal((await poisonedPool.query(`SELECT
+      pg_catalog.has_any_column_privilege(current_user,'zk1_gate.head','INSERT') AS capability`))
+      .rows[0].capability, true);
+    await assert.rejects(verify(), /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+      "a login able to provision fabricated gate heads cannot attest ciphertext");
+  } finally {
+    await poisonedPool.end();
+    await f.admin.query(`REVOKE UPDATE(state) ON zk1_gate.admission FROM ${login}`);
+    await f.admin.query(`REVOKE INSERT(scope_key,keyring_id,revision,digest)
+      ON zk1_gate.head FROM ${login}`);
+    await f.admin.query(`REVOKE zk1_physical_attestor_runtime FROM ${login}`);
+    await f.admin.query(`DROP ROLE ${login}`);
+  }
+});
+
 test("a different physical scope cannot poison the fixed-scope Ed25519 inventory before rejection", {
   skip: !enabled && "requires disposable PostgreSQL 18 lab",
 }, async (t) => {
@@ -347,4 +442,121 @@ test("operator WAL barrier flushes an independently async-committed PG transacti
     "flush fence must not depend on a separate writer session's synchronous_commit");
   assert.equal((await f.proofPool.query(
     "SELECT 1 FROM zk1_gate.head WHERE scope_key=$1", [key])).rowCount, 1);
+});
+
+test("strict PG SQL trigger blocks gate role raw chunks without exact immutable operation intent", {
+  skip: !enabled && "requires disposable PG18",
+}, async (t) => {
+  const f = await fixture(t);
+  const objectId = f.op.object_id.toString("base64url");
+  const workerId = crypto.randomBytes(16);
+  const principal = "strict-raw-sql-adversary";
+  await assert.rejects(f.gate.beginIoAdmission({
+    scope: f.scope, workerId, principal, action: "put",
+    objectId, revision: 1, digest: f.digest,
+  }), /ZK_GATE_UNAVAILABLE/,
+  "an admission cannot precede its immutable operation intent on strict scope");
+  const prewrite = await f.intentAuthority.reserveExact(f.noChunks());
+  assert.equal(prewrite.status, "IMMUTABLE_PREWRITE_INTENT");
+  const started = await f.gate.beginIoAdmission({
+    scope: f.scope, workerId, principal, action: "put",
+    objectId, revision: 1, digest: f.digest,
+  });
+  assert.equal(started.proceed, true);
+  const directPut = (index, object = objectId) => f.gatePool.query(
+    `INSERT INTO zk1_gate.ciphertext_chunk(scope_key,object_id,chunk_index,ciphertext)
+      VALUES($1,$2,$3,$4)`, [f.key, object, index, f.chunks[0]]);
+  const binding = await f.admin.query(`SELECT operation_id,admission_id FROM
+    zk1_gate.physical_inventory_admission WHERE scope_key=$1 AND object_id=$2`,
+  [f.key, objectId]);
+  assert.equal(binding.rowCount, 1);
+  assert.deepEqual(binding.rows[0].operation_id, f.op.operation_id);
+  assert.deepEqual(binding.rows[0].admission_id, started.admissionId);
+  const count = await f.admin.query(
+    "SELECT COUNT(*)::integer AS n FROM zk1_gate.ciphertext_chunk WHERE scope_key=$1", [f.key]);
+  assert.equal(count.rows[0].n, 0);
+  await assert.rejects(f.gate.beginIoAdmission({
+    scope: f.scope, workerId: crypto.randomBytes(16),
+    principal: "other-admission", action: "put",
+    objectId, revision: 1, digest: f.digest,
+  }), /ZK_GATE_UNAVAILABLE/,
+  "second admission must not usurp the immutable operation binding");
+  await assert.rejects(f.admin.query(`UPDATE zk1_gate.physical_inventory_admission
+    SET admission_id=$1 WHERE scope_key=$2 AND object_id=$3`,
+  [crypto.randomBytes(16), f.key, objectId]), /physical admission binding is immutable/i);
+  await assert.rejects(directPut(f.chunks.length), /strict chunk requires exact prewrite/i,
+    "even a privileged gate login cannot exceed the operation-intent chunk boundary");
+  await assert.rejects(directPut(0, crypto.randomBytes(16).toString("base64url")),
+    /strict chunk requires exact prewrite/i,
+    "a valid admission cannot retarget another unbound object");
+  await assert.rejects(f.gatePool.query(
+    `INSERT INTO zk1_gate.sealed_object
+      (scope_key,object_id,revision,digest,generation,admission_id,expected_chunks,root_hash)
+      VALUES($1,$2,1,$3,$4,$5,$6,$7)`,
+    [f.key, objectId, f.digest, started.generation, started.admissionId,
+      f.chunks.length + 1, f.root]), /strict seal requires exact prewrite/i);
+  await f.admin.query("SELECT 1");
+  await assert.rejects(f.admin.query(`UPDATE zk1_gate.head
+    SET require_physical_inventory_intent=FALSE WHERE scope_key=$1`, [f.key]),
+  /gate head identity is immutable/i,
+  "an operator cannot downgrade strict physical intent after provisioning");
+  await assert.rejects(f.admin.query(`UPDATE zk1_gate.physical_inventory_intent
+    SET operation_id=$1 WHERE scope_key=$2 AND object_id=$3`,
+  [crypto.randomBytes(16), f.key, objectId]), /physical inventory intent is immutable/i);
+  await directPut(0);
+  assert.equal((await f.admin.query(`SELECT COUNT(*)::integer AS n
+    FROM zk1_gate.ciphertext_chunk WHERE scope_key=$1`, [f.key])).rows[0].n, 1);
+});
+
+test("strict physical operation reservation races quiesce and forbids obsolete generation write", {
+  skip: !enabled && "requires disposable PG18",
+}, async (t) => {
+  const f = await fixture(t);
+  const guard = await f.admin.connect();
+  await guard.query("BEGIN");
+  try {
+    await guard.query("SELECT 1 FROM zk1_gate.head WHERE scope_key=$1 FOR UPDATE", [f.key]);
+    const pending = f.intentAuthority.reserveExact(f.noChunks());
+    // Already blocked by independent PG row lock. Quiesce goes after the
+    // initial committed intent, then generation must permanently advance.
+    await guard.query("COMMIT");
+    assert.equal((await pending).status, "IMMUTABLE_PREWRITE_INTENT");
+  } finally {
+    try { await guard.query("ROLLBACK"); } catch (_) {}
+    guard.release();
+  }
+  const fenced = { scope: f.scope, revision: 1, digest: f.digest,
+    operationId: crypto.randomBytes(16), reservationId: crypto.randomBytes(16) };
+  assert.equal((await f.gate.beginQuiesce(fenced)).activeCount, 0);
+  await assert.rejects(f.intentAuthority.reserveExact(f.noChunks()), /ZK_PHYSICAL_INTENT_UNAVAILABLE/,
+    "a previous-generation operation is not reopened by a replayed reserve");
+  await assert.rejects(f.gate.beginIoAdmission({
+    scope: f.scope, workerId: crypto.randomBytes(16), principal: "obsolete-physical",
+    action: "put", objectId: f.op.object_id.toString("base64url"),
+    revision: 1, digest: f.digest,
+  }), /ZK_GATE_DENIED/,
+  "a previous gate generation cannot mint any new physical writer");
+  assert.equal((await f.ledger.getOperationStatus(f.op.operation_id)).status, "unknown",
+    "an orphan prewrite intent must never be promoted to signed ciphertext");
+});
+
+test("strict SQL seal persists the exact immutable physical operation ID, not a caller-chosen substitute", {
+  skip: !enabled && "requires disposable PG18",
+}, async (t) => {
+  const f = await fixture(t);
+  assert.equal((await f.bridge().putAndAttest(f.physical)).status,
+    "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+  const row = await f.admin.query(`SELECT operation_id FROM zk1_gate.sealed_object
+    WHERE scope_key=$1 AND object_id=$2`, [f.key, f.op.object_id.toString("base64url")]);
+  assert.equal(row.rowCount, 1);
+  assert.deepEqual(row.rows[0].operation_id, f.op.operation_id);
+  // The signed catalog cannot authorize after a physical superuser rewrites
+  // even the apparently matching bytes' operation binding.
+  await f.admin.query(`UPDATE zk1_gate.sealed_object SET operation_id=$1
+    WHERE scope_key=$2 AND object_id=$3`,
+  [crypto.randomBytes(16), f.key, f.op.object_id.toString("base64url")]);
+  await assert.rejects(f.bridge().reconcile(f.noChunks()),
+    /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/);
+  assert.equal((await f.ledger.getOperationStatus(f.op.operation_id)).status, "committed",
+    "a historical signature survives tampering but does not prove current physical bytes");
 });
