@@ -17,14 +17,16 @@ function stopChild(child) { if (child.exitCode !== null || child.signalCode !== 
 function request(portNumber, requestPath, options = {}) {
   return new Promise((resolve, reject) => {
     const { requestTimeoutMs, ...requestOptions } = options;
+    let deadlineTimer;
+    const finish = (callback, result) => { clearTimeout(deadlineTimer); callback(result); };
     const req = http.request({ host: "127.0.0.1", port: portNumber, path: requestPath, ...requestOptions }, (res) => {
       let body = "";
       res.on("data", (chunk) => { body += chunk; });
-      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body }));
-      res.once("error", reject);
+      res.on("end", () => finish(resolve, { status: res.statusCode, headers: res.headers, body }));
+      res.once("error", (error) => finish(reject, error));
     });
-    if (requestTimeoutMs) req.setTimeout(requestTimeoutMs, () => req.destroy(new Error("readiness request timed out")));
-    req.once("error", reject);
+    if (requestTimeoutMs) deadlineTimer = setTimeout(() => req.destroy(new Error("readiness request timed out")), requestTimeoutMs);
+    req.once("error", (error) => finish(reject, error));
     req.end(options.body);
   });
 }
@@ -69,6 +71,22 @@ test("WebDAV readiness bounds a stalled HTTP response before retrying", { timeou
   t.after(() => new Promise((resolve) => listener.close(resolve)));
   await ready(listener.address().port, null, 2_500);
   assert.equal(probes, 2, "one stalled probe does not strand startup verification");
+});
+test("WebDAV readiness bounds an HTTP response that never finishes streaming", { timeout: 4_500 }, async (t) => {
+  let probes = 0;
+  const listener = http.createServer((_req, res) => {
+    probes += 1;
+    if (probes === 1) {
+      res.writeHead(200);
+      const interval = setInterval(() => res.write("x"), 40);
+      res.once("close", () => clearInterval(interval));
+    } else res.end("ok");
+  });
+  await new Promise((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  t.after(() => listener.closeAllConnections());
+  t.after(() => new Promise((resolve) => listener.close(resolve)));
+  await ready(listener.address().port, null, 2_500);
+  assert.equal(probes, 2, "streaming an unfinished response cannot extend the readiness deadline");
 });
 const websocketMessageStates = new WeakMap();
 function observeWebSocketMessages(socket) {
