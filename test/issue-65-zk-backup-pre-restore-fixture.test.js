@@ -290,7 +290,7 @@ test("directory replacement during inventory enumeration cannot verify externall
     fs.copyFileSync(path.join(f.dir, "versions", name), path.join(externalVersions, name));
   }
   t.after(() => fs.rmSync(outside, { force: true, recursive: true }));
-  const versionsDir = path.join(f.dir, "versions");
+  const versionsDir = fs.realpathSync.native(path.join(f.dir, "versions"));
   const realReaddir = fs.readdirSync;
   let swapped = false;
   fs.readdirSync = function (target, options) {
@@ -324,7 +324,7 @@ test("directory ABA replacement restored before enumeration returns invalidates 
   const detached = path.join(outside, "original");
   const other = path.join(outside, "external");
   fs.mkdirSync(other);
-  const versionsDir = path.join(f.dir, "versions");
+  const versionsDir = fs.realpathSync.native(path.join(f.dir, "versions"));
   for (const name of fs.readdirSync(versionsDir))
     fs.copyFileSync(path.join(versionsDir, name), path.join(other, name));
   t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
@@ -357,7 +357,7 @@ test("ancestor replacement immediately after an opened ciphertext read is reject
   const detached = path.join(outside, "original");
   const other = path.join(outside, "external");
   fs.mkdirSync(other);
-  const versionsDir = path.join(f.dir, "versions");
+  const versionsDir = fs.realpathSync.native(path.join(f.dir, "versions"));
   for (const name of fs.readdirSync(versionsDir))
     fs.copyFileSync(path.join(versionsDir, name), path.join(other, name));
   t.after(() => fs.rmSync(outside, { recursive: true, force: true }));

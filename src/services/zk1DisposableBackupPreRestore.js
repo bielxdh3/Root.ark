@@ -65,10 +65,27 @@ function verifyDirectoryPins(pins) {
 }
 function safeRoot(input) {
   if (typeof input !== "string" || !path.isAbsolute(input)) deny("UNSAFE_FIXTURE");
-  const root = path.resolve(input);
+  const requestedRoot = path.resolve(input);
   const tmp = path.resolve(os.tmpdir());
-  if (path.dirname(root) !== tmp || !path.basename(root).startsWith("rootark-zk-backup-fixture-"))
+  if (!samePath(path.dirname(requestedRoot), tmp)
+    || !path.basename(requestedRoot).startsWith("rootark-zk-backup-fixture-"))
     deny("UNSAFE_FIXTURE");
+  // Windows hosted agents may expose the OS-supplied TEMP through an
+  // administrator-managed junction. Pin the real OS TEMP once, then perform
+  // ALL content reads through its canonical path instead of following the
+  // lexical alias while walking the private fixture. This does NOT permit
+  // a junction at the fixture root or inside its owned child directories.
+  let realTmp, root;
+  try {
+    realTmp = fs.realpathSync.native(tmp);
+    root = path.join(realTmp, path.basename(requestedRoot));
+    const lexical = fs.lstatSync(requestedRoot, { bigint: true });
+    const canonical = fs.lstatSync(root, { bigint: true });
+    if (!lexical.isDirectory() || lexical.isSymbolicLink()
+      || !canonical.isDirectory() || canonical.isSymbolicLink()
+      || lexical.dev !== canonical.dev || lexical.ino !== canonical.ino
+      || !samePath(fs.realpathSync.native(requestedRoot), root)) deny("UNSAFE_FIXTURE");
+  } catch (_) { deny("UNSAFE_FIXTURE"); }
   const parsed = path.parse(root);
   let current = parsed.root;
   const pins = [pinDirectory(current)];
@@ -81,7 +98,7 @@ function safeRoot(input) {
   // Shared OS ancestors can be changed by unrelated processes. Watch their
   // identity; reserve change-time detection for the private fixture tree.
   pins[pins.length - 1].privateBoundary = true;
-  return { root, pins };
+  return { root, pins, trustedTemporaryRoot: { alias: tmp, canonical: realTmp } };
 }
 function entriesExactly(dir, expected, verifyBoundary) {
   verifyBoundary();
@@ -280,8 +297,14 @@ function inspectZk1DisposableBackupPreRestore({ fixtureDir, expectedCompartmentI
     checkedVersions: 0, checkedCopies: 0, checkedEnvelopes: 0,
     findings: [], blockers: [...BLOCKERS] };
   try {
-    const { root, pins } = safeRoot(fixtureDir);
-    const verifyBoundary = () => verifyDirectoryPins(pins);
+    const { root, pins, trustedTemporaryRoot } = safeRoot(fixtureDir);
+    const verifyBoundary = () => {
+      // A changing shared junction is NOT a new trusted temp location.
+      // Content below always uses the original canonical private fixture.
+      if (!samePath(fs.realpathSync.native(trustedTemporaryRoot.alias),
+        trustedTemporaryRoot.canonical)) deny("UNSAFE_FIXTURE");
+      verifyDirectoryPins(pins);
+    };
     checkRootEntries(root, verifyBoundary);
     const marker = readRegular(path.join(root, ".rootark-disposable-fixture"), 128,
       "UNSAFE_FIXTURE_ENTRY", verifyBoundary);
