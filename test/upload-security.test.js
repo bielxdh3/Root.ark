@@ -22,7 +22,8 @@ const createChunkUploadQuota = (options) => createChunkUploadQuotaService({ perA
 
 function chunkBoundaryRequestTimeout(chunkIndex, totalChunks) {
   // Only the final supported 2,000-part boundary assembles 2,000 files on this response.
-  // Keep the other 1,999 socket deadlines strict and the overall 180s test budget intact.
+  // Keep the other 1,999 socket deadlines strict. A slower Windows CI
+  // fixture has a separate bounded wall-time budget for all requests.
   return totalChunks === 2000 && chunkIndex === totalChunks - 1 ? 30_000 : TIMEOUT_MS;
 }
 
@@ -2500,8 +2501,22 @@ test("chunk assembly fails closed when a session ledger path is duplicated", { t
   assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
 });
 
-test("a valid upload can send all 2,000 allowed chunks within the configured window", { timeout: 180_000 }, async (t) => {
-  const harness = await createHarness(t, { envOverrides: { API_RATE_LIMIT_MAX: "1" } });
+// This is a real, strictly sequential 2,000-request filesystem/SQLite test,
+// not a fast unit test. GitHub-hosted Windows disks have previously exceeded
+// the local 180s test cap even while individual requests remained successful.
+// Keep every chunk, response check, and the final assembly; permit a bounded
+// slow-runner budget instead of treating CI throughput as an upload failure.
+const chunkBoundarySuiteTimeoutMs = process.platform === "win32" && process.env.CI === "true"
+  ? 480_000 : 180_000;
+test("a valid upload can send all 2,000 allowed chunks within the configured window",
+  { timeout: chunkBoundarySuiteTimeoutMs }, async (t) => {
+  const harness = await createHarness(t, {
+    envOverrides: { API_RATE_LIMIT_MAX: "1" },
+    // The first cold child boot and Windows AV/filesystem initialization may
+    // exceed the ordinary 10s readiness probe on loaded development hosts.
+    // This changes no upload, admission or per-request timeout behavior.
+    readyTimeout: process.platform === "win32" ? 45_000 : TIMEOUT_MS,
+  });
   const session = await login(harness.port, "uploader", harness.password);
   const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
   t.after(() => agent.destroy());

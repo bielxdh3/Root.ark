@@ -24,7 +24,7 @@ const enabled = Boolean(process.env.ROOTARK_ZK1_TEST_PG_URL
   && process.env.ROOTARK_ZK1_RUNTIME_PG_URL
   && process.env.ROOTARK_ZK1_ATTESTOR_PG_URL);
 
-async function fixture(t) {
+async function fixture(t, { strictPhysicalIntent = true } = {}) {
   const admin = new Pool({ connectionString: process.env.ROOTARK_ZK1_TEST_PG_URL,
     max: 2, connectionTimeoutMillis: 2500 });
   const gatePool = new Pool({ connectionString: process.env.ROOTARK_ZK1_RUNTIME_PG_URL,
@@ -44,8 +44,8 @@ async function fixture(t) {
     + scope.compartment_id.length.toString(16) + ":" + scope.compartment_id.toString("hex");
   await admin.query(`INSERT INTO zk1_gate.head
     (scope_key,keyring_id,revision,digest,require_physical_inventory_intent)
-    VALUES($1,$2,1,$3,TRUE)`,
-    [key, scope.keyring_id, digest]);
+    VALUES($1,$2,1,$3,$4)`,
+    [key, scope.keyring_id, digest, strictPhysicalIntent]);
   let ledger = await Zk1DurableContentInventoryLedger.open(dbPath, {
     bootstrapNew: true, signerKeyId, signerPrivateKey: keys.privateKey, scope,
   });
@@ -144,6 +144,24 @@ test("real PostgreSQL seal is physically reread before exact Ed25519 inventory c
     operation: { ...f.op, operation_id: crypto.randomBytes(16) } }),
   /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
   "a different operation ID now fails at the durable physical prewrite binding");
+});
+
+test("non-strict legacy scopes refuse signed physical bridge before any physical write", {
+  skip: !enabled && "requires disposable PostgreSQL 18 and restricted runtime",
+}, async (t) => {
+  const f = await fixture(t, { strictPhysicalIntent: false });
+  await assert.rejects(f.bridge().putAndAttest(f.physical),
+    /ZK_PHYSICAL_INTENT_UNAVAILABLE/,
+    "opt-in physical intent is mandatory before a bridge opens any PUT admission");
+  assert.deepEqual(f.calls, [], "legacy scope denial cannot touch the physical writer");
+  assert.equal((await f.ledger.getOperationStatus(f.op.operation_id)).status, "unknown");
+  const objectId = f.op.object_id.toString("base64url");
+  for (const table of ["physical_inventory_intent", "physical_inventory_admission",
+    "ciphertext_chunk", "sealed_object"]) {
+    const result = await f.admin.query(`SELECT COUNT(*)::int AS count
+      FROM zk1_gate.${table} WHERE scope_key=$1 AND object_id=$2`, [f.key, objectId]);
+    assert.equal(result.rows[0].count, 0, `non-strict scope must not create ${table}`);
+  }
 });
 
 test("unverified physical write, partial seal, and generation fencing never publish a signed success", {

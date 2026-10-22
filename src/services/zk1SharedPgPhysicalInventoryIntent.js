@@ -93,10 +93,12 @@ class Zk1SharedPgPhysicalInventoryIntent {
       if (identity.rowCount !== 1
         || identity.rows[0]?.session_identity !== role.runtimeRole
         || identity.rows[0]?.active_identity !== role.runtimeRole) fail();
-      const rows = await c.query(`SELECT keyring_id,revision,digest,generation,phase
+      const rows = await c.query(`SELECT keyring_id,revision,digest,generation,phase,
+          require_physical_inventory_intent
         FROM zk1_gate.head WHERE scope_key=$1 FOR UPDATE`, [v.scopeKey]);
       const h = rows.rows?.[0];
       if (rows.rowCount !== 1 || !h || h.phase !== "OPEN"
+        || h.require_physical_inventory_intent !== true
         || !same(h.keyring_id, v.scope.keyring_id)
         || Number(h.revision) !== v.revision || !same(h.digest, v.digest)
         || !Number.isSafeInteger(Number(h.generation))) fail();
