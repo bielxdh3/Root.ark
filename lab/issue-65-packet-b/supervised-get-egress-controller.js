@@ -20,6 +20,11 @@ const { Zk1SharedPgSealedGetReader } =
 const { Zk1SharedPgWitnessCasEgressGuard } =
   require("../../src/services/zk1SharedPgWitnessCasEgressGuard");
 
+// The legacy experiment intentionally generated random TCP frames or read PG
+// ciphertext without a remote witness. Keep it reachable only through the
+// explicitly unsafe lab factory, never through the hardened constructor.
+const UNSAFE_LAB_CAPABILITY = Symbol("zk1-unsafe-legacy-lab-get-fixture");
+
 function deny() {
   const error = new Error("ZK_LAB_GET_DENIED");
   error.code = error.message;
@@ -80,8 +85,22 @@ function pubkeyEquals(a, b) {
       b.export({ format: "der", type: "spki" }));
 }
 class Zk1LabSupervisedGetEgress {
+  #unsafeLegacyLabOnly;
+  #continuing = false;
+  #quorumFailed = false;
+  static createUnsafeLegacyLabFixture(options) {
+    if (!options || typeof options !== "object" || Array.isArray(options)) deny();
+    // Disjoint entry point for the historical synthetic/PG-only experiments.
+    // This is intentionally not a security capability or a production API.
+    return new Zk1LabSupervisedGetEgress({ ...options,
+      [UNSAFE_LAB_CAPABILITY]: true });
+  }
+
   constructor({ gate, supervisor, recorder, ciphertextReader, expectedRootHash,
-    quorumGuard } = {}) {
+    quorumGuard, ...extra } = {}) {
+    const unsafeLabOnly = extra[UNSAFE_LAB_CAPABILITY] === true;
+    if (Reflect.ownKeys(extra).some((key) => key !== UNSAFE_LAB_CAPABILITY)
+      || (Reflect.ownKeys(extra).length > 0 && !unsafeLabOnly)) deny();
     if (!(gate instanceof Zk1SharedPgGateAuthority)
       || !(supervisor instanceof Zk1IsolatedProcessStopSupervisor)
       || !isVerifiedZk1PhysicalStopRecorder(recorder)
@@ -97,11 +116,18 @@ class Zk1LabSupervisedGetEgress {
     if (quorumGuard !== undefined && (
       !(quorumGuard instanceof Zk1SharedPgWitnessCasEgressGuard)
       || !ciphertextReader || !expectedRootHash)) deny();
+    // Every default construction represents a hardened real-PG egress.
+    // A reader+root alone (including null guard or opportunistic flags) is
+    // insufficient, and a synthetic/no-reader path must be explicit lab code.
+    if (unsafeLabOnly ? quorumGuard !== undefined
+      : !ciphertextReader || !expectedRootHash
+        || !(quorumGuard instanceof Zk1SharedPgWitnessCasEgressGuard)) deny();
     this.gate = gate;
     this.supervisor = supervisor;
     this.recorder = recorder;
     this.ciphertextReader = ciphertextReader;
     this.quorumGuard = quorumGuard;
+    this.#unsafeLegacyLabOnly = unsafeLabOnly;
     this.expectedRootHash = expectedRootHash === undefined
       ? null : bytes(expectedRootHash, 32);
     this.phase = "new";
@@ -126,13 +152,29 @@ class Zk1LabSupervisedGetEgress {
     return bytes;
   }
   async #verifyQuorum() {
-    if (this.quorumGuard) await this.quorumGuard.authorize({
-      io: this.io, expectedRootHash: this.expectedRootHash });
+    if (this.#unsafeLegacyLabOnly) return;
+    if (this.#quorumFailed) deny();
+    try {
+      if (!(this.quorumGuard instanceof Zk1SharedPgWitnessCasEgressGuard)) deny();
+      await this.quorumGuard.authorize({
+        io: this.io, expectedRootHash: this.expectedRootHash });
+    } catch (error) {
+      // An uncertain remote witness outcome permanently fences this process's
+      // GET. Even if mTLS reconnects and a caller mutates public properties,
+      // only the existing physical STOP/quiescence path remains admissible.
+      this.#quorumFailed = true;
+      this.stopping = true;
+      // Preserve the independently verified witness-failure contract for
+      // operator callers. The child HTTP listener still sends only generic
+      // denial responses, and arbitrary underlying failures stay redacted.
+      if (error?.code === "ZK_LAB_QUORUM_UNAVAILABLE") throw error;
+      deny();
+    }
   }
 
   async #admitGet() {
     const allowed = () => this.phase === "listening" && !this.stopping
-      && this.session?.bound && !this.session.closed;
+      && !this.#quorumFailed && this.session?.bound && !this.session.closed;
     if (!allowed()) return this.#denyIncoming();
     try {
       this.supervisor.assertLive({ processEpoch: this.process.processEpoch });
@@ -243,20 +285,27 @@ class Zk1LabSupervisedGetEgress {
   }
 
   async continueResponse() {
-    if (this.phase !== "listening" || !this.partial || this.stopping) deny();
-    this.supervisor.assertLive({ processEpoch: this.process.processEpoch });
-    const decision = await this.gate.beginIoAdmission({ ...this.io,
-      hostKeyId: this.process.hostKeyId, processEpoch: this.process.processEpoch,
-      processPid: this.process.processPid });
-    if (this.stopping || !decision.proceed || !decision.admissionId.equals(this.admissionId)
-      || decision.generation !== this.generation) deny();
-    await this.#verifyQuorum();
-    const ciphertext = await this.#readCiphertext(1);
-    await this.#verifyQuorum();
-    if (this.stopping) deny();
-    this.supervisor.assertLive({ processEpoch: this.process.processEpoch });
-    this.partial = false;
-    this.#send({ kind: "continue", ciphertextBase64: ciphertext.toString("base64url") });
+    if (this.phase !== "listening" || !this.partial || this.stopping
+      || this.#quorumFailed || this.#continuing) deny();
+    // Serialize authorization and actual child IPC across concurrent callers.
+    // Without this latch, two awaits can both pass the `partial` check and
+    // queue duplicate ciphertext frames before either clears the marker.
+    this.#continuing = true;
+    try {
+      this.supervisor.assertLive({ processEpoch: this.process.processEpoch });
+      const decision = await this.gate.beginIoAdmission({ ...this.io,
+        hostKeyId: this.process.hostKeyId, processEpoch: this.process.processEpoch,
+        processPid: this.process.processPid });
+      if (this.stopping || !decision.proceed || !decision.admissionId.equals(this.admissionId)
+        || decision.generation !== this.generation) deny();
+      await this.#verifyQuorum();
+      const ciphertext = await this.#readCiphertext(1);
+      await this.#verifyQuorum();
+      if (this.stopping) deny();
+      this.supervisor.assertLive({ processEpoch: this.process.processEpoch });
+      this.#send({ kind: "continue", ciphertextBase64: ciphertext.toString("base64url") });
+      this.partial = false;
+    } finally { this.#continuing = false; }
   }
 
   async beginQuiesce(operation) {

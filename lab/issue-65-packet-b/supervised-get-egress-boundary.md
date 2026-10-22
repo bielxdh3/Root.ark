@@ -138,3 +138,43 @@ Local dependency limitation: the workstation's WSL Node 22 resolves the
 Windows-compiled `better-sqlite3` addon (`invalid ELF header`); the three
 new cross-process SQLite witness cases automatically skip if native SQLite
 cannot open. The original eight PostgreSQL egress/STOP cases remain active.
+
+## 22 October — mandatory quorum for all hardened physical GETs
+
+The normal `new Zk1LabSupervisedGetEgress(...)` constructor now **rejects**
+an absent/null/forged `Zk1SharedPgWitnessCasEgressGuard`, including when the
+caller provides a valid `Zk1SharedPgSealedGetReader` and a matching persisted
+ciphertext root. Hardened construction also requires both that reader and the
+expected root. Arbitrary caller flags (`allowUnverified`, `legacyLabMode`,
+`unsafeLegacyLabOnly`) cannot bypass the check. The private mode flag cannot
+be changed through a writable public property on an existing instance. The
+fresh, owner-SPKI-bound remote mTLS witness check remains mandatory before
+opening a child listener, before first ciphertext-frame authorization and
+before the final TCP frame. An absent or partitioned witness fails closed.
+Once a signed witness check fails, a private process-local fence permanently
+blocks additional grants even if connectivity returns or a caller toggles
+public state. Only quiescence and the independently observed physical STOP
+workflow may finish the in-flight admission.
+
+To keep historical local transport experiments reproducible, tests that
+intentionally transfer **synthetic random bytes** or directly read PostgreSQL
+without independent witness must call the distinct and explicitly dangerous
+`Zk1LabSupervisedGetEgress.createUnsafeLegacyLabFixture(...)` entry point.
+This explicit opt-in factory is strictly **test/lab-only**; it is not accepted
+by hardened construction, not a device-grant mechanism, and must never be
+mounted behind a production route. It refuses a simultaneous `quorumGuard`
+instead of silently downgrading a previously authenticated guard.
+
+The hardened and synthetic paths retain physical process STOP/`FINISHED` /
+`PENDING` requirements. Continuation is additionally serialized: overlapping
+callbacks cannot both issue the second ciphertext frame across asynchronous
+PostgreSQL/witness reads. The regression suite compares constructor behavior
+against the published vulnerable baseline (RED) and verifies the corrected
+constructor (GREEN), alongside multi-client continuation and real paused TCP
+client witness-partition/STOP adversarial fixtures.
+
+**Still a DEV-only boundary:** this change does not make the PG row-lock and
+network write atomic, confer positive current-device/revocation provenance,
+prove independent cloud/CAS service custody, or protect bytes that were already
+buffered before QUIESCING/STOP. Fail-closed admission is necessary but is not
+a production-ready end-to-end protected GET authorization.

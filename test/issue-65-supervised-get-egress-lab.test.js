@@ -72,7 +72,7 @@ async function context(t) {
     stopPinned: { hostKeyId, hostPublicKey: hostKeys.publicKey } });
   const recorder = await createZk1PhysicalStopRecorder({ pool: stop,
     trustedHostKeyId: hostKeyId, trustedHostPublicKey: hostKeys.publicKey });
-  const controller = new Zk1LabSupervisedGetEgress({ gate, supervisor, recorder });
+  const controller = Zk1LabSupervisedGetEgress.createUnsafeLegacyLabFixture({ gate, supervisor, recorder });
   const io = { scope, workerId: crypto.randomBytes(16),
     principal: "CB:".repeat(31) + "CB", action: "get",
     objectId: crypto.randomBytes(16).toString("base64url"), revision: 7, digest };
@@ -334,14 +334,14 @@ test("lab GET requires a separately pinned host, verified STOP recorder and exac
   const c = await context(t);
   const privileged = new Zk1SharedPgGateAuthority({ pool: c.admin,
     stopPinned: c.gate.stopPinned });
-  const untrusted = new Zk1LabSupervisedGetEgress({ gate: privileged,
+  const untrusted = Zk1LabSupervisedGetEgress.createUnsafeLegacyLabFixture({ gate: privileged,
     supervisor: c.supervisor, recorder: c.controller.recorder });
   await assert.rejects(untrusted.begin(c.io), /ZK_GATE_RUNTIME_IDENTITY_INVALID/,
     "superuser/app pool cannot serve as independent GET admission authority");
   const disconnectedGate = new Zk1SharedPgGateAuthority({
     pool: { connect() { throw new Error("synthetic disconnected gate"); } },
     stopPinned: c.gate.stopPinned });
-  const disconnected = new Zk1LabSupervisedGetEgress({ gate: disconnectedGate,
+  const disconnected = Zk1LabSupervisedGetEgress.createUnsafeLegacyLabFixture({ gate: disconnectedGate,
     supervisor: c.supervisor, recorder: c.controller.recorder });
   await assert.rejects(disconnected.begin(c.io), /ZK_GATE_RUNTIME_IDENTITY_INVALID/,
     "lost independent gate is a hard GET denial before opening a listener");
@@ -402,6 +402,28 @@ test("real loopback GET partial drain; QUIESCING blocks late grants; exit+close 
   await assert.rejects(request(port, token), /ECONNREFUSED|ECONNRESET|socket hang up/,
     "old GET cannot reconnect or resume on the terminated fixture listener");
   await assert.rejects(c.controller.begin(c.io), /ZK_LAB_GET_DENIED/);
+});
+
+test("concurrent continuation admits exactly one second frame before quiescence and physical STOP", {
+  skip: !enabled && "disposable PostgreSQL fixture required",
+}, async (t) => {
+  const c = await context(t);
+  const { port, token } = await c.controller.begin(c.io);
+  const stream = await pausedRequest(port, token);
+  await c.controller.waitPartial();
+  const results = await Promise.allSettled([
+    c.controller.continueResponse(), c.controller.continueResponse(),
+  ]);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1,
+    "overlapping grant callbacks must not both write the same ciphertext frame");
+  assert.equal(results.filter((result) => result.status === "rejected"
+    && /ZK_LAB_GET_DENIED/.test(result.reason?.message)).length, 1);
+  assert.equal((await stream.drain()).length, 32768,
+    "exactly two 16KiB frames may reach the peer");
+  assert.equal((await c.controller.beginQuiesce(c.reservation)).state, "QUIESCING");
+  await assert.rejects(c.gate.markPending(c.reservation), /ZK_GATE_DRAIN_INCOMPLETE/);
+  assert.equal((await c.controller.finishAfterQuiesce()).status, "FINISHED");
+  assert.equal((await c.gate.markPending(c.reservation)).status, "PENDING");
 });
 
 test("forced SIGKILL of streaming child still requires independently observed OS close before STOP", {
@@ -480,13 +502,32 @@ test("lost ACK after durable QUIESCING retries exact reservation but never reope
   assert.ok((await stream.drain()).length > 0);
 });
 
+test("physical ciphertext GET defaults to mandatory owner-SPKI and mTLS witness quorum even with correct sealed root", {
+  skip: !enabled && "disposable PostgreSQL fixture required",
+}, async (t) => {
+  const c = await context(t);
+  const { rootHash } = await seedActualSealedCiphertext(c);
+  const physical = { gate: c.gate, supervisor: c.supervisor,
+    recorder: c.controller.recorder,
+    ciphertextReader: new Zk1SharedPgSealedGetReader({ gate: c.gate }),
+    expectedRootHash: rootHash };
+  for (const attempt of [physical,
+    { ...physical, quorumGuard: null },
+    { ...physical, allowUnverified: true },
+    { ...physical, legacyLabMode: true },
+  ]) assert.throws(() => new Zk1LabSupervisedGetEgress(attempt),
+    /ZK_LAB_GET_DENIED/, "operator-supplied bypass flags never grant physical ciphertext GET");
+  assert.equal(c.supervisor.sessions.size, 1,
+    "no unauthorized GET worker may start; the seeded PUT worker already STOPPED");
+});
+
 test("physical sealed PostgreSQL ciphertext reaches supervised HTTP peer byte-for-byte; forged root fails closed", {
   skip: !enabled && "disposable PostgreSQL fixture required",
 }, async (t) => {
   const c = await context(t);
   const { chunks, rootHash } = await seedActualSealedCiphertext(c);
   const reader = new Zk1SharedPgSealedGetReader({ gate: c.gate });
-  const wrongRoot = new Zk1LabSupervisedGetEgress({ gate: c.gate,
+  const wrongRoot = Zk1LabSupervisedGetEgress.createUnsafeLegacyLabFixture({ gate: c.gate,
     supervisor: c.supervisor, recorder: c.controller.recorder,
     ciphertextReader: reader, expectedRootHash: crypto.randomBytes(32) });
   const wrongIo = { ...c.io, workerId: crypto.randomBytes(16) };
@@ -495,7 +536,7 @@ test("physical sealed PostgreSQL ciphertext reaches supervised HTTP peer byte-fo
     "an unverified commitment cannot release even the first physical ciphertext byte");
   const forgedQuiesce = { ...c.reservation };
   // A refused transfer still requires physical STOP before FINISH or PENDING.
-  const controller = new Zk1LabSupervisedGetEgress({ gate: c.gate,
+  const controller = Zk1LabSupervisedGetEgress.createUnsafeLegacyLabFixture({ gate: c.gate,
     supervisor: c.supervisor, recorder: c.controller.recorder,
     ciphertextReader: reader, expectedRootHash: rootHash });
   const admitted = await controller.begin(c.io);
@@ -518,7 +559,7 @@ test("a second PostgreSQL gate host quiesces while real ciphertext GET is partia
   const c = await context(t);
   const { chunks, rootHash } = await seedActualSealedCiphertext(c);
   const reader = new Zk1SharedPgSealedGetReader({ gate: c.gate });
-  const controller = new Zk1LabSupervisedGetEgress({ gate: c.gate,
+  const controller = Zk1LabSupervisedGetEgress.createUnsafeLegacyLabFixture({ gate: c.gate,
     supervisor: c.supervisor, recorder: c.controller.recorder,
     ciphertextReader: reader, expectedRootHash: rootHash });
   const { port, token, admissionId, generation } = await controller.begin(c.io);
@@ -556,7 +597,7 @@ test("GET gate connection loss denies further physical ciphertext; surviving gat
   const isolatedPool = new Pool({ connectionString: process.env.ROOTARK_ZK1_RUNTIME_PG_URL });
   const isolatedGate = new Zk1SharedPgGateAuthority({ pool: isolatedPool,
     stopPinned: c.gate.stopPinned });
-  const controller = new Zk1LabSupervisedGetEgress({ gate: isolatedGate,
+  const controller = Zk1LabSupervisedGetEgress.createUnsafeLegacyLabFixture({ gate: isolatedGate,
     supervisor: c.supervisor, recorder: c.controller.recorder,
     ciphertextReader: new Zk1SharedPgSealedGetReader({ gate: isolatedGate }),
     expectedRootHash: rootHash });
@@ -652,4 +693,41 @@ test("independent witness mTLS partition and peer-pin substitution deny physical
   await assert.rejects(controller.begin(c.io), /ZK_LAB_QUORUM_UNAVAILABLE|ZK_LAB_GET_DENIED/);
   assert.equal(c.supervisor.sessions.size, 1,
     "the only supervised process is the already stopped PUT; failed GET never launches socket child");
+});
+
+test("hardened GET mid-stream witness partition plus concurrent resumes denies all further bytes until signed STOP", {
+  skip: !enabled ? "disposable PostgreSQL fixture required"
+    : !nativeWitnessSqliteReady && "native witness SQLite addon unavailable in this Node environment",
+}, async (t) => {
+  const c = await context(t);
+  const { chunks, rootHash } = await seedActualSealedCiphertext(c);
+  const witness = await isolatedWitness(t);
+  const guard = await Zk1SharedPgWitnessCasEgressGuard.establish({
+    witness: witness.client, witnessFloor: witness.genesis,
+    ...await signedRootFor(c, rootHash),
+  });
+  const controller = new Zk1LabSupervisedGetEgress({ gate: c.gate,
+    supervisor: c.supervisor, recorder: c.controller.recorder,
+    ciphertextReader: new Zk1SharedPgSealedGetReader({ gate: c.gate }),
+    expectedRootHash: rootHash, quorumGuard: guard });
+  const { port, token, child } = await controller.begin(c.io);
+  const stream = await pausedRequest(port, token);
+  await controller.waitPartial();
+  assert.deepEqual(stream.chunks[0], chunks[0]);
+  witness.child.kill("SIGKILL");
+  await new Promise((resolve) => witness.child.once("close", resolve));
+  const attempts = await Promise.allSettled([
+    controller.continueResponse(), controller.continueResponse(),
+  ]);
+  assert.equal(attempts.filter((item) => item.status === "fulfilled").length, 0);
+  assert.equal(attempts.filter((item) => item.status === "rejected").length, 2);
+  assert.equal((await c.gate.beginQuiesce(c.reservation)).state, "QUIESCING");
+  await assert.rejects(c.gate.markPending(c.reservation), /ZK_GATE_DRAIN_INCOMPLETE/,
+    "remote partition does not let the operator mark physical STOP early");
+  assert.equal((await controller.beginQuiesce(c.reservation)).state, "QUIESCING");
+  assert.equal((await controller.finishAfterQuiesce()).status, "FINISHED");
+  assert.equal(child.connected, false);
+  assert.equal((await c.gate.markPending(c.reservation)).status, "PENDING");
+  assert.deepEqual(await stream.drain(), chunks[0],
+    "no ciphertext leaves the real socket after mTLS witness partition");
 });
