@@ -280,6 +280,123 @@ test("a symlinked container or hardlinked metadata/payload cannot serve as backu
   blocked(inspect(symlink), "UNEXPECTED_FIXTURE_ENTRY");
 });
 
+test("directory replacement during inventory enumeration cannot verify externally linked signed ciphertext", (t) => {
+  const f = fixture(t);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-backup-race-outside-"));
+  const detached = path.join(outside, "detached-original");
+  const externalVersions = path.join(outside, "attacker-versions");
+  fs.mkdirSync(externalVersions);
+  for (const name of fs.readdirSync(path.join(f.dir, "versions"))) {
+    fs.copyFileSync(path.join(f.dir, "versions", name), path.join(externalVersions, name));
+  }
+  t.after(() => fs.rmSync(outside, { force: true, recursive: true }));
+  const versionsDir = path.join(f.dir, "versions");
+  const realReaddir = fs.readdirSync;
+  let swapped = false;
+  fs.readdirSync = function (target, options) {
+    if (!swapped && path.resolve(target) === versionsDir && options?.withFileTypes) {
+      fs.renameSync(versionsDir, detached);
+      try { fs.symlinkSync(externalVersions, versionsDir, process.platform === "win32" ? "junction" : "dir"); }
+      catch (error) {
+        fs.renameSync(detached, versionsDir);
+        throw error;
+      }
+      swapped = true;
+    }
+    return realReaddir.apply(this, arguments);
+  };
+  let report;
+  try { report = inspect(f); }
+  finally {
+    fs.readdirSync = realReaddir;
+    if (swapped) {
+      fs.rmSync(versionsDir, { force: true });
+      fs.renameSync(detached, versionsDir);
+    }
+  }
+  assert.equal(swapped, true, "the signed external ciphertext directory was actually traversed");
+  blocked(report, "UNSAFE_FIXTURE");
+});
+
+test("directory ABA replacement restored before enumeration returns invalidates parent metadata", (t) => {
+  const f = fixture(t);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-backup-race-aba-"));
+  const detached = path.join(outside, "original");
+  const other = path.join(outside, "external");
+  fs.mkdirSync(other);
+  const versionsDir = path.join(f.dir, "versions");
+  for (const name of fs.readdirSync(versionsDir))
+    fs.copyFileSync(path.join(versionsDir, name), path.join(other, name));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  const originalReaddir = fs.readdirSync;
+  let swapped = false;
+  fs.readdirSync = function (target, options) {
+    if (!swapped && path.resolve(target) === versionsDir && options?.withFileTypes) {
+      swapped = true;
+      fs.renameSync(versionsDir, detached);
+      try {
+        fs.symlinkSync(other, versionsDir, process.platform === "win32" ? "junction" : "dir");
+        return originalReaddir.apply(this, arguments);
+      } finally {
+        if (fs.lstatSync(versionsDir).isSymbolicLink()) fs.rmSync(versionsDir);
+        fs.renameSync(detached, versionsDir);
+      }
+    }
+    return originalReaddir.apply(this, arguments);
+  };
+  let report;
+  try { report = inspect(f); }
+  finally { fs.readdirSync = originalReaddir; }
+  assert.equal(swapped, true);
+  blocked(report, "UNSAFE_FIXTURE");
+});
+
+test("ancestor replacement immediately after an opened ciphertext read is rejected", (t) => {
+  const f = fixture(t);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-backup-race-read-"));
+  const detached = path.join(outside, "original");
+  const other = path.join(outside, "external");
+  fs.mkdirSync(other);
+  const versionsDir = path.join(f.dir, "versions");
+  for (const name of fs.readdirSync(versionsDir))
+    fs.copyFileSync(path.join(versionsDir, name), path.join(other, name));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  const originalRead = fs.readFileSync;
+  let reads = 0;
+  let swapped = false;
+  let renameBlocked = false;
+  fs.readFileSync = function (target) {
+    const result = originalRead.apply(this, arguments);
+    if (typeof target === "number" && ++reads === 5) {
+      try {
+        fs.renameSync(versionsDir, detached);
+        fs.symlinkSync(other, versionsDir, process.platform === "win32" ? "junction" : "dir");
+        swapped = true;
+      } catch (error) {
+        if (!fs.existsSync(versionsDir) && fs.existsSync(detached))
+          fs.renameSync(detached, versionsDir);
+        if (process.platform === "win32" && ["EPERM", "EACCES", "EBUSY"].includes(error.code)) {
+          renameBlocked = true;
+        }
+        throw error;
+      }
+    }
+    return result;
+  };
+  let report;
+  try { report = inspect(f); }
+  finally {
+    fs.readFileSync = originalRead;
+    if (swapped) {
+      fs.rmSync(versionsDir, { force: true });
+      fs.renameSync(detached, versionsDir);
+    }
+  }
+  assert.equal(swapped || renameBlocked, true,
+    `file descriptor reads=${reads}; findings=${JSON.stringify(report.findings)}`);
+  blocked(report, swapped ? "UNSAFE_FIXTURE" : "INVENTORY_INCOMPLETE");
+});
+
 test("metadata leak patterns, unexpected fields and unsupported modes cannot be trusted", (t) => {
   const f = fixture(t);
   const raw = JSON.parse(fs.readFileSync(path.join(f.dir, "backup-index.json"), "utf8"));

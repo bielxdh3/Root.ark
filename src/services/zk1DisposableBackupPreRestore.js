@@ -37,11 +37,31 @@ function exactKeys(value, fields) {
   return value && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).sort().join("|") === [...fields].sort().join("|");
 }
-function assertDirectory(dir) {
+function samePath(left, right) {
+  const a = path.resolve(left);
+  const b = path.resolve(right);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+function pinDirectory(dir) {
   try {
-    const stat = fs.lstatSync(dir);
+    const stat = fs.lstatSync(dir, { bigint: true });
     if (!stat.isDirectory() || stat.isSymbolicLink()) deny("UNSAFE_FIXTURE");
+    // A junction can redirect descendants even when the leaf file itself is
+    // opened with O_NOFOLLOW. Reject reparse/link resolution at EVERY parent.
+    const real = fs.realpathSync.native(dir);
+    if (!samePath(real, dir)) deny("UNSAFE_FIXTURE");
+    return { dir, dev: stat.dev, ino: stat.ino, mode: stat.mode,
+      birthtimeNs: stat.birthtimeNs, ctimeNs: stat.ctimeNs, real };
   } catch (_) { deny("UNSAFE_FIXTURE"); }
+}
+function verifyDirectoryPins(pins) {
+  for (const pinned of pins) {
+    const current = pinDirectory(pinned.dir);
+    if (current.dev !== pinned.dev || current.ino !== pinned.ino
+      || current.mode !== pinned.mode || current.birthtimeNs !== pinned.birthtimeNs
+      || (pinned.privateBoundary && current.ctimeNs !== pinned.ctimeNs)
+      || !samePath(current.real, pinned.real)) deny("UNSAFE_FIXTURE");
+  }
 }
 function safeRoot(input) {
   if (typeof input !== "string" || !path.isAbsolute(input)) deny("UNSAFE_FIXTURE");
@@ -51,28 +71,39 @@ function safeRoot(input) {
     deny("UNSAFE_FIXTURE");
   const parsed = path.parse(root);
   let current = parsed.root;
+  const pins = [pinDirectory(current)];
   for (const part of root.slice(current.length).split(path.sep).filter(Boolean)) {
     current = path.join(current, part);
-    assertDirectory(current);
+    verifyDirectoryPins(pins);
+    pins.push(pinDirectory(current));
+    verifyDirectoryPins(pins);
   }
-  return root;
+  // Shared OS ancestors can be changed by unrelated processes. Watch their
+  // identity; reserve change-time detection for the private fixture tree.
+  pins[pins.length - 1].privateBoundary = true;
+  return { root, pins };
 }
-function entriesExactly(dir, expected, directories = false) {
+function entriesExactly(dir, expected, verifyBoundary) {
+  verifyBoundary();
   let entries;
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
   catch (_) { deny("INVENTORY_INCOMPLETE"); }
+  verifyBoundary();
   const names = new Set(expected);
   for (const entry of entries) {
     if (!names.delete(entry.name)) deny("UNEXPECTED_FIXTURE_ENTRY");
-    if (entry.isSymbolicLink() || (directories ? !entry.isDirectory() : !entry.isFile()))
+    if (entry.isSymbolicLink() || !entry.isFile())
       deny("UNEXPECTED_FIXTURE_ENTRY");
   }
   if (names.size) deny("INVENTORY_INCOMPLETE");
+  verifyBoundary();
 }
-function checkRootEntries(root) {
+function checkRootEntries(root, verifyBoundary) {
+  verifyBoundary();
   let entries;
   try { entries = fs.readdirSync(root, { withFileTypes: true }); }
   catch (_) { deny("UNSAFE_FIXTURE"); }
+  verifyBoundary();
   const allowed = new Map([
     [".rootark-disposable-fixture", "file"], ["manifest.json", "file"],
     ["backup-index.json", "file"], ["owner-authorization.json", "file"], ["versions", "directory"],
@@ -86,24 +117,30 @@ function checkRootEntries(root) {
     allowed.delete(entry.name);
   }
   if (allowed.size) deny("INVENTORY_INCOMPLETE");
+  verifyBoundary();
 }
-function readRegular(file, maxSize, expectedFailure = "UNSAFE_FIXTURE_ENTRY") {
+function readRegular(file, maxSize, expectedFailure = "UNSAFE_FIXTURE_ENTRY", verifyBoundary = () => {}) {
   let descriptor;
   try {
+    verifyBoundary();
     const before = fs.lstatSync(file);
+    verifyBoundary();
     if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
       || before.size > maxSize) deny(expectedFailure);
     descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    verifyBoundary();
     const opened = fs.fstatSync(descriptor);
     if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev
       || opened.ino !== before.ino || opened.size !== before.size) deny(expectedFailure);
     const contents = fs.readFileSync(descriptor);
+    verifyBoundary();
     const after = fs.fstatSync(descriptor);
     const again = fs.lstatSync(file);
     if (contents.length !== opened.size || contents.length > maxSize
       || after.mtimeMs !== opened.mtimeMs || after.size !== opened.size
       || after.nlink !== 1 || again.nlink !== 1 || again.isSymbolicLink()
       || again.dev !== opened.dev || again.ino !== opened.ino) deny(expectedFailure);
+    verifyBoundary();
     return contents;
   } catch (error) {
     if (error instanceof Refusal) throw error;
@@ -214,27 +251,27 @@ function validateManifest(manifest, index, expectedCompartmentId, checkpoint) {
     || !compare(envelopes, index.envelopeIds)) deny("INVENTORY_INCOMPLETE");
   return { versions, copies, envelopes };
 }
-function verifyPayload(root, folder, entry, extension, expected, mismatch) {
+function verifyPayload(root, folder, entry, extension, expected, mismatch, verifyBoundary) {
   const file = path.join(root, folder, `${entry}.${extension}`);
-  const contents = readRegular(file, MAX_PAYLOAD_BYTES, "INVENTORY_INCOMPLETE");
+  const contents = readRegular(file, MAX_PAYLOAD_BYTES, "INVENTORY_INCOMPLETE", verifyBoundary);
   if (possibleLeak(contents)) deny("POSSIBLE_PLAINTEXT_OR_KEY_LEAK");
   if (!contents.length || sha(contents) !== expected) deny(mismatch);
 }
-function verifyAll(root, manifest, catalog) {
+function verifyAll(root, manifest, catalog, verifyBoundary) {
   for (const [folder, ids, extension] of [
     ["versions", catalog.versions, "ct"], ["copies", catalog.copies, "ct"],
     ["envelopes", catalog.envelopes, "env"],
   ]) {
     const dir = path.join(root, folder);
-    assertDirectory(dir);
-    entriesExactly(dir, ids.map((entry) => `${entry}.${extension}`));
+    entriesExactly(dir, ids.map((entry) => `${entry}.${extension}`), verifyBoundary);
   }
   for (const object of manifest.objects) for (const v of object.versions) {
-    verifyPayload(root, "versions", v.versionId, "ct", v.ciphertextSha256, "VERSION_DIGEST_MISMATCH");
-    verifyPayload(root, "copies", v.copyId, "ct", v.ciphertextSha256, "COPY_DIGEST_MISMATCH");
-    verifyPayload(root, "envelopes", v.ownerEnvelopeId, "env", v.ownerEnvelopeSha256, "ENVELOPE_DIGEST_MISMATCH");
-    verifyPayload(root, "envelopes", v.recoveryEnvelopeId, "env", v.recoveryEnvelopeSha256, "ENVELOPE_DIGEST_MISMATCH");
+    verifyPayload(root, "versions", v.versionId, "ct", v.ciphertextSha256, "VERSION_DIGEST_MISMATCH", verifyBoundary);
+    verifyPayload(root, "copies", v.copyId, "ct", v.ciphertextSha256, "COPY_DIGEST_MISMATCH", verifyBoundary);
+    verifyPayload(root, "envelopes", v.ownerEnvelopeId, "env", v.ownerEnvelopeSha256, "ENVELOPE_DIGEST_MISMATCH", verifyBoundary);
+    verifyPayload(root, "envelopes", v.recoveryEnvelopeId, "env", v.recoveryEnvelopeSha256, "ENVELOPE_DIGEST_MISMATCH", verifyBoundary);
   }
+  verifyBoundary();
 }
 function inspectZk1DisposableBackupPreRestore({ fixtureDir, expectedCompartmentId,
   checkpoint, trustedOwnerPublicKey } = {}) {
@@ -243,24 +280,38 @@ function inspectZk1DisposableBackupPreRestore({ fixtureDir, expectedCompartmentI
     checkedVersions: 0, checkedCopies: 0, checkedEnvelopes: 0,
     findings: [], blockers: [...BLOCKERS] };
   try {
-    const root = safeRoot(fixtureDir);
-    checkRootEntries(root);
-    const marker = readRegular(path.join(root, ".rootark-disposable-fixture"), 128);
+    const { root, pins } = safeRoot(fixtureDir);
+    const verifyBoundary = () => verifyDirectoryPins(pins);
+    checkRootEntries(root, verifyBoundary);
+    const marker = readRegular(path.join(root, ".rootark-disposable-fixture"), 128,
+      "UNSAFE_FIXTURE_ENTRY", verifyBoundary);
     if (marker.toString("utf8") !== "rootark-zk-backup-fixture-v1\n") deny("UNSAFE_FIXTURE");
     if (!id(expectedCompartmentId)) deny("COMPARTMENT_MISMATCH");
     if (!exactKeys(checkpoint, ["epoch", "revision"])
       || !nonNegInt(checkpoint.epoch) || !nonNegInt(checkpoint.revision))
       deny("CHECKPOINT_REQUIRED");
-    const indexBytes = readRegular(path.join(root, "backup-index.json"), MAX_METADATA_BYTES);
+    const indexBytes = readRegular(path.join(root, "backup-index.json"), MAX_METADATA_BYTES,
+      "UNSAFE_FIXTURE_ENTRY", verifyBoundary);
     const index = strictJson(indexBytes);
     validateIndex(index);
-    const manifestBytes = readRegular(path.join(root, "manifest.json"), MAX_METADATA_BYTES);
+    const manifestBytes = readRegular(path.join(root, "manifest.json"), MAX_METADATA_BYTES,
+      "UNSAFE_FIXTURE_ENTRY", verifyBoundary);
     if (sha(manifestBytes) !== index.manifestSha256) deny("MANIFEST_DIGEST_MISMATCH");
     const manifest = strictJson(manifestBytes);
     const catalog = validateManifest(manifest, index, expectedCompartmentId, checkpoint);
-    verifyOwnerBackupApproval(readRegular(path.join(root, "owner-authorization.json"), 4096),
+    verifyOwnerBackupApproval(readRegular(path.join(root, "owner-authorization.json"), 4096,
+      "UNSAFE_FIXTURE_ENTRY", verifyBoundary),
       trustedOwnerPublicKey, indexBytes, manifestBytes, manifest);
-    verifyAll(root, manifest, catalog);
+    // Freeze the identities of ALL child containers before any inventory
+    // enumeration or ciphertext read. Check them after every filesystem call.
+    for (const folder of ["versions", "copies", "envelopes"]) {
+      verifyBoundary();
+      const pinnedChild = pinDirectory(path.join(root, folder));
+      pinnedChild.privateBoundary = true;
+      pins.push(pinnedChild);
+      verifyBoundary();
+    }
+    verifyAll(root, manifest, catalog, verifyBoundary);
     report.fixtureVerified = true;
     report.ownerAuthorizationVerified = true;
     report.checkedVersions = catalog.versions.length;
