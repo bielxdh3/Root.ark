@@ -4,6 +4,7 @@
 // UNTRUSTED until reconciled with the separately signed fresh witness head.
 const https = require("node:https");
 const tls = require("node:tls");
+const net = require("node:net");
 const { performance } = require("node:perf_hooks");
 
 const PIN = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
@@ -78,7 +79,8 @@ function createZk1CasManifestHttpsClient({
           path: history ? "/v1/history" : url.pathname,
           agent: false, // do not reuse a socket authenticated under another TLS pin
           ca, cert: clientCert, key: clientKey, rejectUnauthorized: true,
-          minVersion: "TLSv1.3", servername: url.hostname,
+          // Literal IP endpoints use IP SAN, never an IP-valued SNI name.
+          minVersion: "TLSv1.3", servername: net.isIP(url.hostname) ? "" : url.hostname,
           checkServerIdentity(hostname, peer) {
             const failure = tls.checkServerIdentity(hostname, peer);
             if (failure) return failure;

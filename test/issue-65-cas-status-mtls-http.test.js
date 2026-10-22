@@ -500,4 +500,99 @@ test("real mTLS CAS endpoint handles signed v2 commit, rejects alien scope, and 
     }).getTerminalProof({ query, nonce: crypto.randomBytes(32) }),
     /CAS_STATUS_TRANSPORT_UNAVAILABLE/, "remote TLS identity pin still applies");
   } finally { await privatelyBound.stop(); }
+
+  // Exercise the real signed register/commit and manifest/history transports
+  // on the assigned private adapter. This separate disposable ledger uses the
+  // fixture's signed witness ticket and fixed test clock (the standalone
+  // recovered fixture above has a deliberately historical expiration time).
+  const privateLedger = new Zk1DurableCasStatusLedger(path.join(dir, "private-writer.sqlite"), {
+    bootstrapNew: true, statusPrivateKey: statusKeys.privateKey,
+    anchorPath: path.join(dir, "private-writer-anchor.log"),
+    statusKeyId, witnessPinned: { keyId: witnessKeyId, publicKey: witnessKeys.publicKey },
+    nowSeconds: () => 1100,
+  });
+  connections.add(privateLedger);
+  const newCert = fs.readFileSync(path.join(dir, "server.pem"));
+  const privateServer = createZk1CasStatusHttpsServer({
+    key: tls.serverKey, cert: newCert, clientCa: tls.ca, ledger: privateLedger,
+    principals: config.principals,
+  });
+  await new Promise((resolve) => privateServer.listen(0, privateHost, resolve));
+  try {
+    const privateBase = `https://${privateHost}:${privateServer.address().port}`;
+    const realFingerprint = new crypto.X509Certificate(newCert).fingerprint256;
+    const privateWriter = createZk1CasWriteHttpsClient({
+      endpoint: privateBase, ca: tls.ca,
+      clientKey: tls.allowedKey, clientCert: tls.allowedCert,
+      serverFingerprint256: realFingerprint,
+    });
+    const privateReader = createZk1CasManifestHttpsClient({
+      endpoint: privateBase + "/v1/manifest", ca: tls.ca,
+      clientKey: tls.deniedKey, clientCert: tls.deniedCert,
+      serverFingerprint256: realFingerprint,
+    });
+    assert.deepEqual(await privateWriter.register({ receipt: ticket }), { status: "pending" });
+    assert.deepEqual(await privateWriter.commit({ receipt: ticket, manifestBytes: raw }),
+      { status: "committed", replay: false });
+    assert.deepEqual(await privateWriter.commit({ receipt: ticket, manifestBytes: raw }),
+      { status: "committed", replay: true }, "signed write replay stays idempotent over private IP");
+    assert.deepEqual(await privateReader.getCommittedManifest({ scope: readScope }), raw);
+    assert.deepEqual((await privateReader.getCommittedHistoryPage({
+      scope: readScope, startRevision: 1,
+    })).entries, [raw]);
+    assert.deepEqual((await privateReader.getCommittedHistory({ scope: readScope })).entries, [raw]);
+    assert.equal((await send(privateServer.address().port, tls, "/v1/register",
+      registerBody, "denied", privateHost)).status, 403,
+    "private manifest peer cannot register a signed write");
+    assert.equal((await send(privateServer.address().port, tls, "/v1/manifest",
+      { scope: scopeJson }, "allowed", privateHost)).status, 403,
+    "private writer peer cannot read a manifest");
+    assert.equal((await send(privateServer.address().port, tls, "/v1/manifest", {
+      scope: { ...scopeJson, keyring_id: enc(crypto.randomBytes(16)) },
+    }, "denied", privateHost)).status, 403,
+    "private manifest peer cannot cross protected scope");
+    await assert.rejects(createZk1CasWriteHttpsClient({
+      endpoint: privateBase, ca: tls.ca,
+      clientKey: tls.allowedKey, clientCert: tls.allowedCert,
+      serverFingerprint256: "00:".repeat(31) + "00",
+    }).commit({ receipt: ticket, manifestBytes: raw }), /CAS_WRITE_TRANSPORT_UNAVAILABLE/);
+    await assert.rejects(createZk1CasManifestHttpsClient({
+      endpoint: privateBase + "/v1/manifest", ca: tls.ca,
+      clientKey: tls.deniedKey, clientCert: tls.deniedCert,
+      serverFingerprint256: "00:".repeat(31) + "00",
+    }).getCommittedManifest({ scope: readScope }), /CAS_MANIFEST_TRANSPORT_UNAVAILABLE/);
+    assert.throws(() => createZk1CasWriteHttpsClient({
+      endpoint: privateBase + "/v1/commit", ca: tls.ca,
+      clientKey: tls.allowedKey, clientCert: tls.allowedCert,
+      serverFingerprint256: realFingerprint,
+    }), /CAS_WRITE_TRANSPORT_UNAVAILABLE/, "writer base endpoint cannot carry a path");
+    assert.throws(() => createZk1CasManifestHttpsClient({
+      endpoint: privateBase + "/v1/history", ca: tls.ca,
+      clientKey: tls.deniedKey, clientCert: tls.deniedCert,
+      serverFingerprint256: realFingerprint,
+    }), /CAS_MANIFEST_TRANSPORT_UNAVAILABLE/,
+    "manifest endpoint cannot be switched to another route");
+
+    const wrongSan = createZk1CasStatusHttpsServer({
+      key: tls.serverKey, cert: tls.serverCert, clientCa: tls.ca, ledger: privateLedger,
+      principals: config.principals,
+    });
+    await new Promise((resolve) => wrongSan.listen(0, privateHost, resolve));
+    try {
+      const wrongBase = `https://${privateHost}:${wrongSan.address().port}`;
+      const wrongCertFingerprint = new crypto.X509Certificate(tls.serverCert).fingerprint256;
+      await assert.rejects(createZk1CasWriteHttpsClient({
+        endpoint: wrongBase, ca: tls.ca,
+        clientKey: tls.allowedKey, clientCert: tls.allowedCert,
+        serverFingerprint256: wrongCertFingerprint,
+      }).register({ receipt: ticket }), /CAS_WRITE_TRANSPORT_UNAVAILABLE/,
+      "trusted CA and exact fingerprint cannot override missing IP SAN");
+      await assert.rejects(createZk1CasManifestHttpsClient({
+        endpoint: wrongBase + "/v1/manifest", ca: tls.ca,
+        clientKey: tls.deniedKey, clientCert: tls.deniedCert,
+        serverFingerprint256: wrongCertFingerprint,
+      }).getCommittedManifest({ scope: readScope }), /CAS_MANIFEST_TRANSPORT_UNAVAILABLE/,
+      "manifest read fails closed on a certificate missing the private IP SAN");
+    } finally { await drainZk1CasStatusHttpsServer(wrongSan); }
+  } finally { await drainZk1CasStatusHttpsServer(privateServer); }
 });

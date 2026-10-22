@@ -6,6 +6,7 @@
 // witness must verify signed CAS status before protected state is trusted.
 const https = require("node:https");
 const tls = require("node:tls");
+const net = require("node:net");
 
 const FINGERPRINT = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
 const B64U = /^[A-Za-z0-9_-]+$/;
@@ -58,7 +59,8 @@ function createZk1CasWriteHttpsClient({
         hostname: url.hostname, port: url.port, path, method: "POST",
         agent: false, // never borrow a socket verified by another writer pin
         ca, key: clientKey, cert: clientCert, rejectUnauthorized: true,
-        minVersion: "TLSv1.3", servername: url.hostname,
+        // SNI carries DNS names only; IP SAN is still checked below.
+        minVersion: "TLSv1.3", servername: net.isIP(url.hostname) ? "" : url.hostname,
         checkServerIdentity(hostname, peer) {
           const hostFailure = tls.checkServerIdentity(hostname, peer);
           if (hostFailure) return hostFailure;
