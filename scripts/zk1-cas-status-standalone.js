@@ -7,6 +7,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { Zk1DurableCasStatusLedger } = require("../src/services/zk1DurableCasStatusLedger");
+const { Zk1CasTerminalAnchor } = require("../src/services/zk1CasTerminalAnchor");
+const { Zk1WitnessCasAnchorHttpsClient } =
+  require("../src/services/zk1WitnessCasAnchorHttpsClient");
 const { createZk1CasStatusHttpsServer, drainZk1CasStatusHttpsServer } = require("../src/services/zk1CasStatusHttpsServer");
 
 const FIELDS = Object.freeze([
@@ -14,6 +17,8 @@ const FIELDS = Object.freeze([
   "statusPrivateKeyPath", "witnessKeyId", "witnessPublicKeyPath",
   "serverKeyPath", "serverCertPath", "clientCaPath", "principals",
 ]);
+const ANCHOR_FIELDS = Object.freeze(["endpoint", "caPath", "clientKeyPath",
+  "clientCertPath", "serverFingerprint256"]);
 function fail() { throw new Error("CAS_STATUS_STARTUP_FAILED"); }
 function exact(value, fields) {
   if (!value || typeof value !== "object" || Array.isArray(value)
@@ -34,8 +39,9 @@ function id(value) {
   if (result.length !== 16 || result.toString("base64url") !== value) fail();
   return result;
 }
-function configure(config) {
-  exact(config, FIELDS);
+async function configure(config) {
+  exact(config, Object.hasOwn(config || {}, "casAnchorWitness")
+    ? [...FIELDS, "casAnchorWitness"] : FIELDS);
   if ((config.bootstrapNew !== true && config.bootstrapNew !== false)
     || !["127.0.0.1", "::1"].includes(config.listenHost)
     || !Number.isSafeInteger(config.listenPort)
@@ -43,15 +49,46 @@ function configure(config) {
     || typeof config.dbPath !== "string" || !path.isAbsolute(config.dbPath)
     || typeof config.anchorPath !== "string" || !path.isAbsolute(config.anchorPath)
     || path.resolve(config.anchorPath) === path.resolve(config.dbPath)) fail();
+  const statusKeyId = id(config.statusKeyId);
+  const statusPrivateKey = crypto.createPrivateKey(readFile(config.statusPrivateKeyPath));
+  const witnessKeyId = id(config.witnessKeyId);
+  const witnessPublicKey = crypto.createPublicKey(readFile(config.witnessPublicKeyPath));
+  let casAnchorWitness = null;
+  let trustedAnchorMinimumHead;
+  if (Object.hasOwn(config, "casAnchorWitness")) {
+    exact(config.casAnchorWitness, ANCHOR_FIELDS);
+    const settings = config.casAnchorWitness;
+    casAnchorWitness = new Zk1WitnessCasAnchorHttpsClient({
+      endpoint: settings.endpoint, ca: readFile(settings.caPath),
+      clientKey: readFile(settings.clientKeyPath),
+      clientCert: readFile(settings.clientCertPath),
+      serverFingerprint256: settings.serverFingerprint256,
+      pinnedWitnessPublicKey: witnessPublicKey,
+      pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
+    });
+    // Fail BEFORE opening or creating CAS SQLite on witness outage, nonce
+    // replay, wrong signer or rollback. Never trust a locally derived floor.
+    trustedAnchorMinimumHead = await casAnchorWitness.freshHead();
+    if (!config.bootstrapNew && trustedAnchorMinimumHead.sequence === 0) {
+      // An existing, nonempty CAS history cannot enroll into an EMPTY
+      // independent witness floor without separately reviewed owner-backed
+      // migration. It would bless a jointly rolled-back legacy CAS.
+      const journal = new Zk1CasTerminalAnchor(config.anchorPath, {
+        bootstrapNew: false, statusKeyId, statusPrivateKey,
+        trustedMinimumHead: trustedAnchorMinimumHead,
+        witnessRequired: true, witnessKeyId,
+      });
+      if (journal.headCheckpoint().sequence !== 0) fail();
+    }
+  }
   const ledger = new Zk1DurableCasStatusLedger(config.dbPath, {
     bootstrapNew: config.bootstrapNew,
     anchorPath: config.anchorPath,
-    statusKeyId: id(config.statusKeyId),
-    statusPrivateKey: crypto.createPrivateKey(readFile(config.statusPrivateKeyPath)),
+    statusKeyId, statusPrivateKey,
     witnessPinned: {
-      keyId: id(config.witnessKeyId),
-      publicKey: crypto.createPublicKey(readFile(config.witnessPublicKeyPath)),
+      keyId: witnessKeyId, publicKey: witnessPublicKey,
     },
+    casAnchorWitness, trustedAnchorMinimumHead,
   });
   try {
     return {
@@ -72,7 +109,7 @@ function configure(config) {
 async function main() {
   if (process.argv.length !== 4 || process.argv[2] !== "--config") fail();
   const config = JSON.parse(readFile(process.argv[3]).toString("utf8"));
-  const { ledger, server } = configure(config);
+  const { ledger, server } = await configure(config);
   let stopping = false;
   const close = () => {
     if (stopping) return;

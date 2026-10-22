@@ -11,6 +11,7 @@ const path = require("node:path");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/cas-terminal-anchor/v1\0", "ascii");
 const INTENT_DOMAIN = Buffer.from("Root.ark/zk-1/cas-terminal-intent/v1\0", "ascii");
+const WITNESS_POLICY_DOMAIN = Buffer.from("Root.ark/zk-1/cas-witness-required/v1\0", "ascii");
 const MAX_BYTES = 64 * 1024 * 1024;
 function fail() {
   const error = new Error("CAS_ANCHOR_INVALID");
@@ -46,16 +47,30 @@ class Zk1CasTerminalAnchor {
   #verifiedSnapshot = null;
   #verifiedFileIdentity = null;
   constructor(filename, { bootstrapNew, statusKeyId, statusPrivateKey,
-    trustedMinimumHead } = {}) {
+    trustedMinimumHead, witnessRequired = false, witnessKeyId } = {}) {
     if (typeof filename !== "string" || !path.isAbsolute(filename)
       || !(statusPrivateKey instanceof crypto.KeyObject)
       || statusPrivateKey.asymmetricKeyType !== "ed25519" || statusPrivateKey.type !== "private"
-      || !Buffer.isBuffer(statusKeyId) || statusKeyId.length !== 16) fail();
+      || !Buffer.isBuffer(statusKeyId) || statusKeyId.length !== 16
+      || typeof witnessRequired !== "boolean"
+      || (witnessRequired && (!Buffer.isBuffer(witnessKeyId)
+        || witnessKeyId.length !== 16 || witnessKeyId.equals(statusKeyId)))) fail();
     this.filename = filename;
     this.privateKey = statusPrivateKey;
     this.publicKey = crypto.createPublicKey(statusPrivateKey);
     this.identity = { type: "rootark-zk1-cas-anchor/v1", keyId: base64(statusKeyId),
       fingerprint: digest(this.publicKey.export({ type: "spki", format: "der" })) };
+    if (witnessRequired) {
+      // Persist an Ed25519-signed enrollment in the *independent signed CAS
+      // anchor file*, not the CAS-writable SQLite identity table. A SQL-only
+      // attacker cannot erase mandatory witness protection by flipping a bit
+      // and then starting the legacy standalone service with missing config.
+      const policy = { ...this.identity, witnessRequired: true,
+        witnessKeyId: base64(witnessKeyId) };
+      this.identity = { ...policy, policySignature: base64(crypto.sign(null,
+        Buffer.concat([WITNESS_POLICY_DOMAIN, Buffer.from(JSON.stringify(policy))]),
+        statusPrivateKey)) };
+    }
     this.records = new Map();
     this.anchoredScopes = new Set();
     this.sequence = 0;
@@ -83,7 +98,8 @@ class Zk1CasTerminalAnchor {
     if (!fs.existsSync(filename)) {
       // A nonempty independently pinned floor means THIS IS A RESTART, not
       // a bootstrap. Refuse before creating even a genesis anchor file.
-      if (this.#trustedMinimumHead !== undefined) fail();
+      if (this.#trustedMinimumHead !== undefined
+        && this.#trustedMinimumHead.sequence !== 0) fail();
       if (bootstrapNew !== true) fail();
       // Do not create an implicit new anchor at an unexpected path on restart.
       fs.mkdirSync(path.dirname(filename), { recursive: true });
@@ -159,7 +175,7 @@ class Zk1CasTerminalAnchor {
     let identity;
     try { identity = JSON.parse(lines.shift()); }
     catch (_) { fail(); }
-    strict(identity, ["type", "keyId", "fingerprint"]);
+    strict(identity, Object.keys(this.identity));
     if (JSON.stringify(identity) !== JSON.stringify(this.identity)) fail();
     for (const line of lines) {
       let item;
@@ -192,6 +208,19 @@ class Zk1CasTerminalAnchor {
     // outside this host/operator. It is not an independent anchor by itself.
     this.reload(true);
     return Object.freeze({ sequence: this.sequence, lastHash: this.previousHash });
+  }
+
+  signedRecordPage({ afterSequence, limit = 16 } = {}) {
+    if (!Number.isSafeInteger(afterSequence) || afterSequence < 0
+      || !Number.isSafeInteger(limit) || limit < 1 || limit > 16) fail();
+    this.reload(true);
+    if (afterSequence > this.sequence) fail();
+    // Internal records are parsed, signed, canonical JSON objects in strictly
+    // ascending sequence order. Never ship raw caller-supplied operation data.
+    return Object.freeze([...this.records.values()]
+      .filter((entry) => entry.sequence > afterSequence)
+      .slice(0, limit)
+      .map((entry) => JSON.stringify(entry)));
   }
 
   verify(item) {

@@ -10,6 +10,8 @@ const crypto = require("node:crypto");
 const { Zk1DurableWitnessLedger } = require("../src/services/zk1DurableWitnessLedger");
 const { createZk1WitnessHttpsServer, drainZk1WitnessHttpsServer } = require("../src/services/zk1WitnessHttpsServer");
 const { createZk1CasStatusHttpsClient } = require("../src/services/zk1CasStatusHttpsClient");
+const { Zk1WitnessCasAnchorFloor } =
+  require("../src/services/zk1WitnessCasAnchorFloor");
 
 const TOP_FIELDS = Object.freeze([
   "listenHost", "listenPort", "bootstrapNew", "dbPath", "witnessKeyId",
@@ -40,7 +42,8 @@ function decodeId(value) {
   return buffer;
 }
 function configure(config) {
-  exact(config, TOP_FIELDS);
+  exact(config, Object.hasOwn(config || {}, "casAnchorFloor")
+    ? [...TOP_FIELDS, "casAnchorFloor"] : TOP_FIELDS);
   exact(config.cas, CAS_FIELDS);
   if (config.bootstrapNew !== true && config.bootstrapNew !== false) fail();
   // Only bind loopback by default. A remote deployment requires a reviewed
@@ -56,16 +59,47 @@ function configure(config) {
     clientCert: readFile(config.cas.clientCertPath),
     serverFingerprint256: config.cas.serverFingerprint256,
   });
-  const ledger = new Zk1DurableWitnessLedger(config.dbPath, {
+  const witnessKeyId = decodeId(config.witnessKeyId);
+  const witnessPrivateKey = crypto.createPrivateKey(readFile(config.witnessPrivateKeyPath));
+  const statusKeyId = decodeId(config.statusKeyId);
+  const statusPublicKey = crypto.createPublicKey(readFile(config.statusPublicKeyPath));
+  let floor = null;
+  if (Object.hasOwn(config, "casAnchorFloor")) {
+    // This is provisioned by the OUTSIDE owner/witness overseer. A restarted
+    // witness may not derive its own minimum from its restored SQLite file.
+    // The operator must advance this out-of-band checkpoint after witnessed
+    // receipts; a stale external checkpoint cannot prevent every rollback.
+    exact(config.casAnchorFloor, ["dbPath", "trustedMinimumHead"]);
+    exact(config.casAnchorFloor.trustedMinimumHead, ["sequence", "lastHash"]);
+    if (typeof config.casAnchorFloor.dbPath !== "string"
+      || !path.isAbsolute(config.casAnchorFloor.dbPath)
+      || path.resolve(config.casAnchorFloor.dbPath) === path.resolve(config.dbPath)
+      || !Number.isSafeInteger(config.casAnchorFloor.trustedMinimumHead.sequence)
+      || config.casAnchorFloor.trustedMinimumHead.sequence < 0
+      || config.casAnchorFloor.trustedMinimumHead.sequence > 100000
+      || typeof config.casAnchorFloor.trustedMinimumHead.lastHash !== "string"
+      || !/^[a-f0-9]{64}$/.test(config.casAnchorFloor.trustedMinimumHead.lastHash)
+      || (config.casAnchorFloor.trustedMinimumHead.sequence === 0
+        && config.casAnchorFloor.trustedMinimumHead.lastHash !== "0".repeat(64))) fail();
+    if (fs.existsSync(config.casAnchorFloor.dbPath)
+      && fs.existsSync(config.dbPath)
+      && fs.realpathSync.native(config.casAnchorFloor.dbPath).toLowerCase()
+        === fs.realpathSync.native(config.dbPath).toLowerCase()) fail();
+    floor = new Zk1WitnessCasAnchorFloor(config.casAnchorFloor.dbPath, {
+      bootstrapNew: config.bootstrapNew, witnessKeyId,
+      witnessPrivateKey, statusKeyId, statusPublicKey,
+      trustedMinimumHead: config.casAnchorFloor.trustedMinimumHead,
+    });
+  }
+  let ledger;
+  try { ledger = new Zk1DurableWitnessLedger(config.dbPath, {
     bootstrapNew: config.bootstrapNew,
-    witnessKeyId: decodeId(config.witnessKeyId),
-    witnessPrivateKey: crypto.createPrivateKey(readFile(config.witnessPrivateKeyPath)),
+    witnessKeyId, witnessPrivateKey,
     statusPinned: {
-      keyId: decodeId(config.statusKeyId),
-      publicKey: crypto.createPublicKey(readFile(config.statusPublicKeyPath)),
+      keyId: statusKeyId, publicKey: statusPublicKey,
     },
     statusProvider,
-  });
+  }); } catch (error) { floor?.close(); throw error; }
   try {
     const server = createZk1WitnessHttpsServer({
       key: readFile(config.serverKeyPath),
@@ -73,19 +107,22 @@ function configure(config) {
       clientCa: readFile(config.clientCaPath),
       principals: config.principals,
       ledger,
+      casAnchorFloor: floor,
     });
-    return { server, ledger };
+    return { server, ledger, floor };
   } catch (error) {
     ledger.close();
+    floor?.close();
     throw error;
   }
 }
 async function main() {
   if (process.argv.length !== 4 || process.argv[2] !== "--config") fail();
   const config = JSON.parse(readFile(process.argv[3]).toString("utf8"));
-  const { server, ledger } = configure(config);
+  const { server, ledger, floor } = configure(config);
   server.once("error", () => {
     try { ledger.close(); } catch (_) { /* fail closed */ }
+    try { floor?.close(); } catch (_) { /* fail closed */ }
     process.stderr.write("WITNESS_STARTUP_FAILED\n");
     process.exitCode = 1;
   });
@@ -93,10 +130,14 @@ async function main() {
   const close = () => {
     if (stopping) return;
     stopping = true;
-    void drainZk1WitnessHttpsServer(server).then(() => ledger.close()).catch(() => {
+    void drainZk1WitnessHttpsServer(server).then(() => {
+      ledger.close();
+      floor?.close();
+    }).catch(() => {
       // Do not print errors or sensitive config on shutdown failure.
       process.exitCode = 1;
       try { ledger.close(); } catch (_) { /* fail closed */ }
+      try { floor?.close(); } catch (_) { /* fail closed */ }
     });
   };
   process.on("SIGTERM", close);

@@ -20,6 +20,8 @@ const ROLES = Object.freeze({
   "/v1/quiesce/cancel-expired": "reserve",
   "/v1/admission/start": "admit",
   "/v1/admission/finish": "admit",
+  "/v1/cas-anchor/head": "cas-anchor",
+  "/v1/cas-anchor/advance": "cas-anchor",
 });
 const SCOPE_FIELDS = Object.freeze(["account_id", "compartment_id", "keyring_id"]);
 const OP_FIELDS = Object.freeze([
@@ -90,16 +92,16 @@ function write(res, status, value) {
   });
   res.end(raw);
 }
-async function readBoundedJson(req) {
+async function readBoundedJson(req, maxBodyBytes = MAX_BODY_BYTES) {
   if (req.headers["content-type"] !== "application/json") invalid();
   const length = req.headers["content-length"];
   if (length !== undefined && (!/^\d+$/.test(length)
-    || Number(length) > MAX_BODY_BYTES)) invalid();
+    || Number(length) > maxBodyBytes)) invalid();
   const parts = [];
   let total = 0;
   for await (const part of req) {
     total += part.length;
-    if (total > MAX_BODY_BYTES) invalid();
+    if (total > maxBodyBytes) invalid();
     parts.push(part);
   }
   if (total === 0) invalid();
@@ -127,7 +129,8 @@ function drainZk1WitnessHttpsServer(server, { deadlineMs = 1500 } = {}) {
   });
 }
 
-function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals }) {
+function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals,
+  casAnchorFloor = null }) {
   if (!key || !cert || !clientCa || !ledger
     || typeof ledger.reserve !== "function" || typeof ledger.freshHead !== "function"
     || typeof ledger.resolve !== "function"
@@ -146,9 +149,17 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals }
     if (!/^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i.test(fingerprint)
       || !Array.isArray(roles) || roles.length === 0
       || roles.some((role) => !Object.values(ROLES).includes(role))
-      || !Array.isArray(scopes) || scopes.length === 0 || scopes.length > 64
+      || !Array.isArray(scopes) || scopes.length > 64
       || !Array.isArray(initializeKeys) || initializeKeys.length > 64
       || (initializeKeys.length > 0 && !roles.includes("reserve"))) invalid();
+    // This principal can advance the GLOBAL CAS terminal high-water. Never
+    // co-grant it a content/recovery reserve/head/IO role, and never silently
+    // accept it when the separate witness-owned floor is not configured.
+    if (roles.includes("cas-anchor")
+      ? roles.length !== 1 || scopes.length !== 0 || initializeKeys.length !== 0
+        || !casAnchorFloor || typeof casAnchorFloor.advance !== "function"
+        || typeof casAnchorFloor.freshHead !== "function"
+      : scopes.length === 0) invalid();
     const scoped = new Set(scopes.map((scope) => scopeKey(normalize(scope, SCOPE_FIELDS))));
     if (scoped.size !== scopes.length) invalid();
     const initializers = new Map();
@@ -184,7 +195,19 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals }
         // Refuse before buffering any externally supplied JSON.
         return write(res, 403, { error: "FORBIDDEN" });
       }
-      const body = await readBoundedJson(req);
+      const body = await readBoundedJson(req,
+        req.url === "/v1/cas-anchor/advance" ? 40 * 1024 : MAX_BODY_BYTES);
+      if (req.url === "/v1/cas-anchor/head") {
+        exact(body, ["nonce"]);
+        const head = casAnchorFloor.freshHead({ nonce: decode(body.nonce, BYTE_FIELDS.nonce) });
+        return write(res, 200, { head, authority: "WITNESS_CAS_ANCHOR_FLOOR_V1" });
+      }
+      if (req.url === "/v1/cas-anchor/advance") {
+        exact(body, ["records"]);
+        const result = casAnchorFloor.advance({ records: body.records });
+        return write(res, 200, { sequence: result.sequence,
+          lastHash: result.lastHash, authority: "WITNESS_CAS_ANCHOR_FLOOR_V1" });
+      }
       if (req.url === "/v1/quiesce" || req.url === "/v1/quiesce/cancel-expired") {
         exact(body, ["operation"]);
         const operation = normalize(body.operation, OP_FIELDS);

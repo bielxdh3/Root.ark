@@ -94,8 +94,12 @@ function identityFingerprint(publicKey) {
 }
 
 class Zk1DurableCasStatusLedger {
+  #casAnchorWitness = null;
+  #lastWitnessFloor = null;
+  #anchorQueue = Promise.resolve();
   constructor(filename, { bootstrapNew = false, statusKeyId, statusPrivateKey,
-    witnessPinned, nowSeconds, anchorPath, trustedAnchorMinimumHead } = {}) {
+    witnessPinned, nowSeconds, anchorPath, trustedAnchorMinimumHead,
+    casAnchorWitness = null } = {}) {
     if (typeof filename !== "string" || !filename
       || !(statusPrivateKey instanceof crypto.KeyObject)
       || statusPrivateKey.type !== "private" || statusPrivateKey.asymmetricKeyType !== "ed25519"
@@ -119,7 +123,20 @@ class Zk1DurableCasStatusLedger {
     // A nonempty external floor identifies an existing independently kept
     // terminal history, never a reason to create an empty writable CAS.
     // Reject malformed/bootstrap floor settings before creating either disk.
-    if (!existed && trustedAnchorMinimumHead !== undefined) fail("CAS_ANCHOR_REQUIRED");
+    if (!existed && trustedAnchorMinimumHead !== undefined
+      && trustedAnchorMinimumHead.sequence !== 0) fail("CAS_ANCHOR_REQUIRED");
+    if (casAnchorWitness !== null) {
+      const { Zk1WitnessCasAnchorHttpsClient } = require("./zk1WitnessCasAnchorHttpsClient");
+      if (!(casAnchorWitness instanceof Zk1WitnessCasAnchorHttpsClient)
+        || !trustedAnchorMinimumHead || typeof trustedAnchorMinimumHead !== "object"
+        || !Number.isSafeInteger(trustedAnchorMinimumHead.sequence)
+        || typeof trustedAnchorMinimumHead.lastHash !== "string") fail("CAS_ANCHOR_REQUIRED");
+      this.#casAnchorWitness = casAnchorWitness;
+      this.#lastWitnessFloor = Object.freeze({
+        sequence: trustedAnchorMinimumHead.sequence,
+        lastHash: trustedAnchorMinimumHead.lastHash,
+      });
+    }
     if (typeof anchorPath !== "string" || !path.isAbsolute(anchorPath)
       || path.resolve(anchorPath) === absolute) fail("CAS_ANCHOR_REQUIRED");
     const anchorExisted = fs.existsSync(anchorPath);
@@ -138,7 +155,14 @@ class Zk1DurableCasStatusLedger {
       if (!same(row.status_id, this.statusKeyId)
         || !same(row.status_fingerprint, ownFp)
         || !same(row.witness_id, this.witnessKeyId)
-        || !same(row.witness_fingerprint, witnessFp)) fail("CAS_IDENTITY_MISMATCH");
+        || !same(row.witness_fingerprint, witnessFp)
+        || (row.cas_anchor_witness_required ?? 0) !== (casAnchorWitness === null ? 0 : 1)) {
+        // A CAS bootstrapped in strict witness-anchor mode MUST NOT restart
+        // without its independent witness, even if both local files are valid.
+        // Likewise never bless an old unauthenticated CAS by toggling on the
+        // new mode after arbitrary historical commits without a migration.
+        fail("CAS_IDENTITY_MISMATCH");
+      }
     };
     const fileIdentity = () => {
       const stat = fs.statSync(absolute, { bigint: true });
@@ -153,10 +177,19 @@ class Zk1DurableCasStatusLedger {
       try { verifyIdentity(readonly); }
       finally { readonly.close(); }
       // Refuse invalid foreign anchors before any SQLite write-mode open.
-      new Zk1CasTerminalAnchor(anchorPath, {
+      const inspectedAnchor = new Zk1CasTerminalAnchor(anchorPath, {
         bootstrapNew: false, statusKeyId: this.statusKeyId, statusPrivateKey,
         trustedMinimumHead: trustedAnchorMinimumHead,
+        witnessRequired: casAnchorWitness !== null,
+        witnessKeyId: this.witnessKeyId,
       });
+      if (this.#casAnchorWitness && this.#lastWitnessFloor.sequence === 0
+        && inspectedAnchor.headCheckpoint().sequence !== 0) {
+        // A zero witness floor cannot retroactively attest a nonempty CAS
+        // history. Such a migration needs a separately reviewed owner-signed
+        // external baseline, not trust-on-first-use in the status authority.
+        fail("CAS_ANCHOR_REQUIRED");
+      }
       if (fileIdentity() !== expectedFile) fail("CAS_STATE_MISSING");
     } else {
       fs.mkdirSync(path.dirname(absolute), { recursive: true });
@@ -180,7 +213,9 @@ class Zk1DurableCasStatusLedger {
         CREATE TABLE IF NOT EXISTS cas_identity (
           id INTEGER PRIMARY KEY CHECK(id=1), status_id BLOB NOT NULL,
           status_fingerprint BLOB NOT NULL, witness_id BLOB NOT NULL,
-          witness_fingerprint BLOB NOT NULL
+          witness_fingerprint BLOB NOT NULL,
+          cas_anchor_witness_required INTEGER NOT NULL DEFAULT 0
+            CHECK(cas_anchor_witness_required IN (0,1))
         );
         CREATE TABLE IF NOT EXISTS cas_scope (
           scope_key TEXT PRIMARY KEY, keyring_id BLOB NOT NULL, revision INTEGER,
@@ -202,14 +237,19 @@ class Zk1DurableCasStatusLedger {
         );
       `);
       if (!existed) {
-        this.db.prepare("INSERT INTO cas_identity VALUES(1,?,?,?,?)")
-          .run(this.statusKeyId, ownFp, this.witnessKeyId, witnessFp);
+        this.db.prepare(`INSERT INTO cas_identity
+          (id,status_id,status_fingerprint,witness_id,witness_fingerprint,cas_anchor_witness_required)
+          VALUES(1,?,?,?,?,?)`)
+          .run(this.statusKeyId, ownFp, this.witnessKeyId, witnessFp,
+            casAnchorWitness === null ? 0 : 1);
       }
       this.anchor = new Zk1CasTerminalAnchor(anchorPath, {
         bootstrapNew: !existed && bootstrapNew,
         statusKeyId: this.statusKeyId,
         statusPrivateKey,
         trustedMinimumHead: trustedAnchorMinimumHead,
+        witnessRequired: casAnchorWitness !== null,
+        witnessKeyId: this.witnessKeyId,
       });
       this.scopeRow = this.db.prepare("SELECT * FROM cas_scope WHERE scope_key=?");
       this.operationRow = this.db.prepare("SELECT * FROM cas_operation WHERE reservation_id=?");
@@ -227,6 +267,42 @@ class Zk1DurableCasStatusLedger {
     const value = this.nowSeconds();
     if (!Number.isSafeInteger(value) || value < 0) fail("CAS_CLOCK_UNHEALTHY");
     return value;
+  }
+
+  async #attestIndependentCasAnchor() {
+    if (!this.#casAnchorWitness) return;
+    const current = this.#anchorQueue.then(async () => {
+      let failedAdvances = 0;
+      // Bounded reconciliation: when acknowledgement is lost but the witness
+      // committed, its next independently SIGNED nonce-bound head resolves
+      // the ambiguous state. Never trust a naked HTTP 200 as anchor proof.
+      for (let attempt = 0; attempt < 65; attempt++) {
+        let witnessHead;
+        try { witnessHead = await this.#casAnchorWitness.freshHead(this.#lastWitnessFloor); }
+        catch (_) { fail("CAS_ANCHOR_WITNESS_UNAVAILABLE"); }
+        const local = this.anchor.headCheckpoint();
+        if (witnessHead.sequence > local.sequence
+          || (witnessHead.sequence === local.sequence
+            && witnessHead.lastHash !== local.lastHash)) fail("CAS_LEDGER_ROLLBACK");
+        this.#lastWitnessFloor = Object.freeze({
+          sequence: witnessHead.sequence, lastHash: witnessHead.lastHash,
+        });
+        if (witnessHead.sequence === local.sequence) return;
+        const records = this.anchor.signedRecordPage({
+          afterSequence: witnessHead.sequence, limit: 16,
+        });
+        if (!records.length) fail("CAS_LEDGER_ROLLBACK");
+        try { await this.#casAnchorWitness.advanceSignedRecords(records); }
+        catch (_) {
+          if (++failedAdvances > 1) fail("CAS_ANCHOR_WITNESS_UNAVAILABLE");
+          // One fresh signed read disambiguates a lost ACK. If the witness did
+          // not durably advance, the next exact retry still fails closed.
+        }
+      }
+      fail("CAS_ANCHOR_WITNESS_UNAVAILABLE");
+    });
+    this.#anchorQueue = current.catch(() => {});
+    return current;
   }
 
   async terminalSealMessage(receipt, status, manifestBytes) {
@@ -292,6 +368,7 @@ class Zk1DurableCasStatusLedger {
 
   // The witness must reserve first; CAS cannot create a ticket for itself.
   async registerReservation({ receipt }) {
+    await this.#attestIndependentCasAnchor();
     const ticket = await this.verifiedTicket(receipt);
     const op = ticket.query;
     const scopeKey = compartmentKey(op);
@@ -343,6 +420,7 @@ class Zk1DurableCasStatusLedger {
   }
 
   async commit({ receipt, manifestBytes }) {
+    await this.#attestIndependentCasAnchor();
     const ticket = await this.verifiedTicket(receipt);
     const op = ticket.query;
     const scopeKey = compartmentKey(op);
@@ -441,10 +519,12 @@ class Zk1DurableCasStatusLedger {
     // On crash here, exact signed DB evidence + the prepared intent can be
     // safely reconciled by the normal retry/status path.
     await this.anchor.append(op, ticket.raw, "committed", raw, terminalSeal);
+    await this.#attestIndependentCasAnchor();
     return { status: "committed", replay: false };
   }
 
   async getTerminalProof({ query, nonce }) {
+    await this.#attestIndependentCasAnchor();
     const op = normalizeQuery(query);
     const challenge = asBytes(nonce, 32);
     const scopeKey = compartmentKey(op);
@@ -531,6 +611,7 @@ class Zk1DurableCasStatusLedger {
         committed ? row.committed_manifest : null, row.terminal_seal);
     }
     this.assertAnchor(row, op);
+    await this.#attestIndependentCasAnchor();
     const unsigned = {
       type: "rootark-recovery-cas-status/v1",
       status_authority_key_id: this.statusKeyId,
@@ -546,6 +627,7 @@ class Zk1DurableCasStatusLedger {
   }
 
   async getCommittedManifest({ scope }) {
+    await this.#attestIndependentCasAnchor();
     // Public manifest retrieval is intentionally distinct from terminality.
     // The caller MUST verify it against a fresh independently signed witness
     // head; CAS HTTP success is NEVER a content authorization decision.
@@ -639,6 +721,7 @@ class Zk1DurableCasStatusLedger {
   }
 
   async getCommittedHistoryPage({ scope, startRevision }) {
+    await this.#attestIndependentCasAnchor();
     // History bytes are NEVER an authorization response. In particular do
     // NOT fully audit/materialize the 64 MiB CAS status ledger for EACH
     // untrusted page: a small-page client would amplify work quadratically.
