@@ -56,7 +56,8 @@ async function configure(config) {
   let casAnchorWitness = null;
   let trustedAnchorMinimumHead;
   if (Object.hasOwn(config, "casAnchorWitness")) {
-    exact(config.casAnchorWitness, ANCHOR_FIELDS);
+    exact(config.casAnchorWitness, Object.hasOwn(config.casAnchorWitness || {}, "headTimeoutMs")
+      ? [...ANCHOR_FIELDS, "headTimeoutMs"] : ANCHOR_FIELDS);
     const settings = config.casAnchorWitness;
     casAnchorWitness = new Zk1WitnessCasAnchorHttpsClient({
       endpoint: settings.endpoint, ca: readFile(settings.caPath),
@@ -65,6 +66,7 @@ async function configure(config) {
       serverFingerprint256: settings.serverFingerprint256,
       pinnedWitnessPublicKey: witnessPublicKey,
       pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
+      headTimeoutMs: settings.headTimeoutMs,
     });
     // Fail BEFORE opening or creating CAS SQLite on witness outage, nonce
     // replay, wrong signer or rollback. Never trust a locally derived floor.

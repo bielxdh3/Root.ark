@@ -66,6 +66,23 @@ test("independent real mTLS witness retains exact signed CAS journal history and
   const client = new Zk1WitnessCasAnchorHttpsClient(cfg);
   const genesis = await client.freshHead();
   assert.deepEqual(genesis, { sequence: 0, lastHash: "0".repeat(64) });
+  assert.throws(() => new Zk1WitnessCasAnchorHttpsClient({ ...cfg,
+    headTimeoutMs: 10001 }), /CAS_WITNESS_FLOOR_UNAVAILABLE/);
+  // An expensive full-history witness verification can use its own bounded
+  // HTTP deadline, without increasing the deadline for unsigned /advance.
+  const originalHead = floor.freshHeadAsync.bind(floor);
+  floor.freshHeadAsync = async (request) => {
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    return originalHead(request);
+  };
+  try {
+    await assert.rejects(new Zk1WitnessCasAnchorHttpsClient({ ...cfg,
+      timeoutMs: 100, headTimeoutMs: 100 }).freshHead(),
+    /CAS_WITNESS_FLOOR_UNAVAILABLE/, "a short signed-head deadline fails closed");
+    assert.deepEqual(await new Zk1WitnessCasAnchorHttpsClient({ ...cfg,
+      timeoutMs: 100, headTimeoutMs: 1200 }).freshHead(), genesis,
+    "head-only extended deadline permits a fresh nonce-bound signed response");
+  } finally { floor.freshHeadAsync = originalHead; }
   const q = { account_id: crypto.randomBytes(16), compartment_id: Buffer.from("main"),
     keyring_id: crypto.randomBytes(16), reservation_id: crypto.randomBytes(16) };
   const ticket = crypto.randomBytes(100);

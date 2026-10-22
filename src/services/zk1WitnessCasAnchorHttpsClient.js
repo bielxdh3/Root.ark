@@ -28,9 +28,10 @@ class Zk1WitnessCasAnchorHttpsClient {
   #witnessKeyId;
   #statusKeyId;
   #timeout;
+  #headTimeout;
   constructor({ endpoint, ca, clientKey, clientCert, serverFingerprint256,
     pinnedWitnessPublicKey, pinnedWitnessKeyId, pinnedStatusKeyId,
-    timeoutMs = 5000 } = {}) {
+    timeoutMs = 5000, headTimeoutMs = 9000 } = {}) {
     try { this.#url = new URL(endpoint); }
     catch (_) { fail(); }
     if (this.#url.protocol !== "https:" || !this.#url.hostname || !this.#url.port
@@ -40,7 +41,9 @@ class Zk1WitnessCasAnchorHttpsClient {
       || !(pinnedWitnessPublicKey instanceof crypto.KeyObject)
       || pinnedWitnessPublicKey.type !== "public"
       || pinnedWitnessPublicKey.asymmetricKeyType !== "ed25519"
-      || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 10000) fail();
+      || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 10000
+      || !Number.isSafeInteger(headTimeoutMs) || headTimeoutMs < 100
+      || headTimeoutMs > 10000) fail();
     if ((!Buffer.isBuffer(pinnedWitnessKeyId) && !(pinnedWitnessKeyId instanceof Uint8Array))
       || pinnedWitnessKeyId.byteLength !== 16
       || (!Buffer.isBuffer(pinnedStatusKeyId) && !(pinnedStatusKeyId instanceof Uint8Array))
@@ -52,8 +55,12 @@ class Zk1WitnessCasAnchorHttpsClient {
     this.#witnessKeyId = Buffer.from(pinnedWitnessKeyId);
     this.#statusKeyId = Buffer.from(pinnedStatusKeyId);
     this.#timeout = timeoutMs;
+    // A full signed witness-floor verification may scan 100k immutable events
+    // off-thread. Only that endpoint receives a larger bounded budget; the
+    // untrusted /advance ACK keeps the regular 5s default and never authorizes.
+    this.#headTimeout = headTimeoutMs;
   }
-  async #send(urlPath, body) {
+  async #send(urlPath, body, timeoutMs = this.#timeout) {
     const payload = Buffer.from(JSON.stringify(body), "utf8");
     if (payload.length < 2 || payload.length > (urlPath.endsWith("/advance") ? 40 * 1024 : 4096)) fail();
     try {
@@ -99,7 +106,7 @@ class Zk1WitnessCasAnchorHttpsClient {
           });
         });
         const deadline = setTimeout(() => request.destroy(
-          new Error("CAS_WITNESS_FLOOR_UNAVAILABLE")), this.#timeout);
+          new Error("CAS_WITNESS_FLOOR_UNAVAILABLE")), timeoutMs);
         request.on("error", (error) => done(error));
         request.end(payload);
       });
@@ -109,7 +116,7 @@ class Zk1WitnessCasAnchorHttpsClient {
     const nonce = crypto.randomBytes(32);
     const answer = await this.#send("/v1/cas-anchor/head", {
       nonce: nonce.toString("base64url"),
-    });
+    }, this.#headTimeout);
     try {
       exact(answer, ["head", "authority"]);
       if (answer.authority !== "WITNESS_CAS_ANCHOR_FLOOR_V1") fail();
