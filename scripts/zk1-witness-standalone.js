@@ -12,6 +12,7 @@ const { createZk1WitnessHttpsServer, drainZk1WitnessHttpsServer } = require("../
 const { createZk1CasStatusHttpsClient } = require("../src/services/zk1CasStatusHttpsClient");
 const { Zk1WitnessCasAnchorFloor } =
   require("../src/services/zk1WitnessCasAnchorFloor");
+const ownerFloorCheckpoint = require("../src/crypto/rootark-zk1-owner-cas-floor-checkpoint");
 
 const TOP_FIELDS = Object.freeze([
   "listenHost", "listenPort", "bootstrapNew", "dbPath", "witnessKeyId",
@@ -21,7 +22,6 @@ const TOP_FIELDS = Object.freeze([
 const CAS_FIELDS = Object.freeze([
   "endpoint", "caPath", "clientKeyPath", "clientCertPath", "serverFingerprint256",
 ]);
-const OWNER_FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/cas-owner-floor/v1\0", "ascii");
 const OWNER_PIN_ENV = "ROOTARK_ZK1_CAS_FLOOR_OWNER_SPKI_SHA256";
 const OWNER_CHECKPOINT_PIN_ENV = "ROOTARK_ZK1_CAS_FLOOR_OWNER_CHECKPOINT_SHA256";
 const OWNER_FIELDS = Object.freeze(["publicKeyPath", "issuedAt", "expiresAt", "signature"]);
@@ -118,28 +118,25 @@ function configure(config) {
       const ownerPublicKey = crypto.createPublicKey(readFile(signed.publicKeyPath));
       if (ownerPublicKey.type !== "public" || ownerPublicKey.asymmetricKeyType !== "ed25519") fail();
       const ownerSpki = ownerPublicKey.export({ type: "spki", format: "der" });
-      const fingerprint = crypto.createHash("sha256").update(ownerSpki).digest();
+      const fingerprint = ownerFloorCheckpoint.spkiFingerprint(ownerPublicKey);
       if (!crypto.timingSafeEqual(fingerprint, Buffer.from(ownerPin, "hex"))) fail();
       const witnessSpki = crypto.createPublicKey(witnessPrivateKey)
         .export({ type: "spki", format: "der" });
       const statusSpki = statusPublicKey.export({ type: "spki", format: "der" });
       if (ownerSpki.equals(witnessSpki) || ownerSpki.equals(statusSpki)) fail();
-      const ownerStatement = {
-        type: "rootark-zk1-cas-owner-floor/v1",
+      const ownerStatement = ownerFloorCheckpoint.statement({
         witnessKeyId: config.witnessKeyId,
         statusKeyId: config.statusKeyId,
         sequence: config.casAnchorFloor.trustedMinimumHead.sequence,
         lastHash: config.casAnchorFloor.trustedMinimumHead.lastHash,
         issuedAt: signed.issuedAt, expiresAt: signed.expiresAt,
-      };
+      });
       const signature = Buffer.from(signed.signature, "base64url");
-      const ownerPayload = Buffer.from(JSON.stringify(ownerStatement));
       if (signature.length !== 64
         || signature.toString("base64url") !== signed.signature
-        || !crypto.verify(null, Buffer.concat([OWNER_FLOOR_DOMAIN,
-          ownerPayload]), ownerPublicKey, signature)) fail();
-      const signedCheckpointDigest = crypto.createHash("sha256")
-        .update(OWNER_FLOOR_DOMAIN).update(ownerPayload).update(signature).digest();
+        || !crypto.verify(null, ownerFloorCheckpoint.signingBytes(ownerStatement),
+          ownerPublicKey, signature)) fail();
+      const signedCheckpointDigest = ownerFloorCheckpoint.checkpointDigest(ownerStatement, signature);
       if (!crypto.timingSafeEqual(signedCheckpointDigest,
         Buffer.from(checkpointPin, "hex"))) fail();
     }

@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const Database = require("better-sqlite3");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
@@ -161,6 +161,44 @@ test("actual standalone witness refuses signed-prefix floor rollback against sep
       expiresAt: issuedAt + 3600, signature },
   } };
   await start(signedConfig, true, keyPin, checkpointPin);
+  // Actual offline CLI artifact, then actual witness process startup: no
+  // exported test helper can bypass the on-disk owner pin or signature check.
+  const signerInput = path.join(dir, "operator-minimum.json");
+  const signerOutput = path.join(dir, "operator-checkpoint.json");
+  const ownerPrivate = path.join(dir, "owner-private.pem");
+  const witnessPublic = path.join(dir, "witness-public.pem");
+  fs.writeFileSync(ownerPrivate, owner.privateKey.export({ type: "pkcs8", format: "pem" }));
+  fs.writeFileSync(witnessPublic, witness.publicKey.export({ type: "spki", format: "pem" }));
+  fs.writeFileSync(signerInput, JSON.stringify({
+    source: "owner-retained-independent-floor/v1",
+    witnessKeyId: config.witnessKeyId, statusKeyId: config.statusKeyId,
+    trustedMinimumHead: ownerRetained, issuedAt, expiresAt: issuedAt + 3600,
+  }));
+  const cli = spawnSync(process.execPath, [
+    path.resolve(__dirname, "../scripts/zk1-owner-cas-floor-sign-offline.js"),
+    "--owned-dir", dir, "--input", signerInput,
+    "--owner-private-key", ownerPrivate, "--owner-public-key", files.ownerPub,
+    "--witness-public-key", witnessPublic, "--status-public-key", files.statusPub,
+    "--output", signerOutput, "--confirm-independent-minimum",
+  ], { encoding: "utf8", windowsHide: true });
+  assert.equal(cli.status, 0, cli.stderr);
+  assert.equal(cli.stdout, "OWNER_FLOOR_SIGNED\n");
+  const cliArtifact = JSON.parse(fs.readFileSync(signerOutput, "utf8"));
+  assert.deepEqual(cliArtifact.casAnchorFloor.trustedMinimumHead, ownerRetained);
+  assert.equal(cliArtifact.envPins.ROOTARK_ZK1_CAS_FLOOR_OWNER_SPKI_SHA256, keyPin);
+  assert.equal(cliArtifact.envPins.ROOTARK_ZK1_CAS_FLOOR_OWNER_CHECKPOINT_SHA256, checkpointPin);
+  const cliConfig = { ...config, casAnchorFloor: {
+    ...config.casAnchorFloor, ...cliArtifact.casAnchorFloor,
+  } };
+  await start(cliConfig, true, cliArtifact.envPins.ROOTARK_ZK1_CAS_FLOOR_OWNER_SPKI_SHA256,
+    cliArtifact.envPins.ROOTARK_ZK1_CAS_FLOOR_OWNER_CHECKPOINT_SHA256);
+  await start({ ...cliConfig, casAnchorFloor: {
+    ...cliConfig.casAnchorFloor, trustedMinimumHead: { sequence: 1, lastHash: "f".repeat(64) },
+  } }, false, keyPin, checkpointPin);
+  await start({ ...cliConfig, casAnchorFloor: {
+    ...cliConfig.casAnchorFloor, owner: { ...cliConfig.casAnchorFloor.owner,
+      publicKeyPath: path.join(dir, "status-public.pem") },
+  } }, false, keyPin, checkpointPin);
   await start(signedConfig, false, "f".repeat(64), checkpointPin);
   await start(signedConfig, false, keyPin, "f".repeat(64));
   await start(signedConfig, false, keyPin); // refusing missing independent latest-floor pin
