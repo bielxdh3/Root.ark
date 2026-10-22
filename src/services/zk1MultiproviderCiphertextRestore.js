@@ -13,6 +13,10 @@ const { computeZk1CiphertextRoot } = require("../crypto/rootark-zk-chunk-root-v1
 const { zk1CloudCopyAddress } = require("./zk1CloudCiphertextReadbackVerifier");
 const ownerRoots = require("../../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
 const { recoverSignedCatalogSidecar } = require("./zk1CloudSignedCatalogSidecar");
+const { Zk1ExternallyPinnedProviderDomains, spkiFingerprint } =
+  require("./zk1ExternallyPinnedProviderDomains");
+const { verifyFreshOwnerDeviceRestoreAuthority } =
+  require("./zk1FreshOwnerDeviceRestoreAuthority");
 
 function deny() { const e = new Error("ZK_MULTIPROVIDER_RESTORE_DENIED"); e.code = e.message; throw e; }
 function copied(value, length) {
@@ -70,14 +74,15 @@ function cloneOperation(value) {
     revision: whole(op.revision), epoch: whole(op.epoch, 0),
     ciphertext_sha256: copied(op.ciphertext_sha256, 32) };
 }
-function pinnedReaders(values) {
+function pinnedReaders(values, providerDomains, scope) {
   if (!Array.isArray(values) || values.length < 2 || values.length > 3
     || Reflect.ownKeys(values).length !== values.length + 1) deny();
   const result = [];
   const names = new Set();
   const namespaces = new Set();
   for (const value of values) {
-    const item = exact(value, ["cloudReader", "provider", "expectedReaderContext", "pinnedDriveFileId"]);
+    const item = exact(value, ["cloudReader", "provider", "expectedReaderContext",
+      "pinnedDriveFileId", "domainAttestation"]);
     const reader = item.cloudReader;
     if (!reader || typeof reader !== "object"
       || !["s3", "gdrive", "webdav"].includes(item.provider)
@@ -95,8 +100,14 @@ function pinnedReaders(values) {
     names.add(item.provider);
     namespaces.add(namespace);
     result.push({ reader, provider: item.provider, namespace,
-      context: item.expectedReaderContext, driveId: item.pinnedDriveFileId });
+      context: item.expectedReaderContext, driveId: item.pinnedDriveFileId,
+      domainAttestation: item.domainAttestation });
   }
+  providerDomains.verify({ targets: result.map((item) => ({
+    provider: item.provider, namespaceIdentity: item.namespace,
+    expectedReaderContext: item.context, pinnedDriveFileId: item.driveId,
+    domainAttestation: item.domainAttestation,
+  })), scope, nowSeconds: Math.floor(Date.now() / 1000) });
   return result;
 }
 async function exactGet(target, scope, operation, root, lengths, byteLength) {
@@ -154,8 +165,13 @@ class Zk1MultiproviderCiphertextRestore {
   #minimumHead;
   #minimumSnapshot;
   #authorize;
+  #providerDomains;
+  #deviceGrant;
+  #freshDeviceState;
   constructor({ pinnedInventoryPublicKey, pinnedInventorySignerKeyId, pinnedOwner,
-    pinnedOwnerHead, independentInventoryFloor, assertCurrentAuthorization } = {}) {
+    pinnedOwnerHead, independentInventoryFloor, assertCurrentAuthorization,
+    providerDomainPinset, signedCurrentDeviceGrant,
+    fetchFreshSignedDeviceState, independentOwnerSpkiSha256 } = {}) {
     const head = exact(pinnedOwnerHead, ["revision", "digest", "epoch"]);
     const floor = exact(independentInventoryFloor, ["minimumHead", "minimumSnapshot"]);
     const min = exact(floor.minimumHead, ["sequence", "root"]);
@@ -169,7 +185,17 @@ class Zk1MultiproviderCiphertextRestore {
       || typeof owner.deviceId !== "string"
       || !owner.publicKey || owner.publicKey.type !== "public"
       || owner.publicKey.algorithm?.name !== "Ed25519"
-      || typeof assertCurrentAuthorization !== "function") deny();
+      || typeof assertCurrentAuthorization !== "function"
+      || !(providerDomainPinset instanceof Zk1ExternallyPinnedProviderDomains)
+      || typeof fetchFreshSignedDeviceState !== "function"
+      || !signedCurrentDeviceGrant || typeof signedCurrentDeviceGrant !== "object") deny();
+    let actualOwnerFingerprint;
+    try {
+      actualOwnerFingerprint = spkiFingerprint(crypto.KeyObject.from(owner.publicKey));
+    } catch (_) { deny(); }
+    if (typeof independentOwnerSpkiSha256 !== "string"
+      || !/^[a-f0-9]{64}$/.test(independentOwnerSpkiSha256)
+      || actualOwnerFingerprint !== independentOwnerSpkiSha256) deny();
     this.#publicKey = pinnedInventoryPublicKey;
     this.#signerId = copied(pinnedInventorySignerKeyId, 16);
     this.#pinnedOwner = Object.freeze({ scope: Object.freeze({ ...ownerScope }),
@@ -182,8 +208,20 @@ class Zk1MultiproviderCiphertextRestore {
     this.#minimumSnapshot = copied(floor.minimumSnapshot);
     if (this.#minimumSnapshot.length > inventory.MAX_SNAPSHOT_BYTES) deny();
     this.#authorize = assertCurrentAuthorization;
+    this.#providerDomains = providerDomainPinset;
+    this.#deviceGrant = detachedSignedRecord(signedCurrentDeviceGrant);
+    this.#freshDeviceState = fetchFreshSignedDeviceState;
   }
   async #current(operation) {
+    // A caller-supplied active Boolean is never enough: the owner authority
+    // and actual enrolled device must BOTH sign a fresh nonce per request.
+    await verifyFreshOwnerDeviceRestoreAuthority({
+      signedDeviceGrant: this.#deviceGrant,
+      pinnedOwnerPublicKey: this.#pinnedOwner.publicKey,
+      fetchSignedCurrentDeviceState: this.#freshDeviceState,
+      scope: this.#pinnedOwner.scope, operation,
+      ownerHead: this.#ownerHead,
+    });
     const result = await this.#authorize({
       operationId: Buffer.from(operation.operation_id),
       objectId: Buffer.from(operation.object_id),
@@ -197,6 +235,14 @@ class Zk1MultiproviderCiphertextRestore {
       || !Buffer.isBuffer(result.currentManifestDigest)
       || !same(result.currentManifestDigest, this.#ownerHead.digest)) deny();
   }
+  checkRequesterDeviceIdentity(value) {
+    try {
+      const proof = exact(value, ["authorized", "deviceId", "authorizationKeyId"]);
+      return proof.authorized === true
+        && proof.deviceId === this.#deviceGrant.device_id
+        && proof.authorizationKeyId === this.#deviceGrant.authorization_key_id;
+    } catch (_) { return false; }
+  }
   async restoreExact(input) {
     let returned;
     try {
@@ -205,6 +251,8 @@ class Zk1MultiproviderCiphertextRestore {
         "ownerHistoryCheckpoint", "previousOwnerHistoryProof", "expectedCiphertextRoot",
         "chunkLengths", "readers", "minimumMatchingProviders"]);
       const scope = inventory.normalizeScope(r.scope);
+      if (["account_id", "compartment_id", "keyring_id"].some((name) =>
+        scope[name].toString("base64url") !== this.#pinnedOwner.scope[name])) deny();
       const operation = cloneOperation(r.operation);
       const proofBytes = copied(r.signedCommittedProof);
       const snapshot = copied(r.signedSnapshot);
@@ -227,7 +275,7 @@ class Zk1MultiproviderCiphertextRestore {
         if (!entry || !Object.hasOwn(entry, "value")) deny();
         chain.push(copied(entry.value));
       }
-      const readers = pinnedReaders(r.readers);
+      const readers = pinnedReaders(r.readers, this.#providerDomains, scope);
       const quorum = whole(r.minimumMatchingProviders, 2, readers.length);
       const checkpoint = detachedSignedRecord(r.ownerCheckpoint);
       const ownerHistoryCheckpoint = detachedSignedRecord(r.ownerHistoryCheckpoint);
@@ -278,6 +326,11 @@ class Zk1MultiproviderCiphertextRestore {
       }
       if (good.length < quorum) deny();
       for (const match of good.slice(1)) if (!same(match.data, good[0].data)) deny();
+      this.#providerDomains.verify({ targets: readers.map((item) => ({
+        provider: item.provider, namespaceIdentity: item.namespace,
+        expectedReaderContext: item.context, pinnedDriveFileId: item.driveId,
+        domainAttestation: item.domainAttestation,
+      })), scope, nowSeconds: Math.floor(Date.now() / 1000) });
       await this.#current(operation);
       const ciphertext = Buffer.from(good[0].data);
       returned = Object.freeze({ status: "SIGNED_CATALOG_AND_OWNER_ROOT_CLOUD_RESTORE",
@@ -288,7 +341,11 @@ class Zk1MultiproviderCiphertextRestore {
         signedInventorySequence: catalog.sequence,
         verifiedProviders: Object.freeze(good.map(({ evidence }) => evidence)),
         failedProviders: Object.freeze(failed),
-        serverHasPlaintext: false, currentAuthorizationCallbackPassed: true,
+        serverHasPlaintext: false, signedCurrentDeviceStateRequired: true,
+        administratorSignaturesVerified: true,
+        independentAdministratorCustodyProven: false,
+        providerPhysicalIndependenceProven: false,
+        currentAuthorizationCallbackPassed: true,
         externalOwnerPinCustodyVerifiedByModule: false,
         remoteDurabilityProven: false, authorizesProductionRestore: false });
       return returned;
@@ -306,10 +363,14 @@ class Zk1MultiproviderCiphertextRestore {
     previousOwnerHistoryProof = null } = {}) {
     try {
       const fixed = cloneOperation(operation);
+      const checkedScope = inventory.normalizeScope(scope);
+      if (["account_id", "compartment_id", "keyring_id"].some((name) =>
+        checkedScope[name].toString("base64url") !== this.#pinnedOwner.scope[name])) deny();
       await this.#current(fixed);
       const recovered = await recoverSignedCatalogSidecar({ scope,
         operationId: fixed.operation_id, readers: catalogReaders,
-        minimumMatchingProviders: minimumMatchingCatalogProviders });
+        minimumMatchingProviders: minimumMatchingCatalogProviders,
+        providerDomainPinset: this.#providerDomains });
       const verified = await this.restoreExact({ scope, operation: fixed,
         ...recovered.signedCatalog,
         // Fail closed if the previous proof was merely replayed as JSON;
@@ -335,12 +396,12 @@ function createZk1MultiproviderRestoreGetHandler({ gateway, pinnedOperationId,
   return async (request, response) => {
     try {
       if (request.method !== "GET" || request.url !== `/zk1-recovery/${id}`
-        || await authorizeHttpRequest(request) !== true) deny();
+        || gateway.checkRequesterDeviceIdentity(await authorizeHttpRequest(request)) !== true) deny();
       const restored = restoreInput?.mode === "cloud-catalog"
         ? await gateway.restoreFromCloudCatalog(restoreInput.request)
         : await gateway.restoreExact(restoreInput);
       if (!same(restored.operationId, Buffer.from(id, "base64url"))
-        || await authorizeHttpRequest(request) !== true) deny();
+        || gateway.checkRequesterDeviceIdentity(await authorizeHttpRequest(request)) !== true) deny();
       const body = Buffer.from(JSON.stringify({
         format: "rootark-zk1-cloud-recovery-response/v1",
         operationId: id, ciphertextBase64: restored.ciphertext.toString("base64url"),
@@ -351,6 +412,7 @@ function createZk1MultiproviderRestoreGetHandler({ gateway, pinnedOperationId,
         catalogSequence: restored.signedInventorySequence,
         catalogRoot: restored.signedInventoryRoot.toString("base64url"),
         providerCount: restored.verifiedProviders.length,
+        providerPhysicalIndependenceProven: false,
         signedCatalogRecoveredFromRemote: restored.signedCatalogRecoveredFromRemote === true,
         remoteDurabilityProven: false, authorizesProductionRestore: false,
       }), "utf8");

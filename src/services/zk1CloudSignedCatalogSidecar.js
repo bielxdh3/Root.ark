@@ -10,6 +10,8 @@ const os = require("node:os");
 const path = require("node:path");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
 const { zk1CloudCopyAddress } = require("./zk1CloudCiphertextReadbackVerifier");
+const { Zk1ExternallyPinnedProviderDomains } =
+  require("./zk1ExternallyPinnedProviderDomains");
 
 const FORMAT = "rootark-zk1-signed-catalog-sidecar/v1";
 const DOMAIN = Buffer.from("Root.ark/zk-1/catalog-sidecar-operation/v1\0");
@@ -35,7 +37,20 @@ function keyIdentity(target, method) {
       ? !/^[A-Za-z0-9_-]{1,256}$/.test(target.pinnedDriveFileId)
       : target.pinnedDriveFileId !== null)) deny();
   return { adapter, provider: target.provider, context: target.expectedContext,
-    namespace: adapter.zk1StorageNamespace(), driveFileId: target.pinnedDriveFileId };
+    namespace: adapter.zk1StorageNamespace(), driveFileId: target.pinnedDriveFileId,
+    domainAttestation: target.domainAttestation };
+}
+function pinnedDomains(providerDomainPinset, scope, pinned) {
+  if (!(providerDomainPinset instanceof Zk1ExternallyPinnedProviderDomains)) deny();
+  try {
+    providerDomainPinset.verify({ scope, nowSeconds: Math.floor(Date.now() / 1000),
+      targets: pinned.map((entry) => ({
+        provider: entry.provider, namespaceIdentity: entry.namespace,
+        expectedReaderContext: entry.context,
+        pinnedDriveFileId: entry.driveFileId,
+        domainAttestation: entry.domainAttestation,
+      })) });
+  } catch (_) { deny(); }
 }
 function copyAddress(scope, operationId) {
   const id = crypto.createHash("sha256").update(DOMAIN)
@@ -108,13 +123,15 @@ function parseCatalog(data, expectedOperationId) {
   if (!data.equals(encodeCatalog({ ...output, operationId: expectedOperationId }))) deny();
   return output;
 }
-async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog, writers } = {}) {
+async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog, writers,
+  providerDomainPinset } = {}) {
   let dir;
   try {
     if (!Array.isArray(writers) || writers.length < 2 || writers.length > 3) deny();
     const pinned = writers.map((target) => keyIdentity(target, "cloudWriter"));
     if (new Set(pinned.map((target) => target.provider)).size !== pinned.length
       || new Set(pinned.map((target) => target.namespace)).size !== pinned.length) deny();
+    pinnedDomains(providerDomainPinset, scope, pinned);
     const payload = encodeCatalog({ ...signedCatalog, operationId });
     const address = copyAddress(scope, operationId);
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-write-"));
@@ -129,7 +146,8 @@ async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog,
           ...(target.driveFileId === null ? {} : { providerFileId: target.driveFileId }) });
       if (!result || result.provider !== target.provider || result.key !== expectedKey
         || (target.driveFileId !== null && result.id !== target.driveFileId)
-        || await target.adapter.resolveInventoryContext() !== target.context) deny();
+        || await target.adapter.resolveInventoryContext() !== target.context
+        || target.adapter.zk1StorageNamespace() !== target.namespace) deny();
       acknowledgements.push(Object.freeze({ provider: target.provider,
         providerObjectKey: expectedKey, providerFileId: target.driveFileId }));
     }
@@ -139,13 +157,14 @@ async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog,
   finally { if (dir) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); }
 }
 async function recoverSignedCatalogSidecar({ scope, operationId, readers,
-  minimumMatchingProviders = 2 } = {}) {
+  minimumMatchingProviders = 2, providerDomainPinset } = {}) {
   if (!Array.isArray(readers) || readers.length < 2 || readers.length > 3
     || !Number.isSafeInteger(minimumMatchingProviders)
     || minimumMatchingProviders < 2 || minimumMatchingProviders > readers.length) deny();
   const pinned = readers.map((target) => keyIdentity(target, "cloudReader"));
   if (new Set(pinned.map((target) => target.provider)).size !== pinned.length
     || new Set(pinned.map((target) => target.namespace)).size !== pinned.length) deny();
+  pinnedDomains(providerDomainPinset, scope, pinned);
   const address = copyAddress(scope, operationId);
   const recovered = [];
   for (const target of pinned) {
@@ -158,7 +177,8 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
         destination, "uploads", () => true,
         { maxBytes: MAX, ...(target.driveFileId === null ? {}
           : { providerFileId: target.driveFileId }) });
-      if (received !== true || await target.adapter.resolveInventoryContext() !== target.context) deny();
+      if (received !== true || await target.adapter.resolveInventoryContext() !== target.context
+        || target.adapter.zk1StorageNamespace() !== target.namespace) deny();
       const info = fs.lstatSync(destination, { bigint: true });
       if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1n
         || info.size < 1n || info.size > BigInt(MAX)) deny();

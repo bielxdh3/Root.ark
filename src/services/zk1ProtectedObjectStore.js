@@ -466,7 +466,9 @@ class Zk1ProtectedObjectStore {
         this.inflightSignedHistoryChecks -= 1;
       }
     }
-    return { key, request, head, sealed };
+    return { key, request, head, sealed,
+      deviceId: device.device_id,
+      authorizationKeyId: Buffer.from(device.authorization_key_id).toString("base64url") };
   }
 
   perform({ key, request, head, sealed }, operation) {

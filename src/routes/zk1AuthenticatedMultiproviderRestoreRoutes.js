@@ -13,7 +13,9 @@ const { Zk1MultiproviderCiphertextRestore } =
 
 const ROUTE = "/zk-1/v1/multiprovider-restore/read";
 const PINS = ["pinnedInventoryPublicKey", "pinnedInventorySignerKeyId",
-  "pinnedOwner", "pinnedOwnerHead", "independentInventoryFloor"];
+  "pinnedOwner", "pinnedOwnerHead", "independentInventoryFloor",
+  "independentOwnerSpkiSha256", "providerDomainPinset",
+  "signedCurrentDeviceGrant", "fetchFreshSignedDeviceState"];
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
 
 function deny() { const error = new Error("ZK_MULTIPROVIDER_HTTP_DENIED"); error.code = error.message; throw error; }
@@ -124,6 +126,11 @@ function registerZk1AuthenticatedMultiproviderRestoreRoute({
           || ownerHeadEpoch !== gatewayPins.pinnedOwnerHead.epoch
           || !same(ownerHeadDigest, Buffer.from(gatewayPins.pinnedOwnerHead.digest))) deny();
         const fresh = await store.authorize(signedRequest, "get");
+        // The identity comes from the exact device entry whose Ed25519
+        // signature passed the owner-rooted V2 manifest validation, not
+        // from a caller-supplied `authorized: true` object.
+        if (!gateway.checkRequesterDeviceIdentity({ authorized: true,
+          deviceId: fresh.deviceId, authorizationKeyId: fresh.authorizationKeyId })) deny();
         if (fresh.request.manifest_revision !== ownerHeadRevision
           || fresh.request.epoch !== ownerHeadEpoch
           || !same(fresh.request.manifest_digest, ownerHeadDigest)) deny();

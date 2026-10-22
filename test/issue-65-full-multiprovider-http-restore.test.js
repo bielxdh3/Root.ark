@@ -24,6 +24,10 @@ const { Zk1MultiproviderCiphertextRestore,
   require("../src/services/zk1MultiproviderCiphertextRestore");
 const { publishSignedCatalogSidecars, zk1CatalogSidecarAddress } =
   require("../src/services/zk1CloudSignedCatalogSidecar");
+const { Zk1ExternallyPinnedProviderDomains, signProviderDomainAttestation,
+  spkiFingerprint } = require("../src/services/zk1ExternallyPinnedProviderDomains");
+const { GRANT_FIELDS, STATE_FIELDS, GRANT_DOMAIN, STATUS_DOMAIN, POP_DOMAIN } =
+  require("../src/services/zk1FreshOwnerDeviceRestoreAuthority");
 const ownerHistory = require("../public/client/rootark-zk1-owner-signed-checkpoint");
 const ownerRoots = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
 const portable = require("../public/client/rootark-zk1-portable-file-recovery");
@@ -230,16 +234,55 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     minimumSnapshot: Buffer.from(genesis.bytes) };
   let revoked = false;
   let currentEpoch = ownerEpoch;
-  const gateway = new Zk1MultiproviderCiphertextRestore({
-    pinnedInventoryPublicKey: invKeys.publicKey, pinnedInventorySignerKeyId: signerKeyId,
-    pinnedOwner: { scope: scopeClient, deviceId: "owner-device",
-      signerKeyId: ownerSignerId, publicKey: verifier },
-    pinnedOwnerHead: { revision: ownerRevision, digest: ownerDigest, epoch: ownerEpoch },
-    independentInventoryFloor: floor,
-    assertCurrentAuthorization: async () => ({ active: !revoked,
-      currentManifestRevision: ownerRevision, currentManifestDigest: Buffer.from(ownerDigest),
-      currentEpoch }),
-  });
+  let gateway;
+  const restoreDevice = activeHead.devices[0];
+  const deviceKeys = { privateKey: ownerState.actors.get(
+    Buffer.from(restoreDevice.authorization_key_id).toString("hex")) };
+  assert.ok(deviceKeys.privateKey);
+  const deviceKeyId = Buffer.from(restoreDevice.authorization_key_id).toString("base64url");
+  const grantFields = {
+    schema: "rootark-zk1-browser-owner-device-grant/v1", ...scopeClient,
+    device_id: restoreDevice.device_id,
+    authorization_key_id: deviceKeyId,
+    authorization_public_key: Buffer.from(restoreDevice.authorization_public_key)
+      .toString("base64url"),
+    manifest_revision: ownerRevision, manifest_digest: b64(ownerDigest), current_epoch: ownerEpoch,
+    enrolled_epoch: ownerEpoch, revoked_at_epoch: null,
+  };
+  const signedCurrentDeviceGrant = { ...grantFields, signature: b64(crypto.sign(null,
+    Buffer.concat([GRANT_DOMAIN, Buffer.from(JSON.stringify(
+      Object.fromEntries(GRANT_FIELDS.map((k) => [k, grantFields[k]]))))]),
+    ownerKeys.privateKey)) };
+  let freshAttack = null;
+  let replayed = null;
+  const fetchFreshSignedDeviceState = async (challenge) => {
+    const now = Math.floor(Date.now() / 1000);
+    const state = {
+      schema: "rootark-zk1-current-device-restore-state/v1",
+      ...challenge.scope, device_id: challenge.deviceId,
+      authorization_key_id: challenge.authorizationKeyId,
+      operation_id: challenge.operationId,
+      manifest_revision: challenge.manifestRevision,
+      manifest_digest: challenge.manifestDigest, current_epoch: currentEpoch,
+      state: revoked ? "REVOKED" : "ACTIVE",
+      nonce: freshAttack === "wrong-nonce" ? b64(random(32)) : challenge.nonce,
+      issued_at: freshAttack === "expired" ? now - 35 : now,
+      expires_at: freshAttack === "expired" ? now - 25 : now + 10,
+    };
+    const signed = { ...state, signature: b64(crypto.sign(null,
+      Buffer.concat([STATUS_DOMAIN, Buffer.from(JSON.stringify(
+        Object.fromEntries(STATE_FIELDS.map((k) => [k, state[k]]))))]),
+      freshAttack === "forged" ? crypto.generateKeyPairSync("ed25519").privateKey
+        : ownerKeys.privateKey)) };
+    const popBytes = Buffer.concat([POP_DOMAIN, Buffer.from(challenge.nonce, "base64url"),
+      Buffer.from(challenge.operationId, "base64url"),
+      Buffer.from(signedCurrentDeviceGrant.signature, "base64url")]);
+    const proof = b64(crypto.sign(null, popBytes, deviceKeys.privateKey));
+    if (freshAttack === "replay" && replayed) return replayed;
+    const result = { state: signed, deviceProofOfPossession: proof };
+    if (!replayed) replayed = result;
+    return result;
+  };
 
   const s3Endpoint = `http://127.0.0.1:${s3Port}`;
   const s3Adapter = createCloudStorage({ provider: "s3", prefix: "zk1-restore",
@@ -298,6 +341,42 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   ]) readers.push({ cloudReader: reader, provider,
     expectedReaderContext: await reader.resolveInventoryContext(),
     pinnedDriveFileId: pin });
+  const administrators = Object.fromEntries(["s3", "gdrive", "webdav"].map((provider) => [
+    provider, { keys: crypto.generateKeyPairSync("ed25519"), id: random(32).toString("hex") },
+  ]));
+  const providerDomainPinset = new Zk1ExternallyPinnedProviderDomains({
+    externallyPinnedDomains: Object.entries(administrators).map(([provider, admin]) => ({
+      provider, trustDomainId: admin.id, administratorPublicKey: admin.keys.publicKey,
+      independentAdministratorSpkiSha256: spkiFingerprint(admin.keys.publicKey),
+    })),
+  });
+  const attest = (target) => {
+    const admin = administrators[target.provider];
+    const now = Math.floor(Date.now() / 1000);
+    return signProviderDomainAttestation({ administratorPrivateKey: admin.keys.privateKey,
+      statement: { schema: "rootark-zk1-provider-domain-attestation/v1",
+        provider: target.provider, trust_domain_id: admin.id,
+        namespace_sha256: (target.cloudReader || target.cloudWriter).zk1StorageNamespace(),
+        principal_context_sha256: target.expectedReaderContext || target.expectedContext,
+        drive_file_id: target.pinnedDriveFileId,
+        ...Object.fromEntries(Object.entries(scopeClient).map(([key, value]) => [key, value])),
+        issued_at: now - 3, expires_at: now + 300 } });
+  };
+  for (const reader of readers) reader.domainAttestation = attest(reader);
+  gateway = new Zk1MultiproviderCiphertextRestore({
+    pinnedInventoryPublicKey: invKeys.publicKey, pinnedInventorySignerKeyId: signerKeyId,
+    pinnedOwner: { scope: scopeClient, deviceId: "owner-device",
+      signerKeyId: ownerSignerId, publicKey: verifier },
+    independentOwnerSpkiSha256: spkiFingerprint(ownerKeys.publicKey),
+    pinnedOwnerHead: { revision: ownerRevision, digest: ownerDigest, epoch: ownerEpoch },
+    independentInventoryFloor: floor, providerDomainPinset,
+    signedCurrentDeviceGrant, fetchFreshSignedDeviceState,
+    // Deliberately dishonest legacy callback: a Boolean ACTIVE is no longer
+    // authority. The owner-signed nonce status must reject revocation/epoch.
+    assertCurrentAuthorization: async () => ({ active: true,
+      currentManifestRevision: ownerRevision, currentManifestDigest: Buffer.from(ownerDigest),
+      currentEpoch: ownerEpoch }),
+  });
 
   const address = require("../src/services/zk1CloudCiphertextReadbackVerifier")
     .zk1CloudCopyAddress({ scope, operationId: operation.operation_id });
@@ -388,8 +467,9 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
       cloudWriter: target.cloudReader, expectedContext: target.expectedReaderContext,
       pinnedDriveFileId: target.provider === "gdrive" ? catalogDriveId : null });
   }
+  for (const target of catalogTargets) target.domainAttestation = attest(target);
   const publishInput = { scope, operationId: operation.operation_id,
-    signedCatalog, writers: catalogTargets };
+    signedCatalog, writers: catalogTargets, providerDomainPinset };
   await assert.rejects(publishSignedCatalogSidecars(publishInput),
     /ZK_SIGNED_CATALOG_SIDECAR_DENIED/,
     "false Drive ACK after real media PUT cannot claim completed catalog replication");
@@ -401,8 +481,8 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   assert.equal(published.acknowledgements.length, 3);
   assert.equal(published.remoteDurabilityProven, false);
   const catalogReaders = catalogTargets.map(({ cloudWriter, expectedContext,
-    provider, pinnedDriveFileId }) => ({ cloudReader: cloudWriter,
-    expectedContext, provider, pinnedDriveFileId }));
+    provider, pinnedDriveFileId, domainAttestation }) => ({ cloudReader: cloudWriter,
+    expectedContext, provider, pinnedDriveFileId, domainAttestation }));
   const remoteRecovery = { scope, operation, catalogReaders,
     readers, minimumMatchingProviders: 2, minimumMatchingCatalogProviders: 2 };
   const sidecar = zk1CatalogSidecarAddress(scope, operation.operation_id);
@@ -413,7 +493,10 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   const handler = createZk1MultiproviderRestoreGetHandler({ gateway,
     pinnedOperationId: operation.operation_id,
     restoreInput: { mode: "cloud-catalog", request: remoteRecovery },
-    authorizeHttpRequest: async (request) => session && request.headers.authorization === "Bearer ephemeral-test-session" });
+    authorizeHttpRequest: async (request) => ({
+      authorized: Boolean(session && request.headers.authorization === "Bearer ephemeral-test-session"),
+      deviceId: grantFields.device_id, authorizationKeyId: deviceKeyId,
+    }) });
   const app = http.createServer(handler);
   const appPort = await register(app);
   const url = `http://127.0.0.1:${appPort}/zk1-recovery/${b64(operation.operation_id)}`;
@@ -430,6 +513,45 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   assert.equal(body.signedCatalogRecoveredFromRemote, true);
   assert.deepEqual(Buffer.from(body.ciphertextBase64, "base64url"), ciphertext);
   assert.equal(body.remoteDurabilityProven, false);
+  assert.equal(gateway.checkRequesterDeviceIdentity(true), false,
+    "a Boolean HTTP authorization result is never a device identity");
+  assert.equal(gateway.checkRequesterDeviceIdentity({ authorized: true,
+    deviceId: "foreign-device", authorizationKeyId: deviceKeyId }), false);
+  assert.equal(gateway.checkRequesterDeviceIdentity({ authorized: true,
+    deviceId: grantFields.device_id, authorizationKeyId: deviceKeyId }), true);
+  for (const attack of ["replay", "wrong-nonce", "expired", "forged"]) {
+    const before = { ...hits };
+    freshAttack = attack;
+    assert.equal((await sendGet()).status, 403, attack + " owner-state cannot release ciphertext");
+    assert.deepEqual(hits, before, attack + " fails before cloud GET");
+  }
+  freshAttack = null;
+  for (const [label, fake] of [
+    ["cloned administrator identity", { ...readers[1],
+      domainAttestation: { ...readers[1].domainAttestation,
+        trust_domain_id: readers[0].domainAttestation.trust_domain_id } }],
+    ["wrong provider admin signature", { ...readers[1],
+      domainAttestation: { ...readers[1].domainAttestation,
+        signature: readers[0].domainAttestation.signature } }],
+    ["expired provider cert", { ...readers[1],
+      domainAttestation: { ...readers[1].domainAttestation,
+        expires_at: 1 } }],
+    ["wrong namespace from cloned adapter", { ...readers[1],
+      cloudReader: { ...readers[1].cloudReader,
+        zk1StorageNamespace: readers[0].cloudReader.zk1StorageNamespace.bind(readers[0].cloudReader) } }],
+  ]) {
+    const before = { ...hits };
+    await assert.rejects(gateway.restoreExact({ ...recoverInput,
+      readers: [readers[0], fake, readers[2]] }),
+    /ZK_MULTIPROVIDER_RESTORE_DENIED/, label);
+    assert.deepEqual(hits, before, label + " fails before provider GET");
+  }
+  const beforeForeignScope = { ...hits };
+  await assert.rejects(gateway.restoreExact({ ...recoverInput,
+    scope: { ...scope, account_id: random(16) } }),
+  /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+  "owner-signed root scope must match inventory/account rather than just object/root");
+  assert.deepEqual(hits, beforeForeignScope, "foreign account blocked before network");
   const clientBundle = { ...bundle, ciphertextBase64: body.ciphertextBase64 };
   const opened = await portable.openWithIndependentRoot({
     recoverySecret: secret, bundle: clientBundle,
@@ -525,6 +647,8 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
       signerKeyId: ownerSignerId, publicKey: verifier },
     pinnedOwnerHead: { revision: ownerRevision, digest: ownerDigest, epoch: ownerEpoch },
     independentInventoryFloor: floor,
+    independentOwnerSpkiSha256: spkiFingerprint(ownerKeys.publicKey),
+    providerDomainPinset, signedCurrentDeviceGrant, fetchFreshSignedDeviceState,
   };
   const signedRestoreInput = { mode: "cloud-catalog", request: remoteRecovery };
   const expressApp = express();
