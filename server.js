@@ -5963,14 +5963,16 @@ app.use((req, res, next) => {
   }
   next();
 });
-app.use((req, res, next) => {
-  if (req.path === "/zk1-protected-file-lab.html"
-    && (NODE_ENV === "production"
-      || !process.env.ROOTARK_ZK1_CONTENT_CONFIG)) {
-    return res.sendStatus(404);
-  }
-  next();
-});
+// A development-only page must not live in public/: static serving on Windows
+// is case-insensitive and can decode path aliases differently from req.path.
+// Mount this exact, non-public file only for an explicitly opted-in dev/test
+// process. With no route, all spellings are 404, even through express.static.
+if ((NODE_ENV === "development" || NODE_ENV === "test")
+  && process.env.ROOTARK_ZK1_CONTENT_CONFIG) {
+  app.get("/zk1-protected-file-lab.html", (_req, res) =>
+    res.sendFile(path.join(__dirname, "dev-ui", "zk1-protected-file-lab.html"),
+      { dotfiles: "allow" }));
+}
 app.use(express.static("./public"));
 app.post("/upload-chunk", uploadChunkPeerRateLimit);
 app.use(apiRequestRateLimit);

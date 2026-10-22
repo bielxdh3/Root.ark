@@ -90,6 +90,10 @@
     } finally {
       privateDer?.fill(0);
       data?.fill(0);
+      // A File input retains the original PKCS#8/plaintext Blob even after
+      // our array copies are zeroed. Release those selections on every path.
+      byId("device-private").value = "";
+      byId("file").value = "";
       button.disabled = false;
     }
   });

@@ -30,6 +30,27 @@ const scriptNames = ["rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-r
   "rootark-zk1-uncertain-put-reconciliation", "rootark-zk1-normal-browser-content",
   "rootark-zk1-normal-browser-lab-ui"];
 
+test("production static paths cannot disclose the opt-in normal browser laboratory", async (t) => {
+  const app = express();
+  app.use(express.static(path.join(__dirname, "../public")));
+  const server = await new Promise((resolve) => {
+    const value = app.listen(0, "127.0.0.1", () => resolve(value));
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  for (const name of [
+    "/zk1-protected-file-lab.html",
+    "/ZK1-PROTECTED-FILE-LAB.HTML",
+    "/%7ak1-protected-file-lab.html",
+    "//zk1-protected-file-lab.html",
+    "/zK1-protected-file-lab.html",
+  ]) {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}${name}`);
+    assert.equal(response.status, 404, `lab page leaked through static alias: ${name}`);
+  }
+  assert.ok(fs.existsSync(path.join(__dirname, "../dev-ui/zk1-protected-file-lab.html")),
+    "opt-in page must remain available outside the public static tree");
+});
+
 async function setup(t) {
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-normal-browser-"));
   const clock = Math.floor(Date.now() / 1000);
@@ -109,7 +130,7 @@ async function setup(t) {
     requirePermission: () => (_req, _res, next) => next(),
     resolveTrustedScope: () => state.scope,
   });
-  const html = fs.readFileSync(path.join(__dirname, "../public/zk1-protected-file-lab.html"), "utf8");
+  const html = fs.readFileSync(path.join(__dirname, "../dev-ui/zk1-protected-file-lab.html"), "utf8");
   app.get("/zk1-protected-file-lab.html", (_req, res) =>
     res.type("html").set("Content-Security-Policy", "default-src 'self'; script-src 'self'; connect-src 'self'").send(
       html.replace("</body>", '<script defer src="/__probe.js"></script></body>')));
@@ -287,7 +308,10 @@ document.getElementById("head-epoch").value=String(v.pin.epoch);
 document.getElementById("upload").click();
 for(let i=0;i<80;i++){await new Promise(resolve=>setTimeout(resolve,100));
 const status=document.getElementById("status").textContent;
-if(status.includes("Ciphertext conferido")){output.textContent="EDGE_NORMAL_HTTP_PASS";break;}
+if(status.includes("Ciphertext conferido")){output.textContent=
+  document.getElementById("device-private").files.length===0
+  && document.getElementById("file").files.length===0
+    ?"EDGE_NORMAL_HTTP_PASS":"EDGE_NORMAL_HTTP_FAIL";break;}
 if(status.includes("Operação recusada")){output.textContent="EDGE_NORMAL_HTTP_FAIL";break;}}
 if(!output.textContent)output.textContent="EDGE_NORMAL_HTTP_TIMEOUT";
 }catch(e){output.textContent="EDGE_NORMAL_HTTP_FAIL";}});`);
