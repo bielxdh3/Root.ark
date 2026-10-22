@@ -32,7 +32,8 @@ function fixture(provider) {
           assert.equal(command.input.Bucket, "disposable-zk1-bucket");
           assert.equal(command.input.Key, clientKey());
           const collected = [];
-          for await (const bytes of command.input.Body) collected.push(Buffer.from(bytes));
+          if (Buffer.isBuffer(command.input.Body)) collected.push(Buffer.from(command.input.Body));
+          else for await (const bytes of command.input.Body) collected.push(Buffer.from(bytes));
           state.stored = Buffer.concat(collected);
           assert.equal(command.input.ContentLength, state.stored.length);
           return { ETag: "untrusted-storage-ack" };
@@ -152,6 +153,60 @@ test("cloud copy writer rejects changed storage principal before any remote side
   await assert.rejects(publisher.publishExact(f.payload), /ZK_CLOUD_COPY_UNAVAILABLE/);
   assert.equal(f.state.puts, 0,
     "the archive publisher must not start a remote PUT under a foreign writer identity");
+});
+
+test("Drive write never accepts a forged or absent physical ID in create, update or 409 retry acknowledgements", async () => {
+  for (const scenario of ["create-foreign", "create-missing", "update-foreign",
+    "update-missing", "retry-foreign", "retry-missing"]) {
+    const f = fixture("gdrive");
+    const addr = zk1CloudCopyAddress({ scope: f.payload.scope,
+      operationId: f.payload.operationId });
+    const key = `rootark-ack-fixture/uploads/${addr.folder}/${addr.name}`;
+    const pin = f.fileId;
+    let metadataReads = 0;
+    let createCalls = 0;
+    let updateCalls = 0;
+    const responseId = scenario.endsWith("missing") ? {} : { id: "different-remote-id" };
+    const cloudWriter = createCloudStorage({
+      provider: "gdrive", prefix: "rootark-ack-fixture",
+      resolvePrincipalIdentity: async () => "drive-upload-ack-principal",
+      gdrive: { folderId: "ack-parent" },
+      createGoogleDriveClient: async () => ({ files: {
+        get: async ({ fileId }) => {
+          assert.equal(fileId, pin);
+          metadataReads += 1;
+          if (scenario.startsWith("create")
+            || (scenario.startsWith("retry") && metadataReads === 1)) {
+            throw Object.assign(new Error("missing pinned file"), { status: 404 });
+          }
+          return { data: { id: pin, parents: ["ack-parent"],
+            appProperties: { rootArkKey: key, rootArkFolderId: addr.folder,
+              rootArkArea: "uploads" } } };
+        },
+        create: async ({ requestBody }) => {
+          createCalls += 1;
+          assert.equal(requestBody.id, pin);
+          if (scenario.startsWith("retry")) {
+            throw Object.assign(new Error("409 ID exists"), { status: 409 });
+          }
+          return { data: responseId };
+        },
+        update: async ({ fileId }) => {
+          assert.equal(fileId, pin);
+          updateCalls += 1;
+          return { data: responseId };
+        },
+      } }),
+    });
+    const pub = new Zk1CloudCiphertextCopyPublisher({ cloudWriter,
+      expectedProvider: "gdrive",
+      expectedWriterContext: await cloudWriter.resolveInventoryContext(),
+      pinnedDriveFileId: pin });
+    await assert.rejects(pub.publishExact(f.payload), /ZK_CLOUD_COPY_UNAVAILABLE/,
+      `${scenario} cannot yield acknowledged physical ciphertext replication`);
+    assert.equal(createCalls, Number(!scenario.startsWith("update")));
+    assert.equal(updateCalls, Number(!scenario.startsWith("create")));
+  }
 });
 
 test("Drive verification never substitutes an older same-key duplicate for the exact published ID", async () => {

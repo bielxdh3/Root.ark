@@ -2,7 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { pipeline } = require("stream/promises");
-const { Transform } = require("stream");
+const { Transform, Readable } = require("stream");
 const { normalizeProviderError } = require("../src/services/deploymentResilience");
 
 function abortableProviderRead(action, signal) {
@@ -168,31 +168,45 @@ function createCloudStorage(options = {}) {
     };
   }
   async function uploadToPinnedDriveId(localPath, fileId, requestBody, cloudKey, folderId, area,
-    signal = undefined) {
+    signal = undefined, boundedBytes = null) {
     const client = await drive();
+    // The bounded writer owns a detached byte buffer. Never leave a lazy
+    // file-descriptor stream that may open AFTER its private staging path is
+    // removed by the caller (for example after a lying provider's early ACK).
+    const media = () => ({ body: boundedBytes === null
+      ? fs.createReadStream(localPath) : Readable.from([boundedBytes]) });
     let existing;
     try { existing = await abortableProviderRead(() => getDriveFile(fileId, signal), signal); }
     catch (error) { if (!isDriveStatus(error, 404)) throw error; }
     if (existing) {
       assertDriveFileOwnership(existing, cloudKey, folderId, area);
-      await abortableProviderRead(() => client.files.update({ fileId, requestBody,
-        media: { body: fs.createReadStream(localPath) }, fields: "id" },
+      const result = await abortableProviderRead(() => client.files.update({ fileId, requestBody,
+        media: media(), fields: "id" },
       signal ? { signal } : undefined), signal);
+      if (result?.data?.id !== fileId) {
+        throw cloudError("provider_error", "Drive update receipt returned a different physical file ID");
+      }
       return { provider, key: cloudKey, id: fileId };
     }
     try {
       const result = await abortableProviderRead(() => client.files.create({
         requestBody: { ...requestBody, id: fileId, parents: [folder()] },
-        media: { body: fs.createReadStream(localPath) }, fields: "id" },
+        media: media(), fields: "id" },
       signal ? { signal } : undefined), signal);
-      return { provider, key: cloudKey, id: String(result.data.id || fileId) };
+      if (result?.data?.id !== fileId) {
+        throw cloudError("provider_error", "Drive create receipt returned a different physical file ID");
+      }
+      return { provider, key: cloudKey, id: fileId };
     } catch (error) {
       if (!isDriveStatus(error, 409)) throw error;
       const raced = await abortableProviderRead(() => getDriveFile(fileId, signal), signal);
       assertDriveFileOwnership(raced, cloudKey, folderId, area);
-      await abortableProviderRead(() => client.files.update({ fileId, requestBody,
-        media: { body: fs.createReadStream(localPath) }, fields: "id" },
+      const result = await abortableProviderRead(() => client.files.update({ fileId, requestBody,
+        media: media(), fields: "id" },
       signal ? { signal } : undefined), signal);
+      if (result?.data?.id !== fileId) {
+        throw cloudError("provider_error", "Drive retry receipt returned a different physical file ID");
+      }
       return { provider, key: cloudKey, id: fileId };
     }
   }
@@ -266,6 +280,7 @@ function createCloudStorage(options = {}) {
     assertProvider(); if (!enabled() || !fs.statSync(localPath, { throwIfNoEntry: false })?.isFile()) return null;
     const cloudKey = objectKey(folderId, fileName, area);
     const bound = uploadOptions?.zk1BoundedBytes;
+    let boundedBytes = null;
     if (bound !== undefined) {
       if (!Number.isSafeInteger(bound) || bound < 1 || bound > 16 * 1024 * 1024
         || !uploadOptions || typeof uploadOptions !== "object" || Array.isArray(uploadOptions)
@@ -277,6 +292,23 @@ function createCloudStorage(options = {}) {
         || stat.size !== BigInt(bound)) {
         throw cloudError("configuration", "Ciphertext staging file is not an exact private upload");
       }
+      const fd = fs.openSync(localPath,
+        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      try {
+        const opened = fs.fstatSync(fd, { bigint: true });
+        if (!opened.isFile() || opened.nlink !== 1n || opened.size !== BigInt(bound)
+          || opened.dev !== stat.dev || opened.ino !== stat.ino) {
+          throw cloudError("configuration", "Bounded ciphertext staging file changed identity");
+        }
+        boundedBytes = fs.readFileSync(fd);
+        const ended = fs.fstatSync(fd, { bigint: true });
+        if (boundedBytes.length !== bound || ended.dev !== opened.dev
+          || ended.ino !== opened.ino || ended.size !== opened.size
+          || ended.mtimeNs !== opened.mtimeNs || ended.ctimeNs !== opened.ctimeNs
+          || ended.nlink !== 1n) {
+          throw cloudError("configuration", "Bounded ciphertext staging file changed during capture");
+        }
+      } finally { fs.closeSync(fd); }
     }
     const controller = bound !== undefined ? new AbortController() : null;
     const timeout = controller ? setTimeout(() => controller.abort(), 15000) : null;
@@ -286,7 +318,8 @@ function createCloudStorage(options = {}) {
       const bucketName = bucket();
       await abortableProviderRead(async () => (await s3()).send(
         new (require("@aws-sdk/client-s3").PutObjectCommand)({ Bucket: bucketName,
-          Key: cloudKey, Body: fs.createReadStream(localPath), ...(bound ? { ContentLength: bound } : {}) }),
+          Key: cloudKey, Body: boundedBytes === null ? fs.createReadStream(localPath) : boundedBytes,
+          ...(bound ? { ContentLength: bound } : {}) }),
         signal ? { abortSignal: signal } : undefined), signal);
       if (signal?.aborted) throw cloudError("provider_error", "Bounded ciphertext upload deadline exceeded");
       return { provider, key: cloudKey };
@@ -296,7 +329,7 @@ function createCloudStorage(options = {}) {
       if (!isDriveFileId(providerFileId)) throw cloudError("invalid_path", "Google Drive file ID is invalid");
       const result = await abortableProviderRead(() => uploadToPinnedDriveId(localPath,
         providerFileId, driveRequestBody(folderId, fileName, area, cloudKey),
-        cloudKey, folderId, area, signal), signal);
+        cloudKey, folderId, area, signal, boundedBytes), signal);
       if (signal?.aborted) throw cloudError("provider_error", "Bounded ciphertext upload deadline exceeded");
       return result;
     }

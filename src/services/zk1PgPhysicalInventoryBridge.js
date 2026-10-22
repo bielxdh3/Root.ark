@@ -323,6 +323,85 @@ class Zk1PgPhysicalInventoryBridge {
       authorizesIo: false, externalProviderDurabilityProven: false,
       independentRemoteIoFenceProven: false });
   }
+  // An optional, deliberately NON-AUTHORIZING two-provider copy of one
+  // historically signed physical operation. A late mutation/fault of the
+  // first provider during the second provider's PUT is checked by a *second*
+  // full readback of both providers. The two GETs are not an atomic snapshot;
+  // none of these checks is a remotely fenced durable commit or I/O permit.
+  async publishAndReconcileCloudCopies({ physical, chunks, copies } = {}) {
+    const v = this.#request(physical);
+    const detached = detachedChunks(chunks, v.expectedChunkCount,
+      v.operation.ciphertext_sha256, v.expectedRootHash);
+    if (!Array.isArray(copies) || copies.length !== 2
+      || Reflect.ownKeys(copies).length !== 3) fail();
+    const targets = [];
+    for (let index = 0; index < 2; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(copies, String(index));
+      if (!descriptor || !Object.hasOwn(descriptor, "value")) fail();
+      const item = exact(descriptor.value, ["cloudPublisher", "cloudVerifier"]);
+      if (!(item.cloudPublisher instanceof Zk1CloudCiphertextCopyPublisher)
+        || !(item.cloudVerifier instanceof Zk1CloudCiphertextReadbackVerifier)) fail();
+      if (Object.hasOwn(item.cloudPublisher, "pinnedCopyTarget")
+        || Object.hasOwn(item.cloudVerifier, "pinnedCopyTarget")) fail();
+      const pubTarget = item.cloudPublisher.pinnedCopyTarget;
+      const readTarget = item.cloudVerifier.pinnedCopyTarget;
+      if (pubTarget.provider !== readTarget.provider
+        || pubTarget.driveFileId !== readTarget.driveFileId
+        || !["s3", "gdrive"].includes(pubTarget.provider)) fail();
+      targets.push({ publisher: item.cloudPublisher, verifier: item.cloudVerifier,
+        configuredProvider: pubTarget.provider });
+    }
+    if (targets[0].publisher === targets[1].publisher
+      || targets[0].verifier === targets[1].verifier
+      || targets[0].configuredProvider === targets[1].configuredProvider) fail();
+    const fixed = { scope: v.scope, operation: v.operation,
+      digest: v.digest, expectedRootHash: v.expectedRootHash,
+      expectedChunkCount: v.expectedChunkCount };
+    const signed = await this.reconcile(fixed);
+    if (signed.status !== "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY") fail();
+    const receipts = [];
+    const providerSet = new Set();
+    for (const target of targets) {
+      let status;
+      try {
+        status = await this.publishAndReconcileCloudCopy({ physical: fixed,
+          chunks: detached, cloudPublisher: target.publisher,
+          cloudVerifier: target.verifier });
+      } catch (_) { fail(); }
+      if (status.provider !== target.configuredProvider
+        || providerSet.has(status.provider) || status.byteLength !== detached.reduce(
+          (sum, chunk) => sum + chunk.length, 0)
+        || status.authorizesIo !== false
+        || status.externalProviderDurabilityProven !== false
+        || status.independentRemoteIoFenceProven !== false) fail();
+      providerSet.add(status.provider);
+      receipts.push(status);
+    }
+    // Re-read BOTH after all network PUTs: a later copy operation or crashed
+    // upload cannot silently replace the earlier ciphertext and still produce
+    // a positive evidence receipt for two current copies.
+    for (let index = 0; index < targets.length; index += 1) {
+      let checked;
+      try {
+        checked = await this.reconcileCloudCopy({ physical: fixed,
+          cloudVerifier: targets[index].verifier,
+          chunkLengths: detached.map((chunk) => chunk.length) });
+      } catch (_) { fail(); }
+      if (checked.provider !== receipts[index].provider
+        || checked.authorizesIo !== false
+        || !same(checked.operationId, v.operation.operation_id)) fail();
+    }
+    const after = await this.reconcile(fixed);
+    if (after.status !== signed.status || after.sequence !== signed.sequence
+      || !same(after.root, signed.root)) fail();
+    return Object.freeze({ status: "PG_SIGNED_AND_TWO_CLOUD_COPIES_REREAD",
+      operationId: Buffer.from(v.operation.operation_id),
+      providers: Object.freeze([...providerSet]),
+      providerCount: 2, authorizesIo: false,
+      externalProviderDurabilityProven: false,
+      atomicCrossProviderCommitProven: false,
+      independentRemoteIoFenceProven: false });
+  }
   async publishExisting(input) {
     const v = this.#request(input);
     await this.#verifiedInventoryFloor(v);

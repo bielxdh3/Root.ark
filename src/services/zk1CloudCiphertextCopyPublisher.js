@@ -96,6 +96,10 @@ class Zk1CloudCiphertextCopyPublisher {
     this.#driveId = pinnedDriveFileId;
   }
 
+  get pinnedCopyTarget() {
+    return Object.freeze({ provider: this.#provider, driveFileId: this.#driveId });
+  }
+
   async publishExact(input) {
     let directory;
     try {

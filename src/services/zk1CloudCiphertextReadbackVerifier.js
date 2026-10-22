@@ -91,6 +91,10 @@ class Zk1CloudCiphertextReadbackVerifier {
     this.#driveId = pinnedDriveFileId;
   }
 
+  get pinnedCopyTarget() {
+    return Object.freeze({ provider: this.#expectedProvider, driveFileId: this.#driveId });
+  }
+
   async verifyExact(input) {
     let dir;
     try {

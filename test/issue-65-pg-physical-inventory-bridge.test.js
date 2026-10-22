@@ -354,7 +354,8 @@ test("real sealed PG operation permits only nonauthorizing bounded S3 PUT plus i
       if (cmd.constructor.name === "PutObjectCommand") {
         puts += 1;
         const bytes = [];
-        for await (const chunk of cmd.input.Body) bytes.push(Buffer.from(chunk));
+        if (Buffer.isBuffer(cmd.input.Body)) bytes.push(Buffer.from(cmd.input.Body));
+        else for await (const chunk of cmd.input.Body) bytes.push(Buffer.from(chunk));
         const combined = Buffer.concat(bytes);
         assert.equal(cmd.input.ContentLength, combined.length);
         cloud.set(cmd.input.Key, tamperRemotePut ? Buffer.alloc(combined.length, 0x3a) : combined);
@@ -412,6 +413,131 @@ test("real sealed PG operation permits only nonauthorizing bounded S3 PUT plus i
     /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
     "even authentic PG, receipt and remote bytes cannot authorize a copy whose GET identity disagrees with PUT");
   cloudVerifier.verifyExact = exactRead;
+});
+
+test("one real signed PG operation requires independent S3 and Drive copy rereads, rejecting later first-copy corruption", {
+  skip: !enabled && "requires disposable PostgreSQL 18 and synthetic S3 + Google Drive",
+}, async (t) => {
+  const f = await fixture(t);
+  const address = zk1CloudCopyAddress({ scope: f.scope, operationId: f.op.operation_id });
+  const filename = "pinned-two-provider-file";
+  const expected = Buffer.concat(f.chunks);
+  let s3Bytes = null;
+  let driveBytes = null;
+  let overwriteS3DuringDrive = false;
+  let s3Puts = 0;
+  let drivePuts = 0;
+  const config = (provider, principal) => {
+    const base = { provider, prefix: "zk1-two-provider-physical-fixture",
+      resolvePrincipalIdentity: async () => `${provider}-${principal}` };
+    if (provider === "s3") {
+      base.s3 = { bucket: "synthetic-two-provider-bucket" };
+      base.createS3Client = async () => ({ send: async (cmd) => {
+        if (cmd.constructor.name === "PutObjectCommand") {
+          s3Puts += 1;
+          const collected = [];
+          if (Buffer.isBuffer(cmd.input.Body)) collected.push(Buffer.from(cmd.input.Body));
+          else for await (const data of cmd.input.Body) collected.push(Buffer.from(data));
+          s3Bytes = Buffer.concat(collected);
+          return { ETag: "nonproof" };
+        }
+        if (cmd.constructor.name === "GetObjectCommand") {
+          if (!s3Bytes) throw new Error("missing S3 ciphertext");
+          return { Body: Readable.from([s3Bytes]) };
+        }
+        throw new Error("non-opaque provider effect forbidden");
+      } });
+    } else {
+      base.gdrive = { folderId: "independent-drive-fixture-parent" };
+      const metadata = () => ({ id: filename,
+        parents: ["independent-drive-fixture-parent"],
+        appProperties: {
+          rootArkKey: `zk1-two-provider-physical-fixture/uploads/${address.folder}/${address.name}`,
+          rootArkFolderId: address.folder, rootArkArea: "uploads",
+        } });
+      base.createGoogleDriveClient = async () => ({ files: {
+        get: async ({ fileId, alt }) => {
+          if (fileId !== filename || !driveBytes) {
+            throw Object.assign(new Error("not found"), { status: 404 });
+          }
+          return alt === "media" ? { data: Readable.from([driveBytes]) }
+            : { data: metadata() };
+        },
+        list: async () => ({ data: { files: driveBytes ? [metadata()] : [] } }),
+        create: async ({ requestBody, media }) => {
+          assert.equal(requestBody.id, filename);
+          drivePuts += 1;
+          const pieces = [];
+          for await (const data of media.body) pieces.push(Buffer.from(data));
+          driveBytes = Buffer.concat(pieces);
+          if (overwriteS3DuringDrive) s3Bytes = Buffer.alloc(expected.length, 0x91);
+          return { data: { id: filename } };
+        },
+        update: async ({ fileId, media }) => {
+          assert.equal(fileId, filename);
+          drivePuts += 1;
+          const pieces = [];
+          for await (const data of media.body) pieces.push(Buffer.from(data));
+          driveBytes = Buffer.concat(pieces);
+          if (overwriteS3DuringDrive) s3Bytes = Buffer.alloc(expected.length, 0x91);
+          return { data: { id: filename } };
+        },
+      } });
+    }
+    return createCloudStorage(base);
+  };
+  const makeTarget = async (provider) => {
+    const writer = config(provider, "write-only");
+    const reader = config(provider, "reader-only");
+    return {
+      cloudPublisher: new Zk1CloudCiphertextCopyPublisher({
+        cloudWriter: writer, expectedProvider: provider,
+        expectedWriterContext: await writer.resolveInventoryContext(),
+        pinnedDriveFileId: provider === "gdrive" ? filename : null,
+      }),
+      cloudVerifier: new Zk1CloudCiphertextReadbackVerifier({
+        cloudReader: reader, expectedProvider: provider,
+        expectedReaderContext: await reader.resolveInventoryContext(),
+        pinnedDriveFileId: provider === "gdrive" ? filename : null,
+      }),
+    };
+  };
+  const s3 = await makeTarget("s3");
+  const drive = await makeTarget("gdrive");
+  const bridge = f.bridge();
+  const args = { physical: f.noChunks(), chunks: f.chunks, copies: [s3, drive] };
+  await assert.rejects(bridge.publishAndReconcileCloudCopies(args),
+    /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+    "two cloud PUTs must be refused before exact signed local PG proof");
+  assert.equal(s3Puts + drivePuts, 0);
+  await f.bridge().putAndAttest(f.physical);
+  await assert.rejects(bridge.publishAndReconcileCloudCopies({ ...args, copies: [s3, s3] }),
+    /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+    "two copies of the same S3 authority cannot masquerade as two providers");
+  assert.equal(s3Puts + drivePuts, 0);
+  overwriteS3DuringDrive = true;
+  await assert.rejects(bridge.publishAndReconcileCloudCopies(args),
+    /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+    "Drive PUT tampering with already-verified S3 copy must fail the second full readback");
+  assert.deepEqual(driveBytes, expected);
+  assert.notDeepEqual(s3Bytes, expected);
+  overwriteS3DuringDrive = false;
+  const outcome = await bridge.publishAndReconcileCloudCopies(args);
+  assert.equal(outcome.status, "PG_SIGNED_AND_TWO_CLOUD_COPIES_REREAD");
+  assert.deepEqual(outcome.providers, ["s3", "gdrive"]);
+  assert.equal(outcome.providerCount, 2);
+  assert.equal(outcome.authorizesIo, false);
+  assert.equal(outcome.externalProviderDurabilityProven, false);
+  assert.equal(outcome.independentRemoteIoFenceProven, false);
+  assert.equal(outcome.atomicCrossProviderCommitProven, false);
+  assert.deepEqual(s3Bytes, expected);
+  assert.deepEqual(driveBytes, expected);
+  const beforeFailure = s3Puts + drivePuts;
+  await assert.rejects(bridge.publishAndReconcileCloudCopies({ ...args,
+    chunks: [Buffer.alloc(f.chunks[0].length), f.chunks[1]] }),
+  /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/);
+  assert.equal(s3Puts + drivePuts, beforeFailure,
+    "invalid local chunks cannot start cloud effects on either provider");
 });
 
 test("mTLS signed inventory append requires real strict physical PG readback and WAL", {
