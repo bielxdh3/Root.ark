@@ -10,6 +10,7 @@ const { spawnSync } = require("node:child_process");
 const checkpoint = require("../src/crypto/rootark-zk1-owner-cas-floor-checkpoint");
 
 const SCRIPT = path.resolve(__dirname, "../scripts/zk1-owner-cas-floor-sign-offline.js");
+const { run: runSigner } = require(SCRIPT);
 const now = () => Math.floor(Date.now() / 1000);
 
 test("owner offline signer enforces independent inputs, signer separation, custody and exclusive output", (t) => {
@@ -118,3 +119,115 @@ test("owner offline signer enforces independent inputs, signer separation, custo
   write("public", other.publicKey);
   denied(minimum); // private key does not match pinned owner public key
 });
+
+test("offline signer refuses a directory swap before consuming the owner private key", (t) => {
+  const fixture = nestedFixture(t);
+  const foreignKey = crypto.generateKeyPairSync("ed25519").privateKey.export({
+    type: "pkcs8", format: "pem",
+  });
+  const foreignPrivate = path.join(fixture.foreign, "private.pem");
+  fs.writeFileSync(foreignPrivate, foreignKey);
+  const ownedPrivate = path.join(fixture.nested, "private.pem");
+  let swapped = false;
+  let foreignReads = 0;
+  const fakeFs = Object.create(fs);
+  fakeFs.lstatSync = (name, ...rest) => {
+    if (name === ownedPrivate && !swapped) {
+      fixture.swapToForeign();
+      swapped = true;
+    }
+    return fs.lstatSync(name, ...rest);
+  };
+  fakeFs.readFileSync = (fd, ...rest) => {
+    if (typeof fd === "number") {
+      const opened = fs.fstatSync(fd);
+      const foreign = fs.statSync(foreignPrivate);
+      if (opened.dev === foreign.dev && opened.ino === foreign.ino) foreignReads++;
+    }
+    return fs.readFileSync(fd, ...rest);
+  };
+  try {
+    assert.throws(() => runSigner(fixture.args, now(), fakeFs));
+    assert.equal(swapped, true);
+    assert.equal(foreignReads, 0, "the signer read bytes through the foreign junction");
+    assert.equal(fs.existsSync(fixture.output), false);
+  } finally { fixture.restore(); }
+});
+
+test("offline signer does not write through an output-parent junction swapped at open", (t) => {
+  const fixture = nestedFixture(t);
+  const foreignOutput = path.join(fixture.foreign, "checkpoint.json");
+  const sentinel = path.join(fixture.foreign, "untouched.txt");
+  fs.writeFileSync(sentinel, "foreign contents stay untouched");
+  let swapped = false;
+  const fakeFs = Object.create(fs);
+  fakeFs.openSync = (filename, ...rest) => {
+    if (filename === fixture.output) {
+      fixture.swapToForeign();
+      swapped = true;
+    }
+    return fs.openSync(filename, ...rest);
+  };
+  try {
+    assert.throws(() => runSigner(fixture.args, now(), fakeFs));
+    assert.equal(swapped, true);
+    assert.equal(fs.existsSync(foreignOutput), false, "foreign output must be rolled back");
+    assert.equal(fs.readFileSync(sentinel, "utf8"), "foreign contents stay untouched");
+  } finally { fixture.restore(); }
+  assert.equal(fs.existsSync(fixture.output), false);
+});
+
+function nestedFixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-owner-swap-owned-"));
+  const foreign = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-owner-swap-foreign-"));
+  const nested = path.join(root, "keys");
+  const saved = path.join(root, "keys-original");
+  fs.mkdirSync(nested);
+  const [owner, witness, status] = Array.from({ length: 3 }, () => crypto.generateKeyPairSync("ed25519"));
+  const files = {
+    input: "minimum.json", private: "private.pem", public: "public.pem",
+    witness: "witness.pem", status: "status.pem", output: "checkpoint.json",
+  };
+  const loc = (file) => path.join(nested, files[file]);
+  fs.writeFileSync(loc("input"), JSON.stringify({
+    source: "owner-retained-independent-floor/v1",
+    witnessKeyId: crypto.randomBytes(16).toString("base64url"),
+    statusKeyId: crypto.randomBytes(16).toString("base64url"),
+    trustedMinimumHead: { sequence: 2, lastHash: "a".repeat(64) },
+    issuedAt: now(), expiresAt: now() + 1200,
+  }));
+  for (const [name, key, priv] of [
+    ["private", owner.privateKey, true], ["public", owner.publicKey, false],
+    ["witness", witness.publicKey, false], ["status", status.publicKey, false],
+  ]) fs.writeFileSync(loc(name), key.export({ type: priv ? "pkcs8" : "spki", format: "pem" }));
+  const args = ["--owned-dir", root,
+    "--input", loc("input"), "--owner-private-key", loc("private"),
+    "--owner-public-key", loc("public"), "--witness-public-key", loc("witness"),
+    "--status-public-key", loc("status"), "--output", loc("output"),
+    "--confirm-independent-minimum"];
+  let isSwapped = false;
+  function restore() {
+    if (!isSwapped) return;
+    fs.unlinkSync(nested);
+    fs.renameSync(saved, nested);
+    isSwapped = false;
+  }
+  t.after(() => {
+    restore();
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(foreign, { recursive: true, force: true });
+  });
+  return {
+    foreign, nested, output: loc("output"), args, restore,
+    swapToForeign() {
+      fs.renameSync(nested, saved);
+      try {
+        fs.symlinkSync(foreign, nested, process.platform === "win32" ? "junction" : "dir");
+        isSwapped = true;
+      } catch (error) {
+        fs.renameSync(saved, nested);
+        throw error;
+      }
+    },
+  };
+}

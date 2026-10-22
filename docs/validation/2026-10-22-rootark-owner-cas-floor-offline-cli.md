@@ -94,6 +94,12 @@ paths, symlinks or junctions observed in parent components, public/private
 key mismatch, any reused owner/witness/status Ed25519 signer, identical
 witness/status key IDs, stale/expired timestamps,
 invalid floor encoding, output path collisions or unsafe exclusive creation.
+For input, the signer opens a descriptor before reading and verifies its file
+identity and each ancestor directory against the initially validated chain
+before and after reading. For output, exclusive creation (with no-follow where
+supported) is followed by descriptor/ancestor checks before writing and after
+fsync. An aborted create attempts to remove only the same newly created inode;
+an inaccessible or concurrently replaced path may leave an incomplete file.
 It emits only `OWNER_FLOOR_SIGNED` or `OWNER_FLOOR_SIGN_FAILED` to the console,
 never private-key material. Private PEM buffers are zeroed after import.
 
@@ -114,12 +120,17 @@ it additionally
 rejects key reuse (including identical witness/status PEM contents at different
 paths), duplicate authority IDs, divergent PEM, forged source, bad timestamps,
 outside-owned paths and overwrite attempts without creating an artifact.
+Adversarial tests inject directory-junction swaps between validation and file
+open and assert that foreign private-key bytes are not consumed and a displaced
+exclusive output leaves no foreign artifact.
 
 This owner-side convenience tool cannot verify that an operator's minimum
 came from a physically durable independent quorum. The explicit owner source
 assertion is not cryptographic provenance. Local filesystem adversaries able
-to swap Windows directory junctions between checks can still race standard
+to swap Windows directory junctions between rechecks can still race standard
 Node path/file APIs (no portable `openat` / directory-handle confinement).
+These checks reduce practical exposure but cannot make Windows path access
+race-free against another actor with write access to the owned directory tree.
 Windows ACL enforcement and clock integrity are operator responsibilities;
 an attacker controlling the host, owner key, pin environment or retained
 monotonic checkpoint can defeat the intended independent trust boundary.

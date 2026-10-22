@@ -40,25 +40,25 @@ function parseArgs(argv) {
   return args;
 }
 
-function noSymlinkComponents(location) {
+function noSymlinkComponents(location, io = fs) {
   const absolute = path.resolve(location);
   const root = path.parse(absolute).root;
   let current = root;
   for (const segment of absolute.slice(root.length).split(path.sep).filter(Boolean)) {
     current = path.join(current, segment);
-    const stat = fs.lstatSync(current);
+    const stat = io.lstatSync(current);
     if (stat.isSymbolicLink()) fail();
   }
 }
 
-function within(root, candidate, exists = true) {
+function within(root, candidate, exists = true, io = fs) {
   if (typeof candidate !== "string" || !path.isAbsolute(candidate)) fail();
   const absolute = path.resolve(candidate);
   const relative = path.relative(root, absolute);
   if (!relative || relative === ".." || relative.startsWith(".." + path.sep)
     || path.isAbsolute(relative)) fail();
-  noSymlinkComponents(exists ? absolute : path.dirname(absolute));
-  const resolved = fs.realpathSync.native(exists ? absolute : path.dirname(absolute));
+  noSymlinkComponents(exists ? absolute : path.dirname(absolute), io);
+  const resolved = io.realpathSync.native(exists ? absolute : path.dirname(absolute));
   const target = exists ? resolved : path.join(resolved, path.basename(absolute));
   const canonicalRelative = path.relative(root, target);
   if (!canonicalRelative || canonicalRelative === ".."
@@ -67,23 +67,74 @@ function within(root, candidate, exists = true) {
   return absolute;
 }
 
-function readOwned(root, name) {
-  const file = within(root, name);
-  const before = fs.lstatSync(file);
-  if (!before.isFile() || before.size <= 0 || before.size > MAX_FILE) fail();
-  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+function sameFile(a, b) {
+  return a.dev === b.dev && a.ino === b.ino && a.size === b.size
+    && a.mtimeMs === b.mtimeMs;
+}
+
+// Snapshot the directory identities, including the ancestors of --owned-dir.
+// A junction substituted between path validation and open must not authorize an FD.
+function directoryChain(location, io = fs) {
+  const absolute = path.resolve(location);
+  const volume = path.parse(absolute).root;
+  let current = volume;
+  const paths = [volume];
+  for (const component of absolute.slice(volume.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    paths.push(current);
+  }
+  return paths.map((dir) => {
+    const info = io.lstatSync(dir);
+    if (!info.isDirectory() || info.isSymbolicLink()) fail();
+    const canonical = io.realpathSync.native(dir);
+    const normalize = (value) => process.platform === "win32"
+      ? path.resolve(value).toLowerCase() : path.resolve(value);
+    if (normalize(canonical) !== normalize(dir)) fail();
+    return { dir, dev: info.dev, ino: info.ino };
+  });
+}
+
+function checkDirectories(chain, io = fs) {
+  for (const { dir, dev, ino } of chain) {
+    const info = io.lstatSync(dir);
+    if (!info.isDirectory() || info.isSymbolicLink()
+      || info.dev !== dev || info.ino !== ino) fail();
+    const resolved = io.realpathSync.native(dir);
+    const normalize = (value) => process.platform === "win32"
+      ? path.resolve(value).toLowerCase() : path.resolve(value);
+    if (normalize(resolved) !== normalize(dir)) fail();
+  }
+}
+
+function checkOpenedPath(root, file, chain, opened, io = fs) {
+  checkDirectories(chain, io);
+  const atPath = io.lstatSync(file);
+  if (!atPath.isFile() || atPath.isSymbolicLink() || !sameFile(opened, atPath)) fail();
+  within(root, file, true, io);
+  checkDirectories(chain, io);
+}
+
+function readOwned(root, file, chain, io = fs) {
+  // Open first and authorize the FD before reading any file contents. A path
+  // check alone followed by open is vulnerable to Windows junction swaps.
+  const fd = io.openSync(file, io.constants.O_RDONLY
+    | (io.constants.O_NOFOLLOW || 0) | (io.constants.O_NONBLOCK || 0));
+  let buffer;
   try {
-    const opened = fs.fstatSync(fd);
-    if (!opened.isFile() || opened.size !== before.size
-      || opened.ino !== before.ino || opened.dev !== before.dev) fail();
-    const buffer = fs.readFileSync(fd);
+    const opened = io.fstatSync(fd);
+    if (!opened.isFile() || opened.size <= 0 || opened.size > MAX_FILE) fail();
+    checkOpenedPath(root, file, chain, opened, io);
+    buffer = io.readFileSync(fd);
     if (buffer.length !== opened.size) fail();
-    const after = fs.lstatSync(file);
-    if (after.ino !== opened.ino || after.dev !== opened.dev || after.size !== opened.size
-      || after.mtimeMs !== opened.mtimeMs) fail();
-    within(root, file);
-    return buffer;
-  } finally { fs.closeSync(fd); }
+    if (!sameFile(opened, io.fstatSync(fd))) fail();
+    checkOpenedPath(root, file, chain, opened, io);
+    const result = buffer;
+    buffer = undefined;
+    return result;
+  } finally {
+    if (buffer) buffer.fill(0);
+    io.closeSync(fd);
+  }
 }
 
 function keyId(value) {
@@ -98,26 +149,31 @@ function publicEd25519(buffer) {
   return key;
 }
 
-function run(argv, now = Math.floor(Date.now() / 1000)) {
+function run(argv, now = Math.floor(Date.now() / 1000), io = fs) {
   const args = parseArgs(argv);
   const ownedDir = args["--owned-dir"];
   if (!path.isAbsolute(ownedDir)) fail();
-  noSymlinkComponents(ownedDir);
-  const ownedStat = fs.lstatSync(ownedDir);
+  noSymlinkComponents(ownedDir, io);
+  const ownedStat = io.lstatSync(ownedDir);
   if (!ownedStat.isDirectory() || ownedStat.isSymbolicLink()) fail();
-  const root = fs.realpathSync.native(ownedDir);
-  const inputPath = within(root, args["--input"]);
-  const ownerPrivPath = within(root, args["--owner-private-key"]);
-  const ownerPubPath = within(root, args["--owner-public-key"]);
-  const witnessPubPath = within(root, args["--witness-public-key"]);
-  const statusPubPath = within(root, args["--status-public-key"]);
-  const outputPath = within(root, args["--output"], false);
+  const root = io.realpathSync.native(ownedDir);
+  const inputPath = within(root, args["--input"], true, io);
+  const ownerPrivPath = within(root, args["--owner-private-key"], true, io);
+  const ownerPubPath = within(root, args["--owner-public-key"], true, io);
+  const witnessPubPath = within(root, args["--witness-public-key"], true, io);
+  const statusPubPath = within(root, args["--status-public-key"], true, io);
+  const outputPath = within(root, args["--output"], false, io);
   const allPaths = [inputPath, ownerPrivPath, ownerPubPath, witnessPubPath,
     statusPubPath, outputPath].map((name) => path.normalize(name).toLowerCase());
   if (new Set(allPaths).size !== allPaths.length) fail();
-  if (fs.existsSync(outputPath)) fail();
+  const inputChain = directoryChain(path.dirname(inputPath), io);
+  const ownerPrivChain = directoryChain(path.dirname(ownerPrivPath), io);
+  const ownerPubChain = directoryChain(path.dirname(ownerPubPath), io);
+  const witnessPubChain = directoryChain(path.dirname(witnessPubPath), io);
+  const statusPubChain = directoryChain(path.dirname(statusPubPath), io);
+  const outputChain = directoryChain(path.dirname(outputPath), io);
 
-  const inputBytes = readOwned(root, inputPath);
+  const inputBytes = readOwned(root, inputPath, inputChain, io);
   let data;
   try { data = JSON.parse(inputBytes.toString("utf8")); }
   finally { inputBytes.fill(0); }
@@ -138,15 +194,15 @@ function run(argv, now = Math.floor(Date.now() / 1000)) {
     || data.expiresAt <= now || data.expiresAt <= data.issuedAt
     || data.expiresAt - data.issuedAt > 3600) fail();
 
-  const ownerPub = publicEd25519(readOwned(root, ownerPubPath));
-  const witnessPub = publicEd25519(readOwned(root, witnessPubPath));
-  const statusPub = publicEd25519(readOwned(root, statusPubPath));
+  const ownerPub = publicEd25519(readOwned(root, ownerPubPath, ownerPubChain, io));
+  const witnessPub = publicEd25519(readOwned(root, witnessPubPath, witnessPubChain, io));
+  const statusPub = publicEd25519(readOwned(root, statusPubPath, statusPubChain, io));
   const ownerSpki = ownerPub.export({ type: "spki", format: "der" });
   const witnessSpki = witnessPub.export({ type: "spki", format: "der" });
   const statusSpki = statusPub.export({ type: "spki", format: "der" });
   if (ownerSpki.equals(witnessSpki) || ownerSpki.equals(statusSpki)
     || witnessSpki.equals(statusSpki)) fail();
-  const privatePem = readOwned(root, ownerPrivPath);
+  const privatePem = readOwned(root, ownerPrivPath, ownerPrivChain, io);
   let ownerPriv;
   try { ownerPriv = crypto.createPrivateKey(privatePem); }
   finally { privatePem.fill(0); }
@@ -177,12 +233,45 @@ function run(argv, now = Math.floor(Date.now() / 1000)) {
 
   // An exclusive create never replaces an existing checkpoint. No file names,
   // private-key data, or input contents are emitted to the console on errors.
-  within(root, outputPath, false);
-  const handle = fs.openSync(outputPath, "wx", 0o600);
+  // The new FD is empty and exclusive. Authorize its identity and ancestor
+  // chain BEFORE writing signed material; recheck after fsync as well.
+  const handle = io.openSync(outputPath, io.constants.O_WRONLY | io.constants.O_CREAT
+    | io.constants.O_EXCL | (io.constants.O_NOFOLLOW || 0), 0o600);
+  let completed = false;
   try {
-    fs.writeFileSync(handle, JSON.stringify(artifact, null, 2) + "\n", "utf8");
-    fs.fsyncSync(handle);
-  } finally { fs.closeSync(handle); }
+    const opened = io.fstatSync(handle);
+    if (!opened.isFile() || opened.size !== 0 || opened.nlink !== 1) fail();
+    checkOpenedPath(root, outputPath, outputChain, opened, io);
+    io.writeFileSync(handle, JSON.stringify(artifact, null, 2) + "\n", "utf8");
+    io.fsyncSync(handle);
+    checkOpenedPath(root, outputPath, outputChain, io.fstatSync(handle), io);
+    completed = true;
+  } finally {
+    // Exclusive create proves this pathname did not exist at open. On an
+    // aborted create, remove only the very same file we opened if still named
+    // there; never follow a replacement symlink or delete a different inode.
+    let abortedIdentity;
+    if (!completed) {
+      try {
+        const opened = io.fstatSync(handle);
+        const named = io.lstatSync(outputPath);
+        if (named.isFile() && !named.isSymbolicLink()
+          && opened.dev === named.dev && opened.ino === named.ino) {
+          abortedIdentity = { dev: opened.dev, ino: opened.ino };
+        }
+      } catch (_) { /* A vanished or replaced file is never a cleanup target. */ }
+    }
+    io.closeSync(handle);
+    if (abortedIdentity) {
+      try {
+        const named = io.lstatSync(outputPath);
+        if (named.isFile() && !named.isSymbolicLink()
+          && named.dev === abortedIdentity.dev && named.ino === abortedIdentity.ino) {
+          io.unlinkSync(outputPath);
+        }
+      } catch (_) { /* Fail closed: never delete an unknown replacement. */ }
+    }
+  }
   process.stdout.write("OWNER_FLOOR_SIGNED\n");
 }
 
