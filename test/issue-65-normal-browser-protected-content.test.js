@@ -39,7 +39,8 @@ const scriptNames = ["rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-r
   "rootark-zk1-uncertain-put-reconciliation", "rootark-zk1-normal-browser-trust-floor",
   "rootark-zk1-normal-browser-content", "rootark-zk1-portable-file-recovery",
   "rootark-zk1-browser-recovery-http", "rootark-zk1-recoverable-workspace",
-  "rootark-zk1-normal-browser-lab-ui", "rootark-zk1-portable-recovery-lab-ui"];
+  "rootark-zk1-normal-browser-lab-ui", "rootark-zk1-portable-recovery-lab-ui",
+  "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow"];
 
 test("production static paths cannot disclose the opt-in normal browser laboratory", async (t) => {
   const app = express();
@@ -934,6 +935,11 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
     resolveTrustedScope: (user) => user?.username === "owner" ? f.state.scope : null });
   const scripts = new Set(["rootark-api", "rootark-zk1-authenticated-workspace",
     "rootark-zk1-owner-inventory-trust-head", ...scriptNames]);
+  const untouchedLegacy = Buffer.from("Synthetic existing legacy file; old server has plaintext.");
+  app.get("/files/legacy.txt", authenticate, (_req, res) => {
+    res.set("content-disposition", 'attachment; filename="legacy.txt"');
+    res.type("text/plain").status(200).end(untouchedLegacy);
+  });
   app.get("/client/:asset", (req, res) => {
     const name = req.params.asset.endsWith(".js") ? req.params.asset.slice(0, -3) : "";
     if (!scripts.has(name)) return res.sendStatus(404);
@@ -953,6 +959,7 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
       Buffer.from("302a300506032b6570032100", "hex"), f.ownerRaw])).digest()),
     deviceRaw: b64(f.device.authorization_public_key), privateDer: b64(f.privateDer),
     grant: opts.signedDeviceGrant,
+    migrationCek: b64(crypto.randomBytes(32)),
     head: { revision: opts.pinnedCurrentHead.revision,
       digest: b64(opts.pinnedCurrentHead.digest), epoch: opts.pinnedCurrentHead.epoch },
     ownerHistoryChain: [genesisCheckpoint, successorCheckpoint],
@@ -995,6 +1002,24 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
 	            +typeof window.RootarkZk1RecoverableWorkspace+":HTTP="
 	            +typeof window.RootarkZk1BrowserRecoveryHttp);
         if(field("private").files.length || field("file").files.length)throw Error("KEY_RETAINED");
+        field("legacy-name").value="legacy.txt";
+        field("migration-opt-in").checked=true;
+        setFile("private",decode(values.privateDer));
+        setFile("migration-cek",decode(values.migrationCek));
+        document.querySelector('[data-zk1-action="migrate"]').click();
+        await wait(()=>field("status").textContent.includes("GET conferido")
+          || field("status").textContent.includes("Operação recusada"));
+        if(!field("status").textContent.includes("GET conferido"))throw Error("LEGACY_MIGRATION_DENIED");
+        if(field("migration-object").value.length!==22 || field("migration-version").value.length!==22)
+          throw Error("MIGRATION_ID_LOST");
+        setFile("private",decode(values.privateDer));
+        setFile("migration-cek",decode(values.migrationCek));
+        document.querySelector('[data-zk1-action="migrate"]').click();
+        await wait(()=>field("status").textContent.includes("GET conferido")
+          || field("status").textContent.includes("Operação recusada"));
+        if(!field("status").textContent.includes("GET conferido"))throw Error("MIGRATION_RESUME_DENIED");
+        if(field("private").files.length || field("migration-cek").files.length)
+          throw Error("MIGRATION_KEY_RETAINED");
         field("digest").value=values.head.digest;
         setFile("history",new TextEncoder().encode(JSON.stringify([
           values.ownerHistoryChain[0],
@@ -1094,8 +1119,8 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
       return typeof value === "string" && value.startsWith("EDGE_AUTH_WORKSPACE_") ? value : null;
     });
     assert.equal(observed, "EDGE_AUTH_WORKSPACE_PASS");
-    assert.equal(protectedPuts, 2, "one ordinary and one recoverable PUT; forged head blocked");
-    assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 2);
+    assert.equal(protectedPuts, 3, "one ordinary, one legacy migration and one recoverable PUT; migration resume and forged heads cannot rePUT");
+    assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 3);
   } finally {
     socket?.close();
     if (edge?.pid) {

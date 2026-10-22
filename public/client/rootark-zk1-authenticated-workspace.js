@@ -15,6 +15,7 @@
     "rootark-zk1-owner-inventory-trust-head",
     "rootark-zk1-portable-file-recovery", "rootark-zk1-browser-recovery-http",
     "rootark-zk1-recoverable-workspace",
+    "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow",
   ];
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const base64 = /^[A-Za-z0-9_-]{43}$/;
@@ -176,7 +177,8 @@
       for (const name of dependencyNames) await loadScript(name);
       if (!window.RootarkZk1NormalBrowserContent?.uploadAndVerify
         || !window.RootarkZk1NormalBrowserTrustFloor?.provisionOffline
-        || !window.RootarkZk1RecoverableWorkspace?.restoreOnNewDevice) fail();
+        || !window.RootarkZk1RecoverableWorkspace?.restoreOnNewDevice
+        || !window.RootarkZk1LegacyMigrationWorkflow?.openMigrationJournal) fail();
     })();
     return loadingScripts;
   }
@@ -218,6 +220,20 @@
       + '<button type="button" class="button button-primary" data-zk1-action="upload">Cifrar, enviar e conferir GET</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="upload-recoverable">Enviar e exportar pacote recuperável</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="restore">Recuperar arquivo do novo dispositivo</button></div>'
+      + '<fieldset><legend>Migração opt-in de arquivo legado (apenas laboratório)</legend>'
+      + '<p class="muted">O caminho legado /files já entrega plaintext pelo servidor antigo. Na cópia ZK, apenas ciphertext é enviado. '
+      + 'O original permanece intacto. Guarde a CEK e os IDs fora do servidor para retomada; '
+      + 'a cópia não autoriza exclusão nem prova durabilidade externa.</p>'
+      + '<label>Nome exato do arquivo legado<input data-zk1-field="legacy-name" maxlength="255" autocomplete="off"></label>'
+      + '<label>ID da pasta antiga (opcional)<input data-zk1-field="legacy-folder" maxlength="128" autocomplete="off"></label>'
+      + '<label>ID do objeto ZK (22 caracteres; gerado na primeira tentativa)<input data-zk1-field="migration-object" maxlength="22" autocomplete="off"></label>'
+      + '<label>ID da versão ZK (22 caracteres; gerado na primeira tentativa)<input data-zk1-field="migration-version" maxlength="22" autocomplete="off"></label>'
+      + '<label>CEK externa de 32 bytes (reimportar a mesma para retomar)<input type="file" data-zk1-field="migration-cek"></label>'
+      + '<label>Checkpoint de raiz do proprietário assinado fora do servidor (.json; para confirmar)<input type="file" data-zk1-field="migration-proof" accept=".json,application/json"></label>'
+      + '<label><input type="checkbox" data-zk1-field="migration-opt-in"> Solicito expressamente uma cópia não destrutiva do arquivo legado.</label>'
+      + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="migrate">Copiar / retomar GET</button>'
+      + '<button type="button" class="button button-primary" data-zk1-action="migration-finalize">Verificar checkpoint assinado</button></div>'
+      + '</fieldset>'
       + '</form><p class="muted" data-zk1-field="status" role="status" aria-live="polite">Nenhuma autoridade foi importada.</p>';
     document.body.append(dialog);
     dialog.addEventListener("cancel", (event) => { if (busy) event.preventDefault(); });
@@ -236,7 +252,7 @@
       return;
     }
     if (!["provision", "verify-inventory", "upload", "upload-recoverable",
-      "restore", "new-secret", "new-device"].includes(action)) return;
+      "restore", "new-secret", "new-device", "migrate", "migration-finalize"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -336,7 +352,7 @@
             downloadLocal(restored.name, restored.data, restored.mediaType || "application/octet-stream");
             status("Arquivo histórico recuperado após novo grant + prova Ed25519 do proprietário + GET protegido. Nenhuma CEK/plaintext enviada ao servidor.");
           } finally { restored.data.fill(0); }
-        } else {
+        } else if (action === "upload" || action === "upload-recoverable") {
           const selected = field("file").files[0];
           if (!selected || selected.size < 1 || selected.size > 2 * 1024 * 1024
             || selected.name.length > 255) fail();
@@ -364,6 +380,48 @@
               + (result.lostPutAckReconciled ? " · ACK perdido reconciliado" : "")
               + ". CEK efêmera: este arquivo não é recuperável após fechar a sessão.");
           }
+        } else if (action === "migrate" || action === "migration-finalize") {
+          if (field("migration-opt-in")?.checked !== true) fail();
+          const rawCek = await fileBytes("migration-cek", 32, 32);
+          let cek;
+          try { cek = await window.RootarkZk1FileContent.importFileCek(rawCek); }
+          finally { rawCek.fill(0); }
+          const objectInput = field("migration-object");
+          const versionInput = field("migration-version");
+          // Set opaque IDs BEFORE network I/O so ambiguous outcomes can be
+          // resumed with the same ciphertext journal and externally held CEK.
+          if (action === "migrate" && !objectInput.value) objectInput.value = randomId();
+          if (action === "migrate" && !versionInput.value) versionInput.value = randomId();
+          if (!/^[A-Za-z0-9_-]{22}$/.test(objectInput.value)
+            || !/^[A-Za-z0-9_-]{22}$/.test(versionInput.value)) fail();
+          const scope = trust.signedDeviceGrant;
+          const migrationOptions = {
+            optIn: true,
+            legacy: { name: field("legacy-name").value, folderId: field("legacy-folder").value },
+            metadata: {
+              account_id: scope.account_id, compartment_id: scope.compartment_id,
+              keyring_id: scope.keyring_id, object_id: objectInput.value,
+              version_id: versionInput.value, parent_version_id: null,
+              epoch: trust.pinnedCurrentHead.epoch, kind: "file",
+            },
+            trust: { ...trust, devicePublicKey, devicePrivateKey },
+            cek, origin: location.origin + "/", fetchImpl: sessionFetch,
+            nowSeconds: Math.floor(Date.now() / 1000),
+          };
+          const journal = await window.RootarkZk1LegacyMigrationWorkflow.openMigrationJournal();
+          try {
+            const workflow = window.RootarkZk1LegacyMigrationWorkflow;
+            const result = action === "migrate"
+              ? await workflow.beginLegacyMigration({ ...migrationOptions, journal })
+              : await workflow.finalizeLegacyMigration({ ...migrationOptions, journal,
+                signedRootCheckpoint: JSON.parse(decoder.decode(
+                  await fileBytes("migration-proof", 1, 8192))) });
+            status("Objeto " + result.objectId + " · versão " + versionInput.value
+              + " · root " + result.root + ". "
+              + (action === "migrate" ? "GET conferido; importe checkpoint externo assinado."
+                : "Checkpoint assinado e GET conferidos localmente.")
+              + " Original preservado, corte e exclusão proibidos.");
+          } finally { journal.close(); }
         }
       }
     } catch (_) {
@@ -373,7 +431,7 @@
       data?.fill(0);
       secret?.fill(0);
       // The original File/Blob remains held by the input until explicitly reset.
-      for (const name of ["private", "file", "secret", "bundle"]) {
+      for (const name of ["private", "file", "secret", "bundle", "migration-cek", "migration-proof"]) {
         const control = field(name);
         if (control) control.value = "";
       }
