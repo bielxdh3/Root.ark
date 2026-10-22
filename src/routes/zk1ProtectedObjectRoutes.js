@@ -5,6 +5,8 @@
 // provider, plus authenticated server-side account-to-scope resolution.
 // They do not replace or secure legacy upload/download, WebDAV, or sync.
 const express = require("express");
+const { registerZk1AuthenticatedMultiproviderRestoreRoute } =
+  require("./zk1AuthenticatedMultiproviderRestoreRoutes");
 const FIELDS = Object.freeze([
   "account_id", "compartment_id", "keyring_id", "device_id", "operation",
   "object_id", "expected_object_revision", "manifest_revision", "manifest_digest",
@@ -48,7 +50,8 @@ function authorizationWire(raw) {
 }
 
 function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
-  requirePermission, resolveTrustedScope }) {
+  requirePermission, resolveTrustedScope, multiproviderRestore = null,
+  environment = "development" }) {
   if (!app || typeof app.post !== "function" || !store
     || typeof store.put !== "function" || typeof store.get !== "function"
     || typeof authenticate !== "function" || typeof requirePermission !== "function"
@@ -114,6 +117,14 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
     requirePermission("listFiles"), parseSealedContent, checked("get"));
   app.post("/zk-1/v1/content/put", fenceHeaders, authenticate,
     requirePermission("upload"), parseSealedContent, checked("put"));
+  if (multiproviderRestore !== null) {
+    exact(multiproviderRestore, ["gatewayPins", "restoreInput"]);
+    registerZk1AuthenticatedMultiproviderRestoreRoute({
+      app, store, authenticate, requirePermission, resolveTrustedScope,
+      gatewayPins: multiproviderRestore.gatewayPins,
+      restoreInput: multiproviderRestore.restoreInput, environment,
+    });
+  }
 }
 
 module.exports = { registerZk1ProtectedObjectRoutes };

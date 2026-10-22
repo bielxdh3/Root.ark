@@ -6130,11 +6130,32 @@ if (process.env.ROOTARK_ZK1_CONTENT_CONFIG) {
   if (!["development", "test"].includes(NODE_ENV)) {
     throw new Error("ROOTARK_ZK1_CONTENT_CONFIG requires development or test mode");
   }
+  // Optional operator-owned JavaScript provisioning (trusted startup code)
+  // constructs real provider readers and OFF-SERVER pinned public trust roots.
+  // This opt-in module is executed only in development/test, never from a
+  // request body or legacy file and never with production restore privileges.
+  let multiproviderRestore = null;
+  if (process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE) {
+    const filename = process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE;
+    if (!path.isAbsolute(filename)) throw new Error("ZK restore provisioning requires absolute module path");
+    const stat = fs.lstatSync(filename);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+      throw new Error("ZK restore provisioning must be an ordinary operator-owned file");
+    }
+    const provision = require(filename);
+    if (typeof provision !== "function") {
+      throw new Error("ZK restore provisioning must export a function");
+    }
+    multiproviderRestore = provision();
+  }
   const zk1ContentStore = registerZk1ProtectedContentFromConfig({
     app, authenticate, requirePermission,
     configPath: process.env.ROOTARK_ZK1_CONTENT_CONFIG, environment: NODE_ENV,
+    multiproviderRestore,
   });
   server.once("close", () => zk1ContentStore.close());
+} else if (process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE) {
+  throw new Error("ZK multiprovider restore requires protected content bootstrap");
 }
 
 registerSyncRoutes({

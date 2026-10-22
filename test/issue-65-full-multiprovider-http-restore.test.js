@@ -8,6 +8,8 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 const https = require("node:https");
+const express = require("express");
+const jwt = require("jsonwebtoken");
 const { Readable } = require("node:stream");
 const { S3Client } = require("@aws-sdk/client-s3");
 const { createCloudStorage } = require("../services/cloudStorage");
@@ -25,6 +27,15 @@ const { publishSignedCatalogSidecars, zk1CatalogSidecarAddress } =
 const ownerHistory = require("../public/client/rootark-zk1-owner-signed-checkpoint");
 const ownerRoots = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
 const portable = require("../public/client/rootark-zk1-portable-file-recovery");
+const fixtures = require("./support/issue-65-recovery-v2-fixtures");
+const z = require("../src/crypto/rootark-zk-1");
+const manifestV2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
+const verifiedHistory = require("../src/crypto/rootark-zk-recovery-history-v2");
+const { createAuthenticate } = require("../src/middlewares/auth");
+const { createRequirePermission } = require("../src/middlewares/permissions");
+const { Zk1ProtectedObjectStore, contentAuthorizationMessageV1 } =
+  require("../src/services/zk1ProtectedObjectStore");
+const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 
@@ -73,8 +84,8 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     for (const socket of sockets) socket.destroy();
     for (const server of servers) await new Promise((resolve) => server.close(resolve));
   };
-  let ledger;
-  t.after(async () => { await shutdown(); ledger?.close();
+  let ledger, protectedStore;
+  t.after(async () => { await shutdown(); protectedStore?.close(); ledger?.close();
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 8 }); });
   const register = async (server) => {
     server.on("connection", (socket) => { sockets.push(socket); });
@@ -88,6 +99,7 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   const ca = pem("ca.pem");
   const stores = { s3: new Map(), drive: new Map(), webdav: new Map() };
   const hits = { s3: 0, drive: 0, webdav: 0 };
+  let revokeSessionDuringCloudGet = null;
   let cloudError = null;
   const s3 = http.createServer((req, res) => {
     const key = req.url.split("?")[0];
@@ -100,6 +112,11 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
       return;
     }
     if (req.method !== "GET") { res.writeHead(405); res.end(); return; }
+    if (revokeSessionDuringCloudGet) {
+      const action = revokeSessionDuringCloudGet;
+      revokeSessionDuringCloudGet = null;
+      action();
+    }
     const body = cloudError === "s3" ? null : stores.s3.get(key);
     if (!body) { res.writeHead(404); res.end(); return; }
     res.writeHead(200); res.end(body);
@@ -158,8 +175,10 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   // This plaintext is constructed and opened only by the test's user-held
   // client. None of the cloud servers or restore gateway receives it or a CEK.
   const plaintext = Buffer.from("Opaque multi-provider restore only decrypts on the owner's client");
-  const scopeClient = { account_id: b64(random(16)),
-    compartment_id: b64(Buffer.from("cloud-quorum")), keyring_id: b64(random(16)) };
+  const ownerState = await fixtures.createInitialState(3);
+  let activeHead = ownerState.headManifest;
+  const scopeClient = Object.fromEntries(Object.entries(ownerState.scope)
+    .map(([key, value]) => [key, b64(value)]));
   const objectId = random(16);
   const metadata = { ...scopeClient, object_id: b64(objectId),
     version_id: b64(random(16)), parent_version_id: null, epoch: 1, kind: "file" };
@@ -194,29 +213,31 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   const verifier = await crypto.webcrypto.subtle.importKey("spki",
     ownerKeys.publicKey.export({ type: "spki", format: "der" }), "Ed25519", false, ["verify"]);
   const ownerSignerId = random(16);
-  const ownerDigest = random(32);
+  const ownerDigest = await manifestV2.recoveryManifestDigestV2(activeHead);
+  const ownerRevision = Number(activeHead.revision);
+  const ownerEpoch = Number(activeHead.current_epoch);
   const ownerHistoryCheckpoint = await ownerHistory.signOwnerCheckpoint({
     scope: scopeClient, signerKey: signer, signerPublicKey: verifier,
-    signerKeyId: ownerSignerId, deviceId: "owner-device", revision: 9,
+    signerKeyId: ownerSignerId, deviceId: "owner-device", revision: ownerRevision,
     manifestDigest: ownerDigest, issuedAt: 1001, previous: null });
   const ownerCheckpoint = await ownerRoots.signOwnerCiphertextRootCheckpoint({
     scope: scopeClient, signerKey: signer, signerKeyId: ownerSignerId,
-    deviceId: "owner-device", manifestRevision: 9,
-    manifestDigest: ownerDigest, manifestEpoch: 2,
+    deviceId: "owner-device", manifestRevision: ownerRevision,
+    manifestDigest: ownerDigest, manifestEpoch: ownerEpoch,
     objectId: metadata.object_id, objectRevision: 1,
     ciphertextEpoch: 1, ciphertextRoot: root, issuedAt: 1002 });
   const floor = { minimumHead: { sequence: 0, root: Buffer.from(genesis.root) },
     minimumSnapshot: Buffer.from(genesis.bytes) };
   let revoked = false;
-  let currentEpoch = 2;
+  let currentEpoch = ownerEpoch;
   const gateway = new Zk1MultiproviderCiphertextRestore({
     pinnedInventoryPublicKey: invKeys.publicKey, pinnedInventorySignerKeyId: signerKeyId,
     pinnedOwner: { scope: scopeClient, deviceId: "owner-device",
       signerKeyId: ownerSignerId, publicKey: verifier },
-    pinnedOwnerHead: { revision: 9, digest: ownerDigest, epoch: 2 },
+    pinnedOwnerHead: { revision: ownerRevision, digest: ownerDigest, epoch: ownerEpoch },
     independentInventoryFloor: floor,
     assertCurrentAuthorization: async () => ({ active: !revoked,
-      currentManifestRevision: 9, currentManifestDigest: Buffer.from(ownerDigest),
+      currentManifestRevision: ownerRevision, currentManifestDigest: Buffer.from(ownerDigest),
       currentEpoch }),
   });
 
@@ -450,15 +471,155 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   await assert.rejects(gateway.restoreExact(stale), /ZK_MULTIPROVIDER_RESTORE_DENIED/,
     "rollback to old signed snapshot does not recover deleted catalog entry");
   assert.deepEqual(hits, beforeTamper);
+  // Real normal authenticated session/CSRF endpoint on the SAME Express
+  // middleware, backed by a genuinely owner-rooted and witness-pinned grant.
+  const clock = 1100;
+  const witnessSigner = crypto.generateKeyPairSync("ed25519");
+  const witnessId = random(16);
+  const baseDigest = await manifestV2.recoveryManifestDigestV2(ownerState.baseManifest);
+  const brandedHistory = await verifiedHistory.verifyRecoveryHistoryPublicV2({
+    expectedScope: ownerState.scope, baseManifest: ownerState.baseManifest,
+    baseReceipt: ownerState.baseReceipt, pinnedWitness: ownerState.pinnedWitness,
+    transitions: ownerState.transitions, packageEnvelopes: ownerState.packageEnvelopes,
+    now: clock,
+  });
+  assert.equal(await verifiedHistory.isVerifiedPublicRecoveryHistoryV2(brandedHistory), true);
+  protectedStore = new Zk1ProtectedObjectStore(path.join(dir, "recovery-grants.sqlite"), {
+    trustedScope: ownerState.scope, bootstrapNew: true,
+    signedHistoryRequired: true, signedHistoryGenesisDigest: baseDigest,
+    verifiedHistoryProvider: () => brandedHistory, admissionRequired: true,
+    minimumHead: { revision: 1, witnessSequence: 1, digest: baseDigest },
+    witnessPinned: { keyId: witnessId, publicKey: witnessSigner.publicKey },
+    witnessProvider: {
+      async freshHead({ nonce }) {
+        const unsigned = { type: "rootark-recovery-witness-head/v1",
+          witness_key_id: witnessId, ...ownerState.scope, nonce,
+          current_revision: activeHead.revision,
+          current_manifest_digest: await manifestV2.recoveryManifestDigestV2(activeHead),
+          witness_sequence: activeHead.revision, observed_at: clock,
+          status: "committed", pending_reservation_id: null };
+        const signature = crypto.sign(null, Buffer.concat([
+          Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0"),
+          Buffer.from(await z.encodeDeterministic(unsigned)),
+        ]), witnessSigner.privateKey);
+        return z.encodeDeterministic({ ...unsigned, signature });
+      },
+      async beginIoAdmission() { return { admissionId: random(16), proceed: true }; },
+      async finishIoAdmission() { return { status: "FINISHED" }; },
+    },
+    manifestProvider: () => z.encodeDeterministic(activeHead),
+    nowSeconds: () => clock,
+  });
+  const signedSessionSecret = random(32).toString("hex");
+  let sessionVersion = 0;
+  const authMiddleware = createAuthenticate({ jwt, jwtSecret: signedSessionSecret,
+    loadUser: (name) => name === "owner" ? {
+      username: "owner", sessionVersion, permissions: { listFiles: true, upload: true },
+    } : null,
+    normalizeUserPermissions: (user) => user.permissions });
+  const allowedScope = (user) => user?.username === "owner" ? ownerState.scope : null;
+  const gatewayPins = {
+    pinnedInventoryPublicKey: invKeys.publicKey,
+    pinnedInventorySignerKeyId: signerKeyId,
+    pinnedOwner: { scope: scopeClient, deviceId: "owner-device",
+      signerKeyId: ownerSignerId, publicKey: verifier },
+    pinnedOwnerHead: { revision: ownerRevision, digest: ownerDigest, epoch: ownerEpoch },
+    independentInventoryFloor: floor,
+  };
+  const signedRestoreInput = { mode: "cloud-catalog", request: remoteRecovery };
+  const expressApp = express();
+  assert.throws(() => registerZk1ProtectedObjectRoutes({
+    app: express(), store: protectedStore, authenticate: authMiddleware,
+    requirePermission: createRequirePermission(), resolveTrustedScope: allowedScope,
+    multiproviderRestore: { gatewayPins: {
+      ...gatewayPins, assertCurrentAuthorization: async () => ({ active: true }),
+    }, restoreInput: signedRestoreInput }, environment: "test",
+  }), /ZK_MULTIPROVIDER_HTTP_DENIED/);
+  assert.throws(() => registerZk1ProtectedObjectRoutes({
+    app: express(), store: protectedStore, authenticate: authMiddleware,
+    requirePermission: createRequirePermission(), resolveTrustedScope: allowedScope,
+    multiproviderRestore: { gatewayPins, restoreInput: signedRestoreInput },
+    environment: "production",
+  }), /ZK_MULTIPROVIDER_HTTP_DENIED/);
+  registerZk1ProtectedObjectRoutes({ app: expressApp, store: protectedStore,
+    authenticate: authMiddleware, requirePermission: createRequirePermission(),
+    resolveTrustedScope: allowedScope,
+    multiproviderRestore: { gatewayPins, restoreInput: signedRestoreInput },
+    environment: "test" });
+  const expressServer = http.createServer(expressApp);
+  const expressPort = await register(expressServer);
+  const secureUrl = `http://127.0.0.1:${expressPort}/zk-1/v1/multiprovider-restore/read`;
+  const device = activeHead.devices[0];
+  const privateDeviceKey = ownerState.actors.get(
+    Buffer.from(device.authorization_key_id).toString("hex"));
+  const makeSignedRequest = async ({ overrides = {}, key = privateDeviceKey } = {}) => {
+    const authorization = { ...ownerState.scope, device_id: device.device_id,
+      operation: "get", object_id: b64(operation.object_id),
+      expected_object_revision: operation.revision,
+      manifest_revision: ownerRevision, manifest_digest: ownerDigest,
+      epoch: ownerEpoch, nonce: random(32), issued_at: clock - 1,
+      expires_at: clock + 30, ciphertext_digest: operation.ciphertext_sha256,
+      ...overrides };
+    const signature = crypto.sign(null,
+      await contentAuthorizationMessageV1(authorization), key);
+    return { authorization: Object.fromEntries(Object.entries(authorization)
+      .map(([name, value]) => [name, Buffer.isBuffer(value) ? b64(value) : value])),
+    signatureBase64: b64(signature) };
+  };
+  const signedCookie = jwt.sign({ username: "owner", sessionVersion: 0 },
+    signedSessionSecret, { expiresIn: "10m" });
+  const sessionHeaders = { "content-type": "application/json",
+    cookie: `rootark_session=${signedCookie}; rootark_csrf=restore-lab`,
+    "x-csrf-token": "restore-lab" };
+  const post = async (body, extra = {}) => fetch(secureUrl, {
+    method: "POST", headers: { ...sessionHeaders, ...extra }, body: JSON.stringify(body),
+  });
+  const validRequest = await makeSignedRequest();
+  const beforeAuth = { ...hits };
+  assert.equal((await fetch(secureUrl)).status, 404, "GET not exposed: signed POST required");
+  assert.equal((await post(validRequest, { cookie: "" })).status, 401);
+  assert.equal((await post(validRequest, { "x-csrf-token": "" })).status, 403);
+  assert.equal((await post({ ...validRequest, authorization: {
+    ...validRequest.authorization, account_id: b64(random(16)),
+  } })).status, 403);
+  assert.equal((await post(await makeSignedRequest({ key:
+    crypto.generateKeyPairSync("ed25519").privateKey }))).status, 403);
+  assert.deepEqual(hits, beforeAuth, "unauthorized sessions and forged device GET must not reach clouds");
+  const authorized = await post(validRequest);
+  assert.equal(authorized.status, 200);
+  const authorizedBody = await authorized.json();
+  assert.deepEqual(Buffer.from(authorizedBody.ciphertextBase64, "base64url"), ciphertext);
+  assert.equal(authorizedBody.authorizesProductionRestore, false);
+  assert.equal(authorizedBody.remoteDurabilityProven, false);
+  const afterSuccess = { ...hits };
+  assert.equal((await post(validRequest)).status, 403,
+    "persistent device nonce prevents replay across authenticated HTTP POST requests");
+  assert.deepEqual(hits, afterSuccess);
+  sessionVersion++;
+  assert.equal((await post(await makeSignedRequest())).status, 401,
+    "invalidated real application sessionVersion blocks remote GET");
+  sessionVersion--;
+  revokeSessionDuringCloudGet = () => { sessionVersion = 1; };
+  const midflight = await post(await makeSignedRequest());
+  assert.equal(midflight.status, 401,
+    "session revoked DURING remote provider GET must be rechecked before ciphertext egress");
+  assert.equal((await midflight.text()).includes("ciphertextBase64"), false);
+  sessionVersion = 0;
+  const afterMidflight = { ...hits };
+  activeHead = await fixtures.appendDeviceRevocation(ownerState, device.device_id);
+  assert.equal((await post(await makeSignedRequest())).status, 403,
+    "independently witnessed revoked device cannot access remote ciphertext");
+  assert.deepEqual(hits, afterMidflight, "revoked device blocked before contacting providers");
+  activeHead = ownerState.headManifest;
   revoked = true;
   assert.equal((await sendGet()).status, 403,
     "post-restore owner revocation blocks another cloud GET");
-  assert.deepEqual(hits, beforeTamper, "revocation checked before any remote request");
+  assert.deepEqual(hits, afterMidflight, "revocation checked before any remote request");
   revoked = false;
-  currentEpoch = 3;
+  currentEpoch = ownerEpoch + 1;
   assert.equal((await sendGet()).status, 403,
     "current owner epoch rollover requires a new independently pinned manifest");
-  currentEpoch = 2;
+  currentEpoch = ownerEpoch;
   session = false;
   assert.equal((await sendGet()).status, 403);
 

@@ -574,11 +574,74 @@ class Zk1ProtectedObjectStore {
     if (this.admissionRequired) fail("ZK_CONTENT_GATE_REQUIRED");
     return this.perform(await this.authorize(input, "get"), "get");
   }
+  // The local ciphertext can be LOST while the independently signed owner,
+  // witness/CAS head and durable replay ledger remain intact. A normal GET
+  // would fail ZK_CONTENT_NOT_FOUND before a remote recovery is possible.
+  // Burn the signed device challenge and advance the monotonic floor without
+  // fabricating a local ciphertext row. Only a signed historical GET is valid.
+  #consumeRestoreGet(authenticated, pin) {
+    const wanted = pin;
+    if (!wanted || typeof wanted !== "object"
+      || Reflect.ownKeys(wanted).length !== 5
+      || !["objectId", "revision", "epoch", "digest", "operationId"]
+        .every((x) => Object.hasOwn(wanted, x))
+      || bytes(wanted.operationId, 16).length !== 16) fail();
+    const request = authenticated.request;
+    if (request.object_id !== wanted.objectId
+      || request.expected_object_revision !== positive(wanted.revision)
+      || request.epoch < positive(wanted.epoch)
+      || !equal(request.ciphertext_digest, bytes(wanted.digest, 32))) fail();
+    return this.db.transaction(() => {
+      const key = authenticated.key;
+      const now = currentTime(this.nowSeconds);
+      if (now < request.issued_at - 5 || now > request.expires_at) fail();
+      const last = this.clockRow.get(key);
+      if (last && now < last.last_at) fail("ZK_CONTENT_UNAVAILABLE");
+      const prior = this.getHead.get(key);
+      const minimum = prior && prior.revision >= this.minimumHead.revision
+        ? prior : this.minimumHead;
+      const revision = Number(authenticated.head.current_revision);
+      const digest = Buffer.from(authenticated.head.current_manifest_digest);
+      if (revision < minimum.revision
+        || (revision === minimum.revision && !equal(digest, Buffer.from(minimum.digest)))) {
+        fail("ZK_CONTENT_UNAVAILABLE");
+      }
+      // Remote recovery only when no local ciphertext remains. Existing data
+      // must use the normal protected GET with immutable archive verification.
+      if (this.getObject.get(key, wanted.objectId)
+        || this.getLatestVersion.get(key, wanted.objectId)) fail("ZK_CONTENT_CONFLICT");
+      this.db.prepare(`DELETE FROM zk_content_nonce
+        WHERE scope=? AND expires_at IS NOT NULL AND expires_at < ?`).run(key, now);
+      if (this.db.prepare("SELECT 1 FROM zk_content_nonce WHERE scope=? AND nonce=?")
+        .get(key, request.nonce)) fail("ZK_CONTENT_REPLAY");
+      if (this.nonceCount.get(key).n >= MAX_NONCES) fail("ZK_CONTENT_UNAVAILABLE");
+      this.db.prepare("INSERT INTO zk_content_nonce(scope,nonce,expires_at) VALUES(?,?,?)")
+        .run(key, request.nonce, request.expires_at);
+      this.db.prepare(`INSERT INTO zk_content_clock(scope,last_at) VALUES(?,?)
+        ON CONFLICT(scope) DO UPDATE SET last_at=excluded.last_at`).run(key, now);
+      this.db.prepare(`INSERT INTO zk_content_head(scope,revision,digest) VALUES(?,?,?)
+        ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,digest=excluded.digest`)
+        .run(key, revision, digest);
+    }).immediate();
+  }
+  async runRestoreGetAdmission(input, pinnedOperation, emit) {
+    if (!this.admissionRequired || !this.signedHistoryRequired
+      || typeof emit !== "function") fail("ZK_CONTENT_GATE_REQUIRED");
+    const authenticated = await this.authorize(input, "get");
+    return this.#withAdmission(authenticated, "get", () => {
+      this.#consumeRestoreGet(authenticated, pinnedOperation);
+      return emit();
+    });
+  }
   async runWithAdmission(input, operation, emit) {
     if (typeof emit !== "function" || !["put", "get"].includes(operation)) fail();
     const authenticated = await this.authorize(input, operation);
+    return this.#withAdmission(authenticated, operation,
+      () => emit(this.perform(authenticated, operation)));
+  }
+  async #withAdmission(authenticated, operation, effect) {
     if (!this.admissionRequired) {
-      return emit(this.perform(authenticated, operation));
+      return effect();
     }
     const workerId = crypto.randomBytes(16);
     let admissionId;
@@ -605,7 +668,7 @@ class Zk1ProtectedObjectStore {
       // The caller's emit() must settle only when response bytes have crossed
       // the trusted application egress boundary, or the socket was closed.
       // The witness refuses to reserve while this admission is ACTIVE.
-      return await emit(this.perform(authenticated, operation));
+      return await effect();
     } finally {
       const finish = { scope: this.trustedScope, admissionId, workerId };
       try {
