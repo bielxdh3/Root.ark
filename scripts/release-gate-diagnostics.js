@@ -5,14 +5,20 @@ const { createHash } = require("node:crypto");
 function failedTestDiagnostics(output) {
   return String(output || "").split(/\r?\n/)
     .map((line) => line.replace(/\x1b\[[\d;]*m/g, "").trim())
-    .filter((line) => /^(?:not ok \d+ - |[✖✗×] |error:|failureType:|location:|(?:#\s*|ℹ\s*)(?:tests|pass|fail|cancelled|skipped|todo|suites|duration_ms)\s+\d+(?:\.\d+)?\s*$|npm (?:error|ERR!) (?:code|signal|exit)\s+[A-Z0-9_]+\s*$)/i.test(line))
-    .slice(-20)
+    .filter((line) => /^(?:not ok \d+ - |[✖✗×] |error:|failureType:|location:|(?:#\s*|ℹ\s*)(?:tests|pass|fail|cancelled|skipped|todo|suites|duration_ms)\s+\d+(?:\.\d+)?\s*$|npm (?:error|ERR!) (?:code|signal|exit)\s+[A-Z0-9_]+\s*$)/i.test(line)
+      // Include only safe, bounded TAP assertion facts. Arbitrary child output
+      // may contain credentials or file paths and must remain suppressed.
+      || /^(?:actual|expected): (?:-?\d{1,12}|true|false|null|undefined)$/.test(line)
+      || /^code: '(?:ERR_ASSERTION|ERR_TEST_FAILURE)'$/.test(line)
+      || /^operator: '(?:strictEqual|deepStrictEqual|throws|rejects)'$/.test(line)
+      || /^(?:OWNER_FLOOR_SIGN_FAILED|WITNESS_FLOOR_START_TIMEOUT)$/.test(line))
+    .slice(-32)
     .map((line) => line
       .replace(/\b(?:Bearer|Basic)\s+\S+/gi, "[REDACTED]")
       .replace(/\b(?:password|passphrase|client_secret|refresh_token|access_token|id_token|secret|token|cookie|authorization|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s;,]+)/gi, "[REDACTED]")
       .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[REDACTED]")
       .slice(0, 240))
-    .join("\n").slice(0, 3000);
+    .join("\n").slice(0, 4000);
 }
 
 // Keep minimal metadata even when a failed Windows child exits before Node's
