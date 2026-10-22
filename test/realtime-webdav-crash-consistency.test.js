@@ -38,14 +38,17 @@ function findAbsentPid() {
 function request(port, requestPath, options = {}) {
   return new Promise((resolve, reject) => {
     const { timeoutMs, ...requestOptions } = options;
+    let deadline;
+    const done = () => clearTimeout(deadline);
     const req = http.request({ host: "127.0.0.1", port, path: requestPath, ...requestOptions }, (res) => {
       let body = "";
       res.on("data", (chunk) => { body += chunk; });
-      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body }));
+      res.on("end", () => { done(); resolve({ status: res.statusCode, headers: res.headers, body }); });
+      res.once("error", (error) => { done(); reject(error); });
     });
     if (Number.isSafeInteger(timeoutMs) && timeoutMs > 0)
-      req.setTimeout(timeoutMs, () => req.destroy(new Error("request timed out")));
-    req.once("error", reject);
+      deadline = setTimeout(() => req.destroy(new Error("request timed out")), timeoutMs);
+    req.once("error", (error) => { done(); reject(error); });
     req.end(options.body);
   });
 }
@@ -122,13 +125,20 @@ function startServer(dir, extra = {}, localCrash = false, { serverModule = SERVE
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
     const ready = (async () => {
       const deadline = Date.now() + startupTimeoutMs;
+      let attempts = 0;
+      let lastProbeCode = "none";
       while (Date.now() < deadline) {
+        attempts += 1;
         try {
           await request(port, "/login.html", { timeoutMs: Math.max(1, Math.min(500, deadline - Date.now())) });
           return;
-        } catch { await new Promise((resolve) => setTimeout(resolve, 40)); }
+        } catch (error) {
+          lastProbeCode = typeof error?.code === "string" && /^(?:ECONNREFUSED|ECONNRESET|EPIPE|ETIMEDOUT)$/.test(error.code)
+            ? error.code : error?.message === "request timed out" ? "TIMEOUT" : "OTHER";
+          await new Promise((resolve) => setTimeout(resolve, 40));
+        }
       }
-      throw new Error("server did not start");
+      throw new Error(`server did not start; attempts=${attempts} lastProbe=${lastProbeCode} stderrBytes=${Buffer.byteLength(stderr)}`);
     })();
     const exited = new Promise((_, reject) => child.once("exit", (code, signal) => reject(new Error(`server exited before readiness: ${code || signal}; stderr=${stderr}`))));
     return Promise.race([ready, exited]).then(
@@ -195,6 +205,26 @@ test("an accepted but unanswered startup HTTP probe cannot hang the test worker"
     await assert.rejects(startServer(f.dir, {}, false, {
       serverModule: stub,
       startupTimeoutMs: 1_200,
+      onSpawn: (spawned) => { child = spawned; },
+    }), /server did not start/);
+    assert.ok(child?.pid);
+    assert.ok(child.exitCode !== null || child.signalCode !== null);
+    assert.ok(child.stdio.every((stream) => stream === null || stream.closed));
+  } finally {
+    if (child?.exitCode === null && child?.signalCode === null) await stop(child);
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("an HTTP startup responder that slowly streams forever still meets a hard wall deadline", { timeout: 8_000 }, async () => {
+  const f = fixture();
+  const stub = path.join(f.dir, "never-ending-response.js");
+  fs.writeFileSync(stub, 'require("node:http").createServer((req,res) => { res.writeHead(200); setInterval(() => res.write("x"), 25); }).listen(Number(process.env.PORT), "127.0.0.1");');
+  let child;
+  try {
+    await assert.rejects(startServer(f.dir, {}, false, {
+      serverModule: stub,
+      startupTimeoutMs: 900,
       onSpawn: (spawned) => { child = spawned; },
     }), /server did not start/);
     assert.ok(child?.pid);
