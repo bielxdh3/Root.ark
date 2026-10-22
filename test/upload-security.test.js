@@ -176,19 +176,38 @@ function request(port, requestPath, { method = "GET", headers = {}, body, agent,
   });
 }
 
-async function waitForServer(port, timeout = TIMEOUT_MS) {
+async function waitForServer(port, timeout = process.platform === "win32" ? 30_000 : TIMEOUT_MS, child = null) {
   const deadline = Date.now() + timeout;
-  let lastError;
+  let lastState = "no response";
   while (Date.now() < deadline) {
-    try {
-      return await request(port, "/login.html");
-    } catch (error) {
-      lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 100));
+    if (child && (child.exitCode !== null || child.signalCode !== null)) {
+      throw new Error(`server exited before readiness (code=${child.exitCode}, signal=${child.signalCode})`);
     }
+    try {
+      const result = await request(port, "/login.html", { timeoutMs: Math.max(1, Math.min(1_000, deadline - Date.now())) });
+      if (result.status === 200) return result;
+      lastState = `HTTP ${result.status}`;
+    } catch (error) {
+      lastState = error.code || error.message;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw lastError;
+  throw new Error(`server did not serve login within ${timeout}ms (last probe: ${lastState}; exit=${child?.exitCode ?? "unknown"})`);
 }
+
+test("upload readiness ignores a transient HTTP error before the login route is healthy", async (t) => {
+  let probes = 0;
+  const listener = http.createServer((_req, res) => {
+    probes += 1;
+    res.writeHead(probes === 1 ? 503 : 200);
+    res.end();
+  });
+  await new Promise((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => listener.close(resolve)));
+  const response = await waitForServer(listener.address().port, 2_000);
+  assert.equal(response.status, 200);
+  assert.equal(probes, 2);
+});
 
 async function login(port, username, password) {
   const body = JSON.stringify({ username, password });
@@ -235,7 +254,7 @@ function testDeadQuotaOwnerEnv(...processIds) {
   return { ROOTARK_TEST_DEAD_QUOTA_OWNER_PIDS: ids.join(",") };
 }
 
-async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, readyTimeout = TIMEOUT_MS, uploaderPermissions = {}, secondUploaderHasFolderAccess = false, appDataMode = "json", envOverrides = {}, deterministicQuotaRecovery = false } = {}) {
+async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, readyTimeout = process.platform === "win32" ? 30_000 : TIMEOUT_MS, uploaderPermissions = {}, secondUploaderHasFolderAccess = false, appDataMode = "json", envOverrides = {}, deterministicQuotaRecovery = false } = {}) {
   const password = crypto.randomBytes(24).toString("base64url");
   const fixtureBase = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
   const dir = fs.mkdtempSync(path.join(fixtureBase, "rootark-upload-safety-"));
@@ -338,7 +357,7 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
   });
   if (waitForReady) {
     try {
-      assert.equal((await waitForServer(port, readyTimeout)).status, 200);
+      assert.equal((await waitForServer(port, readyTimeout, child)).status, 200);
     } catch (error) {
       throw new Error(`${error.message}\nserver exit: ${child.exitCode}\nserver stdout:\n${stdout.join("")}\nserver stderr:\n${stderr.join("")}`);
     }
