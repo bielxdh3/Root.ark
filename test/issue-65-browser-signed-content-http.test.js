@@ -73,6 +73,8 @@ test("browser UMD executes without Node require and refuses a cross-origin signe
     "../public/client/rootark-zk1-uncertain-put-reconciliation.js"), "utf8"), context);
   assert.equal(typeof context.RootarkZk1ProtectedHttpClient.signProtectedContentOperation,
     "function", "plain browser build must export a live WebCrypto API without CommonJS");
+  assert.equal(typeof context.RootarkZk1ProtectedHttpClient.postProtectedCiphertextBackupRead,
+    "function", "plain browser build must expose ciphertext-only backup read");
   assert.equal(typeof context.RootarkZk1UncertainPutReconciliation.reconcileUncertainProtectedPut,
     "function", "uncertain PUT verifier must load in a plain browser without require");
   const pkcs8 = crypto.generateKeyPairSync("ed25519").privateKey
@@ -240,6 +242,107 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
   const expected = chunks.createCiphertextRootBuilder(1);
   await expected.append(encrypted);
   const expectedRoot = await expected.finish();
+  const historicalDigest = crypto.createHash("sha256").update(encrypted).digest();
+  let backupWire = "";
+  const backupRequest = await browser.signProtectedContentOperation({
+    ...parameters, operation: "get", objectId: metadata.object_id,
+    expectedObjectRevision: 1, expectedCiphertextDigest: historicalDigest,
+    ciphertext: null,
+  });
+  const backup = await browser.postProtectedCiphertextBackupRead({
+    origin, request: backupRequest, expectedObjectRevision: 1,
+    expectedEpoch: metadata.epoch, expectedRoot,
+    fetchImpl: (url, options) => {
+      backupWire = options.body;
+      return sessionFetch(url, options);
+    },
+  });
+  assert.deepEqual(Buffer.from(backup.ciphertextBase64, "base64url"), Buffer.from(encrypted),
+    "the actual HTTP backup path must return only the original sealed object");
+  assert.equal(Object.isFrozen(backup), true,
+    "backup result must be immutable after its integrity check");
+  assert.equal(backup.objectId, metadata.object_id);
+  assert.equal(backup.revision, 1);
+  assert.equal(backup.epoch, metadata.epoch);
+  assert.equal(backup.integrityMatchesPinnedRoot, true);
+  assert.equal(backup.trustedRootProvenanceVerified, false);
+  assert.equal(backup.authorizesRestore, false);
+  assert.equal(backup.authorizesRecovery, false);
+  assert.equal(backup.durableBackupProven, false);
+  assert.equal(JSON.stringify(backup).includes("segredo local"), false);
+  assert.equal(JSON.stringify(backup).includes("hidden-file.txt"), false);
+  assert.equal(backupWire.includes("segredo local"), false);
+  assert.equal(backupWire.includes("hidden-file.txt"), false);
+  assert.equal(backupWire.includes("cek"), false);
+  let noFetchCount = 0;
+  await assert.rejects(browser.postProtectedCiphertextBackupRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: null, ciphertext: null,
+    }), expectedObjectRevision: 1, expectedEpoch: metadata.epoch,
+    expectedRoot, fetchImpl: () => { noFetchCount++; throw Error("UNEXPECTED"); },
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+  "backup must refuse unpinned latest GET before sending a network request");
+  assert.equal(noFetchCount, 0);
+  await assert.rejects(browser.postProtectedCiphertextBackupRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: 1, expectedCiphertextDigest: historicalDigest,
+      ciphertext: null,
+    }), expectedObjectRevision: 1, expectedEpoch: metadata.epoch,
+    expectedRoot, cek, fetchImpl: () => { noFetchCount++; throw Error("UNEXPECTED"); },
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+  "backup must refuse accidental passage of sensitive CEKs");
+  assert.equal(noFetchCount, 0);
+  const backupTampered = await browser.signProtectedContentOperation({
+    ...parameters, operation: "get", objectId: metadata.object_id,
+    expectedObjectRevision: 1, expectedCiphertextDigest: historicalDigest,
+    ciphertext: null,
+  });
+  await assert.rejects(browser.postProtectedCiphertextBackupRead({
+    origin, request: backupTampered, expectedObjectRevision: 1,
+    expectedEpoch: metadata.epoch, expectedRoot, fetchImpl: async (url, options) => {
+      const res = await sessionFetch(url, options);
+      const altered = await res.json();
+      altered.revision = 0;
+      return new Response(JSON.stringify(altered), { status: 200,
+        headers: { "content-type": "application/json" } });
+    },
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+  "a malicious backup response may not roll the archived revision back");
+  await assert.rejects(browser.postProtectedCiphertextBackupRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: 1, expectedCiphertextDigest: historicalDigest,
+      ciphertext: null,
+    }), expectedObjectRevision: 1, expectedEpoch: metadata.epoch,
+    expectedRoot, fetchImpl: async (url, options) => {
+      const res = await sessionFetch(url, options);
+      const altered = await res.json();
+      altered.ciphertextBase64 = base64(crypto.randomBytes(132));
+      return new Response(JSON.stringify(altered), { status: 200,
+        headers: { "content-type": "application/json" } });
+    },
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+  "a malicious backup response may not substitute bytes despite a valid signed GET");
+  await assert.rejects(browser.postProtectedCiphertextBackupRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: 1, expectedCiphertextDigest: historicalDigest,
+      ciphertext: null,
+    }), expectedObjectRevision: 1, expectedEpoch: metadata.epoch + 1,
+    expectedRoot, fetchImpl: sessionFetch,
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+  "a backup cannot relabel an archived version as a different epoch");
+  await assert.rejects(browser.postProtectedCiphertextBackupRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: 1, expectedCiphertextDigest: historicalDigest,
+      ciphertext: null,
+    }), expectedObjectRevision: 1, expectedEpoch: metadata.epoch,
+    expectedRoot: crypto.randomBytes(32), fetchImpl: sessionFetch,
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+  "a backup with an independently mismatched root is unusable");
   const signedGet = await browser.signProtectedContentOperation({
     ...parameters, operation: "get", objectId: metadata.object_id,
     expectedObjectRevision: null, ciphertext: null,
@@ -358,6 +461,16 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
   assert.deepEqual(Buffer.from(oldOpened.data), plaintext,
     "immutable version 1 remains available after signed overwrite with version 2");
   oldOpened.data.fill(0);
+  const archived = await browser.postProtectedCiphertextBackupRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: 1, expectedCiphertextDigest: historicalDigest,
+      ciphertext: null,
+    }), expectedObjectRevision: 1, expectedEpoch: metadata.epoch,
+    expectedRoot, fetchImpl: sessionFetch,
+  });
+  assert.deepEqual(Buffer.from(archived.ciphertextBase64, "base64url"), Buffer.from(encrypted),
+    "historical backup must preserve version 1 despite latest being version 2");
   const simultaneous = await Promise.all(Array.from({ length: 6 }, async () => {
     const signed = await browser.signProtectedContentOperation({
       ...parameters, operation: "get", objectId: metadata.object_id,
@@ -591,6 +704,15 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
     expectedRoot, cek, metadata,
   }), /ZK_BROWSER_CONTENT_UNAVAILABLE/, "valid Ed25519 on untrusted device key denies");
   gateOpen = false;
+  await assert.rejects(browser.postProtectedCiphertextBackupRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: 1, expectedCiphertextDigest: historicalDigest,
+      ciphertext: null,
+    }), expectedObjectRevision: 1, expectedEpoch: metadata.epoch,
+    expectedRoot, fetchImpl: sessionFetch,
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+  "pending witness must forbid sealed backup egress");
   await assert.rejects(browser.postProtectedCiphertextRead({
     origin, request: await browser.signProtectedContentOperation({
       ...parameters, operation: "get", objectId: metadata.object_id,
@@ -603,6 +725,17 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
   gateOpen = true;
   await fixtures.appendDeviceRevocation(state, device.device_id);
   signedHead = state.headManifest;
+  await assert.rejects(browser.postProtectedCiphertextBackupRead({
+    origin, request: await browser.signProtectedContentOperation({
+      ...parameters, manifestRevision: signedHead.revision,
+      manifestDigest: await manifestDigest(), epoch: signedHead.current_epoch,
+      operation: "get", objectId: metadata.object_id,
+      expectedObjectRevision: 1, expectedCiphertextDigest: historicalDigest,
+      ciphertext: null,
+    }), expectedObjectRevision: 1, expectedEpoch: metadata.epoch,
+    expectedRoot, fetchImpl: sessionFetch,
+  }), /ZK_BROWSER_CONTENT_UNAVAILABLE/,
+  "device revocation must forbid ciphertext backup of its retained versions");
   await assert.rejects(reconciliation.reconcileUncertainProtectedPut({
     ...inputs, signer: { ...parameters, manifestRevision: signedHead.revision,
       manifestDigest: await manifestDigest(), epoch: signedHead.current_epoch },

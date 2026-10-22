@@ -253,41 +253,79 @@
       return Object.freeze({ id: decoded.id, revision: positive(decoded.revision) });
     } catch (_) { deny(); }
   }
+  async function inspectProtectedCiphertextRead({ origin, request, fetchImpl,
+    expectedObjectRevision, expectedRoot, expectedEpoch, requireHistorical }) {
+    const commitment = copy(expectedRoot, 32);
+    const revision = positive(expectedObjectRevision);
+    const epoch = positive(expectedEpoch);
+    const signed = genuineSigned.get(request);
+    if (!signed || signed.op !== "get") deny();
+    const boundRevision = signed.request.authorization.expected_object_revision;
+    if ((requireHistorical && boundRevision === null)
+      || (boundRevision !== null && boundRevision !== revision)) deny();
+    const response = await post(request, "get", origin, fetchImpl);
+    exact(response, ["id", "revision", "epoch", "ciphertextBase64"]);
+    if (response.id !== signed.objectId || response.revision !== revision
+      || response.epoch !== epoch) deny();
+    const ciphertext = from64(response.ciphertextBase64, 16, MAX_CIPHERTEXT);
+    if (boundRevision !== null) {
+      const signedDigest = from64(signed.request.authorization.ciphertext_digest, 32);
+      const actualDigest = new Uint8Array(await webCrypto.subtle.digest("SHA-256", ciphertext));
+      let difference = 0;
+      for (let index = 0; index < 32; ++index) difference |= signedDigest[index] ^ actualDigest[index];
+      if (difference !== 0) deny();
+    }
+    // The response cannot define its own expected root. This is an integrity
+    // comparison only: the caller is responsible for independent provenance.
+    const inspection = await download.inspectCiphertextDownload({
+      frames: [{ index: 0, bytes: ciphertext }],
+      expectedChunkCount: 1, expectedRoot: commitment,
+      maxCiphertextBytes: MAX_CIPHERTEXT,
+    });
+    return { inspection, id: response.id, revision, epoch,
+      ciphertextBase64: response.ciphertextBase64 };
+  }
   async function postProtectedCiphertextRead({ origin, request, fetchImpl = fetch,
     expectedObjectRevision, expectedRoot, cek, metadata } = {}) {
     try {
-      const commitment = copy(expectedRoot, 32);
-      const revision = positive(expectedObjectRevision);
-      const boundRevision = genuineSigned.get(request)?.request?.authorization?.expected_object_revision;
-      if (boundRevision !== null && boundRevision !== revision) deny();
-      const response = await post(request, "get", origin, fetchImpl);
-      exact(response, ["id", "revision", "epoch", "ciphertextBase64"]);
-      if (response.id !== genuineSigned.get(request).objectId
-        || response.revision !== revision
-        || response.epoch !== metadata?.epoch
-        || metadata.object_id !== response.id) deny();
-      const ciphertext = from64(response.ciphertextBase64, 16, MAX_CIPHERTEXT);
-      if (boundRevision !== null) {
-        const signedDigest = from64(genuineSigned.get(request).request.authorization.ciphertext_digest, 32);
-        const actualDigest = new Uint8Array(await webCrypto.subtle.digest("SHA-256", ciphertext));
-        let difference = 0;
-        for (let index = 0; index < 32; ++index) {
-          difference |= signedDigest[index] ^ actualDigest[index];
-        }
-        if (difference !== 0) deny();
-      }
-      // Do not use a root supplied by the HTTP response. Caller must pass a
-      // previously independently authenticated ciphertext commitment.
-      const checked = await download.inspectCiphertextDownload({
-        frames: [{ index: 0, bytes: ciphertext }],
-        expectedChunkCount: 1, expectedRoot: commitment,
-        maxCiphertextBytes: MAX_CIPHERTEXT,
+      const inspected = await inspectProtectedCiphertextRead({
+        origin, request, fetchImpl, expectedObjectRevision, expectedRoot,
+        expectedEpoch: metadata?.epoch, requireHistorical: false,
       });
+      if (metadata?.object_id !== inspected.id) deny();
       return await download.decryptVerifiedCiphertext({
-        inspection: checked, cek, metadata,
+        inspection: inspected.inspection, cek, metadata,
+      });
+    } catch (_) { deny(); }
+  }
+  async function postProtectedCiphertextBackupRead(input = {}) {
+    try {
+      // A backup copy never accepts a CEK, plaintext, metadata or an implicit
+      // latest-version read. Signing the exact historical revision and digest
+      // is required even when the storage server has a newer version.
+      exact(input, ["origin", "request", "expectedObjectRevision", "expectedEpoch",
+        "expectedRoot", ...(Object.hasOwn(input, "fetchImpl") ? ["fetchImpl"] : [])]);
+      const inspected = await inspectProtectedCiphertextRead({
+        origin: input.origin, request: input.request,
+        fetchImpl: input.fetchImpl ?? fetch,
+        expectedObjectRevision: input.expectedObjectRevision,
+        expectedRoot: input.expectedRoot, expectedEpoch: input.expectedEpoch,
+        requireHistorical: true,
+      });
+      return Object.freeze({
+        objectId: inspected.id, revision: inspected.revision, epoch: inspected.epoch,
+        // Immutable canonical base64url preserves the verified bytes across
+        // backup serialization. A mutable Uint8Array plus a fixed integrity
+        // flag would allow later mutation to contradict the verification.
+        ciphertextBase64: inspected.ciphertextBase64,
+        integrityMatchesPinnedRoot: true,
+        trustedRootProvenanceVerified: false,
+        authorizesRecovery: false, authorizesRestore: false,
+        durableBackupProven: false,
       });
     } catch (_) { deny(); }
   }
   return Object.freeze({ signProtectedContentOperation,
-    postProtectedCiphertextPut, postProtectedCiphertextRead });
+    postProtectedCiphertextPut, postProtectedCiphertextRead,
+    postProtectedCiphertextBackupRead });
 }));
