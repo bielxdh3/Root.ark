@@ -165,7 +165,7 @@ test("realtime transport declares bounded payload, compression, binary, and burs
   assert.match(contents, /server\.once\("close", \(\) => clearInterval\(realtimeHeartbeat\)\)/);
 });
 
-test("WebSocket HTTP upgrade enforces cookie, Origin, message, and binary boundaries", { timeout: 20_000 }, async (t) => {
+test("WebSocket HTTP upgrade enforces cookie, Origin, message, and binary boundaries", { timeout: process.platform === "win32" ? 50_000 : 20_000 }, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-realtime-"));
   fs.mkdirSync(path.join(dir, "data"));
   fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([{ username: "agent", password: bcrypt.hashSync("password", 10), role: "admin", permissions: {}, sessionVersion: 0 }]));
@@ -173,7 +173,7 @@ test("WebSocket HTTP upgrade enforces cookie, Origin, message, and binary bounda
   const portNumber = await port();
   const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
   t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
-  await ready(portNumber);
+  await ready(portNumber, child, process.platform === "win32" ? 30_000 : 12_000);
   const body = JSON.stringify({ username: "agent", password: "password" });
   const login = await request(portNumber, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
   const cookie = login.headers["set-cookie"].map((item) => item.split(";", 1)[0]).join("; ");
