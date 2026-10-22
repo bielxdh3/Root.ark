@@ -4,14 +4,16 @@
       require("./rootark-zk1-file-content"),
       require("./rootark-zk1-ciphertext-chunk-root"),
       require("./rootark-zk1-protected-http-client"),
-      require("./rootark-zk1-uncertain-put-reconciliation"));
+      require("./rootark-zk1-uncertain-put-reconciliation"),
+      require("./rootark-zk1-normal-browser-trust-floor"));
   } else {
     root.RootarkZk1NormalBrowserContent = factory(root.crypto,
       root.RootarkZk1FileContent, root.RootarkZk1CiphertextRoot,
-      root.RootarkZk1ProtectedHttpClient, root.RootarkZk1UncertainPutReconciliation);
+      root.RootarkZk1ProtectedHttpClient, root.RootarkZk1UncertainPutReconciliation,
+      root.RootarkZk1NormalBrowserTrustFloor);
   }
 }(typeof globalThis === "object" ? globalThis : this,
-  function (webCrypto, fileContent, roots, http, reconciliation) {
+  function (webCrypto, fileContent, roots, http, reconciliation, trustFloor) {
     "use strict";
 
     // One-file, dev-only normal upload followed by an authenticated HTTP readback.
@@ -33,6 +35,9 @@
     const schema = "rootark-zk1-browser-owner-device-grant/v1";
     const b64re = /^[A-Za-z0-9_-]+$/;
     const verified = new WeakMap();
+    // This laboratory browser must have an externally provisioned local floor.
+    // Node fixtures without a DOM exercise the signed-grant primitive directly.
+    const browserRuntime = typeof window === "object";
 
     function deny() { throw new Error("ZK_NORMAL_BROWSER_AUTHORITY_UNVERIFIED"); }
     function exact(value, fields) {
@@ -161,7 +166,9 @@
       let ciphertext = null;
       let checkedData = null;
       try {
-        exact(input, inputFields);
+        exact(input, browserRuntime
+          ? [...inputFields, "independentOwnerSpkiSha256", "ownerHistoryCheckpoint"]
+          : inputFields);
         exact(input.metadata, metadataFields);
         const metadata = { ...input.metadata };
         const objectId = metadata.object_id;
@@ -196,6 +203,18 @@
           deviceId: trust.deviceId, manifestRevision: trust.revision,
           manifestDigest: trust.digest, epoch: trust.epoch,
           nowSeconds };
+        const checkFloor = async () => {
+          if (!browserRuntime) return;
+          if (!trustFloor?.assertCurrent) deny();
+          await trustFloor.assertCurrent({
+            ownerPublicKey: input.ownerPublicKey,
+            independentOwnerSpkiSha256: input.independentOwnerSpkiSha256,
+            pinnedCurrentHead: input.pinnedCurrentHead,
+            signedDeviceGrant: input.signedDeviceGrant,
+            ownerHistoryCheckpoint: input.ownerHistoryCheckpoint,
+          });
+        };
+        await checkFloor();
         const signed = await http.signProtectedContentOperation({
           ...signer, operation: "put", objectId, expectedObjectRevision: null,
           ciphertext,
@@ -221,6 +240,7 @@
           ...signer, operation: "get", objectId, expectedObjectRevision: 1,
           expectedCiphertextDigest: digest, ciphertext: null,
         });
+        await checkFloor();
         const opened = await http.postProtectedCiphertextRead({
           origin, request: signedRead, fetchImpl,
           expectedObjectRevision: 1, expectedRoot: root, cek, metadata,

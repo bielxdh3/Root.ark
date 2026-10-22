@@ -2,6 +2,7 @@
   "use strict";
   const byId = (id) => document.getElementById(id);
   const button = byId("upload");
+  const provision = byId("provision-owner");
   const status = byId("status");
   const base64 = /^[A-Za-z0-9_-]{43}$/;
   const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -39,37 +40,60 @@
     }
     return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
   }
+  async function trustInputs() {
+    if (!root.isSecureContext || !root.crypto?.subtle
+      || !root.RootarkZk1NormalBrowserTrustFloor) fail();
+    const ownerRaw = await fileBytes("owner-key", 32);
+    const ownerPublicKey = await root.crypto.subtle.importKey("raw", ownerRaw,
+      "Ed25519", true, ["verify"]);
+    const signedDeviceGrant = JSON.parse(decoder.decode(await fileBytes("device-grant", 8192)));
+    const checkpointFiles = byId("owner-history").files;
+    if (checkpointFiles.length > 1) fail();
+    const ownerHistoryCheckpoint = checkpointFiles.length === 1
+      ? JSON.parse(decoder.decode(await fileBytes("owner-history", 8192))) : null;
+    return { ownerPublicKey,
+      independentOwnerSpkiSha256: bytesFrom64(byId("owner-spki-hash").value.trim()),
+      pinnedCurrentHead: { revision: number("head-revision"),
+        digest: bytesFrom64(byId("head-digest").value.trim()),
+        epoch: number("head-epoch") }, signedDeviceGrant, ownerHistoryCheckpoint };
+  }
+  provision.addEventListener("click", async () => {
+    provision.disabled = true;
+    button.disabled = true;
+    status.textContent = "Verificando a âncora externa e a assinatura do proprietário…";
+    try {
+      const trust = await trustInputs();
+      const result = await root.RootarkZk1NormalBrowserTrustFloor.provisionOffline(trust);
+      status.textContent = (result.initialProvision ? "Âncora local criada" : "Piso local conferido ou avançado")
+        + ". Assinatura do proprietário e SPKI conferidos. Preserve o pin e o head atual fora do servidor.";
+    } catch (_) {
+      status.textContent = "Provisionamento recusado: assinatura, fingerprint, revisão, época ou armazenamento inválido.";
+    } finally { provision.disabled = false; button.disabled = false; }
+  });
   button.addEventListener("click", async () => {
     button.disabled = true;
     status.textContent = "Verificando assinatura, pins e chave local…";
     let privateDer;
     let data;
     try {
-      if (!root.isSecureContext || !root.crypto?.subtle
-        || !root.RootarkZk1NormalBrowserContent) fail();
-      const ownerRaw = await fileBytes("owner-key", 32);
+      if (!root.RootarkZk1NormalBrowserContent) fail();
+      const trust = await trustInputs();
       const deviceRaw = await fileBytes("device-public", 32);
       privateDer = await fileBytes("device-private", 8192);
-      const grantBytes = await fileBytes("device-grant", 8192);
-      const ownerPublicKey = await root.crypto.subtle.importKey("raw", ownerRaw,
-        "Ed25519", true, ["verify"]);
       const devicePublicKey = await root.crypto.subtle.importKey("raw", deviceRaw,
         "Ed25519", true, ["verify"]);
       const devicePrivateKey = await root.crypto.subtle.importKey("pkcs8", privateDer,
         "Ed25519", false, ["sign"]);
-      const grant = JSON.parse(decoder.decode(grantBytes));
+      const grant = trust.signedDeviceGrant;
       const selected = byId("file").files?.[0];
       if (!selected || selected.size > 2 * 1024 * 1024
         || selected.name.length > 255) fail();
       data = new Uint8Array(await selected.arrayBuffer());
       const objectId = randomId();
       const result = await root.RootarkZk1NormalBrowserContent.uploadAndVerify({
-        ownerPublicKey,
+        ...trust,
         pinnedOwnerKeyHash: bytesFrom64(byId("owner-hash").value.trim()),
-        pinnedCurrentHead: { revision: number("head-revision"),
-          digest: bytesFrom64(byId("head-digest").value.trim()),
-          epoch: number("head-epoch") },
-        signedDeviceGrant: grant, devicePublicKey, devicePrivateKey,
+        devicePublicKey, devicePrivateKey,
         metadata: {
           account_id: grant.account_id, compartment_id: grant.compartment_id,
           keyring_id: grant.keyring_id, object_id: objectId,

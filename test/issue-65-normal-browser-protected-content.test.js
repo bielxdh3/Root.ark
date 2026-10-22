@@ -6,7 +6,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, execFileSync } = require("node:child_process");
 const express = require("express");
 const z = require("../src/crypto/rootark-zk-1");
 const v2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
@@ -27,7 +27,8 @@ const witnessDomain = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0");
 const scriptNames = ["rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-root",
   "rootark-zk1-ciphertext-download-integrity", "rootark-zk1-owner-signed-checkpoint",
   "rootark-zk1-owner-ciphertext-root-checkpoint", "rootark-zk1-protected-http-client",
-  "rootark-zk1-uncertain-put-reconciliation", "rootark-zk1-normal-browser-content",
+  "rootark-zk1-uncertain-put-reconciliation", "rootark-zk1-normal-browser-trust-floor",
+  "rootark-zk1-normal-browser-content",
   "rootark-zk1-normal-browser-lab-ui"];
 
 test("production static paths cannot disclose the opt-in normal browser laboratory", async (t) => {
@@ -281,6 +282,8 @@ test("Edge WebCrypto executes normal file PUT/GET using actual localhost Express
     "test Express routes expose only explicitly enumerated browser scripts");
   const values = {
     ownerRaw: b64(f.ownerRaw), ownerHash: b64(opts.pinnedOwnerKeyHash),
+    ownerSpkiHash: b64(crypto.createHash("sha256").update(Buffer.concat([
+      Buffer.from("302a300506032b6570032100", "hex"), f.ownerRaw])).digest()),
     deviceRaw: b64(f.device.authorization_public_key), privateDer: b64(f.privateDer),
     pin: { revision: opts.pinnedCurrentHead.revision,
       epoch: opts.pinnedCurrentHead.epoch, digest: b64(opts.pinnedCurrentHead.digest) },
@@ -302,9 +305,14 @@ inputFile("device-private",decode(v.privateDer),"device.pkcs8");
 inputFile("device-grant",new TextEncoder().encode(JSON.stringify(v.grant)),"grant.json");
 inputFile("file",new TextEncoder().encode("WebCrypto Edge real HTTP protected content"),"edge-normal.txt");
 document.getElementById("owner-hash").value=v.ownerHash;
+document.getElementById("owner-spki-hash").value=v.ownerSpkiHash;
 document.getElementById("head-revision").value=String(v.pin.revision);
 document.getElementById("head-digest").value=v.pin.digest;
 document.getElementById("head-epoch").value=String(v.pin.epoch);
+document.getElementById("provision-owner").click();
+for(let i=0;i<50;i++){await new Promise(resolve=>setTimeout(resolve,50));
+if(document.getElementById("status").textContent.includes("Âncora local criada"))break;}
+if(!document.getElementById("status").textContent.includes("Âncora local criada"))throw Error("NO_FLOOR:"+document.getElementById("status").textContent);
 document.getElementById("upload").click();
 for(let i=0;i<80;i++){await new Promise(resolve=>setTimeout(resolve,100));
 const status=document.getElementById("status").textContent;
@@ -314,31 +322,84 @@ if(status.includes("Ciphertext conferido")){output.textContent=
     ?"EDGE_NORMAL_HTTP_PASS":"EDGE_NORMAL_HTTP_FAIL";break;}
 if(status.includes("Operação recusada")){output.textContent="EDGE_NORMAL_HTTP_FAIL";break;}}
 if(!output.textContent)output.textContent="EDGE_NORMAL_HTTP_TIMEOUT";
-}catch(e){output.textContent="EDGE_NORMAL_HTTP_FAIL";}});`);
+}catch(e){output.textContent="EDGE_NORMAL_HTTP_FAIL:"+e.message;}});`);
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-edge-normal-"));
+  const profile = path.join(folder, "profile");
   const args = ["--headless=new", "--disable-gpu", "--no-first-run", "--disable-extensions",
-    "--user-data-dir=" + path.join(folder, "profile"), "--virtual-time-budget=10000",
-    "--dump-dom", f.origin + "/zk1-protected-file-lab.html"];
+    "--remote-debugging-port=0", "--user-data-dir=" + profile, "about:blank"];
   let edge;
+  let socket;
   try {
-    const html = await new Promise((resolve, reject) => {
-      edge = spawn(EDGE, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-      const chunks = []; let size = 0;
-      edge.stdout.on("data", (chunk) => {
-        size += chunk.byteLength;
-        if (size <= 256 * 1024) chunks.push(chunk);
-        else edge.kill();
-      });
-      edge.stderr.resume();
-      edge.once("error", reject);
-      edge.once("exit", (code) => code === 0 && size <= 256 * 1024
-        ? resolve(Buffer.concat(chunks).toString("utf8"))
-        : reject(new Error("Edge headless did not complete")));
+    edge = spawn(EDGE, args, { stdio: "ignore", windowsHide: true });
+    const waitFor = async (fn, maxMs = 20000) => {
+      const deadline = Date.now() + maxMs;
+      while (Date.now() < deadline) {
+        const got = await fn();
+        if (got) return got;
+        await new Promise((resolve) => setTimeout(resolve, 90));
+      }
+      throw new Error("Edge normal browser probe timeout");
+    };
+    const port = await waitFor(() => {
+      const file = path.join(profile, "DevToolsActivePort");
+      if (!fs.existsSync(file)) return null;
+      const n = Number(fs.readFileSync(file, "utf8").split(/\r?\n/)[0]);
+      return Number.isSafeInteger(n) && n > 0 ? n : null;
     });
-    assert.match(html, /EDGE_NORMAL_HTTP_PASS/);
+    const tabs = await (await fetch("http://127.0.0.1:" + port + "/json/list")).json();
+    const tab = tabs.find((item) => item.type === "page");
+    assert.ok(tab?.webSocketDebuggerUrl);
+    socket = new WebSocket(tab.webSocketDebuggerUrl);
+    await new Promise((resolve, reject) => {
+      socket.addEventListener("open", resolve, { once: true });
+      socket.addEventListener("error", reject, { once: true });
+    });
+    const inflight = new Map();
+    let sequence = 0;
+    socket.addEventListener("message", ({ data }) => {
+      const message = JSON.parse(data);
+      if (!inflight.has(message.id)) return;
+      const { resolve, reject } = inflight.get(message.id);
+      inflight.delete(message.id);
+      if (message.error) reject(new Error(message.error.message));
+      else resolve(message.result);
+    });
+    const send = (method, params = {}) => new Promise((resolve, reject) => {
+      const id = ++sequence;
+      inflight.set(id, { resolve, reject });
+      socket.send(JSON.stringify({ id, method, params }));
+    });
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Page.navigate", { url: f.origin + "/zk1-protected-file-lab.html" });
+    const evidence = await waitFor(async () => {
+      const evaluated = await send("Runtime.evaluate", {
+        expression: "document.getElementById('edge-normal-result')?.textContent || null",
+        returnByValue: true,
+      });
+      const value = evaluated.result?.value;
+      return typeof value === "string" && /^(EDGE_NORMAL_HTTP_PASS|EDGE_NORMAL_HTTP_FAIL|EDGE_NORMAL_HTTP_TIMEOUT)/.test(value)
+        ? value : null;
+    });
+    assert.equal(evidence, "EDGE_NORMAL_HTTP_PASS");
     assert.equal(f.putCount, 1);
   } finally {
-    if (edge && edge.exitCode === null) edge.kill();
-    fs.rmSync(folder, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });
+    socket?.close();
+    if (edge?.pid) {
+      try { execFileSync("taskkill", ["/PID", String(edge.pid), "/T", "/F"],
+        { stdio: "ignore", timeout: 10000 }); } catch (_) { edge.kill(); }
+    }
+    let removed = false;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try {
+        fs.rmSync(folder, { recursive: true, force: true });
+        removed = true;
+        break;
+      } catch (error) {
+        if (!["EPERM", "EBUSY", "ENOTEMPTY"].includes(error.code)) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 180));
+      }
+    }
+    if (!removed) process.stderr.write("EDGE_NORMAL_TEST_PROFILE_CLEANUP_PENDING\n");
   }
 });

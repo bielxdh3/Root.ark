@@ -108,6 +108,33 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
     assert.equal(fs.existsSync(data.contentDbPath), false,
       "file identity swap may not create the protected content database");
   }
+  {
+    const originalRead = fs.readSync;
+    const previous = path.join(dir, "post-read-old-config.json");
+    const replacement = path.join(dir, "post-read-new-config.json");
+    fs.writeFileSync(configPath, JSON.stringify(data));
+    fs.writeFileSync(replacement, JSON.stringify(data));
+    const identity = fs.lstatSync(configPath, { bigint: true });
+    let swappedAfterRead = false;
+    try {
+      fs.readSync = (descriptor, ...args) => {
+        const count = originalRead(descriptor, ...args);
+        const opened = fs.fstatSync(descriptor, { bigint: true });
+        if (!swappedAfterRead && opened.dev === identity.dev && opened.ino === identity.ino) {
+          fs.renameSync(configPath, previous);
+          fs.renameSync(replacement, configPath);
+          swappedAfterRead = true;
+        }
+        return count;
+      };
+      assert.throws(() => configure(data), /ZK_CONTENT_BOOTSTRAP_INVALID/,
+        "config replaced after descriptor read but before path confirmation must refuse");
+    } finally {
+      fs.readSync = originalRead;
+    }
+    assert.equal(swappedAfterRead, true);
+    assert.equal(fs.existsSync(data.contentDbPath), false);
+  }
   assert.throws(() => configure({ ...data, witness: { ...data.witness,
     signingPublicKeyPath: undefined } }), /ZK_CONTENT_BOOTSTRAP_INVALID/);
   assert.throws(() => configure({ ...data, cas: { ...data.cas,

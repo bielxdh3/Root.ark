@@ -13,6 +13,7 @@
   <script defer src="/client/rootark-zk1-owner-ciphertext-root-checkpoint.js"></script>
   <script defer src="/client/rootark-zk1-protected-http-client.js"></script>
   <script defer src="/client/rootark-zk1-uncertain-put-reconciliation.js"></script>
+  <script defer src="/client/rootark-zk1-normal-browser-trust-floor.js"></script>
   <script defer src="/client/rootark-zk1-normal-browser-content.js"></script>
   <script defer src="/client/rootark-zk1-normal-browser-lab-ui.js"></script>
 </head>
@@ -30,13 +31,16 @@
     <section class="panel">
       <h2>1. Autoridade externa e dispositivo</h2>
       <p class="notice">Use somente arquivos de desenvolvimento descartáveis.
-      Esta página não distribui, salva ou recupera chaves. O checkpoint e a
-      identidade do proprietário devem ser conferidos fora do Root.ark; um
-      arquivo oferecido pelo servidor não comprova a autoridade atual.</p>
+      Confira o fingerprint SPKI e o checkpoint atual fora do Root.ark, por um
+      canal independente. O clique abaixo grava apenas um piso local no IndexedDB;
+      uma cópia antiga do perfil ou o apagamento do armazenamento ainda pode
+      causar rollback. Uma assinatura válida não comprova atualidade.</p>
       <label for="owner-key">Chave pública Ed25519 do proprietário (raw, 32 bytes)</label>
       <input id="owner-key" type="file">
-      <label for="owner-hash">SHA-256 da chave pública, base64url (pin independente)</label>
+      <label for="owner-hash">SHA-256 da chave pública raw, base64url (pin independente)</label>
       <input id="owner-hash" type="text" maxlength="43" autocomplete="off" spellcheck="false">
+      <label for="owner-spki-hash">SHA-256 do SPKI DER do proprietário, base64url (pin externo independente)</label>
+      <input id="owner-spki-hash" type="text" maxlength="43" autocomplete="off" spellcheck="false">
       <label for="head-revision">Revisão atual confirmada externamente</label>
       <input id="head-revision" type="number" min="1" step="1">
       <label for="head-digest">Digest da revisão atual, base64url (pin independente)</label>
@@ -45,10 +49,17 @@
       <input id="head-epoch" type="number" min="1" step="1">
       <label for="device-grant">Autorização do dispositivo assinada pelo proprietário (.json)</label>
       <input id="device-grant" type="file" accept=".json,application/json">
+      <label for="owner-history">Checkpoint histórico assinado pelo proprietário (.json, opcional: primeiro elo)</label>
+      <input id="owner-history" type="file" accept=".json,application/json">
       <label for="device-public">Chave pública Ed25519 do dispositivo (raw, 32 bytes)</label>
       <input id="device-public" type="file">
       <label for="device-private">Chave privada Ed25519 do dispositivo (PKCS#8 local)</label>
       <input id="device-private" type="file">
+      <button id="provision-owner" type="button">Provisionar offline a âncora e o piso monotônico</button>
+      <p class="notice">Somente a ação explícita acima cria ou avança o piso local.
+      O navegador verifica SPKI e assinatura; a origem independente desses dados
+      deve ser conferida por você. Trocar proprietário, retroceder época ou
+      reaproveitar digest de outra revisão é recusado.</p>
     </section>
     <section class="panel">
       <h2>2. Cifrar, enviar e conferir</h2>
