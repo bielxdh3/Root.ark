@@ -173,6 +173,10 @@ test("app opt-in requires independently provisioned roots, explicit genesis and 
   foreign.exec("CREATE TABLE real_user_rows (id INTEGER PRIMARY KEY, data TEXT NOT NULL);");
   foreign.prepare("INSERT INTO real_user_rows(id,data) VALUES(1,?)").run("keep-this-data");
   foreign.close();
+  // Permit the file-identity preflight to inspect this *private* but foreign
+  // SQLite. A default-mode SQLite file may first be rejected for unsafe POSIX
+  // permissions, which is also fail-closed but tests a different boundary.
+  fs.chmodSync(unrelated, 0o600);
   const before = snapshot(unrelated);
   assert.throws(() => configure({ ...data, bootstrapNew: false,
     contentDbPath: unrelated }), /ZK_CONTENT_IDENTITY_MISSING/);
