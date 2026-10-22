@@ -12,6 +12,7 @@ const v2 = require("../crypto/rootark-zk-recovery-manifest-v2");
 const limits = require("../crypto/rootark-zk-recovery-history-v2");
 const { inspectVerifiedWitnessReservationV1 } = require("../crypto/rootark-zk-witness-operation-wire-v1");
 const { Zk1CasTerminalAnchor } = require("./zk1CasTerminalAnchor");
+const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
 
 const STATUS_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-cas-status/v1\0", "ascii");
 const TERMINAL_SEAL_DOMAIN = Buffer.from("Root.ark/zk-1/cas-terminal-seal/v1\0", "ascii");
@@ -119,6 +120,10 @@ class Zk1DurableCasStatusLedger {
 
     const absolute = path.resolve(filename);
     const existed = fs.existsSync(absolute);
+    try {
+      if (existed) assertPrivateSqliteFile(absolute);
+      else ensurePrivateSqliteDirectory(absolute);
+    } catch (_) { fail("CAS_STATE_MISSING"); }
     if (!existed && !bootstrapNew) fail("CAS_BOOTSTRAP_REQUIRED");
     // A nonempty external floor identifies an existing independently kept
     // terminal history, never a reason to create an empty writable CAS.
@@ -191,8 +196,9 @@ class Zk1DurableCasStatusLedger {
         fail("CAS_ANCHOR_REQUIRED");
       }
       if (fileIdentity() !== expectedFile) fail("CAS_STATE_MISSING");
+      try { assertPrivateSqliteFile(absolute); } catch (_) { fail("CAS_STATE_MISSING"); }
     } else {
-      fs.mkdirSync(path.dirname(absolute), { recursive: true });
+      try { ensurePrivateSqliteDirectory(absolute); } catch (_) { fail("CAS_STATE_MISSING"); }
       const fd = fs.openSync(absolute, fs.constants.O_CREAT | fs.constants.O_EXCL
         | fs.constants.O_RDWR, 0o600);
       try {
@@ -200,8 +206,10 @@ class Zk1DurableCasStatusLedger {
         expectedFile = [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(":");
       } finally { fs.closeSync(fd); }
     }
+    try { assertPrivateSqliteFile(absolute); } catch (_) { fail("CAS_STATE_MISSING"); }
     this.db = new Database(absolute, { fileMustExist: true });
     try {
+      try { assertPrivateSqliteFile(absolute); } catch (_) { fail("CAS_STATE_MISSING"); }
       if (fileIdentity() !== expectedFile) fail("CAS_STATE_MISSING");
       if (existed) {
         verifyIdentity(this.db);

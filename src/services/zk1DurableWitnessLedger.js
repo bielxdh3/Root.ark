@@ -7,6 +7,7 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
 const Database = require("better-sqlite3");
 const z = require("../crypto/rootark-zk-1");
 const { inspectVerifiedCasStatusProofV1 } = require("../crypto/rootark-zk-cas-status-wire-v1");
@@ -134,6 +135,10 @@ class Zk1DurableWitnessLedger {
     this.maxEventsPerScope = maxEventsPerScope;
     const absolute = path.resolve(filename);
     const existed = fs.existsSync(absolute);
+    try {
+      if (existed) assertPrivateSqliteFile(absolute);
+      else ensurePrivateSqliteDirectory(absolute);
+    } catch (_) { fail("WITNESS_STATE_MISSING"); }
     if (!existed && bootstrapNew !== true) fail("WITNESS_BOOTSTRAP_REQUIRED");
     const publicFingerprint = (publicKey) => crypto.createHash("sha256")
       .update(publicKey.export({ format: "der", type: "spki" })).digest();
@@ -171,8 +176,9 @@ class Zk1DurableWitnessLedger {
       try { verifyIdentity(readonly); }
       finally { readonly.close(); }
       if (fileIdentity() !== expectedFile) fail("WITNESS_STATE_MISSING");
+      try { assertPrivateSqliteFile(absolute); } catch (_) { fail("WITNESS_STATE_MISSING"); }
     } else {
-      fs.mkdirSync(path.dirname(absolute), { recursive: true });
+      try { ensurePrivateSqliteDirectory(absolute); } catch (_) { fail("WITNESS_STATE_MISSING"); }
       const fd = fs.openSync(absolute, fs.constants.O_CREAT | fs.constants.O_EXCL
         | fs.constants.O_RDWR, 0o600);
       try {
@@ -180,8 +186,10 @@ class Zk1DurableWitnessLedger {
         expectedFile = [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(":");
       } finally { fs.closeSync(fd); }
     }
+    try { assertPrivateSqliteFile(absolute); } catch (_) { fail("WITNESS_STATE_MISSING"); }
     this.db = new Database(absolute, { fileMustExist: true });
     try {
+      try { assertPrivateSqliteFile(absolute); } catch (_) { fail("WITNESS_STATE_MISSING"); }
       if (fileIdentity() !== expectedFile) fail("WITNESS_STATE_MISSING");
       if (existed) {
         verifyIdentity(this.db);

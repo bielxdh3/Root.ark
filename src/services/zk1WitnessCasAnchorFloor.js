@@ -6,6 +6,7 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
 const { Worker } = require("node:worker_threads");
 const Database = require("better-sqlite3");
 
@@ -146,13 +147,18 @@ class Zk1WitnessCasAnchorFloor {
     const absolute = path.resolve(filename);
     const exists = fs.existsSync(absolute);
     if (exists === bootstrapNew || (exists && !fs.lstatSync(absolute).isFile())) fail();
+    try {
+      if (exists) assertPrivateSqliteFile(absolute);
+      else ensurePrivateSqliteDirectory(absolute);
+    } catch (_) { fail(); }
     if (!exists) {
-      fs.mkdirSync(path.dirname(absolute), { recursive: true });
       const fd = fs.openSync(absolute, "wx", 0o600);
       fs.closeSync(fd);
     }
+    try { assertPrivateSqliteFile(absolute); } catch (_) { fail(); }
     const db = new Database(absolute, { fileMustExist: true });
     try {
+      assertPrivateSqliteFile(absolute);
       this.#filename = absolute;
       this.#fileIdentity = fs.statSync(absolute, { bigint: true });
       db.pragma("journal_mode = WAL");
@@ -231,6 +237,7 @@ class Zk1WitnessCasAnchorFloor {
     }).deferred();
   }
   #assertFileIdentity() {
+    try { assertPrivateSqliteFile(this.#filename); } catch (_) { fail(); }
     const now = fs.statSync(this.#filename, { bigint: true });
     if (!now.isFile() || now.dev !== this.#fileIdentity.dev
       || now.ino !== this.#fileIdentity.ino) fail();

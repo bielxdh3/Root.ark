@@ -91,6 +91,37 @@ test("a fully referenced synthetic backup is independently hashed but can never 
     [sha(fs.readFileSync(file)), fs.statSync(file).mtimeMs], state);
 });
 
+test("backup fixture FD rejects distinct 64-bit inode identities that round to the same Number", (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "manifest.json");
+  const highInode = 2n ** 60n;
+  const originalOpen = fs.openSync;
+  const originalLstat = fs.lstatSync;
+  const originalFstat = fs.fstatSync;
+  let manifestFd;
+  const substitute = (stat, ino) => { stat.ino = typeof stat.ino === "bigint" ? ino : Number(ino); return stat; };
+  try {
+    fs.openSync = function (name) {
+      const fd = originalOpen.apply(this, arguments);
+      if (name === file) manifestFd = fd;
+      return fd;
+    };
+    fs.lstatSync = function (name) {
+      const stat = originalLstat.apply(this, arguments);
+      return name === file ? substitute(stat, highInode) : stat;
+    };
+    fs.fstatSync = function (fd) {
+      const stat = originalFstat.apply(this, arguments);
+      return fd === manifestFd ? substitute(stat, highInode + 1n) : stat;
+    };
+    blocked(inspect(f), "UNSAFE_FIXTURE_ENTRY");
+  } finally {
+    fs.openSync = originalOpen;
+    fs.lstatSync = originalLstat;
+    fs.fstatSync = originalFstat;
+  }
+});
+
 test("owner approval requires an independently pinned Ed25519 public key", (t) => {
   const f = fixture(t);
   blocked(inspect(f, { trustedOwnerPublicKey: undefined }), "OWNER_BACKUP_AUTHORIZATION_INVALID");

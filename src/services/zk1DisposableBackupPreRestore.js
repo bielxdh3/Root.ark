@@ -140,23 +140,26 @@ function readRegular(file, maxSize, expectedFailure = "UNSAFE_FIXTURE_ENTRY", ve
   let descriptor;
   try {
     verifyBoundary();
-    const before = fs.lstatSync(file);
+    const before = fs.lstatSync(file, { bigint: true });
     verifyBoundary();
-    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
-      || before.size > maxSize) deny(expectedFailure);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
+      || before.size > BigInt(maxSize)) deny(expectedFailure);
     descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
     verifyBoundary();
-    const opened = fs.fstatSync(descriptor);
-    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev
-      || opened.ino !== before.ino || opened.size !== before.size) deny(expectedFailure);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    if (!opened.isFile() || opened.nlink !== 1n || opened.dev !== before.dev
+      || opened.ino !== before.ino || opened.size !== before.size
+      || opened.mtimeNs !== before.mtimeNs || opened.ctimeNs !== before.ctimeNs) deny(expectedFailure);
     const contents = fs.readFileSync(descriptor);
     verifyBoundary();
-    const after = fs.fstatSync(descriptor);
-    const again = fs.lstatSync(file);
-    if (contents.length !== opened.size || contents.length > maxSize
-      || after.mtimeMs !== opened.mtimeMs || after.size !== opened.size
-      || after.nlink !== 1 || again.nlink !== 1 || again.isSymbolicLink()
-      || again.dev !== opened.dev || again.ino !== opened.ino) deny(expectedFailure);
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    const again = fs.lstatSync(file, { bigint: true });
+    if (BigInt(contents.length) !== opened.size || contents.length > maxSize
+      || after.mtimeNs !== opened.mtimeNs || after.ctimeNs !== opened.ctimeNs
+      || after.size !== opened.size || after.nlink !== 1n || again.nlink !== 1n
+      || again.isSymbolicLink() || again.dev !== opened.dev || again.ino !== opened.ino
+      || again.size !== opened.size || again.mtimeNs !== opened.mtimeNs
+      || again.ctimeNs !== opened.ctimeNs) deny(expectedFailure);
     verifyBoundary();
     return contents;
   } catch (error) {

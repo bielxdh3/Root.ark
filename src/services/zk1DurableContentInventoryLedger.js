@@ -5,6 +5,7 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
 const Database = require("better-sqlite3");
 const z = require("../crypto/rootark-zk-1");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
@@ -303,6 +304,7 @@ class Zk1DurableContentInventoryLedger {
     let expectedIdentity;
     let hasTerminal = false;
     if (existed) {
+      try { assertPrivateSqliteFile(this.filename); } catch (_) { fail("INVENTORY_STATE"); }
       expectedIdentity = fileIdentity(this.filename);
       const readonly = this.openDatabase(true);
       try {
@@ -315,8 +317,9 @@ class Zk1DurableContentInventoryLedger {
         fail("INVENTORY_STATE");
       } finally { readonly.close(); }
       if (fileIdentity(this.filename) !== expectedIdentity) fail("INVENTORY_STATE");
+      try { assertPrivateSqliteFile(this.filename); } catch (_) { fail("INVENTORY_STATE"); }
     } else {
-      try { fs.mkdirSync(path.dirname(this.filename), { recursive: true }); }
+      try { ensurePrivateSqliteDirectory(this.filename); }
       catch (_) { fail("INVENTORY_STATE"); }
       let fd;
       try {
@@ -325,8 +328,9 @@ class Zk1DurableContentInventoryLedger {
       try { fs.closeSync(fd); } catch (_) { fail("INVENTORY_STATE"); }
       expectedIdentity = fileIdentity(this.filename);
     }
-
+    try { assertPrivateSqliteFile(this.filename); } catch (_) { fail("INVENTORY_STATE"); }
     this.db = this.openDatabase(false);
+    try { assertPrivateSqliteFile(this.filename); } catch (_) { fail("INVENTORY_STATE"); }
     if (fileIdentity(this.filename) !== expectedIdentity) fail("INVENTORY_STATE");
     if (existed) {
       validateSchema(this.db);
