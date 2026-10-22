@@ -142,8 +142,15 @@ function createCloudStorage(options = {}) {
     return id;
   }
   async function getDriveFile(fileId, signal = undefined) {
-    return (await (await drive()).files.get({ fileId, fields: "id,parents,appProperties" },
+    const current = (await (await drive()).files.get({ fileId, fields: "id,parents,appProperties" },
       signal ? { signal } : undefined)).data;
+    // A provider adapter must not answer a pinned ID lookup with metadata
+    // belonging to a different physical file that shares the same app key.
+    // This is required before either an immutable-ID update or a ZK GET.
+    if (!isDriveFileId(fileId) || current?.id !== fileId) {
+      throw cloudError("provider_error", "Drive returned metadata for a different file ID");
+    }
+    return current;
   }
   function assertDriveFileOwnership(file, cloudKey, folderId, area) {
     const properties = file?.appProperties || {};
@@ -160,24 +167,32 @@ function createCloudStorage(options = {}) {
       appProperties: { rootArkKey: cloudKey, rootArkFolderId: String(folderId || rootFolderId), rootArkArea: area },
     };
   }
-  async function uploadToPinnedDriveId(localPath, fileId, requestBody, cloudKey, folderId, area) {
+  async function uploadToPinnedDriveId(localPath, fileId, requestBody, cloudKey, folderId, area,
+    signal = undefined) {
     const client = await drive();
     let existing;
-    try { existing = await getDriveFile(fileId); }
+    try { existing = await abortableProviderRead(() => getDriveFile(fileId, signal), signal); }
     catch (error) { if (!isDriveStatus(error, 404)) throw error; }
     if (existing) {
       assertDriveFileOwnership(existing, cloudKey, folderId, area);
-      await client.files.update({ fileId, requestBody, media: { body: fs.createReadStream(localPath) }, fields: "id" });
+      await abortableProviderRead(() => client.files.update({ fileId, requestBody,
+        media: { body: fs.createReadStream(localPath) }, fields: "id" },
+      signal ? { signal } : undefined), signal);
       return { provider, key: cloudKey, id: fileId };
     }
     try {
-      const result = await client.files.create({ requestBody: { ...requestBody, id: fileId, parents: [folder()] }, media: { body: fs.createReadStream(localPath) }, fields: "id" });
+      const result = await abortableProviderRead(() => client.files.create({
+        requestBody: { ...requestBody, id: fileId, parents: [folder()] },
+        media: { body: fs.createReadStream(localPath) }, fields: "id" },
+      signal ? { signal } : undefined), signal);
       return { provider, key: cloudKey, id: String(result.data.id || fileId) };
     } catch (error) {
       if (!isDriveStatus(error, 409)) throw error;
-      const raced = await getDriveFile(fileId);
+      const raced = await abortableProviderRead(() => getDriveFile(fileId, signal), signal);
       assertDriveFileOwnership(raced, cloudKey, folderId, area);
-      await client.files.update({ fileId, requestBody, media: { body: fs.createReadStream(localPath) }, fields: "id" });
+      await abortableProviderRead(() => client.files.update({ fileId, requestBody,
+        media: { body: fs.createReadStream(localPath) }, fields: "id" },
+      signal ? { signal } : undefined), signal);
       return { provider, key: cloudKey, id: fileId };
     }
   }
@@ -250,12 +265,42 @@ function createCloudStorage(options = {}) {
   async function upload(localPath, folderId, fileName, area = "uploads", uploadOptions = {}) {
     assertProvider(); if (!enabled() || !fs.statSync(localPath, { throwIfNoEntry: false })?.isFile()) return null;
     const cloudKey = objectKey(folderId, fileName, area);
-    if (provider === "s3") { const bucketName = bucket(); await (await s3()).send(new (require("@aws-sdk/client-s3").PutObjectCommand)({ Bucket: bucketName, Key: cloudKey, Body: fs.createReadStream(localPath) })); return { provider, key: cloudKey }; }
+    const bound = uploadOptions?.zk1BoundedBytes;
+    if (bound !== undefined) {
+      if (!Number.isSafeInteger(bound) || bound < 1 || bound > 16 * 1024 * 1024
+        || !uploadOptions || typeof uploadOptions !== "object" || Array.isArray(uploadOptions)
+        || Reflect.ownKeys(uploadOptions).some((key) => !["providerFileId", "zk1BoundedBytes"].includes(key))) {
+        throw cloudError("configuration", "Invalid bounded ZK ciphertext upload");
+      }
+      const stat = fs.lstatSync(localPath, { bigint: true });
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n
+        || stat.size !== BigInt(bound)) {
+        throw cloudError("configuration", "Ciphertext staging file is not an exact private upload");
+      }
+    }
+    const controller = bound !== undefined ? new AbortController() : null;
+    const timeout = controller ? setTimeout(() => controller.abort(), 15000) : null;
+    const signal = controller?.signal;
+    try {
+    if (provider === "s3") {
+      const bucketName = bucket();
+      await abortableProviderRead(async () => (await s3()).send(
+        new (require("@aws-sdk/client-s3").PutObjectCommand)({ Bucket: bucketName,
+          Key: cloudKey, Body: fs.createReadStream(localPath), ...(bound ? { ContentLength: bound } : {}) }),
+        signal ? { abortSignal: signal } : undefined), signal);
+      if (signal?.aborted) throw cloudError("provider_error", "Bounded ciphertext upload deadline exceeded");
+      return { provider, key: cloudKey };
+    }
     const providerFileId = String(uploadOptions?.providerFileId || "").trim();
     if (providerFileId) {
       if (!isDriveFileId(providerFileId)) throw cloudError("invalid_path", "Google Drive file ID is invalid");
-      return uploadToPinnedDriveId(localPath, providerFileId, driveRequestBody(folderId, fileName, area, cloudKey), cloudKey, folderId, area);
+      const result = await abortableProviderRead(() => uploadToPinnedDriveId(localPath,
+        providerFileId, driveRequestBody(folderId, fileName, area, cloudKey),
+        cloudKey, folderId, area, signal), signal);
+      if (signal?.aborted) throw cloudError("provider_error", "Bounded ciphertext upload deadline exceeded");
+      return result;
     }
+    if (bound !== undefined) throw cloudError("configuration", "Bounded Drive copy requires an immutable pinned file ID");
     const existing = await findDriveFile(cloudKey, folderId, area);
     const requestBody = driveRequestBody(folderId, fileName, area, cloudKey);
     const media = { body: fs.createReadStream(localPath) };
@@ -266,15 +311,24 @@ function createCloudStorage(options = {}) {
       return { provider, key: cloudKey, id: existing.id };
     }
     const result = await (await drive()).files.create({ requestBody: { ...requestBody, parents: [folder()] }, media, fields: "id" }); return { provider, key: cloudKey, id: result.data.id };
+    } catch (error) {
+      if (controller) controller.abort();
+      throw error;
+    } finally { if (timeout) clearTimeout(timeout); }
   }
   async function download(folderId, fileName, localPath, area = "uploads", canPublish = () => true,
     constraints = undefined) {
     assertProvider(); if (!enabled() || fs.existsSync(localPath)) return false;
+    const pinId = constraints && Object.hasOwn(constraints, "providerFileId")
+      ? constraints.providerFileId : null;
     if (constraints !== undefined && (!constraints || typeof constraints !== "object"
-      || Array.isArray(constraints) || Reflect.ownKeys(constraints).length !== 1
+      || Array.isArray(constraints)
+      || Reflect.ownKeys(constraints).length !== (pinId === null ? 1 : 2)
       || !Object.hasOwn(constraints, "maxBytes")
       || !Number.isSafeInteger(constraints.maxBytes)
-      || constraints.maxBytes < 1 || constraints.maxBytes > 16 * 1024 * 1024)) {
+      || constraints.maxBytes < 1 || constraints.maxBytes > 16 * 1024 * 1024
+      || (provider === "gdrive" && !isDriveFileId(pinId))
+      || (provider === "s3" && pinId !== null))) {
       throw cloudError("invalid_path", "Invalid bounded ciphertext download");
     }
     const cloudKey = objectKey(folderId, fileName, area);
@@ -294,8 +348,9 @@ function createCloudStorage(options = {}) {
           signal ? { abortSignal: signal } : undefined), signal)).Body;
       }
       else {
-        const existing = await abortableProviderRead(
-          () => findDriveFile(cloudKey, folderId, area, signal), signal);
+        const existing = pinId === null
+          ? await abortableProviderRead(() => findDriveFile(cloudKey, folderId, area, signal), signal)
+          : { id: pinId };
         if (!existing) return false;
         const current = await abortableProviderRead(() => getDriveFile(existing.id, signal), signal);
         assertDriveFileOwnership(current, cloudKey, folderId, area);

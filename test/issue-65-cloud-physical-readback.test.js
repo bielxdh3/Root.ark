@@ -65,7 +65,8 @@ for (const provider of ["s3", "gdrive"]) {
     const f = fixture(provider);
     const pinned = await f.reader.resolveInventoryContext();
     const verifier = new Zk1CloudCiphertextReadbackVerifier({ cloudReader: f.reader,
-      expectedProvider: provider, expectedReaderContext: pinned });
+      expectedProvider: provider, expectedReaderContext: pinned,
+      pinnedDriveFileId: provider === "gdrive" ? "fixture-cloud-id" : null });
     const good = await verifier.verifyExact(f.input);
     assert.equal(good.status, "EXTERNAL_CIPHERTEXT_REREAD_MATCHED");
     assert.equal(good.readbackMatched, true);

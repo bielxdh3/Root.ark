@@ -24,6 +24,8 @@ const { Zk1PgPhysicalInventoryBridge } =
 const { createCloudStorage } = require("../services/cloudStorage");
 const { Zk1CloudCiphertextReadbackVerifier, zk1CloudCopyAddress } =
   require("../src/services/zk1CloudCiphertextReadbackVerifier");
+const { Zk1CloudCiphertextCopyPublisher } =
+  require("../src/services/zk1CloudCiphertextCopyPublisher");
 const { createZk1ContentInventoryHttpsServer,
   drainZk1ContentInventoryHttpsServer } =
   require("../src/services/zk1ContentInventoryHttpsServer");
@@ -333,6 +335,83 @@ test("signed PG ciphertext and separately pinned cloud GET must both match exact
     /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
     "a bad local physical seal must deny before contacting a cloud reader");
   assert.equal(reads, before);
+});
+
+test("real sealed PG operation permits only nonauthorizing bounded S3 PUT plus independent GET replay", {
+  skip: !enabled && "requires disposable PostgreSQL 18 and synthetic cloud GET/PUT",
+}, async (t) => {
+  const f = await fixture(t);
+  const cloud = new Map();
+  let puts = 0;
+  let gets = 0;
+  let tamperRemotePut = false;
+  const makeStore = (principal) => createCloudStorage({
+    provider: "s3", prefix: "rootark-physical-put-fixture",
+    s3: { bucket: "disposable-sealed-copy" },
+    resolvePrincipalIdentity: async () => principal,
+    createS3Client: async () => ({ send: async (cmd) => {
+      assert.equal(cmd.input.Bucket, "disposable-sealed-copy");
+      if (cmd.constructor.name === "PutObjectCommand") {
+        puts += 1;
+        const bytes = [];
+        for await (const chunk of cmd.input.Body) bytes.push(Buffer.from(chunk));
+        const combined = Buffer.concat(bytes);
+        assert.equal(cmd.input.ContentLength, combined.length);
+        cloud.set(cmd.input.Key, tamperRemotePut ? Buffer.alloc(combined.length, 0x3a) : combined);
+        return { ETag: '"fixture-etag-nonproof"' };
+      }
+      if (cmd.constructor.name === "GetObjectCommand") {
+        gets += 1;
+        const contents = cloud.get(cmd.input.Key);
+        if (!contents) throw new Error("cloud object missing");
+        return { Body: Readable.from([contents]) };
+      }
+      throw new Error("must not invoke delete/list/permission changes");
+    } }),
+  });
+  const writer = makeStore("scoped-copy-writer");
+  const reader = makeStore("distinct-scoped-copy-reader");
+  const cloudPublisher = new Zk1CloudCiphertextCopyPublisher({ cloudWriter: writer,
+    expectedProvider: "s3", expectedWriterContext: await writer.resolveInventoryContext() });
+  const cloudVerifier = new Zk1CloudCiphertextReadbackVerifier({ cloudReader: reader,
+    expectedProvider: "s3", expectedReaderContext: await reader.resolveInventoryContext() });
+  const args = { physical: f.noChunks(), chunks: f.chunks, cloudPublisher, cloudVerifier };
+  await assert.rejects(f.bridge().publishAndReconcileCloudCopy(args),
+    /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+    "no external PUT can start before the PG operation has a signed sealed receipt");
+  assert.equal(puts, 0);
+  await f.bridge().putAndAttest(f.physical);
+  const copied = await f.bridge().publishAndReconcileCloudCopy(args);
+  assert.equal(copied.status, "PG_SIGNED_AND_EXTERNAL_COPY_REREAD");
+  assert.deepEqual(copied.operationId, f.op.operation_id);
+  assert.equal(copied.authorizesIo, false);
+  assert.equal(copied.externalProviderDurabilityProven, false);
+  assert.equal(copied.independentRemoteIoFenceProven, false);
+  assert.equal(copied.byteLength, Buffer.concat(f.chunks).length);
+  assert.equal(puts, 1);
+  assert.ok(gets >= 1);
+  const addr = zk1CloudCopyAddress({ scope: f.scope, operationId: f.op.operation_id });
+  assert.deepEqual(cloud.get(writer.key(addr.folder, addr.name, "uploads")),
+    Buffer.concat(f.chunks));
+  await assert.rejects(f.bridge().publishAndReconcileCloudCopy({ ...args,
+    chunks: [Buffer.alloc(f.chunks[0].length), f.chunks[1]] }),
+  /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/);
+  assert.equal(puts, 1, "wrong ciphertext chunks must be refused before provider PUT");
+  tamperRemotePut = true;
+  await assert.rejects(f.bridge().publishAndReconcileCloudCopy(args),
+  /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+  "cloud PUT ACK alone is never signed external durability or accepted without GET");
+  assert.equal(puts, 2);
+  assert.equal((await f.ledger.getOperationStatus(f.op.operation_id)).status, "committed",
+    "a bad cloud copy must not erase the valid historical signed local receipt");
+  tamperRemotePut = false;
+  const exactRead = cloudVerifier.verifyExact.bind(cloudVerifier);
+  cloudVerifier.verifyExact = async (input) => ({ ...await exactRead(input),
+    providerFileId: "unrelated-physical-copy" });
+  await assert.rejects(f.bridge().publishAndReconcileCloudCopy(args),
+    /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+    "even authentic PG, receipt and remote bytes cannot authorize a copy whose GET identity disagrees with PUT");
+  cloudVerifier.verifyExact = exactRead;
 });
 
 test("mTLS signed inventory append requires real strict physical PG readback and WAL", {

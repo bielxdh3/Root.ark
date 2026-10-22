@@ -71,17 +71,24 @@ class Zk1CloudCiphertextReadbackVerifier {
   #reader;
   #expectedProvider;
   #expectedContext;
-  constructor({ cloudReader, expectedProvider, expectedReaderContext } = {}) {
+  #driveId;
+  constructor({ cloudReader, expectedProvider, expectedReaderContext,
+    pinnedDriveFileId = null } = {}) {
     if (!cloudReader || typeof cloudReader !== "object"
       || !["s3", "gdrive"].includes(expectedProvider)
       || !CONTEXT.test(expectedReaderContext)
       || !["status", "enabled", "resolveInventoryContext", "key", "download"]
         .every((method) => typeof cloudReader[method] === "function")
       || cloudReader.status()?.provider !== expectedProvider
-      || cloudReader.enabled() !== true) fail();
+      || cloudReader.enabled() !== true
+      || (expectedProvider === "s3" && pinnedDriveFileId !== null)
+      || (expectedProvider === "gdrive" &&
+        (typeof pinnedDriveFileId !== "string"
+          || !/^[A-Za-z0-9_-]{1,256}$/.test(pinnedDriveFileId)))) fail();
     this.#reader = cloudReader;
     this.#expectedProvider = expectedProvider;
     this.#expectedContext = expectedReaderContext;
+    this.#driveId = pinnedDriveFileId;
   }
 
   async verifyExact(input) {
@@ -112,7 +119,8 @@ class Zk1CloudCiphertextReadbackVerifier {
       dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cloud-readback-"));
       const destination = path.join(dir, "ciphertext.ct");
       const downloaded = await this.#reader.download(folder, name, destination, "uploads",
-        () => true, { maxBytes: total });
+        () => true, { maxBytes: total,
+          ...(this.#driveId === null ? {} : { providerFileId: this.#driveId }) });
       if (downloaded !== true) fail();
       const identity = await boundedIdentityRead(() => this.#reader.resolveInventoryContext());
       if (identity !== this.#expectedContext) fail();
@@ -147,6 +155,7 @@ class Zk1CloudCiphertextReadbackVerifier {
         || !equal(computeZk1CiphertextRoot(chunks), expectedRoot)) fail();
       return Object.freeze({ status: "EXTERNAL_CIPHERTEXT_REREAD_MATCHED",
         provider: this.#expectedProvider, readbackMatched: true,
+        providerFileId: this.#driveId,
         byteLength: total, operationId: Buffer.from(operationId),
         authorizesIo: false, externalProviderDurabilityProven: false,
         independentlyAnchoredFloorProven: false });

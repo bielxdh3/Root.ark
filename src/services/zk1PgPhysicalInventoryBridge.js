@@ -16,6 +16,8 @@ const { Zk1SharedPgPhysicalInventoryIntent } =
 const { Zk1DurableContentInventoryLedger } = require("./zk1DurableContentInventoryLedger");
 const { Zk1CloudCiphertextReadbackVerifier } =
   require("./zk1CloudCiphertextReadbackVerifier");
+const { Zk1CloudCiphertextCopyPublisher } =
+  require("./zk1CloudCiphertextCopyPublisher");
 
 function fail() {
   const e = new Error("ZK_PHYSICAL_INVENTORY_UNAVAILABLE");
@@ -275,11 +277,51 @@ class Zk1PgPhysicalInventoryBridge {
       || !same(after.root, before.root)) fail();
     return Object.freeze({ status: "PG_SIGNED_AND_CLOUD_BYTES_REREAD",
       operationId: Buffer.from(v.operation.operation_id),
-      provider: remote.provider, remoteReadbackMatched: true,
+      provider: remote.provider, providerFileId: remote.providerFileId,
+      remoteReadbackMatched: true,
       localPgWalFlushConfirmed: true, authorizesIo: false,
       externalProviderDurabilityProven: false,
       ownerPinnedFloorChecked: Boolean(this.#trustedInventoryFloor),
       independentlyAnchoredFloorProven: false });
+  }
+  // Reconcile an already committed, physically immutable local ciphertext
+  // before attempting external replication. Any cloud PUT begun here is an
+  // NON-AUTHORIZING copy. There is no shared linearizable gate between S3,
+  // GDrive, local PostgreSQL and the witness: an orphan may remain after a
+  // failed post-PUT verification or quiescence. Never advertise durability.
+  async publishAndReconcileCloudCopy({ physical, chunks, cloudPublisher,
+    cloudVerifier } = {}) {
+    const v = this.#request(physical);
+    if (!(cloudPublisher instanceof Zk1CloudCiphertextCopyPublisher)
+      || !(cloudVerifier instanceof Zk1CloudCiphertextReadbackVerifier)) fail();
+    const detached = detachedChunks(chunks, v.expectedChunkCount,
+      v.operation.ciphertext_sha256, v.expectedRootHash);
+    const fixed = { scope: v.scope, operation: v.operation, digest: v.digest,
+      expectedRootHash: v.expectedRootHash,
+      expectedChunkCount: v.expectedChunkCount };
+    const before = await this.reconcile(fixed);
+    if (before.status !== "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY") fail();
+    let write;
+    try {
+      write = await cloudPublisher.publishExact({ scope: v.scope,
+        operationId: v.operation.operation_id,
+        ciphertextSha256: v.operation.ciphertext_sha256,
+        expectedRootHash: v.expectedRootHash, chunks: detached });
+    } catch (_) { fail(); }
+    if (write?.status !== "CLOUD_COPY_PUT_ACK_NONAUTHORITATIVE"
+      || write.authorizesIo !== false || write.providerDurabilityProven !== false
+      || !same(write.operationId, v.operation.operation_id)) fail();
+    const remote = await this.reconcileCloudCopy({ physical: fixed,
+      cloudVerifier, chunkLengths: detached.map((chunk) => chunk.length) });
+    if (remote.provider !== write.provider
+      || remote.providerFileId !== write.providerFileId
+      || remote.authorizesIo !== false
+      || !same(remote.operationId, v.operation.operation_id)) fail();
+    return Object.freeze({ status: "PG_SIGNED_AND_EXTERNAL_COPY_REREAD",
+      operationId: Buffer.from(v.operation.operation_id), provider: remote.provider,
+      byteLength: write.byteLength, remoteReadbackMatched: true,
+      authorizesIo: false, externalProviderDurabilityProven: false,
+      independentRemoteIoFenceProven: false });
   }
   async publishExisting(input) {
     const v = this.#request(input);
