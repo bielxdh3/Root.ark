@@ -76,6 +76,7 @@ class Zk1CloudCiphertextCopyPublisher {
   #context;
   #provider;
   #driveId;
+  #namespace;
   constructor({ cloudWriter, expectedProvider, expectedWriterContext,
     pinnedDriveFileId = null } = {}) {
     if (!cloudWriter || typeof cloudWriter !== "object"
@@ -94,10 +95,14 @@ class Zk1CloudCiphertextCopyPublisher {
     this.#context = expectedWriterContext;
     this.#provider = expectedProvider;
     this.#driveId = pinnedDriveFileId;
+    this.#namespace = typeof cloudWriter.zk1StorageNamespace === "function"
+      ? cloudWriter.zk1StorageNamespace() : null;
+    if (this.#namespace !== null && !/^[a-f0-9]{64}$/.test(this.#namespace)) fail();
   }
 
   get pinnedCopyTarget() {
-    return Object.freeze({ provider: this.#provider, driveFileId: this.#driveId });
+    return Object.freeze({ provider: this.#provider, driveFileId: this.#driveId,
+      namespaceIdentity: this.#namespace });
   }
 
   async publishExact(input) {
@@ -139,6 +144,8 @@ class Zk1CloudCiphertextCopyPublisher {
       return Object.freeze({ status: "CLOUD_COPY_PUT_ACK_NONAUTHORITATIVE",
         operationId: Buffer.from(operationId), provider: this.#provider,
         providerFileId: this.#driveId,
+        providerObjectKey: key, ciphertextSha256: Buffer.from(sha),
+        namespaceIdentity: this.#namespace,
         byteLength: payload.size, authorizesIo: false,
         providerDurabilityProven: false });
     } catch (_) { fail(); }

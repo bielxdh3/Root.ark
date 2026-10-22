@@ -112,6 +112,9 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
       "rootark-zk1-dev-webdav/v1", endpoint.origin, root, namespace, pin,
       username || "", clientCert ? crypto.createHash("sha256").update(clientCert).digest("hex") : "",
     ])).digest("hex");
+    const namespaceIdentity = crypto.createHash("sha256").update(JSON.stringify([
+      "rootark-zk1/webdav-namespace/v1", endpoint.origin, root, namespace, pin,
+    ])).digest("hex");
 
     function key(folder, name, area) {
       ensure(area === "uploads" && SAFE_FOLDER.test(folder)
@@ -196,6 +199,7 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
       enabled: () => true,
       status: () => Object.freeze({ provider: "webdav", enabled: true, developmentOnly: true }),
       resolveInventoryContext: async () => context,
+      zk1StorageNamespace: () => namespaceIdentity,
       key,
       async upload(source, folder, name, area, opts) {
         try {

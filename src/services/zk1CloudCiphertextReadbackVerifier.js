@@ -72,6 +72,7 @@ class Zk1CloudCiphertextReadbackVerifier {
   #expectedProvider;
   #expectedContext;
   #driveId;
+  #namespace;
   constructor({ cloudReader, expectedProvider, expectedReaderContext,
     pinnedDriveFileId = null } = {}) {
     if (!cloudReader || typeof cloudReader !== "object"
@@ -89,10 +90,14 @@ class Zk1CloudCiphertextReadbackVerifier {
     this.#expectedProvider = expectedProvider;
     this.#expectedContext = expectedReaderContext;
     this.#driveId = pinnedDriveFileId;
+    this.#namespace = typeof cloudReader.zk1StorageNamespace === "function"
+      ? cloudReader.zk1StorageNamespace() : null;
+    if (this.#namespace !== null && !/^[a-f0-9]{64}$/.test(this.#namespace)) fail();
   }
 
   get pinnedCopyTarget() {
-    return Object.freeze({ provider: this.#expectedProvider, driveFileId: this.#driveId });
+    return Object.freeze({ provider: this.#expectedProvider, driveFileId: this.#driveId,
+      namespaceIdentity: this.#namespace });
   }
 
   async verifyExact(input) {
@@ -160,6 +165,8 @@ class Zk1CloudCiphertextReadbackVerifier {
       return Object.freeze({ status: "EXTERNAL_CIPHERTEXT_REREAD_MATCHED",
         provider: this.#expectedProvider, readbackMatched: true,
         providerFileId: this.#driveId,
+        providerObjectKey: expectedKey, readbackSha256: Buffer.from(expectedSha),
+        namespaceIdentity: this.#namespace,
         byteLength: total, operationId: Buffer.from(operationId),
         authorizesIo: false, externalProviderDurabilityProven: false,
         independentlyAnchoredFloorProven: false });

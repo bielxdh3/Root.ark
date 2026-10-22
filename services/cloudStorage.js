@@ -23,6 +23,15 @@ function createCloudStorage(options = {}) {
   const provider = String(options.provider || "local").toLowerCase();
   const prefix = normalizePrefix(options.prefix || "rootark");
   const rootFolderId = String(options.rootFolderId || "root");
+  // Stable physical namespace without including the authenticated principal:
+  // a writer and separately credentialed reader may share the same bucket or
+  // Drive root, while two different remote stores cannot be paired by key.
+  const zk1StorageNamespace = crypto.createHash("sha256").update(JSON.stringify(
+    provider === "s3" ? ["rootark-zk1/s3-namespace/v1", prefix, rootFolderId,
+      options.s3?.bucket || "", options.s3?.region || "", options.s3?.endpoint || "",
+      Boolean(options.s3?.forcePathStyle)]
+      : ["rootark-zk1/gdrive-namespace/v1", prefix, rootFolderId,
+        options.gdrive?.folderId || ""])).digest("hex");
   const createS3Client = options.createS3Client || defaultS3Client(options.s3 || {});
   const createGoogleDriveClient = options.createGoogleDriveClient || defaultGoogleDriveClient(options.gdrive || {});
   let s3Client;
@@ -506,7 +515,9 @@ function createCloudStorage(options = {}) {
   const run = async (operation, ...args) => {
     try { return await operation(...args); } catch (error) { throw classify(error); }
   };
-  return { provider, enabled, status, inventoryContext, resolveInventoryContext, key, inventory: (...args) => run(inventory, ...args), resolveUploadId: (...args) => run(resolveUploadId, ...args), upload: (...args) => run(upload, ...args), download: (...args) => run(download, ...args), remove: (...args) => run(remove, ...args), removePrefix: (...args) => run(removePrefix, ...args), list: (...args) => run(list, ...args) };
+  return { provider, enabled, status, inventoryContext, resolveInventoryContext,
+    zk1StorageNamespace: () => zk1StorageNamespace,
+    key, inventory: (...args) => run(inventory, ...args), resolveUploadId: (...args) => run(resolveUploadId, ...args), upload: (...args) => run(upload, ...args), download: (...args) => run(download, ...args), remove: (...args) => run(remove, ...args), removePrefix: (...args) => run(removePrefix, ...args), list: (...args) => run(list, ...args) };
 }
 
 function normalizePrefix(value) { const clean = String(value || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""); if (!clean || clean.split("/").some((part) => !part || part === "." || part === "..")) throw cloudError("invalid_prefix", "Invalid cloud prefix"); return clean; }

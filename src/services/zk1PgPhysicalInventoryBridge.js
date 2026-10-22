@@ -14,7 +14,7 @@ const { Zk1SharedPgPhysicalCiphertextVerifier } =
 const { Zk1SharedPgPhysicalInventoryIntent } =
   require("./zk1SharedPgPhysicalInventoryIntent");
 const { Zk1DurableContentInventoryLedger } = require("./zk1DurableContentInventoryLedger");
-const { Zk1CloudCiphertextReadbackVerifier } =
+const { Zk1CloudCiphertextReadbackVerifier, zk1CloudCopyAddress } =
   require("./zk1CloudCiphertextReadbackVerifier");
 const { Zk1CloudCiphertextCopyPublisher } =
   require("./zk1CloudCiphertextCopyPublisher");
@@ -94,6 +94,35 @@ function detachedChunks(chunks, count, expectedSha256, expectedRoot) {
   if (!same(hash.digest(), expectedSha256)
     || !same(computeZk1CiphertextRoot(detached), expectedRoot)) fail();
   return detached;
+}
+
+function cloudTargets(copies) {
+  if (!Array.isArray(copies) || copies.length < 2 || copies.length > 3
+    || Reflect.ownKeys(copies).length !== copies.length + 1) fail();
+  const targets = [];
+  const providers = new Set();
+  for (let index = 0; index < copies.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(copies, String(index));
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) fail();
+    const item = exact(descriptor.value, ["cloudPublisher", "cloudVerifier"]);
+    if (!(item.cloudPublisher instanceof Zk1CloudCiphertextCopyPublisher)
+      || !(item.cloudVerifier instanceof Zk1CloudCiphertextReadbackVerifier)
+      || Object.hasOwn(item.cloudPublisher, "pinnedCopyTarget")
+      || Object.hasOwn(item.cloudVerifier, "pinnedCopyTarget")) fail();
+    const writer = item.cloudPublisher.pinnedCopyTarget;
+    const reader = item.cloudVerifier.pinnedCopyTarget;
+    if (writer.provider !== reader.provider || writer.driveFileId !== reader.driveFileId
+      || writer.namespaceIdentity !== reader.namespaceIdentity
+      || !["s3", "gdrive", "webdav"].includes(writer.provider)
+      || providers.has(writer.provider)
+      || targets.some((previous) => previous.publisher === item.cloudPublisher
+        || previous.verifier === item.cloudVerifier)) fail();
+    providers.add(writer.provider);
+    targets.push({ publisher: item.cloudPublisher, verifier: item.cloudVerifier,
+      configuredProvider: writer.provider, providerFileId: writer.driveFileId,
+      namespaceIdentity: writer.namespaceIdentity });
+  }
+  return targets;
 }
 
 class Zk1PgPhysicalInventoryBridge {
@@ -270,6 +299,13 @@ class Zk1PgPhysicalInventoryBridge {
     if (remote.status !== "EXTERNAL_CIPHERTEXT_REREAD_MATCHED"
       || remote.readbackMatched !== true
       || !same(remote.operationId, v.operation.operation_id)
+      || !same(remote.readbackSha256, v.operation.ciphertext_sha256)
+      || (remote.namespaceIdentity !== cloudVerifier.pinnedCopyTarget.namespaceIdentity)
+      || typeof remote.providerObjectKey !== "string"
+      || !remote.providerObjectKey.endsWith(`/uploads/${
+        zk1CloudCopyAddress({ scope: v.scope,
+          operationId: v.operation.operation_id }).folder}/${
+        v.operation.operation_id.toString("base64url")}.ct`)
       || remote.byteLength < 1 || remote.authorizesIo !== false
       || remote.externalProviderDurabilityProven !== false) fail();
     const after = await this.reconcile(fixedRequest);
@@ -278,6 +314,10 @@ class Zk1PgPhysicalInventoryBridge {
     return Object.freeze({ status: "PG_SIGNED_AND_CLOUD_BYTES_REREAD",
       operationId: Buffer.from(v.operation.operation_id),
       provider: remote.provider, providerFileId: remote.providerFileId,
+      providerObjectKey: remote.providerObjectKey,
+      namespaceIdentity: remote.namespaceIdentity,
+      ciphertextSha256: Buffer.from(remote.readbackSha256),
+      inventorySequence: before.sequence, inventoryRoot: Buffer.from(before.root),
       remoteReadbackMatched: true,
       localPgWalFlushConfirmed: true, authorizesIo: false,
       externalProviderDurabilityProven: false,
@@ -310,15 +350,25 @@ class Zk1PgPhysicalInventoryBridge {
     } catch (_) { fail(); }
     if (write?.status !== "CLOUD_COPY_PUT_ACK_NONAUTHORITATIVE"
       || write.authorizesIo !== false || write.providerDurabilityProven !== false
+      || !same(write.ciphertextSha256, v.operation.ciphertext_sha256)
       || !same(write.operationId, v.operation.operation_id)) fail();
     const remote = await this.reconcileCloudCopy({ physical: fixed,
       cloudVerifier, chunkLengths: detached.map((chunk) => chunk.length) });
     if (remote.provider !== write.provider
       || remote.providerFileId !== write.providerFileId
+      || remote.namespaceIdentity !== write.namespaceIdentity
+      || remote.providerObjectKey !== write.providerObjectKey
+      || !same(remote.ciphertextSha256, write.ciphertextSha256)
       || remote.authorizesIo !== false
       || !same(remote.operationId, v.operation.operation_id)) fail();
     return Object.freeze({ status: "PG_SIGNED_AND_EXTERNAL_COPY_REREAD",
       operationId: Buffer.from(v.operation.operation_id), provider: remote.provider,
+      providerFileId: remote.providerFileId,
+      providerObjectKey: remote.providerObjectKey,
+      namespaceIdentity: remote.namespaceIdentity,
+      ciphertextSha256: Buffer.from(remote.ciphertextSha256),
+      inventorySequence: remote.inventorySequence,
+      inventoryRoot: Buffer.from(remote.inventoryRoot),
       byteLength: write.byteLength, remoteReadbackMatched: true,
       authorizesIo: false, externalProviderDurabilityProven: false,
       independentRemoteIoFenceProven: false });
@@ -332,30 +382,7 @@ class Zk1PgPhysicalInventoryBridge {
     const v = this.#request(physical);
     const detached = detachedChunks(chunks, v.expectedChunkCount,
       v.operation.ciphertext_sha256, v.expectedRootHash);
-    if (!Array.isArray(copies) || copies.length < 2 || copies.length > 3
-      || Reflect.ownKeys(copies).length !== copies.length + 1) fail();
-    const targets = [];
-    const registeredProviders = new Set();
-    for (let index = 0; index < copies.length; index += 1) {
-      const descriptor = Object.getOwnPropertyDescriptor(copies, String(index));
-      if (!descriptor || !Object.hasOwn(descriptor, "value")) fail();
-      const item = exact(descriptor.value, ["cloudPublisher", "cloudVerifier"]);
-      if (!(item.cloudPublisher instanceof Zk1CloudCiphertextCopyPublisher)
-        || !(item.cloudVerifier instanceof Zk1CloudCiphertextReadbackVerifier)) fail();
-      if (Object.hasOwn(item.cloudPublisher, "pinnedCopyTarget")
-        || Object.hasOwn(item.cloudVerifier, "pinnedCopyTarget")) fail();
-      const pubTarget = item.cloudPublisher.pinnedCopyTarget;
-      const readTarget = item.cloudVerifier.pinnedCopyTarget;
-      if (pubTarget.provider !== readTarget.provider
-        || pubTarget.driveFileId !== readTarget.driveFileId
-        || !["s3", "gdrive", "webdav"].includes(pubTarget.provider)
-        || registeredProviders.has(pubTarget.provider)
-        || targets.some((t) => t.publisher === item.cloudPublisher
-          || t.verifier === item.cloudVerifier)) fail();
-      registeredProviders.add(pubTarget.provider);
-      targets.push({ publisher: item.cloudPublisher, verifier: item.cloudVerifier,
-        configuredProvider: pubTarget.provider });
-    }
+    const targets = cloudTargets(copies);
     const fixed = { scope: v.scope, operation: v.operation,
       digest: v.digest, expectedRootHash: v.expectedRootHash,
       expectedChunkCount: v.expectedChunkCount };
@@ -403,6 +430,105 @@ class Zk1PgPhysicalInventoryBridge {
       providers: Object.freeze([...providerSet]),
       providerCount: targets.length, authorizesIo: false,
       externalProviderDurabilityProven: false,
+      atomicCrossProviderCommitProven: false,
+      independentRemoteIoFenceProven: false });
+  }
+
+  // Restart / lost-ACK repair. Only an externally supplied owner inventory
+  // floor permits this mode. Existing matched copies are GET-verified and not
+  // overwritten; missing/failed copies are republished from the SAME locally
+  // sealed and signed operation. A transport error is indistinguishable from
+  // missing remote content, so a retry is never described as a remote commit.
+  // On partial failure callers may retry the identical request; the operation
+  // ID, exact cloud object names and pinned Drive ID remain unchanged.
+  async reconcileOrPublishAnchoredCloudCopies({ physical, chunks, copies } = {}) {
+    if (!this.#trustedInventoryFloor) fail();
+    const v = this.#request(physical);
+    const detached = detachedChunks(chunks, v.expectedChunkCount,
+      v.operation.ciphertext_sha256, v.expectedRootHash);
+    const targets = cloudTargets(copies);
+    if (targets.some((target) => target.namespaceIdentity === null)) fail();
+    const fixed = { scope: v.scope, operation: v.operation,
+      digest: v.digest, expectedRootHash: v.expectedRootHash,
+      expectedChunkCount: v.expectedChunkCount };
+    const sizes = detached.map((chunk) => chunk.length);
+    const length = sizes.reduce((total, value) => total + value, 0);
+    const signed = await this.reconcile(fixed);
+    if (signed.status !== "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY") fail();
+    const receipts = [];
+    for (const target of targets) {
+      let outcome;
+      let mode = "reused_verified_copy";
+      try {
+        outcome = await this.reconcileCloudCopy({ physical: fixed,
+          cloudVerifier: target.verifier, chunkLengths: sizes });
+      } catch (_) {
+        mode = "republished_and_verified";
+        // This revalidates physical PG, owner floor and signed operation
+        // immediately before touching the next remote provider.
+        try {
+          await this.publishAndReconcileCloudCopy({ physical: fixed,
+            chunks: detached, cloudPublisher: target.publisher,
+            cloudVerifier: target.verifier });
+          outcome = await this.reconcileCloudCopy({ physical: fixed,
+            cloudVerifier: target.verifier, chunkLengths: sizes });
+        } catch (_) { fail(); }
+      }
+      if (outcome.provider !== target.configuredProvider
+        || outcome.providerFileId !== target.providerFileId
+        || outcome.namespaceIdentity !== target.namespaceIdentity
+        || outcome.ownerPinnedFloorChecked !== true
+        || outcome.inventorySequence !== signed.sequence
+        || !same(outcome.inventoryRoot, signed.root)
+        || !same(outcome.operationId, v.operation.operation_id)
+        || !same(outcome.ciphertextSha256, v.operation.ciphertext_sha256)) fail();
+      receipts.push(Object.freeze({ provider: outcome.provider,
+        providerObjectKey: outcome.providerObjectKey,
+        namespaceIdentity: outcome.namespaceIdentity,
+        providerFileId: outcome.providerFileId,
+        ciphertextSha256: outcome.ciphertextSha256.toString("hex"),
+        byteLength: length, mode }));
+    }
+    // GET each provider again AFTER all retries: a late partial PUT or a
+    // malicious peer modifying the first copy cannot pass the final sweep.
+    for (let index = 0; index < targets.length; index += 1) {
+      const checked = await this.reconcileCloudCopy({ physical: fixed,
+        cloudVerifier: targets[index].verifier, chunkLengths: sizes });
+      if (checked.provider !== receipts[index].provider
+        || checked.providerObjectKey !== receipts[index].providerObjectKey
+        || checked.namespaceIdentity !== receipts[index].namespaceIdentity
+        || checked.providerFileId !== receipts[index].providerFileId
+        || checked.inventorySequence !== signed.sequence
+        || !same(checked.inventoryRoot, signed.root)
+        || !same(checked.ciphertextSha256, v.operation.ciphertext_sha256)
+        || checked.ownerPinnedFloorChecked !== true) fail();
+    }
+    const after = await this.reconcile(fixed);
+    if (after.status !== signed.status || after.sequence !== signed.sequence
+      || !same(after.root, signed.root)) fail();
+    // Canonical digest makes the collected nonauthorizing observation easy to
+    // compare across retries. ONLY the local inventory operation was Ed25519
+    // signed; this digest is not a remotely witnessed storage signature.
+    const basis = Object.freeze({
+      operationId: v.operation.operation_id.toString("base64url"),
+      inventorySequence: signed.sequence, inventoryRoot: signed.root.toString("hex"),
+      ciphertextSha256: v.operation.ciphertext_sha256.toString("hex"),
+      providers: receipts.map(({ provider, providerObjectKey, providerFileId,
+        namespaceIdentity, ciphertextSha256, byteLength }) => ({ provider,
+        providerObjectKey, providerFileId, namespaceIdentity,
+        ciphertextSha256, byteLength })),
+    });
+    const observationDigest = crypto.createHash("sha256")
+      .update("Root.ark/zk-1/multiprovider-observation/v1\0")
+      .update(JSON.stringify(basis)).digest("hex");
+    return Object.freeze({ status: "PG_SIGNED_AND_ANCHORED_CLOUD_COPIES_RECONCILED",
+      operationId: Buffer.from(v.operation.operation_id),
+      signedInventorySequence: signed.sequence,
+      signedInventoryRoot: Buffer.from(signed.root),
+      ciphertextSha256: Buffer.from(v.operation.ciphertext_sha256),
+      providerCount: receipts.length, providers: Object.freeze(receipts),
+      observationDigest, ownerPinnedFloorChecked: true,
+      authorizesIo: false, externalProviderDurabilityProven: false,
       atomicCrossProviderCommitProven: false,
       independentRemoteIoFenceProven: false });
   }
