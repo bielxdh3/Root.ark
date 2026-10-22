@@ -27,6 +27,23 @@ function keys(value, expected) {
   return value && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).sort().join("|") === [...expected].sort().join("|");
 }
+function snapshotFields(value, expected, exact = true) {
+  // Read each caller-controlled field exactly once via its own data descriptor.
+  // A getter/Proxy must never validate object A and then persist/move object B.
+  try {
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) refuse();
+    if (exact && (Reflect.ownKeys(value).length !== expected.length
+      || expected.some((name) => !Object.hasOwn(value, name)))) refuse();
+    const detached = Object.create(null);
+    for (const name of expected) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, name);
+      if (!descriptor || !Object.hasOwn(descriptor, "value")) refuse();
+      detached[name] = descriptor.value;
+    }
+    return detached;
+  } catch (_) { refuse(); }
+}
 function directory(dir) {
   try {
     const stat = fs.lstatSync(dir);
@@ -132,31 +149,38 @@ function parseJournal(file, allowedLinks = 1) {
   return data;
 }
 function normalizedPlan(input) {
-  if (!input || !keys(input.sourceProvenance, ["role", "provider", "identity"])
-    || !keys(input.targetProvenance, ["role", "provider", "identity"])
-    || input.sourceProvenance.role !== "source"
-    || input.sourceProvenance.provider !== "fixture-source"
-    || input.targetProvenance.role !== "target"
-    || input.targetProvenance.provider !== "fixture-target"
-    || !isId(input.sourceProvenance.identity) || !isId(input.targetProvenance.identity)
-    || input.sourceProvenance.identity === input.targetProvenance.identity
-    || !isId(input.objectId) || !isId(input.operationId) || !isDigest(input.sourceDigest)
-    || !keys(input.references, KINDS)) refuse();
+  const raw = snapshotFields(input, [
+    "sourceProvenance", "targetProvenance", "objectId", "operationId", "sourceDigest", "references",
+  ], false);
+  const source = snapshotFields(raw.sourceProvenance, ["role", "provider", "identity"]);
+  const target = snapshotFields(raw.targetProvenance, ["role", "provider", "identity"]);
+  const supplied = snapshotFields(raw.references, KINDS);
+  if (source.role !== "source" || source.provider !== "fixture-source"
+    || target.role !== "target" || target.provider !== "fixture-target"
+    || !isId(source.identity) || !isId(target.identity)
+    || source.identity === target.identity
+    || !isId(raw.objectId) || !isId(raw.operationId) || !isDigest(raw.sourceDigest)) refuse();
   const references = {};
   for (const kind of KINDS) {
-    const entries = input.references[kind];
-    if (!Array.isArray(entries) || !entries.length || entries.length > 32) refuse();
+    const entries = supplied[kind];
+    if (!Array.isArray(entries) || !entries.length || entries.length > 32
+      || Reflect.ownKeys(entries).length !== entries.length + 1) refuse();
     const ids = new Set();
-    references[kind] = entries.map((entry) => {
-      if (!keys(entry, ["id", "digest"]) || !isId(entry.id) || !isDigest(entry.digest)
-        || ids.has(entry.id)) refuse();
+    references[kind] = [];
+    for (let index = 0; index < entries.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(entries, String(index));
+      if (!descriptor || !Object.hasOwn(descriptor, "value")) refuse();
+      const entry = snapshotFields(descriptor.value, ["id", "digest"]);
+      if (!isId(entry.id) || !isDigest(entry.digest) || ids.has(entry.id)) refuse();
       ids.add(entry.id);
-      return { id: entry.id, digest: entry.digest };
-    });
+      references[kind].push({ id: entry.id, digest: entry.digest });
+    }
   }
   return {
-    operationId: input.operationId, objectId: input.objectId, sourceDigest: input.sourceDigest,
-    sourceProvenance: { ...input.sourceProvenance }, targetProvenance: { ...input.targetProvenance }, references,
+    operationId: raw.operationId, objectId: raw.objectId, sourceDigest: raw.sourceDigest,
+    sourceProvenance: { role: source.role, provider: source.provider, identity: source.identity },
+    targetProvenance: { role: target.role, provider: target.provider, identity: target.identity },
+    references,
   };
 }
 function paths(root, plan) {

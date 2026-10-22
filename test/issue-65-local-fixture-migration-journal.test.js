@@ -164,6 +164,50 @@ test("replay with changed scope, provenance or digest fails closed and preserves
   assert.deepEqual(fs.readFileSync(f.target), bytes);
 });
 
+test("changing object ID through a getter cannot redirect an already validated migration", (t) => {
+  const f = fixture(t);
+  const secondSource = path.join(f.dir, "source", "foreignobject.ct");
+  const secondTarget = path.join(f.dir, "target", "foreignobject.ct");
+  fs.writeFileSync(secondSource, bytes);
+  let reads = 0;
+  const hostile = { ...f.plan };
+  Object.defineProperty(hostile, "objectId", {
+    enumerable: true,
+    get() { return ++reads === 1 ? "object1" : "foreignobject"; },
+  });
+  assert.throws(() => runLocalFixtureCiphertextMigration(hostile),
+    /LOCAL_FIXTURE_MIGRATION_REFUSED/,
+    "validated object1 must not be retargeted to a second source and destination");
+  assert.equal(fs.existsSync(secondTarget), false);
+  assert.equal(fs.existsSync(f.target), false);
+  assert.equal(fs.existsSync(f.journal), false);
+  assert.deepEqual(fs.readFileSync(secondSource), bytes);
+});
+
+test("accessor-based provenance and reference digest cannot change after validation", (t) => {
+  const f = fixture(t);
+  const sourceProvenance = { ...f.plan.sourceProvenance };
+  Object.defineProperty(sourceProvenance, "identity", {
+    enumerable: true,
+    get() { return "target-1"; },
+  });
+  assert.throws(() => runLocalFixtureCiphertextMigration({ ...f.plan, sourceProvenance }),
+    /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+
+  const reference = { ...f.plan.references.versions[0] };
+  const referenceDigest = reference.digest;
+  let digestReads = 0;
+  Object.defineProperty(reference, "digest", {
+    enumerable: true,
+    get() { return ++digestReads === 1 ? referenceDigest : "0".repeat(64); },
+  });
+  const references = { ...f.plan.references, versions: [reference] };
+  assert.throws(() => runLocalFixtureCiphertextMigration({ ...f.plan, references }),
+    /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.equal(fs.existsSync(f.target), false);
+  assert.equal(fs.existsSync(f.journal), false);
+});
+
 test("rejects traversal, symlinks, hardlinks, reused target and non-disposable paths", (t) => {
   const f = fixture(t);
   for (const objectId of ["../object1", "..", "bad/name", "bad\\name", ".stage"])
