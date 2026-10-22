@@ -9,9 +9,12 @@
   const dependencyNames = [
     "rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-root",
     "rootark-zk1-ciphertext-download-integrity", "rootark-zk1-owner-signed-checkpoint",
+    "rootark-zk1-owner-ciphertext-root-checkpoint",
     "rootark-zk1-protected-http-client", "rootark-zk1-uncertain-put-reconciliation",
     "rootark-zk1-normal-browser-trust-floor", "rootark-zk1-normal-browser-content",
     "rootark-zk1-owner-inventory-trust-head",
+    "rootark-zk1-portable-file-recovery", "rootark-zk1-browser-recovery-http",
+    "rootark-zk1-recoverable-workspace",
   ];
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const base64 = /^[A-Za-z0-9_-]{43}$/;
@@ -125,6 +128,28 @@
     for (const byte of bytes) value += String.fromCharCode(byte);
     return btoa(value).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
   }
+  function to64(data) {
+    let text = "";
+    for (const item of data) text += String.fromCharCode(item);
+    return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+  function downloadLocal(name, content, type = "application/octet-stream") {
+    const blob = new Blob([content], { type });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = name;
+    document.body.append(link);
+    try { link.click(); } finally {
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }
+  }
+  async function optionalJson(name, maximum = 8192) {
+    const files = field(name)?.files;
+    if (!files || files.length > 1) fail();
+    return files.length ? JSON.parse(decoder.decode(await fileBytes(name, 1, maximum))) : null;
+  }
   function sessionFetch(url, options) {
     // Existing protected HTTP signing uses fetch directly; the real Root.ark
     // session requires the same CSRF double-submit header as RootarkApi.
@@ -150,7 +175,8 @@
     if (!loadingScripts) loadingScripts = (async () => {
       for (const name of dependencyNames) await loadScript(name);
       if (!window.RootarkZk1NormalBrowserContent?.uploadAndVerify
-        || !window.RootarkZk1NormalBrowserTrustFloor?.provisionOffline) fail();
+        || !window.RootarkZk1NormalBrowserTrustFloor?.provisionOffline
+        || !window.RootarkZk1RecoverableWorkspace?.restoreOnNewDevice) fail();
     })();
     return loadingScripts;
   }
@@ -179,9 +205,19 @@
       + '<label>Chave pública do dispositivo (Ed25519 raw)<input type="file" data-zk1-field="device" required></label>'
       + '<label>Chave privada do dispositivo (PKCS#8, local)<input type="file" data-zk1-field="private" required></label>'
       + '<label>Arquivo descartável (até 2 MiB)<input type="file" data-zk1-field="file" required></label>'
+      + '<label>Segredo de recuperação separado (arquivo binário de 32 bytes)<input type="file" data-zk1-field="secret"></label>'
+      + '<label>Pacote cifrado exportado (.json, sem segredo)<input type="file" data-zk1-field="bundle" accept=".json,application/json"></label>'
+      + '<label>Raiz histórica SHA-256 confirmada independentemente pelo proprietário<input type="text" data-zk1-field="root" maxlength="43" spellcheck="false"></label>'
+      + '<label>Checkpoint de root Ed25519 assinado pelo proprietário (.json)<input type="file" data-zk1-field="owner-root" accept=".json,application/json"></label>'
+      + '<label>Identidade do proprietário no checkpoint (device_id)<input type="text" data-zk1-field="owner-device" maxlength="64" spellcheck="false"></label>'
+      + '<label>signer_key_id do proprietário (base64url, 16 bytes)<input type="text" data-zk1-field="owner-signer" maxlength="22" spellcheck="false"></label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="provision">Provisionar piso offline</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="verify-inventory">Verificar checkpoint owner-signed</button>'
-      + '<button type="button" class="button button-primary" data-zk1-action="upload">Cifrar, enviar e conferir GET</button></div>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="new-secret">Gerar segredo de 256 bits</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="new-device">Solicitar novo dispositivo ao proprietário</button>'
+      + '<button type="button" class="button button-primary" data-zk1-action="upload">Cifrar, enviar e conferir GET</button>'
+      + '<button type="button" class="button button-primary" data-zk1-action="upload-recoverable">Enviar e exportar pacote recuperável</button>'
+      + '<button type="button" class="button button-primary" data-zk1-action="restore">Recuperar arquivo do novo dispositivo</button></div>'
       + '</form><p class="muted" data-zk1-field="status" role="status" aria-live="polite">Nenhuma autoridade foi importada.</p>';
     document.body.append(dialog);
     dialog.addEventListener("cancel", (event) => { if (busy) event.preventDefault(); });
@@ -199,12 +235,14 @@
       status("Nenhuma autoridade foi importada.");
       return;
     }
-    if (action !== "provision" && action !== "upload" && action !== "verify-inventory") return;
+    if (!["provision", "verify-inventory", "upload", "upload-recoverable",
+      "restore", "new-secret", "new-device"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
     let privateDer;
     let data;
+    let secret;
     try {
       await ensureScripts();
       // Capability is checked again before every user-initiated operation.
@@ -229,6 +267,36 @@
           + ". A assinatura CBOR e a durabilidade externa exigem validação independente.");
         return;
       }
+      if (action === "new-secret") {
+        secret = window.RootarkZk1PortableFileRecovery.generateRecoverySecret();
+        downloadLocal("rootark-holder-secret-256bit.bin", secret);
+        status("Segredo de 32 bytes exportado SOMENTE neste dispositivo. Guarde fora do servidor e separado do pacote cifrado.");
+        return;
+      }
+      if (action === "new-device") {
+        const pair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+        const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+        privateDer = new Uint8Array(await crypto.subtle.exportKey("pkcs8", pair.privateKey));
+        // The recovery V2 device enrollment also requires a distinct HPKE
+        // X25519 identity and offline target proof-of-possession. A plain
+        // Ed25519 public key is not enough to enroll a real device.
+        const hpke = await crypto.subtle.generateKey("X25519", true, ["deriveBits"]);
+        const hpkeRaw = new Uint8Array(await crypto.subtle.exportKey("raw", hpke.publicKey));
+        const hpkePrivate = new Uint8Array(await crypto.subtle.exportKey("pkcs8", hpke.privateKey));
+        const request = { schema: "rootark-zk1-device-enrollment-request/v1",
+          device_id: randomId(), authorization_key_id: randomId(), hpke_key_id: randomId(),
+          authorization_public_key: to64(raw), challenge: to64(crypto.getRandomValues(new Uint8Array(32))),
+          hpke_public_key: to64(hpkeRaw),
+          approval: "OWNER_MUST_VERIFY_IDENTITY_AND_FINISH_V2_POP_AND_SIGN_CURRENT_GRANT" };
+        try {
+          downloadLocal("rootark-new-device-auth-private.pk8", privateDer);
+          downloadLocal("rootark-new-device-hpke-private.pk8", hpkePrivate);
+        } finally { hpkePrivate.fill(0); hpkeRaw.fill(0); }
+        downloadLocal("rootark-owner-enrollment-request.json", JSON.stringify(request), "application/json");
+        raw.fill(0);
+        status("Chaves Ed25519 e X25519 exportadas localmente. Solicitação NÃO é um grant: proprietário deve confirmar identidade, completar PoP V2, assinar a transição e conceder grant atual fora do servidor.");
+        return;
+      }
       const trust = await grantAndOwner();
       if (action === "provision") {
         const result = await window.RootarkZk1NormalBrowserTrustFloor.provisionOffline({
@@ -247,35 +315,65 @@
         deviceRaw.fill(0);
         privateDer = await fileBytes("private", 1, 8192);
         const devicePrivateKey = await crypto.subtle.importKey("pkcs8", privateDer, "Ed25519", false, ["sign"]);
-        const selected = field("file").files[0];
-        if (!selected || selected.size < 1 || selected.size > 2 * 1024 * 1024
-          || selected.name.length > 255) fail();
-        data = await fileBytes("file", 1, 2 * 1024 * 1024);
-        const scope = trust.signedDeviceGrant;
-        const result = await window.RootarkZk1NormalBrowserContent.uploadAndVerify({
-          ...trust, devicePublicKey, devicePrivateKey,
-          metadata: {
-            account_id: scope.account_id, compartment_id: scope.compartment_id,
-            keyring_id: scope.keyring_id, object_id: randomId(),
-            version_id: randomId(), parent_version_id: null,
-            epoch: trust.pinnedCurrentHead.epoch, kind: "file",
-          },
-          fileName: selected.name, mediaType: selected.type || "", data,
+        const common = { ...trust, devicePublicKey, devicePrivateKey,
           origin: location.origin + "/", fetchImpl: sessionFetch,
-          nowSeconds: Math.floor(Date.now() / 1000),
-        });
-        status("PUT/GET protegidos verificados: " + result.objectId
-          + " · root " + result.ciphertextRoot
-          + (result.lostPutAckReconciled ? " · ACK perdido reconciliado" : "")
-          + ". CEK efêmera: este arquivo não é recuperável após fechar a sessão.");
+          nowSeconds: Math.floor(Date.now() / 1000) };
+        if (action === "restore") {
+          secret = await fileBytes("secret", 32, 32);
+          const bundle = JSON.parse(decoder.decode(await fileBytes("bundle", 1, 6 * 1024 * 1024)));
+          const checkpoint = await optionalJson("owner-root");
+          if (!checkpoint || !trust.ownerHistoryCheckpoint) fail();
+          const restored = await window.RootarkZk1RecoverableWorkspace.restoreOnNewDevice({
+            ...common, recoverySecret: secret, bundle,
+            expectedMetadata: bundle.metadata,
+            independentlyPinnedCiphertextRoot: from64(field("root").value.trim()),
+            ownerSignerKeyId: field("owner-signer").value.trim(),
+            ownerDeviceId: field("owner-device").value.trim(),
+            ownerRootCheckpoint: checkpoint,
+            previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
+          });
+          try {
+            downloadLocal(restored.name, restored.data, restored.mediaType || "application/octet-stream");
+            status("Arquivo histórico recuperado após novo grant + prova Ed25519 do proprietário + GET protegido. Nenhuma CEK/plaintext enviada ao servidor.");
+          } finally { restored.data.fill(0); }
+        } else {
+          const selected = field("file").files[0];
+          if (!selected || selected.size < 1 || selected.size > 2 * 1024 * 1024
+            || selected.name.length > 255) fail();
+          data = await fileBytes("file", 1, 2 * 1024 * 1024);
+          const scope = trust.signedDeviceGrant;
+          const metadata = { account_id: scope.account_id, compartment_id: scope.compartment_id,
+            keyring_id: scope.keyring_id, object_id: randomId(), version_id: randomId(),
+            parent_version_id: null, epoch: trust.pinnedCurrentHead.epoch, kind: "file" };
+          if (action === "upload-recoverable") {
+            secret = await fileBytes("secret", 32, 32);
+            const result = await window.RootarkZk1RecoverableWorkspace.createRecoverableProtectedFile({
+              ...common, recoverySecret: secret, metadata,
+              name: selected.name, mediaType: selected.type || "", data,
+            });
+            downloadLocal("rootark-recovery-" + result.objectId + ".json",
+              JSON.stringify(result.bundle), "application/json");
+            status("Pacote recuperável exportado após PUT/GET. Guarde-o fora do servidor e solicite ao proprietário checkpoint histórico assinado para o root "
+              + result.ciphertextRoot + ". O segredo de 32 bytes deve permanecer separado.");
+          } else {
+            const result = await window.RootarkZk1NormalBrowserContent.uploadAndVerify({
+              ...common, metadata, fileName: selected.name, mediaType: selected.type || "", data,
+            });
+            status("PUT/GET protegidos verificados: " + result.objectId
+              + " · root " + result.ciphertextRoot
+              + (result.lostPutAckReconciled ? " · ACK perdido reconciliado" : "")
+              + ". CEK efêmera: este arquivo não é recuperável após fechar a sessão.");
+          }
+        }
       }
     } catch (_) {
       status("Operação recusada: autoridade, permissão, sessão ou ciphertext não verificado.");
     } finally {
       privateDer?.fill(0);
       data?.fill(0);
+      secret?.fill(0);
       // The original File/Blob remains held by the input until explicitly reset.
-      for (const name of ["private", "file"]) {
+      for (const name of ["private", "file", "secret", "bundle"]) {
         const control = field(name);
         if (control) control.value = "";
       }

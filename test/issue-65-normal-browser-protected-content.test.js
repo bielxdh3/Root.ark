@@ -17,6 +17,7 @@ const fixtures = require("./support/issue-65-recovery-v2-fixtures");
 const normal = require("../public/client/rootark-zk1-normal-browser-content");
 const portable = require("../public/client/rootark-zk1-portable-file-recovery");
 const browserRestore = require("../public/client/rootark-zk1-browser-recovery-http");
+const recoverableWorkspace = require("../public/client/rootark-zk1-recoverable-workspace");
 const protectedHttp = require("../public/client/rootark-zk1-protected-http-client");
 const ownerHistory = require("../public/client/rootark-zk1-owner-signed-checkpoint");
 const ownerRoots = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
@@ -37,7 +38,7 @@ const scriptNames = ["rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-r
   "rootark-zk1-owner-ciphertext-root-checkpoint", "rootark-zk1-protected-http-client",
   "rootark-zk1-uncertain-put-reconciliation", "rootark-zk1-normal-browser-trust-floor",
   "rootark-zk1-normal-browser-content", "rootark-zk1-portable-file-recovery",
-  "rootark-zk1-browser-recovery-http",
+  "rootark-zk1-browser-recovery-http", "rootark-zk1-recoverable-workspace",
   "rootark-zk1-normal-browser-lab-ui", "rootark-zk1-portable-recovery-lab-ui"];
 
 test("production static paths cannot disclose the opt-in normal browser laboratory", async (t) => {
@@ -197,6 +198,154 @@ test("normal browser uploads ciphertext and confirms real localhost HTTP protect
     .get(args.metadata.object_id).ciphertext;
   assert.ok(!stored.includes(args.data));
   assert.ok(!stored.toString().includes(args.fileName));
+});
+
+test("recoverable normal workspace: independent newly enrolled device, owner-approved historical root, replay and epoch fencing", async (t) => {
+  const f = await setup(t);
+  const first = await f.options();
+  const offlineSecret = crypto.randomBytes(32);
+  const spki = crypto.createHash("sha256").update(Buffer.from(
+    await crypto.webcrypto.subtle.exportKey("spki", first.ownerPublicKey))).digest();
+  let wire = "";
+  const firstFetch = async (url, req) => {
+    wire += String(req.body || "");
+    return first.fetchImpl(url, req);
+  };
+  const built = await recoverableWorkspace.createRecoverableProtectedFile({
+    ownerPublicKey: first.ownerPublicKey,
+    pinnedOwnerKeyHash: first.pinnedOwnerKeyHash,
+    independentOwnerSpkiSha256: spki,
+    pinnedCurrentHead: first.pinnedCurrentHead,
+    signedDeviceGrant: first.signedDeviceGrant,
+    ownerHistoryCheckpoint: null,
+    devicePublicKey: first.devicePublicKey,
+    devicePrivateKey: first.devicePrivateKey,
+    origin: first.origin, fetchImpl: firstFetch, nowSeconds: first.nowSeconds,
+    recoverySecret: offlineSecret, metadata: first.metadata,
+    name: first.fileName, mediaType: first.mediaType, data: first.data,
+  });
+  assert.equal(built.clientReadbackVerified, true);
+  assert.equal(built.externalOwnerRootApprovalRequiredForRestore, true);
+  assert.equal(f.putCount, 1);
+  assert.equal(wire.includes(first.fileName), false);
+  assert.equal(wire.includes(new TextDecoder().decode(first.data)), false);
+  assert.equal(wire.includes(offlineSecret.toString("base64url")), false);
+  assert.equal(wire.includes(built.bundle.wrap.sealedCek), false);
+  const archived = f.store.db.prepare("SELECT ciphertext FROM zk_content_object WHERE id=?")
+    .get(first.metadata.object_id).ciphertext;
+  assert.equal(archived.includes(first.data), false);
+
+  // A truly DIFFERENT Ed25519 pair is enrolled in a new signed V2 manifest,
+  // rather than copying the old device's private key to the fresh client.
+  const head = await fixtures.appendDeviceEnrollment(f.state, 3);
+  f.setHead(head);
+  const newDevice = head.devices.find((d) => d.device_id === "trusted-3");
+  assert.ok(newDevice);
+  const newSigner = f.state.actors.get(Buffer.from(newDevice.authorization_key_id).toString("hex"));
+  const subtle = crypto.webcrypto.subtle;
+  const newPrivate = await subtle.importKey("pkcs8",
+    newSigner.export({ format: "der", type: "pkcs8" }), "Ed25519", false, ["sign"]);
+  const newPublic = await subtle.importKey("raw", newDevice.authorization_public_key,
+    "Ed25519", true, ["verify"]);
+  assert.notDeepEqual(Buffer.from(newDevice.authorization_public_key),
+    Buffer.from(await subtle.exportKey("raw", first.devicePublicKey)));
+  const grantFor = async () => {
+    const currentHead = await f.currentHead();
+    const body = { schema: "rootark-zk1-browser-owner-device-grant/v1",
+      account_id: first.metadata.account_id,
+      compartment_id: first.metadata.compartment_id,
+      keyring_id: first.metadata.keyring_id,
+      device_id: newDevice.device_id,
+      authorization_key_id: b64(newDevice.authorization_key_id),
+      authorization_public_key: b64(newDevice.authorization_public_key),
+      manifest_revision: currentHead.revision,
+      manifest_digest: b64(currentHead.digest),
+      current_epoch: currentHead.epoch,
+      enrolled_epoch: newDevice.enrolled_epoch, revoked_at_epoch: null,
+    };
+    const canonical = Object.fromEntries(grantFields.map((name) => [name, body[name]]));
+    return { ...canonical, signature: b64(crypto.sign(null,
+      Buffer.concat([grantDomain, Buffer.from(JSON.stringify(canonical))]), f.ownerPrivate)) };
+  };
+  const ownerPrivate = await subtle.importKey("pkcs8",
+    f.ownerPrivate.export({ format: "der", type: "pkcs8" }), "Ed25519", false, ["sign"]);
+  const ownerSignerKeyId = crypto.randomBytes(16);
+  const ownerDeviceId = "offline-owner-root";
+  const root = Buffer.from(built.bundle.ciphertextRoot, "base64url");
+  const ownerProofs = async () => {
+    const current = await f.currentHead();
+    const scope = Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+      .map((name) => [name, first.metadata[name]]));
+    const ownerHistoryCheckpoint = await ownerHistory.signOwnerCheckpoint({
+      scope, signerKey: ownerPrivate, signerPublicKey: first.ownerPublicKey,
+      signerKeyId: ownerSignerKeyId, deviceId: ownerDeviceId,
+      revision: current.revision, manifestDigest: current.digest,
+      issuedAt: first.nowSeconds, previous: null,
+    });
+    const ownerRootCheckpoint = await ownerRoots.signOwnerCiphertextRootCheckpoint({
+      scope, signerKey: ownerPrivate, signerKeyId: ownerSignerKeyId,
+      deviceId: ownerDeviceId,
+      manifestRevision: current.revision, manifestDigest: current.digest,
+      manifestEpoch: current.epoch,
+      objectId: first.metadata.object_id, objectRevision: 1,
+      ciphertextEpoch: first.metadata.epoch, ciphertextRoot: root,
+      issuedAt: first.nowSeconds,
+    });
+    return { current, ownerHistoryCheckpoint, ownerRootCheckpoint };
+  };
+  let proof = await ownerProofs();
+  const recoverInput = async () => ({
+    ownerPublicKey: first.ownerPublicKey,
+    pinnedOwnerKeyHash: first.pinnedOwnerKeyHash,
+    independentOwnerSpkiSha256: spki,
+    pinnedCurrentHead: proof.current, signedDeviceGrant: await grantFor(),
+    ownerHistoryCheckpoint: proof.ownerHistoryCheckpoint,
+    devicePublicKey: newPublic, devicePrivateKey: newPrivate,
+    origin: first.origin, fetchImpl: first.fetchImpl, nowSeconds: first.nowSeconds,
+    recoverySecret: offlineSecret, bundle: built.bundle,
+    expectedMetadata: first.metadata, independentlyPinnedCiphertextRoot: root,
+    ownerSignerKeyId: b64(ownerSignerKeyId), ownerDeviceId,
+    ownerRootCheckpoint: proof.ownerRootCheckpoint, previousOwnerHistoryProof: null,
+  });
+  const reopened = await recoverableWorkspace.restoreOnNewDevice(await recoverInput());
+  assert.deepEqual(Buffer.from(reopened.data), first.data);
+  assert.equal(reopened.ownerSignedHistoricalRootVerified, true);
+  reopened.data.fill(0);
+  assert.equal(f.putCount, 1, "second device only performs signed GET");
+
+  let hostileNetwork = 0;
+  const rejectsOffline = async (change) => assert.rejects(
+    recoverableWorkspace.restoreOnNewDevice({ ...await recoverInput(), ...change,
+      fetchImpl: (...args) => { hostileNetwork++; return first.fetchImpl(...args); },
+    }), /ZK_RECOVERABLE_WORKSPACE_DENIED/);
+  await rejectsOffline({ pinnedOwnerKeyHash: crypto.randomBytes(32) });
+  await rejectsOffline({ independentOwnerSpkiSha256: crypto.randomBytes(32) });
+  await rejectsOffline({ ownerRootCheckpoint: { ...proof.ownerRootCheckpoint,
+    signature: b64(crypto.randomBytes(64)) } });
+  await rejectsOffline({ ownerRootCheckpoint: { ...proof.ownerRootCheckpoint,
+    ciphertext_root: b64(crypto.randomBytes(32)) } });
+  await rejectsOffline({ signedDeviceGrant: first.signedDeviceGrant });
+  await rejectsOffline({ pinnedCurrentHead: first.pinnedCurrentHead });
+  assert.equal(hostileNetwork, 0, "forged owner and replayed head/grant blocked before HTTP");
+  await assert.rejects(recoverableWorkspace.restoreOnNewDevice({
+    ...await recoverInput(), recoverySecret: crypto.randomBytes(32),
+  }), /ZK_RECOVERABLE_WORKSPACE_DENIED/);
+
+  // A later epoch rotation, while the fresh device remains active, continues
+  // to permit the old ciphertext epoch through a fresh owner-root signature.
+  const other = f.state.headManifest.devices.find((d) =>
+    d.device_id !== newDevice.device_id && d.device_id !== f.device.device_id);
+  const rotated = await fixtures.appendDeviceRevocation(f.state, other.device_id);
+  f.setHead(rotated);
+  proof = await ownerProofs();
+  const afterRotation = await recoverableWorkspace.restoreOnNewDevice(await recoverInput());
+  assert.deepEqual(Buffer.from(afterRotation.data), first.data);
+  afterRotation.data.fill(0);
+  const revoked = await fixtures.appendDeviceRevocation(f.state, newDevice.device_id);
+  f.setHead(revoked);
+  await assert.rejects(recoverableWorkspace.restoreOnNewDevice(await recoverInput()),
+    /ZK_RECOVERABLE_WORKSPACE_DENIED/);
+  offlineSecret.fill(0);
 });
 
 test("normal workspace capability and protected PUT/GET enforce real cookie session, CSRF, permissions, owner scope and revocation", async (t) => {
@@ -841,7 +990,10 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
         document.querySelector('[data-zk1-action="upload"]').click();
         await wait(()=>field("status").textContent.includes("PUT/GET protegidos verificados")
           || field("status").textContent.includes("Operação recusada"));
-        if(!field("status").textContent.includes("PUT/GET protegidos verificados"))throw Error("OP_DENIED");
+	        if(!field("status").textContent.includes("PUT/GET protegidos verificados"))
+	          throw Error("OP_DENIED:"+field("status").textContent+":REC="
+	            +typeof window.RootarkZk1RecoverableWorkspace+":HTTP="
+	            +typeof window.RootarkZk1BrowserRecoveryHttp);
         if(field("private").files.length || field("file").files.length)throw Error("KEY_RETAINED");
         field("digest").value=values.head.digest;
         setFile("history",new TextEncoder().encode(JSON.stringify([
@@ -851,6 +1003,24 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
         document.querySelector('[data-zk1-action="provision"]').click();
         await wait(()=>field("status").textContent.includes("Operação recusada"));
         setFile("history",new TextEncoder().encode(JSON.stringify(values.ownerHistoryChain)));
+	        let locallyExported=0;
+	        const originalClick=HTMLAnchorElement.prototype.click;
+	        HTMLAnchorElement.prototype.click=function(){
+	          if(!this.download || !this.href.startsWith("blob:"))throw Error("UNSAFE_DOWNLOAD");
+	          locallyExported++;};
+	        const holder=crypto.getRandomValues(new Uint8Array(32));
+	        setFile("private",decode(values.privateDer));
+	        setFile("file",new TextEncoder().encode("Recoverable authenticated Edge file"));
+	        setFile("secret",holder);
+	        document.querySelector('[data-zk1-action="upload-recoverable"]').click();
+	        await wait(()=>field("status").textContent.includes("Pacote recuperável exportado")
+	          || field("status").textContent.includes("Operação recusada"));
+	        HTMLAnchorElement.prototype.click=originalClick;
+	        if(!field("status").textContent.includes("Pacote recuperável exportado")
+	          || locallyExported!==1 || field("secret").files.length
+	          || field("private").files.length || field("file").files.length)
+	          throw Error("RECOVERABLE_WORKSPACE_FAILED:"+field("status").textContent);
+	        holder.fill(0);
         field("digest").value=values.ownerHash;
         setFile("private",decode(values.privateDer));
         setFile("file",new TextEncoder().encode("Tampered browser pinned head"));
@@ -924,8 +1094,8 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
       return typeof value === "string" && value.startsWith("EDGE_AUTH_WORKSPACE_") ? value : null;
     });
     assert.equal(observed, "EDGE_AUTH_WORKSPACE_PASS");
-    assert.equal(protectedPuts, 1, "forged external head must fail before PUT");
-    assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 1);
+    assert.equal(protectedPuts, 2, "one ordinary and one recoverable PUT; forged head blocked");
+    assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 2);
   } finally {
     socket?.close();
     if (edge?.pid) {
