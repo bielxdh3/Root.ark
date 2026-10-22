@@ -254,10 +254,17 @@ class Zk1SharedPgGateAuthority {
       if (existing) {
         if (!matchAdmission(existing, io, Boolean(head.require_stop_proof))
           || existing.state === "FINISHED") deny();
+        const sameGeneration = Number(head.generation) === Number(existing.generation);
+        // Replaying a previously admitted GET is itself a fresh egress
+        // decision. A replaced head must never resurrect an old worker merely
+        // because the generation was accidentally left unchanged. Preserve
+        // non-proceed replay of stale generations for lost-ACK reconciliation.
+        if (head.phase === "OPEN" && sameGeneration
+          && (Number(head.revision) !== io.revision || !head.digest.equals(io.digest))) deny();
         return { admissionId: Buffer.from(existing.id),
           generation: Number(existing.generation),
           proceed: head.phase === "OPEN" && existing.state === "ACTIVE"
-            && Number(head.generation) === Number(existing.generation) };
+            && sameGeneration };
       }
       if (head.phase !== "OPEN" || Number(head.revision) !== io.revision
         || !head.digest.equals(io.digest)) deny();
