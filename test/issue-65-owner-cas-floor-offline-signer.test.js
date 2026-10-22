@@ -12,10 +12,14 @@ const checkpoint = require("../src/crypto/rootark-zk1-owner-cas-floor-checkpoint
 const SCRIPT = path.resolve(__dirname, "../scripts/zk1-owner-cas-floor-sign-offline.js");
 const { run: runSigner } = require(SCRIPT);
 const now = () => Math.floor(Date.now() / 1000);
+// Windows hosted runners may expose TEMP through a junction/alias. The signer
+// deliberately rejects such ancestors, so fixtures must start at the resolved
+// physical directory; the adversarial tests still introduce their own swaps.
+const fixtureTempRoot = fs.realpathSync.native(os.tmpdir());
 
 test("owner offline signer enforces independent inputs, signer separation, custody and exclusive output", (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-owner-sign-offline-"));
-  const foreign = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-owner-sign-foreign-"));
+  const dir = fs.mkdtempSync(path.join(fixtureTempRoot, "rootark-owner-sign-offline-"));
+  const foreign = fs.mkdtempSync(path.join(fixtureTempRoot, "rootark-owner-sign-foreign-"));
   t.after(() => {
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     fs.rmSync(foreign, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -178,8 +182,8 @@ test("offline signer does not write through an output-parent junction swapped at
 });
 
 function nestedFixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-owner-swap-owned-"));
-  const foreign = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-owner-swap-foreign-"));
+  const root = fs.mkdtempSync(path.join(fixtureTempRoot, "rootark-owner-swap-owned-"));
+  const foreign = fs.mkdtempSync(path.join(fixtureTempRoot, "rootark-owner-swap-foreign-"));
   const nested = path.join(root, "keys");
   const saved = path.join(root, "keys-original");
   fs.mkdirSync(nested);
