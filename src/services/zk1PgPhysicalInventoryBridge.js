@@ -321,7 +321,9 @@ class Zk1PgPhysicalInventoryBridge {
       remoteReadbackMatched: true,
       localPgWalFlushConfirmed: true, authorizesIo: false,
       externalProviderDurabilityProven: false,
-      ownerPinnedFloorChecked: Boolean(this.#trustedInventoryFloor),
+      // A caller-supplied floor is verified for chain consistency here, NOT
+      // for independent owner custody. This must not become an owner pin.
+      callerSuppliedFloorConsistencyVerified: Boolean(this.#trustedInventoryFloor),
       independentlyAnchoredFloorProven: false });
   }
   // Reconcile an already committed, physically immutable local ciphertext
@@ -477,7 +479,7 @@ class Zk1PgPhysicalInventoryBridge {
       if (outcome.provider !== target.configuredProvider
         || outcome.providerFileId !== target.providerFileId
         || outcome.namespaceIdentity !== target.namespaceIdentity
-        || outcome.ownerPinnedFloorChecked !== true
+        || outcome.callerSuppliedFloorConsistencyVerified !== true
         || outcome.inventorySequence !== signed.sequence
         || !same(outcome.inventoryRoot, signed.root)
         || !same(outcome.operationId, v.operation.operation_id)
@@ -501,7 +503,7 @@ class Zk1PgPhysicalInventoryBridge {
         || checked.inventorySequence !== signed.sequence
         || !same(checked.inventoryRoot, signed.root)
         || !same(checked.ciphertextSha256, v.operation.ciphertext_sha256)
-        || checked.ownerPinnedFloorChecked !== true) fail();
+        || checked.callerSuppliedFloorConsistencyVerified !== true) fail();
     }
     const after = await this.reconcile(fixed);
     if (after.status !== signed.status || after.sequence !== signed.sequence
@@ -521,13 +523,15 @@ class Zk1PgPhysicalInventoryBridge {
     const observationDigest = crypto.createHash("sha256")
       .update("Root.ark/zk-1/multiprovider-observation/v1\0")
       .update(JSON.stringify(basis)).digest("hex");
-    return Object.freeze({ status: "PG_SIGNED_AND_ANCHORED_CLOUD_COPIES_RECONCILED",
+    return Object.freeze({ status: "PG_SIGNED_AND_CALLER_FLOOR_CLOUD_COPIES_REREAD",
       operationId: Buffer.from(v.operation.operation_id),
       signedInventorySequence: signed.sequence,
       signedInventoryRoot: Buffer.from(signed.root),
       ciphertextSha256: Buffer.from(v.operation.ciphertext_sha256),
       providerCount: receipts.length, providers: Object.freeze(receipts),
-      observationDigest, ownerPinnedFloorChecked: true,
+      observationDigest, callerSuppliedFloorConsistencyVerified: true,
+      independentlyAnchoredFloorProven: false,
+      externalOwnerCustodyVerified: false,
       authorizesIo: false, externalProviderDurabilityProven: false,
       atomicCrossProviderCommitProven: false,
       independentRemoteIoFenceProven: false });

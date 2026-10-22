@@ -189,7 +189,7 @@ test("anchored signed operation reconciles lost ACK, partial three-provider copy
     "partition retry does not needlessly rewrite independently verified copies");
   webdavPartitioned = false;
   const replayed = await makeBridge().reconcileOrPublishAnchoredCloudCopies(input);
-  assert.equal(replayed.status, "PG_SIGNED_AND_ANCHORED_CLOUD_COPIES_RECONCILED");
+  assert.equal(replayed.status, "PG_SIGNED_AND_CALLER_FLOOR_CLOUD_COPIES_REREAD");
   assert.deepEqual(replayed.providers.map((r) => r.mode), [
     "reused_verified_copy", "reused_verified_copy", "republished_and_verified"]);
   assert.deepEqual(counts, { s3: 1, gdrive: 1 }, "lost-ACK replay does not duplicate PUTs");
@@ -203,7 +203,10 @@ test("anchored signed operation reconciles lost ACK, partial three-provider copy
   assert.match(replayed.observationDigest, /^[a-f0-9]{64}$/);
   assert.equal(replayed.authorizesIo, false);
   assert.equal(replayed.externalProviderDurabilityProven, false);
-  assert.equal(replayed.ownerPinnedFloorChecked, true);
+  assert.equal(replayed.callerSuppliedFloorConsistencyVerified, true);
+  assert.equal(replayed.independentlyAnchoredFloorProven, false);
+  assert.equal(replayed.externalOwnerCustodyVerified, false);
+  assert.equal(Object.hasOwn(replayed, "ownerPinnedFloorChecked"), false);
 
   // Remote tampering after success is detected; a subsequent signed retry
   // may repair only the affected current copy, and always rechecks all three.

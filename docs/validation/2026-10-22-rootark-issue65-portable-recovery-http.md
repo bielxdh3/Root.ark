@@ -17,6 +17,14 @@ not a production or release authorization. No merge, deploy, or data migration.
   package creation, protected signed PUT, historical signed GET + local
   decryption, and explicitly requested plaintext download. Input selections
   containing the secret, plaintext and signing PKCS8 are cleared on exit.
+- The **UI restoration** now requires the owner-signed historical ciphertext
+  root checkpoint plus a signed owner history checkpoint. It verifies Ed25519
+  using the independently fingerprint-pinned owner public key, binds the exact
+  manifest revision/digest/epoch, account scope, object ID/revision,
+  ciphertext epoch and root, and only then performs the authenticated GET and
+  local key release. A missing/forged owner checkpoint is rejected **before
+  any network request**. The lower-level manual-root recovery helper remains
+  explicitly non-authorizing for synthetic/controlled callers.
 - Historical GET requests sign the **current** device grant/head/epoch while
   expecting exact object revision, old ciphertext epoch, SHA-256 and pinned
   ciphertext root. The protected store's latest signed witness/head and current
@@ -31,9 +39,10 @@ not a production or release authorization. No merge, deploy, or data migration.
 Tests: `test/issue-65-portable-file-recovery.test.js` and
 `test/issue-65-normal-browser-protected-content.test.js`.
 The latter includes real localhost Express protected PUT/GET, archived rev1
-after epoch rotation, rev2, subsequent revocation, and a **real Microsoft Edge
-WebCrypto + IndexedDB + CSP** UI publish/restore sequence. Related tests cover
-actual owner-authorized ciphertext import and owner-grant local floor.
+after epoch rotation, rev2, subsequent revocation, invalid owner root/history
+signature rejection before HTTP, and a **real Microsoft Edge WebCrypto +
+IndexedDB + CSP** UI publish/restore sequence with signed owner root.
+Related tests cover owner-authorized ciphertext import and the owner-grant floor.
 
 ## Unresolved trust boundaries
 

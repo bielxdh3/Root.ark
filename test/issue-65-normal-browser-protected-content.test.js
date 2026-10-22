@@ -15,6 +15,8 @@ const normal = require("../public/client/rootark-zk1-normal-browser-content");
 const portable = require("../public/client/rootark-zk1-portable-file-recovery");
 const browserRestore = require("../public/client/rootark-zk1-browser-recovery-http");
 const protectedHttp = require("../public/client/rootark-zk1-protected-http-client");
+const ownerHistory = require("../public/client/rootark-zk1-owner-signed-checkpoint");
+const ownerRoots = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
 const { Zk1ProtectedObjectStore } = require("../src/services/zk1ProtectedObjectStore");
 const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
 
@@ -172,7 +174,8 @@ async function setup(t) {
     data: Buffer.from("Unique browser owner plaintext is never stored on server."),
     origin, fetchImpl, nowSeconds: clock,
   });
-  return { options, makeGrant, currentHead, store, ownerRaw, privateDer, device,
+  return { options, makeGrant, currentHead, store, ownerRaw,
+    ownerPrivate: owner.privateKey, privateDer, device,
     origin, state, setHead: (next) => { head = next; },
     get putCount() { return putCount; },
     setProbe(value) { probe = value; } };
@@ -250,6 +253,51 @@ test("new browser session opens an owner-pinned ciphertext through real signed H
   assert.equal(wire.includes(new TextDecoder().decode(opts.data)), false);
   assert.equal(wire.includes(offlineSecret.toString("base64url")), false);
   recovered.data.fill(0);
+  // A separate owner-held Ed25519 signature and matching first owner-history
+  // checkpoint now attest the exact archived root before plaintext release.
+  const ownerSigner = await crypto.webcrypto.subtle.importKey("pkcs8",
+    f.ownerPrivate.export({ format: "der", type: "pkcs8" }),
+    "Ed25519", false, ["sign"]);
+  const rootSignerKeyId = crypto.randomBytes(16);
+  const ownerDeviceId = "offline-owner-root";
+  const ownerHistoryCheckpoint = await ownerHistory.signOwnerCheckpoint({
+    scope: signer.scope, signerKey: ownerSigner, signerPublicKey: opts.ownerPublicKey,
+    signerKeyId: rootSignerKeyId, deviceId: ownerDeviceId,
+    revision: opts.pinnedCurrentHead.revision,
+    manifestDigest: opts.pinnedCurrentHead.digest,
+    issuedAt: opts.nowSeconds, previous: null,
+  });
+  const ownerRootCheckpoint = await ownerRoots.signOwnerCiphertextRootCheckpoint({
+    scope: signer.scope, signerKey: ownerSigner, signerKeyId: rootSignerKeyId,
+    deviceId: ownerDeviceId,
+    manifestRevision: opts.pinnedCurrentHead.revision,
+    manifestDigest: opts.pinnedCurrentHead.digest,
+    manifestEpoch: opts.pinnedCurrentHead.epoch,
+    objectId: opts.metadata.object_id, objectRevision: 1,
+    ciphertextEpoch: opts.metadata.epoch, ciphertextRoot: root,
+    issuedAt: opts.nowSeconds,
+  });
+  const signedRequest = { ...expected, ownerHistoryCheckpoint,
+    ownerRootCheckpoint, ownerSignerKeyId: rootSignerKeyId.toString("base64url"),
+    ownerDeviceId, previousOwnerHistoryProof: null };
+  const signedRecovery = await browserRestore.recoverFromOwnerSignedProtectedGet(signedRequest);
+  assert.deepEqual(Buffer.from(signedRecovery.data), Buffer.from(opts.data));
+  assert.equal(signedRecovery.ownerSignedHistoricalRootVerified, true);
+  assert.equal(signedRecovery.externalOwnerKeyOriginVerifiedByModule, false);
+  signedRecovery.data.fill(0);
+  let badProofReachedNetwork = 0;
+  const denySignedProof = (changes) => assert.rejects(
+    browserRestore.recoverFromOwnerSignedProtectedGet({
+      ...signedRequest, ...changes,
+      fetchImpl: (...args) => { badProofReachedNetwork++; return opts.fetchImpl(...args); },
+    }), /ZK_BROWSER_RECOVERY_HTTP_DENIED/);
+  await denySignedProof({ ownerRootCheckpoint: { ...ownerRootCheckpoint,
+    signature: crypto.randomBytes(64).toString("base64url") } });
+  await denySignedProof({ ownerDeviceId: "forged-owner" });
+  await denySignedProof({ ownerSignerKeyId: crypto.randomBytes(16).toString("base64url") });
+  await denySignedProof({ ownerHistoryCheckpoint: null });
+  await denySignedProof({ independentlyPinnedCiphertextRoot: crypto.randomBytes(32) });
+  assert.equal(badProofReachedNetwork, 0, "invalid owner history/root never contacts server");
   for (const bad of [
     { recoverySecret: crypto.randomBytes(32) },
     { independentlyPinnedCiphertextRoot: crypto.randomBytes(32) },
@@ -415,6 +463,7 @@ test("Edge WebCrypto executes normal file PUT/GET using actual localhost Express
     "test Express routes expose only explicitly enumerated browser scripts");
   const values = {
     ownerRaw: b64(f.ownerRaw), ownerHash: b64(opts.pinnedOwnerKeyHash),
+    ownerPrivate: b64(f.ownerPrivate.export({ type: "pkcs8", format: "der" })),
     ownerSpkiHash: b64(crypto.createHash("sha256").update(Buffer.concat([
       Buffer.from("302a300506032b6570032100", "hex"), f.ownerRaw])).digest()),
     deviceRaw: b64(f.device.authorization_public_key), privateDer: b64(f.privateDer),
@@ -466,13 +515,29 @@ if(status.includes("Ciphertext conferido")){
   for(let k=0;k<80;k++){await new Promise(resolve=>setTimeout(resolve,100));
     if(document.getElementById("status").textContent.includes("Ciphertext enviado e GET autenticado")){wrote=true;break;}}
   if(!wrote || !generatedBundle)throw Error("PORTABLE_PUBLISH_FAILED:"+document.getElementById("status").textContent);
+  const signer=await crypto.subtle.importKey("pkcs8",decode(v.ownerPrivate),"Ed25519",false,["sign"]);
+  const signedOwnerPublic=await crypto.subtle.importKey("raw",decode(v.ownerRaw),"Ed25519",true,["verify"]);
+  const ownerKeyId=crypto.getRandomValues(new Uint8Array(16));
+  const historyCheckpoint=await window.RootarkZk1OwnerSignedCheckpoint.signOwnerCheckpoint({
+    scope:v.scope,signerKey:signer,signerPublicKey:signedOwnerPublic,
+    signerKeyId:ownerKeyId,deviceId:"test-independent-owner",revision:v.pin.revision,
+    manifestDigest:decode(v.pin.digest),issuedAt:v.now,previous:null});
+  const checkpoint=await window.RootarkZk1OwnerCiphertextRootCheckpoint.signOwnerCiphertextRootCheckpoint({
+    scope:v.scope,signerKey:signer,signerKeyId:ownerKeyId,deviceId:"test-independent-owner",
+    manifestRevision:v.pin.revision,manifestDigest:decode(v.pin.digest),
+    manifestEpoch:v.pin.epoch,objectId:generatedBundle.metadata.object_id,
+    objectRevision:generatedBundle.objectRevision,
+    ciphertextEpoch:generatedBundle.metadata.epoch,
+    ciphertextRoot:decode(generatedBundle.ciphertextRoot),issuedAt:v.now});
   inputFile("device-private",decode(v.privateDer),"device.pkcs8");
   inputFile("portable-secret",secret,"saved-secret.bin");
   inputFile("portable-bundle",new TextEncoder().encode(JSON.stringify(generatedBundle)),"bundle.json");
+  inputFile("owner-history",new TextEncoder().encode(JSON.stringify(historyCheckpoint)),"owner-history.json");
+  inputFile("portable-owner-root",new TextEncoder().encode(JSON.stringify(checkpoint)),"owner-root.json");
   document.getElementById("portable-restore").click();
   let restored=false;
   for(let k=0;k<80;k++){await new Promise(resolve=>setTimeout(resolve,100));
-    if(document.getElementById("status").textContent.includes("GET protegido e abertura local concluídos")){restored=true;break;}}
+    if(document.getElementById("status").textContent.includes("GET protegido, assinatura da raiz do proprietário e abertura local concluídos")){restored=true;break;}}
   secret.fill(0);
   if(!restored || document.getElementById("portable-secret").files.length!==0
     || document.getElementById("device-private").files.length!==0)

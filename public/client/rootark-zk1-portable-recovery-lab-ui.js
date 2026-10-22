@@ -117,7 +117,8 @@
       epoch: ctx.pinnedCurrentHead.epoch, nowSeconds: ctx.nowSeconds };
   }
   function cleanupInputs() {
-    for (const id of ["portable-secret", "device-private", "file", "portable-bundle"])
+    for (const id of ["portable-secret", "device-private", "file", "portable-bundle",
+      "portable-owner-root"])
       find(id).value = "";
   }
   async function withBusy(action) {
@@ -194,15 +195,22 @@
       secret = await fileBytes("portable-secret", 32, 32);
       const bundle = JSON.parse(text.decode(
         await fileBytes("portable-bundle", 1, 6 * 1024 * 1024)));
+      const ownerRootCheckpoint = JSON.parse(text.decode(
+        await fileBytes("portable-owner-root", 1, 8192)));
+      if (!ctx.ownerHistoryCheckpoint) deny();
       // The root is supplied separately. Do not fill it from bundle contents.
       const independentlyPinnedCiphertextRoot =
         decode64(find("portable-root").value.trim());
-      opened = await root.RootarkZk1BrowserRecoveryHttp.recoverFromProtectedGet({
+      opened = await root.RootarkZk1BrowserRecoveryHttp.recoverFromOwnerSignedProtectedGet({
         ...ctx, recoverySecret: secret, bundle,
         expectedMetadata: bundle.metadata, independentlyPinnedCiphertextRoot,
+        ownerRootCheckpoint,
+        ownerSignerKeyId: ownerRootCheckpoint.signer_key_id,
+        ownerDeviceId: ownerRootCheckpoint.device_id,
+        previousOwnerHistoryProof: null,
       });
       download(opened.name, opened.data, opened.mediaType || "application/octet-stream");
-      status.textContent = "GET protegido e abertura local concluídos. Nenhuma CEK foi enviada ao servidor.";
+      status.textContent = "GET protegido, assinatura da raiz do proprietário e abertura local concluídos. Nenhuma CEK foi enviada ao servidor.";
     } finally { secret?.fill(0); opened?.data?.fill(0); }
   }));
 }(typeof globalThis === "object" ? globalThis : this));

@@ -78,12 +78,16 @@
       <button id="portable-publish" type="button">Enviar arquivo recuperável e salvar pacote cifrado</button>
       <label for="portable-bundle">Pacote de ciphertext portátil (.json)</label>
       <input id="portable-bundle" type="file" accept=".json,application/json">
+      <label for="portable-owner-root">Checkpoint da raiz cifrada assinado pelo proprietário (.json, obrigatório para recuperar)</label>
+      <input id="portable-owner-root" type="file" accept=".json,application/json">
       <label for="portable-root">Raiz do ciphertext conferida fora do pacote, base64url</label>
       <input id="portable-root" type="text" maxlength="43" autocomplete="off" spellcheck="false">
       <button id="portable-restore" type="button">Recuperar por GET protegido e baixar arquivo</button>
       <p class="notice">Guarde a raiz separada do pacote. Ela deve ser conferida
-      por um checkpoint assinado pelo proprietário e por um canal independente
-      antes de restaurar. Uma cópia antiga do perfil ou chaves já expostas ao
+      por um checkpoint Ed25519 assinado pelo proprietário e por um canal
+      independente antes de restaurar. A recuperação exige também o checkpoint
+      histórico da seção 1 com a assinatura do mesmo proprietário.
+      Uma cópia antiga do perfil ou chaves já expostas ao
       dispositivo perdido não podem ser revogadas retroativamente. Somente
       conteúdo e chaves locais são usados para descriptografia.</p>
     </section>

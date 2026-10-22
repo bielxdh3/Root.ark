@@ -4,14 +4,16 @@
       require("./rootark-zk1-normal-browser-content"),
       require("./rootark-zk1-normal-browser-trust-floor"),
       require("./rootark-zk1-portable-file-recovery"),
-      require("./rootark-zk1-protected-http-client"));
+      require("./rootark-zk1-protected-http-client"),
+      require("./rootark-zk1-owner-ciphertext-root-checkpoint"));
   } else {
     root.RootarkZk1BrowserRecoveryHttp = factory(root.crypto,
       root.RootarkZk1NormalBrowserContent, root.RootarkZk1NormalBrowserTrustFloor,
-      root.RootarkZk1PortableFileRecovery, root.RootarkZk1ProtectedHttpClient);
+      root.RootarkZk1PortableFileRecovery, root.RootarkZk1ProtectedHttpClient,
+      root.RootarkZk1OwnerCiphertextRootCheckpoint);
   }
 }(typeof globalThis === "object" ? globalThis : this,
-  function (webCrypto, normal, floor, portable, http) {
+  function (webCrypto, normal, floor, portable, http, ownerRoots) {
     "use strict";
 
     // A development-only normal HTTP GET followed by CLIENT-SIDE recovery
@@ -163,5 +165,64 @@
         expectedCiphertext?.fill(0); digest?.fill(0);
       }
     }
-    return Object.freeze({ recoverFromProtectedGet });
+    // Stronger opt-in recovery mode: a manually entered root can only be used
+    // after the separately pinned owner actually signed the *exact* historical
+    // ciphertext root and current manifest checkpoint. Neither a server JSON
+    // flag nor the bundle's self-asserted root can manufacture this proof.
+    async function recoverFromOwnerSignedProtectedGet(input) {
+      let content;
+      try {
+        exact(input, [...fields, "ownerSignerKeyId", "ownerDeviceId",
+          "ownerRootCheckpoint", "previousOwnerHistoryProof"]);
+        if (!ownerRoots?.verifyOwnerCiphertextRootCheckpoint
+          || input.ownerHistoryCheckpoint === null
+          || input.ownerRootCheckpoint === null) deny();
+        const original = Object.fromEntries(fields.map((key) => [key, input[key]]));
+        const metadata = original.expectedMetadata;
+        const grant = original.signedDeviceGrant;
+        if (!metadata || !grant || scopes.some((name) =>
+          metadata[name] !== grant[name])) deny();
+        await floor.verifyExternalAnchor({
+          ownerPublicKey: original.ownerPublicKey,
+          independentOwnerSpkiSha256: original.independentOwnerSpkiSha256,
+          pinnedCurrentHead: original.pinnedCurrentHead,
+          signedDeviceGrant: grant,
+          ownerHistoryCheckpoint: original.ownerHistoryCheckpoint,
+        });
+        const signed = await ownerRoots.verifyOwnerCiphertextRootCheckpoint({
+          checkpoint: input.ownerRootCheckpoint,
+          ownerHistoryCheckpoint: original.ownerHistoryCheckpoint,
+          previousHistoryProof: input.previousOwnerHistoryProof,
+          pinnedOwner: {
+            scope: Object.fromEntries(scopes.map((name) => [name, metadata[name]])),
+            deviceId: input.ownerDeviceId,
+            signerKeyId: from64(input.ownerSignerKeyId, 16),
+            publicKey: original.ownerPublicKey,
+          },
+          expected: {
+            manifestRevision: original.pinnedCurrentHead.revision,
+            manifestDigest: original.pinnedCurrentHead.digest,
+            manifestEpoch: original.pinnedCurrentHead.epoch,
+            objectId: metadata.object_id,
+            objectRevision: original.bundle?.objectRevision,
+            ciphertextEpoch: metadata.epoch,
+            ciphertextRoot: original.independentlyPinnedCiphertextRoot,
+          },
+        });
+        if (signed.trustedOwnerSignatureVerified !== true
+          || signed.manifestCheckpointVerified !== true
+          || signed.authorizesRecovery !== false) deny();
+        content = await recoverFromProtectedGet(original);
+        return Object.freeze({ ...content,
+          ownerSignedHistoricalRootVerified: true,
+          externalOwnerKeyOriginVerifiedByModule: false,
+          independentServerGateProofVerified: false,
+          authorizesProductionRestore: false,
+        });
+      } catch (_) {
+        content?.data?.fill(0);
+        deny();
+      }
+    }
+    return Object.freeze({ recoverFromProtectedGet, recoverFromOwnerSignedProtectedGet });
   }));
