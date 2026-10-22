@@ -78,6 +78,23 @@ test("owner offline signer enforces independent inputs, signer separation, custo
   denied({ ...minimum, issuedAt: now(), expiresAt: now() + 86400 });
   denied(minimum, { witness: paths.public }); // exact owner key reuse forbidden
   denied(minimum, { status: paths.public });
+  // Distinct owned paths can still contain the *same* witness/status signer.
+  // Reject before signing or creating a checkpoint artifact.
+  write("status", wit.publicKey);
+  const duplicateSignerOutput = path.join(dir, "duplicate-authority-checkpoint.json");
+  const duplicateSigner = invoke(minimum, { output: duplicateSignerOutput });
+  assert.notEqual(duplicateSigner.status, 0);
+  assert.equal(duplicateSigner.stdout, "");
+  assert.equal(duplicateSigner.stderr, "OWNER_FLOOR_SIGN_FAILED\n");
+  assert.equal(fs.existsSync(duplicateSignerOutput), false);
+  write("status", sta.publicKey);
+  const duplicateIdOutput = path.join(dir, "duplicate-authority-id-checkpoint.json");
+  const duplicateId = invoke({ ...minimum, statusKeyId: minimum.witnessKeyId },
+    { output: duplicateIdOutput });
+  assert.notEqual(duplicateId.status, 0);
+  assert.equal(duplicateId.stdout, "");
+  assert.equal(duplicateId.stderr, "OWNER_FLOOR_SIGN_FAILED\n");
+  assert.equal(fs.existsSync(duplicateIdOutput), false);
   const other = crypto.generateKeyPairSync("ed25519");
   write("public", other.publicKey);
   denied(minimum); // private key does not match pinned owner public key

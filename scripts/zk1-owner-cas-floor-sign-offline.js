@@ -127,6 +127,7 @@ function run(argv, now = Math.floor(Date.now() / 1000)) {
   exact(data.trustedMinimumHead, ["sequence", "lastHash"]);
   keyId(data.witnessKeyId);
   keyId(data.statusKeyId);
+  if (data.witnessKeyId === data.statusKeyId) fail();
   const { sequence, lastHash } = data.trustedMinimumHead;
   if (!Number.isSafeInteger(sequence) || sequence < 0 || sequence > 100000
     || typeof lastHash !== "string" || !/^[a-f0-9]{64}$/.test(lastHash)
@@ -141,8 +142,10 @@ function run(argv, now = Math.floor(Date.now() / 1000)) {
   const witnessPub = publicEd25519(readOwned(root, witnessPubPath));
   const statusPub = publicEd25519(readOwned(root, statusPubPath));
   const ownerSpki = ownerPub.export({ type: "spki", format: "der" });
-  if (ownerSpki.equals(witnessPub.export({ type: "spki", format: "der" }))
-    || ownerSpki.equals(statusPub.export({ type: "spki", format: "der" }))) fail();
+  const witnessSpki = witnessPub.export({ type: "spki", format: "der" });
+  const statusSpki = statusPub.export({ type: "spki", format: "der" });
+  if (ownerSpki.equals(witnessSpki) || ownerSpki.equals(statusSpki)
+    || witnessSpki.equals(statusSpki)) fail();
   const privatePem = readOwned(root, ownerPrivPath);
   let ownerPriv;
   try { ownerPriv = crypto.createPrivateKey(privatePem); }

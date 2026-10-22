@@ -82,7 +82,8 @@ JSON. A prior valid checkpoint must not replace a newer retained digest.
 
 The CLI fails closed on malformed or extra fields, outside-owned/missing
 paths, symlinks or junctions observed in parent components, public/private
-key mismatch, owner key reuse as witness/status key, stale/expired timestamps,
+key mismatch, any reused owner/witness/status Ed25519 signer, identical
+witness/status key IDs, stale/expired timestamps,
 invalid floor encoding, output path collisions or unsafe exclusive creation.
 It emits only `OWNER_FLOOR_SIGNED` or `OWNER_FLOOR_SIGN_FAILED` to the console,
 never private-key material. Private PEM buffers are zeroed after import.
@@ -98,8 +99,9 @@ git diff --check
 The standalone subprocess test signs with the offline CLI, starts the real
 witness against a disposable genuine signed CAS floor, and rejects altered
 minimum/key and old signed-checkpoint replay. The CLI test additionally
-rejects key reuse, divergent PEM, forged source, bad timestamps, outside-owned
-paths and overwrite attempts.
+rejects key reuse (including identical witness/status PEM contents at different
+paths), duplicate authority IDs, divergent PEM, forged source, bad timestamps,
+outside-owned paths and overwrite attempts without creating an artifact.
 
 This owner-side convenience tool cannot verify that an operator's minimum
 came from a physically durable independent quorum. The explicit owner source
