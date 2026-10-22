@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { Buffer } = require("node:buffer");
 const { spawnSync } = require("node:child_process");
-const { getNpmInvocation, isDependencyOrNetworkUnavailable } = require("./release-gate-environment");
+const { getNpmInvocation, canonicalTestArgs, isDependencyOrNetworkUnavailable } = require("./release-gate-environment");
 const { failedTestDiagnostics, unrecognizedChildProgress } = require("./release-gate-diagnostics");
 
 const root = path.resolve(__dirname, "..");
@@ -122,7 +122,7 @@ for (const [name, files] of [
 
 // npm forwards args after `--` to the unchanged `node --test` script. Stable TAP
 // reporting makes failing test names and counts parseable across Windows/CI.
-const npmTest = getNpmInvocation(["test", "--", "--test-reporter=tap"]);
+const npmTest = getNpmInvocation(canonicalTestArgs());
 if (results.some((result) => result.status === "FAIL")) {
   record("final-head canonical npm test", "SKIPPED", "earlier mandatory gate failed; run after correction");
 } else {

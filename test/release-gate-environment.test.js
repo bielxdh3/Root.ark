@@ -1,6 +1,21 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { getNpmInvocation, isDependencyOrNetworkUnavailable } = require("../scripts/release-gate-environment");
+const { getNpmInvocation, canonicalTestArgs, isDependencyOrNetworkUnavailable } = require("../scripts/release-gate-environment");
+
+test("Windows canonical release gate bounds file concurrency without omitting any test", () => {
+  assert.deepEqual(canonicalTestArgs({ platform: "win32" }),
+    ["test", "--", "--test-reporter=tap", "--test-concurrency=2"]);
+  assert.deepEqual(canonicalTestArgs({ platform: "linux" }),
+    ["test", "--", "--test-reporter=tap"]);
+  assert.deepEqual(getNpmInvocation(canonicalTestArgs({ platform: "win32" }), {
+    platform: "win32", comSpec: "cmd.exe",
+  }), {
+    executable: "cmd.exe",
+    args: ["/d", "/s", "/c", "npm.cmd test -- --test-reporter=tap --test-concurrency=2"],
+  });
+  // The package's canonical 'npm test' script remains unmodified.
+  assert.equal(require("../package.json").scripts.test, "node --test");
+});
 
 test("release gate uses native npm instead of inherited Windows cmd on Linux", () => {
   assert.deepEqual(getNpmInvocation(["test"], { platform: "linux", comSpec: "C:\\Windows\\System32\\cmd.exe" }), {

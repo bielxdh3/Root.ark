@@ -74,6 +74,15 @@ function getNpmInvocation(args, { platform = process.platform, comSpec = process
   return { executable: "npm", args };
 }
 
+function canonicalTestArgs({ platform = process.platform } = {}) {
+  // Windows CI runs the mandatory heavy suites before the canonical all-file
+  // suite. Unbounded worker-process fan-out can fail whole test files rather
+  // than their assertions when the hosted runner is under resource pressure.
+  // Keep all tests and TAP evidence; only bound Windows file parallelism.
+  return ["test", "--", "--test-reporter=tap",
+    ...(platform === "win32" ? ["--test-concurrency=2"] : [])];
+}
+
 function isDependencyOrNetworkUnavailable(output, { resolvePackage = isResolvablePackage } = {}) {
   const text = String(output || "");
   const missingFailures = getMissingModuleFailures(text);
@@ -96,4 +105,4 @@ function isDependencyOrNetworkUnavailable(output, { resolvePackage = isResolvabl
     || /(?:^|\n)npm (?:ERR!|error) network request to .+ failed/im.test(text));
 }
 
-module.exports = { getNpmInvocation, isDependencyOrNetworkUnavailable };
+module.exports = { getNpmInvocation, canonicalTestArgs, isDependencyOrNetworkUnavailable };

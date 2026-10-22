@@ -58,7 +58,9 @@ jobs:
   windows-validation:
     name: Windows Node 22 - syntax and tests
     runs-on: windows-2022
-    timeout-minutes: 30
+    # The mandatory isolated gates plus the bounded-concurrency complete test
+    # suite can exceed 30m on a constrained Windows runner. No tests are skipped.
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
