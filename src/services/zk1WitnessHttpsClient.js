@@ -5,6 +5,7 @@
 // signing identity, nonce, floor, scope and expected transition.
 const https = require("node:https");
 const tls = require("node:tls");
+const net = require("node:net");
 
 const FINGERPRINT = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
 const B64U = /^[A-Za-z0-9_-]+$/;
@@ -97,7 +98,8 @@ function createZk1WitnessHttpsClient({
         // re-run checkServerIdentity when reusing that existing socket.
         agent: false,
         ca, key: clientKey, cert: clientCert, rejectUnauthorized: true,
-        minVersion: "TLSv1.3", servername: url.hostname,
+        // IP SAN is verified by checkServerIdentity; SNI names are DNS only.
+        minVersion: "TLSv1.3", servername: net.isIP(url.hostname) ? "" : url.hostname,
         checkServerIdentity(hostname, peer) {
           const nameError = tls.checkServerIdentity(hostname, peer);
           if (nameError) return nameError;

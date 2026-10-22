@@ -3,10 +3,11 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { execFileSync, spawn } = require("node:child_process");
-const { generateNativeFixtureCertificates } =
+const { generateNativeFixtureCertificates, runNativeOpenSsl } =
   require("./support/issue-65-native-openssl-fixture");
 const https = require("node:https");
 const test = require("node:test");
@@ -14,6 +15,9 @@ const { Zk1DurableWitnessLedger } = require("../src/services/zk1DurableWitnessLe
 const { createZk1WitnessHttpsServer, drainZk1WitnessHttpsServer } = require("../src/services/zk1WitnessHttpsServer");
 const { createZk1CasStatusHttpsClient } = require("../src/services/zk1CasStatusHttpsClient");
 const { createZk1WitnessHttpsClient } = require("../src/services/zk1WitnessHttpsClient");
+const { Zk1WitnessCasAnchorHttpsClient } =
+  require("../src/services/zk1WitnessCasAnchorHttpsClient");
+const { Zk1WitnessCasAnchorFloor } = require("../src/services/zk1WitnessCasAnchorFloor");
 const z = require("../src/crypto/rootark-zk-1");
 const { inspectVerifiedWitnessReservationV1 } = require("../src/crypto/rootark-zk-witness-operation-wire-v1");
 
@@ -379,13 +383,16 @@ test("mTLS standalone witness listener rejects unknown principals and returns si
       serverFingerprint256: new crypto.X509Certificate(tls.serverCert).fingerprint256,
     },
   };
-  async function launch() {
+  const cleanEnv = { ...process.env };
+  delete cleanEnv.ROOTARK_ZK1_WITNESS_PRIVATE_BIND_HOST;
+  delete cleanEnv.ROOTARK_ZK1_WITNESS_PRIVATE_BIND_INTERFACE;
+  async function launch(extraEnv = {}) {
     fs.writeFileSync(configFile, JSON.stringify(config), { mode: 0o600 });
     const child = spawn(process.execPath, [
       path.resolve(__dirname, "../scripts/zk1-witness-standalone.js"), "--config", configFile,
     ], {
       cwd: path.resolve(__dirname, ".."), stdio: ["ignore", "pipe", "pipe", "ipc"],
-      windowsHide: true,
+      windowsHide: true, env: { ...cleanEnv, ...extraEnv },
     });
     ownedChildren.add(child);
     const result = await new Promise((resolve, reject) => {
@@ -424,4 +431,160 @@ test("mTLS standalone witness listener rejects unknown principals and returns si
     scope: processScopeJson,
   })).status, 200);
   await restarted.stop();
+
+  // Real child-process checks reject every unapproved bind before advertising
+  // readiness. All certificates, SQLite files and connections are disposable.
+  async function rejectBind(host, pins = {}) {
+    fs.writeFileSync(configFile, JSON.stringify({ ...config, listenHost: host }));
+    const child = spawn(process.execPath, [
+      path.resolve(__dirname, "../scripts/zk1-witness-standalone.js"), "--config", configFile,
+    ], { cwd: path.resolve(__dirname, ".."), windowsHide: true,
+      stdio: ["ignore", "ignore", "pipe", "ipc"], env: { ...cleanEnv, ...pins } });
+    ownedChildren.add(child);
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    let timer;
+    try {
+      const result = await Promise.race([
+        new Promise((resolve) => {
+          child.once("exit", (code) => resolve({ type: "exit", code }));
+          child.once("message", () => resolve({ type: "ready" }));
+          child.once("error", () => resolve({ type: "error" }));
+        }),
+        new Promise((resolve) => { timer = setTimeout(() => resolve({ type: "timeout" }), 5000); }),
+      ]);
+      assert.equal(result.type, "exit", `${host} must fail before listener readiness`);
+      assert.notEqual(result.code, 0);
+      assert.equal(stderr.trim(), "WITNESS_STARTUP_FAILED");
+    } finally {
+      clearTimeout(timer);
+      if (child.exitCode === null) {
+        const stopped = new Promise((resolve) => child.once("exit", resolve));
+        child.kill("SIGTERM");
+        await stopped;
+      }
+      ownedChildren.delete(child);
+    }
+  }
+  const bindHostEnv = "ROOTARK_ZK1_WITNESS_PRIVATE_BIND_HOST";
+  const bindInterfaceEnv = "ROOTARK_ZK1_WITNESS_PRIVATE_BIND_INTERFACE";
+  for (const host of ["0.0.0.0", "::", "127.0.0.2", "169.254.10.20",
+    "100.64.1.1", "8.8.8.8", "224.0.0.1", "::ffff:10.0.0.1"]) {
+    await rejectBind(host, { [bindHostEnv]: host, [bindInterfaceEnv]: "unassigned" });
+  }
+  await rejectBind("127.0.0.1", { [bindHostEnv]: "10.0.0.1" });
+  await rejectBind("10.254.254.254");
+  await rejectBind("10.254.254.254", {
+    [bindHostEnv]: "10.254.254.254", [bindInterfaceEnv]: "unassigned",
+  });
+  const adapter = Object.entries(os.networkInterfaces()).flatMap(([name, entries]) =>
+    (entries || []).map((entry) => ({ name, entry }))).find(({ entry }) => {
+      if ((entry.family !== "IPv4" && entry.family !== 4) || entry.internal
+        || net.isIP(entry.address) !== 4) return false;
+      const [a, b] = entry.address.split(".").map(Number);
+      return a === 10 || (a === 172 && b >= 16 && b <= 31)
+        || (a === 192 && b === 168);
+    });
+  if (!adapter) {
+    t.diagnostic("No assigned RFC1918 interface; private witness bind not exercised");
+    return;
+  }
+  const privateHost = adapter.entry.address;
+  const privatePins = { [bindHostEnv]: privateHost, [bindInterfaceEnv]: adapter.name };
+  await rejectBind(privateHost);
+  await rejectBind(privateHost, { ...privatePins, [bindHostEnv]: "10.254.254.254" });
+  await rejectBind(privateHost, { ...privatePins, [bindInterfaceEnv]: "wrong-adapter" });
+  await rejectBind(privateHost, privatePins); // server cert lacks IP SAN
+
+  fs.writeFileSync(path.join(dir, "server.ext"), [
+    "extendedKeyUsage=serverAuth", "keyUsage=digitalSignature,keyEncipherment",
+    `subjectAltName=DNS:localhost,IP:127.0.0.1,IP:${privateHost}`, "",
+  ].join("\n"));
+  runNativeOpenSsl(dir, ["x509", "-req", "-in", "server.csr",
+    "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
+    "-out", "server.pem", "-days", "1", "-extfile", "server.ext"]);
+  const privateCert = fs.readFileSync(path.join(dir, "server.pem"));
+  assert.ok(new crypto.X509Certificate(privateCert).checkIP(privateHost, { subject: "never" }));
+
+  config.listenHost = privateHost;
+  const privateScope = { ...scope, keyring_id: processOp.keyring_id };
+  let privateProcess;
+  try {
+    privateProcess = await launch(privatePins);
+    const remote = createZk1WitnessHttpsClient({
+      endpoint: `https://${privateHost}:${privateProcess.port}`,
+      ca: tls.ca, clientKey: tls.clientKey, clientCert: tls.clientCert,
+      serverFingerprint256: new crypto.X509Certificate(privateCert).fingerprint256,
+    });
+    const validHead = await z.decodeDeterministic(await remote.freshHead({
+      scope: privateScope, nonce: crypto.randomBytes(32),
+    }));
+    assert.equal(validHead.status, "committed", "IP SAN mTLS witness serves durable signed head");
+    await assert.rejects(createZk1WitnessHttpsClient({
+      endpoint: `https://${privateHost}:${privateProcess.port}`,
+      ca: tls.ca, clientKey: tls.clientKey, clientCert: tls.clientCert,
+      serverFingerprint256: "00:".repeat(31) + "00",
+    }).freshHead({ scope: privateScope, nonce: crypto.randomBytes(32) }),
+    /WITNESS_TRANSPORT_UNAVAILABLE/, "server fingerprint pin applies on private IP");
+    await assert.rejects(remote.freshHead({
+      scope: { ...privateScope, keyring_id: crypto.randomBytes(16) }, nonce: crypto.randomBytes(32),
+    }), /WITNESS_TRANSPORT_UNAVAILABLE/, "private IP must enforce scoped grants");
+    await assert.rejects(createZk1WitnessHttpsClient({
+      endpoint: `https://${privateHost}:${privateProcess.port}`,
+      ca: tls.ca, clientKey: tls.forbiddenKey, clientCert: tls.forbiddenCert,
+      serverFingerprint256: new crypto.X509Certificate(privateCert).fingerprint256,
+    }).freshHead({ scope: privateScope, nonce: crypto.randomBytes(32) }),
+    /WITNESS_TRANSPORT_UNAVAILABLE/, "ungranted principal is rejected");
+    runNativeOpenSsl(dir, ["req", "-x509", "-newkey", "rsa:2048", "-nodes",
+      "-keyout", "foreign.key", "-out", "foreign.pem", "-subj", "/CN=foreign",
+      "-days", "1"]);
+    await assert.rejects(createZk1WitnessHttpsClient({
+      endpoint: `https://${privateHost}:${privateProcess.port}`,
+      ca: tls.ca, clientKey: fs.readFileSync(path.join(dir, "foreign.key")),
+      clientCert: fs.readFileSync(path.join(dir, "foreign.pem")),
+      serverFingerprint256: new crypto.X509Certificate(privateCert).fingerprint256,
+    }).freshHead({ scope: privateScope, nonce: crypto.randomBytes(32) }),
+    /WITNESS_TRANSPORT_UNAVAILABLE/, "foreign CA client certificate is rejected at TLS");
+  } finally {
+    await privateProcess?.stop();
+  }
+  // A separate CAS floor transport identity has an exclusive role, and a
+  // previously authorized witness-head identity must lose its revoked role.
+  const floorDb = path.join(dir, "private-cas-floor.sqlite");
+  const privateFloor = new Zk1WitnessCasAnchorFloor(floorDb, {
+    bootstrapNew: true, witnessKeyId, witnessPrivateKey: witnessKey.privateKey,
+    statusKeyId, statusPublicKey: authorityKey.publicKey,
+  });
+  privateFloor.close();
+  config.casAnchorFloor = {
+    dbPath: floorDb, trustedMinimumHead: { sequence: 0, lastHash: "0".repeat(64) },
+  };
+  const anchorFingerprint = new crypto.X509Certificate(tls.forbiddenCert).fingerprint256;
+  config.principals = {
+    [fingerprint]: { ...grant, roles: ["reserve"] },
+    [anchorFingerprint]: { roles: ["cas-anchor"], scopes: [] },
+  };
+  const revokedProcess = await launch(privatePins);
+  try {
+    await assert.rejects(createZk1WitnessHttpsClient({
+      endpoint: `https://${privateHost}:${revokedProcess.port}`,
+      ca: tls.ca, clientKey: tls.clientKey, clientCert: tls.clientCert,
+      serverFingerprint256: new crypto.X509Certificate(privateCert).fingerprint256,
+    }).freshHead({ scope: privateScope, nonce: crypto.randomBytes(32) }),
+    /WITNESS_TRANSPORT_UNAVAILABLE/, "revoked head role cannot read via private IP");
+    const anchorArgs = {
+      endpoint: `https://${privateHost}:${revokedProcess.port}`,
+      ca: tls.ca, clientKey: tls.forbiddenKey, clientCert: tls.forbiddenCert,
+      serverFingerprint256: new crypto.X509Certificate(privateCert).fingerprint256,
+      pinnedWitnessPublicKey: witnessKey.publicKey,
+      pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
+    };
+    assert.deepEqual(await new Zk1WitnessCasAnchorHttpsClient(anchorArgs).freshHead(),
+      { sequence: 0, lastHash: "0".repeat(64) },
+      "separate CAS floor principal reads nonce-bound signed head over private IP");
+    await assert.rejects(new Zk1WitnessCasAnchorHttpsClient({
+      ...anchorArgs, pinnedStatusKeyId: crypto.randomBytes(16),
+    }).freshHead(), /CAS_WITNESS_FLOOR_UNAVAILABLE/,
+    "CAS floor pinned status signer must match on private IP");
+  } finally { await revokedProcess.stop(); }
 });

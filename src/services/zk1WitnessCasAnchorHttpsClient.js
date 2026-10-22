@@ -5,6 +5,7 @@
 // witness Ed25519 signature, request nonce and pinned status signer identity.
 const https = require("node:https");
 const tls = require("node:tls");
+const net = require("node:net");
 const crypto = require("node:crypto");
 const { verifyFreshWitnessCasFloor } = require("./zk1WitnessCasAnchorFloor");
 const FINGERPRINT = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
@@ -75,7 +76,8 @@ class Zk1WitnessCasAnchorHttpsClient {
         };
         const request = https.request({ hostname: this.#url.hostname, port: this.#url.port,
           path: urlPath, method: "POST", agent: false, ...this.#tls,
-          rejectUnauthorized: true, minVersion: "TLSv1.3", servername: this.#url.hostname,
+          rejectUnauthorized: true, minVersion: "TLSv1.3",
+          servername: net.isIP(this.#url.hostname) ? "" : this.#url.hostname,
           checkServerIdentity: (hostname, peer) => {
             const invalid = tls.checkServerIdentity(hostname, peer);
             if (invalid) return invalid;

@@ -7,6 +7,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const os = require("node:os");
+const net = require("node:net");
 const { Zk1DurableWitnessLedger } = require("../src/services/zk1DurableWitnessLedger");
 const { createZk1WitnessHttpsServer, drainZk1WitnessHttpsServer } = require("../src/services/zk1WitnessHttpsServer");
 const { createZk1CasStatusHttpsClient } = require("../src/services/zk1CasStatusHttpsClient");
@@ -25,7 +27,32 @@ const CAS_FIELDS = Object.freeze([
 const OWNER_PIN_ENV = "ROOTARK_ZK1_CAS_FLOOR_OWNER_SPKI_SHA256";
 const OWNER_CHECKPOINT_PIN_ENV = "ROOTARK_ZK1_CAS_FLOOR_OWNER_CHECKPOINT_SHA256";
 const OWNER_FIELDS = Object.freeze(["publicKeyPath", "issuedAt", "expiresAt", "signature"]);
+const PRIVATE_BIND_HOST_ENV = "ROOTARK_ZK1_WITNESS_PRIVATE_BIND_HOST";
+const PRIVATE_BIND_INTERFACE_ENV = "ROOTARK_ZK1_WITNESS_PRIVATE_BIND_INTERFACE";
 function fail() { throw new Error("WITNESS_STARTUP_FAILED"); }
+function validateListenHost(host) {
+  const pinnedHost = process.env[PRIVATE_BIND_HOST_ENV];
+  const pinnedInterface = process.env[PRIVATE_BIND_INTERFACE_ENV];
+  if (host === "127.0.0.1" || host === "::1") {
+    // A partial or stale remote opt-in cannot silently become loopback.
+    if (pinnedHost !== undefined || pinnedInterface !== undefined) fail();
+    return;
+  }
+  // Require canonical literal RFC1918 IPv4 and two independent operator pins.
+  // Reject wildcard, DNS, IPv6, public, CGNAT and link-local endpoints.
+  if (typeof host !== "string" || net.isIP(host) !== 4
+    || pinnedHost !== host || typeof pinnedInterface !== "string"
+    || !pinnedInterface || pinnedInterface.length > 128) fail();
+  const [first, second] = host.split(".").map(Number);
+  if (!(first === 10 || (first === 172 && second >= 16 && second <= 31)
+    || (first === 192 && second === 168))) fail();
+  const interfaces = os.networkInterfaces();
+  const addresses = Object.hasOwn(interfaces, pinnedInterface)
+    ? interfaces[pinnedInterface] : null;
+  if (!Array.isArray(addresses) || !addresses.some((address) =>
+    (address.family === "IPv4" || address.family === 4)
+    && address.internal === false && address.address === host)) fail();
+}
 function exact(value, names) {
   if (!value || typeof value !== "object" || Array.isArray(value)
     || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
@@ -50,9 +77,7 @@ function configure(config) {
     ? [...TOP_FIELDS, "casAnchorFloor"] : TOP_FIELDS);
   exact(config.cas, CAS_FIELDS);
   if (config.bootstrapNew !== true && config.bootstrapNew !== false) fail();
-  // Only bind loopback by default. A remote deployment requires a reviewed
-  // network isolation/provisioning profile, not accidental 0.0.0.0 exposure.
-  if (config.listenHost !== "127.0.0.1" && config.listenHost !== "::1") fail();
+  validateListenHost(config.listenHost);
   if (!Number.isSafeInteger(config.listenPort)
     || config.listenPort < 0 || config.listenPort > 65535
     || typeof config.dbPath !== "string" || !path.isAbsolute(config.dbPath)) fail();
@@ -67,6 +92,13 @@ function configure(config) {
   const witnessPrivateKey = crypto.createPrivateKey(readFile(config.witnessPrivateKeyPath));
   const statusKeyId = decodeId(config.statusKeyId);
   const statusPublicKey = crypto.createPublicKey(readFile(config.statusPublicKeyPath));
+  const serverCert = readFile(config.serverCertPath);
+  if (config.listenHost !== "127.0.0.1" && config.listenHost !== "::1") {
+    // IP SAN is independently verified by remote clients alongside CA and
+    // peer fingerprint; CN or DNS SAN cannot authorize an IP bind.
+    if (!new crypto.X509Certificate(serverCert)
+      .checkIP(config.listenHost, { subject: "never" })) fail();
+  }
   // The owner signer pin is deliberately outside editable witness JSON. This
   // is an opt-in *storage/config-only* tamper guard, not a guarantee if the
   // service environment, clock, owner key, and witness are all compromised.
@@ -162,7 +194,7 @@ function configure(config) {
   try {
     const server = createZk1WitnessHttpsServer({
       key: readFile(config.serverKeyPath),
-      cert: readFile(config.serverCertPath),
+      cert: serverCert,
       clientCa: readFile(config.clientCaPath),
       principals: config.principals,
       ledger,
@@ -202,6 +234,20 @@ async function main() {
   process.on("SIGTERM", close);
   process.on("SIGINT", close);
   server.listen(config.listenPort, config.listenHost, () => {
+    try {
+      validateListenHost(config.listenHost);
+      if (server.address()?.address !== config.listenHost) fail();
+    } catch (_) {
+      void drainZk1WitnessHttpsServer(server)
+        .catch(() => { server.closeAllConnections(); })
+        .finally(() => {
+          try { ledger.close(); } catch (_) { /* fail closed */ }
+          try { floor?.close(); } catch (_) { /* fail closed */ }
+        });
+      process.stderr.write("WITNESS_STARTUP_FAILED\n");
+      process.exitCode = 1;
+      return;
+    }
     // IPC is for the disposable integration test supervisor only.
     // Do not disclose keys, file paths, operation data or user scopes.
     if (typeof process.send === "function") {
