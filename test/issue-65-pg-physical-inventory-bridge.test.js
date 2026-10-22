@@ -23,6 +23,8 @@ const { Zk1PgPhysicalInventoryBridge } =
 const { createZk1ContentInventoryHttpsServer,
   drainZk1ContentInventoryHttpsServer } =
   require("../src/services/zk1ContentInventoryHttpsServer");
+const { createZk1ContentInventoryHttpsClient } =
+  require("../src/services/zk1ContentInventoryHttpsClient");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 
@@ -291,6 +293,92 @@ test("mTLS signed inventory append requires real strict physical PG readback and
     "bounded per-certificate minute budget rejects replay flooding before PG readback");
   assert.equal((await f.ledger.getOperationStatus(f.op.operation_id)).status, "committed",
     "failure preserves historical signed evidence instead of rewriting it");
+});
+
+test("mTLS committed-operation status needs fresh physical PG proof, not historical signature", {
+  skip: !enabled && "requires disposable PostgreSQL 18 and native OpenSSL",
+}, async (t) => {
+  const f = await fixture(t);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-pg-status-"));
+  generateNativeFixtureCertificates(dir, {
+    caSubject: "Rootark physical status lab", servers: ["inventory"], clients: ["status"],
+  });
+  const read = (name) => fs.readFileSync(path.join(dir, name));
+  const cert = read("status.pem");
+  const jsonScope = Object.fromEntries(Object.entries(f.scope).map(([name, value]) =>
+    [name, value.toString("base64url")]));
+  const server = createZk1ContentInventoryHttpsServer({
+    key: read("inventory.key"), cert: read("inventory.pem"), clientCa: read("ca.pem"),
+    ledger: f.ledger, physicalVerifier: f.verifier,
+    principals: {
+      [new crypto.X509Certificate(cert).fingerprint256]: {
+        roles: ["status"], scopes: [jsonScope],
+      },
+    },
+  });
+  const originalPhysicalCheck = f.verifier.verifyCommittedInventoryOperation.bind(f.verifier);
+  let physicalStatusChecks = 0;
+  f.verifier.verifyCommittedInventoryOperation = async (input) => {
+    physicalStatusChecks += 1;
+    return originalPhysicalCheck(input);
+  };
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(async () => {
+    await drainZk1ContentInventoryHttpsServer(server);
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
+  });
+  const client = createZk1ContentInventoryHttpsClient({
+    endpoint: `https://localhost:${server.address().port}/`,
+    ca: read("ca.pem"), clientKey: read("status.key"), clientCert: cert,
+    serverFingerprint256: new crypto.X509Certificate(read("inventory.pem")).fingerprint256,
+    inventoryPublicKey: f.keys.publicKey, inventorySignerKeyId: f.signerKeyId,
+    wallTimeoutMs: 10000,
+  });
+  const request = { scope: f.scope, operation: f.op };
+  assert.equal((await client.getOperationStatus(request)).status, "unknown");
+  assert.equal((await f.bridge().putAndAttest(f.physical)).status,
+    "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+  const good = await client.getOperationStatus(request);
+  assert.equal(good.status, "committed");
+  assert.equal(good.signedLedgerOperationCommitted, true);
+  assert.equal(good.authorizesIo, false);
+  assert.equal(good.externalDurabilityProven, false);
+  assert.equal(physicalStatusChecks, 1);
+  await f.admin.query(`UPDATE zk1_gate.ciphertext_chunk SET ciphertext=$1
+    WHERE scope_key=$2 AND object_id=$3 AND chunk_index=0`,
+  [crypto.randomBytes(f.chunks[0].length), f.key, f.op.object_id.toString("base64url")]);
+  await assert.rejects(client.getOperationStatus(request), /INVENTORY_HTTP_UNAVAILABLE/,
+    "valid signed receipt cannot turn corrupted physical bytes into a positive status");
+  assert.equal((await f.ledger.getOperationStatus(f.op.operation_id)).status, "committed",
+    "the historical signed event must remain intact after physical corruption");
+  await f.admin.query(`UPDATE zk1_gate.ciphertext_chunk SET ciphertext=$1
+    WHERE scope_key=$2 AND object_id=$3 AND chunk_index=0`,
+  [f.chunks[0], f.key, f.op.object_id.toString("base64url")]);
+  const op = { scope: f.scope, revision: 1, digest: f.digest,
+    operationId: crypto.randomBytes(16), reservationId: crypto.randomBytes(16) };
+  assert.equal((await f.gate.beginQuiesce(op)).activeCount, 0);
+  assert.equal((await f.gate.markPending(op)).status, "PENDING");
+  await assert.rejects(client.getOperationStatus(request), /INVENTORY_HTTP_UNAVAILABLE/,
+    "restored bytes cannot bypass a newer physical generation fence");
+  assert.equal(physicalStatusChecks, 3,
+    "the fourth status attempt, including the earlier unknown ID, ran one last physical proof");
+  const originalStatusLookup = f.ledger.getOperationStatus.bind(f.ledger);
+  let ledgerStatusLookups = 0;
+  f.ledger.getOperationStatus = async (...args) => {
+    ledgerStatusLookups += 1;
+    return originalStatusLookup(...args);
+  };
+  await assert.rejects(client.getOperationStatus({ scope: f.scope,
+    operation: { ...f.op, operation_id: crypto.randomBytes(16) } }),
+  /INVENTORY_HTTP_UNAVAILABLE/);
+  assert.equal(ledgerStatusLookups, 0,
+    "flooding unknown operation IDs cannot bypass the quota to trigger catalog reads");
+  await assert.rejects(client.getOperationStatus(request), /INVENTORY_HTTP_UNAVAILABLE/);
+  assert.equal(physicalStatusChecks, 3,
+    "a fifth status replay cannot bypass the mTLS certificate's readback quota");
 });
 
 test("unverified physical write, partial seal, and generation fencing never publish a signed success", {

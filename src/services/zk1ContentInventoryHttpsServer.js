@@ -168,6 +168,28 @@ function createZk1ContentInventoryHttpsServer({
   const physicalPrincipalWindowCounts = new Map();
   let physicalGlobalWindowStarted = process.hrtime.bigint();
   let physicalGlobalWindowCount = 0;
+  // Appends and committed-operation lookups share the same limited physical
+  // readback budget. A status certificate must not bypass append throttling.
+  function acquirePhysicalLease(fingerprint) {
+    const id = fingerprint.toUpperCase();
+    const now = process.hrtime.bigint();
+    if (now - physicalGlobalWindowStarted >= PHYSICAL_WINDOW_NS) {
+      physicalGlobalWindowStarted = now;
+      physicalGlobalWindowCount = 0;
+      physicalPrincipalWindowCounts.clear();
+    }
+    if (activePhysicalAppends >= MAX_ACTIVE_PHYSICAL_APPENDS
+      || activePhysicalPrincipals.has(id)
+      || physicalGlobalWindowCount >= MAX_PHYSICAL_APPENDS_GLOBAL_WINDOW
+      || (physicalPrincipalWindowCounts.get(id) || 0)
+        >= MAX_PHYSICAL_APPENDS_PER_PRINCIPAL_WINDOW) return false;
+    physicalGlobalWindowCount += 1;
+    physicalPrincipalWindowCounts.set(id,
+      (physicalPrincipalWindowCounts.get(id) || 0) + 1);
+    activePhysicalAppends += 1;
+    activePhysicalPrincipals.add(id);
+    return id;
+  }
   for (const [fingerprint, configuration] of Object.entries(principals)) {
     const grant = exact(configuration, ["roles", "scopes"]);
     if (!FINGERPRINT.test(fingerprint) || !Array.isArray(grant.roles)
@@ -254,6 +276,16 @@ function createZk1ContentInventoryHttpsServer({
       }
 
       const operation = normalizeOperation(raw.operation);
+      // Even an unknown operation may require a full SQLite catalog read.
+      // Charge all physical-mode status attempts BEFORE that potentially
+      // expensive lookup, not only successful physical readbacks. Otherwise
+      // a status certificate can flood random IDs without hitting a quota.
+      if (route.kind === "operation" && physicalVerifier) {
+        physicalLeasePrincipal = acquirePhysicalLease(peer.fingerprint256);
+        if (!physicalLeasePrincipal) {
+          return respond(response, 503, { error: "INVENTORY_UNAVAILABLE" });
+        }
+      }
       if (route.kind === "append") {
         const nonce = decode(raw.nonce, 32, 32);
         // Opt-in strict physical publishing path. mTLS append authorization
@@ -261,28 +293,10 @@ function createZk1ContentInventoryHttpsServer({
         // durable ciphertext. Only a separately provisioned read-only
         // PostgreSQL verifier may read the immutable intent and bytes.
         if (physicalVerifier) {
-          const id = peer.fingerprint256.toUpperCase();
-          const now = process.hrtime.bigint();
-          if (now - physicalGlobalWindowStarted >= PHYSICAL_WINDOW_NS) {
-            physicalGlobalWindowStarted = now;
-            physicalGlobalWindowCount = 0;
-            physicalPrincipalWindowCounts.clear();
-          }
-          if (activePhysicalAppends >= MAX_ACTIVE_PHYSICAL_APPENDS
-            || activePhysicalPrincipals.has(id)
-            || physicalGlobalWindowCount >= MAX_PHYSICAL_APPENDS_GLOBAL_WINDOW
-            || (physicalPrincipalWindowCounts.get(id) || 0)
-              >= MAX_PHYSICAL_APPENDS_PER_PRINCIPAL_WINDOW) {
+          physicalLeasePrincipal = acquirePhysicalLease(peer.fingerprint256);
+          if (!physicalLeasePrincipal) {
             return respond(response, 503, { error: "INVENTORY_UNAVAILABLE" });
           }
-          // Count failed verification attempts too: an attacker may send
-          // invalid operations repeatedly to consume finite PG scan work.
-          physicalGlobalWindowCount += 1;
-          physicalPrincipalWindowCounts.set(id,
-            (physicalPrincipalWindowCounts.get(id) || 0) + 1);
-          activePhysicalAppends += 1;
-          activePhysicalPrincipals.add(id);
-          physicalLeasePrincipal = id;
           await physicalVerifier.verifyCommittedInventoryOperation({ scope, operation });
         }
         const result = await ledger.append(operation);
@@ -358,6 +372,14 @@ function createZk1ContentInventoryHttpsServer({
         || result.sequence < 1 || !Buffer.isBuffer(result.root) || result.root.length !== 32
         || !Buffer.isBuffer(result.proof) || result.proof.length < 1
         || result.proof.length > inventory.MAX_COMMITTED_PROOF_BYTES) invalid();
+      // A committed ledger row is historical cryptographic evidence, not
+      // evidence that the ciphertext is still physically present. In the
+      // opt-in physical mode, status reconciliation also fails closed on
+      // changed bytes, stale generation, broken binding or failed WAL flush.
+      // No part of this response authorizes GET/release of protected content.
+      if (physicalVerifier) {
+        await physicalVerifier.verifyCommittedInventoryOperation({ scope, operation });
+      }
       return respond(response, 200, {
         status: "committed",
         operationId,
