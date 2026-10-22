@@ -120,6 +120,56 @@ test("Google Drive escapes lookup values and uses a deterministic duplicate", as
   assert.match(queries[0], /folder\\'one/);
 });
 
+test("Google Drive keeps backslash and apostrophe inside exact list and inventory query literals", async () => {
+  // Decode Drive's single-quoted q literals: both backslash and apostrophe are
+  // escaped with a backslash. An unescaped backslash can consume the escape on
+  // an apostrophe and turn following user text into a query clause.
+  const literals = (query) => {
+    const result = [];
+    let current = null;
+    for (let i = 0; i < query.length; i += 1) {
+      const char = query[i];
+      if (current === null) {
+        if (char === "'") current = "";
+      } else if (char === "\\") {
+        assert.ok(i + 1 < query.length, "Drive query cannot end inside an escape");
+        current += query[++i];
+      } else if (char === "'") {
+        result.push(current);
+        current = null;
+      } else {
+        current += char;
+      }
+    }
+    assert.equal(current, null, "Drive query must not have an unterminated string");
+    return result;
+  };
+  const folderId = "folder\\' or name='foreign";
+  const area = "uploads\\' or trashed=true or name='foreign";
+  const parent = "parent\\' or name='foreign";
+  const filename = "safe.txt";
+  const calls = [];
+  const storage = createCloudStorage({
+    provider: "gdrive", gdrive: { folderId: parent },
+    createGoogleDriveClient: async () => ({ files: {
+      list: async ({ q }) => {
+        calls.push(q);
+        return { data: { files: calls.length === 1 ? [{
+          id: "owned", parents: [parent], appProperties: {
+            rootArkKey: storage.key(folderId, filename, area),
+            rootArkFolderId: folderId, rootArkArea: area,
+          },
+        }] : [] } };
+      },
+    } }),
+  });
+  assert.deepEqual((await storage.list(folderId, area)).map((file) => file.id), ["owned"]);
+  assert.deepEqual(await storage.inventory(), []);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(literals(calls[0]), ["rootArkFolderId", folderId, "rootArkArea", area]);
+  assert.deepEqual(literals(calls[1]), [parent, "rootArkKey"]);
+});
+
 test("provider selection and configuration failures have stable categories", async () => {
   const unsupported = createCloudStorage({ provider: "ftp" });
   await assert.rejects(unsupported.list("root"), { code: "unsupported_provider" });

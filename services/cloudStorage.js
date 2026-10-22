@@ -114,7 +114,7 @@ function createCloudStorage(options = {}) {
   function assertProvider() { if (!["local", "s3", "gdrive"].includes(provider)) throw cloudError("unsupported_provider", "Unsupported cloud provider"); }
   function bucket() { if (!options.s3?.bucket) throw cloudError("configuration", "S3 bucket is not configured"); return options.s3.bucket; }
   function folder() { if (!options.gdrive?.folderId) throw cloudError("configuration", "Google Drive folder is not configured"); return options.gdrive.folderId; }
-  function escapeQuery(value) { return String(value).replace(/'/g, "\\'"); }
+  function escapeQuery(value) { return String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'"); }
   async function findDriveFile(cloudKey, folderId, area, signal = undefined) {
     const result = await (await drive()).files.list({
       q: `appProperties has { key='rootArkKey' and value='${escapeQuery(cloudKey)}' } and trashed=false`,
