@@ -351,6 +351,43 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     assert.equal(historical.tuple.revision, 1);
   });
 
+  await t.test("client verifies multi-step signed receipts against a fresh mTLS snapshot, rejecting gaps", async (child) => {
+    const h = await harness(child);
+    const reader = h.makeClient("reader");
+    const genesis = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+    const floor = await h.ledger.readLocalHead();
+    const receipts = [];
+    let head = floor;
+    let last;
+    for (let i = 1; i <= 3; i += 1) {
+      last = newOperation({ sequence: head.sequence, root: head.root,
+        objectId: Buffer.alloc(16, 0x80 + i) });
+      const commit = await h.ledger.append(last);
+      assert.equal(commit.status, "committed");
+      receipts.push((await h.ledger.getOperationStatus(last.operation_id)).proof);
+      head = { sequence: commit.sequence, root: commit.root };
+    }
+    const query = {
+      scope: h.scope, requested: requested(last),
+      minimumHead: floor, minimumSnapshot: genesis.bytes,
+    };
+    await assert.rejects(reader.getSnapshot({ ...query, nonce: crypto.randomBytes(32) }),
+      { code: "INVENTORY_HTTP_UNAVAILABLE" });
+    const inputReceipts = receipts.map((proof) => Buffer.from(proof));
+    const verifiedPromise = reader.getSnapshot({
+      ...query, nonce: crypto.randomBytes(32), committedProofChain: inputReceipts,
+    });
+    inputReceipts[0].fill(0);
+    inputReceipts.reverse();
+    const verified = await verifiedPromise;
+    assert.equal(verified.outcome, "PRESENT");
+    assert.equal(verified.verifiedInterveningReceipts, 3);
+    assert.deepEqual(verified.root, head.root);
+    await assert.rejects(reader.getSnapshot({
+      ...query, nonce: crypto.randomBytes(32), committedProofChain: receipts.slice(1),
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
+  });
+
   await t.test("exact append retry stays one signed head and replays after service and SQLite restart", async (child) => {
     const h = await harness(child);
     const writer = h.makeClient("writer");

@@ -521,11 +521,72 @@ function assertSuperset(currentEntries, previousEntries) {
   }
 }
 
+function normalizeCommittedProofChain(input) {
+  if (!Array.isArray(input) || input.length > MAX_ENTRIES) fail("INVENTORY_CHAIN");
+  const keys = Reflect.ownKeys(input);
+  if (keys.length !== input.length + 1 || !keys.includes("length")) fail("INVENTORY_CHAIN");
+  const result = [];
+  let total = 0;
+  for (let i = 0; i < input.length; i += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(input, String(i));
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) fail("INVENTORY_CHAIN");
+    const value = descriptor.value;
+    if (!isBytes(value) || (typeof SharedArrayBuffer !== "undefined"
+      && value.buffer instanceof SharedArrayBuffer)
+      || value.byteLength < 1 || value.byteLength > MAX_COMMITTED_PROOF_BYTES
+      || total > MAX_SNAPSHOT_BYTES - value.byteLength) fail("INVENTORY_LIMIT");
+    total += value.byteLength;
+    result.push(Buffer.from(value));
+  }
+  return result;
+}
+
+async function verifyInterveningProofChain({ receipts, previous, current, scope,
+  publicKey, signerKeyId }) {
+  const delta = current.sequence - previous.sequence;
+  if (receipts.length !== delta || delta < 1) fail("INVENTORY_CHAIN");
+  let sequence = previous.sequence;
+  let root = Buffer.from(previous.root);
+  let entries = previous.entries.slice();
+  for (const serialized of receipts) {
+    let decoded;
+    try { decoded = await z.decodeDeterministic(serialized); }
+    catch (_) { fail("INVENTORY_ENCODING"); }
+    const row = exactObject(decoded, COMMITTED_FIELDS, "INVENTORY_CHAIN");
+    const operation = {
+      operation_id: row.operation_id,
+      expected_sequence: row.expected_sequence,
+      expected_root: row.expected_root,
+      object_id: row.entry?.object_id,
+      revision: row.entry?.revision,
+      epoch: row.entry?.epoch,
+      ciphertext_sha256: row.entry?.ciphertext_sha256,
+    };
+    const verified = await verifyCommittedEntryProof({
+      serialized, pinnedPublicKey: publicKey, pinnedSignerKeyId: signerKeyId,
+      expectedScope: scope, operation,
+    });
+    if (verified.sequence !== sequence + 1
+      || row.expected_sequence !== sequence
+      || !sameBytes(copyBytes(row.expected_root, 32), root)) fail("INVENTORY_CHAIN");
+    entries = normalizeEntries([...entries, verified.tuple].sort((a, b) =>
+      Buffer.compare(a.object_id, b.object_id) || a.revision - b.revision));
+    const calculated = await computeRoot(scope, verified.sequence, root, entries);
+    if (!sameBytes(calculated, verified.root)) fail("INVENTORY_CHAIN");
+    sequence = verified.sequence;
+    root = verified.root;
+  }
+  if (sequence !== current.sequence || !sameBytes(root, current.root)
+    || entries.length !== current.entries.length) fail("INVENTORY_CHAIN");
+  assertSuperset(current.entries, entries);
+  assertSuperset(entries, current.entries);
+}
+
 async function verifySnapshot(input) {
   const raw = objectWithOptional(input, [
     "serialized", "pinnedPublicKey", "pinnedSignerKeyId", "expectedScope", "requested",
     "minimumHead", "nonce",
-  ], ["minimumSnapshot"], "INVENTORY_VERIFY_INPUT");
+  ], ["minimumSnapshot", "committedProofChain"], "INVENTORY_VERIFY_INPUT");
   const publicKey = validatePublicKey(raw.pinnedPublicKey);
   const pinnedSignerKeyId = copyBytes(raw.pinnedSignerKeyId, 16);
   const expectedScope = normalizeScope(raw.expectedScope);
@@ -535,6 +596,8 @@ async function verifySnapshot(input) {
   const serialized = copyBytes(raw.serialized, 1, MAX_SNAPSHOT_BYTES);
   const minimumSnapshot = raw.minimumSnapshot === null || raw.minimumSnapshot === undefined
     ? null : copyBytes(raw.minimumSnapshot, 1, MAX_SNAPSHOT_BYTES);
+  const chain = raw.committedProofChain === undefined || raw.committedProofChain === null
+    ? null : normalizeCommittedProofChain(raw.committedProofChain);
 
   const current = await parseAndVerifySnapshot(serialized, publicKey, pinnedSignerKeyId, expectedScope);
   if (!sameBytes(current.nonce, nonce)) fail("INVENTORY_NONCE");
@@ -543,9 +606,10 @@ async function verifySnapshot(input) {
   let previous = null;
   if (current.sequence === minimumHead.sequence) {
     if (!sameBytes(current.root, minimumHead.root)) fail("INVENTORY_FLOOR");
+    if (chain && chain.length) fail("INVENTORY_CHAIN");
   } else {
-    if (current.sequence !== minimumHead.sequence + 1) fail("INVENTORY_FLOOR_GAP");
-    if (!current.previousRoot || !sameBytes(current.previousRoot, minimumHead.root)) {
+    if (!chain && current.sequence !== minimumHead.sequence + 1) fail("INVENTORY_FLOOR_GAP");
+    if (!chain && (!current.previousRoot || !sameBytes(current.previousRoot, minimumHead.root))) {
       fail("INVENTORY_CHAIN");
     }
     if (!minimumSnapshot) fail("INVENTORY_HISTORY_REQUIRED");
@@ -554,6 +618,12 @@ async function verifySnapshot(input) {
       fail("INVENTORY_FLOOR_PROOF");
     }
     assertSuperset(current.entries, previous.entries);
+    if (chain) {
+      await verifyInterveningProofChain({
+        receipts: chain, previous, current, scope: expectedScope, publicKey,
+        signerKeyId: pinnedSignerKeyId,
+      });
+    }
   }
 
   let matched = null;
@@ -583,6 +653,7 @@ async function verifySnapshot(input) {
       epoch: matched.epoch,
       ciphertext_sha256: Buffer.from(matched.ciphertext_sha256),
     } : null,
+    verifiedInterveningReceipts: chain ? chain.length : 0,
   };
 }
 
@@ -606,5 +677,6 @@ module.exports = {
   createTerminalProof,
   verifyTerminalProof,
   verifyCommittedEntryProof,
+  normalizeCommittedProofChain,
   verifySnapshot,
 };

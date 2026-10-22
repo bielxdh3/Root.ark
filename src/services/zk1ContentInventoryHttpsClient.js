@@ -225,7 +225,7 @@ function createZk1ContentInventoryHttpsClient({
   const signerKeyId = copyBytes(inventorySignerKeyId, 16);
 
   function verifySnapshotResponse(response, { scope, nonce, requested: entry, minimumHead,
-    minimumSnapshot }) {
+    minimumSnapshot, committedProofChain }) {
     const raw = exact(response, ["status", "snapshotBase64"]);
     if (raw.status !== "snapshot") fail();
     const serialized = decode(raw.snapshotBase64, 1, inventory.MAX_SNAPSHOT_BYTES);
@@ -237,6 +237,7 @@ function createZk1ContentInventoryHttpsClient({
       requested: entry,
       minimumHead,
       minimumSnapshot,
+      committedProofChain,
       nonce,
     }).then((verification) => ({
       ...verification,
@@ -287,13 +288,17 @@ function createZk1ContentInventoryHttpsClient({
 
   return Object.freeze({
     getSnapshot(input) {
-      const raw = exact(input, ["scope", "nonce", "requested", "minimumHead"], ["minimumSnapshot"]);
+      const raw = exact(input, ["scope", "nonce", "requested", "minimumHead"],
+        ["minimumSnapshot", "committedProofChain"]);
       const scope = inventory.normalizeScope(raw.scope);
       const nonce = inventory.normalizeNonce(raw.nonce);
       const entry = inventory.normalizeRequested(raw.requested);
       const minimumHead = inventory.normalizeMinimumHead(raw.minimumHead);
       const minimumSnapshot = raw.minimumSnapshot === undefined || raw.minimumSnapshot === null
         ? undefined : copyBytes(raw.minimumSnapshot, 1, inventory.MAX_SNAPSHOT_BYTES);
+      // Snapshot all caller-controlled receipts before any TLS/network await.
+      const committedProofChain = raw.committedProofChain === undefined || raw.committedProofChain === null
+        ? undefined : inventory.normalizeCommittedProofChain(raw.committedProofChain);
       const response = call("/v1/inventory/snapshot", {
         scope: Object.fromEntries(Object.entries(scope).map(([field, value]) =>
           [field, value.toString("base64url")])),
@@ -307,7 +312,7 @@ function createZk1ContentInventoryHttpsClient({
           }
         } catch (_) { /* snapshot response is checked below */ }
         return verifySnapshotResponse(result, {
-          scope, nonce, requested: entry, minimumHead, minimumSnapshot,
+          scope, nonce, requested: entry, minimumHead, minimumSnapshot, committedProofChain,
         }).catch(() => fail());
       });
     },

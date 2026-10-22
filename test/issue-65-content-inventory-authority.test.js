@@ -1205,3 +1205,70 @@ test("committed inventory receipts bind the exact operation ID and signed versio
   assert.deepEqual((await inventory.verifyCommittedEntryProof({ ...input, serialized: again.proof })).root,
     commit.root);
 });
+
+test("multiple inventory revisions require a complete signed operation chain from the pinned floor", async (t) => {
+  const f = await testFixture(t);
+  const ledger = await f.openNew();
+  const genesis = await ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+  const base = await decodedSnapshot(genesis.bytes);
+  const receipts = [];
+  let head = { sequence: 0, root: base.root };
+  let lastTuple;
+  for (let i = 1; i <= 3; i += 1) {
+    lastTuple = makeTuple(Buffer.alloc(16, i), 1, 1);
+    const operation = { operation_id: crypto.randomBytes(16),
+      expected_sequence: head.sequence, expected_root: head.root, ...lastTuple };
+    const committed = await ledger.append(operation);
+    assert.equal(committed.status, "committed");
+    receipts.push((await ledger.getOperationStatus(operation.operation_id)).proof);
+    head = { sequence: committed.sequence, root: committed.root };
+  }
+  const nonce = crypto.randomBytes(32);
+  const snapshot = await ledger.getSnapshot({ nonce });
+  const args = {
+    serialized: snapshot.bytes, pinnedPublicKey: f.keys.publicKey,
+    pinnedSignerKeyId: f.signerKeyId, expectedScope: f.scope,
+    requested: requestFor(lastTuple),
+    minimumHead: { sequence: 0, root: base.root },
+    minimumSnapshot: genesis.bytes, nonce,
+  };
+  await assert.rejects(inventory.verifySnapshot(args), /INVENTORY_FLOOR_GAP/);
+  const verified = await inventory.verifySnapshot({ ...args, committedProofChain: receipts });
+  assert.equal(verified.outcome, "PRESENT");
+  assert.equal(verified.sequence, 3);
+  assert.equal(verified.verifiedInterveningReceipts, 3);
+  assert.deepEqual(verified.root, head.root);
+  await assert.rejects(inventory.verifySnapshot({
+    ...args, committedProofChain: receipts.slice(1),
+  }));
+  await assert.rejects(inventory.verifySnapshot({
+    ...args, committedProofChain: [receipts[1], receipts[0], receipts[2]],
+  }));
+  const tampered = Buffer.from(receipts[1]);
+  tampered[tampered.length - 1] ^= 1;
+  await assert.rejects(inventory.verifySnapshot({
+    ...args, committedProofChain: [receipts[0], tampered, receipts[2]],
+  }));
+  await assert.rejects(inventory.verifySnapshot({
+    ...args, committedProofChain: [Buffer.alloc(inventory.MAX_COMMITTED_PROOF_BYTES + 1)],
+  }), /INVENTORY_LIMIT/);
+  const sparse = new Array(3);
+  sparse[0] = receipts[0];
+  sparse[2] = receipts[2];
+  await assert.rejects(inventory.verifySnapshot({
+    ...args, committedProofChain: sparse,
+  }), /INVENTORY_CHAIN/);
+  const polluted = receipts.slice();
+  polluted.untrusted = receipts[0];
+  await assert.rejects(inventory.verifySnapshot({
+    ...args, committedProofChain: polluted,
+  }), /INVENTORY_CHAIN/);
+  const wrongBase = await inventory.createSignedSnapshot({
+    signerKeyId: f.signerKeyId, privateKey: f.keys.privateKey,
+    scope: f.scope, sequence: 0, previousRoot: null, entries: [], nonce: crypto.randomBytes(32),
+  });
+  await assert.rejects(inventory.verifySnapshot({
+    ...args, minimumHead: { sequence: 0, root: Buffer.alloc(32, 0x74) },
+    minimumSnapshot: wrongBase, committedProofChain: receipts,
+  }));
+});
