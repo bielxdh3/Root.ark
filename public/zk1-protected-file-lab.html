@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Arquivo protegido zk-1 · laboratório</title>
+  <link rel="stylesheet" href="/styles/zk-dev-vault.css">
+  <script defer src="/client/rootark-zk1-file-content.js"></script>
+  <script defer src="/client/rootark-zk1-ciphertext-chunk-root.js"></script>
+  <script defer src="/client/rootark-zk1-ciphertext-download-integrity.js"></script>
+  <script defer src="/client/rootark-zk1-owner-signed-checkpoint.js"></script>
+  <script defer src="/client/rootark-zk1-owner-ciphertext-root-checkpoint.js"></script>
+  <script defer src="/client/rootark-zk1-protected-http-client.js"></script>
+  <script defer src="/client/rootark-zk1-uncertain-put-reconciliation.js"></script>
+  <script defer src="/client/rootark-zk1-normal-browser-content.js"></script>
+  <script defer src="/client/rootark-zk1-normal-browser-lab-ui.js"></script>
+</head>
+<body>
+  <main class="vault">
+    <header>
+      <a class="back" href="/">← Arquivos</a>
+      <span class="eyebrow">Root.ark · Desenvolvimento · zk-1</span>
+      <h1>Arquivo protegido com confirmação no navegador</h1>
+      <p>Importe a identidade do proprietário e o checkpoint atual por um canal
+      independente do servidor. A assinatura do proprietário precisa autorizar
+      o dispositivo na mesma revisão e época. O navegador cifra o arquivo,
+      envia apenas ciphertext e relê o resultado pela rota protegida.</p>
+    </header>
+    <section class="panel">
+      <h2>1. Autoridade externa e dispositivo</h2>
+      <p class="notice">Use somente arquivos de desenvolvimento descartáveis.
+      Esta página não distribui, salva ou recupera chaves. O checkpoint e a
+      identidade do proprietário devem ser conferidos fora do Root.ark; um
+      arquivo oferecido pelo servidor não comprova a autoridade atual.</p>
+      <label for="owner-key">Chave pública Ed25519 do proprietário (raw, 32 bytes)</label>
+      <input id="owner-key" type="file">
+      <label for="owner-hash">SHA-256 da chave pública, base64url (pin independente)</label>
+      <input id="owner-hash" type="text" maxlength="43" autocomplete="off" spellcheck="false">
+      <label for="head-revision">Revisão atual confirmada externamente</label>
+      <input id="head-revision" type="number" min="1" step="1">
+      <label for="head-digest">Digest da revisão atual, base64url (pin independente)</label>
+      <input id="head-digest" type="text" maxlength="43" autocomplete="off" spellcheck="false">
+      <label for="head-epoch">Época atual confirmada externamente</label>
+      <input id="head-epoch" type="number" min="1" step="1">
+      <label for="device-grant">Autorização do dispositivo assinada pelo proprietário (.json)</label>
+      <input id="device-grant" type="file" accept=".json,application/json">
+      <label for="device-public">Chave pública Ed25519 do dispositivo (raw, 32 bytes)</label>
+      <input id="device-public" type="file">
+      <label for="device-private">Chave privada Ed25519 do dispositivo (PKCS#8 local)</label>
+      <input id="device-private" type="file">
+    </section>
+    <section class="panel">
+      <h2>2. Cifrar, enviar e conferir</h2>
+      <label for="file">Arquivo descartável (até 2 MiB)</label>
+      <input id="file" type="file">
+      <button id="upload" type="button">Enviar ciphertext e conferir GET protegido</button>
+      <p class="notice">A chave de conteúdo aleatória permanece apenas na
+      memória durante esta operação. O resultado não é um arquivo recuperável
+      após fechar a página. Uma confirmação HTTP não comprova durabilidade
+      externa. Nenhuma cópia legada é modificada.</p>
+    </section>
+    <p id="status" role="status" aria-live="polite">Aguardando arquivos e pins confiáveis.</p>
+  </main>
+</body>
+</html>

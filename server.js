@@ -5963,6 +5963,14 @@ app.use((req, res, next) => {
   }
   next();
 });
+app.use((req, res, next) => {
+  if (req.path === "/zk1-protected-file-lab.html"
+    && (NODE_ENV === "production"
+      || !process.env.ROOTARK_ZK1_CONTENT_CONFIG)) {
+    return res.sendStatus(404);
+  }
+  next();
+});
 app.use(express.static("./public"));
 app.post("/upload-chunk", uploadChunkPeerRateLimit);
 app.use(apiRequestRateLimit);
