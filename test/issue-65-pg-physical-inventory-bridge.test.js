@@ -385,6 +385,161 @@ test("physical attestor separately rejects poisoned admission UPDATE and head IN
   }
 });
 
+test("physical attestor rejects destructive SET ROLE reachability hidden behind NOINHERIT", {
+  skip: !enabled && "requires disposable PostgreSQL 18 membership options",
+}, async (t) => {
+  const f = await fixture(t);
+  assert.equal((await f.bridge().putAndAttest(f.physical)).status,
+    "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+  const login = "zkattestorswitch_" + crypto.randomBytes(6).toString("hex");
+  const hidden = "zkhiddenwriter_" + crypto.randomBytes(6).toString("hex");
+  const password = crypto.randomBytes(24).toString("hex");
+  await f.admin.query(`CREATE ROLE ${hidden} NOLOGIN NOINHERIT`);
+  await f.admin.query(`CREATE ROLE ${login} LOGIN INHERIT PASSWORD '${password}'`);
+  await f.admin.query(`GRANT zk1_physical_attestor_runtime TO ${login}`);
+  await f.admin.query(`GRANT USAGE ON SCHEMA zk1_gate TO ${hidden}`);
+  await f.admin.query(`GRANT TRUNCATE ON zk1_gate.physical_inventory_intent TO ${hidden}`);
+  // Deliberately no inherited DML: existing direct-login privilege preflight
+  // will report false until SET ROLE switches to the hidden destructive role.
+  await f.admin.query(`GRANT ${hidden} TO ${login} WITH INHERIT FALSE, SET TRUE`);
+  const url = new URL(process.env.ROOTARK_ZK1_ATTESTOR_PG_URL);
+  url.username = login;
+  url.password = password;
+  const poisonedPool = new Pool({ connectionString: url.toString(), max: 1,
+    connectionTimeoutMillis: 2500 });
+  try {
+    const c = await poisonedPool.connect();
+    try {
+      const before = await c.query(`SELECT
+        pg_catalog.has_table_privilege(current_user,
+          'zk1_gate.physical_inventory_intent','TRUNCATE') AS direct_power,
+        pg_catalog.pg_has_role(current_user,'zk1_physical_attestor_runtime','USAGE') AS normal_attestor,
+        pg_catalog.pg_has_role(current_user,$1,'SET') AS may_set_role`, [hidden]);
+      assert.deepEqual(before.rows[0],
+        { direct_power: false, normal_attestor: true, may_set_role: true });
+      await c.query(`SET ROLE ${hidden}`);
+      const after = await c.query(`SELECT pg_catalog.has_table_privilege(current_user,
+        'zk1_gate.physical_inventory_intent','TRUNCATE') AS gained_power`);
+      assert.equal(after.rows[0].gained_power, true,
+        "the poisoned login really can obtain TRUNCATE via SET ROLE");
+      await c.query("RESET ROLE");
+    } finally {
+      c.release();
+    }
+    const verifier = new Zk1SharedPgPhysicalCiphertextVerifier({ pool: poisonedPool });
+    await assert.rejects(verifier.verifyExact({
+      scope: f.scope, objectId: f.op.object_id.toString("base64url"),
+      revision: 1, digest: f.digest, expectedRootHash: f.root,
+      expectedChunkCount: f.chunks.length, expectedSha256: f.op.ciphertext_sha256,
+      operationId: f.op.operation_id, expectedInventorySequence: f.op.expected_sequence,
+      expectedInventoryRoot: f.op.expected_root, epoch: f.op.epoch,
+    }), /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+    "read-only attestation must fail if its login can SET ROLE into destructive privilege");
+    assert.equal((await f.admin.query(`SELECT COUNT(*)::integer AS n FROM
+      zk1_gate.physical_inventory_intent WHERE scope_key=$1`, [f.key])).rows[0].n, 1,
+    "the proof must not mutate owner physical evidence");
+  } finally {
+    await poisonedPool.end();
+    await f.admin.query(`REVOKE ${hidden} FROM ${login}`);
+    await f.admin.query(`REVOKE zk1_physical_attestor_runtime FROM ${login}`);
+    await f.admin.query(`REVOKE TRUNCATE ON zk1_gate.physical_inventory_intent FROM ${hidden}`);
+    await f.admin.query(`REVOKE USAGE ON SCHEMA zk1_gate FROM ${hidden}`);
+    await f.admin.query(`DROP ROLE ${login}`);
+    await f.admin.query(`DROP ROLE ${hidden}`);
+  }
+});
+
+test("physical attestor refuses schema CREATE and table MAINTAIN grants on its SQL identity", {
+  skip: !enabled && "requires disposable PostgreSQL 18 MAINTAIN capability",
+}, async (t) => {
+  const f = await fixture(t);
+  assert.equal((await f.bridge().putAndAttest(f.physical)).status,
+    "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+  const login = "zkattestorddl_" + crypto.randomBytes(6).toString("hex");
+  const password = crypto.randomBytes(24).toString("hex");
+  await f.admin.query(`CREATE ROLE ${login} LOGIN PASSWORD '${password}'`);
+  await f.admin.query(`GRANT zk1_physical_attestor_runtime TO ${login}`);
+  const url = new URL(process.env.ROOTARK_ZK1_ATTESTOR_PG_URL);
+  url.username = login;
+  url.password = password;
+  const poisonedPool = new Pool({ connectionString: url.toString(), max: 1,
+    connectionTimeoutMillis: 2500 });
+  const verify = () => new Zk1SharedPgPhysicalCiphertextVerifier({ pool: poisonedPool })
+    .verifyExact({ scope: f.scope,
+      objectId: f.op.object_id.toString("base64url"), revision: 1,
+      digest: f.digest, expectedRootHash: f.root,
+      expectedChunkCount: f.chunks.length, expectedSha256: f.op.ciphertext_sha256,
+      operationId: f.op.operation_id, expectedInventorySequence: f.op.expected_sequence,
+      expectedInventoryRoot: f.op.expected_root, epoch: f.op.epoch });
+  try {
+    await f.admin.query(`GRANT MAINTAIN ON zk1_gate.sealed_object TO ${login}`);
+    assert.equal((await poisonedPool.query(`SELECT pg_catalog.has_table_privilege(
+      current_user,'zk1_gate.sealed_object','MAINTAIN') AS capability`)).rows[0].capability,
+    true);
+    await assert.rejects(verify(), /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+      "VACUUM/REINDEX/CLUSTER capability is not strictly read-only");
+    await f.admin.query(`REVOKE MAINTAIN ON zk1_gate.sealed_object FROM ${login}`);
+    await f.admin.query(`GRANT CREATE ON SCHEMA zk1_gate TO ${login}`);
+    assert.equal((await poisonedPool.query(`SELECT pg_catalog.has_schema_privilege(
+      current_user,'zk1_gate','CREATE') AS capability`)).rows[0].capability, true);
+    await assert.rejects(verify(), /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+      "ability to create objects in the protected schema is not read-only");
+  } finally {
+    await poisonedPool.end();
+    await f.admin.query(`REVOKE MAINTAIN ON zk1_gate.sealed_object FROM ${login}`);
+    await f.admin.query(`REVOKE CREATE ON SCHEMA zk1_gate FROM ${login}`);
+    await f.admin.query(`REVOKE zk1_physical_attestor_runtime FROM ${login}`);
+    await f.admin.query(`DROP ROLE ${login}`);
+  }
+});
+
+test("physical attestor rejects indirect privileged PostgreSQL OS role without executing commands", {
+  skip: !enabled && "requires disposable PostgreSQL 18 predefined role membership",
+}, async (t) => {
+  const f = await fixture(t);
+  assert.equal((await f.bridge().putAndAttest(f.physical)).status,
+    "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+  const login = "zkattestorescape_" + crypto.randomBytes(6).toString("hex");
+  const hidden = "zkhostrole_" + crypto.randomBytes(6).toString("hex");
+  const password = crypto.randomBytes(24).toString("hex");
+  await f.admin.query(`CREATE ROLE ${hidden} NOLOGIN NOINHERIT`);
+  await f.admin.query(`CREATE ROLE ${login} LOGIN PASSWORD '${password}'`);
+  await f.admin.query(`GRANT zk1_physical_attestor_runtime TO ${login}`);
+  await f.admin.query(`GRANT pg_execute_server_program TO ${hidden}
+    WITH INHERIT FALSE, SET TRUE`);
+  await f.admin.query(`GRANT ${hidden} TO ${login} WITH INHERIT FALSE, SET TRUE`);
+  const url = new URL(process.env.ROOTARK_ZK1_ATTESTOR_PG_URL);
+  url.username = login;
+  url.password = password;
+  const poisonedPool = new Pool({ connectionString: url.toString(), max: 1,
+    connectionTimeoutMillis: 2500 });
+  try {
+    const observed = await poisonedPool.query(`SELECT
+      pg_catalog.pg_has_role(current_user,'pg_execute_server_program','USAGE') AS effective,
+      pg_catalog.pg_has_role(current_user,'pg_execute_server_program','SET') AS reachable`);
+    assert.deepEqual(observed.rows[0], { effective: false, reachable: true },
+      "a non-inherited predefined role grants dangerous future SET ROLE powers");
+    // NEVER actually run COPY TO PROGRAM, filesystem writes, shell or remote
+    // services. Prove the privilege graph only, then require verifier denial.
+    const verifier = new Zk1SharedPgPhysicalCiphertextVerifier({ pool: poisonedPool });
+    await assert.rejects(verifier.verifyExact({
+      scope: f.scope, objectId: f.op.object_id.toString("base64url"),
+      revision: 1, digest: f.digest, expectedRootHash: f.root,
+      expectedChunkCount: f.chunks.length, expectedSha256: f.op.ciphertext_sha256,
+      operationId: f.op.operation_id, expectedInventorySequence: f.op.expected_sequence,
+      expectedInventoryRoot: f.op.expected_root, epoch: f.op.epoch,
+    }), /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+    "predefined PostgreSQL execution powers invalidate read-only physical attestation");
+  } finally {
+    await poisonedPool.end();
+    await f.admin.query(`REVOKE ${hidden} FROM ${login}`);
+    await f.admin.query(`REVOKE zk1_physical_attestor_runtime FROM ${login}`);
+    await f.admin.query(`REVOKE pg_execute_server_program FROM ${hidden}`);
+    await f.admin.query(`DROP ROLE ${login}`);
+    await f.admin.query(`DROP ROLE ${hidden}`);
+  }
+});
+
 test("a different physical scope cannot poison the fixed-scope Ed25519 inventory before rejection", {
   skip: !enabled && "requires disposable PostgreSQL 18 lab",
 }, async (t) => {

@@ -75,7 +75,9 @@ class Zk1SharedPgPhysicalCiphertextVerifier {
       await client.query("SET LOCAL statement_timeout = '8000ms'");
       const role = await client.query(`SELECT session_user AS login,current_user AS role,
         r.rolsuper AS superuser, r.rolcreatedb AS create_db,
-        r.rolcreaterole AS create_role,
+        r.rolcreaterole AS create_role, r.rolreplication AS replication,
+        r.rolbypassrls AS bypass_rls,
+        pg_catalog.has_schema_privilege(current_user,'zk1_gate','CREATE') AS can_create_gate_schema,
         pg_catalog.pg_has_role(current_user,'zk1_gate_runtime','USAGE') AS gate,
         pg_catalog.pg_has_role(current_user,'zk1_gate_runtime','MEMBER') AS gate_member,
         pg_catalog.pg_has_role(current_user,'zk1_chunk_writer_runtime','USAGE') AS writer,
@@ -121,11 +123,38 @@ class Zk1SharedPgPhysicalCiphertextVerifier {
         WHERE pg_catalog.has_any_column_privilege(current_user,protected_table.name,
           'INSERT, UPDATE, REFERENCES')
           OR pg_catalog.has_table_privilege(current_user,protected_table.name,
-            'DELETE, TRUNCATE, TRIGGER')) AS any_protected_mutation
+            'DELETE, TRUNCATE, TRIGGER, MAINTAIN')) AS any_protected_mutation,
+        -- NOINHERIT and GRANT ... WITH INHERIT FALSE can hide capabilities
+        -- from checks on current_user. A login that can SET ROLE to any other
+        -- MEMBER with destructive access is not a read-only attestation
+        -- identity, even when it chooses not to switch during this request.
+        EXISTS (SELECT 1 FROM pg_catalog.pg_roles AS reachable
+          WHERE reachable.rolname<>current_user
+            AND pg_catalog.pg_has_role(current_user,reachable.oid,'MEMBER')
+            AND (reachable.rolsuper OR reachable.rolcreatedb OR reachable.rolcreaterole
+              OR reachable.rolreplication OR reachable.rolbypassrls
+              -- PostgreSQL predefined roles can run host OS commands, write
+              -- server files, access other tenants, checkpoint or signal
+              -- backends without ordinary DML grants on these tables.
+              OR pg_catalog.left(reachable.rolname,3)='pg_'
+              OR pg_catalog.has_schema_privilege(reachable.oid,'zk1_gate','CREATE')
+              OR EXISTS (SELECT 1 FROM (VALUES
+                ('zk1_gate.head'), ('zk1_gate.admission'),
+                ('zk1_gate.writer_binding'), ('zk1_gate.physical_stop_receipt'),
+                ('zk1_gate.ciphertext_chunk'), ('zk1_gate.sealed_object'),
+                ('zk1_gate.physical_inventory_intent'),
+                ('zk1_gate.physical_inventory_admission')
+              ) AS protected_table(name)
+              WHERE pg_catalog.has_any_column_privilege(reachable.oid,protected_table.name,
+                'INSERT, UPDATE, REFERENCES')
+                OR pg_catalog.has_table_privilege(reachable.oid,protected_table.name,
+                  'DELETE, TRUNCATE, TRIGGER, MAINTAIN')))) AS any_dormant_mutation
         FROM pg_catalog.pg_roles r WHERE r.rolname=current_user`);
       const r = role.rows?.[0];
       if (role.rowCount !== 1 || !r || r.login !== r.role || r.superuser !== false
-        || r.create_db !== false || r.create_role !== false || r.attestor !== true
+        || r.create_db !== false || r.create_role !== false
+        || r.replication !== false || r.bypass_rls !== false
+        || r.can_create_gate_schema !== false || r.attestor !== true
         || r.gate !== false || r.gate_member !== false
         || r.writer !== false || r.writer_member !== false
         || r.stop !== false || r.stop_member !== false
@@ -143,7 +172,8 @@ class Zk1SharedPgPhysicalCiphertextVerifier {
         || r.dangerous_binding !== false || r.dangerous_chunks !== false
         || r.refs_head !== false || r.refs_seal !== false
         || r.refs_intent !== false || r.refs_binding !== false
-        || r.any_protected_mutation !== false) fail();
+        || r.any_protected_mutation !== false
+        || r.any_dormant_mutation !== false) fail();
       const settings = await client.query("SHOW fsync");
       const synchronous = await client.query("SHOW synchronous_commit");
       const full = await client.query("SHOW full_page_writes");
