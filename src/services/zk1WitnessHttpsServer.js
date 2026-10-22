@@ -158,7 +158,7 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals,
     if (roles.includes("cas-anchor")
       ? roles.length !== 1 || scopes.length !== 0 || initializeKeys.length !== 0
         || !casAnchorFloor || typeof casAnchorFloor.advance !== "function"
-        || typeof casAnchorFloor.freshHead !== "function"
+        || typeof casAnchorFloor.freshHeadAsync !== "function"
       : scopes.length === 0) invalid();
     const scoped = new Set(scopes.map((scope) => scopeKey(normalize(scope, SCOPE_FIELDS))));
     if (scoped.size !== scopes.length) invalid();
@@ -199,7 +199,7 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals,
         req.url === "/v1/cas-anchor/advance" ? 40 * 1024 : MAX_BODY_BYTES);
       if (req.url === "/v1/cas-anchor/head") {
         exact(body, ["nonce"]);
-        const head = casAnchorFloor.freshHead({ nonce: decode(body.nonce, BYTE_FIELDS.nonce) });
+        const head = await casAnchorFloor.freshHeadAsync({ nonce: decode(body.nonce, BYTE_FIELDS.nonce) });
         return write(res, 200, { head, authority: "WITNESS_CAS_ANCHOR_FLOOR_V1" });
       }
       if (req.url === "/v1/cas-anchor/advance") {

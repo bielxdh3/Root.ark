@@ -6,6 +6,7 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { Worker } = require("node:worker_threads");
 const Database = require("better-sqlite3");
 
 const RECORD_DOMAIN = Buffer.from("Root.ark/zk-1/cas-terminal-anchor/v1\0", "ascii");
@@ -114,6 +115,11 @@ class Zk1WitnessCasAnchorFloor {
   #verifiedChain = crypto.createHash("sha256");
   #verifiedChainDigest = digest("");
   #externalMinimum;
+  #filename;
+  #fileIdentity;
+  #closed = false;
+  #activeHeadVerifications = 0;
+  #generation = 0;
   constructor(filename, { bootstrapNew = false, witnessKeyId, witnessPrivateKey,
     statusKeyId, statusPublicKey, trustedMinimumHead } = {}) {
     if (trustedMinimumHead !== undefined) {
@@ -147,6 +153,8 @@ class Zk1WitnessCasAnchorFloor {
     }
     const db = new Database(absolute, { fileMustExist: true });
     try {
+      this.#filename = absolute;
+      this.#fileIdentity = fs.statSync(absolute, { bigint: true });
       db.pragma("journal_mode = WAL");
       db.pragma("synchronous = FULL");
       db.pragma("foreign_keys = ON");
@@ -198,6 +206,112 @@ class Zk1WitnessCasAnchorFloor {
         lastHash: state?.hash || ZERO });
       this.#db = db;
     } catch (error) { db.close(); fail(); }
+  }
+  #quickHeadCheck() {
+    return this.#db.transaction(() => {
+      const identity = this.#db.prepare(
+        "SELECT identity FROM witness_cas_floor_identity WHERE id=1").get();
+      const row = this.#db.prepare("SELECT sequence,line,hash,predecessor FROM witness_cas_floor_event"
+        + " ORDER BY sequence DESC LIMIT 1").get();
+      const count = this.#db.prepare("SELECT COUNT(*) AS n FROM witness_cas_floor_event").get().n;
+      const trusted = this.#trustedFloor;
+      if (!identity || identity.identity !== this.#identity || count > 100000
+        || count !== trusted.sequence || count !== (row?.sequence || 0)
+        || (row?.hash || ZERO) !== trusted.lastHash
+        || (this.#externalMinimum && (count < this.#externalMinimum.sequence
+          || (this.#externalMinimum.sequence > 0
+            && this.#db.prepare("SELECT hash FROM witness_cas_floor_event WHERE sequence=?")
+              .get(this.#externalMinimum.sequence)?.hash !== this.#externalMinimum.lastHash)))) fail();
+      if (row) {
+        const signed = parseRecord(row.line, this.#status);
+        if (signed.sequence !== row.sequence || signed.lastHash !== row.hash
+          || signed.previousHash !== row.predecessor) fail();
+      }
+      return trusted;
+    }).deferred();
+  }
+  #assertFileIdentity() {
+    const now = fs.statSync(this.#filename, { bigint: true });
+    if (!now.isFile() || now.dev !== this.#fileIdentity.dev
+      || now.ino !== this.#fileIdentity.ino) fail();
+  }
+  #fileMutationStamp() {
+    // data_version detects committed SQL changes from another connection.
+    // Also detect visible direct file/WAL edits between the worker's snapshot
+    // and the signature decision (such writes may bypass SQLite counters).
+    const stamp = (filename) => {
+      let stat;
+      try { stat = fs.lstatSync(filename, { bigint: true }); }
+      catch (error) { if (error?.code === "ENOENT") return null; throw error; }
+      if (!stat.isFile() || stat.isSymbolicLink()) fail();
+      return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs]
+        .map((v) => v.toString()).join(":");
+    };
+    return JSON.stringify([stamp(this.#filename), stamp(this.#filename + "-wal")]);
+  }
+  #signHead(nonce, value) {
+    const unsigned = { type: "rootark-zk1-witness-cas-anchor-floor/v1",
+      witnessKeyId: this.#witnessId.toString("base64url"),
+      statusKeyId: this.#statusId.toString("base64url"),
+      sequence: value.sequence, lastHash: value.lastHash,
+      nonce: nonce.toString("base64url") };
+    const signature = crypto.sign(null, Buffer.concat([FLOOR_DOMAIN,
+      Buffer.from(JSON.stringify(unsigned))]), this.#witness);
+    return Object.freeze({ ...unsigned, signature: signature.toString("base64url") });
+  }
+  // HTTPS-only path. Full SQLite snapshot verification executes off the HTTP
+  // thread; the signer private key never enters the worker. Limit concurrent
+  // snapshots so hostile clients cannot create an unbounded worker/DB pool.
+  async freshHeadAsync({ nonce }) {
+    if ((!Buffer.isBuffer(nonce) && !(nonce instanceof Uint8Array))
+      || nonce.byteLength !== 32) fail();
+    const challenge = Buffer.from(nonce); // pin caller's nonce before any await
+    if (this.#closed || this.#activeHeadVerifications >= 2) fail();
+    this.#activeHeadVerifications += 1;
+    try {
+      this.#assertFileIdentity();
+      const initialMutationStamp = this.#fileMutationStamp();
+      const initialDataVersion = this.#db.pragma("data_version", { simple: true });
+      this.#quickHeadCheck();
+      const pinned = { sequence: this.#trustedFloor.sequence,
+        lastHash: this.#trustedFloor.lastHash,
+        chainDigest: this.#verifiedChainDigest, generation: this.#generation };
+      const dbInfo = { filename: this.#filename, identity: this.#identity,
+        sequence: pinned.sequence, lastHash: pinned.lastHash,
+        chainDigest: pinned.chainDigest,
+        fileDev: this.#fileIdentity.dev.toString(),
+        fileIno: this.#fileIdentity.ino.toString() };
+      await new Promise((resolve, reject) => {
+        const worker = new Worker(path.join(__dirname, "zk1WitnessCasAnchorHeadVerifierWorker.js"),
+          { workerData: dbInfo });
+        let verified = false;
+        let settled = false;
+        const timer = setTimeout(() => { worker.terminate(); finish(false); }, 15000);
+        const finish = (ok) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (ok) resolve();
+          else reject(new Error("WITNESS_CAS_FLOOR_DENIED"));
+        };
+        worker.on("message", (result) => { if (result === "VERIFIED") verified = true; else finish(false); });
+        worker.once("error", () => finish(false));
+        worker.once("exit", (code) => finish(code === 0 && verified));
+      });
+      // Any CAS append or external SQLite writer during the snapshot invalidates
+      // the completed proof. Recheck the authenticated final row before signing.
+      if (this.#closed || this.#generation !== pinned.generation
+        || this.#verifiedChainDigest !== pinned.chainDigest
+        || this.#db.pragma("data_version", { simple: true }) !== initialDataVersion
+        || this.#fileMutationStamp() !== initialMutationStamp) fail();
+      this.#assertFileIdentity();
+      const fresh = this.#quickHeadCheck();
+      if (this.#db.pragma("data_version", { simple: true }) !== initialDataVersion
+        || this.#fileMutationStamp() !== initialMutationStamp
+        || fresh.sequence !== pinned.sequence || fresh.lastHash !== pinned.lastHash) fail();
+      return this.#signHead(challenge, fresh);
+    } catch (_) { fail(); }
+    finally { this.#activeHeadVerifications -= 1; }
   }
   head() {
     try {
@@ -280,21 +394,15 @@ class Zk1WitnessCasAnchorFloor {
     }
     this.#verifiedChainDigest = this.#verifiedChain.copy().digest("hex");
     this.#trustedFloor = Object.freeze({ ...updated });
+    this.#generation += 1;
     return updated;
   }
   freshHead({ nonce }) {
     if ((!Buffer.isBuffer(nonce) && !(nonce instanceof Uint8Array))
       || nonce.byteLength !== 32) fail();
     const value = this.head();
-    const unsigned = { type: "rootark-zk1-witness-cas-anchor-floor/v1",
-      witnessKeyId: this.#witnessId.toString("base64url"),
-      statusKeyId: this.#statusId.toString("base64url"),
-      sequence: value.sequence, lastHash: value.lastHash,
-      nonce: Buffer.from(nonce).toString("base64url") };
-    const signature = crypto.sign(null, Buffer.concat([FLOOR_DOMAIN,
-      Buffer.from(JSON.stringify(unsigned))]), this.#witness);
-    return Object.freeze({ ...unsigned, signature: signature.toString("base64url") });
+    return this.#signHead(Buffer.from(nonce), value);
   }
-  close() { if (this.#db.open) this.#db.close(); }
+  close() { this.#closed = true; if (this.#db.open) this.#db.close(); }
 }
 module.exports = { Zk1WitnessCasAnchorFloor, verifyFreshWitnessCasFloor };
