@@ -2,7 +2,22 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { pipeline } = require("stream/promises");
+const { Transform } = require("stream");
 const { normalizeProviderError } = require("../src/services/deploymentResilience");
+
+function abortableProviderRead(action, signal) {
+  if (!signal) return action();
+  return new Promise((resolve, reject) => {
+    const unavailable = () => cloudError("provider_error", "Bounded cloud readback deadline exceeded");
+    if (signal.aborted) return reject(unavailable());
+    const aborted = () => reject(unavailable());
+    signal.addEventListener("abort", aborted, { once: true });
+    Promise.resolve().then(action).then(
+      (value) => { signal.removeEventListener("abort", aborted); resolve(value); },
+      (error) => { signal.removeEventListener("abort", aborted); reject(error); },
+    );
+  });
+}
 
 function createCloudStorage(options = {}) {
   const provider = String(options.provider || "local").toLowerCase();
@@ -100,13 +115,13 @@ function createCloudStorage(options = {}) {
   function bucket() { if (!options.s3?.bucket) throw cloudError("configuration", "S3 bucket is not configured"); return options.s3.bucket; }
   function folder() { if (!options.gdrive?.folderId) throw cloudError("configuration", "Google Drive folder is not configured"); return options.gdrive.folderId; }
   function escapeQuery(value) { return String(value).replace(/'/g, "\\'"); }
-  async function findDriveFile(cloudKey, folderId, area) {
+  async function findDriveFile(cloudKey, folderId, area, signal = undefined) {
     const result = await (await drive()).files.list({
       q: `appProperties has { key='rootArkKey' and value='${escapeQuery(cloudKey)}' } and trashed=false`,
       fields: "files(id,name,parents,appProperties)",
       spaces: "drive",
       pageSize: 100,
-    });
+    }, signal ? { signal } : undefined);
     const files = result.data.files || [];
     for (const file of files) assertDriveFileOwnership(file, cloudKey, folderId, area);
     return files.sort((a, b) => String(a.id).localeCompare(String(b.id)))[0] || null;
@@ -126,8 +141,9 @@ function createCloudStorage(options = {}) {
     if (!isDriveFileId(id)) throw cloudError("provider_error", "Google Drive did not reserve a valid file ID");
     return id;
   }
-  async function getDriveFile(fileId) {
-    return (await (await drive()).files.get({ fileId, fields: "id,parents,appProperties" })).data;
+  async function getDriveFile(fileId, signal = undefined) {
+    return (await (await drive()).files.get({ fileId, fields: "id,parents,appProperties" },
+      signal ? { signal } : undefined)).data;
   }
   function assertDriveFileOwnership(file, cloudKey, folderId, area) {
     const properties = file?.appProperties || {};
@@ -251,30 +267,76 @@ function createCloudStorage(options = {}) {
     }
     const result = await (await drive()).files.create({ requestBody: { ...requestBody, parents: [folder()] }, media, fields: "id" }); return { provider, key: cloudKey, id: result.data.id };
   }
-  async function download(folderId, fileName, localPath, area = "uploads", canPublish = () => true) {
+  async function download(folderId, fileName, localPath, area = "uploads", canPublish = () => true,
+    constraints = undefined) {
     assertProvider(); if (!enabled() || fs.existsSync(localPath)) return false;
+    if (constraints !== undefined && (!constraints || typeof constraints !== "object"
+      || Array.isArray(constraints) || Reflect.ownKeys(constraints).length !== 1
+      || !Object.hasOwn(constraints, "maxBytes")
+      || !Number.isSafeInteger(constraints.maxBytes)
+      || constraints.maxBytes < 1 || constraints.maxBytes > 16 * 1024 * 1024)) {
+      throw cloudError("invalid_path", "Invalid bounded ciphertext download");
+    }
     const cloudKey = objectKey(folderId, fileName, area);
     const parentPath = path.dirname(localPath);
     fs.mkdirSync(parentPath, { recursive: true });
     const stagingDirectory = fs.mkdtempSync(path.join(parentPath, ".rootark-cloud-cache-"));
     const stagedPath = path.join(stagingDirectory, path.basename(localPath));
+    const boundedController = constraints ? new AbortController() : null;
+    const boundedDeadline = boundedController ? setTimeout(() => boundedController.abort(), 15000) : null;
+    const signal = boundedController?.signal;
     try {
       let input;
-      if (provider === "s3") { const bucketName = bucket(); input = (await (await s3()).send(new (require("@aws-sdk/client-s3").GetObjectCommand)({ Bucket: bucketName, Key: cloudKey }))).Body; }
-      else {
-        const existing = await findDriveFile(cloudKey, folderId, area);
-        if (!existing) return false;
-        const current = await getDriveFile(existing.id);
-        assertDriveFileOwnership(current, cloudKey, folderId, area);
-        input = (await (await drive()).files.get({ fileId: existing.id, alt: "media" }, { responseType: "stream" })).data;
+      if (provider === "s3") {
+        const bucketName = bucket();
+        input = (await abortableProviderRead(async () => (await s3()).send(
+          new (require("@aws-sdk/client-s3").GetObjectCommand)({ Bucket: bucketName, Key: cloudKey }),
+          signal ? { abortSignal: signal } : undefined), signal)).Body;
       }
-      await pipeline(input, fs.createWriteStream(stagedPath));
+      else {
+        const existing = await abortableProviderRead(
+          () => findDriveFile(cloudKey, folderId, area, signal), signal);
+        if (!existing) return false;
+        const current = await abortableProviderRead(() => getDriveFile(existing.id, signal), signal);
+        assertDriveFileOwnership(current, cloudKey, folderId, area);
+        input = (await abortableProviderRead(async () => (await drive()).files.get(
+          { fileId: existing.id, alt: "media" },
+          { responseType: "stream", ...(signal ? { signal } : {}) }), signal)).data;
+      }
+      if (constraints) {
+        let size = 0;
+        const bounded = new Transform({ transform(chunk, _encoding, next) {
+          size += chunk.length;
+          if (size > constraints.maxBytes) next(cloudError("provider_error", "Ciphertext copy exceeds bounded readback size"));
+          else next(null, chunk);
+        } });
+        await pipeline(input, bounded, fs.createWriteStream(stagedPath), {
+          signal,
+        });
+      } else {
+        await pipeline(input, fs.createWriteStream(stagedPath));
+      }
+      if (signal?.aborted) throw cloudError("provider_error", "Bounded cloud readback deadline exceeded");
       if (typeof canPublish === "function" && !canPublish()) return false;
-      if (fs.existsSync(localPath)) return true;
-      fs.renameSync(stagedPath, localPath);
+      if (constraints) {
+        // For a ZK verification readback the target MUST be exactly the bytes
+        // just streamed from the provider. A different local writer must not
+        // be able to win an exists/rename race and have its own bytes falsely
+        // attributed to this GET. Hardlink publication is atomic NO_REPLACE
+        // on the same filesystem (staging is under the destination parent).
+        fs.linkSync(stagedPath, localPath);
+      } else {
+        if (fs.existsSync(localPath)) return true;
+        fs.renameSync(stagedPath, localPath);
+      }
       return true;
-    } catch (error) { throw classify(error); }
-    finally { fs.rmSync(stagingDirectory, { recursive: true, force: true }); }
+    } catch (error) {
+      if (boundedController) boundedController.abort();
+      throw classify(error);
+    } finally {
+      if (boundedDeadline) clearTimeout(boundedDeadline);
+      fs.rmSync(stagingDirectory, { recursive: true, force: true });
+    }
   }
   async function remove(folderId, fileName, area = "uploads") {
     assertProvider(); if (!enabled()) return false; const cloudKey = objectKey(folderId, fileName, area);

@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const https = require("node:https");
+const { Readable } = require("node:stream");
 const os = require("node:os");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -20,6 +21,9 @@ const { Zk1DurableContentInventoryLedger } =
   require("../src/services/zk1DurableContentInventoryLedger");
 const { Zk1PgPhysicalInventoryBridge } =
   require("../src/services/zk1PgPhysicalInventoryBridge");
+const { createCloudStorage } = require("../services/cloudStorage");
+const { Zk1CloudCiphertextReadbackVerifier, zk1CloudCopyAddress } =
+  require("../src/services/zk1CloudCiphertextReadbackVerifier");
 const { createZk1ContentInventoryHttpsServer,
   drainZk1ContentInventoryHttpsServer } =
   require("../src/services/zk1ContentInventoryHttpsServer");
@@ -234,6 +238,101 @@ test("PG owner floor refuses reverted or foreign inventory before any physical i
     FROM zk1_gate.physical_inventory_intent WHERE scope_key=$1`, [f.key]);
   assert.equal(count.rows[0].n, 0, "no physical reservation after floor denial");
   assert.equal((await f.ledger.getOperationStatus(f.op.operation_id)).status, "unknown");
+});
+
+test("signed PG ciphertext and separately pinned cloud GET must both match exact immutable operation", {
+  skip: !enabled && "requires disposable PostgreSQL 18 and fake S3 readback",
+}, async (t) => {
+  const f = await fixture(t);
+  const signed = await f.bridge().putAndAttest(f.physical);
+  assert.equal(signed.status, "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+  const addr = zk1CloudCopyAddress({ scope: f.scope, operationId: f.op.operation_id });
+  let remote = Buffer.concat(f.chunks);
+  let readerPrincipal = "cloud-readback-pinned-fixture-A";
+  let reads = 0;
+  let mutateLocalAfterCloudStart = false;
+  const cloudReader = createCloudStorage({
+    provider: "s3", prefix: "rootark-physical-pg-fixture", s3: { bucket: "readback-fixture" },
+    resolvePrincipalIdentity: async () => readerPrincipal,
+    createS3Client: async () => ({ send: async (cmd) => {
+      reads += 1;
+      if (cmd.constructor.name !== "GetObjectCommand"
+        || cmd.input.Key !== cloudReader.key(addr.folder, addr.name, "uploads")
+        || !remote) throw new Error("missing expected opaque cloud object");
+      if (mutateLocalAfterCloudStart) {
+        mutateLocalAfterCloudStart = false;
+        await f.admin.query(`UPDATE zk1_gate.ciphertext_chunk SET ciphertext=$1
+          WHERE scope_key=$2 AND object_id=$3 AND chunk_index=0`,
+        [crypto.randomBytes(f.chunks[0].length), f.key, f.op.object_id.toString("base64url")]);
+      }
+      return { Body: Readable.from([remote]) };
+    } }),
+  });
+  const expectedReaderContext = await cloudReader.resolveInventoryContext();
+  const cloudVerifier = new Zk1CloudCiphertextReadbackVerifier({
+    cloudReader, expectedProvider: "s3", expectedReaderContext,
+  });
+  const args = { physical: f.noChunks(), cloudVerifier,
+    chunkLengths: f.chunks.map((chunk) => chunk.length) };
+  const result = await f.bridge().reconcileCloudCopy(args);
+  assert.equal(result.status, "PG_SIGNED_AND_CLOUD_BYTES_REREAD");
+  assert.equal(result.remoteReadbackMatched, true);
+  assert.equal(result.localPgWalFlushConfirmed, true);
+  assert.equal(result.externalProviderDurabilityProven, false);
+  assert.equal(result.authorizesIo, false);
+  assert.ok(reads > 0);
+  // Two valid signed physical operations must never be mixed by an input
+  // mutated after the cloud reconciliation captured its exact operation A.
+  const other = { ...f.op, object_id: crypto.randomBytes(16),
+    operation_id: crypto.randomBytes(16), expected_sequence: signed.sequence,
+    expected_root: Buffer.from(signed.root) };
+  assert.equal((await f.bridge().putAndAttest({ ...f.physical, operation: other })).status,
+    "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+  const changingPhysical = f.noChunks();
+  const observedOperations = [];
+  const physicalVerifier = f.verifier.verifyExact.bind(f.verifier);
+  f.verifier.verifyExact = async (input) => {
+    observedOperations.push(Buffer.from(input.operationId));
+    return physicalVerifier(input);
+  };
+  const changingLengths = new Proxy(f.chunks.map((chunk) => chunk.length), {
+    get(target, key, receiver) {
+      if (key === "length") changingPhysical.operation = other;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  const pinned = await f.bridge().reconcileCloudCopy({
+    physical: changingPhysical, cloudVerifier, chunkLengths: changingLengths,
+  });
+  assert.deepEqual(pinned.operationId, f.op.operation_id);
+  assert.ok(observedOperations.length >= 2);
+  assert.ok(observedOperations.every((operationId) => operationId.equals(f.op.operation_id)),
+    "both fresh PG proofs must authenticate original operation A, never mutated operation B");
+  f.verifier.verifyExact = physicalVerifier;
+  remote = crypto.randomBytes(remote.length);
+  await assert.rejects(f.bridge().reconcileCloudCopy(args),
+    /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+    "a valid historical signed receipt cannot certify a corrupted external copy");
+  remote = Buffer.concat(f.chunks);
+  readerPrincipal = "cloud-readback-different-principal";
+  await assert.rejects(f.bridge().reconcileCloudCopy(args),
+    /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/);
+  readerPrincipal = "cloud-readback-pinned-fixture-A";
+  mutateLocalAfterCloudStart = true;
+  await assert.rejects(f.bridge().reconcileCloudCopy(args),
+    /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+    "a locally corrupted ciphertext between initial PG proof and remote GET must be denied by the final PG reread");
+  await f.admin.query(`UPDATE zk1_gate.ciphertext_chunk SET ciphertext=$1
+    WHERE scope_key=$2 AND object_id=$3 AND chunk_index=0`,
+  [f.chunks[0], f.key, f.op.object_id.toString("base64url")]);
+  await f.admin.query(`UPDATE zk1_gate.ciphertext_chunk SET ciphertext=$1
+    WHERE scope_key=$2 AND object_id=$3 AND chunk_index=0`,
+  [crypto.randomBytes(f.chunks[0].length), f.key, f.op.object_id.toString("base64url")]);
+  const before = reads;
+  await assert.rejects(f.bridge().reconcileCloudCopy(args),
+    /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+    "a bad local physical seal must deny before contacting a cloud reader");
+  assert.equal(reads, before);
 });
 
 test("mTLS signed inventory append requires real strict physical PG readback and WAL", {

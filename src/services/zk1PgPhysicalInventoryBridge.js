@@ -14,6 +14,8 @@ const { Zk1SharedPgPhysicalCiphertextVerifier } =
 const { Zk1SharedPgPhysicalInventoryIntent } =
   require("./zk1SharedPgPhysicalInventoryIntent");
 const { Zk1DurableContentInventoryLedger } = require("./zk1DurableContentInventoryLedger");
+const { Zk1CloudCiphertextReadbackVerifier } =
+  require("./zk1CloudCiphertextReadbackVerifier");
 
 function fail() {
   const e = new Error("ZK_PHYSICAL_INVENTORY_UNAVAILABLE");
@@ -224,6 +226,60 @@ class Zk1PgPhysicalInventoryBridge {
     if (status.status !== "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY") return status;
     await this.#verifiedPhysical(v);
     return status;
+  }
+  // An already verified local PG+signed operation can be matched against the
+  // *current bytes* returned by a separately pinned S3/Drive reader. There is
+  // no cloud PUT here, and a GET after upload cannot attest indefinite remote
+  // persistence. Run local physical fencing again after the cloud readback.
+  async reconcileCloudCopy({ physical, cloudVerifier, chunkLengths } = {}) {
+    const v = this.#request(physical);
+    if (!(cloudVerifier instanceof Zk1CloudCiphertextReadbackVerifier)
+      || !Array.isArray(chunkLengths) || chunkLengths.length !== v.expectedChunkCount
+      || Reflect.ownKeys(chunkLengths).length !== chunkLengths.length + 1) fail();
+    // No caller-owned array is read after the first local PG network await.
+    const fixedLengths = [];
+    let lengthTotal = 0;
+    for (let index = 0; index < v.expectedChunkCount; index += 1) {
+      const desc = Object.getOwnPropertyDescriptor(chunkLengths, String(index));
+      const size = desc?.value;
+      if (!desc || !Object.hasOwn(desc, "value")
+        || !Number.isSafeInteger(size) || size < 1 || size > 4 * 1024 * 1024
+        || size > 16 * 1024 * 1024 - lengthTotal) fail();
+      fixedLengths.push(size);
+      lengthTotal += size;
+    }
+    // Use only the detached request throughout: the original `physical`
+    // object can be changed by a getter/proxy while the cloud or PG call is
+    // pending. Reusing it would let local PG proof describe operation B while
+    // a cloud verifier was asked about the initially captured operation A.
+    const fixedRequest = { scope: v.scope, operation: v.operation,
+      digest: v.digest, expectedRootHash: v.expectedRootHash,
+      expectedChunkCount: v.expectedChunkCount };
+    const before = await this.reconcile(fixedRequest);
+    if (before.status !== "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY") fail();
+    let remote;
+    try {
+      remote = await cloudVerifier.verifyExact({
+        scope: v.scope, operationId: v.operation.operation_id,
+        ciphertextSha256: v.operation.ciphertext_sha256,
+        expectedRootHash: v.expectedRootHash, chunkLengths: fixedLengths,
+      });
+    } catch (_) { fail(); }
+    if (remote.status !== "EXTERNAL_CIPHERTEXT_REREAD_MATCHED"
+      || remote.readbackMatched !== true
+      || !same(remote.operationId, v.operation.operation_id)
+      || remote.byteLength < 1 || remote.authorizesIo !== false
+      || remote.externalProviderDurabilityProven !== false) fail();
+    const after = await this.reconcile(fixedRequest);
+    if (after.status !== before.status || after.sequence !== before.sequence
+      || !same(after.root, before.root)) fail();
+    return Object.freeze({ status: "PG_SIGNED_AND_CLOUD_BYTES_REREAD",
+      operationId: Buffer.from(v.operation.operation_id),
+      provider: remote.provider, remoteReadbackMatched: true,
+      localPgWalFlushConfirmed: true, authorizesIo: false,
+      externalProviderDurabilityProven: false,
+      ownerPinnedFloorChecked: Boolean(this.#trustedInventoryFloor),
+      independentlyAnchoredFloorProven: false });
   }
   async publishExisting(input) {
     const v = this.#request(input);
