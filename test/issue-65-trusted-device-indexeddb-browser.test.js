@@ -144,6 +144,36 @@ const NORMAL_SESSION_UI_PROBE = `(async () => {
     || (await read("trusted"))?.keyId!==keyId
     || el("device-request-code").textContent!=="Nenhuma solicitação pendente")
     throw Error("CANCEL_DAMAGED_KEYS_OR_UI");
+  // IndexedDB preserves NaN numbers. A corrupt pending timestamp must still
+  // be cancellable without using the destructive Forget all local keys action.
+  const malformedRequest=await RootarkDevVaultTrustedDevice.createRecoveryRequest({username:"alice"});
+  const malformed={...malformedRequest,request:{...malformedRequest.request,
+    createdAt:Number.NaN,expiresAt:Number.NaN}};
+  await write("pending",malformed);
+  const restoredMalformed=await read("pending");
+  if (!Number.isNaN(restoredMalformed?.request.createdAt)
+    || !Number.isNaN(restoredMalformed?.request.expiresAt))
+    throw Error("INDEXEDDB_DID_NOT_PRESERVE_NAN");
+  // Even a malformed expected request cannot cancel a different new request
+  // inserted while the user is confirming the operation.
+  const replacement=await RootarkDevVaultTrustedDevice.createRecoveryRequest({username:"alice"});
+  window.confirm=()=>{
+    const tx=db.transaction("pending","readwrite");
+    tx.objectStore("pending").put(replacement,"alice");
+    return true;
+  };
+  el("device-cancel").click();
+  await until(async()=> (await read("pending"))?.request.requestId===replacement.request.requestId);
+  await new Promise(resolve=>setTimeout(resolve,100));
+  if ((await read("pending"))?.request.requestId!==replacement.request.requestId)
+    throw Error("MALFORMED_CANCEL_DELETED_NEW_REQUEST");
+  await write("pending",malformed);
+  window.confirm=()=>true;
+  el("device-cancel").click();
+  await until(async()=>!(await read("pending")));
+  if ((await read("keys"))?.keyId!==keyId
+    || (await read("trusted"))?.keyId!==keyId)
+    throw Error("MALFORMED_CANCEL_DELETED_TRUSTED_KEYS");
   el("device-request").click();
   const third=await until(()=>read("pending"));
   window.__testAccount="bob";

@@ -200,8 +200,8 @@
                 || saved.username !== expected.username
                 || saved.requestId !== expected.requestId
                 || saved.publicKey !== expected.publicKey
-                || saved.createdAt !== expected.createdAt
-                || saved.expiresAt !== expected.expiresAt) {
+                || !Object.is(saved.createdAt, expected.createdAt)
+                || !Object.is(saved.expiresAt, expected.expiresAt)) {
                 cancelled = new Error("Local recovery request changed");
                 cancelled.code = "DEV_VAULT_CANCELLED";
                 tx.abort();
