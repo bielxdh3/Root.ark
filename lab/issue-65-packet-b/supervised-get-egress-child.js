@@ -25,6 +25,13 @@ function denied(response, status) {
   response.writeHead(status, { "content-length": "0", "cache-control": "no-store" });
   response.end();
 }
+function ciphertext(message) {
+  if (typeof message?.ciphertextBase64 !== "string"
+    || !/^[A-Za-z0-9_-]+$/.test(message.ciphertextBase64)) process.exit(2);
+  const bytes = Buffer.from(message.ciphertextBase64, "base64url");
+  if (bytes.length !== CHUNK || bytes.toString("base64url") !== message.ciphertextBase64) process.exit(2);
+  return bytes;
+}
 
 function listen() {
   server = http.createServer((request, response) => {
@@ -73,6 +80,7 @@ process.on("message", (message) => {
     return;
   }
   if (state === "admitting" && message?.kind === "grant-get") {
+    const payload = ciphertext(message);
     state = "partial";
     activeResponse.writeHead(200, {
       "content-type": "application/octet-stream",
@@ -80,13 +88,14 @@ process.on("message", (message) => {
     });
     // Real HTTP/socket write. The peer may consume some bytes and pause;
     // remaining bytes can be buffered in Node, OS and TCP after child exit.
-    const buffered = !activeResponse.write(crypto.randomBytes(CHUNK));
+    const buffered = !activeResponse.write(payload);
     send({ kind: "partial", bytes: CHUNK, buffered });
     return;
   }
   if (state === "partial" && message?.kind === "continue") {
+    const payload = ciphertext(message);
     state = "finished";
-    activeResponse.end(crypto.randomBytes(CHUNK));
+    activeResponse.end(payload);
     return;
   }
   // Incorrect or unsolicited IPC never conveys an admission grant.

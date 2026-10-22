@@ -48,3 +48,41 @@ This closes an availability/replay corner in the **local synthetic
 controller only**. It does not make a PostgreSQL gate-read and a TCP
 `response.write` atomic, authorize real protected GET, prove buffers were
 un-sent, or establish durable supervisor identity after a host restart.
+
+## 22 October — physically sealed ciphertext GET read adapter
+
+The opt-in `Zk1SharedPgSealedGetReader` makes the same isolated listener send
+**actual PostgreSQL-persisted and SEALED ciphertext**, byte-for-byte, when a
+trusted local operator supplies the exact expected ciphertext-root commitment.
+It is still a development fixture, not a product GET route. It refuses a
+privileged application/admin connection at preflight, requires a strictly
+STOP-attested scope, and transactionally locks the shared PostgreSQL head while
+checking current `OPEN` phase, revision, digest, generation, scope and keyring,
+the exact active GET admission and physically supervised host-key/PID/epoch,
+and the immutable sealed object's expected root. The two bounded 16 KiB chunks
+are selected from the real `ciphertext_chunk` table. The egress child has no
+PostgreSQL credentials and only receives the authorized ciphertext frames over
+supervisor-owned IPC. Malformed frames cause child termination.
+
+An independently instantiated gate connected through a separate PostgreSQL
+pool commits `QUIESCING` while an actual TCP client holds a partial ciphertext
+response. The original child cannot receive the second frame, and a signed
+STOP receipt for the exact OS child remains mandatory before `FINISHED` and
+`PENDING`. A wrong operator-provided root results in HTTP 503 with zero content.
+The partition test closes the egress operator's PostgreSQL pool after its first
+frame, then uses the surviving gate and independent STOP recorder to finish the
+original in-flight admission. No positive continuation is possible from the
+disconnected pool.
+
+**Security boundary:** The expected ciphertext-root commitment is supplied
+by the *trusted fixture operator*; this module does not independently verify
+an owner signature, authenticated device, signed witness head, CAS monotonic
+floor, epochs, revocations, replay ledger, fresh external reservation or
+independent approval proof. A real client cannot treat this adapter as a
+protected GET endpoint. The second gate instance models a remote host using
+a separate pool but runs in the same test process and availability domain.
+PostgreSQL row-lock release happens before the socket write. A cross-host
+`QUIESCING` commit can therefore race a previously granted frame, and already
+buffered TCP ciphertext can remain deliverable after physical STOP. There is
+no multi-host supervisor reconciliation, mTLS GET endpoint, remote provider
+read, foreign-host physical process attestation or failover guarantee.

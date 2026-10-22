@@ -15,6 +15,8 @@ const { Zk1IsolatedProcessStopSupervisor } =
   require("../../src/services/zk1IsolatedProcessStopSupervisor");
 const { isVerifiedZk1PhysicalStopRecorder } =
   require("../../src/services/zk1SharedPgPhysicalStopRecorder");
+const { Zk1SharedPgSealedGetReader } =
+  require("../../src/services/zk1SharedPgSealedGetReader");
 
 function deny() {
   const error = new Error("ZK_LAB_GET_DENIED");
@@ -76,7 +78,7 @@ function pubkeyEquals(a, b) {
       b.export({ format: "der", type: "spki" }));
 }
 class Zk1LabSupervisedGetEgress {
-  constructor({ gate, supervisor, recorder } = {}) {
+  constructor({ gate, supervisor, recorder, ciphertextReader, expectedRootHash } = {}) {
     if (!(gate instanceof Zk1SharedPgGateAuthority)
       || !(supervisor instanceof Zk1IsolatedProcessStopSupervisor)
       || !isVerifiedZk1PhysicalStopRecorder(recorder)
@@ -85,9 +87,16 @@ class Zk1LabSupervisedGetEgress {
       || !pubkeyEquals(gate.stopPinned.hostPublicKey,
         crypto.createPublicKey(supervisor.hostPrivateKey))
       || !pubkeyEquals(recorder.hostPublicKey, gate.stopPinned.hostPublicKey)) deny();
+    if ((ciphertextReader === undefined) !== (expectedRootHash === undefined)
+      || (ciphertextReader !== undefined && (
+        !(ciphertextReader instanceof Zk1SharedPgSealedGetReader)
+        || ciphertextReader.gate !== gate))) deny();
     this.gate = gate;
     this.supervisor = supervisor;
     this.recorder = recorder;
+    this.ciphertextReader = ciphertextReader;
+    this.expectedRootHash = expectedRootHash === undefined
+      ? null : bytes(expectedRootHash, 32);
     this.phase = "new";
     this.partial = false;
   }
@@ -97,6 +106,17 @@ class Zk1LabSupervisedGetEgress {
     if (!child?.connected || this.session.closed || this.session.exited
       || this.session.aborted || child.exitCode !== null || child.signalCode !== null) deny();
     child.send(message);
+  }
+
+  async #readCiphertext(chunkIndex) {
+    if (!this.ciphertextReader) return crypto.randomBytes(16384);
+    const bytes = await this.ciphertextReader.readChunk({ io: this.io,
+      process: this.process, admissionId: this.admissionId,
+      generation: this.generation, expectedRootHash: this.expectedRootHash,
+      chunkIndex });
+    // The disposable child intentionally supports exactly two bounded frames.
+    if (!Buffer.isBuffer(bytes) || bytes.length !== 16384) deny();
+    return bytes;
   }
 
   async #admitGet() {
@@ -111,8 +131,10 @@ class Zk1LabSupervisedGetEgress {
         processPid: this.process.processPid });
       if (!allowed() || !decision.proceed || !decision.admissionId.equals(this.admissionId)
         || decision.generation !== this.generation) return this.#denyIncoming();
+      const ciphertext = await this.#readCiphertext(0);
+      if (!allowed()) return this.#denyIncoming();
       this.supervisor.assertLive({ processEpoch: this.process.processEpoch });
-      this.#send({ kind: "grant-get" });
+      this.#send({ kind: "grant-get", ciphertextBase64: ciphertext.toString("base64url") });
     } catch (_) { this.#denyIncoming(); }
   }
 
@@ -126,6 +148,7 @@ class Zk1LabSupervisedGetEgress {
     // The gate must be an independently provisioned restricted PostgreSQL
     // login. A privileged app/superuser pool is never accepted here.
     await verifyZk1SharedPgRuntimePool(this.gate.pool);
+    if (this.ciphertextReader) await this.ciphertextReader.preflight();
     // Disconnected or non-strict authority rejects before creating a listener.
     if (await this.gate.requiresTrustedLocalStop(io.scope) !== true) deny();
     this.phase = "starting";
@@ -212,9 +235,11 @@ class Zk1LabSupervisedGetEgress {
       processPid: this.process.processPid });
     if (this.stopping || !decision.proceed || !decision.admissionId.equals(this.admissionId)
       || decision.generation !== this.generation) deny();
+    const ciphertext = await this.#readCiphertext(1);
+    if (this.stopping) deny();
     this.supervisor.assertLive({ processEpoch: this.process.processEpoch });
     this.partial = false;
-    this.#send({ kind: "continue" });
+    this.#send({ kind: "continue", ciphertextBase64: ciphertext.toString("base64url") });
   }
 
   async beginQuiesce(operation) {

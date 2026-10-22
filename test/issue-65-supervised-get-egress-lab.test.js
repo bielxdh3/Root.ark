@@ -9,6 +9,9 @@ const { Pool } = require("pg");
 const { Zk1SharedPgGateAuthority } = require("../src/services/zk1SharedPgGateAuthority");
 const { Zk1IsolatedProcessStopSupervisor } = require("../src/services/zk1IsolatedProcessStopSupervisor");
 const { createZk1PhysicalStopRecorder } = require("../src/services/zk1SharedPgPhysicalStopRecorder");
+const { Zk1SharedPgSealedObjectStore } = require("../src/services/zk1SharedPgSealedObjectStore");
+const { Zk1SharedPgSealedGetReader } = require("../src/services/zk1SharedPgSealedGetReader");
+const { computeZk1CiphertextRoot } = require("../src/crypto/rootark-zk-chunk-root-v1");
 const { Zk1LabSupervisedGetEgress } = require("../lab/issue-65-packet-b/supervised-get-egress-controller");
 
 const enabled = Boolean(process.env.ROOTARK_ZK1_TEST_PG_URL
@@ -56,7 +59,41 @@ async function context(t) {
     objectId: crypto.randomBytes(16).toString("base64url"), revision: 7, digest };
   const reservation = { scope, operationId: crypto.randomBytes(16),
     reservationId: crypto.randomBytes(16), revision: 7, digest };
-  return { admin, gate, supervisor, controller, io, reservation, scope };
+  return { admin, runtime, gate, supervisor, controller, io, reservation, scope };
+}
+
+async function seedActualSealedCiphertext(c) {
+  // The fixtures deliberately keep gate, writer and STOP as distinct
+  // privileges. Real bounded ciphertext is persisted, physically sealed and
+  // the original supervised PUT process is independently STOP-attested.
+  const chunks = [crypto.randomBytes(16384), crypto.randomBytes(16384)];
+  const rootHash = computeZk1CiphertextRoot(chunks);
+  const put = { ...c.io, action: "put", workerId: crypto.randomBytes(16) };
+  const proc = c.supervisor.launch({ scope: c.scope,
+    workerId: put.workerId, principal: put.principal });
+  const admitted = await c.gate.beginIoAdmission({ ...put, ...proc });
+  c.supervisor.bindAdmission({ ...proc, scope: c.scope, workerId: put.workerId,
+    principal: put.principal, admissionId: admitted.admissionId,
+    generation: admitted.generation });
+  for (let i = 0; i < chunks.length; ++i) {
+    assert.deepEqual(await c.gate.putCiphertextChunk({ ...put,
+      admissionId: admitted.admissionId, generation: admitted.generation }, i, chunks[i]),
+    { stored: true });
+  }
+  const sealed = new Zk1SharedPgSealedObjectStore({ pool: c.runtime });
+  assert.equal((await sealed.seal({ ...put, admissionId: admitted.admissionId,
+    generation: admitted.generation, expectedChunkCount: 2,
+    expectedRootHash: rootHash })).status, "SEALED");
+  const signedProof = await c.supervisor.stop({ processEpoch: proc.processEpoch });
+  const stopped = await c.controller.recorder.record({ signedProof,
+    expected: { scope: c.scope, workerId: put.workerId, principal: put.principal,
+      admissionId: admitted.admissionId, generation: admitted.generation,
+      processEpoch: proc.processEpoch, processPid: proc.processPid } });
+  assert.equal(stopped.status, "STOP_ATTESTED");
+  assert.equal((await c.gate.finishIoAdmission({ scope: c.scope,
+    workerId: put.workerId, principal: put.principal,
+    admissionId: admitted.admissionId })).status, "FINISHED");
+  return { chunks, rootHash };
 }
 
 function request(port, token, method = "GET", url = "/fixture-ciphertext") {
@@ -259,4 +296,110 @@ test("lost ACK after durable QUIESCING retries exact reservation but never reope
   assert.equal((await c.controller.finishAfterQuiesce()).status, "FINISHED");
   assert.equal((await c.gate.markPending(c.reservation)).status, "PENDING");
   assert.ok((await stream.drain()).length > 0);
+});
+
+test("physical sealed PostgreSQL ciphertext reaches supervised HTTP peer byte-for-byte; forged root fails closed", {
+  skip: !enabled && "disposable PostgreSQL fixture required",
+}, async (t) => {
+  const c = await context(t);
+  const { chunks, rootHash } = await seedActualSealedCiphertext(c);
+  const reader = new Zk1SharedPgSealedGetReader({ gate: c.gate });
+  const wrongRoot = new Zk1LabSupervisedGetEgress({ gate: c.gate,
+    supervisor: c.supervisor, recorder: c.controller.recorder,
+    ciphertextReader: reader, expectedRootHash: crypto.randomBytes(32) });
+  const wrongIo = { ...c.io, workerId: crypto.randomBytes(16) };
+  const forged = await wrongRoot.begin(wrongIo);
+  assert.equal((await request(forged.port, forged.token)).status, 503,
+    "an unverified commitment cannot release even the first physical ciphertext byte");
+  const forgedQuiesce = { ...c.reservation };
+  // A refused transfer still requires physical STOP before FINISH or PENDING.
+  const controller = new Zk1LabSupervisedGetEgress({ gate: c.gate,
+    supervisor: c.supervisor, recorder: c.controller.recorder,
+    ciphertextReader: reader, expectedRootHash: rootHash });
+  const admitted = await controller.begin(c.io);
+  const delivered = request(admitted.port, admitted.token);
+  await controller.waitPartial();
+  await controller.continueResponse();
+  const response = await delivered;
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, Buffer.concat(chunks),
+    "GET must transfer actual persisted, sealed ciphertext rather than generated bytes");
+  await controller.beginQuiesce(forgedQuiesce);
+  await wrongRoot.beginQuiesce(forgedQuiesce);
+  await Promise.all([controller.finishAfterQuiesce(), wrongRoot.finishAfterQuiesce()]);
+  assert.equal((await c.gate.markPending(forgedQuiesce)).status, "PENDING");
+});
+
+test("a second PostgreSQL gate host quiesces while real ciphertext GET is partial, fencing continuation", {
+  skip: !enabled && "disposable PostgreSQL fixture required",
+}, async (t) => {
+  const c = await context(t);
+  const { chunks, rootHash } = await seedActualSealedCiphertext(c);
+  const reader = new Zk1SharedPgSealedGetReader({ gate: c.gate });
+  const controller = new Zk1LabSupervisedGetEgress({ gate: c.gate,
+    supervisor: c.supervisor, recorder: c.controller.recorder,
+    ciphertextReader: reader, expectedRootHash: rootHash });
+  const { port, token, admissionId, generation } = await controller.begin(c.io);
+  const stream = await pausedRequest(port, token);
+  await controller.waitPartial();
+  assert.deepEqual(stream.chunks[0], chunks[0], "the TCP peer receives physical ciphertext");
+  const remotePool = new Pool({ connectionString: process.env.ROOTARK_ZK1_RUNTIME_PG_URL });
+  t.after(() => remotePool.end());
+  const remote = new Zk1SharedPgGateAuthority({ pool: remotePool,
+    stopPinned: c.gate.stopPinned });
+  assert.equal((await remote.beginQuiesce(c.reservation)).state, "QUIESCING");
+  const old = await c.gate.beginIoAdmission({ ...c.io,
+    hostKeyId: c.supervisor.hostKeyId,
+    processEpoch: controller.process.processEpoch, processPid: controller.process.processPid });
+  assert.equal(old.proceed, false);
+  assert.equal(old.generation, generation);
+  assert.deepEqual(old.admissionId, admissionId);
+  await assert.rejects(controller.continueResponse(), /ZK_LAB_GET_DENIED/);
+  await assert.rejects(reader.readChunk({ io: c.io, process: controller.process,
+    admissionId, generation, expectedRootHash: rootHash, chunkIndex: 1 }),
+  /ZK_GATE_GET_DENIED/, "a second host's committed generation change disables DB read");
+  await assert.rejects(c.gate.markPending(c.reservation), /ZK_GATE_DRAIN_INCOMPLETE/);
+  assert.equal((await controller.beginQuiesce(c.reservation)).state, "QUIESCING");
+  assert.equal((await controller.finishAfterQuiesce()).status, "FINISHED");
+  assert.equal((await remote.markPending(c.reservation)).status, "PENDING");
+  assert.deepEqual(await stream.drain(), chunks[0],
+    "the next ciphertext chunk is never emitted once the separate host commits QUIESCING");
+});
+
+test("GET gate connection loss denies further physical ciphertext; surviving gate can quiesce and record original STOP", {
+  skip: !enabled && "disposable PostgreSQL fixture required",
+}, async (t) => {
+  const c = await context(t);
+  const { chunks, rootHash } = await seedActualSealedCiphertext(c);
+  const isolatedPool = new Pool({ connectionString: process.env.ROOTARK_ZK1_RUNTIME_PG_URL });
+  const isolatedGate = new Zk1SharedPgGateAuthority({ pool: isolatedPool,
+    stopPinned: c.gate.stopPinned });
+  const controller = new Zk1LabSupervisedGetEgress({ gate: isolatedGate,
+    supervisor: c.supervisor, recorder: c.controller.recorder,
+    ciphertextReader: new Zk1SharedPgSealedGetReader({ gate: isolatedGate }),
+    expectedRootHash: rootHash });
+  const { port, token, admissionId, generation } = await controller.begin(c.io);
+  const stream = await pausedRequest(port, token);
+  await controller.waitPartial();
+  assert.deepEqual(stream.chunks[0], chunks[0]);
+  // The egress host loses its only gate connection after real bytes were sent;
+  // a separately provisioned surviving controller still shares the durable PG.
+  await isolatedPool.end();
+  await assert.rejects(controller.continueResponse(), /ZK_GATE_UNAVAILABLE|ZK_LAB_GET_DENIED/);
+  assert.equal((await c.gate.beginQuiesce(c.reservation)).state, "QUIESCING");
+  await assert.rejects(controller.beginQuiesce(c.reservation), /ZK_GATE_UNAVAILABLE/);
+  await assert.rejects(c.gate.markPending(c.reservation), /ZK_GATE_DRAIN_INCOMPLETE/);
+  const proof = await c.supervisor.stop({ processEpoch: controller.process.processEpoch });
+  const recorded = await c.controller.recorder.record({ signedProof: proof, expected: {
+    scope: c.scope, admissionId, workerId: c.io.workerId,
+    principal: c.io.principal, generation,
+    processEpoch: controller.process.processEpoch,
+    processPid: controller.process.processPid,
+  } });
+  assert.equal(recorded.status, "STOP_ATTESTED");
+  assert.equal((await c.gate.finishIoAdmission({ scope: c.scope,
+    workerId: c.io.workerId, principal: c.io.principal, admissionId })).status, "FINISHED");
+  assert.equal((await c.gate.markPending(c.reservation)).status, "PENDING");
+  assert.deepEqual(await stream.drain(), chunks[0],
+    "a disconnected GET host cannot send its second SQL-validated physical frame");
 });
