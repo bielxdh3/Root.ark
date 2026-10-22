@@ -15,7 +15,10 @@
   <script defer src="/client/rootark-zk1-uncertain-put-reconciliation.js"></script>
   <script defer src="/client/rootark-zk1-normal-browser-trust-floor.js"></script>
   <script defer src="/client/rootark-zk1-normal-browser-content.js"></script>
+  <script defer src="/client/rootark-zk1-portable-file-recovery.js"></script>
+  <script defer src="/client/rootark-zk1-browser-recovery-http.js"></script>
   <script defer src="/client/rootark-zk1-normal-browser-lab-ui.js"></script>
+  <script defer src="/client/rootark-zk1-portable-recovery-lab-ui.js"></script>
 </head>
 <body>
   <main class="vault">
@@ -60,6 +63,29 @@
       O navegador verifica SPKI e assinatura; a origem independente desses dados
       deve ser conferida por você. Trocar proprietário, retroceder época ou
       reaproveitar digest de outra revisão é recusado.</p>
+    </section>
+    <section class="panel">
+      <h2>3. Pacote portátil e GET recuperável (experimental)</h2>
+      <p class="notice">Este fluxo exige um segredo aleatório de 32 bytes mantido
+      pelo proprietário fora do Root.ark. <strong>Não use senha humana</strong>
+      neste campo: o pacote de recuperação por senha Argon2id é um formato
+      diferente. O servidor só armazena ciphertext; o segredo e a CEK nunca
+      são enviados. A operação exige os mesmos pins, grant e dispositivo atuais
+      da seção 1 e <strong>não</strong> conclui recuperação automática de contas.</p>
+      <button id="portable-generate-secret" type="button">Gerar segredo e salvar fora do servidor</button>
+      <label for="portable-secret">Segredo de recuperação já salvo (binário, exatos 32 bytes)</label>
+      <input id="portable-secret" type="file" accept=".bin,application/octet-stream">
+      <button id="portable-publish" type="button">Enviar arquivo recuperável e salvar pacote cifrado</button>
+      <label for="portable-bundle">Pacote de ciphertext portátil (.json)</label>
+      <input id="portable-bundle" type="file" accept=".json,application/json">
+      <label for="portable-root">Raiz do ciphertext conferida fora do pacote, base64url</label>
+      <input id="portable-root" type="text" maxlength="43" autocomplete="off" spellcheck="false">
+      <button id="portable-restore" type="button">Recuperar por GET protegido e baixar arquivo</button>
+      <p class="notice">Guarde a raiz separada do pacote. Ela deve ser conferida
+      por um checkpoint assinado pelo proprietário e por um canal independente
+      antes de restaurar. Uma cópia antiga do perfil ou chaves já expostas ao
+      dispositivo perdido não podem ser revogadas retroativamente. Somente
+      conteúdo e chaves locais são usados para descriptografia.</p>
     </section>
     <section class="panel">
       <h2>2. Cifrar, enviar e conferir</h2>

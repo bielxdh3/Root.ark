@@ -12,6 +12,9 @@ const z = require("../src/crypto/rootark-zk-1");
 const v2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const fixtures = require("./support/issue-65-recovery-v2-fixtures");
 const normal = require("../public/client/rootark-zk1-normal-browser-content");
+const portable = require("../public/client/rootark-zk1-portable-file-recovery");
+const browserRestore = require("../public/client/rootark-zk1-browser-recovery-http");
+const protectedHttp = require("../public/client/rootark-zk1-protected-http-client");
 const { Zk1ProtectedObjectStore } = require("../src/services/zk1ProtectedObjectStore");
 const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
 
@@ -28,8 +31,9 @@ const scriptNames = ["rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-r
   "rootark-zk1-ciphertext-download-integrity", "rootark-zk1-owner-signed-checkpoint",
   "rootark-zk1-owner-ciphertext-root-checkpoint", "rootark-zk1-protected-http-client",
   "rootark-zk1-uncertain-put-reconciliation", "rootark-zk1-normal-browser-trust-floor",
-  "rootark-zk1-normal-browser-content",
-  "rootark-zk1-normal-browser-lab-ui"];
+  "rootark-zk1-normal-browser-content", "rootark-zk1-portable-file-recovery",
+  "rootark-zk1-browser-recovery-http",
+  "rootark-zk1-normal-browser-lab-ui", "rootark-zk1-portable-recovery-lab-ui"];
 
 test("production static paths cannot disclose the opt-in normal browser laboratory", async (t) => {
   const app = express();
@@ -55,7 +59,9 @@ test("production static paths cannot disclose the opt-in normal browser laborato
 async function setup(t) {
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-normal-browser-"));
   const clock = Math.floor(Date.now() / 1000);
-  const state = await fixtures.createInitialState(2);
+  // Keep a third still-trusted device so two independent revocations can
+  // rotate epochs without illegally removing every recovery authority.
+  const state = await fixtures.createInitialState(3);
   let head = state.headManifest;
   const baseDigest = await v2.recoveryManifestDigestV2(state.baseManifest);
   const witness = crypto.generateKeyPairSync("ed25519");
@@ -187,6 +193,133 @@ test("normal browser uploads ciphertext and confirms real localhost HTTP protect
   assert.ok(!stored.toString().includes(args.fileName));
 });
 
+test("new browser session opens an owner-pinned ciphertext through real signed HTTP GET with only user-held secret", async (t) => {
+  const f = await setup(t);
+  const opts = await f.options();
+  const offlineSecret = portable.generateRecoverySecret();
+  const bundle = await portable.sealForUserHeldSecret({
+    recoverySecret: offlineSecret, metadata: opts.metadata,
+    name: opts.fileName, mediaType: opts.mediaType, data: opts.data,
+  });
+  const signer = {
+    signerKey: opts.devicePrivateKey,
+    scope: Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+      .map((key) => [key, opts.metadata[key]])),
+    deviceId: opts.signedDeviceGrant.device_id,
+    manifestRevision: opts.pinnedCurrentHead.revision,
+    manifestDigest: opts.pinnedCurrentHead.digest,
+    epoch: opts.pinnedCurrentHead.epoch,
+    nowSeconds: opts.nowSeconds,
+  };
+  const encoded = Buffer.from(bundle.ciphertextBase64, "base64url");
+  const signedPut = await protectedHttp.signProtectedContentOperation({
+    ...signer, operation: "put", objectId: opts.metadata.object_id,
+    expectedObjectRevision: null, ciphertext: encoded,
+  });
+  await protectedHttp.postProtectedCiphertextPut({
+    origin: opts.origin, request: signedPut, fetchImpl: opts.fetchImpl,
+  });
+  const root = Buffer.from(bundle.ciphertextRoot, "base64url");
+  const independentOwnerSpkiSha256 = crypto.createHash("sha256").update(
+    Buffer.from(await crypto.webcrypto.subtle.exportKey("spki", opts.ownerPublicKey))).digest();
+  const expected = {
+    ownerPublicKey: opts.ownerPublicKey,
+    pinnedOwnerKeyHash: opts.pinnedOwnerKeyHash,
+    independentOwnerSpkiSha256,
+    pinnedCurrentHead: opts.pinnedCurrentHead,
+    signedDeviceGrant: opts.signedDeviceGrant,
+    devicePublicKey: opts.devicePublicKey,
+    devicePrivateKey: opts.devicePrivateKey,
+    ownerHistoryCheckpoint: null,
+    recoverySecret: offlineSecret, bundle,
+    expectedMetadata: opts.metadata, independentlyPinnedCiphertextRoot: root,
+    origin: opts.origin, fetchImpl: opts.fetchImpl, nowSeconds: opts.nowSeconds,
+  };
+  let wire = "";
+  const recovered = await browserRestore.recoverFromProtectedGet({
+    ...expected, fetchImpl: (url, request) => {
+      wire = String(request.body || "");
+      return opts.fetchImpl(url, request);
+    },
+  });
+  assert.deepEqual(Buffer.from(recovered.data), Buffer.from(opts.data));
+  assert.equal(recovered.historicalGetVerified, true);
+  assert.equal(recovered.localUserSecretOpened, true);
+  assert.equal(recovered.authorizesProductionRestore, false);
+  assert.equal(wire.includes(opts.fileName), false);
+  assert.equal(wire.includes(new TextDecoder().decode(opts.data)), false);
+  assert.equal(wire.includes(offlineSecret.toString("base64url")), false);
+  recovered.data.fill(0);
+  for (const bad of [
+    { recoverySecret: crypto.randomBytes(32) },
+    { independentlyPinnedCiphertextRoot: crypto.randomBytes(32) },
+    { expectedMetadata: { ...opts.metadata, epoch: opts.metadata.epoch + 1 } },
+    { bundle: { ...bundle, ciphertextSha256: crypto.randomBytes(32).toString("base64url") } },
+  ]) await assert.rejects(browserRestore.recoverFromProtectedGet({
+    ...expected, ...bad,
+  }), /ZK_BROWSER_RECOVERY_HTTP_DENIED/);
+  // Rotating the current epoch after revoking ANOTHER device must not make
+  // this device unable to read its genuine historical ciphertext/old CEK.
+  const other = f.state.headManifest.devices.find((device) =>
+    device.device_id !== f.device.device_id);
+  assert.ok(other);
+  const rotated = await fixtures.appendDeviceRevocation(f.state, other.device_id);
+  f.setHead(rotated);
+  const current = await f.currentHead();
+  const currentGrant = await f.makeGrant();
+  const reopenedAfterRotation = await browserRestore.recoverFromProtectedGet({
+    ...expected, pinnedCurrentHead: current,
+    signedDeviceGrant: currentGrant,
+  });
+  assert.deepEqual(Buffer.from(reopenedAfterRotation.data), Buffer.from(opts.data));
+  reopenedAfterRotation.data.fill(0);
+  const nextMetadata = { ...opts.metadata, version_id: id(),
+    parent_version_id: opts.metadata.version_id, epoch: current.epoch };
+  const nextFile = Buffer.from("rev2 remains protected and individually recoverable");
+  const nextBundle = await portable.sealForUserHeldSecret({
+    recoverySecret: offlineSecret, metadata: nextMetadata,
+    objectRevision: 2, name: "revision-2.txt",
+    mediaType: "text/plain", data: nextFile,
+  });
+  const signedSecondPut = await protectedHttp.signProtectedContentOperation({
+    ...signer, manifestRevision: current.revision,
+    manifestDigest: current.digest, epoch: current.epoch,
+    operation: "put", objectId: opts.metadata.object_id,
+    expectedObjectRevision: 1,
+    ciphertext: Buffer.from(nextBundle.ciphertextBase64, "base64url"),
+  });
+  await protectedHttp.postProtectedCiphertextPut({
+    origin: opts.origin, request: signedSecondPut, fetchImpl: opts.fetchImpl,
+  });
+  const revision2 = await browserRestore.recoverFromProtectedGet({
+    ...expected, pinnedCurrentHead: current,
+    signedDeviceGrant: currentGrant, bundle: nextBundle,
+    expectedMetadata: nextMetadata,
+    independentlyPinnedCiphertextRoot: Buffer.from(nextBundle.ciphertextRoot, "base64url"),
+  });
+  assert.equal(revision2.name, "revision-2.txt");
+  assert.deepEqual(Buffer.from(revision2.data), nextFile);
+  revision2.data.fill(0);
+  const stillArchived = await browserRestore.recoverFromProtectedGet({
+    ...expected, pinnedCurrentHead: current, signedDeviceGrant: currentGrant,
+  });
+  assert.deepEqual(Buffer.from(stillArchived.data), Buffer.from(opts.data));
+  stillArchived.data.fill(0);
+  const future = await f.currentHead();
+  assert.ok(future.epoch > opts.metadata.epoch);
+  await assert.rejects(browserRestore.recoverFromProtectedGet({
+    ...expected, pinnedCurrentHead: current,
+    signedDeviceGrant: currentGrant,
+    expectedMetadata: { ...opts.metadata, epoch: future.epoch + 1 },
+  }), /ZK_BROWSER_RECOVERY_HTTP_DENIED/);
+  const revoked = await fixtures.appendDeviceRevocation(f.state, f.device.device_id);
+  f.setHead(revoked);
+  await assert.rejects(browserRestore.recoverFromProtectedGet(expected),
+    /ZK_BROWSER_RECOVERY_HTTP_DENIED/,
+    "a cached old signed grant cannot bypass a more recent server revocation");
+  offlineSecret.fill(0);
+});
+
 test("negative owner, head, grant, active device, epoch and mutation fail before HTTP", async (t) => {
   const f = await setup(t);
   const base = await f.options();
@@ -316,10 +449,35 @@ if(!document.getElementById("status").textContent.includes("Âncora local criada
 document.getElementById("upload").click();
 for(let i=0;i<80;i++){await new Promise(resolve=>setTimeout(resolve,100));
 const status=document.getElementById("status").textContent;
-if(status.includes("Ciphertext conferido")){output.textContent=
-  document.getElementById("device-private").files.length===0
-  && document.getElementById("file").files.length===0
-    ?"EDGE_NORMAL_HTTP_PASS":"EDGE_NORMAL_HTTP_FAIL";break;}
+if(status.includes("Ciphertext conferido")){
+  if(document.getElementById("device-private").files.length!==0
+    || document.getElementById("file").files.length!==0)throw Error("INPUT_RETAINED");
+  const portable=window.RootarkZk1PortableFileRecovery;
+  const originalSeal=portable.sealForUserHeldSecret;
+  let generatedBundle=null;
+  window.RootarkZk1PortableFileRecovery=Object.freeze({...portable,
+    sealForUserHeldSecret:async(value)=>{generatedBundle=await originalSeal(value);return generatedBundle;}});
+  const secret=crypto.getRandomValues(new Uint8Array(32));
+  inputFile("device-private",decode(v.privateDer),"device.pkcs8");
+  inputFile("portable-secret",secret,"saved-secret.bin");
+  inputFile("file",new TextEncoder().encode("Portable Edge protected content"),"recovery.txt");
+  document.getElementById("portable-publish").click();
+  let wrote=false;
+  for(let k=0;k<80;k++){await new Promise(resolve=>setTimeout(resolve,100));
+    if(document.getElementById("status").textContent.includes("Ciphertext enviado e GET autenticado")){wrote=true;break;}}
+  if(!wrote || !generatedBundle)throw Error("PORTABLE_PUBLISH_FAILED:"+document.getElementById("status").textContent);
+  inputFile("device-private",decode(v.privateDer),"device.pkcs8");
+  inputFile("portable-secret",secret,"saved-secret.bin");
+  inputFile("portable-bundle",new TextEncoder().encode(JSON.stringify(generatedBundle)),"bundle.json");
+  document.getElementById("portable-restore").click();
+  let restored=false;
+  for(let k=0;k<80;k++){await new Promise(resolve=>setTimeout(resolve,100));
+    if(document.getElementById("status").textContent.includes("GET protegido e abertura local concluídos")){restored=true;break;}}
+  secret.fill(0);
+  if(!restored || document.getElementById("portable-secret").files.length!==0
+    || document.getElementById("device-private").files.length!==0)
+      throw Error("PORTABLE_RESTORE_FAILED:"+document.getElementById("status").textContent);
+  output.textContent="EDGE_NORMAL_HTTP_PASS";break;}
 if(status.includes("Operação recusada")){output.textContent="EDGE_NORMAL_HTTP_FAIL";break;}}
 if(!output.textContent)output.textContent="EDGE_NORMAL_HTTP_TIMEOUT";
 }catch(e){output.textContent="EDGE_NORMAL_HTTP_FAIL:"+e.message;}});`);
@@ -382,7 +540,8 @@ if(!output.textContent)output.textContent="EDGE_NORMAL_HTTP_TIMEOUT";
         ? value : null;
     });
     assert.equal(evidence, "EDGE_NORMAL_HTTP_PASS");
-    assert.equal(f.putCount, 1);
+    assert.equal(f.putCount, 2,
+      "one ordinary PUT and one portable recovery PUT, no retry during signed GET");
   } finally {
     socket?.close();
     if (edge?.pid) {
