@@ -21,6 +21,10 @@ const TOP_FIELDS = Object.freeze([
 const CAS_FIELDS = Object.freeze([
   "endpoint", "caPath", "clientKeyPath", "clientCertPath", "serverFingerprint256",
 ]);
+const OWNER_FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/cas-owner-floor/v1\0", "ascii");
+const OWNER_PIN_ENV = "ROOTARK_ZK1_CAS_FLOOR_OWNER_SPKI_SHA256";
+const OWNER_CHECKPOINT_PIN_ENV = "ROOTARK_ZK1_CAS_FLOOR_OWNER_CHECKPOINT_SHA256";
+const OWNER_FIELDS = Object.freeze(["publicKeyPath", "issuedAt", "expiresAt", "signature"]);
 function fail() { throw new Error("WITNESS_STARTUP_FAILED"); }
 function exact(value, names) {
   if (!value || typeof value !== "object" || Array.isArray(value)
@@ -63,13 +67,28 @@ function configure(config) {
   const witnessPrivateKey = crypto.createPrivateKey(readFile(config.witnessPrivateKeyPath));
   const statusKeyId = decodeId(config.statusKeyId);
   const statusPublicKey = crypto.createPublicKey(readFile(config.statusPublicKeyPath));
+  // The owner signer pin is deliberately outside editable witness JSON. This
+  // is an opt-in *storage/config-only* tamper guard, not a guarantee if the
+  // service environment, clock, owner key, and witness are all compromised.
+  const ownerPin = process.env[OWNER_PIN_ENV];
+  const checkpointPin = process.env[OWNER_CHECKPOINT_PIN_ENV];
+  if (ownerPin !== undefined && !/^[a-f0-9]{64}$/.test(ownerPin)) fail();
+  if (checkpointPin !== undefined && !/^[a-f0-9]{64}$/.test(checkpointPin)) fail();
+  // Both pins are retained independently of editable witness JSON. The
+  // checkpoint digest specifically rejects replay of an authentic *older*
+  // owner-signed minimum within its otherwise valid expiration window.
+  if ((ownerPin === undefined) !== (checkpointPin === undefined)) fail();
+  if (ownerPin !== undefined && !Object.hasOwn(config, "casAnchorFloor")) fail();
   let floor = null;
   if (Object.hasOwn(config, "casAnchorFloor")) {
     // This is provisioned by the OUTSIDE owner/witness overseer. A restarted
     // witness may not derive its own minimum from its restored SQLite file.
     // The operator must advance this out-of-band checkpoint after witnessed
     // receipts; a stale external checkpoint cannot prevent every rollback.
-    exact(config.casAnchorFloor, ["dbPath", "trustedMinimumHead"]);
+    const ownerSigned = Object.hasOwn(config.casAnchorFloor, "owner");
+    exact(config.casAnchorFloor, ownerSigned
+      ? ["dbPath", "trustedMinimumHead", "owner"]
+      : ["dbPath", "trustedMinimumHead"]);
     exact(config.casAnchorFloor.trustedMinimumHead, ["sequence", "lastHash"]);
     if (typeof config.casAnchorFloor.dbPath !== "string"
       || !path.isAbsolute(config.casAnchorFloor.dbPath)
@@ -81,6 +100,49 @@ function configure(config) {
       || !/^[a-f0-9]{64}$/.test(config.casAnchorFloor.trustedMinimumHead.lastHash)
       || (config.casAnchorFloor.trustedMinimumHead.sequence === 0
         && config.casAnchorFloor.trustedMinimumHead.lastHash !== "0".repeat(64))) fail();
+    // A pin requires an owner-authenticated bounded-age minimum; removing
+    // the owner signature or changing the floor cannot silently downgrade.
+    // Conversely, never accept a signature without an operator-owned pin.
+    if (ownerSigned !== (ownerPin !== undefined)) fail();
+    if (ownerSigned) {
+      const signed = config.casAnchorFloor.owner;
+      exact(signed, OWNER_FIELDS);
+      const now = Math.floor(Date.now() / 1000);
+      if (!Number.isSafeInteger(signed.issuedAt)
+        || !Number.isSafeInteger(signed.expiresAt)
+        || signed.issuedAt > now + 120 || signed.issuedAt < now - 86400
+        || signed.expiresAt <= now || signed.expiresAt <= signed.issuedAt
+        || signed.expiresAt - signed.issuedAt > 86400
+        || typeof signed.signature !== "string"
+        || !/^[A-Za-z0-9_-]{86}$/.test(signed.signature)) fail();
+      const ownerPublicKey = crypto.createPublicKey(readFile(signed.publicKeyPath));
+      if (ownerPublicKey.type !== "public" || ownerPublicKey.asymmetricKeyType !== "ed25519") fail();
+      const ownerSpki = ownerPublicKey.export({ type: "spki", format: "der" });
+      const fingerprint = crypto.createHash("sha256").update(ownerSpki).digest();
+      if (!crypto.timingSafeEqual(fingerprint, Buffer.from(ownerPin, "hex"))) fail();
+      const witnessSpki = crypto.createPublicKey(witnessPrivateKey)
+        .export({ type: "spki", format: "der" });
+      const statusSpki = statusPublicKey.export({ type: "spki", format: "der" });
+      if (ownerSpki.equals(witnessSpki) || ownerSpki.equals(statusSpki)) fail();
+      const ownerStatement = {
+        type: "rootark-zk1-cas-owner-floor/v1",
+        witnessKeyId: config.witnessKeyId,
+        statusKeyId: config.statusKeyId,
+        sequence: config.casAnchorFloor.trustedMinimumHead.sequence,
+        lastHash: config.casAnchorFloor.trustedMinimumHead.lastHash,
+        issuedAt: signed.issuedAt, expiresAt: signed.expiresAt,
+      };
+      const signature = Buffer.from(signed.signature, "base64url");
+      const ownerPayload = Buffer.from(JSON.stringify(ownerStatement));
+      if (signature.length !== 64
+        || signature.toString("base64url") !== signed.signature
+        || !crypto.verify(null, Buffer.concat([OWNER_FLOOR_DOMAIN,
+          ownerPayload]), ownerPublicKey, signature)) fail();
+      const signedCheckpointDigest = crypto.createHash("sha256")
+        .update(OWNER_FLOOR_DOMAIN).update(ownerPayload).update(signature).digest();
+      if (!crypto.timingSafeEqual(signedCheckpointDigest,
+        Buffer.from(checkpointPin, "hex"))) fail();
+    }
     if (fs.existsSync(config.casAnchorFloor.dbPath)
       && fs.existsSync(config.dbPath)
       && fs.realpathSync.native(config.casAnchorFloor.dbPath).toLowerCase()
