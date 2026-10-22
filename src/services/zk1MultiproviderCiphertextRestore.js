@@ -231,7 +231,12 @@ class Zk1MultiproviderCiphertextRestore {
       const quorum = whole(r.minimumMatchingProviders, 2, readers.length);
       const checkpoint = detachedSignedRecord(r.ownerCheckpoint);
       const ownerHistoryCheckpoint = detachedSignedRecord(r.ownerHistoryCheckpoint);
-      const previousHistoryProof = detachedSignedRecord(r.previousOwnerHistoryProof);
+      // An ancestor is NOT signed wire data: verifyOwnerCheckpoint brands its
+      // frozen result in a module-private WeakMap. Copying even identical
+      // public fields loses that proof and breaks valid history seq > 1.
+      // Keep the exact in-process object; the pinned-owner verifier rejects
+      // unbranded JSON, forged flags, foreign signers and broken continuity.
+      const previousHistoryProof = r.previousOwnerHistoryProof;
       if (operation.epoch > this.#ownerHead.epoch) deny();
       // These two independently pinned signatures MUST verify before any GET.
       const signed = await inventory.verifyCommittedEntryProof({
@@ -292,9 +297,13 @@ class Zk1MultiproviderCiphertextRestore {
   // Disaster path when the local SQLite catalog and plaintext-free backup are
   // both missing. Fetch independently matching signed sidecar bytes first;
   // restoreExact then verifies their full Ed25519 history, owner root and live
-  // current authorization BEFORE reading or releasing ciphertext.
+  // current authorization BEFORE reading or releasing ciphertext. When the
+  // signed owner history has sequence > 1, only an already verified in-process
+  // predecessor proof can satisfy its private WeakMap brand. A cloud sidecar
+  // can retain the signed wire, but CANNOT serialize the verified proof brand.
   async restoreFromCloudCatalog({ scope, operation, catalogReaders, readers,
-    minimumMatchingProviders = 2, minimumMatchingCatalogProviders = 2 } = {}) {
+    minimumMatchingProviders = 2, minimumMatchingCatalogProviders = 2,
+    previousOwnerHistoryProof = null } = {}) {
     try {
       const fixed = cloneOperation(operation);
       await this.#current(fixed);
@@ -302,7 +311,12 @@ class Zk1MultiproviderCiphertextRestore {
         operationId: fixed.operation_id, readers: catalogReaders,
         minimumMatchingProviders: minimumMatchingCatalogProviders });
       const verified = await this.restoreExact({ scope, operation: fixed,
-        ...recovered.signedCatalog, readers, minimumMatchingProviders });
+        ...recovered.signedCatalog,
+        // Fail closed if the previous proof was merely replayed as JSON;
+        // a real predecessor must come from the owner verifier, not the cloud.
+        previousOwnerHistoryProof: previousOwnerHistoryProof === null
+          ? recovered.signedCatalog.previousOwnerHistoryProof : previousOwnerHistoryProof,
+        readers, minimumMatchingProviders });
       return Object.freeze({ ...verified,
         signedCatalogRecoveredFromRemote: true,
         signedCatalogSourceProviders: recovered.providers,

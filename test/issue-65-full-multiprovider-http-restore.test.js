@@ -296,6 +296,67 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     expectedCiphertextRoot: root, chunkLengths: [ciphertext.length],
     readers, minimumMatchingProviders: 2 };
 
+  // An owner history predecessor is NOT wire JSON: this is a process-local
+  // WeakMap-branded proof returned by the cryptographic verifier. Rebuilding
+  // an object with the same public fields MUST NOT mint the private brand.
+  const historyVerify = (checkpoint, previous) => ownerHistory.verifyOwnerCheckpoint({
+    checkpoint, scope: scopeClient, signerPublicKey: verifier,
+    signerKeyId: ownerSignerId, previous });
+  const proofV1 = await historyVerify(ownerHistoryCheckpoint, null);
+  const attackerKeys = crypto.generateKeyPairSync("ed25519");
+  const attackerSigner = await crypto.webcrypto.subtle.importKey("pkcs8",
+    attackerKeys.privateKey.export({ type: "pkcs8", format: "der" }),
+    "Ed25519", false, ["sign"]);
+  const attackerVerifier = await crypto.webcrypto.subtle.importKey("spki",
+    attackerKeys.publicKey.export({ type: "spki", format: "der" }),
+    "Ed25519", false, ["verify"]);
+  const foreignHistory = await ownerHistory.signOwnerCheckpoint({
+    scope: scopeClient, signerKey: attackerSigner, signerPublicKey: attackerVerifier,
+    signerKeyId: ownerSignerId, deviceId: "owner-device", revision: 9,
+    manifestDigest: ownerDigest, issuedAt: 1001, previous: null });
+  const foreignBrandedProof = await ownerHistory.verifyOwnerCheckpoint({
+    checkpoint: foreignHistory, scope: scopeClient,
+    signerPublicKey: attackerVerifier, signerKeyId: ownerSignerId, previous: null });
+  assert.equal(foreignBrandedProof.signedCheckpointVerified, true);
+  const historical = [];
+  let predecessor = proofV1;
+  for (const sequence of [2, 3]) {
+    const signedHistory = await ownerHistory.signOwnerCheckpoint({
+      scope: scopeClient, signerKey: signer, signerPublicKey: verifier,
+      signerKeyId: ownerSignerId, deviceId: "owner-device", revision: 9,
+      manifestDigest: ownerDigest, issuedAt: 1001 + sequence, previous: predecessor });
+    const verified = await historyVerify(signedHistory, predecessor);
+    assert.equal(verified.sequence, sequence);
+    historical.push({ sequence, signedHistory, predecessor });
+    predecessor = verified;
+  }
+  for (const item of historical) {
+    await t.test(`verified owner history sequence ${item.sequence} restores; spoofed predecessor is rejected`, async () => {
+      const request = { ...recoverInput,
+        ownerHistoryCheckpoint: item.signedHistory,
+        previousOwnerHistoryProof: item.predecessor };
+      const opened = await gateway.restoreExact(request);
+      assert.equal(opened.status, "SIGNED_CATALOG_AND_OWNER_ROOT_CLOUD_RESTORE");
+      assert.deepEqual(opened.ciphertext, ciphertext);
+      assert.equal(opened.verifiedProviders.length, 3);
+
+      const beforeForgedGet = { ...hits };
+      for (const forged of [
+        { ...item.predecessor },
+        Object.freeze({ ...item.predecessor, authorizesRecovery: true }),
+        Object.freeze({ ...item.predecessor, signedCheckpointVerified: true }),
+        Object.freeze({ ...item.predecessor, checkpointDigest: b64(random(32)) }),
+        new Proxy(item.predecessor, {}),
+        foreignBrandedProof,
+      ]) {
+        await assert.rejects(gateway.restoreExact({ ...request,
+          previousOwnerHistoryProof: forged }), /ZK_MULTIPROVIDER_RESTORE_DENIED/);
+      }
+      assert.deepEqual(hits, beforeForgedGet,
+        "no authenticated cloud GET for unbranded/forged predecessor claims");
+    });
+  }
+
   // Publish the separately addressed Ed25519 catalog backup over the REAL
   // disposable S3 SDK HTTP PUT, Drive HTTPS media CREATE and WebDAV mTLS PUT.
   const signedCatalog = Object.fromEntries(Object.entries(recoverInput).filter(
@@ -400,4 +461,28 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   currentEpoch = 2;
   session = false;
   assert.equal((await sendGet()).status, 403);
+
+  for (const item of historical) {
+    await t.test(`signed cloud sidecar history ${item.sequence} needs independently verified predecessor`, async () => {
+      // A cloud copy carries signed history wire, not the private WeakMap
+      // brand. The current owner verifier must mint that in-process proof.
+      const persisted = { ...signedCatalog,
+        ownerHistoryCheckpoint: item.signedHistory,
+        previousOwnerHistoryProof: { ...item.predecessor } };
+      const sidecarWrite = await publishSignedCatalogSidecars({
+        ...publishInput, signedCatalog: persisted });
+      assert.equal(sidecarWrite.acknowledgements.length, 3);
+      await assert.rejects(gateway.restoreFromCloudCatalog(remoteRecovery),
+        /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+        "server-replayed JSON must never recreate a branded owner proof");
+      const repaired = await gateway.restoreFromCloudCatalog({ ...remoteRecovery,
+        previousOwnerHistoryProof: item.predecessor });
+      assert.equal(repaired.signedCatalogRecoveredFromRemote, true);
+      assert.deepEqual(repaired.ciphertext, ciphertext);
+      for (const predecessor of [{ ...item.predecessor }, foreignBrandedProof]) {
+        await assert.rejects(gateway.restoreFromCloudCatalog({ ...remoteRecovery,
+          previousOwnerHistoryProof: predecessor }), /ZK_MULTIPROVIDER_RESTORE_DENIED/);
+      }
+    });
+  }
 });
