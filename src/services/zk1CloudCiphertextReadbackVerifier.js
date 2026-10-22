@@ -75,13 +75,13 @@ class Zk1CloudCiphertextReadbackVerifier {
   constructor({ cloudReader, expectedProvider, expectedReaderContext,
     pinnedDriveFileId = null } = {}) {
     if (!cloudReader || typeof cloudReader !== "object"
-      || !["s3", "gdrive"].includes(expectedProvider)
+      || !["s3", "gdrive", "webdav"].includes(expectedProvider)
       || !CONTEXT.test(expectedReaderContext)
       || !["status", "enabled", "resolveInventoryContext", "key", "download"]
         .every((method) => typeof cloudReader[method] === "function")
       || cloudReader.status()?.provider !== expectedProvider
       || cloudReader.enabled() !== true
-      || (expectedProvider === "s3" && pinnedDriveFileId !== null)
+      || (["s3", "webdav"].includes(expectedProvider) && pinnedDriveFileId !== null)
       || (expectedProvider === "gdrive" &&
         (typeof pinnedDriveFileId !== "string"
           || !/^[A-Za-z0-9_-]{1,256}$/.test(pinnedDriveFileId)))) fail();

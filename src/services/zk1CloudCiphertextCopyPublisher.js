@@ -79,14 +79,14 @@ class Zk1CloudCiphertextCopyPublisher {
   constructor({ cloudWriter, expectedProvider, expectedWriterContext,
     pinnedDriveFileId = null } = {}) {
     if (!cloudWriter || typeof cloudWriter !== "object"
-      || !["s3", "gdrive"].includes(expectedProvider)
+      || !["s3", "gdrive", "webdav"].includes(expectedProvider)
       || typeof expectedWriterContext !== "string"
       || !/^[a-f0-9]{64}$/.test(expectedWriterContext)
       || !["status", "enabled", "resolveInventoryContext", "key", "upload"]
         .every((method) => typeof cloudWriter[method] === "function")
       || cloudWriter.enabled() !== true
       || cloudWriter.status()?.provider !== expectedProvider
-      || (expectedProvider === "s3" && pinnedDriveFileId !== null)
+      || (["s3", "webdav"].includes(expectedProvider) && pinnedDriveFileId !== null)
       || (expectedProvider === "gdrive" &&
         (typeof pinnedDriveFileId !== "string"
           || !/^[A-Za-z0-9_-]{1,256}$/.test(pinnedDriveFileId)))) fail();
