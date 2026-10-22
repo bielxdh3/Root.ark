@@ -184,13 +184,30 @@
         const store = tx.objectStore(kind);
         let result = null;
         let cancelled = null;
-        if (action === "save") {
+        if (action === "save" || action === "delete-if-current") {
           const check = store.get(username);
           check.onsuccess = () => {
             if (generation !== state.lockGeneration || username !== state.username) {
               cancelled = new Error("Local operation cancelled");
               cancelled.code = "DEV_VAULT_CANCELLED";
               tx.abort();
+            } else if (action === "delete-if-current") {
+              // Another tab may have replaced the pending ECDH request since
+              // it was read. Never delete a newer request in that case.
+              const saved = check.result?.request;
+              const expected = value?.request;
+              if (!saved || !expected || saved.format !== expected.format
+                || saved.username !== expected.username
+                || saved.requestId !== expected.requestId
+                || saved.publicKey !== expected.publicKey
+                || saved.createdAt !== expected.createdAt
+                || saved.expiresAt !== expected.expiresAt) {
+                cancelled = new Error("Local recovery request changed");
+                cancelled.code = "DEV_VAULT_CANCELLED";
+                tx.abort();
+              } else {
+                store.delete(username);
+              }
             } else if (check.result) {
               cancelled = new Error("Local trusted device record already exists");
               tx.abort();
@@ -226,6 +243,14 @@
     const file = input.files?.[0];
     if (!file || file.size > 5000 || file.size < 2) throw new Error("Invalid recovery JSON");
     return JSON.parse(await file.text());
+  }
+  function expiredRecoveryRequest(pending) {
+    const request = pending?.request;
+    return request?.username === state.username
+      && Number.isSafeInteger(request.createdAt)
+      && Number.isSafeInteger(request.expiresAt)
+      && request.expiresAt === request.createdAt + 15 * 60 * 1000
+      && request.expiresAt <= Date.now();
   }
   async function refresh() {
     await requireCurrentAccount();
@@ -311,8 +336,9 @@
         try {
           const pending = await localDeviceRecord("pending", "load");
           if (pending?.request) {
-            $("device-request-code").textContent =
-              await trustedDevice.requestFingerprint({
+            $("device-request-code").textContent = expiredRecoveryRequest(pending)
+              ? "Solicitação expirada. Crie outra sem apagar as chaves locais."
+              : await trustedDevice.requestFingerprint({
                 username: state.username, request: pending.request,
               });
           }
@@ -587,8 +613,12 @@
     const username = await requireCurrentAccount();
     const previous = await localDeviceRecord("pending", "load", undefined, generation);
     if (previous) {
-      status("Existe uma solicitação pendente neste navegador. Conclua-a ou apague as chaves locais antes de criar outra.");
-      return;
+      if (!expiredRecoveryRequest(previous)) {
+        status("Existe uma solicitação pendente. Conclua-a ou use Cancelar solicitação para criar outra.");
+        return;
+      }
+      await requireCurrentAccount();
+      await localDeviceRecord("pending", "delete-if-current", previous, generation);
     }
     const pending = await trustedDevice.createRecoveryRequest({ username });
     await requireCurrentAccount();
@@ -601,6 +631,23 @@
     assertNotRelocked(generation);
     downloadJson("rootark-device-request-dev-v1.json", pending.request);
     status("Solicitação gerada. Anote o código criptográfico exibido acima no navegador solicitante. Envie o JSON ao dispositivo confiável.");
+  }));
+  $("device-cancel").addEventListener("click", () => run(async () => {
+    const generation = state.lockGeneration;
+    await requireCurrentAccount();
+    const pending = await localDeviceRecord("pending", "load", undefined, generation);
+    if (!pending) {
+      $("device-request-code").textContent = "Nenhuma solicitação pendente";
+      status("Não há solicitação para cancelar.");
+      return;
+    }
+    if (!confirm("Cancelar esta solicitação? Uma resposta já recebida não poderá mais ser usada neste navegador.")) return;
+    await requireCurrentAccount();
+    await localDeviceRecord("pending", "delete-if-current", pending, generation);
+    assertNotRelocked(generation);
+    $("device-request-code").textContent = "Nenhuma solicitação pendente";
+    $("device-response-file").value = "";
+    status("Solicitação cancelada neste navegador. Chaves e autorizações locais preservadas.");
   }));
   $("device-approve").addEventListener("click", () => run(async () => {
     if (!trustedDevice) throw new Error("Trusted device recovery unavailable");
@@ -659,7 +706,7 @@
       const recoveredKey = await cryptoFile.importRecoveryKey(result.recoveryKey);
       await requireMatchingVaultKey(computed);
       assertNotRelocked(generation);
-      await localDeviceRecord("pending", "delete", undefined, generation);
+      await localDeviceRecord("pending", "delete-if-current", pending, generation);
       assertNotRelocked(generation);
       $("device-request-code").textContent = "Nenhuma solicitação pendente";
       state.key = recoveredKey;

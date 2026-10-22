@@ -16,6 +16,8 @@ const SCRIPTS = new Map([
     path.join(ROOT, "public/client/rootark-dev-vault-crypto.js")],
   ["/client/rootark-dev-vault-trusted-device.js",
     path.join(ROOT, "public/client/rootark-dev-vault-trusted-device.js")],
+  ["/client/rootark-dev-vault-ui.js",
+    path.join(ROOT, "public/client/rootark-dev-vault-ui.js")],
   ["/client/rootark-zk1-owner-signed-checkpoint.js",
     path.join(ROOT, "public/client/rootark-zk1-owner-signed-checkpoint.js")],
   ["/client/rootark-zk1-owner-checkpoint-indexeddb.js",
@@ -63,6 +65,95 @@ const BROWSER_PROBE = [
   ' return "BROWSER_TRUSTED_DEVICE_INDEXEDDB_PASS";',
   '})()',
 ].join("\n");
+const NORMAL_SESSION_UI_PROBE = `(async () => {
+  const el = id => document.getElementById(id);
+  const until = async check => {
+    for (let i=0;i<250;i++) {
+      const value=await check(); if (value) return value;
+      await new Promise(resolve=>setTimeout(resolve,20));
+    }
+    throw Error("UI_ACTION_TIMEOUT: "+el("status").textContent);
+  };
+  await until(()=>el("account")?.textContent.includes("alice"));
+  await until(()=>el("status")?.textContent.includes("Cofre acessível"));
+  window.confirm=()=>true;
+  const db=await new Promise((resolve,reject)=>{
+    const req=indexedDB.open("rootark-opaque-dev-vault-key-v1",2);
+    req.onsuccess=()=>resolve(req.result); req.onerror=()=>reject(req.error);
+  });
+  const read=store=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(store,"readonly");
+    const req=tx.objectStore(store).get("alice");
+    req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);
+  });
+  const write=(store,record)=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(store,"readwrite");
+    tx.objectStore(store).put(record,"alice");
+    tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error);
+  });
+  const original=await RootarkDevVaultCrypto.generateRecoveryKey();
+  const keyId=await RootarkDevVaultCrypto.keyCommitment(original.recoveryKey,"alice");
+  el("recovery").value=original.recoveryKey;
+  el("import").click();
+  await until(()=>el("status").textContent.includes("Chave importada"));
+  el("save-device").click();
+  await until(async()=>Boolean(await read("keys")));
+  el("emergency-recovery-key").value=original.recoveryKey;
+  el("device-enroll").click();
+  await until(async()=>Boolean(await read("trusted")));
+  el("device-request").click();
+  const first=await until(()=>read("pending"));
+  const oldCode=el("device-request-code").textContent;
+  if (!first.privateKey || oldCode.length!==22) throw Error("FIRST_REQUEST_MISSING");
+  el("device-request").click();
+  await until(()=>el("status").textContent.includes("Existe uma solicitação pendente"));
+  if ((await read("pending")).request.requestId!==first.request.requestId)
+    throw Error("ACTIVE_REQUEST_REPLACED_WITHOUT_CANCEL");
+  const expiredAt=Date.now()-1000;
+  const stale={...first,request:{...first.request,
+    createdAt:expiredAt-15*60*1000,expiresAt:expiredAt}};
+  await write("pending",stale);
+  el("device-request").click();
+  const second=await until(async()=>{
+    const current=await read("pending");
+    return current?.request.requestId!==first.request.requestId && current;
+  });
+  if (!second.privateKey || second.privateKey.extractable!==false
+    || el("device-request-code").textContent===oldCode)
+    throw Error("EXPIRED_REQUEST_NOT_REPLACED");
+  if ((await read("keys"))?.keyId!==keyId
+    || (await read("trusted"))?.keyId!==keyId)
+    throw Error("EXPIRY_RENEWAL_REMOVED_TRUSTED_KEYS");
+  // A second tab changes the pending request after this tab has read it,
+  // during the human confirmation. The first tab must not delete it.
+  const race=await RootarkDevVaultTrustedDevice.createRecoveryRequest({username:"alice"});
+  window.confirm=()=>{
+    const tx=db.transaction("pending","readwrite");
+    tx.objectStore("pending").put(race,"alice");
+    return true;
+  };
+  el("device-cancel").click();
+  await until(async()=> (await read("pending"))?.request.requestId===race.request.requestId);
+  await new Promise(resolve=>setTimeout(resolve,100));
+  if ((await read("pending"))?.request.requestId!==race.request.requestId)
+    throw Error("CONCURRENT_REPLACEMENT_DELETED");
+  window.confirm=()=>true;
+  el("device-cancel").click();
+  await until(async()=>!(await read("pending")));
+  if ((await read("keys"))?.keyId!==keyId
+    || (await read("trusted"))?.keyId!==keyId
+    || el("device-request-code").textContent!=="Nenhuma solicitação pendente")
+    throw Error("CANCEL_DAMAGED_KEYS_OR_UI");
+  el("device-request").click();
+  const third=await until(()=>read("pending"));
+  window.__testAccount="bob";
+  el("device-cancel").click();
+  await until(()=>el("account").textContent.includes("mudou"));
+  if ((await read("pending"))?.request.requestId!==third.request.requestId)
+    throw Error("CHANGED_ACCOUNT_REMOVED_OTHER_ACCOUNT_REQUEST");
+  db.close();
+  return "NORMAL_SESSION_DEVICE_PENDING_UI_PASS";
+})()`;
 const OWNER_CHECKPOINT_PROBE = `(async () => {
   const cryptoClient = RootarkZk1OwnerSignedCheckpoint;
   const idb = RootarkZk1OwnerCheckpointIndexedDb;
@@ -256,6 +347,12 @@ test("real Edge IndexedDB restores nonextractable trusted-device keys for indepe
     if (req.url === "/") {
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       res.end('<!doctype html><meta charset="utf-8"><script defer src="/client/rootark-dev-vault-crypto.js"></script><script defer src="/client/rootark-dev-vault-trusted-device.js"></script><script defer src="/client/rootark-zk1-owner-signed-checkpoint.js"></script><script defer src="/client/rootark-zk1-owner-checkpoint-indexeddb.js"></script>');
+    } else if (req.url === "/ui") {
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      fs.createReadStream(path.join(ROOT,"public/zk-dev-vault.html")).pipe(res);
+    } else if (req.url === "/client/rootark-api.js") {
+      res.setHeader("Content-Type", "application/javascript");
+      res.end('window.__testAccount="alice";window.RootarkApi={get:async url=>url.endsWith("/session")?{username:window.__testAccount,activeKeyId:null}:{objects:[]}};');
     } else if (SCRIPTS.has(req.url)) {
       res.setHeader("Content-Type", "application/javascript");
       fs.createReadStream(SCRIPTS.get(req.url)).pipe(res);
@@ -303,6 +400,20 @@ test("real Edge IndexedDB restores nonextractable trusted-device keys for indepe
     assert.equal(checkpoint.exceptionDetails, undefined,
       checkpoint.exceptionDetails?.text || "Owner checkpoint IndexedDB crashed in browser");
     assert.equal(checkpoint.result?.value, "BROWSER_OWNER_CHECKPOINT_INDEXEDDB_PASS");
+    await client.send("Page.navigate", { url: origin + "/ui" });
+    await waitFor(async () => {
+      const result = await client.send("Runtime.evaluate", {
+        expression: "Boolean(window.RootarkDevVaultTrustedDevice && document.getElementById('device-cancel') && window.RootarkApi)",
+        returnByValue: true,
+      });
+      return result.result?.value === true;
+    });
+    const ui = await client.send("Runtime.evaluate", {
+      expression: NORMAL_SESSION_UI_PROBE, awaitPromise: true, returnByValue: true,
+    });
+    assert.equal(ui.exceptionDetails, undefined,
+      JSON.stringify(ui.exceptionDetails || ui.result));
+    assert.equal(ui.result?.value, "NORMAL_SESSION_DEVICE_PENDING_UI_PASS");
   } finally {
     client?.socket.close();
     // Only the unique test-owned browser process/tree is terminated.
