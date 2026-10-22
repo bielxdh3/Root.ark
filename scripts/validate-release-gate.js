@@ -6,6 +6,7 @@ const path = require("node:path");
 const { Buffer } = require("node:buffer");
 const { spawnSync } = require("node:child_process");
 const { getNpmInvocation, isDependencyOrNetworkUnavailable } = require("./release-gate-environment");
+const { failedTestDiagnostics, unrecognizedChildProgress } = require("./release-gate-diagnostics");
 
 const root = path.resolve(__dirname, "..");
 const results = [];
@@ -13,19 +14,6 @@ const results = [];
 function record(name, status, details) {
   results.push({ name, status, details });
   console.log(`${status}: ${name}${details ? ` — ${details}` : ""}`);
-}
-
-function failedTestDiagnostics(output) {
-  return String(output || "").split(/\r?\n/)
-    .map((line) => line.replace(/\x1b\[[\d;]*m/g, "").trim())
-    .filter((line) => /^(?:not ok \d+ - |[✖✗×] |error:|failureType:|location:|(?:#\s*|ℹ\s*)(?:tests|pass|fail|cancelled|skipped|todo|suites|duration_ms)\s+\d+(?:\.\d+)?\s*$|npm (?:error|ERR!) (?:code|signal|exit)\s+[A-Z0-9_]+\s*$)/i.test(line))
-    .slice(-20)
-    .map((line) => line
-      .replace(/\b(?:Bearer|Basic)\s+\S+/gi, "[REDACTED]")
-      .replace(/\b(?:password|passphrase|client_secret|refresh_token|access_token|id_token|secret|token|cookie|authorization|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s;,]+)/gi, "[REDACTED]")
-      .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[REDACTED]")
-      .slice(0, 240))
-    .join("\n").slice(0, 3000);
 }
 
 function command(name, executable, args, { blockedOnMissing = false, shell = false } = {}) {
@@ -45,7 +33,7 @@ function command(name, executable, args, { blockedOnMissing = false, shell = fal
   else {
     const code = String(result.error?.code || "none");
     const safeCode = /^[A-Z][A-Z0-9_]{1,30}$/.test(code) ? code : "unknown";
-    console.log(`FAIL diagnostics (${name}): unrecognized child output; stdoutBytes=${Buffer.byteLength(result.stdout || "", "utf8")} stderrBytes=${Buffer.byteLength(result.stderr || "", "utf8")} spawnError=${safeCode}; raw output withheld`);
+    console.log(`FAIL diagnostics (${name}): unrecognized child output; stdoutBytes=${Buffer.byteLength(result.stdout || "", "utf8")} stderrBytes=${Buffer.byteLength(result.stderr || "", "utf8")} spawnError=${safeCode}; ${unrecognizedChildProgress(output)}; raw output withheld`);
   }
   return false;
 }
