@@ -24,6 +24,7 @@ async function harness() {
   const downloads = [];
   const trace = [];
   let onDownload = null;
+  let onIndependentFetch = null;
   let restoreCount = 0;
   let finishRestore;
   let finishArchive;
@@ -38,7 +39,7 @@ async function harness() {
   let nextHistoricChallenge = 0;
   const window = {
     RootarkApi: { get: async () => ({ enabled: true,
-      securityVersion: 2, signedHistoryRequired: true }) },
+      securityVersion: 2, signedHistoryRequired: true, opaqueCatalogV1: true }) },
     isSecureContext: true, crypto: crypto.webcrypto,
     RootarkZk1NormalBrowserTrustFloor: {
       provisionOffline: async () => ({}),
@@ -171,11 +172,14 @@ async function harness() {
     head: { append(script) { script.onload?.(); } },
     body: { append() {} },
   };
-  const url = { createObjectURL: (blob) => { selectedBlob = blob; return "blob:fixture"; },
-    revokeObjectURL() {} };
+  class BrowserURL extends URL {}
+  BrowserURL.createObjectURL = (blob) => { selectedBlob = blob; return "blob:fixture"; };
+  BrowserURL.revokeObjectURL = () => {};
   vm.runInNewContext(source, {
     window, document, location: { origin: "https://localhost" },
-    crypto: crypto.webcrypto, URL: url, Blob, Headers,
+    crypto: crypto.webcrypto, URL: BrowserURL, Blob, Headers,
+    fetch: (...args) => onIndependentFetch
+      ? onIndependentFetch(...args) : Promise.reject(Error("NO_INDEPENDENT_FETCH")),
     TextEncoder, TextDecoder, Uint8Array, ArrayBuffer, atob, btoa,
     setTimeout: (callback, delay) => delay === 60000 ? 0 : setTimeout(callback, delay),
   });
@@ -234,6 +238,7 @@ async function harness() {
   return {
     document, dialog, downloads, field, file, listeners, window,
     trace,
+    setIndependentFetch(callback) { onIndependentFetch = callback; },
     setDownloadHook(callback) { onDownload = callback; },
     click(action) { dialog.events.click({
       target: { closest: () => ({ dataset: { zk1Action: action } }) },
@@ -687,6 +692,129 @@ for (const mode of ["no-opt-in", "incomplete-chain", "missing-root", "revoked",
       await page.denied();
       assert.deepEqual([...recovered], [0]);
     } else await page.denied();
+    assert.equal(page.downloads.length, 0);
+  });
+
+async function configureCatalogWriter(page, { delayedPut = false } = {}) {
+  const fixtureGrant = JSON.parse(Buffer.from(
+    await page.field("grant").files[0].arrayBuffer()).toString("utf8"));
+  fixtureGrant.device_id = "writer-device";
+  page.file("grant", JSON.stringify(fixtureGrant));
+  page.file("catalog-signer-grant", JSON.stringify(fixtureGrant));
+  page.file("catalog-write-ciphertext", Buffer.alloc(120, 0x6d));
+  page.file("catalog-write-key", crypto.randomBytes(32));
+  page.field("catalog-write-name").value = "private client-only name.txt";
+  page.field("catalog-write-opt-in").checked = true;
+  page.field("catalog-write-sequence").value = "0";
+  page.field("catalog-write-digest").value = encode(Buffer.alloc(32));
+  const witness = crypto.generateKeyPairSync("ed25519");
+  const cas = crypto.generateKeyPairSync("ed25519");
+  const witnessRaw = witness.publicKey.export({ type: "spki", format: "der" }).subarray(-32);
+  const casRaw = cas.publicKey.export({ type: "spki", format: "der" }).subarray(-32);
+  page.file("catalog-witness-key", witnessRaw);
+  page.file("catalog-cas-key", casRaw);
+  page.field("catalog-witness-id").value = encode(crypto.randomBytes(16));
+  page.field("catalog-witness-spki").value = encode(crypto.createHash("sha256")
+    .update(witness.publicKey.export({ type: "spki", format: "der" })).digest());
+  page.field("catalog-cas-spki").value = encode(crypto.createHash("sha256")
+    .update(cas.publicKey.export({ type: "spki", format: "der" })).digest());
+  page.field("catalog-witness-url").value = "https://independent-witness.example/fresh-head";
+  page.field("catalog-cas-url").value = "https://independent-cas.example/fresh-head";
+  const steps = [];
+  let finishPut;
+  page.setIndependentFetch(async (url, init) => {
+    assert.equal(["https://independent-witness.example/fresh-head",
+      "https://independent-cas.example/fresh-head"].includes(url), true);
+    assert.equal(init.credentials, "omit");
+    assert.equal(init.mode, "cors");
+    assert.equal(init.redirect, "error");
+    assert.equal(init.referrerPolicy, "no-referrer");
+    assert.equal(init.body.includes("private client-only name"), false);
+    assert.deepEqual(Object.keys(JSON.parse(init.body)), ["scope", "nonceBase64"]);
+    steps.push(url.includes("witness") ? "witness" : "cas");
+    return new Response(Uint8Array.of(0x80), { status: 200,
+      headers: { "content-type": "application/cbor" } });
+  });
+  page.window.RootarkZk1BrowserOpaqueCatalogCommit = {
+    createClient(input) {
+      assert.equal(input.minimumCatalogHead.sequence, 0);
+      assert.equal(input.signerGrants.length, 1);
+      assert.equal(input.devicePublicKey.extractable, true);
+      assert.equal(input.devicePrivateKey.extractable, false);
+      assert.equal(input.isSessionCurrent(), true);
+      steps.push("create-client");
+      return {
+        async prepareIntent(writes) {
+          assert.equal(writes.length, 1);
+          assert.equal(writes[0].ciphertext.length, 120);
+          steps.push("journal");
+          await input.ownerWitnessProbe({ scope: fixtureGrant, nonce: crypto.randomBytes(32) });
+          await input.catalogProbe({ scope: fixtureGrant, nonce: crypto.randomBytes(32) });
+          return encode(crypto.randomBytes(32));
+        },
+        async commit(additions, journalId) {
+          steps.push("commit");
+          assert.equal(typeof journalId, "string");
+          assert.equal(additions[0].name, "private client-only name.txt");
+          assert.equal(additions[0].metadataKey.extractable, false);
+          assert.equal(input.isSessionCurrent(), true);
+          return { sequence: 1, digest: encode(crypto.randomBytes(32)),
+            totalCount: 1, verifiedSignedReadback: true,
+            productionDurabilityProven: false };
+        },
+      };
+    },
+  };
+  page.window.RootarkZk1ProtectedHttpClient = {
+    async signProtectedContentOperation(input) {
+      steps.push("sign-put");
+      assert.equal(input.operation, "put");
+      assert.equal(input.expectedObjectRevision, null);
+      assert.equal(input.ciphertext.length, 120);
+      assert.equal(input.scope.keyring_id, fixtureGrant.keyring_id);
+      return { id: input.objectId };
+    },
+    async postProtectedCiphertextPut({ request }) {
+      steps.push("put");
+      if (delayedPut) return new Promise((resolve) => { finishPut = () =>
+        resolve({ id: request.id, revision: 1 }); });
+      return { id: request.id, revision: 1 };
+    },
+  };
+  return { steps, getFinishPut: () => finishPut };
+}
+
+test("catalog publish opt-in invokes durable journal before signed PUT and authenticated commit", async () => {
+  const page = await harness();
+  const { steps } = await configureCatalogWriter(page);
+  page.click("catalog-publish");
+  await tickUntil(() => page.field("status").textContent.includes("Catálogo completo #1"));
+  assert.deepEqual(steps, ["create-client", "journal", "witness", "cas", "sign-put", "put", "commit"]);
+  assert.equal(page.field("catalog-write-journal").textContent.length, 43);
+  assert.equal(page.field("catalog-write-ciphertext").files.length, 0);
+  assert.equal(page.downloads.length, 0);
+});
+
+test("catalog publish denies forged independent signer pin before journal or PUT", async () => {
+  const page = await harness();
+  const { steps } = await configureCatalogWriter(page);
+  page.field("catalog-cas-spki").value = encode(crypto.randomBytes(32));
+  page.click("catalog-publish");
+  await page.denied();
+  assert.equal(steps.length, 0);
+});
+
+for (const mode of ["logout", "csrf"]) test("catalog publish fences " + mode
+  + " after uncertain PUT without catalog commit", async () => {
+    const page = await harness();
+    const { steps, getFinishPut } = await configureCatalogWriter(page, { delayedPut: true });
+    page.click("catalog-publish");
+    await tickUntil(() => Boolean(getFinishPut()));
+    if (mode === "logout") page.logout();
+    else page.document.cookie = "rootark_csrf=changed-session";
+    getFinishPut()();
+    await page.denied();
+    assert.equal(steps.includes("commit"), false);
     assert.equal(page.downloads.length, 0);
   });
 

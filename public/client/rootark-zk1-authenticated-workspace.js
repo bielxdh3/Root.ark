@@ -546,6 +546,49 @@
     if (!value) fail();
     return value;
   }
+  // The catalog writer's CAS and recovery witness are independently operated
+  // signed authorities. Browsers cannot inspect a TLS peer's SPKI: pin the
+  // Ed25519 signing SPKI explicitly, and never obtain these pins from Root.ark.
+  async function importPinnedCatalogAuthority(raw, expectedSpkiSha256) {
+    if (!(raw instanceof Uint8Array) || raw.length !== 32) fail();
+    const spki = new Uint8Array(44);
+    spki.set(Uint8Array.from([0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b,
+      0x65, 0x70, 0x03, 0x21, 0x00]));
+    spki.set(raw, 12);
+    const actual = new Uint8Array(await crypto.subtle.digest("SHA-256", spki));
+    let diff = 0;
+    for (let i = 0; i < 32; i++) diff |= actual[i] ^ expectedSpkiSha256[i];
+    if (diff !== 0) fail();
+    return crypto.subtle.importKey("raw", raw, "Ed25519", false, ["verify"]);
+  }
+  function independentCatalogEndpoint(value, rootOrigin) {
+    if (typeof value !== "string" || value.length > 2048 || !value) fail();
+    let url;
+    try { url = new URL(value); } catch (_) { fail(); }
+    if (url.href !== value || url.origin === rootOrigin || url.username || url.password
+      || url.hash || url.search || url.pathname === "/"
+      || !(url.protocol === "https:"
+        || (url.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)))) fail();
+    return url;
+  }
+  function independentCatalogProbe(url, assertLive) {
+    return async ({ scope, nonce }) => {
+      assertLive();
+      const response = await fetch(url.href, {
+        method: "POST", mode: "cors", credentials: "omit", redirect: "error",
+        referrerPolicy: "no-referrer", cache: "no-store",
+        headers: { "content-type": "application/json", accept: "application/cbor" },
+        body: JSON.stringify({ scope, nonceBase64: to64(nonce) }),
+      });
+      assertLive();
+      if (response.status !== 200 || response.headers.get("content-type")?.split(";")[0].trim() !== "application/cbor"
+        || Number(response.headers.get("content-length") || 0) > 8192) fail();
+      const raw = new Uint8Array(await response.arrayBuffer());
+      assertLive();
+      if (raw.length < 1 || raw.length > 8192) fail();
+      return raw;
+    };
+  }
   function loadScript(name) {
     return new Promise((resolve, reject) => {
       const script = document.createElement("script");
@@ -626,7 +669,7 @@
       + '<button type="button" class="button button-primary" data-zk1-action="upload">Cifrar, enviar e conferir GET</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="upload-recoverable">Enviar e exportar pacote recuperável</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="restore">Recuperar arquivo do novo dispositivo</button></div>'
-      + '<fieldset><legend>Catálogo opaco entre dispositivos (DEV, somente leitura)</legend>'
+      + '<fieldset><legend>Catálogo opaco entre dispositivos (DEV)</legend>'
       + '<p class="muted">Importe o grant do dispositivo que assinou o catálogo e a chave pública do CAS independente, ambos recebidos fora do servidor. '
       + 'Informe o head do catálogo fixado externamente. Os nomes ficam cifrados; só o navegador com a chave de metadados consegue abri-los. '
       + 'Nunca usa o sync-v2 genérico. O segundo dispositivo precisa do próprio grant ativo e da chave privada local.</p>'
@@ -642,6 +685,28 @@
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-page">Exibir página verificada</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-get">GET ciphertext conferido</button></div>'
       + '<div data-zk1-field="catalog-list" role="region" aria-label="IDs de versões opacas validadas"></div>'
+      + '<fieldset><legend>Publicar versão cifrada no catálogo completo (DEV, opt-in)</legend>'
+      + '<p class="muted">Selecione somente ciphertext já cifrado (16 bytes a 4 MiB). O nome é cifrado localmente com AES-GCM; '
+      + 'a chave de metadados e o nome nunca são enviados ao servidor. O journal assinado é gravado localmente ANTES do PUT. '
+      + 'O catálogo completo anterior é lido e autenticado, preservando todas as versões e aceitando apenas inclusão. '
+      + 'Após PUT, GET exato assinado e CAS, anote sequência e digest retornados em canal externo para os dois dispositivos. '
+      + 'As URLs independentes respondem a POST JSON {scope,nonceBase64} com CBOR Ed25519 application/cbor; '
+      + 'elas não podem ser o servidor Root.ark nem compartilhar origem entre si. Prova de nuvem/host físico não é inferida.</p>'
+      + '<label>Versão ciphertext local (.bin)<input type="file" data-zk1-field="catalog-write-ciphertext" accept=".bin,.ciphertext,application/octet-stream"></label>'
+      + '<label>Nome privado (cifrado no cliente, 1–220 bytes UTF-8)<input data-zk1-field="catalog-write-name" maxlength="220" autocomplete="off" spellcheck="false"></label>'
+      + '<label>Object ID opaco (base64url 16 bytes, vazio gera ID novo)<input data-zk1-field="catalog-write-id" maxlength="22" autocomplete="off" spellcheck="false"></label>'
+      + '<label>Chave AES-GCM de metadados (32 bytes, local)<input type="file" data-zk1-field="catalog-write-key"></label>'
+      + '<label>Chave pública Ed25519 do witness (raw 32 bytes, offline)<input type="file" data-zk1-field="catalog-witness-key"></label>'
+      + '<label>ID do witness (base64url 16 bytes, offline)<input data-zk1-field="catalog-witness-id" maxlength="22" spellcheck="false"></label>'
+      + '<label>SHA-256 SPKI do witness (base64url, pin offline)<input data-zk1-field="catalog-witness-spki" maxlength="43" spellcheck="false"></label>'
+      + '<label>URL de consulta direta ao witness independente (HTTPS POST)<input type="url" data-zk1-field="catalog-witness-url" spellcheck="false"></label>'
+      + '<label>URL de consulta direta ao CAS independente (HTTPS POST)<input type="url" data-zk1-field="catalog-cas-url" spellcheck="false"></label>'
+      + '<label>Sequência mínima do CAS fixada offline (0 para novo catálogo)<input type="number" min="0" max="128" step="1" data-zk1-field="catalog-write-sequence"></label>'
+      + '<label>Digest mínimo do CAS fixado offline (base64url; 32 bytes, zero no início)<input data-zk1-field="catalog-write-digest" maxlength="43" spellcheck="false"></label>'
+      + '<label><input type="checkbox" data-zk1-field="catalog-write-opt-in"> Confirmo ciphertext local, grants V2 ativos e autoridade CAS/witness independente; autorizo somente PUT e commit aditivo.</label>'
+      + '<div class="zk1-workspace-actions"><button type="button" class="button button-primary" data-zk1-action="catalog-publish">Journal → PUT → GET assinado → commit</button></div>'
+      + '<p class="muted">Journal local desta tentativa (não é pin nem confirmação): <output data-zk1-field="catalog-write-journal"></output></p>'
+      + '</fieldset>'
       + '</fieldset>'
       + '<fieldset><legend>Revogação de dispositivo e rotação V2 (recibo offline, DEV)</legend>'
       + '<p class="muted">Importe o recibo assinado do proprietário e, por canal separado, as chaves públicas SPKI e pins atuais de proprietário, witness e CAS. '
@@ -751,6 +816,8 @@
       committedDeviceApproval = null;
       verifiedCatalog = null;
       verifiedRevocationHead = null;
+      const journal = field("catalog-write-journal");
+      if (journal) journal.textContent = "";
       window.RootarkZk1V2OwnerRevocationBrowser?.clear();
       dialog.close();
       dialog.querySelector("form").reset();
@@ -761,7 +828,7 @@
       "restore", "new-secret", "new-device", "answer-pop", "import-approval", "verify-revocation",
       "migrate", "migration-finalize", "migration-batch", "archive-create", "archive-recover",
       "account-create", "account-recover", "versioned-create", "versioned-recover",
-      "catalog-discover", "catalog-page", "catalog-get"].includes(action)) return;
+      "catalog-discover", "catalog-page", "catalog-get", "catalog-publish"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -897,6 +964,143 @@
       }
       const trust = await grantAndOwner();
       assertLive();
+      if (action === "catalog-publish") {
+        if (field("catalog-write-opt-in")?.checked !== true
+          || available.opaqueCatalogV1 !== true
+          || trust.signedDeviceGrant.revoked_at_epoch !== null
+          || !trust.ownerHistoryCheckpoint) fail();
+        await window.RootarkZk1NormalBrowserTrustFloor.assertCurrent({
+          ownerPublicKey: trust.ownerPublicKey,
+          independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+          pinnedCurrentHead: trust.pinnedCurrentHead,
+          signedDeviceGrant: trust.signedDeviceGrant,
+          ownerHistoryCheckpoint: trust.ownerHistoryCheckpoint,
+          previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
+        });
+        assertLive();
+        if (!window.RootarkZk1BrowserOpaqueCatalogCommit)
+          await loadScript("rootark-zk1-browser-opaque-catalog-commit");
+        assertLive();
+        if (!window.RootarkZk1BrowserOpaqueCatalogCommit?.createClient
+          || !window.RootarkZk1ProtectedHttpClient?.signProtectedContentOperation
+          || !window.RootarkZk1ProtectedHttpClient?.postProtectedCiphertextPut) fail();
+        const rootOrigin = location.origin;
+        const witnessUrl = independentCatalogEndpoint(field("catalog-witness-url").value.trim(), rootOrigin);
+        const casUrl = independentCatalogEndpoint(field("catalog-cas-url").value.trim(), rootOrigin);
+        if (witnessUrl.origin === casUrl.origin) fail();
+        const signerGrant = JSON.parse(decoder.decode(await fileBytes("catalog-signer-grant", 1, 8192)));
+        const witnessRaw = await fileBytes("catalog-witness-key", 32, 32);
+        const casRaw = await fileBytes("catalog-cas-key", 32, 32);
+        const writerKeyRaw = await fileBytes("catalog-write-key", 32, 32);
+        let witnessKey, casKey, metadataKey;
+        try {
+          witnessKey = await importPinnedCatalogAuthority(witnessRaw,
+            from64(field("catalog-witness-spki").value.trim()));
+          casKey = await importPinnedCatalogAuthority(casRaw,
+            from64(field("catalog-cas-spki").value.trim()));
+          metadataKey = await crypto.subtle.importKey("raw", writerKeyRaw,
+            { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+        } finally { witnessRaw.fill(0); casRaw.fill(0); writerKeyRaw.fill(0); }
+        assertLive();
+        const privateRaw = await fileBytes("private", 1, 8192);
+        let devicePrivateKey;
+        try { devicePrivateKey = await crypto.subtle.importKey("pkcs8", privateRaw,
+          "Ed25519", false, ["sign"]); } finally { privateRaw.fill(0); }
+        const deviceRaw = await fileBytes("device", 32, 32);
+        let devicePublicKey;
+        // The opaque catalog UMD exports only this public key's raw bytes to
+        // compare them with the owner-signed grant; private keys stay sealed.
+        try { devicePublicKey = await crypto.subtle.importKey("raw", deviceRaw,
+          "Ed25519", true, ["verify"]); } finally { deviceRaw.fill(0); }
+        const name = field("catalog-write-name").value;
+        if (typeof name !== "string" || /[\u0000-\u001f\u007f]/.test(name)
+          || new TextEncoder().encode(name).length < 1
+          || new TextEncoder().encode(name).length > 220) fail();
+        const enteredId = field("catalog-write-id").value.trim();
+        if (enteredId && !/^[A-Za-z0-9_-]{22}$/.test(enteredId)) fail();
+        const objectId = enteredId || randomId();
+        field("catalog-write-id").value = objectId;
+        const rawSequence = field("catalog-write-sequence").value.trim();
+        if (!/^(0|[1-9][0-9]*)$/.test(rawSequence)) fail();
+        const sequence = Number(rawSequence);
+        if (!Number.isSafeInteger(sequence) || sequence > 127) fail();
+        const catalogFloor = from64(field("catalog-write-digest").value.trim());
+        if (sequence === 0 && catalogFloor.some((byte) => byte !== 0)) fail();
+        data = await fileBytes("catalog-write-ciphertext", 16, 4 * 1024 * 1024);
+        assertLive();
+        const scope = Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+          .map((key) => [key, trust.signedDeviceGrant[key]]));
+        const signerGrants = [trust.signedDeviceGrant];
+        if (signerGrant.device_id !== trust.signedDeviceGrant.device_id) signerGrants.push(signerGrant);
+        else if (JSON.stringify(signerGrant) !== JSON.stringify(trust.signedDeviceGrant)) fail();
+        const client = window.RootarkZk1BrowserOpaqueCatalogCommit.createClient({
+          origin: rootOrigin + "/", fetchImpl: guardedFetch,
+          ownerPublicKey: trust.ownerPublicKey,
+          pinnedOwnerKeyHash: trust.pinnedOwnerKeyHash,
+          pinnedOwnerHead: { revision: trust.pinnedCurrentHead.revision,
+            digest: trust.pinnedCurrentHead.digest, epoch: trust.pinnedCurrentHead.epoch },
+          signedDeviceGrant: trust.signedDeviceGrant, devicePublicKey, devicePrivateKey,
+          signerGrants, ownerWitnessPublicKey: witnessKey,
+          ownerWitnessKeyId: signerIdFrom64(field("catalog-witness-id").value.trim()),
+          ownerWitnessProbe: independentCatalogProbe(witnessUrl, assertLive),
+          catalogAuthorityPublicKey: casKey,
+          catalogProbe: independentCatalogProbe(casUrl, assertLive),
+          minimumCatalogHead: { sequence, digest: catalogFloor },
+          csrfToken: () => { assertLive(); return initialCsrf; },
+          isSessionCurrent: () => {
+            try { assertLive(); return true; } catch (_) { return false; }
+          },
+          assertCurrent: async () => {
+            assertLive();
+            await window.RootarkZk1NormalBrowserTrustFloor.assertCurrent({
+              ownerPublicKey: trust.ownerPublicKey,
+              independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+              pinnedCurrentHead: trust.pinnedCurrentHead,
+              signedDeviceGrant: trust.signedDeviceGrant,
+              ownerHistoryCheckpoint: trust.ownerHistoryCheckpoint,
+              previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
+            });
+            assertLive();
+          },
+          nowSeconds: () => Math.floor(Date.now() / 1000),
+        });
+        const addition = { objectId, revision: 1, epoch: trust.pinnedCurrentHead.epoch,
+          ciphertext: data, name, metadataKey };
+        const journalId = await client.prepareIntent([{ objectId, revision: 1,
+          epoch: addition.epoch, ciphertext: data }]);
+        assertLive();
+        field("catalog-write-journal").textContent = journalId;
+        status("Intenção assinada persistida no IndexedDB. Enviando ciphertext opaco por PUT autenticado…");
+        const signedPut = await window.RootarkZk1ProtectedHttpClient.signProtectedContentOperation({
+          signerKey: devicePrivateKey, scope, deviceId: trust.signedDeviceGrant.device_id,
+          operation: "put", objectId, expectedObjectRevision: null,
+          manifestRevision: trust.pinnedCurrentHead.revision,
+          manifestDigest: trust.pinnedCurrentHead.digest, epoch: addition.epoch,
+          nowSeconds: Math.floor(Date.now() / 1000), ciphertext: data,
+        });
+        assertLive();
+        let uncertainPut = false;
+        try {
+          const ack = await window.RootarkZk1ProtectedHttpClient.postProtectedCiphertextPut({
+            origin: rootOrigin + "/", request: signedPut, fetchImpl: guardedFetch,
+          });
+          if (ack.id !== objectId || ack.revision !== 1) fail();
+        } catch (_) {
+          // Never repeat an uncertain PUT. The catalog client's fresh signed
+          // exact-version GET and byte comparison resolve its actual outcome.
+          uncertainPut = true;
+        }
+        assertLive();
+        const result = await client.commit([addition], journalId);
+        assertLive();
+        verifiedCatalog = null;
+        if (result.verifiedSignedReadback !== true || result.productionDurabilityProven !== false) fail();
+        status("Catálogo completo #" + result.sequence + " confirmado por GET assinado + CAS: "
+          + result.digest + ". " + result.totalCount + " versão(ões). Object ID: " + objectId
+          + (uncertainPut ? ". ACK do PUT incerto, GET conferido." : ".")
+          + " Fixe sequência/digest por canal externo antes do segundo dispositivo. Sem prova de durabilidade em nuvem.");
+        return;
+      }
       if (["catalog-discover", "catalog-page", "catalog-get"].includes(action)) {
         if (!window.RootarkZk1BrowserCatalog) await loadScript("rootark-zk1-browser-catalog");
         assertLive();
@@ -1597,6 +1801,7 @@
       // The original File/Blob remains held by the input until explicitly reset.
       for (const name of ["private", "hpke-private", "pop-challenge", "new-approval", "file", "secret", "bundle", "migration-cek", "migration-proof",
         "catalog-cas-key", "catalog-signer-grant", "catalog-metadata-key",
+        "catalog-write-ciphertext", "catalog-write-key", "catalog-witness-key",
         "migration-batch-descriptors", "migration-batch-ceks", "migration-batch-secret",
         "archive-files", "archive-owner-private", "archive-json", "archive-historical-proof",
         "account-descriptors", "account-holder-files", "account-local-files",
@@ -1643,6 +1848,8 @@
   window.addEventListener("rootark:logout", () => {
     sessionEpoch++;
     verifiedCatalog = null;
+    const journal = field("catalog-write-journal");
+    if (journal) journal.textContent = "";
     for (const url of activeDownloadUrls) URL.revokeObjectURL(url);
     activeDownloadUrls.clear();
     committedDeviceApproval = null;
