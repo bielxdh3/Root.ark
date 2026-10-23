@@ -1,10 +1,12 @@
 (function (root, factory) {
   if (typeof module === "object" && module.exports) {
-    module.exports = factory(require("node:crypto").webcrypto);
+    module.exports = factory(require("node:crypto").webcrypto,
+      require("./rootark-zk1-protected-http-client"));
   } else {
-    root.RootarkZk1BrowserAuthorityHeadRelay = factory(root.crypto);
+    root.RootarkZk1BrowserAuthorityHeadRelay = factory(root.crypto,
+      root.RootarkZk1ProtectedHttpClient);
   }
-}(typeof globalThis === "object" ? globalThis : this, function (webCrypto) {
+}(typeof globalThis === "object" ? globalThis : this, function (webCrypto, contentHttp) {
   "use strict";
 
   // The authenticated Root.ark service transports a fresh proof from its
@@ -33,16 +35,17 @@
     for (const byte of bytes) raw += String.fromCharCode(byte);
     return btoa(raw).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
   }
-  function from64(value) {
+  function from64(value, maximum = 8192) {
     if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)
-      || value.length > 10924) deny();
+      || !Number.isSafeInteger(maximum) || maximum < 1 || maximum > 4 * 1024 * 1024
+      || value.length > Math.ceil(maximum * 4 / 3) + 4) deny();
     let binary;
     try {
       binary = atob(value.replace(/-/g, "+").replace(/_/g, "/")
         .padEnd(Math.ceil(value.length / 4) * 4, "="));
     } catch (_) { deny(); }
     const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-    if (!bytes.length || bytes.length > 8192 || to64(bytes) !== value) deny();
+    if (!bytes.length || bytes.length > maximum || to64(bytes) !== value) deny();
     return bytes;
   }
   const encoder = new TextEncoder(), decoder = new TextDecoder("utf-8", { fatal: true });
@@ -327,6 +330,9 @@
   const V2_HEADER_FIELDS = ["type", ...SCOPE, "sequence", "previous_digest",
     "manifest_revision", "manifest_digest", "epoch", "signer_device_id",
     "total_count", "page_digests", "issued_at"];
+  // An inventory's public rows are labels only. Its ciphertext commitments and
+  // live permission context remain private until verified by both authorities.
+  const verifiedV2 = new WeakMap();
   async function digest(...parts) {
     return new Uint8Array(await webCrypto.subtle.digest("SHA-256", append(...parts)));
   }
@@ -413,7 +419,7 @@
     if (!await webCrypto.subtle.verify("Ed25519", deviceKey, rawSignature,
       append(V2_HEAD, rawHead))) deny();
     let count = 0, last = null;
-    const rows = [];
+    const rows = [], privateRows = [];
     for (let index = 0; index < record.page_bodies.length; index++) {
       const raw = strictBytes(record.page_bodies[index], 1, 16384);
       if (!equal(await digest(V2_PAGE, raw), strictBytes(header.page_digests[index], 32))) deny();
@@ -435,6 +441,9 @@
         if (last !== null && order <= last) deny();
         last = order; rows.push(Object.freeze({
           objectId: row.object_id, revision: row.revision, epoch: row.epoch }));
+        privateRows.push(Object.freeze({ objectId: row.object_id,
+          revision: row.revision, epoch: row.epoch,
+          ciphertextDigest: copy(row.ciphertext_digest, 32) }));
         count++;
       }
     }
@@ -538,12 +547,102 @@
       }
       input.assertLive();
       if (csrf !== input.csrfToken()) deny();
-      return Object.freeze({ sequence: 129, digest: to64(headDigest),
+      const confirmed = Object.freeze({ sequence: 129, digest: to64(headDigest),
         checkpointDigest: to64(checkpointDigest), totalCount: count,
         rows: Object.freeze(rows), independentlyFinalized: true,
         productionDurabilityProven: false });
+      verifiedV2.set(confirmed, Object.freeze({
+        url: input.origin + "zk-1/v1/content/read", fetchImpl: input.fetchImpl,
+        assertLive: input.assertLive, csrfToken: input.csrfToken, csrf,
+        scope: Object.freeze(Object.fromEntries(SCOPE.map((name) => [name, to64(scope[name])]))),
+        head: Object.freeze({ revision, digest: ownerDigest, epoch }),
+        deviceId: input.ownerDeviceId, deviceKey,
+        rows: Object.freeze(privateRows),
+      }));
+      return confirmed;
     } catch (_) { deny(); }
     finally { clearTimeout(timer); controller.abort(); }
   }
-  return Object.freeze({ createProbes, readFinalizedV2 });
+  async function getFinalizedV2Ciphertext(confirmed, index, signerKey) {
+    try {
+      const state = verifiedV2.get(confirmed);
+      if (!state || !Number.isSafeInteger(index) || index < 0
+        || index >= state.rows.length || !contentHttp?.signProtectedContentOperation
+        || signerKey?.type !== "private" || signerKey?.extractable !== false
+        || signerKey?.algorithm?.name !== "Ed25519"
+        || !signerKey?.usages?.includes("sign")) deny();
+      state.assertLive();
+      if (state.csrf !== state.csrfToken()) deny();
+      // Prove possession of the same current device credential that verified
+      // the checkpoint. Never trust an imported key filename or UI label.
+      const challenge = webCrypto.getRandomValues(new Uint8Array(32));
+      const proof = new Uint8Array(await webCrypto.subtle.sign("Ed25519", signerKey, challenge));
+      if (!await webCrypto.subtle.verify("Ed25519", state.deviceKey, proof, challenge)) deny();
+      const row = state.rows[index];
+      const signed = await contentHttp.signProtectedContentOperation({
+        signerKey, scope: state.scope, deviceId: state.deviceId,
+        operation: "get", objectId: row.objectId,
+        expectedObjectRevision: row.revision,
+        manifestRevision: state.head.revision, manifestDigest: state.head.digest,
+        epoch: state.head.epoch, nowSeconds: Math.floor(Date.now() / 1000),
+        ciphertext: null, expectedCiphertextDigest: row.ciphertextDigest,
+      });
+      state.assertLive();
+      if (state.csrf !== state.csrfToken()) deny();
+      const controller = new AbortController();
+      let timer;
+      try {
+        const deadline = new Promise((_resolve, reject) => {
+          timer = setTimeout(() => { controller.abort(); reject(new Error("timeout")); }, 10000);
+        });
+        const work = (async () => {
+          const response = await state.fetchImpl(state.url, {
+            method: "POST", mode: "same-origin", credentials: "same-origin",
+            redirect: "error", cache: "no-store", signal: controller.signal,
+            headers: { "content-type": "application/json", accept: "application/json",
+              "x-csrf-token": state.csrf }, body: JSON.stringify(signed),
+          });
+          state.assertLive();
+          if (state.csrf !== state.csrfToken() || response.status !== 200
+            || !/^application\/json(?:;\s*charset=utf-8)?$/i.test(
+              response.headers?.get("content-type") || "")) deny();
+          const reader = response.body?.getReader();
+          if (!reader) deny();
+          const pieces = []; let size = 0, complete = false;
+          try {
+            while (true) {
+              const part = await reader.read();
+              if (part.done) { complete = true; break; }
+              state.assertLive();
+              if (state.csrf !== state.csrfToken()
+                || !(part.value instanceof Uint8Array) || !part.value.length) deny();
+              size += part.value.length;
+              if (size > 6 * 1024 * 1024) deny();
+              pieces.push(part.value);
+            }
+          } finally {
+            if (!complete) { try { await reader.cancel(); } catch (_) { /* fail closed */ } }
+            reader.releaseLock();
+          }
+          const wire = new Uint8Array(size);
+          let at = 0;
+          for (const part of pieces) { wire.set(part, at); at += part.length; }
+          const received = JSON.parse(decoder.decode(wire));
+          exact(received, ["id", "revision", "epoch", "ciphertextBase64"]);
+          if (received.id !== row.objectId || received.revision !== row.revision
+            || received.epoch !== row.epoch) deny();
+          const ciphertext = from64(received.ciphertextBase64, 4 * 1024 * 1024);
+          if (ciphertext.length < 16 || ciphertext.length > 4 * 1024 * 1024
+            || !equal(await digest(ciphertext), row.ciphertextDigest)) deny();
+          state.assertLive();
+          if (state.csrf !== state.csrfToken()) deny();
+          return Object.freeze({ objectId: row.objectId, revision: row.revision,
+            epoch: row.epoch, ciphertextBase64: to64(ciphertext),
+            productionDurabilityProven: false });
+        })();
+        return await Promise.race([work, deadline]);
+      } finally { clearTimeout(timer); controller.abort(); }
+    } catch (_) { deny(); }
+  }
+  return Object.freeze({ createProbes, readFinalizedV2, getFinalizedV2Ciphertext });
 }));

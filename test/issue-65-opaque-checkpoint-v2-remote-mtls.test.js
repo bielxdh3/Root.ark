@@ -194,9 +194,12 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   // B is enrolled and active, A is owner-revoked at the later epoch.
   assert.equal(state.headManifest.devices.find((d) =>
     d.device_id === deviceA.device_id).revoked_at_epoch !== null, true);
+  const storedCiphertext = Buffer.from("Synthetic opaque ciphertext from a verified V2 historical revision.");
+  let servedCiphertext = Buffer.from(storedCiphertext);
+  let contentReads = 0;
   const encryptedRecord = { object_id: encoded(crypto.randomBytes(16)),
     revision: 1, epoch: Number(state.headManifest.current_epoch),
-    ciphertext_digest: crypto.randomBytes(32),
+    ciphertext_digest: crypto.createHash("sha256").update(storedCiphertext).digest(),
     metadata_ciphertext: crypto.randomBytes(284) };
   const encryptedPage = Buffer.from(await z.encodeDeterministic([encryptedRecord]));
   const encryptedPageDigest = crypto.createHash("sha256")
@@ -391,6 +394,23 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
     app: web, environment: "test", store: {
       signedHistoryRequired: true,
       put() {}, get() {},
+      async runWithAdmission(request, operation, respond) {
+        assert.equal(operation, "get");
+        const signed = request.authorization;
+        assert.equal(signed.operation, "get");
+        assert.equal(signed.object_id, encryptedRecord.object_id);
+        assert.equal(signed.expected_object_revision, encryptedRecord.revision);
+        assert.equal(signed.epoch, encryptedRecord.epoch);
+        assert.deepEqual(Buffer.from(signed.ciphertext_digest), encryptedRecord.ciphertext_digest);
+        assert.deepEqual(Buffer.from(signed.manifest_digest), nextHeader.manifest_digest);
+        assert.equal(crypto.verify(null, Buffer.concat([Buffer.from(
+          "Root.ark/zk-1/protected-object-operation/v1\0"),
+        Buffer.from(await z.encodeDeterministic(signed))]), owner.publicKey, request.signature), true);
+        contentReads++;
+        return respond({ id: encryptedRecord.object_id,
+          revision: encryptedRecord.revision, epoch: encryptedRecord.epoch,
+          ciphertext: servedCiphertext });
+      },
     },
     authenticate: (req, _res, next) => { req.user = {
       username: "fixture", sessionVersion: currentSession,
@@ -430,6 +450,41 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
     assert.equal(confirmedV2.productionDurabilityProven, false);
     assert.equal(confirmedV2.totalCount, 1);
     assert.equal(confirmedV2.rows[0].objectId, encryptedRecord.object_id);
+    const activePrivate = await crypto.webcrypto.subtle.importKey("pkcs8",
+      owner.privateKey.export({ type: "pkcs8", format: "der" }),
+      "Ed25519", false, ["sign"]);
+    const revokedPrivate = await crypto.webcrypto.subtle.importKey("pkcs8",
+      keys(deviceA).export({ type: "pkcs8", format: "der" }),
+      "Ed25519", false, ["sign"]);
+    assert.equal(contentReads, 0);
+    await assert.rejects(browserV2.getFinalizedV2Ciphertext({ ...confirmedV2 }, 0, activePrivate),
+      /UNVERIFIED/, "a copied unbranded V2 inventory cannot authorize a GET");
+    await assert.rejects(browserV2.getFinalizedV2Ciphertext(confirmedV2, 0, revokedPrivate),
+      /UNVERIFIED/, "an old device cannot sign a GET using the current pinned key");
+    assert.equal(contentReads, 0, "no GET before matching live device proof");
+    const retrieved = await browserV2.getFinalizedV2Ciphertext(confirmedV2, 0, activePrivate);
+    assert.deepEqual(Buffer.from(retrieved.ciphertextBase64, "base64url"), storedCiphertext);
+    assert.equal(retrieved.objectId, encryptedRecord.object_id);
+    assert.equal(retrieved.revision, 1);
+    assert.equal(retrieved.productionDurabilityProven, false);
+    assert.equal(contentReads, 1);
+    servedCiphertext = Buffer.from(storedCiphertext);
+    servedCiphertext[0] ^= 0xff;
+    await assert.rejects(browserV2.getFinalizedV2Ciphertext(confirmedV2, 0, activePrivate),
+      /UNVERIFIED/, "compromised storage bytes must match the signed V2 row digest");
+    servedCiphertext = Buffer.from(storedCiphertext);
+    await assert.rejects(browserV2.getFinalizedV2Ciphertext(confirmedV2, 1, activePrivate),
+      /UNVERIFIED/, "a row outside the verified signed checkpoint cannot be fetched");
+    let sessionToken = "fixture-csrf";
+    const currentSessionRead = await browserV2.readFinalizedV2({
+      ...v2Input, csrfToken: () => sessionToken,
+    });
+    sessionToken = "different-session";
+    const priorReads = contentReads;
+    await assert.rejects(browserV2.getFinalizedV2Ciphertext(
+      currentSessionRead, 0, activePrivate), /UNVERIFIED/,
+    "a saved verified inventory loses GET permission on session switch");
+    assert.equal(contentReads, priorReads);
     let storedResponse = null;
     assert.equal((await browserV2.readFinalizedV2({
       ...v2Input,
@@ -473,14 +528,22 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
       clearTimeout, Date, Promise };
     vmContext.globalThis = vmContext;
     vm.runInNewContext(fs.readFileSync(path.join(__dirname,
+      "../public/client/rootark-zk1-protected-http-client.js"), "utf8"),
+    vmContext, { timeout: 1000 });
+    vm.runInNewContext(fs.readFileSync(path.join(__dirname,
       "../public/client/rootark-zk1-browser-authority-head-relay.js"), "utf8"),
     vmContext, { timeout: 1000 });
     assert.equal(typeof vmContext.RootarkZk1BrowserAuthorityHeadRelay.readFinalizedV2, "function");
-    assert.equal((await vmContext.RootarkZk1BrowserAuthorityHeadRelay.readFinalizedV2(
+    const browserSnapshot = await vmContext.RootarkZk1BrowserAuthorityHeadRelay.readFinalizedV2(
       Object.assign(Object.create(null), v2Input, {
         scope: Object.assign(Object.create(null), v2Input.scope),
-      }))).sequence, 129,
-    "Edge-like VM uses only browser WebCrypto and same-origin relay");
+      }));
+    assert.equal(browserSnapshot.sequence, 129,
+      "Edge-like VM uses browser WebCrypto and same-origin relay");
+    const vmDownload = await vmContext.RootarkZk1BrowserAuthorityHeadRelay
+      .getFinalizedV2Ciphertext(browserSnapshot, 0, activePrivate);
+    assert.deepEqual(Buffer.from(vmDownload.ciphertextBase64, "base64url"), storedCiphertext,
+      "browser VM GET verifies the exact signed V2 commitment");
   } finally {
     await new Promise((resolve) => webServer.close(resolve));
   }

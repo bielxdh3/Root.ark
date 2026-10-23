@@ -138,7 +138,9 @@ async function harness() {
       const name = /data-zk1-field="([^"]+)"/.exec(selector)?.[1];
       if (!name) return null;
       if (!controls.has(name)) {
-        const control = { files: [], checked: false, textContent: "", _value: "" };
+        const control = { files: [], checked: false, textContent: "", _value: "",
+          children: [], replaceChildren() { this.children = []; },
+          append(node) { this.children.push(node); } };
         Object.defineProperty(control, "value", {
           get() { return this._value; },
           set(value) { this._value = value; if (value === "") this.files = []; },
@@ -159,6 +161,7 @@ async function harness() {
     createElement(kind) {
       if (kind === "dialog") return dialog;
       if (kind === "script") return {};
+      if (kind === "p") return { textContent: "" };
       if (kind === "button") return {
         addEventListener(_event, callback) { this.click = callback; },
         remove() { window.button = null; },
@@ -814,6 +817,73 @@ test("catalog publish denies forged independent signer pin before journal or PUT
   page.click("catalog-publish");
   await page.denied();
   assert.equal(steps.length, 0);
+});
+
+test("normal browser V2 uses fresh finalized head and a local device key before ciphertext download", async () => {
+  const page = await harness();
+  page.window.RootarkApi.get = async () => ({ enabled: true,
+    securityVersion: 2, signedHistoryRequired: true, opaqueCatalogV1: true,
+    opaqueCheckpointV2Read: true });
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const grant = JSON.parse(Buffer.from(await page.field("grant").files[0].arrayBuffer()));
+  grant.device_id = "owner-device";
+  grant.authorization_public_key = encode(signer.publicKey.export({
+    type: "spki", format: "der" }).subarray(-32));
+  page.file("grant", JSON.stringify(grant));
+  page.file("private", signer.privateKey.export({ type: "pkcs8", format: "der" }));
+  page.field("catalog-sequence").value = "128";
+  page.field("catalog-digest").value = encode(crypto.randomBytes(32));
+  page.field("catalog-v2-predecessor-checkpoint").value = encode(crypto.randomBytes(32));
+  page.file("catalog-v2-intent", crypto.randomBytes(200));
+  for (const kind of ["cas", "floor", "checkpoint"]) {
+    const pair = crypto.generateKeyPairSync("ed25519");
+    page.file("catalog-v2-" + kind + "-key", pair.publicKey.export({
+      type: "spki", format: "der" }).subarray(-32));
+    page.field("catalog-v2-" + kind + "-pin").value = encode(crypto.createHash("sha256")
+      .update(pair.publicKey.export({ type: "spki", format: "der" })).digest());
+  }
+  page.field("catalog-v2-opt-in").checked = true;
+  page.field("catalog-v2-index").value = "0";
+  const objectId = encode(crypto.randomBytes(16));
+  const inventory = Object.freeze({ sequence: 129, digest: encode(crypto.randomBytes(32)),
+    checkpointDigest: encode(crypto.randomBytes(32)), totalCount: 1,
+    rows: [{ objectId, revision: 1 }], independentlyFinalized: true,
+    productionDurabilityProven: false });
+  const ciphertext = crypto.randomBytes(65);
+  const calls = [];
+  page.window.RootarkZk1BrowserAuthorityHeadRelay = {
+    readFinalizedV2: async (input) => {
+      calls.push("verify");
+      assert.equal(input.origin, "https://localhost/");
+      assert.equal(input.csrfToken(), "original-session");
+      assert.equal(input.ownerDeviceId, "owner-device");
+      return inventory;
+    },
+    getFinalizedV2Ciphertext: async (verified, index, privateKey) => {
+      calls.push("get");
+      assert.equal(verified, inventory);
+      assert.equal(index, 0);
+      assert.equal(privateKey.type, "private");
+      assert.equal(privateKey.extractable, false);
+      return { objectId, revision: 1, ciphertextBase64: encode(ciphertext),
+        productionDurabilityProven: false };
+    },
+  };
+  page.click("catalog-v2-get");
+  await page.denied();
+  assert.deepEqual(calls, [], "ciphertext GET needs separate affirmative opt-in");
+  // Failed ceremonies intentionally clear private-key file inputs.
+  page.file("private", signer.privateKey.export({ type: "pkcs8", format: "der" }));
+  page.field("catalog-v2-get-opt-in").checked = true;
+  page.click("catalog-v2-get");
+  await tickUntil(() => page.field("status").textContent.includes("GET exato autenticados")
+    || page.field("status").textContent.includes("Operação recusada"));
+  assert.equal(page.field("status").textContent.includes("GET exato autenticados"), true,
+    "normal UI V2 failed: " + page.field("status").textContent
+    + "; calls=" + calls.join(","));
+  assert.deepEqual(calls, ["verify", "get"]);
+  assert.equal(page.downloads.length, 1);
+  assert.equal(page.downloads[0].name, "zk1-v2-" + objectId + "-v1.ciphertext");
 });
 
 async function configureSignedRelay(page, setup, attack = null) {

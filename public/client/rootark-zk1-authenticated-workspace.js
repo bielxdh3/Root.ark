@@ -734,11 +734,12 @@
       + '<label><input type="checkbox" data-zk1-field="catalog-lifecycle-opt-in"> Confirmo o head CAS e a origem externa do histórico e das CEKs.</label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button-quiet button" data-zk1-action="catalog-lifecycle">Conferir estado atual assinado</button></div>'
       + '</fieldset>'
-      + '<fieldset><legend>Checkpoint global V2 #129 (leitura, opt-in DEV)</legend>'
+      + '<fieldset><legend>Checkpoint global V2 #129 (GET cifrado, opt-in DEV)</legend>'
       + '<p class="muted">Importe o intent CBOR assinado pelo dispositivo autorizado e as três chaves públicas fixadas offline. '
       + 'O relay autenticado consulta o CAS e floor V2 independentes por mTLS. Somente duas confirmações Ed25519 FINALIZED, '
       + 'o checkpoint Merkle completo, a aprovação e o grant owner-signed atual permitem listar IDs opacos. '
-      + 'Não publica nem faz GET de ciphertext. Os dados V1 permanecem na sequência 128.</p>'
+      + 'Permite GET de ciphertext de uma versão selecionada após nova confirmação, prova de posse da chave do dispositivo e SHA-256 do catálogo assinado. '
+      + 'Não descriptografa nem publica. Os dados V1 permanecem na sequência 128.</p>'
       + '<label>Intent completo V2 assinado CBOR (até 10 MiB)<input type="file" data-zk1-field="catalog-v2-intent" accept=".cbor,application/cbor,application/octet-stream"></label>'
       + '<label>Chave CAS V2 Ed25519 raw (32 bytes)<input type="file" data-zk1-field="catalog-v2-cas-key"></label>'
       + '<label>PIN SHA-256 SPKI CAS V2 (base64url)<input data-zk1-field="catalog-v2-cas-pin" maxlength="43" spellcheck="false"></label>'
@@ -748,7 +749,10 @@
       + '<label>PIN SHA-256 SPKI checkpoint V2 (base64url)<input data-zk1-field="catalog-v2-checkpoint-pin" maxlength="43" spellcheck="false"></label>'
       + '<label>Digest checkpoint V1 #128 fixado fora do servidor (base64url)<input data-zk1-field="catalog-v2-predecessor-checkpoint" maxlength="43" spellcheck="false"></label>'
       + '<label><input type="checkbox" data-zk1-field="catalog-v2-opt-in"> Autorizar somente consulta V2 autenticada do catálogo opaco.</label>'
-      + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-v2-read">Conferir CAS + floor V2 #129</button></div>'
+      + '<label>Índice global da versão V2 (0–4095)<input type="number" min="0" max="4095" step="1" value="0" data-zk1-field="catalog-v2-index"></label>'
+      + '<label><input type="checkbox" data-zk1-field="catalog-v2-get-opt-in"> Autorizo GET cifrado somente da versão V2 escolhida, com revalidação do CAS e floor.</label>'
+      + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-v2-read">Conferir CAS + floor V2 #129</button>'
+      + '<button type="button" class="button button-primary" data-zk1-action="catalog-v2-get">Conferir V2 e baixar ciphertext exato</button></div>'
       + '<div data-zk1-field="catalog-v2-list" role="region" aria-label="Inventário V2 opaco autenticado"></div>'
       + '</fieldset>'
       + '<fieldset><legend>Publicar versão cifrada no catálogo completo (DEV, opt-in)</legend>'
@@ -898,7 +902,7 @@
       "migrate", "migration-finalize", "migration-batch", "archive-create", "archive-recover",
       "account-create", "account-recover", "versioned-create", "versioned-recover",
       "catalog-discover", "catalog-page", "catalog-get", "catalog-publish",
-      "catalog-lifecycle", "catalog-v2-read"].includes(action)) return;
+      "catalog-lifecycle", "catalog-v2-read", "catalog-v2-get"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -1034,12 +1038,14 @@
       }
       const trust = await grantAndOwner();
       assertLive();
-      if (action === "catalog-v2-read") {
+      if (action === "catalog-v2-read" || action === "catalog-v2-get") {
         if (field("catalog-v2-opt-in")?.checked !== true
           || available.opaqueCheckpointV2Read !== true
           || !trust.ownerHistoryCheckpoint
           || trust.signedDeviceGrant.revoked_at_epoch !== null
           || positive("catalog-sequence") !== 128) fail();
+        if (action === "catalog-v2-get"
+          && field("catalog-v2-get-opt-in")?.checked !== true) fail();
         await window.RootarkZk1NormalBrowserTrustFloor.assertCurrent({
           ownerPublicKey: trust.ownerPublicKey,
           independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
@@ -1085,14 +1091,34 @@
             || result.productionDurabilityProven !== false) fail();
           const list = field("catalog-v2-list");
           list.replaceChildren();
-          for (const row of result.rows) {
+          for (const [index, row] of result.rows.entries()) {
             const p = document.createElement("p");
-            p.textContent = row.objectId + " · v" + row.revision;
+            p.textContent = String(index) + " · "
+              + row.objectId + " · v" + row.revision;
             list.append(p);
           }
-          status("Checkpoint V2 #129 autenticado por CAS e floor independentes. "
-            + result.totalCount + " versão(ões) opacas; digest " + result.digest
-            + ". Sem GET, escrita ou prova de nuvem.");
+          if (action === "catalog-v2-get") {
+            const selected = Number(field("catalog-v2-index")?.value);
+            if (!Number.isSafeInteger(selected) || selected < 0
+              || selected >= result.rows.length) fail();
+            privateDer = await fileBytes("private", 1, 8192);
+            const devicePrivate = await crypto.subtle.importKey("pkcs8", privateDer,
+              "Ed25519", false, ["sign"]);
+            const checked = await v2.getFinalizedV2Ciphertext(result, selected, devicePrivate);
+            assertLive();
+            if (checked.productionDurabilityProven !== false
+              || checked.objectId !== result.rows[selected].objectId
+              || checked.revision !== result.rows[selected].revision) fail();
+            downloadLocal("zk1-v2-" + checked.objectId + "-v" + checked.revision
+              + ".ciphertext", contentFrom64(checked.ciphertextBase64),
+            "application/octet-stream", assertLive);
+            status("Checkpoint V2 #129 e GET exato autenticados: " + checked.objectId
+              + " · v" + checked.revision + ". Ciphertext salvo localmente, sem prova de nuvem.");
+          } else {
+            status("Checkpoint V2 #129 autenticado por CAS e floor independentes. "
+              + result.totalCount + " versão(ões) opacas; digest " + result.digest
+              + ". Sem escrita ou prova de nuvem.");
+          }
         } finally { for (const key of keys) key.fill(0); deviceRaw.fill(0); }
         return;
       }
