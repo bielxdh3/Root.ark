@@ -46,6 +46,12 @@ const INTENT_TRIGGERS = [
   ["intent_immutable_delete", "intent"],
 ];
 const MAX_LOCAL_PREFLIGHT_BYTES = 32 * 1024 * 1024;
+// Historical pre-successor schema must be authenticated before owner-authorized
+// migration, never opened writable or upgraded in place.
+const LEGACY_129_SCHEMA = `CREATE TABLE identity (id INTEGER PRIMARY KEY CHECK(id=1), pins BLOB NOT NULL);
+  CREATE TABLE intent (id INTEGER PRIMARY KEY CHECK(id=1), bytes BLOB NOT NULL);
+  ${INTENT_GUARD_SCHEMA}`;
+const LEGACY_129_TRIGGERS = INTENT_TRIGGERS;
 function deny() {
   const err = new Error("ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE");
   err.code = "ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE";
@@ -108,11 +114,122 @@ function verifyJournal(db, identity) {
   if (!pinned || !equal(pinned.pins, identity)) deny();
 }
 
+function privateNewDestination(filename) {
+  if (typeof filename !== "string" || !path.isAbsolute(filename)
+    || fs.existsSync(filename)
+    || ["-wal", "-shm", "-journal"].some((suffix) => fs.existsSync(filename + suffix))) deny();
+  assertPrivateSqliteDirectory(filename);
+  const parent = path.dirname(filename);
+  const stat = fs.lstatSync(parent);
+  if (!stat.isDirectory() || stat.isSymbolicLink()
+    || (process.platform !== "win32"
+      && (stat.uid !== process.getuid() || (stat.mode & 0o077)))) deny();
+}
+
+function inspectedLegacy129(db, identity) {
+  requireCheckpointV2Triggers(db, LEGACY_129_SCHEMA, LEGACY_129_TRIGGERS, deny);
+  if (db.pragma("journal_mode", { simple: true }) !== "wal"
+    || db.pragma("user_version", { simple: true }) !== 0
+    || db.pragma("application_id", { simple: true }) !== 0) deny();
+  const objects = db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").all();
+  if (objects.length !== 4) deny();
+  const canonical = (sql) => sql.trim().replace(/\s+/g, " ").replace(/;$/, "");
+  const expectedTables = [...LEGACY_129_SCHEMA.matchAll(/CREATE TABLE ([a-z_]+)\s*\([\s\S]*?\);/g)];
+  if (expectedTables.length !== 2) deny();
+  for (const ddl of expectedTables) {
+    const stored = objects.find((entry) => entry.name === ddl[1]);
+    if (stored?.type !== "table" || stored.tbl_name !== ddl[1]
+      || canonical(stored.sql) !== canonical(ddl[0])) deny();
+  }
+  const pins = db.prepare("SELECT id,pins FROM identity").all();
+  const intents = db.prepare("SELECT id,bytes FROM intent").all();
+  if (pins.length !== 1 || pins[0].id !== 1
+    || !Buffer.isBuffer(pins[0].pins) || !equal(pins[0].pins, identity)
+    || intents.length !== 1 || intents[0].id !== 1
+    || !Buffer.isBuffer(intents[0].bytes)
+    || intents[0].bytes.length < 1 || intents[0].bytes.length > 10 * 1024 * 1024) deny();
+  return Buffer.from(intents[0].bytes);
+}
+
 class Zk1OpaqueCheckpointV2Client {
   #db;
   #trust;
   #coordinator;
   #queue = Promise.resolve();
+  // Explicit owner-held migration of an authenticated immutable #129 journal.
+  // The old DB and WAL are never opened writable; only a fully verified,
+  // locally fsynced successor-capable DB is published at a fresh destination.
+  static async migrateLegacy129({ legacyJournalPath, migrationOptIn,
+    ownerPrivateKey, ...options } = {}) {
+    let staged;
+    let scratch;
+    try {
+      const { journalPath, trustedScope, expectedV1Digest, expectedV1Checkpoint,
+        casClient, floorClient, checkpointPublicKey, ownerPublicKey, catalogPublicKey } = options;
+      if (migrationOptIn !== true || options.bootstrapNew !== false
+        || typeof legacyJournalPath !== "string" || !path.isAbsolute(legacyJournalPath)
+        || typeof journalPath !== "string" || !path.isAbsolute(journalPath)
+        || path.resolve(legacyJournalPath).toLowerCase() === path.resolve(journalPath).toLowerCase()
+        || fs.existsSync(journalPath)
+        || !equal(fp(crypto.createPublicKey(key(ownerPrivateKey, "private"))),
+          fp(key(ownerPublicKey)))) deny();
+      privateFile(legacyJournalPath, false);
+      const scope = scopeOf(trustedScope);
+      const pins = [key(casClient.publicKey), key(floorClient.publicKey),
+        key(checkpointPublicKey), key(ownerPublicKey), key(catalogPublicKey)].map(fp);
+      const identity = encodeIdentity(scope, bytes(expectedV1Digest, 32),
+        bytes(expectedV1Checkpoint, 32), pins);
+      const readSource = () => {
+        let captured;
+        withReadonlySqliteSnapshot(legacyJournalPath,
+          (db) => { captured = inspectedLegacy129(db, identity); }, deny,
+          2 * 10 * 1024 * 1024 + 8 * 1024 * 1024);
+        return captured;
+      };
+      const old = readSource();
+      privateNewDestination(journalPath);
+      staged = path.join(path.dirname(journalPath),
+        `.zk65-v2-129-migration-${crypto.randomBytes(16).toString("hex")}.sqlite`);
+      scratch = new Zk1OpaqueCheckpointV2Client({ ...options,
+        journalPath: staged, bootstrapNew: true });
+      // Fresh witnessed owner authorization of the exact signed #129 bytes,
+      // followed by independent CAS/FLOOR FINALIZED proof before admission.
+      const examined = await scratch.#inspect(old, true);
+      if (examined.body.previous_sequence !== 128) deny();
+      await scratch.importSignedIntent(old);
+      const state = await scratch.read();
+      if (state.sequence !== 129) deny();
+      scratch.close();
+      scratch = null;
+      if (!equal(readSource(), old)) deny();
+      // A lost ACK, later remote successor, or swapped authority blocks commit.
+      const checked = new Zk1OpaqueCheckpointV2Client({ ...options,
+        journalPath: staged, bootstrapNew: false });
+      try { if ((await checked.read()).sequence !== 129) deny(); }
+      finally { checked.close(); }
+      assertSafeSqliteSidecars(staged, deny);
+      if (["-wal", "-shm", "-journal"].some((suffix) => fs.existsSync(staged + suffix))) deny();
+      const fd = fs.openSync(staged, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0));
+      try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      privateNewDestination(journalPath);
+      // Hardlink creation is atomic NO_REPLACE; crash before removing stage
+      // leaves a linked DB that fails the one-link admission check closed.
+      fs.linkSync(staged, journalPath);
+      fs.unlinkSync(staged);
+      staged = null;
+      return new Zk1OpaqueCheckpointV2Client({ ...options,
+        journalPath, bootstrapNew: false });
+    } catch (_) { deny(); }
+    finally {
+      scratch?.close();
+      if (staged) {
+        for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+          try { fs.unlinkSync(staged + suffix); }
+          catch (error) { if (error.code !== "ENOENT") deny(); }
+        }
+      }
+    }
+  }
   constructor({ journalPath, bootstrapNew, trustedScope, expectedV1Digest,
     expectedV1Checkpoint, v1CasClient, v1FloorClient, casClient, floorClient,
     checkpointPublicKey, ownerPublicKey, catalogPublicKey, ownerTrust }) {

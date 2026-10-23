@@ -307,7 +307,7 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
     checkpointPublicKey: checkpoint.publicKey, ownerPublicKey: owner.publicKey,
     catalogPublicKey: signerB, ownerTrust: trust,
   });
-  const journal = path.join(dir, "v2-device-rollover.sqlite");
+  let journal = path.join(dir, "v2-device-rollover.sqlite");
   let client = new Zk1OpaqueCheckpointV2Client(clientOptions(handles, journal, true));
   t.after(() => client.close());
   await assert.rejects(client.read(), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
@@ -359,6 +359,25 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   console.error("STAGE: dropped ACK verified");
   assert.equal((await handles.floorClient.head()).state, "PREPARED");
   assert.equal((await handles.casClient.head()).state, "CAS_COMMITTED");
+  const uncertainSource = path.join(dir, "v2-pending-129-original.sqlite");
+  const pendingBackup = new Database(journal, { readonly: true, fileMustExist: true });
+  await pendingBackup.backup(uncertainSource);
+  pendingBackup.close();
+  const pendingLegacy = new Database(uncertainSource);
+  pendingLegacy.exec(`DROP TRIGGER successors_immutable_update;
+    DROP TRIGGER successors_immutable_delete;
+    DROP TRIGGER successors_no_gap;
+    DROP TABLE successors;`);
+  pendingLegacy.close();
+  const uncertainTarget = path.join(dir, "v2-pending-129-upgraded.sqlite");
+  await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129({
+    ...clientOptions(handles, uncertainTarget, false),
+    legacyJournalPath: uncertainSource, migrationOptIn: true,
+    ownerPrivateKey: owner.privateKey,
+  }), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+  "durable pending #129 with lost CAS ACK must never be admitted as FINALIZED");
+  assert.equal(fs.existsSync(uncertainTarget), false,
+    "uncertain remote publication cannot create a successor-authorized journal");
   await stopV2();
   floor2 = new OpaqueCheckpointV2Authority(path.join(dir, "v2-floor.sqlite"), {
     ...authorityOptions, role: "FLOOR", bootstrapNew: false,
@@ -383,6 +402,107 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   assert.equal((await handles.casClient.head()).state, "FINALIZED");
   assert.equal((await handles.floorClient.head()).state, "FINALIZED");
   assert.equal((await handles.coordinator.readConsistent(intent)).sequence, 129);
+  // Original pre-130 #129 device format has only identity/intent and two
+  // immutable intent triggers. Upgrade only into a NEW device journal after
+  // fresh owner authority and both signed independent finalized heads.
+  const old129 = path.join(dir, "v2-original-129.sqlite");
+  const snapshot129 = new Database(journal, { readonly: true, fileMustExist: true });
+  await snapshot129.backup(old129);
+  snapshot129.close();
+  const legacy129 = new Database(old129);
+  legacy129.exec(`DROP TRIGGER successors_immutable_update;
+    DROP TRIGGER successors_immutable_delete;
+    DROP TRIGGER successors_no_gap;
+    DROP TABLE successors;`);
+  legacy129.close();
+  if (process.platform !== "win32") fs.chmodSync(old129, 0o600);
+  const original129 = fs.readFileSync(old129);
+  const preUpdateReopen = path.join(dir, "v2-old-reopen-fails.sqlite");
+  fs.copyFileSync(old129, preUpdateReopen);
+  assert.throws(() => new Zk1OpaqueCheckpointV2Client(
+    clientOptions(handles, preUpdateReopen, false)),
+  /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+  "RED: previously shipped valid #129 lacks the new successors schema");
+  const migratedJournal = path.join(dir, "v2-owner-migrated-130.sqlite");
+  const optIn = (source, destination, additional = {}) => ({
+    ...clientOptions(handles, destination, false), legacyJournalPath: source,
+    migrationOptIn: true, ownerPrivateKey: owner.privateKey, ...additional,
+  });
+  await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129(
+    optIn(old129, migratedJournal, { migrationOptIn: false })),
+  /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/, "implicit schema upgrade denied");
+  await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129(
+    optIn(old129, migratedJournal, { ownerPrivateKey: revoked.privateKey })),
+  /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/, "another signing key cannot authorize migration");
+  const swapped129 = path.join(dir, "v2-swapped-129.sqlite");
+  fs.copyFileSync(old129, swapped129);
+  const swappedDb = new Database(swapped129);
+  swappedDb.exec("DROP TRIGGER intent_immutable_update");
+  swappedDb.prepare("UPDATE identity SET pins=? WHERE id=1")
+    .run(crypto.randomBytes(160));
+  swappedDb.exec(`CREATE TRIGGER intent_immutable_update BEFORE UPDATE ON intent
+    BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;`);
+  swappedDb.close();
+  await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129(
+    optIn(swapped129, migratedJournal)), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+  "a swapped pre-update identity must be denied before publishing a destination");
+  const mutable129 = path.join(dir, "v2-mutable-129.sqlite");
+  fs.copyFileSync(old129, mutable129);
+  const mutableDb = new Database(mutable129);
+  mutableDb.exec(`DROP TRIGGER intent_immutable_update;
+    CREATE TRIGGER intent_immutable_update BEFORE UPDATE ON intent
+    WHEN 0 BEGIN SELECT 1; END;`);
+  mutableDb.close();
+  await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129(
+    optIn(mutable129, migratedJournal)), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+  "forged old trigger is not immutable journal evidence");
+  const walTamper129 = path.join(dir, "v2-wal-tamper-129.sqlite");
+  fs.copyFileSync(old129, walTamper129);
+  const uncheckpointed = new Database(walTamper129);
+  uncheckpointed.pragma("journal_mode = WAL");
+  uncheckpointed.pragma("wal_autocheckpoint = 0");
+  uncheckpointed.pragma("user_version = 1");
+  try {
+    assert.equal(fs.existsSync(walTamper129 + "-wal"), true);
+    await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129(
+      optIn(walTamper129, migratedJournal)), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+    "uncheckpointed malicious WAL must be included in read-only validation");
+  } finally { uncheckpointed.close(); }
+  const forged129 = path.join(dir, "v2-forged-owner-129.sqlite");
+  fs.copyFileSync(old129, forged129);
+  const forged129Db = new Database(forged129);
+  forged129Db.exec("DROP TRIGGER intent_immutable_update");
+  const forgedIntent129 = await z.decodeDeterministic(intent);
+  forgedIntent129.owner_signature = crypto.randomBytes(64);
+  forged129Db.prepare("UPDATE intent SET bytes=? WHERE id=1")
+    .run(Buffer.from(await z.encodeDeterministic(forgedIntent129)));
+  forged129Db.exec(`CREATE TRIGGER intent_immutable_update BEFORE UPDATE ON intent
+    BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;`);
+  forged129Db.close();
+  await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129(
+    optIn(forged129, migratedJournal)), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+  "same local identity cannot bless tampered owner signature");
+  assert.equal(fs.existsSync(migratedJournal), false);
+  const migrated = await Zk1OpaqueCheckpointV2Client.migrateLegacy129(
+    optIn(old129, migratedJournal));
+  assert.deepEqual(fs.readFileSync(old129), original129,
+    "migration does not modify the old SQLite database");
+  assert.equal(fs.existsSync(old129 + "-wal"), false);
+  assert.equal(fs.existsSync(old129 + "-shm"), false);
+  assert.equal((await migrated.read()).sequence, 129);
+  assert.deepEqual(await migrated.exportSignedIntents(), [intent]);
+  assert.equal(fs.existsSync(migratedJournal), true);
+  const migratedProbe = new Database(migratedJournal, { readonly: true });
+  assert.equal(migratedProbe.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='successors'").get().name,
+  "successors");
+  migratedProbe.close();
+  await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129(
+    optIn(old129, migratedJournal)), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+  "migration never overwrites a pre-existing destination or replays admission");
+  client.close();
+  client = migrated;
+  journal = migratedJournal;
   // Same-origin authenticated session relay -> independent V2 mTLS providers
   // -> browser verifies both fresh Ed25519 receipts and the owner-approved
   // single-record 129 archive. No Node/SQLite APIs enter the browser client.
@@ -600,6 +720,11 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   const published130 = await publishSuccessor(next130.record);
   assert.equal(published130.sequence, 130);
   assert.deepEqual(published130.digest, next130.digest);
+  const rollbackTarget = path.join(dir, "v2-replay-older-129.sqlite");
+  await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129(
+    optIn(old129, rollbackTarget)), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+  "previously genuine #129 cannot overwrite signed independent 130 or reconcile a lost ACK");
+  assert.equal(fs.existsSync(rollbackTarget), false);
   assert.equal((await handles.casClient.head()).sequence, 130);
   assert.equal((await handles.floorClient.head()).sequence, 130);
   await assert.rejects(client.publishSignedIntent(intent),
