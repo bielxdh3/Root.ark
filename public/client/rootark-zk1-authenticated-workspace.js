@@ -240,9 +240,79 @@
     if (!value || typeof value !== "object" || Array.isArray(value)
       || Object.keys(value).sort().join(",") !== [...keys].sort().join(",")) fail();
   }
+  function sameSignedWire(left, right) {
+    return left && right && typeof left === "object" && typeof right === "object"
+      && !Array.isArray(left) && !Array.isArray(right)
+      && Object.keys(left).sort().join(",") === Object.keys(right).sort().join(",")
+      && Object.keys(left).every((key) => (typeof left[key] === "string"
+        || Number.isSafeInteger(left[key]) || left[key] === null)
+        && left[key] === right[key]);
+  }
+  function checkHistoricalWire(value, scope, signedGrant) {
+    exactly(value, ["signedOwnerHistoryChain", "currentSignedDeviceGrant",
+      "currentOwnerRootCheckpoints"]);
+    if (!sameSignedWire(value.currentSignedDeviceGrant, signedGrant)
+      || signedGrant.revoked_at_epoch !== null
+      || !["account_id", "compartment_id", "keyring_id"].every((name) =>
+        signedGrant[name] === scope[name])
+      || !Array.isArray(value.signedOwnerHistoryChain)
+      || value.signedOwnerHistoryChain.length < 2
+      || value.signedOwnerHistoryChain.length > 64
+      || !Array.isArray(value.currentOwnerRootCheckpoints)
+      || value.currentOwnerRootCheckpoints.length < 1
+      || value.currentOwnerRootCheckpoints.length > 12) fail();
+    for (const record of [...value.signedOwnerHistoryChain, ...value.currentOwnerRootCheckpoints]) {
+      if (!record || Array.isArray(record) || typeof record !== "object"
+        || Object.keys(record).length > 20
+        || Object.values(record).some((v) => !(typeof v === "string"
+          || Number.isSafeInteger(v) || v === null))) fail();
+    }
+  }
+  async function brandedHistoricalChain(value, trust, scope, signerKeyId, deviceId, assertLive) {
+    const chain = value.signedOwnerHistoryChain;
+    let previous = null;
+    for (let index = 0; index < chain.length; index++) {
+      const checkpoint = chain[index];
+      if (checkpoint.sequence !== index + 1 || checkpoint.device_id !== deviceId
+        || checkpoint.signer_key_id !== to64(signerKeyId)) fail();
+      const brand = await window.RootarkZk1OwnerSignedCheckpoint.verifyOwnerCheckpoint({
+        checkpoint, scope, signerPublicKey: trust.ownerPublicKey,
+        signerKeyId, previous,
+      });
+      assertLive();
+      if (brand.sequence !== index + 1) fail();
+      previous = brand;
+    }
+    const newest = chain.at(-1);
+    if (newest.revision !== trust.pinnedCurrentHead.revision
+      || newest.manifest_digest !== to64(trust.pinnedCurrentHead.digest)) fail();
+    return previous;
+  }
+  async function selectedHistoricalKeyring(trust, scope, signerKeyId, deviceId, assertLive) {
+    const raw = await fileBytes("archive-historical-proof", 2, 512 * 1024);
+    let selection;
+    try { selection = JSON.parse(decoder.decode(raw)); }
+    finally { raw.fill(0); }
+    assertLive();
+    exactly(selection, ["schema", "scope", "historicalRecovery"]);
+    exactly(selection.scope, ["account_id", "compartment_id", "keyring_id"]);
+    if (selection.schema !== "rootark-zk1-keyring-history-endorsement/v1"
+      || !["account_id", "compartment_id", "keyring_id"].every((name) =>
+        selection.scope[name] === scope[name])) fail();
+    const historic = selection.historicalRecovery;
+    checkHistoricalWire(historic, scope, trust.signedDeviceGrant);
+    await brandedHistoricalChain(historic, trust, scope, signerKeyId, deviceId, assertLive);
+    // The existing owner-history input is separately imported and verified in
+    // grantAndOwner. It must have the EXACT same current signed checkpoint.
+    if (!sameSignedWire(historic.signedOwnerHistoryChain.at(-1),
+      trust.ownerHistoryCheckpoint)) fail();
+    assertLive();
+    return historic;
+  }
   // Every scope, current head, active signed grant and owner history must be
   // selected outside the archive/server. Rebuild branded history proofs locally.
-  async function selectedAccountKeyrings(trust, create, assertLive, accountFiles) {
+  async function selectedAccountKeyrings(trust, create, assertLive, accountFiles,
+    historicalOptIn = false) {
     const raw = await fileBytes("account-descriptors", 2, 512 * 1024);
     let manifest;
     try { manifest = JSON.parse(decoder.decode(raw)); }
@@ -271,8 +341,11 @@
     const keyrings = [];
     let totalBytes = 0;
     for (const selection of manifest.keyrings) {
+      const hasRoots = Object.hasOwn(selection || {}, "currentOwnerRootCheckpoints");
       exactly(selection, ["scope", "pinnedCurrentHead", "signedDeviceGrant",
-        "ownerHistory", "signerKeyId", "deviceId", "holderSecretFile", "files"]);
+        "ownerHistory", "signerKeyId", "deviceId", "holderSecretFile", "files",
+        ...(hasRoots ? ["currentOwnerRootCheckpoints"] : [])]);
+      if (hasRoots && (!historicalOptIn || create)) fail();
       exactly(selection.scope, ["account_id", "compartment_id", "keyring_id"]);
       exactly(selection.pinnedCurrentHead, ["revision", "digest", "epoch"]);
       const scope = { ...selection.scope };
@@ -355,6 +428,15 @@
         keyrings.push({ ...common, files: selected,
           signedDeviceGrant: selection.signedDeviceGrant,
           ownerHistoryCheckpoint });
+      } else if (hasRoots) {
+        const historicalRecovery = { signedOwnerHistoryChain: selection.ownerHistory,
+          currentSignedDeviceGrant: selection.signedDeviceGrant,
+          currentOwnerRootCheckpoints: selection.currentOwnerRootCheckpoints };
+        checkHistoricalWire(historicalRecovery, scope, selection.signedDeviceGrant);
+        await brandedHistoricalChain(historicalRecovery,
+          { ...trust, pinnedCurrentHead }, scope, signerKeyId, selection.deviceId, assertLive);
+        assertLive();
+        keyrings.push({ ...common, previousOwnerHistoryProof: null, historicalRecovery });
       } else keyrings.push(common);
     }
     if (usedHolders.size !== holders.size
@@ -499,6 +581,8 @@
       + '<label>Arquivo cifrado e assinado (.json, somente recuperação)<input type="file" data-zk1-field="archive-json" accept=".json,application/json"></label>'
       + '<label>SHA-256 externo do arquivo assinado (base64url, 32 bytes)<input data-zk1-field="archive-sha" maxlength="43" spellcheck="false" autocomplete="off"></label>'
       + '<label><input type="checkbox" data-zk1-field="archive-opt-in"> Autorizo a operação local sem persistir arquivos recuperados no servidor.</label>'
+      + '<label><input type="checkbox" data-zk1-field="archive-historical-opt-in"> Recuperar pacote de head antigo: exigir histórico completo genesis→atual, grant ATIVO atual e reendosso assinado de cada raiz (sem substituição automática).</label>'
+      + '<label>Endossos históricos atuais escolhidos offline (.json, schema rootark-zk1-keyring-history-endorsement/v1, {schema,scope,historicalRecovery:{signedOwnerHistoryChain,currentSignedDeviceGrant,currentOwnerRootCheckpoints}})<input type="file" data-zk1-field="archive-historical-proof" accept=".json,application/json"></label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="archive-create">Assinar e baixar arquivo cifrado + hash separado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="archive-recover">Verificar e baixar 1–12 arquivos locais</button></div>'
       + '</fieldset>'
@@ -517,6 +601,7 @@
       + '<label>Arquivo cifrado e assinado da conta (somente recuperação)<input type="file" data-zk1-field="account-archive" accept=".json,application/json"></label>'
       + '<label>SHA-256 do arquivo da conta fixado externamente (base64url, 32 bytes)<input data-zk1-field="account-sha" maxlength="43" autocomplete="off" spellcheck="false"></label>'
       + '<label><input type="checkbox" data-zk1-field="account-opt-in"> Confirmo cópia/recuperação local sem upload, exclusão ou cutover. Pins/segredos foram escolhidos por canal independente.</label>'
+      + '<label><input type="checkbox" data-zk1-field="account-historical-opt-in"> Recuperar pacote com heads antigos: adicionar currentOwnerRootCheckpoints de cada keyring antigo à seleção offline; nunca recuperar com grant revogado ou sem todos os reendossos.</label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="account-create">Assinar e baixar pacote da conta + hash</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="account-recover">Conferir e baixar arquivos de todos os keyrings</button></div>'
       + '</fieldset>'
@@ -653,7 +738,9 @@
         });
         assertLive();
         const create = action === "account-create";
-        const selected = await selectedAccountKeyrings(trust, create, assertLive, accountFiles);
+        const accountHistory = field("account-historical-opt-in")?.checked === true;
+        const selected = await selectedAccountKeyrings(trust, create, assertLive, accountFiles,
+          accountHistory);
         if (create) {
           ownerSigningDer = await fileBytes("account-owner-private", 1, 8192);
           assertLive();
@@ -689,6 +776,22 @@
           try { accountArchive = JSON.parse(decoder.decode(rawArchive)); }
           finally { rawArchive.fill(0); }
           assertLive();
+          if (!Array.isArray(accountArchive?.keyrings)
+            || accountArchive.keyrings.length !== selected.keyrings.length) fail();
+          let historicCount = 0;
+          for (let index = 0; index < selected.keyrings.length; index++) {
+            const expected = selected.keyrings[index];
+            const entry = accountArchive.keyrings[index];
+            if (!entry || !["account_id", "compartment_id", "keyring_id"].every((name) =>
+              expected.scope[name] === entry.scope?.[name])) fail();
+            const old = entry.ownerRevision !== expected.pinnedCurrentHead.revision
+              || entry.ownerDigest !== to64(expected.pinnedCurrentHead.digest)
+              || entry.ownerEpoch !== expected.pinnedCurrentHead.epoch;
+            const historical = Object.hasOwn(expected, "historicalRecovery");
+            if (old !== historical || (old && !accountHistory)) fail();
+            if (old) historicCount++;
+          }
+          if (accountHistory && historicCount === 0) fail();
           accountRecovered = await window.RootarkZk1AccountPortableRecovery.recoverArchive({
             accountArchive, accountId: selected.accountId,
             independentlyPinnedAccountSha256: from64(field("account-sha").value.trim()),
@@ -727,7 +830,9 @@
           }
           status("Assinatura e hash independentes da conta + todos os "
             + selected.keyrings.length + " keyring(s) verificados; " + releases.length
-            + " arquivos baixados localmente. Sem autorização de restore em produção.");
+            + " arquivos baixados localmente. "
+            + (historicCount ? "Heads antigos exigiram concessão atual ATIVA, cadeia assinada e raízes reendossadas. " : "")
+            + "Sem autorização de restore em produção.");
         }
         return;
       }
@@ -795,8 +900,22 @@
           let archive;
           try { archive = JSON.parse(decoder.decode(archiveFile)); }
           finally { archiveFile.fill(0); }
+          const historicOptIn = field("archive-historical-opt-in")?.checked === true;
+          if (historicOptIn && (archive?.ownerRevision === trust.pinnedCurrentHead.revision
+            && archive?.ownerDigest === to64(trust.pinnedCurrentHead.digest)
+            && archive?.ownerEpoch === trust.pinnedCurrentHead.epoch)) fail();
+          if (!historicOptIn && (archive?.ownerRevision !== trust.pinnedCurrentHead.revision
+            || archive?.ownerDigest !== to64(trust.pinnedCurrentHead.digest)
+            || archive?.ownerEpoch !== trust.pinnedCurrentHead.epoch)) fail();
+          const historicalRecovery = historicOptIn
+            ? await selectedHistoricalKeyring(trust, scope, archiveCommon.signerKeyId,
+              archiveCommon.deviceId, assertLive) : null;
+          assertLive();
           const recovered = await window.RootarkZk1KeyringPortableArchive.recoverArchive({
-            ...archiveCommon, recoverySecret: secret, archive,
+            ...archiveCommon, previousOwnerHistoryProof: historicOptIn
+              ? null : archiveCommon.previousOwnerHistoryProof,
+            ...(historicOptIn ? { historicalRecovery } : {}),
+            recoverySecret: secret, archive,
             independentlyPinnedArchiveSha256: from64(field("archive-sha").value.trim()),
           });
           try {
@@ -804,7 +923,9 @@
               || recovered.signedManifestVerified !== true
               || recovered.independentArchiveHashMatched !== true
               || recovered.allOwnerSignedRootsVerified !== true
-              || recovered.activeSignedGrantAtPinnedHeadVerified !== true) fail();
+              || recovered.activeSignedGrantAtPinnedHeadVerified !== true
+              || (historicOptIn && (recovered.historicalOwnerContinuityVerified !== true
+                || recovered.currentSignedGrantAtPinnedHeadVerified !== true))) fail();
             const names = recovered.files.map((file) => localName(file.name));
             if (new Set(names.map((name) => name.toLowerCase())).size !== names.length) fail();
             // Validate all output paths BEFORE creating the first download.
@@ -813,6 +934,7 @@
               downloadLocal(names[index], file.data, file.mediaType || "application/octet-stream", assertLive);
             }
             status("Assinatura, escopo, grant, histórico, todas as raízes e hash externo conferidos. "
+              + (historicOptIn ? "Grant atual e reendosso de cada raiz confirmados. " : "")
               + recovered.files.length + " arquivo(s) baixados localmente. Revogação online/durabilidade externa não comprovadas.");
           } finally { for (const file of recovered.files) file.data.fill(0); }
         }
@@ -1040,7 +1162,7 @@
       // The original File/Blob remains held by the input until explicitly reset.
       for (const name of ["private", "hpke-private", "pop-challenge", "new-approval", "file", "secret", "bundle", "migration-cek", "migration-proof",
         "migration-batch-descriptors", "migration-batch-ceks", "migration-batch-secret",
-        "archive-files", "archive-owner-private", "archive-json",
+        "archive-files", "archive-owner-private", "archive-json", "archive-historical-proof",
         "account-descriptors", "account-holder-files", "account-local-files",
         "account-owner-private", "account-archive"]) {
         const control = field(name);

@@ -49,7 +49,10 @@ async function harness() {
         return {};
       } },
     RootarkZk1OwnerSignedCheckpoint: {
-      verifyOwnerCheckpoint: async () => { trace.push("history"); return {}; } },
+      verifyOwnerCheckpoint: async ({ checkpoint }) => {
+        trace.push("history");
+        return { sequence: checkpoint.sequence };
+      } },
     RootarkZk1NormalBrowserContent: { uploadAndVerify: async () => ({}) },
     RootarkZk1LegacyMigrationWorkflow: { openMigrationJournal: async () => ({ close() {} }) },
     RootarkZk1FileContent: { importFileCek: (raw) => crypto.webcrypto.subtle.importKey(
@@ -202,6 +205,8 @@ async function harness() {
   value("owner-device", "fixture-owner");
   value("witness-spki", encode(crypto.randomBytes(32)));
   value("witness-prior", encode(crypto.randomBytes(32)));
+  file("archive-json", JSON.stringify({ ownerRevision: Number(field("revision").value),
+    ownerDigest: field("digest").value, ownerEpoch: Number(field("epoch").value) }));
   field("archive-opt-in").checked = true;
   field("migration-batch-opt-in").checked = true;
   field("account-opt-in").checked = true;
@@ -236,7 +241,10 @@ async function harness() {
     accountCreateCalls: () => accountCreateCalls,
     accountRecoverCalls: () => accountRecoverCalls,
     waitForAccountCreate: () => tickUntil(() => Boolean(finishAccountCreate)),
-    waitForAccountRecover: () => tickUntil(() => Boolean(finishAccountRecover)),
+    waitForAccountRecover: async () => {
+      try { await tickUntil(() => Boolean(finishAccountRecover)); }
+      catch (e) { throw Error(e.message + ": " + field("status").textContent + " trace=" + trace); }
+    },
     resolveAccountCreate(result) { finishAccountCreate(result); },
     resolveAccountRecover(result) { finishAccountRecover(result); },
     denied: () => tickUntil(() => field("status").textContent.includes("Operação recusada")),
@@ -436,7 +444,14 @@ async function configureAccount(page, create = false) {
     ? [keyedFile("file-0.txt", Buffer.from("local A"), "text/plain"),
       keyedFile("file-1.txt", Buffer.from("local B"), "text/plain")] : [];
   page.file("account-descriptors", JSON.stringify(descriptor));
-  page.file("account-archive", "{}");
+  page.file("account-archive", JSON.stringify({ keyrings: descriptor.keyrings.map((item) => ({
+    scope: item.scope, ownerRevision: item.pinnedCurrentHead.revision,
+    ownerDigest: item.pinnedCurrentHead.digest, ownerEpoch: item.pinnedCurrentHead.epoch,
+  })).sort((a, b) => {
+    const left = a.scope.compartment_id + ":" + a.scope.keyring_id;
+    const right = b.scope.compartment_id + ":" + b.scope.keyring_id;
+    return left < right ? -1 : left > right ? 1 : 0;
+  }) }));
   page.field("account-sha").value = encode(crypto.randomBytes(32));
   return descriptor;
 }
@@ -545,3 +560,149 @@ test("UI explicitly disclaims complete signed inventory for keyring and account 
   assert.match(source, /não comprova inventário completo da conta/);
   assert.doesNotMatch(source, /<legend>Arquivo completo de keyring/);
 });
+
+async function historicKeyring(page) {
+  const grant = JSON.parse(Buffer.from(await page.field("grant").files[0].arrayBuffer()).toString());
+  grant.device_id = "fixture-owner";
+  page.file("grant", JSON.stringify(grant));
+  const signer = page.field("owner-signer").value;
+  const scope = { account_id: grant.account_id, compartment_id: grant.compartment_id,
+    keyring_id: grant.keyring_id };
+  const first = { sequence: 1, signer_key_id: signer, device_id: "fixture-owner",
+    revision: 1, manifest_digest: encode(crypto.randomBytes(32)) };
+  const currentDigest = page.field("digest").value;
+  const last = { sequence: 2, signer_key_id: signer, device_id: "fixture-owner",
+    revision: 2, manifest_digest: currentDigest };
+  page.field("revision").value = "2";
+  page.field("epoch").value = "2";
+  const chain = [first, last];
+  page.file("history", JSON.stringify(chain));
+  const roots = [{ object_id: encode(crypto.randomBytes(16)),
+    ciphertext_root: encode(crypto.randomBytes(32)) }];
+  const historic = { signedOwnerHistoryChain: chain,
+    currentSignedDeviceGrant: grant, currentOwnerRootCheckpoints: roots };
+  const selected = { schema: "rootark-zk1-keyring-history-endorsement/v1",
+    scope, historicalRecovery: historic };
+  page.file("archive-historical-proof", JSON.stringify(selected));
+  page.file("archive-json", JSON.stringify({ ownerRevision: 1,
+    ownerDigest: first.manifest_digest, ownerEpoch: 1 }));
+  page.field("archive-historical-opt-in").checked = true;
+  return { grant, chain, roots, selected };
+}
+
+test("historical keyring opts in with fully branded current chain and current grant", async () => {
+  const page = await harness();
+  const f = await historicKeyring(page);
+  page.click("archive-recover");
+  await page.waitForArchive();
+  const input = page.window;
+  // recoverArchive stub's pending input is captured below in the harness.
+  assert.equal(page.trace.filter((step) => step === "history").length >= 4, true);
+  assert.equal(page.trace.includes("assertCurrent"), true);
+  assert.equal(page.downloads.length, 0);
+  page.resolveArchive({ files: [{ name: "historical.txt", data: Uint8Array.of(7, 8) }],
+    signedManifestVerified: true, independentArchiveHashMatched: true,
+    allOwnerSignedRootsVerified: true, activeSignedGrantAtPinnedHeadVerified: true,
+    historicalOwnerContinuityVerified: true, currentSignedGrantAtPinnedHeadVerified: true });
+  await tickUntil(() => page.downloads.length === 1);
+  assert.equal(page.downloads[0].name, "historical.txt");
+});
+
+for (const mode of ["no-opt-in", "incomplete-chain", "missing-root", "revoked",
+  "cross-owner", "wrong-head", "csrf", "logout"]) test("historical keyring refuses " + mode,
+  async () => {
+    const page = await harness();
+    const f = await historicKeyring(page);
+    if (mode === "no-opt-in") page.field("archive-historical-opt-in").checked = false;
+    if (mode === "incomplete-chain") f.selected.historicalRecovery.signedOwnerHistoryChain = [f.chain[1]];
+    if (mode === "missing-root") f.selected.historicalRecovery.currentOwnerRootCheckpoints = [];
+    if (mode === "revoked") {
+      f.selected.historicalRecovery.currentSignedDeviceGrant =
+        { ...f.grant, revoked_at_epoch: 2 };
+    }
+    if (mode === "cross-owner") f.selected.scope.keyring_id = encode(crypto.randomBytes(16));
+    if (mode === "wrong-head") f.selected.historicalRecovery.signedOwnerHistoryChain[1]
+      = { ...f.chain[1], manifest_digest: encode(crypto.randomBytes(32)) };
+    page.file("archive-historical-proof", JSON.stringify(f.selected));
+    page.click("archive-recover");
+    if (mode === "csrf" || mode === "logout") {
+      await page.waitForArchive();
+      if (mode === "csrf") page.document.cookie = "rootark_csrf=switched";
+      else page.logout();
+      const recovered = Uint8Array.of(5);
+      page.resolveArchive({ files: [{ name: "safe.txt", data: recovered }],
+        signedManifestVerified: true, independentArchiveHashMatched: true,
+        allOwnerSignedRootsVerified: true, activeSignedGrantAtPinnedHeadVerified: true,
+        historicalOwnerContinuityVerified: true, currentSignedGrantAtPinnedHeadVerified: true });
+      await page.denied();
+      assert.deepEqual([...recovered], [0]);
+    } else await page.denied();
+    assert.equal(page.downloads.length, 0);
+  });
+
+async function historicAccount(page) {
+  const manifest = await configureAccount(page);
+  const old = { ...manifest.keyrings[1].pinnedCurrentHead };
+  const freshDigest = encode(crypto.randomBytes(32));
+  const ring = manifest.keyrings[1];
+  ring.pinnedCurrentHead.revision++;
+  ring.pinnedCurrentHead.epoch++;
+  ring.pinnedCurrentHead.digest = freshDigest;
+  ring.ownerHistory[0].device_id = "owner-device";
+  ring.ownerHistory[0].revision = old.revision;
+  ring.ownerHistory[0].manifest_digest = old.digest;
+  ring.ownerHistory.push({ ...ring.ownerHistory[0], sequence: 2,
+    revision: ring.pinnedCurrentHead.revision, manifest_digest: freshDigest });
+  ring.currentOwnerRootCheckpoints = [{ object_id: encode(crypto.randomBytes(16)),
+    ciphertext_root: encode(crypto.randomBytes(32)) }];
+  page.file("account-descriptors", JSON.stringify(manifest));
+  page.field("account-historical-opt-in").checked = true;
+  return manifest;
+}
+
+test("account historical recovery passes per-keyring independent current authority, no silent fallback", async () => {
+  const page = await harness();
+  await historicAccount(page);
+  page.click("account-recover");
+  await page.waitForAccountRecover();
+  const keys = page.window.accountRecoverInput.keyrings;
+  assert.equal(keys.length, 2);
+  assert.equal(Object.hasOwn(keys[0], "historicalRecovery"), false);
+  assert.equal(Object.hasOwn(keys[1], "historicalRecovery"), true);
+  assert.equal(keys[1].previousOwnerHistoryProof, null);
+  assert.equal(keys[1].historicalRecovery.currentOwnerRootCheckpoints.length, 1);
+  page.resolveAccountRecover({ keyrings: keys.map((value, i) => ({
+    scope: value.scope, files: [{ name: "version-" + i + ".txt", data: Uint8Array.of(i + 1) }],
+  })), allKeyringsVerified: true, aggregateSignatureVerified: true,
+  aggregateIndependentPinMatched: true, authorizesProductionRestore: false });
+  await tickUntil(() => page.downloads.length === 2);
+});
+
+for (const mode of ["no-opt-in", "missing-roots", "revoked", "cross-scope",
+  "broken-history", "csrf", "logout"]) test("account historical recovery refuses " + mode,
+  async () => {
+    const page = await harness();
+    const manifest = await historicAccount(page);
+    const ring = manifest.keyrings[1];
+    if (mode === "no-opt-in") page.field("account-historical-opt-in").checked = false;
+    if (mode === "missing-roots") ring.currentOwnerRootCheckpoints = [];
+    if (mode === "revoked") ring.signedDeviceGrant.revoked_at_epoch = 3;
+    if (mode === "cross-scope") ring.signedDeviceGrant.keyring_id = encode(crypto.randomBytes(16));
+    if (mode === "broken-history") ring.ownerHistory = [ring.ownerHistory[1]];
+    page.file("account-descriptors", JSON.stringify(manifest));
+    page.click("account-recover");
+    if (mode === "csrf" || mode === "logout") {
+      await page.waitForAccountRecover();
+      if (mode === "csrf") page.document.cookie = "rootark_csrf=swapped";
+      else page.logout();
+      const input = page.window.accountRecoverInput.keyrings;
+      const files = input.map((v) => ({ scope: v.scope,
+        files: [{ name: "ok.txt", data: Uint8Array.of(1) }] }));
+      page.resolveAccountRecover({ keyrings: files, allKeyringsVerified: true,
+        aggregateSignatureVerified: true, aggregateIndependentPinMatched: true,
+        authorizesProductionRestore: false });
+      await page.denied();
+      assert.equal(files.every((v) => v.files[0].data[0] === 0), true);
+    } else await page.denied();
+    assert.equal(page.downloads.length, 0);
+  });

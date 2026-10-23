@@ -1439,6 +1439,7 @@ test("Edge normal authenticated V2 workspace refuses a real legacy V1 server cap
         if(archiveDownloads.length!==1||document.querySelector("dialog").open)
           throw Error("LATE_LOGOUT_ARCHIVE_RELEASE");
         HTMLAnchorElement.prototype.click=originalClick;
+        const historicHolder=postLogoutHolder.slice();
         postLogoutHolder.fill(0);
         // Real Edge logout while the FIRST historical catalog fetch is still
         // unresolved: no version ciphertext PUT and no report release.
@@ -1476,6 +1477,165 @@ test("Edge normal authenticated V2 workspace refuses a real legacy V1 server cap
         window.fetch=nativeFetch;
         HTMLAnchorElement.prototype.click=originalClick;
         batchSecret.fill(0);
+        // Real Edge: owner signs a NEW current history head + ACTIVE grant and
+        // independently re-endorses EACH encrypted root of an older archive.
+        // The browser reconstructs branded genesis->current proof and must
+        // reject missing roots, stale grant, and logout after verified decrypt.
+        window.__accountProbeStage="historical-real-edge";
+        (await wait(()=>document.getElementById("zk1-workspace-open"))).click();
+        await wait(()=>document.querySelector("dialog").open);
+        const enc=new TextEncoder();
+        const raw64=(bytes)=>btoa(String.fromCharCode(...bytes))
+          .replaceAll("+","-").replaceAll("/","_").replaceAll("=","");
+        const signingKey=await crypto.subtle.importKey("pkcs8",
+          decode(values.archiveOwnerPrivate),"Ed25519",false,["sign"]);
+        const verifyingKey=await crypto.subtle.importKey("raw",decode(values.ownerRaw),
+          "Ed25519",true,["verify"]);
+        const scope={account_id:values.grant.account_id,
+          compartment_id:values.grant.compartment_id,keyring_id:values.grant.keyring_id};
+        const signerId=decode(${JSON.stringify(b64(ownerHistoryKeyId))});
+        const genesisBrand=await window.RootarkZk1OwnerSignedCheckpoint.verifyOwnerCheckpoint({
+          checkpoint:values.archiveHistory,scope,signerPublicKey:verifyingKey,
+          signerKeyId:signerId,previous:null});
+        const latestDigest=crypto.getRandomValues(new Uint8Array(32));
+        const latestHead={revision:values.head.revision+1,
+          digest:raw64(latestDigest),epoch:values.head.epoch+1};
+        const newestHistory=await window.RootarkZk1OwnerSignedCheckpoint.signOwnerCheckpoint({
+          scope,signerKey:signingKey,signerPublicKey:verifyingKey,signerKeyId:signerId,
+          deviceId:values.grant.device_id,revision:latestHead.revision,
+          manifestDigest:latestDigest,issuedAt:Math.floor(Date.now()/1000),previous:genesisBrand});
+        const grantNames=["schema","account_id","compartment_id","keyring_id","device_id",
+          "authorization_key_id","authorization_public_key","manifest_revision",
+          "manifest_digest","current_epoch","enrolled_epoch","revoked_at_epoch"];
+        const unsignedGrant={...values.grant,manifest_revision:latestHead.revision,
+          manifest_digest:latestHead.digest,current_epoch:latestHead.epoch};
+        delete unsignedGrant.signature;
+        const grantPrefix=enc.encode("Root.ark/zk-1/browser-owner-device-grant/v1\\0");
+        const grantBody=enc.encode(JSON.stringify(Object.fromEntries(
+          grantNames.map(key=>[key,unsignedGrant[key]]))));
+        const grantMessage=new Uint8Array(grantPrefix.length+grantBody.length);
+        grantMessage.set(grantPrefix);grantMessage.set(grantBody,grantPrefix.length);
+        const currentGrant={...unsignedGrant,signature:raw64(new Uint8Array(
+          await crypto.subtle.sign("Ed25519",signingKey,grantMessage)))};
+        const oldArchive=JSON.parse(exportedArchive);
+        const oldContext={format:oldArchive.format,scope:oldArchive.scope,
+          ownerRevision:oldArchive.ownerRevision,ownerDigest:oldArchive.ownerDigest,
+          ownerEpoch:oldArchive.ownerEpoch,archiveId:oldArchive.archiveId};
+        const holderKey=await crypto.subtle.importKey("raw",historicHolder,"HKDF",false,["deriveKey"]);
+        const kdfPrefix=enc.encode("Root.ark/zk-1/keyring-archive-key/v1\\0");
+        const kdfContext=enc.encode(JSON.stringify(oldContext));
+        const kdfInfo=new Uint8Array(kdfPrefix.length+kdfContext.length);
+        kdfInfo.set(kdfPrefix);kdfInfo.set(kdfContext,kdfPrefix.length);
+        const oldWrap=await crypto.subtle.deriveKey({name:"HKDF",hash:"SHA-256",
+          salt:decode(oldArchive.salt),info:kdfInfo},holderKey,
+        {name:"AES-GCM",length:256},false,["decrypt"]);
+        const oldContents=new Uint8Array(await crypto.subtle.decrypt({name:"AES-GCM",
+          iv:decode(oldArchive.nonce),additionalData:enc.encode(JSON.stringify(oldContext)),
+          tagLength:128},oldWrap,decode(oldArchive.ciphertextBase64)));
+        const oldEntries=JSON.parse(new TextDecoder().decode(oldContents)).entries;
+        oldContents.fill(0);
+        const roots=[];
+        for(const {bundle} of oldEntries) roots.push(
+          await window.RootarkZk1OwnerCiphertextRootCheckpoint.signOwnerCiphertextRootCheckpoint({
+            scope,signerKey:signingKey,signerKeyId:signerId,deviceId:values.grant.device_id,
+            manifestRevision:latestHead.revision,manifestDigest:latestDigest,
+            manifestEpoch:latestHead.epoch,objectId:bundle.metadata.object_id,
+            objectRevision:bundle.objectRevision,ciphertextEpoch:bundle.metadata.epoch,
+            ciphertextRoot:decode(bundle.ciphertextRoot),issuedAt:Math.floor(Date.now()/1000),
+          }));
+        const historyWire={signedOwnerHistoryChain:[values.archiveHistory,newestHistory],
+          currentSignedDeviceGrant:currentGrant,currentOwnerRootCheckpoints:roots};
+        const selectedHistory={schema:"rootark-zk1-keyring-history-endorsement/v1",
+          scope,historicalRecovery:historyWire};
+        const provisionHistory=()=>{
+          setFile("owner",decode(values.ownerRaw));
+          field("owner-hash").value=values.ownerHash;
+          field("owner-spki").value=values.ownerSpkiHash;
+          field("revision").value=latestHead.revision;
+          field("digest").value=latestHead.digest;
+          field("epoch").value=latestHead.epoch;
+          setFile("grant",enc.encode(JSON.stringify(currentGrant)));
+          setFile("history",enc.encode(JSON.stringify(historyWire.signedOwnerHistoryChain)));
+          field("archive-opt-in").checked=true;
+          field("archive-historical-opt-in").checked=true;
+          field("owner-signer").value=${JSON.stringify(b64(ownerHistoryKeyId))};
+          field("owner-device").value=values.grant.device_id;
+          field("archive-sha").value=externalHash;
+          setFile("archive-json",enc.encode(exportedArchive));
+          setFile("secret",historicHolder);
+          setFile("archive-historical-proof",enc.encode(JSON.stringify(selectedHistory)));
+        };
+        provisionHistory();
+        document.querySelector('[data-zk1-action="provision"]').click();
+        await wait(()=>field("status").textContent.includes("Piso local verificado/avançado")
+          ||field("status").textContent.includes("Operação recusada"));
+        if(field("status").textContent.includes("Operação recusada"))
+          throw Error("HISTORICAL_CURRENT_FLOOR_NOT_PROVISIONED");
+        let historicDownloads=[];
+        const currentClick=HTMLAnchorElement.prototype.click;
+        HTMLAnchorElement.prototype.click=function(){historicDownloads.push({name:this.download,href:this.href});};
+        provisionHistory();
+        document.querySelector('[data-zk1-action="archive-recover"]').click();
+        await wait(()=>field("status").textContent.includes("Grant atual e reendosso")
+          ||field("status").textContent.includes("Operação recusada"));
+        if(!field("status").textContent.includes("Grant atual e reendosso")
+          ||historicDownloads.length!==2)throw Error("HISTORICAL_VALID_RECOVERY_DENIED");
+        historicDownloads=[];
+        selectedHistory.historicalRecovery.currentOwnerRootCheckpoints=roots.slice(1);
+        provisionHistory();
+        document.querySelector('[data-zk1-action="archive-recover"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        if(historicDownloads.length)throw Error("HISTORICAL_MISSING_ROOT_LEAK");
+        await wait(()=>field("archive-historical-proof").files.length===0);
+        selectedHistory.historicalRecovery.currentOwnerRootCheckpoints=roots;
+        selectedHistory.historicalRecovery.currentSignedDeviceGrant={...currentGrant,
+          revoked_at_epoch:latestHead.epoch};
+        provisionHistory();
+        document.querySelector('[data-zk1-action="archive-recover"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        if(historicDownloads.length)throw Error("HISTORICAL_REVOKED_LEAK");
+        await wait(()=>field("archive-historical-proof").files.length===0);
+        selectedHistory.historicalRecovery.currentSignedDeviceGrant=currentGrant;
+        selectedHistory.historicalRecovery.signedOwnerHistoryChain=[newestHistory];
+        window.__accountProbeStage="historical-incomplete-chain";
+        provisionHistory();
+        document.querySelector('[data-zk1-action="archive-recover"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        if(historicDownloads.length)throw Error("HISTORICAL_NO_GENESIS_LEAK");
+        await wait(()=>field("archive-historical-proof").files.length===0);
+        selectedHistory.historicalRecovery.signedOwnerHistoryChain=[values.archiveHistory,newestHistory];
+        selectedHistory.scope={...scope,keyring_id:values.ownerHash.slice(0,22)};
+        window.__accountProbeStage="historical-cross-scope";
+        provisionHistory();
+        document.querySelector('[data-zk1-action="archive-recover"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        if(historicDownloads.length)throw Error("HISTORICAL_CROSS_SCOPE_LEAK");
+        await wait(()=>field("archive-historical-proof").files.length===0);
+        selectedHistory.scope=scope;
+        // Decryption completed, but an actual logout before the returned
+        // promise settles must not release its plaintext as a late download.
+        provisionHistory();
+        window.__accountProbeStage="historical-late-restore";
+        const historicalModule=window.RootarkZk1KeyringPortableArchive;
+        let releaseHistoric=null;
+        window.RootarkZk1KeyringPortableArchive={...historicalModule,
+          recoverArchive:async(input)=>{
+            const opened=await historicalModule.recoverArchive(input);
+            return new Promise(resolve=>{releaseHistoric=()=>resolve(opened);});
+          }};
+        document.querySelector('[data-zk1-action="archive-recover"]').click();
+        await wait(()=>typeof releaseHistoric==="function"
+          ||field("status").textContent.includes("Operação recusada"));
+        if(typeof releaseHistoric!=="function")
+          throw Error("HISTORICAL_LATE_NOT_REACHED");
+        window.dispatchEvent(new Event("rootark:logout"));
+        releaseHistoric();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        if(historicDownloads.length||document.querySelector("dialog").open)
+          throw Error("HISTORICAL_LOGOUT_LATE_RELEASE");
+        window.RootarkZk1KeyringPortableArchive=historicalModule;
+        historicHolder.fill(0);
+        HTMLAnchorElement.prototype.click=currentClick;
         output.textContent="EDGE_AUTH_WORKSPACE_PASS";
       } catch(e){output.textContent="EDGE_AUTH_WORKSPACE_FAIL:"+e.message+
         ":STAGE="+(window.__accountProbeStage||"before-account")+

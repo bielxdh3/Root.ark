@@ -24,6 +24,35 @@ no plaintext/CEK is uploaded. Inputs and output buffers are cleared after use.
 The UI packages only the local file selection per keyring; it does **not** prove
 the set is the complete signed keyring/account inventory or include all versions.
 
+## Opt-in recovery of an older owner head (DEV, browser)
+
+Normal `archive-recover` and `account-recover` still require the ordinary
+owner-current-head equality and cannot automatically fall back to historic mode.
+For an older keyring archive, explicitly check **archive-historical-opt-in** and
+select an additional independent local JSON proof file with schema
+`rootark-zk1-keyring-history-endorsement/v1`, `scope`, and
+`historicalRecovery: { signedOwnerHistoryChain, currentSignedDeviceGrant,
+currentOwnerRootCheckpoints }`. The 2–64 signed checkpoints must start at
+genesis and finish at the currently PINNED head. The current grant must be
+ACTIVE, owner-signed, match the separately imported grant exactly, and the
+1–12 current root checkpoints must re-endorse **every exact archived ciphertext
+root** under that current head. The browser reconstructs Ed25519 history proof
+brands from the imported genesis chain; serialized `verified: true` flags do not
+count. The crypto module rechecks the historical archive's original signed
+history and roots, plus the newly signed current grant and all endorsements.
+
+For an older archive in `account-recover`, explicitly check
+**account-historical-opt-in** and supply `currentOwnerRootCheckpoints` on each
+affected keyring within the independently selected account JSON. The existing
+`ownerHistory`, `signedDeviceGrant` and `pinnedCurrentHead` on each keyring then
+represent the CURRENT independent owner authority. A keyring whose archive head
+still matches current must *not* include historical checkpoints; a keyring whose
+archive head differs *must* include them. One invalid keyring aborts the entire
+account batch and no local file is released. All inputs are opt-in, locally
+selected, bounded and session/CSRF/logout fenced. Neither flow uploads
+plaintext or CEK nor authorizes production restore, account completeness,
+online revocation, witness custody, or independent external durability.
+
 - `createArchive({ accountId, ownerSigningKey, ownerPublicKey,
   independentOwnerSpkiSha256, keyrings })` accepts 1–8 existing keyring-archive
   **creation inputs**. They must belong to the same account and resolve to the
