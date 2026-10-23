@@ -5,6 +5,25 @@ const path = require("node:path");
 const Database = require("better-sqlite3");
 const { assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
 
+function observedFile(filename, reject, required = false) {
+  let stat;
+  try { stat = fs.lstatSync(filename, { bigint: true }); }
+  catch (error) {
+    if (!required && error.code === "ENOENT") return null;
+    reject();
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n
+    || (process.platform !== "win32"
+      && (stat.uid !== BigInt(process.getuid()) || (stat.mode & 0o077n)))) reject();
+  return stat;
+}
+
+function sameObservation(left, right) {
+  if (!left || !right) return left === right;
+  return ["dev", "ino", "nlink", "size", "mtimeNs", "ctimeNs", "mode"]
+    .every((field) => left[field] === right[field]);
+}
+
 function assertSafeSqliteSidecars(filename, reject) {
   for (const suffix of ["-wal", "-shm", "-journal"]) {
     let stat;
@@ -32,17 +51,45 @@ function withReadonlySqliteSnapshot(filename, inspect, reject, maxBytes) {
   let probe;
   try {
     let size = 0;
+    const observed = new Map();
+    // Capture both WAL presence and identity before copying. A live authority
+    // may still write while the private copy is inspected; that is not a
+    // stable, attestable preflight and must fail closed.
+    for (const suffix of ["", "-wal", "-shm"]) {
+      observed.set(suffix, observedFile(filename + suffix, reject, suffix === ""));
+    }
     for (const suffix of ["", "-wal"]) {
       const source = filename + suffix;
-      if (suffix && !fs.existsSync(source)) continue;
-      const stat = fs.lstatSync(source);
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1
-        || (process.platform !== "win32"
-          && (stat.uid !== process.getuid() || (stat.mode & 0o077)))) reject();
-      size += stat.size;
-      if (size < 1 || size > maxBytes) reject();
-      fs.copyFileSync(source, dest + suffix, fs.constants.COPYFILE_EXCL);
-      if (process.platform !== "win32") fs.chmodSync(dest + suffix, 0o600);
+      const stat = observed.get(suffix);
+      if (!stat) continue;
+      size += Number(stat.size);
+      if (!Number.isSafeInteger(size) || size < 1 || size > maxBytes) reject();
+      // Read the previously observed inode by descriptor; a pathname-based
+      // copy could follow a symlink substituted after the initial lstat.
+      const fd = fs.openSync(source, fs.constants.O_RDONLY
+        | (fs.constants.O_NOFOLLOW || 0));
+      try {
+        if (!sameObservation(stat, fs.fstatSync(fd, { bigint: true }))) reject();
+        const out = fs.openSync(dest + suffix,
+          fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+        try {
+          const chunk = Buffer.allocUnsafe(128 * 1024);
+          let remaining = Number(stat.size);
+          while (remaining > 0) {
+            const read = fs.readSync(fd, chunk, 0, Math.min(chunk.length, remaining), null);
+            if (read === 0) reject();
+            let written = 0;
+            while (written < read) {
+              const n = fs.writeSync(out, chunk, written, read - written, null);
+              if (n === 0) reject();
+              written += n;
+            }
+            remaining -= read;
+          }
+        } finally { fs.closeSync(out); }
+        if (!sameObservation(stat, fs.fstatSync(fd, { bigint: true }))
+          || !sameObservation(stat, observedFile(source, reject, true))) reject();
+      } finally { fs.closeSync(fd); }
     }
     // A hot rollback journal cannot be verified from main DB+WAL alone.
     if (fs.existsSync(filename + "-journal")) reject();
@@ -50,7 +97,9 @@ function withReadonlySqliteSnapshot(filename, inspect, reject, maxBytes) {
     inspect(probe);
     const current = assertPrivateSqliteFile(filename);
     assertSafeSqliteSidecars(filename, reject);
-    if (current.dev !== initial.dev || current.ino !== initial.ino) reject();
+    if (current.dev !== initial.dev || current.ino !== initial.ino
+      || [...observed].some(([suffix, stat]) =>
+        !sameObservation(stat, observedFile(filename + suffix, reject, suffix === "")))) reject();
     return initial;
   } catch (_) { reject(); }
   finally {

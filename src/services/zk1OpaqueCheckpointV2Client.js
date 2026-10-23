@@ -16,6 +16,8 @@ const { assertSafeSqliteSidecars, requireCheckpointV2Triggers,
   require("./zk1OpaqueCheckpointV2SqliteGuard");
 const { assertPrivateSqliteDirectory, assertPrivateSqliteFile } =
   require("./zk1PrivateSqlitePath");
+const { syncPrivateParent, publishStagedJournal } =
+  require("./zk1V2DurableJournalMigration");
 
 const APPROVAL_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-checkpoint-remote/owner-approval/v2\0");
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
@@ -188,6 +190,9 @@ class Zk1OpaqueCheckpointV2Client {
       };
       const old = readSource();
       privateNewDestination(journalPath);
+      // Probe the actual directory durability barrier BEFORE creating even a
+      // temporary journal. Unsupported Windows directory fsync fails closed.
+      syncPrivateParent(journalPath);
       staged = path.join(path.dirname(journalPath),
         `.zk65-v2-129-migration-${crypto.randomBytes(16).toString("hex")}.sqlite`);
       scratch = new Zk1OpaqueCheckpointV2Client({ ...options,
@@ -209,24 +214,25 @@ class Zk1OpaqueCheckpointV2Client {
       finally { checked.close(); }
       assertSafeSqliteSidecars(staged, deny);
       if (["-wal", "-shm", "-journal"].some((suffix) => fs.existsSync(staged + suffix))) deny();
-      const fd = fs.openSync(staged, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0));
-      try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
       privateNewDestination(journalPath);
-      // Hardlink creation is atomic NO_REPLACE; crash before removing stage
-      // leaves a linked DB that fails the one-link admission check closed.
-      fs.linkSync(staged, journalPath);
-      fs.unlinkSync(staged);
+      // The helper fsyncs the staged file, the new staging directory entry,
+      // the published hardlink, and removal of the staging name. Any failed
+      // barrier rejects and attempts exact-inode rollback; old #129 untouched.
+      const migrated = publishStagedJournal(staged, journalPath,
+        () => new Zk1OpaqueCheckpointV2Client({ ...options,
+          journalPath, bootstrapNew: false }));
       staged = null;
-      return new Zk1OpaqueCheckpointV2Client({ ...options,
-        journalPath, bootstrapNew: false });
+      return migrated;
     } catch (_) { deny(); }
     finally {
       scratch?.close();
       if (staged) {
+        let removed = false;
         for (const suffix of ["", "-wal", "-shm", "-journal"]) {
-          try { fs.unlinkSync(staged + suffix); }
+          try { fs.unlinkSync(staged + suffix); removed = true; }
           catch (error) { if (error.code !== "ENOENT") deny(); }
         }
+        if (removed) syncPrivateParent(staged);
       }
     }
   }

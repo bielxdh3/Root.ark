@@ -485,26 +485,37 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
     optIn(forged129, migratedJournal)), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
   "same local identity cannot bless tampered owner signature");
   assert.equal(fs.existsSync(migratedJournal), false);
-  const migrated = await Zk1OpaqueCheckpointV2Client.migrateLegacy129(
-    optIn(old129, migratedJournal));
+  let migrated;
+  if (process.platform === "win32") {
+    // Native directory fsync returns EPERM on Windows. The opt-in migration
+    // must refuse to create a destination instead of claiming crash safety.
+    await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129(
+      optIn(old129, migratedJournal)), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/);
+    assert.equal(fs.existsSync(migratedJournal), false);
+  } else {
+    migrated = await Zk1OpaqueCheckpointV2Client.migrateLegacy129(
+      optIn(old129, migratedJournal));
+  }
   assert.deepEqual(fs.readFileSync(old129), original129,
     "migration does not modify the old SQLite database");
   assert.equal(fs.existsSync(old129 + "-wal"), false);
   assert.equal(fs.existsSync(old129 + "-shm"), false);
-  assert.equal((await migrated.read()).sequence, 129);
-  assert.deepEqual(await migrated.exportSignedIntents(), [intent]);
-  assert.equal(fs.existsSync(migratedJournal), true);
-  const migratedProbe = new Database(migratedJournal, { readonly: true });
-  assert.equal(migratedProbe.prepare(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name='successors'").get().name,
-  "successors");
-  migratedProbe.close();
-  await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129(
-    optIn(old129, migratedJournal)), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
-  "migration never overwrites a pre-existing destination or replays admission");
-  client.close();
-  client = migrated;
-  journal = migratedJournal;
+  if (migrated) {
+    assert.equal((await migrated.read()).sequence, 129);
+    assert.deepEqual(await migrated.exportSignedIntents(), [intent]);
+    assert.equal(fs.existsSync(migratedJournal), true);
+    const migratedProbe = new Database(migratedJournal, { readonly: true });
+    assert.equal(migratedProbe.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='successors'").get().name,
+    "successors");
+    migratedProbe.close();
+    await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129(
+      optIn(old129, migratedJournal)), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+    "migration never overwrites a pre-existing destination or replays admission");
+    client.close();
+    client = migrated;
+    journal = migratedJournal;
+  }
   // Same-origin authenticated session relay -> independent V2 mTLS providers
   // -> browser verifies both fresh Ed25519 receipts and the owner-approved
   // single-record 129 archive. No Node/SQLite APIs enter the browser client.
