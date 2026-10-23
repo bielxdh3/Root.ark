@@ -643,8 +643,9 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
   assert.equal(snapshot5.entries.length, 5);
   const uncertainRestore = Object.assign(realm({}), restoreBase, {
     catalog: snapshot5, sourceIndex: 4, sourceMetadata: saved5.metadata,
-    sourceCek: saved5.cek, originalIndex: 3,
-    originalMetadata: restored.metadata, originalCek: archived.get(4).cek,
+    sourceCek: await operableCek(saved5.cek), originalIndex: 3,
+    originalMetadata: restored.metadata,
+    originalCek: await operableCek(archived.get(4).cek),
     catalogWriter: makeWriter(5,
       Buffer.from(badFinalProof.outcome.catalogDigestBase64, "base64url")),
     fetchImpl: async (url, options) => {
