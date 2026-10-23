@@ -270,6 +270,35 @@
       return concat(iv, encrypted);
     } finally { padded.fill(0); nameBytes.fill(0); }
   }
+  // Pure local AEAD opening primitive. It does NOT authenticate a catalog
+  // snapshot: callers must first establish the exact owner/witness/CAS signed
+  // head and pages with readAll(), never trust a server-supplied name.
+  async function openMetadata(input) {
+    let clear;
+    try {
+      exact(input, ["scope", "objectId", "revision", "epoch", "metadataKey", "ciphertext"]);
+      const scope = scopeOf(input.scope);
+      const objectId = id(input.objectId);
+      const revision = uint(input.revision, 1), epoch = uint(input.epoch, 1);
+      const key = input.metadataKey;
+      if (key?.type !== "secret" || key?.algorithm?.name !== "AES-GCM"
+        || key.algorithm.length !== 256 || !key.usages?.includes("decrypt")
+        || key.extractable !== false) deny();
+      const sealed = bytes(input.ciphertext, 284);
+      const aad = concat(META, encode({ ...scope, object_id: objectId, revision, epoch }));
+      clear = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM",
+        iv: sealed.slice(0, 12), additionalData: aad, tagLength: 128 },
+      key, sealed.slice(12)));
+      if (clear.length !== 256) deny();
+      const size = (clear[0] << 8) + clear[1];
+      if (size < 1 || size > 220) deny();
+      const name = td.decode(clear.slice(2, 2 + size));
+      if (!name || /[\u0000-\u001f\u007f]/.test(name)
+        || te.encode(name).length !== size) deny();
+      return name;
+    } catch (_) { deny(); }
+    finally { clear?.fill(0); }
+  }
   function configure(input) {
     const customJournal = Object.hasOwn(input || {}, "journalStore");
     exact(input, ["origin", "fetchImpl", "ownerPublicKey", "pinnedOwnerKeyHash",
@@ -867,5 +896,5 @@
     }, readVerifiedCiphertext, readSignedSuccessor, prepareIntent, commit, confirmPendingIntent,
     delete: deny, trash: deny, rename: deny, move: deny });
   }
-  return Object.freeze({ createClient, indexedDbJournalStore });
+  return Object.freeze({ createClient, indexedDbJournalStore, openMetadata });
 }));

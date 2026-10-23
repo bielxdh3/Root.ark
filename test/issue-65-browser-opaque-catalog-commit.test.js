@@ -255,6 +255,23 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   assert.equal(receiverBefore.head.sequence, 1);
   assert.equal(receiverBefore.entries.length, 1);
   assert.equal(Object.keys(receiverBefore.entries[0]).includes("name"), false);
+  const listingKey = await crypto.subtle.importKey("raw", metadataKey,
+    "AES-GCM", false, ["decrypt"]);
+  const incorrectListingKey = await crypto.subtle.importKey("raw",
+    nodeCrypto.randomBytes(32), "AES-GCM", false, ["decrypt"]);
+  await assert.rejects(receiver.readPrivateListing(receiverBefore, incorrectListingKey),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/, "wrong owner metadata key fails closed");
+  const beforePrivateListPuts = putRequests, beforePrivateListCommits = commits;
+  const privateListing = await receiver.readPrivateListing(receiverBefore, listingKey);
+  assert.deepEqual(privateListing.entries.map((entry) =>
+    [entry.objectId, entry.revision, entry.name]),
+  [[objectId, 1, "sensitive/private/account.txt"]]);
+  assert.equal(privateListing.head.sequence, 1);
+  assert.equal(privateListing.plaintextSentToServer, false);
+  assert.equal(putRequests, beforePrivateListPuts);
+  assert.equal(commits, beforePrivateListCommits);
+  assert.equal(JSON.stringify(receiverBefore).includes("sensitive/private/account.txt"),
+    false, "signed opaque snapshot still exposes no filename");
   const listed = await second.readAll();
   assert.equal(listed.head.sequence, 1);
   assert.equal(listed.rows.length, 1);
@@ -337,6 +354,9 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
     secondCipher, "second device GET is authenticated and digest-bound");
   assert.equal(JSON.stringify(delta).includes("sensitive/private"), false,
     "delta must not disclose plaintext filename");
+  await assert.rejects(receiver.readPrivateListing(receiverBefore, listingKey),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "stale CAS cannot expose an earlier private listing after a signed successor");
   await assert.rejects(receiver.pullDelta(receiverBefore), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
     "consumed predecessor cannot replay/fork a signed successor");
   const conflictDevice = await syncClient(1);

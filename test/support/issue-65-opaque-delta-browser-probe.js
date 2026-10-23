@@ -7,6 +7,9 @@
     for (const n of raw) text += String.fromCharCode(n);
     return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
   };
+  const raw64 = (encoded) => Uint8Array.from(atob(encoded.replace(/-/g, "+")
+    .replace(/_/g, "/").padEnd(Math.ceil(encoded.length / 4) * 4, "=")),
+  (x) => x.charCodeAt(0));
   function make(version) {
     const rows = Array.from({ length: version }, (_, n) => ({
       object_id: b64(new Uint8Array(16).fill(17)), revision: n + 1,
@@ -17,6 +20,11 @@
   }
   root.runOpaqueDeltaBrowserProbe = async function () {
     const first = make(1), successor = make(2);
+    const fixture = root.__deltaCryptoFixture;
+    if (fixture) {
+      first.rows[0].object_id = fixture.objectId;
+      first.rows[0].metadata_ciphertext = raw64(fixture.ciphertextBase64);
+    }
     const wireId = first.rows[0].object_id;
     let live = true, gets = 0, changed = false;
     root.RootarkZk1BrowserOpaqueCatalogCommit.createClient = function () {
@@ -38,12 +46,34 @@
         };
       };
     const sync = root.RootarkZk1OpaqueDeviceDeltaSync.createClient({
-      authority: { signedDeviceGrant: {}, pinnedOwnerHead: { epoch: 1,
+      authority: { signedDeviceGrant: fixture?.scope || {}, pinnedOwnerHead: { epoch: 1,
         digest: new Uint8Array(32) }, signerGrants: [],
       csrfToken: () => "csrf-a", isSessionCurrent: () => live },
       assertLive() { if (!live) throw Error("LOGOUT"); },
     });
     const before = await sync.readCurrent();
+    const metadataKey = await root.crypto.subtle.importKey("raw",
+      new Uint8Array(32).fill(12), "AES-GCM", false, ["decrypt"]);
+    let listingRejected = false;
+    try { await sync.readPrivateListing(before, metadataKey); } catch (error) {
+      listingRejected = error.message === "ZK_OPAQUE_DELTA_SYNC_DENIED";
+    }
+    if (!listingRejected) throw Error("UNVERIFIED_PRIVATE_LISTING");
+    if (fixture) {
+      const rightKey = await root.crypto.subtle.importKey("raw",
+        raw64(fixture.metadataKeyBase64), "AES-GCM", false, ["decrypt"]);
+      const opened = await sync.readPrivateListing(before, rightKey);
+      if (opened.entries.length !== 1 || opened.entries[0].name !== fixture.name
+        || !opened.independentlySignedCatalog || opened.plaintextSentToServer)
+        throw Error("PRIVATE_LISTING_NOT_OPENED_LOCALLY");
+      const wrongScope = { ...fixture.scope, keyring_id: b64(new Uint8Array(16).fill(99)) };
+      let aadRejected = false;
+      try { await root.RootarkZk1BrowserOpaqueCatalogCommit.openMetadata({
+        scope: wrongScope, objectId: fixture.objectId, revision: 1, epoch: 1,
+        metadataKey: rightKey, ciphertext: raw64(fixture.ciphertextBase64),
+      }); } catch (error) { aadRejected = error.message === "ZK_BROWSER_CATALOG_UNVERIFIED"; }
+      if (!aadRejected) throw Error("CROSS_ACCOUNT_AAD_REPLAY");
+    }
     if (before.head.sequence !== 1 || before.entries.length !== 1
       || Object.hasOwn(before.entries[0], "name")) throw Error("PLAIN_METADATA");
     const delta = await sync.pullDelta(before);

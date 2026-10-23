@@ -794,8 +794,10 @@
       + '<label>Delta opaco exportado por outro dispositivo (.json, somente ciphertext e metadados cifrados)<input type="file" data-zk1-field="catalog-delta-package" accept=".json,application/json"></label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-anchor">Ancorar CAS assinado atual</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-pull">Conferir e exportar delta cifrado</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-list">Listar nomes localmente (AES-GCM)</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-import">Importar e comparar delta com GET assinado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-publish">Publicar nova versão cifrada via journal → PUT → CAS</button></div>'
+      + '<div data-zk1-field="catalog-delta-private-list" role="region" aria-label="Nomes locais abertos após CAS e witness assinados"></div>'
       + '<output data-zk1-field="catalog-delta-summary" role="status" aria-live="polite"></output>'
       + '</fieldset>'
       + '</fieldset>'
@@ -910,6 +912,8 @@
       verifiedOpaqueDelta = null;
       const deltaSummary = field("catalog-delta-summary");
       if (deltaSummary) deltaSummary.textContent = "";
+      const privateList = field("catalog-delta-private-list");
+      if (privateList) privateList.replaceChildren();
       verifiedRevocationHead = null;
       const journal = field("catalog-write-journal");
       if (journal) journal.textContent = "";
@@ -925,7 +929,7 @@
       "account-create", "account-recover", "versioned-create", "versioned-recover",
       "catalog-discover", "catalog-page", "catalog-get", "catalog-publish",
       "catalog-lifecycle", "catalog-v2-read", "catalog-v2-get",
-      "catalog-delta-anchor", "catalog-delta-pull", "catalog-delta-import",
+      "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-pull", "catalog-delta-import",
       "catalog-delta-publish"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
@@ -1062,7 +1066,8 @@
       }
       const trust = await grantAndOwner();
       assertLive();
-      if (["catalog-delta-pull", "catalog-delta-import", "catalog-delta-publish"].includes(action)) {
+      if (["catalog-delta-list", "catalog-delta-pull", "catalog-delta-import",
+        "catalog-delta-publish"].includes(action)) {
         if (available.opaqueCatalogV1 !== true
           || field("catalog-delta-opt-in")?.checked !== true
           || trust.signedDeviceGrant.revoked_at_epoch !== null
@@ -1086,6 +1091,41 @@
           previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
         });
         assertLive();
+        if (action !== "catalog-delta-list")
+          field("catalog-delta-private-list")?.replaceChildren();
+        if (action === "catalog-delta-list") {
+          // The metadata key is imported for DECRYPT only and never exported
+          // or sent to the server. Render via textContent, never HTML.
+          const raw = await fileBytes("catalog-write-key", 32, 32);
+          let metadataKey;
+          try { metadataKey = await crypto.subtle.importKey("raw", raw,
+            { name: "AES-GCM", length: 256 }, false, ["decrypt"]); }
+          finally { raw.fill(0); }
+          const list = field("catalog-delta-private-list");
+          list.replaceChildren();
+          const opened = await held.client.readPrivateListing(held.baseline, metadataKey);
+          assertLive();
+          if (opened.independentlySignedCatalog !== true
+            || opened.plaintextSentToServer !== false
+            || opened.authorizesMutation !== false
+            || opened.head.sequence !== held.baseline.head.sequence
+            || opened.head.digest !== held.baseline.head.digest
+            || !Array.isArray(opened.entries)) fail();
+          const content = document.createDocumentFragment();
+          for (const entry of opened.entries) {
+            if (typeof entry.name !== "string" || !entry.name) fail();
+            const item = document.createElement("div");
+            item.textContent = entry.name + " · revisão " + entry.revision;
+            content.appendChild(item);
+          }
+          assertLive();
+          list.replaceChildren(content);
+          field("catalog-delta-summary").textContent = "Listagem local de "
+            + opened.entries.length + " versão(ões) · CAS #" + opened.head.sequence;
+          status("Metadados autenticados via CAS/witness e abertos só neste navegador. "
+            + "Nenhum nome ou chave enviado ao servidor.");
+          return;
+        }
         if (action === "catalog-delta-publish") {
           // A dedicated manual action; the existing writer guarantees one
           // signed PUT/CAS, fresh exact GET and a durable intent journal even
@@ -1424,6 +1464,8 @@
           nowSeconds: () => Math.floor(Date.now() / 1000),
         };
         if (anchoringDelta) {
+          const privateList = field("catalog-delta-private-list");
+          if (privateList) privateList.replaceChildren();
           const client = window.RootarkZk1OpaqueDeviceDeltaSync.createClient({ authority, assertLive });
           const baseline = await client.readCurrent();
           assertLive();
@@ -2294,6 +2336,8 @@
     verifiedOpaqueDelta = null;
     const deltaSummary = field("catalog-delta-summary");
     if (deltaSummary) deltaSummary.textContent = "";
+    const privateList = field("catalog-delta-private-list");
+    if (privateList) privateList.replaceChildren();
     const journal = field("catalog-write-journal");
     if (journal) journal.textContent = "";
     for (const url of activeDownloadUrls) URL.revokeObjectURL(url);

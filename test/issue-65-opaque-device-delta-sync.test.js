@@ -9,6 +9,7 @@ const os = require("node:os");
 const http = require("node:http");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
+const { sealZk1CatalogMetadataV1 } = require("../src/crypto/rootark-zk1-opaque-catalog-client-v1");
 const sourceFile = path.join(__dirname,
   "../public/client/rootark-zk1-opaque-device-delta-sync.js");
 const probeFile = path.join(__dirname, "support/issue-65-opaque-delta-browser-probe.js");
@@ -46,16 +47,34 @@ test("real Edge runs opaque delta browser contract under restrictive CSP", {
     t.skip("Edge Windows unavailable");
     return;
   }
-  const startup = "window.RootarkZk1BrowserOpaqueCatalogCommit={createClient(){}};"
+  const scope = { account_id: crypto.randomBytes(16),
+    compartment_id: crypto.randomBytes(16), keyring_id: crypto.randomBytes(16) };
+  const metadataKey = crypto.randomBytes(32);
+  const objectId = crypto.randomBytes(16).toString("base64url");
+  const name = "edge-local-only-filename.txt";
+  const sealed = await sealZk1CatalogMetadataV1({ scope, objectId,
+    revision: 1, epoch: 1, metadataKey, name });
+  const fixture = { scope: Object.fromEntries(Object.entries(scope)
+    .map(([key, value]) => [key, value.toString("base64url")])),
+  objectId, name, ciphertextBase64: sealed.toString("base64url"),
+  metadataKeyBase64: metadataKey.toString("base64url") };
+  const startup = "window.__deltaCryptoFixture=" + JSON.stringify(fixture) + ";"
     + "window.RootarkZk1ProtectedHttpClient={signProtectedContentOperation(){}};"
     + "window.RootarkZk1CiphertextRoot={computeCiphertextRoot(){}};";
   const html = "<!doctype html><meta charset='utf-8'>"
     + "<output id='probe-result'>PENDING</output>"
     + "<script src='/bootstrap.js'></script>"
+    + "<script src='/writer.js'></script><script src='/writer-bridge.js'></script>"
     + "<script src='/client.js'></script><script src='/probe.js'></script>";
   const server = http.createServer((request, response) => {
     response.setHeader("Content-Security-Policy", "default-src 'none'; script-src 'self'");
     const content = request.url === "/" ? html : request.url === "/bootstrap.js" ? startup
+      : request.url === "/writer-bridge.js"
+        ? "window.RootarkZk1BrowserOpaqueCatalogCommit={"
+          + "openMetadata:window.RootarkZk1BrowserOpaqueCatalogCommit.openMetadata,"
+          + "createClient(){}};"
+      : request.url === "/writer.js" ? fs.readFileSync(path.join(__dirname,
+        "../public/client/rootark-zk1-browser-opaque-catalog-commit.js"), "utf8")
       : request.url === "/client.js" ? fs.readFileSync(sourceFile, "utf8")
         : request.url === "/probe.js" ? fs.readFileSync(probeFile, "utf8") : null;
     response.writeHead(content === null ? 404 : 200, {
@@ -122,7 +141,7 @@ test("real Edge CSP exposes normal authenticated manual delta import, but no unc
         await sleep(30);
       }
       if(!dlg?.open)throw Error("NOT_AUTHENTICATED_ENTRY");
-      const names=["catalog-delta-anchor","catalog-delta-pull",
+      const names=["catalog-delta-anchor","catalog-delta-list","catalog-delta-pull",
         "catalog-delta-import","catalog-delta-publish"];
       for(const name of names){
         if(!dlg.querySelector('[data-zk1-action="'+name+'"]'))

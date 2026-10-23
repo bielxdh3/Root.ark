@@ -139,7 +139,7 @@ async function harness() {
       if (!name) return null;
       if (!controls.has(name)) {
         const control = { files: [], checked: false, textContent: "", _value: "",
-          children: [], replaceChildren() { this.children = []; },
+          children: [], replaceChildren(...children) { this.children = children; },
           append(node) { this.children.push(node); } };
         Object.defineProperty(control, "value", {
           get() { return this._value; },
@@ -162,6 +162,7 @@ async function harness() {
       if (kind === "dialog") return dialog;
       if (kind === "script") return {};
       if (kind === "p") return { textContent: "" };
+      if (kind === "div") return { textContent: "" };
       if (kind === "button") return {
         addEventListener(_event, callback) { this.click = callback; },
         remove() { window.button = null; },
@@ -174,6 +175,9 @@ async function harness() {
         remove() {},
       };
       throw new Error("UNEXPECTED_ELEMENT_" + kind);
+    },
+    createDocumentFragment() {
+      return { children: [], appendChild(node) { this.children.push(node); } };
     },
     head: { append(script) { script.onload?.(); } },
     body: { append() {} },
@@ -815,6 +819,7 @@ test("opaque delta import is an explicit normal-browser authenticated action, no
   assert.match(page.dialog.innerHTML, /data-zk1-action="catalog-delta-anchor"/);
   assert.match(page.dialog.innerHTML, /data-zk1-action="catalog-delta-import"/);
   assert.match(page.dialog.innerHTML, /data-zk1-action="catalog-delta-publish"/);
+  assert.match(page.dialog.innerHTML, /data-zk1-action="catalog-delta-list"/);
   assert.match(page.dialog.innerHTML, /data-zk1-field="catalog-delta-opt-in"/);
   assert.doesNotMatch(page.dialog.innerHTML, /sync-v2 genérico.*habilitado/);
 });
@@ -834,7 +839,7 @@ async function configureDeltaPage(page) {
   const portable = { format: "rootark-zk1-opaque-device-delta/v1",
     fromSequence: 0, toSequence: 1, catalogDigest: encode(crypto.randomBytes(32)),
     additions: [item] };
-  let anchorCalls = 0, deltaCalls = 0, mutationCalls = 0, resolveDelta = null;
+  let anchorCalls = 0, deltaCalls = 0, mutationCalls = 0, listingCalls = 0, resolveDelta = null;
   let pendingDelta = false, uncertainCommit = false;
   const used = [];
   page.window.RootarkZk1OpaqueDeviceDeltaSync = {
@@ -859,6 +864,18 @@ async function configureDeltaPage(page) {
           return { fromSequence: 0, toSequence: 1,
             catalogDigest: portable.catalogDigest, additions: [item],
             plaintextMetadataExposed: false, productionDurabilityProven: false };
+        },
+        async readPrivateListing(previous, metadataKey) {
+          listingCalls++;
+          assert.equal(previous.head.digest, floor);
+          assert.equal(metadataKey.extractable, false);
+          assert.deepEqual(metadataKey.usages, ["decrypt"]);
+          assertLive();
+          return { head: { sequence: 0, digest: floor },
+            entries: [{ objectId: item.objectId, revision: 1, epoch: 1,
+              name: "<private-name>&.txt" }],
+            independentlySignedCatalog: true, plaintextSentToServer: false,
+            authorizesMutation: false };
         },
         async commitVersion(args) {
           mutationCalls++;
@@ -889,12 +906,35 @@ async function configureDeltaPage(page) {
       page.file("catalog-cas-key", casKeyBytes);
     },
     counts: () => ({ anchorCalls, deltaCalls, mutationCalls }),
+    getListingCalls: () => listingCalls,
     stall() { pendingDelta = true; },
     loseCatalogAck() { uncertainCommit = true; },
     release() { resolveDelta?.(); },
     async waitForDelta() { await tickUntil(() => Boolean(resolveDelta)); },
   };
 }
+
+test("manual signed-catalog private listing stays in text nodes and clears on logout", async () => {
+  const page = await harness();
+  const setup = await configureDeltaPage(page);
+  page.file("catalog-write-key", crypto.randomBytes(32));
+  page.click("catalog-delta-list");
+  await page.denied();
+  assert.equal(setup.getListingCalls(), 0, "no offline CAS anchor means no metadata decryption");
+  setup.reimportOfflineFiles();
+  page.click("catalog-delta-anchor");
+  await tickUntil(() => page.field("status").textContent.includes("Piso independente CAS #0"));
+  page.file("catalog-write-key", crypto.randomBytes(32));
+  page.click("catalog-delta-list");
+  await tickUntil(() => page.field("status").textContent.includes("Metadados autenticados"));
+  const items = page.field("catalog-delta-private-list").children;
+  assert.equal(items.length, 1);
+  assert.equal(items[0].children[0].textContent, "<private-name>&.txt · revisão 1");
+  assert.equal(page.downloads.length, 0);
+  assert.equal(setup.getListingCalls(), 1);
+  page.logout();
+  assert.deepEqual(page.field("catalog-delta-private-list").children, []);
+});
 
 test("manual opaque delta anchor blocks absent consent and wrong independent CAS key pin", async () => {
   const page = await harness();

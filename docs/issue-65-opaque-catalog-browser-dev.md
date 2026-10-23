@@ -45,3 +45,22 @@ currently active owner-authorized device must re-endorse the complete inventory
 with independent CAS before normal browsing resumes. The UI never silently
 accepts an old, revoked signer or lets unpinned network state increase the
 local head.
+
+## Manual private listing on a receiving device (DEV)
+
+The separate manual delta control plane can now list filenames **only in the
+receiving browser**, after the user opts in, imports independently pinned
+owner/witness/CAS trust, anchors an exact signed catalog head and imports a
+32-byte AES-GCM metadata key. It performs a **fresh complete signed catalog
+readback** and requires the exact previously anchored sequence/digest before
+decrypting any row. Each AES-GCM authentication tag binds the scope, opaque
+object ID, revision and epoch. A wrong key, altered row, stale/forked head,
+revocation or logout refuses the entire listing, not a partially trusted list.
+The key is imported non-extractable for decrypt only. Names are placed into DOM
+text nodes, cleared on logout/close and before other delta operations, and are
+never serialized into the exported opaque delta or any Root.ark HTTP request.
+
+This is **not** automatic sync, durable server-side application of names,
+change conflict resolution, rename/move/trash, or proof of cloud persistence.
+Only the independently signed, append-only opaque catalog is inspected; no
+unknown legacy corpus or remote deletion becomes authorized.
