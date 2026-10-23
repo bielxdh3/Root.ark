@@ -45,6 +45,40 @@ function assertFullCiphertextGet(response, provider, expectedBytes) {
   }
 }
 
+// A bounded ZK GET is a security assertion about the *selected* destination,
+// not permission to follow a local junction/symlink into an unrelated tree.
+// The caller creates a private cache directory first; unlike legacy downloads,
+// missing parents are refused rather than implicitly created through links.
+function pinBoundedDownloadParent(localPath) {
+  if (typeof localPath !== "string" || !path.isAbsolute(localPath)) {
+    throw cloudError("provider_error", "Bounded ciphertext destination must be absolute");
+  }
+  const parent = path.dirname(path.resolve(localPath));
+  const root = path.parse(parent).root;
+  const segments = path.relative(root, parent).split(path.sep).filter(Boolean);
+  const pinned = [];
+  let current = root;
+  for (const segment of ["", ...segments]) {
+    if (segment) current = path.join(current, segment);
+    const stat = fs.lstatSync(current, { bigint: true });
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw cloudError("provider_error", "Bounded ciphertext destination has a redirected parent");
+    }
+    pinned.push({ current, dev: stat.dev, ino: stat.ino });
+  }
+  const guard = () => {
+    for (const item of pinned) {
+      const stat = fs.lstatSync(item.current, { bigint: true });
+      if (!stat.isDirectory() || stat.isSymbolicLink()
+        || stat.dev !== item.dev || stat.ino !== item.ino) {
+        throw cloudError("provider_error", "Bounded ciphertext destination parent changed");
+      }
+    }
+  };
+  guard();
+  return guard;
+}
+
 function createCloudStorage(options = {}) {
   const provider = String(options.provider || "local").toLowerCase();
   const prefix = normalizePrefix(options.prefix || "rootark");
@@ -405,7 +439,8 @@ function createCloudStorage(options = {}) {
     }
     const cloudKey = objectKey(folderId, fileName, area);
     const parentPath = path.dirname(localPath);
-    fs.mkdirSync(parentPath, { recursive: true });
+    const guardParent = constraints ? pinBoundedDownloadParent(localPath) : null;
+    if (!constraints) fs.mkdirSync(parentPath, { recursive: true });
     const stagingDirectory = fs.mkdtempSync(path.join(parentPath, ".rootark-cloud-cache-"));
     const stagedPath = path.join(stagingDirectory, path.basename(localPath));
     const boundedController = constraints ? new AbortController() : null;
@@ -454,6 +489,7 @@ function createCloudStorage(options = {}) {
         await pipeline(input, fs.createWriteStream(stagedPath));
       }
       if (signal?.aborted) throw cloudError("provider_error", "Bounded cloud readback deadline exceeded");
+      if (guardParent) guardParent();
       if (typeof canPublish === "function" && !canPublish()) return false;
       if (constraints) {
         // For a ZK verification readback the target MUST be exactly the bytes
@@ -461,6 +497,11 @@ function createCloudStorage(options = {}) {
         // be able to win an exists/rename race and have its own bytes falsely
         // attributed to this GET. Hardlink publication is atomic NO_REPLACE
         // on the same filesystem (staging is under the destination parent).
+        guardParent();
+        const stage = fs.lstatSync(stagedPath, { bigint: true });
+        if (!stage.isFile() || stage.isSymbolicLink() || stage.nlink !== 1n) {
+          throw cloudError("provider_error", "Bounded ciphertext staging is not a private file");
+        }
         fs.linkSync(stagedPath, localPath);
       } else {
         if (fs.existsSync(localPath)) return true;
@@ -473,7 +514,14 @@ function createCloudStorage(options = {}) {
     } finally {
       if (boundedDeadline) clearTimeout(boundedDeadline);
       if (externalSignal) externalSignal.removeEventListener("abort", cancel);
-      fs.rmSync(stagingDirectory, { recursive: true, force: true });
+      // A parent replaced by a junction after the provider call must not turn
+      // cache cleanup into a recursive delete of an unrelated directory.
+      // Leave the original disposable stage inert if its parent moved.
+      let cleanupSafe = true;
+      if (guardParent) {
+        try { guardParent(); } catch (_) { cleanupSafe = false; }
+      }
+      if (cleanupSafe) fs.rmSync(stagingDirectory, { recursive: true, force: true });
     }
   }
   async function remove(folderId, fileName, area = "uploads") {

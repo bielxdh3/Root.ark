@@ -106,6 +106,88 @@ test("download cleans up a partial cache file after a provider stream failure", 
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("bounded ZK cloud GET refuses a junction/symlink cache parent without publishing outside the selected workspace", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-cloud-parent-"));
+  const external = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-cloud-external-"));
+  t.after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(external, { recursive: true, force: true });
+  });
+  const link = path.join(root, "cache");
+  try {
+    fs.symlinkSync(external, link, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) {
+      return t.skip("directory symlink/junction unavailable");
+    }
+    throw error;
+  }
+  let providerGets = 0;
+  const bytes = Buffer.from("ciphertext");
+  const cloud = createCloudStorage({
+    provider: "s3", s3: { bucket: "disposable" },
+    createS3Client: async () => ({ async send() {
+      providerGets++;
+      return { $metadata: { httpStatusCode: 200 },
+        ContentLength: bytes.length, Body: Readable.from([bytes]) };
+    } }),
+  });
+  const destination = path.join(link, "outside.ct");
+  await assert.rejects(cloud.download("opaque", "version.ct", destination, "uploads",
+    () => true, { maxBytes: bytes.length }), { code: "provider_error" });
+  assert.equal(fs.existsSync(path.join(external, "outside.ct")), false,
+    "untrusted cache parent redirected a successful signed ciphertext GET outside workspace");
+  assert.equal(providerGets, 0, "unsafe cache path must fail before cloud access");
+});
+
+test("bounded GET rejects parent replacement before NO_REPLACE and never cleans a foreign staging directory", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-cloud-race-"));
+  const external = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-cloud-race-foreign-"));
+  t.after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(external, { recursive: true, force: true });
+  });
+  const parent = path.join(root, "cache");
+  const relocated = path.join(root, "old-cache");
+  fs.mkdirSync(parent);
+  const payload = Buffer.from("ciphertext");
+  const cloud = createCloudStorage({
+    provider: "s3", s3: { bucket: "disposable" },
+    createS3Client: async () => ({ async send() {
+      return { $metadata: { httpStatusCode: 200 }, ContentLength: payload.length,
+        Body: Readable.from([payload]) };
+    } }),
+  });
+  let sentinel;
+  let swapped = false;
+  const target = path.join(parent, "archive.ct");
+  await assert.rejects(cloud.download("opaque", "version.ct", target, "uploads", () => {
+    const staged = fs.readdirSync(parent).find((name) => name.startsWith(".rootark-cloud-cache-"));
+    assert.ok(staged);
+    fs.renameSync(parent, relocated);
+    const foreignStaging = path.join(external, staged);
+    fs.mkdirSync(foreignStaging);
+    sentinel = path.join(foreignStaging, "DO-NOT-REMOVE.txt");
+    fs.writeFileSync(sentinel, "foreign survivor");
+    try {
+      fs.symlinkSync(external, parent, process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) {
+        fs.renameSync(relocated, parent);
+        return false;
+      }
+      throw error;
+    }
+    swapped = true;
+    return true;
+  }, { maxBytes: payload.length }), { code: "provider_error" });
+  if (swapped) {
+    assert.equal(fs.readFileSync(sentinel, "utf8"), "foreign survivor",
+      "cleanup followed an attacker-swapped parent junction and removed an unrelated file");
+    assert.equal(fs.existsSync(path.join(external, "archive.ct")), false);
+  }
+});
+
 test("Google Drive escapes lookup values and uses a deterministic duplicate", async () => {
   const queries = [];
   const key = "rootark/uploads/folder'one/safe.txt";
