@@ -194,6 +194,174 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
     resolveCatalogSigner: async () => signerA,
     checkpointPrivateKey: checkpoint.privateKey, issuedAt: now() });
   const oldCheckpoint = checkpoint128.checkpointDigest;
+  // Real mTLS A129→B130 canary: A approves #129 before its epoch revocation;
+  // B approves #130 afterward. A's approval must stay historically valid.
+  {
+    const retained = { headManifest: state.headManifest,
+      transitions: state.transitions.slice(),
+      verifiedHistory: state.verifiedHistory,
+      packageEnvelopes: state.packageEnvelopes.slice(),
+      epochKeys: state.epochKeys.slice(),
+      usedIdentifiers: new Set(state.usedIdentifiers) };
+    const options = { scope, checkpointPublicKey: checkpoint.publicKey,
+      casSignerPublicKey: v2CasKeys.publicKey,
+      floorSignerPublicKey: v2FloorKeys.publicKey,
+      ownerPublicKey: owner.publicKey, ownerTrust: trust,
+      baseDigest: oldDigest, baseCheckpoint: oldCheckpoint };
+    const caFloor = new OpaqueCheckpointV2Authority(path.join(dir, "canary-floor.sqlite"),
+      { ...options, role: "FLOOR", bootstrapNew: true,
+        signingPrivateKey: v2FloorKeys.privateKey });
+    const caCas = new OpaqueCheckpointV2Authority(path.join(dir, "canary-cas.sqlite"),
+      { ...options, role: "CAS", bootstrapNew: true,
+        signingPrivateKey: v2CasKeys.privateKey });
+    const endpoints = [
+      createOpaqueCheckpointV2HttpsServer({ ledger: caFloor,
+        tlsKey: read("v2floor.key"), tlsCert: read("v2floor.pem"),
+        clientCa: read("ca.pem"), clientFingerprint256: x509("client.pem") }),
+      createOpaqueCheckpointV2HttpsServer({ ledger: caCas,
+        tlsKey: read("v2cas.key"), tlsCert: read("v2cas.pem"),
+        clientCa: read("ca.pem"), clientFingerprint256: x509("client.pem") }),
+    ];
+    try {
+      for (const server of endpoints)
+        await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const [floorClient, casClient] = endpoints.map((server, index) =>
+        createOpaqueCheckpointV2HttpsClient({
+          endpoint: "https://127.0.0.1:" + server.address().port + "/",
+          ca: read("ca.pem"), clientKey: read("client.key"),
+          clientCert: read("client.pem"), scope,
+          casPublicKey: v2CasKeys.publicKey, floorPublicKey: v2FloorKeys.publicKey,
+          serverFingerprint256: x509(index ? "v2cas.pem" : "v2floor.pem"),
+          authorityPublicKey: index ? v2CasKeys.publicKey : v2FloorKeys.publicKey,
+        }));
+      const coordinator = createOpaqueCheckpointV2Coordinator({
+        floorClient, casClient, v1CasClient: v1Cas, v1FloorClient: v1Floor,
+        trustedScope: scope, expectedV1Digest: oldDigest,
+        expectedV1Checkpoint: oldCheckpoint });
+      let prior = { sequence: 128, digest: oldDigest,
+        checkpointDigest: oldCheckpoint, operationId: Buffer.alloc(32) };
+      const signedCanary = [];
+      async function publishBy(sequence, device, publishNow = true) {
+        const rawHeader = Buffer.from(await z.encodeDeterministic({
+          type: "rootark-zk1-opaque-catalog/v1", ...scope,
+          sequence, previous_digest: prior.digest,
+          manifest_revision: Number(state.headManifest.revision),
+          manifest_digest: await ownerManifest.recoveryManifestDigestV2(state.headManifest),
+          epoch: Number(state.headManifest.current_epoch),
+          signer_device_id: device.device_id, total_count: 0,
+          page_digests: [], issued_at: now() }));
+        const signature = crypto.sign(null, Buffer.concat([HEAD_DOMAIN, rawHeader]), keys(device));
+        const record = { header: rawHeader, signature, sequence, page_bodies: [] };
+        const archive = await createAuthenticatedOpaqueCatalogArchiveV2({
+          scope, records: [record], previousSequence: prior.sequence,
+          previousDigest: prior.digest, previousCheckpointDigest: prior.checkpointDigest,
+          resolveCatalogSigner: async () => keyFromDevice(device),
+          checkpointPrivateKey: checkpoint.privateKey, issuedAt: now() });
+        const operationId = crypto.randomBytes(32);
+        const approval = await signCheckpointOwnerApprovalV2({
+          type: "rootark-opaque-checkpoint-remote-owner-approval/v2", ...scope,
+          operation_id: operationId, checkpoint_digest: archive.checkpointDigest,
+          previous_sequence: prior.sequence, previous_digest: prior.digest,
+          previous_checkpoint_digest: prior.checkpointDigest,
+          final_sequence: sequence, final_digest: hd(rawHeader, signature),
+          cas_signer_fp: fp(v2CasKeys.publicKey), floor_signer_fp: fp(v2FloorKeys.publicKey),
+          checkpoint_signer_fp: fp(checkpoint.publicKey), issued_at: now(),
+        }, keys(device));
+        const predecessor = sequence === 129 ? {} :
+          await coordinator.predecessorEndorsements(signedCanary.at(-1).raw);
+        const raw = Buffer.from(await z.encodeDeterministic({
+          type: "rootark-opaque-checkpoint-remote-intent/v2", ...scope,
+          operation_id: operationId, checkpoint_bytes: archive.checkpointBytes,
+          checkpoint_signature: archive.checkpointSignature, records: [record],
+          previous_sequence: prior.sequence, previous_digest: prior.digest,
+          previous_checkpoint_digest: prior.checkpointDigest,
+          owner_approval: approval.raw, owner_signature: approval.signature,
+          owner_evidence: await evidence(), ...predecessor }));
+        const previous = prior;
+        if (publishNow) await coordinator.publish(raw);
+        prior = { sequence, digest: hd(rawHeader, signature),
+          checkpointDigest: archive.checkpointDigest, operationId };
+        signedCanary.push({ raw, previous });
+      }
+      await publishBy(129, deviceA);
+      await fixtures.appendDeviceRevocation(state, deviceA.device_id,
+        undefined, deviceB.device_id);
+      await publishBy(130, deviceB, false);
+      assert.equal((await casClient.head()).sequence, 129);
+      assert.equal((await floorClient.head()).sequence, 129);
+      const endorsementKey = crypto.generateKeyPairSync("ed25519");
+      const currentDigest = await ownerManifest.recoveryManifestDigestV2(state.headManifest);
+      const grantFields = ["schema", "account_id", "compartment_id", "keyring_id",
+        "device_id", "authorization_key_id", "authorization_public_key",
+        "manifest_revision", "manifest_digest", "current_epoch", "enrolled_epoch",
+        "revoked_at_epoch"];
+      const grant = { schema: "rootark-zk1-browser-owner-device-grant/v1",
+        ...Object.fromEntries(Object.entries(scope).map(([name, value]) =>
+          [name, encoded(value)])), device_id: deviceB.device_id,
+        authorization_key_id: encoded(deviceB.authorization_key_id),
+        authorization_public_key: encoded(deviceB.authorization_public_key),
+        manifest_revision: Number(state.headManifest.revision),
+        manifest_digest: encoded(currentDigest),
+        current_epoch: Number(state.headManifest.current_epoch),
+        enrolled_epoch: Number(deviceB.enrolled_epoch), revoked_at_epoch: null };
+      grant.signature = encoded(crypto.sign(null, Buffer.concat([
+        Buffer.from("Root.ark/zk-1/browser-owner-device-grant/v1\0"),
+        Buffer.from(JSON.stringify(Object.fromEntries(grantFields.map((field) =>
+          [field, grant[field]]))))]), endorsementKey.privateKey));
+      const endorser = async (item) => issueVerifiedHistoricalSignerEndorsement({
+        signedIntent: item.raw,
+        inspectorOptions: { ...options, ownerKey: owner.publicKey,
+          checkpointKey: checkpoint.publicKey,
+          casKey: v2CasKeys.publicKey, floorKey: v2FloorKeys.publicKey,
+          casFp: fp(v2CasKeys.publicKey), floorFp: fp(v2FloorKeys.publicKey),
+          checkpointFp: fp(checkpoint.publicKey),
+          baseDigest: item.previous.digest,
+          baseCheckpoint: item.previous.checkpointDigest,
+          previousOperationId: item.previous.operationId },
+        trustedOwnerPrivateKey: endorsementKey.privateKey,
+        independentlyPinnedOwnerSpkiSha256: fp(endorsementKey.publicKey),
+        currentSignedDeviceGrant: grant,
+        independentlyPinnedCurrentOwnerHead: {
+          revision: Number(state.headManifest.revision),
+          digest: currentDigest, epoch: Number(state.headManifest.current_epoch) },
+      });
+      const [grantA, grantB] = await Promise.all(signedCanary.map(endorser));
+      assert.equal(grantA.approval_signer_public_key, encoded(deviceA.authorization_public_key));
+      assert.equal(grantB.approval_signer_public_key, encoded(deviceB.authorization_public_key));
+      const recipient = new Zk1OpaqueCheckpointV2Client({
+        journalPath: path.join(dir, "canary-recipient.sqlite"), bootstrapNew: true,
+        trustedScope: scope, expectedV1Digest: oldDigest,
+        expectedV1Checkpoint: oldCheckpoint,
+        v1CasClient: v1Cas, v1FloorClient: v1Floor, casClient, floorClient,
+        checkpointPublicKey: checkpoint.publicKey, ownerPublicKey: owner.publicKey,
+        catalogPublicKey: signerB, ownerTrust: trust,
+        signerGrantRootPublicKey: endorsementKey.publicKey });
+      try {
+        await recipient.importSignedIntent(signedCanary[0].raw, { signerGrant: grantA });
+        await assert.rejects(recipient.publishSignedIntent(signedCanary[1].raw, {
+          signerGrant: { ...grantB, approval_signer_public_key:
+            encoded(deviceA.authorization_public_key) } }),
+        /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+        "the current signer cannot be replaced in the owner-endorsed grant");
+        assert.equal((await recipient.publishSignedIntent(signedCanary[1].raw, {
+          signerGrant: grantB })).sequence, 130,
+        "real remote B130 signed intent is admitted despite stale local owner pin A129");
+        assert.equal((await casClient.head()).sequence, 130);
+        assert.equal((await floorClient.head()).sequence, 130);
+        assert.equal((await recipient.read()).sequence, 130);
+      } finally { recipient.close(); }
+    } finally {
+      for (const server of endpoints)
+        if (server.listening) { server.closeAllConnections(); server.close(); }
+      caFloor.close(); caCas.close();
+      state.headManifest = retained.headManifest;
+      state.transitions = retained.transitions;
+      state.verifiedHistory = retained.verifiedHistory;
+      state.packageEnvelopes = retained.packageEnvelopes;
+      state.epochKeys = retained.epochKeys;
+      state.usedIdentifiers = retained.usedIdentifiers;
+    }
+  }
   await fixtures.appendDeviceEnrollment(state, 2);
   const deviceC = state.headManifest.devices.find((d) => d.device_id === "trusted-2");
   assert.ok(deviceC && deviceC.revoked_at_epoch === null);

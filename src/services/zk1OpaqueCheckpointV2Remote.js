@@ -380,10 +380,10 @@ async function inspectIntent(raw, opts, { freshOwner = true, historicalOwner = f
   if (freshOwner || historicalOwner) {
     const trusted = await verifyOwnerRooted(body, { ...opts,
       checkpointDigest, finalDigest }, { historical: !freshOwner });
-    // The independently witnessed recovery manifest authenticates the signer
-    // at this sequence. A caller-provided cached key may only corroborate it;
-    // historical inspectors must never require or trust an unproven cache.
     signer = trusted.signer;
+    // Independent owner-history + witness evidence determines the signer.
+    // A cached SQLite key can only corroborate that independent identity;
+    // offline historical issuers need no cache and must not trust a supplied key.
     if (historicalOwner && opts.cachedSigner !== undefined
       && !same(signer.export({ type: "spki", format: "der" }),
         key(opts.cachedSigner).export({ type: "spki", format: "der" }))) fail();

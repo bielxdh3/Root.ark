@@ -438,7 +438,10 @@ class Zk1OpaqueCheckpointV2Client {
       previousOperationId: previous.operationId,
     }, { freshOwner });
     if (grant && (!equal(grant.signer.export({ type: "spki", format: "der" }),
-      inspected.signerSpki) || (freshOwner && !equal(fp(grant.approvalSigner), fp(t.ownerKey))))) deny();
+      inspected.signerSpki)
+      || (freshOwner && (!inspected.ownerApprovalSignerSpki
+        || !equal(grant.approvalSigner.export({ type: "spki", format: "der" }),
+          bytes(inspected.ownerApprovalSignerSpki, 44)))))) deny();
     // Historical reads cannot demand a fresh witness from a device that was
     // revoked AFTER publication. Preserve the signed owner approval binding.
     const approval = await z.decodeDeterministic(inspected.body.owner_approval);
