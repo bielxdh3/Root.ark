@@ -76,8 +76,10 @@ function refuse() {
 }
 function fileIdentity(file) {
   try {
-    const s = fs.lstatSync(file);
-    if (!s.isFile() || s.isSymbolicLink() || s.nlink !== 1) refuse();
+    // NTFS (and other 64-bit filesystems) can expose different dev/ino values
+    // which collide after conversion to Number. Never round file identity.
+    const s = fs.lstatSync(file, { bigint: true });
+    if (!s.isFile() || s.isSymbolicLink() || s.nlink !== 1n) refuse();
     return s;
   } catch (_) { refuse(); }
 }

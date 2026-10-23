@@ -54,6 +54,30 @@ function makeFixture(t) {
 function read(f) {
   return inspect({ optIn: true, databasePath: f.databasePath, persistence: MODE });
 }
+
+test("preflight refuses a 64-bit inode swap concealed by Number rounding", (t) => {
+  const fixture = makeFixture(t);
+  const original = fs.lstatSync;
+  const firstId = 9007199254740992n;
+  const secondId = 9007199254740993n;
+  assert.equal(Number(firstId), Number(secondId), "test requires a Number collision");
+  let observations = 0;
+  fs.lstatSync = function (file, options) {
+    const stat = original.call(fs, file, options);
+    if (file === fixture.databasePath) {
+      observations++;
+      const id = observations === 1 ? firstId : secondId;
+      stat.ino = options?.bigint ? id : Number(id);
+    }
+    return stat;
+  };
+  try {
+    assert.throws(() => read(fixture), /ZK_LIVE_LEGACY_INVENTORY_UNAVAILABLE/);
+    assert.equal(observations, 2, "the check must inspect identity on both sides of read");
+  } finally {
+    fs.lstatSync = original;
+  }
+});
 function ensureNotLeaked(value, f) {
   const serialized = JSON.stringify(value);
   for (const secret of [...SENSITIVE, f.root, f.databasePath])
