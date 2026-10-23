@@ -21,6 +21,11 @@ const ownerHistory = require("../crypto/rootark-zk-recovery-history-v2");
 const ownerManifest = require("../crypto/rootark-zk-recovery-manifest-v2");
 const { inspectVerifiedWitnessFreshHeadV1 } =
   require("../crypto/rootark-zk-witness-head-wire-v1");
+const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } =
+  require("./zk1PrivateSqlitePath");
+const { assertSafeSqliteSidecars, requireCheckpointV2Triggers,
+  withReadonlySqliteSnapshot } =
+  require("./zk1OpaqueCheckpointV2SqliteGuard");
 
 const PREFIX = "Root.ark/zk-1/opaque-checkpoint-remote/";
 const INTENT_DOMAIN = Buffer.from(PREFIX + "intent/v2\0");
@@ -54,6 +59,66 @@ const ZERO = Buffer.alloc(32);
 // advertises FINALIZED without independently verifying a remote receipt.
 const pinnedV2Clients = new WeakSet();
 const domain = (part) => Buffer.from(PREFIX + part + "/v2\0");
+const AUTHORITY_SCHEMA = `
+        CREATE TABLE IF NOT EXISTS config(
+          marker INTEGER PRIMARY KEY CHECK(marker=1), role TEXT NOT NULL,
+          scope TEXT NOT NULL, pins BLOB NOT NULL, base_digest BLOB NOT NULL,
+          base_checkpoint BLOB NOT NULL, genesis_digest BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS transitions(
+          sequence INTEGER PRIMARY KEY CHECK(sequence=129),
+          intent_hash BLOB NOT NULL, operation_id BLOB NOT NULL UNIQUE,
+          checkpoint_digest BLOB NOT NULL UNIQUE, final_digest BLOB NOT NULL,
+          intent BLOB NOT NULL, signer_spki BLOB NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('PREPARED','CAS_COMMITTED','FINALIZED')),
+          floor_prepare BLOB, cas_commit BLOB, floor_finalize BLOB,
+          CHECK (
+            (state='PREPARED' AND floor_prepare IS NULL
+              AND cas_commit IS NULL AND floor_finalize IS NULL)
+            OR (state='CAS_COMMITTED' AND floor_prepare IS NOT NULL
+              AND cas_commit IS NULL AND floor_finalize IS NULL)
+            OR (state='FINALIZED' AND (
+              (cas_commit IS NOT NULL AND floor_prepare IS NULL
+                AND floor_finalize IS NULL)
+              OR (floor_finalize IS NOT NULL AND floor_prepare IS NOT NULL
+                AND cas_commit IS NULL)))
+          )
+        );
+        CREATE TRIGGER IF NOT EXISTS no_config_change
+          BEFORE UPDATE ON config BEGIN SELECT RAISE(ABORT,'CONFIG_LOCKED'); END;
+        CREATE TRIGGER IF NOT EXISTS no_config_delete
+          BEFORE DELETE ON config BEGIN SELECT RAISE(ABORT,'CONFIG_LOCKED'); END;
+        CREATE TRIGGER IF NOT EXISTS no_transition_delete
+          BEFORE DELETE ON transitions BEGIN SELECT RAISE(ABORT,'TRANSITION_LOCKED'); END;
+        CREATE TRIGGER IF NOT EXISTS no_transition_replace
+          BEFORE UPDATE ON transitions WHEN
+            OLD.sequence!=NEW.sequence OR OLD.intent_hash!=NEW.intent_hash
+            OR OLD.operation_id!=NEW.operation_id
+            OR OLD.checkpoint_digest!=NEW.checkpoint_digest
+            OR OLD.final_digest!=NEW.final_digest
+            OR OLD.intent!=NEW.intent OR OLD.signer_spki!=NEW.signer_spki
+          BEGIN SELECT RAISE(ABORT,'TRANSITION_LOCKED'); END;
+        CREATE TRIGGER IF NOT EXISTS no_transition_downgrade
+          BEFORE UPDATE ON transitions WHEN
+            OLD.state='FINALIZED' OR NEW.state!='FINALIZED'
+            OR ((SELECT role FROM config WHERE marker=1)='FLOOR'
+              AND (OLD.state!='PREPARED'
+                OR OLD.cas_commit IS NOT NULL OR NEW.cas_commit IS NULL
+                OR OLD.floor_prepare IS NOT NEW.floor_prepare
+                OR OLD.floor_finalize IS NOT NEW.floor_finalize))
+            OR ((SELECT role FROM config WHERE marker=1)='CAS'
+              AND (OLD.state!='CAS_COMMITTED'
+                OR OLD.floor_finalize IS NOT NULL OR NEW.floor_finalize IS NULL
+                OR OLD.floor_prepare IS NOT NEW.floor_prepare
+                OR OLD.cas_commit IS NOT NEW.cas_commit))
+          BEGIN SELECT RAISE(ABORT,'MONOTONIC_CHECKPOINT'); END;
+      `;
+const AUTHORITY_TRIGGERS = [
+  ["no_config_change", "config"], ["no_config_delete", "config"],
+  ["no_transition_delete", "transitions"],
+  ["no_transition_replace", "transitions"],
+  ["no_transition_downgrade", "transitions"],
+];
 
 function fail(code = "ZK_CHECKPOINT_V2_UNAVAILABLE") {
   const error = new Error(code); error.code = code; throw error;
@@ -117,6 +182,19 @@ function fileSecurity(filename, bootstrapNew) {
       | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
     fs.closeSync(fd);
   }
+}
+function verifyAuthorityIdentity(db, { role, scopeText, allPins, v1Digest,
+  v1Checkpoint, genesisDigest }) {
+  requireCheckpointV2Triggers(db, AUTHORITY_SCHEMA, AUTHORITY_TRIGGERS, fail);
+  const conf = db.prepare("SELECT * FROM config").all();
+  if (conf.length !== 1 || conf[0].role !== role
+    || conf[0].scope !== scopeText
+    || !Buffer.isBuffer(conf[0].pins) || !same(conf[0].pins, allPins)
+    || !Buffer.isBuffer(conf[0].base_digest) || !same(conf[0].base_digest, v1Digest)
+    || !Buffer.isBuffer(conf[0].base_checkpoint)
+    || !same(conf[0].base_checkpoint, v1Checkpoint)
+    || !Buffer.isBuffer(conf[0].genesis_digest)
+    || !same(conf[0].genesis_digest, genesisDigest)) fail();
 }
 function receiptMatches(raw, { scope, role, state, sequence, headDigest,
   checkpointDigest, operationId, casFp, floorFp, signer, nonce, fresh }) {
@@ -301,78 +379,40 @@ class OpaqueCheckpointV2Authority {
       freshWitnessHead: ownerTrust.freshWitnessHead,
     };
     if (!trust.pinnedWitness || !trust.minimumHead) fail();
+    if (typeof filename !== "string" || !path.isAbsolute(filename)
+      || !fs.existsSync(path.dirname(filename))) fail();
+    if (bootstrapNew) ensurePrivateSqliteDirectory(filename);
+    else assertPrivateSqliteFile(filename);
+    assertSafeSqliteSidecars(filename, fail);
     fileSecurity(filename, bootstrapNew);
+    const scopeText = SCOPE.map((n) => scoped[n].toString("hex")).join(":");
+    const allPins = Buffer.concat(pins);
+    const identity = { role, scopeText, allPins, v1Digest, v1Checkpoint,
+      genesisDigest: trust.genesisDigest };
+    // Read-only preflight must reject a swapped database before opening a
+    // writable handle, changing journal mode, or running any CREATE statement.
+    const pinned = bootstrapNew ? assertPrivateSqliteFile(filename)
+      : withReadonlySqliteSnapshot(filename,
+        (probe) => verifyAuthorityIdentity(probe, identity), fail,
+        MAX_WIRE * 2 + 8 * 1024 * 1024);
+    const beforeOpen = assertPrivateSqliteFile(filename);
+    if (beforeOpen.dev !== pinned.dev || beforeOpen.ino !== pinned.ino) fail();
+    assertSafeSqliteSidecars(filename, fail);
     const db = new Database(filename, { fileMustExist: true, timeout: 3000 });
     try {
+      const opened = assertPrivateSqliteFile(filename);
+      if (opened.dev !== pinned.dev || opened.ino !== pinned.ino) fail();
+      assertSafeSqliteSidecars(filename, fail);
+      if (!bootstrapNew) verifyAuthorityIdentity(db, identity);
       db.pragma("journal_mode = WAL");
       db.pragma("synchronous = FULL");
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS config(
-          marker INTEGER PRIMARY KEY CHECK(marker=1), role TEXT NOT NULL,
-          scope TEXT NOT NULL, pins BLOB NOT NULL, base_digest BLOB NOT NULL,
-          base_checkpoint BLOB NOT NULL, genesis_digest BLOB NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS transitions(
-          sequence INTEGER PRIMARY KEY CHECK(sequence=129),
-          intent_hash BLOB NOT NULL, operation_id BLOB NOT NULL UNIQUE,
-          checkpoint_digest BLOB NOT NULL UNIQUE, final_digest BLOB NOT NULL,
-          intent BLOB NOT NULL, signer_spki BLOB NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('PREPARED','CAS_COMMITTED','FINALIZED')),
-          floor_prepare BLOB, cas_commit BLOB, floor_finalize BLOB,
-          CHECK (
-            (state='PREPARED' AND floor_prepare IS NULL
-              AND cas_commit IS NULL AND floor_finalize IS NULL)
-            OR (state='CAS_COMMITTED' AND floor_prepare IS NOT NULL
-              AND cas_commit IS NULL AND floor_finalize IS NULL)
-            OR (state='FINALIZED' AND (
-              (cas_commit IS NOT NULL AND floor_prepare IS NULL
-                AND floor_finalize IS NULL)
-              OR (floor_finalize IS NOT NULL AND floor_prepare IS NOT NULL
-                AND cas_commit IS NULL)))
-          )
-        );
-        CREATE TRIGGER IF NOT EXISTS no_config_change
-          BEFORE UPDATE ON config BEGIN SELECT RAISE(ABORT,'CONFIG_LOCKED'); END;
-        CREATE TRIGGER IF NOT EXISTS no_config_delete
-          BEFORE DELETE ON config BEGIN SELECT RAISE(ABORT,'CONFIG_LOCKED'); END;
-        CREATE TRIGGER IF NOT EXISTS no_transition_delete
-          BEFORE DELETE ON transitions BEGIN SELECT RAISE(ABORT,'TRANSITION_LOCKED'); END;
-        CREATE TRIGGER IF NOT EXISTS no_transition_replace
-          BEFORE UPDATE ON transitions WHEN
-            OLD.sequence!=NEW.sequence OR OLD.intent_hash!=NEW.intent_hash
-            OR OLD.operation_id!=NEW.operation_id
-            OR OLD.checkpoint_digest!=NEW.checkpoint_digest
-            OR OLD.final_digest!=NEW.final_digest
-            OR OLD.intent!=NEW.intent OR OLD.signer_spki!=NEW.signer_spki
-          BEGIN SELECT RAISE(ABORT,'TRANSITION_LOCKED'); END;
-        CREATE TRIGGER IF NOT EXISTS no_transition_downgrade
-          BEFORE UPDATE ON transitions WHEN
-            OLD.state='FINALIZED' OR NEW.state!='FINALIZED'
-            OR ((SELECT role FROM config WHERE marker=1)='FLOOR'
-              AND (OLD.state!='PREPARED'
-                OR OLD.cas_commit IS NOT NULL OR NEW.cas_commit IS NULL
-                OR OLD.floor_prepare IS NOT NEW.floor_prepare
-                OR OLD.floor_finalize IS NOT NEW.floor_finalize))
-            OR ((SELECT role FROM config WHERE marker=1)='CAS'
-              AND (OLD.state!='CAS_COMMITTED'
-                OR OLD.floor_finalize IS NOT NULL OR NEW.floor_finalize IS NULL
-                OR OLD.floor_prepare IS NOT NEW.floor_prepare
-                OR OLD.cas_commit IS NOT NEW.cas_commit))
-          BEGIN SELECT RAISE(ABORT,'MONOTONIC_CHECKPOINT'); END;
-      `);
+      if (bootstrapNew) db.exec(AUTHORITY_SCHEMA);
       const conf = db.prepare("SELECT * FROM config").all();
-      const scopeText = SCOPE.map((n) => scoped[n].toString("hex")).join(":");
-      const allPins = Buffer.concat(pins);
       if (bootstrapNew) {
         if (conf.length || db.prepare("SELECT COUNT(*) as count FROM transitions").get().count) fail();
         db.prepare("INSERT INTO config VALUES (1,?,?,?,?,?,?)").run(role,
           scopeText, allPins, v1Digest, v1Checkpoint, trust.genesisDigest);
-      } else if (conf.length !== 1 || conf[0].role !== role
-        || conf[0].scope !== scopeText
-        || !same(conf[0].pins, allPins)
-        || !same(conf[0].base_digest, v1Digest)
-        || !same(conf[0].base_checkpoint, v1Checkpoint)
-        || !same(conf[0].genesis_digest, trust.genesisDigest)) fail();
+      }
       this.#db = db;
     } catch (error) { db.close(); throw error; }
     this.#settings = { role, signer, casKey, floorKey, checkpointKey, ownerKey,

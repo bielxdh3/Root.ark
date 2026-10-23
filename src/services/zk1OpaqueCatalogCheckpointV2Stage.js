@@ -14,6 +14,11 @@ const {
 const { isZk1OpaqueCatalogIndependentFloorClient } =
   require("./zk1OpaqueCatalogIndependentFloor");
 const { catalogCasDomain } = require("./zk1OpaqueCatalog");
+const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } =
+  require("./zk1PrivateSqlitePath");
+const { assertSafeSqliteSidecars, requireCheckpointV2Triggers,
+  withReadonlySqliteSnapshot } =
+  require("./zk1OpaqueCheckpointV2SqliteGuard");
 
 const OWNER_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-checkpoint-owner-approval/v2\0");
 const FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-independent-floor/v1\0");
@@ -33,6 +38,43 @@ const PAYLOAD_FIELDS = ["type", "checkpoint_bytes", "checkpoint_signature",
 const MAX_BUNDLE = 9 * 1024 * 1024;
 const ZERO = Buffer.alloc(32);
 const MAX_V1_SEQUENCE = 128;
+const STAGE_SCHEMA = `
+        CREATE TABLE IF NOT EXISTS stage_config (
+          scope TEXT PRIMARY KEY, owner_fp BLOB NOT NULL, checkpoint_fp BLOB NOT NULL,
+          cas_fp BLOB NOT NULL, floor_fp BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS checkpoint_stages (
+          final_sequence INTEGER PRIMARY KEY,
+          checkpoint_digest BLOB NOT NULL UNIQUE,
+          payload_digest BLOB NOT NULL, payload BLOB NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('PENDING','STAGED')),
+          cas_proof BLOB, floor_proof BLOB, cas_nonce BLOB,
+          CHECK ((status='PENDING' AND cas_proof IS NULL
+            AND floor_proof IS NULL AND cas_nonce IS NULL)
+            OR (status='STAGED' AND cas_proof IS NOT NULL
+            AND floor_proof IS NOT NULL AND cas_nonce IS NOT NULL))
+        );
+        CREATE TRIGGER IF NOT EXISTS checkpoint_stage_no_delete
+          BEFORE DELETE ON checkpoint_stages BEGIN SELECT RAISE(ABORT,'APPEND_ONLY'); END;
+        CREATE TRIGGER IF NOT EXISTS checkpoint_stage_no_rewrite
+          BEFORE UPDATE ON checkpoint_stages WHEN
+            OLD.status!='PENDING' OR NEW.status!='STAGED'
+            OR OLD.final_sequence!=NEW.final_sequence
+            OR OLD.checkpoint_digest!=NEW.checkpoint_digest
+            OR OLD.payload_digest!=NEW.payload_digest
+            OR OLD.payload!=NEW.payload
+          BEGIN SELECT RAISE(ABORT,'IMMUTABLE_CHECKPOINT'); END;
+        CREATE TRIGGER IF NOT EXISTS checkpoint_stage_config_no_update
+          BEFORE UPDATE ON stage_config BEGIN SELECT RAISE(ABORT,'PIN_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS checkpoint_stage_config_no_delete
+          BEFORE DELETE ON stage_config BEGIN SELECT RAISE(ABORT,'PIN_IMMUTABLE'); END;
+      `;
+const STAGE_TRIGGERS = [
+  ["checkpoint_stage_no_delete", "checkpoint_stages"],
+  ["checkpoint_stage_no_rewrite", "checkpoint_stages"],
+  ["checkpoint_stage_config_no_update", "stage_config"],
+  ["checkpoint_stage_config_no_delete", "stage_config"],
+];
 function fail(code = "ZK_OPAQUE_CHECKPOINT_STAGE_DENIED") {
   const error = new Error(code); error.code = code; throw error;
 }
@@ -120,6 +162,14 @@ function fileCheck(filename, bootstrapNew) {
     fs.closeSync(handle);
   }
 }
+function verifyStageIdentity(db, id, pins) {
+  requireCheckpointV2Triggers(db, STAGE_SCHEMA, STAGE_TRIGGERS, fail);
+  const saved = db.prepare("SELECT * FROM stage_config").all();
+  if (saved.length !== 1 || saved[0].scope !== id
+    || !["owner_fp", "checkpoint_fp", "cas_fp", "floor_fp"]
+      .every((field, i) => Buffer.isBuffer(saved[0][field])
+        && same(saved[0][field], pins[i]))) fail();
+}
 class Zk1OpaqueCatalogCheckpointV2Stage {
   #serialized = Promise.resolve();
   #scope;
@@ -155,52 +205,38 @@ class Zk1OpaqueCatalogCheckpointV2Stage {
     this.#casClient = casClient;
     this.#floorClient = floorClient;
     this.#resolveCatalogSigner = resolveCatalogSigner;
+    if (typeof filename !== "string" || !path.isAbsolute(filename)
+      || !fs.existsSync(path.dirname(filename))) fail();
+    if (bootstrapNew) ensurePrivateSqliteDirectory(filename);
+    else assertPrivateSqliteFile(filename);
+    assertSafeSqliteSidecars(filename, fail);
     fileCheck(filename, bootstrapNew);
+    // Validate even the trigger bodies in read-only mode before SQLite can
+    // change WAL, create a schema object, or touch the wrong authority's DB.
+    const pinned = bootstrapNew ? assertPrivateSqliteFile(filename)
+      : withReadonlySqliteSnapshot(filename,
+        (probe) => verifyStageIdentity(probe, this.#id, this.#pins), fail,
+        MAX_V1_SEQUENCE * MAX_BUNDLE + 64 * 1024 * 1024);
+    const beforeOpen = assertPrivateSqliteFile(filename);
+    if (beforeOpen.dev !== pinned.dev || beforeOpen.ino !== pinned.ino) fail();
+    assertSafeSqliteSidecars(filename, fail);
     this.db = new Database(filename, { fileMustExist: true, timeout: 3000 });
     try {
+      const opened = assertPrivateSqliteFile(filename);
+      if (opened.dev !== pinned.dev || opened.ino !== pinned.ino) fail();
+      assertSafeSqliteSidecars(filename, fail);
+      if (!bootstrapNew) verifyStageIdentity(this.db, this.#id, this.#pins);
       this.db.pragma("journal_mode = WAL");
       this.db.pragma("synchronous = FULL");
       this.db.pragma("foreign_keys = ON");
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS stage_config (
-          scope TEXT PRIMARY KEY, owner_fp BLOB NOT NULL, checkpoint_fp BLOB NOT NULL,
-          cas_fp BLOB NOT NULL, floor_fp BLOB NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS checkpoint_stages (
-          final_sequence INTEGER PRIMARY KEY,
-          checkpoint_digest BLOB NOT NULL UNIQUE,
-          payload_digest BLOB NOT NULL, payload BLOB NOT NULL,
-          status TEXT NOT NULL CHECK(status IN ('PENDING','STAGED')),
-          cas_proof BLOB, floor_proof BLOB, cas_nonce BLOB,
-          CHECK ((status='PENDING' AND cas_proof IS NULL
-            AND floor_proof IS NULL AND cas_nonce IS NULL)
-            OR (status='STAGED' AND cas_proof IS NOT NULL
-            AND floor_proof IS NOT NULL AND cas_nonce IS NOT NULL))
-        );
-        CREATE TRIGGER IF NOT EXISTS checkpoint_stage_no_delete
-          BEFORE DELETE ON checkpoint_stages BEGIN SELECT RAISE(ABORT,'APPEND_ONLY'); END;
-        CREATE TRIGGER IF NOT EXISTS checkpoint_stage_no_rewrite
-          BEFORE UPDATE ON checkpoint_stages WHEN
-            OLD.status!='PENDING' OR NEW.status!='STAGED'
-            OR OLD.final_sequence!=NEW.final_sequence
-            OR OLD.checkpoint_digest!=NEW.checkpoint_digest
-            OR OLD.payload_digest!=NEW.payload_digest
-            OR OLD.payload!=NEW.payload
-          BEGIN SELECT RAISE(ABORT,'IMMUTABLE_CHECKPOINT'); END;
-        CREATE TRIGGER IF NOT EXISTS checkpoint_stage_config_no_update
-          BEFORE UPDATE ON stage_config BEGIN SELECT RAISE(ABORT,'PIN_IMMUTABLE'); END;
-        CREATE TRIGGER IF NOT EXISTS checkpoint_stage_config_no_delete
-          BEFORE DELETE ON stage_config BEGIN SELECT RAISE(ABORT,'PIN_IMMUTABLE'); END;
-      `);
+      if (bootstrapNew) this.db.exec(STAGE_SCHEMA);
       const saved = this.db.prepare("SELECT * FROM stage_config").all();
       if (bootstrapNew) {
         if (saved.length || this.db.prepare("SELECT COUNT(*) AS n FROM checkpoint_stages").get().n) fail();
         this.db.prepare(`INSERT INTO stage_config
           (scope, owner_fp, checkpoint_fp, cas_fp, floor_fp) VALUES (?,?,?,?,?)`)
           .run(this.#id, ...this.#pins);
-      } else if (saved.length !== 1 || saved[0].scope !== this.#id
-        || !["owner_fp", "checkpoint_fp", "cas_fp", "floor_fp"]
-          .every((field, i) => same(saved[0][field], this.#pins[i]))) fail();
+      }
     } catch (error) { this.db.close(); throw error; }
   }
   async #verifyOwner(raw, signature, verified, requireFresh) {
