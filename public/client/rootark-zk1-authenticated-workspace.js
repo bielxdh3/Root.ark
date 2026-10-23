@@ -13,6 +13,7 @@
     "rootark-zk1-protected-http-client", "rootark-zk1-uncertain-put-reconciliation",
     "rootark-zk1-normal-browser-trust-floor", "rootark-zk1-normal-browser-content",
     "rootark-zk1-owner-inventory-trust-head",
+    "rootark-zk1-browser-authoritative-backup",
     "rootark-zk1-portable-file-recovery", "rootark-zk1-browser-recovery-http",
     "rootark-zk1-recoverable-workspace",
     "rootark-dev-vault-migration", "rootark-zk1-legacy-transition-receipt",
@@ -21,6 +22,7 @@
     "rootark-zk1-v2-device-approval", "rootark-zk1-v2-browser-pop",
     "rootark-zk1-v2-committed-approval",
     "rootark-zk1-keyring-portable-archive",
+    "rootark-zk1-browser-versioned-archive",
     "rootark-zk1-account-portable-recovery",
   ];
   const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -550,6 +552,10 @@
         || !window.RootarkZk1KeyringPortableArchive?.historicalRecoveryChallengeMessage) fail();
       if (!window.RootarkZk1AccountPortableRecovery?.createArchive
         || !window.RootarkZk1AccountPortableRecovery?.recoverArchive) fail();
+      if (!window.RootarkZk1BrowserAuthoritativeBackup?.verifyBackupSnapshot
+        || !window.RootarkZk1KeyringPortableArchive?.verifyVersionedAuthority
+        || !window.RootarkZk1BrowserVersionedArchive?.createArchive
+        || !window.RootarkZk1BrowserVersionedArchive?.recoverArchive) fail();
     })();
     return loadingScripts;
   }
@@ -645,6 +651,23 @@
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="archive-create">Assinar e baixar arquivo cifrado + hash separado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="archive-recover">Verificar e baixar 1–12 arquivos locais</button></div>'
       + '</fieldset>'
+      + '<fieldset><legend>Arquivo histórico de versões ZK1, com inventário assinado (DEV)</legend>'
+      + '<p class="muted">Importe o snapshot autoritativo assinado com todas as 1–12 revisões, roster assinado de UM keyring, '
+      + 'checkpoint owner-signed e assinatura CBOR do inventário. O snapshot e a lista escolhida devem conter as mesmas versões, sem omissão. '
+      + 'Hashes do snapshot, roster, signer e checkpoint devem ter origem independente. '
+      + 'A operação é local; ciphertext e CEK nunca são enviados ao servidor.</p>'
+      + '<label>Snapshot autoritativo owner-signed (.json)<input type="file" data-zk1-field="v2-snapshot" accept=".json,application/json"></label>'
+      + '<label>SHA-256 externo desse snapshot (base64url)<input data-zk1-field="v2-snapshot-pin" maxlength="43" autocomplete="off"></label>'
+      + '<label>Roster owner-signed completo desse keyring (.json)<input type="file" data-zk1-field="v2-roster" accept=".json,application/json"></label>'
+      + '<label>SHA-256 externo do roster (base64url)<input data-zk1-field="v2-roster-pin" maxlength="43" autocomplete="off"></label>'
+      + '<label>Chave pública Ed25519 SPKI DER do inventário (.der)<input type="file" data-zk1-field="v2-inventory-signer"></label>'
+      + '<label>ID da chave pública do inventário (base64url, 16 bytes)<input data-zk1-field="v2-inventory-signer-id" maxlength="22" autocomplete="off"></label>'
+      + '<label>Versões locais selecionadas (.json): {schema:"rootark-zk1-version-selection/v1",versions:[{metadata,objectRevision,ciphertextBase64,cekBase64}]}</label>'
+      + '<input type="file" data-zk1-field="v2-versions" accept=".json,application/json">'
+      + '<label><input type="checkbox" data-zk1-field="v2-opt-in"> Autorizo exportação/importação criptográfica local de todas as revisões fixadas no inventário.</label>'
+      + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="versioned-create">Exportar v2 cifrado + hash externo</button>'
+      + '<button type="button" class="button button-primary" data-zk1-action="versioned-recover">Verificar v2 e baixar ciphertext + CEKs</button></div>'
+      + '</fieldset>'
       + '<fieldset><legend>Pacote de arquivos locais selecionados de 1–8 keyrings (somente offline, DEV)</legend>'
       + '<p class="muted">Importe seleção JSON offline schema rootark-zk1-account-workspace-selection/v1: '
       + '{accountId,keyrings:[{scope,pinnedCurrentHead:{revision,digest,epoch},signedDeviceGrant,ownerHistory:[checkpoints assinados],signerKeyId,deviceId,holderSecretFile,files:[nomes locais]}]}. '
@@ -686,7 +709,7 @@
     if (!["provision", "verify-inventory", "upload", "upload-recoverable",
       "restore", "new-secret", "new-device", "answer-pop", "import-approval",
       "migrate", "migration-finalize", "migration-batch", "archive-create", "archive-recover",
-      "account-create", "account-recover"].includes(action)) return;
+      "account-create", "account-recover", "versioned-create", "versioned-recover"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -1029,6 +1052,146 @@
         }
         return;
       }
+      if (action === "versioned-create" || action === "versioned-recover") {
+        if (field("v2-opt-in")?.checked !== true || !trust.ownerHistoryCheckpoint
+          || trust.signedDeviceGrant.revoked_at_epoch !== null) fail();
+        const historicOptIn = action === "versioned-recover"
+          && field("archive-historical-opt-in")?.checked === true;
+        if (action === "versioned-create"
+          && field("archive-historical-opt-in")?.checked === true) fail();
+        const scope = Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+          .map((name) => [name, trust.signedDeviceGrant[name]]));
+        const signerKeyId = signerIdFrom64(field("owner-signer").value.trim());
+        const deviceId = field("owner-device").value.trim();
+        if (deviceId !== trust.signedDeviceGrant.device_id) fail();
+        const historical = historicOptIn
+          ? await selectedHistoricalKeyring(trust, scope, signerKeyId, deviceId, assertLive)
+          : null;
+        const backupJson = JSON.parse(decoder.decode(await fileBytes("v2-snapshot", 1,
+          13 * 1024 * 1024)));
+        const roster = JSON.parse(decoder.decode(await fileBytes("v2-roster", 1, 20000)));
+        const ownerInventoryPortable = decoder.decode(await fileBytes("inventory-portable", 1, 400000));
+        const inventorySignerSpki = await fileBytes("v2-inventory-signer", 44, 256);
+        const inventorySignerPublicKey = await crypto.subtle.importKey("spki",
+          inventorySignerSpki, "Ed25519", true, ["verify"]);
+        inventorySignerSpki.fill(0);
+        const independentRosterSha256 = from64(field("v2-roster-pin").value.trim());
+        const backupVerification = {
+          snapshot: backupJson, roster, independentRosterSha256,
+          ownerPublicKey: trust.ownerPublicKey,
+          independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+          pinnedCurrentHead: trust.pinnedCurrentHead, scope, ownerInventoryPortable,
+          independentlyPinnedInventoryCheckpointDigest: field("inventory-pin").value.trim(),
+          independentlyPinnedInventorySignerSpkiSha256: field("inventory-signer-spki").value.trim(),
+          inventorySignerPublicKey, inventorySignerKeyId:
+            signerIdFrom64(field("v2-inventory-signer-id").value.trim()),
+          signedDeviceGrant: trust.signedDeviceGrant,
+          ownerHistoryCheckpoint: trust.ownerHistoryCheckpoint,
+          previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
+          signerKeyId, deviceId,
+          independentlyPinnedBackupSha256: from64(field("v2-snapshot-pin").value.trim()),
+          nowSeconds: Math.floor(Date.now() / 1000),
+          ...(historical ? { archivalHistoryChain: historical.signedOwnerHistoryChain } : {}),
+        };
+        const versionedAuthority = await window.RootarkZk1KeyringPortableArchive.verifyVersionedAuthority({
+          backupVerification,
+          rosterVerification: { roster,
+            independentlyPinnedRosterSha256: independentRosterSha256,
+            ownerPublicKey: trust.ownerPublicKey,
+            independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+            accountId: scope.account_id },
+          otherVerifiedKeyringProofs: [],
+        });
+        assertLive();
+        if (versionedAuthority.completeRelativeToOwnerCheckpoint !== true
+          || versionedAuthority.authorizesProductionRestore !== false) fail();
+        const archiveCommon = { ownerPublicKey: trust.ownerPublicKey,
+          independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+          pinnedCurrentHead: trust.pinnedCurrentHead, scope,
+          signerKeyId, deviceId, previousOwnerHistoryProof: trust.previousOwnerHistoryProof };
+        secret = await fileBytes("secret", 32, 32);
+        if (action === "versioned-create") {
+          const raw = await fileBytes("v2-versions", 2, 12 * 1024 * 1024);
+          let chosen;
+          try { chosen = JSON.parse(decoder.decode(raw)); }
+          finally { raw.fill(0); }
+          exactly(chosen, ["schema", "versions"]);
+          if (chosen.schema !== "rootark-zk1-version-selection/v1"
+            || !Array.isArray(chosen.versions) || chosen.versions.length < 1
+            || chosen.versions.length > 12) fail();
+          ownerSigningDer = await fileBytes("archive-owner-private", 1, 8192);
+          const ownerSigningKey = await crypto.subtle.importKey("pkcs8", ownerSigningDer,
+            "Ed25519", false, ["sign"]);
+          const probe = crypto.getRandomValues(new Uint8Array(32));
+          if (!await crypto.subtle.verify("Ed25519", trust.ownerPublicKey,
+            await crypto.subtle.sign("Ed25519", ownerSigningKey, probe), probe)) fail();
+          assertLive();
+          const sealed = await window.RootarkZk1BrowserVersionedArchive.createArchive({
+            archiveInput: { ...archiveCommon, recoverySecret: secret, ownerSigningKey,
+              signedDeviceGrant: trust.signedDeviceGrant,
+              ownerHistoryCheckpoint: trust.ownerHistoryCheckpoint,
+              issuedAt: Math.floor(Date.now() / 1000) },
+            versions: chosen.versions, verifiedAuthority: versionedAuthority, assertLive });
+          assertLive();
+          downloadLocal("rootark-keyring-versions-v2.json", JSON.stringify(sealed.archive),
+            "application/json", assertLive);
+          downloadLocal("rootark-keyring-versions-v2.sha256.txt",
+            to64(sealed.archiveSha256), "text/plain", assertLive);
+          status("V2: todas as versões verificadas contra snapshot CBOR, roster assinado, roots e AEAD da CEK. Guarde o hash externo e o segredo separados.");
+        } else {
+          const archivedBytes = await fileBytes("archive-json", 1, 17 * 1024 * 1024);
+          let archived;
+          try { archived = JSON.parse(decoder.decode(archivedBytes)); }
+          finally { archivedBytes.fill(0); }
+          if (archived?.format !== "rootark-zk1-keyring-portable-archive/v2") fail();
+          if (historicOptIn === (archived.ownerRevision === trust.pinnedCurrentHead.revision
+            && archived.ownerDigest === to64(trust.pinnedCurrentHead.digest)
+            && archived.ownerEpoch === trust.pinnedCurrentHead.epoch)) fail();
+          if (historicOptIn) {
+            privateDer = await fileBytes("private", 1, 8192);
+            historical.devicePoP = await signedHistoricalDevicePoP({
+              scope, pinnedCurrentHead: trust.pinnedCurrentHead,
+              independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+              currentSignedDeviceGrant: historical.currentSignedDeviceGrant,
+              archiveSha256: from64(field("archive-sha").value.trim()),
+              accountArchiveSha256: null, privateDer, assertLive,
+            });
+          }
+          const opened = await window.RootarkZk1BrowserVersionedArchive.recoverArchive({
+            recoveryInput: { ...archiveCommon,
+              previousOwnerHistoryProof: historicOptIn ? null
+                : archiveCommon.previousOwnerHistoryProof,
+              ...(historicOptIn ? { historicalRecovery: historical } : {}),
+              recoverySecret: secret, archive: archived,
+              independentlyPinnedArchiveSha256: from64(field("archive-sha").value.trim()) },
+            verifiedAuthority: versionedAuthority, assertLive });
+          try {
+            const output = [];
+            const seen = new Set();
+            for (const file of opened.files) {
+              if (!(file.ciphertext instanceof Uint8Array)
+                || !(file.cek instanceof Uint8Array) || file.cek.length !== 32
+                || !/^[A-Za-z0-9_-]{22}$/.test(file.objectId)
+                || !Number.isSafeInteger(file.objectRevision)
+                || file.objectRevision < 1) fail();
+              const prefix = "zk1-" + file.objectId + "-r" + file.objectRevision;
+              if (seen.has(prefix)) fail();
+              seen.add(prefix);
+              output.push({ name: localName(prefix + ".ciphertext"), data: file.ciphertext });
+              output.push({ name: localName(prefix + ".cek"), data: file.cek });
+            }
+            assertLive();
+            for (const item of output) downloadLocal(item.name, item.data,
+              "application/octet-stream", assertLive);
+            status("V2: " + opened.files.length + " versões autenticadas, ciphertext e CEK baixados separadamente. Nenhuma restauração no servidor.");
+          } finally {
+            for (const file of opened.files) {
+              file.ciphertext.fill(0); file.cek.fill(0);
+            }
+          }
+        }
+        return;
+      }
       if (action === "import-approval") {
         committedDeviceApproval = null;
         // Never infer owner approval from an unsigned request or server data:
@@ -1255,7 +1418,8 @@
         "archive-files", "archive-owner-private", "archive-json", "archive-historical-proof",
         "account-descriptors", "account-holder-files", "account-local-files",
         "account-historical-device-privates",
-        "account-owner-private", "account-archive"]) {
+        "account-owner-private", "account-archive",
+        "v2-snapshot", "v2-roster", "v2-inventory-signer", "v2-versions"]) {
         const control = field(name);
         if (control) control.value = "";
       }

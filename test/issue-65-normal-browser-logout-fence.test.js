@@ -56,6 +56,10 @@ async function harness() {
         return { sequence: checkpoint.sequence };
       } },
     RootarkZk1NormalBrowserContent: { uploadAndVerify: async () => ({}) },
+    RootarkZk1BrowserAuthoritativeBackup: { verifyBackupSnapshot: async () => ({}) },
+    RootarkZk1BrowserVersionedArchive: {
+      createArchive: async () => ({}), recoverArchive: async () => ({}),
+    },
     RootarkZk1LegacyMigrationWorkflow: { openMigrationJournal: async () => ({ close() {} }) },
     RootarkZk1FileContent: { importFileCek: (raw) => crypto.webcrypto.subtle.importKey(
       "raw", raw, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]) },
@@ -89,6 +93,7 @@ async function harness() {
     },
     RootarkZk1KeyringPortableArchive: {
       createArchive: async () => ({}),
+      verifyVersionedAuthority: async () => ({}),
       issueHistoricalRecoveryChallenge: async (binding) => {
         trace.push("historic-issue-device-pop");
         const challenge = Object.freeze({ nonce: ++nextHistoricChallenge });
@@ -684,6 +689,43 @@ for (const mode of ["no-opt-in", "incomplete-chain", "missing-root", "revoked",
     } else await page.denied();
     assert.equal(page.downloads.length, 0);
   });
+
+test("versioned v2 import after logout releases zero blobs and zeroizes ciphertext and CEK", async () => {
+  const page = await harness();
+  const grant = JSON.parse(Buffer.from(await page.field("grant").files[0].arrayBuffer())
+    .toString("utf8"));
+  page.file("grant", JSON.stringify({ ...grant, device_id: "fixture-owner" }));
+  page.field("v2-opt-in").checked = true;
+  page.file("v2-snapshot", "{}");
+  page.file("v2-roster", "{}");
+  page.file("inventory-portable", "{}");
+  const signer = crypto.generateKeyPairSync("ed25519");
+  page.file("v2-inventory-signer", signer.publicKey.export({ format: "der", type: "spki" }));
+  page.field("v2-snapshot-pin").value = encode(crypto.randomBytes(32));
+  page.field("v2-roster-pin").value = encode(crypto.randomBytes(32));
+  page.field("v2-inventory-signer-id").value = encode(crypto.randomBytes(16));
+  page.window.RootarkZk1KeyringPortableArchive.verifyVersionedAuthority =
+    async () => ({ completeRelativeToOwnerCheckpoint: true,
+      authorizesProductionRestore: false });
+  const archived = { format: "rootark-zk1-keyring-portable-archive/v2",
+    ownerRevision: 1, ownerDigest: page.field("digest").value, ownerEpoch: 1 };
+  page.file("archive-json", JSON.stringify(archived));
+  let finish;
+  page.window.RootarkZk1BrowserVersionedArchive.recoverArchive = async () =>
+    new Promise((resolve) => { finish = resolve; });
+  page.click("versioned-recover");
+  await tickUntil(() => typeof finish === "function");
+  page.logout();
+  const ciphertext = Uint8Array.of(3, 4, 5);
+  const cek = new Uint8Array(32).fill(9);
+  finish({ files: [{ objectId: encode(crypto.randomBytes(16)), objectRevision: 1,
+    ciphertext, cek }], completeRelativeToPinnedInventory: true,
+    ownerSignedAccountRosterVerified: true, revisionAncestryVerified: true });
+  await page.denied();
+  assert.equal(page.downloads.length, 0);
+  assert.equal(ciphertext.every((byte) => byte === 0), true);
+  assert.equal(cek.every((byte) => byte === 0), true);
+});
 
 async function historicAccount(page) {
   const manifest = await configureAccount(page);

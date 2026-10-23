@@ -14,7 +14,10 @@
       root.RootarkZk1PortableFileRecovery,
       root.RootarkZk1OwnerCiphertextRootCheckpoint,
       root.RootarkZk1NormalBrowserTrustFloor,
-      root.RootarkZk1OwnerSignedCheckpoint, null, null, null, null);
+      root.RootarkZk1OwnerSignedCheckpoint,
+      root.RootarkZk1BrowserAuthoritativeBackup?.inventoryBridge,
+      root.RootarkZk1BrowserAuthoritativeBackup?.rosterBridge,
+      root.RootarkZk1CiphertextRoot, root.RootarkZk1FileContent);
   }
 }(typeof globalThis === "object" ? globalThis : this,
   function (webCrypto, portable, ownerRoots, trustFloor, ownerHistory,
@@ -354,8 +357,9 @@
         if (input.rosterVerification.accountId !== sc.account_id
           || own.snapshotSha256 !== b64(bytes(
             input.backupVerification.independentlyPinnedBackupSha256, 32))
-          || own.ownerSpkiSha256 !== Buffer.from(
-            input.backupVerification.independentOwnerSpkiSha256).toString("hex")) deny();
+          || own.ownerSpkiSha256 !== Array.from(
+            bytes(input.backupVerification.independentOwnerSpkiSha256, 32),
+            (v) => v.toString(16).padStart(2, "0")).join("")) deny();
         const head = { revision: snapshot.ownerRevision,
           digest: snapshot.ownerDigest, epoch: snapshot.ownerEpoch };
         const rows = snapshot.items.map((item) => ({

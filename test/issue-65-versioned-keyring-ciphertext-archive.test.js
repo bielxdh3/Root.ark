@@ -2,6 +2,9 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
 const z = require("../src/crypto/rootark-zk-1");
 const inventory = require("../src/crypto/rootark-zk-content-inventory-v1");
 const history = require("../public/client/rootark-zk1-owner-signed-checkpoint");
@@ -12,6 +15,7 @@ const roster = require("../public/client/rootark-zk1-owner-account-backup-roster
 const archive = require("../public/client/rootark-zk1-versioned-keyring-ciphertext-archive");
 const portable = require("../public/client/rootark-zk1-portable-file-recovery");
 const fileContent = require("../public/client/rootark-zk1-file-content");
+const browserAuthority = require("../public/client/rootark-zk1-browser-authoritative-backup");
 const b64 = (v) => Buffer.from(v).toString("base64url");
 const rnd = (n) => crypto.randomBytes(n);
 const sha = (v) => crypto.createHash("sha256").update(v).digest();
@@ -328,4 +332,162 @@ test("v2 historical recovery keeps current signed grant, owner re-endorsement an
       ...currentGrant, revoked_at_epoch: laterHead.epoch } } });
   await assert.rejects(archive.recoverVersionedArchive({
     recoveryInput: revoked, verifiedAuthority: f.verifiedAuthority }), deny);
+});
+test("browser WebCrypto independently verifies REAL owner pinned signed CBOR snapshot and complete owner roster", async () => {
+  const f = await fixture();
+  const context = {
+    ...f.backupVerification,
+    roster: f.rosterVerification.roster,
+    independentRosterSha256: f.rosterVerification.independentlyPinnedRosterSha256,
+    ownerHistoryCheckpoint: f.authorityInput.ownerHistoryChain[1],
+    previousOwnerHistoryProof: f.archiveInput.previousOwnerHistoryProof,
+    signerKeyId: f.archiveInput.signerKeyId,
+    inventorySignerPublicKey: await crypto.webcrypto.subtle.importKey("spki",
+      f.authorityInput.inventorySignerPublicKey.export({ type: "spki", format: "der" }),
+      "Ed25519", true, ["verify"]),
+  };
+  const proof = await browserAuthority.verifyBackupSnapshot(context);
+  assert.equal(proof.completeRelativeToOwnerCheckpoint, true);
+  assert.equal(proof.globalAccountCompletenessProven, false);
+  assert.equal(browserAuthority.readVerifiedBackupProof(proof).rows.length, 3);
+  for (const changed of [
+    { independentlyPinnedBackupSha256: rnd(32) },
+    { independentlyPinnedInventoryCheckpointDigest: "0".repeat(64) },
+    { independentRosterSha256: rnd(32) },
+    { roster: { ...context.roster, keyringCount: 2 } },
+    { snapshot: { ...context.snapshot, items: context.snapshot.items.slice(1) } },
+    { pinnedCurrentHead: { ...context.pinnedCurrentHead, revision: 8 } },
+    { inventorySignerKeyId: rnd(16) },
+    { snapshot: { ...context.snapshot, items: context.snapshot.items.map(
+      (row, i) => i === 1 ? { ...row, ciphertextBase64: b64(rnd(50)) } : row) } },
+  ]) await assert.rejects(browserAuthority.verifyBackupSnapshot({
+    ...context, ...changed }), /ZK_BROWSER_AUTHORITATIVE_BACKUP_DENIED/);
+});
+test("browser authority verifies archived signed inventory only through genesis-to-current owner continuity", async () => {
+  const f = await fixture();
+  const [genesis, archived] = f.authorityInput.ownerHistoryChain;
+  const predecessor = await history.verifyOwnerCheckpoint({ checkpoint: archived,
+    scope: f.archiveInput.scope, signerPublicKey: f.archiveInput.ownerPublicKey,
+    signerKeyId: f.archiveInput.signerKeyId,
+    previous: f.archiveInput.previousOwnerHistoryProof });
+  const laterHead = { revision: 8, digest: rnd(32), epoch: 5 };
+  const current = await history.signOwnerCheckpoint({
+    scope: f.archiveInput.scope, signerKey: f.archiveInput.ownerSigningKey,
+    signerPublicKey: f.archiveInput.ownerPublicKey,
+    signerKeyId: f.archiveInput.signerKeyId, deviceId: f.archiveInput.deviceId,
+    revision: laterHead.revision, manifestDigest: laterHead.digest,
+    issuedAt: 1700, previous: predecessor });
+  const signedGrant = { ...f.archiveInput.signedDeviceGrant,
+    manifest_revision: laterHead.revision,
+    manifest_digest: b64(laterHead.digest), current_epoch: laterHead.epoch };
+  const GRANT = ["schema", "account_id", "compartment_id", "keyring_id", "device_id",
+    "authorization_key_id", "authorization_public_key", "manifest_revision",
+    "manifest_digest", "current_epoch", "enrolled_epoch", "revoked_at_epoch"];
+  signedGrant.signature = b64(crypto.sign(null, Buffer.concat([
+    Buffer.from("Root.ark/zk-1/browser-owner-device-grant/v1\0"),
+    Buffer.from(JSON.stringify(Object.fromEntries(GRANT.map((key) => [key, signedGrant[key]])))),
+  ]), f.owner.privateKey));
+  const input = { ...f.backupVerification,
+    roster: f.rosterVerification.roster,
+    independentRosterSha256: f.rosterVerification.independentlyPinnedRosterSha256,
+    inventorySignerPublicKey: await crypto.webcrypto.subtle.importKey("spki",
+      f.authorityInput.inventorySignerPublicKey.export({ type: "spki", format: "der" }),
+      "Ed25519", true, ["verify"]),
+    ownerHistoryCheckpoint: current, previousOwnerHistoryProof: predecessor,
+    signedDeviceGrant: signedGrant,
+    pinnedCurrentHead: laterHead, signerKeyId: f.archiveInput.signerKeyId,
+    archivalHistoryChain: [genesis, archived, current] };
+  assert.equal((await browserAuthority.verifyBackupSnapshot(input))
+    .completeRelativeToOwnerCheckpoint, true);
+  for (const badChain of [null, [archived, current],
+    [genesis, { ...archived, signature: b64(rnd(64)) }, current],
+    [genesis, archived, { ...current, manifest_digest: b64(rnd(32)) }]]) {
+    await assert.rejects(browserAuthority.verifyBackupSnapshot({
+      ...input, archivalHistoryChain: badChain }),
+    /ZK_BROWSER_AUTHORITATIVE_BACKUP_DENIED/);
+  }
+});
+test("UMD browser-only modules mint signed inventory authority and restore genuine ciphertext+CEK", async () => {
+  const f = await fixture();
+  const context = vm.createContext({ crypto: crypto.webcrypto, Uint8Array,
+    ArrayBuffer, TextEncoder, TextDecoder, btoa, atob, performance, setTimeout });
+  const scripts = ["rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-root",
+    "rootark-zk1-owner-signed-checkpoint", "rootark-zk1-owner-ciphertext-root-checkpoint",
+    "rootark-zk1-normal-browser-trust-floor", "rootark-zk1-owner-inventory-trust-head",
+    "rootark-zk1-portable-file-recovery", "rootark-zk1-browser-authoritative-backup",
+    "rootark-zk1-keyring-portable-archive", "rootark-zk1-browser-versioned-archive"];
+  for (const name of scripts) vm.runInContext(fs.readFileSync(path.join(__dirname,
+    "../public/client", name + ".js"), "utf8"), context, { filename: name + ".js" });
+  context.ownerKey = f.archiveInput.ownerPublicKey;
+  context.privateKey = f.archiveInput.ownerSigningKey;
+  context.ownerPin = f.archiveInput.independentOwnerSpkiSha256;
+  context.secret = f.archiveInput.recoverySecret;
+  context.signerId = f.archiveInput.signerKeyId;
+  context.inventorySignerId = f.authorityInput.inventorySignerKeyId;
+  context.invPin = f.backupVerification.independentlyPinnedBackupSha256;
+  context.rosterPin = f.rosterVerification.independentlyPinnedRosterSha256;
+  context.inventorySignerKey = await crypto.webcrypto.subtle.importKey("spki",
+    f.authorityInput.inventorySignerPublicKey.export({ type: "spki", format: "der" }),
+    "Ed25519", true, ["verify"]);
+  context.trustedJson = JSON.stringify({
+    scope: f.archiveInput.scope, ownerHistoryChain: f.authorityInput.ownerHistoryChain,
+    grant: f.archiveInput.signedDeviceGrant,
+    head: { ...f.archiveInput.pinnedCurrentHead, digest: b64(f.archiveInput.pinnedCurrentHead.digest) },
+    signerKeyId: b64(f.archiveInput.signerKeyId), deviceId: f.archiveInput.deviceId,
+    snapshot: f.backupVerification.snapshot, roster: f.rosterVerification.roster,
+    ownerInventoryPortable: f.authorityInput.ownerInventoryPortable,
+    inventoryCheckpointDigest: f.authorityInput.independentlyPinnedInventoryCheckpointDigest,
+    inventorySignerSpki: f.authorityInput.independentlyPinnedInventorySignerSpkiSha256,
+    versions: f.versionInputs.map((entry) => ({
+      metadata: entry.metadata, objectRevision: entry.objectRevision,
+      ciphertextBase64: b64(entry.ciphertext), cekBase64: b64(entry.cek) })),
+  });
+  const opened = await vm.runInContext(`(async () => {
+    const input = JSON.parse(trustedJson);
+    const before = await RootarkZk1OwnerSignedCheckpoint.verifyOwnerCheckpoint({
+      checkpoint: input.ownerHistoryChain[0], scope: input.scope,
+      signerPublicKey: ownerKey, signerKeyId: signerId, previous: null });
+    const head = { revision: input.head.revision,
+      digest: Uint8Array.from(atob(input.head.digest.replace(/-/g, "+").replace(/_/g, "/") + "="),
+        (c) => c.charCodeAt(0)), epoch: input.head.epoch };
+    const backupVerification = { snapshot: input.snapshot, roster: input.roster,
+      independentRosterSha256: rosterPin, ownerPublicKey: ownerKey,
+      independentOwnerSpkiSha256: ownerPin, pinnedCurrentHead: head,
+      scope: input.scope, ownerInventoryPortable: input.ownerInventoryPortable,
+      independentlyPinnedInventoryCheckpointDigest: input.inventoryCheckpointDigest,
+      independentlyPinnedInventorySignerSpkiSha256: input.inventorySignerSpki,
+      inventorySignerPublicKey: inventorySignerKey, inventorySignerKeyId: inventorySignerId,
+      signedDeviceGrant: input.grant, ownerHistoryCheckpoint: input.ownerHistoryChain[1],
+      previousOwnerHistoryProof: before, signerKeyId: signerId,
+      deviceId: input.deviceId, independentlyPinnedBackupSha256: invPin, nowSeconds: 1400 };
+    const authority = await RootarkZk1KeyringPortableArchive.verifyVersionedAuthority({
+      backupVerification, rosterVerification: { roster: input.roster,
+        independentlyPinnedRosterSha256: rosterPin, ownerPublicKey: ownerKey,
+        independentOwnerSpkiSha256: ownerPin, accountId: input.scope.account_id },
+      otherVerifiedKeyringProofs: [] });
+    const common = { recoverySecret: secret, ownerPublicKey: ownerKey,
+      independentOwnerSpkiSha256: ownerPin, pinnedCurrentHead: head, scope: input.scope,
+      signerKeyId: signerId, deviceId: input.deviceId, previousOwnerHistoryProof: before };
+    const sealed = await RootarkZk1BrowserVersionedArchive.createArchive({
+      archiveInput: { ...common, ownerSigningKey: privateKey,
+        signedDeviceGrant: input.grant, ownerHistoryCheckpoint: input.ownerHistoryChain[1],
+        issuedAt: 1500 }, versions: input.versions, verifiedAuthority: authority,
+      assertLive: () => {} });
+    const opened = await RootarkZk1BrowserVersionedArchive.recoverArchive({
+      recoveryInput: { ...common, archive: sealed.archive,
+        independentlyPinnedArchiveSha256: sealed.archiveSha256 },
+      verifiedAuthority: authority, assertLive: () => {} });
+    const output = opened.files.map((item) => ({
+      objectId: item.objectId, revision: item.objectRevision,
+      ciphertext: Uint8Array.from(item.ciphertext), cek: Uint8Array.from(item.cek) }));
+    for (const item of opened.files) { item.ciphertext.fill(0); item.cek.fill(0); }
+    return { format: sealed.archive.format, output };
+  })()`, context);
+  assert.equal(opened.format, "rootark-zk1-keyring-portable-archive/v2");
+  assert.equal(opened.output.length, 3);
+  for (let i = 0; i < opened.output.length; i++) {
+    assert.deepEqual(Buffer.from(opened.output[i].ciphertext), f.versions[i].ciphertext);
+    assert.deepEqual(Buffer.from(opened.output[i].cek), f.versions[i].cek);
+    opened.output[i].cek.fill(0); opened.output[i].ciphertext.fill(0);
+  }
 });
