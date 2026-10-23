@@ -10,6 +10,7 @@ const tls = require("node:tls");
 const net = require("node:net");
 const path = require("node:path");
 const Database = require("better-sqlite3");
+const { requireImmutableTriggers } = require("./zk1OpaqueCatalogSqliteIntegrity");
 const z = require("../crypto/rootark-zk-1");
 const { catalogHeadDigest } = require("./zk1OpaqueCatalog");
 const ownerHistory = require("../crypto/rootark-zk-recovery-history-v2");
@@ -212,6 +213,10 @@ class Zk1OpaqueCatalogIndependentFloorLedger {
           ON transitions BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;
         CREATE TRIGGER IF NOT EXISTS immutable_floor_transition_delete BEFORE DELETE
           ON transitions BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;`);
+      requireImmutableTriggers(this.db, [
+        ["immutable_floor_transition_update", "transitions", "UPDATE"],
+        ["immutable_floor_transition_delete", "transitions", "DELETE"],
+      ], fail);
       if (!exists) this.db.prepare("INSERT INTO identity VALUES(1,?,?,?,?)").run(...expected);
       const saved = this.db.prepare("SELECT * FROM identity WHERE id=1").get();
       if (!saved || saved.scope !== this.id || !same(saved.floor_fp, expected[1])

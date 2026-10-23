@@ -16,6 +16,7 @@ const { inspectVerifiedWitnessFreshHeadV1 } =
   require("../crypto/rootark-zk-witness-head-wire-v1");
 const { isZk1OpaqueCatalogIndependentFloorClient } =
   require("./zk1OpaqueCatalogIndependentFloor");
+const { requireImmutableTriggers } = require("./zk1OpaqueCatalogSqliteIntegrity");
 
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
 const PAGE_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-page/v1\0");
@@ -224,6 +225,12 @@ class Zk1OpaqueCatalogCasLedger {
         BEFORE UPDATE ON snapshots BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;
       CREATE TRIGGER IF NOT EXISTS immutable_opaque_snapshot_delete
         BEFORE DELETE ON snapshots BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;`);
+      requireImmutableTriggers(this.db, [
+        ["immutable_opaque_signer_update", "signer_history", "UPDATE"],
+        ["immutable_opaque_signer_delete", "signer_history", "DELETE"],
+        ["immutable_opaque_snapshot_update", "snapshots", "UPDATE"],
+        ["immutable_opaque_snapshot_delete", "snapshots", "DELETE"],
+      ], fail);
       if (!exists) this.db.prepare("INSERT INTO identity VALUES (1,?,?,?)").run(...identity);
       const saved = this.db.prepare("SELECT * FROM identity WHERE id=1").get();
       if (!saved || saved.authority_fp !== identity[0]
@@ -256,6 +263,7 @@ class Zk1OpaqueCatalogCasLedger {
       .all(this.scopeId);
     if (rows.length > MAX_SEQUENCE) fail();
     let digest = EMPTY;
+    let lastOwner = null;
     for (let i = 0; i < rows.length; ++i) {
       const row = rows[i];
       if (row.sequence !== i + 1 || row.digest.length !== 32
@@ -282,6 +290,11 @@ class Zk1OpaqueCatalogCasLedger {
           || !Number.isSafeInteger(signerRow.owner_revision)
           || signerRow.owner_evidence.length < 1
           || signerRow.owner_evidence.length > 2 * 1024 * 1024) fail();
+        if (lastOwner && (signerRow.owner_revision < lastOwner.revision
+          || (signerRow.owner_revision === lastOwner.revision
+            && !same(signerRow.owner_digest, lastOwner.digest)))) fail();
+        lastOwner = { revision: signerRow.owner_revision,
+          digest: Buffer.from(signerRow.owner_digest) };
         key = crypto.createPublicKey({ key: signerRow.signer_spki,
           format: "der", type: "spki" });
       }
@@ -294,6 +307,11 @@ class Zk1OpaqueCatalogCasLedger {
       const total = this.db.prepare("SELECT COUNT(*) AS n FROM signer_history WHERE scope=?")
         .get(this.scopeId).n;
       if (total !== rows.length) fail();
+      const owner = this.db.prepare("SELECT revision,digest FROM owner_authority WHERE scope=?")
+        .get(this.scopeId);
+      const latest = lastOwner || this.#ownerTrust.minimumHead;
+      if (!owner || owner.revision !== latest.revision
+        || !same(bytes(owner.digest, 32), latest.digest)) fail();
     }
     if ((head && (head.sequence !== rows.length || !same(head.digest, digest)))
       || (!head && rows.length)) fail();
