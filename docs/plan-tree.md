@@ -1,5 +1,42 @@
 # Root.ark Plan Tree
 
+## Current development addendum — 2026-10-23, issue #65 / PR #228
+
+This is an additive development snapshot, not a revision of the dated phase
+history below. The PR branch `cdx/rootark-dual-recovery-20261019` remains
+`OPEN/DRAFT` with issue #65 open; no merge, deployment or production activation
+is authorized. The last *verified published* code baseline before this addendum
+was `0c9034c` (full Ubuntu Node22 2183 PASS / 0 FAIL / 136 SKIP; full Windows
+Node24 local 2153 PASS / 0 FAIL / 166 SKIP, on the same code; local Windows
+Node22 release gate canceled, not failed). That snapshot's CodeQL policy check
+was red with 62 static findings, no new runtime P1/P2 confirmed by its focused
+audit. None of those prior CI outcomes is a new-head verdict.
+
+The active isolated issue #65 integration now includes local commits
+`b6635a9` (metadata leakage register), `7d55c4c` (witnessed owner enrollment
+CLI), `dd7cf11` (opt-in owner/device-signed opaque catalog with externally
+pinned CAS head), `a4f63f2` (owner-signed per-version legacy transition state)
+and `de94f1f` (normal-browser opt-in versioned archive, original per-version
+ciphertext and CEK). Together they passed targeted local Node24 **78 PASS /
+0 FAIL**, Node22 crypto **14 PASS / 0 FAIL**, and syntax **485 / 0**. The
+catalog's two-device authenticated HTTP read is tested; this does not prove a
+production authority, a complete protected bidirectional sync client or every
+destructive mutation. Signed migration receipts permit verified state for
+individually selected versions only, *never* deletion/cutover of legacy sources
+whose references or retention are unknown. Default owner upload uses a
+single-use CEK and is not inherently recoverable without user-held archive
+material.
+
+Still open in development: real end-to-end normal-browser catalog discovery and
+delta sync, authenticated rename/move/delete/trash/conflict operations,
+owner-signed witnessed revocation and epoch rotation ceremony, full account
+inventory completeness and recovery UX, and cutover graph completeness for
+legacy backup/trash/links/derived/retention. Absence of external provider
+durability or physically independent witness evidence must remain explicitly
+distinguished from local cryptographic and PostgreSQL proof. Do not mark issue
+#65 100% done until each acceptance criterion has executable evidence. See
+`docs/issue-65-zk1-runtime-leakage-register.md` for the current threat boundary.
+
 Last reconstructed: 2026-07-25 (historical baseline)
 Latest application-code snapshot for this closure: 2026-10-16 after PR #201 merged at `341804fa2bfd02dcd50f2d1bde560cb677fc27fd`. The [2026-10-16 pre-publication snapshot](validation/2026-10-16-rootark-prepublication-closure.md) records GitHub state and validation evidence queried after PR #199; it is historical and does not describe PR #201 or later commits. Track the final exact `Root/main` SHA and local validation for the documentation-only closure publication in the [final closure PR #202](https://github.com/bielxdh3/Root.ark/pull/202).
 

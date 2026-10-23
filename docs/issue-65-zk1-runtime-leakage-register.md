@@ -1,6 +1,8 @@
 # Issue #65 — zk-1 runtime metadata and trust-boundary register (development)
 
-Evidence baseline: PR #228, commit `0c9034c` (2026-10-23). This register
+Evidence baseline: PR #228, commit `0c9034c` plus the 2026-10-23 local
+integration of independently tested catalog, owner CLI, legacy-transition and
+versioned-browser milestones. This register
 describes only the **opt-in zk-1 protected content path**. It must not be read
 as a claim that Root.ark's legacy files, ordinary sync, WebDAV, public links,
 existing backups, or existing server-readable previews became zero-knowledge.
@@ -16,14 +18,21 @@ existing backups, or existing server-readable previews became zero-knowledge.
 | Authenticated access | HTTP cookie/session, CSRF, account permissions, trusted scope resolution and device/owner signed authority remain required. The server's acceptance of a signed object operation is not an independent proof of a durable cloud write or of externally custodied witness keys. |
 | Recovery and exports | A client explicitly authorized to decrypt can release local plaintext/downloaded files to the device; device theft, OS compromise, exported copies, screenshots and already-seen legacy plaintext are outside server-blind cryptographic erasure. Session/logout fences prevent late releases in supported browser flows, not copies already delivered. |
 
-On this baseline the zk-1 route
-`src/routes/zk1ProtectedObjectRoutes.js` accepts only signed ciphertext
-PUT/GET by opaque object identity, with a separate optional supervised
-multiprovider ciphertext restore path. It does **not** expose a normal
-owner-signed opaque catalog/list/delta protocol, so this baseline cannot claim
-automatic protected multi-device discovery or complete account backup. The
-offline signed inventory and keyring roster attest only their explicitly
-signed and independently pinned scope, not unknown/unrecorded objects.
+The zk-1 route `src/routes/zk1ProtectedObjectRoutes.js` accepts signed
+ciphertext PUT/GET by opaque object identity, with a separate optional
+supervised multiprovider restore. An opt-in opaque **catalog commit/read**
+now permits witnessed, versioned discovery between authorized devices under
+independently pinned owner history and an **external, independently pinned
+Ed25519 CAS head authority**. It cannot safely activate without that configured
+authority; normal application bootstrap keeps this integration disabled by
+default. Catalog entries expose opaque object ID, revision, epoch, ciphertext
+digest, padded 284-byte encrypted filename metadata, paging and sequencing;
+they must never contain plaintext `name` or `path`. The published implementation
+does not yet supply a complete automatic normal-browser bidirectional sync,
+delete/move/trash protocol or proven comprehensive inventory for objects absent
+from the owner-signed root. The separately signed offline backup inventory and
+keyring roster likewise attest only their explicitly signed and independently
+pinned scope, not unknown/unrecorded objects.
 
 ## Separate services are **not** an implicit zk-1 downgrade
 
@@ -79,11 +88,20 @@ prove these external workflows completed.
 - `test/issue-65-authoritative-backup-inventory.test.js` and
   `test/issue-65-versioned-keyring-ciphertext-archive.test.js`: owner-pinned
   inventory/revision snapshots, archive roots and recovery.
+- `src/services/zk1OpaqueCatalog.js`,
+  `src/crypto/rootark-zk1-opaque-catalog-client-v1.js` and
+  `test/issue-65-zk1-opaque-catalog-http.test.js`: witnessed opt-in catalog,
+  encrypted filename metadata, two-device HTTP and rejection tests.
+- `scripts/zk1-owner-offline-enroll-local.js` and
+  `test/issue-65-owner-offline-local-orchestrator.test.js`: independently
+  witnessed owner candidate/commit/delivery, without a forged local witness.
+- `test/issue-65-legacy-transition-receipt.test.js`: signed per-version
+  migration receipt without authorization to delete plaintext legacy sources.
 - `docs/architecture/zero-knowledge-migration-contract.md` and
   `docs/architecture/android-client-architecture.md`: target threat model,
   independent cross-client boundaries and metadata policy decisions.
 
-Update this register when an *implemented and tested* zk-1 catalog, owner
-lifecycle, migration state transition or additional client is integrated.
+Update this register when a *further implemented and tested* zk-1 browser
+catalog, owner revocation/rotation or additional client is integrated.
 Do not weaken it with a production-readiness percentage or an unverified
 security guarantee.
