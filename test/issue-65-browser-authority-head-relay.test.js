@@ -98,6 +98,7 @@ test("authenticated fresh witness/CAS relay: browser-pinned SPKI, nonce, account
   let sessionActive = true, sessionVersion = 3, csrf = "csrf-current-3";
   let witnessCalls = 0, casCalls = 0;
   let revokeDuringWitness = false;
+  let maliciousWitness = null;
   const now = () => Math.floor(Date.now() / 1000);
   function checkScope(received) {
     for (const key of Object.keys(scope)) {
@@ -110,7 +111,11 @@ test("authenticated fresh witness/CAS relay: browser-pinned SPKI, nonce, account
       signature: crypto.sign(null, Buffer.concat([prefix, Buffer.from(proof)]), key) });
   };
   const store = {
-    signedHistoryRequired: true, witnessProvider: {
+    signedHistoryRequired: true,
+    witnessPinned: { keyId, publicKey: witness.publicKey },
+    minimumHead: { revision: 1, witnessSequence: 1, digest: ownerDigest },
+    nowSeconds: now,
+    witnessProvider: {
       async freshHead({ scope: supplied, nonce }) {
         witnessCalls++;
         checkScope(supplied);
@@ -119,16 +124,22 @@ test("authenticated fresh witness/CAS relay: browser-pinned SPKI, nonce, account
           sessionActive = false;
           sessionVersion++;
         }
+        if (maliciousWitness === "oversize") return Buffer.alloc(8193);
         return signed({ type: "rootark-recovery-witness-head/v1", witness_key_id: keyId,
-          ...scope, current_revision: 1, current_manifest_digest: ownerDigest,
-          witness_sequence: 1, nonce, observed_at: now(),
-          status: "committed", pending_reservation_id: null }, OWNER_HEAD, witness.privateKey);
+          ...(maliciousWitness === "scope" ? otherScope : scope),
+          current_revision: 1, current_manifest_digest: ownerDigest,
+          witness_sequence: 1,
+          nonce: maliciousWitness === "nonce" ? crypto.randomBytes(32) : nonce,
+          observed_at: now() - (maliciousWitness === "stale" ? 120 : 0),
+          status: maliciousWitness === "pending" ? "pending" : "committed",
+          pending_reservation_id: null }, OWNER_HEAD,
+        maliciousWitness === "signature" ? untrusted.privateKey : witness.privateKey);
       },
     },
     put() {}, get() {},
   };
   const opaqueCatalog = { store, async commit() {}, async read() {},
-    authority: { async readHead({ scope: supplied, nonce }) {
+    authority: { publicKey: cas.publicKey, async readHead({ scope: supplied, nonce }) {
       casCalls++;
       checkScope(supplied);
       assert.equal(nonce.length, 32);
@@ -198,6 +209,43 @@ test("authenticated fresh witness/CAS relay: browser-pinned SPKI, nonce, account
     assert.equal(crypto.verify(null, Buffer.concat([prefix,
       Buffer.from(await z.encodeDeterministic(unsigned))]), untrusted.publicKey, signature), false);
   }
+  const beforeDuplicate = casCalls;
+  await assert.rejects(relay.catalogProbe({ scope: scopeWire, nonce: nonce2 }),
+    /ZK_BROWSER_AUTHORITY_RELAY_UNVERIFIED/,
+    "browser may not submit a challenge twice, including after successful receipt");
+  assert.equal(casCalls, beforeDuplicate, "duplicate fails before egress");
+  const duplicatedHttp = await fetch(origin + "zk-1/v1/catalog/authority/witness-head", {
+    method: "POST", headers: { "content-type": "application/json",
+      "x-csrf-token": csrf, cookie: "rootark_session=owner; rootark_csrf=" + csrf },
+    body: JSON.stringify({ nonce: b64(nonce1) }),
+  });
+  assert.equal(duplicatedHttp.status, 503, "server also refuses same signed challenge");
+  assert.equal(witnessCalls, 1);
+  // A compromised HTTP relay can forge JSON or replay a real receipt. Even
+  // correctly signed but stale, wrong-scope, or wrong-nonce proofs must fail
+  // IN THE BROWSER, before being passed to the catalog writer.
+  for (const variant of ["replay", "scope", "nonce", "stale", "signature"]) {
+    const malicious = await relayBrowser.createProbes({
+      ...options, fetchImpl: async (_url, init) => {
+        const challenge = Buffer.from(JSON.parse(init.body).nonce, "base64url");
+        let proof = proof2;
+        if (variant !== "replay") {
+          const body = { type: "rootark-zk1-opaque-catalog-cas/v1",
+            ...(variant === "scope" ? otherScope : scope),
+            sequence: 0, digest: Buffer.alloc(32),
+            nonce: variant === "nonce" ? crypto.randomBytes(32) : challenge,
+            observed_at: now() - (variant === "stale" ? 120 : 0) };
+          proof = await signed(body, CAS_HEAD,
+            variant === "signature" ? untrusted.privateKey : cas.privateKey);
+        }
+        return new Response(JSON.stringify({ proofBase64: b64(proof) }),
+          { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+    await assert.rejects(malicious.catalogProbe({ scope: scopeWire,
+      nonce: crypto.randomBytes(32) }), /ZK_BROWSER_AUTHORITY_RELAY_UNVERIFIED/,
+    "browser refuses " + variant + " independently of HTTP session success");
+  }
 
   // A signed proof for a different scope cannot enter the browser writer;
   // the route cannot be retargeted by client-provided account metadata.
@@ -248,4 +296,17 @@ test("authenticated fresh witness/CAS relay: browser-pinned SPKI, nonce, account
     scope: scopeWire, nonce: crypto.randomBytes(32) }));
   assert.equal(witnessCalls, 2, "logout denies before contacting independent witness");
   assert.ok(casCalls >= 2);
+  sessionActive = true;
+  for (const fault of ["scope", "nonce", "stale", "signature", "pending", "oversize"]) {
+    maliciousWitness = fault;
+    const challenge = crypto.randomBytes(32);
+    const remote = await fetch(origin + "zk-1/v1/catalog/authority/witness-head", {
+      method: "POST", headers: { "content-type": "application/json",
+        "x-csrf-token": csrf, cookie: "rootark_session=owner; rootark_csrf=" + csrf },
+      body: JSON.stringify({ nonce: b64(challenge) }),
+    });
+    assert.equal(remote.status, 503,
+      "the authenticated HTTP relay must itself reject the " + fault + " proof");
+  }
+  maliciousWitness = null;
 });

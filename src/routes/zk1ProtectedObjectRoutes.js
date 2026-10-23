@@ -7,6 +7,8 @@
 const express = require("express");
 const { registerZk1AuthenticatedMultiproviderRestoreRoute } =
   require("./zk1AuthenticatedMultiproviderRestoreRoutes");
+const { verifyRelayedAuthorityProof } =
+  require("../services/zk1AuthorityRelayProofVerifier");
 const FIELDS = Object.freeze([
   "account_id", "compartment_id", "keyring_id", "device_id", "operation",
   "object_id", "expected_object_revision", "manifest_revision", "manifest_digest",
@@ -144,6 +146,7 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
     }
   };
   const parseSealedContent = express.json({ limit: "6mb", type: "application/json" });
+  const parseAuthorityChallenge = express.json({ limit: "512b", type: "application/json" });
   // The normal workspace discovers this opt-in capability only through its
   // authenticated session. Registration itself is dev/test-only (bootstrap).
   // Never publish the configured owner's scope or authority pins to browsers.
@@ -173,20 +176,41 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
     // Relay only independently signed, nonce-bound authority statements. The
     // browser verifies both signatures against user-held offline key pins; the
     // application server cannot nominate a trusted key or invent a fresh head.
+    // Per-process duplicate detection supplements the Ed25519 challenge
+    // binding. Other processes and restarts rely on fresh independently
+    // generated browser challenges and downstream signed floor validation.
+    const challenges = new Map();
     const authorityHead = (kind) => async (req, res) => {
       try {
         const scope = resolveTrustedScope(req.user);
         if (!scope) invalid();
+        const pinnedScope = { account_id: Buffer.from(scope.account_id),
+          compartment_id: Buffer.from(scope.compartment_id),
+          keyring_id: Buffer.from(scope.keyring_id) };
         const user = { username: req.user.username, sessionVersion: req.user.sessionVersion };
         exact(req.body, ["nonce"]);
         const nonce = b64(req.body.nonce, 32);
         if (nonce.length !== 32) invalid();
+        const now = require("node:perf_hooks").performance.now();
+        for (const [challenge, expires] of challenges) {
+          if (expires < now) challenges.delete(challenge);
+        }
+        const challengeKey = kind + ":" + Buffer.concat([
+          Buffer.from(pinnedScope.account_id), Buffer.from(pinnedScope.compartment_id),
+          Buffer.from(pinnedScope.keyring_id), nonce,
+        ]).toString("hex");
+        if (challenges.has(challengeKey) || challenges.size >= 4096) invalid();
+        challenges.set(challengeKey, now + 60000);
         const signed = kind === "witness"
-          ? await store.witnessProvider.freshHead({ scope, nonce })
-          : await opaqueCatalog.authority.readHead({ scope, nonce });
-        const proof = Buffer.from(signed);
-        if (proof.length < 1 || proof.length > 8192) invalid();
-        recheckSession(req, user, scope, "listFiles");
+          ? await store.witnessProvider.freshHead({ scope: pinnedScope, nonce })
+          : await opaqueCatalog.authority.readHead({ scope: pinnedScope, nonce });
+        const proof = await verifyRelayedAuthorityProof({ kind, raw: signed,
+          scope: pinnedScope, nonce, witnessPinned: store.witnessPinned,
+          minimumHead: store.minimumHead,
+          casPublicKey: opaqueCatalog.authority.publicKey,
+          nowSeconds: typeof store.nowSeconds === "function"
+            ? store.nowSeconds() : Math.floor(Date.now() / 1000) });
+        recheckSession(req, user, pinnedScope, "listFiles");
         if (res.destroyed || res.headersSent || res.writableEnded) invalid();
         res.status(200).json(kind === "witness"
           ? { receiptBase64: proof.toString("base64url") }
@@ -197,9 +221,9 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
       }
     };
     app.post("/zk-1/v1/catalog/authority/witness-head", fenceHeaders, authenticate,
-      requirePermission("listFiles"), parseSealedContent, authorityHead("witness"));
+      requirePermission("listFiles"), parseAuthorityChallenge, authorityHead("witness"));
     app.post("/zk-1/v1/catalog/authority/cas-head", fenceHeaders, authenticate,
-      requirePermission("listFiles"), parseSealedContent, authorityHead("cas"));
+      requirePermission("listFiles"), parseAuthorityChallenge, authorityHead("cas"));
     const sendUnderGate = (res, status, recheck = null) => (result) => new Promise((resolve, reject) => {
       if (res.destroyed || res.writableEnded || res.headersSent) {
         return reject(new Error("ZK_CATALOG_UNAVAILABLE"));
