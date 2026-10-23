@@ -157,6 +157,8 @@
 
     async function change(input) {
       let sourceBytes, oldPlain, originalBytes, destinationBytes, checkBytes;
+      let journalId = null, commitAttempted = false, confirmedCommit = null;
+      let pendingObjectId = null, pendingRevision = null;
       try {
         exact(input, ["action", "catalog", "sourceIndex", "sourceMetadata", "sourceCek",
           "originalIndex", "originalMetadata", "originalCek", "ownerPublicKey",
@@ -174,6 +176,7 @@
           || !input.catalogWriter || typeof input.catalogWriter.prepareIntent !== "function"
           || typeof input.catalogWriter.commit !== "function"
           || typeof input.catalogWriter.readAll !== "function"
+          || typeof input.catalogWriter.confirmPendingIntent !== "function"
           || !["AES-GCM"].includes(input.metadataKey?.algorithm?.name)
           || input.metadataKey?.extractable !== false) deny();
         key(input.devicePrivateKey, "private"); key(input.devicePublicKey, "public");
@@ -275,6 +278,8 @@
         const newRoot = bytes(await roots.computeCiphertextRoot([destinationBytes]), 32);
         const newRevision = sourceRow.revision + 1;
         if (!Number.isSafeInteger(newRevision)) deny();
+        pendingObjectId = source.object_id;
+        pendingRevision = newRevision;
         const archiveEntries = [
           { metadata: source, revision: sourceRow.revision, ciphertext: sourceBytes,
             cek: input.sourceCek, state: input.action === "trash" ? "file" : "trashed" },
@@ -284,7 +289,7 @@
             cek: newCek, state: input.action === "trash" ? "trashed" : "file" },
         ];
         const nonce = b64(crypto.getRandomValues(new Uint8Array(32)));
-        const archiveChallenge = { objectId: source.object_id, action: input.action,
+        const archiveChallenge = { ...scope, objectId: source.object_id, action: input.action,
           epoch: head.epoch, nonce, entries: await Promise.all(archiveEntries.map(async (entry) => ({
             revision: entry.revision, versionId: entry.metadata.version_id,
             ciphertextDigest: b64(await sha(entry.ciphertext)),
@@ -298,7 +303,7 @@
         // A signature claiming custody is insufficient. Actually open every
         // archived version using the freshly loaded nonextractable CEK.
         for (const entry of archiveEntries) {
-          const restoredKey = await input.readArchivedCek({ objectId: source.object_id,
+          const restoredKey = await input.readArchivedCek({ ...scope, objectId: source.object_id,
             revision: entry.revision, versionId: entry.metadata.version_id,
             nonce });
           await guard();
@@ -314,9 +319,22 @@
           }
           await guard();
         }
+        // Verify the independent catalog proof signer is reachable and still
+        // controls its pinned key BEFORE any irreversible ciphertext/CAS write.
+        // This fresh preflight does not stand in for final post-CAS evidence.
+        const preflightChallenge = { purpose: "precommit", objectId: source.object_id,
+          revision: newRevision, epoch: head.epoch,
+          ciphertextDigest: b64(newDigest), manifestRevision: head.revision,
+          manifestDigest: b64(digestHead), previousSequence: input.catalog.sequence,
+          previousDigest: input.catalog.catalogDigest,
+          nonce: b64(crypto.getRandomValues(new Uint8Array(32))) };
+        const preflightProof = await input.catalogProof(preflightChallenge);
+        await guard();
+        await signedReceipt(input.catalogAuthorityPublicKey, COMMIT,
+          preflightChallenge, preflightProof);
         // Journal is written before the PUT. Catalog writes are strictly
         // additive; no old row/ciphertext is omitted or overwritten.
-        const journalId = await input.catalogWriter.prepareIntent([{
+        journalId = await input.catalogWriter.prepareIntent([{
           objectId: source.object_id, revision: newRevision,
           epoch: head.epoch, ciphertext: destinationBytes }]);
         await guard();
@@ -358,12 +376,13 @@
               || !equal(decrypted.data, oldPlain.data)) deny();
           } finally { decrypted.data.fill(0); }
         }
+        commitAttempted = true;
         const written = await input.catalogWriter.commit([{
           objectId: source.object_id, revision: newRevision, epoch: head.epoch,
           ciphertext: destinationBytes,
           name: input.action === "trash" ? "opaque-trashed-version" : oldPlain.name,
           metadataKey: input.metadataKey,
-        }], journalId);
+        }], journalId, { retainPendingIntent: true });
         await guard();
         if (written?.verifiedSignedReadback !== true
           || !Number.isSafeInteger(written.sequence) || written.sequence < 1) deny();
@@ -379,6 +398,10 @@
           || !final.rows.some((row) => row.object_id === source.object_id
             && row.revision === sourceRow.revision
             && equal(bytes(row.ciphertext_digest, 32), sourceDigest))) deny();
+        // The writer checked the independent CAS signature and the complete
+        // signed final catalog. Subsequent failures must say this COMMITTED.
+        confirmedCommit = Object.freeze({ sequence: written.sequence,
+          digest: written.digest });
         const commitChallenge = { objectId: source.object_id, revision: newRevision,
           epoch: head.epoch, ciphertextDigest: b64(newDigest),
           manifestRevision: head.revision, manifestDigest: b64(digestHead),
@@ -388,6 +411,8 @@
         await guard();
         await signedReceipt(input.catalogAuthorityPublicKey, COMMIT,
           commitChallenge, signedCatalog);
+        if (await input.catalogWriter.confirmPendingIntent(journalId, written) !== true) deny();
+        await guard();
         return Object.freeze({ objectId: source.object_id, revision: newRevision,
           action: input.action, metadata: Object.freeze(next),
           ciphertextDigestBase64: b64(newDigest), ciphertextRootBase64: b64(newRoot),
@@ -397,7 +422,23 @@
           uncertainPutAckReconciled: uncertainAck, logicalStateFinalized: true,
           permanentDeletionAuthorized: false, physicalErasureProven: false,
           productionDurabilityProven: false, authorizesProductionIo: false });
-      } catch (_) { deny(); }
+      } catch (_) {
+        if (commitAttempted) {
+          // The external CAS may have committed even if its ACK, subsequent
+          // verification or final independent proof was lost. Preserve the
+          // signed intent for explicit operator reconciliation; never retry.
+          const error = new Error("ZK_LOGICAL_TRASH_COMMIT_UNCERTAIN");
+          error.code = error.message;
+          error.outcome = Object.freeze({ objectId: pendingObjectId,
+            revision: pendingRevision, journalId,
+            catalogSequence: confirmedCommit?.sequence ?? null,
+            catalogDigestBase64: confirmedCommit?.digest ?? null,
+            signedCatalogReadbackVerified: confirmedCommit !== null,
+            retrySafe: false, logicalStateFinalized: false });
+          throw error;
+        }
+        deny();
+      }
       finally {
         sourceBytes?.fill(0); originalBytes?.fill(0);
         destinationBytes?.fill(0); checkBytes?.fill(0);

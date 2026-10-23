@@ -582,7 +582,14 @@ class Zk1OpaqueCatalog {
           || (payload && !same(await digestPage(entries), Buffer.from(header.page_digests[page])))) {
           fail("ZK_CATALOG_UNAVAILABLE");
         }
-        this.consume(auth);
+        // Page decoding and hashing above await async work. A physical writer
+        // could alter a historical version after the earlier inventory check.
+        // Revalidate the entire inventory and burn the signed nonce in one
+        // synchronous SQLite transaction immediately before response egress.
+        this.store.db.transaction(() => {
+          this.verifyPhysicalVersions(key, historicalPages);
+          this.consume(auth);
+        }).immediate();
         return emit({ sequence: current.sequence, totalCount: header.total_count, pageIndex: page,
           pageCount: header.page_digests.length, catalogDigest: current.digest.toString("base64url"),
           headerBase64: record.header.toString("base64url"),

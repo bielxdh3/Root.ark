@@ -263,6 +263,41 @@ test("revoked former signer cannot read or recommit; ACTIVE device re-endorses i
     BEGIN SELECT RAISE(ABORT,'ZK_CONTENT_VERSION_IMMUTABLE'); END`);
   assert.equal((await post("/zk-1/v1/catalog/read", await read(1))).status, 200,
     "original historical ciphertext remains recoverable after damage repair");
+  // AUDIT ONLY: reproduce a compromised SQLite writer racing the asynchronous
+  // decode after the physical-version check but before catalog page egress.
+  const originalPhysicalVerify = catalog.verifyPhysicalVersions.bind(catalog);
+  const originalDecode = z.decodeDeterministic;
+  let physicalCheckPassed = false;
+  let changedAfterPhysicalCheck = false;
+  catalog.verifyPhysicalVersions = (...args) => {
+    originalPhysicalVerify(...args);
+    physicalCheckPassed = true;
+  };
+  z.decodeDeterministic = async (...args) => {
+    const decoded = await originalDecode(...args);
+    if (physicalCheckPassed && !changedAfterPhysicalCheck) {
+      changedAfterPhysicalCheck = true;
+      store.db.exec("DROP TRIGGER zk_content_version_no_update");
+      store.db.prepare("UPDATE zk_content_version SET ciphertext=? WHERE id=? AND revision=1")
+        .run(replaced, objectId);
+    }
+    return decoded;
+  };
+  let raced;
+  try { raced = await post("/zk-1/v1/catalog/read", await read(1)); }
+  finally {
+    z.decodeDeterministic = originalDecode;
+    catalog.verifyPhysicalVersions = originalPhysicalVerify;
+    if (changedAfterPhysicalCheck) {
+      store.db.prepare("UPDATE zk_content_version SET ciphertext=? WHERE id=? AND revision=1")
+        .run(archived.ciphertext, objectId);
+      store.db.exec(`CREATE TRIGGER zk_content_version_no_update BEFORE UPDATE ON zk_content_version
+        BEGIN SELECT RAISE(ABORT,'ZK_CONTENT_VERSION_IMMUTABLE'); END`);
+    }
+  }
+  assert.equal(changedAfterPhysicalCheck, true, "attack fires only after successful physical inventory verification");
+  assert.equal(raced.status, 503,
+    "RED: corrupted ciphertext after physical check must not allow catalog page egress");
   // Corrupt a disposable archived page despite the SQLite immutability trigger:
   // even matching external CAS cannot cause the service to endorse it again.
   const originalPage = store.db.prepare(

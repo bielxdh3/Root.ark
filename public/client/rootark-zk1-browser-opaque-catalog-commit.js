@@ -302,6 +302,7 @@
       digest: bytes(trust.minimumCatalogHead.digest, 32) };
     let used = false;
     let prepared = false;
+    let pendingCommit = null;
     const scope = scopeOf(trust.signedDeviceGrant);
     const pin = { revision: trust.pinnedOwnerHead.revision,
       digest: bytes(trust.pinnedOwnerHead.digest, 32), epoch: trust.pinnedOwnerHead.epoch };
@@ -606,8 +607,11 @@
         || !equal(current.digest, from64(body.previousDigest, 32))) deny();
       return { head: current, rows };
     }
-    async function commit(additions, journalId) {
+    async function commit(additions, journalId, options = {}) {
       if (used) deny();
+      exact(options, Object.hasOwn(options, "retainPendingIntent") ? ["retainPendingIntent"] : []);
+      if (Object.hasOwn(options, "retainPendingIntent")
+        && options.retainPendingIntent !== true) deny();
       used = true; // one-use intent; lost ACK is never retried.
       try {
         if (!Array.isArray(additions) || additions.length < 1 || additions.length > MAX_ROWS) deny();
@@ -673,17 +677,36 @@
             || !equal(rows[i].metadata_ciphertext, final.rows[i].metadata_ciphertext)) deny();
         }
         advance(final.head);
-        await trust.journalStore.remove(journalId);
+        if (options.retainPendingIntent === true) {
+          pendingCommit = { journalId, sequence: final.head.sequence,
+            digest: b64(final.head.digest) };
+        } else {
+          await trust.journalStore.remove(journalId);
+        }
         return Object.freeze({ sequence: final.head.sequence, digest: b64(final.head.digest),
           totalCount: rows.length, verifiedSignedReadback: true,
           productionDurabilityProven: false });
+      } catch (_) { deny(); }
+    }
+    async function confirmPendingIntent(journalId, head) {
+      try {
+        exact(head, ["sequence", "digest", "totalCount", "verifiedSignedReadback",
+          "productionDurabilityProven"]);
+        if (!pendingCommit || pendingCommit.journalId !== journalId
+          || pendingCommit.sequence !== head.sequence || pendingCommit.digest !== head.digest
+          || head.verifiedSignedReadback !== true) deny();
+        await readAll({ sequence: pendingCommit.sequence,
+          digest: from64(pendingCommit.digest, 32) });
+        await trust.journalStore.remove(journalId);
+        pendingCommit = null;
+        return true;
       } catch (_) { deny(); }
     }
     // An explicit, verified additive delta only. Renames, moves, delete/trash,
     // compaction and any omission of an existing immutable version fail closed.
     return Object.freeze({ readAll: async () => {
       try { return await readAll(); } catch (_) { deny(); }
-    }, readVerifiedCiphertext, prepareIntent, commit,
+    }, readVerifiedCiphertext, prepareIntent, commit, confirmPendingIntent,
     delete: deny, trash: deny, rename: deny, move: deny });
   }
   return Object.freeze({ createClient, indexedDbJournalStore });

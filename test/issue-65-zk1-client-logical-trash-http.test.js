@@ -163,13 +163,12 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
   });
   const origin = "http://127.0.0.1:" + server.address().port;
-  let active = true, csrf = "csrf-a", lostPut = false, switchDuringGet = null;
+  let active = true, csrf = "csrf-a", lostPut = false, lostCatalogAck = false;
+  let switchDuringGet = null;
   const fetchImpl = async (url, options) => {
     if (!active || csrf !== "csrf-a") throw Error("session switched");
     const response = await fetch(url, { ...options,
       headers: { ...options.headers, "x-session": "yes", "x-csrf-token": csrf } });
-    if (url.endsWith("/catalog/read")) console.log("catalog-read-status", response.status,
-      response.status !== 200 ? (await response.clone().json()).error : "OK");
     if (switchDuringGet && url.endsWith("/content/read")) {
       if (switchDuringGet === "logout") active = false;
       if (switchDuringGet === "csrf") csrf = "csrf-b";
@@ -178,6 +177,10 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
     if (lostPut && url.endsWith("/content/put")) {
       await response.arrayBuffer();
       throw Error("ACK dropped after durable server handler");
+    }
+    if (lostCatalogAck && url.endsWith("/catalog/commit")) {
+      await response.arrayBuffer();
+      throw Error("catalog ACK dropped after independently witnessed commit");
     }
     return response;
   };
@@ -406,11 +409,16 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
     Buffer.concat([prefix, Buffer.from(JSON.stringify(body))]), key));
   const archived = new Map();
   const archiveKeys = async ({ challenge, entries }) => {
+    for (const name of ["account_id", "compartment_id", "keyring_id"])
+      assert.equal(challenge[name], scopeWire[name], "custody receipt must bind owner scope");
     for (const entry of entries) archived.set(entry.revision, {
       cek: entry.cek, bytes: Buffer.from(entry.ciphertext), metadata: entry.metadata });
     return realm({ signatureBase64: sign(archivePrefix, challenge, archiveAuthority.privateKey) });
   };
-  const readArchivedCek = async ({ revision, versionId }) => {
+  const readArchivedCek = async ({ account_id, compartment_id, keyring_id, revision, versionId }) => {
+    assert.equal(account_id, scopeWire.account_id);
+    assert.equal(compartment_id, scopeWire.compartment_id);
+    assert.equal(keyring_id, scopeWire.keyring_id);
     const saved = archived.get(revision);
     if (!saved || saved.metadata.version_id !== versionId) throw Error("MISSING_ARCHIVE_CEK");
     return saved.cek;
@@ -424,8 +432,10 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
     assert.deepEqual(Buffer.from(pinnedCurrentHead.digest), Buffer.from(ownerHead.digest));
     return true;
   };
+  const writerJournals = [];
   const makeWriter = (seq, digest) => {
     const journal = new Map();
+    writerJournals.push(journal);
     return runtime.RootarkZk1BrowserOpaqueCatalogCommit.createClient(Object.assign(realm({}), {
       origin: origin + "/", fetchImpl, ownerPublicKey,
       pinnedOwnerKeyHash: hash(ownerPublicRaw),
@@ -508,6 +518,13 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
     archiveKeys: async () => realm({ signatureBase64: b64(crypto.randomBytes(64)) }),
   })), /ZK_LOGICAL_TRASH_DENIED/, "forged custody receipt");
   await assert.rejects(trash.trash(Object.assign(realm({}), base, {
+    archiveKeys: async ({ challenge }) => realm({ signatureBase64: sign(archivePrefix,
+      { ...challenge, account_id: b64(crypto.randomBytes(16)) }, archiveAuthority.privateKey) }),
+  })), /ZK_LOGICAL_TRASH_DENIED/, "cross-scope archive receipt cannot be replayed");
+  await assert.rejects(trash.trash(Object.assign(realm({}), base, {
+    catalogProof: async () => realm({ signatureBase64: b64(crypto.randomBytes(64)) }),
+  })), /ZK_LOGICAL_TRASH_DENIED/, "unavailable unpinned catalog preflight blocks any PUT");
+  await assert.rejects(trash.trash(Object.assign(realm({}), base, {
     readArchivedCek: async () => null,
   })), /ZK_LOGICAL_TRASH_DENIED/, "missing key archive");
   active = false;
@@ -518,8 +535,10 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
   csrf = "csrf-a";
   assert.equal(puts, beforeTrash, "no denied preflight could write");
   lostPut = true;
+  lostCatalogAck = true;
   const trashed = await trash.trash(base);
   lostPut = false;
+  lostCatalogAck = false;
   assert.equal(puts, beforeTrash + 1, "uncertain ACK never repeats PUT");
   assert.equal(trashed.revision, 3);
   assert.equal(trashed.logicalStateFinalized, true);
@@ -587,10 +606,25 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
     sourceId, 3, Buffer.from(trashed.ciphertextDigestBase64, "base64url")))).status,
   200, "historic tombstone persists after restore");
   const snapshot4 = await openCatalog(restored.catalogSequence, restored.catalogDigestBase64);
-  await assert.rejects(trash.trash(Object.assign(realm({}), base, {
+  const beforeBadFinalProof = sequence;
+  let badFinalProof;
+  try { await trash.trash(Object.assign(realm({}), base, {
     catalog: snapshot4, sourceIndex: 3, sourceMetadata: restored.metadata,
     sourceCek: archived.get(4).cek,
     catalogWriter: makeWriter(4, Buffer.from(restored.catalogDigestBase64, "base64url")),
-    catalogProof: async () => realm({ signatureBase64: b64(crypto.randomBytes(64)) }),
-  })), /ZK_LOGICAL_TRASH_DENIED/, "forged final signed head cannot finalize");
+    catalogProof: async (challenge) => realm({ signatureBase64:
+      challenge.purpose === "precommit"
+        ? sign(catalogPrefix, challenge, casKey.privateKey)
+        : b64(crypto.randomBytes(64)) }),
+  })); } catch (error) { badFinalProof = error; }
+  assert.match(badFinalProof?.code || "", /ZK_LOGICAL_TRASH_COMMIT_UNCERTAIN/);
+  assert.equal(sequence, beforeBadFinalProof + 1,
+    "CAS head advanced even though the final catalog proof was rejected");
+  assert.equal(badFinalProof.outcome.signedCatalogReadbackVerified, true,
+    "caller must receive evidence of the already verified signed CAS commit");
+  assert.equal(badFinalProof.outcome.catalogSequence, sequence);
+  assert.equal(badFinalProof.outcome.logicalStateFinalized, false);
+  assert.equal(badFinalProof.outcome.retrySafe, false);
+  assert.equal(writerJournals.at(-1).size, 1,
+    "pending signed intent must remain durable for reconciliation after final proof failure");
 });
