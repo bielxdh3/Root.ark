@@ -25,14 +25,16 @@ function bounded(value) {
 function readPinnedText(filePath) {
   // The caller authorizes a path; check that the opened file is still the
   // same regular file and cap the bytes actually read from its descriptor.
-  const expected = fs.lstatSync(filePath);
-  if (!expected.isFile() || expected.isSymbolicLink() || expected.size > MAX_INPUT_BYTES) {
+  // On Windows (and other 64-bit filesystems), Number dev/ino may silently
+  // round distinct adjacent file IDs to the same value. Preserve exact IDs.
+  const expected = fs.lstatSync(filePath, { bigint: true });
+  if (!expected.isFile() || expected.isSymbolicLink() || expected.size > BigInt(MAX_INPUT_BYTES)) {
     throw parserFailure("PREVIEW_TOO_LARGE", "PREVIEW_TOO_LARGE");
   }
   const fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
   try {
-    const opened = fs.fstatSync(fd);
-    if (!opened.isFile() || opened.size > MAX_INPUT_BYTES) throw parserFailure("PREVIEW_TOO_LARGE", "PREVIEW_TOO_LARGE");
+    const opened = fs.fstatSync(fd, { bigint: true });
+    if (!opened.isFile() || opened.size > BigInt(MAX_INPUT_BYTES)) throw parserFailure("PREVIEW_TOO_LARGE", "PREVIEW_TOO_LARGE");
     if (opened.dev !== expected.dev || opened.ino !== expected.ino) {
       throw parserFailure("PREVIEW_FILE_CHANGED", "PREVIEW_FILE_CHANGED");
     }
