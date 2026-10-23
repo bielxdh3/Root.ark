@@ -2,6 +2,8 @@
 
 const { spawn } = require("node:child_process");
 const { createHash } = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
 const { StringDecoder } = require("node:string_decoder");
 const { getNpmInvocation, canonicalTestArgs } = require("./release-gate-environment");
 
@@ -22,6 +24,19 @@ function categoryFor(code) {
   if (["ERR_DLOPEN_FAILED", "MODULE_NOT_FOUND", "ERR_MODULE_NOT_FOUND"].includes(code)) return "dependency";
   if (code === "ERR_TEST_FAILURE") return "runtime";
   return "unknown";
+}
+
+function canonicalWindowsTestEnvironment(environment = process.env,
+  platform = process.platform, tempDirectory = os.tmpdir()) {
+  if (platform !== "win32") return environment;
+  // Hosted Windows runners can expose TEMP through an administrator-managed
+  // junction. ZK SQLite fixtures must use the actual directory so their
+  // strict ancestor-junction guard still rejects untrusted paths.
+  const canonicalTemp = fs.realpathSync.native(tempDirectory);
+  if (!fs.statSync(canonicalTemp).isDirectory()) {
+    throw Error("Windows canonical suite requires a real temporary directory");
+  }
+  return { ...environment, TEMP: canonicalTemp, TMP: canonicalTemp };
 }
 
 function createTapProgressRecorder(write) {
@@ -93,6 +108,7 @@ function run() {
     cwd: require("node:path").resolve(__dirname, ".."),
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
+    env: canonicalWindowsTestEnvironment(),
   });
 
   function consume(stream, fromStderr) {
@@ -154,4 +170,4 @@ function run() {
 
 if (require.main === module) run();
 
-module.exports = { createTapProgressRecorder };
+module.exports = { createTapProgressRecorder, canonicalWindowsTestEnvironment };
