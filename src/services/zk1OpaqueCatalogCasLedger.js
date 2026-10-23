@@ -75,6 +75,26 @@ function privateDir(filename) {
   if (process.platform !== "win32"
     && (current.uid !== process.getuid() || (current.mode & 0o077) !== 0)) fail();
 }
+function requireExistingCatalogSchema(db, identity, hasOwner) {
+  // A restart must inspect the existing file read-only before switching WAL
+  // mode or installing any schema. Otherwise rejecting a foreign SQLite still
+  // permanently writes CAS tables into that foreign database.
+  if (db.pragma("quick_check", { simple: true }) !== "ok") fail();
+  const objects = new Set(db.prepare("SELECT type, name FROM sqlite_master").all()
+    .map((entry) => `${entry.type}:${entry.name}`));
+  for (const name of ["identity", "heads", "snapshots", "signer_history",
+    "owner_authority"]) if (!objects.has(`table:${name}`)) fail();
+  for (const name of ["immutable_opaque_signer_update", "immutable_opaque_signer_delete",
+    "immutable_opaque_snapshot_update", "immutable_opaque_snapshot_delete"])
+    if (!objects.has(`trigger:${name}`)) fail();
+  if (!objects.has("index:uq_opaque_cas_nonce")) fail();
+  const saved = db.prepare("SELECT * FROM identity WHERE id=1").get();
+  if (!saved || saved.authority_fp !== identity[0]
+    || saved.catalog_fp !== identity[1] || saved.scope !== identity[2]) fail();
+  const owner = db.prepare("SELECT * FROM owner_authority WHERE scope=?")
+    .get(identity[2]);
+  if (Boolean(owner) !== hasOwner) fail();
+}
 
 class Zk1OpaqueCatalogCasLedger {
   #minimum;
@@ -133,6 +153,8 @@ class Zk1OpaqueCatalogCasLedger {
     };
     if (this.#minimum.sequence === 0 && !same(this.#minimum.digest, EMPTY)) fail();
     this.#floor = { sequence: this.#minimum.sequence, digest: Buffer.from(this.#minimum.digest) };
+    const identity = [publicFingerprint(this.publicKey),
+      publicFingerprint(this.catalogSigner), this.scopeId];
     privateDir(filename);
     const exists = fs.existsSync(filename);
     if (bootstrapNew !== !exists || (bootstrapNew && this.#minimum.sequence !== 0)) fail();
@@ -141,6 +163,12 @@ class Zk1OpaqueCatalogCasLedger {
       if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1
         || (process.platform !== "win32"
           && (stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0))) fail();
+      let probe;
+      try {
+        probe = new Database(filename, { readonly: true, fileMustExist: true });
+        requireExistingCatalogSchema(probe, identity, Boolean(this.#ownerTrust));
+      } catch (_) { fail(); }
+      finally { probe?.close(); }
     }
     // SQLite ordinarily creates a new database with the process umask (often
     // 0644 on Linux). A later restart then correctly rejects that same file as
@@ -157,10 +185,14 @@ class Zk1OpaqueCatalogCasLedger {
     }
     this.db = new Database(filename, { fileMustExist: true, timeout: 3000 });
     try {
+      if (exists) {
+        requireExistingCatalogSchema(this.db, identity, Boolean(this.#ownerTrust));
+        this.#inspectSync();
+      }
       this.db.pragma("journal_mode = WAL");
       this.db.pragma("synchronous = FULL");
       this.db.pragma("foreign_keys = ON");
-      this.db.exec(`CREATE TABLE IF NOT EXISTS identity (
+      if (!exists) this.db.exec(`CREATE TABLE IF NOT EXISTS identity (
         id INTEGER PRIMARY KEY CHECK (id=1), authority_fp TEXT NOT NULL,
         catalog_fp TEXT NOT NULL, scope TEXT NOT NULL
       );
@@ -192,8 +224,6 @@ class Zk1OpaqueCatalogCasLedger {
         BEFORE UPDATE ON snapshots BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;
       CREATE TRIGGER IF NOT EXISTS immutable_opaque_snapshot_delete
         BEFORE DELETE ON snapshots BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;`);
-      const identity = [publicFingerprint(this.publicKey),
-        publicFingerprint(this.catalogSigner), this.scopeId];
       if (!exists) this.db.prepare("INSERT INTO identity VALUES (1,?,?,?)").run(...identity);
       const saved = this.db.prepare("SELECT * FROM identity WHERE id=1").get();
       if (!saved || saved.authority_fp !== identity[0]

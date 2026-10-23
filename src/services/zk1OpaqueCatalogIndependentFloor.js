@@ -91,6 +91,22 @@ function requirePrivateFile(filename, exists) {
         && (st.uid !== process.getuid() || (st.mode & 0o077)))) fail();
   }
 }
+function requireExistingFloorSchema(db, identity, hasOwner) {
+  // Validate in read-only mode before WAL pragmas or CREATE TABLE can modify
+  // an unrelated, rolled-back, or partially restored SQLite file.
+  if (db.pragma("quick_check", { simple: true }) !== "ok") fail();
+  const objects = new Set(db.prepare("SELECT type, name FROM sqlite_master").all()
+    .map((entry) => `${entry.type}:${entry.name}`));
+  for (const name of ["identity", "floor", "transitions", "owner_identity",
+    "owner_authority"]) if (!objects.has(`table:${name}`)) fail();
+  for (const name of ["immutable_floor_transition_update",
+    "immutable_floor_transition_delete"]) if (!objects.has(`trigger:${name}`)) fail();
+  const saved = db.prepare("SELECT * FROM identity WHERE id=1").get();
+  if (!saved || saved.scope !== identity[0] || !same(saved.floor_fp, identity[1])
+    || !same(saved.cas_fp, identity[2]) || !same(saved.catalog_fp, identity[3])) fail();
+  const owner = db.prepare("SELECT * FROM owner_identity WHERE id=1").get();
+  if (Boolean(owner) !== hasOwner) fail();
+}
 async function signed(state, nonce, signingKey, scope, fp) {
   const body = { type: TYPE, ...scope, cas_signer_spki_sha256: fp,
     sequence: state.sequence, digest: Buffer.from(state.digest),
@@ -147,12 +163,22 @@ class Zk1OpaqueCatalogIndependentFloorLedger {
     }
     this.casFingerprint = fingerprint(casSignerPublicKey);
     const own = fingerprint(crypto.createPublicKey(signingPrivateKey));
+    const expected = [this.id, own, this.casFingerprint,
+      fingerprint(this.catalogPublicKey)];
     if (same(own, this.casFingerprint) || same(own, fingerprint(catalogSignerPublicKey))
       || (this.ownerTrust && [own, this.casFingerprint, fingerprint(catalogSignerPublicKey)]
         .some((fp) => same(fp, fingerprint(this.ownerTrust.pinnedWitness.publicKey))))) fail();
     const exists = fs.existsSync(filename);
     if (bootstrapNew !== !exists) fail();
     requirePrivateFile(filename, exists);
+    if (exists) {
+      let probe;
+      try {
+        probe = new Database(filename, { readonly: true, fileMustExist: true });
+        requireExistingFloorSchema(probe, expected, Boolean(this.ownerTrust));
+      } catch (_) { fail(); }
+      finally { probe?.close(); }
+    }
     if (!exists) {
       let fd;
       try { fd = fs.openSync(filename, fs.constants.O_CREAT | fs.constants.O_EXCL
@@ -162,9 +188,13 @@ class Zk1OpaqueCatalogIndependentFloorLedger {
     }
     this.db = new Database(filename, { fileMustExist: true, timeout: 3000 });
     try {
+      if (exists) {
+        requireExistingFloorSchema(this.db, expected, Boolean(this.ownerTrust));
+        this.inspect();
+      }
       this.db.pragma("journal_mode=WAL");
       this.db.pragma("synchronous=FULL");
-      this.db.exec(`CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK(id=1),
+      if (!exists) this.db.exec(`CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK(id=1),
         scope TEXT NOT NULL, floor_fp BLOB NOT NULL, cas_fp BLOB NOT NULL,
         catalog_fp BLOB NOT NULL);
         CREATE TABLE IF NOT EXISTS floor (scope TEXT PRIMARY KEY,
@@ -182,8 +212,6 @@ class Zk1OpaqueCatalogIndependentFloorLedger {
           ON transitions BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;
         CREATE TRIGGER IF NOT EXISTS immutable_floor_transition_delete BEFORE DELETE
           ON transitions BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;`);
-      const expected = [this.id, own, this.casFingerprint,
-        fingerprint(this.catalogPublicKey)];
       if (!exists) this.db.prepare("INSERT INTO identity VALUES(1,?,?,?,?)").run(...expected);
       const saved = this.db.prepare("SELECT * FROM identity WHERE id=1").get();
       if (!saved || saved.scope !== this.id || !same(saved.floor_fp, expected[1])

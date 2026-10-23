@@ -528,19 +528,9 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
   cfg.floorDropAckOnce = false;
   await launchFloor();
 
-  // Simulate compromised SQLite rollback while unchanged startup config still
-  // names ZERO. Only the separate floor process knows the committed seq3.
-  const rewound = new Database(dbPath);
-  rewound.exec("DROP TRIGGER immutable_opaque_snapshot_update");
-  rewound.exec("DROP TRIGGER immutable_opaque_snapshot_delete");
-  rewound.exec("DELETE FROM snapshots; DELETE FROM heads;");
-  rewound.pragma("wal_checkpoint(TRUNCATE)");
-  rewound.close();
-  writeConfig();
-  const rejected = child("server", cfgPath);
-  await assert.rejects(wait(rejected, "startupError"), /ZK_OPAQUE_CAS_UNAVAILABLE/);
-  await exited(rejected);
-  // A forged Ed25519 floor signer cannot pass startup attestation.
+  // Test floor identity and loss while the local CAS SQLite is still valid.
+  // The later rollback test deliberately damages immutable triggers; with
+  // fail-closed read-only preflight that corruption is rejected first.
   const fake = crypto.generateKeyPairSync("ed25519");
   writePem("forged-floor.pub.pem", fake.publicKey.export({ type: "spki", format: "pem" }));
   cfg.floorPublicKeyPath = path.join(dir, "forged-floor.pub.pem");
@@ -554,4 +544,19 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
   const unavailable = child("server", cfgPath);
   await assert.rejects(wait(unavailable, "startupError"), /ZK_OPAQUE_FLOOR_UNAVAILABLE/);
   await exited(unavailable);
+  await launchFloor();
+
+  // Simulate compromised SQLite rollback while unchanged startup config still
+  // names ZERO. Only the separate floor process knows the committed seq3.
+  const rewound = new Database(dbPath);
+  rewound.exec("DROP TRIGGER immutable_opaque_snapshot_update");
+  rewound.exec("DROP TRIGGER immutable_opaque_snapshot_delete");
+  rewound.exec("DELETE FROM snapshots; DELETE FROM heads;");
+  rewound.pragma("wal_checkpoint(TRUNCATE)");
+  rewound.close();
+  writeConfig();
+  const rejected = child("server", cfgPath);
+  await assert.rejects(wait(rejected, "startupError"), /ZK_OPAQUE_CAS_UNAVAILABLE/);
+  await exited(rejected);
+  await stopFloor();
 });
