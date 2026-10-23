@@ -29,6 +29,10 @@ async function harness() {
   let finishArchive;
   let finishBatch;
   let batchCalls = 0;
+  let finishAccountCreate;
+  let finishAccountRecover;
+  let accountCreateCalls = 0;
+  let accountRecoverCalls = 0;
   let selectedBlob = null;
   const window = {
     RootarkApi: { get: async () => ({ enabled: true }) },
@@ -55,6 +59,18 @@ async function harness() {
       window.batchInput = input;
       return new Promise((resolve) => { finishBatch = resolve; });
     } },
+    RootarkZk1AccountPortableRecovery: {
+      createArchive: (input) => {
+        accountCreateCalls++;
+        window.accountCreateInput = input;
+        return new Promise((resolve) => { finishAccountCreate = resolve; });
+      },
+      recoverArchive: (input) => {
+        accountRecoverCalls++;
+        window.accountRecoverInput = input;
+        return new Promise((resolve) => { finishAccountRecover = resolve; });
+      },
+    },
     RootarkZk1V2DeviceApproval: { verifyImportedApproval: async () => ({}) },
     RootarkZk1KeyringPortableArchive: {
       createArchive: async () => ({}),
@@ -146,7 +162,7 @@ async function harness() {
   const value = (name, data) => { field(name).value = String(data); };
   file("owner", ownerRaw);
   file("grant", JSON.stringify({ revoked_at_epoch: null,
-    account_id: encode(crypto.randomBytes(16)), compartment_id: "scope",
+    account_id: encode(crypto.randomBytes(16)), compartment_id: encode(Buffer.from("scope")),
     keyring_id: encode(crypto.randomBytes(16)) }));
   file("history", JSON.stringify({ sequence: 1, signer_key_id: encode(crypto.randomBytes(16)) }));
   file("device", device.publicKey.export({ type: "spki", format: "der" }).subarray(-32));
@@ -155,6 +171,7 @@ async function harness() {
   file("bundle", JSON.stringify({ metadata: {} }));
   file("owner-root", "{}");
   file("archive-json", "{}");
+  file("account-owner-private", owner.privateKey.export({ type: "pkcs8", format: "der" }));
   value("owner-hash", encode(crypto.createHash("sha256").update(ownerRaw).digest()));
   value("owner-spki", encode(crypto.createHash("sha256")
     .update(owner.publicKey.export({ type: "spki", format: "der" })).digest()));
@@ -167,6 +184,7 @@ async function harness() {
   value("owner-device", "fixture-owner");
   field("archive-opt-in").checked = true;
   field("migration-batch-opt-in").checked = true;
+  field("account-opt-in").checked = true;
   return {
     document, dialog, downloads, field, file, listeners, window,
     trace,
@@ -187,6 +205,12 @@ async function harness() {
     batchCalls: () => batchCalls,
     waitForBatch: () => tickUntil(() => Boolean(finishBatch)),
     resolveBatch(result) { finishBatch(result); },
+    accountCreateCalls: () => accountCreateCalls,
+    accountRecoverCalls: () => accountRecoverCalls,
+    waitForAccountCreate: () => tickUntil(() => Boolean(finishAccountCreate)),
+    waitForAccountRecover: () => tickUntil(() => Boolean(finishAccountRecover)),
+    resolveAccountCreate(result) { finishAccountCreate(result); },
+    resolveAccountRecover(result) { finishAccountRecover(result); },
     denied: () => tickUntil(() => field("status").textContent.includes("Operação recusada")),
   };
 }
@@ -344,4 +368,142 @@ test("forged offline owner SPKI pin refuses before any batch operation", async (
   await page.denied();
   assert.equal(page.batchCalls(), 0);
   assert.equal(page.downloads.length, 0);
+});
+
+async function configureAccount(page, create = false) {
+  const originalGrant = JSON.parse(Buffer.from(
+    await page.field("grant").files[0].arrayBuffer()).toString());
+  const accountId = originalGrant.account_id;
+  const signer = encode(crypto.randomBytes(16));
+  const descriptor = { schema: "rootark-zk1-account-workspace-selection/v1",
+    accountId, keyrings: Array.from({ length: 2 }, (_unused, index) => ({
+      scope: { account_id: accountId, compartment_id: encode(Buffer.from([index + 1])),
+        keyring_id: encode(crypto.randomBytes(16)) },
+      pinnedCurrentHead: { revision: index + 1,
+        digest: encode(crypto.randomBytes(32)), epoch: index + 1 },
+      signedDeviceGrant: { revoked_at_epoch: null, device_id: "owner-device" },
+      ownerHistory: [{ sequence: 1, signer_key_id: signer }],
+      signerKeyId: signer, deviceId: "owner-device",
+      holderSecretFile: "holder-" + index + ".bin",
+      files: create ? ["file-" + index + ".txt"] : [],
+    })) };
+  for (const ring of descriptor.keyrings) Object.assign(ring.signedDeviceGrant, ring.scope);
+  const keyedFile = (name, bytes, type = "application/octet-stream") => ({
+    name, type, size: bytes.length,
+    arrayBuffer: async () => Uint8Array.from(bytes).buffer,
+  });
+  const secretData = [crypto.randomBytes(32), crypto.randomBytes(32)];
+  page.field("account-holder-files").files = secretData.map((b, i) => keyedFile("holder-" + i + ".bin", b));
+  page.field("account-local-files").files = create
+    ? [keyedFile("file-0.txt", Buffer.from("local A"), "text/plain"),
+      keyedFile("file-1.txt", Buffer.from("local B"), "text/plain")] : [];
+  page.file("account-descriptors", JSON.stringify(descriptor));
+  page.file("account-archive", "{}");
+  page.field("account-sha").value = encode(crypto.randomBytes(32));
+  return descriptor;
+}
+
+test("account create imports two separate holder secrets, signs selected files and wipes inputs", async () => {
+  const page = await harness();
+  await configureAccount(page, true);
+  page.click("account-create");
+  await page.waitForAccountCreate();
+  const input = page.window.accountCreateInput;
+  assert.equal(input.keyrings.length, 2);
+  assert.equal(input.keyrings[0].files.length, 1);
+  assert.equal(input.keyrings[1].files.length, 1);
+  assert.notDeepEqual([...input.keyrings[0].recoverySecret], [...input.keyrings[1].recoverySecret]);
+  assert.equal(input.ownerSigningKey.extractable, false);
+  page.resolveAccountCreate({ archive: { accountId: input.accountId,
+    keyrings: [{}, {}] }, archiveSha256: crypto.randomBytes(32),
+  authorizesProductionRestore: false });
+  await tickUntil(() => page.downloads.length === 2);
+  assert.deepEqual(page.downloads.map((file) => file.name), [
+    "rootark-account-archive.json", "rootark-account-archive.sha256.txt"]);
+  await tickUntil(() => page.field("account-local-files").files.length === 0);
+  for (const ring of input.keyrings) {
+    assert.deepEqual([...ring.recoverySecret], Array(32).fill(0));
+    assert.deepEqual([...ring.files[0].data], Array(ring.files[0].data.length).fill(0));
+  }
+});
+
+test("account recovery releases all verified keyrings locally and wipes every plaintext", async () => {
+  const page = await harness();
+  await configureAccount(page);
+  page.click("account-recover");
+  await page.waitForAccountRecover();
+  const input = page.window.accountRecoverInput;
+  const first = Uint8Array.of(1, 2), second = Uint8Array.of(3, 4);
+  page.resolveAccountRecover({ keyrings: [
+    { scope: input.keyrings[0].scope, files: [{ name: "alpha.txt", data: first }] },
+    { scope: input.keyrings[1].scope, files: [{ name: "beta.txt", data: second }] },
+  ], allKeyringsVerified: true, aggregateSignatureVerified: true,
+  aggregateIndependentPinMatched: true, authorizesProductionRestore: false });
+  await tickUntil(() => page.downloads.length === 2);
+  await tickUntil(() => page.field("account-holder-files").files.length === 0);
+  assert.match(page.downloads[0].name, /keyring-.*alpha\.txt/);
+  assert.match(page.downloads[1].name, /keyring-.*beta\.txt/);
+  assert.deepEqual([...first], [0, 0]);
+  assert.deepEqual([...second], [0, 0]);
+});
+
+test("account recovery aborts all downloads when second keyring has unsafe name", async () => {
+  const page = await harness();
+  await configureAccount(page);
+  page.click("account-recover");
+  await page.waitForAccountRecover();
+  const input = page.window.accountRecoverInput;
+  const first = Uint8Array.of(6), second = Uint8Array.of(7);
+  page.resolveAccountRecover({ keyrings: [
+    { scope: input.keyrings[0].scope, files: [{ name: "safe.txt", data: first }] },
+    { scope: input.keyrings[1].scope, files: [{ name: "../escape.txt", data: second }] },
+  ], allKeyringsVerified: true, aggregateSignatureVerified: true,
+  aggregateIndependentPinMatched: true, authorizesProductionRestore: false });
+  await page.denied();
+  assert.equal(page.downloads.length, 0);
+  assert.deepEqual([...first], [0]);
+  assert.deepEqual([...second], [0]);
+});
+
+for (const mode of ["logout", "session-swap"]) test("account recovery " + mode
+  + " during pending verification denies local release and wipes plaintext", async () => {
+  const page = await harness();
+  await configureAccount(page);
+  page.click("account-recover");
+  await page.waitForAccountRecover();
+  if (mode === "logout") page.logout();
+  else page.document.cookie = "rootark_csrf=another-user";
+  const input = page.window.accountRecoverInput;
+  const first = Uint8Array.of(1), second = Uint8Array.of(2);
+  page.resolveAccountRecover({ keyrings: [
+    { scope: input.keyrings[0].scope, files: [{ name: "one.txt", data: first }] },
+    { scope: input.keyrings[1].scope, files: [{ name: "two.txt", data: second }] },
+  ], allKeyringsVerified: true, aggregateSignatureVerified: true,
+  aggregateIndependentPinMatched: true, authorizesProductionRestore: false });
+  await page.denied();
+  assert.equal(page.downloads.length, 0);
+  assert.deepEqual([...first], [0]);
+  assert.deepEqual([...second], [0]);
+});
+
+test("account missing pinned head or forged owner SPKI denies before archive module", async () => {
+  const page = await harness();
+  const manifest = await configureAccount(page);
+  delete manifest.keyrings[1].pinnedCurrentHead.digest;
+  page.file("account-descriptors", JSON.stringify(manifest));
+  page.click("account-recover");
+  await page.denied();
+  assert.equal(page.accountRecoverCalls(), 0);
+  const other = await harness();
+  await configureAccount(other);
+  other.field("owner-spki").value = encode(crypto.randomBytes(32));
+  other.click("account-recover");
+  await other.denied();
+  assert.equal(other.accountRecoverCalls(), 0);
+});
+
+test("UI explicitly disclaims complete signed inventory for keyring and account selection", () => {
+  assert.match(source, /não comprova inventário completo do keyring/);
+  assert.match(source, /não comprova inventário completo da conta/);
+  assert.doesNotMatch(source, /<legend>Arquivo completo de keyring/);
 });

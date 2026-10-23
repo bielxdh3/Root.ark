@@ -3,7 +3,26 @@
 `public/client/rootark-zk1-account-portable-recovery.js` exposes two UMD/browser and
 CommonJS functions: `createArchive` and `recoverArchive`. It uses the existing
 `rootark-zk1-keyring-portable-archive.js` cryptographic and trust checks for each
-keyring. It does not integrate with the authenticated workspace or server routes.
+keyring. The normal authenticated browser workspace exposes an explicit offline
+selection flow in development mode; it does not add server archive routes.
+
+The browser selection file is a **user-supplied offline** JSON document with
+`schema: "rootark-zk1-account-workspace-selection/v1"`, `accountId`, and 1–8
+`keyrings`. Every keyring entry explicitly provides `scope`,
+`pinnedCurrentHead: { revision, digest, epoch }` (base64url digest),
+`signedDeviceGrant`, `ownerHistory` (genesis-to-current signed chain),
+`signerKeyId` (base64url), `deviceId`, `holderSecretFile` (32-byte binary input),
+and `files` (names of locally selected files during create, `[]` during recover).
+The browser requires the externally selected current owner public key/SPKI pin,
+current session/grant/head/history and independently provisioned browser floor
+for **each keyring**. Recovery additionally requires the independent account
+archive SHA-256, not a hash inside the encrypted package. Creation requires the
+owner PKCS#8 signing key supplied locally and proves it matches that owner key.
+The encrypted archive, its digest, and recovered contents are downloaded locally;
+no plaintext/CEK is uploaded. Inputs and output buffers are cleared after use.
+
+The UI packages only the local file selection per keyring; it does **not** prove
+the set is the complete signed keyring/account inventory or include all versions.
 
 - `createArchive({ accountId, ownerSigningKey, ownerPublicKey,
   independentOwnerSpkiSha256, keyrings })` accepts 1–8 existing keyring-archive

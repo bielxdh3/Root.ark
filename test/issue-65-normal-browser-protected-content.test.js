@@ -42,7 +42,8 @@ const scriptNames = ["rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-r
   "rootark-zk1-normal-browser-lab-ui", "rootark-zk1-portable-recovery-lab-ui",
   "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow",
   "rootark-zk1-legacy-batch-migration",
-  "rootark-zk1-v2-device-approval", "rootark-zk1-keyring-portable-archive"];
+  "rootark-zk1-v2-device-approval", "rootark-zk1-keyring-portable-archive",
+  "rootark-zk1-account-portable-recovery"];
 
 test("production static paths cannot disclose the opt-in normal browser laboratory", async (t) => {
   const app = express();
@@ -1188,6 +1189,113 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
         if(!contents.find(x=>x.name==="alpha.txt"&&x.data==="offline alpha")
           || !contents.find(x=>x.name==="beta.txt"&&x.data==="offline beta"))
           throw Error("KEYRING_LOCAL_CONTENT_MISMATCH");
+        // Real Edge: offline account coordinator through authenticated UI and
+        // native WebCrypto, with no account archive server endpoint.
+        archiveDownloads=[];
+        const accountHolder=crypto.getRandomValues(new Uint8Array(32));
+        const accountSelection=(files)=>({
+          schema:"rootark-zk1-account-workspace-selection/v1",
+          accountId:values.grant.account_id,
+          keyrings:[{scope:{account_id:values.grant.account_id,
+            compartment_id:values.grant.compartment_id,
+            keyring_id:values.grant.keyring_id},
+            pinnedCurrentHead:{...values.head},signedDeviceGrant:values.grant,
+            ownerHistory:[values.archiveHistory],
+            signerKeyId:${JSON.stringify(b64(ownerHistoryKeyId))},
+            deviceId:values.grant.device_id,holderSecretFile:"holder.bin",files}]});
+        const setAccount=(names)=>{
+          setFile("account-descriptors",new TextEncoder().encode(JSON.stringify(accountSelection(names))));
+          const holderInput=new DataTransfer();
+          holderInput.items.add(new File([accountHolder],"holder.bin"));
+          field("account-holder-files").files=holderInput.files;
+          field("account-opt-in").checked=true;
+          setFile("history",new TextEncoder().encode(JSON.stringify(values.archiveHistory)));
+        };
+        setAccount(["account-selected.txt"]);
+        const accountFiles=new DataTransfer();
+        accountFiles.items.add(new File(["only selected offline"],"account-selected.txt",
+          {type:"text/plain"}));
+        field("account-local-files").files=accountFiles.files;
+        setFile("account-owner-private",decode(values.archiveOwnerPrivate));
+        window.__accountProbeStage="create";
+        document.querySelector('[data-zk1-action="account-create"]').click();
+        await wait(()=>field("status").textContent.includes("Pacote cifrado e assinado de")
+          || field("status").textContent.includes("Operação recusada"));
+        if(!field("status").textContent.includes("1 keyring(s) baixado")
+          || archiveDownloads.length!==2)throw Error("ACCOUNT_CREATE_DENIED:"+field("status").textContent);
+        const accountArchiveArtifact=archiveDownloads.find(x=>x.name==="rootark-account-archive.json");
+        const accountHashArtifact=archiveDownloads.find(x=>x.name==="rootark-account-archive.sha256.txt");
+        if(!accountArchiveArtifact||!accountHashArtifact)
+          throw Error("ACCOUNT_INDEPENDENT_HASH_MISSING");
+        const accountArchive=await archiveBlobs.get(accountArchiveArtifact.href).text();
+        const accountHash=await archiveBlobs.get(accountHashArtifact.href).text();
+        if(!JSON.parse(accountArchive).signature)throw Error("ACCOUNT_UNSIGNED");
+        archiveDownloads=[];
+        setAccount([]);
+        setFile("account-archive",new TextEncoder().encode(accountArchive));
+        field("account-sha").value=accountHash;
+        window.__accountProbeStage="recover";
+        document.querySelector('[data-zk1-action="account-recover"]').click();
+        await wait(()=>field("status").textContent.includes("arquivos baixados localmente")
+          || field("status").textContent.includes("Operação recusada"));
+        if(!field("status").textContent.includes("1 arquivos baixados localmente")
+          || archiveDownloads.length!==1)throw Error("ACCOUNT_RECOVER_DENIED:"+field("status").textContent);
+        const openedAccount=await archiveBlobs.get(archiveDownloads[0].href).text();
+        if(openedAccount!=="only selected offline"
+          ||!archiveDownloads[0].name.includes("account-selected.txt"))
+          throw Error("ACCOUNT_PLAINTEXT_MISMATCH");
+        archiveDownloads=[];
+        setAccount([]);
+        field("account-sha").value=values.ownerHash;
+        setFile("account-archive",new TextEncoder().encode(accountArchive));
+        window.__accountProbeStage="wrong-hash";
+        document.querySelector('[data-zk1-action="account-recover"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        await wait(()=>field("account-holder-files").files.length===0);
+        if(archiveDownloads.length)throw Error("ACCOUNT_FORGED_PIN_RELEASE");
+        // Intercept post-verification plaintext and simulate logout in the
+        // middle of the coordinator's promise: no account output is released.
+        setAccount([]);
+        field("account-sha").value=accountHash;
+        setFile("account-archive",new TextEncoder().encode(accountArchive));
+        const accountApi=window.RootarkZk1AccountPortableRecovery;
+        let resolvePendingAccount;
+        let accountIntercepted=false;
+        window.RootarkZk1AccountPortableRecovery={...accountApi,
+          recoverArchive:async(...args)=>{
+            accountIntercepted=true;
+            const value=await accountApi.recoverArchive(...args);
+            return new Promise(resolve=>{resolvePendingAccount=()=>resolve(value);});
+          }};
+        window.__accountProbeStage="late-logout";
+        document.querySelector('[data-zk1-action="account-recover"]').click();
+        window.__accountProbeStage="late-hold";
+        await wait(()=>typeof resolvePendingAccount==="function"
+          ||field("status").textContent.includes("Operação recusada"));
+        if(typeof resolvePendingAccount!=="function")
+          throw Error("ACCOUNT_LATE_NOT_REACHED:"+accountIntercepted);
+        window.dispatchEvent(new Event("rootark:logout"));
+        resolvePendingAccount();
+        window.__accountProbeStage="late-denied";
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        if(archiveDownloads.length||document.querySelector("dialog").open)
+          throw Error("ACCOUNT_LOGOUT_LATE_PLAINTEXT_RELEASE");
+        window.RootarkZk1AccountPortableRecovery=accountApi;
+        accountHolder.fill(0);
+        // The rest of this existing Edge acceptance test exercises a fresh
+        // authenticated dialog after the deliberate account logout.
+        (await wait(()=>document.getElementById("zk1-workspace-open"))).click();
+        await wait(()=>document.querySelector("dialog").open);
+        setFile("owner",decode(values.ownerRaw));
+        field("owner-hash").value=values.ownerHash;
+        field("owner-spki").value=values.ownerSpkiHash;
+        field("revision").value=values.head.revision;
+        field("digest").value=values.head.digest;
+        field("epoch").value=values.head.epoch;
+        setFile("grant",new TextEncoder().encode(JSON.stringify(values.grant)));
+        setFile("history",new TextEncoder().encode(JSON.stringify(values.archiveHistory)));
+        field("owner-signer").value=${JSON.stringify(b64(ownerHistoryKeyId))};
+        field("owner-device").value=values.grant.device_id;
         archiveDownloads=[];
         field("archive-sha").value=values.ownerHash;
         setFile("archive-json",new TextEncoder().encode(exportedArchive));
@@ -1314,7 +1422,9 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
         HTMLAnchorElement.prototype.click=originalClick;
         batchSecret.fill(0);
         output.textContent="EDGE_AUTH_WORKSPACE_PASS";
-      } catch(e){output.textContent="EDGE_AUTH_WORKSPACE_FAIL:"+e.message;}
+      } catch(e){output.textContent="EDGE_AUTH_WORKSPACE_FAIL:"+e.message+
+        ":STAGE="+(window.__accountProbeStage||"before-account")+
+        ":STATUS="+(document.querySelector('[data-zk1-field="status"]')?.textContent||"");}
     });`));
   const server = await new Promise((resolve) => {
     const value = app.listen(0, "127.0.0.1", () => resolve(value));
