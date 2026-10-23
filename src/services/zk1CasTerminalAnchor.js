@@ -126,7 +126,12 @@ class Zk1CasTerminalAnchor {
         sequence: seq.value, lastHash: hash.value,
       });
     }
-    if (!fs.existsSync(filename)) {
+    const existed = fs.existsSync(filename);
+    // An explicit bootstrap may create only a NEW anchor. Accepting an
+    // existing validly signed file would silently adopt an old or transplanted
+    // terminal history under a fresh authority instead of failing closed.
+    if (existed && bootstrapNew === true) fail();
+    if (!existed) {
       // A nonempty independently pinned floor means THIS IS A RESTART, not
       // a bootstrap. Refuse before creating even a genesis anchor file.
       if (this.#trustedMinimumHead !== undefined
