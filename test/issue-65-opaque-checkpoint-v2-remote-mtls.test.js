@@ -30,7 +30,7 @@ const { Zk1OpaqueCatalogIndependentFloorLedger,
   require("../src/services/zk1OpaqueCatalogIndependentFloor");
 const { OpaqueCheckpointV2Authority,
   createOpaqueCheckpointV2HttpsServer, createOpaqueCheckpointV2HttpsClient,
-  signCheckpointOwnerApprovalV2, createOpaqueCheckpointV2Coordinator } =
+  signCheckpointOwnerApprovalV2, createOpaqueCheckpointV2Coordinator, inspectIntent } =
   require("../src/services/zk1OpaqueCheckpointV2Remote");
 const { Zk1OpaqueCheckpointV2Client } =
   require("../src/services/zk1OpaqueCheckpointV2Client");
@@ -197,6 +197,15 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   await fixtures.appendDeviceEnrollment(state, 2);
   const deviceC = state.headManifest.devices.find((d) => d.device_id === "trusted-2");
   assert.ok(deviceC && deviceC.revoked_at_epoch === null);
+  // Snapshot independently witnessed state BEFORE A is revoked. An isolated
+  // second mTLS pair below will bootstrap #129 under A, revoke A, then admit
+  // B for the literal first successor #130 and its #131 continuation.
+  const firstOwnerEpoch = {
+    headManifest: state.headManifest, verifiedHistory: state.verifiedHistory,
+    transitions: state.transitions.slice(), epochKeys: state.epochKeys.slice(),
+    packageEnvelopes: state.packageEnvelopes.slice(),
+    lastVerifiedTargetPopProof: state.lastVerifiedTargetPopProof,
+  };
   await fixtures.appendDeviceRevocation(state, deviceA.device_id);
   // B is enrolled and active, A is owner-revoked at the later epoch.
   assert.equal(state.headManifest.devices.find((d) =>
@@ -1314,6 +1323,237 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
         state.epochKeys = ownerState.epochKeys;
       }
     } finally { recipientRotating.close(); }
+  }
+  // Dedicated first-rotation mTLS canary. The other fixture already had A
+  // revoked before #129; this one proves A129 -> B130 -> B131 against NEW
+  // CAS/FLOOR authorities with their ownerPublicKey still pinned to A.
+  {
+    const historicalState = { ...state, ...firstOwnerEpoch,
+      transitions: firstOwnerEpoch.transitions.slice(),
+      epochKeys: firstOwnerEpoch.epochKeys.slice(),
+      packageEnvelopes: firstOwnerEpoch.packageEnvelopes.slice() };
+    async function historicalWitness(nonce) {
+      const manifest = historicalState.headManifest;
+      const statement = { type: "rootark-recovery-witness-head/v1",
+        witness_key_id: witnessKeyId, ...scope,
+        current_revision: manifest.revision,
+        current_manifest_digest: await ownerManifest.recoveryManifestDigestV2(manifest),
+        witness_sequence: manifest.revision, nonce, observed_at: now(),
+        status: "committed", pending_reservation_id: null };
+      return Buffer.from(await z.encodeDeterministic({ ...statement,
+        signature: crypto.sign(null, Buffer.concat([WITNESS_DOMAIN,
+          await z.encodeDeterministic(statement)]), witness.privateKey) }));
+    }
+    const historicalTrust = { ...trust,
+      freshWitnessHead: ({ nonce }) => historicalWitness(nonce) };
+    const historicalEvidence = async () => Buffer.from(await z.encodeDeterministic({
+      baseManifest: historicalState.baseManifest,
+      baseReceipt: historicalState.baseReceipt,
+      transitions: historicalState.transitions,
+      packageEnvelopes: historicalState.packageEnvelopes,
+      witnessHeadRaw: await historicalWitness(crypto.randomBytes(32)),
+    }));
+    const historicalAuthorityOptions = { ...authorityOptions,
+      ownerPublicKey: signerA, ownerTrust: historicalTrust };
+    const historicCasFile = path.join(dir, "v2-first-rotation-cas.sqlite");
+    const historicFloorFile = path.join(dir, "v2-first-rotation-floor.sqlite");
+    let casHistoric, floorHistoric, casHistoricServer, floorHistoricServer;
+    const openHistorical = (bootstrapNew) => {
+      casHistoric = new OpaqueCheckpointV2Authority(historicCasFile, {
+        ...historicalAuthorityOptions, role: "CAS", bootstrapNew,
+        signingPrivateKey: v2CasKeys.privateKey });
+      floorHistoric = new OpaqueCheckpointV2Authority(historicFloorFile, {
+        ...historicalAuthorityOptions, role: "FLOOR", bootstrapNew,
+        signingPrivateKey: v2FloorKeys.privateKey });
+      cleanupDatabases.push(casHistoric, floorHistoric);
+    };
+    async function serveHistorical() {
+      casHistoricServer = createOpaqueCheckpointV2HttpsServer({
+        ledger: casHistoric, tlsKey: read("v2cas.key"), tlsCert: read("v2cas.pem"),
+        clientCa: read("ca.pem"), clientFingerprint256: x509("client.pem") });
+      floorHistoricServer = createOpaqueCheckpointV2HttpsServer({
+        ledger: floorHistoric, tlsKey: read("v2floor.key"), tlsCert: read("v2floor.pem"),
+        clientCa: read("ca.pem"), clientFingerprint256: x509("client.pem") });
+      for (const server of [casHistoricServer, floorHistoricServer]) {
+        await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+        cleanupServers.push(server);
+      }
+      const common = { ca: read("ca.pem"), clientKey: read("client.key"),
+        clientCert: read("client.pem"), casPublicKey: v2CasKeys.publicKey,
+        floorPublicKey: v2FloorKeys.publicKey, scope };
+      const casClient = createOpaqueCheckpointV2HttpsClient({
+        ...common, endpoint: "https://127.0.0.1:" + casHistoricServer.address().port + "/",
+        authorityPublicKey: v2CasKeys.publicKey,
+        serverFingerprint256: x509("v2cas.pem") });
+      const floorClient = createOpaqueCheckpointV2HttpsClient({
+        ...common, endpoint: "https://127.0.0.1:" + floorHistoricServer.address().port + "/",
+        authorityPublicKey: v2FloorKeys.publicKey,
+        serverFingerprint256: x509("v2floor.pem") });
+      return { casClient, floorClient,
+        coordinator: createOpaqueCheckpointV2Coordinator({
+          casClient, floorClient, v1CasClient: v1Cas, v1FloorClient: v1Floor,
+          trustedScope: scope, expectedV1Digest: oldDigest,
+          expectedV1Checkpoint: oldCheckpoint }) };
+    }
+    async function closeHistorical() {
+      for (const server of [casHistoricServer, floorHistoricServer]) {
+        if (server?.listening) {
+          server.closeAllConnections();
+          await new Promise((resolve) => server.close(resolve));
+        }
+      }
+      casHistoric?.close();
+      floorHistoric?.close();
+    }
+    const historicalPage = Buffer.from(await z.encodeDeterministic([
+      { ...encryptedRecord, epoch: Number(historicalState.headManifest.current_epoch) }]));
+    const historicalPageDigest = crypto.createHash("sha256")
+      .update(Buffer.from("Root.ark/zk-1/opaque-catalog-page/v1\0"))
+      .update(historicalPage).digest();
+    let previousHistorical = { sequence: 128, digest: oldDigest,
+      checkpointDigest: oldCheckpoint, operationId: Buffer.alloc(32), raw: null };
+    let historicalHandles;
+    openHistorical(true);
+    try {
+      historicalHandles = await serveHistorical();
+      async function publishHistorical(sequence, signerDevice, approvalDevice,
+        publish = true) {
+        const epochManifest = historicalState.headManifest;
+        const header = Buffer.from(await z.encodeDeterministic({
+          ...nextHeader, sequence, previous_digest: previousHistorical.digest,
+          manifest_revision: Number(epochManifest.revision),
+          manifest_digest: await ownerManifest.recoveryManifestDigestV2(epochManifest),
+          epoch: Number(epochManifest.current_epoch),
+          signer_device_id: signerDevice.device_id,
+          page_digests: [historicalPageDigest], issued_at: now(),
+        }));
+        const signature = crypto.sign(null, Buffer.concat([HEAD_DOMAIN, header]),
+          keys(signerDevice));
+        const headDigest = hd(header, signature);
+        const record = { sequence, header, signature, page_bodies: [historicalPage] };
+        const archive = await createAuthenticatedOpaqueCatalogArchiveV2({
+          scope, records: [record], previousSequence: sequence - 1,
+          previousDigest: previousHistorical.digest,
+          previousCheckpointDigest: previousHistorical.checkpointDigest,
+          resolveCatalogSigner: async () => keyFromDevice(signerDevice),
+          checkpointPrivateKey: checkpoint.privateKey, issuedAt: now(),
+        });
+        const operationId = crypto.randomBytes(32);
+        const approval = await signCheckpointOwnerApprovalV2({
+          type: "rootark-opaque-checkpoint-remote-owner-approval/v2", ...scope,
+          operation_id: operationId, checkpoint_digest: archive.checkpointDigest,
+          previous_sequence: sequence - 1, previous_digest: previousHistorical.digest,
+          previous_checkpoint_digest: previousHistorical.checkpointDigest,
+          final_sequence: sequence, final_digest: headDigest,
+          cas_signer_fp: fp(v2CasKeys.publicKey),
+          floor_signer_fp: fp(v2FloorKeys.publicKey),
+          checkpoint_signer_fp: fp(checkpoint.publicKey), issued_at: now(),
+        }, keys(approvalDevice));
+        const predecessor = sequence === 129 ? {} :
+          await historicalHandles.coordinator.predecessorEndorsements(previousHistorical.raw);
+        const raw = Buffer.from(await z.encodeDeterministic({
+          type: "rootark-opaque-checkpoint-remote-intent/v2", ...scope,
+          operation_id: operationId, checkpoint_bytes: archive.checkpointBytes,
+          checkpoint_signature: archive.checkpointSignature, records: [record],
+          previous_sequence: sequence - 1,
+          previous_digest: previousHistorical.digest,
+          previous_checkpoint_digest: previousHistorical.checkpointDigest,
+          owner_approval: approval.raw, owner_signature: approval.signature,
+          owner_evidence: await historicalEvidence(), ...predecessor,
+        }));
+        // Every authorizing key must be derived from the signed recovery
+        // manifest and witness, even with NO cachedSigner supplied.
+        const inspectorOptions = { scope, ownerKey: signerA,
+          ownerTrust: historicalTrust, casKey: v2CasKeys.publicKey,
+          floorKey: v2FloorKeys.publicKey, checkpointKey: checkpoint.publicKey,
+          casFp: fp(v2CasKeys.publicKey), floorFp: fp(v2FloorKeys.publicKey),
+          checkpointFp: fp(checkpoint.publicKey),
+          baseDigest: previousHistorical.digest,
+          baseCheckpoint: previousHistorical.checkpointDigest,
+          previousOperationId: previousHistorical.operationId };
+        const inspected = await inspectIntent(raw, inspectorOptions,
+          { freshOwner: false, historicalOwner: true });
+        assert.deepEqual(inspected.signerSpki,
+          keyFromDevice(signerDevice).export({ format: "der", type: "spki" }),
+        "historical catalog signer is proven by owner-rooted history WITHOUT cachedSigner");
+        assert.deepEqual(inspected.ownerApprovalSignerSpki,
+          keyFromDevice(approvalDevice).export({ format: "der", type: "spki" }),
+        "owner approval signer is independently authenticated per epoch, not catalog signer");
+        const alternate = signerDevice.device_id === deviceA.device_id ? signerB : signerA;
+        await assert.rejects(inspectIntent(raw, { ...inspectorOptions,
+          cachedSigner: alternate }, { freshOwner: false, historicalOwner: true }),
+        /ZK_CHECKPOINT_V2_UNAVAILABLE/,
+        "forged cachedSigner cannot override the witnessed catalog signer");
+        const altered = await z.decodeDeterministic(raw);
+        altered.owner_signature = crypto.randomBytes(64);
+        await assert.rejects(inspectIntent(Buffer.from(await z.encodeDeterministic(altered)),
+          inspectorOptions, { freshOwner: false, historicalOwner: true }),
+        /ZK_CHECKPOINT_V2_UNAVAILABLE/,
+        "owner signature forgery cannot certify historical catalog signer");
+        if (publish) {
+          assert.equal((await historicalHandles.coordinator.publish(raw)).finalSequence, sequence,
+            "real independent mTLS CAS/FLOOR accept the owner rotation at its exact sequence");
+          previousHistorical = { sequence, digest: headDigest,
+            checkpointDigest: archive.checkpointDigest, operationId, raw };
+        }
+        return raw;
+      }
+      const raw129 = await publishHistorical(129, deviceA, deviceA);
+      assert.equal((await historicalHandles.floorClient.head()).sequence, 129);
+      assert.equal((await historicalHandles.casClient.head()).sequence, 129);
+      // B signs the owner-signed recovery revocation of A. The immutable #129
+      // historical approval remains valid while A cannot authorize #130.
+      await fixtures.appendDeviceRevocation(historicalState, deviceA.device_id,
+        undefined, deviceB.device_id);
+      assert.ok(historicalState.headManifest.devices.find((device) =>
+        device.device_id === deviceA.device_id).revoked_at_epoch !== null);
+      const raw130 = await publishHistorical(130, deviceB, deviceB);
+      // #131 still has B's owner approval, while independent device C signs
+      // the catalog head. This rules out conflating the two Ed25519 roles.
+      const raw131 = await publishHistorical(131, deviceC, deviceB);
+      assert.equal((await historicalHandles.casClient.head()).sequence, 131);
+      assert.equal((await historicalHandles.floorClient.head()).sequence, 131);
+      await assert.rejects(historicalHandles.coordinator.publish(raw130),
+        /ZK_CHECKPOINT_V2_(?:ACK_UNCERTAIN|CONFLICT|UNAVAILABLE)/,
+      "the older B130 cannot replace already finalized B131");
+      await assert.rejects(historicalHandles.coordinator.publish(raw129),
+        /ZK_CHECKPOINT_V2_(?:ACK_UNCERTAIN|CONFLICT|UNAVAILABLE)/,
+      "revoked A129 cannot roll back a finalized B131");
+      await closeHistorical();
+      openHistorical(false);
+      historicalHandles = await serveHistorical();
+      assert.equal((await historicalHandles.casClient.head()).sequence, 131,
+        "CAS historical A129 survives owner A revocation and database restart");
+      assert.equal((await historicalHandles.floorClient.head()).sequence, 131,
+        "FLOOR historical A129 survives owner A revocation and database restart");
+      assert.equal((await historicalHandles.coordinator.reconcile(raw131)).finalSequence, 131);
+      // Adversarial interleaving: a durable CAS_COMMITTED receipt was accepted
+      // while B was active, then C revoked B before FLOOR.finalize. The old
+      // receipt must not become a fresh public FINALIZED checkpoint.
+      const pending132 = await publishHistorical(132, deviceB, deviceB, false);
+      const pendingFloor = await historicalHandles.floorClient.prepare(pending132);
+      assert.equal(pendingFloor.state, "PREPARED");
+      const pendingCas = await historicalHandles.casClient.commit(pending132,
+        pendingFloor.raw);
+      assert.equal(pendingCas.state, "CAS_COMMITTED");
+      await fixtures.appendDeviceRevocation(historicalState, deviceB.device_id,
+        undefined, deviceC.device_id);
+      await assert.rejects(historicalHandles.floorClient.finalize(pendingCas.raw),
+        /ZK_CHECKPOINT_V2_ACK_UNCERTAIN/,
+        "revocation between CAS_COMMIT and FLOOR_FINALIZE blocks stale approval");
+      assert.equal((await historicalHandles.floorClient.head()).state, "PREPARED");
+      assert.equal((await historicalHandles.casClient.head()).state, "CAS_COMMITTED");
+      await closeHistorical();
+      openHistorical(false);
+      historicalHandles = await serveHistorical();
+      assert.equal((await historicalHandles.floorClient.head()).state, "PREPARED",
+        "revoked pending floor never promotes on restart");
+      assert.equal((await historicalHandles.casClient.head()).state, "CAS_COMMITTED",
+        "CAS acknowledgement remains uncertain after revocation and restart");
+      await assert.rejects(historicalHandles.coordinator.reconcile(pending132),
+        /ZK_CHECKPOINT_V2_(?:ACK_UNCERTAIN|UNAVAILABLE|CONFLICT)/,
+        "reconcile cannot turn revoked pending #132 into FINALIZED");
+    } finally { await closeHistorical(); }
   }
   await new Promise((resolve) => bridgeServer.close(resolve));
   await stopV2();

@@ -380,7 +380,13 @@ async function inspectIntent(raw, opts, { freshOwner = true, historicalOwner = f
   if (freshOwner || historicalOwner) {
     const trusted = await verifyOwnerRooted(body, { ...opts,
       checkpointDigest, finalDigest }, { historical: !freshOwner });
-    signer = freshOwner ? trusted.signer : key(opts.cachedSigner);
+    // The independently witnessed recovery manifest authenticates the signer
+    // at this sequence. A caller-provided cached key may only corroborate it;
+    // historical inspectors must never require or trust an unproven cache.
+    signer = trusted.signer;
+    if (historicalOwner && opts.cachedSigner !== undefined
+      && !same(signer.export({ type: "spki", format: "der" }),
+        key(opts.cachedSigner).export({ type: "spki", format: "der" }))) fail();
     ownerApprovalSigner = trusted.ownerApprovalSigner;
   } else signer = key(opts.cachedSigner); // caller may only use for exact immutable reread
   const verified = await archiveV2.verifyAuthenticatedOpaqueCatalogArchiveV2({
@@ -608,8 +614,14 @@ class OpaqueCheckpointV2Authority {
   async finalize(casCommit, nonce) {
     if (this.role !== ROLE_FLOOR) fail();
     return this.#serial(async () => {
-      const row = (await this.#history()).at(-1);
+      const rows = await this.#history();
+      const row = rows.at(-1);
       if (!row) fail("ZK_CHECKPOINT_V2_CONFLICT");
+      // Revocation may land after PREPARE or CAS_COMMIT. Before advancing a
+      // pending intent into FINALIZED, require the owner approval's witnessed
+      // epoch to STILL be the live witnessed head. A local pending receipt
+      // from an obsolete epoch must not authorize new finalization.
+      if (row.state === "PREPARED") await this.#inspect(row, true, rows.at(-2));
       await receiptMatches(casCommit, { scope: this.#settings.scope,
         role: ROLE_CAS, state: "CAS_COMMITTED", sequence: row.sequence,
         headDigest: row.final_digest, checkpointDigest: row.checkpoint_digest,
@@ -625,8 +637,10 @@ class OpaqueCheckpointV2Authority {
   async attestFinalized(floorFinalized, nonce) {
     if (this.role !== ROLE_CAS) fail();
     return this.#serial(async () => {
-      const row = (await this.#history()).at(-1);
+      const rows = await this.#history();
+      const row = rows.at(-1);
       if (!row) fail("ZK_CHECKPOINT_V2_CONFLICT");
+      if (row.state === "CAS_COMMITTED") await this.#inspect(row, true, rows.at(-2));
       await receiptMatches(floorFinalized, { scope: this.#settings.scope,
         role: ROLE_FLOOR, state: "FINALIZED", sequence: row.sequence,
         headDigest: row.final_digest, checkpointDigest: row.checkpoint_digest,
