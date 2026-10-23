@@ -22,6 +22,36 @@ function bounded(value) {
   return text.length > MAX_OUTPUT_CHARS ? `${text.slice(0, MAX_OUTPUT_CHARS)}\n[preview truncated]` : text;
 }
 
+function readPinnedText(filePath) {
+  // The caller authorizes a path; check that the opened file is still the
+  // same regular file and cap the bytes actually read from its descriptor.
+  const expected = fs.lstatSync(filePath);
+  if (!expected.isFile() || expected.isSymbolicLink() || expected.size > MAX_INPUT_BYTES) {
+    throw parserFailure("PREVIEW_TOO_LARGE", "PREVIEW_TOO_LARGE");
+  }
+  const fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.size > MAX_INPUT_BYTES) throw parserFailure("PREVIEW_TOO_LARGE", "PREVIEW_TOO_LARGE");
+    if (opened.dev !== expected.dev || opened.ino !== expected.ino) {
+      throw parserFailure("PREVIEW_FILE_CHANGED", "PREVIEW_FILE_CHANGED");
+    }
+    const chunks = [];
+    let total = 0;
+    while (total <= MAX_INPUT_BYTES) {
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_INPUT_BYTES + 1 - total));
+      const bytes = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (bytes === 0) break;
+      chunks.push(buffer.subarray(0, bytes));
+      total += bytes;
+    }
+    if (total > MAX_INPUT_BYTES) throw parserFailure("PREVIEW_TOO_LARGE", "PREVIEW_TOO_LARGE");
+    return Buffer.concat(chunks, total).toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function killParserProcess(child, force = false) {
   if (!child || child.exitCode !== null && child.exitCode !== undefined) return;
   const signal = force ? "SIGKILL" : "SIGTERM";
@@ -203,9 +233,11 @@ async function parseDocumentInChildProcess(filePath, extension, options = {}) {
 async function previewText(filePath, fileName, options = {}) {
   const extension = path.extname(fileName || filePath).toLowerCase();
   if (!TEXT_EXTENSIONS.has(extension) && extension !== ".doc" && extension !== ".docx") throw new Error("PREVIEW_UNSUPPORTED");
+  if (TEXT_EXTENSIONS.has(extension)) {
+    return { content: bounded(readPinnedText(filePath)), format: "text", language: extension.slice(1) || "text" };
+  }
   const stat = fs.statSync(filePath);
   if (!stat.isFile() || stat.size > MAX_INPUT_BYTES) throw new Error("PREVIEW_TOO_LARGE");
-  if (TEXT_EXTENSIONS.has(extension)) return { content: bounded(fs.readFileSync(filePath, "utf8")), format: "text", language: extension.slice(1) || "text" };
   const content = await parseDocumentInChildProcess(filePath, extension, options);
   return { content, format: "document", language: extension.slice(1) };
 }
