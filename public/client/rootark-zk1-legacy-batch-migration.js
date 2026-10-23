@@ -137,13 +137,27 @@
   }
   async function runLegacyMigrationBatch(input) {
     exact(input, ["optIn", "entries", "migrationSecret", "trust", "origin",
-      "fetchImpl", "journal", "nowSeconds"]);
+      "fetchImpl", "journal", "nowSeconds",
+      ...(Object.hasOwn(input || {}, "transitionApprovals") ? ["transitionApprovals"] : [])]);
     if (input.optIn !== true || !Array.isArray(input.entries)
       || input.entries.length < 1 || input.entries.length > LIMIT
       || !(input.migrationSecret instanceof Uint8Array)
       || input.migrationSecret.byteLength !== 32
       || typeof input.fetchImpl !== "function" || typeof input.origin !== "string"
       || !input.trust?.signedDeviceGrant || !input.trust?.pinnedCurrentHead) refuse();
+    const approvals = Object.hasOwn(input, "transitionApprovals")
+      ? input.transitionApprovals : null;
+    if (approvals !== null && (!Array.isArray(approvals)
+      || approvals.length !== input.entries.length
+      || Reflect.ownKeys(approvals).length !== approvals.length + 1)) refuse();
+    if (approvals) {
+      for (let i = 0; i < approvals.length; i++) {
+        const slot = Object.getOwnPropertyDescriptor(approvals, String(i));
+        if (!slot || !Object.hasOwn(slot, "value")) refuse();
+        if (slot.value !== null) exact(slot.value,
+          ["signedRootCheckpoint", "signedTransitionReceipt"]);
+      }
+    }
     const scope = Object.fromEntries(SCOPE.map((field) =>
       [field, input.trust.signedDeviceGrant[field]]));
     if (SCOPE.some((field) => typeof scope[field] !== "string"
@@ -178,7 +192,7 @@
     // Sequential, bounded: an ambiguous item never authorizes re-sending PUT,
     // and a partial batch never marks subsequent items as complete.
     const results = [];
-    for (const { entry, metadata } of prepared) {
+    for (const [index, { entry, metadata }] of prepared.entries()) {
       const safeResult = { objectId: metadata.object_id,
         versionId: metadata.version_id, legacyVersion: entry.sourcePin.version,
         canDeleteLegacy: false, authorizesCutover: false };
@@ -191,18 +205,41 @@
           nowSeconds: input.nowSeconds,
         });
         await verifyCatalog(entry, input.fetchImpl);
+        let transitionResult = null;
+        if (approvals && approvals[index] !== null) {
+          const approved = approvals[index];
+          exact(approved, ["signedRootCheckpoint", "signedTransitionReceipt"]);
+          transitionResult = await migration.stageLegacyMigrationTransition({
+            optIn: true, legacy: entry.legacy, sourcePin: entry.sourcePin,
+            metadata, trust: input.trust, cek: entry.cek, origin: input.origin,
+            fetchImpl: input.fetchImpl, journal: input.journal,
+            nowSeconds: input.nowSeconds,
+            signedRootCheckpoint: approved.signedRootCheckpoint,
+            signedTransitionReceipt: approved.signedTransitionReceipt,
+          });
+          await verifyCatalog(entry, input.fetchImpl);
+        }
         results.push(Object.freeze({ ...safeResult,
-          phase: result.phase, verifiedLocalReadback: true, root: result.root,
-          requiresOwnerCheckpoint: true }));
+          phase: transitionResult?.phase || result.phase,
+          transitionState: transitionResult?.state || "staged-copy",
+          verifiedLocalReadback: true, root: result.root,
+          requiresOwnerCheckpoint: !transitionResult,
+          ownerTransitionReceiptVerified: Boolean(transitionResult),
+          wholeCorpusVerified: false }));
       } catch (_) {
         results.push(Object.freeze({ ...safeResult,
           phase: "needs-manual-review", verifiedLocalReadback: false,
-          requiresOwnerCheckpoint: true }));
+          transitionState: "needs-manual-review", requiresOwnerCheckpoint: true,
+          ownerTransitionReceiptVerified: false, wholeCorpusVerified: false }));
       }
     }
+    const approvedCount = results.filter((item) => item.ownerTransitionReceiptVerified).length;
+    const state = approvedCount === results.length ? "verified-protected"
+      : approvedCount > 0 ? "mixed" : "partial";
     return Object.freeze({ total: results.length,
       verified: results.filter((item) => item.verifiedLocalReadback).length,
-      canDeleteLegacy: false, authorizesCutover: false,
+      verifiedProtected: approvedCount, transitionState: state,
+      wholeCorpusVerified: false, canDeleteLegacy: false, authorizesCutover: false,
       results: Object.freeze(results) });
   }
   return Object.freeze({ runLegacyMigrationBatch });

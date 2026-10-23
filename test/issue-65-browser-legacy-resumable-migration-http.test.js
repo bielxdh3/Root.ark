@@ -16,6 +16,7 @@ const signedRoots = require("../public/client/rootark-zk1-owner-ciphertext-root-
 const history = require("../public/client/rootark-zk1-owner-signed-checkpoint");
 const migration = require("../public/client/rootark-zk1-legacy-migration-workflow");
 const batch = require("../public/client/rootark-zk1-legacy-batch-migration");
+const transition = require("../public/client/rootark-zk1-legacy-transition-receipt");
 const { Zk1ProtectedObjectStore } = require("../src/services/zk1ProtectedObjectStore");
 const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
 
@@ -30,6 +31,7 @@ const headDomain = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0", "asci
 function indexedDbFixture() {
   const records = new Map();
   let created = false;
+  let failNextTransitionCas = false;
   const db = {
     objectStoreNames: { contains(name) { return name === "migration_intents" && created; } },
     createObjectStore() { created = true; },
@@ -52,6 +54,11 @@ function indexedDbFixture() {
             },
             put(value, key) {
               assert.equal(mode, "readwrite");
+              if (failNextTransitionCas && value.transition) {
+                failNextTransitionCas = false;
+                tx.abort();
+                return;
+              }
               records.set(key, structuredClone(value));
             },
           };
@@ -60,7 +67,7 @@ function indexedDbFixture() {
       return tx;
     },
   };
-  return { records, api: {
+  return { records, failNextTransitionCas() { failNextTransitionCas = true; }, api: {
     open() {
       const request = { result: db, onupgradeneeded: null, onsuccess: null };
       queueMicrotask(() => {
@@ -272,6 +279,88 @@ test("explicit legacy opt-in migrates through real authenticated HTTP; owner sig
   assert.equal((await f.realFetch("/files/legacy.txt", { method: "GET" })).status, 200);
 });
 
+test("owner-signed legacy version transition is CAS-staged after signed GET, survives reopen, and never purges legacy", async (t) => {
+  const f = await fixture(t);
+  const input = { ...f.input, sourcePin: f.versionEntry(1).sourcePin };
+  const beginning = await migration.beginLegacyMigration(input);
+  const signedRootCheckpoint = await f.checkpoint(beginning.root);
+  const proposed = await migration.prepareLegacyMigrationTransition({
+    ...input, signedRootCheckpoint });
+  assert.equal(proposed.state, "verified-protected");
+  assert.deepEqual(proposed.references, {
+    links: "unknown", backups: "unknown", trash: "unknown",
+    retention: "unknown", derived: "unknown",
+  });
+  const signedTransitionReceipt = await transition.signTransitionReceipt({
+    proposal: proposed, ownerSigningKey: f.ownerPair.privateKey });
+  f.disk.failNextTransitionCas();
+  await assert.rejects(migration.stageLegacyMigrationTransition({
+    ...input, signedRootCheckpoint, signedTransitionReceipt }), fault,
+  "aborted strict CAS must leave a resumable owner transition");
+  assert.equal((await input.journal.read(input.metadata.object_id)).phase, "readback");
+  const staged = await migration.stageLegacyMigrationTransition({
+    ...input, signedRootCheckpoint, signedTransitionReceipt });
+  assert.equal(staged.state, "verified-protected");
+  assert.equal(staged.canDeleteLegacy, false);
+  assert.equal(staged.authorizesCutover, false);
+  assert.equal(staged.wholeCorpusVerified, false);
+  const saved = await input.journal.read(input.metadata.object_id);
+  assert.equal(saved.phase, "owner-proven");
+  assert.equal(saved.transition.signature, signedTransitionReceipt.signature);
+  assert.equal(JSON.stringify(saved).includes("Synthetic old-server plaintext"), false);
+  const competingDraft = await migration.prepareLegacyMigrationTransition({
+    ...input, signedRootCheckpoint });
+  const competingSigned = await transition.signTransitionReceipt({
+    proposal: competingDraft, ownerSigningKey: f.ownerPair.privateKey });
+  await assert.rejects(migration.stageLegacyMigrationTransition({
+    ...input, signedRootCheckpoint, signedTransitionReceipt: competingSigned }),
+  fault, "a second owner-signed transition for the same version cannot replace its CAS checkpoint");
+  assert.equal(f.writes, 1);
+  input.journal.close();
+  const reopened = await migration.openMigrationJournal(f.disk.api);
+  const resumed = await migration.stageLegacyMigrationTransition({
+    ...input, journal: reopened, signedRootCheckpoint, signedTransitionReceipt });
+  assert.equal(resumed.state, "verified-protected");
+  assert.equal(f.writes, 1, "reopen and idempotent transition never resend PUT");
+  assert.equal((await f.realFetch("/files/legacy.txt", { method: "GET" })).status, 200);
+});
+
+test("transition refuses missing owner root, source mtime drift, forged owner, replay, cross-scope, unknown dependencies cleared", async (t) => {
+  const f = await fixture(t);
+  const input = { ...f.input, sourcePin: f.versionEntry(1).sourcePin };
+  const migrated = await migration.beginLegacyMigration(input);
+  const signedRootCheckpoint = await f.checkpoint(migrated.root);
+  await assert.rejects(migration.prepareLegacyMigrationTransition({
+    ...input, signedRootCheckpoint: null }), fault);
+  const proposal = await migration.prepareLegacyMigrationTransition({
+    ...input, signedRootCheckpoint });
+  const receipt = await transition.signTransitionReceipt({
+    proposal, ownerSigningKey: f.ownerPair.privateKey });
+  const staged = (value, override = {}) => migration.stageLegacyMigrationTransition({
+    ...input, signedRootCheckpoint, signedTransitionReceipt: value, ...override });
+  const outsider = await importedPair(crypto.generateKeyPairSync("ed25519"));
+  const foreign = await transition.signTransitionReceipt({ proposal,
+    ownerSigningKey: outsider.privateKey });
+  for (const altered of [
+    foreign,
+    { ...receipt, target: { ...receipt.target, root: b64(crypto.randomBytes(32)) } },
+    { ...receipt, sourcePin: { ...receipt.sourcePin,
+      lastModified: "Fri, 23 Oct 2026 01:00:00 GMT" } },
+    { ...receipt, references: { ...receipt.references, links: "clear" } },
+  ]) await assert.rejects(staged(altered), fault);
+  await assert.rejects(staged(receipt, { nowSeconds: input.nowSeconds + 86401 }), fault);
+  await assert.rejects(staged(receipt, { metadata: {
+    ...input.metadata, keyring_id: id() } }), fault);
+  await assert.rejects(staged(receipt, { trust: {
+    ...input.trust, signedDeviceGrant: {
+      ...input.trust.signedDeviceGrant, revoked_at_epoch: input.metadata.epoch },
+  } }), fault);
+  f.setVersion(1, f.original, "text/plain", "Fri, 23 Oct 2026 03:00:00 GMT");
+  await assert.rejects(staged(receipt), fault);
+  assert.equal((await input.journal.read(input.metadata.object_id)).phase, "readback");
+  assert.equal(f.writes, 1);
+});
+
 test("lost PUT ACK and subsequent GET outage remain journaled ambiguous; resume never issues another PUT", async (t) => {
   const f = await fixture(t);
   let lostAck = true;
@@ -381,6 +470,7 @@ test("browser UMD legacy migration loads without Node require or filesystem depe
     "rootark-zk1-uncertain-put-reconciliation.js",
     "rootark-zk1-normal-browser-trust-floor.js", "rootark-zk1-normal-browser-content.js",
     "rootark-zk1-owner-ciphertext-root-checkpoint.js",
+    "rootark-zk1-legacy-transition-receipt.js",
     "rootark-zk1-legacy-migration-workflow.js",
   ]) vm.runInContext(fs.readFileSync(path.join(__dirname, "../public/client", fileName), "utf8"), ctx);
   assert.equal(vm.runInContext("typeof RootarkZk1LegacyMigrationWorkflow.beginLegacyMigration", ctx), "function");
@@ -395,6 +485,52 @@ function batchInput(f, entries, overrides = {}) {
     fetchImpl: f.realFetch, journal: f.input.journal,
     nowSeconds: f.input.nowSeconds, ...overrides };
 }
+
+test("batch transition labels staged, mixed and verified-protected selected versions without corpus cutover", async (t) => {
+  const f = await fixture(t);
+  f.setVersion(2, "Independent historical source version");
+  const entries = [f.versionEntry(1), f.versionEntry(2, await file.generateFileCek())];
+  const copied = await batch.runLegacyMigrationBatch(batchInput(f, entries));
+  assert.equal(copied.transitionState, "partial");
+  assert.equal(copied.verifiedProtected, 0);
+  const approvals = [];
+  for (let i = 0; i < copied.results.length; i++) {
+    const result = copied.results[i];
+    const entry = entries[i];
+    const metadata = { ...f.input.metadata, object_id: result.objectId, version_id: result.versionId };
+    const signedRootCheckpoint = await signedRoots.signOwnerCiphertextRootCheckpoint({
+      scope: Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+        .map((key) => [key, metadata[key]])),
+      signerKey: f.ownerPair.privateKey, signerKeyId: f.ownerSignerId,
+      deviceId: "owner-offline",
+      manifestRevision: f.input.trust.pinnedCurrentHead.revision,
+      manifestDigest: f.input.trust.pinnedCurrentHead.digest,
+      manifestEpoch: metadata.epoch, objectId: metadata.object_id,
+      objectRevision: 1, ciphertextEpoch: metadata.epoch,
+      ciphertextRoot: Buffer.from(result.root, "base64url"), issuedAt: 1400,
+    });
+    const draft = await migration.prepareLegacyMigrationTransition({
+      ...f.input, metadata, sourcePin: entry.sourcePin, cek: entry.cek,
+      signedRootCheckpoint });
+    approvals.push({ signedRootCheckpoint,
+      signedTransitionReceipt: await transition.signTransitionReceipt({
+        proposal: draft, ownerSigningKey: f.ownerPair.privateKey }) });
+  }
+  const mixed = await batch.runLegacyMigrationBatch(batchInput(f, entries, {
+    transitionApprovals: [approvals[0], null] }));
+  assert.equal(mixed.transitionState, "mixed");
+  assert.equal(mixed.verifiedProtected, 1);
+  assert.equal(mixed.results[0].transitionState, "verified-protected");
+  assert.equal(mixed.results[1].transitionState, "staged-copy");
+  const complete = await batch.runLegacyMigrationBatch(batchInput(f, entries, {
+    transitionApprovals: approvals }));
+  assert.equal(complete.transitionState, "verified-protected");
+  assert.equal(complete.verifiedProtected, 2);
+  assert.equal(complete.wholeCorpusVerified, false);
+  assert.equal(complete.canDeleteLegacy, false);
+  assert.equal(complete.authorizesCutover, false);
+  assert.equal(f.writes, 2, "only the original two PUTs were issued");
+});
 
 test("historical revisions migrate as separate deterministic ZK objects over authenticated HTTP; no cutover or deletion", async (t) => {
   const f = await fixture(t);
@@ -509,7 +645,8 @@ test("batch UMD loads without Node imports and rejects missing explicit opt-in",
     "rootark-zk1-owner-signed-checkpoint.js", "rootark-zk1-protected-http-client.js",
     "rootark-zk1-uncertain-put-reconciliation.js",
     "rootark-zk1-normal-browser-trust-floor.js", "rootark-zk1-normal-browser-content.js",
-    "rootark-zk1-owner-ciphertext-root-checkpoint.js", "rootark-zk1-legacy-migration-workflow.js",
+    "rootark-zk1-owner-ciphertext-root-checkpoint.js",
+    "rootark-zk1-legacy-transition-receipt.js", "rootark-zk1-legacy-migration-workflow.js",
     "rootark-zk1-legacy-batch-migration.js",
   ]) vm.runInContext(fs.readFileSync(path.join(__dirname, "../public/client", filename), "utf8"), ctx);
   assert.equal(vm.runInContext("typeof RootarkZk1LegacyBatchMigration.runLegacyMigrationBatch", ctx),

@@ -8,17 +8,20 @@
       require("./rootark-zk1-uncertain-put-reconciliation"),
       require("./rootark-zk1-normal-browser-content"),
       require("./rootark-zk1-normal-browser-trust-floor"),
-      require("./rootark-zk1-owner-ciphertext-root-checkpoint"));
+      require("./rootark-zk1-owner-ciphertext-root-checkpoint"),
+      require("./rootark-zk1-legacy-transition-receipt"));
   } else {
     root.RootarkZk1LegacyMigrationWorkflow = factory(root.crypto,
       root.RootarkDevVaultMigration, root.RootarkZk1FileContent,
       root.RootarkZk1CiphertextRoot, root.RootarkZk1ProtectedHttpClient,
       root.RootarkZk1UncertainPutReconciliation,
       root.RootarkZk1NormalBrowserContent, root.RootarkZk1NormalBrowserTrustFloor,
-      root.RootarkZk1OwnerCiphertextRootCheckpoint);
+      root.RootarkZk1OwnerCiphertextRootCheckpoint,
+      root.RootarkZk1LegacyTransitionReceipt);
   }
 }(typeof globalThis === "object" ? globalThis : this,
-  function (webCrypto, legacyClient, file, roots, http, reconcile, browser, floor, ownerRoots) {
+  function (webCrypto, legacyClient, file, roots, http, reconcile, browser, floor, ownerRoots,
+    transition) {
     "use strict";
     // Synthetic/dev workspace: explicit non-destructive opt-in. The OLD
     // /files route already gives its server plaintext. New protected PUT/GET
@@ -85,8 +88,10 @@
       return Object.fromEntries(PIN.map((key) => [key, value[key]]));
     }
     function record(value) {
-      exact(value, ["schema", "phase", "binding", "ciphertext", "root", "plainDigest",
-        "cipherDigest", "sourceDescriptorDigest"]);
+      const fields = ["schema", "phase", "binding", "ciphertext", "root", "plainDigest",
+        "cipherDigest", "sourceDescriptorDigest"];
+      const withTransition = Object.hasOwn(value || {}, "transition");
+      exact(value, withTransition ? [...fields, "transition"] : fields);
       if (value.schema !== SCHEMA || !["uncertain", "readback", "owner-proven"].includes(value.phase)
         || typeof value.binding !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value.binding)
         || typeof value.plainDigest !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value.plainDigest)
@@ -100,6 +105,10 @@
       from64(value.cipherDigest, 32);
       from64(value.sourceDescriptorDigest, 32);
       from64(value.ciphertext, 16, 4 * 1024 * 1024);
+      if (withTransition) {
+        if (value.phase !== "owner-proven") deny();
+        transition.cloneReceipt(value.transition);
+      }
       return value;
     }
     async function openMigrationJournal(indexedDBImpl =
@@ -288,17 +297,7 @@
       } catch (_) { deny(); }
       finally { source?.data?.fill(0); ciphertext?.fill(0); }
     }
-    async function finalizeLegacyMigration(input) {
-      try {
-        exact(input, ["optIn", "legacy", "metadata", "trust", "cek", "origin",
-          "fetchImpl", "journal", "nowSeconds", "signedRootCheckpoint",
-          ...(Object.hasOwn(input, "sourcePin") ? ["sourcePin"] : [])]);
-        const context = await authority(input);
-        const key = context.meta.object_id;
-        const previous = await input.journal.read(key);
-        if (!previous || !["readback", "owner-proven"].includes(previous.phase)
-          || previous.binding !== context.binding) deny();
-        await verifyReadback(input, context, previous);
+    async function verifyOwnerCheckpoint(input, context, previous) {
         const checkpoint = input.signedRootCheckpoint;
         const history = context.trust.ownerHistoryCheckpoint;
         const signerKeyId = from64(history.signer_key_id, 16);
@@ -306,7 +305,7 @@
           signerKeyId, publicKey: context.trust.ownerPublicKey };
         const expected = { manifestRevision: context.signer.manifestRevision,
           manifestDigest: context.signer.manifestDigest,
-          manifestEpoch: context.meta.epoch, objectId: key,
+          manifestEpoch: context.meta.epoch, objectId: context.meta.object_id,
           objectRevision: 1, ciphertextEpoch: context.meta.epoch,
           ciphertextRoot: from64(previous.root, 32) };
         const proof = await ownerRoots.verifyOwnerCiphertextRootCheckpoint({
@@ -319,6 +318,20 @@
           manifestEpoch: expected.manifestEpoch, objectId: expected.objectId,
           objectRevision: 1, ciphertextEpoch: expected.ciphertextEpoch,
           ciphertextRoot: expected.ciphertextRoot });
+    }
+    async function finalizeLegacyMigration(input) {
+      try {
+        exact(input, ["optIn", "legacy", "metadata", "trust", "cek", "origin",
+          "fetchImpl", "journal", "nowSeconds", "signedRootCheckpoint",
+          ...(Object.hasOwn(input, "sourcePin") ? ["sourcePin"] : [])]);
+        const context = await authority(input);
+        const key = context.meta.object_id;
+        const previous = await input.journal.read(key);
+        if (!previous || !["readback", "owner-proven"].includes(previous.phase)
+          || previous.binding !== context.binding) deny();
+        record(previous);
+        await verifyReadback(input, context, previous);
+        await verifyOwnerCheckpoint(input, context, previous);
         if (previous.phase === "readback") await input.journal.cas(key, previous,
           { ...previous, phase: "owner-proven" });
         return Object.freeze({ objectId: key, root: previous.root,
@@ -328,6 +341,95 @@
           canDeleteLegacy: false, authorizesCutover: false, authorizesProductionIo: false });
       } catch (_) { deny(); }
     }
+    function proposal(context, previous, signedReceipt) {
+      if (!context.pinnedSource) deny();
+      const head = { revision: context.signer.manifestRevision,
+        digest: b64(context.signer.manifestDigest), epoch: context.meta.epoch };
+      return transition.createProposal({
+        scope: { ...context.signer.scope }, legacy: { ...context.legacy },
+        sourcePin: { ...context.pinnedSource },
+        target: { object_id: context.meta.object_id, version_id: context.meta.version_id,
+          revision: 1, root: previous.root, ciphertext_sha256: previous.cipherDigest,
+          epoch: context.meta.epoch },
+        ownerHead: head, binding: context.binding,
+        sourceDescriptorDigest: previous.sourceDescriptorDigest,
+        issuedAt: signedReceipt.issuedAt, nonce: signedReceipt.nonce,
+      });
+    }
+    async function prepareLegacyMigrationTransition(input) {
+      try {
+        exact(input, ["optIn", "legacy", "metadata", "trust", "cek", "origin",
+          "fetchImpl", "journal", "nowSeconds", "signedRootCheckpoint",
+          ...(Object.hasOwn(input, "sourcePin") ? ["sourcePin"] : [])]);
+        const context = await authority(input);
+        if (!context.pinnedSource) deny();
+        const saved = await input.journal.read(context.meta.object_id);
+        if (!saved || !["readback", "owner-proven"].includes(saved.phase)
+          || saved.binding !== context.binding) deny();
+        record(saved);
+        await verifyReadback(input, context, saved);
+        await verifyOwnerCheckpoint(input, context, saved);
+        // Only owner-approved provenance can become a signed transition.
+        const nonce = new Uint8Array(16);
+        webCrypto.getRandomValues(nonce);
+        return transition.createProposal({
+          scope: { ...context.signer.scope }, legacy: { ...context.legacy },
+          sourcePin: { ...context.pinnedSource },
+          target: { object_id: context.meta.object_id, version_id: context.meta.version_id,
+            revision: 1, root: saved.root, ciphertext_sha256: saved.cipherDigest,
+            epoch: context.meta.epoch },
+          ownerHead: { revision: context.signer.manifestRevision,
+            digest: b64(context.signer.manifestDigest), epoch: context.meta.epoch },
+          binding: context.binding, sourceDescriptorDigest: saved.sourceDescriptorDigest,
+          issuedAt: input.nowSeconds, nonce: b64(nonce),
+        });
+      } catch (_) { deny(); }
+    }
+    async function stageLegacyMigrationTransition(input) {
+      try {
+        exact(input, ["optIn", "legacy", "metadata", "trust", "cek", "origin",
+          "fetchImpl", "journal", "nowSeconds", "signedRootCheckpoint",
+          "signedTransitionReceipt",
+          ...(Object.hasOwn(input, "sourcePin") ? ["sourcePin"] : [])]);
+        const context = await authority(input);
+        if (!context.pinnedSource) deny();
+        const key = context.meta.object_id;
+        const previous = await input.journal.read(key);
+        if (!previous || !["readback", "owner-proven"].includes(previous.phase)
+          || previous.binding !== context.binding) deny();
+        record(previous);
+        await verifyReadback(input, context, previous);
+        await verifyOwnerCheckpoint(input, context, previous);
+        const candidate = transition.cloneReceipt(input.signedTransitionReceipt);
+        const approved = await transition.verifyTransitionReceipt({
+          receipt: candidate,
+          expected: proposal(context, previous, candidate),
+          ownerPublicKey: context.trust.ownerPublicKey,
+          nowSeconds: input.nowSeconds,
+        });
+        if (previous.transition) {
+          if (JSON.stringify(previous.transition) !== JSON.stringify(approved.receipt)) deny();
+        } else {
+          const next = { ...previous, phase: "owner-proven", transition: approved.receipt };
+          try { await input.journal.cas(key, previous, next); }
+          catch (_) {
+            const committed = await input.journal.read(key);
+            if (!committed || committed.phase !== "owner-proven"
+              || committed.binding !== context.binding
+              || JSON.stringify(committed.transition) !== JSON.stringify(approved.receipt)) deny();
+          }
+        }
+        return Object.freeze({ objectId: key, versionId: context.meta.version_id,
+          state: "verified-protected", phase: "verified-protected",
+          transitionReceipt: approved.receipt,
+          provenanceVerified: true, ownerSignatureVerified: true,
+          verifiedLocalReadback: true,
+          legacyReferences: approved.receipt.references,
+          canDeleteLegacy: false, authorizesCutover: false,
+          wholeCorpusVerified: false, authorizesProductionIo: false });
+      } catch (_) { deny(); }
+    }
     return Object.freeze({ openMigrationJournal, beginLegacyMigration,
-      finalizeLegacyMigration });
+      finalizeLegacyMigration, prepareLegacyMigrationTransition,
+      stageLegacyMigrationTransition });
   }));
