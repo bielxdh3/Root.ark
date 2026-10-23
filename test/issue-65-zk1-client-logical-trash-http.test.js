@@ -192,8 +192,8 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
   };
   // Exercise the exact UMD modules as deployed to browsers, with only a
   // synthetic owner-floor IndexedDB implementation for this isolated fixture.
-  const runtime = { crypto: crypto.webcrypto, TextEncoder, TextDecoder,
-    btoa, atob, URL, Headers, structuredClone, queueMicrotask,
+  const runtime = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, AbortController,
+    btoa, atob, URL, Headers, structuredClone, queueMicrotask, setTimeout, clearTimeout,
     location: { origin }, RootarkZk1NormalBrowserTrustFloor: {
       async assertCurrent({ signedDeviceGrant, pinnedCurrentHead }) {
         assert.equal(signedDeviceGrant.manifest_digest, b64(pinnedCurrentHead.digest));
