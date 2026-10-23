@@ -19,6 +19,7 @@ const archive = require("../public/client/rootark-zk1-versioned-keyring-cipherte
 const portable = require("../public/client/rootark-zk1-portable-file-recovery");
 const fileContent = require("../public/client/rootark-zk1-file-content");
 const browserAuthority = require("../public/client/rootark-zk1-browser-authoritative-backup");
+const transport = require("../public/client/rootark-zk1-portable-versioned-backup-transport");
 const b64 = (v) => Buffer.from(v).toString("base64url");
 const rnd = (n) => crypto.randomBytes(n);
 const sha = (v) => crypto.createHash("sha256").update(v).digest();
@@ -930,5 +931,207 @@ test("versioned signed manifest accepts 1 and 12 revisions, rejects omitted rows
     if (count > 1) await assert.rejects(archive.createVersionedArchive({
       archiveInput: f.archiveInput, versions: f.versionInputs.slice(1),
       verifiedAuthority: f.verifiedAuthority }), deny);
+  }
+});
+
+test("real authenticated HTTP owner backup survives lost PUT ACK and restores historical revision 2 on a second device", async (t) => {
+  const f = await fixture();
+  const store = new Map();
+  let puts = 0, gets = 0, unauthorized = 0, leaked = false;
+  const app = express();
+  app.use("/owner-v2/:digest", (req, res, next) => {
+    if (req.headers.cookie !== "rootark_session=owner-device") {
+      unauthorized++; return res.sendStatus(401);
+    }
+    if (!/^[A-Za-z0-9_-]{43}$/.test(req.params.digest)) return res.sendStatus(400);
+    next();
+  });
+  app.put("/owner-v2/:digest", express.raw({ type: "application/octet-stream",
+    limit: "24mb" }), (req, res) => {
+    puts++;
+    if (store.has(req.params.digest)) return res.sendStatus(409);
+    const data = Buffer.from(req.body);
+    leaked ||= data.includes(f.versions[0].cek)
+      || data.includes(Buffer.from("owner private ciphertext revision"));
+    store.set(req.params.digest, data);
+    res.sendStatus(201);
+  });
+  app.get("/owner-v2/:digest", (req, res) => {
+    gets++;
+    const data = store.get(req.params.digest);
+    if (!data) return res.sendStatus(404);
+    return res.type("application/octet-stream").send(data);
+  });
+  const server = await new Promise((resolve) => {
+    const s = app.listen(0, "127.0.0.1", () => resolve(s));
+  });
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const base = "http://127.0.0.1:" + server.address().port;
+  const provider = (session = "owner-device") => ({
+    async putIfAbsent({ key, bytes }) {
+      const response = await fetch(base + "/owner-v2/" + key, { method: "PUT",
+        headers: { cookie: "rootark_session=" + session,
+          "content-type": "application/octet-stream" }, body: bytes });
+      return response.status === 201;
+    },
+    async get({ key }) {
+      const response = await fetch(base + "/owner-v2/" + key, {
+        headers: { cookie: "rootark_session=" + session } });
+      if (response.status !== 200) throw Error("storage unavailable");
+      return new Uint8Array(await response.arrayBuffer());
+    },
+  });
+  const assertLive = () => {};
+  const browserVersions = f.versionInputs.map((entry) => ({
+    metadata: entry.metadata, objectRevision: entry.objectRevision,
+    ciphertextBase64: b64(entry.ciphertext), cekBase64: b64(entry.cek),
+  }));
+  const first = await transport.preparePortableVersionedBackup({
+    archiveInput: f.archiveInput, versions: browserVersions,
+    verifiedAuthority: f.verifiedAuthority, assertLive,
+  });
+  assert.equal(first.archive.format, "rootark-zk1-keyring-portable-archive/v2");
+  assert.equal(store.size, 0, "prepare signs and seals without remote I/O");
+  assert.equal(first.authorizesCutover, false);
+  await assert.rejects(transport.preparePortableVersionedBackup({
+    archiveInput: f.archiveInput, versions: browserVersions.slice(1),
+    verifiedAuthority: f.verifiedAuthority, assertLive,
+  }), /ZK_PORTABLE_VERSIONED_BACKUP_DENIED/,
+  "omitted historical revision cannot be published");
+  await assert.rejects(transport.publishPreparedVersionedBackup({
+    prepared: { ...first }, provider: provider(), assertLive,
+  }), /ZK_PORTABLE_VERSIONED_BACKUP_DENIED/,
+  "caller cannot forge a prepared owner authority");
+  assert.equal(store.size, 0, "invalid preflight caused no remote write");
+
+  const ownerNetwork = provider();
+  const lostAck = {
+    ...ownerNetwork,
+    async putIfAbsent(input) {
+      await ownerNetwork.putIfAbsent(input);
+      throw Error("ACK lost after write");
+    },
+  };
+  await assert.rejects(transport.publishPreparedVersionedBackup({
+    prepared: first, provider: lostAck, assertLive,
+  }), /ZK_PORTABLE_VERSIONED_BACKUP_DENIED/);
+  assert.equal(puts, 1);
+  assert.equal(gets, 0, "ambiguous write must remain unconfirmed");
+  assert.equal(store.size, 1, "remote has exactly one sealed archive");
+  assert.equal(leaked, false, "storage sees neither CEK nor file plaintext");
+
+  // Device B reconstructs its OWN trusted capability from separately pinned
+  // owner inventory and roster. Device A's ephemeral authority is not shared.
+  const remoteAuthority = await archive.verifyVersionedAuthority({
+    backupVerification: f.backupVerification,
+    rosterVerification: f.rosterVerification, otherVerifiedKeyringProofs: [],
+  });
+  assert.notEqual(remoteAuthority, f.verifiedAuthority);
+  const second = await transport.recoverPortableVersionedBackup({
+    archivePin: first.archivePin, provider: provider(),
+    recoveryInput: f.restoreInput, verifiedAuthority: remoteAuthority, assertLive,
+  });
+  assert.equal(second.files.length, 3);
+  assert.equal(second.completeRelativeToPinnedInventory, true);
+  assert.equal(second.revisionAncestryVerified, true);
+  assert.equal(second.authorizesProductionRestore, false);
+  const historic = second.files.find((item) => item.objectRevision === 2);
+  assert.ok(historic, "history includes revision 2 for the same object");
+  assert.deepEqual(Buffer.from(historic.ciphertext),
+    f.versions.find((item) => item.revision === 2).ciphertext);
+  assert.deepEqual(Buffer.from(historic.cek),
+    f.versions.find((item) => item.revision === 2).cek);
+  for (const item of second.files) { item.cek.fill(0); item.ciphertext.fill(0); }
+  assert.equal(puts, 1, "second device never retries the PUT");
+  assert.equal(gets, 1);
+
+  const noStoreWrite = puts;
+  const badPin = new Uint8Array(rnd(32));
+  const fail = (input) => assert.rejects(
+    transport.recoverPortableVersionedBackup({
+      archivePin: first.archivePin, provider: provider(),
+      recoveryInput: f.restoreInput, verifiedAuthority: remoteAuthority,
+      assertLive, ...input,
+    }), /ZK_PORTABLE_VERSIONED_BACKUP_DENIED/);
+  await fail({ archivePin: badPin });
+  await fail({ recoveryInput: { ...f.restoreInput, recoverySecret: rnd(32) } });
+  await fail({ recoveryInput: { ...f.restoreInput,
+    pinnedCurrentHead: { ...f.restoreInput.pinnedCurrentHead, revision: 8 } } });
+  await fail({ provider: provider("attacker") });
+  await fail({ verifiedAuthority: { ...remoteAuthority } });
+  let live = true;
+  await fail({ assertLive: () => { if (!live) throw Error("logout"); },
+    provider: { ...ownerNetwork, async get(request) {
+      const bytes = await ownerNetwork.get(request);
+      live = false;
+      return bytes;
+    } } });
+  const changedPin = new Uint8Array(first.archivePin);
+  const changedSecret = new Uint8Array(f.restoreInput.recoverySecret);
+  const independentInput = { ...f.restoreInput, recoverySecret: changedSecret };
+  const concurrentRead = await transport.recoverPortableVersionedBackup({
+    archivePin: changedPin, recoveryInput: independentInput,
+    verifiedAuthority: remoteAuthority, assertLive,
+    provider: { ...ownerNetwork, async get(request) {
+      const data = await ownerNetwork.get(request);
+      changedPin.fill(7);
+      changedSecret.fill(8);
+      return data;
+    } },
+  });
+  assert.equal(concurrentRead.files.length, 3,
+    "network-time mutation cannot replace the snapshotted independent pins");
+  for (const item of concurrentRead.files) { item.cek.fill(0); item.ciphertext.fill(0); }
+  const remoteKey = b64(first.archivePin);
+  const original = store.get(remoteKey);
+  store.set(remoteKey, Buffer.from(original.subarray(0, original.length - 1)));
+  await fail({});
+  store.set(remoteKey, Buffer.concat([original, Buffer.from(" ") ]));
+  await fail({});
+  store.set(remoteKey, original);
+  await assert.rejects(transport.publishPreparedVersionedBackup({
+    prepared: first, provider: ownerNetwork, assertLive,
+  }), /ZK_PORTABLE_VERSIONED_BACKUP_DENIED/,
+  "ambiguous ACK consumes this single-use PUT capability");
+  assert.equal(store.size, 1);
+  assert.equal(puts, noStoreWrite, "no retry reaches PUT after lost ACK");
+  assert.equal(unauthorized > 0, true);
+
+  const acknowledged = await transport.preparePortableVersionedBackup({
+    archiveInput: f.archiveInput, versions: browserVersions,
+    verifiedAuthority: f.verifiedAuthority, assertLive,
+  });
+  acknowledged.archivePin.fill(0); // Cannot change internally committed digest.
+  const published = await transport.publishPreparedVersionedBackup({
+    prepared: acknowledged, provider: ownerNetwork, assertLive,
+  });
+  assert.equal(published.remoteCiphertextReadbackVerified, true);
+  assert.equal(published.independentDurabilityProven, false);
+  assert.equal(published.authorizesProductionRestore, false);
+  assert.equal(store.has(b64(published.archivePin)), true);
+  assert.notEqual(b64(published.archivePin), b64(acknowledged.archivePin));
+  const verifiedAgain = await transport.recoverPortableVersionedBackup({
+    archivePin: published.archivePin, provider: ownerNetwork,
+    recoveryInput: f.restoreInput, verifiedAuthority: remoteAuthority, assertLive,
+  });
+  assert.equal(verifiedAgain.files.length, 3);
+  for (const item of verifiedAgain.files) { item.cek.fill(0); item.ciphertext.fill(0); }
+  const totalPuts = puts;
+  await assert.rejects(transport.publishPreparedVersionedBackup({
+    prepared: acknowledged, provider: ownerNetwork, assertLive,
+  }), /ZK_PORTABLE_VERSIONED_BACKUP_DENIED/);
+  assert.equal(puts, totalPuts, "ACK-confirmed upload capability also cannot replay");
+});
+
+test("portable historical backup transport loads as browser UMD without Node imports", () => {
+  const context = vm.createContext({ TextEncoder, TextDecoder, atob, btoa,
+    Uint8Array, ArrayBuffer,
+    RootarkZk1BrowserVersionedArchive:
+      require("../public/client/rootark-zk1-browser-versioned-archive") });
+  vm.runInContext(fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-portable-versioned-backup-transport.js"), "utf8"), context);
+  for (const method of ["preparePortableVersionedBackup",
+    "publishPreparedVersionedBackup", "recoverPortableVersionedBackup"]) {
+    assert.equal(typeof context.RootarkZk1PortableVersionedBackupTransport[method], "function");
   }
 });
