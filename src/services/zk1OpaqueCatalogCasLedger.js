@@ -128,7 +128,20 @@ class Zk1OpaqueCatalogCasLedger {
         || (process.platform !== "win32"
           && (stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0))) fail();
     }
-    this.db = new Database(filename, { fileMustExist: exists, timeout: 3000 });
+    // SQLite ordinarily creates a new database with the process umask (often
+    // 0644 on Linux). A later restart then correctly rejects that same file as
+    // non-private. Create the file exclusively with mode 0600 *before* SQLite
+    // opens it; the 0700 parent directory was checked above. O_EXCL also
+    // refuses dangling symlinks and concurrent bootstrap attempts.
+    if (!exists) {
+      let descriptor;
+      try {
+        descriptor = fs.openSync(filename, fs.constants.O_CREAT | fs.constants.O_EXCL
+          | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
+      } catch (_) { fail(); }
+      finally { if (descriptor !== undefined) fs.closeSync(descriptor); }
+    }
+    this.db = new Database(filename, { fileMustExist: true, timeout: 3000 });
     try {
       this.db.pragma("journal_mode = WAL");
       this.db.pragma("synchronous = FULL");

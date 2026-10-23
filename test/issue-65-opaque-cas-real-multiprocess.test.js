@@ -168,6 +168,11 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
   }));
   assert.equal(latest.sequence, 1);
   assert.deepEqual(Buffer.from(latest.digest), headDigest);
+  if (process.platform !== "win32") {
+    const stat = fs.statSync(dbPath);
+    assert.equal(stat.mode & 0o077, 0,
+      "new CAS SQLite must be private before restart on POSIX hosts");
+  }
   const disk = new Database(dbPath, { readonly: true, fileMustExist: true });
   const stored = disk.prepare("SELECT * FROM snapshots WHERE sequence=1").get();
   assert.deepEqual(stored.header, Buffer.from(winner.headBytes, "base64url"));
