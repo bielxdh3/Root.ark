@@ -313,6 +313,11 @@ class Zk1OpaqueCatalog {
           scope: wanted, expectedSequence: current.sequence,
           expectedDigest: current.digest, nextSequence: header.sequence,
           nextDigest: digest, nonce: request.nonce,
+          // An independently operated signer must verify and durably retain
+          // these signed opaque bytes BEFORE attesting their head digest.
+          // A digest supplied alone is not evidence of committed data.
+          headBytes: headerBytes, headSignature: signed,
+          pageBodies: bodies.map((body) => Buffer.from(body)),
         });
         const witnessed = await verifyCas(receipt, wanted, request.nonce,
           this.authority, number(this.store.nowSeconds(), 0));

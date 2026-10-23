@@ -13,6 +13,8 @@ const { createZk1SignedHistoryCasProofProvider } =
   require("./zk1SignedHistoryCasProofProvider");
 const { Zk1ProtectedObjectStore } = require("./zk1ProtectedObjectStore");
 const { Zk1OpaqueCatalog } = require("./zk1OpaqueCatalog");
+const { createZk1OpaqueCatalogCasHttpsClient } =
+  require("./zk1OpaqueCatalogCasHttpsClient");
 const { registerZk1ProtectedObjectRoutes } = require("../routes/zk1ProtectedObjectRoutes");
 
 const B64U = /^[A-Za-z0-9_-]+$/;
@@ -20,6 +22,7 @@ const PIN = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
 const WITNESS_FIELDS = ["endpoint", "caPath", "clientKeyPath", "clientCertPath",
   "serverFingerprint256", "signingKeyId", "signingPublicKeyPath"];
 const CAS_FIELDS = WITNESS_FIELDS.slice(0, 5);
+const CATALOG_CAS_FIELDS = [...CAS_FIELDS, "authorityPublicKeyPath", "timeoutMs"];
 const CAS_DEADLINE_LIMITS = Object.freeze({
   timeoutMs: [100, 30000], historyDeadlineMs: [100, 300000],
 });
@@ -190,7 +193,9 @@ function registerZk1ProtectedContentFromConfig({
   catch (_) { fail(); }
   exact(config, ["version", "bootstrapNew", "username", "contentDbPath",
     "scope", "minimumHead", "witness", "cas",
-    ...(config.version === 2 ? ["signedHistory"] : [])]);
+    ...(config.version === 2 ? ["signedHistory"] : []),
+    ...(Object.hasOwn(config, "catalogCas") && config.version === 2
+      ? ["catalogCas"] : [])]);
   if (![1, 2].includes(config.version) || ![true, false].includes(config.bootstrapNew)
     || typeof config.username !== "string" || config.username.length < 1
     || config.username.length > 128 || /[\u0000-\u001f\u007f]/.test(config.username)) fail();
@@ -223,6 +228,31 @@ function registerZk1ProtectedContentFromConfig({
     || witnessClient.certificate.equals(casClient.certificate)) fail();
   const publicKey = crypto.createPublicKey(readFile(config.witness.signingPublicKeyPath));
   if (publicKey.type !== "public" || publicKey.asymmetricKeyType !== "ed25519") fail();
+  // Explicit V2-only opt-in. This signer is pinned by the operator and
+  // cannot alias either the witness or manifest-CAS mTLS identity.
+  let configuredCatalogAuthority = null;
+  if (Object.hasOwn(config, "catalogCas")) {
+    if (opaqueCatalogAuthority !== null) fail();
+    exact(config.catalogCas, CATALOG_CAS_FIELDS);
+    const catalogTransport = endpoint(Object.fromEntries(CAS_FIELDS.map((field) =>
+      [field, config.catalogCas[field]])), false);
+    const catalogIdentity = clientTlsIdentity(catalogTransport);
+    if ([config.witness.serverFingerprint256, config.cas.serverFingerprint256]
+      .some((pin) => pin.toUpperCase()
+        === config.catalogCas.serverFingerprint256.toUpperCase())
+      || catalogIdentity.key.equals(witnessClient.key)
+      || catalogIdentity.key.equals(casClient.key)
+      || catalogIdentity.certificate.equals(witnessClient.certificate)
+      || catalogIdentity.certificate.equals(casClient.certificate)) fail();
+    const catalogPublicKey = crypto.createPublicKey(readFile(
+      config.catalogCas.authorityPublicKeyPath));
+    if (catalogPublicKey.type !== "public" || catalogPublicKey.asymmetricKeyType !== "ed25519"
+      || catalogPublicKey.equals(publicKey)) fail();
+    configuredCatalogAuthority = createZk1OpaqueCatalogCasHttpsClient({
+      ...catalogTransport, timeoutMs: config.catalogCas.timeoutMs,
+      authorityPublicKey: catalogPublicKey,
+    });
+  }
   const witnessProvider = createZk1WitnessHttpsClient(witnessTransport);
   const manifestProvider = createZk1CasManifestHttpsClient(casTransport);
   // Version 2 is opt-in only in development/test and requires independently
@@ -242,8 +272,9 @@ function registerZk1ProtectedContentFromConfig({
   try {
     // An independently pinned catalog CAS is an explicit opt-in dependency.
     // No unsigned local SQLite-list fallback is ever registered.
-    const opaqueCatalog = opaqueCatalogAuthority === null ? null
-      : new Zk1OpaqueCatalog({ store, authority: opaqueCatalogAuthority });
+    const selectedCatalogAuthority = configuredCatalogAuthority || opaqueCatalogAuthority;
+    const opaqueCatalog = selectedCatalogAuthority === null ? null
+      : new Zk1OpaqueCatalog({ store, authority: selectedCatalogAuthority });
     registerZk1ProtectedObjectRoutes({ app, store, authenticate, requirePermission,
       resolveTrustedScope: (user) => user?.username === config.username ? scope : null,
       environment, multiproviderRestore, opaqueCatalog });
