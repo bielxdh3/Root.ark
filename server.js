@@ -5974,7 +5974,7 @@ app.use((req, res, next) => {
 // process. With no route, all spellings are 404, even through express.static.
 if ((NODE_ENV === "development" || NODE_ENV === "test")
   && process.env.ROOTARK_ZK1_CONTENT_CONFIG) {
-  app.get("/zk1-protected-file-lab.html", (_req, res) =>
+  app.get("/zk1-protected-file-lab.html", apiRequestRateLimit, (_req, res) =>
     res.sendFile(path.join(__dirname, "dev-ui", "zk1-protected-file-lab.html"),
       { dotfiles: "allow" }));
 }
