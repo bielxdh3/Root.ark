@@ -43,6 +43,31 @@ still lacks provider/remote custody, derived files outside the search index,
 owner-signed global inventory and writer fencing, so cutover and legacy
 deletion remain forbidden even if all local checks pass.
 
+An additional isolated read-only inspector,
+`inspectZk1LiveLegacyRecoverableArchiveGraph` from
+`src/services/zk1LiveLegacyRecoverableArchiveGraph.js`, accepts
+`{ optIn: true, databasePath, persistence, backupDataDir, localUploadsDir?, localTempDir? }`.
+It first runs the live SQL and physical backup preflight, then inspects
+checksum-pinned ZIP archives **without extraction**. Each recoverable ZIP
+member must be present in `included_files` with an identical canonical
+path and size; the reader streams and bounds actual decompressed bytes.
+It observes archived uploads, non-FTS `temp/` candidates, historical trash
+files and saved SQLite/metadata members. The optional `localTempDir` also
+hashes a bounded tree of on-disk non-FTS candidate files without exporting
+their names or contents. Unresolved retention tombstones remain unknown,
+never count as recovered archive payloads. Unknown ZIP namespaces,
+symlinks, aliases, checksum mismatch, malformed manifests, decompression
+limits, and changed physical file identities fail closed.
+
+Archive membership is **not** a restored or owner-authenticated file graph:
+an archived SQLite snapshot and its older references have not been joined to
+every ZIP member; deleted/trash generations, external providers, backup
+retention beyond the selected roots, Windows alternate data streams and
+unindexed derived semantics remain unknown. A server-held SQL checksum alone
+is not independent authenticity or durable custody. Every result explicitly
+keeps `wholeCorpusVerified`, `protectedRecoveryVerified`, `canDeleteLegacy`
+and `authorizesCutover` false.
+
 Each entry contains `{ legacy: { name, folderId }, sourcePin, cek }`.
 `sourcePin` must contain exactly `version` (positive number), `storedAs`,
 `uploadedAt`, `size`, `lastModified` (canonical HTTP GMT timestamp),
