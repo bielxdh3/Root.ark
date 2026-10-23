@@ -214,9 +214,11 @@ async function approveRemoteFile(config, configPath, fileName, passwordProvider)
 async function getStableFileInfo(filePath, waitMs, config) {
   const first = await fsp.lstat(filePath, { bigint: true });
   if (!first.isFile() || first.isSymbolicLink()) return null;
+  if (first.nlink !== 1n) throw new Error("Arquivo sincronizado com hardlink inseguro");
   await new Promise((resolve) => setTimeout(resolve, waitMs));
   const second = await fsp.lstat(filePath, { bigint: true });
   if (!second.isFile() || second.isSymbolicLink()) return null;
+  if (second.nlink !== 1n) throw new Error("Arquivo sincronizado com hardlink inseguro");
   if (!sameFileIdentity(first, second)) return null;
   const buffer = await readVerifiedUpload(config, filePath, second);
   return {
@@ -228,6 +230,7 @@ async function getStableFileInfo(filePath, waitMs, config) {
       size: second.size,
       mtimeNs: second.mtimeNs,
       ctimeNs: second.ctimeNs,
+      nlink: second.nlink,
     },
     hash: crypto.createHash("sha256").update(buffer).digest("hex"),
   };
@@ -248,7 +251,8 @@ async function scanFiles(rootDir) {
 
       if (stats.isDirectory()) {
         await walk(safePath);
-      } else if (stats.isFile()) {
+      } else if (stats.isFile() && stats.nlink === 1) {
+        // Hardlink aliases can expose bytes from files outside localFolder.
         result.push({ fullPath: safePath, relativePath, stats });
       }
     }
@@ -264,7 +268,7 @@ function uploadFileTooLarge() {
 
 function sameFileIdentity(a, b) {
   return a.dev === b.dev && a.ino === b.ino && a.size === b.size &&
-    a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+    a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs && a.nlink === b.nlink;
 }
 
 async function readVerifiedUpload(config, filePath, expected) {
@@ -272,14 +276,18 @@ async function readVerifiedUpload(config, filePath, expected) {
   const canonical = await fsp.realpath(filePath);
   if (!safeResolveInside(root, canonical)) throw new Error("Caminho fora da pasta sincronizada bloqueado");
   const before = await fsp.lstat(filePath, { bigint: true });
-  if (!before.isFile() || before.isSymbolicLink()) throw new Error("Arquivo sincronizado alterado ou link inseguro");
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) {
+    throw new Error("Arquivo sincronizado alterado ou link inseguro");
+  }
   if (before.size > BigInt(MAX_FILE_BYTES)) throw uploadFileTooLarge();
   if (expected && !sameFileIdentity(before, expected.identity || expected)) throw new Error("Arquivo sincronizado alterado durante o upload");
 
   const handle = await fsp.open(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
   try {
     const opened = await handle.stat({ bigint: true });
-    if (!opened.isFile() || !sameFileIdentity(before, opened)) throw new Error("Arquivo sincronizado alterado durante o upload");
+    if (!opened.isFile() || opened.nlink !== 1n || !sameFileIdentity(before, opened)) {
+      throw new Error("Arquivo sincronizado alterado durante o upload");
+    }
     if (opened.size > BigInt(MAX_FILE_BYTES)) throw uploadFileTooLarge();
     const chunks = [];
     let total = 0;
@@ -294,7 +302,8 @@ async function readVerifiedUpload(config, filePath, expected) {
     const after = await handle.stat({ bigint: true });
     if (!sameFileIdentity(opened, after)) throw new Error("Arquivo sincronizado alterado durante o upload");
     const pathAfter = await fsp.lstat(filePath, { bigint: true });
-    if (!pathAfter.isFile() || pathAfter.isSymbolicLink() || !sameFileIdentity(opened, pathAfter)) {
+    if (!pathAfter.isFile() || pathAfter.isSymbolicLink() || pathAfter.nlink !== 1n
+      || !sameFileIdentity(opened, pathAfter)) {
       throw new Error("Arquivo sincronizado alterado durante o upload");
     }
     const canonicalAfter = await fsp.realpath(filePath);
