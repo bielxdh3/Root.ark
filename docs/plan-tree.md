@@ -1,5 +1,10 @@
 # Root.ark Plan Tree
 
+> **Most recent issue #65 development checkpoint — 2026-10-23:**
+> [PR #228 source, validation and remaining blocker evidence](validation/2026-10-23-issue-65-pr228-development-checkpoint.md).
+> The `da02715` checkpoint below is historical and not the current HEAD.
+> PR #228 remains OPEN/DRAFT, issue #65 OPEN; no merge/deploy/cutover.
+
 ## Live issue #65 development evidence — 2026-10-23 (`da02715`)
 
 At the observed checkpoint, PR #228 (`cdx/rootark-dual-recovery-20261019`)
