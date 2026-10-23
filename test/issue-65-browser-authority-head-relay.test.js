@@ -29,6 +29,61 @@ test("browser authority relay UMD boots in Edge-like window without Node globals
   assert.equal(typeof context.RootarkZk1BrowserAuthorityHeadRelay.createProbes, "function");
 });
 
+test("browser authority relay aborts stalled fetch and unending signed-proof body within its absolute deadline", async () => {
+  const witness = crypto.generateKeyPairSync("ed25519");
+  const cas = crypto.generateKeyPairSync("ed25519");
+  let observedSignal;
+  const setup = (fetchImpl) => relayBrowser.createProbes({
+    origin: "https://example.test/", fetchImpl,
+    assertLive: () => {}, csrfToken: () => "test-csrf",
+    ownerWitnessKeyRaw: new Uint8Array(raw(witness.publicKey)),
+    ownerWitnessSpkiSha256: new Uint8Array(SHA(spki(witness.publicKey))),
+    ownerWitnessKeyId: new Uint8Array(crypto.randomBytes(16)),
+    catalogAuthorityKeyRaw: new Uint8Array(raw(cas.publicKey)),
+    catalogAuthoritySpkiSha256: new Uint8Array(SHA(spki(cas.publicKey))),
+    requestTimeoutMs: 100,
+  });
+  const scope = { account_id: b64(crypto.randomBytes(16)),
+    compartment_id: b64(crypto.randomBytes(16)), keyring_id: b64(crypto.randomBytes(16)) };
+
+  const noHeaders = await setup((_url, options) => {
+    observedSignal = options.signal;
+    return new Promise(() => {});
+  });
+  await assert.rejects(noHeaders.catalogProbe({ scope, nonce: crypto.randomBytes(32) }),
+    /ZK_BROWSER_AUTHORITY_RELAY_UNVERIFIED/);
+  assert.equal(observedSignal.aborted, true, "fetch without headers is aborted");
+
+  let streamAborted = false;
+  const stalledBody = await setup((_url, options) => {
+    observedSignal = options.signal;
+    let source;
+    const body = new ReadableStream({
+      start(controller) {
+        source = controller;
+        controller.enqueue(new Uint8Array([123])); // Incomplete JSON, then silence.
+      },
+      cancel() { streamAborted = true; },
+    });
+    options.signal.addEventListener("abort", () => {
+      streamAborted = true;
+      try { source.error(new Error("aborted")); } catch (_) { /* reader closed */ }
+    }, { once: true });
+    return new Response(body, { status: 200,
+      headers: { "content-type": "application/json" } });
+  });
+  await assert.rejects(stalledBody.ownerWitnessProbe({ scope, nonce: crypto.randomBytes(32) }),
+    /ZK_BROWSER_AUTHORITY_RELAY_UNVERIFIED/);
+  assert.equal(observedSignal.aborted, true, "stream read is aborted after deadline");
+  assert.equal(streamAborted, true, "stalled response stream observes cancellation");
+
+  const tooLarge = await setup(async () => new Response(new Uint8Array(16000), {
+    status: 200, headers: { "content-type": "application/json" },
+  }));
+  await assert.rejects(tooLarge.catalogProbe({ scope, nonce: crypto.randomBytes(32) }),
+    /ZK_BROWSER_AUTHORITY_RELAY_UNVERIFIED/);
+});
+
 test("authenticated fresh witness/CAS relay: browser-pinned SPKI, nonce, account isolation, logout and forged-key denial", async (t) => {
   const scope = { account_id: crypto.randomBytes(16),
     compartment_id: crypto.randomBytes(16), keyring_id: crypto.randomBytes(16) };

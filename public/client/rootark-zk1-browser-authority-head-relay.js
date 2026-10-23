@@ -66,12 +66,19 @@
     return key;
   }
   async function createProbes(input) {
+    const configuredDeadline = Object.hasOwn(input || {}, "requestTimeoutMs");
     exact(input, ["origin", "fetchImpl", "assertLive", "csrfToken",
       "ownerWitnessKeyRaw", "ownerWitnessSpkiSha256", "ownerWitnessKeyId",
-      "catalogAuthorityKeyRaw", "catalogAuthoritySpkiSha256"]);
+      "catalogAuthorityKeyRaw", "catalogAuthoritySpkiSha256",
+      ...(configuredDeadline ? ["requestTimeoutMs"] : [])]);
     if (!webCrypto?.subtle || typeof input.fetchImpl !== "function"
       || typeof input.assertLive !== "function"
       || typeof input.csrfToken !== "function") deny();
+    // A byte limit alone cannot stop a compromised relay that never finishes
+    // either its HTTP response headers or its response body.
+    const deadlineMs = configuredDeadline ? input.requestTimeoutMs : 10000;
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 100 || deadlineMs > 10000
+      || typeof AbortController !== "function") deny();
     const witnessUrl = urlFrom(input.origin, "witness-head");
     const casUrl = urlFrom(input.origin, "cas-head");
     input.assertLive();
@@ -92,39 +99,52 @@
       if (typeof csrf !== "string" || !csrf || csrf.length > 512
         || /[\r\n\u0000-\u001f\u007f]/.test(csrf)) deny();
       let response, wire;
+      const controller = new AbortController();
+      let timer;
       try {
-        response = await input.fetchImpl(url, {
-          method: "POST", mode: "same-origin", redirect: "error",
-          credentials: "same-origin", cache: "no-store",
-          headers: { "content-type": "application/json", accept: "application/json",
-            "x-csrf-token": csrf },
-          body: JSON.stringify({ nonce: to64(challenge) }),
-        });
-        input.assertLive();
-        if (input.csrfToken() !== csrf || response.status !== 200
-          || !/^application\/json(?:;\s*charset=utf-8)?$/i.test(
-            response.headers?.get("content-type") || "")) deny();
-        if (!response.body || typeof response.body.getReader !== "function") deny();
-        const reader = response.body.getReader();
-        const parts = [];
-        let total = 0, complete = false;
-        try {
-          while (true) {
-            const next = await reader.read();
-            if (next.done) { complete = true; break; }
-            total += next.value.byteLength;
-            if (total > 15000) deny();
-            parts.push(next.value);
+        const work = (async () => {
+          response = await input.fetchImpl(url, {
+            method: "POST", mode: "same-origin", redirect: "error",
+            credentials: "same-origin", cache: "no-store", signal: controller.signal,
+            headers: { "content-type": "application/json", accept: "application/json",
+              "x-csrf-token": csrf },
+            body: JSON.stringify({ nonce: to64(challenge) }),
+          });
+          input.assertLive();
+          if (input.csrfToken() !== csrf || response.status !== 200
+            || !/^application\/json(?:;\s*charset=utf-8)?$/i.test(
+              response.headers?.get("content-type") || "")) deny();
+          if (!response.body || typeof response.body.getReader !== "function") deny();
+          const reader = response.body.getReader();
+          const parts = [];
+          let total = 0, complete = false;
+          try {
+            while (true) {
+              const next = await reader.read();
+              if (next.done) { complete = true; break; }
+              input.assertLive();
+              if (input.csrfToken() !== csrf) deny();
+              total += next.value.byteLength;
+              if (total > 15000) deny();
+              parts.push(next.value);
+            }
+          } finally {
+            if (!complete) try { await reader.cancel(); } catch (_) { /* denied */ }
+            reader.releaseLock();
           }
-        } finally {
-          if (!complete) try { await reader.cancel(); } catch (_) { /* denied */ }
-          reader.releaseLock();
-        }
-        const joined = new Uint8Array(total);
-        let offset = 0;
-        for (const part of parts) { joined.set(part, offset); offset += part.length; }
-        wire = new TextDecoder("utf-8", { fatal: true }).decode(joined);
+          const joined = new Uint8Array(total);
+          let offset = 0;
+          for (const part of parts) { joined.set(part, offset); offset += part.length; }
+          wire = new TextDecoder("utf-8", { fatal: true }).decode(joined);
+        })();
+        await Promise.race([work, new Promise((_resolve, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error("ZK_BROWSER_AUTHORITY_RELAY_TIMEOUT"));
+          }, deadlineMs);
+        })]);
       } catch (_) { deny(); }
+      finally { clearTimeout(timer); controller.abort(); }
       input.assertLive();
       if (input.csrfToken() !== csrf) deny();
       let parsed;
