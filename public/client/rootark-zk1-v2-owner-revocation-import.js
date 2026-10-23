@@ -30,13 +30,14 @@
       || fields.some((field) => !Object.hasOwn(input, field))) deny();
     return input;
   }
-  function decode(raw, length) {
-    if (typeof raw !== "string" || !/^[A-Za-z0-9_-]+$/.test(raw)) deny();
+  function decode(raw, length, maximum = length) {
+    if (typeof raw !== "string" || !/^[A-Za-z0-9_-]+$/.test(raw)
+      || raw.length > Math.ceil(maximum * 4 / 3) + 4) deny();
     let bytes;
     try { bytes = Uint8Array.from(atob(raw.replace(/-/g, "+").replace(/_/g, "/")
       .padEnd(Math.ceil(raw.length / 4) * 4, "=")), (v) => v.charCodeAt(0)); }
     catch (_) { deny(); }
-    if (bytes.length !== length || to64(bytes) !== raw) deny();
+    if (bytes.length < length || bytes.length > maximum || to64(bytes) !== raw) deny();
     return bytes;
   }
   function to64(bytes) {
@@ -78,7 +79,9 @@
       const owner = await importPin(raw.ownerSpki, pin.ownerSpkiSha256);
       const witness = await importPin(raw.witnessSpki, pin.witnessSpkiSha256);
       const cas = await importPin(raw.casSpki, pin.casSpkiSha256);
-      if (same(raw.witnessSpki, raw.casSpki)) deny();
+      if (same(raw.witnessSpki, raw.casSpki)
+        || same(raw.ownerSpki, raw.witnessSpki)
+        || same(raw.ownerSpki, raw.casSpki)) deny();
       const delivered = raw.delivery;
       if (!delivered || typeof delivered !== "object" || Array.isArray(delivered)) deny();
       const { ownerSignature, ...unsigned } = delivered;
@@ -96,7 +99,21 @@
         || delivered.physicalDurabilityProven !== false
         || delivered.historicalCiphertextAccessRevoked !== false
         || !Number.isSafeInteger(raw.nowSeconds)
-        || raw.nowSeconds < 1) deny();
+        || raw.nowSeconds < 1 || !Number.isSafeInteger(pin.revision)
+        || !Number.isSafeInteger(pin.previousRevision)
+        || !Number.isSafeInteger(pin.epoch)
+        || pin.revision !== pin.previousRevision + 1) deny();
+      // The owner-signed delivery includes signed V2 manifest CBOR, but a
+      // signature over the JSON envelope alone does not check its head digest.
+      // CBOR canonical history verification remains a separate required gate.
+      const manifest = decode(delivered.signedV2Manifest, 128, 262144);
+      const prefix = encoder.encode("Root.ark/zk-1/recovery-manifest-digest/v1\0");
+      const digestWire = new Uint8Array(prefix.length + manifest.length);
+      digestWire.set(prefix);
+      digestWire.set(manifest, prefix.length);
+      const manifestDigest = to64(new Uint8Array(await webCrypto.subtle.digest(
+        "SHA-256", digestWire)));
+      if (manifestDigest !== pin.digest) deny();
       const scope = delivered.scope;
       if (!scope || typeof scope !== "object"
         || !["account_id", "compartment_id", "keyring_id"]
@@ -127,7 +144,8 @@
         || first.previous_digest !== previous.digest
         || second.previous_revision !== first.revision
         || second.previous_digest !== first.digest
-        || first.sequence <= previous.sequence || second.sequence !== first.sequence + 1
+        || first.sequence !== previous.sequence + 1 || second.sequence !== first.sequence + 1
+        || first.epoch !== previous.epoch + 1
         || first.operation_id !== delivered.operationId
         || second.operation_id !== delivered.operationId
         || first.pop_challenge_id !== null || second.pop_challenge_id !== null) deny();
@@ -150,6 +168,7 @@
         || first.request_nonce !== cs.request_nonce
         || first.commit_nonce !== cs.commit_nonce
         || first.issued_at > raw.nowSeconds || first.expires_at < raw.nowSeconds
+        || second.issued_at > raw.nowSeconds || second.expires_at < raw.nowSeconds
         || cs.issued_at > raw.nowSeconds || cs.expires_at < raw.nowSeconds) deny();
       const grants = delivered.signedSurvivorGrants;
       if (!Array.isArray(grants) || grants.length < 1 || grants.length > 256) deny();
@@ -161,6 +180,8 @@
           || grant.manifest_revision !== pin.revision
           || grant.manifest_digest !== pin.digest
           || grant.current_epoch !== pin.epoch || grant.revoked_at_epoch !== null
+          || !Number.isSafeInteger(grant.enrolled_epoch)
+          || grant.enrolled_epoch < 1 || grant.enrolled_epoch > pin.epoch
           || !Object.keys(scope).every((field) => grant[field] === scope[field])
           || !await signature(owner, GRANT, unsignedOf(grant, GRANT_FIELDS), grant.signature)) deny();
         seen.add(grant.device_id);

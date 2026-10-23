@@ -21,6 +21,8 @@
     "rootark-zk1-legacy-batch-migration",
     "rootark-zk1-v2-device-approval", "rootark-zk1-v2-browser-pop",
     "rootark-zk1-v2-committed-approval",
+    "rootark-zk1-v2-owner-revocation-import",
+    "rootark-zk1-v2-owner-revocation-browser",
     "rootark-zk1-keyring-portable-archive",
     "rootark-zk1-browser-versioned-archive",
     "rootark-zk1-account-portable-recovery",
@@ -41,6 +43,7 @@
   // browser profile must import independently anchored evidence again.
   let committedDeviceApproval = null;
   let verifiedCatalog = null;
+  let verifiedRevocationHead = null;
 
   function fail() { throw new Error("ZK_WORKSPACE_INPUT_DENIED"); }
   function supportsOwnerRootedV2(value) {
@@ -130,15 +133,23 @@
         });
       }
     }
+    const pinnedCurrentHead = {
+      revision: positive("revision"), digest: from64(field("digest").value.trim()),
+      epoch: positive("epoch"),
+    };
+    if (verifiedRevocationHead
+      && [signedDeviceGrant.account_id, signedDeviceGrant.compartment_id,
+        signedDeviceGrant.keyring_id].join("|") === verifiedRevocationHead.scope) {
+      if (signedDeviceGrant.device_id === verifiedRevocationHead.revokedDeviceId
+        || pinnedCurrentHead.revision !== verifiedRevocationHead.revision
+        || pinnedCurrentHead.epoch !== verifiedRevocationHead.epoch
+        || to64(pinnedCurrentHead.digest) !== verifiedRevocationHead.digest) fail();
+    }
     return {
       ownerPublicKey,
       pinnedOwnerKeyHash: from64(field("owner-hash").value.trim()),
       independentOwnerSpkiSha256: from64(field("owner-spki").value.trim()),
-      pinnedCurrentHead: {
-        revision: positive("revision"),
-        digest: from64(field("digest").value.trim()),
-        epoch: positive("epoch"),
-      },
+      pinnedCurrentHead,
       signedDeviceGrant,
       ownerHistoryCheckpoint,
       previousOwnerHistoryProof,
@@ -557,6 +568,7 @@
         || !window.RootarkZk1V2DeviceApproval?.verifyImportedApproval
         || !window.RootarkZk1V2BrowserPop?.respond
         || !window.RootarkZk1V2CommittedApproval?.verifyCommittedApproval
+        || !window.RootarkZk1V2OwnerRevocationBrowser?.verifyOfflineTransfer
         || !window.RootarkZk1KeyringPortableArchive?.createArchive
         || !window.RootarkZk1KeyringPortableArchive?.recoverArchive
         || !window.RootarkZk1KeyringPortableArchive?.issueHistoricalRecoveryChallenge
@@ -633,6 +645,17 @@
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-page">Exibir página verificada</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-get">GET ciphertext conferido</button></div>'
       + '<div data-zk1-field="catalog-list" role="region" aria-label="IDs de versões opacas validadas"></div>'
+      + '</fieldset>'
+      + '<fieldset><legend>Revogação de dispositivo e rotação V2 (recibo offline, DEV)</legend>'
+      + '<p class="muted">Importe o recibo assinado do proprietário e, por canal separado, as chaves públicas SPKI e pins atuais de proprietário, witness e CAS. '
+      + 'O JSON de pins independente contém ownerSpkiSha256, witnessSpkiSha256, casSpkiSha256, priorReceiptSha256, casSequence, revision, digest, epoch, previousRevision e previousDigest. '
+      + 'A transferência validada NÃO libera grants, GET, restore nem autoriza ProtectedObjectStore sem verificar todo o histórico V2 atual e o compromisso remoto.</p>'
+      + '<label>Recibo assinado do proprietário (.json)<input type="file" data-zk1-field="revoke-delivery" accept=".json,application/json"></label>'
+      + '<label>Pins externos independentes (.json)<input type="file" data-zk1-field="revoke-pins" accept=".json,application/json"></label>'
+      + '<label>SPKI DER do proprietário (.der)<input type="file" data-zk1-field="revoke-owner-spki"></label>'
+      + '<label>SPKI DER do witness (.der)<input type="file" data-zk1-field="revoke-witness-spki"></label>'
+      + '<label>SPKI DER do CAS (.der)<input type="file" data-zk1-field="revoke-cas-spki"></label>'
+      + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="verify-revocation">Conferir revogação assinada e epoch</button></div>'
       + '</fieldset>'
       + '<fieldset><legend>Migração opt-in de arquivo legado (apenas laboratório)</legend>'
       + '<p class="muted">O caminho legado /files já entrega plaintext pelo servidor antigo. Na cópia ZK, apenas ciphertext é enviado. '
@@ -730,13 +753,15 @@
     if (action === "close") {
       committedDeviceApproval = null;
       verifiedCatalog = null;
+      verifiedRevocationHead = null;
+      window.RootarkZk1V2OwnerRevocationBrowser?.clear();
       dialog.close();
       dialog.querySelector("form").reset();
       status("Nenhuma autoridade foi importada.");
       return;
     }
     if (!["provision", "verify-inventory", "upload", "upload-recoverable",
-      "restore", "new-secret", "new-device", "answer-pop", "import-approval",
+      "restore", "new-secret", "new-device", "answer-pop", "import-approval", "verify-revocation",
       "migrate", "migration-finalize", "migration-batch", "archive-create", "archive-recover",
       "account-create", "account-recover", "versioned-create", "versioned-recover",
       "catalog-discover", "catalog-page", "catalog-get"].includes(action)) return;
@@ -769,6 +794,33 @@
       const available = await api.get("/zk-1/v1/workspace-capability");
       assertLive();
       if (!supportsOwnerRootedV2(available)) fail();
+      if (action === "verify-revocation") {
+        // A previous approved grant cannot survive a newly presented owner
+        // revocation receipt; neither a failed nor successful import releases it.
+        committedDeviceApproval = null;
+        const delivery = JSON.parse(decoder.decode(await fileBytes("revoke-delivery", 1, 400000)));
+        const independentPins = JSON.parse(decoder.decode(await fileBytes("revoke-pins", 1, 8192)));
+        const ownerSpki = await fileBytes("revoke-owner-spki", 40, 512);
+        const witnessSpki = await fileBytes("revoke-witness-spki", 40, 512);
+        const casSpki = await fileBytes("revoke-cas-spki", 40, 512);
+        assertLive();
+        const verified = await window.RootarkZk1V2OwnerRevocationBrowser.verifyOfflineTransfer({
+          delivery, ownerSpki, witnessSpki, casSpki, independentPins,
+          nowSeconds: Math.floor(Date.now() / 1000), assertLive,
+        });
+        assertLive();
+        if (verified.verified !== true || verified.grantsReleased !== false
+          || verified.authorizesProtectedIo !== false) fail();
+        verifiedRevocationHead = { scope: [delivery.scope.account_id,
+          delivery.scope.compartment_id, delivery.scope.keyring_id].join("|"),
+          revision: verified.revision, digest: independentPins.digest,
+          epoch: verified.epoch, revokedDeviceId: verified.revokedDeviceId };
+        status("Revogação V2 assinada confirmada: dispositivo "
+          + verified.revokedDeviceId + ", revisão " + verified.revision
+          + ", época " + verified.epoch + ". " + verified.signedSurvivorCount
+          + " grants conferidos, zero liberados. Exija histórico V2 integral antes de qualquer acesso protegido.");
+        return;
+      }
       if (action === "verify-inventory") {
         const raw = decoder.decode(await fileBytes("inventory-portable", 1, 400000));
         const grant = JSON.parse(decoder.decode(await fileBytes("grant", 1, 8192)));
@@ -1543,7 +1595,8 @@
         "account-descriptors", "account-holder-files", "account-local-files",
         "account-historical-device-privates",
         "account-owner-private", "account-archive",
-        "v2-snapshot", "v2-roster", "v2-inventory-signer", "v2-versions"]) {
+        "v2-snapshot", "v2-roster", "v2-inventory-signer", "v2-versions",
+        "revoke-delivery", "revoke-pins", "revoke-owner-spki", "revoke-witness-spki", "revoke-cas-spki"]) {
         const control = field(name);
         if (control) control.value = "";
       }
@@ -1586,6 +1639,8 @@
     for (const url of activeDownloadUrls) URL.revokeObjectURL(url);
     activeDownloadUrls.clear();
     committedDeviceApproval = null;
+    verifiedRevocationHead = null;
+    window.RootarkZk1V2OwnerRevocationBrowser?.clear();
     capability = false;
     if (dialog?.open) dialog.close();
     dialog?.querySelector("form")?.reset();

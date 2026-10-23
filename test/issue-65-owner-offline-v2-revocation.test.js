@@ -14,6 +14,7 @@ const commitments = require("../src/crypto/rootark-zk1-offline-commitment-receip
 const casModule = require("../src/crypto/rootark-zk1-offline-cas-commit-proof");
 const orchestrator = require("../src/services/zk1OwnerOfflineRevocationOrchestrator");
 const importer = require("../public/client/rootark-zk1-v2-owner-revocation-import");
+const browser = require("../public/client/rootark-zk1-v2-owner-revocation-browser");
 
 const b64 = (v) => Buffer.from(v).toString("base64url");
 const sha = (v) => crypto.createHash("sha256").update(v).digest();
@@ -169,11 +170,47 @@ test("offline V2 rotation creates real HPKE wraps, revokes target, verifies dual
       digest: candidate.digest, previousRevision: f.previous.revision,
       previousDigest: f.pins.digest,
     }, nowSeconds: Math.floor(Date.now() / 1000) };
+  if (process.env.ZK65_EDGE_FIXTURE_DIR) {
+    const dir = path.resolve(process.env.ZK65_EDGE_FIXTURE_DIR);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "delivery.json"), JSON.stringify(delivered));
+    fs.writeFileSync(path.join(dir, "pins.json"), JSON.stringify(check.independentPins));
+    for (const [name, bytes] of [["owner", check.ownerSpki],
+      ["witness", check.witnessSpki], ["cas", check.casSpki]]) {
+      fs.writeFileSync(path.join(dir, name + ".der"), bytes);
+    }
+  }
   const verified = await importer.verifyRevocationDelivery(check);
   assert.equal(verified.transferVerified, true);
   assert.equal(verified.authorizesProtectedIo, false);
   assert.equal(verified.liveCasOrCustodyVerified, false);
   assert.equal(verified.fullV2ManifestHistoryVerified, false);
+  browser.clear();
+  let fenceChecks = 0;
+  const guarded = { ...check, assertLive: () => { fenceChecks++; } };
+  const inspection = await browser.verifyOfflineTransfer(guarded);
+  assert.equal(inspection.verified, true);
+  assert.equal(inspection.revokedDeviceId, "trusted-1");
+  assert.equal(inspection.epoch, delivered.epoch);
+  assert.equal(inspection.signedSurvivorCount, 1);
+  assert.equal(inspection.grantsReleased, false);
+  assert.equal(inspection.fullV2HistoryVerified, false);
+  assert.equal(inspection.authorizesProtectedIo, false);
+  assert.equal(Object.hasOwn(inspection, "signedSurvivorGrants"), false);
+  assert.ok(fenceChecks >= 3);
+  await assert.rejects(browser.verifyOfflineTransfer(guarded),
+    /ZK_V2_OWNER_REVOCATION_BROWSER_DENIED/);
+  browser.clear();
+  let checked = 0;
+  await assert.rejects(browser.verifyOfflineTransfer({ ...guarded,
+    assertLive: () => { if (++checked > 1) throw new Error("logged out / CSRF changed"); },
+  }), /ZK_V2_OWNER_REVOCATION_BROWSER_DENIED/);
+  // Abort must not consume a valid receipt's local replay floor.
+  assert.equal((await browser.verifyOfflineTransfer(guarded)).verified, true);
+  browser.clear();
+  await assert.rejects(browser.verifyOfflineTransfer({ ...guarded,
+    independentPins: { ...check.independentPins, casSequence: delivered.signedCasProof.cas_sequence },
+  }), /ZK_V2_OWNER_REVOCATION_BROWSER_DENIED/);
   for (const changed of [
     { independentPins: { ...check.independentPins, epoch: f.pins.epoch } },
     { independentPins: { ...check.independentPins, casSequence: delivered.signedCasProof.cas_sequence } },
@@ -202,12 +239,24 @@ test("offline V2 rotation creates real HPKE wraps, revokes target, verifies dual
       Buffer.from(JSON.stringify(unsignedDelivery))]), f.owner.privateKey)) };
   await assert.rejects(importer.verifyRevocationDelivery({
     ...check, delivery: oldDelivery }), /ZK_OWNER_REVOCATION_IMPORT_DENIED/);
+  // A valid owner signature over mismatched CBOR cannot replace the actual
+  // independently pinned V2 digest, nor can signed predecessor epochs fork.
+  const altered = { ...unsigned, signedV2Manifest: b64(crypto.randomBytes(256)) };
+  const alteredDelivery = { ...altered, ownerSignature: b64(crypto.sign(null,
+    Buffer.concat([Buffer.from("Root.ark/zk-1/owner-v2-revocation-delivery/v1\0"),
+      Buffer.from(JSON.stringify(altered))]), f.owner.privateKey)) };
+  await assert.rejects(importer.verifyRevocationDelivery({ ...check, delivery: alteredDelivery }),
+    /ZK_OWNER_REVOCATION_IMPORT_DENIED/);
   const ctx = vm.createContext({ crypto: crypto.webcrypto, TextEncoder, Uint8Array,
     ArrayBuffer, atob, btoa });
   vm.runInContext(fs.readFileSync(path.resolve(__dirname,
     "../public/client/rootark-zk1-v2-owner-revocation-import.js"), "utf8"), ctx);
+  vm.runInContext(fs.readFileSync(path.resolve(__dirname,
+    "../public/client/rootark-zk1-v2-owner-revocation-browser.js"), "utf8"), ctx);
   assert.equal(vm.runInContext(
     "typeof RootarkZk1V2OwnerRevocationImport.verifyRevocationDelivery", ctx), "function");
+  assert.equal(vm.runInContext(
+    "typeof RootarkZk1V2OwnerRevocationBrowser.verifyOfflineTransfer", ctx), "function");
 });
 test("canonical V2 signer rejects an actually revoked historical actor for a later epoch", async () => {
   const f = await setup();
