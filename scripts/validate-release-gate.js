@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { Buffer } = require("node:buffer");
 const { spawnSync } = require("node:child_process");
-const { getNpmInvocation, canonicalTestArgs, isDependencyOrNetworkUnavailable } = require("./release-gate-environment");
+const { getNpmInvocation, canonicalTestArgs, hasSeparateWindowsCiCanonicalTest, isDependencyOrNetworkUnavailable } = require("./release-gate-environment");
 const { failedTestDiagnostics, unrecognizedChildProgress } = require("./release-gate-diagnostics");
 
 const root = path.resolve(__dirname, "..");
@@ -125,6 +125,8 @@ for (const [name, files] of [
 const npmTest = getNpmInvocation(canonicalTestArgs());
 if (results.some((result) => result.status === "FAIL")) {
   record("final-head canonical npm test", "SKIPPED", "earlier mandatory gate failed; run after correction");
+} else if (hasSeparateWindowsCiCanonicalTest()) {
+  record("final-head canonical npm test", "DELEGATED", "required Windows CI canonical-suite job runs the complete test set");
 } else {
   command("final-head canonical npm test", npmTest.executable, npmTest.args, { blockedOnMissing: true });
 }

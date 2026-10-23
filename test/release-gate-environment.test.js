@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { getNpmInvocation, canonicalTestArgs, isDependencyOrNetworkUnavailable } = require("../scripts/release-gate-environment");
+const { getNpmInvocation, canonicalTestArgs, hasSeparateWindowsCiCanonicalTest, isDependencyOrNetworkUnavailable } = require("../scripts/release-gate-environment");
+const { createTapProgressRecorder } = require("../scripts/run-windows-canonical-tests");
 
 test("Windows canonical release gate bounds file concurrency without omitting any test", () => {
   assert.deepEqual(canonicalTestArgs({ platform: "win32" }),
@@ -15,6 +16,29 @@ test("Windows canonical release gate bounds file concurrency without omitting an
   });
   // The package's canonical 'npm test' script remains unmodified.
   assert.equal(require("../package.json").scripts.test, "node --test");
+});
+
+test("only the explicitly split Windows Actions gate delegates the canonical suite", () => {
+  assert.equal(hasSeparateWindowsCiCanonicalTest({ platform: "win32", githubActions: "true", separateJob: "true" }), true);
+  assert.equal(hasSeparateWindowsCiCanonicalTest({ platform: "win32", githubActions: "true", separateJob: undefined }), false);
+  assert.equal(hasSeparateWindowsCiCanonicalTest({ platform: "win32", githubActions: "false", separateJob: "true" }), false);
+  assert.equal(hasSeparateWindowsCiCanonicalTest({ platform: "linux", githubActions: "true", separateJob: "true" }), false);
+});
+
+test("streaming Windows canonical runner reports progress without revealing test names or output", () => {
+  const logged = [];
+  const recorder = createTapProgressRecorder((message) => logged.push(message));
+  recorder.accept("TAP version 13");
+  recorder.accept("not ok 1 - fixture secret should never appear in a CI log");
+  recorder.accept("ok 2 - passing test");
+  recorder.accept("1..2");
+  recorder.accept("# tests 2");
+  recorder.accept("# fail 1");
+  assert.deepEqual({ results: recorder.state.results, failures: recorder.state.failures, plan: recorder.state.plan,
+    tests: recorder.state.tests, reportedFailures: recorder.state.reportedFailures },
+  { results: 2, failures: 1, plan: true, tests: 2, reportedFailures: 1 });
+  assert.match(logged.join("\n"), /nameSha256=[0-9a-f]{24}/);
+  assert.doesNotMatch(logged.join("\n"), /fixture secret|passing test/);
 });
 
 test("release gate uses native npm instead of inherited Windows cmd on Linux", () => {
