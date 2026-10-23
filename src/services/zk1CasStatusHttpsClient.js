@@ -70,8 +70,23 @@ function createZk1CasStatusHttpsClient({
       }));
       if (body.length > 4096) fail();
       return new Promise((resolve, reject) => {
-        const rejectGeneric = () => reject(new Error("CAS_STATUS_TRANSPORT_UNAVAILABLE"));
-        const request = https.request({
+        let settled = false;
+        let request;
+        let deadline;
+        const rejectGeneric = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(deadline);
+          request?.destroy();
+          reject(new Error("CAS_STATUS_TRANSPORT_UNAVAILABLE"));
+        };
+        const accept = (bytes) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(deadline);
+          resolve(bytes);
+        };
+        request = https.request({
           hostname: url.hostname, port: url.port,
           path: url.pathname, method: "POST",
           agent: false, // always recheck this CAS-status client's exact server pin
@@ -106,7 +121,6 @@ function createZk1CasStatusHttpsClient({
           response.on("data", (part) => {
             size += part.length;
             if (size > 8192) {
-              request.destroy();
               rejectGeneric();
             } else received.push(part);
           });
@@ -121,12 +135,16 @@ function createZk1CasStatusHttpsClient({
               const raw = Buffer.from(object.proofBase64, "base64url");
               if (!raw.length || raw.length > 6144
                 || raw.toString("base64url") !== object.proofBase64) fail();
-              resolve(raw);
+              accept(raw);
             } catch (_) { rejectGeneric(); }
           });
           response.on("error", rejectGeneric);
         });
-        request.on("timeout", () => request.destroy());
+        // A socket timeout only measures inactivity. A pinned but untrusted
+        // peer can send one byte per interval and block witness terminality
+        // forever unless the entire mTLS exchange has a hard deadline.
+        deadline = setTimeout(rejectGeneric, timeoutMs);
+        request.on("timeout", rejectGeneric);
         request.on("error", rejectGeneric);
         request.end(body);
       });
