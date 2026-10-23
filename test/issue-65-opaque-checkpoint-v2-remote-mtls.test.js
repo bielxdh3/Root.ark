@@ -1130,7 +1130,8 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
     });
   const endorse132 = await issueEndorsement(signed132, endorsementPrevious, grant);
   {
-    async function rotate(sequence, predecessor, signerDevice) {
+    async function rotate(sequence, predecessor, signerDevice,
+      approvalDevice = deviceB, issueGrant = true) {
       const priorBody = await z.decodeDeterministic(predecessor.raw);
       const header = Buffer.from(await z.encodeDeterministic({ ...nextHeader,
         sequence, previous_digest: predecessor.digest,
@@ -1157,7 +1158,7 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
         cas_signer_fp: fp(v2CasKeys.publicKey),
         floor_signer_fp: fp(v2FloorKeys.publicKey),
         checkpoint_signer_fp: fp(checkpoint.publicKey), issued_at: now(),
-      }, owner.privateKey);
+      }, keys(approvalDevice));
       const predecessorReceipts = await handles.coordinator.predecessorEndorsements(predecessor.raw);
       const raw = Buffer.from(await z.encodeDeterministic({
         type: "rootark-opaque-checkpoint-remote-intent/v2", ...scope,
@@ -1169,10 +1170,20 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
         owner_approval: approval.raw, owner_signature: approval.signature,
         owner_evidence: await evidence(), ...predecessorReceipts,
       }));
+      if (sequence === 136) {
+        const forged = await z.decodeDeterministic(raw);
+        forged.owner_signature = crypto.randomBytes(64);
+        await assert.rejects(handles.coordinator.publish(Buffer.from(
+          await z.encodeDeterministic(forged))),
+        /ZK_CHECKPOINT_V2_(?:ACK_UNCERTAIN|UNAVAILABLE|CONFLICT)/,
+        "forged rotated owner approval is denied by real mTLS authorities");
+        assert.equal((await handles.casClient.head()).sequence, 135);
+        assert.equal((await handles.floorClient.head()).sequence, 135);
+      }
       assert.equal((await handles.coordinator.publish(raw)).finalSequence, sequence);
-      const signedEndorsement = await issueEndorsement(raw, {
+      const signedEndorsement = issueGrant ? await issueEndorsement(raw, {
         digest: predecessor.digest, checkpointDigest: predecessor.checkpointDigest,
-        operationId: priorBody.operation_id }, grant);
+        operationId: priorBody.operation_id }, grant) : null;
       return { raw, digest: hd(header, signature),
         checkpointDigest: checkpointBytes.checkpointDigest,
         ownerEndorsement: signedEndorsement };
@@ -1234,8 +1245,54 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
       const reopened = new Zk1OpaqueCheckpointV2Client({
         ...recipientOptions, journalPath: path.join(dir, "v2-B-C-B-recipient.sqlite"),
         bootstrapNew: false });
-      try { assert.equal((await reopened.read()).sequence, 135); }
-      finally { reopened.close(); }
+      let signed135;
+      try {
+        assert.equal((await reopened.read()).sequence, 135);
+        signed135 = (await reopened.exportSignedIntents()).at(-1);
+      } finally { reopened.close(); }
+      // Owner approval, independent of catalog signer: B135 -> C136 -> B137.
+      // The CAS/FLOOR journals remain pinned to the original B configuration.
+      const rotated136 = await rotate(136, { raw: signed135,
+        digest: published135.digest,
+        checkpointDigest: published135.checkpointDigest }, deviceC, deviceC, false);
+      const rotated137 = await rotate(137, rotated136, deviceB, deviceB, false);
+      assert.equal((await handles.casClient.head()).sequence, 137);
+      assert.equal((await handles.floorClient.head()).sequence, 137);
+      await assert.rejects(handles.coordinator.publish(rotated136.raw),
+        /ZK_CHECKPOINT_V2_(?:ACK_UNCERTAIN|UNAVAILABLE|CONFLICT)/,
+        "historical 136 owner approval cannot replay after both authorities finalized 137");
+      // Old C approval stays historically valid after real signed revocation,
+      // including reconstruction from separately persisted SQLite CAS/FLOOR.
+      const ownerState = { headManifest: state.headManifest,
+        transitions: state.transitions.slice(),
+        verifiedHistory: state.verifiedHistory,
+        epochKeys: state.epochKeys.slice() };
+      try {
+        await fixtures.appendDeviceRevocation(state, deviceC.device_id,
+          undefined, deviceB.device_id);
+        assert.equal((await handles.casClient.head()).sequence, 137);
+        await assert.rejects(rotate(138, rotated137, deviceC, deviceC, false),
+          /ZK_CHECKPOINT_V2_(?:ACK_UNCERTAIN|UNAVAILABLE|CONFLICT)/,
+          "revoked C cannot publish a fresh approval at new epoch");
+        assert.equal((await handles.floorClient.head()).sequence, 137);
+        await stopV2();
+        floor2 = new OpaqueCheckpointV2Authority(path.join(dir, "v2-floor.sqlite"), {
+          ...authorityOptions, role: "FLOOR", bootstrapNew: false,
+          signingPrivateKey: v2FloorKeys.privateKey });
+        cas2 = new OpaqueCheckpointV2Authority(path.join(dir, "v2-cas.sqlite"), {
+          ...authorityOptions, role: "CAS", bootstrapNew: false,
+          signingPrivateKey: v2CasKeys.privateKey });
+        handles = await serveV2({ restart: true });
+        assert.equal((await handles.casClient.head()).sequence, 137,
+          "persisted CAS history revalidates C owner approval after revocation and restart");
+        assert.equal((await handles.floorClient.head()).sequence, 137,
+          "persisted FLOOR history revalidates C owner approval after revocation and restart");
+      } finally {
+        state.headManifest = ownerState.headManifest;
+        state.transitions = ownerState.transitions;
+        state.verifiedHistory = ownerState.verifiedHistory;
+        state.epochKeys = ownerState.epochKeys;
+      }
     } finally { recipientRotating.close(); }
   }
   await new Promise((resolve) => bridgeServer.close(resolve));

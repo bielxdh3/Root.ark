@@ -281,8 +281,13 @@ async function appendDeviceEnrollment(state, index) {
   return state.headManifest;
 }
 
-async function prepareDeviceRevocation(state, deviceId, operationId = crypto.randomBytes(16)) {
+async function prepareDeviceRevocation(state, deviceId, operationId = crypto.randomBytes(16),
+  actorDeviceId) {
   const previous = state.headManifest;
+  const acting = actorDeviceId
+    ? previous.devices.find((device) => device.device_id === actorDeviceId
+      && device.revoked_at_epoch === null) : previous.devices[0];
+  if (!acting) throw new Error("fixture active revocation actor missing");
   const target = previous.devices.find((device) => device.device_id === deviceId);
   if (!target) throw new Error("fixture target device missing");
   const currentEpoch = previous.current_epoch + 1;
@@ -323,7 +328,7 @@ async function prepareDeviceRevocation(state, deviceId, operationId = crypto.ran
       operation_id: operationId,
       operation_type: "revoke-device",
       actor_type: "device",
-      actor_key_id: previous.devices[0].authorization_key_id,
+      actor_key_id: acting.authorization_key_id,
       target_device_id: deviceId,
       target_device_key_digest: null,
       compromised_package_id: null,
@@ -339,10 +344,11 @@ async function prepareDeviceRevocation(state, deviceId, operationId = crypto.ran
   return { core, newKey, newWraps };
 }
 
-async function appendDeviceRevocation(state, deviceId, operationId) {
-  const prepared = await prepareDeviceRevocation(state, deviceId, operationId);
+async function appendDeviceRevocation(state, deviceId, operationId, actorDeviceId) {
+  const prepared = await prepareDeviceRevocation(state, deviceId, operationId, actorDeviceId);
   const previous = state.headManifest;
-  const actor = state.actors.get(previous.devices[0].authorization_key_id.toString("hex"));
+  const actorKeyId = prepared.core.operation.actor_key_id;
+  const actor = state.actors.get(actorKeyId.toString("hex"));
   const next = await m.signRecoveryTransitionV2({
     proposedCore: prepared.core,
     priorVerifiedHistory: state.verifiedHistory,

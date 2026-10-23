@@ -253,13 +253,11 @@ async function signCheckpointOwnerApprovalV2(statement, privateKey) {
     key(privateKey, "private")) };
 }
 
-async function verifyOwnerRooted(intent, opts) {
+async function verifyOwnerRooted(intent, opts, { historical = false } = {}) {
   const approval = await z.decodeDeterministic(bytes(intent.owner_approval, 1, 4096));
   exact(approval, APPROVAL_FIELDS);
   if (approval.type !== "rootark-opaque-checkpoint-remote-owner-approval/v2") fail();
   matchesScope(approval, opts.scope);
-  if (!crypto.verify(null, Buffer.concat([APPROVAL_DOMAIN, intent.owner_approval]),
-    opts.ownerKey, bytes(intent.owner_signature, 64))) fail();
   if (approval.previous_sequence !== intent.previous_sequence
     || approval.final_sequence !== intent.previous_sequence + 1
     || !same(bytes(approval.operation_id, 32), intent.operation_id)
@@ -270,7 +268,8 @@ async function verifyOwnerRooted(intent, opts) {
     || !same(bytes(approval.cas_signer_fp, 32), opts.casFp)
     || !same(bytes(approval.floor_signer_fp, 32), opts.floorFp)
     || !same(bytes(approval.checkpoint_signer_fp, 32), opts.checkpointFp)
-    || Math.abs(Date.now() / 1000 - num(approval.issued_at, 0)) > 300) fail();
+    || (!historical && Math.abs(Date.now() / 1000 - num(approval.issued_at, 0)) > 300)) fail();
+  num(approval.issued_at, 0);
   const evidence = await z.decodeDeterministic(bytes(intent.owner_evidence, 1, MAX_OWNER));
   exact(evidence, OWNER_EVIDENCE);
   if (!Array.isArray(evidence.transitions) || !Array.isArray(evidence.packageEnvelopes)) fail();
@@ -289,27 +288,41 @@ async function verifyOwnerRooted(intent, opts) {
     raw: bytes(evidence.witnessHeadRaw, 1, 8192), nonce: challenge,
     scope: opts.scope, pinned: trust.pinnedWitness, minimumHead: trust.minimumHead,
   });
-  const liveNonce = crypto.randomBytes(32);
-  const liveRaw = bytes(await trust.freshWitnessHead({ nonce: liveNonce,
-    scope: opts.scope }), 1, 8192);
-  await inspectVerifiedWitnessFreshHeadV1({
-    raw: liveRaw, nonce: liveNonce, scope: opts.scope,
-    pinned: trust.pinnedWitness, minimumHead: trust.minimumHead,
+  // The signed, independently pinned witness is the authority for which owner
+  // epoch was current when this exact immutable intent was approved. Replays
+  // cannot choose a newer epoch or manufacture enrollment/revocation facts.
+  const recorded = await z.decodeDeterministic(evidence.witnessHeadRaw);
+  if (!seenWitness || Number(recorded.current_revision) !== Number(verified.revision)
+    || !same(bytes(recorded.current_manifest_digest, 32), verified.headDigest)
+    || Math.abs(Number(recorded.observed_at) - approval.issued_at) > 300) fail();
+  if (!historical) {
+    const liveNonce = crypto.randomBytes(32);
+    const liveRaw = bytes(await trust.freshWitnessHead({ nonce: liveNonce,
+      scope: opts.scope }), 1, 8192);
+    await inspectVerifiedWitnessFreshHeadV1({
+      raw: liveRaw, nonce: liveNonce, scope: opts.scope,
+      pinned: trust.pinnedWitness, minimumHead: trust.minimumHead,
+    });
+    const live = await z.decodeDeterministic(liveRaw);
+    if (Math.abs(Date.now() / 1000 - live.observed_at) > 30
+      || Number(live.current_revision) !== Number(verified.revision)
+      || !same(bytes(live.current_manifest_digest, 32), verified.headDigest)) fail();
+  }
+  // Never accept an owner key advertised by the intent. Independently verify
+  // the owner recovery chain and select only an active enrolled signer whose
+  // Ed25519 signature authenticates this exact owner approval at its epoch.
+  const approvalMessage = Buffer.concat([APPROVAL_DOMAIN, intent.owner_approval]);
+  const approvalSignature = bytes(intent.owner_signature, 64);
+  const matchingOwnerKeys = verified.headManifest.devices.filter((device) => {
+    if (device.revoked_at_epoch !== null
+      || Number(device.enrolled_epoch) > Number(verified.headManifest.current_epoch))
+      return false;
+    const signer = crypto.createPublicKey({ key: Buffer.concat([
+      SPKI_PREFIX, bytes(device.authorization_public_key, 32)]),
+    format: "der", type: "spki" });
+    return crypto.verify(null, approvalMessage, signer, approvalSignature);
   });
-  const live = await z.decodeDeterministic(liveRaw);
-  if (Math.abs(Date.now() / 1000 - live.observed_at) > 30
-    || Number(live.current_revision) !== Number(verified.revision)
-    || !same(bytes(live.current_manifest_digest, 32), verified.headDigest)
-    || !seenWitness) fail();
-  // Owner approval signer must itself be currently authorized by the
-  // independently witnessed owner-recovery history. A merely supplied
-  // Ed25519 public key cannot unilaterally declare itself the owner.
-  const approvedOwnerSigner = verified.headManifest.devices.some((device) =>
-    device.revoked_at_epoch === null
-    && Number(device.enrolled_epoch) <= Number(verified.headManifest.current_epoch)
-    && same(bytes(device.authorization_public_key, 32),
-      opts.ownerKey.export({ type: "spki", format: "der" }).subarray(-32)));
-  if (!approvedOwnerSigner) fail();
+  if (matchingOwnerKeys.length !== 1) fail();
   const header = await z.decodeDeterministic(bytes(intent.records[0].header, 1, 16384));
   exact(header, HEAD_FIELDS);
   if (header.manifest_revision !== Number(verified.revision)
@@ -323,10 +336,13 @@ async function verifyOwnerRooted(intent, opts) {
   const signer = crypto.createPublicKey({ key: Buffer.concat([
     SPKI_PREFIX, bytes(authorized.authorization_public_key, 32)]),
   format: "der", type: "spki" });
-  return { signer, proof: verified };
+  return { signer, proof: verified, ownerApprovalSigner: crypto.createPublicKey({
+    key: Buffer.concat([SPKI_PREFIX,
+      bytes(matchingOwnerKeys[0].authorization_public_key, 32)]),
+    format: "der", type: "spki" }) };
 }
 
-async function inspectIntent(raw, opts, { freshOwner = true } = {}) {
+async function inspectIntent(raw, opts, { freshOwner = true, historicalOwner = false } = {}) {
   const body = await z.decodeDeterministic(bytes(raw, 1, MAX_WIRE));
   const previousSequence = num(body.previous_sequence, 128, MAX_V2_SEQUENCE - 1);
   exact(body, previousSequence === 128 ? INTENT_FIELDS
@@ -360,9 +376,13 @@ async function inspectIntent(raw, opts, { freshOwner = true } = {}) {
   const finalDigest = hash(Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0"),
     body.records[0].header, body.records[0].signature);
   let signer;
-  if (freshOwner) ({ signer } = await verifyOwnerRooted(body, { ...opts,
-    checkpointDigest, finalDigest }));
-  else signer = key(opts.cachedSigner); // caller may only use for exact immutable reread
+  let ownerApprovalSigner = null;
+  if (freshOwner || historicalOwner) {
+    const trusted = await verifyOwnerRooted(body, { ...opts,
+      checkpointDigest, finalDigest }, { historical: !freshOwner });
+    signer = freshOwner ? trusted.signer : key(opts.cachedSigner);
+    ownerApprovalSigner = trusted.ownerApprovalSigner;
+  } else signer = key(opts.cachedSigner); // caller may only use for exact immutable reread
   const verified = await archiveV2.verifyAuthenticatedOpaqueCatalogArchiveV2({
     checkpointBytes: body.checkpoint_bytes,
     checkpointSignature: body.checkpoint_signature,
@@ -378,7 +398,8 @@ async function inspectIntent(raw, opts, { freshOwner = true } = {}) {
   });
   return { body, raw: Buffer.from(raw), intentHash: hash(INTENT_DOMAIN, raw),
     operationId: bytes(body.operation_id, 32), checkpointDigest, finalDigest,
-    verified, signerSpki: signer.export({ type: "spki", format: "der" }) };
+    verified, signerSpki: signer.export({ type: "spki", format: "der" }),
+    ownerApprovalSignerSpki: ownerApprovalSigner?.export({ type: "spki", format: "der" }) };
 }
 
 class OpaqueCheckpointV2Authority {
@@ -497,7 +518,8 @@ class OpaqueCheckpointV2Authority {
       baseCheckpoint: previous?.checkpoint_digest || s.baseCheckpoint,
       previousOperationId: previous?.operation_id || ZERO,
       cachedSigner: crypto.createPublicKey({ key: row.signer_spki,
-        format: "der", type: "spki" }) }, { freshOwner: freshness });
+        format: "der", type: "spki" }) },
+    { freshOwner: freshness, historicalOwner: !freshness });
     if (row.sequence !== inspected.body.previous_sequence + 1) fail();
     if (!same(inspected.intentHash, row.intent_hash)
       || !same(inspected.operationId, row.operation_id)
