@@ -235,6 +235,34 @@ test("revoked former signer cannot read or recommit; ACTIVE device re-endorses i
     "independent authority rollback is rejected before page egress");
   casSeq = 3;
   assert.equal((await post("/zk-1/v1/catalog/read", await read(1))).status, 200);
+  const unauthorized = await fetch(`http://127.0.0.1:${server.address().port}/zk-1/v1/catalog/read`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(await read(1)),
+  });
+  assert.equal(unauthorized.status, 401, "expired or missing session never receives catalog pages");
+  // A logical tombstone must never conceal missing or replaced historical
+  // ciphertext. Simulate a compromised SQLite writer in a disposable store:
+  // the signed catalog head remains unchanged and the version count matches.
+  const archived = store.db.prepare(
+    "SELECT ciphertext,ciphertext_digest FROM zk_content_version WHERE id=? AND revision=1"
+  ).get(objectId);
+  assert.ok(archived?.ciphertext?.length > 0);
+  store.db.exec("DROP TRIGGER zk_content_version_no_update");
+  const replaced = crypto.randomBytes(archived.ciphertext.length);
+  store.db.prepare("UPDATE zk_content_version SET ciphertext=? WHERE id=? AND revision=1")
+    .run(replaced, objectId);
+  assert.equal((await post("/zk-1/v1/catalog/read", await read(1))).status, 503,
+    "replaced historical ciphertext fails despite matching row count");
+  store.db.prepare("UPDATE zk_content_version SET ciphertext_digest=? WHERE id=? AND revision=1")
+    .run(sha(replaced), objectId);
+  assert.equal((await post("/zk-1/v1/catalog/read", await read(1))).status, 503,
+    "rewritten ciphertext and self-consistent digest cannot override signed archive");
+  store.db.prepare("UPDATE zk_content_version SET ciphertext=?,ciphertext_digest=? WHERE id=? AND revision=1")
+    .run(archived.ciphertext, archived.ciphertext_digest, objectId);
+  store.db.exec(`CREATE TRIGGER zk_content_version_no_update BEFORE UPDATE ON zk_content_version
+    BEGIN SELECT RAISE(ABORT,'ZK_CONTENT_VERSION_IMMUTABLE'); END`);
+  assert.equal((await post("/zk-1/v1/catalog/read", await read(1))).status, 200,
+    "original historical ciphertext remains recoverable after damage repair");
   // Corrupt a disposable archived page despite the SQLite immutability trigger:
   // even matching external CAS cannot cause the service to endorse it again.
   const originalPage = store.db.prepare(

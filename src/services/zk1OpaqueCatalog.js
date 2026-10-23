@@ -389,8 +389,7 @@ class Zk1OpaqueCatalog {
     if ((!local && current.sequence === 0)
       || (local && local.sequence === current.sequence
         && same(local.digest, current.digest))) {
-      await this.verifyStoredChain(key, current, auth.verifiedHeadManifest);
-      return;
+      return this.verifyStoredChain(key, current, auth.verifiedHeadManifest);
     }
     // Only the missing tail of an independently committed snapshot can be
     // recovered. Never repair a fork, a rollback or an altered local row.
@@ -458,7 +457,7 @@ class Zk1OpaqueCatalog {
       this.store.db.prepare("INSERT INTO zk_content_catalog_head(scope,sequence,digest) VALUES(?,?,?) ON CONFLICT(scope) DO UPDATE SET sequence=excluded.sequence,digest=excluded.digest")
         .run(key, current.sequence, current.digest);
     }).immediate();
-    await this.verifyStoredChain(key, current, auth.verifiedHeadManifest);
+    return this.verifyStoredChain(key, current, auth.verifiedHeadManifest);
   }
   async commit({ scope, authorization, signature, header, headerSignature, pages,
     ownerEvidence, guard = null, emit = (result) => result }) {
@@ -496,9 +495,7 @@ class Zk1OpaqueCatalog {
         if (current.sequence >= MAX_HEADS
           || header.sequence !== current.sequence + 1
           || !same(buf(header.previous_digest, 32), current.digest)) fail("ZK_CATALOG_CONFLICT");
-        await this.reconcileMissing(key, current, auth);
-        const previousPages = await this.verifyStoredChain(key, current,
-          auth.verifiedHeadManifest);
+        const previousPages = await this.reconcileMissing(key, current, auth);
         // Owner-authorized signer cannot attest a conveniently omitted list:
         // compare every immutable locally archived ciphertext VERSION exactly.
         const rows = this.store.db.prepare("SELECT id,revision,epoch,ciphertext,ciphertext_digest FROM zk_content_version WHERE scope=? ORDER BY id COLLATE BINARY,revision").all(key);
@@ -553,7 +550,7 @@ class Zk1OpaqueCatalog {
         if (current.sequence < 1) fail("ZK_CATALOG_NOT_FOUND");
         if (auth.request.expected_object_revision !== current.sequence
           || !same(auth.request.ciphertext_digest, current.digest)) fail("ZK_CATALOG_CONFLICT");
-        await this.reconcileMissing(key, current, auth);
+        const historicalPages = await this.reconcileMissing(key, current, auth);
         const record = this.snapshot.get(key, current.sequence);
         if (!record || !same(record.digest, current.digest)
           || !same(headDigest(record.header, record.signature), current.digest)) {
@@ -574,6 +571,10 @@ class Zk1OpaqueCatalog {
           ED_SPKI, buf(signer.authorization_public_key, 32)]), format: "der", type: "spki" });
         if (!crypto.verify(null, Buffer.concat([HEAD_DOMAIN, record.header]),
           publicKey, record.signature)) fail("ZK_CATALOG_DENIED");
+        // A signed catalog does not prove the physical historical ciphertext
+        // survived a trash/restore. Verify every archived version before
+        // releasing metadata, including ciphertext hidden on other pages.
+        this.verifyPhysicalVersions(key, historicalPages);
         const payload = this.page.get(key, current.sequence, page);
         const entries = payload ? await z.decodeDeterministic(payload.body) : [];
         if ((header.total_count === 0 && page !== 0)
