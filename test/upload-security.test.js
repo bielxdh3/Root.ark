@@ -20,6 +20,35 @@ const TIMEOUT_MS = 10_000;
 const FOLDER_ID = "upload-safety";
 const createChunkUploadQuota = (options) => createChunkUploadQuotaService({ perAccountEntries: 5000, systemEntries: 10000, ...options });
 
+test("multipart parser uses the locked Multer from this checkout", () => {
+  const packagePath = require.resolve("multer/package.json");
+  const expectedPath = path.join(ROOT, "node_modules", "multer", "package.json");
+  assert.equal(fs.existsSync(expectedPath), true,
+    "Install locked dependencies with npm ci in this checkout before running tests");
+  assert.equal(fs.realpathSync(packagePath), fs.realpathSync(expectedPath),
+    "Node must not silently load Multer from another worktree's node_modules");
+  assert.equal(require(packagePath).version,
+    require("../package-lock.json").packages["node_modules/multer"].version);
+});
+
+test("server fails closed when inherited Multer does not match the lockfile", () => {
+  const simulatedLegacyModule = [
+    'const Module = require("node:module");',
+    "const originalLoad = Module._load;",
+    'Module._load = function(name, parent, main) {',
+    '  if (name === "multer/package.json") return {version: "1.4.5-lts.2"};',
+    '  return originalLoad.apply(this, arguments);',
+    '};',
+    "require(" + JSON.stringify(SERVER) + ");",
+  ].join("\n");
+  const child = spawnSync(process.execPath, ["-e", simulatedLegacyModule], {
+    cwd: ROOT, encoding: "utf8", timeout: 15_000,
+    env: { ...process.env, ROOTARK_RESTORE_INSTANCE_COUNT: "1" },
+  });
+  assert.equal(child.status, 1, child.stderr || child.stdout || child.error?.message);
+  assert.match(child.stderr, /MULTER_LOCKFILE_MISMATCH/);
+});
+
 function chunkBoundaryRequestTimeout(chunkIndex, totalChunks) {
   // Only the final supported 2,000-part boundary assembles 2,000 files on this response.
   // Keep the other 1,999 socket deadlines strict. A slower Windows CI

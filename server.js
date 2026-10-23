@@ -15,6 +15,13 @@ const { rateLimit } = require("express-rate-limit");
 const UploadChunkSlidingWindowStore = require("./src/middlewares/uploadChunkSlidingWindowStore");
 const SqliteSlidingWindowStore = require("./src/middlewares/sqliteSlidingWindowStore");
 const multer = require("multer");
+// Multer 1.x silently ignores fieldNestingDepth/defParamCharset and enforces
+// a different file-size boundary. Node can otherwise inherit that old parser
+// from a parent worktree when this checkout has no node_modules.
+const lockedMulterVersion = require("./package-lock.json").packages?.["node_modules/multer"]?.version;
+if (!lockedMulterVersion || require("multer/package.json").version !== lockedMulterVersion) {
+  throw new Error("MULTER_LOCKFILE_MISMATCH: install dependencies using npm ci in this checkout");
+}
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
