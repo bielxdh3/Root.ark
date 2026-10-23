@@ -11,8 +11,11 @@ const z = require("../crypto/rootark-zk-1");
 const archive = require("../crypto/rootark-zk1-opaque-catalog-checkpoint-v2");
 const { createOpaqueCheckpointV2Coordinator, signCheckpointOwnerApprovalV2,
   inspectIntent } = require("./zk1OpaqueCheckpointV2Remote");
-const { requireCheckpointV2Triggers } =
+const { assertSafeSqliteSidecars, requireCheckpointV2Triggers,
+  withReadonlySqliteSnapshot } =
   require("./zk1OpaqueCheckpointV2SqliteGuard");
+const { assertPrivateSqliteDirectory, assertPrivateSqliteFile } =
+  require("./zk1PrivateSqlitePath");
 
 const APPROVAL_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-checkpoint-remote/owner-approval/v2\0");
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
@@ -33,6 +36,16 @@ const SUCCESSOR_TRIGGERS = [
   ["successors_immutable_delete", "successors"],
   ["successors_no_gap", "successors"],
 ];
+const INTENT_GUARD_SCHEMA = `
+  CREATE TRIGGER IF NOT EXISTS intent_immutable_update BEFORE UPDATE ON intent
+    BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;
+  CREATE TRIGGER IF NOT EXISTS intent_immutable_delete BEFORE DELETE ON intent
+    BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;`;
+const INTENT_TRIGGERS = [
+  ["intent_immutable_update", "intent"],
+  ["intent_immutable_delete", "intent"],
+];
+const MAX_LOCAL_PREFLIGHT_BYTES = 32 * 1024 * 1024;
 function deny() {
   const err = new Error("ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE");
   err.code = "ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE";
@@ -67,6 +80,7 @@ function scopeOf(v) {
 }
 function privateFile(filename, bootstrapNew) {
   if (typeof filename !== "string" || !path.isAbsolute(filename)) deny();
+  assertPrivateSqliteDirectory(filename);
   const parent = fs.lstatSync(path.dirname(filename));
   if (!parent.isDirectory() || parent.isSymbolicLink()
     || (process.platform !== "win32"
@@ -83,6 +97,15 @@ function privateFile(filename, bootstrapNew) {
       | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
     fs.closeSync(fd);
   }
+}
+function verifyJournal(db, identity) {
+  if (db.pragma("quick_check", { simple: true }) !== "ok"
+    || !db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='intent'").get()
+    || !db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='identity'").get()) deny();
+  requireCheckpointV2Triggers(db, INTENT_GUARD_SCHEMA, INTENT_TRIGGERS, deny);
+  requireCheckpointV2Triggers(db, SUCCESSOR_SCHEMA, SUCCESSOR_TRIGGERS, deny);
+  const pinned = db.prepare("SELECT pins FROM identity WHERE id=1").get();
+  if (!pinned || !equal(pinned.pins, identity)) deny();
 }
 
 class Zk1OpaqueCheckpointV2Client {
@@ -115,18 +138,20 @@ class Zk1OpaqueCheckpointV2Client {
     });
     privateFile(journalPath, bootstrapNew);
     const identity = Buffer.from(encodeIdentity(scope, digest, checkpoint, fingerprints));
+    // Foreign WAL/SHM aliases and unknown schemas must be refused before any
+    // writable SQLite open, journal-mode change or sidecar creation.
+    const pinned = bootstrapNew ? assertPrivateSqliteFile(journalPath)
+      : withReadonlySqliteSnapshot(journalPath,
+        (probe) => verifyJournal(probe, identity), deny, MAX_LOCAL_PREFLIGHT_BYTES);
+    const current = assertPrivateSqliteFile(journalPath);
+    if (pinned.dev !== current.dev || pinned.ino !== current.ino) deny();
+    assertSafeSqliteSidecars(journalPath, deny);
     const db = new Database(journalPath, { fileMustExist: true, timeout: 3000 });
     try {
-      if (!bootstrapNew) {
-        if (db.pragma("quick_check", { simple: true }) !== "ok"
-          || !db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='intent'").get()
-          || !db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='identity'").get()
-          || !db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='intent_immutable_update'").get()
-          || !db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='intent_immutable_delete'").get()) deny();
-        const pinned = db.prepare("SELECT pins FROM identity WHERE id=1").get();
-        if (!pinned || !equal(pinned.pins, identity)) deny();
-        requireCheckpointV2Triggers(db, SUCCESSOR_SCHEMA, SUCCESSOR_TRIGGERS, deny);
-      }
+      const opened = assertPrivateSqliteFile(journalPath);
+      if (opened.dev !== pinned.dev || opened.ino !== pinned.ino) deny();
+      assertSafeSqliteSidecars(journalPath, deny);
+      if (!bootstrapNew) verifyJournal(db, identity);
       db.pragma("journal_mode=WAL");
       db.pragma("synchronous=FULL");
       if (bootstrapNew) {
