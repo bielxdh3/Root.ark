@@ -221,7 +221,7 @@ class Zk1MultiproviderCiphertextRestore {
   async #current(operation) {
     // A caller-supplied active Boolean is never enough: the owner authority
     // and actual enrolled device must BOTH sign a fresh nonce per request.
-    await verifyFreshOwnerDeviceRestoreAuthority({
+    const freshOwner = await verifyFreshOwnerDeviceRestoreAuthority({
       signedDeviceGrant: this.#deviceGrant,
       pinnedOwnerPublicKey: this.#pinnedOwner.publicKey,
       fetchSignedCurrentDeviceState: this.#freshDeviceState,
@@ -240,6 +240,7 @@ class Zk1MultiproviderCiphertextRestore {
       || result.currentEpoch !== this.#ownerHead.epoch
       || !Buffer.isBuffer(result.currentManifestDigest)
       || !same(result.currentManifestDigest, this.#ownerHead.digest)) deny();
+    return freshOwner;
   }
   checkRequesterDeviceIdentity(value) {
     try {
@@ -248,6 +249,14 @@ class Zk1MultiproviderCiphertextRestore {
         && proof.deviceId === this.#deviceGrant.device_id
         && proof.authorizationKeyId === this.#deviceGrant.authorization_key_id;
     } catch (_) { return false; }
+  }
+  async recheckBeforeEgress(operation) {
+    // Rejection-only API: it neither reads nor releases ciphertext and cannot
+    // be substituted with a caller-supplied Boolean authorization callback.
+    try {
+      const proof = await this.#current(cloneOperation(operation));
+      return Object.freeze({ expiresAtSeconds: proof.expiresAtSeconds });
+    } catch (_) { deny(); }
   }
   async restoreExact(input, { abortSignal, deadline } = {}) {
     let returned;

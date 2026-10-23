@@ -12,6 +12,8 @@ const { Zk1MultiproviderCiphertextRestore } =
   require("../services/zk1MultiproviderCiphertextRestore");
 const { validDeadlineMs, DEFAULT_PROVIDER_DEADLINE_MS } =
   require("../services/zk1ProviderDeadline");
+const { Zk1ExternallyPinnedProviderDomains, spkiFingerprint } =
+  require("../services/zk1ExternallyPinnedProviderDomains");
 
 const ROUTE = "/zk-1/v1/multiprovider-restore/read";
 const PINS = ["pinnedInventoryPublicKey", "pinnedInventorySignerKeyId",
@@ -50,6 +52,8 @@ function serializeResult(restored) {
     catalogSequence: restored.signedInventorySequence,
     catalogRoot: restored.signedInventoryRoot.toString("base64url"),
     providerCount: restored.verifiedProviders.length,
+    administratorSignaturesVerified: restored.administratorSignaturesVerified === true,
+    providerPhysicalIndependenceProven: false,
     signedCatalogRecoveredFromRemote: restored.signedCatalogRecoveredFromRemote === true,
     remoteDurabilityProven: false, authorizesProductionRestore: false,
   };
@@ -67,6 +71,17 @@ function registerZk1AuthenticatedMultiproviderRestoreRoute({
     || typeof resolveTrustedScope !== "function") deny();
   exact(gatewayPins, PINS); // Explicitly REJECT assertCurrentAuthorization or arbitrary hook.
   validDeadlineMs(ioDeadlineMs);
+  // Reject an unusable/downgraded deployment at registration, not after a
+  // signed request is admitted. The 9 strict pins are mandatory in dev too.
+  let ownerFingerprint;
+  try { ownerFingerprint = spkiFingerprint(crypto.KeyObject.from(gatewayPins.pinnedOwner.publicKey)); }
+  catch (_) { deny(); }
+  if (!(gatewayPins.providerDomainPinset instanceof Zk1ExternallyPinnedProviderDomains)
+    || typeof gatewayPins.fetchFreshSignedDeviceState !== "function"
+    || !gatewayPins.signedCurrentDeviceGrant
+    || typeof gatewayPins.signedCurrentDeviceGrant !== "object"
+    || typeof gatewayPins.independentOwnerSpkiSha256 !== "string"
+    || gatewayPins.independentOwnerSpkiSha256 !== ownerFingerprint) deny();
   if (!restoreInput || !["cloud-catalog", undefined].includes(restoreInput.mode)) deny();
   const source = restoreInput?.mode === "cloud-catalog" ? restoreInput.request : restoreInput;
   const operation = source?.operation;
@@ -93,6 +108,22 @@ function registerZk1AuthenticatedMultiproviderRestoreRoute({
     return scope;
   };
   const permission = requirePermission("listFiles");
+  const recheckSession = (req, res) => new Promise((resolve, reject) => {
+    const refused = () => { cleanup(); reject(new Error("session denied")); };
+    const cleanup = () => { res.off("finish", refused); res.off("close", refused); };
+    res.once("finish", refused);
+    res.once("close", refused);
+    try {
+      authenticate(req, res, (error) => {
+        if (error || res.headersSent || res.destroyed) return refused();
+        permission(req, res, (permissionError) => {
+          if (permissionError || res.headersSent || res.destroyed) return refused();
+          cleanup();
+          resolve();
+        });
+      });
+    } catch (_) { refused(); }
+  });
   app.post(ROUTE, (req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Content-Type-Options", "nosniff");
@@ -170,21 +201,20 @@ function registerZk1AuthenticatedMultiproviderRestoreRoute({
         if (!same(restored.operationId, pinned.operationId)) deny();
         // Re-evaluate current sessionVersion, expiry, CSRF, permission and
         // account scope AFTER slow provider reads and before socket egress.
-        await new Promise((resolve, reject) => {
-          const refused = () => { cleanup(); reject(new Error("session denied")); };
-          const cleanup = () => { res.off("finish", refused); res.off("close", refused); };
-          res.once("finish", refused); res.once("close", refused);
-          try {
-            authenticate(req, res, (error) => {
-              if (error || res.headersSent) return refused();
-              permission(req, res, (permissionError) => {
-                if (permissionError || res.headersSent) return refused();
-                cleanup(); resolve();
-              });
-            });
-          } catch (_) { refused(); }
-        });
+        await recheckSession(req, res);
         checkedScope(req.user);
+        // Last owner-signed ACTIVE status + real protected-store device/grant
+        // check is fresh AFTER cloud reads and slow session middleware. A
+        // revocation in that window must not reach socket egress.
+        const finalOwnerStatus = await gateway.recheckBeforeEgress(operation);
+        // The last signed-state read itself may block. Revalidate the
+        // application session/permissions again after that await as well.
+        await recheckSession(req, res);
+        checkedScope(req.user);
+        // Auth middleware can also stall. Never release bytes if the last
+        // owner-signed ACTIVE status expired during that final await.
+        if (!Number.isSafeInteger(finalOwnerStatus.expiresAtSeconds)
+          || Math.floor(Date.now() / 1000) > finalOwnerStatus.expiresAtSeconds) deny();
         if (req.authExpiresAt !== null && req.authExpiresAt !== undefined
           && Date.now() >= req.authExpiresAt) deny();
         if (cancellation.signal.aborted || res.destroyed || res.writableEnded) deny();

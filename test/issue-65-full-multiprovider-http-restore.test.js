@@ -254,9 +254,11 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
       Object.fromEntries(GRANT_FIELDS.map((k) => [k, grantFields[k]]))))]),
     ownerKeys.privateKey)) };
   let freshAttack = null;
+  let finalEgressStatusReads = 0;
   let replayed = null;
   const fetchFreshSignedDeviceState = async (challenge) => {
     const now = Math.floor(Date.now() / 1000);
+    if (freshAttack === "revoke-on-final-egress") finalEgressStatusReads += 1;
     const state = {
       schema: "rootark-zk1-current-device-restore-state/v1",
       ...challenge.scope, device_id: challenge.deviceId,
@@ -264,7 +266,8 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
       operation_id: challenge.operationId,
       manifest_revision: challenge.manifestRevision,
       manifest_digest: challenge.manifestDigest, current_epoch: currentEpoch,
-      state: revoked ? "REVOKED" : "ACTIVE",
+      state: (revoked || (freshAttack === "revoke-on-final-egress"
+        && finalEgressStatusReads >= 4)) ? "REVOKED" : "ACTIVE",
       nonce: freshAttack === "wrong-nonce" ? b64(random(32)) : challenge.nonce,
       issued_at: freshAttack === "expired" ? now - 35 : now,
       expires_at: freshAttack === "expired" ? now - 25 : now + 10,
@@ -724,6 +727,30 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   };
   const signedRestoreInput = { mode: "cloud-catalog", request: remoteRecovery };
   const expressApp = express();
+  const invalidStrictPins = [
+    ["missing domain pin", Object.fromEntries(Object.entries(gatewayPins)
+      .filter(([name]) => name !== "providerDomainPinset"))],
+    ["null domain pin", { ...gatewayPins, providerDomainPinset: null }],
+    ["forged domain pin class", { ...gatewayPins, providerDomainPinset: { verify: () => true } }],
+    ["missing signed device grant", Object.fromEntries(Object.entries(gatewayPins)
+      .filter(([name]) => name !== "signedCurrentDeviceGrant"))],
+    ["missing fresh device authority", Object.fromEntries(Object.entries(gatewayPins)
+      .filter(([name]) => name !== "fetchFreshSignedDeviceState"))],
+    ["caller-provided active authorization", { ...gatewayPins,
+      assertCurrentAuthorization: async () => ({ active: true }) }],
+    ["forged owner pin", { ...gatewayPins,
+      independentOwnerSpkiSha256: random(32).toString("hex") }],
+    ["unsigned provider mode injection", { ...gatewayPins,
+      providerTrustMode: "protected-store-logical-only" }],
+  ];
+  for (const [label, invalidPins] of invalidStrictPins) {
+    assert.throws(() => registerZk1ProtectedObjectRoutes({
+      app: express(), store: protectedStore, authenticate: authMiddleware,
+      requirePermission: createRequirePermission(), resolveTrustedScope: allowedScope,
+      multiproviderRestore: { gatewayPins: invalidPins, restoreInput: signedRestoreInput },
+      environment: "test",
+    }), /ZK_MULTIPROVIDER_HTTP_DENIED/, label + " must fail closed in dev");
+  }
   assert.throws(() => registerZk1ProtectedObjectRoutes({
     app: express(), store: protectedStore, authenticate: authMiddleware,
     requirePermission: createRequirePermission(), resolveTrustedScope: allowedScope,
@@ -787,7 +814,83 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   assert.deepEqual(Buffer.from(authorizedBody.ciphertextBase64, "base64url"), ciphertext);
   assert.equal(authorizedBody.authorizesProductionRestore, false);
   assert.equal(authorizedBody.remoteDurabilityProven, false);
-  const afterSuccess = { ...hits };
+  assert.equal(authorizedBody.administratorSignaturesVerified, true);
+  assert.equal(authorizedBody.providerPhysicalIndependenceProven, false);
+  // Same real Express signed POST must survive one corrupt ciphertext provider,
+  // but a second unavailable peer leaves no 2/3 byte quorum.
+  const intactWebdav = Buffer.from(stores.webdav.get(`/dav/${davKey}`));
+  stores.webdav.set(`/dav/${davKey}`, Buffer.alloc(ciphertext.length, 0x91));
+  const oneCorrupt = await post(await makeSignedRequest());
+  assert.equal(oneCorrupt.status, 200, "one bad provider still leaves 2/3 real HTTP restore");
+  assert.equal((await oneCorrupt.json()).providerCount, 2);
+  stores.drive.delete(driveId);
+  const noQuorum = await post(await makeSignedRequest());
+  assert.equal(noQuorum.status, 403, "corrupt WebDAV plus missing Drive never releases ciphertext");
+  assert.equal((await noQuorum.text()).includes("ciphertextBase64"), false);
+  stores.drive.set(driveId, Buffer.from(ciphertext));
+  stores.webdav.set(`/dav/${davKey}`, intactWebdav);
+
+  // A different device ID can have a syntactically valid OWNER signature,
+  // the same private key and a valid fresh owner ACTIVE response. The actual
+  // signed V2 manifest/device selected by protectedStore must still match.
+  const differentDevice = { ...grantFields, device_id: "different-approved-device" };
+  const differentSignature = b64(crypto.sign(null, Buffer.concat([
+    GRANT_DOMAIN, Buffer.from(JSON.stringify(Object.fromEntries(
+      GRANT_FIELDS.map((name) => [name, differentDevice[name]])))),
+  ]), ownerKeys.privateKey));
+  const differentSignedGrant = { ...differentDevice, signature: differentSignature };
+  const mismatchedGatewayPins = { ...gatewayPins,
+    signedCurrentDeviceGrant: differentSignedGrant,
+    fetchFreshSignedDeviceState: async (challenge) => {
+      const answer = await fetchFreshSignedDeviceState(challenge);
+      const boundDeviceProof = Buffer.concat([
+        POP_DOMAIN, Buffer.from(challenge.nonce, "base64url"),
+        Buffer.from(challenge.operationId, "base64url"),
+        Buffer.from(differentSignature, "base64url"),
+      ]);
+      return { ...answer, deviceProofOfPossession: b64(crypto.sign(null,
+        boundDeviceProof, deviceKeys.privateKey)) };
+    },
+  };
+  const mismatchedApp = express();
+  registerZk1ProtectedObjectRoutes({
+    app: mismatchedApp, store: protectedStore, authenticate: authMiddleware,
+    requirePermission: createRequirePermission(), resolveTrustedScope: allowedScope,
+    multiproviderRestore: { gatewayPins: mismatchedGatewayPins,
+      restoreInput: signedRestoreInput }, environment: "test",
+  });
+  const mismatchedPort = await register(http.createServer(mismatchedApp));
+  const mismatchedResponse = await fetch(
+    `http://127.0.0.1:${mismatchedPort}/zk-1/v1/multiprovider-restore/read`,
+    { method: "POST", headers: sessionHeaders,
+      body: JSON.stringify(await makeSignedRequest()) });
+  assert.equal(mismatchedResponse.status, 403,
+    "a properly signed alternate device grant cannot borrow a V2 device identity");
+  assert.equal((await mismatchedResponse.text()).includes("ciphertextBase64"), false);
+
+  let afterSuccess = { ...hits };
+  for (const attack of ["replay", "wrong-nonce", "expired", "forged"]) {
+    freshAttack = attack;
+    const before = { ...hits };
+    const hostile = await post(await makeSignedRequest());
+    assert.equal(hostile.status, 403, attack + " owner proof must deny authenticated HTTP");
+    assert.equal((await hostile.text()).includes("ciphertextBase64"), false);
+    assert.deepEqual(hits, before, attack + " must fail before cloud reads");
+  }
+  freshAttack = null;
+  finalEgressStatusReads = 0;
+  freshAttack = "revoke-on-final-egress";
+  const beforeLateRevocation = { ...hits };
+  const lateRevocation = await post(await makeSignedRequest());
+  assert.equal(lateRevocation.status, 403,
+    "a device revoked after cloud quorum but before Express egress must fail closed");
+  assert.equal((await lateRevocation.text()).includes("ciphertextBase64"), false);
+  assert.equal(finalEgressStatusReads, 4,
+    "final egress MUST perform a fourth independently signed owner state check");
+  assert.ok(hits.s3 > beforeLateRevocation.s3,
+    "prove adversarial revocation happened only AFTER actual cloud reads");
+  freshAttack = null;
+  afterSuccess = { ...hits };
   assert.equal((await post(validRequest)).status, 403,
     "persistent device nonce prevents replay across authenticated HTTP POST requests");
   assert.deepEqual(hits, afterSuccess);

@@ -124,7 +124,8 @@ async function verifyFreshOwnerDeviceRestoreAuthority({
     return Object.freeze({ signedOwnerStateVerified: true,
       currentDevicePossessionVerified: true, nonceBoundCurrentRevocationChecked: true,
       externalOwnerAuthorityCustodyProven: false, authorizesIo: false,
-      deviceId: grant.device_id, authorizationKeyId: deviceId });
+      deviceId: grant.device_id, authorizationKeyId: deviceId,
+      expiresAtSeconds: expires });
   } catch (_) { deny(); }
 }
 module.exports = { GRANT_FIELDS, STATE_FIELDS, GRANT_DOMAIN, STATUS_DOMAIN, POP_DOMAIN,

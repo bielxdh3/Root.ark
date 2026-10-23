@@ -58,6 +58,35 @@ storage server. Software cannot prove independent owner service custody,
 durable revocation linearizability, or current eligibility between two signed
 checks. No production route is installed and no plaintext/CEK reaches server.
 
+## Required authenticated Express restore policy
+
+The development/test authenticated restore route requires exactly NINE
+operator-supplied gatewayPins: pinnedInventoryPublicKey,
+pinnedInventorySignerKeyId, pinnedOwner, pinnedOwnerHead,
+independentInventoryFloor, independentOwnerSpkiSha256,
+providerDomainPinset, signedCurrentDeviceGrant and
+fetchFreshSignedDeviceState. All nine are mandatory; this route does NOT
+support unsigned provider configurations, self-proclaimed physical quorum,
+caller-supplied authorization callbacks, opt-out flags or a legacy 5-pin mode.
+Registration rejects absent/invalid administrator pinset, absent fresh
+authority, wrong owner SPKI and unauthorized extra keys, even in development.
+
+Every HTTP request must independently pass the actual signed current V2
+device GET authorization and exact device/key ID in the owner-rooted
+protected store (including fresh witness, persistent replay check, session,
+permission and CSRF). The independently pinned owner signs a fresh ACTIVE
+status over the exact grant/operation/epoch; the device proves possession.
+After reading a 2/3 cloud quorum, the gateway repeats BOTH checks. Directly
+before network egress, the route performs a further owner/device check,
+rechecks the session and refuses a signature that expired during async
+middleware. A late revocation must not leak ciphertext after cloud read.
+
+The signed provider statements attest administrator-provisioned identities,
+not actual physical independent data custody. Authenticated HTTP responses
+must explicitly report administratorSignaturesVerified:true,
+providerPhysicalIndependenceProven:false, remoteDurabilityProven:false and
+authorizesProductionRestore:false; no production guarantees are inferred.
+
 ## Verification
 
 The provider-domain-and-fresh-authorization test exercises duplicate domain
