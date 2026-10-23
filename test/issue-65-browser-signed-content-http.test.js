@@ -375,7 +375,7 @@ test("browser WebCrypto Ed25519 canonical-CBOR signed encrypted HTTP PUT/GET obe
   assert.equal(ownerBacked.durableBackupProven, false);
   const liveBrowserContext = vm.createContext({
     crypto: crypto.webcrypto, TextEncoder, TextDecoder, Uint8Array, ArrayBuffer,
-    URL, btoa, atob, location: { origin },
+    URL, btoa, atob, AbortController, setTimeout, clearTimeout, location: { origin },
     RootarkZk1CiphertextDownloadIntegrity:
       require("../public/client/rootark-zk1-ciphertext-download-integrity"),
   });

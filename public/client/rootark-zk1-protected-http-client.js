@@ -19,6 +19,7 @@
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const domain = encoder.encode("Root.ark/zk-1/protected-object-operation/v1\0");
   const MAX_CIPHERTEXT = 4 * 1024 * 1024;
+  const HTTP_DEADLINE_MS = 15000;
   const fields = ["account_id", "compartment_id", "keyring_id", "device_id",
     "operation", "object_id", "expected_object_revision", "manifest_revision",
     "manifest_digest", "epoch", "nonce", "issued_at", "expires_at", "ciphertext_digest"];
@@ -234,18 +235,40 @@
     const brand = genuineSigned.get(request);
     if (!brand || brand.op !== op || typeof fetchImpl !== "function") deny();
     const url = httpEndpoint(origin, op);
-    let response;
+    const controller = new AbortController();
+    let timer;
+    let completed = false;
     try {
-      response = await fetchImpl(url, {
-        method: "POST", redirect: "error", credentials: "same-origin",
-        cache: "no-store", mode: "same-origin",
-        headers: { "content-type": "application/json", accept: "application/json" },
-        body: JSON.stringify(brand.request),
-      });
-      if ((op === "put" && ![200, 201].includes(response.status))
-        || (op === "get" && response.status !== 200)) deny();
-      return await readLimited(response, op === "put" ? 2048 : 6 * 1024 * 1024);
+      // A stalled header or trickling JSON body must not retain a signed
+      // operation indefinitely. A socket-idle timeout alone is insufficient.
+      // Race the complete request AND response stream: even a mock transport
+      // that ignores AbortSignal must never yield a false successful ACK.
+      let expire;
+      const deadline = new Promise((_, reject) => { expire = reject; });
+      timer = setTimeout(() => {
+        controller.abort();
+        expire(new Error("ZK_PROTECTED_HTTP_DEADLINE"));
+      }, HTTP_DEADLINE_MS);
+      const work = (async () => {
+        const response = await fetchImpl(url, {
+          method: "POST", redirect: "error", credentials: "same-origin",
+          cache: "no-store", mode: "same-origin", signal: controller.signal,
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify(brand.request),
+        });
+        if ((op === "put" && ![200, 201].includes(response.status))
+          || (op === "get" && response.status !== 200)) deny();
+        return readLimited(response, op === "put" ? 2048 : 6 * 1024 * 1024);
+      })();
+      const result = await Promise.race([work, deadline]);
+      if (controller.signal.aborted) deny();
+      completed = true;
+      return result;
     } catch (_) { deny(); }
+    finally {
+      clearTimeout(timer);
+      if (!completed) controller.abort();
+    }
   }
   async function postProtectedCiphertextPut({ origin, request, fetchImpl = fetch } = {}) {
     try {
