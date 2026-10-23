@@ -103,7 +103,17 @@ function privateFile(filename, bootstrapNew) {
   } else {
     const fd = fs.openSync(filename, fs.constants.O_EXCL | fs.constants.O_CREAT
       | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
-    fs.closeSync(fd);
+    try {
+      // Pin the inode returned by exclusive creation, not the pathname after
+      // close. A swapped private, single-link SQLite must never receive our
+      // WAL, bootstrap tables or immutable journal authority.
+      const created = fs.fstatSync(fd, { bigint: true });
+      if (!created.isFile() || created.nlink !== 1n
+        || (process.platform !== "win32"
+          && (created.uid !== BigInt(process.getuid())
+            || (created.mode & 0o077n) !== 0n))) deny();
+      return Object.freeze({ dev: created.dev, ino: created.ino });
+    } finally { fs.closeSync(fd); }
   }
 }
 function verifyJournal(db, identity) {
@@ -259,11 +269,11 @@ class Zk1OpaqueCheckpointV2Client {
       expectedV1Digest: digest, expectedV1Checkpoint: checkpoint,
       v1CasClient, v1FloorClient,
     });
-    privateFile(journalPath, bootstrapNew);
+    const creationPin = privateFile(journalPath, bootstrapNew);
     const identity = Buffer.from(encodeIdentity(scope, digest, checkpoint, fingerprints));
     // Foreign WAL/SHM aliases and unknown schemas must be refused before any
     // writable SQLite open, journal-mode change or sidecar creation.
-    const pinned = bootstrapNew ? assertPrivateSqliteFile(journalPath)
+    const pinned = bootstrapNew ? creationPin
       : withReadonlySqliteSnapshot(journalPath,
         (probe) => verifyJournal(probe, identity), deny, MAX_LOCAL_PREFLIGHT_BYTES);
     const current = assertPrivateSqliteFile(journalPath);

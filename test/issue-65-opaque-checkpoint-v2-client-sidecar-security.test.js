@@ -95,3 +95,59 @@ test("a same-name fake immutable intent trigger attached to another table fails 
   assert.equal(sha(journalPath), original, "preflight never repairs or changes a malformed client journal");
   assert.equal(fs.existsSync(journalPath + "-shm"), false);
 });
+
+test("V2 client bootstrap rejects a foreign SQLite substituted after O_EXCL without modifying it", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-v2-client-bootstrap-race-"));
+  if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+  const journalPath = path.join(dir, "new-client.sqlite");
+  const foreign = path.join(dir, "foreign.sqlite");
+  const unrelated = new Database(foreign);
+  unrelated.exec("CREATE TABLE foreign_identity (id INTEGER PRIMARY KEY, marker TEXT);");
+  unrelated.prepare("INSERT INTO foreign_identity VALUES (1, 'untouched')").run();
+  unrelated.close();
+  if (process.platform !== "win32") fs.chmodSync(foreign, 0o600);
+  const priorHash = sha(foreign);
+
+  const originalOpen = fs.openSync;
+  const originalClose = fs.closeSync;
+  let createdFd;
+  let swapped = false;
+  fs.openSync = function (name, flags, ...rest) {
+    const fd = originalOpen.call(fs, name, flags, ...rest);
+    if (name === journalPath && (flags & fs.constants.O_EXCL)) createdFd = fd;
+    return fd;
+  };
+  fs.closeSync = function (fd, ...rest) {
+    const closed = originalClose.call(fs, fd, ...rest);
+    if (fd === createdFd && !swapped) {
+      swapped = true;
+      fs.renameSync(journalPath, path.join(dir, "original-client.sqlite"));
+      // A distinct private, single-link inode bypasses ordinary no-hardlink
+      // checks while retaining a recognizable foreign SQLite schema.
+      fs.copyFileSync(foreign, journalPath);
+    }
+    return closed;
+  };
+  let opened;
+  let rejected;
+  try {
+    opened = new Zk1OpaqueCheckpointV2Client(options(journalPath, true));
+  } catch (error) {
+    rejected = error;
+  } finally {
+    fs.openSync = originalOpen;
+    fs.closeSync = originalClose;
+    opened?.close();
+  }
+  assert.equal(swapped, true, "the adversary must swap the exact O_EXCL-created journal");
+  assert.equal(sha(foreign), priorHash, "foreign database bytes must remain unchanged");
+  assert.equal(sha(journalPath), priorHash, "substituted single-link journal must not be mutated");
+  const readonly = new Database(foreign, { readonly: true, fileMustExist: true });
+  try {
+    assert.deepEqual(readonly.prepare("SELECT name FROM sqlite_master WHERE type='table'").all(),
+      [{ name: "foreign_identity" }]);
+  } finally { readonly.close(); }
+  assert.match(rejected?.message || "", /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE|UNTRUSTED_SQLITE_PATH/,
+    "the constructor must reject before opening the substituted journal writable");
+});
