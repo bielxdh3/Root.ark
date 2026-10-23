@@ -157,6 +157,7 @@
 
     async function change(input) {
       let sourceBytes, oldPlain, originalBytes, destinationBytes, checkBytes;
+      let rawNewCek;
       let journalId = null, putAttempted = false, commitAttempted = false;
       let confirmedCommit = null;
       let pendingObjectId = null, pendingRevision = null;
@@ -267,7 +268,10 @@
         await guard();
         const next = { ...source, version_id: b64(crypto.getRandomValues(new Uint8Array(16))),
           parent_version_id: source.version_id, epoch: head.epoch };
-        const newCek = await content.generateFileCek();
+        // Retain only a transient client-side raw key for encrypted escrow.
+        // The operational CEK is nonextractable immediately after import.
+        rawNewCek = crypto.getRandomValues(new Uint8Array(32));
+        const newCek = await content.importFileCek(rawNewCek);
         if (input.action === "trash") {
           destinationBytes = await sealTombstone(newCek, next, prior);
         } else {
@@ -287,7 +291,7 @@
           ...(input.action === "restore" ? [{ metadata: original, revision: originalRow.revision,
             ciphertext: originalBytes, cek: input.originalCek, state: "file" }] : []),
           { metadata: next, revision: newRevision, ciphertext: destinationBytes,
-            cek: newCek, state: input.action === "trash" ? "trashed" : "file" },
+            cek: rawNewCek, state: input.action === "trash" ? "trashed" : "file" },
         ];
         const nonce = b64(crypto.getRandomValues(new Uint8Array(32)));
         const archiveChallenge = { ...scope, objectId: source.object_id, action: input.action,
@@ -320,6 +324,7 @@
           }
           await guard();
         }
+        rawNewCek.fill(0); rawNewCek = null;
         // Verify the independent catalog proof signer is reachable and still
         // controls its pinned key BEFORE any irreversible ciphertext/CAS write.
         // This fresh preflight does not stand in for final post-CAS evidence.
@@ -458,6 +463,7 @@
         deny();
       }
       finally {
+        rawNewCek?.fill(0);
         sourceBytes?.fill(0); originalBytes?.fill(0);
         destinationBytes?.fill(0); checkBytes?.fill(0);
         oldPlain?.data?.fill(0);

@@ -405,6 +405,9 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
     "Ed25519", true, ["verify"]);
   const archivePrefix = Buffer.from("Root.ark/zk-1/logical-trash-archive-receipt/v1\0");
   const catalogPrefix = Buffer.from("Root.ark/zk-1/logical-trash-catalog-receipt/v1\0");
+  const operableCek = async (value) => ArrayBuffer.isView(value) && value.byteLength === 32
+    ? crypto.webcrypto.subtle.importKey("raw", value, "AES-GCM", false,
+      ["encrypt", "decrypt"]) : value;
   const sign = (prefix, body, key) => b64(crypto.sign(null,
     Buffer.concat([prefix, Buffer.from(JSON.stringify(body))]), key));
   const archived = new Map();
@@ -412,7 +415,8 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
     for (const name of ["account_id", "compartment_id", "keyring_id"])
       assert.equal(challenge[name], scopeWire[name], "custody receipt must bind owner scope");
     for (const entry of entries) archived.set(entry.revision, {
-      cek: entry.cek, bytes: Buffer.from(entry.ciphertext), metadata: entry.metadata });
+      cek: ArrayBuffer.isView(entry.cek) ? Buffer.from(entry.cek) : entry.cek,
+      bytes: Buffer.from(entry.ciphertext), metadata: entry.metadata });
     return realm({ signatureBase64: sign(archivePrefix, challenge, archiveAuthority.privateKey) });
   };
   const readArchivedCek = async ({ account_id, compartment_id, keyring_id, revision, versionId }) => {
@@ -421,7 +425,9 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
     assert.equal(keyring_id, scopeWire.keyring_id);
     const saved = archived.get(revision);
     if (!saved || saved.metadata.version_id !== versionId) throw Error("MISSING_ARCHIVE_CEK");
-    return saved.cek;
+    // The lifecycle now escrows a transient raw32 for the new tombstone and
+    // immediately imports it as a nonextractable CryptoKey for operations.
+    return operableCek(saved.cek);
   };
   const catalogProof = async (challenge) => realm({
     signatureBase64: sign(catalogPrefix, challenge, casKey.privateKey) });
@@ -574,7 +580,7 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
   assert.equal(snapshot3.entries.length, 3);
   const restoreBase = Object.assign(realm({}), base, {
     catalog: snapshot3, sourceIndex: 2, sourceMetadata: trashed.metadata,
-    sourceCek: archived.get(3).cek, originalIndex: 1,
+    sourceCek: await operableCek(archived.get(3).cek), originalIndex: 1,
     originalMetadata: result.metadata, originalCek: archived.get(2).cek,
     catalogWriter: makeWriter(3, Buffer.from(trashed.catalogDigestBase64, "base64url")),
   });
@@ -595,7 +601,7 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
   const restoredRead = await send("/zk-1/v1/content/read", await rawSigner("get",
     sourceId, 4, Buffer.from(restored.ciphertextDigestBase64, "base64url")));
   assert.equal(restoredRead.status, 200);
-  const openedRestore = await file.decryptFile({ cek: archived.get(4).cek,
+  const openedRestore = await file.decryptFile({ cek: await operableCek(archived.get(4).cek),
     metadata: restored.metadata,
     envelopeBytes: Buffer.from(restoredRead.result.ciphertextBase64, "base64url") });
   assert.equal(openedRestore.name, "renamed.txt");
@@ -610,7 +616,7 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
   let badFinalProof;
   try { await trash.trash(Object.assign(realm({}), base, {
     catalog: snapshot4, sourceIndex: 3, sourceMetadata: restored.metadata,
-    sourceCek: archived.get(4).cek,
+    sourceCek: await operableCek(archived.get(4).cek),
     catalogWriter: makeWriter(4, Buffer.from(restored.catalogDigestBase64, "base64url")),
     catalogProof: async (challenge) => realm({ signatureBase64:
       challenge.purpose === "precommit"

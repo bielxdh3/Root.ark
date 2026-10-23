@@ -61,13 +61,75 @@ digest, verifies the remote signer/receipt, signed archive, AEAD and current
 owner/grant, and atomically restores local storage. The owner private key is
 not needed on the restoring device.
 
+## Two-browser-device and lifecycle integration
+
+`syncFromBackup({expectedDigest})` imports the independently pinned newest
+archive into a second browser's separate IndexedDB database, or advances a
+stale first browser after the second writes. It validates the signed provider
+GET, Ed25519 owner signature, AEAD, monotonically linked sequence and every
+intermediate signed predecessor archive (up to 64 records), stopping only at
+an independently verified local digest or genesis. It rejects missing history,
+forks, rollback, stale pins and differing epoch. This is an explicit operation,
+never an implicit trust upgrade during a CEK read. The second device must have
+its own current owner-signed device grant and user-held recovery secret.
+
+For `renameOrMoveCommitted`, inject `cekArchive:
+store.createRenameArchiveBridge()`. Its `write` AEAD-seals the transient raw32
+destination CEK before the file's remote PUT and returns a 43-character signed
+archive digest; `read` requires that exact independently pinned receipt and
+checks the signed ciphertext digest and full metadata. It releases a temporary
+32-byte copy *only* to the existing rename composer, which compares and zeroes
+it before PUT.
+
+For `rootark-zk1-client-logical-trash`, inject the callbacks from
+`store.createLogicalTrashBridge()` as `archiveKeys` and `readArchivedCek`, and
+use the same independently pinned owner public key as
+`archiveAuthorityPublicKey`. The bridge binds the exact owner scope in its
+challenge, returns precisely `{signatureBase64}` for the lifecycle verifier,
+and restores nonextractable operational CEKs. Existing nonexportable source
+CEKs can be proven against a *previously* encrypted raw CEK by an authenticated
+AES-GCM challenge; unknown source CEKs remain blocked. The new tombstone CEK
+is randomly generated on the client, immediately imported nonextractable for
+AEAD operations, and its raw32 is wiped after authenticated archive readback
+before any ciphertext PUT. Tombstone and restored revisions stay in the
+encrypted historical archive; permanent erasure is outside this bridge.
+
+## Owner rotation and recovery on another browser
+
+The newly authorized owner (new Ed25519 key, independently pinned SPKI, new
+current signed device grant, higher owner revision **and** epoch) calls
+`rotateFromPreviousOwner({transition,previousOwnerPublicKey,
+independentPreviousOwnerSpkiSha256,previousRecoverySecret})`. The transition
+is a strict object with fields `schema,scope,fromOwnerSpkiSha256,
+toOwnerSpkiSha256,fromHead,toHead,previousArchiveDigest,nonce,
+fromSignature,toSignature` and schema
+`rootark-zk1-client-cek-owner-rotation/v1`. Both owner signatures authenticate
+the eight unsigned fields with the Ed25519 domain
+`Root.ark/zk-1/cek-owner-rotation/v1\0`. The adapter verifies the old signed
+archive against the external old floor, decrypts privately, re-encrypts all
+historical CEKs under the new recovery secret, signs with the new owner,
+requires signed remote GET/readback and moves the external CAS floor.
+`adoptRotatedOwner(...)` lets an old device holding the old signed local archive,
+or an empty new device, verify the same two signatures, both AEAD plaintext
+histories and old-to-new signed predecessor edge, and adopt the new signed
+archive only when the new digest is independently pinned. There is no automatic
+credential or trust-anchor transfer; explicit owner authorization and current
+device grant are mandatory.
+
+These operations prove client cryptographic continuity and readback relative to
+the injected external provider. They do **not** attest cloud-host independence,
+provider retention, atomicity across IndexedDB and external CAS, or physical
+durability. If local storage committed but the external CAS failed, CEK release
+stays blocked until explicit reconciliation. Post-CAS external crash recovery
+and remote provider custody remain provider-operational responsibilities.
+
 ## Explicit boundaries
 
 - Existing lifecycle `generateFileCek()` returns a **nonextractable CryptoKey**.
-  WebCrypto cannot export or AES-wrap that key. This adapter refuses it;
-  integration requires minting a recoverable 32-byte CEK under client control
-  and immediately importing the operational copy as nonextractable, or a
-  separately reviewed custody primitive. The module does not alter W5/W6.
+  WebCrypto cannot export or AES-wrap a new key. The adapter refuses a new
+  nonextractable CEK without pre-existing authenticated raw32 escrow. For
+  tombstones the client generates raw32 first and imports the operational
+  CryptoKey nonextractably; for rename the committed composer already does so.
 - A successful IndexedDB transaction is **local browser persistence**, not an
   independently durable cloud backup. A signed remote GET/receipt proves only
   what that endpoint returned, not physical cloud replication or retention.

@@ -159,7 +159,7 @@ async function fixture({ backup = true } = {}) {
       nonce, entries: entries.map((item) => ({ revision: item.revision,
         versionId: item.metadata.version_id, ciphertextDigest: b64(sha(item.ciphertext)) })) };
   }
-  return { db, config, grant, head, pinProvider, remote, backupProvider,
+  return { db, config, grant, head, pinProvider, remote, backupProvider, signing,
     entry, challenge, getPin: () => pin, setPin: (value) => { pin = value; },
     lostAck() { pinLostAck = true; remoteLostAck = true; } };
 }
@@ -365,4 +365,178 @@ test("an expired synchronous session fence denies key access after opening", asy
   await assert.rejects(store.readArchivedCek({ objectId: item.metadata.object_id,
     revision: 1, versionId: item.metadata.version_id, nonce: challenge.nonce }), /DENIED/);
   store.close();
+});
+
+test("two independent browser stores exchange tombstone and restored CEKs through signed backup", async () => {
+  const f = await fixture();
+  const browserA = await archive.openCekArchive(f.config);
+  const initial = f.entry();
+  const started = f.challenge([initial]);
+  const first = await browserA.archiveKeys({ challenge: started, entries: [initial] });
+  const grantB = { ...f.grant, device_id: "second-browser-device",
+    authorization_key_id: b64(rnd(16)), authorization_public_key: b64(rnd(32)) };
+  grantB.signature = b64(crypto.sign(null, Buffer.concat([
+    Buffer.from("Root.ark/zk-1/browser-owner-device-grant/v1\0"),
+    Buffer.from(JSON.stringify(Object.fromEntries(GRANT.map((key) => [key, grantB[key]])))),
+  ]), f.signing.privateKey));
+  const deviceB = { ...f.config, indexedDBImpl: indexedDBMock(),
+    signedDeviceGrant: grantB };
+  const browserB = await archive.openCekArchive(deviceB);
+  const imported = await browserB.syncFromBackup({ expectedDigest: first.externallyPinnedDigest });
+  assert.equal(imported.signedHistoryVerified, true);
+  const historical = await browserB.readArchivedCek({ objectId: initial.metadata.object_id,
+    revision: 1, versionId: initial.metadata.version_id, nonce: started.nonce });
+  const next = f.entry({ revision: 2, version: b64(rnd(16)) });
+  next.metadata.parent_version_id = initial.metadata.version_id;
+  next.state = "trashed";
+  const request = { ...f.challenge([initial, next]), ...Object.fromEntries(
+    ["account_id", "compartment_id", "keyring_id"].map((k) => [k, initial.metadata[k]])),
+    action: "trash" };
+  const bridgeB = browserB.createLogicalTrashBridge();
+  const signed = await bridgeB.archiveKeys({ challenge: request, entries: [
+    { ...initial, cek: historical }, next,
+  ] });
+  assert.deepEqual(Object.keys(signed), ["signatureBase64"]);
+  assert.equal(Buffer.from(signed.signatureBase64, "base64url").length, 64);
+  await assert.rejects(browserA.readArchivedCek({ objectId: initial.metadata.object_id,
+    revision: 1, versionId: initial.metadata.version_id, nonce: started.nonce }), /DENIED/);
+  assert.equal((await browserA.syncFromBackup({ expectedDigest: f.getPin() })).signedHistoryVerified, true);
+  const readA = await browserA.createLogicalTrashBridge().readArchivedCek({
+    account_id: initial.metadata.account_id,
+    compartment_id: initial.metadata.compartment_id,
+    keyring_id: initial.metadata.keyring_id,
+    objectId: next.metadata.object_id, revision: 2,
+    versionId: next.metadata.version_id, nonce: request.nonce });
+  assert.equal(readA.extractable, false);
+  // Restore is a new version, not a physical deletion of the tombstone.
+  const restored = f.entry({ revision: 3, version: b64(rnd(16)) });
+  restored.metadata.parent_version_id = next.metadata.version_id;
+  const restore = { ...f.challenge([next, restored]), ...Object.fromEntries(
+    ["account_id", "compartment_id", "keyring_id"].map((k) => [k, next.metadata[k]])),
+    action: "restore" };
+  const signedRestore = await browserA.createLogicalTrashBridge().archiveKeys({
+    challenge: restore, entries: [{ ...next, cek: readA }, restored] });
+  assert.equal(Object.keys(signedRestore).length, 1);
+  browserA.close(); browserB.close();
+  const restartedB = await archive.openCekArchive({ ...deviceB,
+    indexedDBImpl: indexedDBMock(), ownerSigningKey: null });
+  await restartedB.restoreFromBackup({ expectedDigest: f.getPin() });
+  assert.equal((await restartedB.readArchivedCek({ objectId: restored.metadata.object_id,
+    revision: 3, versionId: restored.metadata.version_id, nonce: restore.nonce })).extractable, false);
+  restartedB.close();
+  // The archive contains no raw CEKs, protected names, or plaintext on the provider.
+  for (const data of f.remote.values()) {
+    const text = Buffer.from(data).toString("utf8");
+    for (const raw of [initial.cek, next.cek, restored.cek])
+      assert.ok(!text.includes(b64(raw)));
+  }
+});
+
+test("renameOrMoveCommitted bridge writes and reads exact raw32 before remote PUT", async () => {
+  const f = await fixture();
+  const browser = await archive.openCekArchive(f.config);
+  const entry = f.entry();
+  const bridge = browser.createRenameArchiveBridge();
+  const digest = sha(entry.ciphertext);
+  const receiptId = await bridge.write({ metadata: entry.metadata,
+    objectRevision: entry.revision, ciphertext: entry.ciphertext,
+    ciphertextDigest: digest, cek: entry.cek });
+  assert.equal(receiptId, f.getPin());
+  const recovered = await bridge.read({ receiptId, metadata: entry.metadata,
+    objectRevision: entry.revision, ciphertextDigest: digest });
+  assert.deepEqual(Buffer.from(recovered), Buffer.from(entry.cek));
+  recovered.fill(0);
+  await assert.rejects(bridge.read({ receiptId, metadata: entry.metadata,
+    objectRevision: entry.revision, ciphertextDigest: rnd(32) }), /DENIED/);
+  await assert.rejects(bridge.write({ metadata: entry.metadata,
+    objectRevision: 2, ciphertext: entry.ciphertext, ciphertextDigest: digest,
+    cek: await subtle.importKey("raw", entry.cek, "AES-GCM", false, ["encrypt"]) }), /DENIED/);
+  browser.close();
+});
+
+test("two distinct owner keys cross-sign rotation and preserve historical CEKs without key egress", async () => {
+  const f = await fixture();
+  const browserA = await archive.openCekArchive(f.config);
+  const entry = f.entry();
+  const firstChallenge = f.challenge([entry]);
+  await browserA.archiveKeys({ challenge: firstChallenge, entries: [entry] });
+  const oldDigest = f.getPin();
+  browserA.close();
+  const nextOwner = crypto.generateKeyPairSync("ed25519");
+  const nextPublic = await subtle.importKey("spki", nextOwner.publicKey.export({
+    format: "der", type: "spki" }), "Ed25519", true, ["verify"]);
+  const nextPrivate = await subtle.importKey("pkcs8", nextOwner.privateKey.export({
+    format: "der", type: "pkcs8" }), "Ed25519", false, ["sign"]);
+  const nextHead = { revision: f.head.revision + 1, epoch: f.head.epoch + 1,
+    digest: rnd(32) };
+  const nextGrant = { ...f.grant, device_id: "new-owner-browser",
+    authorization_key_id: b64(rnd(16)), authorization_public_key: b64(rnd(32)),
+    manifest_revision: nextHead.revision,
+    manifest_digest: b64(nextHead.digest), current_epoch: nextHead.epoch };
+  nextGrant.signature = b64(crypto.sign(null, Buffer.concat([
+    Buffer.from("Root.ark/zk-1/browser-owner-device-grant/v1\0"),
+    Buffer.from(JSON.stringify(Object.fromEntries(GRANT.map((key) => [key, nextGrant[key]])))),
+  ]), nextOwner.privateKey));
+  const oldPin = sha(f.signing.publicKey.export({ format: "der", type: "spki" }));
+  const newPin = sha(nextOwner.publicKey.export({ format: "der", type: "spki" }));
+  const scope = Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+    .map((key) => [key, entry.metadata[key]]));
+  const transition = { schema: "rootark-zk1-client-cek-owner-rotation/v1", scope,
+    fromOwnerSpkiSha256: b64(oldPin), toOwnerSpkiSha256: b64(newPin),
+    fromHead: { revision: f.head.revision, digest: b64(f.head.digest), epoch: f.head.epoch },
+    toHead: { revision: nextHead.revision, digest: b64(nextHead.digest), epoch: nextHead.epoch },
+    previousArchiveDigest: oldDigest, nonce: b64(rnd(32)) };
+  const signatureMessage = Buffer.concat([Buffer.from("Root.ark/zk-1/cek-owner-rotation/v1\0"),
+    Buffer.from(JSON.stringify(transition))]);
+  const approved = { ...transition,
+    fromSignature: b64(crypto.sign(null, signatureMessage, f.signing.privateKey)),
+    toSignature: b64(crypto.sign(null, signatureMessage, nextOwner.privateKey)) };
+  const rotatedConfig = { ...f.config, indexedDBImpl: indexedDBMock(),
+    ownerPublicKey: nextPublic, ownerSigningKey: nextPrivate,
+    pinnedCurrentHead: nextHead, signedDeviceGrant: nextGrant,
+    independentOwnerSpkiSha256: newPin };
+  const browserB = await archive.openCekArchive(rotatedConfig);
+  for (const invalid of [
+    { ...approved, fromSignature: b64(rnd(64)) },
+    { ...approved, toSignature: b64(rnd(64)) },
+    { ...approved, previousArchiveDigest: b64(rnd(32)) },
+    { ...approved, fromHead: { ...approved.fromHead, epoch: nextHead.epoch } },
+  ]) await assert.rejects(browserB.rotateFromPreviousOwner({ transition: invalid,
+    previousOwnerPublicKey: f.config.ownerPublicKey,
+    independentPreviousOwnerSpkiSha256: oldPin,
+    previousRecoverySecret: f.config.recoverySecret }), /DENIED/);
+  const rotated = await browserB.rotateFromPreviousOwner({ transition: approved,
+    previousOwnerPublicKey: f.config.ownerPublicKey,
+    independentPreviousOwnerSpkiSha256: oldPin,
+    previousRecoverySecret: f.config.recoverySecret });
+  assert.equal(rotated.signedOwnerRotationVerified, true);
+  assert.equal(rotated.previousArchiveDigest, oldDigest);
+  assert.equal((await browserB.readArchivedCek({ objectId: entry.metadata.object_id,
+    revision: 1, versionId: entry.metadata.version_id, nonce: firstChallenge.nonce })).extractable, false);
+  browserB.close();
+  const migratedA = await archive.openCekArchive({ ...rotatedConfig,
+    indexedDBImpl: f.db, ownerSigningKey: null });
+  const adoption = await migratedA.adoptRotatedOwner({ transition: approved,
+    previousOwnerPublicKey: f.config.ownerPublicKey,
+    independentPreviousOwnerSpkiSha256: oldPin,
+    previousRecoverySecret: f.config.recoverySecret,
+    expectedDigest: rotated.independentlyPinnedDigest });
+  assert.equal(adoption.crossSignedOwnerRotationVerified, true);
+  assert.equal((await migratedA.readArchivedCek({ objectId: entry.metadata.object_id,
+    revision: 1, versionId: entry.metadata.version_id, nonce: firstChallenge.nonce })).extractable, false);
+  migratedA.close();
+  const revived = await archive.openCekArchive({ ...rotatedConfig, ownerSigningKey: null });
+  assert.equal((await revived.readArchivedCek({ objectId: entry.metadata.object_id,
+    revision: 1, versionId: entry.metadata.version_id, nonce: firstChallenge.nonce })).extractable, false);
+  revived.close();
+  const newBrowser = await archive.openCekArchive({ ...rotatedConfig,
+    indexedDBImpl: indexedDBMock(), ownerSigningKey: null });
+  assert.equal((await newBrowser.adoptRotatedOwner({ transition: approved,
+    previousOwnerPublicKey: f.config.ownerPublicKey,
+    independentPreviousOwnerSpkiSha256: oldPin,
+    previousRecoverySecret: f.config.recoverySecret,
+    expectedDigest: rotated.independentlyPinnedDigest })).crossSignedOwnerRotationVerified, true);
+  newBrowser.close();
+  await assert.rejects(archive.openCekArchive({ ...f.config,
+    signedDeviceGrant: { ...f.grant, revoked_at_epoch: f.head.epoch } }), /DENIED/);
 });

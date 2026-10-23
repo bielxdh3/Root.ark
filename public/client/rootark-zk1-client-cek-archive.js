@@ -16,6 +16,7 @@
   const DOMAIN = new TextEncoder().encode("Root.ark/zk-1/client-cek-archive/v1\0");
   const RECEIPT = new TextEncoder().encode("Root.ark/zk-1/logical-trash-archive-receipt/v1\0");
   const BACKUP_RECEIPT = new TextEncoder().encode("Root.ark/zk-1/cek-backup-provider-receipt/v1\0");
+  const OWNER_ROTATION = new TextEncoder().encode("Root.ark/zk-1/cek-owner-rotation/v1\0");
   const GRANT = new TextEncoder().encode("Root.ark/zk-1/browser-owner-device-grant/v1\0");
   const INFO = new TextEncoder().encode("Root.ark/zk-1/client-cek-archive-aead/v1\0");
   const GRANT_FIELDS = ["schema", "account_id", "compartment_id", "keyring_id",
@@ -93,9 +94,16 @@
     return metadata;
   }
   function validateChallenge(challenge) {
-    exact(challenge, ["objectId", "action", "epoch", "nonce", "entries"]);
+    const hasScope = !!challenge && Object.hasOwn(challenge, "account_id");
+    exact(challenge, [...(hasScope ? ["account_id", "compartment_id", "keyring_id"] : []),
+      "objectId", "action", "epoch", "nonce", "entries"]);
     from64(challenge.objectId, 16);
-    if (!["trash", "restore", "rename", "move"].includes(challenge.action)) deny();
+    if (!["trash", "restore", "rename", "move", "rotate"].includes(challenge.action)) deny();
+    if (hasScope) {
+      from64(challenge.account_id, 16);
+      from64(challenge.compartment_id, 1, 128);
+      from64(challenge.keyring_id, 16);
+    }
     positive(challenge.epoch);
     from64(challenge.nonce, 32);
     if (!Array.isArray(challenge.entries) || challenge.entries.length < 1
@@ -220,7 +228,10 @@
       }
       async function digest(raw) { return b64(await sha(enc.encode(raw))); }
       async function derive(salt) {
-        const material = await webCrypto.subtle.importKey("raw", recoverySecret,
+        return deriveFromSecret(recoverySecret, salt);
+      }
+      async function deriveFromSecret(secret, salt) {
+        const material = await webCrypto.subtle.importKey("raw", secret,
           "HKDF", false, ["deriveKey"]);
         return webCrypto.subtle.deriveKey({ name: "HKDF", salt, info: INFO,
           hash: "SHA-256" }, material, { name: "AES-GCM", length: 256 },
@@ -241,8 +252,8 @@
           from64(record.signature, 64), message(DOMAIN, unsigned(record))))) deny();
         return record;
       }
-      async function decryptRecord(record) {
-        const key = await derive(from64(record.salt, 32));
+      async function decryptRecord(record, secret = recoverySecret) {
+        const key = await deriveFromSecret(secret, from64(record.salt, 32));
         let plaintext;
         try {
           plaintext = new Uint8Array(await webCrypto.subtle.decrypt({ name: "AES-GCM",
@@ -275,6 +286,78 @@
         const entries = await decryptRecord(record);
         alive();
         return { raw, observed, record, entries };
+      }
+      async function retrieveSignedArchive(digestValue, signer = input.ownerPublicKey) {
+        if (input.backupProvider === null) deny();
+        from64(digestValue, 32);
+        alive();
+        const response = await input.backupProvider.get({ key: digestValue });
+        const raw = dec.decode(await verifyProviderReadback(response, digestValue));
+        if (await digest(raw) !== digestValue) deny();
+        const record = parseRecord(raw);
+        if (JSON.stringify(record.scope) !== JSON.stringify(scope)
+          || !(await webCrypto.subtle.verify("Ed25519", signer,
+            from64(record.signature, 64), message(DOMAIN, unsigned(record))))) deny();
+        return { raw, record, digest: digestValue };
+      }
+      // Walk the signed predecessor chain to a locally verified digest or
+      // genesis. A remote latest response alone cannot prove its provenance.
+      async function syncFromBackup({ expectedDigest }) {
+        try {
+          from64(expectedDigest, 32);
+          alive();
+          if (await input.pinProvider.read() !== expectedDigest) deny();
+          const original = await readLocal();
+          const originalDigest = original === null ? null : await digest(original);
+          if (originalDigest === expectedDigest) {
+            await readPinned();
+            return Object.freeze({ independentlyPinnedDigest: expectedDigest,
+              localIndexedDbCommitted: true, signedHistoryVerified: true,
+              providerReadbackVerified: true });
+          }
+          if (original !== null) await verifyRecord(original);
+          let next = expectedDigest;
+          let previousSequence = null;
+          const visited = new Set();
+          for (let step = 0; step < 64; step++) {
+            if (visited.has(next)) deny();
+            visited.add(next);
+            const fetched = await retrieveSignedArchive(next);
+            if (fetched.record.head.revision !== head.revision
+              || fetched.record.head.digest !== head.digest
+              || fetched.record.head.epoch !== head.epoch
+              || fetched.record.challenge.epoch !== head.epoch) deny();
+            if (previousSequence !== null && fetched.record.sequence !== previousSequence - 1)
+              deny();
+            await decryptRecord(fetched.record);
+            if (next === expectedDigest) {
+              // Verify local signing authority and the current scope/owner.
+              await verifyRecord(fetched.raw);
+            }
+            if (fetched.record.previousDigest === originalDigest) {
+              if (original !== null) {
+                const historic = parseRecord(original);
+                if (historic.sequence + 1 !== fetched.record.sequence) deny();
+              } else if (fetched.record.sequence !== 1) deny();
+              break;
+            }
+            if (fetched.record.previousDigest === null) deny();
+            previousSequence = fetched.record.sequence;
+            next = fetched.record.previousDigest;
+            if (step === 63) deny();
+          }
+          alive();
+          if (await input.pinProvider.read() !== expectedDigest) deny();
+          const latest = await retrieveSignedArchive(expectedDigest);
+          await verifyRecord(latest.raw);
+          await decryptRecord(latest.record);
+          await writeCas(original, latest.raw);
+          const observed = await readPinned();
+          if (observed.observed !== expectedDigest) deny();
+          return Object.freeze({ independentlyPinnedDigest: expectedDigest,
+            localIndexedDbCommitted: true, signedHistoryVerified: true,
+            providerReadbackVerified: true });
+        } catch (_) { deny(); }
       }
       async function backup(raw) {
         if (!input.backupProvider) return false;
@@ -316,6 +399,10 @@
           const request = validateChallenge(challenge);
           if (request.epoch !== head.epoch || !Array.isArray(entries)
             || entries.length !== request.entries.length || entries.length > 12) deny();
+          if (Object.hasOwn(request, "account_id") &&
+            (request.account_id !== scope.account_id
+              || request.compartment_id !== scope.compartment_id
+              || request.keyring_id !== scope.keyring_id)) deny();
           const previous = await readPinned();
           const accumulated = new Map((previous?.entries || []).map((item) =>
             [entryId(item.metadata, item.revision), item]));
@@ -332,12 +419,30 @@
             if (b64(await sha(item.ciphertext)) !== request.entries[i].ciphertextDigest) deny();
             // CryptoKey(extractable=false) cannot be AEAD-wrapped or exported.
             // Never silently downgrade to storing a directly usable key in IDB.
-            const cek = bytes(item.cek, 32);
+            const id = entryId(meta, item.revision);
+            let cek;
+            if (item.cek?.type === "secret" && item.cek.extractable === false) {
+              const existing = accumulated.get(id);
+              if (!existing || existing.ciphertextDigest !== request.entries[i].ciphertextDigest
+                || JSON.stringify(existing.metadata) !== JSON.stringify(meta)) deny();
+              cek = from64(existing.cek, 32);
+              const operational = await webCrypto.subtle.importKey("raw", cek, "AES-GCM",
+                false, ["encrypt", "decrypt"]);
+              const nonce = webCrypto.getRandomValues(new Uint8Array(12));
+              const probe = webCrypto.getRandomValues(new Uint8Array(32));
+              const settings = { name: "AES-GCM", iv: nonce,
+                additionalData: enc.encode("Root.ark/zk-1/cek-provenance/v1"), tagLength: 128 };
+              const [saved, supplied] = await Promise.all([
+                webCrypto.subtle.encrypt(settings, operational, probe),
+                webCrypto.subtle.encrypt(settings, item.cek, probe),
+              ]);
+              if (!same(new Uint8Array(saved), new Uint8Array(supplied))) deny();
+              probe.fill(0);
+            } else cek = bytes(item.cek, 32);
             try {
               const row = { metadata: meta, revision: item.revision,
                 ciphertextDigest: request.entries[i].ciphertextDigest,
                 cek: b64(cek), nonces: [request.nonce] };
-              const id = entryId(meta, item.revision);
               const prior = accumulated.get(id);
               if (prior) {
                 if (JSON.stringify(prior.metadata) !== JSON.stringify(row.metadata)
@@ -403,6 +508,61 @@
           } finally { cek.fill(0); }
         } catch (_) { deny(); }
       }
+      function createRenameArchiveBridge() {
+        return Object.freeze({
+          async write({ metadata, objectRevision, ciphertext, ciphertextDigest, cek }) {
+            try {
+              alive();
+              metaCopy(metadata, scope, head.epoch);
+              positive(objectRevision);
+              const expectedDigest = b64(bytes(ciphertextDigest, 32));
+              if (b64(await sha(ciphertext)) !== expectedDigest) deny();
+              const challenge = { objectId: metadata.object_id, action: "rename",
+                epoch: head.epoch, nonce: b64(webCrypto.getRandomValues(new Uint8Array(32))),
+                entries: [{ revision: objectRevision, versionId: metadata.version_id,
+                  ciphertextDigest: expectedDigest }] };
+              const receipt = await archiveKeys({ challenge, entries: [{ metadata,
+                revision: objectRevision, ciphertext, cek, state: "file" }] });
+              if (receipt.localIndexedDbCommitted !== true
+                || receipt.externallyPinnedDigest !== await input.pinProvider.read()) deny();
+              return receipt.externallyPinnedDigest;
+            } catch (_) { deny(); }
+          },
+          async read({ receiptId, metadata, objectRevision, ciphertextDigest }) {
+            try {
+              from64(receiptId, 32);
+              const wanted = metaCopy(metadata, scope, head.epoch);
+              positive(objectRevision);
+              const cipherDigest = b64(bytes(ciphertextDigest, 32));
+              const pinned = await readPinned();
+              if (!pinned || pinned.observed !== receiptId) deny();
+              const found = pinned.entries.filter((entry) =>
+                entryId(entry.metadata, entry.revision) === entryId(wanted, objectRevision)
+                && JSON.stringify(entry.metadata) === JSON.stringify(wanted)
+                && entry.ciphertextDigest === cipherDigest);
+              if (found.length !== 1) deny();
+              alive();
+              return from64(found[0].cek, 32);
+            } catch (_) { deny(); }
+          },
+        });
+      }
+      function createLogicalTrashBridge() {
+        return Object.freeze({
+          async archiveKeys(args) {
+            const result = await archiveKeys(args);
+            if (result.localIndexedDbCommitted !== true
+              || result.remoteCiphertextReadbackVerified !== (input.backupProvider !== null)) deny();
+            // Actual logical-trash signedReceipt() requires EXACTLY one field.
+            return { signatureBase64: result.signatureBase64 };
+          },
+          async readArchivedCek(args) {
+            if (!args || !["account_id", "compartment_id", "keyring_id"].every(
+              (field) => args[field] === scope[field])) deny();
+            return readArchivedCek(args);
+          },
+        });
+      }
       async function reconcileUncertainArchive({ expectedDigest }) {
         try {
           from64(expectedDigest, 32);
@@ -444,22 +604,137 @@
           from64(expectedDigest, 32);
           if (input.backupProvider === null || await readLocal() !== null
             || await input.pinProvider.read() !== expectedDigest) deny();
-          alive();
-          const reply = await input.backupProvider.get({ key: expectedDigest });
-          const raw = dec.decode(await verifyProviderReadback(reply, expectedDigest));
-          if (await digest(raw) !== expectedDigest) deny();
-          const record = await verifyRecord(raw);
-          await decryptRecord(record);
-          alive();
-          await writeCas(null, raw);
-          const restored = await readPinned();
-          if (restored?.observed !== expectedDigest) deny();
+          const restored = await syncFromBackup({ expectedDigest });
           return Object.freeze({ localIndexedDbCommitted: true, externallyPinnedDigest: expectedDigest,
-            remoteCiphertextReadbackVerified: true, independentCloudDurabilityProven: false });
+            remoteCiphertextReadbackVerified: restored.providerReadbackVerified,
+            independentCloudDurabilityProven: false });
         } catch (_) { deny(); }
       }
+      async function verifyRotationEvidence(transition, previousOwnerPublicKey,
+        independentPreviousOwnerSpkiSha256) {
+          exact(transition, ["schema", "scope", "fromOwnerSpkiSha256",
+            "toOwnerSpkiSha256", "fromHead", "toHead", "previousArchiveDigest",
+            "nonce", "fromSignature", "toSignature"]);
+          const signed = Object.fromEntries(Object.entries(transition).filter(
+            ([field]) => !["fromSignature", "toSignature"].includes(field)));
+          if (transition.schema !== "rootark-zk1-client-cek-owner-rotation/v1"
+            || JSON.stringify(transition.scope) !== JSON.stringify(scope)
+            || typeof transition.toOwnerSpkiSha256 !== "string"
+            || transition.toOwnerSpkiSha256 !== b64(bytes(input.independentOwnerSpkiSha256, 32))
+            || transition.fromOwnerSpkiSha256 !== b64(bytes(independentPreviousOwnerSpkiSha256, 32))
+            || JSON.stringify(transition.toHead) !== JSON.stringify(head)
+            ) deny();
+          from64(transition.nonce, 32);
+          from64(transition.previousArchiveDigest, 32);
+          const oldHead = transition.fromHead;
+          exact(oldHead, ["revision", "digest", "epoch"]);
+          positive(oldHead.revision); from64(oldHead.digest, 32); positive(oldHead.epoch);
+          if (head.revision <= oldHead.revision || head.epoch <= oldHead.epoch
+            || transition.fromOwnerSpkiSha256 === transition.toOwnerSpkiSha256) deny();
+          const previousSpki = await webCrypto.subtle.exportKey("spki", previousOwnerPublicKey);
+          if (!same(await sha(previousSpki), bytes(independentPreviousOwnerSpkiSha256, 32))) deny();
+          const signedBytes = message(OWNER_ROTATION, signed);
+          if (!(await webCrypto.subtle.verify("Ed25519", previousOwnerPublicKey,
+            from64(transition.fromSignature, 64), signedBytes))
+            || !(await webCrypto.subtle.verify("Ed25519", input.ownerPublicKey,
+              from64(transition.toSignature, 64), signedBytes))) deny();
+          return oldHead;
+      }
+      async function rotateFromPreviousOwner({ transition, previousOwnerPublicKey,
+        independentPreviousOwnerSpkiSha256, previousRecoverySecret }) {
+        let priorSecret, plaintext;
+        try {
+          alive();
+          if (input.ownerSigningKey === null || input.backupProvider === null) deny();
+          const oldHead = await verifyRotationEvidence(transition, previousOwnerPublicKey,
+            independentPreviousOwnerSpkiSha256);
+          if (await input.pinProvider.read() !== transition.previousArchiveDigest) deny();
+          priorSecret = bytes(previousRecoverySecret, 32);
+          const old = await retrieveSignedArchive(transition.previousArchiveDigest,
+            previousOwnerPublicKey);
+          if (JSON.stringify(old.record.head) !== JSON.stringify(oldHead)
+            || old.record.challenge.epoch !== oldHead.epoch) deny();
+          const oldRows = await decryptRecord(old.record, priorSecret);
+          if (oldRows.length < 1 || oldRows.length > MAX_ENTRIES) deny();
+          const rawAtDestination = await readLocal();
+          if (rawAtDestination !== null && rawAtDestination !== old.raw) deny();
+          const anchor = oldRows[0];
+          const request = { objectId: anchor.metadata.object_id, action: "rotate",
+            epoch: head.epoch, nonce: transition.nonce,
+            entries: [{ revision: anchor.revision, versionId: anchor.metadata.version_id,
+              ciphertextDigest: anchor.ciphertextDigest }] };
+          const salt = webCrypto.getRandomValues(new Uint8Array(32));
+          const iv = webCrypto.getRandomValues(new Uint8Array(12));
+          const rotated = { format: FORMAT, scope, head, sequence: old.record.sequence + 1,
+            previousDigest: transition.previousArchiveDigest, challenge: request,
+            salt: b64(salt), iv: b64(iv), ciphertext: "", signature: "" };
+          if (!Number.isSafeInteger(rotated.sequence)) deny();
+          plaintext = enc.encode(JSON.stringify(oldRows));
+          if (plaintext.byteLength > MAX_RECORD / 2) deny();
+          rotated.ciphertext = b64(new Uint8Array(await webCrypto.subtle.encrypt({
+            name: "AES-GCM", iv, additionalData: aad(rotated), tagLength: 128 },
+          await derive(salt), plaintext)));
+          rotated.signature = b64(new Uint8Array(await webCrypto.subtle.sign(
+            "Ed25519", input.ownerSigningKey, message(DOMAIN, unsigned(rotated)))));
+          const raw = JSON.stringify(rotated);
+          await verifyRecord(raw);
+          await backup(raw);
+          alive();
+          if (await input.pinProvider.read() !== transition.previousArchiveDigest) deny();
+          await writeCas(rawAtDestination, raw);
+          const newDigest = await digest(raw);
+          try {
+            await input.pinProvider.compareAndSwap(transition.previousArchiveDigest, newDigest);
+          } catch (_) { /* Lost pin ACK reconciled by fresh external floor GET. */ }
+          if (await input.pinProvider.read() !== newDigest) deny();
+          if ((await readPinned()).observed !== newDigest) deny();
+          return Object.freeze({ localIndexedDbCommitted: true,
+            independentlyPinnedDigest: newDigest, previousArchiveDigest: old.digest,
+            signedOwnerRotationVerified: true, remoteCiphertextReadbackVerified: true,
+            independentCloudDurabilityProven: false });
+        } catch (_) { deny(); }
+        finally { priorSecret?.fill(0); plaintext?.fill(0); }
+      }
+      async function adoptRotatedOwner({ transition, previousOwnerPublicKey,
+        independentPreviousOwnerSpkiSha256, previousRecoverySecret,
+        expectedDigest }) {
+        let oldSecret;
+        try {
+          alive();
+          const oldHead = await verifyRotationEvidence(transition, previousOwnerPublicKey,
+            independentPreviousOwnerSpkiSha256);
+          from64(expectedDigest, 32);
+          if (await input.pinProvider.read() !== expectedDigest) deny();
+          oldSecret = bytes(previousRecoverySecret, 32);
+          const old = await retrieveSignedArchive(transition.previousArchiveDigest,
+            previousOwnerPublicKey);
+          if (JSON.stringify(old.record.head) !== JSON.stringify(oldHead)) deny();
+          const historical = await decryptRecord(old.record, oldSecret);
+          const newRecord = await retrieveSignedArchive(expectedDigest);
+          await verifyRecord(newRecord.raw);
+          if (newRecord.record.previousDigest !== old.digest
+            || newRecord.record.sequence !== old.record.sequence + 1
+            || newRecord.record.challenge.action !== "rotate"
+            || newRecord.record.challenge.nonce !== transition.nonce) deny();
+          const successor = await decryptRecord(newRecord.record);
+          if (JSON.stringify(successor) !== JSON.stringify(historical)) deny();
+          const oldLocal = await readLocal();
+          if (oldLocal !== null && oldLocal !== old.raw) deny();
+          alive();
+          if (await input.pinProvider.read() !== expectedDigest) deny();
+          await writeCas(oldLocal, newRecord.raw);
+          if ((await readPinned()).observed !== expectedDigest) deny();
+          return Object.freeze({ independentlyPinnedDigest: expectedDigest,
+            previousArchiveDigest: old.digest, crossSignedOwnerRotationVerified: true,
+            localIndexedDbCommitted: true, remoteCiphertextReadbackVerified: true,
+            independentCloudDurabilityProven: false });
+        } catch (_) { deny(); }
+        finally { oldSecret?.fill(0); }
+      }
       return Object.freeze({ archiveKeys, readArchivedCek, reconcileUncertainArchive,
-        inspectPendingArchive, restoreFromBackup,
+        inspectPendingArchive, restoreFromBackup, syncFromBackup, rotateFromPreviousOwner,
+        adoptRotatedOwner,
+        createRenameArchiveBridge, createLogicalTrashBridge,
         close() { if (!closed) { closed = true; recoverySecret.fill(0); db.close(); } } });
     } catch (_) { recoverySecret?.fill(0); db?.close(); deny(); }
   }
