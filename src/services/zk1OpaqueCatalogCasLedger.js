@@ -17,7 +17,7 @@ const { inspectVerifiedWitnessFreshHeadV1 } =
 const { isZk1OpaqueCatalogIndependentFloorClient } =
   require("./zk1OpaqueCatalogIndependentFloor");
 const { requireImmutableTriggers } = require("./zk1OpaqueCatalogSqliteIntegrity");
-const { assertPrivateSqliteDirectory } = require("./zk1PrivateSqlitePath");
+const { assertPrivateSqliteDirectory, assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
 
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
 const PAGE_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-page/v1\0");
@@ -163,7 +163,9 @@ class Zk1OpaqueCatalogCasLedger {
     privateDir(filename);
     const exists = fs.existsSync(filename);
     if (bootstrapNew !== !exists || (bootstrapNew && this.#minimum.sequence !== 0)) fail();
+    let filePin;
     if (exists) {
+      try { filePin = assertPrivateSqliteFile(filename); } catch (_) { fail(); }
       const stat = fs.lstatSync(filename);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1
         || (process.platform !== "win32"
@@ -185,15 +187,30 @@ class Zk1OpaqueCatalogCasLedger {
       try {
         descriptor = fs.openSync(filename, fs.constants.O_CREAT | fs.constants.O_EXCL
           | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
+        const pinned = fs.fstatSync(descriptor, { bigint: true });
+        if (!pinned.isFile() || pinned.nlink !== 1n) fail();
+        filePin = { dev: pinned.dev, ino: pinned.ino };
       } catch (_) { fail(); }
       finally { if (descriptor !== undefined) fs.closeSync(descriptor); }
     }
+    // A foreign hardlink/replacement may be installed after O_EXCL (or after
+    // read-only restart preflight), before SQLite reopens the pathname. Never
+    // run WAL pragmas or authority DDL on a different inode.
+    const checkFilePin = () => {
+      try {
+        const current = assertPrivateSqliteFile(filename);
+        if (current.dev !== filePin.dev || current.ino !== filePin.ino) fail();
+      } catch (_) { fail(); }
+    };
+    checkFilePin();
     this.db = new Database(filename, { fileMustExist: true, timeout: 3000 });
     try {
+      checkFilePin();
       if (exists) {
         requireExistingCatalogSchema(this.db, identity, Boolean(this.#ownerTrust));
         this.#inspectSync();
       }
+      checkFilePin();
       this.db.pragma("journal_mode = WAL");
       this.db.pragma("synchronous = FULL");
       this.db.pragma("foreign_keys = ON");
