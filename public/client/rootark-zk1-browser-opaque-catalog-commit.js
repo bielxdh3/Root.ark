@@ -502,6 +502,65 @@
           ciphertextDigestBase64: b64(row.ciphertext_digest) });
       } catch (_) { deny(); }
     }
+    async function readSignedSuccessor(previous) {
+      try {
+        // A plain caller-provided catalog (or edited/rolled-back copy) is not
+        // a predecessor. Only this owner's independently signed readAll() can
+        // establish the old head, rows and trust epoch in the private WeakMap.
+        const old = verifiedSnapshots.get(previous);
+        if (!old || previous.head.sequence !== old.head.sequence
+          || !equal(bytes(previous.head.digest, 32), old.head.digest)
+          || previous.rows.length !== old.rows.length
+          || old.manifestRevision !== pin.revision || old.epoch !== pin.epoch
+          || old.manifestDigest !== b64(pin.digest)
+          || SCOPE.some((key) => old.scope[key] !== b64(scope[key]))) deny();
+        for (let i = 0; i < old.rows.length; ++i) {
+          const before = old.rows[i], provided = previous.rows[i];
+          if (!provided || provided.object_id !== before.object_id
+            || provided.revision !== before.revision || provided.epoch !== before.epoch
+            || !equal(bytes(provided.ciphertext_digest, 32), before.ciphertext_digest)
+            || !equal(bytes(provided.metadata_ciphertext, 284), before.metadata_ciphertext)) deny();
+        }
+        // readAll verifies the active owner grant, live signed witness, CAS
+        // signature, full Merkle catalog pages, and a second fresh CAS head.
+        const next = await readAll();
+        const signed = verifiedSnapshots.get(next);
+        if (!signed || next.head.sequence !== old.head.sequence + 1
+          || !signed.predecessorDigest
+          || !equal(signed.predecessorDigest, old.head.digest)
+          || signed.rows.length <= old.rows.length) deny();
+        const oldRows = new Map(old.rows.map((row) => [row.object_id + ":" + row.revision, row]));
+        const highest = new Map();
+        for (const row of old.rows) highest.set(row.object_id,
+          Math.max(highest.get(row.object_id) ?? 0, row.revision));
+        const additions = [];
+        for (const row of signed.rows) {
+          const key = row.object_id + ":" + row.revision;
+          const before = oldRows.get(key);
+          if (before) {
+            if (row.epoch !== before.epoch
+              || !equal(row.ciphertext_digest, before.ciphertext_digest)
+              || !equal(row.metadata_ciphertext, before.metadata_ciphertext)) deny();
+            oldRows.delete(key);
+          } else {
+            // A signed insertion with a missing predecessor (or an invented
+            // revision jump) is not a usable monotonic per-object delta.
+            if (row.revision !== (highest.get(row.object_id) ?? 0) + 1
+              || row.epoch !== pin.epoch) deny();
+            highest.set(row.object_id, row.revision);
+            additions.push({ objectId: row.object_id, revision: row.revision,
+              epoch: row.epoch, ciphertextDigestBase64: b64(row.ciphertext_digest),
+              metadataCiphertextBase64: b64(row.metadata_ciphertext) });
+          }
+        }
+        if (oldRows.size || additions.length === 0
+          || signed.rows.length !== old.rows.length + additions.length) deny();
+        // Do not authorize a sync from a just-changed CAS/fork after the page
+        // read; the next exact historical GET performs another CAS challenge.
+        return Object.freeze({ snapshot: next, additions: Object.freeze(additions.map(
+          (item) => Object.freeze(item))) });
+      } catch (_) { deny(); }
+    }
     async function readAll(expected) {
       await ownerCurrent();
       const current = await freshHead();
@@ -805,7 +864,7 @@
     // compaction and any omission of an existing immutable version fail closed.
     return Object.freeze({ readAll: async () => {
       try { return await readAll(); } catch (_) { deny(); }
-    }, readVerifiedCiphertext, prepareIntent, commit, confirmPendingIntent,
+    }, readVerifiedCiphertext, readSignedSuccessor, prepareIntent, commit, confirmPendingIntent,
     delete: deny, trash: deny, rename: deny, move: deny });
   }
   return Object.freeze({ createClient, indexedDbJournalStore });

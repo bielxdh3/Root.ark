@@ -18,6 +18,7 @@ const { Zk1ProtectedObjectStore, contentAuthorizationMessageV1 } =
 const { Zk1OpaqueCatalog, catalogCasDomain } = require("../src/services/zk1OpaqueCatalog");
 const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
 const catalogBrowser = require("../public/client/rootark-zk1-browser-opaque-catalog-commit");
+const opaqueSync = require("../public/client/rootark-zk1-opaque-device-delta-sync");
 const { openZk1CatalogMetadataV1 } = require("../src/crypto/rootark-zk1-opaque-catalog-client-v1");
 
 const b64 = (bytes) => Buffer.from(bytes).toString("base64url");
@@ -130,7 +131,8 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
     ownerKeys.privateKey)) };
   };
   const ownerHash = digest(rawPub(ownerKeys.publicKey));
-  let active = true, csrf = "known-csrf-token", loseAck = false, csrfRequests = 0, commits = 0;
+  let active = true, csrf = "known-csrf-token", loseAck = false,
+    losePutAck = false, csrfRequests = 0, commits = 0, putRequests = 0;
   const journalStore = {
     async write(key, value) {
       const pathname = path.join(dir, "intent-" + key + ".json");
@@ -153,18 +155,23 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
     csrfRequests++;
     const response = await fetch(url, { ...init, headers: { ...init.headers,
       "x-session": "authenticated" } });
+    if (url.endsWith("/content/put")) {
+      putRequests++;
+      if (losePutAck) { losePutAck = false; await response.arrayBuffer();
+        throw Error("PUT ACK lost after committed write"); }
+    }
     if (url.endsWith("/catalog/commit")) {
       commits++;
       if (loseAck) { loseAck = false; throw Error("ACK lost after write"); }
     }
     return response;
   };
-  async function client(i, controls = {}) {
+  async function clientOptions(i, controls = {}) {
     const device = manifest.devices[i];
     const privateKey = state.actors.get(Buffer.from(device.authorization_key_id).toString("hex"));
     const pinnedOwnerHead = { revision: Number(manifest.revision),
       digest: await v2.recoveryManifestDigestV2(manifest), epoch: Number(manifest.current_epoch) };
-    return catalogBrowser.createClient({ origin, fetchImpl, ownerPublicKey: await asKey(ownerKeys.publicKey, "public"),
+    return { origin, fetchImpl, ownerPublicKey: await asKey(ownerKeys.publicKey, "public"),
       pinnedOwnerKeyHash: ownerHash, pinnedOwnerHead, signedDeviceGrant: await grant(device),
       devicePublicKey: await asKey(nodeCrypto.createPublicKey(privateKey), "public"),
       devicePrivateKey: await asKey(privateKey, "private"),
@@ -176,8 +183,15 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
       minimumCatalogHead: { sequence: 0, digest: Buffer.alloc(32) },
       csrfToken: () => csrf, isSessionCurrent: () => active,
       assertCurrent: async () => { if (!active) throw Error("session closed"); },
-      nowSeconds: () => time, journalStore, ...controls });
+      nowSeconds: () => time, journalStore, ...controls };
   }
+  const client = async (i, controls = {}) => catalogBrowser.createClient(
+    await clientOptions(i, controls));
+  const syncClient = async (i, controls = {}) => opaqueSync.createClient({
+    authority: await clientOptions(i, controls),
+    assertLive: () => { if (!active || csrf !== "known-csrf-token")
+      throw Error("SESSION_INACTIVE"); },
+  });
   const put = async (i, objectId, ciphertext, predecessor = null) => {
     const device = manifest.devices[i];
     const key = state.actors.get(Buffer.from(device.authorization_key_id).toString("hex"));
@@ -221,6 +235,26 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   await assert.rejects(first.commit([rowInput]), /ZK_BROWSER_CATALOG_UNVERIFIED/);
   await assert.rejects(journalStore.read(firstIntent), /ENOENT/);
   const second = await client(1);
+  const receiver = await syncClient(1);
+  const receiverBefore = await receiver.readCurrent();
+  const tamperedReceiver = await syncClient(1, { fetchImpl: async (url, init) => {
+    const response = await fetchImpl(url, init);
+    if (!url.endsWith("/content/read") || response.status !== 200) return response;
+    const wire = await response.json();
+    wire.ciphertextBase64 = b64(nodeCrypto.randomBytes(90));
+    return new Response(JSON.stringify(wire), { status: 200,
+      headers: { "content-type": "application/json" } });
+  } });
+  const tamperedBefore = await tamperedReceiver.readCurrent();
+  const disconnectedReceiver = await syncClient(1, { fetchImpl: async (url, init) => {
+    const response = await fetchImpl(url, init);
+    if (url.endsWith("/content/read")) active = false;
+    return response;
+  } });
+  const disconnectedBefore = await disconnectedReceiver.readCurrent();
+  assert.equal(receiverBefore.head.sequence, 1);
+  assert.equal(receiverBefore.entries.length, 1);
+  assert.equal(Object.keys(receiverBefore.entries[0]).includes("name"), false);
   const listed = await second.readAll();
   assert.equal(listed.head.sequence, 1);
   assert.equal(listed.rows.length, 1);
@@ -269,15 +303,52 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   assert.equal(await openZk1CatalogMetadataV1({ scope, objectId, revision: 1, epoch: 1,
     metadataKey, ciphertext: listed.rows[0].metadata_ciphertext }), rowInput.name);
   const secondCipher = nodeCrypto.randomBytes(90);
-  const third = await client(1);
-  const nextIntent = await third.prepareIntent([{ objectId, revision: 2,
-    epoch: 1, ciphertext: secondCipher }]);
-  await put(1, objectId, secondCipher, 1);
-  await assert.rejects(second.readAll(), /ZK_BROWSER_CATALOG_UNVERIFIED/,
-    "catalog READ must close during the PUT-before-COMMIT window");
-  const secondCommit = await third.commit([{ ...rowInput, revision: 2, ciphertext: secondCipher,
-    name: "sensitive/private/revision-2.txt" }], nextIntent);
+  const producer = await syncClient(0);
+  const producerBefore = await producer.readCurrent();
+  const beforeDeltaPut = putRequests, beforeDeltaCommit = commits;
+  losePutAck = true;
+  loseAck = true;
+  const secondCommit = await producer.commitVersion({ previous: producerBefore,
+    objectId, expectedRevision: 1, revision: 2, epoch: 1,
+    ciphertext: secondCipher, name: "sensitive/private/revision-2.txt",
+    metadataKey: cryptoMeta });
+  assert.equal(putRequests, beforeDeltaPut + 1,
+    "one signed PUT despite lost HTTP ACK");
+  assert.equal(commits, beforeDeltaCommit + 1,
+    "one signed catalog CAS despite lost HTTP ACK");
+  assert.equal(secondCommit.journalClearedAfterSignedProof, true);
+  assert.equal(secondCommit.plaintextMetadataExposed, false);
+  assert.equal((await second.readAll()).head.sequence, 2,
+    "a freshly signed successor CAS advances a live reader's monotonic floor");
   assert.equal(secondCommit.sequence, 2);
+  await assert.rejects(tamperedReceiver.pullDelta(tamperedBefore),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/, "forged encrypted bytes cannot become verified delta");
+  await assert.rejects(disconnectedReceiver.pullDelta(disconnectedBefore),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/, "logout during signed ciphertext GET aborts delta");
+  active = true;
+  const delta = await receiver.pullDelta(receiverBefore);
+  assert.equal(delta.fromSequence, 1);
+  assert.equal(delta.toSequence, 2);
+  assert.equal(delta.additions.length, 1);
+  assert.equal(delta.additions[0].revision, 2);
+  assert.equal(Buffer.from(delta.additions[0].metadataCiphertextBase64, "base64url").length,
+    284, "transfer only encrypted filename metadata");
+  assert.deepEqual(Buffer.from(delta.additions[0].ciphertextBase64, "base64url"),
+    secondCipher, "second device GET is authenticated and digest-bound");
+  assert.equal(JSON.stringify(delta).includes("sensitive/private"), false,
+    "delta must not disclose plaintext filename");
+  await assert.rejects(receiver.pullDelta(receiverBefore), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+    "consumed predecessor cannot replay/fork a signed successor");
+  const conflictDevice = await syncClient(1);
+  const conflictHead = await conflictDevice.readCurrent();
+  const beforeConflictPuts = putRequests, beforeConflictCommits = commits;
+  await assert.rejects(conflictDevice.commitVersion({ previous: conflictHead,
+    objectId, expectedRevision: 1, revision: 2, epoch: 1,
+    ciphertext: secondCipher, name: "stale-and-conflicting.txt",
+    metadataKey: cryptoMeta }), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "stale object revision fails before any side effect");
+  assert.equal(putRequests, beforeConflictPuts);
+  assert.equal(commits, beforeConflictCommits);
   const verifySecondDevice = await client(0);
   const versions = await verifySecondDevice.readAll();
   assert.equal(versions.rows.length, 2);
@@ -286,7 +357,10 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
     /ZK_BROWSER_CATALOG_UNVERIFIED/, "old snapshot cannot authorize GET after CAS advance");
   assert.equal(JSON.stringify(versions).includes("sensitive"), false);
   assert.ok(csrfRequests >= 5);
-  assert.throws(() => third.delete(), /ZK_BROWSER_CATALOG_UNVERIFIED/);
+  await assert.rejects(producer.commitVersion({ previous: producerBefore,
+    objectId, expectedRevision: 1, revision: 2, epoch: 1,
+    ciphertext: secondCipher, name: "private", metadataKey: cryptoMeta }),
+  /ZK_OPAQUE_DELTA_SYNC_DENIED/, "never retry an already committed mutation");
   // Signed CAS rollback: the exact signed floor from a prior read must fence it.
   sequence = 1;
   currentDigest = Buffer.from(created.digest, "base64url");
@@ -331,4 +405,6 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   });
   await assert.rejects(second.readAll(), /ZK_BROWSER_CATALOG_UNVERIFIED/,
     "owner witness must reject stale grants after revocation");
+  await assert.rejects(producer.pullDelta(producerBefore),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/, "revoked source device cannot accept a later delta");
 });
