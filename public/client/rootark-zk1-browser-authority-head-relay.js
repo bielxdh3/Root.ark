@@ -317,6 +317,10 @@
   const V2_DIGEST = encoder.encode("Root.ark/zk-1/opaque-catalog-checkpoint-digest/v2\0");
   const V2_LEAF = encoder.encode("Root.ark/zk-1/opaque-catalog-archive-leaf/v2\0");
   const V2_PAGE = encoder.encode("Root.ark/zk-1/opaque-catalog-page/v1\0");
+  const V2_GRANT = encoder.encode("Root.ark/zk-1/browser-owner-device-grant/v1\0");
+  const V2_GRANT_FIELDS = ["schema", ...SCOPE, "device_id", "authorization_key_id",
+    "authorization_public_key", "manifest_revision", "manifest_digest",
+    "current_epoch", "enrolled_epoch", "revoked_at_epoch"];
   const V2_RECEIPT_FIELDS = ["type", ...SCOPE, "role", "state", "sequence",
     "head_digest", "checkpoint_digest", "operation_id", "cas_signer_fp",
     "floor_signer_fp", "nonce", "issued_at"];
@@ -341,15 +345,20 @@
       field === "compartment_id" ? 1 : 16,
       field === "compartment_id" ? 128 : 16), scope[field])) deny();
   }
-  // Read-only browser boundary for the single verified global rollover 128->129.
-  // The user imports the complete owner-approved intent from an offline channel.
+  // Read-only browser boundary for a complete owner-approved signed 129..N chain.
+  // Its only origin is the offline owner-provided sequence; fresh signed dual
+  // remote heads decide whether its LAST checkpoint is currently finalized.
   // The server only relays nonce-bound independently signed CAS and floor heads.
   async function readFinalizedV2(input) {
+    const chainProvided = Object.hasOwn(input || {}, "signedIntents");
+    const grantProvided = Object.hasOwn(input || {}, "signedDeviceGrant");
     exact(input, ["origin", "fetchImpl", "assertLive", "csrfToken", "scope",
       "previousDigest", "previousCheckpointDigest", "ownerRevision", "ownerDigest",
       "ownerEpoch", "ownerDeviceId", "signedIntent", "casKeyRaw", "casSpkiPin",
       "floorKeyRaw", "floorSpkiPin", "checkpointKeyRaw", "checkpointSpkiPin",
-      "deviceKeyRaw", "deviceSpkiPin"]);
+      "deviceKeyRaw", "deviceSpkiPin",
+      ...(chainProvided ? ["signedIntents"] : []),
+      ...(grantProvided ? ["signedDeviceGrant", "ownerKeyRaw", "ownerSpkiPin"] : [])]);
     if (!webCrypto?.subtle || !webCrypto.getRandomValues
       || typeof input.fetchImpl !== "function"
       || typeof input.assertLive !== "function"
@@ -362,8 +371,8 @@
         name === "compartment_id" ? 128 : 16);
       return [name, b];
     }));
-    const previous = copy(input.previousDigest, 32);
-    const previousCheckpoint = copy(input.previousCheckpointDigest, 32);
+    let previous = copy(input.previousDigest, 32);
+    let previousCheckpoint = copy(input.previousCheckpointDigest, 32);
     if (previous.every((v) => v === 0) || previousCheckpoint.every((v) => v === 0)) deny();
     const ownerDigest = copy(input.ownerDigest, 32);
     const revision = uint(input.ownerRevision, 1), epoch = uint(input.ownerEpoch, 1);
@@ -380,14 +389,49 @@
       input.casSpkiPin, input.floorSpkiPin, input.checkpointSpkiPin];
     if (equal(casFp, floorFp) || equal(casFp, checkpointFp)
       || equal(floorFp, checkpointFp)) deny();
-    const intentRaw = strictBytes(input.signedIntent, 1, 10 * 1024 * 1024);
+    // Capture the entire caller-owned chain before the first awaited signature.
+    const lastIntentRaw = strictBytes(input.signedIntent, 1, 10 * 1024 * 1024).slice();
+    const chain = chainProvided ? input.signedIntents : [lastIntentRaw];
+    if (!Array.isArray(chain) || !chain.length || chain.length > 128) deny();
+    const signedChain = chain.map((raw) => strictBytes(raw, 1, 10 * 1024 * 1024).slice());
+    if (!equal(signedChain.at(-1), lastIntentRaw)) deny();
+    // A successor demands the independently pinned CURRENT owner-signed device
+    // grant. The 129-only legacy opt-in preserves its earlier input contract.
+    if (signedChain.length > 1 && !grantProvided) deny();
+    if (grantProvided) {
+      exact(input.signedDeviceGrant, [...V2_GRANT_FIELDS, "signature"]);
+      // Copy only signed scalar fields before WebCrypto yields. Later edits to
+      // the UI's grant object cannot change which authorization was checked.
+      const grant = Object.fromEntries([...V2_GRANT_FIELDS, "signature"]
+        .map((name) => [name, input.signedDeviceGrant[name]]));
+      const ownerKey = await verifyKey(input.ownerKeyRaw, input.ownerSpkiPin);
+      const frozenGrant = Object.fromEntries(V2_GRANT_FIELDS.map((name) => [name, grant[name]]));
+      if (grant.schema !== "rootark-zk1-browser-owner-device-grant/v1"
+        || grant.manifest_revision !== revision || grant.manifest_digest !== to64(ownerDigest)
+        || grant.current_epoch !== epoch || grant.revoked_at_epoch !== null
+        || uint(grant.enrolled_epoch, 1) > epoch
+        || grant.device_id !== input.ownerDeviceId
+        || !equal(from64(grant.authorization_public_key, 32), copy(input.deviceKeyRaw, 32))) deny();
+      scoped(Object.fromEntries(SCOPE.map((name) => [name,
+        from64(grant[name], name === "compartment_id" ? 128 : 16)])), scope);
+      strictBytes(from64(grant.authorization_key_id), 16);
+      if (!await webCrypto.subtle.verify("Ed25519", ownerKey,
+        from64(grant.signature, 64), append(V2_GRANT,
+          encoder.encode(JSON.stringify(frozenGrant))))) deny();
+    }
+    let sequence = 128;
+    let previousOperation = null;
+    let operation, headDigest, checkpointDigest, count, rows, privateRows;
+    for (const intentRaw of signedChain) {
     const intent = decode(intentRaw, 10 * 1024 * 1024);
+    const nextSequence = sequence + 1;
     exact(intent, ["type", ...SCOPE, "operation_id", "checkpoint_bytes",
       "checkpoint_signature", "records", "previous_sequence", "previous_digest",
-      "previous_checkpoint_digest", "owner_approval", "owner_signature", "owner_evidence"]);
+      "previous_checkpoint_digest", "owner_approval", "owner_signature", "owner_evidence",
+      ...(nextSequence > 129 ? ["predecessor_cas_receipt", "predecessor_floor_receipt"] : [])]);
     scoped(intent, scope);
     if (intent.type !== "rootark-opaque-checkpoint-remote-intent/v2"
-      || intent.previous_sequence !== 128
+      || intent.previous_sequence !== sequence
       || !equal(strictBytes(intent.previous_digest, 32), previous)
       || !equal(strictBytes(intent.previous_checkpoint_digest, 32), previousCheckpoint)
       || !Array.isArray(intent.records) || intent.records.length !== 1) deny();
@@ -398,16 +442,16 @@
     strictBytes(ownerEvidence.witnessHeadRaw, 1, 8192);
     if (!Array.isArray(ownerEvidence.transitions)
       || !Array.isArray(ownerEvidence.packageEnvelopes)) deny();
-    const operation = strictBytes(intent.operation_id, 32);
+    operation = strictBytes(intent.operation_id, 32);
     const record = intent.records[0];
     exact(record, ["sequence", "header", "signature", "page_bodies"]);
-    if (record.sequence !== 129 || !Array.isArray(record.page_bodies)
+    if (record.sequence !== nextSequence || !Array.isArray(record.page_bodies)
       || record.page_bodies.length > 128) deny();
     const rawHead = strictBytes(record.header, 1, 16384);
     const rawSignature = strictBytes(record.signature, 64);
     const header = decode(rawHead, 16384);
     exact(header, V2_HEADER_FIELDS); scoped(header, scope);
-    if (header.type !== "rootark-zk1-opaque-catalog/v1" || header.sequence !== 129
+    if (header.type !== "rootark-zk1-opaque-catalog/v1" || header.sequence !== nextSequence
       || !equal(strictBytes(header.previous_digest, 32), previous)
       || !equal(strictBytes(header.manifest_digest, 32), ownerDigest)
       || header.manifest_revision !== revision || header.epoch !== epoch
@@ -418,8 +462,8 @@
       || header.page_digests.length !== Math.ceil(header.total_count / 32)) deny();
     if (!await webCrypto.subtle.verify("Ed25519", deviceKey, rawSignature,
       append(V2_HEAD, rawHead))) deny();
-    let count = 0, last = null;
-    const rows = [], privateRows = [];
+    count = 0; let last = null;
+    rows = []; privateRows = [];
     for (let index = 0; index < record.page_bodies.length; index++) {
       const raw = strictBytes(record.page_bodies[index], 1, 16384);
       if (!equal(await digest(V2_PAGE, raw), strictBytes(header.page_digests[index], 32))) deny();
@@ -448,16 +492,16 @@
       }
     }
     if (count !== header.total_count) deny();
-    const headDigest = await digest(V2_HEAD, rawHead, rawSignature);
+    headDigest = await digest(V2_HEAD, rawHead, rawSignature);
     const checkpointBytes = strictBytes(intent.checkpoint_bytes, 1, 16384);
     const checkpointSig = strictBytes(intent.checkpoint_signature, 64);
     if (!await webCrypto.subtle.verify("Ed25519", checkpointKey, checkpointSig,
       append(V2_CHECKPOINT, checkpointBytes))) deny();
-    const checkpointDigest = await digest(V2_DIGEST, checkpointBytes, checkpointSig);
+    checkpointDigest = await digest(V2_DIGEST, checkpointBytes, checkpointSig);
     const checkpoint = decode(checkpointBytes, 16384);
     exact(checkpoint, V2_CHECKPOINT_FIELDS); scoped(checkpoint, scope);
     if (checkpoint.type !== "rootark-zk1-opaque-catalog-checkpoint/v2"
-      || checkpoint.previous_sequence !== 128 || checkpoint.final_sequence !== 129
+      || checkpoint.previous_sequence !== sequence || checkpoint.final_sequence !== nextSequence
       || checkpoint.record_count !== 1
       || !equal(strictBytes(checkpoint.previous_digest, 32), previous)
       || !equal(strictBytes(checkpoint.previous_checkpoint_digest, 32), previousCheckpoint)
@@ -468,7 +512,7 @@
     const approval = decode(approvalBytes, 4096);
     exact(approval, V2_OWNER_FIELDS); scoped(approval, scope);
     if (approval.type !== "rootark-opaque-checkpoint-remote-owner-approval/v2"
-      || approval.previous_sequence !== 128 || approval.final_sequence !== 129
+      || approval.previous_sequence !== sequence || approval.final_sequence !== nextSequence
       || !equal(strictBytes(approval.operation_id, 32), operation)
       || !equal(strictBytes(approval.previous_digest, 32), previous)
       || !equal(strictBytes(approval.previous_checkpoint_digest, 32), previousCheckpoint)
@@ -479,9 +523,41 @@
       || !equal(strictBytes(approval.checkpoint_signer_fp, 32), checkpointFp)
       || !await webCrypto.subtle.verify("Ed25519", deviceKey,
         strictBytes(intent.owner_signature, 64), append(V2_OWNER, approvalBytes))) deny();
+    if (nextSequence > 129) {
+      // Historical predecessor endorsements are immutable evidence. Freshness
+      // belongs to the CURRENT remote head challenge checked below.
+      for (const [field, role, signer] of [
+        ["predecessor_cas_receipt", "CAS", casKey],
+        ["predecessor_floor_receipt", "FLOOR", floorKey],
+      ]) {
+        const proof = decode(strictBytes(intent[field], 1, 4096));
+        exact(proof, [...V2_RECEIPT_FIELDS, "signature"]); scoped(proof, scope);
+        if (proof.type !== "rootark-opaque-checkpoint-remote-receipt/v2"
+          || proof.role !== role || proof.state !== "FINALIZED"
+          || proof.sequence !== sequence
+          || !equal(strictBytes(proof.head_digest, 32), previous)
+          || !equal(strictBytes(proof.checkpoint_digest, 32), previousCheckpoint)
+          || !equal(strictBytes(proof.operation_id, 32), previousOperation)
+          || !equal(strictBytes(proof.cas_signer_fp, 32), casFp)
+          || !equal(strictBytes(proof.floor_signer_fp, 32), floorFp)) deny();
+        uint(proof.issued_at, 0); strictBytes(proof.nonce, 32);
+        const predecessorStatement = Object.fromEntries(
+          V2_RECEIPT_FIELDS.map((name) => [name, proof[name]]));
+        if (!await webCrypto.subtle.verify("Ed25519", signer,
+          strictBytes(proof.signature, 64),
+          append(V2_RECEIPT, canonical(predecessorStatement)))) deny();
+      }
+    }
+    previous = headDigest;
+    previousCheckpoint = checkpointDigest;
+    previousOperation = operation;
+    sequence = nextSequence;
+    input.assertLive();
+    }
     input.assertLive();
     const csrf = input.csrfToken();
     if (typeof csrf !== "string" || !csrf || csrf.length > 512) deny();
+    async function recheckCurrent() {
     const nonce = webCrypto.getRandomValues(new Uint8Array(32));
     const controller = new AbortController();
     let timer;
@@ -534,7 +610,7 @@
         exact(proof, [...V2_RECEIPT_FIELDS, "signature"]); scoped(proof, scope);
         if (proof.type !== "rootark-opaque-checkpoint-remote-receipt/v2"
           || proof.role !== role || proof.state !== "FINALIZED"
-          || proof.sequence !== 129 || !equal(strictBytes(proof.nonce, 32), nonce)
+          || proof.sequence !== sequence || !equal(strictBytes(proof.nonce, 32), nonce)
           || Math.abs(uint(proof.issued_at) - Math.floor(Date.now() / 1000)) > 30
           || !equal(strictBytes(proof.operation_id, 32), operation)
           || !equal(strictBytes(proof.head_digest, 32), headDigest)
@@ -547,7 +623,11 @@
       }
       input.assertLive();
       if (csrf !== input.csrfToken()) deny();
-      const confirmed = Object.freeze({ sequence: 129, digest: to64(headDigest),
+    } catch (_) { deny(); }
+    finally { clearTimeout(timer); controller.abort(); }
+    }
+    await recheckCurrent();
+      const confirmed = Object.freeze({ sequence, digest: to64(headDigest),
         checkpointDigest: to64(checkpointDigest), totalCount: count,
         rows: Object.freeze(rows), independentlyFinalized: true,
         productionDurabilityProven: false });
@@ -557,11 +637,10 @@
         scope: Object.freeze(Object.fromEntries(SCOPE.map((name) => [name, to64(scope[name])]))),
         head: Object.freeze({ revision, digest: ownerDigest, epoch }),
         deviceId: input.ownerDeviceId, deviceKey,
+        recheckCurrent,
         rows: Object.freeze(privateRows),
       }));
       return confirmed;
-    } catch (_) { deny(); }
-    finally { clearTimeout(timer); controller.abort(); }
   }
   async function getFinalizedV2Ciphertext(confirmed, index, signerKey) {
     try {
@@ -573,6 +652,9 @@
         || !signerKey?.usages?.includes("sign")) deny();
       state.assertLive();
       if (state.csrf !== state.csrfToken()) deny();
+      // A once-finalized head is insufficient for a later GET: newer signed
+      // 132+ heads revoke this snapshot, even if its ciphertext stayed valid.
+      await state.recheckCurrent();
       // Prove possession of the same current device credential that verified
       // the checkpoint. Never trust an imported key filename or UI label.
       const challenge = webCrypto.getRandomValues(new Uint8Array(32));
@@ -634,6 +716,7 @@
           const ciphertext = from64(received.ciphertextBase64, 4 * 1024 * 1024);
           if (ciphertext.length < 16 || ciphertext.length > 4 * 1024 * 1024
             || !equal(await digest(ciphertext), row.ciphertextDigest)) deny();
+          await state.recheckCurrent();
           state.assertLive();
           if (state.csrf !== state.csrfToken()) deny();
           return Object.freeze({ objectId: row.objectId, revision: row.revision,

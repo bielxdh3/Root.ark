@@ -36,6 +36,7 @@ const { Zk1OpaqueCheckpointV2Client } =
   require("../src/services/zk1OpaqueCheckpointV2Client");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
+const { realEdge } = require("./support/issue-65-checkpoint-v2-real-edge");
 
 const PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 const BASE_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-base/v1\0");
@@ -43,6 +44,7 @@ const WITNESS_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0");
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
 const fp = (key) => crypto.createHash("sha256")
   .update(key.export({ type: "spki", format: "der" })).digest();
+const rawPublicForGrant = (key) => key.export({ type: "spki", format: "der" }).subarray(-32);
 const hd = (raw, signature) => crypto.createHash("sha256")
   .update(HEAD_DOMAIN).update(raw).update(signature).digest();
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -752,6 +754,190 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   assert.equal((await handles.floorClient.head()).sequence, 131);
   const signedHistory = await client.exportSignedIntents();
   assert.equal(signedHistory.length, 3);
+  // Normal same-origin browser opt-in over REAL pinned mTLS CAS/FLOOR heads.
+  // The server authenticates the session/permissions on both HEAD and GET;
+  // imported chain/owner key pins come exclusively from the local test device.
+  const grantSigner = crypto.generateKeyPairSync("ed25519");
+  const grantFields = ["schema", "account_id", "compartment_id", "keyring_id",
+    "device_id", "authorization_key_id", "authorization_public_key",
+    "manifest_revision", "manifest_digest", "current_epoch", "enrolled_epoch",
+    "revoked_at_epoch"];
+  const grantStatement = {
+    schema: "rootark-zk1-browser-owner-device-grant/v1",
+    ...Object.fromEntries(Object.entries(scope).map(([k, v]) => [k, encoded(v)])),
+    device_id: deviceB.device_id, authorization_key_id: encoded(crypto.randomBytes(16)),
+    authorization_public_key: encoded(rawPublicForGrant(owner.publicKey)),
+    manifest_revision: Number(state.headManifest.revision),
+    manifest_digest: encoded(await ownerManifest.recoveryManifestDigestV2(state.headManifest)),
+    current_epoch: Number(state.headManifest.current_epoch), enrolled_epoch: 1,
+    revoked_at_epoch: null,
+  };
+  const grant = { ...grantStatement,
+    signature: encoded(crypto.sign(null, Buffer.concat([
+      Buffer.from("Root.ark/zk-1/browser-owner-device-grant/v1\0"),
+      Buffer.from(JSON.stringify(Object.fromEntries(grantFields.map((n) =>
+        [n, grantStatement[n]])))),
+    ]), grantSigner.privateKey)) };
+  const bridge = express();
+  let bridgeSession = 11;
+  let bridgeReads = 0;
+  let bridgeCiphertext = Buffer.from(storedCiphertext);
+  const relayScript = fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-browser-authority-head-relay.js"), "utf8");
+  const httpScript = fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-protected-http-client.js"), "utf8");
+  bridge.get("/checkpoint-v2-browser-test", (_req, res) => res.type("html").send(
+    '<!doctype html><meta charset="utf-8"><script src="/test-content-http.js"></script>'
+    + '<script src="/test-v2-head.js"></script><main>fixture</main>'));
+  bridge.get("/test-content-http.js", (_req, res) => res.type("js").send(httpScript));
+  bridge.get("/test-v2-head.js", (_req, res) => res.type("js").send(relayScript));
+  registerZk1ProtectedObjectRoutes({ app: bridge, environment: "test",
+    store: { signedHistoryRequired: true, put() {}, get() {},
+      async runWithAdmission(request, operation, respond) {
+        assert.equal(operation, "get");
+        assert.equal(request.authorization.object_id, encryptedRecord.object_id);
+        assert.equal(request.authorization.expected_object_revision, 1);
+        assert.deepEqual(Buffer.from(request.authorization.ciphertext_digest),
+          encryptedRecord.ciphertext_digest);
+        bridgeReads++;
+        return respond({ id: encryptedRecord.object_id, revision: 1,
+          epoch: encryptedRecord.epoch, ciphertext: bridgeCiphertext });
+      },
+    },
+    authenticate: (req, _res, next) => {
+      req.user = { username: "fixture", sessionVersion: bridgeSession }; next();
+    },
+    requirePermission: () => (_req, _res, next) => next(),
+    resolveTrustedScope: () => scope,
+    opaqueCheckpointV2: { casClient: handles.casClient, floorClient: handles.floorClient },
+  });
+  const bridgeServer = await new Promise((resolve) => {
+    const instance = bridge.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => { if (bridgeServer.listening) bridgeServer.close(); });
+  const bridgeOrigin = "http://127.0.0.1:" + bridgeServer.address().port + "/";
+  const bridgeInput = {
+    origin: bridgeOrigin, fetchImpl: fetch, assertLive: () => {},
+    csrfToken: () => "checkpoint-csrf", scope: Object.fromEntries(
+      Object.entries(scope).map(([name, value]) => [name, encoded(value)])),
+    previousDigest: new Uint8Array(oldDigest),
+    previousCheckpointDigest: new Uint8Array(oldCheckpoint),
+    ownerRevision: Number(state.headManifest.revision),
+    ownerDigest: new Uint8Array(await ownerManifest.recoveryManifestDigestV2(state.headManifest)),
+    ownerEpoch: Number(state.headManifest.current_epoch),
+    ownerDeviceId: deviceB.device_id,
+    signedIntent: new Uint8Array(signedHistory[2]),
+    signedIntents: signedHistory.map((value) => new Uint8Array(value)),
+    casKeyRaw: new Uint8Array(rawPublicForGrant(v2CasKeys.publicKey)),
+    casSpkiPin: new Uint8Array(fp(v2CasKeys.publicKey)),
+    floorKeyRaw: new Uint8Array(rawPublicForGrant(v2FloorKeys.publicKey)),
+    floorSpkiPin: new Uint8Array(fp(v2FloorKeys.publicKey)),
+    checkpointKeyRaw: new Uint8Array(rawPublicForGrant(checkpoint.publicKey)),
+    checkpointSpkiPin: new Uint8Array(fp(checkpoint.publicKey)),
+    deviceKeyRaw: new Uint8Array(rawPublicForGrant(owner.publicKey)),
+    deviceSpkiPin: new Uint8Array(fp(owner.publicKey)),
+    signedDeviceGrant: grant,
+    ownerKeyRaw: new Uint8Array(rawPublicForGrant(grantSigner.publicKey)),
+    ownerSpkiPin: new Uint8Array(fp(grantSigner.publicKey)),
+  };
+  const verified131 = await browserV2.readFinalizedV2(bridgeInput);
+  assert.equal(verified131.sequence, 131);
+  const privateEdge = await crypto.webcrypto.subtle.importKey("pkcs8",
+    owner.privateKey.export({ type: "pkcs8", format: "der" }),
+    "Ed25519", false, ["sign"]);
+  assert.deepEqual(Buffer.from((await browserV2.getFinalizedV2Ciphertext(
+    verified131, 0, privateEdge)).ciphertextBase64, "base64url"), storedCiphertext);
+  assert.equal(bridgeReads, 1);
+  const truncated131 = [signedHistory[0], signedHistory[2]].map((r) => new Uint8Array(r));
+  await assert.rejects(browserV2.readFinalizedV2({ ...bridgeInput,
+    signedIntents: truncated131 }), /UNVERIFIED/,
+  "unsigned gap from 129 directly to 131 cannot be read");
+  await assert.rejects(browserV2.readFinalizedV2({ ...bridgeInput,
+    signedIntents: signedHistory.slice(0, 2).map((r) => new Uint8Array(r)),
+    signedIntent: new Uint8Array(signedHistory[1]) }), /UNVERIFIED/,
+  "valid 130 signed history must not conceal the live 131 head");
+  const replacedProof = await z.decodeDeterministic(signedHistory[2]);
+  const replayCas = await z.decodeDeterministic(replacedProof.predecessor_cas_receipt);
+  replayCas.signature = crypto.randomBytes(64);
+  replacedProof.predecessor_cas_receipt = Buffer.from(
+    await z.encodeDeterministic(replayCas));
+  await assert.rejects(browserV2.readFinalizedV2({ ...bridgeInput,
+    signedIntents: [...signedHistory.slice(0, 2),
+      await z.encodeDeterministic(replacedProof)].map((r) => new Uint8Array(r)),
+    signedIntent: new Uint8Array(await z.encodeDeterministic(replacedProof)),
+  }), /UNVERIFIED/, "forged predecessor CAS endorsement fails closed");
+  await assert.rejects(browserV2.readFinalizedV2({ ...bridgeInput,
+    signedDeviceGrant: { ...grant, signature: encoded(crypto.randomBytes(64)) },
+  }), /UNVERIFIED/, "a forged current owner grant cannot authorize 131");
+  let bridgeCsrf = "checkpoint-csrf";
+  await assert.rejects(browserV2.readFinalizedV2({ ...bridgeInput,
+    csrfToken: () => bridgeCsrf,
+    fetchImpl: async (...args) => { const response = await fetch(...args);
+      bridgeSession++; bridgeCsrf = "replaced-session"; return response; },
+  }), /UNVERIFIED/, "session switch during authenticated final heads is denied");
+  bridgeCiphertext = Buffer.from(storedCiphertext);
+  bridgeCiphertext[0] ^= 0xff;
+  await assert.rejects(browserV2.getFinalizedV2Ciphertext(verified131, 0, privateEdge),
+    /UNVERIFIED/, "GET still checks the latest signed ciphertext digest");
+  bridgeCiphertext = Buffer.from(storedCiphertext);
+  const edge = await realEdge(t, bridgeOrigin);
+  const edgeWire = { ...bridgeInput,
+    previousDigest: encoded(oldDigest), previousCheckpointDigest: encoded(oldCheckpoint),
+    ownerDigest: encoded(bridgeInput.ownerDigest),
+    signedIntent: encoded(signedHistory[2]),
+    signedIntents: signedHistory.map(encoded),
+    casKeyRaw: encoded(bridgeInput.casKeyRaw), casSpkiPin: encoded(bridgeInput.casSpkiPin),
+    floorKeyRaw: encoded(bridgeInput.floorKeyRaw), floorSpkiPin: encoded(bridgeInput.floorSpkiPin),
+    checkpointKeyRaw: encoded(bridgeInput.checkpointKeyRaw),
+    checkpointSpkiPin: encoded(bridgeInput.checkpointSpkiPin),
+    deviceKeyRaw: encoded(bridgeInput.deviceKeyRaw), deviceSpkiPin: encoded(bridgeInput.deviceSpkiPin),
+    ownerKeyRaw: encoded(bridgeInput.ownerKeyRaw), ownerSpkiPin: encoded(bridgeInput.ownerSpkiPin),
+  };
+  const edgePrivate = encoded(owner.privateKey.export({ type: "pkcs8", format: "der" }));
+  const edgeResult = await edge.evaluate(`(async () => {
+    const wire=${JSON.stringify(edgeWire)};
+    const toBytes=s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')
+      .padEnd(Math.ceil(s.length/4)*4,'=')),c=>c.charCodeAt(0));
+    const names=['previousDigest','previousCheckpointDigest','ownerDigest','signedIntent',
+      'casKeyRaw','casSpkiPin','floorKeyRaw','floorSpkiPin','checkpointKeyRaw',
+      'checkpointSpkiPin','deviceKeyRaw','deviceSpkiPin','ownerKeyRaw','ownerSpkiPin'];
+    for(const name of names) wire[name]=toBytes(wire[name]);
+    wire.signedIntents=wire.signedIntents.map(toBytes);
+    wire.origin=location.origin+'/'; wire.fetchImpl=fetch.bind(window);
+    wire.csrfToken=()=>window.__csrf||'checkpoint-csrf';
+    wire.assertLive=()=>{if(window.__dead)throw Error('logout')};
+    window.__config=wire;
+    const v2=window.RootarkZk1BrowserAuthorityHeadRelay;
+    window.__verified=await v2.readFinalizedV2(wire);
+    const privateKey=await crypto.subtle.importKey('pkcs8',toBytes(${JSON.stringify(edgePrivate)}),
+      'Ed25519',false,['sign']);
+    window.__privateKey=privateKey;
+    const file=await v2.getFinalizedV2Ciphertext(window.__verified,0,privateKey);
+    return {sequence:window.__verified.sequence, fetched:file.ciphertextBase64};
+  })()`);
+  assert.equal(edgeResult.sequence, 131);
+  assert.deepEqual(Buffer.from(edgeResult.fetched, "base64url"), storedCiphertext);
+  assert.equal(await edge.evaluate(`(async()=>{
+    const v2=window.RootarkZk1BrowserAuthorityHeadRelay;
+    try{await v2.readFinalizedV2({...window.__config,
+      signedIntents:window.__config.signedIntents.slice(0,2),
+      signedIntent:window.__config.signedIntents[1]});return 'accepted'}
+    catch(e){return e.message}
+  })()`), "ZK_BROWSER_AUTHORITY_RELAY_UNVERIFIED");
+  assert.equal(await edge.evaluate(`(async()=>{
+    const v2=window.RootarkZk1BrowserAuthorityHeadRelay;
+    try{await v2.readFinalizedV2({...window.__config,
+      signedDeviceGrant:{...window.__config.signedDeviceGrant,
+        revoked_at_epoch:window.__config.ownerEpoch}});return 'accepted'}
+    catch(e){return e.message}
+  })()`), "ZK_BROWSER_AUTHORITY_RELAY_UNVERIFIED",
+  "REAL Edge refuses a revoked owner-device grant");
+  assert.equal(await edge.evaluate(`(async()=>{
+    window.__csrf='session-switched';
+    try{await window.RootarkZk1BrowserAuthorityHeadRelay
+      .getFinalizedV2Ciphertext(window.__verified,0,window.__privateKey);return 'accepted'}
+    catch(e){return e.message}
+  })()`), "ZK_BROWSER_AUTHORITY_RELAY_UNVERIFIED");
   const second = new Zk1OpaqueCheckpointV2Client(clientOptions(handles,
     path.join(dir, "v2-second-device.sqlite"), true));
   try {
@@ -793,6 +979,23 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
     clientOptions(handles, forgedSuccessorDb, false)),
   /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
   "a forged local append guard must fail closed on restart");
+  // A valid but superseded 131 snapshot loses GET authorization as soon as
+  // BOTH pinned authorities have independently finalized a signed 132 head.
+  const next132 = await successorRecord(132, next131.digest);
+  assert.equal((await publishSuccessor(next132.record)).sequence, 132);
+  const priorBridgeReads = bridgeReads;
+  await assert.rejects(browserV2.getFinalizedV2Ciphertext(verified131, 0, privateEdge),
+    /UNVERIFIED/, "a superseded checkpoint loses GET authorization");
+  assert.equal(bridgeReads, priorBridgeReads,
+    "superseded head must stop GET before reaching content storage");
+  assert.equal(await edge.evaluate(`(async()=>{
+    window.__csrf='checkpoint-csrf';
+    try{await window.RootarkZk1BrowserAuthorityHeadRelay
+      .getFinalizedV2Ciphertext(window.__verified,0,window.__privateKey);return 'accepted'}
+    catch(e){return e.message}
+  })()`), "ZK_BROWSER_AUTHORITY_RELAY_UNVERIFIED",
+  "REAL Edge cannot download after another independently finalized head");
+  await new Promise((resolve) => bridgeServer.close(resolve));
   await stopV2();
   await assert.rejects(client.read(), /ZK_CHECKPOINT_V2_ACK_UNCERTAIN/,
     "offline CAS/floor must fence metadata read even after local recovery");

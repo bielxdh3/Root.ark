@@ -740,7 +740,7 @@
       + 'o checkpoint Merkle completo, a aprovação e o grant owner-signed atual permitem listar IDs opacos. '
       + 'Permite GET de ciphertext de uma versão selecionada após nova confirmação, prova de posse da chave do dispositivo e SHA-256 do catálogo assinado. '
       + 'Não descriptografa nem publica. Os dados V1 permanecem na sequência 128.</p>'
-      + '<label>Intent completo V2 assinado CBOR (até 10 MiB)<input type="file" data-zk1-field="catalog-v2-intent" accept=".cbor,application/cbor,application/octet-stream"></label>'
+      + '<label>Intents V2 assinados em ordem (129 até o atual, até 10 MiB cada)<input type="file" multiple data-zk1-field="catalog-v2-intent" accept=".cbor,application/cbor,application/octet-stream"></label>'
       + '<label>Chave CAS V2 Ed25519 raw (32 bytes)<input type="file" data-zk1-field="catalog-v2-cas-key"></label>'
       + '<label>PIN SHA-256 SPKI CAS V2 (base64url)<input data-zk1-field="catalog-v2-cas-pin" maxlength="43" spellcheck="false"></label>'
       + '<label>Chave floor V2 Ed25519 raw (32 bytes)<input type="file" data-zk1-field="catalog-v2-floor-key"></label>'
@@ -1070,6 +1070,18 @@
         const scope = Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
           .map((name) => [name, trust.signedDeviceGrant[name]]));
         try {
+          const chosenIntents = field("catalog-v2-intent")?.files;
+          if (!chosenIntents?.length || chosenIntents.length > 128) fail();
+          const signedIntents = [];
+          for (const file of chosenIntents) {
+            if (file.size < 1 || file.size > 10 * 1024 * 1024) fail();
+            const raw = new Uint8Array(await file.arrayBuffer());
+            assertLive();
+            if (raw.byteLength !== file.size) fail();
+            signedIntents.push(raw);
+          }
+          const ownerKeyRaw = new Uint8Array(await crypto.subtle.exportKey("raw",
+            trust.ownerPublicKey));
           const result = await v2.readFinalizedV2({
             origin: location.origin + "/", fetchImpl: guardedFetch, assertLive,
             csrfToken: () => { assertLive(); return initialCsrf; },
@@ -1079,7 +1091,9 @@
             ownerDigest: trust.pinnedCurrentHead.digest,
             ownerEpoch: trust.pinnedCurrentHead.epoch,
             ownerDeviceId: trust.signedDeviceGrant.device_id,
-            signedIntent: await fileBytes("catalog-v2-intent", 1, 10 * 1024 * 1024),
+            signedIntent: signedIntents.at(-1), signedIntents,
+            signedDeviceGrant: trust.signedDeviceGrant,
+            ownerKeyRaw, ownerSpkiPin: trust.independentOwnerSpkiSha256,
             casKeyRaw: keys[0], casSpkiPin: from64(field("catalog-v2-cas-pin").value.trim()),
             floorKeyRaw: keys[1], floorSpkiPin: from64(field("catalog-v2-floor-pin").value.trim()),
             checkpointKeyRaw: keys[2],
@@ -1087,7 +1101,8 @@
             deviceKeyRaw: deviceRaw, deviceSpkiPin: devicePin,
           });
           assertLive();
-          if (result.sequence !== 129 || result.independentlyFinalized !== true
+          if (result.sequence !== 128 + signedIntents.length
+            || result.independentlyFinalized !== true
             || result.productionDurabilityProven !== false) fail();
           const list = field("catalog-v2-list");
           list.replaceChildren();
@@ -1112,10 +1127,10 @@
             downloadLocal("zk1-v2-" + checked.objectId + "-v" + checked.revision
               + ".ciphertext", contentFrom64(checked.ciphertextBase64),
             "application/octet-stream", assertLive);
-            status("Checkpoint V2 #129 e GET exato autenticados: " + checked.objectId
+            status("Checkpoint V2 #" + result.sequence + " e GET exato autenticados: " + checked.objectId
               + " · v" + checked.revision + ". Ciphertext salvo localmente, sem prova de nuvem.");
           } else {
-            status("Checkpoint V2 #129 autenticado por CAS e floor independentes. "
+            status("Checkpoint V2 #" + result.sequence + " autenticado por CAS e floor independentes. "
               + result.totalCount + " versão(ões) opacas; digest " + result.digest
               + ". Sem escrita ou prova de nuvem.");
           }
