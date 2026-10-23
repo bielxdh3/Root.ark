@@ -86,6 +86,9 @@
     async function performRenameOrMove(input, composed) {
       let oldCiphertext, oldPlain, newCiphertext, readBack, reconciledPlain;
       let rawDestinationCek, recoveredCek;
+      let journalId = null, archiveAttempted = false, putAttempted = false;
+      let commitAttempted = false, confirmedCommit = null;
+      let pendingObjectId = null, pendingRevision = null;
       try {
         const keys = ["catalog", "sourceIndex", "sourceMetadata", "sourceCek",
           "destinationName", "destinationParentFolderId",
@@ -98,6 +101,7 @@
         if (composed && (typeof input.catalogWriter?.readAll !== "function"
           || typeof input.catalogWriter?.prepareIntent !== "function"
           || typeof input.catalogWriter?.commit !== "function"
+          || typeof input.catalogWriter?.confirmPendingIntent !== "function"
           || typeof input.cekArchive?.write !== "function"
           || typeof input.cekArchive?.read !== "function"
           || input.metadataKey?.type !== "secret"
@@ -223,11 +227,21 @@
         await guard();
         const root = bytes(await roots.computeCiphertextRoot([newCiphertext]), 32);
         const newDigest = bytes(await crypto.subtle.digest("SHA-256", newCiphertext), 32);
-        let journalId = null;
         if (composed) {
-          // Archive adapters are explicit trusted client-side providers. A
-          // separate archive read must reconstruct the exact CEK; an ACK alone
-          // is insufficient. The writer's signed intent is persisted next.
+          pendingObjectId = source.object_id;
+          pendingRevision = previousRevision + 1;
+          // prepareIntent checks the fresh independent signed catalog authority
+          // and durably persists the device-signed revision/digest intent before
+          // any external CEK custody side effect, including a lost archive ACK.
+          journalId = await input.catalogWriter.prepareIntent([{
+            objectId: source.object_id, revision: previousRevision + 1,
+            epoch: next.epoch, ciphertext: new Uint8Array(newCiphertext),
+          }]);
+          await guard();
+          if (typeof journalId !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(journalId)) deny();
+          // A separate archive read must reconstruct the exact CEK; an ACK
+          // alone is insufficient evidence for subsequent ciphertext PUT.
+          archiveAttempted = true;
           const receiptId = await input.cekArchive.write({ metadata: { ...next },
             objectRevision: previousRevision + 1,
             ciphertext: new Uint8Array(newCiphertext),
@@ -244,12 +258,6 @@
           if (!equal(rawDestinationCek, recoveredCek)) deny();
           recoveredCek.fill(0); recoveredCek = null;
           rawDestinationCek.fill(0); rawDestinationCek = null;
-          journalId = await input.catalogWriter.prepareIntent([{
-            objectId: source.object_id, revision: previousRevision + 1,
-            epoch: next.epoch, ciphertext: new Uint8Array(newCiphertext),
-          }]);
-          await guard();
-          if (typeof journalId !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(journalId)) deny();
         }
         const signedPut = await http.signProtectedContentOperation({
           ...signer, nowSeconds: clock(input.nowSeconds),
@@ -258,6 +266,7 @@
         await guard();
         let lostAck = false;
         try {
+          putAttempted = true;
           const ack = await http.postProtectedCiphertextPut({
             origin: input.origin, request: signedPut, fetchImpl: fetchGuarded });
           await guard();
@@ -301,11 +310,12 @@
           || readBack.authorizesRelease !== false) deny();
         let catalogCommit = null;
         if (composed) {
+          commitAttempted = true;
           catalogCommit = await input.catalogWriter.commit([{
             objectId: source.object_id, revision: previousRevision + 1,
             epoch: next.epoch, ciphertext: new Uint8Array(newCiphertext),
             name: newName, metadataKey: input.metadataKey,
-          }], journalId);
+          }], journalId, { retainPendingIntent: true });
           await guard();
           if (catalogCommit?.verifiedSignedReadback !== true
             || !Number.isSafeInteger(catalogCommit.sequence)
@@ -320,6 +330,12 @@
             || !equal(bytes(matches[0].ciphertext_digest, 32), newDigest)
             || signed.head.sequence !== catalogCommit.sequence
             || b64(bytes(signed.head.digest, 32)) !== catalogCommit.digest) deny();
+          confirmedCommit = { sequence: catalogCommit.sequence, digest: catalogCommit.digest };
+          // Only explicit fresh signed CAS, catalog and ciphertext confirmation
+          // can clear a committed intent. Failure retains it for reconciliation.
+          await guard();
+          if (await input.catalogWriter.confirmPendingIntent(journalId, catalogCommit)
+            !== true) deny();
         }
         return Object.freeze({
           objectId: source.object_id, revision: previousRevision + 1,
@@ -336,7 +352,38 @@
           durableExternalCommitVerified: false, authorizesCutover: false,
           authorizesProductionIo: false,
         });
-      } catch (_) { deny(); }
+      } catch (_) {
+        if (composed && commitAttempted) {
+          const error = new Error("ZK_CLIENT_RENAME_MOVE_COMMIT_UNCERTAIN");
+          error.code = error.message;
+          error.outcome = Object.freeze({ objectId: pendingObjectId,
+            revision: pendingRevision, journalId,
+            catalogSequence: confirmedCommit?.sequence ?? null,
+            catalogDigestBase64: confirmedCommit?.digest ?? null,
+            signedCatalogReadbackVerified: confirmedCommit !== null,
+            retrySafe: false, renameMoveFinalized: false });
+          throw error;
+        }
+        if (composed && putAttempted) {
+          const error = new Error("ZK_CLIENT_RENAME_MOVE_PUT_UNCERTAIN");
+          error.code = error.message;
+          error.outcome = Object.freeze({ objectId: pendingObjectId,
+            revision: pendingRevision, journalId,
+            ciphertextPutMayHaveCommitted: true, ciphertextReadbackVerified: false,
+            retrySafe: false, renameMoveFinalized: false });
+          throw error;
+        }
+        if (composed && archiveAttempted) {
+          const error = new Error("ZK_CLIENT_RENAME_MOVE_ARCHIVE_UNCERTAIN");
+          error.code = error.message;
+          error.outcome = Object.freeze({ objectId: pendingObjectId,
+            revision: pendingRevision, journalId, archiveMayHaveCommitted: true,
+            ciphertextPutMayHaveCommitted: false,
+            retrySafe: false, renameMoveFinalized: false });
+          throw error;
+        }
+        deny();
+      }
       finally {
         oldCiphertext?.fill(0);
         oldPlain?.data?.fill(0);

@@ -75,7 +75,11 @@ function indexedDb() {
   } };
 }
 
-test("rename/move uses witnessed catalog historical GET, fresh AEAD/CEK and signed CAS PUT; old archive remains", async (t) => {
+for (const mode of ["committed", "post-commit-read-fail", "forged-catalog-receipt",
+  "post-put-read-fail"]) test(
+  "rename/move uses witnessed catalog historical GET and signed CAS PUT; "
+    + mode,
+  async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-client-move-"));
   const state = await fixture.createInitialState(2);
   const manifest = state.headManifest, scope = state.scope, now = 1100;
@@ -163,9 +167,14 @@ test("rename/move uses witnessed catalog historical GET, fresh AEAD/CEK and sign
   });
   const origin = "http://127.0.0.1:" + server.address().port;
   let active = true, csrf = "csrf-a", lostPut = false, lostCatalogAck = false;
+  let forgeCatalogReceipt = false, failReadAfterPut = false;
+  let failReadAfterPutThreshold = Number.MAX_SAFE_INTEGER;
   let switchDuringGet = null, catalogCommits = 0;
   const fetchImpl = async (url, options) => {
     if (!active || csrf !== "csrf-a") throw Error("session switched");
+    if (failReadAfterPut && url.endsWith("/content/read")
+      && puts > failReadAfterPutThreshold)
+      throw Error("signed GET failed after accepted ciphertext PUT");
     const response = await fetch(url, { ...options,
       headers: { ...options.headers, "x-session": "yes", "x-csrf-token": csrf } });
     if (switchDuringGet && url.endsWith("/content/read")) {
@@ -179,6 +188,14 @@ test("rename/move uses witnessed catalog historical GET, fresh AEAD/CEK and sign
     }
     if (url.endsWith("/catalog/commit")) {
       catalogCommits++;
+      if (forgeCatalogReceipt) {
+        const forged = await response.json();
+        return new Response(JSON.stringify({ ...forged,
+          authorityProofBase64: b64(crypto.randomBytes(64)) }), {
+          status: response.status,
+          headers: { "content-type": "application/json" },
+        });
+      }
       if (lostCatalogAck) {
         await response.arrayBuffer();
         lostCatalogAck = false;
@@ -308,8 +325,13 @@ test("rename/move uses witnessed catalog historical GET, fresh AEAD/CEK and sign
     false, ["encrypt", "decrypt"]);
   const archiveRecords = new Map();
   let failArchiveWrite = false, corruptArchiveRead = false, failJournalWrite = false;
+  let forgeReceipt = false;
   const archive = {
     async write({ metadata, objectRevision, ciphertext, ciphertextDigest, cek }) {
+      assert.ok([...intents.values()].some((intent) => intent.body.writes.some((write) =>
+        write.objectId === metadata.object_id && write.revision === objectRevision
+        && write.ciphertextDigest === b64(ciphertextDigest))),
+      "signed durable intent must precede first CEK escrow side effect");
       if (failArchiveWrite) throw Error("archive unavailable");
       assert.equal(metadata.object_id, sourceId);
       assert.equal(objectRevision, 2);
@@ -320,7 +342,7 @@ test("rename/move uses witnessed catalog historical GET, fresh AEAD/CEK and sign
         name: "AES-GCM", iv, additionalData: aad }, archiveKey, cek));
       const id = b64(crypto.randomBytes(16));
       archiveRecords.set(id, { iv, aad, sealed });
-      return id;
+      return forgeReceipt ? "forged-invalid-receipt" : id;
     },
     async read({ receiptId, metadata, objectRevision, ciphertextDigest }) {
       assert.equal(objectRevision, 2);
@@ -370,7 +392,27 @@ test("rename/move uses witnessed catalog historical GET, fresh AEAD/CEK and sign
   const composed = async () => Object.assign(realm({}), options, {
     catalogWriter: await writerFactory(), metadataKey, cekArchive: archive,
   });
-  const noPutBefore = puts;
+  let noPutBefore = puts;
+  for (const unsafe of [
+    { origin: "http://localhost:" + server.address().port + "/" },
+    { origin: origin + "/zk-1/v1/content/put" },
+  ]) {
+    await assert.rejects(runtime.RootarkZk1ClientRenameMove.renameOrMove(
+      Object.assign(realm({}), options, unsafe)), /ZK_CLIENT_RENAME_MOVE_DENIED/,
+    "cross-origin and path injection denied without an HTTP PUT");
+    assert.equal(puts, noPutBefore);
+  }
+  for (const unsafe of [
+    { nowSeconds: () => now - 100 },
+    { fetchImpl: (url, request) => fetch(url, request) },
+  ]) {
+    await assert.rejects(runtime.RootarkZk1ClientRenameMove.renameOrMove(
+      Object.assign(realm({}), options, unsafe)), /ZK_CLIENT_RENAME_MOVE_DENIED/,
+    "expired signed authorization and unauthenticated HTTP requests are rejected");
+  }
+  // Unauthorized/expired requests may reach the route, but cannot commit a
+  // revision. The valid CAS below must still succeed from predecessor 1.
+  noPutBefore = puts;
   await assert.rejects(runtime.RootarkZk1ClientRenameMove.renameOrMove(Object.assign(
     realm({}), options, { sourceMetadata: realm({ ...sourceMetadata,
       version_id: b64(crypto.randomBytes(16)), epoch: ownerHead.epoch + 1 }) })),
@@ -394,25 +436,93 @@ test("rename/move uses witnessed catalog historical GET, fresh AEAD/CEK and sign
   /ZK_CLIENT_RENAME_MOVE_DENIED/, "revoked or edited owner grant refused");
   assert.equal(puts, noPutBefore);
   failArchiveWrite = true;
+  const intentBeforeArchiveFailure = intents.size;
   await assert.rejects(runtime.RootarkZk1ClientRenameMove.renameOrMoveCommitted(await composed()),
-    /ZK_CLIENT_RENAME_MOVE_DENIED/, "archive write must precede PUT");
+    (error) => error.code === "ZK_CLIENT_RENAME_MOVE_ARCHIVE_UNCERTAIN"
+      && error.outcome.retrySafe === false
+      && intents.has(error.outcome.journalId), "uncertain archive retains prior signed intent");
   assert.equal(puts, noPutBefore);
+  assert.equal(intents.size, intentBeforeArchiveFailure + 1);
   failArchiveWrite = false;
   corruptArchiveRead = true;
   await assert.rejects(runtime.RootarkZk1ClientRenameMove.renameOrMoveCommitted(await composed()),
-    /ZK_CLIENT_RENAME_MOVE_DENIED/, "archive ACK with mismatching recovered CEK denied");
+    /ZK_CLIENT_RENAME_MOVE_ARCHIVE_UNCERTAIN/,
+    "archive ACK with mismatching recovered CEK denied");
   assert.equal(puts, noPutBefore);
   corruptArchiveRead = false;
+  forgeReceipt = true;
+  await assert.rejects(runtime.RootarkZk1ClientRenameMove.renameOrMoveCommitted(await composed()),
+    /ZK_CLIENT_RENAME_MOVE_/, "forged archive receipt denied before PUT");
+  assert.equal(puts, noPutBefore);
+  forgeReceipt = false;
   failJournalWrite = true;
+  const archivesBeforeRejectedJournal = archiveRecords.size;
   await assert.rejects(runtime.RootarkZk1ClientRenameMove.renameOrMoveCommitted(await composed()),
     /ZK_CLIENT_RENAME_MOVE_DENIED/, "missing durable intent must precede PUT");
   assert.equal(puts, noPutBefore);
+  assert.equal(archiveRecords.size, archivesBeforeRejectedJournal,
+    "failed durable journal must never create external CEK escrow");
   failJournalWrite = false;
   const probeWriter = await writerFactory();
   assert.equal((await probeWriter.readAll()).rows.length, 1);
-  lostPut = true;
-  lostCatalogAck = true;
-  const result = await runtime.RootarkZk1ClientRenameMove.renameOrMoveCommitted(await composed());
+  lostPut = mode !== "post-put-read-fail";
+  lostCatalogAck = mode !== "post-put-read-fail" && mode !== "forged-catalog-receipt";
+  forgeCatalogReceipt = mode === "forged-catalog-receipt";
+  failReadAfterPut = mode === "post-put-read-fail";
+  failReadAfterPutThreshold = puts;
+  const pendingBeforeCommit = intents.size;
+  const committedInput = await composed();
+  if (mode === "post-put-read-fail") {
+    let pendingJournalId = null;
+    await assert.rejects(
+      runtime.RootarkZk1ClientRenameMove.renameOrMoveCommitted(committedInput), (error) => {
+        assert.equal(error.code, "ZK_CLIENT_RENAME_MOVE_PUT_UNCERTAIN");
+        assert.equal(error.outcome.retrySafe, false);
+        assert.equal(error.outcome.ciphertextPutMayHaveCommitted, true);
+        assert.equal(error.outcome.revision, 2);
+        assert.ok(intents.has(error.outcome.journalId));
+        pendingJournalId = error.outcome.journalId;
+        return true;
+      }, "a failed signed GET after PUT must retain the journal and prohibit retries");
+    failReadAfterPut = false;
+    assert.equal(puts, noPutBefore + 1);
+    assert.equal(catalogCommits, 1, "no catalog commit without complete ciphertext readback");
+    assert.equal(intents.size, pendingBeforeCommit + 1);
+    const plannedDigest = Buffer.from(intents.get(pendingJournalId).body.writes[0]
+      .ciphertextDigest, "base64url");
+    const signed = await rawSigner("get", sourceId, 2, plannedDigest);
+    assert.equal((await send("/zk-1/v1/content/read", signed)).status, 200,
+      "remote immutable revision survived the failed client GET");
+    return;
+  }
+  if (mode === "post-commit-read-fail") {
+    const writer = committedInput.catalogWriter;
+    let reads = 0;
+    committedInput.catalogWriter = { ...writer, async readAll() {
+      if (++reads === 2) throw Error("post-CAS signed read unavailable");
+      return writer.readAll();
+    } };
+    await assert.rejects(
+      runtime.RootarkZk1ClientRenameMove.renameOrMoveCommitted(committedInput), (error) => {
+        assert.equal(error.code, "ZK_CLIENT_RENAME_MOVE_COMMIT_UNCERTAIN");
+        assert.equal(error.outcome.retrySafe, false);
+        assert.equal(error.outcome.revision, 2);
+        assert.equal(error.outcome.signedCatalogReadbackVerified, false);
+        assert.match(error.outcome.journalId, /^[A-Za-z0-9_-]{43}$/);
+        return true;
+      }, "a committed CAS with lost final readback preserves its reconciliation journal");
+    assert.equal(sequence, 2, "the server and external authority really committed");
+    assert.equal(catalogCommits, 2, "catalog commit must not retry");
+    assert.equal(puts, noPutBefore + 1, "ciphertext PUT must not retry");
+    assert.equal(intents.size, pendingBeforeCommit + 1, "journal survives uncertain commit");
+    const [journalId] = [...intents.keys()].filter((id) => ![...intents.keys()]
+      .slice(0, pendingBeforeCommit).includes(id));
+    assert.equal(await (await writerFactory()).confirmPendingIntent(journalId), true,
+      "explicit fresh authority/ciphertext proof recovers lost post-commit readback");
+    assert.equal(intents.size, pendingBeforeCommit);
+    return;
+  }
+  const result = await runtime.RootarkZk1ClientRenameMove.renameOrMoveCommitted(committedInput);
   lostPut = false;
   assert.equal(result.revision, 2);
   assert.equal(result.lostPutAckReconciled, true);
@@ -427,8 +537,9 @@ test("rename/move uses witnessed catalog historical GET, fresh AEAD/CEK and sign
   assert.equal(result.archivePhysicalDurabilityProven, false);
   assert.equal(result.durableExternalCommitVerified, false);
   assert.equal(result.authorizesCutover, false);
-  assert.equal(intents.size, 0, "signed catalog journal removed after authoritative readback");
-  assert.equal(catalogCommits, 2, "initial commit plus one uncertain CAS, never a retry");
+  assert.equal(intents.size, pendingBeforeCommit,
+    "successful commit removes only its own intent after independent confirmation");
+  assert.equal(catalogCommits, 2, "initial commit plus one signed CAS, never a retry");
   assert.equal(archiveRecords.size, 3, "archive precedes every attempted PUT");
   assert.notEqual(result.destinationCek, originalCek, "fresh CEK for each version");
   assert.equal(puts, noPutBefore + 1, "uncertain ACK must not retry PUT");
