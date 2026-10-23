@@ -517,7 +517,12 @@
         const sequence = outOfBand.sequence;
         const digest = b64(from64(outOfBand.digest, 32));
         if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence > 128) deny();
-        const live = () => input.assertLive();
+        const live = () => {
+          // The session fence is synchronous: never treat a pending Promise
+          // as a successful check while removing a committed journal.
+          const check = input.assertLive();
+          if (check === false || (check && typeof check.then === "function")) deny();
+        };
         live();
         const snapshot = await writer.readAll();
         live();
@@ -581,7 +586,122 @@
         opened?.data?.fill(0);
       }
     }
+    // Recovery only AFTER a RESTORE catalog CAS is committed. Unlike a trash
+    // reconciliation, both the old file and its authenticated tombstone must
+    // be proven before accepting the newly encrypted restored file. In-memory
+    // keys/ACKs may be gone; this uses only the durable signed journal ID and
+    // fresh independently verified CAS + exact protected historical GETs.
+    async function reconcileCommittedRestore(input) {
+      const ciphertexts = [];
+      const plains = [];
+      try {
+        exact(input, ["catalogWriter", "journalId", "pinnedCatalogHead",
+          "originalMetadata", "sourceMetadata", "destinationMetadata",
+          "originalRevision", "sourceRevision", "destinationRevision",
+          "readArchivedCek", "assertLive"]);
+        const writer = input.catalogWriter;
+        if (typeof writer?.readAll !== "function"
+          || typeof writer?.readVerifiedCiphertext !== "function"
+          || typeof writer?.confirmPendingIntent !== "function"
+          || typeof input.readArchivedCek !== "function"
+          || typeof input.assertLive !== "function") deny();
+        const journalId = b64(from64(input.journalId, 32));
+        const original = metadata(input.originalMetadata);
+        const source = metadata(input.sourceMetadata);
+        const restored = metadata(input.destinationMetadata);
+        const originalRevision = input.originalRevision;
+        const sourceRevision = input.sourceRevision;
+        const destinationRevision = input.destinationRevision;
+        if (!Number.isSafeInteger(originalRevision) || originalRevision < 1
+          || originalRevision >= Number.MAX_SAFE_INTEGER - 1
+          || sourceRevision !== originalRevision + 1
+          || destinationRevision !== sourceRevision + 1
+          || original.object_id !== source.object_id
+          || source.object_id !== restored.object_id
+          || SCOPE.some((field) => original[field] !== source[field]
+            || source[field] !== restored[field])
+          || source.parent_version_id !== original.version_id
+          || restored.parent_version_id !== source.version_id
+          || original.epoch > source.epoch || source.epoch > restored.epoch) deny();
+        const outside = exact(input.pinnedCatalogHead, ["sequence", "digest"]);
+        const headSequence = outside.sequence;
+        const headDigest = from64(outside.digest, 32);
+        if (!Number.isSafeInteger(headSequence)
+          || headSequence < 1 || headSequence > 128) deny();
+        const live = () => {
+          const check = input.assertLive();
+          if (check === false || (check && typeof check.then === "function")) deny();
+        };
+        live();
+        const snapshot = await writer.readAll();
+        live();
+        if (snapshot?.head?.sequence !== headSequence
+          || !equal(bytes(snapshot.head.digest, 32), headDigest)
+          || !Array.isArray(snapshot.rows)) deny();
+        const versions = [originalRevision, sourceRevision, destinationRevision];
+        const metas = [original, source, restored];
+        const rows = versions.map((revision, index) => {
+          const matches = snapshot.rows.filter((row) => row.object_id === source.object_id
+            && row.revision === revision);
+          if (matches.length !== 1 || matches[0].epoch !== metas[index].epoch) deny();
+          return matches[0];
+        });
+        if (snapshot.rows.some((row) => row.object_id === source.object_id
+          && row.revision > destinationRevision)) deny();
+        const scope = Object.fromEntries(SCOPE.map((field) => [field, source[field]]));
+        const keys = [];
+        for (let i = 0; i < 3; ++i) {
+          const keyValue = await input.readArchivedCek({ ...scope,
+            objectId: source.object_id, revision: versions[i],
+            versionId: metas[i].version_id, nonce: journalId });
+          keys.push(cek(keyValue));
+          live();
+        }
+        for (let i = 0; i < 3; ++i) {
+          const read = await writer.readVerifiedCiphertext(snapshot,
+            source.object_id, versions[i]);
+          live();
+          if (read.objectId !== source.object_id
+            || read.revision !== versions[i] || read.epoch !== metas[i].epoch) deny();
+          const wire = from64(read.ciphertextBase64, 16, MAX);
+          ciphertexts.push(wire);
+          if (!equal(await sha(wire), bytes(rows[i].ciphertext_digest, 32))) deny();
+        }
+        const expectedOriginal = predecessor(originalRevision,
+          b64(bytes(rows[0].ciphertext_digest, 32)), original.version_id);
+        await openTombstone(keys[1], source, ciphertexts[1], expectedOriginal);
+        live();
+        const first = await content.decryptFile({ cek: keys[0],
+          metadata: original, envelopeBytes: ciphertexts[0] });
+        plains.push(first.data);
+        live();
+        const last = await content.decryptFile({ cek: keys[2],
+          metadata: restored, envelopeBytes: ciphertexts[2] });
+        plains.push(last.data);
+        live();
+        if (first.authorizesRelease === true || last.authorizesRelease === true
+          || first.name !== last.name || first.mediaType !== last.mediaType
+          || (first.parentFolderId ?? null) !== (last.parentFolderId ?? null)
+          || !equal(first.data, last.data)) deny();
+        // Must revalidate signed journal signer, exact successor row, *all*
+        // previous immutable rows, independent CAS/witness, and remote GETs
+        // before removing the pending journal. Never repeat PUT/CAS.
+        if (await writer.confirmPendingIntent(journalId) !== true) deny();
+        live();
+        return Object.freeze({ objectId: source.object_id,
+          revision: destinationRevision, state: "file", restoredAfterTombstone: true,
+          signedCatalogCommitVerified: true, archivedCeksReadbackVerified: true,
+          historicalCiphertextPreserved: true, ciphertextReadbackVerified: true,
+          permanentDeletionAuthorized: false, productionDurabilityProven: false,
+          authorizesProductionIo: false });
+      } catch (_) { deny(); }
+      finally {
+        for (const wire of ciphertexts) wire.fill(0);
+        for (const plain of plains) plain.fill(0);
+      }
+    }
     return Object.freeze({ trash: (input) => change({ ...input, action: "trash" }),
       restore: (input) => change({ ...input, action: "restore" }),
-      reconcileCommittedTrash, permanentDelete: noPermanentDelete });
+      reconcileCommittedTrash, reconcileCommittedRestore,
+      permanentDelete: noPermanentDelete });
   }));

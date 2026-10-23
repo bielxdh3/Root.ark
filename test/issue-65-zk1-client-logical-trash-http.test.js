@@ -880,20 +880,82 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
   assert.equal(independentlyObserved5.state, "trashed",
     "second owner device sees the same committed tombstone after reconnect");
 
+  // A second restore commits on disk/CAS, but the final independent authority
+  // receipt vanishes. The browser was closed: only signed journal + archived
+  // CEKs and historical protected GETs survive to the new browser instance.
+  const restore5 = Object.assign(realm({}), restoreBase, {
+    catalog: await openCatalog(5, badFinalProof.outcome.catalogDigestBase64),
+    sourceIndex: 4, sourceMetadata: realm(lastTrash.metadata),
+    sourceCek: await operableCek(lastTrash.cek),
+    originalIndex: 3, originalMetadata: realm(restored.metadata),
+    originalCek: await operableCek(archived.get(4).cek),
+    catalogWriter: makeWriter(5, Buffer.from(badFinalProof.outcome.catalogDigestBase64, "base64url")),
+    catalogProof: async (challenge) => realm({ signatureBase64:
+      challenge.purpose === "precommit"
+        ? sign(catalogPrefix, challenge, casKey.privateKey)
+        : b64(crypto.randomBytes(64)) }),
+  });
+  let restoreAckLost;
+  try { await trash.restore(restore5); } catch (error) { restoreAckLost = error; }
+  assert.equal(restoreAckLost?.code, "ZK_LOGICAL_TRASH_COMMIT_UNCERTAIN");
+  assert.equal(restoreAckLost.outcome.signedCatalogReadbackVerified, true);
+  assert.equal(restoreAckLost.outcome.logicalStateFinalized, false);
+  assert.equal(sequence, 6, "the restore's signed CAS has already committed");
+  const strandedRestore = writerJournals.at(-1), restored6 = archived.get(6);
+  const resumeRestore = (overrides = {}) => Object.assign(realm({}), {
+    catalogWriter: makeWriter(5, Buffer.from(badFinalProof.outcome.catalogDigestBase64,
+      "base64url"), strandedRestore),
+    journalId: restoreAckLost.outcome.journalId,
+    pinnedCatalogHead: realm({ sequence: 6,
+      digest: restoreAckLost.outcome.catalogDigestBase64 }),
+    originalMetadata: realm(restored.metadata), sourceMetadata: realm(lastTrash.metadata),
+    destinationMetadata: realm(restored6.metadata),
+    originalRevision: 4, sourceRevision: 5, destinationRevision: 6,
+    readArchivedCek, assertLive, ...overrides,
+  });
+  const beforeRestoredPuts = puts;
+  await assert.rejects(trash.reconcileCommittedRestore(resumeRestore({
+    destinationMetadata: realm({ ...restored6.metadata,
+      parent_version_id: restored.metadata.version_id }),
+  })), /ZK_LOGICAL_TRASH_DENIED/,
+  "forged restore ancestry cannot clear signed journal");
+  assert.equal(strandedRestore.size, 1);
+  await assert.rejects(trash.reconcileCommittedRestore(resumeRestore({
+    pinnedCatalogHead: realm({ sequence: 5,
+      digest: badFinalProof.outcome.catalogDigestBase64 }),
+  })), /ZK_LOGICAL_TRASH_DENIED/, "old CAS floor denies rollback");
+  assert.equal(strandedRestore.size, 1);
+  await assert.rejects(trash.reconcileCommittedRestore(resumeRestore({
+    readArchivedCek: async (selection) => selection.revision === 6
+      ? file.generateFileCek() : readArchivedCek(selection),
+  })), /ZK_LOGICAL_TRASH_DENIED/, "wrong recovered destination CEK rejected");
+  assert.equal(strandedRestore.size, 1);
+  const reconciledRestore = await trash.reconcileCommittedRestore(resumeRestore());
+  assert.equal(reconciledRestore.state, "file");
+  assert.equal(reconciledRestore.restoredAfterTombstone, true);
+  assert.equal(reconciledRestore.revision, 6);
+  assert.equal(reconciledRestore.signedCatalogCommitVerified, true);
+  assert.equal(reconciledRestore.productionDurabilityProven, false);
+  assert.equal(strandedRestore.size, 0, "signed pending restore cleared on reconnect");
+  assert.equal(puts, beforeRestoredPuts, "reconnect must not retry immutable PUT");
+  assert.equal(sequence, 6, "reconnect must not retry CAS");
+  const independentRestore6 = await secondInspection(6,
+    restoreAckLost.outcome.catalogDigestBase64,
+    [...inspectedMetadata, restored.metadata, lastTrash.metadata, restored6.metadata]);
+  assert.equal(independentRestore6.state, "file");
+  assert.equal(independentRestore6.restoredAfterTombstone, true);
+
   // Real HTTP PUT commits the next immutable version, but its subsequent GET
   // confirmation disappears. The client must report an uncertain I/O result,
   // not DENIED (which could tempt the caller to retry against a stale head).
-  const snapshot5 = await openCatalog(badFinalProof.outcome.catalogSequence,
-    badFinalProof.outcome.catalogDigestBase64);
-  const saved5 = archived.get(5);
-  assert.equal(snapshot5.entries.length, 5);
-  const uncertainRestore = Object.assign(realm({}), restoreBase, {
-    catalog: snapshot5, sourceIndex: 4, sourceMetadata: saved5.metadata,
-    sourceCek: await operableCek(saved5.cek), originalIndex: 3,
-    originalMetadata: restored.metadata,
-    originalCek: await operableCek(archived.get(4).cek),
-    catalogWriter: makeWriter(5,
-      Buffer.from(badFinalProof.outcome.catalogDigestBase64, "base64url")),
+  const snapshot6 = await openCatalog(6,
+    restoreAckLost.outcome.catalogDigestBase64);
+  assert.equal(snapshot6.entries.length, 6);
+  const uncertainTrash = Object.assign(realm({}), base, {
+    catalog: snapshot6, sourceIndex: 5, sourceMetadata: realm(restored6.metadata),
+    sourceCek: await operableCek(restored6.cek),
+    catalogWriter: makeWriter(6,
+      Buffer.from(restoreAckLost.outcome.catalogDigestBase64, "base64url")),
     fetchImpl: async (url, options) => {
       const response = await fetchImpl(url, options);
       if (url.endsWith("/content/read")) {
@@ -905,7 +967,7 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
   });
   const beforeLostReadback = puts;
   let readbackError;
-  try { await trash.restore(uncertainRestore); } catch (error) { readbackError = error; }
+  try { await trash.trash(uncertainTrash); } catch (error) { readbackError = error; }
   assert.equal(readbackError?.code, "ZK_LOGICAL_TRASH_PUT_UNCERTAIN");
   assert.equal(readbackError.outcome.phase, "ciphertext_readback");
   assert.equal(readbackError.outcome.retrySafe, false);
@@ -913,14 +975,14 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
   assert.equal(readbackError.outcome.ciphertextReadbackVerified, false);
   assert.equal(readbackError.outcome.logicalStateFinalized, false);
   assert.equal(puts, beforeLostReadback + 1, "a real HTTP PUT already committed");
-  assert.equal(sequence, badFinalProof.outcome.catalogSequence,
+  assert.equal(sequence, restoreAckLost.outcome.catalogSequence,
     "no catalog CAS can occur without ciphertext GET confirmation");
   assert.equal(writerJournals.at(-1).size, 1,
     "pre-PUT journal survives outage and cannot be silently retried");
-  const stored6 = archived.get(6).bytes;
-  const actual6 = await send("/zk-1/v1/content/read", await rawSigner("get",
-    sourceId, 6, hash(stored6)));
-  assert.equal(actual6.status, 200,
-    "server persisted revision 6 despite missing browser readback");
-  assert.equal(actual6.result.ciphertextBase64, b64(stored6));
+  const stored7 = archived.get(7).bytes;
+  const actual7 = await send("/zk-1/v1/content/read", await rawSigner("get",
+    sourceId, 7, hash(stored7)));
+  assert.equal(actual7.status, 200,
+    "server persisted revision 7 despite missing browser readback");
+  assert.equal(actual7.result.ciphertextBase64, b64(stored7));
 });
