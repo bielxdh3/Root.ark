@@ -11358,6 +11358,14 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
   }
 
   const target = getVersionFilePath(folder, name, versionNumber);
+  // The restore-provider suppression policy is an access-control boundary.
+  // Deny a suppressed storedAs alias before inspecting optional legacy
+  // timestamps: missing history metadata cannot turn a forbidden 403 into a
+  // distinguishable 409, even when the current file itself is readable.
+  if (target?.version?.storedAs
+    && isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) {
+    return res.status(403).json({ error: "Acesso negado a esta versao" });
+  }
   // Cloud cache rehydration gives the local copy a fresh filesystem mtime.
   // Historical Last-Modified must instead derive from immutable version data,
   // or fail closed when that legacy metadata was never persisted.
@@ -11367,7 +11375,6 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
     return res.status(409).json({ error: "Metadados historicos da versao indisponiveis" });
   }
   if (target?.version?.storedAs) {
-    if (isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
     await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads", () => !isFileInTrash(folder.id, name), name);
   }
   if (!refreshAuthenticatedUser(req, res)) return;

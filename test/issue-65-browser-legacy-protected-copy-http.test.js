@@ -158,7 +158,8 @@ test("plain browser UMD modules compose legacy encrypted copy without Node requi
   const f = await fixture(t);
   const context = vm.createContext({
     crypto: crypto.webcrypto, TextEncoder, TextDecoder, URL, btoa, atob,
-    Uint8Array, ArrayBuffer, location: { origin: f.origin },
+    Uint8Array, ArrayBuffer, AbortController, setTimeout, clearTimeout,
+    location: { origin: f.origin },
   });
   for (const moduleName of [
     "rootark-dev-vault-migration.js",
