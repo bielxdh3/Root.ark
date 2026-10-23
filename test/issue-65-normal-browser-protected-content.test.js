@@ -41,7 +41,7 @@ const scriptNames = ["rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-r
   "rootark-zk1-browser-recovery-http", "rootark-zk1-recoverable-workspace",
   "rootark-zk1-normal-browser-lab-ui", "rootark-zk1-portable-recovery-lab-ui",
   "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow",
-  "rootark-zk1-v2-device-approval"];
+  "rootark-zk1-v2-device-approval", "rootark-zk1-keyring-portable-archive"];
 
 test("production static paths cannot disclose the opt-in normal browser laboratory", async (t) => {
   const app = express();
@@ -919,6 +919,13 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
     manifestDigest: opts.pinnedCurrentHead.digest, issuedAt: opts.nowSeconds + 1,
     previous: trustedGenesis,
   });
+  const archiveHistory = await ownerHistory.signOwnerCheckpoint({
+    scope: historicalScope, signerKey: ownerPrivate,
+    signerPublicKey: opts.ownerPublicKey, signerKeyId: ownerHistoryKeyId,
+    deviceId: opts.signedDeviceGrant.device_id, revision: opts.pinnedCurrentHead.revision,
+    manifestDigest: opts.pinnedCurrentHead.digest, issuedAt: opts.nowSeconds,
+    previous: null,
+  });
   const session = jwt.sign({ username: "owner", sessionVersion: 0 }, secret,
     { expiresIn: "10m" });
   const app = express();
@@ -964,6 +971,7 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
     head: { revision: opts.pinnedCurrentHead.revision,
       digest: b64(opts.pinnedCurrentHead.digest), epoch: opts.pinnedCurrentHead.epoch },
     ownerHistoryChain: [genesisCheckpoint, successorCheckpoint],
+    archiveHistory, archiveOwnerPrivate: b64(f.ownerPrivate.export({ type: "pkcs8", format: "der" })),
   };
   app.get("/workspace-probe.js", (_req, res) => res.type("application/javascript")
     .send(`window.addEventListener("load",async()=>{
@@ -1047,6 +1055,120 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
 	          || field("private").files.length || field("file").files.length)
 	          throw Error("RECOVERABLE_WORKSPACE_FAILED:"+field("status").textContent);
 	        holder.fill(0);
+        // No owner keys, holder secret, selected file plaintext or recovered
+        // plaintext crosses the application HTTP endpoint. Capture DOWNLOADS
+        // (blob URLs) without ever permitting a browser file-system write.
+        let archiveDownloads=[];
+        const originalCreate=URL.createObjectURL;
+        const archiveBlobs=new Map();
+        URL.createObjectURL=function(blob){const url=originalCreate.call(URL,blob);
+          archiveBlobs.set(url,blob);return url;};
+        HTMLAnchorElement.prototype.click=function(){
+          if(!this.download || !this.href.startsWith("blob:"))throw Error("UNSAFE_KEYRING_DOWNLOAD");
+          archiveDownloads.push({name:this.download,href:this.href});};
+        const archiveHolder=crypto.getRandomValues(new Uint8Array(32));
+        const storageView=async()=>JSON.stringify({
+          local:Object.keys(localStorage).sort().map(k=>[k,localStorage.getItem(k)]),
+          session:Object.keys(sessionStorage).sort().map(k=>[k,sessionStorage.getItem(k)]),
+          databases:(await indexedDB.databases()).map(db=>db.name).sort()});
+        const beforeArchiveStorage=await storageView();
+        setFile("history",new TextEncoder().encode(JSON.stringify(values.archiveHistory)));
+        field("owner-device").value=values.grant.device_id;
+        field("owner-signer").value=${JSON.stringify(b64(ownerHistoryKeyId))};
+        field("archive-opt-in").checked=true;
+        setFile("archive-owner-private",decode(values.archiveOwnerPrivate));
+        setFile("secret",archiveHolder);
+        const select=new DataTransfer();
+        select.items.add(new File(["offline alpha"],"alpha.txt",{type:"text/plain"}));
+        select.items.add(new File(["offline beta"],"beta.txt",{type:"text/plain"}));
+        field("archive-files").files=select.files;
+        document.querySelector('[data-zk1-action="archive-create"]').click();
+        await wait(()=>field("status").textContent.includes("cifrado e assinado localmente")
+          || field("status").textContent.includes("Operação recusada"));
+        if(!field("status").textContent.includes("cifrado e assinado localmente")
+          || archiveDownloads.length!==2 || field("archive-owner-private").files.length
+          || field("archive-files").files.length || field("secret").files.length)
+          throw Error("KEYRING_CREATE_DENIED:"+field("status").textContent);
+        const archiveArtifact=archiveDownloads.find(x=>x.name.endsWith(".json"));
+        const hashArtifact=archiveDownloads.find(x=>x.name.endsWith(".sha256.txt"));
+        if(!archiveArtifact||!hashArtifact)throw Error("KEYRING_EXPORTS_MISSING");
+        const exportedArchive=await archiveBlobs.get(archiveArtifact.href).text();
+        const externalHash=await archiveBlobs.get(hashArtifact.href).text();
+        archiveDownloads=[];
+        field("archive-sha").value=externalHash;
+        setFile("archive-json",new TextEncoder().encode(exportedArchive));
+        setFile("secret",archiveHolder);
+        document.querySelector('[data-zk1-action="archive-recover"]').click();
+        await wait(()=>field("status").textContent.includes("arquivo(s) baixados localmente")
+          || field("status").textContent.includes("Operação recusada"));
+        if(!field("status").textContent.includes("2 arquivo(s) baixados localmente")
+          || archiveDownloads.length!==2 || field("secret").files.length
+          || field("archive-json").files.length)throw Error("KEYRING_RESTORE_DENIED:"+field("status").textContent);
+        const contents=await Promise.all(archiveDownloads.map(async x=>({name:x.name,
+          data:await archiveBlobs.get(x.href).text()})));
+        if(!contents.find(x=>x.name==="alpha.txt"&&x.data==="offline alpha")
+          || !contents.find(x=>x.name==="beta.txt"&&x.data==="offline beta"))
+          throw Error("KEYRING_LOCAL_CONTENT_MISMATCH");
+        archiveDownloads=[];
+        field("archive-sha").value=values.ownerHash;
+        setFile("archive-json",new TextEncoder().encode(exportedArchive));
+        setFile("secret",archiveHolder);
+        document.querySelector('[data-zk1-action="archive-recover"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        if(archiveDownloads.length)throw Error("KEYRING_WRONG_HASH_LEAK");
+        // Pinning the exact hostile archive hash cannot bypass Ed25519 owner
+        // signature checks even when that hash is supplied as a valid digest.
+        const forged=JSON.parse(exportedArchive);
+        forged.signature=btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(64))))
+          .replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/g,"");
+        const forgedCanonical=new TextEncoder().encode(JSON.stringify(forged));
+        const forgedDigest=new Uint8Array(await crypto.subtle.digest("SHA-256",forgedCanonical));
+        field("archive-sha").value=btoa(String.fromCharCode(...forgedDigest))
+          .replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/g,"");
+        setFile("archive-json",forgedCanonical);
+        setFile("secret",archiveHolder);
+        document.querySelector('[data-zk1-action="archive-recover"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        if(archiveDownloads.length)throw Error("KEYRING_UNSIGNED_ARCHIVE_LEAK");
+        field("archive-sha").value=externalHash;
+        setFile("archive-json",new TextEncoder().encode(exportedArchive));
+        setFile("secret",archiveHolder);
+        setFile("grant",new TextEncoder().encode(JSON.stringify({
+          ...values.grant,revoked_at_epoch:values.head.epoch})));
+        document.querySelector('[data-zk1-action="archive-recover"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        if(archiveDownloads.length)throw Error("KEYRING_REVOKED_GRANT_LEAK");
+        setFile("grant",new TextEncoder().encode(JSON.stringify({
+          ...values.grant,keyring_id:values.ownerHash.slice(0,22)})));
+        setFile("archive-json",new TextEncoder().encode(exportedArchive));
+        setFile("secret",archiveHolder);
+        document.querySelector('[data-zk1-action="archive-recover"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        if(archiveDownloads.length)throw Error("KEYRING_CROSS_SCOPE_LEAK");
+        setFile("grant",new TextEncoder().encode(JSON.stringify(values.grant)));
+        archiveDownloads=[];
+        field("archive-sha").value=externalHash;
+        setFile("archive-json",new TextEncoder().encode(exportedArchive));
+        setFile("secret",archiveHolder);
+        field("archive-opt-in").checked=false;
+        document.querySelector('[data-zk1-action="archive-recover"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        if(archiveDownloads.length)throw Error("KEYRING_NO_OPTIN_LEAK");
+        field("archive-opt-in").checked=true;
+        setFile("archive-owner-private",decode(values.archiveOwnerPrivate));
+        setFile("secret",archiveHolder);
+        const unsafe=new DataTransfer();
+        unsafe.items.add(new File(["bad path"],"../escape.txt"));
+        field("archive-files").files=unsafe.files;
+        document.querySelector('[data-zk1-action="archive-create"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        if(archiveDownloads.length)throw Error("KEYRING_UNSAFE_NAME_LEAK");
+        if(await storageView()!==beforeArchiveStorage)
+          throw Error("KEYRING_UNINTENDED_BROWSER_PERSISTENCE");
+        archiveHolder.fill(0);
+        URL.createObjectURL=originalCreate;
+        HTMLAnchorElement.prototype.click=originalClick;
+        setFile("history",new TextEncoder().encode(JSON.stringify(values.ownerHistoryChain)));
         field("digest").value=values.ownerHash;
         setFile("private",decode(values.privateDer));
         setFile("file",new TextEncoder().encode("Tampered browser pinned head"));

@@ -17,6 +17,7 @@
     "rootark-zk1-recoverable-workspace",
     "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow",
     "rootark-zk1-v2-device-approval",
+    "rootark-zk1-keyring-portable-archive",
   ];
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const base64 = /^[A-Za-z0-9_-]{43}$/;
@@ -135,6 +136,15 @@
     for (const item of data) text += String.fromCharCode(item);
     return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
   }
+  // Download names are intentionally much narrower than valid encrypted file
+  // metadata. Never interpret paths from a selected file or an imported archive.
+  function localName(value) {
+    if (typeof value !== "string" || value.length < 1 || value.length > 120
+      || value === "." || value === ".." || /[\\/\u0000-\u001f\u007f<>:"|?*]/.test(value)
+      || /[. ]$/.test(value)
+      || /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(value)) fail();
+    return value;
+  }
   function downloadLocal(name, content, type = "application/octet-stream") {
     const blob = new Blob([content], { type });
     const url = URL.createObjectURL(blob);
@@ -180,7 +190,9 @@
         || !window.RootarkZk1NormalBrowserTrustFloor?.provisionOffline
         || !window.RootarkZk1RecoverableWorkspace?.restoreOnNewDevice
         || !window.RootarkZk1LegacyMigrationWorkflow?.openMigrationJournal
-        || !window.RootarkZk1V2DeviceApproval?.verifyImportedApproval) fail();
+        || !window.RootarkZk1V2DeviceApproval?.verifyImportedApproval
+        || !window.RootarkZk1KeyringPortableArchive?.createArchive
+        || !window.RootarkZk1KeyringPortableArchive?.recoverArchive) fail();
     })();
     return loadingScripts;
   }
@@ -239,6 +251,19 @@
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="migrate">Copiar / retomar GET</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="migration-finalize">Verificar checkpoint assinado</button></div>'
       + '</fieldset>'
+      + '<fieldset><legend>Arquivo completo de keyring: 1–12 arquivos, somente offline (DEV)</legend>'
+      + '<p class="muted">Selecione arquivos descartáveis (até 8 MiB somados). '
+      + 'Criação exige chave Ed25519 privada do PROPRIETÁRIO e histórico assinado atual; '
+      + 'a recuperação exige a âncora SHA-256 do arquivo recebida por canal separado. '
+      + 'Sem upload, CEK ou plaintext no servidor. O segredo e o hash devem ficar separados do pacote.</p>'
+      + '<label>Arquivos locais (1–12, máx. 8 MiB somados)<input type="file" multiple data-zk1-field="archive-files"></label>'
+      + '<label>Chave PKCS#8 do proprietário para assinar offline (somente criação)<input type="file" data-zk1-field="archive-owner-private"></label>'
+      + '<label>Arquivo cifrado e assinado (.json, somente recuperação)<input type="file" data-zk1-field="archive-json" accept=".json,application/json"></label>'
+      + '<label>SHA-256 externo do arquivo assinado (base64url, 32 bytes)<input data-zk1-field="archive-sha" maxlength="43" spellcheck="false" autocomplete="off"></label>'
+      + '<label><input type="checkbox" data-zk1-field="archive-opt-in"> Autorizo a operação local sem persistir arquivos recuperados no servidor.</label>'
+      + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="archive-create">Assinar e baixar arquivo cifrado + hash separado</button>'
+      + '<button type="button" class="button button-primary" data-zk1-action="archive-recover">Verificar e baixar 1–12 arquivos locais</button></div>'
+      + '</fieldset>'
       + '</form><p class="muted" data-zk1-field="status" role="status" aria-live="polite">Nenhuma autoridade foi importada.</p>';
     document.body.append(dialog);
     dialog.addEventListener("cancel", (event) => { if (busy) event.preventDefault(); });
@@ -258,13 +283,15 @@
     }
     if (!["provision", "verify-inventory", "upload", "upload-recoverable",
       "restore", "new-secret", "new-device", "import-approval",
-      "migrate", "migration-finalize"].includes(action)) return;
+      "migrate", "migration-finalize", "archive-create", "archive-recover"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
     let privateDer;
     let data;
     let secret;
+    let ownerSigningDer;
+    let archiveFiles;
     try {
       await ensureScripts();
       // Capability is checked again before every user-initiated operation.
@@ -320,6 +347,93 @@
         return;
       }
       const trust = await grantAndOwner();
+      if (action === "archive-create" || action === "archive-recover") {
+        if (field("archive-opt-in")?.checked !== true || !trust.ownerHistoryCheckpoint) fail();
+        if (trust.signedDeviceGrant.revoked_at_epoch !== null) fail();
+        // The runtime's signed grant/history proof is not sufficient to pick a
+        // trust root: independently entered SPKI/head + browser floor are
+        // checked AGAIN on every invocation, without trusting JSON flags.
+        await window.RootarkZk1NormalBrowserTrustFloor.assertCurrent({
+          ownerPublicKey: trust.ownerPublicKey,
+          independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+          pinnedCurrentHead: trust.pinnedCurrentHead,
+          signedDeviceGrant: trust.signedDeviceGrant,
+          ownerHistoryCheckpoint: trust.ownerHistoryCheckpoint,
+          previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
+        });
+        const scope = Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+          .map((name) => [name, trust.signedDeviceGrant[name]]));
+        const archiveCommon = {
+          ownerPublicKey: trust.ownerPublicKey,
+          independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+          pinnedCurrentHead: trust.pinnedCurrentHead, scope,
+          signerKeyId: signerIdFrom64(field("owner-signer").value.trim()),
+          deviceId: field("owner-device").value.trim(),
+          previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
+        };
+        secret = await fileBytes("secret", 32, 32);
+        if (action === "archive-create") {
+          const selections = Array.from(field("archive-files")?.files || []);
+          if (selections.length < 1 || selections.length > 12
+            || selections.some((file) => !file || file.size < 1 || file.size > 8 * 1024 * 1024)
+            || selections.reduce((sum, file) => sum + file.size, 0) > 8 * 1024 * 1024) fail();
+          const checkedNames = selections.map((file) => localName(file.name));
+          if (new Set(checkedNames.map((name) => name.toLowerCase())).size !== selections.length) fail();
+          ownerSigningDer = await fileBytes("archive-owner-private", 1, 8192);
+          const ownerSigningKey = await crypto.subtle.importKey("pkcs8", ownerSigningDer,
+            "Ed25519", false, ["sign"]);
+          // Private key must really match the pinned owner's public key.
+          const probe = crypto.getRandomValues(new Uint8Array(32));
+          const probeSignature = await crypto.subtle.sign("Ed25519", ownerSigningKey, probe);
+          if (!await crypto.subtle.verify("Ed25519", trust.ownerPublicKey, probeSignature, probe)) fail();
+          archiveFiles = [];
+          for (let index = 0; index < selections.length; index++) {
+            const selected = selections[index];
+            const bytes = new Uint8Array(await selected.arrayBuffer());
+            if (bytes.length !== selected.size) fail();
+            archiveFiles.push({ metadata: { ...scope,
+              object_id: randomId(), version_id: randomId(), parent_version_id: null,
+              epoch: trust.pinnedCurrentHead.epoch, kind: "file" },
+              objectRevision: 1, name: checkedNames[index],
+              mediaType: selected.type || "application/octet-stream", data: bytes });
+          }
+          const sealed = await window.RootarkZk1KeyringPortableArchive.createArchive({
+            ...archiveCommon, recoverySecret: secret, ownerSigningKey,
+            files: archiveFiles, signedDeviceGrant: trust.signedDeviceGrant,
+            ownerHistoryCheckpoint: trust.ownerHistoryCheckpoint,
+            issuedAt: Math.floor(Date.now() / 1000),
+          });
+          downloadLocal("rootark-keyring-archive.json", JSON.stringify(sealed.archive), "application/json");
+          downloadLocal("rootark-keyring-archive.sha256.txt", to64(sealed.archiveSha256), "text/plain");
+          status("Arquivo de " + selections.length + " objeto(s) cifrado e assinado localmente. Guarde SHA-256 externamente, separado do arquivo e do segredo. Não é backup de produção.");
+        } else {
+          const archiveFile = await fileBytes("archive-json", 1, 17 * 1024 * 1024);
+          let archive;
+          try { archive = JSON.parse(decoder.decode(archiveFile)); }
+          finally { archiveFile.fill(0); }
+          const recovered = await window.RootarkZk1KeyringPortableArchive.recoverArchive({
+            ...archiveCommon, recoverySecret: secret, archive,
+            independentlyPinnedArchiveSha256: from64(field("archive-sha").value.trim()),
+          });
+          try {
+            if (recovered.files.length < 1 || recovered.files.length > 12
+              || recovered.signedManifestVerified !== true
+              || recovered.independentArchiveHashMatched !== true
+              || recovered.allOwnerSignedRootsVerified !== true
+              || recovered.activeSignedGrantAtPinnedHeadVerified !== true) fail();
+            const names = recovered.files.map((file) => localName(file.name));
+            if (new Set(names.map((name) => name.toLowerCase())).size !== names.length) fail();
+            // Validate all output paths BEFORE creating the first download.
+            for (let index = 0; index < recovered.files.length; index++) {
+              const file = recovered.files[index];
+              downloadLocal(names[index], file.data, file.mediaType || "application/octet-stream");
+            }
+            status("Assinatura, escopo, grant, histórico, todas as raízes e hash externo conferidos. "
+              + recovered.files.length + " arquivo(s) baixados localmente. Revogação online/durabilidade externa não comprovadas.");
+          } finally { for (const file of recovered.files) file.data.fill(0); }
+        }
+        return;
+      }
       if (action === "import-approval") {
         // Never infer owner approval from an unsigned request or server data:
         // current head, owner SPKI/raw pins and grant all arrive independently.
@@ -462,8 +576,11 @@
       privateDer?.fill(0);
       data?.fill(0);
       secret?.fill(0);
+      ownerSigningDer?.fill(0);
+      for (const item of archiveFiles || []) item.data.fill(0);
       // The original File/Blob remains held by the input until explicitly reset.
-      for (const name of ["private", "file", "secret", "bundle", "migration-cek", "migration-proof"]) {
+      for (const name of ["private", "file", "secret", "bundle", "migration-cek", "migration-proof",
+        "archive-files", "archive-owner-private", "archive-json"]) {
         const control = field(name);
         if (control) control.value = "";
       }
