@@ -7,6 +7,7 @@ const z = require("../src/crypto/rootark-zk-1");
 const manifest = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const verify = require("../src/crypto/rootark-zk-recovery-history-v2");
 const enrollment = require("../src/crypto/rootark-zk1-owner-offline-v2-enrollment");
+const commitment = require("../src/crypto/rootark-zk1-offline-commitment-receipt");
 const approval = require("../public/client/rootark-zk1-v2-device-approval");
 const normal = require("../public/client/rootark-zk1-normal-browser-content");
 const fixtures = require("./support/issue-65-recovery-v2-fixtures");
@@ -36,6 +37,25 @@ const newDeviceRequest = async () => {
 test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs only after independently pinned committed head", async () => {
   const state = await fixtures.createInitialState(3);
   const owner = crypto.generateKeyPairSync("ed25519");
+  const witness = crypto.generateKeyPairSync("ed25519");
+  const witnessSpki = b64(crypto.createHash("sha256").update(witness.publicKey.export({
+    format: "der", type: "spki" })).digest());
+  const scope = Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+    .map((name) => [name, b64(state.headManifest[name])]));
+  const signReceipt = (fields, signer = witness.privateKey) => {
+    const source = { schema: commitment.SCHEMA, status: "committed", ...scope,
+      revision: null, digest: null, epoch: null, previous_revision: null,
+      previous_digest: null, operation_id: null, pop_challenge_id: null,
+      request_nonce: null, commit_nonce: null, sequence: null,
+      previous_receipt_sha256: null, issued_at: null, expires_at: null,
+      ...fields };
+    const unsigned = Object.fromEntries(commitment.FIELDS.map((name) => [name, source[name]]));
+    return { ...unsigned, signature: b64(crypto.sign(null,
+      commitment.commitmentSigningBytes(unsigned), signer)) };
+  };
+  const receiptHash = (signed) => crypto.createHash("sha256").update(Buffer.concat([
+    commitment.commitmentSigningBytes(Object.fromEntries(commitment.FIELDS.map(
+      (name) => [name, signed[name]]))), Buffer.from(signed.signature, "base64url")])).digest();
   const ownerRaw = pub(owner.publicKey);
   const ownerSpki = crypto.createHash("sha256").update(
     owner.publicKey.export({ format: "der", type: "spki" })).digest();
@@ -47,10 +67,16 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
   };
   const fresh = await newDeviceRequest();
   const now = Math.floor(Date.now() / 1000);
+  const priorCommitment = signReceipt({ revision: former.revision,
+    digest: externalCurrentHead.digest, epoch: former.current_epoch,
+    sequence: 10, issued_at: now, expires_at: now + 600 });
   const prepared = await enrollment.beginOwnerEnrollment({
     request: fresh.request, verifiedHistory: state.verifiedHistory,
     externalCurrentHead, trustedOwnerPublicKey: owner.publicKey,
-    independentOwnerSpkiSha256: b64(ownerSpki), nowSeconds: now,
+    independentOwnerSpkiSha256: b64(ownerSpki),
+    trustedCommitmentSignerPublicKey: witness.publicKey,
+    independentCommitmentSignerSpkiSha256: witnessSpki,
+    trustedPriorCommitment: priorCommitment, nowSeconds: now,
   });
   const answer = await enrollment.answerTargetPop({
     request: fresh.request, challenge: prepared.challenge,
@@ -61,7 +87,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
   const actor = state.actors.get(Buffer.from(former.devices[0].authorization_key_id)
     .toString("hex"));
   const candidate = await enrollment.stageV2Enrollment({
-    prepared, response: answer, trustedActorPrivateKey: actor, nowSeconds: now,
+    prepared, response: answer, trustedActorPrivateKey: actor, nowSeconds: now + 5,
   });
   assert.equal(candidate.manifest.operation.operation_type, "enroll-device");
   assert.equal(candidate.manifest.revision, former.revision + 1);
@@ -95,20 +121,60 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     digest: b64(await manifest.recoveryManifestDigestV2(candidate.manifest)),
     epoch: candidate.manifest.current_epoch,
   };
+  const signedCommittedHead = signReceipt({ revision: committed.revision,
+    digest: committed.digest, epoch: committed.epoch,
+    previous_revision: former.revision, previous_digest: externalCurrentHead.digest,
+    operation_id: b64(candidate.manifest.operation.operation_id),
+    pop_challenge_id: b64(candidate.manifest.operation.target_pop_proof.challenge_context.challenge_id),
+    request_nonce: fresh.request.challenge, commit_nonce: prepared.commitmentNonce,
+    sequence: 12, previous_receipt_sha256: b64(receiptHash(priorCommitment)),
+    issued_at: now + 6, expires_at: now + 300 });
+  const revokedReceipt = { ...signedCommittedHead, status: "revoked" };
+  revokedReceipt.signature = b64(crypto.sign(null, Buffer.concat([
+    Buffer.from("Root.ark/zk-1/offline-commitment-receipt/v1\0"),
+    Buffer.from(JSON.stringify(Object.fromEntries(commitment.FIELDS.map(
+      (name) => [name, revokedReceipt[name]]))))]), witness.privateKey));
+  assert.equal(crypto.verify(null, Buffer.concat([
+    Buffer.from("Root.ark/zk-1/offline-commitment-receipt/v1\0"),
+    Buffer.from(JSON.stringify(Object.fromEntries(commitment.FIELDS.map(
+      (name) => [name, revokedReceipt[name]]))))]), witness.publicKey,
+  Buffer.from(revokedReceipt.signature, "base64url")), true,
+  "revoked status must be denied even if the real independent witness signed it");
   await assert.rejects(enrollment.ownerApproveCommittedEnrollment({
-    candidate, externalCommittedHead: { ...externalCurrentHead },
-    ownerPrivateKey: owner.privateKey, nowSeconds: now,
+    candidate, signedCommittedHead: { ...externalCurrentHead },
+    ownerPrivateKey: owner.privateKey, nowSeconds: now + 9,
   }), /ZK_OWNER_OFFLINE_ENROLLMENT_DENIED/,
-  "an uncommitted candidate cannot authorize new device");
+  "an unsigned self-reported head cannot authorize new device");
+  const hostileReceipts = [
+    { ...signedCommittedHead, digest: externalCurrentHead.digest },
+    signReceipt({ ...signedCommittedHead, commit_nonce: b64(crypto.randomBytes(32)) }),
+    signReceipt({ ...signedCommittedHead, request_nonce: b64(crypto.randomBytes(32)) }),
+    signReceipt({ ...signedCommittedHead, pop_challenge_id: b64(crypto.randomBytes(16)) }),
+    signReceipt({ ...signedCommittedHead, operation_id: b64(crypto.randomBytes(16)) }),
+    signReceipt({ ...signedCommittedHead, previous_receipt_sha256: b64(crypto.randomBytes(32)) }),
+    signReceipt({ ...signedCommittedHead, sequence: priorCommitment.sequence }),
+    signReceipt({ ...signedCommittedHead, expires_at: now + 7 }),
+    revokedReceipt,
+    signReceipt({ ...signedCommittedHead }, crypto.generateKeyPairSync("ed25519").privateKey),
+  ];
+  for (const [index, hostileReceipt] of hostileReceipts.entries()) {
+    await assert.rejects(enrollment.ownerApproveCommittedEnrollment({
+      candidate, signedCommittedHead: hostileReceipt,
+      ownerPrivateKey: owner.privateKey, nowSeconds: now + 9,
+    }), /ZK_OWNER_OFFLINE_ENROLLMENT_DENIED/,
+    `hostile commitment ${index} must fail closed`);
+  }
   const issued = await enrollment.ownerApproveCommittedEnrollment({
-    candidate, externalCommittedHead: committed, ownerPrivateKey: owner.privateKey,
-    nowSeconds: now,
+    candidate, signedCommittedHead, ownerPrivateKey: owner.privateKey,
+    nowSeconds: now + 9,
   });
   assert.equal(issued.noServerSecretExposure, true);
-  assert.equal(issued.committedHeadOriginProven, false);
+  assert.equal(issued.signedCommitmentVerified, true);
+  assert.equal(issued.physicalDurabilityProven, false);
+  assert.equal(issued.externalCustodyProven, false);
   await assert.rejects(enrollment.ownerApproveCommittedEnrollment({
-    candidate, externalCommittedHead: committed, ownerPrivateKey: owner.privateKey,
-    nowSeconds: now,
+    candidate, signedCommittedHead, ownerPrivateKey: owner.privateKey,
+    nowSeconds: now + 9,
   }), /ZK_OWNER_OFFLINE_ENROLLMENT_DENIED/, "replay owner authorization blocked");
   assert.equal(issued.signedDeviceGrant.manifest_digest, committed.digest);
   assert.equal(issued.signedDeviceGrant.device_id, fresh.request.device_id);
@@ -133,7 +199,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       revision: committed.revision, digest: Buffer.from(committed.digest, "base64url"),
       epoch: committed.epoch,
     },
-    devicePublicKey: newPublic, devicePrivateKey: newPrivate, nowSeconds: now,
+    devicePublicKey: newPublic, devicePrivateKey: newPrivate, nowSeconds: now + 9,
   };
   const report = await approval.verifyImportedApproval(credentials);
   assert.equal(report.verifiedOwnerOfflineApproval, true);
@@ -155,7 +221,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     { independentOwnerSpkiSha256: crypto.randomBytes(32) },
     { pinnedCurrentHead: { ...credentials.pinnedCurrentHead, revision: former.revision } },
     { signedDeviceGrant: { ...issued.signedDeviceGrant, revoked_at_epoch: committed.epoch } },
-    { nowSeconds: now + 301 },
+    { nowSeconds: now + 310 },
   ];
   for (const [index, changes] of attacks.entries()) {
     await assert.rejects(approval.verifyImportedApproval({
@@ -166,6 +232,34 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
   await assert.rejects(enrollment.beginOwnerEnrollment({
     request: fresh.request, verifiedHistory: state.verifiedHistory,
     externalCurrentHead, trustedOwnerPublicKey: attacker.publicKey,
-    independentOwnerSpkiSha256: b64(ownerSpki), nowSeconds: now,
+    independentOwnerSpkiSha256: b64(ownerSpki),
+    trustedCommitmentSignerPublicKey: witness.publicKey,
+    independentCommitmentSignerSpkiSha256: witnessSpki,
+    trustedPriorCommitment: priorCommitment, nowSeconds: now,
   }), /ZK_OWNER_OFFLINE_ENROLLMENT_DENIED/);
+  await assert.rejects(enrollment.beginOwnerEnrollment({
+    request: fresh.request, verifiedHistory: state.verifiedHistory,
+    externalCurrentHead, trustedOwnerPublicKey: owner.publicKey,
+    independentOwnerSpkiSha256: b64(ownerSpki),
+    trustedCommitmentSignerPublicKey: witness.publicKey,
+    independentCommitmentSignerSpkiSha256: b64(crypto.randomBytes(32)),
+    trustedPriorCommitment: priorCommitment, nowSeconds: now,
+  }), /ZK_OWNER_OFFLINE_ENROLLMENT_DENIED/, "foreign independent signer pin");
+  await assert.rejects(enrollment.beginOwnerEnrollment({
+    request: fresh.request, verifiedHistory: state.verifiedHistory,
+    externalCurrentHead, trustedOwnerPublicKey: owner.publicKey,
+    independentOwnerSpkiSha256: b64(ownerSpki),
+    trustedCommitmentSignerPublicKey: witness.publicKey,
+    independentCommitmentSignerSpkiSha256: witnessSpki,
+    trustedPriorCommitment: { ...priorCommitment, signature: b64(crypto.randomBytes(64)) },
+    nowSeconds: now,
+  }), /ZK_OWNER_OFFLINE_ENROLLMENT_DENIED/, "unsigned/forged prior commitment");
+  await assert.rejects(enrollment.beginOwnerEnrollment({
+    request: fresh.request, verifiedHistory: state.verifiedHistory,
+    externalCurrentHead, trustedOwnerPublicKey: owner.publicKey,
+    independentOwnerSpkiSha256: b64(ownerSpki),
+    trustedCommitmentSignerPublicKey: witness.publicKey,
+    independentCommitmentSignerSpkiSha256: witnessSpki,
+    trustedPriorCommitment: priorCommitment, nowSeconds: now - 60,
+  }), /ZK_OWNER_OFFLINE_ENROLLMENT_DENIED/, "caller clock rollback cannot extend PoP");
 });

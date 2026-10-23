@@ -8,6 +8,7 @@ const z = require("./rootark-zk-1");
 const v2 = require("./rootark-zk-recovery-manifest-v2");
 const auth = require("./rootark-zk-recovery-authorization");
 const history = require("./rootark-zk-recovery-history-v2");
+const commitment = require("./rootark-zk1-offline-commitment-receipt");
 const browserApproval = require("../../public/client/rootark-zk1-v2-device-approval");
 const sessions = new WeakMap();
 const staged = new WeakMap();
@@ -44,6 +45,23 @@ function safeTime(value) {
   if (!Number.isSafeInteger(value) || value <= 0) deny();
   return value;
 }
+function checkedClock(value) {
+  const now = safeTime(value);
+  // A caller-supplied stale timestamp cannot silently extend a 5-minute
+  // offline ceremony. A broken or rolled-back local clock fails closed.
+  if (Math.abs(now - Math.floor(Date.now() / 1000)) > 30) deny();
+  return now;
+}
+function ceremonyClock(value, state) {
+  const now = checkedClock(value);
+  const elapsedNanoseconds = process.hrtime.bigint() - state.monotonicStart;
+  if (elapsedNanoseconds < 0n || elapsedNanoseconds > 300000000000n
+    || now < state.now
+    // Compare against an independent monotonic process clock. Merely moving
+    // the wall clock backwards must not extend the challenge's live window.
+    || now + 1 < state.now + Number(elapsedNanoseconds / 1000000000n)) deny();
+  return now;
+}
 function parseRequest(request) {
   exact(request, requestKeys);
   if (request.schema !== requestSchema
@@ -68,7 +86,9 @@ function ownerPins(pub, externalSha256) {
       b64(externalSha256, 32))) deny();
 }
 async function beginOwnerEnrollment({ request, verifiedHistory, externalCurrentHead,
-  trustedOwnerPublicKey, independentOwnerSpkiSha256, nowSeconds }) {
+  trustedOwnerPublicKey, independentOwnerSpkiSha256,
+  trustedCommitmentSignerPublicKey, independentCommitmentSignerSpkiSha256,
+  trustedPriorCommitment, nowSeconds }) {
   try {
     const target = parseRequest(request);
     if (!await history.isVerifiedTrustedDeviceRecoveryHistoryV2(verifiedHistory)) deny();
@@ -79,8 +99,15 @@ async function beginOwnerEnrollment({ request, verifiedHistory, externalCurrentH
     if (prior.devices.some((device) => device.device_id === target.device_id
       || match(device.hpke_public_key, target.hpke_public_key)
       || match(device.authorization_public_key, target.authorization_public_key))) deny();
-    const now = safeTime(nowSeconds);
+    const now = checkedClock(nowSeconds);
+    commitment.verifySignedReceipt({ receipt: trustedPriorCommitment,
+      signerPublicKey: trustedCommitmentSignerPublicKey,
+      independentSignerSpkiSha256: independentCommitmentSignerSpkiSha256,
+      expectedScope: prior,
+      expectedHead: { revision: prior.revision, digest, epoch: prior.current_epoch },
+      nowSeconds: now });
     const operationId = crypto.randomBytes(16);
+    const commitmentNonce = crypto.randomBytes(32).toString("base64url");
     const challenge = await auth.createTargetPopChallenge({
       scope: Object.fromEntries(scopeKeys.map((key) => [key, prior[key]])),
       operationId, targetDeviceId: target.device_id,
@@ -89,10 +116,12 @@ async function beginOwnerEnrollment({ request, verifiedHistory, externalCurrentH
       authorizationPublicKey: target.authorization_public_key,
       issuedAt: now, expiresAt: now + 300,
     });
-    const result = Object.freeze({ request, challenge });
+    const result = Object.freeze({ request, challenge, commitmentNonce });
     sessions.set(result, { target, operationId, challenge, verifiedHistory,
       trustedOwnerPublicKey, independentOwnerSpkiSha256, externalCurrentHead,
-      now, completed: false });
+      trustedCommitmentSignerPublicKey, independentCommitmentSignerSpkiSha256,
+      trustedPriorCommitment: JSON.parse(JSON.stringify(trustedPriorCommitment)),
+      commitmentNonce, now, monotonicStart: process.hrtime.bigint(), completed: false });
     return result;
   } catch (_) { deny(); }
 }
@@ -140,8 +169,8 @@ async function stageV2Enrollment({ prepared, response, trustedActorPrivateKey,
     // Parallel owner/offline callers cannot race two different V2 manifests
     // over the same target PoP and operation ID.
     state.completed = true;
-    const now = safeTime(nowSeconds);
-    if (now !== state.now) deny();
+    const now = ceremonyClock(nowSeconds, state);
+    if (now < state.now || now > state.now + 300) deny();
     const { target, challenge, verifiedHistory: priorHistory } = state;
     if (!await history.isVerifiedTrustedDeviceRecoveryHistoryV2(priorHistory)) deny();
     const prior = priorHistory.headManifest;
@@ -202,22 +231,41 @@ async function stageV2Enrollment({ prepared, response, trustedActorPrivateKey,
       priorVerifiedHistory: priorHistory, actorPrivateKey: trustedActorPrivateKey,
       manifestMacKey: epochKeys.find((entry) => entry.epoch === prior.current_epoch).key,
       now, clockHealthy: true });
-    const candidate = Object.freeze({ request: prepared.request, manifest });
+    const candidate = Object.freeze({ request: prepared.request, manifest,
+      commitmentNonce: state.commitmentNonce });
     staged.set(candidate, { ...state, digest: await v2.recoveryManifestDigestV2(manifest),
-      manifest, target, confirmed: false });
+      manifest, target, stagedAt: now, confirmed: false });
     return candidate;
   } catch (_) { deny(); }
 }
-async function ownerApproveCommittedEnrollment({ candidate, externalCommittedHead,
+async function ownerApproveCommittedEnrollment({ candidate, signedCommittedHead,
   ownerPrivateKey, nowSeconds }) {
   try {
     const state = staged.get(candidate);
     if (!state || state.confirmed) deny();
     const current = candidate.manifest;
     if (usedOperations.has(state.operationId.toString("hex"))) deny();
-    const now = safeTime(nowSeconds);
-    if (now < state.now || now > state.now + 300) deny();
-    currentMatches({ ...current, _digest: state.digest }, externalCommittedHead);
+    const now = ceremonyClock(nowSeconds, state);
+    if (now < state.stagedAt || now > state.now + 300) deny();
+    // A bare self-reported revision/digest/epoch is never commitment evidence.
+    // The pinned independent signer binds a fresh nonce, V2 PoP operation,
+    // previous signed witness floor, exact digest and monotonic sequence.
+    const commitmentProof = commitment.verifySignedReceipt({
+      receipt: signedCommittedHead,
+      signerPublicKey: state.trustedCommitmentSignerPublicKey,
+      independentSignerSpkiSha256: state.independentCommitmentSignerSpkiSha256,
+      expectedScope: current,
+      expectedHead: { revision: current.revision, digest: state.digest,
+        epoch: current.current_epoch },
+      previousReceipt: state.trustedPriorCommitment,
+      expectedOperation: { operation_id: state.operationId.toString("base64url"),
+        pop_challenge_id: current.operation.target_pop_proof.challenge_context.challenge_id.toString("base64url"),
+        request_nonce: state.target.challenge.toString("base64url"),
+        commit_nonce: state.commitmentNonce },
+      nowSeconds: now,
+    });
+    if (signedCommittedHead.issued_at < state.stagedAt
+      || signedCommittedHead.issued_at > now) deny();
     const pub = crypto.createPublicKey(ownerPrivateKey);
     if (!match(pub.export({ format: "der", type: "spki" }),
       state.trustedOwnerPublicKey.export({ format: "der", type: "spki" }))) deny();
@@ -251,8 +299,11 @@ async function ownerApproveCommittedEnrollment({ candidate, externalCommittedHea
     usedOperations.add(state.operationId.toString("hex"));
     return Object.freeze({ approval, signedDeviceGrant: grant,
       signedV2Manifest: Buffer.from(await z.encodeDeterministic(current)).toString("base64url"),
-      // The module cannot prove an externally supplied head came from CAS.
-      committedHeadOriginProven: false, noServerSecretExposure: true });
+      signedCommitmentVerified: commitmentProof.signedReceiptVerified,
+      commitmentSignerSpkiMatchedSuppliedPin: true,
+      independentPinOriginProven: false,
+      physicalDurabilityProven: false, externalCustodyProven: false,
+      noServerSecretExposure: true });
   } catch (_) { deny(); }
 }
 module.exports = { beginOwnerEnrollment, answerTargetPop, stageV2Enrollment,
