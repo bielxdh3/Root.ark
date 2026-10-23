@@ -381,7 +381,8 @@ class OpaqueCheckpointV2Authority {
   async #signed(row, state, nonce) {
     const s = this.#settings;
     const statement = { type: "rootark-opaque-checkpoint-remote-receipt/v2",
-      ...s.scope, role: s.role, state, sequence: 129,
+      ...s.scope, role: s.role, state,
+      sequence: state === "V1_BASELINE" ? 128 : 129,
       head_digest: row.final_digest, checkpoint_digest: row.checkpoint_digest,
       operation_id: row.operation_id, cas_signer_fp: s.casFp,
       floor_signer_fp: s.floorFp, nonce: bytes(nonce, 32),
@@ -511,9 +512,20 @@ class OpaqueCheckpointV2Authority {
   async head(nonce) {
     return this.#serial(async () => {
       const row = this.#saved();
-      if (!row) return { state: "V1_BASELINE", sequence: 128,
-        headDigest: Buffer.from(this.#settings.baseDigest),
-        checkpointDigest: Buffer.from(this.#settings.baseCheckpoint) };
+      if (!row) {
+        // Even the ABSENCE of v2 state must be freshly authenticated. An
+        // unsigned baseline lets a transport-only compromise conceal a
+        // previously finalized checkpoint and falsely advertise rollback.
+        const baseline = {
+          final_digest: this.#settings.baseDigest,
+          checkpoint_digest: this.#settings.baseCheckpoint,
+          operation_id: ZERO,
+        };
+        return { state: "V1_BASELINE", sequence: 128,
+          headDigest: Buffer.from(this.#settings.baseDigest),
+          checkpointDigest: Buffer.from(this.#settings.baseCheckpoint),
+          proof: await this.#signed(baseline, "V1_BASELINE", nonce) };
+      }
       await this.#inspect(row, false);
       return { state: row.state, sequence: 129, headDigest: Buffer.from(row.final_digest),
         checkpointDigest: Buffer.from(row.checkpoint_digest),
@@ -641,10 +653,20 @@ function createOpaqueCheckpointV2HttpsClient({ endpoint, ca, clientKey, clientCe
     const rawProof = outcome.proof ? Buffer.from(outcome.proof, "base64url") : null;
     if (route === "/v2/head") {
       if (outcome.state === "V1_BASELINE") {
-        if (outcome.sequence !== 128) fail();
-        return { state: "V1_BASELINE", sequence: 128,
-          headDigest: Buffer.from(outcome.headDigest, "base64url"),
-          checkpointDigest: Buffer.from(outcome.checkpointDigest, "base64url") };
+          if (outcome.sequence !== 128 || !rawProof) fail();
+          const baseline = await z.decodeDeterministic(rawProof);
+          if (!same(bytes(baseline.nonce, 32), nonce)) fail();
+          const digest = bytes(Buffer.from(outcome.headDigest, "base64url"), 32);
+          const checkpoint = bytes(
+            Buffer.from(outcome.checkpointDigest, "base64url"), 32);
+          await receiptMatches(rawProof, { scope: scopeBytes,
+            role: same(fp(signer), casFp) ? ROLE_CAS : ROLE_FLOOR,
+            state: "V1_BASELINE", sequence: 128,
+            headDigest: digest, checkpointDigest: checkpoint,
+            operationId: ZERO, casFp, floorFp, signer, nonce, fresh: true });
+          if (outcome.operationId !== null) fail();
+          return { state: "V1_BASELINE", sequence: 128,
+            headDigest: digest, checkpointDigest: checkpoint };
       }
       if (!rawProof || !["PREPARED", "CAS_COMMITTED", "FINALIZED"].includes(outcome.state)) fail();
     }
