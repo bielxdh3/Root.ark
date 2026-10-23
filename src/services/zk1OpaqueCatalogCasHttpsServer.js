@@ -68,7 +68,7 @@ function createZk1OpaqueCatalogCasHttpsServer({ key, cert, clientCa,
       if (!req.socket.authorized || peer?.fingerprint256?.toUpperCase() !== pin) {
         return reply(res, 403, { error: "FORBIDDEN" });
       }
-      if (req.method !== "POST" || !["/v1/head", "/v1/cas"].includes(req.url)) {
+      if (req.method !== "POST" || !["/v1/head", "/v1/cas", "/v1/snapshot"].includes(req.url)) {
         return reply(res, 404, { error: "NOT_FOUND" });
       }
       const body = await payload(req);
@@ -77,6 +77,10 @@ function createZk1OpaqueCatalogCasHttpsServer({ key, cert, clientCa,
         exact(body, ["scope", "nonce"]);
         result = await ledger.readHead({ scope: scopeFrom(body.scope),
           nonce: b64(body.nonce, 32) });
+      } else if (req.url === "/v1/snapshot") {
+        exact(body, ["scope", "sequence", "nonce"]);
+        result = await ledger.fetchSnapshot({ scope: scopeFrom(body.scope),
+          sequence: body.sequence, nonce: b64(body.nonce, 32) });
       } else {
         const fields = ["scope", "expectedSequence", "expectedDigest",
           "nextSequence", "nextDigest", "nonce", "headBytes", "headSignature", "pageBodies"];

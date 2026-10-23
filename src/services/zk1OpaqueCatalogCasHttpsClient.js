@@ -34,10 +34,10 @@ function encodeScope(scope) {
     [key, bytes(scope[key], key === "compartment_id" ? 1 : 16,
       key === "compartment_id" ? 128 : 16).toString("base64url")]));
 }
-function decodeProof(value) {
+function decodeProof(value, maxBytes = 8192) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) fail();
   const data = Buffer.from(value, "base64url");
-  if (!data.length || data.length > 8192 || data.toString("base64url") !== value) fail();
+  if (!data.length || data.length > maxBytes || data.toString("base64url") !== value) fail();
   return data;
 }
 async function verifyProof(raw, expected, publicKey) {
@@ -72,7 +72,7 @@ function createZk1OpaqueCatalogCasHttpsClient({
     || authorityPublicKey.type !== "public"
     || authorityPublicKey.asymmetricKeyType !== "ed25519") fail();
   const pin = serverFingerprint256.toUpperCase();
-  async function request(route, body, expected, uncertain = false) {
+  async function request(route, body, expected, uncertain = false, snapshot = false) {
     const payload = Buffer.from(JSON.stringify(body));
     if (payload.length > 3 * 1024 * 1024) fail();
     const received = await new Promise((resolve, reject) => {
@@ -106,7 +106,7 @@ function createZk1OpaqueCatalogCasHttpsClient({
         const parts = [];
         response.on("data", (part) => {
           total += part.length;
-          if (total > 8192) finish(failError());
+          if (total > (snapshot ? 5 * 1024 * 1024 : 8192)) finish(failError());
           else parts.push(part);
         });
         response.on("error", () => finish(failError()));
@@ -114,7 +114,8 @@ function createZk1OpaqueCatalogCasHttpsClient({
           try {
             const data = JSON.parse(Buffer.concat(parts).toString("utf8"));
             exact(data, ["proofBase64"]);
-            finish(null, decodeProof(data.proofBase64));
+            finish(null, decodeProof(data.proofBase64,
+              snapshot ? 3 * 1024 * 1024 : 8192));
           } catch (_) { finish(failError()); }
         });
       });
@@ -123,6 +124,7 @@ function createZk1OpaqueCatalogCasHttpsClient({
       req.end(payload);
     }).catch(() => fail(uncertain
       ? "ZK_OPAQUE_CAS_ACK_UNCERTAIN" : "ZK_OPAQUE_CAS_TRANSPORT_UNAVAILABLE"));
+    if (snapshot) return { proof: received };
     let proof;
     try { proof = await verifyProof(received, expected, authorityPublicKey); }
     catch (_) { fail(uncertain ? "ZK_OPAQUE_CAS_ACK_UNCERTAIN" : "ZK_OPAQUE_CAS_TRANSPORT_UNAVAILABLE"); }
@@ -131,6 +133,18 @@ function createZk1OpaqueCatalogCasHttpsClient({
   const failError = () => new Error("ZK_OPAQUE_CAS_TRANSPORT_UNAVAILABLE");
   return Object.freeze({
     publicKey: authorityPublicKey,
+    // The catalog independently verifies the signed snapshot envelope and
+    // its current pinned head before accepting any missing SQLite rows.
+    async fetchSnapshot({ scope, sequence, nonce }) {
+      const scopeBytes = Object.fromEntries(SCOPE.map((key) =>
+        [key, bytes(scope[key], key === "compartment_id" ? 1 : 16,
+          key === "compartment_id" ? 128 : 16)]));
+      if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence > 128) fail();
+      const challenge = bytes(nonce, 32);
+      return (await request("/v1/snapshot", { scope: encodeScope(scopeBytes),
+        sequence, nonce: challenge.toString("base64url") },
+      { scope: scopeBytes, nonce: challenge }, false, true)).proof;
+    },
     async readHead({ scope, nonce }) {
       const scopeBytes = Object.fromEntries(SCOPE.map((key) =>
         [key, bytes(scope[key], key === "compartment_id" ? 1 : 16,

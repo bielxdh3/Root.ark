@@ -17,6 +17,7 @@ const { inspectVerifiedWitnessFreshHeadV1 } =
 
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
 const PAGE_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-page/v1\0");
+const SNAPSHOT_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-snapshot-fetch/v1\0");
 const EMPTY = Buffer.alloc(32);
 const MAX_SEQUENCE = 128;
 const HEAD_TYPE = "rootark-zk1-opaque-catalog/v1";
@@ -369,6 +370,36 @@ class Zk1OpaqueCatalogCasLedger {
     await this.ready;
     const current = await this.#inspect();
     return this.#receipt(nonce, current);
+  }
+  // Authenticated historical bytes are returned with a fresh Ed25519
+  // signature binding the request nonce, scope, snapshot and CURRENT CAS head.
+  // A stored digest alone can never repair a missing local snapshot.
+  async fetchSnapshot({ scope, sequence, nonce }) {
+    if (!scopeEquals(scopeInput(scope), this.scope)) fail();
+    const wanted = integer(sequence, 1, MAX_SEQUENCE);
+    const challenge = bytes(nonce, 32);
+    await this.ready;
+    const current = await this.#inspect();
+    if (wanted > current.sequence) fail();
+    const row = this.db.prepare("SELECT * FROM snapshots WHERE scope=? AND sequence=?")
+      .get(this.scopeId, wanted);
+    if (!row) fail();
+    const packed = JSON.parse(row.pages.toString("utf8"));
+    if (!Array.isArray(packed) || packed.length > 128) fail();
+    const statement = {
+      type: "rootark-zk1-opaque-catalog-snapshot-fetch/v1",
+      ...this.scope, sequence: wanted, digest: Buffer.from(row.digest),
+      head_sequence: current.sequence, head_digest: Buffer.from(current.digest),
+      nonce: challenge, observed_at: Math.floor(Date.now() / 1000),
+      header: Buffer.from(row.header), header_signature: Buffer.from(row.signature),
+      page_bodies: packed.map((encoded) => Buffer.from(encoded, "base64url")),
+    };
+    // Refuse a concurrent CAS advance while preparing the signed response.
+    const latest = this.#inspectSync();
+    if (latest.sequence !== current.sequence || !same(latest.digest, current.digest)) fail();
+    const signature = crypto.sign(null, Buffer.concat([
+      SNAPSHOT_DOMAIN, Buffer.from(await z.encodeDeterministic(statement))]), this.signer);
+    return Buffer.from(await z.encodeDeterministic({ ...statement, signature }));
   }
   async compareAndSwap({ scope, expectedSequence, expectedDigest,
     nextSequence, nextDigest, nonce, headBytes, headSignature, pageBodies,

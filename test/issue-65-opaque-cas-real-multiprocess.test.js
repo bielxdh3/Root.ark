@@ -10,7 +10,8 @@ const https = require("node:https");
 const { fork } = require("node:child_process");
 const Database = require("better-sqlite3");
 const z = require("../src/crypto/rootark-zk-1");
-const { catalogHeadDigest } = require("../src/services/zk1OpaqueCatalog");
+const { Zk1OpaqueCatalog, catalogHeadDigest, catalogOperationObjectId } =
+  require("../src/services/zk1OpaqueCatalog");
 const { createZk1OpaqueCatalogCasHttpsClient } =
   require("../src/services/zk1OpaqueCatalogCasHttpsClient");
 const { generateNativeFixtureCertificates } =
@@ -101,13 +102,15 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
     if (server) { try { await stop(); } catch (_) { server.kill(); } }
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
   });
+  let inherited = null;
   const build = async (sequence, previousDigest, signer = deviceKeys.privateKey,
     nonce = crypto.randomBytes(32)) => {
-    const pageBody = Buffer.from(await z.encodeDeterministic([{
+    const ciphertext = inherited?.ciphertext || crypto.randomBytes(64);
+    const item = inherited?.item || {
       object_id: b64(crypto.randomBytes(16)), revision: 1, epoch: 1,
-      ciphertext_digest: crypto.randomBytes(32),
-      metadata_ciphertext: crypto.randomBytes(284),
-    }]));
+      ciphertext_digest: crypto.createHash("sha256").update(ciphertext).digest(),
+      metadata_ciphertext: crypto.randomBytes(284) };
+    const pageBody = Buffer.from(await z.encodeDeterministic([item]));
     const pageDigest = crypto.createHash("sha256").update(PAGE_DOMAIN).update(pageBody).digest();
     const header = { type: "rootark-zk1-opaque-catalog/v1", ...scope,
       sequence, previous_digest: previousDigest, manifest_revision: 1,
@@ -119,7 +122,8 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
     const digest = catalogHeadDigest(headBytes, signature);
     return { expectedSequence: sequence - 1, expectedDigest: b64(previousDigest),
       nextSequence: sequence, nextDigest: b64(digest), nonce: b64(nonce),
-      headBytes: b64(headBytes), headSignature: b64(signature), pageBodies: [b64(pageBody)] };
+      headBytes: b64(headBytes), headSignature: b64(signature), pageBodies: [b64(pageBody)],
+      ciphertextBase64: b64(ciphertext) };
   };
   const inputs = (raw) => ({
     scope, expectedSequence: raw.expectedSequence,
@@ -155,6 +159,9 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
   assert.equal(results.filter((r) => r.outcome === "COMMITTED").length, 1,
     "exactly one independent OS writer may atomically win a genesis CAS: " + JSON.stringify(results));
   const winner = results[0].outcome === "COMMITTED" ? a : b;
+  inherited = { item: (await z.decodeDeterministic(
+    Buffer.from(winner.pageBodies[0], "base64url")))[0],
+  ciphertext: Buffer.from(winner.ciphertextBase64, "base64url") };
   const headDigest = Buffer.from(winner.nextDigest, "base64url");
   const latest = await z.decodeDeterministic(await client().readHead({
     scope, nonce: crypto.randomBytes(32),
@@ -229,7 +236,11 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
   assert.equal(afterRestart.sequence, 1);
 
   const uncertain = await build(2, headDigest);
-  await assert.rejects(client().compareAndSwap(inputs(uncertain)), /ZK_OPAQUE_CAS_ACK_UNCERTAIN/);
+  const uncertainPath = path.join(dir, "writer-lost-ack.json");
+  fs.writeFileSync(uncertainPath, JSON.stringify(uncertain), { mode: 0o600 });
+  const crashedWriter = child("writer", cfgPath, uncertainPath);
+  assert.equal((await wait(crashedWriter, "outcome")).outcome, "ZK_OPAQUE_CAS_ACK_UNCERTAIN");
+  await exited(crashedWriter);
   const reconciliation = await client().reconcile({
     scope, nonce: crypto.randomBytes(32), expectedSequence: 1,
     expectedDigest: headDigest, nextSequence: 2,
@@ -238,6 +249,174 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
   assert.equal(reconciliation.outcome, "CAS_COMMITTED_LOCAL_DURABLE");
   assert.equal(reconciliation.localCatalogPublished, false);
   assert.equal(reconciliation.remoteCloudDurabilityProven, false);
+  const challenge = crypto.randomBytes(32);
+  const remoteSigned = await client().fetchSnapshot({ scope, sequence: 2, nonce: challenge });
+  const fetched = await z.decodeDeterministic(remoteSigned);
+  assert.deepEqual(Buffer.from(fetched.nonce), challenge);
+  assert.deepEqual(Buffer.from(fetched.digest),
+    Buffer.from(uncertain.nextDigest, "base64url"));
+  assert.deepEqual(Buffer.from(fetched.header), Buffer.from(uncertain.headBytes, "base64url"));
+  assert.deepEqual(fetched.page_bodies.map(b64), uncertain.pageBodies);
+  const { signature: fetchSignature, ...fetchStatement } = fetched;
+  assert.ok(crypto.verify(null, Buffer.concat([
+    Buffer.from("Root.ark/zk-1/opaque-catalog-snapshot-fetch/v1\0"),
+    Buffer.from(await z.encodeDeterministic(fetchStatement))]),
+  authorityKeys.publicKey, fetchSignature), "independent Ed25519 snapshot proof");
+  // The writer exited after the independent FULL SQLite commit without an
+  // ACK. Reopen a DIFFERENT app SQLite process state with only snapshot N-1:
+  // the first authenticated catalog read must restore N from remote signed
+  // bytes, never issue a second CAS.
+  const localPath = path.join(dir, "app-after-crash.sqlite");
+  const appKey = Object.values(scope).map((v) => v.toString("hex")).join(":");
+  const setup = new Database(localPath);
+  setup.exec(`CREATE TABLE zk_content_version (
+    scope TEXT, id TEXT, revision INTEGER, epoch INTEGER, ciphertext BLOB,
+    ciphertext_digest BLOB);
+    CREATE TABLE zk_content_nonce (scope TEXT, nonce BLOB, expires_at INTEGER,
+      PRIMARY KEY(scope,nonce));
+    CREATE TABLE zk_content_clock (scope TEXT PRIMARY KEY, last_at INTEGER);
+    CREATE TABLE zk_content_head (scope TEXT PRIMARY KEY, revision INTEGER, digest BLOB);`);
+  setup.prepare("INSERT INTO zk_content_version VALUES (?,?,?,?,?,?)").run(
+    appKey, (await z.decodeDeterministic(Buffer.from(uncertain.pageBodies[0], "base64url")))[0].object_id,
+    1, 1, Buffer.from(uncertain.ciphertextBase64, "base64url"),
+    (await z.decodeDeterministic(Buffer.from(uncertain.pageBodies[0], "base64url")))[0].ciphertext_digest);
+  // Emulate the locally acknowledged N-1 data without sharing the remote DB.
+  setup.exec(`CREATE TABLE zk_content_catalog_head (
+    scope TEXT PRIMARY KEY, sequence INTEGER NOT NULL, digest BLOB NOT NULL);
+    CREATE TABLE zk_content_catalog_snapshot (
+    scope TEXT NOT NULL, sequence INTEGER NOT NULL, digest BLOB NOT NULL,
+    header BLOB NOT NULL, signature BLOB NOT NULL, PRIMARY KEY(scope,sequence));
+    CREATE TABLE zk_content_catalog_page (
+    scope TEXT NOT NULL, sequence INTEGER NOT NULL, page INTEGER NOT NULL,
+    body BLOB NOT NULL, PRIMARY KEY(scope,sequence,page));`);
+  setup.prepare("INSERT INTO zk_content_catalog_head VALUES (?,?,?)")
+    .run(appKey, 1, headDigest);
+  setup.prepare("INSERT INTO zk_content_catalog_snapshot VALUES (?,?,?,?,?)")
+    .run(appKey, 1, headDigest, Buffer.from(winner.headBytes, "base64url"),
+      Buffer.from(winner.headSignature, "base64url"));
+  setup.prepare("INSERT INTO zk_content_catalog_page VALUES (?,?,?,?)")
+    .run(appKey, 1, 0, Buffer.from(winner.pageBodies[0], "base64url"));
+  setup.close(); // abrupt app process exit after CAS, before local snapshot N
+  const localDb = new Database(localPath);
+  const remoteHeader = await z.decodeDeterministic(Buffer.from(uncertain.headBytes, "base64url"));
+  const manifestDevice = { device_id: "owner-device", enrolled_epoch: 1,
+    revoked_at_epoch: null, authorization_public_key:
+      deviceKeys.publicKey.export({ type: "spki", format: "der" }).subarray(-32) };
+  const fixedNonce = crypto.randomBytes(32);
+  const now = () => Math.floor(Date.now() / 1000);
+  const fakeStore = {
+    signedHistoryRequired: true, admissionRequired: true, db: localDb,
+    trustedScope: scope, nowSeconds: now,
+    minimumHead: { revision: 1, digest: Buffer.from(remoteHeader.manifest_digest) },
+    clockRow: localDb.prepare("SELECT last_at FROM zk_content_clock WHERE scope=?"),
+    getHead: localDb.prepare("SELECT revision,digest FROM zk_content_head WHERE scope=?"),
+    nonceCount: localDb.prepare("SELECT COUNT(*) AS n FROM zk_content_nonce WHERE scope=?"),
+    async runCatalogWithAdmission(_input, operation, effect) {
+      assert.equal(operation, "catalog-read");
+      return effect({ key: appKey,
+        request: { object_id: catalogOperationObjectId(scope, "catalog-read", 0),
+          expected_object_revision: 2,
+          ciphertext_digest: Buffer.from(uncertain.nextDigest, "base64url"),
+          manifest_revision: 1, manifest_digest: Buffer.from(remoteHeader.manifest_digest),
+          epoch: 1, nonce: fixedNonce, issued_at: now(), expires_at: now() + 30 },
+        head: { current_revision: 1,
+          current_manifest_digest: Buffer.from(remoteHeader.manifest_digest) },
+        verifiedHeadManifest: { revision: 1, current_epoch: 1, devices: [manifestDevice] } });
+    },
+  };
+  let independentFetches = 0;
+  let independentWrites = 0;
+  let mutateFetch = null;
+  const authority = {
+    publicKey: authorityKeys.publicKey,
+    readHead: (...args) => client().readHead(...args),
+    async fetchSnapshot(args) {
+      independentFetches++;
+      const signed = await client().fetchSnapshot(args);
+      return mutateFetch ? mutateFetch(signed) : signed;
+    },
+    compareAndSwap() { independentWrites++; throw Error("UNEXPECTED_RE_CAS"); },
+  };
+  const catalog = new Zk1OpaqueCatalog({ store: fakeStore, authority });
+  const readCatalog = () => catalog.read({ scope, authorization: {}, signature: Buffer.alloc(64),
+    pageIndex: 0 });
+  const savedSigned = await z.decodeDeterministic(remoteSigned);
+  mutateFetch = async () => {
+    const forged = { ...savedSigned, signature: crypto.randomBytes(64) };
+    return z.encodeDeterministic(forged);
+  };
+  await assert.rejects(readCatalog(), /ZK_CATALOG_UNAVAILABLE/,
+    "signed CAS snapshot fetch cannot be forged");
+  mutateFetch = async () => z.encodeDeterministic({
+    ...savedSigned, compartment_id: Buffer.from("wrong-scope") });
+  await assert.rejects(readCatalog(), /ZK_CATALOG_UNAVAILABLE/,
+    "same signed head with wrong scope is unusable");
+  // Even the independent CAS signer cannot replace a page: the original
+  // owner device header binds its exact canonical-CBOR SHA-256 page digest.
+  mutateFetch = async () => {
+    const changedBody = Buffer.from(savedSigned.page_bodies[0]);
+    changedBody[0] ^= 0x01;
+    const { signature: _prior, ...statement } = savedSigned;
+    const forged = { ...statement, page_bodies: [changedBody] };
+    const signature = crypto.sign(null, Buffer.concat([
+      Buffer.from("Root.ark/zk-1/opaque-catalog-snapshot-fetch/v1\0"),
+      Buffer.from(await z.encodeDeterministic(forged))]), authorityKeys.privateKey);
+    return z.encodeDeterministic({ ...forged, signature });
+  };
+  await assert.rejects(readCatalog(), /ZK_CATALOG_UNAVAILABLE/,
+    "valid CAS signer with altered body still fails owner signed page digest");
+  mutateFetch = null;
+  localDb.prepare("UPDATE zk_content_version SET ciphertext_digest=? WHERE scope=?")
+    .run(crypto.randomBytes(32), appKey);
+  await assert.rejects(readCatalog(), /ZK_CATALOG_UNAVAILABLE/,
+    "physical immutable version archive must match every signed entry");
+  const latestPage = await z.decodeDeterministic(Buffer.from(uncertain.pageBodies[0], "base64url"));
+  localDb.prepare("UPDATE zk_content_version SET ciphertext_digest=? WHERE scope=?")
+    .run(latestPage[0].ciphertext_digest, appKey);
+  manifestDevice.revoked_at_epoch = 1;
+  await assert.rejects(readCatalog(), /ZK_CATALOG_(DENIED|UNAVAILABLE)/,
+    "revoked owner V2 signer cannot reconcile an authenticated CAS snapshot");
+  manifestDevice.revoked_at_epoch = null;
+  localDb.prepare("UPDATE zk_content_catalog_head SET digest=? WHERE scope=?")
+    .run(crypto.randomBytes(32), appKey);
+  await assert.rejects(readCatalog(), /ZK_CATALOG_UNAVAILABLE/,
+    "local fork of the signed predecessor never repairs from external head");
+  localDb.prepare("UPDATE zk_content_catalog_head SET digest=? WHERE scope=?")
+    .run(headDigest, appKey);
+  assert.equal(localDb.prepare("SELECT COUNT(*) n FROM zk_content_catalog_snapshot").get().n, 1,
+    "no untrusted snapshot was inserted");
+  const recovered = await readCatalog();
+  assert.equal(recovered.sequence, 2);
+  assert.deepEqual(recovered.entries[0].ciphertextDigestBase64, b64(latestPage[0].ciphertext_digest));
+  assert.ok(independentFetches >= 4);
+  assert.equal(independentWrites, 0, "recovery never tries to re-CAS a committed head");
+  assert.equal(localDb.prepare("SELECT COUNT(*) n FROM zk_content_catalog_snapshot").get().n, 2);
+  assert.deepEqual(localDb.prepare("SELECT digest FROM zk_content_catalog_head WHERE scope=?")
+    .get(appKey).digest, Buffer.from(uncertain.nextDigest, "base64url"));
+  const rollbackAuthority = {
+    ...authority,
+    async readHead({ nonce }) {
+      const statement = { type: "rootark-zk1-opaque-catalog-cas/v1", ...scope,
+        sequence: 1, digest: headDigest, nonce,
+        observed_at: now() };
+      return z.encodeDeterministic({ ...statement,
+        signature: crypto.sign(null, Buffer.concat([
+          Buffer.from("Root.ark/zk-1/opaque-catalog-cas/v1\0"),
+          Buffer.from(await z.encodeDeterministic(statement))]), authorityKeys.privateKey) });
+    },
+  };
+  const rollbackCatalog = new Zk1OpaqueCatalog({ store: fakeStore, authority: rollbackAuthority });
+  await assert.rejects(rollbackCatalog.read({
+    scope, authorization: {}, signature: Buffer.alloc(64), pageIndex: 0,
+  }), /ZK_CATALOG_UNAVAILABLE/,
+  "even a correctly signed but rolled-back CAS head cannot rewrite local N");
+  await assert.rejects(readCatalog(), /ZK_CATALOG_REPLAY/,
+    "persisted device nonce remains consumed across recovery");
+  localDb.prepare("UPDATE zk_content_catalog_head SET digest=? WHERE scope=?")
+    .run(crypto.randomBytes(32), appKey);
+  await assert.rejects(readCatalog(), /ZK_CATALOG_UNAVAILABLE/,
+    "altered local contents are never silently repaired");
+  localDb.close();
   const losingReconcile = await client().reconcile({
     scope, nonce: crypto.randomBytes(32), expectedSequence: 1,
     expectedDigest: headDigest, nextSequence: 2, nextDigest: crypto.randomBytes(32),
