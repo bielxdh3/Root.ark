@@ -101,8 +101,10 @@ async function inspectRecord(record, scope, expectedSequence, expectedDigest,
   if (record.sequence !== expectedSequence) fail();
   const headerBytes = bytes(record.header, 1, MAX_HEADER_BYTES);
   const signature = bytes(record.signature, 64);
-  const pageBodies = record.page_bodies;
-  if (!Array.isArray(pageBodies) || pageBodies.length > MAX_PAGES) fail();
+  if (!Array.isArray(record.page_bodies) || record.page_bodies.length > MAX_PAGES) fail();
+  // Capture caller-owned data before awaiting the CBOR decoder or the trusted
+  // historical-key resolver. The signed leaf must contain the validated values.
+  const pageBodies = record.page_bodies.map((body) => bytes(body, 1, MAX_PAGE_BYTES));
   const header = await canonical(headerBytes, MAX_HEADER_BYTES);
   exact(header, HEADER_FIELDS);
   if (header.type !== HEADER_TYPE || header.sequence !== expectedSequence) fail();
@@ -129,7 +131,7 @@ async function inspectRecord(record, scope, expectedSequence, expectedDigest,
   let priorRevision = 0;
   let count = 0;
   for (let i = 0; i < pageBodies.length; i++) {
-    const raw = bytes(pageBodies[i], 1, MAX_PAGE_BYTES);
+    const raw = pageBodies[i];
     if (!same(hash(Buffer.from("Root.ark/zk-1/opaque-catalog-page/v1\0"), raw),
       bytes(header.page_digests[i], 32))) fail();
     const page = await canonical(raw, MAX_PAGE_BYTES);
@@ -156,7 +158,7 @@ async function inspectRecord(record, scope, expectedSequence, expectedDigest,
   if (count !== header.total_count) fail();
   const digest = hash(HEADER_DOMAIN, headerBytes, signature);
   return {
-    record: { sequence: record.sequence, header: headerBytes, signature,
+    record: { sequence: expectedSequence, header: headerBytes, signature,
       page_bodies: normalized },
     digest,
   };
@@ -194,14 +196,15 @@ async function inspectArchive({ scope, records, previousSequence,
   if (typeof resolveCatalogSigner !== "function"
     || !Array.isArray(records) || !records.length
     || records.length > MAX_ARCHIVE_RECORDS) fail();
+  const archiveRecords = records.slice();
   const prior = checkRange(previousSequence, previousDigest, previousCheckpointDigest);
-  if (prior.previous > Number.MAX_SAFE_INTEGER - records.length) fail();
+  if (prior.previous > Number.MAX_SAFE_INTEGER - archiveRecords.length) fail();
   let currentDigest = prior.digest;
   const normalized = [];
   const leaves = [];
   let totalBytes = 0;
-  for (let i = 0; i < records.length; i++) {
-    const inspected = await inspectRecord(records[i], scoped,
+  for (let i = 0; i < archiveRecords.length; i++) {
+    const inspected = await inspectRecord(archiveRecords[i], scoped,
       prior.previous + i + 1, currentDigest, resolveCatalogSigner);
     totalBytes += inspected.record.header.length + inspected.record.signature.length
       + inspected.record.page_bodies.reduce((sum, body) => sum + body.length, 0);
@@ -211,7 +214,7 @@ async function inspectArchive({ scope, records, previousSequence,
     currentDigest = inspected.digest;
   }
   return { scope: scoped, records: normalized, leaves, previous: prior,
-    finalSequence: prior.previous + records.length, finalDigest: currentDigest,
+    finalSequence: prior.previous + archiveRecords.length, finalDigest: currentDigest,
     archiveRoot: merkleLayers(leaves).at(-1)[0] };
 }
 function checkpointMatches(checkpoint, expected, archive) {
@@ -271,10 +274,11 @@ async function verifyAuthenticatedOpaqueCatalogArchiveV2({
 async function createOpaqueCatalogInclusionProofV2({ records, index }) {
   if (!Array.isArray(records) || !records.length
     || records.length > MAX_ARCHIVE_RECORDS) fail();
-  seq(index, 0, records.length - 1);
+  const archiveRecords = records.slice();
+  seq(index, 0, archiveRecords.length - 1);
   let totalBytes = 0;
   const leaves = [];
-  for (const record of records) {
+  for (const record of archiveRecords) {
     exact(record, RECORD_FIELDS);
     const header = bytes(record.header, 1, MAX_HEADER_BYTES);
     const signature = bytes(record.signature, 64);
@@ -294,7 +298,7 @@ async function createOpaqueCatalogInclusionProofV2({ records, index }) {
     siblings.push(Buffer.from(nodes[position ^ 1] || nodes[position]));
     position = Math.floor(position / 2);
   }
-  return { index, count: records.length, siblings };
+  return { index, count: archiveRecords.length, siblings };
 }
 async function verifyAuthenticatedOpaqueCatalogInclusionV2({
   checkpointBytes, checkpointSignature, pinnedCheckpointPublicKey,
