@@ -22,6 +22,10 @@ or multi-host physical independence.
   independently signed witness head, epoch, signer enrolment and revocation.
   The owner-approval signer itself MUST be a currently authorized device
   from this authenticated history.
+* Even an unchanged v2 authority at the v1 terminal baseline (sequence 128)
+  MUST return its own fresh nonce-bound Ed25519 receipt. A pinned TLS
+  certificate is not a substitute for a signed CAS/floor state claim.
+  Unsigned, replayed or forged baseline responses fail closed.
 
 ## Recoverable two-authority protocol
 
@@ -47,6 +51,9 @@ and leaves v1 at 128. A second scenario runs CAS and FLOOR in **two separate
 Node24 OS processes**, with distinct SQLite, TLS and Ed25519 signing keys,
 under concurrent clients. This is loopback, NOT independent cloud hosting.
 The witness private key shared by the fixture processes is test-only.
+The separate `test/issue-65-opaque-checkpoint-v2-baseline-auth.test.js`
+uses real pinned TLS and mTLS to confirm that an endpoint with the valid
+transport certificate still cannot forge an authority's Ed25519 baseline.
 
 ## Remaining NO-GO boundaries
 
