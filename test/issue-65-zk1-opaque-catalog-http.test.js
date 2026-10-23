@@ -680,4 +680,50 @@ test("ZK1 opaque catalog: two owner-enrolled device sessions enumerate signed ve
   const resumed = await requestRead(1);
   assert.equal((await send("/zk-1/v1/catalog/read", { ...resumed,
     pageIndex: 0 })).status, 200);
+
+  // The archive CAS preflight is not sufficient if a genuine signed CAS
+  // successor commits while the restored ciphertext is still being GETed.
+  // Test on the final fixture head so this concurrent successor cannot
+  // invalidate earlier read-only assertions.
+  const currentOwnerHead = { revision: Number(manifest.revision),
+    digest: await v2.recoveryManifestDigestV2(manifest),
+    epoch: Number(manifest.current_epoch) };
+  const currentGrantFields = { ...makeGrant(1),
+    manifest_revision: currentOwnerHead.revision,
+    manifest_digest: b64(currentOwnerHead.digest),
+    current_epoch: currentOwnerHead.epoch };
+  delete currentGrantFields.signature;
+  const currentGrant = { ...currentGrantFields,
+    signature: b64(crypto.sign(null, Buffer.concat([
+      Buffer.from("Root.ark/zk-1/browser-owner-device-grant/v1\0"),
+      Buffer.from(JSON.stringify(Object.fromEntries(
+        GRANT.map((key) => [key, currentGrantFields[key]])))),
+    ]), owner.privateKey)) };
+  let successorDuringGet = false;
+  const racedCatalogInput = { ...browserInput(1), signerGrant: currentGrant,
+    trust: { ...trust(1), signedDeviceGrant: currentGrant,
+      pinnedCurrentHead: currentOwnerHead },
+    pinnedCatalogHead: { sequence, digest: b64(currentDigest) },
+    devicePrivateKey: await privateFor(1), indexedDBImpl: ephemeralIndexedDB(),
+    assertLive: liveGuard,
+    fetchImpl: async (url, options) => {
+      if (url.endsWith("/content/read") && !successorDuringGet) {
+        successorDuringGet = true;
+        const next = await send("/zk-1/v1/catalog/commit", await build(1));
+        assert.equal(next.status, 201, JSON.stringify(next.json));
+      }
+      return fetchImpl(url, options);
+    },
+  };
+  selectedFiles = restoredFiles.map((item) => ({
+    ...item, ciphertext: Uint8Array.from(item.ciphertext),
+    cek: crypto.randomBytes(32),
+  }));
+  const raceOutcome = await guarded({ catalogInput: racedCatalogInput })
+    .then(() => "ACCEPTED", () => "DENIED");
+  assert.equal(successorDuringGet, true, "signed CAS successor committed during real GET");
+  assert.equal(raceOutcome, "DENIED",
+    "superseded signed catalog cannot release historical CEKs after concurrent GET");
+  assert.equal(selectedFiles[0].cek.every((byte) => byte === 0), true,
+    "a concurrent signed successor must zero every pending CEK");
 });

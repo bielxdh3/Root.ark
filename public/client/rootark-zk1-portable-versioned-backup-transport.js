@@ -185,6 +185,14 @@
       if (crossCheck.signedCatalogCasCoverageVerified !== true
         || crossCheck.protectedCiphertextReadbackVerified !== true
         || crossCheck.authorizesCutover !== false) deny();
+      // Each protected historical GET is asynchronous. A newer, genuinely
+      // signed CAS successor can commit after the second preflight while an
+      // old ciphertext is in flight. Reauthenticate the complete head AFTER
+      // the last GET; a changed head must zero all decrypted CEKs below.
+      const finalCatalog = await catalog.openCatalog(input.catalogInput);
+      if (finalCatalog.sequence !== verified.sequence
+        || finalCatalog.catalogDigest !== verified.catalogDigest
+        || finalCatalog.totalCount !== verified.totalCount) deny();
       assertLive(input.assertLive);
       return Object.freeze({ ...recovered, signedCatalogCasCoverageVerified: true,
         protectedCiphertextReadbackVerified: true, authorizesProductionRestore: false,
