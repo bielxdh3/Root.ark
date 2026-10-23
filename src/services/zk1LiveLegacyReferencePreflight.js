@@ -87,7 +87,7 @@ function inspectTable(db, source, secret) {
 }
 
 function inspectZk1LiveLegacyReferencePreflight({
-  optIn, databasePath, persistence = {},
+  optIn, databasePath, persistence = {}, backupDataDir,
 } = {}) {
   if (optIn !== true || typeof databasePath !== "string" || !path.isAbsolute(databasePath)
     || persistence.dbEnabled !== true || persistence.jsonReadFallback !== false
@@ -105,6 +105,11 @@ function inspectZk1LiveLegacyReferencePreflight({
     db.exec("BEGIN");
     const ephemeralKey = crypto.randomBytes(32);
     const observations = SOURCES.map((source) => inspectTable(db, source, ephemeralKey));
+    const backupEvidence = backupDataDir === undefined
+      ? Object.freeze({ observation: "uninspected", globallyComplete: false })
+      : require("./zk1LiveLegacyBackupEvidence").inspectZk1LiveLegacyBackupEvidence({
+        dataDir: backupDataDir, databasePath, db, runSecret: ephemeralKey,
+      });
     db.exec("COMMIT");
     if (!sameIdentity(before, fileIdentity(databasePath))) refuse();
     return Object.freeze({
@@ -115,6 +120,7 @@ function inspectZk1LiveLegacyReferencePreflight({
         domain: "legacy-server-visible-metadata",
         coverage: "partial",
         observations: Object.freeze(observations),
+        backupEvidence,
       }),
       protected: Object.freeze({
         domain: "zk-ciphertext-only",

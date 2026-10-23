@@ -78,3 +78,60 @@ providers, with stable generation/fence, collision-free joins, content
 readback, owner-scoped authorization and independent monotonic persistence.
 An incomplete or unknown class is never converted to an empty/clear class.
 The returned report is diagnostic only.
+
+## Independent local backup/history/alias/retention evidence (opt-in extension)
+
+The optional `backupDataDir` argument (an existing absolute legacy `data/`
+directory containing the selected SQLite file) invokes
+`zk1LiveLegacyBackupEvidence.js`. It is NOT enabled automatically. The
+extension reads a second, independently observed local source:
+`data/backup-history.json` if present and the ENTIRE
+`data/backups/` namespace. It checks registered archive basenames against
+the SQL `backup_history` IDs/statuses/checksums. JSON backup-history mirrors
+must match SQL identities when present, even if database fallback is disabled;
+stale/malformed/orphan mirrors refuse, rather than becoming evidence that old
+archives do not exist. A missing mirror is reported as `jsonHistoryRows:null`
+and is **not** interpreted as an empty historical corpus.
+
+The physical scanner recognizes `rootark-(backup|pre-restore)-...`.zip
+archives, paired `.retention-tombstone` and `.retention-tombstone.json`
+files, and `.retention-transactions/tx-<uuid>/transaction.json` states
+(`prepared`, `archive_moved`, `history_removed`, `cleanup_committed`).
+Each named artifact must correspond to an unambiguous backup ID/filename.
+Where present, backup checksums are checked against independently read bytes;
+transaction and tombstone checksums and their canonical local paths must
+agree with the corresponding physical aliases and histories. No
+`recoverRetentionTombstones`, `cleanupRetention`, rename, unlink, SQL
+mutation, cloud GET or protected ZK route is called. Links, junctions, hardlink
+aliases, extra/unrecognized backup filenames, staged/incomplete forms,
+malformed transaction JSON, duplicate backup IDs, missing successful backup
+archives and unsupported unknown references cause an explicit refusal.
+
+The bounded experiment scans at most 5,000 entries per directory, 32 MiB per
+file, **64 MiB aggregate**, 256 KiB per metadata JSON, and rechecks every
+inspected file identity/size/mtime/ctime and directory identity at the end.
+Backups exceeding these limits intentionally fail closed; no production
+backup workflow uses this inspector. Ordinary concurrent legacy writes,
+undetected same-size same-time substitutions, Windows power-loss durability,
+privileged filesystem attacks, cloud staging and remote-only snapshots remain
+unproved; a real authoritative inventory requires independent generations,
+quiescence, archive ZIP manifest verification, remote copies and signed owner
+authority. The physical content may still be server-readable legacy data;
+**never** forward it to the ZK plane.
+
+The response adds only `legacy.backupEvidence` with bounded numerical counts,
+`globallyComplete:false` and a per-invocation HMAC. It contains no raw
+filenames, paths, archive bytes, account IDs or private keys. With no
+`backupDataDir`, the field explicitly says `observation:"uninspected"`.
+All prior `wholeCorpusVerified:false`, `authorizesCutover:false`,
+`canDeleteLegacy:false` and `snapshotOwnerSigned:false` guarantees remain.
+
+`test/issue-65-live-legacy-backup-evidence.test.js` uses disposable real
+SQLite, filesystem/retention fixtures and a localhost authenticated HTTP
+**test-only** wrapper. It tests forged history, extra hardlink/alias/archive,
+corrupt/missing payload, mismatched checksum, tombstone and transaction drift,
+unsafe paths, unknown reference classes, oversize refusal and source survival.
+The existing six-class SQL and unrelated legacy tests remain separate.
+An in-memory mutation that bypasses this second independent inspection was
+RED **0 PASS / 7 FAIL**; this is an intentional insecure mutant, not a prior
+production regression.
