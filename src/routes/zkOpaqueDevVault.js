@@ -4,6 +4,7 @@
 // handles plaintext; normal Root.ark uploads/downloads remain unchanged.
 const { OpaqueDevVaultStore } = require("../services/zkOpaqueDevVault");
 const fs = require("node:fs");
+const express = require("express");
 const SODIUM_JS = require.resolve("libsodium-sumo");
 const SODIUM_WRAPPERS_JS = require.resolve("libsodium-wrappers-sumo");
 
@@ -55,8 +56,11 @@ function registerOpaqueDevVaultRoutes({ app, authenticate, requirePermission, db
     }
   };
   const reader = [neverCache, authenticate, requirePermission("listFiles")];
-  const writer = [neverCache, authenticate, requirePermission("upload")];
-  const deleter = [neverCache, authenticate, requirePermission("delete")];
+  // Larger opaque envelopes are parsed only after session, CSRF and permission
+  // checks. GET requests and unknown/disabled routes never parse a JSON body.
+  const opaqueJsonParser = express.json({ limit: "9mb" });
+  const writer = [neverCache, authenticate, requirePermission("upload"), opaqueJsonParser];
+  const deleter = [neverCache, authenticate, requirePermission("delete"), opaqueJsonParser];
 
   // Installed, audited npm assets are served only while the dev-vault feature
   // is enabled. No third-party CDN or browser request to an external host.

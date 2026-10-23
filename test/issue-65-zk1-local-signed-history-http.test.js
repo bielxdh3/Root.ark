@@ -16,7 +16,6 @@ const b64 = (value) => Buffer.from(value).toString("base64url");
 test("opt-in signed zk-1 history API authenticates, isolates owners, verifies signed append, paginates and conflicts", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-http-"));
   const app = express();
-  app.use(express.json({ limit: "9mb" }));
   const authentication = (req, res, next) => {
     if (req.headers.authorization !== "Bearer example-test-token")
       return res.status(401).json({ error: "UNAUTHORIZED" });

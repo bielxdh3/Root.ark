@@ -5990,15 +5990,15 @@ if ((NODE_ENV === "development" || NODE_ENV === "test")
 app.use(express.static("./public"));
 app.post("/upload-chunk", uploadChunkPeerRateLimit);
 app.use(apiRequestRateLimit);
+// Express routes ignore case and accept a trailing slash by default. Match the
+// same dev API families BEFORE the global body parser, including when disabled:
+// otherwise unknown routes or unauthenticated requests allocate up to 9 MiB.
+// Dev route handlers install their JSON parsers only after auth and permission.
+const isDeferredZkDevApiPath = (pathname) =>
+  /^\/zk-dev\/v1\/(?:objects|zk1-history)(?:\/|$)/i.test(pathname);
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
-  if (req.method === "POST" && req.path === "/zk-dev/v1/zk1-history"
-    && process.env.ROOTARK_ZK_DEV_VAULT_ENABLED === "true"
-    && ["development", "test"].includes(NODE_ENV)) {
-    // Parsing the larger signed-manifest envelope happens inside its
-    // dedicated route, AFTER authentication and upload authorization.
-    return next();
-  }
+  if (isDeferredZkDevApiPath(req.path)) return next();
   if (shouldDeferZk1JsonParsing(req, {
     contentConfig: process.env.ROOTARK_ZK1_CONTENT_CONFIG, environment: NODE_ENV,
   })) {
@@ -6006,8 +6006,7 @@ app.use((req, res, next) => {
     // 8kb for multiprovider restore) precede any body parsing.
     return next();
   }
-  if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")
-    || req.path === "/zk-dev/v1/objects" || req.path.startsWith("/zk-dev/v1/objects/")) {
+  if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) {
     return syncJsonParser(req, res, next);
   }
   return express.json()(req, res, next);
