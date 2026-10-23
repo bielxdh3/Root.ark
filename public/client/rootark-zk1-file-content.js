@@ -13,6 +13,8 @@
   const decode = new TextDecoder("utf-8", { fatal: true });
   const FORMAT = "rootark-zk1-file-v1";
   const DOMAIN = "Root.ark/zk-1/content-aead/v1\0";
+  const MOVE_FORMAT = "rootark-zk1-file-v2";
+  const MOVE_DOMAIN = "Root.ark/zk-1/content-aead/v2\0";
   const MAX_PLAIN = 2 * 1024 * 1024;
   const MAX_WIRE = 4 * 1024 * 1024;
   const B64 = /^[A-Za-z0-9_-]+$/;
@@ -75,8 +77,9 @@
       || cek.algorithm?.name !== "AES-GCM" || cek.algorithm?.length !== 256
       || !cek.usages.includes("encrypt") || !cek.usages.includes("decrypt")) fail();
   }
-  function aadFor(metadata) {
-    return encode.encode(DOMAIN + JSON.stringify(normalizedMetadata(metadata)));
+  function aadFor(metadata, format = FORMAT) {
+    return encode.encode((format === MOVE_FORMAT ? MOVE_DOMAIN : DOMAIN)
+      + JSON.stringify(normalizedMetadata(metadata)));
   }
   function validName(name) {
     return typeof name === "string" && name.length >= 1 && name.length <= 255
@@ -100,6 +103,16 @@
     } finally { source.fill(0); }
   }
   async function encryptFile({ cek, metadata, name, mediaType, data }) {
+    return sealFile({ cek, metadata, name, mediaType, data }, FORMAT, undefined);
+  }
+  // A folder reference stays inside the AEAD payload; the store only sees an
+  // opaque object/version chain. The new domain prevents V1/V2 substitution.
+  async function encryptFileWithParent({ cek, metadata, name, mediaType, data,
+    parentFolderId }) {
+    if (parentFolderId !== null) id(parentFolderId);
+    return sealFile({ cek, metadata, name, mediaType, data }, MOVE_FORMAT, parentFolderId);
+  }
+  async function sealFile({ cek, metadata, name, mediaType, data }, format, parentFolderId) {
     if (!subtle) fail();
     keyIsValid(cek);
     const context = normalizedMetadata(metadata);
@@ -109,14 +122,15 @@
     if (raw.length > MAX_PLAIN) fail();
     const payload = encode.encode(JSON.stringify({
       name, mediaType, length: raw.length, content: b64(raw),
+      ...(format === MOVE_FORMAT ? { parentFolderId } : {}),
     }));
     const nonce = webCrypto.getRandomValues(new Uint8Array(12));
     try {
       const sealed = new Uint8Array(await subtle.encrypt({
-        name: "AES-GCM", iv: nonce, additionalData: aadFor(context), tagLength: 128,
+        name: "AES-GCM", iv: nonce, additionalData: aadFor(context, format), tagLength: 128,
       }, cek, payload));
       const wire = encode.encode(JSON.stringify({
-        format: FORMAT, algorithm: "AES-256-GCM", metadata: context,
+        format, algorithm: "AES-256-GCM", metadata: context,
         nonce: b64(nonce), ciphertext: b64(sealed),
       }));
       if (wire.length > MAX_WIRE) fail();
@@ -134,7 +148,8 @@
     try {
       const value = JSON.parse(decode.decode(encoded));
       strict(value, ["format", "algorithm", "metadata", "nonce", "ciphertext"]);
-      if (value.format !== FORMAT || value.algorithm !== "AES-256-GCM") fail();
+      if (![FORMAT, MOVE_FORMAT].includes(value.format)
+        || value.algorithm !== "AES-256-GCM") fail();
       const receivedMetadata = normalizedMetadata(value.metadata);
       if (JSON.stringify(expected) !== JSON.stringify(receivedMetadata)) fail();
       // Reject any ambiguous or alternative serialization before accepting
@@ -142,19 +157,25 @@
       if (JSON.stringify(value) !== decode.decode(encoded)) fail();
       decrypted = new Uint8Array(await subtle.decrypt({
         name: "AES-GCM", iv: from64(value.nonce, 12, 12),
-        additionalData: aadFor(expected), tagLength: 128,
+        additionalData: aadFor(expected, value.format), tagLength: 128,
       }, cek, from64(value.ciphertext, 16, MAX_WIRE)));
       const payload = JSON.parse(decode.decode(decrypted));
-      strict(payload, ["name", "mediaType", "length", "content"]);
+      strict(payload, ["name", "mediaType", "length", "content",
+        ...(value.format === MOVE_FORMAT ? ["parentFolderId"] : [])]);
+      if (value.format === MOVE_FORMAT && payload.parentFolderId !== null)
+        id(payload.parentFolderId);
       if (!validName(payload.name) || typeof payload.mediaType !== "string"
         || payload.mediaType.length > 128 || /[\u0000-\u001f\u007f]/.test(payload.mediaType)
         || !Number.isSafeInteger(payload.length) || payload.length < 0
         || payload.length > MAX_PLAIN) fail();
       const data = from64(payload.content, 0, MAX_PLAIN);
       if (payload.length !== data.length) fail();
-      return { name: payload.name, mediaType: payload.mediaType, data };
+      return { name: payload.name, mediaType: payload.mediaType, data,
+        ...(value.format === MOVE_FORMAT
+          ? { parentFolderId: payload.parentFolderId } : {}) };
     } catch (_) { fail(); }
     finally { decrypted?.fill(0); }
   }
-  return Object.freeze({ generateFileCek, importFileCek, encryptFile, decryptFile });
+  return Object.freeze({ generateFileCek, importFileCek, encryptFile,
+    encryptFileWithParent, decryptFile });
 }));
