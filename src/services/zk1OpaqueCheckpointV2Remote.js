@@ -620,8 +620,9 @@ function createOpaqueCheckpointV2HttpsClient({ endpoint, ca, clientKey, clientCe
   if (same(casFp, floorFp)
     || (!same(fp(signer), casFp) && !same(fp(signer), floorFp))) fail();
   const pin = serverFingerprint256.toUpperCase();
-  async function request(route, raw, proof) {
-    const nonce = crypto.randomBytes(32);
+  async function request(route, raw, proof, headChallenge) {
+    const nonce = headChallenge === undefined
+      ? crypto.randomBytes(32) : bytes(headChallenge, 32);
     const encoded = Buffer.from(JSON.stringify({ raw: raw?.toString("base64url") || null,
       proof: proof?.toString("base64url") || null, nonce: nonce.toString("base64url") }));
     const outcome = await new Promise((resolve, reject) => {
@@ -670,7 +671,7 @@ function createOpaqueCheckpointV2HttpsClient({ endpoint, ca, clientKey, clientCe
             headDigest: digest, checkpointDigest: checkpoint,
             operationId: ZERO, casFp, floorFp, signer, nonce, fresh: true });
           if (outcome.operationId !== null) fail();
-          return { state: "V1_BASELINE", sequence: 128,
+          return { state: "V1_BASELINE", sequence: 128, raw: Buffer.from(rawProof),
             headDigest: digest, checkpointDigest: checkpoint };
       }
       if (!rawProof || !["PREPARED", "CAS_COMMITTED", "FINALIZED"].includes(outcome.state)) fail();
@@ -701,10 +702,13 @@ function createOpaqueCheckpointV2HttpsClient({ endpoint, ca, clientKey, clientCe
     commit: (raw, floorPrepare) => request("/v2/commit", raw, floorPrepare),
     finalize: (casCommit) => request("/v2/finalize", null, casCommit),
     attest: (floorFinalized) => request("/v2/attest", null, floorFinalized),
-    head: () => request("/v2/head"),
+    head: (challenge) => request("/v2/head", null, null, challenge),
   });
   pinnedV2Clients.add(client);
   return client;
+}
+function isOpaqueCheckpointV2PinnedClient(client) {
+  return pinnedV2Clients.has(client);
 }
 
 function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
@@ -827,4 +831,5 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
 
 module.exports = { OpaqueCheckpointV2Authority, createOpaqueCheckpointV2HttpsServer,
   createOpaqueCheckpointV2HttpsClient, signCheckpointOwnerApprovalV2,
-  createOpaqueCheckpointV2Coordinator, inspectIntent, receiptMatches };
+  createOpaqueCheckpointV2Coordinator, inspectIntent, receiptMatches,
+  isOpaqueCheckpointV2PinnedClient };

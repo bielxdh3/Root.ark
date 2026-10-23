@@ -9,6 +9,8 @@ const { registerZk1AuthenticatedMultiproviderRestoreRoute } =
   require("./zk1AuthenticatedMultiproviderRestoreRoutes");
 const { verifyRelayedAuthorityProof } =
   require("../services/zk1AuthorityRelayProofVerifier");
+const { isOpaqueCheckpointV2PinnedClient } =
+  require("../services/zk1OpaqueCheckpointV2Remote");
 const FIELDS = Object.freeze([
   "account_id", "compartment_id", "keyring_id", "device_id", "operation",
   "object_id", "expected_object_revision", "manifest_revision", "manifest_digest",
@@ -53,7 +55,7 @@ function authorizationWire(raw) {
 
 function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
   requirePermission, resolveTrustedScope, multiproviderRestore = null,
-  opaqueCatalog = null,
+  opaqueCatalog = null, opaqueCheckpointV2 = null,
   environment = "development" }) {
   if (!app || typeof app.post !== "function" || !store
     || typeof store.put !== "function" || typeof store.get !== "function"
@@ -147,6 +149,47 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
   };
   const parseSealedContent = express.json({ limit: "6mb", type: "application/json" });
   const parseAuthorityChallenge = express.json({ limit: "512b", type: "application/json" });
+  if (opaqueCheckpointV2 !== null) {
+    const { casClient, floorClient } = opaqueCheckpointV2;
+    if (!isOpaqueCheckpointV2PinnedClient(casClient)
+      || !isOpaqueCheckpointV2PinnedClient(floorClient)
+      || casClient.role !== "CAS" || floorClient.role !== "FLOOR"
+      || casClient.publicKey.equals(floorClient.publicKey)
+      || !store.signedHistoryRequired) invalid();
+    app.post("/zk-1/v1/catalog/authority/v2-heads", fenceHeaders, authenticate,
+      requirePermission("listFiles"), parseAuthorityChallenge, async (req, res) => {
+        try {
+          exact(req.body, ["nonce"]);
+          const nonce = b64(req.body.nonce, 32);
+          if (nonce.length !== 32) invalid();
+          const scope = resolveTrustedScope(req.user);
+          if (!scope) invalid();
+          const user = { username: req.user.username, sessionVersion: req.user.sessionVersion };
+          const [cas, floor] = await Promise.all([
+            casClient.head(nonce), floorClient.head(nonce),
+          ]);
+          const z = require("../crypto/rootark-zk-1");
+          for (const [answer, role] of [[cas, "CAS"], [floor, "FLOOR"]]) {
+            if (!Buffer.isBuffer(answer?.raw) || answer.raw.length > 4096) invalid();
+            const receipt = await z.decodeDeterministic(answer.raw);
+            if (receipt.role !== role
+              || !(Buffer.isBuffer(receipt.nonce) || receipt.nonce instanceof Uint8Array)
+              || !Buffer.from(receipt.nonce).equals(nonce)
+              || ["account_id", "compartment_id", "keyring_id"].some(
+                (field) => !(Buffer.isBuffer(receipt[field])
+                  || receipt[field] instanceof Uint8Array)
+                  || !Buffer.from(receipt[field]).equals(scope[field]))) invalid();
+          }
+          recheckSession(req, user, scope, "listFiles");
+          if (res.headersSent || res.destroyed || res.writableEnded) invalid();
+          res.status(200).json({ casProofBase64: cas.raw.toString("base64url"),
+            floorProofBase64: floor.raw.toString("base64url") });
+        } catch (error) {
+          if (!res.headersSent && !res.destroyed)
+            res.status(error?.httpStatus || 503).json({ error: "ZK_CHECKPOINT_V2_UNAVAILABLE" });
+        }
+      });
+  }
   // The normal workspace discovers this opt-in capability only through its
   // authenticated session. Registration itself is dev/test-only (bootstrap).
   // Never publish the configured owner's scope or authority pins to browsers.
@@ -159,7 +202,8 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
         // This reports a mode, never the owner's private scope or key pins.
         res.json({ enabled: true, securityVersion: store.signedHistoryRequired === true ? 2 : 1,
           signedHistoryRequired: store.signedHistoryRequired === true,
-          ...(opaqueCatalog !== null ? { opaqueCatalogV1: true } : {}) });
+          ...(opaqueCatalog !== null ? { opaqueCatalogV1: true } : {}),
+          ...(opaqueCheckpointV2 !== null ? { opaqueCheckpointV2Read: true } : {}) });
       } catch (_) { res.status(403).json({ error: "ZK_CONTENT_DENIED" }); }
     });
   // POST-for-read prevents accidental caches and keeps signed nonces out of URLs.

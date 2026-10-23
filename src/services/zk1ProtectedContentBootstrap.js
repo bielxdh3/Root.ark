@@ -183,6 +183,7 @@ function registerZk1ProtectedContentFromConfig({
   app, authenticate, requirePermission, configPath, environment,
   multiproviderRestore = null,
   opaqueCatalogAuthority = null,
+  opaqueCheckpointV2 = null,
 }) {
   if (!["development", "test"].includes(environment)
     || !app || typeof app.post !== "function"
@@ -277,7 +278,7 @@ function registerZk1ProtectedContentFromConfig({
       : new Zk1OpaqueCatalog({ store, authority: selectedCatalogAuthority });
     registerZk1ProtectedObjectRoutes({ app, store, authenticate, requirePermission,
       resolveTrustedScope: (user) => user?.username === config.username ? scope : null,
-      environment, multiproviderRestore, opaqueCatalog });
+      environment, multiproviderRestore, opaqueCatalog, opaqueCheckpointV2 });
   } catch (error) {
     store.close();
     throw error;

@@ -8,6 +8,11 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const Database = require("better-sqlite3");
 const { spawn } = require("node:child_process");
+const vm = require("node:vm");
+const express = require("express");
+const { registerZk1ProtectedObjectRoutes } =
+  require("../src/routes/zk1ProtectedObjectRoutes");
+const browserV2 = require("../public/client/rootark-zk1-browser-authority-head-relay");
 const z = require("../src/crypto/rootark-zk-1");
 const ownerManifest = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const fixtures = require("./support/issue-65-recovery-v2-fixtures");
@@ -189,17 +194,26 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   // B is enrolled and active, A is owner-revoked at the later epoch.
   assert.equal(state.headManifest.devices.find((d) =>
     d.device_id === deviceA.device_id).revoked_at_epoch !== null, true);
+  const encryptedRecord = { object_id: encoded(crypto.randomBytes(16)),
+    revision: 1, epoch: Number(state.headManifest.current_epoch),
+    ciphertext_digest: crypto.randomBytes(32),
+    metadata_ciphertext: crypto.randomBytes(284) };
+  const encryptedPage = Buffer.from(await z.encodeDeterministic([encryptedRecord]));
+  const encryptedPageDigest = crypto.createHash("sha256")
+    .update(Buffer.from("Root.ark/zk-1/opaque-catalog-page/v1\0"))
+    .update(encryptedPage).digest();
   const nextHeader = { type: "rootark-zk1-opaque-catalog/v1", ...scope,
     sequence: 129, previous_digest: oldDigest,
     manifest_revision: Number(state.headManifest.revision),
     manifest_digest: await ownerManifest.recoveryManifestDigestV2(state.headManifest),
     epoch: Number(state.headManifest.current_epoch),
     signer_device_id: deviceB.device_id,
-    total_count: 0, page_digests: [], issued_at: now() };
+    total_count: 1, page_digests: [encryptedPageDigest], issued_at: now() };
   const nextRaw = Buffer.from(await z.encodeDeterministic(nextHeader));
   const nextSig = crypto.sign(null, Buffer.concat([HEAD_DOMAIN, nextRaw]), keys(deviceB));
   const newDigest = hd(nextRaw, nextSig);
-  const records = [{ header: nextRaw, signature: nextSig, sequence: 129, page_bodies: [] }];
+  const records = [{ header: nextRaw, signature: nextSig, sequence: 129,
+    page_bodies: [encryptedPage] }];
   const checkpoint129 = await createAuthenticatedOpaqueCatalogArchiveV2({
     scope, records, previousSequence: 128, previousDigest: oldDigest,
     previousCheckpointDigest: oldCheckpoint,
@@ -302,7 +316,7 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   const retiredSignature = crypto.sign(null, Buffer.concat([HEAD_DOMAIN, retiredBytes]),
     keys(deviceA));
   const retiredRecord = { sequence: 129, header: retiredBytes,
-    signature: retiredSignature, page_bodies: [] };
+    signature: retiredSignature, page_bodies: [encryptedPage] };
   const retiredCheckpoint = await createAuthenticatedOpaqueCatalogArchiveV2({
     scope, records: [retiredRecord], previousSequence: 128, previousDigest: oldDigest,
     previousCheckpointDigest: oldCheckpoint, resolveCatalogSigner: async () => signerA,
@@ -366,6 +380,110 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   assert.equal((await handles.casClient.head()).state, "FINALIZED");
   assert.equal((await handles.floorClient.head()).state, "FINALIZED");
   assert.equal((await handles.coordinator.readConsistent(intent)).sequence, 129);
+  // Same-origin authenticated session relay -> independent V2 mTLS providers
+  // -> browser verifies both fresh Ed25519 receipts and the owner-approved
+  // single-record 129 archive. No Node/SQLite APIs enter the browser client.
+  const web = express();
+  const relayUser = { username: "fixture", sessionVersion: 7 };
+  let currentSession = 7;
+  web.use((req, _res, next) => { req.user = { ...relayUser, sessionVersion: currentSession }; next(); });
+  registerZk1ProtectedObjectRoutes({
+    app: web, environment: "test", store: {
+      signedHistoryRequired: true,
+      put() {}, get() {},
+    },
+    authenticate: (req, _res, next) => { req.user = {
+      username: "fixture", sessionVersion: currentSession,
+    }; next(); },
+    requirePermission: () => (_req, _res, next) => next(),
+    resolveTrustedScope: () => scope,
+    opaqueCheckpointV2: { casClient: handles.casClient, floorClient: handles.floorClient },
+  });
+  const webServer = await new Promise((resolve) => {
+    const created = web.listen(0, "127.0.0.1", () => resolve(created));
+  });
+  try {
+    const siteOrigin = "http://127.0.0.1:" + webServer.address().port + "/";
+    const v2Input = {
+      origin: siteOrigin, fetchImpl: fetch, assertLive: () => {},
+      csrfToken: () => "fixture-csrf",
+      scope: Object.fromEntries(Object.entries(scope).map(([name, v]) => [name, encoded(v)])),
+      previousDigest: new Uint8Array(oldDigest),
+      previousCheckpointDigest: new Uint8Array(oldCheckpoint),
+      ownerRevision: Number(state.headManifest.revision),
+      ownerDigest: new Uint8Array(await ownerManifest.recoveryManifestDigestV2(
+        state.headManifest)),
+      ownerEpoch: Number(state.headManifest.current_epoch),
+      ownerDeviceId: deviceB.device_id, signedIntent: new Uint8Array(intent),
+      casKeyRaw: new Uint8Array(v2CasKeys.publicKey.export({ type: "spki", format: "der" }).subarray(-32)),
+      casSpkiPin: new Uint8Array(fp(v2CasKeys.publicKey)),
+      floorKeyRaw: new Uint8Array(v2FloorKeys.publicKey.export({ type: "spki", format: "der" }).subarray(-32)),
+      floorSpkiPin: new Uint8Array(fp(v2FloorKeys.publicKey)),
+      checkpointKeyRaw: new Uint8Array(checkpoint.publicKey.export({ type: "spki", format: "der" }).subarray(-32)),
+      checkpointSpkiPin: new Uint8Array(fp(checkpoint.publicKey)),
+      deviceKeyRaw: new Uint8Array(owner.publicKey.export({ type: "spki", format: "der" }).subarray(-32)),
+      deviceSpkiPin: new Uint8Array(fp(owner.publicKey)),
+    };
+    const confirmedV2 = await browserV2.readFinalizedV2(v2Input);
+    assert.equal(confirmedV2.sequence, 129);
+    assert.equal(confirmedV2.independentlyFinalized, true);
+    assert.equal(confirmedV2.productionDurabilityProven, false);
+    assert.equal(confirmedV2.totalCount, 1);
+    assert.equal(confirmedV2.rows[0].objectId, encryptedRecord.object_id);
+    let storedResponse = null;
+    assert.equal((await browserV2.readFinalizedV2({
+      ...v2Input,
+      fetchImpl: async (...args) => {
+        const valid = await fetch(...args);
+        storedResponse = await valid.text();
+        return new Response(storedResponse, {
+          status: valid.status, headers: { "content-type": "application/json" },
+        });
+      },
+    })).sequence, 129);
+    await assert.rejects(browserV2.readFinalizedV2({
+      ...v2Input,
+      fetchImpl: async () => new Response(storedResponse, {
+        status: 200, headers: { "content-type": "application/json" },
+      }),
+    }), /UNVERIFIED/, "a perfectly signed cached dual proof cannot answer a fresh browser challenge");
+    await assert.rejects(browserV2.readFinalizedV2({
+      ...v2Input,
+      ownerRevision: v2Input.ownerRevision - 1,
+    }), /UNVERIFIED/, "historical owner manifest is never treated as current");
+    const changed = await z.decodeDeterministic(intent);
+    changed.owner_signature = crypto.randomBytes(64);
+    await assert.rejects(browserV2.readFinalizedV2({
+      ...v2Input, signedIntent: new Uint8Array(await z.encodeDeterministic(changed)),
+    }), /UNVERIFIED/, "forged owner approval is denied before relay");
+    await assert.rejects(browserV2.readFinalizedV2({
+      ...v2Input, casSpkiPin: new Uint8Array(crypto.randomBytes(32)),
+    }), /UNVERIFIED/, "independently pinned CAS signer cannot change");
+    await assert.rejects(browserV2.readFinalizedV2({
+      ...v2Input, previousDigest: new Uint8Array(crypto.randomBytes(32)),
+    }), /UNVERIFIED/, "old V1 128 predecessor pin cannot roll back or fork");
+    let switched = false;
+    await assert.rejects(browserV2.readFinalizedV2({
+      ...v2Input, csrfToken: () => switched ? "new-session" : "fixture-csrf",
+      fetchImpl: async (...args) => { const response = await fetch(...args);
+        switched = true; return response; },
+    }), /UNVERIFIED/, "session switch during relay must fail closed");
+    const vmContext = { crypto: crypto.webcrypto, TextEncoder, TextDecoder,
+      Uint8Array, ArrayBuffer, URL, btoa, atob, AbortController, setTimeout,
+      clearTimeout, Date, Promise };
+    vmContext.globalThis = vmContext;
+    vm.runInNewContext(fs.readFileSync(path.join(__dirname,
+      "../public/client/rootark-zk1-browser-authority-head-relay.js"), "utf8"),
+    vmContext, { timeout: 1000 });
+    assert.equal(typeof vmContext.RootarkZk1BrowserAuthorityHeadRelay.readFinalizedV2, "function");
+    assert.equal((await vmContext.RootarkZk1BrowserAuthorityHeadRelay.readFinalizedV2(
+      Object.assign(Object.create(null), v2Input, {
+        scope: Object.assign(Object.create(null), v2Input.scope),
+      }))).sequence, 129,
+    "Edge-like VM uses only browser WebCrypto and same-origin relay");
+  } finally {
+    await new Promise((resolve) => webServer.close(resolve));
+  }
   await assert.rejects(handles.coordinator.publish(await makeIntent()),
     /CONFLICT/);
   assert.deepEqual((await handles.coordinator.reconcile(intent)).outcome, finished.outcome);

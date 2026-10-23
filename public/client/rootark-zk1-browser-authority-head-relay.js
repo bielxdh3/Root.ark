@@ -63,7 +63,7 @@
   }
   function append(...parts) {
     const length = parts.reduce((total, item) => total + item.length, 0);
-    if (length > 16384) deny();
+    if (length > 11 * 1024 * 1024) deny();
     const out = new Uint8Array(length);
     let at = 0;
     for (const part of parts) { out.set(part, at); at += part.length; }
@@ -83,7 +83,10 @@
   }
   function canonical(value) {
     if (value === null) return Uint8Array.of(0xf6);
-    if (typeof value === "number") return head(0, value);
+    if (value === false) return Uint8Array.of(0xf4);
+    if (value === true) return Uint8Array.of(0xf5);
+    if (typeof value === "number") return value >= 0
+      ? head(0, value) : head(1, -1 - value);
     if (typeof value === "string") {
       const raw = encoder.encode(value);
       return append(head(3, raw.length), raw);
@@ -99,8 +102,8 @@
     }
     deny();
   }
-  function decode(raw) {
-    strictBytes(raw, 1, 8192);
+  function decode(raw, maximum = 8192) {
+    strictBytes(raw, 1, maximum);
     let offset = 0;
     function take(n) {
       if (offset + n > raw.length) deny();
@@ -112,15 +115,18 @@
       if (depth > 12) deny();
       const tag = take(1)[0], major = tag >>> 5, info = tag & 31;
       if (tag === 0xf6) return null;
-      if (![0, 2, 3, 4, 5].includes(major) || info > 27) deny();
+      if (tag === 0xf4) return false;
+      if (tag === 0xf5) return true;
+      if (![0, 1, 2, 3, 4, 5].includes(major) || info > 27) deny();
       const count = info < 24 ? info : (() => {
         const n = { 24: 1, 25: 2, 26: 4, 27: 8 }[info];
         if (!n) deny();
         let size = 0;
         for (const byte of take(n)) size = size * 256 + byte;
-        return uint(size, 0, major === 0 ? Number.MAX_SAFE_INTEGER : 8192);
+        return uint(size, 0, major === 0 ? Number.MAX_SAFE_INTEGER : maximum);
       })();
       if (major === 0) return count;
+      if (major === 1) return -1 - count;
       if (major === 2) return take(count);
       if (major === 3) return decoder.decode(take(count));
       if (major === 4) return Array.from({ length: count }, () => read(depth + 1));
@@ -301,5 +307,243 @@
       catalogProbe: (input) => relay(casUrl, "proofBase64", input),
     });
   }
-  return Object.freeze({ createProbes });
+  const V2_RECEIPT = encoder.encode("Root.ark/zk-1/opaque-checkpoint-remote/receipt/v2\0");
+  const V2_OWNER = encoder.encode("Root.ark/zk-1/opaque-checkpoint-remote/owner-approval/v2\0");
+  const V2_HEAD = encoder.encode("Root.ark/zk-1/opaque-catalog-head/v1\0");
+  const V2_CHECKPOINT = encoder.encode("Root.ark/zk-1/opaque-catalog-checkpoint-sign/v2\0");
+  const V2_DIGEST = encoder.encode("Root.ark/zk-1/opaque-catalog-checkpoint-digest/v2\0");
+  const V2_LEAF = encoder.encode("Root.ark/zk-1/opaque-catalog-archive-leaf/v2\0");
+  const V2_PAGE = encoder.encode("Root.ark/zk-1/opaque-catalog-page/v1\0");
+  const V2_RECEIPT_FIELDS = ["type", ...SCOPE, "role", "state", "sequence",
+    "head_digest", "checkpoint_digest", "operation_id", "cas_signer_fp",
+    "floor_signer_fp", "nonce", "issued_at"];
+  const V2_OWNER_FIELDS = ["type", ...SCOPE, "operation_id", "checkpoint_digest",
+    "previous_sequence", "previous_digest", "previous_checkpoint_digest",
+    "final_sequence", "final_digest", "cas_signer_fp", "floor_signer_fp",
+    "checkpoint_signer_fp", "issued_at"];
+  const V2_CHECKPOINT_FIELDS = ["type", ...SCOPE, "previous_sequence", "previous_digest",
+    "final_sequence", "final_digest", "previous_checkpoint_digest",
+    "archive_root", "record_count", "issued_at"];
+  const V2_HEADER_FIELDS = ["type", ...SCOPE, "sequence", "previous_digest",
+    "manifest_revision", "manifest_digest", "epoch", "signer_device_id",
+    "total_count", "page_digests", "issued_at"];
+  async function digest(...parts) {
+    return new Uint8Array(await webCrypto.subtle.digest("SHA-256", append(...parts)));
+  }
+  function scoped(value, scope) {
+    for (const field of SCOPE) if (!equal(strictBytes(value[field],
+      field === "compartment_id" ? 1 : 16,
+      field === "compartment_id" ? 128 : 16), scope[field])) deny();
+  }
+  // Read-only browser boundary for the single verified global rollover 128->129.
+  // The user imports the complete owner-approved intent from an offline channel.
+  // The server only relays nonce-bound independently signed CAS and floor heads.
+  async function readFinalizedV2(input) {
+    exact(input, ["origin", "fetchImpl", "assertLive", "csrfToken", "scope",
+      "previousDigest", "previousCheckpointDigest", "ownerRevision", "ownerDigest",
+      "ownerEpoch", "ownerDeviceId", "signedIntent", "casKeyRaw", "casSpkiPin",
+      "floorKeyRaw", "floorSpkiPin", "checkpointKeyRaw", "checkpointSpkiPin",
+      "deviceKeyRaw", "deviceSpkiPin"]);
+    if (!webCrypto?.subtle || !webCrypto.getRandomValues
+      || typeof input.fetchImpl !== "function"
+      || typeof input.assertLive !== "function"
+      || typeof input.csrfToken !== "function"
+      || typeof AbortController !== "function") deny();
+    exact(input.scope, SCOPE);
+    const scope = Object.fromEntries(SCOPE.map((name) => {
+      const b = from64(input.scope[name]);
+      strictBytes(b, name === "compartment_id" ? 1 : 16,
+        name === "compartment_id" ? 128 : 16);
+      return [name, b];
+    }));
+    const previous = copy(input.previousDigest, 32);
+    const previousCheckpoint = copy(input.previousCheckpointDigest, 32);
+    if (previous.every((v) => v === 0) || previousCheckpoint.every((v) => v === 0)) deny();
+    const ownerDigest = copy(input.ownerDigest, 32);
+    const revision = uint(input.ownerRevision, 1), epoch = uint(input.ownerEpoch, 1);
+    if (typeof input.ownerDeviceId !== "string" || !input.ownerDeviceId) deny();
+    const url = urlFrom(input.origin, "v2-heads");
+    input.assertLive();
+    const [casKey, floorKey, checkpointKey, deviceKey] = await Promise.all([
+      verifyKey(input.casKeyRaw, input.casSpkiPin),
+      verifyKey(input.floorKeyRaw, input.floorSpkiPin),
+      verifyKey(input.checkpointKeyRaw, input.checkpointSpkiPin),
+      verifyKey(input.deviceKeyRaw, input.deviceSpkiPin),
+    ]);
+    const [casFp, floorFp, checkpointFp] = [
+      input.casSpkiPin, input.floorSpkiPin, input.checkpointSpkiPin];
+    if (equal(casFp, floorFp) || equal(casFp, checkpointFp)
+      || equal(floorFp, checkpointFp)) deny();
+    const intentRaw = strictBytes(input.signedIntent, 1, 10 * 1024 * 1024);
+    const intent = decode(intentRaw, 10 * 1024 * 1024);
+    exact(intent, ["type", ...SCOPE, "operation_id", "checkpoint_bytes",
+      "checkpoint_signature", "records", "previous_sequence", "previous_digest",
+      "previous_checkpoint_digest", "owner_approval", "owner_signature", "owner_evidence"]);
+    scoped(intent, scope);
+    if (intent.type !== "rootark-opaque-checkpoint-remote-intent/v2"
+      || intent.previous_sequence !== 128
+      || !equal(strictBytes(intent.previous_digest, 32), previous)
+      || !equal(strictBytes(intent.previous_checkpoint_digest, 32), previousCheckpoint)
+      || !Array.isArray(intent.records) || intent.records.length !== 1) deny();
+    const ownerEvidence = decode(strictBytes(intent.owner_evidence, 1,
+      2 * 1024 * 1024), 2 * 1024 * 1024);
+    exact(ownerEvidence, ["baseManifest", "baseReceipt", "transitions",
+      "packageEnvelopes", "witnessHeadRaw"]);
+    strictBytes(ownerEvidence.witnessHeadRaw, 1, 8192);
+    if (!Array.isArray(ownerEvidence.transitions)
+      || !Array.isArray(ownerEvidence.packageEnvelopes)) deny();
+    const operation = strictBytes(intent.operation_id, 32);
+    const record = intent.records[0];
+    exact(record, ["sequence", "header", "signature", "page_bodies"]);
+    if (record.sequence !== 129 || !Array.isArray(record.page_bodies)
+      || record.page_bodies.length > 128) deny();
+    const rawHead = strictBytes(record.header, 1, 16384);
+    const rawSignature = strictBytes(record.signature, 64);
+    const header = decode(rawHead, 16384);
+    exact(header, V2_HEADER_FIELDS); scoped(header, scope);
+    if (header.type !== "rootark-zk1-opaque-catalog/v1" || header.sequence !== 129
+      || !equal(strictBytes(header.previous_digest, 32), previous)
+      || !equal(strictBytes(header.manifest_digest, 32), ownerDigest)
+      || header.manifest_revision !== revision || header.epoch !== epoch
+      || header.signer_device_id !== input.ownerDeviceId
+      || !Array.isArray(header.page_digests)
+      || header.page_digests.length !== record.page_bodies.length
+      || uint(header.total_count, 0, 4096) > 4096
+      || header.page_digests.length !== Math.ceil(header.total_count / 32)) deny();
+    if (!await webCrypto.subtle.verify("Ed25519", deviceKey, rawSignature,
+      append(V2_HEAD, rawHead))) deny();
+    let count = 0, last = null;
+    const rows = [];
+    for (let index = 0; index < record.page_bodies.length; index++) {
+      const raw = strictBytes(record.page_bodies[index], 1, 16384);
+      if (!equal(await digest(V2_PAGE, raw), strictBytes(header.page_digests[index], 32))) deny();
+      const page = decode(raw, 16384);
+      if (!Array.isArray(page) || page.length < 1 || page.length > 32
+        || (index < record.page_bodies.length - 1 && page.length !== 32)) deny();
+      for (const row of page) {
+        exact(row, ["object_id", "revision", "epoch", "ciphertext_digest",
+          "metadata_ciphertext"]);
+        if (typeof row.object_id !== "string"
+          || !/^[A-Za-z0-9_-]{22}$/.test(row.object_id)
+          || to64(from64(row.object_id)) !== row.object_id
+          || !Number.isSafeInteger(row.revision) || row.revision < 1
+          || !Number.isSafeInteger(row.epoch) || row.epoch < 1
+          || row.epoch > epoch
+          || strictBytes(row.ciphertext_digest, 32).length !== 32
+          || strictBytes(row.metadata_ciphertext, 284).length !== 284) deny();
+        const order = row.object_id + ":" + String(row.revision).padStart(17, "0");
+        if (last !== null && order <= last) deny();
+        last = order; rows.push(Object.freeze({
+          objectId: row.object_id, revision: row.revision, epoch: row.epoch }));
+        count++;
+      }
+    }
+    if (count !== header.total_count) deny();
+    const headDigest = await digest(V2_HEAD, rawHead, rawSignature);
+    const checkpointBytes = strictBytes(intent.checkpoint_bytes, 1, 16384);
+    const checkpointSig = strictBytes(intent.checkpoint_signature, 64);
+    if (!await webCrypto.subtle.verify("Ed25519", checkpointKey, checkpointSig,
+      append(V2_CHECKPOINT, checkpointBytes))) deny();
+    const checkpointDigest = await digest(V2_DIGEST, checkpointBytes, checkpointSig);
+    const checkpoint = decode(checkpointBytes, 16384);
+    exact(checkpoint, V2_CHECKPOINT_FIELDS); scoped(checkpoint, scope);
+    if (checkpoint.type !== "rootark-zk1-opaque-catalog-checkpoint/v2"
+      || checkpoint.previous_sequence !== 128 || checkpoint.final_sequence !== 129
+      || checkpoint.record_count !== 1
+      || !equal(strictBytes(checkpoint.previous_digest, 32), previous)
+      || !equal(strictBytes(checkpoint.previous_checkpoint_digest, 32), previousCheckpoint)
+      || !equal(strictBytes(checkpoint.final_digest, 32), headDigest)
+      || !equal(strictBytes(checkpoint.archive_root, 32),
+        await digest(V2_LEAF, canonical(record)))) deny();
+    const approvalBytes = strictBytes(intent.owner_approval, 1, 4096);
+    const approval = decode(approvalBytes, 4096);
+    exact(approval, V2_OWNER_FIELDS); scoped(approval, scope);
+    if (approval.type !== "rootark-opaque-checkpoint-remote-owner-approval/v2"
+      || approval.previous_sequence !== 128 || approval.final_sequence !== 129
+      || !equal(strictBytes(approval.operation_id, 32), operation)
+      || !equal(strictBytes(approval.previous_digest, 32), previous)
+      || !equal(strictBytes(approval.previous_checkpoint_digest, 32), previousCheckpoint)
+      || !equal(strictBytes(approval.final_digest, 32), headDigest)
+      || !equal(strictBytes(approval.checkpoint_digest, 32), checkpointDigest)
+      || !equal(strictBytes(approval.cas_signer_fp, 32), casFp)
+      || !equal(strictBytes(approval.floor_signer_fp, 32), floorFp)
+      || !equal(strictBytes(approval.checkpoint_signer_fp, 32), checkpointFp)
+      || !await webCrypto.subtle.verify("Ed25519", deviceKey,
+        strictBytes(intent.owner_signature, 64), append(V2_OWNER, approvalBytes))) deny();
+    input.assertLive();
+    const csrf = input.csrfToken();
+    if (typeof csrf !== "string" || !csrf || csrf.length > 512) deny();
+    const nonce = webCrypto.getRandomValues(new Uint8Array(32));
+    const controller = new AbortController();
+    let timer;
+    let response;
+    try {
+      const deadline = new Promise((_ok, reject) => {
+        timer = setTimeout(() => { controller.abort(); reject(new Error("timeout")); }, 10000);
+      });
+      response = await Promise.race([input.fetchImpl(url, {
+        method: "POST", mode: "same-origin", credentials: "same-origin",
+        redirect: "error", cache: "no-store", signal: controller.signal,
+        headers: { "content-type": "application/json", accept: "application/json",
+          "x-csrf-token": csrf },
+        body: JSON.stringify({ nonce: to64(nonce) }),
+      }), deadline]);
+      input.assertLive();
+      if (csrf !== input.csrfToken() || response.status !== 200
+        || !/^application\/json(?:;\s*charset=utf-8)?$/i.test(
+          response.headers?.get("content-type") || "")) deny();
+      // Streamed size limit and a single absolute deadline covering headers and
+      // body prevent a compromised same-origin proxy from exhausting memory.
+      if (!response.body || typeof response.body.getReader !== "function") deny();
+      const readBody = async () => {
+        const reader = response.body.getReader();
+        const chunks = []; let count = 0;
+        try {
+          while (true) {
+            const part = await reader.read();
+            if (part.done) break;
+            if (!(part.value instanceof Uint8Array) || part.value.length === 0) deny();
+            count += part.value.length;
+            if (count > 12000) deny();
+            chunks.push(part.value);
+          }
+        } finally {
+          try { reader.releaseLock(); } catch (_) { /* aborted */ }
+        }
+        const joined = new Uint8Array(count);
+        let position = 0;
+        for (const chunk of chunks) { joined.set(chunk, position); position += chunk.length; }
+        return decoder.decode(joined);
+      };
+      const body = await Promise.race([readBody(), deadline]);
+      const result = JSON.parse(body);
+      exact(result, ["casProofBase64", "floorProofBase64"]);
+      for (const [field, role, signer] of [
+        ["casProofBase64", "CAS", casKey], ["floorProofBase64", "FLOOR", floorKey],
+      ]) {
+        const proof = decode(from64(result[field]));
+        exact(proof, [...V2_RECEIPT_FIELDS, "signature"]); scoped(proof, scope);
+        if (proof.type !== "rootark-opaque-checkpoint-remote-receipt/v2"
+          || proof.role !== role || proof.state !== "FINALIZED"
+          || proof.sequence !== 129 || !equal(strictBytes(proof.nonce, 32), nonce)
+          || Math.abs(uint(proof.issued_at) - Math.floor(Date.now() / 1000)) > 30
+          || !equal(strictBytes(proof.operation_id, 32), operation)
+          || !equal(strictBytes(proof.head_digest, 32), headDigest)
+          || !equal(strictBytes(proof.checkpoint_digest, 32), checkpointDigest)
+          || !equal(strictBytes(proof.cas_signer_fp, 32), casFp)
+          || !equal(strictBytes(proof.floor_signer_fp, 32), floorFp)) deny();
+        const signed = Object.fromEntries(V2_RECEIPT_FIELDS.map((n) => [n, proof[n]]));
+        if (!await webCrypto.subtle.verify("Ed25519", signer,
+          strictBytes(proof.signature, 64), append(V2_RECEIPT, canonical(signed)))) deny();
+      }
+      input.assertLive();
+      if (csrf !== input.csrfToken()) deny();
+      return Object.freeze({ sequence: 129, digest: to64(headDigest),
+        checkpointDigest: to64(checkpointDigest), totalCount: count,
+        rows: Object.freeze(rows), independentlyFinalized: true,
+        productionDurabilityProven: false });
+    } catch (_) { deny(); }
+    finally { clearTimeout(timer); controller.abort(); }
+  }
+  return Object.freeze({ createProbes, readFinalizedV2 });
 }));

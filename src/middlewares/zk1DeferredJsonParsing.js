@@ -10,6 +10,7 @@ const DEFERRED_PATHS = new Set([
   "/zk-1/v1/catalog/commit",
   "/zk-1/v1/catalog/authority/witness-head",
   "/zk-1/v1/catalog/authority/cas-head",
+  "/zk-1/v1/catalog/authority/v2-heads",
   "/zk-1/v1/multiprovider-restore/read",
 ]);
 

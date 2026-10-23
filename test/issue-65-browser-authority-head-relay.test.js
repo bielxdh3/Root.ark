@@ -24,7 +24,9 @@ test("global JSON deferral is restricted to exact opt-in development POST routes
   const names = ["/zk-1/v1/content/read", "/zk-1/v1/content/put",
     "/zk-1/v1/catalog/read", "/zk-1/v1/catalog/commit",
     "/zk-1/v1/catalog/authority/witness-head",
-    "/zk-1/v1/catalog/authority/cas-head", "/zk-1/v1/multiprovider-restore/read"];
+    "/zk-1/v1/catalog/authority/cas-head",
+    "/zk-1/v1/catalog/authority/v2-heads",
+    "/zk-1/v1/multiprovider-restore/read"];
   for (const path of names) {
     const req = { method: "POST", path };
     assert.equal(shouldDeferZk1JsonParsing(req,

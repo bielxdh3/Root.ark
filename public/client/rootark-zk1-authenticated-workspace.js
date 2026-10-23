@@ -734,6 +734,23 @@
       + '<label><input type="checkbox" data-zk1-field="catalog-lifecycle-opt-in"> Confirmo o head CAS e a origem externa do histórico e das CEKs.</label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button-quiet button" data-zk1-action="catalog-lifecycle">Conferir estado atual assinado</button></div>'
       + '</fieldset>'
+      + '<fieldset><legend>Checkpoint global V2 #129 (leitura, opt-in DEV)</legend>'
+      + '<p class="muted">Importe o intent CBOR assinado pelo dispositivo autorizado e as três chaves públicas fixadas offline. '
+      + 'O relay autenticado consulta o CAS e floor V2 independentes por mTLS. Somente duas confirmações Ed25519 FINALIZED, '
+      + 'o checkpoint Merkle completo, a aprovação e o grant owner-signed atual permitem listar IDs opacos. '
+      + 'Não publica nem faz GET de ciphertext. Os dados V1 permanecem na sequência 128.</p>'
+      + '<label>Intent completo V2 assinado CBOR (até 10 MiB)<input type="file" data-zk1-field="catalog-v2-intent" accept=".cbor,application/cbor,application/octet-stream"></label>'
+      + '<label>Chave CAS V2 Ed25519 raw (32 bytes)<input type="file" data-zk1-field="catalog-v2-cas-key"></label>'
+      + '<label>PIN SHA-256 SPKI CAS V2 (base64url)<input data-zk1-field="catalog-v2-cas-pin" maxlength="43" spellcheck="false"></label>'
+      + '<label>Chave floor V2 Ed25519 raw (32 bytes)<input type="file" data-zk1-field="catalog-v2-floor-key"></label>'
+      + '<label>PIN SHA-256 SPKI floor V2 (base64url)<input data-zk1-field="catalog-v2-floor-pin" maxlength="43" spellcheck="false"></label>'
+      + '<label>Chave checkpoint V2 Ed25519 raw (32 bytes)<input type="file" data-zk1-field="catalog-v2-checkpoint-key"></label>'
+      + '<label>PIN SHA-256 SPKI checkpoint V2 (base64url)<input data-zk1-field="catalog-v2-checkpoint-pin" maxlength="43" spellcheck="false"></label>'
+      + '<label>Digest checkpoint V1 #128 fixado fora do servidor (base64url)<input data-zk1-field="catalog-v2-predecessor-checkpoint" maxlength="43" spellcheck="false"></label>'
+      + '<label><input type="checkbox" data-zk1-field="catalog-v2-opt-in"> Autorizar somente consulta V2 autenticada do catálogo opaco.</label>'
+      + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-v2-read">Conferir CAS + floor V2 #129</button></div>'
+      + '<div data-zk1-field="catalog-v2-list" role="region" aria-label="Inventário V2 opaco autenticado"></div>'
+      + '</fieldset>'
       + '<fieldset><legend>Publicar versão cifrada no catálogo completo (DEV, opt-in)</legend>'
       + '<p class="muted">Selecione somente ciphertext já cifrado (16 bytes a 4 MiB). O nome é cifrado localmente com AES-GCM; '
       + 'a chave de metadados e o nome nunca são enviados ao servidor. O journal assinado é gravado localmente ANTES do PUT. '
@@ -881,7 +898,7 @@
       "migrate", "migration-finalize", "migration-batch", "archive-create", "archive-recover",
       "account-create", "account-recover", "versioned-create", "versioned-recover",
       "catalog-discover", "catalog-page", "catalog-get", "catalog-publish",
-      "catalog-lifecycle"].includes(action)) return;
+      "catalog-lifecycle", "catalog-v2-read"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -1017,6 +1034,68 @@
       }
       const trust = await grantAndOwner();
       assertLive();
+      if (action === "catalog-v2-read") {
+        if (field("catalog-v2-opt-in")?.checked !== true
+          || available.opaqueCheckpointV2Read !== true
+          || !trust.ownerHistoryCheckpoint
+          || trust.signedDeviceGrant.revoked_at_epoch !== null
+          || positive("catalog-sequence") !== 128) fail();
+        await window.RootarkZk1NormalBrowserTrustFloor.assertCurrent({
+          ownerPublicKey: trust.ownerPublicKey,
+          independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+          pinnedCurrentHead: trust.pinnedCurrentHead,
+          signedDeviceGrant: trust.signedDeviceGrant,
+          ownerHistoryCheckpoint: trust.ownerHistoryCheckpoint,
+          previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
+        });
+        assertLive();
+        if (!window.RootarkZk1BrowserAuthorityHeadRelay?.readFinalizedV2)
+          await loadScript("rootark-zk1-browser-authority-head-relay");
+        const v2 = window.RootarkZk1BrowserAuthorityHeadRelay;
+        if (!v2?.readFinalizedV2) fail();
+        const names = ["catalog-v2-cas-key", "catalog-v2-floor-key",
+          "catalog-v2-checkpoint-key"];
+        const keys = await Promise.all(names.map((name) => fileBytes(name, 32, 32)));
+        const deviceRaw = from64(trust.signedDeviceGrant.authorization_public_key);
+        const deviceKey = await crypto.subtle.importKey("raw", deviceRaw,
+          "Ed25519", true, ["verify"]);
+        const deviceSpki = new Uint8Array(await crypto.subtle.exportKey("spki", deviceKey));
+        const devicePin = new Uint8Array(await crypto.subtle.digest("SHA-256", deviceSpki));
+        const scope = Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+          .map((name) => [name, trust.signedDeviceGrant[name]]));
+        try {
+          const result = await v2.readFinalizedV2({
+            origin: location.origin + "/", fetchImpl: guardedFetch, assertLive,
+            csrfToken: () => { assertLive(); return initialCsrf; },
+            scope, previousDigest: from64(field("catalog-digest").value.trim()),
+            previousCheckpointDigest: from64(field("catalog-v2-predecessor-checkpoint").value.trim()),
+            ownerRevision: trust.pinnedCurrentHead.revision,
+            ownerDigest: trust.pinnedCurrentHead.digest,
+            ownerEpoch: trust.pinnedCurrentHead.epoch,
+            ownerDeviceId: trust.signedDeviceGrant.device_id,
+            signedIntent: await fileBytes("catalog-v2-intent", 1, 10 * 1024 * 1024),
+            casKeyRaw: keys[0], casSpkiPin: from64(field("catalog-v2-cas-pin").value.trim()),
+            floorKeyRaw: keys[1], floorSpkiPin: from64(field("catalog-v2-floor-pin").value.trim()),
+            checkpointKeyRaw: keys[2],
+            checkpointSpkiPin: from64(field("catalog-v2-checkpoint-pin").value.trim()),
+            deviceKeyRaw: deviceRaw, deviceSpkiPin: devicePin,
+          });
+          assertLive();
+          if (result.sequence !== 129 || result.independentlyFinalized !== true
+            || result.productionDurabilityProven !== false) fail();
+          const list = field("catalog-v2-list");
+          list.replaceChildren();
+          for (const row of result.rows) {
+            const p = document.createElement("p");
+            p.textContent = row.objectId + " · v" + row.revision;
+            list.append(p);
+          }
+          status("Checkpoint V2 #129 autenticado por CAS e floor independentes. "
+            + result.totalCount + " versão(ões) opacas; digest " + result.digest
+            + ". Sem GET, escrita ou prova de nuvem.");
+        } finally { for (const key of keys) key.fill(0); deviceRaw.fill(0); }
+        return;
+      }
       if (action === "catalog-publish") {
         if (field("catalog-write-opt-in")?.checked !== true
           || available.opaqueCatalogV1 !== true
