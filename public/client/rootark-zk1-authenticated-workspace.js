@@ -40,6 +40,7 @@
   // Session-local branded approval only: logout/close erases it and a new
   // browser profile must import independently anchored evidence again.
   let committedDeviceApproval = null;
+  let verifiedCatalog = null;
 
   function fail() { throw new Error("ZK_WORKSPACE_INPUT_DENIED"); }
   function supportsOwnerRootedV2(value) {
@@ -153,6 +154,16 @@
     let text = "";
     for (const item of data) text += String.fromCharCode(item);
     return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+  function contentFrom64(value) {
+    if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)
+      || value.length > Math.ceil(4 * 1024 * 1024 * 4 / 3) + 4) fail();
+    const text = atob(value.replace(/-/g, "+").replace(/_/g, "/")
+      .padEnd(Math.ceil(value.length / 4) * 4, "="));
+    const result = Uint8Array.from(text, (c) => c.charCodeAt(0));
+    if (result.length < 16 || result.length > 4 * 1024 * 1024
+      || to64(result) !== value) fail();
+    return result;
   }
   // Download names are intentionally much narrower than valid encrypted file
   // metadata. Never interpret paths from a selected file or an imported archive.
@@ -606,6 +617,23 @@
       + '<button type="button" class="button button-primary" data-zk1-action="upload">Cifrar, enviar e conferir GET</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="upload-recoverable">Enviar e exportar pacote recuperável</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="restore">Recuperar arquivo do novo dispositivo</button></div>'
+      + '<fieldset><legend>Catálogo opaco entre dispositivos (DEV, somente leitura)</legend>'
+      + '<p class="muted">Importe o grant do dispositivo que assinou o catálogo e a chave pública do CAS independente, ambos recebidos fora do servidor. '
+      + 'Informe o head do catálogo fixado externamente. Os nomes ficam cifrados; só o navegador com a chave de metadados consegue abri-los. '
+      + 'Nunca usa o sync-v2 genérico. O segundo dispositivo precisa do próprio grant ativo e da chave privada local.</p>'
+      + '<label>Grant owner-signed do dispositivo assinante do catálogo (.json)<input type="file" data-zk1-field="catalog-signer-grant" accept=".json,application/json"></label>'
+      + '<label>Chave pública Ed25519 do CAS do catálogo (raw, 32 bytes)<input type="file" data-zk1-field="catalog-cas-key"></label>'
+      + '<label>SHA-256 do SPKI do CAS, pin offline (base64url)<input data-zk1-field="catalog-cas-spki" maxlength="43" spellcheck="false" autocomplete="off"></label>'
+      + '<label>Sequência exata do catálogo confirmada fora do servidor<input type="number" min="1" max="128" step="1" data-zk1-field="catalog-sequence"></label>'
+      + '<label>Digest do catálogo confirmado fora do servidor (base64url)<input data-zk1-field="catalog-digest" maxlength="43" spellcheck="false" autocomplete="off"></label>'
+      + '<label>Chave AES de metadados de 32 bytes (local, opcional)<input type="file" data-zk1-field="catalog-metadata-key"></label>'
+      + '<label>Página local (0–127)<input type="number" min="0" max="127" step="1" value="0" data-zk1-field="catalog-page"></label>'
+      + '<label>Índice na página (0–31) para GET do ciphertext<input type="number" min="0" max="31" step="1" value="0" data-zk1-field="catalog-entry"></label>'
+      + '<div class="zk1-workspace-actions"><button type="button" class="button button-primary" data-zk1-action="catalog-discover">Descobrir e conferir catálogo</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-page">Exibir página verificada</button>'
+      + '<button type="button" class="button button-primary" data-zk1-action="catalog-get">GET ciphertext conferido</button></div>'
+      + '<div data-zk1-field="catalog-list" role="region" aria-label="IDs de versões opacas validadas"></div>'
+      + '</fieldset>'
       + '<fieldset><legend>Migração opt-in de arquivo legado (apenas laboratório)</legend>'
       + '<p class="muted">O caminho legado /files já entrega plaintext pelo servidor antigo. Na cópia ZK, apenas ciphertext é enviado. '
       + 'O original permanece intacto. Guarde a CEK e os IDs fora do servidor para retomada; '
@@ -701,6 +729,7 @@
     if (busy) return;
     if (action === "close") {
       committedDeviceApproval = null;
+      verifiedCatalog = null;
       dialog.close();
       dialog.querySelector("form").reset();
       status("Nenhuma autoridade foi importada.");
@@ -709,7 +738,8 @@
     if (!["provision", "verify-inventory", "upload", "upload-recoverable",
       "restore", "new-secret", "new-device", "answer-pop", "import-approval",
       "migrate", "migration-finalize", "migration-batch", "archive-create", "archive-recover",
-      "account-create", "account-recover", "versioned-create", "versioned-recover"].includes(action)) return;
+      "account-create", "account-recover", "versioned-create", "versioned-recover",
+      "catalog-discover", "catalog-page", "catalog-get"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -808,6 +838,99 @@
       }
       const trust = await grantAndOwner();
       assertLive();
+      if (["catalog-discover", "catalog-page", "catalog-get"].includes(action)) {
+        if (!window.RootarkZk1BrowserCatalog) await loadScript("rootark-zk1-browser-catalog");
+        assertLive();
+        if (!window.RootarkZk1BrowserCatalog?.openCatalog
+          || !window.RootarkZk1BrowserCatalog?.getCatalogCiphertext) fail();
+        if (available.opaqueCatalogV1 !== true
+          || trust.signedDeviceGrant.revoked_at_epoch !== null
+          || !trust.ownerHistoryCheckpoint) fail();
+        const scope = Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+          .map((name) => [name, trust.signedDeviceGrant[name]]));
+        await window.RootarkZk1NormalBrowserTrustFloor.assertCurrent({
+          ownerPublicKey: trust.ownerPublicKey,
+          independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+          pinnedCurrentHead: trust.pinnedCurrentHead,
+          signedDeviceGrant: trust.signedDeviceGrant,
+          ownerHistoryCheckpoint: trust.ownerHistoryCheckpoint,
+          previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
+        });
+        assertLive();
+        if (action === "catalog-discover") {
+          verifiedCatalog = null;
+          const signerGrant = JSON.parse(decoder.decode(
+            await fileBytes("catalog-signer-grant", 1, 8192)));
+          const casRaw = await fileBytes("catalog-cas-key", 32, 32);
+          let casKey;
+          try { casKey = await crypto.subtle.importKey("raw", casRaw,
+            "Ed25519", true, ["verify"]); }
+          finally { casRaw.fill(0); }
+          privateDer = await fileBytes("private", 1, 8192);
+          const devicePrivateKey = await crypto.subtle.importKey("pkcs8", privateDer,
+            "Ed25519", false, ["sign"]);
+          const result = await window.RootarkZk1BrowserCatalog.openCatalog({
+            trust, signerGrant, devicePrivateKey, catalogAuthorityKey: casKey,
+            independentAuthoritySpkiHash: from64(field("catalog-cas-spki").value.trim()),
+            pinnedCatalogHead: {
+              sequence: positive("catalog-sequence"),
+              digest: field("catalog-digest").value.trim(),
+            },
+            origin: location.origin + "/", fetchImpl: guardedFetch,
+            assertLive, indexedDBImpl: indexedDB,
+            nowSeconds: () => Math.floor(Date.now() / 1000),
+          });
+          assertLive();
+          verifiedCatalog = { result, scope, epoch: sessionEpoch, csrf: initialCsrf };
+          status("Catálogo #" + result.sequence + " · " + result.totalCount
+            + " versão(ões) criptografadas conferidas. Páginas modificadas: "
+            + (result.changedPageIndices.join(", ") || "nenhuma")
+            + ". Head: " + result.catalogDigest + ". GET sempre assinado e verificado."
+            + (result.sequence === 128 ? " LIMITE ATINGIDO: novas publicações bloqueadas até um rollover assinado e auditado." : ""));
+        } else if (!verifiedCatalog || verifiedCatalog.epoch !== sessionEpoch
+          || verifiedCatalog.csrf !== initialCsrf
+          || !Object.keys(scope).every((key) => scope[key] === verifiedCatalog.scope[key])) fail();
+        const current = verifiedCatalog.result;
+        const page = Number(field("catalog-page").value);
+        if (!Number.isSafeInteger(page) || page < 0 || page > 127
+          || page >= Math.max(1, Math.ceil(current.totalCount / 32))) fail();
+        const offset = page * 32;
+        const visible = current.entries.slice(offset, offset + 32);
+        if (action === "catalog-discover" || action === "catalog-page") {
+          const container = field("catalog-list");
+          container.replaceChildren();
+          let metadataKey = null;
+          const files = field("catalog-metadata-key")?.files;
+          if (files?.length) metadataKey = await fileBytes("catalog-metadata-key", 32, 32);
+          try {
+            for (let i = 0; i < visible.length; i++) {
+              assertLive();
+              const entry = visible[i];
+              const line = document.createElement("p");
+              let localLabel = "(nome cifrado)";
+              if (metadataKey) localLabel = await window.RootarkZk1BrowserCatalog.openCatalogName(
+                current, offset + i, metadataKey);
+              assertLive();
+              line.textContent = String(i) + " · " + entry.objectId + " · v"
+                + entry.revision + " · " + localLabel;
+              container.append(line);
+            }
+          } finally { metadataKey?.fill(0); }
+        } else {
+          const selected = Number(field("catalog-entry").value);
+          if (!Number.isSafeInteger(selected) || selected < 0
+            || selected >= visible.length) fail();
+          const checked = await window.RootarkZk1BrowserCatalog.getCatalogCiphertext(
+            current, offset + selected);
+          assertLive();
+          downloadLocal("zk1-" + checked.objectId + "-v" + checked.revision + ".ciphertext",
+            contentFrom64(checked.ciphertextBase64),
+            "application/octet-stream", assertLive);
+          status("GET autenticado e digest SHA-256 conferido: " + checked.objectId
+            + " · versão " + checked.revision + ". Ciphertext entregue localmente.");
+        }
+        return;
+      }
       if (action === "account-create" || action === "account-recover") {
         if (field("account-opt-in")?.checked !== true || !trust.ownerHistoryCheckpoint
           || trust.signedDeviceGrant.revoked_at_epoch !== null) fail();
@@ -1414,6 +1537,7 @@
       }
       // The original File/Blob remains held by the input until explicitly reset.
       for (const name of ["private", "hpke-private", "pop-challenge", "new-approval", "file", "secret", "bundle", "migration-cek", "migration-proof",
+        "catalog-cas-key", "catalog-signer-grant", "catalog-metadata-key",
         "migration-batch-descriptors", "migration-batch-ceks", "migration-batch-secret",
         "archive-files", "archive-owner-private", "archive-json", "archive-historical-proof",
         "account-descriptors", "account-holder-files", "account-local-files",
@@ -1458,6 +1582,7 @@
   });
   window.addEventListener("rootark:logout", () => {
     sessionEpoch++;
+    verifiedCatalog = null;
     for (const url of activeDownloadUrls) URL.revokeObjectURL(url);
     activeDownloadUrls.clear();
     committedDeviceApproval = null;
