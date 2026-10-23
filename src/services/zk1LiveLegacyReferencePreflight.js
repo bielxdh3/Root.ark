@@ -172,11 +172,15 @@ function inspectRegisteredSqlCoverage(db, secret, originalObservations) {
 
 function inspectZk1LiveLegacyReferencePreflight({
   optIn, databasePath, persistence = {}, backupDataDir, sqlCoverageOptIn, localUploadsDir,
+  strictSourceInventoryOptIn,
 } = {}) {
   if (optIn !== true || typeof databasePath !== "string" || !path.isAbsolute(databasePath)
     || persistence.dbEnabled !== true || persistence.jsonReadFallback !== false
     || persistence.jsonWriteMirror !== false
-    || (sqlCoverageOptIn !== undefined && typeof sqlCoverageOptIn !== "boolean")) refuse();
+    || (sqlCoverageOptIn !== undefined && typeof sqlCoverageOptIn !== "boolean")
+    || (strictSourceInventoryOptIn !== undefined && typeof strictSourceInventoryOptIn !== "boolean")
+    || (strictSourceInventoryOptIn === true && (sqlCoverageOptIn !== true
+      || backupDataDir === undefined || localUploadsDir === undefined))) refuse();
   let db;
   try {
     const before = fileIdentity(databasePath);
@@ -201,7 +205,24 @@ function inspectZk1LiveLegacyReferencePreflight({
       ? Object.freeze({ observation: "uninspected", globallyComplete: false })
       : require("./zk1LiveLegacyLocalReferenceEvidence").inspectZk1LiveLegacyLocalReferenceEvidence({
         uploadsDir: localUploadsDir, db, runSecret: ephemeralKey,
+        strictSourceReferences: strictSourceInventoryOptIn === true,
       });
+    const sourceInventory = strictSourceInventoryOptIn === true
+      ? Object.freeze({
+        observation: "bounded-reconciled-local-source-types-only",
+        local: localReferenceEvidence.strictSourceTypes,
+        backupHistoryRows: backupEvidence.historyRows,
+        archiveFiles: backupEvidence.archives,
+        archiveTombstones: backupEvidence.retentionTombstones,
+        archiveTransactions: backupEvidence.retentionTransactions,
+        sqlTablesRecognized: sqlCoverage.unrecognizedTables === 0,
+        externalReferencesVerified: false,
+        derivedOutsideSearchIndexVerified: false,
+        ownerSignedCorpusProofVerified: false,
+        globallyComplete: false,
+        authorizesCutover: false,
+        canDeleteLegacy: false,
+      }) : null;
     db.exec("COMMIT");
     if (!sameIdentity(before, fileIdentity(databasePath))) refuse();
     return Object.freeze({
@@ -214,6 +235,7 @@ function inspectZk1LiveLegacyReferencePreflight({
         observations: Object.freeze(observations),
         backupEvidence,
         localReferenceEvidence,
+        ...(sourceInventory ? { sourceInventory } : {}),
         ...(sqlCoverage ? { sqlCoverage } : {}),
       }),
       protected: Object.freeze({

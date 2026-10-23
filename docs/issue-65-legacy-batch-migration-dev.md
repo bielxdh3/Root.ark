@@ -30,6 +30,19 @@ authorize deletion, restore, production or cutover. Keep the independent
 owner/head anchors, private key, secret and separately pinned selection digest
 off the server.
 
+The optional server-side read-only preflight has a separate
+`strictSourceInventoryOptIn: true` setting. It requires
+`sqlCoverageOptIn: true`, `localUploadsDir` and `backupDataDir` and
+reconciles live encrypted-file records, derived search entries, public links,
+permissions and expiry references with versioned local bytes; it also checks
+the bounded physical backup archive and retention evidence. Orphan references,
+unmapped local bytes, unknown SQL schema, or pending/trash sources whose
+separate custody cannot be reconciled fail closed. The opaque
+`legacy.sourceInventory` contains type counts only. This local snapshot
+still lacks provider/remote custody, derived files outside the search index,
+owner-signed global inventory and writer fencing, so cutover and legacy
+deletion remain forbidden even if all local checks pass.
+
 Each entry contains `{ legacy: { name, folderId }, sourcePin, cek }`.
 `sourcePin` must contain exactly `version` (positive number), `storedAs`,
 `uploadedAt`, `size`, `lastModified` (canonical HTTP GMT timestamp),

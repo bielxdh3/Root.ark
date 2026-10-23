@@ -63,9 +63,11 @@ function parseVersionJson(source) {
   return { currentVersion: parsed.currentVersion, versions: parsed.versions };
 }
 
-function inspectZk1LiveLegacyLocalReferenceEvidence({ uploadsDir, db, runSecret }) {
+function inspectZk1LiveLegacyLocalReferenceEvidence({ uploadsDir, db, runSecret,
+  strictSourceReferences = false }) {
   if (typeof uploadsDir !== "string" || !path.isAbsolute(uploadsDir)
-    || !db || !Buffer.isBuffer(runSecret) || runSecret.length !== 32) deny();
+    || !db || !Buffer.isBuffer(runSecret) || runSecret.length !== 32
+    || typeof strictSourceReferences !== "boolean") deny();
   const dirs = new Map([[uploadsDir, directory(uploadsDir)]]);
   const folders = rows(db, "SELECT id FROM folders ORDER BY id LIMIT ?");
   const allowed = new Set(["root"]);
@@ -149,6 +151,42 @@ function inspectZk1LiveLegacyLocalReferenceEvidence({ uploadsDir, db, runSecret 
     refs.add(key);
   }
 
+  // The ordinary scan reports unknown local bytes without treating them as
+  // migration evidence. Strict opt-in additionally joins every known live
+  // reference class to a real, versioned source. A dangling encrypted-file,
+  // link, permission, expiry or derived entry can otherwise hide an omitted
+  // legacy source even when the individual SQL and filesystem scans succeed.
+  let sourceTypes;
+  if (strictSourceReferences) {
+    if (local.size !== refs.size) deny();
+    for (const key of uniqueSearch) if (!versionRows.has(key)) deny();
+    const referenceTables = Object.freeze([
+      ["encryptedFiles", "encrypted_files"],
+      ["publicLinks", "public_links"],
+      ["filePermissions", "file_permissions"],
+      ["retention", "file_expirations"],
+    ]);
+    const counts = { versionRows: versionRows.size, historicalPayloads: versionPayloads,
+      derivedSearchReferences: uniqueSearch.size, unmappedLocalFiles: 0 };
+    for (const [kind, table] of referenceTables) {
+      const linked = rows(db, `SELECT folder_id,file_name FROM ${table}
+        ORDER BY folder_id,file_name LIMIT ?`);
+      for (const row of linked) {
+        if (!safeName(row.folder_id) || !allowed.has(row.folder_id)
+          || !safeName(row.file_name)
+          || !versionRows.has(`${row.folder_id}\0${row.file_name}`)
+          || !refs.has(`${row.folder_id}\0${row.file_name}`)) deny();
+      }
+      counts[kind] = linked.length;
+    }
+    // Pending uploads and trash may store independently reachable bytes whose
+    // physical namespace is outside the uploads directory. Until an explicit
+    // source reader can reconcile those, treat any row as unknown custody.
+    for (const table of ["pending_uploads", "trash_items"])
+      if (db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get()) deny();
+    sourceTypes = Object.freeze(counts);
+  }
+
   // Detect renamed/replaced payloads as well as added/removed namespace entries
   // after the SQLite read transaction started. This is local observational
   // stability, not an independent monotonic generation or remote ACK proof.
@@ -165,9 +203,11 @@ function inspectZk1LiveLegacyLocalReferenceEvidence({ uploadsDir, db, runSecret 
   const mac = crypto.createHmac("sha256", runSecret)
     .update("rootark-zk1-legacy-local-refs/v1\0")
     .update(JSON.stringify([...local].map(([key, val]) => [key, val.hash, val.size])))
-    .update(JSON.stringify([...refs].sort())).update(JSON.stringify(counts)).digest("base64url");
+    .update(JSON.stringify([...refs].sort())).update(JSON.stringify(counts))
+    .update(JSON.stringify(sourceTypes || null)).digest("base64url");
   return Object.freeze({ observation: "partial-local-legacy-file-references-only",
-    ...counts, ephemeralFingerprint: mac, globallyComplete: false });
+    ...counts, ...(sourceTypes ? { strictSourceTypes: sourceTypes } : {}),
+    ephemeralFingerprint: mac, globallyComplete: false });
 }
 
 module.exports = { inspectZk1LiveLegacyLocalReferenceEvidence };
