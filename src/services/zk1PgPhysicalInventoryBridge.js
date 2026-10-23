@@ -345,6 +345,7 @@ class Zk1PgPhysicalInventoryBridge {
       || !same(remote.operationId, v.operation.operation_id)
       || !same(remote.readbackSha256, v.operation.ciphertext_sha256)
       || (remote.namespaceIdentity !== cloudVerifier.pinnedCopyTarget.namespaceIdentity)
+      || remote.providerVersionId !== cloudVerifier.pinnedCopyTarget.providerVersionId
       || typeof remote.providerObjectKey !== "string"
       || !remote.providerObjectKey.endsWith(`/uploads/${
         zk1CloudCopyAddress({ scope: v.scope,
@@ -358,6 +359,7 @@ class Zk1PgPhysicalInventoryBridge {
     return Object.freeze({ status: "PG_SIGNED_AND_CLOUD_BYTES_REREAD",
       operationId: Buffer.from(v.operation.operation_id),
       provider: remote.provider, providerFileId: remote.providerFileId,
+      providerVersionId: remote.providerVersionId,
       providerObjectKey: remote.providerObjectKey,
       namespaceIdentity: remote.namespaceIdentity,
       ciphertextSha256: Buffer.from(remote.readbackSha256),
@@ -404,6 +406,10 @@ class Zk1PgPhysicalInventoryBridge {
       cloudVerifier, chunkLengths: detached.map((chunk) => chunk.length) });
     if (remote.provider !== write.provider
       || remote.providerFileId !== write.providerFileId
+      // A version-pinned GET may have returned a valid older copy of the
+      // same bytes. It cannot be attributed to a newer PUT acknowledgment.
+      || (remote.providerVersionId !== null
+        && write.providerVersionId !== remote.providerVersionId)
       || remote.namespaceIdentity !== write.namespaceIdentity
       || remote.providerObjectKey !== write.providerObjectKey
       || !same(remote.ciphertextSha256, write.ciphertextSha256)

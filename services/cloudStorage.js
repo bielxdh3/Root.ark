@@ -45,6 +45,13 @@ function assertFullCiphertextGet(response, provider, expectedBytes) {
   }
 }
 
+// S3 version IDs are opaque. Restrict pinned identifiers to a bounded ASCII
+// subset; an unversioned "null" object cannot prove historical identity.
+function validZk1S3VersionId(value) {
+  return typeof value === "string" && value !== "null"
+    && /^[A-Za-z0-9_.+\-=/]{1,1024}$/.test(value);
+}
+
 // A bounded ZK GET is a security assertion about the *selected* destination,
 // not permission to follow a local junction/symlink into an unrelated tree.
 // The caller creates a private cache directory first; unlike legacy downloads,
@@ -505,7 +512,7 @@ function createCloudStorage(options = {}) {
     try {
     if (provider === "s3") {
       const bucketName = bucket();
-      await abortableProviderRead(async () => {
+      const s3Put = await abortableProviderRead(async () => {
         const client = await s3();
         // Path-less streams cannot use the SDK's path/stat length inference.
         // Sign the byte count of the pinned file instead of rereading a name.
@@ -518,7 +525,17 @@ function createCloudStorage(options = {}) {
         signal ? { abortSignal: signal } : undefined);
       }, signal);
       if (signal?.aborted) throw cloudError("provider_error", "Bounded ciphertext upload deadline exceeded");
-      return { provider, key: cloudKey };
+      // A returned version ID is a provider assertion only. It can be pinned
+      // for subsequent exact GETs, but never proves independent durability.
+      if (s3Put?.VersionId !== undefined && s3Put.VersionId !== "null"
+        && !validZk1S3VersionId(s3Put.VersionId)) {
+        throw cloudError("provider_error", "Invalid S3 ciphertext version identity");
+      }
+      // S3 versioning-suspended buckets can acknowledge VersionId="null":
+      // preserve the unversioned copy, but never expose a pinnable version.
+      const versionId = s3Put?.VersionId === "null" ? undefined : s3Put?.VersionId;
+      return { provider, key: cloudKey,
+        ...(versionId === undefined ? {} : { versionId }) };
     }
     const providerFileId = String(uploadOptions?.providerFileId || "").trim();
     if (providerFileId) {
@@ -555,16 +572,20 @@ function createCloudStorage(options = {}) {
       ? constraints.providerFileId : null;
     const externalSignal = constraints && Object.hasOwn(constraints, "abortSignal")
       ? constraints.abortSignal : undefined;
+    const pinnedVersion = constraints && Object.hasOwn(constraints, "providerVersionId")
+      ? constraints.providerVersionId : null;
     if (constraints !== undefined && (!constraints || typeof constraints !== "object"
       || Array.isArray(constraints)
       || Reflect.ownKeys(constraints).length !== (pinId === null ? 1 : 2)
-        + (externalSignal === undefined ? 0 : 1)
+        + (externalSignal === undefined ? 0 : 1) + (pinnedVersion === null ? 0 : 1)
       || !Object.hasOwn(constraints, "maxBytes")
       || !Number.isSafeInteger(constraints.maxBytes)
       || constraints.maxBytes < 1 || constraints.maxBytes > 16 * 1024 * 1024
       || (externalSignal !== undefined && !(externalSignal instanceof AbortSignal))
       || (provider === "gdrive" && !isDriveFileId(pinId))
-      || (provider === "s3" && pinId !== null))) {
+      || (provider === "s3" && pinId !== null)
+      || (pinnedVersion !== null && (provider !== "s3"
+        || !validZk1S3VersionId(pinnedVersion))))) {
       throw cloudError("invalid_path", "Invalid bounded ciphertext download");
     }
     const cloudKey = objectKey(folderId, fileName, area);
@@ -587,9 +608,13 @@ function createCloudStorage(options = {}) {
       if (provider === "s3") {
         const bucketName = bucket();
         const response = await abortableProviderRead(async () => (await s3()).send(
-          new (require("@aws-sdk/client-s3").GetObjectCommand)({ Bucket: bucketName, Key: cloudKey }),
+          new (require("@aws-sdk/client-s3").GetObjectCommand)({ Bucket: bucketName,
+            Key: cloudKey, ...(pinnedVersion === null ? {} : { VersionId: pinnedVersion }) }),
           signal ? { abortSignal: signal } : undefined), signal);
         if (constraints) assertFullCiphertextGet(response, provider, constraints.maxBytes);
+        if (pinnedVersion !== null && response?.VersionId !== pinnedVersion) {
+          throw cloudError("provider_error", "S3 returned a different ciphertext version");
+        }
         input = response.Body;
       }
       else {

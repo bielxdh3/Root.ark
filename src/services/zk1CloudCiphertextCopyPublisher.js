@@ -140,10 +140,14 @@ class Zk1CloudCiphertextCopyPublisher {
           ...(this.#driveId === null ? {} : { providerFileId: this.#driveId }) });
       if (!answer || answer.provider !== this.#provider || answer.key !== key
         || (this.#driveId !== null && answer.id !== this.#driveId)) fail();
+      if (this.#provider === "s3" && answer.versionId !== undefined
+        && (typeof answer.versionId !== "string" || answer.versionId === "null"
+          || !/^[A-Za-z0-9_.+\-=/]{1,1024}$/.test(answer.versionId))) fail();
       if (await boundedIdentity(() => this.#writer.resolveInventoryContext()) !== this.#context) fail();
       return Object.freeze({ status: "CLOUD_COPY_PUT_ACK_NONAUTHORITATIVE",
         operationId: Buffer.from(operationId), provider: this.#provider,
         providerFileId: this.#driveId,
+        providerVersionId: this.#provider === "s3" ? answer.versionId || null : null,
         providerObjectKey: key, ciphertextSha256: Buffer.from(sha),
         namespaceIdentity: this.#namespace,
         byteLength: payload.size, authorizesIo: false,

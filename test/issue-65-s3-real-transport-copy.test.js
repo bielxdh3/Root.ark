@@ -15,30 +15,41 @@ const { Zk1CloudCiphertextReadbackVerifier } =
 
 test("real AWS S3 client PUT/GET against isolated HTTP emulator verifies bytes after missing ACK and replay", async (t) => {
   const objects = new Map();
+  const versions = new Map();
   const requests = [];
   const sockets = new Set();
   let corruptGet = false;
+  let forgedVersionReply = false;
+  let suspendVersionResponse = false;
   let failPutOnce = true;
+  let version = 0;
   const server = http.createServer((request, response) => {
     const key = request.url.split("?")[0];
-    requests.push({ method: request.method, key });
+    requests.push({ method: request.method, key, url: request.url });
     if (request.method === "PUT") {
       const parts = [];
       request.on("data", (chunk) => parts.push(chunk));
       request.on("end", () => {
-        objects.set(key, Buffer.concat(parts));
+        const bytes = Buffer.concat(parts);
+        objects.set(key, bytes);
+        version += 1;
+        versions.set(`s3-version-${version}`, bytes);
         if (failPutOnce) {
           failPutOnce = false;
           response.writeHead(400, { "content-type": "application/xml" });
           response.end("<Error><Code>AccessDenied</Code></Error>");
-        } else { response.writeHead(200); response.end(); }
+        } else { response.writeHead(200, { "x-amz-version-id": suspendVersionResponse
+          ? "null" : `s3-version-${version}` }); response.end(); }
       });
     } else if (request.method === "GET") {
-      const current = objects.get(key);
+      const requestedVersion = new URL(request.url, "http://localhost").searchParams.get("versionId");
+      const current = requestedVersion ? versions.get(requestedVersion) : objects.get(key);
       if (!current) { response.writeHead(404); response.end(); return; }
       const bytes = corruptGet ? Buffer.alloc(current.length, 0x19) : current;
       response.writeHead(200, { "content-length": bytes.length,
-        "content-type": "application/octet-stream" });
+        "content-type": "application/octet-stream",
+        "x-amz-version-id": forgedVersionReply ? "s3-version-1"
+          : requestedVersion || `s3-version-${version}` });
       response.end(bytes);
     } else { response.writeHead(405); response.end(); }
   });
@@ -94,7 +105,36 @@ test("real AWS S3 client PUT/GET against isolated HTTP emulator verifies bytes a
   const ack = await publisher.publishExact(put);
   assert.equal(ack.providerObjectKey, surviving.providerObjectKey);
   assert.equal(ack.providerDurabilityProven, false);
+  assert.equal(ack.providerVersionId, "s3-version-2");
   const replay = await verifier.verifyExact(read);
   assert.equal(replay.readbackMatched, true);
+  const versionPinned = new Zk1CloudCiphertextReadbackVerifier({ cloudReader: reader,
+    expectedProvider: "s3", expectedReaderContext: await reader.resolveInventoryContext(),
+    pinnedS3VersionId: ack.providerVersionId });
+  const pinned = await versionPinned.verifyExact(read);
+  assert.equal(pinned.providerVersionId, "s3-version-2");
+  assert.equal(pinned.externalProviderDurabilityProven, false);
+  assert.ok(requests.some((item) => item.method === "GET"
+    && item.url.includes("versionId=s3-version-2")), "the real SDK GET must pin S3 VersionId");
+  forgedVersionReply = true;
+  await assert.rejects(versionPinned.verifyExact(read), /ZK_CLOUD_READBACK_UNAVAILABLE/,
+    "even matching ciphertext bytes cannot authorize a different S3 object version");
+  forgedVersionReply = false;
+  const foreignReader = create("different-reader-credential");
+  const foreignPin = new Zk1CloudCiphertextReadbackVerifier({ cloudReader: foreignReader,
+    expectedProvider: "s3", expectedReaderContext: await reader.resolveInventoryContext(),
+    pinnedS3VersionId: ack.providerVersionId });
+  const beforeForeign = requests.length;
+  await assert.rejects(foreignPin.verifyExact(read), /ZK_CLOUD_READBACK_UNAVAILABLE/);
+  assert.equal(requests.length, beforeForeign,
+    "the wrong provider principal must not reach the remote GET");
+  const pinnedContext = await reader.resolveInventoryContext();
+  assert.throws(() => new Zk1CloudCiphertextReadbackVerifier({ cloudReader: reader,
+    expectedProvider: "s3", expectedReaderContext: pinnedContext,
+    pinnedS3VersionId: "null" }), /ZK_CLOUD_READBACK_UNAVAILABLE/);
+  suspendVersionResponse = true;
+  const unversioned = await publisher.publishExact(put);
+  assert.equal(unversioned.providerVersionId, null,
+    "a suspended S3 bucket can hold ciphertext but never advertises a pinnable null version");
   assert.equal(objects.size, 1, "same signed operation targets exactly the same S3 object key");
 });
