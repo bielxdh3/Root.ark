@@ -11,7 +11,7 @@ const net = require("node:net");
 const path = require("node:path");
 const Database = require("better-sqlite3");
 const { requireImmutableTriggers } = require("./zk1OpaqueCatalogSqliteIntegrity");
-const { assertPrivateSqliteDirectory } = require("./zk1PrivateSqlitePath");
+const { assertPrivateSqliteDirectory, assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
 const z = require("../crypto/rootark-zk-1");
 const { catalogHeadDigest } = require("./zk1OpaqueCatalog");
 const ownerHistory = require("../crypto/rootark-zk-recovery-history-v2");
@@ -174,7 +174,9 @@ class Zk1OpaqueCatalogIndependentFloorLedger {
     const exists = fs.existsSync(filename);
     if (bootstrapNew !== !exists) fail();
     requirePrivateFile(filename, exists);
+    let filePin;
     if (exists) {
+      try { filePin = assertPrivateSqliteFile(filename); } catch (_) { fail(); }
       let probe;
       try {
         probe = new Database(filename, { readonly: true, fileMustExist: true });
@@ -184,17 +186,35 @@ class Zk1OpaqueCatalogIndependentFloorLedger {
     }
     if (!exists) {
       let fd;
-      try { fd = fs.openSync(filename, fs.constants.O_CREAT | fs.constants.O_EXCL
-        | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600); }
+      try {
+        fd = fs.openSync(filename, fs.constants.O_CREAT | fs.constants.O_EXCL
+          | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
+        const opened = fs.fstatSync(fd, { bigint: true });
+        if (!opened.isFile() || opened.nlink !== 1n) fail();
+        filePin = { dev: opened.dev, ino: opened.ino };
+      }
       catch (_) { fail(); }
       finally { if (fd !== undefined) fs.closeSync(fd); }
     }
+    // O_EXCL protects the created name only during open. A local actor can
+    // replace it with a foreign hardlink before SQLite opens its own handle;
+    // restarting after read-only preflight has the same replacement window.
+    // Reject a changed file identity before any WAL mode or schema mutation.
+    const checkFilePin = () => {
+      try {
+        const current = assertPrivateSqliteFile(filename);
+        if (current.dev !== filePin.dev || current.ino !== filePin.ino) fail();
+      } catch (_) { fail(); }
+    };
+    checkFilePin();
     this.db = new Database(filename, { fileMustExist: true, timeout: 3000 });
     try {
+      checkFilePin();
       if (exists) {
         requireExistingFloorSchema(this.db, expected, Boolean(this.ownerTrust));
         this.inspect();
       }
+      checkFilePin();
       this.db.pragma("journal_mode=WAL");
       this.db.pragma("synchronous=FULL");
       if (!exists) this.db.exec(`CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK(id=1),
