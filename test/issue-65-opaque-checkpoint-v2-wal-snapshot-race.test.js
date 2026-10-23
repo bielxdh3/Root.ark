@@ -23,6 +23,19 @@ test("readonly preflight fails closed if live WAL advances after the snapshot re
   live.exec("CREATE TABLE samples (token BLOB NOT NULL)");
   live.prepare("INSERT INTO samples VALUES (?)").run(crypto.randomBytes(64));
   assert.equal(fs.existsSync(file + "-wal"), true);
+  // On Linux, SQLite uses the process umask for its fixture files. The real
+  // ZK preflight requires owner-only permissions; establish that prerequisite
+  // so the adversarial test reaches the WAL-generation fence, not the earlier
+  // (also correct) untrusted-file permission rejection.
+  if (process.platform !== "win32") {
+    for (const suffix of ["", "-wal", "-shm"]) {
+      if (fs.existsSync(file + suffix)) fs.chmodSync(file + suffix, 0o600);
+    }
+  }
+  const unavailable = () => { throw new Error("WAL_SNAPSHOT_CHANGED"); };
+  withReadonlySqliteSnapshot(file, (copy) => {
+    assert.equal(copy.prepare("SELECT count(*) AS count FROM samples").get().count, 1);
+  }, unavailable, 4 * 1024 * 1024);
   let inspected = false;
   assert.throws(() => withReadonlySqliteSnapshot(file, (copy) => {
     assert.equal(copy.prepare("SELECT count(*) AS count FROM samples").get().count, 1);
@@ -30,7 +43,7 @@ test("readonly preflight fails closed if live WAL advances after the snapshot re
     // A legitimate concurrent writer produces a newer consistent WAL while
     // the preflight is still deciding whether the captured state is trusted.
     live.prepare("INSERT INTO samples VALUES (?)").run(crypto.randomBytes(64));
-  }, () => { throw new Error("WAL_SNAPSHOT_CHANGED"); }, 4 * 1024 * 1024),
+  }, unavailable, 4 * 1024 * 1024),
   /WAL_SNAPSHOT_CHANGED/);
   assert.equal(inspected, true);
   assert.equal(live.prepare("SELECT count(*) AS count FROM samples").get().count, 2);
