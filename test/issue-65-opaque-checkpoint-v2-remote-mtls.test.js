@@ -1447,12 +1447,111 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
         assert.equal((await reopened.read()).sequence, 135);
         signed135 = (await reopened.exportSignedIntents()).at(-1);
       } finally { reopened.close(); }
-      // Owner approval, independent of catalog signer: B135 -> C136 -> B137.
+      // Owner approval, independent of catalog signer: B135 -> C136 -> C137.
       // The CAS/FLOOR journals remain pinned to the original B configuration.
-      const rotated136 = await rotate(136, { raw: signed135,
-        digest: published135.digest,
-        checkpointDigest: published135.checkpointDigest }, deviceC, deviceC, false);
-      const rotated137 = await rotate(137, rotated136, deviceB, deviceB, false);
+      // Publish the new C signer/approver through the NORMAL device journal,
+      // which starts with the original B pins. The independent owner issuer
+      // verifies the witnessed active C approval and signs its exact intent.
+      const signed135Body = await z.decodeDeterministic(signed135);
+      const rotatedHeader136 = Buffer.from(await z.encodeDeterministic({
+        ...nextHeader, sequence: 136, previous_digest: published135.digest,
+        manifest_revision: Number(state.headManifest.revision),
+        manifest_digest: await ownerManifest.recoveryManifestDigestV2(state.headManifest),
+        epoch: Number(state.headManifest.current_epoch),
+        signer_device_id: deviceC.device_id, issued_at: now(),
+      }));
+      const rotatedRecord136 = { sequence: 136, header: rotatedHeader136,
+        signature: crypto.sign(null, Buffer.concat([HEAD_DOMAIN, rotatedHeader136]),
+          keys(deviceC)), page_bodies: [encryptedPage] };
+      const rotate136Input = { record: rotatedRecord136,
+        catalogSignerPublicKey: keyFromDevice(deviceC),
+        ownerPrivateKey: keys(deviceC),
+        checkpointPrivateKey: checkpoint.privateKey, ownerEvidence: await evidence() };
+      const publisher136 = new Zk1OpaqueCheckpointV2Client({
+        ...recipientOptions, journalPath: path.join(dir, "v2-B-C-B-recipient.sqlite"),
+        bootstrapNew: false });
+      let rotated136;
+      const issuedFromWitness = (preceding) => async (signed) => {
+        const first = await issueEndorsement(signed, preceding, grant);
+        // Verify the approver from independently witnessed recovery history.
+        // This fixture signs the exact V2 endorsement with a distinct owner
+        // root while the separate issuer module is reviewed by worker-9.
+        const approved = await require("../src/services/zk1OpaqueCheckpointV2Remote")
+          .inspectIntent(signed, { ...inspectorOptions,
+            baseDigest: preceding.digest,
+            baseCheckpoint: preceding.checkpointDigest,
+            previousOperationId: preceding.operationId }, { freshOwner: true });
+        const { signature: _unused, ...statement } = first;
+        statement.approval_signer_public_key = encoded(
+          approved.ownerApprovalSignerSpki.subarray(-32));
+        const fields = require("../src/crypto/rootark-zk1-v2-historical-signer-endorsement").FIELDS;
+        return { ...statement, signature: encoded(crypto.sign(null, Buffer.concat([
+          Buffer.from("Root.ark/zk-1/v2-historical-signer-endorsement/v2\0"),
+          Buffer.from(JSON.stringify(Object.fromEntries(fields.map((name) =>
+            [name, statement[name]]))))]), grantSigner.privateKey)) };
+      };
+      try {
+        await assert.rejects(publisher136.publish(rotate136Input),
+          /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+        "rotated device must not self-authorize without an owner-root grant issuer");
+        const predecessor135 = { digest: published135.digest,
+          checkpointDigest: published135.checkpointDigest,
+          operationId: signed135Body.operation_id };
+        await assert.rejects(publisher136.publish({ ...rotate136Input,
+          catalogSignerPublicKey: v2CasKeys.publicKey,
+          signerGrantIssuer: issuedFromWitness(predecessor135) }),
+        /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+        "a rotated signer cannot reuse the independently pinned CAS key");
+        await assert.rejects(publisher136.publish({ ...rotate136Input,
+          signerGrantIssuer: async (raw) => ({
+            ...await issuedFromWitness(predecessor135)(raw),
+            signature: encoded(crypto.randomBytes(64)),
+          }) }), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+        "a forged external endorsement cannot commit a rotated local intent");
+        const published136 = await publisher136.publish({ ...rotate136Input,
+          signerGrantIssuer: issuedFromWitness(predecessor135) });
+        assert.equal(published136.sequence, 136);
+        const raw136 = (await publisher136.exportSignedIntents()).at(-1);
+        rotated136 = { raw: raw136, digest: published136.digest,
+          checkpointDigest: published136.checkpointDigest };
+      } finally { publisher136.close(); }
+      const restart136 = new Zk1OpaqueCheckpointV2Client({
+        ...recipientOptions, journalPath: path.join(dir, "v2-B-C-B-recipient.sqlite"),
+        bootstrapNew: false });
+      let rotated137;
+      try {
+        assert.equal((await restart136.read()).sequence, 136);
+        const signed136Body = await z.decodeDeterministic(rotated136.raw);
+        const header137 = Buffer.from(await z.encodeDeterministic({ ...nextHeader,
+          sequence: 137, previous_digest: rotated136.digest,
+          manifest_revision: Number(state.headManifest.revision),
+          manifest_digest: await ownerManifest.recoveryManifestDigestV2(state.headManifest),
+          epoch: Number(state.headManifest.current_epoch),
+          signer_device_id: deviceC.device_id, issued_at: now(),
+        }));
+        const record137 = { sequence: 137, header: header137,
+          signature: crypto.sign(null, Buffer.concat([HEAD_DOMAIN, header137]),
+            keys(deviceC)), page_bodies: [encryptedPage] };
+        const published137 = await restart136.publish({ record: record137,
+          catalogSignerPublicKey: keyFromDevice(deviceC),
+          ownerPrivateKey: keys(deviceC),
+          checkpointPrivateKey: checkpoint.privateKey,
+          ownerEvidence: await evidence(),
+          signerGrantIssuer: issuedFromWitness({ digest: rotated136.digest,
+            checkpointDigest: rotated136.checkpointDigest,
+            operationId: signed136Body.operation_id }),
+        });
+        assert.equal(published137.sequence, 137);
+        rotated137 = { raw: (await restart136.exportSignedIntents()).at(-1),
+          digest: published137.digest,
+          checkpointDigest: published137.checkpointDigest };
+      }
+      finally { restart136.close(); }
+      const verified137 = new Zk1OpaqueCheckpointV2Client({
+        ...recipientOptions, journalPath: path.join(dir, "v2-B-C-B-recipient.sqlite"),
+        bootstrapNew: false });
+      try { assert.equal((await verified137.read()).sequence, 137); }
+      finally { verified137.close(); }
       assert.equal((await handles.casClient.head()).sequence, 137);
       assert.equal((await handles.floorClient.head()).sequence, 137);
       await assert.rejects(handles.coordinator.publish(rotated136.raw),

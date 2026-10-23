@@ -437,6 +437,10 @@ class Zk1OpaqueCheckpointV2Client {
       casKey: t.casKey, floorKey: t.floorKey,
       previousOperationId: previous.operationId,
     }, { freshOwner });
+    // The approval signer may rotate independently of the catalog signer.
+    // For a NEW intent, the signed, independently witnessed owner history is
+    // the sole authority that identifies the approver at this epoch. Do not
+    // inherit the launch-time owner key or accept the grant's self-assertion.
     if (grant && (!equal(grant.signer.export({ type: "spki", format: "der" }),
       inspected.signerSpki)
       || (freshOwner && (!inspected.ownerApprovalSignerSpki
@@ -505,6 +509,7 @@ class Zk1OpaqueCheckpointV2Client {
       pages, state: "V2_BOTH_FINALIZED", remoteCloudDurabilityProven: false });
   }
   async publish({ record, checkpointPrivateKey, ownerPrivateKey, signerGrantIssuer,
+    catalogSignerPublicKey,
     ownerEvidence, operationId = crypto.randomBytes(32),
     issuedAt = Math.floor(Date.now() / 1000), ownerIssuedAt = issuedAt }) {
     return this.#serial(async () => {
@@ -515,9 +520,17 @@ class Zk1OpaqueCheckpointV2Client {
       const endorsements = existing
         ? await this.#coordinator.predecessorEndorsements(existing) : null;
       if (prior.sequence >= 1000000) deny();
+      const approvalSigner = crypto.createPublicKey(key(ownerPrivateKey, "private"));
+      const catalogSigner = catalogSignerPublicKey ? key(catalogSignerPublicKey)
+        : t.catalogKey;
+      const independentPins = [t.casFp, t.floorFp, t.checkpointFp,
+        ...(t.signerGrantRootKey ? [fp(t.signerGrantRootKey)] : [])];
       if (!equal(fp(crypto.createPublicKey(key(checkpointPrivateKey, "private"))),
-        t.checkpointFp) || !equal(fp(crypto.createPublicKey(key(ownerPrivateKey, "private"))),
-        fp(t.ownerKey))) deny();
+        t.checkpointFp)
+        || independentPins.some((pin) => equal(pin, fp(approvalSigner))
+          || equal(pin, fp(catalogSigner)))
+        || (!t.signerGrantRootKey && (!equal(fp(approvalSigner), fp(t.ownerKey))
+          || !equal(fp(catalogSigner), fp(t.catalogKey))))) deny();
       // An external owner issuer sees the complete signed intent, verifies the
       // independently witnessed history and returns an endorsement before any
       // local append or network mutation. The caller cannot self-authorize.
@@ -526,7 +539,7 @@ class Zk1OpaqueCheckpointV2Client {
         scope: t.scope, records: [record], previousSequence: prior.sequence,
         previousDigest: prior.digest,
         previousCheckpointDigest: prior.checkpointDigest,
-        resolveCatalogSigner: async () => t.catalogKey,
+        resolveCatalogSigner: async () => catalogSigner,
         checkpointPrivateKey, issuedAt,
       });
       if (archived.records[0].sequence !== prior.sequence + 1) deny();
