@@ -603,6 +603,122 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
   assert.equal(trashed.physicalErasureProven, false);
   assert.equal(trashed.permanentDeletionAuthorized, false);
   assert.equal(trashed.metadata.parent_version_id, result.metadata.version_id);
+  // A separately created browser/physical-device identity reads a fresh
+  // independently pinned signed CAS head. Nothing depends on writer RAM,
+  // a JSON "trashed" server flag, or the PUT/CAS ACK that was dropped above.
+  const second = manifest.devices[1];
+  const secondPair = state.actors.get(Buffer.from(second.authorization_key_id).toString("hex"));
+  const secondPrivateKey = await crypto.webcrypto.subtle.importKey("pkcs8",
+    secondPair.export({ type: "pkcs8", format: "der" }), "Ed25519", false, ["sign"]);
+  const secondGrantBody = { ...grantBody, device_id: second.device_id,
+    authorization_key_id: b64(second.authorization_key_id),
+    authorization_public_key: b64(second.authorization_public_key),
+    enrolled_epoch: Number(second.enrolled_epoch),
+    revoked_at_epoch: second.revoked_at_epoch };
+  const secondGrant = { ...secondGrantBody, signature: b64(crypto.sign(null,
+    Buffer.concat([GRANT_DOMAIN, Buffer.from(JSON.stringify(Object.fromEntries(
+      GRANT_FIELDS.map((field) => [field, secondGrantBody[field]]))))]),
+  owner.privateKey)) };
+  const secondBrowser = { crypto: crypto.webcrypto, TextEncoder, TextDecoder,
+    AbortController, btoa, atob, URL, Headers, structuredClone, queueMicrotask,
+    setTimeout, clearTimeout, location: { origin },
+    RootarkZk1NormalBrowserTrustFloor: {
+      async assertCurrent({ signedDeviceGrant, pinnedCurrentHead }) {
+        assert.equal(signedDeviceGrant.device_id, second.device_id);
+        assert.equal(signedDeviceGrant.manifest_digest, b64(pinnedCurrentHead.digest));
+      },
+    },
+  };
+  vm.createContext(secondBrowser);
+  for (const name of ["rootark-zk1-file-content", "rootark-zk1-protected-http-client",
+    "rootark-zk1-browser-catalog", "rootark-zk1-cross-device-trash-observer"]) {
+    const js = fs.readFileSync(path.join(__dirname, "../public/client/" + name + ".js"), "utf8");
+    vm.runInContext(js, secondBrowser, { filename: name });
+  }
+  const secondRealm = vm.runInContext("(json) => JSON.parse(json)", secondBrowser);
+  const copy2 = (v) => secondRealm(JSON.stringify(v));
+  const secondDb = indexedDb();
+  const readSecond = (sequencePin, digestPin, overrides = {}) => Object.assign(copy2({}), {
+    trust: Object.assign(copy2({}), {
+      ...trust, signedDeviceGrant: copy2(secondGrant) }),
+    signerGrant: copy2(signedDeviceGrant), devicePrivateKey: secondPrivateKey,
+    catalogAuthorityKey: authorityKey,
+    independentAuthoritySpkiHash: hash(casKey.publicKey.export({
+      type: "spki", format: "der" })),
+    pinnedCatalogHead: copy2({ sequence: sequencePin, digest: digestPin }),
+    origin: origin + "/", fetchImpl, assertLive,
+    indexedDBImpl: secondDb, nowSeconds: () => now, ...overrides,
+  });
+  const secondKeys = async ({ revision, versionId }) => {
+    if (revision === 1 && sourceMetadata.version_id === versionId) return originalCek;
+    if (revision === 2 && result.metadata.version_id === versionId) return result.destinationCek;
+    return readArchivedCek({ ...scopeWire, revision, versionId });
+  };
+  const secondObserver = secondBrowser.RootarkZk1CrossDeviceTrashObserver;
+  const inspectedMetadata = [sourceMetadata, result.metadata, trashed.metadata];
+  const secondInspection = (pin, digest, records, overrides = {}) =>
+    secondObserver.inspect(Object.assign(copy2({}), {
+      catalogRead: readSecond(pin, digest), objectId: sourceId,
+      versionMetadata: copy2(records), readArchivedCek: secondKeys, assertLive,
+      ...overrides,
+    }));
+  const observedTrash = await secondInspection(trashed.catalogSequence,
+    trashed.catalogDigestBase64, inspectedMetadata);
+  assert.equal(observedTrash.state, "trashed");
+  assert.equal(observedTrash.revision, 3);
+  assert.equal(observedTrash.exactSignedGetAndAeadVerified, true);
+  assert.equal(observedTrash.physicalErasureProven, false);
+  await assert.rejects(secondInspection(2, b64(renameDigest), inspectedMetadata),
+    /ZK_CROSS_DEVICE_TRASH_UNVERIFIED/, "rollback/offline stale CAS floor");
+  await assert.rejects(secondInspection(trashed.catalogSequence,
+    trashed.catalogDigestBase64, inspectedMetadata.slice(1)),
+  /ZK_CROSS_DEVICE_TRASH_UNVERIFIED/, "omitting earlier version cannot disguise tombstone");
+  await assert.rejects(secondInspection(trashed.catalogSequence,
+    trashed.catalogDigestBase64, inspectedMetadata.map((m, i) => i === 2
+      ? { ...m, parent_version_id: sourceMetadata.version_id } : m)),
+  /ZK_CROSS_DEVICE_TRASH_UNVERIFIED/, "fake tombstone predecessor");
+  await assert.rejects(secondInspection(trashed.catalogSequence,
+    trashed.catalogDigestBase64, inspectedMetadata, {
+      catalogRead: readSecond(trashed.catalogSequence, trashed.catalogDigestBase64, {
+        trust: Object.assign(copy2({}), { ...trust,
+          signedDeviceGrant: copy2({ ...secondGrant,
+            revoked_at_epoch: ownerHead.epoch }) }),
+      }),
+    }), /ZK_CROSS_DEVICE_TRASH_UNVERIFIED/,
+  "revoked receiving device cannot inspect even immutable historical tombstones");
+  await assert.rejects(secondInspection(trashed.catalogSequence,
+    trashed.catalogDigestBase64, inspectedMetadata, {
+      catalogRead: readSecond(trashed.catalogSequence, trashed.catalogDigestBase64, {
+        signerGrant: copy2({ ...signedDeviceGrant,
+          compartment_id: b64(Buffer.from("foreign-scope")) }),
+      }),
+    }), /ZK_CROSS_DEVICE_TRASH_UNVERIFIED/,
+  "foreign signer scope cannot endorse receiving device's tombstone");
+  await assert.rejects(secondInspection(trashed.catalogSequence,
+    trashed.catalogDigestBase64, inspectedMetadata, {
+      readArchivedCek: async () => file.generateFileCek(),
+    }), /ZK_CROSS_DEVICE_TRASH_UNVERIFIED/, "forged escrow key cannot create deletion claim");
+  let disconnectedGets = 0;
+  await assert.rejects(secondInspection(trashed.catalogSequence,
+    trashed.catalogDigestBase64, inspectedMetadata, {
+      catalogRead: readSecond(trashed.catalogSequence, trashed.catalogDigestBase64, {
+        fetchImpl: async (url, opts) => {
+          const response = await fetchImpl(url, opts);
+          if (url.endsWith("/content/read")) {
+            disconnectedGets++;
+            await response.arrayBuffer();
+            throw Error("GET response lost after the server handled it");
+          }
+          return response;
+        },
+      }),
+    }), /ZK_CROSS_DEVICE_TRASH_UNVERIFIED/,
+  "lost GET response cannot be mistaken for evidence of a remote tombstone");
+  assert.equal(disconnectedGets, 1, "never automatically retry a lost historical read");
+  const recoveredAfterLostGet = await secondInspection(trashed.catalogSequence,
+    trashed.catalogDigestBase64, inspectedMetadata);
+  assert.equal(recoveredAfterLostGet.state, "trashed",
+    "a fresh, externally pinned signed GET can later reconcile the lost response");
   const historicalAfterTrash = await send("/zk-1/v1/content/read", await rawSigner("get",
     sourceId, 2, hash(renameBytes)));
   assert.equal(historicalAfterTrash.status, 200);
@@ -665,6 +781,17 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
   assert.equal(restored.logicalStateFinalized, true);
   assert.equal(puts, beforeRestore + 1);
   assert.equal(restored.metadata.parent_version_id, trashed.metadata.version_id);
+  const observedRestore = await secondInspection(restored.catalogSequence,
+    restored.catalogDigestBase64, [...inspectedMetadata, restored.metadata]);
+  assert.equal(observedRestore.state, "file");
+  assert.equal(observedRestore.restoredAfterTombstone, true);
+  assert.equal(observedRestore.revision, 4);
+  assert.equal(observedRestore.authorizesProductionRestore, false);
+  const beforeCrossDeviceDenied = puts;
+  await assert.rejects(secondInspection(trashed.catalogSequence,
+    trashed.catalogDigestBase64, inspectedMetadata), /ZK_CROSS_DEVICE_TRASH_UNVERIFIED/,
+  "two-device old tombstone cannot override a newer signed restore");
+  assert.equal(puts, beforeCrossDeviceDenied, "reader only, no mutation");
   const restoredRead = await send("/zk-1/v1/content/read", await rawSigner("get",
     sourceId, 4, Buffer.from(restored.ciphertextDigestBase64, "base64url")));
   assert.equal(restoredRead.status, 200);

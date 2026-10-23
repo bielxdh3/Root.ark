@@ -185,7 +185,7 @@ async function harness() {
       ? onIndependentFetch(...args) : Promise.reject(Error("NO_INDEPENDENT_FETCH")),
     TextEncoder, TextDecoder, Uint8Array, ArrayBuffer, atob, btoa,
     setTimeout: (callback, delay) => delay === 60000 ? 0 : setTimeout(callback, delay),
-    clearTimeout, AbortController,
+    clearTimeout, AbortController, indexedDB: {},
   });
   vm.runInContext(source, context);
   listeners.get("rootark:workspace-rendered")();
@@ -907,6 +907,76 @@ test("catalog writer relay denies forged offline key pin before any journal or H
   await page.denied();
   assert.equal(calls(), 0);
   assert.equal(setup.steps.length, 0);
+});
+
+async function configureLifecycleUI(page) {
+  await configureCatalogWriter(page);
+  page.window.RootarkZk1BrowserCatalog = {
+    openCatalog: async () => { throw Error("SHOULD_USE_LIFECYCLE_OBSERVER"); },
+    getCatalogCiphertext: async () => { throw Error("SHOULD_USE_LIFECYCLE_OBSERVER"); },
+  };
+  const objectId = encode(crypto.randomBytes(16));
+  const versionId = encode(crypto.randomBytes(16));
+  const descriptor = { schema: "rootark-zk1-lifecycle-selection/v1", objectId,
+    versions: [{ object_id: objectId, version_id: versionId, epoch: 1 }] };
+  page.file("catalog-lifecycle-history", JSON.stringify(descriptor));
+  page.field("catalog-lifecycle-id").value = objectId;
+  page.field("catalog-lifecycle-ceks").files = [{ size: 32,
+    arrayBuffer: async () => Uint8Array.from(crypto.randomBytes(32)).buffer }];
+  page.field("catalog-lifecycle-opt-in").checked = true;
+  page.field("catalog-sequence").value = "3";
+  page.field("catalog-digest").value = encode(crypto.randomBytes(32));
+  return { objectId, versionId, descriptor };
+}
+
+test("normal browser opt-in imports local CEK and dispatches pinned cross-device lifecycle read", async () => {
+  const page = await harness();
+  const fixture = await configureLifecycleUI(page);
+  let invoked = 0;
+  page.window.RootarkZk1CrossDeviceTrashObserver = { async inspect(input) {
+    invoked++;
+    assert.equal(input.catalogRead.pinnedCatalogHead.sequence, 3);
+    assert.equal(input.catalogRead.pinnedCatalogHead.digest,
+      page.field("catalog-digest").value);
+    assert.equal(input.objectId, fixture.objectId);
+    const cek = await input.readArchivedCek({ ...input.catalogRead.trust.signedDeviceGrant,
+      objectId: fixture.objectId, revision: 1, versionId: fixture.versionId });
+    assert.equal(cek.extractable, false);
+    assert.equal(cek.algorithm.name, "AES-GCM");
+    return { objectId: fixture.objectId, revision: 1, state: "trashed",
+      catalogSequence: 3, exactSignedGetAndAeadVerified: true,
+      monotonicPinnedFloorVerified: true, authorizesProductionRestore: false,
+      physicalErasureProven: false };
+  } };
+  page.click("catalog-lifecycle");
+  await tickUntil(() => page.field("status").textContent.includes("tombstone conferido")
+    || page.field("status").textContent.includes("Operação recusada"));
+  assert.equal(page.field("status").textContent.includes("tombstone conferido"), true,
+    "lifecycle UI refused before observer; invoked=" + invoked);
+  assert.equal(invoked, 1);
+  assert.equal(page.downloads.length, 0);
+  assert.equal(page.field("catalog-lifecycle-history").files.length, 0);
+  assert.equal(page.field("catalog-lifecycle-ceks").files.length, 0);
+});
+
+test("normal browser cross-device lifecycle never opens catalog without opt-in and all CEKs", async () => {
+  const page = await harness();
+  await configureLifecycleUI(page);
+  let calls = 0;
+  page.window.RootarkZk1CrossDeviceTrashObserver = {
+    async inspect() { calls++; throw Error("MUST_NOT_START"); },
+  };
+  page.field("catalog-lifecycle-opt-in").checked = false;
+  page.click("catalog-lifecycle");
+  await page.denied();
+  assert.equal(calls, 0);
+  page.field("catalog-lifecycle-opt-in").checked = true;
+  page.field("catalog-lifecycle-ceks").files = [];
+  page.file("catalog-lifecycle-history", JSON.stringify({
+    schema: "rootark-zk1-lifecycle-selection/v1", objectId: "invalid", versions: [] }));
+  page.click("catalog-lifecycle");
+  await page.denied();
+  assert.equal(calls, 0);
 });
 
 for (const mode of ["logout", "csrf"]) test("catalog publish fences " + mode

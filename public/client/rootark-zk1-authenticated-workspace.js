@@ -723,6 +723,17 @@
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-page">Exibir página verificada</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-get">GET ciphertext conferido</button></div>'
       + '<div data-zk1-field="catalog-list" role="region" aria-label="IDs de versões opacas validadas"></div>'
+      + '<fieldset><legend>Conferir tombstone e restauração entre dispositivos (DEV)</legend>'
+      + '<p class="muted">O outro dispositivo exige seu próprio grant, chave privada e o head CAS exato fixado fora do servidor acima. '
+      + 'Importe todas as revisões do objeto, com metadados AEAD, e uma CEK de 32 bytes por revisão, na mesma ordem. '
+      + 'Use somente um cofre/arquivo de CEKs previamente verificado fora do servidor. A conferência faz GET assinado, '
+      + 'descriptografa e apaga os dados temporários localmente. Nunca sincroniza plaintext, apaga versões nem autoriza restore de produção.</p>'
+      + '<label>Object ID a conferir (base64url de 16 bytes)<input data-zk1-field="catalog-lifecycle-id" maxlength="22" autocomplete="off" spellcheck="false"></label>'
+      + '<label>Metadados históricos locais (.json com schema rootark-zk1-lifecycle-selection/v1, objectId, versions)<input type="file" data-zk1-field="catalog-lifecycle-history" accept=".json,application/json"></label>'
+      + '<label>CEKs locais por revisão (arquivos binários de 32 bytes, em ordem)<input type="file" multiple data-zk1-field="catalog-lifecycle-ceks"></label>'
+      + '<label><input type="checkbox" data-zk1-field="catalog-lifecycle-opt-in"> Confirmo o head CAS e a origem externa do histórico e das CEKs.</label>'
+      + '<div class="zk1-workspace-actions"><button type="button" class="button-quiet button" data-zk1-action="catalog-lifecycle">Conferir estado atual assinado</button></div>'
+      + '</fieldset>'
       + '<fieldset><legend>Publicar versão cifrada no catálogo completo (DEV, opt-in)</legend>'
       + '<p class="muted">Selecione somente ciphertext já cifrado (16 bytes a 4 MiB). O nome é cifrado localmente com AES-GCM; '
       + 'a chave de metadados e o nome nunca são enviados ao servidor. O journal assinado é gravado localmente ANTES do PUT. '
@@ -869,7 +880,8 @@
       "restore", "new-secret", "new-device", "answer-pop", "import-approval", "verify-revocation",
       "migrate", "migration-finalize", "migration-batch", "archive-create", "archive-recover",
       "account-create", "account-recover", "versioned-create", "versioned-recover",
-      "catalog-discover", "catalog-page", "catalog-get", "catalog-publish"].includes(action)) return;
+      "catalog-discover", "catalog-page", "catalog-get", "catalog-publish",
+      "catalog-lifecycle"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -1162,7 +1174,7 @@
           + " Fixe sequência/digest por canal externo antes do segundo dispositivo. Sem prova de durabilidade em nuvem.");
         return;
       }
-      if (["catalog-discover", "catalog-page", "catalog-get"].includes(action)) {
+      if (["catalog-discover", "catalog-page", "catalog-get", "catalog-lifecycle"].includes(action)) {
         if (!window.RootarkZk1BrowserCatalog) await loadScript("rootark-zk1-browser-catalog");
         assertLive();
         if (!window.RootarkZk1BrowserCatalog?.openCatalog
@@ -1181,8 +1193,8 @@
           previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
         });
         assertLive();
-        if (action === "catalog-discover") {
-          verifiedCatalog = null;
+        if (action === "catalog-discover" || action === "catalog-lifecycle") {
+          if (action === "catalog-discover") verifiedCatalog = null;
           const signerGrant = JSON.parse(decoder.decode(
             await fileBytes("catalog-signer-grant", 1, 8192)));
           const casRaw = await fileBytes("catalog-cas-key", 32, 32);
@@ -1193,7 +1205,7 @@
           privateDer = await fileBytes("private", 1, 8192);
           const devicePrivateKey = await crypto.subtle.importKey("pkcs8", privateDer,
             "Ed25519", false, ["sign"]);
-          const result = await window.RootarkZk1BrowserCatalog.openCatalog({
+          const catalogRead = {
             trust, signerGrant, devicePrivateKey, catalogAuthorityKey: casKey,
             independentAuthoritySpkiHash: from64(field("catalog-cas-spki").value.trim()),
             pinnedCatalogHead: {
@@ -1203,7 +1215,58 @@
             origin: location.origin + "/", fetchImpl: guardedFetch,
             assertLive, indexedDBImpl: indexedDB,
             nowSeconds: () => Math.floor(Date.now() / 1000),
-          });
+          };
+          if (action === "catalog-lifecycle") {
+            if (field("catalog-lifecycle-opt-in")?.checked !== true) fail();
+            if (!window.RootarkZk1CrossDeviceTrashObserver)
+              await loadScript("rootark-zk1-cross-device-trash-observer");
+            assertLive();
+            if (!window.RootarkZk1CrossDeviceTrashObserver?.inspect
+              || !window.RootarkZk1FileContent?.importFileCek) fail();
+            const packed = await fileBytes("catalog-lifecycle-history", 2, 65536);
+            let selected;
+            try { selected = JSON.parse(decoder.decode(packed)); }
+            finally { packed.fill(0); }
+            exactly(selected, ["schema", "objectId", "versions"]);
+            if (selected.schema !== "rootark-zk1-lifecycle-selection/v1"
+              || selected.objectId !== field("catalog-lifecycle-id")?.value.trim()
+              || !/^[A-Za-z0-9_-]{22}$/.test(selected.objectId)
+              || !Array.isArray(selected.versions) || selected.versions.length < 1
+              || selected.versions.length > 12) fail();
+            const keys = Array.from(field("catalog-lifecycle-ceks")?.files || []);
+            if (keys.length !== selected.versions.length
+              || keys.some((key) => key.size !== 32)) fail();
+            const reviewed = await window.RootarkZk1CrossDeviceTrashObserver.inspect({
+              catalogRead, objectId: selected.objectId,
+              versionMetadata: selected.versions, assertLive,
+              readArchivedCek: async (requested) => {
+                assertLive();
+                if (!["account_id", "compartment_id", "keyring_id"]
+                  .every((name) => requested[name] === scope[name])) fail();
+                const index = requested.revision - 1;
+                if (!Number.isSafeInteger(index) || index < 0 || index >= keys.length
+                  || selected.versions[index]?.version_id !== requested.versionId) fail();
+                const raw = new Uint8Array(await keys[index].arrayBuffer());
+                try {
+                  assertLive();
+                  if (raw.length !== 32) fail();
+                  return await window.RootarkZk1FileContent.importFileCek(raw);
+                } finally { raw.fill(0); }
+              },
+            });
+            assertLive();
+            if (reviewed.exactSignedGetAndAeadVerified !== true
+              || reviewed.monotonicPinnedFloorVerified !== true
+              || reviewed.authorizesProductionRestore !== false
+              || reviewed.physicalErasureProven !== false) fail();
+            status("Objeto " + reviewed.objectId + ": "
+              + (reviewed.state === "trashed" ? "tombstone conferido" : reviewed.restoredAfterTombstone
+                ? "restauração conferida" : "arquivo conferido")
+              + " na revisão " + reviewed.revision + ". CAS assinado #"
+              + reviewed.catalogSequence + ". Sem exclusão física ou restore de produção.");
+            return;
+          }
+          const result = await window.RootarkZk1BrowserCatalog.openCatalog(catalogRead);
           assertLive();
           verifiedCatalog = { result, scope, epoch: sessionEpoch, csrf: initialCsrf };
           status("Catálogo #" + result.sequence + " · " + result.totalCount
@@ -1862,6 +1925,7 @@
       // The original File/Blob remains held by the input until explicitly reset.
       for (const name of ["private", "hpke-private", "pop-challenge", "new-approval", "file", "secret", "bundle", "migration-cek", "migration-proof",
         "catalog-cas-key", "catalog-signer-grant", "catalog-metadata-key",
+        "catalog-lifecycle-history", "catalog-lifecycle-ceks",
         "catalog-write-ciphertext", "catalog-write-key", "catalog-witness-key",
         "migration-batch-descriptors", "migration-batch-ceks", "migration-batch-secret",
         "archive-files", "archive-owner-private", "archive-json", "archive-historical-proof",
