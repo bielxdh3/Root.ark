@@ -89,10 +89,12 @@ function digest(bytes) { return crypto.createHash("sha256").update(bytes).digest
 function hex64(value) { return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value); }
 function archiveName(name) { return typeof name === "string" && ARCHIVE.test(name); }
 
-function inspectZk1LiveLegacyBackupEvidence({ dataDir, databasePath, db, runSecret }) {
+function inspectZk1LiveLegacyBackupEvidence({ dataDir, databasePath, db, runSecret,
+  zipContentsOptIn = false }) {
   if (typeof dataDir !== "string" || !path.isAbsolute(dataDir)
     || typeof databasePath !== "string" || path.dirname(path.resolve(databasePath)) !== path.resolve(dataDir)
-    || !db || !Buffer.isBuffer(runSecret) || runSecret.length !== 32) deny();
+    || !db || !Buffer.isBuffer(runSecret) || runSecret.length !== 32
+    || typeof zipContentsOptIn !== "boolean") deny();
   const baseStat = directory(dataDir);
   const backupDir = path.join(dataDir, "backups");
   const backupStat = directory(backupDir);
@@ -211,6 +213,10 @@ function inspectZk1LiveLegacyBackupEvidence({ dataDir, databasePath, db, runSecr
     if (isTombstone && expected.checksum === null) deny();
     if (!isTombstone) verifiedArchives++;
   }
+  const archiveContents = zipContentsOptIn
+    ? require("./zk1LiveLegacyZipReferenceEvidence").inspectZk1LiveLegacyZipReferenceEvidence({
+      archives: files, runSecret,
+    }) : null;
   for (const row of rows) {
     // No silent 'success' for archive missing on all local paths. The report
     // remains partial even with every local archive present.
@@ -232,7 +238,9 @@ function inspectZk1LiveLegacyBackupEvidence({ dataDir, databasePath, db, runSecr
     .update(JSON.stringify([...files].map(([name, bytes]) => [name, digest(bytes)])))
     .update(JSON.stringify(count)).digest("base64url");
   return Object.freeze({ observation: "partial-local-backup-evidence-only",
-    ...count, ephemeralFingerprint: fingerprint, globallyComplete: false });
+    ...count, ephemeralFingerprint: fingerprint,
+    ...(archiveContents ? { archiveContents } : {}),
+    globallyComplete: false });
 }
 
 function filesForTransaction(tx, archives, tombstones, buffers) {

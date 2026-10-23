@@ -136,6 +136,29 @@ An in-memory mutation that bypasses this second independent inspection was
 RED **0 PASS / 7 FAIL**; this is an intentional insecure mutant, not a prior
 production regression.
 
+### Optional ZIP reference metadata inspection (DEV)
+
+Set `zipContentsOptIn:true` **together with** `backupDataDir` on the
+read-only live reference preflight. This inspects the central directories of
+each selected, independently checksummed local ZIP archive and retention
+tombstone. The bounded scanner validates EOCD, local/central header identity,
+single-disk layout, duplicate/case aliases, path traversal, encryption flags,
+ZIP64 sentinels, entry metadata and declared-size limits. An unrecognized ZIP
+container or unsafe name refuses the entire scan rather than becoming an
+empty archive.
+
+The optional `legacy.backupEvidence.archiveContents` report contains only
+counts for manifests, SQLite candidates, derived candidates, directories and
+**unknown** entry classes, plus an ephemeral keyed fingerprint. All source
+filenames, archive paths and entry names remain private. It does **not**
+decompress or cryptographically read back individual entry content, establish
+the correctness of backup-manifest.json, cover external provider namespaces,
+prove archive or derived completeness, or authorize restore, cutover/deletion
+or production use. `contentReadbackVerified:false`,
+`derivedCoverage:"unknown"`, `providerCoverage:"unknown"` and
+`archiveCompleteness:"unknown"` are explicit. Omitting the option preserves
+the previous partial backup observation unchanged.
+
 ## Local version payload and derived search reference evidence (third independent opt-in)
 
 The optional `localUploadsDir` is the existing absolute canonical legacy

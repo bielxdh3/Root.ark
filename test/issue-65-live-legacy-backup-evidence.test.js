@@ -60,6 +60,107 @@ function checkOpaque(f, result) {
   for (const key of ["authorizesCutover", "canDeleteLegacy", "wholeCorpusVerified", "authoritativeCorpusInventory"])
     assert.equal(result[key], false);
 }
+
+function selectedZip(entries) {
+  const locals = [], centers = [];
+  let offset = 0;
+  for (const [name, payload] of entries) {
+    const nameBytes = Buffer.from(name);
+    const body = Buffer.from(payload);
+    let crc = 0xffffffff;
+    for (const value of body) {
+      crc ^= value;
+      for (let i = 0; i < 8; i++) crc = crc & 1
+        ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+    }
+    crc = (crc ^ 0xffffffff) >>> 0;
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x800, 6);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(body.length, 18);
+    local.writeUInt32LE(body.length, 22);
+    local.writeUInt16LE(nameBytes.length, 26);
+    locals.push(local, nameBytes, body);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0x800, 8);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(body.length, 20);
+    central.writeUInt32LE(body.length, 24);
+    central.writeUInt16LE(nameBytes.length, 28);
+    central.writeUInt32LE(offset, 42);
+    centers.push(central, nameBytes);
+    offset += local.length + nameBytes.length + body.length;
+  }
+  const directory = Buffer.concat(centers);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(directory.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, directory, end]);
+}
+
+function replaceArchive(f, bytes) {
+  fs.writeFileSync(f.zip, bytes);
+  const db = new DatabaseSync(f.databasePath);
+  db.prepare("UPDATE backup_history SET checksum=? WHERE id='backup-1'")
+    .run(crypto.createHash("sha256").update(bytes).digest("hex"));
+  db.close();
+}
+
+test("explicit ZIP metadata inventory counts derived, SQL, unknown references without corpus clearance", (t) => {
+  const f = fixture(t);
+  const zip = selectedZip([
+    ["backup-manifest.json", "{}"],
+    ["data/rootark.sqlite", "private synthetic db bytes"],
+    ["derived/previews/opaque.dat", "private synthetic preview"],
+    ["future-family/surprise.dat", "unclassified synthetic file"],
+  ]);
+  replaceArchive(f, zip);
+  const original = Buffer.from(fs.readFileSync(f.zip));
+  const report = scan(f, { zipContentsOptIn: true });
+  const observed = report.legacy.backupEvidence.archiveContents;
+  assert.deepEqual({ ...observed, ephemeralFingerprint: null }, {
+    observation: "partial-local-zip-central-directory-only",
+    archivesInspected: 1, entries: 4, directories: 0,
+    manifests: 1, sqliteCandidates: 1, derivedCandidates: 1,
+    unknownEntries: 1, ephemeralFingerprint: null,
+    contentReadbackVerified: false, derivedCoverage: "unknown",
+    providerCoverage: "unknown", archiveCompleteness: "unknown",
+    globallyComplete: false,
+  });
+  checkOpaque(f, report);
+  assert.equal(JSON.stringify(report).includes("surprise.dat"), false);
+  assert.deepEqual(fs.readFileSync(f.zip), original);
+  assert.equal(report.authorizesCutover, false);
+});
+
+test("selected ZIP inventory rejects malformed, unsafe, aliased and oversized central directory without any writes", (t) => {
+  const valid = selectedZip([["backup-manifest.json", "{}"]]);
+  for (const build of [
+    () => Buffer.from("not a ZIP"),
+    () => selectedZip([["../traversal.txt", "bad"]]),
+    () => selectedZip([["backup-manifest.json", "{}"], ["backup-manifest.json", "duplicate"]]),
+    () => selectedZip([["x\\bad.txt", "unsafe"]]),
+    () => { const b = Buffer.from(valid); b.writeUInt32LE(0xffffffff, b.length - 6); return b; },
+    () => { const b = Buffer.from(valid); b.writeUInt16LE(0xffff, b.length - 14); return b; },
+    () => { const b = Buffer.from(valid); b.writeUInt16LE(1, 6); return b; },
+    () => { const b = Buffer.from(valid); b.writeUInt32LE(0xffffffff, 22); return b; },
+  ]) {
+    const f = fixture(t);
+    replaceArchive(f, build());
+    const before = fs.readFileSync(f.zip);
+    assert.throws(() => scan(f, { zipContentsOptIn: true }),
+      /ZK_LIVE_LEGACY_INVENTORY_UNAVAILABLE/);
+    assert.deepEqual(fs.readFileSync(f.zip), before);
+  }
+});
 function tx(f, phase = "prepared", name = NAME) {
   const txRoot = path.join(f.backupDir, ".retention-transactions");
   const folder = path.join(txRoot, "tx-" + TX_ID);

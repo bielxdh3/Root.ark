@@ -172,7 +172,7 @@ function inspectRegisteredSqlCoverage(db, secret, originalObservations) {
 
 function inspectZk1LiveLegacyReferencePreflight({
   optIn, databasePath, persistence = {}, backupDataDir, sqlCoverageOptIn, localUploadsDir,
-  strictSourceInventoryOptIn,
+  strictSourceInventoryOptIn, zipContentsOptIn,
 } = {}) {
   if (optIn !== true || typeof databasePath !== "string" || !path.isAbsolute(databasePath)
     || persistence.dbEnabled !== true || persistence.jsonReadFallback !== false
@@ -180,7 +180,9 @@ function inspectZk1LiveLegacyReferencePreflight({
     || (sqlCoverageOptIn !== undefined && typeof sqlCoverageOptIn !== "boolean")
     || (strictSourceInventoryOptIn !== undefined && typeof strictSourceInventoryOptIn !== "boolean")
     || (strictSourceInventoryOptIn === true && (sqlCoverageOptIn !== true
-      || backupDataDir === undefined || localUploadsDir === undefined))) refuse();
+      || backupDataDir === undefined || localUploadsDir === undefined))
+    || (zipContentsOptIn !== undefined && typeof zipContentsOptIn !== "boolean")
+    || (zipContentsOptIn === true && backupDataDir === undefined)) refuse();
   let db;
   try {
     const before = fileIdentity(databasePath);
@@ -200,6 +202,7 @@ function inspectZk1LiveLegacyReferencePreflight({
       ? Object.freeze({ observation: "uninspected", globallyComplete: false })
       : require("./zk1LiveLegacyBackupEvidence").inspectZk1LiveLegacyBackupEvidence({
         dataDir: backupDataDir, databasePath, db, runSecret: ephemeralKey,
+        zipContentsOptIn: zipContentsOptIn === true,
       });
     const localReferenceEvidence = localUploadsDir === undefined
       ? Object.freeze({ observation: "uninspected", globallyComplete: false })
