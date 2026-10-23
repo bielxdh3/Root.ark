@@ -15,6 +15,7 @@ const DOMAIN = Buffer.from("Root.ark/zk-1/cloud-physical-copy/v1\0");
 const MAX_BYTES = 16 * 1024 * 1024;
 const CONTEXT = /^[a-f0-9]{64}$/;
 const S3_VERSION = /^[A-Za-z0-9_.+\-=/]{1,1024}$/;
+const WEBDAV_ETAG = /^"[A-Za-z0-9_.:-]{1,128}"$/;
 
 function fail() {
   const error = new Error("ZK_CLOUD_READBACK_UNAVAILABLE");
@@ -74,9 +75,11 @@ class Zk1CloudCiphertextReadbackVerifier {
   #expectedContext;
   #driveId;
   #s3Version;
+  #webdavEtag;
   #namespace;
   constructor({ cloudReader, expectedProvider, expectedReaderContext,
-    pinnedDriveFileId = null, pinnedS3VersionId = null } = {}) {
+    pinnedDriveFileId = null, pinnedS3VersionId = null,
+    pinnedWebdavEtag = null } = {}) {
     if (!cloudReader || typeof cloudReader !== "object"
       || !["s3", "gdrive", "webdav"].includes(expectedProvider)
       || !CONTEXT.test(expectedReaderContext)
@@ -87,6 +90,8 @@ class Zk1CloudCiphertextReadbackVerifier {
       || (["s3", "webdav"].includes(expectedProvider) && pinnedDriveFileId !== null)
       || (pinnedS3VersionId !== null && (expectedProvider !== "s3"
         || pinnedS3VersionId === "null" || !S3_VERSION.test(pinnedS3VersionId)))
+      || (pinnedWebdavEtag !== null && (expectedProvider !== "webdav"
+        || !WEBDAV_ETAG.test(pinnedWebdavEtag)))
       || (expectedProvider === "gdrive" &&
         (typeof pinnedDriveFileId !== "string"
           || !/^[A-Za-z0-9_-]{1,256}$/.test(pinnedDriveFileId)))) fail();
@@ -95,6 +100,7 @@ class Zk1CloudCiphertextReadbackVerifier {
     this.#expectedContext = expectedReaderContext;
     this.#driveId = pinnedDriveFileId;
     this.#s3Version = pinnedS3VersionId;
+    this.#webdavEtag = pinnedWebdavEtag;
     this.#namespace = typeof cloudReader.zk1StorageNamespace === "function"
       ? cloudReader.zk1StorageNamespace() : null;
     if (this.#namespace !== null && !/^[a-f0-9]{64}$/.test(this.#namespace)) fail();
@@ -102,7 +108,8 @@ class Zk1CloudCiphertextReadbackVerifier {
 
   get pinnedCopyTarget() {
     return Object.freeze({ provider: this.#expectedProvider, driveFileId: this.#driveId,
-      namespaceIdentity: this.#namespace, providerVersionId: this.#s3Version });
+      namespaceIdentity: this.#namespace, providerVersionId: this.#s3Version,
+      providerEtag: this.#webdavEtag });
   }
 
   async verifyExact(input) {
@@ -135,6 +142,7 @@ class Zk1CloudCiphertextReadbackVerifier {
       const downloaded = await this.#reader.download(folder, name, destination, "uploads",
         () => true, { maxBytes: total,
           ...(this.#s3Version === null ? {} : { providerVersionId: this.#s3Version }),
+          ...(this.#webdavEtag === null ? {} : { expectedEtag: this.#webdavEtag }),
           ...(this.#driveId === null ? {} : { providerFileId: this.#driveId }) });
       if (downloaded !== true) fail();
       const identity = await boundedIdentityRead(() => this.#reader.resolveInventoryContext());
@@ -172,6 +180,7 @@ class Zk1CloudCiphertextReadbackVerifier {
         provider: this.#expectedProvider, readbackMatched: true,
         providerFileId: this.#driveId,
         providerVersionId: this.#s3Version,
+        providerEtag: this.#webdavEtag,
         providerObjectKey: expectedKey, readbackSha256: Buffer.from(expectedSha),
         namespaceIdentity: this.#namespace,
         byteLength: total, operationId: Buffer.from(operationId),

@@ -10,6 +10,7 @@ const path = require("node:path");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
 const { computeZk1CiphertextRoot } = require("../crypto/rootark-zk-chunk-root-v1");
 const { zk1CloudCopyAddress } = require("./zk1CloudCiphertextReadbackVerifier");
+const WEBDAV_ETAG = /^"[A-Za-z0-9_.:-]{1,128}"$/;
 
 function fail() {
   const error = new Error("ZK_CLOUD_COPY_UNAVAILABLE");
@@ -76,9 +77,10 @@ class Zk1CloudCiphertextCopyPublisher {
   #context;
   #provider;
   #driveId;
+  #webdavEtag;
   #namespace;
   constructor({ cloudWriter, expectedProvider, expectedWriterContext,
-    pinnedDriveFileId = null } = {}) {
+    pinnedDriveFileId = null, expectedWebdavEtag = null } = {}) {
     if (!cloudWriter || typeof cloudWriter !== "object"
       || !["s3", "gdrive", "webdav"].includes(expectedProvider)
       || typeof expectedWriterContext !== "string"
@@ -88,6 +90,8 @@ class Zk1CloudCiphertextCopyPublisher {
       || cloudWriter.enabled() !== true
       || cloudWriter.status()?.provider !== expectedProvider
       || (["s3", "webdav"].includes(expectedProvider) && pinnedDriveFileId !== null)
+      || (expectedWebdavEtag !== null && (expectedProvider !== "webdav"
+        || !WEBDAV_ETAG.test(expectedWebdavEtag)))
       || (expectedProvider === "gdrive" &&
         (typeof pinnedDriveFileId !== "string"
           || !/^[A-Za-z0-9_-]{1,256}$/.test(pinnedDriveFileId)))) fail();
@@ -95,6 +99,7 @@ class Zk1CloudCiphertextCopyPublisher {
     this.#context = expectedWriterContext;
     this.#provider = expectedProvider;
     this.#driveId = pinnedDriveFileId;
+    this.#webdavEtag = expectedWebdavEtag;
     this.#namespace = typeof cloudWriter.zk1StorageNamespace === "function"
       ? cloudWriter.zk1StorageNamespace() : null;
     if (this.#namespace !== null && !/^[a-f0-9]{64}$/.test(this.#namespace)) fail();
@@ -137,17 +142,22 @@ class Zk1CloudCiphertextCopyPublisher {
       } finally { fs.closeSync(fd); }
       const answer = await this.#writer.upload(staged, address.folder,
         address.name, "uploads", { zk1BoundedBytes: payload.size,
+          ...(this.#webdavEtag === null ? {} : { expectedEtag: this.#webdavEtag }),
           ...(this.#driveId === null ? {} : { providerFileId: this.#driveId }) });
       if (!answer || answer.provider !== this.#provider || answer.key !== key
         || (this.#driveId !== null && answer.id !== this.#driveId)) fail();
       if (this.#provider === "s3" && answer.versionId !== undefined
         && (typeof answer.versionId !== "string" || answer.versionId === "null"
           || !/^[A-Za-z0-9_.+\-=/]{1,1024}$/.test(answer.versionId))) fail();
+      if (this.#provider === "webdav" && answer.etag !== undefined
+        && answer.etag !== null && !WEBDAV_ETAG.test(answer.etag)) fail();
+      if (this.#webdavEtag !== null && !WEBDAV_ETAG.test(answer.etag)) fail();
       if (await boundedIdentity(() => this.#writer.resolveInventoryContext()) !== this.#context) fail();
       return Object.freeze({ status: "CLOUD_COPY_PUT_ACK_NONAUTHORITATIVE",
         operationId: Buffer.from(operationId), provider: this.#provider,
         providerFileId: this.#driveId,
         providerVersionId: this.#provider === "s3" ? answer.versionId || null : null,
+        providerEtag: this.#provider === "webdav" ? answer.etag || null : null,
         providerObjectKey: key, ciphertextSha256: Buffer.from(sha),
         namespaceIdentity: this.#namespace,
         byteLength: payload.size, authorizesIo: false,

@@ -346,6 +346,7 @@ class Zk1PgPhysicalInventoryBridge {
       || !same(remote.readbackSha256, v.operation.ciphertext_sha256)
       || (remote.namespaceIdentity !== cloudVerifier.pinnedCopyTarget.namespaceIdentity)
       || remote.providerVersionId !== cloudVerifier.pinnedCopyTarget.providerVersionId
+      || remote.providerEtag !== cloudVerifier.pinnedCopyTarget.providerEtag
       || typeof remote.providerObjectKey !== "string"
       || !remote.providerObjectKey.endsWith(`/uploads/${
         zk1CloudCopyAddress({ scope: v.scope,
@@ -360,6 +361,7 @@ class Zk1PgPhysicalInventoryBridge {
       operationId: Buffer.from(v.operation.operation_id),
       provider: remote.provider, providerFileId: remote.providerFileId,
       providerVersionId: remote.providerVersionId,
+      providerEtag: remote.providerEtag,
       providerObjectKey: remote.providerObjectKey,
       namespaceIdentity: remote.namespaceIdentity,
       ciphertextSha256: Buffer.from(remote.readbackSha256),
@@ -410,6 +412,7 @@ class Zk1PgPhysicalInventoryBridge {
       // same bytes. It cannot be attributed to a newer PUT acknowledgment.
       || (remote.providerVersionId !== null
         && write.providerVersionId !== remote.providerVersionId)
+      || (remote.providerEtag !== null && write.providerEtag !== remote.providerEtag)
       || remote.namespaceIdentity !== write.namespaceIdentity
       || remote.providerObjectKey !== write.providerObjectKey
       || !same(remote.ciphertextSha256, write.ciphertextSha256)

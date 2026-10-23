@@ -14,6 +14,10 @@ const MAX_ACK = 4096;
 const SAFE_NAMESPACE = /^[a-z0-9][a-z0-9_-]{2,63}$/;
 const SAFE_FOLDER = /^zk1-[a-f0-9]{64}$/;
 const SAFE_FILE = /^[A-Za-z0-9_-]{22}\.ct$/;
+// ETag is a provider assertion, not a durable receipt. Reject weak validators,
+// multi-value headers, controls and unbounded input before constructing HTTPS.
+const STRONG_ETAG = /^"[A-Za-z0-9_.:-]{1,128}"$/;
+function validEtag(value) { return typeof value === "string" && STRONG_ETAG.test(value); }
 
 function unavailable() {
   const error = new Error("ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE");
@@ -167,7 +171,8 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
       return `${namespace}/uploads/${folder}/${name}`;
     }
 
-    function transfer(method, objectKey, uploadBytes, expectedLength, abortSignal) {
+    function transfer(method, objectKey, uploadBytes, expectedLength, abortSignal,
+      expectedEtag = null) {
       return new Promise((resolve, reject) => {
         let complete = false;
         let total = 0;
@@ -190,6 +195,10 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
           if (abortSignal) abortSignal.addEventListener("abort", cancelled, { once: true });
           const headers = { "accept-encoding": "identity" };
           if (authorization) headers.authorization = authorization;
+          if (expectedEtag !== null) {
+            ensure(validEtag(expectedEtag));
+            headers["if-match"] = expectedEtag;
+          }
           if (method === "PUT") {
             headers["content-type"] = "application/octet-stream";
             headers["content-length"] = String(uploadBytes.length);
@@ -216,6 +225,21 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
               response.destroy();
               return finish(unavailable());
             }
+            const receivedEtag = response.headers.etag;
+            // A conditional update cannot produce a verifiable next pin if
+            // the peer omits its new strong validator after acknowledging PUT.
+            if (expectedEtag !== null && method === "PUT"
+              && !validEtag(receivedEtag)) {
+              response.destroy();
+              return finish(unavailable());
+            }
+            // Some peers ignore If-Match, so a 200 with the wrong or missing
+            // strong ETag must fail even when the ciphertext hash still matches.
+            if (expectedEtag !== null && method === "GET"
+              && (!validEtag(receivedEtag) || receivedEtag !== expectedEtag)) {
+              response.destroy();
+              return finish(unavailable());
+            }
             const max = method === "GET" ? expectedLength : MAX_ACK;
             if (response.headers["content-length"] !== undefined) {
               const advertised = response.headers["content-length"];
@@ -232,7 +256,8 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
             });
             response.on("end", () => {
               if (method === "GET" && total !== expectedLength) finish(unavailable());
-              else finish(null, method === "GET" ? Buffer.concat(parts, total) : null);
+              else finish(null, method === "GET" ? Buffer.concat(parts, total)
+                : validEtag(receivedEtag) ? receivedEtag : null);
             });
             response.on("aborted", () => finish(unavailable()));
             response.on("error", () => finish(unavailable()));
@@ -254,25 +279,35 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
       async upload(source, folder, name, area, opts) {
         try {
           const objectKey = key(folder, name, area);
-          ensure(opts && Object.keys(opts).length === 1
+          const expectedEtag = opts && Object.hasOwn(opts, "expectedEtag")
+            ? opts.expectedEtag : null;
+          ensure(opts && Object.getPrototypeOf(opts) === Object.prototype
+            && Reflect.ownKeys(opts).length === (expectedEtag === null ? 1 : 2)
+            && (expectedEtag === null || validEtag(expectedEtag))
             && Number.isSafeInteger(opts.zk1BoundedBytes)
             && opts.zk1BoundedBytes >= 1 && opts.zk1BoundedBytes <= MAX_BYTES);
           const bytes = readBoundedFile(source, opts.zk1BoundedBytes);
-          await transfer("PUT", objectKey, bytes, 0);
-          return Object.freeze({ provider: "webdav", key: objectKey });
+          const etag = await transfer("PUT", objectKey, bytes, 0, undefined, expectedEtag);
+          return Object.freeze({ provider: "webdav", key: objectKey, etag });
         } catch (_) { throw unavailable(); }
       },
       async download(folder, name, destination, area, allowWrite, opts) {
         try {
           const objectKey = key(folder, name, area);
-          ensure(opts && Object.keys(opts).length === (opts.abortSignal === undefined ? 1 : 2)
+          const expectedEtag = opts && Object.hasOwn(opts, "expectedEtag")
+            ? opts.expectedEtag : null;
+          ensure(opts && Object.getPrototypeOf(opts) === Object.prototype
+            && Reflect.ownKeys(opts).length === (opts.abortSignal === undefined ? 1 : 2)
+              + (expectedEtag === null ? 0 : 1)
+            && (expectedEtag === null || validEtag(expectedEtag))
             && Number.isSafeInteger(opts.maxBytes) && opts.maxBytes >= 1
             && opts.maxBytes <= MAX_BYTES && typeof destination === "string"
             && (opts.abortSignal === undefined || opts.abortSignal instanceof AbortSignal)
             && !opts.abortSignal?.aborted
             && typeof allowWrite === "function" && allowWrite() === true);
           const parent = pinParent(destination);
-          const bytes = await transfer("GET", objectKey, null, opts.maxBytes, opts.abortSignal);
+          const bytes = await transfer("GET", objectKey, null, opts.maxBytes,
+            opts.abortSignal, expectedEtag);
           ensure(!opts.abortSignal?.aborted && allowWrite() === true);
           writeExclusive(destination, bytes, parent);
           return true;
