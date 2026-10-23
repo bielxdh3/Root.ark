@@ -10,6 +10,7 @@ const { inspectIntent } = require("../services/zk1OpaqueCheckpointV2Remote");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/v2-historical-signer-endorsement/v2\0");
 const GRANT_DOMAIN = Buffer.from("Root.ark/zk-1/browser-owner-device-grant/v1\0");
+const APPROVAL_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-checkpoint-remote/owner-approval/v2\0");
 const GRANT_FIELDS = ["schema", "account_id", "compartment_id", "keyring_id",
   "device_id", "authorization_key_id", "authorization_public_key",
   "manifest_revision", "manifest_digest", "current_epoch", "enrolled_epoch", "revoked_at_epoch"];
@@ -21,6 +22,12 @@ const LEGACY_FIELDS = Object.freeze(["schema", "account_id", "compartment_id", "
 const FIELDS = Object.freeze([...LEGACY_FIELDS, "approval_signer_public_key"]);
 const sha = (v) => crypto.createHash("sha256").update(v).digest();
 function denied() { throw Error("ZK_V2_HISTORICAL_SIGNER_UNVERIFIED"); }
+function b64(value, length) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) denied();
+  const raw = Buffer.from(value, "base64url");
+  if (raw.length !== length || raw.toString("base64url") !== value) denied();
+  return raw;
+}
 
 async function issueVerifiedHistoricalSignerEndorsement({ signedIntent, inspectorOptions,
   trustedOwnerPrivateKey, independentlyPinnedOwnerSpkiSha256,
@@ -29,8 +36,6 @@ async function issueVerifiedHistoricalSignerEndorsement({ signedIntent, inspecto
     const signer = trustedOwnerPrivateKey?.type === "private"
       ? trustedOwnerPrivateKey : crypto.createPrivateKey(trustedOwnerPrivateKey);
     const owner = crypto.createPublicKey(signer);
-    const trusted = inspectorOptions.ownerKey?.type === "public"
-      ? inspectorOptions.ownerKey : crypto.createPublicKey(inspectorOptions.ownerKey);
     const spki = owner.export({ format: "der", type: "spki" });
     if (signer.asymmetricKeyType !== "ed25519"
       || !sha(spki).equals(Buffer.from(independentlyPinnedOwnerSpkiSha256))
@@ -43,21 +48,41 @@ async function issueVerifiedHistoricalSignerEndorsement({ signedIntent, inspecto
       || !Object.hasOwn(grant, "signature")
       || grant.schema !== "rootark-zk1-browser-owner-device-grant/v1"
       || grant.revoked_at_epoch !== null
+      || !Number.isSafeInteger(head.revision) || head.revision < 1
+      || !Number.isSafeInteger(head.epoch) || head.epoch < 1
+      || !Number.isSafeInteger(grant.enrolled_epoch) || grant.enrolled_epoch < 1
+      || !Number.isSafeInteger(grant.current_epoch) || grant.current_epoch < 1
+      || !Number.isSafeInteger(grant.manifest_revision) || grant.manifest_revision < 1
+      || typeof grant.device_id !== "string" || !grant.device_id || grant.device_id.length > 128
       || !Number.isSafeInteger(grant.enrolled_epoch)
       || grant.enrolled_epoch > head.epoch
       || grant.current_epoch !== head.epoch || grant.manifest_revision !== head.revision
-      || grant.manifest_digest !== Buffer.from(head.digest).toString("base64url")
+      || !b64(grant.manifest_digest, 32).equals(Buffer.from(head.digest))
       || ["account_id", "compartment_id", "keyring_id"].some((field) =>
         grant[field] !== Buffer.from(inspectorOptions.scope[field]).toString("base64url"))) denied();
     const grantSignerSpki = Buffer.concat([SPKI_PREFIX,
-      Buffer.from(grant.authorization_public_key, "base64url")]);
+      b64(grant.authorization_public_key, 32)]);
     if (grantSignerSpki.length !== 44
-      || !grantSignerSpki.equals(trusted.export({ format: "der", type: "spki" }))
+      || !b64(grant.authorization_key_id, 16)
+      || grantSignerSpki.equals(spki)
       || !crypto.verify(null, Buffer.concat([GRANT_DOMAIN,
         Buffer.from(JSON.stringify(Object.fromEntries(GRANT_FIELDS.map((f) => [f, grant[f]]))))]),
-      owner, Buffer.from(grant.signature, "base64url"))) denied();
+      owner, b64(grant.signature, 64))) denied();
     const raw = Buffer.from(signedIntent);
-    const inspected = await inspectIntent(raw, inspectorOptions, { freshOwner: true });
+    // Historical checkpoints can outlive their owner approver's revocation.
+    // The remote inspector authenticates that signer from the signed recovery
+    // history at the checkpoint epoch, and verifies witness/CAS/FLOOR lineage.
+    // Never source either historical key from the untrusted intent or the
+    // current signed-device grant (which may name a different active device).
+    const inspected = await inspectIntent(raw, inspectorOptions,
+      { freshOwner: false, historicalOwner: true });
+    const approvalSpki = Buffer.from(inspected.ownerApprovalSignerSpki || []);
+    if (approvalSpki.length !== 44 || !approvalSpki.subarray(0, 12).equals(SPKI_PREFIX)
+      || approvalSpki.equals(spki)
+      || !crypto.verify(null, Buffer.concat([APPROVAL_DOMAIN,
+        Buffer.from(inspected.body.owner_approval)]),
+      crypto.createPublicKey({ key: approvalSpki, type: "spki", format: "der" }),
+      Buffer.from(inspected.body.owner_signature))) denied();
     const header = await z.decodeDeterministic(inspected.body.records[0].header);
     const scope = inspectorOptions.scope;
     const statement = {
@@ -77,10 +102,9 @@ async function issueVerifiedHistoricalSignerEndorsement({ signedIntent, inspecto
       witness_signer_spki_sha256: sha(
         inspectorOptions.ownerTrust.pinnedWitness.publicKey
           .export({ format: "der", type: "spki" })).toString("base64url"),
-      // The fresh inspector verified this approval signer against signed,
-      // independently witnessed owner enrollment and revocation history.
-      approval_signer_public_key: trusted.export({ type: "spki", format: "der" })
-        .subarray(-32).toString("base64url"),
+      // The backend selected this exact approver from authenticated historical
+      // owner recovery history; its present-day revocation does not rewrite it.
+      approval_signer_public_key: approvalSpki.subarray(-32).toString("base64url"),
     };
     return Object.freeze({ ...statement,
       signature: crypto.sign(null, Buffer.concat([DOMAIN,
