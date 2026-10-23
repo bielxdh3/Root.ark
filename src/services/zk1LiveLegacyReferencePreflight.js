@@ -171,7 +171,7 @@ function inspectRegisteredSqlCoverage(db, secret, originalObservations) {
 }
 
 function inspectZk1LiveLegacyReferencePreflight({
-  optIn, databasePath, persistence = {}, backupDataDir, sqlCoverageOptIn,
+  optIn, databasePath, persistence = {}, backupDataDir, sqlCoverageOptIn, localUploadsDir,
 } = {}) {
   if (optIn !== true || typeof databasePath !== "string" || !path.isAbsolute(databasePath)
     || persistence.dbEnabled !== true || persistence.jsonReadFallback !== false
@@ -197,6 +197,11 @@ function inspectZk1LiveLegacyReferencePreflight({
       : require("./zk1LiveLegacyBackupEvidence").inspectZk1LiveLegacyBackupEvidence({
         dataDir: backupDataDir, databasePath, db, runSecret: ephemeralKey,
       });
+    const localReferenceEvidence = localUploadsDir === undefined
+      ? Object.freeze({ observation: "uninspected", globallyComplete: false })
+      : require("./zk1LiveLegacyLocalReferenceEvidence").inspectZk1LiveLegacyLocalReferenceEvidence({
+        uploadsDir: localUploadsDir, db, runSecret: ephemeralKey,
+      });
     db.exec("COMMIT");
     if (!sameIdentity(before, fileIdentity(databasePath))) refuse();
     return Object.freeze({
@@ -208,6 +213,7 @@ function inspectZk1LiveLegacyReferencePreflight({
         coverage: "partial",
         observations: Object.freeze(observations),
         backupEvidence,
+        localReferenceEvidence,
         ...(sqlCoverage ? { sqlCoverage } : {}),
       }),
       protected: Object.freeze({

@@ -135,3 +135,51 @@ The existing six-class SQL and unrelated legacy tests remain separate.
 An in-memory mutation that bypasses this second independent inspection was
 RED **0 PASS / 7 FAIL**; this is an intentional insecure mutant, not a prior
 production regression.
+
+## Local version payload and derived search reference evidence (third independent opt-in)
+
+The optional `localUploadsDir` is the existing absolute canonical legacy
+`uploads/` directory, supplied by an authorized local operator. With this
+argument the inspector additionally performs bounded, synchronous, read-only
+inspection through `zk1LiveLegacyLocalReferenceEvidence.js` in the **same**
+SQLite read transaction as the six source classes and optional SQL/backup
+gates. No default activation, HTTP registration, read repair, local file
+mutation, or protected object access occurs. It must only be used when the
+operator expects local bodies to be available; cloud-only or incomplete caches
+refuse on missing referenced files.
+
+The scanner maps `file_versions.versions_json[*].storedAs` to the actual
+`uploads/` root (folder ID `root`) or one-level `uploads/<folderId>/`
+directory according to `folders.id`, checks declared sizes and current
+version identity, and requires each `file_search_index` `(folder_id,file_name)`
+derived reference to resolve to a local regular file. It reads and hashes
+actual file bytes without exporting them. It enumerates **all** entries in
+the chosen `uploads/` namespace; unregistered regular files are counted as
+`unmappedLocalFiles`, never assumed to be safe to delete. Unknown directories,
+symlinks, junctions, hardlinks, unsafe names, duplicate aliases or derived
+references, invalid/stale version metadata, unavailable historical payloads
+and changes in file/directory identity during the scan cause a generic refusal.
+At most 5,000 combined files/directories and 5,000 rows per class are examined;
+per-file content is limited to 32 MiB, aggregate bytes to 64 MiB, JSON to
+256 KiB. Larger real corpora intentionally refuse rather than truncate.
+
+`legacy.localReferenceEvidence` emits only counts, a fresh-key HMAC per run,
+`globallyComplete:false`, and the label
+`partial-local-legacy-file-references-only`. Without the option it explicitly
+returns `observation:"uninspected"`. All top-level destructive/cutover flags
+remain false. This establishes **local existence and observational identity
+only**, without signed owner permission, archived ZIP manifest coverage,
+remote provider inventories, trusted baseline, durable monotonic rollback
+floor, full derived previews, untracked paths elsewhere or cross-source
+quiescence. A coordinated rollback of *both* database and files cannot be
+detected from this local snapshot; adversarial tests reject an inconsistent
+SQL rollback that references missing bytes. Readback also cannot prevent an
+unprivileged writer from mutating a file between the final identity check and
+another process consuming it.
+
+`test/issue-65-live-legacy-local-reference-evidence.test.js` verifies real
+SQLite, local version bytes, physical derived targets, unknown/unmapped files,
+symlinks/junctions/hardlinks, missing historical versions, stale SQL rollback,
+late same-path replacement, and a combined migrated SQLite + backup archive
++ local upload fixture. The test includes a RED/GREEN contract for the
+otherwise absent opt-in report.
