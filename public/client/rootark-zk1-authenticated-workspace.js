@@ -41,6 +41,9 @@
   // browser profile must import independently anchored evidence again.
   let committedDeviceApproval = null;
   let verifiedCatalog = null;
+  // Transient one-step delta anchor. Never persist unverified sync cursors or
+  // silently fetch/apply data in the generic workspace.
+  let verifiedOpaqueDelta = null;
   let verifiedRevocationHead = null;
 
   function fail() { throw new Error("ZK_WORKSPACE_INPUT_DENIED"); }
@@ -779,6 +782,19 @@
       + '<label><input type="checkbox" data-zk1-field="catalog-write-opt-in"> Confirmo ciphertext local, grants V2 ativos e autoridade CAS/witness independente; autorizo somente PUT e commit aditivo.</label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-primary" data-zk1-action="catalog-publish">Journal → PUT → GET assinado → commit</button></div>'
       + '<p class="muted">Journal local desta tentativa (não é pin nem confirmação): <output data-zk1-field="catalog-write-journal"></output></p>'
+      + '<fieldset><legend>Sincronização ZK opaca incremental entre dispositivos (DEV, manual)</legend>'
+      + '<p class="muted">Abra esta tela em cada dispositivo autorizado, com seu próprio grant, chave privada e pins externos. '
+      + 'Ancore o CAS exato ANTES da mutação do outro dispositivo. Importe um delta .json recebido por canal externo somente para conferir '
+      + 'contra um novo CAS/witness assinado e GET protegido feito neste dispositivo. Não usa sync-v2 genérico, não aplica '
+      + 'arquivos ao sistema e não transmite nomes, caminhos ou CEKs em texto claro. Sem sincronização automática.</p>'
+      + '<label><input type="checkbox" data-zk1-field="catalog-delta-opt-in"> Autorizo esta ação manual com meu grant ativo, CAS/witness independentes e journal local para escrita.</label>'
+      + '<label>Delta opaco exportado por outro dispositivo (.json, somente ciphertext e metadados cifrados)<input type="file" data-zk1-field="catalog-delta-package" accept=".json,application/json"></label>'
+      + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-anchor">Ancorar CAS assinado atual</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-pull">Conferir e exportar delta cifrado</button>'
+      + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-import">Importar e comparar delta com GET assinado</button>'
+      + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-publish">Publicar nova versão cifrada via journal → PUT → CAS</button></div>'
+      + '<output data-zk1-field="catalog-delta-summary" role="status" aria-live="polite"></output>'
+      + '</fieldset>'
       + '</fieldset>'
       + '</fieldset>'
       + '<fieldset><legend>Revogação de dispositivo e rotação V2 (recibo offline, DEV)</legend>'
@@ -888,6 +904,9 @@
     if (action === "close") {
       committedDeviceApproval = null;
       verifiedCatalog = null;
+      verifiedOpaqueDelta = null;
+      const deltaSummary = field("catalog-delta-summary");
+      if (deltaSummary) deltaSummary.textContent = "";
       verifiedRevocationHead = null;
       const journal = field("catalog-write-journal");
       if (journal) journal.textContent = "";
@@ -902,7 +921,9 @@
       "migrate", "migration-finalize", "migration-batch", "archive-create", "archive-recover",
       "account-create", "account-recover", "versioned-create", "versioned-recover",
       "catalog-discover", "catalog-page", "catalog-get", "catalog-publish",
-      "catalog-lifecycle", "catalog-v2-read", "catalog-v2-get"].includes(action)) return;
+      "catalog-lifecycle", "catalog-v2-read", "catalog-v2-get",
+      "catalog-delta-anchor", "catalog-delta-pull", "catalog-delta-import",
+      "catalog-delta-publish"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -1038,6 +1059,127 @@
       }
       const trust = await grantAndOwner();
       assertLive();
+      if (["catalog-delta-pull", "catalog-delta-import", "catalog-delta-publish"].includes(action)) {
+        if (available.opaqueCatalogV1 !== true
+          || field("catalog-delta-opt-in")?.checked !== true
+          || trust.signedDeviceGrant.revoked_at_epoch !== null
+          || !trust.ownerHistoryCheckpoint || !verifiedOpaqueDelta) fail();
+        const held = verifiedOpaqueDelta;
+        if (held.epoch !== sessionEpoch || held.csrf !== initialCsrf
+          || held.origin !== location.origin || held.grant !== JSON.stringify(trust.signedDeviceGrant)
+          || held.ownerDigest !== to64(trust.pinnedCurrentHead.digest)
+          || held.ownerRevision !== trust.pinnedCurrentHead.revision
+          || held.ownerEpoch !== trust.pinnedCurrentHead.epoch
+          || held.minimumSequence !== field("catalog-write-sequence")?.value.trim()
+          || held.minimumDigest !== field("catalog-write-digest")?.value.trim()
+          || held.casPin !== field("catalog-cas-spki")?.value.trim()
+          || held.witnessPin !== field("catalog-witness-spki")?.value.trim()) fail();
+        await window.RootarkZk1NormalBrowserTrustFloor.assertCurrent({
+          ownerPublicKey: trust.ownerPublicKey,
+          independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+          pinnedCurrentHead: trust.pinnedCurrentHead,
+          signedDeviceGrant: trust.signedDeviceGrant,
+          ownerHistoryCheckpoint: trust.ownerHistoryCheckpoint,
+          previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
+        });
+        assertLive();
+        if (action === "catalog-delta-publish") {
+          // A dedicated manual action; the existing writer guarantees one
+          // signed PUT/CAS, fresh exact GET and a durable intent journal even
+          // if either network ACK disappears. Never loop or retry here.
+          const name = field("catalog-write-name")?.value;
+          if (typeof name !== "string" || /[\u0000-\u001f\u007f]/.test(name)
+            || new TextEncoder().encode(name).length < 1
+            || new TextEncoder().encode(name).length > 220) fail();
+          const objectId = field("catalog-write-id")?.value.trim();
+          if (!/^[A-Za-z0-9_-]{22}$/.test(objectId)) fail();
+          const source = held.baseline.entries.filter((row) => row.objectId === objectId);
+          const expectedRevision = source.length
+            ? Math.max(...source.map((item) => item.revision)) : null;
+          const raw = await fileBytes("catalog-write-key", 32, 32);
+          let metadataKey;
+          try { metadataKey = await crypto.subtle.importKey("raw", raw,
+            { name: "AES-GCM", length: 256 }, false, ["encrypt"]); }
+          finally { raw.fill(0); }
+          data = await fileBytes("catalog-write-ciphertext", 16, 4 * 1024 * 1024);
+          assertLive();
+          // Once a mutation starts, this anchor cannot authorize any second
+          // mutation, including after lost ACK or a transient catch.
+          verifiedOpaqueDelta = null;
+          let result;
+          try {
+            result = await held.client.commitVersion({ previous: held.baseline,
+              objectId, expectedRevision, revision: expectedRevision === null ? 1
+                : expectedRevision + 1, epoch: trust.pinnedCurrentHead.epoch,
+              ciphertext: data, name, metadataKey });
+          } catch (error) {
+            if (typeof error?.outcome?.journalId === "string"
+              && /^[A-Za-z0-9_-]{43}$/.test(error.outcome.journalId))
+              field("catalog-write-journal").textContent = error.outcome.journalId;
+            // No retry button is enabled from this anchor after uncertainty.
+            throw error;
+          }
+          assertLive();
+          if (result.journalClearedAfterSignedProof !== true
+            || result.plaintextMetadataExposed !== false
+            || result.productionDurabilityProven !== false) fail();
+          field("catalog-delta-summary").textContent = "CAS assinado #" + result.sequence;
+          status("Versão cifrada enviada uma única vez, GET exato e catálogo CAS assinados. "
+            + "Fixe o novo head externamente e ancore novamente em ambos os dispositivos. "
+            + "Nenhuma sincronização automática ou durabilidade de nuvem comprovada.");
+          return;
+        }
+        // Import never trusts the uploaded JSON. Fresh independent witness/CAS
+        // and this device's signed exact protected GET reconstruct *every*
+        // byte before accepting the portable ciphertext-only delta package.
+        let imported = null;
+        if (action === "catalog-delta-import") {
+          const raw = await fileBytes("catalog-delta-package", 2, 12 * 1024 * 1024);
+          try { imported = JSON.parse(decoder.decode(raw)); } finally { raw.fill(0); }
+          exactly(imported, ["format", "fromSequence", "toSequence", "catalogDigest", "additions"]);
+          if (imported.format !== "rootark-zk1-opaque-device-delta/v1"
+            || !Array.isArray(imported.additions) || imported.additions.length < 1
+            || imported.additions.length > 4096) fail();
+        }
+        // Prevent any second import attempt against a consumed/stale anchor.
+        verifiedOpaqueDelta = null;
+        const delta = await held.client.pullDelta(held.baseline);
+        assertLive();
+        if (delta.fromSequence !== held.baseline.head.sequence
+          || delta.toSequence !== delta.fromSequence + 1
+          || delta.plaintextMetadataExposed !== false
+          || delta.productionDurabilityProven !== false
+          || !Array.isArray(delta.additions) || !delta.additions.length) fail();
+        const portable = {
+          format: "rootark-zk1-opaque-device-delta/v1",
+          fromSequence: delta.fromSequence, toSequence: delta.toSequence,
+          catalogDigest: delta.catalogDigest,
+          additions: delta.additions.map((entry) => ({
+            objectId: entry.objectId, revision: entry.revision, epoch: entry.epoch,
+            ciphertextDigestBase64: entry.ciphertextDigestBase64,
+            metadataCiphertextBase64: entry.metadataCiphertextBase64,
+            ciphertextBase64: entry.ciphertextBase64,
+          })),
+        };
+        if (imported) {
+          // The exact canonical representation is intentionally narrow: extra
+          // fields, plaintext paths, reordering, omissions or altered bytes
+          // fail before any local export/application.
+          if (JSON.stringify(imported) !== JSON.stringify(portable)) fail();
+          field("catalog-delta-summary").textContent = "Importado e conferido: "
+            + portable.additions.length + " versão(ões) cifradas · CAS #" + portable.toSequence;
+          status("Delta importado conferido com CAS/witness independentes e GET assinado local. "
+            + "Nenhuma escrita, aplicação de arquivo ou plaintext no servidor.");
+        } else {
+          downloadLocal("rootark-zk1-opaque-delta.json", JSON.stringify(portable),
+            "application/json", assertLive);
+          field("catalog-delta-summary").textContent = "Exportado: "
+            + portable.additions.length + " versão(ões) cifradas · CAS #" + portable.toSequence;
+          status("Delta opaco conferido e exportado manualmente; só contém ciphertext "
+            + "e metadados AES-GCM. O outro dispositivo deve revalidar CAS e GET.");
+        }
+        return;
+      }
       if (action === "catalog-v2-read" || action === "catalog-v2-get") {
         if (field("catalog-v2-opt-in")?.checked !== true
           || available.opaqueCheckpointV2Read !== true
@@ -1137,8 +1279,11 @@
         } finally { for (const key of keys) key.fill(0); deviceRaw.fill(0); }
         return;
       }
-      if (action === "catalog-publish") {
-        if (field("catalog-write-opt-in")?.checked !== true
+      if (action === "catalog-publish" || action === "catalog-delta-anchor") {
+        const anchoringDelta = action === "catalog-delta-anchor";
+        if (anchoringDelta) verifiedOpaqueDelta = null;
+        if ((anchoringDelta ? field("catalog-delta-opt-in")?.checked !== true
+          : field("catalog-write-opt-in")?.checked !== true)
           || available.opaqueCatalogV1 !== true
           || trust.signedDeviceGrant.revoked_at_epoch !== null
           || !trust.ownerHistoryCheckpoint) fail();
@@ -1154,6 +1299,10 @@
         if (!window.RootarkZk1BrowserOpaqueCatalogCommit)
           await loadScript("rootark-zk1-browser-opaque-catalog-commit");
         assertLive();
+        if (anchoringDelta && !window.RootarkZk1OpaqueDeviceDeltaSync?.createClient)
+          await loadScript("rootark-zk1-opaque-device-delta-sync");
+        assertLive();
+        if (anchoringDelta && !window.RootarkZk1OpaqueDeviceDeltaSync?.createClient) fail();
         if (!window.RootarkZk1BrowserOpaqueCatalogCommit?.createClient
           || !window.RootarkZk1ProtectedHttpClient?.signProtectedContentOperation
           || !window.RootarkZk1ProtectedHttpClient?.postProtectedCiphertextPut) fail();
@@ -1168,14 +1317,14 @@
         const signerGrant = JSON.parse(decoder.decode(await fileBytes("catalog-signer-grant", 1, 8192)));
         const witnessRaw = await fileBytes("catalog-witness-key", 32, 32);
         const casRaw = await fileBytes("catalog-cas-key", 32, 32);
-        const writerKeyRaw = await fileBytes("catalog-write-key", 32, 32);
+        const writerKeyRaw = anchoringDelta ? null : await fileBytes("catalog-write-key", 32, 32);
         let witnessKey, casKey, metadataKey, relayProbes;
         try {
           const witnessPin = from64(field("catalog-witness-spki").value.trim());
           const casPin = from64(field("catalog-cas-spki").value.trim());
           witnessKey = await importPinnedCatalogAuthority(witnessRaw, witnessPin);
           casKey = await importPinnedCatalogAuthority(casRaw, casPin);
-          metadataKey = await crypto.subtle.importKey("raw", writerKeyRaw,
+          if (!anchoringDelta) metadataKey = await crypto.subtle.importKey("raw", writerKeyRaw,
             { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
           if (relayOptIn) {
             if (!window.RootarkZk1BrowserAuthorityHeadRelay)
@@ -1191,7 +1340,7 @@
             });
             assertLive();
           }
-        } finally { witnessRaw.fill(0); casRaw.fill(0); writerKeyRaw.fill(0); }
+        } finally { witnessRaw.fill(0); casRaw.fill(0); writerKeyRaw?.fill(0); }
         assertLive();
         const privateRaw = await fileBytes("private", 1, 8192);
         let devicePrivateKey;
@@ -1203,28 +1352,31 @@
         // compare them with the owner-signed grant; private keys stay sealed.
         try { devicePublicKey = await crypto.subtle.importKey("raw", deviceRaw,
           "Ed25519", true, ["verify"]); } finally { deviceRaw.fill(0); }
-        const name = field("catalog-write-name").value;
-        if (typeof name !== "string" || /[\u0000-\u001f\u007f]/.test(name)
-          || new TextEncoder().encode(name).length < 1
-          || new TextEncoder().encode(name).length > 220) fail();
-        const enteredId = field("catalog-write-id").value.trim();
-        if (enteredId && !/^[A-Za-z0-9_-]{22}$/.test(enteredId)) fail();
-        const objectId = enteredId || randomId();
-        field("catalog-write-id").value = objectId;
+        let name, objectId;
+        if (!anchoringDelta) {
+          name = field("catalog-write-name").value;
+          if (typeof name !== "string" || /[\u0000-\u001f\u007f]/.test(name)
+            || new TextEncoder().encode(name).length < 1
+            || new TextEncoder().encode(name).length > 220) fail();
+          const enteredId = field("catalog-write-id").value.trim();
+          if (enteredId && !/^[A-Za-z0-9_-]{22}$/.test(enteredId)) fail();
+          objectId = enteredId || randomId();
+          field("catalog-write-id").value = objectId;
+        }
         const rawSequence = field("catalog-write-sequence").value.trim();
         if (!/^(0|[1-9][0-9]*)$/.test(rawSequence)) fail();
         const sequence = Number(rawSequence);
         if (!Number.isSafeInteger(sequence) || sequence > 127) fail();
         const catalogFloor = from64(field("catalog-write-digest").value.trim());
         if (sequence === 0 && catalogFloor.some((byte) => byte !== 0)) fail();
-        data = await fileBytes("catalog-write-ciphertext", 16, 4 * 1024 * 1024);
+        if (!anchoringDelta) data = await fileBytes("catalog-write-ciphertext", 16, 4 * 1024 * 1024);
         assertLive();
         const scope = Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
           .map((key) => [key, trust.signedDeviceGrant[key]]));
         const signerGrants = [trust.signedDeviceGrant];
         if (signerGrant.device_id !== trust.signedDeviceGrant.device_id) signerGrants.push(signerGrant);
         else if (JSON.stringify(signerGrant) !== JSON.stringify(trust.signedDeviceGrant)) fail();
-        const client = window.RootarkZk1BrowserOpaqueCatalogCommit.createClient({
+        const authority = {
           origin: rootOrigin + "/", fetchImpl: guardedFetch,
           ownerPublicKey: trust.ownerPublicKey,
           pinnedOwnerKeyHash: trust.pinnedOwnerKeyHash,
@@ -1256,7 +1408,36 @@
             assertLive();
           },
           nowSeconds: () => Math.floor(Date.now() / 1000),
-        });
+        };
+        if (anchoringDelta) {
+          const client = window.RootarkZk1OpaqueDeviceDeltaSync.createClient({ authority, assertLive });
+          const baseline = await client.readCurrent();
+          assertLive();
+          // Never bootstrap an independent floor from what the server just
+          // returned. Its exact sequence/digest MUST have been pinned offline.
+          if (baseline.head.sequence !== sequence
+            || baseline.head.digest !== to64(catalogFloor)
+            || baseline.plaintextMetadataExposed !== false
+            || baseline.independentCloudDurabilityProven !== false) fail();
+          verifiedOpaqueDelta = {
+            client, baseline, csrf: initialCsrf, epoch: sessionEpoch,
+            origin: location.origin, grant: JSON.stringify(trust.signedDeviceGrant),
+            ownerDigest: to64(trust.pinnedCurrentHead.digest),
+            ownerRevision: trust.pinnedCurrentHead.revision,
+            ownerEpoch: trust.pinnedCurrentHead.epoch,
+            minimumSequence: field("catalog-write-sequence").value.trim(),
+            minimumDigest: field("catalog-write-digest").value.trim(),
+            casPin: field("catalog-cas-spki").value.trim(),
+            witnessPin: field("catalog-witness-spki").value.trim(),
+          };
+          field("catalog-delta-summary").textContent = "Piso CAS #" + baseline.head.sequence
+            + " · " + baseline.entries.length + " versão(ões) opacas";
+          status("Piso independente CAS #" + baseline.head.sequence
+            + " autenticado. Agora outra sessão/dispositivo pode publicar UMA nova revisão; "
+            + "volte para importar ou exportar o delta cifrado manualmente.");
+          return;
+        }
+        const client = window.RootarkZk1BrowserOpaqueCatalogCommit.createClient(authority);
         const addition = { objectId, revision: 1, epoch: trust.pinnedCurrentHead.epoch,
           ciphertext: data, name, metadataKey };
         const journalId = await client.prepareIntent([{ objectId, revision: 1,
@@ -2047,6 +2228,7 @@
         "catalog-cas-key", "catalog-signer-grant", "catalog-metadata-key",
         "catalog-lifecycle-history", "catalog-lifecycle-ceks",
         "catalog-write-ciphertext", "catalog-write-key", "catalog-witness-key",
+        "catalog-delta-package",
         "migration-batch-descriptors", "migration-batch-ceks", "migration-batch-secret",
         "archive-files", "archive-owner-private", "archive-json", "archive-historical-proof",
         "account-descriptors", "account-holder-files", "account-local-files",
@@ -2093,6 +2275,9 @@
   window.addEventListener("rootark:logout", () => {
     sessionEpoch++;
     verifiedCatalog = null;
+    verifiedOpaqueDelta = null;
+    const deltaSummary = field("catalog-delta-summary");
+    if (deltaSummary) deltaSummary.textContent = "";
     const journal = field("catalog-write-journal");
     if (journal) journal.textContent = "";
     for (const url of activeDownloadUrls) URL.revokeObjectURL(url);

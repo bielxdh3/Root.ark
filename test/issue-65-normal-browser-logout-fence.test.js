@@ -810,6 +810,206 @@ test("catalog publish opt-in invokes durable journal before signed PUT and authe
   assert.equal(page.downloads.length, 0);
 });
 
+test("opaque delta import is an explicit normal-browser authenticated action, not generic sync", async () => {
+  const page = await harness();
+  assert.match(page.dialog.innerHTML, /data-zk1-action="catalog-delta-anchor"/);
+  assert.match(page.dialog.innerHTML, /data-zk1-action="catalog-delta-import"/);
+  assert.match(page.dialog.innerHTML, /data-zk1-action="catalog-delta-publish"/);
+  assert.match(page.dialog.innerHTML, /data-zk1-field="catalog-delta-opt-in"/);
+  assert.doesNotMatch(page.dialog.innerHTML, /sync-v2 genérico.*habilitado/);
+});
+
+async function configureDeltaPage(page) {
+  const base = await configureCatalogWriter(page);
+  const signerGrantBytes = Buffer.from(await page.field("catalog-signer-grant").files[0].arrayBuffer());
+  const privateDerBytes = Buffer.from(await page.field("private").files[0].arrayBuffer());
+  const witnessKeyBytes = Buffer.from(await page.field("catalog-witness-key").files[0].arrayBuffer());
+  const casKeyBytes = Buffer.from(await page.field("catalog-cas-key").files[0].arrayBuffer());
+  page.field("catalog-delta-opt-in").checked = true;
+  const floor = encode(Buffer.alloc(32));
+  const bytes = encode(Buffer.alloc(64, 0x88));
+  const item = { objectId: encode(crypto.randomBytes(16)), revision: 1,
+    epoch: 1, ciphertextDigestBase64: encode(crypto.randomBytes(32)),
+    metadataCiphertextBase64: encode(Buffer.alloc(284, 0x4c)), ciphertextBase64: bytes };
+  const portable = { format: "rootark-zk1-opaque-device-delta/v1",
+    fromSequence: 0, toSequence: 1, catalogDigest: encode(crypto.randomBytes(32)),
+    additions: [item] };
+  let anchorCalls = 0, deltaCalls = 0, mutationCalls = 0, resolveDelta = null;
+  let pendingDelta = false, uncertainCommit = false;
+  const used = [];
+  page.window.RootarkZk1OpaqueDeviceDeltaSync = {
+    createClient({ authority, assertLive }) {
+      used.push("create");
+      assert.equal(authority.minimumCatalogHead.sequence, 0);
+      assert.equal(authority.minimumCatalogHead.digest.length, 32);
+      assert.equal(authority.devicePrivateKey.extractable, false);
+      assert.equal(authority.signerGrants.length, 1);
+      return {
+        async readCurrent() {
+          anchorCalls++;
+          assertLive();
+          return { head: { sequence: 0, digest: floor }, entries: [],
+            plaintextMetadataExposed: false, independentCloudDurabilityProven: false };
+        },
+        async pullDelta(previous) {
+          deltaCalls++;
+          assert.equal(previous.head.digest, floor);
+          if (pendingDelta) await new Promise((resolve) => { resolveDelta = resolve; });
+          assertLive();
+          return { fromSequence: 0, toSequence: 1,
+            catalogDigest: portable.catalogDigest, additions: [item],
+            plaintextMetadataExposed: false, productionDurabilityProven: false };
+        },
+        async commitVersion(args) {
+          mutationCalls++;
+          assert.equal(args.previous.head.digest, floor);
+          assert.equal(args.expectedRevision, null);
+          assert.equal(args.revision, 1);
+          assert.equal(args.name, "private client-only name.txt");
+          assert.equal(args.metadataKey.extractable, false);
+          assert.equal(args.ciphertext.length, 120);
+          assertLive();
+          if (uncertainCommit) {
+            const error = new Error("ZK_OPAQUE_DELTA_COMMIT_UNCERTAIN");
+            error.outcome = { journalId: encode(Buffer.alloc(32, 41)), retrySafe: false };
+            throw error;
+          }
+          return { sequence: 1, digest: portable.catalogDigest,
+            journalClearedAfterSignedProof: true, plaintextMetadataExposed: false,
+            productionDurabilityProven: false };
+        },
+      };
+    },
+  };
+  return { base, portable, used,
+    reimportOfflineFiles() {
+      page.file("catalog-signer-grant", signerGrantBytes);
+      page.file("private", privateDerBytes);
+      page.file("catalog-witness-key", witnessKeyBytes);
+      page.file("catalog-cas-key", casKeyBytes);
+    },
+    counts: () => ({ anchorCalls, deltaCalls, mutationCalls }),
+    stall() { pendingDelta = true; },
+    loseCatalogAck() { uncertainCommit = true; },
+    release() { resolveDelta?.(); },
+    async waitForDelta() { await tickUntil(() => Boolean(resolveDelta)); },
+  };
+}
+
+test("manual opaque delta anchor blocks absent consent and wrong independent CAS key pin", async () => {
+  const page = await harness();
+  const setup = await configureDeltaPage(page);
+  page.field("catalog-delta-opt-in").checked = false;
+  page.click("catalog-delta-anchor");
+  await page.denied();
+  assert.equal(setup.counts().anchorCalls, 0);
+  page.field("catalog-delta-opt-in").checked = true;
+  page.field("catalog-cas-spki").value = encode(crypto.randomBytes(32));
+  page.click("catalog-delta-anchor");
+  await page.denied();
+  assert.equal(setup.counts().anchorCalls, 0);
+  assert.equal(page.downloads.length, 0);
+});
+
+test("manual opaque delta import rejects forged bytes; real local export excludes plaintext paths", async () => {
+  const page = await harness();
+  const setup = await configureDeltaPage(page);
+  page.click("catalog-delta-import");
+  await page.denied();
+  assert.deepEqual(setup.counts(), { anchorCalls: 0, deltaCalls: 0, mutationCalls: 0 });
+  setup.reimportOfflineFiles();
+  page.click("catalog-delta-anchor");
+  await tickUntil(() => page.field("status").textContent.includes("Piso independente CAS #0"))
+    .catch((error) => { throw Error(error.message + ": " + page.field("status").textContent); });
+  page.file("catalog-delta-package", JSON.stringify({ ...setup.portable,
+    additions: [{ ...setup.portable.additions[0], ciphertextBase64: encode(Buffer.alloc(64)) }] }));
+  page.click("catalog-delta-import");
+  await page.denied();
+  assert.equal(page.downloads.length, 0);
+  assert.equal(setup.counts().deltaCalls, 1);
+  page.click("catalog-delta-import");
+  await page.denied();
+  assert.equal(setup.counts().deltaCalls, 1, "stale/failed import cannot silently retry");
+
+  // Independent explicit anchoring ceremony is required before another pull.
+  setup.reimportOfflineFiles();
+  page.click("catalog-delta-anchor");
+  await tickUntil(() => page.field("status").textContent.includes("Piso independente CAS #0"));
+  page.click("catalog-delta-pull");
+  await tickUntil(() => page.field("status").textContent.includes("Delta opaco conferido"));
+  assert.equal(page.downloads.length, 1);
+  const raw = await page.downloads[0].blob.text();
+  assert.equal(raw.includes("private client-only name.txt"), false);
+  assert.equal(raw.includes("metadataCiphertextBase64"), true);
+  assert.equal(JSON.parse(raw).additions[0].metadataCiphertextBase64,
+    setup.portable.additions[0].metadataCiphertextBase64);
+  assert.equal(setup.counts().deltaCalls, 2);
+});
+
+test("opaque delta import completes only after signed recheck; logout during pull denies download", async () => {
+  const page = await harness();
+  const setup = await configureDeltaPage(page);
+  page.click("catalog-delta-anchor");
+  await tickUntil(() => page.field("status").textContent.includes("Piso independente CAS #0"));
+  page.file("catalog-delta-package", JSON.stringify(setup.portable));
+  page.click("catalog-delta-import");
+  await tickUntil(() => page.field("status").textContent.includes("Delta importado conferido"));
+  assert.equal(page.downloads.length, 0);
+  assert.equal(page.field("catalog-delta-summary").textContent.includes("CAS #1"), true);
+  setup.reimportOfflineFiles();
+  page.click("catalog-delta-anchor");
+  await tickUntil(() => page.field("status").textContent.includes("Piso independente CAS #0"));
+  setup.stall();
+  page.click("catalog-delta-pull");
+  await setup.waitForDelta();
+  page.document.cookie = "rootark_csrf=switched-session";
+  setup.release();
+  await page.denied();
+  assert.equal(page.downloads.length, 0);
+});
+
+test("opaque delta publication is one explicit journaled mutation; logout disallows reusing anchor", async () => {
+  const page = await harness();
+  const setup = await configureDeltaPage(page);
+  page.click("catalog-delta-anchor");
+  await tickUntil(() => page.field("status").textContent.includes("Piso independente CAS #0"));
+  page.field("catalog-write-id").value = setup.portable.additions[0].objectId;
+  page.file("catalog-write-ciphertext", Buffer.alloc(120, 0x6d));
+  page.file("catalog-write-key", crypto.randomBytes(32));
+  page.click("catalog-delta-publish");
+  await tickUntil(() => page.field("status").textContent.includes("Versão cifrada enviada uma única vez"));
+  assert.equal(setup.counts().mutationCalls, 1);
+  page.file("catalog-write-ciphertext", Buffer.alloc(120, 0x6d));
+  page.file("catalog-write-key", crypto.randomBytes(32));
+  page.click("catalog-delta-publish");
+  await page.denied();
+  assert.equal(setup.counts().mutationCalls, 1, "consumed anchor never retries PUT/CAS");
+  page.logout();
+  assert.equal(page.dialog.open, false);
+});
+
+test("lost signed CAS acknowledgement exposes only durable journal ID and forbids a second PUT", async () => {
+  const page = await harness();
+  const setup = await configureDeltaPage(page);
+  page.click("catalog-delta-anchor");
+  await tickUntil(() => page.field("status").textContent.includes("Piso independente CAS #0"));
+  setup.loseCatalogAck();
+  page.field("catalog-write-id").value = setup.portable.additions[0].objectId;
+  page.file("catalog-write-ciphertext", Buffer.alloc(120, 0x6d));
+  page.file("catalog-write-key", crypto.randomBytes(32));
+  page.click("catalog-delta-publish");
+  await page.denied();
+  assert.equal(page.field("catalog-write-journal").textContent,
+    encode(Buffer.alloc(32, 41)), "signed immutable pending journal survives lost ACK");
+  page.file("catalog-write-ciphertext", Buffer.alloc(120, 0x6d));
+  page.file("catalog-write-key", crypto.randomBytes(32));
+  page.click("catalog-delta-publish");
+  await page.denied();
+  assert.equal(setup.counts().mutationCalls, 1,
+    "uncertain CAS must never be silently reissued");
+  assert.equal(page.downloads.length, 0);
+});
+
 test("catalog publish denies forged independent signer pin before journal or PUT", async () => {
   const page = await harness();
   const { steps } = await configureCatalogWriter(page);

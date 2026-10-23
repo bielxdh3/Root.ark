@@ -80,3 +80,98 @@ test("real Edge runs opaque delta browser contract under restrictive CSP", {
   assert.match(result.stdout, /EDGE_OPAQUE_DELTA_PASS/);
   assert.doesNotMatch(result.stdout, /EDGE_OPAQUE_DELTA_FAIL/);
 });
+
+test("real Edge CSP exposes normal authenticated manual delta import, but no unconsented sync", {
+  timeout: 40_000,
+}, async (t) => {
+  const edge = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+  if (process.platform !== "win32" || !fs.existsSync(edge)) {
+    t.skip("Edge Windows unavailable"); return;
+  }
+  const source = fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-authenticated-workspace.js"), "utf8");
+  const dependencies = source.match(/const dependencyNames = \[([\s\S]*?)\];/)[1]
+    .match(/"rootark-[^"]+"/g).map((name) => JSON.parse(name));
+  const allowed = new Set(["rootark-zk1-authenticated-workspace", ...dependencies]);
+  const root = path.join(__dirname, "../public/client");
+  const html = "<!doctype html><meta charset='utf-8'>"
+    + "<section class='protected-client-panel'><p id='protectedClientStatus'></p></section>"
+    + "<output id='edge-delta-ui-result'>PENDING</output>"
+    + "<script defer src='/bootstrap.js'></script>"
+    + "<script defer src='/client/rootark-zk1-authenticated-workspace.js'></script>"
+    + "<script defer src='/ui-probe.js'></script>";
+  const bootstrap = "window.RootarkApi={get:async()=>({enabled:true,"
+    + "securityVersion:2,signedHistoryRequired:true,opaqueCatalogV1:true})};";
+  const probe = `window.addEventListener("load", async()=>{
+    const out=document.getElementById("edge-delta-ui-result");
+    const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+    try{
+      window.dispatchEvent(new Event("rootark:workspace-rendered"));
+      let opener=null;
+      for(let i=0;i<80;i++){
+        opener=document.getElementById("zk1-workspace-open");
+        if(opener)break;
+        await sleep(30);
+      }
+      if(!opener)throw Error("CAPABILITY_GATE_MISSING");
+      opener.click();
+      let dlg;
+      for(let i=0;i<80;i++){
+        dlg=document.querySelector("dialog.zk1-workspace-dialog");
+        if(dlg?.open)break;
+        await sleep(30);
+      }
+      if(!dlg?.open)throw Error("NOT_AUTHENTICATED_ENTRY");
+      const names=["catalog-delta-anchor","catalog-delta-pull",
+        "catalog-delta-import","catalog-delta-publish"];
+      for(const name of names){
+        if(!dlg.querySelector('[data-zk1-action="'+name+'"]'))
+          throw Error("MISSING_ACTION_"+name);
+      }
+      const consent=dlg.querySelector('[data-zk1-field="catalog-delta-opt-in"]');
+      if(!consent || consent.checked)throw Error("SILENT_AUTO_SYNC");
+      dlg.querySelector('[data-zk1-action="catalog-delta-import"]').click();
+      for(let i=0;i<100;i++){
+        if(dlg.querySelector('[data-zk1-field="status"]').textContent
+          .includes("Operação recusada"))break;
+        await sleep(30);
+      }
+      if(!dlg.querySelector('[data-zk1-field="status"]').textContent
+        .includes("Operação recusada"))throw Error("UNCONSENTED_IMPORT_NOT_DENIED");
+      out.textContent="EDGE_DELTA_UI_PASS";
+    }catch(error){out.textContent="EDGE_DELTA_UI_FAIL:"+error.message;}
+  });`;
+  let protectedRequests = 0;
+  const server = http.createServer((request, response) => {
+    response.setHeader("Content-Security-Policy",
+      "default-src 'none'; script-src 'self'; connect-src 'self'");
+    if (/\/zk-1\/v1\/(catalog|content)\//.test(request.url)) protectedRequests++;
+    const name = /^\/client\/([a-z0-9-]+)\.js$/.exec(request.url)?.[1];
+    const content = request.url === "/" ? html
+      : request.url === "/bootstrap.js" ? bootstrap
+        : request.url === "/ui-probe.js" ? probe
+          : name && allowed.has(name)
+            ? fs.readFileSync(path.join(root, name + ".js"), "utf8") : null;
+    response.writeHead(content === null ? 404 : 200, {
+      "Content-Type": request.url === "/" ? "text/html; charset=utf-8"
+        : "text/javascript; charset=utf-8",
+    });
+    response.end(content ?? "");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "zk-delta-normal-edge-"));
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(folder, { recursive: true, force: true, maxRetries: 5 });
+  });
+  const result = await promisify(execFile)(edge, ["--headless=new", "--disable-gpu",
+    "--no-first-run", "--disable-extensions", "--no-default-browser-check",
+    "--virtual-time-budget=15000", "--user-data-dir=" + path.join(folder, "edge"),
+    "--dump-dom", "http://127.0.0.1:" + server.address().port + "/"], {
+    timeout: 35000, windowsHide: true, maxBuffer: 4 * 1024 * 1024,
+  });
+  assert.match(result.stdout, /EDGE_DELTA_UI_PASS/);
+  assert.doesNotMatch(result.stdout, /EDGE_DELTA_UI_FAIL/);
+  assert.equal(protectedRequests, 0,
+    "opening the authenticated opt-in interface must never auto-sync or issue PUT/GET");
+});
