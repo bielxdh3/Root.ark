@@ -307,13 +307,15 @@
     const pin = { revision: trust.pinnedOwnerHead.revision,
       digest: bytes(trust.pinnedOwnerHead.digest, 32), epoch: trust.pinnedOwnerHead.epoch };
     const requireSession = () => { if (trust.isSessionCurrent() !== true) deny(); };
-    function remember(head, rows) {
+    function remember(head, rows, header = null) {
       const result = { head: { sequence: head.sequence, digest: bytes(head.digest, 32) },
         rows: rows.map((row) => ({ ...row, ciphertext_digest: bytes(row.ciphertext_digest, 32),
           metadata_ciphertext: bytes(row.metadata_ciphertext, 284) })) };
       verifiedSnapshots.set(result, { scope: Object.fromEntries(SCOPE.map((k) => [k, b64(scope[k])])),
         manifestRevision: pin.revision, manifestDigest: b64(pin.digest), epoch: pin.epoch,
         head: { sequence: head.sequence, digest: bytes(head.digest, 32) },
+        predecessorDigest: header ? bytes(header.previous_digest, 32) : null,
+        signerDeviceId: header ? header.signer_device_id : null,
         rows: result.rows.map((row) => ({ ...row,
           ciphertext_digest: bytes(row.ciphertext_digest, 32),
           metadata_ciphertext: bytes(row.metadata_ciphertext, 284) })) });
@@ -557,7 +559,7 @@
       const final = await freshHead();
       if (final.sequence !== current.sequence || !equal(final.digest, current.digest)) deny();
       advance(final);
-      return remember(final, rows);
+      return remember(final, rows, decode(firstHeader));
     }
     async function prepareIntent(writes) {
       if (prepared || used) deny();
@@ -599,7 +601,7 @@
         return journalId;
       } catch (_) { deny(); }
     }
-    async function loadIntent(journalId, additions) {
+    async function verifiedIntent(journalId) {
       from64(journalId, 32);
       const saved = await trust.journalStore.read(journalId);
       exact(saved, ["body", "signature"]);
@@ -613,22 +615,17 @@
         || !await crypto.subtle.verify("Ed25519", trust.devicePublicKey,
           from64(saved.signature, 64), concat(INTENT, te.encode(JSON.stringify(body))))) deny();
       uint(body.previousSequence, 0, 128); uint(body.issuedAt);
-      if (!Array.isArray(body.writes) || body.writes.length !== additions.length
+      if (!Array.isArray(body.writes) || body.writes.length < 1
+        || body.writes.length > MAX_ROWS
         || !Array.isArray(body.rows) || body.rows.length > MAX_ROWS) deny();
       const plans = new Map();
       for (const planned of body.writes) {
         exact(planned, ["objectId", "revision", "epoch", "ciphertextDigest"]);
         const version = id(planned.objectId) + ":" + uint(planned.revision, 1);
         if (plans.has(version) || planned.epoch !== pin.epoch) deny();
-        plans.set(version, from64(planned.ciphertextDigest, 32));
+        plans.set(version, { objectId: planned.objectId, revision: planned.revision,
+          epoch: planned.epoch, digest: from64(planned.ciphertextDigest, 32) });
       }
-      for (const addition of additions) {
-        const version = id(addition.objectId) + ":" + uint(addition.revision, 1);
-        if (!plans.has(version) || !equal(plans.get(version),
-          await hash(bytes(addition.ciphertext, 16, 4 * 1024 * 1024)))) deny();
-        plans.delete(version);
-      }
-      if (plans.size !== 0) deny();
       const rows = body.rows.map((item) => {
         exact(item, ["objectId", "revision", "epoch", "ciphertextDigestBase64",
           "metadataCiphertextBase64"]);
@@ -637,6 +634,22 @@
           metadata_ciphertext: from64(item.metadataCiphertextBase64, 284) };
       });
       inspectRows(rows);
+      if (body.previousSequence === 0 && body.rows.length !== 0) deny();
+      if (body.previousSequence >= 128) deny();
+      const old = new Set(rows.map((row) => row.object_id + ":" + row.revision));
+      if ([...plans.keys()].some((version) => old.has(version))) deny();
+      return { body, rows, plans };
+    }
+    async function loadIntent(journalId, additions) {
+      const { body, rows, plans } = await verifiedIntent(journalId);
+      if (additions.length !== plans.size) deny();
+      for (const addition of additions) {
+        const version = id(addition.objectId) + ":" + uint(addition.revision, 1);
+        if (!plans.has(version) || !equal(plans.get(version).digest,
+          await hash(bytes(addition.ciphertext, 16, 4 * 1024 * 1024)))) deny();
+        plans.delete(version);
+      }
+      if (plans.size !== 0) deny();
       await ownerCurrent();
       const current = await freshHead();
       if (current.sequence !== body.previousSequence
@@ -726,13 +739,63 @@
     }
     async function confirmPendingIntent(journalId, head) {
       try {
-        exact(head, ["sequence", "digest", "totalCount", "verifiedSignedReadback",
-          "productionDurabilityProven"]);
-        if (!pendingCommit || pendingCommit.journalId !== journalId
-          || pendingCommit.sequence !== head.sequence || pendingCommit.digest !== head.digest
-          || head.verifiedSignedReadback !== true) deny();
-        await readAll({ sequence: pendingCommit.sequence,
-          digest: from64(pendingCommit.digest, 32) });
+        const { body, rows: oldRows, plans } = await verifiedIntent(journalId);
+        // The final proof can itself be lost. An absent caller hint is never
+        // treated as success: derive the successor from a NEW independent CAS
+        // challenge, then prove its full signed contents against the journal.
+        const independentlyObserved = await freshHead();
+        const wanted = { sequence: independentlyObserved.sequence,
+          digest: bytes(independentlyObserved.digest, 32) };
+        if (head !== undefined) {
+          exact(head, ["sequence", "digest", "totalCount", "verifiedSignedReadback",
+            "productionDurabilityProven"]);
+          if (head.verifiedSignedReadback !== true
+            || head.productionDurabilityProven !== false
+            || head.totalCount !== oldRows.length + plans.size
+            || head.sequence !== wanted.sequence
+            || !equal(from64(head.digest, 32), wanted.digest)) deny();
+        }
+        if (wanted.sequence !== body.previousSequence + 1
+          || (pendingCommit && (pendingCommit.journalId !== journalId
+            || pendingCommit.sequence !== wanted.sequence
+            || pendingCommit.digest !== b64(wanted.digest)))) deny();
+        // The journal alone is only an intent, not a proof of a commit. On a
+        // fresh browser instance the exact immutable successor must be proven
+        // again by independent nonce-bound witness/CAS signatures and the
+        // complete signed catalog readback; never retransmit the commit.
+        const snapshot = await readAll(wanted);
+        const verified = verifiedSnapshots.get(snapshot);
+        if (!verified || verified.signerDeviceId !== body.deviceId
+          || !equal(verified.predecessorDigest, from64(body.previousDigest, 32))
+          || snapshot.rows.length !== oldRows.length + plans.size) deny();
+        const actual = new Map();
+        for (const row of snapshot.rows) {
+          const version = row.object_id + ":" + row.revision;
+          if (actual.has(version)) deny();
+          actual.set(version, row);
+        }
+        for (const old of oldRows) {
+          const version = old.object_id + ":" + old.revision;
+          const row = actual.get(version);
+          if (!row || row.epoch !== old.epoch
+            || !equal(row.ciphertext_digest, old.ciphertext_digest)
+            || !equal(row.metadata_ciphertext, old.metadata_ciphertext)) deny();
+          actual.delete(version);
+        }
+        for (const [version, planned] of plans) {
+          const row = actual.get(version);
+          if (!row || row.epoch !== planned.epoch
+            || !equal(row.ciphertext_digest, planned.digest)) deny();
+          // A catalog row does not prove that its protected ciphertext exists.
+          // Perform a NEW exact, authorized GET with the owner/device grant.
+          await fetchVerifiedCiphertext(planned.objectId, planned.revision,
+            planned.epoch, planned.digest);
+          actual.delete(version);
+        }
+        if (actual.size !== 0) deny();
+        const final = await freshHead();
+        if (final.sequence !== wanted.sequence || !equal(final.digest, wanted.digest)) deny();
+        requireSession();
         await trust.journalStore.remove(journalId);
         pendingCommit = null;
         return true;
