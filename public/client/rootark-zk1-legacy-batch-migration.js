@@ -16,6 +16,7 @@
   const PIN = ["version", "storedAs", "uploadedAt", "size", "lastModified",
     "sha256", "mediaType"];
   const LIMIT = 12;
+  const READ_DEADLINE_MS = 15000;
   function refuse() { throw new Error("ZK_LEGACY_BATCH_UNVERIFIED"); }
   function exact(obj, fields) {
     if (!obj || typeof obj !== "object" || Array.isArray(obj)
@@ -76,21 +77,36 @@
     const url = "/versions/" + encodeURIComponent(entry.legacy.name)
       + (entry.legacy.folderId
         ? "?folderId=" + encodeURIComponent(entry.legacy.folderId) : "");
-    const res = await fetchImpl(url, { method: "GET", credentials: "same-origin",
-      cache: "no-store", redirect: "error", referrerPolicy: "no-referrer",
-      headers: { Accept: "application/json" } });
-    if (res?.status !== 200
-      || !/^application\/json(?:\s*;|\s*$)/i.test(res.headers?.get?.("content-type") || "")
-      || !res.body?.getReader) refuse();
-    // Version history also contains optional action history. Bound the whole
-    // response before JSON decoding, including chunked responses without CL.
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder("utf-8", { fatal: true });
-    let body = "", length = 0;
-    let complete = false;
+    const controller = new AbortController();
+    let deadlineHandle, res, reader, complete = false;
+    const deadline = new Promise((_, reject) => {
+      deadlineHandle = setTimeout(() => {
+        controller.abort();
+        reject(new Error("Legacy catalog deadline exceeded"));
+      }, READ_DEADLINE_MS);
+    });
+    const bounded = (promise) => Promise.race([promise, deadline]);
     try {
+      res = await bounded(Promise.resolve().then(() => fetchImpl(url, { method: "GET", credentials: "same-origin",
+        cache: "no-store", redirect: "error", referrerPolicy: "no-referrer",
+        headers: { Accept: "application/json" }, signal: controller.signal })).then((received) => {
+        if (controller.signal.aborted) {
+          try {
+            const canceled = received?.body?.cancel?.();
+            if (canceled?.catch) canceled.catch(() => {});
+          } catch (_) { /* already refused */ }
+        }
+        return received;
+      }));
+      if (res?.status !== 200
+        || !/^application\/json(?:\s*;|\s*$)/i.test(res.headers?.get?.("content-type") || "")
+        || !res.body?.getReader) refuse();
+      // Bound the complete response, including chunked bodies without CL.
+      reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      let body = "", length = 0;
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await bounded(reader.read());
         if (done) break;
         if (!(value instanceof Uint8Array) || length + value.byteLength > 256 * 1024) refuse();
         length += value.byteLength;
@@ -98,19 +114,26 @@
       }
       body += decoder.decode();
       complete = true;
-    } finally {
-      if (!complete) { try { await reader.cancel(); } catch (_) { /* refusal wins */ } }
-      reader.releaseLock();
+      const data = JSON.parse(body);
+      if (!data || data.fileName !== entry.legacy.name
+        || (entry.legacy.folderId && data.folderId !== entry.legacy.folderId)
+        || !Array.isArray(data.versions) || data.versions.length > 512) refuse();
+      const selected = data.versions.filter((v) => v?.version === entry.sourcePin.version);
+      if (selected.length !== 1 || selected[0].storedAs !== entry.sourcePin.storedAs
+        || selected[0].uploadedAt !== entry.sourcePin.uploadedAt
+        || selected[0].size !== entry.sourcePin.size) refuse();
+    } catch (_) { refuse(); }
+    finally {
+      clearTimeout(deadlineHandle);
+      if (!complete) {
+        controller.abort();
+        try {
+          const canceled = reader ? reader.cancel() : res?.body?.cancel?.();
+          if (canceled?.catch) canceled.catch(() => {});
+        } catch (_) { /* refusal wins */ }
+      }
+      if (reader) { try { reader.releaseLock(); } catch (_) { /* canceled */ } }
     }
-    let data;
-    try { data = JSON.parse(body); } catch (_) { refuse(); }
-    if (!data || data.fileName !== entry.legacy.name
-      || (entry.legacy.folderId && data.folderId !== entry.legacy.folderId)
-      || !Array.isArray(data.versions) || data.versions.length > 512) refuse();
-    const selected = data.versions.filter((v) => v?.version === entry.sourcePin.version);
-    if (selected.length !== 1 || selected[0].storedAs !== entry.sourcePin.storedAs
-      || selected[0].uploadedAt !== entry.sourcePin.uploadedAt
-      || selected[0].size !== entry.sourcePin.size) refuse();
   }
   async function runLegacyMigrationBatch(input) {
     exact(input, ["optIn", "entries", "migrationSecret", "trust", "origin",

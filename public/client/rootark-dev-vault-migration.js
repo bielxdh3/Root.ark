@@ -7,6 +7,7 @@
   // Non-destructive, explicitly user-selected legacy plaintext COPY only.
   // Never accepts password-encrypted legacy blobs or mutates legacy storage.
   const MAX_BYTES = 4 * 1024 * 1024;
+  const READ_DEADLINE_MS = 15000;
   function fail() { throw new Error("Legacy file is unavailable or cannot be copied safely"); }
   function validName(value) {
     return typeof value === "string" && value.length > 0 && value.length <= 255
@@ -28,42 +29,55 @@
       + encodeURIComponent(name)
       + (version === null ? "" : "/v/" + version)
       + (folderId ? "?folderId=" + encodeURIComponent(folderId) : "");
-    let response;
+    const controller = new AbortController();
+    let deadlineHandle, response, reader;
+    const chunks = [];
+    const deadline = new Promise((_, reject) => {
+      deadlineHandle = setTimeout(() => {
+        controller.abort();
+        reject(new Error("Legacy download deadline exceeded"));
+      }, READ_DEADLINE_MS);
+    });
+    const bounded = (promise) => Promise.race([promise, deadline]);
     try {
-      response = await fetchImpl(route, {
+      response = await bounded(Promise.resolve().then(() => fetchImpl(route, {
         method: "GET",
         credentials: "same-origin",
         redirect: "error",
         cache: "no-store",
         referrerPolicy: "no-referrer",
         headers: { Accept: "application/octet-stream" },
-      });
-    } catch (_) { fail(); }
-    // The legacy route returns 403 for encrypted modes. Do not automatically
-    // invoke server-side decrypt, because a migration must never introduce
-    // implicit legacy password or key handling.
-    if (!response || response.status !== 200 || !response.body?.getReader) fail();
-    const disposition = response.headers?.get?.("content-disposition");
-    const advertisedLength = response.headers?.get?.("content-length");
-    if (typeof disposition !== "string"
-      || !/^attachment(?:\s*;|\s*$)/i.test(disposition)
-      || typeof advertisedLength !== "string"
-      || !/^\d+$/.test(advertisedLength)
-      || !Number.isSafeInteger(Number(advertisedLength))
-      || Number(advertisedLength) > maxBytes) {
-      try { await response.body.cancel(); } catch (_) { /* refusal wins */ }
-      fail();
-    }
-    const type = String(response.headers?.get?.("content-type") || "application/octet-stream")
-      .split(";")[0].trim().toLowerCase();
-    if (type.length > 128) fail();
-    const mediaType = type || "application/octet-stream";
-    const reader = response.body.getReader();
-    const chunks = [];
-    let size = 0;
-    try {
+        signal: controller.signal,
+      })).then((received) => {
+        // A fake or noncooperative fetch may resolve after the deadline.
+        // Discard and cancel that late response without exposing its bytes.
+        if (controller.signal.aborted) {
+          try {
+            const canceled = received?.body?.cancel?.();
+            if (canceled?.catch) canceled.catch(() => {});
+          } catch (_) { /* already refused */ }
+        }
+        return received;
+      }));
+      // The legacy route returns 403 for encrypted modes. Do not invoke
+      // server-side decrypt or accept a login HTML fallback as file contents.
+      if (!response || response.status !== 200 || !response.body?.getReader) fail();
+      const disposition = response.headers?.get?.("content-disposition");
+      const advertisedLength = response.headers?.get?.("content-length");
+      if (typeof disposition !== "string"
+        || !/^attachment(?:\s*;|\s*$)/i.test(disposition)
+        || typeof advertisedLength !== "string"
+        || !/^\d+$/.test(advertisedLength)
+        || !Number.isSafeInteger(Number(advertisedLength))
+        || Number(advertisedLength) > maxBytes) fail();
+      const type = String(response.headers?.get?.("content-type") || "application/octet-stream")
+        .split(";")[0].trim().toLowerCase();
+      if (type.length > 128) fail();
+      const mediaType = type || "application/octet-stream";
+      reader = response.body.getReader();
+      let size = 0;
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await bounded(reader.read());
         if (done) break;
         if (!(value instanceof Uint8Array)
           || size + value.byteLength > maxBytes) fail();
@@ -79,14 +93,21 @@
       }
       return { name, mediaType, lastModified: response.headers?.get?.("last-modified") || null, data };
     } catch (_) {
-      try { await reader.cancel(); } catch (_) { /* best-effort stream cancellation */ }
+      controller.abort();
+      // Cancellation is best-effort: do not await a malicious/noncooperative
+      // stream's cancel promise after the absolute deadline has expired.
+      try {
+        const canceled = reader ? reader.cancel() : response?.body?.cancel?.();
+        if (canceled?.catch) canceled.catch(() => {});
+      } catch (_) { /* refusal wins */ }
       fail();
     } finally {
+      clearTimeout(deadlineHandle);
       // Best-effort cleanup of intermediate decoded network chunks. The
       // independent bounded result is separately scrubbed by the UI after
       // encryption/read-back, including on a failed copy.
       for (const chunk of chunks) chunk.fill(0);
-      reader.releaseLock();
+      if (reader) { try { reader.releaseLock(); } catch (_) { /* canceled */ } }
     }
   }
   return Object.freeze({ readLegacyPlaintext, MAX_BYTES });

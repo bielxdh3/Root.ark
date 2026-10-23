@@ -2966,7 +2966,11 @@ function normalizeVersionHistory(entry) {
           version: Number(version.version),
           storedAs: path.basename(version.storedAs || ""),
           uploadedBy: version.uploadedBy || "sistema",
-          uploadedAt: version.uploadedAt || new Date().toISOString(),
+          // Missing historical timestamps must remain explicitly unavailable.
+          // Inventing a new wall-clock timestamp on every catalog read makes
+          // authenticated legacy migration pins impossible to reproduce.
+          uploadedAt: typeof version.uploadedAt === "string" && Number.isFinite(Date.parse(version.uploadedAt))
+            ? version.uploadedAt : null,
           size: Number(version.size) || 0,
           comment: version.comment || "",
         }))
@@ -3908,7 +3912,7 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
     "Content-Disposition": getFileContentDisposition(safeName, dispositionType),
     "X-Content-Type-Options": "nosniff",
   };
-  if (options.includeLastModified) commonHeaders["Last-Modified"] = stats.mtime.toUTCString();
+  if (options.includeLastModified) commonHeaders["Last-Modified"] = options.lastModified || stats.mtime.toUTCString();
   if (isActiveContentFile(safeName)) commonHeaders["Content-Security-Policy"] = "sandbox; default-src 'none'";
 
   const streamOptions = { highWaterMark };
@@ -11354,6 +11358,14 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
   }
 
   const target = getVersionFilePath(folder, name, versionNumber);
+  // Cloud cache rehydration gives the local copy a fresh filesystem mtime.
+  // Historical Last-Modified must instead derive from immutable version data,
+  // or fail closed when that legacy metadata was never persisted.
+  const storedUploadedAt = target?.version?.uploadedAt;
+  if (target && (typeof storedUploadedAt !== "string"
+    || !Number.isFinite(Date.parse(storedUploadedAt)))) {
+    return res.status(409).json({ error: "Metadados historicos da versao indisponiveis" });
+  }
   if (target?.version?.storedAs) {
     if (isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
     await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads", () => !isFileInTrash(folder.id, name), name);
@@ -11373,7 +11385,9 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
     return res.status(404).json({ error: "Versao nao encontrada" });
   }
 
-  sendOptimizedFile(req, res, target.filePath, name, "attachment", { includeLastModified: true });
+  sendOptimizedFile(req, res, target.filePath, name, "attachment", {
+    includeLastModified: true, lastModified: new Date(storedUploadedAt).toUTCString(),
+  });
 });
 
 app.post("/version-open-token", versionOpenTokenRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
