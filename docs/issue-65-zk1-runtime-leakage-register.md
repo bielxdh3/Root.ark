@@ -1,8 +1,9 @@
 # Issue #65 — zk-1 runtime metadata and trust-boundary register (development)
 
-Evidence baseline: PR #228, commit `0c9034c` plus the 2026-10-23 local
-integration of independently tested catalog, owner CLI, legacy-transition and
-versioned-browser milestones. This register
+Evidence baseline: PR #228, verified exact published HEAD `da02715` on
+2026-10-23, including owner V2, opt-in writable browser catalog, separately
+pinned independent CAS/floor and authenticated browser witness/CAS head relay.
+This register
 describes only the **opt-in zk-1 protected content path**. It must not be read
 as a claim that Root.ark's legacy files, ordinary sync, WebDAV, public links,
 existing backups, or existing server-readable previews became zero-knowledge.
@@ -29,9 +30,13 @@ default. Catalog entries expose opaque object ID, revision, epoch, ciphertext
 digest, padded 284-byte encrypted filename metadata, paging and sequencing;
 they must never contain plaintext `name` or `path`. The normal authenticated
 browser now offers opt-in signed opaque catalog page discovery, changed-page
-comparison, AEAD filename display using a separately imported local key, and
-independently signed ciphertext GET, but **not** a complete bidirectional sync,
-delete/move/trash protocol or proven comprehensive inventory for objects absent
+comparison, AEAD filename display using a separately imported local key,
+independently signed ciphertext GET and an opt-in signed write with durable
+local journal and two-device tests. An independent mTLS CAS floor can prevent
+re-signing a conflicting catalog head after rollback of the CAS's own SQLite;
+its actual external custody must be independently provisioned and verified.
+This does **not** establish a complete automatic bidirectional sync,
+delete/move/trash lifecycle or proven comprehensive inventory for objects absent
 from the owner-signed root. The separately signed offline backup inventory and
 keyring roster likewise attest only their explicitly signed and independently
 pinned scope, not unknown/unrecorded objects.
@@ -114,6 +119,14 @@ prove these external workflows completed.
   `test/issue-65-opaque-cas-real-multiprocess.test.js`: independent mTLS
   CAS journal/receipt, persistent signed ciphertext-page evidence, competing
   writers and replay/rollback/lost-ACK negative tests.
+- `src/services/zk1OpaqueCatalogIndependentFloor.js` and
+  `docs/issue-65-opaque-catalog-independent-floor.md`: separately pinned
+  mTLS/Ed25519 monotonic floor with owner V2 signer continuity; tested on
+  disposable local processes, not proof of a physically independent host.
+- `public/client/rootark-zk1-browser-opaque-catalog-commit.js` and
+  `public/client/rootark-zk1-browser-authority-head-relay.js`: opt-in
+  authenticated browser write/journal and independent signed head delivery;
+  the application relay cannot provision its own trust keys.
 - `test/issue-65-versioned-keyring-ciphertext-archive.test.js`: true Edge
   multiversion signed-CBOR recovery plus adversarial roster substitution
   regression; the second unsigned roster is rejected before minting authority.

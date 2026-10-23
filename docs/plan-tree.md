@@ -1,5 +1,48 @@
 # Root.ark Plan Tree
 
+## Live issue #65 development evidence — 2026-10-23 (`da02715`)
+
+At the observed checkpoint, PR #228 (`cdx/rootark-dual-recovery-20261019`)
+is **OPEN/DRAFT** and issue #65 is **OPEN**. Local integration HEAD and
+remote branch HEAD both equal `da02715a8a6787836a05aeb06e6d1b0bdc61d61a`;
+the worktree was clean. This checkpoint supersedes the *live-status claims*
+in the older dated addenda below, not their historical test evidence.
+
+Newly integrated development work includes `7feb752` (restore missing local
+catalog snapshots from remotely signed CAS snapshots after an uncertain ACK),
+`db7baa6` (private POSIX SQLite file creation), `80baa3a` (authenticated
+browser writable opaque catalog), `7a93a9b` (an independently signed,
+monotonically advancing mTLS/SQLite floor with owner V2 signer rotation),
+and `da02715` (browser relay of independently signed witness/CAS heads).
+These are *opt-in protected* paths and must not be conflated with ordinary
+plaintext sync-v2, a physically independent deployed authority or provider
+durability. The catalog still has a fail-closed 128-head limit; authenticated
+logical delete/trash, complete account inventory and automatic safe legacy
+cutover need their own end-to-end evidence before declaring 100% development.
+
+Exact-HEAD hosted checks: Ubuntu Node22 full suite **2358 total / 2221 PASS /
+0 FAIL / 137 SKIP**; real disposable PostgreSQL18 **PASS**; JS/TS analysis
+**PASS**; dependency review **PASS**. Windows Node22's release gate was
+**CANCELLED** after earlier steps had passed, not a proved assertion failure.
+The separate CodeQL policy check remains **FAIL**; do not label it green or
+silently dismiss its findings. The next validated HEAD must be checked again
+after publication: CI results do not transfer between SHAs.
+
+Local Windows Node24 on the same `da02715` checkpoint: focused browser,
+owner revocation, authenticated catalog, multi-version Edge archive, session
+fencing and rename selection **67 PASS / 0 FAIL / 0 SKIP**; real mTLS CAS,
+owner signer rotation and re-endorsement selection **6 PASS / 0 FAIL**;
+independent floor/CAS/Edge selection **17 PASS / 0 FAIL** (overlapping
+selections, **not** additive coverage). `validate-syntax.js`: **513 checked /
+0 failed**; `validate-runtime-artifacts.js` and `git diff --check`: **PASS**.
+These local focused runs do not substitute for the hosted full suite.
+
+The trust boundary still requires independent custody of out-of-band SPKI
+pins, witness/floor keys and monotonic state. Distinguish Ed25519 receipts,
+PostgreSQL local readback, SQLite WAL/FULL commits, HTTP ACK and actual remote
+storage durability. No merge, deploy, production activation, plaintext-to-
+server fallback or destructive migration cutover is authorized.
+
 ## Current development addendum — 2026-10-23, issue #65 / PR #228
 
 **Additional integration after the published `0e571eb` milestone (local DEV
