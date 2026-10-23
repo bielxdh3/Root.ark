@@ -6,7 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { once } = require("node:events");
-const archiver = require("archiver");
+const { ZipArchive } = require("archiver");
 const { DatabaseSync } = require("node:sqlite");
 const { MIGRATIONS } = require("../db/migrations");
 const { inspectZk1LiveLegacyRecoverableArchiveGraph: inspect } =
@@ -42,7 +42,7 @@ function members(f) {
 async function writeZip(file, manifest, entries) {
   const stream = fs.createWriteStream(file);
   const closed = once(stream, "close");
-  const zip = archiver("zip", { zlib: { level: 6 } });
+  const zip = new ZipArchive({ zlib: { level: 6 } });
   zip.pipe(stream);
   zip.append(Buffer.from(JSON.stringify(manifest)), { name: "backup-manifest.json" });
   for (const item of entries) zip.append(item.bytes, { name: item.path });
