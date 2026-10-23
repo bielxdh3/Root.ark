@@ -4,16 +4,21 @@
       require("./rootark-zk1-portable-file-recovery"),
       require("./rootark-zk1-owner-ciphertext-root-checkpoint"),
       require("./rootark-zk1-normal-browser-trust-floor"),
-      require("./rootark-zk1-owner-signed-checkpoint"));
+      require("./rootark-zk1-owner-signed-checkpoint"),
+      require("./rootark-zk1-authoritative-backup-inventory"),
+      require("./rootark-zk1-owner-account-backup-roster"),
+      require("./rootark-zk1-ciphertext-chunk-root"),
+      require("./rootark-zk1-file-content"));
   } else {
     root.RootarkZk1KeyringPortableArchive = factory(root.crypto,
       root.RootarkZk1PortableFileRecovery,
       root.RootarkZk1OwnerCiphertextRootCheckpoint,
       root.RootarkZk1NormalBrowserTrustFloor,
-      root.RootarkZk1OwnerSignedCheckpoint);
+      root.RootarkZk1OwnerSignedCheckpoint, null, null, null, null);
   }
 }(typeof globalThis === "object" ? globalThis : this,
-  function (webCrypto, portable, ownerRoots, trustFloor, ownerHistory) {
+  function (webCrypto, portable, ownerRoots, trustFloor, ownerHistory,
+    backupInventory, accountRoster, ciphertextRoots, fileContent) {
     "use strict";
 
     // Development-only offline keyring snapshot, not server recovery authority.
@@ -22,6 +27,9 @@
     // An archive or server reply cannot establish any of those trust anchors.
     const FORMAT = "rootark-zk1-keyring-portable-archive/v1";
     const CONTENT = "rootark-zk1-keyring-portable-contents/v1";
+    const VERSIONED_FORMAT = "rootark-zk1-keyring-portable-archive/v2";
+    const VERSIONED_CONTENT = "rootark-zk1-keyring-portable-contents/v2";
+    const VERSION_PACKET = "rootark-zk1-versioned-ciphertext-cek/v1";
     const DOMAIN = new TextEncoder().encode("Root.ark/zk-1/keyring-archive-signed/v1\0");
     const KDF = new TextEncoder().encode("Root.ark/zk-1/keyring-archive-key/v1\0");
     const SCOPE = ["account_id", "compartment_id", "keyring_id"];
@@ -31,6 +39,10 @@
       "archiveId", "salt", "nonce", "ciphertextBase64", "signature"];
     const SIGNED = OUTER.slice(0, -1);
     const CONTENT_FIELDS = ["format", "signedDeviceGrant", "ownerHistoryCheckpoint", "entries"];
+    const VERSIONED_CONTENT_FIELDS = [...CONTENT_FIELDS, "versionProof"];
+    const VERSION_PROOF_FIELDS = ["snapshotSha256", "rosterSha256",
+      "inventoryCheckpointDigest", "inventoryRoot", "inventorySequence"];
+    const PACKET_FIELDS = ["format", "ciphertextBase64", "cekBase64"];
     const ENTRY = ["bundle", "ownerRootCheckpoint"];
     const MAX_FILES = 12;
     const MAX_PLAIN = 8 * 1024 * 1024;
@@ -39,6 +51,7 @@
     const POP_DOMAIN = new TextEncoder().encode("Root.ark/zk-1/historical-device-pop/v1\0");
     const POP_TTL_MS = 120000;
     const issuedPop = new WeakMap();
+    const versionAuthorities = new WeakMap();
     const enc = new TextEncoder();
     const dec = new TextDecoder("utf-8", { fatal: true });
     const re64 = /^[A-Za-z0-9_-]+$/;
@@ -139,6 +152,13 @@
       let difference = 0;
       for (let i = 0; i < a.length; i++) difference |= a[i] ^ b[i];
       return difference === 0;
+    }
+    function compareIds(a, b) {
+      const left = from64(a, 16), right = from64(b, 16);
+      for (let i = 0; i < 16; i++) {
+        if (left[i] !== right[i]) return left[i] < right[i] ? -1 : 1;
+      }
+      return 0;
     }
     // The owner-signed ACTIVE grant is necessary but NOT device proof of
     // possession. The signer must prove possession of the distinct grant key
@@ -255,11 +275,12 @@
         || (kind === "private" && value.extractable !== false)) deny();
       return value;
     }
-    function validateEntries(entries, expectedScope, epoch) {
+    function validateEntries(entries, expectedScope, epoch, versioned = false) {
       if (!Array.isArray(entries) || entries.length < 1 || entries.length > MAX_FILES
         || Reflect.ownKeys(entries).length !== entries.length + 1) deny();
       const objects = new Set();
       const versions = new Set();
+      let previous = null;
       let total = 0;
       for (const entry of entries) {
         exact(entry, ENTRY);
@@ -270,20 +291,124 @@
           || meta.kind !== "file" || !Number.isSafeInteger(meta.epoch)
           || meta.epoch < 1 || meta.epoch > epoch
           || !Number.isSafeInteger(bundle.objectRevision) || bundle.objectRevision < 1
-          || objects.has(meta.object_id) || versions.has(meta.version_id)) deny();
+          || (!versioned && objects.has(meta.object_id))
+          || versions.has(meta.version_id)) deny();
         from64(meta.object_id, 16);
         from64(meta.version_id, 16);
+        if (meta.parent_version_id !== null) from64(meta.parent_version_id, 16);
         from64(bundle.ciphertextRoot, 32);
         from64(bundle.ciphertextSha256, 32);
         total += from64(bundle.ciphertextBase64, 1, 4 * 1024 * 1024).length;
         if (total > MAX_PLAIN * 2) deny();
         objects.add(meta.object_id);
         versions.add(meta.version_id);
+        if (versioned) {
+          if (previous && compareIds(previous.metadata.object_id, meta.object_id) > 0) deny();
+          const ancestor = previous && previous.metadata.object_id === meta.object_id
+            ? previous : null;
+          if (bundle.objectRevision !== (ancestor ? ancestor.objectRevision + 1 : 1)
+            || meta.parent_version_id !== (ancestor ? ancestor.metadata.version_id : null)
+            || (ancestor && meta.epoch < ancestor.metadata.epoch)) deny();
+          previous = bundle;
+        }
       }
       // Canonical unique inventory order prevents alternate list permutations
       // from producing competing independent interpretations.
-      for (let i = 1; i < entries.length; i++) {
+      if (!versioned) for (let i = 1; i < entries.length; i++) {
         if (entries[i - 1].bundle.metadata.object_id >= entries[i].bundle.metadata.object_id) deny();
+      }
+    }
+    function authorityFor(value, expectedScope, head) {
+      const auth = value && versionAuthorities.get(value);
+      if (!auth || SCOPE.some((name) => auth.scope[name] !== expectedScope[name])
+        || auth.head.revision !== head.revision || auth.head.epoch !== head.epoch
+        || auth.head.digest !== b64(head.digest)) deny();
+      return auth;
+    }
+    // A capability exists only after BOTH independently pinned, signed
+    // inventories and the complete owner roster were verified. Node-only DEV:
+    // the browser UMD cannot mint this authority from self-reported JSON.
+    async function verifyVersionedAuthority(input) {
+      try {
+        exact(input, ["backupVerification", "rosterVerification",
+          "otherVerifiedKeyringProofs"]);
+        if (!backupInventory?.verifyBackupSnapshot
+          || !backupInventory?.readVerifiedBackupProof
+          || !accountRoster?.verifyOwnerRosterCoverage) deny();
+        const snapshotWire = JSON.stringify(input.backupVerification.snapshot);
+        const rosterWire = JSON.stringify(input.rosterVerification.roster);
+        if (typeof snapshotWire !== "string" || snapshotWire.length > MAX_ARCHIVE
+          || typeof rosterWire !== "string" || rosterWire.length > 20000) deny();
+        const snapshot = JSON.parse(snapshotWire);
+        const roster = JSON.parse(rosterWire);
+        const proof = await backupInventory.verifyBackupSnapshot({
+          ...input.backupVerification, snapshot });
+        const others = input.otherVerifiedKeyringProofs;
+        if (!Array.isArray(others) || others.length > 7
+          || Reflect.ownKeys(others).length !== others.length + 1) deny();
+        await accountRoster.verifyOwnerRosterCoverage({
+          ...input.rosterVerification, roster,
+          verifiedKeyringProofs: [proof, ...others] });
+        const own = backupInventory.readVerifiedBackupProof(proof);
+        const sc = scope(snapshot.scope);
+        if (input.rosterVerification.accountId !== sc.account_id
+          || own.snapshotSha256 !== b64(bytes(
+            input.backupVerification.independentlyPinnedBackupSha256, 32))
+          || own.ownerSpkiSha256 !== Buffer.from(
+            input.backupVerification.independentOwnerSpkiSha256).toString("hex")) deny();
+        const head = { revision: snapshot.ownerRevision,
+          digest: snapshot.ownerDigest, epoch: snapshot.ownerEpoch };
+        const rows = snapshot.items.map((item) => ({
+          objectId: item.objectId, revision: item.revision, epoch: item.epoch,
+          ciphertextSha256: item.ciphertextSha256,
+          ciphertextRoot: item.ciphertextRoot,
+          ciphertextBase64: item.ciphertextBase64 }));
+        if (rows.length < 1 || rows.length > MAX_FILES) deny();
+        const versionProof = Object.freeze({
+          snapshotSha256: own.snapshotSha256,
+          rosterSha256: b64(bytes(input.rosterVerification.independentlyPinnedRosterSha256, 32)),
+          inventoryCheckpointDigest: own.inventoryCheckpointDigest,
+          inventoryRoot: own.inventoryRoot, inventorySequence: own.inventorySequence });
+        const capability = Object.freeze({ completeRelativeToOwnerCheckpoint: true,
+          globalAccountCompletenessProven: false, authorizesProductionRestore: false });
+        versionAuthorities.set(capability, Object.freeze({ scope: sc, head,
+          rows, versionProof }));
+        return capability;
+      } catch (_) { deny(); }
+    }
+    async function decodePacket(raw, expectedRow, metadata) {
+      let encoded, cek, opened;
+      try {
+        if (!expectedRow || !fileContent?.importFileCek || !fileContent?.decryptFile) deny();
+        const packet = JSON.parse(dec.decode(raw));
+        exact(packet, PACKET_FIELDS);
+        if (packet.format !== VERSION_PACKET) deny();
+        encoded = from64(packet.ciphertextBase64, 16, 4 * 1024 * 1024);
+        cek = from64(packet.cekBase64, 32);
+        const sha = new Uint8Array(await webCrypto.subtle.digest("SHA-256", encoded));
+        const root = await ciphertextRoots.computeCiphertextRoot([encoded]);
+        if (packet.ciphertextBase64 !== expectedRow.ciphertextBase64
+          || !same(sha, from64(expectedRow.ciphertextSha256, 32))
+          || !same(bytes(root, 32), from64(expectedRow.ciphertextRoot, 32))) deny();
+        // The original zk-1 ciphertext MUST actually authenticate under this
+        // exact CEK and version metadata; hash/root alone cannot prove that.
+        const cekKey = await fileContent.importFileCek(cek);
+        opened = await fileContent.decryptFile({ cek: cekKey, metadata,
+          envelopeBytes: encoded });
+        return { ciphertext: encoded, cek };
+      } catch (_) { encoded?.fill(0); cek?.fill(0); deny(); }
+      finally { opened?.data?.fill(0); }
+    }
+    async function verifyVersionedData(files, entries, authority) {
+      if (entries.length !== authority.rows.length || files.length !== entries.length) deny();
+      for (let index = 0; index < entries.length; index++) {
+        const bundle = entries[index].bundle;
+        const row = authority.rows[index];
+        if (bundle.metadata.object_id !== row.objectId
+          || bundle.objectRevision !== row.revision
+          || bundle.metadata.epoch !== row.epoch) deny();
+        const packet = await decodePacket(files[index].data, row, bundle.metadata);
+        packet.ciphertext.fill(0); packet.cek.fill(0);
       }
     }
     function snapshotHistoricalRecovery(value) {
@@ -425,10 +550,12 @@
     async function createArchive(input) {
       let secret, contents, openedBytes, fixedFiles;
       try {
+        const versioned = Object.hasOwn(input || {}, "versionedAuthority");
         exact(input, ["recoverySecret", "ownerSigningKey", "ownerPublicKey",
           "independentOwnerSpkiSha256", "pinnedCurrentHead", "scope", "files",
           "ownerHistoryCheckpoint", "previousOwnerHistoryProof", "signedDeviceGrant",
-          "signerKeyId", "deviceId", "issuedAt"]);
+          "signerKeyId", "deviceId", "issuedAt",
+          ...(versioned ? ["versionedAuthority"] : [])]);
         if (!webCrypto?.subtle || !portable?.sealForUserHeldSecret) deny();
         secret = bytes(input.recoverySecret, 32);
         const expectedScope = scope(input.scope);
@@ -448,6 +575,11 @@
         const ownerDevice = input.deviceId;
         const signedAt = input.issuedAt;
         fixedFiles = copyFiles(input.files);
+        const authority = versioned
+          ? authorityFor(input.versionedAuthority, expectedScope, head) : null;
+        if (versioned) fixedFiles.sort((a, b) =>
+          compareIds(a.metadata.object_id, b.metadata.object_id)
+          || a.objectRevision - b.objectRevision);
         const marker = { ownerRevision: head.revision, ownerDigest,
           ownerEpoch: head.epoch };
         await verifyAnchors({ outer: marker, ownerPublicKey,
@@ -472,23 +604,29 @@
             ciphertextRoot: from64(bundle.ciphertextRoot, 32), issuedAt: signedAt });
           entries.push({ bundle, ownerRootCheckpoint: rootCheckpoint });
         }
-        entries.sort((a, b) => a.bundle.metadata.object_id < b.bundle.metadata.object_id ? -1
-          : a.bundle.metadata.object_id > b.bundle.metadata.object_id ? 1 : 0);
-        validateEntries(entries, expectedScope, head.epoch);
+        entries.sort((a, b) => versioned
+          ? compareIds(a.bundle.metadata.object_id, b.bundle.metadata.object_id)
+            || a.bundle.objectRevision - b.bundle.objectRevision
+          : a.bundle.metadata.object_id < b.bundle.metadata.object_id ? -1
+            : a.bundle.metadata.object_id > b.bundle.metadata.object_id ? 1 : 0);
+        validateEntries(entries, expectedScope, head.epoch, versioned);
+        if (versioned) await verifyVersionedData(fixedFiles, entries, authority);
         await verifyEveryOwnerRoot(entries, { ownerPublicKey,
           signerKeyId: id, deviceId: ownerDevice,
           ownerHistoryCheckpoint: history, previousOwnerHistoryProof: previous,
           pinnedCurrentHead: head, expectedScope });
         // The complete object inventory, metadata, grant, wrapped CEKs and
         // signed per-file roots stay ENCRYPTED in the portable outer envelope.
-        contents = enc.encode(JSON.stringify({ format: CONTENT,
+        contents = enc.encode(JSON.stringify({ format: versioned ? VERSIONED_CONTENT : CONTENT,
           signedDeviceGrant: grant,
-          ownerHistoryCheckpoint: history, entries }));
+          ownerHistoryCheckpoint: history, entries,
+          ...(versioned ? { versionProof: authority.versionProof } : {}) }));
         if (contents.length > MAX_ARCHIVE / 2) deny();
         const salt = webCrypto.getRandomValues(new Uint8Array(32));
         const nonce = webCrypto.getRandomValues(new Uint8Array(12));
         const archiveId = webCrypto.getRandomValues(new Uint8Array(16));
-        const context = { format: FORMAT, scope: expectedScope, ...marker,
+        const context = { format: versioned ? VERSIONED_FORMAT : FORMAT,
+          scope: expectedScope, ...marker,
           archiveId: b64(archiveId) };
         const archiveKey = await wrapping(secret, salt, context);
         openedBytes = new Uint8Array(await webCrypto.subtle.encrypt({ name: "AES-GCM",
@@ -512,11 +650,13 @@
       try {
         const historic = Object.hasOwn(input || {}, "historicalRecovery");
         const aggregate = Object.hasOwn(input || {}, "accountArchiveSha256");
+        const versioned = Object.hasOwn(input || {}, "versionedAuthority");
         exact(input, ["archive", "recoverySecret", "ownerPublicKey",
           "independentOwnerSpkiSha256", "independentlyPinnedArchiveSha256",
           "pinnedCurrentHead", "scope", "signerKeyId", "deviceId",
           "previousOwnerHistoryProof", ...(historic ? ["historicalRecovery"] : []),
-          ...(aggregate ? ["accountArchiveSha256"] : [])]);
+          ...(aggregate ? ["accountArchiveSha256"] : []),
+          ...(versioned ? ["versionedAuthority"] : [])]);
         if (aggregate && !historic) deny();
         secret = bytes(input.recoverySecret, 32);
         exact(input.archive, OUTER);
@@ -525,7 +665,7 @@
           if (!prop || !Object.hasOwn(prop, "value")) deny();
           return [name, prop.value];
         }));
-        if (archive.format !== FORMAT) deny();
+        if (archive.format !== (versioned ? VERSIONED_FORMAT : FORMAT)) deny();
         archive.scope = scope(archive.scope);
         const expectedScope = scope(input.scope);
         if (!SCOPE.every((name) => archive.scope[name] === expectedScope[name])) deny();
@@ -541,6 +681,13 @@
         const trustedDevice = input.deviceId;
         const predecessor = input.previousOwnerHistoryProof; // in-process brand
         const historical = historic ? snapshotHistoricalRecovery(input.historicalRecovery) : null;
+        const authority = versioned
+          ? versionAuthorities.get(input.versionedAuthority) : null;
+        if (versioned && (!authority
+          || SCOPE.some((name) => authority.scope[name] !== expectedScope[name])
+          || authority.head.revision !== archive.ownerRevision
+          || authority.head.digest !== archive.ownerDigest
+          || authority.head.epoch !== archive.ownerEpoch)) deny();
         positive(head.revision); positive(head.epoch);
         if (historic ? predecessor !== null
           : (archive.ownerRevision !== head.revision
@@ -550,7 +697,7 @@
         if (!same(digest, archivePin)) deny();
         if (!await webCrypto.subtle.verify("Ed25519", ownerPublicKey,
           from64(archive.signature, 64), signatureMessage(archive))) deny();
-        const context = { format: FORMAT, scope: expectedScope,
+        const context = { format: versioned ? VERSIONED_FORMAT : FORMAT, scope: expectedScope,
           ownerRevision: archive.ownerRevision, ownerDigest: archive.ownerDigest,
           ownerEpoch: archive.ownerEpoch, archiveId: archive.archiveId };
         from64(archive.archiveId, 16);
@@ -562,9 +709,14 @@
         if (decrypted.length > MAX_ARCHIVE / 2) deny();
         let payload;
         try { payload = JSON.parse(dec.decode(decrypted)); } catch (_) { deny(); }
-        exact(payload, CONTENT_FIELDS);
-        if (payload.format !== CONTENT) deny();
-        validateEntries(payload.entries, expectedScope, archive.ownerEpoch);
+        exact(payload, versioned ? VERSIONED_CONTENT_FIELDS : CONTENT_FIELDS);
+        if (payload.format !== (versioned ? VERSIONED_CONTENT : CONTENT)) deny();
+        validateEntries(payload.entries, expectedScope, archive.ownerEpoch, versioned);
+        if (versioned) {
+          exact(payload.versionProof, VERSION_PROOF_FIELDS);
+          if (JSON.stringify(payload.versionProof) !== JSON.stringify(authority.versionProof)
+            || payload.entries.length !== authority.rows.length) deny();
+        }
         if (historic) await verifyHistoricalRecovery({ historical, archive,
           payload, head, expectedScope, ownerPublicKey,
           ownerSpkiPin, signerKeyId: trustedSigner, deviceId: trustedDevice,
@@ -583,12 +735,28 @@
         }
         // No partial release: accumulate privately until ALL files and
         // signatures have succeeded. On any failure wipe every opened file.
-        for (const item of payload.entries) {
+        for (let index = 0; index < payload.entries.length; index++) {
+          const item = payload.entries[index];
           const opened = await portable.openWithIndependentRoot({
             recoverySecret: secret, bundle: item.bundle,
             expectedMetadata: item.bundle.metadata,
             independentlyPinnedCiphertextRoot: from64(item.bundle.ciphertextRoot, 32) });
-          recovered.push(Object.freeze({ objectId: item.bundle.metadata.object_id,
+          if (versioned) {
+            let packet;
+            try {
+              const row = authority.rows[index];
+              if (item.bundle.metadata.object_id !== row.objectId
+                || item.bundle.objectRevision !== row.revision
+                || item.bundle.metadata.epoch !== row.epoch) deny();
+              packet = await decodePacket(opened.data, row, item.bundle.metadata);
+              recovered.push(Object.freeze({
+                objectId: item.bundle.metadata.object_id,
+                versionId: item.bundle.metadata.version_id,
+                parentVersionId: item.bundle.metadata.parent_version_id,
+                objectRevision: item.bundle.objectRevision, metadata: item.bundle.metadata,
+                ciphertext: packet.ciphertext, cek: packet.cek }));
+            } finally { opened.data?.fill(0); }
+          } else recovered.push(Object.freeze({ objectId: item.bundle.metadata.object_id,
             objectRevision: item.bundle.objectRevision, metadata: item.bundle.metadata,
             name: opened.name, mediaType: opened.mediaType, data: opened.data }));
         }
@@ -597,14 +765,19 @@
           independentArchiveHashMatched: true, activeSignedGrantAtPinnedHeadVerified: true,
           currentSignedGrantAtPinnedHeadVerified: true,
           historicalOwnerContinuityVerified: historic,
+          ...(versioned ? { completeRelativeToPinnedInventory: true,
+            ownerSignedAccountRosterVerified: true,
+            revisionAncestryVerified: true } : {}),
           currentOnlineRevocationVerified: false,
           independentPinProvenanceVerifiedByModule: false,
           authorizesProductionRestore: false });
         recovered = [];
         return result;
-      } catch (_) { for (const item of recovered) item.data?.fill(0); deny(); }
+      } catch (_) { for (const item of recovered) {
+        item.data?.fill(0); item.ciphertext?.fill(0); item.cek?.fill(0);
+      } deny(); }
       finally { secret?.fill(0); decrypted?.fill(0); }
     }
-    return Object.freeze({ createArchive, recoverArchive,
+    return Object.freeze({ createArchive, recoverArchive, verifyVersionedAuthority,
       issueHistoricalRecoveryChallenge, historicalRecoveryChallengeMessage });
   }));
