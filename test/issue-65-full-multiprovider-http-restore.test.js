@@ -9,6 +9,7 @@ const path = require("node:path");
 const http = require("node:http");
 const https = require("node:https");
 const express = require("express");
+const { shouldDeferZk1JsonParsing } = require("../src/middlewares/zk1DeferredJsonParsing");
 const jwt = require("jsonwebtoken");
 const { Readable } = require("node:stream");
 const { S3Client } = require("@aws-sdk/client-s3");
@@ -727,6 +728,10 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   };
   const signedRestoreInput = { mode: "cloud-catalog", request: remoteRecovery };
   const expressApp = express();
+  // Exercise the same opt-in global-parser selection that server.js uses.
+  expressApp.use((req, res, next) => shouldDeferZk1JsonParsing(req, {
+    contentConfig: "opted-in-config", environment: "test",
+  }) ? next() : express.json()(req, res, next));
   const invalidStrictPins = [
     ["missing domain pin", Object.fromEntries(Object.entries(gatewayPins)
       .filter(([name]) => name !== "providerDomainPinset"))],
@@ -769,6 +774,7 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     resolveTrustedScope: allowedScope,
     multiproviderRestore: { gatewayPins, restoreInput: signedRestoreInput },
     environment: "test" });
+  expressApp.use((error, _req, res, _next) => res.status(error.status || 500).end());
   const expressServer = http.createServer(expressApp);
   const expressPort = await register(expressServer);
   const secureUrl = `http://127.0.0.1:${expressPort}/zk-1/v1/multiprovider-restore/read`;
@@ -798,6 +804,15 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     method: "POST", headers: { ...sessionHeaders, ...extra }, body: JSON.stringify(body),
   });
   const validRequest = await makeSignedRequest();
+  const overGlobalLimit = JSON.stringify({ padding: "A".repeat(120_000) });
+  const unauthenticatedOversized = await fetch(secureUrl, { method: "POST",
+    headers: { "content-type": "application/json" }, body: overGlobalLimit });
+  assert.equal(unauthenticatedOversized.status, 401,
+    "unauthenticated recovery must reject before consuming a large JSON body");
+  const authenticatedOversized = await fetch(secureUrl, { method: "POST",
+    headers: sessionHeaders, body: JSON.stringify({ padding: "A".repeat(9_000) }) });
+  assert.equal(authenticatedOversized.status, 413,
+    "authenticated recovery must enforce its local 8 KB parser limit");
   const beforeAuth = { ...hits };
   assert.equal((await fetch(secureUrl)).status, 404, "GET not exposed: signed POST required");
   assert.equal((await post(validRequest, { cookie: "" })).status, 401);

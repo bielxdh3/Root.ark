@@ -10,6 +10,7 @@ if (String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim() !== "1") {
   throw new Error("Multiple server instances are unsupported while authentication state is process-local.");
 }
 const express = require("express");
+const { shouldDeferZk1JsonParsing } = require("./src/middlewares/zk1DeferredJsonParsing");
 const { rateLimit } = require("express-rate-limit");
 const UploadChunkSlidingWindowStore = require("./src/middlewares/uploadChunkSlidingWindowStore");
 const SqliteSlidingWindowStore = require("./src/middlewares/sqliteSlidingWindowStore");
@@ -5998,13 +5999,11 @@ app.use((req, res, next) => {
     // dedicated route, AFTER authentication and upload authorization.
     return next();
   }
-  if (process.env.ROOTARK_ZK1_CONTENT_CONFIG
-    && ["development", "test"].includes(NODE_ENV)
-    && req.method === "POST"
-    && ["/zk-1/v1/content/read", "/zk-1/v1/content/put",
-      "/zk-1/v1/catalog/read", "/zk-1/v1/catalog/commit"].includes(req.path)) {
-    // Defer JSON body parsing until AFTER the normal session and permissions
-    // have been checked by the isolated protected-content routes.
+  if (shouldDeferZk1JsonParsing(req, {
+    contentConfig: process.env.ROOTARK_ZK1_CONTENT_CONFIG, environment: NODE_ENV,
+  })) {
+    // Auth, permissions, and route-local limits (512b for authority probes;
+    // 8kb for multiprovider restore) precede any body parsing.
     return next();
   }
   if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")

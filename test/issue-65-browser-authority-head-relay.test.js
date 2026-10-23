@@ -7,6 +7,7 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const path = require("node:path");
 const express = require("express");
+const { shouldDeferZk1JsonParsing } = require("../src/middlewares/zk1DeferredJsonParsing");
 const z = require("../src/crypto/rootark-zk-1");
 const { registerZk1ProtectedObjectRoutes } =
   require("../src/routes/zk1ProtectedObjectRoutes");
@@ -18,6 +19,33 @@ const spki = (key) => key.export({ type: "spki", format: "der" });
 const raw = (key) => spki(key).subarray(-32);
 const OWNER_HEAD = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0");
 const CAS_HEAD = Buffer.from("Root.ark/zk-1/opaque-catalog-cas/v1\0");
+
+test("global JSON deferral is restricted to exact opt-in development POST routes", () => {
+  const names = ["/zk-1/v1/content/read", "/zk-1/v1/content/put",
+    "/zk-1/v1/catalog/read", "/zk-1/v1/catalog/commit",
+    "/zk-1/v1/catalog/authority/witness-head",
+    "/zk-1/v1/catalog/authority/cas-head", "/zk-1/v1/multiprovider-restore/read"];
+  for (const path of names) {
+    const req = { method: "POST", path };
+    assert.equal(shouldDeferZk1JsonParsing(req,
+      { contentConfig: "test-config", environment: "test" }), true);
+    assert.equal(shouldDeferZk1JsonParsing({ ...req, path: path.toUpperCase() + "/" },
+      { contentConfig: "test-config", environment: "development" }), true,
+    "match Express's case-insensitive optional-slash route aliases");
+    for (const options of [{ contentConfig: "", environment: "test" },
+      { contentConfig: "test-config", environment: "production" },
+      { contentConfig: "test-config", environment: "staging" }]) {
+      assert.equal(shouldDeferZk1JsonParsing(req, options), false);
+    }
+    assert.equal(shouldDeferZk1JsonParsing({ ...req, method: "PUT" },
+      { contentConfig: "test-config", environment: "test" }), false);
+    assert.equal(shouldDeferZk1JsonParsing({ ...req, path: path + "-evil" },
+      { contentConfig: "test-config", environment: "test" }), false);
+  }
+  for (const path of ["/auth/login", "/upload", "/zk-1/v1/catalog/authority/other-head"])
+    assert.equal(shouldDeferZk1JsonParsing({ path, method: "POST" },
+      { contentConfig: "test-config", environment: "test" }), false);
+});
 
 test("browser authority relay UMD boots in Edge-like window without Node globals", () => {
   const context = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, Uint8Array,
@@ -149,6 +177,10 @@ test("authenticated fresh witness/CAS relay: browser-pinned SPKI, nonce, account
     } },
   };
   const app = express();
+  // Exercise the same opt-in global-parser selection that server.js uses.
+  app.use((req, res, next) => shouldDeferZk1JsonParsing(req, {
+    contentConfig: "opted-in-config", environment: "test",
+  }) ? next() : express.json()(req, res, next));
   const authenticate = (req, res, next) => {
     const cookie = req.get("cookie") || "";
     if (!sessionActive || cookie !== "rootark_session=owner; rootark_csrf=" + csrf
@@ -164,10 +196,28 @@ test("authenticated fresh witness/CAS relay: browser-pinned SPKI, nonce, account
     },
     resolveTrustedScope: (user) => user?.username === "owner" ? scope : null,
   });
+  app.use((error, _req, res, _next) => res.status(error.status || 500).end());
   const server = app.listen(0, "127.0.0.1");
   await new Promise((resolve) => server.once("listening", resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const origin = `http://127.0.0.1:${server.address().port}/`;
+  for (const route of ["catalog/authority/witness-head", "catalog/authority/cas-head",
+    "CATALOG/AUTHORITY/WITNESS-HEAD/"]) {
+    const endpoint = origin + "zk-1/v1/" + route;
+    const unauthenticated = await fetch(endpoint, { method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ nonce: b64(crypto.randomBytes(32)), padding: "a".repeat(120_000) }) });
+    assert.equal(unauthenticated.status, 401,
+      "reject oversized unauthenticated body before any JSON parsing");
+    const authenticated = await fetch(endpoint, { method: "POST",
+      headers: { "content-type": "application/json", "x-csrf-token": csrf,
+        cookie: "rootark_session=owner; rootark_csrf=" + csrf },
+      body: JSON.stringify({ nonce: b64(crypto.randomBytes(32)), padding: "a".repeat(600) }) });
+    assert.equal(authenticated.status, 413,
+      "route-local 512-byte parser must enforce limit after authorization");
+  }
+  assert.equal(witnessCalls, 0);
+  assert.equal(casCalls, 0);
   let flipCsrfAfterResponse = false;
   const fetchImpl = async (url, options) => {
     assert.equal(options.method, "POST");
