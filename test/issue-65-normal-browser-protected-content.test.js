@@ -41,6 +41,7 @@ const scriptNames = ["rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-r
   "rootark-zk1-browser-recovery-http", "rootark-zk1-recoverable-workspace",
   "rootark-zk1-normal-browser-lab-ui", "rootark-zk1-portable-recovery-lab-ui",
   "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow",
+  "rootark-zk1-legacy-batch-migration",
   "rootark-zk1-v2-device-approval", "rootark-zk1-keyring-portable-archive"];
 
 test("production static paths cannot disclose the opt-in normal browser laboratory", async (t) => {
@@ -944,9 +945,26 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
   const scripts = new Set(["rootark-api", "rootark-zk1-authenticated-workspace",
     "rootark-zk1-owner-inventory-trust-head", ...scriptNames]);
   const untouchedLegacy = Buffer.from("Synthetic existing legacy file; old server has plaintext.");
+  const legacyLastModified = "Thu, 01 Jan 2026 00:00:00 GMT";
+  const legacyPin = { storedAs: "legacy.txt", uploadedAt: "2026-01-01T00:00:00Z",
+    size: untouchedLegacy.length, lastModified: legacyLastModified,
+    sha256: b64(crypto.createHash("sha256").update(untouchedLegacy).digest()),
+    mediaType: "text/plain" };
   app.get("/files/legacy.txt", authenticate, (_req, res) => {
     res.set("content-disposition", 'attachment; filename="legacy.txt"');
     res.type("text/plain").status(200).end(untouchedLegacy);
+  });
+  app.get("/versions/legacy.txt", authenticate, (_req, res) => res.json({
+    fileName: "legacy.txt", versions: [1, 2].map((version) => ({
+      version, storedAs: legacyPin.storedAs,
+      uploadedAt: legacyPin.uploadedAt, size: legacyPin.size,
+    })),
+  }));
+  app.get("/download/legacy.txt/v/:version", authenticate, (req, res) => {
+    if (!["1", "2"].includes(req.params.version)) return res.sendStatus(404);
+    res.set("content-disposition", 'attachment; filename="legacy.txt"');
+    res.set("last-modified", legacyLastModified);
+    return res.type("text/plain").status(200).end(untouchedLegacy);
   });
   app.get("/client/:asset", (req, res) => {
     const name = req.params.asset.endsWith(".js") ? req.params.asset.slice(0, -3) : "";
@@ -968,6 +986,8 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
     deviceRaw: b64(f.device.authorization_public_key), privateDer: b64(f.privateDer),
     grant: opts.signedDeviceGrant,
     migrationCek: b64(crypto.randomBytes(32)),
+    batchCeks: [b64(crypto.randomBytes(32)), b64(crypto.randomBytes(32))],
+    legacyPin,
     head: { revision: opts.pinnedCurrentHead.revision,
       digest: b64(opts.pinnedCurrentHead.digest), epoch: opts.pinnedCurrentHead.epoch },
     ownerHistoryChain: [genesisCheckpoint, successorCheckpoint],
@@ -1029,6 +1049,65 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
         if(!field("status").textContent.includes("GET conferido"))throw Error("MIGRATION_RESUME_DENIED");
         if(field("private").files.length || field("migration-cek").files.length)
           throw Error("MIGRATION_KEY_RETAINED");
+        // Real Edge integration: local JSON descriptors, two distinct binary
+        // CEKs and a separate 32-byte migration secret through authenticated
+        // version catalog + legacy GET + signed ciphertext PUT/GET.
+        let batchDownloads=[];
+        const previousClick=HTMLAnchorElement.prototype.click;
+        const previousCreate=URL.createObjectURL;
+        const batchBlobs=new Map();
+        URL.createObjectURL=function(blob){const url=previousCreate.call(URL,blob);
+          batchBlobs.set(url,blob);return url;};
+        HTMLAnchorElement.prototype.click=function(){
+          if(!this.download||!this.href.startsWith("blob:"))throw Error("UNSAFE_BATCH_DOWNLOAD");
+          batchDownloads.push({name:this.download,href:this.href});};
+        const batchSecret=crypto.getRandomValues(new Uint8Array(32));
+        const batchDescriptors=(partial=false)=>({schema:"rootark-zk1-legacy-version-batch/v1",
+          entries:[1,2].map((version,index)=>({legacy:{name:"legacy.txt",folderId:""},
+            sourcePin:{...values.legacyPin,version,
+              sha256:partial&&index===1?values.ownerHash:values.legacyPin.sha256},
+            cekFile:"version-"+version+".bin"}))});
+        const selectBatch=(partial=false)=>{
+          setFile("history",new TextEncoder().encode(JSON.stringify(values.ownerHistoryChain)));
+          setFile("private",decode(values.privateDer));
+          setFile("migration-batch-descriptors",new TextEncoder().encode(
+            JSON.stringify(batchDescriptors(partial))));
+          setFile("migration-batch-secret",batchSecret);
+          field("migration-batch-opt-in").checked=true;
+          const selection=new DataTransfer();
+          for(let index=0;index<2;index++)selection.items.add(new File(
+            [decode(values.batchCeks[index])],"version-"+(index+1)+".bin"));
+          field("migration-batch-ceks").files=selection.files;
+        };
+        selectBatch(true);
+        document.querySelector('[data-zk1-action="migration-batch"]').click();
+        await wait(()=>field("status").textContent.includes("Versões conferidas localmente")
+          || field("status").textContent.includes("Operação recusada"));
+        if(!field("status").textContent.includes("1/2")||batchDownloads.length!==1)
+          throw Error("EDGE_BATCH_PARTIAL_FAIL:"+field("status").textContent);
+        const batchPartial=JSON.parse(await batchBlobs.get(batchDownloads[0].href).text());
+        if(batchPartial.verified!==1||batchPartial.authorizesCutover!==false
+          ||batchPartial.results[1].phase!=="needs-manual-review")
+          throw Error("EDGE_BATCH_PARTIAL_REPORT_UNSAFE");
+        if(field("migration-batch-ceks").files.length||field("migration-batch-secret").files.length)
+          throw Error("EDGE_BATCH_RETAINED_KEYS");
+        batchDownloads=[];
+        selectBatch(false);
+        document.querySelector('[data-zk1-action="migration-batch"]').click();
+        await wait(()=>field("status").textContent.includes("Versões conferidas localmente")
+          || field("status").textContent.includes("Operação recusada"));
+        if(!field("status").textContent.includes("2/2")||batchDownloads.length!==1)
+          throw Error("EDGE_BATCH_RESUME_FAIL:"+field("status").textContent);
+        batchDownloads=[];
+        selectBatch(false);
+        field("owner-spki").value=values.ownerHash;
+        document.querySelector('[data-zk1-action="migration-batch"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        if(batchDownloads.length)throw Error("EDGE_BATCH_FORGED_OWNER_PIN_LEAK");
+        field("owner-spki").value=values.ownerSpkiHash;
+        URL.createObjectURL=previousCreate;
+        HTMLAnchorElement.prototype.click=previousClick;
+        batchSecret.fill(0);
         field("digest").value=values.head.digest;
         setFile("history",new TextEncoder().encode(JSON.stringify([
           values.ownerHistoryChain[0],
@@ -1198,6 +1277,42 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
           throw Error("LATE_LOGOUT_ARCHIVE_RELEASE");
         HTMLAnchorElement.prototype.click=originalClick;
         postLogoutHolder.fill(0);
+        // Real Edge logout while the FIRST historical catalog fetch is still
+        // unresolved: no version ciphertext PUT and no report release.
+        (await wait(()=>document.getElementById("zk1-workspace-open"))).click();
+        await wait(()=>document.querySelector("dialog").open);
+        setFile("owner",decode(values.ownerRaw));
+        field("owner-hash").value=values.ownerHash;
+        field("owner-spki").value=values.ownerSpkiHash;
+        field("revision").value=values.head.revision;
+        field("digest").value=values.head.digest;
+        field("epoch").value=values.head.epoch;
+        setFile("grant",new TextEncoder().encode(JSON.stringify(values.grant)));
+        setFile("device",decode(values.deviceRaw));
+        batchSecret.set(crypto.getRandomValues(new Uint8Array(32)));
+        selectBatch(false);
+        let releaseCatalog=null;
+        let interceptedCatalog=false;
+        const nativeFetch=window.fetch;
+        window.fetch=(...args)=>{
+          if(!interceptedCatalog&&String(args[0]).startsWith("/versions/legacy.txt")){
+            interceptedCatalog=true;
+            return new Promise(resolve=>{releaseCatalog=()=>resolve(nativeFetch(...args));});
+          }
+          return nativeFetch(...args);
+        };
+        let lateBatchDownloads=0;
+        HTMLAnchorElement.prototype.click=function(){lateBatchDownloads++;};
+        document.querySelector('[data-zk1-action="migration-batch"]').click();
+        await wait(()=>typeof releaseCatalog==="function");
+        window.dispatchEvent(new Event("rootark:logout"));
+        releaseCatalog();
+        await wait(()=>field("status").textContent.includes("Operação recusada"));
+        if(lateBatchDownloads!==0||document.querySelector("dialog").open)
+          throw Error("EDGE_LOGOUT_MID_BATCH_EXPORTED");
+        window.fetch=nativeFetch;
+        HTMLAnchorElement.prototype.click=originalClick;
+        batchSecret.fill(0);
         output.textContent="EDGE_AUTH_WORKSPACE_PASS";
       } catch(e){output.textContent="EDGE_AUTH_WORKSPACE_FAIL:"+e.message;}
     });`));
@@ -1266,8 +1381,8 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
       return typeof value === "string" && value.startsWith("EDGE_AUTH_WORKSPACE_") ? value : null;
     });
     assert.equal(observed, "EDGE_AUTH_WORKSPACE_PASS");
-    assert.equal(protectedPuts, 3, "one ordinary, one legacy migration and one recoverable PUT; migration resume and forged heads cannot rePUT");
-    assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 3);
+    assert.equal(protectedPuts, 5, "ordinary, legacy, recoverable and two distinct batch version PUTs; partial retry and forged pins cannot rePUT");
+    assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 5);
   } finally {
     socket?.close();
     if (edge?.pid) {

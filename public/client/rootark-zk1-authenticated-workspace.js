@@ -16,6 +16,7 @@
     "rootark-zk1-portable-file-recovery", "rootark-zk1-browser-recovery-http",
     "rootark-zk1-recoverable-workspace",
     "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow",
+    "rootark-zk1-legacy-batch-migration",
     "rootark-zk1-v2-device-approval",
     "rootark-zk1-keyring-portable-archive",
   ];
@@ -172,6 +173,55 @@
     if (!files || files.length > 1) fail();
     return files.length ? JSON.parse(decoder.decode(await fileBytes(name, 1, maximum))) : null;
   }
+  // The descriptor and each raw CEK are chosen on the local device. A JSON
+  // CryptoKey, a server catalog response or a missing source pin is NEVER a
+  // substitute for an explicitly imported 32-byte non-extractable CEK.
+  async function selectedLegacyBatch(assertLive) {
+    const raw = await fileBytes("migration-batch-descriptors", 2, 32 * 1024);
+    let manifest;
+    try { manifest = JSON.parse(decoder.decode(raw)); }
+    finally { raw.fill(0); }
+    assertLive();
+    if (!manifest || Array.isArray(manifest) || typeof manifest !== "object"
+      || Object.keys(manifest).sort().join(",") !== "entries,schema"
+      || manifest.schema !== "rootark-zk1-legacy-version-batch/v1"
+      || !Array.isArray(manifest.entries)
+      || manifest.entries.length < 1 || manifest.entries.length > 12) fail();
+    const files = Array.from(field("migration-batch-ceks")?.files || []);
+    if (files.length !== manifest.entries.length) fail();
+    const byName = new Map();
+    for (const file of files) {
+      if (!file || file.size !== 32 || !localName(file.name)
+        || byName.has(file.name)) fail();
+      byName.set(file.name, file);
+    }
+    const selected = [];
+    const used = new Set();
+    for (const descriptor of manifest.entries) {
+      if (!descriptor || Array.isArray(descriptor) || typeof descriptor !== "object"
+        || Object.keys(descriptor).sort().join(",") !== "cekFile,legacy,sourcePin"
+        || typeof descriptor.cekFile !== "string"
+        || !byName.has(descriptor.cekFile) || used.has(descriptor.cekFile)) fail();
+      if (!descriptor.legacy || Array.isArray(descriptor.legacy)
+        || Object.keys(descriptor.legacy).sort().join(",") !== "folderId,name"
+        || typeof descriptor.legacy.name !== "string"
+        || typeof descriptor.legacy.folderId !== "string"
+        || !descriptor.sourcePin || Array.isArray(descriptor.sourcePin)
+        || Object.keys(descriptor.sourcePin).sort().join(",")
+          !== "lastModified,mediaType,sha256,size,storedAs,uploadedAt,version") fail();
+      used.add(descriptor.cekFile);
+      const rawCek = new Uint8Array(await byName.get(descriptor.cekFile).arrayBuffer());
+      try {
+        assertLive();
+        if (rawCek.byteLength !== 32) fail();
+        const cek = await window.RootarkZk1FileContent.importFileCek(rawCek);
+        assertLive();
+        selected.push({ legacy: descriptor.legacy, sourcePin: descriptor.sourcePin, cek });
+      } finally { rawCek.fill(0); }
+    }
+    if (used.size !== files.length) fail();
+    return selected;
+  }
   function sessionFetch(url, options) {
     // Existing protected HTTP signing uses fetch directly; the real Root.ark
     // session requires the same CSRF double-submit header as RootarkApi.
@@ -208,6 +258,7 @@
         || !window.RootarkZk1NormalBrowserTrustFloor?.provisionOffline
         || !window.RootarkZk1RecoverableWorkspace?.restoreOnNewDevice
         || !window.RootarkZk1LegacyMigrationWorkflow?.openMigrationJournal
+        || !window.RootarkZk1LegacyBatchMigration?.runLegacyMigrationBatch
         || !window.RootarkZk1V2DeviceApproval?.verifyImportedApproval
         || !window.RootarkZk1KeyringPortableArchive?.createArchive
         || !window.RootarkZk1KeyringPortableArchive?.recoverArchive) fail();
@@ -269,6 +320,20 @@
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="migrate">Copiar / retomar GET</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="migration-finalize">Verificar checkpoint assinado</button></div>'
       + '</fieldset>'
+      + '<fieldset><legend>Migração histórica em lote: 1–12 versões (DEV)</legend>'
+      + '<p class="muted">Importe um JSON local com schema rootark-zk1-legacy-version-batch/v1 e entries: '
+      + '[{legacy:{name,folderId},sourcePin:{version,storedAs,uploadedAt,size,lastModified,sha256,mediaType},cekFile}]. '
+      + 'Cada cekFile aponta para um arquivo binário distinto de 32 bytes selecionado abaixo. '
+      + 'O segredo de migração é um arquivo separado de 32 bytes; reimporte exatamente os mesmos '
+      + 'descritores, CEKs e segredo para retomar uma operação incerta. '
+      + 'Cópias parciais exigem revisão e checkpoint assinado externo. '
+      + 'Nenhum resultado autoriza excluir originais, restaurar, ou fazer cutover.</p>'
+      + '<label>Descritores históricos e pins de versões (.json, offline)<input type="file" data-zk1-field="migration-batch-descriptors" accept=".json,application/json"></label>'
+      + '<label>CEKs binárias locais: 1–12 arquivos distintos de 32 bytes<input type="file" multiple data-zk1-field="migration-batch-ceks"></label>'
+      + '<label>migrationSecret separado (binário, exatamente 32 bytes)<input type="file" data-zk1-field="migration-batch-secret"></label>'
+      + '<label><input type="checkbox" data-zk1-field="migration-batch-opt-in"> Autorizo cópias históricas somente de leitura da origem. Entendo que não há exclusão nem migração definitiva.</label>'
+      + '<div class="zk1-workspace-actions"><button type="button" class="button button-primary" data-zk1-action="migration-batch">Copiar / retomar versões e baixar relatório local</button></div>'
+      + '</fieldset>'
       + '<fieldset><legend>Arquivo completo de keyring: 1–12 arquivos, somente offline (DEV)</legend>'
       + '<p class="muted">Selecione arquivos descartáveis (até 8 MiB somados). '
       + 'Criação exige chave Ed25519 privada do PROPRIETÁRIO e histórico assinado atual; '
@@ -301,7 +366,7 @@
     }
     if (!["provision", "verify-inventory", "upload", "upload-recoverable",
       "restore", "new-secret", "new-device", "import-approval",
-      "migrate", "migration-finalize", "archive-create", "archive-recover"].includes(action)) return;
+      "migrate", "migration-finalize", "migration-batch", "archive-create", "archive-recover"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -317,9 +382,11 @@
         if (sessionEpoch !== operationEpoch || dialog?.open !== true
           || currentCsrf() !== initialCsrf) fail();
       };
-      const guardedFetch = (url, options) => {
+      const guardedFetch = async (url, options) => {
         assertLive();
-        return sessionFetch(url, options);
+        const response = await sessionFetch(url, options);
+        assertLive();
+        return response;
       };
       await ensureScripts();
       assertLive();
@@ -513,7 +580,44 @@
         const common = { ...trust, devicePublicKey, devicePrivateKey,
           origin: location.origin + "/", fetchImpl: guardedFetch,
           nowSeconds: Math.floor(Date.now() / 1000) };
-        if (action === "restore") {
+        if (action === "migration-batch") {
+          if (field("migration-batch-opt-in")?.checked !== true
+            || !trust.ownerHistoryCheckpoint || trust.signedDeviceGrant.revoked_at_epoch !== null) fail();
+          await window.RootarkZk1NormalBrowserTrustFloor.assertCurrent({
+            ownerPublicKey: trust.ownerPublicKey,
+            independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+            pinnedCurrentHead: trust.pinnedCurrentHead,
+            signedDeviceGrant: trust.signedDeviceGrant,
+            ownerHistoryCheckpoint: trust.ownerHistoryCheckpoint,
+            previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
+          });
+          assertLive();
+          const entries = await selectedLegacyBatch(assertLive);
+          secret = await fileBytes("migration-batch-secret", 32, 32);
+          assertLive();
+          const journal = await window.RootarkZk1LegacyMigrationWorkflow.openMigrationJournal();
+          try {
+            assertLive();
+            const result = await window.RootarkZk1LegacyBatchMigration.runLegacyMigrationBatch({
+              optIn: true, entries, migrationSecret: secret,
+              trust: { ...trust, devicePublicKey, devicePrivateKey },
+              origin: location.origin + "/", fetchImpl: guardedFetch,
+              journal, nowSeconds: Math.floor(Date.now() / 1000),
+            });
+            assertLive();
+            if (result.canDeleteLegacy !== false || result.authorizesCutover !== false
+              || result.total !== entries.length || result.results.length !== entries.length
+              || result.results.some((entry) => entry.canDeleteLegacy !== false
+                || entry.authorizesCutover !== false)) fail();
+            const report = { schema: "rootark-zk1-legacy-version-batch-report/v1",
+              ...result, requiresIndependentOwnerCheckpoint: true,
+              productionAuthorized: false };
+            downloadLocal("rootark-legacy-version-batch-report.json",
+              JSON.stringify(report), "application/json", assertLive);
+            status("Versões conferidas localmente: " + result.verified + "/" + result.total
+              + ". Relatório baixado; cada falha exige revisão manual. Originais mantidos, sem exclusão/cutover e sem prova de durabilidade externa.");
+          } finally { journal.close(); }
+        } else if (action === "restore") {
           secret = await fileBytes("secret", 32, 32);
           const bundle = JSON.parse(decoder.decode(await fileBytes("bundle", 1, 6 * 1024 * 1024)));
           const checkpoint = await optionalJson("owner-root");
@@ -615,6 +719,7 @@
       for (const item of archiveFiles || []) item.data.fill(0);
       // The original File/Blob remains held by the input until explicitly reset.
       for (const name of ["private", "file", "secret", "bundle", "migration-cek", "migration-proof",
+        "migration-batch-descriptors", "migration-batch-ceks", "migration-batch-secret",
         "archive-files", "archive-owner-private", "archive-json"]) {
         const control = field(name);
         if (control) control.value = "";
