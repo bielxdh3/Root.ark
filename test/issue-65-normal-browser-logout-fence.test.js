@@ -6,9 +6,12 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const z = require("../src/crypto/rootark-zk-1");
 
 const source = fs.readFileSync(path.join(__dirname,
   "../public/client/rootark-zk1-authenticated-workspace.js"), "utf8");
+const relaySource = fs.readFileSync(path.join(__dirname,
+  "../public/client/rootark-zk1-browser-authority-head-relay.js"), "utf8");
 const encode = (value) => Buffer.from(value).toString("base64url");
 const tickUntil = async (condition) => {
   for (let attempt = 0; attempt < 200; attempt++) {
@@ -175,14 +178,16 @@ async function harness() {
   class BrowserURL extends URL {}
   BrowserURL.createObjectURL = (blob) => { selectedBlob = blob; return "blob:fixture"; };
   BrowserURL.revokeObjectURL = () => {};
-  vm.runInNewContext(source, {
+  const context = vm.createContext({
     window, document, location: { origin: "https://localhost" },
     crypto: crypto.webcrypto, URL: BrowserURL, Blob, Headers,
     fetch: (...args) => onIndependentFetch
       ? onIndependentFetch(...args) : Promise.reject(Error("NO_INDEPENDENT_FETCH")),
     TextEncoder, TextDecoder, Uint8Array, ArrayBuffer, atob, btoa,
     setTimeout: (callback, delay) => delay === 60000 ? 0 : setTimeout(callback, delay),
+    clearTimeout, AbortController,
   });
+  vm.runInContext(source, context);
   listeners.get("rootark:workspace-rendered")();
   await tickUntil(() => Boolean(window.button));
   await window.button.click();
@@ -238,6 +243,10 @@ async function harness() {
   return {
     document, dialog, downloads, field, file, listeners, window,
     trace,
+    loadBrowserRelay() {
+      vm.runInContext(relaySource, context);
+      window.RootarkZk1BrowserAuthorityHeadRelay = context.RootarkZk1BrowserAuthorityHeadRelay;
+    },
     setIndependentFetch(callback) { onIndependentFetch = callback; },
     setDownloadHook(callback) { onDownload = callback; },
     click(action) { dialog.events.click({
@@ -748,8 +757,11 @@ async function configureCatalogWriter(page, { delayedPut = false } = {}) {
           assert.equal(writes.length, 1);
           assert.equal(writes[0].ciphertext.length, 120);
           steps.push("journal");
-          await input.ownerWitnessProbe({ scope: fixtureGrant, nonce: crypto.randomBytes(32) });
-          await input.catalogProbe({ scope: fixtureGrant, nonce: crypto.randomBytes(32) });
+          const scope = Object.assign(Object.create(null),
+            Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+              .map((name) => [name, fixtureGrant[name]])));
+          await input.ownerWitnessProbe({ scope, nonce: crypto.randomBytes(32) });
+          await input.catalogProbe({ scope, nonce: crypto.randomBytes(32) });
           return encode(crypto.randomBytes(32));
         },
         async commit(additions, journalId) {
@@ -781,7 +793,7 @@ async function configureCatalogWriter(page, { delayedPut = false } = {}) {
       return { id: request.id, revision: 1 };
     },
   };
-  return { steps, getFinishPut: () => finishPut };
+  return { steps, getFinishPut: () => finishPut, witness, cas, fixtureGrant };
 }
 
 test("catalog publish opt-in invokes durable journal before signed PUT and authenticated commit", async () => {
@@ -802,6 +814,99 @@ test("catalog publish denies forged independent signer pin before journal or PUT
   page.click("catalog-publish");
   await page.denied();
   assert.equal(steps.length, 0);
+});
+
+async function configureSignedRelay(page, setup, attack = null) {
+  const { witness, cas, fixtureGrant } = setup;
+  page.field("catalog-relay-opt-in").checked = true;
+  page.field("catalog-witness-url").value = "";
+  page.field("catalog-cas-url").value = "";
+  page.loadBrowserRelay();
+  const sign = async (statement, kind, signer) => z.encodeDeterministic({
+    ...statement, signature: crypto.sign(null, Buffer.concat([
+      Buffer.from(kind === "witness"
+        ? "Root.ark/zk-1/recovery-witness-head/v1\0"
+        : "Root.ark/zk-1/opaque-catalog-cas/v1\0"),
+      Buffer.from(await z.encodeDeterministic(statement)),
+    ]), signer),
+  });
+  let calls = 0;
+  page.setIndependentFetch(async (url, init) => {
+    calls++;
+    const kind = url.endsWith("/witness-head") ? "witness" : "cas";
+    assert.equal(url, "https://localhost/zk-1/v1/catalog/authority/"
+      + (kind === "witness" ? "witness-head" : "cas-head"));
+    assert.equal(init.method, "POST");
+    assert.equal(init.mode, "same-origin");
+    assert.equal(init.credentials, "same-origin");
+    assert.equal(init.headers.get("x-csrf-token"), "original-session");
+    assert.equal(JSON.stringify(JSON.parse(init.body)), init.body);
+    const request = JSON.parse(init.body);
+    assert.deepEqual(Object.keys(request), ["nonce"]);
+    const nonce = Buffer.from(request.nonce, "base64url");
+    assert.equal(nonce.length, 32);
+    const scope = Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+      .map((field) => [field, Buffer.from(fixtureGrant[field], "base64url")]));
+    const now = Math.floor(Date.now() / 1000);
+    const witnessStatement = { type: "rootark-recovery-witness-head/v1",
+      witness_key_id: Buffer.from(page.field("catalog-witness-id").value, "base64url"),
+      ...scope, current_revision: 1, current_manifest_digest: crypto.randomBytes(32),
+      witness_sequence: 1, nonce, observed_at: now,
+      status: "committed", pending_reservation_id: null };
+    const casStatement = { type: "rootark-zk1-opaque-catalog-cas/v1",
+      ...scope, sequence: 0, digest: Buffer.alloc(32), nonce, observed_at: now };
+    const statement = kind === "witness" ? witnessStatement : casStatement;
+    if (attack === "wrong-scope") statement.keyring_id = crypto.randomBytes(16);
+    if (attack === "stale") statement.observed_at -= 120;
+    if (attack === "wrong-nonce") statement.nonce = crypto.randomBytes(32);
+    if (attack === "pending" && kind === "witness") statement.status = "pending";
+    const signer = attack === "forged-signature" ? crypto.generateKeyPairSync("ed25519").privateKey
+      : kind === "witness" ? witness.privateKey : cas.privateKey;
+    const proof = await sign(statement, kind, signer);
+    return new Response(JSON.stringify(kind === "witness"
+      ? { receiptBase64: encode(proof) } : { proofBase64: encode(proof) }),
+    { status: 200, headers: { "content-type": "application/json" } });
+  });
+  return () => calls;
+}
+
+test("catalog writer uses authenticated mTLS relay with externally pinned signed heads", async () => {
+  const page = await harness();
+  const setup = await configureCatalogWriter(page);
+  const calls = await configureSignedRelay(page, setup);
+  page.click("catalog-publish");
+  await tickUntil(() => page.field("status").textContent.includes("Catálogo completo #1")
+    || page.field("status").textContent.includes("Operação recusada"));
+  assert.equal(page.field("status").textContent.includes("Catálogo completo #1"), true,
+    "relay browser publish failed after " + calls()
+      + " probes; steps=" + setup.steps.join(","));
+  assert.equal(calls(), 2);
+  assert.deepEqual(setup.steps, ["create-client", "journal", "sign-put", "put", "commit"]);
+  assert.equal(page.field("catalog-write-journal").textContent.length, 43);
+});
+
+for (const attack of ["wrong-scope", "wrong-nonce", "stale", "pending", "forged-signature"])
+  test("catalog writer relay refuses " + attack + " before signed PUT", async () => {
+    const page = await harness();
+    const setup = await configureCatalogWriter(page);
+    await configureSignedRelay(page, setup, attack);
+    page.click("catalog-publish");
+    await page.denied();
+    assert.equal(setup.steps.includes("sign-put"), false);
+    assert.equal(setup.steps.includes("put"), false);
+    assert.equal(setup.steps.includes("commit"), false);
+    assert.equal(page.downloads.length, 0);
+  });
+
+test("catalog writer relay denies forged offline key pin before any journal or HTTP", async () => {
+  const page = await harness();
+  const setup = await configureCatalogWriter(page);
+  const calls = await configureSignedRelay(page, setup);
+  page.field("catalog-cas-spki").value = encode(crypto.randomBytes(32));
+  page.click("catalog-publish");
+  await page.denied();
+  assert.equal(calls(), 0);
+  assert.equal(setup.steps.length, 0);
 });
 
 for (const mode of ["logout", "csrf"]) test("catalog publish fences " + mode

@@ -691,7 +691,9 @@
       + 'O catálogo completo anterior é lido e autenticado, preservando todas as versões e aceitando apenas inclusão. '
       + 'Após PUT, GET exato assinado e CAS, anote sequência e digest retornados em canal externo para os dois dispositivos. '
       + 'As URLs independentes respondem a POST JSON {scope,nonceBase64} com CBOR Ed25519 application/cbor; '
-      + 'elas não podem ser o servidor Root.ark nem compartilhar origem entre si. Prova de nuvem/host físico não é inferida.</p>'
+      + 'elas não podem ser o servidor Root.ark nem compartilhar origem entre si. '
+      + 'Opcionalmente, o relay autenticado Root.ark transporta provas assinadas dos serviços mTLS configurados. '
+      + 'Pins de assinatura continuam vindo de fora do servidor. Prova de nuvem/host físico não é inferida.</p>'
       + '<label>Versão ciphertext local (.bin)<input type="file" data-zk1-field="catalog-write-ciphertext" accept=".bin,.ciphertext,application/octet-stream"></label>'
       + '<label>Nome privado (cifrado no cliente, 1–220 bytes UTF-8)<input data-zk1-field="catalog-write-name" maxlength="220" autocomplete="off" spellcheck="false"></label>'
       + '<label>Object ID opaco (base64url 16 bytes, vazio gera ID novo)<input data-zk1-field="catalog-write-id" maxlength="22" autocomplete="off" spellcheck="false"></label>'
@@ -701,6 +703,7 @@
       + '<label>SHA-256 SPKI do witness (base64url, pin offline)<input data-zk1-field="catalog-witness-spki" maxlength="43" spellcheck="false"></label>'
       + '<label>URL de consulta direta ao witness independente (HTTPS POST)<input type="url" data-zk1-field="catalog-witness-url" spellcheck="false"></label>'
       + '<label>URL de consulta direta ao CAS independente (HTTPS POST)<input type="url" data-zk1-field="catalog-cas-url" spellcheck="false"></label>'
+      + '<label><input type="checkbox" data-zk1-field="catalog-relay-opt-in"> Usar relay autenticado Root.ark para obter provas assinadas do witness e CAS independentes via mTLS (dispensa URLs diretas).</label>'
       + '<label>Sequência mínima do CAS fixada offline (0 para novo catálogo)<input type="number" min="0" max="128" step="1" data-zk1-field="catalog-write-sequence"></label>'
       + '<label>Digest mínimo do CAS fixado offline (base64url; 32 bytes, zero no início)<input data-zk1-field="catalog-write-digest" maxlength="43" spellcheck="false"></label>'
       + '<label><input type="checkbox" data-zk1-field="catalog-write-opt-in"> Confirmo ciphertext local, grants V2 ativos e autoridade CAS/witness independente; autorizo somente PUT e commit aditivo.</label>'
@@ -985,21 +988,39 @@
           || !window.RootarkZk1ProtectedHttpClient?.signProtectedContentOperation
           || !window.RootarkZk1ProtectedHttpClient?.postProtectedCiphertextPut) fail();
         const rootOrigin = location.origin;
-        const witnessUrl = independentCatalogEndpoint(field("catalog-witness-url").value.trim(), rootOrigin);
-        const casUrl = independentCatalogEndpoint(field("catalog-cas-url").value.trim(), rootOrigin);
-        if (witnessUrl.origin === casUrl.origin) fail();
+        const relayOptIn = field("catalog-relay-opt-in")?.checked === true;
+        let witnessUrl, casUrl;
+        if (!relayOptIn) {
+          witnessUrl = independentCatalogEndpoint(field("catalog-witness-url").value.trim(), rootOrigin);
+          casUrl = independentCatalogEndpoint(field("catalog-cas-url").value.trim(), rootOrigin);
+          if (witnessUrl.origin === casUrl.origin) fail();
+        }
         const signerGrant = JSON.parse(decoder.decode(await fileBytes("catalog-signer-grant", 1, 8192)));
         const witnessRaw = await fileBytes("catalog-witness-key", 32, 32);
         const casRaw = await fileBytes("catalog-cas-key", 32, 32);
         const writerKeyRaw = await fileBytes("catalog-write-key", 32, 32);
-        let witnessKey, casKey, metadataKey;
+        let witnessKey, casKey, metadataKey, relayProbes;
         try {
-          witnessKey = await importPinnedCatalogAuthority(witnessRaw,
-            from64(field("catalog-witness-spki").value.trim()));
-          casKey = await importPinnedCatalogAuthority(casRaw,
-            from64(field("catalog-cas-spki").value.trim()));
+          const witnessPin = from64(field("catalog-witness-spki").value.trim());
+          const casPin = from64(field("catalog-cas-spki").value.trim());
+          witnessKey = await importPinnedCatalogAuthority(witnessRaw, witnessPin);
+          casKey = await importPinnedCatalogAuthority(casRaw, casPin);
           metadataKey = await crypto.subtle.importKey("raw", writerKeyRaw,
             { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+          if (relayOptIn) {
+            if (!window.RootarkZk1BrowserAuthorityHeadRelay)
+              await loadScript("rootark-zk1-browser-authority-head-relay");
+            assertLive();
+            if (!window.RootarkZk1BrowserAuthorityHeadRelay?.createProbes) fail();
+            relayProbes = await window.RootarkZk1BrowserAuthorityHeadRelay.createProbes({
+              origin: rootOrigin + "/", fetchImpl: guardedFetch, assertLive,
+              csrfToken: () => { assertLive(); return initialCsrf; },
+              ownerWitnessKeyRaw: witnessRaw, ownerWitnessSpkiSha256: witnessPin,
+              ownerWitnessKeyId: signerIdFrom64(field("catalog-witness-id").value.trim()),
+              catalogAuthorityKeyRaw: casRaw, catalogAuthoritySpkiSha256: casPin,
+            });
+            assertLive();
+          }
         } finally { witnessRaw.fill(0); casRaw.fill(0); writerKeyRaw.fill(0); }
         assertLive();
         const privateRaw = await fileBytes("private", 1, 8192);
@@ -1042,9 +1063,11 @@
           signedDeviceGrant: trust.signedDeviceGrant, devicePublicKey, devicePrivateKey,
           signerGrants, ownerWitnessPublicKey: witnessKey,
           ownerWitnessKeyId: signerIdFrom64(field("catalog-witness-id").value.trim()),
-          ownerWitnessProbe: independentCatalogProbe(witnessUrl, assertLive),
+          ownerWitnessProbe: relayOptIn ? relayProbes.ownerWitnessProbe
+            : independentCatalogProbe(witnessUrl, assertLive),
           catalogAuthorityPublicKey: casKey,
-          catalogProbe: independentCatalogProbe(casUrl, assertLive),
+          catalogProbe: relayOptIn ? relayProbes.catalogProbe
+            : independentCatalogProbe(casUrl, assertLive),
           minimumCatalogHead: { sequence, digest: catalogFloor },
           csrfToken: () => { assertLive(); return initialCsrf; },
           isSessionCurrent: () => {
