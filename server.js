@@ -77,6 +77,7 @@ const { createAuthenticate, createRealtimeAuthenticator, getClientIp, getExpecte
 const { getTrustedClientIp, parseTrustedProxies } = require("./src/middlewares/trustedProxies");
 const { createRealtimeUpgradeGuard } = require("./src/realtime/upgradeGuard");
 const { createRequirePermission } = require("./src/middlewares/permissions");
+const { parseIndependentCatalogConnectOrigins } = require("./src/zk1-catalog-connect-csp");
 const { isTotpRequired, validateTotpPolicy } = require("./src/services/totpPolicy");
 const { getDeploymentReadiness, isSessionCookieSecure, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
 const { createWebDavCredentialCache } = require("./src/services/webdavCredentialCache");
@@ -5943,16 +5944,23 @@ const APP_CONTENT_SECURITY_POLICY = [
   "form-action 'self'",
   "frame-ancestors 'self'",
 ].join("; ");
+const independentCatalogConnectOrigins = parseIndependentCatalogConnectOrigins(
+  process.env.ROOTARK_ZK1_INDEPENDENT_CATALOG_CONNECT_ORIGINS);
+const WORKSPACE_CONTENT_SECURITY_POLICY = independentCatalogConnectOrigins.length
+  ? APP_CONTENT_SECURITY_POLICY.replace("connect-src 'self' ws: wss:",
+    `connect-src 'self' ws: wss: ${independentCatalogConnectOrigins.join(" ")}`)
+  : APP_CONTENT_SECURITY_POLICY;
 app.use((req, res, next) => {
   // The opt-in development-only emergency package uses Argon2id from
   // libsodium's WebAssembly build. Permit WASM compilation on that single
   // page, not unrestricted JS eval and never on legacy application pages.
   const devVaultWasm = process.env.ROOTARK_ZK_DEV_VAULT_ENABLED === "true"
     && NODE_ENV !== "production" && req.path === "/zk-dev-vault.html";
+  const isWorkspace = req.path === "/" || req.path === "/index.html";
   res.setHeader("Content-Security-Policy", devVaultWasm
     ? APP_CONTENT_SECURITY_POLICY.replace("script-src 'self'",
       "script-src 'self' 'wasm-unsafe-eval'")
-    : APP_CONTENT_SECURITY_POLICY);
+    : isWorkspace ? WORKSPACE_CONTENT_SECURITY_POLICY : APP_CONTENT_SECURITY_POLICY);
   res.setHeader("X-Frame-Options", "SAMEORIGIN");
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "same-origin");
