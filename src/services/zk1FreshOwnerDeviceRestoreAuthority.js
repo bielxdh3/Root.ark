@@ -60,7 +60,7 @@ function pinnedKey(value) {
 }
 async function verifyFreshOwnerDeviceRestoreAuthority({
   signedDeviceGrant, pinnedOwnerPublicKey, fetchSignedCurrentDeviceState,
-  scope, operation, ownerHead, nowSeconds = Math.floor(Date.now() / 1000),
+  scope, operation, ownerHead, nowSeconds,
 } = {}) {
   try {
     const owner = pinnedKey(pinnedOwnerPublicKey);
@@ -103,7 +103,12 @@ async function verifyFreshOwnerDeviceRestoreAuthority({
       || state.state !== "ACTIVE" || state.nonce !== nonce) deny();
     const issued = number(state.issued_at);
     const expires = number(state.expires_at, issued + 1);
-    const now = number(nowSeconds);
+    // Evaluate time after the asynchronous status fetch, not on method
+    // entry. A provider may withhold a valid, short-lived owner signature
+    // until it has expired, while keeping the request itself in flight.
+    const clock = nowSeconds === undefined ? () => Math.floor(Date.now() / 1000)
+      : typeof nowSeconds === "function" ? nowSeconds : () => nowSeconds;
+    const now = number(clock());
     if (issued > now + 2 || expires < now || expires - issued > 15) deny();
     const bytes = signingBytes(STATUS_DOMAIN, STATE_FIELDS,
       Object.fromEntries(STATE_FIELDS.map((field) => [field, state[field]])));
@@ -112,6 +117,10 @@ async function verifyFreshOwnerDeviceRestoreAuthority({
       Buffer.from(opId, "base64url"), Buffer.from(grant.signature, "base64url")]);
     if (!await crypto.webcrypto.subtle.verify("Ed25519", devicePublic,
       b64(answer.deviceProofOfPossession, 64), pop)) deny();
+    // Crypto verification is asynchronous too; never authorize using a
+    // status that expired while Ed25519/WebCrypto work was finishing.
+    const completedAt = number(clock());
+    if (expires < completedAt || issued > completedAt + 2) deny();
     return Object.freeze({ signedOwnerStateVerified: true,
       currentDevicePossessionVerified: true, nonceBoundCurrentRevocationChecked: true,
       externalOwnerAuthorityCustodyProven: false, authorizesIo: false,

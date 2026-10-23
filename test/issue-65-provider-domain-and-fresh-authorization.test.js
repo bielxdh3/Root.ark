@@ -111,8 +111,10 @@ test("fresh owner+device signed nonce binds current grant and rejects replay, ex
       manifest_digest: challenge.manifestDigest,
       current_epoch: challenge.currentEpoch,
       state: attack === "revoked" ? "REVOKED" : "ACTIVE", nonce: challenge.nonce,
-      issued_at: attack === "expired" ? now - 30 : now - 1,
-      expires_at: attack === "expired" ? now - 20 : now + 9 };
+      issued_at: attack === "expired" ? now - 30
+        : attack === "delayed" ? Math.floor(Date.now() / 1000) - 1 : now - 1,
+      expires_at: attack === "expired" ? now - 20
+        : attack === "delayed" ? Math.floor(Date.now() / 1000) + 1 : now + 9 };
     const signature = ownerSign(STATUS_DOMAIN, STATE_FIELDS, fields);
     const pop = Buffer.concat([POP_DOMAIN, Buffer.from(challenge.nonce, "base64url"),
       Buffer.from(challenge.operationId, "base64url"),
@@ -121,6 +123,7 @@ test("fresh owner+device signed nonce binds current grant and rejects replay, ex
       deviceProofOfPossession: b64(crypto.sign(null, pop, deviceKeys.privateKey)) };
     if (attack === "replay" && retained) return retained;
     if (!retained) retained = answer;
+    if (attack === "delayed") await new Promise((resolve) => setTimeout(resolve, 2200));
     return answer;
   };
   const assertCurrent = () => verifyFreshOwnerDeviceRestoreAuthority({
@@ -133,6 +136,12 @@ test("fresh owner+device signed nonce binds current grant and rejects replay, ex
     attack = mode;
     await assert.rejects(assertCurrent(), /ZK_FRESH_RESTORE_DEVICE_UNVERIFIED/, mode);
   }
+  attack = "delayed";
+  await assert.rejects(verifyFreshOwnerDeviceRestoreAuthority({
+    signedDeviceGrant: signedGrant, pinnedOwnerPublicKey: ownerPublic,
+    fetchSignedCurrentDeviceState: fetch, scope: trusted, operation: op, ownerHead,
+  }), /ZK_FRESH_RESTORE_DEVICE_UNVERIFIED/,
+  "owner-signed ACTIVE must expire during a delayed provider response");
   attack = null;
   await assert.rejects(verifyFreshOwnerDeviceRestoreAuthority({
     signedDeviceGrant: { ...signedGrant, device_id: "cloned-device" },
