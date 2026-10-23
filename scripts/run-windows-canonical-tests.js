@@ -8,22 +8,69 @@ const { getNpmInvocation, canonicalTestArgs } = require("./release-gate-environm
 const HEARTBEAT_MS = 60_000;
 const IDLE_LIMIT_MS = 15 * 60_000;
 const TOTAL_LIMIT_MS = 55 * 60_000;
+const SAFE_CODES = new Set(["ERR_ASSERTION", "ERR_TEST_FAILURE", "SQLITE_BUSY",
+  "SQLITE_LOCKED", "ENOENT", "EACCES", "EPERM", "EADDRINUSE", "ETIMEDOUT",
+  "ECONNRESET", "ERR_DLOPEN_FAILED", "MODULE_NOT_FOUND", "ERR_MODULE_NOT_FOUND"]);
+const SAFE_FAILURE_TYPES = new Set(["testCodeFailure", "hookFailed", "cancelledByParent",
+  "uncaughtException", "unhandledRejection", "subtestsFailed"]);
+const hash = (value) => createHash("sha256").update(value).digest("hex").slice(0, 24);
+function categoryFor(code) {
+  if (code === "ERR_ASSERTION") return "assertion";
+  if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(code)) return "sqlite_busy";
+  if (["ENOENT", "EACCES", "EPERM", "EADDRINUSE"].includes(code)) return "filesystem";
+  if (["ETIMEDOUT", "ECONNRESET"].includes(code)) return "network_timeout";
+  if (["ERR_DLOPEN_FAILED", "MODULE_NOT_FOUND", "ERR_MODULE_NOT_FOUND"].includes(code)) return "dependency";
+  if (code === "ERR_TEST_FAILURE") return "runtime";
+  return "unknown";
+}
 
 function createTapProgressRecorder(write) {
   const state = { results: 0, failures: 0, plan: false, tests: null, reportedFailures: null };
+  const categories = { assertion: 0, sqlite_busy: 0, filesystem: 0,
+    network_timeout: 0, dependency: 0, runtime: 0, unknown: 0 };
+  let pending = null;
+  let detailed = 0;
+  const finish = () => {
+    if (!pending) return;
+    const category = categoryFor(pending.code);
+    categories[category]++;
+    if (detailed < 12) {
+      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}`);
+      detailed++;
+    }
+    pending = null;
+  };
   return {
     state,
+    finish,
+    safeSummary() {
+      return `failureCategories=${Object.entries(categories).map(([name, count]) => `${name}=${count}`).join(",")} pending=${pending ? 1 : 0} details=${detailed}`;
+    },
     accept(line) {
       const result = /^(ok|not ok) ([1-9]\d{0,8}) - (.{1,4096})$/.exec(line);
       if (result) {
+        finish();
         state.results += 1;
         if (result[1] === "not ok") {
           state.failures += 1;
-          const nameHash = createHash("sha256").update(result[3]).digest("hex").slice(0, 24);
+          const nameHash = hash(result[3]);
           write(`FAIL test result index=${result[2]} nameSha256=${nameHash}`);
+          pending = { index: result[2], nameHash, pathHash: "none",
+            failureType: "unknown", code: "unknown" };
         } else if (state.results % 100 === 0) {
           write(`Windows canonical progress: ${state.results} TAP results, ${state.failures} failed`);
         }
+      }
+      if (pending) {
+        const location = /^  location: ['"](.{1,2048})['"]$/.exec(line);
+        if (location) {
+          const file = /(?:^|[\\/]+)test[\\/]+([A-Za-z0-9._-]{1,160}\.test\.js):\d+:\d+$/.exec(location[1]);
+          if (file) pending.pathHash = hash(`test/${file[1]}`);
+        }
+        const kind = /^  failureType: '([A-Za-z]{1,40})'$/.exec(line);
+        if (kind && SAFE_FAILURE_TYPES.has(kind[1])) pending.failureType = kind[1];
+        const code = /^  code: '([A-Z0-9_]{1,40})'$/.exec(line);
+        if (code && SAFE_CODES.has(code[1])) pending.code = code[1];
       }
       if (/^1\.\.\d+$/.test(line)) state.plan = true;
       const tests = /^# tests (\d+)$/.exec(line);
@@ -75,7 +122,8 @@ function run() {
   function terminate(reason) {
     if (timedOut) return;
     timedOut = true;
-    console.error(`FAIL Windows canonical test ${reason}; TAP results=${tracker.state.results}, failures=${tracker.state.failures}`);
+    tracker.finish();
+    console.error(`FAIL Windows canonical test ${reason}; TAP results=${tracker.state.results}, failures=${tracker.state.failures}; ${tracker.safeSummary()}`);
     if (process.platform === "win32" && child.pid) {
       const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
       killer.on("error", () => child.kill());
@@ -88,7 +136,7 @@ function run() {
   const heartbeat = setInterval(() => {
     const elapsed = Math.floor((Date.now() - started) / 1000);
     const idle = Math.floor((Date.now() - lastOutput) / 1000);
-    console.log(`Windows canonical heartbeat: elapsedSeconds=${elapsed} idleSeconds=${idle} TAPresults=${tracker.state.results} failures=${tracker.state.failures}`);
+    console.log(`Windows canonical heartbeat: elapsedSeconds=${elapsed} idleSeconds=${idle} TAPresults=${tracker.state.results} failures=${tracker.state.failures} ${tracker.safeSummary()}`);
     if (idle * 1000 >= IDLE_LIMIT_MS) terminate("idle timeout (15 minutes without child output)");
     else if (elapsed * 1000 >= TOTAL_LIMIT_MS) terminate("total timeout (55 minutes)");
   }, HEARTBEAT_MS);
@@ -96,9 +144,10 @@ function run() {
   child.on("error", () => { spawnFailed = true; });
   child.on("close", (code, signal) => {
     clearInterval(heartbeat);
+    tracker.finish();
     const { results, failures, plan, tests, reportedFailures } = tracker.state;
     const passed = !timedOut && !spawnFailed && code === 0 && !signal && plan && tests !== null && reportedFailures === 0 && failures === 0;
-    console.log(`${passed ? "PASS" : "FAIL"} Windows canonical suite: exit=${code ?? "unknown"} signal=${signal ? "present" : "none"} TAPresults=${results} tests=${tests ?? "unknown"} failures=${failures} stderrBytes=${stderrBytes}`);
+    console.log(`${passed ? "PASS" : "FAIL"} Windows canonical suite: exit=${code ?? "unknown"} signal=${signal ? "present" : "none"} TAPresults=${results} tests=${tests ?? "unknown"} failures=${failures} stderrBytes=${stderrBytes} ${tracker.safeSummary()}`);
     if (!passed) process.exitCode = 1;
   });
 }

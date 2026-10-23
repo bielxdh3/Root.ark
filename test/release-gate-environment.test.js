@@ -41,6 +41,48 @@ test("streaming Windows canonical runner reports progress without revealing test
   assert.doesNotMatch(logged.join("\n"), /fixture secret|passing test/);
 });
 
+test("canonical runner summarizes bounded failure categories, test path hashes and safe error codes", () => {
+  const output = [];
+  const recorder = createTapProgressRecorder((value) => output.push(value));
+  const secret = "superSecretTokenValue";
+  recorder.accept(`not ok 15 - password=${secret}`);
+  recorder.accept(`  location: 'C:\\runner\\test\\issue-65-durable-witness-ledger.test.js:72:1'`);
+  recorder.accept("  failureType: 'testCodeFailure'");
+  recorder.accept(`  error: '${secret}'`);
+  recorder.accept("  code: 'SQLITE_BUSY'");
+  recorder.accept("ok 16 - another test");
+  recorder.accept("not ok 17 - private test title");
+  recorder.accept("  failureType: 'testCodeFailure'");
+  recorder.accept("  code: 'ERR_ASSERTION'");
+  recorder.finish();
+  assert.equal(recorder.state.failures, 2);
+  const diagnostic = output.join("\n") + " " + recorder.safeSummary();
+  assert.match(diagnostic, /testPathSha256=[0-9a-f]{24}/);
+  assert.match(diagnostic, /code=SQLITE_BUSY/);
+  assert.match(diagnostic, /code=ERR_ASSERTION/);
+  assert.match(diagnostic, /sqlite_busy=1/);
+  assert.match(diagnostic, /assertion=1/);
+  assert.doesNotMatch(diagnostic, /superSecretTokenValue|private test title|issue-65-durable-witness-ledger|C:\\runner/);
+});
+
+test("canonical runner ignores arbitrary error data, unsafe codes and bounds diagnostic output", () => {
+  const logged = [];
+  const recorder = createTapProgressRecorder((value) => logged.push(value));
+  for (let i = 1; i <= 25; i++) {
+    recorder.accept(`not ok ${i} - Bearer verySensitiveCredential${i}`);
+    recorder.accept("  failureType: 'testCodeFailure'");
+    recorder.accept("  code: 'SECRET_API_KEY_99'");
+    recorder.accept("  location: 'C:\\top-secret\\test\\not-a-test.js:10:2'");
+  }
+  recorder.finish();
+  assert.equal(recorder.state.failures, 25);
+  const joined = logged.join("\n") + recorder.safeSummary();
+  assert.doesNotMatch(joined, /SECRET_API_KEY_99|verySensitiveCredential|top-secret|not-a-test/);
+  assert.match(joined, /unknown=25/);
+  assert.ok(logged.filter((line) => line.startsWith("FAIL detail ")).length <= 12);
+  assert.ok(recorder.safeSummary().length < 400);
+});
+
 test("release gate uses native npm instead of inherited Windows cmd on Linux", () => {
   assert.deepEqual(getNpmInvocation(["test"], { platform: "linux", comSpec: "C:\\Windows\\System32\\cmd.exe" }), {
     executable: "npm",
