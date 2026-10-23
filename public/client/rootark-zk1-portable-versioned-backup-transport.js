@@ -1,11 +1,12 @@
 (function (root, factory) {
   if (typeof module === "object" && module.exports) {
-    module.exports = factory(require("./rootark-zk1-browser-versioned-archive"));
+    module.exports = factory(require("./rootark-zk1-browser-versioned-archive"),
+      require("./rootark-zk1-browser-catalog"));
   } else {
     root.RootarkZk1PortableVersionedBackupTransport = factory(
-      root.RootarkZk1BrowserVersionedArchive);
+      root.RootarkZk1BrowserVersionedArchive, root.RootarkZk1BrowserCatalog);
   }
-}(typeof globalThis === "object" ? globalThis : this, function (versioned) {
+}(typeof globalThis === "object" ? globalThis : this, function (versioned, catalog) {
   "use strict";
 
   // DEV owner-held V2 transfer. The storage adapter is an untrusted,
@@ -154,6 +155,51 @@
       deny();
     } finally { raw?.fill(0); pin?.fill(0); recoverySecret?.fill(0); }
   }
+  async function recoverPortableVersionedBackupWithSignedCatalog(input) {
+    let recovered;
+    try {
+      exact(input, ["archivePin", "provider", "recoveryInput",
+        "verifiedAuthority", "assertLive", "catalogInput"]);
+      if (!catalog?.openCatalog || !catalog?.assertVersionedArchiveMatchesCatalog
+        || !input.catalogInput || input.catalogInput.assertLive !== input.assertLive) deny();
+      // Require an authenticated signed CAS/catalog preflight BEFORE the
+      // remote archive GET and CEK decryption. A stale owner/catalog pin
+      // cannot cause even an attempted cloud handoff in this opt-in mode.
+      const startingCatalog = await catalog.openCatalog(input.catalogInput);
+      assertLive(input.assertLive);
+      recovered = await recoverPortableVersionedBackup({
+        archivePin: input.archivePin, provider: input.provider,
+        recoveryInput: input.recoveryInput,
+        verifiedAuthority: input.verifiedAuthority, assertLive: input.assertLive,
+      });
+      assertLive(input.assertLive);
+      // Re-probe the same signed CAS head after cloud transfer and decrypt:
+      // a concurrent catalog move must not release an archival CEK set.
+      const verified = await catalog.openCatalog(input.catalogInput);
+      if (startingCatalog.sequence !== verified.sequence
+        || startingCatalog.catalogDigest !== verified.catalogDigest
+        || startingCatalog.totalCount !== verified.totalCount) deny();
+      const crossCheck = await catalog.assertVersionedArchiveMatchesCatalog({
+        catalog: verified, files: recovered.files,
+      });
+      if (crossCheck.signedCatalogCasCoverageVerified !== true
+        || crossCheck.protectedCiphertextReadbackVerified !== true
+        || crossCheck.authorizesCutover !== false) deny();
+      assertLive(input.assertLive);
+      return Object.freeze({ ...recovered, signedCatalogCasCoverageVerified: true,
+        protectedCiphertextReadbackVerified: true, authorizesProductionRestore: false,
+        independentDurabilityProven: false });
+    } catch (_) {
+      // Decrypted historical CEKs remain internal until the ENTIRE signed
+      // catalog and physical GET comparison finishes. No partial release.
+      for (const file of recovered?.files || []) {
+        file.cek?.fill(0);
+        file.ciphertext?.fill(0);
+      }
+      deny();
+    }
+  }
   return Object.freeze({ preparePortableVersionedBackup,
-    publishPreparedVersionedBackup, recoverPortableVersionedBackup });
+    publishPreparedVersionedBackup, recoverPortableVersionedBackup,
+    recoverPortableVersionedBackupWithSignedCatalog });
 }));

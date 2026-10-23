@@ -107,6 +107,10 @@ test("ZK1 opaque catalog: two owner-enrolled device sessions enumerate signed ve
     authenticate, requirePermission: () => (_req, _res, next) => next(),
     resolveTrustedScope: (user) => user.username === "owner" ? scope : null });
   app.use("/client", express.static(path.join(__dirname, "../public/client")));
+  app.get("/owner-archive-opaque", (req, res) => {
+    if (req.get("x-session") !== "authenticated") return res.sendStatus(401);
+    return res.type("application/octet-stream").send(Buffer.from('{"encrypted":true}'));
+  });
   app.get("/edge-catalog-fixture", (_req, res) => res.type("html").send(
     "<!doctype html><html><body>"
     + "<script>window.RootarkZk1NormalBrowserTrustFloor={assertCurrent:async()=>{}};</script>"
@@ -343,6 +347,93 @@ test("ZK1 opaque catalog: two owner-enrolled device sessions enumerate signed ve
     crypto.randomBytes(32)), /ZK_BROWSER_CATALOG_UNVERIFIED/);
   assert.deepEqual(Buffer.from((await browser.getCatalogCiphertext(
     deviceOneSnapshot, 0)).ciphertextBase64, "base64url"), sealed);
+  // This is a real signed, CAS-anchored browser catalog result. The restored
+  // historical archive transport must refuse missing/extra/substituted rows
+  // and a JSON clone of the catalog before returning any client-held CEK.
+  const restoredFiles = [{ objectId: id, objectRevision: 1,
+    metadata: { ...browserScope, object_id: id, epoch: Number(manifest.current_epoch) },
+    ciphertext: Uint8Array.from(sealed), cek: crypto.randomBytes(32) }];
+  assert.equal((await browser.assertVersionedArchiveMatchesCatalog({
+    catalog: deviceOneSnapshot, files: restoredFiles,
+  })).signedCatalogCasCoverageVerified, true);
+  const refuse = (files, snapshot = deviceOneSnapshot) => assert.rejects(
+    browser.assertVersionedArchiveMatchesCatalog({ catalog: snapshot, files }),
+    /ZK_BROWSER_CATALOG_UNVERIFIED/);
+  await refuse(restoredFiles, { ...deviceOneSnapshot });
+  await refuse([]);
+  await refuse([...restoredFiles, restoredFiles[0]]);
+  await refuse([{ ...restoredFiles[0],
+    metadata: { ...restoredFiles[0].metadata, account_id: b64(crypto.randomBytes(16)) } }]);
+  await refuse([{ ...restoredFiles[0], objectRevision: 2 }]);
+  await refuse([{ ...restoredFiles[0], ciphertext: crypto.randomBytes(sealed.length) }]);
+  // Exercise the actual portable transfer integration against this genuine,
+  // signed HTTP catalog/CAS and protected signed GET. The offline archive's
+  // crypto is separately E2E-tested in issue-65-versioned-keyring; here that
+  // verifier is a controlled test seam to observe whether CEKs are released
+  // only after the live catalog comparison (and zeroed on denial).
+  let selectedFiles = restoredFiles.map((item) => ({
+    ...item, ciphertext: Uint8Array.from(item.ciphertext),
+    cek: Uint8Array.from(item.cek),
+  }));
+  let logoutAfterDecrypt = false;
+  browserContext.RootarkZk1BrowserVersionedArchive = {
+    async recoverArchive() {
+      if (logoutAfterDecrypt) activeSession = false;
+      return { files: selectedFiles, completeRelativeToPinnedInventory: true,
+        revisionAncestryVerified: true, authorizesProductionRestore: false };
+    },
+  };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-portable-versioned-backup-transport.js"),
+  "utf8"), browserContext);
+  vm.runInNewContext("globalThis.__recoverCloudArchive = (params) => "
+    + "RootarkZk1PortableVersionedBackupTransport."
+    + "recoverPortableVersionedBackupWithSignedCatalog({...params})", browserContext);
+  const liveGuard = () => {
+    if (!activeSession || csrfValue !== "first") throw Error("session expired");
+  };
+  const catalogInput = { ...browserInput(1),
+    devicePrivateKey: await privateFor(1), assertLive: liveGuard };
+  const recoveryInput = { recoverySecret: crypto.randomBytes(32),
+    independentOwnerSpkiSha256: crypto.randomBytes(32), signerKeyId: crypto.randomBytes(16),
+    scope: browserScope, pinnedCurrentHead: ownerHead };
+  let archiveGets = 0;
+  const portableProvider = { async get() {
+    archiveGets++;
+    const res = await fetch(origin + "/owner-archive-opaque",
+      { headers: { "x-session": activeSession ? "authenticated" : "" } });
+    if (res.status !== 200) throw Error("remote unavailable");
+    return new Uint8Array(await res.arrayBuffer());
+  } };
+  const guarded = (overrides = {}) => browserContext.__recoverCloudArchive({
+    archivePin: crypto.randomBytes(32), provider: portableProvider,
+    recoveryInput, verifiedAuthority: {}, assertLive: liveGuard, catalogInput,
+    ...overrides,
+  });
+  await assert.rejects(guarded({ catalogInput: { ...catalogInput,
+    pinnedCatalogHead: { sequence: 1, digest: b64(crypto.randomBytes(32)) } } }),
+  /ZK_PORTABLE_VERSIONED_BACKUP_DENIED/);
+  assert.equal(archiveGets, 0,
+    "stale external CAS pin must fail before cloud provider receives even a GET");
+  const admitted = await guarded();
+  assert.equal(admitted.signedCatalogCasCoverageVerified, true);
+  assert.equal(admitted.protectedCiphertextReadbackVerified, true);
+  assert.equal(admitted.authorizesProductionRestore, false);
+  for (const item of admitted.files) { item.cek.fill(0); item.ciphertext.fill(0); }
+  selectedFiles = [{ ...restoredFiles[0], objectRevision: 2,
+    ciphertext: Uint8Array.from(sealed), cek: crypto.randomBytes(32) }];
+  await assert.rejects(guarded(), /ZK_PORTABLE_VERSIONED_BACKUP_DENIED/);
+  assert.equal(selectedFiles[0].cek.every((byte) => byte === 0), true,
+    "no historical CEK survives failed signed CAS catalog cross-check");
+  selectedFiles = restoredFiles.map((item) => ({
+    ...item, ciphertext: Uint8Array.from(item.ciphertext), cek: crypto.randomBytes(32),
+  }));
+  logoutAfterDecrypt = true;
+  await assert.rejects(guarded(), /ZK_PORTABLE_VERSIONED_BACKUP_DENIED/);
+  assert.equal(selectedFiles[0].cek.every((byte) => byte === 0), true,
+    "revoked session after decrypt must wipe pending CEKs");
+  activeSession = true;
+  logoutAfterDecrypt = false;
   // Reopening with exactly the same independently pinned current head has no
   // changed page. A second authorized profile has its own independent floor.
   const repeatSnapshot = await browser.openCatalog({
@@ -449,14 +540,22 @@ test("ZK1 opaque catalog: two owner-enrolled device sessions enumerate signed ve
       const name=await RootarkZk1BrowserCatalog.openCatalogName(
         window.__edgeCatalog,0,from64(d.metadataKey));
       const fetched=await RootarkZk1BrowserCatalog.getCatalogCiphertext(window.__edgeCatalog,0);
+      const matched=await RootarkZk1BrowserCatalog.assertVersionedArchiveMatchesCatalog({
+        catalog:window.__edgeCatalog,files:[{objectId:fetched.objectId,
+          objectRevision:fetched.revision,metadata:{account_id:d.ownGrant.account_id,
+            compartment_id:d.ownGrant.compartment_id,keyring_id:d.ownGrant.keyring_id,
+            object_id:fetched.objectId,epoch:d.epoch},
+          ciphertext:from64(fetched.ciphertextBase64),cek:new Uint8Array(32)}]});
       window.__edgeCatalogActive=false;
       let refused=false;try{await RootarkZk1BrowserCatalog.getCatalogCiphertext(window.__edgeCatalog,0)}
       catch(e){refused=e.message==="ZK_BROWSER_CATALOG_UNVERIFIED"}
       return {count:window.__edgeCatalog.totalCount,name,sha:to64(new Uint8Array(
-        await crypto.subtle.digest("SHA-256",from64(fetched.ciphertextBase64)))),refused};
+        await crypto.subtle.digest("SHA-256",from64(fetched.ciphertextBase64)))),
+        matched:matched.signedCatalogCasCoverageVerified,refused};
     })()`);
     assert.deepEqual(edgeResult, { count: 1, name: filename, sha: b64(digest(sealed)),
-      refused: true }, "real Edge must verify and GET with an independent active device");
+      matched: true, refused: true },
+    "real Edge must verify and GET with an independent active device");
   }
   await assert.rejects(browser.openCatalog({
     ...browserInput(1), devicePrivateKey: await privateFor(1),

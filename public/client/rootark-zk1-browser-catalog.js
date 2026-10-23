@@ -469,6 +469,49 @@
         ciphertextBase64: to64(ciphertext) });
     } catch (_) { deny(); }
   }
+  async function assertVersionedArchiveMatchesCatalog(input) {
+    try {
+      exact(input, ["catalog", "files"]);
+      // Only openCatalog can issue this in-process capability after verifying
+      // the device signature, independently pinned signed CAS head, page
+      // digests, signed owner grant and monotonic local catalog floor.
+      const context = genuine.get(input.catalog);
+      if (!context || !Array.isArray(input.files)
+        || input.files.length < 1 || input.files.length !== input.catalog.entries.length
+        || input.files.length > MAX_VERSIONS
+        || Reflect.ownKeys(input.files).length !== input.files.length + 1) deny();
+      const seen = new Set();
+      for (const [index, entry] of input.catalog.entries.entries()) {
+        context.assertLive();
+        const file = input.files[index];
+        if (!file || typeof file !== "object" || !file.metadata
+          || typeof file.metadata !== "object") deny();
+        const key = entry.objectId + ":" + entry.revision;
+        if (seen.has(key) || file.objectId !== entry.objectId
+          || file.objectRevision !== entry.revision
+          || file.metadata.object_id !== file.objectId
+          || file.metadata.epoch !== entry.epoch
+          || file.metadata.account_id !== context.scope.account_id
+          || file.metadata.compartment_id !== context.scope.compartment_id
+          || file.metadata.keyring_id !== context.scope.keyring_id) deny();
+        seen.add(key);
+        const sealed = bytes(file.ciphertext, 16, 4 * 1024 * 1024);
+        if (!equal(await hash(sealed), from64(entry.ciphertextDigestBase64, 32))) deny();
+        // The CAS snapshot alone may describe ciphertext no longer readable
+        // after a failed copy or concurrent deletion. Require a fresh signed,
+        // device-authorized protected GET for EVERY recovered version.
+        const onServer = await getCatalogCiphertext(input.catalog, index);
+        if (onServer.objectId !== file.objectId
+          || onServer.revision !== file.objectRevision
+          || !equal(sealed, from64(onServer.ciphertextBase64, 16, 4 * 1024 * 1024))) deny();
+      }
+      context.assertLive();
+      return Object.freeze({ signedCatalogCasCoverageVerified: true,
+        protectedCiphertextReadbackVerified: true,
+        catalogSequence: input.catalog.sequence,
+        authorizesCutover: false, externalDurabilityProven: false });
+    } catch (_) { deny(); }
+  }
   async function openCatalogName(result, index, metadataKey) {
     const context = genuine.get(result);
     if (!context) deny();
@@ -496,5 +539,6 @@
       return name;
     } catch (_) { deny(); }
   }
-  return Object.freeze({ openCatalog, getCatalogCiphertext, openCatalogName });
+  return Object.freeze({ openCatalog, getCatalogCiphertext,
+    assertVersionedArchiveMatchesCatalog, openCatalogName });
 }));

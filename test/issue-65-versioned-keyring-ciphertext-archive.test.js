@@ -1027,6 +1027,13 @@ test("real authenticated HTTP owner backup survives lost PUT ACK and restores hi
     rosterVerification: f.rosterVerification, otherVerifiedKeyringProofs: [],
   });
   assert.notEqual(remoteAuthority, f.verifiedAuthority);
+  await assert.rejects(transport.recoverPortableVersionedBackupWithSignedCatalog({
+    archivePin: first.archivePin, provider: provider(),
+    recoveryInput: f.restoreInput, verifiedAuthority: remoteAuthority,
+    assertLive, catalogInput: null,
+  }), /ZK_PORTABLE_VERSIONED_BACKUP_DENIED/,
+  "the CAS-required mode must never silently fall back to offline recovery");
+  assert.equal(gets, 0, "missing authenticated CAS preflight blocks provider GET");
   const second = await transport.recoverPortableVersionedBackup({
     archivePin: first.archivePin, provider: provider(),
     recoveryInput: f.restoreInput, verifiedAuthority: remoteAuthority, assertLive,
@@ -1131,7 +1138,8 @@ test("portable historical backup transport loads as browser UMD without Node imp
   vm.runInContext(fs.readFileSync(path.join(__dirname,
     "../public/client/rootark-zk1-portable-versioned-backup-transport.js"), "utf8"), context);
   for (const method of ["preparePortableVersionedBackup",
-    "publishPreparedVersionedBackup", "recoverPortableVersionedBackup"]) {
+    "publishPreparedVersionedBackup", "recoverPortableVersionedBackup",
+    "recoverPortableVersionedBackupWithSignedCatalog"]) {
     assert.equal(typeof context.RootarkZk1PortableVersionedBackupTransport[method], "function");
   }
 });
