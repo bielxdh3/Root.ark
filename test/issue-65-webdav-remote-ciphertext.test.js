@@ -230,6 +230,47 @@ test("WebDAV rejects coercion-based remote path escape before any HTTPS PUT", as
     "a namespace accessor must not mutate between validation and use");
 });
 
+test("WebDAV does not PUT a source rewritten after FD pin with its mtime restored", async (t) => {
+  const f = await fixture(t);
+  const writer = createZk1WebdavCiphertextAdapter(f.config);
+  const staging = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-source-ctime-"));
+  t.after(() => fs.rmSync(staging, { recursive: true, force: true, maxRetries: 5 }));
+  const source = path.join(staging, "source.ct");
+  const prior = Buffer.from(f.ciphertext);
+  const substituted = crypto.randomBytes(prior.length);
+  fs.writeFileSync(source, prior, { flag: "wx", mode: 0o600 });
+  const fixedTime = new Date("2020-01-01T00:00:00Z");
+  fs.utimesSync(source, fixedTime, fixedTime);
+  const original = fs.statSync(source, { bigint: true });
+  const realRead = fs.readSync;
+  let attacked = false;
+  fs.readSync = function (fd, buffer, offset, length, position) {
+    if (!attacked && typeof fd === "number" && length === prior.length) {
+      attacked = true;
+      // Preserve inode, byte length, and mtime. Only ctime detects the
+      // replacement of the authenticated opaque source across the FD read.
+      fs.writeFileSync(source, substituted);
+      fs.utimesSync(source, fixedTime, fixedTime);
+    }
+    return realRead.call(fs, fd, buffer, offset, length, position);
+  };
+  const folder = `zk1-${"a".repeat(64)}`;
+  try {
+    await assert.rejects(writer.upload(source, folder, `${"b".repeat(22)}.ct`, "uploads",
+      { zk1BoundedBytes: prior.length }), /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
+  } finally {
+    fs.readSync = realRead;
+  }
+  const changed = fs.statSync(source, { bigint: true });
+  assert.equal(attacked, true, "the source must be rewritten during its pinned FD read");
+  assert.equal(changed.dev, original.dev);
+  assert.equal(changed.ino, original.ino);
+  assert.equal(changed.size, original.size);
+  assert.equal(changed.mtimeNs, original.mtimeNs);
+  assert.notEqual(changed.ctimeNs, original.ctimeNs);
+  assert.equal(f.requests.length, 0, "a modified source must never reach the remote HTTPS peer");
+});
+
 test("WebDAV remote errors, redirect, truncated/oversized/corrupt data fail closed", async (t) => {
   const f = await fixture(t);
   const { publisher, verifier } = await f.makePair();

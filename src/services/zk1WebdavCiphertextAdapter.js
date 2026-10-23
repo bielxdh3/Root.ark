@@ -83,9 +83,13 @@ function readBoundedFile(source, length) {
     verifyParent(parent);
     ensure(after.dev === before.dev && after.ino === before.ino
       && after.size === before.size && after.mtimeNs === before.mtimeNs
+      && after.ctimeNs === before.ctimeNs && after.mode === before.mode
       && after.nlink === 1n && namedAfter.dev === before.dev
       && namedAfter.ino === before.ino && !namedAfter.isSymbolicLink()
-      && namedAfter.nlink === 1n);
+      && namedAfter.nlink === 1n && namedAfter.size === before.size
+      && namedAfter.mtimeNs === before.mtimeNs
+      && namedAfter.ctimeNs === before.ctimeNs
+      && namedAfter.mode === before.mode);
     return data;
   } finally { fs.closeSync(fd); }
 }
