@@ -141,7 +141,7 @@ function createZk1OpaqueCatalogCasHttpsClient({
       return result.proof;
     },
     async compareAndSwap({ scope, expectedSequence, expectedDigest, nextSequence,
-      nextDigest, nonce, headBytes, headSignature, pageBodies }) {
+      nextDigest, nonce, headBytes, headSignature, pageBodies, ownerEvidence }) {
       const scopeBytes = Object.fromEntries(SCOPE.map((key) =>
         [key, bytes(scope[key], key === "compartment_id" ? 1 : 16,
           key === "compartment_id" ? 128 : 16)]));
@@ -157,6 +157,9 @@ function createZk1OpaqueCatalogCasHttpsClient({
         headBytes: bytes(headBytes, 1, 16384).toString("base64url"),
         headSignature: bytes(headSignature, 64).toString("base64url"),
         pageBodies: pageBodies.map((body) => bytes(body, 1, 16384).toString("base64url")),
+        ...(ownerEvidence === undefined ? {} : {
+          ownerEvidence: bytes(ownerEvidence, 1, 2 * 1024 * 1024).toString("base64url"),
+        }),
       }, { scope: scopeBytes, nonce: challenge }, true);
       if (result.sequence !== nextSequence || !same(result.digest, bytes(nextDigest, 32))) {
         fail("ZK_OPAQUE_CAS_ACK_UNCERTAIN");

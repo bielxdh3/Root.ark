@@ -10,10 +10,15 @@ const net = require("node:net");
 const { Zk1OpaqueCatalogCasLedger } = require("./zk1OpaqueCatalogCasLedger");
 const { createZk1OpaqueCatalogCasHttpsServer } =
   require("./zk1OpaqueCatalogCasHttpsServer");
+const { createZk1WitnessHttpsClient } = require("./zk1WitnessHttpsClient");
 const FIELDS = ["developmentOnlyOptIn", "bindHost", "port", "databasePath",
   "bootstrapNew", "signingPrivateKeyPath", "catalogSignerPublicKeyPath",
   "trustedScope", "minimumHead", "tlsKeyPath", "tlsCertPath", "clientCaPath",
   "authorizedClientFingerprint256"];
+const OWNER_FIELDS = ["genesisDigest", "witnessPublicKeyPath", "witnessKeyId",
+  "minimumHead", "witnessTransport"];
+const WITNESS_TLS_FIELDS = ["endpoint", "caPath", "clientKeyPath",
+  "clientCertPath", "serverFingerprint256", "timeoutMs"];
 function deny() { throw new Error("ZK_OPAQUE_CAS_SERVICE_CONFIG_DENIED"); }
 function strict(value, fields) {
   if (!value || typeof value !== "object" || Array.isArray(value)
@@ -52,7 +57,7 @@ async function startZk1OpaqueCatalogCasServiceFromConfig(configPath) {
   let config;
   try { config = JSON.parse(readBounded(configPath).toString("utf8")); }
   catch (_) { deny(); }
-  strict(config, FIELDS);
+  strict(config, Object.hasOwn(config, "ownerTrust") ? [...FIELDS, "ownerTrust"] : FIELDS);
   if (config.developmentOnlyOptIn !== true
     || !["development", "test"].includes(process.env.NODE_ENV)
     || typeof config.bindHost !== "string"
@@ -70,9 +75,44 @@ async function startZk1OpaqueCatalogCasServiceFromConfig(configPath) {
     || config.minimumHead.sequence < 0 || config.minimumHead.sequence > 128) deny();
   const signer = crypto.createPrivateKey(readBounded(config.signingPrivateKeyPath));
   const catalogSigner = crypto.createPublicKey(readBounded(config.catalogSignerPublicKeyPath));
+  let ownerTrust;
+  if (config.ownerTrust !== undefined) {
+    const owner = config.ownerTrust;
+    strict(owner, OWNER_FIELDS);
+    strict(owner.minimumHead, ["revision", "digest"]);
+    strict(owner.witnessTransport, WITNESS_TLS_FIELDS);
+    if (!Number.isSafeInteger(owner.minimumHead.revision)
+      || owner.minimumHead.revision < 1
+      || typeof owner.witnessTransport.timeoutMs !== "number") deny();
+    const transport = owner.witnessTransport;
+    const witnessPublicKey = crypto.createPublicKey(readBounded(owner.witnessPublicKeyPath));
+    if (witnessPublicKey.type !== "public" || witnessPublicKey.asymmetricKeyType !== "ed25519"
+      || witnessPublicKey.equals(crypto.createPublicKey(signer))
+      || witnessPublicKey.equals(catalogSigner)
+      || transport.serverFingerprint256.toUpperCase()
+        === config.authorizedClientFingerprint256.toUpperCase()
+      || config.tlsCertPath === transport.clientCertPath
+      || config.tlsKeyPath === transport.clientKeyPath) deny();
+    const witnessClient = createZk1WitnessHttpsClient({
+      endpoint: transport.endpoint, ca: readBounded(transport.caPath),
+      clientKey: readBounded(transport.clientKeyPath),
+      clientCert: readBounded(transport.clientCertPath),
+      serverFingerprint256: transport.serverFingerprint256,
+      timeoutMs: transport.timeoutMs,
+    });
+    ownerTrust = {
+      genesisDigest: decode(owner.genesisDigest, 32),
+      pinnedWitness: { keyId: decode(owner.witnessKeyId, 16),
+        publicKey: witnessPublicKey },
+      minimumHead: { revision: owner.minimumHead.revision,
+        witnessSequence: owner.minimumHead.revision,
+        digest: decode(owner.minimumHead.digest, 32) },
+      freshWitnessHead: ({ scope, nonce }) => witnessClient.freshHead({ scope, nonce }),
+    };
+  }
   const ledger = new Zk1OpaqueCatalogCasLedger(config.databasePath, {
     bootstrapNew: config.bootstrapNew, signingPrivateKey: signer,
-    catalogSignerPublicKey: catalogSigner, trustedScope,
+    catalogSignerPublicKey: catalogSigner, trustedScope, ownerTrust,
     minimumHead: { sequence: config.minimumHead.sequence,
       digest: decode(config.minimumHead.digest, 32) },
   });

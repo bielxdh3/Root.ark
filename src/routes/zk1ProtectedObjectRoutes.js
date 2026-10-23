@@ -194,9 +194,11 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
         const originalUser = { username: req.user.username,
           sessionVersion: req.user.sessionVersion };
         const body = req.body;
+        const catalogCommitFields = ["authorization", "signatureBase64",
+          "headerBase64", "headerSignatureBase64", "pages"];
         exact(body, action === "commit"
-          ? ["authorization", "signatureBase64", "headerBase64",
-            "headerSignatureBase64", "pages"]
+          ? (Object.hasOwn(body, "ownerEvidenceBase64")
+            ? [...catalogCommitFields, "ownerEvidenceBase64"] : catalogCommitFields)
           : ["authorization", "signatureBase64", "pageIndex"]);
         const authorization = authorizationWire(body.authorization);
         const input = { scope: trustedScope, authorization,
@@ -223,7 +225,9 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
           result = await opaqueCatalog.commit({ ...input, header, pages,
             guard: () => recheckSession(req, originalUser, trustedScope, "upload"),
             emit: sendUnderGate(res, 201),
-            headerSignature: b64(body.headerSignatureBase64, 64) });
+            headerSignature: b64(body.headerSignatureBase64, 64),
+            ownerEvidence: body.ownerEvidenceBase64 === undefined
+              ? undefined : b64(body.ownerEvidenceBase64, 2 * 1024 * 1024) });
         } else {
           result = await opaqueCatalog.read({ ...input, pageIndex: body.pageIndex,
             emit: sendUnderGate(res, 200,

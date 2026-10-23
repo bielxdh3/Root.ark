@@ -10,6 +10,10 @@ const path = require("node:path");
 const Database = require("better-sqlite3");
 const z = require("../crypto/rootark-zk-1");
 const { catalogHeadDigest, catalogCasDomain } = require("./zk1OpaqueCatalog");
+const ownerHistory = require("../crypto/rootark-zk-recovery-history-v2");
+const ownerManifest = require("../crypto/rootark-zk-recovery-manifest-v2");
+const { inspectVerifiedWitnessFreshHeadV1 } =
+  require("../crypto/rootark-zk-witness-head-wire-v1");
 
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
 const PAGE_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-page/v1\0");
@@ -18,6 +22,9 @@ const MAX_SEQUENCE = 128;
 const HEAD_TYPE = "rootark-zk1-opaque-catalog/v1";
 const CAS_TYPE = "rootark-zk1-opaque-catalog-cas/v1";
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
+const ED_SPKI = Buffer.from("302a300506032b6570032100", "hex");
+const OWNER_EVIDENCE = ["baseManifest", "baseReceipt", "transitions",
+  "packageEnvelopes", "witnessHeadRaw"];
 const HEAD_FIELDS = ["type", ...SCOPE, "sequence", "previous_digest",
   "manifest_revision", "manifest_digest", "epoch", "signer_device_id",
   "total_count", "page_digests", "issued_at"];
@@ -69,8 +76,9 @@ function privateDir(filename) {
 class Zk1OpaqueCatalogCasLedger {
   #minimum;
   #floor;
+  #ownerTrust;
   constructor(filename, { bootstrapNew, signingPrivateKey, catalogSignerPublicKey,
-    trustedScope, minimumHead } = {}) {
+    trustedScope, minimumHead, ownerTrust } = {}) {
     if (typeof filename !== "string" || !path.isAbsolute(filename)
       || !(signingPrivateKey instanceof crypto.KeyObject)
       || signingPrivateKey.type !== "private" || signingPrivateKey.asymmetricKeyType !== "ed25519"
@@ -82,6 +90,27 @@ class Zk1OpaqueCatalogCasLedger {
     this.signer = signingPrivateKey;
     this.publicKey = crypto.createPublicKey(signingPrivateKey);
     this.catalogSigner = catalogSignerPublicKey;
+    if (ownerTrust !== undefined) {
+      exact(ownerTrust, ["genesisDigest", "pinnedWitness", "minimumHead", "freshWitnessHead"]);
+      exact(ownerTrust.pinnedWitness, ["keyId", "publicKey"]);
+      exact(ownerTrust.minimumHead, ["revision", "witnessSequence", "digest"]);
+      if (!(ownerTrust.pinnedWitness.publicKey instanceof crypto.KeyObject)
+        || ownerTrust.pinnedWitness.publicKey.type !== "public"
+        || ownerTrust.pinnedWitness.publicKey.asymmetricKeyType !== "ed25519"
+        || typeof ownerTrust.freshWitnessHead !== "function") fail();
+      const revision = integer(ownerTrust.minimumHead.revision, 1, Number.MAX_SAFE_INTEGER);
+      if (ownerTrust.minimumHead.witnessSequence !== revision) fail();
+      this.#ownerTrust = {
+        genesisDigest: bytes(ownerTrust.genesisDigest, 32),
+        pinnedWitness: {
+          keyId: bytes(ownerTrust.pinnedWitness.keyId, 16),
+          publicKey: ownerTrust.pinnedWitness.publicKey,
+        },
+        minimumHead: { revision, witnessSequence: revision,
+          digest: bytes(ownerTrust.minimumHead.digest, 32) },
+        freshWitnessHead: ownerTrust.freshWitnessHead,
+      };
+    }
     if (publicFingerprint(this.publicKey) === publicFingerprint(this.catalogSigner)) fail();
     this.#minimum = {
       sequence: integer(minimumHead.sequence, 0, MAX_SEQUENCE),
@@ -117,6 +146,20 @@ class Zk1OpaqueCatalogCasLedger {
         PRIMARY KEY (scope, sequence)
       );
       CREATE UNIQUE INDEX IF NOT EXISTS uq_opaque_cas_nonce ON snapshots(scope,nonce);
+      CREATE TABLE IF NOT EXISTS signer_history (
+        scope TEXT NOT NULL, sequence INTEGER NOT NULL, signer_spki BLOB NOT NULL,
+        owner_revision INTEGER NOT NULL, owner_digest BLOB NOT NULL,
+        owner_evidence BLOB NOT NULL, PRIMARY KEY(scope,sequence)
+      );
+      CREATE TABLE IF NOT EXISTS owner_authority (
+        scope TEXT PRIMARY KEY, genesis_digest BLOB NOT NULL,
+        witness_fp TEXT NOT NULL, witness_key_id BLOB NOT NULL,
+        revision INTEGER NOT NULL, digest BLOB NOT NULL
+      );
+      CREATE TRIGGER IF NOT EXISTS immutable_opaque_signer_update
+        BEFORE UPDATE ON signer_history BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;
+      CREATE TRIGGER IF NOT EXISTS immutable_opaque_signer_delete
+        BEFORE DELETE ON signer_history BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;
       CREATE TRIGGER IF NOT EXISTS immutable_opaque_snapshot_update
         BEFORE UPDATE ON snapshots BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;
       CREATE TRIGGER IF NOT EXISTS immutable_opaque_snapshot_delete
@@ -127,6 +170,22 @@ class Zk1OpaqueCatalogCasLedger {
       const saved = this.db.prepare("SELECT * FROM identity WHERE id=1").get();
       if (!saved || saved.authority_fp !== identity[0]
         || saved.catalog_fp !== identity[1] || saved.scope !== identity[2]) fail();
+      if (!exists && this.#ownerTrust) {
+        this.db.prepare("INSERT INTO owner_authority VALUES (?,?,?,?,?,?)").run(
+          this.scopeId, this.#ownerTrust.genesisDigest,
+          publicFingerprint(this.#ownerTrust.pinnedWitness.publicKey),
+          this.#ownerTrust.pinnedWitness.keyId,
+          this.#ownerTrust.minimumHead.revision, this.#ownerTrust.minimumHead.digest);
+      }
+      const savedOwner = this.db.prepare("SELECT * FROM owner_authority WHERE scope=?")
+        .get(this.scopeId);
+      if (Boolean(savedOwner) !== Boolean(this.#ownerTrust)) fail();
+      if (savedOwner && (!same(savedOwner.genesis_digest, this.#ownerTrust.genesisDigest)
+        || savedOwner.witness_fp !== publicFingerprint(this.#ownerTrust.pinnedWitness.publicKey)
+        || !same(savedOwner.witness_key_id, this.#ownerTrust.pinnedWitness.keyId)
+        || savedOwner.revision < this.#ownerTrust.minimumHead.revision
+        || (savedOwner.revision === this.#ownerTrust.minimumHead.revision
+          && !same(savedOwner.digest, this.#ownerTrust.minimumHead.digest)))) fail();
       // Parsing deterministic CBOR uses the project's verified async ESM
       // codec. Callers MUST await ready before admitting TLS requests.
       this.ready = this.#inspect();
@@ -153,11 +212,29 @@ class Zk1OpaqueCatalogCasLedger {
       });
       // Synchronous cryptographic signature verification; in the normal
       // network path the asynchronous CBOR decoder is run before insertion.
+      const signerRow = this.db.prepare("SELECT * FROM signer_history WHERE scope=? AND sequence=?")
+        .get(this.scopeId, row.sequence);
+      if (Boolean(signerRow) !== Boolean(this.#ownerTrust)) fail();
+      let key = this.catalogSigner;
+      if (signerRow) {
+        if (signerRow.signer_spki.length !== 44
+          || signerRow.owner_digest.length !== 32
+          || !Number.isSafeInteger(signerRow.owner_revision)
+          || signerRow.owner_evidence.length < 1
+          || signerRow.owner_evidence.length > 2 * 1024 * 1024) fail();
+        key = crypto.createPublicKey({ key: signerRow.signer_spki,
+          format: "der", type: "spki" });
+      }
       if (!crypto.verify(null, Buffer.concat([HEAD_DOMAIN, row.header]),
-        this.catalogSigner, row.signature)) fail();
+        key, row.signature)) fail();
       digest = row.digest;
     }
     const head = this.db.prepare("SELECT sequence,digest FROM heads WHERE scope=?").get(this.scopeId);
+    if (this.#ownerTrust) {
+      const total = this.db.prepare("SELECT COUNT(*) AS n FROM signer_history WHERE scope=?")
+        .get(this.scopeId).n;
+      if (total !== rows.length) fail();
+    }
     if ((head && (head.sequence !== rows.length || !same(head.digest, digest)))
       || (!head && rows.length)) fail();
     const sequence = head?.sequence || 0;
@@ -193,6 +270,16 @@ class Zk1OpaqueCatalogCasLedger {
         count += page.length;
       }
       if (count !== header.total_count) fail();
+      if (this.#ownerTrust) {
+        const signer = this.db.prepare("SELECT * FROM signer_history WHERE scope=? AND sequence=?")
+          .get(this.scopeId, row.sequence);
+        const confirmed = await this.#verifyOwnerEvidence({
+          evidenceRaw: signer.owner_evidence, nonce: row.nonce, header,
+          signerKey: crypto.createPublicKey({ key: signer.signer_spki,
+            format: "der", type: "spki" }), historical: true });
+        if (confirmed.revision !== signer.owner_revision
+          || !same(confirmed.digest, signer.owner_digest)) fail();
+      }
       previous = row.digest;
     }
     // A second sync check detects a concurrent head change between full
@@ -200,6 +287,73 @@ class Zk1OpaqueCatalogCasLedger {
     const latest = this.#inspectSync();
     if (latest.sequence !== current.sequence || !same(latest.digest, current.digest)) fail();
     return latest;
+  }
+  async #verifyOwnerEvidence({ evidenceRaw, nonce, header, signerKey, historical }) {
+    if (!this.#ownerTrust) fail();
+    const evidence = await z.decodeDeterministic(bytes(evidenceRaw, 1, 2 * 1024 * 1024));
+    exact(evidence, OWNER_EVIDENCE);
+    if (!Array.isArray(evidence.transitions) || !Array.isArray(evidence.packageEnvelopes)) fail();
+    const pinned = this.#ownerTrust;
+    const verified = await ownerHistory.verifyRecoveryHistoryPublicV2({
+      expectedScope: this.scope, baseManifest: evidence.baseManifest,
+      baseReceipt: evidence.baseReceipt, pinnedWitness: pinned.pinnedWitness,
+      transitions: evidence.transitions, packageEnvelopes: evidence.packageEnvelopes,
+      now: Math.floor(Date.now() / 1000),
+    });
+    if (!await ownerHistory.isVerifiedPublicRecoveryHistoryV2(verified)
+      || !same(await ownerManifest.recoveryManifestDigestV2(verified.baseManifest),
+        pinned.genesisDigest)) fail();
+    const witness = bytes(evidence.witnessHeadRaw, 1, 8192);
+    const floor = historical ? { revision: 1, witnessSequence: 1,
+      digest: pinned.genesisDigest } : this.#currentOwnerFloor();
+    await inspectVerifiedWitnessFreshHeadV1({
+      raw: witness, nonce: bytes(nonce, 32), scope: this.scope,
+      pinned: pinned.pinnedWitness, minimumHead: floor,
+    });
+    const signed = await z.decodeDeterministic(witness);
+    const now = Math.floor(Date.now() / 1000);
+    if ((!historical && Math.abs(signed.observed_at - now) > 30)
+      || Number(signed.current_revision) !== Number(verified.revision)
+      || !same(bytes(signed.current_manifest_digest, 32), verified.headDigest)
+      || Number(header.manifest_revision) !== Number(verified.revision)
+      || !same(bytes(header.manifest_digest, 32), verified.headDigest)
+      || Number(header.epoch) !== Number(verified.headManifest.current_epoch)) fail();
+    if (!historical) {
+      // Fetch the current signed head independently on the CAS host. A caller
+      // cannot keep authoring with A using a still-time-valid pre-revocation
+      // witness receipt once the external witness has committed the revoke.
+      const independentRaw = bytes(await pinned.freshWitnessHead({
+        scope: this.scope, nonce: Buffer.from(nonce),
+      }), 1, 8192);
+      await inspectVerifiedWitnessFreshHeadV1({
+        raw: independentRaw, nonce: bytes(nonce, 32), scope: this.scope,
+        pinned: pinned.pinnedWitness, minimumHead: floor,
+      });
+      const latest = await z.decodeDeterministic(independentRaw);
+      if (Math.abs(latest.observed_at - Math.floor(Date.now() / 1000)) > 30
+        || Number(latest.current_revision) !== Number(verified.revision)
+        || !same(bytes(latest.current_manifest_digest, 32), verified.headDigest)) fail();
+    }
+    const device = verified.headManifest.devices.find((entry) =>
+      entry.device_id === header.signer_device_id
+      && entry.revoked_at_epoch === null
+      && Number(entry.enrolled_epoch) <= Number(header.epoch));
+    if (!device) fail();
+    const trustedKey = crypto.createPublicKey({ key: Buffer.concat([
+      ED_SPKI, bytes(device.authorization_public_key, 32)]),
+    format: "der", type: "spki" });
+    if (publicFingerprint(trustedKey) !== publicFingerprint(signerKey)) fail();
+    return { revision: Number(verified.revision),
+      digest: Buffer.from(verified.headDigest), deviceId: device.device_id };
+  }
+  #currentOwnerFloor() {
+    const saved = this.db.prepare("SELECT revision,digest FROM owner_authority WHERE scope=?")
+      .get(this.scopeId);
+    if (!saved || saved.revision < this.#ownerTrust.minimumHead.revision) fail();
+    if (saved.revision === this.#ownerTrust.minimumHead.revision
+      && !same(saved.digest, this.#ownerTrust.minimumHead.digest)) fail();
+    return { revision: saved.revision, witnessSequence: saved.revision,
+      digest: Buffer.from(saved.digest) };
   }
   async #receipt(nonce, current) {
     const statement = { type: CAS_TYPE, ...this.scope,
@@ -217,7 +371,8 @@ class Zk1OpaqueCatalogCasLedger {
     return this.#receipt(nonce, current);
   }
   async compareAndSwap({ scope, expectedSequence, expectedDigest,
-    nextSequence, nextDigest, nonce, headBytes, headSignature, pageBodies }) {
+    nextSequence, nextDigest, nonce, headBytes, headSignature, pageBodies,
+    ownerEvidence }) {
     if (!scopeEquals(scopeInput(scope), this.scope)) fail();
     await this.ready;
     const old = integer(expectedSequence, 0, MAX_SEQUENCE);
@@ -229,10 +384,39 @@ class Zk1OpaqueCatalogCasLedger {
     const signature = bytes(headSignature, 64);
     if (next !== old + 1 || same(wanted, previous)
       || !Array.isArray(pageBodies) || pageBodies.length > 128) fail("ZK_OPAQUE_CAS_CONFLICT");
-    if (!same(catalogHeadDigest(headerRaw, signature), wanted)
-      || !crypto.verify(null, Buffer.concat([HEAD_DOMAIN, headerRaw]), this.catalogSigner, signature)) fail();
+    if (!same(catalogHeadDigest(headerRaw, signature), wanted)) fail();
     const header = await z.decodeDeterministic(headerRaw);
     exact(header, HEAD_FIELDS);
+    let activeSigner = this.catalogSigner;
+    let verifiedOwner = null;
+    let evidenceRaw = null;
+    if (this.#ownerTrust) {
+      evidenceRaw = bytes(ownerEvidence, 1, 2 * 1024 * 1024);
+      // The signer key comes ONLY from a verified owner-rooted V2 history.
+      const evidence = await z.decodeDeterministic(evidenceRaw);
+      exact(evidence, OWNER_EVIDENCE);
+      const trust = this.#ownerTrust;
+      const proof = await ownerHistory.verifyRecoveryHistoryPublicV2({
+        expectedScope: this.scope, baseManifest: evidence.baseManifest,
+        baseReceipt: evidence.baseReceipt, transitions: evidence.transitions,
+        packageEnvelopes: evidence.packageEnvelopes,
+        pinnedWitness: trust.pinnedWitness, now: Math.floor(Date.now() / 1000),
+      });
+      if (!await ownerHistory.isVerifiedPublicRecoveryHistoryV2(proof)
+        || !same(await ownerManifest.recoveryManifestDigestV2(proof.baseManifest),
+          trust.genesisDigest)) fail();
+      const device = proof.headManifest.devices.find((entry) =>
+        entry.device_id === header.signer_device_id);
+      if (!device) fail();
+      activeSigner = crypto.createPublicKey({ key: Buffer.concat([
+        ED_SPKI, bytes(device.authorization_public_key, 32)]),
+      format: "der", type: "spki" });
+      verifiedOwner = await this.#verifyOwnerEvidence({
+        evidenceRaw, nonce: challenge, header, signerKey: activeSigner,
+        historical: false });
+    }
+    if (!crypto.verify(null, Buffer.concat([HEAD_DOMAIN, headerRaw]),
+      activeSigner, signature)) fail();
     if (header.type !== HEAD_TYPE || !scopeEquals(header, this.scope)
       || header.sequence !== next || !same(bytes(header.previous_digest, 32), previous)
       || !Number.isSafeInteger(header.issued_at)
@@ -263,9 +447,28 @@ class Zk1OpaqueCatalogCasLedger {
       if (current.sequence !== old || !same(current.digest, previous)) fail("ZK_OPAQUE_CAS_CONFLICT");
       if (this.db.prepare("SELECT 1 FROM snapshots WHERE scope=? AND nonce=?")
         .get(this.scopeId, challenge)) fail("ZK_OPAQUE_CAS_REPLAY");
+      if (verifiedOwner) {
+        const floor = this.#currentOwnerFloor();
+        if (verifiedOwner.revision < floor.revision
+          || (verifiedOwner.revision === floor.revision
+            && !same(verifiedOwner.digest, floor.digest))) fail("ZK_OPAQUE_CAS_CONFLICT");
+        const prior = this.db.prepare("SELECT * FROM signer_history WHERE scope=? AND sequence=?")
+          .get(this.scopeId, old);
+        if (old === 0 && publicFingerprint(activeSigner) !== publicFingerprint(this.catalogSigner)) fail();
+        if (prior && !same(prior.signer_spki,
+          activeSigner.export({ format: "der", type: "spki" }))
+          && verifiedOwner.revision <= prior.owner_revision) fail("ZK_OPAQUE_CAS_CONFLICT");
+      }
       this.db.prepare("INSERT INTO snapshots VALUES (?,?,?,?,?,?,?,?)").run(
         this.scopeId, next, wanted, headerRaw, signature, packedBytes,
         challenge, Math.floor(Date.now() / 1000));
+      if (verifiedOwner) {
+        this.db.prepare("INSERT INTO signer_history VALUES (?,?,?,?,?,?)").run(
+          this.scopeId, next, activeSigner.export({ type: "spki", format: "der" }),
+          verifiedOwner.revision, verifiedOwner.digest, evidenceRaw);
+        this.db.prepare("UPDATE owner_authority SET revision=?,digest=? WHERE scope=?")
+          .run(verifiedOwner.revision, verifiedOwner.digest, this.scopeId);
+      }
       this.db.prepare(`INSERT INTO heads(scope,sequence,digest) VALUES(?,?,?)
         ON CONFLICT(scope) DO UPDATE SET sequence=excluded.sequence,digest=excluded.digest`)
         .run(this.scopeId, next, wanted);

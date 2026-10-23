@@ -78,8 +78,9 @@ function createZk1OpaqueCatalogCasHttpsServer({ key, cert, clientCa,
         result = await ledger.readHead({ scope: scopeFrom(body.scope),
           nonce: b64(body.nonce, 32) });
       } else {
-        exact(body, ["scope", "expectedSequence", "expectedDigest",
-          "nextSequence", "nextDigest", "nonce", "headBytes", "headSignature", "pageBodies"]);
+        const fields = ["scope", "expectedSequence", "expectedDigest",
+          "nextSequence", "nextDigest", "nonce", "headBytes", "headSignature", "pageBodies"];
+        exact(body, Object.hasOwn(body, "ownerEvidence") ? [...fields, "ownerEvidence"] : fields);
         if (!Array.isArray(body.pageBodies) || body.pageBodies.length > 128) fail();
         result = await ledger.compareAndSwap({
           scope: scopeFrom(body.scope), expectedSequence: body.expectedSequence,
@@ -89,6 +90,8 @@ function createZk1OpaqueCatalogCasHttpsServer({ key, cert, clientCa,
           headBytes: b64(body.headBytes, 1, 16384),
           headSignature: b64(body.headSignature, 64),
           pageBodies: body.pageBodies.map((v) => b64(v, 1, 16384)),
+          ownerEvidence: Object.hasOwn(body, "ownerEvidence")
+            ? b64(body.ownerEvidence, 1, 2 * 1024 * 1024) : undefined,
         });
         // Test-only fault injection: SQLite FULL commit has already completed
         // but the HTTPS reply is lost. Reconcile must use a NEW signed read.

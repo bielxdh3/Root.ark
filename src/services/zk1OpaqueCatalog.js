@@ -298,7 +298,7 @@ class Zk1OpaqueCatalog {
     return previousPages;
   }
   async commit({ scope, authorization, signature, header, headerSignature, pages,
-    guard = null, emit = (result) => result }) {
+    ownerEvidence, guard = null, emit = (result) => result }) {
     if (guard !== null && typeof guard !== "function") fail();
     return this.store.runCatalogWithAdmission({ scope, authorization, signature },
       "catalog-commit", async (auth) => {
@@ -356,6 +356,7 @@ class Zk1OpaqueCatalog {
           // A digest supplied alone is not evidence of committed data.
           headBytes: headerBytes, headSignature: signed,
           pageBodies: bodies.map((body) => Buffer.from(body)),
+          ownerEvidence,
         });
         const witnessed = await verifyCas(receipt, wanted, request.nonce,
           this.authority, number(this.store.nowSeconds(), 0));
