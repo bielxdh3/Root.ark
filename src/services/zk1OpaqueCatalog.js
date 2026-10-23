@@ -298,7 +298,8 @@ class Zk1OpaqueCatalog {
     return previousPages;
   }
   async commit({ scope, authorization, signature, header, headerSignature, pages,
-    emit = (result) => result }) {
+    guard = null, emit = (result) => result }) {
+    if (guard !== null && typeof guard !== "function") fail();
     return this.store.runCatalogWithAdmission({ scope, authorization, signature },
       "catalog-commit", async (auth) => {
         const wanted = this.store.trustedScope;
@@ -340,6 +341,9 @@ class Zk1OpaqueCatalog {
         if (rows.length > MAX_ENTRIES) fail("ZK_CATALOG_CONFLICT");
         auditZk1CatalogReendorsement({ previousPages, proposedPages: normalized,
           physicalVersions: rows });
+        // Async manifest/CAS checks above may outlive the initiating web
+        // session. Recheck immediately before durable local/external effects.
+        if (guard) guard();
         this.consume(auth);
         // Authority must atomically CAS independently of local SQLite. A
         // lost ACK may leave the catalog unavailable until audited recovery.
@@ -371,7 +375,7 @@ class Zk1OpaqueCatalog {
         }).immediate();
         return emit({ sequence: header.sequence, catalogDigest: digest.toString("base64url"),
           authorityProofBase64: witnessed.proof.toString("base64url") });
-      });
+      }, guard);
   }
   async read({ scope, authorization, signature, pageIndex, emit = (result) => result }) {
     return this.store.runCatalogWithAdmission({ scope, authorization, signature },

@@ -643,21 +643,31 @@ class Zk1ProtectedObjectStore {
       return emit();
     }, abortSignal);
   }
-  async runWithAdmission(input, operation, emit) {
-    if (typeof emit !== "function" || !["put", "get"].includes(operation)) fail();
+  async runWithAdmission(input, operation, emit, guard = null) {
+    if (typeof emit !== "function" || (guard !== null && typeof guard !== "function")
+      || !["put", "get"].includes(operation)) fail();
     const authenticated = await this.authorize(input, operation);
-    return this.#withAdmission(authenticated, operation,
-      () => emit(this.perform(authenticated, operation)));
+    return this.#withAdmission(authenticated, operation, () => {
+      // Account-session authorization is mutable independently of the owner's
+      // device witness. A guard supplied by HTTP must run AFTER the admission
+      // await and BEFORE a PUT changes durable ciphertext.
+      if (guard) guard();
+      return emit(this.perform(authenticated, operation));
+    });
   }
   // Catalog read/commit use the identical independently witnessed current
   // owner history and device PoP, plus the existing physical I/O gate.
   // Their separate signature domain and effect live in zk1OpaqueCatalog.
-  async runCatalogWithAdmission(input, operation, emit) {
+  async runCatalogWithAdmission(input, operation, emit, guard = null) {
     if (!this.signedHistoryRequired || typeof emit !== "function"
+      || (guard !== null && typeof guard !== "function")
       || !["catalog-commit", "catalog-read"].includes(operation)) fail();
     const authenticated = await this.authorize(input, operation);
     return this.#withAdmission(authenticated,
-      operation === "catalog-commit" ? "put" : "get", () => emit(authenticated));
+      operation === "catalog-commit" ? "put" : "get", () => {
+        if (guard) guard();
+        return emit(authenticated);
+      });
   }
   async #withAdmission(authenticated, operation, effect, abortSignal) {
     if (abortSignal?.aborted) fail("ZK_CONTENT_UNAVAILABLE");

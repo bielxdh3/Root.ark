@@ -62,10 +62,47 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
     res.setHeader("X-Content-Type-Options", "nosniff");
     next();
   };
+  // A witness validates device authority, not the account's mutable web
+  // session. Re-run the same authoritative middleware before sensitive effects
+  // and read egress, while admission is still held. Its rejection must never
+  // write to the live response: only the route's error handler sends a denial.
+  const recheckSession = (req, originalUser, originalScope, permission) => {
+    const probe = Object.create(req);
+    probe.user = null;
+    let approved = false;
+    let rejectedStatus = null;
+    const shadowResponse = {
+      status(status) { rejectedStatus = status; return this; },
+      json() { rejectedStatus ||= 403; return this; },
+    };
+    const denied = () => {
+      const error = new Error("ZK_CONTENT_DENIED");
+      error.code = "ZK_CONTENT_DENIED";
+      error.httpStatus = [401, 403, 503].includes(rejectedStatus) ? rejectedStatus : 403;
+      throw error;
+    };
+    try {
+      authenticate(probe, shadowResponse, () => {
+        requirePermission(permission)(probe, shadowResponse, () => { approved = true; });
+      });
+      if (!approved || rejectedStatus !== null || !probe.user
+        || probe.user.username !== originalUser.username
+        || probe.user.sessionVersion !== originalUser.sessionVersion) denied();
+      const scope = resolveTrustedScope(probe.user);
+      if (!scope || ["account_id", "compartment_id", "keyring_id"].some((field) =>
+        !Buffer.isBuffer(scope[field]) || !Buffer.isBuffer(originalScope[field])
+        || !scope[field].equals(originalScope[field]))) denied();
+    } catch (error) {
+      if (error?.code === "ZK_CONTENT_DENIED") throw error;
+      denied();
+    }
+  };
   const checked = (operation) => async (req, res) => {
     try {
       const trustedScope = resolveTrustedScope(req.user);
       if (!trustedScope) invalid();
+      const originalUser = { username: req.user.username,
+        sessionVersion: req.user.sessionVersion };
       exact(req.body, operation === "put"
         ? ["authorization", "signatureBase64", "ciphertextBase64"]
         : ["authorization", "signatureBase64"]);
@@ -78,7 +115,9 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
         // Do not release the witness admission when res.json() merely queues
         // bytes. Keep revocation closed until the socket has finished egress
         // into the kernel or has been closed/aborted.
-        if (res.destroyed || res.writableEnded) return reject(new Error("ZK_CONTENT_UNAVAILABLE"));
+        if (res.destroyed || res.writableEnded || res.headersSent) {
+          return reject(new Error("ZK_CONTENT_UNAVAILABLE"));
+        }
         const clear = () => {
           res.off("finish", settled);
           res.off("close", settled);
@@ -87,17 +126,19 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
         res.once("finish", settled);
         res.once("close", settled);
         try {
+          if (operation === "get") recheckSession(req, originalUser, trustedScope, "listFiles");
           if (operation === "put") res.status(result.revision === 1 ? 201 : 200).json(result);
           else res.status(200).json({ id: result.id, revision: result.revision,
             epoch: result.epoch, ciphertextBase64: result.ciphertext.toString("base64url") });
         } catch (error) { clear(); reject(error); }
-      }));
+      }), operation === "put"
+        ? () => recheckSession(req, originalUser, trustedScope, "upload") : undefined);
       return;
     } catch (error) {
       if (res.headersSent || res.destroyed) return;
-      const status = error?.code === "ZK_CONTENT_NOT_FOUND" ? 404
+      const status = error?.httpStatus || (error?.code === "ZK_CONTENT_NOT_FOUND" ? 404
         : ["ZK_CONTENT_REPLAY", "ZK_CONTENT_CONFLICT"].includes(error?.code) ? 409
-          : error?.code === "ZK_CONTENT_DENIED" ? 403 : 503;
+          : error?.code === "ZK_CONTENT_DENIED" ? 403 : 503);
       return res.status(status).json({ error: status === 503
         ? "ZK_CONTENT_UNAVAILABLE" : error.code });
     }
@@ -129,8 +170,10 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
     if (!store.signedHistoryRequired || typeof opaqueCatalog.commit !== "function"
       || typeof opaqueCatalog.read !== "function"
       || opaqueCatalog.store !== store) invalid();
-    const sendUnderGate = (res, status) => (result) => new Promise((resolve, reject) => {
-      if (res.destroyed || res.writableEnded) return reject(new Error("ZK_CATALOG_UNAVAILABLE"));
+    const sendUnderGate = (res, status, recheck = null) => (result) => new Promise((resolve, reject) => {
+      if (res.destroyed || res.writableEnded || res.headersSent) {
+        return reject(new Error("ZK_CATALOG_UNAVAILABLE"));
+      }
       const done = () => {
         res.off("finish", settled);
         res.off("close", settled);
@@ -138,13 +181,18 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
       const settled = () => { done(); resolve(); };
       res.once("finish", settled);
       res.once("close", settled);
-      try { res.status(status).json(result); }
+      try {
+        if (recheck) recheck();
+        res.status(status).json(result);
+      }
       catch (error) { done(); reject(error); }
     });
     const respond = (action) => async (req, res) => {
       try {
         const trustedScope = resolveTrustedScope(req.user);
         if (!trustedScope) invalid();
+        const originalUser = { username: req.user.username,
+          sessionVersion: req.user.sessionVersion };
         const body = req.body;
         exact(body, action === "commit"
           ? ["authorization", "signatureBase64", "headerBase64",
@@ -173,18 +221,20 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
             });
           });
           result = await opaqueCatalog.commit({ ...input, header, pages,
+            guard: () => recheckSession(req, originalUser, trustedScope, "upload"),
             emit: sendUnderGate(res, 201),
             headerSignature: b64(body.headerSignatureBase64, 64) });
         } else {
           result = await opaqueCatalog.read({ ...input, pageIndex: body.pageIndex,
-            emit: sendUnderGate(res, 200) });
+            emit: sendUnderGate(res, 200,
+              () => recheckSession(req, originalUser, trustedScope, "listFiles")) });
         }
         return result;
       } catch (error) {
         if (res.headersSent || res.destroyed) return;
-        const status = ["ZK_CATALOG_CONFLICT", "ZK_CATALOG_REPLAY"].includes(error?.code)
+        const status = error?.httpStatus || (["ZK_CATALOG_CONFLICT", "ZK_CATALOG_REPLAY"].includes(error?.code)
           ? 409 : error?.code === "ZK_CATALOG_NOT_FOUND" ? 404
-            : ["ZK_CATALOG_DENIED", "ZK_CONTENT_DENIED"].includes(error?.code) ? 403 : 503;
+            : ["ZK_CATALOG_DENIED", "ZK_CONTENT_DENIED"].includes(error?.code) ? 403 : 503);
         return res.status(status).json({ error: status === 503
           ? "ZK_CATALOG_UNAVAILABLE" : error.code });
       }
