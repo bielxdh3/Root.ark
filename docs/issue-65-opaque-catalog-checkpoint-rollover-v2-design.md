@@ -40,6 +40,65 @@ authorization for 129. No service imports it and no v1 limits changed.
 `test/issue-65-opaque-checkpoint-v2-merkle.test.js` exercises the isolated
 archive and hostile mutation on Node 22 and 24.
 
+## Implemented LOCAL STAGING layer (not a v2 authority)
+
+src/services/zk1OpaqueCatalogCheckpointV2Stage.js now exports the opt-in
+Zk1OpaqueCatalogCheckpointV2Stage and createSignedOpaqueCheckpointOwnerApprovalV2.
+Each approval is Ed25519-signed by an **independently pinned owner public key**
+in the separate Root.ark/zk-1/opaque-catalog-checkpoint-owner-approval/v2
+signature domain. It authenticates the checkpoint digest, absolute sequence
+range, previous checkpoint digest, final head digest, fresh nonce and exact
+SPKI-SHA256 pins of CAS, floor and checkpoint signers. All four keys differ.
+An independently authenticated owner-history chain must establish that this
+owner key and each archived device signer were legitimately authorized.
+
+The stage uses the **existing** independently pinned CAS HTTPS and floor HTTPS
+clients (floor client brand checked). Each client requires TLS 1.3/mTLS and a
+server-certificate fingerprint. CAS and floor signed-head proof validation
+rechecks scope, signature domain, separate Ed25519 keys, freshness, challenge
+nonce, floor linkage to the CAS signer, final sequence and digest. There are
+**zero calls** to authority compareAndSwap. A bounded, full Merkle archive
+and owner approval are first appended to LOCAL SQLite as a PENDING intent,
+with WAL/FULL, immutable pins and append-only SQL triggers. Two fresh reads
+of both independent remote heads precede the irreversible local advance to
+STAGED; signed readbacks are stored and verified again after SQLite commit.
+
+Disconnected/failed remote observations produce STAGE_ACK_UNCERTAIN and keep
+the durable PENDING intent. Exact matching intents can be reconciled after a
+process restart; stale owner approval older than five minutes fails closed.
+Concurrent writers cannot replace staged entries, and conflicting bytes at
+the same absolute sequence are rejected. audit() checks full recorded
+Merkle archives and checkpoint predecessor chain. revalidateRemote(sequence)
+re-audits all local rows then obtains **fresh** signed remote heads. Node24
+tests use real mTLS HTTPS servers, independent CAS/floor SQLite databases,
+multiple OS processes sharing one staging SQLite, disconnect, restart,
+replay, forged signer, concurrency and 129 refusal:
+test/issue-65-opaque-checkpoint-v2-stage-mtls.test.js.
+
+### Remaining NO-GO boundaries
+
+* The staging module hard-rejects final sequence **over 128**, never imports
+  into browser/recovery/v1 routes, and never calls CAS/floor compareAndSwap.
+  Being able to represent signed seq129 in the pure primitive is NOT permission
+  to publish it.
+* Existing v1 CAS/floor signed reads attest only to the **v1 catalog head**
+  (up to seq128). They do NOT countersign, independently persist, or anchor
+  any **v2 checkpoint digest/Merkle root**; the staging DB is strictly LOCAL.
+  mTLS in a loopback test does not demonstrate independent physical hosts.
+* The staging database and self-contained signed head proofs cannot prove
+  recovery against rollback/loss of the entire database. A future v2
+  authority must implement external monotonic CAS plus independently durable
+  floor checkpoint anchors, rollback/replay fencing and remote readback.
+* The pinned owner signature alone does NOT prove recovery-history freshness,
+  revocation/rotation validity or that archived devices were owner-approved.
+  Future authority and recovery paths must revalidate anchored owner history,
+  epoch/revocation and archived signer lineage before v2 publication.
+* Uncertain ACK after a future v2 authority WRITE requires durably persisted
+  operation_id and external CAS/floor reconciliation. Current ACK reconciliation
+  applies ONLY to remote v1 HEAD READS/local staging, because no authority
+  write occurs here. Browser, backup/restore, distributed witness,
+  multi-host and 128-to-129 publication remain NO-GO.
+
 ## Confirmed v1 constraint
 
 - `src/services/zk1OpaqueCatalog.js` validates both owner-signed headers and
