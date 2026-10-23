@@ -521,18 +521,28 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
     signedDeviceGrant: realm({ ...signedDeviceGrant, revoked_at_epoch: ownerHead.epoch }),
   })), /ZK_LOGICAL_TRASH_DENIED/, "revoked owner grant");
   await assert.rejects(trash.trash(Object.assign(realm({}), base, {
+    catalogWriter: makeWriter(2, renameDigest),
     archiveKeys: async () => realm({ signatureBase64: b64(crypto.randomBytes(64)) }),
-  })), /ZK_LOGICAL_TRASH_DENIED/, "forged custody receipt");
+  })), /ZK_LOGICAL_TRASH_ARCHIVE_UNCERTAIN/, "forged custody receipt is never trusted");
   await assert.rejects(trash.trash(Object.assign(realm({}), base, {
+    catalogWriter: makeWriter(2, renameDigest),
     archiveKeys: async ({ challenge }) => realm({ signatureBase64: sign(archivePrefix,
       { ...challenge, account_id: b64(crypto.randomBytes(16)) }, archiveAuthority.privateKey) }),
-  })), /ZK_LOGICAL_TRASH_DENIED/, "cross-scope archive receipt cannot be replayed");
+  })), /ZK_LOGICAL_TRASH_ARCHIVE_UNCERTAIN/, "cross-scope archive receipt cannot be replayed");
+  let untrustedPreflightArchiveCalls = 0;
   await assert.rejects(trash.trash(Object.assign(realm({}), base, {
     catalogProof: async () => realm({ signatureBase64: b64(crypto.randomBytes(64)) }),
+    archiveKeys: async (request) => {
+      untrustedPreflightArchiveCalls++;
+      return archiveKeys(request);
+    },
   })), /ZK_LOGICAL_TRASH_DENIED/, "unavailable unpinned catalog preflight blocks any PUT");
+  assert.equal(untrustedPreflightArchiveCalls, 0,
+    "unsigned catalog preflight cannot trigger external key archival");
   await assert.rejects(trash.trash(Object.assign(realm({}), base, {
+    catalogWriter: makeWriter(2, renameDigest),
     readArchivedCek: async () => null,
-  })), /ZK_LOGICAL_TRASH_DENIED/, "missing key archive");
+  })), /ZK_LOGICAL_TRASH_ARCHIVE_UNCERTAIN/, "missing key archive");
   active = false;
   await assert.rejects(trash.trash(base), /ZK_LOGICAL_TRASH_DENIED/, "logout fence");
   active = true;
@@ -540,6 +550,45 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
   await assert.rejects(trash.trash(base), /ZK_LOGICAL_TRASH_DENIED/, "CSRF during GET");
   csrf = "csrf-a";
   assert.equal(puts, beforeTrash, "no denied preflight could write");
+  // The escrow can durably save keys and lose its ACK before the ciphertext
+  // PUT. Recovery needs an immutable intent; a generic DENIED is misleading.
+  const lostArchiveWriter = makeWriter(2, renameDigest);
+  let lostArchiveError;
+  try {
+    await trash.trash(Object.assign(realm({}), base, {
+      catalogWriter: lostArchiveWriter,
+      archiveKeys: async (request) => {
+        await archiveKeys(request);
+        throw Error("ARCHIVE_ACK_LOST_AFTER_SAVE");
+      },
+    }));
+  } catch (error) { lostArchiveError = error; }
+  assert.equal(lostArchiveError?.code, "ZK_LOGICAL_TRASH_ARCHIVE_UNCERTAIN");
+  assert.equal(lostArchiveError?.outcome?.retrySafe, false);
+  assert.equal(lostArchiveError?.outcome?.ciphertextPutMayHaveCommitted, false);
+  assert.ok(archived.has(3), "external key escrow committed before the lost ACK");
+  assert.equal(writerJournals.at(-1).has(lostArchiveError?.outcome?.journalId), true,
+    "signed intent remains after uncertain escrow ACK");
+  assert.equal(puts, beforeTrash, "uncertain escrow cannot reach PUT");
+  assert.equal(sequence, 2, "uncertain escrow cannot commit catalog CAS");
+  const revokedArchiveWriter = makeWriter(2, renameDigest);
+  let revokedArchiveError;
+  try {
+    await trash.trash(Object.assign(realm({}), base, {
+      catalogWriter: revokedArchiveWriter,
+      archiveKeys: async (request) => {
+        const receipt = await archiveKeys(request);
+        active = false;
+        return receipt;
+      },
+    }));
+  } catch (error) { revokedArchiveError = error; }
+  assert.equal(revokedArchiveError?.code, "ZK_LOGICAL_TRASH_ARCHIVE_UNCERTAIN");
+  assert.equal(writerJournals.at(-1).has(revokedArchiveError?.outcome?.journalId), true,
+    "logout racing a saved archive keeps the signed intent");
+  assert.equal(puts, beforeTrash, "logout before PUT cannot write ciphertext");
+  assert.equal(sequence, 2, "logout before PUT cannot commit catalog CAS");
+  active = true;
   lostPut = true;
   lostCatalogAck = true;
   const trashed = await trash.trash(base);
@@ -589,10 +638,28 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
     originalMetadata: realm({ ...result.metadata, version_id: b64(crypto.randomBytes(16)) }),
   })), /ZK_LOGICAL_TRASH_DENIED/, "tampered tombstone parent");
   await assert.rejects(trash.restore(Object.assign(realm({}), restoreBase, {
+    catalogWriter: makeWriter(3, Buffer.from(trashed.catalogDigestBase64, "base64url")),
     readArchivedCek: async ({ revision, versionId }) => revision === 2
       ? null : readArchivedCek({ revision, versionId }),
-  })), /ZK_LOGICAL_TRASH_DENIED/, "missing historical key");
+  })), /ZK_LOGICAL_TRASH_ARCHIVE_UNCERTAIN/, "missing historical key");
   assert.equal(puts, beforeRestore);
+  const lostRestoreArchiveWriter = makeWriter(3,
+    Buffer.from(trashed.catalogDigestBase64, "base64url"));
+  let lostRestoreArchiveError;
+  try {
+    await trash.restore(Object.assign(realm({}), restoreBase, {
+      catalogWriter: lostRestoreArchiveWriter,
+      archiveKeys: async (request) => {
+        await archiveKeys(request);
+        throw Error("RESTORE_ARCHIVE_ACK_LOST_AFTER_SAVE");
+      },
+    }));
+  } catch (error) { lostRestoreArchiveError = error; }
+  assert.equal(lostRestoreArchiveError?.code, "ZK_LOGICAL_TRASH_ARCHIVE_UNCERTAIN");
+  assert.equal(lostRestoreArchiveError?.outcome?.retrySafe, false);
+  assert.equal(writerJournals.at(-1).has(lostRestoreArchiveError?.outcome?.journalId), true);
+  assert.equal(puts, beforeRestore, "lost restoration escrow ACK cannot reach PUT");
+  assert.equal(sequence, 3, "lost restoration escrow ACK cannot commit catalog CAS");
   const restored = await trash.restore(restoreBase);
   assert.equal(restored.revision, 4);
   assert.equal(restored.logicalStateFinalized, true);

@@ -158,7 +158,8 @@
     async function change(input) {
       let sourceBytes, oldPlain, originalBytes, destinationBytes, checkBytes;
       let rawNewCek;
-      let journalId = null, putAttempted = false, commitAttempted = false;
+      let journalId = null, archiveAttempted = false;
+      let putAttempted = false, commitAttempted = false;
       let confirmedCommit = null;
       let pendingObjectId = null, pendingRevision = null;
       try {
@@ -299,7 +300,25 @@
             revision: entry.revision, versionId: entry.metadata.version_id,
             ciphertextDigest: b64(await sha(entry.ciphertext)),
           }))) };
+        // Establish the independently signed catalog authority before any
+        // external key custody or ciphertext side effect.
+        const preflightChallenge = { purpose: "precommit", objectId: source.object_id,
+          revision: newRevision, epoch: head.epoch,
+          ciphertextDigest: b64(newDigest), manifestRevision: head.revision,
+          manifestDigest: b64(digestHead), previousSequence: input.catalog.sequence,
+          previousDigest: input.catalog.catalogDigest,
+          nonce: b64(crypto.getRandomValues(new Uint8Array(32))) };
+        const preflightProof = await input.catalogProof(preflightChallenge);
         await guard();
+        await signedReceipt(input.catalogAuthorityPublicKey, COMMIT,
+          preflightChallenge, preflightProof);
+        // The archive may save the CEK even when its acknowledgement is lost.
+        // An immutable signed intent must exist before that first side effect.
+        journalId = await input.catalogWriter.prepareIntent([{
+          objectId: source.object_id, revision: newRevision,
+          epoch: head.epoch, ciphertext: destinationBytes }]);
+        await guard();
+        archiveAttempted = true;
         const archiveReceipt = await input.archiveKeys({ challenge: archiveChallenge,
           entries: archiveEntries });
         await guard();
@@ -325,24 +344,6 @@
           await guard();
         }
         rawNewCek.fill(0); rawNewCek = null;
-        // Verify the independent catalog proof signer is reachable and still
-        // controls its pinned key BEFORE any irreversible ciphertext/CAS write.
-        // This fresh preflight does not stand in for final post-CAS evidence.
-        const preflightChallenge = { purpose: "precommit", objectId: source.object_id,
-          revision: newRevision, epoch: head.epoch,
-          ciphertextDigest: b64(newDigest), manifestRevision: head.revision,
-          manifestDigest: b64(digestHead), previousSequence: input.catalog.sequence,
-          previousDigest: input.catalog.catalogDigest,
-          nonce: b64(crypto.getRandomValues(new Uint8Array(32))) };
-        const preflightProof = await input.catalogProof(preflightChallenge);
-        await guard();
-        await signedReceipt(input.catalogAuthorityPublicKey, COMMIT,
-          preflightChallenge, preflightProof);
-        // Journal is written before the PUT. Catalog writes are strictly
-        // additive; no old row/ciphertext is omitted or overwritten.
-        journalId = await input.catalogWriter.prepareIntent([{
-          objectId: source.object_id, revision: newRevision,
-          epoch: head.epoch, ciphertext: destinationBytes }]);
         await guard();
         const put = await http.signProtectedContentOperation({
           ...signer, nowSeconds: time(input.nowSeconds), operation: "put",
@@ -457,6 +458,17 @@
             revision: pendingRevision, journalId, phase: "ciphertext_readback",
             ciphertextPutMayHaveCommitted: true,
             ciphertextReadbackVerified: false, signedCatalogReadbackVerified: false,
+            retrySafe: false, logicalStateFinalized: false });
+          throw error;
+        }
+        if (archiveAttempted) {
+          // Key escrow is an externally durable side effect. Without an ACK
+          // we cannot declare the operation absent or silently retry it.
+          const error = new Error("ZK_LOGICAL_TRASH_ARCHIVE_UNCERTAIN");
+          error.code = error.message;
+          error.outcome = Object.freeze({ objectId: pendingObjectId,
+            revision: pendingRevision, journalId, phase: "key_archive",
+            archiveMayHaveCommitted: true, ciphertextPutMayHaveCommitted: false,
             retrySafe: false, logicalStateFinalized: false });
           throw error;
         }
