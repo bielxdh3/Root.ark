@@ -294,12 +294,6 @@
           { metadata: next, revision: newRevision, ciphertext: destinationBytes,
             cek: rawNewCek, state: input.action === "trash" ? "trashed" : "file" },
         ];
-        const nonce = b64(crypto.getRandomValues(new Uint8Array(32)));
-        const archiveChallenge = { ...scope, objectId: source.object_id, action: input.action,
-          epoch: head.epoch, nonce, entries: await Promise.all(archiveEntries.map(async (entry) => ({
-            revision: entry.revision, versionId: entry.metadata.version_id,
-            ciphertextDigest: b64(await sha(entry.ciphertext)),
-          }))) };
         // Establish the independently signed catalog authority before any
         // external key custody or ciphertext side effect.
         const preflightChallenge = { purpose: "precommit", objectId: source.object_id,
@@ -318,6 +312,16 @@
           objectId: source.object_id, revision: newRevision,
           epoch: head.epoch, ciphertext: destinationBytes }]);
         await guard();
+        // The signed, durable journal ID is also the CEK archive challenge
+        // nonce. A reconnecting browser can re-read the exact escrowed key
+        // without depending on a lost in-memory random nonce or retrying PUT.
+        from64(journalId, 32);
+        const nonce = journalId;
+        const archiveChallenge = { ...scope, objectId: source.object_id, action: input.action,
+          epoch: head.epoch, nonce, entries: await Promise.all(archiveEntries.map(async (entry) => ({
+            revision: entry.revision, versionId: entry.metadata.version_id,
+            ciphertextDigest: b64(await sha(entry.ciphertext)),
+          }))) };
         archiveAttempted = true;
         const archiveReceipt = await input.archiveKeys({ challenge: archiveChallenge,
           entries: archiveEntries });
@@ -481,7 +485,103 @@
         oldPlain?.data?.fill(0);
       }
     }
+    // Reconnect after a signed catalog CAS has committed, but the final ACK or
+    // lifecycle proof was lost. This is explicitly a read-only recovery of a
+    // TRASH commit: no PUT, no catalog commit, no plaintext release. A future
+    // restore needs its own signed transaction and must not infer permission.
+    async function reconcileCommittedTrash(input) {
+      let sourceBytes, destinationBytes, opened;
+      try {
+        exact(input, ["catalogWriter", "journalId", "pinnedCatalogHead",
+          "sourceMetadata", "destinationMetadata", "sourceRevision",
+          "destinationRevision", "readArchivedCek", "assertLive"]);
+        const writer = input.catalogWriter;
+        if (typeof writer?.readAll !== "function"
+          || typeof writer?.readVerifiedCiphertext !== "function"
+          || typeof writer?.confirmPendingIntent !== "function"
+          || typeof input.readArchivedCek !== "function"
+          || typeof input.assertLive !== "function") deny();
+        const journalId = b64(from64(input.journalId, 32));
+        const source = metadata(input.sourceMetadata);
+        const target = metadata(input.destinationMetadata);
+        const sourceRevision = input.sourceRevision;
+        const targetRevision = input.destinationRevision;
+        if (!Number.isSafeInteger(sourceRevision) || sourceRevision < 1
+          || sourceRevision >= Number.MAX_SAFE_INTEGER
+          || targetRevision !== sourceRevision + 1
+          || source.object_id !== target.object_id
+          || SCOPE.some((field) => source[field] !== target[field])
+          || target.parent_version_id !== source.version_id
+          || target.epoch < source.epoch) deny();
+        const outOfBand = exact(input.pinnedCatalogHead, ["sequence", "digest"]);
+        const sequence = outOfBand.sequence;
+        const digest = b64(from64(outOfBand.digest, 32));
+        if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence > 128) deny();
+        const live = () => input.assertLive();
+        live();
+        const snapshot = await writer.readAll();
+        live();
+        if (snapshot?.head?.sequence !== sequence
+          || !equal(bytes(snapshot.head.digest, 32), from64(digest, 32))
+          || !Array.isArray(snapshot.rows)) deny();
+        const selected = [sourceRevision, targetRevision].map((revision) => {
+          const found = snapshot.rows.filter((row) => row.object_id === source.object_id
+            && row.revision === revision);
+          if (found.length !== 1) deny();
+          return found[0];
+        });
+        if (selected[0].epoch !== source.epoch || selected[1].epoch !== target.epoch
+          || snapshot.rows.some((row) => row.object_id === source.object_id
+            && row.revision > targetRevision)) deny();
+        const scope = Object.fromEntries(SCOPE.map((field) => [field, source[field]]));
+        const keys = [];
+        for (const [index, item] of [source, target].entries()) {
+          const revision = index ? targetRevision : sourceRevision;
+          const recovered = await input.readArchivedCek({ ...scope,
+            objectId: source.object_id, revision, versionId: item.version_id,
+            nonce: journalId });
+          cek(recovered);
+          keys.push(recovered);
+          live();
+        }
+        const sourceGet = await writer.readVerifiedCiphertext(snapshot,
+          source.object_id, sourceRevision);
+        live();
+        const targetGet = await writer.readVerifiedCiphertext(snapshot,
+          target.object_id, targetRevision);
+        live();
+        if (sourceGet.objectId !== source.object_id || targetGet.objectId !== target.object_id
+          || sourceGet.revision !== sourceRevision || targetGet.revision !== targetRevision
+          || sourceGet.epoch !== source.epoch || targetGet.epoch !== target.epoch) deny();
+        sourceBytes = from64(sourceGet.ciphertextBase64, 16, MAX);
+        destinationBytes = from64(targetGet.ciphertextBase64, 16, MAX);
+        if (!equal(await sha(sourceBytes), bytes(selected[0].ciphertext_digest, 32))
+          || !equal(await sha(destinationBytes), bytes(selected[1].ciphertext_digest, 32))) deny();
+        opened = await content.decryptFile({ cek: keys[0],
+          metadata: source, envelopeBytes: sourceBytes });
+        if (opened.authorizesRelease === true) deny();
+        opened.data.fill(0); opened = null;
+        await openTombstone(keys[1], target, destinationBytes,
+          predecessor(sourceRevision, b64(bytes(selected[0].ciphertext_digest, 32)),
+            source.version_id));
+        live();
+        // The signed journal is checked AGAIN against independently pinned
+        // CAS, complete history, exact protected GET and signer identity before
+        // deletion. This also forbids replay of a competing/newer commit.
+        if (await writer.confirmPendingIntent(journalId) !== true) deny();
+        live();
+        return Object.freeze({ objectId: source.object_id, revision: targetRevision,
+          state: "trashed", signedCatalogCommitVerified: true,
+          archivedCeksReadbackVerified: true, sourceHistoricalVersionPreserved: true,
+          ciphertextReadbackVerified: true, productionDurabilityProven: false,
+          permanentDeletionAuthorized: false, authorizesProductionIo: false });
+      } catch (_) { deny(); }
+      finally {
+        sourceBytes?.fill(0); destinationBytes?.fill(0);
+        opened?.data?.fill(0);
+      }
+    }
     return Object.freeze({ trash: (input) => change({ ...input, action: "trash" }),
       restore: (input) => change({ ...input, action: "restore" }),
-      permanentDelete: noPermanentDelete });
+      reconcileCommittedTrash, permanentDelete: noPermanentDelete });
   }));

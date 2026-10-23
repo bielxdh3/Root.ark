@@ -415,16 +415,19 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
     for (const name of ["account_id", "compartment_id", "keyring_id"])
       assert.equal(challenge[name], scopeWire[name], "custody receipt must bind owner scope");
     for (const entry of entries) archived.set(entry.revision, {
+      nonce: challenge.nonce,
       cek: ArrayBuffer.isView(entry.cek) ? Buffer.from(entry.cek) : entry.cek,
       bytes: Buffer.from(entry.ciphertext), metadata: entry.metadata });
     return realm({ signatureBase64: sign(archivePrefix, challenge, archiveAuthority.privateKey) });
   };
-  const readArchivedCek = async ({ account_id, compartment_id, keyring_id, revision, versionId }) => {
+  const readArchivedCek = async ({ account_id, compartment_id, keyring_id, revision, versionId,
+    nonce }) => {
     assert.equal(account_id, scopeWire.account_id);
     assert.equal(compartment_id, scopeWire.compartment_id);
     assert.equal(keyring_id, scopeWire.keyring_id);
     const saved = archived.get(revision);
-    if (!saved || saved.metadata.version_id !== versionId) throw Error("MISSING_ARCHIVE_CEK");
+    if (!saved || saved.metadata.version_id !== versionId
+      || (nonce !== undefined && nonce !== saved.nonce)) throw Error("MISSING_ARCHIVE_CEK");
     // The lifecycle now escrows a transient raw32 for the new tombstone and
     // immediately imports it as a nonextractable CryptoKey for operations.
     return operableCek(saved.cek);
@@ -439,8 +442,8 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
     return true;
   };
   const writerJournals = [];
-  const makeWriter = (seq, digest) => {
-    const journal = new Map();
+  const makeWriter = (seq, digest, savedJournal = null) => {
+    const journal = savedJournal ?? new Map();
     writerJournals.push(journal);
     return runtime.RootarkZk1BrowserOpaqueCatalogCommit.createClient(Object.assign(realm({}), {
       origin: origin + "/", fetchImpl, ownerPublicKey,
@@ -827,6 +830,55 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
   assert.equal(badFinalProof.outcome.retrySafe, false);
   assert.equal(writerJournals.at(-1).size, 1,
     "pending signed intent must remain durable for reconciliation after final proof failure");
+  const stranded = writerJournals.at(-1);
+  const pendingId = badFinalProof.outcome.journalId;
+  assert.equal(archived.get(5).nonce, pendingId,
+    "archived CEK challenge survives browser restart as signed journal identity");
+  const recoveredWriter = makeWriter(4, Buffer.from(restored.catalogDigestBase64, "base64url"),
+    stranded);
+  const lastTrash = archived.get(5);
+  const resume = (overrides = {}) => Object.assign(realm({}), {
+    catalogWriter: recoveredWriter, journalId: pendingId,
+    pinnedCatalogHead: realm({ sequence: 5, digest: badFinalProof.outcome.catalogDigestBase64 }),
+    sourceMetadata: realm(restored.metadata), destinationMetadata: realm(lastTrash.metadata),
+    sourceRevision: 4, destinationRevision: 5,
+    readArchivedCek, assertLive, ...overrides,
+  });
+  const beforeReconnectPuts = puts, beforeReconnectCommits = sequence;
+  await assert.rejects(trash.reconcileCommittedTrash(resume({
+    destinationMetadata: realm({ ...lastTrash.metadata,
+      parent_version_id: sourceMetadata.version_id }),
+  })), /ZK_LOGICAL_TRASH_DENIED/,
+  "reconnection must reject forged tombstone ancestry and keep the signed journal");
+  assert.equal(stranded.size, 1);
+  await assert.rejects(trash.reconcileCommittedTrash(resume({
+    pinnedCatalogHead: realm({ sequence: 4, digest: restored.catalogDigestBase64 }),
+  })), /ZK_LOGICAL_TRASH_DENIED/, "rollback floor cannot settle a lost ACK");
+  assert.equal(stranded.size, 1);
+  await assert.rejects(trash.reconcileCommittedTrash(resume({
+    readArchivedCek: async ({ revision }) => revision === 5
+      ? file.generateFileCek() : readArchivedCek({ ...scopeWire,
+        objectId: sourceId, revision, versionId: restored.metadata.version_id }),
+  })), /ZK_LOGICAL_TRASH_DENIED/, "forged CEK cannot clear a journal");
+  assert.equal(stranded.size, 1);
+  await assert.rejects(trash.reconcileCommittedTrash(resume({
+    readArchivedCek: (selection) => readArchivedCek({ ...selection,
+      nonce: b64(crypto.randomBytes(32)) }),
+  })), /ZK_LOGICAL_TRASH_DENIED/, "wrong CEK archive nonce cannot clear a journal");
+  assert.equal(stranded.size, 1);
+  const reconciled = await trash.reconcileCommittedTrash(resume());
+  assert.equal(reconciled.state, "trashed");
+  assert.equal(reconciled.revision, 5);
+  assert.equal(reconciled.signedCatalogCommitVerified, true);
+  assert.equal(reconciled.productionDurabilityProven, false);
+  assert.equal(stranded.size, 0, "reconnected device clears only verified immutable intent");
+  assert.equal(puts, beforeReconnectPuts, "reconnection never repeats ciphertext PUT");
+  assert.equal(sequence, beforeReconnectCommits, "reconnection never repeats CAS commit");
+  const independentlyObserved5 = await secondInspection(5,
+    badFinalProof.outcome.catalogDigestBase64,
+    [...inspectedMetadata, restored.metadata, lastTrash.metadata]);
+  assert.equal(independentlyObserved5.state, "trashed",
+    "second owner device sees the same committed tombstone after reconnect");
 
   // Real HTTP PUT commits the next immutable version, but its subsequent GET
   // confirmation disappears. The client must report an uncertain I/O result,
