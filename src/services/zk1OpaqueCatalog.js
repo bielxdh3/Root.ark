@@ -7,6 +7,7 @@
 // monotonically advancing head. Local SQLite is never a head authority.
 const crypto = require("node:crypto");
 const z = require("../crypto/rootark-zk-1");
+const { auditZk1CatalogReendorsement } = require("./zk1CatalogReendorsement");
 
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0", "ascii");
 const PAGE_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-page/v1\0", "ascii");
@@ -239,8 +240,9 @@ class Zk1OpaqueCatalog {
       fail("ZK_CATALOG_UNAVAILABLE");
     }
   }
-  async verifyStoredChain(key, current) {
+  async verifyStoredChain(key, current, activeManifest) {
     let previous = Buffer.from(EMPTY);
+    let previousPages = [];
     for (let seq = 1; seq <= current.sequence; seq++) {
       const saved = this.snapshot.get(key, seq);
       if (!saved || saved.header.length > MAX_HEAD_BYTES
@@ -252,13 +254,48 @@ class Zk1OpaqueCatalog {
       if (header.sequence !== seq || !same(Buffer.from(header.previous_digest), previous)) {
         fail("ZK_CATALOG_UNAVAILABLE");
       }
+      if (!same(Buffer.from(await z.encodeDeterministic(header)), saved.header)
+        || header.manifest_revision > Number(activeManifest.revision)
+        || header.epoch > Number(activeManifest.current_epoch)) fail("ZK_CATALOG_UNAVAILABLE");
+      // A revoked signer remains valid ONLY for a head committed in an older
+      // epoch. Its historical signature is verified against the owner-rooted
+      // roster, but that key is never accepted to authorize fresh catalog I/O.
+      const signer = activeManifest.devices.find((device) =>
+        device.device_id === header.signer_device_id
+        && Number(device.enrolled_epoch) <= header.epoch
+        && (device.revoked_at_epoch === null
+          || header.epoch < Number(device.revoked_at_epoch)));
+      if (!signer || !crypto.verify(null, Buffer.concat([HEAD_DOMAIN, saved.header]),
+        crypto.createPublicKey({ key: Buffer.concat([
+          ED_SPKI, buf(signer.authorization_public_key, 32)]), format: "der", type: "spki" }),
+        buf(saved.signature, 64))) fail("ZK_CATALOG_UNAVAILABLE");
       const pageCount = this.store.db.prepare(
         "SELECT COUNT(*) AS n FROM zk_content_catalog_page WHERE scope=? AND sequence=?")
         .get(key, seq).n;
       if (pageCount !== header.page_digests.length) fail("ZK_CATALOG_UNAVAILABLE");
+      const archivedPages = [];
+      for (let page = 0; page < pageCount; page++) {
+        const stored = this.page.get(key, seq, page);
+        if (!stored || stored.body.length > MAX_PAGE_BYTES) fail("ZK_CATALOG_UNAVAILABLE");
+        const entries = await z.decodeDeterministic(stored.body);
+        if (!same(Buffer.from(await z.encodeDeterministic(entries)), stored.body)
+          || !same(await digestPage(entries), Buffer.from(header.page_digests[page]))) {
+          fail("ZK_CATALOG_UNAVAILABLE");
+        }
+        archivedPages.push(entries);
+      }
+      const normalized = await normalizePages(archivedPages);
+      if (normalized.flat().length !== header.total_count) fail("ZK_CATALOG_UNAVAILABLE");
+      if (seq > 1) {
+        try {
+          auditZk1CatalogReendorsement({ previousPages, proposedPages: normalized });
+        } catch (_) { fail("ZK_CATALOG_UNAVAILABLE"); }
+      }
+      previousPages = normalized;
       previous = Buffer.from(saved.digest);
     }
     if (!same(previous, current.digest)) fail("ZK_CATALOG_UNAVAILABLE");
+    return previousPages;
   }
   async commit({ scope, authorization, signature, header, headerSignature, pages,
     emit = (result) => result }) {
@@ -292,20 +329,17 @@ class Zk1OpaqueCatalog {
         const key = scopeKey(wanted);
         const current = await this.fresh(auth);
         this.localMatches(key, current);
-        await this.verifyStoredChain(key, current);
+        const previousPages = await this.verifyStoredChain(key, current,
+          auth.verifiedHeadManifest);
         if (current.sequence >= MAX_HEADS
           || header.sequence !== current.sequence + 1
           || !same(buf(header.previous_digest, 32), current.digest)) fail("ZK_CATALOG_CONFLICT");
         // Owner-authorized signer cannot attest a conveniently omitted list:
         // compare every immutable locally archived ciphertext VERSION exactly.
-        const rows = this.store.db.prepare("SELECT id,revision,epoch,ciphertext_digest FROM zk_content_version WHERE scope=? ORDER BY id COLLATE BINARY,revision").all(key);
-        const listed = normalized.flat();
-        if (rows.length !== listed.length || rows.length > MAX_ENTRIES) fail("ZK_CATALOG_CONFLICT");
-        for (let i = 0; i < rows.length; i++) {
-          if (rows[i].id !== listed[i].object_id
-            || rows[i].revision !== listed[i].revision || rows[i].epoch !== listed[i].epoch
-            || !same(rows[i].ciphertext_digest, listed[i].ciphertext_digest)) fail("ZK_CATALOG_CONFLICT");
-        }
+        const rows = this.store.db.prepare("SELECT id,revision,epoch,ciphertext,ciphertext_digest FROM zk_content_version WHERE scope=? ORDER BY id COLLATE BINARY,revision").all(key);
+        if (rows.length > MAX_ENTRIES) fail("ZK_CATALOG_CONFLICT");
+        auditZk1CatalogReendorsement({ previousPages, proposedPages: normalized,
+          physicalVersions: rows });
         this.consume(auth);
         // Authority must atomically CAS independently of local SQLite. A
         // lost ACK may leave the catalog unavailable until audited recovery.
@@ -347,7 +381,7 @@ class Zk1OpaqueCatalog {
         const current = await this.fresh(auth);
         const key = scopeKey(this.store.trustedScope);
         this.localMatches(key, current);
-        await this.verifyStoredChain(key, current);
+        await this.verifyStoredChain(key, current, auth.verifiedHeadManifest);
         if (current.sequence < 1) fail("ZK_CATALOG_NOT_FOUND");
         if (auth.request.expected_object_revision !== current.sequence
           || !same(auth.request.ciphertext_digest, current.digest)) fail("ZK_CATALOG_CONFLICT");
