@@ -101,9 +101,21 @@ async function readJson(filePath, fallback) {
 
 async function writeJsonAtomic(filePath, data) {
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.tmp-${process.pid}`;
-  await fsp.writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
-  await fsp.rename(tempPath, filePath);
+  const tempPath = `${filePath}.tmp-${crypto.randomBytes(16).toString("hex")}`;
+  let created = false;
+  try {
+    // Exclusive creation prevents a planted symlink/hardlink from receiving
+    // credentials or causing an unrelated file to be truncated.
+    const handle = await fsp.open(tempPath, "wx", 0o600);
+    created = true;
+    try {
+      await handle.writeFile(`${JSON.stringify(data, null, 2)}\n`, "utf8");
+      await handle.sync();
+    } finally { await handle.close(); }
+    await fsp.rename(tempPath, filePath);
+  } finally {
+    if (created) await fsp.rm(tempPath, { force: true });
+  }
 }
 
 async function loadConfig(configPath) {
@@ -131,6 +143,8 @@ async function login(serverUrl, username, password) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
+    // A 307/308 can replay the password body to an attacker-controlled origin.
+    redirect: "error",
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || !payload.token) {
@@ -154,6 +168,8 @@ async function authFetch(config, configPath, urlPath, options = {}) {
   const token = await ensureToken(config, configPath, options.passwordProvider);
   const response = await fetch(`${config.serverUrl}${urlPath}`, {
     ...options,
+    // Never replay uploaded files or bearer-authenticated requests on redirects.
+    redirect: "error",
     headers: {
       Authorization: `Bearer ${token}`,
       ...(options.headers || {}),
@@ -165,6 +181,7 @@ async function authFetch(config, configPath, urlPath, options = {}) {
     const freshToken = await ensureToken(config, configPath, options.passwordProvider);
     return fetch(`${config.serverUrl}${urlPath}`, {
       ...options,
+      redirect: "error",
       headers: {
         Authorization: `Bearer ${freshToken}`,
         ...(options.headers || {}),
