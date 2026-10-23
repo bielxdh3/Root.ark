@@ -16,6 +16,7 @@ const signedRoots = require("../public/client/rootark-zk1-owner-ciphertext-root-
 const history = require("../public/client/rootark-zk1-owner-signed-checkpoint");
 const migration = require("../public/client/rootark-zk1-legacy-migration-workflow");
 const batch = require("../public/client/rootark-zk1-legacy-batch-migration");
+const selection = require("../public/client/rootark-zk1-owner-legacy-batch-selection");
 const transition = require("../public/client/rootark-zk1-legacy-transition-receipt");
 const { Zk1ProtectedObjectStore } = require("../src/services/zk1ProtectedObjectStore");
 const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
@@ -485,6 +486,70 @@ function batchInput(f, entries, overrides = {}) {
     fetchImpl: f.realFetch, journal: f.input.journal,
     nowSeconds: f.input.nowSeconds, ...overrides };
 }
+
+test("owner legacy selection loads in browser WebCrypto UMD without Node imports", () => {
+  const ctx = vm.createContext({ crypto: crypto.webcrypto,
+    TextEncoder, Uint8Array, ArrayBuffer, atob, btoa });
+  vm.runInContext(fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-owner-legacy-batch-selection.js"), "utf8"), ctx);
+  assert.equal(vm.runInContext(
+    "typeof RootarkZk1OwnerLegacyBatchSelection.signOwnerSelection", ctx), "function");
+  assert.equal(vm.runInContext(
+    "typeof RootarkZk1OwnerLegacyBatchSelection.verifyOwnerSelection", ctx), "function");
+});
+
+test("opt-in owner-signed whole batch selection gates authenticated historical migration before network", async (t) => {
+  const f = await fixture(t);
+  f.setVersion(2, "owner selected second version");
+  const entries = [f.versionEntry(1), f.versionEntry(2, await file.generateFileCek())];
+  const signed = await selection.signOwnerSelection({ optIn: true, entries,
+    trust: f.input.trust, ownerSigningKey: f.ownerPair.privateKey,
+    migrationSecret: Buffer.alloc(32, 0x73),
+    issuedAt: 1399, expiresAt: 1500, nonce: id() });
+  const approved = { signedSelection: signed.signedSelection,
+    independentlyPinnedSelectionSha256: signed.selectionSha256 };
+  const valid = batchInput(f, entries, { selectionApproval: approved });
+  const rejectBeforeNetwork = async (override) => {
+    let requests = 0;
+    await assert.rejects(batch.runLegacyMigrationBatch({ ...valid, ...override,
+      fetchImpl: async () => { requests++; throw Error("must not fetch"); } }),
+    /ZK_LEGACY_BATCH_UNVERIFIED/);
+    assert.equal(requests, 0);
+    assert.equal(f.writes, 0);
+  };
+  await rejectBeforeNetwork({ entries: [entries[0]] });
+  await rejectBeforeNetwork({ entries: [...entries].reverse() });
+  await rejectBeforeNetwork({ entries: [entries[0], { ...entries[1],
+    sourcePin: { ...entries[1].sourcePin, size: entries[1].sourcePin.size + 1 } }] });
+  await rejectBeforeNetwork({ selectionApproval: { ...approved,
+    independentlyPinnedSelectionSha256: crypto.randomBytes(32) } });
+  await rejectBeforeNetwork({ selectionApproval: { ...approved, signedSelection: {
+    ...approved.signedSelection, signature: b64(crypto.randomBytes(64)) } } });
+  const forgedSigned = { ...approved.signedSelection, signature: b64(crypto.randomBytes(64)) };
+  await rejectBeforeNetwork({ selectionApproval: { signedSelection: forgedSigned,
+    independentlyPinnedSelectionSha256: digest(Buffer.from(JSON.stringify(forgedSigned))) } });
+  await rejectBeforeNetwork({ trust: { ...f.input.trust,
+    independentOwnerSpkiSha256: crypto.randomBytes(32) } });
+  await rejectBeforeNetwork({ trust: { ...f.input.trust,
+    pinnedCurrentHead: { ...f.input.trust.pinnedCurrentHead, epoch: 99 } } });
+  await rejectBeforeNetwork({ nowSeconds: 1501 });
+  await rejectBeforeNetwork({ migrationSecret: crypto.randomBytes(32) });
+  const falseCoverage = { ...approved.signedSelection,
+    coverage: { ...approved.signedSelection.coverage, derived: "clear" } };
+  await rejectBeforeNetwork({ selectionApproval: { signedSelection: falseCoverage,
+    independentlyPinnedSelectionSha256: digest(Buffer.from(JSON.stringify(falseCoverage))) } });
+  const foreignSigner = await importedPair(crypto.generateKeyPairSync("ed25519"));
+  await assert.rejects(selection.signOwnerSelection({ optIn: true, entries,
+    trust: f.input.trust, ownerSigningKey: foreignSigner.privateKey,
+    migrationSecret: Buffer.alloc(32, 0x73), issuedAt: 1399, expiresAt: 1500, nonce: id() }),
+  /ZK_LEGACY_SELECTION_UNVERIFIED/);
+  assert.equal(f.writes, 0);
+  const result = await batch.runLegacyMigrationBatch(valid);
+  assert.equal(result.verified, 2);
+  assert.equal(result.wholeCorpusVerified, false);
+  assert.equal(result.canDeleteLegacy, false);
+  assert.equal(f.writes, 2);
+});
 
 test("batch transition labels staged, mixed and verified-protected selected versions without corpus cutover", async (t) => {
   const f = await fixture(t);

@@ -8,6 +8,28 @@ reference switch, trash restoration, provider durability claim, or production
 authorization is possible. It is intentionally not connected to the shared
 authenticated workspace UI.
 
+An optional owner-held signed selection gate is available before any legacy
+GET or protected PUT: construct a selection with
+`rootark-zk1-owner-legacy-batch-selection.js` using
+`signOwnerSelection({optIn:true,entries,trust,ownerSigningKey,migrationSecret,
+issuedAt,expiresAt,nonce})`. Retain its `selectionSha256` independently
+of the application server, and pass the returned `signedSelection` plus
+`independentlyPinnedSelectionSha256` in `selectionApproval` to
+`runLegacyMigrationBatch`. The owner key must be non-extractable Ed25519.
+The signature binds all selected historical source pins in their exact order,
+the migration-secret digest, owner SPKI SHA-256, owner scope and pinned head,
+with a maximum 24-hour validity. Changed, omitted, reordered, replayed,
+expired or forged selections fail before network I/O. A batch without the
+optional `selectionApproval` follows the existing DEV behavior.
+
+This proves only explicit owner authorization of the selected subset. The
+signed evidence labels backups, trash, links, derived files, retention,
+archives and providers `unknown` and labels historical versions
+`selected-only`. It cannot prove completeness of a legacy corpus or
+authorize deletion, restore, production or cutover. Keep the independent
+owner/head anchors, private key, secret and separately pinned selection digest
+off the server.
+
 Each entry contains `{ legacy: { name, folderId }, sourcePin, cek }`.
 `sourcePin` must contain exactly `version` (positive number), `storedAs`,
 `uploadedAt`, `size`, `lastModified` (canonical HTTP GMT timestamp),

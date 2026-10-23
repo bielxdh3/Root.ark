@@ -1,12 +1,13 @@
 (function (root, factory) {
   if (typeof module === "object" && module.exports) {
     module.exports = factory(require("node:crypto").webcrypto,
-      require("./rootark-zk1-legacy-migration-workflow"));
+      require("./rootark-zk1-legacy-migration-workflow"),
+      require("./rootark-zk1-owner-legacy-batch-selection"));
   } else {
     root.RootarkZk1LegacyBatchMigration = factory(root.crypto,
-      root.RootarkZk1LegacyMigrationWorkflow);
+      root.RootarkZk1LegacyMigrationWorkflow, root.RootarkZk1OwnerLegacyBatchSelection);
   }
-}(typeof globalThis === "object" ? globalThis : this, function (crypto, migration) {
+}(typeof globalThis === "object" ? globalThis : this, function (crypto, migration, selection) {
   "use strict";
   // DEV, opt-in and non-destructive. All historical revisions become distinct
   // immutable ZK objects (revision 1); no legacy restore/delete or ZK cutover.
@@ -142,7 +143,8 @@
   async function runLegacyMigrationBatch(input) {
     exact(input, ["optIn", "entries", "migrationSecret", "trust", "origin",
       "fetchImpl", "journal", "nowSeconds",
-      ...(Object.hasOwn(input || {}, "transitionApprovals") ? ["transitionApprovals"] : [])]);
+      ...(Object.hasOwn(input || {}, "transitionApprovals") ? ["transitionApprovals"] : []),
+      ...(Object.hasOwn(input || {}, "selectionApproval") ? ["selectionApproval"] : [])]);
     if (input.optIn !== true || !Array.isArray(input.entries)
       || input.entries.length < 1 || input.entries.length > LIMIT
       || !(input.migrationSecret instanceof Uint8Array)
@@ -177,13 +179,37 @@
     if (!Number.isSafeInteger(head.revision) || !Number.isSafeInteger(head.epoch)
       || head.revision < 1 || head.epoch < 1) refuse();
     const secret = new Uint8Array(input.migrationSecret);
+    // Freeze the whole selection before awaiting signatures or performing
+    // network I/O. CryptoKeys are intentionally retained as opaque handles.
+    const chosen = input.entries.map((selected) => {
+      validateEntry(selected);
+      return { legacy: { ...selected.legacy },
+        sourcePin: { ...selected.sourcePin }, cek: selected.cek };
+    });
+    if (Object.hasOwn(input, "selectionApproval")) {
+      const approval = input.selectionApproval;
+      exact(approval, ["signedSelection", "independentlyPinnedSelectionSha256"]);
+      try {
+        await selection.verifyOwnerSelection({ optIn: true,
+          signedSelection: approval.signedSelection,
+          independentlyPinnedSelectionSha256: approval.independentlyPinnedSelectionSha256,
+          entries: chosen.map(({ legacy, sourcePin }) => ({ legacy, sourcePin })),
+          trust: input.trust, migrationSecret: secret, nowSeconds: input.nowSeconds });
+      } catch (_) { secret.fill(0); refuse(); }
+      const current = input.trust;
+      if (SCOPE.some((field) => current.signedDeviceGrant[field] !== scope[field])
+        || b64(new Uint8Array(current.independentOwnerSpkiSha256)) !== ownerPin
+        || current.pinnedCurrentHead.revision !== head.revision
+        || current.pinnedCurrentHead.epoch !== head.epoch
+        || b64(new Uint8Array(current.pinnedCurrentHead.digest)) !== head.digest) {
+        secret.fill(0);
+        refuse();
+      }
+    }
     const prepared = [];
     const seen = new Set();
     try {
-      for (const selected of input.entries) {
-        validateEntry(selected);
-        const entry = { legacy: { ...selected.legacy }, sourcePin: { ...selected.sourcePin },
-          cek: selected.cek };
+      for (const entry of chosen) {
         const identity = JSON.stringify({ legacy: entry.legacy,
           version: entry.sourcePin.version });
         if (seen.has(identity)) refuse();
