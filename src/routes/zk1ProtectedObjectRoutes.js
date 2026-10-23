@@ -170,6 +170,36 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
     if (!store.signedHistoryRequired || typeof opaqueCatalog.commit !== "function"
       || typeof opaqueCatalog.read !== "function"
       || opaqueCatalog.store !== store) invalid();
+    // Relay only independently signed, nonce-bound authority statements. The
+    // browser verifies both signatures against user-held offline key pins; the
+    // application server cannot nominate a trusted key or invent a fresh head.
+    const authorityHead = (kind) => async (req, res) => {
+      try {
+        const scope = resolveTrustedScope(req.user);
+        if (!scope) invalid();
+        const user = { username: req.user.username, sessionVersion: req.user.sessionVersion };
+        exact(req.body, ["nonce"]);
+        const nonce = b64(req.body.nonce, 32);
+        if (nonce.length !== 32) invalid();
+        const signed = kind === "witness"
+          ? await store.witnessProvider.freshHead({ scope, nonce })
+          : await opaqueCatalog.authority.readHead({ scope, nonce });
+        const proof = Buffer.from(signed);
+        if (proof.length < 1 || proof.length > 8192) invalid();
+        recheckSession(req, user, scope, "listFiles");
+        if (res.destroyed || res.headersSent || res.writableEnded) invalid();
+        res.status(200).json(kind === "witness"
+          ? { receiptBase64: proof.toString("base64url") }
+          : { proofBase64: proof.toString("base64url") });
+      } catch (error) {
+        if (!res.headersSent && !res.destroyed) res.status(error?.httpStatus || 503)
+          .json({ error: "ZK_CATALOG_UNAVAILABLE" });
+      }
+    };
+    app.post("/zk-1/v1/catalog/authority/witness-head", fenceHeaders, authenticate,
+      requirePermission("listFiles"), parseSealedContent, authorityHead("witness"));
+    app.post("/zk-1/v1/catalog/authority/cas-head", fenceHeaders, authenticate,
+      requirePermission("listFiles"), parseSealedContent, authorityHead("cas"));
     const sendUnderGate = (res, status, recheck = null) => (result) => new Promise((resolve, reject) => {
       if (res.destroyed || res.writableEnded || res.headersSent) {
         return reject(new Error("ZK_CATALOG_UNAVAILABLE"));
