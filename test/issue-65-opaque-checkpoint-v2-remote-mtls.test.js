@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const Database = require("better-sqlite3");
 const { spawn } = require("node:child_process");
 const z = require("../src/crypto/rootark-zk-1");
 const ownerManifest = require("../src/crypto/rootark-zk-recovery-manifest-v2");
@@ -26,6 +27,8 @@ const { OpaqueCheckpointV2Authority,
   createOpaqueCheckpointV2HttpsServer, createOpaqueCheckpointV2HttpsClient,
   signCheckpointOwnerApprovalV2, createOpaqueCheckpointV2Coordinator } =
   require("../src/services/zk1OpaqueCheckpointV2Remote");
+const { Zk1OpaqueCheckpointV2Client } =
+  require("../src/services/zk1OpaqueCheckpointV2Client");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 
@@ -271,6 +274,27 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
     floor2.close(); cas2.close();
   }
   let handles = await serveV2({ dropCommit: true });
+  assert.throws(() => createOpaqueCheckpointV2Coordinator({
+    casClient: { role: "CAS", publicKey: v2CasKeys.publicKey,
+      head: async () => ({ state: "FINALIZED", sequence: 129 }) },
+    floorClient: handles.floorClient, trustedScope: scope,
+    expectedV1Digest: oldDigest, expectedV1Checkpoint: oldCheckpoint,
+    v1CasClient: v1Cas, v1FloorClient: v1Floor,
+  }), /ZK_CHECKPOINT_V2_UNAVAILABLE/,
+  "injected fake CAS client cannot manufacture a finalized global checkpoint");
+  const clientOptions = (endpoints, journalPath, bootstrapNew) => ({
+    journalPath, bootstrapNew, trustedScope: scope,
+    expectedV1Digest: oldDigest, expectedV1Checkpoint: oldCheckpoint,
+    v1CasClient: v1Cas, v1FloorClient: v1Floor,
+    casClient: endpoints.casClient, floorClient: endpoints.floorClient,
+    checkpointPublicKey: checkpoint.publicKey, ownerPublicKey: owner.publicKey,
+    catalogPublicKey: signerB, ownerTrust: trust,
+  });
+  const journal = path.join(dir, "v2-device-rollover.sqlite");
+  let client = new Zk1OpaqueCheckpointV2Client(clientOptions(handles, journal, true));
+  t.after(() => client.close());
+  await assert.rejects(client.read(), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+    "unsigned local sequence bump must never provide a v2 read");
   // Cryptographically valid-but-revoked device A must not authorize seq129,
   // even if the newly enrolled B independently signs the owner approval.
   const retiredHeader = { ...nextHeader, signer_device_id: deviceA.device_id };
@@ -314,7 +338,7 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
     for (const server of [floor2Server, cas2Server])
       if (server.listening) { server.closeAllConnections(); server.close(); }
   });
-  await assert.rejects(handles.coordinator.publish(intent), /ACK_UNCERTAIN/);
+  await assert.rejects(client.publishSignedIntent(intent), /ACK_UNCERTAIN/);
   console.error("STAGE: dropped ACK verified");
   assert.equal((await handles.floorClient.head()).state, "PREPARED");
   assert.equal((await handles.casClient.head()).state, "CAS_COMMITTED");
@@ -327,6 +351,14 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
     signingPrivateKey: v2CasKeys.privateKey });
   handles = await serveV2({});
   console.error("STAGE: v2 authorities restarted");
+  client.close();
+  client = new Zk1OpaqueCheckpointV2Client(clientOptions(handles, journal, false));
+  const recovered = await client.recover();
+  assert.equal(recovered.sequence, 129);
+  assert.equal(recovered.state, "V2_BOTH_FINALIZED");
+  assert.deepEqual(recovered.digest, newDigest);
+  assert.deepEqual(recovered.checkpointDigest, checkpoint129.checkpointDigest);
+  assert.equal((await client.read()).sequence, 129);
   const finished = await handles.coordinator.reconcile(intent);
   assert.equal(finished.finalSequence, 129);
   assert.equal(finished.outcome, "V2_CHECKPOINT_BOTH_FINALIZED_LOCAL_ONLY");
@@ -337,11 +369,38 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   await assert.rejects(handles.coordinator.publish(await makeIntent()),
     /CONFLICT/);
   assert.deepEqual((await handles.coordinator.reconcile(intent)).outcome, finished.outcome);
+  const differentKey = crypto.generateKeyPairSync("ed25519");
+  assert.throws(() => new Zk1OpaqueCheckpointV2Client({
+    ...clientOptions(handles, journal, false),
+    ownerPublicKey: differentKey.publicKey,
+  }), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+  "restart cannot silently accept an owner or endpoint-signing key substitution");
+  const tamperedJournalPath = path.join(dir, "v2-tampered-device.sqlite");
+  const copySource = new Database(journal, { readonly: true, fileMustExist: true });
+  await copySource.backup(tamperedJournalPath);
+  copySource.close();
+  if (process.platform !== "win32") fs.chmodSync(tamperedJournalPath, 0o600);
+  const attacked = new Database(tamperedJournalPath);
+  attacked.exec("DROP TRIGGER intent_immutable_update");
+  const edited = await z.decodeDeterministic(intent);
+  edited.owner_signature = crypto.randomBytes(64);
+  attacked.prepare("UPDATE intent SET bytes=? WHERE id=1")
+    .run(Buffer.from(await z.encodeDeterministic(edited)));
+  attacked.exec(`CREATE TRIGGER intent_immutable_update BEFORE UPDATE ON intent
+    BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;`);
+  attacked.close();
+  const contaminated = new Zk1OpaqueCheckpointV2Client(
+    clientOptions(handles, tamperedJournalPath, false));
+  await assert.rejects(contaminated.read(), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+    "locally altered checkpoint approval must never inherit valid remote finalization");
+  contaminated.close();
   // Actual v1 authorities remain immutable: 128 is not promoted in their DBs.
   assert.equal((await z.decodeDeterministic(await v1Cas.readHead({
     scope, nonce: crypto.randomBytes(32) }))).sequence, 128);
   assert.equal(floorLedger.inspect().sequence, 128);
   await stopV2();
+  await assert.rejects(client.read(), /ZK_CHECKPOINT_V2_ACK_UNCERTAIN/,
+    "offline CAS/floor must fence metadata read even after local recovery");
   // A second integration uses two separate OS processes and two new SQLite
   // stores. These are loopback hosts; not claimed to be physically independent.
   const putKey = (name, value) => fs.writeFileSync(path.join(dir, name),
@@ -413,11 +472,31 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
       v1CasClient: v1Cas, v1FloorClient: v1Floor,
       trustedScope: scope, expectedV1Digest: oldDigest,
       expectedV1Checkpoint: oldCheckpoint });
-    const [a, b] = await Promise.all([
-      remoteCoordinator.publish(intent), remoteCoordinator.publish(intent),
-    ]);
-    assert.equal(a.finalSequence, 129);
-    assert.equal(b.finalSequence, 129);
+    const remoteEndpoints = { casClient: remoteCas, floorClient: remoteFloor };
+    const remoteJournal = path.join(dir, "v2-device-fresh-publish.sqlite");
+    const remoteDevice = new Zk1OpaqueCheckpointV2Client(
+      clientOptions(remoteEndpoints, remoteJournal, true));
+    try {
+      // Device constructs a canonical signed 129 intent; the separate OS
+      // processes accept it only after independently authenticating the V1 128
+      // terminal and live owner-rooted witness.
+      const original = await z.decodeDeterministic(intent);
+      const signedApproval = await z.decodeDeterministic(original.owner_approval);
+      const signedCheckpoint = await z.decodeDeterministic(original.checkpoint_bytes);
+      const [published, competitor] = await Promise.all([
+        remoteDevice.publish({ record: records[0],
+          checkpointPrivateKey: checkpoint.privateKey,
+          ownerPrivateKey: owner.privateKey, ownerEvidence: original.owner_evidence,
+          operationId: original.operation_id,
+          issuedAt: signedCheckpoint.issued_at,
+          ownerIssuedAt: signedApproval.issued_at }),
+        remoteCoordinator.publish(intent),
+      ]);
+      assert.equal(published.sequence, 129);
+      assert.equal(competitor.finalSequence, 129);
+      assert.deepEqual(published.checkpointDigest, checkpoint129.checkpointDigest);
+      assert.equal((await remoteDevice.read()).sequence, 129);
+    } finally { remoteDevice.close(); }
     assert.equal((await remoteFloor.head()).state, "FINALIZED");
     assert.equal((await remoteCas.head()).state, "FINALIZED");
     await Promise.all([stopProcess(casProc.proc), stopProcess(floorProc.proc)]);

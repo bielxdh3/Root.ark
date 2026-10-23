@@ -50,6 +50,9 @@ const MAX_WIRE = 10 * 1024 * 1024;
 const MAX_OWNER = 2 * 1024 * 1024;
 const CERT_PIN = /^(?:[0-9a-f]{2}:){31}[0-9a-f]{2}$/i;
 const ZERO = Buffer.alloc(32);
+// A coordinator must never accept caller-supplied stand-ins whose head()
+// advertises FINALIZED without independently verifying a remote receipt.
+const pinnedV2Clients = new WeakSet();
 const domain = (part) => Buffer.from(PREFIX + part + "/v2\0");
 
 function fail(code = "ZK_CHECKPOINT_V2_UNAVAILABLE") {
@@ -614,6 +617,8 @@ function createOpaqueCheckpointV2HttpsClient({ endpoint, ca, clientKey, clientCe
   const cas = key(casPublicKey), floor = key(floorPublicKey);
   const scopeBytes = scopeOf(scope);
   const casFp = fp(cas), floorFp = fp(floor);
+  if (same(casFp, floorFp)
+    || (!same(fp(signer), casFp) && !same(fp(signer), floorFp))) fail();
   const pin = serverFingerprint256.toUpperCase();
   async function request(route, raw, proof) {
     const nonce = crypto.randomBytes(32);
@@ -690,7 +695,7 @@ function createOpaqueCheckpointV2HttpsClient({ endpoint, ca, clientKey, clientCe
     }
     return { ...receipt, state: receipt.state };
   }
-  return Object.freeze({
+  const client = Object.freeze({
     publicKey: signer, role: same(fp(signer), casFp) ? ROLE_CAS : ROLE_FLOOR,
     prepare: (raw) => request("/v2/prepare", raw),
     commit: (raw, floorPrepare) => request("/v2/commit", raw, floorPrepare),
@@ -698,13 +703,15 @@ function createOpaqueCheckpointV2HttpsClient({ endpoint, ca, clientKey, clientCe
     attest: (floorFinalized) => request("/v2/attest", null, floorFinalized),
     head: () => request("/v2/head"),
   });
+  pinnedV2Clients.add(client);
+  return client;
 }
 
 function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
   trustedScope, expectedV1Digest, expectedV1Checkpoint,
   v1CasClient, v1FloorClient }) {
-  if (!casClient || casClient.role !== ROLE_CAS
-    || !floorClient || floorClient.role !== ROLE_FLOOR
+  if (!pinnedV2Clients.has(casClient) || casClient.role !== ROLE_CAS
+    || !pinnedV2Clients.has(floorClient) || floorClient.role !== ROLE_FLOOR
     || same(fp(casClient.publicKey), fp(floorClient.publicKey))
     || !v1CasClient || typeof v1CasClient.readHead !== "function"
     || !isZk1OpaqueCatalogIndependentFloorClient(v1FloorClient)
