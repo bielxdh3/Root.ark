@@ -27,8 +27,10 @@ Ed25519 CAS head authority**. It cannot safely activate without that configured
 authority; normal application bootstrap keeps this integration disabled by
 default. Catalog entries expose opaque object ID, revision, epoch, ciphertext
 digest, padded 284-byte encrypted filename metadata, paging and sequencing;
-they must never contain plaintext `name` or `path`. The published implementation
-does not yet supply a complete automatic normal-browser bidirectional sync,
+they must never contain plaintext `name` or `path`. The normal authenticated
+browser now offers opt-in signed opaque catalog page discovery, changed-page
+comparison, AEAD filename display using a separately imported local key, and
+independently signed ciphertext GET, but **not** a complete bidirectional sync,
 delete/move/trash protocol or proven comprehensive inventory for objects absent
 from the owner-signed root. The separately signed offline backup inventory and
 keyring roster likewise attest only their explicitly signed and independently
@@ -97,11 +99,20 @@ prove these external workflows completed.
   witnessed owner candidate/commit/delivery, without a forged local witness.
 - `test/issue-65-legacy-transition-receipt.test.js`: signed per-version
   migration receipt without authorization to delete plaintext legacy sources.
+- `scripts/zk1-owner-offline-revoke-local.js` and
+  `test/issue-65-owner-offline-v2-revocation.test.js`: owner-local witnessed
+  revocation/epoch rotation, independent CAS proof, current survivors only.
+- `public/client/rootark-zk1-browser-catalog.js`: optional authenticated
+  browser read-only opaque catalog; externally pinned CAS, current signed
+  grants and IndexedDB floor without plaintext routing through sync-v2.
+- `test/issue-65-versioned-keyring-ciphertext-archive.test.js`: true Edge
+  multiversion signed-CBOR recovery plus adversarial roster substitution
+  regression; the second unsigned roster is rejected before minting authority.
 - `docs/architecture/zero-knowledge-migration-contract.md` and
   `docs/architecture/android-client-architecture.md`: target threat model,
   independent cross-client boundaries and metadata policy decisions.
 
-Update this register when a *further implemented and tested* zk-1 browser
-catalog, owner revocation/rotation or additional client is integrated.
+Update this register when any *further implemented and tested* zk-1 writable
+catalog, external CAS configuration, protected lifecycle or client is integrated.
 Do not weaken it with a production-readiness percentage or an unverified
 security guarantee.

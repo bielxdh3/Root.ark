@@ -2,6 +2,27 @@
 
 ## Current development addendum — 2026-10-23, issue #65 / PR #228
 
+**Additional integration after the published `0e571eb` milestone (local DEV
+checkpoint `df7c8f2`, pending next coherent push):** `9239e52` adds real Edge
+12-version archive creation and recovery assertions; `a8116a7` reconciles its
+test fixture with separately integrated legacy signed transition; `aa8091e`
+implements owner-local V2 revocation/epoch rotation requiring distinct
+independently pinned witness and CAS commitment with fresh HPKE wraps only for
+survivors; `e71ef3b` fixes a reproduced independently identified P2 browser
+roster substitution (RED before fix, GREEN after, strict pin and exact signed
+roster equality); `df7c8f2` adds the normal authenticated **read-only** ZK1
+opaque catalog UI, owner-pinned page/delta visibility and signed version GET.
+The combined checks on this local sequence yielded Node24 **70 PASS / 0 FAIL**,
+Node22 pure crypto **19 PASS / 0 FAIL**, syntax **492 / 0**, and a separate
+real Edge catalog+archive **11 PASS / 0 FAIL**. This is not a full-suite or
+exact-head CI verdict. The previous published `0e571eb` passed Ubuntu Node22,
+PostgreSQL18, JS/TS and dependency review, but the Windows Node22 job was
+**cancelled during the release gate**; the CodeQL policy still listed 62 alerts.
+Do not count a canceled job as a code failure, or static alerts as resolved.
+The browser catalog still requires independently pinned CAS/owner authority
+and user-imported head and remains read-only; owner revocation transfer is not
+automatic proof of current full V2 grant/history or remote key custody.
+
 This is an additive development snapshot, not a revision of the dated phase
 history below. The PR branch `cdx/rootark-dual-recovery-20261019` remains
 `OPEN/DRAFT` with issue #65 open; no merge, deployment or production activation
