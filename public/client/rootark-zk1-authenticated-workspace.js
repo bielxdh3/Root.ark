@@ -574,19 +574,57 @@
   function independentCatalogProbe(url, assertLive) {
     return async ({ scope, nonce }) => {
       assertLive();
-      const response = await fetch(url.href, {
-        method: "POST", mode: "cors", credentials: "omit", redirect: "error",
-        referrerPolicy: "no-referrer", cache: "no-store",
-        headers: { "content-type": "application/json", accept: "application/cbor" },
-        body: JSON.stringify({ scope, nonceBase64: to64(nonce) }),
-      });
-      assertLive();
-      if (response.status !== 200 || response.headers.get("content-type")?.split(";")[0].trim() !== "application/cbor"
-        || Number(response.headers.get("content-length") || 0) > 8192) fail();
-      const raw = new Uint8Array(await response.arrayBuffer());
-      assertLive();
-      if (raw.length < 1 || raw.length > 8192) fail();
-      return raw;
+      if (typeof AbortController !== "function") fail();
+      const controller = new AbortController();
+      let timer, reader, complete = false;
+      try {
+        // The limit covers DNS/headers and every chunk of the body, even when
+        // the server omits or lies about Content-Length or stops sending bytes.
+        const work = (async () => {
+          const response = await fetch(url.href, {
+            method: "POST", mode: "cors", credentials: "omit", redirect: "error",
+            referrerPolicy: "no-referrer", cache: "no-store", signal: controller.signal,
+            headers: { "content-type": "application/json", accept: "application/cbor" },
+            body: JSON.stringify({ scope, nonceBase64: to64(nonce) }),
+          });
+          assertLive();
+          if (response.status !== 200
+            || response.headers?.get("content-type")?.split(";")[0].trim() !== "application/cbor"
+            || Number(response.headers.get("content-length") || 0) > 8192
+            || !response.body || typeof response.body.getReader !== "function") fail();
+          reader = response.body.getReader();
+          const raw = new Uint8Array(8192);
+          let total = 0, chunks = 0;
+          while (true) {
+            const next = await reader.read();
+            assertLive();
+            if (controller.signal.aborted) fail();
+            if (next.done) { complete = true; break; }
+            if (!(next.value instanceof Uint8Array) || next.value.byteLength < 1
+              || ++chunks > 8192 || next.value.byteLength > raw.length - total) fail();
+            raw.set(next.value, total);
+            total += next.value.byteLength;
+          }
+          if (total < 1) fail();
+          return raw.slice(0, total);
+        })();
+        const result = await Promise.race([work, new Promise((_resolve, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error("ZK_WORKSPACE_INPUT_DENIED"));
+          }, 10000);
+        })]);
+        assertLive();
+        return result;
+      } finally {
+        clearTimeout(timer);
+        controller.abort();
+        if (reader) {
+          if (!complete) try { Promise.resolve(reader.cancel()).catch(() => {}); }
+            catch (_) { /* stream is already closed */ }
+          try { reader.releaseLock(); } catch (_) { /* stream is aborted */ }
+        }
+      }
     };
   }
   function loadScript(name) {
