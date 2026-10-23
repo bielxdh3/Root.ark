@@ -225,6 +225,34 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   assert.equal(listed.head.sequence, 1);
   assert.equal(listed.rows.length, 1);
   assert.deepEqual(Buffer.from(listed.rows[0].ciphertext_digest), digest(firstCipher));
+  let producedBytes = 0, oversizeCancelled = false;
+  const unboundedServer = await client(1, { fetchImpl: async (url, init) => {
+    if (!url.endsWith("/catalog/read")) return fetchImpl(url, init);
+    return new Response(new ReadableStream({
+      pull(controller) {
+        producedBytes += 8192;
+        controller.enqueue(new Uint8Array(8192).fill(65));
+      },
+      cancel() { oversizeCancelled = true; },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  } });
+  await assert.rejects(unboundedServer.readAll(), /ZK_BROWSER_CATALOG_UNVERIFIED/,
+    "infinite HTTP body must stop at the byte bound without response.text()");
+  assert.equal(oversizeCancelled, true, "overflow cancels the stream");
+  assert.ok(producedBytes <= 6 * 8192, "server cannot force unbounded buffering");
+  let hangingCancelled = false;
+  const hangingServer = await client(1, { fetchImpl: async (url, init) => {
+    if (!url.endsWith("/catalog/read")) return fetchImpl(url, init);
+    return new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(7).fill(65)); },
+      cancel() { hangingCancelled = true; },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  } });
+  const deadlineStart = Date.now();
+  await assert.rejects(hangingServer.readAll(), /ZK_BROWSER_CATALOG_UNVERIFIED/,
+    "a body that never closes must hit the absolute 15s HTTP deadline");
+  assert.ok(Date.now() - deadlineStart >= 14000 && Date.now() - deadlineStart < 22000);
+  assert.equal(hangingCancelled, true, "deadline cancels a stalled body");
   const independentGet = await second.readVerifiedCiphertext(listed, objectId, 1);
   assert.deepEqual(Buffer.from(independentGet.ciphertextBase64, "base64url"), firstCipher,
     "second device must independently sign a historically bound exact GET");

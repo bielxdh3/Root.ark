@@ -83,16 +83,28 @@
         deny();
       return value;
     }
-    async function renameOrMove(input) {
+    async function performRenameOrMove(input, composed) {
       let oldCiphertext, oldPlain, newCiphertext, readBack, reconciledPlain;
+      let rawDestinationCek, recoveredCek;
       try {
         const keys = ["catalog", "sourceIndex", "sourceMetadata", "sourceCek",
           "destinationName", "destinationParentFolderId",
           "ownerPublicKey", "pinnedOwnerKeyHash", "independentOwnerSpkiSha256",
           "pinnedCurrentHead", "signedDeviceGrant", "ownerHistoryCheckpoint",
           "previousOwnerHistoryProof", "devicePublicKey", "devicePrivateKey",
-          "origin", "fetchImpl", "nowSeconds", "assertLive"];
+          "origin", "fetchImpl", "nowSeconds", "assertLive",
+          ...(composed ? ["catalogWriter", "metadataKey", "cekArchive"] : [])];
         exact(input, keys);
+        if (composed && (typeof input.catalogWriter?.readAll !== "function"
+          || typeof input.catalogWriter?.prepareIntent !== "function"
+          || typeof input.catalogWriter?.commit !== "function"
+          || typeof input.cekArchive?.write !== "function"
+          || typeof input.cekArchive?.read !== "function"
+          || input.metadataKey?.type !== "secret"
+          || input.metadataKey?.extractable !== false
+          || input.metadataKey?.algorithm?.name !== "AES-GCM"
+          || input.metadataKey?.algorithm?.length !== 256
+          || !input.metadataKey?.usages?.includes("encrypt"))) deny();
         exact(input.sourceMetadata, META);
         const source = { ...input.sourceMetadata };
         const head = { revision: input.pinnedCurrentHead?.revision,
@@ -175,6 +187,16 @@
         oldCiphertext = from64(historical.ciphertextBase64, 16, MAX);
         const digest = bytes(await crypto.subtle.digest("SHA-256", oldCiphertext), 32);
         if (!equal(sourceDigest, digest)) deny();
+        if (composed) {
+          // The catalog writer has its own fresh signed CAS/witness floor. Its
+          // source must match the separately branded historical catalog GET.
+          const independentlySigned = await input.catalogWriter.readAll();
+          await guard();
+          const versions = independentlySigned.rows.filter((row) =>
+            row.object_id === source.object_id && row.revision === previousRevision);
+          if (versions.length !== 1 || versions[0].epoch !== source.epoch
+            || !equal(bytes(versions[0].ciphertext_digest, 32), digest)) deny();
+        }
         oldPlain = await content.decryptFile({ cek: input.sourceCek,
           metadata: source, envelopeBytes: oldCiphertext });
         await guard();
@@ -182,7 +204,13 @@
         const next = { ...source,
           version_id: b64(crypto.getRandomValues(new Uint8Array(16))),
           parent_version_id: source.version_id, epoch: head.epoch };
-        const destinationCek = await content.generateFileCek();
+        // A non-extractable browser CryptoKey cannot be recovered by an archive
+        // created later. Compose mode escrows random raw bytes before importing
+        // the non-extractable key and before any remote ciphertext PUT.
+        if (composed) rawDestinationCek = crypto.getRandomValues(new Uint8Array(32));
+        const destinationCek = composed
+          ? await content.importFileCek(rawDestinationCek)
+          : await content.generateFileCek();
         const destinationParent = input.destinationParentFolderId;
         const newName = input.destinationName;
         const originalMediaType = oldPlain.mediaType;
@@ -195,6 +223,34 @@
         await guard();
         const root = bytes(await roots.computeCiphertextRoot([newCiphertext]), 32);
         const newDigest = bytes(await crypto.subtle.digest("SHA-256", newCiphertext), 32);
+        let journalId = null;
+        if (composed) {
+          // Archive adapters are explicit trusted client-side providers. A
+          // separate archive read must reconstruct the exact CEK; an ACK alone
+          // is insufficient. The writer's signed intent is persisted next.
+          const receiptId = await input.cekArchive.write({ metadata: { ...next },
+            objectRevision: previousRevision + 1,
+            ciphertext: new Uint8Array(newCiphertext),
+            ciphertextDigest: new Uint8Array(newDigest),
+            cek: new Uint8Array(rawDestinationCek) });
+          await guard();
+          if (typeof receiptId !== "string" || receiptId.length < 16
+            || receiptId.length > 128 || !/^[A-Za-z0-9_-]+$/.test(receiptId)) deny();
+          recoveredCek = bytes(await input.cekArchive.read({
+            receiptId, metadata: { ...next }, objectRevision: previousRevision + 1,
+            ciphertextDigest: new Uint8Array(newDigest),
+          }), 32);
+          await guard();
+          if (!equal(rawDestinationCek, recoveredCek)) deny();
+          recoveredCek.fill(0); recoveredCek = null;
+          rawDestinationCek.fill(0); rawDestinationCek = null;
+          journalId = await input.catalogWriter.prepareIntent([{
+            objectId: source.object_id, revision: previousRevision + 1,
+            epoch: next.epoch, ciphertext: new Uint8Array(newCiphertext),
+          }]);
+          await guard();
+          if (typeof journalId !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(journalId)) deny();
+        }
         const signedPut = await http.signProtectedContentOperation({
           ...signer, nowSeconds: clock(input.nowSeconds),
           operation: "put", objectId: source.object_id,
@@ -243,6 +299,28 @@
           || readBack.parentFolderId !== destinationParent
           || readBack.mediaType !== originalMediaType
           || readBack.authorizesRelease !== false) deny();
+        let catalogCommit = null;
+        if (composed) {
+          catalogCommit = await input.catalogWriter.commit([{
+            objectId: source.object_id, revision: previousRevision + 1,
+            epoch: next.epoch, ciphertext: new Uint8Array(newCiphertext),
+            name: newName, metadataKey: input.metadataKey,
+          }], journalId);
+          await guard();
+          if (catalogCommit?.verifiedSignedReadback !== true
+            || !Number.isSafeInteger(catalogCommit.sequence)
+            || catalogCommit.sequence < 1
+            || typeof catalogCommit.digest !== "string"
+            || catalogCommit.productionDurabilityProven !== false) deny();
+          const signed = await input.catalogWriter.readAll();
+          await guard();
+          const matches = signed.rows.filter((row) => row.object_id === source.object_id
+            && row.revision === previousRevision + 1);
+          if (matches.length !== 1 || matches[0].epoch !== next.epoch
+            || !equal(bytes(matches[0].ciphertext_digest, 32), newDigest)
+            || signed.head.sequence !== catalogCommit.sequence
+            || b64(bytes(signed.head.digest, 32)) !== catalogCommit.digest) deny();
+        }
         return Object.freeze({
           objectId: source.object_id, revision: previousRevision + 1,
           previousRevision, metadata: Object.freeze(next),
@@ -250,7 +328,11 @@
           sourceHistoricalVersionPreserved: true,
           destinationReadbackVerified: true, lostPutAckReconciled: lostAck,
           destinationCek,
-          requiresExternalCekArchive: true, metadataCatalogCommitPending: true,
+          requiresExternalCekArchive: !composed, metadataCatalogCommitPending: !composed,
+          cekArchiveReadbackVerified: composed,
+          signedCatalogCommitReadbackVerified: composed,
+          catalogSequence: catalogCommit?.sequence ?? null,
+          archivePhysicalDurabilityProven: false,
           durableExternalCommitVerified: false, authorizesCutover: false,
           authorizesProductionIo: false,
         });
@@ -261,7 +343,12 @@
         newCiphertext?.fill(0);
         readBack?.data?.fill(0);
         reconciledPlain?.data?.fill(0);
+        rawDestinationCek?.fill(0);
+        recoveredCek?.fill(0);
       }
     }
-    return Object.freeze({ renameOrMove });
+    return Object.freeze({
+      renameOrMove: (input) => performRenameOrMove(input, false),
+      renameOrMoveCommitted: (input) => performRenameOrMove(input, true),
+    });
   }));

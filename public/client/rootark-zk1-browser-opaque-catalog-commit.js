@@ -409,21 +409,57 @@
       const csrf = trust.csrfToken();
       if (typeof csrf !== "string" || csrf.length < 1 || csrf.length > 512
         || /[\r\n\u0000-\u001f\u007f]/.test(csrf)) deny();
-      const response = await trust.fetchImpl(originURL(trust.origin, route, resource), {
-        method: "POST", mode: "same-origin", credentials: "same-origin", redirect: "error",
-        cache: "no-store", headers: { "content-type": "application/json",
-          accept: "application/json", "x-csrf-token": csrf },
-        body: JSON.stringify(request),
-      });
-      requireSession();
-      if (response.status !== (route === "commit" ? 201 : 200)
-        || !/^application\/json(?:;\s*charset=utf-8)?$/i.test(
-          response.headers?.get("content-type") || "")) deny();
-      const raw = await response.text();
-      requireSession();
-      if (raw.length > (resource === "content" ? 6 * 1024 * 1024
-        : route === "read" ? 25000 : 2048)) deny();
-      return JSON.parse(raw);
+      // The server is untrusted. Never allocate response.text() before
+      // checking its size. One deadline covers the request and every chunk;
+      // cancellation also prevents a stalled body from holding the caller.
+      const controller = new AbortController();
+      let rejectDeadline, reader;
+      const deadline = new Promise((_, reject) => { rejectDeadline = reject; });
+      const timer = setTimeout(() => {
+        controller.abort();
+        rejectDeadline(new Error("catalog HTTP deadline"));
+      }, 15000);
+      try {
+        const response = await Promise.race([
+          trust.fetchImpl(originURL(trust.origin, route, resource), {
+            method: "POST", mode: "same-origin", credentials: "same-origin", redirect: "error",
+            cache: "no-store", signal: controller.signal,
+            headers: { "content-type": "application/json", accept: "application/json",
+              "x-csrf-token": csrf }, body: JSON.stringify(request),
+          }), deadline,
+        ]);
+        requireSession();
+        if (response.status !== (route === "commit" ? 201 : 200)
+          || !/^application\/json(?:;\s*charset=utf-8)?$/i.test(
+            response.headers?.get("content-type") || "")) deny();
+        const maximum = resource === "content" ? 6 * 1024 * 1024
+          : route === "read" ? 25000 : 2048;
+        if (!response.body || typeof response.body.getReader !== "function") deny();
+        reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8", { fatal: true });
+        let raw = "", used = 0;
+        while (true) {
+          const piece = await Promise.race([reader.read(), deadline]);
+          requireSession();
+          if (piece.done) break;
+          if (!ArrayBuffer.isView(piece.value) || !(piece.value.byteLength > 0)
+            || piece.value.byteLength > maximum - used) deny();
+          used += piece.value.byteLength;
+          raw += decoder.decode(piece.value, { stream: true });
+          if (raw.length > maximum) deny();
+        }
+        raw += decoder.decode();
+        requireSession();
+        if (raw.length > maximum) deny();
+        return JSON.parse(raw);
+      } finally {
+        clearTimeout(timer);
+        if (reader) {
+          // Do not await cancellation: a malicious reader may never settle it.
+          try { Promise.resolve(reader.cancel()).catch(() => {}); } catch (_) { /* deny below */ }
+        }
+        controller.abort();
+      }
     }
     async function fetchVerifiedCiphertext(objectId, revision, epoch, digest) {
       // Resolve a potentially ambiguous earlier PUT by a NEW signed exact

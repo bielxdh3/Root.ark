@@ -34,7 +34,7 @@ const modules = ["rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-root"
   "rootark-zk1-owner-ciphertext-root-checkpoint",
   "rootark-zk1-protected-http-client", "rootark-zk1-uncertain-put-reconciliation",
   "rootark-zk1-normal-browser-content", "rootark-zk1-browser-catalog",
-  "rootark-zk1-client-rename-move"];
+  "rootark-zk1-browser-opaque-catalog-commit", "rootark-zk1-client-rename-move"];
 
 function indexedDb() {
   const values = new Map();
@@ -162,7 +162,8 @@ test("rename/move uses witnessed catalog historical GET, fresh AEAD/CEK and sign
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
   });
   const origin = "http://127.0.0.1:" + server.address().port;
-  let active = true, csrf = "csrf-a", lostPut = false, switchDuringGet = null;
+  let active = true, csrf = "csrf-a", lostPut = false, lostCatalogAck = false;
+  let switchDuringGet = null, catalogCommits = 0;
   const fetchImpl = async (url, options) => {
     if (!active || csrf !== "csrf-a") throw Error("session switched");
     const response = await fetch(url, { ...options,
@@ -176,6 +177,14 @@ test("rename/move uses witnessed catalog historical GET, fresh AEAD/CEK and sign
       await response.arrayBuffer();
       throw Error("ACK dropped after durable server handler");
     }
+    if (url.endsWith("/catalog/commit")) {
+      catalogCommits++;
+      if (lostCatalogAck) {
+        await response.arrayBuffer();
+        lostCatalogAck = false;
+        throw Error("catalog ACK dropped after CAS");
+      }
+    }
     return response;
   };
   const send = async (url, body) => {
@@ -186,7 +195,8 @@ test("rename/move uses witnessed catalog historical GET, fresh AEAD/CEK and sign
   };
   // Exercise the exact UMD modules as deployed to browsers, with only a
   // synthetic owner-floor IndexedDB implementation for this isolated fixture.
-  const runtime = { crypto: crypto.webcrypto, TextEncoder, TextDecoder,
+  const runtime = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, console,
+    AbortController, setTimeout, clearTimeout,
     btoa, atob, URL, Headers, structuredClone, queueMicrotask,
     location: { origin }, RootarkZk1NormalBrowserTrustFloor: {
       async assertCurrent({ signedDeviceGrant, pinnedCurrentHead }) {
@@ -294,6 +304,72 @@ test("rename/move uses witnessed catalog historical GET, fresh AEAD/CEK and sign
     destinationParentFolderId: folder, ...trust,
     devicePublicKey, devicePrivateKey: signerKey, origin: origin + "/",
     fetchImpl, nowSeconds: () => now, assertLive });
+  const archiveKey = await crypto.webcrypto.subtle.generateKey({ name: "AES-GCM", length: 256 },
+    false, ["encrypt", "decrypt"]);
+  const archiveRecords = new Map();
+  let failArchiveWrite = false, corruptArchiveRead = false, failJournalWrite = false;
+  const archive = {
+    async write({ metadata, objectRevision, ciphertext, ciphertextDigest, cek }) {
+      if (failArchiveWrite) throw Error("archive unavailable");
+      assert.equal(metadata.object_id, sourceId);
+      assert.equal(objectRevision, 2);
+      assert.deepEqual(hash(ciphertext), Buffer.from(ciphertextDigest));
+      const iv = crypto.randomBytes(12);
+      const aad = Buffer.from(JSON.stringify(metadata));
+      const sealed = Buffer.from(await crypto.webcrypto.subtle.encrypt({
+        name: "AES-GCM", iv, additionalData: aad }, archiveKey, cek));
+      const id = b64(crypto.randomBytes(16));
+      archiveRecords.set(id, { iv, aad, sealed });
+      return id;
+    },
+    async read({ receiptId, metadata, objectRevision, ciphertextDigest }) {
+      assert.equal(objectRevision, 2);
+      assert.equal(ciphertextDigest.length, 32);
+      const record = archiveRecords.get(receiptId);
+      assert.ok(record);
+      assert.equal(record.aad.toString(), JSON.stringify(metadata));
+      const raw = new Uint8Array(await crypto.webcrypto.subtle.decrypt({
+        name: "AES-GCM", iv: record.iv, additionalData: record.aad,
+      }, archiveKey, record.sealed));
+      if (corruptArchiveRead) raw[0] ^= 1;
+      return raw;
+    },
+  };
+  const intents = new Map();
+  const journalStore = {
+    async write(id, value) {
+      if (failJournalWrite) throw Error("journal unavailable");
+      if (intents.has(id)) throw Error("journal collision");
+      intents.set(id, structuredClone(value));
+    },
+    async read(id) { return intents.has(id) ? realm(intents.get(id)) : undefined; },
+    async remove(id) { intents.delete(id); },
+  };
+  const writerFactory = async () => {
+    const publicWitness = await crypto.webcrypto.subtle.importKey("raw",
+      witness.publicKey.export({ type: "spki", format: "der" }).subarray(-32),
+      "Ed25519", false, ["verify"]);
+    return runtime.RootarkZk1BrowserOpaqueCatalogCommit.createClient(Object.assign(realm({}), {
+      origin: origin + "/", fetchImpl, ownerPublicKey, pinnedOwnerKeyHash: trust.pinnedOwnerKeyHash,
+      pinnedOwnerHead: Object.assign(realm({}), { revision: ownerHead.revision,
+        digest: ownerHead.digest, epoch: ownerHead.epoch }),
+      signedDeviceGrant: realm(signedDeviceGrant), devicePublicKey, devicePrivateKey: signerKey,
+      signerGrants: realm([signedDeviceGrant]),
+      ownerWitnessPublicKey: publicWitness, ownerWitnessKeyId: witnessKeyId,
+      ownerWitnessProbe: async ({ nonce }) => witnessProvider.freshHead({ nonce: Buffer.from(nonce) }),
+      catalogAuthorityPublicKey: authorityKey,
+      catalogProbe: async ({ nonce }) => authority.readHead({ nonce: Buffer.from(nonce) }),
+      minimumCatalogHead: Object.assign(realm({}), { sequence: 1,
+        digest: Buffer.from(committed.result.catalogDigest, "base64url") }),
+      csrfToken: () => csrf, isSessionCurrent: () => active,
+      assertCurrent: async () => assertLive(), nowSeconds: () => now, journalStore,
+    }));
+  };
+  const metadataKey = await crypto.webcrypto.subtle.importKey("raw", sealedMetadataKey,
+    "AES-GCM", false, ["encrypt"]);
+  const composed = async () => Object.assign(realm({}), options, {
+    catalogWriter: await writerFactory(), metadataKey, cekArchive: archive,
+  });
   const noPutBefore = puts;
   await assert.rejects(runtime.RootarkZk1ClientRenameMove.renameOrMove(Object.assign(
     realm({}), options, { sourceMetadata: realm({ ...sourceMetadata,
@@ -317,15 +393,43 @@ test("rename/move uses witnessed catalog historical GET, fresh AEAD/CEK and sign
       ...signedDeviceGrant, revoked_at_epoch: ownerHead.epoch }) })),
   /ZK_CLIENT_RENAME_MOVE_DENIED/, "revoked or edited owner grant refused");
   assert.equal(puts, noPutBefore);
+  failArchiveWrite = true;
+  await assert.rejects(runtime.RootarkZk1ClientRenameMove.renameOrMoveCommitted(await composed()),
+    /ZK_CLIENT_RENAME_MOVE_DENIED/, "archive write must precede PUT");
+  assert.equal(puts, noPutBefore);
+  failArchiveWrite = false;
+  corruptArchiveRead = true;
+  await assert.rejects(runtime.RootarkZk1ClientRenameMove.renameOrMoveCommitted(await composed()),
+    /ZK_CLIENT_RENAME_MOVE_DENIED/, "archive ACK with mismatching recovered CEK denied");
+  assert.equal(puts, noPutBefore);
+  corruptArchiveRead = false;
+  failJournalWrite = true;
+  await assert.rejects(runtime.RootarkZk1ClientRenameMove.renameOrMoveCommitted(await composed()),
+    /ZK_CLIENT_RENAME_MOVE_DENIED/, "missing durable intent must precede PUT");
+  assert.equal(puts, noPutBefore);
+  failJournalWrite = false;
+  const probeWriter = await writerFactory();
+  assert.equal((await probeWriter.readAll()).rows.length, 1);
   lostPut = true;
-  const result = await runtime.RootarkZk1ClientRenameMove.renameOrMove(options);
+  lostCatalogAck = true;
+  const result = await runtime.RootarkZk1ClientRenameMove.renameOrMoveCommitted(await composed());
   lostPut = false;
   assert.equal(result.revision, 2);
   assert.equal(result.lostPutAckReconciled, true);
   assert.equal(result.sourceHistoricalVersionPreserved, true);
   assert.equal(result.metadata.parent_version_id, sourceMetadata.version_id);
   assert.notEqual(result.metadata.version_id, sourceMetadata.version_id);
-  assert.equal(result.requiresExternalCekArchive, true);
+  assert.equal(result.requiresExternalCekArchive, false);
+  assert.equal(result.metadataCatalogCommitPending, false);
+  assert.equal(result.cekArchiveReadbackVerified, true);
+  assert.equal(result.signedCatalogCommitReadbackVerified, true);
+  assert.equal(result.catalogSequence, 2);
+  assert.equal(result.archivePhysicalDurabilityProven, false);
+  assert.equal(result.durableExternalCommitVerified, false);
+  assert.equal(result.authorizesCutover, false);
+  assert.equal(intents.size, 0, "signed catalog journal removed after authoritative readback");
+  assert.equal(catalogCommits, 2, "initial commit plus one uncertain CAS, never a retry");
+  assert.equal(archiveRecords.size, 3, "archive precedes every attempted PUT");
   assert.notEqual(result.destinationCek, originalCek, "fresh CEK for each version");
   assert.equal(puts, noPutBefore + 1, "uncertain ACK must not retry PUT");
   assert.ok(reads >= 3, "historical source GET, uncertain ACK GET, final GET");
