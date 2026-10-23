@@ -65,6 +65,25 @@ test("canonical runner summarizes bounded failure categories, test path hashes a
   assert.doesNotMatch(diagnostic, /superSecretTokenValue|private test title|issue-65-durable-witness-ledger|C:\\runner/);
 });
 
+test("canonical runner groups every failing file by hash after the detail cap", () => {
+  const { createHash } = require("node:crypto");
+  const hash = (name) => createHash("sha256").update("test/" + name).digest("hex").slice(0, 24);
+  const logged = [];
+  const recorder = createTapProgressRecorder((line) => logged.push(line));
+  for (let index = 1; index <= 20; index++) {
+    const filename = index <= 15 ? "alpha.test.js" : "beta.test.js";
+    recorder.accept("not ok " + index + " - secret fixture title " + index);
+    recorder.accept("  location: 'C:/runner/test/" + filename + ":23:1'");
+    recorder.accept("  code: 'ERR_ASSERTION'");
+  }
+  recorder.finish();
+  const summary = recorder.safeSummary();
+  assert.match(summary, /failurePathGroups=2/);
+  assert.ok(summary.includes("topFailurePaths=" + hash("alpha.test.js") + ":15," + hash("beta.test.js") + ":5"));
+  assert.equal(logged.filter((line) => line.startsWith("FAIL detail ")).length, 12);
+  assert.doesNotMatch(summary + logged.join("\n"), /alpha\.test|beta\.test|secret fixture|C:\/runner/);
+});
+
 test("canonical runner ignores arbitrary error data, unsafe codes and bounds diagnostic output", () => {
   const logged = [];
   const recorder = createTapProgressRecorder((value) => logged.push(value));

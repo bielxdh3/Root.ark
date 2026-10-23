@@ -43,12 +43,16 @@ function createTapProgressRecorder(write) {
   const state = { results: 0, failures: 0, plan: false, tests: null, reportedFailures: null };
   const categories = { assertion: 0, sqlite_busy: 0, filesystem: 0,
     network_timeout: 0, dependency: 0, runtime: 0, unknown: 0 };
+  const failurePaths = new Map();
   let pending = null;
   let detailed = 0;
   const finish = () => {
     if (!pending) return;
     const category = categoryFor(pending.code);
     categories[category]++;
+    if (pending.pathHash !== "none") {
+      failurePaths.set(pending.pathHash, (failurePaths.get(pending.pathHash) || 0) + 1);
+    }
     if (detailed < 12) {
       write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}`);
       detailed++;
@@ -59,7 +63,10 @@ function createTapProgressRecorder(write) {
     state,
     finish,
     safeSummary() {
-      return `failureCategories=${Object.entries(categories).map(([name, count]) => `${name}=${count}`).join(",")} pending=${pending ? 1 : 0} details=${detailed}`;
+      const topFailurePaths = [...failurePaths].sort((a, b) => b[1] - a[1]
+        || a[0].localeCompare(b[0])).slice(0, 4)
+        .map(([pathHash, count]) => `${pathHash}:${count}`).join(",") || "none";
+      return `failureCategories=${Object.entries(categories).map(([name, count]) => `${name}=${count}`).join(",")} pending=${pending ? 1 : 0} details=${detailed} failurePathGroups=${failurePaths.size} topFailurePaths=${topFailurePaths}`;
     },
     accept(line) {
       const result = /^(ok|not ok) ([1-9]\d{0,8}) - (.{1,4096})$/.exec(line);
