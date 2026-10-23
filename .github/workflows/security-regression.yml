@@ -37,6 +37,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install real Microsoft Edge for checkpoint browser tests
+        run: |
+          curl --fail --silent --show-error --location https://packages.microsoft.com/keys/microsoft.asc |
+            gpg --dearmor | sudo tee /usr/share/keyrings/rootark-msedge.gpg > /dev/null
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rootark-msedge.gpg] https://packages.microsoft.com/repos/edge stable main" |
+            sudo tee /etc/apt/sources.list.d/rootark-msedge.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y microsoft-edge-stable
+          test -x /usr/bin/microsoft-edge-stable
+
       - name: Set deterministic locale and timezone
         run: echo "TZ=UTC" >> $GITHUB_ENV && echo "LC_ALL=C" >> $GITHUB_ENV
 

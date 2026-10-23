@@ -4,22 +4,35 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn, execFileSync } = require("node:child_process");
-const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+function findRealEdge(platform = process.platform, exists = fs.existsSync) {
+  const candidates = platform === "win32"
+    ? ["C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+      "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe"]
+    : platform === "linux"
+      ? ["/usr/bin/microsoft-edge-stable", "/usr/bin/microsoft-edge"]
+      : [];
+  return candidates.find((candidate) => exists(candidate)) || null;
+}
 
 async function realEdge(t, origin) {
-  if (!fs.existsSync(EDGE)) throw Error("REAL_EDGE_NOT_INSTALLED");
+  const edge = findRealEdge();
+  if (!edge) throw Error("REAL_EDGE_NOT_INSTALLED");
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-checkpoint-v2-edge-"));
-  const proc = spawn(EDGE, ["--headless=new", "--disable-gpu", "--no-first-run",
-    "--disable-extensions", "--remote-debugging-port=0",
+  const proc = spawn(edge, ["--headless=new", "--disable-gpu", "--no-first-run",
+    "--disable-extensions", "--disable-dev-shm-usage", "--remote-debugging-port=0",
     "--user-data-dir=" + profile, "about:blank"],
   { windowsHide: true, stdio: "ignore" });
   let socket;
   t.after(async () => {
     socket?.close();
     if (proc.pid) {
-      try { execFileSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"],
-        { timeout: 10000, stdio: "ignore" }); }
-      catch (_) { proc.kill(); }
+      if (process.platform === "win32") {
+        try { execFileSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"],
+          { timeout: 10000, stdio: "ignore" }); }
+        catch (_) { proc.kill(); }
+      } else {
+        proc.kill();
+      }
     }
     for (let i = 0; i < 30; i++) {
       try { fs.rmSync(profile, { recursive: true, force: true }); break; }
@@ -83,4 +96,4 @@ async function realEdge(t, origin) {
   return { evaluate };
 }
 
-module.exports = { realEdge };
+module.exports = { realEdge, findRealEdge };
