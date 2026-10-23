@@ -26,6 +26,10 @@
   let loadingScripts = null;
   let busy = false;
   let dialog = null;
+  // A logout invalidates the operation even if an awaited crypto/file/network
+  // promise later resolves. The CSRF cookie also fences session switches in
+  // another tab which do not dispatch this window's logout event.
+  let sessionEpoch = 0;
 
   function fail() { throw new Error("ZK_WORKSPACE_INPUT_DENIED"); }
   function field(name) { return dialog?.querySelector('[data-zk1-field="' + name + '"]'); }
@@ -145,14 +149,20 @@
       || /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(value)) fail();
     return value;
   }
-  function downloadLocal(name, content, type = "application/octet-stream") {
+  function downloadLocal(name, content, type = "application/octet-stream", assertLive) {
+    assertLive();
     const blob = new Blob([content], { type });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
     link.download = name;
     document.body.append(link);
-    try { link.click(); } finally {
+    try {
+      // A download handler may synchronously log the user out. Each artifact
+      // in a multi-file export gets its own check immediately before release.
+      assertLive();
+      link.click();
+    } finally {
       link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 60000);
     }
@@ -173,6 +183,14 @@
     const headers = new Headers(options.headers);
     headers.set("X-CSRF-Token", csrf);
     return fetch(url, { ...options, headers, credentials: "same-origin" });
+  }
+  function currentCsrf() {
+    const cookie = document.cookie.split(";").map((value) => value.trim())
+      .find((value) => value.startsWith("rootark_csrf="));
+    if (!cookie) fail();
+    const value = decodeURIComponent(cookie.slice("rootark_csrf=".length));
+    if (!value) fail();
+    return value;
   }
   function loadScript(name) {
     return new Promise((resolve, reject) => {
@@ -293,9 +311,21 @@
     let ownerSigningDer;
     let archiveFiles;
     try {
+      const operationEpoch = sessionEpoch;
+      const initialCsrf = currentCsrf();
+      const assertLive = () => {
+        if (sessionEpoch !== operationEpoch || dialog?.open !== true
+          || currentCsrf() !== initialCsrf) fail();
+      };
+      const guardedFetch = (url, options) => {
+        assertLive();
+        return sessionFetch(url, options);
+      };
       await ensureScripts();
+      assertLive();
       // Capability is checked again before every user-initiated operation.
       const available = await api.get("/zk-1/v1/workspace-capability");
+      assertLive();
       if (available?.enabled !== true) fail();
       if (action === "verify-inventory") {
         const raw = decoder.decode(await fileBytes("inventory-portable", 1, 400000));
@@ -318,7 +348,7 @@
       }
       if (action === "new-secret") {
         secret = window.RootarkZk1PortableFileRecovery.generateRecoverySecret();
-        downloadLocal("rootark-holder-secret-256bit.bin", secret);
+        downloadLocal("rootark-holder-secret-256bit.bin", secret, undefined, assertLive);
         status("Segredo de 32 bytes exportado SOMENTE neste dispositivo. Guarde fora do servidor e separado do pacote cifrado.");
         return;
       }
@@ -338,15 +368,16 @@
           hpke_public_key: to64(hpkeRaw),
           approval: "OWNER_MUST_VERIFY_IDENTITY_AND_FINISH_V2_POP_AND_SIGN_CURRENT_GRANT" };
         try {
-          downloadLocal("rootark-new-device-auth-private.pk8", privateDer);
-          downloadLocal("rootark-new-device-hpke-private.pk8", hpkePrivate);
+          downloadLocal("rootark-new-device-auth-private.pk8", privateDer, undefined, assertLive);
+          downloadLocal("rootark-new-device-hpke-private.pk8", hpkePrivate, undefined, assertLive);
         } finally { hpkePrivate.fill(0); hpkeRaw.fill(0); }
-        downloadLocal("rootark-owner-enrollment-request.json", JSON.stringify(request), "application/json");
+        downloadLocal("rootark-owner-enrollment-request.json", JSON.stringify(request), "application/json", assertLive);
         raw.fill(0);
         status("Chaves Ed25519 e X25519 exportadas localmente. Solicitação NÃO é um grant: proprietário deve confirmar identidade, completar PoP V2, assinar a transição e conceder grant atual fora do servidor.");
         return;
       }
       const trust = await grantAndOwner();
+      assertLive();
       if (action === "archive-create" || action === "archive-recover") {
         if (field("archive-opt-in")?.checked !== true || !trust.ownerHistoryCheckpoint) fail();
         if (trust.signedDeviceGrant.revoked_at_epoch !== null) fail();
@@ -403,8 +434,8 @@
             ownerHistoryCheckpoint: trust.ownerHistoryCheckpoint,
             issuedAt: Math.floor(Date.now() / 1000),
           });
-          downloadLocal("rootark-keyring-archive.json", JSON.stringify(sealed.archive), "application/json");
-          downloadLocal("rootark-keyring-archive.sha256.txt", to64(sealed.archiveSha256), "text/plain");
+          downloadLocal("rootark-keyring-archive.json", JSON.stringify(sealed.archive), "application/json", assertLive);
+          downloadLocal("rootark-keyring-archive.sha256.txt", to64(sealed.archiveSha256), "text/plain", assertLive);
           status("Arquivo de " + selections.length + " objeto(s) cifrado e assinado localmente. Guarde SHA-256 externamente, separado do arquivo e do segredo. Não é backup de produção.");
         } else {
           const archiveFile = await fileBytes("archive-json", 1, 17 * 1024 * 1024);
@@ -426,7 +457,7 @@
             // Validate all output paths BEFORE creating the first download.
             for (let index = 0; index < recovered.files.length; index++) {
               const file = recovered.files[index];
-              downloadLocal(names[index], file.data, file.mediaType || "application/octet-stream");
+              downloadLocal(names[index], file.data, file.mediaType || "application/octet-stream", assertLive);
             }
             status("Assinatura, escopo, grant, histórico, todas as raízes e hash externo conferidos. "
               + recovered.files.length + " arquivo(s) baixados localmente. Revogação online/durabilidade externa não comprovadas.");
@@ -454,6 +485,7 @@
           pinnedCurrentHead: trust.pinnedCurrentHead,
           devicePublicKey, devicePrivateKey, nowSeconds: Math.floor(Date.now() / 1000),
         });
+        assertLive();
         if (result.verifiedOwnerOfflineApproval !== true
           || result.authorizesProductionIo !== false) fail();
         // The independent pinning step stays explicit and separate.
@@ -469,6 +501,7 @@
           ownerHistoryCheckpoint: trust.ownerHistoryCheckpoint,
           previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
         });
+        assertLive();
         status(result.initialProvision ? "Âncora offline provisionada neste navegador."
           : "Piso local verificado/avançado. Confira os pins atuais fora do servidor.");
       } else {
@@ -478,7 +511,7 @@
         privateDer = await fileBytes("private", 1, 8192);
         const devicePrivateKey = await crypto.subtle.importKey("pkcs8", privateDer, "Ed25519", false, ["sign"]);
         const common = { ...trust, devicePublicKey, devicePrivateKey,
-          origin: location.origin + "/", fetchImpl: sessionFetch,
+          origin: location.origin + "/", fetchImpl: guardedFetch,
           nowSeconds: Math.floor(Date.now() / 1000) };
         if (action === "restore") {
           secret = await fileBytes("secret", 32, 32);
@@ -495,7 +528,7 @@
             previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
           });
           try {
-            downloadLocal(restored.name, restored.data, restored.mediaType || "application/octet-stream");
+            downloadLocal(restored.name, restored.data, restored.mediaType || "application/octet-stream", assertLive);
             status("Arquivo histórico recuperado após novo grant + prova Ed25519 do proprietário + GET protegido. Nenhuma CEK/plaintext enviada ao servidor.");
           } finally { restored.data.fill(0); }
         } else if (action === "upload" || action === "upload-recoverable") {
@@ -514,13 +547,14 @@
               name: selected.name, mediaType: selected.type || "", data,
             });
             downloadLocal("rootark-recovery-" + result.objectId + ".json",
-              JSON.stringify(result.bundle), "application/json");
+              JSON.stringify(result.bundle), "application/json", assertLive);
             status("Pacote recuperável exportado após PUT/GET. Guarde-o fora do servidor e solicite ao proprietário checkpoint histórico assinado para o root "
               + result.ciphertextRoot + ". O segredo de 32 bytes deve permanecer separado.");
           } else {
             const result = await window.RootarkZk1NormalBrowserContent.uploadAndVerify({
               ...common, metadata, fileName: selected.name, mediaType: selected.type || "", data,
             });
+            assertLive();
             status("PUT/GET protegidos verificados: " + result.objectId
               + " · root " + result.ciphertextRoot
               + (result.lostPutAckReconciled ? " · ACK perdido reconciliado" : "")
@@ -551,7 +585,7 @@
               epoch: trust.pinnedCurrentHead.epoch, kind: "file",
             },
             trust: { ...trust, devicePublicKey, devicePrivateKey },
-            cek, origin: location.origin + "/", fetchImpl: sessionFetch,
+            cek, origin: location.origin + "/", fetchImpl: guardedFetch,
             nowSeconds: Math.floor(Date.now() / 1000),
           };
           const journal = await window.RootarkZk1LegacyMigrationWorkflow.openMigrationJournal();
@@ -562,6 +596,7 @@
               : await workflow.finalizeLegacyMigration({ ...migrationOptions, journal,
                 signedRootCheckpoint: JSON.parse(decoder.decode(
                   await fileBytes("migration-proof", 1, 8192))) });
+            assertLive();
             status("Objeto " + result.objectId + " · versão " + versionInput.value
               + " · root " + result.root + ". "
               + (action === "migrate" ? "GET conferido; importe checkpoint externo assinado."
@@ -618,6 +653,7 @@
     }).catch(() => { capability = false; }).finally(() => { checking = false; });
   });
   window.addEventListener("rootark:logout", () => {
+    sessionEpoch++;
     capability = false;
     if (dialog?.open) dialog.close();
     dialog?.querySelector("form")?.reset();

@@ -1165,6 +1165,7 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
         if(archiveDownloads.length)throw Error("KEYRING_UNSAFE_NAME_LEAK");
         if(await storageView()!==beforeArchiveStorage)
           throw Error("KEYRING_UNINTENDED_BROWSER_PERSISTENCE");
+        const postLogoutHolder=archiveHolder.slice();
         archiveHolder.fill(0);
         URL.createObjectURL=originalCreate;
         HTMLAnchorElement.prototype.click=originalClick;
@@ -1174,6 +1175,29 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
         setFile("file",new TextEncoder().encode("Tampered browser pinned head"));
         document.querySelector('[data-zk1-action="upload"]').click();
         await wait(()=>field("status").textContent.includes("Operação recusada"));
+        // Real Edge: a session logout inside the first local archive download
+        // must invalidate the remaining plaintext files before release.
+        field("digest").value=values.head.digest;
+        setFile("grant",new TextEncoder().encode(JSON.stringify(values.grant)));
+        setFile("history",new TextEncoder().encode(JSON.stringify(values.archiveHistory)));
+        field("archive-opt-in").checked=true;
+        field("archive-sha").value=externalHash;
+        setFile("archive-json",new TextEncoder().encode(exportedArchive));
+        setFile("secret",postLogoutHolder);
+        archiveDownloads=[];
+        HTMLAnchorElement.prototype.click=function(){
+          if(!this.download||!this.href.startsWith("blob:"))throw Error("UNSAFE_LATE_DOWNLOAD");
+          archiveDownloads.push(this.download);
+          if(archiveDownloads.length===1)
+            window.dispatchEvent(new Event("rootark:logout"));
+        };
+        document.querySelector('[data-zk1-action="archive-recover"]').click();
+        await wait(()=>field("status").textContent.includes("Operação recusada")
+          && archiveDownloads.length===1);
+        if(archiveDownloads.length!==1||document.querySelector("dialog").open)
+          throw Error("LATE_LOGOUT_ARCHIVE_RELEASE");
+        HTMLAnchorElement.prototype.click=originalClick;
+        postLogoutHolder.fill(0);
         output.textContent="EDGE_AUTH_WORKSPACE_PASS";
       } catch(e){output.textContent="EDGE_AUTH_WORKSPACE_FAIL:"+e.message;}
     });`));
