@@ -336,6 +336,11 @@
           globalAccountCompletenessProven: false, authorizesProductionRestore: false });
         proofStore.set(proof, Object.freeze({ scope: { ...scope },
           snapshotSha256: b64(independentlyPinnedBackupSha256),
+          // Provenance of the exact independently pinned, owner-signed roster
+          // is part of the private brand. A later caller must not replace it
+          // with a different roster whose single snapshot row happens to match.
+          rosterSha256: b64(bytes(independentRosterSha256, 32)),
+          rosterWire: JSON.stringify(ownerRoster),
           ownerSpkiSha256: Array.from(independentOwnerSpkiSha256,
             (v) => v.toString(16).padStart(2, "0")).join(""),
           inventoryCheckpointDigest: backup.inventoryCheckpointDigest,
@@ -361,9 +366,15 @@
       if (!Array.isArray(input.verifiedKeyringProofs)
         || input.verifiedKeyringProofs.length !== 1
         || !proofStore.has(input.verifiedKeyringProofs[0])) deny();
-      if (input.roster.keyrings?.length !== 1
-        || input.roster.keyrings[0]?.snapshotSha256
-          !== proofStore.get(input.verifiedKeyringProofs[0]).snapshotSha256) deny();
+      const held = proofStore.get(input.verifiedKeyringProofs[0]);
+      const rosterWire = JSON.stringify(input.roster);
+      const rosterPin = bytes(input.independentlyPinnedRosterSha256, 32);
+      if (input.accountId !== held.scope.account_id
+        || typeof rosterWire !== "string" || rosterWire !== held.rosterWire
+        || !same(await hash(te.encode(rosterWire)), rosterPin)
+        || b64(rosterPin) !== held.rosterSha256
+        || input.roster.keyrings?.length !== 1
+        || input.roster.keyrings[0]?.snapshotSha256 !== held.snapshotSha256) deny();
       return { allOwnerRosterKeyringsVerified: true };
     } });
     return Object.freeze({ verifyBackupSnapshot, readVerifiedBackupProof,

@@ -371,6 +371,34 @@ test("browser WebCrypto independently verifies REAL owner pinned signed CBOR sna
   ]) await assert.rejects(browserAuthority.verifyBackupSnapshot({
     ...context, ...changed }), /ZK_BROWSER_AUTHORITATIVE_BACKUP_DENIED/);
 });
+test("browser roster bridge refuses a second unsigned roster with a counterfeit independent pin", async () => {
+  const f = await fixture();
+  const proof = await browserAuthority.verifyBackupSnapshot({
+    ...f.backupVerification,
+    roster: f.rosterVerification.roster,
+    independentRosterSha256: f.rosterVerification.independentlyPinnedRosterSha256,
+    ownerHistoryCheckpoint: f.authorityInput.ownerHistoryChain[1],
+    previousOwnerHistoryProof: f.archiveInput.previousOwnerHistoryProof,
+    signerKeyId: f.archiveInput.signerKeyId,
+    inventorySignerPublicKey: await crypto.webcrypto.subtle.importKey("spki",
+      f.authorityInput.inventorySignerPublicKey.export({ type: "spki", format: "der" }),
+      "Ed25519", true, ["verify"]),
+  });
+  const trusted = { ...f.rosterVerification, verifiedKeyringProofs: [proof] };
+  assert.equal((await browserAuthority.rosterBridge.verifyOwnerRosterCoverage(trusted))
+    .allOwnerRosterKeyringsVerified, true);
+  const fakeRoster = { ...f.rosterVerification.roster,
+    issuedAt: f.rosterVerification.roster.issuedAt + 1 };
+  // The exact account/snapshot row is unchanged. The old browser bridge used
+  // this lone matching row to brand an unrelated, unsigned "newer" roster B.
+  await assert.rejects(browserAuthority.rosterBridge.verifyOwnerRosterCoverage({
+    ...trusted, roster: fakeRoster,
+    independentlyPinnedRosterSha256: sha(Buffer.from(JSON.stringify(fakeRoster))),
+  }), /ZK_BROWSER_AUTHORITATIVE_BACKUP_DENIED/);
+  await assert.rejects(browserAuthority.rosterBridge.verifyOwnerRosterCoverage({
+    ...trusted, independentlyPinnedRosterSha256: rnd(32),
+  }), /ZK_BROWSER_AUTHORITATIVE_BACKUP_DENIED/);
+});
 test("browser authority verifies archived signed inventory only through genesis-to-current owner continuity", async () => {
   const f = await fixture();
   const [genesis, archived] = f.authorityInput.ownerHistoryChain;
