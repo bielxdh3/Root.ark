@@ -8,16 +8,17 @@ const crypto = require("node:crypto");
 const z = require("./rootark-zk-1");
 const { inspectIntent } = require("../services/zk1OpaqueCheckpointV2Remote");
 
-const DOMAIN = Buffer.from("Root.ark/zk-1/v2-historical-signer-endorsement/v1\0");
+const DOMAIN = Buffer.from("Root.ark/zk-1/v2-historical-signer-endorsement/v2\0");
 const GRANT_DOMAIN = Buffer.from("Root.ark/zk-1/browser-owner-device-grant/v1\0");
 const GRANT_FIELDS = ["schema", "account_id", "compartment_id", "keyring_id",
   "device_id", "authorization_key_id", "authorization_public_key",
   "manifest_revision", "manifest_digest", "current_epoch", "enrolled_epoch", "revoked_at_epoch"];
 const SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
-const FIELDS = Object.freeze(["schema", "account_id", "compartment_id", "keyring_id",
+const LEGACY_FIELDS = Object.freeze(["schema", "account_id", "compartment_id", "keyring_id",
   "sequence", "intent_sha256", "operation_id", "head_digest", "checkpoint_digest",
   "signer_device_id", "signer_public_key", "manifest_revision", "manifest_digest",
   "epoch", "genesis_digest", "witness_signer_spki_sha256"]);
+const FIELDS = Object.freeze([...LEGACY_FIELDS, "approval_signer_public_key"]);
 const sha = (v) => crypto.createHash("sha256").update(v).digest();
 function denied() { throw Error("ZK_V2_HISTORICAL_SIGNER_UNVERIFIED"); }
 
@@ -60,7 +61,7 @@ async function issueVerifiedHistoricalSignerEndorsement({ signedIntent, inspecto
     const header = await z.decodeDeterministic(inspected.body.records[0].header);
     const scope = inspectorOptions.scope;
     const statement = {
-      schema: "rootark-zk1-v2-historical-signer-endorsement/v1",
+      schema: "rootark-zk1-v2-historical-signer-endorsement/v2",
       ...Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
         .map((field) => [field, Buffer.from(scope[field]).toString("base64url")])),
       sequence: header.sequence, intent_sha256: sha(raw).toString("base64url"),
@@ -76,6 +77,10 @@ async function issueVerifiedHistoricalSignerEndorsement({ signedIntent, inspecto
       witness_signer_spki_sha256: sha(
         inspectorOptions.ownerTrust.pinnedWitness.publicKey
           .export({ format: "der", type: "spki" })).toString("base64url"),
+      // The fresh inspector verified this approval signer against signed,
+      // independently witnessed owner enrollment and revocation history.
+      approval_signer_public_key: trusted.export({ type: "spki", format: "der" })
+        .subarray(-32).toString("base64url"),
     };
     return Object.freeze({ ...statement,
       signature: crypto.sign(null, Buffer.concat([DOMAIN,
@@ -84,4 +89,4 @@ async function issueVerifiedHistoricalSignerEndorsement({ signedIntent, inspecto
   } catch (_) { denied(); }
 }
 
-module.exports = { FIELDS, issueVerifiedHistoricalSignerEndorsement };
+module.exports = { FIELDS, LEGACY_FIELDS, issueVerifiedHistoricalSignerEndorsement };

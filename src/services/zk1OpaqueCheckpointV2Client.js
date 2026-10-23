@@ -18,13 +18,14 @@ const { assertPrivateSqliteDirectory, assertPrivateSqliteFile } =
   require("./zk1PrivateSqlitePath");
 const { syncPrivateParent, publishStagedJournal } =
   require("./zk1V2DurableJournalMigration");
-const { FIELDS: SIGNER_ENDORSEMENT_FIELDS } =
+const { FIELDS: SIGNER_ENDORSEMENT_FIELDS, LEGACY_FIELDS: LEGACY_SIGNER_ENDORSEMENT_FIELDS } =
   require("../crypto/rootark-zk1-v2-historical-signer-endorsement");
 
 const APPROVAL_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-checkpoint-remote/owner-approval/v2\0");
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
 const ZERO = Buffer.alloc(32);
-const SIGNER_GRANT_DOMAIN = Buffer.from("Root.ark/zk-1/v2-historical-signer-endorsement/v1\0");
+const SIGNER_GRANT_DOMAIN = Buffer.from("Root.ark/zk-1/v2-historical-signer-endorsement/v2\0");
+const LEGACY_SIGNER_GRANT_DOMAIN = Buffer.from("Root.ark/zk-1/v2-historical-signer-endorsement/v1\0");
 const HEAD_DIGEST_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
 const CHECKPOINT_DIGEST_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-checkpoint-digest/v2\0");
 const SIGNER_GRANT_SCHEMA = `CREATE TABLE IF NOT EXISTS signer_grants (
@@ -111,18 +112,21 @@ async function verifiedSignerGrant(raw, intent, t, intentRaw) {
   let grant;
   try { grant = JSON.parse(Buffer.from(raw).toString("utf8")); }
   catch (_) { deny(); }
+  const legacy = grant?.schema === "rootark-zk1-v2-historical-signer-endorsement/v1";
+  const names = legacy ? LEGACY_SIGNER_ENDORSEMENT_FIELDS : SIGNER_ENDORSEMENT_FIELDS;
   if (!grant || Object.getPrototypeOf(grant) !== Object.prototype
-    || Reflect.ownKeys(grant).length !== SIGNER_ENDORSEMENT_FIELDS.length + 1
-    || [...SIGNER_ENDORSEMENT_FIELDS, "signature"].some((name) =>
+    || Reflect.ownKeys(grant).length !== names.length + 1
+    || [...names, "signature"].some((name) =>
       !Object.hasOwn(grant, name))) deny();
-  const statement = Object.fromEntries(SIGNER_ENDORSEMENT_FIELDS.map((name) => [name, grant[name]]));
+  const statement = Object.fromEntries(names.map((name) => [name, grant[name]]));
   const canonical = Buffer.from(JSON.stringify({ ...statement, signature: grant.signature }));
   if (!equal(canonical, Buffer.from(raw))) deny();
   const headerBytes = intent.records[0].header;
   if ((!Buffer.isBuffer(headerBytes) && !(headerBytes instanceof Uint8Array))
     || headerBytes.length < 1 || headerBytes.length > 16384) deny();
   const header = await z.decodeDeterministic(headerBytes);
-  if (grant.schema !== "rootark-zk1-v2-historical-signer-endorsement/v1"
+  if (grant.schema !== (legacy ? "rootark-zk1-v2-historical-signer-endorsement/v1"
+    : "rootark-zk1-v2-historical-signer-endorsement/v2")
     || grant.sequence !== intent.records[0].sequence
     || !equal(b64(grant.intent_sha256, 32), crypto.createHash("sha256").update(intentRaw).digest())
     || !equal(b64(grant.operation_id, 32), bytes(intent.operation_id, 32))
@@ -139,13 +143,16 @@ async function verifiedSignerGrant(raw, intent, t, intentRaw) {
     || !equal(b64(grant.genesis_digest, 32), bytes(t.ownerTrust.genesisDigest, 32))
     || !equal(b64(grant.witness_signer_spki_sha256, 32), fp(t.ownerTrust.pinnedWitness.publicKey))
     || SCOPE.some((name) => !equal(b64(grant[name], t.scope[name].length), t.scope[name]))) deny();
-  if (!crypto.verify(null, Buffer.concat([SIGNER_GRANT_DOMAIN,
+  if (!crypto.verify(null, Buffer.concat([legacy ? LEGACY_SIGNER_GRANT_DOMAIN : SIGNER_GRANT_DOMAIN,
     Buffer.from(JSON.stringify(statement))]), t.signerGrantRootKey,
   b64(grant.signature, 64))) deny();
   const signer = crypto.createPublicKey({ key: Buffer.concat([
     Buffer.from("302a300506032b6570032100", "hex"),
     b64(grant.signer_public_key, 32)]), format: "der", type: "spki" });
-  return { raw: canonical, signer };
+  const approvalSigner = legacy ? t.ownerKey : crypto.createPublicKey({
+    key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"),
+      b64(grant.approval_signer_public_key, 32)]), format: "der", type: "spki" });
+  return { raw: canonical, signer, approvalSigner };
 }
 function scopeOf(v) {
   if (!v || Reflect.ownKeys(v).length !== 3) deny();
@@ -430,8 +437,8 @@ class Zk1OpaqueCheckpointV2Client {
       casKey: t.casKey, floorKey: t.floorKey,
       previousOperationId: previous.operationId,
     }, { freshOwner });
-    if (grant && !equal(grant.signer.export({ type: "spki", format: "der" }),
-      inspected.signerSpki)) deny();
+    if (grant && (!equal(grant.signer.export({ type: "spki", format: "der" }),
+      inspected.signerSpki) || (freshOwner && !equal(fp(grant.approvalSigner), fp(t.ownerKey))))) deny();
     // Historical reads cannot demand a fresh witness from a device that was
     // revoked AFTER publication. Preserve the signed owner approval binding.
     const approval = await z.decodeDeterministic(inspected.body.owner_approval);
@@ -440,7 +447,7 @@ class Zk1OpaqueCheckpointV2Client {
       || !Number.isSafeInteger(approval.issued_at)
       || approval.issued_at < 0
       || !crypto.verify(null, Buffer.concat([APPROVAL_DOMAIN,
-      Buffer.from(inspected.body.owner_approval)]), t.ownerKey,
+      Buffer.from(inspected.body.owner_approval)]), grant?.approvalSigner || t.ownerKey,
       bytes(inspected.body.owner_signature, 64))
       || !equal(bytes(approval.operation_id, 32), inspected.operationId)
       || !equal(bytes(approval.checkpoint_digest, 32), inspected.checkpointDigest)

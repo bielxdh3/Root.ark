@@ -321,12 +321,15 @@
   const V2_GRANT_FIELDS = ["schema", ...SCOPE, "device_id", "authorization_key_id",
     "authorization_public_key", "manifest_revision", "manifest_digest",
     "current_epoch", "enrolled_epoch", "revoked_at_epoch"];
-  const V2_HISTORY_ENDORSEMENT = encoder.encode(
+  const V2_HISTORY_ENDORSEMENT_V1 = encoder.encode(
     "Root.ark/zk-1/v2-historical-signer-endorsement/v1\0");
-  const V2_HISTORY_FIELDS = ["schema", ...SCOPE, "sequence", "intent_sha256",
+  const V2_HISTORY_ENDORSEMENT = encoder.encode(
+    "Root.ark/zk-1/v2-historical-signer-endorsement/v2\0");
+  const V2_HISTORY_V1_FIELDS = ["schema", ...SCOPE, "sequence", "intent_sha256",
     "operation_id", "head_digest", "checkpoint_digest", "signer_device_id",
     "signer_public_key", "manifest_revision", "manifest_digest", "epoch",
     "genesis_digest", "witness_signer_spki_sha256"];
+  const V2_HISTORY_FIELDS = [...V2_HISTORY_V1_FIELDS, "approval_signer_public_key"];
   const V2_RECEIPT_FIELDS = ["type", ...SCOPE, "role", "state", "sequence",
     "head_digest", "checkpoint_digest", "operation_id", "cas_signer_fp",
     "floor_signer_fp", "nonce", "issued_at"];
@@ -410,8 +413,10 @@
       || input.historicalSignerEndorsements.length > 128)) deny();
     const historicalProofs = historicalProofsProvided
       ? input.historicalSignerEndorsements.map((entry) => {
-        exact(entry, [...V2_HISTORY_FIELDS, "signature"]);
-        return Object.fromEntries([...V2_HISTORY_FIELDS, "signature"]
+        const legacy = entry?.schema === "rootark-zk1-v2-historical-signer-endorsement/v1";
+        const fields = legacy ? V2_HISTORY_V1_FIELDS : V2_HISTORY_FIELDS;
+        exact(entry, [...fields, "signature"]);
+        return Object.fromEntries([...fields, "signature"]
           .map((field) => [field, entry[field]]));
       }) : null;
     const independentGenesis = historicalProofsProvided
@@ -429,6 +434,8 @@
       const grant = Object.fromEntries([...V2_GRANT_FIELDS, "signature"]
         .map((name) => [name, input.signedDeviceGrant[name]]));
       ownerKey = await verifyKey(input.ownerKeyRaw, input.ownerSpkiPin);
+      if ([input.deviceSpkiPin, casFp, floorFp, checkpointFp]
+        .some((pin) => equal(copy(input.ownerSpkiPin, 32), copy(pin, 32)))) deny();
       const frozenGrant = Object.fromEntries(V2_GRANT_FIELDS.map((name) => [name, grant[name]]));
       if (grant.schema !== "rootark-zk1-browser-owner-device-grant/v1"
         || grant.manifest_revision !== revision || grant.manifest_digest !== to64(ownerDigest)
@@ -484,11 +491,14 @@
       || header.page_digests.length !== record.page_bodies.length
       || uint(header.total_count, 0, 4096) > 4096
       || header.page_digests.length !== Math.ceil(header.total_count / 32)) deny();
-    let historicalSigner = deviceKey;
+    let historicalSigner = deviceKey, approvalSigner = deviceKey;
     if (historicalProofs) {
       const certificate = historicalProofs[intentIndex];
-      const statement = Object.fromEntries(V2_HISTORY_FIELDS.map((f) => [f, certificate[f]]));
-      if (certificate.schema !== "rootark-zk1-v2-historical-signer-endorsement/v1"
+      const legacy = certificate.schema === "rootark-zk1-v2-historical-signer-endorsement/v1";
+      const fields = legacy ? V2_HISTORY_V1_FIELDS : V2_HISTORY_FIELDS;
+      const statement = Object.fromEntries(fields.map((f) => [f, certificate[f]]));
+      if (certificate.schema !== (legacy ? "rootark-zk1-v2-historical-signer-endorsement/v1"
+        : "rootark-zk1-v2-historical-signer-endorsement/v2")
         || certificate.sequence !== nextSequence
         || certificate.signer_device_id !== header.signer_device_id
         || certificate.manifest_revision !== header.manifest_revision
@@ -505,8 +515,11 @@
       historicalSigner = await webCrypto.subtle.importKey("raw", expectedSigner,
         "Ed25519", false, ["verify"]);
       if (!await webCrypto.subtle.verify("Ed25519", ownerKey,
-        from64(certificate.signature, 64), append(V2_HISTORY_ENDORSEMENT,
+        from64(certificate.signature, 64), append(legacy
+          ? V2_HISTORY_ENDORSEMENT_V1 : V2_HISTORY_ENDORSEMENT,
           encoder.encode(JSON.stringify(statement))))) deny();
+      if (!legacy) approvalSigner = await webCrypto.subtle.importKey("raw",
+        from64(certificate.approval_signer_public_key, 32), "Ed25519", false, ["verify"]);
     }
     if (!await webCrypto.subtle.verify("Ed25519", historicalSigner, rawSignature,
       append(V2_HEAD, rawHead))) deny();
@@ -571,7 +584,7 @@
       || !equal(strictBytes(approval.cas_signer_fp, 32), casFp)
       || !equal(strictBytes(approval.floor_signer_fp, 32), floorFp)
       || !equal(strictBytes(approval.checkpoint_signer_fp, 32), checkpointFp)
-      || !await webCrypto.subtle.verify("Ed25519", deviceKey,
+      || !await webCrypto.subtle.verify("Ed25519", approvalSigner,
         strictBytes(intent.owner_signature, 64), append(V2_OWNER, approvalBytes))) deny();
     if (nextSequence > 129) {
       // Historical predecessor endorsements are immutable evidence. Freshness
