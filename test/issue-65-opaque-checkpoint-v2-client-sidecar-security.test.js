@@ -151,3 +151,39 @@ test("V2 client bootstrap rejects a foreign SQLite substituted after O_EXCL with
   assert.match(rejected?.message || "", /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE|UNTRUSTED_SQLITE_PATH/,
     "the constructor must reject before opening the substituted journal writable");
 });
+
+test("a forged historical signer append trigger fails preflight before writable SQLite open", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-v2-signer-trigger-"));
+  if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+  const journalPath = path.join(dir, "client.sqlite");
+  const opts = options(journalPath, true);
+  const original = new Zk1OpaqueCheckpointV2Client(opts);
+  original.close();
+  const tampered = new Database(journalPath);
+  tampered.exec(`DROP TRIGGER signer_grants_no_gap;
+    CREATE TRIGGER signer_grants_no_gap BEFORE INSERT ON signer_grants
+    BEGIN SELECT 1; END;`);
+  tampered.close();
+  const originalHash = sha(journalPath);
+  assert.throws(() => new Zk1OpaqueCheckpointV2Client({ ...opts, bootstrapNew: false }),
+    /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/);
+  assert.equal(sha(journalPath), originalHash,
+    "preflight rejects forged signer schema without repairing or mutating journal");
+  assert.equal(fs.existsSync(journalPath + "-shm"), false);
+});
+
+test("historical grant authority cannot alias device, owner approval, CAS, floor or checkpoint signers", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-v2-grant-root-alias-"));
+  if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+  const journalPath = path.join(dir, "client.sqlite");
+  const opts = options(journalPath, true);
+  for (const alias of [opts.catalogPublicKey, opts.ownerPublicKey,
+    opts.checkpointPublicKey, opts.casClient.publicKey, opts.floorClient.publicKey]) {
+    assert.throws(() => new Zk1OpaqueCheckpointV2Client({ ...opts,
+      signerGrantRootPublicKey: alias }), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/);
+    assert.equal(fs.existsSync(journalPath), false,
+      "a self-certifying trust root is rejected before an authority journal is created");
+  }
+});

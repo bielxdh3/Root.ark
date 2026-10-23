@@ -18,10 +18,32 @@ const { assertPrivateSqliteDirectory, assertPrivateSqliteFile } =
   require("./zk1PrivateSqlitePath");
 const { syncPrivateParent, publishStagedJournal } =
   require("./zk1V2DurableJournalMigration");
+const { FIELDS: SIGNER_ENDORSEMENT_FIELDS } =
+  require("../crypto/rootark-zk1-v2-historical-signer-endorsement");
 
 const APPROVAL_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-checkpoint-remote/owner-approval/v2\0");
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
 const ZERO = Buffer.alloc(32);
+const SIGNER_GRANT_DOMAIN = Buffer.from("Root.ark/zk-1/v2-historical-signer-endorsement/v1\0");
+const HEAD_DIGEST_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
+const CHECKPOINT_DIGEST_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-checkpoint-digest/v2\0");
+const SIGNER_GRANT_SCHEMA = `CREATE TABLE IF NOT EXISTS signer_grants (
+    sequence INTEGER PRIMARY KEY CHECK(sequence BETWEEN 129 AND 1000000),
+    grant BLOB NOT NULL, signer_spki BLOB NOT NULL);
+  CREATE TRIGGER IF NOT EXISTS signer_grants_immutable_update BEFORE UPDATE ON signer_grants
+    BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;
+  CREATE TRIGGER IF NOT EXISTS signer_grants_immutable_delete BEFORE DELETE ON signer_grants
+    BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;
+  CREATE TRIGGER IF NOT EXISTS signer_grants_no_gap BEFORE INSERT ON signer_grants WHEN
+    NEW.sequence!=(SELECT COALESCE(MAX(sequence),128)+1 FROM signer_grants)
+    OR (NEW.sequence=129 AND (SELECT COUNT(*) FROM intent WHERE id=1)!=1)
+    OR (NEW.sequence>129 AND (SELECT COUNT(*) FROM successors WHERE sequence=NEW.sequence)!=1)
+    BEGIN SELECT RAISE(ABORT,'NONCONTIGUOUS_SIGNER'); END;`;
+const SIGNER_GRANT_TRIGGERS = [
+  ["signer_grants_immutable_update", "signer_grants"],
+  ["signer_grants_immutable_delete", "signer_grants"],
+  ["signer_grants_no_gap", "signer_grants"],
+];
 const SUCCESSOR_SCHEMA = `CREATE TABLE IF NOT EXISTS successors (
     sequence INTEGER PRIMARY KEY CHECK(sequence BETWEEN 130 AND 1000000),
     bytes BLOB NOT NULL);
@@ -76,6 +98,55 @@ function fp(k) {
   return crypto.createHash("sha256").update(key(k)
     .export({ type: "spki", format: "der" })).digest();
 }
+function b64(value, size) {
+  if (typeof value !== "string" || value.length > 512
+    || !/^[A-Za-z0-9_-]+$/.test(value)) deny();
+  const decoded = Buffer.from(value, "base64url");
+  if (decoded.length !== size || decoded.toString("base64url") !== value) deny();
+  return decoded;
+}
+async function verifiedSignerGrant(raw, intent, t, intentRaw) {
+  if (!t.signerGrantRootKey || (!Buffer.isBuffer(raw) && !(raw instanceof Uint8Array))
+    || raw.length < 1 || raw.length > 4096) deny();
+  let grant;
+  try { grant = JSON.parse(Buffer.from(raw).toString("utf8")); }
+  catch (_) { deny(); }
+  if (!grant || Object.getPrototypeOf(grant) !== Object.prototype
+    || Reflect.ownKeys(grant).length !== SIGNER_ENDORSEMENT_FIELDS.length + 1
+    || [...SIGNER_ENDORSEMENT_FIELDS, "signature"].some((name) =>
+      !Object.hasOwn(grant, name))) deny();
+  const statement = Object.fromEntries(SIGNER_ENDORSEMENT_FIELDS.map((name) => [name, grant[name]]));
+  const canonical = Buffer.from(JSON.stringify({ ...statement, signature: grant.signature }));
+  if (!equal(canonical, Buffer.from(raw))) deny();
+  const headerBytes = intent.records[0].header;
+  if ((!Buffer.isBuffer(headerBytes) && !(headerBytes instanceof Uint8Array))
+    || headerBytes.length < 1 || headerBytes.length > 16384) deny();
+  const header = await z.decodeDeterministic(headerBytes);
+  if (grant.schema !== "rootark-zk1-v2-historical-signer-endorsement/v1"
+    || grant.sequence !== intent.records[0].sequence
+    || !equal(b64(grant.intent_sha256, 32), crypto.createHash("sha256").update(intentRaw).digest())
+    || !equal(b64(grant.operation_id, 32), bytes(intent.operation_id, 32))
+    || !equal(b64(grant.head_digest, 32), crypto.createHash("sha256")
+      .update(HEAD_DIGEST_DOMAIN).update(intent.records[0].header)
+      .update(intent.records[0].signature).digest())
+    || !equal(b64(grant.checkpoint_digest, 32), crypto.createHash("sha256")
+      .update(CHECKPOINT_DIGEST_DOMAIN).update(intent.checkpoint_bytes)
+      .update(intent.checkpoint_signature).digest())
+    || grant.signer_device_id !== header.signer_device_id
+    || grant.manifest_revision !== header.manifest_revision
+    || !equal(b64(grant.manifest_digest, 32), bytes(header.manifest_digest, 32))
+    || grant.epoch !== header.epoch
+    || !equal(b64(grant.genesis_digest, 32), bytes(t.ownerTrust.genesisDigest, 32))
+    || !equal(b64(grant.witness_signer_spki_sha256, 32), fp(t.ownerTrust.pinnedWitness.publicKey))
+    || SCOPE.some((name) => !equal(b64(grant[name], t.scope[name].length), t.scope[name]))) deny();
+  if (!crypto.verify(null, Buffer.concat([SIGNER_GRANT_DOMAIN,
+    Buffer.from(JSON.stringify(statement))]), t.signerGrantRootKey,
+  b64(grant.signature, 64))) deny();
+  const signer = crypto.createPublicKey({ key: Buffer.concat([
+    Buffer.from("302a300506032b6570032100", "hex"),
+    b64(grant.signer_public_key, 32)]), format: "der", type: "spki" });
+  return { raw: canonical, signer };
+}
 function scopeOf(v) {
   if (!v || Reflect.ownKeys(v).length !== 3) deny();
   return Object.fromEntries(SCOPE.map((n) => {
@@ -116,7 +187,7 @@ function privateFile(filename, bootstrapNew) {
     } finally { fs.closeSync(fd); }
   }
 }
-function verifyJournal(db, identity) {
+function verifyJournal(db, identity, requireSignerGrants = false) {
   if (db.pragma("quick_check", { simple: true }) !== "ok"
     || !db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='intent'").get()
     || !db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='identity'").get()) deny();
@@ -124,6 +195,14 @@ function verifyJournal(db, identity) {
   requireCheckpointV2Triggers(db, SUCCESSOR_SCHEMA, SUCCESSOR_TRIGGERS, deny);
   const pinned = db.prepare("SELECT pins FROM identity WHERE id=1").get();
   if (!pinned || !equal(pinned.pins, identity)) deny();
+  const table = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='signer_grants'").get();
+  if (!table && requireSignerGrants) deny();
+  if (!table) return;
+  requireCheckpointV2Triggers(db, SIGNER_GRANT_SCHEMA, SIGNER_GRANT_TRIGGERS, deny);
+  const expected = SIGNER_GRANT_SCHEMA.match(/CREATE TABLE IF NOT EXISTS signer_grants \([\s\S]*?\);/)[0];
+  const normalize = (sql) => sql.replace(/IF NOT EXISTS /g, "")
+    .trim().replace(/\s+/g, " ").replace(/;$/, "");
+  if (!table?.sql || normalize(table.sql) !== normalize(expected)) deny();
 }
 
 function privateNewDestination(filename) {
@@ -187,6 +266,8 @@ class Zk1OpaqueCheckpointV2Client {
           fp(key(ownerPublicKey)))) deny();
       privateFile(legacyJournalPath, false);
       const scope = scopeOf(trustedScope);
+      // Source #129 was written before grant-root pinning. Authenticate its
+      // original five-key identity, then publish a separately pinned journal.
       const pins = [key(casClient.publicKey), key(floorClient.publicKey),
         key(checkpointPublicKey), key(ownerPublicKey), key(catalogPublicKey)].map(fp);
       const identity = encodeIdentity(scope, bytes(expectedV1Digest, 32),
@@ -209,9 +290,9 @@ class Zk1OpaqueCheckpointV2Client {
         journalPath: staged, bootstrapNew: true });
       // Fresh witnessed owner authorization of the exact signed #129 bytes,
       // followed by independent CAS/FLOOR FINALIZED proof before admission.
-      const examined = await scratch.#inspect(old, true);
+      const examined = await scratch.#inspect(old, true, undefined, options.migrationSignerGrant);
       if (examined.body.previous_sequence !== 128) deny();
-      await scratch.importSignedIntent(old);
+      await scratch.importSignedIntent(old, { signerGrant: options.migrationSignerGrant });
       const state = await scratch.read();
       if (state.sequence !== 129) deny();
       scratch.close();
@@ -248,7 +329,8 @@ class Zk1OpaqueCheckpointV2Client {
   }
   constructor({ journalPath, bootstrapNew, trustedScope, expectedV1Digest,
     expectedV1Checkpoint, v1CasClient, v1FloorClient, casClient, floorClient,
-    checkpointPublicKey, ownerPublicKey, catalogPublicKey, ownerTrust }) {
+    checkpointPublicKey, ownerPublicKey, catalogPublicKey, ownerTrust,
+    signerGrantRootPublicKey }) {
     const scope = scopeOf(trustedScope);
     const digest = bytes(expectedV1Digest, 32);
     const checkpoint = bytes(expectedV1Checkpoint, 32);
@@ -258,10 +340,18 @@ class Zk1OpaqueCheckpointV2Client {
     const checkpointKey = key(checkpointPublicKey);
     const ownerKey = key(ownerPublicKey);
     const catalogKey = key(catalogPublicKey);
-    const fingerprints = [cas, floor, checkpointKey, ownerKey, catalogKey].map(fp);
+    const signerGrantRootKey = signerGrantRootPublicKey
+      ? key(signerGrantRootPublicKey) : null;
+    const fingerprints = [cas, floor, checkpointKey, ownerKey, catalogKey,
+      ...(signerGrantRootKey ? [signerGrantRootKey] : [])].map(fp);
     // The owner-approved device may also sign the catalog header.
     if (new Set(fingerprints.slice(0, 4).map((b) => b.toString("hex"))).size !== 4
       || fingerprints.slice(0, 3).some((b) => equal(b, fingerprints[4]))
+      // The independently pinned historical grant authority cannot be any
+      // currently active device or checkpoint/CAS/FLOOR signer. In particular,
+      // catalog-key aliasing would let a device certify its own history.
+      || (signerGrantRootKey && fingerprints.slice(0, 5)
+        .some((b) => equal(b, fingerprints[5])))
       || !ownerTrust?.pinnedWitness || !ownerTrust?.minimumHead
       || typeof ownerTrust?.freshWitnessHead !== "function") deny();
     const coordinator = createOpaqueCheckpointV2Coordinator({
@@ -275,7 +365,8 @@ class Zk1OpaqueCheckpointV2Client {
     // writable SQLite open, journal-mode change or sidecar creation.
     const pinned = bootstrapNew ? creationPin
       : withReadonlySqliteSnapshot(journalPath,
-        (probe) => verifyJournal(probe, identity), deny, MAX_LOCAL_PREFLIGHT_BYTES);
+        (probe) => verifyJournal(probe, identity, !!signerGrantRootKey), deny,
+        MAX_LOCAL_PREFLIGHT_BYTES);
     const current = assertPrivateSqliteFile(journalPath);
     if (pinned.dev !== current.dev || pinned.ino !== current.ino) deny();
     assertSafeSqliteSidecars(journalPath, deny);
@@ -284,7 +375,7 @@ class Zk1OpaqueCheckpointV2Client {
       const opened = assertPrivateSqliteFile(journalPath);
       if (opened.dev !== pinned.dev || opened.ino !== pinned.ino) deny();
       assertSafeSqliteSidecars(journalPath, deny);
-      if (!bootstrapNew) verifyJournal(db, identity);
+      if (!bootstrapNew) verifyJournal(db, identity, !!signerGrantRootKey);
       db.pragma("journal_mode=WAL");
       db.pragma("synchronous=FULL");
       if (bootstrapNew) {
@@ -296,14 +387,14 @@ class Zk1OpaqueCheckpointV2Client {
             BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;`);
         db.prepare("INSERT INTO identity VALUES(1,?)").run(identity);
       }
-      if (bootstrapNew) db.exec(SUCCESSOR_SCHEMA);
+      if (bootstrapNew) db.exec(SUCCESSOR_SCHEMA + SIGNER_GRANT_SCHEMA);
     } catch (error) { db.close(); throw error; }
     this.#db = db;
     this.#coordinator = coordinator;
     this.#trust = { scope, digest, checkpoint, casFp: fingerprints[0],
       floorFp: fingerprints[1], casKey: cas, floorKey: floor,
       checkpointFp: fingerprints[2],
-      checkpointKey, ownerKey, catalogKey, ownerTrust };
+      checkpointKey, ownerKey, catalogKey, ownerTrust, signerGrantRootKey };
   }
   #serial(fn) {
     const result = this.#queue.then(fn);
@@ -317,17 +408,30 @@ class Zk1OpaqueCheckpointV2Client {
   }
   async #inspect(raw, freshOwner, previous = { sequence: 128,
     digest: this.#trust.digest, checkpointDigest: this.#trust.checkpoint,
-    operationId: ZERO }) {
+    operationId: ZERO }, grantEvidence) {
     const t = this.#trust;
+    const body = await z.decodeDeterministic(raw);
+    let grant = null;
+    if (t.signerGrantRootKey) {
+      if (!grantEvidence) deny();
+      if (!Buffer.isBuffer(grantEvidence) && !(grantEvidence instanceof Uint8Array)
+        && (!grantEvidence || typeof grantEvidence !== "object"
+          || Array.isArray(grantEvidence))) deny();
+      const captured = (Buffer.isBuffer(grantEvidence) || grantEvidence instanceof Uint8Array)
+        ? Buffer.from(grantEvidence) : Buffer.from(JSON.stringify(grantEvidence));
+      grant = await verifiedSignerGrant(captured, body, t, raw);
+    } else if (grantEvidence) deny();
     const inspected = await inspectIntent(raw, {
       scope: t.scope, baseDigest: previous.digest,
       baseCheckpoint: previous.checkpointDigest,
       casFp: t.casFp, floorFp: t.floorFp, checkpointFp: t.checkpointFp,
       checkpointKey: t.checkpointKey, ownerKey: t.ownerKey,
-      ownerTrust: t.ownerTrust, cachedSigner: t.catalogKey,
+      ownerTrust: t.ownerTrust, cachedSigner: grant ? grant.signer : t.catalogKey,
       casKey: t.casKey, floorKey: t.floorKey,
       previousOperationId: previous.operationId,
     }, { freshOwner });
+    if (grant && !equal(grant.signer.export({ type: "spki", format: "der" }),
+      inspected.signerSpki)) deny();
     // Historical reads cannot demand a fresh witness from a device that was
     // revoked AFTER publication. Preserve the signed owner approval binding.
     const approval = await z.decodeDeterministic(inspected.body.owner_approval);
@@ -348,17 +452,26 @@ class Zk1OpaqueCheckpointV2Client {
       || !equal(bytes(approval.previous_checkpoint_digest, 32), previous.checkpointDigest)
       || approval.previous_sequence !== previous.sequence
       || approval.final_sequence !== previous.sequence + 1) deny();
-    return inspected;
+    return { ...inspected, grant };
   }
   async #chain() {
     const first = this.#db.prepare("SELECT bytes FROM intent WHERE id=1").get();
     const successors = this.#db.prepare("SELECT sequence,bytes FROM successors ORDER BY sequence").all();
+    const grants = this.#db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='signer_grants'").get()
+      ? this.#db.prepare("SELECT sequence,grant,signer_spki FROM signer_grants ORDER BY sequence").all()
+      : [];
     if (!first && successors.length) deny();
     let previous = { sequence: 128, digest: this.#trust.digest,
       checkpointDigest: this.#trust.checkpoint, operationId: ZERO };
-    for (const item of first ? [{ sequence: 129, bytes: first.bytes }, ...successors] : []) {
+    const chain = first ? [{ sequence: 129, bytes: first.bytes }, ...successors] : [];
+    if (grants.length !== (this.#trust.signerGrantRootKey ? chain.length : 0)) deny();
+    for (const [index, item] of chain.entries()) {
       if (item.sequence !== previous.sequence + 1) deny();
-      const inspected = await this.#inspect(item.bytes, false, previous);
+      const stored = grants[index];
+      if (this.#trust.signerGrantRootKey && (stored.sequence !== item.sequence
+        || !Buffer.isBuffer(stored.grant) || !Buffer.isBuffer(stored.signer_spki))) deny();
+      const inspected = await this.#inspect(item.bytes, false, previous, stored?.grant);
+      if (stored && !equal(stored.signer_spki, inspected.signerSpki)) deny();
       previous = { sequence: item.sequence, digest: inspected.finalDigest,
         checkpointDigest: inspected.checkpointDigest,
         operationId: inspected.operationId, inspected };
@@ -381,7 +494,7 @@ class Zk1OpaqueCheckpointV2Client {
       checkpointDigest: checked.checkpointDigest, head,
       pages, state: "V2_BOTH_FINALIZED", remoteCloudDurabilityProven: false });
   }
-  async publish({ record, checkpointPrivateKey, ownerPrivateKey,
+  async publish({ record, checkpointPrivateKey, ownerPrivateKey, signerGrantIssuer,
     ownerEvidence, operationId = crypto.randomBytes(32),
     issuedAt = Math.floor(Date.now() / 1000), ownerIssuedAt = issuedAt }) {
     return this.#serial(async () => {
@@ -395,6 +508,10 @@ class Zk1OpaqueCheckpointV2Client {
       if (!equal(fp(crypto.createPublicKey(key(checkpointPrivateKey, "private"))),
         t.checkpointFp) || !equal(fp(crypto.createPublicKey(key(ownerPrivateKey, "private"))),
         fp(t.ownerKey))) deny();
+      // An external owner issuer sees the complete signed intent, verifies the
+      // independently witnessed history and returns an endorsement before any
+      // local append or network mutation. The caller cannot self-authorize.
+      if (t.signerGrantRootKey && typeof signerGrantIssuer !== "function") deny();
       const archived = await archive.createAuthenticatedOpaqueCatalogArchiveV2({
         scope: t.scope, records: [record], previousSequence: prior.sequence,
         previousDigest: prior.digest,
@@ -426,21 +543,23 @@ class Zk1OpaqueCheckpointV2Client {
         owner_evidence: Buffer.from(ownerEvidence),
         ...(endorsements || {}),
       }));
-      await this.#inspect(raw, true, prior);
-      this.#append(raw, prior.sequence + 1);
+      const signedSignerGrant = t.signerGrantRootKey
+        ? await signerGrantIssuer(Buffer.from(raw)) : null;
+      const inspected = await this.#inspect(raw, true, prior, signedSignerGrant);
+      this.#append(raw, prior.sequence + 1, inspected.grant);
       await this.#coordinator.publish(raw);
       return this.#read();
     });
   }
-  publishSignedIntent(signedIntent) {
+  publishSignedIntent(signedIntent, { signerGrant } = {}) {
     return this.#serial(async () => {
       const raw = Buffer.from(signedIntent);
       const saved = this.#saved();
       const prior = await this.#chain();
       if (!saved || !equal(saved, raw)) {
         if (saved) await this.#coordinator.readConsistent(saved);
-        const inspected = await this.#inspect(raw, true, prior);
-        this.#append(raw, prior.sequence + 1);
+        const inspected = await this.#inspect(raw, true, prior, signerGrant);
+        this.#append(raw, prior.sequence + 1, inspected.grant);
         if (inspected.body.previous_sequence !== prior.sequence) deny();
       } else {
         await this.#chain();
@@ -452,15 +571,15 @@ class Zk1OpaqueCheckpointV2Client {
   // A second device can import an authenticated chain before reading. The
   // remote signed heads still decide whether the final imported entry is
   // current; a local imported journal alone never grants a metadata read.
-  importSignedIntent(signedIntent) {
+  importSignedIntent(signedIntent, { signerGrant } = {}) {
     return this.#serial(async () => {
       if ((!Buffer.isBuffer(signedIntent) && !(signedIntent instanceof Uint8Array))
         || signedIntent.byteLength < 1 || signedIntent.byteLength > 10 * 1024 * 1024)
         deny();
       const raw = Buffer.from(signedIntent);
       const prior = await this.#chain();
-      await this.#inspect(raw, false, prior);
-      this.#append(raw, prior.sequence + 1);
+      const inspected = await this.#inspect(raw, false, prior, signerGrant);
+      this.#append(raw, prior.sequence + 1, inspected.grant);
       return { importedSequence: prior.sequence + 1, remotelyFinalized: false };
     });
   }
@@ -483,10 +602,14 @@ class Zk1OpaqueCheckpointV2Client {
     });
   }
   read() { return this.#serial(() => this.#read()); }
-  #append(raw, sequence) {
-    if (sequence === 129) this.#db.prepare("INSERT INTO intent(id,bytes) VALUES(1,?)").run(raw);
-    else this.#db.prepare("INSERT INTO successors(sequence,bytes) VALUES(?,?)")
-      .run(sequence, raw);
+  #append(raw, sequence, grant) {
+    this.#db.transaction(() => {
+      if (sequence === 129) this.#db.prepare("INSERT INTO intent(id,bytes) VALUES(1,?)").run(raw);
+      else this.#db.prepare("INSERT INTO successors(sequence,bytes) VALUES(?,?)")
+        .run(sequence, raw);
+      if (grant) this.#db.prepare("INSERT INTO signer_grants(sequence,grant,signer_spki) VALUES(?,?,?)")
+        .run(sequence, grant.raw, grant.signer.export({ format: "der", type: "spki" }));
+    })();
   }
   close() { if (this.#db.open) this.#db.close(); }
 }
