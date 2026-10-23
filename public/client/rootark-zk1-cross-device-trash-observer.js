@@ -147,6 +147,7 @@
           .filter(({ entry }) => entry.objectId === objectId);
         if (!matches.length || matches.length !== metadataRows.length) deny();
         let previous = null, priorRow = null, lastState = "file", restored = false;
+        let lastFile = null;
         for (let offset = 0; offset < matches.length; offset++) {
           const { entry, index } = matches[offset];
           if (entry.revision !== offset + 1 || entry.epoch < 1) deny();
@@ -174,8 +175,22 @@
             } else {
               opened = await file.decryptFile({ cek, metadata: meta, envelopeBytes: ciphertext });
               if (opened.authorizesRelease === true) deny();
+              const contentDigest = to64(new Uint8Array(await crypto.subtle.digest(
+                "SHA-256", opened.data)));
+              const currentFile = { name: opened.name,
+                parentFolderId: opened.parentFolderId ?? null,
+                mediaType: opened.mediaType, size: opened.data.byteLength,
+                contentDigest };
+              // The catalog authenticates that a new FILE was written; it does
+              // not authenticate the user's intent to RESTORE a trashed file.
+              // Only an exact re-encryption of the preceding live version can
+              // be classified as a restore without a separate signed marker.
+              if (lastState === "trashed" && (!lastFile
+                || Object.keys(currentFile).some((name) =>
+                  currentFile[name] !== lastFile[name]))) deny();
               value = "file";
               if (lastState === "trashed") restored = true;
+              lastFile = currentFile;
             }
           } finally { opened?.data?.fill(0); ciphertext.fill(0); }
           previous = meta;
