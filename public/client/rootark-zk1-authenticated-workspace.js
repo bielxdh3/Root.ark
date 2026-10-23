@@ -309,10 +309,47 @@
     assertLive();
     return historic;
   }
+  // One-use device PoP is issued inside the trusted keyring module. Neither
+  // challenge nor nonce may be imported from JSON or provided by the server.
+  // Only the matching locally imported Ed25519 private key can sign a binding
+  // over the exact keyring/account archive hash, current signed grant and head.
+  async function signedHistoricalDevicePoP({ scope, pinnedCurrentHead,
+    independentOwnerSpkiSha256, currentSignedDeviceGrant, archiveSha256,
+    accountArchiveSha256, privateDer, assertLive }) {
+    assertLive();
+    if (!(privateDer instanceof Uint8Array) || privateDer.length < 1
+      || privateDer.length > 8192 || currentSignedDeviceGrant.revoked_at_epoch !== null) fail();
+    const keyringApi = window.RootarkZk1KeyringPortableArchive;
+    if (!keyringApi?.issueHistoricalRecoveryChallenge
+      || !keyringApi?.historicalRecoveryChallengeMessage) fail();
+    const devicePrivateKey = await crypto.subtle.importKey("pkcs8", privateDer,
+      "Ed25519", false, ["sign"]);
+    assertLive();
+    const devicePublicKey = await crypto.subtle.importKey("raw",
+      from64(currentSignedDeviceGrant.authorization_public_key), "Ed25519", false, ["verify"]);
+    const challenge = await keyringApi.issueHistoricalRecoveryChallenge({
+      archiveSha256, accountArchiveSha256, scope, pinnedCurrentHead,
+      independentOwnerSpkiSha256, currentSignedDeviceGrant,
+    });
+    assertLive();
+    const message = keyringApi.historicalRecoveryChallengeMessage(challenge);
+    if (!(message instanceof Uint8Array) || message.length < 1
+      || message.length > 4096) fail();
+    try {
+      const signature = new Uint8Array(await crypto.subtle.sign("Ed25519",
+        devicePrivateKey, message));
+      assertLive();
+      if (signature.length !== 64 || !await crypto.subtle.verify("Ed25519",
+        devicePublicKey, signature, message)) fail();
+      assertLive();
+      return { challenge, signature: to64(signature) };
+    } finally { message.fill(0); }
+  }
   // Every scope, current head, active signed grant and owner history must be
   // selected outside the archive/server. Rebuild branded history proofs locally.
   async function selectedAccountKeyrings(trust, create, assertLive, accountFiles,
     historicalOptIn = false) {
+    if (historicalOptIn && create) fail();
     const raw = await fileBytes("account-descriptors", 2, 512 * 1024);
     let manifest;
     try { manifest = JSON.parse(decoder.decode(raw)); }
@@ -325,8 +362,10 @@
       || manifest.accountId !== trust.signedDeviceGrant.account_id) fail();
     const holderFiles = Array.from(field("account-holder-files")?.files || []);
     const localFiles = Array.from(field("account-local-files")?.files || []);
+    const privateInputs = Array.from(field("account-historical-device-privates")?.files || []);
     if (holderFiles.length !== manifest.keyrings.length
-      || (!create && localFiles.length !== 0)) fail();
+      || (!create && localFiles.length !== 0)
+      || (!historicalOptIn && privateInputs.length)) fail();
     const byName = (files) => {
       const result = new Map();
       for (const item of files) {
@@ -337,14 +376,16 @@
     };
     const holders = byName(holderFiles);
     const selections = byName(localFiles);
+    const privateByName = byName(privateInputs);
     const usedHolders = new Set(), usedFiles = new Set(), usedRings = new Set();
+    const usedPrivates = new Set(), historyPrivateFiles = new Map();
     const keyrings = [];
     let totalBytes = 0;
     for (const selection of manifest.keyrings) {
       const hasRoots = Object.hasOwn(selection || {}, "currentOwnerRootCheckpoints");
       exactly(selection, ["scope", "pinnedCurrentHead", "signedDeviceGrant",
         "ownerHistory", "signerKeyId", "deviceId", "holderSecretFile", "files",
-        ...(hasRoots ? ["currentOwnerRootCheckpoints"] : [])]);
+        ...(hasRoots ? ["currentOwnerRootCheckpoints", "devicePrivateFile"] : [])]);
       if (hasRoots && (!historicalOptIn || create)) fail();
       exactly(selection.scope, ["account_id", "compartment_id", "keyring_id"]);
       exactly(selection.pinnedCurrentHead, ["revision", "digest", "epoch"]);
@@ -429,6 +470,18 @@
           signedDeviceGrant: selection.signedDeviceGrant,
           ownerHistoryCheckpoint });
       } else if (hasRoots) {
+        if (typeof selection.devicePrivateFile !== "string"
+          || !privateByName.has(selection.devicePrivateFile)
+          || usedPrivates.has(selection.devicePrivateFile)) fail();
+        const privateFile = privateByName.get(selection.devicePrivateFile);
+        if (!Number.isSafeInteger(privateFile.size) || privateFile.size < 1
+          || privateFile.size > 8192) fail();
+        const devicePrivateDer = new Uint8Array(await privateFile.arrayBuffer());
+        accountFiles.privates.push(devicePrivateDer);
+        assertLive();
+        if (devicePrivateDer.length !== privateFile.size) fail();
+        usedPrivates.add(selection.devicePrivateFile);
+        historyPrivateFiles.set(ringId, devicePrivateDer);
         const historicalRecovery = { signedOwnerHistoryChain: selection.ownerHistory,
           currentSignedDeviceGrant: selection.signedDeviceGrant,
           currentOwnerRootCheckpoints: selection.currentOwnerRootCheckpoints };
@@ -440,13 +493,15 @@
       } else keyrings.push(common);
     }
     if (usedHolders.size !== holders.size
-      || (create && usedFiles.size !== selections.size)) fail();
+      || (create && usedFiles.size !== selections.size)
+      || usedPrivates.size !== privateByName.size) fail();
     keyrings.sort((a, b) => {
       const left = a.scope.compartment_id + ":" + a.scope.keyring_id;
       const right = b.scope.compartment_id + ":" + b.scope.keyring_id;
       return left < right ? -1 : left > right ? 1 : 0;
     });
-    return { accountId: manifest.accountId, keyrings };
+    return { accountId: manifest.accountId, keyrings,
+      ...(historicalOptIn ? { historyPrivateFiles } : {}) };
   }
   function sessionFetch(url, options) {
     // Existing protected HTTP signing uses fetch directly; the real Root.ark
@@ -489,7 +544,9 @@
         || !window.RootarkZk1V2BrowserPop?.respond
         || !window.RootarkZk1V2CommittedApproval?.verifyCommittedApproval
         || !window.RootarkZk1KeyringPortableArchive?.createArchive
-        || !window.RootarkZk1KeyringPortableArchive?.recoverArchive) fail();
+        || !window.RootarkZk1KeyringPortableArchive?.recoverArchive
+        || !window.RootarkZk1KeyringPortableArchive?.issueHistoricalRecoveryChallenge
+        || !window.RootarkZk1KeyringPortableArchive?.historicalRecoveryChallengeMessage) fail();
       if (!window.RootarkZk1AccountPortableRecovery?.createArchive
         || !window.RootarkZk1AccountPortableRecovery?.recoverArchive) fail();
     })();
@@ -583,6 +640,7 @@
       + '<label><input type="checkbox" data-zk1-field="archive-opt-in"> Autorizo a operação local sem persistir arquivos recuperados no servidor.</label>'
       + '<label><input type="checkbox" data-zk1-field="archive-historical-opt-in"> Recuperar pacote de head antigo: exigir histórico completo genesis→atual, grant ATIVO atual e reendosso assinado de cada raiz (sem substituição automática).</label>'
       + '<label>Endossos históricos atuais escolhidos offline (.json, schema rootark-zk1-keyring-history-endorsement/v1, {schema,scope,historicalRecovery:{signedOwnerHistoryChain,currentSignedDeviceGrant,currentOwnerRootCheckpoints}})<input type="file" data-zk1-field="archive-historical-proof" accept=".json,application/json"></label>'
+      + '<p class="muted">Para recuperar head antigo, importe também no campo "Chave privada do dispositivo (PKCS#8, local)" a chave Ed25519 ATUAL vinculada ao grant. O desafio PoP é criado neste navegador, é de uso único e nunca vem do JSON ou do servidor.</p>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="archive-create">Assinar e baixar arquivo cifrado + hash separado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="archive-recover">Verificar e baixar 1–12 arquivos locais</button></div>'
       + '</fieldset>'
@@ -602,6 +660,7 @@
       + '<label>SHA-256 do arquivo da conta fixado externamente (base64url, 32 bytes)<input data-zk1-field="account-sha" maxlength="43" autocomplete="off" spellcheck="false"></label>'
       + '<label><input type="checkbox" data-zk1-field="account-opt-in"> Confirmo cópia/recuperação local sem upload, exclusão ou cutover. Pins/segredos foram escolhidos por canal independente.</label>'
       + '<label><input type="checkbox" data-zk1-field="account-historical-opt-in"> Recuperar pacote com heads antigos: adicionar currentOwnerRootCheckpoints de cada keyring antigo à seleção offline; nunca recuperar com grant revogado ou sem todos os reendossos.</label>'
+      + '<label>Chaves privadas Ed25519 PKCS#8 dos grants atuais dos keyrings históricos (1 arquivo por keyring antigo; nomes em devicePrivateFile no JSON da seleção)<input type="file" multiple data-zk1-field="account-historical-device-privates"></label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="account-create">Assinar e baixar pacote da conta + hash</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="account-recover">Conferir e baixar arquivos de todos os keyrings</button></div>'
       + '</fieldset>'
@@ -635,7 +694,7 @@
     let secret;
     let ownerSigningDer;
     let archiveFiles;
-    const accountFiles = { plaintext: [], secrets: [] };
+    const accountFiles = { plaintext: [], secrets: [], privates: [] };
     let accountRecovered;
     try {
       const operationEpoch = sessionEpoch;
@@ -778,6 +837,7 @@
           assertLive();
           if (!Array.isArray(accountArchive?.keyrings)
             || accountArchive.keyrings.length !== selected.keyrings.length) fail();
+          const independentAccountHash = from64(field("account-sha").value.trim());
           let historicCount = 0;
           for (let index = 0; index < selected.keyrings.length; index++) {
             const expected = selected.keyrings[index];
@@ -789,12 +849,28 @@
               || entry.ownerEpoch !== expected.pinnedCurrentHead.epoch;
             const historical = Object.hasOwn(expected, "historicalRecovery");
             if (old !== historical || (old && !accountHistory)) fail();
-            if (old) historicCount++;
+            if (old) {
+              const ringId = expected.scope.compartment_id + ":" + expected.scope.keyring_id;
+              const devicePrivateDer = selected.historyPrivateFiles?.get(ringId);
+              if (!devicePrivateDer) fail();
+              const devicePoP = await signedHistoricalDevicePoP({
+                scope: expected.scope,
+                pinnedCurrentHead: expected.pinnedCurrentHead,
+                independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+                currentSignedDeviceGrant: expected.historicalRecovery.currentSignedDeviceGrant,
+                archiveSha256: from64(entry.archiveSha256),
+                accountArchiveSha256: independentAccountHash,
+                privateDer: devicePrivateDer, assertLive,
+              });
+              assertLive();
+              expected.historicalRecovery = { ...expected.historicalRecovery, devicePoP };
+              historicCount++;
+            }
           }
           if (accountHistory && historicCount === 0) fail();
           accountRecovered = await window.RootarkZk1AccountPortableRecovery.recoverArchive({
             accountArchive, accountId: selected.accountId,
-            independentlyPinnedAccountSha256: from64(field("account-sha").value.trim()),
+            independentlyPinnedAccountSha256: independentAccountHash,
             ownerPublicKey: trust.ownerPublicKey,
             independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
             keyrings: selected.keyrings,
@@ -911,6 +987,18 @@
             ? await selectedHistoricalKeyring(trust, scope, archiveCommon.signerKeyId,
               archiveCommon.deviceId, assertLive) : null;
           assertLive();
+          if (historicOptIn) {
+            privateDer = await fileBytes("private", 1, 8192);
+            assertLive();
+            historicalRecovery.devicePoP = await signedHistoricalDevicePoP({
+              scope, pinnedCurrentHead: trust.pinnedCurrentHead,
+              independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
+              currentSignedDeviceGrant: historicalRecovery.currentSignedDeviceGrant,
+              archiveSha256: from64(field("archive-sha").value.trim()),
+              accountArchiveSha256: null, privateDer, assertLive,
+            });
+            assertLive();
+          }
           const recovered = await window.RootarkZk1KeyringPortableArchive.recoverArchive({
             ...archiveCommon, previousOwnerHistoryProof: historicOptIn
               ? null : archiveCommon.previousOwnerHistoryProof,
@@ -1152,6 +1240,7 @@
       for (const item of archiveFiles || []) item.data.fill(0);
       for (const item of accountFiles.plaintext) item.fill(0);
       for (const item of accountFiles.secrets) item.fill(0);
+      for (const item of accountFiles.privates) item.fill(0);
       if (Array.isArray(accountRecovered?.keyrings)) {
         for (const ring of accountRecovered.keyrings) {
           if (Array.isArray(ring?.files)) for (const file of ring.files) {
@@ -1164,6 +1253,7 @@
         "migration-batch-descriptors", "migration-batch-ceks", "migration-batch-secret",
         "archive-files", "archive-owner-private", "archive-json", "archive-historical-proof",
         "account-descriptors", "account-holder-files", "account-local-files",
+        "account-historical-device-privates",
         "account-owner-private", "account-archive"]) {
         const control = field(name);
         if (control) control.value = "";

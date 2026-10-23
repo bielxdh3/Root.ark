@@ -1548,6 +1548,7 @@ test("Edge normal authenticated V2 workspace refuses a real legacy V1 server cap
         const selectedHistory={schema:"rootark-zk1-keyring-history-endorsement/v1",
           scope,historicalRecovery:historyWire};
         const provisionHistory=()=>{
+          setFile("private",decode(values.privateDer));
           setFile("owner",decode(values.ownerRaw));
           field("owner-hash").value=values.ownerHash;
           field("owner-spki").value=values.ownerSpkiHash;

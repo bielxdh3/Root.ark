@@ -40,6 +40,14 @@ root** under that current head. The browser reconstructs Ed25519 history proof
 brands from the imported genesis chain; serialized `verified: true` flags do not
 count. The crypto module rechecks the historical archive's original signed
 history and roots, plus the newly signed current grant and all endorsements.
+Historic recovery also requires one-use PoP from the **current ACTIVE device**:
+select its private Ed25519 PKCS#8 in the ordinary browser `private` field.
+The client module issues a fresh, in-process WeakMap-branded challenge bound to
+the selected archive hash, owner SPKI/head, scope and current signed grant; the
+browser signs it with a non-extractable imported device key, then the module
+consumes it only once. Neither nonce nor signature is accepted from a user JSON
+file or server response. If key possession cannot be established, no historical
+plaintext is released.
 
 For an older archive in `account-recover`, explicitly check
 **account-historical-opt-in** and supply `currentOwnerRootCheckpoints` on each
@@ -52,6 +60,12 @@ account batch and no local file is released. All inputs are opt-in, locally
 selected, bounded and session/CSRF/logout fenced. Neither flow uploads
 plaintext or CEK nor authorizes production restore, account completeness,
 online revocation, witness custody, or independent external durability.
+Every affected keyring's JSON selection must additionally name `devicePrivateFile`,
+and the user must select the corresponding *current* device PKCS#8 file in
+`account-historical-device-privates`. Each per-keyring one-use challenge binds
+both the individual archived keyring SHA-256 and the independently pinned
+account archive SHA-256; missing, reused, or incorrect private keys deny the
+entire operation. The browser never imports a caller-provided PoP nonce.
 
 - `createArchive({ accountId, ownerSigningKey, ownerPublicKey,
   independentOwnerSpkiSha256, keyrings })` accepts 1–8 existing keyring-archive

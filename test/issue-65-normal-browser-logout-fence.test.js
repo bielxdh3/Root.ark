@@ -34,6 +34,8 @@ async function harness() {
   let accountCreateCalls = 0;
   let accountRecoverCalls = 0;
   let selectedBlob = null;
+  const historicalChallenges = new WeakMap();
+  let nextHistoricChallenge = 0;
   const window = {
     RootarkApi: { get: async () => ({ enabled: true,
       securityVersion: 2, signedHistoryRequired: true }) },
@@ -87,8 +89,22 @@ async function harness() {
     },
     RootarkZk1KeyringPortableArchive: {
       createArchive: async () => ({}),
-      recoverArchive: () => {
+      issueHistoricalRecoveryChallenge: async (binding) => {
+        trace.push("historic-issue-device-pop");
+        const challenge = Object.freeze({ nonce: ++nextHistoricChallenge });
+        historicalChallenges.set(challenge, { binding,
+          message: Uint8Array.from(Buffer.from("historical-one-use-" + nextHistoricChallenge)) });
+        window.lastChallenge = challenge;
+        return challenge;
+      },
+      historicalRecoveryChallengeMessage: (challenge) => {
+        if (!historicalChallenges.has(challenge)) throw Error("FORGED_DEVICE_POP_CHALLENGE");
+        trace.push("historic-branded-challenge-message");
+        return historicalChallenges.get(challenge).message.slice();
+      },
+      recoverArchive: (input) => {
         trace.push("recoverArchive");
+        window.archiveRecoverInput = input;
         return new Promise((resolve) => { finishArchive = resolve; });
       },
     },
@@ -420,6 +436,7 @@ async function configureAccount(page, create = false) {
   const originalGrant = JSON.parse(Buffer.from(
     await page.field("grant").files[0].arrayBuffer()).toString());
   const accountId = originalGrant.account_id;
+  const deviceRaw = Buffer.from(await page.field("device").files[0].arrayBuffer());
   const signer = encode(crypto.randomBytes(16));
   const descriptor = { schema: "rootark-zk1-account-workspace-selection/v1",
     accountId, keyrings: Array.from({ length: 2 }, (_unused, index) => ({
@@ -427,7 +444,8 @@ async function configureAccount(page, create = false) {
         keyring_id: encode(crypto.randomBytes(16)) },
       pinnedCurrentHead: { revision: index + 1,
         digest: encode(crypto.randomBytes(32)), epoch: index + 1 },
-      signedDeviceGrant: { revoked_at_epoch: null, device_id: "owner-device" },
+      signedDeviceGrant: { revoked_at_epoch: null, device_id: "owner-device",
+        authorization_public_key: encode(deviceRaw) },
       ownerHistory: [{ sequence: 1, signer_key_id: signer }],
       signerKeyId: signer, deviceId: "owner-device",
       holderSecretFile: "holder-" + index + ".bin",
@@ -447,6 +465,7 @@ async function configureAccount(page, create = false) {
   page.file("account-archive", JSON.stringify({ keyrings: descriptor.keyrings.map((item) => ({
     scope: item.scope, ownerRevision: item.pinnedCurrentHead.revision,
     ownerDigest: item.pinnedCurrentHead.digest, ownerEpoch: item.pinnedCurrentHead.epoch,
+    archiveSha256: encode(crypto.randomBytes(32)),
   })).sort((a, b) => {
     const left = a.scope.compartment_id + ":" + a.scope.keyring_id;
     const right = b.scope.compartment_id + ":" + b.scope.keyring_id;
@@ -564,6 +583,8 @@ test("UI explicitly disclaims complete signed inventory for keyring and account 
 async function historicKeyring(page) {
   const grant = JSON.parse(Buffer.from(await page.field("grant").files[0].arrayBuffer()).toString());
   grant.device_id = "fixture-owner";
+  grant.authorization_public_key = encode(Buffer.from(
+    await page.field("device").files[0].arrayBuffer()));
   page.file("grant", JSON.stringify(grant));
   const signer = page.field("owner-signer").value;
   const scope = { account_id: grant.account_id, compartment_id: grant.compartment_id,
@@ -595,8 +616,10 @@ test("historical keyring opts in with fully branded current chain and current gr
   const f = await historicKeyring(page);
   page.click("archive-recover");
   await page.waitForArchive();
-  const input = page.window;
-  // recoverArchive stub's pending input is captured below in the harness.
+  const input = page.window.archiveRecoverInput;
+  assert.equal(typeof input.historicalRecovery.devicePoP.signature, "string");
+  assert.equal(input.historicalRecovery.devicePoP.challenge, page.window.lastChallenge);
+  assert.equal(page.trace.filter((step) => step === "historic-issue-device-pop").length, 1);
   assert.equal(page.trace.filter((step) => step === "history").length >= 4, true);
   assert.equal(page.trace.includes("assertCurrent"), true);
   assert.equal(page.downloads.length, 0);
@@ -606,6 +629,28 @@ test("historical keyring opts in with fully branded current chain and current gr
     historicalOwnerContinuityVerified: true, currentSignedGrantAtPinnedHeadVerified: true });
   await tickUntil(() => page.downloads.length === 1);
   assert.equal(page.downloads[0].name, "historical.txt");
+});
+
+test("historical keyring denies incorrect device private key and never calls recovery module", async () => {
+  const page = await harness();
+  await historicKeyring(page);
+  const other = crypto.generateKeyPairSync("ed25519");
+  page.file("private", other.privateKey.export({ type: "pkcs8", format: "der" }));
+  page.click("archive-recover");
+  await page.denied();
+  assert.equal(page.trace.includes("recoverArchive"), false);
+  assert.equal(page.downloads.length, 0);
+});
+
+test("historical keyring refuses user-supplied devicePoP in offline JSON", async () => {
+  const page = await harness();
+  const value = await historicKeyring(page);
+  value.selected.historicalRecovery.devicePoP = { challenge: "fake", signature: "fake" };
+  page.file("archive-historical-proof", JSON.stringify(value.selected));
+  page.click("archive-recover");
+  await page.denied();
+  assert.equal(page.trace.includes("historic-issue-device-pop"), false);
+  assert.equal(page.downloads.length, 0);
 });
 
 for (const mode of ["no-opt-in", "incomplete-chain", "missing-root", "revoked",
@@ -655,6 +700,12 @@ async function historicAccount(page) {
     revision: ring.pinnedCurrentHead.revision, manifest_digest: freshDigest });
   ring.currentOwnerRootCheckpoints = [{ object_id: encode(crypto.randomBytes(16)),
     ciphertext_root: encode(crypto.randomBytes(32)) }];
+  ring.devicePrivateFile = "historical-device-1.pk8";
+  const privateDer = Buffer.from(await page.field("private").files[0].arrayBuffer());
+  page.field("account-historical-device-privates").files = [{
+    name: ring.devicePrivateFile, size: privateDer.byteLength,
+    arrayBuffer: async () => Uint8Array.from(privateDer).buffer,
+  }];
   page.file("account-descriptors", JSON.stringify(manifest));
   page.field("account-historical-opt-in").checked = true;
   return manifest;
@@ -671,11 +722,35 @@ test("account historical recovery passes per-keyring independent current authori
   assert.equal(Object.hasOwn(keys[1], "historicalRecovery"), true);
   assert.equal(keys[1].previousOwnerHistoryProof, null);
   assert.equal(keys[1].historicalRecovery.currentOwnerRootCheckpoints.length, 1);
+  assert.equal(typeof keys[1].historicalRecovery.devicePoP.signature, "string");
+  assert.equal(keys[1].historicalRecovery.devicePoP.challenge, page.window.lastChallenge);
   page.resolveAccountRecover({ keyrings: keys.map((value, i) => ({
     scope: value.scope, files: [{ name: "version-" + i + ".txt", data: Uint8Array.of(i + 1) }],
   })), allKeyringsVerified: true, aggregateSignatureVerified: true,
   aggregateIndependentPinMatched: true, authorizesProductionRestore: false });
   await tickUntil(() => page.downloads.length === 2);
+});
+
+test("account historical recovery denies wrong grant device private key before archive I/O", async () => {
+  const page = await harness();
+  await historicAccount(page);
+  const other = crypto.generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "der" });
+  page.field("account-historical-device-privates").files = [{ name: "historical-device-1.pk8",
+    size: other.length, arrayBuffer: async () => Uint8Array.from(other).buffer }];
+  page.click("account-recover");
+  await page.denied();
+  assert.equal(page.accountRecoverCalls(), 0);
+  assert.equal(page.downloads.length, 0);
+});
+
+test("account historical recovery refuses missing selected current device private file", async () => {
+  const page = await harness();
+  await historicAccount(page);
+  page.field("account-historical-device-privates").files = [];
+  page.click("account-recover");
+  await page.denied();
+  assert.equal(page.accountRecoverCalls(), 0);
+  assert.equal(page.downloads.length, 0);
 });
 
 for (const mode of ["no-opt-in", "missing-roots", "revoked", "cross-scope",
