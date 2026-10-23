@@ -127,4 +127,4 @@ if (require.main === module) {
     process.exitCode = 1;
   });
 }
-module.exports = { run, parse };
+module.exports = { run, parse, safeDir, fileAt, readJson, publishJson, awaitJson };
