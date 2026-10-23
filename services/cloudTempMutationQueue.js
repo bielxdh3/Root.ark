@@ -2,12 +2,21 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 
-function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, upload, remove, isSuppressed = () => false, isEnabled = () => true, area = "temp" } = {}) {
+function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, upload, remove, isSuppressed = () => false, isEnabled = () => true, area = "temp", retryBaseMs = 2000, retryMaxMs = 30000 } = {}) {
   if (!directory || !lifecycleLock?.run || typeof localPathFor !== "function" || typeof upload !== "function" || typeof remove !== "function") {
     throw new TypeError("Cloud mutation queue requires storage, lock, and provider operations");
   }
   if (!["temp", "uploads"].includes(area)) throw new TypeError("Invalid cloud mutation area");
+  if (!Number.isSafeInteger(retryBaseMs) || retryBaseMs < 1
+    || !Number.isSafeInteger(retryMaxMs) || retryMaxMs < retryBaseMs) {
+    throw new TypeError("Invalid cloud mutation retry bounds");
+  }
   const queueDirectory = path.resolve(directory);
+  // In-memory cooldown limits provider traffic and folder-lock starvation
+  // during an outage. The durable desired-state record remains authoritative;
+  // a fresh process always retries it immediately.
+  const retryState = new Map();
+  let activeSweep = null;
 
   function identity(folderId, fileName) {
     const cleanName = path.basename(String(fileName || ""));
@@ -84,6 +93,7 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
     const item = identity(folderId, fileName);
     const record = { version: 1, ...item, ...(area === "temp" ? {} : { area }), desired, generation: crypto.randomUUID(), updatedAt: new Date().toISOString() };
     write(record);
+    retryState.delete(recordPath(item.folderId, item.fileName));
     return record;
   }
 
@@ -151,18 +161,42 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
 
   async function process(folderId, fileName) {
     const item = identity(folderId, fileName);
-    return lifecycleLock.run(item.folderId, item.fileName, () => processLocked(item));
+    return lifecycleLock.run(item.folderId, item.fileName, () => processAttempt(item));
+  }
+
+  async function processAttempt(item) {
+    const key = recordPath(item.folderId, item.fileName);
+    try {
+      await processLocked(item);
+      retryState.delete(key);
+    } catch (error) {
+      // Track only the same durable generation. A fresh enqueue must not
+      // inherit the previous failure's delay or suppress its processing.
+      let current;
+      try { current = read(item.folderId, item.fileName); } catch { current = null; }
+      if (current) {
+        const previous = retryState.get(key);
+        const failures = previous?.generation === current.generation ? previous.failures + 1 : 1;
+        retryState.set(key, {
+          generation: current.generation,
+          failures,
+          nextAt: Date.now() + Math.min(retryMaxMs,
+            retryBaseMs * (2 ** Math.min(failures - 1, 16))),
+        });
+      } else retryState.delete(key);
+      throw error;
+    }
   }
 
   async function enqueue(folderId, fileName, desired) {
     const item = identity(folderId, fileName);
     return lifecycleLock.run(item.folderId, item.fileName, async () => {
       setDesired(item.folderId, item.fileName, desired);
-      await processLocked(item);
+      await processAttempt(item);
     });
   }
 
-  async function processAll() {
+  async function sweep() {
     if (!isEnabled()) return;
     if (!fs.existsSync(queueDirectory)) return;
     const records = [];
@@ -177,9 +211,27 @@ function createCloudTempMutationQueue({ directory, lifecycleLock, localPathFor, 
       if (recordPath(record.folderId, record.fileName) !== path.join(queueDirectory, entry.name)) throw new Error("Cloud temp queue record identity does not match its filename");
       records.push(record);
     }
-    const results = await Promise.allSettled(records.map((record) => process(record.folderId, record.fileName)));
+    const results = await Promise.allSettled(records.map((record) => {
+      const state = retryState.get(recordPath(record.folderId, record.fileName));
+      if (state?.generation === record.generation && Date.now() < state.nextAt) {
+        return Promise.resolve();
+      }
+      return process(record.folderId, record.fileName);
+    }));
     const failed = results.filter((result) => result.status === "rejected");
     if (failed.length) throw new AggregateError(failed.map((result) => result.reason), "Cloud temp mutations remain pending");
+  }
+
+  function processAll() {
+    // Startup reconciliation and periodic sweeps may overlap. Coalesce them
+    // so one failed provider call cannot queue many 30s lifecycle waiters.
+    if (activeSweep) return activeSweep;
+    const running = sweep();
+    activeSweep = running;
+    void running.finally(() => {
+      if (activeSweep === running) activeSweep = null;
+    }).catch(() => {});
+    return running;
   }
 
   return { enqueue, getRecord, hasPending, process, processAll, restoreRecord, setDesired };
