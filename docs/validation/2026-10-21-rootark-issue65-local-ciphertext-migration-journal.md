@@ -4,9 +4,9 @@
 
 `src/services/zk1LocalFixtureMigrationJournal.js` exports `runLocalFixtureCiphertextMigration`, `verifyLocalFixtureCiphertextMigration`, and `rollbackLocalFixtureCiphertextMigration`. Each takes the same explicit fixture plan. There is no implicit execution or provider discovery. Every report carries `canMigrate:false` and `rollbackScope:"local-fixture-only"` even after the local copy is verified.
 
-The fixture directory must be an immediate child of `os.tmpdir()` whose name starts with `rootark-zk-local-fixture-`, have the exact marker `.rootark-disposable-fixture` containing `rootark-zk-local-fixture-v1\n`, and pre-existing `source/`, `target/`, `journal/`, `references/{versions,backups,trash}/` directories. The caller must create this **freshly with synthetic ciphertext**. A path and marker cannot prove that a malicious or careless caller did not copy private data there. This code assumes a trusted single-process, non-concurrent disposable fixture with ordinary filesystem semantics. It rejects symlinks on the fixture root and inspected entries, linked source/reference files, traversal or unsafe IDs, payloads over 16 MiB, reused targets, and unsupported or incomplete reference sets.
+The fixture directory must be an immediate child of `os.tmpdir()` whose name starts with `rootark-zk-local-fixture-`, have the exact marker `.rootark-disposable-fixture` containing `rootark-zk-local-fixture-v1\n`, and pre-existing `source/`, `target/`, `journal/`, `references/{versions,backups,trash,links,derived,retention}/` directories. The caller must create this **freshly with synthetic ciphertext**. A path and marker cannot prove that a malicious or careless caller did not copy private data there. This code assumes a trusted single-process, non-concurrent disposable fixture with ordinary filesystem semantics. It rejects symlinks on the fixture root and inspected entries, linked source/reference files, traversal or unsafe IDs, payloads over 16 MiB, reused targets, and unsupported or incomplete reference sets.
 
-Plans name one synthetic object (`source/<objectId>.ct`, `target/<objectId>.ct`) and one operation ID. A lowercase hex SHA-256 commitment covers the source bytes. The inventory requires **nonempty** synthetic versions, backup and trash reference lists with per-entry SHA-256 commitments and presence checks, all independently reopened before any write, before commit and before rollback. `sourceProvenance` must be `{role:"source",provider:"fixture-source",identity:<opaque-id>}`, and `targetProvenance` must be `{role:"target",provider:"fixture-target",identity:<distinct-opaque-id>}`. These are *caller-asserted fixture labels*, not independently authenticated cloud principals or owner-signed authorization. Mismatched plans and duplicated names fail closed.
+Plans name one synthetic object (`source/<objectId>.ct`, `target/<objectId>.ct`) and one operation ID. A lowercase hex SHA-256 commitment covers the source bytes. The inventory requires **nonempty** synthetic version, backup, trash, link, derived and retention reference lists with per-entry SHA-256 commitments and presence checks, all independently reopened before any write, before commit and before rollback. `sourceProvenance` must be `{role:"source",provider:"fixture-source",identity:<opaque-id>}`, and `targetProvenance` must be `{role:"target",provider:"fixture-target",identity:<distinct-opaque-id>}`. These are *caller-asserted fixture labels*, not independently authenticated cloud principals or owner-signed authorization. Mismatched plans and duplicated names fail closed.
 
 The local transaction deliberately copies already-encrypted bytes and **does not** decrypt, re-encrypt, claim AEAD authentication, advance the signed ZK envelope/version registry or migrate current legacy server-readable keys. The source and all references stay untouched. The committed destination cannot be accepted as a runtime ZK object.
 
@@ -32,6 +32,19 @@ GREEN with the exact-directory check (15 pass, 0 fail). This is an ordinary
 local directory enumeration, **not** an authenticated remote provider
 inventory or a defense against a concurrent privileged filesystem actor;
 it does not make `canMigrate` true.
+
+The later cutover-completeness probe extends this **fixture-only** closed-world
+inventory to the six classes `versions`, `backups`, `trash`, `links`,
+`derived` and `retention`. All directories, exact declared filenames and
+per-reference ciphertext SHA-256 must exist and match before a journal is
+created, during readback and before rollback. Missing classes, unknown classes,
+unknown payloads or additions after commit cause refusal and preserve sources.
+RED against the preceding three-class contract: **20 FAIL / 7 PASS**;
+GREEN after extending the fixture gate: **27 PASS / 0 FAIL** on Node 22 and
+Node 24 (Windows). `localVerified` means only the local synthetic fixture was
+checked. No live legacy reference graph, remote archival retention, off-provider
+backup completeness, independent inventory signing or global migration
+completeness is established. `canMigrate` remains `false`.
 
 An additional process-crash boundary is now covered: initial exclusive
 publication uses `link(temp, journal)`, which briefly gives the same journal

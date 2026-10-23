@@ -15,16 +15,20 @@ const {
 
 const digest = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
 const bytes = Buffer.from("synthetic encrypted ciphertext, never plaintext/user material\x00", "utf8");
+const REFERENCE_KINDS = ["versions", "backups", "trash", "links", "derived", "retention"];
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk-local-fixture-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  for (const sub of ["source", "target", "journal", "references/versions", "references/backups", "references/trash"])
+  for (const sub of ["source", "target", "journal",
+    ...REFERENCE_KINDS.map((kind) => "references/" + kind)])
     fs.mkdirSync(path.join(dir, sub), { recursive: true });
   fs.writeFileSync(path.join(dir, ".rootark-disposable-fixture"), "rootark-zk-local-fixture-v1\n");
   fs.writeFileSync(path.join(dir, "source", "object1.ct"), bytes);
   const references = {};
-  for (const [kind, id] of [["versions", "version1"], ["backups", "backup1"], ["trash", "trash1"]]) {
+  for (const kind of REFERENCE_KINDS) {
+    const id = kind === "versions" ? "version1"
+      : kind === "backups" ? "backup1" : kind === "trash" ? "trash1" : kind + "1";
     const snapshot = Buffer.from(`${kind}-distinct-encrypted-reference`);
     fs.writeFileSync(path.join(dir, "references", kind, `${id}.ct`), snapshot);
     references[kind] = [{ id, digest: digest(snapshot) }];
@@ -89,8 +93,8 @@ for (const checkpoint of ["rollback-intent-recorded", "target-unlinked"]) {
   });
 }
 
-test("missing or stale versions/backups/trash and missing source block before journal creation", (t) => {
-  for (const kind of ["versions", "backups", "trash"]) {
+test("missing or stale version, backup, trash, link, derived and retention references block before journal", (t) => {
+  for (const kind of REFERENCE_KINDS) {
     const f = fixture(t);
     fs.rmSync(path.join(f.dir, "references", kind, `${f.plan.references[kind][0].id}.ct`));
     assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
@@ -107,8 +111,8 @@ test("missing or stale versions/backups/trash and missing source block before jo
   assert.throws(() => runLocalFixtureCiphertextMigration(f.plan), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
 });
 
-test("undeclared ciphertext versions, backups or trash cannot be silently omitted from local inventory", (t) => {
-  for (const kind of ["versions", "backups", "trash"]) {
+test("unlisted reference payloads in every closed-world class block commit, verify and rollback", (t) => {
+  for (const kind of REFERENCE_KINDS) {
     const f = fixture(t);
     const extra = path.join(f.dir, "references", kind, "unlisted.ct");
     fs.writeFileSync(extra, Buffer.from("independent synthetic unlisted ciphertext"));
@@ -129,6 +133,29 @@ test("undeclared ciphertext versions, backups or trash cannot be silently omitte
     assert.equal(fs.existsSync(f.target), true,
       "a blocked rollback must not destroy the validated target copy");
   }
+});
+
+test("no missing or unknown class may be called reference-complete despite valid ciphertext", (t) => {
+  for (const kind of REFERENCE_KINDS) {
+    const f = fixture(t);
+    const omitted = { ...f.plan.references };
+    delete omitted[kind];
+    assert.throws(() => runLocalFixtureCiphertextMigration({
+      ...f.plan, references: omitted,
+    }), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+    assert.equal(fs.existsSync(f.target), false);
+    assert.equal(fs.existsSync(f.journal), false);
+  }
+  const f = fixture(t);
+  assert.throws(() => runLocalFixtureCiphertextMigration({ ...f.plan,
+    references: { ...f.plan.references, unknown: [{ id: "unknown1", digest: digest(bytes) }] },
+  }), /LOCAL_FIXTURE_MIGRATION_REFUSED/);
+  assert.equal(fs.existsSync(f.target), false);
+  const extra = path.join(f.dir, "references", "unmodeled");
+  fs.mkdirSync(extra);
+  assert.throws(() => runLocalFixtureCiphertextMigration(f.plan),
+    /LOCAL_FIXTURE_MIGRATION_REFUSED/, "unknown on-disk reference class must deny");
+  assert.equal(fs.existsSync(f.journal), false);
 });
 
 test("adulterated destination, source or journal blocks replay and rollback without destroying evidence", (t) => {

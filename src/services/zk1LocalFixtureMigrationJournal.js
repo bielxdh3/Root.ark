@@ -11,7 +11,10 @@ const path = require("node:path");
 const SCHEMA = "rootark-zk1-local-fixture-migration-journal/v1";
 const MODE = "rootark-zk-local-fixture-only/v1";
 const MARKER = ".rootark-disposable-fixture";
-const KINDS = ["versions", "backups", "trash"];
+// This is a closed-world, disposable filesystem fixture. A selected version
+// alone cannot prove that links, derived data or retention references survived
+// a migration. All modeled classes must exist and match their on-disk payloads.
+const KINDS = ["versions", "backups", "trash", "links", "derived", "retention"];
 const PHASES = new Set(["planned", "committed", "rollback-pending", "rolled-back"]);
 const MAX_BYTES = 16 * 1024 * 1024;
 
@@ -285,7 +288,9 @@ function report(phase, verified) {
   return Object.freeze({ schema: SCHEMA, canMigrate: false, rollbackScope: "local-fixture-only",
     state: phase, localVerified: verified,
     blockers: ["missing-owner-approved-migration", "missing-authoritative-provider-roles",
-      "missing-client-decrypt-and-verify", "missing-live-version-backup-trash-sync-authority"] });
+      "missing-client-decrypt-and-verify", "missing-live-version-backup-trash-sync-authority",
+      "missing-live-link-derived-retention-reference-authority",
+      "missing-global-backup-completeness-and-retention-proof"] });
 }
 function readOperation(input) {
   const { root, guard } = safeRoot(input?.fixtureDir, input?.fixtureMode);
