@@ -5,6 +5,41 @@ protocol transition; no v2 checkpoint is accepted by the running v1 services.
 The executable boundary proof is
 `test/issue-65-opaque-cas-sequence-ceiling-evidence.test.js`.
 
+## Isolated implemented primitive (not a rollover)
+
+`src/crypto/rootark-zk1-opaque-catalog-checkpoint-v2.js` now exports four
+opt-in operations: `createAuthenticatedOpaqueCatalogArchiveV2`,
+`verifyAuthenticatedOpaqueCatalogArchiveV2`,
+`createOpaqueCatalogInclusionProofV2` and
+`verifyAuthenticatedOpaqueCatalogInclusionV2`. The primitive keeps original
+canonical CBOR v1 headers, Ed25519 signatures, and opaque page bytes. It
+verifies each historic device signature through a **caller-provided trusted**
+`resolveCatalogSigner(header)`; the resolver must independently validate the
+owner's then-valid device authorization and never trust the archived signer
+identity without an authenticated owner history. The v2 archive signature is
+made using a distinct, **independently pinned** Ed25519 checkpoint key.
+
+Leaf, interior Merkle node, checkpoint signing and checkpoint digest use four
+different v2 domain prefixes. A full archive verifier checks an absolute,
+consecutive sequence, predecessor digest for every historical head, final
+digest, canonical CBOR, signed page hashes, item order, archive Merkle root,
+and the predecessor checkpoint digest. Inclusion proofs authenticate exact
+historical bytes by index against the signed archive root. They do **not**
+prove the intermediate chain without a verified complete archive or separate
+consistency proof; callers requiring end-to-end continuity must invoke the
+full archive verifier. The root is over a bounded range, not an arbitrary
+server-provided digest. The primitive caps each archive at 128 heads and 8
+MiB of serialized head/signature/page payload, with separate per-head/page
+caps. All values remain zero knowledge: no content, plaintext names or keys.
+
+Archived headers continue to carry the original v1 type because historical
+signed bytes cannot be rewritten. **Only** the checkpoint format is v2.
+The primitive can mathematically authenticate a data-only 128→129 chain but
+never grants CAS admission, floor authority, browser permission or restore
+authorization for 129. No service imports it and no v1 limits changed.
+`test/issue-65-opaque-checkpoint-v2-merkle.test.js` exercises the isolated
+archive and hostile mutation on Node 22 and 24.
+
 ## Confirmed v1 constraint
 
 - `src/services/zk1OpaqueCatalog.js` validates both owner-signed headers and
