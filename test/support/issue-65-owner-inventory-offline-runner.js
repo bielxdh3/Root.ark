@@ -6,7 +6,8 @@ const path = require("node:path");
 function runOfflineSigner(input) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [
-      path.join(__dirname, "issue-65-owner-inventory-offline-signer.js"),
+      path.resolve(__dirname, "../../scripts/issue-65-owner-inventory-offline-signer.js"),
+      "--issue65-owner-inventory-stdin-v1",
     ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     let stdout = "";
     let stderr = "";

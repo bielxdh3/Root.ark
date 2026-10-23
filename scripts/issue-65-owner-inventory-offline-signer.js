@@ -4,8 +4,12 @@
 // repository server's process or a test bridge. Only public proof is emitted.
 const crypto = require("node:crypto");
 const { SCHEMA, signOwnerInventoryCheckpoint, checkpointDigest } =
-  require("../../src/crypto/rootark-zk1-owner-inventory-trust-head");
+  require("../src/crypto/rootark-zk1-owner-inventory-trust-head");
 
+// `node --test` discovers every .js in test/support on newer Node versions.
+// This helper is a separate signing process, not a standalone test. Without
+// its explicit IPC role it must not attach a perpetual stdin listener.
+if (process.argv[2] === "--issue65-owner-inventory-stdin-v1") {
 let input = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => { input += chunk; if (input.length > 65536) process.exit(2); });
@@ -36,3 +40,4 @@ process.stdin.on("end", () => {
     }));
   } catch (_) { process.exitCode = 2; }
 });
+}
