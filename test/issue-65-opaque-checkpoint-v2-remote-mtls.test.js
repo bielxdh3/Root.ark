@@ -355,7 +355,7 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   putKey("fixture-checkpoint.pub", checkpoint.publicKey);
   const wireScope = Object.fromEntries(Object.entries(scope)
     .map(([name, value]) => [name, encoded(value)]));
-  const childFile = path.join(__dirname, "support",
+  const childFile = path.join(__dirname, "..", "lab", "issue-65-packet-b",
     "issue-65-checkpoint-v2-authority-child.js");
   const processes = [];
   async function startProcess(role) {
