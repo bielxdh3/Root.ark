@@ -21,8 +21,6 @@
     "rootark-zk1-legacy-batch-migration",
     "rootark-zk1-v2-device-approval", "rootark-zk1-v2-browser-pop",
     "rootark-zk1-v2-committed-approval",
-    "rootark-zk1-v2-owner-revocation-import",
-    "rootark-zk1-v2-owner-revocation-browser",
     "rootark-zk1-keyring-portable-archive",
     "rootark-zk1-browser-versioned-archive",
     "rootark-zk1-account-portable-recovery",
@@ -568,7 +566,6 @@
         || !window.RootarkZk1V2DeviceApproval?.verifyImportedApproval
         || !window.RootarkZk1V2BrowserPop?.respond
         || !window.RootarkZk1V2CommittedApproval?.verifyCommittedApproval
-        || !window.RootarkZk1V2OwnerRevocationBrowser?.verifyOfflineTransfer
         || !window.RootarkZk1KeyringPortableArchive?.createArchive
         || !window.RootarkZk1KeyringPortableArchive?.recoverArchive
         || !window.RootarkZk1KeyringPortableArchive?.issueHistoricalRecoveryChallenge
@@ -795,6 +792,16 @@
       assertLive();
       if (!supportsOwnerRootedV2(available)) fail();
       if (action === "verify-revocation") {
+        // The optional offline revocation inspector is loaded only for this
+        // ceremony. Neither ordinary protected I/O nor pre-existing archive
+        // and recovery flows depend on its scripts being available.
+        if (!window.RootarkZk1V2OwnerRevocationImport?.verifyRevocationDelivery)
+          await loadScript("rootark-zk1-v2-owner-revocation-import");
+        assertLive();
+        if (!window.RootarkZk1V2OwnerRevocationBrowser?.verifyOfflineTransfer)
+          await loadScript("rootark-zk1-v2-owner-revocation-browser");
+        assertLive();
+        if (!window.RootarkZk1V2OwnerRevocationBrowser?.verifyOfflineTransfer) fail();
         // A previous approved grant cannot survive a newly presented owner
         // revocation receipt; neither a failed nor successful import releases it.
         committedDeviceApproval = null;
