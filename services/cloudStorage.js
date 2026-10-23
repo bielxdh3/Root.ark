@@ -290,12 +290,36 @@ function createCloudStorage(options = {}) {
     if (parts.some((part) => !part || part === "." || part === "..")) throw cloudError("invalid_inventory_key", "Cloud object key is unsafe");
     return { area: parts[0], folderId: parts[1], name: parts[2], key: clean };
   }
-  async function inventory() {
+  async function inventory(readOnlyBounds = undefined) {
     assertProvider();
     if (!enabled()) return [];
+    // The opt-in owner-scoped migration probe MUST bound remote pages before
+    // accumulating provider metadata; normal historical callers are unchanged.
+    const bounded = readOnlyBounds !== undefined;
+    if (bounded && (!readOnlyBounds || typeof readOnlyBounds !== "object"
+      || Array.isArray(readOnlyBounds)
+      || Reflect.ownKeys(readOnlyBounds).length !== 3
+      || !["maxEntries", "maxPages", "abortSignal"]
+        .every((name) => Object.hasOwn(readOnlyBounds, name))
+      || !Number.isSafeInteger(readOnlyBounds.maxEntries)
+      || readOnlyBounds.maxEntries < 1 || readOnlyBounds.maxEntries > 5000
+      || !Number.isSafeInteger(readOnlyBounds.maxPages)
+      || readOnlyBounds.maxPages < 1 || readOnlyBounds.maxPages > 8
+      || !(readOnlyBounds.abortSignal instanceof AbortSignal))) {
+      throw cloudError("configuration", "Invalid read-only inventory bounds");
+    }
+    const fence = () => {
+      if (bounded && readOnlyBounds.abortSignal.aborted) {
+        throw cloudError("provider_error", "Read-only inventory deadline expired");
+      }
+    };
     const objects = [];
     const identities = new Set();
     const add = (entry) => {
+      fence();
+      if (bounded && objects.length >= readOnlyBounds.maxEntries) {
+        throw cloudError("provider_error", "Read-only inventory entry limit exceeded");
+      }
       const identity = `${entry.provider}:${entry.providerIdentity || entry.key}`;
       if (identities.has(identity)) throw cloudError("duplicate_inventory_identity", "Cloud inventory contains a duplicate identity");
       identities.add(identity);
@@ -304,36 +328,68 @@ function createCloudStorage(options = {}) {
     if (provider === "s3") {
       const bucketName = bucket();
       let token;
+      const visited = new Set();
+      let pages = 0;
       do {
-        const page = await (await s3()).send(new (require("@aws-sdk/client-s3").ListObjectsV2Command)({ Bucket: bucketName, Prefix: `${prefix}/`, ContinuationToken: token }));
+        fence();
+        if (bounded && ++pages > readOnlyBounds.maxPages) throw cloudError("provider_error", "Read-only inventory page limit exceeded");
+        const page = await (await s3()).send(new (require("@aws-sdk/client-s3").ListObjectsV2Command)({ Bucket: bucketName,
+          Prefix: `${prefix}/`, ContinuationToken: token,
+          ...(bounded ? { MaxKeys: 1000 } : {}) }),
+        bounded ? { abortSignal: readOnlyBounds.abortSignal } : undefined);
+        fence();
+        if (bounded && (!page || (page.Contents !== undefined && !Array.isArray(page.Contents))
+          || (page.Contents || []).length > 1000
+          || typeof page.IsTruncated !== "boolean"
+          || (page.IsTruncated !== Boolean(page.NextContinuationToken)))) {
+          throw cloudError("provider_error", "Incomplete S3 inventory page");
+        }
         for (const object of page.Contents || []) {
           const parsed = parseInventoryKey(object.Key);
           add({ provider, providerIdentity: parsed.key, ...parsed });
         }
         token = page.NextContinuationToken;
+        if (bounded && token && (typeof token !== "string" || token.length > 4096
+          || visited.has(token))) throw cloudError("provider_error", "Repeated S3 inventory token");
+        if (bounded && token) visited.add(token);
       } while (token);
       return objects;
     }
     let token;
+    const visited = new Set();
+    let pages = 0;
     do {
+      fence();
+      if (bounded && ++pages > readOnlyBounds.maxPages) throw cloudError("provider_error", "Read-only inventory page limit exceeded");
       const page = await (await drive()).files.list({
         q: `'${escapeQuery(folder())}' in parents and appProperties has { key='rootArkKey' } and trashed=false`,
         fields: "nextPageToken,files(id,name,parents,appProperties)",
         spaces: "drive",
         pageToken: token,
         pageSize: 100,
-      });
+      }, bounded ? { signal: readOnlyBounds.abortSignal } : undefined);
+      fence();
+      if (bounded && (!Array.isArray(page?.data?.files) || page.data.files.length > 100)) {
+        throw cloudError("provider_error", "Incomplete Google Drive inventory page");
+      }
       for (const file of page.data.files || []) {
         if (!Array.isArray(file.parents)) {
           throw cloudError("invalid_inventory_identity", "Drive object is missing its parent metadata");
         }
-        if (!file.parents.includes(folder())) continue;
+        if (!file.parents.includes(folder())) {
+          if (bounded) throw cloudError("provider_error", "Foreign Drive parent in bounded inventory");
+          continue;
+        }
         const properties = file.appProperties || {};
         if (typeof properties.rootArkKey !== "string" || !properties.rootArkKey) {
           throw cloudError("invalid_inventory_key", "Drive object is missing its inventory key");
         }
         const normalizedKey = properties.rootArkKey.replace(/\\/g, "/");
-        if (!normalizedKey.startsWith(`${prefix}/`)) continue;
+        if ((bounded && normalizedKey !== properties.rootArkKey)
+          || !normalizedKey.startsWith(`${prefix}/`)) {
+          if (bounded) throw cloudError("provider_error", "Foreign Drive namespace in bounded inventory");
+          continue;
+        }
         const parsed = parseInventoryKey(normalizedKey);
         if (String(properties.rootArkFolderId || "") !== parsed.folderId || String(properties.rootArkArea || "") !== parsed.area) {
           throw cloudError("invalid_inventory_metadata", "Drive metadata does not match rootArkKey");
@@ -342,6 +398,9 @@ function createCloudStorage(options = {}) {
         add({ provider, providerIdentity: String(file.id), id: String(file.id), ...parsed });
       }
       token = page.data.nextPageToken;
+      if (bounded && token && (typeof token !== "string" || token.length > 4096
+        || visited.has(token))) throw cloudError("provider_error", "Repeated Drive inventory token");
+      if (bounded && token) visited.add(token);
     } while (token);
     return objects;
   }

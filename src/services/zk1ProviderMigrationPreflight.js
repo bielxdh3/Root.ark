@@ -86,4 +86,6 @@ async function inspectZk1CloudMigrationReadiness({ cloudStorage } = {}) {
   } catch (_) { refuse(); }
 }
 
-module.exports = { inspectZk1CloudMigrationReadiness };
+module.exports = { inspectZk1CloudMigrationReadiness,
+  inspectZk1LiveLegacyRemoteCopyEvidence:
+    require("./zk1LiveLegacyRemoteCopyEvidence").inspectZk1LiveLegacyRemoteCopyEvidence };
