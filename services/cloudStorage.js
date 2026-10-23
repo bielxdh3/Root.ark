@@ -453,7 +453,13 @@ function createCloudStorage(options = {}) {
     return objects;
   }
   async function upload(localPath, folderId, fileName, area = "uploads", uploadOptions = {}) {
-    assertProvider(); if (!enabled() || !fs.statSync(localPath, { throwIfNoEntry: false })?.isFile()) return null;
+    assertProvider(); if (!enabled()) return null;
+    // The initial path check is an authorization boundary, not just an
+    // existence probe. An attacker can rename a parent directory after this
+    // stat and before the upload's later FD open. Retain the original inode
+    // instead of silently authorizing whichever file now occupies the name.
+    const initialSource = fs.statSync(localPath, { throwIfNoEntry: false, bigint: true });
+    if (!initialSource?.isFile()) return null;
     const cloudKey = objectKey(folderId, fileName, area);
     const bound = uploadOptions?.zk1BoundedBytes;
     let boundedBytes = null;
@@ -465,7 +471,8 @@ function createCloudStorage(options = {}) {
       }
       const stat = fs.lstatSync(localPath, { bigint: true });
       if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n
-        || stat.size !== BigInt(bound)) {
+        || stat.size !== BigInt(bound) || stat.dev !== initialSource.dev
+        || stat.ino !== initialSource.ino) {
         throw cloudError("configuration", "Ciphertext staging file is not an exact private upload");
       }
       const fd = fs.openSync(localPath,
@@ -490,7 +497,7 @@ function createCloudStorage(options = {}) {
     let initialLegacy = null;
     let firstLegacyBody = false;
     if (boundedBytes === null) {
-      initialLegacy = openVerifiedLegacyUpload(localPath);
+      initialLegacy = openVerifiedLegacyUpload(localPath, initialSource);
       legacyStreams.push(initialLegacy.stream);
     }
     const legacyBody = () => {
