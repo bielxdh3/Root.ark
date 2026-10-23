@@ -518,6 +518,7 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
     "rootark-zk1-browser-authoritative-backup", "rootark-zk1-portable-file-recovery",
     "rootark-zk1-browser-recovery-http", "rootark-zk1-recoverable-workspace",
     "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow",
+    "rootark-zk1-legacy-transition-receipt",
     "rootark-zk1-legacy-batch-migration", "rootark-zk1-v2-device-approval",
     "rootark-zk1-v2-browser-pop", "rootark-zk1-v2-committed-approval",
     "rootark-zk1-keyring-portable-archive", "rootark-zk1-browser-versioned-archive",
