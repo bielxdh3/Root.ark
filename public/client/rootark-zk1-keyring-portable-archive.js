@@ -35,6 +35,10 @@
     const MAX_FILES = 12;
     const MAX_PLAIN = 8 * 1024 * 1024;
     const MAX_ARCHIVE = 17 * 1024 * 1024;
+    const POP_SCHEMA = "rootark-zk1-historical-device-pop/v1";
+    const POP_DOMAIN = new TextEncoder().encode("Root.ark/zk-1/historical-device-pop/v1\0");
+    const POP_TTL_MS = 120000;
+    const issuedPop = new WeakMap();
     const enc = new TextEncoder();
     const dec = new TextDecoder("utf-8", { fatal: true });
     const re64 = /^[A-Za-z0-9_-]+$/;
@@ -136,6 +140,91 @@
       for (let i = 0; i < a.length; i++) difference |= a[i] ^ b[i];
       return difference === 0;
     }
+    // The owner-signed ACTIVE grant is necessary but NOT device proof of
+    // possession. The signer must prove possession of the distinct grant key
+    // against a freshly minted, one-use, privately branded challenge.
+    function popBinding(input) {
+      exact(input, ["archiveSha256", "accountArchiveSha256", "scope",
+        "pinnedCurrentHead", "independentOwnerSpkiSha256", "currentSignedDeviceGrant"]);
+      const trustedScope = scope(input.scope);
+      exact(input.pinnedCurrentHead, ["revision", "digest", "epoch"]);
+      const revision = positive(input.pinnedCurrentHead.revision);
+      const epoch = positive(input.pinnedCurrentHead.epoch);
+      const grant = detachedWire(input.currentSignedDeviceGrant);
+      if (typeof grant.device_id !== "string" || !grant.device_id) deny();
+      return { schema: POP_SCHEMA, purpose: "historical-ciphertext-recovery",
+        archiveSha256: b64(bytes(input.archiveSha256, 32)),
+        accountArchiveSha256: input.accountArchiveSha256 === null ? null
+          : b64(bytes(input.accountArchiveSha256, 32)),
+        scope: trustedScope, ownerRevision: revision,
+        ownerDigest: b64(bytes(input.pinnedCurrentHead.digest, 32)),
+        ownerEpoch: epoch,
+        ownerSpkiSha256: b64(bytes(input.independentOwnerSpkiSha256, 32)),
+        currentGrant: grant };
+    }
+    function popMessage(challenge) {
+      const encoded = enc.encode(JSON.stringify(challenge));
+      if (encoded.byteLength > 4096) deny();
+      const message = new Uint8Array(POP_DOMAIN.length + encoded.length);
+      message.set(POP_DOMAIN); message.set(encoded, POP_DOMAIN.length);
+      return message;
+    }
+    function freshPop(issued) {
+      const wall = Date.now();
+      if (!Number.isSafeInteger(wall) || wall < issued.issuedAtMs
+        || wall > issued.expiresAtMs) deny();
+      if (issued.monotonicStart !== null && typeof performance === "object"
+        && typeof performance.now === "function"
+        && (performance.now() < issued.monotonicStart
+          || performance.now() - issued.monotonicStart > POP_TTL_MS)) deny();
+    }
+    async function issueHistoricalRecoveryChallenge(input) {
+      try {
+        if (!webCrypto?.subtle?.digest || !webCrypto?.getRandomValues) deny();
+        const binding = popBinding(input); // snapshot all caller fields before await
+        const bindingHash = new Uint8Array(await webCrypto.subtle.digest("SHA-256",
+          enc.encode(JSON.stringify(binding))));
+        const issuedAtMs = Date.now();
+        if (!Number.isSafeInteger(issuedAtMs)
+          || !Number.isSafeInteger(issuedAtMs + POP_TTL_MS)) deny();
+        const challenge = Object.freeze({ schema: POP_SCHEMA,
+          nonce: b64(webCrypto.getRandomValues(new Uint8Array(32))),
+          issuedAtMs, expiresAtMs: issuedAtMs + POP_TTL_MS,
+          bindingSha256: b64(bindingHash) });
+        issuedPop.set(challenge, { used: false, bindingHash,
+          issuedAtMs, expiresAtMs: challenge.expiresAtMs,
+          monotonicStart: typeof performance === "object"
+            && typeof performance.now === "function" ? performance.now() : null,
+          message: popMessage(challenge) });
+        return challenge;
+      } catch (_) { deny(); }
+    }
+    function historicalRecoveryChallengeMessage(challenge) {
+      const record = issuedPop.get(challenge);
+      if (!record || record.used) deny();
+      freshPop(record);
+      return new Uint8Array(record.message);
+    }
+    async function verifyDevicePop(pop, input) {
+      exact(pop, ["challenge", "signature"]);
+      const record = issuedPop.get(pop.challenge);
+      if (!record || record.used) deny();
+      // Reserve before the first await; parallel or replayed callers cannot
+      // consume one device signature twice, even when validation fails.
+      record.used = true;
+      freshPop(record);
+      const signature = from64(pop.signature, 64);
+      const expected = popBinding(input);
+      const digest = new Uint8Array(await webCrypto.subtle.digest("SHA-256",
+        enc.encode(JSON.stringify(expected))));
+      if (!same(digest, record.bindingHash)) deny();
+      const signer = await webCrypto.subtle.importKey("raw",
+        from64(input.currentSignedDeviceGrant.authorization_public_key, 32),
+        { name: "Ed25519" }, false, ["verify"]);
+      if (!await webCrypto.subtle.verify("Ed25519", signer, signature,
+        record.message)) deny();
+      freshPop(record);
+    }
     function signatureMessage(body) {
       const raw = enc.encode(JSON.stringify(Object.fromEntries(SIGNED.map((field) => [field, body[field]]))));
       if (raw.length > MAX_ARCHIVE) deny();
@@ -199,7 +288,7 @@
     }
     function snapshotHistoricalRecovery(value) {
       exact(value, ["signedOwnerHistoryChain", "currentSignedDeviceGrant",
-        "currentOwnerRootCheckpoints"]);
+        "currentOwnerRootCheckpoints", "devicePoP"]);
       const chain = value.signedOwnerHistoryChain;
       const roots = value.currentOwnerRootCheckpoints;
       if (!Array.isArray(chain) || chain.length < 2 || chain.length > 64
@@ -211,8 +300,17 @@
         if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
         return detachedWire(descriptor.value);
       });
+      const proof = value.devicePoP;
+      exact(proof, ["challenge", "signature"]);
+      const challenge = Object.getOwnPropertyDescriptor(proof, "challenge");
+      const signature = Object.getOwnPropertyDescriptor(proof, "signature");
+      if (!challenge || !Object.hasOwn(challenge, "value")
+        || !signature || !Object.hasOwn(signature, "value")) deny();
+      from64(signature.value, 64);
       return { chain: copyArray(chain), roots: copyArray(roots),
-        currentGrant: detachedWire(value.currentSignedDeviceGrant) };
+        currentGrant: detachedWire(value.currentSignedDeviceGrant),
+        devicePoP: Object.freeze({ challenge: challenge.value,
+          signature: signature.value }) };
     }
     function sameSignedWire(a, b) {
       if (!a || !b || typeof b !== "object" || Array.isArray(b)) return false;
@@ -224,7 +322,8 @@
       });
     }
     async function verifyHistoricalRecovery({ historical, archive, payload, head,
-      expectedScope, ownerPublicKey, ownerSpkiPin, signerKeyId, deviceId }) {
+      expectedScope, ownerPublicKey, ownerSpkiPin, signerKeyId, deviceId,
+      archivePin, accountPin }) {
       if (!ownerHistory?.verifyOwnerCheckpoint
         || head.revision < archive.ownerRevision || head.epoch < archive.ownerEpoch
         || (head.revision === archive.ownerRevision && head.epoch === archive.ownerEpoch)
@@ -263,6 +362,11 @@
       ownerPublicKey, independentOwnerSpkiSha256: ownerSpkiPin,
       pinnedCurrentHead: head, signedDeviceGrant: historical.currentGrant,
       ownerHistoryCheckpoint: newest, previousOwnerHistoryProof: newestPrevious });
+      await verifyDevicePop(historical.devicePoP, {
+        archiveSha256: archivePin, accountArchiveSha256: accountPin,
+        scope: expectedScope, pinnedCurrentHead: head,
+        independentOwnerSpkiSha256: ownerSpkiPin,
+        currentSignedDeviceGrant: historical.currentGrant });
       await verifyEveryOwnerRoot(payload.entries, {
         ownerPublicKey, signerKeyId, deviceId, expectedScope,
         ownerHistoryCheckpoint: payload.ownerHistoryCheckpoint,
@@ -407,10 +511,13 @@
       let secret, decrypted, recovered = [];
       try {
         const historic = Object.hasOwn(input || {}, "historicalRecovery");
+        const aggregate = Object.hasOwn(input || {}, "accountArchiveSha256");
         exact(input, ["archive", "recoverySecret", "ownerPublicKey",
           "independentOwnerSpkiSha256", "independentlyPinnedArchiveSha256",
           "pinnedCurrentHead", "scope", "signerKeyId", "deviceId",
-          "previousOwnerHistoryProof", ...(historic ? ["historicalRecovery"] : [])]);
+          "previousOwnerHistoryProof", ...(historic ? ["historicalRecovery"] : []),
+          ...(aggregate ? ["accountArchiveSha256"] : [])]);
+        if (aggregate && !historic) deny();
         secret = bytes(input.recoverySecret, 32);
         exact(input.archive, OUTER);
         const archive = Object.fromEntries(OUTER.map((name) => {
@@ -429,6 +536,7 @@
           epoch: input.pinnedCurrentHead.epoch };
         const ownerSpkiPin = bytes(input.independentOwnerSpkiSha256, 32);
         const archivePin = bytes(input.independentlyPinnedArchiveSha256, 32);
+        const accountPin = aggregate ? bytes(input.accountArchiveSha256, 32) : null;
         const trustedSigner = bytes(input.signerKeyId, 16);
         const trustedDevice = input.deviceId;
         const predecessor = input.previousOwnerHistoryProof; // in-process brand
@@ -459,7 +567,8 @@
         validateEntries(payload.entries, expectedScope, archive.ownerEpoch);
         if (historic) await verifyHistoricalRecovery({ historical, archive,
           payload, head, expectedScope, ownerPublicKey,
-          ownerSpkiPin, signerKeyId: trustedSigner, deviceId: trustedDevice });
+          ownerSpkiPin, signerKeyId: trustedSigner, deviceId: trustedDevice,
+          archivePin, accountPin });
         else {
           await verifyAnchors({ outer: archive, ownerPublicKey,
             independentOwnerSpkiSha256: ownerSpkiPin,
@@ -496,5 +605,6 @@
       } catch (_) { for (const item of recovered) item.data?.fill(0); deny(); }
       finally { secret?.fill(0); decrypted?.fill(0); }
     }
-    return Object.freeze({ createArchive, recoverArchive });
+    return Object.freeze({ createArchive, recoverArchive,
+      issueHistoricalRecoveryChallenge, historicalRecoveryChallengeMessage });
   }));

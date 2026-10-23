@@ -309,6 +309,10 @@ test("account coordinator preserves atomic multi-keyring restore when one archiv
   const currentUnsignedGrant = { ...old.signedDeviceGrant,
     manifest_revision: currentHead.revision,
     manifest_digest: b64(currentHead.digest), current_epoch: currentHead.epoch };
+  const deviceSigner = crypto.generateKeyPairSync("ed25519");
+  const deviceSpki = deviceSigner.publicKey.export({ type: "spki", format: "der" });
+  currentUnsignedGrant.authorization_key_id = b64(random(16));
+  currentUnsignedGrant.authorization_public_key = b64(deviceSpki.subarray(-32));
   delete currentUnsignedGrant.signature;
   const grantMessage = Buffer.concat([grantDomain, Buffer.from(JSON.stringify(
     Object.fromEntries(grantFields.map((field) => [field, currentUnsignedGrant[field]]))))]);
@@ -322,9 +326,19 @@ test("account coordinator preserves atomic multi-keyring restore when one archiv
       objectId: bundle.metadata.object_id, objectRevision: bundle.objectRevision,
       ciphertextEpoch: bundle.metadata.epoch,
       ciphertextRoot: Buffer.from(bundle.ciphertextRoot, "base64url"), issuedAt: 1801 })));
+  const challenge = await keyringApi.issueHistoricalRecoveryChallenge({
+    archiveSha256: Buffer.from(sealed.archive.keyrings[1].archiveSha256, "base64url"),
+    accountArchiveSha256: sealed.archiveSha256,
+    scope: old.scope, pinnedCurrentHead: currentHead,
+    independentOwnerSpkiSha256: old.independentOwnerSpkiSha256,
+    currentSignedDeviceGrant });
+  const devicePoP = { challenge,
+    signature: b64(crypto.sign(null,
+      Buffer.from(keyringApi.historicalRecoveryChallengeMessage(challenge)),
+      deviceSigner.privateKey)) };
   const updatedSecond = { ...oldRecovery, pinnedCurrentHead: currentHead,
     historicalRecovery: { signedOwnerHistoryChain: [old.ownerHistoryCheckpoint, newest],
-      currentSignedDeviceGrant, currentOwnerRootCheckpoints } };
+      currentSignedDeviceGrant, currentOwnerRootCheckpoints, devicePoP } };
   await assert.rejects(api.recoverArchive({ ...accountRestore,
     keyrings: [accountRestore.keyrings[0], { ...oldRecovery,
       pinnedCurrentHead: currentHead }] }), failure,

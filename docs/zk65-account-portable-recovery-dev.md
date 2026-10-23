@@ -51,6 +51,46 @@ the set is the complete signed keyring/account inventory or include all versions
   The caller owns successful returned `file.data` buffers and must clear them
   after use. No plaintext or content encryption key is sent to the server.
 
+## Historical recovery: additional device proof of possession
+
+An archived keyring may be recovered under a later owner-signed head **only**
+with the verified genesis-to-current owner history, a fresh owner-signed ACTIVE
+grant at the independently pinned current head, and newly owner-endorsed roots
+for **every** archived ciphertext object. These facts alone do **not** prove
+possession of the device private key named in the grant.
+
+For each *attempt*, the verifier holding the live `RootarkZk1KeyringPortableArchive`
+module instance must call `issueHistoricalRecoveryChallenge` with exactly:
+
+- `archiveSha256`: independently pinned keyring ciphertext archive SHA-256;
+- `accountArchiveSha256`: independently pinned aggregate SHA-256 for an account
+  recovery, or `null` for direct keyring recovery;
+- `scope`, `pinnedCurrentHead`, `independentOwnerSpkiSha256`, and
+  `currentSignedDeviceGrant` matching the intended restore.
+
+The verifier exports the challenge's **domain-separated bytes** through
+`historicalRecoveryChallengeMessage(challenge)`. The authorized device, after
+independently checking the requested restore purpose, signs those bytes with
+the non-extractable Ed25519 private key corresponding to the **current grant's**
+`authorization_public_key`. Include the result as canonical base64url in
+`historicalRecovery.devicePoP = { challenge, signature }` along with the chain,
+current grant, and fresh root endorsements. Never sign these bytes using the
+owner's root signing key in place of the enrolled device key.
+
+The challenge is a 256-bit verifier-generated nonce bound to the archive,
+aggregate (if applicable), owner SPKI, exact scope, current revision/digest/epoch
+and entire current grant. It expires after 120 seconds, rejects clock rollback,
+and is consumed once on verification, even on a failed signature. It has a
+private in-process identity: JSON cloning or importing it into another tab,
+process, or browser session does **not** transfer the verifier's one-use state.
+Mint a new challenge for each retry. The previously supported nonhistorical
+recovery mode does not require a device challenge.
+
+This demonstrates possession of the device signing key for a bounded **offline
+ceremony**, not an externally authenticated time source, independent witness,
+live revocation proof, complete historical inventory, or production access
+permission. The device must not sign unsolicited challenges.
+
 This implements portable recovery of **file bundles inside keyrings**. It is
 **not** complete account state restoration, an independent witness/CAS grant,
 actual dual recovery, online revocation validation, proof of durable external

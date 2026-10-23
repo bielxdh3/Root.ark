@@ -177,7 +177,7 @@
   }
   function copyHistoricalRecovery(value) {
     exact(value, ["signedOwnerHistoryChain", "currentSignedDeviceGrant",
-      "currentOwnerRootCheckpoints"]);
+      "currentOwnerRootCheckpoints", "devicePoP"]);
     function bounded(list, max) {
       if (!Array.isArray(list) || list.length < 1 || list.length > max
         || Reflect.ownKeys(list).length !== list.length + 1) deny();
@@ -187,9 +187,18 @@
         return copySignedWire(d.value);
       });
     }
+    const proof = value.devicePoP;
+    exact(proof, ["challenge", "signature"]);
+    const challenge = Object.getOwnPropertyDescriptor(proof, "challenge");
+    const signature = Object.getOwnPropertyDescriptor(proof, "signature");
+    if (!challenge || !Object.hasOwn(challenge, "value")
+      || !signature || !Object.hasOwn(signature, "value")) deny();
+    from64(signature.value, 64);
     return { signedOwnerHistoryChain: bounded(value.signedOwnerHistoryChain, 64),
       currentSignedDeviceGrant: copySignedWire(value.currentSignedDeviceGrant),
-      currentOwnerRootCheckpoints: bounded(value.currentOwnerRootCheckpoints, 12) };
+      currentOwnerRootCheckpoints: bounded(value.currentOwnerRootCheckpoints, 12),
+      devicePoP: Object.freeze({ challenge: challenge.value,
+        signature: signature.value }) };
   }
   function immutableArchive(value) {
     for (const entry of value.keyrings) {
@@ -321,7 +330,8 @@
           deviceId: expected.deviceId,
           previousOwnerHistoryProof: expected.previousOwnerHistoryProof,
           ...(Object.hasOwn(expected, "historicalRecovery")
-            ? { historicalRecovery: expected.historicalRecovery } : {}) });
+            ? { historicalRecovery: expected.historicalRecovery,
+              accountArchiveSha256: accountPin } : {}) });
         opened.push({ scope: sc, files: result.files });
       }
       // Return plaintext only once every keyring has passed signed history,

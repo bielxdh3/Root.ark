@@ -266,6 +266,20 @@ test("caller mutation after first await cannot swap files, head, grants or signe
   for (const item of restored.files) item.data.fill(0);
 });
 
+async function freshDevicePop(input, signer, overrides = {}) {
+  const challenge = await api.issueHistoricalRecoveryChallenge({
+    archiveSha256: input.independentlyPinnedArchiveSha256,
+    accountArchiveSha256: null,
+    scope: input.scope, pinnedCurrentHead: input.pinnedCurrentHead,
+    independentOwnerSpkiSha256: input.independentOwnerSpkiSha256,
+    currentSignedDeviceGrant: input.historicalRecovery.currentSignedDeviceGrant,
+    ...overrides,
+  });
+  return { ...input, historicalRecovery: { ...input.historicalRecovery,
+    devicePoP: { challenge, signature: b64(crypto.sign(null,
+      Buffer.from(api.historicalRecoveryChallengeMessage(challenge)), signer.privateKey)) } } };
+}
+
 async function laterOwnerHeadFixture() {
   const f = await prepare();
   const archive = f.sealed.archive;
@@ -297,9 +311,13 @@ async function laterOwnerHeadFixture() {
     signerKeyId: f.common.signerKeyId, deviceId: f.common.deviceId,
     revision: laterHead.revision, manifestDigest: laterHead.digest,
     issuedAt: 1700, previous: genesisProof });
+  const deviceSigner = crypto.generateKeyPairSync("ed25519");
+  const currentDevicePublic = deviceSigner.publicKey.export({ type: "spki", format: "der" });
   const currentlySignedGrant = f.signGrant({ ...f.signedDeviceGrant,
     manifest_revision: laterHead.revision, manifest_digest: b64(laterHead.digest),
-    current_epoch: laterHead.epoch });
+    current_epoch: laterHead.epoch,
+    authorization_public_key: b64(currentDevicePublic.subarray(-32)),
+    authorization_key_id: b64(random(16)) });
   const currentOwnerRootCheckpoints = await Promise.all(manifest.entries.map(({ bundle }) =>
     ownerRoots.signOwnerCiphertextRootCheckpoint({
       scope: f.common.scope, signerKey: f.options.ownerSigningKey,
@@ -311,13 +329,13 @@ async function laterOwnerHeadFixture() {
   const historicalRecovery = { signedOwnerHistoryChain: [f.ownerHistoryCheckpoint, laterHistory],
     currentSignedDeviceGrant: currentlySignedGrant, currentOwnerRootCheckpoints };
   const input = { ...f.recover, pinnedCurrentHead: laterHead, historicalRecovery };
-  return { f, input, historicalRecovery, laterHead, laterHistory };
+  return { f, input, historicalRecovery, laterHead, laterHistory, deviceSigner };
 }
 
 test("RED: legitimate later head and epoch recover archived roots ONLY after current owner re-endorsement and signed genesis continuity", async () => {
-  const { f, input } = await laterOwnerHeadFixture();
+  const { f, input, deviceSigner } = await laterOwnerHeadFixture();
   await assert.rejects(api.recoverArchive({ ...input, historicalRecovery: undefined }), failure);
-  const restored = await api.recoverArchive(input);
+  const restored = await api.recoverArchive(await freshDevicePop(input, deviceSigner));
   assert.equal(restored.files.length, 3);
   assert.equal(restored.currentSignedGrantAtPinnedHeadVerified, true);
   assert.equal(restored.historicalOwnerContinuityVerified, true);
@@ -327,7 +345,7 @@ test("RED: legitimate later head and epoch recover archived roots ONLY after cur
 });
 
 test("historic recovery fails closed on stale/revoked grant, fork, missing roots, reused outsider history or rollback", async () => {
-  const { f, input, historicalRecovery, laterHead, laterHistory } = await laterOwnerHeadFixture();
+  const { f, input, historicalRecovery, laterHead, laterHistory, deviceSigner } = await laterOwnerHeadFixture();
   const forged = (patch) => ({ ...input, historicalRecovery: { ...historicalRecovery, ...patch } });
   for (const value of [
     { currentSignedDeviceGrant: f.options.signedDeviceGrant },
@@ -344,18 +362,18 @@ test("historic recovery fails closed on stale/revoked grant, fork, missing roots
     { currentOwnerRootCheckpoints: historicalRecovery.currentOwnerRootCheckpoints.slice(1) },
     { currentOwnerRootCheckpoints: historicalRecovery.currentOwnerRootCheckpoints.map((root, i) =>
       i === 2 ? { ...root, ciphertext_root: b64(random(32)) } : root) },
-  ]) await assert.rejects(api.recoverArchive(forged(value)), failure);
+  ]) await assert.rejects(api.recoverArchive(await freshDevicePop(forged(value), deviceSigner)), failure);
   for (const changed of [
     { pinnedCurrentHead: { ...laterHead, revision: 7 } },
     { pinnedCurrentHead: { ...laterHead, digest: random(32) } },
     { pinnedCurrentHead: f.common.pinnedCurrentHead },
     { independentlyPinnedArchiveSha256: random(32) },
     { independentOwnerSpkiSha256: random(32) },
-  ]) await assert.rejects(api.recoverArchive({ ...input, ...changed }), failure);
+  ]) await assert.rejects(api.recoverArchive(await freshDevicePop({ ...input, ...changed }, deviceSigner)), failure);
 });
 
 test("signed genesis through owner history sequence 3 stays valid, while wrong intermediate predecessor/future epoch cannot authorize", async () => {
-  const { f, input, laterHead, historicalRecovery } = await laterOwnerHeadFixture();
+  const { f, input, laterHead, historicalRecovery, deviceSigner } = await laterOwnerHeadFixture();
   const seq1 = await ownerHistory.verifyOwnerCheckpoint({
     checkpoint: f.ownerHistoryCheckpoint, scope: f.common.scope,
     signerPublicKey: f.common.ownerPublicKey,
@@ -375,33 +393,116 @@ test("signed genesis through owner history sequence 3 stays valid, while wrong i
     deviceId: f.common.deviceId, revision: laterHead.revision,
     manifestDigest: laterHead.digest, issuedAt: 1702, previous: seq2 });
   const chain = [f.ownerHistoryCheckpoint, intermediate, latest];
-  const restored = await api.recoverArchive({ ...input,
-    historicalRecovery: { ...historicalRecovery, signedOwnerHistoryChain: chain } });
+  const restored = await api.recoverArchive(await freshDevicePop({ ...input,
+    historicalRecovery: { ...historicalRecovery, signedOwnerHistoryChain: chain } }, deviceSigner));
   assert.equal(restored.files.length, 3);
   for (const entry of restored.files) entry.data.fill(0);
-  await assert.rejects(api.recoverArchive({ ...input,
+  await assert.rejects(api.recoverArchive(await freshDevicePop({ ...input,
     historicalRecovery: { ...historicalRecovery,
       signedOwnerHistoryChain: [chain[0], { ...chain[1],
-        signature: b64(random(64)) }, chain[2]] } }), failure);
-  await assert.rejects(api.recoverArchive({ ...input,
+        signature: b64(random(64)) }, chain[2]] } }, deviceSigner)), failure);
+  await assert.rejects(api.recoverArchive(await freshDevicePop({ ...input,
     pinnedCurrentHead: { ...laterHead, epoch: 3 },
-    historicalRecovery: { ...historicalRecovery, signedOwnerHistoryChain: chain } }), failure);
+    historicalRecovery: { ...historicalRecovery, signedOwnerHistoryChain: chain } }, deviceSigner)), failure);
 });
 
 test("hist recovery snapshots grants, complete chain and per-object endorsement before async verification", async () => {
-  const { input } = await laterOwnerHeadFixture();
+  const { input, deviceSigner } = await laterOwnerHeadFixture();
   const supplied = { ...input, historicalRecovery: {
     signedOwnerHistoryChain: input.historicalRecovery.signedOwnerHistoryChain.map((item) => ({ ...item })),
     currentSignedDeviceGrant: { ...input.historicalRecovery.currentSignedDeviceGrant },
     currentOwnerRootCheckpoints: input.historicalRecovery.currentOwnerRootCheckpoints.map((item) => ({ ...item })),
   } };
-  const p = api.recoverArchive(supplied);
+  const p = api.recoverArchive(await freshDevicePop(supplied, deviceSigner));
   supplied.historicalRecovery.currentSignedDeviceGrant.signature = b64(random(64));
   supplied.historicalRecovery.signedOwnerHistoryChain[1].manifest_digest = b64(random(32));
   supplied.historicalRecovery.currentOwnerRootCheckpoints[2].ciphertext_root = b64(random(32));
   const files = await p;
   assert.equal(files.files.length, 3);
   for (const file of files.files) file.data.fill(0);
+});
+
+test("historical recovery requires fresh one-use device Ed25519 PoP, not merely an ACTIVE owner grant", async () => {
+  const { input, deviceSigner } = await laterOwnerHeadFixture();
+  await assert.rejects(api.recoverArchive(input), failure,
+    "a signed grant alone is not possession of its authorized device private key");
+  const approved = await freshDevicePop(input, deviceSigner);
+  const recovered = await api.recoverArchive(approved);
+  assert.equal(recovered.currentSignedGrantAtPinnedHeadVerified, true);
+  for (const item of recovered.files) item.data.fill(0);
+  await assert.rejects(api.recoverArchive(approved), failure,
+    "a consumed challenge cannot release plaintext a second time");
+});
+
+test("historical device proof rejects wrong key, cloned nonce, wrong challenge, account context and tampered scope", async () => {
+  const { input, deviceSigner } = await laterOwnerHeadFixture();
+  const outsider = crypto.generateKeyPairSync("ed25519");
+  const prepared = await freshDevicePop(input, outsider);
+  await assert.rejects(api.recoverArchive(prepared), failure,
+    "an unrelated Ed25519 private key cannot claim the signed grant's device key");
+
+  const fresh = await freshDevicePop(input, deviceSigner);
+  const { challenge, signature } = fresh.historicalRecovery.devicePoP;
+  const clone = { ...challenge };
+  await assert.rejects(api.recoverArchive({ ...fresh,
+    historicalRecovery: { ...fresh.historicalRecovery,
+      devicePoP: { challenge: clone, signature } } }), failure,
+  "a JSON-cloned self-reported nonce lacks the verifier's WeakMap identity");
+
+  const replaced = await freshDevicePop(input, deviceSigner);
+  await assert.rejects(api.recoverArchive({ ...replaced,
+    historicalRecovery: { ...replaced.historicalRecovery,
+      devicePoP: { ...replaced.historicalRecovery.devicePoP,
+        signature: signature } } }), failure,
+  "the correct signature over a different challenge must fail");
+
+  const asAccount = await freshDevicePop(input, deviceSigner, {
+    accountArchiveSha256: random(32),
+  });
+  await assert.rejects(api.recoverArchive(asAccount), failure,
+    "an account-bound proof cannot be downgraded to a direct keyring recovery");
+
+  const changedScope = await freshDevicePop(input, deviceSigner);
+  await assert.rejects(api.recoverArchive({ ...changedScope,
+    scope: { ...changedScope.scope, keyring_id: b64(random(16)) } }), failure);
+});
+
+test("historical device challenge rejects expiry, clock rollback and forged proof signature", async () => {
+  const { input, deviceSigner } = await laterOwnerHeadFixture();
+  const normalDateNow = Date.now;
+  try {
+    const expiring = await freshDevicePop(input, deviceSigner);
+    const start = expiring.historicalRecovery.devicePoP.challenge.issuedAtMs;
+    Date.now = () => start + 120001;
+    await assert.rejects(api.recoverArchive(expiring), failure,
+      "an expired but correctly signed proof is never current authorization");
+  } finally { Date.now = normalDateNow; }
+  try {
+    const rolled = await freshDevicePop(input, deviceSigner);
+    const start = rolled.historicalRecovery.devicePoP.challenge.issuedAtMs;
+    Date.now = () => start - 1;
+    await assert.rejects(api.recoverArchive(rolled), failure,
+      "backwards wall clock cannot extend challenge validity");
+  } finally { Date.now = normalDateNow; }
+  const fake = await freshDevicePop(input, deviceSigner);
+  await assert.rejects(api.recoverArchive({ ...fake,
+    historicalRecovery: { ...fake.historicalRecovery,
+      devicePoP: { ...fake.historicalRecovery.devicePoP,
+        signature: b64(random(64)) } } }), failure);
+});
+
+test("concurrent historical restores cannot both consume the same signed challenge", async () => {
+  const { input, deviceSigner } = await laterOwnerHeadFixture();
+  const authorized = await freshDevicePop(input, deviceSigner);
+  const results = await Promise.allSettled([
+    api.recoverArchive(authorized), api.recoverArchive(authorized),
+  ]);
+  assert.equal(results.filter((item) => item.status === "fulfilled").length, 1);
+  assert.equal(results.filter((item) => item.status === "rejected").length, 1);
+  assert.match(String(results.find((item) => item.status === "rejected").reason), failure);
+  for (const item of results) if (item.status === "fulfilled") {
+    for (const file of item.value.files) file.data.fill(0);
+  }
 });
 
 test("browser UMD archive is available without Node globals", async () => {
@@ -459,6 +560,17 @@ test("browser UMD archive is available without Node globals", async () => {
   context.scopeJSON = JSON.stringify(later.input.scope);
   context.signerId = later.input.signerKeyId;
   context.deviceId = later.input.deviceId;
+  context.vmChallenge = await vm.runInContext(`RootarkZk1KeyringPortableArchive.issueHistoricalRecoveryChallenge({
+    archiveSha256: new Uint8Array(offlineArchiveHash), accountArchiveSha256: null,
+    scope: JSON.parse(scopeJSON),
+    pinnedCurrentHead: { revision: laterHead.revision,
+      digest: new Uint8Array(laterHead.digest), epoch: laterHead.epoch },
+    independentOwnerSpkiSha256: new Uint8Array(ownerSpkiHash),
+    currentSignedDeviceGrant: JSON.parse(historicalAuthority).currentSignedDeviceGrant
+  })`, context);
+  const popMessage = vm.runInContext(`RootarkZk1KeyringPortableArchive
+    .historicalRecoveryChallengeMessage(vmChallenge)`, context);
+  context.popSignature = b64(crypto.sign(null, Buffer.from(popMessage), later.deviceSigner.privateKey));
   const historicResult = await vm.runInContext(`RootarkZk1KeyringPortableArchive.recoverArchive({
     archive: JSON.parse(historicalWire), scope: JSON.parse(scopeJSON),
     recoverySecret: new Uint8Array(heldSecret),
@@ -468,7 +580,8 @@ test("browser UMD archive is available without Node globals", async () => {
       digest: new Uint8Array(laterHead.digest), epoch: laterHead.epoch },
     ownerPublicKey: ownerVerifyKey, signerKeyId: new Uint8Array(signerId),
     deviceId, previousOwnerHistoryProof: null,
-    historicalRecovery: JSON.parse(historicalAuthority)
+    historicalRecovery: { ...JSON.parse(historicalAuthority),
+      devicePoP: { challenge: vmChallenge, signature: popSignature } }
   })`, context);
   assert.equal(historicResult.files.length, 3);
   assert.equal(historicResult.historicalOwnerContinuityVerified, true);
