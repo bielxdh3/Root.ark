@@ -190,6 +190,46 @@ test("WebDAV rejects insecure/ambiguous setup, wrong pin, foreign context and pa
     pinnedDriveFileId: "foreign-id" }), /ZK_CLOUD_COPY_UNAVAILABLE/);
 });
 
+test("WebDAV rejects coercion-based remote path escape before any HTTPS PUT", async (t) => {
+  const f = await fixture(t);
+  const writer = createZk1WebdavCiphertextAdapter(f.config);
+  const staging = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-coercion-"));
+  t.after(() => fs.rmSync(staging, { recursive: true, force: true }));
+  const source = path.join(staging, "opaque.ct");
+  fs.writeFileSync(source, f.ciphertext);
+  const folder = `zk1-${"a".repeat(64)}`;
+  let conversions = 0;
+  const maliciousName = {
+    toString() {
+      conversions += 1;
+      return conversions === 1 ? `${"b".repeat(22)}.ct` : "../../outside/foreign.ct";
+    },
+  };
+  const requestsBefore = f.requests.length;
+  await assert.rejects(writer.upload(source, folder, maliciousName, "uploads",
+    { zk1BoundedBytes: f.ciphertext.length }), /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
+  assert.equal(f.requests.length, requestsBefore,
+    "a dynamic name must never be interpreted again as a remote path");
+
+  const mutableNamespace = {
+    toString: () => "separate_dev_namespace",
+  };
+  assert.throws(() => createZk1WebdavCiphertextAdapter({
+    ...f.config, namespace: mutableNamespace,
+  }), /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/,
+  "namespace identity and remote namespace must both be one validated string");
+
+  let reads = 0;
+  const getterConfig = { ...f.config };
+  Object.defineProperty(getterConfig, "namespace", {
+    enumerable: true,
+    get() { return ++reads <= 2 ? "separate_dev_namespace" : "../foreign"; },
+  });
+  assert.throws(() => createZk1WebdavCiphertextAdapter(getterConfig),
+    /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/,
+    "a namespace accessor must not mutate between validation and use");
+});
+
 test("WebDAV remote errors, redirect, truncated/oversized/corrupt data fail closed", async (t) => {
   const f = await fixture(t);
   const { publisher, verifier } = await f.makePair();

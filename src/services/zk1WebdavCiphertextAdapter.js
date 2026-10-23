@@ -23,6 +23,18 @@ function unavailable() {
 
 function ensure(condition) { if (!condition) throw unavailable(); }
 
+function snapshotConfig(input) {
+  ensure(input && Object.getPrototypeOf(input) === Object.prototype);
+  const config = Object.create(null);
+  for (const field of Reflect.ownKeys(input)) {
+    ensure(typeof field === "string");
+    const descriptor = Object.getOwnPropertyDescriptor(input, field);
+    ensure(descriptor && Object.hasOwn(descriptor, "value"));
+    Object.defineProperty(config, field, { value: descriptor.value, enumerable: true });
+  }
+  return config;
+}
+
 function samePath(left, right) {
   const a = path.resolve(left);
   const b = path.resolve(right);
@@ -103,12 +115,13 @@ function writeExclusive(destination, data, parent) {
 
 function createZk1WebdavCiphertextAdapter(config = {}) {
   try {
+    config = snapshotConfig(config);
     // Never let production config accidentally enable this experimental endpoint.
-    ensure(config && Object.getPrototypeOf(config) === Object.prototype
-      && config.developmentOnlyOptIn === true
+    ensure(config.developmentOnlyOptIn === true
       && process.env.NODE_ENV === "development"
       && typeof config.endpoint === "string"
       && /^https:\/\/[A-Za-z0-9.-]+(?::\d{1,5})?(?:\/[A-Za-z0-9_-]+)*\/?$/.test(config.endpoint)
+      && typeof config.namespace === "string"
       && SAFE_NAMESPACE.test(config.namespace)
       && typeof config.ca === "string" && config.ca.includes("BEGIN CERTIFICATE")
       && typeof config.serverFingerprint256 === "string");
@@ -144,7 +157,8 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
     ])).digest("hex");
 
     function key(folder, name, area) {
-      ensure(area === "uploads" && SAFE_FOLDER.test(folder)
+      ensure(area === "uploads" && typeof folder === "string"
+        && typeof name === "string" && SAFE_FOLDER.test(folder)
         && SAFE_FILE.test(name));
       return `${namespace}/uploads/${folder}/${name}`;
     }
