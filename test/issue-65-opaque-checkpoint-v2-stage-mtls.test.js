@@ -211,7 +211,8 @@ test("signed v2 checkpoint local staging with independent CAS+floor mTLS, SQLite
     deviceSignerPem: device.publicKey.export({ type: "spki", format: "pem" }),
   };
   fs.writeFileSync(configFile, JSON.stringify(config));
-  const childFile = path.join(__dirname, "support", "issue-65-checkpoint-stage-child.js");
+  const childFile = path.join(__dirname, "..", "lab", "issue-65-packet-b",
+    "issue-65-checkpoint-stage-child.js");
   const forkOnce = () => new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [childFile, configFile], {
       cwd: path.join(__dirname, ".."), windowsHide: true,

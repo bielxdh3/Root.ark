@@ -111,7 +111,10 @@ test("release gate emits a bounded redacted TAP failure from canonical npm test 
     __dirname: path.dirname(gatePath),
     process: simulatedProcess,
     console: { log: (line) => printed.push(String(line)) },
-    require: (name) => name === "node:child_process" ? { spawnSync: simulatedSpawnSync } : gateRequire(name),
+    require: (name) => name === "node:child_process" ? { spawnSync: simulatedSpawnSync }
+      : name === "./release-gate-environment" ? {
+        ...gateRequire(name), hasSeparateWindowsCiCanonicalTest: () => false,
+      } : gateRequire(name),
   }, { filename: gatePath });
   const output = printed.join("\n");
   assert.ok(commands.some((line) => /(?:^|\s)(?:npm(?:\.cmd)?\s+)?test -- --test-reporter=tap(?:\s|$)/.test(line)), "canonical npm still runs every test with a deterministic TAP reporter");
@@ -136,7 +139,10 @@ test("release gate prints metadata-only failure diagnostics for unknown npm outp
     console: { log: (line) => printed.push(String(line)) },
     require: (name) => name === "node:child_process" ? { spawnSync: (executable, args) => isCanonicalNpmTestInvocation(executable, args)
       ? { status: 1, stdout: `unknown-format ${secret}\n`, stderr: "", error: { code: "ENOBUFS" } }
-      : { status: 0, stdout: "", stderr: "" } } : gateRequire(name),
+      : { status: 0, stdout: "", stderr: "" } }
+      : name === "./release-gate-environment" ? {
+        ...gateRequire(name), hasSeparateWindowsCiCanonicalTest: () => false,
+      } : gateRequire(name),
   }, { filename: gatePath });
   const output = printed.join("\n");
   assert.match(output, /FAIL diagnostics \(final-head canonical npm test\):/);

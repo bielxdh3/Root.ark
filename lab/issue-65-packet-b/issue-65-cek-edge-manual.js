@@ -1,7 +1,7 @@
 "use strict";
 
 // Optional real Edge IndexedDB smoke test (Node 24, Windows, no npm packages).
-// Run explicitly: node test/support/issue-65-cek-edge-manual.js
+// Run explicitly: node lab/issue-65-packet-b/issue-65-cek-edge-manual.js
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
