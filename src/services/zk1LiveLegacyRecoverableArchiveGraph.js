@@ -76,9 +76,10 @@ function regularZipMember(entry) {
     || entry.uncompressedSize > MAX_ENTRY_BYTES
     || !Number.isSafeInteger(entry.compressedSize) || entry.compressedSize < 0) refuse();
 }
-async function digestInflated(entry, limit) {
+async function digestInflated(entry, limit, retainBytes = false) {
   if (entry.uncompressedSize > limit) refuse();
   const hash = crypto.createHash("sha256");
+  const chunks = retainBytes ? [] : null;
   const stream = entry.stream();
   const timer = setTimeout(() => stream.destroy(new Error("ZIP deadline")), MAX_MS);
   timer.unref?.();
@@ -88,9 +89,11 @@ async function digestInflated(entry, limit) {
       if (!Buffer.isBuffer(bytes) || bytes.length > limit - size) refuse();
       size += bytes.length;
       hash.update(bytes);
+      if (chunks) chunks.push(bytes);
     }
     if (size !== entry.uncompressedSize) refuse();
-    return { size, digest: hash.digest("hex") };
+    return { size, digest: hash.digest("hex"),
+      ...(chunks ? { bytes: Buffer.concat(chunks, size) } : {}) };
   } finally {
     clearTimeout(timer);
     if (!stream.destroyed) stream.destroy();
@@ -159,15 +162,24 @@ async function inspectArchive(bytes, expected, secret) {
   const mac = crypto.createHmac("sha256", secret)
     .update("rootark-zk1-recoverable-archive-graph/v1\0")
     .update(expected.id + "\0");
+  const members = new Map();
+  let archivedDb = null;
   for (const { name, entry } of files.values()) {
-    const checked = await digestInflated(entry, MAX_ENTRY_BYTES);
+    const checked = await digestInflated(entry, MAX_ENTRY_BYTES,
+      name === "data/rootark.sqlite" && manifest.persistence_mode === "sqlite");
+    if (checked.bytes) archivedDb = checked.bytes;
+    members.set(name.toLowerCase(), { size: checked.size });
     counts[category(name)]++;
     mac.update(JSON.stringify([name, checked.size, checked.digest]) + "\n");
   }
+  const historicalSqlite = archivedDb === null ? null :
+    require("./zk1LiveLegacyArchivedSqliteJoin").inspectZk1LiveLegacyArchivedSqliteJoin({
+      sqliteBytes: archivedDb, members,
+    });
   // A backup may legitimately contain content no longer present in live FTS,
   // which remains a recovery candidate, not an authority for cutover.
   return { ...counts, members: files.size, cloudCompleteClaim: manifest.cloud_complete,
-    ephemeralFingerprint: mac.digest("base64url"), globallyComplete: false };
+    historicalSqlite, ephemeralFingerprint: mac.digest("base64url"), globallyComplete: false };
 }
 
 async function inspectZk1LiveLegacyRecoverableArchiveGraph({
@@ -232,6 +244,21 @@ async function inspectZk1LiveLegacyRecoverableArchiveGraph({
       liveNonFtsDerivedInspected: Boolean(localDerived),
       archiveMetadataAndState: reports.reduce((s, x) => s + x.archiveMetadataAndState, 0),
       archiveMembers: reports.reduce((s, x) => s + x.members, 0),
+      historicalSqlite: Object.freeze({
+        inspectedSnapshots: reports.filter((x) => x.historicalSqlite).length,
+        joinedVersionReferences: reports.reduce((s, x) => s + (x.historicalSqlite?.joinedVersionReferences || 0), 0),
+        joinedTrashReferences: reports.reduce((s, x) => s + (x.historicalSqlite?.joinedTrashReferences || 0), 0),
+        joinedDerivedReferences: reports.reduce((s, x) => s + (x.historicalSqlite?.joinedDerivedReferences || 0), 0),
+        joinedRetentionReferences: reports.reduce((s, x) => s + (x.historicalSqlite?.joinedRetentionReferences || 0), 0),
+        joinedMetadataReferences: reports.reduce((s, x) => s + (x.historicalSqlite?.joinedMetadataReferences || 0), 0),
+        unknownReferences: reports.reduce((s, x) => s + (x.historicalSqlite?.unknownReferences || 0), 0)
+          + reports.filter((x) => !x.historicalSqlite).length + unresolvedBackupRows
+          + (reports.length === 0 ? 1 : 0),
+        status: reports.length > 0
+          && reports.every((x) => x.historicalSqlite?.status === "BOUNDED_JOINS_ONLY")
+          && unresolvedBackupRows === 0 ? "BOUNDED_JOINS_ONLY" : "UNKNOWN",
+        globallyComplete: false,
+      }),
       cloudCompleteClaimCount: reports.filter((x) => x.cloudCompleteClaim).length,
       backupRetentionTombstones: preflight.legacy.backupEvidence.retentionTombstones,
       backupRetentionTransactions: preflight.legacy.backupEvidence.retentionTransactions,

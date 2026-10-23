@@ -68,6 +68,23 @@ is not independent authenticity or durable custody. Every result explicitly
 keeps `wholeCorpusVerified`, `protectedRecoveryVerified`, `canDeleteLegacy`
 and `authorizesCutover` false.
 
+The separate bounded historical-SQLite join now runs within that existing
+archive inspector for `persistence_mode: sqlite` backups. It opens only the
+already validated `data/rootark.sqlite` member in a private temporary
+read-only SQLite database, with no WAL/SHM source sidecars, and checks all
+recorded version aliases against actual ZIP payload paths and exact sizes.
+FTS, encryption metadata, links, file permissions and retention count as
+linked only if **every** version of the logical file is represented. Current
+trashed-file references additionally require matching ZIP paths and SQL
+sizes. Missing historical bytes, stale/unknown schema, pending uploads,
+unassociated ZIP members, backup history references and ambiguous
+temp/derived records contribute to `historicalSqlite.unknownReferences`,
+reported as `status: "UNKNOWN"`. A ZIP with no historical SQLite snapshot
+is also UNKNOWN. The `BOUNDED_JOINS_ONLY` status confirms only these local
+archive references; it is never whole-account completion or independent
+cryptographic provenance. A backup checksum held in the same mutable live
+SQLite store cannot prove owner authorization or protection against rollback.
+
 Each entry contains `{ legacy: { name, folderId }, sourcePin, cek }`.
 `sourcePin` must contain exactly `version` (positive number), `storedAs`,
 `uploadedAt`, `size`, `lastModified` (canonical HTTP GMT timestamp),
