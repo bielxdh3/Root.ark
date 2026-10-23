@@ -15,6 +15,7 @@ const file = require("../public/client/rootark-zk1-file-content");
 const signedRoots = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
 const history = require("../public/client/rootark-zk1-owner-signed-checkpoint");
 const migration = require("../public/client/rootark-zk1-legacy-migration-workflow");
+const batch = require("../public/client/rootark-zk1-legacy-batch-migration");
 const { Zk1ProtectedObjectStore } = require("../src/services/zk1ProtectedObjectStore");
 const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
 
@@ -94,6 +95,16 @@ async function fixture(t) {
   let legacyReads = 0;
   let writes = 0;
   let reads = 0;
+  let versionReads = 0;
+  const revisions = new Map();
+  function setVersion(version, content, mediaType = "text/plain",
+    lastModified = "Thu, 22 Oct 2026 01:00:00 GMT") {
+    const data = Buffer.from(content);
+    revisions.set(version, { version, storedAs: "legacy.txt.v" + version,
+      uploadedAt: "2026-10-22T01:00:00.000Z", size: data.length,
+      lastModified, mediaType, sha256: b64(digest(data)), data });
+  }
+  setVersion(1, original);
   const app = express();
   app.get("/files/:name", (req, res) => {
     if (req.headers["x-lab-session"] !== "owner") return res.sendStatus(401);
@@ -102,6 +113,25 @@ async function fixture(t) {
     res.set("content-disposition", 'attachment; filename="legacy.txt"');
     res.type(legacyType);
     res.status(200).send(original);
+  });
+  app.get("/versions/:name", (req, res) => {
+    if (req.headers["x-lab-session"] !== "owner") return res.sendStatus(401);
+    if (req.params.name !== "legacy.txt") return res.sendStatus(404);
+    res.json({ folderId: "", fileName: "legacy.txt",
+      currentVersion: Math.max(...revisions.keys()),
+      versions: [...revisions.values()].map(({ version, storedAs, uploadedAt, size }) =>
+        ({ version, storedAs, uploadedAt, size })) });
+  });
+  app.get("/download/:name/v/:version", (req, res) => {
+    if (req.headers["x-lab-session"] !== "owner") return res.sendStatus(401);
+    if (req.params.name !== "legacy.txt") return res.sendStatus(404);
+    const item = revisions.get(Number(req.params.version));
+    if (!item) return res.sendStatus(404);
+    versionReads++;
+    res.set("content-disposition", 'attachment; filename="legacy.txt"');
+    res.set("last-modified", item.lastModified);
+    res.type(item.mediaType);
+    res.status(200).send(item.data);
   });
   const witnessProvider = {
     async freshHead({ nonce }) {
@@ -188,8 +218,15 @@ async function fixture(t) {
   return { input, ownerPair, ownerSignerId, disk, realFetch, store, original,
     get writes() { return writes; }, get reads() { return reads; },
     get legacyReads() { return legacyReads; },
+    get versionReads() { return versionReads; },
     setSource(next) { original = Buffer.from(next); },
     setMediaType(next) { legacyType = next; },
+    setVersion,
+    versionEntry(version, cek = input.cek) {
+      const { data, ...pin } = revisions.get(version);
+      return { legacy: { name: "legacy.txt", folderId: "" },
+        sourcePin: { ...pin }, cek };
+    },
     async checkpoint(rootValue) {
       return signedRoots.signOwnerCiphertextRootCheckpoint({
         scope: scopeWire, signerKey: ownerPair.privateKey, signerKeyId: ownerSignerId,
@@ -350,4 +387,131 @@ test("browser UMD legacy migration loads without Node require or filesystem depe
   assert.equal(vm.runInContext("typeof RootarkZk1LegacyMigrationWorkflow.finalizeLegacyMigration", ctx), "function");
   await assert.rejects(vm.runInContext(
     "RootarkZk1LegacyMigrationWorkflow.openMigrationJournal(null)", ctx), fault);
+});
+
+function batchInput(f, entries, overrides = {}) {
+  return { optIn: true, entries, migrationSecret: Buffer.alloc(32, 0x73),
+    trust: f.input.trust, origin: f.input.origin,
+    fetchImpl: f.realFetch, journal: f.input.journal,
+    nowSeconds: f.input.nowSeconds, ...overrides };
+}
+
+test("historical revisions migrate as separate deterministic ZK objects over authenticated HTTP; no cutover or deletion", async (t) => {
+  const f = await fixture(t);
+  f.setVersion(2, "Historical revised bytes");
+  const entries = [f.versionEntry(1), f.versionEntry(2, await file.generateFileCek())];
+  const input = batchInput(f, entries);
+  const copied = await batch.runLegacyMigrationBatch(input);
+  assert.equal(copied.total, 2);
+  assert.equal(copied.verified, 2);
+  assert.equal(copied.canDeleteLegacy, false);
+  assert.equal(copied.authorizesCutover, false);
+  assert.equal(f.writes, 2);
+  assert.equal(f.versionReads, 4, "every source revision must be read before and after PUT");
+  assert.notEqual(copied.results[0].objectId, copied.results[1].objectId);
+  assert.notEqual(copied.results[0].versionId, copied.results[1].versionId);
+  for (const result of copied.results) {
+    assert.equal(result.requiresOwnerCheckpoint, true);
+    assert.equal(result.verifiedLocalReadback, true);
+    assert.equal((await f.input.journal.read(result.objectId)).phase, "readback");
+    const ciphertext = f.store.db.prepare("SELECT ciphertext FROM zk_content_object WHERE id=?")
+      .get(result.objectId).ciphertext;
+    assert.equal(ciphertext.includes(Buffer.from("Historical revised bytes")), false);
+    assert.equal(ciphertext.includes(f.original), false);
+  }
+  const resumed = await batch.runLegacyMigrationBatch(input);
+  assert.deepEqual(resumed.results.map((r) => [r.objectId, r.versionId]),
+    copied.results.map((r) => [r.objectId, r.versionId]));
+  assert.equal(resumed.verified, 2);
+  assert.equal(f.writes, 2, "replays with identical selected revision must not issue PUT");
+  assert.equal((await f.realFetch("/files/legacy.txt", { method: "GET" })).status, 200);
+});
+
+test("partial batch, changing historical version, MIME and last-modified remain incomplete without plaintext PUT", async (t) => {
+  const f = await fixture(t);
+  f.setVersion(2, "Second historical version");
+  const entries = [f.versionEntry(1), f.versionEntry(2, await file.generateFileCek())];
+  // Catalog changed while selected snapshot remains pinned.
+  f.setVersion(2, "Second historical version with a different size");
+  const chosen = batchInput(f, entries);
+  const partial = await batch.runLegacyMigrationBatch(chosen);
+  assert.equal(partial.verified, 1);
+  assert.equal(partial.results[1].phase, "needs-manual-review");
+  assert.equal(f.writes, 1);
+  f.setVersion(2, "Second historical version");
+  const complete = await batch.runLegacyMigrationBatch(chosen);
+  assert.equal(complete.verified, 2);
+  assert.equal(f.writes, 2, "the previously migrated first item never repeats PUT");
+  const otherPin = { ...entries[1].sourcePin, mediaType: "application/json" };
+  const mismatched = await batch.runLegacyMigrationBatch(batchInput(f,
+    [entries[0], { ...entries[1], sourcePin: otherPin }]));
+  assert.equal(mismatched.verified, 1);
+  assert.equal(f.writes, 2);
+});
+
+test("payload/MIME/mtime drift, lost ACK, replay and forged tenant grant fail closed", async (t) => {
+  const f = await fixture(t);
+  f.setVersion(2, "Protected historical version");
+  const entry = f.versionEntry(2, await file.generateFileCek());
+  const pristine = batchInput(f, [entry]);
+  const assertNoWrite = async (tamper) => {
+    f.setVersion(2, ...tamper);
+    const checked = await batch.runLegacyMigrationBatch(pristine);
+    assert.equal(checked.verified, 0);
+    assert.equal(checked.results[0].phase, "needs-manual-review");
+    assert.equal(f.writes, 0);
+  };
+  await assertNoWrite(["X".repeat(Buffer.byteLength("Protected historical version"))]);
+  await assertNoWrite(["Protected historical version", "application/json"]);
+  await assertNoWrite(["Protected historical version", "text/plain",
+    "Thu, 22 Oct 2026 03:00:00 GMT"]);
+  f.setVersion(2, "Protected historical version");
+
+  let failRead = true;
+  const lostAck = async (url, options) => {
+    if (url.endsWith("/content/read") && failRead) throw new Error("unavailable signed GET");
+    const res = await f.realFetch(url, options);
+    if (url.endsWith("/content/put") && failRead) throw new Error("ACK was lost after write");
+    return res;
+  };
+  const ambiguous = await batch.runLegacyMigrationBatch(batchInput(f, [entry],
+    { fetchImpl: lostAck }));
+  assert.equal(ambiguous.verified, 0);
+  assert.equal(f.writes, 1);
+  f.input.journal.close();
+  const reopened = await migration.openMigrationJournal(f.disk.api);
+  failRead = false;
+  const restored = await batch.runLegacyMigrationBatch(batchInput(f, [entry],
+    { fetchImpl: lostAck, journal: reopened }));
+  assert.equal(restored.verified, 1);
+  assert.equal(f.writes, 1, "uncertain write cannot be retried");
+  const foreignTrust = { ...f.input.trust, signedDeviceGrant: {
+    ...f.input.trust.signedDeviceGrant, account_id: id() } };
+  const foreign = await batch.runLegacyMigrationBatch(batchInput(f, [entry],
+    { trust: foreignTrust }));
+  assert.equal(foreign.verified, 0);
+  assert.equal(f.writes, 1);
+  await assert.rejects(batch.runLegacyMigrationBatch(batchInput(f, [entry, entry])),
+    /ZK_LEGACY_BATCH_UNVERIFIED/);
+  await assert.rejects(batch.runLegacyMigrationBatch(batchInput(f, [{ ...entry,
+    sourcePin: { ...entry.sourcePin, kind: "trash" } }])),
+  /ZK_LEGACY_BATCH_UNVERIFIED/, "trash has no authenticated legacy plaintext GET route");
+  await assert.rejects(batch.runLegacyMigrationBatch(batchInput(f, [entry],
+    { optIn: false })), /ZK_LEGACY_BATCH_UNVERIFIED/);
+});
+
+test("batch UMD loads without Node imports and rejects missing explicit opt-in", async () => {
+  const ctx = vm.createContext({ crypto: crypto.webcrypto, TextEncoder, TextDecoder,
+    Uint8Array, ArrayBuffer, URL, atob, btoa });
+  for (const filename of [
+    "rootark-dev-vault-migration.js", "rootark-zk1-file-content.js",
+    "rootark-zk1-ciphertext-chunk-root.js", "rootark-zk1-ciphertext-download-integrity.js",
+    "rootark-zk1-owner-signed-checkpoint.js", "rootark-zk1-protected-http-client.js",
+    "rootark-zk1-uncertain-put-reconciliation.js",
+    "rootark-zk1-normal-browser-trust-floor.js", "rootark-zk1-normal-browser-content.js",
+    "rootark-zk1-owner-ciphertext-root-checkpoint.js", "rootark-zk1-legacy-migration-workflow.js",
+    "rootark-zk1-legacy-batch-migration.js",
+  ]) vm.runInContext(fs.readFileSync(path.join(__dirname, "../public/client", filename), "utf8"), ctx);
+  assert.equal(vm.runInContext("typeof RootarkZk1LegacyBatchMigration.runLegacyMigrationBatch", ctx),
+    "function");
 });

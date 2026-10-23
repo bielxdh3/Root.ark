@@ -3908,6 +3908,7 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
     "Content-Disposition": getFileContentDisposition(safeName, dispositionType),
     "X-Content-Type-Options": "nosniff",
   };
+  if (options.includeLastModified) commonHeaders["Last-Modified"] = stats.mtime.toUTCString();
   if (isActiveContentFile(safeName)) commonHeaders["Content-Security-Policy"] = "sandbox; default-src 'none'";
 
   const streamOptions = { highWaterMark };
@@ -11372,7 +11373,7 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
     return res.status(404).json({ error: "Versao nao encontrada" });
   }
 
-  sendOptimizedFile(req, res, target.filePath, name, "attachment");
+  sendOptimizedFile(req, res, target.filePath, name, "attachment", { includeLastModified: true });
 });
 
 app.post("/version-open-token", versionOpenTokenRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {

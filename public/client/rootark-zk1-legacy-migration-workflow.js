@@ -32,6 +32,8 @@
     const SCHEMA = "rootark-zk1-legacy-migration-intent/v1";
     const SCOPE = ["account_id", "compartment_id", "keyring_id"];
     const META = [...SCOPE, "object_id", "version_id", "parent_version_id", "epoch", "kind"];
+    const PIN = ["version", "storedAs", "uploadedAt", "size", "lastModified",
+      "sha256", "mediaType"];
     const activeJournals = new WeakSet();
     function deny() { throw new Error("ZK_LEGACY_MIGRATION_AMBIGUOUS"); }
     function exact(value, fields) {
@@ -66,6 +68,22 @@
       return b64(new Uint8Array(await webCrypto.subtle.digest("SHA-256", raw)));
     }
     function id(value) { if (typeof value !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(value)) deny(); return value; }
+    function sourcePin(value) {
+      exact(value, PIN);
+      if (!Number.isSafeInteger(value.version) || value.version < 1
+        || typeof value.storedAs !== "string" || !value.storedAs
+        || value.storedAs.length > 255 || /[\\/\u0000-\u001f\u007f]/.test(value.storedAs)
+        || typeof value.uploadedAt !== "string" || !Number.isFinite(Date.parse(value.uploadedAt))
+        || typeof value.lastModified !== "string"
+        || !Number.isFinite(Date.parse(value.lastModified))
+        || new Date(value.lastModified).toUTCString() !== value.lastModified
+        || !Number.isSafeInteger(value.size) || value.size < 0 || value.size > 2 * 1024 * 1024
+        || typeof value.sha256 !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value.sha256)
+        || typeof value.mediaType !== "string" || !/^[a-z0-9][a-z0-9.!#$&^_+-]*\/[a-z0-9][a-z0-9.!#$&^_+-]*$/.test(value.mediaType)
+        || value.mediaType.length > 128) deny();
+      from64(value.sha256, 32);
+      return Object.fromEntries(PIN.map((key) => [key, value[key]]));
+    }
     function record(value) {
       exact(value, ["schema", "phase", "binding", "ciphertext", "root", "plainDigest",
         "cipherDigest", "sourceDescriptorDigest"]);
@@ -143,6 +161,7 @@
       // mutation to redirect an otherwise valid device authorization.
       const legacy = { name: input.legacy.name, folderId: input.legacy.folderId };
       const meta = Object.fromEntries(META.map((field) => [field, input.metadata[field]]));
+      const pinnedSource = Object.hasOwn(input, "sourcePin") ? sourcePin(input.sourcePin) : null;
       const head = { revision: trust.pinnedCurrentHead?.revision,
         digest: bytes(trust.pinnedCurrentHead?.digest, 32),
         epoch: trust.pinnedCurrentHead?.epoch };
@@ -182,8 +201,24 @@
         schema: SCHEMA, legacy, metadata: meta,
         ownerSpki: b64(anchored.independentOwnerSpkiSha256),
         headDigest: b64(signer.manifestDigest), manifestRevision: signer.manifestRevision,
+        ...(pinnedSource ? { pinnedSource } : {}),
       })));
-      return { signer, binding, meta, trust, legacy };
+      return { signer, binding, meta, trust, legacy, pinnedSource };
+    }
+    async function getPinnedSource(input, context) {
+      const source = await legacyClient.readLegacyPlaintext({
+        ...context.legacy, maxBytes: 2 * 1024 * 1024,
+        version: context.pinnedSource?.version ?? null, fetchImpl: input.fetchImpl,
+      });
+      let accepted = false;
+      try {
+        if (context.pinnedSource && (source.data.byteLength !== context.pinnedSource.size
+          || source.mediaType !== context.pinnedSource.mediaType
+          || source.lastModified !== context.pinnedSource.lastModified
+          || await digest(source.data) !== context.pinnedSource.sha256)) deny();
+        accepted = true;
+        return source;
+      } finally { if (!accepted) source.data.fill(0); }
     }
     async function verifyReadback(input, context, saved) {
       const ciphertext = from64(saved.ciphertext, 16, 4 * 1024 * 1024);
@@ -199,9 +234,7 @@
           expectedPlaintextSha256: from64(saved.plainDigest, 32),
           cek: input.cek, metadata: context.meta,
         });
-        source = await legacyClient.readLegacyPlaintext({
-          ...context.legacy, maxBytes: 2 * 1024 * 1024, fetchImpl: input.fetchImpl,
-        });
+        source = await getPinnedSource(input, context);
         if (await digest(source.data) !== saved.plainDigest
           || await digest(new TextEncoder().encode(JSON.stringify({
             name: source.name, mediaType: source.mediaType,
@@ -213,14 +246,12 @@
       let source, ciphertext;
       try {
         exact(input, ["optIn", "legacy", "metadata", "trust", "cek", "origin",
-          "fetchImpl", "journal", "nowSeconds"]);
+          "fetchImpl", "journal", "nowSeconds", ...(Object.hasOwn(input, "sourcePin") ? ["sourcePin"] : [])]);
         const context = await authority(input);
         const key = context.meta.object_id;
         let previous = await input.journal.read(key);
         if (previous === null) {
-          source = await legacyClient.readLegacyPlaintext({
-            ...context.legacy, maxBytes: 2 * 1024 * 1024, fetchImpl: input.fetchImpl,
-          });
+          source = await getPinnedSource(input, context);
           ciphertext = await file.encryptFile({ cek: input.cek, metadata: context.meta,
             name: source.name, mediaType: source.mediaType, data: source.data });
           const root = bytes(await roots.computeCiphertextRoot([ciphertext]), 32);
@@ -260,7 +291,8 @@
     async function finalizeLegacyMigration(input) {
       try {
         exact(input, ["optIn", "legacy", "metadata", "trust", "cek", "origin",
-          "fetchImpl", "journal", "nowSeconds", "signedRootCheckpoint"]);
+          "fetchImpl", "journal", "nowSeconds", "signedRootCheckpoint",
+          ...(Object.hasOwn(input, "sourcePin") ? ["sourcePin"] : [])]);
         const context = await authority(input);
         const key = context.meta.object_id;
         const previous = await input.journal.read(key);

@@ -15,14 +15,18 @@
   }
   async function readLegacyPlaintext({
     name, folderId = "", maxBytes = MAX_BYTES,
+    version = null,
     fetchImpl = typeof fetch === "function" ? fetch : null,
   }) {
     if (!validName(name) || typeof folderId !== "string"
       || (folderId && (!/^[A-Za-z0-9._-]{1,128}$/.test(folderId)
         || folderId === "." || folderId === ".."))
       || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_BYTES
+      || (version !== null && (!Number.isSafeInteger(version) || version < 1))
       || typeof fetchImpl !== "function") fail();
-    const route = "/files/" + encodeURIComponent(name)
+    const route = (version === null ? "/files/" : "/download/")
+      + encodeURIComponent(name)
+      + (version === null ? "" : "/v/" + version)
       + (folderId ? "?folderId=" + encodeURIComponent(folderId) : "");
     let response;
     try {
@@ -73,7 +77,7 @@
         data.set(chunk, offset);
         offset += chunk.byteLength;
       }
-      return { name, mediaType, data };
+      return { name, mediaType, lastModified: response.headers?.get?.("last-modified") || null, data };
     } catch (_) {
       try { await reader.cancel(); } catch (_) { /* best-effort stream cancellation */ }
       fail();
