@@ -17,6 +17,7 @@ const { inspectVerifiedWitnessFreshHeadV1 } =
 const { isZk1OpaqueCatalogIndependentFloorClient } =
   require("./zk1OpaqueCatalogIndependentFloor");
 const { requireImmutableTriggers } = require("./zk1OpaqueCatalogSqliteIntegrity");
+const { assertPrivateSqliteDirectory } = require("./zk1PrivateSqlitePath");
 
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
 const PAGE_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-page/v1\0");
@@ -75,6 +76,9 @@ function privateDir(filename) {
   if (!current.isDirectory() || current.isSymbolicLink()) fail();
   if (process.platform !== "win32"
     && (current.uid !== process.getuid() || (current.mode & 0o077) !== 0)) fail();
+  // SQLite follows ancestor junctions while opening the DB and WAL/SHM paths.
+  // Reject aliases even when the immediate parent itself is a real directory.
+  try { assertPrivateSqliteDirectory(filename); } catch (_) { fail(); }
 }
 function requireExistingCatalogSchema(db, identity, hasOwner) {
   // A restart must inspect the existing file read-only before switching WAL

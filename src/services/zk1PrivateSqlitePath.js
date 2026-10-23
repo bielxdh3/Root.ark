@@ -34,6 +34,10 @@ function checkDirectory(filename) {
   }
 }
 
+function assertPrivateSqliteDirectory(filename) {
+  checkDirectory(filename);
+}
+
 function ensurePrivateSqliteDirectory(filename) {
   // Verify the existing ancestors BEFORE mkdir. mkdir(recursive) otherwise
   // follows a preinstalled symlink and creates files in a foreign directory.
@@ -77,4 +81,5 @@ function assertPrivateSqliteFile(filename) {
   } finally { fs.closeSync(fd); }
 }
 
-module.exports = { ensurePrivateSqliteDirectory, assertPrivateSqliteFile };
+module.exports = { ensurePrivateSqliteDirectory, assertPrivateSqliteFile,
+  assertPrivateSqliteDirectory };
