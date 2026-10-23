@@ -110,7 +110,14 @@ function run() {
   let timedOut = false;
   let spawnFailed = false;
   let stderrBytes = 0;
+  let reportedSuite = false;
   const tracker = createTapProgressRecorder((message) => console.log(message));
+  // PowerShell/CI can lose the last asynchronous console line when npm or its
+  // parent exits during a buffered write. Emit failures synchronously instead.
+  function writeFailureDiagnostic(message) {
+    try { fs.writeSync(2, `${message}\n`); }
+    catch { console.error(message); }
+  }
   const child = spawn(invocation.executable, invocation.args, {
     cwd: require("node:path").resolve(__dirname, ".."),
     stdio: ["ignore", "pipe", "pipe"],
@@ -141,12 +148,19 @@ function run() {
 
   consume(child.stdout, false);
   consume(child.stderr, true);
+  process.on("exit", (exitCode) => {
+    if (!reportedSuite) {
+      tracker.finish();
+      process.exitCode = 1;
+      writeFailureDiagnostic(`FAIL Windows canonical runner exited before child close: exit=${exitCode} TAPresults=${tracker.state.results} failures=${tracker.state.failures} stderrBytes=${stderrBytes} ${tracker.safeSummary()}`);
+    }
+  });
 
   function terminate(reason) {
     if (timedOut) return;
     timedOut = true;
     tracker.finish();
-    console.error(`FAIL Windows canonical test ${reason}; TAP results=${tracker.state.results}, failures=${tracker.state.failures}; ${tracker.safeSummary()}`);
+    writeFailureDiagnostic(`FAIL Windows canonical test ${reason}; TAP results=${tracker.state.results}, failures=${tracker.state.failures}; ${tracker.safeSummary()}`);
     if (process.platform === "win32" && child.pid) {
       const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
       killer.on("error", () => child.kill());
@@ -170,7 +184,10 @@ function run() {
     tracker.finish();
     const { results, failures, plan, tests, reportedFailures } = tracker.state;
     const passed = !timedOut && !spawnFailed && code === 0 && !signal && plan && tests !== null && reportedFailures === 0 && failures === 0;
-    console.log(`${passed ? "PASS" : "FAIL"} Windows canonical suite: exit=${code ?? "unknown"} signal=${signal ? "present" : "none"} TAPresults=${results} tests=${tests ?? "unknown"} failures=${failures} stderrBytes=${stderrBytes} ${tracker.safeSummary()}`);
+    const summary = `${passed ? "PASS" : "FAIL"} Windows canonical suite: exit=${code ?? "unknown"} signal=${signal ? "present" : "none"} TAPresults=${results} tests=${tests ?? "unknown"} failures=${failures} stderrBytes=${stderrBytes} ${tracker.safeSummary()}`;
+    reportedSuite = true;
+    if (passed) console.log(summary);
+    else writeFailureDiagnostic(summary);
     if (!passed) process.exitCode = 1;
   });
 }

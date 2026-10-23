@@ -1,7 +1,60 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
+const vm = require("node:vm");
+const { EventEmitter } = require("node:events");
+const { PassThrough } = require("node:stream");
 const { getNpmInvocation, canonicalTestArgs, hasSeparateWindowsCiCanonicalTest, isDependencyOrNetworkUnavailable } = require("../scripts/release-gate-environment");
 const { createTapProgressRecorder } = require("../scripts/run-windows-canonical-tests");
+
+test("Windows canonical runner synchronously reports failure even when console output is buffered", () => {
+  const runnerPath = path.join(__dirname, "..", "scripts", "run-windows-canonical-tests.js");
+  const source = fs.readFileSync(runnerPath, "utf8");
+  const runFixture = ({ closeChild }) => {
+    const child = new EventEmitter();
+    child.pid = 1234;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    const synchronous = [];
+    const processHooks = {};
+    const fakeProcess = {
+      platform: "linux", env: {}, exitCode: 0,
+      on(name, handler) { processHooks[name] = handler; },
+    };
+    const fakeModule = { exports: {} };
+    const fakeRequire = (id) => {
+      if (id === "node:child_process") return { spawn: () => child };
+      if (id === "node:fs") return { ...fs, writeSync: (fd, data) => {
+        assert.equal(fd, 2, "failure diagnostics go to stderr");
+        synchronous.push(String(data));
+      } };
+      if (id === "./release-gate-environment") return {
+        getNpmInvocation: () => ({ executable: "fixture", args: [] }),
+        canonicalTestArgs: () => [],
+      };
+      return require(id);
+    };
+    fakeRequire.main = fakeModule;
+    vm.runInNewContext(source, {
+      module: fakeModule, require: fakeRequire, __dirname: path.dirname(runnerPath),
+      process: fakeProcess, console: { log() {}, error() {} },
+      setInterval: () => 1, clearInterval: () => {},
+    }, { filename: runnerPath });
+    child.stdout.write("TAP version 13\nnot ok 1 - private token=fixture-secret\n");
+    if (closeChild) child.emit("close", 1, null);
+    else processHooks.exit?.(1);
+    return { synchronous: synchronous.join(""), fakeProcess };
+  };
+  const closed = runFixture({ closeChild: true });
+  assert.equal(closed.fakeProcess.exitCode, 1);
+  assert.match(closed.synchronous, /FAIL Windows canonical suite: exit=1/);
+  assert.doesNotMatch(closed.synchronous, /fixture-secret/);
+  const premature = runFixture({ closeChild: false });
+  assert.equal(premature.fakeProcess.exitCode, 1, "premature termination cannot pass the release gate");
+  assert.match(premature.synchronous, /FAIL Windows canonical runner exited before child close/);
+  assert.doesNotMatch(premature.synchronous, /fixture-secret/);
+});
 
 test("Windows canonical release gate bounds file concurrency without omitting any test", () => {
   assert.deepEqual(canonicalTestArgs({ platform: "win32" }),
