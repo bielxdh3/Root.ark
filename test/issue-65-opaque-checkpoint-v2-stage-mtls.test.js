@@ -223,13 +223,36 @@ test("signed v2 checkpoint local staging with independent CAS+floor mTLS, SQLite
     child.stderr.on("data", (part) => { error += part; });
     child.on("error", reject);
     child.on("exit", (code) => {
-      if (code !== 0) reject(new Error("child-failure: " + out + error));
-      else { try { resolve(JSON.parse(out)); } catch (parseError) { reject(parseError); } }
+      try {
+        const result = JSON.parse(out);
+        if (code === 0) return resolve(result);
+        // The independent readonly SQLite snapshot deliberately rejects when
+        // another process changes a WAL/SHM identity during preflight. A
+        // competing reader must fail closed, not bypass the identity guard to
+        // turn a transient race into an unverified successful stage.
+        if (code === 1 && result?.error === "ZK_OPAQUE_CHECKPOINT_STAGE_DENIED") {
+          return resolve({ deniedWhileCompeting: true });
+        }
+        reject(new Error("child-failure: " + out + error));
+      } catch (parseError) { reject(new Error("child-output-invalid: " + error,
+        { cause: parseError })); }
     });
   });
   const [firstChild, secondChild] = await Promise.all([forkOnce(), forkOnce()]);
-  assert.deepEqual([firstChild.outcome, secondChild.outcome],
-    ["LOCAL_STAGED_NOT_PUBLISHED", "LOCAL_STAGED_NOT_PUBLISHED"]);
+  const competed = [firstChild, secondChild];
+  assert.ok(competed.some((result) =>
+    result.outcome === "LOCAL_STAGED_NOT_PUBLISHED"),
+  "at least one real competing process must complete the authenticated stage");
+  assert.ok(competed.every((result) => result.deniedWhileCompeting === true
+    || result.outcome === "LOCAL_STAGED_NOT_PUBLISHED"),
+  "the other process may only fail closed during concurrent WAL preflight");
+  if (competed.some((result) => result.deniedWhileCompeting === true)) {
+    // Once the writer has quiesced the losing process must be able to
+    // independently revalidate the signed staged record. Never classify a
+    // permanently inaccessible/corrupted SQLite as a harmless race.
+    const sequential = await forkOnce();
+    assert.equal(sequential.outcome, "LOCAL_STAGED_NOT_PUBLISHED");
+  }
   const checkedMulti = new Stage(multiprocessDb, { ...stageOptions,
     bootstrapNew: false });
   assert.deepEqual({ count: (await checkedMulti.audit()).count,
