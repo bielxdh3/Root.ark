@@ -13,6 +13,7 @@ const { createAuthenticate } = require("../src/middlewares/auth");
 const { createRequirePermission } = require("../src/middlewares/permissions");
 const z = require("../src/crypto/rootark-zk-1");
 const v2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
+const targetPop = require("../src/crypto/rootark-zk-recovery-authorization");
 const fixtures = require("./support/issue-65-recovery-v2-fixtures");
 const normal = require("../public/client/rootark-zk1-normal-browser-content");
 const portable = require("../public/client/rootark-zk1-portable-file-recovery");
@@ -43,6 +44,7 @@ const scriptNames = ["rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-r
   "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow",
   "rootark-zk1-legacy-batch-migration",
   "rootark-zk1-v2-device-approval", "rootark-zk1-keyring-portable-archive",
+  "rootark-zk1-v2-browser-pop", "rootark-zk1-v2-committed-approval",
   "rootark-zk1-account-portable-recovery"];
 
 test("production static paths cannot disclose the opt-in normal browser laboratory", async (t) => {
@@ -896,6 +898,30 @@ test("Edge normal authenticated V2 workspace refuses a real legacy V1 server cap
   }
   const f = await setup(t);
   const opts = await f.options();
+  const hpke = await z.hpkeSuite().kem.generateKeyPair();
+  const hpkeRaw = Buffer.from(await z.hpkeSuite().kem.serializePublicKey(hpke.publicKey));
+  const hpkePrivateRaw = Buffer.from(await z.hpkeSuite().kem.serializePrivateKey(hpke.privateKey));
+  const popSigner = crypto.generateKeyPairSync("ed25519");
+  const popAuthId = crypto.randomBytes(16);
+  const popHpkeId = crypto.randomBytes(16);
+  const browserRequest = { schema: "rootark-zk1-device-enrollment-request/v1",
+    device_id: "fresh-edge-browser-v2", authorization_key_id: b64(popAuthId),
+    authorization_public_key: b64(popSigner.publicKey.export({
+      format: "der", type: "spki" }).subarray(-32)),
+    hpke_key_id: b64(popHpkeId), hpke_public_key: b64(hpkeRaw),
+    challenge: b64(crypto.randomBytes(32)),
+    approval: "OWNER_MUST_VERIFY_IDENTITY_AND_FINISH_V2_POP_AND_SIGN_CURRENT_GRANT" };
+  const popNow = Math.floor(Date.now() / 1000);
+  const ownerChallenge = await targetPop.createTargetPopChallenge({
+    scope: f.state.scope, operationId: crypto.randomBytes(16),
+    targetDeviceId: browserRequest.device_id, hpkeKeyId: popHpkeId,
+    hpkePublicKey: hpkeRaw, authorizationKeyId: popAuthId,
+    authorizationPublicKey: Buffer.from(browserRequest.authorization_public_key, "base64url"),
+    issuedAt: popNow, expiresAt: popNow + 300 });
+  const challengeWire = { schema: "rootark-zk1-v2-browser-pop-challenge/v1",
+    challenge_context: Object.fromEntries(Object.entries(ownerChallenge.challengeContext)
+      .map(([name, value]) => [name, Buffer.isBuffer(value) ? b64(value) : value])),
+    enc: b64(ownerChallenge.enc), ciphertext: b64(ownerChallenge.ciphertext) };
   const secret = crypto.randomBytes(32).toString("hex");
   const ownerPrivate = await crypto.webcrypto.subtle.importKey("pkcs8",
     f.ownerPrivate.export({ type: "pkcs8", format: "der" }),
@@ -978,11 +1004,18 @@ test("Edge normal authenticated V2 workspace refuses a real legacy V1 server cap
     .set("Content-Security-Policy", "default-src 'self'; script-src 'self'; connect-src 'self'")
     .send('<!doctype html><html><head><meta charset="utf-8">'
       + '<script defer src="/client/rootark-api.js"></script>'
+      + '<script defer src="/client/rootark-zk1-v2-browser-pop.js"></script>'
       + '<script defer src="/client/rootark-zk1-authenticated-workspace.js"></script>'
       + '<script defer src="/workspace-probe.js"></script></head><body>'
       + '<section class="protected-client-panel"><p id="protectedClientStatus"></p></section>'
       + '</body></html>'));
   const values = { ownerRaw: b64(f.ownerRaw), ownerHash: b64(opts.pinnedOwnerKeyHash),
+    browserPoP: { request: browserRequest, challenge: challengeWire,
+      hpkePrivateDer: b64(Buffer.concat([
+        Buffer.from("302e020100300506032b656e04220420", "hex"),
+        Buffer.from(hpkePrivateRaw)])),
+      authorizationPrivateDer: b64(popSigner.privateKey.export({
+        format: "der", type: "pkcs8" })), nowSeconds: popNow },
     ownerSpkiHash: b64(crypto.createHash("sha256").update(Buffer.concat([
       Buffer.from("302a300506032b6570032100", "hex"), f.ownerRaw])).digest()),
     deviceRaw: b64(f.device.authorization_public_key), privateDer: b64(f.privateDer),
@@ -1015,6 +1048,14 @@ test("Edge normal authenticated V2 workspace refuses a real legacy V1 server cap
         // exercise protected PUT/GET and CSP under authenticated HTTP.
         const capability=await fetch("/zk-1/v1/workspace-capability",{
           credentials:"include"}).then(res=>res.json());
+        // A V1 server MUST NOT enable the V2 workspace. However, the real
+        // browser's standalone HPKE/Ed25519 device PoP remains independently
+        // testable without granting any V2 HTTP write or restore privilege.
+        window.edgeV2Pop=await window.RootarkZk1V2BrowserPop.respond({
+          request: values.browserPoP.request,challenge: values.browserPoP.challenge,
+          deviceHpkePrivateDer: decode(values.browserPoP.hpkePrivateDer),
+          deviceAuthorizationPrivateDer: decode(values.browserPoP.authorizationPrivateDer),
+          nowSeconds: values.browserPoP.nowSeconds });
         if(capability.securityVersion===1 && capability.signedHistoryRequired===false){
           window.dispatchEvent(new Event("rootark:workspace-rendered"));
           await new Promise(resolve=>setTimeout(resolve,250));
@@ -1505,8 +1546,24 @@ test("Edge normal authenticated V2 workspace refuses a real legacy V1 server cap
       return typeof value === "string" && value.startsWith("EDGE_AUTH_WORKSPACE_") ? value : null;
     });
     assert.equal(observed, "EDGE_AUTH_WORKSPACE_PASS");
+    const edgeProof = await send("Runtime.evaluate", {
+      expression: "window.edgeV2Pop || null", returnByValue: true,
+    });
+    const signedPoP = edgeProof.result?.value;
+    assert.equal(signedPoP?.schema, "rootark-zk1-v2-browser-pop-response/v1");
+    const verifiedPoP = await targetPop.verifyTargetPopResponse({
+      challenge: ownerChallenge,
+      challengeContext: ownerChallenge.challengeContext,
+      response: { challenge_context: ownerChallenge.challengeContext,
+        challenge: Buffer.from(signedPoP.challenge, "base64url"),
+        target_signature: Buffer.from(signedPoP.target_signature, "base64url") },
+      expectedScope: f.state.scope,
+      expectedDeviceKeyDigest: ownerChallenge.challengeContext.target_device_key_digest,
+      now: popNow + 30,
+    });
+    assert.equal(await targetPop.isVerifiedTargetPopResponse(verifiedPoP, popNow + 30), true);
     assert.equal(protectedPuts, 0,
-      "a V1 backend cannot be tricked into receiving V2 browser PUTs");
+      "V1 backend cannot be tricked into receiving V2 PUTs, even when independent browser PoP succeeds");
     assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 0);
   } finally {
     socket?.close();

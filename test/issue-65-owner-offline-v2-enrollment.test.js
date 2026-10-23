@@ -9,6 +9,8 @@ const verify = require("../src/crypto/rootark-zk-recovery-history-v2");
 const enrollment = require("../src/crypto/rootark-zk1-owner-offline-v2-enrollment");
 const commitment = require("../src/crypto/rootark-zk1-offline-commitment-receipt");
 const approval = require("../public/client/rootark-zk1-v2-device-approval");
+const browserPop = require("../public/client/rootark-zk1-v2-browser-pop");
+const committedApproval = require("../public/client/rootark-zk1-v2-committed-approval");
 const normal = require("../public/client/rootark-zk1-normal-browser-content");
 const fixtures = require("./support/issue-65-recovery-v2-fixtures");
 
@@ -78,15 +80,31 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     independentCommitmentSignerSpkiSha256: witnessSpki,
     trustedPriorCommitment: priorCommitment, nowSeconds: now,
   });
-  const answer = await enrollment.answerTargetPop({
-    request: fresh.request, challenge: prepared.challenge,
+  const exportedChallenge = enrollment.exportBrowserChallenge(prepared);
+  for (const [label, changes] of [
+    ["wrong HPKE recipient", { deviceHpkePrivateDer: Buffer.concat([
+      Buffer.from("302e020100300506032b656e04220420", "hex"), crypto.randomBytes(32)]) }],
+    ["wrong signing key", { deviceAuthorizationPrivateDer: crypto.generateKeyPairSync("ed25519")
+      .privateKey.export({ format: "der", type: "pkcs8" }) }],
+    ["forged request target", { request: { ...fresh.request,
+      hpke_public_key: b64(crypto.randomBytes(32)) } }],
+    ["modified signed challenge", { challenge: { ...exportedChallenge,
+      ciphertext: b64(crypto.randomBytes(48)) } }],
+  ]) await assert.rejects(browserPop.respond({
+    request: fresh.request, challenge: exportedChallenge,
+    deviceHpkePrivateDer: fresh.hpkePrivateDer,
+    deviceAuthorizationPrivateDer: fresh.signer.privateKey.export({
+      format: "der", type: "pkcs8" }), nowSeconds: now, ...changes,
+  }), /ZK_V2_BROWSER_POP_DENIED/, label);
+  const answer = await browserPop.respond({
+    request: fresh.request, challenge: exportedChallenge,
     deviceHpkePrivateDer: fresh.hpkePrivateDer,
     deviceAuthorizationPrivateDer: fresh.signer.privateKey.export({
       format: "der", type: "pkcs8" }), nowSeconds: now,
   });
   const actor = state.actors.get(Buffer.from(former.devices[0].authorization_key_id)
     .toString("hex"));
-  const candidate = await enrollment.stageV2Enrollment({
+  const candidate = await enrollment.stageBrowserPopResponse({
     prepared, response: answer, trustedActorPrivateKey: actor, nowSeconds: now + 5,
   });
   assert.equal(candidate.manifest.operation.operation_type, "enroll-device");
@@ -204,6 +222,42 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
   const report = await approval.verifyImportedApproval(credentials);
   assert.equal(report.verifiedOwnerOfflineApproval, true);
   assert.equal(report.v2TransitionProvenByBrowser, false);
+  const witnessPublicKey = await subtle.importKey("raw", pub(witness.publicKey),
+    "Ed25519", true, ["verify"]);
+  const linked = {
+    ...credentials,
+    committedReceipt: signedCommittedHead,
+    previousReceipt: priorCommitment,
+    signedV2Manifest: issued.signedV2Manifest,
+    witnessPublicKey,
+    independentWitnessSpkiSha256: Buffer.from(witnessSpki, "base64url"),
+    independentlyPinnedPreviousReceiptSha256: receiptHash(priorCommitment),
+  };
+  const liveProof = await committedApproval.verifyCommittedApproval(linked);
+  assert.equal(liveProof.committedOwnerApprovalVerified, true);
+  assert.equal(liveProof.previousReceiptHashPinned, true);
+  assert.equal(liveProof.committedV2ManifestDigestMatched, true);
+  assert.equal(liveProof.publicV2HistoryVerifiedByBrowser, false);
+  assert.equal(liveProof.authorizesProductionIo, false);
+  for (const [label, override] of [
+    ["forged witness", { witnessPublicKey: await subtle.importKey("raw",
+      pub(crypto.generateKeyPairSync("ed25519").publicKey), "Ed25519", true, ["verify"]) }],
+    ["wrong witness SPKI pin", { independentWitnessSpkiSha256: crypto.randomBytes(32) }],
+    ["self-pinned previous receipt", { independentlyPinnedPreviousReceiptSha256: crypto.randomBytes(32) }],
+    ["fork witness head", { committedReceipt: { ...signedCommittedHead,
+      digest: b64(crypto.randomBytes(32)) } }],
+    ["replayed operation", { committedReceipt: { ...signedCommittedHead,
+      operation_id: b64(crypto.randomBytes(16)) } }],
+    ["revoked device", { signedDeviceGrant: { ...issued.signedDeviceGrant,
+      revoked_at_epoch: committed.epoch } }],
+    ["unrelated HPKE target", { request: { ...fresh.request,
+      hpke_public_key: b64(crypto.randomBytes(32)) } }],
+    ["unsigned witness", { committedReceipt: { ...signedCommittedHead,
+      signature: b64(crypto.randomBytes(64)) } }],
+    ["altered signed V2 bytes", { signedV2Manifest: b64(crypto.randomBytes(256)) }],
+  ]) await assert.rejects(committedApproval.verifyCommittedApproval({
+    ...linked, ...override,
+  }), /ZK_V2_COMMITTED_APPROVAL_DENIED/, label);
   const active = await normal.verifyOwnerGrant({
     ownerPublicKey: ownerPublic, pinnedOwnerKeyHash: credentials.pinnedOwnerKeyHash,
     pinnedCurrentHead: credentials.pinnedCurrentHead,

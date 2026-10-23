@@ -17,7 +17,8 @@
     "rootark-zk1-recoverable-workspace",
     "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow",
     "rootark-zk1-legacy-batch-migration",
-    "rootark-zk1-v2-device-approval",
+    "rootark-zk1-v2-device-approval", "rootark-zk1-v2-browser-pop",
+    "rootark-zk1-v2-committed-approval",
     "rootark-zk1-keyring-portable-archive",
     "rootark-zk1-account-portable-recovery",
   ];
@@ -33,6 +34,9 @@
   // another tab which do not dispatch this window's logout event.
   let sessionEpoch = 0;
   const activeDownloadUrls = new Set();
+  // Session-local branded approval only: logout/close erases it and a new
+  // browser profile must import independently anchored evidence again.
+  let committedDeviceApproval = null;
 
   function fail() { throw new Error("ZK_WORKSPACE_INPUT_DENIED"); }
   function supportsOwnerRootedV2(value) {
@@ -400,6 +404,8 @@
         || !window.RootarkZk1LegacyMigrationWorkflow?.openMigrationJournal
         || !window.RootarkZk1LegacyBatchMigration?.runLegacyMigrationBatch
         || !window.RootarkZk1V2DeviceApproval?.verifyImportedApproval
+        || !window.RootarkZk1V2BrowserPop?.respond
+        || !window.RootarkZk1V2CommittedApproval?.verifyCommittedApproval
         || !window.RootarkZk1KeyringPortableArchive?.createArchive
         || !window.RootarkZk1KeyringPortableArchive?.recoverArchive) fail();
       if (!window.RootarkZk1AccountPortableRecovery?.createArchive
@@ -432,7 +438,12 @@
       + '<label>Chave pública do dispositivo (Ed25519 raw)<input type="file" data-zk1-field="device" required></label>'
       + '<label>Chave privada do dispositivo (PKCS#8, local)<input type="file" data-zk1-field="private" required></label>'
       + '<label>Pedido original emitido no dispositivo novo (.json)<input type="file" data-zk1-field="new-request" accept=".json,application/json"></label>'
-      + '<label>Autorização offline Ed25519 assinada pelo proprietário (.json)<input type="file" data-zk1-field="new-approval" accept=".json,application/json"></label>'
+      + '<label>Desafio HPKE emitido pelo proprietário (.json; para provar posse)<input type="file" data-zk1-field="pop-challenge" accept=".json,application/json"></label>'
+      + '<label>Chave privada X25519 do dispositivo novo (PKCS#8, local)<input type="file" data-zk1-field="hpke-private"></label>'
+      + '<label>Pacote assinado pelo proprietário APÓS confirmação do witness (JSON: request,approval,grant,recibos)<input type="file" data-zk1-field="new-approval" accept=".json,application/json"></label>'
+      + '<label>Chave pública Ed25519 do witness independente (raw, 32 bytes)<input type="file" data-zk1-field="witness-key"></label>'
+      + '<label>SHA-256 SPKI do witness fixado por canal externo<input data-zk1-field="witness-spki" maxlength="43" spellcheck="false"></label>'
+      + '<label>SHA-256 do recibo ANTERIOR do witness fixado fora do pacote<input data-zk1-field="witness-prior" maxlength="43" spellcheck="false"></label>'
       + '<label>Arquivo descartável (até 2 MiB)<input type="file" data-zk1-field="file" required></label>'
       + '<label>Segredo de recuperação separado (arquivo binário de 32 bytes)<input type="file" data-zk1-field="secret"></label>'
       + '<label>Pacote cifrado exportado (.json, sem segredo)<input type="file" data-zk1-field="bundle" accept=".json,application/json"></label>'
@@ -444,7 +455,8 @@
       + '<button type="button" class="button button-quiet" data-zk1-action="verify-inventory">Verificar checkpoint owner-signed</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="new-secret">Gerar segredo de 256 bits</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="new-device">Solicitar novo dispositivo ao proprietário</button>'
-      + '<button type="button" class="button button-quiet" data-zk1-action="import-approval">Verificar aprovação offline do novo dispositivo</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="answer-pop">Responder desafio HPKE com as duas chaves locais</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="import-approval">Verificar compromisso witness + aprovação V2</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="upload">Cifrar, enviar e conferir GET</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="upload-recoverable">Enviar e exportar pacote recuperável</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="restore">Recuperar arquivo do novo dispositivo</button></div>'
@@ -520,13 +532,14 @@
   async function perform(action) {
     if (busy) return;
     if (action === "close") {
+      committedDeviceApproval = null;
       dialog.close();
       dialog.querySelector("form").reset();
       status("Nenhuma autoridade foi importada.");
       return;
     }
     if (!["provision", "verify-inventory", "upload", "upload-recoverable",
-      "restore", "new-secret", "new-device", "import-approval",
+      "restore", "new-secret", "new-device", "answer-pop", "import-approval",
       "migrate", "migration-finalize", "migration-batch", "archive-create", "archive-recover",
       "account-create", "account-recover"].includes(action)) return;
     busy = true;
@@ -605,6 +618,24 @@
         downloadLocal("rootark-owner-enrollment-request.json", JSON.stringify(request), "application/json", assertLive);
         raw.fill(0);
         status("Chaves Ed25519 e X25519 exportadas localmente. Solicitação NÃO é um grant: proprietário deve confirmar identidade, completar PoP V2, assinar a transição e conceder grant atual fora do servidor.");
+        return;
+      }
+      if (action === "answer-pop") {
+        const request = JSON.parse(decoder.decode(await fileBytes("new-request", 1, 8192)));
+        const challenge = JSON.parse(decoder.decode(await fileBytes("pop-challenge", 1, 8192)));
+        privateDer = await fileBytes("private", 1, 8192);
+        const hpkeDer = await fileBytes("hpke-private", 1, 8192);
+        try {
+          const response = await window.RootarkZk1V2BrowserPop.respond({
+            request, challenge, deviceHpkePrivateDer: hpkeDer,
+            deviceAuthorizationPrivateDer: privateDer,
+            nowSeconds: Math.floor(Date.now() / 1000),
+          });
+          assertLive();
+          downloadLocal("rootark-v2-device-pop-response.json",
+            JSON.stringify(response), "application/json", assertLive);
+          status("PoP X25519 + Ed25519 assinado localmente. O proprietário ainda DEVE verificar o desafio original, obter V2 assinado e recibo independente do witness; resposta NÃO é aprovação.");
+        } finally { hpkeDer.fill(0); }
         return;
       }
       const trust = await grantAndOwner();
@@ -788,10 +819,14 @@
         return;
       }
       if (action === "import-approval") {
+        committedDeviceApproval = null;
         // Never infer owner approval from an unsigned request or server data:
         // current head, owner SPKI/raw pins and grant all arrive independently.
-        const request = JSON.parse(decoder.decode(await fileBytes("new-request", 1, 8192)));
-        const approval = JSON.parse(decoder.decode(await fileBytes("new-approval", 1, 8192)));
+        const delivery = JSON.parse(decoder.decode(await fileBytes("new-approval", 1, 400000)));
+        if (!delivery || delivery.schema !== "rootark-zk1-v2-owner-browser-delivery/v1"
+          || Object.keys(delivery).sort().join(",")
+            !== "approval,committedReceipt,previousReceipt,request,schema,signedDeviceGrant,signedV2Manifest"
+          || JSON.stringify(delivery.signedDeviceGrant) !== JSON.stringify(trust.signedDeviceGrant)) fail();
         const publicRaw = await fileBytes("device", 32, 32);
         const devicePublicKey = await crypto.subtle.importKey("raw", publicRaw,
           "Ed25519", true, ["verify"]);
@@ -799,19 +834,33 @@
         privateDer = await fileBytes("private", 1, 8192);
         const devicePrivateKey = await crypto.subtle.importKey("pkcs8", privateDer,
           "Ed25519", false, ["sign"]);
-        const result = await window.RootarkZk1V2DeviceApproval.verifyImportedApproval({
-          request, approval, signedDeviceGrant: trust.signedDeviceGrant,
+        const witnessRaw = await fileBytes("witness-key", 32, 32);
+        const witnessPublicKey = await crypto.subtle.importKey("raw", witnessRaw,
+          "Ed25519", true, ["verify"]);
+        witnessRaw.fill(0);
+        const original = {
+          request: delivery.request, approval: delivery.approval,
+          signedDeviceGrant: trust.signedDeviceGrant,
           ownerPublicKey: trust.ownerPublicKey,
           independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
           pinnedOwnerKeyHash: trust.pinnedOwnerKeyHash,
           pinnedCurrentHead: trust.pinnedCurrentHead,
           devicePublicKey, devicePrivateKey, nowSeconds: Math.floor(Date.now() / 1000),
-        });
+          committedReceipt: delivery.committedReceipt, previousReceipt: delivery.previousReceipt,
+          witnessPublicKey,
+          independentWitnessSpkiSha256: from64(field("witness-spki").value.trim()),
+          independentlyPinnedPreviousReceiptSha256: from64(field("witness-prior").value.trim()),
+          signedV2Manifest: delivery.signedV2Manifest,
+        };
+        const result = await window.RootarkZk1V2CommittedApproval.verifyCommittedApproval(original);
         assertLive();
-        if (result.verifiedOwnerOfflineApproval !== true
+        if (result.committedOwnerApprovalVerified !== true
+          || result.signedWitnessReceiptVerified !== true
+          || result.previousReceiptHashPinned !== true
+          || result.committedV2ManifestDigestMatched !== true
           || result.authorizesProductionIo !== false) fail();
-        // The independent pinning step stays explicit and separate.
-        status("Aprovação offline vinculada ao pedido, à chave nova, ao grant e ao head atual. Provisione o piso offline para este perfil; o V2/CAS deve ser conferido externamente.");
+        committedDeviceApproval = { proof: result, original, sessionEpoch };
+        status("Prova V2/witness e grant vinculados ao pedido, chave nova e head atual. Provisione o piso offline antes do GET. Histórico completo V2 continua exigido pelo servidor.");
         return;
       }
       if (action === "provision") {
@@ -873,6 +922,13 @@
               + ". Relatório baixado; cada falha exige revisão manual. Originais mantidos, sem exclusão/cutover e sem prova de durabilidade externa.");
           } finally { journal.close(); }
         } else if (action === "restore") {
+          if (!committedDeviceApproval || committedDeviceApproval.sessionEpoch !== sessionEpoch) fail();
+          await window.RootarkZk1V2CommittedApproval.assertForRestore({
+            proof: committedDeviceApproval.proof,
+            original: committedDeviceApproval.original,
+            trust, devicePublicKey,
+          });
+          assertLive();
           secret = await fileBytes("secret", 32, 32);
           const bundle = JSON.parse(decoder.decode(await fileBytes("bundle", 1, 6 * 1024 * 1024)));
           const checkpoint = await optionalJson("owner-root");
@@ -982,7 +1038,7 @@
         }
       }
       // The original File/Blob remains held by the input until explicitly reset.
-      for (const name of ["private", "file", "secret", "bundle", "migration-cek", "migration-proof",
+      for (const name of ["private", "hpke-private", "pop-challenge", "new-approval", "file", "secret", "bundle", "migration-cek", "migration-proof",
         "migration-batch-descriptors", "migration-batch-ceks", "migration-batch-secret",
         "archive-files", "archive-owner-private", "archive-json",
         "account-descriptors", "account-holder-files", "account-local-files",
@@ -1027,6 +1083,7 @@
     sessionEpoch++;
     for (const url of activeDownloadUrls) URL.revokeObjectURL(url);
     activeDownloadUrls.clear();
+    committedDeviceApproval = null;
     capability = false;
     if (dialog?.open) dialog.close();
     dialog?.querySelector("form")?.reset();

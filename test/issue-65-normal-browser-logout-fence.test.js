@@ -73,6 +73,15 @@ async function harness() {
       },
     },
     RootarkZk1V2DeviceApproval: { verifyImportedApproval: async () => ({}) },
+    RootarkZk1V2BrowserPop: { respond: async () => ({}) },
+    RootarkZk1V2CommittedApproval: {
+      verifyCommittedApproval: async () => ({
+        committedOwnerApprovalVerified: true, signedWitnessReceiptVerified: true,
+        previousReceiptHashPinned: true, committedV2ManifestDigestMatched: true,
+        authorizesProductionIo: false,
+      }),
+      assertForRestore: async () => true,
+    },
     RootarkZk1KeyringPortableArchive: {
       createArchive: async () => ({}),
       recoverArchive: () => {
@@ -162,9 +171,10 @@ async function harness() {
   };
   const value = (name, data) => { field(name).value = String(data); };
   file("owner", ownerRaw);
-  file("grant", JSON.stringify({ revoked_at_epoch: null,
+  const grantWire = { revoked_at_epoch: null,
     account_id: encode(crypto.randomBytes(16)), compartment_id: encode(Buffer.from("scope")),
-    keyring_id: encode(crypto.randomBytes(16)) }));
+    keyring_id: encode(crypto.randomBytes(16)) };
+  file("grant", JSON.stringify(grantWire));
   file("history", JSON.stringify({ sequence: 1, signer_key_id: encode(crypto.randomBytes(16)) }));
   file("device", device.publicKey.export({ type: "spki", format: "der" }).subarray(-32));
   file("private", device.privateKey.export({ type: "pkcs8", format: "der" }));
@@ -173,6 +183,13 @@ async function harness() {
   file("owner-root", "{}");
   file("archive-json", "{}");
   file("account-owner-private", owner.privateKey.export({ type: "pkcs8", format: "der" }));
+  file("witness-key", crypto.randomBytes(32));
+  // This test harness isolates logout behavior, not cryptographic validity.
+  file("new-approval", JSON.stringify({
+    schema: "rootark-zk1-v2-owner-browser-delivery/v1",
+    request: {}, approval: {}, signedDeviceGrant: grantWire,
+    committedReceipt: {}, previousReceipt: {}, signedV2Manifest: "signed-fixture",
+  }));
   value("owner-hash", encode(crypto.createHash("sha256").update(ownerRaw).digest()));
   value("owner-spki", encode(crypto.createHash("sha256")
     .update(owner.publicKey.export({ type: "spki", format: "der" })).digest()));
@@ -183,6 +200,8 @@ async function harness() {
   value("archive-sha", encode(crypto.randomBytes(32)));
   value("owner-signer", encode(crypto.randomBytes(16)));
   value("owner-device", "fixture-owner");
+  value("witness-spki", encode(crypto.randomBytes(32)));
+  value("witness-prior", encode(crypto.randomBytes(32)));
   field("archive-opt-in").checked = true;
   field("migration-batch-opt-in").checked = true;
   field("account-opt-in").checked = true;
@@ -193,6 +212,14 @@ async function harness() {
     click(action) { dialog.events.click({
       target: { closest: () => ({ dataset: { zk1Action: action } }) },
     }); },
+    async authorizeRestore() {
+      this.click("import-approval");
+      await tickUntil(() => field("status").textContent.includes("Prova V2/witness"));
+      // The UI clears imported private-key files between ceremonies.
+      file("private", device.privateKey.export({ type: "pkcs8", format: "der" }));
+      file("secret", crypto.randomBytes(32));
+      file("bundle", JSON.stringify({ metadata: {} }));
+    },
     logout() { listeners.get("rootark:logout")(); },
     restoreCalls() { return restoreCount; },
     waitForRestore: () => tickUntil(() => Boolean(finishRestore)),
@@ -218,6 +245,7 @@ async function harness() {
 
 test("logout while signed restore is awaiting plaintext denies download and wipes output", async () => {
   const page = await harness();
+  await page.authorizeRestore();
   page.click("restore");
   await page.waitForRestore();
   page.logout();
@@ -229,8 +257,17 @@ test("logout while signed restore is awaiting plaintext denies download and wipe
   assert.deepEqual([...data], [0, 0, 0]);
 });
 
+test("restoration without a separately witnessed and branded new-device approval never starts protected GET", async () => {
+  const page = await harness();
+  page.click("restore");
+  await page.denied();
+  assert.equal(page.restoreCalls(), 0);
+  assert.equal(page.downloads.length, 0);
+});
+
 test("session change in another tab blocks resumed plaintext download", async () => {
   const page = await harness();
+  await page.authorizeRestore();
   page.click("restore");
   await page.waitForRestore();
   page.document.cookie = "rootark_csrf=second-user";

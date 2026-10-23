@@ -160,6 +160,37 @@ async function answerTargetPop({ request, challenge, deviceHpkePrivateDer,
   } catch (_) { deny(); }
   finally { hpkeRaw?.fill(0); }
 }
+// Transfer only the encrypted one-time PoP challenge to the fresh browser.
+// The original live WeakMap challenge MUST remain on the trusted owner host:
+// a JSON clone returned by a browser is never a valid replacement.
+function exportBrowserChallenge(prepared) {
+  const state = sessions.get(prepared);
+  if (!state || state.completed) deny();
+  const context = state.challenge.challengeContext;
+  const enc = (value) => Buffer.from(value).toString("base64url");
+  return {
+    schema: "rootark-zk1-v2-browser-pop-challenge/v1",
+    challenge_context: Object.fromEntries(Object.entries(context).map(([key, value]) =>
+      [key, Buffer.isBuffer(value) || value instanceof Uint8Array ? enc(value) : value])),
+    enc: enc(state.challenge.enc), ciphertext: enc(state.challenge.ciphertext),
+  };
+}
+async function stageBrowserPopResponse({ prepared, response, trustedActorPrivateKey, nowSeconds }) {
+  try {
+    const state = sessions.get(prepared);
+    if (!state || state.completed) deny();
+    exact(response, ["schema", "challenge_context", "challenge", "target_signature"]);
+    if (response.schema !== "rootark-zk1-v2-browser-pop-response/v1") deny();
+    const expected = exportBrowserChallenge(prepared).challenge_context;
+    if (JSON.stringify(response.challenge_context) !== JSON.stringify(expected)) deny();
+    return await stageV2Enrollment({
+      prepared, trustedActorPrivateKey, nowSeconds,
+      response: { challenge_context: state.challenge.challengeContext,
+        challenge: b64(response.challenge, 32),
+        target_signature: b64(response.target_signature, 64) },
+    });
+  } catch (_) { deny(); }
+}
 async function stageV2Enrollment({ prepared, response, trustedActorPrivateKey,
   nowSeconds }) {
   try {
@@ -297,8 +328,18 @@ async function ownerApproveCommittedEnrollment({ candidate, signedCommittedHead,
       issuedAt: now, expiresAt: now + 300,
     });
     usedOperations.add(state.operationId.toString("hex"));
+    const signedV2Manifest = Buffer.from(await z.encodeDeterministic(current)).toString("base64url");
     return Object.freeze({ approval, signedDeviceGrant: grant,
-      signedV2Manifest: Buffer.from(await z.encodeDeterministic(current)).toString("base64url"),
+      signedV2Manifest,
+      // Browser transport only; its witness pubkey / SPKI and predecessor
+      // commitment hash MUST still be provisioned over an independent channel.
+      browserDelivery: Object.freeze({
+        schema: "rootark-zk1-v2-owner-browser-delivery/v1",
+        request: candidate.request, approval, signedDeviceGrant: grant,
+        signedV2Manifest,
+        committedReceipt: JSON.parse(JSON.stringify(signedCommittedHead)),
+        previousReceipt: JSON.parse(JSON.stringify(state.trustedPriorCommitment)),
+      }),
       signedCommitmentVerified: commitmentProof.signedReceiptVerified,
       commitmentSignerSpkiMatchedSuppliedPin: true,
       independentPinOriginProven: false,
@@ -306,5 +347,5 @@ async function ownerApproveCommittedEnrollment({ candidate, signedCommittedHead,
       noServerSecretExposure: true });
   } catch (_) { deny(); }
 }
-module.exports = { beginOwnerEnrollment, answerTargetPop, stageV2Enrollment,
-  ownerApproveCommittedEnrollment };
+module.exports = { beginOwnerEnrollment, answerTargetPop, exportBrowserChallenge,
+  stageBrowserPopResponse, stageV2Enrollment, ownerApproveCommittedEnrollment };
