@@ -9,6 +9,7 @@ const api = require("../public/client/rootark-zk1-account-portable-recovery");
 const keyringApi = require("../public/client/rootark-zk1-keyring-portable-archive");
 const portable = require("../public/client/rootark-zk1-portable-file-recovery");
 const ownerHistory = require("../public/client/rootark-zk1-owner-signed-checkpoint");
+const ownerRoots = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
 
 const b64 = (raw) => Buffer.from(raw).toString("base64url");
 const random = (n) => crypto.randomBytes(n);
@@ -269,6 +270,75 @@ test("coordinator zeroizes earlier plaintext when a later keyring fails", async 
   }
   assert.equal(calls, 2);
   assert.deepEqual(Array.from(firstPlaintext), [0, 0, 0, 0]);
+});
+
+test("account coordinator preserves atomic multi-keyring restore when one archived keyring advances to signed newer head", async () => {
+  const f = await fixture(2);
+  const sealed = await api.createArchive(f.create);
+  const accountRestore = f.recovery(sealed);
+  const archived = sealed.archive.keyrings[1].archive;
+  const old = f.keyringOptions[1];
+  const oldRecovery = f.recoverOptions[1];
+  const context = { format: archived.format, scope: archived.scope,
+    ownerRevision: archived.ownerRevision, ownerDigest: archived.ownerDigest,
+    ownerEpoch: archived.ownerEpoch, archiveId: archived.archiveId };
+  const subtle = crypto.webcrypto.subtle;
+  const base = await subtle.importKey("raw", old.recoverySecret, "HKDF", false,
+    ["deriveKey"]);
+  const info = Buffer.concat([Buffer.from("Root.ark/zk-1/keyring-archive-key/v1\0"),
+    Buffer.from(JSON.stringify(context))]);
+  const wrapped = await subtle.deriveKey({ name: "HKDF", hash: "SHA-256",
+    salt: Buffer.from(archived.salt, "base64url"), info }, base,
+  { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+  const bytes = Buffer.from(await subtle.decrypt({ name: "AES-GCM",
+    iv: Buffer.from(archived.nonce, "base64url"),
+    additionalData: Buffer.from(JSON.stringify(context)), tagLength: 128 },
+  wrapped, Buffer.from(archived.ciphertextBase64, "base64url")));
+  const entries = JSON.parse(bytes.toString("utf8")).entries;
+  bytes.fill(0);
+  const prior = await ownerHistory.verifyOwnerCheckpoint({
+    checkpoint: old.ownerHistoryCheckpoint, scope: old.scope,
+    signerPublicKey: old.ownerPublicKey, signerKeyId: old.signerKeyId, previous: null });
+  const currentHead = { revision: old.pinnedCurrentHead.revision + 1,
+    digest: random(32), epoch: old.pinnedCurrentHead.epoch + 1 };
+  const newest = await ownerHistory.signOwnerCheckpoint({ scope: old.scope,
+    signerKey: old.ownerSigningKey, signerPublicKey: old.ownerPublicKey,
+    signerKeyId: old.signerKeyId, deviceId: old.deviceId,
+    revision: currentHead.revision, manifestDigest: currentHead.digest,
+    issuedAt: 1800, previous: prior });
+  const currentUnsignedGrant = { ...old.signedDeviceGrant,
+    manifest_revision: currentHead.revision,
+    manifest_digest: b64(currentHead.digest), current_epoch: currentHead.epoch };
+  delete currentUnsignedGrant.signature;
+  const grantMessage = Buffer.concat([grantDomain, Buffer.from(JSON.stringify(
+    Object.fromEntries(grantFields.map((field) => [field, currentUnsignedGrant[field]]))))]);
+  const currentSignedDeviceGrant = { ...currentUnsignedGrant,
+    signature: b64(crypto.sign(null, grantMessage, f.keys.privateKey)) };
+  const currentOwnerRootCheckpoints = await Promise.all(entries.map(({ bundle }) =>
+    ownerRoots.signOwnerCiphertextRootCheckpoint({ scope: old.scope,
+      signerKey: old.ownerSigningKey, signerKeyId: old.signerKeyId,
+      deviceId: old.deviceId, manifestRevision: currentHead.revision,
+      manifestDigest: currentHead.digest, manifestEpoch: currentHead.epoch,
+      objectId: bundle.metadata.object_id, objectRevision: bundle.objectRevision,
+      ciphertextEpoch: bundle.metadata.epoch,
+      ciphertextRoot: Buffer.from(bundle.ciphertextRoot, "base64url"), issuedAt: 1801 })));
+  const updatedSecond = { ...oldRecovery, pinnedCurrentHead: currentHead,
+    historicalRecovery: { signedOwnerHistoryChain: [old.ownerHistoryCheckpoint, newest],
+      currentSignedDeviceGrant, currentOwnerRootCheckpoints } };
+  await assert.rejects(api.recoverArchive({ ...accountRestore,
+    keyrings: [accountRestore.keyrings[0], { ...oldRecovery,
+      pinnedCurrentHead: currentHead }] }), failure,
+  "normal recovery still denies a changed head without explicit historical authority");
+  const restored = await api.recoverArchive({ ...accountRestore,
+    keyrings: [accountRestore.keyrings[0], updatedSecond] });
+  assert.equal(restored.keyrings.length, 2);
+  assert.equal(Buffer.from(restored.keyrings[1].files[0].data).toString(), "secret file 1");
+  for (const ring of restored.keyrings) for (const file of ring.files) file.data.fill(0);
+  await assert.rejects(api.recoverArchive({ ...accountRestore,
+    keyrings: [accountRestore.keyrings[0], { ...updatedSecond,
+      historicalRecovery: { ...updatedSecond.historicalRecovery,
+        currentSignedDeviceGrant: old.signedDeviceGrant } }] }), failure,
+  "old signed grant does not authorize the later head, even inside a valid account archive");
 });
 
 test("aggregate payload above 16 MiB is denied even when each keyring is individually valid", async () => {

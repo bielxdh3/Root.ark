@@ -3,15 +3,17 @@
     module.exports = factory(require("node:crypto").webcrypto,
       require("./rootark-zk1-portable-file-recovery"),
       require("./rootark-zk1-owner-ciphertext-root-checkpoint"),
-      require("./rootark-zk1-normal-browser-trust-floor"));
+      require("./rootark-zk1-normal-browser-trust-floor"),
+      require("./rootark-zk1-owner-signed-checkpoint"));
   } else {
     root.RootarkZk1KeyringPortableArchive = factory(root.crypto,
       root.RootarkZk1PortableFileRecovery,
       root.RootarkZk1OwnerCiphertextRootCheckpoint,
-      root.RootarkZk1NormalBrowserTrustFloor);
+      root.RootarkZk1NormalBrowserTrustFloor,
+      root.RootarkZk1OwnerSignedCheckpoint);
   }
 }(typeof globalThis === "object" ? globalThis : this,
-  function (webCrypto, portable, ownerRoots, trustFloor) {
+  function (webCrypto, portable, ownerRoots, trustFloor, ownerHistory) {
     "use strict";
 
     // Development-only offline keyring snapshot, not server recovery authority.
@@ -195,6 +197,91 @@
         if (entries[i - 1].bundle.metadata.object_id >= entries[i].bundle.metadata.object_id) deny();
       }
     }
+    function snapshotHistoricalRecovery(value) {
+      exact(value, ["signedOwnerHistoryChain", "currentSignedDeviceGrant",
+        "currentOwnerRootCheckpoints"]);
+      const chain = value.signedOwnerHistoryChain;
+      const roots = value.currentOwnerRootCheckpoints;
+      if (!Array.isArray(chain) || chain.length < 2 || chain.length > 64
+        || Reflect.ownKeys(chain).length !== chain.length + 1
+        || !Array.isArray(roots) || roots.length < 1 || roots.length > MAX_FILES
+        || Reflect.ownKeys(roots).length !== roots.length + 1) deny();
+      const copyArray = (list) => Array.from({ length: list.length }, (_, index) => {
+        const descriptor = Object.getOwnPropertyDescriptor(list, String(index));
+        if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
+        return detachedWire(descriptor.value);
+      });
+      return { chain: copyArray(chain), roots: copyArray(roots),
+        currentGrant: detachedWire(value.currentSignedDeviceGrant) };
+    }
+    function sameSignedWire(a, b) {
+      if (!a || !b || typeof b !== "object" || Array.isArray(b)) return false;
+      const names = Reflect.ownKeys(a);
+      return Reflect.ownKeys(b).length === names.length && names.every((name) => {
+        const descriptor = Object.getOwnPropertyDescriptor(b, name);
+        return descriptor && Object.hasOwn(descriptor, "value")
+          && descriptor.value === a[name];
+      });
+    }
+    async function verifyHistoricalRecovery({ historical, archive, payload, head,
+      expectedScope, ownerPublicKey, ownerSpkiPin, signerKeyId, deviceId }) {
+      if (!ownerHistory?.verifyOwnerCheckpoint
+        || head.revision < archive.ownerRevision || head.epoch < archive.ownerEpoch
+        || (head.revision === archive.ownerRevision && head.epoch === archive.ownerEpoch)
+        || historical.roots.length !== payload.entries.length) deny();
+      let previous = null;
+      let archivedPrevious = null;
+      let archivalMatched = false;
+      let newestPrevious = null;
+      for (let i = 0; i < historical.chain.length; i++) {
+        const checkpoint = historical.chain[i];
+        // The first checkpoint MUST be the signed genesis. A naked later
+        // sequence, claimed digest or self-reported predecessor is worthless.
+        if (i === 0 && checkpoint.sequence !== 1) deny();
+        const brand = await ownerHistory.verifyOwnerCheckpoint({ checkpoint,
+          scope: expectedScope, signerPublicKey: ownerPublicKey,
+          signerKeyId, previous });
+        if (brand.sequence !== i + 1 || checkpoint.device_id !== deviceId) deny();
+        if (sameSignedWire(checkpoint, payload.ownerHistoryCheckpoint)) {
+          if (archivalMatched || checkpoint.revision !== archive.ownerRevision
+            || checkpoint.manifest_digest !== archive.ownerDigest) deny();
+          archivedPrevious = previous;
+          archivalMatched = true;
+        }
+        if (i === historical.chain.length - 1) newestPrevious = previous;
+        previous = brand;
+      }
+      const newest = historical.chain[historical.chain.length - 1];
+      if (!archivalMatched || !newestPrevious
+        || newest.revision !== head.revision || newest.manifest_digest !== b64(head.digest)
+        || newest.device_id !== deviceId) deny();
+      // The archive's OLD grant is intentionally never used for present-day
+      // authorization. Only a newly signed ACTIVE grant matching the independently
+      // pinned CURRENT head can permit historical recovery.
+      await verifyAnchors({ outer: { ownerRevision: head.revision,
+        ownerDigest: b64(head.digest), ownerEpoch: head.epoch },
+      ownerPublicKey, independentOwnerSpkiSha256: ownerSpkiPin,
+      pinnedCurrentHead: head, signedDeviceGrant: historical.currentGrant,
+      ownerHistoryCheckpoint: newest, previousOwnerHistoryProof: newestPrevious });
+      await verifyEveryOwnerRoot(payload.entries, {
+        ownerPublicKey, signerKeyId, deviceId, expectedScope,
+        ownerHistoryCheckpoint: payload.ownerHistoryCheckpoint,
+        previousOwnerHistoryProof: archivedPrevious,
+        pinnedCurrentHead: { revision: archive.ownerRevision,
+          digest: from64(archive.ownerDigest, 32), epoch: archive.ownerEpoch },
+      });
+      // A fresh owner signature must re-endorse the EXACT archived ciphertext
+      // root at the latest pinned head. History alone cannot prove the file
+      // still belongs to the current manifest after revocation/deletion.
+      const endorsements = payload.entries.map((entry, index) => ({
+        bundle: entry.bundle, ownerRootCheckpoint: historical.roots[index],
+      }));
+      await verifyEveryOwnerRoot(endorsements, {
+        ownerPublicKey, signerKeyId, deviceId, expectedScope,
+        ownerHistoryCheckpoint: newest, previousOwnerHistoryProof: newestPrevious,
+        pinnedCurrentHead: head,
+      });
+    }
     async function verifyAnchors({ outer, signedDeviceGrant, ownerHistoryCheckpoint,
       previousOwnerHistoryProof, ownerPublicKey, independentOwnerSpkiSha256,
       pinnedCurrentHead }) {
@@ -319,10 +406,11 @@
     async function recoverArchive(input) {
       let secret, decrypted, recovered = [];
       try {
+        const historic = Object.hasOwn(input || {}, "historicalRecovery");
         exact(input, ["archive", "recoverySecret", "ownerPublicKey",
           "independentOwnerSpkiSha256", "independentlyPinnedArchiveSha256",
           "pinnedCurrentHead", "scope", "signerKeyId", "deviceId",
-          "previousOwnerHistoryProof"]);
+          "previousOwnerHistoryProof", ...(historic ? ["historicalRecovery"] : [])]);
         secret = bytes(input.recoverySecret, 32);
         exact(input.archive, OUTER);
         const archive = Object.fromEntries(OUTER.map((name) => {
@@ -344,9 +432,12 @@
         const trustedSigner = bytes(input.signerKeyId, 16);
         const trustedDevice = input.deviceId;
         const predecessor = input.previousOwnerHistoryProof; // in-process brand
-        if (archive.ownerRevision !== positive(head.revision)
-          || archive.ownerDigest !== b64(bytes(head.digest, 32))
-          || archive.ownerEpoch !== positive(head.epoch)) deny();
+        const historical = historic ? snapshotHistoricalRecovery(input.historicalRecovery) : null;
+        positive(head.revision); positive(head.epoch);
+        if (historic ? predecessor !== null
+          : (archive.ownerRevision !== head.revision
+            || archive.ownerDigest !== b64(head.digest)
+            || archive.ownerEpoch !== head.epoch)) deny();
         const { digest } = await archiveDigest(archive);
         if (!same(digest, archivePin)) deny();
         if (!await webCrypto.subtle.verify("Ed25519", ownerPublicKey,
@@ -365,17 +456,22 @@
         try { payload = JSON.parse(dec.decode(decrypted)); } catch (_) { deny(); }
         exact(payload, CONTENT_FIELDS);
         if (payload.format !== CONTENT) deny();
-        validateEntries(payload.entries, expectedScope, head.epoch);
-        await verifyAnchors({ outer: archive, ownerPublicKey,
-          independentOwnerSpkiSha256: ownerSpkiPin,
-          pinnedCurrentHead: head, signedDeviceGrant: payload.signedDeviceGrant,
-          ownerHistoryCheckpoint: payload.ownerHistoryCheckpoint,
-          previousOwnerHistoryProof: predecessor });
-        await verifyEveryOwnerRoot(payload.entries, {
-          ownerPublicKey, signerKeyId: trustedSigner, deviceId: trustedDevice,
-          ownerHistoryCheckpoint: payload.ownerHistoryCheckpoint,
-          previousOwnerHistoryProof: predecessor,
-          pinnedCurrentHead: head, expectedScope });
+        validateEntries(payload.entries, expectedScope, archive.ownerEpoch);
+        if (historic) await verifyHistoricalRecovery({ historical, archive,
+          payload, head, expectedScope, ownerPublicKey,
+          ownerSpkiPin, signerKeyId: trustedSigner, deviceId: trustedDevice });
+        else {
+          await verifyAnchors({ outer: archive, ownerPublicKey,
+            independentOwnerSpkiSha256: ownerSpkiPin,
+            pinnedCurrentHead: head, signedDeviceGrant: payload.signedDeviceGrant,
+            ownerHistoryCheckpoint: payload.ownerHistoryCheckpoint,
+            previousOwnerHistoryProof: predecessor });
+          await verifyEveryOwnerRoot(payload.entries, {
+            ownerPublicKey, signerKeyId: trustedSigner, deviceId: trustedDevice,
+            ownerHistoryCheckpoint: payload.ownerHistoryCheckpoint,
+            previousOwnerHistoryProof: predecessor,
+            pinnedCurrentHead: head, expectedScope });
+        }
         // No partial release: accumulate privately until ALL files and
         // signatures have succeeded. On any failure wipe every opened file.
         for (const item of payload.entries) {
@@ -390,6 +486,8 @@
         const result = Object.freeze({ files: Object.freeze(recovered),
           signedManifestVerified: true, allOwnerSignedRootsVerified: true,
           independentArchiveHashMatched: true, activeSignedGrantAtPinnedHeadVerified: true,
+          currentSignedGrantAtPinnedHeadVerified: true,
+          historicalOwnerContinuityVerified: historic,
           currentOnlineRevocationVerified: false,
           independentPinProvenanceVerifiedByModule: false,
           authorizesProductionRestore: false });

@@ -158,6 +158,39 @@
     return { format: FORMAT, accountId: value.accountId, keyrings: entries,
       signature: value.signature };
   }
+  function copySignedWire(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) deny();
+    const names = Reflect.ownKeys(value);
+    if (names.length < 1 || names.length > 20) deny();
+    const record = {};
+    for (const name of names) {
+      if (typeof name !== "string" || name.length > 80) deny();
+      const d = Object.getOwnPropertyDescriptor(value, name);
+      if (!d || !Object.hasOwn(d, "value")
+        || !(typeof d.value === "string" || d.value === null
+          || Number.isSafeInteger(d.value))
+        || (typeof d.value === "string" && d.value.length > 2048)) deny();
+      record[name] = d.value;
+    }
+    return Object.freeze(record);
+  }
+  function copyHistoricalRecovery(value) {
+    exact(value, ["signedOwnerHistoryChain", "currentSignedDeviceGrant",
+      "currentOwnerRootCheckpoints"]);
+    function bounded(list, max) {
+      if (!Array.isArray(list) || list.length < 1 || list.length > max
+        || Reflect.ownKeys(list).length !== list.length + 1) deny();
+      return Array.from({ length: list.length }, (_, i) => {
+        const d = Object.getOwnPropertyDescriptor(list, String(i));
+        if (!d || !Object.hasOwn(d, "value")) deny();
+        return copySignedWire(d.value);
+      });
+    }
+    return { signedOwnerHistoryChain: bounded(value.signedOwnerHistoryChain, 64),
+      currentSignedDeviceGrant: copySignedWire(value.currentSignedDeviceGrant),
+      currentOwnerRootCheckpoints: bounded(value.currentOwnerRootCheckpoints, 12) };
+  }
   function immutableArchive(value) {
     for (const entry of value.keyrings) {
       Object.freeze(entry.scope);
@@ -242,15 +275,26 @@
       // Snapshot every keyring's external trust material and holder secret
       // before any await. Delayed async verification cannot switch pins.
       for (const value of array(input.keyrings)) {
+        const historic = Object.hasOwn(value || {}, "historicalRecovery");
         exact(value, ["scope", "pinnedCurrentHead", "recoverySecret",
           "ownerPublicKey", "independentOwnerSpkiSha256", "signerKeyId",
-          "deviceId", "previousOwnerHistoryProof"]);
-        requested.push({ scope: scope(value.scope), pinnedCurrentHead: head(value.pinnedCurrentHead),
+          "deviceId", "previousOwnerHistoryProof",
+          ...(historic ? ["historicalRecovery"] : [])]);
+        // Capture every fallible signed-wire/pin field first. The 256-bit
+        // holder-secret copy is last, so a rejected history cannot strand a
+        // secret allocation outside the finally zeroization list.
+        const historicalRecovery = historic ? copyHistoricalRecovery(value.historicalRecovery) : null;
+        const ringScope = scope(value.scope);
+        const ringHead = head(value.pinnedCurrentHead);
+        const ringOwnerPin = bytes(value.independentOwnerSpkiSha256, 32);
+        const ringSigner = bytes(value.signerKeyId, 16);
+        requested.push({ scope: ringScope, pinnedCurrentHead: ringHead,
           recoverySecret: bytes(value.recoverySecret, 32),
           ownerPublicKey: value.ownerPublicKey,
-          independentOwnerSpkiSha256: bytes(value.independentOwnerSpkiSha256, 32),
-          signerKeyId: bytes(value.signerKeyId, 16), deviceId: value.deviceId,
-          previousOwnerHistoryProof: value.previousOwnerHistoryProof });
+          independentOwnerSpkiSha256: ringOwnerPin,
+          signerKeyId: ringSigner, deviceId: value.deviceId,
+          previousOwnerHistoryProof: value.previousOwnerHistoryProof,
+          ...(historic ? { historicalRecovery } : {}) });
       }
       if (requested.length !== archived.keyrings.length) deny();
       // Aggregate pin must be obtained independently: the archive is not its source.
@@ -265,16 +309,19 @@
         if (!SCOPE.every((field) => sc[field] === archivedKeyring.scope[field])
           || !same(expected.independentOwnerSpkiSha256, spki)) deny();
         const pinnedHead = expected.pinnedCurrentHead;
-        if (pinnedHead.revision !== archivedKeyring.ownerRevision
-          || pinnedHead.epoch !== archivedKeyring.ownerEpoch
-          || b64(pinnedHead.digest) !== archivedKeyring.ownerDigest) deny();
+        if (!Object.hasOwn(expected, "historicalRecovery")
+          && (pinnedHead.revision !== archivedKeyring.ownerRevision
+            || pinnedHead.epoch !== archivedKeyring.ownerEpoch
+            || b64(pinnedHead.digest) !== archivedKeyring.ownerDigest)) deny();
         const result = await keyrings.recoverArchive({ archive: archivedKeyring.archive,
           independentlyPinnedArchiveSha256: from64(archivedKeyring.archiveSha256, 32),
           recoverySecret: expected.recoverySecret, ownerPublicKey: expected.ownerPublicKey,
           independentOwnerSpkiSha256: spki, pinnedCurrentHead: pinnedHead,
           scope: sc, signerKeyId: expected.signerKeyId,
           deviceId: expected.deviceId,
-          previousOwnerHistoryProof: expected.previousOwnerHistoryProof });
+          previousOwnerHistoryProof: expected.previousOwnerHistoryProof,
+          ...(Object.hasOwn(expected, "historicalRecovery")
+            ? { historicalRecovery: expected.historicalRecovery } : {}) });
         opened.push({ scope: sc, files: result.files });
       }
       // Return plaintext only once every keyring has passed signed history,
