@@ -12,6 +12,7 @@ const { createZk1CasManifestHttpsClient } = require("./zk1CasManifestHttpsClient
 const { createZk1SignedHistoryCasProofProvider } =
   require("./zk1SignedHistoryCasProofProvider");
 const { Zk1ProtectedObjectStore } = require("./zk1ProtectedObjectStore");
+const { Zk1OpaqueCatalog } = require("./zk1OpaqueCatalog");
 const { registerZk1ProtectedObjectRoutes } = require("../routes/zk1ProtectedObjectRoutes");
 
 const B64U = /^[A-Za-z0-9_-]+$/;
@@ -178,6 +179,7 @@ function trustedSignedHistory(config, scope, casClient) {
 function registerZk1ProtectedContentFromConfig({
   app, authenticate, requirePermission, configPath, environment,
   multiproviderRestore = null,
+  opaqueCatalogAuthority = null,
 }) {
   if (!["development", "test"].includes(environment)
     || !app || typeof app.post !== "function"
@@ -238,9 +240,13 @@ function registerZk1ProtectedContentFromConfig({
       } }),
   });
   try {
+    // An independently pinned catalog CAS is an explicit opt-in dependency.
+    // No unsigned local SQLite-list fallback is ever registered.
+    const opaqueCatalog = opaqueCatalogAuthority === null ? null
+      : new Zk1OpaqueCatalog({ store, authority: opaqueCatalogAuthority });
     registerZk1ProtectedObjectRoutes({ app, store, authenticate, requirePermission,
       resolveTrustedScope: (user) => user?.username === config.username ? scope : null,
-      environment, multiproviderRestore });
+      environment, multiproviderRestore, opaqueCatalog });
   } catch (error) {
     store.close();
     throw error;

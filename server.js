@@ -5993,7 +5993,8 @@ app.use((req, res, next) => {
   if (process.env.ROOTARK_ZK1_CONTENT_CONFIG
     && ["development", "test"].includes(NODE_ENV)
     && req.method === "POST"
-    && ["/zk-1/v1/content/read", "/zk-1/v1/content/put"].includes(req.path)) {
+    && ["/zk-1/v1/content/read", "/zk-1/v1/content/put",
+      "/zk-1/v1/catalog/read", "/zk-1/v1/catalog/commit"].includes(req.path)) {
     // Defer JSON body parsing until AFTER the normal session and permissions
     // have been checked by the isolated protected-content routes.
     return next();

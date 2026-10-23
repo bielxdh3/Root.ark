@@ -51,6 +51,7 @@ function authorizationWire(raw) {
 
 function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
   requirePermission, resolveTrustedScope, multiproviderRestore = null,
+  opaqueCatalog = null,
   environment = "development" }) {
   if (!app || typeof app.post !== "function" || !store
     || typeof store.put !== "function" || typeof store.get !== "function"
@@ -121,6 +122,77 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
     requirePermission("listFiles"), parseSealedContent, checked("get"));
   app.post("/zk-1/v1/content/put", fenceHeaders, authenticate,
     requirePermission("upload"), parseSealedContent, checked("put"));
+  // Opt-in only: a separate pinned, independent signed CAS authority must
+  // be configured to register these routes. No generic sync-v2 metadata.
+  if (opaqueCatalog !== null) {
+    if (!store.signedHistoryRequired || typeof opaqueCatalog.commit !== "function"
+      || typeof opaqueCatalog.read !== "function"
+      || opaqueCatalog.store !== store) invalid();
+    const sendUnderGate = (res, status) => (result) => new Promise((resolve, reject) => {
+      if (res.destroyed || res.writableEnded) return reject(new Error("ZK_CATALOG_UNAVAILABLE"));
+      const done = () => {
+        res.off("finish", settled);
+        res.off("close", settled);
+      };
+      const settled = () => { done(); resolve(); };
+      res.once("finish", settled);
+      res.once("close", settled);
+      try { res.status(status).json(result); }
+      catch (error) { done(); reject(error); }
+    });
+    const respond = (action) => async (req, res) => {
+      try {
+        const trustedScope = resolveTrustedScope(req.user);
+        if (!trustedScope) invalid();
+        const body = req.body;
+        exact(body, action === "commit"
+          ? ["authorization", "signatureBase64", "headerBase64",
+            "headerSignatureBase64", "pages"]
+          : ["authorization", "signatureBase64", "pageIndex"]);
+        const authorization = authorizationWire(body.authorization);
+        const input = { scope: trustedScope, authorization,
+          signature: b64(body.signatureBase64, 64) };
+        let result;
+        if (action === "commit") {
+          const { Zk1OpaqueCatalog } = require("../services/zk1OpaqueCatalog");
+          if (!(opaqueCatalog instanceof Zk1OpaqueCatalog)) invalid();
+          const headBytes = b64(body.headerBase64, 16384);
+          const z = require("../crypto/rootark-zk-1");
+          const header = await z.decodeDeterministic(headBytes);
+          if (!Buffer.from(await z.encodeDeterministic(header)).equals(headBytes)) invalid();
+          if (!Array.isArray(body.pages) || body.pages.length > 128) invalid();
+          const pages = body.pages.map((page) => {
+            if (!Array.isArray(page) || page.length > 32) invalid();
+            return page.map((entry) => {
+              exact(entry, ["objectId", "revision", "epoch", "ciphertextDigestBase64",
+                "metadataCiphertextBase64"]);
+              return { object_id: entry.objectId, revision: entry.revision,
+                epoch: entry.epoch, ciphertext_digest: b64(entry.ciphertextDigestBase64, 32),
+                metadata_ciphertext: b64(entry.metadataCiphertextBase64, 284) };
+            });
+          });
+          result = await opaqueCatalog.commit({ ...input, header, pages,
+            emit: sendUnderGate(res, 201),
+            headerSignature: b64(body.headerSignatureBase64, 64) });
+        } else {
+          result = await opaqueCatalog.read({ ...input, pageIndex: body.pageIndex,
+            emit: sendUnderGate(res, 200) });
+        }
+        return result;
+      } catch (error) {
+        if (res.headersSent || res.destroyed) return;
+        const status = ["ZK_CATALOG_CONFLICT", "ZK_CATALOG_REPLAY"].includes(error?.code)
+          ? 409 : error?.code === "ZK_CATALOG_NOT_FOUND" ? 404
+            : ["ZK_CATALOG_DENIED", "ZK_CONTENT_DENIED"].includes(error?.code) ? 403 : 503;
+        return res.status(status).json({ error: status === 503
+          ? "ZK_CATALOG_UNAVAILABLE" : error.code });
+      }
+    };
+    app.post("/zk-1/v1/catalog/commit", fenceHeaders, authenticate,
+      requirePermission("upload"), parseSealedContent, respond("commit"));
+    app.post("/zk-1/v1/catalog/read", fenceHeaders, authenticate,
+      requirePermission("listFiles"), parseSealedContent, respond("read"));
+  }
   if (multiproviderRestore !== null) {
     if (Object.hasOwn(multiproviderRestore, "ioDeadlineMs")) {
       exact(multiproviderRestore, ["gatewayPins", "restoreInput", "ioDeadlineMs"]);

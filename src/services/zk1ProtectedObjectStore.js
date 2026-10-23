@@ -89,7 +89,7 @@ function normalizeAuthorization(value) {
   };
   if (typeof result.device_id !== "string" || result.device_id.length < 1
     || result.device_id.length > 64 || /[\u0000-\u001f\u007f]/.test(result.device_id)
-    || !["put", "get"].includes(result.operation)
+    || !["put", "get", "catalog-commit", "catalog-read"].includes(result.operation)
     || typeof result.object_id !== "string"
     || !/^[A-Za-z0-9_-]{22}$/.test(result.object_id)
     || Buffer.from(result.object_id, "base64url").toString("base64url") !== result.object_id
@@ -98,7 +98,9 @@ function normalizeAuthorization(value) {
     || result.expires_at - result.issued_at > 60
     || (result.operation === "get"
       && (result.ciphertext_digest === null) !== (result.expected_object_revision === null))
-    || (result.operation === "put" && result.ciphertext_digest === null)) fail();
+    || (["put", "catalog-commit", "catalog-read"].includes(result.operation)
+      && result.ciphertext_digest === null)
+    || (result.operation === "catalog-read" && result.expected_object_revision === null)) fail();
   return result;
 }
 async function contentAuthorizationMessageV1(input) {
@@ -466,8 +468,9 @@ class Zk1ProtectedObjectStore {
         this.inflightSignedHistoryChecks -= 1;
       }
     }
-    return { key, request, head, sealed,
+    return { key, request, head, sealed, verifiedHeadManifest: manifest,
       deviceId: device.device_id,
+      deviceAuthorizationPublicKey: Buffer.from(device.authorization_public_key),
       authorizationKeyId: Buffer.from(device.authorization_key_id).toString("base64url") };
   }
 
@@ -645,6 +648,16 @@ class Zk1ProtectedObjectStore {
     const authenticated = await this.authorize(input, operation);
     return this.#withAdmission(authenticated, operation,
       () => emit(this.perform(authenticated, operation)));
+  }
+  // Catalog read/commit use the identical independently witnessed current
+  // owner history and device PoP, plus the existing physical I/O gate.
+  // Their separate signature domain and effect live in zk1OpaqueCatalog.
+  async runCatalogWithAdmission(input, operation, emit) {
+    if (!this.signedHistoryRequired || typeof emit !== "function"
+      || !["catalog-commit", "catalog-read"].includes(operation)) fail();
+    const authenticated = await this.authorize(input, operation);
+    return this.#withAdmission(authenticated,
+      operation === "catalog-commit" ? "put" : "get", () => emit(authenticated));
   }
   async #withAdmission(authenticated, operation, effect, abortSignal) {
     if (abortSignal?.aborted) fail("ZK_CONTENT_UNAVAILABLE");
