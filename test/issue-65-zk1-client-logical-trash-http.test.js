@@ -627,4 +627,47 @@ test("DEV logical trash/restore: signed current catalog, new AEAD/CEK, archival 
   assert.equal(badFinalProof.outcome.retrySafe, false);
   assert.equal(writerJournals.at(-1).size, 1,
     "pending signed intent must remain durable for reconciliation after final proof failure");
+
+  // Real HTTP PUT commits the next immutable version, but its subsequent GET
+  // confirmation disappears. The client must report an uncertain I/O result,
+  // not DENIED (which could tempt the caller to retry against a stale head).
+  const snapshot5 = await openCatalog(badFinalProof.outcome.catalogSequence,
+    badFinalProof.outcome.catalogDigestBase64);
+  const saved5 = archived.get(5);
+  assert.equal(snapshot5.entries.length, 5);
+  const uncertainRestore = Object.assign(realm({}), restoreBase, {
+    catalog: snapshot5, sourceIndex: 4, sourceMetadata: saved5.metadata,
+    sourceCek: saved5.cek, originalIndex: 3,
+    originalMetadata: restored.metadata, originalCek: archived.get(4).cek,
+    catalogWriter: makeWriter(5,
+      Buffer.from(badFinalProof.outcome.catalogDigestBase64, "base64url")),
+    fetchImpl: async (url, options) => {
+      const response = await fetchImpl(url, options);
+      if (url.endsWith("/content/read")) {
+        await response.arrayBuffer();
+        throw Error("readback disconnected after committed PUT");
+      }
+      return response;
+    },
+  });
+  const beforeLostReadback = puts;
+  let readbackError;
+  try { await trash.restore(uncertainRestore); } catch (error) { readbackError = error; }
+  assert.equal(readbackError?.code, "ZK_LOGICAL_TRASH_PUT_UNCERTAIN");
+  assert.equal(readbackError.outcome.phase, "ciphertext_readback");
+  assert.equal(readbackError.outcome.retrySafe, false);
+  assert.equal(readbackError.outcome.ciphertextPutMayHaveCommitted, true);
+  assert.equal(readbackError.outcome.ciphertextReadbackVerified, false);
+  assert.equal(readbackError.outcome.logicalStateFinalized, false);
+  assert.equal(puts, beforeLostReadback + 1, "a real HTTP PUT already committed");
+  assert.equal(sequence, badFinalProof.outcome.catalogSequence,
+    "no catalog CAS can occur without ciphertext GET confirmation");
+  assert.equal(writerJournals.at(-1).size, 1,
+    "pre-PUT journal survives outage and cannot be silently retried");
+  const stored6 = archived.get(6).bytes;
+  const actual6 = await send("/zk-1/v1/content/read", await rawSigner("get",
+    sourceId, 6, hash(stored6)));
+  assert.equal(actual6.status, 200,
+    "server persisted revision 6 despite missing browser readback");
+  assert.equal(actual6.result.ciphertextBase64, b64(stored6));
 });

@@ -157,7 +157,8 @@
 
     async function change(input) {
       let sourceBytes, oldPlain, originalBytes, destinationBytes, checkBytes;
-      let journalId = null, commitAttempted = false, confirmedCommit = null;
+      let journalId = null, putAttempted = false, commitAttempted = false;
+      let confirmedCommit = null;
       let pendingObjectId = null, pendingRevision = null;
       try {
         exact(input, ["action", "catalog", "sourceIndex", "sourceMetadata", "sourceCek",
@@ -345,6 +346,10 @@
         await guard();
         let uncertainAck = false;
         try {
+          // Once the request leaves the browser, even a thrown network error
+          // cannot prove that the immutable version was not accepted. Keep the
+          // prepared journal and forbid another PUT until signed GET resolves it.
+          putAttempted = true;
           const ack = await http.postProtectedCiphertextPut({
             origin: input.origin, request: put, fetchImpl: fetchGuarded });
           await guard();
@@ -434,6 +439,19 @@
             catalogSequence: confirmedCommit?.sequence ?? null,
             catalogDigestBase64: confirmedCommit?.digest ?? null,
             signedCatalogReadbackVerified: confirmedCommit !== null,
+            retrySafe: false, logicalStateFinalized: false });
+          throw error;
+        }
+        if (putAttempted) {
+          // A failed/missing readback is NOT proof that the initial PUT failed.
+          // Retrying against the prior revision could strand the catalog or
+          // collide with a successfully written immutable ciphertext version.
+          const error = new Error("ZK_LOGICAL_TRASH_PUT_UNCERTAIN");
+          error.code = error.message;
+          error.outcome = Object.freeze({ objectId: pendingObjectId,
+            revision: pendingRevision, journalId, phase: "ciphertext_readback",
+            ciphertextPutMayHaveCommitted: true,
+            ciphertextReadbackVerified: false, signedCatalogReadbackVerified: false,
             retrySafe: false, logicalStateFinalized: false });
           throw error;
         }
