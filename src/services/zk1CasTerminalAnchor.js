@@ -513,7 +513,18 @@ class Zk1CasTerminalAnchor {
       this.reload(true);
       return true;
     } finally {
+      // The append lock protects sequence assignment only while we own the
+      // exact inode created with wx. Another local process can replace the
+      // pathname before release; blindly unlinking its new lock would admit
+      // overlapping writers. Refuse and preserve any unexpected lock.
+      const owned = fs.fstatSync(lock, { bigint: true });
       fs.closeSync(lock);
+      let current;
+      try { current = fs.lstatSync(lockPath, { bigint: true }); }
+      catch (_) { fail(); }
+      if (!owned.isFile() || owned.nlink !== 1n
+        || !current.isFile() || current.isSymbolicLink() || current.nlink !== 1n
+        || owned.dev !== current.dev || owned.ino !== current.ino) fail();
       fs.unlinkSync(lockPath);
     }
   }

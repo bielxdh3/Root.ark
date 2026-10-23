@@ -45,6 +45,53 @@ test("two CAS handles cannot append a duplicate sequence or permanently corrupt 
   assert.equal(first.sequence, 2, "a stale first handle must refresh its durable head");
 });
 
+test("CAS append cannot unlink another writer's replacement lock during release", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-lock-replaced-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+  const filename = path.join(dir, "anchor.log");
+  const lockPath = filename + ".append.lock";
+  const displaced = path.join(dir, "displaced-owned-lock");
+  const anchor = new Zk1CasTerminalAnchor(filename, {
+    bootstrapNew: true, statusKeyId: crypto.randomBytes(16),
+    statusPrivateKey: crypto.generateKeyPairSync("ed25519").privateKey,
+  });
+  const query = { account_id: crypto.randomBytes(16),
+    compartment_id: Buffer.from("main"), keyring_id: crypto.randomBytes(16),
+    reservation_id: crypto.randomBytes(16) };
+  const ticket = crypto.randomBytes(64);
+  const manifest = crypto.randomBytes(64);
+  anchor.prepare(query, ticket, "committed", manifest);
+  const originalOpen = fs.openSync;
+  const originalClose = fs.closeSync;
+  let ownedLockFd;
+  let replaced = false;
+  try {
+    fs.openSync = function (pathname, flags) {
+      const fd = originalOpen.apply(this, arguments);
+      if (pathname === lockPath && flags === "wx") ownedLockFd = fd;
+      return fd;
+    };
+    fs.closeSync = function (fd) {
+      const result = originalClose.apply(this, arguments);
+      if (fd === ownedLockFd && !replaced) {
+        replaced = true;
+        fs.renameSync(lockPath, displaced);
+        fs.writeFileSync(lockPath, "another writer owns this lock", { flag: "wx", mode: 0o600 });
+      }
+      return result;
+    };
+    await assert.rejects(anchor.append(query, ticket, "committed", manifest,
+      crypto.randomBytes(64)), /CAS_ANCHOR_INVALID/,
+    "a replaced lock must abort release rather than removing another writer's exclusive lock");
+  } finally {
+    fs.openSync = originalOpen;
+    fs.closeSync = originalClose;
+  }
+  assert.equal(replaced, true);
+  assert.equal(fs.readFileSync(lockPath, "utf8"), "another writer owns this lock",
+    "a competing writer's lock must remain intact after our release fails");
+});
+
 test("incomplete staging file from a crashed intent writer is not an authoritative intent", (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-intent-stage-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
