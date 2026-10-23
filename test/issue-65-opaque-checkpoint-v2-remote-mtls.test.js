@@ -374,7 +374,8 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   pendingLegacy.exec(`DROP TRIGGER successors_immutable_update;
     DROP TRIGGER successors_immutable_delete;
     DROP TRIGGER successors_no_gap;
-    DROP TABLE successors;`);
+    DROP TABLE successors;
+    DROP TABLE signer_grants;`);
   pendingLegacy.close();
   const uncertainTarget = path.join(dir, "v2-pending-129-upgraded.sqlite");
   await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129({
@@ -420,7 +421,15 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   legacy129.exec(`DROP TRIGGER successors_immutable_update;
     DROP TRIGGER successors_immutable_delete;
     DROP TRIGGER successors_no_gap;
-    DROP TABLE successors;`);
+    DROP TABLE successors;
+    DROP TABLE signer_grants;`);
+  // The historical #129 format predates BOTH successors and signer grants.
+  // Replaying an upgraded fixture with extra tables would be correctly
+  // rejected by the strict schema check before the migration path is tested.
+  assert.deepEqual(legacy129.prepare(`SELECT name FROM sqlite_master
+    WHERE name NOT LIKE 'sqlite_%' ORDER BY name`).all().map((row) => row.name), [
+    "identity", "intent", "intent_immutable_delete", "intent_immutable_update",
+  ]);
   legacy129.close();
   if (process.platform !== "win32") fs.chmodSync(old129, 0o600);
   const original129 = fs.readFileSync(old129);
@@ -435,6 +444,17 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
     ...clientOptions(handles, destination, false), legacyJournalPath: source,
     migrationOptIn: true, ownerPrivateKey: owner.privateKey, ...additional,
   });
+  const unexpectedGrants129 = path.join(dir, "v2-unexpected-grants-129.sqlite");
+  fs.copyFileSync(old129, unexpectedGrants129);
+  const unexpectedGrantsDb = new Database(unexpectedGrants129);
+  unexpectedGrantsDb.exec(`CREATE TABLE signer_grants (
+    sequence INTEGER PRIMARY KEY, grant BLOB NOT NULL, signer_spki BLOB NOT NULL);`);
+  unexpectedGrantsDb.close();
+  if (process.platform !== "win32") fs.chmodSync(unexpectedGrants129, 0o600);
+  await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129(
+    optIn(unexpectedGrants129, migratedJournal)), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+  "a migrated source carrying newer signer_grants cannot masquerade as legacy #129");
+  assert.equal(fs.existsSync(migratedJournal), false);
   await assert.rejects(Zk1OpaqueCheckpointV2Client.migrateLegacy129(
     optIn(old129, migratedJournal, { migrationOptIn: false })),
   /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/, "implicit schema upgrade denied");
