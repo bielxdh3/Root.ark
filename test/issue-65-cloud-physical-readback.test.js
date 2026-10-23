@@ -24,6 +24,7 @@ function fixture(provider) {
   const address = zk1CloudCopyAddress({ scope, operationId });
   let payload = Buffer.from(original);
   let principal = `${provider}-reader-A`;
+  let httpVariant = null;
   const calls = [];
   const config = {
     provider, prefix: "rootark-cloud-physical-fixture", rootFolderId: "root",
@@ -48,7 +49,12 @@ function fixture(provider) {
         || command.input.Bucket !== "disposable-fixture"
         || command.input.Key !== reader.key(address.folder, address.name, "uploads")
         || !payload) throw new Error("missing fixture object");
-      return { Body: Readable.from([payload]) };
+      return { Body: Readable.from([payload]),
+        ...(httpVariant === null ? {} : {
+          $metadata: { httpStatusCode: httpVariant.status },
+          ...(httpVariant.contentRange ? { ContentRange: httpVariant.contentRange } : {}),
+          ...(httpVariant.contentEncoding ? { ContentEncoding: httpVariant.contentEncoding } : {}),
+        }) };
     } });
   } else {
     config.gdrive = { folderId: "fixture-parent" };
@@ -60,14 +66,44 @@ function fixture(provider) {
       get: async ({ fileId, alt }) => {
         calls.push(`get:${alt || "metadata"}`);
         if (fileId !== "fixture-cloud-id" || !payload) throw new Error("missing fixture object");
-        return alt === "media" ? { data: Readable.from([payload]) } : { data: file() };
+        return alt === "media" ? { data: Readable.from([payload]),
+          ...(httpVariant === null ? {} : {
+            status: httpVariant.status,
+            headers: {
+              ...(httpVariant.contentRange ? { "content-range": httpVariant.contentRange } : {}),
+              ...(httpVariant.contentEncoding ? { "content-encoding": httpVariant.contentEncoding } : {}),
+            },
+          }) } : { data: file() };
       },
     } });
   }
   const reader = createCloudStorage(config);
   const input = { scope, operationId, ciphertextSha256, expectedRootHash, chunkLengths };
   return { reader, input, calls, original,
-    changePayload(next) { payload = next; }, changePrincipal(next) { principal = next; } };
+    changePayload(next) { payload = next; }, changePrincipal(next) { principal = next; },
+    setHttpVariant(next) { httpVariant = next; } };
+}
+
+for (const provider of ["s3", "gdrive"]) {
+  test(`${provider} bounded ciphertext GET rejects partial and transformed HTTP representation even when sha/root match`, async () => {
+    const f = fixture(provider);
+    const readerContext = await f.reader.resolveInventoryContext();
+    const verifier = new Zk1CloudCiphertextReadbackVerifier({ cloudReader: f.reader,
+      expectedProvider: provider, expectedReaderContext: readerContext,
+      pinnedDriveFileId: provider === "gdrive" ? "fixture-cloud-id" : null });
+    const contentRange = `bytes 0-${f.original.length - 1}/${f.original.length + 1}`;
+    for (const httpVariant of [
+      { status: 206, contentRange },
+      { status: 200, contentRange },
+      { status: 200, contentEncoding: "gzip" },
+    ]) {
+      f.setHttpVariant(httpVariant);
+      await assert.rejects(verifier.verifyExact(f.input), /ZK_CLOUD_READBACK_UNAVAILABLE/,
+        `${provider} may not claim a complete provider object from HTTP ${JSON.stringify(httpVariant)}`);
+    }
+    f.setHttpVariant({ status: 200 });
+    assert.equal((await verifier.verifyExact(f.input)).readbackMatched, true);
+  });
 }
 
 for (const provider of ["s3", "gdrive"]) {

@@ -68,7 +68,8 @@ async function secureTransfer(uri, ca, method, data = null) {
       method, timeout: 5000 }, (res) => {
       const parts = [];
       res.on("data", (chunk) => parts.push(chunk));
-      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(parts) }));
+      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(parts),
+        headers: res.headers }));
     });
     req.on("error", reject);
     req.end(data);
@@ -106,6 +107,8 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   const hits = { s3: 0, drive: 0, webdav: 0 };
   let revokeSessionDuringCloudGet = null;
   let cloudError = null;
+  let partialS3CiphertextGet = false;
+  let partialDriveCiphertextGet = false;
   const s3 = http.createServer((req, res) => {
     const key = req.url.split("?")[0];
     hits.s3 += 1;
@@ -124,6 +127,10 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     }
     const body = cloudError === "s3" ? null : stores.s3.get(key);
     if (!body) { res.writeHead(404); res.end(); return; }
+    if (partialS3CiphertextGet && key.endsWith(".ct")) {
+      res.writeHead(206, { "content-range": `bytes 0-${body.length - 1}/${body.length + 1}` });
+      res.end(body); return;
+    }
     res.writeHead(200); res.end(body);
   });
   const s3Port = await register(s3);
@@ -156,6 +163,10 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
       }
       const body = target[2] === "media" ? stores.drive.get(id) : null;
       if (!body) { res.writeHead(404); res.end(); return; }
+      if (partialDriveCiphertextGet && id === driveId) {
+        res.writeHead(206, { "content-range": `bytes 0-${body.length - 1}/${body.length + 1}` });
+        res.end(body); return;
+      }
       res.writeHead(200); res.end(body);
     });
   const drivePort = await register(driveServer);
@@ -306,10 +317,13 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
         assert.ok([driveId, catalogDriveId].includes(fileId));
         const reply = await secureTransfer(`https://127.0.0.1:${drivePort}/drive/${fileId}/`
           + (alt === "media" ? "media" : "metadata"), ca, "GET");
-        if (reply.status !== 200) throw Object.assign(new Error("not found"),
+        if (reply.status !== 200 && !(alt === "media" && reply.status === 206)) {
+          throw Object.assign(new Error("not found"),
           { status: reply.status });
-        return { data: alt === "media" ? Readable.from([reply.body])
-          : JSON.parse(reply.body.toString("utf8")) };
+        }
+        return { status: reply.status, headers: reply.headers,
+          data: alt === "media" ? Readable.from([reply.body])
+            : JSON.parse(reply.body.toString("utf8")) };
       },
       create: async ({ requestBody, media }) => {
         assert.equal(requestBody.id, catalogDriveId);
@@ -844,6 +858,26 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   assert.equal((await noQuorum.text()).includes("ciphertextBase64"), false);
   stores.drive.set(driveId, Buffer.from(ciphertext));
   stores.webdav.set(`/dav/${davKey}`, intactWebdav);
+
+  // A provider can answer HTTP 206 with exactly the signed bytes while its
+  // object has a larger physical representation. That is not an exact remote
+  // copy and must not count as either member of the 2/3 restore quorum.
+  stores.drive.delete(driveId);
+  partialS3CiphertextGet = true;
+  const s3Partial = await post(await makeSignedRequest());
+  assert.equal(s3Partial.status, 403,
+    "S3 partial HTTP 206 plus valid WebDAV cannot claim two complete copies");
+  assert.equal((await s3Partial.text()).includes("ciphertextBase64"), false);
+  partialS3CiphertextGet = false;
+  stores.drive.set(driveId, Buffer.from(ciphertext));
+  stores.s3.delete(`/quorum-fixture/${s3Key}`);
+  partialDriveCiphertextGet = true;
+  const drivePartial = await post(await makeSignedRequest());
+  assert.equal(drivePartial.status, 403,
+    "Drive partial HTTPS 206 plus valid mTLS WebDAV cannot release ciphertext");
+  assert.equal((await drivePartial.text()).includes("ciphertextBase64"), false);
+  partialDriveCiphertextGet = false;
+  stores.s3.set(`/quorum-fixture/${s3Key}`, Buffer.from(ciphertext));
 
   // A different device ID can have a syntactically valid OWNER signature,
   // the same private key and a valid fresh owner ACTIVE response. The actual

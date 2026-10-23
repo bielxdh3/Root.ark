@@ -15,6 +15,36 @@ async function abortableProviderRead(action, signal) {
   return result;
 }
 
+// A matching digest of the received bytes does not prove a complete remote
+// object GET: a 206 response can contain exactly those bytes while the object
+// has additional content outside the returned range. Reject partial/encoded
+// representations before a bounded ZK readback can be reconciled as a copy.
+function assertFullCiphertextGet(response, provider, expectedBytes) {
+  const status = provider === "s3" ? response?.$metadata?.httpStatusCode : response?.status;
+  const headers = provider === "s3" ? null : response?.headers;
+  const header = (key) => {
+    if (provider === "s3") return response?.[{
+      "content-range": "ContentRange", "content-encoding": "ContentEncoding",
+      "content-length": "ContentLength",
+    }[key]];
+    if (typeof headers?.get === "function") return headers.get(key);
+    if (!headers || typeof headers !== "object") return undefined;
+    const actual = Object.keys(headers).find((name) => name.toLowerCase() === key);
+    return actual === undefined ? undefined : headers[actual];
+  };
+  const range = header("content-range");
+  const encoding = header("content-encoding");
+  const length = header("content-length");
+  if ((status !== undefined && status !== 200)
+    || (range !== undefined && range !== null)
+    || (encoding !== undefined && encoding !== null && encoding !== "identity")
+    || (length !== undefined && length !== null
+      && (!/^(0|[1-9][0-9]*)$/.test(String(length))
+        || Number(length) !== expectedBytes))) {
+    throw cloudError("provider_error", "Bounded ZK ciphertext GET was not a complete object representation");
+  }
+}
+
 function createCloudStorage(options = {}) {
   const provider = String(options.provider || "local").toLowerCase();
   const prefix = normalizePrefix(options.prefix || "rootark");
@@ -391,9 +421,11 @@ function createCloudStorage(options = {}) {
       let input;
       if (provider === "s3") {
         const bucketName = bucket();
-        input = (await abortableProviderRead(async () => (await s3()).send(
+        const response = await abortableProviderRead(async () => (await s3()).send(
           new (require("@aws-sdk/client-s3").GetObjectCommand)({ Bucket: bucketName, Key: cloudKey }),
-          signal ? { abortSignal: signal } : undefined), signal)).Body;
+          signal ? { abortSignal: signal } : undefined), signal);
+        if (constraints) assertFullCiphertextGet(response, provider, constraints.maxBytes);
+        input = response.Body;
       }
       else {
         const existing = pinId === null
@@ -402,9 +434,11 @@ function createCloudStorage(options = {}) {
         if (!existing) return false;
         const current = await abortableProviderRead(() => getDriveFile(existing.id, signal), signal);
         assertDriveFileOwnership(current, cloudKey, folderId, area);
-        input = (await abortableProviderRead(async () => (await drive()).files.get(
+        const response = await abortableProviderRead(async () => (await drive()).files.get(
           { fileId: existing.id, alt: "media" },
-          { responseType: "stream", ...(signal ? { signal } : {}) }), signal)).data;
+          { responseType: "stream", ...(signal ? { signal } : {}) }), signal);
+        if (constraints) assertFullCiphertextGet(response, provider, constraints.maxBytes);
+        input = response.data;
       }
       if (constraints) {
         let size = 0;
