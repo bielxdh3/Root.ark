@@ -5,18 +5,14 @@ const { pipeline } = require("stream/promises");
 const { Transform, Readable } = require("stream");
 const { normalizeProviderError } = require("../src/services/deploymentResilience");
 
-function abortableProviderRead(action, signal) {
-  if (!signal) return action();
-  return new Promise((resolve, reject) => {
-    const unavailable = () => cloudError("provider_error", "Bounded cloud readback deadline exceeded");
-    if (signal.aborted) return reject(unavailable());
-    const aborted = () => reject(unavailable());
-    signal.addEventListener("abort", aborted, { once: true });
-    Promise.resolve().then(action).then(
-      (value) => { signal.removeEventListener("abort", aborted); resolve(value); },
-      (error) => { signal.removeEventListener("abort", aborted); reject(error); },
-    );
-  });
+async function abortableProviderRead(action, signal) {
+  if (signal?.aborted) throw cloudError("provider_error", "Bounded cloud readback deadline exceeded");
+  // SDK transport receives AbortSignal from the caller. Await its ACTUAL
+  // settlement so a slow/misbehaving SDK cannot outlive witness admission,
+  // provider staging cleanup, or a supposedly finished remote I/O effect.
+  const result = await action();
+  if (signal?.aborted) throw cloudError("provider_error", "Bounded cloud readback deadline exceeded");
+  return result;
 }
 
 function createCloudStorage(options = {}) {
@@ -363,12 +359,16 @@ function createCloudStorage(options = {}) {
     assertProvider(); if (!enabled() || fs.existsSync(localPath)) return false;
     const pinId = constraints && Object.hasOwn(constraints, "providerFileId")
       ? constraints.providerFileId : null;
+    const externalSignal = constraints && Object.hasOwn(constraints, "abortSignal")
+      ? constraints.abortSignal : undefined;
     if (constraints !== undefined && (!constraints || typeof constraints !== "object"
       || Array.isArray(constraints)
       || Reflect.ownKeys(constraints).length !== (pinId === null ? 1 : 2)
+        + (externalSignal === undefined ? 0 : 1)
       || !Object.hasOwn(constraints, "maxBytes")
       || !Number.isSafeInteger(constraints.maxBytes)
       || constraints.maxBytes < 1 || constraints.maxBytes > 16 * 1024 * 1024
+      || (externalSignal !== undefined && !(externalSignal instanceof AbortSignal))
       || (provider === "gdrive" && !isDriveFileId(pinId))
       || (provider === "s3" && pinId !== null))) {
       throw cloudError("invalid_path", "Invalid bounded ciphertext download");
@@ -381,7 +381,13 @@ function createCloudStorage(options = {}) {
     const boundedController = constraints ? new AbortController() : null;
     const boundedDeadline = boundedController ? setTimeout(() => boundedController.abort(), 15000) : null;
     const signal = boundedController?.signal;
+    const cancel = () => boundedController?.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) cancel();
+      else externalSignal.addEventListener("abort", cancel, { once: true });
+    }
     try {
+      if (signal?.aborted) throw cloudError("provider_error", "Cancelled bounded cloud readback");
       let input;
       if (provider === "s3") {
         const bucketName = bucket();
@@ -432,6 +438,7 @@ function createCloudStorage(options = {}) {
       throw classify(error);
     } finally {
       if (boundedDeadline) clearTimeout(boundedDeadline);
+      if (externalSignal) externalSignal.removeEventListener("abort", cancel);
       fs.rmSync(stagingDirectory, { recursive: true, force: true });
     }
   }

@@ -118,11 +118,14 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
   app.post("/zk-1/v1/content/put", fenceHeaders, authenticate,
     requirePermission("upload"), parseSealedContent, checked("put"));
   if (multiproviderRestore !== null) {
-    exact(multiproviderRestore, ["gatewayPins", "restoreInput"]);
+    if (Object.hasOwn(multiproviderRestore, "ioDeadlineMs")) {
+      exact(multiproviderRestore, ["gatewayPins", "restoreInput", "ioDeadlineMs"]);
+    } else exact(multiproviderRestore, ["gatewayPins", "restoreInput"]);
     registerZk1AuthenticatedMultiproviderRestoreRoute({
       app, store, authenticate, requirePermission, resolveTrustedScope,
       gatewayPins: multiproviderRestore.gatewayPins,
       restoreInput: multiproviderRestore.restoreInput, environment,
+      ioDeadlineMs: multiproviderRestore.ioDeadlineMs,
     });
   }
 }

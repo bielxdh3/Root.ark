@@ -17,6 +17,8 @@ const { Zk1ExternallyPinnedProviderDomains, spkiFingerprint } =
   require("./zk1ExternallyPinnedProviderDomains");
 const { verifyFreshOwnerDeviceRestoreAuthority } =
   require("./zk1FreshOwnerDeviceRestoreAuthority");
+const { createZk1ProviderDeadline, validDeadlineMs, isZk1ProviderDeadline,
+  DEFAULT_PROVIDER_DEADLINE_MS } = require("./zk1ProviderDeadline");
 
 function deny() { const e = new Error("ZK_MULTIPROVIDER_RESTORE_DENIED"); e.code = e.message; throw e; }
 function copied(value, length) {
@@ -110,21 +112,22 @@ function pinnedReaders(values, providerDomains, scope) {
   })), scope, nowSeconds: Math.floor(Date.now() / 1000) });
   return result;
 }
-async function exactGet(target, scope, operation, root, lengths, byteLength) {
+async function exactGet(target, scope, operation, root, lengths, byteLength, deadline) {
   let dir;
   try {
     const address = zk1CloudCopyAddress({ scope, operationId: operation.operation_id });
     const key = target.reader.key(address.folder, address.name, "uploads");
     if (typeof key !== "string"
       || !key.endsWith(`/uploads/${address.folder}/${address.name}`)
-      || await target.reader.resolveInventoryContext() !== target.context
+      || await deadline.run(() => target.reader.resolveInventoryContext()) !== target.context
       || target.reader.zk1StorageNamespace() !== target.namespace) deny();
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-cloud-recovery-"));
     const destination = path.join(dir, "opaque.ct");
-    const ok = await target.reader.download(address.folder, address.name, destination,
-      "uploads", () => true, { maxBytes: byteLength,
-        ...(target.driveId === null ? {} : { providerFileId: target.driveId }) });
-    if (ok !== true || await target.reader.resolveInventoryContext() !== target.context
+    const ok = await deadline.run((signal) => target.reader.download(address.folder, address.name, destination,
+      "uploads", () => !signal.aborted, { maxBytes: byteLength,
+        ...(target.driveId === null ? {} : { providerFileId: target.driveId }),
+        abortSignal: signal }));
+    if (ok !== true || await deadline.run(() => target.reader.resolveInventoryContext()) !== target.context
       || target.reader.zk1StorageNamespace() !== target.namespace) deny();
     const named = fs.lstatSync(destination, { bigint: true });
     if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n
@@ -168,10 +171,12 @@ class Zk1MultiproviderCiphertextRestore {
   #providerDomains;
   #deviceGrant;
   #freshDeviceState;
+  #ioDeadlineMs;
   constructor({ pinnedInventoryPublicKey, pinnedInventorySignerKeyId, pinnedOwner,
     pinnedOwnerHead, independentInventoryFloor, assertCurrentAuthorization,
     providerDomainPinset, signedCurrentDeviceGrant,
-    fetchFreshSignedDeviceState, independentOwnerSpkiSha256 } = {}) {
+    fetchFreshSignedDeviceState, independentOwnerSpkiSha256,
+    ioDeadlineMs = DEFAULT_PROVIDER_DEADLINE_MS } = {}) {
     const head = exact(pinnedOwnerHead, ["revision", "digest", "epoch"]);
     const floor = exact(independentInventoryFloor, ["minimumHead", "minimumSnapshot"]);
     const min = exact(floor.minimumHead, ["sequence", "root"]);
@@ -211,6 +216,7 @@ class Zk1MultiproviderCiphertextRestore {
     this.#providerDomains = providerDomainPinset;
     this.#deviceGrant = detachedSignedRecord(signedCurrentDeviceGrant);
     this.#freshDeviceState = fetchFreshSignedDeviceState;
+    this.#ioDeadlineMs = validDeadlineMs(ioDeadlineMs);
   }
   async #current(operation) {
     // A caller-supplied active Boolean is never enough: the owner authority
@@ -243,8 +249,11 @@ class Zk1MultiproviderCiphertextRestore {
         && proof.authorizationKeyId === this.#deviceGrant.authorization_key_id;
     } catch (_) { return false; }
   }
-  async restoreExact(input) {
+  async restoreExact(input, { abortSignal, deadline } = {}) {
     let returned;
+    if (deadline !== undefined && !isZk1ProviderDeadline(deadline)) deny();
+    const limit = deadline || createZk1ProviderDeadline({
+      deadlineMs: this.#ioDeadlineMs, parentSignal: abortSignal });
     try {
       const r = exact(input, ["scope", "operation", "signedCommittedProof",
         "signedSnapshot", "snapshotNonce", "committedProofChain", "ownerCheckpoint",
@@ -317,12 +326,18 @@ class Zk1MultiproviderCiphertextRestore {
       if (ownerProof.trustedOwnerSignatureVerified !== true
         || ownerProof.manifestCheckpointVerified !== true
         || ownerProof.authorizesProtectedIo !== false) deny();
+      limit.assertActive();
       await this.#current(operation);
+      limit.assertActive();
       const good = [];
       const failed = [];
       for (const provider of readers) {
-        try { good.push(await exactGet(provider, scope, operation, root, lengths, byteLength)); }
-        catch (_) { failed.push(provider.provider); }
+        if (good.length >= quorum) break;
+        try { good.push(await exactGet(provider, scope, operation, root, lengths, byteLength, limit)); }
+        catch (_) {
+          if (limit.signal.aborted) deny();
+          failed.push(provider.provider);
+        }
       }
       if (good.length < quorum) deny();
       for (const match of good.slice(1)) if (!same(match.data, good[0].data)) deny();
@@ -332,6 +347,7 @@ class Zk1MultiproviderCiphertextRestore {
         domainAttestation: item.domainAttestation,
       })), scope, nowSeconds: Math.floor(Date.now() / 1000) });
       await this.#current(operation);
+      limit.assertActive();
       const ciphertext = Buffer.from(good[0].data);
       returned = Object.freeze({ status: "SIGNED_CATALOG_AND_OWNER_ROOT_CLOUD_RESTORE",
         ciphertext, ciphertextSha256: Buffer.from(operation.ciphertext_sha256),
@@ -350,6 +366,7 @@ class Zk1MultiproviderCiphertextRestore {
         remoteDurabilityProven: false, authorizesProductionRestore: false });
       return returned;
     } catch (_) { deny(); }
+    finally { if (!deadline) limit.close(); }
   }
   // Disaster path when the local SQLite catalog and plaintext-free backup are
   // both missing. Fetch independently matching signed sidecar bytes first;
@@ -360,29 +377,34 @@ class Zk1MultiproviderCiphertextRestore {
   // can retain the signed wire, but CANNOT serialize the verified proof brand.
   async restoreFromCloudCatalog({ scope, operation, catalogReaders, readers,
     minimumMatchingProviders = 2, minimumMatchingCatalogProviders = 2,
-    previousOwnerHistoryProof = null } = {}) {
+    previousOwnerHistoryProof = null } = {}, { abortSignal } = {}) {
+    const limit = createZk1ProviderDeadline({
+      deadlineMs: this.#ioDeadlineMs, parentSignal: abortSignal });
     try {
       const fixed = cloneOperation(operation);
       const checkedScope = inventory.normalizeScope(scope);
       if (["account_id", "compartment_id", "keyring_id"].some((name) =>
         checkedScope[name].toString("base64url") !== this.#pinnedOwner.scope[name])) deny();
+      limit.assertActive();
       await this.#current(fixed);
+      limit.assertActive();
       const recovered = await recoverSignedCatalogSidecar({ scope,
         operationId: fixed.operation_id, readers: catalogReaders,
         minimumMatchingProviders: minimumMatchingCatalogProviders,
-        providerDomainPinset: this.#providerDomains });
+        providerDomainPinset: this.#providerDomains, deadline: limit });
       const verified = await this.restoreExact({ scope, operation: fixed,
         ...recovered.signedCatalog,
         // Fail closed if the previous proof was merely replayed as JSON;
         // a real predecessor must come from the owner verifier, not the cloud.
         previousOwnerHistoryProof: previousOwnerHistoryProof === null
           ? recovered.signedCatalog.previousOwnerHistoryProof : previousOwnerHistoryProof,
-        readers, minimumMatchingProviders });
+        readers, minimumMatchingProviders }, { deadline: limit });
       return Object.freeze({ ...verified,
         signedCatalogRecoveredFromRemote: true,
         signedCatalogSourceProviders: recovered.providers,
         remoteDurabilityProven: false, authorizesProductionRestore: false });
     } catch (_) { deny(); }
+    finally { limit.close(); }
   }
 }
 

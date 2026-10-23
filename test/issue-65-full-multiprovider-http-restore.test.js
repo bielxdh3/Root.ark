@@ -22,7 +22,7 @@ const { computeZk1CiphertextRoot } =
 const { Zk1MultiproviderCiphertextRestore,
   createZk1MultiproviderRestoreGetHandler } =
   require("../src/services/zk1MultiproviderCiphertextRestore");
-const { publishSignedCatalogSidecars, zk1CatalogSidecarAddress } =
+const { publishSignedCatalogSidecars, recoverSignedCatalogSidecar, zk1CatalogSidecarAddress } =
   require("../src/services/zk1CloudSignedCatalogSidecar");
 const { Zk1ExternallyPinnedProviderDomains, signProviderDomainAttestation,
   spkiFingerprint } = require("../src/services/zk1ExternallyPinnedProviderDomains");
@@ -363,7 +363,7 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
         issued_at: now - 3, expires_at: now + 300 } });
   };
   for (const reader of readers) reader.domainAttestation = attest(reader);
-  gateway = new Zk1MultiproviderCiphertextRestore({
+  const directGatewayPins = {
     pinnedInventoryPublicKey: invKeys.publicKey, pinnedInventorySignerKeyId: signerKeyId,
     pinnedOwner: { scope: scopeClient, deviceId: "owner-device",
       signerKeyId: ownerSignerId, publicKey: verifier },
@@ -376,7 +376,8 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     assertCurrentAuthorization: async () => ({ active: true,
       currentManifestRevision: ownerRevision, currentManifestDigest: Buffer.from(ownerDigest),
       currentEpoch: ownerEpoch }),
-  });
+  };
+  gateway = new Zk1MultiproviderCiphertextRestore(directGatewayPins);
 
   const address = require("../src/services/zk1CloudCiphertextReadbackVerifier")
     .zk1CloudCopyAddress({ scope, operationId: operation.operation_id });
@@ -395,6 +396,52 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     ownerCheckpoint, ownerHistoryCheckpoint, previousOwnerHistoryProof: null,
     expectedCiphertextRoot: root, chunkLengths: [ciphertext.length],
     readers, minimumMatchingProviders: 2 };
+
+  await t.test("a verified 2/3 ciphertext quorum never waits on silent third provider", async () => {
+    let thirdCalled = 0;
+    const slow = { ...readers[2], cloudReader: { ...readers[2].cloudReader,
+      async download() { thirdCalled++; return new Promise(() => {}); } } };
+    const opened = await gateway.restoreExact({ ...recoverInput,
+      readers: [readers[0], readers[1], slow] });
+    assert.deepEqual(opened.ciphertext, ciphertext);
+    assert.equal(opened.verifiedProviders.length, 2);
+    assert.equal(thirdCalled, 0);
+  });
+
+  await t.test("silent first cloud GET observes abort and fails closed on absolute deadline", async () => {
+    let aborted = false;
+    const silent = { ...readers[0], cloudReader: { ...readers[0].cloudReader,
+      download(_folder, _name, _destination, _area, _allowWrite, opts) {
+        return new Promise((_, reject) => {
+          opts.abortSignal.addEventListener("abort", () => {
+            aborted = true; reject(new Error("cancelled"));
+          }, { once: true });
+        });
+      } } };
+    const timed = new Zk1MultiproviderCiphertextRestore({ ...directGatewayPins,
+      ioDeadlineMs: 100 });
+    await assert.rejects(timed.restoreExact({ ...recoverInput,
+      readers: [silent, readers[1], readers[2]] }), /ZK_MULTIPROVIDER_RESTORE_DENIED/);
+    assert.equal(aborted, true);
+  });
+
+  await t.test("client abort fences provider IO and releases no bytes", async () => {
+    let aborted = false;
+    const controller = new AbortController();
+    const silent = { ...readers[0], cloudReader: { ...readers[0].cloudReader,
+      download(_folder, _name, _destination, _area, _allowWrite, opts) {
+        return new Promise((_, reject) => {
+          opts.abortSignal.addEventListener("abort", () => {
+            aborted = true; reject(new Error("client disconnected"));
+          }, { once: true });
+        });
+      } } };
+    const request = gateway.restoreExact({ ...recoverInput,
+      readers: [silent, readers[1], readers[2]] }, { abortSignal: controller.signal });
+    setTimeout(() => controller.abort(), 100);
+    await assert.rejects(request, /ZK_MULTIPROVIDER_RESTORE_DENIED/);
+    assert.equal(aborted, true);
+  });
 
   // An owner history predecessor is NOT wire JSON: this is a process-local
   // WeakMap-branded proof returned by the cryptographic verifier. Rebuilding
@@ -438,7 +485,7 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
       const opened = await gateway.restoreExact(request);
       assert.equal(opened.status, "SIGNED_CATALOG_AND_OWNER_ROOT_CLOUD_RESTORE");
       assert.deepEqual(opened.ciphertext, ciphertext);
-      assert.equal(opened.verifiedProviders.length, 3);
+      assert.equal(opened.verifiedProviders.length, 2);
 
       const beforeForgedGet = { ...hits };
       for (const forged of [
@@ -485,6 +532,31 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     expectedContext, provider, pinnedDriveFileId, domainAttestation }));
   const remoteRecovery = { scope, operation, catalogReaders,
     readers, minimumMatchingProviders: 2, minimumMatchingCatalogProviders: 2 };
+
+  await t.test("signed catalog 2/3 quorum skips a silent third provider", async () => {
+    let thirdCalled = 0;
+    const slow = { ...catalogReaders[2], cloudReader: { ...catalogReaders[2].cloudReader,
+      async download() { thirdCalled++; return new Promise(() => {}); } } };
+    const restored = await recoverSignedCatalogSidecar({ scope,
+      operationId: operation.operation_id, readers: [catalogReaders[0], catalogReaders[1], slow],
+      providerDomainPinset, deadlineMs: 500 });
+    assert.equal(restored.matchingCount, 2);
+    assert.equal(thirdCalled, 0);
+  });
+
+  await t.test("signed sidecar refuses a provider that never sends a byte", async () => {
+    let aborted = false;
+    const slow = { ...catalogReaders[0], cloudReader: { ...catalogReaders[0].cloudReader,
+      download(_folder, _name, _destination, _area, _allowWrite, opts) {
+        return new Promise((_, reject) => opts.abortSignal.addEventListener("abort", () => {
+          aborted = true; reject(new Error("cancelled"));
+        }, { once: true }));
+      } } };
+    await assert.rejects(recoverSignedCatalogSidecar({ scope,
+      operationId: operation.operation_id, readers: [slow, catalogReaders[1]],
+      providerDomainPinset, deadlineMs: 100 }), /ZK_SIGNED_CATALOG_SIDECAR_DENIED/);
+    assert.equal(aborted, true);
+  });
   const sidecar = zk1CatalogSidecarAddress(scope, operation.operation_id);
   const catalogWebdavKey = `/dav/${webdavAdapter.key(sidecar.folder, sidecar.name, "uploads")}`;
   const catalogDriveData = Buffer.from(stores.drive.get(catalogDriveId));
@@ -506,7 +578,7 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   assert.equal(result.status, 200, "two independently verified remote bytes permit client transfer");
   assert.equal(result.headers.get("cache-control"), "no-store");
   const body = await result.json();
-  assert.equal(body.providerCount, 3);
+  assert.equal(body.providerCount, 2);
   assert.equal(body.signedCommittedProof, b64(proof));
   assert.equal(body.signedSnapshot, b64(signedCurrent.bytes));
   assert.equal(body.operationId, b64(operation.operation_id));

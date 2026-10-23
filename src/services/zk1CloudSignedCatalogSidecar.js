@@ -12,6 +12,8 @@ const inventory = require("../crypto/rootark-zk-content-inventory-v1");
 const { zk1CloudCopyAddress } = require("./zk1CloudCiphertextReadbackVerifier");
 const { Zk1ExternallyPinnedProviderDomains } =
   require("./zk1ExternallyPinnedProviderDomains");
+const { createZk1ProviderDeadline, isZk1ProviderDeadline } =
+  require("./zk1ProviderDeadline");
 
 const FORMAT = "rootark-zk1-signed-catalog-sidecar/v1";
 const DOMAIN = Buffer.from("Root.ark/zk-1/catalog-sidecar-operation/v1\0");
@@ -157,7 +159,8 @@ async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog,
   finally { if (dir) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); }
 }
 async function recoverSignedCatalogSidecar({ scope, operationId, readers,
-  minimumMatchingProviders = 2, providerDomainPinset } = {}) {
+  minimumMatchingProviders = 2, providerDomainPinset, deadlineMs, abortSignal,
+  deadline } = {}) {
   if (!Array.isArray(readers) || readers.length < 2 || readers.length > 3
     || !Number.isSafeInteger(minimumMatchingProviders)
     || minimumMatchingProviders < 2 || minimumMatchingProviders > readers.length) deny();
@@ -165,19 +168,22 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
   if (new Set(pinned.map((target) => target.provider)).size !== pinned.length
     || new Set(pinned.map((target) => target.namespace)).size !== pinned.length) deny();
   pinnedDomains(providerDomainPinset, scope, pinned);
+  if (deadline !== undefined && !isZk1ProviderDeadline(deadline)) deny();
+  const limit = deadline || createZk1ProviderDeadline({ deadlineMs, parentSignal: abortSignal });
   const address = copyAddress(scope, operationId);
   const recovered = [];
+  try {
   for (const target of pinned) {
     let dir;
     try {
-      if (await target.adapter.resolveInventoryContext() !== target.context) deny();
+      if (await limit.run(() => target.adapter.resolveInventoryContext()) !== target.context) deny();
       dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-read-"));
       const destination = path.join(dir, "catalog.ct");
-      const received = await target.adapter.download(address.folder, address.name,
-        destination, "uploads", () => true,
+      const received = await limit.run((signal) => target.adapter.download(address.folder, address.name,
+        destination, "uploads", () => !signal.aborted,
         { maxBytes: MAX, ...(target.driveFileId === null ? {}
-          : { providerFileId: target.driveFileId }) });
-      if (received !== true || await target.adapter.resolveInventoryContext() !== target.context
+          : { providerFileId: target.driveFileId }), abortSignal: signal }));
+      if (received !== true || await limit.run(() => target.adapter.resolveInventoryContext()) !== target.context
         || target.adapter.zk1StorageNamespace() !== target.namespace) deny();
       const info = fs.lstatSync(destination, { bigint: true });
       if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1n
@@ -199,7 +205,12 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
       } finally { fs.closeSync(fd); }
       const parsed = parseCatalog(data, operationId);
       recovered.push({ data, parsed, provider: target.provider });
-    } catch (_) { /* unknown/missing/corrupt provider is excluded from quorum */ }
+      const matching = recovered.filter((item) => item.data.equals(data));
+      if (matching.length >= minimumMatchingProviders) break;
+    } catch (_) {
+      if (limit.signal.aborted) deny();
+      // An unavailable or corrupt provider is excluded from quorum.
+    }
     finally { if (dir) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); }
   }
   const groups = new Map();
@@ -214,6 +225,7 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
     providers: Object.freeze(eligible[0].map((item) => item.provider)),
     matchingCount: eligible[0].length, remoteDurabilityProven: false,
     signaturesVerifiedBySidecar: false });
+  } finally { if (!deadline) limit.close(); }
 }
 
 module.exports = { publishSignedCatalogSidecars, recoverSignedCatalogSidecar,

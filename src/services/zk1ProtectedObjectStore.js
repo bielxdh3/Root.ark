@@ -626,14 +626,19 @@ class Zk1ProtectedObjectStore {
         .run(key, revision, digest);
     }).immediate();
   }
-  async runRestoreGetAdmission(input, pinnedOperation, emit) {
+  async runRestoreGetAdmission(input, pinnedOperation, emit, { abortSignal } = {}) {
     if (!this.admissionRequired || !this.signedHistoryRequired
-      || typeof emit !== "function") fail("ZK_CONTENT_GATE_REQUIRED");
+      || typeof emit !== "function"
+      || (abortSignal !== undefined && !(abortSignal instanceof AbortSignal))) {
+      fail("ZK_CONTENT_GATE_REQUIRED");
+    }
+    if (abortSignal?.aborted) fail("ZK_CONTENT_UNAVAILABLE");
     const authenticated = await this.authorize(input, "get");
     return this.#withAdmission(authenticated, "get", () => {
+      if (abortSignal?.aborted) fail("ZK_CONTENT_UNAVAILABLE");
       this.#consumeRestoreGet(authenticated, pinnedOperation);
       return emit();
-    });
+    }, abortSignal);
   }
   async runWithAdmission(input, operation, emit) {
     if (typeof emit !== "function" || !["put", "get"].includes(operation)) fail();
@@ -641,7 +646,8 @@ class Zk1ProtectedObjectStore {
     return this.#withAdmission(authenticated, operation,
       () => emit(this.perform(authenticated, operation)));
   }
-  async #withAdmission(authenticated, operation, effect) {
+  async #withAdmission(authenticated, operation, effect, abortSignal) {
+    if (abortSignal?.aborted) fail("ZK_CONTENT_UNAVAILABLE");
     if (!this.admissionRequired) {
       return effect();
     }
@@ -666,7 +672,7 @@ class Zk1ProtectedObjectStore {
       mayProceed = receipt.proceed;
     } catch (_) { fail("ZK_CONTENT_UNAVAILABLE"); }
     try {
-      if (!mayProceed) fail("ZK_CONTENT_UNAVAILABLE");
+      if (!mayProceed || abortSignal?.aborted) fail("ZK_CONTENT_UNAVAILABLE");
       // The caller's emit() must settle only when response bytes have crossed
       // the trusted application egress boundary, or the socket was closed.
       // The witness refuses to reserve while this admission is ACTIVE.

@@ -10,6 +10,8 @@ const express = require("express");
 const { Zk1ProtectedObjectStore } = require("../services/zk1ProtectedObjectStore");
 const { Zk1MultiproviderCiphertextRestore } =
   require("../services/zk1MultiproviderCiphertextRestore");
+const { validDeadlineMs, DEFAULT_PROVIDER_DEADLINE_MS } =
+  require("../services/zk1ProviderDeadline");
 
 const ROUTE = "/zk-1/v1/multiprovider-restore/read";
 const PINS = ["pinnedInventoryPublicKey", "pinnedInventorySignerKeyId",
@@ -55,6 +57,7 @@ function serializeResult(restored) {
 function registerZk1AuthenticatedMultiproviderRestoreRoute({
   app, store, authenticate, requirePermission, resolveTrustedScope,
   gatewayPins, restoreInput, environment,
+  ioDeadlineMs = DEFAULT_PROVIDER_DEADLINE_MS,
 }) {
   if (!["development", "test"].includes(environment)
     || !app || typeof app.post !== "function"
@@ -63,6 +66,7 @@ function registerZk1AuthenticatedMultiproviderRestoreRoute({
     || typeof authenticate !== "function" || typeof requirePermission !== "function"
     || typeof resolveTrustedScope !== "function") deny();
   exact(gatewayPins, PINS); // Explicitly REJECT assertCurrentAuthorization or arbitrary hook.
+  validDeadlineMs(ioDeadlineMs);
   if (!restoreInput || !["cloud-catalog", undefined].includes(restoreInput.mode)) deny();
   const source = restoreInput?.mode === "cloud-catalog" ? restoreInput.request : restoreInput;
   const operation = source?.operation;
@@ -95,7 +99,20 @@ function registerZk1AuthenticatedMultiproviderRestoreRoute({
     next();
   }, authenticate, permission, content, async (req, res) => {
     let restored;
+    const cancellation = new AbortController();
+    const disconnected = () => cancellation.abort();
+    // Terminate the socket at the absolute operator deadline. The witness
+    // admission is NOT released by this timer: #withAdmission waits for the
+    // actual provider promise to settle after cancellation.
+    const watchdog = setTimeout(() => {
+      cancellation.abort();
+      if (res.headersSent) res.destroy();
+      else if (!res.destroyed) res.status(403).json({ error: "ZK_MULTIPROVIDER_HTTP_DENIED" });
+    }, ioDeadlineMs);
+    res.once("close", disconnected);
+    req.once("aborted", disconnected);
     try {
+      if (req.aborted || res.destroyed) deny();
       checkedScope(req.user);
       exact(req.body, ["authorization", "signatureBase64"]);
       const auth = req.body.authorization;
@@ -141,11 +158,15 @@ function registerZk1AuthenticatedMultiproviderRestoreRoute({
       // construct a PRIVATE gateway bound to the protected store for THIS call.
       const gateway = new Zk1MultiproviderCiphertextRestore({
         ...gatewayPins, assertCurrentAuthorization: checkLive,
+        ioDeadlineMs,
       });
       await store.runRestoreGetAdmission(signedRequest, pinned, async () => {
+        if (cancellation.signal.aborted) deny();
         restored = restoreInput.mode === "cloud-catalog"
-          ? await gateway.restoreFromCloudCatalog(restoreInput.request)
-          : await gateway.restoreExact(restoreInput);
+          ? await gateway.restoreFromCloudCatalog(restoreInput.request,
+            { abortSignal: cancellation.signal })
+          : await gateway.restoreExact(restoreInput, { abortSignal: cancellation.signal });
+        if (cancellation.signal.aborted) deny();
         if (!same(restored.operationId, pinned.operationId)) deny();
         // Re-evaluate current sessionVersion, expiry, CSRF, permission and
         // account scope AFTER slow provider reads and before socket egress.
@@ -166,7 +187,7 @@ function registerZk1AuthenticatedMultiproviderRestoreRoute({
         checkedScope(req.user);
         if (req.authExpiresAt !== null && req.authExpiresAt !== undefined
           && Date.now() >= req.authExpiresAt) deny();
-        if (res.destroyed || res.writableEnded) deny();
+        if (cancellation.signal.aborted || res.destroyed || res.writableEnded) deny();
         await new Promise((resolve, reject) => {
           const finish = () => { res.off("finish", finish); res.off("close", finish); resolve(); };
           res.once("finish", finish); res.once("close", finish);
@@ -176,7 +197,12 @@ function registerZk1AuthenticatedMultiproviderRestoreRoute({
       });
     } catch (_) {
       if (!res.headersSent && !res.destroyed) res.status(403).json({ error: "ZK_MULTIPROVIDER_HTTP_DENIED" });
-    } finally { restored?.ciphertext?.fill(0); }
+    } finally {
+      clearTimeout(watchdog);
+      res.off("close", disconnected);
+      req.off("aborted", disconnected);
+      restored?.ciphertext?.fill(0);
+    }
   });
   return Object.freeze({ route: ROUTE, developmentOnly: true });
 }

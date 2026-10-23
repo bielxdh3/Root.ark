@@ -149,23 +149,27 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
       return `${namespace}/uploads/${folder}/${name}`;
     }
 
-    function transfer(method, objectKey, uploadBytes, expectedLength) {
+    function transfer(method, objectKey, uploadBytes, expectedLength, abortSignal) {
       return new Promise((resolve, reject) => {
         let complete = false;
         let total = 0;
         const parts = [];
         let timer;
         let request;
+        const cancelled = () => finish(unavailable());
         const finish = (error, value) => {
           if (complete) return;
           complete = true;
           clearTimeout(timer);
+          if (abortSignal) abortSignal.removeEventListener("abort", cancelled);
           if (error) {
             if (request) request.destroy();
             reject(unavailable());
           } else resolve(value);
         };
         try {
+          if (abortSignal?.aborted) return finish(unavailable());
+          if (abortSignal) abortSignal.addEventListener("abort", cancelled, { once: true });
           const headers = { "accept-encoding": "identity" };
           if (authorization) headers.authorization = authorization;
           if (method === "PUT") {
@@ -217,6 +221,7 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
           });
           request.on("error", () => finish(unavailable()));
           timer = setTimeout(() => finish(unavailable()), DEADLINE_MS);
+          if (abortSignal?.aborted) return finish(unavailable());
           request.end(uploadBytes || undefined);
         } catch (_) { finish(unavailable()); }
       });
@@ -242,13 +247,15 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
       async download(folder, name, destination, area, allowWrite, opts) {
         try {
           const objectKey = key(folder, name, area);
-          ensure(opts && Object.keys(opts).length === 1
+          ensure(opts && Object.keys(opts).length === (opts.abortSignal === undefined ? 1 : 2)
             && Number.isSafeInteger(opts.maxBytes) && opts.maxBytes >= 1
             && opts.maxBytes <= MAX_BYTES && typeof destination === "string"
+            && (opts.abortSignal === undefined || opts.abortSignal instanceof AbortSignal)
+            && !opts.abortSignal?.aborted
             && typeof allowWrite === "function" && allowWrite() === true);
           const parent = pinParent(destination);
-          const bytes = await transfer("GET", objectKey, null, opts.maxBytes);
-          ensure(allowWrite() === true);
+          const bytes = await transfer("GET", objectKey, null, opts.maxBytes, opts.abortSignal);
+          ensure(!opts.abortSignal?.aborted && allowWrite() === true);
           writeExclusive(destination, bytes, parent);
           return true;
         } catch (_) { throw unavailable(); }
