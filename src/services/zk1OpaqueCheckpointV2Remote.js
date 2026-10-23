@@ -38,6 +38,7 @@ const INTENT_FIELDS = ["type", ...SCOPE, "operation_id", "checkpoint_bytes",
   "checkpoint_signature", "records", "previous_sequence",
   "previous_digest", "previous_checkpoint_digest", "owner_approval",
   "owner_signature", "owner_evidence"];
+const PREDECESSOR_FIELDS = ["predecessor_cas_receipt", "predecessor_floor_receipt"];
 const APPROVAL_FIELDS = ["type", ...SCOPE, "operation_id", "checkpoint_digest",
   "previous_sequence", "previous_digest", "previous_checkpoint_digest",
   "final_sequence", "final_digest", "cas_signer_fp", "floor_signer_fp",
@@ -55,6 +56,7 @@ const MAX_WIRE = 10 * 1024 * 1024;
 const MAX_OWNER = 2 * 1024 * 1024;
 const CERT_PIN = /^(?:[0-9a-f]{2}:){31}[0-9a-f]{2}$/i;
 const ZERO = Buffer.alloc(32);
+const MAX_V2_SEQUENCE = 1000000;
 // A coordinator must never accept caller-supplied stand-ins whose head()
 // advertises FINALIZED without independently verifying a remote receipt.
 const pinnedV2Clients = new WeakSet();
@@ -66,7 +68,7 @@ const AUTHORITY_SCHEMA = `
           base_checkpoint BLOB NOT NULL, genesis_digest BLOB NOT NULL
         );
         CREATE TABLE IF NOT EXISTS transitions(
-          sequence INTEGER PRIMARY KEY CHECK(sequence=129),
+          sequence INTEGER PRIMARY KEY CHECK(sequence BETWEEN 129 AND 1000000),
           intent_hash BLOB NOT NULL, operation_id BLOB NOT NULL UNIQUE,
           checkpoint_digest BLOB NOT NULL UNIQUE, final_digest BLOB NOT NULL,
           intent BLOB NOT NULL, signer_spki BLOB NOT NULL,
@@ -90,6 +92,11 @@ const AUTHORITY_SCHEMA = `
           BEFORE DELETE ON config BEGIN SELECT RAISE(ABORT,'CONFIG_LOCKED'); END;
         CREATE TRIGGER IF NOT EXISTS no_transition_delete
           BEFORE DELETE ON transitions BEGIN SELECT RAISE(ABORT,'TRANSITION_LOCKED'); END;
+        CREATE TRIGGER IF NOT EXISTS no_transition_gap
+          BEFORE INSERT ON transitions WHEN
+            NEW.sequence!=(SELECT COALESCE(MAX(sequence),128)+1 FROM transitions)
+            OR EXISTS(SELECT 1 FROM transitions WHERE state!='FINALIZED')
+          BEGIN SELECT RAISE(ABORT,'MONOTONIC_CHECKPOINT'); END;
         CREATE TRIGGER IF NOT EXISTS no_transition_replace
           BEFORE UPDATE ON transitions WHEN
             OLD.sequence!=NEW.sequence OR OLD.intent_hash!=NEW.intent_hash
@@ -116,6 +123,7 @@ const AUTHORITY_SCHEMA = `
 const AUTHORITY_TRIGGERS = [
   ["no_config_change", "config"], ["no_config_delete", "config"],
   ["no_transition_delete", "transitions"],
+  ["no_transition_gap", "transitions"],
   ["no_transition_replace", "transitions"],
   ["no_transition_downgrade", "transitions"],
 ];
@@ -227,8 +235,8 @@ async function signCheckpointOwnerApprovalV2(statement, privateKey) {
   const { type, ...rest } = statement;
   if (type !== "rootark-opaque-checkpoint-remote-owner-approval/v2") fail();
   scopeOf(Object.fromEntries(SCOPE.map((name) => [name, statement[name]])));
-  num(rest.previous_sequence, 128, 128);
-  num(rest.final_sequence, 129, 129);
+  num(rest.previous_sequence, 128, MAX_V2_SEQUENCE - 1);
+  if (rest.final_sequence !== rest.previous_sequence + 1) fail();
   for (const field of ["operation_id", "checkpoint_digest", "previous_digest",
     "previous_checkpoint_digest", "final_digest", "cas_signer_fp",
     "floor_signer_fp", "checkpoint_signer_fp"]) bytes(rest[field], 32);
@@ -245,7 +253,8 @@ async function verifyOwnerRooted(intent, opts) {
   matchesScope(approval, opts.scope);
   if (!crypto.verify(null, Buffer.concat([APPROVAL_DOMAIN, intent.owner_approval]),
     opts.ownerKey, bytes(intent.owner_signature, 64))) fail();
-  if (approval.previous_sequence !== 128 || approval.final_sequence !== 129
+  if (approval.previous_sequence !== intent.previous_sequence
+    || approval.final_sequence !== intent.previous_sequence + 1
     || !same(bytes(approval.operation_id, 32), intent.operation_id)
     || !same(bytes(approval.previous_digest, 32), intent.previous_digest)
     || !same(bytes(approval.previous_checkpoint_digest, 32), intent.previous_checkpoint_digest)
@@ -312,15 +321,31 @@ async function verifyOwnerRooted(intent, opts) {
 
 async function inspectIntent(raw, opts, { freshOwner = true } = {}) {
   const body = await z.decodeDeterministic(bytes(raw, 1, MAX_WIRE));
-  exact(body, INTENT_FIELDS);
+  const previousSequence = num(body.previous_sequence, 128, MAX_V2_SEQUENCE - 1);
+  exact(body, previousSequence === 128 ? INTENT_FIELDS
+    : [...INTENT_FIELDS, ...PREDECESSOR_FIELDS]);
   if (body.type !== "rootark-opaque-checkpoint-remote-intent/v2") fail();
   matchesScope(body, opts.scope);
   bytes(body.operation_id, 32);
-  if (body.previous_sequence !== 128) fail();
   if (!Array.isArray(body.records) || body.records.length !== 1
-    || body.records[0].sequence !== 129) fail();
+    || body.records[0].sequence !== body.previous_sequence + 1) fail();
   if (!same(bytes(body.previous_digest, 32), opts.baseDigest)
     || !same(bytes(body.previous_checkpoint_digest, 32), opts.baseCheckpoint)) fail();
+  if (previousSequence > 128) {
+    const predecessorOperation = bytes(opts.previousOperationId, 32);
+    for (const [field, role, signer] of [
+      [PREDECESSOR_FIELDS[0], ROLE_CAS, opts.casKey],
+      [PREDECESSOR_FIELDS[1], ROLE_FLOOR, opts.floorKey],
+    ]) {
+      const signed = bytes(body[field], 1, 4096);
+      const data = await z.decodeDeterministic(signed);
+      await receiptMatches(signed, { scope: opts.scope, role, state: "FINALIZED",
+        sequence: previousSequence, headDigest: opts.baseDigest,
+        checkpointDigest: opts.baseCheckpoint, operationId: predecessorOperation,
+        casFp: opts.casFp, floorFp: opts.floorFp, signer,
+        nonce: bytes(data.nonce, 32), fresh: false });
+    }
+  }
   // Verify pinned owner root/witness *before* resolving historical signers.
   const checkpointDigest = hash(Buffer.from("Root.ark/zk-1/opaque-catalog-checkpoint-digest/v2\0"),
     bytes(body.checkpoint_bytes, 1, 16384), bytes(body.checkpoint_signature, 64));
@@ -335,10 +360,10 @@ async function inspectIntent(raw, opts, { freshOwner = true } = {}) {
     checkpointBytes: body.checkpoint_bytes,
     checkpointSignature: body.checkpoint_signature,
     pinnedCheckpointPublicKey: opts.checkpointKey, scope: opts.scope,
-    records: body.records, previousSequence: 128,
+    records: body.records, previousSequence: body.previous_sequence,
     previousDigest: opts.baseDigest,
     previousCheckpointDigest: opts.baseCheckpoint,
-    expectedFinalSequence: 129, expectedFinalDigest: finalDigest,
+    expectedFinalSequence: body.previous_sequence + 1, expectedFinalDigest: finalDigest,
     resolveCatalogSigner: async (header) => {
       if (header.signer_device_id !== parsedHeader.signer_device_id) fail();
       return signer;
@@ -425,7 +450,7 @@ class OpaqueCheckpointV2Authority {
     const s = this.#settings;
     const statement = { type: "rootark-opaque-checkpoint-remote-receipt/v2",
       ...s.scope, role: s.role, state,
-      sequence: state === "V1_BASELINE" ? 128 : 129,
+      sequence: state === "V1_BASELINE" ? 128 : row.sequence,
       head_digest: row.final_digest, checkpoint_digest: row.checkpoint_digest,
       operation_id: row.operation_id, cas_signer_fp: s.casFp,
       floor_signer_fp: s.floorFp, nonce: bytes(nonce, 32),
@@ -439,16 +464,34 @@ class OpaqueCheckpointV2Authority {
     this.#queue = pending.catch(() => {});
     return pending;
   }
-  #saved() { return this.#db.prepare("SELECT * FROM transitions WHERE sequence=129").get(); }
-  async #inspect(row, freshness) {
+  async #history() {
+    const rows = this.#db.prepare("SELECT * FROM transitions ORDER BY sequence").all();
+    if (rows.length > MAX_V2_SEQUENCE - 128) fail();
+    let previous = { sequence: 128, final_digest: this.#settings.baseDigest,
+      checkpoint_digest: this.#settings.baseCheckpoint, state: "FINALIZED" };
+    for (const [index, row] of rows.entries()) {
+      if (row.sequence !== previous.sequence + 1
+        || (index > 0 && previous.state !== "FINALIZED")) fail();
+      await this.#inspect(row, false, previous);
+      previous = row;
+    }
+    return rows;
+  }
+  async #inspect(row, freshness, previous) {
     const s = this.#settings;
     if (!row) return null;
     if (!["PREPARED", "CAS_COMMITTED", "FINALIZED"].includes(row.state)
       || (s.role === ROLE_FLOOR && row.state === "CAS_COMMITTED")
       || (s.role === ROLE_CAS && row.state === "PREPARED")) fail();
+    if (previous && (row.sequence !== previous.sequence + 1
+      || previous.state !== "FINALIZED")) fail();
     const inspected = await inspectIntent(row.intent, { ...s,
+      baseDigest: previous?.final_digest || s.baseDigest,
+      baseCheckpoint: previous?.checkpoint_digest || s.baseCheckpoint,
+      previousOperationId: previous?.operation_id || ZERO,
       cachedSigner: crypto.createPublicKey({ key: row.signer_spki,
         format: "der", type: "spki" }) }, { freshOwner: freshness });
+    if (row.sequence !== inspected.body.previous_sequence + 1) fail();
     if (!same(inspected.intentHash, row.intent_hash)
       || !same(inspected.operationId, row.operation_id)
       || !same(inspected.checkpointDigest, row.checkpoint_digest)
@@ -456,7 +499,7 @@ class OpaqueCheckpointV2Authority {
       || !same(inspected.signerSpki, row.signer_spki)) fail();
     const verifySavedReceipt = async (raw, role, state, signer) => {
       const statement = await z.decodeDeterministic(bytes(raw, 1, 4096));
-      await receiptMatches(raw, { scope: s.scope, role, state, sequence: 129,
+      await receiptMatches(raw, { scope: s.scope, role, state, sequence: row.sequence,
         headDigest: row.final_digest, checkpointDigest: row.checkpoint_digest,
         operationId: row.operation_id, casFp: s.casFp, floorFp: s.floorFp,
         signer, nonce: bytes(statement.nonce, 32), fresh: false });
@@ -473,45 +516,62 @@ class OpaqueCheckpointV2Authority {
   async prepare(raw, nonce) {
     if (this.role !== ROLE_FLOOR) fail();
     return this.#serial(async () => {
-      const intent = await inspectIntent(raw, this.#settings);
-      const row = this.#saved();
+      const rows = await this.#history();
+      const proposed = await z.decodeDeterministic(bytes(raw, 1, MAX_WIRE));
+      const target = num(proposed.previous_sequence, 128, MAX_V2_SEQUENCE - 1) + 1;
+      const row = rows.at(-1);
+      const predecessor = row?.sequence === target ? rows.at(-2) : row;
+      if ((predecessor?.sequence || 128) !== target - 1
+        || (predecessor && predecessor.state !== "FINALIZED")) fail("ZK_CHECKPOINT_V2_CONFLICT");
+      const intent = await inspectIntent(raw, { ...this.#settings,
+        baseDigest: predecessor?.final_digest || this.#settings.baseDigest,
+        baseCheckpoint: predecessor?.checkpoint_digest || this.#settings.baseCheckpoint,
+        previousOperationId: predecessor?.operation_id || ZERO });
       if (row) {
-        await this.#inspect(row, false);
-        if (!same(row.intent_hash, intent.intentHash)) fail("ZK_CHECKPOINT_V2_CONFLICT");
-        return this.#signed(row, row.state === "FINALIZED" ? "FINALIZED" : "PREPARED", nonce);
+        if (row.sequence === target) {
+          if (!same(row.intent_hash, intent.intentHash)) fail("ZK_CHECKPOINT_V2_CONFLICT");
+          return this.#signed(row, row.state === "FINALIZED" ? "FINALIZED" : "PREPARED", nonce);
+        }
       }
       this.#db.prepare(`INSERT INTO transitions
         (sequence,intent_hash,operation_id,checkpoint_digest,final_digest,
-        intent,signer_spki,state) VALUES (129,?,?,?,?,?,?,'PREPARED')`)
-        .run(intent.intentHash, intent.operationId, intent.checkpointDigest,
+        intent,signer_spki,state) VALUES (?,?,?,?,?,?,?,'PREPARED')`)
+        .run(target, intent.intentHash, intent.operationId, intent.checkpointDigest,
           intent.finalDigest, intent.raw, intent.signerSpki);
-      const saved = this.#saved();
-      await this.#inspect(saved, false);
+      const saved = (await this.#history()).at(-1);
       return this.#signed(saved, "PREPARED", nonce);
     });
   }
   async commit(raw, floorPrepare, nonce) {
     if (this.role !== ROLE_CAS) fail();
     return this.#serial(async () => {
-      const intent = await inspectIntent(raw, this.#settings);
+      const rows = await this.#history();
+      const proposed = await z.decodeDeterministic(bytes(raw, 1, MAX_WIRE));
+      const target = num(proposed.previous_sequence, 128, MAX_V2_SEQUENCE - 1) + 1;
+      let row = rows.at(-1);
+      const predecessor = row?.sequence === target ? rows.at(-2) : row;
+      if ((predecessor?.sequence || 128) !== target - 1
+        || (predecessor && predecessor.state !== "FINALIZED")) fail("ZK_CHECKPOINT_V2_CONFLICT");
+      const intent = await inspectIntent(raw, { ...this.#settings,
+        baseDigest: predecessor?.final_digest || this.#settings.baseDigest,
+        baseCheckpoint: predecessor?.checkpoint_digest || this.#settings.baseCheckpoint,
+        previousOperationId: predecessor?.operation_id || ZERO });
       await receiptMatches(floorPrepare, { scope: this.#settings.scope,
-        role: ROLE_FLOOR, sequence: 129,
+        role: ROLE_FLOOR, sequence: target,
         headDigest: intent.finalDigest, checkpointDigest: intent.checkpointDigest,
         operationId: intent.operationId, casFp: this.#settings.casFp,
         floorFp: this.#settings.floorFp, signer: this.#settings.floorKey,
         fresh: true });
-      let row = this.#saved();
-      if (row) {
-        await this.#inspect(row, false);
-        if (!same(row.intent_hash, intent.intentHash)) fail("ZK_CHECKPOINT_V2_CONFLICT");
-      } else {
+      if (row?.sequence === target && !same(row.intent_hash, intent.intentHash))
+        fail("ZK_CHECKPOINT_V2_CONFLICT");
+      if (!row || row.sequence !== target) {
         this.#db.prepare(`INSERT INTO transitions
           (sequence,intent_hash,operation_id,checkpoint_digest,final_digest,intent,
           signer_spki,state,floor_prepare)
-          VALUES(129,?,?,?,?,?,?,'CAS_COMMITTED',?)`)
-          .run(intent.intentHash, intent.operationId, intent.checkpointDigest,
+          VALUES(?,?,?,?,?,?,?,'CAS_COMMITTED',?)`)
+          .run(target, intent.intentHash, intent.operationId, intent.checkpointDigest,
             intent.finalDigest, intent.raw, intent.signerSpki, floorPrepare);
-        row = this.#saved();
+        row = (await this.#history()).at(-1);
       }
       return this.#signed(row, "CAS_COMMITTED", nonce);
     });
@@ -519,42 +579,40 @@ class OpaqueCheckpointV2Authority {
   async finalize(casCommit, nonce) {
     if (this.role !== ROLE_FLOOR) fail();
     return this.#serial(async () => {
-      const row = this.#saved();
+      const row = (await this.#history()).at(-1);
       if (!row) fail("ZK_CHECKPOINT_V2_CONFLICT");
-      await this.#inspect(row, false);
       await receiptMatches(casCommit, { scope: this.#settings.scope,
-        role: ROLE_CAS, state: "CAS_COMMITTED", sequence: 129,
+        role: ROLE_CAS, state: "CAS_COMMITTED", sequence: row.sequence,
         headDigest: row.final_digest, checkpointDigest: row.checkpoint_digest,
         operationId: row.operation_id, casFp: this.#settings.casFp,
         floorFp: this.#settings.floorFp, signer: this.#settings.casKey,
         fresh: true });
       if (row.state === "PREPARED") this.#db.prepare(`UPDATE transitions
-        SET state='FINALIZED',cas_commit=? WHERE sequence=129 AND state='PREPARED'`)
-        .run(casCommit);
-      return this.#signed(this.#saved(), "FINALIZED", nonce);
+        SET state='FINALIZED',cas_commit=? WHERE sequence=? AND state='PREPARED'`)
+        .run(casCommit, row.sequence);
+      return this.#signed((await this.#history()).at(-1), "FINALIZED", nonce);
     });
   }
   async attestFinalized(floorFinalized, nonce) {
     if (this.role !== ROLE_CAS) fail();
     return this.#serial(async () => {
-      const row = this.#saved();
+      const row = (await this.#history()).at(-1);
       if (!row) fail("ZK_CHECKPOINT_V2_CONFLICT");
-      await this.#inspect(row, false);
       await receiptMatches(floorFinalized, { scope: this.#settings.scope,
-        role: ROLE_FLOOR, state: "FINALIZED", sequence: 129,
+        role: ROLE_FLOOR, state: "FINALIZED", sequence: row.sequence,
         headDigest: row.final_digest, checkpointDigest: row.checkpoint_digest,
         operationId: row.operation_id, casFp: this.#settings.casFp,
         floorFp: this.#settings.floorFp, signer: this.#settings.floorKey,
         fresh: true });
       if (row.state === "CAS_COMMITTED") this.#db.prepare(`UPDATE transitions
         SET state='FINALIZED', floor_finalize=?
-        WHERE sequence=129 AND state='CAS_COMMITTED'`).run(floorFinalized);
-      return this.#signed(this.#saved(), "FINALIZED", nonce);
+        WHERE sequence=? AND state='CAS_COMMITTED'`).run(floorFinalized, row.sequence);
+      return this.#signed((await this.#history()).at(-1), "FINALIZED", nonce);
     });
   }
   async head(nonce) {
     return this.#serial(async () => {
-      const row = this.#saved();
+      const row = (await this.#history()).at(-1);
       if (!row) {
         // Even the ABSENCE of v2 state must be freshly authenticated. An
         // unsigned baseline lets a transport-only compromise conceal a
@@ -569,8 +627,7 @@ class OpaqueCheckpointV2Authority {
           checkpointDigest: Buffer.from(this.#settings.baseCheckpoint),
           proof: await this.#signed(baseline, "V1_BASELINE", nonce) };
       }
-      await this.#inspect(row, false);
-      return { state: row.state, sequence: 129, headDigest: Buffer.from(row.final_digest),
+      return { state: row.state, sequence: row.sequence, headDigest: Buffer.from(row.final_digest),
         checkpointDigest: Buffer.from(row.checkpoint_digest),
         operationId: Buffer.from(row.operation_id),
         proof: await this.#signed(row, row.state, nonce) };
@@ -724,11 +781,11 @@ function createOpaqueCheckpointV2HttpsClient({ endpoint, ca, clientKey, clientCe
       state: route === "/v2/head" ? outcome.state
         : ({ "/v2/prepare": "PREPARED", "/v2/commit": "CAS_COMMITTED",
           "/v2/finalize": "FINALIZED", "/v2/attest": "FINALIZED" })[route],
-      sequence: 129, headDigest: data.head_digest,
+      sequence: num(data.sequence, 129, MAX_V2_SEQUENCE), headDigest: data.head_digest,
       checkpointDigest: data.checkpoint_digest, operationId: data.operation_id,
       casFp, floorFp, signer, nonce, fresh: true });
     if (route === "/v2/head") {
-      if (outcome.sequence !== 129
+      if (outcome.sequence !== receipt.sequence
         || !same(bytes(Buffer.from(outcome.headDigest, "base64url"), 32),
           receipt.head_digest)
         || !same(bytes(Buffer.from(outcome.checkpointDigest, "base64url"), 32),
@@ -802,8 +859,13 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
   }
   async function confirmedState(raw) {
     const body = await z.decodeDeterministic(bytes(raw, 1, MAX_WIRE));
-    exact(body, INTENT_FIELDS);
+    const previousSequence = num(body.previous_sequence, 128, MAX_V2_SEQUENCE - 1);
+    exact(body, previousSequence === 128 ? INTENT_FIELDS
+      : [...INTENT_FIELDS, ...PREDECESSOR_FIELDS]);
     matchesScope(body, scope);
+    const finalSequence = previousSequence + 1;
+    if (!Array.isArray(body.records) || body.records.length !== 1
+      || body.records[0].sequence !== finalSequence) fail();
     const op = bytes(body.operation_id, 32);
     const requestedCheckpoint = hash(
       Buffer.from("Root.ark/zk-1/opaque-catalog-checkpoint-digest/v2\0"),
@@ -814,56 +876,77 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
       bytes(body.records?.[0]?.signature, 64));
     const [cas, floor] = await Promise.all([casClient.head(), floorClient.head()]);
     for (const head of [cas, floor]) {
-      if (head.sequence === 128) {
-        if (head.state !== "V1_BASELINE"
-          || !same(head.headDigest, oldDigest)
-          || !same(head.checkpointDigest, oldCheckpoint)) fail("ZK_CHECKPOINT_V2_BASELINE_CONFLICT");
+      if (head.sequence === previousSequence) {
+        if (head.state !== (previousSequence === 128 ? "V1_BASELINE" : "FINALIZED")
+          || !same(bytes(previousSequence === 128 ? head.headDigest : head.head_digest, 32),
+            bytes(body.previous_digest, 32))
+          || !same(bytes(previousSequence === 128 ? head.checkpointDigest : head.checkpoint_digest, 32),
+            bytes(body.previous_checkpoint_digest, 32)))
+          fail("ZK_CHECKPOINT_V2_BASELINE_CONFLICT");
       } else {
-        if (head.sequence !== 129
+        if (head.sequence !== finalSequence
           || !same(bytes(head.checkpoint_digest, 32), requestedCheckpoint)
           || !same(bytes(head.head_digest, 32), headDigest)
           || !same(bytes(head.operation_id, 32), op)) fail("ZK_CHECKPOINT_V2_CONFLICT");
       }
     }
-    return { cas, floor };
+    return { cas, floor, previousSequence, finalSequence };
   }
   async function reconcile(raw) {
     await assertV1Terminal();
     // CAS_COMMITTED and FLOOR_PREPARED are durable, but NOT public until
     // FINALIZED on both independently signed authorities.
-    let { cas, floor } = await confirmedState(raw);
-    if (cas.state === "FINALIZED" && floor.state === "FINALIZED") {
+    let { cas, floor, previousSequence, finalSequence } = await confirmedState(raw);
+    if (cas.sequence === finalSequence && floor.sequence === finalSequence
+      && cas.state === "FINALIZED" && floor.state === "FINALIZED") {
       return Object.freeze({ outcome: "V2_CHECKPOINT_BOTH_FINALIZED_LOCAL_ONLY",
-        finalSequence: 129, remoteCloudDurabilityProven: false,
+        finalSequence, remoteCloudDurabilityProven: false,
         atomicCrossDatabaseTransactionProven: false, publishedToBrowser: false });
     }
-    if (cas.sequence === 128) {
-      const prepared = floor.sequence === 128
+    if (cas.sequence === previousSequence) {
+      const prepared = floor.sequence === previousSequence
         ? await floorClient.prepare(raw) : floor;
+      floor = prepared;
       cas = await casClient.commit(raw, prepared.raw);
     }
-    if (cas.state === "FINALIZED" && floor.state !== "FINALIZED") {
+    if (cas.sequence === finalSequence && cas.state === "FINALIZED"
+      && (floor.sequence !== finalSequence || floor.state !== "FINALIZED")) {
       fail("ZK_CHECKPOINT_V2_FLOOR_NOT_FINALIZED");
     }
-    if (cas.state !== "CAS_COMMITTED" && cas.state !== "FINALIZED") fail();
-    if (floor.state !== "FINALIZED") floor = await floorClient.finalize(cas.raw);
+    if (cas.sequence !== finalSequence
+      || (cas.state !== "CAS_COMMITTED" && cas.state !== "FINALIZED")) fail();
+    if (floor.sequence !== finalSequence || floor.state !== "FINALIZED")
+      floor = await floorClient.finalize(cas.raw);
     if (cas.state !== "FINALIZED") cas = await casClient.attest(floor.raw);
     const checked = await confirmedState(raw);
-    if (checked.cas.state !== "FINALIZED" || checked.floor.state !== "FINALIZED")
+    if (checked.cas.sequence !== finalSequence || checked.floor.sequence !== finalSequence
+      || checked.cas.state !== "FINALIZED" || checked.floor.state !== "FINALIZED")
       fail("ZK_CHECKPOINT_V2_ACK_UNCERTAIN");
     return Object.freeze({ outcome: "V2_CHECKPOINT_BOTH_FINALIZED_LOCAL_ONLY",
-      finalSequence: 129, remoteCloudDurabilityProven: false,
+      finalSequence, remoteCloudDurabilityProven: false,
       atomicCrossDatabaseTransactionProven: false, publishedToBrowser: false });
   }
   return Object.freeze({
     publish: reconcile,
     reconcile,
+    predecessorEndorsements: async (raw) => {
+      await assertV1Terminal();
+      const states = await confirmedState(raw);
+      if (states.cas.sequence !== states.finalSequence
+        || states.floor.sequence !== states.finalSequence
+        || states.cas.state !== "FINALIZED" || states.floor.state !== "FINALIZED")
+        fail("ZK_CHECKPOINT_V2_PENDING");
+      return Object.freeze({ predecessor_cas_receipt: Buffer.from(states.cas.raw),
+        predecessor_floor_receipt: Buffer.from(states.floor.raw) });
+    },
     readConsistent: async (raw) => {
       await assertV1Terminal();
       const states = await confirmedState(raw);
-      if (states.cas.state !== "FINALIZED" || states.floor.state !== "FINALIZED")
+      if (states.cas.sequence !== states.finalSequence
+        || states.floor.sequence !== states.finalSequence
+        || states.cas.state !== "FINALIZED" || states.floor.state !== "FINALIZED")
         fail("ZK_CHECKPOINT_V2_PENDING");
-      return { sequence: 129, checkpointDigest:
+      return { sequence: states.finalSequence, checkpointDigest:
         Buffer.from(states.cas.checkpoint_digest), publishedToBrowser: false };
     },
   });

@@ -579,6 +579,95 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   assert.equal((await z.decodeDeterministic(await v1Cas.readHead({
     scope, nonce: crypto.randomBytes(32) }))).sequence, 128);
   assert.equal(floorLedger.inspect().sequence, 128);
+  // Signed successive V2 checkpoints use the same immutable V1 terminal and
+  // distinct owner approvals, checkpoint signatures and CAS/floor receipts.
+  const ownerEvidence = (await z.decodeDeterministic(intent)).owner_evidence;
+  async function successorRecord(sequence, previousDigest) {
+    const header = { ...nextHeader, sequence, previous_digest: previousDigest,
+      issued_at: now() };
+    const raw = Buffer.from(await z.encodeDeterministic(header));
+    const signature = crypto.sign(null, Buffer.concat([HEAD_DOMAIN, raw]), keys(deviceB));
+    return { sequence, record: { sequence, header: raw, signature,
+      page_bodies: [encryptedPage] }, digest: hd(raw, signature) };
+  }
+  const next130 = await successorRecord(130, newDigest);
+  const publishSuccessor = (record) => client.publish({ record,
+    checkpointPrivateKey: checkpoint.privateKey, ownerPrivateKey: owner.privateKey,
+    ownerEvidence });
+  await assert.rejects(publishSuccessor((await successorRecord(131, newDigest)).record),
+    /ZK_OPAQUE_CHECKPOINT_V2_UNVERIFIED/,
+    "a skipped sequence is never admitted by merely increasing the ceiling");
+  const published130 = await publishSuccessor(next130.record);
+  assert.equal(published130.sequence, 130);
+  assert.deepEqual(published130.digest, next130.digest);
+  assert.equal((await handles.casClient.head()).sequence, 130);
+  assert.equal((await handles.floorClient.head()).sequence, 130);
+  await assert.rejects(client.publishSignedIntent(intent),
+    /ZK_CHECKPOINT_V2_(?:CLIENT_)?UNAVAILABLE/,
+    "replaying the 129 owner intent cannot advance or rewind the journal");
+  await assert.rejects(publishSuccessor((await successorRecord(131, oldDigest)).record),
+    /ZK_OPAQUE_CHECKPOINT_V2_UNVERIFIED/,
+    "a valid signer cannot fork the signed predecessor digest");
+  await stopV2();
+  floor2 = new OpaqueCheckpointV2Authority(path.join(dir, "v2-floor.sqlite"), {
+    ...authorityOptions, role: "FLOOR", bootstrapNew: false,
+    signingPrivateKey: v2FloorKeys.privateKey });
+  cas2 = new OpaqueCheckpointV2Authority(path.join(dir, "v2-cas.sqlite"), {
+    ...authorityOptions, role: "CAS", bootstrapNew: false,
+    signingPrivateKey: v2CasKeys.privateKey });
+  handles = await serveV2({});
+  client.close();
+  client = new Zk1OpaqueCheckpointV2Client(clientOptions(handles, journal, false));
+  assert.equal((await client.read()).sequence, 130,
+    "the complete 129->130 locally durable chain survives restart");
+  const next131 = await successorRecord(131, next130.digest);
+  const published131 = await publishSuccessor(next131.record);
+  assert.equal(published131.sequence, 131);
+  assert.equal((await handles.casClient.head()).sequence, 131);
+  assert.equal((await handles.floorClient.head()).sequence, 131);
+  const signedHistory = await client.exportSignedIntents();
+  assert.equal(signedHistory.length, 3);
+  const second = new Zk1OpaqueCheckpointV2Client(clientOptions(handles,
+    path.join(dir, "v2-second-device.sqlite"), true));
+  try {
+    await second.importSignedIntent(signedHistory[0]);
+    await assert.rejects(second.read(), /ZK_CHECKPOINT_V2_CONFLICT/,
+      "a second device with only 129 cannot accept rollback from remote 131");
+    const alteredEndorsement = await z.decodeDeterministic(signedHistory[1]);
+    const spoofedCas = await z.decodeDeterministic(
+      alteredEndorsement.predecessor_cas_receipt);
+    spoofedCas.signature = crypto.randomBytes(64);
+    alteredEndorsement.predecessor_cas_receipt = Buffer.from(
+      await z.encodeDeterministic(spoofedCas));
+    await assert.rejects(second.importSignedIntent(Buffer.from(
+      await z.encodeDeterministic(alteredEndorsement))),
+    /ZK_CHECKPOINT_V2_UNAVAILABLE/,
+    "successor requires the actual CAS signed FINALIZED predecessor proof");
+    await second.importSignedIntent(signedHistory[1]);
+    await second.importSignedIntent(signedHistory[2]);
+    assert.equal((await second.read()).sequence, 131);
+    await assert.rejects(second.importSignedIntent(signedHistory[2]),
+      /ZK_CHECKPOINT_V2_UNAVAILABLE/,
+      "replayed owner intent cannot duplicate an imported checkpoint");
+    const forgedIntent = await z.decodeDeterministic(signedHistory[2]);
+    forgedIntent.owner_signature = crypto.randomBytes(64);
+    await assert.rejects(second.importSignedIntent(Buffer.from(
+      await z.encodeDeterministic(forgedIntent))), /ZK_CHECKPOINT_V2_UNAVAILABLE/);
+  } finally { second.close(); }
+  const forgedSuccessorDb = path.join(dir, "v2-forged-successor-trigger.sqlite");
+  const sourceJournal = new Database(journal, { readonly: true, fileMustExist: true });
+  await sourceJournal.backup(forgedSuccessorDb);
+  sourceJournal.close();
+  if (process.platform !== "win32") fs.chmodSync(forgedSuccessorDb, 0o600);
+  const forgedDb = new Database(forgedSuccessorDb);
+  forgedDb.exec(`DROP TRIGGER successors_no_gap;
+    CREATE TRIGGER successors_no_gap BEFORE INSERT ON successors
+    BEGIN SELECT 1; END;`);
+  forgedDb.close();
+  assert.throws(() => new Zk1OpaqueCheckpointV2Client(
+    clientOptions(handles, forgedSuccessorDb, false)),
+  /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+  "a forged local append guard must fail closed on restart");
   await stopV2();
   await assert.rejects(client.read(), /ZK_CHECKPOINT_V2_ACK_UNCERTAIN/,
     "offline CAS/floor must fence metadata read even after local recovery");

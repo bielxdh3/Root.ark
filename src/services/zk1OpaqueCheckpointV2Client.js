@@ -11,10 +11,28 @@ const z = require("../crypto/rootark-zk-1");
 const archive = require("../crypto/rootark-zk1-opaque-catalog-checkpoint-v2");
 const { createOpaqueCheckpointV2Coordinator, signCheckpointOwnerApprovalV2,
   inspectIntent } = require("./zk1OpaqueCheckpointV2Remote");
+const { requireCheckpointV2Triggers } =
+  require("./zk1OpaqueCheckpointV2SqliteGuard");
 
 const APPROVAL_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-checkpoint-remote/owner-approval/v2\0");
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
 const ZERO = Buffer.alloc(32);
+const SUCCESSOR_SCHEMA = `CREATE TABLE IF NOT EXISTS successors (
+    sequence INTEGER PRIMARY KEY CHECK(sequence BETWEEN 130 AND 1000000),
+    bytes BLOB NOT NULL);
+  CREATE TRIGGER IF NOT EXISTS successors_immutable_update BEFORE UPDATE ON successors
+    BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;
+  CREATE TRIGGER IF NOT EXISTS successors_immutable_delete BEFORE DELETE ON successors
+    BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;
+  CREATE TRIGGER IF NOT EXISTS successors_no_gap BEFORE INSERT ON successors WHEN
+    (SELECT COUNT(*) FROM intent WHERE id=1)!=1
+    OR NEW.sequence!=(SELECT COALESCE(MAX(sequence),129)+1 FROM successors)
+    BEGIN SELECT RAISE(ABORT,'NONCONTIGUOUS_CHECKPOINT'); END;`;
+const SUCCESSOR_TRIGGERS = [
+  ["successors_immutable_update", "successors"],
+  ["successors_immutable_delete", "successors"],
+  ["successors_no_gap", "successors"],
+];
 function deny() {
   const err = new Error("ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE");
   err.code = "ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE";
@@ -107,6 +125,7 @@ class Zk1OpaqueCheckpointV2Client {
           || !db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='intent_immutable_delete'").get()) deny();
         const pinned = db.prepare("SELECT pins FROM identity WHERE id=1").get();
         if (!pinned || !equal(pinned.pins, identity)) deny();
+        requireCheckpointV2Triggers(db, SUCCESSOR_SCHEMA, SUCCESSOR_TRIGGERS, deny);
       }
       db.pragma("journal_mode=WAL");
       db.pragma("synchronous=FULL");
@@ -119,11 +138,13 @@ class Zk1OpaqueCheckpointV2Client {
             BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END;`);
         db.prepare("INSERT INTO identity VALUES(1,?)").run(identity);
       }
+      if (bootstrapNew) db.exec(SUCCESSOR_SCHEMA);
     } catch (error) { db.close(); throw error; }
     this.#db = db;
     this.#coordinator = coordinator;
     this.#trust = { scope, digest, checkpoint, casFp: fingerprints[0],
-      floorFp: fingerprints[1], checkpointFp: fingerprints[2],
+      floorFp: fingerprints[1], casKey: cas, floorKey: floor,
+      checkpointFp: fingerprints[2],
       checkpointKey, ownerKey, catalogKey, ownerTrust };
   }
   #serial(fn) {
@@ -132,16 +153,22 @@ class Zk1OpaqueCheckpointV2Client {
     return result;
   }
   #saved() {
-    const row = this.#db.prepare("SELECT bytes FROM intent WHERE id=1").get();
+    const row = this.#db.prepare("SELECT bytes FROM successors ORDER BY sequence DESC LIMIT 1").get()
+      || this.#db.prepare("SELECT bytes FROM intent WHERE id=1").get();
     return row ? Buffer.from(row.bytes) : null;
   }
-  async #inspect(raw, freshOwner) {
+  async #inspect(raw, freshOwner, previous = { sequence: 128,
+    digest: this.#trust.digest, checkpointDigest: this.#trust.checkpoint,
+    operationId: ZERO }) {
     const t = this.#trust;
     const inspected = await inspectIntent(raw, {
-      scope: t.scope, baseDigest: t.digest, baseCheckpoint: t.checkpoint,
+      scope: t.scope, baseDigest: previous.digest,
+      baseCheckpoint: previous.checkpointDigest,
       casFp: t.casFp, floorFp: t.floorFp, checkpointFp: t.checkpointFp,
       checkpointKey: t.checkpointKey, ownerKey: t.ownerKey,
       ownerTrust: t.ownerTrust, cachedSigner: t.catalogKey,
+      casKey: t.casKey, floorKey: t.floorKey,
+      previousOperationId: previous.operationId,
     }, { freshOwner });
     // Historical reads cannot demand a fresh witness from a device that was
     // revoked AFTER publication. Preserve the signed owner approval binding.
@@ -159,23 +186,40 @@ class Zk1OpaqueCheckpointV2Client {
       || !equal(bytes(approval.cas_signer_fp, 32), t.casFp)
       || !equal(bytes(approval.floor_signer_fp, 32), t.floorFp)
       || !equal(bytes(approval.checkpoint_signer_fp, 32), t.checkpointFp)
-      || !equal(bytes(approval.previous_digest, 32), t.digest)
-      || !equal(bytes(approval.previous_checkpoint_digest, 32), t.checkpoint)
-      || approval.previous_sequence !== 128 || approval.final_sequence !== 129) deny();
+      || !equal(bytes(approval.previous_digest, 32), previous.digest)
+      || !equal(bytes(approval.previous_checkpoint_digest, 32), previous.checkpointDigest)
+      || approval.previous_sequence !== previous.sequence
+      || approval.final_sequence !== previous.sequence + 1) deny();
     return inspected;
+  }
+  async #chain() {
+    const first = this.#db.prepare("SELECT bytes FROM intent WHERE id=1").get();
+    const successors = this.#db.prepare("SELECT sequence,bytes FROM successors ORDER BY sequence").all();
+    if (!first && successors.length) deny();
+    let previous = { sequence: 128, digest: this.#trust.digest,
+      checkpointDigest: this.#trust.checkpoint, operationId: ZERO };
+    for (const item of first ? [{ sequence: 129, bytes: first.bytes }, ...successors] : []) {
+      if (item.sequence !== previous.sequence + 1) deny();
+      const inspected = await this.#inspect(item.bytes, false, previous);
+      previous = { sequence: item.sequence, digest: inspected.finalDigest,
+        checkpointDigest: inspected.checkpointDigest,
+        operationId: inspected.operationId, inspected };
+    }
+    return previous;
   }
   async #read() {
     const raw = this.#saved();
     if (!raw) deny();
-    const checked = await this.#inspect(raw, false);
+    const last = await this.#chain();
+    const checked = last.inspected;
     const state = await this.#coordinator.readConsistent(raw);
-    if (state.sequence !== 129
+    if (state.sequence !== last.sequence
       || !equal(bytes(state.checkpointDigest, 32), checked.checkpointDigest)) deny();
     const record = checked.body.records[0];
     const head = await z.decodeDeterministic(record.header);
     const pages = [];
     for (const p of record.page_bodies) pages.push(await z.decodeDeterministic(p));
-    return Object.freeze({ sequence: 129, digest: checked.finalDigest,
+    return Object.freeze({ sequence: last.sequence, digest: checked.finalDigest,
       checkpointDigest: checked.checkpointDigest, head,
       pages, state: "V2_BOTH_FINALIZED", remoteCloudDurabilityProven: false });
   }
@@ -184,23 +228,30 @@ class Zk1OpaqueCheckpointV2Client {
     issuedAt = Math.floor(Date.now() / 1000), ownerIssuedAt = issuedAt }) {
     return this.#serial(async () => {
       const t = this.#trust;
-      if (this.#saved()) deny(); // recovery must reuse the exact durable intent
+      const prior = await this.#chain();
+      const existing = this.#saved();
+      // An earlier pending intent must be reconciled before any new owner intent.
+      const endorsements = existing
+        ? await this.#coordinator.predecessorEndorsements(existing) : null;
+      if (prior.sequence >= 1000000) deny();
       if (!equal(fp(crypto.createPublicKey(key(checkpointPrivateKey, "private"))),
         t.checkpointFp) || !equal(fp(crypto.createPublicKey(key(ownerPrivateKey, "private"))),
         fp(t.ownerKey))) deny();
       const archived = await archive.createAuthenticatedOpaqueCatalogArchiveV2({
-        scope: t.scope, records: [record], previousSequence: 128,
-        previousDigest: t.digest, previousCheckpointDigest: t.checkpoint,
+        scope: t.scope, records: [record], previousSequence: prior.sequence,
+        previousDigest: prior.digest,
+        previousCheckpointDigest: prior.checkpointDigest,
         resolveCatalogSigner: async () => t.catalogKey,
         checkpointPrivateKey, issuedAt,
       });
-      if (archived.records[0].sequence !== 129) deny();
+      if (archived.records[0].sequence !== prior.sequence + 1) deny();
       const approval = await signCheckpointOwnerApprovalV2({
         type: "rootark-opaque-checkpoint-remote-owner-approval/v2",
         ...t.scope, operation_id: bytes(operationId, 32),
-        checkpoint_digest: archived.checkpointDigest, previous_sequence: 128,
-        previous_digest: t.digest, previous_checkpoint_digest: t.checkpoint,
-        final_sequence: 129,
+        checkpoint_digest: archived.checkpointDigest,
+        previous_sequence: prior.sequence, previous_digest: prior.digest,
+        previous_checkpoint_digest: prior.checkpointDigest,
+        final_sequence: prior.sequence + 1,
         final_digest: crypto.createHash("sha256")
           .update(Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0"))
           .update(archived.records[0].header).update(archived.records[0].signature).digest(),
@@ -211,13 +262,14 @@ class Zk1OpaqueCheckpointV2Client {
         type: "rootark-opaque-checkpoint-remote-intent/v2", ...t.scope,
         operation_id: bytes(operationId, 32), checkpoint_bytes: archived.checkpointBytes,
         checkpoint_signature: archived.checkpointSignature, records: archived.records,
-        previous_sequence: 128, previous_digest: t.digest,
-        previous_checkpoint_digest: t.checkpoint,
+        previous_sequence: prior.sequence, previous_digest: prior.digest,
+        previous_checkpoint_digest: prior.checkpointDigest,
         owner_approval: approval.raw, owner_signature: approval.signature,
         owner_evidence: Buffer.from(ownerEvidence),
+        ...(endorsements || {}),
       }));
-      await this.#inspect(raw, true);
-      this.#db.prepare("INSERT INTO intent(id,bytes) VALUES(1,?)").run(raw);
+      await this.#inspect(raw, true, prior);
+      this.#append(raw, prior.sequence + 1);
       await this.#coordinator.publish(raw);
       return this.#read();
     });
@@ -225,24 +277,59 @@ class Zk1OpaqueCheckpointV2Client {
   publishSignedIntent(signedIntent) {
     return this.#serial(async () => {
       const raw = Buffer.from(signedIntent);
-      await this.#inspect(raw, true);
       const saved = this.#saved();
-      if (saved && !equal(saved, raw)) deny();
-      if (!saved) this.#db.prepare("INSERT INTO intent(id,bytes) VALUES(1,?)").run(raw);
+      const prior = await this.#chain();
+      if (!saved || !equal(saved, raw)) {
+        if (saved) await this.#coordinator.readConsistent(saved);
+        const inspected = await this.#inspect(raw, true, prior);
+        this.#append(raw, prior.sequence + 1);
+        if (inspected.body.previous_sequence !== prior.sequence) deny();
+      } else {
+        await this.#chain();
+      }
       await this.#coordinator.publish(raw);
       return this.#read();
+    });
+  }
+  // A second device can import an authenticated chain before reading. The
+  // remote signed heads still decide whether the final imported entry is
+  // current; a local imported journal alone never grants a metadata read.
+  importSignedIntent(signedIntent) {
+    return this.#serial(async () => {
+      if ((!Buffer.isBuffer(signedIntent) && !(signedIntent instanceof Uint8Array))
+        || signedIntent.byteLength < 1 || signedIntent.byteLength > 10 * 1024 * 1024)
+        deny();
+      const raw = Buffer.from(signedIntent);
+      const prior = await this.#chain();
+      await this.#inspect(raw, false, prior);
+      this.#append(raw, prior.sequence + 1);
+      return { importedSequence: prior.sequence + 1, remotelyFinalized: false };
+    });
+  }
+  exportSignedIntents() {
+    return this.#serial(async () => {
+      await this.#chain();
+      const first = this.#db.prepare("SELECT bytes FROM intent WHERE id=1").get();
+      return (first ? [first] : []).concat(this.#db.prepare(
+        "SELECT bytes FROM successors ORDER BY sequence").all())
+        .map((entry) => Buffer.from(entry.bytes));
     });
   }
   recover() {
     return this.#serial(async () => {
       const raw = this.#saved();
       if (!raw) deny();
-      await this.#inspect(raw, false);
+      await this.#chain();
       await this.#coordinator.reconcile(raw);
       return this.#read();
     });
   }
   read() { return this.#serial(() => this.#read()); }
+  #append(raw, sequence) {
+    if (sequence === 129) this.#db.prepare("INSERT INTO intent(id,bytes) VALUES(1,?)").run(raw);
+    else this.#db.prepare("INSERT INTO successors(sequence,bytes) VALUES(?,?)")
+      .run(sequence, raw);
+  }
   close() { if (this.#db.open) this.#db.close(); }
 }
 function encodeIdentity(scope, digest, checkpoint, fingerprints) {

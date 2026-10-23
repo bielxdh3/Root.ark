@@ -64,7 +64,7 @@ function withReadonlySqliteSnapshot(filename, inspect, reject, maxBytes) {
 function requireCheckpointV2Triggers(db, schema, expected, reject) {
   if (db.pragma("quick_check", { simple: true }) !== "ok") reject();
   const definitions = [...schema.matchAll(
-    /CREATE TRIGGER IF NOT EXISTS ([a-z_]+)\s+BEFORE (?:UPDATE|DELETE) ON ([a-z_]+)[\s\S]*?END;/g,
+    /CREATE TRIGGER IF NOT EXISTS ([a-z_]+)\s+BEFORE (?:INSERT|UPDATE|DELETE) ON ([a-z_]+)[\s\S]*?END;/g,
   )];
   if (definitions.length !== expected.length
     || new Set(definitions.map((match) => match[1])).size !== expected.length) reject();
