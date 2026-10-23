@@ -65,6 +65,11 @@ prove these external workflows completed.
 3. mTLS sockets and independently pinned signing keys in disposable
    multi-process tests do not prove physical ownership or failure-domain
    separation of real cloud tenants/hosts.
+   The optional opaque-catalog CAS service persists a separately signed
+   head and opaque pages atomically in its **own local SQLite WAL/FULL** with
+   a strict independently supplied monotonic floor. Its proof authenticates
+   that authority's signed local event; it does not prove a remote tenant's
+   `fsync` or independently administered external floor custody.
 4. A cloud HTTP ACK or a 2/3 signed catalog quorum without independent
    external custody and authenticated physical readback cannot establish
    indefinite retention of the bytes. Deadlines and STOP/fencing are
@@ -105,6 +110,10 @@ prove these external workflows completed.
 - `public/client/rootark-zk1-browser-catalog.js`: optional authenticated
   browser read-only opaque catalog; externally pinned CAS, current signed
   grants and IndexedDB floor without plaintext routing through sync-v2.
+- `src/services/zk1OpaqueCatalogCasLedger.js` and
+  `test/issue-65-opaque-cas-real-multiprocess.test.js`: independent mTLS
+  CAS journal/receipt, persistent signed ciphertext-page evidence, competing
+  writers and replay/rollback/lost-ACK negative tests.
 - `test/issue-65-versioned-keyring-ciphertext-archive.test.js`: true Edge
   multiversion signed-CBOR recovery plus adversarial roster substitution
   regression; the second unsigned roster is rejected before minting authority.

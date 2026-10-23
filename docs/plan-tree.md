@@ -23,6 +23,20 @@ The browser catalog still requires independently pinned CAS/owner authority
 and user-imported head and remains read-only; owner revocation transfer is not
 automatic proof of current full V2 grant/history or remote key custody.
 
+**Independent catalog CAS development extension:** local commit `90932d7`
+adds an explicit opt-in standalone mTLS HTTPS CAS service/client with a
+separately pinned Ed25519 signing identity, trusted device-signed catalog
+headers and encrypted pages, atomic local SQLite WAL/FULL persistence and
+monotonic floor, writer competition, replay checks, bounded transport and
+lost-ACK reconciliation. Its integrated Node24 catalog/Edge selection passed
+**12 PASS / 0 FAIL**; focused Node22 owner/catalog crypto **9 PASS / 0 FAIL**;
+syntax **499 / 0**. The separate standalone CAS service tests used actual
+disposable OS child processes and mTLS, not cloud infrastructure. This is a
+local physical SQLite durability boundary, **not proof of cloud fsync**, a
+physically independent host or guaranteed operator control of the external
+floor. External CAS and historical catalog recovery still require explicit
+trust-pin provisioning and operator-owned records, not a server-supplied pin.
+
 This is an additive development snapshot, not a revision of the dated phase
 history below. The PR branch `cdx/rootark-dual-recovery-20261019` remains
 `OPEN/DRAFT` with issue #65 open; no merge, deployment or production activation
