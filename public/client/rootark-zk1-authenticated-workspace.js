@@ -2162,7 +2162,9 @@
             });
             downloadLocal("rootark-recovery-" + result.objectId + ".json",
               JSON.stringify(result.bundle), "application/json", assertLive);
-            status("Pacote recuperável exportado após PUT/GET. Guarde-o fora do servidor e solicite ao proprietário checkpoint histórico assinado para o root "
+            status("Pacote recuperável exportado após PUT/GET. "
+              + (result.lostPutAckReconciled ? "ACK do PUT perdido, resolvido por GET assinado. " : "")
+              + "Guarde-o fora do servidor e solicite ao proprietário checkpoint histórico assinado para o root "
               + result.ciphertextRoot + ". O segredo de 32 bytes deve permanecer separado.");
           } else {
             const result = await window.RootarkZk1NormalBrowserContent.uploadAndVerify({

@@ -213,10 +213,16 @@ test("recoverable normal workspace: independent newly enrolled device, owner-app
   const offlineSecret = crypto.randomBytes(32);
   const spki = crypto.createHash("sha256").update(Buffer.from(
     await crypto.webcrypto.subtle.exportKey("spki", first.ownerPublicKey))).digest();
-  let wire = "";
+  let wire = "", lostRecoverableAck = 0;
   const firstFetch = async (url, req) => {
     wire += String(req.body || "");
-    return first.fetchImpl(url, req);
+    const response = await first.fetchImpl(url, req);
+    if (url.endsWith("/content/put")) {
+      await response.arrayBuffer();
+      lostRecoverableAck++;
+      throw Error("recoverable PUT ACK lost after physical SQLite commit");
+    }
+    return response;
   };
   const built = await recoverableWorkspace.createRecoverableProtectedFile({
     ownerPublicKey: first.ownerPublicKey,
@@ -232,6 +238,9 @@ test("recoverable normal workspace: independent newly enrolled device, owner-app
     name: first.fileName, mediaType: first.mediaType, data: first.data,
   });
   assert.equal(built.clientReadbackVerified, true);
+  assert.equal(lostRecoverableAck, 1);
+  assert.equal(built.lostPutAckReconciled, true,
+    "a dropped initial PUT ACK still returns the sealed recovery bundle after signed GET");
   assert.equal(built.externalOwnerRootApprovalRequiredForRestore, true);
   assert.equal(f.putCount, 1);
   assert.equal(wire.includes(first.fileName), false);
@@ -353,6 +362,51 @@ test("recoverable normal workspace: independent newly enrolled device, owner-app
   await assert.rejects(recoverableWorkspace.restoreOnNewDevice(await recoverInput()),
     /ZK_RECOVERABLE_WORKSPACE_DENIED/);
   offlineSecret.fill(0);
+});
+
+test("recoverable upload with lost PUT ACK and forged historical GET fails closed without replay", async (t) => {
+  const f = await setup(t);
+  const first = await f.options();
+  const secret = crypto.randomBytes(32);
+  const spki = crypto.createHash("sha256").update(Buffer.from(
+    await crypto.webcrypto.subtle.exportKey("spki", first.ownerPublicKey))).digest();
+  let putAckLost = 0, tamperedReads = 0;
+  const fetchImpl = async (url, options) => {
+    const response = await first.fetchImpl(url, options);
+    if (url.endsWith("/content/put")) {
+      await response.arrayBuffer();
+      putAckLost++;
+      throw Error("ACK_LOST_AFTER_SERVER_COMMIT");
+    }
+    if (url.endsWith("/content/read") && response.status === 200) {
+      const forged = await response.json();
+      forged.ciphertextBase64 = b64(crypto.randomBytes(64));
+      tamperedReads++;
+      return new Response(JSON.stringify(forged), { status: 200,
+        headers: { "content-type": "application/json" } });
+    }
+    return response;
+  };
+  await assert.rejects(recoverableWorkspace.createRecoverableProtectedFile({
+    ownerPublicKey: first.ownerPublicKey,
+    pinnedOwnerKeyHash: first.pinnedOwnerKeyHash,
+    independentOwnerSpkiSha256: spki,
+    pinnedCurrentHead: first.pinnedCurrentHead,
+    signedDeviceGrant: first.signedDeviceGrant,
+    ownerHistoryCheckpoint: null,
+    devicePublicKey: first.devicePublicKey,
+    devicePrivateKey: first.devicePrivateKey,
+    origin: first.origin, fetchImpl, nowSeconds: first.nowSeconds,
+    recoverySecret: secret, metadata: first.metadata,
+    name: first.fileName, mediaType: first.mediaType, data: first.data,
+  }), /ZK_RECOVERABLE_WORKSPACE_DENIED/);
+  assert.equal(putAckLost, 1);
+  assert.equal(tamperedReads, 1,
+    "uncertain PUT must actually attempt a signed exact-version readback");
+  assert.equal(f.putCount, 1, "no second PUT may be issued after an ambiguous ACK");
+  assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object")
+    .get().n, 1, "original ciphertext remains persisted for explicit recovery");
+  secret.fill(0);
 });
 
 test("normal workspace capability and protected PUT/GET enforce real cookie session, CSRF, permissions, owner scope and revocation", async (t) => {

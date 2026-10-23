@@ -118,11 +118,16 @@
           ...signer(input), operation: "put", objectId: input.metadata.object_id,
           expectedObjectRevision: null, ciphertext,
         });
-        // No blind retry after unknown PUT outcome; the exported bundle may
-        // still be safely kept by the holder for independent reconciliation.
-        await http.postProtectedCiphertextPut({
-          origin: input.origin, request: signed, fetchImpl: input.fetchImpl,
-        });
+        // A disconnected HTTP ACK says nothing about whether the server
+        // committed the immutable version. Never repeat PUT: reconcile by the
+        // same exact revision/digest/root signed historical GET below, and
+        // release the user-held recovery bundle only after its readback.
+        let lostPutAck = false;
+        try {
+          await http.postProtectedCiphertextPut({
+            origin: input.origin, request: signed, fetchImpl: input.fetchImpl,
+          });
+        } catch (_) { lostPutAck = true; }
         const signedGet = await http.signProtectedContentOperation({
           ...signer(input), operation: "get", objectId: input.metadata.object_id,
           expectedObjectRevision: 1, expectedCiphertextDigest: digest,
@@ -142,7 +147,8 @@
         });
         return Object.freeze({ bundle, objectId: input.metadata.object_id,
           ciphertextRoot: bundle.ciphertextRoot,
-          clientReadbackVerified: true, ownerSignedHistoricalRootVerified: false,
+          clientReadbackVerified: true, lostPutAckReconciled: lostPutAck,
+          ownerSignedHistoricalRootVerified: false,
           // Approval of the exported ciphertext root is an independent OWNER
           // step. An ordinary client operation cannot sign as the owner.
           externalOwnerRootApprovalRequiredForRestore: true,
