@@ -14,6 +14,8 @@ const ownerHistory = require("../crypto/rootark-zk-recovery-history-v2");
 const ownerManifest = require("../crypto/rootark-zk-recovery-manifest-v2");
 const { inspectVerifiedWitnessFreshHeadV1 } =
   require("../crypto/rootark-zk-witness-head-wire-v1");
+const { isZk1OpaqueCatalogIndependentFloorClient } =
+  require("./zk1OpaqueCatalogIndependentFloor");
 
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
 const PAGE_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-page/v1\0");
@@ -78,14 +80,23 @@ class Zk1OpaqueCatalogCasLedger {
   #minimum;
   #floor;
   #ownerTrust;
+  #floorSync;
+  #serialized = Promise.resolve();
+  #serialize(operation) {
+    // A local FULL commit cannot overlap a signed read or another CAS before
+    // its independent floor is durably advanced and read back.
+    const pending = this.#serialized.then(operation);
+    this.#serialized = pending.catch(() => {});
+    return pending;
+  }
   constructor(filename, { bootstrapNew, signingPrivateKey, catalogSignerPublicKey,
-    trustedScope, minimumHead, ownerTrust } = {}) {
+    trustedScope, minimumHead, ownerTrust, independentFloor } = {}) {
     if (typeof filename !== "string" || !path.isAbsolute(filename)
       || !(signingPrivateKey instanceof crypto.KeyObject)
       || signingPrivateKey.type !== "private" || signingPrivateKey.asymmetricKeyType !== "ed25519"
       || !(catalogSignerPublicKey instanceof crypto.KeyObject)
       || catalogSignerPublicKey.type !== "public" || catalogSignerPublicKey.asymmetricKeyType !== "ed25519"
-      || !minimumHead) fail();
+      || !minimumHead || !isZk1OpaqueCatalogIndependentFloorClient(independentFloor)) fail();
     this.scope = scopeInput(trustedScope);
     this.scopeId = scopeId(this.scope);
     this.signer = signingPrivateKey;
@@ -112,7 +123,10 @@ class Zk1OpaqueCatalogCasLedger {
         freshWitnessHead: ownerTrust.freshWitnessHead,
       };
     }
+    this.independentFloor = independentFloor;
     if (publicFingerprint(this.publicKey) === publicFingerprint(this.catalogSigner)) fail();
+    if (publicFingerprint(this.publicKey) === publicFingerprint(independentFloor.publicKey)
+      || publicFingerprint(this.catalogSigner) === publicFingerprint(independentFloor.publicKey)) fail();
     this.#minimum = {
       sequence: integer(minimumHead.sequence, 0, MAX_SEQUENCE),
       digest: bytes(minimumHead.digest, 32),
@@ -202,7 +216,9 @@ class Zk1OpaqueCatalogCasLedger {
           && !same(savedOwner.digest, this.#ownerTrust.minimumHead.digest)))) fail();
       // Parsing deterministic CBOR uses the project's verified async ESM
       // codec. Callers MUST await ready before admitting TLS requests.
-      this.ready = this.#inspect();
+      // Startup is barred until a newly nonce-challenged, independently signed
+      // head has been fetched. Static minimumHead is only a lower bound.
+      this.ready = this.#syncFloor();
     } catch (error) { this.db.close(); throw error; }
   }
   #inspectSync() {
@@ -254,7 +270,6 @@ class Zk1OpaqueCatalogCasLedger {
     const sequence = head?.sequence || 0;
     if (sequence < this.#floor.sequence
       || (sequence === this.#floor.sequence && !same(digest, this.#floor.digest))) fail();
-    if (sequence > this.#floor.sequence) this.#floor = { sequence, digest: Buffer.from(digest) };
     return { sequence, digest: Buffer.from(digest) };
   }
   async #inspect() {
@@ -369,6 +384,60 @@ class Zk1OpaqueCatalogCasLedger {
     return { revision: saved.revision, witnessSequence: saved.revision,
       digest: Buffer.from(saved.digest) };
   }
+  async #syncFloor() {
+    // Coalesce concurrent reconciliation, and never derive a trusted floor
+    // solely from the local database that an attacker can roll back.
+    if (this.#floorSync) return this.#floorSync;
+    const running = this.#syncFloorInternal();
+    this.#floorSync = running;
+    try { return await running; }
+    finally { if (this.#floorSync === running) this.#floorSync = null; }
+  }
+  async #syncFloorInternal() {
+    let remote = await this.independentFloor.readHead({ scope: this.scope });
+    if (remote.sequence < this.#minimum.sequence
+      || (remote.sequence === this.#minimum.sequence
+        && !same(remote.digest, this.#minimum.digest))
+      || remote.sequence < this.#floor.sequence
+      || (remote.sequence === this.#floor.sequence
+        && !same(remote.digest, this.#floor.digest))) fail();
+    this.#floor = { sequence: remote.sequence, digest: Buffer.from(remote.digest) };
+    const local = await this.#inspect();
+    if (local.sequence < remote.sequence
+      || (local.sequence === remote.sequence && !same(local.digest, remote.digest))) fail();
+    // FULL local commit may have survived while power loss or a dropped floor
+    // acknowledgement prevented signing a receipt. Reconcile from VERIFIED
+    // owner-signed immutable rows, one monotonic remote CAS per missing head.
+    while (remote.sequence < local.sequence) {
+      const row = this.db.prepare("SELECT * FROM snapshots WHERE scope=? AND sequence=?")
+        .get(this.scopeId, remote.sequence + 1);
+      if (!row) fail();
+      const ownerSignerRow = this.#ownerTrust
+        ? this.db.prepare("SELECT owner_evidence FROM signer_history WHERE scope=? AND sequence=?")
+          .get(this.scopeId, row.sequence) : null;
+      if (this.#ownerTrust && !ownerSignerRow) fail();
+      const desired = { sequence: row.sequence, digest: Buffer.from(row.digest) };
+      try {
+        remote = await this.independentFloor.compareAndSwap({
+          scope: this.scope, expectedSequence: remote.sequence,
+          expectedDigest: remote.digest, nextSequence: desired.sequence,
+          nextDigest: desired.digest, headBytes: row.header,
+          headSignature: row.signature,
+          ownerEvidence: this.#ownerTrust ? ownerSignerRow.owner_evidence : undefined,
+          ownerNonce: this.#ownerTrust ? row.nonce : undefined,
+        });
+      } catch (_) {
+        // An absent CAS ACK says nothing about durability. A NEW signed read
+        // may establish that the exact digest was already accepted.
+        remote = await this.independentFloor.readHead({ scope: this.scope });
+      }
+      if (remote.sequence !== desired.sequence || !same(remote.digest, desired.digest)) fail();
+      this.#floor = { sequence: remote.sequence, digest: Buffer.from(remote.digest) };
+    }
+    const confirmed = await this.#inspect();
+    if (confirmed.sequence !== remote.sequence || !same(confirmed.digest, remote.digest)) fail();
+    return confirmed;
+  }
   async #receipt(nonce, current) {
     const statement = { type: CAS_TYPE, ...this.scope,
       sequence: current.sequence, digest: Buffer.from(current.digest),
@@ -381,8 +450,10 @@ class Zk1OpaqueCatalogCasLedger {
   async readHead({ scope, nonce }) {
     if (!scopeEquals(scopeInput(scope), this.scope)) fail();
     await this.ready;
-    const current = await this.#inspect();
-    return this.#receipt(nonce, current);
+    return this.#serialize(async () => {
+      const current = await this.#syncFloor();
+      return this.#receipt(nonce, current);
+    });
   }
   // Authenticated historical bytes are returned with a fresh Ed25519
   // signature binding the request nonce, scope, snapshot and CURRENT CAS head.
@@ -392,6 +463,8 @@ class Zk1OpaqueCatalogCasLedger {
     const wanted = integer(sequence, 1, MAX_SEQUENCE);
     const challenge = bytes(nonce, 32);
     await this.ready;
+    return this.#serialize(async () => {
+    await this.#syncFloor();
     const current = await this.#inspect();
     if (wanted > current.sequence) fail();
     const row = this.db.prepare("SELECT * FROM snapshots WHERE scope=? AND sequence=?")
@@ -413,12 +486,15 @@ class Zk1OpaqueCatalogCasLedger {
     const signature = crypto.sign(null, Buffer.concat([
       SNAPSHOT_DOMAIN, Buffer.from(await z.encodeDeterministic(statement))]), this.signer);
     return Buffer.from(await z.encodeDeterministic({ ...statement, signature }));
+    });
   }
   async compareAndSwap({ scope, expectedSequence, expectedDigest,
     nextSequence, nextDigest, nonce, headBytes, headSignature, pageBodies,
     ownerEvidence }) {
     if (!scopeEquals(scopeInput(scope), this.scope)) fail();
     await this.ready;
+    return this.#serialize(async () => {
+    await this.#syncFloor();
     const old = integer(expectedSequence, 0, MAX_SEQUENCE);
     const next = integer(nextSequence, 1, MAX_SEQUENCE);
     const previous = bytes(expectedDigest, 32);
@@ -518,9 +594,16 @@ class Zk1OpaqueCatalogCasLedger {
         .run(this.scopeId, next, wanted);
     });
     transaction.immediate();
-    const confirmed = await this.#inspect();
+    // Fault injection is available only to the separate-process test harness.
+    // It simulates abrupt power loss after SQLite FULL commit and before floor
+    // contact, proving startup reconciliation cannot issue an unanchored ACK.
+    if (process.env.NODE_ENV === "test" && typeof this.testOnlyAfterLocalCommit === "function") {
+      this.testOnlyAfterLocalCommit();
+    }
+    const confirmed = await this.#syncFloor();
     if (confirmed.sequence !== next || !same(confirmed.digest, wanted)) fail();
     return this.#receipt(challenge, confirmed);
+    });
   }
   close() { if (this.db.open) this.db.close(); }
 }

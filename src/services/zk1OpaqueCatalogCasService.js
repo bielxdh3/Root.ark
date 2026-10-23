@@ -11,14 +11,18 @@ const { Zk1OpaqueCatalogCasLedger } = require("./zk1OpaqueCatalogCasLedger");
 const { createZk1OpaqueCatalogCasHttpsServer } =
   require("./zk1OpaqueCatalogCasHttpsServer");
 const { createZk1WitnessHttpsClient } = require("./zk1WitnessHttpsClient");
-const FIELDS = ["developmentOnlyOptIn", "bindHost", "port", "databasePath",
-  "bootstrapNew", "signingPrivateKeyPath", "catalogSignerPublicKeyPath",
-  "trustedScope", "minimumHead", "tlsKeyPath", "tlsCertPath", "clientCaPath",
-  "authorizedClientFingerprint256"];
 const OWNER_FIELDS = ["genesisDigest", "witnessPublicKeyPath", "witnessKeyId",
   "minimumHead", "witnessTransport"];
 const WITNESS_TLS_FIELDS = ["endpoint", "caPath", "clientKeyPath",
   "clientCertPath", "serverFingerprint256", "timeoutMs"];
+const { createZk1OpaqueCatalogIndependentFloorHttpsClient } =
+  require("./zk1OpaqueCatalogIndependentFloor");
+const FIELDS = ["developmentOnlyOptIn", "bindHost", "port", "databasePath",
+  "bootstrapNew", "signingPrivateKeyPath", "catalogSignerPublicKeyPath",
+  "trustedScope", "minimumHead", "tlsKeyPath", "tlsCertPath", "clientCaPath",
+  "authorizedClientFingerprint256", "floorEndpoint", "floorCaPath",
+  "floorClientKeyPath", "floorClientCertPath", "floorServerFingerprint256",
+  "floorSignerPublicKeyPath"];
 function deny() { throw new Error("ZK_OPAQUE_CAS_SERVICE_CONFIG_DENIED"); }
 function strict(value, fields) {
   if (!value || typeof value !== "object" || Array.isArray(value)
@@ -110,11 +114,19 @@ async function startZk1OpaqueCatalogCasServiceFromConfig(configPath) {
       freshWitnessHead: ({ scope, nonce }) => witnessClient.freshHead({ scope, nonce }),
     };
   }
+  const independentFloor = createZk1OpaqueCatalogIndependentFloorHttpsClient({
+    endpoint: config.floorEndpoint, ca: readBounded(config.floorCaPath),
+    clientKey: readBounded(config.floorClientKeyPath),
+    clientCert: readBounded(config.floorClientCertPath),
+    serverFingerprint256: config.floorServerFingerprint256,
+    floorPublicKey: crypto.createPublicKey(readBounded(config.floorSignerPublicKeyPath)),
+    casSignerPublicKey: crypto.createPublicKey(signer), trustedScope,
+  });
   const ledger = new Zk1OpaqueCatalogCasLedger(config.databasePath, {
     bootstrapNew: config.bootstrapNew, signingPrivateKey: signer,
     catalogSignerPublicKey: catalogSigner, trustedScope, ownerTrust,
     minimumHead: { sequence: config.minimumHead.sequence,
-      digest: decode(config.minimumHead.digest, 32) },
+      digest: decode(config.minimumHead.digest, 32) }, independentFloor,
   });
   let server;
   try {

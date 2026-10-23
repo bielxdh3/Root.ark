@@ -15,6 +15,10 @@ const { createZk1OpaqueCatalogCasHttpsServer } =
   require("../src/services/zk1OpaqueCatalogCasHttpsServer");
 const { createZk1OpaqueCatalogCasHttpsClient } =
   require("../src/services/zk1OpaqueCatalogCasHttpsClient");
+const { Zk1OpaqueCatalogIndependentFloorLedger,
+  createZk1OpaqueCatalogIndependentFloorHttpsServer,
+  createZk1OpaqueCatalogIndependentFloorHttpsClient } =
+  require("../src/services/zk1OpaqueCatalogIndependentFloor");
 const { catalogHeadDigest } = require("../src/services/zk1OpaqueCatalog");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
@@ -31,9 +35,8 @@ test("mTLS independent CAS rotates owner-granted signer A to B after A revocatio
 }, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-cas-rotate-"));
   if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
   generateNativeFixtureCertificates(dir, { caSubject: "ZK1 Owner CAS",
-    servers: ["server"], clients: ["client", "foreign"] });
+    servers: ["server", "floor"], clients: ["client", "foreign"] });
   const read = (name) => fs.readFileSync(path.join(dir, name));
   const state = await fixtures.createInitialState(1);
   const scope = state.scope;
@@ -60,17 +63,47 @@ test("mTLS independent CAS rotates owner-granted signer A to B after A revocatio
     Buffer.from(state.headManifest.devices[1].authorization_public_key)]),
   format: "der", type: "spki" });
   const authority = crypto.generateKeyPairSync("ed25519");
+  const floorKeys = crypto.generateKeyPairSync("ed25519");
   const db = path.join(dir, "authority.sqlite");
   const minimumHead = { sequence: 0, digest: Buffer.alloc(32) };
   const ownerTrust = { genesisDigest: genesis, pinnedWitness: state.pinnedWitness,
     minimumHead: { revision: 1, witnessSequence: 1, digest: genesis },
     freshWitnessHead: ({ nonce }) => witnessed(nonce) };
-  let ledger, server, client;
+  let ledger, server, client, floorLedger, floorServer, floorClient;
+  floorLedger = new Zk1OpaqueCatalogIndependentFloorLedger(path.join(dir, "floor.sqlite"), {
+    bootstrapNew: true, trustedScope: scope, signingPrivateKey: floorKeys.privateKey,
+    casSignerPublicKey: authority.publicKey, catalogSignerPublicKey: signerA,
+    ownerTrust,
+  });
+  floorServer = createZk1OpaqueCatalogIndependentFloorHttpsServer({
+    ledger: floorLedger, key: read("floor.key"), cert: read("floor.pem"),
+    clientCa: read("ca.pem"), authorizedClientFingerprint256:
+      new crypto.X509Certificate(read("client.pem")).fingerprint256,
+  });
+  await new Promise((resolve) => floorServer.listen(0, "127.0.0.1", resolve));
+  floorClient = createZk1OpaqueCatalogIndependentFloorHttpsClient({
+    endpoint: "https://127.0.0.1:" + floorServer.address().port + "/",
+    ca: read("ca.pem"), clientKey: read("client.key"), clientCert: read("client.pem"),
+    serverFingerprint256: new crypto.X509Certificate(read("floor.pem")).fingerprint256,
+    floorPublicKey: floorKeys.publicKey, casSignerPublicKey: authority.publicKey,
+    trustedScope: scope,
+  });
+  assert.throws(() => new Zk1OpaqueCatalogCasLedger(db, {
+    bootstrapNew: true, signingPrivateKey: authority.privateKey,
+    catalogSignerPublicKey: signerA, trustedScope: scope, minimumHead, ownerTrust,
+  }), /ZK_OPAQUE_CAS_UNAVAILABLE/,
+  "owner V2 rotation may never bypass an unavailable/unconfigured independent floor");
+  t.after(async () => {
+    const closed = new Promise((resolve) => floorServer.close(resolve));
+    floorServer.closeAllConnections();
+    await closed;
+    floorLedger.close();
+  });
   const start = async (bootstrapNew) => {
     ledger = new Zk1OpaqueCatalogCasLedger(db, {
       bootstrapNew, signingPrivateKey: authority.privateKey,
       catalogSignerPublicKey: signerA, trustedScope: scope,
-      minimumHead, ownerTrust,
+      minimumHead, ownerTrust, independentFloor: floorClient,
     });
     await ledger.ready;
     server = createZk1OpaqueCatalogCasHttpsServer({
@@ -96,6 +129,7 @@ test("mTLS independent CAS rotates owner-granted signer A to B after A revocatio
     ledger.close();
   };
   t.after(async () => { if (server?.listening) await stop(); });
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
   const witnessed = async (nonce, manifest = state.headManifest) => {
     const statement = { type: "rootark-recovery-witness-head/v1",
       witness_key_id: witnessKeyId, ...scope,

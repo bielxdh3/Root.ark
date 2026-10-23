@@ -14,6 +14,8 @@ const { Zk1OpaqueCatalog, catalogHeadDigest, catalogOperationObjectId } =
   require("../src/services/zk1OpaqueCatalog");
 const { createZk1OpaqueCatalogCasHttpsClient } =
   require("../src/services/zk1OpaqueCatalogCasHttpsClient");
+const { createZk1OpaqueCatalogIndependentFloorHttpsClient } =
+  require("../src/services/zk1OpaqueCatalogIndependentFloor");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 
@@ -52,8 +54,9 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-opaque-remote-cas-"));
   if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
   generateNativeFixtureCertificates(dir, { caSubject: "Opaque Catalog CAS Fixture",
-    servers: ["server"], clients: ["client", "foreign"] });
+    servers: ["server", "floor"], clients: ["client", "foreign"] });
   const authorityKeys = crypto.generateKeyPairSync("ed25519");
+  const floorKeys = crypto.generateKeyPairSync("ed25519");
   const deviceKeys = crypto.generateKeyPairSync("ed25519");
   const foreignKeys = crypto.generateKeyPairSync("ed25519");
   const writePem = (name, value) => fs.writeFileSync(path.join(dir, name), value, {
@@ -61,14 +64,23 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
   });
   writePem("authority.key.pem", authorityKeys.privateKey.export({ type: "pkcs8", format: "pem" }));
   writePem("authority.pub.pem", authorityKeys.publicKey.export({ type: "spki", format: "pem" }));
+  writePem("floor.key.pem", floorKeys.privateKey.export({ type: "pkcs8", format: "pem" }));
+  writePem("floor.pub.pem", floorKeys.publicKey.export({ type: "spki", format: "pem" }));
   writePem("device.pub.pem", deviceKeys.publicKey.export({ type: "spki", format: "pem" }));
   const tlsFingerprint = new crypto.X509Certificate(read(path.join(dir, "server.pem"))).fingerprint256;
+  const floorFingerprint = new crypto.X509Certificate(read(path.join(dir, "floor.pem"))).fingerprint256;
   const scope = { account_id: crypto.randomBytes(16),
     compartment_id: Buffer.from("remote-cas-lab"), keyring_id: crypto.randomBytes(16) };
   const wireScope = Object.fromEntries(Object.entries(scope).map(([k, v]) => [k, b64(v)]));
   const dbPath = path.join(dir, "authority.sqlite");
   const cfg = {
     dbPath, bootstrapNew: true, scope: wireScope,
+    floorDbPath: path.join(dir, "independently-administered-floor.sqlite"),
+    floorBootstrapNew: true, floorKeyPath: path.join(dir, "floor.key.pem"),
+    floorPublicKeyPath: path.join(dir, "floor.pub.pem"),
+    floorServerKeyPath: path.join(dir, "floor.key"),
+    floorServerCertPath: path.join(dir, "floor.pem"),
+    floorServerFingerprint256: floorFingerprint, floorDropAckOnce: false,
     minimumSequence: 0, minimumDigest: b64(Buffer.alloc(32)),
     authorityKeyPath: path.join(dir, "authority.key.pem"),
     authorityPublicKeyPath: path.join(dir, "authority.pub.pem"),
@@ -82,7 +94,14 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
   };
   const cfgPath = path.join(dir, "config.json");
   const writeConfig = () => fs.writeFileSync(cfgPath, JSON.stringify(cfg), { mode: 0o600 });
-  let server = null;
+  let server = null; let floorServer = null;
+  async function launchFloor() {
+    writeConfig();
+    floorServer = child("floor", cfgPath);
+    const ready = await wait(floorServer, "port");
+    cfg.floorEndpoint = "https://127.0.0.1:" + ready.port + "/";
+    writeConfig();
+  }
   async function launch() {
     writeConfig();
     server = child("server", cfgPath);
@@ -98,8 +117,17 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
     await exited(server);
     server = null;
   }
+  async function stopFloor() {
+    if (!floorServer) return;
+    const exiting = wait(floorServer, "stopped", 10000);
+    floorServer.send("stop");
+    await exiting;
+    await exited(floorServer);
+    floorServer = null;
+  }
   t.after(async () => {
     if (server) { try { await stop(); } catch (_) { server.kill(); } }
+    if (floorServer) { try { await stopFloor(); } catch (_) { floorServer.kill(); } }
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
   });
   let inherited = null;
@@ -140,7 +168,22 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
     serverFingerprint256: tlsFingerprint, authorityPublicKey: authorityKeys.publicKey,
     timeoutMs: 1500,
   });
+  const floorClient = () => createZk1OpaqueCatalogIndependentFloorHttpsClient({
+    endpoint: cfg.floorEndpoint, ca: read(cfg.caPath),
+    clientKey: read(cfg.clientKeyPath), clientCert: read(cfg.clientCertPath),
+    serverFingerprint256: floorFingerprint,
+    floorPublicKey: floorKeys.publicKey,
+    casSignerPublicKey: authorityKeys.publicKey, trustedScope: scope,
+    timeoutMs: 1500,
+  });
+  await launchFloor();
   await launch();
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(cfg.floorDbPath).mode & 0o777, 0o600,
+      "independent floor SQLite must bootstrap with POSIX mode 0600");
+    assert.equal(fs.statSync(cfg.dbPath).mode & 0o777, 0o600,
+      "CAS SQLite must bootstrap with POSIX mode 0600");
+  }
   const genesis = await client().readHead({ scope, nonce: crypto.randomBytes(32) });
   const parsed = await z.decodeDeterministic(genesis);
   assert.equal(parsed.sequence, 0);
@@ -180,6 +223,14 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
   assert.deepEqual(JSON.parse(stored.pages.toString()), winner.pageBodies,
     "authority committed the actual independently checked opaque page bytes");
   disk.close();
+  const independent = new Database(cfg.floorDbPath, { readonly: true, fileMustExist: true });
+  const independentHead = independent.prepare("SELECT * FROM floor").get();
+  assert.equal(independentHead.sequence, 1);
+  assert.deepEqual(independentHead.digest, headDigest);
+  independent.close();
+  // The independent floor has deliberately destroyed its first successful
+  // CAS acknowledgement. Receipt is valid only because the catalog process
+  // recovered a FRESH signed floor/head proof with the matching digest.
 
   const forged = await build(2, headDigest, foreignKeys.privateKey);
   await assert.rejects(client().compareAndSwap(inputs(forged)), /ZK_OPAQUE_CAS_ACK_UNCERTAIN/);
@@ -231,8 +282,14 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
   "same trusted CA is insufficient without independently pinned mTLS client cert");
 
   await stop();
+  await stopFloor();
+  cfg.floorBootstrapNew = false;
+  cfg.floorDropAckOnce = true;
+  await launchFloor();
   cfg.bootstrapNew = false;
-  cfg.minimumSequence = 1; cfg.minimumDigest = b64(headDigest);
+  // Keep the operator's STATIC startup floor at zero: the independently
+  // signed remote floor must still reject an old local SQLite after restart.
+  cfg.minimumSequence = 0; cfg.minimumDigest = b64(Buffer.alloc(32));
   cfg.dropAckOnce = true;
   await launch();
   const afterRestart = await z.decodeDeterministic(await client().readHead({
@@ -246,6 +303,12 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
   const crashedWriter = child("writer", cfgPath, uncertainPath);
   assert.equal((await wait(crashedWriter, "outcome")).outcome, "ZK_OPAQUE_CAS_ACK_UNCERTAIN");
   await exited(crashedWriter);
+  // The INDEPENDENT floor drops its ACK after FULL commit. CAS must perform
+  // a fresh signed read, discover the exact committed digest, and only then
+  // allow the catalog ACK (which this fixture independently drops too).
+  const floorHead = await floorClient().readHead({ scope });
+  assert.equal(floorHead.sequence, 2);
+  assert.deepEqual(floorHead.digest, Buffer.from(uncertain.nextDigest, "base64url"));
   const reconciliation = await client().reconcile({
     scope, nonce: crypto.randomBytes(32), expectedSequence: 1,
     expectedDigest: headDigest, nextSequence: 2,
@@ -429,15 +492,44 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
   assert.equal(losingReconcile.outcome, "CAS_HEAD_CONFLICT");
   await stop();
   cfg.dropAckOnce = false;
-  cfg.minimumSequence = 2; cfg.minimumDigest = uncertain.nextDigest;
+  cfg.minimumSequence = 0; cfg.minimumDigest = b64(Buffer.alloc(32));
   await launch();
   assert.equal((await z.decodeDeterministic(await client().readHead({
     scope, nonce: crypto.randomBytes(32),
   }))).sequence, 2);
+  // Power loss window: a separate process exits immediately after local FULL
+  // commit of seq3, before it can contact the independently operated floor.
   await stop();
+  cfg.crashAfterLocalCommitOnce = true;
+  await launch();
+  const third = await build(3, Buffer.from(uncertain.nextDigest, "base64url"));
+  await assert.rejects(client().compareAndSwap(inputs(third)), /ZK_OPAQUE_CAS_ACK_UNCERTAIN/);
+  await exited(server);
+  server = null;
+  const unconfirmed = new Database(dbPath, { readonly: true, fileMustExist: true });
+  assert.equal(unconfirmed.prepare("SELECT sequence FROM heads").get().sequence, 3);
+  unconfirmed.close();
+  cfg.crashAfterLocalCommitOnce = false;
+  await launch();
+  const afterPowerLoss = await z.decodeDeterministic(await client().readHead({
+    scope, nonce: crypto.randomBytes(32),
+  }));
+  assert.equal(afterPowerLoss.sequence, 3);
+  assert.deepEqual(Buffer.from(afterPowerLoss.digest), Buffer.from(third.nextDigest, "base64url"));
+  const recoveredFloor = new Database(cfg.floorDbPath, { readonly: true, fileMustExist: true });
+  assert.equal(recoveredFloor.prepare("SELECT sequence FROM floor").get().sequence, 3);
+  recoveredFloor.close();
+  await stopFloor();
+  await assert.rejects(client().readHead({
+    scope, nonce: crypto.randomBytes(32),
+  }), /ZK_OPAQUE_CAS_TRANSPORT_UNAVAILABLE/);
+  await stop();
+  cfg.floorBootstrapNew = false;
+  cfg.floorDropAckOnce = false;
+  await launchFloor();
 
-  // Simulate compromised SQLite rollback without changing the external
-  // operator's independently retained 2/digest floor.
+  // Simulate compromised SQLite rollback while unchanged startup config still
+  // names ZERO. Only the separate floor process knows the committed seq3.
   const rewound = new Database(dbPath);
   rewound.exec("DROP TRIGGER immutable_opaque_snapshot_update");
   rewound.exec("DROP TRIGGER immutable_opaque_snapshot_delete");
@@ -448,4 +540,18 @@ test("external opaque catalog CAS: real mTLS processes, atomic competition, sign
   const rejected = child("server", cfgPath);
   await assert.rejects(wait(rejected, "startupError"), /ZK_OPAQUE_CAS_UNAVAILABLE/);
   await exited(rejected);
+  // A forged Ed25519 floor signer cannot pass startup attestation.
+  const fake = crypto.generateKeyPairSync("ed25519");
+  writePem("forged-floor.pub.pem", fake.publicKey.export({ type: "spki", format: "pem" }));
+  cfg.floorPublicKeyPath = path.join(dir, "forged-floor.pub.pem");
+  writeConfig();
+  const forgedFloor = child("server", cfgPath);
+  await assert.rejects(wait(forgedFloor, "startupError"), /ZK_OPAQUE_FLOOR_UNAVAILABLE/);
+  await exited(forgedFloor);
+  cfg.floorPublicKeyPath = path.join(dir, "floor.pub.pem");
+  await stopFloor();
+  writeConfig();
+  const unavailable = child("server", cfgPath);
+  await assert.rejects(wait(unavailable, "startupError"), /ZK_OPAQUE_FLOOR_UNAVAILABLE/);
+  await exited(unavailable);
 });
