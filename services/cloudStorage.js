@@ -79,6 +79,47 @@ function pinBoundedDownloadParent(localPath) {
   return guard;
 }
 
+// Legacy uploads may be larger than the bounded ZK staging contract. Keep
+// streaming them, but never allow a provider SDK to reopen a mutable pathname
+// after an asynchronous credential/metadata lookup. The bytes must come from
+// the exact regular inode authorized before the first await.
+function openVerifiedLegacyUpload(localPath, expectedIdentity = null) {
+  let fd;
+  try {
+    const named = fs.lstatSync(localPath, { bigint: true });
+    if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n) {
+      throw new Error("unsafe upload source");
+    }
+    fd = fs.openSync(localPath, fs.constants.O_RDONLY
+      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_CLOEXEC || 0));
+    const opened = fs.fstatSync(fd, { bigint: true });
+    const same = (a, b) => a.isFile() && !a.isSymbolicLink() && a.nlink === 1n
+      && a.dev === b.dev && a.ino === b.ino && a.size === b.size
+      && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+    if (!same(opened, named) || (expectedIdentity && !same(opened, expectedIdentity))
+      || !same(fs.lstatSync(localPath, { bigint: true }), opened)) {
+      throw new Error("upload source replaced");
+    }
+    // A null path + explicit FD is essential: fs.createReadStream(localPath)
+    // would perform another path resolution at its first asynchronous read.
+    const stream = fs.createReadStream(null, { fd, autoClose: true, start: 0 });
+    const verifyName = () => {
+      try {
+        if (!same(fs.fstatSync(fd, { bigint: true }), opened)
+          || !same(fs.lstatSync(localPath, { bigint: true }), opened)) {
+          throw new Error("upload source replaced");
+        }
+      } catch (_) { throw cloudError("invalid_path", "Cloud upload source was replaced"); }
+    };
+    return { stream, identity: opened, verifyName };
+  } catch (_) {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch (_) { /* already closed */ }
+    }
+    throw cloudError("invalid_path", "Cloud upload source was replaced or is unsafe");
+  }
+}
+
 function createCloudStorage(options = {}) {
   const provider = String(options.provider || "local").toLowerCase();
   const prefix = normalizePrefix(options.prefix || "rootark");
@@ -237,13 +278,13 @@ function createCloudStorage(options = {}) {
     };
   }
   async function uploadToPinnedDriveId(localPath, fileId, requestBody, cloudKey, folderId, area,
-    signal = undefined, boundedBytes = null) {
+    signal = undefined, boundedBytes = null, legacyBody = null) {
     const client = await drive();
     // The bounded writer owns a detached byte buffer. Never leave a lazy
     // file-descriptor stream that may open AFTER its private staging path is
     // removed by the caller (for example after a lying provider's early ACK).
     const media = () => ({ body: boundedBytes === null
-      ? fs.createReadStream(localPath) : Readable.from([boundedBytes]) });
+      ? legacyBody() : Readable.from([boundedBytes]) });
     let existing;
     try { existing = await abortableProviderRead(() => getDriveFile(fileId, signal), signal); }
     catch (error) { if (!isDriveStatus(error, 404)) throw error; }
@@ -438,17 +479,44 @@ function createCloudStorage(options = {}) {
         }
       } finally { fs.closeSync(fd); }
     }
+    const legacyStreams = [];
+    let initialLegacy = null;
+    let firstLegacyBody = false;
+    if (boundedBytes === null) {
+      initialLegacy = openVerifiedLegacyUpload(localPath);
+      legacyStreams.push(initialLegacy.stream);
+    }
+    const legacyBody = () => {
+      if (!initialLegacy) throw cloudError("invalid_path", "Missing verified upload source");
+      if (!firstLegacyBody) {
+        initialLegacy.verifyName();
+        firstLegacyBody = true;
+        return initialLegacy.stream;
+      }
+      // A pinned Drive create may receive 409 and retry as an update. Reopen
+      // only when the same authorized inode still occupies the original name.
+      const retry = openVerifiedLegacyUpload(localPath, initialLegacy.identity);
+      legacyStreams.push(retry.stream);
+      return retry.stream;
+    };
     const controller = bound !== undefined ? new AbortController() : null;
     const timeout = controller ? setTimeout(() => controller.abort(), 15000) : null;
     const signal = controller?.signal;
     try {
     if (provider === "s3") {
       const bucketName = bucket();
-      await abortableProviderRead(async () => (await s3()).send(
-        new (require("@aws-sdk/client-s3").PutObjectCommand)({ Bucket: bucketName,
-          Key: cloudKey, Body: boundedBytes === null ? fs.createReadStream(localPath) : boundedBytes,
-          ...(bound ? { ContentLength: bound } : {}) }),
-        signal ? { abortSignal: signal } : undefined), signal);
+      await abortableProviderRead(async () => {
+        const client = await s3();
+        // Path-less streams cannot use the SDK's path/stat length inference.
+        // Sign the byte count of the pinned file instead of rereading a name.
+        if (initialLegacy && initialLegacy.identity.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+          throw cloudError("invalid_path", "Cloud upload source size is unsupported");
+        }
+        return client.send(new (require("@aws-sdk/client-s3").PutObjectCommand)({ Bucket: bucketName,
+          Key: cloudKey, Body: boundedBytes === null ? legacyBody() : boundedBytes,
+          ContentLength: bound || Number(initialLegacy.identity.size) }),
+        signal ? { abortSignal: signal } : undefined);
+      }, signal);
       if (signal?.aborted) throw cloudError("provider_error", "Bounded ciphertext upload deadline exceeded");
       return { provider, key: cloudKey };
     }
@@ -457,14 +525,14 @@ function createCloudStorage(options = {}) {
       if (!isDriveFileId(providerFileId)) throw cloudError("invalid_path", "Google Drive file ID is invalid");
       const result = await abortableProviderRead(() => uploadToPinnedDriveId(localPath,
         providerFileId, driveRequestBody(folderId, fileName, area, cloudKey),
-        cloudKey, folderId, area, signal, boundedBytes), signal);
+        cloudKey, folderId, area, signal, boundedBytes, legacyBody), signal);
       if (signal?.aborted) throw cloudError("provider_error", "Bounded ciphertext upload deadline exceeded");
       return result;
     }
     if (bound !== undefined) throw cloudError("configuration", "Bounded Drive copy requires an immutable pinned file ID");
     const existing = await findDriveFile(cloudKey, folderId, area);
     const requestBody = driveRequestBody(folderId, fileName, area, cloudKey);
-    const media = { body: fs.createReadStream(localPath) };
+    const media = { body: legacyBody() };
     if (existing) {
       const current = await getDriveFile(existing.id);
       assertDriveFileOwnership(current, cloudKey, folderId, area);
@@ -475,7 +543,10 @@ function createCloudStorage(options = {}) {
     } catch (error) {
       if (controller) controller.abort();
       throw error;
-    } finally { if (timeout) clearTimeout(timeout); }
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      for (const stream of legacyStreams) stream.destroy();
+    }
   }
   async function download(folderId, fileName, localPath, area = "uploads", canPublish = () => true,
     constraints = undefined) {
