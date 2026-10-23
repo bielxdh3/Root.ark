@@ -109,7 +109,11 @@ function registerZk1ProtectedObjectRoutes({ app, store, authenticate,
     requirePermission("listFiles"), requirePermission("upload"), (req, res) => {
       try {
         if (!resolveTrustedScope(req.user)) invalid();
-        res.json({ enabled: true });
+        // V1 is still deliberately available for legacy dev fixtures, but a
+        // V2 owner-history browser MUST NOT interpret V1 as equivalent security.
+        // This reports a mode, never the owner's private scope or key pins.
+        res.json({ enabled: true, securityVersion: store.signedHistoryRequired === true ? 2 : 1,
+          signedHistoryRequired: store.signedHistoryRequired === true });
       } catch (_) { res.status(403).json({ error: "ZK_CONTENT_DENIED" }); }
     });
   // POST-for-read prevents accidental caches and keeps signed nonces out of URLs.

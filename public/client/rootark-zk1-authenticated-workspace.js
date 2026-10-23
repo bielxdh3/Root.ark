@@ -35,6 +35,10 @@
   const activeDownloadUrls = new Set();
 
   function fail() { throw new Error("ZK_WORKSPACE_INPUT_DENIED"); }
+  function supportsOwnerRootedV2(value) {
+    return value?.enabled === true && value.securityVersion === 2
+      && value.signedHistoryRequired === true;
+  }
   function field(name) { return dialog?.querySelector('[data-zk1-field="' + name + '"]'); }
   function status(value) {
     const target = field("status");
@@ -553,7 +557,7 @@
       // Capability is checked again before every user-initiated operation.
       const available = await api.get("/zk-1/v1/workspace-capability");
       assertLive();
-      if (available?.enabled !== true) fail();
+      if (!supportsOwnerRootedV2(available)) fail();
       if (action === "verify-inventory") {
         const raw = decoder.decode(await fileBytes("inventory-portable", 1, 400000));
         const grant = JSON.parse(decoder.decode(await fileBytes("grant", 1, 8192)));
@@ -1003,7 +1007,7 @@
     button.addEventListener("click", async () => {
       button.disabled = true;
       try {
-        if ((await api.get("/zk-1/v1/workspace-capability"))?.enabled !== true) fail();
+        if (!supportsOwnerRootedV2(await api.get("/zk-1/v1/workspace-capability"))) fail();
         createDialog().showModal();
       } catch (_) { capability = false; button.remove(); }
       finally { button.disabled = false; }
@@ -1015,7 +1019,7 @@
     if (capability === false || checking || !document.getElementById("protectedClientStatus")) return;
     checking = true;
     api.get("/zk-1/v1/workspace-capability").then((result) => {
-      capability = result?.enabled === true;
+      capability = supportsOwnerRootedV2(result);
       showEntry();
     }).catch(() => { capability = false; }).finally(() => { checking = false; });
   });

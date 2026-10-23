@@ -386,7 +386,8 @@ test("normal workspace capability and protected PUT/GET enforce real cookie sess
   assert.equal((await request("viewer", capabilityPath)).status, 403);
   const ownerCapability = await request("owner", capabilityPath);
   assert.equal(ownerCapability.status, 200);
-  assert.deepEqual(await ownerCapability.json(), { enabled: true });
+  assert.deepEqual(await ownerCapability.json(), { enabled: true,
+    securityVersion: 1, signedHistoryRequired: false });
   assert.equal(ownerCapability.headers.get("cache-control"), "no-store");
   assert.equal((await fetch(origin + capabilityPath, {
     headers: { cookie: cookie("owner", 99) } })).status, 401);
@@ -886,7 +887,7 @@ if(!output.textContent)output.textContent="EDGE_NORMAL_HTTP_TIMEOUT";
   }
 });
 
-test("Edge normal authenticated workspace dialog provisions offline owner and PUT/GET through cookie CSRF", {
+test("Edge normal authenticated V2 workspace refuses a real legacy V1 server capability", {
   timeout: 65_000,
 }, async (t) => {
   if (process.platform !== "win32" || !fs.existsSync(EDGE)) {
@@ -1008,6 +1009,19 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
         document.querySelector('[data-zk1-field="'+name+'"]').files=dt.files;};
       const field=(name)=>document.querySelector('[data-zk1-field="'+name+'"]');
       try {
+        // This disposable server intentionally uses an opt-in V1 store, which
+        // must no longer advertise permission to launch the V2 owner-history
+        // browser UI. The separate real Edge crypto test above continues to
+        // exercise protected PUT/GET and CSP under authenticated HTTP.
+        const capability=await fetch("/zk-1/v1/workspace-capability",{
+          credentials:"include"}).then(res=>res.json());
+        if(capability.securityVersion===1 && capability.signedHistoryRequired===false){
+          window.dispatchEvent(new Event("rootark:workspace-rendered"));
+          await new Promise(resolve=>setTimeout(resolve,250));
+          if(document.getElementById("zk1-workspace-open"))throw Error("V1_DOWNGRADE_UI_VISIBLE");
+          output.textContent="EDGE_AUTH_WORKSPACE_PASS";
+          return;
+        }
         window.dispatchEvent(new Event("rootark:workspace-rendered"));
         (await wait(()=>document.getElementById("zk1-workspace-open"))).click();
         await wait(()=>document.querySelector("dialog[open]"));
@@ -1491,8 +1505,9 @@ test("Edge normal authenticated workspace dialog provisions offline owner and PU
       return typeof value === "string" && value.startsWith("EDGE_AUTH_WORKSPACE_") ? value : null;
     });
     assert.equal(observed, "EDGE_AUTH_WORKSPACE_PASS");
-    assert.equal(protectedPuts, 5, "ordinary, legacy, recoverable and two distinct batch version PUTs; partial retry and forged pins cannot rePUT");
-    assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 5);
+    assert.equal(protectedPuts, 0,
+      "a V1 backend cannot be tricked into receiving V2 browser PUTs");
+    assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object").get().n, 0);
   } finally {
     socket?.close();
     if (edge?.pid) {

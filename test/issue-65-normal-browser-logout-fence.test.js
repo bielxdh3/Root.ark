@@ -35,7 +35,8 @@ async function harness() {
   let accountRecoverCalls = 0;
   let selectedBlob = null;
   const window = {
-    RootarkApi: { get: async () => ({ enabled: true }) },
+    RootarkApi: { get: async () => ({ enabled: true,
+      securityVersion: 2, signedHistoryRequired: true }) },
     isSecureContext: true, crypto: crypto.webcrypto,
     RootarkZk1NormalBrowserTrustFloor: {
       provisionOffline: async () => ({}),
