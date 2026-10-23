@@ -188,7 +188,14 @@ function fileSecurity(filename, bootstrapNew) {
   } else {
     const fd = fs.openSync(filename, fs.constants.O_EXCL | fs.constants.O_CREAT
       | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
-    fs.closeSync(fd);
+    try {
+      // Pin the inode created by O_EXCL before closing its descriptor. A
+      // single-link foreign SQLite can be renamed onto this pathname after
+      // close and would otherwise be trusted by the next pathname stat.
+      const st = fs.fstatSync(fd, { bigint: true });
+      if (!st.isFile() || st.nlink !== 1n) fail();
+      return Object.freeze({ dev: st.dev, ino: st.ino });
+    } finally { fs.closeSync(fd); }
   }
 }
 function verifyAuthorityIdentity(db, { role, scopeText, allPins, v1Digest,
@@ -409,14 +416,14 @@ class OpaqueCheckpointV2Authority {
     if (bootstrapNew) ensurePrivateSqliteDirectory(filename);
     else assertPrivateSqliteFile(filename);
     assertSafeSqliteSidecars(filename, fail);
-    fileSecurity(filename, bootstrapNew);
+    const createdPin = fileSecurity(filename, bootstrapNew);
     const scopeText = SCOPE.map((n) => scoped[n].toString("hex")).join(":");
     const allPins = Buffer.concat(pins);
     const identity = { role, scopeText, allPins, v1Digest, v1Checkpoint,
       genesisDigest: trust.genesisDigest };
     // Read-only preflight must reject a swapped database before opening a
     // writable handle, changing journal mode, or running any CREATE statement.
-    const pinned = bootstrapNew ? assertPrivateSqliteFile(filename)
+    const pinned = bootstrapNew ? createdPin
       : withReadonlySqliteSnapshot(filename,
         (probe) => verifyAuthorityIdentity(probe, identity), fail,
         MAX_WIRE * 2 + 8 * 1024 * 1024);
