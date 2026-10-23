@@ -160,7 +160,10 @@
         return trust;
       } catch (_) { deny(); }
     }
-    async function importOwnerSignedBackupCiphertext(input) {
+    // After an unknown PUT outcome, a different currently admitted device may
+    // verify the exact object through a newly signed GET. This read-only path
+    // rechecks the same independently pinned owner proof and never replays PUT.
+    async function performOwnerSignedBackupCiphertext(input, reconcileOnly) {
       let sealed;
       let root;
       let digest;
@@ -221,14 +224,17 @@
         if (!equal(digest, ownerDigest)
           || !equal(root, new Uint8Array(await roots.computeCiphertextRoot([sealed])))) deny();
 
-        // Create ONLY. An already existing object (including a prior lost ACK)
-        // must fail the server's CAS check; never replace it or retry this PUT.
-        const put = await http.signProtectedContentOperation({
-          ...signer, operation: "put", objectId: owner.object_id,
-          expectedObjectRevision: null, ciphertext: sealed,
-        });
-        const written = await http.postProtectedCiphertextPut({ origin, request: put, fetchImpl });
-        if (written.id !== owner.object_id || written.revision !== 1) deny();
+        if (!reconcileOnly) {
+          // Create ONLY. An existing object (including a previous lost ACK)
+          // must fail the server's CAS check. The caller may then explicitly
+          // reconcile with a separate GET-only operation.
+          const put = await http.signProtectedContentOperation({
+            ...signer, operation: "put", objectId: owner.object_id,
+            expectedObjectRevision: null, ciphertext: sealed,
+          });
+          const written = await http.postProtectedCiphertextPut({ origin, request: put, fetchImpl });
+          if (written.id !== owner.object_id || written.revision !== 1) deny();
+        }
         const get = await http.signProtectedContentOperation({
           ...signer, operation: "get", objectId: owner.object_id,
           expectedObjectRevision: 1, expectedCiphertextDigest: digest,
@@ -243,11 +249,18 @@
         return Object.freeze({ objectId: owner.object_id, revision: 1,
           ownerSignatureVerified: true, signedHistoricalRootVerified: true,
           externalPinSourceVerifiedByModule: false, ciphertextReadbackVerified: true,
+          ...(reconcileOnly ? { reconciledWithoutWrite: true } : {}),
           independentDurabilityProven: false, authorizesRecovery: false,
           authorizesRestore: false, authorizesRelease: false });
       } catch (_) { deny(); }
       finally { sealed?.fill(0); root?.fill(0); digest?.fill(0); }
     }
+    function importOwnerSignedBackupCiphertext(input) {
+      return performOwnerSignedBackupCiphertext(input, false);
+    }
+    function reconcileOwnerSignedBackupCiphertext(input) {
+      return performOwnerSignedBackupCiphertext(input, true);
+    }
     return Object.freeze({ prepareOwnerBackupImportTrust,
-      importOwnerSignedBackupCiphertext });
+      importOwnerSignedBackupCiphertext, reconcileOwnerSignedBackupCiphertext });
   }));

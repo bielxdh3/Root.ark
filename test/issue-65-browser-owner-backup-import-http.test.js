@@ -162,6 +162,13 @@ async function scenario(t) {
     get wire() { return wire; }, setGate: (value) => { gateOpen = value; },
     revoke: async () => { await fixtures.appendDeviceRevocation(state, device.device_id);
       head = state.headManifest; },
+    secondSigner: async () => {
+      const second = head.devices[1];
+      const privateKey = state.actors.get(Buffer.from(second.authorization_key_id).toString("hex"));
+      return { ...signer, signerKey: await crypto.webcrypto.subtle.importKey("pkcs8",
+        privateKey.export({ format: "der", type: "pkcs8" }),
+        "Ed25519", false, ["sign"]), deviceId: second.device_id };
+    },
     currentSigner: async () => ({ ...signer, manifestRevision: head.revision,
       manifestDigest: await manifestDigest(), epoch: head.current_epoch }),
   };
@@ -349,6 +356,96 @@ test("lost PUT acknowledgement stays uncertain and never retries or deletes the 
   Buffer.from(f.sealed), "already stored ciphertext must remain intact for later manual reconciliation");
 });
 
+test("second enrolled device reconciles lost ACK through signed HTTP GET, without another PUT or restore authority", async (t) => {
+  const f = await scenario(t);
+  const lostAck = async (url, options) => {
+    const response = await f.fetchImpl(url, options);
+    if (url.endsWith("/content/put")) throw Error("lost ACK after durable commit");
+    return response;
+  };
+  await assert.rejects(importer.importOwnerSignedBackupCiphertext({
+    ...f.input, fetchImpl: lostAck,
+  }), /ZK_OWNER_BACKUP_IMPORT_DENIED/);
+  assert.equal(f.countPut, 1);
+  assert.equal(f.networkReads, 0);
+
+  const remoteDevice = await f.secondSigner();
+  const readback = await importer.reconcileOwnerSignedBackupCiphertext({
+    ...f.input, signer: remoteDevice,
+  });
+  assert.equal(readback.objectId, f.metadata.object_id);
+  assert.equal(readback.revision, 1);
+  assert.equal(readback.ownerSignatureVerified, true);
+  assert.equal(readback.signedHistoricalRootVerified, true);
+  assert.equal(readback.ciphertextReadbackVerified, true);
+  assert.equal(readback.reconciledWithoutWrite, true);
+  assert.equal(readback.authorizesRestore, false);
+  assert.equal(readback.authorizesRecovery, false);
+  assert.equal(readback.independentDurabilityProven, false);
+  assert.equal(f.countPut, 1, "second device must NEVER resend uncertain PUT");
+  assert.equal(f.networkReads, 1, "second device authenticates exact remote ciphertext");
+  // The second device can now use an independently held owner CEK to open the
+  // exact sealed object locally. The server never sees that key or plaintext.
+  const get = await http.signProtectedContentOperation({
+    ...remoteDevice, operation: "get", objectId: f.metadata.object_id,
+    expectedObjectRevision: 1,
+    expectedCiphertextDigest: crypto.createHash("sha256").update(f.sealed).digest(),
+    ciphertext: null,
+  });
+  const reopened = await http.postProtectedCiphertextRead({
+    origin: f.origin, request: get, fetchImpl: f.fetchImpl,
+    expectedObjectRevision: 1, expectedRoot: f.root,
+    cek: f.cek, metadata: f.metadata,
+  });
+  assert.deepEqual(Buffer.from(reopened.data), f.plaintext);
+  reopened.data.fill(0);
+  assert.equal(f.countPut, 1);
+  assert.equal(f.networkReads, 2);
+  assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_version").get().n, 1);
+});
+
+test("owner backup reconcile refuses missing write, forged preflight, tampered GET and pending/revoked admission", async (t) => {
+  const f = await scenario(t);
+  const second = await f.secondSigner();
+  const recovered = { ...f.input, signer: second };
+  await assert.rejects(importer.reconcileOwnerSignedBackupCiphertext(recovered),
+    /ZK_OWNER_BACKUP_IMPORT_DENIED/, "an intent without committed remote bytes never succeeds");
+  assert.equal(f.countPut, 0);
+  assert.equal(f.networkReads, 1);
+
+  const readsBefore = f.networkReads;
+  for (const invalid of [
+    { ...recovered, ownerTrust: null },
+    { ...recovered, approval: { ...recovered.approval, signatureBase64: b64(crypto.randomBytes(64)) } },
+    { ...recovered, ciphertextBase64: b64(crypto.randomBytes(64)) },
+    { ...recovered, signer: { ...second, epoch: second.epoch + 1 } },
+    { ...recovered, signer: { ...second, nowSeconds: 1500 } },
+  ]) await assert.rejects(importer.reconcileOwnerSignedBackupCiphertext(invalid),
+    /ZK_OWNER_BACKUP_IMPORT_DENIED/);
+  assert.equal(f.countPut, 0, "invalid owner proof must not write");
+  assert.equal(f.networkReads, readsBefore, "invalid owner proof must fail before network");
+
+  await importer.importOwnerSignedBackupCiphertext(f.input);
+  const tamperedFetch = (url, options) => {
+    if (url.endsWith("/content/read")) return Promise.resolve(new Response(JSON.stringify({
+      id: f.metadata.object_id, revision: 1, epoch: f.metadata.epoch,
+      ciphertextBase64: b64(crypto.randomBytes(f.sealed.length)),
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    return f.fetchImpl(url, options);
+  };
+  await assert.rejects(importer.reconcileOwnerSignedBackupCiphertext({
+    ...recovered, fetchImpl: tamperedFetch,
+  }), /ZK_OWNER_BACKUP_IMPORT_DENIED/);
+  f.setGate(false);
+  await assert.rejects(importer.reconcileOwnerSignedBackupCiphertext(recovered),
+    /ZK_OWNER_BACKUP_IMPORT_DENIED/, "pending witness gate blocks historical readback");
+  f.setGate(true);
+  await f.revoke();
+  await assert.rejects(importer.reconcileOwnerSignedBackupCiphertext(f.input),
+    /ZK_OWNER_BACKUP_IMPORT_DENIED/, "revoked device cannot reconcile");
+  assert.equal(f.countPut, 1, "all reconciliation paths remain GET-only");
+});
+
 test("browser standalone UMD loads signed backup importer without Node capabilities", () => {
   const context = vm.createContext({ crypto: crypto.webcrypto,
     TextEncoder, TextDecoder, URL, btoa, atob, Uint8Array, ArrayBuffer,
@@ -360,5 +457,7 @@ test("browser standalone UMD loads signed backup importer without Node capabilit
   assert.equal(typeof context.RootarkZk1OwnerBackupImport.importOwnerSignedBackupCiphertext,
     "function");
   assert.equal(typeof context.RootarkZk1OwnerBackupImport.prepareOwnerBackupImportTrust,
+    "function");
+  assert.equal(typeof context.RootarkZk1OwnerBackupImport.reconcileOwnerSignedBackupCiphertext,
     "function");
 });
