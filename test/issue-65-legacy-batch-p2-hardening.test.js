@@ -162,3 +162,74 @@ test("stalled legacy catalog fails within deadline and never starts ciphertext P
   assert.equal(canceled, true);
   assert.equal(writes, 0);
 });
+
+test("legacy batch authenticates root and nested folder identity before and after copying", async () => {
+  const ctx = acceleratedContext();
+  let writes = 0;
+  ctx.RootarkZk1LegacyMigrationWorkflow = {
+    async beginLegacyMigration() {
+      writes++;
+      return { phase: "awaiting-independent-owner-checkpoint", root: "signed-get-root" };
+    },
+  };
+  vm.runInContext(fs.readFileSync(path.resolve(__dirname,
+    "../public/client/rootark-zk1-legacy-batch-migration.js"), "utf8"), ctx);
+  const input = vm.runInContext(`({ optIn: true, entries: [{
+    legacy: { name: "old.txt", folderId: "" },
+    sourcePin: { version: 1, storedAs: "old.v1", uploadedAt: "2026-10-22T01:00:00.000Z",
+      size: 1, lastModified: "Thu, 22 Oct 2026 01:00:00 GMT",
+      sha256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", mediaType: "text/plain" },
+    cek: null }], migrationSecret: new Uint8Array(32),
+    trust: { signedDeviceGrant: { account_id: "a", compartment_id: "b", keyring_id: "c" },
+      independentOwnerSpkiSha256: new Uint8Array(32),
+      pinnedCurrentHead: { digest: new Uint8Array(32), revision: 1, epoch: 1 } },
+    origin: "http://localhost/", journal: null, nowSeconds: 1400, fetchImpl: null })`, ctx);
+  input.entries[0].cek = await file.generateFileCek();
+  const catalogResponse = (folderId) => new Response(JSON.stringify({
+    folderId, fileName: "old.txt", versions: [{
+      version: 1, storedAs: "old.v1", uploadedAt: "2026-10-22T01:00:00.000Z", size: 1,
+    }],
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  const check = async (folders) => {
+    let reads = 0;
+    const urls = [];
+    input.fetchImpl = async (url) => {
+      urls.push(url);
+      return catalogResponse(folders[Math.min(reads++, folders.length - 1)]);
+    };
+    const result = await ctx.RootarkZk1LegacyBatchMigration.runLegacyMigrationBatch(input);
+    return { result, urls, reads };
+  };
+
+  // Existing lab fixtures identify root as "", while the real server uses "root".
+  for (const folderId of ["", "root"]) {
+    const verified = await check([folderId]);
+    assert.equal(verified.result.verified, 1);
+    assert.equal(verified.reads, 2);
+    assert.deepEqual(verified.urls, ["/versions/old.txt", "/versions/old.txt"]);
+  }
+  const baselineWrites = writes;
+  for (const malicious of ["foreign-folder", undefined, null, "../traversal", {}]) {
+    const rejected = await check([malicious]);
+    assert.equal(rejected.result.verified, 0);
+    assert.equal(rejected.result.results[0].phase, "needs-manual-review");
+    assert.equal(rejected.reads, 1, "mismatched source blocks copy before PUT");
+    assert.equal(writes, baselineWrites);
+  }
+  const swappedAfterCopy = await check(["root", "foreign-folder"]);
+  assert.equal(swappedAfterCopy.result.verified, 0);
+  assert.equal(swappedAfterCopy.result.results[0].phase, "needs-manual-review");
+  assert.equal(swappedAfterCopy.reads, 2);
+  assert.equal(writes, baselineWrites + 1, "post-copy source swap never reports verified");
+
+  input.entries[0].legacy.folderId = "nested-folder";
+  const wrongNested = await check(["root"]);
+  assert.equal(wrongNested.result.verified, 0);
+  assert.equal(wrongNested.reads, 1);
+  assert.equal(writes, baselineWrites + 1);
+  const exactNested = await check(["nested-folder"]);
+  assert.equal(exactNested.result.verified, 1);
+  assert.deepEqual(exactNested.urls, [
+    "/versions/old.txt?folderId=nested-folder", "/versions/old.txt?folderId=nested-folder",
+  ]);
+});

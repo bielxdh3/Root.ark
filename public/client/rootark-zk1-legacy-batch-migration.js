@@ -115,8 +115,12 @@
       body += decoder.decode();
       complete = true;
       const data = JSON.parse(body);
+      // The real route identifies the root folder as "root" while older
+      // local fixtures use "". Even a root selection must authenticate the
+      // folder identity; otherwise a foreign folder can replace the source.
       if (!data || data.fileName !== entry.legacy.name
-        || (entry.legacy.folderId && data.folderId !== entry.legacy.folderId)
+        || (data.folderId !== entry.legacy.folderId
+          && !(entry.legacy.folderId === "" && data.folderId === "root"))
         || !Array.isArray(data.versions) || data.versions.length > 512) refuse();
       const selected = data.versions.filter((v) => v?.version === entry.sourcePin.version);
       if (selected.length !== 1 || selected[0].storedAs !== entry.sourcePin.storedAs
