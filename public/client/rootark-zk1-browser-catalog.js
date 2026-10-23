@@ -34,6 +34,7 @@
     "manifest_digest", "nonce", "ciphertext_digest"]);
   const EMPTY = new Uint8Array(32);
   const MAX_VERSIONS = 4096, PAGE_SIZE = 32, MAX_CATALOG_HEADS = 128;
+  const HTTP_READ_DEADLINE_MS = 15_000;
   const genuine = new WeakMap();
   function deny() { throw new Error("ZK_BROWSER_CATALOG_UNVERIFIED"); }
   function exact(v, keys) {
@@ -204,28 +205,61 @@
     return { authorization: wire, signatureBase64: to64(signature), pageIndex: page };
   }
   async function readJson(fetchImpl, url, body, assertLive, max = 35000) {
-    assertLive();
-    if (typeof location === "object" && location.origin && new URL(url).origin !== location.origin) deny();
-    const response = await fetchImpl(url, { method: "POST", credentials: "same-origin",
-      cache: "no-store", redirect: "error", mode: "same-origin",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify(body) });
-    assertLive();
-    if (response.status !== 200 || !/application\/json/i.test(response.headers.get("content-type") || "")) deny();
-    const reader = response.body?.getReader();
-    if (!reader) deny();
-    const chunks = []; let size = 0;
+    if (typeof AbortController !== "function") deny();
+    const controller = new AbortController();
+    let reader, complete = false, timer;
+    // The same absolute deadline covers DNS, response headers and every byte
+    // of a slow/trickled body. Byte limits alone cannot bound stalled recovery
+    // after historical CEKs have been decrypted in memory.
+    const deadline = new Promise((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new Error("catalog HTTP deadline"));
+      }, HTTP_READ_DEADLINE_MS);
+    });
     try {
-      while (true) {
-        const { done, value } = await reader.read();
+      const work = (async () => {
         assertLive();
-        if (done) break;
-        size += value.byteLength;
-        if (size > max) deny();
-        chunks.push(value);
+        if (typeof location === "object" && location.origin
+          && new URL(url).origin !== location.origin) deny();
+        const response = await fetchImpl(url, {
+          method: "POST", credentials: "same-origin",
+          cache: "no-store", redirect: "error", mode: "same-origin",
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify(body), signal: controller.signal,
+        });
+        assertLive();
+        if (controller.signal.aborted || response.status !== 200
+          || !/application\/json/i.test(response.headers.get("content-type") || "")) deny();
+        reader = response.body?.getReader();
+        if (!reader) deny();
+        const chunks = []; let size = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          assertLive();
+          if (controller.signal.aborted) deny();
+          if (done) { complete = true; break; }
+          if (!ArrayBuffer.isView(value) || value.BYTES_PER_ELEMENT !== 1
+            || value.byteLength === 0) deny();
+          size += value.byteLength;
+          if (size > max) deny();
+          chunks.push(value);
+        }
+        return JSON.parse(dec.decode(join(chunks, max)));
+      })();
+      return await Promise.race([work, deadline]);
+    } catch (_) { deny(); }
+    finally {
+      clearTimeout(timer);
+      controller.abort();
+      if (reader) {
+        if (!complete) {
+          // Never await cancellation: a malicious reader can stall cancel().
+          try { Promise.resolve(reader.cancel()).catch(() => {}); } catch (_) { /* denied */ }
+        }
+        try { reader.releaseLock(); } catch (_) { /* aborted */ }
       }
-    } finally { reader.releaseLock(); }
-    return JSON.parse(dec.decode(join(chunks, max)));
+    }
   }
   async function verifyPage({ response, scope, signerGrant, pinnedHead,
     authorityKey, requestNonce, expectedSequence, expectedDigest, index, now }) {

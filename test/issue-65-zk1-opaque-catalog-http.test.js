@@ -285,6 +285,7 @@ test("ZK1 opaque catalog: two owner-enrolled device sessions enumerate signed ve
   });
   const browserContext = {
     crypto: crypto.webcrypto, TextEncoder, TextDecoder, btoa, atob, URL,
+    AbortController, setTimeout, clearTimeout,
     location: { origin },
     RootarkZk1NormalBrowserTrustFloor: {
       async assertCurrent({ signedDeviceGrant, pinnedCurrentHead }) {
