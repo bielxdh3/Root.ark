@@ -159,7 +159,14 @@ function fileCheck(filename, bootstrapNew) {
   } else {
     const handle = fs.openSync(filename, fs.constants.O_CREAT | fs.constants.O_EXCL
       | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
-    fs.closeSync(handle);
+    try {
+      // Pin the file created by O_EXCL while its handle is still open. A
+      // pathname lookup after close could instead pin a single-link SQLite
+      // swapped in by another actor, then write WAL/schema to that database.
+      const stat = fs.fstatSync(handle, { bigint: true });
+      if (!stat.isFile() || stat.nlink !== 1n) fail();
+      return Object.freeze({ dev: stat.dev, ino: stat.ino });
+    } finally { fs.closeSync(handle); }
   }
 }
 function verifyStageIdentity(db, id, pins) {
@@ -210,10 +217,10 @@ class Zk1OpaqueCatalogCheckpointV2Stage {
     if (bootstrapNew) ensurePrivateSqliteDirectory(filename);
     else assertPrivateSqliteFile(filename);
     assertSafeSqliteSidecars(filename, fail);
-    fileCheck(filename, bootstrapNew);
+    const createdPin = fileCheck(filename, bootstrapNew);
     // Validate even the trigger bodies in read-only mode before SQLite can
     // change WAL, create a schema object, or touch the wrong authority's DB.
-    const pinned = bootstrapNew ? assertPrivateSqliteFile(filename)
+    const pinned = bootstrapNew ? createdPin
       : withReadonlySqliteSnapshot(filename,
         (probe) => verifyStageIdentity(probe, this.#id, this.#pins), fail,
         MAX_V1_SEQUENCE * MAX_BUNDLE + 64 * 1024 * 1024);
