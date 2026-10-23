@@ -375,6 +375,7 @@ test("REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores 
       "rootark-zk1-normal-browser-content", "rootark-zk1-owner-inventory-trust-head",
       "rootark-zk1-portable-file-recovery", "rootark-zk1-browser-recovery-http",
       "rootark-zk1-recoverable-workspace", "rootark-dev-vault-migration",
+      "rootark-zk1-legacy-transition-receipt",
       "rootark-zk1-legacy-migration-workflow", "rootark-zk1-legacy-batch-migration",
       "rootark-zk1-v2-device-approval", "rootark-zk1-v2-browser-pop",
       "rootark-zk1-v2-committed-approval", "rootark-zk1-browser-authoritative-backup",
