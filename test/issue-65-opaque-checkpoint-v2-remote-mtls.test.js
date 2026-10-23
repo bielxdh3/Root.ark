@@ -34,6 +34,8 @@ const { OpaqueCheckpointV2Authority,
   require("../src/services/zk1OpaqueCheckpointV2Remote");
 const { Zk1OpaqueCheckpointV2Client } =
   require("../src/services/zk1OpaqueCheckpointV2Client");
+const { issueVerifiedHistoricalSignerEndorsement } =
+  require("../src/crypto/rootark-zk1-v2-historical-signer-endorsement");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 const { realEdge } = require("./support/issue-65-checkpoint-v2-real-edge");
@@ -851,6 +853,62 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
     ownerKeyRaw: new Uint8Array(rawPublicForGrant(grantSigner.publicKey)),
     ownerSpkiPin: new Uint8Array(fp(grantSigner.publicKey)),
   };
+  // The owner may export a separate historical endorsement ONLY after the
+  // independent recovery-history, owner-witness, genesis and V2 predecessor
+  // attestations have all verified. The browser never trusts an intent's own
+  // unverified owner_evidence as its signer authorization.
+  const endorsements = [];
+  let endorsementPrevious = { sequence: 128, digest: oldDigest,
+    checkpointDigest: oldCheckpoint, operationId: Buffer.alloc(32) };
+  const inspectorOptions = { scope, ownerKey: owner.publicKey,
+    ownerTrust: trust, casKey: v2CasKeys.publicKey, floorKey: v2FloorKeys.publicKey,
+    casFp: fp(v2CasKeys.publicKey), floorFp: fp(v2FloorKeys.publicKey),
+    checkpointFp: fp(checkpoint.publicKey), checkpointKey: checkpoint.publicKey };
+  for (const rawIntent of signedHistory) {
+    const item = await z.decodeDeterministic(rawIntent);
+    const issued = await issueVerifiedHistoricalSignerEndorsement({
+      signedIntent: rawIntent, inspectorOptions: { ...inspectorOptions,
+        baseDigest: endorsementPrevious.digest,
+        baseCheckpoint: endorsementPrevious.checkpointDigest,
+        previousOperationId: endorsementPrevious.operationId },
+      trustedOwnerPrivateKey: grantSigner.privateKey,
+      independentlyPinnedOwnerSpkiSha256: fp(grantSigner.publicKey),
+      currentSignedDeviceGrant: grant,
+      independentlyPinnedCurrentOwnerHead: { revision: Number(state.headManifest.revision),
+        epoch: Number(state.headManifest.current_epoch),
+        digest: await ownerManifest.recoveryManifestDigestV2(state.headManifest) },
+    });
+    endorsements.push(issued);
+    endorsementPrevious = { sequence: issued.sequence,
+      digest: Buffer.from(issued.head_digest, "base64url"),
+      checkpointDigest: Buffer.from(issued.checkpoint_digest, "base64url"),
+      operationId: Buffer.from(item.operation_id) };
+  }
+  const historyAuthenticated = await browserV2.readFinalizedV2({ ...bridgeInput,
+    historicalSignerEndorsements: endorsements,
+    independentGenesisDigest: new Uint8Array(genesis),
+    independentWitnessSpkiSha256: new Uint8Array(fp(witness.publicKey)),
+  });
+  assert.equal(historyAuthenticated.sequence, 131);
+  await assert.rejects(browserV2.readFinalizedV2({ ...bridgeInput,
+    historicalSignerEndorsements: [{ ...endorsements[0], signer_public_key:
+      encoded(rawPublicForGrant(revoked.publicKey)) }, ...endorsements.slice(1)],
+    independentGenesisDigest: new Uint8Array(genesis),
+    independentWitnessSpkiSha256: new Uint8Array(fp(witness.publicKey)),
+  }), /UNVERIFIED/, "historical signer substitution cannot reuse owner signature");
+  await assert.rejects(issueVerifiedHistoricalSignerEndorsement({
+    signedIntent: signedHistory[0], inspectorOptions: { ...inspectorOptions,
+      baseDigest: oldDigest, baseCheckpoint: oldCheckpoint,
+      previousOperationId: Buffer.alloc(32), ownerTrust: { ...trust,
+        genesisDigest: crypto.randomBytes(32) } },
+    trustedOwnerPrivateKey: grantSigner.privateKey,
+    independentlyPinnedOwnerSpkiSha256: fp(grantSigner.publicKey),
+    currentSignedDeviceGrant: grant,
+    independentlyPinnedCurrentOwnerHead: { revision: Number(state.headManifest.revision),
+      epoch: Number(state.headManifest.current_epoch),
+      digest: await ownerManifest.recoveryManifestDigestV2(state.headManifest) },
+  }), /HISTORICAL_SIGNER_UNVERIFIED/,
+  "the offline issuer must refuse a mismatched independently pinned owner genesis");
   const verified131 = await browserV2.readFinalizedV2(bridgeInput);
   assert.equal(verified131.sequence, 131);
   const privateEdge = await crypto.webcrypto.subtle.importKey("pkcs8",
@@ -903,6 +961,9 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
     checkpointSpkiPin: encoded(bridgeInput.checkpointSpkiPin),
     deviceKeyRaw: encoded(bridgeInput.deviceKeyRaw), deviceSpkiPin: encoded(bridgeInput.deviceSpkiPin),
     ownerKeyRaw: encoded(bridgeInput.ownerKeyRaw), ownerSpkiPin: encoded(bridgeInput.ownerSpkiPin),
+    historicalSignerEndorsements: endorsements,
+    independentGenesisDigest: encoded(genesis),
+    independentWitnessSpkiSha256: encoded(fp(witness.publicKey)),
   };
   const edgePrivate = encoded(owner.privateKey.export({ type: "pkcs8", format: "der" }));
   const edgeResult = await edge.evaluate(`(async () => {
@@ -911,7 +972,8 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
       .padEnd(Math.ceil(s.length/4)*4,'=')),c=>c.charCodeAt(0));
     const names=['previousDigest','previousCheckpointDigest','ownerDigest','signedIntent',
       'casKeyRaw','casSpkiPin','floorKeyRaw','floorSpkiPin','checkpointKeyRaw',
-      'checkpointSpkiPin','deviceKeyRaw','deviceSpkiPin','ownerKeyRaw','ownerSpkiPin'];
+      'checkpointSpkiPin','deviceKeyRaw','deviceSpkiPin','ownerKeyRaw','ownerSpkiPin',
+      'independentGenesisDigest','independentWitnessSpkiSha256'];
     for(const name of names) wire[name]=toBytes(wire[name]);
     wire.signedIntents=wire.signedIntents.map(toBytes);
     wire.origin=location.origin+'/'; wire.fetchImpl=fetch.bind(window);

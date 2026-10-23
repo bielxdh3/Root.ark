@@ -744,6 +744,9 @@
       + 'Permite GET de ciphertext de uma versão selecionada após nova confirmação, prova de posse da chave do dispositivo e SHA-256 do catálogo assinado. '
       + 'Não descriptografa nem publica. Os dados V1 permanecem na sequência 128.</p>'
       + '<label>Intents V2 assinados em ordem (129 até o atual, até 10 MiB cada)<input type="file" multiple data-zk1-field="catalog-v2-intent" accept=".cbor,application/cbor,application/octet-stream"></label>'
+      + '<label>Endossos históricos independentes assinados pelo proprietário (.json, um por intent em ordem; obrigatório quando o signer mudou)<input type="file" data-zk1-field="catalog-v2-historical-endorsements" accept=".json,application/json"></label>'
+      + '<label>Digest gênese owner V2 fixado fora do servidor (base64url)<input data-zk1-field="catalog-v2-genesis-pin" maxlength="43" spellcheck="false"></label>'
+      + '<label>PIN SHA-256 SPKI witness owner V2 fixado fora do servidor (base64url)<input data-zk1-field="catalog-v2-owner-witness-pin" maxlength="43" spellcheck="false"></label>'
       + '<label>Chave CAS V2 Ed25519 raw (32 bytes)<input type="file" data-zk1-field="catalog-v2-cas-key"></label>'
       + '<label>PIN SHA-256 SPKI CAS V2 (base64url)<input data-zk1-field="catalog-v2-cas-pin" maxlength="43" spellcheck="false"></label>'
       + '<label>Chave floor V2 Ed25519 raw (32 bytes)<input type="file" data-zk1-field="catalog-v2-floor-key"></label>'
@@ -1224,6 +1227,13 @@
           }
           const ownerKeyRaw = new Uint8Array(await crypto.subtle.exportKey("raw",
             trust.ownerPublicKey));
+          const historicalFile = field("catalog-v2-historical-endorsements")?.files;
+          let historical = null;
+          if (historicalFile?.length) {
+            const raw = await fileBytes("catalog-v2-historical-endorsements", 2, 128 * 8192);
+            historical = JSON.parse(decoder.decode(raw));
+            if (!Array.isArray(historical) || historical.length !== signedIntents.length) fail();
+          }
           const result = await v2.readFinalizedV2({
             origin: location.origin + "/", fetchImpl: guardedFetch, assertLive,
             csrfToken: () => { assertLive(); return initialCsrf; },
@@ -1236,6 +1246,10 @@
             signedIntent: signedIntents.at(-1), signedIntents,
             signedDeviceGrant: trust.signedDeviceGrant,
             ownerKeyRaw, ownerSpkiPin: trust.independentOwnerSpkiSha256,
+            ...(historical ? { historicalSignerEndorsements: historical,
+              independentGenesisDigest: from64(field("catalog-v2-genesis-pin").value.trim()),
+              independentWitnessSpkiSha256:
+                from64(field("catalog-v2-owner-witness-pin").value.trim()) } : {}),
             casKeyRaw: keys[0], casSpkiPin: from64(field("catalog-v2-cas-pin").value.trim()),
             floorKeyRaw: keys[1], floorSpkiPin: from64(field("catalog-v2-floor-pin").value.trim()),
             checkpointKeyRaw: keys[2],

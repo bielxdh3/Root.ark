@@ -321,6 +321,12 @@
   const V2_GRANT_FIELDS = ["schema", ...SCOPE, "device_id", "authorization_key_id",
     "authorization_public_key", "manifest_revision", "manifest_digest",
     "current_epoch", "enrolled_epoch", "revoked_at_epoch"];
+  const V2_HISTORY_ENDORSEMENT = encoder.encode(
+    "Root.ark/zk-1/v2-historical-signer-endorsement/v1\0");
+  const V2_HISTORY_FIELDS = ["schema", ...SCOPE, "sequence", "intent_sha256",
+    "operation_id", "head_digest", "checkpoint_digest", "signer_device_id",
+    "signer_public_key", "manifest_revision", "manifest_digest", "epoch",
+    "genesis_digest", "witness_signer_spki_sha256"];
   const V2_RECEIPT_FIELDS = ["type", ...SCOPE, "role", "state", "sequence",
     "head_digest", "checkpoint_digest", "operation_id", "cas_signer_fp",
     "floor_signer_fp", "nonce", "issued_at"];
@@ -352,13 +358,16 @@
   async function readFinalizedV2(input) {
     const chainProvided = Object.hasOwn(input || {}, "signedIntents");
     const grantProvided = Object.hasOwn(input || {}, "signedDeviceGrant");
+    const historicalProofsProvided = Object.hasOwn(input || {}, "historicalSignerEndorsements");
     exact(input, ["origin", "fetchImpl", "assertLive", "csrfToken", "scope",
       "previousDigest", "previousCheckpointDigest", "ownerRevision", "ownerDigest",
       "ownerEpoch", "ownerDeviceId", "signedIntent", "casKeyRaw", "casSpkiPin",
       "floorKeyRaw", "floorSpkiPin", "checkpointKeyRaw", "checkpointSpkiPin",
       "deviceKeyRaw", "deviceSpkiPin",
       ...(chainProvided ? ["signedIntents"] : []),
-      ...(grantProvided ? ["signedDeviceGrant", "ownerKeyRaw", "ownerSpkiPin"] : [])]);
+      ...(grantProvided ? ["signedDeviceGrant", "ownerKeyRaw", "ownerSpkiPin"] : []),
+      ...(historicalProofsProvided ? ["historicalSignerEndorsements",
+        "independentGenesisDigest", "independentWitnessSpkiSha256"] : [])]);
     if (!webCrypto?.subtle || !webCrypto.getRandomValues
       || typeof input.fetchImpl !== "function"
       || typeof input.assertLive !== "function"
@@ -395,16 +404,31 @@
     if (!Array.isArray(chain) || !chain.length || chain.length > 128) deny();
     const signedChain = chain.map((raw) => strictBytes(raw, 1, 10 * 1024 * 1024).slice());
     if (!equal(signedChain.at(-1), lastIntentRaw)) deny();
+    if (historicalProofsProvided && (!grantProvided
+      || !Array.isArray(input.historicalSignerEndorsements)
+      || input.historicalSignerEndorsements.length !== signedChain.length
+      || input.historicalSignerEndorsements.length > 128)) deny();
+    const historicalProofs = historicalProofsProvided
+      ? input.historicalSignerEndorsements.map((entry) => {
+        exact(entry, [...V2_HISTORY_FIELDS, "signature"]);
+        return Object.fromEntries([...V2_HISTORY_FIELDS, "signature"]
+          .map((field) => [field, entry[field]]));
+      }) : null;
+    const independentGenesis = historicalProofsProvided
+      ? copy(input.independentGenesisDigest, 32) : null;
+    const independentWitness = historicalProofsProvided
+      ? copy(input.independentWitnessSpkiSha256, 32) : null;
     // A successor demands the independently pinned CURRENT owner-signed device
     // grant. The 129-only legacy opt-in preserves its earlier input contract.
     if (signedChain.length > 1 && !grantProvided) deny();
+    let ownerKey = null;
     if (grantProvided) {
       exact(input.signedDeviceGrant, [...V2_GRANT_FIELDS, "signature"]);
       // Copy only signed scalar fields before WebCrypto yields. Later edits to
       // the UI's grant object cannot change which authorization was checked.
       const grant = Object.fromEntries([...V2_GRANT_FIELDS, "signature"]
         .map((name) => [name, input.signedDeviceGrant[name]]));
-      const ownerKey = await verifyKey(input.ownerKeyRaw, input.ownerSpkiPin);
+      ownerKey = await verifyKey(input.ownerKeyRaw, input.ownerSpkiPin);
       const frozenGrant = Object.fromEntries(V2_GRANT_FIELDS.map((name) => [name, grant[name]]));
       if (grant.schema !== "rootark-zk1-browser-owner-device-grant/v1"
         || grant.manifest_revision !== revision || grant.manifest_digest !== to64(ownerDigest)
@@ -422,7 +446,7 @@
     let sequence = 128;
     let previousOperation = null;
     let operation, headDigest, checkpointDigest, count, rows, privateRows;
-    for (const intentRaw of signedChain) {
+    for (const [intentIndex, intentRaw] of signedChain.entries()) {
     const intent = decode(intentRaw, 10 * 1024 * 1024);
     const nextSequence = sequence + 1;
     exact(intent, ["type", ...SCOPE, "operation_id", "checkpoint_bytes",
@@ -453,14 +477,38 @@
     exact(header, V2_HEADER_FIELDS); scoped(header, scope);
     if (header.type !== "rootark-zk1-opaque-catalog/v1" || header.sequence !== nextSequence
       || !equal(strictBytes(header.previous_digest, 32), previous)
-      || !equal(strictBytes(header.manifest_digest, 32), ownerDigest)
-      || header.manifest_revision !== revision || header.epoch !== epoch
-      || header.signer_device_id !== input.ownerDeviceId
+      || (!historicalProofs && (!equal(strictBytes(header.manifest_digest, 32), ownerDigest)
+        || header.manifest_revision !== revision || header.epoch !== epoch
+        || header.signer_device_id !== input.ownerDeviceId))
       || !Array.isArray(header.page_digests)
       || header.page_digests.length !== record.page_bodies.length
       || uint(header.total_count, 0, 4096) > 4096
       || header.page_digests.length !== Math.ceil(header.total_count / 32)) deny();
-    if (!await webCrypto.subtle.verify("Ed25519", deviceKey, rawSignature,
+    let historicalSigner = deviceKey;
+    if (historicalProofs) {
+      const certificate = historicalProofs[intentIndex];
+      const statement = Object.fromEntries(V2_HISTORY_FIELDS.map((f) => [f, certificate[f]]));
+      if (certificate.schema !== "rootark-zk1-v2-historical-signer-endorsement/v1"
+        || certificate.sequence !== nextSequence
+        || certificate.signer_device_id !== header.signer_device_id
+        || certificate.manifest_revision !== header.manifest_revision
+        || certificate.epoch !== header.epoch
+        || !equal(from64(certificate.manifest_digest, 32),
+          strictBytes(header.manifest_digest, 32))
+        || !equal(from64(certificate.genesis_digest, 32), independentGenesis)
+        || !equal(from64(certificate.witness_signer_spki_sha256, 32), independentWitness)
+        || !equal(from64(certificate.intent_sha256, 32), await digest(intentRaw))
+        || !equal(from64(certificate.operation_id, 32), operation)) deny();
+      scoped(Object.fromEntries(SCOPE.map((f) => [f,
+        from64(certificate[f], f === "compartment_id" ? 128 : 16)])), scope);
+      const expectedSigner = from64(certificate.signer_public_key, 32);
+      historicalSigner = await webCrypto.subtle.importKey("raw", expectedSigner,
+        "Ed25519", false, ["verify"]);
+      if (!await webCrypto.subtle.verify("Ed25519", ownerKey,
+        from64(certificate.signature, 64), append(V2_HISTORY_ENDORSEMENT,
+          encoder.encode(JSON.stringify(statement))))) deny();
+    }
+    if (!await webCrypto.subtle.verify("Ed25519", historicalSigner, rawSignature,
       append(V2_HEAD, rawHead))) deny();
     count = 0; let last = null;
     rows = []; privateRows = [];
@@ -498,6 +546,8 @@
     if (!await webCrypto.subtle.verify("Ed25519", checkpointKey, checkpointSig,
       append(V2_CHECKPOINT, checkpointBytes))) deny();
     checkpointDigest = await digest(V2_DIGEST, checkpointBytes, checkpointSig);
+    if (historicalProofs && (!equal(from64(historicalProofs[intentIndex].head_digest, 32), headDigest)
+      || !equal(from64(historicalProofs[intentIndex].checkpoint_digest, 32), checkpointDigest))) deny();
     const checkpoint = decode(checkpointBytes, 16384);
     exact(checkpoint, V2_CHECKPOINT_FIELDS); scoped(checkpoint, scope);
     if (checkpoint.type !== "rootark-zk1-opaque-catalog-checkpoint/v2"
