@@ -288,16 +288,21 @@ test("Drive verification never substitutes an older same-key duplicate for the e
     "a forged get-by-ID reply cannot authorize an update of another physical Drive object");
 });
 
-test("bounded cloud PUT rejects a provider that stalls before acknowledging the write", {
+test("bounded cloud PUT rejects a cooperative provider that stalls before acknowledging the write", {
   timeout: 20000,
 }, async () => {
   const f = fixture("s3");
   const writer = createCloudStorage({ provider: "s3", prefix: "rootark-stalled-copy-fixture",
     s3: { bucket: "stalled-upload-fixture" },
     resolvePrincipalIdentity: async () => "synthetic-reader-identity",
-    createS3Client: async () => ({ send: async (cmd) => {
+    createS3Client: async () => ({ send: async (cmd, { abortSignal } = {}) => {
       assert.equal(cmd.constructor.name, "PutObjectCommand");
-      return new Promise(() => {});
+      assert.ok(abortSignal instanceof AbortSignal);
+      return new Promise((_resolve, reject) => {
+        if (abortSignal.aborted) return reject(new Error("synthetic S3 PUT aborted"));
+        abortSignal.addEventListener("abort",
+          () => reject(new Error("synthetic S3 PUT aborted")), { once: true });
+      });
     } }),
   });
   const publisher = new Zk1CloudCiphertextCopyPublisher({ cloudWriter: writer,
@@ -306,4 +311,36 @@ test("bounded cloud PUT rejects a provider that stalls before acknowledging the 
   await assert.rejects(publisher.publishExact(f.payload), /ZK_CLOUD_COPY_UNAVAILABLE/);
   assert.ok(Date.now() - began < 19000,
     "an unresponsive external upload must not leave a protected operation waiting indefinitely");
+});
+
+test("bounded cloud PUT retains its I/O fence until a noncooperative provider settles after abort", {
+  timeout: 20000,
+}, async () => {
+  const f = fixture("s3");
+  let finishSdk;
+  let sawAbort;
+  const aborted = new Promise((resolve) => { sawAbort = resolve; });
+  const writer = createCloudStorage({ provider: "s3", prefix: "rootark-late-ack-fixture",
+    s3: { bucket: "late-ack-fixture" },
+    resolvePrincipalIdentity: async () => "synthetic-late-ack-identity",
+    createS3Client: async () => ({ send: async (cmd, { abortSignal } = {}) => {
+      assert.equal(cmd.constructor.name, "PutObjectCommand");
+      assert.ok(abortSignal instanceof AbortSignal);
+      abortSignal.addEventListener("abort", sawAbort, { once: true });
+      // This SDK ignores abort; the physical call remains pending until the
+      // test explicitly settles it. Timeout must never fabricate a PUT ACK.
+      return new Promise((resolve) => { finishSdk = resolve; });
+    } }),
+  });
+  const publisher = new Zk1CloudCiphertextCopyPublisher({ cloudWriter: writer,
+    expectedProvider: "s3", expectedWriterContext: await writer.resolveInventoryContext() });
+  let finished = false;
+  const pending = publisher.publishExact(f.payload).finally(() => { finished = true; });
+  await aborted;
+  assert.equal(finished, false, "aborting SDK I/O must not release its physical-operation fence");
+  assert.equal(typeof finishSdk, "function");
+  finishSdk({ ETag: "late-untrusted-ack" });
+  await assert.rejects(pending, /ZK_CLOUD_COPY_UNAVAILABLE/,
+    "late SDK success after the hard deadline cannot become a successful publication");
+  assert.equal(finished, true);
 });

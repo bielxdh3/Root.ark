@@ -31,9 +31,19 @@ function fixture(provider) {
   };
   if (provider === "s3") {
     config.s3 = { bucket: "disposable-fixture" };
-    config.createS3Client = async () => ({ send: async (command) => {
+    config.createS3Client = async () => ({ send: async (command, { abortSignal } = {}) => {
       calls.push(command.constructor.name);
-      if (payload === "stall") return new Promise(() => {});
+      if (payload === "stall") {
+        // Real SDK transports settle their request after honoring AbortSignal.
+        // A never-settling mock instead models a noncooperative provider and
+        // must keep the physical I/O fence held until it actually settles.
+        assert.ok(abortSignal instanceof AbortSignal);
+        return new Promise((_resolve, reject) => {
+          if (abortSignal.aborted) return reject(new Error("synthetic S3 GET aborted"));
+          abortSignal.addEventListener("abort",
+            () => reject(new Error("synthetic S3 GET aborted")), { once: true });
+        });
+      }
       if (command.constructor.name !== "GetObjectCommand"
         || command.input.Bucket !== "disposable-fixture"
         || command.input.Key !== reader.key(address.folder, address.name, "uploads")
