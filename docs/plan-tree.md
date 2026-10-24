@@ -7,7 +7,7 @@ The last *remote* draft PR HEAD observed for
 `6a5e71ed33ae44d65f7c3a124632cb4d5c4ae4f3`. In the isolated worktree,
 local unpublished commits `b5792b2`, `e16f5b3`, `bf18851`, `ea9a8a2`,
 `3323737`, `62fff4f`, `e91053e`, `48f3da7`, `0722405`,
-`083f3b0` and `a3a9f13` are descendants, not
+`083f3b0`, `a3a9f13`, `e1824f4`, `a1dd767`, `228dc6d` and `eb54e5b` are descendants, not
 published CI checkpoints.
 They preserve the previously integrated owner V2 security fixes `356bf2f`
 and `d014005`.
@@ -62,6 +62,57 @@ verifier. Windows Node 24 sync/HTTP/WebDAV tests **41 PASS / 0 FAIL**;
 Ubuntu Node 22 corresponding tests **32 PASS / 0 FAIL / 8 SKIP**.
 Those snapshots are *not* owner-signed monotonic revocation records and can
 be rolled back by an attacker controlling local configuration.
+
+`a1dd767` adds crash/failure recovery on the real persisted sync JSON store.
+Adversarial RED cases confirmed that a rejected transaction permanently
+poisoned the in-process queue and that merely clearing the rejection could
+silently overwrite an operation already renamed onto disk when directory
+`fsync` failed. The repaired queue recovers only pre-rename failures;
+post-rename durability ambiguity now fences all reads and writes, including
+HTTP sync endpoints (`503 sync_commit_indeterminate`), until a fresh store
+instance reads and validates the disk state. A second RED case caught the
+previously uncaught HTTP rejection; GREEN requires the explicit 503.
+This proves only bounded local failure handling and a fresh readback, not
+external fsync, process-independent CAS, or revocation atomicity. Windows
+Node 24 targeted 69 tests: **68 PASS / 0 FAIL / 1 SKIP**; Ubuntu Node 22
+targeted 41: **39 PASS / 0 FAIL / 2 SKIP**; the final three focused
+Ubuntu Node 22 failure/recovery tests **3 PASS / 0 FAIL**. The full
+Windows Node 24 run on `a1dd767` finished **2631 total / 2464 PASS /
+0 FAIL / 167 SKIP**, `duration_ms=723095.6808`, in
+`.local-full-node24-20261024-post-ambiguous-fsync-fence.log`. This run
+precedes the following recovery guard and is not final-HEAD evidence.
+
+`228dc6d` closes a separate availability/credential-consumption gap:
+when the sync store is already quarantined or becomes indeterminate
+during asynchronous bcrypt/recovery verification, the device-resume
+HTTP route now returns **503 SYNC_COMMIT_INDETERMINATE** before persisting
+TOTP replay state or spending a single-use recovery code. Adversarial
+RED tests saw **400** (already quarantined) and **401** (became quarantined
+after bcrypt) instead of the required **503**. GREEN on the actual
+server route and real JSON store, including opening a separate store
+instance and using the previously untouched recovery code once:
+Windows Node 24 **30 PASS / 0 FAIL / 0 SKIP**; Ubuntu Node 22
+**30 PASS / 0 FAIL / 0 SKIP**. This does **not** make writes to
+the separate user account file atomic with sync-store transactions,
+nor establish a process-independent monotonic revocation authority.
+
+`eb54e5b` resolves a separate sync tenant/index isolation bug: JavaScript
+inherited properties such as `constructor` and `toString` were previously
+treated as committed operations or existing objects, while an authenticated
+`__proto__` username could mutate the process-wide prototype and fail to
+persist a private tenant. Legacy accounts with missing index maps could also
+read inherited ciphertext or history when a different component had already
+polluted `Object.prototype`. Child-process adversarial tests reproduced
+all three failure classes in RED, including a GET of counterfeit history
+*before* the first write. GREEN uses own-property reads, defined own keys and
+safe index initialization, including V1 migration and restart. Integrated
+Windows Node 24: **71 total / 70 PASS / 0 FAIL / 1 SKIP**; Ubuntu/WSL
+Node 22: **71 total / 69 PASS / 0 FAIL / 2 SKIP**. Syntax:
+**638 checked / 0 FAIL**; artifact validation and diff-check PASS.
+Independent read-only P1/P2 review identified the inherited GET gap,
+which was reproduced and closed in this same commit, and found no further
+concrete P1/P2 in this bounded patch. Neither this review nor focused
+validation constitutes acceptance of the entire issue.
 
 Hosted checks still refer **only** to the published `6a5e71e`: Ubuntu Node 22
 full, disposable PostgreSQL 18, Windows mandatory release gates, JavaScript
