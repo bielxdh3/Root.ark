@@ -162,8 +162,8 @@ class Zk1PgPhysicalInventoryBridge {
         || !(pinnedPhysicalAttestorPublicKey instanceof crypto.KeyObject)
         || pinnedPhysicalAttestorPublicKey.type !== "public"
         || pinnedPhysicalAttestorPublicKey.asymmetricKeyType !== "ed25519"
-        || same(pinnedPhysicalAttestorPublicKey.export({ type: "spki", format: "der" }),
-          pinnedPublicKey.export({ type: "spki", format: "der" }))) fail();
+        || crypto.KeyObject.prototype.equals.call(pinnedPhysicalAttestorPublicKey,
+          pinnedPublicKey)) fail();
       this.#attestorClient = attestorClient;
       this.#attestorPublicKey = pinnedPhysicalAttestorPublicKey;
     }

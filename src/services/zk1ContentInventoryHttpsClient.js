@@ -232,8 +232,8 @@ function createZk1ContentInventoryHttpsClient({
     && (!(physicalAttestorPublicKey instanceof crypto.KeyObject)
       || physicalAttestorPublicKey.type !== "public"
       || physicalAttestorPublicKey.asymmetricKeyType !== "ed25519"
-      || physicalAttestorPublicKey.export({ format: "der", type: "spki" }).equals(
-        inventoryPublicKey.export({ format: "der", type: "spki" })))) fail();
+      || crypto.KeyObject.prototype.equals.call(physicalAttestorPublicKey,
+        inventoryPublicKey))) fail();
   const serverFingerprint = serverFingerprint256.toUpperCase();
   const signerKeyId = copyBytes(inventorySignerKeyId, 16);
 

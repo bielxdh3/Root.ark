@@ -13,6 +13,8 @@ const { signCommittedPhysicalReadback } =
   require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
 const { createZk1ContentInventoryHttpsServer } =
   require("../src/services/zk1ContentInventoryHttpsServer");
+const { createZk1ContentInventoryHttpsClient } =
+  require("../src/services/zk1ContentInventoryHttpsClient");
 
 const random = (n) => crypto.randomBytes(n);
 const wire = (obj) => Object.fromEntries(Object.entries(obj).map(([field, value]) =>
@@ -101,6 +103,21 @@ test("strict inventory mTLS append needs independent fresh physical Ed25519 read
     pinnedPhysicalAttestorPublicKey: trusted.publicKey,
     pinnedInventorySignerPublicKey: writer.publicKey,
   }), /INVENTORY_HTTP_INVALID/, "a facade cannot substitute a different inventory identity");
+  const forgedAttestor = crypto.createPublicKey(writer.privateKey);
+  forgedAttestor.export = () => trusted.publicKey.export({ format: "der", type: "spki" });
+  assert.throws(() => createZk1ContentInventoryHttpsServer({
+    key: read("attestor.key"), cert: read("attestor.pem"), clientCa: read("ca.pem"),
+    ledger, principals: grant, physicalAttestorClient: client,
+    pinnedPhysicalAttestorPublicKey: forgedAttestor,
+    pinnedInventorySignerPublicKey: writer.publicKey,
+  }), /INVENTORY_HTTP_INVALID/, "mTLS server must compare native attestor key identities");
+  assert.throws(() => createZk1ContentInventoryHttpsClient({
+    endpoint: "https://localhost:4444/", ca: read("ca.pem"),
+    clientKey: read("allowed.key"), clientCert: read("allowed.pem"),
+    serverFingerprint256: new crypto.X509Certificate(read("attestor.pem")).fingerprint256,
+    inventoryPublicKey: writer.publicKey, inventorySignerKeyId: random(16),
+    physicalAttestorPublicKey: forgedAttestor,
+  }), /INVENTORY_HTTP_UNAVAILABLE/, "mTLS client must compare native attestor key identities");
   const validServer = await serve(trusted.publicKey, client);
   const accepted = await post(validServer.address().port);
   assert.deepEqual(accepted, { status: 200, body: { status: "pending",

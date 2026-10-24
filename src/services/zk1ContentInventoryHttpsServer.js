@@ -168,6 +168,7 @@ function createZk1ContentInventoryHttpsServer({
       !== (pinnedPhysicalAttestorPublicKey === undefined))
     || ((physicalAttestorClient === undefined)
       !== (pinnedInventorySignerPublicKey === undefined))) invalid();
+  const ledgerSignerKey = physicalAttestorClient === undefined ? undefined : ledger.publicKey;
   if (physicalAttestorClient !== undefined
     && (!physicalAttestorClient || typeof physicalAttestorClient.requestAttestation !== "function"
       || !(pinnedPhysicalAttestorPublicKey instanceof crypto.KeyObject)
@@ -179,13 +180,15 @@ function createZk1ContentInventoryHttpsServer({
       // The inventory identity must be pinned OUTSIDE the mutable ledger
       // facade; comparing only ledger.publicKey lets a compromised writer
       // substitute an unrelated fake identity during server construction.
-      || !(ledger.publicKey instanceof crypto.KeyObject)
-      || ledger.publicKey.type !== "public"
-      || ledger.publicKey.asymmetricKeyType !== "ed25519"
-      || !ledger.publicKey.export({ format: "der", type: "spki" }).equals(
-        pinnedInventorySignerPublicKey.export({ format: "der", type: "spki" }))
-      || pinnedInventorySignerPublicKey.export({ format: "der", type: "spki" }).equals(
-        pinnedPhysicalAttestorPublicKey.export({ format: "der", type: "spki" })))) invalid();
+      || !(ledgerSignerKey instanceof crypto.KeyObject)
+      || ledgerSignerKey.type !== "public"
+      || ledgerSignerKey.asymmetricKeyType !== "ed25519"
+      // KeyObject.export is mutable; native equality compares actual key
+      // identity even if an attacker overwrites an instance .export method.
+      || !crypto.KeyObject.prototype.equals.call(ledgerSignerKey,
+        pinnedInventorySignerPublicKey)
+      || crypto.KeyObject.prototype.equals.call(pinnedInventorySignerPublicKey,
+        pinnedPhysicalAttestorPublicKey))) invalid();
   const physicalEnabled = physicalVerifier !== undefined || physicalAttestorClient !== undefined;
 
   const ledgerScope = inventory.normalizeScope(ledger.scope);

@@ -128,6 +128,22 @@ or default application behavior was changed by this patch.
   chain and a fresh proof after service/SQLite restart. The physical readback
   in **that** TLS fixture is synthetic; the signatures and SQLite persistence
   are real, while PostgreSQL execution is **not** part of that test.
+- A further adversarial Proxy reproducer found that two async signature
+  verifiers could read *different* versions of the caller's mutable operation
+  and incorrectly combine a valid inventory A with a valid physical readback
+  B. The composite verifier now snapshots scope, all operation fields and
+  inventory signer ID **once before either async verification**, and the
+  reproduced splice fails closed on Node 22 and Node 24 (RED→GREEN).
+- Two additional independently reviewed writer-key compromise reproducers
+  found identity substitution through a changing top-level public-key getter
+  and through overriding the public `KeyObject.export()` method. The composite
+  verifier now captures the exact pinned keys once and compares their
+  *native Ed25519 key identities* using `KeyObject.prototype.equals.call`.
+  The same native-identity guard is enforced at the inventory mTLS server,
+  mTLS client, and PostgreSQL inventory bridge constructors, before either
+  accepts a writer-controlled apparent attestor. Node 22/24 adversarial
+  tests reproduced rejection after the fixes. These are local cryptographic
+  identity checks, not evidence of an independent remote monotonic witness.
 - The pre-existing disposable PostgreSQL 18 labs verify the restricted login,
   immutable SQL intent, physical bytes and WAL separately. A **new combined
   PG18+separate-process mTLS** run is still required before this pathway can

@@ -82,3 +82,83 @@ test("composite inventory receipt binds separate signer, physical PG proof, oper
   const writerForgery = await f.makePhysical(f.writer.privateKey);
   await deny({ physicalAttestation: writerForgery });
 });
+
+test("a concurrently mutated operation cannot splice a signed inventory A to physical attestation B", async () => {
+  const f = await fixture();
+  const bOperation = { ...f.input.operation,
+    operation_id: random(16), expected_sequence: 9, expected_root: random(32),
+    object_id: random(16), revision: 12, epoch: 17, ciphertext_sha256: random(32) };
+  const bReadback = { ...f.readback, operationId: bOperation.operation_id,
+    revision: bOperation.revision, epoch: bOperation.epoch,
+    expectedInventorySequence: bOperation.expected_sequence,
+    expectedInventoryRoot: bOperation.expected_root,
+    ciphertextSha256: bOperation.ciphertext_sha256 };
+  const attestationB = await signCommittedPhysicalReadback({
+    scope: f.input.scope, operation: bOperation, readback: bReadback,
+    nonce: f.input.nonce, issuedAt: f.input.nowSeconds,
+  }, f.attestor.privateKey);
+  const mutableOperation = { ...f.input.operation };
+  let descriptorReads = 0;
+  const operationUnderRace = new Proxy(mutableOperation, {
+    getOwnPropertyDescriptor(target, field) {
+      if (descriptorReads++ === 7) Object.assign(target, bOperation);
+      return Reflect.getOwnPropertyDescriptor(target, field);
+    },
+  });
+  await assert.rejects(verifyAttestedInventoryCommit({
+    ...f.input, operation: operationUnderRace, physicalAttestation: attestationB,
+  }), /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/,
+    "inventory and physical verifiers must use one detached operation snapshot");
+});
+
+test("physical evidence from another account cannot be spliced by a mutable scope proxy", async () => {
+  const f = await fixture();
+  const foreignScope = { ...f.input.scope, account_id: random(16) };
+  const physicalB = await signCommittedPhysicalReadback({
+    scope: foreignScope, operation: f.input.operation, readback: f.readback,
+    nonce: f.input.nonce, issuedAt: f.input.nowSeconds,
+  }, f.attestor.privateKey);
+  const mutableScope = { ...f.input.scope };
+  let descriptorReads = 0;
+  const switchingScope = new Proxy(mutableScope, {
+    getOwnPropertyDescriptor(target, field) {
+      if (descriptorReads++ === 3) Object.assign(target, foreignScope);
+      return Reflect.getOwnPropertyDescriptor(target, field);
+    },
+  });
+  await assert.rejects(verifyAttestedInventoryCommit({ ...f.input,
+    scope: switchingScope, physicalAttestation: physicalB,
+  }), /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/);
+});
+
+test("hostile top-level key getter cannot swap the pinned attestor to the compromised writer", async () => {
+  const f = await fixture();
+  const forgedPhysical = await f.makePhysical(f.writer.privateKey);
+  let reads = 0;
+  const hostile = new Proxy({ ...f.input, physicalAttestation: forgedPhysical }, {
+    get(target, prop, receiver) {
+      if (prop === "pinnedPhysicalAttestorPublicKey") {
+        reads += 1;
+        return reads === 1 ? f.attestor.publicKey : f.writer.publicKey;
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+  await assert.rejects(verifyAttestedInventoryCommit(hostile),
+    /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/,
+    "keys checked for separation must be the exact keys used for both signatures");
+});
+
+test("writer KeyObject with an overridden export cannot masquerade as a separate physical attestor", async () => {
+  const f = await fixture();
+  const writerDisguisedAsAttestor = crypto.createPublicKey(f.writer.privateKey);
+  writerDisguisedAsAttestor.export = () => f.attestor.publicKey.export({
+    format: "der", type: "spki",
+  });
+  const forgedPhysical = await f.makePhysical(f.writer.privateKey);
+  await assert.rejects(verifyAttestedInventoryCommit({ ...f.input,
+    pinnedPhysicalAttestorPublicKey: writerDisguisedAsAttestor,
+    physicalAttestation: forgedPhysical,
+  }), /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/,
+    "identity comparison must use native immutable SPKI, not an untrusted export method");
+});

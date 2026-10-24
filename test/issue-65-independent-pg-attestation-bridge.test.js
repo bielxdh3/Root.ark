@@ -54,6 +54,11 @@ test("strict bridge rejects a writer-owned physical proof and accepts only pinne
     intentAuthority: mockOf(Zk1SharedPgPhysicalInventoryIntent), ledger,
     pinnedPublicKey: inventorySigner.publicKey, pinnedSignerKeyId: random(16),
     attestorClient, pinnedPhysicalAttestorPublicKey: attest.publicKey };
+  const forgedSameWriter = crypto.createPublicKey(inventorySigner.privateKey);
+  forgedSameWriter.export = () => attest.publicKey.export({ type: "spki", format: "der" });
+  assert.throws(() => new Zk1PgPhysicalInventoryBridge({ ...ctor,
+    pinnedPhysicalAttestorPublicKey: forgedSameWriter }), /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+  "a mutable KeyObject export cannot invent an independent bridge attestor");
   const bridge = new Zk1PgPhysicalInventoryBridge(ctor);
   assert.deepEqual(await bridge.reconcile(physical),
     { status: "pending", authorizesIo: false });

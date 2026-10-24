@@ -34,34 +34,63 @@ function rawBytes(value, min, max) {
 function publicKey(value) {
   if (!(value instanceof crypto.KeyObject) || value.type !== "public"
     || value.asymmetricKeyType !== "ed25519") deny();
-  return value.export({ format: "der", type: "spki" });
 }
 function sha(bytes) { return crypto.createHash("sha256").update(bytes).digest(); }
+function snapshotOperation(value) {
+  exact(value, ["operation_id", "expected_sequence", "expected_root", "object_id",
+    "revision", "epoch", "ciphertext_sha256"]);
+  if (!Number.isSafeInteger(value.expected_sequence) || value.expected_sequence < 0
+    || !Number.isSafeInteger(value.revision) || value.revision < 1
+    || !Number.isSafeInteger(value.epoch) || value.epoch < 1) deny();
+  return { operation_id: rawBytes(value.operation_id, 16, 16),
+    expected_sequence: value.expected_sequence,
+    expected_root: rawBytes(value.expected_root, 32, 32),
+    object_id: rawBytes(value.object_id, 16, 16),
+    revision: value.revision, epoch: value.epoch,
+    ciphertext_sha256: rawBytes(value.ciphertext_sha256, 32, 32) };
+}
 
 async function verifyAttestedInventoryCommit(input) {
   try {
     exact(input, ["receipt", "physicalAttestation", "scope", "operation", "nonce",
       "pinnedInventoryPublicKey", "pinnedInventorySignerKeyId",
       "pinnedPhysicalAttestorPublicKey", "nowSeconds"]);
-    const inventoryPin = publicKey(input.pinnedInventoryPublicKey);
-    const attestorPin = publicKey(input.pinnedPhysicalAttestorPublicKey);
-    if (crypto.timingSafeEqual(inventoryPin, attestorPin)) deny();
+    // The exact KeyObject references used for separation MUST also verify
+    // both signatures. A top-level Proxy can otherwise serve separate keys
+    // to this comparison then replace the attestor with the writer key.
+    const inventoryKey = input.pinnedInventoryPublicKey;
+    const attestorKey = input.pinnedPhysicalAttestorPublicKey;
+    const nowSeconds = input.nowSeconds;
+    publicKey(inventoryKey);
+    publicKey(attestorKey);
+    // The public KeyObject's .export() is an overridable own property.
+    // Compare native cryptographic key identities with the intrinsic method,
+    // not caller-supplied DER from an attacker-controlled export override.
+    if (crypto.KeyObject.prototype.equals.call(inventoryKey, attestorKey)) deny();
     const receipt = rawBytes(input.receipt, 1, inventory.MAX_COMMITTED_PROOF_BYTES);
     const physicalBytes = rawBytes(input.physicalAttestation, 1, 2048);
     const nonce = rawBytes(input.nonce, 32, 32);
+    // Both signature parsers have asynchronous CBOR boundaries. If they read
+    // the caller's mutable operation/scope independently, a hostile Proxy can
+    // present a valid ledger operation A and a valid physical readback B.
+    // Detach exactly ONCE before either parser awaits any promise.
+    const scope = inventory.normalizeScope(input.scope);
+    const operation = snapshotOperation(input.operation);
+    const signerId = rawBytes(input.pinnedInventorySignerKeyId, 16, 16);
     const [signedReceipt, physical] = await Promise.all([
       inventory.verifyCommittedEntryProof({ serialized: receipt,
-        pinnedPublicKey: input.pinnedInventoryPublicKey,
-        pinnedSignerKeyId: input.pinnedInventorySignerKeyId,
-        expectedScope: input.scope, operation: input.operation }),
-      verifyCommittedPhysicalReadback(physicalBytes, { scope: input.scope,
-        operation: input.operation, expected: undefined, nonce,
-        pinnedPublicKey: input.pinnedPhysicalAttestorPublicKey,
-        nowSeconds: input.nowSeconds }),
+        pinnedPublicKey: inventoryKey,
+        pinnedSignerKeyId: signerId,
+        expectedScope: scope, operation }),
+      verifyCommittedPhysicalReadback(physicalBytes, { scope,
+        operation, expected: undefined, nonce,
+        pinnedPublicKey: attestorKey,
+        nowSeconds }),
     ]);
     if (signedReceipt.outcome !== "COMMITTED_IN_SIGNED_LEDGER"
       || physical.status !== "PHYSICALLY_REREAD_PG_COMMITTED"
       || physical.verified !== true || physical.walFlushConfirmed !== true
+      || !crypto.timingSafeEqual(signedReceipt.operationId, physical.operationId)
       || physical.authorizesIo !== false || signedReceipt.authorizesIo !== false) deny();
     // Digest is an explicitly NON-DURABLE evidence-bundle fingerprint, not a
     // replacement for an externally anchored CAS/FLOOR or a recovery ticket.
