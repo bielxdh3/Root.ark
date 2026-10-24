@@ -151,6 +151,11 @@ test("real Edge CSP exposes normal authenticated manual delta import, but no unc
         if(!dlg.querySelector('[data-zk1-action="'+name+'"]'))
           throw Error("MISSING_ACTION_"+name);
       }
+      if(!dlg.querySelector('[data-zk1-field="catalog-restore-epoch-opt-in"]')
+        || !dlg.querySelector('[data-zk1-field="catalog-restore-rekey-grant"]')
+        || !dlg.querySelector('[data-zk1-field="catalog-restore-current-cek"]')
+        || !dlg.querySelector('[data-zk1-field="catalog-restore-current-metadata"]'))
+        throw Error("MISSING_CURRENT_OWNER_REKEY_PROOF");
       const consent=dlg.querySelector('[data-zk1-field="catalog-delta-opt-in"]');
       if(!consent || consent.checked)throw Error("SILENT_AUTO_SYNC");
       dlg.querySelector('[data-zk1-action="catalog-delta-import"]').click();

@@ -3,14 +3,16 @@
     module.exports = factory(require("node:crypto").webcrypto,
       require("./rootark-zk1-browser-opaque-catalog-commit"),
       require("./rootark-zk1-protected-http-client"),
-      require("./rootark-zk1-ciphertext-chunk-root"));
+      require("./rootark-zk1-ciphertext-chunk-root"),
+      require("./rootark-zk1-file-content"));
   } else {
     root.RootarkZk1OpaqueDeviceDeltaSync = factory(root.crypto,
       root.RootarkZk1BrowserOpaqueCatalogCommit,
-      root.RootarkZk1ProtectedHttpClient, root.RootarkZk1CiphertextRoot);
+      root.RootarkZk1ProtectedHttpClient, root.RootarkZk1CiphertextRoot,
+      root.RootarkZk1FileContent);
   }
 }(typeof globalThis === "object" ? globalThis : this,
-  function (crypto, catalog, http, roots) {
+  function (crypto, catalog, http, roots, fileContent) {
     "use strict";
     // Owner-authorized, additive ZK1 opaque-catalog sync. No generic sync
     // engine, server-supplied trust pin, plaintext filename, CEK or local
@@ -21,6 +23,14 @@
     const TRASH_TYPE = "rootark-zk1-opaque-logical-trash/v1";
     const TRASH_DOMAIN = new TextEncoder().encode("Root.ark/zk-1/opaque-logical-trash/v1\0");
     const TRASH_AAD = "Root.ark/zk-1/opaque-logical-trash-aead/v1\0";
+    const REKEY_DOMAIN = new TextEncoder().encode("Root.ark/zk-1/opaque-owner-epoch-restore-grant/v1\0");
+    const REKEY_FORMAT = "rootark-zk1-opaque-owner-epoch-restore-grant/v1";
+    const REKEY_FIELDS = ["format", "account_id", "compartment_id", "keyring_id",
+      "deviceId", "objectId", "sourceRevision", "sourceEpoch",
+      "sourceDigest", "tombstoneRevision", "tombstoneEpoch", "tombstoneDigest",
+      "catalogSequence", "catalogDigest", "ownerRevision", "ownerDigest",
+      "currentEpoch", "destinationRevision", "currentCekSha256",
+      "currentMetadataKeySha256", "nonce", "issuedAt", "expiresAt"];
     const te = new TextEncoder(), td = new TextDecoder("utf-8", { fatal: true });
     const tracked = new WeakMap();
     function deny() { throw new Error("ZK_OPAQUE_DELTA_SYNC_DENIED"); }
@@ -71,6 +81,36 @@
         || !key.usages?.includes("encrypt") || !key.usages?.includes("decrypt")) deny();
       return key;
     }
+    function fileCek(key) {
+      if (!key || key.type !== "secret" || key.algorithm?.name !== "AES-GCM"
+        || key.algorithm.length !== 256 || key.extractable !== false
+        || !key.usages?.includes("decrypt") || !key.usages?.includes("encrypt")) deny();
+      return key;
+    }
+    function restoredSourceMetadata(value, scope, objectId, epoch) {
+      exact(value, ["account_id", "compartment_id", "keyring_id", "object_id",
+        "version_id", "parent_version_id", "epoch", "kind"]);
+      if (Object.keys(scope).some((key) => value[key] !== scope[key])
+        || value.object_id !== objectId || value.epoch !== epoch
+        || value.kind !== "file" || !/^[A-Za-z0-9_-]{22}$/.test(value.version_id)
+        || (value.parent_version_id !== null
+          && !/^[A-Za-z0-9_-]{22}$/.test(value.parent_version_id))) deny();
+      from64(value.version_id, 16);
+      if (value.parent_version_id !== null) from64(value.parent_version_id, 16);
+      return { ...value };
+    }
+    function historicalSourceMetadataKey(key) {
+      if (!key || key.type !== "secret" || key.algorithm?.name !== "AES-GCM"
+        || key.algorithm.length !== 256 || key.extractable !== false
+        || key.usages?.length !== 1 || key.usages[0] !== "decrypt") deny();
+      return key;
+    }
+    function readablePredecessorMetadataKey(key) {
+      if (!key || key.type !== "secret" || key.algorithm?.name !== "AES-GCM"
+        || key.algorithm.length !== 256 || key.extractable !== false
+        || !key.usages?.includes("decrypt")) deny();
+      return key;
+    }
     function readOnlyEpochMetadataKey(mapping, epoch) {
       if (!Array.isArray(mapping) || mapping.length < 1 || mapping.length > 128
         || mapping.some((entry, index) => {
@@ -93,6 +133,49 @@
     function scopeFor(grant) {
       return Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
         .map((key) => [key, grant[key]]));
+    }
+    async function verifyEpochRekeyGrant(grant, source, tombstone, state, trust,
+      newCekRaw, newMetadataRaw) {
+      exact(grant, [...REKEY_FIELDS, "signature"]);
+      const { signature } = grant;
+      const unsigned = Object.fromEntries(REKEY_FIELDS.map((name) => [name, grant[name]]));
+      const scope = scopeFor(trust.signedDeviceGrant);
+      if (grant.format !== REKEY_FORMAT
+        || Object.keys(scope).some((name) => grant[name] !== scope[name])
+        || grant.deviceId !== trust.signedDeviceGrant.device_id
+        || grant.objectId !== source.object_id
+        || grant.sourceRevision !== source.revision
+        || grant.sourceEpoch !== source.epoch
+        || grant.sourceDigest !== b64(bytes(source.ciphertext_digest, 32))
+        || grant.tombstoneRevision !== tombstone.revision
+        || grant.tombstoneEpoch !== tombstone.epoch
+        || grant.tombstoneDigest !== b64(bytes(tombstone.ciphertext_digest, 32))
+        || grant.catalogSequence !== state.head.sequence
+        || grant.catalogDigest !== state.head.digest
+        || grant.ownerRevision !== trust.pinnedOwnerHead.revision
+        || grant.ownerDigest !== b64(bytes(trust.pinnedOwnerHead.digest, 32))
+        || grant.currentEpoch !== trust.pinnedOwnerHead.epoch
+        || grant.destinationRevision !== tombstone.revision + 1
+        || grant.currentCekSha256 !== b64(new Uint8Array(await crypto.subtle.digest(
+          "SHA-256", newCekRaw)))
+        || grant.currentMetadataKeySha256 !== b64(new Uint8Array(await crypto.subtle.digest(
+          "SHA-256", newMetadataRaw)))
+        || !Number.isSafeInteger(grant.issuedAt)
+        || !Number.isSafeInteger(grant.expiresAt)
+        || grant.issuedAt < 1 || grant.expiresAt <= grant.issuedAt
+        || grant.expiresAt - grant.issuedAt > 300
+        || grant.issuedAt > trust.nowSeconds() + 30
+        || trust.nowSeconds() > grant.expiresAt
+        || from64(grant.nonce, 32).length !== 32) deny();
+      const ownerKey = trust.ownerPublicKey;
+      if (ownerKey?.type !== "public" || ownerKey.algorithm?.name !== "Ed25519"
+        || ownerKey.extractable !== true || !ownerKey.usages?.includes("verify")
+        || !equal(new Uint8Array(await crypto.subtle.digest("SHA-256",
+          await crypto.subtle.exportKey("raw", ownerKey))),
+        bytes(trust.pinnedOwnerKeyHash, 32))) deny();
+      const msg = new Uint8Array([...REKEY_DOMAIN, ...te.encode(JSON.stringify(unsigned))]);
+      if (!await crypto.subtle.verify("Ed25519", ownerKey,
+        from64(signature, 64), msg)) deny();
     }
     async function sealTrash(statement, signer, key) {
       const unsigned = te.encode(JSON.stringify(statement));
@@ -238,7 +321,9 @@
             authorizesMutation: false });
         } catch (_) { deny(); }
       }
-      async function commitVersion(inputVersion, internalTrash = false) {
+      async function commitVersion(inputVersion, internalTrash = false,
+        internalRestore = false, predecessorMetadataKey = null,
+        restoreAdmission = null) {
         let journalId = null, phase = "none", sealed = null;
         try {
           exact(inputVersion, ["previous", "objectId", "expectedRevision",
@@ -246,7 +331,9 @@
           // Snapshot caller scalars before the first asynchronous signature.
           // A moving UI selection must never redirect the authorized PUT.
           inputVersion = { ...inputVersion };
-          if (usedMutation) deny();
+          if (usedMutation || (internalRestore && typeof restoreAdmission !== "function")
+            || (!internalRestore && restoreAdmission !== null)) deny();
+          if (internalRestore) restoreAdmission();
           const base = tracked.get(inputVersion.previous);
           if (!base || base.owner !== writer || latest !== inputVersion.previous) deny();
           if (inputVersion.expectedRevision !== null
@@ -271,23 +358,27 @@
           if (fresh.head.sequence !== base.head.sequence
             || !equal(bytes(fresh.head.digest, 32), from64(base.head.digest, 32))) deny();
           if (expectedRevision !== null) {
-            // An ordinary additive version is not an authorized restore. Open
-            // the authenticated latest metadata under the user's holder key
-            // so a signed tombstone cannot silently become a live file again.
+            // An ordinary append cannot turn a logical tombstone back into a
+            // visible file. Only the privately authorized restore path may
+            // issue that transition. A changed/unknown old metadata key also
+            // fails closed instead of treating ciphertext as "not trash".
             metadataKey(inputVersion.metadataKey);
-            const prior = fresh.rows.find((row) => row.object_id === inputVersion.objectId
+            if (internalRestore) readablePredecessorMetadataKey(predecessorMetadataKey);
+            const parent = fresh.rows.find((row) => row.object_id === inputVersion.objectId
               && row.revision === expectedRevision);
-            if (!prior) deny();
-            const priorName = await catalog.openMetadata({ scope: trust.signedDeviceGrant,
-              objectId: prior.object_id, revision: prior.revision, epoch: prior.epoch,
-              metadataKey: inputVersion.metadataKey,
-              ciphertext: bytes(prior.metadata_ciphertext, 284) });
+            if (!parent) deny();
+            const parentName = await catalog.openMetadata({
+              scope: trust.signedDeviceGrant, objectId: inputVersion.objectId,
+              revision: parent.revision, epoch: parent.epoch,
+              metadataKey: internalRestore ? predecessorMetadataKey : inputVersion.metadataKey,
+              ciphertext: bytes(parent.metadata_ciphertext, 284) });
             assertLive();
-            if (priorName === TRASH_NAME) deny();
-          }
+            if ((parentName === TRASH_NAME) !== (internalRestore === true)) deny();
+          } else if (internalRestore) deny();
           const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", sealed));
           const root = await roots.computeCiphertextRoot([sealed]);
           // Durable, signer-authenticated intent BEFORE the external PUT.
+          if (internalRestore) restoreAdmission();
           journalId = await writer.prepareIntent([{ objectId: inputVersion.objectId,
             revision: inputVersion.revision, epoch: inputVersion.epoch, ciphertext: sealed }],
           { sequence: base.head.sequence, digest: from64(base.head.digest, 32) });
@@ -313,6 +404,7 @@
             expectedObjectRevision: expectedRevision, ciphertext: sealed });
           assertLive();
           phase = "put";
+          if (internalRestore) restoreAdmission();
           // One and only one signed PUT, regardless of timeout/lost ACK.
           try { await http.postProtectedCiphertextPut({ origin: trust.origin,
             request: put, fetchImpl: guardedFetch }); } catch (_) { /* exact GET below */ }
@@ -329,6 +421,7 @@
           if (read.ciphertextBase64 !== b64(sealed)
             || read.integrityMatchesPinnedRoot !== true) deny();
           phase = "commit";
+          if (internalRestore) restoreAdmission();
           // Metadata name/CEK exist only in local memory. The writer seals the
           // filename as AES-GCM (284 bytes) before signed catalog POST.
           const receipt = await writer.commit([{ objectId: inputVersion.objectId,
@@ -530,8 +623,200 @@
             ownerApprovedRekeyRequired: historical });
         } catch (_) { deny(); } finally { clear?.fill(0); }
       }
+      async function restoreVersion(inputRestore) {
+        let plaintext = null, sealed = null, nextCekBytes = null, nextMetadataBytes = null;
+        try {
+          const crossing = Object.hasOwn(inputRestore || {}, "ownerRekeyGrant");
+          exact(inputRestore, ["previous", "objectId", "metadataKey",
+            "sourceMetadata", "sourceCek", ...(crossing ? [
+              "ownerRekeyGrant", "currentEpochCekRaw", "currentEpochMetadataKeyRaw",
+              "tombstoneMetadataKey",
+            ] : [])]);
+          if (crossing) historicalSourceMetadataKey(inputRestore.metadataKey);
+          else metadataKey(inputRestore.metadataKey);
+          const currentTombstoneKey = crossing
+            ? metadataKey(inputRestore.tombstoneMetadataKey) : inputRestore.metadataKey;
+          if (usedMutation || !fileCek(inputRestore.sourceCek)
+            || typeof fileContent?.decryptFile !== "function"
+            || typeof fileContent?.encryptFileWithParent !== "function") deny();
+          // Copy the signed grant before any await; a caller may not change
+          // nonce, expiry or anchored digests after signature validation.
+          if (crossing) exact(inputRestore.ownerRekeyGrant,
+            [...REKEY_FIELDS, "signature"]);
+          const rekeyGrant = crossing ? Object.freeze({ ...inputRestore.ownerRekeyGrant }) : null;
+          const restoreAdmission = () => {
+            assertLive();
+            if (crossing && (trust.nowSeconds() > rekeyGrant.expiresAt
+              || rekeyGrant.issuedAt > trust.nowSeconds() + 30
+              || trust.signedDeviceGrant.current_epoch !== trust.pinnedOwnerHead.epoch
+              || trust.signedDeviceGrant.revoked_at_epoch !== null)) deny();
+          };
+          const state = tracked.get(inputRestore.previous);
+          if (!state || state.owner !== writer || latest !== inputRestore.previous
+            || inputRestore.previous.head.sequence !== state.head.sequence
+            || inputRestore.previous.head.digest !== state.head.digest) deny();
+          const objectId = inputRestore.objectId;
+          if (typeof objectId !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(objectId)) deny();
+          from64(objectId, 16);
+          // The opaque marker is not an authoritative server trash flag. Its
+          // Ed25519 author, predecessor digest and independent CAS predecessor
+          // must be proven before recovering any historical plaintext.
+          const marker = await readTrash({ previous: inputRestore.previous,
+            objectId, metadataKey: currentTombstoneKey });
+          assertLive();
+          const signed = await writer.readAll();
+          assertLive();
+          if (signed.head.sequence !== state.head.sequence
+            || !equal(bytes(signed.head.digest, 32), from64(state.head.digest, 32))
+            || signed.rows.length !== state.snapshot.rows.length) deny();
+          const rows = signed.rows.filter((row) => row.object_id === objectId);
+          if (rows.length < 2) deny();
+          const prior = rows[rows.length - 2], tombstone = rows[rows.length - 1];
+          if (prior.revision !== marker.predecessorRevision
+            || tombstone.revision !== marker.revision
+            || tombstone.revision !== prior.revision + 1
+            || tombstone.epoch !== trust.pinnedOwnerHead.epoch
+            || (prior.epoch !== tombstone.epoch) !== crossing) deny();
+          let targetCek = inputRestore.sourceCek, targetMetadataKey = inputRestore.metadataKey;
+          if (crossing) {
+            // Current owner grant and witness/CAS history are independently
+            // authenticated by the actual browser writer.readAll above.
+            // Accept a historical tombstone author ONLY when it is the same
+            // currently owner-granted device. This excludes unsigned extra
+            // signerGrants supplied by an untrusted caller (readTrash P2).
+            if (trust.signedDeviceGrant.revoked_at_epoch !== null
+              || trust.signedDeviceGrant.current_epoch !== trust.pinnedOwnerHead.epoch
+              || prior.epoch >= tombstone.epoch) deny();
+            const tombstoneGet = await writer.readVerifiedCiphertext(signed,
+              objectId, tombstone.revision);
+            assertLive();
+            const rawTombstone = from64(tombstoneGet.ciphertextBase64, 28, MAX);
+            if (tombstoneGet.ciphertextDigestBase64 !== b64(bytes(tombstone.ciphertext_digest, 32))
+              || !equal(new Uint8Array(await crypto.subtle.digest("SHA-256",
+                rawTombstone)), bytes(tombstone.ciphertext_digest, 32))) deny();
+            let clearTombstone = null;
+            try {
+              clearTombstone = new Uint8Array(await crypto.subtle.decrypt({
+                name: "AES-GCM", iv: rawTombstone.slice(0, 12),
+                additionalData: trashAad(scopeFor(trust.signedDeviceGrant),
+                  objectId, tombstone.revision, tombstone.epoch), tagLength: 128,
+              }, currentTombstoneKey, rawTombstone.slice(12)));
+              const parsed = JSON.parse(td.decode(clearTombstone));
+              exact(parsed, ["statement", "signature"]);
+              if (parsed.statement?.deviceId !== trust.signedDeviceGrant.device_id) deny();
+              const trustedSigner = await crypto.subtle.importKey("raw",
+                from64(trust.signedDeviceGrant.authorization_public_key, 32),
+                "Ed25519", false, ["verify"]);
+              if (!await crypto.subtle.verify("Ed25519", trustedSigner,
+                from64(parsed.signature, 64),
+                new Uint8Array([...TRASH_DOMAIN,
+                  ...te.encode(JSON.stringify(parsed.statement))]))) deny();
+            } finally { clearTombstone?.fill(0); }
+            nextCekBytes = bytes(inputRestore.currentEpochCekRaw, 32);
+            nextMetadataBytes = bytes(inputRestore.currentEpochMetadataKeyRaw, 32);
+            if (equal(nextCekBytes, nextMetadataBytes)) deny();
+            await verifyEpochRekeyGrant(rekeyGrant, prior,
+              tombstone, state, trust, nextCekBytes, nextMetadataBytes);
+            restoreAdmission();
+            // The current tombstone key must be cryptographically distinct
+            // from the original historical metadata key (revocation boundary).
+            let reusedOldMetadataKey = false;
+            try {
+              await catalog.openMetadata({ scope: trust.signedDeviceGrant,
+                objectId, revision: prior.revision, epoch: prior.epoch,
+                metadataKey: currentTombstoneKey,
+                ciphertext: bytes(prior.metadata_ciphertext, 284) });
+              reusedOldMetadataKey = true;
+            } catch (_) { /* the epoch keys must differ */ }
+            if (reusedOldMetadataKey) deny();
+            targetCek = await fileContent.importFileCek(nextCekBytes);
+            targetMetadataKey = await crypto.subtle.importKey("raw",
+              nextMetadataBytes, { name: "AES-GCM", length: 256 },
+              false, ["encrypt", "decrypt"]);
+          }
+          const original = restoredSourceMetadata(inputRestore.sourceMetadata,
+            scopeFor(trust.signedDeviceGrant), objectId, prior.epoch);
+          const originalName = await catalog.openMetadata({
+            scope: trust.signedDeviceGrant, objectId, revision: prior.revision,
+            epoch: prior.epoch, metadataKey: inputRestore.metadataKey,
+            ciphertext: bytes(prior.metadata_ciphertext, 284) });
+          assertLive();
+          if (originalName === TRASH_NAME) deny();
+          const fetched = await writer.readVerifiedCiphertext(signed,
+            objectId, prior.revision);
+          assertLive();
+          if (fetched.objectId !== objectId || fetched.revision !== prior.revision
+            || fetched.epoch !== prior.epoch
+            || fetched.ciphertextDigestBase64 !== b64(bytes(prior.ciphertext_digest, 32))) deny();
+          const previousCiphertext = from64(fetched.ciphertextBase64, 16, MAX);
+          if (!equal(new Uint8Array(await crypto.subtle.digest("SHA-256",
+            previousCiphertext)), bytes(prior.ciphertext_digest, 32))) deny();
+          plaintext = await fileContent.decryptFile({ cek: inputRestore.sourceCek,
+            metadata: original, envelopeBytes: previousCiphertext });
+          assertLive();
+          if (plaintext.name !== originalName
+            || plaintext.authorizesRelease === true) deny();
+          if (crossing) {
+            // A raw current-epoch "rekey" that equals the old CEK would leak
+            // the new revision to devices revoked by the rotation.
+            let sameKey = false;
+            try {
+              const duplicate = await fileContent.decryptFile({ cek: targetCek,
+                metadata: original, envelopeBytes: previousCiphertext });
+              duplicate.data.fill(0);
+              sameKey = true;
+            } catch (_) { /* different key is mandatory */ }
+            if (sameKey) deny();
+            let sameMetadataKey = false;
+            try {
+              await catalog.openMetadata({ scope: trust.signedDeviceGrant,
+                objectId, revision: prior.revision, epoch: prior.epoch,
+                metadataKey: targetMetadataKey,
+                ciphertext: bytes(prior.metadata_ciphertext, 284) });
+              sameMetadataKey = true;
+            } catch (_) { /* a NEW current-epoch metadata key must not decrypt the old name */ }
+            if (sameMetadataKey) deny();
+          }
+          const next = { ...original,
+            version_id: b64(crypto.getRandomValues(new Uint8Array(16))),
+            // Opaque tombstones do not contain a file-content version_id.
+            // The last actual file is the authenticated content ancestor.
+            parent_version_id: original.version_id,
+            epoch: trust.pinnedOwnerHead.epoch };
+          sealed = await fileContent.encryptFileWithParent({
+            cek: targetCek, metadata: next, name: plaintext.name,
+            mediaType: plaintext.mediaType,
+            parentFolderId: plaintext.parentFolderId ?? null,
+            data: plaintext.data });
+          plaintext.data.fill(0); plaintext = null;
+          assertLive();
+          // This path deliberately reuses the independently held original CEK.
+          // No new unrecoverable key is minted without signed archive custody.
+          const result = await commitVersion({ previous: inputRestore.previous,
+            objectId, expectedRevision: tombstone.revision,
+            revision: tombstone.revision + 1, epoch: next.epoch,
+            ciphertext: sealed, name: originalName,
+            metadataKey: targetMetadataKey }, false, true,
+          currentTombstoneKey, restoreAdmission);
+          return Object.freeze({ ...result, objectId, revision: tombstone.revision + 1,
+            state: "restored", predecessorRevision: prior.revision,
+            tombstoneRevision: tombstone.revision, originalHistoryPreserved: true,
+            sourceCiphertextVerifiedBySignedGet: true,
+            tombstoneSignedAndVerified: true, originalCekReused: !crossing,
+            independentlyOwnerSignedEpochRekey: crossing,
+            serverPlaintextExposed: false, physicalDeletionAuthorized: false });
+        } catch (error) {
+          if (error?.outcome) throw error;
+          deny();
+        } finally {
+          plaintext?.data?.fill(0);
+          sealed?.fill(0);
+          nextCekBytes?.fill(0);
+          nextMetadataBytes?.fill(0);
+        }
+      }
       return Object.freeze({ readCurrent, pullDelta, readPrivateListing,
-        commitVersion: (value) => commitVersion(value, false), trashVersion, readTrash });
+        commitVersion: (value) => commitVersion(value, false), trashVersion, readTrash, restoreVersion });
     }
     return Object.freeze({ createClient });
   }));

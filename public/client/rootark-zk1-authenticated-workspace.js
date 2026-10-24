@@ -801,13 +801,22 @@
       + '<label>Delta opaco exportado por outro dispositivo (.json, somente ciphertext e metadados cifrados)<input type="file" data-zk1-field="catalog-delta-package" accept=".json,application/json"></label>'
       + '<label>Histórico proprietário de epochs (JSON assinado do início ao head atual; somente leitura histórica)<input type="file" data-zk1-field="catalog-historical-epoch-history" accept=".json,application/json"></label>'
       + '<label>Chave AES-GCM da epoch histórica (32 bytes, local; somente leitura de tombstone)<input type="file" data-zk1-field="catalog-historical-epoch-key"></label>'
+      + '<label>Restaurar: metadados canônicos da versão original (.json, IDs opacos, sem nome)<input type="file" data-zk1-field="catalog-restore-metadata" accept=".json,application/json"></label>'
+      + '<label>Restaurar: CEK original mantida fora do servidor (AES-256, 32 bytes)<input type="file" data-zk1-field="catalog-restore-cek"></label>'
+      + '<label><input type="checkbox" data-zk1-field="catalog-restore-epoch-opt-in"> Restauração entre epochs: possuo grant Ed25519 do proprietário atual e duas chaves NOVAS, guardadas offline e distintas das anteriores.</label>'
+      + '<label>Grant de rekey entre epochs assinado pelo proprietário atual (.json; escopo, digests, CAS e prazo de 5 min)<input type="file" data-zk1-field="catalog-restore-rekey-grant" accept=".json,application/json"></label>'
+      + '<label>Chave historica de metadados do arquivo ANTES da rotacao (raw 32 bytes; importada somente para leitura local)<input type="file" data-zk1-field="catalog-restore-source-metadata-key"></label>'
+      + '<label>CEK NOVA do epoch atual (raw 32 bytes; compromisso SHA-256 no grant)<input type="file" data-zk1-field="catalog-restore-current-cek"></label>'
+      + '<label>Chave NOVA de metadados do epoch atual (raw 32 bytes; compromisso SHA-256 no grant)<input type="file" data-zk1-field="catalog-restore-current-metadata"></label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-anchor">Ancorar CAS assinado atual</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-pull">Conferir e exportar delta cifrado</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-list">Listar nomes localmente (AES-GCM)</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-trash-inspect">Conferir tombstone assinado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-import">Importar e comparar delta com GET assinado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-publish">Publicar nova versão cifrada via journal → PUT → CAS</button>'
-      + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-trash">Trash lógico (nova revisão assinada, sem deletar histórico)</button></div>'
+      + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-trash">Trash lógico (nova revisão assinada, sem deletar histórico)</button>'
+      + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-restore">Restaurar ciphertext histórico autenticado (sem delete)</button></div>'
+      + '<p class="muted">Restore exige tombstone Ed25519 válido, GET histórico assinado, CEK original offline e piso CAS/witness atual. Entre epochs, o tombstone deve ter sido assinado pelo dispositivo atual após rotação, e a versão antiga deve ter seu conteúdo e CEK preservados; o grant de rekey atual e duas chaves novas produzem revisão AEAD sem reutilizar CEK antiga. Fixe e preserve as novas chaves fora do servidor para recuperação futura. Sem deleção física.</p>'
       + '<div data-zk1-field="catalog-delta-private-list" role="region" aria-label="Nomes locais abertos após CAS e witness assinados"></div>'
       + '<output data-zk1-field="catalog-delta-summary" role="status" aria-live="polite"></output>'
       + '</fieldset>'
@@ -1137,6 +1146,75 @@
               + " versões históricas preservadas";
             status("Tombstone cifrado e assinado conferido contra GET exato, witness e CAS. "
               + "Nenhuma restauração ou deleção física.");
+            return;
+          }
+          if (action === "catalog-delta-restore") {
+            const metadataRaw = await fileBytes("catalog-restore-metadata", 2, 4096);
+            let sourceMetadata;
+            try { sourceMetadata = JSON.parse(decoder.decode(metadataRaw)); }
+            finally { metadataRaw.fill(0); }
+            const cekRaw = await fileBytes("catalog-restore-cek", 32, 32);
+            let sourceCek;
+            try { sourceCek = await window.RootarkZk1FileContent.importFileCek(cekRaw); }
+            finally { cekRaw.fill(0); }
+            const rekeySelected = field("catalog-restore-epoch-opt-in")?.checked === true;
+            const providedRekeyFiles = ["catalog-restore-rekey-grant",
+              "catalog-restore-current-cek", "catalog-restore-current-metadata",
+              "catalog-restore-source-metadata-key"]
+              .some((name) => field(name)?.files?.length);
+            if (!rekeySelected && providedRekeyFiles) fail();
+            let rekeyOptions = {};
+            let restoreSourceMetadataKey = metadataKey;
+            let nextCekRaw = null, nextMetadataRaw = null;
+            if (rekeySelected) {
+              const oldKeyRaw = await fileBytes("catalog-restore-source-metadata-key", 32, 32);
+              try {
+                restoreSourceMetadataKey = await window.crypto.subtle.importKey("raw",
+                  oldKeyRaw, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+              } finally { oldKeyRaw.fill(0); }
+              const grantRaw = await fileBytes("catalog-restore-rekey-grant", 2, 8192);
+              let ownerRekeyGrant;
+              try { ownerRekeyGrant = JSON.parse(decoder.decode(grantRaw)); }
+              finally { grantRaw.fill(0); }
+              nextCekRaw = await fileBytes("catalog-restore-current-cek", 32, 32);
+              nextMetadataRaw = await fileBytes("catalog-restore-current-metadata", 32, 32);
+              // The ordinary input key authenticates the CURRENT epoch
+              // tombstone; historical metadata only receives decrypt usage.
+              rekeyOptions = { ownerRekeyGrant, currentEpochCekRaw: nextCekRaw,
+                currentEpochMetadataKeyRaw: nextMetadataRaw,
+                tombstoneMetadataKey: metadataKey };
+            }
+            assertLive();
+            // Consume this exact offline anchor before starting mutation; a
+            // lost PUT/CAS response can never authorize an automatic retry.
+            verifiedOpaqueDelta = null;
+            let result;
+            try {
+              result = await held.client.restoreVersion({
+                previous: held.baseline, objectId,
+                metadataKey: restoreSourceMetadataKey,
+                sourceMetadata, sourceCek, ...rekeyOptions });
+            } catch (error) {
+              if (typeof error?.outcome?.journalId === "string"
+                && /^[A-Za-z0-9_-]{43}$/.test(error.outcome.journalId))
+                field("catalog-write-journal").textContent = error.outcome.journalId;
+              throw error;
+            } finally { nextCekRaw?.fill(0); nextMetadataRaw?.fill(0); }
+            assertLive();
+            if (result.state !== "restored" || result.originalHistoryPreserved !== true
+              || result.tombstoneSignedAndVerified !== true
+              || result.sourceCiphertextVerifiedBySignedGet !== true
+              || result.originalCekReused !== !rekeySelected
+              || result.independentlyOwnerSignedEpochRekey !== rekeySelected
+              || result.serverPlaintextExposed !== false
+              || result.physicalDeletionAuthorized !== false
+              || result.journalClearedAfterSignedProof !== true) fail();
+            field("catalog-delta-summary").textContent = "Restore cifrado · CAS #"
+              + result.sequence + " · revisão " + result.revision;
+            status("Restore lógico" + (rekeySelected ? " com rekey do proprietário" : "")
+              + " assinado e recriptografado neste navegador: GET "
+              + "histórico e tombstone conferidos, journal → PUT → GET → CAS. "
+              + "Fixe o novo head CAS offline antes de sincronizar outro dispositivo.");
             return;
           }
           const source = held.baseline.entries.filter((row) => row.objectId === objectId);
