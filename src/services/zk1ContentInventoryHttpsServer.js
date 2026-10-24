@@ -19,7 +19,8 @@ const MAX_SNAPSHOT_RESPONSE_BYTES = MAX_SNAPSHOT_BASE64_BYTES + 16 * 1024;
 const MAX_SMALL_RESPONSE_BYTES = 16 * 1024;
 const MAX_CHAIN_RESPONSE_BYTES = 128 * 1024;
 const MAX_CHAIN_PAGE_RECEIPTS = 16;
-const MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS = 2;
+const MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS = 4;
+const MAX_PHYSICAL_CHAIN_PAGES_PER_WINDOW = 16;
 // Physical verification re-reads up to 64 MiB from PostgreSQL twice per
 // successful append. A valid but compromised mTLS append certificate must
 // not fan out unbounded concurrent hash/readback work. Reject rather than
@@ -205,6 +206,9 @@ function createZk1ContentInventoryHttpsServer({
   const physicalPrincipalWindowCounts = new Map();
   let physicalGlobalWindowStarted = process.hrtime.bigint();
   let physicalGlobalWindowCount = 0;
+  const physicalChainPrincipalWindowCounts = new Map();
+  let physicalChainWindowStarted = process.hrtime.bigint();
+  let physicalChainGlobalWindowCount = 0;
   async function verifyPhysical(scope, operation, callerNonce) {
     if (physicalAttestorClient !== undefined) {
       // The application/inventory signer does not supply the physical digest,
@@ -242,6 +246,29 @@ function createZk1ContentInventoryHttpsServer({
     physicalGlobalWindowCount += 1;
     physicalPrincipalWindowCounts.set(id,
       (physicalPrincipalWindowCounts.get(id) || 0) + 1);
+    activePhysicalAppends += 1;
+    activePhysicalPrincipals.add(id);
+    return id;
+  }
+  function acquirePhysicalChainLease(fingerprint) {
+    const id = fingerprint.toUpperCase();
+    const now = process.hrtime.bigint();
+    if (now - physicalChainWindowStarted >= PHYSICAL_WINDOW_NS) {
+      physicalChainWindowStarted = now;
+      physicalChainGlobalWindowCount = 0;
+      physicalChainPrincipalWindowCounts.clear();
+    }
+    // Chain reads have a separate, finite budget so an ordinary 64-entry
+    // authenticated continuation can finish without relaxing write/status
+    // throttling. The shared active limit still fences concurrent PG reads.
+    if (activePhysicalAppends >= MAX_ACTIVE_PHYSICAL_APPENDS
+      || activePhysicalPrincipals.has(id)
+      || physicalChainGlobalWindowCount >= MAX_PHYSICAL_CHAIN_PAGES_PER_WINDOW
+      || (physicalChainPrincipalWindowCounts.get(id) || 0)
+        >= MAX_PHYSICAL_CHAIN_PAGES_PER_WINDOW) return false;
+    physicalChainGlobalWindowCount += 1;
+    physicalChainPrincipalWindowCounts.set(id,
+      (physicalChainPrincipalWindowCounts.get(id) || 0) + 1);
     activePhysicalAppends += 1;
     activePhysicalPrincipals.add(id);
     return id;
@@ -299,7 +326,7 @@ function createZk1ContentInventoryHttpsServer({
             ? MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS : MAX_CHAIN_PAGE_RECEIPTS)) invalid();
         const pageNonce = physicalAttestorClient ? decode(raw.nonce, 32, 32) : null;
         if (physicalAttestorClient) {
-          physicalLeasePrincipal = acquirePhysicalLease(peer.fingerprint256);
+          physicalLeasePrincipal = acquirePhysicalChainLease(peer.fingerprint256);
           if (!physicalLeasePrincipal) {
             return respond(response, 503, { error: "INVENTORY_UNAVAILABLE" });
           }

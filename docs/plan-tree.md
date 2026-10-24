@@ -10,14 +10,20 @@ returns both. The client independently verifies each Ed25519 receipt/readback
 pair against the exact operation and pinned identities before authenticating
 the complete chain against its caller-retained signed floor and fresh snapshot.
 Missing, forged, or downgraded physical evidence fails closed. Strict pages
-are capped at two receipts under the existing physical-read lease; long chains
-can hit the current per-principal rate budget and must retry rather than infer
-success. This is nonauthorizing proof of local physical readback, **not** a
+are capped at four receipts. The independently reviewed P2 in `98c2f4d`
+was that sharing the 4-request append/status budget made a 9-entry chain
+impossible; a separate 16-page-per-minute budget now permits the full 64-entry
+client cap while retaining a shared two-active-read ceiling and the tighter
+append/status quotas. Contention can still return unavailable; it must never
+be mistaken for a verified result. This is nonauthorizing proof of local
+physical readback, **not** a
 cloud durability guarantee or an externally anchored floor.
 
-Windows Node 24 mTLS + independent attestor transport: 24 PASS / 0 FAIL after
-fixing a synthetic ledger fixture missing its signer key ID. Ubuntu WSL Node 22
-mTLS: 23 PASS / 0 FAIL. The multi-page restart fixture uses a synthetic signed
+Windows Node 24 mTLS after the rate-budget RED/GREEN: 24 PASS / 0 FAIL,
+including 9-entry status continuation and the full 64-entry client cap.
+Ubuntu WSL Node 22 mTLS: 24 PASS / 0 FAIL. The separate independent-attestor
+transport test and its synthetic ledger fixture passed before this revision;
+the multi-page restart fixture uses a synthetic signed
 readback; it does not replace the separate PostgreSQL 18 laboratory, and the
 sync historical-admission gap below remains NO-GO. No publication or cutover.
 

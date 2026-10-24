@@ -1197,7 +1197,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     const base = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
     let head = floor;
     let last;
-    for (let i = 0; i < 3; i += 1) {
+    for (let i = 0; i < 9; i += 1) {
       last = newOperation({ sequence: head.sequence, root: head.root,
         objectId: Buffer.alloc(16, 0xa0 + i) });
       const committed = await h.ledger.append(last);
@@ -1209,16 +1209,44 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       minimumSnapshot: base.bytes, includeVerifiedProofChain: true };
     const before = await h.makeClient("status-reader").getVerifiedSnapshotWithChain(input);
     assert.equal(before.independentPhysicalChainVerified, true);
-    assert.equal(before.authenticatedProofChain.length, 3);
-    assert.equal(before.authenticatedPhysicalProofChain.length, 3);
+    assert.equal(before.authenticatedProofChain.length, 9);
+    assert.equal(before.authenticatedPhysicalProofChain.length, 9);
+    const status = await h.makeClient("status-reader").getOperationStatusWithVerifiedChain({
+      scope: h.scope, operation: last, minimumHead: floor,
+      minimumSnapshot: base.bytes,
+    });
+    assert.equal(status.verifiedChainContinuation, true);
     await h.restart();
     const after = await h.makeClient("status-reader").getVerifiedSnapshotWithChain({
       ...input, nonce: crypto.randomBytes(32),
     });
     assert.equal(after.independentPhysicalChainVerified, true);
-    assert.equal(after.authenticatedPhysicalProofChain.length, 3);
+    assert.equal(after.authenticatedPhysicalProofChain.length, 9);
     assert.notDeepEqual(after.authenticatedPhysicalProofChain[0],
       before.authenticatedPhysicalProofChain[0],
       "restart must request fresh physical evidence, not reuse a cached proof");
+  });
+
+  await t.test("strict physical budget completes the full 64-entry client chain cap", async (child) => {
+    const h = await harness(child, { strictPhysical: true });
+    const floor = await h.ledger.readLocalHead();
+    const base = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+    let head = floor;
+    let last;
+    for (let i = 0; i < 64; i += 1) {
+      last = newOperation({ sequence: head.sequence, root: head.root,
+        objectId: Buffer.from(`object-${i.toString().padStart(9, "0")}`) });
+      const result = await h.ledger.append(last);
+      assert.equal(result.status, "committed");
+      head = { sequence: result.sequence, root: result.root };
+    }
+    const verified = await h.makeClient("status-reader").getVerifiedSnapshotWithChain({
+      scope: h.scope, nonce: crypto.randomBytes(32), requested: requested(last),
+      minimumHead: floor, minimumSnapshot: base.bytes,
+      includeVerifiedProofChain: true,
+    });
+    assert.equal(verified.independentPhysicalChainVerified, true);
+    assert.equal(verified.authenticatedProofChain.length, 64);
+    assert.equal(verified.authenticatedPhysicalProofChain.length, 64);
   });
 });
