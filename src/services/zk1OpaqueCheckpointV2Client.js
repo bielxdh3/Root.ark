@@ -337,7 +337,8 @@ class Zk1OpaqueCheckpointV2Client {
   constructor({ journalPath, bootstrapNew, trustedScope, expectedV1Digest,
     expectedV1Checkpoint, v1CasClient, v1FloorClient, casClient, floorClient,
     checkpointPublicKey, ownerPublicKey, catalogPublicKey, ownerTrust,
-    signerGrantRootPublicKey }) {
+    signerGrantRootPublicKey, requireFullV1ArchiveRollover = false,
+    fullV1ArchiveRollover }) {
     const scope = scopeOf(trustedScope);
     const digest = bytes(expectedV1Digest, 32);
     const checkpoint = bytes(expectedV1Checkpoint, 32);
@@ -364,10 +365,14 @@ class Zk1OpaqueCheckpointV2Client {
     const coordinator = createOpaqueCheckpointV2Coordinator({
       casClient, floorClient, trustedScope: scope,
       expectedV1Digest: digest, expectedV1Checkpoint: checkpoint,
-      v1CasClient, v1FloorClient,
+      v1CasClient, v1FloorClient, requireFullV1ArchiveRollover,
+      fullV1ArchiveRollover,
     });
     const creationPin = privateFile(journalPath, bootstrapNew);
-    const identity = Buffer.from(encodeIdentity(scope, digest, checkpoint, fingerprints));
+    const identity = Buffer.concat([encodeIdentity(scope, digest, checkpoint, fingerprints),
+      ...(requireFullV1ArchiveRollover
+        ? [Buffer.from("ROOTARK_ZK1_V1_FULL_128_OWNER_ARCHIVE_PINNED_DEV_V1", "ascii")]
+        : [])]);
     // Foreign WAL/SHM aliases and unknown schemas must be refused before any
     // writable SQLite open, journal-mode change or sidecar creation.
     const pinned = bootstrapNew ? creationPin
@@ -401,7 +406,8 @@ class Zk1OpaqueCheckpointV2Client {
     this.#trust = { scope, digest, checkpoint, casFp: fingerprints[0],
       floorFp: fingerprints[1], casKey: cas, floorKey: floor,
       checkpointFp: fingerprints[2],
-      checkpointKey, ownerKey, catalogKey, ownerTrust, signerGrantRootKey };
+      checkpointKey, ownerKey, catalogKey, ownerTrust, signerGrantRootKey,
+      strictFullV1Archive: requireFullV1ArchiveRollover };
   }
   #serial(fn) {
     const result = this.#queue.then(fn);
@@ -515,6 +521,8 @@ class Zk1OpaqueCheckpointV2Client {
     return this.#serial(async () => {
       const t = this.#trust;
       const prior = await this.#chain();
+      if (t.strictFullV1Archive)
+        await this.#coordinator.verifyFullArchiveForLocalAdmission();
       const existing = this.#saved();
       // An earlier pending intent must be reconciled before any new owner intent.
       const endorsements = existing
@@ -581,6 +589,8 @@ class Zk1OpaqueCheckpointV2Client {
       const prior = await this.#chain();
       if (!saved || !equal(saved, raw)) {
         if (saved) await this.#coordinator.readConsistent(saved);
+        if (this.#trust.strictFullV1Archive)
+          await this.#coordinator.verifyFullArchiveForLocalAdmission();
         const inspected = await this.#inspect(raw, true, prior, signerGrant);
         this.#append(raw, prior.sequence + 1, inspected.grant);
         if (inspected.body.previous_sequence !== prior.sequence) deny();
@@ -601,6 +611,8 @@ class Zk1OpaqueCheckpointV2Client {
         deny();
       const raw = Buffer.from(signedIntent);
       const prior = await this.#chain();
+      if (this.#trust.strictFullV1Archive)
+        await this.#coordinator.verifyFullArchiveForLocalAdmission();
       const inspected = await this.#inspect(raw, false, prior, signerGrant);
       this.#append(raw, prior.sequence + 1, inspected.grant);
       return { importedSequence: prior.sequence + 1, remotelyFinalized: false };

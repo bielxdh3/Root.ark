@@ -853,7 +853,8 @@ function isOpaqueCheckpointV2PinnedClient(client) {
 
 function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
   trustedScope, expectedV1Digest, expectedV1Checkpoint,
-  v1CasClient, v1FloorClient }) {
+  v1CasClient, v1FloorClient, requireFullV1ArchiveRollover = false,
+  fullV1ArchiveRollover }) {
   if (!pinnedV2Clients.has(casClient) || casClient.role !== ROLE_CAS
     || !pinnedV2Clients.has(floorClient) || floorClient.role !== ROLE_FLOOR
     || same(fp(casClient.publicKey), fp(floorClient.publicKey))
@@ -863,6 +864,64 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
   const scope = scopeOf(trustedScope);
   const oldDigest = bytes(expectedV1Digest, 32);
   const oldCheckpoint = bytes(expectedV1Checkpoint, 32);
+  // Opt-in strict transition for newly owner-pinned FULL 1..128 baselines.
+  // The legacy single-head #128 predecessor remains DEV/NO-GO; never treat
+  // its independently signed digest as proof of the complete V1 archive.
+  if (typeof requireFullV1ArchiveRollover !== "boolean"
+    || (requireFullV1ArchiveRollover !== !!fullV1ArchiveRollover)) fail();
+  async function assertFullArchive() {
+    if (!requireFullV1ArchiveRollover) fail("ZK_CHECKPOINT_V2_FULL_ARCHIVE_REQUIRED");
+    const proof = fullV1ArchiveRollover;
+    try {
+      if (!proof || !proof.scope || SCOPE.some((field) =>
+        !same(bytes(proof.scope[field], scope[field].length), scope[field]))
+        || proof.v1CasClient !== v1CasClient || proof.v1FloorClient !== v1FloorClient
+        || !same(fp(key(proof.v1CasKey)), fp(key(v1CasClient.publicKey)))
+        || !same(fp(key(proof.v1FloorKey)), fp(key(v1FloorClient.publicKey)))
+        || !same(fp(key(proof.v2CasKey)), fp(key(casClient.publicKey)))
+        || !same(fp(key(proof.v2FloorKey)), fp(key(floorClient.publicKey)))
+        || !same(bytes(Buffer.from(proof.v2PredecessorCheckpointPin, "base64url"), 32),
+          oldCheckpoint)) fail();
+      const { verifyRolloverPreflight } =
+        require("./zk1OpaqueCatalogV1RolloverPreflight");
+      const checked = await verifyRolloverPreflight(proof);
+      if (checked.sequence !== 128 || checked.archivesRetained !== 128
+        || checked.v2WriteAuthorized !== false
+        || !same(bytes(Buffer.from(checked.digest, "base64url"), 32), oldDigest)
+        || !same(bytes(Buffer.from(checked.checkpointDigest, "base64url"), 32),
+          oldCheckpoint)) fail();
+      return checked;
+    } catch (_) { fail("ZK_CHECKPOINT_V2_FULL_ARCHIVE_UNVERIFIED"); }
+  }
+  async function verifyFullArchiveBaseline() {
+    const checked = await assertFullArchive();
+    const heads = await Promise.all([casClient.head(), floorClient.head()]);
+    assertFullBaselineHeads(heads);
+    return Object.freeze({ sequence: checked.sequence, archiveRoot: checked.archiveRoot,
+      checkpointDigest: checked.checkpointDigest, v2WriteAuthorized: false });
+  }
+  function assertFullBaselineHeads(heads) {
+    if (heads.some((head) => head.state !== "V1_BASELINE"
+      || head.sequence !== 128 || !same(bytes(head.headDigest, 32), oldDigest)
+      || !same(bytes(head.checkpointDigest, 32), oldCheckpoint))) {
+      fail("ZK_CHECKPOINT_V2_FULL_ARCHIVE_BASELINE_CONFLICT");
+    }
+  }
+  async function verifyFullArchiveForLocalAdmission() {
+    await assertV1Terminal();
+    const checked = await assertFullArchive();
+    const heads = await Promise.all([casClient.head(), floorClient.head()]);
+    if (heads.some((head) => head.sequence === 128)) assertFullBaselineHeads(heads);
+    else if (heads.some((head) => head.state !== "FINALIZED"
+      || head.sequence < 129 || head.sequence > MAX_V2_SEQUENCE)
+      || heads[0].sequence !== heads[1].sequence
+      || !same(bytes(heads[0].checkpoint_digest, 32),
+        bytes(heads[1].checkpoint_digest, 32))) {
+      fail("ZK_CHECKPOINT_V2_FULL_ARCHIVE_BASELINE_CONFLICT");
+    }
+    return Object.freeze({ sequence: checked.sequence,
+      checkpointDigest: checked.checkpointDigest, v2WriteAuthorized: false });
+  }
   async function assertV1Terminal() {
     const nonce = crypto.randomBytes(32);
     const [casRaw, floor] = await Promise.all([
@@ -937,6 +996,14 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
   }
   async function reconcile(raw) {
     await assertV1Terminal();
+    if (requireFullV1ArchiveRollover) {
+      await assertFullArchive();
+      const heads = await Promise.all([casClient.head(), floorClient.head()]);
+      if (heads[0].sequence === 128 && heads[1].sequence === 128)
+        assertFullBaselineHeads(heads);
+      // Interrupted #129 writes are handled by confirmedState(), whose
+      // immutable, signed predecessor digest remains pinned to the full 128.
+    }
     // CAS_COMMITTED and FLOOR_PREPARED are durable, but NOT public until
     // FINALIZED on both independently signed authorities.
     let { cas, floor, previousSequence, finalSequence } = await confirmedState(raw);
@@ -972,8 +1039,11 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
   return Object.freeze({
     publish: reconcile,
     reconcile,
+    verifyFullArchiveBaseline,
+    verifyFullArchiveForLocalAdmission,
     predecessorEndorsements: async (raw) => {
       await assertV1Terminal();
+      if (requireFullV1ArchiveRollover) await assertFullArchive();
       const states = await confirmedState(raw);
       if (states.cas.sequence !== states.finalSequence
         || states.floor.sequence !== states.finalSequence
@@ -984,6 +1054,7 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
     },
     readConsistent: async (raw) => {
       await assertV1Terminal();
+      if (requireFullV1ArchiveRollover) await assertFullArchive();
       const states = await confirmedState(raw);
       if (states.cas.sequence !== states.finalSequence
         || states.floor.sequence !== states.finalSequence
