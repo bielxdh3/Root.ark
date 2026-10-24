@@ -155,6 +155,7 @@ function respond(response, status, object, limit = MAX_SMALL_RESPONSE_BYTES) {
 function createZk1ContentInventoryHttpsServer({
   key, cert, clientCa, ledger, principals, physicalVerifier,
   physicalAttestorClient, pinnedPhysicalAttestorPublicKey,
+  pinnedInventorySignerPublicKey,
 }) {
   if (!key || !cert || !clientCa || !ledger
     || typeof ledger.getSnapshot !== "function" || typeof ledger.append !== "function"
@@ -164,18 +165,26 @@ function createZk1ContentInventoryHttpsServer({
     || (physicalVerifier !== undefined
       && !(physicalVerifier instanceof Zk1SharedPgPhysicalCiphertextVerifier))
     || ((physicalAttestorClient === undefined)
-      !== (pinnedPhysicalAttestorPublicKey === undefined))) invalid();
+      !== (pinnedPhysicalAttestorPublicKey === undefined))
+    || ((physicalAttestorClient === undefined)
+      !== (pinnedInventorySignerPublicKey === undefined))) invalid();
   if (physicalAttestorClient !== undefined
     && (!physicalAttestorClient || typeof physicalAttestorClient.requestAttestation !== "function"
       || !(pinnedPhysicalAttestorPublicKey instanceof crypto.KeyObject)
       || pinnedPhysicalAttestorPublicKey.type !== "public"
       || pinnedPhysicalAttestorPublicKey.asymmetricKeyType !== "ed25519"
-      // A single inventory/writer Ed25519 identity cannot certify its own
-      // physical PG readback, including through a proxy ledger facade.
+      || !(pinnedInventorySignerPublicKey instanceof crypto.KeyObject)
+      || pinnedInventorySignerPublicKey.type !== "public"
+      || pinnedInventorySignerPublicKey.asymmetricKeyType !== "ed25519"
+      // The inventory identity must be pinned OUTSIDE the mutable ledger
+      // facade; comparing only ledger.publicKey lets a compromised writer
+      // substitute an unrelated fake identity during server construction.
       || !(ledger.publicKey instanceof crypto.KeyObject)
       || ledger.publicKey.type !== "public"
       || ledger.publicKey.asymmetricKeyType !== "ed25519"
-      || ledger.publicKey.export({ format: "der", type: "spki" }).equals(
+      || !ledger.publicKey.export({ format: "der", type: "spki" }).equals(
+        pinnedInventorySignerPublicKey.export({ format: "der", type: "spki" }))
+      || pinnedInventorySignerPublicKey.export({ format: "der", type: "spki" }).equals(
         pinnedPhysicalAttestorPublicKey.export({ format: "der", type: "spki" })))) invalid();
   const physicalEnabled = physicalVerifier !== undefined || physicalAttestorClient !== undefined;
 

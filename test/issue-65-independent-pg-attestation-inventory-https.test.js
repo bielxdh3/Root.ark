@@ -66,7 +66,8 @@ test("strict inventory mTLS append needs independent fresh physical Ed25519 read
     const server = createZk1ContentInventoryHttpsServer({
       key: read("attestor.key"), cert: read("attestor.pem"), clientCa: read("ca.pem"),
       ledger, principals: grant, physicalAttestorClient: client,
-      pinnedPhysicalAttestorPublicKey: pin });
+      pinnedPhysicalAttestorPublicKey: pin,
+      pinnedInventorySignerPublicKey: writer.publicKey });
     t.after(async () => {
       server.closeAllConnections();
       await new Promise((resolve) => server.close(() => resolve()));
@@ -78,14 +79,28 @@ test("strict inventory mTLS append needs independent fresh physical Ed25519 read
   const client = { requestAttestation: (request) => issuer(request, trusted.privateKey) };
   assert.throws(() => createZk1ContentInventoryHttpsServer({
     key: read("attestor.key"), cert: read("attestor.pem"), clientCa: read("ca.pem"),
+    ledger, principals: grant, physicalAttestorClient: client,
+    pinnedPhysicalAttestorPublicKey: trusted.publicKey,
+  }), /INVENTORY_HTTP_INVALID/, "strict mode needs an out-of-band inventory signer pin");
+  assert.throws(() => createZk1ContentInventoryHttpsServer({
+    key: read("attestor.key"), cert: read("attestor.pem"), clientCa: read("ca.pem"),
     ledger: { ...ledger, publicKey: trusted.publicKey }, principals: grant,
     physicalAttestorClient: client, pinnedPhysicalAttestorPublicKey: trusted.publicKey,
+    pinnedInventorySignerPublicKey: trusted.publicKey,
   }), /INVENTORY_HTTP_INVALID/, "inventory signer may not masquerade as physical attestor");
   assert.throws(() => createZk1ContentInventoryHttpsServer({
     key: read("attestor.key"), cert: read("attestor.pem"), clientCa: read("ca.pem"),
     ledger: { ...ledger, publicKey: undefined }, principals: grant,
     physicalAttestorClient: client, pinnedPhysicalAttestorPublicKey: trusted.publicKey,
+    pinnedInventorySignerPublicKey: writer.publicKey,
   }), /INVENTORY_HTTP_INVALID/, "strict mode needs a verifiable inventory signer identity");
+  assert.throws(() => createZk1ContentInventoryHttpsServer({
+    key: read("attestor.key"), cert: read("attestor.pem"), clientCa: read("ca.pem"),
+    ledger: { ...ledger, publicKey: crypto.generateKeyPairSync("ed25519").publicKey },
+    principals: grant, physicalAttestorClient: client,
+    pinnedPhysicalAttestorPublicKey: trusted.publicKey,
+    pinnedInventorySignerPublicKey: writer.publicKey,
+  }), /INVENTORY_HTTP_INVALID/, "a facade cannot substitute a different inventory identity");
   const validServer = await serve(trusted.publicKey, client);
   const accepted = await post(validServer.address().port);
   assert.deepEqual(accepted, { status: 200, body: { status: "pending",

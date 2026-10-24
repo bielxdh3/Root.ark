@@ -41,7 +41,9 @@ ciphertext egress, device enrollment, restore, deletion, or legacy cutover.
   non-independent and does not silently substitute for a failed remote proof.
   Strict construction additionally requires the inventory ledger's public
   signing key, rejecting a missing identity or one equal to the attestor's
-  Ed25519 pin. The strict mode remains an admission guard: historical signed
+  Ed25519 pin. The caller must also provide an independently retained
+  `pinnedInventorySignerPublicKey`; a mutable ledger facade cannot choose its
+  own alternate identity. The strict mode remains an admission guard: historical signed
   inventory entries do **not** yet embed the physical attestation/hash.
 - The attestor listener admits only one in-flight verification per pinned
   mTLS client fingerprint, eight overall and sixteen live connections. A
@@ -57,6 +59,9 @@ HTTP client is `createZk1PgPhysicalAttestorHttpsClient`, whose
 `requestAttestation({scope, operation, nonce})` returns signed CBOR bytes.
 Pass that client plus the separately retained `pinnedPhysicalAttestorPublicKey`
 to `Zk1PgPhysicalInventoryBridge` or the independent inventory mTLS service.
+For the inventory mTLS server additionally pass `pinnedInventorySignerPublicKey`
+from separately held operator trust configuration, not from a mutable ledger
+property. This does not replace the client's own independent inventory pin.
 Do not set the pinned key from the client,
 remote response, app database, or issuer-controlled operation.
 
