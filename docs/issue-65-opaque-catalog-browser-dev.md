@@ -98,7 +98,66 @@ The tombstone is **logical only**; it is not physical deletion, GC, provider
 durability proof, restoration of a trashed file, rename/move or general
 bidirectional sync/conflict convergence. Uncertain PUT/CAS intentionally
 requires independent reconciliation, not an automatic retry.
+The signer grant is verified against the externally pinned owner's Ed25519 key,
+current scope/manifest/epoch and live witness; duplicate or revoked signer
+grants are rejected. Publication binds the originally signed CAS sequence and
+digest to the immutable pre-PUT journal, and requires a newly authenticated
+signed tombstone readback before clearing that journal.
+
+After later unrelated catalog commits, historical tombstone verification asks
+the independent CAS authority for the **exact historical sequence** and checks
+its nonce-bound, freshly signed `rootark-zk1-opaque-catalog-snapshot-fetch/v1`
+envelope against the *current* pinned CAS head, owner-signed historical catalog
+header and every immutable encrypted row. The manual browser form offers an
+optional independent **snapshot URL**; the browser sends POST JSON
+`{scope, nonceBase64, sequence}` without cookies and requires canonical signed
+CBOR with the independent CAS key. If the snapshot endpoint is unavailable or
+does not match the current signed head, historical inspection fails closed.
 Inspection of a tombstone created under an older epoch remains fail-closed
-after owner rotation until an independently witnessed historical signer/
-epoch proof and catalog re-endorsement are implemented; the encrypted
-historical versions are **not** removed.
+without the separately signed historical signer/epoch proof and active-device
+catalog re-endorsement described below. Encrypted historical versions are
+**not** removed.
+
+## Historical tombstones across a signed owner epoch rotation (restricted DEV)
+
+The read-only historical path now accepts a **separately supplied** complete
+owner-signed epoch-head sequence, from manifest revision 1 through the current
+witness-pinned revision (maximum 128; no rollover). Each entry has exactly
+`{schema,account_id,compartment_id,keyring_id,revision,manifestDigest,epoch,previousDigest,signature}`,
+where `schema` is `rootark-zk1-browser-owner-epoch-head/v1`. The independently
+pinned owner Ed25519 key signs `Root.ark/zk-1/browser-owner-epoch-head/v1\0`
+followed by UTF-8 JSON of the ordered fields excluding the signature.
+`previousDigest` is null at revision 1 and otherwise base64url SHA-256 of
+`Root.ark/zk-1/browser-owner-epoch-head-hash/v1\0` plus the predecessor's
+ordered JSON and its decoded Ed25519 signature. Manifest revisions must be
+consecutive, epochs monotone (at most one epoch per revision), and the final
+signed revision/digest/epoch must equal the current *externally selected*
+manifest that the freshly signed independent recovery witness confirms.
+The JSON file contains `heads` and `grants`: each historic signer grant is
+separately signed by the owner and must match the precise historical manifest
+revision/digest, epoch, device ID and scope. A grant only proves authorization
+**at that historical revision**; it cannot authorize an operation in a later
+epoch, even when its signature was valid before revocation.
+
+A current, unrevoked reader's grant is mandatory for the protected historical
+ciphertext GET, and the current catalog head must have been re-endorsed by an
+active signer after rotation. The exact old header/rows remain independently
+authenticated by the current CAS authority's nonce-bound signed snapshot
+(`sequence`, `digest`, `head_sequence`, `head_digest`, pages). The old header's
+owner revision/digest/epoch must match the enclosed tombstone's owner claims,
+the owner-signed chain and the historical signer grant. The receiving user
+imports the historical epoch AES key **only as nonextractable decrypt-only**;
+an explicit local array maps one key per epoch and refuses duplicate/missing
+epochs. New PUT, tombstone publication, restore and grant issuance still use
+only the current owner's verified grant and epoch.
+
+Absent or forged historical owner chain, incomplete grant, wrong epoch key,
+unre-endorsed current catalog, offline independent authority, or head number
+over 128 are **UNKNOWN / fail closed**; no read/restore is authorized. This
+restricted feature verifies the separately owner-issued epoch mapping but does
+**not** establish a complete V2 manifest transition proof for every old epoch,
+external fsync, any generalized epoch rollover, or automatic migration. The
+current repo branch does not include worker-3's separately approved rekey
+restore: historical inspection returns `ownerApprovedRekeyRequired: true`, and
+does not unlock the generic `commitVersion()` path. Integration with that
+separate restore contract must be reviewed before enabling writes.

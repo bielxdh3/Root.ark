@@ -20,10 +20,15 @@
   const WITNESS = te.encode("Root.ark/zk-1/recovery-witness-head/v1\0");
   const GRANT = te.encode("Root.ark/zk-1/browser-owner-device-grant/v1\0");
   const INTENT = te.encode("Root.ark/zk-1/browser-opaque-catalog-intent/v1\0");
+  const SNAPSHOT = te.encode("Root.ark/zk-1/opaque-catalog-snapshot-fetch/v1\0");
+  const OWNER_EPOCH = te.encode("Root.ark/zk-1/browser-owner-epoch-head/v1\0");
+  const OWNER_EPOCH_HASH = te.encode("Root.ark/zk-1/browser-owner-epoch-head-hash/v1\0");
   const SCOPE = ["account_id", "compartment_id", "keyring_id"];
   const GRANT_FIELDS = ["schema", ...SCOPE, "device_id", "authorization_key_id",
     "authorization_public_key", "manifest_revision", "manifest_digest",
     "current_epoch", "enrolled_epoch", "revoked_at_epoch"];
+  const OWNER_EPOCH_FIELDS = ["schema", ...SCOPE, "revision", "manifestDigest",
+    "epoch", "previousDigest"];
   const HEADER = ["type", ...SCOPE, "sequence", "previous_digest", "manifest_revision",
     "manifest_digest", "epoch", "signer_device_id", "total_count", "page_digests", "issued_at"];
   const ROW = ["object_id", "revision", "epoch", "ciphertext_digest", "metadata_ciphertext"];
@@ -34,6 +39,8 @@
     "current_revision", "current_manifest_digest", "witness_sequence", "nonce",
     "observed_at", "status", "pending_reservation_id"];
   const CAS_FIELDS = ["type", ...SCOPE, "sequence", "digest", "nonce", "observed_at"];
+  const SNAPSHOT_FIELDS = ["type", ...SCOPE, "sequence", "digest", "head_sequence",
+    "head_digest", "nonce", "observed_at", "header", "header_signature", "page_bodies"];
   const ZERO = new Uint8Array(32);
   const MAX_ROWS = 4096;
   const PAGE_SIZE = 32;
@@ -56,6 +63,13 @@
         return await new Promise((resolve, reject) => {
           const transaction = db.transaction("intents", operation === "read" ? "readonly" : "readwrite",
             operation === "read" ? undefined : { durability: "strict" });
+          // Browsers that silently ignore the strict durability option cannot
+          // authorize a first PUT on the strength of an unconfirmed intent.
+          if (operation !== "read" && transaction.durability !== "strict") {
+            transaction.abort();
+            reject(new Error("journal strict transaction unavailable"));
+            return;
+          }
           const store = transaction.objectStore("intents");
           const request = operation === "read" ? store.get(key)
             : operation === "write" ? store.add(value, key) : store.delete(key);
@@ -152,8 +166,8 @@
     }
     deny();
   }
-  function decode(raw) {
-    const input = bytes(raw, 1, 16384); let at = 0;
+  function decode(raw, maximum = 16384) {
+    const input = bytes(raw, 1, maximum); let at = 0;
     function take(n) { if (at + n > input.length) deny(); const part = input.slice(at, at + n); at += n; return part; }
     function read(depth) {
       if (depth > 16) deny();
@@ -164,8 +178,11 @@
         const length = { 24: 1, 25: 2, 26: 4, 27: 8 }[info];
         if (!length) deny(); let n = 0;
         for (const b of take(length)) n = n * 256 + b;
-        return uint(n, 0, 16384);
+        return uint(n, 0, maximum);
       })();
+      // Snapshot envelopes can be larger than a catalog header, but a tiny
+      // CBOR array/map declaration must not allocate millions of JS entries.
+      if ((major === 4 || major === 5) && count > 16384) deny();
       if (major === 0) return count;
       if (major === 2) return take(count);
       if (major === 3) return td.decode(take(count));
@@ -301,16 +318,32 @@
   }
   function configure(input) {
     const customJournal = Object.hasOwn(input || {}, "journalStore");
+    const historicalProbe = Object.hasOwn(input || {}, "catalogSnapshotProbe");
+    const historicalEpochs = Object.hasOwn(input || {}, "historicalOwnerEpochHistory");
     exact(input, ["origin", "fetchImpl", "ownerPublicKey", "pinnedOwnerKeyHash",
       "pinnedOwnerHead", "signedDeviceGrant", "devicePublicKey", "devicePrivateKey",
       "signerGrants", "ownerWitnessPublicKey", "ownerWitnessKeyId", "ownerWitnessProbe",
       "catalogAuthorityPublicKey", "catalogProbe", "minimumCatalogHead", "csrfToken",
-      "isSessionCurrent", "assertCurrent", "nowSeconds", ...(customJournal ? ["journalStore"] : [])]);
+      "isSessionCurrent", "assertCurrent", "nowSeconds", ...(customJournal ? ["journalStore"] : []),
+      ...(historicalProbe ? ["catalogSnapshotProbe"] : []),
+      ...(historicalEpochs ? ["historicalOwnerEpochHistory"] : [])]);
     if (!crypto?.subtle || !crypto.getRandomValues || typeof input.fetchImpl !== "function"
       || typeof input.ownerWitnessProbe !== "function" || typeof input.catalogProbe !== "function"
       || typeof input.assertCurrent !== "function" || typeof input.isSessionCurrent !== "function"
       || typeof input.nowSeconds !== "function" || typeof input.csrfToken !== "function"
       || !Array.isArray(input.signerGrants)) deny();
+    if (historicalProbe && typeof input.catalogSnapshotProbe !== "function") deny();
+    if (historicalEpochs) {
+      exact(input.historicalOwnerEpochHistory, ["heads", "grants"]);
+      if (!Array.isArray(input.historicalOwnerEpochHistory.heads)
+        || input.historicalOwnerEpochHistory.heads.length < 1
+        || input.historicalOwnerEpochHistory.heads.length > 128
+        || !Array.isArray(input.historicalOwnerEpochHistory.grants)
+        || input.historicalOwnerEpochHistory.grants.length > 128) deny();
+    }
+    if (input.signerGrants.length > 64 || input.signerGrants.some((entry, index) =>
+      !entry || typeof entry.device_id !== "string" || !entry.device_id
+      || input.signerGrants.slice(0, index).some((prior) => prior.device_id === entry.device_id))) deny();
     originURL(input.origin, "read");
     edKey(input.ownerPublicKey, "public"); edKey(input.devicePublicKey, "public");
     edKey(input.devicePrivateKey, "private");
@@ -345,19 +378,23 @@
         head: { sequence: head.sequence, digest: bytes(head.digest, 32) },
         predecessorDigest: header ? bytes(header.previous_digest, 32) : null,
         signerDeviceId: header ? header.signer_device_id : null,
+        headerManifestRevision: header ? header.manifest_revision : null,
+        headerManifestDigest: header ? bytes(header.manifest_digest, 32) : null,
+        headerEpoch: header ? header.epoch : null,
+        headerIssuedAt: header ? header.issued_at : null,
         rows: result.rows.map((row) => ({ ...row,
           ciphertext_digest: bytes(row.ciphertext_digest, 32),
           metadata_ciphertext: bytes(row.metadata_ciphertext, 284) })) });
       return result;
     }
     const now = () => uint(trust.nowSeconds(), 0);
-    const probe = async (fn) => {
+    const probe = async (fn, maximum = 8192) => {
       requireSession();
       const nonce = crypto.getRandomValues(new Uint8Array(32));
       const raw = bytes(await fn({ scope: Object.fromEntries(SCOPE.map((k) => [k, b64(scope[k])])),
-        nonce: new Uint8Array(nonce) }), 1, 8192);
+        nonce: new Uint8Array(nonce) }), 1, maximum);
       requireSession();
-      return { nonce, decoded: decode(raw) };
+      return { nonce, decoded: decode(raw, maximum) };
     };
     async function ownerCurrent() {
       requireSession();
@@ -385,6 +422,60 @@
         await crypto.subtle.sign("Ed25519", trust.devicePrivateKey, challenge), challenge)) deny();
       await trust.assertCurrent();
       requireSession();
+    }
+    async function verifiedOwnerEpochHeads() {
+      const history = trust.historicalOwnerEpochHistory;
+      if (!history || history.heads.length !== pin.revision || pin.revision > 128) deny();
+      let predecessor = null, previousEpoch = 0;
+      const verified = new Map();
+      for (const entry of history.heads) {
+        exact(entry, [...OWNER_EPOCH_FIELDS, "signature"]);
+        const body = Object.fromEntries(OWNER_EPOCH_FIELDS.map((field) => [field, entry[field]]));
+        if (entry.schema !== "rootark-zk1-browser-owner-epoch-head/v1"
+          || entry.revision !== verified.size + 1 || !Number.isSafeInteger(entry.epoch)
+          || entry.epoch < 1 || entry.epoch < previousEpoch
+          || entry.epoch > previousEpoch + 1
+          || entry.previousDigest !== predecessor
+          || !/^[A-Za-z0-9_-]{43}$/.test(entry.manifestDigest)) deny();
+        matchingScope(scopeOf(entry), scope);
+        from64(entry.manifestDigest, 32);
+        if (!await crypto.subtle.verify("Ed25519", trust.ownerPublicKey,
+          from64(entry.signature, 64), concat(OWNER_EPOCH, te.encode(JSON.stringify(body))))) deny();
+        predecessor = b64(await hash(concat(OWNER_EPOCH_HASH,
+          te.encode(JSON.stringify(body)), from64(entry.signature, 64))));
+        previousEpoch = entry.epoch;
+        verified.set(entry.revision, { revision: entry.revision,
+          digest: from64(entry.manifestDigest, 32), epoch: entry.epoch });
+      }
+      const current = verified.get(pin.revision);
+      if (!current || current.epoch !== pin.epoch
+        || !equal(current.digest, pin.digest)) deny();
+      return verified;
+    }
+    async function verifyHistoricalSigner(deviceId, epoch, revision, digest) {
+      await ownerCurrent(); // An offline old grant cannot bypass today's witness.
+      if (epoch === pin.epoch && revision === pin.revision
+        && equal(bytes(digest, 32), pin.digest)) {
+        return verifyAuthorizedSigner(deviceId, epoch);
+      }
+      // A historical owner grant is read-only proof of authority AT its signed
+      // revision, never a capability for current protected PUT/CAS.
+      const heads = await verifiedOwnerEpochHeads();
+      const historic = heads.get(revision);
+      if (!historic || historic.epoch !== epoch
+        || !equal(historic.digest, bytes(digest, 32))
+        || epoch >= pin.epoch) deny();
+      const matching = trust.historicalOwnerEpochHistory.grants.filter((grant) =>
+        grant?.device_id === deviceId && grant.manifest_revision === revision
+        && grant.current_epoch === epoch);
+      if (matching.length !== 1) deny();
+      return verifyGrant(matching[0], trust.ownerPublicKey, scope, historic);
+    }
+    async function verifyAuthorizedSigner(deviceId, epoch) {
+      const matching = trust.signerGrants.filter((grant) => grant.device_id === deviceId);
+      if (matching.length !== 1 || epoch !== pin.epoch) deny();
+      // An arbitrary public key supplied through a JSON roster is NOT a grant.
+      return verifyGrant(matching[0], trust.ownerPublicKey, scope, pin);
     }
     async function casHead(nonce, raw) {
       const body = decode(raw);
@@ -603,6 +694,93 @@
         return bytes(checked.predecessorDigest, 32);
       } catch (_) { deny(); }
     }
+    async function readSignedHistoricalHead(snapshot, sequence, expectedRow) {
+      try {
+        const checked = verifiedSnapshots.get(snapshot);
+        exact(expectedRow, ["objectId", "revision", "epoch", "ciphertextDigest", "metadataCiphertext"]);
+        const target = id(expectedRow.objectId) + ":" + uint(expectedRow.revision, 1);
+        const validRow = (row) => row.object_id + ":" + row.revision === target
+          && row.epoch === expectedRow.epoch
+          && equal(bytes(row.ciphertext_digest, 32), bytes(expectedRow.ciphertextDigest, 32))
+          && equal(bytes(row.metadata_ciphertext, 284), bytes(expectedRow.metadataCiphertext, 284));
+        if (!checked || !Number.isSafeInteger(sequence) || sequence < 1
+          || sequence > checked.head.sequence
+          || !equal(bytes(snapshot.head.digest, 32), checked.head.digest)
+          || snapshot.head.sequence !== checked.head.sequence) deny();
+        await ownerCurrent();
+        const current = await freshHead();
+        if (current.sequence !== checked.head.sequence
+          || !equal(current.digest, checked.head.digest)) deny();
+        if (sequence === current.sequence) {
+          if (!checked.predecessorDigest) deny();
+          if (checked.rows.filter(validRow).length !== 1) deny();
+          return Object.freeze({ sequence, digest: b64(current.digest),
+            previousDigest: b64(bytes(checked.predecessorDigest, 32)),
+            manifestRevision: checked.headerManifestRevision,
+            manifestDigest: b64(checked.headerManifestDigest),
+            epoch: checked.headerEpoch, issuedAt: checked.headerIssuedAt,
+            exactHistoricalAuthorityVerified: true });
+        }
+        if (typeof trust.catalogSnapshotProbe !== "function") deny();
+        const { nonce, decoded: proof } = await probe((challenge) =>
+          trust.catalogSnapshotProbe({ ...challenge, sequence }), 3 * 1024 * 1024);
+        exact(proof, [...SNAPSHOT_FIELDS, "signature"]);
+        const { signature, ...signed } = proof;
+        exact(signed, SNAPSHOT_FIELDS); matchingScope(signed, scope);
+        if (signed.type !== "rootark-zk1-opaque-catalog-snapshot-fetch/v1"
+          || signed.sequence !== sequence || signed.head_sequence !== current.sequence
+          || !equal(bytes(signed.head_digest, 32), current.digest)
+          || !equal(bytes(signed.nonce, 32), nonce)
+          || Math.abs(now() - uint(signed.observed_at)) > 30
+          || !await crypto.subtle.verify("Ed25519", trust.catalogAuthorityPublicKey,
+            bytes(signature, 64), concat(SNAPSHOT, encode(signed)))) deny();
+        const headerRaw = bytes(signed.header, 1, 16384);
+        const headSignature = bytes(signed.header_signature, 64);
+        const digest = await hash(concat(HEAD, headerRaw, headSignature));
+        const header = decode(headerRaw);
+        exact(header, HEADER); matchingScope(header, scope);
+        if (!equal(encode(header), headerRaw) || !equal(bytes(signed.digest, 32), digest)
+          || header.type !== "rootark-zk1-opaque-catalog/v1"
+          || header.sequence !== sequence
+          || uint(header.total_count, 0, MAX_ROWS) > checked.rows.length
+          || !Array.isArray(signed.page_bodies)
+          || signed.page_bodies.length !== Math.ceil(header.total_count / PAGE_SIZE)
+          || signed.page_bodies.length !== header.page_digests.length) deny();
+        const signerKey = await verifyHistoricalSigner(header.signer_device_id,
+          uint(header.epoch, 1), uint(header.manifest_revision, 1),
+          bytes(header.manifest_digest, 32));
+        if (!await crypto.subtle.verify("Ed25519", signerKey, headSignature,
+          concat(HEAD, headerRaw))) deny();
+        let count = 0, matched = 0;
+        const latest = new Map(checked.rows.map((row) => [row.object_id + ":" + row.revision, row]));
+        for (let i = 0; i < signed.page_bodies.length; i++) {
+          const pageRaw = bytes(signed.page_bodies[i], 1, 16384);
+          const rows = decode(pageRaw);
+          if (!Array.isArray(rows) || !equal(encode(rows), pageRaw)
+            || !equal(await hash(concat(PAGE, pageRaw)), bytes(header.page_digests[i], 32))
+            || rows.length !== Math.min(PAGE_SIZE, header.total_count - i * PAGE_SIZE)) deny();
+          for (const row of rows) {
+            exact(row, ROW);
+            const saved = latest.get(id(row.object_id) + ":" + uint(row.revision, 1));
+            if (!saved || row.epoch !== saved.epoch
+              || !equal(bytes(row.ciphertext_digest, 32), bytes(saved.ciphertext_digest, 32))
+              || !equal(bytes(row.metadata_ciphertext, 284), bytes(saved.metadata_ciphertext, 284))) deny();
+            if (validRow(row)) matched++;
+            count++;
+          }
+        }
+        if (count !== header.total_count || matched !== 1) deny();
+        const reconfirm = await freshHead();
+        if (reconfirm.sequence !== current.sequence
+          || !equal(reconfirm.digest, current.digest)) deny();
+        return Object.freeze({ sequence, digest: b64(digest),
+          previousDigest: b64(bytes(header.previous_digest, 32)),
+          manifestRevision: header.manifest_revision,
+          manifestDigest: b64(bytes(header.manifest_digest, 32)),
+          epoch: header.epoch, issuedAt: header.issued_at,
+          exactHistoricalAuthorityVerified: true });
+      } catch (_) { deny(); }
+    }
     async function readAll(expected) {
       await ownerCurrent();
       const current = await freshHead();
@@ -628,9 +806,7 @@
           || !Array.isArray(header.page_digests)
           || header.page_digests.length !== Math.ceil(header.total_count / PAGE_SIZE)
           || response.pageCount !== header.page_digests.length) deny();
-        const signer = trust.signerGrants.find((v) => v.device_id === header.signer_device_id);
-        if (!signer) deny();
-        const signerKey = await verifyGrant(signer, trust.ownerPublicKey, scope, pin);
+        const signerKey = await verifyAuthorizedSigner(header.signer_device_id, header.epoch);
         const sig = from64(response.headerSignatureBase64, 64);
         if (!await crypto.subtle.verify("Ed25519", signerKey, sig,
           concat(HEAD, headerBytes))) deny();
@@ -662,12 +838,17 @@
       advance(final);
       return remember(final, rows, decode(firstHeader));
     }
-    async function prepareIntent(writes) {
+    async function prepareIntent(writes, expectedHead) {
       if (prepared || used) deny();
       prepared = true;
       try {
         if (!Array.isArray(writes) || !writes.length || writes.length > MAX_ROWS) deny();
         const snapshot = await readAll();
+        if (expectedHead !== undefined) {
+          exact(expectedHead, ["sequence", "digest"]);
+          if (snapshot.head.sequence !== uint(expectedHead.sequence, 0, 128)
+            || !equal(bytes(snapshot.head.digest, 32), bytes(expectedHead.digest, 32))) deny();
+        }
         if (snapshot.head.sequence >= 128) deny();
         const oldVersions = new Set(snapshot.rows.map((r) => r.object_id + ":" + r.revision));
         const planned = [];
@@ -907,6 +1088,7 @@
     return Object.freeze({ readAll: async () => {
       try { return await readAll(); } catch (_) { deny(); }
     }, readVerifiedCiphertext, readSignedSuccessor, readVerifiedPredecessorDigest,
+    readSignedHistoricalHead, verifyAuthorizedSigner, verifyHistoricalSigner,
     prepareIntent, commit, confirmPendingIntent,
     delete: deny, trash: deny, rename: deny, move: deny });
   }

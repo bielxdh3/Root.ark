@@ -26,6 +26,7 @@ const digest = (bytes) => nodeCrypto.createHash("sha256").update(bytes).digest()
 const rawPub = (key) => Buffer.from(key.export({ type: "spki", format: "der" })).subarray(-32);
 const WITNESS = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0");
 const GRANT = Buffer.from("Root.ark/zk-1/browser-owner-device-grant/v1\0");
+const SNAPSHOT = Buffer.from("Root.ark/zk-1/opaque-catalog-snapshot-fetch/v1\0");
 const GRANT_FIELDS = ["schema", "account_id", "compartment_id", "keyring_id", "device_id",
   "authorization_key_id", "authorization_public_key", "manifest_revision", "manifest_digest",
   "current_epoch", "enrolled_epoch", "revoked_at_epoch"];
@@ -84,6 +85,7 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   });
   let sequence = 0;
   let currentDigest = Buffer.alloc(32);
+  const historicalSnapshots = new Map();
   const signedCas = async (nonce) => {
     const stmt = { type: "rootark-zk1-opaque-catalog-cas/v1", ...scope,
       sequence, digest: Buffer.from(currentDigest), nonce: Buffer.from(nonce),
@@ -94,13 +96,29 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   };
   const authority = { publicKey: authorityKeys.publicKey,
     readHead: async ({ nonce }) => signedCas(nonce),
-    async compareAndSwap({ expectedSequence, expectedDigest, nextSequence, nextDigest, nonce }) {
+    async compareAndSwap({ expectedSequence, expectedDigest, nextSequence, nextDigest, nonce,
+      headBytes, headSignature, pageBodies }) {
       if (expectedSequence !== sequence || !Buffer.from(expectedDigest).equals(currentDigest)
         || nextSequence !== sequence + 1) throw Error("CAS conflict");
       sequence = nextSequence;
       currentDigest = Buffer.from(nextDigest);
+      historicalSnapshots.set(nextSequence, { digest: Buffer.from(nextDigest),
+        header: Buffer.from(headBytes), header_signature: Buffer.from(headSignature),
+        page_bodies: pageBodies.map((raw) => Buffer.from(raw)) });
       return signedCas(nonce);
     } };
+  const signedSnapshot = async ({ nonce, sequence: requested }) => {
+    const stored = historicalSnapshots.get(requested);
+    if (!stored) throw Error("missing authoritative historical snapshot");
+    const body = { type: "rootark-zk1-opaque-catalog-snapshot-fetch/v1", ...scope,
+      sequence: requested, digest: stored.digest, head_sequence: sequence,
+      head_digest: Buffer.from(currentDigest), nonce: Buffer.from(nonce),
+      observed_at: time, header: stored.header,
+      header_signature: stored.header_signature, page_bodies: stored.page_bodies };
+    return z.encodeDeterministic({ ...body, signature: nodeCrypto.sign(null,
+      Buffer.concat([SNAPSHOT, Buffer.from(await z.encodeDeterministic(body))]),
+      authorityKeys.privateKey) });
+  };
   const app = express();
   const catalog = new Zk1OpaqueCatalog({ store, authority });
   registerZk1ProtectedObjectRoutes({ app, store, opaqueCatalog: catalog,
@@ -180,6 +198,7 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
       ownerWitnessKeyId: witnessId, ownerWitnessProbe: async ({ nonce }) => witnessStatement(nonce),
       catalogAuthorityPublicKey: await asKey(authorityKeys.publicKey, "public"),
       catalogProbe: async ({ nonce }) => signedCas(nonce),
+      catalogSnapshotProbe: signedSnapshot,
       minimumCatalogHead: { sequence: 0, digest: Buffer.alloc(32) },
       csrfToken: () => csrf, isSessionCurrent: () => active,
       assertCurrent: async () => { if (!active) throw Error("session closed"); },
@@ -215,7 +234,8 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   const objectId = b64(nodeCrypto.randomBytes(16));
   const firstCipher = nodeCrypto.randomBytes(100);
   const metadataKey = nodeCrypto.randomBytes(32);
-  const cryptoMeta = await crypto.subtle.importKey("raw", metadataKey, "AES-GCM", false, ["encrypt"]);
+  const cryptoMeta = await crypto.subtle.importKey("raw", metadataKey, "AES-GCM", false,
+    ["encrypt", "decrypt"]);
   const first = await client(0);
   const rowInput = { objectId, revision: 1, epoch: 1, ciphertext: firstCipher,
     name: "sensitive/private/account.txt", metadataKey: cryptoMeta };
@@ -427,6 +447,8 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   }), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
   "generic signed version PUT may never forge a reserved tombstone marker");
   assert.equal(putRequests, markerPutCount);
+  const stalePublisher = await syncClient(1);
+  const stalePublisherBase = await stalePublisher.readCurrent();
   const initialPutCount = putRequests, initialCommitCount = commits;
   losePutAck = true; loseAck = true;
   const trashed = await tombstoneWriter.trashVersion({ previous: trashBase,
@@ -498,6 +520,100 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   await assert.rejects(tombstoneReader.readTrash({ previous: readerBase,
     objectId, metadataKey: ownerMetadataKey }), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
   "stale signed CAS must not accept a future tombstone");
+  const resurrection = await syncClient(1);
+  const resurrectionHead = await resurrection.readCurrent();
+  const putsBeforeResurrection = putRequests, commitsBeforeResurrection = commits;
+  await assert.rejects(resurrection.commitVersion({ previous: resurrectionHead,
+    objectId, expectedRevision: 3, revision: 4, epoch: 1,
+    ciphertext: nodeCrypto.randomBytes(90), name: "resurrected-without-approval.txt",
+    metadataKey: ownerMetadataKey }), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "latest authenticated tombstone must forbid ordinary version publishing");
+  assert.equal(putRequests, putsBeforeResurrection, "refuse resurrection before PUT");
+  assert.equal(commits, commitsBeforeResurrection, "refuse resurrection before CAS");
+  await assert.rejects(stalePublisher.commitVersion({ previous: stalePublisherBase,
+    objectId, expectedRevision: 2, revision: 3, epoch: 1,
+    ciphertext: nodeCrypto.randomBytes(90), name: "stale-untrash.txt",
+    metadataKey: ownerMetadataKey }), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "a prior device's stale catalog snapshot cannot override logical trash");
+  assert.equal(putRequests, putsBeforeResurrection);
+  assert.equal(commits, commitsBeforeResurrection);
+  const unrelated = await syncClient(1);
+  const unrelatedBase = await unrelated.readCurrent();
+  const unrelatedId = b64(nodeCrypto.randomBytes(16));
+  const unrelatedResult = await unrelated.commitVersion({ previous: unrelatedBase,
+    objectId: unrelatedId, expectedRevision: null, revision: 1, epoch: 1,
+    ciphertext: nodeCrypto.randomBytes(80), name: "unrelated-after-trash.txt",
+    metadataKey: cryptoMeta });
+  assert.equal(unrelatedResult.sequence, 4);
+  const historicReader = await syncClient(1);
+  const historicHead = await historicReader.readCurrent();
+  assert.equal((await historicReader.readTrash({ previous: historicHead,
+    objectId, metadataKey: ownerMetadataKey })).state, "trashed",
+  "historical signed tombstone remains verifiable after an unrelated signed CAS append");
+  const forgedGrant = await grant(manifest.devices[0]);
+  forgedGrant.signature = b64(nodeCrypto.randomBytes(64));
+  const selfAttestedReader = await syncClient(1, { signerGrants: [
+    await grant(manifest.devices[1]), forgedGrant] });
+  const selfAttestedHead = await selfAttestedReader.readCurrent();
+  await assert.rejects(selfAttestedReader.readTrash({ previous: selfAttestedHead,
+    objectId, metadataKey: ownerMetadataKey }), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "tombstone signing key must be owner-signed, never self-attested");
+  const signedRevokedGrant = await grant(manifest.devices[0]);
+  signedRevokedGrant.revoked_at_epoch = 1;
+  const revokeFields = Object.fromEntries(GRANT_FIELDS.map((key) =>
+    [key, signedRevokedGrant[key]]));
+  signedRevokedGrant.signature = b64(nodeCrypto.sign(null, Buffer.concat([
+    GRANT, Buffer.from(JSON.stringify(revokeFields))]), ownerKeys.privateKey));
+  const revokedSignerReader = await syncClient(1, { signerGrants: [
+    await grant(manifest.devices[1]), signedRevokedGrant] });
+  const revokedSignerHead = await revokedSignerReader.readCurrent();
+  await assert.rejects(revokedSignerReader.readTrash({ previous: revokedSignerHead,
+    objectId, metadataKey: ownerMetadataKey }), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "even owner-signed revoked grant cannot authenticate historical tombstone");
+  await assert.rejects(syncClient(1, { signerGrants: [
+    await grant(manifest.devices[0]), await grant(manifest.devices[0]),
+    await grant(manifest.devices[1])] }), /ZK_BROWSER_CATALOG_UNVERIFIED/,
+  "duplicate signer device IDs cannot select an arbitrary key");
+  const corruptSnapshot = await syncClient(1, { catalogSnapshotProbe: async (args) => {
+    const unsigned = await z.decodeDeterministic(await signedSnapshot(args));
+    unsigned.head_digest = nodeCrypto.randomBytes(32);
+    return z.encodeDeterministic(unsigned);
+  } });
+  const corruptHead = await corruptSnapshot.readCurrent();
+  await assert.rejects(corruptSnapshot.readTrash({ previous: corruptHead,
+    objectId, metadataKey: ownerMetadataKey }), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "CAS head fork inside signed historical snapshot must never be accepted");
+  // A declared but missing independent snapshot authority is not a fallback.
+  await assert.rejects(syncClient(1, { catalogSnapshotProbe: undefined }),
+    /ZK_BROWSER_CATALOG_UNVERIFIED/);
+  let raceArmed = false, raceProbes = 0, didAdvanceCas = false, racedOwnPuts = 0;
+  const racingTrashWriter = await syncClient(0, {
+    catalogProbe: async ({ nonce }) => {
+      // Two complete signed reads precede prepareIntent (two CAS probes each).
+      // Advance CAS at the FIRST probe within prepareIntent's independent read.
+      if (raceArmed && ++raceProbes === 5) {
+        const peer = await syncClient(1);
+        const peerHead = await peer.readCurrent();
+        await peer.commitVersion({ previous: peerHead, objectId: b64(nodeCrypto.randomBytes(16)),
+          expectedRevision: null, revision: 1, epoch: 1,
+          ciphertext: nodeCrypto.randomBytes(80), name: "cas-racer.txt", metadataKey: cryptoMeta });
+        didAdvanceCas = true;
+      }
+      return signedCas(nonce);
+    },
+    fetchImpl: async (url, init) => {
+      if (url.endsWith("/content/put")) racedOwnPuts++;
+      return fetchImpl(url, init);
+    },
+  });
+  const preRace = await racingTrashWriter.readCurrent();
+  raceArmed = true;
+  await assert.rejects(racingTrashWriter.trashVersion({ previous: preRace,
+    objectId: unrelatedId, expectedRevision: 1, metadataKey: ownerMetadataKey }),
+  /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "CAS advancement after tombstone statement but before journal must deny publication");
+  assert.equal(didAdvanceCas, true, "adversarial CAS advance must actually occur");
+  assert.equal(racedOwnPuts, 0, "stale tombstone must be fenced before its signed PUT");
   const planned = await client(1);
   const revision3 = nodeCrypto.randomBytes(90);
   const plannedIntent = await planned.prepareIntent([{ objectId, revision: 4,
@@ -509,7 +625,7 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   await assert.rejects(competing.commit([{ ...rowInput, revision: 4,
     ciphertext: revision3 }], plannedIntent), /ZK_BROWSER_CATALOG_UNVERIFIED/,
   "an additional PUT after the pre-write journal cannot be silently omitted");
-  assert.equal(sequence, 3, "CAS must not advance when server inventory contains an unlisted write");
+  assert.equal(sequence, 5, "CAS must not advance when server inventory contains an unlisted write");
   await fixture.appendDeviceRevocation(state, "trusted-0");
   manifest = state.headManifest;
   ownerHistory = await history.verifyRecoveryHistoryPublicV2({

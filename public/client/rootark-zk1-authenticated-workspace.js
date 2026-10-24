@@ -574,12 +574,14 @@
         || (url.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)))) fail();
     return url;
   }
-  function independentCatalogProbe(url, assertLive) {
-    return async ({ scope, nonce }) => {
+  function independentCatalogProbe(url, assertLive, snapshot = false) {
+    return async ({ scope, nonce, sequence }) => {
       assertLive();
+      if (snapshot && (!Number.isSafeInteger(sequence) || sequence < 1 || sequence > 128)) fail();
       if (typeof AbortController !== "function") fail();
       const controller = new AbortController();
       let timer, reader, complete = false;
+      const maximum = snapshot ? 3 * 1024 * 1024 : 8192;
       try {
         // The limit covers DNS/headers and every chunk of the body, even when
         // the server omits or lies about Content-Length or stops sending bytes.
@@ -588,15 +590,16 @@
             method: "POST", mode: "cors", credentials: "omit", redirect: "error",
             referrerPolicy: "no-referrer", cache: "no-store", signal: controller.signal,
             headers: { "content-type": "application/json", accept: "application/cbor" },
-            body: JSON.stringify({ scope, nonceBase64: to64(nonce) }),
+            body: JSON.stringify({ scope, nonceBase64: to64(nonce),
+              ...(snapshot ? { sequence } : {}) }),
           });
           assertLive();
           if (response.status !== 200
             || response.headers?.get("content-type")?.split(";")[0].trim() !== "application/cbor"
-            || Number(response.headers.get("content-length") || 0) > 8192
+            || Number(response.headers.get("content-length") || 0) > maximum
             || !response.body || typeof response.body.getReader !== "function") fail();
           reader = response.body.getReader();
-          const raw = new Uint8Array(8192);
+          const raw = new Uint8Array(maximum);
           let total = 0, chunks = 0;
           while (true) {
             const next = await reader.read();
@@ -604,7 +607,7 @@
             if (controller.signal.aborted) fail();
             if (next.done) { complete = true; break; }
             if (!(next.value instanceof Uint8Array) || next.value.byteLength < 1
-              || ++chunks > 8192 || next.value.byteLength > raw.length - total) fail();
+              || ++chunks > maximum || next.value.byteLength > raw.length - total) fail();
             raw.set(next.value, total);
             total += next.value.byteLength;
           }
@@ -782,6 +785,7 @@
       + '<label>SHA-256 SPKI do witness (base64url, pin offline)<input data-zk1-field="catalog-witness-spki" maxlength="43" spellcheck="false"></label>'
       + '<label>URL de consulta direta ao witness independente (HTTPS POST)<input type="url" data-zk1-field="catalog-witness-url" spellcheck="false"></label>'
       + '<label>URL de consulta direta ao CAS independente (HTTPS POST)<input type="url" data-zk1-field="catalog-cas-url" spellcheck="false"></label>'
+      + '<label>URL independente de snapshot histórico assinado (HTTPS POST, opcional; necessária para tombstone após outros commits)<input type="url" data-zk1-field="catalog-snapshot-url" spellcheck="false"></label>'
       + '<label><input type="checkbox" data-zk1-field="catalog-relay-opt-in"> Usar relay autenticado Root.ark para obter provas assinadas do witness e CAS independentes via mTLS (dispensa URLs diretas).</label>'
       + '<label>Sequência mínima do CAS fixada offline (0 para novo catálogo)<input type="number" min="0" max="128" step="1" data-zk1-field="catalog-write-sequence"></label>'
       + '<label>Digest mínimo do CAS fixado offline (base64url; 32 bytes, zero no início)<input data-zk1-field="catalog-write-digest" maxlength="43" spellcheck="false"></label>'
@@ -795,6 +799,8 @@
       + 'arquivos ao sistema e não transmite nomes, caminhos ou CEKs em texto claro. Sem sincronização automática.</p>'
       + '<label><input type="checkbox" data-zk1-field="catalog-delta-opt-in"> Autorizo esta ação manual com meu grant ativo, CAS/witness independentes e journal local para escrita.</label>'
       + '<label>Delta opaco exportado por outro dispositivo (.json, somente ciphertext e metadados cifrados)<input type="file" data-zk1-field="catalog-delta-package" accept=".json,application/json"></label>'
+      + '<label>Histórico proprietário de epochs (JSON assinado do início ao head atual; somente leitura histórica)<input type="file" data-zk1-field="catalog-historical-epoch-history" accept=".json,application/json"></label>'
+      + '<label>Chave AES-GCM da epoch histórica (32 bytes, local; somente leitura de tombstone)<input type="file" data-zk1-field="catalog-historical-epoch-key"></label>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-anchor">Ancorar CAS assinado atual</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-pull">Conferir e exportar delta cifrado</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-list">Listar nomes localmente (AES-GCM)</button>'
@@ -1087,7 +1093,8 @@
           || held.minimumSequence !== field("catalog-write-sequence")?.value.trim()
           || held.minimumDigest !== field("catalog-write-digest")?.value.trim()
           || held.casPin !== field("catalog-cas-spki")?.value.trim()
-          || held.witnessPin !== field("catalog-witness-spki")?.value.trim()) fail();
+          || held.witnessPin !== field("catalog-witness-spki")?.value.trim()
+          || held.snapshotUrl !== field("catalog-snapshot-url")?.value.trim()) fail();
         await window.RootarkZk1NormalBrowserTrustFloor.assertCurrent({
           ownerPublicKey: trust.ownerPublicKey,
           independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
@@ -1102,19 +1109,30 @@
         if (action === "catalog-delta-trash" || action === "catalog-delta-trash-inspect") {
           const objectId = field("catalog-write-id")?.value.trim();
           if (!/^[A-Za-z0-9_-]{22}$/.test(objectId)) fail();
-          const raw = await fileBytes("catalog-write-key", 32, 32);
+          const versions = held.baseline.entries.filter((row) => row.objectId === objectId);
+          const newest = versions.length
+            ? versions.reduce((a, b) => a.revision > b.revision ? a : b) : null;
+          const historicalInspection = action === "catalog-delta-trash-inspect"
+            && newest !== null && newest.epoch < trust.pinnedCurrentHead.epoch;
+          const raw = await fileBytes(historicalInspection ? "catalog-historical-epoch-key"
+            : "catalog-write-key", 32, 32);
           let metadataKey;
           try { metadataKey = await crypto.subtle.importKey("raw", raw,
-            { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]); }
+            { name: "AES-GCM", length: 256 }, false,
+            historicalInspection ? ["decrypt"] : ["encrypt", "decrypt"]); }
           finally { raw.fill(0); }
           if (action === "catalog-delta-trash-inspect") {
             const result = await held.client.readTrash({
-              previous: held.baseline, objectId, metadataKey });
+              previous: held.baseline, objectId,
+              ...(historicalInspection ? { historicalMetadataKeys: [
+                { epoch: newest.epoch, key: metadataKey }] } : { metadataKey }) });
             assertLive();
             if (result.state !== "trashed" || result.signedByAuthorizedDevice !== true
               || result.originalHistoryPreserved !== true
               || result.serverPlaintextExposed !== false) fail();
-            field("catalog-delta-summary").textContent = "Tombstone autenticado · revisão "
+            field("catalog-delta-summary").textContent = (historicalInspection
+              ? "Tombstone histórico autenticado (somente leitura) · revisão "
+              : "Tombstone autenticado · revisão ")
               + result.revision + " · " + result.retainedHistoricalVersions
               + " versões históricas preservadas";
             status("Tombstone cifrado e assinado conferido contra GET exato, witness e CAS. "
@@ -1198,7 +1216,7 @@
           const raw = await fileBytes("catalog-write-key", 32, 32);
           let metadataKey;
           try { metadataKey = await crypto.subtle.importKey("raw", raw,
-            { name: "AES-GCM", length: 256 }, false, ["encrypt"]); }
+            { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]); }
           finally { raw.fill(0); }
           data = await fileBytes("catalog-write-ciphertext", 16, 4 * 1024 * 1024);
           assertLive();
@@ -1418,7 +1436,9 @@
           || !window.RootarkZk1ProtectedHttpClient?.postProtectedCiphertextPut) fail();
         const rootOrigin = location.origin;
         const relayOptIn = field("catalog-relay-opt-in")?.checked === true;
-        let witnessUrl, casUrl;
+        let witnessUrl, casUrl, snapshotUrl;
+        const selectedSnapshotUrl = field("catalog-snapshot-url")?.value.trim() || "";
+        if (selectedSnapshotUrl) snapshotUrl = independentCatalogEndpoint(selectedSnapshotUrl, rootOrigin);
         if (!relayOptIn) {
           witnessUrl = independentCatalogEndpoint(field("catalog-witness-url").value.trim(), rootOrigin);
           casUrl = independentCatalogEndpoint(field("catalog-cas-url").value.trim(), rootOrigin);
@@ -1486,6 +1506,13 @@
         const signerGrants = [trust.signedDeviceGrant];
         if (signerGrant.device_id !== trust.signedDeviceGrant.device_id) signerGrants.push(signerGrant);
         else if (JSON.stringify(signerGrant) !== JSON.stringify(trust.signedDeviceGrant)) fail();
+        const historicalEpochFile = field("catalog-historical-epoch-history")?.files;
+        let historicalOwnerEpochHistory;
+        if (anchoringDelta && historicalEpochFile?.length) {
+          historicalOwnerEpochHistory = JSON.parse(decoder.decode(await fileBytes(
+            "catalog-historical-epoch-history", 1, 256 * 1024)));
+          exactly(historicalOwnerEpochHistory, ["heads", "grants"]);
+        }
         const authority = {
           origin: rootOrigin + "/", fetchImpl: guardedFetch,
           ownerPublicKey: trust.ownerPublicKey,
@@ -1494,12 +1521,15 @@
             digest: trust.pinnedCurrentHead.digest, epoch: trust.pinnedCurrentHead.epoch },
           signedDeviceGrant: trust.signedDeviceGrant, devicePublicKey, devicePrivateKey,
           signerGrants, ownerWitnessPublicKey: witnessKey,
+          ...(historicalOwnerEpochHistory ? { historicalOwnerEpochHistory } : {}),
           ownerWitnessKeyId: signerIdFrom64(field("catalog-witness-id").value.trim()),
           ownerWitnessProbe: relayOptIn ? relayProbes.ownerWitnessProbe
             : independentCatalogProbe(witnessUrl, assertLive),
           catalogAuthorityPublicKey: casKey,
           catalogProbe: relayOptIn ? relayProbes.catalogProbe
             : independentCatalogProbe(casUrl, assertLive),
+          ...(snapshotUrl ? { catalogSnapshotProbe:
+            independentCatalogProbe(snapshotUrl, assertLive, true) } : {}),
           minimumCatalogHead: { sequence, digest: catalogFloor },
           csrfToken: () => { assertLive(); return initialCsrf; },
           isSessionCurrent: () => {
@@ -1541,6 +1571,7 @@
             minimumDigest: field("catalog-write-digest").value.trim(),
             casPin: field("catalog-cas-spki").value.trim(),
             witnessPin: field("catalog-witness-spki").value.trim(),
+            snapshotUrl: selectedSnapshotUrl,
           };
           field("catalog-delta-summary").textContent = "Piso CAS #" + baseline.head.sequence
             + " · " + baseline.entries.length + " versão(ões) opacas";

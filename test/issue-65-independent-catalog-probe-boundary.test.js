@@ -94,6 +94,30 @@ test("direct browser catalog probe reads bounded chunks and preserves cross-orig
   assert.ok(observed.init.signal instanceof AbortSignal);
 });
 
+test("historical snapshot probe binds exact sequence without cookies and enforces its larger bounded CBOR limit", async () => {
+  let observed;
+  const { independentCatalogProbe: probe } = browser(async (url, init) => {
+    observed = { url, init };
+    return response(stream([new Uint8Array(8193)]),
+      { "content-type": "application/cbor", "content-length": "8193" });
+  });
+  const endpoint = probe(new URL("https://historical-cas.example/snapshot"), () => {}, true);
+  const bytes = await endpoint({ scope, nonce, sequence: 3 });
+  assert.equal(bytes.length, 8193, "historical snapshot may exceed 8192-byte head receipts");
+  assert.deepEqual(JSON.parse(observed.init.body), {
+    scope, nonceBase64: Buffer.alloc(32).toString("base64url"), sequence: 3 });
+  assert.equal(observed.init.credentials, "omit");
+  assert.equal(observed.init.referrerPolicy, "no-referrer");
+  await assert.rejects(endpoint({ scope, nonce, sequence: 129 }), /ZK_WORKSPACE_INPUT_DENIED/);
+  let canceled = false;
+  const bad = browser(async () => response(stream([
+    new Uint8Array(3 * 1024 * 1024), new Uint8Array(1),
+  ], { onCancel() { canceled = true; } })));
+  await assert.rejects(bad.independentCatalogProbe(new URL("https://historical-cas.example/snapshot"),
+    () => {}, true)({ scope, nonce, sequence: 3 }), /ZK_WORKSPACE_INPUT_DENIED/);
+  assert.equal(canceled, true);
+});
+
 test("lying Content-Length cannot bypass streamed 8192-byte proof limit", async () => {
   let reads = 0, canceled = false;
   const { independentCatalogProbe: probe } = browser(async () => response(stream([

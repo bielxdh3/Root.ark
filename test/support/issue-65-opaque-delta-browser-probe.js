@@ -118,7 +118,30 @@
         ],
       };
       let badGet = false;
+      // The Edge probe isolates the AES-GCM/Ed25519 browser primitive. The
+      // full owner grant, CAS and historical header verification is exercised
+      // against the signed HTTP/SQLite fixture, not these local stubs.
+      const verifiedLocalAuthority = {
+        async readSignedHistoricalHead(snapshot, sequence, expectedRow) {
+          if (snapshot !== candidate || sequence !== 2
+            || expectedRow.objectId !== fixture.objectId || expectedRow.revision !== 2)
+            throw Error("UNVERIFIED_HISTORY");
+          return { exactHistoricalAuthorityVerified: true, previousDigest: b64(prevDigest),
+            epoch: 1, manifestRevision: 1, manifestDigest: statement.ownerDigest,
+            issuedAt: 1700000000 };
+        },
+        async verifyAuthorizedSigner(deviceId, epoch) {
+          if (deviceId !== "edge-issuer" || epoch !== 1) throw Error("UNVERIFIED_SIGNER");
+          return signing.publicKey;
+        },
+        async verifyHistoricalSigner(deviceId, epoch, revision, digest) {
+          if (deviceId !== "edge-issuer" || epoch !== 1 || revision !== 1
+            || b64(digest) !== statement.ownerDigest) throw Error("UNVERIFIED_HISTORICAL_OWNER_GRANT");
+          return signing.publicKey;
+        },
+      };
       root.RootarkZk1BrowserOpaqueCatalogCommit.createClient = () => ({
+        ...verifiedLocalAuthority,
         async readAll() { return candidate; },
         async readVerifiedPredecessorDigest() { return prevDigest; },
         async readVerifiedCiphertext() {
@@ -154,6 +177,7 @@
       const forgedEnvelope = new Uint8Array(anotherIv.length + anotherEncrypted.length);
       forgedEnvelope.set(anotherIv); forgedEnvelope.set(anotherEncrypted, anotherIv.length);
       root.RootarkZk1BrowserOpaqueCatalogCommit.createClient = () => ({
+        ...verifiedLocalAuthority,
         async readAll() { return candidate; },
         async readVerifiedPredecessorDigest() { return prevDigest; },
         async readVerifiedCiphertext() { return { ciphertextBase64: b64(forgedEnvelope) }; },
@@ -165,6 +189,7 @@
       catch (error) { signatureRejected = error.message === "ZK_OPAQUE_DELTA_SYNC_DENIED"; }
       if (!signatureRejected) throw Error("EDGE_INVALID_SIGNER_ACCEPTED");
       root.RootarkZk1BrowserOpaqueCatalogCommit.createClient = () => ({
+        ...verifiedLocalAuthority,
         async readAll() { return candidate; },
         async readVerifiedPredecessorDigest() { return prevDigest; },
         async readVerifiedCiphertext() {
@@ -181,6 +206,23 @@
       catch (error) { forgedRejected = error.message === "ZK_OPAQUE_DELTA_SYNC_DENIED"; }
       if (!forgedRejected) throw Error("EDGE_TRASH_FORGED_CIPHERTEXT_ACCEPTED");
       badGet = false;
+      // After owner rotation, only a correctly epoch-indexed AES key may
+      // inspect the old encrypted tombstone. This path is strictly read-only.
+      trust.pinnedOwnerHead = { revision: 2, epoch: 2,
+        digest: new Uint8Array(32).fill(9) };
+      const oldReadOnlyKey = await root.crypto.subtle.importKey("raw",
+        raw64(fixture.metadataKeyBase64), "AES-GCM", false, ["decrypt"]);
+      const historicalReader = newReader(), historicalBaseline = await historicalReader.readCurrent();
+      const old = await historicalReader.readTrash({ previous: historicalBaseline,
+        objectId: fixture.objectId, historicalMetadataKeys: [{ epoch: 1, key: oldReadOnlyKey }] });
+      if (!old.historicEpochVerifiedReadOnly || old.mutationAuthorized !== false
+        || old.ownerApprovedRekeyRequired !== true) throw Error("EDGE_HISTORIC_TRASH_NOT_READ_ONLY");
+      const wrongEpochReader = newReader(), wrongEpochBase = await wrongEpochReader.readCurrent();
+      let wrongEpochDenied = false;
+      try { await wrongEpochReader.readTrash({ previous: wrongEpochBase,
+        objectId: fixture.objectId, historicalMetadataKeys: [{ epoch: 2, key: oldReadOnlyKey }] }); }
+      catch (error) { wrongEpochDenied = error.message === "ZK_OPAQUE_DELTA_SYNC_DENIED"; }
+      if (!wrongEpochDenied) throw Error("EDGE_HISTORIC_KEY_EPOCH_DOWNGRADE");
     }
     if (before.head.sequence !== 1 || before.entries.length !== 1
       || Object.hasOwn(before.entries[0], "name")) throw Error("PLAIN_METADATA");
