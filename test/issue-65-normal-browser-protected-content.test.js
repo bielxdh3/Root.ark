@@ -7,6 +7,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn, execFileSync } = require("node:child_process");
+const vm = require("node:vm");
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const { createAuthenticate } = require("../src/middlewares/auth");
@@ -19,6 +20,8 @@ const normal = require("../public/client/rootark-zk1-normal-browser-content");
 const portable = require("../public/client/rootark-zk1-portable-file-recovery");
 const browserRestore = require("../public/client/rootark-zk1-browser-recovery-http");
 const recoverableWorkspace = require("../public/client/rootark-zk1-recoverable-workspace");
+const recoverableJournal = require("../public/client/rootark-zk1-recoverable-pending-journal");
+const { strictIndexedDB } = require("./support/issue-65-strict-indexeddb-fixture");
 const protectedHttp = require("../public/client/rootark-zk1-protected-http-client");
 const ownerHistory = require("../public/client/rootark-zk1-owner-signed-checkpoint");
 const ownerRoots = require("../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
@@ -39,7 +42,8 @@ const scriptNames = ["rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-r
   "rootark-zk1-owner-ciphertext-root-checkpoint", "rootark-zk1-protected-http-client",
   "rootark-zk1-uncertain-put-reconciliation", "rootark-zk1-normal-browser-trust-floor",
   "rootark-zk1-normal-browser-content", "rootark-zk1-portable-file-recovery",
-  "rootark-zk1-browser-recovery-http", "rootark-zk1-recoverable-workspace",
+  "rootark-zk1-browser-recovery-http", "rootark-zk1-recoverable-pending-journal",
+  "rootark-zk1-recoverable-workspace",
   "rootark-zk1-normal-browser-lab-ui", "rootark-zk1-portable-recovery-lab-ui",
   "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow",
   "rootark-zk1-legacy-batch-migration",
@@ -224,6 +228,8 @@ test("recoverable normal workspace: independent newly enrolled device, owner-app
     }
     return response;
   };
+  const pendingDb = strictIndexedDB();
+  const memoryJournal = recoverableJournal.openStore(pendingDb);
   const built = await recoverableWorkspace.createRecoverableProtectedFile({
     ownerPublicKey: first.ownerPublicKey,
     pinnedOwnerKeyHash: first.pinnedOwnerKeyHash,
@@ -236,6 +242,7 @@ test("recoverable normal workspace: independent newly enrolled device, owner-app
     origin: first.origin, fetchImpl: firstFetch, nowSeconds: first.nowSeconds,
     recoverySecret: offlineSecret, metadata: first.metadata,
     name: first.fileName, mediaType: first.mediaType, data: first.data,
+    journal: memoryJournal,
   });
   assert.equal(built.clientReadbackVerified, true);
   assert.equal(lostRecoverableAck, 1);
@@ -387,6 +394,8 @@ test("recoverable upload with lost PUT ACK and forged historical GET fails close
     }
     return response;
   };
+  const pendingDb = strictIndexedDB();
+  const memoryJournal = recoverableJournal.openStore(pendingDb);
   await assert.rejects(recoverableWorkspace.createRecoverableProtectedFile({
     ownerPublicKey: first.ownerPublicKey,
     pinnedOwnerKeyHash: first.pinnedOwnerKeyHash,
@@ -399,6 +408,7 @@ test("recoverable upload with lost PUT ACK and forged historical GET fails close
     origin: first.origin, fetchImpl, nowSeconds: first.nowSeconds,
     recoverySecret: secret, metadata: first.metadata,
     name: first.fileName, mediaType: first.mediaType, data: first.data,
+    journal: memoryJournal,
   }), /ZK_RECOVERABLE_WORKSPACE_DENIED/);
   assert.equal(putAckLost, 1);
   assert.equal(tamperedReads, 1,
@@ -407,6 +417,135 @@ test("recoverable upload with lost PUT ACK and forged historical GET fails close
   assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM zk_content_object")
     .get().n, 1, "original ciphertext remains persisted for explicit recovery");
   secret.fill(0);
+});
+
+test("real SQLite pending recoverable intent survives lost PUT ACK + unavailable GET and resumes only signed GET", async (t) => {
+  const f = await setup(t);
+  const first = await f.options();
+  const secret = crypto.randomBytes(32);
+  const spki = crypto.createHash("sha256").update(Buffer.from(
+    await crypto.webcrypto.subtle.exportKey("spki", first.ownerPublicKey))).digest();
+  const pending = strictIndexedDB();
+  const journal = recoverableJournal.openStore(pending);
+  let lostAck = 0, offlineGets = 0, networkCalls = 0, wire = "";
+  const common = { ownerPublicKey: first.ownerPublicKey,
+    pinnedOwnerKeyHash: first.pinnedOwnerKeyHash,
+    independentOwnerSpkiSha256: spki, pinnedCurrentHead: first.pinnedCurrentHead,
+    signedDeviceGrant: first.signedDeviceGrant, ownerHistoryCheckpoint: null,
+    devicePublicKey: first.devicePublicKey, devicePrivateKey: first.devicePrivateKey,
+    origin: first.origin, nowSeconds: first.nowSeconds, recoverySecret: secret, journal };
+  const down = async (url, options) => {
+    networkCalls++;
+    wire += String(options.body || "");
+    if (url.endsWith("/content/put")) {
+      const response = await first.fetchImpl(url, options);
+      await response.arrayBuffer();
+      lostAck++;
+      throw Error("ACK lost after SQLite commit");
+    }
+    if (url.endsWith("/content/read")) { offlineGets++; throw Error("network offline"); }
+    throw Error("unexpected route");
+  };
+  await assert.rejects(recoverableWorkspace.createRecoverableProtectedFile({
+    ...common, metadata: first.metadata, name: first.fileName,
+    mediaType: first.mediaType, data: first.data, fetchImpl: down,
+  }), /ZK_RECOVERABLE_WORKSPACE_DENIED/);
+  assert.equal(f.putCount, 1);
+  assert.equal(lostAck, 1);
+  assert.equal(offlineGets, 1);
+  assert.equal(pending.writes, 1, "strict encrypted pre-PUT record committed exactly once");
+  assert.deepEqual(await journal.listPendingIds(), [first.metadata.object_id]);
+  const stored = JSON.stringify([...pending.values.values()]);
+  assert.equal(stored.includes(first.fileName), false);
+  assert.equal(stored.includes(Buffer.from(first.data).toString()), false);
+  assert.equal(stored.includes(secret.toString("base64url")), false);
+  assert.equal(stored.includes(first.metadata.object_id), true);
+  assert.equal(wire.includes(first.fileName), false);
+  assert.equal(wire.includes(secret.toString("base64url")), false);
+
+  // Simulate a cold process/browser restart: fresh journal instance, same
+  // durable IndexedDB records. Fail closed while GET still unavailable.
+  const restarted = recoverableJournal.openStore(pending);
+  const opts = { ...common, journal: restarted,
+    objectId: first.metadata.object_id,
+    fetchImpl: async (url, options) => {
+      assert.ok(url.endsWith("/content/read"), "pending intent MUST NOT issue PUT");
+      return down(url, options);
+    } };
+  await assert.rejects(recoverableWorkspace.resumePendingProtectedFile(opts),
+    /ZK_RECOVERABLE_WORKSPACE_DENIED/);
+  assert.equal(f.putCount, 1);
+  let attacked = 0;
+  const blocked = async (overrides) => assert.rejects(
+    recoverableWorkspace.resumePendingProtectedFile({ ...opts, ...overrides,
+      fetchImpl: (...args) => { attacked++; return first.fetchImpl(...args); } }),
+    /ZK_RECOVERABLE_WORKSPACE_DENIED/);
+  await blocked({ recoverySecret: crypto.randomBytes(32) });
+  await blocked({ independentOwnerSpkiSha256: crypto.randomBytes(32) });
+  await blocked({ pinnedCurrentHead: { ...first.pinnedCurrentHead, revision: 0 } });
+  assert.equal(attacked, 0, "wrong holder secret/anchor/rollback refused before HTTP");
+
+  const resumed = await recoverableWorkspace.resumePendingProtectedFile({ ...opts,
+    fetchImpl: (url, request) => {
+      assert.ok(url.endsWith("/content/read"), "no replay of the original PUT");
+      networkCalls++;
+      wire += String(request.body || "");
+      return first.fetchImpl(url, request);
+    } });
+  assert.equal(resumed.resumedSignedGetOnly, true);
+  assert.equal(resumed.encryptedLocalRecoveryJournalCommitted, true);
+  assert.equal(resumed.authorizesProductionIo, false);
+  assert.deepEqual(resumed.bundle.metadata, first.metadata);
+  assert.equal(f.putCount, 1);
+  assert.equal(pending.writes, 1, "resume does not mutate/replace the pending journal");
+  const reopened = await portable.openWithIndependentRoot({
+    recoverySecret: secret, bundle: resumed.bundle,
+    expectedMetadata: first.metadata,
+    independentlyPinnedCiphertextRoot: Buffer.from(resumed.ciphertextRoot, "base64url"),
+  });
+  assert.deepEqual(Buffer.from(reopened.data), first.data);
+  reopened.data.fill(0);
+
+  // The signed PUT nonce/operation binding is part of the journal's AEAD
+  // associated data. Replaying a modified IndexedDB header cannot authorize
+  // either a plaintext export or a new network request.
+  const journalRow = pending.values.get(first.metadata.object_id);
+  const originalOperationId = journalRow.operationId;
+  journalRow.operationId = b64(crypto.randomBytes(32));
+  await blocked({});
+  assert.equal(attacked, 0, "tampered local operation binding rejected before GET");
+  journalRow.operationId = originalOperationId;
+
+  const revoked = await fixtures.appendDeviceRevocation(f.state, f.device.device_id);
+  f.setHead(revoked);
+  await blocked({});
+  assert.equal(attacked, 1, "attempted revoked re-entry never receives a valid restored bundle");
+  assert.equal(f.putCount, 1);
+  secret.fill(0);
+});
+
+test("strict encrypted local journal refusal aborts recoverable upload before network PUT", async (t) => {
+  const f = await setup(t);
+  const first = await f.options();
+  const spki = crypto.createHash("sha256").update(Buffer.from(
+    await crypto.webcrypto.subtle.exportKey("spki", first.ownerPublicKey))).digest();
+  for (const db of [strictIndexedDB({ refuseStrict: true }),
+    strictIndexedDB({ failCommit: true })]) {
+    let requests = 0;
+    await assert.rejects(recoverableWorkspace.createRecoverableProtectedFile({
+      ownerPublicKey: first.ownerPublicKey, pinnedOwnerKeyHash: first.pinnedOwnerKeyHash,
+      independentOwnerSpkiSha256: spki, pinnedCurrentHead: first.pinnedCurrentHead,
+      signedDeviceGrant: first.signedDeviceGrant, ownerHistoryCheckpoint: null,
+      devicePublicKey: first.devicePublicKey, devicePrivateKey: first.devicePrivateKey,
+      origin: first.origin, nowSeconds: first.nowSeconds,
+      recoverySecret: crypto.randomBytes(32), metadata: first.metadata,
+      name: first.fileName, mediaType: first.mediaType, data: first.data,
+      journal: recoverableJournal.openStore(db),
+      fetchImpl: (...args) => { requests++; return first.fetchImpl(...args); },
+    }), /ZK_RECOVERABLE_WORKSPACE_DENIED/);
+    assert.equal(requests, 0, "not one HTTP request before strict commit/readback");
+    assert.equal(f.putCount, 0);
+  }
 });
 
 test("normal workspace capability and protected PUT/GET enforce real cookie session, CSRF, permissions, owner scope and revocation", async (t) => {
@@ -1244,6 +1383,36 @@ test("Edge normal authenticated V2 workspace refuses a real legacy V1 server cap
 	          || locallyExported!==1 || field("secret").files.length
 	          || field("private").files.length || field("file").files.length)
 	          throw Error("RECOVERABLE_WORKSPACE_FAILED:"+field("status").textContent);
+		        // Actual Edge IndexedDB strict transaction survives a later offline
+		        // recovery attempt; re-enter using only a signed GET, never PUT.
+		        const journal=window.RootarkZk1RecoverablePendingJournal.openStore(indexedDB);
+		        const pendingIds=await journal.listPendingIds();
+		        if(pendingIds.length!==1)throw Error("EDGE_PENDING_ID_MISSING");
+		        field("pending-object").value=pendingIds[0];
+		        let offline=true, forbiddenPuts=0;
+		        const pendingNativeFetch=window.fetch.bind(window);
+		        window.fetch=(url,opts)=>{
+		          if(String(url).includes("/content/put")){forbiddenPuts++;throw Error("NO_REPLAY_PUT");}
+		          if(offline&&String(url).includes("/content/read"))
+		            return Promise.reject(Error("SIMULATED_OFFLINE_GET"));
+		          return pendingNativeFetch(url,opts);
+		        };
+		        setFile("private",decode(values.privateDer));
+		        setFile("secret",holder);
+		        document.querySelector('[data-zk1-action="pending-resume"]').click();
+		        await wait(()=>field("status").textContent.includes("Operação recusada"));
+		        if(locallyExported!==1||forbiddenPuts!==0)
+		          throw Error("EDGE_OFFLINE_PENDING_RELEASED");
+		        offline=false;
+		        setFile("private",decode(values.privateDer));
+		        setFile("secret",holder);
+		        document.querySelector('[data-zk1-action="pending-resume"]').click();
+		        await wait(()=>field("status").textContent.includes("GET histórico autenticado")
+		          || field("status").textContent.includes("Operação recusada"));
+		        window.fetch=pendingNativeFetch;
+		        if(!field("status").textContent.includes("GET histórico autenticado")
+		          || locallyExported!==2 || forbiddenPuts!==0)
+		          throw Error("EDGE_PENDING_REENTRY_FAILED:"+field("status").textContent);
 	        holder.fill(0);
         // No owner keys, holder secret, selected file plaintext or recovered
         // plaintext crosses the application HTTP endpoint. Capture DOWNLOADS
@@ -1703,6 +1872,7 @@ test("Edge normal authenticated V2 workspace refuses a real legacy V1 server cap
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const origin = "http://127.0.0.1:" + server.address().port;
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-edge-auth-workspace-"));
+  new vm.Script(await (await fetch(origin + "/workspace-probe.js")).text());
   const profile = path.join(folder, "profile");
   let edge;
   let socket;
@@ -1760,6 +1930,11 @@ test("Edge normal authenticated V2 workspace refuses a real legacy V1 server cap
       });
       const value = result.result?.value;
       return typeof value === "string" && value.startsWith("EDGE_AUTH_WORKSPACE_") ? value : null;
+    }).catch(async (cause) => {
+      const debug = await send("Runtime.evaluate", { expression:
+        "JSON.stringify({status:document.querySelector('[data-zk1-field=status]')?.textContent,stage:window.__accountProbeStage,busy:document.querySelector('[data-zk1-action=pending-resume]')?.disabled,output:document.getElementById('edge-workspace-result')?.textContent})",
+      returnByValue: true });
+      throw new Error(cause.message + ": " + debug.result?.value);
     });
     assert.equal(observed, "EDGE_AUTH_WORKSPACE_PASS");
     const edgeProof = await send("Runtime.evaluate", {

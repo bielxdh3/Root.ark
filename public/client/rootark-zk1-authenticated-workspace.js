@@ -15,7 +15,7 @@
     "rootark-zk1-owner-inventory-trust-head",
     "rootark-zk1-browser-authoritative-backup",
     "rootark-zk1-portable-file-recovery", "rootark-zk1-browser-recovery-http",
-    "rootark-zk1-recoverable-workspace",
+    "rootark-zk1-recoverable-pending-journal", "rootark-zk1-recoverable-workspace",
     "rootark-dev-vault-migration", "rootark-zk1-legacy-transition-receipt",
     "rootark-zk1-legacy-migration-workflow",
     "rootark-zk1-legacy-batch-migration",
@@ -697,6 +697,7 @@
       + '<label>Arquivo descartável (até 2 MiB)<input type="file" data-zk1-field="file" required></label>'
       + '<label>Segredo de recuperação separado (arquivo binário de 32 bytes)<input type="file" data-zk1-field="secret"></label>'
       + '<label>Pacote cifrado exportado (.json, sem segredo)<input type="file" data-zk1-field="bundle" accept=".json,application/json"></label>'
+      + '<label>Objeto com GET pendente (ID opaco base64url, consultar lista local)<input type="text" data-zk1-field="pending-object" maxlength="22" autocomplete="off" spellcheck="false"></label>'
       + '<label>Raiz histórica SHA-256 confirmada independentemente pelo proprietário<input type="text" data-zk1-field="root" maxlength="43" spellcheck="false"></label>'
       + '<label>Checkpoint de root Ed25519 assinado pelo proprietário (.json)<input type="file" data-zk1-field="owner-root" accept=".json,application/json"></label>'
       + '<label>Identidade do proprietário no checkpoint (device_id)<input type="text" data-zk1-field="owner-device" maxlength="64" spellcheck="false"></label>'
@@ -709,6 +710,8 @@
       + '<button type="button" class="button button-quiet" data-zk1-action="import-approval">Verificar compromisso witness + aprovação V2</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="upload">Cifrar, enviar e conferir GET</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="upload-recoverable">Enviar e exportar pacote recuperável</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="pending-list">Listar IDs locais pendentes</button>'
+      + '<button type="button" class="button button-primary" data-zk1-action="pending-resume">Retomar GET sem PUT</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="restore">Recuperar arquivo do novo dispositivo</button></div>'
       + '<fieldset><legend>Catálogo opaco entre dispositivos (DEV)</legend>'
       + '<p class="muted">Importe o grant do dispositivo que assinou o catálogo e a chave pública do CAS independente, ambos recebidos fora do servidor. '
@@ -924,6 +927,7 @@
       return;
     }
     if (!["provision", "verify-inventory", "upload", "upload-recoverable",
+      "pending-list", "pending-resume",
       "restore", "new-secret", "new-device", "answer-pop", "import-approval", "verify-revocation",
       "migrate", "migration-finalize", "migration-batch", "archive-create", "archive-recover",
       "account-create", "account-recover", "versioned-create", "versioned-recover",
@@ -2104,7 +2108,14 @@
         status("Prova V2/witness e grant vinculados ao pedido, chave nova e head atual. Provisione o piso offline antes do GET. Histórico completo V2 continua exigido pelo servidor.");
         return;
       }
-      if (action === "provision") {
+      if (action === "pending-list") {
+        if (!window.RootarkZk1RecoverablePendingJournal?.openStore) fail();
+        const ids = await window.RootarkZk1RecoverablePendingJournal.openStore(indexedDB)
+          .listPendingIds();
+        assertLive();
+        status(ids.length ? "IDs opacos preservados localmente (pendentes até GET): "
+          + ids.join(", ") : "Sem pendências locais neste perfil. Não há consulta de nomes ao servidor.");
+      } else if (action === "provision") {
         const result = await window.RootarkZk1NormalBrowserTrustFloor.provisionOffline({
           ownerPublicKey: trust.ownerPublicKey,
           independentOwnerSpkiSha256: trust.independentOwnerSpkiSha256,
@@ -2162,6 +2173,22 @@
             status("Versões conferidas localmente: " + result.verified + "/" + result.total
               + ". Relatório baixado; cada falha exige revisão manual. Originais mantidos, sem exclusão/cutover e sem prova de durabilidade externa.");
           } finally { journal.close(); }
+        } else if (action === "pending-resume") {
+          if (!window.RootarkZk1RecoverablePendingJournal?.openStore) fail();
+          const objectId = field("pending-object")?.value.trim();
+          if (!/^[A-Za-z0-9_-]{22}$/.test(objectId)) fail();
+          secret = await fileBytes("secret", 32, 32);
+          const resumed = await window.RootarkZk1RecoverableWorkspace.resumePendingProtectedFile({
+            ...common, recoverySecret: secret, objectId,
+            journal: window.RootarkZk1RecoverablePendingJournal.openStore(indexedDB),
+          });
+          assertLive();
+          if (!resumed.resumedSignedGetOnly || !resumed.clientReadbackVerified) fail();
+          downloadLocal("rootark-recovery-" + objectId + ".json",
+            JSON.stringify(resumed.bundle), "application/json", assertLive);
+          status("GET histórico autenticado sem repetir PUT. Pacote recuperável exportado; "
+            + "aguarde checkpoint histórico independente assinado pelo proprietário. "
+            + "O diário cifrado local permanece como cópia pendente.");
         } else if (action === "restore") {
           if (!committedDeviceApproval || committedDeviceApproval.sessionEpoch !== sessionEpoch) fail();
           await window.RootarkZk1V2CommittedApproval.assertForRestore({
@@ -2201,6 +2228,7 @@
             const result = await window.RootarkZk1RecoverableWorkspace.createRecoverableProtectedFile({
               ...common, recoverySecret: secret, metadata,
               name: selected.name, mediaType: selected.type || "", data,
+              journal: window.RootarkZk1RecoverablePendingJournal.openStore(indexedDB),
             });
             downloadLocal("rootark-recovery-" + result.objectId + ".json",
               JSON.stringify(result.bundle), "application/json", assertLive);

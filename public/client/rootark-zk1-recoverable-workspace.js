@@ -26,7 +26,8 @@
       "independentOwnerSpkiSha256", "pinnedCurrentHead", "signedDeviceGrant",
       "ownerHistoryCheckpoint", "devicePublicKey", "devicePrivateKey",
       "origin", "fetchImpl", "nowSeconds"];
-    const upload = [...base, "recoverySecret", "metadata", "name", "mediaType", "data"];
+    const upload = [...base, "recoverySecret", "metadata", "name", "mediaType", "data", "journal"];
+    const resume = [...base, "recoverySecret", "objectId", "journal"];
     const restore = [...base, "recoverySecret", "bundle", "expectedMetadata",
       "independentlyPinnedCiphertextRoot", "ownerSignerKeyId", "ownerDeviceId",
       "ownerRootCheckpoint", "previousOwnerHistoryProof"];
@@ -93,8 +94,46 @@
         manifestDigest: input.pinnedCurrentHead.digest,
         epoch: input.pinnedCurrentHead.epoch, nowSeconds: input.nowSeconds };
     }
+    async function verifiedJournal(input, bundle, secret, signed) {
+      const candidate = input.journal;
+      if (typeof candidate?.prepare !== "function"
+        || typeof candidate?.load !== "function") deny();
+      const saved = await candidate.prepare({ recoverySecret: secret, bundle,
+        operationId: signed.authorization.nonce,
+        operationSignature: signed.signatureBase64,
+        ownerSpkiSha256: input.independentOwnerSpkiSha256,
+        pinnedCurrentHead: input.pinnedCurrentHead,
+        ownerHistorySequence: input.ownerHistoryCheckpoint?.sequence ?? null });
+      if (saved.strictTransactionCompleted !== true
+        || saved.encryptedJournalReadbackVerified !== true
+        || saved.objectId !== bundle.metadata.object_id) deny();
+      const check = await candidate.load({ recoverySecret: secret,
+        objectId: bundle.metadata.object_id });
+      if (check?.encryptedJournalReadbackVerified !== true
+        || JSON.stringify(check.bundle) !== JSON.stringify(bundle)) deny();
+    }
+    async function signedReadback(input, bundle, secret, digest, root) {
+      const signedGet = await http.signProtectedContentOperation({
+        ...signer(input), operation: "get", objectId: bundle.metadata.object_id,
+        expectedObjectRevision: bundle.objectRevision,
+        expectedCiphertextDigest: digest, ciphertext: null,
+      });
+      await floor.verifyExternalAnchor(anchor(input));
+      if (typeof window === "object") await floor.assertCurrent(anchor(input));
+      const read = await http.postProtectedCiphertextBackupRead({
+        origin: input.origin, request: signedGet, fetchImpl: input.fetchImpl,
+        expectedObjectRevision: bundle.objectRevision,
+        expectedEpoch: bundle.metadata.epoch, expectedRoot: root,
+      });
+      if (read.ciphertextBase64 !== bundle.ciphertextBase64) deny();
+      const opened = await portable.openWithIndependentRoot({
+        recoverySecret: secret, bundle, expectedMetadata: bundle.metadata,
+        independentlyPinnedCiphertextRoot: root,
+      });
+      opened.data.fill(0);
+    }
     async function createRecoverableProtectedFile(input) {
-      let secret, opened, ciphertext;
+      let secret, ciphertext;
       try {
         exact(input, Object.hasOwn(input || {}, "previousOwnerHistoryProof")
           ? [...upload, "previousOwnerHistoryProof"] : upload);
@@ -114,10 +153,16 @@
         const expectedDigest = decode(bundle.ciphertextSha256, 32);
         if (digest.some((byte, index) => byte !== expectedDigest[index])) deny();
         const root = decode(bundle.ciphertextRoot, 32);
+        // Generate one signed operation nonce before recording the intent; the
+        // exact signed nonce/signature are authenticated by the pre-PUT journal.
         const signed = await http.signProtectedContentOperation({
           ...signer(input), operation: "put", objectId: input.metadata.object_id,
           expectedObjectRevision: null, ciphertext,
         });
+        // No PUT is permitted until encrypted local intent is committed with
+        // strict IndexedDB durability and independently read back/decrypted.
+        // Browser storage eviction / OS crash protection remains unproven.
+        await verifiedJournal(input, bundle, secret, signed);
         // A disconnected HTTP ACK says nothing about whether the server
         // committed the immutable version. Never repeat PUT: reconcile by the
         // same exact revision/digest/root signed historical GET below, and
@@ -128,26 +173,11 @@
             origin: input.origin, request: signed, fetchImpl: input.fetchImpl,
           });
         } catch (_) { lostPutAck = true; }
-        const signedGet = await http.signProtectedContentOperation({
-          ...signer(input), operation: "get", objectId: input.metadata.object_id,
-          expectedObjectRevision: 1, expectedCiphertextDigest: digest,
-          ciphertext: null,
-        });
-        await floor.verifyExternalAnchor(anchor(input));
-        if (typeof window === "object") await floor.assertCurrent(anchor(input));
-        const read = await http.postProtectedCiphertextBackupRead({
-          origin: input.origin, request: signedGet, fetchImpl: input.fetchImpl,
-          expectedObjectRevision: 1, expectedEpoch: input.metadata.epoch,
-          expectedRoot: root,
-        });
-        if (read.ciphertextBase64 !== bundle.ciphertextBase64) deny();
-        opened = await portable.openWithIndependentRoot({
-          recoverySecret: secret, bundle, expectedMetadata: input.metadata,
-          independentlyPinnedCiphertextRoot: root,
-        });
+        await signedReadback(input, bundle, secret, digest, root);
         return Object.freeze({ bundle, objectId: input.metadata.object_id,
           ciphertextRoot: bundle.ciphertextRoot,
           clientReadbackVerified: true, lostPutAckReconciled: lostPutAck,
+          encryptedLocalRecoveryJournalCommitted: true,
           ownerSignedHistoricalRootVerified: false,
           // Approval of the exported ciphertext root is an independent OWNER
           // step. An ordinary client operation cannot sign as the owner.
@@ -155,7 +185,52 @@
           currentOnlineRevocationVerifiedByClient: false,
           authorizesProductionIo: false });
       } catch (_) { deny(); }
-      finally { secret?.fill(0); opened?.data?.fill(0); ciphertext?.fill(0); }
+      finally { secret?.fill(0); ciphertext?.fill(0); }
+    }
+    async function resumePendingProtectedFile(input) {
+      let secret, ciphertext;
+      try {
+        exact(input, Object.hasOwn(input || {}, "previousOwnerHistoryProof")
+          ? [...resume, "previousOwnerHistoryProof"] : resume);
+        secret = raw(input.recoverySecret, 32);
+        if (typeof input.journal?.load !== "function"
+          || typeof input.objectId !== "string") deny();
+        const saved = await input.journal.load({ recoverySecret: secret,
+          objectId: input.objectId });
+        if (saved?.encryptedJournalReadbackVerified !== true
+          || saved.objectId !== input.objectId) deny();
+        const bundle = saved.bundle;
+        await validate(input, bundle.metadata);
+        const prior = saved.head;
+        const current = input.pinnedCurrentHead;
+        if (!prior || bundle.metadata.object_id !== input.objectId
+          || bundle.objectRevision !== 1 || prior.epoch !== bundle.metadata.epoch
+          || current.revision < prior.revision || current.epoch < prior.epoch
+          || (current.revision === prior.revision
+            && decode(prior.digest, 32).some((byte, i) =>
+              byte !== raw(current.digest, 32)[i]))
+          || decode(prior.ownerSpkiSha256, 32).some((byte, i) =>
+            byte !== raw(input.independentOwnerSpkiSha256, 32)[i])
+          || (prior.ownerHistorySequence !== null
+            && (!input.ownerHistoryCheckpoint
+              || input.ownerHistoryCheckpoint.sequence < prior.ownerHistorySequence))) deny();
+        ciphertext = decode(bundle.ciphertextBase64,
+          Math.floor(bundle.ciphertextBase64.length * 3 / 4));
+        const digest = raw(await webCrypto.subtle.digest("SHA-256", ciphertext), 32);
+        const root = decode(bundle.ciphertextRoot, 32);
+        if (digest.some((value, i) => value !== decode(bundle.ciphertextSha256, 32)[i])) deny();
+        // Deliberately GET-ONLY; the pending intent may have been committed,
+        // refused or interrupted before it ever reached the server.
+        await signedReadback(input, bundle, secret, digest, root);
+        return Object.freeze({ bundle, objectId: input.objectId,
+          ciphertextRoot: bundle.ciphertextRoot,
+          clientReadbackVerified: true, resumedSignedGetOnly: true,
+          encryptedLocalRecoveryJournalCommitted: true,
+          externalOwnerRootApprovalRequiredForRestore: true,
+          ownerSignedHistoricalRootVerified: false,
+          authorizesProductionIo: false });
+      } catch (_) { deny(); }
+      finally { secret?.fill(0); ciphertext?.fill(0); }
     }
     async function restoreOnNewDevice(input) {
       let secret;
@@ -180,5 +255,6 @@
       } catch (_) { deny(); }
       finally { secret?.fill(0); }
     }
-    return Object.freeze({ createRecoverableProtectedFile, restoreOnNewDevice });
+    return Object.freeze({ createRecoverableProtectedFile, resumePendingProtectedFile,
+      restoreOnNewDevice });
   }));
