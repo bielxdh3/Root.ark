@@ -23,6 +23,8 @@ const { computeZk1CiphertextRoot } =
 const { Zk1MultiproviderCiphertextRestore,
   createZk1MultiproviderRestoreGetHandler } =
   require("../src/services/zk1MultiproviderCiphertextRestore");
+const { signOwnerProviderVersionPin } =
+  require("../src/services/zk1OwnerProviderVersionPin");
 const { publishSignedCatalogSidecars, recoverSignedCatalogSidecar, zk1CatalogSidecarAddress } =
   require("../src/services/zk1CloudSignedCatalogSidecar");
 const { Zk1ExternallyPinnedProviderDomains, signProviderDomainAttestation,
@@ -109,6 +111,8 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   let cloudError = null;
   let partialS3CiphertextGet = false;
   let partialDriveCiphertextGet = false;
+  let s3CurrentVersion = "owner-version-v1";
+  let webdavCurrentEtag = '"opaque-v1"';
   const s3 = http.createServer((req, res) => {
     const key = req.url.split("?")[0];
     hits.s3 += 1;
@@ -127,11 +131,15 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     }
     const body = cloudError === "s3" ? null : stores.s3.get(key);
     if (!body) { res.writeHead(404); res.end(); return; }
+    const pinnedVersion = new URL(req.url, "http://localhost").searchParams.get("versionId");
+    if (pinnedVersion !== null && pinnedVersion !== s3CurrentVersion) {
+      res.writeHead(404); res.end(); return;
+    }
     if (partialS3CiphertextGet && key.endsWith(".ct")) {
       res.writeHead(206, { "content-range": `bytes 0-${body.length - 1}/${body.length + 1}` });
       res.end(body); return;
     }
-    res.writeHead(200); res.end(body);
+    res.writeHead(200, { "x-amz-version-id": s3CurrentVersion }); res.end(body);
   });
   const s3Port = await register(s3);
   const driveId = "pinned-drive-copy-restoration";
@@ -184,7 +192,7 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     if (req.method !== "GET" || !body || cloudError === "webdav") {
       res.writeHead(404); res.end(); return;
     }
-    res.writeHead(200); res.end(body);
+    res.writeHead(200, { etag: webdavCurrentEtag }); res.end(body);
   });
   const webdavPort = await register(webdavServer);
 
@@ -414,6 +422,98 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     ownerCheckpoint, ownerHistoryCheckpoint, previousOwnerHistoryProof: null,
     expectedCiphertextRoot: root, chunkLengths: [ciphertext.length],
     readers, minimumMatchingProviders: 2 };
+
+  await t.test("owner Ed25519 pins exact S3 version, WebDAV ETag and Drive ID across fallback and restart", async () => {
+    const pinnedReaders = readers.map((reader) => {
+      const target = { provider: reader.provider,
+        namespaceIdentity: reader.cloudReader.zk1StorageNamespace(),
+        expectedReaderContext: reader.expectedReaderContext,
+        providerObjectKey: reader.cloudReader.key(address.folder, address.name, "uploads"),
+        pinnedDriveFileId: reader.pinnedDriveFileId };
+      return { ...reader, ownerSignedVersionPin: signOwnerProviderVersionPin({
+        ownerPrivateKey: ownerKeys.privateKey, scope, operation, root,
+        byteLength: ciphertext.length,
+        ownerHead: { revision: ownerRevision, digest: ownerDigest, epoch: ownerEpoch },
+        target, providerVersionId: reader.provider === "s3" ? "owner-version-v1" : null,
+        providerEtag: reader.provider === "webdav" ? '"opaque-v1"' : null,
+      }) };
+    });
+    const request = { ...recoverInput, readers: pinnedReaders, minimumMatchingProviders: 3 };
+    const fullyPinned = await gateway.restoreExact(request);
+    assert.deepEqual(fullyPinned.ciphertext, ciphertext);
+    assert.equal(fullyPinned.ownerSignedProviderVersionsVerified, true);
+    assert.deepEqual(fullyPinned.verifiedProviders.map((entry) => entry.provider),
+      ["s3", "gdrive", "webdav"]);
+    assert.equal(fullyPinned.verifiedProviders[0].providerVersionId, "owner-version-v1");
+    assert.equal(fullyPinned.verifiedProviders[1].providerFileId, driveId);
+    assert.equal(fullyPinned.verifiedProviders[2].providerEtag, '"opaque-v1"');
+
+    const beforeForgery = { ...hits };
+    for (const forged of [
+      { ...pinnedReaders[0], ownerSignedVersionPin: { ...pinnedReaders[0].ownerSignedVersionPin,
+        signature: b64(random(64)) } },
+      { ...pinnedReaders[0], ownerSignedVersionPin: { ...pinnedReaders[0].ownerSignedVersionPin,
+        provider_version_id: "owner-version-v0" } },
+      { ...pinnedReaders[0], ownerSignedVersionPin: { ...pinnedReaders[0].ownerSignedVersionPin,
+        ciphertext_sha256: b64(random(32)) } },
+      { ...pinnedReaders[0], ownerSignedVersionPin: { ...pinnedReaders[0].ownerSignedVersionPin,
+        owner_head_revision: ownerRevision + 1 } },
+      { ...pinnedReaders[1], ownerSignedVersionPin: { ...pinnedReaders[1].ownerSignedVersionPin,
+        provider_file_id: "replayed-drive-id" } },
+      { ...pinnedReaders[2], ownerSignedVersionPin: { ...pinnedReaders[2].ownerSignedVersionPin,
+        provider_etag: '"opaque-v0"' } },
+    ]) {
+      const at = forged.provider === "s3" ? 0 : forged.provider === "gdrive" ? 1 : 2;
+      await assert.rejects(gateway.restoreExact({ ...request,
+        readers: pinnedReaders.map((entry, index) => index === at ? forged : entry) }),
+      /ZK_MULTIPROVIDER_RESTORE_DENIED/);
+    }
+    await assert.rejects(gateway.restoreExact({ ...request,
+      readers: [pinnedReaders[0], readers[1], pinnedReaders[2]] }),
+    /ZK_MULTIPROVIDER_RESTORE_DENIED/, "signed quorum cannot downgrade to unpinned Drive");
+    assert.deepEqual(hits, beforeForgery, "forged versions and downgrade deny before HTTP GET");
+
+    const s3GetCount = hits.s3;
+    let keyCalls = 0;
+    const switchedS3 = { ...pinnedReaders[0], cloudReader: { ...pinnedReaders[0].cloudReader,
+      key(...args) {
+        keyCalls += 1;
+        const original = s3Adapter.key(...args);
+        return keyCalls === 1 ? original : `foreign/${original}`;
+      },
+    } };
+    await assert.rejects(gateway.restoreExact({ ...request,
+      readers: [switchedS3, pinnedReaders[1], pinnedReaders[2]] }),
+    /ZK_MULTIPROVIDER_RESTORE_DENIED/, "provider must not switch object key after owner pin validation");
+    assert.equal(hits.s3, s3GetCount, "key switch fails before S3 network read");
+
+    s3CurrentVersion = "owner-version-v0"; // identical ciphertext, old remote version
+    const fallback = await gateway.restoreExact({ ...request, minimumMatchingProviders: 2 });
+    assert.equal(fallback.ownerSignedProviderVersionsVerified, true);
+    assert.deepEqual(fallback.verifiedProviders.map((entry) => entry.provider),
+      ["gdrive", "webdav"], "wrong S3 version cannot be counted even with equal bytes");
+    assert.deepEqual(fallback.failedProviders, ["s3"]);
+
+    // A new process must enforce the same owner signature without relying on
+    // local in-memory provider observations from the first attempt.
+    const restarted = new Zk1MultiproviderCiphertextRestore(directGatewayPins);
+    webdavCurrentEtag = '"opaque-v0"'; // bytes unchanged, ETag changed
+    await assert.rejects(restarted.restoreExact({ ...request, minimumMatchingProviders: 2 }),
+      /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+      "Drive alone cannot satisfy quorum if remote S3 version and WebDAV ETag rolled back");
+    s3CurrentVersion = "owner-version-v1";
+    const recovered = await restarted.restoreExact({ ...request, minimumMatchingProviders: 2 });
+    assert.deepEqual(recovered.verifiedProviders.map((entry) => entry.provider),
+      ["s3", "gdrive"], "owner-pinned S3 version is usable after restart");
+    s3CurrentVersion = "owner-version-v0";
+    stores.drive.set(driveId, Buffer.alloc(ciphertext.length, 0xbb));
+    await assert.rejects(restarted.restoreExact({ ...request, minimumMatchingProviders: 2 }),
+      /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+      "digest-tampered Drive plus two stale version peers never release bytes");
+    stores.drive.set(driveId, Buffer.from(ciphertext));
+    s3CurrentVersion = "owner-version-v1";
+    webdavCurrentEtag = '"opaque-v1"';
+  });
 
   await t.test("a verified 2/3 ciphertext quorum never waits on silent third provider", async () => {
     let thirdCalled = 0;

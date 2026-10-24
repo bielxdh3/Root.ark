@@ -145,6 +145,7 @@ async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog,
       const expectedKey = target.adapter.key(address.folder, address.name, "uploads");
       const result = await target.adapter.upload(staged, address.folder, address.name,
         "uploads", { zk1BoundedBytes: payload.length,
+          ...(target.provider === "webdav" ? { zk1ExpectedSha256: crypto.createHash("sha256").update(payload).digest("hex") } : {}),
           ...(target.driveFileId === null ? {} : { providerFileId: target.driveFileId }) });
       if (!result || result.provider !== target.provider || result.key !== expectedKey
         || (target.driveFileId !== null && result.id !== target.driveFileId)

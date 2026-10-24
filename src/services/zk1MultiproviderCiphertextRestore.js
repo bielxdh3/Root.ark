@@ -17,6 +17,7 @@ const { Zk1ExternallyPinnedProviderDomains, spkiFingerprint } =
   require("./zk1ExternallyPinnedProviderDomains");
 const { verifyFreshOwnerDeviceRestoreAuthority } =
   require("./zk1FreshOwnerDeviceRestoreAuthority");
+const { verifyOwnerProviderVersionPin } = require("./zk1OwnerProviderVersionPin");
 const { createZk1ProviderDeadline, validDeadlineMs, isZk1ProviderDeadline,
   DEFAULT_PROVIDER_DEADLINE_MS } = require("./zk1ProviderDeadline");
 
@@ -76,15 +77,20 @@ function cloneOperation(value) {
     revision: whole(op.revision), epoch: whole(op.epoch, 0),
     ciphertext_sha256: copied(op.ciphertext_sha256, 32) };
 }
-function pinnedReaders(values, providerDomains, scope) {
+function pinnedReaders(values, providerDomains, scope, operation, root, byteLength,
+  ownerHead, ownerPublicKey) {
   if (!Array.isArray(values) || values.length < 2 || values.length > 3
     || Reflect.ownKeys(values).length !== values.length + 1) deny();
   const result = [];
   const names = new Set();
   const namespaces = new Set();
+  // Signed-version quorums cannot silently fall back to unpinned peers.
+  const signedMode = values.some((item) => item && typeof item === "object"
+    && Object.hasOwn(item, "ownerSignedVersionPin"));
   for (const value of values) {
-    const item = exact(value, ["cloudReader", "provider", "expectedReaderContext",
-      "pinnedDriveFileId", "domainAttestation"]);
+    const fields = ["cloudReader", "provider", "expectedReaderContext",
+      "pinnedDriveFileId", "domainAttestation"];
+    const item = exact(value, signedMode ? [...fields, "ownerSignedVersionPin"] : fields);
     const reader = item.cloudReader;
     if (!reader || typeof reader !== "object"
       || !["s3", "gdrive", "webdav"].includes(item.provider)
@@ -101,9 +107,21 @@ function pinnedReaders(values, providerDomains, scope) {
         : item.pinnedDriveFileId !== null)) deny();
     names.add(item.provider);
     namespaces.add(namespace);
+    const address = zk1CloudCopyAddress({ scope, operationId: operation.operation_id });
+    const providerObjectKey = reader.key(address.folder, address.name, "uploads");
+    const versionPin = signedMode ? verifyOwnerProviderVersionPin({
+      signedPin: item.ownerSignedVersionPin, pinnedOwnerPublicKey: ownerPublicKey,
+      scope, operation, root, byteLength, ownerHead,
+      target: { provider: item.provider, namespaceIdentity: namespace,
+        expectedReaderContext: item.expectedReaderContext, providerObjectKey,
+        pinnedDriveFileId: item.pinnedDriveFileId },
+    }) : { providerVersionId: null, providerEtag: null };
     result.push({ reader, provider: item.provider, namespace,
       context: item.expectedReaderContext, driveId: item.pinnedDriveFileId,
-      domainAttestation: item.domainAttestation });
+      domainAttestation: item.domainAttestation,
+      ownerPinnedObjectKey: signedMode ? providerObjectKey : null,
+      providerVersionId: versionPin.providerVersionId,
+      providerEtag: versionPin.providerEtag, ownerSignedVersionPinVerified: signedMode });
   }
   providerDomains.verify({ targets: result.map((item) => ({
     provider: item.provider, namespaceIdentity: item.namespace,
@@ -119,6 +137,7 @@ async function exactGet(target, scope, operation, root, lengths, byteLength, dea
     const key = target.reader.key(address.folder, address.name, "uploads");
     if (typeof key !== "string"
       || !key.endsWith(`/uploads/${address.folder}/${address.name}`)
+      || (target.ownerPinnedObjectKey !== null && key !== target.ownerPinnedObjectKey)
       || await deadline.run(() => target.reader.resolveInventoryContext()) !== target.context
       || target.reader.zk1StorageNamespace() !== target.namespace) deny();
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-cloud-recovery-"));
@@ -126,6 +145,8 @@ async function exactGet(target, scope, operation, root, lengths, byteLength, dea
     const ok = await deadline.run((signal) => target.reader.download(address.folder, address.name, destination,
       "uploads", () => !signal.aborted, { maxBytes: byteLength,
         ...(target.driveId === null ? {} : { providerFileId: target.driveId }),
+        ...(target.providerVersionId === null ? {} : { providerVersionId: target.providerVersionId }),
+        ...(target.providerEtag === null ? {} : { expectedEtag: target.providerEtag }),
         abortSignal: signal }));
     if (ok !== true || await deadline.run(() => target.reader.resolveInventoryContext()) !== target.context
       || target.reader.zk1StorageNamespace() !== target.namespace) deny();
@@ -154,7 +175,8 @@ async function exactGet(target, scope, operation, root, lengths, byteLength, dea
       || !same(computeZk1CiphertextRoot(pieces), root)) deny();
     return { data, evidence: Object.freeze({ provider: target.provider,
       namespaceIdentity: target.namespace, providerObjectKey: key,
-      providerFileId: target.driveId, byteLength }) };
+      providerFileId: target.driveId, providerVersionId: target.providerVersionId,
+      providerEtag: target.providerEtag, byteLength }) };
   } finally {
     if (dir) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 4 });
   }
@@ -293,7 +315,8 @@ class Zk1MultiproviderCiphertextRestore {
         if (!entry || !Object.hasOwn(entry, "value")) deny();
         chain.push(copied(entry.value));
       }
-      const readers = pinnedReaders(r.readers, this.#providerDomains, scope);
+      const readers = pinnedReaders(r.readers, this.#providerDomains, scope,
+        operation, root, byteLength, this.#ownerHead, this.#pinnedOwner.publicKey);
       const quorum = whole(r.minimumMatchingProviders, 2, readers.length);
       const checkpoint = detachedSignedRecord(r.ownerCheckpoint);
       const ownerHistoryCheckpoint = detachedSignedRecord(r.ownerHistoryCheckpoint);
@@ -367,6 +390,7 @@ class Zk1MultiproviderCiphertextRestore {
         verifiedProviders: Object.freeze(good.map(({ evidence }) => evidence)),
         failedProviders: Object.freeze(failed),
         serverHasPlaintext: false, signedCurrentDeviceStateRequired: true,
+        ownerSignedProviderVersionsVerified: readers.every((reader) => reader.ownerSignedVersionPinVerified),
         administratorSignaturesVerified: true,
         independentAdministratorCustodyProven: false,
         providerPhysicalIndependenceProven: false,
