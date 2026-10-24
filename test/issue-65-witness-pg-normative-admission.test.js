@@ -152,6 +152,14 @@ test("strict CAS witness floor refuses signed status advance without independent
   assert.equal(floor.head().sequence, 0, "failed evidence must not advance independent floor");
   const result = await floor.advanceAttested({ records: [record], evidence: [evidence] });
   assert.equal(result.sequence, 1);
+  const durableFenceDb = new Database(path.join(directory, "witness-floor.sqlite"),
+    { readonly: true, fileMustExist: true });
+  try {
+    assert.equal(durableFenceDb.prepare(
+      "SELECT operation_id FROM witness_cas_inventory_fence WHERE sequence=1"
+    ).get().operation_id, op.operation_id.toString("hex"),
+    "the witness must sign and durably pin the independent PG operation ID");
+  } finally { durableFenceDb.close(); }
   const strictNonce = random(32);
   const strictSignedHead = floor.freshHead({ nonce: strictNonce });
   assert.equal(strictSignedHead.type, "rootark-zk1-witness-cas-physical-floor/v2",
@@ -436,6 +444,18 @@ test("strict CAS witness floor refuses signed status advance without independent
   assert.deepEqual(restarted.head(), result,
     "restart validates strict operator identities and the independently pinned floor");
   restarted.close();
+  const operationTamperedPath = path.join(directory, "witness-operation-tampered.sqlite");
+  fs.copyFileSync(path.join(directory, "witness-floor.sqlite"), operationTamperedPath);
+  const operationTamperDb = new Database(operationTamperedPath);
+  operationTamperDb.prepare("UPDATE witness_cas_inventory_fence SET operation_id=? WHERE sequence=1")
+    .run(random(16).toString("hex"));
+  operationTamperDb.close();
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(operationTamperedPath, {
+    bootstrapNew: false, witnessKeyId, witnessPrivateKey: witness.privateKey,
+    statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission,
+    trustedMinimumHead: result,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "PG operation-id substitution after SQLite restart invalidates the witness signature");
   const replacement = new Zk1WitnessCasPhysicalAdmission({
     pinnedOwnerPublicKey: crypto.generateKeyPairSync("ed25519").publicKey,
     pinnedInventoryPublicKey: inventory.publicKey,

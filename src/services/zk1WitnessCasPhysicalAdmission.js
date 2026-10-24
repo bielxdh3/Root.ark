@@ -215,6 +215,7 @@ class Zk1WitnessCasPhysicalAdmission {
         || proof.inventoryReceipt.sequence > checked.sequence) deny();
       return Object.freeze({ ownerBound: true, physicallyCommitted: true,
         localReadbackConfirmed: true, externallyDurable: false,
+        operationId: Buffer.from(proof.physicalReadback.operationId),
         inventoryScope: r.scope,
         inventorySequence: checked.sequence, inventoryRoot: Buffer.from(checked.root),
         inventorySnapshot: snapshot });

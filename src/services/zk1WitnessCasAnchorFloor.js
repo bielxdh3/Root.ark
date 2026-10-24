@@ -14,7 +14,7 @@ const { Zk1WitnessCasPhysicalAdmission } = require("./zk1WitnessCasPhysicalAdmis
 const RECORD_DOMAIN = Buffer.from("Root.ark/zk-1/cas-terminal-anchor/v1\0", "ascii");
 const FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-anchor-floor/v1\0", "ascii");
 const PHYSICAL_FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-physical-floor/v2\0", "ascii");
-const PHYSICAL_FENCE_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-inventory-fence/v1\0", "ascii");
+const PHYSICAL_FENCE_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-inventory-fence/v2\0", "ascii");
 const RECORD_FIELDS = ["sequence", "reservation", "scope", "status", "ticketHash",
   "manifestHash", "terminalSeal", "previousHash", "signature"];
 const RECORD_PAYLOAD = RECORD_FIELDS.slice(0, -1);
@@ -46,13 +46,13 @@ function rowEvidence(row) {
 }
 function physicalFenceEvidence(row) {
   return JSON.stringify([row.sequence, row.cas_hash, row.scope,
-    row.inventory_sequence, row.inventory_root,
+    row.operation_id, row.inventory_sequence, row.inventory_root,
     row.snapshot === null ? null : digest(row.snapshot),
     row.signature.toString("base64url")]) + "\n";
 }
 function physicalFenceMessage(row) {
   return Buffer.concat([PHYSICAL_FENCE_DOMAIN, Buffer.from(JSON.stringify([
-    row.sequence, row.cas_hash, row.scope, row.inventory_sequence,
+    row.sequence, row.cas_hash, row.scope, row.operation_id, row.inventory_sequence,
     row.inventory_root, row.snapshot === null ? null : digest(row.snapshot),
   ]))]);
 }
@@ -224,6 +224,7 @@ class Zk1WitnessCasAnchorFloor {
         statusFingerprint: digest(spki(statusPublicKey)),
         ...(this.#attestedAdmission ? {
           normativePhysicalAdmissionDigest: this.#attestedAdmission.policyDigest(),
+          physicalFenceSchema: "operation-id-v2",
         } : {}),
       });
       if (exists) {
@@ -240,7 +241,7 @@ class Zk1WitnessCasAnchorFloor {
           db.exec(`CREATE TABLE witness_cas_inventory_fence (
             sequence INTEGER PRIMARY KEY CHECK(sequence>=1),
             cas_hash TEXT NOT NULL, scope TEXT NOT NULL,
-            inventory_sequence INTEGER, inventory_root TEXT,
+            operation_id TEXT, inventory_sequence INTEGER, inventory_root TEXT,
             snapshot BLOB, signature BLOB NOT NULL);`);
         }
         db.prepare("INSERT INTO witness_cas_floor_identity VALUES(1,?)").run(this.#identity);
@@ -289,7 +290,9 @@ class Zk1WitnessCasAnchorFloor {
             || !crypto.verify(null, physicalFenceMessage(row),
               crypto.createPublicKey(this.#witness), row.signature)) fail();
           if (source.status === "committed") {
-            if (!Number.isSafeInteger(row.inventory_sequence)
+            if (typeof row.operation_id !== "string"
+              || !/^[a-f0-9]{32}$/.test(row.operation_id)
+              || !Number.isSafeInteger(row.inventory_sequence)
               || row.inventory_sequence < 1 || !validHex(row.inventory_root)
               || !Buffer.isBuffer(row.snapshot)
               || row.snapshot.length < 1
@@ -303,7 +306,8 @@ class Zk1WitnessCasAnchorFloor {
                 root: Buffer.from(row.inventory_root, "hex") },
               snapshot: Buffer.from(row.snapshot),
             });
-          } else if (row.inventory_sequence !== null || row.inventory_root !== null
+          } else if (row.operation_id !== null || row.inventory_sequence !== null
+            || row.inventory_root !== null
             || row.snapshot !== null) fail();
           physicalChain.update(physicalFenceEvidence(row));
         }
@@ -550,6 +554,8 @@ class Zk1WitnessCasAnchorFloor {
         }, evidence[i], pendingHeads.get(record.scope));
         if (record.status === "committed") {
           if (!verified.physicallyCommitted || !verified.localReadbackConfirmed
+            || !Buffer.isBuffer(verified.operationId)
+            || verified.operationId.length !== 16
             || verified.inventoryScope !== record.scope
             || !Number.isSafeInteger(verified.inventorySequence)
             || verified.inventorySequence < 1
@@ -579,7 +585,7 @@ class Zk1WitnessCasAnchorFloor {
       const existing = this.#db.prepare("SELECT hash,line FROM witness_cas_floor_event WHERE sequence=?");
       const insert = this.#db.prepare("INSERT INTO witness_cas_floor_event VALUES(?,?,?,?)");
       const insertFence = verifiedPhysical ? this.#db.prepare(
-        "INSERT INTO witness_cas_inventory_fence VALUES(?,?,?,?,?,?,?)") : null;
+        "INSERT INTO witness_cas_inventory_fence VALUES(?,?,?,?,?,?,?,?)") : null;
       const existingBytes = verifiedPhysical ? this.#db.prepare(
         "SELECT COALESCE(SUM(length(snapshot)),0) AS total FROM witness_cas_inventory_fence").get().total : 0;
       let totalSnapshotBytes = existingBytes;
@@ -600,11 +606,12 @@ class Zk1WitnessCasAnchorFloor {
           if (totalSnapshotBytes > 64 * 1024 * 1024) fail();
           const fence = { sequence: item.sequence, cas_hash: item.lastHash,
             scope: item.scope,
+            operation_id: committed ? verified.operationId.toString("hex") : null,
             inventory_sequence: committed ? verified.inventorySequence : null,
             inventory_root: committed ? verified.inventoryRoot.toString("hex") : null,
             snapshot, signature: null };
           fence.signature = crypto.sign(null, physicalFenceMessage(fence), this.#witness);
-          insertFence.run(fence.sequence, fence.cas_hash, fence.scope,
+          insertFence.run(fence.sequence, fence.cas_hash, fence.scope, fence.operation_id,
             fence.inventory_sequence, fence.inventory_root, fence.snapshot, fence.signature);
           insertedFences.push(fence);
         }
