@@ -13,6 +13,8 @@ const authorization = require("../sync-client/rootark-sync-authorization");
 test("Sync v2 CLI verifies real signed incoming operations and rejects absent or forged authorization", async () => {
   const keys = crypto.generateKeyPairSync("ed25519");
   const publicKey = keys.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const revokedKeys = crypto.generateKeyPairSync("ed25519");
+  const revokedPublicKey = revokedKeys.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
   const operation = protocol.createOperation({ operation: "create", objectId: "signed-incoming",
     deviceId: "device1", keyEpoch: "epoch1", compartmentId: "private",
     revision: { counter: 1, deviceId: "device1" },
@@ -25,7 +27,9 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
     { username: "alice" }), true, "test fixture must have a genuine Ed25519 proof");
 
   const config = { serverUrl: "https://unused.invalid", localFolder: path.resolve("unused-sync-v2"),
-    token: "not-used", username: "alice", deviceId: "device1", keyEpoch: "epoch1" };
+    token: "not-used", username: "alice", deviceId: "device1", keyEpoch: "epoch1",
+    trustedDevicePublicKeys: { device1: publicKey, revoked1: revokedPublicKey },
+    revokedDeviceIds: ["revoked1"] };
   let engineOptions = null;
   class FakeEngine {
     constructor(options) { engineOptions = options; }
@@ -56,6 +60,24 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
   await sandboxModule.exports.start({ config: "not-opened.json", once: true });
   assert.ok(engineOptions && engineOptions.requireAuthorization === true);
   assert.equal(await engineOptions.verifyIncoming(signedIncoming), true);
+  // A perfectly valid Ed25519 signature by an attacker must not enroll its
+  // self-asserted public key as the trusted device1 authority.
+  const attacker = crypto.generateKeyPairSync("ed25519");
+  const attackerPublicKey = attacker.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const impostor = await authorization.createAuthorizationProof(operation, {
+    username: "alice", privateKey: attacker.privateKey, publicKey: attackerPublicKey });
+  await assert.rejects(engineOptions.verifyIncoming({ ...operation, authorization: impostor }),
+    { code: "authorization_device_untrusted" });
+  const revokedOperation = protocol.createOperation({ operation: "create", objectId: "revoked-incoming",
+    deviceId: "revoked1", keyEpoch: "epoch1", compartmentId: "private",
+    revision: { counter: 1, deviceId: "revoked1" },
+    metadata: { path: "revoked.txt" }, plaintext: Buffer.from("denied"),
+    fileKey: crypto.randomBytes(32) });
+  const revokedSignature = await authorization.createAuthorizationProof(revokedOperation, {
+    username: "alice", privateKey: revokedKeys.privateKey, publicKey: revokedPublicKey });
+  await assert.rejects(engineOptions.verifyIncoming({
+    ...revokedOperation, authorization: revokedSignature }),
+  { code: "authorization_device_revoked" });
   assert.equal(await engineOptions.verifyIncoming({ ...operation }), false,
     "missing authorization must fail closed");
   await assert.rejects(engineOptions.verifyIncoming({ ...signedIncoming,

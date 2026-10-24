@@ -377,7 +377,11 @@ class SyncEngine {
   }
 
   async verifyIncomingOperation(operation) {
-    if (this.verifyIncoming && await this.verifyIncoming(operation) !== true) fail("Remote sync authorization rejected", "remote_authorization_rejected");
+    if (!this.verifyIncoming) {
+      if (this.requireAuthorization) fail("Remote sync authorization verifier is required", "remote_authorization_rejected");
+      return;
+    }
+    if (await this.verifyIncoming(operation) !== true) fail("Remote sync authorization rejected", "remote_authorization_rejected");
   }
 
   isInScope(relativePath) {

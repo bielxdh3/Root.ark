@@ -262,6 +262,18 @@ Backups are not useful until restore behavior is tested. Read [BACKUP.md](BACKUP
 | `npm run sync:init` | Initialize the local sync client |
 | `npm run sync:start` | Start the local sync client |
 
+The protocol-v2 `sync:start` configuration must contain an independently
+provisioned `trustedDevicePublicKeys` object mapping every authorized remote
+`deviceId` to its canonical Ed25519 public key (DER SPKI, base64url), plus
+an explicit `revokedDeviceIds` array (empty if no devices are revoked).
+Neither field is learned from incoming ciphertext or its self-signed proof.
+Missing pins or revocation state fail closed. Provision these values through
+an authenticated owner-controlled process; accepting a key advertised in
+the incoming operation as its own trust pin defeats device authentication.
+These **local snapshots** do not establish a fresh owner epoch or prevent
+rollback of the configuration. Distributed revocation still requires an
+independent monotonic owner-history anchor; this is not a production GO.
+
 ## Validation
 
 Run the full repository validation before trusting a change:

@@ -102,6 +102,22 @@ async function verifyAuthorizationProof(proof, operation, expected = {}) {
   if (normalized.schemaVersion !== 1 || normalized.type !== "rootark-sync-device-authorization-v1" || normalized.suite !== zk.SUITE_ID) fail("Unsupported authorization proof");
   if (normalized.expiresAt < Date.now()) fail("Authorization expired", "authorization_expired");
   if (normalized.protocolVersion !== operation.protocolVersion || normalized.username !== expected.username || normalized.deviceId !== operation.deviceId) fail("Authorization scope mismatch", "authorization_scope");
+  if (expected.trustedDevicePublicKeys !== undefined) {
+    const pins = expected.trustedDevicePublicKeys;
+    const pinned = pins && typeof pins === "object" && !Array.isArray(pins)
+      && Object.hasOwn(pins, normalized.deviceId) ? pins[normalized.deviceId] : null;
+    // A signed envelope proves control of the *supplied* key. Authorization
+    // also requires an independently provisioned device-to-key binding.
+    if (typeof pinned !== "string" || pinned !== normalized.publicKey) {
+      fail("Device signing key is not trusted", "authorization_device_untrusted");
+    }
+  }
+  if (expected.revokedDeviceIds !== undefined) {
+    if (!Array.isArray(expected.revokedDeviceIds)
+      || expected.revokedDeviceIds.includes(normalized.deviceId)) {
+      fail("Device has been revoked or revocation state is invalid", "authorization_device_revoked");
+    }
+  }
   const expectedCore = proofCore(operation, { username: normalized.username, publicKey: normalized.publicKey, expiresAt: normalized.expiresAt, replayId: normalized.replayId, idempotencyKey: normalized.idempotencyKey });
   for (const field of ["operationId", "objectId", "fileId", "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId", "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest"]) {
     if (JSON.stringify(normalized[field]) !== JSON.stringify(expectedCore[field])) fail("Authorization payload mismatch", "authorization_scope");

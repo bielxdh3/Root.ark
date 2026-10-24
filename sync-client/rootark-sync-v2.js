@@ -31,6 +31,26 @@ async function readConfig(filePath) {
   const privateKeyBytes = process.env.ROOTARK_SYNC_DEVICE_PRIVATE_KEY ? Buffer.from(process.env.ROOTARK_SYNC_DEVICE_PRIVATE_KEY, "base64url") : null;
   const publicKey = process.env.ROOTARK_SYNC_DEVICE_PUBLIC_KEY || "";
   if (!privateKeyBytes || !publicKey) throw new Error("Sync v2 requires device signing keys held only in memory");
+  const pins = config.trustedDevicePublicKeys;
+  if (!pins || typeof pins !== "object" || Array.isArray(pins) || !Object.keys(pins).length) {
+    throw new Error("Sync v2 requires independently provisioned trustedDevicePublicKeys");
+  }
+  for (const [deviceId, spki] of Object.entries(pins)) {
+    if (!deviceId || deviceId.length > 512 || typeof spki !== "string") {
+      throw new Error("Sync v2 trusted device pin is invalid");
+    }
+    const bytes = Buffer.from(spki, "base64url");
+    if (bytes.toString("base64url") !== spki
+      || bytes.length !== 44
+      || crypto.createPublicKey({ key: bytes, format: "der", type: "spki" }).asymmetricKeyType !== "ed25519") {
+      throw new Error("Sync v2 trusted device pin must be canonical Ed25519 SPKI");
+    }
+  }
+  if (!Array.isArray(config.revokedDeviceIds)
+    || config.revokedDeviceIds.some((id) => typeof id !== "string"
+      || !id || id.length > 512)) {
+    throw new Error("Sync v2 requires an explicit revokedDeviceIds snapshot");
+  }
   return { ...config, serverUrl: String(config.serverUrl).replace(/\/+$/, ""), localFolder: path.resolve(config.localFolder), fileKey, privateKey: crypto.createPrivateKey({ key: privateKeyBytes, format: "der", type: "pkcs8" }), publicKey };
 }
 
@@ -55,9 +75,13 @@ async function start(options = {}) {
     compartmentId: config.compartmentId || "private",
     fileKeyResolver: fileKeyResolver(config.fileKey, config.keyEpoch),
     authorize: async (operation) => operation.keyEpoch === config.keyEpoch,
-    authorizeOutgoing: async (operation) => config.deviceRevoked !== true && operation.deviceId === config.deviceId,
+    authorizeOutgoing: async (operation) => config.deviceRevoked !== true
+      && !config.revokedDeviceIds.includes(config.deviceId)
+      && operation.deviceId === config.deviceId,
     verifyIncoming: async (operation) => operation.authorization
-      ? verifyAuthorizationProof(operation.authorization, operation, { username: config.username })
+      ? verifyAuthorizationProof(operation.authorization, operation, {
+        username: config.username, trustedDevicePublicKeys: config.trustedDevicePublicKeys,
+        revokedDeviceIds: config.revokedDeviceIds })
       : false,
     authorizationFactory: (operation) => createAuthorizationProof(operation, { username: config.username, privateKey: config.privateKey, publicKey: config.publicKey }),
     requireAuthorization: true,
