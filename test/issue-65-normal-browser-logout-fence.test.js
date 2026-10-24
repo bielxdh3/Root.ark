@@ -839,7 +839,8 @@ async function configureDeltaPage(page) {
   const portable = { format: "rootark-zk1-opaque-device-delta/v1",
     fromSequence: 0, toSequence: 1, catalogDigest: encode(crypto.randomBytes(32)),
     additions: [item] };
-  let anchorCalls = 0, deltaCalls = 0, mutationCalls = 0, listingCalls = 0, resolveDelta = null;
+  let anchorCalls = 0, deltaCalls = 0, mutationCalls = 0, listingCalls = 0,
+    trashCalls = 0, trashProofCalls = 0, baselineEntries = [], resolveDelta = null;
   let pendingDelta = false, uncertainCommit = false;
   const used = [];
   page.window.RootarkZk1OpaqueDeviceDeltaSync = {
@@ -853,7 +854,7 @@ async function configureDeltaPage(page) {
         async readCurrent() {
           anchorCalls++;
           assertLive();
-          return { head: { sequence: 0, digest: floor }, entries: [],
+          return { head: { sequence: 0, digest: floor }, entries: baselineEntries,
             plaintextMetadataExposed: false, independentCloudDurabilityProven: false };
         },
         async pullDelta(previous) {
@@ -876,6 +877,26 @@ async function configureDeltaPage(page) {
               name: "<private-name>&.txt" }],
             independentlySignedCatalog: true, plaintextSentToServer: false,
             authorizesMutation: false };
+        },
+        async trashVersion(args) {
+          trashCalls++;
+          assert.equal(args.previous.head.digest, floor);
+          assert.equal(args.expectedRevision, 1);
+          assert.equal(args.metadataKey.extractable, false);
+          assert.deepEqual(args.metadataKey.usages, ["encrypt", "decrypt"]);
+          assertLive();
+          return { state: "trashed", tombstoneSignedAndSealed: true,
+            originalHistoryPreserved: true, serverPlaintextExposed: false,
+            journalClearedAfterSignedProof: true, sequence: 1, revision: 2 };
+        },
+        async readTrash(args) {
+          trashProofCalls++;
+          assert.equal(args.previous.head.digest, floor);
+          assert.equal(args.metadataKey.extractable, false);
+          assertLive();
+          return { state: "trashed", signedByAuthorizedDevice: true,
+            originalHistoryPreserved: true, serverPlaintextExposed: false,
+            revision: 2, retainedHistoricalVersions: 1 };
         },
         async commitVersion(args) {
           mutationCalls++;
@@ -906,6 +927,11 @@ async function configureDeltaPage(page) {
       page.file("catalog-cas-key", casKeyBytes);
     },
     counts: () => ({ anchorCalls, deltaCalls, mutationCalls }),
+    trashCounts: () => ({ trashCalls, trashProofCalls }),
+    withCurrentVersion() {
+      baselineEntries = [{ objectId: portable.additions[0].objectId,
+        revision: 1, epoch: 1 }];
+    },
     getListingCalls: () => listingCalls,
     stall() { pendingDelta = true; },
     loseCatalogAck() { uncertainCommit = true; },
@@ -934,6 +960,49 @@ test("manual signed-catalog private listing stays in text nodes and clears on lo
   assert.equal(setup.getListingCalls(), 1);
   page.logout();
   assert.deepEqual(page.field("catalog-delta-private-list").children, []);
+});
+
+test("manual logical trash requires consent and consumes its signed CAS anchor only once", async () => {
+  const page = await harness();
+  const setup = await configureDeltaPage(page);
+  setup.withCurrentVersion();
+  page.field("catalog-write-id").value = setup.portable.additions[0].objectId;
+  page.field("catalog-delta-opt-in").checked = false;
+  page.file("catalog-write-key", crypto.randomBytes(32));
+  page.click("catalog-delta-trash");
+  await page.denied();
+  assert.deepEqual(setup.trashCounts(), { trashCalls: 0, trashProofCalls: 0 });
+  setup.reimportOfflineFiles();
+  page.field("catalog-delta-opt-in").checked = true;
+  page.click("catalog-delta-anchor");
+  await tickUntil(() => page.field("status").textContent.includes("Piso independente CAS #0"));
+  page.file("catalog-write-key", crypto.randomBytes(32));
+  page.click("catalog-delta-trash");
+  await tickUntil(() => page.field("status").textContent.includes("Tombstone AES-GCM/Ed25519"));
+  assert.equal(setup.trashCounts().trashCalls, 1);
+  assert.equal(page.downloads.length, 0);
+  page.file("catalog-write-key", crypto.randomBytes(32));
+  page.click("catalog-delta-trash");
+  await page.denied();
+  assert.equal(setup.trashCounts().trashCalls, 1, "consumed trash anchor must not replay a PUT");
+});
+
+test("manual tombstone verification exposes history counts without requiring server plaintext", async () => {
+  const page = await harness();
+  const setup = await configureDeltaPage(page);
+  page.field("catalog-write-id").value = setup.portable.additions[0].objectId;
+  page.click("catalog-delta-trash-inspect");
+  await page.denied();
+  assert.equal(setup.trashCounts().trashProofCalls, 0);
+  setup.reimportOfflineFiles();
+  page.click("catalog-delta-anchor");
+  await tickUntil(() => page.field("status").textContent.includes("Piso independente CAS #0"));
+  page.file("catalog-write-key", crypto.randomBytes(32));
+  page.click("catalog-delta-trash-inspect");
+  await tickUntil(() => page.field("status").textContent.includes("Tombstone cifrado e assinado"));
+  assert.equal(setup.trashCounts().trashProofCalls, 1);
+  assert.equal(page.field("catalog-delta-summary").textContent.includes("1 versões históricas"), true);
+  assert.equal(page.downloads.length, 0);
 });
 
 test("manual opaque delta anchor blocks absent consent and wrong independent CAS key pin", async () => {

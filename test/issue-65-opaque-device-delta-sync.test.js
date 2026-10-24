@@ -54,9 +54,13 @@ test("real Edge runs opaque delta browser contract under restrictive CSP", {
   const name = "edge-local-only-filename.txt";
   const sealed = await sealZk1CatalogMetadataV1({ scope, objectId,
     revision: 1, epoch: 1, metadataKey, name });
+  const trashMetadata = await sealZk1CatalogMetadataV1({ scope, objectId,
+    revision: 2, epoch: 1, metadataKey,
+    name: "\uE000rootark-zk1-logical-trash/v1" });
   const fixture = { scope: Object.fromEntries(Object.entries(scope)
     .map(([key, value]) => [key, value.toString("base64url")])),
   objectId, name, ciphertextBase64: sealed.toString("base64url"),
+  trashMetadataBase64: trashMetadata.toString("base64url"),
   metadataKeyBase64: metadataKey.toString("base64url") };
   const startup = "window.__deltaCryptoFixture=" + JSON.stringify(fixture) + ";"
     + "window.RootarkZk1ProtectedHttpClient={signProtectedContentOperation(){}};"

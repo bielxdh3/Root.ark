@@ -64,3 +64,41 @@ This is **not** automatic sync, durable server-side application of names,
 change conflict resolution, rename/move/trash, or proof of cloud persistence.
 Only the independently signed, append-only opaque catalog is inspected; no
 unknown legacy corpus or remote deletion becomes authorized.
+
+## Owner-witnessed logical trash (DEV; additive only)
+
+The manually anchored normal-browser delta control now supports a **single**
+logical trash for an existing current object/version. The user separately
+supplies a non-extractable AES-GCM metadata key with encrypt+decrypt usage,
+an exact offline-pinned CAS floor, a current owner-signed device grant, and
+independent witness/CAS authority. The browser verifies current signed catalog
+pages and decrypts the preceding metadata locally; if already trashed, or a
+revision/epoch/key/CAS floor conflicts, it refuses **before** write. It then
+signs an Ed25519 statement naming the encrypted predecessor digest and metadata
+digest, exact precommit CAS sequence/digest, scope, device, revision, epoch,
+owner head and one-use nonce. The statement and signature are encrypted with
+AES-GCM under a domain-separated AAD before they cross the protected HTTP
+boundary. A separate encrypted metadata marker identifies the new append-only
+tombstone row **inside the browser only**. Generic version publishing cannot
+select this marker.
+
+The existing durable local intent → single protected PUT → exact signed GET →
+one CAS commit/readback → journal confirmation remains the sole publication
+path. No DELETE endpoint is invoked and all old ciphertext versions remain
+in the signed catalog and recoverable through their original historic exact
+GET. A second authorized device can opt into checking the signed tombstone:
+fresh current owner/witness/CAS and full catalog, AEAD open, Ed25519 signer
+signature, previous CAS link, parent metadata/ciphertext digest, historical
+version retention and a final signed head readback are all mandatory. Fork,
+revoked grant, wrong metadata key, tampered signed tombstone, stale head and
+second trash attempt fail closed. UI never renders encrypted internal marker
+as a filename; the name/key/operation class are never posted as plaintext.
+
+The tombstone is **logical only**; it is not physical deletion, GC, provider
+durability proof, restoration of a trashed file, rename/move or general
+bidirectional sync/conflict convergence. Uncertain PUT/CAS intentionally
+requires independent reconciliation, not an automatic retry.
+Inspection of a tombstone created under an older epoch remains fail-closed
+after owner rotation until an independently witnessed historical signer/
+epoch proof and catalog re-endorsement are implemented; the encrypted
+historical versions are **not** removed.

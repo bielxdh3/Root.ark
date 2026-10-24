@@ -798,8 +798,10 @@
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-anchor">Ancorar CAS assinado atual</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-pull">Conferir e exportar delta cifrado</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-list">Listar nomes localmente (AES-GCM)</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-trash-inspect">Conferir tombstone assinado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-import">Importar e comparar delta com GET assinado</button>'
-      + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-publish">Publicar nova versão cifrada via journal → PUT → CAS</button></div>'
+      + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-publish">Publicar nova versão cifrada via journal → PUT → CAS</button>'
+      + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-trash">Trash lógico (nova revisão assinada, sem deletar histórico)</button></div>'
       + '<div data-zk1-field="catalog-delta-private-list" role="region" aria-label="Nomes locais abertos após CAS e witness assinados"></div>'
       + '<output data-zk1-field="catalog-delta-summary" role="status" aria-live="polite"></output>'
       + '</fieldset>'
@@ -934,7 +936,7 @@
       "catalog-discover", "catalog-page", "catalog-get", "catalog-publish",
       "catalog-lifecycle", "catalog-v2-read", "catalog-v2-get",
       "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-pull", "catalog-delta-import",
-      "catalog-delta-publish"].includes(action)) return;
+      "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect"].includes(action)) return;
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -1071,7 +1073,7 @@
       const trust = await grantAndOwner();
       assertLive();
       if (["catalog-delta-list", "catalog-delta-pull", "catalog-delta-import",
-        "catalog-delta-publish"].includes(action)) {
+        "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect"].includes(action)) {
         if (available.opaqueCatalogV1 !== true
           || field("catalog-delta-opt-in")?.checked !== true
           || trust.signedDeviceGrant.revoked_at_epoch !== null
@@ -1097,6 +1099,53 @@
         assertLive();
         if (action !== "catalog-delta-list")
           field("catalog-delta-private-list")?.replaceChildren();
+        if (action === "catalog-delta-trash" || action === "catalog-delta-trash-inspect") {
+          const objectId = field("catalog-write-id")?.value.trim();
+          if (!/^[A-Za-z0-9_-]{22}$/.test(objectId)) fail();
+          const raw = await fileBytes("catalog-write-key", 32, 32);
+          let metadataKey;
+          try { metadataKey = await crypto.subtle.importKey("raw", raw,
+            { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]); }
+          finally { raw.fill(0); }
+          if (action === "catalog-delta-trash-inspect") {
+            const result = await held.client.readTrash({
+              previous: held.baseline, objectId, metadataKey });
+            assertLive();
+            if (result.state !== "trashed" || result.signedByAuthorizedDevice !== true
+              || result.originalHistoryPreserved !== true
+              || result.serverPlaintextExposed !== false) fail();
+            field("catalog-delta-summary").textContent = "Tombstone autenticado · revisão "
+              + result.revision + " · " + result.retainedHistoricalVersions
+              + " versões históricas preservadas";
+            status("Tombstone cifrado e assinado conferido contra GET exato, witness e CAS. "
+              + "Nenhuma restauração ou deleção física.");
+            return;
+          }
+          const source = held.baseline.entries.filter((row) => row.objectId === objectId);
+          if (!source.length) fail();
+          const expectedRevision = Math.max(...source.map((item) => item.revision));
+          // No second mutation may reuse this owner's signed CAS anchor.
+          verifiedOpaqueDelta = null;
+          let result;
+          try { result = await held.client.trashVersion({
+            previous: held.baseline, objectId, expectedRevision, metadataKey }); }
+          catch (error) {
+            if (typeof error?.outcome?.journalId === "string"
+              && /^[A-Za-z0-9_-]{43}$/.test(error.outcome.journalId))
+              field("catalog-write-journal").textContent = error.outcome.journalId;
+            throw error;
+          }
+          assertLive();
+          if (result.state !== "trashed" || result.tombstoneSignedAndSealed !== true
+            || result.originalHistoryPreserved !== true
+            || result.serverPlaintextExposed !== false
+            || result.journalClearedAfterSignedProof !== true) fail();
+          field("catalog-delta-summary").textContent = "Trash lógico · CAS #"
+            + result.sequence + " · revisão " + result.revision;
+          status("Tombstone AES-GCM/Ed25519 publicado em nova revisão: PUT uma vez, "
+            + "GET exato e CAS assinado. Histórico imutável permanece; nenhum delete físico.");
+          return;
+        }
         if (action === "catalog-delta-list") {
           // The metadata key is imported for DECRYPT only and never exported
           // or sent to the server. Render via textContent, never HTML.
@@ -1117,9 +1166,12 @@
             || !Array.isArray(opened.entries)) fail();
           const content = document.createDocumentFragment();
           for (const entry of opened.entries) {
-            if (typeof entry.name !== "string" || !entry.name) fail();
+            if ((typeof entry.name !== "string" || !entry.name)
+              && !(entry.name === null && entry.logicalTrashCandidate === true)) fail();
             const item = document.createElement("div");
-            item.textContent = entry.name + " · revisão " + entry.revision;
+            item.textContent = (entry.logicalTrashCandidate === true
+              ? "Lixeira lógica (verifique o tombstone assinado)" : entry.name)
+              + " · revisão " + entry.revision;
             content.appendChild(item);
           }
           assertLive();

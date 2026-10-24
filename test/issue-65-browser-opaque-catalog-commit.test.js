@@ -404,18 +404,112 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   } });
   await assert.rejects(midflight.readAll(), /ZK_BROWSER_CATALOG_UNVERIFIED/);
   active = true;
+  // Full protected E2E: append a device-signed encrypted tombstone under the
+  // current owner/witness/CAS, never removing either historical revision.
+  const privateWire = [];
+  const tombstoneWriter = await syncClient(0, { fetchImpl: async (url, options) => {
+    if (url.endsWith("/content/put") || url.endsWith("/catalog/commit")) {
+      privateWire.push(String(options.body));
+    }
+    return fetchImpl(url, options);
+  } });
+  const trashBase = await tombstoneWriter.readCurrent();
+  const tombstoneReader = await syncClient(1);
+  const readerBase = await tombstoneReader.readCurrent();
+  assert.equal(trashBase.head.sequence, 2);
+  const unprivilegedMarker = await syncClient(1);
+  const markerHead = await unprivilegedMarker.readCurrent();
+  const markerPutCount = putRequests;
+  await assert.rejects(unprivilegedMarker.commitVersion({
+    previous: markerHead, objectId, expectedRevision: 2, revision: 3, epoch: 1,
+    ciphertext: nodeCrypto.randomBytes(64),
+    name: "\uE000rootark-zk1-logical-trash/v1", metadataKey: cryptoMeta,
+  }), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "generic signed version PUT may never forge a reserved tombstone marker");
+  assert.equal(putRequests, markerPutCount);
+  const initialPutCount = putRequests, initialCommitCount = commits;
+  losePutAck = true; loseAck = true;
+  const trashed = await tombstoneWriter.trashVersion({ previous: trashBase,
+    objectId, expectedRevision: 2,
+    metadataKey: await crypto.subtle.importKey("raw", metadataKey,
+      "AES-GCM", false, ["encrypt", "decrypt"]) });
+  assert.equal(trashed.state, "trashed");
+  assert.equal(trashed.revision, 3);
+  assert.equal(trashed.journalClearedAfterSignedProof, true);
+  assert.equal(putRequests, initialPutCount + 1);
+  assert.equal(commits, initialCommitCount + 1);
+  assert.equal(privateWire.length, 2);
+  assert.doesNotMatch(privateWire.join(" "), /sensitive\/private|opaque-logical-trash|trash\/v1/,
+    "server sees only encrypted payload and metadata, never filenames or lifecycle");
+  const historyReader = await client(1);
+  const catalogAfterTrash = await historyReader.readAll();
+  assert.deepEqual(catalogAfterTrash.rows.map((row) => row.revision), [1, 2, 3],
+    "append-only signed CAS retains every protected historical revision");
+  assert.deepEqual(Buffer.from((await historyReader.readVerifiedCiphertext(
+    catalogAfterTrash, objectId, 1)).ciphertextBase64, "base64url"), firstCipher);
+  assert.deepEqual(Buffer.from((await historyReader.readVerifiedCiphertext(
+    catalogAfterTrash, objectId, 2)).ciphertextBase64, "base64url"), secondCipher);
+  const freshTrashReader = await syncClient(1);
+  const latestTrash = await freshTrashReader.readCurrent();
+  const ownerMetadataKey = await crypto.subtle.importKey("raw", metadataKey,
+    "AES-GCM", false, ["encrypt", "decrypt"]);
+  const signedTombstone = await freshTrashReader.readTrash({
+    previous: latestTrash, objectId, metadataKey: ownerMetadataKey });
+  assert.equal(signedTombstone.signedByAuthorizedDevice, true);
+  assert.equal(signedTombstone.retainedHistoricalVersions, 2);
+  const forgedGetReader = await syncClient(1, { fetchImpl: async (url, options) => {
+    const response = await fetchImpl(url, options);
+    if (!url.endsWith("/content/read") || response.status !== 200) return response;
+    const wire = await response.json();
+    wire.ciphertextBase64 = b64(nodeCrypto.randomBytes(110));
+    return new Response(JSON.stringify(wire), { status: 200,
+      headers: { "content-type": "application/json" } });
+  } });
+  const forgedGetHead = await forgedGetReader.readCurrent();
+  await assert.rejects(forgedGetReader.readTrash({ previous: forgedGetHead,
+    objectId, metadataKey: ownerMetadataKey }), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "forged protected GET cannot turn opaque encrypted metadata into a valid trash");
+  const forkReader = await syncClient(1);
+  const forkBaseline = await forkReader.readCurrent();
+  const realHeadDigest = Buffer.from(currentDigest);
+  currentDigest = nodeCrypto.randomBytes(32);
+  await assert.rejects(forkReader.readTrash({ previous: forkBaseline,
+    objectId, metadataKey: ownerMetadataKey }), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "same-sequence CAS fork must fail before archived tombstone inspection");
+  currentDigest = realHeadDigest;
+  const listingAfterTrash = await freshTrashReader.readPrivateListing(
+    latestTrash, ownerMetadataKey);
+  assert.equal(listingAfterTrash.entries[2].name, null);
+  assert.equal(listingAfterTrash.entries[2].logicalTrashCandidate, true);
+  const badTombstoneReader = await syncClient(1);
+  const badBase = await badTombstoneReader.readCurrent();
+  await assert.rejects(badTombstoneReader.readTrash({ previous: badBase, objectId,
+    metadataKey: await crypto.subtle.importKey("raw", nodeCrypto.randomBytes(32),
+      "AES-GCM", false, ["encrypt", "decrypt"]) }), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "wrong owner-held key refuses the entire tombstone");
+  await assert.rejects(tombstoneWriter.trashVersion({ previous: trashBase,
+    objectId, expectedRevision: 2, metadataKey: ownerMetadataKey }),
+  /ZK_OPAQUE_DELTA_SYNC_DENIED/, "same anchor cannot reissue a signed trash");
+  const competingTrash = await syncClient(1);
+  const competingTrashBase = await competingTrash.readCurrent();
+  await assert.rejects(competingTrash.trashVersion({ previous: competingTrashBase,
+    objectId, expectedRevision: 3, metadataKey: ownerMetadataKey }),
+  /ZK_OPAQUE_DELTA_SYNC_DENIED/, "newest signed tombstone cannot be trashed twice");
+  await assert.rejects(tombstoneReader.readTrash({ previous: readerBase,
+    objectId, metadataKey: ownerMetadataKey }), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "stale signed CAS must not accept a future tombstone");
   const planned = await client(1);
   const revision3 = nodeCrypto.randomBytes(90);
-  const plannedIntent = await planned.prepareIntent([{ objectId, revision: 3,
+  const plannedIntent = await planned.prepareIntent([{ objectId, revision: 4,
     epoch: 1, ciphertext: revision3 }]);
-  await put(1, objectId, revision3, 2);
+  await put(1, objectId, revision3, 3);
   const unlistedId = b64(nodeCrypto.randomBytes(16));
   await put(1, unlistedId, nodeCrypto.randomBytes(72));
   const competing = await client(1);
-  await assert.rejects(competing.commit([{ ...rowInput, revision: 3,
+  await assert.rejects(competing.commit([{ ...rowInput, revision: 4,
     ciphertext: revision3 }], plannedIntent), /ZK_BROWSER_CATALOG_UNVERIFIED/,
   "an additional PUT after the pre-write journal cannot be silently omitted");
-  assert.equal(sequence, 2, "CAS must not advance when server inventory contains an unlisted write");
+  assert.equal(sequence, 3, "CAS must not advance when server inventory contains an unlisted write");
   await fixture.appendDeviceRevocation(state, "trusted-0");
   manifest = state.headManifest;
   ownerHistory = await history.verifyRecoveryHistoryPublicV2({
@@ -425,6 +519,9 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   });
   await assert.rejects(second.readAll(), /ZK_BROWSER_CATALOG_UNVERIFIED/,
     "owner witness must reject stale grants after revocation");
+  await assert.rejects(freshTrashReader.readTrash({
+    previous: latestTrash, objectId, metadataKey: ownerMetadataKey }),
+  /ZK_OPAQUE_DELTA_SYNC_DENIED/, "revoked owner grant cannot inspect historical tombstone");
   await assert.rejects(producer.pullDelta(producerBefore),
     /ZK_OPAQUE_DELTA_SYNC_DENIED/, "revoked source device cannot accept a later delta");
 });

@@ -17,6 +17,11 @@
     // filesystem path crosses the wire. A delta covers ONE signed CAS successor
     // only; an unproven gap/fork is not interpreted as a set of changes.
     const MAX = 4 * 1024 * 1024;
+    const TRASH_NAME = "\uE000rootark-zk1-logical-trash/v1";
+    const TRASH_TYPE = "rootark-zk1-opaque-logical-trash/v1";
+    const TRASH_DOMAIN = new TextEncoder().encode("Root.ark/zk-1/opaque-logical-trash/v1\0");
+    const TRASH_AAD = "Root.ark/zk-1/opaque-logical-trash-aead/v1\0";
+    const te = new TextEncoder(), td = new TextDecoder("utf-8", { fatal: true });
     const tracked = new WeakMap();
     function deny() { throw new Error("ZK_OPAQUE_DELTA_SYNC_DENIED"); }
     function exact(value, keys) {
@@ -59,6 +64,34 @@
       return Object.freeze({ objectId: row.object_id, revision: row.revision,
         epoch: row.epoch, ciphertextDigestBase64: b64(bytes(row.ciphertext_digest, 32)),
         metadataCiphertextBase64: b64(bytes(row.metadata_ciphertext, 284)) });
+    }
+    function metadataKey(key) {
+      if (!key || key.type !== "secret" || key.algorithm?.name !== "AES-GCM"
+        || key.algorithm.length !== 256 || key.extractable !== false
+        || !key.usages?.includes("encrypt") || !key.usages?.includes("decrypt")) deny();
+      return key;
+    }
+    function trashAad(scope, objectId, revision, epoch) {
+      return te.encode(TRASH_AAD + JSON.stringify({ ...scope, objectId, revision, epoch }));
+    }
+    function scopeFor(grant) {
+      return Object.fromEntries(["account_id", "compartment_id", "keyring_id"]
+        .map((key) => [key, grant[key]]));
+    }
+    async function sealTrash(statement, signer, key) {
+      const unsigned = te.encode(JSON.stringify(statement));
+      const signature = new Uint8Array(await crypto.subtle.sign("Ed25519",
+        signer, new Uint8Array([...TRASH_DOMAIN, ...unsigned])));
+      const plaintext = te.encode(JSON.stringify({ statement, signature: b64(signature) }));
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      try {
+        const encrypted = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv,
+          additionalData: trashAad(scopeFor(statement), statement.objectId,
+            statement.revision, statement.epoch), tagLength: 128 }, key, plaintext));
+        const out = new Uint8Array(iv.length + encrypted.length);
+        out.set(iv); out.set(encrypted, iv.length);
+        return out;
+      } finally { plaintext.fill(0); unsigned.fill(0); signature.fill(0); }
     }
     function createClient(input) {
       exact(input, ["authority", "assertLive"]);
@@ -177,7 +210,9 @@
             });
             assertLive();
             entries.push(Object.freeze({ objectId: row.object_id,
-              revision: row.revision, epoch: row.epoch, name }));
+              revision: row.revision, epoch: row.epoch,
+              name: name === TRASH_NAME ? null : name,
+              logicalTrashCandidate: name === TRASH_NAME }));
           }
           assertLive();
           // One bad entry/key invalidates the ENTIRE list; no partial results.
@@ -187,7 +222,7 @@
             authorizesMutation: false });
         } catch (_) { deny(); }
       }
-      async function commitVersion(inputVersion) {
+      async function commitVersion(inputVersion, internalTrash = false) {
         let journalId = null, phase = "none", sealed = null;
         try {
           exact(inputVersion, ["previous", "objectId", "expectedRevision",
@@ -207,6 +242,7 @@
             || inputVersion.epoch !== trust.pinnedOwnerHead.epoch) deny();
           if (typeof inputVersion.name !== "string" || !inputVersion.name
             || inputVersion.name.length > 220) deny();
+          if ((inputVersion.name === TRASH_NAME) !== (internalTrash === true)) deny();
           sealed = bytes(inputVersion.ciphertext, 16, MAX);
           if (typeof inputVersion.objectId !== "string"
             || !/^[A-Za-z0-9_-]{22}$/.test(inputVersion.objectId)) deny();
@@ -292,7 +328,146 @@
           sealed?.fill(0);
         }
       }
-      return Object.freeze({ readCurrent, pullDelta, readPrivateListing, commitVersion });
+      async function trashVersion(inputTrash) {
+        let ciphertext = null;
+        try {
+          exact(inputTrash, ["previous", "objectId", "expectedRevision", "metadataKey"]);
+          const state = tracked.get(inputTrash.previous);
+          if (!state || state.owner !== writer || latest !== inputTrash.previous
+            || usedMutation || !Number.isSafeInteger(inputTrash.expectedRevision)
+            || inputTrash.expectedRevision < 1) deny();
+          const objectId = inputTrash.objectId;
+          if (typeof objectId !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(objectId)) deny();
+          from64(objectId, 16);
+          const rows = state.snapshot.rows.filter((row) => row.object_id === objectId);
+          const parent = rows.find((row) => row.revision === inputTrash.expectedRevision);
+          if (!parent || rows.some((row) => row.revision > parent.revision)
+            || !metadataKey(inputTrash.metadataKey)) deny();
+          assertLive();
+          const signed = await writer.readAll();
+          assertLive();
+          if (signed.head.sequence !== state.head.sequence
+            || !equal(bytes(signed.head.digest, 32), from64(state.head.digest, 32))
+            || signed.rows.length !== state.snapshot.rows.length) deny();
+          const signedParent = signed.rows.find((row) => row.object_id === objectId
+            && row.revision === parent.revision);
+          if (!signedParent || !equal(bytes(signedParent.ciphertext_digest, 32),
+            bytes(parent.ciphertext_digest, 32))
+            || !equal(bytes(signedParent.metadata_ciphertext, 284),
+              bytes(parent.metadata_ciphertext, 284))) deny();
+          // The owner's local key must authenticate the predecessor metadata;
+          // a duplicate tombstone cannot be mistaken for a live file.
+          const priorName = await catalog.openMetadata({ scope: trust.signedDeviceGrant,
+            objectId, revision: parent.revision, epoch: parent.epoch,
+            metadataKey: inputTrash.metadataKey,
+            ciphertext: bytes(parent.metadata_ciphertext, 284) });
+          assertLive();
+          if (priorName === TRASH_NAME) deny();
+          const scope = scopeFor(trust.signedDeviceGrant);
+          const statement = { format: TRASH_TYPE, ...scope,
+            deviceId: trust.signedDeviceGrant.device_id, objectId,
+            parentRevision: parent.revision, parentEpoch: parent.epoch,
+            parentDigest: b64(bytes(parent.ciphertext_digest, 32)),
+            parentMetadataDigest: b64(new Uint8Array(await crypto.subtle.digest("SHA-256",
+              bytes(parent.metadata_ciphertext, 284)))),
+            revision: parent.revision + 1, epoch: trust.pinnedOwnerHead.epoch,
+            previousSequence: state.head.sequence, previousDigest: state.head.digest,
+            ownerRevision: trust.pinnedOwnerHead.revision,
+            ownerDigest: b64(bytes(trust.pinnedOwnerHead.digest, 32)),
+            nonce: b64(crypto.getRandomValues(new Uint8Array(32))),
+            issuedAt: trust.nowSeconds() };
+          ciphertext = await sealTrash(statement, trust.devicePrivateKey,
+            inputTrash.metadataKey);
+          assertLive();
+          const result = await commitVersion({ previous: inputTrash.previous,
+            objectId, expectedRevision: parent.revision, revision: statement.revision,
+            epoch: statement.epoch, ciphertext, name: TRASH_NAME,
+            metadataKey: inputTrash.metadataKey }, true);
+          return Object.freeze({ ...result, objectId, revision: statement.revision,
+            state: "trashed", originalHistoryPreserved: true,
+            serverPlaintextExposed: false, tombstoneSignedAndSealed: true });
+        } catch (error) {
+          if (error?.outcome) throw error; // Do not erase uncertain PUT/CAS.
+          deny();
+        } finally { ciphertext?.fill(0); }
+      }
+      async function readTrash(inputRead) {
+        let clear = null;
+        try {
+          exact(inputRead, ["previous", "objectId", "metadataKey"]);
+          const state = tracked.get(inputRead.previous);
+          if (!state || state.owner !== writer || latest !== inputRead.previous
+            || !metadataKey(inputRead.metadataKey)) deny();
+          const signed = await writer.readAll();
+          assertLive();
+          if (signed.head.sequence !== state.head.sequence
+            || !equal(bytes(signed.head.digest, 32), from64(state.head.digest, 32))) deny();
+          const rows = signed.rows.filter((row) => row.object_id === inputRead.objectId);
+          if (rows.length < 2) deny();
+          const newest = rows[rows.length - 1], prior = rows[rows.length - 2];
+          if (newest.revision !== prior.revision + 1
+            || newest.epoch !== trust.pinnedOwnerHead.epoch) deny();
+          const stateName = await catalog.openMetadata({ scope: trust.signedDeviceGrant,
+            objectId: newest.object_id, revision: newest.revision, epoch: newest.epoch,
+            metadataKey: inputRead.metadataKey,
+            ciphertext: bytes(newest.metadata_ciphertext, 284) });
+          if (stateName !== TRASH_NAME) deny();
+          const fetched = await writer.readVerifiedCiphertext(signed,
+            newest.object_id, newest.revision);
+          assertLive();
+          const envelope = from64(fetched.ciphertextBase64, 28, MAX);
+          clear = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM",
+            iv: envelope.slice(0, 12), additionalData: trashAad(scopeFor(trust.signedDeviceGrant),
+              newest.object_id, newest.revision, newest.epoch), tagLength: 128 },
+          inputRead.metadataKey, envelope.slice(12)));
+          const parsed = JSON.parse(td.decode(clear));
+          exact(parsed, ["statement", "signature"]);
+          const statement = parsed.statement;
+          exact(statement, ["format", "account_id", "compartment_id", "keyring_id",
+            "deviceId", "objectId", "parentRevision", "parentEpoch", "parentDigest",
+            "parentMetadataDigest", "revision", "epoch", "previousSequence",
+            "previousDigest", "ownerRevision", "ownerDigest", "nonce", "issuedAt"]);
+          const scope = scopeFor(trust.signedDeviceGrant);
+          const signedParentHead = await writer.readVerifiedPredecessorDigest(signed);
+          assertLive();
+          if (statement.format !== TRASH_TYPE
+            || Object.keys(scope).some((key) => statement[key] !== scope[key])
+            || statement.objectId !== newest.object_id
+            || statement.parentRevision !== prior.revision
+            || statement.parentEpoch !== prior.epoch
+            || statement.parentDigest !== b64(bytes(prior.ciphertext_digest, 32))
+            || statement.parentMetadataDigest !== b64(new Uint8Array(await crypto.subtle.digest(
+              "SHA-256", bytes(prior.metadata_ciphertext, 284))))
+            || statement.revision !== newest.revision || statement.epoch !== newest.epoch
+            || statement.previousSequence !== state.head.sequence - 1
+            || statement.previousDigest !== b64(signedParentHead)
+            || statement.ownerRevision !== trust.pinnedOwnerHead.revision
+            || statement.ownerDigest !== b64(bytes(trust.pinnedOwnerHead.digest, 32))
+            || !Number.isSafeInteger(statement.issuedAt)
+            || statement.issuedAt > trust.nowSeconds() + 30
+            || from64(statement.nonce, 32).length !== 32
+            || from64(statement.previousDigest, 32).length !== 32) deny();
+          const signer = trust.signerGrants.find((grant) => grant.device_id === statement.deviceId
+            && grant.revoked_at_epoch === null
+            && grant.current_epoch === newest.epoch);
+          if (!signer) deny();
+          const pub = await crypto.subtle.importKey("raw",
+            from64(signer.authorization_public_key, 32), "Ed25519", false, ["verify"]);
+          if (!await crypto.subtle.verify("Ed25519", pub,
+            from64(parsed.signature, 64),
+            new Uint8Array([...TRASH_DOMAIN, ...te.encode(JSON.stringify(statement))]))) deny();
+          const reconfirm = await writer.readAll();
+          assertLive();
+          if (reconfirm.head.sequence !== signed.head.sequence
+            || !equal(bytes(reconfirm.head.digest, 32), bytes(signed.head.digest, 32))) deny();
+          return Object.freeze({ state: "trashed", objectId: newest.object_id,
+            revision: newest.revision, predecessorRevision: prior.revision,
+            retainedHistoricalVersions: rows.length - 1, originalHistoryPreserved: true,
+            signedByAuthorizedDevice: true, serverPlaintextExposed: false });
+        } catch (_) { deny(); } finally { clear?.fill(0); }
+      }
+      return Object.freeze({ readCurrent, pullDelta, readPrivateListing,
+        commitVersion: (value) => commitVersion(value, false), trashVersion, readTrash });
     }
     return Object.freeze({ createClient });
   }));

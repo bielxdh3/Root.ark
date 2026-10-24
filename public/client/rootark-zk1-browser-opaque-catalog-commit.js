@@ -590,6 +590,19 @@
           (item) => Object.freeze(item))) });
       } catch (_) { deny(); }
     }
+    async function readVerifiedPredecessorDigest(snapshot) {
+      try {
+        const checked = verifiedSnapshots.get(snapshot);
+        if (!checked || !checked.predecessorDigest
+          || snapshot.head.sequence !== checked.head.sequence
+          || !equal(bytes(snapshot.head.digest, 32), checked.head.digest)) deny();
+        await ownerCurrent();
+        const now = await freshHead();
+        if (now.sequence !== checked.head.sequence
+          || !equal(now.digest, checked.head.digest)) deny();
+        return bytes(checked.predecessorDigest, 32);
+      } catch (_) { deny(); }
+    }
     async function readAll(expected) {
       await ownerCurrent();
       const current = await freshHead();
@@ -893,7 +906,8 @@
     // compaction and any omission of an existing immutable version fail closed.
     return Object.freeze({ readAll: async () => {
       try { return await readAll(); } catch (_) { deny(); }
-    }, readVerifiedCiphertext, readSignedSuccessor, prepareIntent, commit, confirmPendingIntent,
+    }, readVerifiedCiphertext, readSignedSuccessor, readVerifiedPredecessorDigest,
+    prepareIntent, commit, confirmPendingIntent,
     delete: deny, trash: deny, rename: deny, move: deny });
   }
   return Object.freeze({ createClient, indexedDbJournalStore, openMetadata });

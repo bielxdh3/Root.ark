@@ -73,6 +73,114 @@
         metadataKey: rightKey, ciphertext: raw64(fixture.ciphertextBase64),
       }); } catch (error) { aadRejected = error.message === "ZK_BROWSER_CATALOG_UNVERIFIED"; }
       if (!aadRejected) throw Error("CROSS_ACCOUNT_AAD_REPLAY");
+      // Real Edge WebCrypto: independent Ed25519 signed tombstone, AES-GCM
+      // ciphertext with scope+revision AAD and authentic catalog metadata.
+      const signing = await root.crypto.subtle.generateKey("Ed25519", false, ["sign", "verify"]);
+      const trashKey = await root.crypto.subtle.importKey("raw",
+        raw64(fixture.metadataKeyBase64), "AES-GCM", false, ["encrypt", "decrypt"]);
+      const signerPublic = new Uint8Array(await root.crypto.subtle.exportKey("raw", signing.publicKey));
+      const prevDigest = new Uint8Array(32).fill(11);
+      const previousMetadata = raw64(fixture.ciphertextBase64);
+      const digest = async (raw) => new Uint8Array(await root.crypto.subtle.digest("SHA-256", raw));
+      const parentCipherDigest = new Uint8Array(32).fill(18);
+      const statement = {
+        format: "rootark-zk1-opaque-logical-trash/v1", ...fixture.scope,
+        deviceId: "edge-issuer", objectId: fixture.objectId,
+        parentRevision: 1, parentEpoch: 1, parentDigest: b64(parentCipherDigest),
+        parentMetadataDigest: b64(await digest(previousMetadata)),
+        revision: 2, epoch: 1, previousSequence: 1, previousDigest: b64(prevDigest),
+        ownerRevision: 1, ownerDigest: b64(new Uint8Array(32).fill(8)),
+        nonce: b64(root.crypto.getRandomValues(new Uint8Array(32))),
+        issuedAt: 1700000000,
+      };
+      const domain = new TextEncoder().encode("Root.ark/zk-1/opaque-logical-trash/v1\0");
+      const message = new TextEncoder().encode(JSON.stringify(statement));
+      const signed = new Uint8Array(await root.crypto.subtle.sign("Ed25519",
+        signing.privateKey, new Uint8Array([...domain, ...message])));
+      const plaintext = new TextEncoder().encode(JSON.stringify({
+        statement, signature: b64(signed) }));
+      const aad = new TextEncoder().encode("Root.ark/zk-1/opaque-logical-trash-aead/v1\0"
+        + JSON.stringify({ ...fixture.scope, objectId: fixture.objectId, revision: 2, epoch: 1 }));
+      const iv = root.crypto.getRandomValues(new Uint8Array(12));
+      const encrypted = new Uint8Array(await root.crypto.subtle.encrypt({
+        name: "AES-GCM", iv, additionalData: aad, tagLength: 128 }, trashKey, plaintext));
+      plaintext.fill(0);
+      const envelope = new Uint8Array(12 + encrypted.length);
+      envelope.set(iv); envelope.set(encrypted, 12);
+      const candidate = {
+        head: { sequence: 2, digest: new Uint8Array(32).fill(12) },
+        rows: [
+          { object_id: fixture.objectId, revision: 1, epoch: 1,
+            ciphertext_digest: parentCipherDigest, metadata_ciphertext: previousMetadata },
+          { object_id: fixture.objectId, revision: 2, epoch: 1,
+            ciphertext_digest: await digest(envelope),
+            metadata_ciphertext: raw64(fixture.trashMetadataBase64) },
+        ],
+      };
+      let badGet = false;
+      root.RootarkZk1BrowserOpaqueCatalogCommit.createClient = () => ({
+        async readAll() { return candidate; },
+        async readVerifiedPredecessorDigest() { return prevDigest; },
+        async readVerifiedCiphertext() {
+          const raw = envelope.slice();
+          if (badGet) raw[raw.length - 1] ^= 1;
+          return { ciphertextBase64: b64(raw) };
+        },
+      });
+      const trust = { signedDeviceGrant: { ...fixture.scope, device_id: "edge-reader" },
+        pinnedOwnerHead: { revision: 1, epoch: 1, digest: new Uint8Array(32).fill(8) },
+        signerGrants: [{ device_id: "edge-issuer", authorization_public_key: b64(signerPublic),
+          revoked_at_epoch: null, current_epoch: 1 }],
+        csrfToken: () => "edge-csrf", isSessionCurrent: () => true, nowSeconds: () => 1700000000 };
+      const newReader = () => root.RootarkZk1OpaqueDeviceDeltaSync.createClient({
+        authority: trust, assertLive() { return true; } });
+      const reader = newReader(), pinned = await reader.readCurrent();
+      const tombstone = await reader.readTrash({
+        previous: pinned, objectId: fixture.objectId, metadataKey: trashKey });
+      if (!tombstone.signedByAuthorizedDevice || tombstone.retainedHistoricalVersions !== 1
+        || tombstone.state !== "trashed") throw Error("EDGE_TRASH_SIGNATURE_NOT_VERIFIED");
+      // A party with only the AES metadata key may replace encrypted bytes,
+      // but cannot manufacture the missing Ed25519 device signature.
+      const alteredSignature = signed.slice();
+      alteredSignature[0] ^= 1;
+      const reencrypted = new TextEncoder().encode(JSON.stringify({
+        statement, signature: b64(alteredSignature) }));
+      const anotherIv = root.crypto.getRandomValues(new Uint8Array(12));
+      const anotherEncrypted = new Uint8Array(await root.crypto.subtle.encrypt({
+        name: "AES-GCM", iv: anotherIv, additionalData: aad, tagLength: 128 },
+      trashKey, reencrypted));
+      reencrypted.fill(0);
+      const originalEnvelope = envelope.slice();
+      const forgedEnvelope = new Uint8Array(anotherIv.length + anotherEncrypted.length);
+      forgedEnvelope.set(anotherIv); forgedEnvelope.set(anotherEncrypted, anotherIv.length);
+      root.RootarkZk1BrowserOpaqueCatalogCommit.createClient = () => ({
+        async readAll() { return candidate; },
+        async readVerifiedPredecessorDigest() { return prevDigest; },
+        async readVerifiedCiphertext() { return { ciphertextBase64: b64(forgedEnvelope) }; },
+      });
+      const alteredReader = newReader(), alteredBase = await alteredReader.readCurrent();
+      let signatureRejected = false;
+      try { await alteredReader.readTrash({ previous: alteredBase,
+        objectId: fixture.objectId, metadataKey: trashKey }); }
+      catch (error) { signatureRejected = error.message === "ZK_OPAQUE_DELTA_SYNC_DENIED"; }
+      if (!signatureRejected) throw Error("EDGE_INVALID_SIGNER_ACCEPTED");
+      root.RootarkZk1BrowserOpaqueCatalogCommit.createClient = () => ({
+        async readAll() { return candidate; },
+        async readVerifiedPredecessorDigest() { return prevDigest; },
+        async readVerifiedCiphertext() {
+          const raw = originalEnvelope.slice();
+          if (badGet) raw[raw.length - 1] ^= 1;
+          return { ciphertextBase64: b64(raw) };
+        },
+      });
+      badGet = true;
+      const forgedReader = newReader(), forgedBase = await forgedReader.readCurrent();
+      let forgedRejected = false;
+      try { await forgedReader.readTrash({ previous: forgedBase,
+        objectId: fixture.objectId, metadataKey: trashKey }); }
+      catch (error) { forgedRejected = error.message === "ZK_OPAQUE_DELTA_SYNC_DENIED"; }
+      if (!forgedRejected) throw Error("EDGE_TRASH_FORGED_CIPHERTEXT_ACCEPTED");
+      badGet = false;
     }
     if (before.head.sequence !== 1 || before.entries.length !== 1
       || Object.hasOwn(before.entries[0], "name")) throw Error("PLAIN_METADATA");
