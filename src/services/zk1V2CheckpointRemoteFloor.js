@@ -10,6 +10,8 @@ const path = require("node:path");
 const z = require("../crypto/rootark-zk-1");
 const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } =
   require("./zk1PrivateSqlitePath");
+const { nativeEd25519Spki } =
+  require("../crypto/rootark-zk1-native-ed25519-public-key");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/v2-independent-checkpoint-floor/v1\0");
 const OWNER_DOMAIN = Buffer.from("Root.ark/zk-1/v2-checkpoint-floor-owner-advance/v1\0");
@@ -98,7 +100,7 @@ function same(a, b) { return a.length === b.length && crypto.timingSafeEqual(a, 
 function identity(scope, casKey, floorKey, ownerKey, witnessKey, base) {
   return hash(Buffer.from("v2-floor-identity\0"), ...Object.values(scope),
     ...[casKey, floorKey, ownerKey, witnessKey].map((v) =>
-      v.export({ type: "spki", format: "der" })), base.headDigest, base.checkpointDigest);
+      nativeEd25519Spki(v)), base.headDigest, base.checkpointDigest);
 }
 function advanceStatement(v) {
   exact(v, ["scope", "sequence", "epoch", "headDigest", "checkpointDigest",
@@ -263,6 +265,14 @@ class Zk1V2CheckpointRemoteFloor {
     this.#owner = key(ownerPublicKey);
     this.#witness = key(witnessPrivateKey, "private");
     const witnessPublic = crypto.createPublicKey(this.#witness);
+    // Distinct physical authorities must not collapse to one signing key.
+    // Equality MUST use native key material; .export() is overridable.
+    const authorities = [this.#cas, this.#floor, this.#owner, witnessPublic];
+    for (let i = 0; i < authorities.length; i += 1) {
+      for (let j = i + 1; j < authorities.length; j += 1) {
+        if (crypto.KeyObject.prototype.equals.call(authorities[i], authorities[j])) deny();
+      }
+    }
     this.#base = { sequence: 128, epoch: 0,
       head_digest: byte(baseHeadDigest, 32),
       checkpoint_digest: byte(baseCheckpointDigest, 32), chain_hash: ZERO };
@@ -280,24 +290,32 @@ class Zk1V2CheckpointRemoteFloor {
     else ensurePrivateSqliteDirectory(filename);
     const Database = require("better-sqlite3");
     this.#db = new Database(filename);
-    this.#db.pragma("journal_mode = WAL");
-    this.#db.pragma("synchronous = FULL");
-    this.#db.exec(`CREATE TABLE IF NOT EXISTS floor_identity(id INTEGER PRIMARY KEY,
-      identity BLOB NOT NULL, CHECK(id=1));
-      CREATE TABLE IF NOT EXISTS floor_event(sequence INTEGER PRIMARY KEY, epoch INTEGER NOT NULL,
-      head_digest BLOB NOT NULL, checkpoint_digest BLOB NOT NULL,
-      previous_head_digest BLOB NOT NULL, previous_checkpoint_digest BLOB NOT NULL,
-      chain_hash BLOB NOT NULL, previous_hash BLOB NOT NULL,
-      operation_id BLOB NOT NULL, cas_receipt BLOB NOT NULL, floor_receipt BLOB NOT NULL,
-      owner_signature BLOB NOT NULL);`);
-    if (!existed) this.#db.prepare("INSERT INTO floor_identity VALUES(1,?)").run(identityDigest);
-    const record = this.#db.prepare("SELECT identity FROM floor_identity WHERE id=1").get();
-    if (!record || !same(record.identity, identityDigest)) deny();
-    this.#trusted = this.#quickVerify();
+    try {
+      this.#db.pragma("journal_mode = WAL");
+      this.#db.pragma("synchronous = FULL");
+      this.#db.exec(`CREATE TABLE IF NOT EXISTS floor_identity(id INTEGER PRIMARY KEY,
+        identity BLOB NOT NULL, CHECK(id=1));
+        CREATE TABLE IF NOT EXISTS floor_event(sequence INTEGER PRIMARY KEY, epoch INTEGER NOT NULL,
+        head_digest BLOB NOT NULL, checkpoint_digest BLOB NOT NULL,
+        previous_head_digest BLOB NOT NULL, previous_checkpoint_digest BLOB NOT NULL,
+        chain_hash BLOB NOT NULL, previous_hash BLOB NOT NULL,
+        operation_id BLOB NOT NULL, cas_receipt BLOB NOT NULL, floor_receipt BLOB NOT NULL,
+        owner_signature BLOB NOT NULL);`);
+      if (!existed) this.#db.prepare("INSERT INTO floor_identity VALUES(1,?)").run(identityDigest);
+      const record = this.#db.prepare("SELECT identity FROM floor_identity WHERE id=1").get();
+      if (!record || !same(record.identity, identityDigest)) deny();
+      this.#trusted = this.#quickVerify();
+    } catch (error) {
+      // A rejected identity or corrupted rollback must never retain an open
+      // SQLite handle (particularly on Windows, where an open handle blocks
+      // safe recovery and disposal of the rejected database).
+      try { this.#db.close(); } catch (_) { /* Preserve the original denial. */ }
+      throw error;
+    }
   }
   async #verifyReceipts(v) {
     const { receiptMatches } = require("./zk1OpaqueCheckpointV2Remote");
-    const fp = (pub) => hash(pub.export({ type: "spki", format: "der" }));
+    const fp = (pub) => hash(nativeEd25519Spki(pub));
     await Promise.all([["CAS", v.casReceipt, this.#cas], ["FLOOR", v.floorReceipt,
       this.#floor]].map(async ([role, raw, signer]) => receiptMatches(raw, {
         scope: this.#scope, role, state: "FINALIZED", sequence: v.sequence,
