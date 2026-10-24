@@ -75,7 +75,9 @@ async function readContainedFile(rootDir, relativePath, expectedStats = null) {
   const root = path.resolve(rootDir);
   const target = await contained(root, relativePath, false);
   const before = expectedStats || await fsp.lstat(target, { bigint: true });
-  if (!before.isFile() || before.isSymbolicLink() || before.ino === 0n) {
+  // A hardlink into the selected root can alias an unrelated file outside it.
+  // Canonical path and FD identity checks alone cannot detect that provenance.
+  if (!before.isFile() || before.isSymbolicLink() || before.ino === 0n || before.nlink !== 1n) {
     fail("Sync file must be a regular file with a stable identity", "unsafe_path");
   }
 
@@ -83,22 +85,24 @@ async function readContainedFile(rootDir, relativePath, expectedStats = null) {
   const handle = await fsp.open(target, flags);
   try {
     const opened = await handle.stat({ bigint: true });
-    if (!opened.isFile() || !sameFileVersion(before, opened)) fail("Sync file changed while opening", "unsafe_path");
+    if (!opened.isFile() || opened.nlink !== 1n || !sameFileVersion(before, opened)) fail("Sync file changed while opening", "unsafe_path");
 
     await containedAbsolute(root, target, false);
     const canonicalRoot = await fsp.realpath(root);
     const canonicalTarget = await fsp.realpath(target);
     if (!isWithinPath(canonicalRoot, canonicalTarget)) fail("Sync file escaped root", "unsafe_path");
     const pathStats = await fsp.lstat(target, { bigint: true });
-    if (!pathStats.isFile() || pathStats.isSymbolicLink() || !sameFileIdentity(opened, pathStats)) {
+    if (!pathStats.isFile() || pathStats.isSymbolicLink() || pathStats.nlink !== 1n
+      || !sameFileIdentity(opened, pathStats)) {
       fail("Sync file changed while opening", "unsafe_path");
     }
 
     const data = await handle.readFile();
     const openedAfterRead = await handle.stat({ bigint: true });
     const pathAfterRead = await fsp.lstat(target, { bigint: true });
-    if (!sameFileVersion(opened, openedAfterRead) || !sameFileIdentity(openedAfterRead, pathAfterRead)
-      || !pathAfterRead.isFile() || pathAfterRead.isSymbolicLink()) {
+    if (!sameFileVersion(opened, openedAfterRead) || openedAfterRead.nlink !== 1n
+      || !sameFileIdentity(openedAfterRead, pathAfterRead)
+      || !pathAfterRead.isFile() || pathAfterRead.isSymbolicLink() || pathAfterRead.nlink !== 1n) {
       fail("Sync file changed while reading", "unsafe_path");
     }
     await containedAbsolute(root, target, false);
