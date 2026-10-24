@@ -267,7 +267,10 @@ provisioned `trustedDevicePublicKeys` object mapping every authorized remote
 `deviceId` to its canonical Ed25519 public key (DER SPKI, base64url), plus
 an explicit `revokedDeviceIds` array (empty if no devices are revoked).
 Neither field is learned from incoming ciphertext or its self-signed proof.
-Missing pins or revocation state fail closed. Provision these values through
+The reusable `verifyAuthorizationProof` API also rejects any caller that
+omits the independently provisioned device pin; a valid signature from an
+unknown key is not authorization. Missing pins or revocation state in the
+CLI fail closed. Provision these values through
 an authenticated owner-controlled process; accepting a key advertised in
 the incoming operation as its own trust pin defeats device authentication.
 These **local snapshots** do not establish a fresh owner epoch or prevent

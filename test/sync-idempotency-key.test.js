@@ -10,6 +10,7 @@ const { createAuthorizationProof, generateIdempotencyKey, verifyAuthorizationPro
 const KEY_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
 const keys = crypto.generateKeyPairSync("ed25519");
 const publicKey = keys.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+const trustedAlice = { username: "alice", trustedDevicePublicKeys: { "device-a": publicKey } };
 
 function operationFor(operationId = "idem-operation") {
   return protocol.createOperation({
@@ -107,14 +108,14 @@ test("signed proof covers the exact idempotency key string", async () => {
   const operation = operationFor();
   const proof = await proofFor(operation, "abcdefghijklmnopq");
   const swapped = { ...proof, idempotencyKey: "zyxwvutsrqponmlkj" };
-  await assert.rejects(verifyAuthorizationProof(swapped, operation, { username: "alice" }), { code: "authorization_signature" });
-  assert.equal(await verifyAuthorizationProof(proof, operation, { username: "alice" }), true);
+  await assert.rejects(verifyAuthorizationProof(swapped, operation, trustedAlice), { code: "authorization_signature" });
+  assert.equal(await verifyAuthorizationProof(proof, operation, trustedAlice), true);
 });
 
 test("proof with an invalid idempotency key is rejected during verification", async () => {
   const operation = operationFor();
   const proof = await proofFor(operation, "abcdefghijklmnopq");
-  await assert.rejects(verifyAuthorizationProof({ ...proof, idempotencyKey: "bad key!" }, operation, { username: "alice" }), { message: "Invalid device authorization" });
+  await assert.rejects(verifyAuthorizationProof({ ...proof, idempotencyKey: "bad key!" }, operation, trustedAlice), { message: "Invalid device authorization" });
 });
 
 test("previously accepted 36-character UUID key still validates", async () => {
@@ -122,7 +123,7 @@ test("previously accepted 36-character UUID key still validates", async () => {
   const uuid = crypto.randomUUID();
   const proof = await proofFor(operation, uuid);
   assert.equal(protocol.normalizeAuthorization(proof).idempotencyKey, uuid);
-  assert.equal(await verifyAuthorizationProof(proof, operation, { username: "alice" }), true);
+  assert.equal(await verifyAuthorizationProof(proof, operation, trustedAlice), true);
 });
 
 test("historical operationId-derived keys still validate (fixtures per format)", async () => {
@@ -141,7 +142,7 @@ test("historical operationId-derived keys still validate (fixtures per format)",
   for (const [name, key] of Object.entries(fixtures)) {
     const proof = await proofFor(operation, key);
     assert.equal(protocol.normalizeAuthorization(proof).idempotencyKey, key, name);
-    assert.equal(await verifyAuthorizationProof(proof, operation, { username: "alice" }), true, name);
+    assert.equal(await verifyAuthorizationProof(proof, operation, trustedAlice), true, name);
   }
 });
 

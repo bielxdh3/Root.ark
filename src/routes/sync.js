@@ -330,7 +330,9 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     try { registry = JSON.parse(await fs.readFile(deviceRegistryPath, "utf8")); } catch { return false; }
     const record = registry?.devices?.[operation.deviceId];
     if (!record || record.username !== username || record.revoked || record.active === false || record.publicKey !== proof.publicKey) return false;
-    return verifyAuthorizationProof(proof, operation, { username });
+    return verifyAuthorizationProof(proof, operation, {
+      username, trustedDevicePublicKeys: { [operation.deviceId]: record.publicKey },
+    });
   } : null);
   const retentionMs = positiveEnvInteger(process.env.SYNC_RECOVERY_RETENTION_MS, DEFAULT_RECOVERY_RETENTION_MS);
   const store = new SyncObjectStore(storagePath, { burstGuard: burstGuard || createSyncBurstGuard(), retentionMs });

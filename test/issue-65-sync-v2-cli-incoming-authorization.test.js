@@ -24,7 +24,11 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
     username: "alice", privateKey: keys.privateKey, publicKey });
   const signedIncoming = { ...operation, authorization: signature };
   assert.equal(await authorization.verifyAuthorizationProof(signature, signedIncoming,
-    { username: "alice" }), true, "test fixture must have a genuine Ed25519 proof");
+    { username: "alice", trustedDevicePublicKeys: { device1: publicKey } }), true,
+  "test fixture must have a genuine Ed25519 proof from the separately pinned device");
+  await assert.rejects(authorization.verifyAuthorizationProof(signature, signedIncoming,
+    { username: "alice" }), { code: "authorization_device_untrusted" },
+  "a valid self-signed proof must not confer authorization without a pre-provisioned device pin");
 
   const config = { serverUrl: "https://unused.invalid", localFolder: path.resolve("unused-sync-v2"),
     token: "not-used", username: "alice", deviceId: "device1", keyEpoch: "epoch1",
