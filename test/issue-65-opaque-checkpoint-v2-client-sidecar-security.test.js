@@ -40,6 +40,27 @@ function options(journalPath, bootstrapNew) {
       freshWitnessHead: async () => Buffer.alloc(0) } };
 }
 
+test("V2 client rejects a historical grant root using the CAS signing key with forged SPKI export", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-v2-grant-cas-separation-"));
+  if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
+  let created;
+  t.after(() => {
+    created?.close();
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+  });
+  const opts = options(path.join(dir, "forged-grant.sqlite"), true);
+  const copiedCas = crypto.createPublicKey({
+    key: opts.casClient.publicKey.export({ type: "spki", format: "der" }),
+    type: "spki", format: "der",
+  });
+  const unrelated = identity();
+  copiedCas.export = () => unrelated.publicKey.export({ type: "spki", format: "der" });
+  assert.throws(() => { created = new Zk1OpaqueCheckpointV2Client({ ...opts,
+    signerGrantRootPublicKey: copiedCas }); },
+  /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
+  "a compromised CAS must not certify its own historical owner signer grants");
+});
+
 test("existing V2 client journal refuses alien hardlinked WAL/SHM and redirected directory before writable open", (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-v2-local-sidecar-"));
   if (process.platform !== "win32") fs.chmodSync(dir, 0o700);

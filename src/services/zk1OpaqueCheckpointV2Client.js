@@ -20,6 +20,8 @@ const { syncPrivateParent, publishStagedJournal } =
   require("./zk1V2DurableJournalMigration");
 const { FIELDS: SIGNER_ENDORSEMENT_FIELDS, LEGACY_FIELDS: LEGACY_SIGNER_ENDORSEMENT_FIELDS } =
   require("../crypto/rootark-zk1-v2-historical-signer-endorsement");
+const { nativeEd25519Spki } =
+  require("../crypto/rootark-zk1-native-ed25519-public-key");
 
 const APPROVAL_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-checkpoint-remote/owner-approval/v2\0");
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
@@ -96,8 +98,7 @@ function equal(a, b) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 function fp(k) {
-  return crypto.createHash("sha256").update(key(k)
-    .export({ type: "spki", format: "der" })).digest();
+  return crypto.createHash("sha256").update(nativeEd25519Spki(key(k))).digest();
 }
 function b64(value, size) {
   if (typeof value !== "string" || value.length > 512
