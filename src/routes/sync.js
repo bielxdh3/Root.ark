@@ -260,6 +260,12 @@ class SyncObjectStore {
     return result;
   }
 
+  async assertWritable() {
+    // Exercise the SAME queued durable-rename/fsync path used by resumeDevice.
+    // A mere commitIndeterminate check misses an already locked/read-only store.
+    await this.transact(() => undefined);
+  }
+
   user(next, username) {
     const current = ownRecord(next.users, username)
       || { objects: {}, versions: {}, revisions: {}, seen: {} };
@@ -497,6 +503,12 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
         let key;
         try { key = getTotpKey(); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
         if (!Buffer.isBuffer(key) || key.length !== 32) return errorResponse(res, 503, "Sync re-authentication unavailable");
+        // A recovery code is irreversibly consumed by saveUsers below. Refuse
+        // to spend it if the sync store cannot currently commit a durable write.
+        try { await store.assertWritable(); } catch {
+          return errorResponse(res, 503, store.commitIndeterminate ? "sync_commit_indeterminate" : "Sync re-authentication unavailable",
+            store.commitIndeterminate ? { code: "SYNC_COMMIT_INDETERMINATE" } : {});
+        }
         let proof;
         try { proof = await verifySecondFactor(user, body.code, key); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
         if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });

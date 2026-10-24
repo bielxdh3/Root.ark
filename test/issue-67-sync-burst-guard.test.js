@@ -534,6 +534,28 @@ test("issue 65 resume: indeterminate sync persistence rejects re-auth before spe
   assert.equal(reopened.route.accountState.users[0].totpRecoveryHashes.length, 1);
 });
 
+test("issue 65 resume: an already locked sync store cannot consume a recovery code", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-locked-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const { port, route } = await startServer(t, {
+    storagePath: path.join(dir, "objects.json"), accountUsers: account.users,
+  });
+  const recovery = account.recoveryCodes[0];
+  const originalTransact = route.store.transact.bind(route.store);
+  route.store.transact = async () => {
+    throw Object.assign(new Error("storage busy"), { code: "EACCES" });
+  };
+  const locked = await resumeRequest(port, { password: PASSWORD, code: recovery });
+  assert.equal(locked.status, 503);
+  assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 2,
+    "no recovery factor may be spent when the sync storage cannot persist");
+  route.store.transact = originalTransact;
+  assert.equal((await resumeRequest(port, { password: PASSWORD, code: recovery })).status, 200,
+    "the same code works after storage becomes writable");
+  assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 1);
+});
+
 test("issue 65 resume: a store becoming indeterminate during bcrypt fails before second-factor consumption", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-race-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
