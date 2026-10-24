@@ -1,5 +1,40 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228 security development checkpoint — 2026-10-24
+
+The last remotely confirmed draft-PR HEAD before this checkpoint is
+`6a5e71ed33ae44d65f7c3a124632cb4d5c4ae4f3`; the new *local* isolated
+worktree commit `b5792b246d1adbe5eb87420c176acd6e54ae7ffe` has **not**
+yet been counted as a published or CI-accepted milestone.
+
+Two adversarial RED→GREEN regressions prevent a compromised owner from using
+an overridable `KeyObject.export()` to fabricate independently pinned Ed25519
+generation evidence in the read-only legacy S3/Drive inventory or to pass one
+signing identity off as two separate witness/CAS authorities during owner-side
+V2 device revocation and epoch rotation. Revocation also pins the actual native
+owner/CAS/witness SPKI identities rather than caller-provided export bytes.
+Focused Node 24/Windows and Node 22/Ubuntu tests for both modules each yielded
+**11 PASS / 0 FAIL**; artifact and diff checks passed; syntax checked **629 / 0**.
+
+The hosted checks for the *published* `6a5e71e` HEAD show Ubuntu Node 22 full,
+disposable PostgreSQL 18, JavaScript analysis and Windows mandatory release
+gates **PASS**. The hosted Windows canonical suite has **one FAIL** in the real
+Edge V2 witnessed-recovery test, while Windows syntax dependent gate and CodeQL
+policy also **FAIL** (CodeQL reports 57 high + 35 medium untriaged alerts).
+The failing Edge test name and file were identified from the canonical runner's
+privacy-preserving hashes; the same real-Edge test passed **5/5** consecutive
+local stress runs, which does **not** erase the hosted Windows failure.
+An earlier complete local Node 24 run at the preceding code checkpoint yielded
+**2445 PASS / 0 FAIL / 167 SKIP**, which must not be transferred to this diff.
+Independent final review for the new local patch could not finish because the
+reviewer service blocked the request; do not claim that gate passed.
+
+This narrows cryptographic forgery, **not** physical external custody, a
+monotonic independently retained CAS/FLOOR, PostgreSQL-to-remote atomicity,
+complete legacy reference inventory, or safe migration cutover. PR #228 remains
+**OPEN/DRAFT**, issue #65 **OPEN**, overall status **NO-GO**; no merge, deploy,
+production activation or legacy deletion is authorized.
+
 > **Most recent issue #65 development checkpoint — 2026-10-23:**
 > [PR #228 source, validation and remaining blocker evidence](validation/2026-10-23-issue-65-pr228-development-checkpoint.md).
 > The `da02715` checkpoint below is historical and not the current HEAD.
