@@ -854,7 +854,7 @@ function isOpaqueCheckpointV2PinnedClient(client) {
 function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
   trustedScope, expectedV1Digest, expectedV1Checkpoint,
   v1CasClient, v1FloorClient, requireFullV1ArchiveRollover = false,
-  fullV1ArchiveRollover }) {
+  fullV1ArchiveRollover, pinnedOwnerPublicKey, pinnedCheckpointPublicKey }) {
   if (!pinnedV2Clients.has(casClient) || casClient.role !== ROLE_CAS
     || !pinnedV2Clients.has(floorClient) || floorClient.role !== ROLE_FLOOR
     || same(fp(casClient.publicKey), fp(floorClient.publicKey))
@@ -869,6 +869,13 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
   // its independently signed digest as proof of the complete V1 archive.
   if (typeof requireFullV1ArchiveRollover !== "boolean"
     || (requireFullV1ArchiveRollover !== !!fullV1ArchiveRollover)) fail();
+  // Strict admission must bind the handoff to the V2 client's independently
+  // configured owner and checkpoint keys. Pins carried by the handoff itself
+  // cannot establish either trusted identity.
+  const strictOwnerFp = requireFullV1ArchiveRollover
+    ? fp(key(pinnedOwnerPublicKey)) : null;
+  const strictCheckpointFp = requireFullV1ArchiveRollover
+    ? fp(key(pinnedCheckpointPublicKey)) : null;
   async function assertFullArchive() {
     if (!requireFullV1ArchiveRollover) fail("ZK_CHECKPOINT_V2_FULL_ARCHIVE_REQUIRED");
     const proof = fullV1ArchiveRollover;
@@ -880,6 +887,8 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
         || !same(fp(key(proof.v1FloorKey)), fp(key(v1FloorClient.publicKey)))
         || !same(fp(key(proof.v2CasKey)), fp(key(casClient.publicKey)))
         || !same(fp(key(proof.v2FloorKey)), fp(key(floorClient.publicKey)))
+        || !same(fp(key(proof.ownerKey)), strictOwnerFp)
+        || !same(fp(key(proof.v2CheckpointKey)), strictCheckpointFp)
         || !same(bytes(Buffer.from(proof.v2PredecessorCheckpointPin, "base64url"), 32),
           oldCheckpoint)) fail();
       const { verifyRolloverPreflight } =

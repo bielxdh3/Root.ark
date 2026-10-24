@@ -138,7 +138,7 @@ async function build() {
     v2FloorSpkiSha256: b64(id(v2Floor.publicKey)),
     v2CheckpointSpkiSha256: b64(id(checkpoint.publicKey)) };
   return { options, state, browserInput, v2Cas, v2Floor, v1Cas, v1Floor,
-    catalog, checkpoint };
+    catalog, checkpoint, owner };
 }
 test("authenticated 128-head archival rollover preflight is read-only; adversarial fails closed", {
   timeout: 90000 }, async () => {
@@ -232,7 +232,7 @@ test("real Edge verifies owner V1 #128 -> V2 epoch handoff under strict CSP/loop
 
 test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and missing full-128 owner proof", {
   timeout: 120000 }, async (t) => {
-  const { options, v2Cas, v2Floor, v1Cas, v1Floor, catalog, checkpoint } = await build();
+  const { options, v2Cas, v2Floor, v1Cas, v1Floor, catalog, checkpoint, owner } = await build();
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-128-gate-mtls-"));
   if (process.platform !== "win32") fs.chmodSync(folder, 0o700);
   generateNativeFixtureCertificates(folder, {
@@ -339,7 +339,9 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
   await withAuthorities(fullDigest, async (casClient, floorClient, trust) => {
     const shared = { casClient, floorClient, trustedScope: options.scope,
       expectedV1Digest: options.stateDigest, expectedV1Checkpoint: fullDigest,
-      v1CasClient, v1FloorClient };
+      v1CasClient, v1FloorClient,
+      pinnedOwnerPublicKey: options.ownerKey,
+      pinnedCheckpointPublicKey: options.checkpointKey };
     assert.throws(() => createOpaqueCheckpointV2Coordinator({ ...shared,
       requireFullV1ArchiveRollover: true }), /ZK_CHECKPOINT_V2/);
     const guarded = createOpaqueCheckpointV2Coordinator({ ...shared,
@@ -348,6 +350,43 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
     const result = await guarded.verifyFullArchiveBaseline();
     assert.equal(result.sequence, 128);
     assert.equal(result.v2WriteAuthorized, false);
+    const impostor = pair();
+    const fakeOwnerRollover = {
+      ...options, v1CasClient, v1FloorClient,
+      ownerKey: impostor.publicKey,
+      ownerSignature: crypto.sign(null, Buffer.concat([OWNER_DOMAIN,
+        Buffer.from(JSON.stringify(options.handoff))]), impostor.privateKey),
+      independentSpkiPins: { ...options.independentSpkiPins,
+        owner: b64(id(impostor.publicKey)) },
+    };
+    // Without independent V2 trust bindings, the unchanged genuine 128-head
+    // archive would authenticate this replacement self-signed owner handoff.
+    assert.equal((await verifyRolloverPreflight(fakeOwnerRollover)).sequence, 128);
+    const impostorOwnerCoordinator = createOpaqueCheckpointV2Coordinator({
+      ...shared, requireFullV1ArchiveRollover: true,
+      fullV1ArchiveRollover: fakeOwnerRollover });
+    await assert.rejects(impostorOwnerCoordinator.verifyFullArchiveBaseline(),
+      /ZK_CHECKPOINT_V2_FULL_ARCHIVE_UNVERIFIED/,
+      "a self-signed handoff from a foreign owner cannot authorize strict admission");
+    const substitutedCheckpoint = pair();
+    const changedCheckpointHandoff = { ...options.handoff,
+      v2_checkpoint_spki_sha256: b64(id(substitutedCheckpoint.publicKey)) };
+    const fakeCheckpointRollover = {
+      ...options, v1CasClient, v1FloorClient,
+      v2CheckpointKey: substitutedCheckpoint.publicKey,
+      handoff: changedCheckpointHandoff,
+      ownerSignature: crypto.sign(null, Buffer.concat([OWNER_DOMAIN,
+        Buffer.from(JSON.stringify(changedCheckpointHandoff))]), owner.privateKey),
+      independentSpkiPins: { ...options.independentSpkiPins,
+        v2Checkpoint: b64(id(substitutedCheckpoint.publicKey)) },
+    };
+    assert.equal((await verifyRolloverPreflight(fakeCheckpointRollover)).sequence, 128);
+    const swappedCheckpointCoordinator = createOpaqueCheckpointV2Coordinator({
+      ...shared, requireFullV1ArchiveRollover: true,
+      fullV1ArchiveRollover: fakeCheckpointRollover });
+    await assert.rejects(swappedCheckpointCoordinator.verifyFullArchiveBaseline(),
+      /ZK_CHECKPOINT_V2_FULL_ARCHIVE_UNVERIFIED/,
+      "a claimant cannot substitute the V2 checkpoint signer in a genuine archive handoff");
     assert.equal((await casClient.head()).state, "V1_BASELINE");
     assert.equal((await floorClient.head()).state, "V1_BASELINE");
     const journalPath = path.join(folder, "strict-128-client.sqlite");
@@ -379,6 +418,8 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
       casClient, floorClient, trustedScope: options.scope,
       expectedV1Digest: options.stateDigest, expectedV1Checkpoint: fullDigest,
       v1CasClient, v1FloorClient,
+      pinnedOwnerPublicKey: options.ownerKey,
+      pinnedCheckpointPublicKey: options.checkpointKey,
       requireFullV1ArchiveRollover: true, fullV1ArchiveRollover: {
         ...options, v1CasClient, v1FloorClient } });
     await assert.rejects(guarded.verifyFullArchiveBaseline(), /ZK_CHECKPOINT_V2/);

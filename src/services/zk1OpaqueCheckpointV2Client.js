@@ -366,7 +366,8 @@ class Zk1OpaqueCheckpointV2Client {
       casClient, floorClient, trustedScope: scope,
       expectedV1Digest: digest, expectedV1Checkpoint: checkpoint,
       v1CasClient, v1FloorClient, requireFullV1ArchiveRollover,
-      fullV1ArchiveRollover,
+      fullV1ArchiveRollover, pinnedOwnerPublicKey: ownerKey,
+      pinnedCheckpointPublicKey: checkpointKey,
     });
     const creationPin = privateFile(journalPath, bootstrapNew);
     const identity = Buffer.concat([encodeIdentity(scope, digest, checkpoint, fingerprints),
