@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("node:fs/promises");
+const crypto = require("node:crypto");
 const path = require("node:path");
 const { PROTOCOL_VERSION, compareRevisions, validateOperation } = require("../../sync-client/rootark-sync-protocol");
 const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
@@ -166,6 +167,31 @@ function commitSecondFactorProof(target, proof) {
   return false;
 }
 
+// The sync store and the account store are distinct durable files. A verified factor
+// must first acquire an immutable, MAC-bound resume intent in the sync store. If
+// account persistence succeeds but the final sync write fails, the SAME factor can
+// complete this specific pause after restart; it cannot authorize a later pause.
+function resumeCodeMac(key, username, deviceId, pauseFence, code, intent) {
+  return crypto.createHmac("sha256", key)
+    .update("Root.ark/sync-resume-intent/v1\0")
+    .update(JSON.stringify([username, deviceId, pauseFence, code,
+      intent.version, intent.passwordHash, intent.sessionVersion, intent.secretDigest,
+      intent.proof, intent.expectedReplayDigest]))
+    .digest("hex");
+}
+
+function equalMac(left, right) {
+  return typeof left === "string" && typeof right === "string"
+    && /^[0-9a-f]{64}$/.test(left) && /^[0-9a-f]{64}$/.test(right)
+    && crypto.timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"));
+}
+
+function secondFactorReplayDigest(user) {
+  return crypto.createHash("sha256").update(JSON.stringify([
+    user.totpRecoveryHashes, user.totpLastUsedStep ?? null, user.totpSecret,
+  ])).digest("hex");
+}
+
 function positiveEnvInteger(value, fallback) {
   const number = Number(value);
   return value !== undefined && value !== "" && Number.isSafeInteger(number) && number > 0 ? number : fallback;
@@ -292,7 +318,7 @@ class SyncObjectStore {
         const burst = this.burstGuard.recordDestructive(username, input.deviceId, input.objectId, at);
         if (burst.exceeded) {
           ensureOwnMap(user, "pausedDevices");
-          user.pausedDevices[pausedKey(input.deviceId)] = { pausedAt: new Date(at).toISOString(), reason: burst.objectExceeded ? "object_burst" : "destructive_burst", limit: burst.limit, windowMs: burst.windowMs };
+          user.pausedDevices[pausedKey(input.deviceId)] = { pausedAt: new Date(at).toISOString(), pauseNonce: crypto.randomUUID(), reason: burst.objectExceeded ? "object_burst" : "destructive_burst", limit: burst.limit, windowMs: burst.windowMs };
           return { kind: "paused", newlyPaused: true, deviceId: input.deviceId, limit: burst.limit, windowMs: burst.windowMs, objectLimit: burst.objectLimit };
         }
       }
@@ -323,6 +349,51 @@ class SyncObjectStore {
       return wasPaused;
     });
     this.burstGuard.reset(username, deviceId);
+    return { wasPaused };
+  }
+
+  pauseFence(username, deviceId) {
+    if (this.commitIndeterminate) throw indeterminateCommitError();
+    const user = ownRecord(this.state.users, username) || {};
+    const pause = ownRecord(ownRecord(user, "pausedDevices"), pausedKey(deviceId));
+    return pause ? (pause.pauseNonce || JSON.stringify(pause)) : null;
+  }
+
+  pendingResume(username) {
+    if (this.commitIndeterminate) throw indeterminateCommitError();
+    return ownRecord(ownRecord(this.state.users, username), "resumeIntent") || null;
+  }
+
+  async stageResume(username, intent) {
+    return this.transact((next) => {
+      const user = this.user(next, username);
+      if (ownRecord(user, "resumeIntent")) {
+        throw Object.assign(new Error("A sync resume intent is already pending"), { code: "SYNC_RESUME_PENDING" });
+      }
+      const pause = ownRecord(user.pausedDevices, pausedKey(intent.deviceId));
+      const fence = pause ? (pause.pauseNonce || JSON.stringify(pause)) : null;
+      if (fence !== intent.pauseFence) throw new Error("Sync pause changed during resume");
+      user.resumeIntent = intent;
+    });
+  }
+
+  async finishStagedResume(username, intent) {
+    let wasPaused = false;
+    await this.transact((next) => {
+      const user = this.user(next, username);
+      const current = ownRecord(user, "resumeIntent");
+      if (!current || !equalMac(current.codeMac, intent.codeMac)
+        || current.deviceId !== intent.deviceId || current.pauseFence !== intent.pauseFence) {
+        throw new Error("Sync resume intent mismatch");
+      }
+      const pause = ownRecord(user.pausedDevices, pausedKey(intent.deviceId));
+      const fence = pause ? (pause.pauseNonce || JSON.stringify(pause)) : null;
+      if (fence !== intent.pauseFence) throw new Error("Sync pause changed before finalization");
+      wasPaused = Boolean(pause);
+      if (wasPaused) delete user.pausedDevices[pausedKey(intent.deviceId)];
+      delete user.resumeIntent;
+    });
+    this.burstGuard.reset(username, intent.deviceId);
     return { wasPaused };
   }
 
@@ -497,6 +568,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       if (!user || user.disabled || user.password !== checkedHash || (user.sessionVersion || 0) !== checkedSessionVersion) {
         return errorResponse(res, 401, "Re-authentication failed");
       }
+      let stagedResume = null;
       if (user.totpEnabled) {
         // Fail closed: 2FA is required but the key or the persistence helper is not available.
         if (typeof getTotpKey !== "function" || typeof saveUsers !== "function") return errorResponse(res, 503, "Sync re-authentication unavailable");
@@ -509,22 +581,72 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
           return errorResponse(res, 503, store.commitIndeterminate ? "sync_commit_indeterminate" : "Sync re-authentication unavailable",
             store.commitIndeterminate ? { code: "SYNC_COMMIT_INDETERMINATE" } : {});
         }
-        let proof;
-        try { proof = await verifySecondFactor(user, body.code, key); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
-        if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
-        if (!proof) return fail("second_factor_failed");
+        const pending = store.pendingResume(username);
+        const pauseFence = store.pauseFence(username, deviceId);
+        if (pending && (pending.deviceId !== deviceId || pending.pauseFence !== pauseFence
+          || pending.passwordHash !== checkedHash || pending.sessionVersion !== checkedSessionVersion
+          || typeof body.code !== "string" || body.code.length > 256
+          || !equalMac(pending.codeMac, resumeCodeMac(key, username, deviceId, pauseFence, body.code, pending)))) {
+          return fail("pending_resume_mismatch");
+        }
+        let proof = null;
+        if (!pending) {
+          try { proof = await verifySecondFactor(user, body.code, key); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
+          if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
+          if (!proof) return fail("second_factor_failed");
+        }
         // Re-load after async recovery-code verification and revalidate the account before committing replay state.
         const freshUsers = loadUsers();
         const freshUser = Array.isArray(freshUsers) ? freshUsers.find((entry) => entry?.username === username) : null;
         if (!freshUser || freshUser.disabled || freshUser.password !== checkedHash || (freshUser.sessionVersion || 0) !== checkedSessionVersion || !freshUser.totpEnabled) {
           return errorResponse(res, 401, "Re-authentication failed");
         }
-        if (!commitSecondFactorProof(freshUser, proof)) return fail("second_factor_failed");
-        // Persist replay state (totpLastUsedStep) or the consumed recovery code before resuming.
-        try { saveUsers(freshUsers); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
+        const secretDigest = crypto.createHash("sha256").update(JSON.stringify(freshUser.totpSecret)).digest("hex");
+        if (pending && secretDigest !== pending.secretDigest) return fail("second_factor_rotated");
+        if (pending) {
+          stagedResume = pending;
+          // Account state may already contain the consumed code after an interrupted
+          // final sync write, or may still need the original proof applied.
+          if (secondFactorReplayDigest(freshUser) !== pending.expectedReplayDigest) {
+            const stagedProof = pending.proof?.type === "recovery"
+              ? { type: "recovery", hash: pending.proof.hash }
+              : { type: "totp", step: pending.proof?.step, secretRecord: JSON.stringify(freshUser.totpSecret) };
+            if (!commitSecondFactorProof(freshUser, stagedProof)
+              || secondFactorReplayDigest(freshUser) !== pending.expectedReplayDigest) return fail("pending_resume_replay_state_mismatch");
+            try { saveUsers(freshUsers); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
+          }
+        } else {
+          if (!commitSecondFactorProof(freshUser, proof)) return fail("second_factor_failed");
+          stagedResume = {
+            version: 1, deviceId, pauseFence,
+            passwordHash: checkedHash, sessionVersion: checkedSessionVersion, secretDigest,
+            proof: proof.type === "recovery" ? { type: "recovery", hash: proof.hash } : { type: "totp", step: proof.step },
+            expectedReplayDigest: secondFactorReplayDigest(freshUser),
+          };
+          stagedResume.codeMac = resumeCodeMac(key, username, deviceId, pauseFence, body.code, stagedResume);
+          // Prepare an immutable durable intent *before* spending the factor.
+          try { await store.stageResume(username, stagedResume); } catch (error) {
+            // A concurrent valid factor cannot overtake an already staged
+            // single-use proof, even if both verified before the first commit.
+            if (error?.code === "SYNC_RESUME_PENDING") return fail("concurrent_resume_pending");
+            return errorResponse(res, 503, store.commitIndeterminate ? "sync_commit_indeterminate" : "Sync re-authentication unavailable",
+              store.commitIndeterminate ? { code: "SYNC_COMMIT_INDETERMINATE" } : {});
+          }
+          try { saveUsers(freshUsers); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
+        }
+      }
+      // Staged intent fences the exact pause nonce. If final persistence fails,
+      // it stays paused and the MAC-bound intent survives restart for retry.
+      let wasPaused;
+      try {
+        ({ wasPaused } = stagedResume
+          ? await store.finishStagedResume(username, stagedResume)
+          : await store.resumeDevice(username, deviceId));
+      } catch {
+        return errorResponse(res, 503, store.commitIndeterminate ? "sync_commit_indeterminate" : "Sync re-authentication unavailable",
+          store.commitIndeterminate ? { code: "SYNC_COMMIT_INDETERMINATE" } : {});
       }
       state.count = 0;
-      const { wasPaused } = await store.resumeDevice(username, deviceId);
       if (wasPaused) audit("sync.device.resumed", req, deviceId, "resumed", "success", {});
       return res.json({ protocolVersion: PROTOCOL_VERSION, deviceId, paused: false, wasPaused });
     } finally {
