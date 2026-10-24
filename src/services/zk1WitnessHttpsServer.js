@@ -196,15 +196,24 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals,
         return write(res, 403, { error: "FORBIDDEN" });
       }
       const body = await readBoundedJson(req,
-        req.url === "/v1/cas-anchor/advance" ? 40 * 1024 : MAX_BODY_BYTES);
+        req.url === "/v1/cas-anchor/advance"
+          ? (casAnchorFloor?.requiresPhysicalAttestation ? 96 * 1024 : 40 * 1024)
+          : MAX_BODY_BYTES);
       if (req.url === "/v1/cas-anchor/head") {
         exact(body, ["nonce"]);
         const head = await casAnchorFloor.freshHeadAsync({ nonce: decode(body.nonce, BYTE_FIELDS.nonce) });
         return write(res, 200, { head, authority: "WITNESS_CAS_ANCHOR_FLOOR_V1" });
       }
       if (req.url === "/v1/cas-anchor/advance") {
-        exact(body, ["records"]);
-        const result = casAnchorFloor.advance({ records: body.records });
+        const strict = casAnchorFloor.requiresPhysicalAttestation;
+        exact(body, strict ? ["records", "evidence"] : ["records"]);
+        // Legacy signed-status-only requests cannot downgrade an independent
+        // floor enrolled in mandatory physical PG admission mode.
+        const result = strict
+          ? await casAnchorFloor.advanceAttested({
+            records: body.records, evidence: body.evidence,
+          })
+          : casAnchorFloor.advance({ records: body.records });
         return write(res, 200, { sequence: result.sequence,
           lastHash: result.lastHash, authority: "WITNESS_CAS_ANCHOR_FLOOR_V1" });
       }

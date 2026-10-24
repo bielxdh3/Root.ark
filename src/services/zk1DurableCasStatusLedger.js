@@ -98,9 +98,10 @@ class Zk1DurableCasStatusLedger {
   #casAnchorWitness = null;
   #lastWitnessFloor = null;
   #anchorQueue = Promise.resolve();
+  #casPhysicalEvidenceProvider = null;
   constructor(filename, { bootstrapNew = false, statusKeyId, statusPrivateKey,
     witnessPinned, nowSeconds, anchorPath, trustedAnchorMinimumHead,
-    casAnchorWitness = null } = {}) {
+    casAnchorWitness = null, casAnchorPhysicalEvidenceProvider = null } = {}) {
     if (typeof filename !== "string" || !filename
       || !(statusPrivateKey instanceof crypto.KeyObject)
       || statusPrivateKey.type !== "private" || statusPrivateKey.asymmetricKeyType !== "ed25519"
@@ -142,6 +143,13 @@ class Zk1DurableCasStatusLedger {
         lastHash: trustedAnchorMinimumHead.lastHash,
       });
     }
+    if (casAnchorPhysicalEvidenceProvider !== null) {
+      if (casAnchorWitness === null || !casAnchorPhysicalEvidenceProvider
+        || typeof casAnchorPhysicalEvidenceProvider.forSignedRecord !== "function") {
+        fail("CAS_ANCHOR_REQUIRED");
+      }
+      this.#casPhysicalEvidenceProvider = casAnchorPhysicalEvidenceProvider;
+    }
     if (typeof anchorPath !== "string" || !path.isAbsolute(anchorPath)
       || path.resolve(anchorPath) === absolute) fail("CAS_ANCHOR_REQUIRED");
     const anchorExisted = fs.existsSync(anchorPath);
@@ -161,7 +169,9 @@ class Zk1DurableCasStatusLedger {
         || !same(row.status_fingerprint, ownFp)
         || !same(row.witness_id, this.witnessKeyId)
         || !same(row.witness_fingerprint, witnessFp)
-        || (row.cas_anchor_witness_required ?? 0) !== (casAnchorWitness === null ? 0 : 1)) {
+        || (row.cas_anchor_witness_required ?? 0) !== (casAnchorWitness === null ? 0 : 1)
+        || (row.cas_anchor_physical_required ?? 0)
+          !== (casAnchorPhysicalEvidenceProvider === null ? 0 : 1)) {
         // A CAS bootstrapped in strict witness-anchor mode MUST NOT restart
         // without its independent witness, even if both local files are valid.
         // Likewise never bless an old unauthenticated CAS by toggling on the
@@ -187,6 +197,7 @@ class Zk1DurableCasStatusLedger {
         trustedMinimumHead: trustedAnchorMinimumHead,
         witnessRequired: casAnchorWitness !== null,
         witnessKeyId: this.witnessKeyId,
+        normativePhysicalAdmissionRequired: casAnchorPhysicalEvidenceProvider !== null,
       });
       if (this.#casAnchorWitness && this.#lastWitnessFloor.sequence === 0
         && inspectedAnchor.headCheckpoint().sequence !== 0) {
@@ -223,7 +234,9 @@ class Zk1DurableCasStatusLedger {
           status_fingerprint BLOB NOT NULL, witness_id BLOB NOT NULL,
           witness_fingerprint BLOB NOT NULL,
           cas_anchor_witness_required INTEGER NOT NULL DEFAULT 0
-            CHECK(cas_anchor_witness_required IN (0,1))
+            CHECK(cas_anchor_witness_required IN (0,1)),
+          cas_anchor_physical_required INTEGER NOT NULL DEFAULT 0
+            CHECK(cas_anchor_physical_required IN (0,1))
         );
         CREATE TABLE IF NOT EXISTS cas_scope (
           scope_key TEXT PRIMARY KEY, keyring_id BLOB NOT NULL, revision INTEGER,
@@ -246,10 +259,12 @@ class Zk1DurableCasStatusLedger {
       `);
       if (!existed) {
         this.db.prepare(`INSERT INTO cas_identity
-          (id,status_id,status_fingerprint,witness_id,witness_fingerprint,cas_anchor_witness_required)
-          VALUES(1,?,?,?,?,?)`)
+          (id,status_id,status_fingerprint,witness_id,witness_fingerprint,
+          cas_anchor_witness_required,cas_anchor_physical_required)
+          VALUES(1,?,?,?,?,?,?)`)
           .run(this.statusKeyId, ownFp, this.witnessKeyId, witnessFp,
-            casAnchorWitness === null ? 0 : 1);
+            casAnchorWitness === null ? 0 : 1,
+            casAnchorPhysicalEvidenceProvider === null ? 0 : 1);
       }
       this.anchor = new Zk1CasTerminalAnchor(anchorPath, {
         bootstrapNew: !existed && bootstrapNew,
@@ -258,6 +273,7 @@ class Zk1DurableCasStatusLedger {
         trustedMinimumHead: trustedAnchorMinimumHead,
         witnessRequired: casAnchorWitness !== null,
         witnessKeyId: this.witnessKeyId,
+        normativePhysicalAdmissionRequired: casAnchorPhysicalEvidenceProvider !== null,
       });
       this.scopeRow = this.db.prepare("SELECT * FROM cas_scope WHERE scope_key=?");
       this.operationRow = this.db.prepare("SELECT * FROM cas_operation WHERE reservation_id=?");
@@ -300,7 +316,19 @@ class Zk1DurableCasStatusLedger {
           afterSequence: witnessHead.sequence, limit: 16,
         });
         if (!records.length) fail("CAS_LEDGER_ROLLBACK");
-        try { await this.#casAnchorWitness.advanceSignedRecords(records); }
+        let evidence;
+        if (this.#casPhysicalEvidenceProvider) {
+          evidence = [];
+          try {
+            for (const signedRecord of records) {
+              // Signed owner bindings must be retained across restart. The
+              // witness independently validates each one and fresh-queries
+              // PostgreSQL; these provider bytes themselves grant no authority.
+              evidence.push(await this.#casPhysicalEvidenceProvider.forSignedRecord(signedRecord));
+            }
+          } catch (_) { fail("CAS_ANCHOR_WITNESS_UNAVAILABLE"); }
+        }
+        try { await this.#casAnchorWitness.advanceSignedRecords(records, evidence); }
         catch (_) {
           if (++failedAdvances > 1) fail("CAS_ANCHOR_WITNESS_UNAVAILABLE");
           // One fresh signed read disambiguates a lost ACK. If the witness did

@@ -63,7 +63,7 @@ class Zk1WitnessCasAnchorHttpsClient {
   }
   async #send(urlPath, body, timeoutMs = this.#timeout) {
     const payload = Buffer.from(JSON.stringify(body), "utf8");
-    if (payload.length < 2 || payload.length > (urlPath.endsWith("/advance") ? 40 * 1024 : 4096)) fail();
+    if (payload.length < 2 || payload.length > (urlPath.endsWith("/advance") ? 96 * 1024 : 4096)) fail();
     try {
       return await new Promise((resolve, reject) => {
         let ended = false;
@@ -129,7 +129,7 @@ class Zk1WitnessCasAnchorHttpsClient {
         minimumHead });
     } catch (_) { fail(); }
   }
-  async advanceSignedRecords(records) {
+  async advanceSignedRecords(records, evidence = undefined) {
     if (!Array.isArray(records) || !records.length || records.length > 16
       || Reflect.ownKeys(records).length !== records.length + 1) fail();
     const snapshot = [];
@@ -139,7 +139,19 @@ class Zk1WitnessCasAnchorHttpsClient {
         || d.value.length < 100 || d.value.length > 2048) fail();
       snapshot.push(d.value);
     }
-    const response = await this.#send("/v1/cas-anchor/advance", { records: snapshot });
+    let attested = undefined;
+    if (evidence !== undefined) {
+      if (!Array.isArray(evidence) || evidence.length !== snapshot.length
+        || Reflect.ownKeys(evidence).length !== evidence.length + 1) fail();
+      // Only JSON-data evidence crosses this interface. The witness performs
+      // the actual fresh-nonce PG readback, signature and chain verification.
+      try { attested = JSON.parse(JSON.stringify(evidence)); }
+      catch (_) { fail(); }
+      if (!Array.isArray(attested) || attested.length !== snapshot.length) fail();
+    }
+    const response = await this.#send("/v1/cas-anchor/advance", {
+      records: snapshot, ...(attested ? { evidence: attested } : {}),
+    });
     try {
       exact(response, ["sequence", "lastHash", "authority"]);
       if (response.authority !== "WITNESS_CAS_ANCHOR_FLOOR_V1"

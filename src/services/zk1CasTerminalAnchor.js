@@ -78,12 +78,15 @@ class Zk1CasTerminalAnchor {
   #verifiedSnapshot = null;
   #verifiedFileIdentity = null;
   constructor(filename, { bootstrapNew, statusKeyId, statusPrivateKey,
-    trustedMinimumHead, witnessRequired = false, witnessKeyId } = {}) {
+    trustedMinimumHead, witnessRequired = false, witnessKeyId,
+    normativePhysicalAdmissionRequired = false } = {}) {
     if (typeof filename !== "string" || !path.isAbsolute(filename)
       || !(statusPrivateKey instanceof crypto.KeyObject)
       || statusPrivateKey.asymmetricKeyType !== "ed25519" || statusPrivateKey.type !== "private"
       || !Buffer.isBuffer(statusKeyId) || statusKeyId.length !== 16
       || typeof witnessRequired !== "boolean"
+      || typeof normativePhysicalAdmissionRequired !== "boolean"
+      || (normativePhysicalAdmissionRequired && !witnessRequired)
       || (witnessRequired && (!Buffer.isBuffer(witnessKeyId)
         || witnessKeyId.length !== 16 || witnessKeyId.equals(statusKeyId)))) fail();
     this.filename = filename;
@@ -97,7 +100,10 @@ class Zk1CasTerminalAnchor {
       // attacker cannot erase mandatory witness protection by flipping a bit
       // and then starting the legacy standalone service with missing config.
       const policy = { ...this.identity, witnessRequired: true,
-        witnessKeyId: base64(witnessKeyId) };
+        witnessKeyId: base64(witnessKeyId),
+        ...(normativePhysicalAdmissionRequired ? {
+          normativePhysicalAdmissionRequired: true,
+        } : {}) };
       this.identity = { ...policy, policySignature: base64(crypto.sign(null,
         Buffer.concat([WITNESS_POLICY_DOMAIN, Buffer.from(JSON.stringify(policy))]),
         statusPrivateKey)) };
