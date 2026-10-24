@@ -17,7 +17,19 @@ const HEAD_FIELDS = ["schema", "status", "account_id", "compartment_id", "keyrin
   "revision", "digest", "epoch", "previous_revision", "previous_digest",
   "operation_id", "pop_challenge_id", "request_nonce", "commit_nonce",
   "sequence", "previous_receipt_sha256", "issued_at", "expires_at"];
+// Capture the built-in public-key exporter at module load. An Ed25519
+// KeyObject instance is extensible: caller code can override `.export()` to
+// invent an unrelated SPKI pin without changing crypto.verify's real key.
+const NATIVE_PUBLIC_EXPORT = Object.getPrototypeOf(crypto.createPublicKey({
+  key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
+  format: "der", type: "spki",
+})).export;
 function denied() { throw new Error("ZK_OWNER_V2_REVOCATION_DENIED"); }
+function nativePublicSpki(value) {
+  if (!(value instanceof crypto.KeyObject) || value.type !== "public"
+    || value.asymmetricKeyType !== "ed25519") denied();
+  return Buffer.from(NATIVE_PUBLIC_EXPORT.call(value, { format: "der", type: "spki" }));
+}
 function b64(value, size) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) denied();
   const bytes = Buffer.from(value, "base64url");
@@ -37,8 +49,8 @@ function now() { return Math.floor(Date.now() / 1000); }
 function ownerKeyMatches(privateKey, ownerPublicKey, pinnedSpki) {
   if (privateKey?.type !== "private" || privateKey.asymmetricKeyType !== "ed25519"
     || ownerPublicKey?.type !== "public" || ownerPublicKey.asymmetricKeyType !== "ed25519") denied();
-  const ownerSpki = ownerPublicKey.export({ format: "der", type: "spki" });
-  if (!same(ownerSpki, crypto.createPublicKey(privateKey).export({ format: "der", type: "spki" }))
+  const ownerSpki = nativePublicSpki(ownerPublicKey);
+  if (!crypto.KeyObject.prototype.equals.call(ownerPublicKey, crypto.createPublicKey(privateKey))
     || !same(hash(ownerSpki), b64(pinnedSpki, 32))) denied();
 }
 function actorDevice(prior, privateKey, revokedId) {
@@ -110,16 +122,16 @@ async function executeOwnerRevocation({
     if (!trusted.trustedCommitmentSignerPublicKey
       || trusted.trustedCommitmentSignerPublicKey.type !== "public"
       || trusted.trustedCommitmentSignerPublicKey.asymmetricKeyType !== "ed25519"
-      || !same(hash(trusted.trustedCommitmentSignerPublicKey.export({
-        format: "der", type: "spki" })), b64(externalPins.witnessSpkiSha256, 32))) denied();
+      || !same(hash(nativePublicSpki(trusted.trustedCommitmentSignerPublicKey)),
+        b64(externalPins.witnessSpkiSha256, 32))) denied();
     if (trusted.trustedCasSignerPublicKey?.type !== "public"
       || trusted.trustedCasSignerPublicKey.asymmetricKeyType !== "ed25519"
       || !Number.isSafeInteger(externalPins.casSequence)
       || externalPins.casSequence < 1
-      || !same(hash(trusted.trustedCasSignerPublicKey.export({
-        format: "der", type: "spki" })), b64(externalPins.casSpkiSha256, 32))
-      || same(trusted.trustedCasSignerPublicKey.export({ format: "der", type: "spki" }),
-        trusted.trustedCommitmentSignerPublicKey.export({ format: "der", type: "spki" }))) denied();
+      || !same(hash(nativePublicSpki(trusted.trustedCasSignerPublicKey)),
+        b64(externalPins.casSpkiSha256, 32))
+      || crypto.KeyObject.prototype.equals.call(trusted.trustedCasSignerPublicKey,
+        trusted.trustedCommitmentSignerPublicKey)) denied();
     ownerKeyMatches(trusted.ownerPrivateKey, trusted.trustedOwnerPublicKey,
       externalPins.ownerSpkiSha256);
     const actor = actorDevice(prior, trusted.trustedActorPrivateKey, targetDeviceId);

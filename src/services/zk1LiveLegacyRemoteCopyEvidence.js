@@ -84,8 +84,10 @@ async function inspectZk1LiveLegacyRemoteCopyEvidence({ optIn, cloudStorage, sco
     || typeof readSignedGeneration !== "function") deny();
   const ownerKey = fingerprintKey(pinnedOwnerPublicKey);
   const generationKey = fingerprintKey(pinnedGenerationPublicKey);
-  if (ownerKey.export({ format: "der", type: "spki" }).equals(
-    generationKey.export({ format: "der", type: "spki" }))) deny();
+  // KeyObject.export() is overridable on each instance. A compromised owner
+  // can lie about a generation public key's DER while crypto.verify() still
+  // accepts its *real* owner signature. Compare native identities instead.
+  if (crypto.KeyObject.prototype.equals.call(ownerKey, generationKey)) deny();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
   // An uncooperative read-only inventory may retain a network request after

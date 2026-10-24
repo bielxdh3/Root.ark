@@ -80,6 +80,25 @@ test("owner-authorized S3 legacy remote copy references are observed read-only w
     namespaceIdentity]) assert.equal(JSON.stringify(first).includes(secret), false);
 });
 
+test("compromised owner signer cannot impersonate a distinct generation authority through KeyObject.export", async () => {
+  const f = fixture();
+  const fakeGenerationPin = crypto.createPublicKey(f.owner.privateKey);
+  fakeGenerationPin.export = () => f.generationKey.publicKey.export({
+    format: "der", type: "spki",
+  });
+  f.args.pinnedGenerationPublicKey = fakeGenerationPin;
+  f.args.readSignedGeneration = async (nonce) => {
+    const statement = { type: "rootark-zk1-legacy-remote-copy-generation/v1",
+      scope, provider: "s3", namespaceIdentity, readerContext: context,
+      generation: 12, nonce };
+    return { statement, signature: sign(f.owner.privateKey, GENERATION_DOMAIN, statement) };
+  };
+  await assert.rejects(inspect(f.args), /ZK_LIVE_LEGACY_REMOTE_COPY_UNAVAILABLE/,
+    "a compromised owner must not forge the separate generation signature used for migration evidence");
+  assert.equal(f.events.includes("inventory"), false,
+    "reject bogus authority separation before any external provider inventory");
+});
+
 test("remote copy evidence refuses old generation, changed identity, foreign owner, unknown class, overflow and replay", async () => {
   for (const attack of [
     (f) => { f.changeGeneration(13); },

@@ -35,11 +35,19 @@ function signed(fields, scope, key) {
   return { ...unsigned, signature: b64(crypto.sign(null,
     commitments.commitmentSigningBytes(unsigned), key)) };
 }
-async function setup() {
+async function setup({ spoofSameAuthority = false } = {}) {
   const state = await fixtures.createInitialState(2);
   const owner = crypto.generateKeyPairSync("ed25519");
   const witness = crypto.generateKeyPairSync("ed25519");
-  const cas = crypto.generateKeyPairSync("ed25519");
+  const cas = spoofSameAuthority ? { privateKey: witness.privateKey,
+    publicKey: crypto.createPublicKey(witness.privateKey) }
+    : crypto.generateKeyPairSync("ed25519");
+  if (spoofSameAuthority) {
+    const foreignCas = crypto.generateKeyPairSync("ed25519");
+    cas.publicKey.export = () => foreignCas.publicKey.export({
+      format: "der", type: "spki",
+    });
+  }
   const previous = state.headManifest;
   const priorDigest = b64(await m.recoveryManifestDigestV2(previous));
   const at = Math.floor(Date.now() / 1000);
@@ -104,6 +112,11 @@ async function setup() {
   return { state, owner, witness, cas, previous, pins, prior, trusted,
     first, second, casReceipt, casAdapter };
 }
+test("owner V2 revocation cannot trust witness and CAS proofs from the same signer with spoofed SPKI export", async () => {
+  const f = await setup({ spoofSameAuthority: true });
+  await assert.rejects(perform(f), /ZK_OWNER_V2_REVOCATION_DENIED/,
+    "distinct pinned signer hashes must refer to distinct native Ed25519 authorities");
+});
 async function perform(f, overrides = {}) {
   const outputs = [];
   let candidate, delivered;
