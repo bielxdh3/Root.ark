@@ -11,6 +11,8 @@ const unzipper = require("unzipper");
 const { DatabaseSync } = require("node:sqlite");
 const { inspectZk1LiveLegacyReferencePreflight } =
   require("./zk1LiveLegacyReferencePreflight");
+const { verifyZk1LegacyArchiveReferentialProof } =
+  require("./zk1LegacyArchiveReferentialProof");
 
 const MAX_ARCHIVES = 32;
 const MAX_ARCHIVE_BYTES = 32 * 1024 * 1024;
@@ -168,7 +170,7 @@ async function inspectArchive(bytes, expected, secret) {
     const checked = await digestInflated(entry, MAX_ENTRY_BYTES,
       name === "data/rootark.sqlite" && manifest.persistence_mode === "sqlite");
     if (checked.bytes) archivedDb = checked.bytes;
-    members.set(name.toLowerCase(), { size: checked.size });
+    members.set(name.toLowerCase(), { size: checked.size, digest: checked.digest });
     counts[category(name)]++;
     mac.update(JSON.stringify([name, checked.size, checked.digest]) + "\n");
   }
@@ -176,14 +178,33 @@ async function inspectArchive(bytes, expected, secret) {
     require("./zk1LiveLegacyArchivedSqliteJoin").inspectZk1LiveLegacyArchivedSqliteJoin({
       sqliteBytes: archivedDb, members,
     });
+  // Include every inflated member's *bytes* and the exact historical join
+  // outcome. SQLite self-references and archive CRC/byte lengths alone cannot
+  // authenticate another independently pinned version of this same backup.
+  const referentialSha256 = crypto.createHash("sha256")
+    .update("rootark-zk1-legacy-archive-referential-graph/v1\0")
+    .update(JSON.stringify({
+      members: [...members.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+        .map(([name, entry]) => [name, entry.size, entry.digest]),
+      historicalSqlite,
+    })).digest("hex");
+  const archiveEvidence = Object.freeze({
+    archiveIdSha256: crypto.createHash("sha256")
+      .update("rootark-zk1-legacy-archive-id/v1\0").update(expected.id).digest("hex"),
+    archiveSha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+    referentialSha256,
+    historicalStatus: historicalSqlite?.status || "UNKNOWN",
+  });
   // A backup may legitimately contain content no longer present in live FTS,
   // which remains a recovery candidate, not an authority for cutover.
   return { ...counts, members: files.size, cloudCompleteClaim: manifest.cloud_complete,
-    historicalSqlite, ephemeralFingerprint: mac.digest("base64url"), globallyComplete: false };
+    historicalSqlite, archiveEvidence, ephemeralFingerprint: mac.digest("base64url"),
+    globallyComplete: false };
 }
 
 async function inspectZk1LiveLegacyRecoverableArchiveGraph({
   optIn, databasePath, persistence, backupDataDir, localUploadsDir, localTempDir,
+  pinnedArchiveReferentialPublicKey, signedArchiveReferentialProofs,
 } = {}) {
   if (optIn !== true || typeof databasePath !== "string" || !path.isAbsolute(databasePath)
     || typeof backupDataDir !== "string" || !path.isAbsolute(backupDataDir)
@@ -232,6 +253,20 @@ async function inspectZk1LiveLegacyRecoverableArchiveGraph({
     }
     db.exec("COMMIT");
     if (!same(dbBefore, regular(databasePath, 1024 * 1024 * 1024))) refuse();
+    // An absent, stale, forged or incomplete owner checkpoint is UNKNOWN. A
+    // separately pinned Ed25519 public key is required: no operator callback
+    // and no signature or secret embedded in the ZIP is trusted here.
+    const signed = Array.isArray(signedArchiveReferentialProofs)
+      && signedArchiveReferentialProofs.length === reports.length
+      && signedArchiveReferentialProofs.length <= MAX_ARCHIVES;
+    const verified = reports.map((report, i) => signed
+      && verifyZk1LegacyArchiveReferentialProof({ evidence: report.archiveEvidence,
+        signedProof: signedArchiveReferentialProofs[i],
+        pinnedOwnerPublicKey: pinnedArchiveReferentialPublicKey }));
+    const verifiedArchives = verified.filter(Boolean).length;
+    const fullyAuthenticated = reports.length > 0 && signed
+      && verifiedArchives === reports.length && unresolvedBackupRows === 0
+      && reports.every((report) => report.historicalSqlite?.status === "BOUNDED_JOINS_ONLY");
     const result = {
       observation: "bounded-readonly-legacy-recoverable-archive-members",
       inspectedArchives: reports.length,
@@ -258,6 +293,16 @@ async function inspectZk1LiveLegacyRecoverableArchiveGraph({
           && reports.every((x) => x.historicalSqlite?.status === "BOUNDED_JOINS_ONLY")
           && unresolvedBackupRows === 0 ? "BOUNDED_JOINS_ONLY" : "UNKNOWN",
         globallyComplete: false,
+      }),
+      archiveEvidence: Object.freeze(reports.map((report) => report.archiveEvidence)),
+      referentialAuthentication: Object.freeze({
+        observation: "owner-signed-archived-sqlite-zip-referential-evidence",
+        status: fullyAuthenticated ? "AUTHENTICATED_BOUNDED_JOINS" : "UNKNOWN",
+        verifiedArchives,
+        unresolvedArchives: reports.filter((report, i) => !verified[i]
+          || report.historicalSqlite?.status !== "BOUNDED_JOINS_ONLY").length + unresolvedBackupRows
+          + (reports.length === 0 ? 1 : 0),
+        globallyComplete: false, authorizesCutover: false, canDeleteLegacy: false,
       }),
       cloudCompleteClaimCount: reports.filter((x) => x.cloudCompleteClaim).length,
       backupRetentionTombstones: preflight.legacy.backupEvidence.retentionTombstones,
