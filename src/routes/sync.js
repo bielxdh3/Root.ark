@@ -55,6 +55,26 @@ function indeterminateCommitError() {
   return error;
 }
 
+// JSON records are ordinary objects after JSON.parse: reserved account,
+// operation, and object identifiers must never resolve inherited properties
+// or invoke the __proto__ setter while persisting tenant-owned entries.
+function ownRecord(record, key) {
+  return record && Object.hasOwn(record, key) ? record[key] : undefined;
+}
+function setOwnRecord(record, key, value) {
+  Object.defineProperty(record, key, {
+    value, enumerable: true, configurable: true, writable: true,
+  });
+}
+function ensureOwnMap(record, key) {
+  let value = ownRecord(record, key);
+  if (!value) {
+    value = {};
+    setOwnRecord(record, key, value);
+  }
+  return value;
+}
+
 async function durableWrite(filePath, value) {
   const directory = path.dirname(filePath);
   await fs.mkdir(directory, { recursive: true });
@@ -157,7 +177,8 @@ function pausedKey(deviceId) {
 }
 
 function isPausedDevice(user, deviceId) {
-  return Boolean(user?.pausedDevices && Object.hasOwn(user.pausedDevices, pausedKey(deviceId)));
+  const pausedDevices = ownRecord(user, "pausedDevices");
+  return Boolean(pausedDevices && Object.hasOwn(pausedDevices, pausedKey(deviceId)));
 }
 
 // Keeps the newest cap-1 versions plus the newest pre-window checkpoint (the last version whose store time is
@@ -198,12 +219,13 @@ class SyncObjectStore {
       if (this.state.version === 1) {
         this.state.version = STORE_VERSION;
         for (const user of Object.values(this.state.users)) {
-          user.versions ||= {};
-          user.revisions ||= {};
-          user.seen ||= {};
-          for (const [objectId, record] of Object.entries(user.objects || {})) {
-            user.versions[objectId] ||= [record];
-            user.revisions[objectId] ||= record.revision;
+          const objects = ensureOwnMap(user, "objects");
+          const versions = ensureOwnMap(user, "versions");
+          const revisions = ensureOwnMap(user, "revisions");
+          ensureOwnMap(user, "seen");
+          for (const [objectId, record] of Object.entries(objects)) {
+            if (!ownRecord(versions, objectId)) setOwnRecord(versions, objectId, [record]);
+            if (!ownRecord(revisions, objectId)) setOwnRecord(revisions, objectId, record.revision);
           }
         }
         await durableWrite(this.filePath, this.state);
@@ -239,13 +261,10 @@ class SyncObjectStore {
   }
 
   user(next, username) {
-    const current = next.users[username] || { objects: {}, versions: {}, revisions: {}, seen: {} };
-    current.objects ||= {};
-    current.versions ||= {};
-    current.revisions ||= {};
-    current.seen ||= {};
-    current.versionTimes ||= {};
-    next.users[username] = current;
+    const current = ownRecord(next.users, username)
+      || { objects: {}, versions: {}, revisions: {}, seen: {} };
+    for (const key of ["objects", "versions", "revisions", "seen", "versionTimes"]) ensureOwnMap(current, key);
+    setOwnRecord(next.users, username, current);
     return current;
   }
 
@@ -253,8 +272,8 @@ class SyncObjectStore {
     return this.transact((next) => {
       const at = this.now();
       const user = this.user(next, username);
-      if (user.seen[input.operationId]) return { kind: "replay", record: null };
-      const current = user.objects[input.objectId] || null;
+      if (ownRecord(user.seen, input.operationId)) return { kind: "replay", record: null };
+      const current = ownRecord(user.objects, input.objectId) || null;
       // Destructive = delete, or any non-create operation that replaces an existing object's state.
       const destructive = Boolean(input.tombstone) || input.operation === "delete" || (input.operation !== "create" && Boolean(current));
       if (destructive && isPausedDevice(user, input.deviceId)) return { kind: "paused", newlyPaused: false, deviceId: input.deviceId };
@@ -266,23 +285,23 @@ class SyncObjectStore {
       if (destructive) {
         const burst = this.burstGuard.recordDestructive(username, input.deviceId, input.objectId, at);
         if (burst.exceeded) {
-          user.pausedDevices ||= {};
+          ensureOwnMap(user, "pausedDevices");
           user.pausedDevices[pausedKey(input.deviceId)] = { pausedAt: new Date(at).toISOString(), reason: burst.objectExceeded ? "object_burst" : "destructive_burst", limit: burst.limit, windowMs: burst.windowMs };
           return { kind: "paused", newlyPaused: true, deviceId: input.deviceId, limit: burst.limit, windowMs: burst.windowMs, objectLimit: burst.objectLimit };
         }
       }
       const record = publicRecord(input);
-      user.objects[input.objectId] = record;
+      setOwnRecord(user.objects, input.objectId, record);
       // Legacy history without timestamps is padded with 0 (treated as older than any retention cutoff).
-      const previousVersions = user.versions[input.objectId] || [];
-      const previousTimes = user.versionTimes?.[input.objectId] || [];
+      const previousVersions = ownRecord(user.versions, input.objectId) || [];
+      const previousTimes = ownRecord(user.versionTimes, input.objectId) || [];
       const padding = Array(Math.max(0, previousVersions.length - previousTimes.length)).fill(0);
-      const pruned = pruneObjectHistory([...previousVersions, record], [...padding, ...previousTimes, at], at - this.retentionMs, user.pausedDevices || {});
-      user.versions[input.objectId] = pruned.versions;
+      const pruned = pruneObjectHistory([...previousVersions, record], [...padding, ...previousTimes, at], at - this.retentionMs, ownRecord(user, "pausedDevices") || {});
+      setOwnRecord(user.versions, input.objectId, pruned.versions);
       user.versionTimes ||= {};
-      user.versionTimes[input.objectId] = pruned.times;
-      user.revisions[input.objectId] = input.revision;
-      user.seen[input.operationId] = true;
+      setOwnRecord(user.versionTimes, input.objectId, pruned.times);
+      setOwnRecord(user.revisions, input.objectId, input.revision);
+      setOwnRecord(user.seen, input.operationId, true);
       const seenIds = Object.keys(user.seen);
       for (const oldId of seenIds.slice(0, Math.max(0, seenIds.length - MAX_SEEN_OPERATIONS))) delete user.seen[oldId];
       return { kind: "stored", record };
@@ -303,20 +322,25 @@ class SyncObjectStore {
 
   isDevicePaused(username, deviceId) {
     if (this.commitIndeterminate) throw indeterminateCommitError();
-    return isPausedDevice(this.state.users[username] || {}, deviceId);
+    return isPausedDevice(ownRecord(this.state.users, username) || {}, deviceId);
   }
 
   list(username, objectId = null) {
     if (this.commitIndeterminate) throw indeterminateCommitError();
-    const user = this.state.users[username] || { objects: {} };
-    if (objectId) return user.objects[objectId] ? [publicRecord(user.objects[objectId])] : [];
-    return Object.values(user.objects).map(publicRecord);
+    const user = ownRecord(this.state.users, username) || { objects: {} };
+    const objects = ownRecord(user, "objects") || {};
+    if (objectId) {
+      const record = ownRecord(objects, objectId);
+      return record ? [publicRecord(record)] : [];
+    }
+    return Object.values(objects).map(publicRecord);
   }
 
   history(username, objectId) {
     if (this.commitIndeterminate) throw indeterminateCommitError();
-    const user = this.state.users[username] || { versions: {} };
-    return (user.versions?.[objectId] || []).map(publicRecord);
+    const user = ownRecord(this.state.users, username) || { versions: {} };
+    const versions = ownRecord(user, "versions") || {};
+    return (ownRecord(versions, objectId) || []).map(publicRecord);
   }
 }
 
