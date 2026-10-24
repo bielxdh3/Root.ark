@@ -410,6 +410,19 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   const s3Key = s3Adapter.key(address.folder, address.name, "uploads");
   const driveKey = driveAdapter.key(address.folder, address.name, "uploads");
   const davKey = webdavAdapter.key(address.folder, address.name, "uploads");
+  const signVersion = (reader) => signOwnerProviderVersionPin({
+    ownerPrivateKey: ownerKeys.privateKey, scope, operation, root,
+    byteLength: ciphertext.length,
+    ownerHead: { revision: ownerRevision, digest: ownerDigest, epoch: ownerEpoch },
+    target: { provider: reader.provider,
+      namespaceIdentity: reader.cloudReader.zk1StorageNamespace(),
+      expectedReaderContext: reader.expectedReaderContext,
+      providerObjectKey: reader.cloudReader.key(address.folder, address.name, "uploads"),
+      pinnedDriveFileId: reader.pinnedDriveFileId },
+    providerVersionId: reader.provider === "s3" ? "owner-version-v1" : null,
+    providerEtag: reader.provider === "webdav" ? '"opaque-v1"' : null,
+  });
+  for (const reader of readers) reader.ownerSignedVersionPin = signVersion(reader);
   stores.s3.set(`/quorum-fixture/${s3Key}`, Buffer.from(ciphertext));
   stores.drive.set(driveId, Buffer.from(ciphertext));
   stores.webdav.set(`/dav/${davKey}`, Buffer.from(ciphertext));
@@ -424,20 +437,7 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     readers, minimumMatchingProviders: 2 };
 
   await t.test("owner Ed25519 pins exact S3 version, WebDAV ETag and Drive ID across fallback and restart", async () => {
-    const pinnedReaders = readers.map((reader) => {
-      const target = { provider: reader.provider,
-        namespaceIdentity: reader.cloudReader.zk1StorageNamespace(),
-        expectedReaderContext: reader.expectedReaderContext,
-        providerObjectKey: reader.cloudReader.key(address.folder, address.name, "uploads"),
-        pinnedDriveFileId: reader.pinnedDriveFileId };
-      return { ...reader, ownerSignedVersionPin: signOwnerProviderVersionPin({
-        ownerPrivateKey: ownerKeys.privateKey, scope, operation, root,
-        byteLength: ciphertext.length,
-        ownerHead: { revision: ownerRevision, digest: ownerDigest, epoch: ownerEpoch },
-        target, providerVersionId: reader.provider === "s3" ? "owner-version-v1" : null,
-        providerEtag: reader.provider === "webdav" ? '"opaque-v1"' : null,
-      }) };
-    });
+    const pinnedReaders = readers.map((reader) => ({ ...reader }));
     const request = { ...recoverInput, readers: pinnedReaders, minimumMatchingProviders: 3 };
     const fullyPinned = await gateway.restoreExact(request);
     assert.deepEqual(fullyPinned.ciphertext, ciphertext);
@@ -447,6 +447,24 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     assert.equal(fullyPinned.verifiedProviders[0].providerVersionId, "owner-version-v1");
     assert.equal(fullyPinned.verifiedProviders[1].providerFileId, driveId);
     assert.equal(fullyPinned.verifiedProviders[2].providerEtag, '"opaque-v1"');
+
+    // Attacker strips every owner-signed provider version after the owner
+    // approved S3 VersionId/WebDAV ETag. Same bytes at stale versions must
+    // never become an unsigned 2/3 quorum, including after a gateway restart.
+    const allStripped = pinnedReaders.map(({ ownerSignedVersionPin, ...reader }) => reader);
+    s3CurrentVersion = "owner-version-v0";
+    webdavCurrentEtag = '"opaque-v0"';
+    const beforeStrip = { ...hits };
+    await assert.rejects(gateway.restoreExact({ ...request, readers: allStripped,
+      minimumMatchingProviders: 2 }), /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+    "removing ALL owner signatures must not turn a signed version quorum into legacy");
+    const afterRestart = new Zk1MultiproviderCiphertextRestore(directGatewayPins);
+    await assert.rejects(afterRestart.restoreExact({ ...request, readers: allStripped,
+      minimumMatchingProviders: 2 }), /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+    "stripped signatures must still be rejected by a new gateway instance");
+    assert.deepEqual(hits, beforeStrip, "stripped owner signatures denied before remote GET");
+    s3CurrentVersion = "owner-version-v1";
+    webdavCurrentEtag = '"opaque-v1"';
 
     const beforeForgery = { ...hits };
     for (const forged of [
@@ -469,7 +487,7 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
       /ZK_MULTIPROVIDER_RESTORE_DENIED/);
     }
     await assert.rejects(gateway.restoreExact({ ...request,
-      readers: [pinnedReaders[0], readers[1], pinnedReaders[2]] }),
+      readers: [pinnedReaders[0], allStripped[1], pinnedReaders[2]] }),
     /ZK_MULTIPROVIDER_RESTORE_DENIED/, "signed quorum cannot downgrade to unpinned Drive");
     assert.deepEqual(hits, beforeForgery, "forged versions and downgrade deny before HTTP GET");
 
@@ -945,6 +963,26 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   assert.equal(authorizedBody.remoteDurabilityProven, false);
   assert.equal(authorizedBody.administratorSignaturesVerified, true);
   assert.equal(authorizedBody.providerPhysicalIndependenceProven, false);
+  // Remove all owner pins from the server's closure, leaving otherwise valid
+  // device/session/CAS admission, sidecar, bytes and remote provider domains.
+  // Historical versions retain the exact ciphertext digest: only signed
+  // VersionId/ETag enforcement can distinguish the stale copies.
+  const pinnedRemoteReaders = remoteRecovery.readers;
+  remoteRecovery.readers = readers.map(({ ownerSignedVersionPin, ...reader }) => reader);
+  s3CurrentVersion = "owner-version-v0";
+  webdavCurrentEtag = '"opaque-v0"';
+  const beforeHttpStrip = { ...hits };
+  const strippedHttp = await post(await makeSignedRequest());
+  assert.equal(strippedHttp.status, 403,
+    "authenticated Express POST must reject removal of every owner version signature");
+  assert.equal((await strippedHttp.text()).includes("ciphertextBase64"), false);
+  assert.equal((await sendGet()).status, 403,
+    "dedicated GET handler must also reject stripped owner versions");
+  assert.deepEqual(hits, beforeHttpStrip,
+    "stripped owner pins must deny before remote sidecar or ciphertext GET");
+  remoteRecovery.readers = pinnedRemoteReaders;
+  s3CurrentVersion = "owner-version-v1";
+  webdavCurrentEtag = '"opaque-v1"';
   // Same real Express signed POST must survive one corrupt ciphertext provider,
   // but a second unavailable peer leaves no 2/3 byte quorum.
   const intactWebdav = Buffer.from(stores.webdav.get(`/dav/${davKey}`));

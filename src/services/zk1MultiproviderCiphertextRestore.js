@@ -77,20 +77,25 @@ function cloneOperation(value) {
     revision: whole(op.revision), epoch: whole(op.epoch, 0),
     ciphertext_sha256: copied(op.ciphertext_sha256, 32) };
 }
+function requireOwnerVersionPins(values) {
+  // This is a protocol requirement, independent of all request/constructor
+  // flags. An unpinned legacy inventory can still be inspected via its signed
+  // catalog, but cannot release cloud ciphertext through this restore API.
+  if (!Array.isArray(values) || values.length < 2 || values.length > 3
+    || Reflect.ownKeys(values).length !== values.length + 1
+    || values.some((item) => !item || typeof item !== "object"
+      || !Object.hasOwn(item, "ownerSignedVersionPin"))) deny();
+}
 function pinnedReaders(values, providerDomains, scope, operation, root, byteLength,
   ownerHead, ownerPublicKey) {
-  if (!Array.isArray(values) || values.length < 2 || values.length > 3
-    || Reflect.ownKeys(values).length !== values.length + 1) deny();
+  requireOwnerVersionPins(values);
   const result = [];
   const names = new Set();
   const namespaces = new Set();
-  // Signed-version quorums cannot silently fall back to unpinned peers.
-  const signedMode = values.some((item) => item && typeof item === "object"
-    && Object.hasOwn(item, "ownerSignedVersionPin"));
   for (const value of values) {
     const fields = ["cloudReader", "provider", "expectedReaderContext",
-      "pinnedDriveFileId", "domainAttestation"];
-    const item = exact(value, signedMode ? [...fields, "ownerSignedVersionPin"] : fields);
+      "pinnedDriveFileId", "domainAttestation", "ownerSignedVersionPin"];
+    const item = exact(value, fields);
     const reader = item.cloudReader;
     if (!reader || typeof reader !== "object"
       || !["s3", "gdrive", "webdav"].includes(item.provider)
@@ -109,19 +114,19 @@ function pinnedReaders(values, providerDomains, scope, operation, root, byteLeng
     namespaces.add(namespace);
     const address = zk1CloudCopyAddress({ scope, operationId: operation.operation_id });
     const providerObjectKey = reader.key(address.folder, address.name, "uploads");
-    const versionPin = signedMode ? verifyOwnerProviderVersionPin({
+    const versionPin = verifyOwnerProviderVersionPin({
       signedPin: item.ownerSignedVersionPin, pinnedOwnerPublicKey: ownerPublicKey,
       scope, operation, root, byteLength, ownerHead,
       target: { provider: item.provider, namespaceIdentity: namespace,
         expectedReaderContext: item.expectedReaderContext, providerObjectKey,
         pinnedDriveFileId: item.pinnedDriveFileId },
-    }) : { providerVersionId: null, providerEtag: null };
+    });
     result.push({ reader, provider: item.provider, namespace,
       context: item.expectedReaderContext, driveId: item.pinnedDriveFileId,
       domainAttestation: item.domainAttestation,
-      ownerPinnedObjectKey: signedMode ? providerObjectKey : null,
+      ownerPinnedObjectKey: providerObjectKey,
       providerVersionId: versionPin.providerVersionId,
-      providerEtag: versionPin.providerEtag, ownerSignedVersionPinVerified: signedMode });
+      providerEtag: versionPin.providerEtag, ownerSignedVersionPinVerified: true });
   }
   providerDomains.verify({ targets: result.map((item) => ({
     provider: item.provider, namespaceIdentity: item.namespace,
@@ -414,6 +419,7 @@ class Zk1MultiproviderCiphertextRestore {
     const limit = createZk1ProviderDeadline({
       deadlineMs: this.#ioDeadlineMs, parentSignal: abortSignal });
     try {
+      requireOwnerVersionPins(readers);
       const fixed = cloneOperation(operation);
       const checkedScope = inventory.normalizeScope(scope);
       if (["account_id", "compartment_id", "keyring_id"].some((name) =>
