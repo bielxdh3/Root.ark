@@ -86,6 +86,13 @@ function saveUsers(users = []) {
 }
 
 function commitSyncResumeProof(claim) {
+  if (!claim || typeof claim.username !== "string" || typeof claim.deviceId !== "string"
+    || claim.deviceId.length < 1 || claim.deviceId.length > 256
+    || (claim.pauseFence !== null && (typeof claim.pauseFence !== "string"
+      || claim.pauseFence.length > 512))
+    || typeof claim.codeMac !== "string" || !/^[a-f0-9]{64}$/.test(claim.codeMac)) {
+    return "conflict";
+  }
   const db = getDb();
   // BEGIN IMMEDIATE serializes the read/compare/selective update with
   // concurrent SQLite writers, including other server processes. Never
@@ -109,11 +116,27 @@ function commitSyncResumeProof(claim) {
       totpLastUsedStep: row.totp_last_used_step,
     };
     const result = applySyncResumeAccountProof(user, claim);
+    if (result === "already") {
+      // An equal replay digest alone is not ownership of the factor: another
+      // host could have spent it for a different device/pause. SQLite pins
+      // the *exact* signed resume intent in the same transaction as spending.
+      const grant = db.prepare(`SELECT code_mac, device_id, pause_fence
+        FROM sync_resume_factor_spend_grant
+        WHERE username=? AND replay_digest=?`).get(claim.username, claim.expectedReplayDigest);
+      return grant && grant.code_mac === claim.codeMac
+        && grant.device_id === claim.deviceId
+        && grant.pause_fence === claim.pauseFence ? "already" : "conflict";
+    }
     if (result !== "committed") return result;
     const update = db.prepare(`UPDATE users SET totp_recovery_hashes_json = ?,
       totp_last_used_step = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`)
       .run(jsonStringify(user.totpRecoveryHashes), user.totpLastUsedStep, nowIso(), claim.username);
-    return update.changes === 1 ? "committed" : "conflict";
+    if (update.changes !== 1) throw new Error("Sync resume account CAS failed");
+    db.prepare(`INSERT INTO sync_resume_factor_spend_grant
+      (username, replay_digest, code_mac, device_id, pause_fence, committed_at)
+      VALUES (?, ?, ?, ?, ?, ?)`).run(claim.username, claim.expectedReplayDigest,
+      claim.codeMac, claim.deviceId, claim.pauseFence, nowIso());
+    return "committed";
   }).immediate();
 }
 

@@ -32,6 +32,7 @@ test("SQLite recovery commit is selective, atomic and rejects admin revocation o
   const claim = { username: "alice", passwordHash: original.password,
     sessionVersion: original.sessionVersion, secretDigest: secretDigest(original),
     authorizationDigest: authorizationDigest(original),
+    deviceId: "device-a", pauseFence: "pause-first", codeMac: "a".repeat(64),
     proof: { type: "recovery", hash: "recovery-A" },
     expectedReplayDigest: replayDigest(afterProof) };
 
@@ -59,6 +60,12 @@ test("SQLite recovery commit is selective, atomic and rejects admin revocation o
   assert.equal(usersRepository.commitSyncResumeProof(updatedClaim), "committed");
   assert.equal(usersRepository.commitSyncResumeProof(updatedClaim), "already",
     "the same persisted staged intent may finish after a sync-storage failure");
+  assert.equal(usersRepository.commitSyncResumeProof({ ...updatedClaim, deviceId: "device-b" }), "conflict",
+    "a second device may not reuse another paused device's spent factor");
+  assert.equal(usersRepository.commitSyncResumeProof({ ...updatedClaim, pauseFence: "pause-fork" }), "conflict",
+    "a forked pause marker may not borrow the same consumed factor");
+  assert.equal(usersRepository.commitSyncResumeProof({ ...updatedClaim, codeMac: "b".repeat(64) }), "conflict",
+    "a different signed resume intent cannot claim the committed factor");
   const committed = usersRepository.loadUsers().find((item) => item.username === "alice");
   assert.deepEqual(committed.totpRecoveryHashes, ["recovery-B"]);
   assert.equal(committed.role, "user");

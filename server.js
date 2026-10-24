@@ -47,7 +47,6 @@ const {
 const dbConfig = require("./db");
 const { runMigrations } = require("./db/migrations");
 const usersRepository = require("./repositories/usersRepository");
-const { applySyncResumeAccountProof } = require("./src/services/syncResumeAccountProof");
 const foldersRepository = require("./repositories/foldersRepository");
 const pendingUploadsRepository = require("./repositories/pendingUploadsRepository");
 const publicLinksRepository = require("./repositories/publicLinksRepository");
@@ -667,19 +666,12 @@ function saveUsers(users) {
 }
 
 function commitSyncResumeProof(claim) {
-  if (shouldUseDatabase()) {
-    // A simultaneous JSON mirror cannot share SQLite's atomic compare-and-
-    // update boundary. Refuse this 2FA mutation until there is one authority.
-    if (shouldWriteLegacyJson()) throw new Error("Sync resume requires a single authoritative account store");
-    return usersRepository.commitSyncResumeProof(claim);
+  // Interprocess JSON read+rename has no globally serialized CAS. Fail closed
+  // instead of allowing parallel servers to spend a single recovery factor.
+  if (!shouldUseDatabase() || shouldWriteLegacyJson()) {
+    throw new Error("Sync 2FA resume requires one authoritative SQLite account store");
   }
-  // Legacy JSON is single-process only. Reload after all async work and write
-  // just once within this event-loop turn; cross-process JSON CAS is NOT proven.
-  const users = loadUsers();
-  const user = users.find((entry) => entry?.username === claim.username);
-  const result = applySyncResumeAccountProof(user, claim);
-  if (result === "committed") saveUsers(users);
-  return result;
+  return usersRepository.commitSyncResumeProof(claim);
 }
 
 function getBasePermissions() {
@@ -6205,7 +6197,8 @@ registerSyncRoutes({
   bcrypt,
   loadUsers,
   saveUsers,
-  commitSyncResumeProof,
+  commitSyncResumeProof: shouldUseDatabase() && !shouldWriteLegacyJson()
+    ? commitSyncResumeProof : null,
   getTotpKey: () => getServerMasterKey({ createIfMissing: false }),
 });
 

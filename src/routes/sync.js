@@ -17,6 +17,7 @@ const MAX_REQUEST_BYTES = 9 * 1024 * 1024;
 const MAX_CIPHERTEXT_BYTES = 8 * 1024 * 1024;
 const WINDOWS_RENAME_MAX_ATTEMPTS = 3;
 const WINDOWS_RENAME_RETRY_DELAY_MS = 10;
+const SYNC_LOCK_WAIT_MS = 2000;
 
 function isUnsupportedDirectorySync(error) {
   return ["EINVAL", "ENOTSUP"].includes(error?.code)
@@ -240,29 +241,71 @@ class SyncObjectStore {
     this.now = now;
   }
 
-  async open() {
-    try {
-      this.state = JSON.parse(await fs.readFile(this.filePath, "utf8"));
-      if (![1, STORE_VERSION].includes(this.state.version) || !this.state.users || typeof this.state.users !== "object") throw new Error("Invalid sync object store");
-      if (this.state.version === 1) {
-        this.state.version = STORE_VERSION;
-        for (const user of Object.values(this.state.users)) {
-          const objects = ensureOwnMap(user, "objects");
-          const versions = ensureOwnMap(user, "versions");
-          const revisions = ensureOwnMap(user, "revisions");
-          ensureOwnMap(user, "seen");
-          for (const [objectId, record] of Object.entries(objects)) {
-            if (!ownRecord(versions, objectId)) setOwnRecord(versions, objectId, [record]);
-            if (!ownRecord(revisions, objectId)) setOwnRecord(revisions, objectId, record.revision);
-          }
+  // Exclusive-create on the SAME local filesystem fences independent Node
+  // processes. Never break an orphaned lock automatically: doing so after a
+  // slow fsync or suspend would reintroduce split-brain writes. A crashed
+  // writer therefore requires explicit operator recovery and remains NO-GO.
+  async withWriteLock(callback) {
+    const lockPath = `${this.filePath}.writer-lock`;
+    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+    const deadline = Date.now() + SYNC_LOCK_WAIT_MS;
+    let handle;
+    while (!handle) {
+      try {
+        handle = await fs.open(lockPath, "wx", 0o600);
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+        if (Date.now() >= deadline) {
+          throw Object.assign(new Error("Independent sync writer lock is busy or orphaned"), { code: "SYNC_STORE_LOCK_BUSY" });
         }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    try {
+      return await callback();
+    } finally {
+      try {
+        await handle.close();
+        await fs.unlink(lockPath);
+      } catch (error) {
+        this.commitIndeterminate = true;
+        throw new Error("Sync writer lock release failed; restart and investigate before writing", { cause: error });
+      }
+    }
+  }
+
+  async readCurrentState() {
+    const current = JSON.parse(await fs.readFile(this.filePath, "utf8"));
+    if (![1, STORE_VERSION].includes(current.version) || !current.users || typeof current.users !== "object" || Array.isArray(current.users)) {
+      throw new Error("Invalid sync object store");
+    }
+    attestCiphertextOnlySyncState(current);
+    return current;
+  }
+
+  async open() {
+    await this.withWriteLock(async () => {
+      try {
+        this.state = await this.readCurrentState();
+        if (this.state.version === 1) {
+          this.state.version = STORE_VERSION;
+          for (const user of Object.values(this.state.users)) {
+            const objects = ensureOwnMap(user, "objects");
+            const versions = ensureOwnMap(user, "versions");
+            const revisions = ensureOwnMap(user, "revisions");
+            ensureOwnMap(user, "seen");
+            for (const [objectId, record] of Object.entries(objects)) {
+              if (!ownRecord(versions, objectId)) setOwnRecord(versions, objectId, [record]);
+              if (!ownRecord(revisions, objectId)) setOwnRecord(revisions, objectId, record.revision);
+            }
+          }
+          await durableWrite(this.filePath, this.state);
+        }
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
         await durableWrite(this.filePath, this.state);
       }
-      attestCiphertextOnlySyncState(this.state);
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-      await durableWrite(this.filePath, this.state);
-    }
+    });
     return this;
   }
 
@@ -274,15 +317,19 @@ class SyncObjectStore {
     // scheduling chain, never the failed mutation or its result.
     this.queue = this.queue.catch(() => {}).then(async () => {
       if (this.commitIndeterminate) throw indeterminateCommitError();
-      const next = JSON.parse(JSON.stringify(this.state));
-      result = await mutator(next);
-      try {
-        await durableWrite(this.filePath, next);
-      } catch (error) {
-        if (error?.syncCommitIndeterminate === true) this.commitIndeterminate = true;
-        throw error;
-      }
-      this.state = next;
+      await this.withWriteLock(async () => {
+        // Refresh *inside* the process-external lock: a sibling may have
+        // advanced pause fences, committed resume intents or object revisions.
+        const next = JSON.parse(JSON.stringify(await this.readCurrentState()));
+        result = await mutator(next);
+        try {
+          await durableWrite(this.filePath, next);
+        } catch (error) {
+          if (error?.syncCommitIndeterminate === true) this.commitIndeterminate = true;
+          throw error;
+        }
+        this.state = next;
+      });
     });
     await this.queue;
     return result;
@@ -638,6 +685,8 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
             username, passwordHash: checkedHash, sessionVersion: checkedSessionVersion,
             secretDigest: stagedResume.secretDigest,
             authorizationDigest: stagedResume.authorizationDigest,
+            deviceId: stagedResume.deviceId, pauseFence: stagedResume.pauseFence,
+            codeMac: stagedResume.codeMac,
             proof: stagedResume.proof,
             expectedReplayDigest: stagedResume.expectedReplayDigest,
           });

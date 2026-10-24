@@ -1,5 +1,36 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: exact-factor grant and local cross-process sync fencing (2026-10-24)
+
+The descendant of `59bc97c` adds SQLite migration 8, `sync_resume_factor_spend_grant`.
+An already-consumed TOTP/recovery factor may resume a staged intent **only**
+when the durable `(username, replay_digest, code_mac, device_id, pause_fence)`
+grant matches exactly. A competing device, changed pause marker, or different
+MAC cannot borrow an earlier spent factor; the selective account mutation and
+grant insertion are one `BEGIN IMMEDIATE` transaction. The live route fails
+closed for JSON-only or dual JSON-mirror account persistence, where that SQLite
+transaction is unavailable.
+
+The local sync JSON store now obtains an exclusive `wx` writer lock before
+opening or mutating the file, refreshes and validates the latest persisted
+state **under** the lock, and holds the lock through durable rename/fence. A
+stale second Node process can no longer overwrite a sibling's committed pause,
+intent, history or object state. Orphaned locks are never stolen automatically:
+recovery is deliberately blocked pending operator investigation. The lock is
+only a **single-host, cooperating-process filesystem boundary**, not a remote
+CAS, distributed quorum, independent monotonic floor, NFS safety proof or
+guarantee against a host filesystem attacker.
+
+Adversarial RED before the cross-process fix: **2 FAIL** (stale reopened
+instance and actual independent child processes lost records). GREEN after
+the fix: Windows Node 24 **39 PASS / 0 FAIL** across focused SQLite grant,
+resume, local child process, and strict witness tests; Ubuntu WSL Node 22
+**36 PASS / 0 FAIL** on local child process plus resume tests. Independently
+signed PG readback inclusion, truly remote monotonic fencing, physical PG18
+validation, complete suite on this new HEAD, mandatory independent review,
+and published CI remain separately blocked/unverified. PR #228 stays
+**OPEN/DRAFT; NO-GO; no push/merge/deploy/cutover**.
+
 ## Issue #65 / PR #228: resumable 2FA CAS and physical witness startup minimum (2026-10-24)
 
 The remote draft branch was still at 6a5e71e when verified. In an

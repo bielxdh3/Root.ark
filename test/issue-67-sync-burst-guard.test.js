@@ -145,7 +145,18 @@ async function startServer(t, { storagePath, burstGuard, auditEvents = [], bcryp
     const current = loadUsers();
     const user = current.find((entry) => entry?.username === claim.username);
     const outcome = applySyncResumeAccountProof(user, claim);
-    if (outcome === "committed") saveUsers(current);
+    if (outcome === "already") {
+      const ticket = user?.syncResumeGrants?.[claim.expectedReplayDigest];
+      return ticket?.codeMac === claim.codeMac && ticket?.deviceId === claim.deviceId
+        && ticket?.pauseFence === claim.pauseFence ? "already" : "conflict";
+    }
+    if (outcome === "committed") {
+      user.syncResumeGrants ||= {};
+      user.syncResumeGrants[claim.expectedReplayDigest] = {
+        codeMac: claim.codeMac, deviceId: claim.deviceId, pauseFence: claim.pauseFence,
+      };
+      saveUsers(current);
+    }
     return outcome;
   };
   const getTotpKey = () => totpKey;
