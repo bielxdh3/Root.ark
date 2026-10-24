@@ -1,5 +1,7 @@
 "use strict";
 
+// Spawned laboratory child, kept outside test/ so Node's auto-discovery does
+// not execute its argv-dependent process bootstrap as an independent test.
 // Isolated protocol fixture: readback is SYNTHETIC. Real PG validation runs
 // in the disposable PG18 lab; never describe this as a physical disk test.
 const fs = require("node:fs");

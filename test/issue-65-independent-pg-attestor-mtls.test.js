@@ -54,7 +54,7 @@ test("separate-process mTLS attestor signs WAL readback, denies foreign principa
   const cfgPath = path.join(dir, "config.json");
   fs.writeFileSync(cfgPath, JSON.stringify(cfg), { mode: 0o600 });
   const child = spawn(process.execPath,
-    [path.join(__dirname, "support", "issue-65-pg-physical-attestor-child.js"), cfgPath],
+    [path.join(__dirname, "../lab/issue-65-packet-b/pg-physical-attestor-child.js"), cfgPath],
     { stdio: ["ignore", "pipe", "pipe", "ipc"], windowsHide: true,
       env: { ...process.env, NODE_ENV: "test" } });
   t.after(() => { if (!child.killed) child.kill(); });
