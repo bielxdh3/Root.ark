@@ -1,5 +1,23 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: historical signed sync reads (2026-10-24)
+
+The isolated descendant of `caf3ed2` separates fresh authorization for new
+sync writes from verification of a previously stored remote operation. Pull,
+conflict-current, cache eviction, and remote-only materialization parse the
+historical record without re-imposing its expired write deadline; the Sync v2
+client still checks its Ed25519 signature, exact operation scope, independently
+pinned device key, current revocation snapshot, selected path and key epoch.
+Server ingress and outgoing writes retain fresh expiry enforcement. Malformed
+expiry values fail closed. A persisted signed operation was pulled after expiry
+and local restart in adversarial tests; Windows Node 24 focused regressions
+passed 43/0, Ubuntu WSL Node 22 focused regressions passed 14/0, and syntax
+validation checked 646 files/0 failures. This does not independently prove
+the *time of original server admission* for an old signed operation; a separate
+admission anchor remains necessary for a compromised-server threat model.
+Normative physical inclusion, final independent review, Windows hosted Edge
+failure and CodeQL gate remain NO-GO; no publication/cutover.
+
 ## Issue #65 / PR #228: exact-factor grant and local cross-process sync fencing (2026-10-24)
 
 The descendant of `59bc97c` adds SQLite migration 8, `sync_resume_factor_spend_grant`.

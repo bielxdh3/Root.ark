@@ -871,7 +871,7 @@ class SyncEngine {
           summary.conflicts.push({ operationId: operation?.operationId || pending.operationId, policy: "remote-wins", currentRevision: error.currentRevision || error.payload?.currentRevision || null });
           await this.recoverConflict(operation, summary);
           if (error.current) {
-            const current = protocol.validateOperation(error.current);
+            const current = protocol.validateStoredOperation(error.current);
             if (this.operationDestinationIsSelected(current)) {
               await this._apply(current, summary);
             } else {
@@ -1247,7 +1247,7 @@ class SyncEngine {
     const remoteRecords = Array.isArray(remoteResult) ? remoteResult
       : Array.isArray(remoteResult?.objects) ? remoteResult.objects : remoteResult ? [remoteResult] : [];
     if (remoteRecords.length !== 1) fail("Current remote object is unavailable", "remote_object_missing");
-    const remote = protocol.validateOperation(remoteRecords[0]);
+    const remote = protocol.validateStoredOperation(remoteRecords[0]);
     if (remote.objectId !== prior.objectId || remote.fileId !== prior.fileId || !pathsEqual(remote.metadata.path, safePath)) {
       fail("Current remote object no longer matches the local cache", "remote_object_changed");
     }
@@ -1354,7 +1354,7 @@ class SyncEngine {
     const result = await this.adapter.list(entry.objectId);
     const records = Array.isArray(result) ? result : Array.isArray(result?.objects) ? result.objects : result ? [result] : [];
     if (!records.length) fail("Remote object is no longer available", "remote_object_unavailable");
-    const operation = protocol.validateOperation(records[0]);
+    const operation = protocol.validateStoredOperation(records[0]);
     if (operation.objectId !== entry.objectId || !this.operationDestinationIsSelected(operation)) {
       fail("Remote object is outside the selected scope", "path_not_selected");
     }
@@ -1403,7 +1403,7 @@ class SyncEngine {
     });
     let remoteOnlyChanged = false;
     for (const raw of ordered) {
-      const operation = protocol.validateOperation(raw);
+      const operation = protocol.validateStoredOperation(raw);
       if (!this.operationDestinationIsSelected(operation)) {
         await this.verifyIncomingOperation(operation);
         await this.reconcileOutOfScopeMove(operation, summary);

@@ -5,7 +5,7 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 const { SyncEngine } = require("./rootark-sync-engine");
 const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
-const { createAuthorizationProof, verifyAuthorizationProof } = require("./rootark-sync-authorization");
+const { createAuthorizationProof, verifyHistoricalAuthorizationProof } = require("./rootark-sync-authorization");
 
 const DEFAULT_CONFIG = path.resolve(process.cwd(), ".rootark-sync.json");
 
@@ -79,7 +79,7 @@ async function start(options = {}) {
       && !config.revokedDeviceIds.includes(config.deviceId)
       && operation.deviceId === config.deviceId,
     verifyIncoming: async (operation) => operation.authorization
-      ? verifyAuthorizationProof(operation.authorization, operation, {
+      ? verifyHistoricalAuthorizationProof(operation.authorization, operation, {
         username: config.username, trustedDevicePublicKeys: config.trustedDevicePublicKeys,
         revokedDeviceIds: config.revokedDeviceIds })
       : false,

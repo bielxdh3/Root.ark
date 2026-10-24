@@ -64,6 +64,12 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
   await sandboxModule.exports.start({ config: "not-opened.json", once: true });
   assert.ok(engineOptions && engineOptions.requireAuthorization === true);
   assert.equal(await engineOptions.verifyIncoming(signedIncoming), true);
+  const now = Date.now;
+  try {
+    Date.now = () => signature.expiresAt + 1;
+    assert.equal(await engineOptions.verifyIncoming(signedIncoming), true,
+      "the CLI must verify signed historical remote records after proof expiry");
+  } finally { Date.now = now; }
   // A perfectly valid Ed25519 signature by an attacker must not enroll its
   // self-asserted public key as the trusted device1 authority.
   const attacker = crypto.generateKeyPairSync("ed25519");
