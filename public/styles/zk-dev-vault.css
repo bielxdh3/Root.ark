@@ -1,0 +1,36 @@
+:root { color-scheme: light dark; font-family: system-ui, -apple-system, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; background: #101827; color: #f1f5f9; line-height: 1.55; }
+.vault { max-width: 790px; padding: 38px 18px 64px; margin: auto; }
+a { color: #99c7ff; }
+.back { display: inline-block; margin-bottom: 22px; text-decoration: none; }
+.eyebrow { color: #95baff; font-size: .76rem; text-transform: uppercase; letter-spacing: .09em; }
+h1 { font-size: clamp(1.7rem, 4vw, 2.35rem); letter-spacing: -.04em; margin: 8px 0; }
+h2 { font-size: 1.15rem; margin: 0 0 10px; }
+header { margin-bottom: 30px; }
+header p, .muted { color: #b4c0cf; }
+.panel { background: #192437; border: 1px solid #344154; border-radius: 16px; margin: 18px 0; padding: 23px; }
+label { display: block; margin: 15px 0 7px; font-weight: 600; }
+button, input { font: inherit; }
+input[type="password"], input[type="text"], input[type="file"] {
+  background: #0e1726; border: 1px solid #46556c; color: #f1f5f9;
+  border-radius: 8px; padding: 11px; max-width: 100%; width: 100%;
+}
+button { padding: 10px 14px; border-radius: 9px; border: 1px solid #7caef5;
+  background: #3470d7; color: white; cursor: pointer; font-weight: 600; }
+button:hover { background: #4384e9; }
+button:focus-visible, input:focus-visible { outline: 3px solid #99c7ff; outline-offset: 2px; }
+button:disabled { opacity: .55; cursor: not-allowed; }
+button.quiet { background: transparent; border-color: #64748b; }
+.actions { display: flex; gap: 9px; flex-wrap: wrap; margin: 13px 0; }
+.secret-row { display: flex; gap: 8px; }
+.secret-row input { flex: 1; min-width: 0; }
+.notice { border-left: 3px solid #99b7ed; padding: 9px 12px; color: #c8d4e7; background: #222d40; }
+.heading { display: flex; justify-content: space-between; align-items: center; }
+ul { padding: 0; list-style: none; }
+li { padding: 11px 0; border-bottom: 1px solid #364157; display: flex;
+  align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+li span { overflow-wrap: anywhere; }
+li .actions { margin: 0; }
+#status { padding: 10px; color: #cfdef2; min-height: 1.5em; }
+@media(max-width:520px) { .secret-row { flex-wrap: wrap; } .secret-row input { flex-basis: 100%; } }

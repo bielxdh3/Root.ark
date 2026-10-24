@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Cofre cifrado de desenvolvimento — Root.ark</title>
+  <link rel="icon" href="/assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles/zk-dev-vault.css">
+  <script defer src="/client/rootark-api.js"></script>
+  <script defer src="/client/rootark-dev-vault-crypto.js"></script>
+  <script defer src="/client/rootark-dev-vault-migration.js"></script>
+  <script defer src="/zk-dev/vendor/libsodium-sumo.js"></script>
+  <script defer src="/zk-dev/vendor/libsodium-wrappers.js"></script>
+  <script defer src="/client/rootark-dev-vault-emergency.js"></script>
+  <script defer src="/client/rootark-dev-vault-trusted-device.js"></script>
+  <script defer src="/client/rootark-dev-vault-ui.js"></script>
+</head>
+<body>
+  <main class="vault">
+    <header>
+      <a href="/" class="back">← Arquivos</a>
+      <span class="eyebrow">Root.ark · Desenvolvimento</span>
+      <h1>Cofre cifrado no navegador</h1>
+      <p>Os dados, o nome do arquivo e seu tipo são cifrados antes de chegar ao servidor.
+      Nenhuma senha ou chave é enviada. Este cofre é experimental, separado dos arquivos normais,
+      e não deve guardar a única cópia de um documento importante.</p>
+    </header>
+    <section class="panel">
+      <h2>1. Abrir seu cofre</h2>
+      <p id="account" class="muted" aria-live="polite">Verificando sessão…</p>
+      <div class="actions">
+        <button type="button" id="generate">Gerar chave nova</button>
+        <button type="button" id="restore-browser">Usar chave salva neste navegador</button>
+      </div>
+      <label for="recovery">Chave de recuperação (43 caracteres)</label>
+      <div class="secret-row">
+        <input id="recovery" type="password" maxlength="60" spellcheck="false" autocomplete="off" placeholder="Cole sua chave para recuperar o acesso">
+        <button type="button" id="import">Importar</button>
+        <button type="button" id="reveal">Mostrar</button>
+      </div>
+      <div class="actions">
+        <button type="button" id="save-device">Salvar chave não exportável neste navegador</button>
+        <button type="button" id="forget-device" class="quiet">Esquecer chave deste navegador</button>
+        <button type="button" id="lock" class="quiet">Bloquear sessão local</button>
+      </div>
+      <p class="notice">Guarde sua chave em um gerenciador de senhas ou em local seguro antes de enviar arquivos.
+      Ela não será recuperada pelo administrador. Salvar uma chave neste navegador não garante armazenamento
+      inviolável nem substitui o futuro protocolo de dispositivos autorizados.</p>
+    </section>
+    <section class="panel">
+      <h2>Recuperação de emergência protegida por senha</h2>
+      <p class="muted">Gere um arquivo de recuperação cifrado, protegido por senha com Argon2id e AES-256-GCM.
+      Ele é criado e aberto apenas neste navegador; guarde o arquivo e a senha separadamente.</p>
+      <label for="emergency-password">Senha forte do pacote (mínimo 12 caracteres)</label>
+      <input id="emergency-password" type="password" autocomplete="off" spellcheck="false"
+        placeholder="Senha para proteger ou abrir seu pacote">
+      <label for="emergency-recovery-key">Chave original do cofre (necessária apenas para criar o pacote)</label>
+      <input id="emergency-recovery-key" type="password" autocomplete="off" spellcheck="false"
+        placeholder="Cole a chave de 43 caracteres para protegê-la">
+      <div class="actions">
+        <button type="button" id="emergency-export">Baixar pacote cifrado</button>
+      </div>
+      <label for="emergency-file">Pacote para recuperar acesso</label>
+      <input id="emergency-file" type="file" accept=".json,application/json">
+      <div class="actions">
+        <button type="button" id="emergency-import">Restaurar chave do pacote</button>
+      </div>
+      <p class="notice">Se perder o pacote, a senha e a chave original, este cofre não poderá recuperar os arquivos.
+      Esta recuperação pertence ao cofre de desenvolvimento; não equivale ao pacote assinado do protocolo zk-1.</p>
+    </section>
+    <section class="panel">
+      <h2>Recuperação por navegador confiável</h2>
+      <p class="muted">Este é um segundo caminho independente do pacote protegido por senha.
+      Um navegador já autorizado pode aprovar uma solicitação de outro navegador.
+      Troque os arquivos de solicitação e resposta por um canal que você controla.</p>
+      <div class="actions">
+        <button id="device-enroll" type="button">Autorizar este navegador como dispositivo confiável</button>
+        <button id="device-request" type="button">Criar solicitação de recuperação neste navegador</button>
+        <button id="device-cancel" type="button" class="quiet">Cancelar solicitação pendente</button>
+      </div>
+      <p class="notice">Código de confirmação deste navegador:
+      <strong id="device-request-code">Nenhuma solicitação pendente</strong>.
+      Mostre este código pessoalmente ao usuário do navegador confiável — não o copie
+      do arquivo recebido no dispositivo confiável.</p>
+      <p class="notice">Para autorizar, informe primeiro a chave original no campo
+      «Chave original do cofre» da seção anterior. O dispositivo confiável guarda
+      uma cópia cifrada sob chave não exportável no IndexedDB, não a chave em texto claro.</p>
+      <label for="device-request-file">No navegador confiável: solicitação recebida (.json)</label>
+      <input type="file" id="device-request-file" accept=".json,application/json">
+      <label for="device-confirm-code">Digite o código de 22 caracteres mostrado NO navegador que solicitou a recuperação</label>
+      <input id="device-confirm-code" type="text" maxlength="22"
+        spellcheck="false" autocomplete="off" placeholder="Código do navegador solicitante">
+      <button id="device-approve" type="button">Aprovar e baixar resposta cifrada</button>
+      <label for="device-response-file">No novo navegador: resposta do dispositivo confiável (.json)</label>
+      <input type="file" id="device-response-file" accept=".json,application/json">
+      <button id="device-complete" type="button">Concluir recuperação neste navegador</button>
+      <p class="notice">Confira pessoalmente o código da solicitação antes de aprovar.
+      Não aprove pedidos inesperados. A autorização local não substitui a futura
+      revisão e revogação de dispositivos do protocolo zk-1.</p>
+    </section>
+    <section class="panel">
+      <h2>2. Enviar arquivo protegido</h2>
+      <p class="muted">Limite de 4 MiB por arquivo nesta versão de desenvolvimento. O arquivo legado nunca é alterado.</p>
+      <label for="file">Arquivo</label>
+      <input type="file" id="file">
+      <button type="button" id="upload">Cifrar e enviar</button>
+    </section>
+    <section class="panel">
+      <h2>Copiar arquivo legado existente</h2>
+      <p class="muted">Cópia explícita, não destrutiva, de um arquivo legado
+      <strong>não criptografado</strong>, ao qual esta conta já tem acesso.
+      A cópia só é confirmada depois de reler e comparar o arquivo cifrado.
+      O original e seus backups permanecem no armazenamento legado.</p>
+      <label for="legacy-name">Nome exato do arquivo no Root.ark</label>
+      <input id="legacy-name" type="text" maxlength="255" autocomplete="off" spellcheck="false"
+        placeholder="exemplo.txt">
+      <label for="legacy-folder">Identificador da pasta (opcional, vazio para pasta padrão)</label>
+      <input id="legacy-folder" type="text" maxlength="128" autocomplete="off" spellcheck="false"
+        placeholder="ID da pasta">
+      <button id="legacy-copy" type="button">Copiar, cifrar e verificar sem excluir o original</button>
+      <p class="notice">Não converte arquivos legados já criptografados, nem move ou
+      exclui dados. Este fluxo experimental ainda não equivale à migração
+      completa e certificada do protocolo zk-1.</p>
+    </section>
+    <section class="panel">
+      <div class="heading">
+        <h2>3. Arquivos cifrados</h2>
+        <button type="button" id="refresh" class="quiet">Atualizar</button>
+      </div>
+      <p class="muted">Somente IDs opacos são listados. O nome original aparece apenas após descriptografia local.</p>
+      <ul id="objects" aria-label="Arquivos protegidos"></ul>
+    </section>
+    <p id="status" role="status" aria-live="polite">Aguardando sessão.</p>
+  </main>
+</body>
+</html>

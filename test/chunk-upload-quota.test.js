@@ -13,7 +13,8 @@ const {
   getCurrentProcessIdentity,
   parseChunkUploadQuotaConfig,
 } = require("../services/chunkUploadQuota");
-const { ensureWindowsChunkUploadRoot, getWindowsChunkAclDescriptor } = require("../services/chunkUploadWindowsAcl");
+const { ensureWindowsChunkUploadRoot, getWindowsChunkAclDescriptor,
+  verifyWindowsChunkUploadTree } = require("../services/chunkUploadWindowsAcl");
 const QUOTA_TEST_TEMP = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
 const createChunkUploadQuota = (options) => createChunkUploadQuotaService({ perAccountEntries: 5000, systemEntries: 10000, ...options });
 
@@ -421,6 +422,65 @@ test("Windows creates a protected chunk staging root and verifies its DACL", { s
       assert.doesNotMatch(children, /S-1-5-32-545|S-1-1-0/);
     } finally {
       quota.close();
+    }
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("Windows ACL scan tolerates only vanished trusted transient files under concurrent child IO", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const { parent, root } = createQuotaTestRoot("rootark-chunk-acl-volatile-");
+  const childSource = `
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const Database = require(${JSON.stringify(require.resolve("better-sqlite3"))});
+    const root = process.argv[1];
+    const marker = path.join(root, 'worker-ready');
+    const dbPath = path.join(root, '.volatile.sqlite');
+    const pause = new Int32Array(new SharedArrayBuffer(4));
+    for (let i = 0; i < 150; i++) {
+      const db = new Database(dbPath);
+      try {
+        db.pragma('journal_mode = WAL');
+        db.exec('CREATE TABLE IF NOT EXISTS transient (value INTEGER)');
+        db.prepare('INSERT INTO transient(value) VALUES(?)').run(i);
+        if (i === 0) fs.writeFileSync(marker, 'ready');
+      } finally { db.close(); }
+      Atomics.wait(pause, 0, 0, 10);
+    }
+  `;
+  try {
+    const child = spawn(process.execPath, ["-e", childSource, root], {
+      stdio: ["ignore", "ignore", "pipe"], windowsHide: true,
+    });
+    const exited = new Promise((resolve, reject) => {
+      let stderr = "";
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.once("error", reject);
+      child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(
+        `disposable transient writer exited ${code}: ${stderr.slice(0, 160)}`)));
+    });
+    try {
+      const started = Date.now() + 10000;
+      while (!fs.existsSync(path.join(root, "worker-ready")) && Date.now() < started) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(fs.existsSync(path.join(root, "worker-ready")), true,
+        "ACL verifier must actually overlap a separately running SQLite WAL/SHM writer");
+      for (let i = 0; i < 2; i++) verifyWindowsChunkUploadTree(root);
+      await exited;
+      verifyWindowsChunkUploadTree(root);
+      execFileSync("icacls.exe", [root, "/grant", "*S-1-5-32-545:(OI)(CI)M"], {
+        stdio: "ignore", windowsHide: true,
+      });
+      assert.throws(() => verifyWindowsChunkUploadTree(root),
+        /Windows chunk staging ACL validation failed|Untrusted principal/,
+        "an untrusted ACL must remain denied even after bounded transient-file retries");
+    } finally {
+      if (child.exitCode === null) child.kill();
+      await Promise.allSettled([exited]);
     }
   } finally {
     fs.rmSync(parent, { recursive: true, force: true });

@@ -231,32 +231,59 @@ test("JSON metadata lock uses crash-safe bounded ownership", async (t) => {
     const raceDir = path.join(runtime, "race");
     fs.mkdirSync(raceDir);
     const startFile = path.join(raceDir, "start");
+    const releaseFile = path.join(raceDir, "release");
     const readyA = path.join(raceDir, "ready-a");
     const readyB = path.join(raceDir, "ready-b");
+    const attemptedA = path.join(raceDir, "attempted-a");
+    const attemptedB = path.join(raceDir, "attempted-b");
     const action = `
       const ready = process.env.READY_FILE;
       fs.writeFileSync(ready, "ready");
       const deadline = Date.now() + 5000;
       while (!fs.existsSync(process.env.START_FILE) && Date.now() < deadline) {}
+      if (process.env.RACE_DELAY_MS) {
+        const delayedUntil = Date.now() + Number(process.env.RACE_DELAY_MS);
+        while (Date.now() < delayedUntil) {}
+      }
       try {
         const lease = repository.acquireJsonMutationLock("race");
+        fs.writeFileSync(process.env.ATTEMPTED_FILE, "acquired");
         console.log(JSON.stringify({ winner: true, token: lease.token }));
-        setTimeout(() => { lease.release(); process.exit(0); }, 500);
+        const holdDeadline = Date.now() + 5000;
+        while (!fs.existsSync(process.env.RELEASE_FILE) && Date.now() < holdDeadline) {}
+        lease.release();
+        process.exit(0);
       } catch (error) {
+        fs.writeFileSync(process.env.ATTEMPTED_FILE, "denied");
         console.log(JSON.stringify({ winner: false, code: error.code }));
         process.exit(error.code === "BACKUP_METADATA_LOCK_BUSY" ? 2 : 1);
       }
     `;
-    const first = runChild(action, { READY_FILE: readyA, START_FILE: startFile });
-    const second = runChild(action, { READY_FILE: readyB, START_FILE: startFile });
+    const childEnv = { START_FILE: startFile, RELEASE_FILE: releaseFile,
+      RACE_DELAY_MS: "250" };
+    const first = runChild(action, { ...childEnv, READY_FILE: readyA,
+      ATTEMPTED_FILE: attemptedA });
+    const second = runChild(action, { ...childEnv, READY_FILE: readyB,
+      ATTEMPTED_FILE: attemptedB });
     const deadline = Date.now() + 3000;
     while ((!fs.existsSync(readyA) || !fs.existsSync(readyB)) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     assert.equal(fs.existsSync(readyA) && fs.existsSync(readyB), true, `${fs.existsSync(readyA)} ${fs.existsSync(readyB)}`);
     fs.writeFileSync(startFile, "start");
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.equal(fs.existsSync(backupRepository.MUTATION_LOCK_FILE), true);
+    const acquiredDeadline = Date.now() + 5000;
+    try {
+      while ((!fs.existsSync(attemptedA) || !fs.existsSync(attemptedB))
+        && Date.now() < acquiredDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(fs.existsSync(attemptedA) && fs.existsSync(attemptedB), true,
+        "both contenders must attempt the same lease before the holder releases it");
+      assert.equal(fs.existsSync(backupRepository.MUTATION_LOCK_FILE), true,
+        "the winner must publish its lock while waiting for parent release");
+    } finally {
+      fs.writeFileSync(releaseFile, "release");
+    }
     const results = await Promise.all([first, second]);
     const values = results.map((result) => JSON.parse(result.stdout.trim().split(/\r?\n/).pop()));
     assert.equal(values.filter((value) => value.winner).length, 1, results.map((result) => `${result.code}:${result.stderr}:${result.stdout}`).join(" | "));

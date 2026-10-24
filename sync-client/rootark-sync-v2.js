@@ -5,7 +5,7 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 const { SyncEngine } = require("./rootark-sync-engine");
 const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
-const { createAuthorizationProof } = require("./rootark-sync-authorization");
+const { createAuthorizationProof, verifyAuthorizationProof } = require("./rootark-sync-authorization");
 
 const DEFAULT_CONFIG = path.resolve(process.cwd(), ".rootark-sync.json");
 

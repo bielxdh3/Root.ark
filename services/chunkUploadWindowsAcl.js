@@ -8,6 +8,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Threading;
 
 public static class RootarkChunkAclNative {
   const uint OWNER_SECURITY_INFORMATION = 0x1;
@@ -123,19 +124,36 @@ public static class RootarkChunkAclNative {
       return String.Empty;
     }
     if (action == "verify") {
-      AssertDirectoryNoReparse(root);
-      AssertRestrictedItem(root, true, trusted);
-      Stack<string> pending = new Stack<string>();
-      pending.Push(root);
-      while (pending.Count > 0) {
-        string directory = pending.Pop();
-        foreach (string entry in Directory.GetFileSystemEntries(directory)) {
-          FileAttributes attributes = File.GetAttributes(entry);
-          AssertRestrictedItem(entry, false, trusted);
-          if ((attributes & FileAttributes.Directory) != 0) pending.Push(entry);
+      // Concurrent trusted SQLite writers may delete transient WAL/SHM files
+      // after enumeration but before the ACL query. Restart the ENTIRE scan,
+      // including ancestry and root, only for positively identified absence;
+      // never retry an unsafe DACL, reparse point, or access-denied result.
+      for (int attempt = 0; attempt < 4; attempt++) {
+        try {
+          AssertTrustedOwnerAndSafeAncestors(root, trusted);
+          AssertDirectoryNoReparse(root);
+          AssertRestrictedItem(root, true, trusted);
+          Stack<string> pending = new Stack<string>();
+          pending.Push(root);
+          while (pending.Count > 0) {
+            string directory = pending.Pop();
+            foreach (string entry in Directory.GetFileSystemEntries(directory)) {
+              FileAttributes attributes = File.GetAttributes(entry);
+              AssertRestrictedItem(entry, false, trusted);
+              if ((attributes & FileAttributes.Directory) != 0) pending.Push(entry);
+            }
+          }
+          return ReadSddl(root);
+        } catch (FileNotFoundException) {
+          if (attempt == 3) throw;
+        } catch (DirectoryNotFoundException) {
+          if (attempt == 3) throw;
+        } catch (Win32Exception error) {
+          if ((error.NativeErrorCode != 2 && error.NativeErrorCode != 3) || attempt == 3) throw;
         }
+        Thread.Sleep(10 * (attempt + 1));
       }
-      return ReadSddl(root);
+      throw new InvalidOperationException("Chunk staging tree changed during ACL verification");
     }
     throw new InvalidOperationException("Invalid chunk ACL operation");
   }

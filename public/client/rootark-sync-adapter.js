@@ -132,7 +132,12 @@
 
   function createOpaqueSyncAdapter({ fetchImpl = fetch, baseUrl = "" } = {}) {
     const request = async (url, options = {}) => {
-      const response = await fetchImpl(`${baseUrl}${url}`, { ...options, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
+      // A 307/308 replays the complete signed encrypted operation to the
+      // redirect target. Never let an untrusted sync endpoint or proxy choose
+      // a different recipient for ciphertext, AAD filenames or bearer tokens.
+      const response = await fetchImpl(`${baseUrl}${url}`, { ...options,
+        redirect: "error",
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
       const payload = await response.json().catch(() => ({}));
       if (response.status === 409) throw new SyncConflictError(payload);
       if (!response.ok) throw Object.assign(new Error(payload.error || "Falha de sincronizacao"), { status: response.status, payload });

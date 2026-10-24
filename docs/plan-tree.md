@@ -1,5 +1,125 @@
 # Root.ark Plan Tree
 
+> **Most recent issue #65 development checkpoint — 2026-10-23:**
+> [PR #228 source, validation and remaining blocker evidence](validation/2026-10-23-issue-65-pr228-development-checkpoint.md).
+> The `da02715` checkpoint below is historical and not the current HEAD.
+> PR #228 remains OPEN/DRAFT, issue #65 OPEN; no merge/deploy/cutover.
+
+## Live issue #65 development evidence — 2026-10-23 (`da02715`)
+
+At the observed checkpoint, PR #228 (`cdx/rootark-dual-recovery-20261019`)
+is **OPEN/DRAFT** and issue #65 is **OPEN**. Local integration HEAD and
+remote branch HEAD both equal `da02715a8a6787836a05aeb06e6d1b0bdc61d61a`;
+the worktree was clean. This checkpoint supersedes the *live-status claims*
+in the older dated addenda below, not their historical test evidence.
+
+Newly integrated development work includes `7feb752` (restore missing local
+catalog snapshots from remotely signed CAS snapshots after an uncertain ACK),
+`db7baa6` (private POSIX SQLite file creation), `80baa3a` (authenticated
+browser writable opaque catalog), `7a93a9b` (an independently signed,
+monotonically advancing mTLS/SQLite floor with owner V2 signer rotation),
+and `da02715` (browser relay of independently signed witness/CAS heads).
+These are *opt-in protected* paths and must not be conflated with ordinary
+plaintext sync-v2, a physically independent deployed authority or provider
+durability. The catalog still has a fail-closed 128-head limit; authenticated
+logical delete/trash, complete account inventory and automatic safe legacy
+cutover need their own end-to-end evidence before declaring 100% development.
+
+Exact-HEAD hosted checks: Ubuntu Node22 full suite **2358 total / 2221 PASS /
+0 FAIL / 137 SKIP**; real disposable PostgreSQL18 **PASS**; JS/TS analysis
+**PASS**; dependency review **PASS**. Windows Node22's release gate was
+**CANCELLED** after earlier steps had passed, not a proved assertion failure.
+The separate CodeQL policy check remains **FAIL**; do not label it green or
+silently dismiss its findings. The next validated HEAD must be checked again
+after publication: CI results do not transfer between SHAs.
+
+Local Windows Node24 on the same `da02715` checkpoint: focused browser,
+owner revocation, authenticated catalog, multi-version Edge archive, session
+fencing and rename selection **67 PASS / 0 FAIL / 0 SKIP**; real mTLS CAS,
+owner signer rotation and re-endorsement selection **6 PASS / 0 FAIL**;
+independent floor/CAS/Edge selection **17 PASS / 0 FAIL** (overlapping
+selections, **not** additive coverage). `validate-syntax.js`: **513 checked /
+0 failed**; `validate-runtime-artifacts.js` and `git diff --check`: **PASS**.
+These local focused runs do not substitute for the hosted full suite.
+
+The trust boundary still requires independent custody of out-of-band SPKI
+pins, witness/floor keys and monotonic state. Distinguish Ed25519 receipts,
+PostgreSQL local readback, SQLite WAL/FULL commits, HTTP ACK and actual remote
+storage durability. No merge, deploy, production activation, plaintext-to-
+server fallback or destructive migration cutover is authorized.
+
+## Current development addendum — 2026-10-23, issue #65 / PR #228
+
+**Additional integration after the published `0e571eb` milestone (local DEV
+checkpoint `df7c8f2`, pending next coherent push):** `9239e52` adds real Edge
+12-version archive creation and recovery assertions; `a8116a7` reconciles its
+test fixture with separately integrated legacy signed transition; `aa8091e`
+implements owner-local V2 revocation/epoch rotation requiring distinct
+independently pinned witness and CAS commitment with fresh HPKE wraps only for
+survivors; `e71ef3b` fixes a reproduced independently identified P2 browser
+roster substitution (RED before fix, GREEN after, strict pin and exact signed
+roster equality); `df7c8f2` adds the normal authenticated **read-only** ZK1
+opaque catalog UI, owner-pinned page/delta visibility and signed version GET.
+The combined checks on this local sequence yielded Node24 **70 PASS / 0 FAIL**,
+Node22 pure crypto **19 PASS / 0 FAIL**, syntax **492 / 0**, and a separate
+real Edge catalog+archive **11 PASS / 0 FAIL**. This is not a full-suite or
+exact-head CI verdict. The previous published `0e571eb` passed Ubuntu Node22,
+PostgreSQL18, JS/TS and dependency review, but the Windows Node22 job was
+**cancelled during the release gate**; the CodeQL policy still listed 62 alerts.
+Do not count a canceled job as a code failure, or static alerts as resolved.
+The browser catalog still requires independently pinned CAS/owner authority
+and user-imported head and remains read-only; owner revocation transfer is not
+automatic proof of current full V2 grant/history or remote key custody.
+
+**Independent catalog CAS development extension:** local commit `90932d7`
+adds an explicit opt-in standalone mTLS HTTPS CAS service/client with a
+separately pinned Ed25519 signing identity, trusted device-signed catalog
+headers and encrypted pages, atomic local SQLite WAL/FULL persistence and
+monotonic floor, writer competition, replay checks, bounded transport and
+lost-ACK reconciliation. Its integrated Node24 catalog/Edge selection passed
+**12 PASS / 0 FAIL**; focused Node22 owner/catalog crypto **9 PASS / 0 FAIL**;
+syntax **499 / 0**. The separate standalone CAS service tests used actual
+disposable OS child processes and mTLS, not cloud infrastructure. This is a
+local physical SQLite durability boundary, **not proof of cloud fsync**, a
+physically independent host or guaranteed operator control of the external
+floor. External CAS and historical catalog recovery still require explicit
+trust-pin provisioning and operator-owned records, not a server-supplied pin.
+
+This is an additive development snapshot, not a revision of the dated phase
+history below. The PR branch `cdx/rootark-dual-recovery-20261019` remains
+`OPEN/DRAFT` with issue #65 open; no merge, deployment or production activation
+is authorized. The last *verified published* code baseline before this addendum
+was `0c9034c` (full Ubuntu Node22 2183 PASS / 0 FAIL / 136 SKIP; full Windows
+Node24 local 2153 PASS / 0 FAIL / 166 SKIP, on the same code; local Windows
+Node22 release gate canceled, not failed). That snapshot's CodeQL policy check
+was red with 62 static findings, no new runtime P1/P2 confirmed by its focused
+audit. None of those prior CI outcomes is a new-head verdict.
+
+The active isolated issue #65 integration now includes local commits
+`b6635a9` (metadata leakage register), `7d55c4c` (witnessed owner enrollment
+CLI), `dd7cf11` (opt-in owner/device-signed opaque catalog with externally
+pinned CAS head), `a4f63f2` (owner-signed per-version legacy transition state)
+and `de94f1f` (normal-browser opt-in versioned archive, original per-version
+ciphertext and CEK). Together they passed targeted local Node24 **78 PASS /
+0 FAIL**, Node22 crypto **14 PASS / 0 FAIL**, and syntax **485 / 0**. The
+catalog's two-device authenticated HTTP read is tested; this does not prove a
+production authority, a complete protected bidirectional sync client or every
+destructive mutation. Signed migration receipts permit verified state for
+individually selected versions only, *never* deletion/cutover of legacy sources
+whose references or retention are unknown. Default owner upload uses a
+single-use CEK and is not inherently recoverable without user-held archive
+material.
+
+Still open in development: real end-to-end normal-browser catalog discovery and
+delta sync, authenticated rename/move/delete/trash/conflict operations,
+owner-signed witnessed revocation and epoch rotation ceremony, full account
+inventory completeness and recovery UX, and cutover graph completeness for
+legacy backup/trash/links/derived/retention. Absence of external provider
+durability or physically independent witness evidence must remain explicitly
+distinguished from local cryptographic and PostgreSQL proof. Do not mark issue
+#65 100% done until each acceptance criterion has executable evidence. See
+`docs/issue-65-zk1-runtime-leakage-register.md` for the current threat boundary.
+
 Last reconstructed: 2026-07-25 (historical baseline)
 Latest application-code snapshot for this closure: 2026-10-16 after PR #201 merged at `341804fa2bfd02dcd50f2d1bde560cb677fc27fd`. The [2026-10-16 pre-publication snapshot](validation/2026-10-16-rootark-prepublication-closure.md) records GitHub state and validation evidence queried after PR #199; it is historical and does not describe PR #201 or later commits. Track the final exact `Root/main` SHA and local validation for the documentation-only closure publication in the [final closure PR #202](https://github.com/bielxdh3/Root.ark/pull/202).
 

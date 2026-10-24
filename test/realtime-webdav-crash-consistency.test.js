@@ -37,12 +37,18 @@ function findAbsentPid() {
 
 function request(port, requestPath, options = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, path: requestPath, ...options }, (res) => {
+    const { timeoutMs, ...requestOptions } = options;
+    let deadline;
+    const done = () => clearTimeout(deadline);
+    const req = http.request({ host: "127.0.0.1", port, path: requestPath, ...requestOptions }, (res) => {
       let body = "";
       res.on("data", (chunk) => { body += chunk; });
-      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body }));
+      res.on("end", () => { done(); resolve({ status: res.statusCode, headers: res.headers, body }); });
+      res.once("error", (error) => { done(); reject(error); });
     });
-    req.once("error", reject);
+    if (Number.isSafeInteger(timeoutMs) && timeoutMs > 0)
+      deadline = setTimeout(() => req.destroy(new Error("request timed out")), timeoutMs);
+    req.once("error", (error) => { done(); reject(error); });
     req.end(options.body);
   });
 }
@@ -56,7 +62,7 @@ async function waitFor(predicate, timeout = 10_000) {
   throw new Error("timed out waiting for state");
 }
 
-function childSource(localCrash = false) {
+function childSource(localCrash = false, serverModule = SERVER) {
   return `
     const fs=require("fs");
     const path=require("path");
@@ -86,7 +92,7 @@ function childSource(localCrash = false) {
     require.cache[cloudPath]={id:cloudPath,filename:cloudPath,loaded:true,exports:{createCloudStorage:()=>fake}};
     ${localCrash ? `const originalRename=fs.renameSync; fs.renameSync=(from,to)=>{const result=originalRename(from,to); if(process.env.LOCAL_CRASH_TO&&String(from).includes(".rootark-move-")&&String(from).endsWith(".source")&&path.resolve(to)===path.resolve(process.env.LOCAL_CRASH_TO)) process.kill(process.pid,"SIGKILL"); return result;};` : ""}
     if(process.env.CLAIM_SWAP_LOCK_PATH){const lockPath=path.resolve(process.env.CLAIM_SWAP_LOCK_PATH);const evidencePath=path.resolve(process.env.CLAIM_SWAP_EVIDENCE_PATH);const originalRename=fs.renameSync;const originalOpenSync=fs.openSync;const originalReadSync=fs.readSync;let evidenceFd=null;let swapped=false;let completionQueued=false;fs.renameSync=(from,to)=>{if(!swapped&&path.resolve(String(from))===lockPath&&path.resolve(String(to))===evidencePath){swapped=true;fs.writeFileSync(lockPath,process.env.CLAIM_SWAP_CONTENTS);const result=originalRename(from,to);fs.writeFileSync(process.env.CLAIM_SWAP_OBSERVED,"swapped");return result;}return originalRename(from,to);};fs.openSync=(file,...args)=>{const fd=originalOpenSync(file,...args);if(path.resolve(String(file))===evidencePath)evidenceFd=fd;return fd;};fs.readSync=(fd,...args)=>{const result=originalReadSync(fd,...args);if(swapped&&!completionQueued&&fd===evidenceFd&&result>0){completionQueued=true;setImmediate(()=>fs.writeFileSync(process.env.CLAIM_SWAP_COMPLETED,"verified"));}return result;};}
-    require(${JSON.stringify(SERVER)});
+    require(${JSON.stringify(serverModule)});
     if(process.env.CLAIM_PAUSE_POST_START) setImmediate(installPause); else if(installPause) installPause();
   `;
 }
@@ -111,14 +117,38 @@ function serverEnv(dir, port, extra = {}) {
   };
 }
 
-function startServer(dir, extra = {}, localCrash = false) {
+function startServer(dir, extra = {}, localCrash = false, { serverModule = SERVER, startupTimeoutMs = 10_000, onSpawn } = {}) {
   return freePort().then((port) => {
-    const child = spawn(process.execPath, ["-e", childSource(localCrash)], { cwd: dir, env: serverEnv(dir, port, extra), stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    const child = spawn(process.execPath, ["-e", childSource(localCrash, serverModule)], { cwd: dir, env: serverEnv(dir, port, extra), stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    onSpawn?.(child);
     let stderr = "";
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-    const ready = (async () => { for (let i = 0; i < 150; i += 1) { try { await request(port, "/login.html"); return; } catch { await new Promise((resolve) => setTimeout(resolve, 40)); } } throw new Error("server did not start"); })();
+    const ready = (async () => {
+      const deadline = Date.now() + startupTimeoutMs;
+      let attempts = 0;
+      let lastProbeCode = "none";
+      while (Date.now() < deadline) {
+        attempts += 1;
+        try {
+          await request(port, "/login.html", { timeoutMs: Math.max(1, Math.min(500, deadline - Date.now())) });
+          return;
+        } catch (error) {
+          lastProbeCode = typeof error?.code === "string" && /^(?:ECONNREFUSED|ECONNRESET|EPIPE|ETIMEDOUT)$/.test(error.code)
+            ? error.code : error?.message === "request timed out" ? "TIMEOUT" : "OTHER";
+          await new Promise((resolve) => setTimeout(resolve, 40));
+        }
+      }
+      throw new Error(`server did not start; attempts=${attempts} lastProbe=${lastProbeCode} stderrBytes=${Buffer.byteLength(stderr)}`);
+    })();
     const exited = new Promise((_, reject) => child.once("exit", (code, signal) => reject(new Error(`server exited before readiness: ${code || signal}; stderr=${stderr}`))));
-    return Promise.race([ready, exited]).then(() => ({ child, port, stderr: () => stderr }));
+    return Promise.race([ready, exited]).then(
+      () => ({ child, port, stderr: () => stderr }),
+      async (error) => {
+        try { await stop(child); }
+        catch (cleanupError) { throw new AggregateError([error, cleanupError], "server readiness failed and test child cleanup failed"); }
+        throw error;
+      },
+    );
   });
 }
 
@@ -144,6 +174,66 @@ test("stop rejects when a process does not close after termination", { timeout: 
   Object.assign(child, { exitCode: null, signalCode: null, stdio: [null, null, null], pid: "not-a-pid" });
   child.kill = () => true;
   await assert.rejects(stop(child, 5), /did not close within 5ms/);
+});
+
+test("a failed server readiness probe reaps its spawned child", { timeout: 8_000 }, async () => {
+  const f = fixture();
+  const stub = path.join(f.dir, "never-listening.js");
+  fs.writeFileSync(stub, "setInterval(() => {}, 1000);");
+  let child;
+  try {
+    await assert.rejects(startServer(f.dir, {}, false, {
+      serverModule: stub,
+      startupTimeoutMs: 350,
+      onSpawn: (spawned) => { child = spawned; },
+    }), /server did not start/);
+    assert.ok(child?.pid, "test must observe a genuinely started disposable child");
+    assert.ok(child.exitCode !== null || child.signalCode !== null, "readiness failure must terminate the child");
+    assert.ok(child.stdio.every((stream) => stream === null || stream.closed), "child pipes must be closed");
+  } finally {
+    if (child?.exitCode === null && child?.signalCode === null) await stop(child);
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("an accepted but unanswered startup HTTP probe cannot hang the test worker", { timeout: 8_000 }, async () => {
+  const f = fixture();
+  const stub = path.join(f.dir, "never-responding.js");
+  fs.writeFileSync(stub, 'require("node:http").createServer(() => {}).listen(Number(process.env.PORT), "127.0.0.1");');
+  let child;
+  try {
+    await assert.rejects(startServer(f.dir, {}, false, {
+      serverModule: stub,
+      startupTimeoutMs: 1_200,
+      onSpawn: (spawned) => { child = spawned; },
+    }), /server did not start/);
+    assert.ok(child?.pid);
+    assert.ok(child.exitCode !== null || child.signalCode !== null);
+    assert.ok(child.stdio.every((stream) => stream === null || stream.closed));
+  } finally {
+    if (child?.exitCode === null && child?.signalCode === null) await stop(child);
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("an HTTP startup responder that slowly streams forever still meets a hard wall deadline", { timeout: 8_000 }, async () => {
+  const f = fixture();
+  const stub = path.join(f.dir, "never-ending-response.js");
+  fs.writeFileSync(stub, 'require("node:http").createServer((req,res) => { res.writeHead(200); setInterval(() => res.write("x"), 25); }).listen(Number(process.env.PORT), "127.0.0.1");');
+  let child;
+  try {
+    await assert.rejects(startServer(f.dir, {}, false, {
+      serverModule: stub,
+      startupTimeoutMs: 900,
+      onSpawn: (spawned) => { child = spawned; },
+    }), /server did not start/);
+    assert.ok(child?.pid);
+    assert.ok(child.exitCode !== null || child.signalCode !== null);
+    assert.ok(child.stdio.every((stream) => stream === null || stream.closed));
+  } finally {
+    if (child?.exitCode === null && child?.signalCode === null) await stop(child);
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
 });
 
 function fixture() {

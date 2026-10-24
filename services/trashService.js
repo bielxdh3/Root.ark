@@ -94,19 +94,11 @@ function claimRemoteDeletion({ item, clock, leaseMs = 60 * 1000, workerId = cryp
     fs.closeSync(fd);
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
-    try {
-      const lockState = fs.statSync(target);
-      if (lockState.mtimeMs + leaseMs <= now) fs.rmSync(target, { force: true });
-    } catch {
-      return null;
-    }
-    try {
-      const fd = fs.openSync(target, "wx");
-      fs.writeFileSync(fd, token, "utf8");
-      fs.closeSync(fd);
-    } catch {
-      return null;
-    }
+    // A stale mtime is not ownership proof. Removing this pathname after a
+    // stat can unlink a new worker's exclusive claim (CodeQL #133). Until a
+    // durable fenced reclaim protocol exists, a pre-existing claim blocks
+    // retries and requires explicit operator recovery.
+    return null;
   }
   const at = new Date(now).toISOString();
   const claimed = transition(previous, previous.state, at, {

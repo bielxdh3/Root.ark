@@ -20,9 +20,39 @@ const TIMEOUT_MS = 10_000;
 const FOLDER_ID = "upload-safety";
 const createChunkUploadQuota = (options) => createChunkUploadQuotaService({ perAccountEntries: 5000, systemEntries: 10000, ...options });
 
+test("multipart parser uses the locked Multer from this checkout", () => {
+  const packagePath = require.resolve("multer/package.json");
+  const expectedPath = path.join(ROOT, "node_modules", "multer", "package.json");
+  assert.equal(fs.existsSync(expectedPath), true,
+    "Install locked dependencies with npm ci in this checkout before running tests");
+  assert.equal(fs.realpathSync(packagePath), fs.realpathSync(expectedPath),
+    "Node must not silently load Multer from another worktree's node_modules");
+  assert.equal(require(packagePath).version,
+    require("../package-lock.json").packages["node_modules/multer"].version);
+});
+
+test("server fails closed when inherited Multer does not match the lockfile", () => {
+  const simulatedLegacyModule = [
+    'const Module = require("node:module");',
+    "const originalLoad = Module._load;",
+    'Module._load = function(name, parent, main) {',
+    '  if (name === "multer/package.json") return {version: "1.4.5-lts.2"};',
+    '  return originalLoad.apply(this, arguments);',
+    '};',
+    "require(" + JSON.stringify(SERVER) + ");",
+  ].join("\n");
+  const child = spawnSync(process.execPath, ["-e", simulatedLegacyModule], {
+    cwd: ROOT, encoding: "utf8", timeout: 15_000,
+    env: { ...process.env, ROOTARK_RESTORE_INSTANCE_COUNT: "1" },
+  });
+  assert.equal(child.status, 1, child.stderr || child.stdout || child.error?.message);
+  assert.match(child.stderr, /MULTER_LOCKFILE_MISMATCH/);
+});
+
 function chunkBoundaryRequestTimeout(chunkIndex, totalChunks) {
   // Only the final supported 2,000-part boundary assembles 2,000 files on this response.
-  // Keep the other 1,999 socket deadlines strict and the overall 180s test budget intact.
+  // Keep the other 1,999 socket deadlines strict. A slower Windows CI
+  // fixture has a separate bounded wall-time budget for all requests.
   return totalChunks === 2000 && chunkIndex === totalChunks - 1 ? 30_000 : TIMEOUT_MS;
 }
 
@@ -110,7 +140,10 @@ test("release gate emits a bounded redacted TAP failure from canonical npm test 
     __dirname: path.dirname(gatePath),
     process: simulatedProcess,
     console: { log: (line) => printed.push(String(line)) },
-    require: (name) => name === "node:child_process" ? { spawnSync: simulatedSpawnSync } : gateRequire(name),
+    require: (name) => name === "node:child_process" ? { spawnSync: simulatedSpawnSync }
+      : name === "./release-gate-environment" ? {
+        ...gateRequire(name), hasSeparateWindowsCiCanonicalTest: () => false,
+      } : gateRequire(name),
   }, { filename: gatePath });
   const output = printed.join("\n");
   assert.ok(commands.some((line) => /(?:^|\s)(?:npm(?:\.cmd)?\s+)?test -- --test-reporter=tap(?:\s|$)/.test(line)), "canonical npm still runs every test with a deterministic TAP reporter");
@@ -135,7 +168,10 @@ test("release gate prints metadata-only failure diagnostics for unknown npm outp
     console: { log: (line) => printed.push(String(line)) },
     require: (name) => name === "node:child_process" ? { spawnSync: (executable, args) => isCanonicalNpmTestInvocation(executable, args)
       ? { status: 1, stdout: `unknown-format ${secret}\n`, stderr: "", error: { code: "ENOBUFS" } }
-      : { status: 0, stdout: "", stderr: "" } } : gateRequire(name),
+      : { status: 0, stdout: "", stderr: "" } }
+      : name === "./release-gate-environment" ? {
+        ...gateRequire(name), hasSeparateWindowsCiCanonicalTest: () => false,
+      } : gateRequire(name),
   }, { filename: gatePath });
   const output = printed.join("\n");
   assert.match(output, /FAIL diagnostics \(final-head canonical npm test\):/);
@@ -175,19 +211,38 @@ function request(port, requestPath, { method = "GET", headers = {}, body, agent,
   });
 }
 
-async function waitForServer(port, timeout = TIMEOUT_MS) {
+async function waitForServer(port, timeout = process.platform === "win32" ? 30_000 : TIMEOUT_MS, child = null) {
   const deadline = Date.now() + timeout;
-  let lastError;
+  let lastState = "no response";
   while (Date.now() < deadline) {
-    try {
-      return await request(port, "/login.html");
-    } catch (error) {
-      lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 100));
+    if (child && (child.exitCode !== null || child.signalCode !== null)) {
+      throw new Error(`server exited before readiness (code=${child.exitCode}, signal=${child.signalCode})`);
     }
+    try {
+      const result = await request(port, "/login.html", { timeoutMs: Math.max(1, Math.min(1_000, deadline - Date.now())) });
+      if (result.status === 200) return result;
+      lastState = `HTTP ${result.status}`;
+    } catch (error) {
+      lastState = error.code || error.message;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw lastError;
+  throw new Error(`server did not serve login within ${timeout}ms (last probe: ${lastState}; exit=${child?.exitCode ?? "unknown"})`);
 }
+
+test("upload readiness ignores a transient HTTP error before the login route is healthy", async (t) => {
+  let probes = 0;
+  const listener = http.createServer((_req, res) => {
+    probes += 1;
+    res.writeHead(probes === 1 ? 503 : 200);
+    res.end();
+  });
+  await new Promise((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => listener.close(resolve)));
+  const response = await waitForServer(listener.address().port, 2_000);
+  assert.equal(response.status, 200);
+  assert.equal(probes, 2);
+});
 
 async function login(port, username, password) {
   const body = JSON.stringify({ username, password });
@@ -234,7 +289,7 @@ function testDeadQuotaOwnerEnv(...processIds) {
   return { ROOTARK_TEST_DEAD_QUOTA_OWNER_PIDS: ids.join(",") };
 }
 
-async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, readyTimeout = TIMEOUT_MS, uploaderPermissions = {}, secondUploaderHasFolderAccess = false, appDataMode = "json", envOverrides = {}, deterministicQuotaRecovery = false } = {}) {
+async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, readyTimeout = process.platform === "win32" ? 30_000 : TIMEOUT_MS, uploaderPermissions = {}, secondUploaderHasFolderAccess = false, appDataMode = "json", envOverrides = {}, deterministicQuotaRecovery = false } = {}) {
   const password = crypto.randomBytes(24).toString("base64url");
   const fixtureBase = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
   const dir = fs.mkdtempSync(path.join(fixtureBase, "rootark-upload-safety-"));
@@ -337,7 +392,7 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
   });
   if (waitForReady) {
     try {
-      assert.equal((await waitForServer(port, readyTimeout)).status, 200);
+      assert.equal((await waitForServer(port, readyTimeout, child)).status, 200);
     } catch (error) {
       throw new Error(`${error.message}\nserver exit: ${child.exitCode}\nserver stdout:\n${stdout.join("")}\nserver stderr:\n${stderr.join("")}`);
     }
@@ -2500,8 +2555,22 @@ test("chunk assembly fails closed when a session ledger path is duplicated", { t
   assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
 });
 
-test("a valid upload can send all 2,000 allowed chunks within the configured window", { timeout: 180_000 }, async (t) => {
-  const harness = await createHarness(t, { envOverrides: { API_RATE_LIMIT_MAX: "1" } });
+// This is a real, strictly sequential 2,000-request filesystem/SQLite test,
+// not a fast unit test. GitHub-hosted Windows disks have previously exceeded
+// the local 180s test cap even while individual requests remained successful.
+// Keep every chunk, response check, and the final assembly; permit a bounded
+// slow-runner budget instead of treating CI throughput as an upload failure.
+const chunkBoundarySuiteTimeoutMs = process.platform === "win32" && process.env.CI === "true"
+  ? 480_000 : 180_000;
+test("a valid upload can send all 2,000 allowed chunks within the configured window",
+  { timeout: chunkBoundarySuiteTimeoutMs }, async (t) => {
+  const harness = await createHarness(t, {
+    envOverrides: { API_RATE_LIMIT_MAX: "1" },
+    // The first cold child boot and Windows AV/filesystem initialization may
+    // exceed the ordinary 10s readiness probe on loaded development hosts.
+    // This changes no upload, admission or per-request timeout behavior.
+    readyTimeout: process.platform === "win32" ? 45_000 : TIMEOUT_MS,
+  });
   const session = await login(harness.port, "uploader", harness.password);
   const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
   t.after(() => agent.destroy());

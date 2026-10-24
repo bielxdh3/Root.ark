@@ -10,10 +10,18 @@ if (String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim() !== "1") {
   throw new Error("Multiple server instances are unsupported while authentication state is process-local.");
 }
 const express = require("express");
+const { shouldDeferZk1JsonParsing } = require("./src/middlewares/zk1DeferredJsonParsing");
 const { rateLimit } = require("express-rate-limit");
 const UploadChunkSlidingWindowStore = require("./src/middlewares/uploadChunkSlidingWindowStore");
 const SqliteSlidingWindowStore = require("./src/middlewares/sqliteSlidingWindowStore");
 const multer = require("multer");
+// Multer 1.x silently ignores fieldNestingDepth/defParamCharset and enforces
+// a different file-size boundary. Node can otherwise inherit that old parser
+// from a parent worktree when this checkout has no node_modules.
+const lockedMulterVersion = require("./package-lock.json").packages?.["node_modules/multer"]?.version;
+if (!lockedMulterVersion || require("multer/package.json").version !== lockedMulterVersion) {
+  throw new Error("MULTER_LOCKFILE_MISMATCH: install dependencies using npm ci in this checkout");
+}
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
@@ -69,11 +77,15 @@ const registerAuditRoutes = require("./src/routes/audit");
 const registerBackupRoutes = require("./src/routes/backups");
 const registerTrashRoutes = require("./src/routes/trash");
 const { registerSyncRoutes } = require("./src/routes/sync");
+const { registerOpaqueDevVaultRoutes } = require("./src/routes/zkOpaqueDevVault");
+const { registerZk1LocalSignedHistoryRoutes } = require("./src/routes/zk1LocalSignedHistoryRoutes");
+const { registerZk1ProtectedContentFromConfig } = require("./src/services/zk1ProtectedContentBootstrap");
 const { registerGroupRoutes } = require("./src/routes/groups");
 const { createAuthenticate, createRealtimeAuthenticator, getClientIp, getExpectedOrigin, isAuthTokenExpired, parseCookies } = require("./src/middlewares/auth");
 const { getTrustedClientIp, parseTrustedProxies } = require("./src/middlewares/trustedProxies");
 const { createRealtimeUpgradeGuard } = require("./src/realtime/upgradeGuard");
 const { createRequirePermission } = require("./src/middlewares/permissions");
+const { parseIndependentCatalogConnectOrigins } = require("./src/zk1-catalog-connect-csp");
 const { isTotpRequired, validateTotpPolicy } = require("./src/services/totpPolicy");
 const { getDeploymentReadiness, isSessionCookieSecure, registerReadinessRoutes, sanitizeLogValue } = require("./src/services/deploymentResilience");
 const { createWebDavCredentialCache } = require("./src/services/webdavCredentialCache");
@@ -2963,7 +2975,11 @@ function normalizeVersionHistory(entry) {
           version: Number(version.version),
           storedAs: path.basename(version.storedAs || ""),
           uploadedBy: version.uploadedBy || "sistema",
-          uploadedAt: version.uploadedAt || new Date().toISOString(),
+          // Missing historical timestamps must remain explicitly unavailable.
+          // Inventing a new wall-clock timestamp on every catalog read makes
+          // authenticated legacy migration pins impossible to reproduce.
+          uploadedAt: typeof version.uploadedAt === "string" && Number.isFinite(Date.parse(version.uploadedAt))
+            ? version.uploadedAt : null,
           size: Number(version.size) || 0,
           comment: version.comment || "",
         }))
@@ -3905,6 +3921,7 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
     "Content-Disposition": getFileContentDisposition(safeName, dispositionType),
     "X-Content-Type-Options": "nosniff",
   };
+  if (options.includeLastModified) commonHeaders["Last-Modified"] = options.lastModified || stats.mtime.toUTCString();
   if (isActiveContentFile(safeName)) commonHeaders["Content-Security-Policy"] = "sandbox; default-src 'none'";
 
   const streamOptions = { highWaterMark };
@@ -5935,8 +5952,23 @@ const APP_CONTENT_SECURITY_POLICY = [
   "form-action 'self'",
   "frame-ancestors 'self'",
 ].join("; ");
+const independentCatalogConnectOrigins = parseIndependentCatalogConnectOrigins(
+  process.env.ROOTARK_ZK1_INDEPENDENT_CATALOG_CONNECT_ORIGINS);
+const WORKSPACE_CONTENT_SECURITY_POLICY = independentCatalogConnectOrigins.length
+  ? APP_CONTENT_SECURITY_POLICY.replace("connect-src 'self' ws: wss:",
+    `connect-src 'self' ws: wss: ${independentCatalogConnectOrigins.join(" ")}`)
+  : APP_CONTENT_SECURITY_POLICY;
 app.use((req, res, next) => {
-  res.setHeader("Content-Security-Policy", APP_CONTENT_SECURITY_POLICY);
+  // The opt-in development-only emergency package uses Argon2id from
+  // libsodium's WebAssembly build. Permit WASM compilation on that single
+  // page, not unrestricted JS eval and never on legacy application pages.
+  const devVaultWasm = process.env.ROOTARK_ZK_DEV_VAULT_ENABLED === "true"
+    && NODE_ENV !== "production" && req.path === "/zk-dev-vault.html";
+  const isWorkspace = req.path === "/" || req.path === "/index.html";
+  res.setHeader("Content-Security-Policy", devVaultWasm
+    ? APP_CONTENT_SECURITY_POLICY.replace("script-src 'self'",
+      "script-src 'self' 'wasm-unsafe-eval'")
+    : isWorkspace ? WORKSPACE_CONTENT_SECURITY_POLICY : APP_CONTENT_SECURITY_POLICY);
   res.setHeader("X-Frame-Options", "SAMEORIGIN");
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "same-origin");
@@ -5952,12 +5984,38 @@ app.use((req, res, next) => {
   }
   next();
 });
+// A development-only page must not live in public/: static serving on Windows
+// is case-insensitive and can decode path aliases differently from req.path.
+// Mount this exact, non-public file only for an explicitly opted-in dev/test
+// process. With no route, all spellings are 404, even through express.static.
+if ((NODE_ENV === "development" || NODE_ENV === "test")
+  && process.env.ROOTARK_ZK1_CONTENT_CONFIG) {
+  app.get("/zk1-protected-file-lab.html", apiRequestRateLimit, (_req, res) =>
+    res.sendFile(path.join(__dirname, "dev-ui", "zk1-protected-file-lab.html"),
+      { dotfiles: "allow" }));
+}
 app.use(express.static("./public"));
 app.post("/upload-chunk", uploadChunkPeerRateLimit);
 app.use(apiRequestRateLimit);
+// Express routes ignore case and accept a trailing slash by default. Match the
+// same dev API families BEFORE the global body parser, including when disabled:
+// otherwise unknown routes or unauthenticated requests allocate up to 9 MiB.
+// Dev route handlers install their JSON parsers only after auth and permission.
+const isDeferredZkDevApiPath = (pathname) =>
+  /^\/zk-dev\/v1\/(?:objects|zk1-history)(?:\/|$)/i.test(pathname);
 app.use((req, res, next) => {
   if (WEBDAV_ENABLED && isWebDavRequestPath(req.path)) return next();
-  if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
+  if (isDeferredZkDevApiPath(req.path)) return next();
+  if (shouldDeferZk1JsonParsing(req, {
+    contentConfig: process.env.ROOTARK_ZK1_CONTENT_CONFIG, environment: NODE_ENV,
+  })) {
+    // Auth, permissions, and route-local limits (512b for authority probes;
+    // 8kb for multiprovider restore) precede any body parsing.
+    return next();
+  }
+  if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) {
+    return syncJsonParser(req, res, next);
+  }
   return express.json()(req, res, next);
 });
 const loadCurrentUser = (username) => loadUsers().find((user) => user.username === username);
@@ -6066,6 +6124,58 @@ wss.on("connection", (socket, req) => {
 });
 
 const requirePermission = createRequirePermission();
+
+// Opt-in developer workflow: a browser-only encrypted file vault. This is
+// deliberately NOT integrated with legacy uploads or presented as zk-1.
+// Enabling it never creates a server-held recovery key.
+if (process.env.ROOTARK_ZK_DEV_VAULT_ENABLED === "true" && ["development", "test"].includes(NODE_ENV)) {
+  const devVaultDbPath = process.env.ROOTARK_ZK_DEV_VAULT_DB || "./data/zk-dev-vault.sqlite";
+  registerOpaqueDevVaultRoutes({
+    app, authenticate, requirePermission, auditLog,
+    dbPath: devVaultDbPath,
+  });
+  // An independent local archive of public SIGNED zk-1 v2 manifests.
+  // Do not use its unwitnessed head for protected content authorization.
+  registerZk1LocalSignedHistoryRoutes({
+    app, authenticate, requirePermission, auditLog,
+    dbPath: devVaultDbPath + ".zk1-history.sqlite",
+  });
+}
+
+// Opt-in authenticated ZK-1 ciphertext I/O with pinned remote CAS + witness.
+// This is an experimental single-scope integration, not a replacement for
+// legacy file, sync, cloud, backup or WebDAV routes and not complete ZK.
+if (process.env.ROOTARK_ZK1_CONTENT_CONFIG) {
+  if (!["development", "test"].includes(NODE_ENV)) {
+    throw new Error("ROOTARK_ZK1_CONTENT_CONFIG requires development or test mode");
+  }
+  // Optional operator-owned JavaScript provisioning (trusted startup code)
+  // constructs real provider readers and OFF-SERVER pinned public trust roots.
+  // This opt-in module is executed only in development/test, never from a
+  // request body or legacy file and never with production restore privileges.
+  let multiproviderRestore = null;
+  if (process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE) {
+    const filename = process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE;
+    if (!path.isAbsolute(filename)) throw new Error("ZK restore provisioning requires absolute module path");
+    const stat = fs.lstatSync(filename);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+      throw new Error("ZK restore provisioning must be an ordinary operator-owned file");
+    }
+    const provision = require(filename);
+    if (typeof provision !== "function") {
+      throw new Error("ZK restore provisioning must export a function");
+    }
+    multiproviderRestore = provision();
+  }
+  const zk1ContentStore = registerZk1ProtectedContentFromConfig({
+    app, authenticate, requirePermission,
+    configPath: process.env.ROOTARK_ZK1_CONTENT_CONFIG, environment: NODE_ENV,
+    multiproviderRestore,
+  });
+  server.once("close", () => zk1ContentStore.close());
+} else if (process.env.ROOTARK_ZK1_MULTIPROVIDER_RESTORE_MODULE) {
+  throw new Error("ZK multiprovider restore requires protected content bootstrap");
+}
 
 registerSyncRoutes({
   app,
@@ -11262,8 +11372,23 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
   }
 
   const target = getVersionFilePath(folder, name, versionNumber);
+  // The restore-provider suppression policy is an access-control boundary.
+  // Deny a suppressed storedAs alias before inspecting optional legacy
+  // timestamps: missing history metadata cannot turn a forbidden 403 into a
+  // distinguishable 409, even when the current file itself is readable.
+  if (target?.version?.storedAs
+    && isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) {
+    return res.status(403).json({ error: "Acesso negado a esta versao" });
+  }
+  // Cloud cache rehydration gives the local copy a fresh filesystem mtime.
+  // Historical Last-Modified must instead derive from immutable version data,
+  // or fail closed when that legacy metadata was never persisted.
+  const storedUploadedAt = target?.version?.uploadedAt;
+  if (target && (typeof storedUploadedAt !== "string"
+    || !Number.isFinite(Date.parse(storedUploadedAt)))) {
+    return res.status(409).json({ error: "Metadados historicos da versao indisponiveis" });
+  }
   if (target?.version?.storedAs) {
-    if (isRestoreProviderOrphanDenied(req, folder.id, target.version.storedAs)) return res.status(403).json({ error: "Acesso negado a esta versao" });
     await ensureCloudFileCached(folder.id, target.version.storedAs, target.filePath, "uploads", () => !isFileInTrash(folder.id, name), name);
   }
   if (!refreshAuthenticatedUser(req, res)) return;
@@ -11281,7 +11406,9 @@ app.get("/download/:filename/v/:version", authenticate, requirePermission("listF
     return res.status(404).json({ error: "Versao nao encontrada" });
   }
 
-  sendOptimizedFile(req, res, target.filePath, name, "attachment");
+  sendOptimizedFile(req, res, target.filePath, name, "attachment", {
+    includeLastModified: true, lastModified: new Date(storedUploadedAt).toUTCString(),
+  });
 });
 
 app.post("/version-open-token", versionOpenTokenRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {

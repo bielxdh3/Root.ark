@@ -1,0 +1,244 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const Database = require("better-sqlite3");
+const z = require("../src/crypto/rootark-zk-1");
+const v2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
+const fixtures = require("./support/issue-65-recovery-v2-fixtures");
+const { Zk1ProtectedObjectStore, contentAuthorizationMessageV1 } =
+  require("../src/services/zk1ProtectedObjectStore");
+
+const DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0", "ascii");
+const rand = (n) => crypto.randomBytes(n);
+
+test("protected local PUT archives ciphertext revisions atomically and never replaces earlier opaque bytes", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-version-ledger-"));
+  const filename = path.join(dir, "content.sqlite");
+  const state = await fixtures.createInitialState(2);
+  const scope = state.scope;
+  const manifest = state.headManifest;
+  const witness = crypto.generateKeyPairSync("ed25519");
+  const witnessKeyId = rand(16);
+  const digest = await v2.recoveryManifestDigestV2(manifest);
+  const instances = [];
+  t.after(() => {
+    for (const instance of instances) if (instance.db.open) instance.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const make = (bootstrapNew) => {
+    const store = new Zk1ProtectedObjectStore(filename, {
+      trustedScope: scope, minimumHead: { revision: 1,
+        digest: awaitDigest, witnessSequence: 1 },
+      bootstrapNew,
+      witnessProvider: { async freshHead({ nonce }) {
+        const head = { type: "rootark-recovery-witness-head/v1",
+          witness_key_id: witnessKeyId, ...scope,
+          current_revision: manifest.revision, current_manifest_digest: digest,
+          witness_sequence: manifest.revision, nonce, observed_at: 1200,
+          status: "committed", pending_reservation_id: null };
+        const signature = crypto.sign(null, Buffer.concat([
+          DOMAIN, Buffer.from(await z.encodeDeterministic(head)),
+        ]), witness.privateKey);
+        return z.encodeDeterministic({ ...head, signature });
+      } },
+      witnessPinned: { keyId: witnessKeyId, publicKey: witness.publicKey },
+      manifestProvider: () => z.encodeDeterministic(manifest),
+      nowSeconds: () => 1200,
+    });
+    instances.push(store);
+    return store;
+  };
+  const awaitDigest = await v2.recoveryManifestDigestV2(state.baseManifest);
+  let store = make(true);
+  const device = manifest.devices[0];
+  const privateKey = state.actors.get(Buffer.from(device.authorization_key_id).toString("hex"));
+  const objectId = rand(16).toString("base64url");
+  const signed = async (data, expectedRevision) => {
+    const operation = { ...scope, device_id: device.device_id, operation: "put",
+      object_id: objectId, expected_object_revision: expectedRevision,
+      manifest_revision: manifest.revision, manifest_digest: digest,
+      epoch: manifest.current_epoch, nonce: rand(32), issued_at: 1199,
+      expires_at: 1230, ciphertext_digest: crypto.createHash("sha256").update(data).digest() };
+    return { scope, authorization: operation, ciphertext: data,
+      signature: crypto.sign(null, await contentAuthorizationMessageV1(operation), privateKey) };
+  };
+  const firstBytes = rand(300);
+  const secondBytes = rand(301);
+  const first = await signed(firstBytes, null);
+  assert.equal((await store.put(first)).revision, 1);
+  const second = await signed(secondBytes, 1);
+  assert.equal((await store.put(second)).revision, 2);
+  const revisions = () => store.db.prepare(
+    "SELECT revision,epoch,ciphertext,ciphertext_digest,provenance FROM zk_content_version WHERE id=? ORDER BY revision")
+    .all(objectId);
+  assert.equal(revisions().length, 2,
+    "both committed ciphertext versions must persist, not just latest overwritten bytes");
+  assert.deepEqual(revisions().map((row) => row.revision), [1, 2]);
+  assert.deepEqual(revisions().map((row) => row.ciphertext), [firstBytes, secondBytes]);
+  for (const row of revisions()) {
+    assert.deepEqual(row.ciphertext_digest,
+      crypto.createHash("sha256").update(row.ciphertext).digest());
+    assert.equal(row.provenance, "transactional");
+  }
+  const historicalGet = async (revision, expectedDigest) => {
+    const authorization = { ...scope, device_id: device.device_id, operation: "get",
+      object_id: objectId, expected_object_revision: revision,
+      manifest_revision: manifest.revision, manifest_digest: digest,
+      epoch: manifest.current_epoch, nonce: rand(32), issued_at: 1199,
+      expires_at: 1230, ciphertext_digest: expectedDigest };
+    return { scope, authorization, signature: crypto.sign(null,
+      await contentAuthorizationMessageV1(authorization), privateKey) };
+  };
+  assert.deepEqual((await store.get(await historicalGet(1,
+    crypto.createHash("sha256").update(firstBytes).digest()))).ciphertext,
+  firstBytes, "signed historical GET must return first committed ciphertext, not the current projection");
+  await assert.rejects(store.get(await historicalGet(1,
+    crypto.createHash("sha256").update(secondBytes).digest())),
+  /ZK_CONTENT_DENIED|ZK_CONTENT_CONFLICT/,
+  "signed digest for wrong historic revision may never access archived ciphertext");
+  await assert.rejects(store.get(await historicalGet(3,
+    crypto.createHash("sha256").update(firstBytes).digest())),
+  /ZK_CONTENT_DENIED|ZK_CONTENT_NOT_FOUND/,
+  "unknown revision is not silently substituted with the latest");
+  await assert.rejects(historicalGet(null,
+    crypto.createHash("sha256").update(firstBytes).digest()),
+  /ZK_CONTENT_DENIED/,
+  "digest with no historical revision is not an ambiguous latest read");
+  const latestRead = () => historicalGet(null, null);
+  const corruptProjection = rand(secondBytes.length);
+  store.db.prepare("UPDATE zk_content_object SET ciphertext=? WHERE id=?")
+    .run(corruptProjection, objectId);
+  await assert.rejects(store.get(await latestRead()),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT|ZK_CONTENT_CONFLICT/,
+    "the latest ciphertext projection cannot be sent if it disagrees with the immutable archive");
+  await assert.rejects(store.put(await signed(rand(302), 2)),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT|ZK_CONTENT_CONFLICT/,
+    "a legitimate PUT must not launder an unexpected modified current projection");
+  store.db.prepare("UPDATE zk_content_object SET ciphertext=? WHERE id=?")
+    .run(secondBytes, objectId);
+  assert.deepEqual((await store.get(await latestRead())).ciphertext, secondBytes,
+    "exact projection/archive parity restores the original authorized read");
+  store.db.prepare("UPDATE zk_content_object SET revision=?, epoch=?, ciphertext=? WHERE id=?")
+    .run(1, manifest.current_epoch, firstBytes, objectId);
+  await assert.rejects(store.get(await latestRead()),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT/,
+    "a rollback to a valid earlier archived revision is still a forged latest head");
+  await assert.rejects(store.put(await signed(rand(300), 1)),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT/,
+    "rollback to a valid archived revision must not allow a replayed sequential PUT");
+  store.db.prepare("UPDATE zk_content_object SET revision=?, epoch=?, ciphertext=? WHERE id=?")
+    .run(2, manifest.current_epoch, secondBytes, objectId);
+  store.db.prepare("DELETE FROM zk_content_object WHERE id=?").run(objectId);
+  await assert.rejects(store.get(await latestRead()),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT/,
+    "removing the current projection must not hide an intact historical object");
+  store.db.prepare("INSERT INTO zk_content_object(scope,id,revision,epoch,ciphertext) VALUES(?,?,?,?,?)")
+    .run(store.db.prepare("SELECT scope FROM zk_content_version WHERE id=? LIMIT 1")
+      .get(objectId).scope, objectId, 2, manifest.current_epoch, secondBytes);
+  assert.deepEqual((await store.get(await latestRead())).ciphertext, secondBytes);
+  const failed = await signed(rand(100), 1);
+  await assert.rejects(store.put(failed), /ZK_CONTENT_CONFLICT/);
+  assert.equal(revisions().length, 2, "failed overwrite cannot create phantom immutable revisions");
+  assert.throws(() => store.db.prepare("UPDATE zk_content_version SET ciphertext=? WHERE id=?")
+    .run(rand(20), objectId), /ZK_CONTENT_VERSION_IMMUTABLE/);
+  assert.throws(() => store.db.prepare("DELETE FROM zk_content_version WHERE id=?")
+    .run(objectId), /ZK_CONTENT_VERSION_IMMUTABLE/);
+  const currentScope = store.db.prepare("SELECT scope FROM zk_content_object WHERE id=?")
+    .get(objectId).scope;
+  const replaced = rand(300);
+  assert.throws(() => store.db.prepare(
+    "INSERT OR REPLACE INTO zk_content_version "
+      + "(scope,id,revision,epoch,ciphertext,ciphertext_digest,provenance) "
+      + "VALUES(?,?,?,?,?,?,'transactional')")
+    .run(currentScope, objectId, 1, manifest.current_epoch,
+      replaced, crypto.createHash("sha256").update(replaced).digest()),
+  /ZK_CONTENT_VERSION_IMMUTABLE/,
+  "SQLite REPLACE must not silently bypass immutable history via its implicit DELETE");
+  store.close();
+  store = make(false);
+  assert.deepEqual(revisions().map((row) => row.ciphertext), [firstBytes, secondBytes],
+    "restart must preserve all opaque revisions byte-for-byte");
+  assert.deepEqual((await store.get(await historicalGet(1,
+    crypto.createHash("sha256").update(firstBytes).digest()))).ciphertext, firstBytes,
+  "historical GET after restart still enforces independent signed revision and digest");
+  await assert.rejects(store.put(second), /ZK_CONTENT_REPLAY/);
+  assert.equal(revisions().length, 2);
+  const third = await signed(rand(320), 2);
+  store.db.exec("CREATE TRIGGER zk_content_version_fixture_abort "
+    + "BEFORE INSERT ON zk_content_version "
+    + "BEGIN SELECT RAISE(ABORT,'VERSION_FIXTURE_ABORT'); END");
+  await assert.rejects(store.put(third), /VERSION_FIXTURE_ABORT/,
+    "a history write failure must reject the entire protected PUT");
+  assert.equal(store.db.prepare("SELECT revision FROM zk_content_object WHERE id=?")
+    .get(objectId).revision, 2, "no partially advanced latest ciphertext revision");
+  assert.equal(revisions().length, 2, "no phantom archive row");
+  store.db.exec("DROP TRIGGER zk_content_version_fixture_abort");
+  assert.equal((await store.put(third)).revision, 3,
+    "failed transaction must not consume nonce or poison a safe exact retry");
+  assert.equal(revisions().length, 3);
+  // Adversarial live SQLite tampering: a privileged local writer can drop an
+  // immutability trigger and erase a non-tail revision while the latest
+  // projection and archive tail still agree. Ordinary reads/writes must
+  // reject the missing history BEFORE the next process restart.
+  store.db.exec("DROP TRIGGER zk_content_version_no_delete");
+  store.db.prepare("DELETE FROM zk_content_version WHERE id=? AND revision=1")
+    .run(objectId);
+  await assert.rejects(store.get(await latestRead()),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT/,
+    "live latest GET must detect an erased historical ciphertext revision");
+  await assert.rejects(store.put(await signed(rand(330), 3)),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT/,
+    "live PUT must never build on a truncated ciphertext version history");
+  store.db.prepare(`INSERT INTO zk_content_version
+    (scope,id,revision,epoch,ciphertext,ciphertext_digest,provenance)
+    VALUES(?,?,?,?,?,?,'transactional')`).run(currentScope, objectId, 1,
+    manifest.current_epoch, firstBytes,
+    crypto.createHash("sha256").update(firstBytes).digest());
+  // INTEGER affinity is not a STRICT type constraint in SQLite. A forged
+  // fractional revision can retain COUNT=3/MIN=1/MAX=3 while rev2 is absent.
+  store.db.prepare("DELETE FROM zk_content_version WHERE id=? AND revision=2")
+    .run(objectId);
+  store.db.prepare(`INSERT INTO zk_content_version
+    (scope,id,revision,epoch,ciphertext,ciphertext_digest,provenance)
+    VALUES(?,?,?,?,?,?,'transactional')`).run(currentScope, objectId, 1.5,
+    manifest.current_epoch, secondBytes,
+    crypto.createHash("sha256").update(secondBytes).digest());
+  assert.equal(store.db.prepare("SELECT typeof(revision) AS type FROM zk_content_version "
+    + "WHERE id=? AND revision=1.5").get(objectId).type, "real");
+  await assert.rejects(store.get(await latestRead()),
+    /ZK_CONTENT_VERSION_HISTORY_CORRUPT/,
+    "fractional archive revision must not disguise a missing version");
+  store.db.prepare("DELETE FROM zk_content_version WHERE id=? AND revision=1.5")
+    .run(objectId);
+  store.db.prepare(`INSERT INTO zk_content_version
+    (scope,id,revision,epoch,ciphertext,ciphertext_digest,provenance)
+    VALUES(?,?,?,?,?,?,'transactional')`).run(currentScope, objectId, 2,
+    manifest.current_epoch, secondBytes,
+    crypto.createHash("sha256").update(secondBytes).digest());
+  store.db.exec(`CREATE TRIGGER zk_content_version_no_delete
+    BEFORE DELETE ON zk_content_version
+    BEGIN SELECT RAISE(ABORT,'ZK_CONTENT_VERSION_IMMUTABLE'); END`);
+  assert.deepEqual((await store.get(await latestRead())).ciphertext, third.ciphertext);
+  // Intentional corruption of this disposable fixture, not customer data.
+  // An attacker with direct file access can drop SQLite triggers; the next
+  // startup must detect a corrupted historical digest and refuse future I/O.
+  store.db.exec("DROP TRIGGER zk_content_version_no_update");
+  store.db.prepare("UPDATE zk_content_version SET ciphertext=? WHERE id=? AND revision=1")
+    .run(rand(300), objectId);
+  store.close();
+  assert.throws(() => make(false), /ZK_CONTENT_VERSION_HISTORY_CORRUPT/,
+    "restart must never accept a forged/altered prior version");
+  const fixture = new Database(filename);
+  fixture.exec("DROP TABLE zk_content_version");
+  fixture.close();
+  const bytesBefore = fs.readFileSync(filename);
+  assert.throws(() => make(false), /ZK_CONTENT_VERSION_HISTORY_REQUIRED/,
+    "older/incomplete history requires an explicit reviewed migration, not invented prior rows");
+  assert.deepEqual(fs.readFileSync(filename), bytesBefore,
+    "unknown or missing version archive must not be repaired by writing to the original database");
+});

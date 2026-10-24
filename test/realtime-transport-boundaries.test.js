@@ -14,8 +14,80 @@ const { EventEmitter } = require("node:events");
 const ROOT = path.resolve(__dirname, "..");
 function port() { return new Promise((resolve, reject) => { const server = net.createServer(); server.once("error", reject); server.listen(0, "127.0.0.1", () => { const value = server.address().port; server.close(() => resolve(value)); }); }); }
 function stopChild(child) { if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(); const exited = new Promise((resolve) => child.once("exit", resolve)); child.kill(); return exited; }
-function request(portNumber, requestPath, options = {}) { return new Promise((resolve, reject) => { const req = http.request({ host: "127.0.0.1", port: portNumber, path: requestPath, ...options }, (res) => { let body = ""; res.on("data", (chunk) => { body += chunk; }); res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body })); }); req.once("error", reject); req.end(options.body); }); }
-async function ready(portNumber) { for (let index = 0; index < 100; index += 1) { try { await request(portNumber, "/login.html"); return; } catch { await new Promise((resolve) => setTimeout(resolve, 50)); } } throw new Error("server did not start"); }
+function request(portNumber, requestPath, options = {}) {
+  return new Promise((resolve, reject) => {
+    const { requestTimeoutMs, ...requestOptions } = options;
+    let deadlineTimer;
+    const finish = (callback, result) => { clearTimeout(deadlineTimer); callback(result); };
+    const req = http.request({ host: "127.0.0.1", port: portNumber, path: requestPath, ...requestOptions }, (res) => {
+      let body = "";
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => finish(resolve, { status: res.statusCode, headers: res.headers, body }));
+      res.once("error", (error) => finish(reject, error));
+    });
+    if (requestTimeoutMs) deadlineTimer = setTimeout(() => req.destroy(new Error("readiness request timed out")), requestTimeoutMs);
+    req.once("error", (error) => finish(reject, error));
+    req.end(options.body);
+  });
+}
+async function ready(portNumber, child, timeoutMs = 12_000) {
+  const deadline = performance.now() + timeoutMs;
+  let lastState = "no response";
+  while (performance.now() < deadline) {
+    if (child && (child.exitCode !== null || child.signalCode !== null)) {
+      throw new Error(`server exited before readiness (code=${child.exitCode}, signal=${child.signalCode})`);
+    }
+    try {
+      const response = await request(portNumber, "/login.html", { requestTimeoutMs: Math.max(1, Math.min(1000, deadline - performance.now())) });
+      if (response.status === 200) return;
+      lastState = `HTTP ${response.status}`;
+    } catch (error) {
+      lastState = error.code || error.message;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 75));
+  }
+  throw new Error(`server did not start within ${timeoutMs}ms (last probe: ${lastState}; exit=${child?.exitCode ?? "unknown"})`);
+}
+test("WebDAV readiness rejects an HTTP error until the login route actually serves", async (t) => {
+  let probes = 0;
+  const listener = http.createServer((_req, res) => {
+    probes += 1;
+    res.writeHead(probes === 1 ? 503 : 200);
+    res.end();
+  });
+  await new Promise((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => listener.close(resolve)));
+  await ready(listener.address().port);
+  assert.equal(probes, 2, "an unhealthy HTTP response cannot be mistaken for a ready server");
+});
+test("WebDAV readiness bounds a stalled HTTP response before retrying", { timeout: 4_000 }, async (t) => {
+  let probes = 0;
+  const listener = http.createServer((_req, res) => {
+    probes += 1;
+    if (probes > 1) res.end("ok");
+  });
+  await new Promise((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  t.after(() => listener.closeAllConnections());
+  t.after(() => new Promise((resolve) => listener.close(resolve)));
+  await ready(listener.address().port, null, 2_500);
+  assert.equal(probes, 2, "one stalled probe does not strand startup verification");
+});
+test("WebDAV readiness bounds an HTTP response that never finishes streaming", { timeout: 4_500 }, async (t) => {
+  let probes = 0;
+  const listener = http.createServer((_req, res) => {
+    probes += 1;
+    if (probes === 1) {
+      res.writeHead(200);
+      const interval = setInterval(() => res.write("x"), 40);
+      res.once("close", () => clearInterval(interval));
+    } else res.end("ok");
+  });
+  await new Promise((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  t.after(() => listener.closeAllConnections());
+  t.after(() => new Promise((resolve) => listener.close(resolve)));
+  await ready(listener.address().port, null, 2_500);
+  assert.equal(probes, 2, "streaming an unfinished response cannot extend the readiness deadline");
+});
 const websocketMessageStates = new WeakMap();
 function observeWebSocketMessages(socket) {
   const state = { messages: [], waiters: [] };
@@ -93,7 +165,7 @@ test("realtime transport declares bounded payload, compression, binary, and burs
   assert.match(contents, /server\.once\("close", \(\) => clearInterval\(realtimeHeartbeat\)\)/);
 });
 
-test("WebSocket HTTP upgrade enforces cookie, Origin, message, and binary boundaries", { timeout: 20_000 }, async (t) => {
+test("WebSocket HTTP upgrade enforces cookie, Origin, message, and binary boundaries", { timeout: process.platform === "win32" ? 50_000 : 20_000 }, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-realtime-"));
   fs.mkdirSync(path.join(dir, "data"));
   fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([{ username: "agent", password: bcrypt.hashSync("password", 10), role: "admin", permissions: {}, sessionVersion: 0 }]));
@@ -101,7 +173,7 @@ test("WebSocket HTTP upgrade enforces cookie, Origin, message, and binary bounda
   const portNumber = await port();
   const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: { ...process.env, PORT: String(portNumber), DB_ENABLED: "false", ROOTARK_BOOTSTRAP_USERS_FROM_SEED: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") }, stdio: "ignore", windowsHide: true });
   t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
-  await ready(portNumber);
+  await ready(portNumber, child, process.platform === "win32" ? 30_000 : 12_000);
   const body = JSON.stringify({ username: "agent", password: "password" });
   const login = await request(portNumber, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
   const cookie = login.headers["set-cookie"].map((item) => item.split(";", 1)[0]).join("; ");
@@ -392,7 +464,7 @@ test("WebDAV stops dispatch when the TOTP policy becomes invalid after startup",
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   t.after(async () => { if (child.exitCode === null) { child.kill(); await new Promise((resolve) => child.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
-  await ready(portNumber);
+  await ready(portNumber, child);
   const policyChanged = new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("child did not acknowledge the policy change")), 2_000);
     child.once("message", (message) => { clearTimeout(timer); resolve(message); });
