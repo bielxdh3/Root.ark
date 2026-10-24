@@ -11,6 +11,7 @@ const { verifyCommittedPhysicalReadback } =
   require("./rootark-zk-pg-physical-attestation-v1");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/attested-inventory-commit/v1\0");
+const CHAIN_NONCE_DOMAIN = Buffer.from("Root.ark/zk-1/physical-chain-nonce/v1\0");
 
 function deny() {
   const error = new Error("ZK_ATTESTED_INVENTORY_COMMIT_DENIED");
@@ -36,6 +37,14 @@ function publicKey(value) {
     || value.asymmetricKeyType !== "ed25519") deny();
 }
 function sha(bytes) { return crypto.createHash("sha256").update(bytes).digest(); }
+function derivePhysicalChainNonce(pageNonce, sequence, operationId) {
+  const nonce = rawBytes(pageNonce, 32, 32);
+  const id = rawBytes(operationId, 16, 16);
+  if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence > inventory.MAX_ENTRIES) deny();
+  const seq = Buffer.alloc(8);
+  seq.writeBigUInt64BE(BigInt(sequence));
+  return sha(Buffer.concat([CHAIN_NONCE_DOMAIN, nonce, seq, id]));
+}
 function snapshotOperation(value) {
   exact(value, ["operation_id", "expected_sequence", "expected_root", "object_id",
     "revision", "epoch", "ciphertext_sha256"]);
@@ -105,4 +114,4 @@ async function verifyAttestedInventoryCommit(input) {
   } catch (_) { deny(); }
 }
 
-module.exports = { verifyAttestedInventoryCommit, DOMAIN };
+module.exports = { verifyAttestedInventoryCommit, derivePhysicalChainNonce, DOMAIN };

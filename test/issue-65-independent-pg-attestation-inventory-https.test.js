@@ -43,7 +43,7 @@ test("strict inventory mTLS append needs independent fresh physical Ed25519 read
   const issuer = async ({ scope: requestedScope, operation: requestedOp, nonce }, key) =>
     signCommittedPhysicalReadback({ scope: requestedScope, operation: requestedOp,
       readback, nonce, issuedAt: Math.floor(Date.now() / 1000) }, key);
-  const ledger = { scope, publicKey: writer.publicKey, appendCount: 0,
+  const ledger = { scope, publicKey: writer.publicKey, signerKeyId: random(16), appendCount: 0,
     async append() { this.appendCount += 1; return { status: "pending", reason: "SEAL_UNCERTAIN" }; },
     async getOperationStatus() { return { status: "pending" }; },
     async getSnapshot() { return { status: "pending" }; } };

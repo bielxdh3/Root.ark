@@ -396,6 +396,27 @@ async function verifyCommittedEntryProof(input) {
   };
 }
 
+async function readVerifiedCommittedOperation({ serialized, pinnedPublicKey,
+  pinnedSignerKeyId, expectedScope }) {
+  const bytes = copyBytes(serialized, 1, MAX_COMMITTED_PROOF_BYTES);
+  let decoded;
+  try { decoded = await z.decodeDeterministic(bytes); }
+  catch (_) { fail("INVENTORY_ENCODING"); }
+  const row = exactObject(decoded, COMMITTED_FIELDS, "INVENTORY_COMMIT_PROOF");
+  const operation = normalizeTerminalOperation({
+    operation_id: row.operation_id,
+    expected_sequence: row.expected_sequence,
+    expected_root: row.expected_root,
+    object_id: row.entry?.object_id,
+    revision: row.entry?.revision,
+    epoch: row.entry?.epoch,
+    ciphertext_sha256: row.entry?.ciphertext_sha256,
+  });
+  await verifyCommittedEntryProof({ serialized: bytes, pinnedPublicKey,
+    pinnedSignerKeyId, expectedScope, operation });
+  return operation;
+}
+
 function sameBytes(a, b) {
   return Buffer.isBuffer(a) && Buffer.isBuffer(b)
     && a.length === b.length && crypto.timingSafeEqual(a, b);
@@ -677,6 +698,7 @@ module.exports = {
   createTerminalProof,
   verifyTerminalProof,
   verifyCommittedEntryProof,
+  readVerifiedCommittedOperation,
   normalizeCommittedProofChain,
   verifySnapshot,
 };

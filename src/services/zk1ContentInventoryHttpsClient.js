@@ -8,7 +8,7 @@ const tls = require("node:tls");
 const net = require("node:net");
 const crypto = require("node:crypto");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
-const { verifyAttestedInventoryCommit } =
+const { verifyAttestedInventoryCommit, derivePhysicalChainNonce } =
   require("../crypto/rootark-zk1-attested-inventory-commit-v1");
 
 const FINGERPRINT = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
@@ -20,6 +20,7 @@ const MAX_SNAPSHOT_RESPONSE_BYTES = MAX_SNAPSHOT_BASE64_BYTES + 16 * 1024;
 const MAX_SMALL_RESPONSE_BYTES = 16 * 1024;
 const MAX_CHAIN_RESPONSE_BYTES = 128 * 1024;
 const MAX_CHAIN_PAGE_RECEIPTS = 16;
+const MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS = 2;
 const MAX_AUTO_CHAIN_RECEIPTS = 64;
 const SCOPE_FIELDS = Object.freeze(["account_id", "compartment_id", "keyring_id"]);
 const OPERATION_FIELDS = Object.freeze([
@@ -306,12 +307,15 @@ function createZk1ContentInventoryHttpsClient({
       if (!Number.isSafeInteger(raw.afterSequence) || raw.afterSequence < 0
         || raw.afterSequence > inventory.MAX_ENTRIES
         || !Number.isSafeInteger(raw.limit) || raw.limit < 1
-        || raw.limit > MAX_CHAIN_PAGE_RECEIPTS) fail();
+        || raw.limit > (physicalAttestorPublicKey
+          ? MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS : MAX_CHAIN_PAGE_RECEIPTS)) fail();
+      const pageNonce = physicalAttestorPublicKey ? crypto.randomBytes(32) : null;
       return call("/v1/inventory/chain", {
         scope: Object.fromEntries(Object.entries(scope).map(([field, value]) =>
           [field, value.toString("base64url")])),
         afterSequence: raw.afterSequence, limit: raw.limit,
-      }, MAX_METADATA_REQUEST_BYTES, MAX_CHAIN_RESPONSE_BYTES).then((result) => {
+        ...(pageNonce ? { nonce: pageNonce.toString("base64url") } : {}),
+      }, MAX_METADATA_REQUEST_BYTES, MAX_CHAIN_RESPONSE_BYTES).then(async (result) => {
         try {
           const pending = exact(result, ["status", "reason"]);
           if (pending.status === "pending" && pending.reason === "UNRESOLVED_INTENT") {
@@ -319,7 +323,8 @@ function createZk1ContentInventoryHttpsClient({
           }
         } catch (_) { /* next check requires the exact chain page shape */ }
         const page = exact(result, ["status", "afterSequence", "nextSequence",
-          "headSequence", "proofsBase64"]);
+          "headSequence", "proofsBase64"].concat(physicalAttestorPublicKey
+          ? ["physicalAttestationsBase64"] : []));
         if (page.status !== "chain_page" || page.afterSequence !== raw.afterSequence
           || !Number.isSafeInteger(page.nextSequence)
           || page.nextSequence < raw.afterSequence
@@ -332,13 +337,34 @@ function createZk1ContentInventoryHttpsClient({
           || (page.nextSequence < page.headSequence && page.proofsBase64.length !== raw.limit)) fail();
         const proofs = page.proofsBase64.map((item) =>
           decode(item, 1, inventory.MAX_COMMITTED_PROOF_BYTES));
+        const physicalProofs = [];
+        if (physicalAttestorPublicKey) {
+          if (!Array.isArray(page.physicalAttestationsBase64)
+            || page.physicalAttestationsBase64.length !== proofs.length) fail();
+          for (let i = 0; i < proofs.length; i += 1) {
+            const operation = await inventory.readVerifiedCommittedOperation({
+              serialized: proofs[i], pinnedPublicKey: inventoryPublicKey,
+              pinnedSignerKeyId: signerKeyId, expectedScope: scope,
+            });
+            if (operation.expected_sequence !== raw.afterSequence + i) fail();
+            const physicalAttestation = decode(page.physicalAttestationsBase64[i], 1, 2048);
+            const nonce = derivePhysicalChainNonce(pageNonce,
+              operation.expected_sequence + 1, operation.operation_id);
+            await verifyAttestedInventoryCommit({ receipt: proofs[i], physicalAttestation,
+              scope, operation, nonce, pinnedInventoryPublicKey: inventoryPublicKey,
+              pinnedInventorySignerKeyId: signerKeyId,
+              pinnedPhysicalAttestorPublicKey: physicalAttestorPublicKey,
+              nowSeconds: Math.floor(Date.now() / 1000) });
+            physicalProofs.push(physicalAttestation);
+          }
+        }
         // Transport delivery is NOT a signed floor or a verified chain.
         // Only verifySnapshot with a pinned minimumHead and complete signed
         // minimumSnapshot can authenticate these bytes.
         return {
           status: "transport_unverified", afterSequence: raw.afterSequence,
           nextSequence: page.nextSequence, headSequenceReported: page.headSequence,
-          proofs, authorizesIo: false,
+          proofs, physicalProofs, authorizesIo: false,
         };
       }).catch(() => fail());
     },
@@ -356,10 +382,12 @@ function createZk1ContentInventoryHttpsClient({
       const minimumHead = inventory.normalizeMinimumHead(raw.minimumHead);
       const minimumSnapshot = copyBytes(raw.minimumSnapshot, 1, inventory.MAX_SNAPSHOT_BYTES);
       const committedProofChain = [];
+      const physicalProofChain = [];
       let cursor = minimumHead.sequence;
       for (;;) {
         if (committedProofChain.length >= MAX_AUTO_CHAIN_RECEIPTS) fail();
-        const limit = Math.min(MAX_CHAIN_PAGE_RECEIPTS,
+        const limit = Math.min(physicalAttestorPublicKey
+          ? MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS : MAX_CHAIN_PAGE_RECEIPTS,
           MAX_AUTO_CHAIN_RECEIPTS - committedProofChain.length);
         const page = await client.getProofPage({ scope, afterSequence: cursor, limit });
         if (page.status === "pending") {
@@ -369,6 +397,10 @@ function createZk1ContentInventoryHttpsClient({
           || page.nextSequence - cursor !== page.proofs.length
           || (page.nextSequence === cursor && page.headSequenceReported !== cursor)) fail();
         committedProofChain.push(...page.proofs);
+        if (physicalAttestorPublicKey) {
+          if (page.physicalProofs.length !== page.proofs.length) fail();
+          physicalProofChain.push(...page.physicalProofs);
+        }
         cursor = page.nextSequence;
         if (page.headSequenceReported === cursor) break;
       }
@@ -377,11 +409,16 @@ function createZk1ContentInventoryHttpsClient({
       const verified = await client.getSnapshot({
         scope, nonce, requested, minimumHead, minimumSnapshot, committedProofChain,
       });
-      if (raw.includeVerifiedProofChain !== true || verified.status !== "VERIFIED_NONAUTHORIZING") {
-        return verified;
-      }
-      return { ...verified, authenticatedProofChain: committedProofChain.map((proof) =>
-        Buffer.from(proof)) };
+      if (verified.status !== "VERIFIED_NONAUTHORIZING") return verified;
+      return { ...verified,
+        ...(physicalAttestorPublicKey ? { independentPhysicalChainVerified: true } : {}),
+        ...(raw.includeVerifiedProofChain === true ? {
+          authenticatedProofChain: committedProofChain.map((proof) => Buffer.from(proof)),
+          ...(physicalAttestorPublicKey ? {
+            authenticatedPhysicalProofChain: physicalProofChain.map((proof) => Buffer.from(proof)),
+          } : {}),
+        } : {}),
+      };
     },
 
     getSnapshot(input) {
@@ -598,7 +635,10 @@ function createZk1ContentInventoryHttpsClient({
           nonce: crypto.randomBytes(32), requested: operationEntry(operation),
           minimumHead, minimumSnapshot, includeVerifiedProofChain: true });
         if (chain.status !== "VERIFIED_NONAUTHORIZING" || chain.outcome !== "PRESENT"
+          || chain.independentPhysicalChainVerified !== true
           || !Array.isArray(chain.authenticatedProofChain)
+          || !Array.isArray(chain.authenticatedPhysicalProofChain)
+          || chain.authenticatedPhysicalProofChain.length !== chain.authenticatedProofChain.length
           || chain.sequence < before.sequence) fail();
         const offset = before.verifiedReceipt.sequence - minimumHead.sequence - 1;
         if (offset === -1) {

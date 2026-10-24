@@ -1,5 +1,26 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: independently attested strict inventory chain (2026-10-24)
+
+The opt-in strict mTLS inventory chain now requires a fresh caller challenge per
+page and derives a distinct challenge for every signed entry. The server
+verifies each ledger receipt under its pinned inventory identity, asks the
+separate read-only physical attestor for a fresh PostgreSQL readback, and
+returns both. The client independently verifies each Ed25519 receipt/readback
+pair against the exact operation and pinned identities before authenticating
+the complete chain against its caller-retained signed floor and fresh snapshot.
+Missing, forged, or downgraded physical evidence fails closed. Strict pages
+are capped at two receipts under the existing physical-read lease; long chains
+can hit the current per-principal rate budget and must retry rather than infer
+success. This is nonauthorizing proof of local physical readback, **not** a
+cloud durability guarantee or an externally anchored floor.
+
+Windows Node 24 mTLS + independent attestor transport: 24 PASS / 0 FAIL after
+fixing a synthetic ledger fixture missing its signer key ID. Ubuntu WSL Node 22
+mTLS: 23 PASS / 0 FAIL. The multi-page restart fixture uses a synthetic signed
+readback; it does not replace the separate PostgreSQL 18 laboratory, and the
+sync historical-admission gap below remains NO-GO. No publication or cutover.
+
 ## Issue #65 / PR #228: historical signed sync reads (2026-10-24)
 
 The isolated descendant of `caf3ed2` separates fresh authorization for new

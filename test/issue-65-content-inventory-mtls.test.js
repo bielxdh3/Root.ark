@@ -242,6 +242,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     const ledgerProxy = {
       get scope() { return ledger.scope; },
       get publicKey() { return ledger.publicKey; },
+      get signerKeyId() { return ledger.signerKeyId; },
       getSnapshot: (...args) => ledger.getSnapshot(...args),
       append: (...args) => ledger.append(...args),
       getOperationStatus: (...args) => ledger.getOperationStatus(...args),
@@ -323,6 +324,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       get port() { return port; },
       signer,
       attestor,
+      physicalAttestorClient,
       signerKeyId,
       scope: scopeBytes,
       makeClient,
@@ -1121,6 +1123,34 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     });
     assert.equal(checkedChain.outcome, "PRESENT");
     assert.equal(checkedChain.authenticatedProofChain.length, 1);
+    assert.equal(checkedChain.independentPhysicalChainVerified, true,
+      "every strict chain entry must have a fresh independent physical inclusion proof");
+    assert.equal(checkedChain.authenticatedPhysicalProofChain.length, 1);
+    assert.equal(checkedChain.authenticatedPhysicalProofChain[0].length > 0, true);
+    const validAttestation = h.physicalAttestorClient.requestAttestation;
+    h.physicalAttestorClient.requestAttestation = async ({ scope, operation: candidate, nonce }) =>
+      signCommittedPhysicalReadback({ scope, operation: candidate, nonce,
+        issuedAt: Math.floor(Date.now() / 1000),
+        readback: { status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
+          walFlushConfirmed: true, authorizesIo: false, provesIndependentOperator: false,
+          generation: 3, admissionId: crypto.randomBytes(16),
+          operationId: candidate.operation_id, revision: candidate.revision,
+          epoch: candidate.epoch, expectedInventorySequence: candidate.expected_sequence,
+          expectedInventoryRoot: candidate.expected_root,
+          ciphertextSha256: candidate.ciphertext_sha256, digest: crypto.randomBytes(32),
+          root: crypto.randomBytes(32), chunkCount: 1 },
+      }, h.signer.privateKey);
+    await assert.rejects(h.makeClient("status-reader").getVerifiedSnapshotWithChain({
+      scope: h.scope, nonce: crypto.randomBytes(32), requested: requested(operation),
+      minimumHead: floor, minimumSnapshot: snapshot.bytes,
+      includeVerifiedProofChain: true,
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" },
+    "the inventory writer key cannot fabricate strict chain physical inclusion");
+    h.physicalAttestorClient.requestAttestation = validAttestation;
+    // This fixture deliberately spends the principal's strict physical-read
+    // budget above. Restart only its disposable listener before positive
+    // assertions; production throttling must not be weakened for a test.
+    await h.restart();
     const chained = await h.makeClient("status-reader").getOperationStatusWithVerifiedChain({
       scope: h.scope, operation, minimumHead: floor, minimumSnapshot: snapshot.bytes,
     });
@@ -1159,5 +1189,36 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       minimumHead: floor, minimumSnapshot: snapshot.bytes,
     }), { code: "INVENTORY_HTTP_UNAVAILABLE" },
     "a signer-only client must not treat strict transport as an attested receipt");
+  });
+
+  await t.test("strict physical chain pages verify every signed ancestor across restart", async (child) => {
+    const h = await harness(child, { strictPhysical: true });
+    const floor = await h.ledger.readLocalHead();
+    const base = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+    let head = floor;
+    let last;
+    for (let i = 0; i < 3; i += 1) {
+      last = newOperation({ sequence: head.sequence, root: head.root,
+        objectId: Buffer.alloc(16, 0xa0 + i) });
+      const committed = await h.ledger.append(last);
+      assert.equal(committed.status, "committed");
+      head = { sequence: committed.sequence, root: committed.root };
+    }
+    const input = { scope: h.scope, nonce: crypto.randomBytes(32),
+      requested: requested(last), minimumHead: floor,
+      minimumSnapshot: base.bytes, includeVerifiedProofChain: true };
+    const before = await h.makeClient("status-reader").getVerifiedSnapshotWithChain(input);
+    assert.equal(before.independentPhysicalChainVerified, true);
+    assert.equal(before.authenticatedProofChain.length, 3);
+    assert.equal(before.authenticatedPhysicalProofChain.length, 3);
+    await h.restart();
+    const after = await h.makeClient("status-reader").getVerifiedSnapshotWithChain({
+      ...input, nonce: crypto.randomBytes(32),
+    });
+    assert.equal(after.independentPhysicalChainVerified, true);
+    assert.equal(after.authenticatedPhysicalProofChain.length, 3);
+    assert.notDeepEqual(after.authenticatedPhysicalProofChain[0],
+      before.authenticatedPhysicalProofChain[0],
+      "restart must request fresh physical evidence, not reuse a cached proof");
   });
 });

@@ -7,6 +7,8 @@ const crypto = require("node:crypto");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
 const { verifyCommittedPhysicalReadback } =
   require("../crypto/rootark-zk-pg-physical-attestation-v1");
+const { derivePhysicalChainNonce } =
+  require("../crypto/rootark-zk1-attested-inventory-commit-v1");
 const { Zk1SharedPgPhysicalCiphertextVerifier } =
   require("./zk1SharedPgPhysicalCiphertextVerifier");
 
@@ -17,6 +19,7 @@ const MAX_SNAPSHOT_RESPONSE_BYTES = MAX_SNAPSHOT_BASE64_BYTES + 16 * 1024;
 const MAX_SMALL_RESPONSE_BYTES = 16 * 1024;
 const MAX_CHAIN_RESPONSE_BYTES = 128 * 1024;
 const MAX_CHAIN_PAGE_RECEIPTS = 16;
+const MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS = 2;
 // Physical verification re-reads up to 64 MiB from PostgreSQL twice per
 // successful append. A valid but compromised mTLS append certificate must
 // not fan out unbounded concurrent hash/readback work. Reject rather than
@@ -169,6 +172,7 @@ function createZk1ContentInventoryHttpsServer({
     || ((physicalAttestorClient === undefined)
       !== (pinnedInventorySignerPublicKey === undefined))) invalid();
   const ledgerSignerKey = physicalAttestorClient === undefined ? undefined : ledger.publicKey;
+  const ledgerSignerId = physicalAttestorClient === undefined ? undefined : ledger.signerKeyId;
   if (physicalAttestorClient !== undefined
     && (!physicalAttestorClient || typeof physicalAttestorClient.requestAttestation !== "function"
       || !(pinnedPhysicalAttestorPublicKey instanceof crypto.KeyObject)
@@ -183,12 +187,14 @@ function createZk1ContentInventoryHttpsServer({
       || !(ledgerSignerKey instanceof crypto.KeyObject)
       || ledgerSignerKey.type !== "public"
       || ledgerSignerKey.asymmetricKeyType !== "ed25519"
+      || !Buffer.isBuffer(ledgerSignerId) || ledgerSignerId.length !== 16
       // KeyObject.export is mutable; native equality compares actual key
       // identity even if an attacker overwrites an instance .export method.
       || !crypto.KeyObject.prototype.equals.call(ledgerSignerKey,
         pinnedInventorySignerPublicKey)
       || crypto.KeyObject.prototype.equals.call(pinnedInventorySignerPublicKey,
         pinnedPhysicalAttestorPublicKey))) invalid();
+  const strictSignerId = ledgerSignerId === undefined ? undefined : Buffer.from(ledgerSignerId);
   const physicalEnabled = physicalVerifier !== undefined || physicalAttestorClient !== undefined;
 
   const ledgerScope = inventory.normalizeScope(ledger.scope);
@@ -275,7 +281,8 @@ function createZk1ContentInventoryHttpsServer({
       const body = await readJson(request,
         route.kind === "append" ? MAX_APPEND_REQUEST_BYTES : MAX_METADATA_REQUEST_BYTES);
       const expectedFields = route.kind === "snapshot" ? ["scope", "nonce"]
-        : route.kind === "chain" ? ["scope", "afterSequence", "limit"]
+        : route.kind === "chain" ? ["scope", "afterSequence", "limit"].concat(
+          physicalAttestorClient ? ["nonce"] : [])
           : ["scope", "operation"].concat(route.kind === "append"
             || (route.kind === "operation" && physicalAttestorClient)
             ? ["nonce"] : []);
@@ -288,7 +295,15 @@ function createZk1ContentInventoryHttpsServer({
         if (!Number.isSafeInteger(raw.afterSequence) || raw.afterSequence < 0
           || raw.afterSequence > inventory.MAX_ENTRIES
           || !Number.isSafeInteger(raw.limit) || raw.limit < 1
-          || raw.limit > MAX_CHAIN_PAGE_RECEIPTS) invalid();
+          || raw.limit > (physicalAttestorClient
+            ? MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS : MAX_CHAIN_PAGE_RECEIPTS)) invalid();
+        const pageNonce = physicalAttestorClient ? decode(raw.nonce, 32, 32) : null;
+        if (physicalAttestorClient) {
+          physicalLeasePrincipal = acquirePhysicalLease(peer.fingerprint256);
+          if (!physicalLeasePrincipal) {
+            return respond(response, 503, { error: "INVENTORY_UNAVAILABLE" });
+          }
+        }
         const page = await ledger.getCommittedProofPage({
           afterSequence: raw.afterSequence, limit: raw.limit,
         });
@@ -307,10 +322,24 @@ function createZk1ContentInventoryHttpsServer({
           || (page.nextSequence < page.headSequence && page.proofs.length !== raw.limit)
           || page.proofs.some((item) => !Buffer.isBuffer(item)
             || item.length < 1 || item.length > inventory.MAX_COMMITTED_PROOF_BYTES)) invalid();
+        const physicalAttestations = [];
+        if (physicalAttestorClient) {
+          for (const proof of page.proofs) {
+            const operation = await inventory.readVerifiedCommittedOperation({
+              serialized: proof, pinnedPublicKey: pinnedInventorySignerPublicKey,
+              pinnedSignerKeyId: strictSignerId, expectedScope: scope,
+            });
+            const entryNonce = derivePhysicalChainNonce(pageNonce,
+              operation.expected_sequence + 1, operation.operation_id);
+            const attested = await verifyPhysical(scope, operation, entryNonce);
+            physicalAttestations.push(attested.attestationBytes.toString("base64url"));
+          }
+        }
         return respond(response, 200, {
           status: "chain_page", afterSequence: page.afterSequence,
           nextSequence: page.nextSequence, headSequence: page.headSequence,
           proofsBase64: page.proofs.map((item) => item.toString("base64url")),
+          ...(physicalAttestorClient ? { physicalAttestationsBase64: physicalAttestations } : {}),
         }, MAX_CHAIN_RESPONSE_BYTES);
       }
 
