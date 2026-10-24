@@ -1249,4 +1249,80 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     assert.equal(verified.authenticatedProofChain.length, 64);
     assert.equal(verified.authenticatedPhysicalProofChain.length, 64);
   });
+
+  await t.test("denied physical leases cannot release another principal's active slot", async (child) => {
+    const h = await harness(child, { strictPhysical: true });
+    const floor = await h.ledger.readLocalHead();
+    const base = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+    const committed = newOperation({ root: floor.root });
+    assert.equal((await h.ledger.append(committed)).status, "committed");
+    const head = await h.ledger.readLocalHead();
+    const current = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+    const next = newOperation({ sequence: head.sequence, root: head.root,
+      objectId: Buffer.alloc(16, 0xb1) });
+    const original = h.physicalAttestorClient.requestAttestation;
+    let release;
+    const blocked = new Promise((resolve) => { release = resolve; });
+    let entered;
+    const twoEntered = new Promise((resolve) => { entered = resolve; });
+    let calls = 0;
+    h.physicalAttestorClient.requestAttestation = async (request) => {
+      calls += 1;
+      if (calls === 2) entered();
+      await blocked;
+      return original(request);
+    };
+    const status = h.makeClient("status-reader").getOperationStatus({
+      scope: h.scope, operation: committed,
+    });
+    const chain = h.makeClient("reader").getVerifiedSnapshotWithChain({
+      scope: h.scope, nonce: crypto.randomBytes(32), requested: requested(committed),
+      minimumHead: floor, minimumSnapshot: base.bytes,
+    });
+    let secondSettled;
+    try {
+      await twoEntered;
+      const appendInput = { scope: h.scope, operation: next,
+        nonce: crypto.randomBytes(32), minimumHead: head,
+        minimumSnapshot: current.bytes };
+      await assert.rejects(h.makeClient("writer").append(appendInput),
+        { code: "INVENTORY_HTTP_UNAVAILABLE" });
+      secondSettled = h.makeClient("writer").append({ ...appendInput,
+        nonce: crypto.randomBytes(32) }).then(
+        (value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(calls, 2);
+    } finally {
+      release();
+      h.physicalAttestorClient.requestAttestation = original;
+      await Promise.allSettled([status, chain, secondSettled].filter(Boolean));
+    }
+    const denied = await secondSettled;
+    assert.equal(denied.ok, false,
+      "a denied lease cannot free capacity still owned by two live principals");
+    assert.equal(denied.error.code, "INVENTORY_HTTP_UNAVAILABLE");
+    assert.equal((await status).status, "committed");
+    assert.equal((await chain).independentPhysicalChainVerified, true);
+  });
+
+  await t.test("empty chain pages cannot consume the physical readback budget of another principal", async (child) => {
+    const h = await harness(child, { strictPhysical: true });
+    const floor = await h.ledger.readLocalHead();
+    const base = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+    const reader = h.makeClient("reader");
+    for (let i = 0; i < 16; i += 1) {
+      const page = await reader.getProofPage({ scope: h.scope,
+        afterSequence: 0, limit: 4 });
+      assert.equal(page.proofs.length, 0);
+    }
+    const committed = newOperation({ root: floor.root });
+    assert.equal((await h.ledger.append(committed)).status, "committed");
+    const verified = await h.makeClient("status-reader").getVerifiedSnapshotWithChain({
+      scope: h.scope, nonce: crypto.randomBytes(32), requested: requested(committed),
+      minimumHead: floor, minimumSnapshot: base.bytes,
+      includeVerifiedProofChain: true,
+    });
+    assert.equal(verified.independentPhysicalChainVerified, true);
+    assert.equal(verified.authenticatedPhysicalProofChain.length, 1);
+  });
 });

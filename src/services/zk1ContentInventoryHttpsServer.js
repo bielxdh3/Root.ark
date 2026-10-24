@@ -20,7 +20,10 @@ const MAX_SMALL_RESPONSE_BYTES = 16 * 1024;
 const MAX_CHAIN_RESPONSE_BYTES = 128 * 1024;
 const MAX_CHAIN_PAGE_RECEIPTS = 16;
 const MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS = 4;
-const MAX_PHYSICAL_CHAIN_PAGES_PER_WINDOW = 16;
+const MAX_PHYSICAL_CHAIN_PAGES_PER_PRINCIPAL_WINDOW = 16;
+const MAX_PHYSICAL_CHAIN_PAGES_GLOBAL_WINDOW = 32;
+const MAX_CHAIN_METADATA_PAGES_PER_PRINCIPAL_WINDOW = 32;
+const MAX_CHAIN_METADATA_PAGES_GLOBAL_WINDOW = 256;
 // Physical verification re-reads up to 64 MiB from PostgreSQL twice per
 // successful append. A valid but compromised mTLS append certificate must
 // not fan out unbounded concurrent hash/readback work. Reject rather than
@@ -209,6 +212,25 @@ function createZk1ContentInventoryHttpsServer({
   const physicalChainPrincipalWindowCounts = new Map();
   let physicalChainWindowStarted = process.hrtime.bigint();
   let physicalChainGlobalWindowCount = 0;
+  const chainMetadataPrincipalWindowCounts = new Map();
+  let chainMetadataWindowStarted = process.hrtime.bigint();
+  let chainMetadataGlobalWindowCount = 0;
+  function acquireChainMetadataBudget(fingerprint) {
+    const id = fingerprint.toUpperCase();
+    const now = process.hrtime.bigint();
+    if (now - chainMetadataWindowStarted >= PHYSICAL_WINDOW_NS) {
+      chainMetadataWindowStarted = now;
+      chainMetadataGlobalWindowCount = 0;
+      chainMetadataPrincipalWindowCounts.clear();
+    }
+    if (chainMetadataGlobalWindowCount >= MAX_CHAIN_METADATA_PAGES_GLOBAL_WINDOW
+      || (chainMetadataPrincipalWindowCounts.get(id) || 0)
+        >= MAX_CHAIN_METADATA_PAGES_PER_PRINCIPAL_WINDOW) return false;
+    chainMetadataGlobalWindowCount += 1;
+    chainMetadataPrincipalWindowCounts.set(id,
+      (chainMetadataPrincipalWindowCounts.get(id) || 0) + 1);
+    return true;
+  }
   async function verifyPhysical(scope, operation, callerNonce) {
     if (physicalAttestorClient !== undefined) {
       // The application/inventory signer does not supply the physical digest,
@@ -263,9 +285,9 @@ function createZk1ContentInventoryHttpsServer({
     // throttling. The shared active limit still fences concurrent PG reads.
     if (activePhysicalAppends >= MAX_ACTIVE_PHYSICAL_APPENDS
       || activePhysicalPrincipals.has(id)
-      || physicalChainGlobalWindowCount >= MAX_PHYSICAL_CHAIN_PAGES_PER_WINDOW
+      || physicalChainGlobalWindowCount >= MAX_PHYSICAL_CHAIN_PAGES_GLOBAL_WINDOW
       || (physicalChainPrincipalWindowCounts.get(id) || 0)
-        >= MAX_PHYSICAL_CHAIN_PAGES_PER_WINDOW) return false;
+        >= MAX_PHYSICAL_CHAIN_PAGES_PER_PRINCIPAL_WINDOW) return false;
     physicalChainGlobalWindowCount += 1;
     physicalChainPrincipalWindowCounts.set(id,
       (physicalChainPrincipalWindowCounts.get(id) || 0) + 1);
@@ -325,11 +347,9 @@ function createZk1ContentInventoryHttpsServer({
           || raw.limit > (physicalAttestorClient
             ? MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS : MAX_CHAIN_PAGE_RECEIPTS)) invalid();
         const pageNonce = physicalAttestorClient ? decode(raw.nonce, 32, 32) : null;
-        if (physicalAttestorClient) {
-          physicalLeasePrincipal = acquirePhysicalChainLease(peer.fingerprint256);
-          if (!physicalLeasePrincipal) {
-            return respond(response, 503, { error: "INVENTORY_UNAVAILABLE" });
-          }
+        if (physicalAttestorClient
+          && !acquireChainMetadataBudget(peer.fingerprint256)) {
+          return respond(response, 503, { error: "INVENTORY_UNAVAILABLE" });
         }
         const page = await ledger.getCommittedProofPage({
           afterSequence: raw.afterSequence, limit: raw.limit,
@@ -350,7 +370,11 @@ function createZk1ContentInventoryHttpsServer({
           || page.proofs.some((item) => !Buffer.isBuffer(item)
             || item.length < 1 || item.length > inventory.MAX_COMMITTED_PROOF_BYTES)) invalid();
         const physicalAttestations = [];
-        if (physicalAttestorClient) {
+        if (physicalAttestorClient && page.proofs.length > 0) {
+          physicalLeasePrincipal = acquirePhysicalChainLease(peer.fingerprint256);
+          if (!physicalLeasePrincipal) {
+            return respond(response, 503, { error: "INVENTORY_UNAVAILABLE" });
+          }
           for (const proof of page.proofs) {
             const operation = await inventory.readVerifiedCommittedOperation({
               serialized: proof, pinnedPublicKey: pinnedInventorySignerPublicKey,
@@ -513,7 +537,7 @@ function createZk1ContentInventoryHttpsServer({
       }
       return respond(response, 503, { error: "INVENTORY_UNAVAILABLE" });
     } finally {
-      if (physicalLeasePrincipal !== undefined) {
+      if (typeof physicalLeasePrincipal === "string") {
         activePhysicalAppends -= 1;
         activePhysicalPrincipals.delete(physicalLeasePrincipal);
       }
