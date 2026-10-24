@@ -241,25 +241,55 @@ test("WebDAV does not PUT a source rewritten after FD pin with its mtime restore
   fs.writeFileSync(source, prior, { flag: "wx", mode: 0o600 });
   const fixedTime = new Date("2020-01-01T00:00:00Z");
   fs.utimesSync(source, fixedTime, fixedTime);
+  const folder = `zk1-${"a".repeat(64)}`;
+  const name = `${"b".repeat(22)}.ct`;
+  await assert.rejects(writer.upload(source, folder, name, "uploads",
+    { zk1BoundedBytes: prior.length }), /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/,
+  "a low-level upload without a publisher-pinned digest must fail closed");
+  await assert.rejects(writer.upload(source, folder, name, "uploads",
+    { zk1BoundedBytes: prior.length, zk1ExpectedSha256: "0".repeat(64) }),
+  /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/,
+  "a mismatching publisher pin must fail before HTTPS");
+  assert.equal(f.requests.length, 0);
   const original = fs.statSync(source, { bigint: true });
   const realRead = fs.readSync;
+  const realFstat = fs.fstatSync;
+  const realLstat = fs.lstatSync;
   let attacked = false;
+  // Model the observed NTFS 100ns timestamp collision deterministically:
+  // a same-size rewrite can preserve both mtimeNs and ctimeNs. The digest
+  // must catch this even when the metadata guard cannot distinguish writes.
+  fs.fstatSync = function (...args) {
+    const stat = realFstat.apply(fs, args);
+    if (attacked && stat.dev === original.dev && stat.ino === original.ino) {
+      stat.ctimeNs = original.ctimeNs;
+    }
+    return stat;
+  };
+  fs.lstatSync = function (...args) {
+    const stat = realLstat.apply(fs, args);
+    if (attacked && args[0] === source) stat.ctimeNs = original.ctimeNs;
+    return stat;
+  };
   fs.readSync = function (fd, buffer, offset, length, position) {
     if (!attacked && typeof fd === "number" && length === prior.length) {
       attacked = true;
-      // Preserve inode, byte length, and mtime. Only ctime detects the
-      // replacement of the authenticated opaque source across the FD read.
+      // Preserve inode, byte length and mtime; fake an identical ctime
+      // to prove the content pin survives low-precision NTFS timestamps.
       fs.writeFileSync(source, substituted);
       fs.utimesSync(source, fixedTime, fixedTime);
     }
     return realRead.call(fs, fd, buffer, offset, length, position);
   };
-  const folder = `zk1-${"a".repeat(64)}`;
   try {
-    await assert.rejects(writer.upload(source, folder, `${"b".repeat(22)}.ct`, "uploads",
-      { zk1BoundedBytes: prior.length }), /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
+    await assert.rejects(writer.upload(source, folder, name, "uploads",
+      { zk1BoundedBytes: prior.length,
+        zk1ExpectedSha256: crypto.createHash("sha256").update(prior).digest("hex") }),
+    /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/);
   } finally {
     fs.readSync = realRead;
+    fs.fstatSync = realFstat;
+    fs.lstatSync = realLstat;
   }
   const changed = fs.statSync(source, { bigint: true });
   assert.equal(attacked, true, "the source must be rewritten during its pinned FD read");
@@ -267,7 +297,7 @@ test("WebDAV does not PUT a source rewritten after FD pin with its mtime restore
   assert.equal(changed.ino, original.ino);
   assert.equal(changed.size, original.size);
   assert.equal(changed.mtimeNs, original.mtimeNs);
-  assert.notEqual(changed.ctimeNs, original.ctimeNs);
+  assert.deepEqual(fs.readFileSync(source), substituted);
   assert.equal(f.requests.length, 0, "a modified source must never reach the remote HTTPS peer");
 });
 

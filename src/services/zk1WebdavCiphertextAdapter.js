@@ -282,11 +282,19 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
           const expectedEtag = opts && Object.hasOwn(opts, "expectedEtag")
             ? opts.expectedEtag : null;
           ensure(opts && Object.getPrototypeOf(opts) === Object.prototype
-            && Reflect.ownKeys(opts).length === (expectedEtag === null ? 1 : 2)
+            && Reflect.ownKeys(opts).length === (expectedEtag === null ? 2 : 3)
             && (expectedEtag === null || validEtag(expectedEtag))
+            && typeof opts.zk1ExpectedSha256 === "string"
+            && /^[a-f0-9]{64}$/.test(opts.zk1ExpectedSha256)
             && Number.isSafeInteger(opts.zk1BoundedBytes)
             && opts.zk1BoundedBytes >= 1 && opts.zk1BoundedBytes <= MAX_BYTES);
           const bytes = readBoundedFile(source, opts.zk1BoundedBytes);
+          // NTFS can report the same ctimeNs after a same-size rewrite with
+          // restored mtime. Only the publisher's prevalidated ciphertext
+          // digest pins the exact bytes crossing the FD-to-HTTPS boundary.
+          ensure(crypto.timingSafeEqual(
+            crypto.createHash("sha256").update(bytes).digest(),
+            Buffer.from(opts.zk1ExpectedSha256, "hex")));
           const etag = await transfer("PUT", objectKey, bytes, 0, undefined, expectedEtag);
           return Object.freeze({ provider: "webdav", key: objectKey, etag });
         } catch (_) { throw unavailable(); }

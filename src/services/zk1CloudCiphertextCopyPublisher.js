@@ -142,6 +142,7 @@ class Zk1CloudCiphertextCopyPublisher {
       } finally { fs.closeSync(fd); }
       const answer = await this.#writer.upload(staged, address.folder,
         address.name, "uploads", { zk1BoundedBytes: payload.size,
+          ...(this.#provider === "webdav" ? { zk1ExpectedSha256: sha.toString("hex") } : {}),
           ...(this.#webdavEtag === null ? {} : { expectedEtag: this.#webdavEtag }),
           ...(this.#driveId === null ? {} : { providerFileId: this.#driveId }) });
       if (!answer || answer.provider !== this.#provider || answer.key !== key
