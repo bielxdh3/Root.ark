@@ -49,6 +49,12 @@ function errorResponse(res, status, error, extra = {}) {
   return res.status(status).json({ error, ...extra });
 }
 
+function indeterminateCommitError() {
+  const error = new Error("Sync commit state is indeterminate; restart and verify disk state before continuing");
+  error.code = "SYNC_COMMIT_INDETERMINATE";
+  return error;
+}
+
 async function durableWrite(filePath, value) {
   const directory = path.dirname(filePath);
   await fs.mkdir(directory, { recursive: true });
@@ -66,7 +72,17 @@ async function durableWrite(filePath, value) {
     await fs.unlink(temporary).catch(() => {});
     throw error;
   }
-  await syncDirectory(directory);
+  try {
+    await syncDirectory(directory);
+  } catch (error) {
+    // rename() already replaced the destination. The new contents may be
+    // visible even though the directory durability barrier was not confirmed.
+    // Never schedule a write from the previous in-memory state over them.
+    const ambiguous = new Error("Sync commit may have been renamed without a durable directory barrier", { cause: error });
+    ambiguous.code = error?.code || "SYNC_COMMIT_INDETERMINATE";
+    ambiguous.syncCommitIndeterminate = true;
+    throw ambiguous;
+  }
 }
 
 function publicRecord(record) {
@@ -169,6 +185,7 @@ class SyncObjectStore {
     this.filePath = path.resolve(filePath);
     this.state = { version: STORE_VERSION, users: {} };
     this.queue = Promise.resolve();
+    this.commitIndeterminate = false;
     this.burstGuard = burstGuard;
     this.retentionMs = retentionMs;
     this.now = now;
@@ -201,10 +218,20 @@ class SyncObjectStore {
 
   async transact(mutator) {
     let result;
-    this.queue = this.queue.then(async () => {
+    // A failed mutator or fsync must reject its own caller, but must not
+    // permanently poison every later transaction on this store instance.
+    // State advances only after durableWrite succeeds; recover only the
+    // scheduling chain, never the failed mutation or its result.
+    this.queue = this.queue.catch(() => {}).then(async () => {
+      if (this.commitIndeterminate) throw indeterminateCommitError();
       const next = JSON.parse(JSON.stringify(this.state));
       result = await mutator(next);
-      await durableWrite(this.filePath, next);
+      try {
+        await durableWrite(this.filePath, next);
+      } catch (error) {
+        if (error?.syncCommitIndeterminate === true) this.commitIndeterminate = true;
+        throw error;
+      }
       this.state = next;
     });
     await this.queue;
@@ -275,16 +302,19 @@ class SyncObjectStore {
   }
 
   isDevicePaused(username, deviceId) {
+    if (this.commitIndeterminate) throw indeterminateCommitError();
     return isPausedDevice(this.state.users[username] || {}, deviceId);
   }
 
   list(username, objectId = null) {
+    if (this.commitIndeterminate) throw indeterminateCommitError();
     const user = this.state.users[username] || { objects: {} };
     if (objectId) return user.objects[objectId] ? [publicRecord(user.objects[objectId])] : [];
     return Object.values(user.objects).map(publicRecord);
   }
 
   history(username, objectId) {
+    if (this.commitIndeterminate) throw indeterminateCommitError();
     const user = this.state.users[username] || { versions: {} };
     return (user.versions?.[objectId] || []).map(publicRecord);
   }
@@ -356,7 +386,15 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
         if (await verifyRegisteredDevice({ username: req.user.username, operation, proof: operation.authorization }) !== true) return errorResponse(res, 403, "Sync device authorization rejected");
       } catch { return errorResponse(res, 403, "Sync device authorization rejected"); }
     }
-    const result = await store.put(req.user.username, operation);
+    let result;
+    try {
+      result = await store.put(req.user.username, operation);
+    } catch (error) {
+      if (error?.code === "SYNC_COMMIT_INDETERMINATE" || store.commitIndeterminate) {
+        return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
+      }
+      throw error;
+    }
     if (result.kind === "paused") {
       if (result.newlyPaused) audit("sync.burst.paused", req, result.deviceId, "paused", "partial", { limit: result.limit, windowMs: result.windowMs });
       return errorResponse(res, 423, "sync_burst_paused", { code: "sync_burst_paused", deviceId: result.deviceId });
@@ -369,10 +407,12 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
 
   app.get("/sync/v1/objects", authenticate, requirePermission("listFiles"), async (req, res) => {
     await ready;
+    if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
     res.json({ protocolVersion: PROTOCOL_VERSION, objects: store.list(req.user.username, req.query.objectId ? String(req.query.objectId) : null) });
   });
   app.get("/sync/v1/objects/:objectId", authenticate, requirePermission("listFiles"), async (req, res) => {
     await ready;
+    if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
     const objects = store.list(req.user.username, req.params.objectId);
     if (!objects.length) return errorResponse(res, 404, "Sync object not found");
     res.json(objects[0]);
