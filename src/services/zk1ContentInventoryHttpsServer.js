@@ -3,7 +3,10 @@
 // Standalone mTLS transport for the signed content inventory. This service is
 // intentionally not connected to protected content routes or storage I/O.
 const https = require("node:https");
+const crypto = require("node:crypto");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
+const { verifyCommittedPhysicalReadback } =
+  require("../crypto/rootark-zk-pg-physical-attestation-v1");
 const { Zk1SharedPgPhysicalCiphertextVerifier } =
   require("./zk1SharedPgPhysicalCiphertextVerifier");
 
@@ -151,6 +154,7 @@ function respond(response, status, object, limit = MAX_SMALL_RESPONSE_BYTES) {
 
 function createZk1ContentInventoryHttpsServer({
   key, cert, clientCa, ledger, principals, physicalVerifier,
+  physicalAttestorClient, pinnedPhysicalAttestorPublicKey,
 }) {
   if (!key || !cert || !clientCa || !ledger
     || typeof ledger.getSnapshot !== "function" || typeof ledger.append !== "function"
@@ -158,7 +162,22 @@ function createZk1ContentInventoryHttpsServer({
     || !principals || typeof principals !== "object" || Array.isArray(principals)
     || Object.keys(principals).length < 1 || Object.keys(principals).length > 128
     || (physicalVerifier !== undefined
-      && !(physicalVerifier instanceof Zk1SharedPgPhysicalCiphertextVerifier))) invalid();
+      && !(physicalVerifier instanceof Zk1SharedPgPhysicalCiphertextVerifier))
+    || ((physicalAttestorClient === undefined)
+      !== (pinnedPhysicalAttestorPublicKey === undefined))) invalid();
+  if (physicalAttestorClient !== undefined
+    && (!physicalAttestorClient || typeof physicalAttestorClient.requestAttestation !== "function"
+      || !(pinnedPhysicalAttestorPublicKey instanceof crypto.KeyObject)
+      || pinnedPhysicalAttestorPublicKey.type !== "public"
+      || pinnedPhysicalAttestorPublicKey.asymmetricKeyType !== "ed25519"
+      // A single inventory/writer Ed25519 identity cannot certify its own
+      // physical PG readback, including through a proxy ledger facade.
+      || !(ledger.publicKey instanceof crypto.KeyObject)
+      || ledger.publicKey.type !== "public"
+      || ledger.publicKey.asymmetricKeyType !== "ed25519"
+      || ledger.publicKey.export({ format: "der", type: "spki" }).equals(
+        pinnedPhysicalAttestorPublicKey.export({ format: "der", type: "spki" })))) invalid();
+  const physicalEnabled = physicalVerifier !== undefined || physicalAttestorClient !== undefined;
 
   const ledgerScope = inventory.normalizeScope(ledger.scope);
   const ledgerScopeKey = scopeKey(ledgerScope);
@@ -168,6 +187,24 @@ function createZk1ContentInventoryHttpsServer({
   const physicalPrincipalWindowCounts = new Map();
   let physicalGlobalWindowStarted = process.hrtime.bigint();
   let physicalGlobalWindowCount = 0;
+  async function verifyPhysical(scope, operation) {
+    if (physicalAttestorClient !== undefined) {
+      // The application/inventory signer does not supply the physical digest,
+      // root or chunk count. Only the independently pinned read-only attestor
+      // can report those facts from its immutable PG intent and WAL barrier.
+      const nonce = crypto.randomBytes(32);
+      const raw = await physicalAttestorClient.requestAttestation({ scope,
+        operation, nonce: Buffer.from(nonce) });
+      const proof = await verifyCommittedPhysicalReadback(raw, { scope, operation,
+        expected: undefined, nonce, pinnedPublicKey: pinnedPhysicalAttestorPublicKey,
+        nowSeconds: Math.floor(Date.now() / 1000) });
+      if (proof.status !== "PHYSICALLY_REREAD_PG_COMMITTED"
+        || proof.verified !== true || proof.walFlushConfirmed !== true
+        || proof.authorizesIo !== false) invalid();
+      return proof;
+    }
+    return physicalVerifier.verifyCommittedInventoryOperation({ scope, operation });
+  }
   // Appends and committed-operation lookups share the same limited physical
   // readback budget. A status certificate must not bypass append throttling.
   function acquirePhysicalLease(fingerprint) {
@@ -280,7 +317,7 @@ function createZk1ContentInventoryHttpsServer({
       // Charge all physical-mode status attempts BEFORE that potentially
       // expensive lookup, not only successful physical readbacks. Otherwise
       // a status certificate can flood random IDs without hitting a quota.
-      if (route.kind === "operation" && physicalVerifier) {
+      if (route.kind === "operation" && physicalEnabled) {
         physicalLeasePrincipal = acquirePhysicalLease(peer.fingerprint256);
         if (!physicalLeasePrincipal) {
           return respond(response, 503, { error: "INVENTORY_UNAVAILABLE" });
@@ -292,12 +329,12 @@ function createZk1ContentInventoryHttpsServer({
         // alone must not turn an arbitrary signed operation into a claim of
         // durable ciphertext. Only a separately provisioned read-only
         // PostgreSQL verifier may read the immutable intent and bytes.
-        if (physicalVerifier) {
+        if (physicalEnabled) {
           physicalLeasePrincipal = acquirePhysicalLease(peer.fingerprint256);
           if (!physicalLeasePrincipal) {
             return respond(response, 503, { error: "INVENTORY_UNAVAILABLE" });
           }
-          await physicalVerifier.verifyCommittedInventoryOperation({ scope, operation });
+          await verifyPhysical(scope, operation);
         }
         const result = await ledger.append(operation);
         if (!result || typeof result.status !== "string") invalid();
@@ -337,8 +374,8 @@ function createZk1ContentInventoryHttpsServer({
         // A signature may already be durable before a physical corruption is
         // detected. Never return positive transport success unless a fresh
         // readback still passes. A historical receipt is not GET authority.
-        if (physicalVerifier) {
-          await physicalVerifier.verifyCommittedInventoryOperation({ scope, operation });
+        if (physicalEnabled) {
+          await verifyPhysical(scope, operation);
         }
         const snapshotBase64 = snapshot.bytes.toString("base64url");
         if (snapshotBase64.length > MAX_SNAPSHOT_BASE64_BYTES) invalid();
@@ -377,8 +414,8 @@ function createZk1ContentInventoryHttpsServer({
       // opt-in physical mode, status reconciliation also fails closed on
       // changed bytes, stale generation, broken binding or failed WAL flush.
       // No part of this response authorizes GET/release of protected content.
-      if (physicalVerifier) {
-        await physicalVerifier.verifyCommittedInventoryOperation({ scope, operation });
+      if (physicalEnabled) {
+        await verifyPhysical(scope, operation);
       }
       return respond(response, 200, {
         status: "committed",

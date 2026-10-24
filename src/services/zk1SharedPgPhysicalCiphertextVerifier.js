@@ -310,6 +310,9 @@ class Zk1SharedPgPhysicalCiphertextVerifier {
         verified: true, generation: Number(s.generation),
         admissionId: Buffer.from(s.admission_id), operationId: Buffer.from(v.operationId),
         walFlushConfirmed: true, chunkCount: v.expectedChunkCount,
+        revision: v.revision, epoch: v.epoch, digest: Buffer.from(v.digest),
+        expectedInventorySequence: v.expectedInventorySequence,
+        expectedInventoryRoot: Buffer.from(v.expectedInventoryRoot),
         root: Buffer.from(v.expectedRootHash), ciphertextSha256: Buffer.from(v.expectedSha256),
         authorizesIo: false, provesIndependentOperator: false });
     } catch (_) {

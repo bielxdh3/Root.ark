@@ -20,6 +20,8 @@ const { Zk1CloudCiphertextCopyPublisher } =
   require("./zk1CloudCiphertextCopyPublisher");
 const { verifyOwnerInventoryEnrollment } =
   require("../crypto/rootark-zk1-owner-inventory-trust-head");
+const { verifyCommittedPhysicalReadback } =
+  require("../crypto/rootark-zk-pg-physical-attestation-v1");
 
 function fail() {
   const e = new Error("ZK_PHYSICAL_INVENTORY_UNAVAILABLE");
@@ -130,10 +132,14 @@ function cloudTargets(copies) {
 class Zk1PgPhysicalInventoryBridge {
   #trustedInventoryFloor;
   #ownerInventoryEnrollment;
+  #attestorClient;
+  #attestorPublicKey;
   constructor({ sink, verifier, intentAuthority, ledger, pinnedPublicKey, pinnedSignerKeyId,
-    trustedInventoryFloor, ownerInventoryEnrollment } = {}) {
+    trustedInventoryFloor, ownerInventoryEnrollment,
+    attestorClient, pinnedPhysicalAttestorPublicKey } = {}) {
     if (!(sink instanceof Zk1SharedPgCiphertextSink)
-      || !(verifier instanceof Zk1SharedPgPhysicalCiphertextVerifier)
+      || (verifier !== undefined && !(verifier instanceof Zk1SharedPgPhysicalCiphertextVerifier))
+      || (verifier === undefined && attestorClient === undefined)
       || !(intentAuthority instanceof Zk1SharedPgPhysicalInventoryIntent)
       || !(ledger instanceof Zk1DurableContentInventoryLedger)
       || !(pinnedPublicKey instanceof crypto.KeyObject)
@@ -145,6 +151,20 @@ class Zk1PgPhysicalInventoryBridge {
     this.ledgerScope = inventory.normalizeScope(ledger.scope);
     this.pinnedPublicKey = pinnedPublicKey;
     this.signerKeyId = bytes(pinnedSignerKeyId, 16);
+    // Strict DEV mode cannot accept the writer's own JavaScript boolean as
+    // evidence of a physical PG readback. Pin this signing identity from an
+    // external operator, never from a response, operation or app database.
+    if ((attestorClient === undefined) !== (pinnedPhysicalAttestorPublicKey === undefined)) fail();
+    if (attestorClient !== undefined) {
+      if (!attestorClient || typeof attestorClient.requestAttestation !== "function"
+        || !(pinnedPhysicalAttestorPublicKey instanceof crypto.KeyObject)
+        || pinnedPhysicalAttestorPublicKey.type !== "public"
+        || pinnedPhysicalAttestorPublicKey.asymmetricKeyType !== "ed25519"
+        || same(pinnedPhysicalAttestorPublicKey.export({ type: "spki", format: "der" }),
+          pinnedPublicKey.export({ type: "spki", format: "der" }))) fail();
+      this.#attestorClient = attestorClient;
+      this.#attestorPublicKey = pinnedPhysicalAttestorPublicKey;
+    }
     // Optional, independently retained owner floor. Never derive this from
     // the same mutable SQLite ledger whose rollback it is meant to detect.
     // A caller that does not possess an independently kept floor must not
@@ -274,7 +294,28 @@ class Zk1PgPhysicalInventoryBridge {
       independentlyAnchoredFloorProven: false };
   }
   async #verifiedPhysical(v) {
-    const proof = await this.verifier.verifyExact({
+    let proof;
+    if (this.#attestorClient) {
+      const nonce = crypto.randomBytes(32);
+      const scope = Object.fromEntries(Object.entries(v.scope).map(([field, data]) =>
+        [field, Buffer.from(data)]));
+      const operation = Object.fromEntries(Object.entries(v.operation).map(([field, data]) =>
+        [field, Buffer.isBuffer(data) ? Buffer.from(data) : data]));
+      let raw;
+      try {
+        raw = await this.#attestorClient.requestAttestation({
+          scope, operation, nonce: Buffer.from(nonce) });
+        const verified = await verifyCommittedPhysicalReadback(raw, {
+          scope: v.scope, operation: v.operation, nonce,
+          expected: { digest: v.digest, root: v.expectedRootHash,
+            chunks: v.expectedChunkCount },
+          pinnedPublicKey: this.#attestorPublicKey,
+          nowSeconds: Math.floor(Date.now() / 1000),
+        });
+        proof = { ...verified, root: Buffer.from(v.expectedRootHash),
+          ciphertextSha256: Buffer.from(v.operation.ciphertext_sha256) };
+      } catch (_) { fail(); }
+    } else proof = await this.verifier.verifyExact({
       scope: v.scope, objectId: v.objectId, revision: v.operation.revision,
       digest: v.digest, expectedRootHash: v.expectedRootHash,
       expectedChunkCount: v.expectedChunkCount,
