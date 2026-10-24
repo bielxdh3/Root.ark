@@ -80,7 +80,12 @@ test("signed seq130 ancestry recomputes exact owner-approved chain from pinned s
   const nonce = crypto.randomBytes(32);
   const pinned = { sequence: 129, epoch: 3,
     chainHash: crypto.randomBytes(32), headDigest: crypto.randomBytes(32),
-    checkpointDigest: crypto.randomBytes(32) };
+    checkpointDigest: crypto.randomBytes(32),
+    operationId: crypto.randomBytes(32),
+    casReceiptHash: crypto.randomBytes(32),
+    floorReceiptHash: crypto.randomBytes(32),
+    casReceiptIdentityHash: crypto.randomBytes(32),
+    floorReceiptIdentityHash: crypto.randomBytes(32) };
   const statement = { ...scope, sequence: 130, epoch: 4,
     head_digest: crypto.randomBytes(32), checkpoint_digest: crypto.randomBytes(32),
     previous_head_digest: pinned.headDigest,
@@ -129,8 +134,34 @@ test("signed seq130 ancestry recomputes exact owner-approved chain from pinned s
     cas_receipt_hash: crypto.randomBytes(32) }), options),
   /ZK_V2_INDEPENDENT_FLOOR_DENIED/,
   "signed floor HEAD cannot reinterpret another CAS finalization receipt");
+  await assert.rejects(verifySignedHead(await signProof({ ...proof,
+    epoch: proof.epoch + 1 }), options),
+  /ZK_V2_INDEPENDENT_FLOOR_DENIED/,
+  "floor signing key must not announce an owner epoch later than final authorized ancestry step");
   await assert.rejects(verifySignedHead(await signProof(proof), {
     ...options, pinnedOwnerPublicKey: crypto.generateKeyPairSync("ed25519").publicKey }),
   /ZK_V2_INDEPENDENT_FLOOR_DENIED/,
   "untrusted owner key cannot certify successor of retained ancestor");
+  // A dishonest floor signer can re-sign a HEAD of the exact pinned sequence
+  // using the ORIGINAL pinned chainHash but another operation identity. If an
+  // externally retained minimum includes only (seq,hash), HEAD ancestry=[]
+  // previously skipped comparison against the owner-authorized operation.
+  const sameSeqForgedHead = { ...proof, ancestry: [],
+    operation_id: crypto.randomBytes(32) };
+  await assert.rejects(verifySignedHead(await signProof(sameSeqForgedHead), {
+    ...options, minimum: { sequence: 130, chainHash },
+  }), /ZK_V2_INDEPENDENT_FLOOR_DENIED/,
+  "same-sequence resigner must not erase the pinned operation and receipt identity");
+  const fullTip = { sequence: 130, epoch: proof.epoch, chainHash,
+    headDigest: proof.head_digest, checkpointDigest: proof.checkpoint_digest,
+    operationId: proof.operation_id, casReceiptHash: proof.cas_receipt_hash,
+    floorReceiptHash: proof.floor_receipt_hash,
+    casReceiptIdentityHash: proof.cas_receipt_identity_hash,
+    floorReceiptIdentityHash: proof.floor_receipt_identity_hash };
+  assert.equal((await verifySignedHead(await signProof({ ...proof, ancestry: [] }), {
+    ...options, minimum: fullTip })).sequence, 130,
+  "fully retained unchanged owner-approved terminal head remains readable");
+  await assert.rejects(verifySignedHead(await signProof(sameSeqForgedHead), {
+    ...options, minimum: fullTip }), /ZK_V2_INDEPENDENT_FLOOR_DENIED/,
+  "floor signer with its own key cannot rewrite an externally retained operation");
 });

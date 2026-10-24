@@ -23,8 +23,11 @@ process.once("message", async (request) => {
         key: Buffer.from(request.ownerKey, "base64url"), type: "spki", format: "der" }),
       scope: Object.fromEntries(Object.entries(request.scope)
         .map(([name, value]) => [name, Buffer.from(value, "base64url")])),
-      minimum: { sequence: request.minimum.sequence,
-        chainHash: Buffer.from(request.minimum.chainHash, "base64url") },
+      minimum: { sequence: request.minimum.sequence, epoch: request.minimum.epoch,
+        ...Object.fromEntries(["chainHash", "headDigest", "checkpointDigest",
+          "operationId", "casReceiptHash", "floorReceiptHash",
+          "casReceiptIdentityHash", "floorReceiptIdentityHash"].map((name) =>
+          [name, Buffer.from(request.minimum[name], "base64url")])) },
     });
     const head = await client.freshHead();
     process.send({ kind: "checked", sequence: head.sequence, epoch: head.epoch });

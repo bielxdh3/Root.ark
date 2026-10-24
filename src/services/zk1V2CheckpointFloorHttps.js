@@ -4,7 +4,8 @@ const https = require("node:https");
 const tls = require("node:tls");
 const net = require("node:net");
 const crypto = require("node:crypto");
-const { verifySignedHead } = require("./zk1V2CheckpointRemoteFloor");
+const { verifySignedHead, fullRetainedMinimum } =
+  require("./zk1V2CheckpointRemoteFloor");
 
 const CERT = /^(?:[0-9a-f]{2}:){31}[0-9a-f]{2}$/i;
 const B64 = /^[A-Za-z0-9_-]+$/;
@@ -118,15 +119,8 @@ class Zk1V2CheckpointFloorHttpsClient {
       || scope.compartment_id.length < 1 || scope.compartment_id.length > 128) deny();
     this.#scope = Object.freeze(Object.fromEntries(Object.entries(scope)
       .map(([k, v]) => [k, Buffer.from(v)])));
-    if (!minimum || (!Number.isSafeInteger(minimum.sequence)
-      || minimum.sequence < 128 || !Buffer.isBuffer(minimum.chainHash)
-      || minimum.chainHash.length !== 32)) deny();
-    this.#minimum = { sequence: minimum.sequence,
-      chainHash: Buffer.from(minimum.chainHash),
-      ...(minimum.headDigest ? { headDigest: Buffer.from(minimum.headDigest) } : {}),
-      ...(minimum.checkpointDigest
-        ? { checkpointDigest: Buffer.from(minimum.checkpointDigest) } : {}),
-      ...(Number.isSafeInteger(minimum.epoch) ? { epoch: minimum.epoch } : {}) };
+    try { this.#minimum = fullRetainedMinimum(minimum); }
+    catch (_) { deny(); }
   }
   #send(urlPath, body) {
     const payload = Buffer.from(JSON.stringify(body));

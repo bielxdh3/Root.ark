@@ -22,6 +22,8 @@ const FIELDS = ["type", "account_id", "compartment_id", "keyring_id", "sequence"
 const ANCESTRY_FIELDS = ["sequence", "epoch", "head_digest", "checkpoint_digest",
   "previous_head_digest", "previous_checkpoint_digest", "operation_id",
   "cas_receipt_hash", "floor_receipt_hash", "owner_signature"];
+const RETAINED_ID_FIELDS = ["operationId", "casReceiptHash", "floorReceiptHash",
+  "casReceiptIdentityHash", "floorReceiptIdentityHash"];
 const MAX_ANCESTRY = 8;
 const ENTRY_DOMAIN = Buffer.from("v2-independent-floor-entry\0");
 const RECEIPT_ID_DOMAIN = Buffer.from("v2-independent-floor-receipt-identity\0");
@@ -42,6 +44,30 @@ function scopeOf(scope) {
   return { account_id: byte(scope.account_id, 16),
     compartment_id: Buffer.from(scope.compartment_id),
     keyring_id: byte(scope.keyring_id, 16) };
+}
+function fullRetainedMinimum(minimum) {
+  if (!minimum || !Number.isSafeInteger(minimum.sequence)
+    || minimum.sequence < 128
+    || !Number.isSafeInteger(minimum.epoch)
+    || minimum.epoch < (minimum.sequence === 128 ? 0 : 1)) deny();
+  const genesis = minimum.sequence === 128;
+  const baseFields = ["sequence", "epoch", "chainHash", "headDigest", "checkpointDigest"];
+  const extra = genesis && Reflect.ownKeys(minimum).length === baseFields.length
+    ? [] : RETAINED_ID_FIELDS;
+  exact(minimum, [...baseFields, ...extra]);
+  const pinned = { sequence: minimum.sequence, epoch: minimum.epoch,
+    chainHash: byte(minimum.chainHash, 32),
+    headDigest: byte(minimum.headDigest, 32),
+    checkpointDigest: byte(minimum.checkpointDigest, 32) };
+  if (genesis) {
+    if (pinned.epoch !== 0 || !same(pinned.chainHash, ZERO)) deny();
+    if (extra.length && RETAINED_ID_FIELDS.some((name) =>
+      !same(byte(minimum[name], 32), ZERO))) deny();
+    return { ...pinned, ...Object.fromEntries(RETAINED_ID_FIELDS
+      .map((name) => [name, Buffer.from(ZERO)])) };
+  }
+  for (const name of RETAINED_ID_FIELDS) pinned[name] = byte(minimum[name], 32);
+  return pinned;
 }
 function key(value, kind = "public") {
   if (!(value instanceof crypto.KeyObject) || value.type !== kind
@@ -164,34 +190,23 @@ async function verifySignedHead(raw, { scope, pinnedFloorPublicKey,
     if (!minimum && head.sequence !== 128) deny();
     if (!Array.isArray(proof.ancestry) || proof.ancestry.length > MAX_ANCESTRY) deny();
     if (minimum) {
-      if (!Number.isSafeInteger(minimum.sequence) || minimum.sequence < 128
-        || head.sequence < minimum.sequence) deny();
-      const delta = head.sequence - minimum.sequence;
+      const pinned = fullRetainedMinimum(minimum);
+      if (head.sequence < pinned.sequence) deny();
+      const delta = head.sequence - pinned.sequence;
       if (proof.ancestry.length !== delta || delta > MAX_ANCESTRY) deny();
-      if (!delta && ((minimum.headDigest
-        && !same(head.headDigest, byte(minimum.headDigest, 32)))
-        || (minimum.checkpointDigest
-          && !same(head.checkpointDigest, byte(minimum.checkpointDigest, 32)))
-        || (minimum.operationId
-          && !same(head.operationId, byte(minimum.operationId, 32)))
-        || (minimum.casReceiptHash
-          && !same(head.casReceiptHash, byte(minimum.casReceiptHash, 32)))
-        || (minimum.floorReceiptHash
-          && !same(head.floorReceiptHash, byte(minimum.floorReceiptHash, 32)))
-        || (minimum.casReceiptIdentityHash
-          && !same(head.casReceiptIdentityHash,
-            byte(minimum.casReceiptIdentityHash, 32)))
-        || (minimum.floorReceiptIdentityHash
-          && !same(head.floorReceiptIdentityHash,
-            byte(minimum.floorReceiptIdentityHash, 32)))
-        || (Number.isSafeInteger(minimum.epoch) && head.epoch !== minimum.epoch))) deny();
-      let sequence = minimum.sequence;
-      let chainHash = byte(minimum.chainHash, 32);
-      let previousHeadDigest = minimum.headDigest === undefined ? null
-        : byte(minimum.headDigest, 32);
-      let previousCheckpointDigest = minimum.checkpointDigest === undefined ? null
-        : byte(minimum.checkpointDigest, 32);
-      let epoch = Number.isSafeInteger(minimum.epoch) ? minimum.epoch : 0;
+      if (!delta && (!same(head.headDigest, pinned.headDigest)
+        || !same(head.checkpointDigest, pinned.checkpointDigest)
+        || !same(head.operationId, pinned.operationId)
+        || !same(head.casReceiptHash, pinned.casReceiptHash)
+        || !same(head.floorReceiptHash, pinned.floorReceiptHash)
+        || !same(head.casReceiptIdentityHash, pinned.casReceiptIdentityHash)
+        || !same(head.floorReceiptIdentityHash, pinned.floorReceiptIdentityHash)
+        || head.epoch !== pinned.epoch)) deny();
+      let sequence = pinned.sequence;
+      let chainHash = pinned.chainHash;
+      let previousHeadDigest = pinned.headDigest;
+      let previousCheckpointDigest = pinned.checkpointDigest;
+      let epoch = pinned.epoch;
       for (const step of proof.ancestry) {
         const statement = compactStatement(expected, step);
         if (statement.sequence !== ++sequence || statement.epoch < epoch
@@ -211,7 +226,7 @@ async function verifySignedHead(raw, { scope, pinnedFloorPublicKey,
           || !same(head.casReceiptHash, statement.cas_receipt_hash)
           || !same(head.floorReceiptHash, statement.floor_receipt_hash))) deny();
       }
-      if (!same(chainHash, head.chainHash) || epoch > head.epoch
+      if (!same(chainHash, head.chainHash) || epoch !== head.epoch
         || (delta && (!same(previousHeadDigest, head.headDigest)
           || !same(previousCheckpointDigest, head.checkpointDigest)))) deny();
     } else if (proof.ancestry.length || !same(head.chainHash, ZERO)
@@ -462,4 +477,5 @@ class Zk1V2CheckpointRemoteFloor {
 }
 
 module.exports = { Zk1V2CheckpointRemoteFloor, verifySignedHead, signOwnerAdvance,
-  assertIndependentV2Predecessor, receiptIdentityHash, DOMAIN, TYPE };
+  assertIndependentV2Predecessor, receiptIdentityHash, fullRetainedMinimum,
+  DOMAIN, TYPE };

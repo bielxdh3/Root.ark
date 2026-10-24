@@ -731,8 +731,15 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
             ownerKey: pub(owner.publicKey),
             scope: Object.fromEntries(Object.entries(scope).map(([key, value]) =>
               [key, encoded(value)])),
-            minimum: { sequence: signedTerminal.sequence,
-              chainHash: encoded(signedTerminal.chainHash) } });
+            minimum: { sequence: signedTerminal.sequence, epoch: signedTerminal.epoch,
+              chainHash: encoded(signedTerminal.chainHash),
+              headDigest: encoded(signedTerminal.headDigest),
+              checkpointDigest: encoded(signedTerminal.checkpointDigest),
+              operationId: encoded(signedTerminal.operationId),
+              casReceiptHash: encoded(signedTerminal.casReceiptHash),
+              floorReceiptHash: encoded(signedTerminal.floorReceiptHash),
+              casReceiptIdentityHash: encoded(signedTerminal.casReceiptIdentityHash),
+              floorReceiptIdentityHash: encoded(signedTerminal.floorReceiptIdentityHash) } });
           const result = await observed;
           assert.equal(result.sequence, 129);
           assert.equal(result.epoch, nextHeader.epoch);
