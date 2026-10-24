@@ -39,11 +39,11 @@ test("SQLite increments a deleted username generation on every recreation", (t) 
   assert.deepEqual(loaded.totpRecoveryHashes, agent.totpRecoveryHashes);
   assert.equal(loaded.totpLastUsedStep, 123);
   assert.equal(loaded.totpEnrolledAt, agent.totpEnrolledAt);
-  usersRepository.saveUsers([]);
-  usersRepository.saveUsers([agent]);
+  usersRepository.saveUsers([], { expectedDeletedUsers: [loaded] });
+  usersRepository.saveUsers([agent], { allowRecreateUsernames: [agent.username] });
   assert.equal(usersRepository.loadUsers()[0].sessionVersion, 1);
 
-  usersRepository.saveUsers([]);
-  usersRepository.saveUsers([agent]);
+  usersRepository.saveUsers([], { expectedDeletedUsers: usersRepository.loadUsers() });
+  usersRepository.saveUsers([agent], { allowRecreateUsernames: [agent.username] });
   assert.equal(usersRepository.loadUsers()[0].sessionVersion, 2);
 });

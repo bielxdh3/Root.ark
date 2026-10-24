@@ -27,6 +27,7 @@ test("SQLite recovery commit is selective, atomic and rejects admin revocation o
     permissions: { listFiles: true }, sessionVersion: 7, disabled: false };
   usersRepository.saveUsers([alice, bob]);
   const original = usersRepository.loadUsers().find((item) => item.username === "alice");
+  const savedBob = usersRepository.loadUsers().find((item) => item.username === "bob");
   const afterProof = structuredClone(original);
   afterProof.totpRecoveryHashes.splice(0, 1);
   const claim = { username: "alice", passwordHash: original.password,
@@ -38,7 +39,7 @@ test("SQLite recovery commit is selective, atomic and rejects admin revocation o
 
   const revoked = { ...original, disabled: true, sessionVersion: 4,
     role: "user", permissions: { upload: false } };
-  usersRepository.saveUsers([revoked, bob]);
+  usersRepository.saveUsers([revoked, savedBob]);
   assert.equal(usersRepository.commitSyncResumeProof(claim), "conflict");
   const stillRevoked = usersRepository.loadUsers().find((item) => item.username === "alice");
   assert.equal(stillRevoked.disabled, true);
@@ -48,7 +49,7 @@ test("SQLite recovery commit is selective, atomic and rejects admin revocation o
   assert.equal(usersRepository.loadUsers().find((item) => item.username === "bob").sessionVersion, 7);
 
   const reinstated = { ...stillRevoked, disabled: false };
-  usersRepository.saveUsers([reinstated, bob]);
+  usersRepository.saveUsers([reinstated, usersRepository.loadUsers().find((item) => item.username === "bob")]);
   assert.equal(usersRepository.commitSyncResumeProof(claim), "conflict",
     "stale sessionVersion cannot authorize a reinstated user");
   const current = usersRepository.loadUsers().find((item) => item.username === "alice");
@@ -71,4 +72,14 @@ test("SQLite recovery commit is selective, atomic and rejects admin revocation o
   assert.equal(committed.role, "user");
   assert.deepEqual(committed.permissions, { upload: false });
   assert.equal(usersRepository.loadUsers().find((item) => item.username === "bob").sessionVersion, 7);
+
+  // A second process may have loaded all users before the factor was spent.
+  // An unrelated account edit must not write that stale snapshot over Alice.
+  const staleAlice = structuredClone(current);
+  const staleBob = { ...savedBob, role: "admin" };
+  assert.throws(() => usersRepository.saveUsers([staleAlice, staleBob]),
+    /conflict|revision|stale/i);
+  assert.deepEqual(usersRepository.loadUsers().find((item) => item.username === "alice").totpRecoveryHashes,
+    ["recovery-B"]);
+  assert.equal(usersRepository.loadUsers().find((item) => item.username === "bob").role, "user");
 });

@@ -278,6 +278,13 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 9,
+    name: "users_optimistic_storage_revision",
+    up(db) {
+      db.exec("ALTER TABLE users ADD COLUMN storage_revision INTEGER NOT NULL DEFAULT 0 CHECK(storage_revision >= 0);");
+    },
+  },
 ];
 
 function ensureMigrationTable(db) {

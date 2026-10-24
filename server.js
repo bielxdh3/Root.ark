@@ -643,14 +643,14 @@ function getCreatedUserSessionVersion(username) {
   return Object.hasOwn(generations, username) ? generations[username] + 1 : 0;
 }
 
-function saveUsers(users) {
+function saveUsers(users, options = {}) {
   const passwordHashesToValidate = trustedUserPasswordHashes === null
     ? users
     : users.filter((user) => trustedUserPasswordHashes.get(String(user?.username || "")) !== String(user?.password || ""));
   if (NODE_ENV !== "test" && hasPublishedSampleCredentials(passwordHashesToValidate)) {
     throw new Error("Published sample credentials are not allowed outside NODE_ENV=test.");
   }
-  if (shouldUseDatabase()) usersRepository.saveUsers(users);
+  if (shouldUseDatabase()) usersRepository.saveUsers(users, options);
   if (shouldWriteLegacyJson()) {
     rememberUserGenerations(users);
     const temporaryFile = `${USERS_FILE}.tmp-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
@@ -4060,7 +4060,7 @@ function normalizeFilePermissionEntry(entry) {
   };
 }
 
-function toPublicUserRecord({ password, totpSecret, totpPendingSecret, totpRecoveryHashes, totpLastUsedStep, ...user }) {
+function toPublicUserRecord({ password, totpSecret, totpPendingSecret, totpRecoveryHashes, totpLastUsedStep, storageRevision, ...user }) {
   return user;
 }
 
@@ -6348,7 +6348,7 @@ app.post("/users", authenticate, requirePermission("manageUsers"), async (req, r
     sessionVersion: getCreatedUserSessionVersion(username),
   });
 
-  saveUsers(users);
+  saveUsers(users, { allowRecreateUsernames: [username] });
   auditLog("user.created", getAuditActor(req), { type: "user", id: username }, "created", "success", {
     role: role || "user",
     permissions: finalPermissions,
@@ -6436,7 +6436,7 @@ app.delete("/users/:username", authenticate, requirePermission("manageUsers"), (
   }
 
   if (shouldWriteLegacyJson()) rememberUserGenerations(users);
-  saveUsers(filtered);
+  saveUsers(filtered, { expectedDeletedUsers: users.filter((u) => u.username === req.params.username) });
   removeUserFromFilePermissions(req.params.username);
   removeUserFromFolderPermissions(req.params.username);
   auditLog("user.deleted", getAuditActor(req), { type: "user", id: req.params.username }, "deleted", "success", {
