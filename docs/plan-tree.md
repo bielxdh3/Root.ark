@@ -6,7 +6,8 @@ The last *remote* draft PR HEAD observed for
 `cdx/rootark-dual-recovery-20261019` remains
 `6a5e71ed33ae44d65f7c3a124632cb4d5c4ae4f3`. In the isolated worktree,
 local unpublished commits `b5792b2`, `e16f5b3`, `bf18851`, `ea9a8a2`,
-`3323737`, `62fff4f`, `e91053e` and `48f3da7` are descendants, not
+`3323737`, `62fff4f`, `e91053e`, `48f3da7`, `0722405`,
+`083f3b0` and `a3a9f13` are descendants, not
 published CI checkpoints.
 They preserve the previously integrated owner V2 security fixes `356bf2f`
 and `d014005`.
@@ -40,8 +41,27 @@ diff checks PASS. A broad Windows Node 24 suite returned **2620 total / 2453
 PASS / 0 FAIL / 167 SKIP**, but source files were edited during its run;
 this is *not* final-HEAD CI evidence. A subsequent exact-code suite on
 `e91053e` completed **2626 total / 2459 PASS / 0 FAIL / 167 SKIP**. Since
-`48f3da7` then changed runtime behavior and added a regression test, a new
-full Windows Node 24 suite is required for the newest local HEAD.
+`48f3da7` then changed runtime behavior and added a regression test.
+An overlapping Windows Node 24 run reached **2627 total / 2460 PASS /
+0 FAIL / 167 SKIP**, but synchronization source was changed during that run;
+it is not an exact-current-HEAD validation. A fresh Windows Node 24 full
+suite after the pinned synchronization commits finished with **2628 total /
+2461 PASS / 0 FAIL / 167 SKIP**, `duration_ms=707405.1237`, in
+`.local-full-node24-20261024-final-pinned-sync.log` (local-only evidence,
+not hosted PR CI).
+
+Additional RED→GREEN security changes in `083f3b0` and `a3a9f13` close
+three concrete synchronization authorization gaps: a reusable `SyncEngine`
+with `requireAuthorization:true` previously accepted remote ciphertext
+without any incoming verifier; the Sync v2 CLI trusted self-signed remote
+device public keys without an independently provisioned device-to-key pin;
+and the shared proof verifier silently allowed callers to omit that pin.
+The CLI now requires a pinned Ed25519-SPKI device map and explicit revoked
+device snapshot; the server passes the already-registered key into the shared
+verifier. Windows Node 24 sync/HTTP/WebDAV tests **41 PASS / 0 FAIL**;
+Ubuntu Node 22 corresponding tests **32 PASS / 0 FAIL / 8 SKIP**.
+Those snapshots are *not* owner-signed monotonic revocation records and can
+be rolled back by an attacker controlling local configuration.
 
 Hosted checks still refer **only** to the published `6a5e71e`: Ubuntu Node 22
 full, disposable PostgreSQL 18, Windows mandatory release gates, JavaScript
@@ -49,9 +69,15 @@ analysis and dependency review PASS; Windows canonical Edge V2, its dependent
 syntax gate and CodeQL policy FAIL. The Edge failure could not be reproduced
 in five local real-Edge repetitions; no timeout or failure masking was done.
 CodeQL findings require exact-sink triage, not blanket suppressions. The
-independent reviewer service blocked the final review attempt; there is **no
-independent review approval** for these unpublished changes, hence **NO PUSH**
-before a successful required review.
+independent reviewer service blocked an earlier broad review attempt.
+The later bounded independent read-only review of `083f3b0` + `a3a9f13`
+found no newly introduced P1/P2, but identified a **pre-existing P2**:
+`src/routes/sync.js` checks device revocation before `store.put()` without
+a shared registry/store fence, permitting a concurrent revocation race.
+The formal security-diff-scan reference was unavailable, and no independent
+final approval covers the whole issue #65 integration. Therefore **NO PUSH**
+until the mandatory full review gate and remaining security conditions are
+met; PR remains DRAFT and the release/cutover decision remains NO-GO.
 
 Physical PostgreSQL Ed25519/mTLS and inventory composite readback remain
 non-authorizing opt-in evidence. They do **not** yet prove an independently
