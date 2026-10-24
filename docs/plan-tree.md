@@ -7,7 +7,8 @@ The last *remote* draft PR HEAD observed for
 `6a5e71ed33ae44d65f7c3a124632cb4d5c4ae4f3`. In the isolated worktree,
 local unpublished commits `b5792b2`, `e16f5b3`, `bf18851`, `ea9a8a2`,
 `3323737`, `62fff4f`, `e91053e`, `48f3da7`, `0722405`,
-`083f3b0`, `a3a9f13`, `e1824f4`, `a1dd767`, `228dc6d` and `eb54e5b` are descendants, not
+`083f3b0`, `a3a9f13`, `e1824f4`, `a1dd767`, `228dc6d`, `eb54e5b`,
+`b2ff600` and `c607e81` are descendants, not
 published CI checkpoints.
 They preserve the previously integrated owner V2 security fixes `356bf2f`
 and `d014005`.
@@ -113,6 +114,36 @@ Independent read-only P1/P2 review identified the inherited GET gap,
 which was reproduced and closed in this same commit, and found no further
 concrete P1/P2 in this bounded patch. Neither this review nor focused
 validation constitutes acceptance of the entire issue.
+
+`c607e81` tightens the authenticated loopback sync WebDAV bridge:
+plain-text error/denial responses now send `Content-Type: text/plain` and
+`X-Content-Type-Options: nosniff` (CodeQL alert #2), while `PROPFIND`
+remains XML. GET/HEAD now use a verified regular single-link file descriptor
+instead of opening the pathname again when streaming, send bounded MIME
+headers, refuse leaf swaps between `lstat` and `open`, and close the stream
+when a client aborts. RED tests reproduced the missing MIME headers, path
+reopen, and descriptor leak on abrupt disconnect; GREEN on Windows Node 24
+and Ubuntu/WSL Node 22 **4 PASS / 0 FAIL / 0 SKIP each**. The broader
+Windows WebDAV crash/recovery/remediation matrix initially FAILED when run
+concurrently with WSL (server readiness timeout, not silently reclassified);
+an isolated Windows `--test-concurrency=1` rerun passed **84 / 0 / 0**.
+An independent reviewer confirmed the abort-FD fix, but found a remaining
+conditional parent-directory symlink swap/restore race: `O_NOFOLLOW` on the
+leaf cannot replace native secure open-relative-to-pinned-directories.
+This is an explicit **P2 / NO-GO** under an adversarial local-filesystem
+trust boundary; the WebDAV patch as a whole is not approved for publication.
+CodeQL open-alert spot triage without suppressions: #268
+(`js/insufficient-password-hash`) refers to an ephemeral
+`HMAC-SHA256(random-process-secret, username + NUL + password)` used only
+as a cache lookup key in `webdavCredentialCache.js`, with actual password
+verification performed separately by bcrypt; this is not a password hash
+substituting for the password verifier. #160
+(`js/user-controlled-bypass`) flags the optional `authorization` field
+in a client-side operation builder; the shipped `server.js` sync route
+explicitly starts with `requireDeviceAuthorization: true` and fails
+closed absent a verified registered device. These findings do not prove
+a bypass on those checked runtime paths; unrelated call sites and remaining
+CodeQL sinks require separate triage. Neither alert was blanket-suppressed.
 
 Hosted checks still refer **only** to the published `6a5e71e`: Ubuntu Node 22
 full, disposable PostgreSQL 18, Windows mandatory release gates, JavaScript
