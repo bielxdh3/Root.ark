@@ -172,7 +172,7 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
     }
 
     function transfer(method, objectKey, uploadBytes, expectedLength, abortSignal,
-      expectedEtag = null) {
+      expectedEtag = null, boundedLengthOnly = false) {
       return new Promise((resolve, reject) => {
         let complete = false;
         let total = 0;
@@ -244,7 +244,8 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
             if (response.headers["content-length"] !== undefined) {
               const advertised = response.headers["content-length"];
               if (!/^\d+$/.test(advertised) || Number(advertised) > max
-                || (method === "GET" && Number(advertised) !== expectedLength)) {
+                || (method === "GET" && (boundedLengthOnly
+                  ? Number(advertised) < 1 : Number(advertised) !== expectedLength))) {
                 response.destroy();
                 return finish(unavailable());
               }
@@ -255,7 +256,8 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
               else if (method === "GET") parts.push(Buffer.from(chunk));
             });
             response.on("end", () => {
-              if (method === "GET" && total !== expectedLength) finish(unavailable());
+                if (method === "GET" && (boundedLengthOnly
+                  ? total < 1 || total > expectedLength : total !== expectedLength)) finish(unavailable());
               else finish(null, method === "GET" ? Buffer.concat(parts, total)
                 : validEtag(receivedEtag) ? receivedEtag : null);
             });
@@ -304,9 +306,10 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
           const objectKey = key(folder, name, area);
           const expectedEtag = opts && Object.hasOwn(opts, "expectedEtag")
             ? opts.expectedEtag : null;
+          const boundedLengthOnly = opts?.boundedLengthOnly === true;
           ensure(opts && Object.getPrototypeOf(opts) === Object.prototype
             && Reflect.ownKeys(opts).length === (opts.abortSignal === undefined ? 1 : 2)
-              + (expectedEtag === null ? 0 : 1)
+              + (expectedEtag === null ? 0 : 1) + (boundedLengthOnly ? 1 : 0)
             && (expectedEtag === null || validEtag(expectedEtag))
             && Number.isSafeInteger(opts.maxBytes) && opts.maxBytes >= 1
             && opts.maxBytes <= MAX_BYTES && typeof destination === "string"
@@ -315,7 +318,7 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
             && typeof allowWrite === "function" && allowWrite() === true);
           const parent = pinParent(destination);
           const bytes = await transfer("GET", objectKey, null, opts.maxBytes,
-            opts.abortSignal, expectedEtag);
+            opts.abortSignal, expectedEtag, boundedLengthOnly);
           ensure(!opts.abortSignal?.aborted && allowWrite() === true);
           writeExclusive(destination, bytes, parent);
           return true;

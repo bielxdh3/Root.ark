@@ -139,7 +139,11 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
       res.writeHead(206, { "content-range": `bytes 0-${body.length - 1}/${body.length + 1}` });
       res.end(body); return;
     }
-    res.writeHead(200, { "x-amz-version-id": s3CurrentVersion }); res.end(body);
+    // Real S3 supplies ContentLength for a full GET. A signed sidecar is
+    // normally shorter than its maxBytes limit; an ordinary ciphertext copy
+    // must still enforce its exact expected length.
+    res.writeHead(200, { "x-amz-version-id": s3CurrentVersion,
+      "content-length": String(body.length) }); res.end(body);
   });
   const s3Port = await register(s3);
   const driveId = "pinned-drive-copy-restoration";
@@ -175,7 +179,7 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
         res.writeHead(206, { "content-range": `bytes 0-${body.length - 1}/${body.length + 1}` });
         res.end(body); return;
       }
-      res.writeHead(200); res.end(body);
+      res.writeHead(200, { "content-length": String(body.length) }); res.end(body);
     });
   const drivePort = await register(driveServer);
   const webdavServer = https.createServer({ key: pem("server.key"), cert: pem("server.pem"),
@@ -679,6 +683,22 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     assert.equal(restored.matchingCount, 2);
     assert.equal(thirdCalled, 0);
   });
+  await t.test("signed catalog quorum recovers a real shorter-than-cap WebDAV sidecar when S3 is unavailable", async () => {
+    let firstCalled = 0;
+    const unavailableS3 = { ...catalogReaders[0], cloudReader: {
+      ...catalogReaders[0].cloudReader,
+      async download() { firstCalled += 1; throw new Error("S3 unavailable"); },
+    } };
+    // Drive HTTPS + WebDAV mTLS must be a viable quorum for a normal signed
+    // catalog whose valid encoded length is much smaller than the wire cap.
+    // Previously WebDAV used maxBytes as an exact size and refused this GET.
+    const restored = await recoverSignedCatalogSidecar({ scope,
+      operationId: operation.operation_id,
+      readers: [unavailableS3, catalogReaders[1], catalogReaders[2]],
+      providerDomainPinset, deadlineMs: 5000 });
+    assert.equal(firstCalled, 1);
+    assert.equal(restored.matchingCount, 2);
+  });
 
   await t.test("signed sidecar refuses a provider that never sends a byte", async () => {
     let aborted = false;
@@ -696,6 +716,16 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   const sidecar = zk1CatalogSidecarAddress(scope, operation.operation_id);
   const catalogWebdavKey = `/dav/${webdavAdapter.key(sidecar.folder, sidecar.name, "uploads")}`;
   const catalogDriveData = Buffer.from(stores.drive.get(catalogDriveId));
+  assert.ok(catalogDriveData.length < 1024 * 1024,
+    "this end-to-end sample must exercise normal signed sidecars below the maximum wire cap");
+  await t.test("ordinary WebDAV ciphertext GET still demands exact bytes without catalog-only cap mode", async () => {
+    const destination = path.join(dir, "strict-exact-ciphertext.ct");
+    await assert.rejects(webdavAdapter.download(sidecar.folder, sidecar.name,
+      destination, "uploads", () => true, { maxBytes: catalogDriveData.length + 1 }),
+    /ZK_WEBDAV_CIPHERTEXT_UNAVAILABLE/,
+    "unsigned upper bounds must not silently relax the default exact ciphertext readback");
+    assert.equal(fs.existsSync(destination), false);
+  });
 
   let session = true;
   const handler = createZk1MultiproviderRestoreGetHandler({ gateway,

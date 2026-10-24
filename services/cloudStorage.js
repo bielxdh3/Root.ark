@@ -19,7 +19,7 @@ async function abortableProviderRead(action, signal) {
 // object GET: a 206 response can contain exactly those bytes while the object
 // has additional content outside the returned range. Reject partial/encoded
 // representations before a bounded ZK readback can be reconciled as a copy.
-function assertFullCiphertextGet(response, provider, expectedBytes) {
+function assertFullCiphertextGet(response, provider, expectedBytes, boundedLengthOnly = false) {
   const status = provider === "s3" ? response?.$metadata?.httpStatusCode : response?.status;
   const headers = provider === "s3" ? null : response?.headers;
   const header = (key) => {
@@ -40,7 +40,9 @@ function assertFullCiphertextGet(response, provider, expectedBytes) {
     || (encoding !== undefined && encoding !== null && encoding !== "identity")
     || (length !== undefined && length !== null
       && (!/^(0|[1-9][0-9]*)$/.test(String(length))
-        || Number(length) !== expectedBytes))) {
+        || (boundedLengthOnly
+          ? Number(length) < 1 || Number(length) > expectedBytes
+          : Number(length) !== expectedBytes)))) {
     throw cloudError("provider_error", "Bounded ZK ciphertext GET was not a complete object representation");
   }
 }
@@ -581,10 +583,15 @@ function createCloudStorage(options = {}) {
       ? constraints.abortSignal : undefined;
     const pinnedVersion = constraints && Object.hasOwn(constraints, "providerVersionId")
       ? constraints.providerVersionId : null;
+    // Signed catalog sidecars have a cryptographically authenticated payload
+    // length *below* their maximum. All regular ciphertext copies still demand
+    // an exact Content-Length and byte count, never this upper-bound-only mode.
+    const boundedLengthOnly = constraints?.boundedLengthOnly === true;
     if (constraints !== undefined && (!constraints || typeof constraints !== "object"
       || Array.isArray(constraints)
       || Reflect.ownKeys(constraints).length !== (pinId === null ? 1 : 2)
         + (externalSignal === undefined ? 0 : 1) + (pinnedVersion === null ? 0 : 1)
+        + (boundedLengthOnly ? 1 : 0)
       || !Object.hasOwn(constraints, "maxBytes")
       || !Number.isSafeInteger(constraints.maxBytes)
       || constraints.maxBytes < 1 || constraints.maxBytes > 16 * 1024 * 1024
@@ -618,7 +625,8 @@ function createCloudStorage(options = {}) {
           new (require("@aws-sdk/client-s3").GetObjectCommand)({ Bucket: bucketName,
             Key: cloudKey, ...(pinnedVersion === null ? {} : { VersionId: pinnedVersion }) }),
           signal ? { abortSignal: signal } : undefined), signal);
-        if (constraints) assertFullCiphertextGet(response, provider, constraints.maxBytes);
+        if (constraints) assertFullCiphertextGet(response, provider,
+          constraints.maxBytes, boundedLengthOnly);
         if (pinnedVersion !== null && response?.VersionId !== pinnedVersion) {
           throw cloudError("provider_error", "S3 returned a different ciphertext version");
         }
@@ -634,7 +642,8 @@ function createCloudStorage(options = {}) {
         const response = await abortableProviderRead(async () => (await drive()).files.get(
           { fileId: existing.id, alt: "media" },
           { responseType: "stream", ...(signal ? { signal } : {}) }), signal);
-        if (constraints) assertFullCiphertextGet(response, provider, constraints.maxBytes);
+        if (constraints) assertFullCiphertextGet(response, provider,
+          constraints.maxBytes, boundedLengthOnly);
         input = response.data;
       }
       if (constraints) {
@@ -647,6 +656,9 @@ function createCloudStorage(options = {}) {
         await pipeline(input, bounded, fs.createWriteStream(stagedPath), {
           signal,
         });
+        if (boundedLengthOnly && size === 0) {
+          throw cloudError("provider_error", "Empty signed catalog object");
+        }
       } else {
         await pipeline(input, fs.createWriteStream(stagedPath));
       }

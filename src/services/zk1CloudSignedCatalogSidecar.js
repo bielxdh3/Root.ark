@@ -182,7 +182,7 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
       const destination = path.join(dir, "catalog.ct");
       const received = await limit.run((signal) => target.adapter.download(address.folder, address.name,
         destination, "uploads", () => !signal.aborted,
-        { maxBytes: MAX, ...(target.driveFileId === null ? {}
+        { maxBytes: MAX, boundedLengthOnly: true, ...(target.driveFileId === null ? {}
           : { providerFileId: target.driveFileId }), abortSignal: signal }));
       if (received !== true || await limit.run(() => target.adapter.resolveInventoryContext()) !== target.context
         || target.adapter.zk1StorageNamespace() !== target.namespace) deny();
