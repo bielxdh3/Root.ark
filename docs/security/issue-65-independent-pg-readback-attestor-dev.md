@@ -67,6 +67,15 @@ ciphertext egress, device enrollment, restore, deletion, or legacy cutover.
   `reconcile` and on lost-ACK/restart `publishExisting` retries. The bridge
   never treats the writer-signed SQLite entry alone as verified independent
   readback. Legacy non-strict paths remain explicitly non-independent.
+- In strict mode, S3/Drive/WebDAV ciphertext copy readbacks and the opt-in
+  owner-anchored three-provider restart/failover flow preserve the result's
+  `independentPhysicalAttestationVerified` flag and the final challenged
+  `physicalAttestationReceiptDigest`. Both physical observations surrounding
+  each remote GET must pass, and a forged writer-owned physical signer is
+  denied **before** the cloud reader is contacted. The challenged fingerprint
+  naturally changes across requests; the stable multi-provider observation
+  fingerprint deliberately does not claim remote durability or carry a CAS
+  witness signature. Legacy non-strict returns `false`/`null` for these fields.
 - The attestor listener admits only one in-flight verification per pinned
   mTLS client fingerprint, eight overall and sixteen live connections. A
   busy request fails closed; it is not queued while its PG readback is active.

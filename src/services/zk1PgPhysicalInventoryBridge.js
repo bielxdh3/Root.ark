@@ -418,6 +418,11 @@ class Zk1PgPhysicalInventoryBridge {
     const after = await this.reconcile(fixedRequest);
     if (after.status !== before.status || after.sequence !== before.sequence
       || !same(after.root, before.root)) fail();
+    const independentlyAttested = Boolean(this.#attestorClient);
+    if ((before.independentPhysicalAttestationVerified === true) !== independentlyAttested
+      || (after.independentPhysicalAttestationVerified === true) !== independentlyAttested
+      || (independentlyAttested && (!Buffer.isBuffer(after.physicalAttestationReceiptDigest)
+        || after.physicalAttestationReceiptDigest.length !== 32))) fail();
     return Object.freeze({ status: "PG_SIGNED_AND_CLOUD_BYTES_REREAD",
       operationId: Buffer.from(v.operation.operation_id),
       provider: remote.provider, providerFileId: remote.providerFileId,
@@ -429,6 +434,9 @@ class Zk1PgPhysicalInventoryBridge {
       inventorySequence: before.sequence, inventoryRoot: Buffer.from(before.root),
       remoteReadbackMatched: true,
       localPgWalFlushConfirmed: true, authorizesIo: false,
+      independentPhysicalAttestationVerified: independentlyAttested,
+      physicalAttestationReceiptDigest: independentlyAttested
+        ? Buffer.from(after.physicalAttestationReceiptDigest) : null,
       externalProviderDurabilityProven: false,
       // A caller-supplied floor is verified for chain consistency here, NOT
       // for independent owner custody. This must not become an owner pin.
@@ -488,6 +496,8 @@ class Zk1PgPhysicalInventoryBridge {
       inventorySequence: remote.inventorySequence,
       inventoryRoot: Buffer.from(remote.inventoryRoot),
       byteLength: write.byteLength, remoteReadbackMatched: true,
+      independentPhysicalAttestationVerified: remote.independentPhysicalAttestationVerified,
+      physicalAttestationReceiptDigest: remote.physicalAttestationReceiptDigest,
       authorizesIo: false, externalProviderDurabilityProven: false,
       independentRemoteIoFenceProven: false });
   }
@@ -547,6 +557,9 @@ class Zk1PgPhysicalInventoryBridge {
       operationId: Buffer.from(v.operation.operation_id),
       providers: Object.freeze([...providerSet]),
       providerCount: targets.length, authorizesIo: false,
+      independentPhysicalAttestationVerified: after.independentPhysicalAttestationVerified === true,
+      physicalAttestationReceiptDigest: after.independentPhysicalAttestationVerified === true
+        ? Buffer.from(after.physicalAttestationReceiptDigest) : null,
       externalProviderDurabilityProven: false,
       atomicCrossProviderCommitProven: false,
       independentRemoteIoFenceProven: false });
@@ -658,6 +671,9 @@ class Zk1PgPhysicalInventoryBridge {
       externallyPinnedCheckpointDigestMatched: true,
       signedOwnerCounter: ownerHead.signedCounter,
       ownerCheckpointDigest: ownerHead.ownerCheckpointDigest,
+      independentPhysicalAttestationVerified: after.independentPhysicalAttestationVerified === true,
+      physicalAttestationReceiptDigest: after.independentPhysicalAttestationVerified === true
+        ? Buffer.from(after.physicalAttestationReceiptDigest) : null,
       independentlyAnchoredFloorProven: false,
       externalOwnerCustodyVerified: false,
       authorizesIo: false, externalProviderDurabilityProven: false,

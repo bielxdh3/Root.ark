@@ -21,6 +21,8 @@ const { Zk1DurableContentInventoryLedger } =
   require("../src/services/zk1DurableContentInventoryLedger");
 const { Zk1PgPhysicalInventoryBridge } =
   require("../src/services/zk1PgPhysicalInventoryBridge");
+const { signCommittedPhysicalReadback } =
+  require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
 const { Zk1SharedPgCiphertextSink } =
   require("../src/services/zk1SharedPgCiphertextSink");
 const { Zk1SharedPgPhysicalCiphertextVerifier } =
@@ -121,8 +123,10 @@ test("anchored signed operation reconciles lost ACK, partial three-provider copy
   });
   const expected = { scope, operation, digest: crypto.randomBytes(32),
     expectedRootHash: root, expectedChunkCount: chunks.length };
+  const physicalSigner = crypto.generateKeyPairSync("ed25519");
+  let currentPhysicalSigningKey = physicalSigner.privateKey;
   const makeBridge = (pinned = floor, enrolled = pinned === false ? null
-    : ownerEnrollment(pinned !== floor)) => {
+    : ownerEnrollment(pinned !== floor), strictPhysical = false) => {
     // Disposable synthetic PG attestor only; the real Ed25519 SQLite ledger
     // and all remote GET/PUTs remain exercised in this isolated test.
     const verifier = Object.create(Zk1SharedPgPhysicalCiphertextVerifier.prototype);
@@ -137,6 +141,24 @@ test("anchored signed operation reconciles lost ACK, partial three-provider copy
       intentAuthority: Object.create(Zk1SharedPgPhysicalInventoryIntent.prototype),
       verifier, ledger, pinnedPublicKey: keys.publicKey,
       pinnedSignerKeyId: signerKeyId,
+      ...(strictPhysical ? {
+        pinnedPhysicalAttestorPublicKey: physicalSigner.publicKey,
+        attestorClient: { async requestAttestation({ scope: exactScope,
+          operation: exactOperation, nonce }) {
+          return signCommittedPhysicalReadback({ scope: exactScope,
+            operation: exactOperation, nonce, issuedAt: Math.floor(Date.now() / 1000),
+            readback: { status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
+              walFlushConfirmed: true, generation: 3, admissionId: crypto.randomBytes(16),
+              operationId: exactOperation.operation_id, revision: exactOperation.revision,
+              epoch: exactOperation.epoch,
+              expectedInventorySequence: exactOperation.expected_sequence,
+              expectedInventoryRoot: exactOperation.expected_root,
+              digest: expected.digest, root, chunkCount: chunks.length,
+              ciphertextSha256: exactOperation.ciphertext_sha256,
+              authorizesIo: false, provesIndependentOperator: false },
+          }, currentPhysicalSigningKey);
+        } },
+      } : {}),
       ...(pinned === false ? {} : { trustedInventoryFloor: pinned }),
       ...(enrolled === null ? {} : { ownerInventoryEnrollment: enrolled }),
     });
@@ -241,6 +263,29 @@ test("anchored signed operation reconciles lost ACK, partial three-provider copy
   assert.equal(replayed.independentlyAnchoredFloorProven, false);
   assert.equal(replayed.externalOwnerCustodyVerified, false);
   assert.equal(Object.hasOwn(replayed, "ownerPinnedFloorChecked"), false);
+
+  const strictBridge = makeBridge(floor, ownerEnrollment(false), true);
+  const strictReadback = await strictBridge.reconcileCloudCopy({
+    physical: expected, cloudVerifier: targets[0].cloudVerifier,
+    chunkLengths: chunks.map((chunk) => chunk.length),
+  });
+  assert.equal(strictReadback.independentPhysicalAttestationVerified, true,
+    "remote GET evidence must preserve separate physical attestor verification");
+  assert.equal(strictReadback.physicalAttestationReceiptDigest.length, 32);
+  const strictRecovery = await strictBridge.reconcileOrPublishAnchoredCloudCopies(input);
+  assert.equal(strictRecovery.independentPhysicalAttestationVerified, true,
+    "three-provider restart/retry evidence must carry the composite local proof");
+  assert.equal(strictRecovery.externalProviderDurabilityProven, false);
+  const readsBeforeForgery = webdavRequests.length;
+  currentPhysicalSigningKey = keys.privateKey;
+  await assert.rejects(strictBridge.reconcileCloudCopy({ physical: expected,
+    cloudVerifier: targets[2].cloudVerifier,
+    chunkLengths: chunks.map((chunk) => chunk.length) }),
+  /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+  "compromised inventory writer cannot substitute its own physical signature");
+  assert.equal(webdavRequests.length, readsBeforeForgery,
+    "forged local attestor proof blocks before contacting the remote provider");
+  currentPhysicalSigningKey = physicalSigner.privateKey;
 
   // Remote tampering after success is detected; a subsequent signed retry
   // may repair only the affected current copy, and always rechecks all three.
