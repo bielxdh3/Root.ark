@@ -2,7 +2,7 @@
 
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const { canonicalJson, validateOperation } = require("../../sync-client/rootark-sync-protocol");
+const { canonicalJson, validateStoredOperation } = require("../../sync-client/rootark-sync-protocol");
 
 const SAFE_PROVIDER_CODES = new Set([
   "configuration", "unsupported_provider", "invalid_path", "invalid_prefix", "foreign_prefix",
@@ -194,7 +194,7 @@ function attestCiphertextOnlyRecords(records) {
     assertNoProtectedSecrets(fields);
     assertNoProtectedSecrets(authorization);
     let normalized;
-    try { normalized = validateOperation(record); } catch { throw Object.assign(new Error("Protected sync attestation failed"), { code: "SYNC_ATTESTATION_FAILED" }); }
+    try { normalized = validateStoredOperation(record); } catch { throw Object.assign(new Error("Protected sync attestation failed"), { code: "SYNC_ATTESTATION_FAILED" }); }
     decodeBase64Url(normalized.ciphertext, "ciphertext");
     decodeBase64Url(normalized.nonce, "nonce");
     decodeBase64Url(normalized.tag, "tag");
