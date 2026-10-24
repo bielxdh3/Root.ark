@@ -428,6 +428,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
   });
   app.post("/sync/v1/devices/:deviceId/resume", authenticate, requirePermission("upload"), async (req, res) => {
     await ready;
+    if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
     const deviceId = req.params.deviceId;
     if (!deviceId || deviceId.length > MAX_DEVICE_ID_LENGTH) return errorResponse(res, 400, "Invalid sync device id");
     const username = req.user.username;
@@ -456,6 +457,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       const snapshot = await findUser(username);
       const hasPassword = Boolean(snapshot && !snapshot.disabled && typeof snapshot.password === "string" && snapshot.password);
       const matches = await bcrypt.compare(body.password, hasPassword ? snapshot.password : DUMMY_PASSWORD_HASH);
+      if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
       if (!hasPassword || !matches) return fail("reauth_failed");
       const checkedHash = snapshot.password;
       const checkedSessionVersion = snapshot.sessionVersion || 0;
@@ -473,6 +475,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
         if (!Buffer.isBuffer(key) || key.length !== 32) return errorResponse(res, 503, "Sync re-authentication unavailable");
         let proof;
         try { proof = await verifySecondFactor(user, body.code, key); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
+        if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
         if (!proof) return fail("second_factor_failed");
         // Re-load after async recovery-code verification and revalidate the account before committing replay state.
         const freshUsers = loadUsers();

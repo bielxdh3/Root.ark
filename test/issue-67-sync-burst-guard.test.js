@@ -510,6 +510,63 @@ test("issue 67 resume 2FA: a recovery code works once", async (t) => {
   assert.equal((await resumeRequest(port, { password: PASSWORD, code: recovery })).status, 401);
 });
 
+test("issue 65 resume: indeterminate sync persistence rejects re-auth before spending a recovery code", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-indeterminate-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const storagePath = path.join(dir, "objects.json");
+  const { port, route } = await startServer(t, {
+    storagePath, accountUsers: account.users,
+  });
+  const recovery = account.recoveryCodes[0];
+  route.store.commitIndeterminate = true;
+
+  const missingPassword = await resumeRequest(port, {});
+  assert.equal(missingPassword.status, 503);
+  assert.equal(missingPassword.body.code, "SYNC_COMMIT_INDETERMINATE");
+  const rejected = await resumeRequest(port, { password: PASSWORD, code: recovery });
+  assert.equal(rejected.status, 503);
+  assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 2);
+
+  // A newly opened store reads the persisted JSON rather than bypassing the quarantine flag.
+  const reopened = await startServer(t, { storagePath, accountUsers: route.accountState.users });
+  assert.equal((await resumeRequest(reopened.port, { password: PASSWORD, code: recovery })).status, 200);
+  assert.equal(reopened.route.accountState.users[0].totpRecoveryHashes.length, 1);
+});
+
+test("issue 65 resume: a store becoming indeterminate during bcrypt fails before second-factor consumption", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-race-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const storagePath = path.join(dir, "objects.json");
+  let route;
+  let quarantineNext = true;
+  const bcryptImpl = {
+    compare: async (...args) => {
+      const result = await bcrypt.compare(...args);
+      if (quarantineNext) {
+        route.store.commitIndeterminate = true;
+        quarantineNext = false;
+      }
+      return result;
+    },
+  };
+  const opened = await startServer(t, {
+    storagePath, accountUsers: account.users, bcryptImpl,
+  });
+  route = opened.route;
+  const recovery = account.recoveryCodes[0];
+
+  const rejected = await resumeRequest(opened.port, { password: PASSWORD, code: "000000" });
+  assert.equal(rejected.status, 503);
+  assert.equal(rejected.body.code, "SYNC_COMMIT_INDETERMINATE");
+  assert.equal(route.accountState.users[0].totpRecoveryHashes.length, 2);
+
+  const reopened = await startServer(t, { storagePath, accountUsers: route.accountState.users });
+  assert.equal((await resumeRequest(reopened.port, { password: PASSWORD, code: recovery })).status, 200);
+  assert.equal(reopened.route.accountState.users[0].totpRecoveryHashes.length, 1);
+});
+
 test("issue 203 sync resume: recovery verification does not call synchronous scrypt", async (t) => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue203-sync-recovery-"));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
