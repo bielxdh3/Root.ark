@@ -32,16 +32,19 @@ const EXTRA_SOURCES = Object.freeze([
   { kind: "audit-logs", table: "audit_logs", columns: ["id", "event_type", "target_type", "target_id", "details_json"], order: "id", json: ["details_json"] },
   { kind: "users", table: "users", columns: ["id", "username", "permissions_json", "deleted_at"], order: "id", json: ["permissions_json"] },
   { kind: "schema-migrations", table: "schema_migrations", columns: ["version", "name", "applied_at"], order: "version", json: [] },
+  // Authentication replay grants are observed as bounded opaque metadata,
+  // never treated as proof of file provenance or legacy cutover readiness.
+  { kind: "sync-resume-grants", table: "sync_resume_factor_spend_grant", columns: ["username", "replay_digest", "code_mac", "device_id", "pause_fence", "committed_at"], order: "username, replay_digest", json: [] },
 ]);
 const FTS_SHADOW = Object.freeze(["data", "idx", "content", "docsize", "config"]
   .map((suffix) => `file_search_index_${suffix}`));
 const KNOWN_TABLES = new Set([...SOURCES, ...EXTRA_SOURCES].map((entry) => entry.table)
   .concat(FTS_SHADOW, ["sqlite_sequence", "sqlite_stat1", "sqlite_stat4"]));
 // Column drift can hide a NEW plaintext/reference field inside a previously
-// recognized table. Allow only fields from migrations 1-7, even if not all are
+// recognized table. Allow only fields from migrations 1-9, even if not all are
 // selected into the opaque observation. Missing selected fields fail below.
 const KNOWN_COLUMNS = Object.freeze({
-  users: "id username password_hash role permissions_json created_at updated_at deleted_at session_version disabled totp_enabled totp_secret_json totp_pending_secret_json totp_recovery_hashes_json totp_last_used_step totp_enrolled_at",
+  users: "id username password_hash role permissions_json created_at updated_at deleted_at session_version disabled totp_enabled totp_secret_json totp_pending_secret_json totp_recovery_hashes_json totp_last_used_step totp_enrolled_at storage_revision",
   folders: "id name created_by created_at updated_at allowed_users_json is_root expires_at deleted_at",
   pending_uploads: "id file_name original_name folder_id uploaded_by uploaded_at size metadata_json",
   public_links: "token folder_id file_name created_by created_at expires_at max_views views password_hash metadata_json revoked_at permissions_json",
@@ -56,6 +59,7 @@ const KNOWN_COLUMNS = Object.freeze({
   trash_items: "id item_type original_folder_id original_folder_name original_file_name stored_file_name original_path trash_path deleted_by deleted_at size_bytes metadata_json restore_metadata_json status restored_by restored_at permanently_deleted_by permanently_deleted_at",
   file_search_index: "folder_id file_name",
   schema_migrations: "version name applied_at",
+  sync_resume_factor_spend_grant: "username replay_digest code_mac device_id pause_fence committed_at",
 });
 const LIMITATIONS = Object.freeze([
   "live-legacy-sqlite-metadata-only",

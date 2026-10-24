@@ -14,7 +14,8 @@ const MODE = { dbEnabled: true, jsonReadFallback: false, jsonWriteMirror: false 
 const SECRET = "LEGACY-PRIVATE-REFERENCE-DO-NOT-EXPORT";
 const ALL = ["versions", "backups", "trash", "links", "derived", "retention",
   "folders", "pending-uploads", "file-permissions", "encrypted-files",
-  "actions-history", "analytics-events", "audit-logs", "users", "schema-migrations"];
+  "actions-history", "analytics-events", "audit-logs", "users", "schema-migrations",
+  "sync-resume-grants"];
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-legacy-coverage-"));
@@ -40,6 +41,8 @@ function fixture(t) {
     CREATE TABLE audit_logs(id TEXT PRIMARY KEY, event_type TEXT, target_type TEXT, target_id TEXT, details_json TEXT);
     CREATE TABLE users(id INTEGER PRIMARY KEY, username TEXT, permissions_json TEXT, deleted_at TEXT);
     CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT, applied_at TEXT);
+    CREATE TABLE sync_resume_factor_spend_grant(username TEXT, replay_digest TEXT,
+      code_mac TEXT, device_id TEXT, pause_fence TEXT, committed_at TEXT);
   `);
   db.prepare("INSERT INTO folders VALUES (?,?,?,?,?)").run("root", SECRET, "{}", null, null);
   db.prepare("INSERT INTO file_versions VALUES (?,?,?,?)").run(1, "root", SECRET, '{"versions":[]}');
@@ -67,7 +70,7 @@ test("explicit read-only SQL coverage observes all registered legacy references 
   assert.equal(a.legacy.sqlCoverage.observation, "bounded-registered-sqlite-sources-only");
   assert.deepEqual(a.legacy.sqlCoverage.sources.map((x) => x.kind), ALL);
   assert.deepEqual(a.legacy.sqlCoverage.sources.map((x) => x.observedRows),
-    [1, 0, 0, 2, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0]);
+    [1, 0, 0, 2, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0]);
   assert.equal(a.legacy.sqlCoverage.unrecognizedTables, 0);
   assert.equal(a.legacy.sqlCoverage.registeredTableNamesOnly, true);
   assert.equal(a.legacy.sqlCoverage.registeredColumnNamesOnly, true);

@@ -188,7 +188,11 @@ function expectedAad(record) {
 function attestCiphertextOnlyRecords(records) {
   if (!Array.isArray(records)) throw Object.assign(new Error("Protected sync attestation failed"), { code: "SYNC_ATTESTATION_FAILED" });
   for (const record of records) {
-    assertNoProtectedSecrets(record);
+    // A signed device authorization is public proof, not a credential. Scan
+    // its contents for secrets while allowing this one protocol field itself.
+    const { authorization, ...fields } = record;
+    assertNoProtectedSecrets(fields);
+    assertNoProtectedSecrets(authorization);
     let normalized;
     try { normalized = validateOperation(record); } catch { throw Object.assign(new Error("Protected sync attestation failed"), { code: "SYNC_ATTESTATION_FAILED" }); }
     decodeBase64Url(normalized.ciphertext, "ciphertext");

@@ -13,7 +13,7 @@ const KNOWN_TABLES = new Set([
   "users", "folders", "pending_uploads", "public_links", "actions_history",
   "file_permissions", "file_expirations", "file_versions", "encrypted_files",
   "analytics_events", "audit_logs", "backup_history", "trash_items",
-  "file_search_index", "schema_migrations", "sqlite_sequence",
+  "file_search_index", "schema_migrations", "sync_resume_factor_spend_grant", "sqlite_sequence",
   "sqlite_stat1", "sqlite_stat4", ...["data", "idx", "content", "docsize", "config"]
     .map((name) => "file_search_index_" + name),
 ]);
@@ -25,6 +25,7 @@ const KNOWN_REFERENCE_COLUMNS = Object.freeze({
   file_permissions: "id folder_id file_name allowed_users_json created_at updated_at",
   file_expirations: "id folder_id file_name expires_at created_by created_at",
   trash_items: "id item_type original_folder_id original_folder_name original_file_name stored_file_name original_path trash_path deleted_by deleted_at size_bytes metadata_json restore_metadata_json status restored_by restored_at permanently_deleted_by permanently_deleted_at",
+  sync_resume_factor_spend_grant: "username replay_digest code_mac device_id pause_fence committed_at",
 });
 function deny() { throw new Error("ZK_LEGACY_ARCHIVE_SQLITE_JOIN_UNVERIFIED"); }
 function safePart(value) {
