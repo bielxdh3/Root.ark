@@ -614,11 +614,37 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   "CAS advancement after tombstone statement but before journal must deny publication");
   assert.equal(didAdvanceCas, true, "adversarial CAS advance must actually occur");
   assert.equal(racedOwnPuts, 0, "stale tombstone must be fenced before its signed PUT");
-  const planned = await client(1);
+  let expiredInsideWriter = false, finalCasPosts = 0, finalFenceCalls = 0;
+  const planned = await client(1, { fetchImpl: async (url, init) => {
+    const response = await fetchImpl(url, init);
+    // Simulate the owner rekey grant expiring inside the actual writer's
+    // awaited signed GET/readback, after the external ciphertext PUT.
+    if (url.endsWith("/content/read") && response.status === 200)
+      expiredInsideWriter = true;
+    if (url.endsWith("/catalog/commit")) finalCasPosts++;
+    return response;
+  } });
   const revision3 = nodeCrypto.randomBytes(90);
   const plannedIntent = await planned.prepareIntent([{ objectId, revision: 4,
     epoch: 1, ciphertext: revision3 }]);
   await put(1, objectId, revision3, 3);
+  await assert.rejects(planned.commit([{ objectId, revision: 4, epoch: 1,
+    ciphertext: revision3, name: "restore-expiration-canary.txt",
+    metadataKey: cryptoMeta }], plannedIntent, {
+    retainPendingIntent: true,
+    beforeCasAdmission: () => {
+      finalFenceCalls++;
+      return !expiredInsideWriter;
+    },
+  }), /ZK_BROWSER_CATALOG_UNVERIFIED/,
+  "an expired rekey grant after signed GET must never reach the actual CAS POST");
+  assert.equal(expiredInsideWriter, true,
+    "adversarial grant expiry must occur AFTER real signed HTTP readback");
+  assert.equal(finalFenceCalls, 1, "actual writer must call fence just before CAS");
+  assert.equal(finalCasPosts, 0, "expired rekey must not send catalog/CAS commit");
+  assert.equal(sequence, 5, "expired grant must not advance independent CAS");
+  assert.ok(await journalStore.read(plannedIntent),
+    "lost CAS admission must preserve the immutable signed intent");
   const unlistedId = b64(nodeCrypto.randomBytes(16));
   await put(1, unlistedId, nodeCrypto.randomBytes(72));
   const competing = await client(1);

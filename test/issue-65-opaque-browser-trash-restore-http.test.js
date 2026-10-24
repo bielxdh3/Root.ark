@@ -59,7 +59,7 @@ const cases = ["valid", "forgedSignature", "tamperedSource", "wrongCek",
   "rekeyWrongMetadataKey", "rekeySameCek", "rekeyNoGrant",
   "rekeyExpiredGrant", "rekeySameMetadataKey",
   "rekeySameTombstoneKey", "rekeyExpiredDuringRead",
-  "rekeySignerSubstitute", "rekeyRollback",
+  "rekeySignerSubstitute", "rekeyRollback", "rekeyExpiredInCommit",
   "rekeyLostReadback"];
 
 test("normal browser restores signed logical trash with real HTTP readback, AAD and fail-closed journals", {
@@ -141,12 +141,12 @@ test("normal browser restores signed logical trash with real HTTP readback, AAD 
     assert.equal(result.result, "PASS", caseName);
     assert.equal(result.caseName, caseName);
     assert.equal(result.puts, ["valid", "lostReadback", "rekeyValid",
-      "rekeyLostReadback"].includes(caseName) ? 1 : 0,
+      "rekeyLostReadback", "rekeyExpiredInCommit"].includes(caseName) ? 1 : 0,
       caseName + ": prohibited PUT");
     const wire = requests.slice(before);
     assert.equal(wire.filter((entry) => entry.path === "/protected-get").length,
       result.gets + (result.puts && ["valid", "rekeyValid", "lostReadback",
-        "rekeyLostReadback"].includes(caseName) ? 1 : 0),
+        "rekeyLostReadback", "rekeyExpiredInCommit"].includes(caseName) ? 1 : 0),
       caseName + ": protected GET count");
     assert.equal(wire.filter((entry) => entry.path === "/protected-put").length,
       result.puts, caseName);

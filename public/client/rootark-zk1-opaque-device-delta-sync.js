@@ -428,7 +428,8 @@
             revision: inputVersion.revision, epoch: inputVersion.epoch,
             ciphertext: sealed, name: inputVersion.name,
             metadataKey: inputVersion.metadataKey }], journalId,
-          { retainPendingIntent: true });
+          { retainPendingIntent: true,
+            ...(internalRestore ? { beforeCasAdmission: restoreAdmission } : {}) });
           assertLive();
           if (receipt.verifiedSignedReadback !== true) deny();
           if (internalTrash) {
@@ -650,6 +651,7 @@
               || rekeyGrant.issuedAt > trust.nowSeconds() + 30
               || trust.signedDeviceGrant.current_epoch !== trust.pinnedOwnerHead.epoch
               || trust.signedDeviceGrant.revoked_at_epoch !== null)) deny();
+            return true;
           };
           const state = tracked.get(inputRestore.previous);
           if (!state || state.owner !== writer || latest !== inputRestore.previous

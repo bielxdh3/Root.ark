@@ -109,3 +109,23 @@ tombstone without this restore-specific verified path.
   expiry after historical readback is denied before any PUT. Node/Edge loopback
   is still a local test and the mock writer is not a substitute for independent
   multi-host mTLS, PostgreSQL durability or cloud custody evidence.
+
+### Last-moment CAS admission expiry fence (independent P2 follow-up)
+
+The recoverable writer now accepts an opt-in, synchronous, **true-returning**
+`beforeCasAdmission` callback only with a retained signed pending intent. This
+callback is invoked **after** authenticated owner/CAS checks and all awaited
+ciphertext GET and catalog-signature preparation, immediately before the
+single real CAS POST. The normal browser restore supplies its local sealed
+owner-grant epoch/expiry/session verification closure. An expired grant aborts
+before the actual CAS POST; the already-written immutable PUT and journal
+remain conservatively uncertain and MUST NOT be retried automatically.
+
+An adversarial real HTTP/SQLite browser-writer test advances the simulated
+grant clock inside the awaited signed ciphertext GET. It verifies the final
+admission callback ran, no CAS POST was sent, the signed CAS sequence did not
+advance, and the pending intent survives. A separate Edge/loopback fixture
+advances expiry inside a mocked commit and verifies the uncertain journal.
+This is **not** an atomic multi-host authorization lease: host-side clock
+changes, witness revocations after the synchronous callback and untrusted
+network delays still require independent authority fencing in DEV.

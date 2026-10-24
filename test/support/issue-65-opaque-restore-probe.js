@@ -148,7 +148,16 @@
             pending = b64(root.crypto.getRandomValues(new Uint8Array(32)));
             return pending;
           },
-          async commit(additions, journalId) {
+          async commit(additions, journalId, options = {}) {
+            // A delayed CAS admission must re-check expiry AFTER the
+            // writer's own async work, not only at its call boundary.
+            if (fixture.caseName === "rekeyExpiredInCommit")
+              nowSeconds = 1700000600;
+            if (options.beforeCasAdmission) {
+              strict(typeof options.beforeCasAdmission === "function",
+                "MISSING_CAS_ADMISSION_FENCE");
+              options.beforeCasAdmission();
+            }
             strict(journalId === pending && puts === 1
               && additions.length === 1 && additions[0].revision === 3, "COMMIT_GUARD");
             committedCiphertext = new Uint8Array(additions[0].ciphertext);
@@ -315,7 +324,12 @@
       return { caseName: fixture.caseName, result: "PASS", puts, gets };
     } catch (error) {
       if (["valid", "rekeyValid"].includes(fixture.caseName)) throw error;
-      if (["lostReadback", "rekeyLostReadback"].includes(fixture.caseName)) {
+      if (fixture.caseName === "rekeyExpiredInCommit") {
+        strict(error.code === "ZK_OPAQUE_DELTA_COMMIT_UNCERTAIN"
+          && error.outcome?.retrySafe === false && pending !== null
+          && puts === 1 && !confirmed,
+        "EXPIRED_CAS_JOURNAL_MUST_REMAIN_UNCERTAIN");
+      } else if (["lostReadback", "rekeyLostReadback"].includes(fixture.caseName)) {
         strict(error.code === "ZK_OPAQUE_DELTA_PUT_UNCERTAIN"
           && error.outcome?.retrySafe === false && pending !== null
           && puts === 1 && !confirmed, "UNCERTAIN_JOURNAL_NOT_PRESERVED");

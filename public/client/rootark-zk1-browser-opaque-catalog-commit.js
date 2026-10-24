@@ -940,9 +940,13 @@
     }
     async function commit(additions, journalId, options = {}) {
       if (used) deny();
-      exact(options, Object.hasOwn(options, "retainPendingIntent") ? ["retainPendingIntent"] : []);
-      if (Object.hasOwn(options, "retainPendingIntent")
-        && options.retainPendingIntent !== true) deny();
+      const retained = Object.hasOwn(options, "retainPendingIntent");
+      const fencedCas = Object.hasOwn(options, "beforeCasAdmission");
+      exact(options, [...(retained ? ["retainPendingIntent"] : []),
+        ...(fencedCas ? ["beforeCasAdmission"] : [])]);
+      if ((retained && options.retainPendingIntent !== true)
+        || (fencedCas && (options.retainPendingIntent !== true
+          || typeof options.beforeCasAdmission !== "function"))) deny();
       used = true; // one-use intent; lost ACK is never retried.
       try {
         if (!Array.isArray(additions) || additions.length < 1 || additions.length > MAX_ROWS) deny();
@@ -991,6 +995,11 @@
         const request = { authorization: signed.authorization, signatureBase64: signed.signatureBase64,
           headerBase64: b64(rawHead), headerSignatureBase64: b64(headerSig), pages: wireRows(rows) };
         await ownerCurrent();
+        // The restore grant may expire WHILE loadIntent/readback/signing awaits.
+        // This is the final synchronous admission fence directly adjacent to
+        // the first CAS egress; do not move it above any awaited operation.
+        // Throwing here is NOT an uncertain CAS ACK (no CAS POST was issued).
+        if (fencedCas && options.beforeCasAdmission() !== true) deny();
         try {
           const ack = await post("commit", request);
           exact(ack, ["sequence", "catalogDigest", "authorityProofBase64"]);
