@@ -1358,11 +1358,25 @@ test("local-only restore keeps cloud inventory unknown until selected-archive re
 
       const childProcess = require("node:child_process");
       const serverPath = ${JSON.stringify(path.join(ROOT, "server.js"))};
+      const localStartupBackupModule = ${JSON.stringify(path.join(ROOT, "services", "backupService"))};
       const localStartupCode = [
-        'const net = require("node:net"); let listened = false; const original = net.Server.prototype.listen;',
-        'net.Server.prototype.listen = function (...args) { listened = true; return original.apply(this, args); };',
+        'const net = require("node:net"); let socketReady = false; const original = net.Server.prototype.listen;',
+        'net.Server.prototype.listen = function (...args) {',
+        '  this.once("listening", () => { socketReady = Boolean(this.listening && this.address()); });',
+        '  return original.apply(this, args);',
+        '};',
+        'const originalLog = console.log;',
+        'console.log = (...args) => {',
+        '  originalLog(...args);',
+        '  if (args.some((value) => typeof value === "string" && value.startsWith("Servidor rodando em http://"))) {',
+        '    if (!socketReady) process.exit(2);',
+        '    process.stdout.write("local-cloud-disabled-listening"); process.exit(0);',
+        '  }',
+        '};',
+        'const backup = require(' + JSON.stringify(localStartupBackupModule) + ');',
+        'const recover = backup.recoverRetentionAtStartup;',
+        'backup.recoverRetentionAtStartup = async (...args) => { await new Promise((resolve) => setTimeout(resolve, 350)); return recover(...args); };',
         "require(" + JSON.stringify(serverPath) + ");",
-        'setTimeout(() => { if (!listened) process.exit(2); process.stdout.write("local-cloud-disabled-listening"); process.exit(0); }, 150);',
       ].join("\\n");
       const localStartup = childProcess.spawnSync(process.execPath, ["-e", localStartupCode], {
         cwd: process.cwd(),
