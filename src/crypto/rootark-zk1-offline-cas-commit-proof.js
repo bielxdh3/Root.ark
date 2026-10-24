@@ -15,6 +15,13 @@ function exact(raw, fields) {
     || ![Object.prototype, null].includes(Object.getPrototypeOf(raw))
     || Reflect.ownKeys(raw).length !== fields.length
     || fields.some((name) => !Object.hasOwn(raw, name))) denied();
+  const copied = {};
+  for (const name of fields) {
+    const descriptor = Object.getOwnPropertyDescriptor(raw, name);
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) denied();
+    copied[name] = descriptor.value;
+  }
+  return copied;
 }
 function b64(raw, count, min = count) {
   if (typeof raw !== "string" || !/^[A-Za-z0-9_-]+$/.test(raw)) denied();
@@ -27,7 +34,7 @@ function integer(raw) {
   return raw;
 }
 function signingBytes(unsigned) {
-  exact(unsigned, FIELDS);
+  unsigned = exact(unsigned, FIELDS);
   if (unsigned.schema !== SCHEMA || unsigned.status !== "committed") denied();
   b64(unsigned.account_id, 16);
   b64(unsigned.compartment_id, 128, 1);
@@ -49,7 +56,7 @@ function verifySignedCasProof({
   witnessReceiptSha256, witnessSequence, minimumCasSequence,
   nowSeconds,
 }) {
-  exact(proof, [...FIELDS, "signature"]);
+  proof = exact(proof, [...FIELDS, "signature"]);
   let nativeSpki;
   try { nativeSpki = nativeEd25519Spki(signerPublicKey); }
   catch (_) { denied(); }

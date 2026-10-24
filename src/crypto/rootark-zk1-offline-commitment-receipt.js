@@ -17,6 +17,13 @@ function exact(value, keys) {
     || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
     || Reflect.ownKeys(value).length !== keys.length
     || keys.some((name) => !Object.hasOwn(value, name))) deny();
+  const copied = {};
+  for (const name of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, name);
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
+    copied[name] = descriptor.value;
+  }
+  return copied;
 }
 function uint(value) {
   if (!Number.isSafeInteger(value) || value < 1) deny();
@@ -34,7 +41,7 @@ function same(a, b) {
     && crypto.timingSafeEqual(a, b);
 }
 function signingBytes(unsigned) {
-  exact(unsigned, FIELDS);
+  unsigned = exact(unsigned, FIELDS);
   if (unsigned.schema !== SCHEMA || unsigned.status !== "committed") deny();
   b64(unsigned.account_id, 16);
   const compartment = Buffer.from(unsigned.compartment_id || "", "base64url");
@@ -62,7 +69,8 @@ function commitmentSigningBytes(unsigned) {
 function verifySignedReceipt({ receipt, signerPublicKey, independentSignerSpkiSha256,
   expectedScope, expectedHead, nowSeconds, previousReceipt = null,
   expectedOperation = null }) {
-  exact(receipt, [...FIELDS, "signature"]);
+  receipt = exact(receipt, [...FIELDS, "signature"]);
+  if (previousReceipt !== null) previousReceipt = exact(previousReceipt, [...FIELDS, "signature"]);
   let nativeSpki;
   try { nativeSpki = nativeEd25519Spki(signerPublicKey); }
   catch (_) { deny(); }
