@@ -545,13 +545,26 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
     "rootark-zk1-uncertain-put-reconciliation", "rootark-zk1-normal-browser-trust-floor",
     "rootark-zk1-normal-browser-content", "rootark-zk1-owner-inventory-trust-head",
     "rootark-zk1-browser-authoritative-backup", "rootark-zk1-portable-file-recovery",
-    "rootark-zk1-browser-recovery-http", "rootark-zk1-recoverable-workspace",
+    "rootark-zk1-browser-recovery-http", "rootark-zk1-recoverable-pending-journal",
+    "rootark-zk1-recoverable-workspace",
     "rootark-dev-vault-migration", "rootark-zk1-legacy-migration-workflow",
     "rootark-zk1-legacy-transition-receipt",
     "rootark-zk1-legacy-batch-migration", "rootark-zk1-v2-device-approval",
     "rootark-zk1-v2-browser-pop", "rootark-zk1-v2-committed-approval",
     "rootark-zk1-keyring-portable-archive", "rootark-zk1-browser-versioned-archive",
     "rootark-zk1-account-portable-recovery", "rootark-zk1-authenticated-workspace"];
+  // Every browser dependency must resolve through this fixed route list;
+  // otherwise newly added fail-closed modules produce a false Edge crypto
+  // failure long before the archive signing path is exercised.
+  const workspaceSource = fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-authenticated-workspace.js"), "utf8");
+  const declaredMatch = workspaceSource.match(/const dependencyNames = \[([\s\S]*?)\];/);
+  assert.ok(declaredMatch, "workspace dependency declaration is required");
+  const declaredDeps = [...declaredMatch[1].matchAll(/"([^"\n]+)"/g)].map((item) => item[1]);
+  assert.ok(declaredDeps.length >= 25 && declaredDeps.every((name) =>
+    /^rootark-[a-z0-9-]+$/.test(name) && scriptNames.includes(name)),
+  "real Edge archive fixture must explicitly allow each workspace script");
+  assert.equal(scriptNames.includes("arbitrary-untrusted-script"), false);
   for (const name of scriptNames) app.get("/client/" + name + ".js", (_req, res) =>
     res.type("application/javascript").sendFile(path.join(__dirname, "../public/client",
       name + ".js"), { dotfiles: "allow" }));
