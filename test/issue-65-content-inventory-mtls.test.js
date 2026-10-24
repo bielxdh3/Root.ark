@@ -16,6 +16,8 @@ const {
 } = require("../src/services/zk1ContentInventoryHttpsServer");
 const { createZk1ContentInventoryHttpsClient } =
   require("../src/services/zk1ContentInventoryHttpsClient");
+const { signCommittedPhysicalReadback } =
+  require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
 
 const SCOPE = Object.freeze({
   account_id: Buffer.alloc(16, 0x11),
@@ -221,9 +223,10 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
   const tls = makeCertificates(tlsDir);
   t.after(() => fs.rmSync(tlsDir, { recursive: true, force: true, maxRetries: 10 }));
 
-  async function harness(child, { scope = SCOPE } = {}) {
+  async function harness(child, { scope = SCOPE, strictPhysical = false } = {}) {
     const dbPath = path.join(tlsDir, `inventory-${crypto.randomBytes(8).toString("hex")}.sqlite`);
     const signer = crypto.generateKeyPairSync("ed25519");
+    const attestor = strictPhysical ? crypto.generateKeyPairSync("ed25519") : null;
     const signerKeyId = crypto.randomBytes(16);
     const scopeBytes = {
       account_id: Buffer.from(scope.account_id),
@@ -238,6 +241,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     });
     const ledgerProxy = {
       get scope() { return ledger.scope; },
+      get publicKey() { return ledger.publicKey; },
       getSnapshot: (...args) => ledger.getSnapshot(...args),
       append: (...args) => ledger.append(...args),
       getOperationStatus: (...args) => ledger.getOperationStatus(...args),
@@ -247,7 +251,24 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     const principals = {
       [tls.clientFingerprints.reader]: { roles: ["read"], scopes },
       [tls.clientFingerprints.writer]: { roles: ["append"], scopes },
-      [tls.clientFingerprints["status-reader"]]: { roles: ["status"], scopes },
+      [tls.clientFingerprints["status-reader"]]: { roles: strictPhysical
+        ? ["status", "read"] : ["status"], scopes },
+    };
+    // Strict mTLS protocol fixture only. The attached readback is synthetic,
+    // not evidence of actual PG18 bytes or independent host custody.
+    const physicalAttestorClient = !strictPhysical ? undefined : {
+      requestAttestation: async ({ scope, operation, nonce }) =>
+        signCommittedPhysicalReadback({ scope, operation, nonce,
+          issuedAt: Math.floor(Date.now() / 1000),
+          readback: { status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
+            walFlushConfirmed: true, authorizesIo: false, provesIndependentOperator: false,
+            generation: 3, admissionId: crypto.randomBytes(16),
+            operationId: operation.operation_id, revision: operation.revision,
+            epoch: operation.epoch, expectedInventorySequence: operation.expected_sequence,
+            expectedInventoryRoot: operation.expected_root,
+            ciphertextSha256: operation.ciphertext_sha256, digest: crypto.randomBytes(32),
+            root: crypto.randomBytes(32), chunkCount: 1 },
+        }, attestor.privateKey),
     };
     const makeServer = () => createZk1ContentInventoryHttpsServer({
       key: tls.serverKey,
@@ -255,6 +276,9 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       clientCa: tls.ca,
       ledger: ledgerProxy,
       principals,
+      ...(strictPhysical ? { physicalAttestorClient,
+        pinnedPhysicalAttestorPublicKey: attestor.publicKey,
+        pinnedInventorySignerPublicKey: signer.publicKey } : {}),
     });
     let server = makeServer();
     let port = await listen(server);
@@ -266,6 +290,8 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       serverFingerprint256: options.serverFingerprint256 || tls.serverFingerprint256,
       inventoryPublicKey: options.inventoryPublicKey || signer.publicKey,
       inventorySignerKeyId: options.inventorySignerKeyId || signerKeyId,
+      physicalAttestorPublicKey: strictPhysical && !options.disablePhysicalPin
+        ? attestor.publicKey : undefined,
       idleTimeoutMs: options.idleTimeoutMs,
       wallTimeoutMs: options.wallTimeoutMs,
     });
@@ -280,6 +306,15 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
         ledger = null;
       }
     };
+    const restart = async () => {
+      await closeCurrent();
+      ledger = await Zk1DurableContentInventoryLedger.open(dbPath, {
+        bootstrapNew: false, signerKeyId, signerPrivateKey: signer.privateKey,
+        scope: scopeBytes,
+      });
+      server = makeServer();
+      port = await listen(server);
+    };
     child.after(closeCurrent);
     return {
       dbPath,
@@ -287,10 +322,12 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       get server() { return server; },
       get port() { return port; },
       signer,
+      attestor,
       signerKeyId,
       scope: scopeBytes,
       makeClient,
       stop: closeCurrent,
+      restart,
     };
   }
 
@@ -1049,5 +1086,78 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       scope: h.scope,
       operation,
     }), { code: "INVENTORY_HTTP_UNAVAILABLE" });
+  });
+
+  await t.test("strict mTLS inventory receipt requires fresh independently verified physical proof", async (child) => {
+    const h = await harness(child, { strictPhysical: true });
+    const head = await h.ledger.readLocalHead();
+    const operation = newOperation({ root: head.root });
+    const floor = { sequence: 0, root: head.root };
+    const snapshot = await h.ledger.getSnapshot({ nonce: crypto.randomBytes(32) });
+    const absentStatus = await h.makeClient("status-reader")
+      .getOperationStatusWithVerifiedChain({
+        scope: h.scope, operation, minimumHead: floor, minimumSnapshot: snapshot.bytes,
+      });
+    assert.equal(absentStatus.status, "unknown");
+    assert.equal(absentStatus.verifiedChainContinuation, false,
+      "an unknown or terminal operation must never inherit an authenticated chain flag");
+    const verified = await h.makeClient("writer").append({
+      scope: h.scope, operation, nonce: crypto.randomBytes(32),
+      minimumHead: floor, minimumSnapshot: snapshot.bytes,
+    });
+    assert.equal(verified.status, "committed");
+    assert.equal(verified.independentPhysicalAttestationVerified, true);
+    assert.equal(verified.physicalAttestationReceiptDigest.length, 32);
+    assert.equal(verified.externalDurabilityProven, false);
+    const historical = await h.makeClient("status-reader").getOperationStatus({
+      scope: h.scope, operation,
+    });
+    assert.equal(historical.independentPhysicalAttestationVerified, true);
+    assert.deepEqual(historical.physicalAttestationReceiptDigest.length, 32);
+    const checkedChain = await h.makeClient("status-reader").getVerifiedSnapshotWithChain({
+      scope: h.scope, nonce: crypto.randomBytes(32), requested: requested(operation),
+      minimumHead: floor, minimumSnapshot: snapshot.bytes,
+      includeVerifiedProofChain: true,
+    });
+    assert.equal(checkedChain.outcome, "PRESENT");
+    assert.equal(checkedChain.authenticatedProofChain.length, 1);
+    const chained = await h.makeClient("status-reader").getOperationStatusWithVerifiedChain({
+      scope: h.scope, operation, minimumHead: floor, minimumSnapshot: snapshot.bytes,
+    });
+    assert.equal(chained.verifiedChainContinuation, true,
+      "a live physical proof must belong to the full signed chain above the pinned floor");
+    assert.equal(chained.independentPhysicalAttestationVerified, true);
+    await assert.rejects(h.makeClient("reader").getOperationStatusWithVerifiedChain({
+      scope: h.scope, operation, minimumHead: floor, minimumSnapshot: snapshot.bytes,
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" },
+    "read-only mTLS principal cannot silently gain status read permission");
+    await assert.rejects(h.makeClient("status-reader").getOperationStatusWithVerifiedChain({
+      scope: h.scope, operation,
+      minimumHead: { sequence: floor.sequence, root: crypto.randomBytes(32) },
+      minimumSnapshot: snapshot.bytes,
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" }, "forked floor must fail closed");
+    await h.restart();
+    const afterRestart = await h.makeClient("status-reader").getOperationStatus({
+      scope: h.scope, operation,
+    });
+    assert.equal(afterRestart.independentPhysicalAttestationVerified, true);
+    assert.equal(afterRestart.sequence, historical.sequence);
+    assert.deepEqual(afterRestart.root, historical.root);
+    assert.notDeepEqual(afterRestart.physicalAttestationReceiptDigest,
+      historical.physicalAttestationReceiptDigest,
+      "a new client challenge must create distinct physical evidence after SQLite restart");
+    const chainAfterRestart = await h.makeClient("status-reader")
+      .getOperationStatusWithVerifiedChain({
+        scope: h.scope, operation, minimumHead: floor, minimumSnapshot: snapshot.bytes,
+      });
+    assert.equal(chainAfterRestart.verifiedChainContinuation, true);
+    assert.deepEqual(chainAfterRestart.root, chained.root);
+    assert.equal(chainAfterRestart.independentlyAnchoredFloorProven, false,
+      "an operator-supplied minimum is not an independently operated monotonic anchor");
+    await assert.rejects(h.makeClient("writer", { disablePhysicalPin: true }).append({
+      scope: h.scope, operation, nonce: crypto.randomBytes(32),
+      minimumHead: floor, minimumSnapshot: snapshot.bytes,
+    }), { code: "INVENTORY_HTTP_UNAVAILABLE" },
+    "a signer-only client must not treat strict transport as an attested receipt");
   });
 });

@@ -22,6 +22,8 @@ const { verifyOwnerInventoryEnrollment } =
   require("../crypto/rootark-zk1-owner-inventory-trust-head");
 const { verifyCommittedPhysicalReadback } =
   require("../crypto/rootark-zk-pg-physical-attestation-v1");
+const { verifyAttestedInventoryCommit } =
+  require("../crypto/rootark-zk1-attested-inventory-commit-v1");
 
 function fail() {
   const e = new Error("ZK_PHYSICAL_INVENTORY_UNAVAILABLE");
@@ -312,7 +314,8 @@ class Zk1PgPhysicalInventoryBridge {
           pinnedPublicKey: this.#attestorPublicKey,
           nowSeconds: Math.floor(Date.now() / 1000),
         });
-        proof = { ...verified, root: Buffer.from(v.expectedRootHash),
+        proof = { ...verified, physicalAttestationBytes: Buffer.from(raw),
+          challengeNonce: Buffer.from(nonce), root: Buffer.from(v.expectedRootHash),
           ciphertextSha256: Buffer.from(v.operation.ciphertext_sha256) };
       } catch (_) { fail(); }
     } else proof = await this.verifier.verifyExact({
@@ -340,8 +343,25 @@ class Zk1PgPhysicalInventoryBridge {
     await this.#verifiedPhysical(v);
     const status = await this.#checkedCommit(v);
     if (status.status !== "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY") return status;
-    await this.#verifiedPhysical(v);
-    return status;
+    const after = await this.#verifiedPhysical(v);
+    if (!this.#attestorClient) return status;
+    try {
+      const latest = await this.ledger.getOperationStatus(v.operation.operation_id);
+      if (latest.status !== "committed" || latest.sequence !== status.sequence
+        || !same(latest.root, status.root) || !Buffer.isBuffer(latest.proof)) fail();
+      const combined = await verifyAttestedInventoryCommit({
+        receipt: latest.proof, physicalAttestation: after.physicalAttestationBytes,
+        scope: v.scope, operation: v.operation, nonce: after.challengeNonce,
+        pinnedInventoryPublicKey: this.pinnedPublicKey,
+        pinnedInventorySignerKeyId: this.signerKeyId,
+        pinnedPhysicalAttestorPublicKey: this.#attestorPublicKey,
+        nowSeconds: Math.floor(Date.now() / 1000),
+      });
+      if (combined.inventoryReceipt.sequence !== status.sequence
+        || !same(combined.inventoryReceipt.root, status.root)) fail();
+      return { ...status, independentPhysicalAttestationVerified: true,
+        physicalAttestationReceiptDigest: Buffer.from(combined.receiptDigest) };
+    } catch (_) { fail(); }
   }
   // An already verified local PG+signed operation can be matched against the
   // *current bytes* returned by a separately pinned S3/Drive reader. There is
@@ -650,8 +670,12 @@ class Zk1PgPhysicalInventoryBridge {
     await this.#verifiedPhysical(v);
     const before = await this.#checkedCommit(v);
     if (before.status === "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY") {
-      await this.#verifiedPhysical(v);
-      return before;
+      // A replay/lost-ACK branch cannot return the legacy writer-signed
+      // status without the same fresh, dual-pinned composite proof required
+      // for normal reconciliation. Re-run the exact authoritative request.
+      return this.reconcile({ scope: v.scope, operation: v.operation,
+        digest: v.digest, expectedRootHash: v.expectedRootHash,
+        expectedChunkCount: v.expectedChunkCount });
     }
     const result = await this.ledger.append(v.operation);
     if (result.status !== "committed") {

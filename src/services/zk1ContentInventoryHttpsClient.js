@@ -8,6 +8,8 @@ const tls = require("node:tls");
 const net = require("node:net");
 const crypto = require("node:crypto");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
+const { verifyAttestedInventoryCommit } =
+  require("../crypto/rootark-zk1-attested-inventory-commit-v1");
 
 const FINGERPRINT = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
 const B64U = /^[A-Za-z0-9_-]+$/;
@@ -211,6 +213,7 @@ function createZk1ContentInventoryHttpsClient({
   serverFingerprint256,
   inventoryPublicKey,
   inventorySignerKeyId,
+  physicalAttestorPublicKey,
   idleTimeoutMs = 2000,
   wallTimeoutMs = 5000,
 }) {
@@ -225,6 +228,12 @@ function createZk1ContentInventoryHttpsClient({
     || inventoryPublicKey.type !== "public" || inventoryPublicKey.asymmetricKeyType !== "ed25519"
     || !Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 50 || idleTimeoutMs > 10000
     || !Number.isSafeInteger(wallTimeoutMs) || wallTimeoutMs < 100 || wallTimeoutMs > 15000) fail();
+  if (physicalAttestorPublicKey !== undefined
+    && (!(physicalAttestorPublicKey instanceof crypto.KeyObject)
+      || physicalAttestorPublicKey.type !== "public"
+      || physicalAttestorPublicKey.asymmetricKeyType !== "ed25519"
+      || physicalAttestorPublicKey.export({ format: "der", type: "spki" }).equals(
+        inventoryPublicKey.export({ format: "der", type: "spki" })))) fail();
   const serverFingerprint = serverFingerprint256.toUpperCase();
   const signerKeyId = copyBytes(inventorySignerKeyId, 16);
 
@@ -335,7 +344,10 @@ function createZk1ContentInventoryHttpsClient({
     },
 
     async getVerifiedSnapshotWithChain(input) {
-      const raw = exact(input, ["scope", "nonce", "requested", "minimumHead", "minimumSnapshot"]);
+      const raw = exact(input, ["scope", "nonce", "requested", "minimumHead", "minimumSnapshot"],
+        ["includeVerifiedProofChain"]);
+      if (raw.includeVerifiedProofChain !== undefined
+        && raw.includeVerifiedProofChain !== true) fail();
       // Copy every user-controlled buffer before fetching the first page. The
       // network's reported head is never accepted as an authenticated floor.
       const scope = inventory.normalizeScope(raw.scope);
@@ -362,9 +374,14 @@ function createZk1ContentInventoryHttpsClient({
       }
       // A malicious or racing peer may give a stale/partial chain. The
       // separately pinned nonce-bound signed snapshot rejects it closed.
-      return client.getSnapshot({
+      const verified = await client.getSnapshot({
         scope, nonce, requested, minimumHead, minimumSnapshot, committedProofChain,
       });
+      if (raw.includeVerifiedProofChain !== true || verified.status !== "VERIFIED_NONAUTHORIZING") {
+        return verified;
+      }
+      return { ...verified, authenticatedProofChain: committedProofChain.map((proof) =>
+        Buffer.from(proof)) };
     },
 
     getSnapshot(input) {
@@ -429,13 +446,27 @@ function createZk1ContentInventoryHttpsClient({
         } catch (_) { /* committed response is checked below */ }
         try {
           const committed = exact(result, ["status", "replay", "operationId", "headSequence",
-            "headRootBase64", "snapshotBase64", "proofBase64"]);
+            "headRootBase64", "snapshotBase64", "proofBase64"].concat(
+            physicalAttestorPublicKey ? ["physicalAttestationBase64"] : []));
           if (committed.status !== "committed" || typeof committed.replay !== "boolean"
             || !sameOperationId(committed.operationId, operation.operation_id)
             || !Number.isSafeInteger(committed.headSequence) || committed.headSequence < 1) fail();
           const headRoot = decode(committed.headRootBase64, 32, 32);
           const snapshot = decode(committed.snapshotBase64, 1, inventory.MAX_SNAPSHOT_BYTES);
           const receiptBytes = decode(committed.proofBase64, 1, inventory.MAX_COMMITTED_PROOF_BYTES);
+          const receiptVerification = physicalAttestorPublicKey
+            ? verifyAttestedInventoryCommit({ receipt: receiptBytes,
+              physicalAttestation: decode(committed.physicalAttestationBase64, 1, 2048),
+              scope, operation, nonce,
+              pinnedInventoryPublicKey: inventoryPublicKey,
+              pinnedInventorySignerKeyId: signerKeyId,
+              pinnedPhysicalAttestorPublicKey: physicalAttestorPublicKey,
+              nowSeconds: Math.floor(Date.now() / 1000),
+            })
+            : inventory.verifyCommittedEntryProof({ serialized: receiptBytes,
+              pinnedPublicKey: inventoryPublicKey,
+              pinnedSignerKeyId: signerKeyId,
+              expectedScope: scope, operation });
           return Promise.all([inventory.verifySnapshot({
             serialized: snapshot,
             pinnedPublicKey: inventoryPublicKey,
@@ -445,13 +476,8 @@ function createZk1ContentInventoryHttpsClient({
             minimumHead,
             minimumSnapshot,
             nonce,
-          }), inventory.verifyCommittedEntryProof({
-            serialized: receiptBytes,
-            pinnedPublicKey: inventoryPublicKey,
-            pinnedSignerKeyId: signerKeyId,
-            expectedScope: scope,
-            operation,
-          })]).then(([verification, receipt]) => {
+          }), receiptVerification]).then(([verification, checked]) => {
+            const receipt = physicalAttestorPublicKey ? checked.inventoryReceipt : checked;
             if (verification.sequence !== committed.headSequence
               || !crypto.timingSafeEqual(verification.root, headRoot)
               || verification.outcome !== "PRESENT"
@@ -473,6 +499,10 @@ function createZk1ContentInventoryHttpsClient({
               verification,
               serializedSnapshot: Buffer.from(snapshot),
               authorizesIo: false,
+              ...(physicalAttestorPublicKey ? {
+                independentPhysicalAttestationVerified: true,
+                physicalAttestationReceiptDigest: Buffer.from(checked.receiptDigest),
+              } : {}),
             };
           });
         } catch (_) { return fail(); }
@@ -483,10 +513,12 @@ function createZk1ContentInventoryHttpsClient({
       const raw = exact(input, ["scope", "operation"]);
       const scope = inventory.normalizeScope(raw.scope);
       const operation = normalizeOperation(raw.operation);
+      const nonce = physicalAttestorPublicKey ? crypto.randomBytes(32) : null;
       const response = call("/v1/inventory/operation", {
         scope: Object.fromEntries(Object.entries(scope).map(([field, value]) =>
           [field, value.toString("base64url")])),
         operation: encodeOperation(operation),
+        ...(nonce ? { nonce: nonce.toString("base64url") } : {}),
       }, MAX_METADATA_REQUEST_BYTES, MAX_SMALL_RESPONSE_BYTES);
       return response.then((result) => {
         try {
@@ -504,19 +536,28 @@ function createZk1ContentInventoryHttpsClient({
           }
         } catch (_) { /* inspect committed form */ }
         try {
-          const committed = exact(result, ["status", "operationId", "sequence", "rootBase64", "proofBase64"]);
+          const committed = exact(result, ["status", "operationId", "sequence", "rootBase64", "proofBase64"].concat(
+            physicalAttestorPublicKey ? ["physicalAttestationBase64"] : []));
           if (committed.status !== "committed"
             || !sameOperationId(committed.operationId, operation.operation_id)
             || !Number.isSafeInteger(committed.sequence) || committed.sequence < 1) fail();
           const expectedRoot = decode(committed.rootBase64, 32, 32);
           const serialized = decode(committed.proofBase64, 1, inventory.MAX_COMMITTED_PROOF_BYTES);
-          return inventory.verifyCommittedEntryProof({
-            serialized,
-            pinnedPublicKey: inventoryPublicKey,
-            pinnedSignerKeyId: signerKeyId,
-            expectedScope: scope,
-            operation,
-          }).then((verified) => {
+          const verifiedPromise = physicalAttestorPublicKey
+            ? verifyAttestedInventoryCommit({ receipt: serialized,
+              physicalAttestation: decode(committed.physicalAttestationBase64, 1, 2048),
+              scope, operation, nonce,
+              pinnedInventoryPublicKey: inventoryPublicKey,
+              pinnedInventorySignerKeyId: signerKeyId,
+              pinnedPhysicalAttestorPublicKey: physicalAttestorPublicKey,
+              nowSeconds: Math.floor(Date.now() / 1000),
+            })
+            : inventory.verifyCommittedEntryProof({ serialized,
+              pinnedPublicKey: inventoryPublicKey,
+              pinnedSignerKeyId: signerKeyId,
+              expectedScope: scope, operation });
+          return verifiedPromise.then((checked) => {
+            const verified = physicalAttestorPublicKey ? checked.inventoryReceipt : checked;
             if (verified.sequence !== committed.sequence
               || !crypto.timingSafeEqual(verified.root, expectedRoot)) fail();
             return {
@@ -528,10 +569,60 @@ function createZk1ContentInventoryHttpsClient({
               transportReportedCommittedOnly: false,
               externalDurabilityProven: false,
               authorizesIo: false,
+              ...(physicalAttestorPublicKey ? {
+                independentPhysicalAttestationVerified: true,
+                physicalAttestationReceiptDigest: Buffer.from(checked.receiptDigest),
+              } : {}),
             };
           });
         } catch (_) { return fail(); }
       }).catch(() => fail());
+    },
+
+    // Strict live physical re-attestation plus full authenticated signed
+    // inventory ancestry from a caller-retained minimum. The returned floor
+    // consistency is NOT proof the caller actually stored that floor outside
+    // the writer's rollback domain; it never grants GET or CAS authority.
+    async getOperationStatusWithVerifiedChain(input) {
+      if (!physicalAttestorPublicKey) fail();
+      const raw = exact(input, ["scope", "operation", "minimumHead", "minimumSnapshot"]);
+      const scope = inventory.normalizeScope(raw.scope);
+      const operation = normalizeOperation(raw.operation);
+      const minimumHead = inventory.normalizeMinimumHead(raw.minimumHead);
+      const minimumSnapshot = copyBytes(raw.minimumSnapshot, 1, inventory.MAX_SNAPSHOT_BYTES);
+      try {
+        const before = await client.getOperationStatus({ scope, operation });
+        if (before.status !== "committed") return { ...before,
+          verifiedChainContinuation: false, independentlyAnchoredFloorProven: false };
+        const chain = await client.getVerifiedSnapshotWithChain({ scope,
+          nonce: crypto.randomBytes(32), requested: operationEntry(operation),
+          minimumHead, minimumSnapshot, includeVerifiedProofChain: true });
+        if (chain.status !== "VERIFIED_NONAUTHORIZING" || chain.outcome !== "PRESENT"
+          || !Array.isArray(chain.authenticatedProofChain)
+          || chain.sequence < before.sequence) fail();
+        const offset = before.verifiedReceipt.sequence - minimumHead.sequence - 1;
+        if (offset === -1) {
+          if (!crypto.timingSafeEqual(before.root, minimumHead.root)) fail();
+        } else {
+          if (!Number.isSafeInteger(offset) || offset < 0
+            || offset >= chain.authenticatedProofChain.length) fail();
+          const member = await inventory.verifyCommittedEntryProof({
+            serialized: chain.authenticatedProofChain[offset],
+            pinnedPublicKey: inventoryPublicKey,
+            pinnedSignerKeyId: signerKeyId, expectedScope: scope, operation,
+          });
+          if (member.sequence !== before.sequence
+            || !crypto.timingSafeEqual(member.root, before.root)) fail();
+        }
+        // A later physical readback prevents a stale PG response from being
+        // accepted merely because the ledger ancestry was checked afterward.
+        const after = await client.getOperationStatus({ scope, operation });
+        if (after.status !== "committed" || after.sequence !== before.sequence
+          || !crypto.timingSafeEqual(after.root, before.root)
+          || after.independentPhysicalAttestationVerified !== true) fail();
+        return { ...after, verifiedChainContinuation: true,
+          independentlyAnchoredFloorProven: false };
+      } catch (_) { fail(); }
     },
   });
   return client;

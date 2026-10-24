@@ -45,6 +45,28 @@ ciphertext egress, device enrollment, restore, deletion, or legacy cutover.
   `pinnedInventorySignerPublicKey`; a mutable ledger facade cannot choose its
   own alternate identity. The strict mode remains an admission guard: historical signed
   inventory entries do **not** yet embed the physical attestation/hash.
+- A strict inventory mTLS **committed** append or historical status now sends
+  `physicalAttestationBase64` from a separate fresh Ed25519 attestor request.
+  The append uses the caller's 32-byte nonce; historical status requires a
+  separately generated challenge on every request. The client's independently
+  provisioned `physicalAttestorPublicKey` and existing inventory signer pin
+  must both verify the canonical signed bytes for the same scope, operation_id,
+  revision, epoch, prior inventory checkpoint and ciphertext SHA-256. The
+  composite helper returns a bounded evidence-bundle SHA-256 fingerprint,
+  **not** an independent monotonic anchor or signed release permission.
+- The strict client additionally offers `getOperationStatusWithVerifiedChain`
+  for an operator-retained `minimumHead` and signed `minimumSnapshot`. It
+  verifies the full bounded append chain, proves the exact committed operation
+  is at its signed sequence/root on that chain, and re-challenges physical
+  readback afterward. The mTLS identity for this call requires **both**
+  `status` and `read` privileges; a status-only client is not automatically
+  promoted to historical read access. The result's
+  `verifiedChainContinuation: true` proves consistency with the **supplied**
+  minimum, not that its custody or monotonicity was externally enforced.
+- The strict PG inventory bridge performs the same composite verification on
+  `reconcile` and on lost-ACK/restart `publishExisting` retries. The bridge
+  never treats the writer-signed SQLite entry alone as verified independent
+  readback. Legacy non-strict paths remain explicitly non-independent.
 - The attestor listener admits only one in-flight verification per pinned
   mTLS client fingerprint, eight overall and sixteen live connections. A
   busy request fails closed; it is not queued while its PG readback is active.
@@ -90,6 +112,13 @@ or default application behavior was changed by this patch.
 - The verifier unit test exercises the exact fields returned by the readback
   function and checks that the WAL barrier was invoked. It simulates SQL
   results; it does not prove a real PG transaction or power loss.
+- Added adversarial compositional tests check separate signer identities,
+  writer-key compromise, operation/epoch/checkpoint mismatch, bounded proof
+  bytes, missing/replayed nonce and signed ancestry rollback. A live inventory
+  TLS1.3/SQLite test checks strict append, status, the full floor-to-head
+  chain and a fresh proof after service/SQLite restart. The physical readback
+  in **that** TLS fixture is synthetic; the signatures and SQLite persistence
+  are real, while PostgreSQL execution is **not** part of that test.
 - The pre-existing disposable PostgreSQL 18 labs verify the restricted login,
   immutable SQL intent, physical bytes and WAL separately. A **new combined
   PG18+separate-process mTLS** run is still required before this pathway can
@@ -106,3 +135,6 @@ The operator must maintain independent key/pin custody and monotonic anchors.
 Further work must couple the attested receipt to the normative witness/FINISH
 fence and owner restore grant at CAS, then prove restart, malicious writer,
 rollback/fork, full historical migration and multi-host recovery in real labs.
+The composed proof must still be bound *persistently* into the normative
+inventory/FINISH/CAS/witness receipt and independently anchored across restores;
+the on-demand challenge-specific bundle digest alone does not accomplish this.

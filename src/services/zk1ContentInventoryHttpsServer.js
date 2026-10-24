@@ -196,12 +196,13 @@ function createZk1ContentInventoryHttpsServer({
   const physicalPrincipalWindowCounts = new Map();
   let physicalGlobalWindowStarted = process.hrtime.bigint();
   let physicalGlobalWindowCount = 0;
-  async function verifyPhysical(scope, operation) {
+  async function verifyPhysical(scope, operation, callerNonce) {
     if (physicalAttestorClient !== undefined) {
       // The application/inventory signer does not supply the physical digest,
       // root or chunk count. Only the independently pinned read-only attestor
       // can report those facts from its immutable PG intent and WAL barrier.
-      const nonce = crypto.randomBytes(32);
+      const nonce = callerNonce === undefined ? crypto.randomBytes(32)
+        : Buffer.from(callerNonce);
       const raw = await physicalAttestorClient.requestAttestation({ scope,
         operation, nonce: Buffer.from(nonce) });
       const proof = await verifyCommittedPhysicalReadback(raw, { scope, operation,
@@ -210,7 +211,7 @@ function createZk1ContentInventoryHttpsServer({
       if (proof.status !== "PHYSICALLY_REREAD_PG_COMMITTED"
         || proof.verified !== true || proof.walFlushConfirmed !== true
         || proof.authorizesIo !== false) invalid();
-      return proof;
+      return Object.freeze({ ...proof, attestationBytes: Buffer.from(raw) });
     }
     return physicalVerifier.verifyCommittedInventoryOperation({ scope, operation });
   }
@@ -272,7 +273,9 @@ function createZk1ContentInventoryHttpsServer({
         route.kind === "append" ? MAX_APPEND_REQUEST_BYTES : MAX_METADATA_REQUEST_BYTES);
       const expectedFields = route.kind === "snapshot" ? ["scope", "nonce"]
         : route.kind === "chain" ? ["scope", "afterSequence", "limit"]
-          : ["scope", "operation"].concat(route.kind === "append" ? ["nonce"] : []);
+          : ["scope", "operation"].concat(route.kind === "append"
+            || (route.kind === "operation" && physicalAttestorClient)
+            ? ["nonce"] : []);
       const raw = exact(body, expectedFields);
       const scope = normalizeScope(raw.scope);
       const keyForScope = scopeKey(scope);
@@ -383,9 +386,9 @@ function createZk1ContentInventoryHttpsServer({
         // A signature may already be durable before a physical corruption is
         // detected. Never return positive transport success unless a fresh
         // readback still passes. A historical receipt is not GET authority.
-        if (physicalEnabled) {
-          await verifyPhysical(scope, operation);
-        }
+        const attested = physicalEnabled
+          ? await verifyPhysical(scope, operation, physicalAttestorClient ? nonce : undefined)
+          : null;
         const snapshotBase64 = snapshot.bytes.toString("base64url");
         if (snapshotBase64.length > MAX_SNAPSHOT_BASE64_BYTES) invalid();
         return respond(response, 200, {
@@ -396,6 +399,9 @@ function createZk1ContentInventoryHttpsServer({
           headRootBase64: snapshot.root.toString("base64url"),
           snapshotBase64,
           proofBase64: receipt.proof.toString("base64url"),
+          ...(physicalAttestorClient ? {
+            physicalAttestationBase64: attested.attestationBytes.toString("base64url"),
+          } : {}),
         }, MAX_SNAPSHOT_RESPONSE_BYTES);
       }
 
@@ -423,15 +429,17 @@ function createZk1ContentInventoryHttpsServer({
       // opt-in physical mode, status reconciliation also fails closed on
       // changed bytes, stale generation, broken binding or failed WAL flush.
       // No part of this response authorizes GET/release of protected content.
-      if (physicalEnabled) {
-        await verifyPhysical(scope, operation);
-      }
+      const attested = physicalEnabled ? await verifyPhysical(scope, operation,
+        physicalAttestorClient ? decode(raw.nonce, 32, 32) : undefined) : null;
       return respond(response, 200, {
         status: "committed",
         operationId,
         sequence: result.sequence,
         rootBase64: result.root.toString("base64url"),
         proofBase64: result.proof.toString("base64url"),
+        ...(physicalAttestorClient ? {
+          physicalAttestationBase64: attested.attestationBytes.toString("base64url"),
+        } : {}),
       });
     } catch (error) {
       if (response.headersSent || response.destroyed) return;

@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const z = require("../src/crypto/rootark-zk-1");
 const { signCommittedPhysicalReadback } =
   require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
 const { Zk1PgPhysicalInventoryBridge } = require("../src/services/zk1PgPhysicalInventoryBridge");
@@ -63,6 +64,35 @@ test("strict bridge rejects a writer-owned physical proof and accepts only pinne
     { status: "pending", authorizesIo: false });
   assert.equal(received.length, 2);
   assert.deepEqual(received[0].operation.operation_id, operation.operation_id);
+  // The bridge must export a verified composite receipt, rather than a
+  // writer-signed local catalog entry with an unrelated boolean PG flag.
+  const signerId = ctor.pinnedSignerKeyId;
+  const committedRoot = random(32);
+  const signedEntry = { type: "rootark-content-inventory-entry/v1", version: 1,
+    signer_key_id: signerId, scope, sequence: operation.expected_sequence + 1,
+    previous_root: operation.expected_root, root: committedRoot,
+    operation_id: operation.operation_id,
+    expected_sequence: operation.expected_sequence,
+    expected_root: operation.expected_root,
+    request_digest: crypto.createHash("sha256").update(
+      await z.encodeDeterministic(operation)).digest(),
+    entry: { object_id: operation.object_id, revision: operation.revision,
+      epoch: operation.epoch, ciphertext_sha256: operation.ciphertext_sha256 } };
+  const signature = crypto.sign(null, Buffer.concat([
+    Buffer.from("Root.ark/zk-1/content-inventory-entry/v1\0"),
+    await z.encodeDeterministic(signedEntry),
+  ]), inventorySigner.privateKey);
+  const signedProof = Buffer.from(await z.encodeDeterministic({ ...signedEntry, signature }));
+  ledger.getOperationStatus = async () => ({ status: "committed", sequence: 3,
+    root: committedRoot, proof: signedProof });
+  const committed = await bridge.reconcile(physical);
+  assert.equal(committed.status, "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+  assert.equal(committed.independentPhysicalAttestationVerified, true);
+  assert.equal(committed.physicalAttestationReceiptDigest.length, 32);
+  const retried = await bridge.publishExisting(physical);
+  assert.equal(retried.independentPhysicalAttestationVerified, true,
+    "an already committed operation must not bypass composite verification on restart/retry");
+  assert.equal(retried.physicalAttestationReceiptDigest.length, 32);
   signer = writer.privateKey;
   await assert.rejects(bridge.reconcile(physical), /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
     "writer with valid own Ed25519 key cannot forge independent PG success");
