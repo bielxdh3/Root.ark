@@ -7,7 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const Database = require("better-sqlite3");
-const { spawn } = require("node:child_process");
+const { spawn, fork } = require("node:child_process");
 const vm = require("node:vm");
 const express = require("express");
 const { registerZk1ProtectedObjectRoutes } =
@@ -34,6 +34,9 @@ const { OpaqueCheckpointV2Authority,
   require("../src/services/zk1OpaqueCheckpointV2Remote");
 const { Zk1OpaqueCheckpointV2Client } =
   require("../src/services/zk1OpaqueCheckpointV2Client");
+const { Zk1V2CheckpointFloorHttpsClient } =
+  require("../src/services/zk1V2CheckpointFloorHttps");
+const { signOwnerAdvance } = require("../src/services/zk1V2CheckpointRemoteFloor");
 const { issueVerifiedHistoricalSignerEndorsement } =
   require("../src/crypto/rootark-zk1-v2-historical-signer-endorsement");
 const { generateNativeFixtureCertificates } =
@@ -65,8 +68,8 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-checkpoint-v2-remote-"));
   if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
   generateNativeFixtureCertificates(dir, { caSubject: "ZK65 Checkpoint Remote",
-    servers: ["v1cas", "v1floor", "v2cas", "v2floor"],
-    clients: ["client"] });
+    servers: ["v1cas", "v1floor", "v2cas", "v2floor", "v2floorremote"],
+    clients: ["client", "denied"] });
   const read = (name) => fs.readFileSync(path.join(dir, name));
   const x509 = (name) => new crypto.X509Certificate(read(name)).fingerprint256;
   const state = await fixtures.createInitialState(1);
@@ -587,6 +590,177 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   assert.equal((await handles.casClient.head()).state, "FINALIZED");
   assert.equal((await handles.floorClient.head()).state, "FINALIZED");
   assert.equal((await handles.coordinator.readConsistent(intent)).sequence, 129);
+  if (process.env.ZK65_V2_INDEPENDENT_FLOOR_MTLS === "1") {
+    // A deliberately separate OS child holds a second WAL/FULL SQLite and
+    // Ed25519 private key. Same physical host => DEV split only, NOT HA proof.
+    const pub = (key) => encoded(key.export({ type: "spki", format: "der" }));
+    const remoteCert = x509("v2floorremote.pem");
+    let floorChild = null;
+    async function launchFloor({ bootstrapNew, minimum } = {}) {
+      const child = fork(path.join(__dirname,
+        "support/issue-65-v2-checkpoint-floor-child.js"), [], {
+        env: process.env, stdio: ["ignore", "ignore", "ignore", "ipc"],
+      });
+      floorChild = child;
+      const ready = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("DEV_FLOOR_CHILD_TIMEOUT")), 10000);
+        child.on("message", (message) => {
+          if (message?.kind === "ready" || message?.kind === "failed") {
+            clearTimeout(timer);
+            if (message.kind === "failed") reject(new Error("DEV_FLOOR_CHILD_" + message.code));
+            else resolve(message);
+          }
+        });
+        child.once("exit", (code) => {
+          clearTimeout(timer);
+          reject(new Error("DEV_FLOOR_CHILD_EXIT_" + code));
+        });
+      });
+      child.send({ kind: "init", dir, bootstrapNew,
+        scope: Object.fromEntries(Object.entries(scope).map(([key, value]) =>
+          [key, encoded(value)])),
+        casKey: pub(v2CasKeys.publicKey), floorKey: pub(v2FloorKeys.publicKey),
+        ownerKey: pub(owner.publicKey), baseHead: encoded(oldDigest),
+        baseCheckpoint: encoded(oldCheckpoint),
+        ...(minimum ? { minimum: { sequence: minimum.sequence,
+          chainHash: encoded(minimum.chainHash) } } : {}) });
+      try {
+        const result = await ready;
+        const client = new Zk1V2CheckpointFloorHttpsClient({
+          endpoint: `https://127.0.0.1:${result.port}/`,
+          ca: read("ca.pem"), clientKey: read("client.key"),
+          clientCert: read("client.pem"), serverFingerprint256: remoteCert,
+          pinnedFloorPublicKey: crypto.createPublicKey({
+            key: Buffer.from(result.floorKey, "base64url"), format: "der", type: "spki" }),
+          pinnedOwnerPublicKey: owner.publicKey, scope,
+          minimum: minimum || { sequence: 128, chainHash: Buffer.alloc(32),
+            headDigest: oldDigest, checkpointDigest: oldCheckpoint, epoch: 0 },
+        });
+        return { client, result };
+      } catch (error) {
+        child.kill();
+        await new Promise((resolve) => child.once("exit", resolve));
+        floorChild = null;
+        throw error;
+      }
+    }
+    async function stopFloor() {
+      const child = floorChild;
+      if (!child) return;
+      floorChild = null;
+      if (child.exitCode !== null) return;
+      const stopped = new Promise((resolve) => child.once("exit", resolve));
+      child.send({ kind: "stop" });
+      await stopped;
+    }
+    try {
+      const first = await launchFloor({ bootstrapNew: true });
+      assert.equal((await first.client.freshHead()).sequence, 128);
+      const guardedCoordinator = (floorClient) => createOpaqueCheckpointV2Coordinator({
+        casClient: handles.casClient, floorClient: handles.floorClient,
+        v1CasClient: v1Cas, v1FloorClient: v1Floor,
+        trustedScope: scope, expectedV1Digest: oldDigest,
+        expectedV1Checkpoint: oldCheckpoint, requiredV2FloorClient: floorClient });
+      await assert.rejects(guardedCoordinator(first.client).readConsistent(intent),
+        /ZK_CHECKPOINT_V2_INDEPENDENT_FLOOR_UNAVAILABLE/,
+        "a signed but stale independent floor cannot authorize V2 terminal readback");
+      await assert.rejects(guardedCoordinator(first.client).reconcile(intent),
+        /ZK_CHECKPOINT_V2_INDEPENDENT_FLOOR_UNAVAILABLE/,
+        "already finalized CAS/FLOOR cannot be presented as success before third readback");
+      const options = { endpoint: `https://127.0.0.1:${first.result.port}/`,
+        ca: read("ca.pem"), clientKey: read("client.key"),
+        clientCert: read("client.pem"), serverFingerprint256: remoteCert,
+        pinnedFloorPublicKey: crypto.createPublicKey({
+          key: Buffer.from(first.result.floorKey, "base64url"), format: "der", type: "spki" }),
+        pinnedOwnerPublicKey: owner.publicKey, scope,
+        minimum: { sequence: 128, chainHash: Buffer.alloc(32),
+          headDigest: oldDigest, checkpointDigest: oldCheckpoint, epoch: 0 } };
+      await assert.rejects(new Zk1V2CheckpointFloorHttpsClient({ ...options,
+        clientKey: read("denied.key"), clientCert: read("denied.pem") }).freshHead(),
+      /ZK_V2_REMOTE_FLOOR_UNAVAILABLE/, "ungranted mTLS principal must not access signed floor");
+      await assert.rejects(new Zk1V2CheckpointFloorHttpsClient({ ...options,
+        pinnedFloorPublicKey: crypto.generateKeyPairSync("ed25519").publicKey }).freshHead(),
+      /ZK_V2_REMOTE_FLOOR_UNAVAILABLE/, "wrong signer pin cannot authorize readback");
+      const receipts = await handles.coordinator.predecessorEndorsements(intent);
+      const payload = { scope, sequence: 129, epoch: nextHeader.epoch,
+        headDigest: newDigest, checkpointDigest: checkpoint129.checkpointDigest,
+        previousHeadDigest: oldDigest, previousCheckpointDigest: oldCheckpoint,
+        operationId: Buffer.from((await z.decodeDeterministic(intent)).operation_id),
+        casReceipt: receipts.predecessor_cas_receipt,
+        floorReceipt: receipts.predecessor_floor_receipt };
+      const ownerSignature = await signOwnerAdvance(payload, owner.privateKey);
+      const toAdvance = ({ scope: ignored, ...v }) => v;
+      await assert.rejects(first.client.advance({ ...toAdvance(payload),
+        ownerSignature: crypto.randomBytes(64) }), /ZK_V2_REMOTE_FLOOR_UNAVAILABLE/,
+      "two real FINALIZED receipts without independent owner approval cannot advance floor");
+      const wrongPredecessor = { ...payload, previousHeadDigest: crypto.randomBytes(32) };
+      await assert.rejects(first.client.advance({ ...toAdvance(wrongPredecessor),
+        ownerSignature: await signOwnerAdvance(wrongPredecessor, owner.privateKey) }),
+      /ZK_V2_REMOTE_FLOOR_UNAVAILABLE/,
+      "even the authorized owner cannot skip the independently pinned predecessor digest");
+      const signedTerminal = await first.client.advance({ ...toAdvance(payload), ownerSignature });
+      assert.equal(signedTerminal.sequence, 129);
+      assert.equal(signedTerminal.epoch, nextHeader.epoch);
+      assert.equal((await guardedCoordinator(first.client).readConsistent(intent)).sequence, 129);
+      assert.equal((await guardedCoordinator(first.client).reconcile(intent)).finalSequence, 129);
+      assert.ok((await guardedCoordinator(first.client).predecessorEndorsements(intent))
+        .predecessor_floor_receipt.byteLength > 0);
+      const alternateNode = process.env.ZK65_NODE22_BINARY || process.execPath;
+      if (fs.existsSync(alternateNode)) {
+        // The alternate runtime only verifies the remote signed mTLS head;
+        // its process never opens the native SQLite addon or private key.
+        const reader = fork(path.join(__dirname,
+          "support/issue-65-v2-floor-readback-client.js"), [], {
+          execPath: alternateNode, execArgv: [], env: process.env,
+          stdio: ["ignore", "ignore", "ignore", "ipc"],
+        });
+        try {
+          const observed = new Promise((resolve, reject) => {
+            const deadline = setTimeout(() => reject(Error("DEV_FLOOR_READER_TIMEOUT")), 10000);
+            reader.on("message", (message) => {
+              clearTimeout(deadline);
+              message.kind === "checked" ? resolve(message) : reject(Error("DEV_FLOOR_READER_DENIED"));
+            });
+            reader.once("exit", (code) => {
+              clearTimeout(deadline);
+              reject(Error("DEV_FLOOR_READER_EXIT_" + code));
+            });
+          });
+          reader.send({ type: "read", directory: dir, port: first.result.port,
+            serverPin: remoteCert, floorKey: first.result.floorKey,
+            ownerKey: pub(owner.publicKey),
+            scope: Object.fromEntries(Object.entries(scope).map(([key, value]) =>
+              [key, encoded(value)])),
+            minimum: { sequence: signedTerminal.sequence,
+              chainHash: encoded(signedTerminal.chainHash) } });
+          const result = await observed;
+          assert.equal(result.sequence, 129);
+          assert.equal(result.epoch, nextHeader.epoch);
+        } finally {
+          if (reader.exitCode === null) reader.kill();
+        }
+      }
+      await stopFloor();
+      await assert.rejects(guardedCoordinator(first.client).readConsistent(intent),
+        /ZK_CHECKPOINT_V2_INDEPENDENT_FLOOR_UNAVAILABLE/,
+      "partitioned second process must fail closed, not fall back to CAS/FLOOR");
+      await assert.rejects(guardedCoordinator(first.client).predecessorEndorsements(intent),
+        /ZK_CHECKPOINT_V2_INDEPENDENT_FLOOR_UNAVAILABLE/,
+      "a partitioned floor cannot authorize generation of successor endorsements");
+      const restored = await launchFloor({ bootstrapNew: false, minimum: signedTerminal });
+      assert.equal((await guardedCoordinator(restored.client).readConsistent(intent)).sequence, 129,
+        "separate process reload must verify authentic full floor history");
+      await stopFloor();
+      // Roll back one disposable floor database while retaining the previously
+      // authenticated minimum outside its SQLite. Rebootstrap MUST reject.
+      const edited = new Database(path.join(dir, "independent-v2-floor.sqlite"));
+      try { edited.prepare("DELETE FROM floor_event").run(); }
+      finally { edited.close(); }
+      await assert.rejects(launchFloor({ bootstrapNew: false,
+        minimum: signedTerminal }), /DEV_FLOOR_CHILD_/,
+      "rolling back independent SQLite below retained signed floor must fail");
+    } finally { await stopFloor(); }
+  }
   // Original pre-130 #129 device format has only identity/intent and two
   // immutable intent triggers. Upgrade only into a NEW device journal after
   // fresh owner authority and both signed independent finalized heads.

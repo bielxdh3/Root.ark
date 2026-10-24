@@ -16,6 +16,8 @@ const z = require("../crypto/rootark-zk-1");
 const archiveV2 = require("../crypto/rootark-zk1-opaque-catalog-checkpoint-v2");
 const { isZk1OpaqueCatalogIndependentFloorClient } =
   require("./zk1OpaqueCatalogIndependentFloor");
+const { Zk1V2CheckpointFloorHttpsClient } =
+  require("./zk1V2CheckpointFloorHttps");
 const { catalogCasDomain } = require("./zk1OpaqueCatalog");
 const ownerHistory = require("../crypto/rootark-zk-recovery-history-v2");
 const ownerManifest = require("../crypto/rootark-zk-recovery-manifest-v2");
@@ -959,13 +961,16 @@ function isOpaqueCheckpointV2PinnedClient(client) {
 function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
   trustedScope, expectedV1Digest, expectedV1Checkpoint,
   v1CasClient, v1FloorClient, requireFullV1ArchiveRollover = false,
-  fullV1ArchiveRollover, pinnedOwnerPublicKey, pinnedCheckpointPublicKey }) {
+  fullV1ArchiveRollover, pinnedOwnerPublicKey, pinnedCheckpointPublicKey,
+  requiredV2FloorClient = null }) {
   if (!pinnedV2Clients.has(casClient) || casClient.role !== ROLE_CAS
     || !pinnedV2Clients.has(floorClient) || floorClient.role !== ROLE_FLOOR
     || same(fp(casClient.publicKey), fp(floorClient.publicKey))
     || !v1CasClient || typeof v1CasClient.readHead !== "function"
     || !isZk1OpaqueCatalogIndependentFloorClient(v1FloorClient)
-    || same(fp(key(v1CasClient.publicKey)), fp(key(v1FloorClient.publicKey)))) fail();
+    || same(fp(key(v1CasClient.publicKey)), fp(key(v1FloorClient.publicKey)))
+    || (requiredV2FloorClient !== null
+      && !(requiredV2FloorClient instanceof Zk1V2CheckpointFloorHttpsClient))) fail();
   const scope = scopeOf(trustedScope);
   const oldDigest = bytes(expectedV1Digest, 32);
   const oldCheckpoint = bytes(expectedV1Checkpoint, 32);
@@ -1108,6 +1113,33 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
     }
     return { cas, floor, previousSequence, finalSequence };
   }
+  async function assertIndependentV2Floor(raw, states) {
+    if (!requiredV2FloorClient) return;
+    // This is a second signed readback gate for *already FINALIZED* CAS and
+    // FLOOR. It is not a physical distributed admission fence and does not
+    // imply any atomic transaction across three separate authorities.
+    if (states.cas.sequence !== states.finalSequence
+      || states.floor.sequence !== states.finalSequence
+      || states.cas.state !== "FINALIZED" || states.floor.state !== "FINALIZED") {
+      fail("ZK_CHECKPOINT_V2_INDEPENDENT_FLOOR_PENDING");
+    }
+    try {
+      const body = await z.decodeDeterministic(bytes(raw, 1, MAX_WIRE));
+      const header = await z.decodeDeterministic(bytes(body.records[0].header, 1, 16384));
+      const remote = await requiredV2FloorClient.freshHead();
+      const { receiptIdentityHash } = require("./zk1V2CheckpointRemoteFloor");
+      const casReceiptHash = await receiptIdentityHash(states.cas.raw);
+      const floorReceiptHash = await receiptIdentityHash(states.floor.raw);
+      if (remote.sequence !== states.finalSequence || remote.epoch !== header.epoch
+        || !same(remote.headDigest, bytes(states.cas.head_digest, 32))
+        || !same(remote.checkpointDigest, bytes(states.cas.checkpoint_digest, 32))
+        || !same(remote.operationId, bytes(body.operation_id, 32))
+        || !same(remote.casReceiptIdentityHash, casReceiptHash)
+        || !same(remote.floorReceiptIdentityHash, floorReceiptHash)) {
+        fail("ZK_CHECKPOINT_V2_INDEPENDENT_FLOOR_MISMATCH");
+      }
+    } catch (_) { fail("ZK_CHECKPOINT_V2_INDEPENDENT_FLOOR_UNAVAILABLE"); }
+  }
   async function reconcile(raw) {
     await assertV1Terminal();
     if (requireFullV1ArchiveRollover) {
@@ -1123,6 +1155,7 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
     let { cas, floor, previousSequence, finalSequence } = await confirmedState(raw);
     if (cas.sequence === finalSequence && floor.sequence === finalSequence
       && cas.state === "FINALIZED" && floor.state === "FINALIZED") {
+      await assertIndependentV2Floor(raw, { cas, floor, previousSequence, finalSequence });
       return Object.freeze({ outcome: "V2_CHECKPOINT_BOTH_FINALIZED_LOCAL_ONLY",
         finalSequence, remoteCloudDurabilityProven: false,
         atomicCrossDatabaseTransactionProven: false, publishedToBrowser: false });
@@ -1146,6 +1179,7 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
     if (checked.cas.sequence !== finalSequence || checked.floor.sequence !== finalSequence
       || checked.cas.state !== "FINALIZED" || checked.floor.state !== "FINALIZED")
       fail("ZK_CHECKPOINT_V2_ACK_UNCERTAIN");
+    await assertIndependentV2Floor(raw, checked);
     return Object.freeze({ outcome: "V2_CHECKPOINT_BOTH_FINALIZED_LOCAL_ONLY",
       finalSequence, remoteCloudDurabilityProven: false,
       atomicCrossDatabaseTransactionProven: false, publishedToBrowser: false });
@@ -1163,6 +1197,7 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
         || states.floor.sequence !== states.finalSequence
         || states.cas.state !== "FINALIZED" || states.floor.state !== "FINALIZED")
         fail("ZK_CHECKPOINT_V2_PENDING");
+      await assertIndependentV2Floor(raw, states);
       return Object.freeze({ predecessor_cas_receipt: Buffer.from(states.cas.raw),
         predecessor_floor_receipt: Buffer.from(states.floor.raw) });
     },
@@ -1174,6 +1209,7 @@ function createOpaqueCheckpointV2Coordinator({ casClient, floorClient,
         || states.floor.sequence !== states.finalSequence
         || states.cas.state !== "FINALIZED" || states.floor.state !== "FINALIZED")
         fail("ZK_CHECKPOINT_V2_PENDING");
+      await assertIndependentV2Floor(raw, states);
       return { sequence: states.finalSequence, checkpointDigest:
         Buffer.from(states.cas.checkpoint_digest), publishedToBrowser: false };
     },
