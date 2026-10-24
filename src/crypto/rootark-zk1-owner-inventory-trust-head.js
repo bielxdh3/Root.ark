@@ -6,6 +6,7 @@
 const crypto = require("node:crypto");
 const z = require("./rootark-zk-1");
 const inventory = require("./rootark-zk-content-inventory-v1");
+const { nativeEd25519Spki } = require("./rootark-zk1-native-ed25519-public-key");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/owner-inventory-trust-head/v1\0", "ascii");
 const SCHEMA = "rootark-zk1-owner-inventory-trust-head/v1";
@@ -48,8 +49,8 @@ function key(value, kind) {
   return value;
 }
 function spkiHash(publicKey) {
-  return crypto.createHash("sha256").update(key(publicKey, "public")
-    .export({ type: "spki", format: "der" })).digest("hex");
+  return crypto.createHash("sha256").update(nativeEd25519Spki(
+    key(publicKey, "public"))).digest("hex");
 }
 function digest(data) { return crypto.createHash("sha256").update(data).digest("hex"); }
 function statement(value) {

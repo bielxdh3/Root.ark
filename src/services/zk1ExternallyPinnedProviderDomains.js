@@ -4,6 +4,7 @@
 // can vouch for each provider's configured principal and namespace. A signed
 // statement cannot prove separate physical custody or cloud durability.
 const crypto = require("node:crypto");
+const { nativeEd25519Spki } = require("../crypto/rootark-zk1-native-ed25519-public-key");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/provider-domain-attestation/v1\0", "ascii");
 const SCHEMA = "rootark-zk1-provider-domain-attestation/v1";
@@ -39,8 +40,8 @@ function key(value, kind) {
   return value;
 }
 function spkiFingerprint(publicKey) {
-  return crypto.createHash("sha256").update(key(publicKey, "public")
-    .export({ type: "spki", format: "der" })).digest("hex");
+  return crypto.createHash("sha256").update(nativeEd25519Spki(
+    key(publicKey, "public"))).digest("hex");
 }
 function normalize(scope) {
   if (!scope || typeof scope !== "object") deny();

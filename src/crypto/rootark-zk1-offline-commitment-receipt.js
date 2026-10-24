@@ -4,6 +4,7 @@
 // signer must be provisioned independently of the Root.ark server. A valid
 // signature alone cannot prove external custody or physical durability.
 const crypto = require("node:crypto");
+const { nativeEd25519Spki } = require("./rootark-zk1-native-ed25519-public-key");
 const DOMAIN = Buffer.from("Root.ark/zk-1/offline-commitment-receipt/v1\0");
 const SCHEMA = "rootark-zk1-offline-commitment-receipt/v1";
 const FIELDS = ["schema", "status", "account_id", "compartment_id", "keyring_id",
@@ -62,9 +63,11 @@ function verifySignedReceipt({ receipt, signerPublicKey, independentSignerSpkiSh
   expectedScope, expectedHead, nowSeconds, previousReceipt = null,
   expectedOperation = null }) {
   exact(receipt, [...FIELDS, "signature"]);
-  if (signerPublicKey?.type !== "public" || signerPublicKey.asymmetricKeyType !== "ed25519"
-    || !same(crypto.createHash("sha256").update(signerPublicKey.export({
-      format: "der", type: "spki" })).digest(), b64(independentSignerSpkiSha256, 32))) deny();
+  let nativeSpki;
+  try { nativeSpki = nativeEd25519Spki(signerPublicKey); }
+  catch (_) { deny(); }
+  if (!same(crypto.createHash("sha256").update(nativeSpki).digest(),
+    b64(independentSignerSpkiSha256, 32))) deny();
   const unsigned = Object.fromEntries(FIELDS.map((key) => [key, receipt[key]]));
   const bytes = commitmentSigningBytes(unsigned);
   if (!crypto.verify(null, bytes, signerPublicKey, b64(receipt.signature, 64))) deny();

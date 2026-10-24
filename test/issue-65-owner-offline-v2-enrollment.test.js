@@ -36,6 +36,50 @@ const newDeviceRequest = async () => {
   return { request, signer, hpkePrivateDer, hpkePrivateRaw };
 };
 
+test("offline V2 enrollment rejects a locally signed owner key disguised as the externally pinned owner", async () => {
+  const state = await fixtures.createInitialState(2);
+  const owner = crypto.generateKeyPairSync("ed25519");
+  const foreign = crypto.generateKeyPairSync("ed25519");
+  const witness = crypto.generateKeyPairSync("ed25519");
+  const signer = crypto.createPublicKey({
+    key: owner.publicKey.export({ format: "der", type: "spki" }),
+    type: "spki", format: "der",
+  });
+  const foreignSpki = foreign.publicKey.export({ format: "der", type: "spki" });
+  signer.export = () => Buffer.from(foreignSpki);
+  const now = Math.floor(Date.now() / 1000);
+  const prior = state.headManifest;
+  const head = { revision: prior.revision,
+    digest: b64(await manifest.recoveryManifestDigestV2(prior)),
+    epoch: prior.current_epoch };
+  const unsigned = { schema: commitment.SCHEMA, status: "committed",
+    account_id: b64(prior.account_id), compartment_id: b64(prior.compartment_id),
+    keyring_id: b64(prior.keyring_id), revision: head.revision,
+    digest: head.digest, epoch: head.epoch,
+    previous_revision: null, previous_digest: null,
+    operation_id: null, pop_challenge_id: null, request_nonce: null,
+    commit_nonce: null, sequence: 1, previous_receipt_sha256: null,
+    issued_at: now, expires_at: now + 300 };
+  const signed = { ...unsigned, signature: b64(crypto.sign(null,
+    commitment.commitmentSigningBytes(unsigned), witness.privateKey)) };
+  const args = { request: (await newDeviceRequest()).request,
+    verifiedHistory: state.verifiedHistory, externalCurrentHead: head,
+    trustedOwnerPublicKey: owner.publicKey,
+    independentOwnerSpkiSha256: b64(crypto.createHash("sha256").update(
+      owner.publicKey.export({ type: "spki", format: "der" })).digest()),
+    trustedCommitmentSignerPublicKey: witness.publicKey,
+    independentCommitmentSignerSpkiSha256: b64(crypto.createHash("sha256").update(
+      witness.publicKey.export({ type: "spki", format: "der" })).digest()),
+    trustedPriorCommitment: signed, nowSeconds: now };
+  const honest = await enrollment.beginOwnerEnrollment(args);
+  assert.ok(honest.challenge);
+  await assert.rejects(enrollment.beginOwnerEnrollment({ ...args,
+    trustedOwnerPublicKey: signer,
+    independentOwnerSpkiSha256: b64(crypto.createHash("sha256")
+      .update(foreignSpki).digest()),
+  }), /ZK_OWNER_OFFLINE_ENROLLMENT_DENIED/);
+});
+
 test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs only after independently pinned committed head", async () => {
   const state = await fixtures.createInitialState(3);
   const owner = crypto.generateKeyPairSync("ed25519");

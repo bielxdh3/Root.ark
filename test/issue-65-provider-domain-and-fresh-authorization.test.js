@@ -14,6 +14,34 @@ const b64 = (bytes) => Buffer.from(bytes).toString("base64url");
 const scope = () => ({ account_id: random(16), compartment_id: Buffer.from("tenant-alpha"),
   keyring_id: random(16) });
 
+test("two branded cloud providers cannot claim independent custody with one native Ed25519 administrator", () => {
+  const shared = crypto.generateKeyPairSync("ed25519");
+  const unrelated = crypto.generateKeyPairSync("ed25519");
+  const disguised = crypto.createPublicKey({
+    key: shared.publicKey.export({ format: "der", type: "spki" }),
+    type: "spki", format: "der",
+  });
+  const foreignSpki = unrelated.publicKey.export({ type: "spki", format: "der" });
+  disguised.export = () => Buffer.from(foreignSpki);
+  const domains = [
+    { provider: "s3", trustDomainId: random(32).toString("hex"),
+      administratorPublicKey: shared.publicKey,
+      independentAdministratorSpkiSha256: spkiFingerprint(shared.publicKey) },
+    { provider: "gdrive", trustDomainId: random(32).toString("hex"),
+      administratorPublicKey: disguised,
+      independentAdministratorSpkiSha256: crypto.createHash("sha256")
+        .update(foreignSpki).digest("hex") },
+  ];
+  assert.throws(() => new Zk1ExternallyPinnedProviderDomains({
+    externallyPinnedDomains: domains,
+  }), /ZK_PROVIDER_DOMAIN_UNVERIFIED/,
+  "separate SPKI pins must represent separate actual signing authorities");
+  assert.doesNotThrow(() => new Zk1ExternallyPinnedProviderDomains({
+    externallyPinnedDomains: [domains[0], { ...domains[1],
+      administratorPublicKey: unrelated.publicKey }],
+  }));
+});
+
 test("independently fixed admin signing keys bind distinct namespaces, contexts and custody domains", () => {
   const trusted = scope();
   const now = Math.floor(Date.now() / 1000);

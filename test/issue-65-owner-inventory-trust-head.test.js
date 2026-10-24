@@ -55,6 +55,23 @@ test("independent offline owner process signs an externally pinned, verified inv
   assert.equal(verified.authorizesIo, false);
 });
 
+test("signed owner inventory ancestry cannot be verified under a spoofed independent owner SPKI pin", async () => {
+  const f = await fixture();
+  const genuineOwner = f.enrollment.ownerPublicKey;
+  const disguisedOwner = crypto.createPublicKey({
+    key: genuineOwner.export({ type: "spki", format: "der" }),
+    format: "der", type: "spki",
+  });
+  const foreignOwner = crypto.generateKeyPairSync("ed25519");
+  const foreignSpki = foreignOwner.publicKey.export({ type: "spki", format: "der" });
+  disguisedOwner.export = () => Buffer.from(foreignSpki);
+  await assert.rejects(verifyOwnerInventoryEnrollment({ ...f.enrollment,
+    ownerPublicKey: disguisedOwner,
+    independentOwnerSpkiSha256: crypto.createHash("sha256").update(foreignSpki).digest("hex"),
+  }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
+  "an owner signature is not proof of the independently pinned owner identity");
+});
+
 test("browser/WebCrypto imports offline owner checkpoint with independent pins; export roundtrip is portable", async () => {
   const f = await fixture();
   const wire = portable.exportPortableEnrollment({

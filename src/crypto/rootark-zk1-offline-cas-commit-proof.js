@@ -2,6 +2,7 @@
 // Independent cryptographic CAS authority statement. It verifies an
 // assertion from a separately pinned public key, NOT physical durability.
 const crypto = require("node:crypto");
+const { nativeEd25519Spki } = require("./rootark-zk1-native-ed25519-public-key");
 const SCHEMA = "rootark-zk1-offline-cas-commit-proof/v1";
 const DOMAIN = Buffer.from("Root.ark/zk-1/offline-cas-commit-proof/v1\0");
 const FIELDS = ["schema", "status", "account_id", "compartment_id", "keyring_id",
@@ -49,9 +50,10 @@ function verifySignedCasProof({
   nowSeconds,
 }) {
   exact(proof, [...FIELDS, "signature"]);
-  if (signerPublicKey?.type !== "public" || signerPublicKey.asymmetricKeyType !== "ed25519") denied();
-  const actual = crypto.createHash("sha256").update(signerPublicKey.export({
-    type: "spki", format: "der" })).digest();
+  let nativeSpki;
+  try { nativeSpki = nativeEd25519Spki(signerPublicKey); }
+  catch (_) { denied(); }
+  const actual = crypto.createHash("sha256").update(nativeSpki).digest();
   if (!crypto.timingSafeEqual(actual, b64(independentSignerSpkiSha256, 32))) denied();
   const unsigned = Object.fromEntries(FIELDS.map((name) => [name, proof[name]]));
   if (!crypto.verify(null, signingBytes(unsigned), signerPublicKey, b64(proof.signature, 64))) denied();

@@ -9,6 +9,7 @@ const v2 = require("./rootark-zk-recovery-manifest-v2");
 const auth = require("./rootark-zk-recovery-authorization");
 const history = require("./rootark-zk-recovery-history-v2");
 const commitment = require("./rootark-zk1-offline-commitment-receipt");
+const { nativeEd25519Spki } = require("./rootark-zk1-native-ed25519-public-key");
 const browserApproval = require("../../public/client/rootark-zk1-v2-device-approval");
 const sessions = new WeakMap();
 const staged = new WeakMap();
@@ -81,8 +82,7 @@ function currentMatches(head, pin) {
     || !match(b64(pin.digest, 32), head._digest)) deny();
 }
 function ownerPins(pub, externalSha256) {
-  if (pub?.type !== "public" || pub.asymmetricKeyType !== "ed25519"
-    || !match(crypto.createHash("sha256").update(pub.export({ type: "spki", format: "der" })).digest(),
+  if (!match(crypto.createHash("sha256").update(nativeEd25519Spki(pub)).digest(),
       b64(externalSha256, 32))) deny();
 }
 async function beginOwnerEnrollment({ request, verifiedHistory, externalCurrentHead,
