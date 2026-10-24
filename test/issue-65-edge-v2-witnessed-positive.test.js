@@ -374,6 +374,7 @@ test("REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores 
       "rootark-zk1-uncertain-put-reconciliation", "rootark-zk1-normal-browser-trust-floor",
       "rootark-zk1-normal-browser-content", "rootark-zk1-owner-inventory-trust-head",
       "rootark-zk1-portable-file-recovery", "rootark-zk1-browser-recovery-http",
+      "rootark-zk1-recoverable-pending-journal",
       "rootark-zk1-recoverable-workspace", "rootark-dev-vault-migration",
       "rootark-zk1-legacy-transition-receipt",
       "rootark-zk1-legacy-migration-workflow", "rootark-zk1-legacy-batch-migration",
@@ -381,6 +382,19 @@ test("REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores 
       "rootark-zk1-v2-committed-approval", "rootark-zk1-browser-authoritative-backup",
       "rootark-zk1-keyring-portable-archive", "rootark-zk1-browser-versioned-archive",
       "rootark-zk1-account-portable-recovery" ]]);
+  // The real workspace dynamically loads every dependency. A new fail-closed
+  // browser module must be reflected in this tight allowlist, otherwise the
+  // Edge owner PoP fixture silently 404s before its cryptographic contract.
+  const workspaceJs = fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-authenticated-workspace.js"), "utf8");
+  const dependencyList = workspaceJs.match(/const dependencyNames = \[([\s\S]*?)\];/);
+  assert.ok(dependencyList, "workspace dependency declaration must be inspectable");
+  const declared = [...dependencyList[1].matchAll(/"([^"\n]+)"/g)].map((entry) => entry[1]);
+  assert.ok(declared.length >= 25 && declared.every((name) =>
+    /^rootark-[a-z0-9-]+$/.test(name) && allowed.has(name)),
+  "all dynamically required scripts must be explicitly admitted by Edge's CSP fixture");
+  assert.equal(allowed.has("unexpected-user-controlled-script"), false,
+    "the fixture must never switch to an arbitrary static script server");
   app.get("/client/:name", (req, res) => {
     const name = req.params.name.replace(/\.js$/, "");
     if (!allowed.has(name) || req.params.name !== name + ".js") return res.sendStatus(404);
