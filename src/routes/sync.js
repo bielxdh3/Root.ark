@@ -8,6 +8,7 @@ const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-aut
 const { attestCiphertextOnlySyncState } = require("../services/deploymentResilience");
 const { createSyncBurstGuard } = require("../services/syncBurstGuard");
 const { DEFAULT_WINDOW, decryptSecret, normalizeOtp, verifyRecoveryCodeAsync, verifyTotp } = require("../services/totp");
+const { authorizationDigest } = require("../services/syncResumeAccountProof");
 
 const STORE_VERSION = 2;
 const MAX_HISTORY_PER_OBJECT = 32;
@@ -176,6 +177,7 @@ function resumeCodeMac(key, username, deviceId, pauseFence, code, intent) {
     .update("Root.ark/sync-resume-intent/v1\0")
     .update(JSON.stringify([username, deviceId, pauseFence, code,
       intent.version, intent.passwordHash, intent.sessionVersion, intent.secretDigest,
+      intent.authorizationDigest,
       intent.proof, intent.expectedReplayDigest]))
     .digest("hex");
 }
@@ -428,7 +430,7 @@ const RESUME_TRACKED_USERS_MAX = 10000;
 // Same public placeholder hash used by the auth route so unknown users cost one bcrypt compare too.
 const DUMMY_PASSWORD_HASH = "$2a$10$C8U56P8wZK.G7zWKmqF88e3f64PIxJ1xdTJN9WxiHcSVkYCfaSeDG";
 
-function registerSyncRoutes({ app, authenticate, requirePermission, storagePath = process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json", deviceAuthorization = null, requireDeviceAuthorization = false, deviceRegistryPath = process.env.SYNC_DEVICE_REGISTRY || "", burstGuard = null, auditLog = null, bcrypt = null, loadUsers = null, saveUsers = null, getTotpKey = null }) {
+function registerSyncRoutes({ app, authenticate, requirePermission, storagePath = process.env.SYNC_OBJECTS_FILE || "./data/sync-objects.json", deviceAuthorization = null, requireDeviceAuthorization = false, deviceRegistryPath = process.env.SYNC_DEVICE_REGISTRY || "", burstGuard = null, auditLog = null, bcrypt = null, loadUsers = null, saveUsers = null, commitSyncResumeProof = null, getTotpKey = null }) {
   const audit = (eventType, req, deviceId, action, result, details = {}) => {
     if (typeof auditLog !== "function") return;
     auditLog(eventType, { username: req.user?.username, role: req.user?.role }, { type: "sync_device", id: String(deviceId).slice(0, 200) }, action, result, details);
@@ -571,7 +573,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       let stagedResume = null;
       if (user.totpEnabled) {
         // Fail closed: 2FA is required but the key or the persistence helper is not available.
-        if (typeof getTotpKey !== "function" || typeof saveUsers !== "function") return errorResponse(res, 503, "Sync re-authentication unavailable");
+        if (typeof getTotpKey !== "function" || typeof commitSyncResumeProof !== "function") return errorResponse(res, 503, "Sync re-authentication unavailable");
         let key;
         try { key = getTotpKey(); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
         if (!Buffer.isBuffer(key) || key.length !== 32) return errorResponse(res, 503, "Sync re-authentication unavailable");
@@ -584,6 +586,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
         const pending = store.pendingResume(username);
         const pauseFence = store.pauseFence(username, deviceId);
         if (pending && (pending.deviceId !== deviceId || pending.pauseFence !== pauseFence
+          || pending.version !== 2
           || pending.passwordHash !== checkedHash || pending.sessionVersion !== checkedSessionVersion
           || typeof body.code !== "string" || body.code.length > 256
           || !equalMac(pending.codeMac, resumeCodeMac(key, username, deviceId, pauseFence, body.code, pending)))) {
@@ -602,24 +605,16 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
           return errorResponse(res, 401, "Re-authentication failed");
         }
         const secretDigest = crypto.createHash("sha256").update(JSON.stringify(freshUser.totpSecret)).digest("hex");
-        if (pending && secretDigest !== pending.secretDigest) return fail("second_factor_rotated");
+        if (pending && (secretDigest !== pending.secretDigest
+          || authorizationDigest(freshUser) !== pending.authorizationDigest)) return fail("second_factor_or_authority_rotated");
         if (pending) {
           stagedResume = pending;
-          // Account state may already contain the consumed code after an interrupted
-          // final sync write, or may still need the original proof applied.
-          if (secondFactorReplayDigest(freshUser) !== pending.expectedReplayDigest) {
-            const stagedProof = pending.proof?.type === "recovery"
-              ? { type: "recovery", hash: pending.proof.hash }
-              : { type: "totp", step: pending.proof?.step, secretRecord: JSON.stringify(freshUser.totpSecret) };
-            if (!commitSecondFactorProof(freshUser, stagedProof)
-              || secondFactorReplayDigest(freshUser) !== pending.expectedReplayDigest) return fail("pending_resume_replay_state_mismatch");
-            try { saveUsers(freshUsers); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
-          }
         } else {
           if (!commitSecondFactorProof(freshUser, proof)) return fail("second_factor_failed");
           stagedResume = {
-            version: 1, deviceId, pauseFence,
+            version: 2, deviceId, pauseFence,
             passwordHash: checkedHash, sessionVersion: checkedSessionVersion, secretDigest,
+            authorizationDigest: authorizationDigest(freshUser),
             proof: proof.type === "recovery" ? { type: "recovery", hash: proof.hash } : { type: "totp", step: proof.step },
             expectedReplayDigest: secondFactorReplayDigest(freshUser),
           };
@@ -632,8 +627,23 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
             return errorResponse(res, 503, store.commitIndeterminate ? "sync_commit_indeterminate" : "Sync re-authentication unavailable",
               store.commitIndeterminate ? { code: "SYNC_COMMIT_INDETERMINATE" } : {});
           }
-          try { saveUsers(freshUsers); } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
         }
+        // This is an atomic, selective account-store CAS. In SQLite the proof
+        // is applied inside BEGIN IMMEDIATE against the CURRENT user row.
+        // Never persist freshUsers: it was read before stageResume's await and
+        // can be obsolete after administrative revocation or password rotation.
+        let accountCommit;
+        try {
+          accountCommit = commitSyncResumeProof({
+            username, passwordHash: checkedHash, sessionVersion: checkedSessionVersion,
+            secretDigest: stagedResume.secretDigest,
+            authorizationDigest: stagedResume.authorizationDigest,
+            proof: stagedResume.proof,
+            expectedReplayDigest: stagedResume.expectedReplayDigest,
+          });
+          if (accountCommit && typeof accountCommit.then === "function") throw new Error("Async account CAS forbidden");
+        } catch { return errorResponse(res, 503, "Sync re-authentication unavailable"); }
+        if (accountCommit !== "committed" && accountCommit !== "already") return fail("account_state_changed");
       }
       // Staged intent fences the exact pause nonce. If final persistence fails,
       // it stays paused and the MAC-bound intent survives restart for retry.

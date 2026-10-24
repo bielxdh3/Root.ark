@@ -162,13 +162,20 @@ class Zk1WitnessCasAnchorFloor {
     statusKeyId, statusPublicKey, trustedMinimumHead,
     attestedAdmission = null } = {}) {
     if (trustedMinimumHead !== undefined) {
-      const floor = exact(trustedMinimumHead, ["sequence", "lastHash"]);
+      // Strict restart's independent high-water anchor must bind the physical
+      // witness chain, not merely its signed CAS sequence and last hash.
+      const strict = attestedAdmission !== null;
+      const floor = exact(trustedMinimumHead, ["sequence", "lastHash",
+        ...(strict ? ["physicalFenceDigest"] : [])]);
       if (!Number.isSafeInteger(floor.sequence) || floor.sequence < 0
         || floor.sequence > 100000 || !validHex(floor.lastHash)
-        || (floor.sequence === 0 && floor.lastHash !== ZERO)) fail();
+        || (floor.sequence === 0 && floor.lastHash !== ZERO)
+        || (strict && (!validHex(floor.physicalFenceDigest)
+          || (floor.sequence === 0 && floor.physicalFenceDigest !== digest(""))))) fail();
       // A caller-retained owner floor cannot be mutated after construction.
       this.#externalMinimum = Object.freeze({ sequence: floor.sequence,
-        lastHash: floor.lastHash });
+        lastHash: floor.lastHash,
+        ...(strict ? { physicalFenceDigest: floor.physicalFenceDigest } : {}) });
       if (bootstrapNew && floor.sequence !== 0) fail();
     }
     if (typeof filename !== "string" || !path.isAbsolute(filename)
@@ -315,6 +322,8 @@ class Zk1WitnessCasAnchorFloor {
         this.#physicalFenceChain = physicalChain;
         this.#physicalFenceDigest = physicalChain.copy().digest("hex");
       }
+      if (this.#attestedAdmission && this.#externalMinimum
+        && this.#externalMinimum.physicalFenceDigest !== this.#physicalFenceDigest) fail();
       this.#verifiedChain = verifiedChain;
       this.#verifiedChainDigest = verifiedChain.copy().digest("hex");
       this.#trustedFloor = Object.freeze({ sequence: state?.sequence || 0,

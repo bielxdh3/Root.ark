@@ -436,10 +436,24 @@ test("strict CAS witness floor refuses signed status advance without independent
     trustedMinimumHead: { sequence: 0, lastHash: "0".repeat(64) },
   }), /WITNESS_CAS_FLOOR_DENIED/,
   "a stale external minimum must not be accepted as an exact restart boundary");
-  const restarted = new Zk1WitnessCasAnchorFloor(path.join(directory, "witness-floor.sqlite"), {
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(path.join(directory, "witness-floor.sqlite"), {
     bootstrapNew: false, witnessKeyId, witnessPrivateKey: witness.privateKey,
     statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission,
     trustedMinimumHead: result,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "strict witness restart must reject a CAS-only external minimum lacking the physical digest");
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(path.join(directory, "witness-floor.sqlite"), {
+    bootstrapNew: false, witnessKeyId, witnessPrivateKey: witness.privateKey,
+    statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission,
+    trustedMinimumHead: { ...result, physicalFenceDigest: "f".repeat(64) },
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "strict witness restart must reject the correct signed CAS floor with a forked physical history");
+  const independentlyPinnedMinimum = { ...result,
+    physicalFenceDigest: strictVerifiedHead.physicalFenceDigest };
+  const restarted = new Zk1WitnessCasAnchorFloor(path.join(directory, "witness-floor.sqlite"), {
+    bootstrapNew: false, witnessKeyId, witnessPrivateKey: witness.privateKey,
+    statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission,
+    trustedMinimumHead: independentlyPinnedMinimum,
   });
   assert.deepEqual(restarted.head(), result,
     "restart validates strict operator identities and the independently pinned floor");
@@ -453,7 +467,7 @@ test("strict CAS witness floor refuses signed status advance without independent
   assert.throws(() => new Zk1WitnessCasAnchorFloor(operationTamperedPath, {
     bootstrapNew: false, witnessKeyId, witnessPrivateKey: witness.privateKey,
     statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission,
-    trustedMinimumHead: result,
+    trustedMinimumHead: independentlyPinnedMinimum,
   }), /WITNESS_CAS_FLOOR_DENIED/,
   "PG operation-id substitution after SQLite restart invalidates the witness signature");
   const replacement = new Zk1WitnessCasPhysicalAdmission({

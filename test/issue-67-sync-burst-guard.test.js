@@ -11,6 +11,7 @@ const test = require("node:test");
 
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { SyncObjectStore, registerSyncRoutes } = require("../src/routes/sync");
+const { applySyncResumeAccountProof } = require("../src/services/syncResumeAccountProof");
 const { DEFAULT_MAX_DESTRUCTIVE, DEFAULT_WINDOW_MS, createSyncBurstGuard } = require("../src/services/syncBurstGuard");
 
 // ---- unit tests of the metadata-only guard ----
@@ -140,8 +141,15 @@ async function startServer(t, { storagePath, burstGuard, auditEvents = [], bcryp
   const auditLog = (eventType, actor, target, action, result, details) => auditEvents.push({ eventType, actor, target, action, result, details });
   const loadUsers = () => JSON.parse(JSON.stringify(accountState.users));
   const saveUsers = (users) => { accountState.users = JSON.parse(JSON.stringify(users)); };
+  const commitSyncResumeProof = (claim) => {
+    const current = loadUsers();
+    const user = current.find((entry) => entry?.username === claim.username);
+    const outcome = applySyncResumeAccountProof(user, claim);
+    if (outcome === "committed") saveUsers(current);
+    return outcome;
+  };
   const getTotpKey = () => totpKey;
-  const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath, burstGuard, auditLog, bcrypt: bcryptImpl, loadUsers, saveUsers, getTotpKey });
+  const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath, burstGuard, auditLog, bcrypt: bcryptImpl, loadUsers, saveUsers, commitSyncResumeProof, getTotpKey });
   route.accountState = accountState;
   const server = await new Promise((resolve) => { const value = app.listen(0, "127.0.0.1", () => resolve(value)); });
   t.after(async () => { await new Promise((resolve) => server.close(resolve)); });
@@ -629,6 +637,61 @@ test("issue 65 resume: a forged on-disk pending replay proof cannot finish a pau
   assert.equal((await resumeRequest(restarted.port, { password: PASSWORD, code })).status, 401);
   assert.equal(restarted.route.store.isDevicePaused("alice", "device-a"), true,
     "forged grant cannot lift the durable paused-device fence");
+});
+
+test("issue 65 resume: administrative revocation while durable staging waits cannot be overwritten by stale account snapshot", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-revoked-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  const opened = await startServer(t, { storagePath: path.join(dir, "objects.json"), accountUsers: account.users });
+  const realStage = opened.route.store.stageResume.bind(opened.route.store);
+  let release;
+  const staged = new Promise((resolve) => { release = resolve; });
+  let stagedReady;
+  const staging = new Promise((resolve) => { stagedReady = resolve; });
+  opened.route.store.stageResume = async (username, intent) => {
+    await realStage(username, intent);
+    stagedReady();
+    await staged;
+  };
+  const code = account.recoveryCodes[0];
+  const resume = resumeRequest(opened.port, { password: PASSWORD, code });
+  await staging;
+  const revoked = opened.route.accountState.users[0];
+  revoked.disabled = true;
+  revoked.sessionVersion += 1;
+  const expectedVersion = revoked.sessionVersion;
+  release();
+  assert.equal((await resume).status, 401);
+  assert.equal(opened.route.accountState.users[0].disabled, true);
+  assert.equal(opened.route.accountState.users[0].sessionVersion, expectedVersion);
+  assert.equal(opened.route.accountState.users[0].totpRecoveryHashes.length, 2,
+    "admin revocation must not accidentally consume or resurrect a recovery factor");
+});
+
+test("issue 65 resume: permission-only admin revocation during staging denies reactivation", async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue65-resume-permission-"));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const account = twoFactorAccount();
+  account.users[0].role = "user";
+  account.users[0].permissions = { upload: true };
+  const opened = await startServer(t, { storagePath: path.join(dir, "objects.json"), accountUsers: account.users });
+  const originalStage = opened.route.store.stageResume.bind(opened.route.store);
+  let release, signal;
+  const wait = new Promise((resolve) => { release = resolve; });
+  const ready = new Promise((resolve) => { signal = resolve; });
+  opened.route.store.stageResume = async (username, intent) => {
+    await originalStage(username, intent);
+    signal();
+    await wait;
+  };
+  const response = resumeRequest(opened.port, { password: PASSWORD, code: account.recoveryCodes[0] });
+  await ready;
+  opened.route.accountState.users[0].permissions = { upload: false };
+  release();
+  assert.equal((await response).status, 401);
+  assert.deepEqual(opened.route.accountState.users[0].permissions, { upload: false });
+  assert.equal(opened.route.accountState.users[0].totpRecoveryHashes.length, 2);
 });
 
 test("issue 65 resume: a store becoming indeterminate during bcrypt fails before second-factor consumption", async (t) => {

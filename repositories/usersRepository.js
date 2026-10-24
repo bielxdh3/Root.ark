@@ -1,5 +1,6 @@
 const { getDb } = require("../db");
 const { jsonStringify, nowIso, runWrite, safeJsonParse } = require("./repositoryUtils");
+const { applySyncResumeAccountProof } = require("../src/services/syncResumeAccountProof");
 
 function loadUsers() {
   return getDb().prepare(`
@@ -84,4 +85,36 @@ function saveUsers(users = []) {
   });
 }
 
-module.exports = { loadUsers, saveUsers };
+function commitSyncResumeProof(claim) {
+  const db = getDb();
+  // BEGIN IMMEDIATE serializes the read/compare/selective update with
+  // concurrent SQLite writers, including other server processes. Never
+  // UPSERT a stale users array or soft-delete unrelated accounts.
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT username, password_hash, role, permissions_json,
+      session_version, disabled,
+      totp_enabled, totp_secret_json, totp_recovery_hashes_json, totp_last_used_step
+      FROM users WHERE username = ? AND deleted_at IS NULL`).get(claim.username);
+    if (!row) return "conflict";
+    const user = {
+      username: row.username,
+      password: row.password_hash,
+      role: row.role,
+      permissions: safeJsonParse(row.permissions_json, {}),
+      sessionVersion: row.session_version || 0,
+      disabled: Boolean(row.disabled),
+      totpEnabled: Boolean(row.totp_enabled),
+      totpSecret: safeJsonParse(row.totp_secret_json, null),
+      totpRecoveryHashes: safeJsonParse(row.totp_recovery_hashes_json, []),
+      totpLastUsedStep: row.totp_last_used_step,
+    };
+    const result = applySyncResumeAccountProof(user, claim);
+    if (result !== "committed") return result;
+    const update = db.prepare(`UPDATE users SET totp_recovery_hashes_json = ?,
+      totp_last_used_step = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`)
+      .run(jsonStringify(user.totpRecoveryHashes), user.totpLastUsedStep, nowIso(), claim.username);
+    return update.changes === 1 ? "committed" : "conflict";
+  }).immediate();
+}
+
+module.exports = { loadUsers, saveUsers, commitSyncResumeProof };

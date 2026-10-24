@@ -47,6 +47,7 @@ const {
 const dbConfig = require("./db");
 const { runMigrations } = require("./db/migrations");
 const usersRepository = require("./repositories/usersRepository");
+const { applySyncResumeAccountProof } = require("./src/services/syncResumeAccountProof");
 const foldersRepository = require("./repositories/foldersRepository");
 const pendingUploadsRepository = require("./repositories/pendingUploadsRepository");
 const publicLinksRepository = require("./repositories/publicLinksRepository");
@@ -663,6 +664,22 @@ function saveUsers(users) {
     }
   }
   trustedUserPasswordHashes = snapshotUserPasswordHashes(users);
+}
+
+function commitSyncResumeProof(claim) {
+  if (shouldUseDatabase()) {
+    // A simultaneous JSON mirror cannot share SQLite's atomic compare-and-
+    // update boundary. Refuse this 2FA mutation until there is one authority.
+    if (shouldWriteLegacyJson()) throw new Error("Sync resume requires a single authoritative account store");
+    return usersRepository.commitSyncResumeProof(claim);
+  }
+  // Legacy JSON is single-process only. Reload after all async work and write
+  // just once within this event-loop turn; cross-process JSON CAS is NOT proven.
+  const users = loadUsers();
+  const user = users.find((entry) => entry?.username === claim.username);
+  const result = applySyncResumeAccountProof(user, claim);
+  if (result === "committed") saveUsers(users);
+  return result;
 }
 
 function getBasePermissions() {
@@ -6188,6 +6205,7 @@ registerSyncRoutes({
   bcrypt,
   loadUsers,
   saveUsers,
+  commitSyncResumeProof,
   getTotpKey: () => getServerMasterKey({ createIfMissing: false }),
 });
 

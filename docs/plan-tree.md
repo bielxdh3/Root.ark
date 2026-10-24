@@ -1,5 +1,34 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: resumable 2FA CAS and physical witness startup minimum (2026-10-24)
+
+The remote draft branch was still at 6a5e71e when verified. In an
+isolated descendant of local 21d9047, e99500a introduced a durable,
+MAC-bound resume intent before consuming a second factor. Failed final
+sync persistence leaves the device paused and a same-code/same-device/
+same-pause restart-safe recovery grant; staging failure spends nothing.
+The reviewer found a concrete P1: awaiting staging before bulk saveUsers
+could overwrite a simultaneous administrative revocation. The follow-up
+removes bulk saves from this path: SQLite performs selective one-row
+compare-and-update inside BEGIN IMMEDIATE and rejects stale password,
+session version, disabled, key, or second-factor state. The JSON-only path
+is single-process only, and dual-store JSON mirroring is denied for this
+sensitive operation until an atomic protocol exists.
+
+Strict witness restart now pins and verifies the signed physical fence
+chain digest independently of the CAS last hash. Unpinned, mismatched,
+and whole-file-restored physical histories fail closed.
+
+RED-to-GREEN covered recovery failure/restart, code replay, forged resume
+intent, concurrent reactivation, admin revoke race, SQLite selective CAS,
+and strict physical witness minimum. The unchanged prior 21d9047
+Windows Node 24 complete suite reported 2476 PASS / 0 FAIL / 167 SKIP;
+those numbers are NOT evidence for these newer edits. No claim of
+PostgreSQL-to-SQLite atomicity or remote durability is made.
+Hosted CI, PostgreSQL 18 locally, Ubuntu native SQLite coverage,
+physical normative client inclusion, full affected suite and independent
+re-review still gate publication. PR stays DRAFT and NO-GO.
+
 ## Issue #65 / PR #228 native authority and signed-claim fixes — 2026-10-24
 
 The last *remote* draft PR HEAD observed for
