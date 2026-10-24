@@ -6,7 +6,8 @@ The last *remote* draft PR HEAD observed for
 `cdx/rootark-dual-recovery-20261019` remains
 `6a5e71ed33ae44d65f7c3a124632cb4d5c4ae4f3`. In the isolated worktree,
 local unpublished commits `b5792b2`, `e16f5b3`, `bf18851`, `ea9a8a2`,
-`3323737` and `62fff4f` are descendants, not published CI checkpoints.
+`3323737`, `62fff4f`, `e91053e` and `48f3da7` are descendants, not
+published CI checkpoints.
 They preserve the previously integrated owner V2 security fixes `356bf2f`
 and `d014005`.
 
@@ -21,6 +22,13 @@ SQLite connection if constructor validation fails. A separate signed-claims
 attack could present valid fields A during verification and fields B for the
 decision; immutable primitive snapshots now bind the offline CAS/witness
 decisions to the exact bytes verified.
+The later `48f3da7` reproduces and closes another authority-separation bypass:
+the V2 device would accept the existing CAS public key as an independently
+pinned historical signer-grant root if the caller overrode that key's
+`KeyObject.export()`. The native fingerprint now rejects this alias before
+creating the client SQLite journal; Windows Node 24 and Ubuntu Node 22 each
+validated 6 PASS / 0 FAIL, and actual V2 mTLS/owner-history regression passed
+2 / 0 on Windows.
 
 Focused validation: Windows Node 24 signed-claim and pin tests 34 PASS/0 FAIL;
 Ubuntu Node 22 corresponding tests 20 PASS/0 FAIL; real V2 mTLS, signer
@@ -30,7 +38,10 @@ plus regressions 3 PASS/0 FAIL. S3/Drive/WebDAV loopback remote GET/integrity
 and failover 14 PASS/0 FAIL on each Node 22/24. Syntax, runtime artifact and
 diff checks PASS. A broad Windows Node 24 suite returned **2620 total / 2453
 PASS / 0 FAIL / 167 SKIP**, but source files were edited during its run;
-this is *not* final-HEAD CI evidence. A fresh exact-HEAD suite is required.
+this is *not* final-HEAD CI evidence. A subsequent exact-code suite on
+`e91053e` completed **2626 total / 2459 PASS / 0 FAIL / 167 SKIP**. Since
+`48f3da7` then changed runtime behavior and added a regression test, a new
+full Windows Node 24 suite is required for the newest local HEAD.
 
 Hosted checks still refer **only** to the published `6a5e71e`: Ubuntu Node 22
 full, disposable PostgreSQL 18, Windows mandatory release gates, JavaScript
