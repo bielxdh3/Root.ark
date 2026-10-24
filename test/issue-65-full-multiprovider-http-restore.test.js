@@ -705,6 +705,13 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
       authorized: Boolean(session && request.headers.authorization === "Bearer ephemeral-test-session"),
       deviceId: grantFields.device_id, authorizationKeyId: deviceKeyId,
     }) });
+  assert.throws(() => createZk1MultiproviderRestoreGetHandler({ gateway,
+    pinnedOperationId: random(16),
+    restoreInput: { mode: "cloud-catalog", request: remoteRecovery },
+    authorizeHttpRequest: async () => ({ authorized: true,
+      deviceId: grantFields.device_id, authorizationKeyId: deviceKeyId }),
+  }), /ZK_MULTIPROVIDER_RESTORE_DENIED/,
+  "low-level route must pin the exact signed operation before serving requests");
   const app = http.createServer(handler);
   const appPort = await register(app);
   const url = `http://127.0.0.1:${appPort}/zk1-recovery/${b64(operation.operation_id)}`;
@@ -727,6 +734,23 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
     deviceId: "foreign-device", authorizationKeyId: deviceKeyId }), false);
   assert.equal(gateway.checkRequesterDeviceIdentity({ authorized: true,
     deviceId: grantFields.device_id, authorizationKeyId: deviceKeyId }), true);
+  // Unlike the Express protected-object route, this lower-level, opt-in GET
+  // gateway has its own final response egress boundary. A device may be
+  // revoked AFTER the remote provider quorum has returned identical bytes,
+  // while the HTTP identity callback is still in flight. Its response must
+  // never emit ciphertext using only the earlier owner-state proof.
+  freshAttack = "revoke-on-final-egress";
+  finalEgressStatusReads = 0;
+  const readsBeforeRevokedEgress = { ...hits };
+  const revokedAtGatewayEgress = await sendGet();
+  assert.equal(revokedAtGatewayEgress.status, 403,
+    "low-level recovery GET must revalidate owner/device after provider quorum");
+  assert.equal((await revokedAtGatewayEgress.text()).includes("ciphertextBase64"), false);
+  assert.equal(finalEgressStatusReads, 4,
+    "low-level gateway must make the final, independently signed owner-state check");
+  assert.ok(hits.s3 > readsBeforeRevokedEgress.s3,
+    "revocation adversary must activate only after genuine remote GET");
+  freshAttack = null;
   for (const attack of ["replay", "wrong-nonce", "expired", "forged"]) {
     const before = { ...hits };
     freshAttack = attack;

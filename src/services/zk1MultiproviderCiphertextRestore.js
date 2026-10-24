@@ -453,7 +453,15 @@ function createZk1MultiproviderRestoreGetHandler({ gateway, pinnedOperationId,
   restoreInput, authorizeHttpRequest } = {}) {
   if (!(gateway instanceof Zk1MultiproviderCiphertextRestore)
     || typeof authorizeHttpRequest !== "function") deny();
-  const id = copied(pinnedOperationId, 16).toString("base64url");
+  const pinnedId = copied(pinnedOperationId, 16);
+  const id = pinnedId.toString("base64url");
+  // The route is bound to one immutable operation before handling requests.
+  // Never use a mutable or dynamically supplied operation at the final
+  // authorization boundary, even if the ciphertext itself has a valid digest.
+  const mapped = restoreInput?.mode === "cloud-catalog"
+    ? restoreInput.request?.operation : restoreInput?.operation;
+  const fixedOperation = cloneOperation(mapped);
+  if (!same(fixedOperation.operation_id, pinnedId)) deny();
   return async (request, response) => {
     try {
       if (request.method !== "GET" || request.url !== `/zk1-recovery/${id}`
@@ -461,7 +469,8 @@ function createZk1MultiproviderRestoreGetHandler({ gateway, pinnedOperationId,
       const restored = restoreInput?.mode === "cloud-catalog"
         ? await gateway.restoreFromCloudCatalog(restoreInput.request)
         : await gateway.restoreExact(restoreInput);
-      if (!same(restored.operationId, Buffer.from(id, "base64url"))
+      if (!same(restored.operationId, pinnedId)
+        || !same(restored.ciphertextSha256, fixedOperation.ciphertext_sha256)
         || gateway.checkRequesterDeviceIdentity(await authorizeHttpRequest(request)) !== true) deny();
       const body = Buffer.from(JSON.stringify({
         format: "rootark-zk1-cloud-recovery-response/v1",
@@ -477,6 +486,14 @@ function createZk1MultiproviderRestoreGetHandler({ gateway, pinnedOperationId,
         signedCatalogRecoveredFromRemote: restored.signedCatalogRecoveredFromRemote === true,
         remoteDurabilityProven: false, authorizesProductionRestore: false,
       }), "utf8");
+      // There is an await between the restore's final owner check and the
+      // second HTTP identity check above. Re-evaluate independently signed,
+      // nonce-fresh owner/device state AFTER that await and body construction,
+      // immediately before releasing even opaque ciphertext to this socket.
+      // This is a rejection fence, not an atomic witness/cloud transaction.
+      const egress = await gateway.recheckBeforeEgress(fixedOperation);
+      if (!Number.isSafeInteger(egress.expiresAtSeconds)
+        || Math.floor(Date.now() / 1000) >= egress.expiresAtSeconds) deny();
       response.writeHead(200, { "content-type": "application/json; charset=utf-8",
         "content-length": body.length, "cache-control": "no-store" });
       response.end(body);
