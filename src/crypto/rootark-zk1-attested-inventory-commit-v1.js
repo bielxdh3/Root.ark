@@ -12,6 +12,8 @@ const { verifyCommittedPhysicalReadback } =
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/attested-inventory-commit/v1\0");
 const CHAIN_NONCE_DOMAIN = Buffer.from("Root.ark/zk-1/physical-chain-nonce/v1\0");
+const CHAIN_PAGE_NONCE_DOMAIN = Buffer.from("Root.ark/zk-1/physical-chain-page-nonce/v1\0");
+const MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS = 4;
 
 function deny() {
   const error = new Error("ZK_ATTESTED_INVENTORY_COMMIT_DENIED");
@@ -37,6 +39,14 @@ function publicKey(value) {
     || value.asymmetricKeyType !== "ed25519") deny();
 }
 function sha(bytes) { return crypto.createHash("sha256").update(bytes).digest(); }
+function derivePhysicalChainPageNonce(chainNonce, afterSequence) {
+  const nonce = rawBytes(chainNonce, 32, 32);
+  if (!Number.isSafeInteger(afterSequence) || afterSequence < 0
+    || afterSequence > inventory.MAX_ENTRIES) deny();
+  const seq = Buffer.alloc(8);
+  seq.writeBigUInt64BE(BigInt(afterSequence));
+  return sha(Buffer.concat([CHAIN_PAGE_NONCE_DOMAIN, nonce, seq]));
+}
 function derivePhysicalChainNonce(pageNonce, sequence, operationId) {
   const nonce = rawBytes(pageNonce, 32, 32);
   const id = rawBytes(operationId, 16, 16);
@@ -114,4 +124,5 @@ async function verifyAttestedInventoryCommit(input) {
   } catch (_) { deny(); }
 }
 
-module.exports = { verifyAttestedInventoryCommit, derivePhysicalChainNonce, DOMAIN };
+module.exports = { verifyAttestedInventoryCommit, derivePhysicalChainNonce,
+  derivePhysicalChainPageNonce, MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS, DOMAIN };

@@ -7,7 +7,8 @@
 // proof alone is external persistence or authorization for content I/O.
 const crypto = require("node:crypto");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
-const { verifyAttestedInventoryCommit } =
+const { verifyAttestedInventoryCommit, derivePhysicalChainNonce,
+  derivePhysicalChainPageNonce, MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS } =
   require("../crypto/rootark-zk1-attested-inventory-commit-v1");
 
 const OWNER_DOMAIN = Buffer.from("Root.ark/zk-1/cas-witness-physical-owner-binding/v1\0");
@@ -201,6 +202,33 @@ class Zk1WitnessCasPhysicalAdmission {
       const snapshot = Buffer.from(continuation.serializedSnapshot);
       const chain = inventory.normalizeCommittedProofChain(
         continuation.authenticatedProofChain);
+      if (!Array.isArray(continuation.authenticatedPhysicalProofChain)
+        || continuation.authenticatedPhysicalProofChain.length !== chain.length) deny();
+      // Recheck the *actual* attestor signatures under this witness's own
+      // challenge. A transport-controlled `independentPhysicalChainVerified`
+      // flag is not evidence and a target-only readback cannot bless ancestors.
+      for (let i = 0; i < chain.length; i += 1) {
+        const operationInChain = await inventory.readVerifiedCommittedOperation({
+          serialized: chain[i], pinnedPublicKey: this.#inventory,
+          pinnedSignerKeyId: this.#signerId, expectedScope: scope,
+        });
+        const sequence = minimumHead.sequence + i + 1;
+        if (operationInChain.expected_sequence + 1 !== sequence) deny();
+        const pageStart = minimumHead.sequence
+          + Math.floor(i / MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS)
+            * MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS;
+        const pageNonce = derivePhysicalChainPageNonce(chainNonce, pageStart);
+        const entryNonce = derivePhysicalChainNonce(pageNonce, sequence,
+          operationInChain.operation_id);
+        await verifyAttestedInventoryCommit({ receipt: chain[i],
+          physicalAttestation: continuation.authenticatedPhysicalProofChain[i],
+          scope, operation: operationInChain, nonce: entryNonce,
+          pinnedInventoryPublicKey: this.#inventory,
+          pinnedInventorySignerKeyId: this.#signerId,
+          pinnedPhysicalAttestorPublicKey: this.#physical,
+          nowSeconds: Math.floor(Date.now() / 1000),
+        });
+      }
       const checked = await inventory.verifySnapshot({
         serialized: snapshot, pinnedPublicKey: this.#inventory,
         pinnedSignerKeyId: this.#signerId,

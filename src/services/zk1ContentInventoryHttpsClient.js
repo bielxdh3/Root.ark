@@ -8,7 +8,8 @@ const tls = require("node:tls");
 const net = require("node:net");
 const crypto = require("node:crypto");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
-const { verifyAttestedInventoryCommit, derivePhysicalChainNonce } =
+const { verifyAttestedInventoryCommit, derivePhysicalChainNonce,
+  derivePhysicalChainPageNonce, MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS } =
   require("../crypto/rootark-zk1-attested-inventory-commit-v1");
 
 const FINGERPRINT = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
@@ -20,7 +21,6 @@ const MAX_SNAPSHOT_RESPONSE_BYTES = MAX_SNAPSHOT_BASE64_BYTES + 16 * 1024;
 const MAX_SMALL_RESPONSE_BYTES = 16 * 1024;
 const MAX_CHAIN_RESPONSE_BYTES = 128 * 1024;
 const MAX_CHAIN_PAGE_RECEIPTS = 16;
-const MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS = 4;
 const MAX_AUTO_CHAIN_RECEIPTS = 64;
 const SCOPE_FIELDS = Object.freeze(["account_id", "compartment_id", "keyring_id"]);
 const OPERATION_FIELDS = Object.freeze([
@@ -302,14 +302,17 @@ function createZk1ContentInventoryHttpsClient({
 
   const client = Object.freeze({
     getProofPage(input) {
-      const raw = exact(input, ["scope", "afterSequence", "limit"]);
+      const raw = exact(input, ["scope", "afterSequence", "limit"], ["pageNonce"]);
       const scope = inventory.normalizeScope(raw.scope);
       if (!Number.isSafeInteger(raw.afterSequence) || raw.afterSequence < 0
         || raw.afterSequence > inventory.MAX_ENTRIES
         || !Number.isSafeInteger(raw.limit) || raw.limit < 1
         || raw.limit > (physicalAttestorPublicKey
           ? MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS : MAX_CHAIN_PAGE_RECEIPTS)) fail();
-      const pageNonce = physicalAttestorPublicKey ? crypto.randomBytes(32) : null;
+      if (!physicalAttestorPublicKey && raw.pageNonce !== undefined) fail();
+      const pageNonce = physicalAttestorPublicKey
+        ? (raw.pageNonce === undefined ? crypto.randomBytes(32)
+          : copyBytes(raw.pageNonce, 32)) : null;
       return call("/v1/inventory/chain", {
         scope: Object.fromEntries(Object.entries(scope).map(([field, value]) =>
           [field, value.toString("base64url")])),
@@ -389,7 +392,10 @@ function createZk1ContentInventoryHttpsClient({
         const limit = Math.min(physicalAttestorPublicKey
           ? MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS : MAX_CHAIN_PAGE_RECEIPTS,
           MAX_AUTO_CHAIN_RECEIPTS - committedProofChain.length);
-        const page = await client.getProofPage({ scope, afterSequence: cursor, limit });
+        const page = await client.getProofPage({ scope, afterSequence: cursor, limit,
+          ...(physicalAttestorPublicKey ? {
+            pageNonce: derivePhysicalChainPageNonce(nonce, cursor),
+          } : {}) });
         if (page.status === "pending") {
           return { status: "pending", reason: "UNRESOLVED_INTENT", authorizesIo: false };
         }

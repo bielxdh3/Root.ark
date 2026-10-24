@@ -11,6 +11,8 @@ const Database = require("better-sqlite3");
 const z = require("../src/crypto/rootark-zk-1");
 const contentInventory = require("../src/crypto/rootark-zk-content-inventory-v1");
 const { signCommittedPhysicalReadback } = require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
+const { derivePhysicalChainPageNonce, derivePhysicalChainNonce } =
+  require("../src/crypto/rootark-zk1-attested-inventory-commit-v1");
 const { Zk1WitnessCasAnchorFloor, verifyFreshWitnessCasFloor } =
   require("../src/services/zk1WitnessCasAnchorFloor");
 const { Zk1CasTerminalAnchor } = require("../src/services/zk1CasTerminalAnchor");
@@ -85,6 +87,23 @@ test("strict CAS witness floor refuses signed status advance without independent
   let forgeAttestor = false;
   let forkSnapshot = null;
   let forkProofs = null;
+  let chainPhysicalPresent = false;
+  const chainPhysicalProof = async (challenge) => {
+    const pageNonce = derivePhysicalChainPageNonce(challenge, 0);
+    const nonce = derivePhysicalChainNonce(pageNonce, 1, op.operation_id);
+    return signCommittedPhysicalReadback({ scope, operation: op, nonce,
+      issuedAt: Math.floor(Date.now() / 1000),
+      readback: { status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
+        walFlushConfirmed: true, authorizesIo: false,
+        provesIndependentOperator: false, generation: 1,
+        admissionId: random(16), operationId: op.operation_id,
+        revision: op.revision, epoch: op.epoch,
+        expectedInventorySequence: op.expected_sequence,
+        expectedInventoryRoot: op.expected_root,
+        ciphertextSha256: op.ciphertext_sha256,
+        digest: random(32), root: random(32), chunkCount: 1 },
+    }, attestor.privateKey);
+  };
   const admission = new Zk1WitnessCasPhysicalAdmission({
     pinnedOwnerPublicKey: owner.publicKey,
     pinnedInventoryPublicKey: inventory.publicKey,
@@ -114,7 +133,10 @@ test("strict CAS witness floor refuses signed status advance without independent
         assert.deepEqual(argScope, scope);
         return { serializedSnapshot: Buffer.from(await (
           forkSnapshot ? forkSnapshot(nonce) : buildCurrentSnapshot(nonce))),
-          authenticatedProofChain: forkProofs || [receipt], authorizesIo: false };
+          authenticatedProofChain: forkProofs || [receipt], authorizesIo: false,
+          ...(chainPhysicalPresent ? {
+            authenticatedPhysicalProofChain: [await chainPhysicalProof(nonce)],
+          } : {}) };
       },
     },
   });
@@ -150,6 +172,10 @@ test("strict CAS witness floor refuses signed status advance without independent
     /WITNESS_CAS_FLOOR_DENIED/, "the CAS status signer cannot impersonate the physical signer");
   forgeAttestor = false;
   assert.equal(floor.head().sequence, 0, "failed evidence must not advance independent floor");
+  await assert.rejects(floor.advanceAttested({ records: [record], evidence: [evidence] }),
+    /WITNESS_CAS_FLOOR_DENIED/,
+    "a target readback does not substitute for physical evidence on the signed chain");
+  chainPhysicalPresent = true;
   const result = await floor.advanceAttested({ records: [record], evidence: [evidence] });
   assert.equal(result.sequence, 1);
   const durableFenceDb = new Database(path.join(directory, "witness-floor.sqlite"),
@@ -214,8 +240,10 @@ test("strict CAS witness floor refuses signed status advance without independent
     pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
     requirePhysicalAdmission: true,
   }), /WITNESS_CAS_FLOOR_DENIED/, "a replayed strict signed head fails a new challenge");
-  assert.equal(physicalCalls, 2);
-  assert.equal(inventoryCalls, 1);
+  assert.equal(physicalCalls, 3,
+    "forged target, missing-chain attempt, and successful target each require a fresh readback");
+  assert.equal(inventoryCalls, 2,
+    "the missing-chain attempt and accepted attempt each require a fresh signed snapshot");
   assert.deepEqual(await floor.advanceAttested({ records: [record], evidence: [evidence] }),
     result, "exact retries are idempotent but must re-attest");
   // A compromised writer and separately valid inventory signer can make B1,
@@ -395,6 +423,7 @@ test("strict CAS witness floor refuses signed status advance without independent
     inventoryClient: { getVerifiedSnapshotWithChain: async ({ nonce }) => ({
       serializedSnapshot: Buffer.from(await buildCurrentSnapshot(nonce)),
       authenticatedProofChain: [receipt],
+      authenticatedPhysicalProofChain: [await chainPhysicalProof(nonce)],
     }) },
   });
   const remoteFloor = new Zk1WitnessCasAnchorFloor(
