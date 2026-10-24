@@ -25,6 +25,8 @@ const { inspectVerifiedWitnessFreshHeadV1 } =
   require("../crypto/rootark-zk-witness-head-wire-v1");
 const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } =
   require("./zk1PrivateSqlitePath");
+const { nativeEd25519Spki } =
+  require("../crypto/rootark-zk1-native-ed25519-public-key");
 const { assertSafeSqliteSidecars, requireCheckpointV2Triggers,
   withReadonlySqliteSnapshot } =
   require("./zk1OpaqueCheckpointV2SqliteGuard");
@@ -172,7 +174,7 @@ function key(value, role = "public") {
   return value;
 }
 function fp(value) {
-  return hash(key(value).export({ format: "der", type: "spki" }));
+  return hash(nativeEd25519Spki(key(value)));
 }
 function scopeOf(value) {
   exact(value, SCOPE);
@@ -398,8 +400,8 @@ async function inspectIntent(raw, opts, { freshOwner = true, historicalOwner = f
     // A cached SQLite key can only corroborate that independent identity;
     // offline historical issuers need no cache and must not trust a supplied key.
     if (historicalOwner && opts.cachedSigner !== undefined
-      && !same(signer.export({ type: "spki", format: "der" }),
-        key(opts.cachedSigner).export({ type: "spki", format: "der" }))) fail();
+      && !crypto.KeyObject.prototype.equals.call(signer,
+        key(opts.cachedSigner))) fail();
     ownerApprovalSigner = trusted.ownerApprovalSigner;
   } else signer = key(opts.cachedSigner); // caller may only use for exact immutable reread
   const verified = await archiveV2.verifyAuthenticatedOpaqueCatalogArchiveV2({
@@ -417,8 +419,9 @@ async function inspectIntent(raw, opts, { freshOwner = true, historicalOwner = f
   });
   return { body, raw: Buffer.from(raw), intentHash: hash(INTENT_DOMAIN, raw),
     operationId: bytes(body.operation_id, 32), checkpointDigest, finalDigest,
-    verified, signerSpki: signer.export({ type: "spki", format: "der" }),
-    ownerApprovalSignerSpki: ownerApprovalSigner?.export({ type: "spki", format: "der" }) };
+    verified, signerSpki: nativeEd25519Spki(signer),
+    ownerApprovalSignerSpki: ownerApprovalSigner
+      ? nativeEd25519Spki(ownerApprovalSigner) : undefined };
 }
 
 class OpaqueCheckpointV2Authority {

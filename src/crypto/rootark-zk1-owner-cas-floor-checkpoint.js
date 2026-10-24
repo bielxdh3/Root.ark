@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { nativeEd25519Spki } = require("./rootark-zk1-native-ed25519-public-key");
 
 // Shared byte contract for the offline owner and the standalone witness.
 // Keep the property order stable: JSON.stringify is the signed wire encoding.
@@ -29,7 +30,7 @@ function checkpointDigest(value, signature) {
 }
 
 function spkiFingerprint(publicKey) {
-  return crypto.createHash("sha256").update(publicKey.export({ type: "spki", format: "der" })).digest();
+  return crypto.createHash("sha256").update(nativeEd25519Spki(publicKey)).digest();
 }
 
 module.exports = { statement, signingBytes, checkpointDigest, spkiFingerprint };
