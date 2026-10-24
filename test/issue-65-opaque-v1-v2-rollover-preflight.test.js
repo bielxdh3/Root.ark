@@ -289,26 +289,46 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
   const fullCheckpoint = Buffer.from(options.archiveCheckpointBytes);
   const fullDigest = digest(Buffer.from("Root.ark/zk-1/opaque-catalog-checkpoint-digest/v2\0"),
     fullCheckpoint, options.archiveCheckpointSignature);
-  async function withAuthorities(baseCheckpoint, action) {
+  async function withAuthorities(baseCheckpoint, action, enforceAuthorityProof = false) {
     const trust = { genesisDigest: crypto.randomBytes(32),
       pinnedWitness: { publicKey: pair().publicKey, keyId: crypto.randomBytes(16) },
       minimumHead: { revision: 8, digest: options.ownerHead.digest, epoch: 4 },
       freshWitnessHead: async () => { throw new Error("NO_OWNER_WRITE_PROOF"); } };
+    let liveOwnerDigest = options.ownerHead.digest;
+    let liveOwnerRevision = 8;
+    if (enforceAuthorityProof) {
+      const witness = pair(), keyId = crypto.randomBytes(16);
+      trust.pinnedWitness = { publicKey: witness.publicKey, keyId };
+      trust.minimumHead = { revision: 8, witnessSequence: 8,
+        digest: options.ownerHead.digest };
+      trust.freshWitnessHead = async ({ scope, nonce }) => signed(Buffer.from(
+        "Root.ark/zk-1/recovery-witness-head/v1\0"), {
+        type: "rootark-recovery-witness-head/v1", witness_key_id: keyId, ...scope,
+        current_revision: liveOwnerRevision, current_manifest_digest: liveOwnerDigest,
+        witness_sequence: liveOwnerRevision, nonce, observed_at: Math.floor(Date.now() / 1000),
+        status: "committed", pending_reservation_id: null }, witness.privateKey);
+    }
+    const authorityProof = enforceAuthorityProof ? {
+      requireFullV1ArchiveRollover: true,
+      fullV1ArchiveRollover: { ...options, v1CasClient, v1FloorClient },
+    } : {};
+    const casDb = path.join(folder, `cas-${crypto.randomBytes(5).toString('hex')}.sqlite`);
+    const floorDb = path.join(folder, `floor-${crypto.randomBytes(5).toString('hex')}.sqlite`);
     const cas = new OpaqueCheckpointV2Authority(path.join(folder,
-      `cas-${crypto.randomBytes(5).toString("hex")}.sqlite`), {
+      path.basename(casDb)), {
       role: "CAS", bootstrapNew: true, scope: options.scope,
       signingPrivateKey: v2Cas.privateKey, casSignerPublicKey: v2Cas.publicKey,
       floorSignerPublicKey: v2Floor.publicKey, checkpointPublicKey: options.checkpointKey,
       ownerPublicKey: options.ownerKey, ownerTrust: trust,
       baseDigest: options.stateDigest,
-      baseCheckpoint });
+      baseCheckpoint, ...authorityProof });
     const floor = new OpaqueCheckpointV2Authority(path.join(folder,
-      `floor-${crypto.randomBytes(5).toString("hex")}.sqlite`), {
+      path.basename(floorDb)), {
       role: "FLOOR", bootstrapNew: true, scope: options.scope,
       signingPrivateKey: v2Floor.privateKey, casSignerPublicKey: v2Cas.publicKey,
       floorSignerPublicKey: v2Floor.publicKey, checkpointPublicKey: options.checkpointKey,
       ownerPublicKey: options.ownerKey, ownerTrust: trust,
-      baseDigest: options.stateDigest, baseCheckpoint });
+      baseDigest: options.stateDigest, baseCheckpoint, ...authorityProof });
     const servers = [
       createOpaqueCheckpointV2HttpsServer({ ledger: cas, tlsKey: file("cas.key"),
         tlsCert: file("cas.pem"), clientCa: file("ca.pem"),
@@ -328,7 +348,11 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
         casPublicKey: v2Cas.publicKey, floorPublicKey: v2Floor.publicKey,
         scope: options.scope,
       }));
-      await action(...clients, trust);
+      await action(...clients, trust, { cas, floor, authorityProof,
+        casDb, floorDb, setLiveOwnerDigest: (digest) => {
+          liveOwnerDigest = digest;
+          liveOwnerRevision = digest.equals(options.ownerHead.digest) ? 8 : 9;
+        } });
     } finally {
       for (const server of servers) {
         if (server.listening) { server.closeAllConnections(); server.close(); }
@@ -403,6 +427,96 @@ test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and 
       bootstrapNew: false }), /ZK_CHECKPOINT_V2_CLIENT_UNAVAILABLE/,
     "a strict journal cannot restart with its 128-head guard removed");
   });
+  await withAuthorities(fullDigest, async (casClient, floorClient, _trust, context) => {
+    const nonce = crypto.randomBytes(32), raw = Buffer.from([0xa0]);
+    await assert.rejects(context.floor.prepare(raw, nonce),
+      /ZK_CHECKPOINT_V2/,
+      'legacy direct FLOOR still authenticates every submitted V2 intent');
+    await assert.rejects(context.cas.commit(raw, Buffer.alloc(64), nonce),
+      /ZK_CHECKPOINT_V2/,
+      'legacy direct CAS still authenticates every submitted V2 intent');
+    await assert.rejects(context.floor.finalize(Buffer.alloc(64), nonce),
+      /ZK_CHECKPOINT_V2/,
+      'legacy FLOOR cannot finalize nonexistent pending intent');
+    await assert.rejects(context.cas.attestFinalized(Buffer.alloc(64), nonce),
+      /ZK_CHECKPOINT_V2/,
+      'legacy CAS cannot attest nonexistent pending intent');
+    await assert.rejects(floorClient.prepare(raw), /ZK_CHECKPOINT_V2/,
+      'real mTLS direct request rejects the unguarded rollover');
+    assert.equal((await casClient.head()).state, 'V1_BASELINE');
+    assert.equal((await floorClient.head()).state, 'V1_BASELINE');
+  });
+  // Strict admission is now independently enforced by BOTH mTLS servers,
+  // not just by the coordinator used by a well-behaved browser.
+  await withAuthorities(fullDigest, async (casClient, floorClient, trust, context) => {
+    const { cas, floor, authorityProof } = context;
+    const badIntent = Buffer.from([0xa0]), nonce = crypto.randomBytes(32);
+    const ownerProof = authorityProof.fullV1ArchiveRollover;
+    const originalSignature = ownerProof.ownerSignature;
+    ownerProof.ownerSignature = crypto.randomBytes(64);
+    await assert.rejects(floor.prepare(badIntent, nonce),
+      { code: 'ZK_V1_V2_ROLLOVER_PREFLIGHT_DENIED' },
+      'direct FLOOR mutation fails on forged owner rollover');
+    await assert.rejects(cas.commit(badIntent, Buffer.alloc(64), nonce),
+      { code: 'ZK_V1_V2_ROLLOVER_PREFLIGHT_DENIED' },
+      'direct CAS mutation fails on forged owner rollover');
+    await assert.rejects(floorClient.prepare(badIntent),
+      /ZK_CHECKPOINT_V2/, 'mTLS direct ingress fails closed');
+    assert.equal((await floorClient.head()).state, 'V1_BASELINE');
+    assert.equal((await casClient.head()).state, 'V1_BASELINE');
+    ownerProof.ownerSignature = originalSignature;
+    const old = ownerProof.handoff;
+    ownerProof.handoff = { ...old, expires_at: Math.floor(Date.now() / 1000) - 1 };
+    await assert.rejects(floor.prepare(badIntent, nonce),
+      { code: 'ZK_V1_V2_ROLLOVER_PREFLIGHT_DENIED' },
+      'expired signed owner handoff cannot authorize new writes');
+    const now = Math.floor(Date.now() / 1000);
+    const renewedHandoff = { ...old, nonce: b64(crypto.randomBytes(32)),
+      issued_at: now, expires_at: now + 180 };
+    const renewedSignature = crypto.sign(null, Buffer.concat([OWNER_DOMAIN,
+      Buffer.from(JSON.stringify(renewedHandoff))]), owner.privateKey);
+    const renewal = await floor.renewFullV1ArchiveOwnerHandoff({
+      handoff: renewedHandoff, ownerSignature: renewedSignature,
+      ownerHead: options.ownerHead });
+    assert.equal(renewal.renewed, true);
+    assert.equal(renewal.v2WriteAuthorized, false);
+    await assert.rejects(floor.prepare(badIntent, nonce),
+      (error) => error.code !== 'ZK_V1_V2_ROLLOVER_PREFLIGHT_DENIED',
+      'renewal reaches genuine signed V2 intent verification instead of preflight denial');
+    context.setLiveOwnerDigest(crypto.randomBytes(32));
+    await assert.rejects(floor.prepare(badIntent, nonce),
+      { code: 'ZK_CHECKPOINT_V2_OWNER_ROLLOVER_STALE' },
+      'new independently signed owner head fences a previously valid grant');
+    context.setLiveOwnerDigest(options.ownerHead.digest);
+    await assert.rejects(floor.renewFullV1ArchiveOwnerHandoff({
+      handoff: { ...renewedHandoff, next_epoch: 3 },
+      ownerSignature: renewedSignature, ownerHead: options.ownerHead }),
+      { code: 'ZK_V1_V2_ROLLOVER_PREFLIGHT_DENIED' });
+    // Failed renewal must leave the last independently verified handoff active.
+    await assert.rejects(floor.prepare(badIntent, nonce),
+      (error) => error.code !== 'ZK_V1_V2_ROLLOVER_PREFLIGHT_DENIED');
+    // Signed 128-root obligation is immutable across a SQLite WAL/FULL restart.
+    const floorArgs = { role: 'FLOOR', bootstrapNew: false,
+      scope: options.scope, signingPrivateKey: v2Floor.privateKey,
+      casSignerPublicKey: v2Cas.publicKey, floorSignerPublicKey: v2Floor.publicKey,
+      checkpointPublicKey: options.checkpointKey, ownerPublicKey: options.ownerKey,
+      ownerTrust: trust, baseDigest: options.stateDigest, baseCheckpoint: fullDigest };
+    assert.throws(() => new OpaqueCheckpointV2Authority(context.floorDb, floorArgs),
+      /ZK_CHECKPOINT_V2_/,
+      'removing strict mode must fail before writable SQLite open');
+    floor.close();
+    const restartedProof = { ...options, v1CasClient, v1FloorClient,
+      handoff: renewedHandoff, ownerSignature: renewedSignature };
+    const restarted = new OpaqueCheckpointV2Authority(context.floorDb, {
+      ...floorArgs, requireFullV1ArchiveRollover: true,
+      fullV1ArchiveRollover: restartedProof });
+    try {
+      assert.equal((await restarted.head(nonce)).state, 'V1_BASELINE');
+      await assert.rejects(restarted.prepare(badIntent, nonce),
+        (error) => error.code !== 'ZK_V1_V2_ROLLOVER_PREFLIGHT_DENIED');
+      assert.equal((await restarted.head(nonce)).sequence, 128);
+    } finally { restarted.close(); }
+  }, true);
   const lastHead = options.records128[127];
   const header128 = await z.decodeDeterministic(lastHead.header);
   const oneHeadOnly = await createAuthenticatedOpaqueCatalogArchiveV2({

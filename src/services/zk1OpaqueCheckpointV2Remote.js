@@ -127,6 +127,17 @@ const AUTHORITY_TRIGGERS = [
   ["no_transition_replace", "transitions"],
   ["no_transition_downgrade", "transitions"],
 ];
+// Additive guard for strict, owner-approved FULL 128-head rollovers. Its
+// immutable local pin survives process restart; an expired owner handoff can
+// be renewed but a strict authority cannot be reopened in legacy write mode.
+const STRICT_ROLLOVER_SCHEMA = `CREATE TABLE strict_rollover (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    archive_root BLOB NOT NULL CHECK(length(archive_root)=32),
+    archive_checkpoint BLOB NOT NULL CHECK(length(archive_checkpoint)=32));
+  CREATE TRIGGER strict_rollover_immutable_update BEFORE UPDATE ON strict_rollover
+    BEGIN SELECT RAISE(ABORT,'STRICT_ROLLOVER_LOCKED'); END;
+  CREATE TRIGGER strict_rollover_immutable_delete BEFORE DELETE ON strict_rollover
+    BEGIN SELECT RAISE(ABORT,'STRICT_ROLLOVER_LOCKED'); END;`;
 
 function fail(code = "ZK_CHECKPOINT_V2_UNAVAILABLE") {
   const error = new Error(code); error.code = code; throw error;
@@ -412,9 +423,11 @@ class OpaqueCheckpointV2Authority {
   #settings;
   #db;
   #queue = Promise.resolve();
+  #strictRollover = null;
   constructor(filename, { role, bootstrapNew, scope, signingPrivateKey,
     casSignerPublicKey, floorSignerPublicKey, checkpointPublicKey,
-    ownerPublicKey, ownerTrust, baseDigest, baseCheckpoint }) {
+    ownerPublicKey, ownerTrust, baseDigest, baseCheckpoint,
+    requireFullV1ArchiveRollover = false, fullV1ArchiveRollover }) {
     if (![ROLE_CAS, ROLE_FLOOR].includes(role) || typeof bootstrapNew !== "boolean"
       || !ownerTrust || typeof ownerTrust.freshWitnessHead !== "function") fail();
     const scoped = scopeOf(scope);
@@ -431,6 +444,17 @@ class OpaqueCheckpointV2Authority {
     const v1Digest = bytes(baseDigest, 32);
     const v1Checkpoint = bytes(baseCheckpoint, 32);
     if (same(v1Digest, ZERO) || same(v1Checkpoint, ZERO)) fail();
+    if (typeof requireFullV1ArchiveRollover !== "boolean"
+      || requireFullV1ArchiveRollover !== !!fullV1ArchiveRollover) fail();
+    const pinnedStrict = requireFullV1ArchiveRollover ? {
+      archiveRoot: Buffer.from(fullV1ArchiveRollover.handoff?.v1_archive_root || "",
+        "base64url"),
+      checkpoint: Buffer.from(fullV1ArchiveRollover.v2PredecessorCheckpointPin || "",
+        "base64url"),
+    } : null;
+    if (pinnedStrict && (pinnedStrict.archiveRoot.length !== 32
+      || pinnedStrict.checkpoint.length !== 32
+      || !same(pinnedStrict.checkpoint, v1Checkpoint))) fail();
     const trust = {
       genesisDigest: bytes(ownerTrust.genesisDigest, 32),
       pinnedWitness: ownerTrust.pinnedWitness,
@@ -452,7 +476,10 @@ class OpaqueCheckpointV2Authority {
     // writable handle, changing journal mode, or running any CREATE statement.
     const pinned = bootstrapNew ? createdPin
       : withReadonlySqliteSnapshot(filename,
-        (probe) => verifyAuthorityIdentity(probe, identity), fail,
+        (probe) => {
+          verifyAuthorityIdentity(probe, identity);
+          this.#verifyStrictPin(probe, pinnedStrict);
+        }, fail,
         MAX_WIRE * 2 + 8 * 1024 * 1024);
     const beforeOpen = assertPrivateSqliteFile(filename);
     if (beforeOpen.dev !== pinned.dev || beforeOpen.ino !== pinned.ino) fail();
@@ -462,7 +489,10 @@ class OpaqueCheckpointV2Authority {
       const opened = assertPrivateSqliteFile(filename);
       if (opened.dev !== pinned.dev || opened.ino !== pinned.ino) fail();
       assertSafeSqliteSidecars(filename, fail);
-      if (!bootstrapNew) verifyAuthorityIdentity(db, identity);
+      if (!bootstrapNew) {
+        verifyAuthorityIdentity(db, identity);
+        this.#verifyStrictPin(db, pinnedStrict);
+      }
       db.pragma("journal_mode = WAL");
       db.pragma("synchronous = FULL");
       if (bootstrapNew) db.exec(AUTHORITY_SCHEMA);
@@ -471,12 +501,83 @@ class OpaqueCheckpointV2Authority {
         if (conf.length || db.prepare("SELECT COUNT(*) as count FROM transitions").get().count) fail();
         db.prepare("INSERT INTO config VALUES (1,?,?,?,?,?,?)").run(role,
           scopeText, allPins, v1Digest, v1Checkpoint, trust.genesisDigest);
+        if (pinnedStrict) {
+          db.exec(STRICT_ROLLOVER_SCHEMA);
+          db.prepare("INSERT INTO strict_rollover VALUES(1,?,?)")
+            .run(pinnedStrict.archiveRoot, pinnedStrict.checkpoint);
+        }
       }
       this.#db = db;
     } catch (error) { db.close(); throw error; }
     this.#settings = { role, signer, casKey, floorKey, checkpointKey, ownerKey,
       ownerTrust: trust, scope: scoped, casFp: pins[0], floorFp: pins[1],
       checkpointFp: pins[2], baseDigest: v1Digest, baseCheckpoint: v1Checkpoint };
+    this.#strictRollover = pinnedStrict ? {
+      pinned: pinnedStrict, proof: fullV1ArchiveRollover,
+    } : null;
+  }
+  #verifyStrictPin(db, pinned) {
+    const table = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='strict_rollover'").get();
+    if (!!table !== !!pinned) fail("ZK_CHECKPOINT_V2_ROLLOVER_DOWNGRADE");
+    if (!pinned) return;
+    for (const trigger of ["strict_rollover_immutable_update",
+      "strict_rollover_immutable_delete"]) {
+      const row = db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name=?")
+        .get(trigger);
+      if (!row) fail();
+    }
+    const rows = db.prepare("SELECT * FROM strict_rollover").all();
+    if (rows.length !== 1 || rows[0].id !== 1
+      || !same(bytes(rows[0].archive_root, 32), pinned.archiveRoot)
+      || !same(bytes(rows[0].archive_checkpoint, 32), pinned.checkpoint)) fail();
+  }
+  async #verifyStrictAdmission() {
+    // A newly provisioned STRICT authority binds this obligation in its
+    // immutable SQLite identity. Existing legacy V2 authorities are not
+    // retroactively upgraded by guessing an archive or repinning their head.
+    if (!this.#strictRollover) return;
+    const p = this.#strictRollover.proof, s = this.#settings;
+    const pinned = this.#strictRollover.pinned;
+    if (!p || !same(fp(key(p.ownerKey)), fp(s.ownerKey))
+      || !same(fp(key(p.checkpointKey)), s.checkpointFp)
+      || !same(fp(key(p.v2CasKey)), s.casFp)
+      || !same(fp(key(p.v2FloorKey)), s.floorFp)
+      || !same(bytes(Buffer.from(p.v2PredecessorCheckpointPin, "base64url"), 32),
+        pinned.checkpoint)
+      || !same(bytes(Buffer.from(p.handoff.v1_archive_root, "base64url"), 32),
+        pinned.archiveRoot)
+      || !same(bytes(Buffer.from(p.handoff.v1_digest, "base64url"), 32),
+        s.baseDigest)
+      || !SCOPE.every((field) => same(bytes(p.scope[field], s.scope[field].length),
+        s.scope[field]))) fail("ZK_CHECKPOINT_V2_FULL_ARCHIVE_REQUIRED");
+    const nonce = crypto.randomBytes(32);
+    const observed = bytes(await s.ownerTrust.freshWitnessHead({
+      scope: s.scope, nonce }), 1, 8192);
+    await inspectVerifiedWitnessFreshHeadV1({ raw: observed, nonce,
+      scope: s.scope, pinned: s.ownerTrust.pinnedWitness,
+      minimumHead: s.ownerTrust.minimumHead });
+    const head = await z.decodeDeterministic(observed);
+    if (Math.abs(Math.floor(Date.now() / 1000) - head.observed_at) > 30
+      || head.current_revision !== p.ownerHead.revision
+      || !same(bytes(head.current_manifest_digest, 32),
+        bytes(p.ownerHead.digest, 32))) fail("ZK_CHECKPOINT_V2_OWNER_ROLLOVER_STALE");
+    const { verifyRolloverPreflight } = require("./zk1OpaqueCatalogV1RolloverPreflight");
+    await verifyRolloverPreflight(p);
+    // A changing proof object must not make the immutable SQLite anchor
+    // appear different after asynchronous witness / CAS verification.
+    if (!same(bytes(Buffer.from(p.handoff.v1_archive_root, "base64url"), 32),
+      pinned.archiveRoot)) fail();
+  }
+  async renewFullV1ArchiveOwnerHandoff({ handoff, ownerSignature, ownerHead }) {
+    if (!this.#strictRollover) fail("ZK_CHECKPOINT_V2_FULL_ARCHIVE_REQUIRED");
+    return this.#serial(async () => {
+      const old = this.#strictRollover.proof;
+      const next = { ...old, handoff, ownerSignature, ownerHead };
+      this.#strictRollover.proof = next;
+      try { await this.#verifyStrictAdmission(); }
+      catch (error) { this.#strictRollover.proof = old; throw error; }
+      return Object.freeze({ renewed: true, v2WriteAuthorized: false });
+    });
   }
   get role() { return this.#settings.role; }
   get publicKey() { return crypto.createPublicKey(this.#settings.signer); }
@@ -551,6 +652,7 @@ class OpaqueCheckpointV2Authority {
   async prepare(raw, nonce) {
     if (this.role !== ROLE_FLOOR) fail();
     return this.#serial(async () => {
+      await this.#verifyStrictAdmission();
       const rows = await this.#history();
       const proposed = await z.decodeDeterministic(bytes(raw, 1, MAX_WIRE));
       const target = num(proposed.previous_sequence, 128, MAX_V2_SEQUENCE - 1) + 1;
@@ -580,6 +682,7 @@ class OpaqueCheckpointV2Authority {
   async commit(raw, floorPrepare, nonce) {
     if (this.role !== ROLE_CAS) fail();
     return this.#serial(async () => {
+      await this.#verifyStrictAdmission();
       const rows = await this.#history();
       const proposed = await z.decodeDeterministic(bytes(raw, 1, MAX_WIRE));
       const target = num(proposed.previous_sequence, 128, MAX_V2_SEQUENCE - 1) + 1;
@@ -614,6 +717,7 @@ class OpaqueCheckpointV2Authority {
   async finalize(casCommit, nonce) {
     if (this.role !== ROLE_FLOOR) fail();
     return this.#serial(async () => {
+      await this.#verifyStrictAdmission();
       const rows = await this.#history();
       const row = rows.at(-1);
       if (!row) fail("ZK_CHECKPOINT_V2_CONFLICT");
@@ -637,6 +741,7 @@ class OpaqueCheckpointV2Authority {
   async attestFinalized(floorFinalized, nonce) {
     if (this.role !== ROLE_CAS) fail();
     return this.#serial(async () => {
+      await this.#verifyStrictAdmission();
       const rows = await this.#history();
       const row = rows.at(-1);
       if (!row) fail("ZK_CHECKPOINT_V2_CONFLICT");
