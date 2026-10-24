@@ -30,9 +30,11 @@ class Zk1WitnessCasAnchorHttpsClient {
   #statusKeyId;
   #timeout;
   #headTimeout;
+  #requirePhysicalAdmission;
   constructor({ endpoint, ca, clientKey, clientCert, serverFingerprint256,
     pinnedWitnessPublicKey, pinnedWitnessKeyId, pinnedStatusKeyId,
-    timeoutMs = 5000, headTimeoutMs = 9000 } = {}) {
+    timeoutMs = 5000, headTimeoutMs = 9000,
+    requirePhysicalAdmission = false } = {}) {
     try { this.#url = new URL(endpoint); }
     catch (_) { fail(); }
     if (this.#url.protocol !== "https:" || !this.#url.hostname || !this.#url.port
@@ -44,7 +46,7 @@ class Zk1WitnessCasAnchorHttpsClient {
       || pinnedWitnessPublicKey.asymmetricKeyType !== "ed25519"
       || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 10000
       || !Number.isSafeInteger(headTimeoutMs) || headTimeoutMs < 100
-      || headTimeoutMs > 10000) fail();
+      || headTimeoutMs > 10000 || typeof requirePhysicalAdmission !== "boolean") fail();
     if ((!Buffer.isBuffer(pinnedWitnessKeyId) && !(pinnedWitnessKeyId instanceof Uint8Array))
       || pinnedWitnessKeyId.byteLength !== 16
       || (!Buffer.isBuffer(pinnedStatusKeyId) && !(pinnedStatusKeyId instanceof Uint8Array))
@@ -60,7 +62,9 @@ class Zk1WitnessCasAnchorHttpsClient {
     // off-thread. Only that endpoint receives a larger bounded budget; the
     // untrusted /advance ACK keeps the regular 5s default and never authorizes.
     this.#headTimeout = headTimeoutMs;
+    this.#requirePhysicalAdmission = requirePhysicalAdmission;
   }
+  get requiresPhysicalAdmission() { return this.#requirePhysicalAdmission; }
   async #send(urlPath, body, timeoutMs = this.#timeout) {
     const payload = Buffer.from(JSON.stringify(body), "utf8");
     if (payload.length < 2 || payload.length > (urlPath.endsWith("/advance") ? 96 * 1024 : 4096)) fail();
@@ -126,7 +130,7 @@ class Zk1WitnessCasAnchorHttpsClient {
         pinnedWitnessPublicKey: this.#pinnedWitness,
         pinnedWitnessKeyId: this.#witnessKeyId,
         pinnedStatusKeyId: this.#statusKeyId,
-        minimumHead });
+        minimumHead, requirePhysicalAdmission: this.#requirePhysicalAdmission });
     } catch (_) { fail(); }
   }
   async advanceSignedRecords(records, evidence = undefined) {

@@ -145,10 +145,23 @@ class Zk1DurableCasStatusLedger {
     }
     if (casAnchorPhysicalEvidenceProvider !== null) {
       if (casAnchorWitness === null || !casAnchorPhysicalEvidenceProvider
-        || typeof casAnchorPhysicalEvidenceProvider.forSignedRecord !== "function") {
+        || typeof casAnchorPhysicalEvidenceProvider.forSignedRecord !== "function"
+        || casAnchorWitness.requiresPhysicalAdmission !== true) {
+        fail("CAS_ANCHOR_REQUIRED");
+      }
+      const externalDigest = trustedAnchorMinimumHead?.physicalFenceDigest;
+      if (typeof externalDigest !== "string" || !/^[a-f0-9]{64}$/.test(externalDigest)
+        || (trustedAnchorMinimumHead.sequence === 0
+          && externalDigest !== crypto.createHash("sha256").digest("hex"))) {
+        // The CAS operator must retain the strict witness's independently
+        // signed physical-fence digest OUTSIDE its SQLite/anchor rollback
+        // domain, not silently pin the value supplied by the writer.
         fail("CAS_ANCHOR_REQUIRED");
       }
       this.#casPhysicalEvidenceProvider = casAnchorPhysicalEvidenceProvider;
+      this.#lastWitnessFloor = Object.freeze({
+        ...this.#lastWitnessFloor, physicalFenceDigest: externalDigest,
+      });
     }
     if (typeof anchorPath !== "string" || !path.isAbsolute(anchorPath)
       || path.resolve(anchorPath) === absolute) fail("CAS_ANCHOR_REQUIRED");
@@ -194,7 +207,10 @@ class Zk1DurableCasStatusLedger {
       // Refuse invalid foreign anchors before any SQLite write-mode open.
       const inspectedAnchor = new Zk1CasTerminalAnchor(anchorPath, {
         bootstrapNew: false, statusKeyId: this.statusKeyId, statusPrivateKey,
-        trustedMinimumHead: trustedAnchorMinimumHead,
+        trustedMinimumHead: trustedAnchorMinimumHead === undefined ? undefined : {
+          sequence: trustedAnchorMinimumHead.sequence,
+          lastHash: trustedAnchorMinimumHead.lastHash,
+        },
         witnessRequired: casAnchorWitness !== null,
         witnessKeyId: this.witnessKeyId,
         normativePhysicalAdmissionRequired: casAnchorPhysicalEvidenceProvider !== null,
@@ -270,7 +286,10 @@ class Zk1DurableCasStatusLedger {
         bootstrapNew: !existed && bootstrapNew,
         statusKeyId: this.statusKeyId,
         statusPrivateKey,
-        trustedMinimumHead: trustedAnchorMinimumHead,
+        trustedMinimumHead: trustedAnchorMinimumHead === undefined ? undefined : {
+          sequence: trustedAnchorMinimumHead.sequence,
+          lastHash: trustedAnchorMinimumHead.lastHash,
+        },
         witnessRequired: casAnchorWitness !== null,
         witnessKeyId: this.witnessKeyId,
         normativePhysicalAdmissionRequired: casAnchorPhysicalEvidenceProvider !== null,
@@ -310,6 +329,8 @@ class Zk1DurableCasStatusLedger {
             && witnessHead.lastHash !== local.lastHash)) fail("CAS_LEDGER_ROLLBACK");
         this.#lastWitnessFloor = Object.freeze({
           sequence: witnessHead.sequence, lastHash: witnessHead.lastHash,
+          ...(this.#casPhysicalEvidenceProvider
+            ? { physicalFenceDigest: witnessHead.physicalFenceDigest } : {}),
         });
         if (witnessHead.sequence === local.sequence) return;
         const records = this.anchor.signedRecordPage({

@@ -13,6 +13,7 @@ const { Zk1WitnessCasPhysicalAdmission } = require("./zk1WitnessCasPhysicalAdmis
 
 const RECORD_DOMAIN = Buffer.from("Root.ark/zk-1/cas-terminal-anchor/v1\0", "ascii");
 const FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-anchor-floor/v1\0", "ascii");
+const PHYSICAL_FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-physical-floor/v2\0", "ascii");
 const PHYSICAL_FENCE_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-inventory-fence/v1\0", "ascii");
 const RECORD_FIELDS = ["sequence", "reservation", "scope", "status", "ticketHash",
   "manifestHash", "terminalSeal", "previousHash", "signature"];
@@ -89,14 +90,19 @@ function parseRecord(line, pinned) {
     lastHash: digest(line), line, status: record.status, scope: record.scope };
 }
 function verifyFreshWitnessCasFloor({ signed, nonce, pinnedWitnessPublicKey,
-  pinnedWitnessKeyId, pinnedStatusKeyId, minimumHead } = {}) {
+  pinnedWitnessKeyId, pinnedStatusKeyId, minimumHead,
+  requirePhysicalAdmission = false } = {}) {
+  if (typeof requirePhysicalAdmission !== "boolean") fail();
   const fields = ["type", "witnessKeyId", "statusKeyId", "sequence",
-    "lastHash", "nonce", "signature"];
+    "lastHash", ...(requirePhysicalAdmission ? ["physicalFenceDigest"] : []),
+    "nonce", "signature"];
   const value = exact(signed, fields);
   if (!(pinnedWitnessPublicKey instanceof crypto.KeyObject)
     || pinnedWitnessPublicKey.type !== "public"
     || pinnedWitnessPublicKey.asymmetricKeyType !== "ed25519"
-    || value.type !== "rootark-zk1-witness-cas-anchor-floor/v1"
+    || value.type !== (requirePhysicalAdmission
+      ? "rootark-zk1-witness-cas-physical-floor/v2"
+      : "rootark-zk1-witness-cas-anchor-floor/v1")
     || value.witnessKeyId !== id(pinnedWitnessKeyId).toString("base64url")
     || value.statusKeyId !== id(pinnedStatusKeyId).toString("base64url")
     || (!Buffer.isBuffer(nonce) && !(nonce instanceof Uint8Array))
@@ -104,20 +110,32 @@ function verifyFreshWitnessCasFloor({ signed, nonce, pinnedWitnessPublicKey,
     || value.nonce !== Buffer.from(nonce).toString("base64url")
     || !Number.isSafeInteger(value.sequence) || value.sequence < 0
     || value.sequence > 100000 || !validHex(value.lastHash)
+    || (requirePhysicalAdmission && !validHex(value.physicalFenceDigest))
     || (value.sequence === 0 && value.lastHash !== ZERO)
     || typeof value.signature !== "string" || !/^[A-Za-z0-9_-]{86}$/.test(value.signature)) fail();
   const signature = Buffer.from(value.signature, "base64url");
   const unsigned = Object.fromEntries(fields.slice(0, -1).map((key) => [key, value[key]]));
   if (signature.byteLength !== 64 || signature.toString("base64url") !== value.signature
-    || !crypto.verify(null, Buffer.concat([FLOOR_DOMAIN,
+    || !crypto.verify(null, Buffer.concat([requirePhysicalAdmission
+      ? PHYSICAL_FLOOR_DOMAIN : FLOOR_DOMAIN,
       Buffer.from(JSON.stringify(unsigned))]), pinnedWitnessPublicKey, signature)) fail();
   if (minimumHead !== undefined) {
-    const minimum = exact(minimumHead, ["sequence", "lastHash"]);
+    // A strict external monotonic minimum must pin the physical fence too.
+    // Accepting a valid CAS-only minimum would reopen a physical rollback
+    // across client restart even though the current signed head is V2.
+    const minimumKeys = requirePhysicalAdmission
+      ? ["sequence", "lastHash", "physicalFenceDigest"]
+      : ["sequence", "lastHash"];
+    const minimum = exact(minimumHead, minimumKeys);
     if (!Number.isSafeInteger(minimum.sequence) || minimum.sequence < 0
       || !validHex(minimum.lastHash) || value.sequence < minimum.sequence
-      || (value.sequence === minimum.sequence && value.lastHash !== minimum.lastHash)) fail();
+      || (value.sequence === minimum.sequence && value.lastHash !== minimum.lastHash)
+      || (minimumKeys.length === 3 && (!validHex(minimum.physicalFenceDigest)
+        || (value.sequence === minimum.sequence
+          && value.physicalFenceDigest !== minimum.physicalFenceDigest)))) fail();
   }
-  return Object.freeze({ sequence: value.sequence, lastHash: value.lastHash });
+  return Object.freeze({ sequence: value.sequence, lastHash: value.lastHash,
+    ...(requirePhysicalAdmission ? { physicalFenceDigest: value.physicalFenceDigest } : {}) });
 }
 class Zk1WitnessCasAnchorFloor {
   #db;
@@ -362,12 +380,17 @@ class Zk1WitnessCasAnchorFloor {
     return JSON.stringify([stamp(this.#filename), stamp(this.#filename + "-wal")]);
   }
   #signHead(nonce, value) {
-    const unsigned = { type: "rootark-zk1-witness-cas-anchor-floor/v1",
+    const strict = Boolean(this.#attestedAdmission);
+    const unsigned = { type: strict
+      ? "rootark-zk1-witness-cas-physical-floor/v2"
+      : "rootark-zk1-witness-cas-anchor-floor/v1",
       witnessKeyId: this.#witnessId.toString("base64url"),
       statusKeyId: this.#statusId.toString("base64url"),
       sequence: value.sequence, lastHash: value.lastHash,
+      ...(strict ? { physicalFenceDigest: this.#physicalFenceDigest } : {}),
       nonce: nonce.toString("base64url") };
-    const signature = crypto.sign(null, Buffer.concat([FLOOR_DOMAIN,
+    const signature = crypto.sign(null, Buffer.concat([strict
+      ? PHYSICAL_FLOOR_DOMAIN : FLOOR_DOMAIN,
       Buffer.from(JSON.stringify(unsigned))]), this.#witness);
     return Object.freeze({ ...unsigned, signature: signature.toString("base64url") });
   }

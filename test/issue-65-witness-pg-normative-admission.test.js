@@ -11,7 +11,8 @@ const Database = require("better-sqlite3");
 const z = require("../src/crypto/rootark-zk-1");
 const contentInventory = require("../src/crypto/rootark-zk-content-inventory-v1");
 const { signCommittedPhysicalReadback } = require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
-const { Zk1WitnessCasAnchorFloor } = require("../src/services/zk1WitnessCasAnchorFloor");
+const { Zk1WitnessCasAnchorFloor, verifyFreshWitnessCasFloor } =
+  require("../src/services/zk1WitnessCasAnchorFloor");
 const { Zk1CasTerminalAnchor } = require("../src/services/zk1CasTerminalAnchor");
 const { Zk1WitnessCasPhysicalAdmission } = require("../src/services/zk1WitnessCasPhysicalAdmission");
 const { createZk1WitnessHttpsServer, drainZk1WitnessHttpsServer } =
@@ -151,6 +152,60 @@ test("strict CAS witness floor refuses signed status advance without independent
   assert.equal(floor.head().sequence, 0, "failed evidence must not advance independent floor");
   const result = await floor.advanceAttested({ records: [record], evidence: [evidence] });
   assert.equal(result.sequence, 1);
+  const strictNonce = random(32);
+  const strictSignedHead = floor.freshHead({ nonce: strictNonce });
+  assert.equal(strictSignedHead.type, "rootark-zk1-witness-cas-physical-floor/v2",
+    "strict witnesses must cryptographically bind the physical-inventory fence");
+  const strictVerifiedHead = verifyFreshWitnessCasFloor({
+    signed: strictSignedHead, nonce: strictNonce,
+    pinnedWitnessPublicKey: witness.publicKey,
+    pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
+    requirePhysicalAdmission: true,
+  });
+  assert.match(strictVerifiedHead.physicalFenceDigest, /^[a-f0-9]{64}$/);
+  assert.throws(() => verifyFreshWitnessCasFloor({
+    signed: strictSignedHead, nonce: strictNonce,
+    pinnedWitnessPublicKey: witness.publicKey,
+    pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
+    minimumHead: { sequence: strictVerifiedHead.sequence,
+      lastHash: strictVerifiedHead.lastHash },
+    requirePhysicalAdmission: true,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "strict external minimums may not silently omit the physical-fence digest");
+  assert.throws(() => verifyFreshWitnessCasFloor({
+    signed: { ...strictSignedHead, physicalFenceDigest: "f".repeat(64) },
+    nonce: strictNonce, pinnedWitnessPublicKey: witness.publicKey,
+    pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
+    requirePhysicalAdmission: true,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "a signed CAS-only checkpoint cannot be spliced to a different physical fence");
+  const legacyHeadBody = { type: "rootark-zk1-witness-cas-anchor-floor/v1",
+    witnessKeyId: witnessKeyId.toString("base64url"),
+    statusKeyId: statusKeyId.toString("base64url"), sequence: result.sequence,
+    lastHash: result.lastHash, nonce: strictNonce.toString("base64url") };
+  const legacyHead = { ...legacyHeadBody,
+    signature: crypto.sign(null, Buffer.concat([
+      Buffer.from("Root.ark/zk-1/witness-cas-anchor-floor/v1\0", "ascii"),
+      Buffer.from(JSON.stringify(legacyHeadBody)),
+    ]), witness.privateKey).toString("base64url") };
+  assert.equal(verifyFreshWitnessCasFloor({
+    signed: legacyHead, nonce: strictNonce,
+    pinnedWitnessPublicKey: witness.publicKey,
+    pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
+  }).sequence, result.sequence, "the downgrade test must contain a valid legacy signature");
+  assert.throws(() => verifyFreshWitnessCasFloor({
+    signed: legacyHead, nonce: strictNonce,
+    pinnedWitnessPublicKey: witness.publicKey,
+    pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
+    requirePhysicalAdmission: true,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "clients enrolled in physical admission refuse an otherwise valid CAS-only head");
+  await assert.rejects(async () => verifyFreshWitnessCasFloor({
+    signed: strictSignedHead, nonce: random(32),
+    pinnedWitnessPublicKey: witness.publicKey,
+    pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
+    requirePhysicalAdmission: true,
+  }), /WITNESS_CAS_FLOOR_DENIED/, "a replayed strict signed head fails a new challenge");
   assert.equal(physicalCalls, 2);
   assert.equal(inventoryCalls, 1);
   assert.deepEqual(await floor.advanceAttested({ records: [record], evidence: [evidence] }),
@@ -259,12 +314,16 @@ test("strict CAS witness floor refuses signed status advance without independent
     serverFingerprint256: new crypto.X509Certificate(read("server.pem")).fingerprint256,
     pinnedWitnessPublicKey: witness.publicKey,
     pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
+    requirePhysicalAdmission: true,
   });
   try {
     await assert.rejects(client.advanceSignedRecords([record]),
       /CAS_WITNESS_FLOOR_UNAVAILABLE/);
     assert.equal(await client.advanceSignedRecords([record], [evidence]), false);
-    assert.equal((await client.freshHead(result)).sequence, 1);
+    const clientHead = await client.freshHead({ ...result,
+      physicalFenceDigest: strictVerifiedHead.physicalFenceDigest });
+    assert.equal(clientHead.sequence, 1);
+    assert.equal(clientHead.physicalFenceDigest, strictVerifiedHead.physicalFenceDigest);
   } finally {
     await drainZk1WitnessHttpsServer(service);
   }
@@ -415,6 +474,7 @@ test("CAS persists mandatory physical evidence provider enrollment and refuses r
     serverFingerprint256: new Array(32).fill("AB").join(":"),
     pinnedWitnessPublicKey: witness.publicKey,
     pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
+    requirePhysicalAdmission: true,
   });
   const provider = { forSignedRecord: async () => { throw Error("NO_RECORD_YET"); } };
   const filename = path.join(directory, "status.sqlite");
@@ -423,6 +483,13 @@ test("CAS persists mandatory physical evidence provider enrollment and refuses r
     witnessPinned: { keyId: witnessKeyId, publicKey: witness.publicKey },
     trustedAnchorMinimumHead: { sequence: 0, lastHash: "0".repeat(64) },
     casAnchorWitness, casAnchorPhysicalEvidenceProvider: provider,
+  };
+  assert.throws(() => new Zk1DurableCasStatusLedger(filename, options),
+    /CAS_ANCHOR_REQUIRED/,
+    "strict CAS may not enroll without a separately retained physical-fence digest");
+  options.trustedAnchorMinimumHead = {
+    sequence: 0, lastHash: "0".repeat(64),
+    physicalFenceDigest: hex(Buffer.alloc(0)),
   };
   const cas = new Zk1DurableCasStatusLedger(filename, options);
   cas.close();
