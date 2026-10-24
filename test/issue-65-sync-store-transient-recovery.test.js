@@ -68,7 +68,7 @@ test("failed filesystem commit remains uncommitted and the next durable commit c
     [first.operationId, next.operationId].sort());
 });
 
-test("post-rename directory sync ambiguity fences subsequent writes until disk state is reopened", async (t) => {
+test("post-rename directory sync ambiguity quarantines every process and restart", async (t) => {
   const folder = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-sync-ambiguous-"));
   t.after(() => fs.rm(folder, { recursive: true, force: true }));
   const file = path.join(folder, "objects.json");
@@ -80,6 +80,7 @@ test("post-rename directory sync ambiguity fences subsequent writes until disk s
   await ready;
   const old = encryptedCreate("already-committed");
   assert.equal((await store.put("alice", old)).kind, "stored");
+  const peer = await new SyncObjectStore(file).open();
   const originalOpen = fs.open;
   fs.open = async (target, mode, ...args) => {
     if (target === folder && mode === "r") {
@@ -110,7 +111,12 @@ test("post-rename directory sync ambiguity fences subsequent writes until disk s
   await assert.rejects(store.put("alice", encryptedCreate("unsafe-followup")),
     { code: "SYNC_COMMIT_INDETERMINATE" }, "same process must not overwrite the ambiguous disk state");
   assert.equal(await fs.readFile(file, "utf8"), renamedState, "unconfirmed operation has not been overwritten");
-  const reopened = await new SyncObjectStore(file).open();
-  assert.deepEqual(reopened.list("alice").map((item) => item.operationId).sort(),
-    [old.operationId, ambiguous.operationId].sort(), "an explicit readback after restart retains both records");
+  assert.throws(() => peer.list("alice"), { code: "SYNC_STORE_LOCK_BUSY" },
+    "a second process cannot serve the ambiguous rename as confirmed inventory");
+  await assert.rejects(peer.put("alice", encryptedCreate("unsafe-peer-followup")),
+    { code: "SYNC_STORE_LOCK_BUSY" });
+  await assert.rejects(new SyncObjectStore(file).open(), { code: "SYNC_STORE_LOCK_BUSY" },
+    "restart must require explicit operator reconciliation before writes resume");
+  assert.equal(await fs.readFile(file, "utf8"), renamedState);
+  assert.ok((await fs.stat(`${file}.writer-lock`)).isFile(), "durable quarantine survives the failed process");
 });

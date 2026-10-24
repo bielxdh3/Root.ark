@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("node:fs/promises");
+const fsSync = require("node:fs");
 const crypto = require("node:crypto");
 const path = require("node:path");
 const { PROTOCOL_VERSION, compareRevisions, validateOperation } = require("../../sync-client/rootark-sync-protocol");
@@ -261,12 +262,23 @@ class SyncObjectStore {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
     }
+    let quarantine = false;
     try {
       return await callback();
+    } catch (error) {
+      // rename succeeded but the parent-directory durability barrier did
+      // not. A process-local flag is insufficient: keep this exclusive-create
+      // marker in place so peers and restarts also fail closed. No automatic
+      // stale-lock stealing or inferred commit from visible bytes is safe.
+      if (error?.syncCommitIndeterminate === true || this.commitIndeterminate) {
+        this.commitIndeterminate = true;
+        quarantine = true;
+      }
+      throw error;
     } finally {
       try {
         await handle.close();
-        await fs.unlink(lockPath);
+        if (!quarantine) await fs.unlink(lockPath);
       } catch (error) {
         this.commitIndeterminate = true;
         throw new Error("Sync writer lock release failed; restart and investigate before writing", { cause: error });
@@ -280,6 +292,23 @@ class SyncObjectStore {
       throw new Error("Invalid sync object store");
     }
     attestCiphertextOnlySyncState(current);
+    return current;
+  }
+
+  readSnapshot() {
+    if (this.commitIndeterminate) throw indeterminateCommitError();
+    const lockPath = `${this.filePath}.writer-lock`;
+    const busy = () => Object.assign(new Error("Sync inventory writer is active"), { code: "SYNC_STORE_LOCK_BUSY" });
+    // Atomic replacement permits a complete disk snapshot, but do not serve
+    // one while another process has not yet confirmed its durability barrier.
+    if (fsSync.existsSync(lockPath)) throw busy();
+    const current = JSON.parse(fsSync.readFileSync(this.filePath, "utf8"));
+    if (![1, STORE_VERSION].includes(current.version) || !current.users
+      || typeof current.users !== "object" || Array.isArray(current.users)) {
+      throw new Error("Invalid sync object store");
+    }
+    attestCiphertextOnlySyncState(current);
+    if (fsSync.existsSync(lockPath)) throw busy();
     return current;
   }
 
@@ -349,6 +378,65 @@ class SyncObjectStore {
     return current;
   }
 
+  recordDurableBurst(user, deviceId, objectId, at) {
+    const { maxDestructive, maxPerObject, windowMs, maxKeys } = this.burstGuard.config;
+    const buckets = ensureOwnMap(user, "burstCounters");
+    const deviceKey = pausedKey(deviceId);
+    const cutoff = at - windowMs;
+    const live = (values) => {
+      if (!Array.isArray(values) || values.some((value) => !Number.isFinite(value))) {
+        throw new Error("Invalid persisted sync burst timestamp");
+      }
+      return values.filter((value) => value > cutoff);
+    };
+    const pruneExpired = () => {
+      for (const [key, entry] of Object.entries(buckets)) {
+        if (!entry || typeof entry !== "object" || !entry.objects
+          || typeof entry.objects !== "object" || Array.isArray(entry.objects)) {
+          throw new Error("Invalid persisted sync burst state");
+        }
+        entry.events = live(entry.events);
+        for (const [objectKey, values] of Object.entries(entry.objects)) {
+          const remaining = live(values);
+          if (remaining.length) entry.objects[objectKey] = remaining;
+          else delete entry.objects[objectKey];
+        }
+        if (!entry.events.length && !Object.keys(entry.objects).length) delete buckets[key];
+      }
+    };
+    let bucket = ownRecord(buckets, deviceKey);
+    if (!bucket) {
+      if (Object.keys(buckets).length >= maxKeys) pruneExpired();
+      if (Object.keys(buckets).length >= maxKeys) {
+        return { exceeded: true, objectExceeded: false, limit: maxDestructive, windowMs, objectLimit: maxPerObject };
+      }
+      bucket = { events: [], objects: {} };
+      setOwnRecord(buckets, deviceKey, bucket);
+    }
+    if (!Array.isArray(bucket.events) || !bucket.objects || typeof bucket.objects !== "object"
+      || Array.isArray(bucket.objects)) throw new Error("Invalid persisted sync burst state");
+    const events = live(bucket.events);
+    events.push(at);
+    bucket.events = events.slice(-(maxDestructive + 1));
+    const objectKey = `o:${String(objectId)}`;
+    let objectEvents = ownRecord(bucket.objects, objectKey);
+    if (!objectEvents) {
+      const objectCount = () => Object.values(buckets)
+        .reduce((total, entry) => total + Object.keys(entry.objects).length, 0);
+      if (objectCount() >= maxKeys) pruneExpired();
+      if (objectCount() >= maxKeys) {
+        return { exceeded: true, objectExceeded: true, limit: maxDestructive, windowMs, objectLimit: maxPerObject };
+      }
+      objectEvents = [];
+    }
+    objectEvents = live(objectEvents);
+    objectEvents.push(at);
+    setOwnRecord(bucket.objects, objectKey, objectEvents.slice(-(maxPerObject + 1)));
+    return { exceeded: bucket.events.length > maxDestructive || objectEvents.length > maxPerObject,
+      objectExceeded: objectEvents.length > maxPerObject,
+      limit: maxDestructive, windowMs, objectLimit: maxPerObject };
+  }
+
   async put(username, input) {
     return this.transact((next) => {
       const at = this.now();
@@ -364,7 +452,7 @@ class SyncObjectStore {
       if (current && !input.baseRevision) return { kind: "conflict", current };
       if (current && compareRevisions(input.revision, current.revision) <= 0) return { kind: "stale", current };
       if (destructive) {
-        const burst = this.burstGuard.recordDestructive(username, input.deviceId, input.objectId, at);
+        const burst = this.recordDurableBurst(user, input.deviceId, input.objectId, at);
         if (burst.exceeded) {
           ensureOwnMap(user, "pausedDevices");
           user.pausedDevices[pausedKey(input.deviceId)] = { pausedAt: new Date(at).toISOString(), pauseNonce: crypto.randomUUID(), reason: burst.objectExceeded ? "object_burst" : "destructive_burst", limit: burst.limit, windowMs: burst.windowMs };
@@ -395,6 +483,7 @@ class SyncObjectStore {
       const user = this.user(next, username);
       wasPaused = isPausedDevice(user, deviceId);
       if (wasPaused) delete user.pausedDevices[pausedKey(deviceId)];
+      if (wasPaused && user.burstCounters) delete user.burstCounters[pausedKey(deviceId)];
       return wasPaused;
     });
     this.burstGuard.reset(username, deviceId);
@@ -402,15 +491,13 @@ class SyncObjectStore {
   }
 
   pauseFence(username, deviceId) {
-    if (this.commitIndeterminate) throw indeterminateCommitError();
-    const user = ownRecord(this.state.users, username) || {};
+    const user = ownRecord(this.readSnapshot().users, username) || {};
     const pause = ownRecord(ownRecord(user, "pausedDevices"), pausedKey(deviceId));
     return pause ? (pause.pauseNonce || JSON.stringify(pause)) : null;
   }
 
   pendingResume(username) {
-    if (this.commitIndeterminate) throw indeterminateCommitError();
-    return ownRecord(ownRecord(this.state.users, username), "resumeIntent") || null;
+    return ownRecord(ownRecord(this.readSnapshot().users, username), "resumeIntent") || null;
   }
 
   async stageResume(username, intent) {
@@ -440,6 +527,7 @@ class SyncObjectStore {
       if (fence !== intent.pauseFence) throw new Error("Sync pause changed before finalization");
       wasPaused = Boolean(pause);
       if (wasPaused) delete user.pausedDevices[pausedKey(intent.deviceId)];
+      if (wasPaused && user.burstCounters) delete user.burstCounters[pausedKey(intent.deviceId)];
       delete user.resumeIntent;
     });
     this.burstGuard.reset(username, intent.deviceId);
@@ -447,13 +535,11 @@ class SyncObjectStore {
   }
 
   isDevicePaused(username, deviceId) {
-    if (this.commitIndeterminate) throw indeterminateCommitError();
-    return isPausedDevice(ownRecord(this.state.users, username) || {}, deviceId);
+    return isPausedDevice(ownRecord(this.readSnapshot().users, username) || {}, deviceId);
   }
 
   list(username, objectId = null) {
-    if (this.commitIndeterminate) throw indeterminateCommitError();
-    const user = ownRecord(this.state.users, username) || { objects: {} };
+    const user = ownRecord(this.readSnapshot().users, username) || { objects: {} };
     const objects = ownRecord(user, "objects") || {};
     if (objectId) {
       const record = ownRecord(objects, objectId);
@@ -463,8 +549,7 @@ class SyncObjectStore {
   }
 
   history(username, objectId) {
-    if (this.commitIndeterminate) throw indeterminateCommitError();
-    const user = ownRecord(this.state.users, username) || { versions: {} };
+    const user = ownRecord(this.readSnapshot().users, username) || { versions: {} };
     const versions = ownRecord(user, "versions") || {};
     return (ownRecord(versions, objectId) || []).map(publicRecord);
   }
@@ -558,12 +643,16 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
   app.get("/sync/v1/objects", authenticate, requirePermission("listFiles"), async (req, res) => {
     await ready;
     if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
-    res.json({ protocolVersion: PROTOCOL_VERSION, objects: store.list(req.user.username, req.query.objectId ? String(req.query.objectId) : null) });
+    try {
+      res.json({ protocolVersion: PROTOCOL_VERSION, objects: store.list(req.user.username, req.query.objectId ? String(req.query.objectId) : null) });
+    } catch { return errorResponse(res, 503, "Sync inventory unavailable"); }
   });
   app.get("/sync/v1/objects/:objectId", authenticate, requirePermission("listFiles"), async (req, res) => {
     await ready;
     if (store.commitIndeterminate) return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
-    const objects = store.list(req.user.username, req.params.objectId);
+    let objects;
+    try { objects = store.list(req.user.username, req.params.objectId); }
+    catch { return errorResponse(res, 503, "Sync inventory unavailable"); }
     if (!objects.length) return errorResponse(res, 404, "Sync object not found");
     res.json(objects[0]);
   });
@@ -630,8 +719,12 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
           return errorResponse(res, 503, store.commitIndeterminate ? "sync_commit_indeterminate" : "Sync re-authentication unavailable",
             store.commitIndeterminate ? { code: "SYNC_COMMIT_INDETERMINATE" } : {});
         }
-        const pending = store.pendingResume(username);
-        const pauseFence = store.pauseFence(username, deviceId);
+        let pending;
+        let pauseFence;
+        try {
+          pending = store.pendingResume(username);
+          pauseFence = store.pauseFence(username, deviceId);
+        } catch { return errorResponse(res, 503, "Sync inventory unavailable"); }
         if (pending && (pending.deviceId !== deviceId || pending.pauseFence !== pauseFence
           || pending.version !== 2
           || pending.passwordHash !== checkedHash || pending.sessionVersion !== checkedSessionVersion
