@@ -152,6 +152,8 @@ test("strict historical admission needs independently signed physical witness an
   };
   await denied({ admission: signedAlteration({ admittedAtMs:
     f.input.envelope.authorization.expiresAt + 1 }) });
+  await denied({ admission: signedAlteration({ admittedAtMs:
+    f.input.envelope.authorization.expiresAt }) });
   await denied({ admission: signedAlteration({ envelopeSha256:
     random(32).toString("base64url") }) });
   await denied({ admission: signedAlteration({ operationId:
@@ -186,6 +188,19 @@ test("strict historical admission needs independently signed physical witness an
     checkpointRoot: random(32).toString("base64url") } });
   await denied({ nonce: random(32) });
   await denied({ admission: { ...f.admission, authorizesIo: true } });
+  const impostorSpki = crypto.generateKeyPairSync("ed25519").publicKey.export({
+    format: "der", type: "spki" });
+  const nativeAttestor = f.attestor.publicKey;
+  Object.defineProperty(nativeAttestor, "export", { value: () => impostorSpki });
+  const floorUnsigned = { ...f.freshFloor };
+  delete floorUnsigned.signature;
+  const forgedFloor = { ...floorUnsigned, signature: crypto.sign(null,
+    Buffer.concat([FLOOR_DOMAIN, Buffer.from(JSON.stringify(floorUnsigned))]),
+    f.attestor.privateKey).toString("base64url") };
+  await denied({ pinnedWitnessPublicKey: nativeAttestor,
+    pinnedPhysicalAttestorPublicKey: nativeAttestor,
+    freshFloor: forgedFloor,
+    admission: signedAlteration({}, f.attestor.privateKey) });
 });
 
 test("a signed Sync v2 envelope binds exactly to two independent ZK1 signer identities and PG readback", async () => {

@@ -232,15 +232,16 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
     const witness = v.pinnedWitnessPublicKey;
     if (!(witness instanceof crypto.KeyObject) || witness.type !== "public"
       || witness.asymmetricKeyType !== "ed25519") deny();
-    const witnessSpki = witness.export({ type: "spki", format: "der" });
-    const publicDer = (pin) => pin instanceof crypto.KeyObject
-      ? pin.export({ type: "spki", format: "der" }) : checkedBytes(pin, 44);
     const deviceSpki = checkedBytes(Buffer.from(bound.envelope.authorization.publicKey,
       "base64url"), 44);
+    const deviceKey = crypto.createPublicKey({ key: deviceSpki,
+      type: "spki", format: "der" });
     // Witness and all signers must be independently provisioned principals.
     for (const pin of [v.pinnedInventoryPublicKey, v.pinnedPhysicalAttestorPublicKey,
-      deviceSpki]) {
-      if (witnessSpki.equals(publicDer(pin))) deny();
+      deviceKey]) {
+      if (!(pin instanceof crypto.KeyObject) || pin.type !== "public"
+        || pin.asymmetricKeyType !== "ed25519"
+        || crypto.KeyObject.prototype.equals.call(witness, pin)) deny();
     }
     const floorFields = ["type", "witnessKeyId", "statusKeyId", "sequence",
       "lastHash", "physicalFenceDigest", "nonce", "signature"];
@@ -283,7 +284,7 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
       || admission.checkpointSequence !== bound.operation.expected_sequence
       || admission.checkpointRoot !== bound.operation.expected_root.toString("base64url")
       || !Number.isSafeInteger(admission.admittedAtMs) || admission.admittedAtMs < 1
-      || admission.admittedAtMs > bound.envelope.authorization.expiresAt
+      || admission.admittedAtMs >= bound.envelope.authorization.expiresAt
       || admission.admittedAtMs > Date.now()
       || admission.witnessSequence !== floor.sequence
       || admission.witnessLastHash !== floor.lastHash
@@ -325,4 +326,5 @@ async function verifySyncV2HistoricalWitnessAdmission(input) {
 }
 
 module.exports = { envelopeBinding, physicalWriteRequest,
-  verifySyncV2PhysicalEnvelopeEvidence, verifySyncV2HistoricalWitnessAdmission };
+  snapshotLocalDevicePolicy, verifySyncV2PhysicalEnvelopeEvidence,
+  verifySyncV2HistoricalWitnessAdmission };

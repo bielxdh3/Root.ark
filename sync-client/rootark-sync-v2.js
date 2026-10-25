@@ -79,9 +79,15 @@ async function start(options = {}) {
   const strictHistorical = externalMode
     || historicalMode === "independent-physical-witness-v1";
   if (strictHistorical && (typeof options.historicalEvidenceProvider !== "function"
-    || !options.trustedHistoricalAdmission)) {
+    || !options.trustedHistoricalAdmission
+    || !options.trustedHistoricalAdmission.localTrustedDevicePolicy)) {
     throw new Error("Independent witness evidence provider and external pins are required");
   }
+  const strictBinding = strictHistorical
+    ? require("./rootark-sync-zk1-physical-binding") : null;
+  const independentlyPinnedDevicePolicy = strictHistorical
+    ? strictBinding.snapshotLocalDevicePolicy(
+      options.trustedHistoricalAdmission.localTrustedDevicePolicy) : null;
   const trustedHistorical = strictHistorical ? (() => {
     const provided = options.trustedHistoricalAdmission;
     const copyPin = (pin) => Buffer.isBuffer(pin) || pin instanceof Uint8Array
@@ -101,8 +107,7 @@ async function start(options = {}) {
     };
   })() : null;
   const strictVerifier = strictHistorical
-    ? require("./rootark-sync-zk1-physical-binding")
-      .verifySyncV2HistoricalWitnessAdmission : null;
+    ? strictBinding.verifySyncV2HistoricalWitnessAdmission : null;
   const adapter = createOpaqueSyncAdapter({
     baseUrl: config.serverUrl,
     fetchImpl: (url, request = {}) => fetch(url, { ...request, headers: { Authorization: `Bearer ${config.token}`, ...(request.headers || {}) } }),
@@ -118,15 +123,18 @@ async function start(options = {}) {
     fileKeyResolver: fileKeyResolver(config.fileKey, config.keyEpoch),
     authorize: async (operation) => operation.keyEpoch === config.keyEpoch,
     authorizeOutgoing: async (operation) => config.deviceRevoked !== true
-      && !config.revokedDeviceIds.includes(config.deviceId)
+      && !(strictHistorical ? independentlyPinnedDevicePolicy.revokedDeviceIds
+        : config.revokedDeviceIds).includes(config.deviceId)
       && operation.deviceId === config.deviceId,
     verifyIncoming: async (operation, { locallyAdmitted = false } = {}) => {
       if (!operation.authorization) return false;
-      const expected = { username: config.username,
+      const expected = independentlyPinnedDevicePolicy || { username: config.username,
         trustedDevicePublicKeys: config.trustedDevicePublicKeys,
         revokedDeviceIds: config.revokedDeviceIds };
       if (operation.authorization.expiresAt > Date.now()) {
-        return verifyAuthorizationProof(operation.authorization, operation, expected);
+        const verified = await verifyAuthorizationProof(operation.authorization, operation, expected);
+        return verified === true && (!strictHistorical
+          || operation.authorization.expiresAt > Date.now());
       }
       // A signed but expired record does not prove that the remote server
       // admitted it before expiry. The default legacy mode retains only the

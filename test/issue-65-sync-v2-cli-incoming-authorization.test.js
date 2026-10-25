@@ -50,6 +50,9 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
   };
   let historicalVerifierArgs = null;
   imports["./rootark-sync-zk1-physical-binding"] = {
+    snapshotLocalDevicePolicy: (policy) => ({ username: policy.username,
+      trustedDevicePublicKeys: { ...policy.trustedDevicePublicKeys },
+      revokedDeviceIds: [...policy.revokedDeviceIds] }),
     verifySyncV2HistoricalWitnessAdmission: async (input) => {
       historicalVerifierArgs = input;
       return { authorizesHistoricalRead: true };
@@ -113,7 +116,9 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
     once: true }), /Independent witness evidence provider/);
   const externalPins = Object.freeze({ pinnedWitnessPublicKey: "trusted-witness-key",
     pinnedInventoryPublicKey: "trusted-inventory-key", trustedMinimumFloor: {
-      sequence: 9, lastHash: "externally-pinned" } });
+      sequence: 9, lastHash: "externally-pinned" },
+    localTrustedDevicePolicy: { username: "alice",
+      trustedDevicePublicKeys: { device1: publicKey }, revokedDeviceIds: [] } });
   let challenge;
   await sandboxModule.exports.start({ config: "not-opened.json", once: true,
     trustedHistoricalAdmission: externalPins,
@@ -137,6 +142,51 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
       "untrusted provider cannot overwrite the provisioned signer");
     assert.equal(historicalVerifierArgs.localTrustedDevicePolicy.username, "alice");
   } finally { Date.now = now; }
+  // The mutable JSON policy can be rolled back or poisoned independently of
+  // the protected external minimum; it must have no effect on strict checks.
+  config.revokedDeviceIds.push("device1");
+  config.trustedDevicePublicKeys.device1 = attackerPublicKey;
+  assert.equal(await engineOptions.verifyIncoming(signedIncoming), true,
+    "strict mode uses independently pinned device keys, not the altered JSON");
+  assert.equal(await engineOptions.authorizeOutgoing({ deviceId: "device1" }), true);
+  config.revokedDeviceIds.pop();
+  config.trustedDevicePublicKeys.device1 = publicKey;
+  // Verification can finish after its authorization expires. Strict mode
+  // re-checks the clock and refuses to promote this as a fresh acceptance.
+  let releaseVerification;
+  imports["./rootark-sync-authorization"] = { ...authorization,
+    verifyAuthorizationProof: async (...args) => {
+      const verified = await authorization.verifyAuthorizationProof(...args);
+      await new Promise((resolve) => { releaseVerification = resolve; });
+      return verified;
+    },
+  };
+  const delayedModule = { exports: {} };
+  // Use a second script instance so its destructured verification function
+  // is the deliberately delayed signer fixture.
+  vm.runInNewContext(source, {
+    module: delayedModule, exports: delayedModule.exports,
+    require(name) { if (!Object.hasOwn(imports, name)) throw Error(name); return imports[name]; },
+    process: { env: { ROOTARK_SYNC_FILE_KEY: crypto.randomBytes(32).toString("base64url"),
+      ROOTARK_SYNC_DEVICE_PRIVATE_KEY: keys.privateKey.export({ type: "pkcs8", format: "der" }).toString("base64url"),
+      ROOTARK_SYNC_DEVICE_PUBLIC_KEY: publicKey }, cwd: () => process.cwd(), argv: [] },
+    Buffer, Date, console: { log() {} }, setTimeout,
+  }, { filename: "sync-client/rootark-sync-v2.js" });
+  await delayedModule.exports.start({ config: "not-opened.json", once: true,
+    requireIndependentHistoricalAdmission: true, trustedHistoricalAdmission: externalPins,
+    historicalEvidenceProvider: async () => ({}) });
+  const freshNow = Date.now;
+  try {
+    Date.now = () => signature.expiresAt - 1;
+    const verifying = engineOptions.verifyIncoming(signedIncoming);
+    for (let attempt = 0; !releaseVerification && attempt < 20; attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(typeof releaseVerification, "function");
+    Date.now = () => signature.expiresAt + 1;
+    releaseVerification();
+    assert.equal(await verifying, false, "expiry during Ed25519 must fail closed");
+  } finally { Date.now = freshNow; }
   // An attacker rolling the JSON config back cannot disable an externally
   // enforced historical policy, even when the old journal claims admission.
   delete config.historicalAdmissionMode;

@@ -592,6 +592,18 @@ full signed ancestry for later witness heads exists. No production historical
 admission guarantee or issue #65 GO can be claimed from this standalone
 verifier. Do not bootstrap witness trust from the mutable local sync config.
 
+Follow-up security validation (2026-10-25): the witness's signed admission
+timestamp must be STRICTLY earlier than the device signature expiration (equal
+milliseconds fail), and strict fresh verification checks expiration again after
+asynchronous signature verification. Signer separation compares native Ed25519
+KeyObject identities, bypassing attacker-defined `.export()` methods. Strict
+mode now also requires a separately provisioned `localTrustedDevicePolicy`
+containing username, device SPKI pins and current revocations; both historical
+and fresh verification use that detached policy, and local outgoing revocations
+cannot be lifted by editing the on-disk config. Without independent policy
+custody the strict mode refuses to start; this is not a substitute for a
+fresh network revocation source or durable independent floor retention.
+
 Last reconstructed: 2026-07-25 (historical baseline)
 Latest application-code snapshot for this closure: 2026-10-16 after PR #201 merged at `341804fa2bfd02dcd50f2d1bde560cb677fc27fd`. The [2026-10-16 pre-publication snapshot](validation/2026-10-16-rootark-prepublication-closure.md) records GitHub state and validation evidence queried after PR #199; it is historical and does not describe PR #201 or later commits. Track the final exact `Root/main` SHA and local validation for the documentation-only closure publication in the [final closure PR #202](https://github.com/bielxdh3/Root.ark/pull/202).
 
