@@ -13,7 +13,18 @@ const express = require("express");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { SyncObjectStore, registerSyncRoutes } = require("../src/routes/sync");
+const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 const execFileAsync = promisify(execFile);
+
+async function isolatedRegistryDirectory(prefix) {
+  if (process.platform !== "win32") return fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  // The Windows test machine's %TEMP% inherits broad Modify rights. Strict
+  // atomic mode intentionally refuses it; provision ONLY a disposable child
+  // below the separately protected per-user LocalAppData ancestry instead.
+  const directory = path.join(process.env.LOCALAPPDATA, `${prefix}${crypto.randomBytes(8).toString("hex")}`);
+  ensureWindowsChunkUploadRoot(directory);
+  return directory;
+}
 
 function post(port, body) {
   return new Promise((resolve, reject) => {
@@ -29,7 +40,7 @@ function post(port, body) {
 }
 
 test("revocation committed before sync put must fence operation across authorization gap", async (t) => {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-sync-revoke-race-"));
+  const directory = await isolatedRegistryDirectory("rootark-sync-revoke-race-");
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const storagePath = path.join(directory, "objects.json");
   const keys = crypto.generateKeyPairSync("ed25519");
@@ -84,7 +95,7 @@ test("revocation committed before sync put must fence operation across authoriza
 });
 
 test("strict co-located mode rejects an external registry or callback and refuses unmigrated stores", async (t) => {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-sync-registry-strict-"));
+  const directory = await isolatedRegistryDirectory("rootark-sync-registry-strict-");
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const storagePath = path.join(directory, "objects.json");
   const app = express();
@@ -104,7 +115,7 @@ test("strict co-located mode rejects an external registry or callback and refuse
 });
 
 test("global epoch CAS is serialized across store instances and restart", async (t) => {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-sync-registry-cas-"));
+  const directory = await isolatedRegistryDirectory("rootark-sync-registry-cas-");
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const storagePath = path.join(directory, "objects.json");
   const pair = crypto.generateKeyPairSync("ed25519");
@@ -126,7 +137,7 @@ test("global epoch CAS is serialized across store instances and restart", async 
 });
 
 test("registered signer can commit; wrong signer, revoked signer, and legacy process cannot", async (t) => {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-sync-signature-"));
+  const directory = await isolatedRegistryDirectory("rootark-sync-signature-");
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const storagePath = path.join(directory, "objects.json");
   const store = await new SyncObjectStore(storagePath, { atomicDeviceRegistry: true }).open();
@@ -160,7 +171,7 @@ test("registered signer can commit; wrong signer, revoked signer, and legacy pro
 });
 
 test("atomic device authorization expires during Ed25519 verification before durable commit", async (t) => {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-sync-expiry-race-"));
+  const directory = await isolatedRegistryDirectory("rootark-sync-expiry-race-");
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const store = await new SyncObjectStore(path.join(directory, "objects.json"),
     { atomicDeviceRegistry: true }).open();
@@ -202,7 +213,7 @@ test("atomic device authorization expires during Ed25519 verification before dur
 });
 
 test("a separate Node process revokes durably before a queued HTTP object commit", async (t) => {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-sync-revoke-process-"));
+  const directory = await isolatedRegistryDirectory("rootark-sync-revoke-process-");
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const storagePath = path.join(directory, "objects.json");
   const keys = crypto.generateKeyPairSync("ed25519");

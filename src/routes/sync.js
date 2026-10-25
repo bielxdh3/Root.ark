@@ -14,6 +14,8 @@ const {
   MAX_DEVICES, assertAtomicDeviceRegistry, emptyAtomicDeviceRegistry, invalidRegistry,
   validIdentifier, validPublicKey,
 } = require("../services/syncAtomicDeviceRegistry");
+const { assertAtomicRegistryStoragePermissions } =
+  require("../services/syncAtomicRegistryStoragePermissions");
 
 const STORE_VERSION = 2;
 const MAX_HISTORY_PER_OBJECT = 32;
@@ -23,6 +25,10 @@ const MAX_CIPHERTEXT_BYTES = 8 * 1024 * 1024;
 const WINDOWS_RENAME_MAX_ATTEMPTS = 3;
 const WINDOWS_RENAME_RETRY_DELAY_MS = 10;
 const SYNC_LOCK_WAIT_MS = 2000;
+// The Windows native NTFS ACL audit must inspect the complete private
+// directory before/inside each writer critical section. A 2s wait can expire
+// before the first verified writer releases its lock; never steal a lock.
+const ATOMIC_DEVICE_LOCK_WAIT_MS = 30000;
 
 function isUnsupportedDirectorySync(error) {
   return ["EINVAL", "ENOTSUP"].includes(error?.code)
@@ -95,9 +101,10 @@ function ensureOwnMap(record, key) {
   return value;
 }
 
-async function durableWrite(filePath, value) {
+async function durableWrite(filePath, value, requirePrivateStorage = false) {
   const directory = path.dirname(filePath);
-  await fs.mkdir(directory, { recursive: true });
+  if (requirePrivateStorage) assertAtomicRegistryStoragePermissions(filePath);
+  else await fs.mkdir(directory, { recursive: true });
   const temporary = `${filePath}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
   const handle = await fs.open(temporary, "w", 0o600);
   try {
@@ -106,10 +113,18 @@ async function durableWrite(filePath, value) {
   } finally {
     await handle.close();
   }
+  let renamed = false;
   try {
+    if (requirePrivateStorage) assertAtomicRegistryStoragePermissions(filePath);
     await renameWithRetry(temporary, filePath);
+    renamed = true;
+    if (requirePrivateStorage) assertAtomicRegistryStoragePermissions(filePath);
   } catch (error) {
     await fs.unlink(temporary).catch(() => {});
+    // The JSON may already have replaced the old registry. An ACL mismatch
+    // discovered after rename cannot be returned as a retryable non-commit:
+    // quarantine the cross-process lock until explicit operator recovery.
+    if (renamed && requirePrivateStorage) error.syncCommitIndeterminate = true;
     throw error;
   }
   try {
@@ -267,8 +282,10 @@ class SyncObjectStore {
   // writer therefore requires explicit operator recovery and remains NO-GO.
   async withWriteLock(callback) {
     const lockPath = `${this.filePath}.writer-lock`;
-    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    const deadline = Date.now() + SYNC_LOCK_WAIT_MS;
+    if (this.atomicDeviceRegistry) assertAtomicRegistryStoragePermissions(this.filePath);
+    else await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+    const deadline = Date.now() + (this.atomicDeviceRegistry
+      ? ATOMIC_DEVICE_LOCK_WAIT_MS : SYNC_LOCK_WAIT_MS);
     let handle;
     while (!handle) {
       try {
@@ -283,6 +300,7 @@ class SyncObjectStore {
     }
     let quarantine = false;
     try {
+      if (this.atomicDeviceRegistry) assertAtomicRegistryStoragePermissions(this.filePath);
       return await callback();
     } catch (error) {
       // rename succeeded but the parent-directory durability barrier did
@@ -306,6 +324,7 @@ class SyncObjectStore {
   }
 
   async readCurrentState() {
+    if (this.atomicDeviceRegistry) assertAtomicRegistryStoragePermissions(this.filePath);
     const current = JSON.parse(await fs.readFile(this.filePath, "utf8"));
     if (![1, STORE_VERSION].includes(current.version) || !current.users || typeof current.users !== "object" || Array.isArray(current.users)) {
       throw new Error("Invalid sync object store");
@@ -317,6 +336,7 @@ class SyncObjectStore {
 
   readSnapshot() {
     if (this.commitIndeterminate) throw indeterminateCommitError();
+    if (this.atomicDeviceRegistry) assertAtomicRegistryStoragePermissions(this.filePath);
     const lockPath = `${this.filePath}.writer-lock`;
     const busy = () => Object.assign(new Error("Sync inventory writer is active"), { code: "SYNC_STORE_LOCK_BUSY" });
     // Atomic replacement permits a complete disk snapshot, but do not serve
@@ -348,11 +368,11 @@ class SyncObjectStore {
               if (!ownRecord(revisions, objectId)) setOwnRecord(revisions, objectId, record.revision);
             }
           }
-          await durableWrite(this.filePath, this.state);
+          await durableWrite(this.filePath, this.state, this.atomicDeviceRegistry);
         }
       } catch (error) {
         if (error.code !== "ENOENT") throw error;
-        await durableWrite(this.filePath, this.state);
+        await durableWrite(this.filePath, this.state, this.atomicDeviceRegistry);
       }
     });
     return this;
@@ -372,7 +392,7 @@ class SyncObjectStore {
         const next = JSON.parse(JSON.stringify(await this.readCurrentState()));
         result = await mutator(next);
         try {
-          await durableWrite(this.filePath, next);
+          await durableWrite(this.filePath, next, this.atomicDeviceRegistry);
         } catch (error) {
           if (error?.syncCommitIndeterminate === true) this.commitIndeterminate = true;
           throw error;

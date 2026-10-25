@@ -15,6 +15,35 @@ cases and a real Mammoth DOCX extraction were added. This is a conditional
 local-filesystem threat; no network-only exploit has been demonstrated.
 It does not establish completion of PR #228 or release readiness.
 
+## Issue #65 / PR #228: strict atomic device-registry storage permissions (2026-10-25)
+
+The opt-in same-file device registry now **fails closed** unless the complete
+storage directory is provisioned with a private service-owned ACL (Windows) or
+strict private ownership/mode (POSIX). On Windows it reuses the native NTFS
+GetNamedSecurityInfoW-based verification used for protected chunk staging:
+the storage directory must have a protected DACL with only the service
+principal, SYSTEM and Administrators, and its ancestors must not be replaceable
+by other local principals. Store, exclusive writer lock and rename-temp files
+are inspected before critical operations. An ACL failure observed after the
+atomic JSON rename quarantines the writer lock and flags the commit as
+indeterminate rather than permitting a blind retry. On POSIX the owned directory must
+be 0700, store/lock/temp files 0600, without symlinks or hardlinks, and
+writable ancestors require a root-owned sticky directory. Existing shared
+directories or ACLs are **never altered or hardened automatically**.
+
+In particular, the existing `E:/servidor/data` inherits broad local Modify
+rights in the tested Windows environment and **cannot** host the protected
+atomic registry. An operator must separately provision a service-private
+directory under safe ancestry before enabling
+`SYNC_ATOMIC_DEVICE_REGISTRY=true` and point `SYNC_OBJECTS_FILE` there.
+No claim of external nonrollbackable monotonic anchoring, protection against
+the privileged service principal/Administrators/SYSTEM, cross-volume
+durability, or readiness for production is made. Native NTFS ACL verification
+adds measurable latency to synchronous operations and may reject concurrent
+changes closed; only atomic mode receives a longer bounded writer-lock wait.
+The existing legacy mode remains unchanged.
+
+
 ## Issue #65 / PR #228: Windows Edge V2 IPv4 fixture binding (2026-10-24)
 
 The disposable positive Edge + strict mTLS CAS/witness fixture bound both HTTPS
