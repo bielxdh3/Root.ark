@@ -1,5 +1,25 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: Windows release-gate Phase 16 authorization fixture (2026-10-25)
+
+At hosted SHA `37efce2`, Windows Node 22 mandatory release gate job
+`121238464999` failed only the Phase 16 final-corrections suite (27/28):
+its historical `device authorization is exact, signed, expiry-bound, and
+revocable` fixture still used an **external mutable JSON device registry** and
+expected an HTTP `201`. The new protected Sync v2 atomic-ingress rule correctly
+returned HTTP `503 SYNC_PROTECTED_ATOMIC_REQUIRED`. Production behavior is
+unchanged; weakening this rejection would reinstate the revocation race.
+
+The test now provisions its own protected Windows ACL/owner-only POSIX directory,
+authoritative disposable SQLite user/session/permission record, and co-located
+atomic registry with explicit Ed25519 device enrollment. It exercises real HTTP
+creation (`201`), replay rejection (`409`), an **independently signed** proof
+rejected after expiry (`403`), and an independently signed proof rejected after
+durable device revocation (`403`). No legacy JSON trust is treated as an atomic
+authority. Windows Node 22 targeted RED was `503 !== 201`, corrected targeted
+GREEN **1/1**, full Phase 16 **28/28**; Windows Node 24 targeted **1/1**.
+Hosted release-gate revalidation remains necessary; the PR stays DRAFT / NO-GO.
+
 ## Issue #65 / PR #228: protected Sync v2 atomic revocation ingress gate (2026-10-25)
 
 **Security follow-up (independent W15 P1/P2 review).** The legacy direct-store
