@@ -8,6 +8,7 @@ const path = require("node:path");
 const { spawn, execFileSync } = require("node:child_process");
 const test = require("node:test");
 const WebSocket = require("ws");
+const { waitForIndexedDbEdgePage } = require("./support/issue-65-trusted-device-edge-target");
 
 const ROOT = path.resolve(__dirname, "..");
 const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
@@ -362,6 +363,45 @@ async function connectDevTools(socketUrl) {
   return { socket, send };
 }
 
+test("IndexedDB Edge target waits for DevTools readiness after a port appears", async () => {
+  let calls = 0;
+  const found = await waitForIndexedDbEdgePage({
+    getPort: () => 41414,
+    getTargets: async () => {
+      calls++;
+      if (calls === 1) throw Object.assign(Error("not listening"), { code: "ECONNREFUSED" });
+      if (calls === 2) return [];
+      return [{ type: "page", webSocketDebuggerUrl:
+        "ws://127.0.0.1:41414/devtools/page/fixture" }];
+    },
+    pause: async () => {},
+  });
+  assert.deepEqual(found, { port: 41414,
+    url: "ws://127.0.0.1:41414/devtools/page/fixture" });
+  assert.equal(calls, 3);
+});
+
+test("IndexedDB Edge target rejects a foreign debugger and exits within original deadline", async () => {
+  await assert.rejects(waitForIndexedDbEdgePage({
+    getPort: () => 41414,
+    getTargets: async () => [{ type: "page",
+      webSocketDebuggerUrl: "ws://example.org:41414/devtools/page/fixture" }],
+  }), /EDGE_INDEXEDDB_UNSAFE_DEBUGGER_TARGET/);
+  let elapsed = 0;
+  await assert.rejects(waitForIndexedDbEdgePage({
+    getPort: () => 0,
+    getTargets: () => { throw Error("must not fetch invalid port"); },
+    now: () => elapsed,
+    pause: async (ms) => { elapsed += ms; },
+    timeoutMs: 15000,
+  }), /EDGE_INDEXEDDB_PAGE_NOT_READY/);
+  assert.equal(elapsed, 15000);
+  await assert.rejects(waitForIndexedDbEdgePage({
+    getPort: () => 41414, isExited: () => true,
+    getTargets: () => { throw Error("must not poll a dead browser"); },
+  }), /EDGE_INDEXEDDB_BROWSER_EXITED/);
+});
+
 test("real Edge IndexedDB restores nonextractable trusted-device keys for independent recovery", {
   timeout: 60000,
 }, async (t) => {
@@ -397,15 +437,27 @@ test("real Edge IndexedDB restores nonextractable trusted-device keys for indepe
   let client;
   try {
     const activePort = path.join(profile, "DevToolsActivePort");
-    const port = await waitFor(() => {
-      if (!fs.existsSync(activePort)) return null;
-      const value = Number(fs.readFileSync(activePort, "utf8").split(/\r?\n/)[0]);
-      return Number.isSafeInteger(value) && value > 0 ? value : null;
+    const debuggerPage = await waitForIndexedDbEdgePage({
+      getPort: () => {
+        try {
+          const value = Number(fs.readFileSync(activePort, "utf8").split(/\r?\n/)[0]);
+          return Number.isSafeInteger(value) && value > 0 ? value : null;
+        } catch (error) {
+          if (error.code === "ENOENT") return null;
+          throw error;
+        }
+      },
+      isExited: () => edge.exitCode !== null || edge.signalCode !== null,
+      getTargets: async (value, remainingMs) => {
+        const response = await fetch("http://127.0.0.1:" + value + "/json/list", {
+          signal: AbortSignal.timeout(remainingMs),
+        });
+        if (!response.ok) throw Error("EDGE_INDEXEDDB_DEBUGGER_NOT_READY");
+        return response.json();
+      },
     });
-    const targets = await (await fetch("http://127.0.0.1:" + port + "/json/list")).json();
-    const page = targets.find((item) => item.type === "page");
-    assert.ok(page?.webSocketDebuggerUrl, "isolated Edge tab must be accessible");
-    client = await connectDevTools(page.webSocketDebuggerUrl);
+    const port = debuggerPage.port;
+    client = await connectDevTools(debuggerPage.url);
     await client.send("Page.enable");
     await client.send("Runtime.enable");
     await client.send("Page.navigate", { url: origin + "/" });
