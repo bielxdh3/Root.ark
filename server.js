@@ -1326,6 +1326,7 @@ function loadAuditLogs(file = AUDIT_LOGS_FILE) {
       const entries = auditRepository.loadAuditLogs();
       if (entries.logs.length || !shouldReadJsonFallback()) return entries;
     } catch (error) {
+      if (error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE") throw error;
       console.error("Falha ao ler auditoria do SQLite:", error.message);
       if (!shouldReadJsonFallback()) return getDefaultAuditLogs();
     }
@@ -1534,6 +1535,13 @@ function archiveAuditLogs(logs) {
 }
 
 function appendAuditLog(log) {
+  // Synchronous audit callsites must never silently drop post-commit events.
+  // While strict Sync owns the primary SQLite writer, durably stage a pending
+  // audit in its independent journal, then include it on subsequent reads.
+  if (shouldUseDatabase() && !shouldWriteLegacyJson() && auditRepository.deferIfStrictSyncWriter(log)) {
+    broadcastDataChanged("audit");
+    return;
+  }
   const entries = loadAuditLogs();
   const cutoff = Date.now() - AUDIT_RETENTION_MS;
   const retained = entries.logs.filter((entry) => {

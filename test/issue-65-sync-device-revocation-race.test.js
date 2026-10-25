@@ -21,7 +21,10 @@ const usersRepository = require("../repositories/usersRepository");
 const execFileAsync = promisify(execFile);
 
 function configureStrictSqliteAuthority(t) {
-  const directory = fsSync.mkdtempSync(path.join(os.tmpdir(), "rootark-sync-authority-"));
+  const directory = process.platform === "win32"
+    ? path.join(process.env.LOCALAPPDATA, "rootark-sync-authority-" + crypto.randomBytes(8).toString("hex"))
+    : fsSync.mkdtempSync(path.join(os.tmpdir(), "rootark-sync-authority-"));
+  if (process.platform === "win32") ensureWindowsChunkUploadRoot(directory);
   const prior = { DATABASE_URL: process.env.DATABASE_URL,
     DB_ENABLED: process.env.DB_ENABLED, DB_WRITE_LEGACY_JSON: process.env.DB_WRITE_LEGACY_JSON };
   process.env.DATABASE_URL = path.join(directory, "accounts.sqlite");

@@ -1,4 +1,5 @@
 const { getDb } = require("../db");
+const { assertNoLocalStrictSyncWriter } = require("../src/services/syncSqliteAccountWriteFence");
 const { jsonStringify, randomId, runWrite, safeJsonParse } = require("./repositoryUtils");
 
 const ANALYTICS_KEYS = [
@@ -67,6 +68,7 @@ function loadAnalytics() {
 }
 
 function saveAnalytics(entries = {}) {
+  assertNoLocalStrictSyncWriter();
   const db = getDb();
   runWrite(db, () => {
     db.prepare("DELETE FROM analytics_events").run();

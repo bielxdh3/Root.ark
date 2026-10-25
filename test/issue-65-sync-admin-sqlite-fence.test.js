@@ -19,6 +19,8 @@ const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindows
 const { runMigrations } = require("../db/migrations");
 const { closeDb } = require("../db");
 const users = require("../repositories/usersRepository");
+const auditRepository = require("../repositories/auditRepository");
+const analyticsRepository = require("../repositories/analyticsRepository");
 
 const execFileAsync = promisify(execFile);
 
@@ -288,6 +290,70 @@ test("same-process admin account update fails fast during protected Sync without
   assert.equal(await pending, 201);
   users.saveUsers([{ ...users.loadUsers()[0], permissions: { upload: false } }]);
   assert.equal(await post(ctx.listener.address().port, await ctx.signedOperation("admin-after")), 403);
+});
+
+test("audit and analytics SQLite writes during strict Sync do not stall the event loop; audit survives reopen", async (t) => {
+  const ctx = await fixture(t);
+  const originalRename = fsp.rename;
+  let reachRename;
+  let releaseRename;
+  const reached = new Promise((resolve) => { reachRename = resolve; });
+  const released = new Promise((resolve) => { releaseRename = resolve; });
+  fsp.rename = async (...args) => {
+    if (args[1] === ctx.storagePath) { reachRename(); await released; }
+    return originalRename(...args);
+  };
+  t.after(() => { releaseRename(); fsp.rename = originalRename; });
+  const pending = post(ctx.listener.address().port, await ctx.signedOperation("audit-analytics-stall"));
+  await reached;
+  const auditEvent = { id: crypto.randomUUID(), eventType: "file.access.denied",
+    timestamp: new Date().toISOString(), actor: { username: "alice" },
+    action: "read", result: "failure", details: { reason: "missing_viewAuditLogs" } };
+  const began = performance.now();
+  let timerDelay = Infinity;
+  const timer = setTimeout(() => { timerDelay = performance.now() - began; }, 20);
+  t.after(() => clearTimeout(timer));
+  try {
+    // Direct legacy whole-table writers must NOT enter the blocking 5s SQLite
+    // busy wait. Server auditLog uses a durable sidecar for this one call.
+    assert.throws(() => auditRepository.saveAuditLogs({ logs: [auditEvent] }),
+      { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" });
+    assert.throws(() => analyticsRepository.saveAnalytics({ uploads: [{ id: "a1" }] }),
+      { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" });
+    assert.equal(auditRepository.deferIfStrictSyncWriter(auditEvent), true,
+      "the same fallback used by server appendAuditLog must persist a denied access");
+    assert.ok(performance.now() - began < 200, "all three operations must return in less than 200 ms");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.ok(timerDelay < 200, "audit/analytics must not starve the event loop");
+    assert.equal(auditRepository.loadAuditLogs().logs.filter((x) => x.id === auditEvent.id).length, 1,
+      "durably deferred audit should remain readable during Sync");
+  } finally {
+    releaseRename();
+  }
+  assert.equal(await pending, 201);
+  const once = auditRepository.loadAuditLogs().logs.filter((x) => x.id === auditEvent.id);
+  assert.equal(once.length, 1);
+  const readFromRestartedProcess = async () => {
+    const script = "const rows=require(process.argv[1]).loadAuditLogs().logs;process.stdout.write(JSON.stringify(rows.filter(x=>x.id===process.argv[2])))";
+    const { stdout } = await execFileAsync(process.execPath, ["-e", script,
+      require.resolve("../repositories/auditRepository"), auditEvent.id],
+    { timeout: 15000, env: { ...process.env, NODE_PATH: process.env.NODE_PATH } });
+    return JSON.parse(stdout);
+  };
+  assert.equal((await readFromRestartedProcess()).length, 1,
+    "a separate Node process can recover the durable pending audit after exit/restart");
+  auditRepository.saveAuditLogs({ logs: once });
+  assert.equal(auditRepository.loadAuditLogs().logs.filter((x) => x.id === auditEvent.id).length, 1,
+    "audit must migrate to primary SQLite once without duplication");
+  assert.equal((await readFromRestartedProcess()).length, 1,
+    "consolidated audit remains durably visible exactly once across processes");
+  assert.equal(auditRepository.deferIfStrictSyncWriter({ ...auditEvent, id: crypto.randomUUID() }), false,
+    "noncontended and legacy audit paths must still use the original primary writer");
+  assert.deepEqual(analyticsRepository.loadAnalytics().uploads, [],
+    "a failed analytics replace must not mutate the analytics ledger");
+  analyticsRepository.saveAnalytics({ uploads: [{ id: "event-after-fence", timestamp: new Date().toISOString() }] });
+  assert.equal(analyticsRepository.loadAnalytics().uploads.length, 1,
+    "analytics writes resume normally after protected Sync finishes");
 });
 
 test("strict REST rejects a missing SQLite authority or concurrent legacy JSON account writes at setup", (t) => {

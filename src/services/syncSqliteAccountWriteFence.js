@@ -80,6 +80,10 @@ function createSyncSqliteAccountWriteFence() {
     });
   }
   const dbPath = getDatabasePath();
+  // Validate a separate private, crash-durable audit journal before accepting
+  // strict requests. Without it, access-denial auditing would block SQLite
+  // during the cross-process authorization reservation.
+  require("../../repositories/auditRepository").preparePendingAuditJournal();
 
   return async function persistUnderAccountFence(user, operation, persist) {
     if (!user || typeof user.username !== "string" || !user.username
