@@ -741,6 +741,14 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     if (typeof payload.ciphertext === "string" && Buffer.byteLength(payload.ciphertext, "base64url") > MAX_CIPHERTEXT_BYTES) return errorResponse(res, 413, "Ciphertext too large");
     let operation;
     try { operation = validateOperation(payload); } catch (error) { return errorResponse(res, error.code === "payload_too_large" ? 413 : error.code?.startsWith("authorization") ? 403 : 400, "Invalid sync operation"); }
+    // POST and PUT carry the operation kind inside the signed envelope, so
+    // checking only the route's fixed "upload" permission would let an
+    // upload-only account delete objects by submitting a tombstone there.
+    // The account's current server-authenticated delete permission is required
+    // for every entry point that can persist a delete operation.
+    if (operation.operation === "delete" && req.user?.permissions?.delete !== true) {
+      return errorResponse(res, 403, "Sync delete permission required");
+    }
     if (!atomicDeviceRegistry && (requireDeviceAuthorization || verifyRegisteredDevice)) {
       if (typeof verifyRegisteredDevice !== "function" || !operation.authorization) return errorResponse(res, 403, "Sync device authorization required");
       try {
