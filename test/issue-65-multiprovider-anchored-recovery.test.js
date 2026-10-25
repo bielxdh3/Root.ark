@@ -276,6 +276,40 @@ test("anchored signed operation reconciles lost ACK, partial three-provider copy
   assert.equal(strictRecovery.independentPhysicalAttestationVerified, true,
     "three-provider restart/retry evidence must carry the composite local proof");
   assert.equal(strictRecovery.externalProviderDurabilityProven, false);
+  // Adversarial final-owner-verification stall: all remote copies and the
+  // independent PG proof were fresh at the last reconcile, but the owner
+  // checkpoint verifier's final awaited crypto crosses the 30-second bound.
+  // Returning the old attestation as fresh would fabricate a current receipt.
+  const delayedBridge = makeBridge(floor, ownerEnrollment(false), true);
+  const cloudRead = delayedBridge.reconcileCloudCopy.bind(delayedBridge);
+  let cloudChecks = 0;
+  let finalSweepComplete = false;
+  delayedBridge.reconcileCloudCopy = async (...args) => {
+    const outcome = await cloudRead(...args);
+    if (++cloudChecks === 6) finalSweepComplete = true;
+    return outcome;
+  };
+  const physicalReconcile = delayedBridge.reconcile.bind(delayedBridge);
+  const realNow = Date.now;
+  const initialNow = realNow();
+  let simulatedNow = initialNow;
+  let crossedAfterFinalReconcile = false;
+  try {
+    Date.now = () => simulatedNow;
+    delayedBridge.reconcile = async (...args) => {
+      const result = await physicalReconcile(...args);
+      if (finalSweepComplete && !crossedAfterFinalReconcile) {
+        crossedAfterFinalReconcile = true;
+        simulatedNow = initialNow + 31_000;
+      }
+      return result;
+    };
+    await assert.rejects(delayedBridge.reconcileOrPublishAnchoredCloudCopies(input),
+      /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+      "owner verification must not return a physically expired attestation");
+    assert.equal(cloudChecks, 6);
+    assert.equal(crossedAfterFinalReconcile, true);
+  } finally { Date.now = realNow; }
   const readsBeforeForgery = webdavRequests.length;
   currentPhysicalSigningKey = keys.privateKey;
   await assert.rejects(strictBridge.reconcileCloudCopy({ physical: expected,

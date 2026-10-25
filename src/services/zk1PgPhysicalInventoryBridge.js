@@ -370,7 +370,11 @@ class Zk1PgPhysicalInventoryBridge {
       if (combined.inventoryReceipt.sequence !== status.sequence
         || !same(combined.inventoryReceipt.root, status.root)) fail();
       return { ...status, independentPhysicalAttestationVerified: true,
-        physicalAttestationReceiptDigest: Buffer.from(combined.receiptDigest) };
+        physicalAttestationReceiptDigest: Buffer.from(combined.receiptDigest),
+        // Retain the verified SIGNED issuance time for callers with further
+        // asynchronous work. A proof that was fresh here may expire before
+        // owner enrollment or remote custody verification completes.
+        physicalAttestationIssuedAt: combined.physicalReadback.issuedAt };
     } catch (_) { fail(); }
   }
   // An already verified local PG+signed operation can be matched against the
@@ -671,6 +675,12 @@ class Zk1PgPhysicalInventoryBridge {
       inventorySignerKeyId: this.signerKeyId,
       nowSeconds: Math.floor(Date.now() / 1000),
     });
+    if (after.independentPhysicalAttestationVerified === true) {
+      // Final owner verification awaits deterministic CBOR and signature
+      // checks after the most recent PG readback; do not return a composite
+      // whose authenticated physical 30-second window ended meanwhile.
+      requireFreshSignedPhysical({ issuedAt: after.physicalAttestationIssuedAt });
+    }
     return Object.freeze({ status: "PG_SIGNED_AND_OWNER_SIGNED_CLOUD_COPIES_REREAD",
       operationId: Buffer.from(v.operation.operation_id),
       signedInventorySequence: signed.sequence,

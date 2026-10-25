@@ -1,5 +1,18 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: physical evidence freshness after multiprovider owner verification (2026-10-24)
+
+The strict multiprovider recovery path now retains the independently verified
+Ed25519-signed physical readback `issuedAt` from its final PostgreSQL inventory
+reconcile and checks it again after awaited owner-checkpoint authentication.
+Previously, a signed proof verified at age 29 seconds could be returned as a
+fresh composite after the owner verification stalled until age 31 seconds.
+An adversarial isolated WebDAV HTTPS + S3/Drive fixture reproduced this RED,
+then passed GREEN; Windows Node 22 and 24 focused matrix: 12 PASS / 0 FAIL
+each. This avoids an extra physical network request and does not establish
+trusted monotonic time, independent external durability, historic Sync v2
+admission, or end-to-end PG18 correctness. PR #228 remains DRAFT / NO-GO.
+
 ## Issue #65 / PR #228: strict PostgreSQL bridge proof freshness (2026-10-24)
 
 The strict independent-attestor branch of `Zk1PgPhysicalInventoryBridge`
