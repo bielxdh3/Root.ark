@@ -12,6 +12,37 @@ const { SyncObjectStore, registerSyncRoutes } = require("../src/routes/sync");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
+const { runMigrations } = require("../db/migrations");
+const { closeDb } = require("../db");
+
+async function strictSqliteAuthority(t) {
+  // The strict route also requires an independent, durable SQLite account
+  // authority. Supply it in these negative *object-store* tests so they reach
+  // the intended legacy-migration / unsafe-ACL guard instead of failing early
+  // because DB_ENABLED defaults to false in a standalone test process.
+  const original = {
+    DB_ENABLED: process.env.DB_ENABLED,
+    DATABASE_URL: process.env.DATABASE_URL,
+    DB_WRITE_LEGACY_JSON: process.env.DB_WRITE_LEGACY_JSON,
+  };
+  const directory = process.platform === "win32"
+    ? path.join(process.env.LOCALAPPDATA,
+      "zk65-strict-sqlite-test-" + crypto.randomBytes(8).toString("hex"))
+    : await fs.mkdtemp(path.join(os.tmpdir(), "zk65-strict-sqlite-test-"));
+  if (process.platform === "win32") ensureWindowsChunkUploadRoot(directory);
+  process.env.DB_ENABLED = "true";
+  process.env.DB_WRITE_LEGACY_JSON = "false";
+  process.env.DATABASE_URL = path.join(directory, "accounts.sqlite");
+  t.after(async () => {
+    closeDb();
+    for (const [key, value] of Object.entries(original)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+  runMigrations({ backup: false });
+}
 
 function request(port, method, object) {
   return new Promise((resolve, reject) => {
@@ -142,6 +173,7 @@ test("required signed device mode with missing proof returns explicit 503, not l
 });
 
 test("strict registry refuses legacy store across restart without migrating unsigned data", async (t) => {
+  await strictSqliteAuthority(t);
   const directory = process.platform === "win32"
     ? path.join(process.env.LOCALAPPDATA, "zk65-atomic-no-silent-migration-"
       + crypto.randomBytes(8).toString("hex"))
@@ -175,6 +207,7 @@ test("strict registry refuses legacy store across restart without migrating unsi
 });
 
 test("private ACL required: unsafe atomic registry fails closed with HTTP 503 and no new store", async (t) => {
+  await strictSqliteAuthority(t);
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "zk65-atomic-unsafe-perms-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   if (process.platform !== "win32") await fs.chmod(directory, 0o755);
