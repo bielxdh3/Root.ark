@@ -295,3 +295,74 @@ test("owner revocation quiescence wins before witness catalog admission and deni
   await assert.rejects(f.ledger.beginCatalogAdmission(f.input), /WITNESS_CATALOG_DENIED/,
     "PENDING owner revision cannot issue any late catalog authorization");
 });
+
+test("P2 RED: forged SQLite terminal cannot subtract an unfinished physical admission", async (t) => {
+  const f = await fixture(t);
+  const admitted = await f.ledger.beginCatalogAdmission(f.input);
+  const Database = require("better-sqlite3");
+  const foreign = new Database(f.file);
+  try {
+    foreign.prepare("INSERT INTO witness_catalog_terminal(admission_id,floor_proof,terminal_seal) VALUES(?,?,?)")
+      .run(admitted.admissionId, Buffer.from([0x82, 0x01, 0x02, 0x03]),
+        crypto.randomBytes(64));
+    assert.equal(foreign.pragma("quick_check", { simple: true }), "ok");
+  } finally { foreign.close(); }
+  await assert.rejects(f.ledger.prepareQuiesce(f.next), /WITNESS_CATALOG_DENIED/,
+    "unsigned terminal injected into intact SQLite cannot mark physical work drained");
+  await assert.rejects(f.ledger.reserve(f.next), /WITNESS_CATALOG_DENIED|WITNESS_CATALOG_ACTIVE/,
+    "owner cannot revoke while the job remains physically ACTIVE");
+  f.ledger.close();
+  assert.throws(f.open, /WITNESS_CATALOG_DENIED/,
+    "restarting may not trust a forged terminal despite SQLite quick_check=ok");
+});
+
+test("a valid FLOOR completion cannot be altered in SQL while retaining the witness terminal seal", async (t) => {
+  const f = await fixture(t);
+  const admitted = await f.ledger.beginCatalogAdmission(f.input);
+  await f.ledger.completeCatalogAdmission({ scope: f.input.scope,
+    admissionId: admitted.admissionId, principal: f.input.principal,
+    floorProof: await f.signFloor(admitted) });
+  const Database = require("better-sqlite3");
+  const foreign = new Database(f.file);
+  try {
+    // Simulate a DB editor restoring the exact native immutability trigger
+    // after modifying a terminal. SQLite integrity checks still report OK.
+    foreign.exec("DROP TRIGGER catalog_terminal_update");
+    foreign.prepare("UPDATE witness_catalog_terminal SET floor_proof=? WHERE admission_id=?")
+      .run(Buffer.from([0xa0, 0xa1, 0xa2, 0xa3]), admitted.admissionId);
+    foreign.exec(`CREATE TRIGGER catalog_terminal_update
+      BEFORE UPDATE ON witness_catalog_terminal
+      BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END`);
+    assert.equal(foreign.pragma("quick_check", { simple: true }), "ok");
+  } finally { foreign.close(); }
+  await assert.rejects(f.ledger.prepareQuiesce(f.next), /WITNESS_CATALOG_DENIED/,
+    "terminal proof modified under restored trigger cannot falsely drain revocation");
+  f.ledger.close();
+  assert.throws(f.open, /WITNESS_CATALOG_DENIED/,
+    "valid terminal witness seal cannot be replayed over changed FLOOR bytes after restart");
+});
+
+test("P2 RED: lost START ACK replays exact grant for cleanup only after QUIESCING or expiry", async (t) => {
+  const f = await fixture(t);
+  const admitted = await f.ledger.beginCatalogAdmission(f.input);
+  assert.deepEqual(await f.ledger.prepareQuiesce(f.next),
+    { status: "QUIESCING", activeCount: 1 });
+  const quiescedReplay = await f.ledger.beginCatalogAdmission(f.input);
+  assert.deepEqual(quiescedReplay, { admissionId: admitted.admissionId, proceed: false },
+    "a retry gives only the original completion identity, no usable fresh ticket");
+  await assert.rejects(f.ledger.beginCatalogAdmission({
+    ...f.input, policyGrant: await f.signPolicy(f.input),
+  }), /WITNESS_CATALOG_DENIED/,
+  "a newly signed token is NOT the original replay during quiescence");
+  f.ledger.close();
+  const restarted = f.open();
+  f.setClock(951);
+  assert.deepEqual(await restarted.beginCatalogAdmission(f.input),
+    { admissionId: admitted.admissionId, proceed: false },
+    "exact durable replay survives restart and expiry without extending authority");
+  assert.deepEqual(await restarted.prepareQuiesce(f.next),
+    { status: "QUIESCING", activeCount: 1 });
+  await assert.rejects(restarted.reserve({ ...f.next, expires_at: 1100 }),
+    /WITNESS_QUIESCING|WITNESS_CATALOG_ACTIVE/,
+    "replay cannot unquiesce or release owner STOP");
+});

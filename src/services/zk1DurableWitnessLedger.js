@@ -23,6 +23,8 @@ const CATALOG_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-catalog-admis
 const CATALOG_POLICY_DOMAIN = Buffer.from(
   "Root.ark/zk-1/recovery-witness-catalog-policy-grant/v1\0", "ascii");
 const CATALOG_POLICY_TYPE = "rootark-recovery-witness-catalog-policy-grant/v1";
+const CATALOG_TERMINAL_SEAL_DOMAIN = Buffer.from(
+  "Root.ark/zk-1/recovery-witness-catalog-terminal-seal/v1\0", "ascii");
 const CATALOG_POLICY_FIELDS = Object.freeze([
   "type", "account_id", "compartment_id", "keyring_id", "operation_id",
   "owner_revision", "owner_digest", "signer_device_id", "epoch", "sequence",
@@ -151,7 +153,41 @@ function catalogRequest(input) {
     policyGrant: bytes(input.policyGrant, 1, 4096) };
 }
 
-function catalogSchema(db, floorFingerprint, policyFingerprint) {
+// The seal is written ONLY after a complete FLOOR Ed25519 signature and
+// admission binding check. It makes direct SQLite INSERT with unverified
+// floor_proof detectable synchronously on startup and while holding the
+// same BEGIN IMMEDIATE lock that decides owner revocation/quiescence.
+function catalogTerminalSealMessage(row) {
+  const fields = ["admission_id", "scope_key", "keyring_id", "operation_id",
+    "principal", "owner_revision", "owner_digest", "signer_device_id",
+    "epoch", "sequence", "catalog_digest", "cas_fp", "expires_at",
+    "floor_nonce", "ticket", "policy_nonce", "policy_grant", "floor_proof"];
+  const serialized = fields.map((field) => {
+    const value = row[field];
+    if (Buffer.isBuffer(value)) return ["bytes", value.toString("base64url")];
+    if (typeof value === "string") return ["string", value];
+    if (Number.isSafeInteger(value)) return ["integer", value];
+    fail("WITNESS_CATALOG_DENIED");
+  });
+  if (!Buffer.isBuffer(row.admission_id) || row.admission_id.length !== 16
+    || !Buffer.isBuffer(row.floor_proof) || row.floor_proof.length < 1
+    || row.floor_proof.length > 4096) fail("WITNESS_CATALOG_DENIED");
+  return Buffer.concat([CATALOG_TERMINAL_SEAL_DOMAIN,
+    Buffer.from(JSON.stringify(serialized))]);
+}
+function assertCatalogTerminalSeals(db, publicKey) {
+  if (!publicKey) return;
+  const rows = db.prepare(`SELECT a.*,t.floor_proof,t.terminal_seal
+    FROM witness_catalog_terminal t
+    LEFT JOIN witness_catalog_admission a ON a.admission_id=t.admission_id`).all();
+  for (const row of rows) {
+    if (!Buffer.isBuffer(row.terminal_seal) || row.terminal_seal.length !== 64
+      || !crypto.verify(null, catalogTerminalSealMessage(row),
+        publicKey, row.terminal_seal)) fail("WITNESS_CATALOG_DENIED");
+  }
+}
+
+function catalogSchema(db, floorFingerprint, policyFingerprint, witnessPublicKey) {
   const entries = new Set(db.prepare("SELECT type,name FROM sqlite_master").all()
     .map(({ type, name }) => `${type}:${name}`));
   const has = entries.has("table:witness_catalog_identity");
@@ -182,7 +218,7 @@ function catalogSchema(db, floorFingerprint, policyFingerprint) {
       "operation_id", "principal", "owner_revision", "owner_digest",
       "signer_device_id", "epoch", "sequence", "catalog_digest", "cas_fp",
       "expires_at", "floor_nonce", "ticket", "policy_nonce", "policy_grant"],
-    witness_catalog_terminal: ["admission_id", "floor_proof"],
+    witness_catalog_terminal: ["admission_id", "floor_proof", "terminal_seal"],
   };
   for (const [table, names] of Object.entries(required)) {
     const actual = db.pragma(`table_info(${table})`).map((column) => column.name);
@@ -208,6 +244,7 @@ function catalogSchema(db, floorFingerprint, policyFingerprint) {
     || db.prepare("SELECT COUNT(*) AS n FROM witness_catalog_identity").get().n !== 1) {
     fail("WITNESS_CATALOG_DENIED");
   }
+  assertCatalogTerminalSeals(db, witnessPublicKey);
 }
 
 class Zk1DurableWitnessLedger {
@@ -281,7 +318,8 @@ class Zk1DurableWitnessLedger {
         if (!db.prepare(`SELECT name FROM sqlite_master
           WHERE type='table' AND name='witness_identity'`).get()) fail("WITNESS_STATE_MISSING");
         row = db.prepare("SELECT * FROM witness_identity WHERE id=1").get();
-        catalogSchema(db, floorFingerprint, policyFingerprint);
+        catalogSchema(db, floorFingerprint, policyFingerprint,
+          crypto.createPublicKey(witnessPrivateKey));
       } catch (error) {
         if (["WITNESS_STATE_MISSING", "WITNESS_CATALOG_DENIED"].includes(error.code)) throw error;
         fail("WITNESS_STATE_MISSING");
@@ -395,6 +433,7 @@ class Zk1DurableWitnessLedger {
             );
             CREATE TABLE witness_catalog_terminal (
               admission_id BLOB PRIMARY KEY, floor_proof BLOB NOT NULL,
+              terminal_seal BLOB NOT NULL CHECK(length(terminal_seal)=64),
               FOREIGN KEY(admission_id) REFERENCES witness_catalog_admission(admission_id)
             );
             CREATE TRIGGER catalog_admission_update BEFORE UPDATE ON witness_catalog_admission
@@ -410,7 +449,8 @@ class Zk1DurableWitnessLedger {
             .run(floorFingerprint, policyFingerprint);
         }
     }
-      catalogSchema(this.db, floorFingerprint, policyFingerprint);
+      catalogSchema(this.db, floorFingerprint, policyFingerprint,
+        crypto.createPublicKey(witnessPrivateKey));
     this.getScope = this.db.prepare("SELECT * FROM witness_scope WHERE scope_key=?");
     this.insertScope = this.db.prepare(
       "INSERT INTO witness_scope(scope_key,keyring_id,revision,digest,pending_id,tombstoned) VALUES(?,?,NULL,NULL,?,0)");
@@ -446,6 +486,7 @@ class Zk1DurableWitnessLedger {
       WHERE a.scope_key=? AND NOT EXISTS (
         SELECT 1 FROM witness_catalog_terminal t WHERE t.admission_id=a.admission_id
       )`);
+    this.catalogWitnessPublicKey = crypto.createPublicKey(witnessPrivateKey);
     } catch (error) {
       this.db.close();
       throw error;
@@ -487,6 +528,63 @@ class Zk1DurableWitnessLedger {
         this.catalogPolicyPublicKey, bytes(signature, 64))) fail("WITNESS_CATALOG_DENIED");
       return { nonce: bytes(body.nonce, 32), issuedAt: body.issued_at };
     } catch (_) { fail("WITNESS_CATALOG_DENIED"); }
+  }
+
+  assertCatalogTerminalIntegrity() {
+    if (this.catalogFloorPublicKey) {
+      assertCatalogTerminalSeals(this.db, this.catalogWitnessPublicKey);
+    }
+  }
+
+  async verifyCatalogFloorProof(scope, row, raw) {
+    try {
+      const proof = await z.decodeDeterministic(bytes(raw, 1, 4096));
+      const fields = ["type", "account_id", "compartment_id", "keyring_id",
+        "cas_signer_spki_sha256", "sequence", "digest", "nonce", "observed_at",
+        "admission_id", "operation_id", "owner_revision", "owner_digest",
+        "signer_device_id", "epoch", "expires_at", "signature"];
+      if (!proof || typeof proof !== "object" || Array.isArray(proof)
+        || Reflect.ownKeys(proof).length !== fields.length
+        || fields.some((field) => !Object.hasOwn(proof, field))) {
+        fail("WITNESS_CATALOG_DENIED");
+      }
+      const { signature, ...body } = proof;
+      if (body.type !== FLOOR_TYPE
+        || !["account_id", "compartment_id", "keyring_id"]
+          .every((name) => equal(body[name], scope[name]))
+        || !equal(body.cas_signer_spki_sha256, row.cas_fp)
+        || !equal(body.admission_id, row.admission_id)
+        || !equal(body.operation_id, row.operation_id)
+        || body.owner_revision !== row.owner_revision
+        || !equal(body.owner_digest, row.owner_digest)
+        || !equal(body.signer_device_id, row.signer_device_id)
+        || body.epoch !== row.epoch || body.expires_at !== row.expires_at
+        || !equal(body.nonce, row.floor_nonce)
+        || !equal(body.digest, row.catalog_digest)
+        || body.sequence !== row.sequence
+        || !Number.isSafeInteger(body.observed_at)
+        || body.observed_at > row.expires_at
+        || !crypto.verify(null, Buffer.concat([FLOOR_DOMAIN,
+          Buffer.from(await z.encodeDeterministic(body))]),
+        this.catalogFloorPublicKey, bytes(signature, 64))) {
+        fail("WITNESS_CATALOG_DENIED");
+      }
+      return proof;
+    } catch (_) { fail("WITNESS_CATALOG_DENIED"); }
+  }
+
+  async verifyCatalogTerminalProofs(scope) {
+    if (!this.catalogFloorPublicKey) return;
+    const scopeKey = compartmentKey(scope.account_id, scope.compartment_id);
+    const terminals = this.db.prepare(`SELECT a.*,t.floor_proof,t.terminal_seal
+      FROM witness_catalog_terminal t JOIN witness_catalog_admission a
+      ON a.admission_id=t.admission_id WHERE a.scope_key=?`).all(scopeKey);
+    for (const row of terminals) {
+      // Ed25519 must be checked against the original immutable admission,
+      // not inferred from a SQLite row or from the generic FLOOR read head.
+      await this.verifyCatalogFloorProof(scope, row, row.floor_proof);
+    }
+    this.assertCatalogTerminalIntegrity();
   }
 
   assertClockFloor(key, now) {
@@ -562,6 +660,7 @@ class Zk1DurableWitnessLedger {
     const policy = await this.verifyCatalogPolicy(req);
     const key = compartmentKey(req.scope.account_id, req.scope.compartment_id);
     const { row: checked } = await this.checkedScope(req.scope);
+    await this.verifyCatalogTerminalProofs(req.scope);
     const admissionId = crypto.randomBytes(16);
     const floorNonce = crypto.randomBytes(32);
     const ticket = await this.sign({
@@ -578,15 +677,8 @@ class Zk1DurableWitnessLedger {
     return this.db.transaction(() => {
       const now = number(this.nowSeconds());
       this.assertClockFloor(key, now);
-      if (req.expiresAt <= now || req.expiresAt > now + 60
-        || policy.issuedAt > now + 30 || now - policy.issuedAt > 60
-        || checked.revision !== req.ownerRevision
-        || !equal(checked.digest, req.ownerDigest)) fail("WITNESS_CATALOG_DENIED");
+      this.assertCatalogTerminalIntegrity();
       const head = this.getScope.get(key);
-      if (!head || head.tombstoned || head.pending_id !== null
-        || !equal(head.keyring_id, req.scope.keyring_id)
-        || head.revision !== req.ownerRevision || !equal(head.digest, req.ownerDigest)
-        || this.quiesce.get(key)) fail("WITNESS_CATALOG_DENIED");
       const old = this.db.prepare(`SELECT * FROM witness_catalog_admission
         WHERE scope_key=? AND operation_id=?`).get(key, req.operationId);
       if (old) {
@@ -603,9 +695,30 @@ class Zk1DurableWitnessLedger {
           || !equal(old.policy_grant, req.policyGrant)
           || this.db.prepare("SELECT 1 FROM witness_catalog_terminal WHERE admission_id=?")
             .get(old.admission_id)) fail("WITNESS_CATALOG_DENIED");
+        // A lost START ACK must recover its original admission ID so the
+        // caller can finish/reconcile, even after owner QUIESCING or expiry.
+        // Such recovery is NOT a second grant: do not return ticket/nonce
+        // when either gate is closed. No DB writes or auto-unquiescence.
+        if (!head || head.tombstoned || head.pending_id !== null
+          || !equal(head.keyring_id, req.scope.keyring_id)
+          || head.revision !== req.ownerRevision || !equal(head.digest, req.ownerDigest)
+          || this.quiesce.get(key) || req.expiresAt <= now
+          || policy.issuedAt > now + 30 || now - policy.issuedAt > 60
+          || checked.revision !== req.ownerRevision
+          || !equal(checked.digest, req.ownerDigest)) {
+          return { admissionId: Buffer.from(old.admission_id), proceed: false };
+        }
         return { admissionId: Buffer.from(old.admission_id),
           floorNonce: Buffer.from(old.floor_nonce), ticket: Buffer.from(old.ticket) };
       }
+      if (req.expiresAt <= now || req.expiresAt > now + 60
+        || policy.issuedAt > now + 30 || now - policy.issuedAt > 60
+        || checked.revision !== req.ownerRevision
+        || !equal(checked.digest, req.ownerDigest)
+        || !head || head.tombstoned || head.pending_id !== null
+        || !equal(head.keyring_id, req.scope.keyring_id)
+        || head.revision !== req.ownerRevision || !equal(head.digest, req.ownerDigest)
+        || this.quiesce.get(key)) fail("WITNESS_CATALOG_DENIED");
       if (this.catalogActive.get(key)) fail("WITNESS_CATALOG_ACTIVE");
       if (this.db.prepare(`SELECT 1 FROM witness_catalog_admission
         WHERE scope_key=? AND policy_nonce=?`).get(key, policy.nonce)) {
@@ -642,38 +755,11 @@ class Zk1DurableWitnessLedger {
       .get(admissionId);
     if (!row || row.scope_key !== key || !equal(row.keyring_id, scope.keyring_id)
       || row.principal !== input.principal) fail("WITNESS_CATALOG_DENIED");
-    let proof;
     const raw = bytes(input.floorProof, 1, 4096);
-    try {
-      proof = await z.decodeDeterministic(raw);
-      const fields = ["type", "account_id", "compartment_id", "keyring_id",
-        "cas_signer_spki_sha256", "sequence", "digest", "nonce", "observed_at",
-        "admission_id", "operation_id", "owner_revision", "owner_digest",
-        "signer_device_id", "epoch", "expires_at", "signature"];
-      if (!proof || Array.isArray(proof)
-        || Reflect.ownKeys(proof).length !== fields.length
-        || fields.some((field) => !Object.hasOwn(proof, field))) fail("WITNESS_CATALOG_DENIED");
-      const { signature, ...body } = proof;
-      if (body.type !== FLOOR_TYPE
-        || !["account_id", "compartment_id", "keyring_id"]
-          .every((name) => equal(body[name], scope[name]))
-        || !equal(body.cas_signer_spki_sha256, row.cas_fp)
-        || !equal(body.admission_id, admissionId)
-        || !equal(body.operation_id, row.operation_id)
-        || body.owner_revision !== row.owner_revision
-        || !equal(body.owner_digest, row.owner_digest)
-        || !equal(body.signer_device_id, row.signer_device_id)
-        || body.epoch !== row.epoch || body.expires_at !== row.expires_at
-        || !equal(body.nonce, row.floor_nonce)
-        || !equal(body.digest, row.catalog_digest)
-        || body.sequence !== row.sequence
-        || !Number.isSafeInteger(body.observed_at)
-        || body.observed_at > row.expires_at
-        || !crypto.verify(null, Buffer.concat([FLOOR_DOMAIN,
-          Buffer.from(await z.encodeDeterministic(body))]),
-        this.catalogFloorPublicKey, bytes(signature, 64))) fail("WITNESS_CATALOG_DENIED");
-    } catch (_) { fail("WITNESS_CATALOG_DENIED"); }
+    const proof = await this.verifyCatalogFloorProof(scope, row, raw);
+    await this.verifyCatalogTerminalProofs(scope);
     return this.db.transaction(() => {
+      this.assertCatalogTerminalIntegrity();
       // Exact durable FINISH ACK replay, even after revocation advanced the
       // owner HEAD or the terminal's observation expired. A replay only reads
       // an immutable completed record; it cannot issue a new grant.
@@ -692,8 +778,10 @@ class Zk1DurableWitnessLedger {
         || !equal(current.digest, row.owner_digest)) fail("WITNESS_CATALOG_DENIED");
       this.assertClockFloor(key, number(this.nowSeconds()));
       if (number(this.nowSeconds()) > row.expires_at) fail("WITNESS_CATALOG_DENIED");
-      this.db.prepare("INSERT INTO witness_catalog_terminal VALUES(?,?)")
-        .run(admissionId, raw);
+      const seal = crypto.sign(null,
+        catalogTerminalSealMessage({ ...row, floor_proof: raw }), this.witnessPrivateKey);
+      this.db.prepare("INSERT INTO witness_catalog_terminal VALUES(?,?,?)")
+        .run(admissionId, raw, seal);
       const now = number(this.nowSeconds());
       this.db.prepare(`INSERT INTO witness_clock_floor(scope_key,last_at) VALUES(?,?)
         ON CONFLICT(scope_key) DO UPDATE SET last_at=excluded.last_at
@@ -709,8 +797,10 @@ class Zk1DurableWitnessLedger {
     // Verify the existing signed event chain before accepting a request that
     // will withhold all subsequent fresh committed-head receipts.
     const { row: checked } = await this.checkedScope(op);
+    await this.verifyCatalogTerminalProofs(op);
     const raw = Buffer.from(await z.encodeDeterministic(op));
     return this.db.transaction(() => {
+      this.assertCatalogTerminalIntegrity();
       const head = this.getScope.get(key);
       if (!head || head.tombstoned || head.pending_id !== null
         || !equal(head.keyring_id, op.keyring_id)
@@ -744,8 +834,10 @@ class Zk1DurableWitnessLedger {
     if (op.expected_revision === null) fail("WITNESS_QUIESCING_INVALID");
     const key = compartmentKey(op.account_id, op.compartment_id);
     const { row: checked } = await this.checkedScope(op);
+    await this.verifyCatalogTerminalProofs(op);
     const raw = Buffer.from(await z.encodeDeterministic(op));
     return this.db.transaction(() => {
+      this.assertCatalogTerminalIntegrity();
       const quiescing = this.quiesce.get(key);
       if (!quiescing || !equal(quiescing.operation, raw)) fail("WITNESS_QUIESCING");
       const head = this.getScope.get(key);
@@ -776,6 +868,7 @@ class Zk1DurableWitnessLedger {
   async reserve(input) {
     const op = normalizeOperation(input);
     const key = compartmentKey(op.account_id, op.compartment_id);
+    await this.verifyCatalogTerminalProofs(op);
     const currentTime = number(this.nowSeconds());
     if (op.expires_at <= currentTime || op.expires_at > currentTime + 360) {
       // Test fixtures may pass a reservation near expiry; a *new* ticket
@@ -800,6 +893,7 @@ class Zk1DurableWitnessLedger {
     // Retain the exact signed reservation, not an unsigned editable copy of
     // the operation. Each later startup/read can validate the event ledger.
     this.db.transaction(() => {
+      this.assertCatalogTerminalIntegrity();
       const commitTime = number(this.nowSeconds());
       this.assertClockFloor(key, commitTime);
       if (op.expires_at <= commitTime || op.expires_at > commitTime + 360) {

@@ -158,6 +158,9 @@ missing cross-host revocation fence:
   An already opted-in W25 database must reopen with the exact original FLOOR
   **and independent policy** public keys or fail closed. The
   persisted identity and immutability trigger targets are checked on restart.
+  **Post-W25 terminal-seal hardening changes this fresh-only schema again**:
+  old witness catalog databases without `terminal_seal` fail closed and
+  require separately reviewed migration; do not add missing columns by hand.
 - `beginCatalogAdmission` now requires a domain-separated Ed25519 policy grant
   verified under that pinned external policy key, binding the exact scope,
   operation, committed owner revision/digest, signer device, epoch, sequence,
@@ -178,7 +181,12 @@ missing cross-host revocation fence:
   While active it blocks owner `reserve`, and `prepareQuiesce` cannot
   report DRAINED.
 - Identical START replays are idempotent only with the same externally signed
-  policy grant, without extending deadline or changing authorization. Once
+  policy grant, without extending deadline or changing authorization. On
+  QUIESCING, owner HEAD advance or expiry, a previously ACTIVE identical START
+  may return only `{admissionId, proceed:false}` for recovery/cleanup: no new
+  grant, floor nonce or ticket is issued; no SQLite state changes, new work,
+  revocation bypass or implicit unquiesce. The original signed grant is still
+  bound to the immutable admission and may not be substituted. Once
   a terminal is durably stored, exact-byte FINISH replay remains idempotent
   across revocation/owner HEAD advance, restart and expiry, without creating
   any fresh authority; a different terminal is denied. Expiry/restart never
@@ -187,6 +195,19 @@ missing cross-host revocation fence:
   halt revocation indefinitely until independent audited reconciliation exists.
   This is a deliberate safety stop; granting automatic timeout release
   without physical CAS evidence would reintroduce the race.
+- A FLOOR terminal is checked against the exact original admission and pinned
+  FLOOR Ed25519 key **before storage**. The witness then signs a separate
+  domain-specific immutable `terminal_seal` over the full saved admission
+  binding and exact FLOOR bytes. Its seal is checked synchronously at startup
+  and under the owner writer's `BEGIN IMMEDIATE` lock before every
+  completion-count/quiescence/reserve decision; terminal FLOOR Ed25519
+  signature and fields are independently reverified on the associated read
+  path. A direct SQLite `INSERT` containing untrusted FLOOR bytes, even when
+  `PRAGMA quick_check` reports `ok`, therefore causes **DENY** instead of
+  subtracting an ACTIVE physical job from the count. SQLite cannot prohibit
+  direct INSERT while allowing the trusted writer to insert; it is the
+  witness-owned signature and repeated binding verification that prevent
+  forged rows from authorizing owner revocation.
 - `completeCatalogAdmission` only accepts a new token-specific Ed25519
   FLOOR terminal signature pinned to admission ID, operation ID, owner
   revision/digest, device, epoch, catalog head, nonce and expiry. A generic
