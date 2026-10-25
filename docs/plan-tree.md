@@ -21,6 +21,32 @@ rollback/deletion across a full browser restart. A tab terminated **before**
 its revocation transaction commits also cannot guarantee another tab was
 invalidated. No independent witness, zk-1 epoch policy or production GO follows.
 
+## Issue #65 / PR #228: disposable real loopback WebDAV mTLS physical-copy milestone (2026-10-25)
+
+The opt-in, development-only ZK1 ciphertext WebDAV adapter now refuses any
+HTTPS destination other than the literal `127.0.0.1`, avoiding DNS rebinding,
+private-network and cloud-metadata SSRF through experimental provider setup.
+Redirect responses remain errors; no remote redirect is followed. The
+disposable real HTTPS fixture provisions WebDAV parents using `MKCOL`, then
+exercises bounded `PUT`, `GET` and independent `HEAD`, with separately
+enrolled writer and reader mTLS identities, unknown-client rejection, a
+pinned server leaf certificate, strong ETag CAS, stale-version refusal,
+corrupted PUT/GET content and malicious redirect rejection. WebDAV parents
+must be provisioned by an operator; the client does not automatically create
+arbitrary remote folders.
+
+The isolated PostgreSQL 18 extension verifies the exact physical ciphertext
+and signed local inventory operation before any WebDAV PUT, then challenges
+the reader with a separate real HTTPS GET. A successful `PUT` remains
+`CLOUD_COPY_PUT_ACK_NONAUTHORITATIVE`, and a matched GET is only a point-in-time
+observation. Neither proves remote durable persistence, independent provider
+administration, nonrollbackable external epochs, atomic PostgreSQL-to-WebDAV
+commit, client authorization, or production readiness. Tests and the adapter
+do not enable a production endpoint. Windows Node 24 and Node 22 focused
+WebDAV regressions passed 10/10 each; a separate isolated PostgreSQL 18
+physical-copy lab passed 1/1 for each Node version, with verified disposable
+database cleanup. PR #228 remains DRAFT / NO-GO.
+
 ## Issue #65: current-device revocation at strict historical Sync read (2026-10-25)
 
 Strict Sync v2 now requires an operator-injected, independently maintained

@@ -134,8 +134,12 @@ function createZk1WebdavCiphertextAdapter(config = {}) {
       && typeof config.ca === "string" && config.ca.includes("BEGIN CERTIFICATE")
       && typeof config.serverFingerprint256 === "string");
     const endpoint = new URL(config.endpoint);
+    // This experimental provider is limited to a literal loopback peer.
+    // Operator-controlled hostnames/IPs must not become an HTTPS SSRF proxy
+    // into private networks or metadata endpoints, even with a valid CA/pin.
     ensure(endpoint.protocol === "https:" && !endpoint.username && !endpoint.password
-      && !endpoint.search && !endpoint.hash && endpoint.hostname && !endpoint.pathname.includes("//"));
+      && !endpoint.search && !endpoint.hash && endpoint.hostname === "127.0.0.1"
+      && !endpoint.pathname.includes("//"));
     const pin = config.serverFingerprint256.replace(/:/g, "").toLowerCase();
     ensure(/^[a-f0-9]{64}$/.test(pin));
     const namespace = config.namespace;

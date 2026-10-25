@@ -127,7 +127,10 @@ async function main() {
   // Use the Node executable that launched this runner (Node 22 is required
   // for the release reference), not a different node.exe found on PATH.
   const focusedHistoricalE2e = process.argv.includes("--historical-e2e-only");
-  const tests = focusedHistoricalE2e ? [
+  const focusedRealWebdav = process.argv.includes("--real-webdav-only");
+  const tests = focusedRealWebdav ? [
+    "test/issue-65-pg-physical-inventory-bridge.test.js",
+  ] : focusedHistoricalE2e ? [
     "test/issue-65-real-pg-w2-historical-sync-e2e.test.js",
   ] : [
     "test/issue-65-shared-gate-postgres.test.js",
@@ -147,6 +150,7 @@ async function main() {
     "test/issue-65-real-pg-w2-historical-sync-e2e.test.js",
   ];
   run(process.execPath, ["--test",
+    ...(focusedRealWebdav ? ["--test-name-pattern=real PG18 signed physical seal gates a disposable HTTPS mTLS WebDAV"] : []),
     ...(focusedHistoricalE2e ? ["--test-force-exit"] : []),
     "--test-reporter=spec", ...tests],
   { env: { ...process.env, ROOTARK_ZK1_TEST_PG_URL: uri,

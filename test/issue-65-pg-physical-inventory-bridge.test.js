@@ -44,6 +44,9 @@ const { Zk1CasTerminalAnchor } =
   require("../src/services/zk1CasTerminalAnchor");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
+const { createRealLocalWebdav } = require("./support/issue-65-real-local-webdav");
+const { createZk1WebdavCiphertextAdapter } =
+  require("../src/services/zk1WebdavCiphertextAdapter");
 
 const enabled = Boolean(process.env.ROOTARK_ZK1_TEST_PG_URL
   && process.env.ROOTARK_ZK1_RUNTIME_PG_URL
@@ -824,6 +827,62 @@ test("one real signed PG operation requires independent S3 and Drive copy reread
   /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/);
   assert.equal(s3Puts + drivePuts, beforeFailure,
     "invalid local chunks cannot start cloud effects on either provider");
+});
+
+test("real PG18 signed physical seal gates a disposable HTTPS mTLS WebDAV PUT and independent GET", {
+  skip: !enabled && "requires isolated PostgreSQL 18, separate roles and native OpenSSL",
+}, async (t) => {
+  const previous = process.env.NODE_ENV;
+  process.env.NODE_ENV = "development";
+  t.after(() => { if (previous === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previous; });
+  const f = await fixture(t);
+  const peer = await createRealLocalWebdav(t);
+  const address = zk1CloudCopyAddress({ scope: f.scope, operationId: f.op.operation_id });
+  await peer.provision(address.folder);
+  const writer = createZk1WebdavCiphertextAdapter(peer.config("writer"));
+  const reader = createZk1WebdavCiphertextAdapter(peer.config("reader"));
+  const publisher = new Zk1CloudCiphertextCopyPublisher({
+    cloudWriter: writer, expectedProvider: "webdav",
+    expectedWriterContext: await writer.resolveInventoryContext(),
+  });
+  const verifier = new Zk1CloudCiphertextReadbackVerifier({
+    cloudReader: reader, expectedProvider: "webdav",
+    expectedReaderContext: await reader.resolveInventoryContext(),
+  });
+  const physical = f.noChunks();
+  const args = { physical, chunks: f.chunks,
+    cloudPublisher: publisher, cloudVerifier: verifier };
+  const requestCount = peer.requests.length;
+  await assert.rejects(f.bridge().publishAndReconcileCloudCopy(args),
+    /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+    "no unsigned PG operation may send a network ciphertext PUT");
+  assert.equal(peer.requests.length, requestCount);
+  const signed = await f.bridge().putAndAttest(f.physical);
+  assert.equal(signed.status, "PHYSICAL_PG_AND_SIGNED_LOCAL_INVENTORY");
+  const result = await f.bridge().publishAndReconcileCloudCopy(args);
+  assert.equal(result.status, "PG_SIGNED_AND_EXTERNAL_COPY_REREAD");
+  assert.equal(result.remoteReadbackMatched, true);
+  assert.equal(result.authorizesIo, false);
+  assert.equal(result.externalProviderDurabilityProven, false);
+  assert.equal(result.independentRemoteIoFenceProven, false);
+  assert.deepEqual(peer.objects.get(`/dav/${writer.key(address.folder, address.name, "uploads")}`)
+    .ciphertext, Buffer.concat(f.chunks));
+  const observed = peer.requests.slice(requestCount);
+  assert.ok(observed.some((entry) => entry.method === "PUT" && entry.role === "writer"));
+  assert.ok(observed.some((entry) => entry.method === "GET" && entry.role === "reader"));
+  peer.setMode("corrupt-on-put");
+  await assert.rejects(f.bridge().publishAndReconcileCloudCopy(args),
+    /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/,
+    "ACK for substituted ciphertext is rejected by independent live GET");
+  peer.setMode("normal");
+  assert.equal((await f.ledger.getOperationStatus(f.op.operation_id)).status, "committed",
+    "remote failure cannot invalidate an already signed physical PG receipt");
+  // The previous failed PUT left an orphaned provider copy. It can become
+  // evidence only after another exact current-byte readback verifies it.
+  await assert.rejects(f.bridge().reconcileCloudCopy({ physical,
+    cloudVerifier: verifier, chunkLengths: f.chunks.map((chunk) => chunk.length) }),
+  /ZK_PHYSICAL_INVENTORY_UNAVAILABLE/);
 });
 
 test("mTLS signed inventory append requires real strict physical PG readback and WAL", {
