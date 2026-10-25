@@ -12637,6 +12637,16 @@ setInterval(() => {
   });
 }, CHUNK_UPLOAD_SESSION_SWEEP_INTERVAL_MS);
 setInterval(() => { void restoreRequestGate.run(() => cleanupIncomingUploads()); }, 60 * 1000);
+// Account writes must fail fast while protected Sync holds the local SQLite
+// reservation. Administrative callers receive an explicit retryable response
+// instead of Express's generic 500 error for the intentional busy fence.
+app.use((error, _req, res, next) => {
+  if (error?.code !== "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" || res.headersSent) return next(error);
+  return res.status(503).set("Retry-After", "1").json({
+    error: "Account authorization temporarily busy",
+    code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+  });
+});
 const listenForRequests = () => {
   const onListening = () => {
     void (async () => {

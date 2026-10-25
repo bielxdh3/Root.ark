@@ -1,6 +1,7 @@
 const { getDb } = require("../db");
 const { jsonStringify, nowIso, safeJsonParse } = require("./repositoryUtils");
 const { applySyncResumeAccountProof } = require("../src/services/syncResumeAccountProof");
+const { assertNoLocalStrictSyncWriter } = require("../src/services/syncSqliteAccountWriteFence");
 
 function loadUsers() {
   return getDb().prepare(`
@@ -28,6 +29,7 @@ function loadUsers() {
 }
 
 function saveUsers(users = [], { expectedDeletedUsers = [], allowRecreateUsernames = [] } = {}) {
+  assertNoLocalStrictSyncWriter();
   const db = getDb();
   const now = nowIso();
   const write = () => {
@@ -120,6 +122,7 @@ function saveUsers(users = [], { expectedDeletedUsers = [], allowRecreateUsernam
 }
 
 function commitSyncResumeProof(claim) {
+  assertNoLocalStrictSyncWriter();
   if (!claim || typeof claim.username !== "string" || typeof claim.deviceId !== "string"
     || claim.deviceId.length < 1 || claim.deviceId.length > 256
     || (claim.pauseFence !== null && (typeof claim.pauseFence !== "string"

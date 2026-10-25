@@ -9,6 +9,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFile, spawn } = require("node:child_process");
 const { promisify } = require("node:util");
+const { performance } = require("node:perf_hooks");
 const test = require("node:test");
 const express = require("express");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
@@ -175,6 +176,118 @@ test("a second process cannot commit SQLite revocation while signed Sync JSON co
   assert.deepEqual(restarted.list("alice").map((record) => record.objectId), ["first-commit"]);
   assert.equal(await post(ctx.listener.address().port, await ctx.signedOperation("after-revoke")), 403);
   assert.deepEqual(restarted.list("alice").map((record) => record.objectId), ["first-commit"]);
+});
+
+test("two concurrent strict HTTP POSTs on one Node process keep event-loop timers alive", async (t) => {
+  const ctx = await fixture(t);
+  const originalRename = fsp.rename;
+  let hitFirstRename;
+  const firstRenameReached = new Promise((resolve) => { hitFirstRename = resolve; });
+  let releaseFirstRename;
+  const firstRenameReleased = new Promise((resolve) => { releaseFirstRename = resolve; });
+  let calls = 0;
+  fsp.rename = async (...args) => {
+    if (args[1] === ctx.storagePath && ++calls === 1) {
+      hitFirstRename();
+      await firstRenameReleased;
+    }
+    return originalRename(...args);
+  };
+  t.after(() => { releaseFirstRename(); fsp.rename = originalRename; });
+
+  const op1 = await ctx.signedOperation("same-process-one");
+  const op2 = await ctx.signedOperation("same-process-two");
+  const firstRequest = post(ctx.listener.address().port, op1);
+  await firstRenameReached;
+  let heartbeat = 0;
+  const interval = setInterval(() => { heartbeat++; }, 40);
+  t.after(() => clearInterval(interval));
+  const started = performance.now();
+  let timerDelay = Infinity;
+  const releaseTimer = setTimeout(() => {
+    timerDelay = performance.now() - started;
+    releaseFirstRename();
+  }, 200);
+  t.after(() => clearTimeout(releaseTimer));
+  const secondRequest = post(ctx.listener.address().port, op2);
+  const statuses = await Promise.all([firstRequest, secondRequest]);
+  assert.deepEqual(statuses, [201, 201], "both unique signed devices operations should serialize");
+  assert.ok(timerDelay < 5000,
+    `the first pending JSON fsync must not be starved by a second synchronous SQLite BEGIN IMMEDIATE (timer delay ${timerDelay}ms)`);
+  assert.ok(heartbeat > 0, "same-process request contention must yield to the event loop");
+  const reopened = await new SyncObjectStore(ctx.storagePath, { atomicDeviceRegistry: true }).open();
+  assert.deepEqual(reopened.list("alice").map((record) => record.objectId).sort(),
+    ["same-process-one", "same-process-two"]);
+});
+
+test("independent SQLite admin writer wins before admission without blocking the HTTP event loop", async (t) => {
+  const ctx = await fixture(t);
+  const program = `const Database=require(process.argv[1]);const db=new Database(process.argv[2],{timeout:0});db.exec('BEGIN IMMEDIATE');process.stdout.write('LOCKED\\n');setTimeout(()=>{db.prepare("UPDATE users SET permissions_json='{\\\"upload\\\":false,\\\"delete\\\":false}',storage_revision=storage_revision+1 WHERE username='alice'").run();db.exec('COMMIT');db.close();process.stdout.write('REVOKED\\n')},600);`;
+  const child = spawn(process.execPath, ["-e", program, require.resolve("better-sqlite3"),
+    process.env.DATABASE_URL], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  let output = "";
+  child.stdout.on("data", (data) => { output += data.toString(); });
+  await new Promise((resolve, reject) => {
+    child.stdout.on("data", function onData() {
+      if (!output.includes("LOCKED")) return;
+      child.stdout.off("data", onData);
+      resolve();
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => reject(new Error(`SQLite admin lock child terminated: ${code}`)));
+  });
+  const operation = await ctx.signedOperation("external-admin-wins");
+  let ticks = 0;
+  const ticker = setInterval(() => { ticks++; }, 40);
+  t.after(() => clearInterval(ticker));
+  let pingDelay = Infinity;
+  const started = performance.now();
+  const ping = setTimeout(() => { pingDelay = performance.now() - started; }, 100);
+  t.after(() => clearTimeout(ping));
+  assert.equal(await post(ctx.listener.address().port, operation), 403);
+  assert.ok(ticks > 0 && pingDelay < 5000,
+    `SQLite busy retries should yield to timers (${pingDelay}ms)`);
+  const restarted = await new SyncObjectStore(ctx.storagePath, { atomicDeviceRegistry: true }).open();
+  assert.deepEqual(restarted.list("alice"), []);
+  assert.match(output, /REVOKED/);
+});
+
+test("same-process admin account update fails fast during protected Sync without stalling timers", async (t) => {
+  const ctx = await fixture(t);
+  const originalRename = fsp.rename;
+  let reachedRename;
+  const reached = new Promise((resolve) => { reachedRename = resolve; });
+  let releaseRename;
+  const released = new Promise((resolve) => { releaseRename = resolve; });
+  fsp.rename = async (...args) => {
+    if (args[1] === ctx.storagePath) { reachedRename(); await released; }
+    return originalRename(...args);
+  };
+  t.after(() => { releaseRename(); fsp.rename = originalRename; });
+  const pending = post(ctx.listener.address().port, await ctx.signedOperation("admin-stall"));
+  await reached;
+  const previous = users.loadUsers()[0];
+  let tickDelay = Infinity;
+  const began = performance.now();
+  const timer = setTimeout(() => { tickDelay = performance.now() - began; }, 20);
+  t.after(() => clearTimeout(timer));
+  try {
+    assert.throws(() => users.saveUsers([{ ...previous, permissions: { upload: false } }]),
+      { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" });
+    assert.throws(() => users.commitSyncResumeProof({ username: "alice" }),
+      { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" });
+    const blockedMs = performance.now() - began;
+    assert.ok(blockedMs < 200,
+      `admin retryable fail-fast must not block the Node event loop (${blockedMs}ms)`);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.ok(tickDelay < 200, `heartbeat missed its bounded window (${tickDelay}ms)`);
+  } finally {
+    releaseRename();
+  }
+  assert.equal(await pending, 201);
+  users.saveUsers([{ ...users.loadUsers()[0], permissions: { upload: false } }]);
+  assert.equal(await post(ctx.listener.address().port, await ctx.signedOperation("admin-after")), 403);
 });
 
 test("strict REST rejects a missing SQLite authority or concurrent legacy JSON account writes at setup", (t) => {
