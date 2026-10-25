@@ -5,7 +5,10 @@ const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const crypto = require("node:crypto");
 const { SyncJournal } = require("../sync-client/rootark-sync-journal");
+const { SyncEngine } = require("../sync-client/rootark-sync-engine");
+const { createOperation } = require("../sync-client/rootark-sync-protocol");
 
 test("legacy operation-ID-only seen lists never become authenticated admission pins", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-observed-journal-"));
@@ -67,4 +70,26 @@ test("pre-observation is durable before completion and cannot be reassigned", as
   assert.equal(restored.hasLocalAdmission("signed-op", digest), true);
   assert.equal(Object.hasOwn(restored.state.observed, "signed-op"), false,
     "completion transfers the observation into the applied admission map");
+});
+
+test("strict historical pull cannot skip an expired remote envelope due to a forged local seen ID", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-seen-witness-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const operation = createOperation({ operation: "create", operationId: "forged-seen-op",
+    objectId: "seen-object", deviceId: "device-a", compartmentId: "private",
+    keyEpoch: "epoch-4", revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "forged-seen.txt" }, plaintext: Buffer.from("sealed"),
+    fileKey: crypto.randomBytes(32) });
+  const journal = await new SyncJournal(path.join(dir, ".rootark-sync-journal.json")).open();
+  await journal.markSeen(operation.operationId);
+  let checked = 0;
+  const engine = await new SyncEngine({ rootDir: dir, journal,
+    adapter: { push: async () => ({}), list: async () => ({ objects: [operation] }) },
+    deviceId: "device-a", keyEpoch: "epoch-4", compartmentId: "private",
+    requireAuthorization: true, reverifySeenIncoming: true,
+    verifyIncoming: async () => { checked += 1; return false; },
+  }).open();
+  await assert.rejects(engine.pullRemote({ pulled: 0, conflicts: [], offline: false }),
+    { code: "remote_authorization_rejected" });
+  assert.equal(checked, 1, "forged seen ID cannot skip the independent authorization verifier");
 });

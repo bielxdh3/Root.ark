@@ -48,6 +48,13 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
     "../public/client/rootark-sync-adapter": { createOpaqueSyncAdapter: () => ({}) },
     "./rootark-sync-authorization": authorization,
   };
+  let historicalVerifierArgs = null;
+  imports["./rootark-sync-zk1-physical-binding"] = {
+    verifySyncV2HistoricalWitnessAdmission: async (input) => {
+      historicalVerifierArgs = input;
+      return { authorizesHistoricalRead: true };
+    },
+  };
   const source = fs.readFileSync(path.join(__dirname, "../sync-client/rootark-sync-v2.js"), "utf8");
   const sandboxModule = { exports: {} };
   vm.runInNewContext(source, {
@@ -99,4 +106,41 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
   await assert.rejects(engineOptions.verifyIncoming({ ...signedIncoming,
     metadata: { ...signedIncoming.metadata, path: "forged.txt" } }),
   /Authorization payload mismatch/);
+
+  // Strict opt-in must ignore the forgeable on-disk local journal admission.
+  config.historicalAdmissionMode = "independent-physical-witness-v1";
+  await assert.rejects(sandboxModule.exports.start({ config: "not-opened.json",
+    once: true }), /Independent witness evidence provider/);
+  const externalPins = Object.freeze({ pinnedWitnessPublicKey: "trusted-witness-key",
+    pinnedInventoryPublicKey: "trusted-inventory-key", trustedMinimumFloor: {
+      sequence: 9, lastHash: "externally-pinned" } });
+  let challenge;
+  await sandboxModule.exports.start({ config: "not-opened.json", once: true,
+    trustedHistoricalAdmission: externalPins,
+    historicalEvidenceProvider: async (_operation, args) => {
+      challenge = args.nonce;
+      return { scope: "untrusted-scope", expectedSequence: 2,
+        expectedRoot: "untrusted-root", receipt: "untrusted-receipt",
+        physicalAttestation: "untrusted-physical", admission: "untrusted-admission",
+        freshFloor: "untrusted-floor", pinnedWitnessPublicKey: "rogue-key" };
+    } });
+  assert.equal(engineOptions.reverifySeenIncoming, true,
+    "a mutable legacy seen journal must not suppress witness checks");
+  try {
+    Date.now = () => signature.expiresAt + 1;
+    assert.equal(await engineOptions.verifyIncoming(signedIncoming, {
+      locallyAdmitted: false }), true);
+    assert.ok(Buffer.isBuffer(challenge) && challenge.length === 32);
+    assert.deepEqual(historicalVerifierArgs.nonce, challenge,
+      "independent challenge must be verifier-owned");
+    assert.equal(historicalVerifierArgs.pinnedWitnessPublicKey, "trusted-witness-key",
+      "untrusted provider cannot overwrite the provisioned signer");
+    assert.equal(historicalVerifierArgs.localTrustedDevicePolicy.username, "alice");
+  } finally { Date.now = now; }
+  // An attacker rolling the JSON config back cannot disable an externally
+  // enforced historical policy, even when the old journal claims admission.
+  delete config.historicalAdmissionMode;
+  await assert.rejects(sandboxModule.exports.start({ config: "not-opened.json",
+    once: true, requireIndependentHistoricalAdmission: true }),
+  /Independent witness evidence provider/);
 });

@@ -8,12 +8,15 @@ const { createOperation } = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { signCommittedPhysicalReadback } =
   require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
-const { envelopeBinding, physicalWriteRequest, verifySyncV2PhysicalEnvelopeEvidence } =
+const { envelopeBinding, physicalWriteRequest, verifySyncV2PhysicalEnvelopeEvidence,
+  verifySyncV2HistoricalWitnessAdmission } =
   require("../sync-client/rootark-sync-zk1-physical-binding");
 const { computeZk1CiphertextRoot } =
   require("../src/crypto/rootark-zk-chunk-root-v1");
 
 const ENTRY_DOMAIN = Buffer.from("Root.ark/zk-1/content-inventory-entry/v1\0");
+const HISTORICAL_DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0");
+const FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-physical-floor/v2\0");
 const sha = (data) => crypto.createHash("sha256").update(data).digest();
 const random = (n) => crypto.randomBytes(n);
 
@@ -77,6 +80,113 @@ async function createFixture({ deviceExpiryOffsetMs = 60000 } = {}) {
   return { input, bound, readback, inventory, attestor, rogue, signSync, scope,
     issuedAt };
 }
+
+async function witnessedFixture() {
+  const f = await createFixture({ deviceExpiryOffsetMs: 15000 });
+  const witness = crypto.generateKeyPairSync("ed25519");
+  const status = crypto.generateKeyPairSync("ed25519");
+  const witnessKeyId = random(16);
+  const statusKeyId = random(16);
+  const challenge = random(32);
+  const floor = { sequence: 9, lastHash: random(32).toString("hex"),
+    physicalFenceDigest: random(32).toString("hex") };
+  const floorUnsigned = { type: "rootark-zk1-witness-cas-physical-floor/v2",
+    witnessKeyId: witnessKeyId.toString("base64url"),
+    statusKeyId: statusKeyId.toString("base64url"),
+    ...floor, nonce: challenge.toString("base64url") };
+  const freshFloor = { ...floorUnsigned, signature: crypto.sign(null,
+    Buffer.concat([FLOOR_DOMAIN, Buffer.from(JSON.stringify(floorUnsigned))]),
+    witness.privateKey).toString("base64url") };
+  const bound = f.bound;
+  const challengedPhysicalAttestation = await signCommittedPhysicalReadback({
+    scope: f.scope, operation: bound.operation, readback: f.readback,
+    nonce: challenge, issuedAt: Math.floor(Date.now() / 1000),
+  }, f.attestor.privateKey);
+  const admissionUnsigned = {
+    type: "rootark-sync-v2-historical-witness-admission/v1",
+    envelopeSha256: sha(bound.canonicalEnvelope).toString("base64url"),
+    operationId: bound.operation.operation_id.toString("base64url"),
+    deviceId: bound.envelope.deviceId,
+    deviceSpkiSha256: sha(Buffer.from(bound.envelope.authorization.publicKey,
+      "base64url")).toString("base64url"),
+    epoch: bound.operation.epoch,
+    checkpointSequence: f.input.expectedSequence,
+    checkpointRoot: f.input.expectedRoot.toString("base64url"),
+    inventoryReceiptSha256: sha(f.input.receipt).toString("base64url"),
+    admittedAtMs: bound.envelope.authorization.expiresAt - 1,
+    witnessSequence: floor.sequence, witnessLastHash: floor.lastHash,
+    witnessPhysicalFenceDigest: floor.physicalFenceDigest,
+  };
+  const admission = { ...admissionUnsigned,
+    signature: crypto.sign(null, Buffer.concat([HISTORICAL_DOMAIN,
+      Buffer.from(JSON.stringify(admissionUnsigned))]),
+    witness.privateKey).toString("base64url") };
+  const policy = { pinnedWitnessPublicKey: witness.publicKey, witnessKeyId,
+    statusKeyId, trustedMinimumFloor: { ...floor } };
+  const evidence = { ...f.input, nonce: challenge,
+    physicalAttestation: challengedPhysicalAttestation,
+    admission, freshFloor, ...policy };
+  return { ...f, witness, status, challenge, floor, admissionUnsigned, admission,
+    freshFloor, policy, evidence };
+}
+
+test("strict historical admission needs independently signed physical witness and exact envelope", async () => {
+  const f = await witnessedFixture();
+  const wall = Date.now;
+  Date.now = () => f.input.envelope.authorization.expiresAt + 1000;
+  let result;
+  try { result = await verifySyncV2HistoricalWitnessAdmission(f.evidence); }
+  finally { Date.now = wall; }
+  assert.equal(result.historicalServerAdmissionProven, true);
+  assert.equal(result.authorizesHistoricalRead, true);
+  assert.equal(result.independentlyAnchoredFloorProven, true);
+  assert.equal(result.externalDurabilityProven, false);
+  const denied = (delta) => assert.rejects(
+    verifySyncV2HistoricalWitnessAdmission({ ...f.evidence, ...delta }),
+    /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/);
+  const signedAlteration = (changes, privateKey = f.witness.privateKey) => {
+    const unsigned = { ...f.admissionUnsigned, ...changes };
+    return { ...unsigned, signature: crypto.sign(null,
+      Buffer.concat([HISTORICAL_DOMAIN, Buffer.from(JSON.stringify(unsigned))]),
+      privateKey).toString("base64url") };
+  };
+  await denied({ admission: signedAlteration({ admittedAtMs:
+    f.input.envelope.authorization.expiresAt + 1 }) });
+  await denied({ admission: signedAlteration({ envelopeSha256:
+    random(32).toString("base64url") }) });
+  await denied({ admission: signedAlteration({ operationId:
+    random(16).toString("base64url") }) });
+  await denied({ admission: signedAlteration({ deviceSpkiSha256:
+    random(32).toString("base64url") }) });
+  await denied({ admission: signedAlteration({ inventoryReceiptSha256:
+    random(32).toString("base64url") }) });
+  await denied({ admission: signedAlteration({}, f.status.privateKey) });
+  await denied({ admission: { ...f.admission, admittedAtMs:
+    f.input.envelope.authorization.expiresAt + 1 } });
+  await denied({ admission: { ...f.admission, signature:
+    crypto.sign(null, Buffer.from("server-boolean"), f.witness.privateKey)
+      .toString("base64url") } });
+  await denied({ admission: { ...f.admission, envelopeSha256:
+    random(32).toString("base64url") } });
+  await denied({ admission: { ...f.admission, deviceId: "impostor" } });
+  await denied({ freshFloor: { ...f.freshFloor, nonce: random(32).toString("base64url") } });
+  await denied({ trustedMinimumFloor: { ...f.floor, sequence: f.floor.sequence + 1 } });
+  await denied({ trustedMinimumFloor: { ...f.floor, lastHash: random(32).toString("hex") } });
+  await denied({ pinnedWitnessPublicKey: f.inventory.publicKey });
+  await denied({ pinnedWitnessPublicKey: f.attestor.publicKey });
+  await denied({ pinnedWitnessPublicKey: f.status.publicKey });
+  await denied({ freshFloor: { ...f.freshFloor, sequence: f.floor.sequence - 1 } });
+  await denied({ freshFloor: { ...f.freshFloor, physicalFenceDigest:
+    random(32).toString("hex") } });
+  await denied({ admission: { ...f.admission,
+    witnessSequence: f.floor.sequence - 1 } });
+  await denied({ admission: { ...f.admission,
+    inventoryReceiptSha256: random(32).toString("base64url") } });
+  await denied({ admission: { ...f.admission,
+    checkpointRoot: random(32).toString("base64url") } });
+  await denied({ nonce: random(32) });
+  await denied({ admission: { ...f.admission, authorizesIo: true } });
+});
 
 test("a signed Sync v2 envelope binds exactly to two independent ZK1 signer identities and PG readback", async () => {
   const f = await createFixture();

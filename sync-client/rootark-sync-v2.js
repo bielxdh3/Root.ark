@@ -62,6 +62,47 @@ function fileKeyResolver(master, fallbackEpoch) {
 async function start(options = {}) {
   const configPath = path.resolve(options.config || DEFAULT_CONFIG);
   const config = await readConfig(configPath);
+  // The historical witness mode requires pins provisioned by the embedding
+  // trusted process, outside the mutable sync config and local JSON journal.
+  // The standalone CLI deliberately fails closed until a real independent
+  // mTLS PG/witness evidence source is wired by that embedding process.
+  const historicalMode = config.historicalAdmissionMode;
+  if (historicalMode !== undefined
+    && historicalMode !== "independent-physical-witness-v1") {
+    throw new Error("Unsupported Sync v2 historical admission mode");
+  }
+  // The required mode must also be enforceable outside the mutable on-disk
+  // config, or a local attacker can simply delete that JSON setting and
+  // reactivate forgeable local-journal admissions on the next restart.
+  const externalMode = options.requireIndependentHistoricalAdmission === true
+    || process.env.ROOTARK_SYNC_REQUIRE_INDEPENDENT_HISTORY === "1";
+  const strictHistorical = externalMode
+    || historicalMode === "independent-physical-witness-v1";
+  if (strictHistorical && (typeof options.historicalEvidenceProvider !== "function"
+    || !options.trustedHistoricalAdmission)) {
+    throw new Error("Independent witness evidence provider and external pins are required");
+  }
+  const trustedHistorical = strictHistorical ? (() => {
+    const provided = options.trustedHistoricalAdmission;
+    const copyPin = (pin) => Buffer.isBuffer(pin) || pin instanceof Uint8Array
+      ? Buffer.from(pin) : pin;
+    const floor = provided.trustedMinimumFloor;
+    return {
+      pinnedInventoryPublicKey: copyPin(provided.pinnedInventoryPublicKey),
+      pinnedInventorySignerKeyId: copyPin(provided.pinnedInventorySignerKeyId),
+      pinnedPhysicalAttestorPublicKey: copyPin(provided.pinnedPhysicalAttestorPublicKey),
+      pinnedWitnessPublicKey: copyPin(provided.pinnedWitnessPublicKey),
+      witnessKeyId: copyPin(provided.witnessKeyId),
+      statusKeyId: copyPin(provided.statusKeyId),
+      trustedMinimumFloor: floor && {
+        sequence: floor.sequence, lastHash: floor.lastHash,
+        physicalFenceDigest: floor.physicalFenceDigest,
+      },
+    };
+  })() : null;
+  const strictVerifier = strictHistorical
+    ? require("./rootark-sync-zk1-physical-binding")
+      .verifySyncV2HistoricalWitnessAdmission : null;
   const adapter = createOpaqueSyncAdapter({
     baseUrl: config.serverUrl,
     fetchImpl: (url, request = {}) => fetch(url, { ...request, headers: { Authorization: `Bearer ${config.token}`, ...(request.headers || {}) } }),
@@ -88,15 +129,40 @@ async function start(options = {}) {
         return verifyAuthorizationProof(operation.authorization, operation, expected);
       }
       // A signed but expired record does not prove that the remote server
-      // admitted it before expiry. Until independently signed server admission
-      // receipts exist, trust only the exact envelope durably witnessed by
-      // this client while it was fresh; first-ever stale records remain UNKNOWN.
+      // admitted it before expiry. The default legacy mode retains only the
+      // exact envelope locally witnessed while fresh; strict mode requires an
+      // independently signed admission and a currently attested physical floor.
+      if (strictHistorical) {
+        // The supplied proof is untrusted transport data. Generate the nonce
+        // locally, override all trust pins from the independent integration,
+        // and revalidate the exact original signed encrypted envelope.
+        const nonce = crypto.randomBytes(32);
+        const proof = await options.historicalEvidenceProvider(operation,
+          { nonce: Buffer.from(nonce) });
+        if (!proof || typeof proof !== "object" || Array.isArray(proof)) return false;
+        const verified = await strictVerifier({
+          envelope: operation, scope: proof.scope,
+          expectedSequence: proof.expectedSequence, expectedRoot: proof.expectedRoot,
+          receipt: proof.receipt, physicalAttestation: proof.physicalAttestation,
+          nonce, admission: proof.admission, freshFloor: proof.freshFloor,
+          pinnedInventoryPublicKey: trustedHistorical.pinnedInventoryPublicKey,
+          pinnedInventorySignerKeyId: trustedHistorical.pinnedInventorySignerKeyId,
+          pinnedPhysicalAttestorPublicKey: trustedHistorical.pinnedPhysicalAttestorPublicKey,
+          pinnedWitnessPublicKey: trustedHistorical.pinnedWitnessPublicKey,
+          witnessKeyId: trustedHistorical.witnessKeyId,
+          statusKeyId: trustedHistorical.statusKeyId,
+          trustedMinimumFloor: trustedHistorical.trustedMinimumFloor,
+          localTrustedDevicePolicy: expected,
+        });
+        return verified.authorizesHistoricalRead === true;
+      }
       if (locallyAdmitted !== true) return false;
       return verifyHistoricalAuthorizationProof(operation.authorization, operation,
         expected);
     },
     authorizationFactory: (operation) => createAuthorizationProof(operation, { username: config.username, privateKey: config.privateKey, publicKey: config.publicKey }),
     requireAuthorization: true,
+    reverifySeenIncoming: strictHistorical,
   }).open();
   const once = options.once === true || options.once === "true";
   do {

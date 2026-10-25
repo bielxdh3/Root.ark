@@ -18,6 +18,8 @@ const { computeZk1CiphertextRoot } =
 
 const OPERATION_DOMAIN = Buffer.from("Root.ark/sync-v2/zk1-operation-id/v1\0", "utf8");
 const OBJECT_DOMAIN = Buffer.from("Root.ark/sync-v2/zk1-object-id/v1\0", "utf8");
+const HISTORICAL_DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0");
+const PHYSICAL_FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-physical-floor/v2\0");
 const MAX_CANONICAL_ENVELOPE_BYTES = 9 * 1024 * 1024;
 const PG_CHUNK_BYTES = 1024 * 1024;
 
@@ -208,5 +210,119 @@ async function verifySyncV2PhysicalEnvelopeEvidence(input) {
   } catch (_) { deny(); }
 }
 
+// Opt-in historical READ authorization. A local journal hash, HTTP ACK or
+// self-declared server bool cannot satisfy this verifier. The independently
+// provisioned witness key must sign an exact envelope/PG receipt admission
+// AND answer a fresh challenge with the exact externally pinned physical
+// witness head. The equality rule deliberately rejects advancing histories
+// until an authenticated ancestry protocol is available.
+async function verifySyncV2HistoricalWitnessAdmission(input) {
+  try {
+    const v = strict(input, ["envelope", "scope", "expectedSequence", "expectedRoot",
+      "receipt", "physicalAttestation", "nonce", "pinnedInventoryPublicKey",
+      "pinnedInventorySignerKeyId", "pinnedPhysicalAttestorPublicKey",
+      "localTrustedDevicePolicy", "admission", "freshFloor", "pinnedWitnessPublicKey",
+      "witnessKeyId", "statusKeyId", "trustedMinimumFloor"]);
+    const bound = envelopeBinding(v.envelope, v.scope, v.expectedSequence, v.expectedRoot);
+    const challenge = checkedBytes(v.nonce, 32);
+    const committedInventoryReceipt = checkedBytes(v.receipt, 1,
+      inventory.MAX_COMMITTED_PROOF_BYTES);
+    const witnessId = checkedBytes(v.witnessKeyId, 16).toString("base64url");
+    const statusId = checkedBytes(v.statusKeyId, 16).toString("base64url");
+    const witness = v.pinnedWitnessPublicKey;
+    if (!(witness instanceof crypto.KeyObject) || witness.type !== "public"
+      || witness.asymmetricKeyType !== "ed25519") deny();
+    const witnessSpki = witness.export({ type: "spki", format: "der" });
+    const publicDer = (pin) => pin instanceof crypto.KeyObject
+      ? pin.export({ type: "spki", format: "der" }) : checkedBytes(pin, 44);
+    const deviceSpki = checkedBytes(Buffer.from(bound.envelope.authorization.publicKey,
+      "base64url"), 44);
+    // Witness and all signers must be independently provisioned principals.
+    for (const pin of [v.pinnedInventoryPublicKey, v.pinnedPhysicalAttestorPublicKey,
+      deviceSpki]) {
+      if (witnessSpki.equals(publicDer(pin))) deny();
+    }
+    const floorFields = ["type", "witnessKeyId", "statusKeyId", "sequence",
+      "lastHash", "physicalFenceDigest", "nonce", "signature"];
+    const floor = strict(v.freshFloor, floorFields);
+    const minimum = strict(v.trustedMinimumFloor,
+      ["sequence", "lastHash", "physicalFenceDigest"]);
+    const HEX = /^[a-f0-9]{64}$/;
+    if (floor.type !== "rootark-zk1-witness-cas-physical-floor/v2"
+      || floor.witnessKeyId !== witnessId || floor.statusKeyId !== statusId
+      || floor.nonce !== challenge.toString("base64url")
+      || !Number.isSafeInteger(floor.sequence) || floor.sequence < 1
+      || floor.sequence > 100000 || !HEX.test(floor.lastHash)
+      || !HEX.test(floor.physicalFenceDigest)
+      || !Number.isSafeInteger(minimum.sequence) || minimum.sequence !== floor.sequence
+      || minimum.lastHash !== floor.lastHash
+      || minimum.physicalFenceDigest !== floor.physicalFenceDigest) deny();
+    const canonicalSignature = (encoded) => {
+      if (typeof encoded !== "string" || !/^[A-Za-z0-9_-]{86}$/.test(encoded)) deny();
+      return checkedBytes(Buffer.from(encoded, "base64url"), 64);
+    };
+    const floorUnsigned = Object.fromEntries(floorFields.slice(0, -1)
+      .map((field) => [field, floor[field]]));
+    if (!crypto.verify(null, Buffer.concat([PHYSICAL_FLOOR_DOMAIN,
+      Buffer.from(JSON.stringify(floorUnsigned))]), witness,
+    canonicalSignature(floor.signature))) deny();
+
+    const admissionFields = ["type", "envelopeSha256", "operationId", "deviceId",
+      "deviceSpkiSha256", "epoch", "checkpointSequence", "checkpointRoot",
+      "inventoryReceiptSha256", "admittedAtMs", "witnessSequence", "witnessLastHash",
+      "witnessPhysicalFenceDigest", "signature"];
+    const admission = strict(v.admission, admissionFields);
+    const digest = (data) => crypto.createHash("sha256").update(data)
+      .digest("base64url");
+    if (admission.type !== "rootark-sync-v2-historical-witness-admission/v1"
+      || admission.envelopeSha256 !== digest(bound.canonicalEnvelope)
+      || admission.operationId !== bound.operation.operation_id.toString("base64url")
+      || admission.deviceId !== bound.envelope.deviceId
+      || admission.deviceSpkiSha256 !== digest(deviceSpki)
+      || admission.epoch !== bound.operation.epoch
+      || admission.checkpointSequence !== bound.operation.expected_sequence
+      || admission.checkpointRoot !== bound.operation.expected_root.toString("base64url")
+      || !Number.isSafeInteger(admission.admittedAtMs) || admission.admittedAtMs < 1
+      || admission.admittedAtMs > bound.envelope.authorization.expiresAt
+      || admission.admittedAtMs > Date.now()
+      || admission.witnessSequence !== floor.sequence
+      || admission.witnessLastHash !== floor.lastHash
+      || admission.witnessPhysicalFenceDigest !== floor.physicalFenceDigest) deny();
+    const admissionUnsigned = Object.fromEntries(admissionFields.slice(0, -1)
+      .map((field) => [field, admission[field]]));
+    if (!crypto.verify(null, Buffer.concat([HISTORICAL_DOMAIN,
+      Buffer.from(JSON.stringify(admissionUnsigned))]), witness,
+    canonicalSignature(admission.signature))) deny();
+    // Both cryptographic verifications above happen before the asynchronous
+    // PG/inventory proof check; all attacker-controlled values were detached.
+    const physical = await verifySyncV2PhysicalEnvelopeEvidence({
+      envelope: bound.envelope, scope: bound.scope,
+      expectedSequence: bound.operation.expected_sequence,
+      expectedRoot: bound.operation.expected_root,
+      receipt: committedInventoryReceipt,
+      physicalAttestation: checkedBytes(v.physicalAttestation, 1, 2048), nonce: challenge,
+      pinnedInventoryPublicKey: v.pinnedInventoryPublicKey,
+      pinnedInventorySignerKeyId: checkedBytes(v.pinnedInventorySignerKeyId, 16),
+      pinnedPhysicalAttestorPublicKey: v.pinnedPhysicalAttestorPublicKey,
+      localTrustedDevicePolicy: snapshotLocalDevicePolicy(v.localTrustedDevicePolicy),
+    });
+    // Bind the immutable inventory receipt rather than the fresh PG readback
+    // signature: its nonce cannot be known when the *historical* admission is
+    // signed. The current PG attestor signature is independently challenged.
+    if (admission.inventoryReceiptSha256 !== digest(committedInventoryReceipt)
+      || physical.localPgReadbackVerified !== true
+      || physical.authorizesIo !== false) deny();
+    return Object.freeze({ status: "SYNC_V2_HISTORICAL_WITNESS_VERIFIED",
+      envelopeSha256: Buffer.from(bound.operation.ciphertext_sha256),
+      historicalServerAdmissionProven: true, independentlyAnchoredFloorProven: true,
+      localPgReadbackVerified: true, externalDurabilityProven: false,
+      authorizesHistoricalRead: true, authorizesIo: false });
+  } catch (_) {
+    const error = new Error("SYNC_ZK1_HISTORICAL_ADMISSION_DENIED");
+    error.code = error.message;
+    throw error;
+  }
+}
+
 module.exports = { envelopeBinding, physicalWriteRequest,
-  verifySyncV2PhysicalEnvelopeEvidence };
+  verifySyncV2PhysicalEnvelopeEvidence, verifySyncV2HistoricalWitnessAdmission };

@@ -255,6 +255,7 @@ class SyncEngine {
     this.authorize = options.authorize || (() => true);
     this.authorizeOutgoing = options.authorizeOutgoing || (() => true);
     this.verifyIncoming = options.verifyIncoming || null;
+    this.reverifySeenIncoming = options.reverifySeenIncoming === true;
     this.authorizationFactory = options.authorizationFactory || null;
     this.requireAuthorization = options.requireAuthorization === true;
     this.translateWebDavOperation = options.translateWebDavOperation || null;
@@ -1546,7 +1547,14 @@ class SyncEngine {
         continue;
       }
       // A folder re-included after an exclusion must hydrate even if this operation was seen before.
-      if (this.journal.hasSeen(operation.operationId) && remoteOnly?.reason !== "excluded") continue;
+      if (this.journal.hasSeen(operation.operationId) && remoteOnly?.reason !== "excluded") {
+        // The local seen JSON is mutable. In independently enforced historical
+        // mode it cannot suppress verification of remote signed envelopes on
+        // a restarted pull; a forged seen ID only risks local availability.
+        if (this.reverifySeenIncoming) await this.verifyIncomingOperation(operation,
+          { preObserve: false });
+        continue;
+      }
       const verifiedFreshDigest = await this._apply(operation, summary);
       await this.journal.markSeen(operation.operationId, verifiedFreshDigest);
       summary.pulled += 1;

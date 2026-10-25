@@ -565,6 +565,33 @@ independently anchored monotonic floor, remote durability, or IO authority.
 Only explicit `epoch-N` key epochs are interoperable with this prototype;
 other epoch names fail closed rather than inventing a numeric mapping.
 
+Isolated Sync v2 witness-admission verifier milestone (2026-10-25):
+`verifySyncV2HistoricalWitnessAdmission` checks an independently pinned
+Ed25519 witness signature over the full encrypted, signed envelope hash,
+device identity and SPKI hash, operation ID, epoch, inventory checkpoint and
+stable signed-inventory receipt digest. The signed witness `admittedAtMs` must
+precede the device's signed expiry, and the verifier independently challenges
+fresh PostgreSQL readback and a separate physically fenced witness head using
+the caller-owned nonce. The fresh physical witness floor must match an exact
+out-of-band pinned minimum, including its physical-fence digest; this
+conservatively refuses later head advances until signed ancestry is supported.
+The opt-in `independent-physical-witness-v1` CLI engine mode disregards mutable
+local journal historical-admission evidence, can be enforced independently via
+`requireIndependentHistoricalAdmission` or the external
+`ROOTARK_SYNC_REQUIRE_INDEPENDENT_HISTORY=1` environment setting, requires separately injected
+trusted keys/floor and an independent evidence provider, and refuses to start
+without both. Previously seen remote entries are rechecked in strict mode,
+because mutable `seen` journal IDs cannot suppress independent authorization
+on a restarted LIST. Default CLI behavior remains unchanged. Fixture-level negative
+tests cover forged signatures, replay, floor rollback, wrong device/checkpoint,
+expired device signing and valid witness/PG signatures with wrong contents.
+**Not a deployed issuance path or PostgreSQL integration:** no independently
+durable admission-receipt issuer, real mTLS evidence adapter, witnessed
+historical enrollment timestamp, externally retained post-restart floor, or
+full signed ancestry for later witness heads exists. No production historical
+admission guarantee or issue #65 GO can be claimed from this standalone
+verifier. Do not bootstrap witness trust from the mutable local sync config.
+
 Last reconstructed: 2026-07-25 (historical baseline)
 Latest application-code snapshot for this closure: 2026-10-16 after PR #201 merged at `341804fa2bfd02dcd50f2d1bde560cb677fc27fd`. The [2026-10-16 pre-publication snapshot](validation/2026-10-16-rootark-prepublication-closure.md) records GitHub state and validation evidence queried after PR #199; it is historical and does not describe PR #201 or later commits. Track the final exact `Root/main` SHA and local validation for the documentation-only closure publication in the [final closure PR #202](https://github.com/bielxdh3/Root.ark/pull/202).
 
