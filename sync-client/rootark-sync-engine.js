@@ -254,6 +254,14 @@ class SyncEngine {
     this.fileKeyResolver = options.fileKeyResolver || (() => options.fileKey);
     this.authorize = options.authorize || (() => true);
     this.authorizeOutgoing = options.authorizeOutgoing || (() => true);
+    // Supplied by the embedding process from independently trusted, CURRENT
+    // device policy. Config snapshots and the local journal are not authority.
+    this.currentDeviceAuthorization = options.currentDeviceAuthorization || null;
+    this.requireCurrentOutgoingAuthorization = options.requireCurrentOutgoingAuthorization === true;
+    if ((options.currentDeviceAuthorization != null && typeof options.currentDeviceAuthorization !== "function")
+      || (this.requireCurrentOutgoingAuthorization && !this.currentDeviceAuthorization)) {
+      fail("Current device authorization callback is required", "authorization_required");
+    }
     this.verifyIncoming = options.verifyIncoming || null;
     this.reverifySeenIncoming = options.reverifySeenIncoming === true;
     this.authorizationFactory = options.authorizationFactory || null;
@@ -602,10 +610,29 @@ class SyncEngine {
       operationId: input.operationId || crypto.randomUUID(),
       fileKey: key,
     });
-    if (await this.authorizeOutgoing(operation) !== true) fail("Local sync authorization rejected", "authorization_rejected");
+    await this.assertOutgoingAuthorized(operation);
     if (this.authorizationFactory) operation.authorization = await this.authorizationFactory(operation);
     else if (this.requireAuthorization) fail("Device authorization is required", "authorization_required");
+    // Signing can await an external key provider. Revocation after the initial
+    // check must stop the signed operation before it reaches the journal.
+    await this.assertOutgoingAuthorized(operation);
     return operation;
+  }
+
+  async assertOutgoingAuthorized(operation, authorizedAction = null) {
+    if (await this.authorizeOutgoing(operation) !== true) {
+      fail("Local sync authorization rejected", "authorization_rejected");
+    }
+    if (this.requireCurrentOutgoingAuthorization && operation.deviceId !== this.deviceId) {
+      fail("Local sync device authorization rejected", "authorization_rejected");
+    }
+    if (this.currentDeviceAuthorization
+      && await this.currentDeviceAuthorization(operation) !== true) {
+      fail("Current sync device authorization rejected", "authorization_rejected");
+    }
+    // Invoke the network action in the same continuation as the last current
+    // policy check: no further await may open another client-side race window.
+    if (authorizedAction) return authorizedAction();
   }
 
   async enqueueChange(input) {
@@ -618,6 +645,7 @@ class SyncEngine {
     if (remoteOnly?.reason === "evicted") fail("Materialize a remote-only file before enqueuing changes", "remote_only_object");
     const key = input.fileKey || await this.fileKeyResolver(input);
     const operation = protocol.validateOperation(await this.buildOperation({ ...input, fileKey: key }));
+    await this.assertOutgoingAuthorized(operation);
     await this.journal.enqueue(operation);
     let hash;
     if (operation.operation === "move") {
@@ -864,8 +892,13 @@ class SyncEngine {
   async retryPush(operation) {
     let lastError;
     for (let attempt = 0; attempt < this.maxRetries; attempt += 1) {
-      try { return await this.adapter.push(operation); } catch (error) {
+      // The journal's prior authorization is not a live device grant. Check
+      // again on EVERY attempt, after all queue/retry waits, before HTTP PUT.
+      // An in-flight request still needs independent server-side revocation
+      // fencing in the atomic PUT transaction.
+      try { return await this.assertOutgoingAuthorized(operation, () => this.adapter.push(operation)); } catch (error) {
         lastError = error;
+        if (error?.code === "authorization_rejected" || error?.code === "authorization_required") throw error;
         if (!transient(error) || attempt + 1 === this.maxRetries) throw error;
       }
     }
@@ -1261,6 +1294,7 @@ class SyncEngine {
       }
       const key = await this.fileKeyResolver(prior);
       const operation = await this.buildOperation({ operation: "delete", objectId: prior.objectId, fileId: prior.fileId, versionId: crypto.randomUUID(), baseRevision: prior.revision, revision: { counter: (prior.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata: { path: relative }, fileKey: key });
+      await this.assertOutgoingAuthorized(operation);
       await this.journal.enqueue(operation);
       this.rememberOperation(operation);
     }
@@ -1293,6 +1327,7 @@ class SyncEngine {
       const key = await this.fileKeyResolver({ objectId, fileId, path: relative, keyEpoch: this.keyEpoch });
       const metadata = { path: relative, name: path.basename(relative), size: data.length, ...(isDirectory ? { contentType: "inode/directory" } : {}) };
       const operation = await this.buildOperation({ operation: isUpdate ? "update" : "create", objectId, fileId, versionId: crypto.randomUUID(), baseRevision: isUpdate ? prior.revision : null, revision: { counter: (prior?.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata, plaintext: data, fileKey: key });
+      await this.assertOutgoingAuthorized(operation);
       await this.journal.enqueue(operation);
       this.rememberOperation(operation, contentHash);
     }
