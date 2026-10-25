@@ -102,12 +102,12 @@ function createZk1PgPhysicalAttestorHttpsServer({ key, cert, clientCa,
   const server = https.createServer({ key, cert, ca: clientCa, requestCert: true,
     rejectUnauthorized: true, minVersion: "TLSv1.3" }, async (req, res) => {
     try {
-      if (req.method !== "POST" || req.url !== "/v1/physical/attest") {
-        return send(res, 404, { error: "NOT_FOUND" });
-      }
       const fingerprint = req.socket.getPeerCertificate()?.fingerprint256?.toUpperCase();
       if (!req.socket.authorized || !fingerprint || !grants.has(fingerprint)) {
         return send(res, 403, { error: "FORBIDDEN" });
+      }
+      if (req.method !== "POST" || req.url !== "/v1/physical/attest") {
+        return send(res, 404, { error: "NOT_FOUND" });
       }
       if (active.has(fingerprint) || active.size >= 8) {
         return send(res, 503, { error: "ZK_PHYSICAL_ATTESTOR_BUSY" });
