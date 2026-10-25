@@ -142,6 +142,8 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
     "a mutable legacy seen journal must not suppress witness checks");
   assert.equal(engineOptions.requireCurrentOutgoingAuthorization, true,
     "strict client must force current independent authorization at queued HTTP send");
+  assert.equal(engineOptions.currentDeviceAuthorization({ deviceId: "device1" }), true,
+    "the final device-policy check must be synchronous so PUT starts before any microtask");
   try {
     Date.now = () => signature.expiresAt + 1;
     assert.equal(await engineOptions.verifyIncoming(signedIncoming, {

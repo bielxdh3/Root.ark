@@ -152,7 +152,7 @@ async function start(options = {}) {
     // retry/push. Authorization at initial operation creation is insufficient.
     requireCurrentOutgoingAuthorization: strictHistorical,
     currentDeviceAuthorization: strictHistorical
-      ? async (operation) => config.deviceRevoked !== true
+      ? (operation) => config.deviceRevoked !== true
         && operation.deviceId === config.deviceId
         && currentlyTrustedDevice(operation.deviceId)
       : undefined,
