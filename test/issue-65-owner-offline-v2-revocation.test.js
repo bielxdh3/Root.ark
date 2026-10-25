@@ -7,6 +7,8 @@ const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
 const { spawn } = require("node:child_process");
+const { publishFixtureJson, awaitFixtureJson } =
+  require("./support/issue-65-owner-revocation-fixture-ipc");
 const fixtures = require("./support/issue-65-recovery-v2-fixtures");
 const m = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const z = require("../src/crypto/rootark-zk-1");
@@ -370,7 +372,7 @@ test("real Node CLI exchanges candidate and two signed witness proofs with separ
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-owner-revoke-"));
     t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
     const file = (name) => path.join(root, name);
-    const write = (name, data) => fs.writeFileSync(file(name), JSON.stringify(data));
+    const write = (name, data) => publishFixtureJson(root, name, data);
     const source = path.resolve(__dirname, "../");
     write("offline-state.json", {
       scope: Object.fromEntries(Object.entries(f.state.scope).map(([name, bytes]) =>
@@ -416,14 +418,11 @@ test("real Node CLI exchanges candidate and two signed witness proofs with separ
       child.once("exit", (code, signal) => resolve({ code, signal }));
       child.once("error", (error) => resolve({ code: -1, error }));
     });
-    const until = async (filename) => {
-      for (let i = 0; i < 90; i++) {
-        if (fs.existsSync(file(filename))) return JSON.parse(fs.readFileSync(file(filename), "utf8"));
-        if (child.exitCode !== null) throw new Error("early CLI exit: " + err);
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-      throw new Error("missing " + filename + ": " + err);
-    };
+    const until = (filename) => awaitFixtureJson(file(filename), {
+      exited: () => child.exitCode !== null,
+    }).catch((error) => {
+      throw new Error(error.message + ": " + err);
+    });
     if (mode === "bad-prior-pin") {
       assert.notEqual((await exit).code, 0);
       assert.equal(fs.existsSync(file("revocation-candidate.json")), false);

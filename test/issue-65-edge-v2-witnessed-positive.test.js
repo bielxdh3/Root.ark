@@ -13,6 +13,7 @@ const os = require("node:os");
 const path = require("node:path");
 const https = require("node:https");
 const { spawn, execFileSync } = require("node:child_process");
+const { waitForEdgeDevtoolsPage } = require("./support/issue-65-edge-devtools-readiness");
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const { generateNativeFixtureCertificates } =
@@ -199,12 +200,7 @@ async function launchEdge(t, origin, session) {
       }
     }
   });
-  const port = await wait(() => {
-    const file = path.join(profileDir, "DevToolsActivePort");
-    return fs.existsSync(file) ? Number(fs.readFileSync(file, "utf8").split(/\r?\n/)[0]) : null;
-  }, "devtools");
-  const pages = await (await fetch("http://127.0.0.1:" + port + "/json/list")).json();
-  socket = new WebSocket(pages.find((p) => p.type === "page").webSocketDebuggerUrl);
+  socket = new WebSocket(await waitForEdgeDevtoolsPage({ profileDir, child: edge }));
   await new Promise((resolve, reject) => {
     socket.addEventListener("open", resolve, { once: true });
     socket.addEventListener("error", reject, { once: true });
