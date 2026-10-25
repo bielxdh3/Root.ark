@@ -47,6 +47,8 @@ const { createZk1WitnessHttpsServer, drainZk1WitnessHttpsServer } =
 const { configure: configureStandaloneHistoricalWitness,
   serve: serveStandaloneHistoricalWitness } =
   require("../scripts/zk1-witness-standalone");
+const { createExternalRecoveryHeadFixture } =
+  require("./support/issue-65-external-recovery-head-fixture");
 
 const enabled = Boolean(process.env.ROOTARK_ZK1_TEST_PG_URL
   && process.env.ROOTARK_ZK1_RUNTIME_PG_URL
@@ -308,6 +310,9 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
       serverFingerprint256: fingerprint(read("witness.pem")) },
     casAnchorFloor: { dbPath: witnessPath, trustedMinimumHead: genesisFloor },
   };
+  const operatorRecovery = createExternalRecoveryHeadFixture(
+    path.join(dir, "separate-operator-recovery-floor.sqlite"));
+  cleanups.push(() => operatorRecovery.close());
   const trustedHistorical = {
     physicalAdmission: admission,
     witnessPublicKey: witnessKeys.publicKey,
@@ -315,6 +320,7 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
     trustedMinimumHead: { ...genesisFloor,
       physicalFenceDigest: crypto.createHash("sha256").update("").digest("hex") },
     trustedHistoricalAdmissionHead: { sequence: 0, lastHash: "0".repeat(64) },
+    trustedRecoveryNonceAuthority: operatorRecovery.authority,
     trustedSyncDevicePolicyProvider: () => ({ username: policy.username,
       trustedDevicePublicKeys: { ...policy.trustedDevicePublicKeys },
       revokedDeviceIds: [...policy.revokedDeviceIds] }),
@@ -347,6 +353,17 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
       trustedHistoricalAdmissionHead: { sequence: 1, lastHash: "f".repeat(64) } } }),
   /WITNESS_STARTUP_FAILED/,
   "bootstrap cannot install independently claimed nonzero historical high-water");
+  assert.throws(() => configureStandaloneHistoricalWitness(config, {
+    historicalAuthority: { ...trustedHistorical,
+      trustedRecoveryNonceAuthority: null } }),
+  /WITNESS_STARTUP_FAILED/,
+  "standalone historical issuer refuses missing independent recovery checkpoint custody");
+  operatorRecovery.setAvailable(false);
+  assert.throws(() => configureStandaloneHistoricalWitness(config, {
+    historicalAuthority: trustedHistorical }),
+  /WITNESS_STARTUP_FAILED/,
+  "external authority unavailable denies standalone startup before local SQLite bootstrap");
+  operatorRecovery.setAvailable(true);
   assert.equal(fs.existsSync(config.dbPath), false);
   for (const needed of [config.cas.caPath, config.cas.clientKeyPath,
     config.cas.clientCertPath, config.witnessPrivateKeyPath]) {
@@ -425,6 +442,16 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
   const recoveredClientProof = await clientProvider(envelope, {
     nonce: recoveryChallenge, recovery: true,
   });
+  assert.deepEqual(operatorRecovery.read(), witness.historicalRecoveryNonceHead(),
+    "a successful real PG18 recovery ACK requires independently durable external CAS head");
+  operatorRecovery.setAvailable(false);
+  assert.equal(witness.supportsClientHistoricalNonce, false,
+    "unavailable operator custody disables the mTLS historical recovery capability");
+  const unavailable = await postHistorical(port, read, "historical",
+    body(envelope, random(32)), { route: "/v1/cas-anchor/historical-recover" });
+  assert.notEqual(unavailable.status, 200,
+    "real mTLS route must not authorize another recovery without external head");
+  operatorRecovery.setAvailable(true);
   const accepted = { body: {
     admission: recoveredClientProof.admission,
     freshFloor: recoveredClientProof.freshFloor,

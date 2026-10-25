@@ -80,6 +80,7 @@ function snapshotHistoricalAuthority(authority, config, witnessKey, statusKey) {
   if (authority === undefined || authority === null) return null;
   exact(authority, ["physicalAdmission", "trustedSyncDevicePolicyProvider",
     "trustedMinimumHead", "trustedHistoricalAdmissionHead",
+    "trustedRecoveryNonceAuthority",
     "witnessPublicKey", "statusPublicKey", "principals"]);
   if (!(authority.physicalAdmission instanceof Zk1WitnessCasPhysicalAdmission)
     || typeof authority.trustedSyncDevicePolicyProvider !== "function"
@@ -89,6 +90,9 @@ function snapshotHistoricalAuthority(authority, config, witnessKey, statusKey) {
     || !(authority.statusPublicKey instanceof crypto.KeyObject)
     || authority.statusPublicKey.type !== "public"
     || authority.statusPublicKey.asymmetricKeyType !== "ed25519"
+    || !authority.trustedRecoveryNonceAuthority
+    || typeof authority.trustedRecoveryNonceAuthority.loadHead !== "function"
+    || typeof authority.trustedRecoveryNonceAuthority.compareAndAdvance !== "function"
     || !crypto.KeyObject.prototype.equals.call(authority.witnessPublicKey,
       crypto.createPublicKey(witnessKey))
     || !crypto.KeyObject.prototype.equals.call(authority.statusPublicKey, statusKey)
@@ -99,14 +103,27 @@ function snapshotHistoricalAuthority(authority, config, witnessKey, statusKey) {
   exact(floor, ["sequence", "lastHash", "physicalFenceDigest"]);
   const historical = authority.trustedHistoricalAdmissionHead;
   exact(historical, ["sequence", "lastHash"]);
+  // This object is a direct injection from the separate operator launcher,
+  // never config JSON, request JSON, the witness SQLite or the CAS writer.
+  // A *live* externally committed read is mandatory before any DB startup.
+  let externalRecoveryHead;
+  try { externalRecoveryHead = authority.trustedRecoveryNonceAuthority.loadHead(); }
+  catch (_) { fail(); }
+  exact(externalRecoveryHead, ["sequence", "lastHash"]);
   const checkHash = (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
   if (!Number.isSafeInteger(floor.sequence) || floor.sequence < 0
     || floor.sequence > 100000 || !checkHash(floor.lastHash)
     || !checkHash(floor.physicalFenceDigest)
     || !Number.isSafeInteger(historical.sequence) || historical.sequence < 0
     || historical.sequence > 100000 || !checkHash(historical.lastHash)
+    || !Number.isSafeInteger(externalRecoveryHead.sequence)
+    || externalRecoveryHead.sequence < 0 || externalRecoveryHead.sequence > 4096
+    || !checkHash(externalRecoveryHead.lastHash)
+    || (externalRecoveryHead.sequence === 0
+      && externalRecoveryHead.lastHash !== "0".repeat(64))
     || (historical.sequence === 0 && historical.lastHash !== "0".repeat(64))
-    || (config.bootstrapNew && (historical.sequence !== 0
+    || (config.bootstrapNew && (externalRecoveryHead.sequence !== 0
+      || historical.sequence !== 0
       || floor.sequence !== 0 || floor.lastHash !== "0".repeat(64)
       || floor.physicalFenceDigest !== crypto.createHash("sha256")
         .update("").digest("hex")))
@@ -138,6 +155,7 @@ function snapshotHistoricalAuthority(authority, config, witnessKey, statusKey) {
     trustedSyncDevicePolicyProvider: authority.trustedSyncDevicePolicyProvider,
     trustedMinimumHead: Object.freeze({ ...floor }),
     trustedHistoricalAdmissionHead: Object.freeze({ ...historical }),
+    trustedRecoveryNonceAuthority: authority.trustedRecoveryNonceAuthority,
     principals: externalPrincipals });
 }
 
@@ -266,7 +284,8 @@ function configure(config, { historicalAuthority } = {}) {
       ...(historical ? { attestedAdmission: historical.physicalAdmission,
         enableSyncHistoricalIssuer: true,
         trustedSyncDevicePolicyProvider: historical.trustedSyncDevicePolicyProvider,
-        trustedHistoricalAdmissionHead: historical.trustedHistoricalAdmissionHead } : {}),
+        trustedHistoricalAdmissionHead: historical.trustedHistoricalAdmissionHead,
+        trustedRecoveryNonceAuthority: historical.trustedRecoveryNonceAuthority } : {}),
     });
   }
   let ledger;

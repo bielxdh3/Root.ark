@@ -31,6 +31,8 @@ const { createOperation } = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { envelopeBinding, verifySyncV2HistoricalWitnessAdmission } =
   require("../sync-client/rootark-sync-zk1-physical-binding");
+const { createExternalRecoveryHeadFixture } =
+  require("./support/issue-65-external-recovery-head-fixture");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/cas-witness-physical-owner-binding/v1\0");
 const ENTRY = Buffer.from("Root.ark/zk-1/content-inventory-entry/v1\0");
@@ -40,7 +42,11 @@ const hex = (b) => sha(b).toString("hex");
 
 test("strict CAS witness floor refuses signed status advance without independent PG attestation and owner binding", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-witness-physical-"));
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const externalAuthorities = [];
+  t.after(() => {
+    for (const authority of externalAuthorities.reverse()) authority.close();
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
   const status = crypto.generateKeyPairSync("ed25519");
   const witness = crypto.generateKeyPairSync("ed25519");
   const owner = crypto.generateKeyPairSync("ed25519");
@@ -256,6 +262,10 @@ test("strict CAS witness floor refuses signed status advance without independent
     statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission,
     enableSyncHistoricalIssuer: true, trustedSyncDevicePolicyProvider,
   };
+  const externalRecovery = createExternalRecoveryHeadFixture(
+    path.join(directory, "operator-outside-witness-recovery-head.sqlite"));
+  externalAuthorities.push(externalRecovery);
+  historicalOptions.trustedRecoveryNonceAuthority = externalRecovery.authority;
   assert.throws(() => new Zk1WitnessCasAnchorFloor(
     path.join(directory, "forbidden-policyless-issuer.sqlite"), {
       witnessKeyId, witnessPrivateKey: witness.privateKey,
@@ -277,6 +287,14 @@ test("strict CAS witness floor refuses signed status advance without independent
   const historicalChallenge = random(32);
   const issueInput = { envelope: syncEnvelope, scope, expectedSequence: 0,
     expectedRoot: genesisRoot, inventoryReceipt: receipt, nonce: historicalChallenge };
+  externalRecovery.setAvailable(false);
+  assert.equal(historical.supportsClientHistoricalNonce, false);
+  await assert.rejects(historical.issueSyncHistoricalAdmission(issueInput),
+    /WITNESS_CAS_FLOOR_DENIED/,
+    "issuer cannot perform its FIRST signed admission when external operator floor is down");
+  externalRecovery.setAvailable(true);
+  assert.deepEqual(historical.historicalAdmissionHead(), {
+    sequence: 0, lastHash: "0".repeat(64) });
   await assert.rejects(historical.issueSyncHistoricalAdmission({ ...issueInput,
     nonce: random(31) }), /WITNESS_CAS_FLOOR_DENIED/,
   "historical admission must reject malformed caller challenges before physical IO");
@@ -625,6 +643,80 @@ test("strict CAS witness floor refuses signed status advance without independent
   assert.ok(independentlyPinnedRecoveryHead.sequence >= 2,
     "recovery ledger exports a separately retainable monotonic head");
   historical.close();
+  const pinnedRestart = {
+    ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
+      sequence: 1, lastHash: admittedFloor.lastHash,
+      physicalFenceDigest: admittedFloor.physicalFenceDigest },
+    trustedHistoricalAdmissionHead: admittedHistoryHead,
+  };
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(olderSignedReplaySnapshot,
+    pinnedRestart), /WITNESS_CAS_FLOOR_DENIED/,
+  "old valid SQLite snapshot fails automatically without a caller-supplied static recovery floor");
+  // Crash window: the immutable local nonce INSERT commits, but external
+  // operator custody is unavailable BEFORE its monotonic CAS. No HTTP ACK,
+  // no future ISSUE/RECOVER, and no automatic promotion on restart.
+  const pendingPath = path.join(directory, "witness-external-checkpoint-pending.sqlite");
+  fs.copyFileSync(historicalFilename, pendingPath);
+  const externalPending = createExternalRecoveryHeadFixture(
+    path.join(directory, "separate-operator-pending-recovery-head.sqlite"),
+    independentlyPinnedRecoveryHead);
+  externalAuthorities.push(externalPending);
+  const pendingOptions = {
+    ...pinnedRestart, trustedRecoveryNonceAuthority: externalPending.authority,
+  };
+  let pendingWitness = new Zk1WitnessCasAnchorFloor(pendingPath, pendingOptions);
+  externalPending.setAvailable(false);
+  await assert.rejects(pendingWitness.issueSyncHistoricalAdmission({
+    ...issueInput, nonce: random(32),
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "offline external custody denies ISSUE before signing, despite a complete local admission");
+  await assert.rejects(pendingWitness.recoverSyncHistoricalAdmission({
+    ...recoveryInput, nonce: random(32),
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "offline external custody denies RECOVER before PG readback");
+  externalPending.setAvailable(true);
+  externalPending.setFailurePhase("before");
+  const committedOnlyNonce = random(32);
+  await assert.rejects(pendingWitness.recoverSyncHistoricalAdmission({
+    ...recoveryInput, nonce: committedOnlyNonce,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "failure AFTER durable witness FULL but BEFORE external CAS returns no ACK");
+  assert.deepEqual(externalPending.read(), independentlyPinnedRecoveryHead);
+  pendingWitness.close();
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(pendingPath, pendingOptions),
+    /WITNESS_CAS_FLOOR_DENIED/,
+  "restart with local-ahead/external-behind pending checkpoint MUST be NO-GO");
+  // An independent operator explicitly reconciles the ORIGINAL signed
+  // SQLite chain to remote custody. The launcher may never do this itself.
+  const pendingSql = new Database(pendingPath, { readonly: true, fileMustExist: true });
+  const persistedPending = pendingSql.prepare(
+    "SELECT sequence,last_hash FROM witness_cas_sync_historical_recovery_head WHERE id=1").get();
+  pendingSql.close();
+  const reconciled = { sequence: persistedPending.sequence,
+    lastHash: persistedPending.last_hash };
+  assert.equal(reconciled.sequence, independentlyPinnedRecoveryHead.sequence + 1);
+  externalPending.setFailurePhase(null);
+  assert.equal(externalPending.authority.compareAndAdvance(
+    independentlyPinnedRecoveryHead, reconciled), true);
+  pendingWitness = new Zk1WitnessCasAnchorFloor(pendingPath, pendingOptions);
+  await assert.rejects(pendingWitness.recoverSyncHistoricalAdmission({
+    ...recoveryInput, nonce: committedOnlyNonce,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "after owner-approved reconciliation, an unacknowledged challenge remains forever spent");
+  const acknowledgedExternallyButLost = random(32);
+  externalPending.setFailurePhase("after");
+  await assert.rejects(pendingWitness.recoverSyncHistoricalAdmission({
+    ...recoveryInput, nonce: acknowledgedExternallyButLost,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "lost external CAS acknowledgment must not return HTTP recovery evidence");
+  pendingWitness.close();
+  externalPending.setFailurePhase(null);
+  pendingWitness = new Zk1WitnessCasAnchorFloor(pendingPath, pendingOptions);
+  await assert.rejects(pendingWitness.recoverSyncHistoricalAdmission({
+    ...recoveryInput, nonce: acknowledgedExternallyButLost,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "external CAS actually committed, so the no-ACK nonce is spent after restart");
+  pendingWitness.close();
   assert.throws(() => new Zk1WitnessCasAnchorFloor(olderSignedReplaySnapshot, {
     ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
       sequence: 1, lastHash: admittedFloor.lastHash,
@@ -972,6 +1064,12 @@ test("strict CAS witness floor refuses signed status advance without independent
       statusKeyId, statusPublicKey: status.publicKey,
       attestedAdmission: endToEndAdmission, enableSyncHistoricalIssuer: true,
       trustedSyncDevicePolicyProvider,
+      trustedRecoveryNonceAuthority: (() => {
+        const authority = createExternalRecoveryHeadFixture(
+          path.join(directory, "remote-witness-operator-recovery-head.sqlite"));
+        externalAuthorities.push(authority);
+        return authority.authority;
+      })(),
     });
   try {
     assert.equal((await remoteFloor.advanceAttested({

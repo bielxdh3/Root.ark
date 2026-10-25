@@ -177,24 +177,33 @@ class Zk1WitnessCasAnchorFloor {
   #historicalHead = Object.freeze({ sequence: 0, lastHash: ZERO });
   #recoveryHead = Object.freeze({ sequence: 0, lastHash: ZERO });
   #pinnedRecoveryHead;
+  #externalRecoveryAuthority;
   #trustedSyncDevicePolicyProvider;
   // Read-only capability for the separately reviewed mTLS issuer transport.
   // Never advertise legacy/writer-signed floors or a closed issuer as nonce
   // bound; strict mode always uses the caller nonce for PG AND witness floor.
   get supportsClientHistoricalNonce() {
-    return this.#historicalEnabled && !this.#closed
-      && this.#attestedAdmission instanceof Zk1WitnessCasPhysicalAdmission
-      && typeof this.#trustedSyncDevicePolicyProvider === "function";
+    if (!this.#historicalEnabled || this.#closed
+      || !(this.#attestedAdmission instanceof Zk1WitnessCasPhysicalAdmission)
+      || typeof this.#trustedSyncDevicePolicyProvider !== "function") return false;
+    try { this.#assertExternalRecoveryHead(); return true; }
+    catch (_) { return false; }
   }
   constructor(filename, { bootstrapNew = false, witnessKeyId, witnessPrivateKey,
     statusKeyId, statusPublicKey, trustedMinimumHead,
     attestedAdmission = null, enableSyncHistoricalIssuer = false,
     trustedHistoricalAdmissionHead, trustedRecoveryNonceHead,
+    trustedRecoveryNonceAuthority,
     trustedSyncDevicePolicyProvider } = {}) {
     if (typeof enableSyncHistoricalIssuer !== "boolean"
       || (enableSyncHistoricalIssuer && (!attestedAdmission
-        || typeof trustedSyncDevicePolicyProvider !== "function"))) fail();
+        || typeof trustedSyncDevicePolicyProvider !== "function"
+        || !trustedRecoveryNonceAuthority
+        || typeof trustedRecoveryNonceAuthority.loadHead !== "function"
+        || typeof trustedRecoveryNonceAuthority.compareAndAdvance !== "function"))
+      || (!enableSyncHistoricalIssuer && trustedRecoveryNonceAuthority !== undefined)) fail();
     this.#historicalEnabled = enableSyncHistoricalIssuer;
+    this.#externalRecoveryAuthority = trustedRecoveryNonceAuthority || null;
     // Operator-supplied trust context, independent of the incoming request:
     // remote callers may NEVER provide their own device pins or revocations.
     this.#trustedSyncDevicePolicyProvider = enableSyncHistoricalIssuer
@@ -217,6 +226,10 @@ class Zk1WitnessCasAnchorFloor {
           || (bootstrapNew && (pinned.sequence !== 0 || pinned.lastHash !== ZERO))) fail();
         this.#pinnedRecoveryHead = Object.freeze({ ...pinned });
       }
+      // The initial externally retained minimum must be acquired BEFORE
+      // bootstrapping even an empty local ledger; no mutable DB or request
+      // JSON is permitted to supply the authority.
+      if (bootstrapNew) this.#assertExternalRecoveryHead();
     }
     if (trustedMinimumHead !== undefined) {
       // Strict restart's independent high-water anchor must bind the physical
@@ -468,6 +481,7 @@ class Zk1WitnessCasAnchorFloor {
         // Never silently migrate it to an all-clear anti-replay ledger: safe
         // recovery requires the nonce co-committed with the original receipt.
         this.#assertHistoricalNonceIntegrity(db);
+        this.#assertExternalRecoveryHead();
       }
       this.#verifiedChain = verifiedChain;
       this.#verifiedChainDigest = verifiedChain.copy().digest("hex");
@@ -712,6 +726,7 @@ class Zk1WitnessCasAnchorFloor {
     if (!this.#historicalEnabled || this.#closed) fail();
     this.head();
     this.#assertHistoricalIntegrity();
+    this.#assertExternalRecoveryHead();
     // Operator-retained off-host minimum is needed to detect restoration of
     // an ENTIRE previously valid signed SQLite replay ledger snapshot.
     return Object.freeze({ ...this.#recoveryHead });
@@ -721,6 +736,41 @@ class Zk1WitnessCasAnchorFloor {
       this.#witnessId.toString("base64url"), this.#statusId.toString("base64url"),
       sequence, lastHash,
     ]))]);
+  }
+  #readExternallyCommittedRecoveryHead() {
+    if (!this.#externalRecoveryAuthority) fail();
+    // The operator-provisioned external reader MUST load committed durable
+    // state on every invocation. Promises/remote unavailability are not
+    // implicitly successful: this API deliberately requires synchronous
+    // independently durable admission fencing.
+    let observed;
+    try { observed = this.#externalRecoveryAuthority.loadHead(); }
+    catch (_) { fail(); }
+    const head = exact(observed, ["sequence", "lastHash"]);
+    if (!Number.isSafeInteger(head.sequence)
+      || head.sequence < 0 || head.sequence > MAX_RECOVERY_CHALLENGES
+      || !validHex(head.lastHash)
+      || (head.sequence === 0 && head.lastHash !== ZERO)) fail();
+    return Object.freeze({ sequence: head.sequence, lastHash: head.lastHash });
+  }
+  #assertExternalRecoveryHead() {
+    const external = this.#readExternallyCommittedRecoveryHead();
+    if (external.sequence !== this.#recoveryHead.sequence
+      || external.lastHash !== this.#recoveryHead.lastHash) fail();
+  }
+  #commitExternalRecoveryHead(previous, next) {
+    const loaded = this.#readExternallyCommittedRecoveryHead();
+    if (loaded.sequence !== previous.sequence
+      || loaded.lastHash !== previous.lastHash) fail();
+    let acknowledged;
+    try {
+      acknowledged = this.#externalRecoveryAuthority.compareAndAdvance(
+        Object.freeze({ ...previous }), Object.freeze({ ...next }));
+    } catch (_) { fail(); }
+    // Only explicit durable CAS acknowledgment is accepted. Re-read from
+    // external custody *after* the CAS, before any HTTP success response.
+    if (acknowledged !== true) fail();
+    this.#assertExternalRecoveryHead();
   }
   #signRecoveryHead(head) {
     return crypto.sign(null, this.#recoveryHeadMessage(head), this.#witness);
@@ -911,6 +961,7 @@ class Zk1WitnessCasAnchorFloor {
   async #recoverSyncSerial({ bound, receipt, nonce }) {
     try {
       if (!this.supportsClientHistoricalNonce) fail();
+      this.#assertExternalRecoveryHead();
       const operationId = bound.operation.operation_id.toString("base64url");
       const saved = this.historicalAdmissionForOperation(bound.operation.operation_id);
       if (!saved) fail();
@@ -986,6 +1037,7 @@ class Zk1WitnessCasAnchorFloor {
       let committedHead;
       this.#db.transaction(() => {
         this.#assertHistoricalIntegrity();
+        this.#assertExternalRecoveryHead();
         const own = this.#db.prepare(
           "SELECT a.hash,i.admission_hash,i.nonce"
           + " FROM witness_cas_sync_historical_admission a"
@@ -1031,7 +1083,13 @@ class Zk1WitnessCasAnchorFloor {
           || Math.abs(Math.floor(afterInsert / 1000) - composite.physicalIssuedAt) > 30) fail();
         committedHead = Object.freeze(nextHead);
       }).immediate();
+      const previousExternal = this.#recoveryHead;
       this.#recoveryHead = committedHead;
+      // Crash point: FULL SQLite has committed but the independent CAS may
+      // not yet have committed. A missed/ambiguous external ACK denies this
+      // request and all future historical operations until the operator
+      // reconciles both durable stores. NEVER infer authority from SQLite.
+      this.#commitExternalRecoveryHead(previousExternal, committedHead);
       return Object.freeze({
         admission, freshFloor: floor,
         physicalAttestation: Buffer.from(composite.physicalAttestation),
@@ -1043,6 +1101,7 @@ class Zk1WitnessCasAnchorFloor {
   }
   async #issueSyncSerial(input) {
     try {
+      this.#assertExternalRecoveryHead();
       const v = exact(input, ["envelope", "scope", "expectedSequence",
         "expectedRoot", "inventoryReceipt", "nonce"]);
       const bound = envelopeBinding(v.envelope, v.scope, v.expectedSequence,
@@ -1125,7 +1184,9 @@ class Zk1WitnessCasAnchorFloor {
       const head = this.head();
       if (head.sequence !== floor.sequence || head.lastHash !== floor.lastHash) fail();
       this.#assertHistoricalIntegrity();
+      this.#assertExternalRecoveryHead();
       this.#db.transaction(() => {
+        this.#assertExternalRecoveryHead();
         if (this.#db.prepare("SELECT COUNT(*) AS n FROM witness_cas_sync_historical_admission")
             .get().n !== previous.sequence) fail();
         // Native SQLite stmt creation precedes the final time sample too.
@@ -1162,6 +1223,11 @@ class Zk1WitnessCasAnchorFloor {
       }).immediate();
       this.#historicalHead = Object.freeze({ sequence: previous.sequence + 1,
         lastHash: hash });
+      // A concurrent loss or advancement of externally retained recovery
+      // custody after the initial check must not still yield an ISSUE ACK.
+      // The original immutable local receipt may now be PENDING lost-ACK
+      // recovery, but no mutable fallback or retroactive signature is allowed.
+      this.#assertExternalRecoveryHead();
       return Object.freeze({ admission, freshFloor: floor,
         physicalAttestation: Buffer.from(composite.physicalAttestation),
         historicalAdmissionHead: this.historicalAdmissionHead(),

@@ -24,17 +24,46 @@ rolling five-minute window; exhaustion intentionally fails closed.
 
 ## External rollback protection and compatibility
 
-The operator can read `historicalRecoveryNonceHead()` and retain
-`{sequence,lastHash}` outside witness SQLite. On restart, pass the latest
-trusted checkpoint as the constructor option `trustedRecoveryNonceHead`.
-The witness rejects a rollback below that signed and independently pinned
-minimum, and checks chain ancestry as the journal advances. A standalone
-SQLite database **cannot** detect a full rollback to a previously valid,
-already signed snapshot if both its recovery history and its internally
-signed head are restored together and the external recovery minimum is absent.
-The existing independently pinned CAS/PG and historical-admission heads do
-not automatically cover recovery nonces. This external monotonic checkpoint
-is mandatory to claim rollback resistance against whole-file restoration.
+**Strict historical issuer now REQUIRES live external custody.** The operator's
+separately governed executable launcher injects
+`trustedRecoveryNonceAuthority` with synchronous `loadHead()` and
+`compareAndAdvance(expectedHead,nextHead)`. Both must access an independently
+durable, linearizable monotonic store outside witness SQLite, CAS/writer JSON,
+and the witness host's replaceable storage. The stock CLI/JSON cannot add this
+authority. The standalone launcher checks this capability and reads the live
+external floor before constructing the witness; direct strict issuers deny
+bootstrap or restart if the provider is absent/unavailable.
+
+Before **every** ISSUE and RECOVER (including their last SQLite transaction),
+the witness reloads the operator's current committed floor and requires EXACT
+equality with its locally verified signed recovery head. During RECOVER, after
+the immutable SQLite FULL transaction commits, it advances the externally
+held floor via a monotonic CAS and independently re-reads the result BEFORE
+returning the new signed evidence. If the external CAS is unavailable,
+ambiguous, ahead, behind, or does not acknowledge a durable write, there is no
+HTTP success response or authority to start another historical admission.
+There is deliberately no fallback to `trustedRecoveryNonceHead`, old
+owner/PG floors, a local signed SQLite head, writer/client metadata or JSON.
+
+**Crash boundary:** SQLite FULL and the operator's external CAS are two
+independent durability domains and CANNOT be made atomic by this protocol.
+If SQLite is ahead (crash before external CAS), startup and all historical
+operations fail closed. If external custody is ahead (CAS committed but SQLite
+rolled back), startup also fails closed. If external CAS succeeds but its ACK
+is lost, recovery is denied; after restart the original spent nonce remains
+unusable. Reconciliation is **manual and separately authorized**: the operator
+must independently inspect the witness's original signed recovery chain and
+the external monotonic record, then advance only a proven predecessor to its
+successor. The launcher NEVER self-promotes SQLite or silently rewinds the
+external floor. In particular, a historical SQLite snapshot signed by the
+same witness key is NOT sufficient authority if external head moved forward.
+The older optional `trustedRecoveryNonceHead` is only an additional static
+minimum; it cannot replace the live externally loaded head.
+
+The test-only SQLite authority fixture lives in a separate disposable file;
+it tests the protocol and crash window but is NOT evidence of independent
+operator custody or cross-host durability. Deployment requires a real
+separately controlled authority endpoint and external trust/access controls.
 
 **There is no unattended upgrade or nonce reconstruction** from the earlier
 recovery tables (pre-append-only, time-pruned schema). Such a file fails
