@@ -5,7 +5,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } =
+const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile,
+  assertPrivateSqliteDirectory } =
   require("../src/services/zk1PrivateSqlitePath");
 
 function create(t) {
@@ -68,5 +69,79 @@ test("Unix writable parent and writable DB file are rejected", (t) => {
   fs.chmodSync(f.privateDir, 0o777);
   assert.throws(() => assertPrivateSqliteFile(filename), /UNTRUSTED_SQLITE_PATH/);
   assert.throws(() => ensurePrivateSqliteDirectory(path.join(f.privateDir, "other.sqlite")),
+    /UNTRUSTED_SQLITE_PATH/);
+});
+
+test("POSIX rejects an unwritable-looking 0755 ancestor owned by another local UID", (t) => {
+  if (process.platform === "win32") return t.skip("POSIX uid ownership only");
+  const f = create(t);
+  const foreignParent = path.join(f.privateDir, "foreign-owned-parent");
+  const privateChild = path.join(foreignParent, "service-private");
+  fs.mkdirSync(foreignParent, { mode: 0o755 });
+  fs.mkdirSync(privateChild, { mode: 0o700 });
+  const filename = path.join(privateChild, "ledger.sqlite");
+  fs.writeFileSync(filename, "dummy", { mode: 0o600 });
+  const actual = fs.lstatSync(foreignParent, { bigint: true });
+  assert.equal(actual.uid, BigInt(process.getuid()));
+  assert.equal(actual.mode & 0o777n, 0o755n);
+  // No chown/privilege change: simulate the one POSIX stat field which an
+  // unprivileged caller cannot assign to another UID on a disposable tree.
+  // A 0755 directory owner can still chmod it or rename descendants, even
+  // if another service has a private 0700 child below it.
+  const realLstat = fs.lstatSync;
+  let observedForeign = 0;
+  fs.lstatSync = function (target, options) {
+    const stat = realLstat.call(fs, target, options);
+    if (path.resolve(target) !== foreignParent) return stat;
+    observedForeign += 1;
+    return Object.assign(Object.create(stat), {
+      uid: typeof stat.uid === "bigint"
+        ? BigInt(process.getuid() + 10000) : process.getuid() + 10000,
+    });
+  };
+  try {
+    assert.throws(() => assertPrivateSqliteDirectory(filename), /UNTRUSTED_SQLITE_PATH/);
+    assert.throws(() => assertPrivateSqliteFile(filename), /UNTRUSTED_SQLITE_PATH/);
+    assert.throws(() => ensurePrivateSqliteDirectory(path.join(privateChild,
+      "new-ledger.sqlite")), /UNTRUSTED_SQLITE_PATH/);
+  } finally { fs.lstatSync = realLstat; }
+  assert.ok(observedForeign >= 3, "all checks must traverse the untrusted ancestor");
+});
+
+test("POSIX accepts real root-owned sticky tmp ancestor and rejects foreign-owned sticky ancestor", (t) => {
+  if (process.platform === "win32") return t.skip("POSIX uid ownership only");
+  const tmp = fs.lstatSync(os.tmpdir(), { bigint: true });
+  if (tmp.uid !== 0n || (tmp.mode & 0o1777n) !== 0o1777n) {
+    return t.skip("Platform temp directory is not root-owned sticky 1777");
+  }
+  const f = create(t);
+  const filename = path.join(f.privateDir, "ledger.sqlite");
+  assert.doesNotThrow(() => assertPrivateSqliteDirectory(filename),
+    "real /tmp as root-owned sticky ancestor must remain usable");
+  const realLstat = fs.lstatSync;
+  fs.lstatSync = function (target, options) {
+    const stat = realLstat.call(fs, target, options);
+    if (path.resolve(target) !== path.resolve(os.tmpdir())) return stat;
+    return Object.assign(Object.create(stat), {
+      uid: typeof stat.uid === "bigint"
+        ? BigInt(process.getuid() + 10000) : process.getuid() + 10000,
+    });
+  };
+  try {
+    assert.throws(() => assertPrivateSqliteDirectory(filename), /UNTRUSTED_SQLITE_PATH/,
+      "untrusted UID on a sticky directory cannot receive root's exception");
+  } finally { fs.lstatSync = realLstat; }
+});
+
+test("POSIX refuses a writable sticky ancestor owned by the service rather than root", (t) => {
+  if (process.platform === "win32") return t.skip("POSIX uid ownership only");
+  const f = create(t);
+  const ancestor = path.join(f.privateDir, "sticky-owned-by-service");
+  const containing = path.join(ancestor, "private");
+  fs.mkdirSync(ancestor, { mode: 0o700 });
+  fs.mkdirSync(containing, { mode: 0o700 });
+  fs.chmodSync(ancestor, 0o1777);
+  assert.equal(fs.lstatSync(ancestor, { bigint: true }).uid, BigInt(process.getuid()));
+  assert.throws(() => assertPrivateSqliteDirectory(path.join(containing, "ledger.sqlite")),
     /UNTRUSTED_SQLITE_PATH/);
 });

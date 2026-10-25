@@ -22,9 +22,15 @@ function checkDirectory(filename) {
       const owner = BigInt(process.getuid());
       const writable = (stat.mode & 0o022n) !== 0n;
       const sticky = (stat.mode & 0o1000n) !== 0n;
+      // Even a 0755 ancestor is unsafe if a different unprivileged UID owns
+      // it: that owner can chmod it or rename its children between our
+      // pathname checks and SQLite's later open of the DB/WAL/SHM files.
+      // Only the service UID and root may own ancestors. Writable ancestors
+      // must be root-owned sticky directories (e.g. /tmp).
       if ((current === containing && (stat.uid !== owner || writable))
-        || (current !== containing && writable
-          && !(sticky && (stat.uid === 0n || stat.uid === owner)))) {
+        || (current !== containing && (
+          (stat.uid !== owner && stat.uid !== 0n)
+          || (writable && !(sticky && stat.uid === 0n))))) {
         throw Error("UNTRUSTED_SQLITE_PATH");
       }
     }
