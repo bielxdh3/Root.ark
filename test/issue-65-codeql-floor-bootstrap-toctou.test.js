@@ -9,14 +9,15 @@ const path = require("node:path");
 const Database = require("better-sqlite3");
 const { Zk1OpaqueCatalogIndependentFloorLedger } =
   require("../src/services/zk1OpaqueCatalogIndependentFloor");
+const { privateAuthorityDirectory, privateAuthorityChild } =
+  require("./support/issue-65-private-authority-directory");
 
 const sha = (file) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 
 test("independent floor denies post-O_EXCL substitution before any foreign SQLite writes", (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-floor-bootstrap-race-"));
+  const root = privateAuthorityDirectory("zk1-floor-bootstrap-race-");
   t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
-  const privateDir = path.join(root, "private");
-  fs.mkdirSync(privateDir, { mode: 0o700 });
+  const privateDir = privateAuthorityChild(root, "private");
   if (process.platform !== "win32") fs.chmodSync(privateDir, 0o700);
   const target = path.join(privateDir, "floor.sqlite");
   const foreign = path.join(root, "foreign.sqlite");

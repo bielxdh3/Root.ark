@@ -9,6 +9,8 @@ const path = require("node:path");
 const Database = require("better-sqlite3");
 const { OpaqueCheckpointV2Authority } =
   require("../src/services/zk1OpaqueCheckpointV2Remote");
+const { privateAuthorityDirectory } =
+  require("./support/issue-65-private-authority-directory");
 
 function digest(file) {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
@@ -16,7 +18,7 @@ function digest(file) {
 
 for (const role of ["CAS", "FLOOR"]) {
   test(`v2 remote ${role} denies single-link SQLite replacement after O_EXCL close`, (t) => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-v2-remote-fd-swap-"));
+    const root = privateAuthorityDirectory("zk65-v2-remote-fd-swap-");
     if (process.platform !== "win32") fs.chmodSync(root, 0o700);
     t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
     const filename = path.join(root, "authority.sqlite");

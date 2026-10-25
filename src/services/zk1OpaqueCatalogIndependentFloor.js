@@ -11,7 +11,8 @@ const net = require("node:net");
 const path = require("node:path");
 const Database = require("better-sqlite3");
 const { requireImmutableTriggers } = require("./zk1OpaqueCatalogSqliteIntegrity");
-const { assertPrivateSqliteDirectory, assertPrivateSqliteFile } = require("./zk1PrivateSqlitePath");
+const { assertPrivateSqliteAuthorityDirectory, assertPrivateSqliteFile } =
+  require("./zk1PrivateSqlitePath");
 const z = require("../crypto/rootark-zk-1");
 const { catalogHeadDigest } = require("./zk1OpaqueCatalog");
 const ownerHistory = require("../crypto/rootark-zk-recovery-history-v2");
@@ -85,7 +86,7 @@ function requirePrivateFile(filename, exists) {
   const dir = fs.lstatSync(path.dirname(filename));
   if (!dir.isDirectory() || dir.isSymbolicLink()) fail();
   if (process.platform !== "win32" && (dir.uid !== process.getuid() || (dir.mode & 0o077))) fail();
-  try { assertPrivateSqliteDirectory(filename); } catch (_) { fail(); }
+  try { assertPrivateSqliteAuthorityDirectory(filename); } catch (_) { fail(); }
   if (fs.existsSync(filename) !== exists) fail();
   if (exists) {
     const st = fs.lstatSync(filename);

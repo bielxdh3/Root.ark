@@ -23,7 +23,8 @@ const ownerHistory = require("../crypto/rootark-zk-recovery-history-v2");
 const ownerManifest = require("../crypto/rootark-zk-recovery-manifest-v2");
 const { inspectVerifiedWitnessFreshHeadV1 } =
   require("../crypto/rootark-zk-witness-head-wire-v1");
-const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } =
+const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile,
+  assertPrivateSqliteAuthorityDirectory } =
   require("./zk1PrivateSqlitePath");
 const { nativeEd25519Spki } =
   require("../crypto/rootark-zk1-native-ed25519-public-key");
@@ -471,6 +472,7 @@ class OpaqueCheckpointV2Authority {
       || !fs.existsSync(path.dirname(filename))) fail();
     if (bootstrapNew) ensurePrivateSqliteDirectory(filename);
     else assertPrivateSqliteFile(filename);
+    try { assertPrivateSqliteAuthorityDirectory(filename); } catch (_) { fail(); }
     assertSafeSqliteSidecars(filename, fail);
     const createdPin = fileSecurity(filename, bootstrapNew);
     const scopeText = SCOPE.map((n) => scoped[n].toString("hex")).join(":");

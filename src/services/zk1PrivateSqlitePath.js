@@ -38,6 +38,20 @@ function assertPrivateSqliteDirectory(filename) {
   checkDirectory(filename);
 }
 
+function assertPrivateSqliteAuthorityDirectory(filename) {
+  checkDirectory(filename);
+  if (process.platform === "win32") {
+    // SQLite opens its main DB and WAL/SHM files by name. A less-privileged
+    // local principal with Modify/DELETE_CHILD on this directory can replace
+    // a perfectly valid earlier signed floor after restart. NTFS mode bits
+    // cannot describe that right. Require a protected owner-only DACL and
+    // safe ancestry before opening or creating any authority database.
+    const { verifyWindowsChunkUploadTree } =
+      require("../../services/chunkUploadWindowsAcl");
+    verifyWindowsChunkUploadTree(path.dirname(filename));
+  }
+}
+
 function ensurePrivateSqliteDirectory(filename) {
   // Verify the existing ancestors BEFORE mkdir. mkdir(recursive) otherwise
   // follows a preinstalled symlink and creates files in a foreign directory.
@@ -82,4 +96,4 @@ function assertPrivateSqliteFile(filename) {
 }
 
 module.exports = { ensurePrivateSqliteDirectory, assertPrivateSqliteFile,
-  assertPrivateSqliteDirectory };
+  assertPrivateSqliteDirectory, assertPrivateSqliteAuthorityDirectory };

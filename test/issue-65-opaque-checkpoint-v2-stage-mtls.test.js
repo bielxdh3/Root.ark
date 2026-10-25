@@ -26,6 +26,8 @@ const { Zk1OpaqueCatalogCheckpointV2Stage: Stage,
   require("../src/services/zk1OpaqueCatalogCheckpointV2Stage");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
+const { privateAuthorityDirectory } =
+  require("./support/issue-65-private-authority-directory");
 const HEAD = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
 const fp = (publicKey) => crypto.createHash("sha256")
   .update(publicKey.export({ type: "spki", format: "der" })).digest();
@@ -34,7 +36,7 @@ const err = (code) => ({ code });
 test("signed v2 checkpoint local staging with independent CAS+floor mTLS, SQLite restart, owner, uncertain ACK and competing writers", {
   timeout: 120000,
 }, async (t) => {
-  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-checkpoint-stage-"));
+  const folder = privateAuthorityDirectory("zk65-checkpoint-stage-");
   if (process.platform !== "win32") fs.chmodSync(folder, 0o700);
   generateNativeFixtureCertificates(folder, {
     caSubject: "ZK65 staging fixtures", servers: ["cas", "floor"], clients: ["client"],

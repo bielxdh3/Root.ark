@@ -42,6 +42,8 @@ const { issueVerifiedHistoricalSignerEndorsement } =
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 const { realEdge } = require("./support/issue-65-checkpoint-v2-real-edge");
+const { privateAuthorityDirectory } =
+  require("./support/issue-65-private-authority-directory");
 
 const PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 const BASE_DOMAIN = Buffer.from("Root.ark/zk-1/recovery-witness-base/v1\0");
@@ -65,7 +67,7 @@ test("v2 independent durable endorsements: authenticated 128->129, mTLS, owner r
   const cleanupServers = [];
   const cleanupDatabases = [];
   try {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-checkpoint-v2-remote-"));
+  const dir = privateAuthorityDirectory("zk65-checkpoint-v2-remote-");
   if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
   generateNativeFixtureCertificates(dir, { caSubject: "ZK65 Checkpoint Remote",
     servers: ["v1cas", "v1floor", "v2cas", "v2floor", "v2floorremote"],

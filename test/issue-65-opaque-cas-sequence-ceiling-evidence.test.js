@@ -15,11 +15,13 @@ const { Zk1OpaqueCatalogIndependentFloorLedger } =
   require("../src/services/zk1OpaqueCatalogIndependentFloor");
 const { createZk1OpaqueCatalogCasHttpsClient } =
   require("../src/services/zk1OpaqueCatalogCasHttpsClient");
+const { privateAuthorityDirectory } =
+  require("./support/issue-65-private-authority-directory");
 
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
 
 test("signed opaque catalog v1 ceiling: 129 refused, immutable floor retains absolute sequence across restart", async (t) => {
-  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-opaque-sequence-ceiling-"));
+  const folder = privateAuthorityDirectory("zk65-opaque-sequence-ceiling-");
   if (process.platform !== "win32") fs.chmodSync(folder, 0o700);
   let floor;
   t.after(() => {

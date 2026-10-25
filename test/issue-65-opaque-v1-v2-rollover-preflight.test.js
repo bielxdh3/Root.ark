@@ -30,6 +30,8 @@ const { Zk1OpaqueCheckpointV2Client } =
   require("../src/services/zk1OpaqueCheckpointV2Client");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
+const { privateAuthorityDirectory } =
+  require("./support/issue-65-private-authority-directory");
 const browser = require("../public/client/rootark-zk1-opaque-v1-v2-handoff-preflight");
 const HEAD = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
 const FLOOR = Buffer.from("Root.ark/zk-1/opaque-catalog-independent-floor/v1\0");
@@ -233,7 +235,7 @@ test("real Edge verifies owner V1 #128 -> V2 epoch handoff under strict CSP/loop
 test("real V2 CAS and FLOOR mTLS baseline refuses last-head-only checkpoint and missing full-128 owner proof", {
   timeout: 120000 }, async (t) => {
   const { options, v2Cas, v2Floor, v1Cas, v1Floor, catalog, checkpoint, owner } = await build();
-  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-128-gate-mtls-"));
+  const folder = privateAuthorityDirectory("zk65-128-gate-mtls-");
   if (process.platform !== "win32") fs.chmodSync(folder, 0o700);
   generateNativeFixtureCertificates(folder, {
     caSubject: "ZK65 full archive mTLS",

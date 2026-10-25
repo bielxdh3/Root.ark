@@ -23,6 +23,8 @@ const { Zk1OpaqueCatalogIndependentFloorLedger,
 const { catalogHeadDigest } = require("../src/services/zk1OpaqueCatalog");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
+const { privateAuthorityDirectory } =
+  require("./support/issue-65-private-authority-directory");
 
 const HEAD_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-head/v1\0");
 const PAGE_DOMAIN = Buffer.from("Root.ark/zk-1/opaque-catalog-page/v1\0");
@@ -34,7 +36,7 @@ const hash = (v) => crypto.createHash("sha256").update(v).digest();
 test("mTLS independent CAS rotates owner-granted signer A to B after A revocation; rollback, fork, nonce, restart denied", {
   timeout: 90000,
 }, async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-cas-rotate-"));
+  const dir = privateAuthorityDirectory("zk1-cas-rotate-");
   if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
   generateNativeFixtureCertificates(dir, { caSubject: "ZK1 Owner CAS",
     servers: ["server", "floor"], clients: ["client", "foreign"] });
