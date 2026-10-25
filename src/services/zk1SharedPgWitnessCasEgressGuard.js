@@ -8,6 +8,8 @@
 // not a signed statement that a particular device is currently approved.
 const crypto = require("node:crypto");
 const { Zk1WitnessCasAnchorHttpsClient } = require("./zk1WitnessCasAnchorHttpsClient");
+const { Zk1IndependentWitnessFloorQuorum } = require("./zk1IndependentWitnessFloorQuorum");
+const NATIVE_DISTRIBUTED_HEAD = Zk1IndependentWitnessFloorQuorum.prototype.freshHead;
 const ownerRoots = require("../../public/client/rootark-zk1-owner-ciphertext-root-checkpoint");
 
 function deny() {
@@ -39,9 +41,11 @@ class Zk1SharedPgWitnessCasEgressGuard {
   #digest;
   #objectId;
   constructor(token, witness, floor, pinned) {
-    if (token !== INTERNAL || !(witness instanceof Zk1WitnessCasAnchorHttpsClient)) deny();
+    if (token !== INTERNAL || !validWitness(witness)) deny();
     this.#witness = witness;
-    this.#floor = Object.freeze({ sequence: floor.sequence, lastHash: floor.lastHash });
+    this.#floor = Object.freeze({ sequence: floor.sequence, lastHash: floor.lastHash,
+      ...(witness instanceof Zk1IndependentWitnessFloorQuorum
+        ? { physicalFenceDigest: floor.physicalFenceDigest } : {}) });
     this.#scope = { account_id: Buffer.from(pinned.scope.account_id),
       compartment_id: Buffer.from(pinned.scope.compartment_id),
       keyring_id: Buffer.from(pinned.scope.keyring_id) };
@@ -56,13 +60,18 @@ class Zk1SharedPgWitnessCasEgressGuard {
     externallyPinnedOwnerSpkiSha256,
     ownerProofInput } = {}) {
     try {
-      if (!(witness instanceof Zk1WitnessCasAnchorHttpsClient)) deny();
-      exact(witnessFloor, ["sequence", "lastHash"]);
+      if (!validWitness(witness)) deny();
+      const distributed = witness instanceof Zk1IndependentWitnessFloorQuorum;
+      exact(witnessFloor, ["sequence", "lastHash",
+        ...(distributed ? ["physicalFenceDigest"] : [])]);
       if (!Number.isSafeInteger(witnessFloor.sequence) || witnessFloor.sequence < 0
         || typeof witnessFloor.lastHash !== "string"
-        || !/^[a-f0-9]{64}$/.test(witnessFloor.lastHash)) deny();
+        || !/^[a-f0-9]{64}$/.test(witnessFloor.lastHash)
+        || (distributed && (typeof witnessFloor.physicalFenceDigest !== "string"
+          || !/^[a-f0-9]{64}$/.test(witnessFloor.physicalFenceDigest)))) deny();
       const floorSnapshot = { sequence: witnessFloor.sequence,
-        lastHash: witnessFloor.lastHash };
+        lastHash: witnessFloor.lastHash,
+        ...(distributed ? { physicalFenceDigest: witnessFloor.physicalFenceDigest } : {}) };
       exact(ownerProofInput, ["checkpoint", "ownerHistoryCheckpoint",
         "previousHistoryProof", "pinnedOwner", "expected"]);
       const pin = ownerProofInput.pinnedOwner;
@@ -106,8 +115,8 @@ class Zk1SharedPgWitnessCasEgressGuard {
         objectRevision: frozenExpected.objectRevision,
         ciphertextEpoch: frozenExpected.ciphertextEpoch,
         ciphertextRoot: frozenExpected.ciphertextRoot })) deny();
-      const head = await witness.freshHead(floorSnapshot);
-      if (head.sequence !== floorSnapshot.sequence || head.lastHash !== floorSnapshot.lastHash) deny();
+      const head = await freshWitnessHead(witness, floorSnapshot);
+      if (!matchingHead(head, floorSnapshot)) deny();
       const scope = pinnedScopeWire;
       // Only the operator-provisioned scope and current revision can be used;
       // a historical object is not a general current-head grant.
@@ -138,11 +147,26 @@ class Zk1SharedPgWitnessCasEgressGuard {
         || !equal(bytes(expectedRootHash, 32), this.#root)
         || ["account_id", "compartment_id", "keyring_id"].some((k) =>
           !equal(Buffer.from(scope[k]), this.#scope[k]))) deny();
-      const head = await this.#witness.freshHead(this.#floor);
-      if (head.sequence !== this.#floor.sequence || head.lastHash !== this.#floor.lastHash) deny();
+      const head = await freshWitnessHead(this.#witness, this.#floor);
+      if (!matchingHead(head, this.#floor)) deny();
       return true;
     } catch (_) { deny(); }
   }
+}
+function validWitness(witness) {
+  return witness instanceof Zk1WitnessCasAnchorHttpsClient
+    || (witness !== null && typeof witness === "object"
+      && Object.getPrototypeOf(witness) === Zk1IndependentWitnessFloorQuorum.prototype);
+}
+function freshWitnessHead(witness, minimum) {
+  return witness instanceof Zk1IndependentWitnessFloorQuorum
+    ? NATIVE_DISTRIBUTED_HEAD.call(witness, minimum)
+    : witness.freshHead(minimum);
+}
+function matchingHead(head, floor) {
+  return head?.sequence === floor.sequence && head.lastHash === floor.lastHash
+    && (floor.physicalFenceDigest === undefined
+      || head.physicalFenceDigest === floor.physicalFenceDigest);
 }
 const INTERNAL = Object.freeze({});
 module.exports = { Zk1SharedPgWitnessCasEgressGuard };

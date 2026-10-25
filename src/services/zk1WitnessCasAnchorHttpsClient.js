@@ -65,6 +65,22 @@ class Zk1WitnessCasAnchorHttpsClient {
     this.#requirePhysicalAdmission = requirePhysicalAdmission;
   }
   get requiresPhysicalAdmission() { return this.#requirePhysicalAdmission; }
+  // Identity-only view for an operator-provisioned independent-floor monitor.
+  // No TLS credentials or private keys leave this client. Native SPKI export
+  // prevents caller-overridden methods on a pinned KeyObject from lying here.
+  get independentlyPinnedIdentity() {
+    const spki = Object.getPrototypeOf(this.#pinnedWitness).export.call(this.#pinnedWitness, {
+      type: "spki", format: "der",
+    });
+    return Object.freeze({
+      endpoint: this.#url.origin,
+      peerFingerprint256: this.#pinned,
+      signerSpkiSha256: crypto.createHash("sha256").update(spki).digest("hex"),
+      witnessKeyId: this.#witnessKeyId.toString("base64url"),
+      statusKeyId: this.#statusKeyId.toString("base64url"),
+      requirePhysicalAdmission: this.#requirePhysicalAdmission,
+    });
+  }
   async #send(urlPath, body, timeoutMs = this.#timeout) {
     const payload = Buffer.from(JSON.stringify(body), "utf8");
     if (payload.length < 2 || payload.length > (urlPath.endsWith("/advance") ? 96 * 1024 : 4096)) fail();
