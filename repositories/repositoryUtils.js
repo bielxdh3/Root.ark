@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const path = require("path");
-const { getDb, jsonStringify, nowIso, safeJsonParse, splitStorageKey } = require("../db");
+const { getDb, jsonStringify, nowIso, safeJsonParse, splitStorageKey,
+  normalizeStrictSyncSqliteError } = require("../db");
 const { assertNoLocalStrictSyncWriter } = require("../src/services/syncSqliteAccountWriteFence");
 
 function basename(value) {
@@ -70,8 +71,12 @@ function randomId() {
 
 function runWrite(db, callback) {
   assertNoLocalStrictSyncWriter();
-  if (db.inTransaction) return callback();
-  return db.transaction(callback)();
+  try {
+    if (db.inTransaction) return callback();
+    return db.transaction(callback)();
+  } catch (error) {
+    throw normalizeStrictSyncSqliteError(error);
+  }
 }
 
 module.exports = {

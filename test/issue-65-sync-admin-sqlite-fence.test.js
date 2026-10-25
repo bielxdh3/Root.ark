@@ -445,6 +445,126 @@ test("abrupt process exit after durable audit sidecar commit still recovers exac
   assert.equal(auditRepository.loadAuditLogs().logs.filter(({ id }) => id === event.id).length, 1);
 });
 
+test("independent process cannot erase strict audit with absent or renamed sidecar", async (t) => {
+  await fixture(t);
+  const entry = { id: crypto.randomUUID(), timestamp: new Date().toISOString(),
+    eventType: "user.updated", actor: { username: "admin" },
+    action: "updated", result: "success" };
+  auditRepository.saveAuditLogs({ logs: [entry] });
+  const sidecar = process.env.DATABASE_URL + ".audit-private";
+  // Strict route registration must materialize the FULL durable journal
+  // BEFORE enrolling the permanent main SQLite marker.
+  assert.equal(fs.existsSync(path.join(sidecar, "pending.sqlite")), true);
+  // A second process must NOT infer legacy mode from a removed/renamed file.
+  const script = `const audit=require(process.argv[1]);audit.saveAuditLogs({logs:[]});`;
+  const runPeer = async () => execFileAsync(process.execPath,
+    ["-e", script, require.resolve("../repositories/auditRepository")],
+    { timeout: 15000, env: { ...process.env, NODE_PATH: process.env.NODE_PATH } });
+  await runPeer();
+  assert.equal(auditRepository.loadAuditLogs().logs.filter(({ id }) => id === entry.id).length, 1,
+    "another process cannot DELETE confirmed audit without a sidecar file");
+  if (fs.existsSync(sidecar)) {
+    const old = sidecar + "-renamed";
+    fs.renameSync(sidecar, old);
+    t.after(() => { if (fs.existsSync(old)) fs.renameSync(old, sidecar); });
+    await assert.rejects(runPeer(), /Strict audit|missing|unavailable/);
+    assert.equal(getDb().prepare("SELECT COUNT(*) AS n FROM audit_logs WHERE id=?").get(entry.id).n, 1,
+      "a missing enrolled sidecar must fail closed without erasing confirmed primary rows");
+    assert.throws(() => auditRepository.loadAuditLogs(), { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" });
+  }
+});
+
+test("strict marker bounds an independent Node process's SQLite busy wait while another writer holds the lock", async (t) => {
+  await fixture(t);
+  const db = getDb();
+  assert.equal(db.pragma("busy_timeout", { simple: true }), 25);
+  db.exec("BEGIN IMMEDIATE");
+  const script = `const t=require("node:perf_hooks").performance;const started=t.now();let code="OK";try{require(process.argv[1]).saveAnalytics({uploads:[{id:"crossprocess"}]})}catch(e){code=e.code||"UNKNOWN"}process.stdout.write(JSON.stringify({code,elapsed:t.now()-started}));`;
+  let outcome;
+  try {
+    const { stdout } = await execFileAsync(process.execPath, ["-e", script,
+      require.resolve("../repositories/analyticsRepository")],
+    { timeout: 7000, env: { ...process.env, NODE_PATH: process.env.NODE_PATH } });
+    outcome = JSON.parse(stdout);
+  } finally { db.exec("ROLLBACK"); }
+  assert.equal(outcome.code, "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE");
+  assert.ok(outcome.elapsed < 500, `remote Node writer must not pause its event loop 5s (${outcome.elapsed}ms)`);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM analytics_events").get().n, 0);
+});
+
+test("busy sidecar cleanup after main commit remains retryable without failing a committed audit event", async (t) => {
+  await fixture(t);
+  const event = { id: crypto.randomUUID(), timestamp: new Date().toISOString(),
+    eventType: "file.access.denied", action: "denied", result: "failure" };
+  auditRepository.deferAuditLog(event);
+  const sidecar = path.join(process.env.DATABASE_URL + ".audit-private", "pending.sqlite");
+  const program = `const D=require(process.argv[1]);const db=new D(process.argv[2]);db.exec("BEGIN IMMEDIATE");process.stdout.write("LOCKED\\n");setTimeout(()=>{db.exec("ROLLBACK");db.close()},700)`;
+  const child = spawn(process.execPath, ["-e", program, require.resolve("better-sqlite3"), sidecar],
+    { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  await new Promise((resolve, reject) => {
+    child.stdout.once("data", (data) => data.toString().includes("LOCKED") ? resolve() : reject(new Error("No sidecar lock")));
+    child.once("error", reject);
+    child.once("exit", (code) => reject(new Error(`sidecar writer exited early ${code}`)));
+  });
+  // The main DB commits successfully; cleanup gets SQLITE_BUSY from another
+  // process. It must retain the pending duplicate, not claim HTTP500.
+  assert.doesNotThrow(() => auditRepository.saveAuditLogs({ logs: [event] }));
+  assert.equal(getDb().prepare("SELECT COUNT(*) AS n FROM audit_logs WHERE id=?").get(event.id).n, 1);
+  await new Promise((resolve) => child.once("exit", resolve));
+  assert.equal(auditRepository.loadAuditLogs().logs.filter(({ id }) => id === event.id).length, 1);
+  auditRepository.saveAuditLogs({ logs: [event] });
+  assert.equal(auditRepository.loadAuditLogs().logs.filter(({ id }) => id === event.id).length, 1);
+});
+
+test("strict archive physically prunes primary rows while preserving one durable archive and rejecting stale resurrection", async (t) => {
+  await fixture(t);
+  const event = { id: crypto.randomUUID(), timestamp: new Date().toISOString(),
+    eventType: "file.deleted", action: "deleted", result: "success" };
+  auditRepository.saveAuditLogs({ logs: [event] });
+  assert.equal(getDb().prepare("SELECT COUNT(*) AS n FROM audit_logs WHERE id=?").get(event.id).n, 1);
+  auditRepository.archiveAuditLogs([event]);
+  assert.equal(getDb().prepare("SELECT COUNT(*) AS n FROM audit_logs WHERE id=?").get(event.id).n, 0,
+    "archive must release primary SQLite rows after FULL-durable sidecar commit");
+  auditRepository.saveAuditLogs({ logs: [event] });
+  assert.equal(getDb().prepare("SELECT COUNT(*) AS n FROM audit_logs WHERE id=?").get(event.id).n, 0);
+  assert.equal(auditRepository.loadArchivedAuditLogs().logs.filter(({ id }) => id === event.id).length, 1);
+});
+
+test("unmarked SQLite preserves legacy whole-table audit replacement and 5000ms busy timeout", (t) => {
+  const dir = isolatedDirectory();
+  const old = Object.fromEntries(["DATABASE_URL", "DB_ENABLED", "DB_WRITE_LEGACY_JSON"]
+    .map((key) => [key, process.env[key]]));
+  closeDb();
+  process.env.DATABASE_URL = path.join(dir, "legacy.sqlite");
+  process.env.DB_ENABLED = "true";
+  process.env.DB_WRITE_LEGACY_JSON = "false";
+  t.after(() => {
+    closeDb();
+    for (const [key, value] of Object.entries(old)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  runMigrations({ backup: false });
+  assert.equal(getDb().pragma("busy_timeout", { simple: true }), 5000);
+  const entry = { id: crypto.randomUUID(), eventType: "file.access.denied" };
+  auditRepository.saveAuditLogs({ logs: [entry] });
+  auditRepository.saveAuditLogs({ logs: [] });
+  assert.equal(auditRepository.loadAuditLogs().logs.length, 0);
+});
+
+test("once strict SQLite marker is observed, malformed or missing marker cannot restore legacy semantics", async (t) => {
+  await fixture(t);
+  const db = getDb();
+  assert.equal(db.pragma("busy_timeout", { simple: true }), 25);
+  db.exec("DROP TABLE rootark_strict_sync_audit_mode");
+  assert.throws(() => getDb(), { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" });
+  closeDb();
+  assert.throws(() => getDb(), { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" });
+});
+
 test("strict audit sidecar rejects an existing Windows directory with an untrusted DACL", async (t) => {
   if (process.platform !== "win32") return t.skip("Windows ACL-specific security gate");
   const root = isolatedDirectory();

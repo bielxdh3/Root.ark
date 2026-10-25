@@ -1321,6 +1321,19 @@ function sanitizeAuditValue(value, maxLength = 500) {
 }
 
 function loadAuditLogs(file = AUDIT_LOGS_FILE) {
+  if (shouldUseDatabase() && file === AUDIT_ARCHIVE_FILE) {
+    dbConfig.getDb(); // Observe the main SQLite's durable strict marker.
+    if (dbConfig.isStrictSyncModeObserved()) {
+      const fromJournal = auditRepository.loadArchivedAuditLogs();
+      if (!fs.existsSync(file)) return fromJournal;
+      const legacy = JSON.parse(fs.readFileSync(file, "utf8"));
+      const seen = new Set(fromJournal.logs.map(({ id }) => id));
+      for (const log of Array.isArray(legacy?.logs) ? legacy.logs : []) {
+        if (!seen.has(log.id)) { seen.add(log.id); fromJournal.logs.push(log); }
+      }
+      return fromJournal;
+    }
+  }
   if (shouldUseDatabase() && file === AUDIT_LOGS_FILE) {
     try {
       const entries = auditRepository.loadAuditLogs();
@@ -1529,8 +1542,10 @@ function parseWebDavSegments(req) {
 
 function archiveAuditLogs(logs) {
   if (!logs.length) return;
-  if (shouldUseDatabase() && !shouldWriteLegacyJson()
-    && require("./src/services/syncSqliteAccountWriteFence").isStrictSyncAccountFenceConfigured()) {
+  if (shouldUseDatabase() && !shouldWriteLegacyJson()) {
+    dbConfig.getDb();
+  }
+  if (shouldUseDatabase() && !shouldWriteLegacyJson() && dbConfig.isStrictSyncModeObserved()) {
     auditRepository.archiveAuditLogs(logs);
     return;
   }

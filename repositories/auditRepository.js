@@ -1,7 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const Database = require("better-sqlite3");
-const { getDb, getDatabasePath } = require("../db");
+const { getDb, getDatabasePath, isStrictSyncModeObserved } = require("../db");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 const { verifyWindowsChunkUploadTree } = require("../services/chunkUploadWindowsAcl");
 const { assertNoLocalStrictSyncWriter, isStrictSyncAccountFenceConfigured } =
@@ -9,6 +9,11 @@ const { assertNoLocalStrictSyncWriter, isStrictSyncAccountFenceConfigured } =
 const { assertPrivateSqliteDirectory } = require("../src/services/zk1PrivateSqlitePath");
 const { jsonStringify, runWrite, safeJsonParse } = require("./repositoryUtils");
 const MAX_DEFERRED_AUDITS = 4096;
+// The archival record is deliberately retained, but its capacity is finite.
+// Never silently evict audit evidence to recover space: reject archiving and
+// require operator intervention before any configured hard limit is exceeded.
+const MAX_ARCHIVED_AUDITS = 100000;
+const MAX_ARCHIVED_BYTES = 512 * 1024 * 1024;
 const preparedJournals = new Set();
 
 function auditJournalPath() {
@@ -63,6 +68,11 @@ function assertSafePendingFiles(filename) {
 function withPendingAuditDb(callback) {
   const filename = preparePendingAuditJournal();
   assertSafePendingFiles(filename);
+  if (isStrictSyncModeObserved() && !fs.existsSync(filename)) {
+    throw Object.assign(new Error("Previously enrolled strict audit journal missing"), {
+      code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+    });
+  }
   const db = new Database(filename, { timeout: 100 });
   try {
     // Sidecar is a separate SQLite file, NOT the locked account authority.
@@ -90,6 +100,12 @@ function withPendingAuditDb(callback) {
   }
 }
 
+function ensurePendingAuditDatabase() {
+  // Called BEFORE durable strict marker enrollment. Once enrolled, missing
+  // journal is tamper/corruption, not permission to create a fresh empty one.
+  withPendingAuditDb(() => {});
+}
+
 function archiveAuditLogs(logs) {
   if (!Array.isArray(logs) || !logs.length) return;
   try {
@@ -97,17 +113,29 @@ function archiveAuditLogs(logs) {
       const insert = db.prepare("INSERT INTO archived_audit(id,event) VALUES (?,?) ON CONFLICT(id) DO NOTHING");
       const clear = db.prepare("DELETE FROM pending_audit WHERE id=?");
       db.transaction(() => {
+        const size = db.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(event)),0) AS bytes FROM archived_audit").get();
+        let count = size.n;
+        let bytes = size.bytes;
+        const exists = db.prepare("SELECT 1 FROM archived_audit WHERE id=?");
         for (const log of logs) {
           if (typeof log?.id !== "string" || !log.id || log.id.length > 128) {
             throw new TypeError("Invalid archived audit ID");
           }
           const serialized = JSON.stringify(log);
           if (Buffer.byteLength(serialized) > 64 * 1024) throw new Error("Archived audit too large");
+          if (!exists.get(log.id)) {
+            if (++count > MAX_ARCHIVED_AUDITS || (bytes += Buffer.byteLength(serialized)) > MAX_ARCHIVED_BYTES) {
+              throw Object.assign(new Error("Durable audit archive capacity reached: operator action required"), {
+                code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+              });
+            }
+          }
           insert.run(log.id, serialized);
           clear.run(log.id);
         }
       })();
     });
+    pruneArchivedAuditRows(logs);
   } catch (error) {
     if (["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_BUSY_SNAPSHOT"].includes(error?.code)) {
       throw Object.assign(new Error("Durable audit archive busy", { cause: error }), {
@@ -118,8 +146,37 @@ function archiveAuditLogs(logs) {
   }
 }
 
+function pruneArchivedAuditRows(logs) {
+  // Archived payload first becomes durable in the FULL sidecar. Physical
+  // deletion from the active main database is a non-destructive optimization,
+  // retried by later audit writes; a busy main writer does not roll back an
+  // already acknowledged archive.
+  if (!isStrictSyncModeObserved()) return;
+  const ids = [...new Set(logs.map(({ id }) => id))];
+  if (!ids.length) return;
+  try {
+    assertNoLocalStrictSyncWriter();
+    const main = getDb();
+    main.transaction(() => {
+      const remove = main.prepare("DELETE FROM audit_logs WHERE id=?");
+      for (const id of ids) remove.run(id);
+    })();
+  } catch (error) {
+    if (error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE"
+      || ["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_BUSY_SNAPSHOT"].includes(error?.code)) {
+      console.warn("Archived audit cleanup deferred while main SQLite writer is busy");
+      return;
+    }
+    throw error;
+  }
+}
+
 function loadArchivedAuditLogs() {
-  if (!fs.existsSync(auditJournalPath())) return { logs: [] };
+  if (!fs.existsSync(auditJournalPath())) {
+    if (isStrictSyncModeObserved()) throw Object.assign(
+      new Error("Enrolled strict audit archive unavailable"), { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" });
+    return { logs: [] };
+  }
   return { logs: withPendingAuditDb((db) =>
     db.prepare("SELECT id,event FROM archived_audit ORDER BY rowid").all().map(({ id, event }) => {
       const entry = JSON.parse(event);
@@ -128,16 +185,31 @@ function loadArchivedAuditLogs() {
     })) };
 }
 
-function archivedAuditIds() {
-  if (!fs.existsSync(auditJournalPath())) return new Set();
-  return new Set(withPendingAuditDb((db) => db.prepare("SELECT id FROM archived_audit").all()
-    .map(({ id }) => id)));
+function archivedAuditIds(candidates) {
+  if (!fs.existsSync(auditJournalPath())) {
+    if (isStrictSyncModeObserved()) throw Object.assign(
+      new Error("Strict audit sidecar missing"), { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" });
+    return new Set();
+  }
+  return new Set(withPendingAuditDb((db) => {
+    if (!candidates) return db.prepare("SELECT id FROM archived_audit").all().map(({ id }) => id);
+    const selected = [];
+    const find = db.prepare("SELECT id FROM archived_audit WHERE id=?");
+    for (const id of new Set(candidates)) {
+      if (typeof id === "string" && find.get(id)) selected.push(id);
+    }
+    return selected;
+  }));
 }
 
 function pendingAudits() {
   // Reads must include the durable sidecar across restarts, before the next
   // normal audit triggers consolidation. Do not fabricate a journal on read.
-  if (!fs.existsSync(auditJournalPath())) return [];
+  if (!fs.existsSync(auditJournalPath())) {
+    if (isStrictSyncModeObserved()) throw Object.assign(
+      new Error("Strict pending audit journal missing"), { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" });
+    return [];
+  }
   try {
     return withPendingAuditDb((db) => db.prepare("SELECT id, event FROM pending_audit ORDER BY rowid").all()
       .map(({ id, event }) => {
@@ -257,7 +329,7 @@ function loadAuditLogs() {
   for (const log of pendingAudits()) {
     if (!seen.has(log.id)) { seen.add(log.id); logs.push(log); }
   }
-  const archived = archivedAuditIds();
+  const archived = archivedAuditIds(logs.map(({ id }) => id));
   const activeLogs = logs.filter(({ id }) => !archived.has(id));
   activeLogs.sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
   return { logs: activeLogs };
@@ -267,9 +339,27 @@ function saveAuditLogs(entries = {}) {
   assertNoLocalStrictSyncWriter();
   const db = getDb();
   const logs = Array.isArray(entries?.logs) ? entries.logs : [];
-  const protectedAudit = isStrictSyncAccountFenceConfigured() || fs.existsSync(auditJournalPath());
+  const protectedAudit = isStrictSyncModeObserved();
+  if (protectedAudit && !fs.existsSync(auditJournalPath())) {
+    throw Object.assign(new Error("Enrolled strict audit journal missing"), {
+      code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+    });
+  }
+  // Probe only IDs relevant to the current main table/snapshot. Avoid
+  // scanning 100k archive tombstones and issuing 100k DELETEs per request.
+  const candidates = protectedAudit
+    ? [...db.prepare("SELECT id FROM audit_logs").all().map(({ id }) => id),
+      ...logs.map(({ id }) => id)]
+    : [];
+  const archived = protectedAudit ? archivedAuditIds(candidates) : new Set();
   runWrite(db, () => {
     if (!protectedAudit) db.prepare("DELETE FROM audit_logs").run();
+    // Physical retention: every archive ID is already durably held on the
+    // separate FULL journal, so the primary table need not grow forever.
+    if (archived.size) {
+      const remove = db.prepare("DELETE FROM audit_logs WHERE id=?");
+      for (const id of archived) remove.run(id);
+    }
     // Audit is monotonic: callers often supply whole-table snapshots read
     // BEFORE another process committed a newer event. Blind DELETE+replace
     // makes a late stale snapshot irreversibly erase that event after its
@@ -282,6 +372,7 @@ function saveAuditLogs(entries = {}) {
     `);
 
     for (const log of logs) {
+      if (archived.has(log.id)) continue;
       const row = logToRow(log);
       insert.run(
         row.id,
@@ -302,16 +393,27 @@ function saveAuditLogs(entries = {}) {
   // deduplicates by id, and the next successful save can retry deletion.
   if (fs.existsSync(auditJournalPath())) {
     const committedIds = new Set(logs.map(({ id }) => id));
-    withPendingAuditDb((pending) => {
-      const remove = pending.prepare("DELETE FROM pending_audit WHERE id=?");
-      pending.transaction(() => {
-        for (const { id } of pending.prepare("SELECT id FROM pending_audit").all()) {
-          if (committedIds.has(id)) remove.run(id);
-        }
-      })();
-    });
+    try {
+      withPendingAuditDb((pending) => {
+        const remove = pending.prepare("DELETE FROM pending_audit WHERE id=?");
+        pending.transaction(() => {
+          for (const { id } of pending.prepare("SELECT id FROM pending_audit").all()) {
+            if (committedIds.has(id)) remove.run(id);
+          }
+        })();
+      });
+    } catch (error) {
+      if (["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_BUSY_SNAPSHOT"].includes(error?.code)) {
+        // Main audit event is already committed and durable. Cleanup is
+        // idempotent: retaining the pending record is safer than throwing an
+        // ambiguous HTTP 500 AFTER acknowledging the primary write.
+        console.warn("Deferred non-destructive audit journal cleanup after SQLite contention");
+      } else {
+        throw error;
+      }
+    }
   }
 }
 
 module.exports = { loadAuditLogs, saveAuditLogs, deferAuditLog, deferIfStrictSyncWriter,
-  preparePendingAuditJournal, archiveAuditLogs, loadArchivedAuditLogs };
+  preparePendingAuditJournal, ensurePendingAuditDatabase, archiveAuditLogs, loadArchivedAuditLogs };

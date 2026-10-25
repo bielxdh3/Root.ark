@@ -2,7 +2,8 @@
 
 const Database = require("better-sqlite3");
 const { performance } = require("node:perf_hooks");
-const { getDatabasePath, isDbEnabled, isLegacyJsonWriteEnabled } = require("../../db");
+const { getDatabasePath, getDb, isDbEnabled, isLegacyJsonWriteEnabled,
+  isStrictSyncModeObserved, normalizeStrictSyncSqliteError } = require("../../db");
 
 const localAccountWriters = new Map();
 const configuredStrictAccountPaths = new Set();
@@ -16,6 +17,19 @@ function assertNoLocalStrictSyncWriter(dbPath = getDatabasePath()) {
   // same Node event loop while a protected Sync owns the SQLite writer lock.
   // The admin write is rejected for a retry; it does not commit stale state.
   if (localAccountWriters.get(dbPath)?.held) throw unavailable();
+  // A peer process can hold the writer lock even when our process-local FIFO
+  // is empty. Observe durable strict mode, then use only bounded synchronous
+  // SQLite waits, never the legacy 5-second busy_timeout.
+  if (!isDbEnabled() || isLegacyJsonWriteEnabled()) return;
+  const db = getDb();
+  if (!isStrictSyncModeObserved() || db.inTransaction) return;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    db.exec("ROLLBACK");
+  } catch (error) {
+    if (db.inTransaction) db.exec("ROLLBACK");
+    throw normalizeStrictSyncSqliteError(error);
+  }
 }
 
 function isStrictSyncAccountFenceConfigured(dbPath = getDatabasePath()) {
@@ -88,7 +102,23 @@ function createSyncSqliteAccountWriteFence() {
   // Validate a separate private, crash-durable audit journal before accepting
   // strict requests. Without it, access-denial auditing would block SQLite
   // during the cross-process authorization reservation.
-  require("../../repositories/auditRepository").preparePendingAuditJournal();
+  const audit = require("../../repositories/auditRepository");
+  audit.preparePendingAuditJournal();
+  audit.ensurePendingAuditDatabase();
+  // Register the mode exactly once in the authoritative main SQLite DB. A
+  // second process never consults an optional sidecar for legacy-vs-strict.
+  // WAL/FULL is already required; fail startup closed on any marker mismatch.
+  const main = getDb();
+  main.transaction(() => {
+    main.exec("CREATE TABLE IF NOT EXISTS rootark_strict_sync_audit_mode (id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT NOT NULL CHECK(mode='append_only'))");
+    const rows = main.prepare("SELECT id,mode FROM rootark_strict_sync_audit_mode").all();
+    if (rows.length === 0) {
+      main.prepare("INSERT INTO rootark_strict_sync_audit_mode (id,mode) VALUES (1,'append_only')").run();
+    } else if (rows.length !== 1 || rows[0].id !== 1 || rows[0].mode !== "append_only") {
+      throw unavailable();
+    }
+  }).immediate();
+  getDb(); // Re-read committed marker and tighten singleton write timeout.
   configuredStrictAccountPaths.add(dbPath);
 
   return async function persistUnderAccountFence(user, operation, persist) {
