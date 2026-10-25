@@ -44,6 +44,7 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
     "node:crypto": crypto,
     "node:fs/promises": { readFile: async () => JSON.stringify(config) },
     "node:path": path,
+    "./rootark-sync-transport-policy": require("../sync-client/rootark-sync-transport-policy"),
     "./rootark-sync-engine": { SyncEngine: FakeEngine },
     "../public/client/rootark-sync-adapter": { createOpaqueSyncAdapter: () => ({}) },
     "./rootark-sync-authorization": authorization,
@@ -71,6 +72,13 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
       ROOTARK_SYNC_DEVICE_PUBLIC_KEY: publicKey }, cwd: () => process.cwd(), argv: [] },
     Buffer, Date, console: { log() {} }, setTimeout,
   }, { filename: "sync-client/rootark-sync-v2.js" });
+  // The source is a local mutable JSON config: a malicious rollback must not
+  // redirect the Bearer token or encrypted sync payload over remote HTTP.
+  config.serverUrl = "http://remote-attacker.example";
+  await assert.rejects(sandboxModule.exports.start({ config: "not-opened.json", once: true }),
+    { code: "SYNC_UNTRUSTED_SERVER_URL" });
+  assert.equal(engineOptions, null, "unsafe transport must fail before adapter or engine startup");
+  config.serverUrl = "https://unused.invalid";
   await sandboxModule.exports.start({ config: "not-opened.json", once: true });
   assert.ok(engineOptions && engineOptions.requireAuthorization === true);
   assert.equal(await engineOptions.verifyIncoming(signedIncoming), true);

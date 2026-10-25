@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
+const { normalizeTrustedSyncServerUrl } = require("./rootark-sync-transport-policy");
 const { SyncEngine } = require("./rootark-sync-engine");
 const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
 const { createAuthorizationProof, verifyAuthorizationProof,
@@ -52,7 +53,7 @@ async function readConfig(filePath) {
       || !id || id.length > 512)) {
     throw new Error("Sync v2 requires an explicit revokedDeviceIds snapshot");
   }
-  return { ...config, serverUrl: String(config.serverUrl).replace(/\/+$/, ""), localFolder: path.resolve(config.localFolder), fileKey, privateKey: crypto.createPrivateKey({ key: privateKeyBytes, format: "der", type: "pkcs8" }), publicKey };
+  return { ...config, serverUrl: normalizeTrustedSyncServerUrl(config.serverUrl), localFolder: path.resolve(config.localFolder), fileKey, privateKey: crypto.createPrivateKey({ key: privateKeyBytes, format: "der", type: "pkcs8" }), publicKey };
 }
 
 function fileKeyResolver(master, fallbackEpoch) {

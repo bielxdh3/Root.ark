@@ -6,6 +6,7 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const readline = require("readline");
+const { normalizeTrustedSyncServerUrl } = require("./rootark-sync-transport-policy");
 
 const DEFAULT_CONFIG_PATH = path.resolve(process.cwd(), ".rootark-sync.json");
 const STATE_FILE_NAME = ".rootark-sync-state.json";
@@ -67,7 +68,7 @@ async function fileExists(filePath) {
 }
 
 function normalizeServerUrl(serverUrl) {
-  return String(serverUrl || "").trim().replace(/\/+$/, "");
+  return normalizeTrustedSyncServerUrl(serverUrl);
 }
 
 function safeResolveInside(rootDir, targetPath) {
@@ -139,7 +140,7 @@ async function saveConfig(configPath, config) {
 }
 
 async function login(serverUrl, username, password) {
-  const response = await fetch(`${serverUrl}/auth/login`, {
+  const response = await fetch(`${normalizeServerUrl(serverUrl)}/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
@@ -165,8 +166,11 @@ async function ensureToken(config, configPath, passwordProvider = null) {
 }
 
 async function authFetch(config, configPath, urlPath, options = {}) {
+  // Check again at the final network boundary. A caller must not be able to
+  // inject an unsafe origin after initial loadConfig/initialization.
+  const serverUrl = normalizeServerUrl(config.serverUrl);
   const token = await ensureToken(config, configPath, options.passwordProvider);
-  const response = await fetch(`${config.serverUrl}${urlPath}`, {
+  const response = await fetch(`${serverUrl}${urlPath}`, {
     ...options,
     // Never replay uploaded files or bearer-authenticated requests on redirects.
     redirect: "error",
@@ -179,7 +183,7 @@ async function authFetch(config, configPath, urlPath, options = {}) {
   if (response.status === 401 && options.passwordProvider) {
     config.token = "";
     const freshToken = await ensureToken(config, configPath, options.passwordProvider);
-    return fetch(`${config.serverUrl}${urlPath}`, {
+    return fetch(`${serverUrl}${urlPath}`, {
       ...options,
       redirect: "error",
       headers: {

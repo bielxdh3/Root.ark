@@ -68,6 +68,8 @@ async function harness(t, { tamperPathStream = false } = {}) {
     require(id) {
       if (id === "fs") return mockFs;
       if (id === "fs/promises") return mockFsp;
+      if (id === "./rootark-sync-transport-policy")
+        return require("../sync-client/rootark-sync-transport-policy");
       return require(id);
     },
     process: { argv: ["node", "rootark-sync", "help"], cwd: () => localFolder, env: {} },
