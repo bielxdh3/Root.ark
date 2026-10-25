@@ -248,3 +248,156 @@ test("invalid ZIP stays UNKNOWN even when its untrusted local SQLite checksum is
   assert.equal(report.sections.backups.status, "UNKNOWN");
   assert.equal(report.canDeleteLegacy, false);
 });
+
+test("SQLite query uses the exact pinned image even if a different database is substituted at reopen", async (t) => {
+  const a = await fixture(t);
+  const b = await fixture(t);
+  const replacement = new DatabaseSync(b.databasePath);
+  replacement.exec("UPDATE file_versions SET versions_json='{\"currentVersion\":1,\"versions\":[{\"version\":1,\"storedAs\":\"missing-b.bin\",\"size\":1}]}'");
+  replacement.close();
+  const sqlite = require("node:sqlite");
+  const Native = sqlite.DatabaseSync;
+  let sourceOpenCount = 0;
+  const location = require.resolve("../src/services/zk1LegacyEvidenceManifest");
+  try {
+    sqlite.DatabaseSync = class PathRebindDatabase extends Native {
+      constructor(filename, options) {
+        if (filename === a.databasePath) sourceOpenCount++;
+        super(filename === a.databasePath ? b.databasePath : filename, options);
+      }
+    };
+    delete require.cache[location];
+    const isolated = require(location).inspectZk1LegacyEvidenceManifest;
+    const report = await isolated({ optIn: true, databasePath: a.databasePath,
+      uploadsDir: a.uploads, tempDir: a.temp, trashDir: a.trash, backupsDir: a.backups });
+    assert.equal(report.sections.sqlite.sha256, sha(fs.readFileSync(a.databasePath)));
+    assert.equal(report.sections.sqlite.status, "PROVEN");
+    assert.equal(report.sections.versions.status, "PROVEN",
+      "SQL rows must be derived from the exact hashed image of A, never from B");
+    assert.equal(sourceOpenCount, 0,
+      "opening the mutable original pathname cannot bind a SQLite transaction to hashed bytes");
+    assert.equal(report.canDeleteLegacy, false);
+  } finally {
+    sqlite.DatabaseSync = Native;
+    delete require.cache[location];
+  }
+});
+
+test("growing file is read through bounded descriptor requests and cannot be PROVEN", async (t) => {
+  const f = await fixture(t);
+  const victim = path.join(f.uploads, "nested", "old-version.bin");
+  const originalSize = fs.statSync(victim).size;
+  const originalReadSync = fs.readSync;
+  let grew = false;
+  const requested = [];
+  try {
+    fs.readSync = function (fd, buffer, offset, length, position) {
+      requested.push(length);
+      if (!grew) {
+        fs.appendFileSync(victim, Buffer.alloc(128 * 1024, 0x41));
+        grew = true;
+      }
+      return originalReadSync.call(fs, fd, buffer, offset, length, position);
+    };
+    const report = await scan(f);
+    assert.equal(grew, true, "reader must control the allocated and requested byte count");
+    assert.ok(requested.length > 0 && requested.every((n) => n > 0 && n <= 16 * 1024));
+    assert.ok(requested.some((n) => n <= originalSize));
+    assert.equal(report.sections.uploads.status, "UNKNOWN");
+    assert.equal(report.sections.versions.status, "UNKNOWN");
+  } finally { fs.readSync = originalReadSync; }
+});
+
+test("ZIP self-inclusion never substitutes for a missing real physical member", async (t) => {
+  const f = await fixture(t);
+  let declaredSize = 0;
+  let forgedManifest;
+  for (let i = 0; i < 10; i++) {
+    forgedManifest = JSON.stringify({ included_files: [
+      { path: "uploads/nested/copied.bin", size: zipData.length },
+      { path: "backup-manifest.json", size: declaredSize },
+    ] });
+    const next = Buffer.byteLength(forgedManifest);
+    if (next === declaredSize) break;
+    declaredSize = next;
+  }
+  assert.equal(Buffer.byteLength(forgedManifest), declaredSize);
+  const replaced = path.join(f.root, "forged.zip");
+  await new Promise((resolve, reject) => {
+    const output = fs.createWriteStream(replaced);
+    const zip = archiver("zip", { zlib: { level: 5 } });
+    output.on("close", resolve);
+    output.on("error", reject);
+    zip.on("error", reject);
+    zip.pipe(output);
+    zip.append(zipData, { name: "uploads/nested/copied.bin" });
+    zip.append(Buffer.from("orphan remains unlisted"), { name: "data/archived.json" });
+    zip.append(forgedManifest, { name: "backup-manifest.json" });
+    zip.finalize().catch(reject);
+  });
+  fs.copyFileSync(replaced, f.zipFile);
+  const db = new DatabaseSync(f.databasePath);
+  db.prepare("UPDATE backup_history SET checksum=?").run(sha(fs.readFileSync(f.zipFile)));
+  db.close();
+  const report = await scan(f);
+  assert.equal(report.sections.backupReferences.status, "PROVEN");
+  assert.equal(report.sections.backupMembers.status, "UNKNOWN",
+    "the declared set must equal the actual non-manifest members");
+  assert.equal(report.sections.backups.status, "UNKNOWN");
+  assert.equal(report.canDeleteLegacy, false);
+});
+
+test("two backup rows naming A cannot conceal unreferenced backup B", async (t) => {
+  const f = await fixture(t);
+  const secondName = "rootark-backup-2026-10-25-01-00-00.zip";
+  fs.copyFileSync(f.zipFile, path.join(f.backups, secondName));
+  const db = new DatabaseSync(f.databasePath);
+  db.prepare("INSERT INTO backup_history(id,filename,type,status,created_at,checksum) VALUES (?,?,?,?,?,?)")
+    .run("backup-2", backupName, "manual", "success", now, sha(fs.readFileSync(f.zipFile)));
+  db.close();
+  const report = await scan(f);
+  assert.equal(report.sections.backupReferences.status, "UNKNOWN",
+    "distinct SQL rows are not distinct physical archive identities");
+  assert.equal(report.sections.backups.status, "UNKNOWN");
+  assert.equal(report.authorizesCutover, false);
+});
+
+test("two trash rows naming A cannot conceal unreferenced trash B", async (t) => {
+  const f = await fixture(t);
+  const pathB = path.join(f.trash, "files", "trash-2");
+  fs.mkdirSync(pathB);
+  fs.writeFileSync(path.join(pathB, "trash.bin"), trashBytes);
+  const db = new DatabaseSync(f.databasePath);
+  db.prepare("INSERT INTO trash_items(id,item_type,trash_path,status,deleted_at,size_bytes) VALUES (?,?,?,?,?,?)")
+    .run("trash-2", "file", "files/trash-1/trash.bin", "trashed", now, trashBytes.length);
+  db.close();
+  const report = await scan(f);
+  assert.equal(report.sections.trashReferences.status, "UNKNOWN",
+    "all physical files need exactly one distinct SQL owner");
+  assert.equal(report.canDeleteLegacy, false);
+});
+
+test("an inaccessible private SQLite snapshot cleanup cannot leave PROVEN evidence", async (t) => {
+  const f = await fixture(t);
+  const originalRm = fs.rmSync;
+  let snapshotDirectory;
+  try {
+    fs.rmSync = function (target, options) {
+      if (typeof target === "string" && path.basename(target).startsWith("zk1-legacy-sql-image-")
+        && !snapshotDirectory) {
+        snapshotDirectory = target;
+        throw Object.assign(new Error("simulated snapshot handle busy"), { code: "EPERM" });
+      }
+      return originalRm.call(fs, target, options);
+    };
+    const report = await scan(f);
+    assert.ok(snapshotDirectory);
+    assert.equal(report.sections.sqlite.status, "UNKNOWN");
+    assert.equal(report.sections.versions.status, "UNKNOWN");
+    assert.equal(report.canDeleteLegacy, false);
+  } finally {
+    fs.rmSync = originalRm;
+    if (snapshotDirectory && fs.existsSync(snapshotDirectory))
+      originalRm(snapshotDirectory, { recursive: true, force: true });
+  }
+});

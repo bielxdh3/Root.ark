@@ -4,6 +4,7 @@
 // bounded local join were read and checked; it NEVER means whole-corpus
 // completeness, backup restorability, provider durability or deletion safety.
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const zlib = require("node:zlib");
@@ -45,9 +46,17 @@ function fileBytes(target, budget) {
   try {
     fd = fs.openSync(target, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
     if (!stable(before, fs.fstatSync(fd, { bigint: true }))) throw Error("race opening");
-    const content = fs.readFileSync(fd);
-    if (BigInt(content.length) !== before.size
-      || !stable(before, fs.fstatSync(fd, { bigint: true }))
+    // readFileSync(fd) may continue allocating as a concurrent writer grows
+    // the file past the size we validated. Read at most the initial size.
+    const content = Buffer.alloc(Number(before.size));
+    let offset = 0;
+    while (offset < content.length) {
+      const length = Math.min(16 * 1024, content.length - offset);
+      const count = fs.readSync(fd, content, offset, length, null);
+      if (count <= 0 || count > length) throw Error("short or invalid read");
+      offset += count;
+    }
+    if (!stable(before, fs.fstatSync(fd, { bigint: true }))
       || !stable(before, fs.lstatSync(target, { bigint: true })))
       throw Error("race reading");
     budget.left -= content.length;
@@ -117,13 +126,23 @@ const KNOWN = new Set([
 ]);
 function observeDb(filename) {
   if (typeof filename !== "string" || !path.isAbsolute(filename)) return { section: unknown(), tables: null };
-  let db;
+  let db, snapshotDir;
+  let result = { section: unknown(), tables: null };
   try {
     if (["-wal", "-shm", "-journal"].some((part) => fs.existsSync(filename + part)))
       throw Error("unsettled SQL sidecars");
     const budget = { left: MAX_BYTES };
     const bytes = fileBytes(filename, budget);
-    db = new DatabaseSync(filename, { readOnly: true });
+    // The original pathname is mutable. Opening it with SQLite after reading
+    // the hash permits an A -> B -> A rebind that pairs A's hash with B's rows.
+    // Query a private immutable-by-contract copy of the already pinned bytes.
+    // This temp file is ours, never a source record; it is always disposed.
+    snapshotDir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-legacy-sql-image-"));
+    const snapshotPath = path.join(snapshotDir, "image.sqlite");
+    fs.writeFileSync(snapshotPath, bytes, { flag: "wx", mode: 0o600 });
+    if (!bytes.equals(fileBytes(snapshotPath, { left: MAX_BYTES })))
+      throw Error("snapshot mismatch");
+    db = new DatabaseSync(snapshotPath, { readOnly: true });
     db.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; BEGIN");
     if (db.prepare("PRAGMA quick_check").get()?.quick_check !== "ok") throw Error("invalid SQL");
     const schema = db.prepare("SELECT name,type FROM sqlite_master WHERE type IN ('table','view','trigger') LIMIT 129").all();
@@ -146,13 +165,22 @@ function observeDb(filename) {
       tables[table] = rows(db, table, columns);
     db.exec("COMMIT");
     db.close(); db = null;
+    if (!bytes.equals(fileBytes(snapshotPath, { left: MAX_BYTES })))
+      throw Error("snapshot changed during SQL inspection");
     if (!bytes.equals(fileBytes(filename, { left: MAX_BYTES }))) throw Error("database changed");
     if (["-wal", "-shm", "-journal"].some((part) => fs.existsSync(filename + part)))
       throw Error("database journal appeared");
-    return { section: { status: "PROVEN", count: 1, sha256: sha(bytes),
+    result = { section: { status: "PROVEN", count: 1, sha256: sha(bytes),
       id: id("sqlite", "legacy-source") }, tables };
-  } catch (_) { return { section: unknown(), tables: null }; }
-  finally { try { db?.close(); } catch (_) { /* already unknown */ } }
+  } catch (_) { /* Any unavailable evidence stays UNKNOWN. */ }
+  finally {
+    try { db?.close(); } catch (_) { result = { section: unknown(), tables: null }; }
+    if (snapshotDir) {
+      try { fs.rmSync(snapshotDir, { recursive: true, force: true }); }
+      catch (_) { result = { section: unknown(), tables: null }; }
+    }
+  }
+  return result;
 }
 function references(tables, uploads, trash, backups) {
   const fields = ["versions", "links", "permissions", "retention", "encryptedMetadata",
@@ -211,19 +239,33 @@ function references(tables, uploads, trash, backups) {
     ? proven(0) : unknown(tables.pending_uploads.length);
   if (trash.section.status === "PROVEN") {
     const values = tables.trash_items;
-    output.trashReferences = values.every((row) => row.item_type === "file"
+    const attributed = new Set();
+    output.trashReferences = values.every((row) => {
+      const key = typeof row.trash_path === "string" ? row.trash_path.toLowerCase() : null;
+      if (!key || attributed.has(key)) return false;
+      attributed.add(key);
+      return row.item_type === "file"
       && row.status === "trashed" && typeof row.trash_path === "string"
       && row.trash_path.split("/").every(safePart) && trash.lookup.has(row.trash_path)
       && Number.isSafeInteger(row.size_bytes)
-      && trash.lookup.get(row.trash_path).size === row.size_bytes)
-      && values.length === trash.lookup.size ? proven(values.length) : unknown(values.length);
+      && trash.lookup.get(row.trash_path).size === row.size_bytes;
+    }) && attributed.size === trash.lookup.size
+      && [...trash.lookup.keys()].every((key) => attributed.has(key.toLowerCase()))
+      ? proven(values.length) : unknown(values.length);
   }
   if (backups.section.status === "PROVEN") {
     const values = tables.backup_history;
-    output.backupReferences = values.every((row) => row.status === "success"
+    const attributed = new Set();
+    output.backupReferences = values.every((row) => {
+      const key = typeof row.filename === "string" ? row.filename.toLowerCase() : null;
+      if (!key || attributed.has(key)) return false;
+      attributed.add(key);
+      return row.status === "success"
       && safePart(row.filename) && /^[a-f0-9]{64}$/.test(row.checksum || "")
-      && backups.lookup.get(row.filename)?.sha256 === row.checksum)
-      && values.length === backups.lookup.size ? proven(values.length) : unknown(values.length);
+      && backups.lookup.get(row.filename)?.sha256 === row.checksum;
+    }) && attributed.size === backups.lookup.size
+      && [...backups.lookup.keys()].every((key) => attributed.has(key.toLowerCase()))
+      ? proven(values.length) : unknown(values.length);
   }
   return output;
 }
@@ -290,12 +332,17 @@ async function inspectArchiveContents(backups) {
       const declared = new Set();
       for (const item of manifest.included_files) {
         if (!item || typeof item.path !== "string"
+          || item.path === "backup-manifest.json"
           || !Number.isSafeInteger(item.size) || item.size < 0
           || declared.has(item.path) || !members.has(item.path)
           || members.get(item.path).length !== item.size)
           throw Error("unjoined ZIP manifest");
         declared.add(item.path);
       }
+      if (declared.size !== members.size - 1
+        || [...members.keys()].some((name) =>
+          name !== "backup-manifest.json" && !declared.has(name)))
+        throw Error("incomplete physical ZIP membership");
     }
     return { section: proven(entries.length), entries };
   } catch (_) { return { section: unknown(), entries: [] }; }
