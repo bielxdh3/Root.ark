@@ -40,10 +40,20 @@ async function assembleChunkedUpload(sessionDir, destinationPath, totalChunks,
       // Convert rejections to results immediately: a prefetched descriptor can
       // fail before its turn, and must never become an unhandled rejection.
       queued.push(Promise.resolve().then(async () => {
-        const handle = await openPart(filename, "r");
+        // A filename checked earlier by the HTTP handler is not a trustable
+        // descriptor: a local actor could replace a part while opens queue.
+        // Pin the exact regular inode and byte length across this open.
+        const before = await fs.promises.lstat(filename, { bigint: true });
+        if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) {
+          throw new Error("Unsafe chunk assembly input");
+        }
+        const flags = process.platform === "win32" ? "r"
+          : fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
+        const handle = await openPart(filename, flags);
         try {
-          const stat = await handle.stat();
-          if (!stat.isFile() || stat.nlink !== 1) {
+          const stat = await handle.stat({ bigint: true });
+          if (!stat.isFile() || stat.nlink !== 1n || stat.dev !== before.dev
+            || stat.ino !== before.ino || stat.size !== before.size) {
             throw new Error("Unsafe chunk assembly input");
           }
           return { handle };

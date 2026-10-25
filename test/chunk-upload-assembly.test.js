@@ -110,3 +110,40 @@ test("assembly rejects hardlinked parts before copying their data", { timeout: 1
     /Unsafe chunk assembly input/);
   assert.equal(fs.existsSync(destination), false);
 });
+
+test("assembly refuses a part replaced after pathname validation", { timeout: 10_000 }, async (t) => {
+  const { session, destination } = fixture(t, 3);
+  const original = path.join(session, "0.part");
+  const swapped = path.join(session, "0.prior");
+  const replacement = Buffer.from("UNTRUSTED_SUBSTITUTION_NOT_A_CHUNK");
+  let injected = false;
+  const openPart = async (filename, flags) => {
+    if (!injected && filename === original) {
+      injected = true;
+      await fs.promises.rename(original, swapped);
+      await fs.promises.writeFile(original, replacement);
+    }
+    return fs.promises.open(filename, flags);
+  };
+  await assert.rejects(assembleChunkedUpload(session, destination, 3, { openPart }),
+    /Unsafe chunk assembly input/);
+  assert.equal(injected, true);
+  assert.equal(fs.existsSync(destination), false);
+  assert.deepEqual(fs.readFileSync(swapped), Buffer.from([0]));
+});
+
+test("assembly never follows an input symlink outside the stage", { timeout: 10_000 }, async (t) => {
+  const { session, destination } = fixture(t, 1);
+  const source = path.join(path.dirname(session), "other-private-file");
+  fs.writeFileSync(source, "must-not-be-copied");
+  const part = path.join(session, "0.part");
+  fs.unlinkSync(part);
+  try { fs.symlinkSync(source, part, "file"); } catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP", "EINVAL"].includes(error.code)) return t.skip("host disallows file symlinks");
+    throw error;
+  }
+  await assert.rejects(assembleChunkedUpload(session, destination, 1),
+    /Unsafe chunk assembly input/);
+  assert.equal(fs.existsSync(destination), false);
+  assert.equal(fs.readFileSync(source, "utf8"), "must-not-be-copied");
+});
