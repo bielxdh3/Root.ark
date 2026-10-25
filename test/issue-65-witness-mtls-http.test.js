@@ -397,7 +397,13 @@ test("mTLS standalone witness listener rejects unknown principals and returns si
     });
     ownedChildren.add(child);
     const result = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("WITNESS_PROCESS_START_TIMEOUT")), 5000);
+      // Windows mandatory native DACL verification invokes a separate,
+      // fail-closed PowerShell security check for each of the nine key,
+      // certificate and configuration files before sending "ready". These
+      // checks add real startup work; do not mistake it for a failed listener.
+      // Keep the shorter watchdog on platforms without that verification.
+      const startupDeadlineMs = process.platform === "win32" ? 30000 : 5000;
+      const timer = setTimeout(() => reject(new Error("WITNESS_PROCESS_START_TIMEOUT")), startupDeadlineMs);
       child.once("message", (msg) => {
         clearTimeout(timer);
         if (msg?.type === "ready" && Number.isSafeInteger(msg.port)) resolve(msg.port);
