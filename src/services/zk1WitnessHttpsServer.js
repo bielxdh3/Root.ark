@@ -31,6 +31,7 @@ const ROLES = Object.freeze({
   "/v1/cas-anchor/head": "cas-anchor",
   "/v1/cas-anchor/advance": "cas-anchor",
   "/v1/cas-anchor/historical-admit": "cas-historical-admit",
+  "/v1/cas-anchor/historical-recover": "cas-historical-admit",
 });
 const SCOPE_FIELDS = Object.freeze(["account_id", "compartment_id", "keyring_id"]);
 const OP_FIELDS = Object.freeze([
@@ -238,19 +239,22 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals,
         // Refuse before buffering any externally supplied JSON.
         return write(res, 403, { error: "FORBIDDEN" });
       }
-      if (req.url === "/v1/cas-anchor/historical-admit") {
+      if (req.url === "/v1/cas-anchor/historical-admit"
+        || req.url === "/v1/cas-anchor/historical-recover") {
         releaseHistorical = historicalSlot(granted);
         if (!releaseHistorical) {
           return write(res, 429, { error: "WITNESS_HISTORICAL_RATE_LIMIT" });
         }
       }
       const body = await readBoundedJson(req,
-        req.url === "/v1/cas-anchor/historical-admit"
+        (req.url === "/v1/cas-anchor/historical-admit"
+          || req.url === "/v1/cas-anchor/historical-recover")
           ? HISTORICAL_BODY_BYTES
           : req.url === "/v1/cas-anchor/advance"
           ? (casAnchorFloor?.requiresPhysicalAttestation ? 96 * 1024 : 40 * 1024)
           : MAX_BODY_BYTES);
-      if (req.url === "/v1/cas-anchor/historical-admit") {
+      if (req.url === "/v1/cas-anchor/historical-admit"
+        || req.url === "/v1/cas-anchor/historical-recover") {
         if (casAnchorFloor?.supportsClientHistoricalNonce !== true) invalid();
         exact(body, ["envelope", "scope", "expectedSequence", "expectedRoot",
           "inventoryReceipt", "nonce"]);
@@ -265,7 +269,15 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals,
           expectedRoot: decode(body.expectedRoot, [32, 32]),
           inventoryReceipt: decode(body.inventoryReceipt,
             [1, inventory.MAX_COMMITTED_PROOF_BYTES]), nonce };
-        const issued = await casAnchorFloor.issueSyncHistoricalAdmission(input);
+        const recovering = req.url === "/v1/cas-anchor/historical-recover";
+        if (recovering
+          && typeof casAnchorFloor.recoverSyncHistoricalAdmission !== "function") invalid();
+        const issued = recovering
+          ? await casAnchorFloor.recoverSyncHistoricalAdmission(input)
+          : await casAnchorFloor.issueSyncHistoricalAdmission(input);
+        // Recovery is read-only; a buggy or downgraded backend must not
+        // issue a second durable receipt in response to a recovery request.
+        if (recovering && issued?.recoveredDurableAdmission !== true) invalid();
         // A mismatched reply must never be delivered as proof of the caller's
         // fresh challenge, even if the witness signed a different nonce.
         if (!issued?.admission || !issued?.freshFloor

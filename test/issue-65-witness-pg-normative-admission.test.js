@@ -452,6 +452,72 @@ test("strict CAS witness floor refuses signed status advance without independent
   ]), witness.publicKey, Buffer.from(admissionSignature, "base64url")), true);
   await assert.rejects(historical.issueSyncHistoricalAdmission(issueInput),
     /WITNESS_CAS_FLOOR_DENIED/, "repeated same op ID cannot mint another signed receipt");
+  // A lost HTTPS ACK cannot repeat a durable INSERT. Recovery must return
+  // the ORIGINAL receipt, with a new signed floor and independent PG readback
+  // for a fresh challenge, without changing either SQLite high-water.
+  const persistedBeforeRecovery = historical.historicalAdmissionHead();
+  const recoveryNonce = random(32);
+  const recoveryInput = { ...issueInput, nonce: recoveryNonce };
+  const recovered = await historical.recoverSyncHistoricalAdmission(recoveryInput);
+  assert.deepEqual(recovered.admission, issued.admission);
+  assert.deepEqual(historical.historicalAdmissionHead(), persistedBeforeRecovery);
+  assert.equal(recovered.freshFloor.nonce, recoveryNonce.toString("base64url"));
+  assert.equal((await verifySyncV2HistoricalWitnessAdmission({
+    ...strictClientInput, nonce: recoveryNonce, admission: recovered.admission,
+    freshFloor: recovered.freshFloor, physicalAttestation: recovered.physicalAttestation,
+  })).authorizesHistoricalRead, true);
+  await assert.rejects(verifySyncV2HistoricalWitnessAdmission({
+    ...strictClientInput, nonce: historicalChallenge,
+    admission: recovered.admission, freshFloor: recovered.freshFloor,
+    physicalAttestation: recovered.physicalAttestation,
+  }), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/, "old challenge cannot reuse recovery proof");
+  await assert.rejects(historical.recoverSyncHistoricalAdmission(recoveryInput),
+    /WITNESS_CAS_FLOOR_DENIED/, "nonce replay cannot recover twice");
+  for (const bad of [
+    { envelope: { ...syncEnvelope, deviceId: "wrong-device" } },
+    { scope: { ...scope, keyring_id: random(16) } },
+    { inventoryReceipt: Buffer.from("foreign-receipt") },
+    { expectedRoot: random(32) },
+    { nonce: random(31) },
+  ]) {
+    await assert.rejects(historical.recoverSyncHistoricalAdmission({
+      ...recoveryInput, nonce: random(32), ...bad,
+    }), /WITNESS_CAS_FLOOR_DENIED/);
+  }
+  trustedDeviceRevocations = ["device-a"];
+  await assert.rejects(historical.recoverSyncHistoricalAdmission({
+    ...recoveryInput, nonce: random(32),
+  }), /WITNESS_CAS_FLOOR_DENIED/, "live owner revocation must fence lost-ACK recovery");
+  trustedDeviceRevocations = [];
+  const originalAttestSync = admission.attestSyncCommitted;
+  admission.attestSyncCommitted = async function (...args) {
+    const proof = await originalAttestSync.apply(this, args);
+    trustedDeviceRevocations = ["device-a"];
+    return proof;
+  };
+  try {
+    await assert.rejects(historical.recoverSyncHistoricalAdmission({
+      ...recoveryInput, nonce: random(32),
+    }), /WITNESS_CAS_FLOOR_DENIED/,
+    "revocation arriving DURING independent PG proof must refuse old admission");
+  } finally {
+    admission.attestSyncCommitted = originalAttestSync;
+    trustedDeviceRevocations = [];
+  }
+  // Historical expiry is not a new grant: the immutable durable signature
+  // attests to a past valid admission, while current revocation still applies.
+  const expiryClock = Date.now;
+  const expiredRecoveryNonce = random(32);
+  try {
+    Date.now = () => syncEnvelope.authorization.expiresAt + 1000;
+    const past = await historical.recoverSyncHistoricalAdmission({
+      ...recoveryInput, nonce: expiredRecoveryNonce,
+    });
+    assert.deepEqual(past.admission, issued.admission);
+    assert.equal(past.freshFloor.nonce, expiredRecoveryNonce.toString("base64url"));
+  } finally { Date.now = expiryClock; }
+  assert.deepEqual(historical.historicalAdmissionHead(), persistedBeforeRecovery,
+    "all recovery attempts are read-only");
   const admittedFloor = issued.freshFloor;
   const admittedHistoryHead = issued.historicalAdmissionHead;
   historical.close();
@@ -473,6 +539,15 @@ test("strict CAS witness floor refuses signed status advance without independent
   assert.deepEqual(historical.historicalAdmissionForOperation(op.operation_id).admission,
     issued.admission, "signed admission remains retrievable after durable restart");
   assert.equal(historical.historicalAdmissionForOperation(random(16)), null);
+  const restartNonce = random(32);
+  const restartRecovered = await historical.recoverSyncHistoricalAdmission({
+    ...recoveryInput, nonce: restartNonce,
+  });
+  assert.deepEqual(restartRecovered.admission, issued.admission,
+    "lost ACK remains recoverable AFTER witness restart from FULL durable SQLite");
+  assert.equal(restartRecovered.freshFloor.nonce, restartNonce.toString("base64url"));
+  assert.deepEqual(historical.historicalAdmissionHead(), admittedHistoryHead,
+    "recovery after restart must never append a new signed receipt");
   historical.close();
   // A SQL editor can forge an empty local history by deleting a row, but
   // cannot make the exact separately pinned signed-receipt high-water agree.

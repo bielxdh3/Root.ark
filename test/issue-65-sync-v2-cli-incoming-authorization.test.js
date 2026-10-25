@@ -252,4 +252,30 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
     historicalEvidenceProvider: async () => ({}) });
   assert.equal(await engineOptions.authorizeOutgoing({ deviceId: "device1" }), false,
     "a stale live callback cannot reverse an independently pinned prior revocation");
+  // Lost-ACK path: the verifier, never the provider, generates each challenge.
+  // A failed first recovery, a durable issue whose ACK disappears, and a
+  // successful second recovery use THREE distinct challenges. Stale transport
+  // proofs cannot choose the nonce or any trusted pin used by the verifier.
+  const seenAttempts = [];
+  await sandboxModule.exports.start({ config: "not-opened.json", once: true,
+    requireIndependentHistoricalAdmission: true, trustedHistoricalAdmission: externalPins,
+    historicalEvidenceProvider: async (_operation, { nonce, recovery }) => {
+      seenAttempts.push({ nonce: Buffer.from(nonce), recovery });
+      if (seenAttempts.length < 3) throw Error("ACK_LOST_OR_NOT_ISSUED");
+      return { scope: "external-scope", expectedSequence: 2,
+        expectedRoot: "external-root", receipt: "external-receipt",
+        physicalAttestation: "external-pg", admission: "original-durable-admission",
+        freshFloor: "fresh-witness-floor" };
+    } });
+  const clockForRecovery = Date.now;
+  try {
+    Date.now = () => signature.expiresAt + 1;
+    assert.equal(await engineOptions.verifyIncoming(signedIncoming), true);
+    assert.deepEqual(seenAttempts.map((item) => item.recovery),
+      [true, false, true], "read-only first, durable issue only when needed, recovery after lost ACK");
+    assert.equal(new Set(seenAttempts.map((item) => item.nonce.toString("hex"))).size, 3);
+    assert.deepEqual(historicalVerifierArgs.nonce, seenAttempts[2].nonce,
+      "strict verifier uses final locally generated challenge, not untrusted proof nonce");
+    assert.equal(historicalVerifierArgs.pinnedWitnessPublicKey, externalPins.pinnedWitnessPublicKey);
+  } finally { Date.now = clockForRecovery; }
 });

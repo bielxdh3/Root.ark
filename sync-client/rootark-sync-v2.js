@@ -173,30 +173,40 @@ async function start(options = {}) {
       // exact envelope locally witnessed while fresh; strict mode requires an
       // independently signed admission and a currently attested physical floor.
       if (strictHistorical) {
-        // The supplied proof is untrusted transport data. Generate the nonce
-        // locally, override all trust pins from the independent integration,
-        // and revalidate the exact original signed encrypted envelope.
-        const nonce = crypto.randomBytes(32);
-        const proof = await options.historicalEvidenceProvider(operation,
-          { nonce: Buffer.from(nonce) });
-        if (!proof || typeof proof !== "object" || Array.isArray(proof)) return false;
-        const verified = await strictVerifier({
-          envelope: operation, scope: proof.scope,
-          expectedSequence: proof.expectedSequence, expectedRoot: proof.expectedRoot,
-          receipt: proof.receipt, physicalAttestation: proof.physicalAttestation,
-          nonce, admission: proof.admission, freshFloor: proof.freshFloor,
-          pinnedInventoryPublicKey: trustedHistorical.pinnedInventoryPublicKey,
-          pinnedInventorySignerKeyId: trustedHistorical.pinnedInventorySignerKeyId,
-          pinnedPhysicalAttestorPublicKey: trustedHistorical.pinnedPhysicalAttestorPublicKey,
-          pinnedWitnessPublicKey: trustedHistorical.pinnedWitnessPublicKey,
-          witnessKeyId: trustedHistorical.witnessKeyId,
-          statusKeyId: trustedHistorical.statusKeyId,
-          trustedMinimumFloor: trustedHistorical.trustedMinimumFloor,
-          localTrustedDevicePolicy: expected,
-          trustedCurrentDevicePolicyProvider:
-            options.trustedHistoricalAdmission.trustedCurrentDevicePolicyProvider,
-        });
-        return verified.authorizesHistoricalRead === true && currentlyAuthorized(operation);
+        // Rechecks overwhelmingly reference already-issued durable receipts.
+        // First try read-only recovery. When none exists, issue with another
+        // CLIENT-generated challenge. If issuance committed but its HTTP ACK
+        // was lost, recover with yet another fresh challenge; no nonce or
+        // authority claim is accepted from the untrusted response.
+        for (const recovery of [true, false, true]) {
+          const nonce = crypto.randomBytes(32);
+          try {
+            const proof = await options.historicalEvidenceProvider(operation,
+              { nonce: Buffer.from(nonce), recovery });
+            if (!proof || typeof proof !== "object" || Array.isArray(proof)) continue;
+            const verified = await strictVerifier({
+              envelope: operation, scope: proof.scope,
+              expectedSequence: proof.expectedSequence, expectedRoot: proof.expectedRoot,
+              receipt: proof.receipt, physicalAttestation: proof.physicalAttestation,
+              nonce, admission: proof.admission, freshFloor: proof.freshFloor,
+              pinnedInventoryPublicKey: trustedHistorical.pinnedInventoryPublicKey,
+              pinnedInventorySignerKeyId: trustedHistorical.pinnedInventorySignerKeyId,
+              pinnedPhysicalAttestorPublicKey: trustedHistorical.pinnedPhysicalAttestorPublicKey,
+              pinnedWitnessPublicKey: trustedHistorical.pinnedWitnessPublicKey,
+              witnessKeyId: trustedHistorical.witnessKeyId,
+              statusKeyId: trustedHistorical.statusKeyId,
+              trustedMinimumFloor: trustedHistorical.trustedMinimumFloor,
+              localTrustedDevicePolicy: expected,
+              trustedCurrentDevicePolicyProvider:
+                options.trustedHistoricalAdmission.trustedCurrentDevicePolicyProvider,
+            });
+            if (verified.authorizesHistoricalRead === true
+              && verified.authorizesIo !== true
+              && currentlyAuthorized(operation)) return true;
+          } catch (_) { /* This attempt cannot authorize a read. */ }
+          if (!currentlyAuthorized(operation)) return false;
+        }
+        return false;
       }
       if (locallyAdmitted !== true) return false;
       return verifyHistoricalAuthorizationProof(operation.authorization, operation,

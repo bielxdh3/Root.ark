@@ -91,10 +91,13 @@ function createSyncV2HistoricalEvidenceProvider({
   // every historical recheck, and the cryptographic verifier binds the
   // witness floor and PG attestation to that exact original challenge.
   const inFlightNonces = new Set();
-  return async function historicalEvidenceProvider(operation, { nonce } = {}) {
+  return async function historicalEvidenceProvider(operation, {
+    nonce, recovery = false,
+  } = {}) {
     let acquiredNonce;
     try {
       const challenge = bytes(nonce, 32);
+      if (typeof recovery !== "boolean") fail();
       const nonceText = challenge.toString("base64url");
       if (inFlightNonces.size >= MAX_IN_FLIGHT_NONCES
         || inFlightNonces.has(nonceText)) fail();
@@ -127,7 +130,9 @@ function createSyncV2HistoricalEvidenceProvider({
       };
       const payload = Buffer.from(JSON.stringify(body), "utf8");
       if (payload.length < 2 || payload.length > REQUEST_LIMIT) fail();
-      const result = await postHistoricalAdmission(transport, payload);
+      const result = await postHistoricalAdmission(transport, payload,
+        recovery ? "/v1/cas-anchor/historical-recover"
+          : "/v1/cas-anchor/historical-admit");
       const answer = exact(result, ["admission", "freshFloor",
         "physicalAttestation", "authority"]);
       const floor = exact(answer.freshFloor, FLOOR);
@@ -181,7 +186,7 @@ function bytesOrPem(input) {
   }
   return bytes(input, 1, 8192);
 }
-async function postHistoricalAdmission(options, payload) {
+async function postHistoricalAdmission(options, payload, pathname) {
   return new Promise((resolve, reject) => {
     let settled = false, request;
     const done = (error, result) => {
@@ -193,7 +198,7 @@ async function postHistoricalAdmission(options, payload) {
     };
     request = https.request({
       hostname: options.host, port: options.port,
-      path: "/v1/cas-anchor/historical-admit", method: "POST", agent: false,
+      path: pathname, method: "POST", agent: false,
       ca: options.ca, key: options.key, cert: options.cert,
       minVersion: "TLSv1.3", maxVersion: "TLSv1.3",
       rejectUnauthorized: true,

@@ -12,13 +12,16 @@ const Database = require("better-sqlite3");
 const { Zk1WitnessCasPhysicalAdmission } = require("./zk1WitnessCasPhysicalAdmission");
 const { envelopeBinding, snapshotLocalDevicePolicy } =
   require("../../sync-client/rootark-sync-zk1-physical-binding");
-const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
+const { verifyAuthorizationProof, verifyHistoricalAuthorizationProof } =
+  require("../../sync-client/rootark-sync-authorization");
 
 const RECORD_DOMAIN = Buffer.from("Root.ark/zk-1/cas-terminal-anchor/v1\0", "ascii");
 const FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-anchor-floor/v1\0", "ascii");
 const PHYSICAL_FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-physical-floor/v2\0", "ascii");
 const PHYSICAL_FENCE_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-inventory-fence/v2\0", "ascii");
 const HISTORICAL_SYNC_DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0");
+const RECOVERY_CHALLENGE_WINDOW_NS = 300_000_000_000n;
+const MAX_RECOVERY_CHALLENGES = 4096;
 const RECORD_FIELDS = ["sequence", "reservation", "scope", "status", "ticketHash",
   "manifestHash", "terminalSeal", "previousHash", "signature"];
 const RECORD_PAYLOAD = RECORD_FIELDS.slice(0, -1);
@@ -165,6 +168,7 @@ class Zk1WitnessCasAnchorFloor {
   #historicalEnabled = false;
   #historicalHead = Object.freeze({ sequence: 0, lastHash: ZERO });
   #trustedSyncDevicePolicyProvider;
+  #recoveryChallenges = new Map();
   // Read-only capability for the separately reviewed mTLS issuer transport.
   // Never advertise legacy/writer-signed floors or a closed issuer as nonce
   // bound; strict mode always uses the caller nonce for PG AND witness floor.
@@ -708,6 +712,119 @@ class Zk1WitnessCasAnchorFloor {
     const pending = this.#advanceQueue.then(() => this.#issueSyncSerial(pinnedInput));
     this.#advanceQueue = pending.catch(() => {});
     return pending;
+  }
+  // Lost HTTP ACK recovery never inserts, updates or re-signs a historical
+  // admission. It independently re-proves the exact durable receipt with a
+  // NEW client challenge, a fresh signed witness floor and fresh mTLS PG
+  // readback. Inability to prove the original exact floor is a hard denial;
+  // accepting a later head would require a separately reviewed ancestry proof.
+  async recoverSyncHistoricalAdmission(input) {
+    if (!this.supportsClientHistoricalNonce) fail();
+    const captured = exact(input, ["envelope", "scope", "expectedSequence",
+      "expectedRoot", "inventoryReceipt", "nonce"]);
+    if ((!Buffer.isBuffer(captured.nonce) && !(captured.nonce instanceof Uint8Array))
+      || captured.nonce.byteLength !== 32
+      || (typeof SharedArrayBuffer !== "undefined"
+        && captured.nonce.buffer instanceof SharedArrayBuffer)
+      || (!Buffer.isBuffer(captured.inventoryReceipt)
+        && !(captured.inventoryReceipt instanceof Uint8Array))
+      || captured.inventoryReceipt.byteLength < 1
+      || captured.inventoryReceipt.byteLength > 8192) fail();
+    // Canonicalize and detach all attacker-owned mutable input before queuing.
+    let bound;
+    try {
+      bound = envelopeBinding(captured.envelope, captured.scope,
+        captured.expectedSequence, captured.expectedRoot);
+    } catch (_) { fail(); }
+    const pinned = { bound, receipt: Buffer.from(captured.inventoryReceipt),
+      nonce: Buffer.from(captured.nonce) };
+    const pending = this.#advanceQueue.then(() => this.#recoverSyncSerial(pinned));
+    this.#advanceQueue = pending.catch(() => {});
+    return pending;
+  }
+  async #recoverSyncSerial({ bound, receipt, nonce }) {
+    try {
+      if (!this.supportsClientHistoricalNonce) fail();
+      const operationId = bound.operation.operation_id.toString("base64url");
+      const saved = this.historicalAdmissionForOperation(bound.operation.operation_id);
+      if (!saved) fail();
+      const admission = saved.admission;
+      const stamp = Date.now();
+      if (!Number.isSafeInteger(stamp) || stamp < 1
+        || !Number.isSafeInteger(admission.admittedAtMs)
+        || admission.admittedAtMs < 1 || admission.admittedAtMs > stamp
+        || admission.admittedAtMs >= bound.envelope.authorization.expiresAt
+        || admission.type !== "rootark-sync-v2-historical-witness-admission/v1"
+        || admission.operationId !== operationId
+        || admission.envelopeSha256 !== crypto.createHash("sha256")
+          .update(bound.canonicalEnvelope).digest("base64url")
+        || admission.deviceId !== bound.envelope.deviceId
+        || admission.epoch !== bound.operation.epoch
+        || admission.checkpointSequence !== bound.operation.expected_sequence
+        || admission.checkpointRoot !== bound.operation.expected_root.toString("base64url")
+        || admission.inventoryReceiptSha256 !== crypto.createHash("sha256")
+          .update(receipt).digest("base64url")) fail();
+      const deviceSpki = Buffer.from(bound.envelope.authorization.publicKey, "base64url");
+      if (admission.deviceSpkiSha256 !== crypto.createHash("sha256")
+        .update(deviceSpki).digest("base64url")) fail();
+      const deviceKey = crypto.createPublicKey({ key: deviceSpki,
+        format: "der", type: "spki" });
+      if (deviceKey.asymmetricKeyType !== "ed25519"
+        || crypto.KeyObject.prototype.equals.call(
+          deviceKey, crypto.createPublicKey(this.#witness))
+        || crypto.KeyObject.prototype.equals.call(deviceKey, this.#status)) fail();
+      this.#attestedAdmission.assertSeparateDevice(deviceKey);
+      const policy = snapshotLocalDevicePolicy(this.#trustedSyncDevicePolicyProvider());
+      if (await verifyHistoricalAuthorizationProof(bound.envelope.authorization,
+        bound.envelope, policy) !== true) fail();
+      const policySnapshot = JSON.stringify(policy);
+      const nonceText = nonce.toString("base64url");
+      const now = process.hrtime.bigint();
+      for (const [old, when] of this.#recoveryChallenges) {
+        if (now - when >= RECOVERY_CHALLENGE_WINDOW_NS) this.#recoveryChallenges.delete(old);
+      }
+      if (this.#recoveryChallenges.has(nonceText)
+        || this.#recoveryChallenges.size >= MAX_RECOVERY_CHALLENGES) fail();
+      const composite = await this.#attestedAdmission.attestSyncCommitted({
+        scope: bound.scope, operation: bound.operation, receipt, nonce });
+      if (!composite.pgReadbackVerified || composite.authorizesIo !== false
+        || composite.inventorySequence !== bound.operation.expected_sequence + 1
+        || composite.receiptSha256.toString("base64url")
+          !== admission.inventoryReceiptSha256) fail();
+      const fenced = await this.proveCommittedPhysicalFence({
+        scope: bound.scope, operationId: bound.operation.operation_id,
+        inventorySequence: composite.inventorySequence,
+        inventoryRoot: composite.inventoryRoot, nonce });
+      const floor = fenced.signedFloor;
+      // No optimistic promotion of the original receipt to a later floor.
+      if (admission.witnessSequence !== floor.sequence
+        || admission.witnessLastHash !== floor.lastHash
+        || admission.witnessPhysicalFenceDigest !== floor.physicalFenceDigest
+        || floor.nonce !== nonceText) fail();
+      const current = snapshotLocalDevicePolicy(this.#trustedSyncDevicePolicyProvider());
+      if (JSON.stringify(current) !== policySnapshot
+        || await verifyHistoricalAuthorizationProof(bound.envelope.authorization,
+          bound.envelope, current) !== true) fail();
+      const completed = Date.now();
+      if (!Number.isSafeInteger(completed) || completed < stamp
+        || !Number.isSafeInteger(composite.physicalIssuedAt)
+        || Math.abs(Math.floor(completed / 1000) - composite.physicalIssuedAt) > 30
+        || admission.admittedAtMs > completed
+        || this.#recoveryChallenges.has(nonceText)) fail();
+      // Device revocation may arrive during async Ed25519/PG checks or the
+      // last clock sample. No await, user callback or clock hook follows this
+      // final synchronous operator-policy read before returning the proof.
+      if (JSON.stringify(snapshotLocalDevicePolicy(
+        this.#trustedSyncDevicePolicyProvider())) !== policySnapshot) fail();
+      this.#recoveryChallenges.set(nonceText, now);
+      return Object.freeze({
+        admission, freshFloor: floor,
+        physicalAttestation: Buffer.from(composite.physicalAttestation),
+        recoveredDurableAdmission: true,
+        authorizesHistoricalRead: false, authorizesIo: false,
+        externalCustodyProven: false,
+      });
+    } catch (_) { fail(); }
   }
   async #issueSyncSerial(input) {
     try {

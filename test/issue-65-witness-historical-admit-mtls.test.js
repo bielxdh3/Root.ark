@@ -16,6 +16,8 @@ const { createOperation } = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { envelopeBinding } =
   require("../sync-client/rootark-sync-zk1-physical-binding");
+const { createSyncV2HistoricalEvidenceProvider } =
+  require("../sync-client/rootark-sync-v2-historical-evidence-provider");
 const { signCommittedPhysicalReadback } =
   require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
 
@@ -36,7 +38,7 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   generateNativeFixtureCertificates(dir, {
     caSubject: "W2 Historical Admission Dedicated mTLS CA",
-    servers: ["server"], clients: ["historical", "anchor", "denied", "wrongscope"],
+    servers: ["server"], clients: ["historical", "recovery", "anchor", "denied", "wrongscope"],
   });
   const read = (name) => fs.readFileSync(path.join(dir, name));
   const fingerprint = (name) => new crypto.X509Certificate(read(name + ".pem")).fingerprint256;
@@ -74,6 +76,9 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
   let corruptNonce = false, corruptFence = false;
   let corruptProof = "";
   let alreadyIssued = false;
+  let issuedState;
+  const recoveredNonces = new Set();
+  let recoveryCalls = 0;
   const floor = {
     requiresPhysicalAttestation: true,
     supportsClientHistoricalNonce: true,
@@ -123,12 +128,46 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
         nonce: corruptProof === "wrong-nonce" ? random(32) : input.nonce,
         readback, issuedAt: Math.floor(Date.now() / 1000) }, physicalSigner.privateKey);
       if (!corruptNonce && !corruptFence && !corruptProof) alreadyIssued = true;
-      return { freshFloor, admission: { ...admissionUnsigned,
+      const issued = { freshFloor, admission: { ...admissionUnsigned,
         signature: signed(witness.privateKey, HISTORICAL_DOMAIN, admissionUnsigned) },
       ...(corruptProof === "missing" ? {} : {
         physicalAttestation: corruptProof === "malformed" ? "not-a-buffer"
           : corruptProof === "oversize" ? Buffer.alloc(2049) : attestation,
       }) };
+      if (alreadyIssued && !issuedState) issuedState = issued;
+      return issued;
+    },
+    async recoverSyncHistoricalAdmission(input) {
+      recoveryCalls += 1;
+      if (!issuedState || !Buffer.isBuffer(input.nonce) || input.nonce.length !== 32
+        || recoveredNonces.has(input.nonce.toString("base64url"))) {
+        throw Error("RECOVERY_UNAVAILABLE");
+      }
+      const bound = envelopeBinding(input.envelope, input.scope, input.expectedSequence,
+        input.expectedRoot);
+      if (issuedState.admission.envelopeSha256 !== sha(bound.canonicalEnvelope).toString("base64url")
+        || issuedState.admission.inventoryReceiptSha256
+          !== sha(input.inventoryReceipt).toString("base64url")) throw Error("RECOVERY_UNAVAILABLE");
+      const floorUnsigned = { ...issuedState.freshFloor,
+        nonce: input.nonce.toString("base64url") };
+      delete floorUnsigned.signature;
+      const freshFloor = { ...floorUnsigned,
+        signature: signed(witness.privateKey, FENCE_DOMAIN, floorUnsigned) };
+      const physicalAttestation = await signCommittedPhysicalReadback({
+        scope: input.scope, operation: bound.operation, nonce: input.nonce,
+        readback: { status: "PHYSICALLY_REREAD_PG_COMMITTED",
+          verified: true, walFlushConfirmed: true, authorizesIo: false,
+          provesIndependentOperator: false, generation: 4, admissionId: random(16),
+          operationId: bound.operation.operation_id, revision: bound.operation.revision,
+          epoch: bound.operation.epoch, expectedInventorySequence: bound.operation.expected_sequence,
+          expectedInventoryRoot: bound.operation.expected_root,
+          ciphertextSha256: bound.operation.ciphertext_sha256,
+          digest: random(32), root: random(32), chunkCount: 1 },
+        issuedAt: Math.floor(Date.now() / 1000),
+      }, physicalSigner.privateKey);
+      recoveredNonces.add(input.nonce.toString("base64url"));
+      return { admission: issuedState.admission, freshFloor, physicalAttestation,
+        recoveredDurableAdmission: true };
     },
   };
   const none = async () => { throw Error("WRONG_LEDGER_ROLE"); };
@@ -141,6 +180,8 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
   });
   const auth = { [fingerprint("historical")]: {
     roles: ["cas-historical-admit"], scopes: [wireScope(allowed)] },
+    [fingerprint("recovery")]: {
+      roles: ["cas-historical-admit"], scopes: [wireScope(allowed)] },
     [fingerprint("anchor")]: { roles: ["cas-anchor"], scopes: [] },
     [fingerprint("denied")]: { roles: ["head"], scopes: [wireScope(allowed)] },
     [fingerprint("wrongscope")]: {
@@ -237,6 +278,41 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
   assert.equal(answer.data.authority, "WITNESS_SYNC_HISTORICAL_ADMISSION_V1");
   assert.notEqual((await post("historical", data)).status, 200,
     "an exact client nonce and operation replay cannot mint a second historical admission");
+  const recoverRoute = "/v1/cas-anchor/historical-recover";
+  const freshRecovery = { ...data, nonce: random(32).toString("base64url") };
+  assert.equal((await post("denied", freshRecovery, recoverRoute)).status, 403);
+  assert.equal((await post("wrongscope", freshRecovery, recoverRoute)).status, 403);
+  assert.equal((await post("historical", freshRecovery, recoverRoute, "GET")).status, 404);
+  const recovered = await post("recovery", freshRecovery, recoverRoute);
+  assert.equal(recovered.status, 200,
+    "separate authenticated mTLS route retrieves original signed admission");
+  assert.equal(recovered.data.freshFloor.nonce, freshRecovery.nonce);
+  assert.deepEqual(recovered.data.admission, answer.data.admission,
+    "recovery must not re-sign or alter persisted receipt");
+  assert.equal(recoveryCalls, 1, "wrong peer/scope never reaches recovery authority");
+  assert.notEqual((await post("recovery", freshRecovery, recoverRoute)).status, 200,
+    "replayed challenge cannot recover twice");
+  // Exercise the ACTUAL consumer transport adapter, rather than only a
+  // hand-built HTTPS POST. Its independent inventory source and signer pin
+  // must remain immutable while switching to the recovery route.
+  const provider = createSyncV2HistoricalEvidenceProvider({
+    endpoint: `https://127.0.0.1:${server.address().port}`,
+    ca: read("ca.pem"), clientKey: read("recovery.key"),
+    clientCert: read("recovery.pem"),
+    serverFingerprint256: fingerprint("server"),
+    pinnedInventoryPublicKey: inventorySigner.publicKey,
+    pinnedInventorySignerKeyId: inventorySignerId,
+    trustedInventoryEvidenceProvider: async () => ({
+      scope: allowed, expectedSequence: 0, expectedRoot,
+      receipt: inventoryReceipt,
+    }),
+  });
+  const providerChallenge = random(32);
+  const recoveredByClient = await provider(syncEnvelope, {
+    nonce: providerChallenge, recovery: true,
+  });
+  assert.deepEqual(recoveredByClient.admission, answer.data.admission);
+  assert.equal(recoveredByClient.freshFloor.nonce, providerChallenge.toString("base64url"));
   // This issuer is a crypto fixture, not a replacement for W2's durable
   // SQLite authority. The published consumer itself validates both signatures
   // and an independently challenged signed PG physical readback here.
@@ -278,6 +354,13 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
   await assert.rejects(verify({ nonce: random(32) }),
     /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
   "tampered challenge cannot replay physical signed admission evidence");
+  const verifiedRecovery = await verify({
+    nonce: providerChallenge, admission: recoveredByClient.admission,
+    freshFloor: recoveredByClient.freshFloor,
+    physicalAttestation: recoveredByClient.physicalAttestation,
+  });
+  assert.equal(verifiedRecovery.authorizesHistoricalRead, true,
+    "real Sync transport + exact pinned verifier accept recovered receipt and NEW challenge");
 });
 
 test("historical mTLS admission limits per principal/global concurrent JSON buffering and request rate", async (t) => {
@@ -296,6 +379,7 @@ test("historical mTLS admission limits per principal/global concurrent JSON buff
   const unusable = async () => { throw Error("UNUSED"); };
   const floor = { requiresPhysicalAttestation: true, supportsClientHistoricalNonce: true,
     advance: unusable, freshHeadAsync: unusable,
+    recoverSyncHistoricalAdmission: unusable,
     async issueSyncHistoricalAdmission() {
       issued += 1;
       await blocked;

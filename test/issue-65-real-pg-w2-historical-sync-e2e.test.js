@@ -16,6 +16,8 @@ const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
+const { createSyncV2HistoricalEvidenceProvider } =
+  require("../sync-client/rootark-sync-v2-historical-evidence-provider");
 const { physicalWriteRequest,
   verifySyncV2HistoricalWitnessAdmission } =
   require("../sync-client/rootark-sync-zk1-physical-binding");
@@ -88,16 +90,25 @@ function startChild(cleanups, file, config, configFile) {
   });
 }
 
-function postHistorical(port, read, who, body) {
+function postHistorical(port, read, who, body, {
+  route = "/v1/cas-anchor/historical-admit", dropAck = false,
+} = {}) {
   return new Promise((resolve, reject) => {
     const payload = Buffer.from(JSON.stringify(body));
     const request = https.request({
       hostname: "127.0.0.1", servername: "localhost", port,
       minVersion: "TLSv1.3", rejectUnauthorized: true, method: "POST",
-      path: "/v1/cas-anchor/historical-admit",
+      path: route,
       ca: read("ca.pem"), cert: read(who + ".pem"), key: read(who + ".key"),
       headers: { "content-type": "application/json", "content-length": payload.length },
     }, (response) => {
+      if (dropAck) {
+        // Headers arrive only AFTER the SQLite FULL commit. Simulate a lost
+        // response body without giving the application its signed receipt.
+        response.destroy();
+        resolve({ status: "DROPPED" });
+        return;
+      }
       const parts = [];
       response.on("data", (chunk) => parts.push(chunk));
       response.on("end", () => resolve({ status: response.statusCode,
@@ -390,9 +401,34 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
   assert.notEqual(rejected.status, 200, "real W2 must reject a physically absent ciphertext");
   assert.equal(witness.historicalAdmissionHead().sequence, 0,
     "failed PG challenge cannot create a durable SQLite historical admission");
-  const accepted = await postHistorical(port, read, "historical", body(envelope, challenge));
-  assert.equal(accepted.status, 200,
-    "historical mTLS endpoint must use the real SQLite W2 issuer after PG readback");
+  const lost = await postHistorical(port, read, "historical", body(envelope, challenge),
+    { dropAck: true });
+  assert.equal(lost.status, "DROPPED", "client never receives the signed receipt body");
+  assert.equal(witness.historicalAdmissionHead().sequence, 1,
+    "witness persisted original admission before HTTPS response was lost");
+  const recoveryChallenge = random(32);
+  const clientProvider = createSyncV2HistoricalEvidenceProvider({
+    endpoint: `https://127.0.0.1:${port}`,
+    ca: read("ca.pem"), clientKey: read("historical.key"),
+    clientCert: read("historical.pem"),
+    serverFingerprint256: fingerprint(read("witness.pem")),
+    trustedInventoryEvidenceProvider: async () => ({
+      scope, expectedSequence: minimumHead.sequence,
+      expectedRoot: minimumHead.root, receipt: committed.proof,
+    }),
+    pinnedInventoryPublicKey: inventoryKeys.publicKey,
+    pinnedInventorySignerKeyId: inventoryKeyId,
+  });
+  const recoveredClientProof = await clientProvider(envelope, {
+    nonce: recoveryChallenge, recovery: true,
+  });
+  const accepted = { body: {
+    admission: recoveredClientProof.admission,
+    freshFloor: recoveredClientProof.freshFloor,
+    physicalAttestation: recoveredClientProof.physicalAttestation.toString("base64url"),
+  } };
+  assert.equal(accepted.body.freshFloor.nonce, b64(recoveryChallenge),
+    "real Sync client adapter re-proves FULL durable original with new PG challenge");
   assert.equal(witness.historicalAdmissionHead().sequence, 1);
   assert.deepEqual(witness.historicalAdmissionForOperation(
     physical.operation.operation_id).admission, accepted.body.admission,
@@ -412,7 +448,7 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
     pinnedWitnessPublicKey: witnessKeys.publicKey,
     witnessKeyId, statusKeyId, trustedMinimumFloor, ...extra,
   });
-  const verified = await strict(challenge);
+  const verified = await strict(recoveryChallenge);
   assert.equal(verified.authorizesHistoricalRead, true);
   assert.equal(verified.localPgReadbackVerified, true);
   assert.equal(verified.externalDurabilityProven, false);
@@ -425,6 +461,8 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
   "current independent revocation must reject otherwise valid PG18 historical proofs");
   await assert.rejects(strict(random(32)), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
     "another nonce cannot reuse the true PG18 attestation or signed W2 floor");
+  await assert.rejects(strict(challenge), /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
+    "lost original challenge cannot reuse recovered signed physical proof");
   const replay = await postHistorical(port, read, "historical", body(envelope, challenge));
   assert.notEqual(replay.status, 200, "durable SQLite issuer must deny duplicate operation");
   assert.equal(witness.historicalAdmissionHead().sequence, 1);
