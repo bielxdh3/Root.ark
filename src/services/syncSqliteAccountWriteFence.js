@@ -99,16 +99,19 @@ function createSyncSqliteAccountWriteFence() {
     });
   }
   const dbPath = getDatabasePath();
-  // Validate a separate private, crash-durable audit journal before accepting
-  // strict requests. Without it, access-denial auditing would block SQLite
-  // during the cross-process authorization reservation.
+  // Observe the authoritative durable enrollment marker FIRST. On restart a
+  // missing sidecar must never be recreated before the process knows it is
+  // already in strict mode: a previous process may have acknowledged audit
+  // records held only in the now-disconnected WAL/FULL journal.
+  const main = getDb();
+  // Only a genuinely unmarked main SQLite may initialize the audit journal.
+  // Once marked, preparePendingAuditJournal fails closed on a missing path.
   const audit = require("../../repositories/auditRepository");
   audit.preparePendingAuditJournal();
   audit.ensurePendingAuditDatabase();
   // Register the mode exactly once in the authoritative main SQLite DB. A
   // second process never consults an optional sidecar for legacy-vs-strict.
   // WAL/FULL is already required; fail startup closed on any marker mismatch.
-  const main = getDb();
   main.transaction(() => {
     main.exec("CREATE TABLE IF NOT EXISTS rootark_strict_sync_audit_mode (id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT NOT NULL CHECK(mode='append_only'))");
     const rows = main.prepare("SELECT id,mode FROM rootark_strict_sync_audit_mode").all();

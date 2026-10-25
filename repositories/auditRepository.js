@@ -22,6 +22,16 @@ function auditJournalPath() {
 
 function preparePendingAuditJournal() {
   const filename = auditJournalPath();
+  // This check MUST precede preparedJournals caching, mkdir and Windows ACL
+  // creator. The strict marker is read from the main SQLite on bootstrap;
+  // its presence makes a missing sidecar a potential irreversible audit loss,
+  // never an invitation to construct a fresh empty authority.
+  if (isStrictSyncModeObserved()
+    && (!fs.existsSync(path.dirname(filename)) || !fs.existsSync(filename))) {
+    throw Object.assign(new Error("Previously enrolled strict audit journal missing"), {
+      code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+    });
+  }
   if (preparedJournals.has(filename)) return filename;
   const dir = path.dirname(filename);
   // Initial setup runs at strict Sync route registration, BEFORE requests.

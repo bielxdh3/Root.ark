@@ -492,6 +492,67 @@ test("strict marker bounds an independent Node process's SQLite busy wait while 
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM analytics_events").get().n, 0);
 });
 
+test("strict restart in a second process rejects vanished pending audit journal without recreating it", async (t) => {
+  const ctx = await fixture(t);
+  const pending = { id: crypto.randomUUID(), timestamp: new Date().toISOString(),
+    eventType: "file.access.denied", action: "denied", result: "failure",
+    actor: { username: "auditor" } };
+  auditRepository.deferAuditLog(pending);
+  const sidecarDir = process.env.DATABASE_URL + ".audit-private";
+  const sidecarDb = path.join(sidecarDir, "pending.sqlite");
+  assert.equal(fs.existsSync(sidecarDb), true);
+  const moved = path.join(ctx.dir, "audit-sidecar-disconnected");
+  fs.renameSync(sidecarDir, moved);
+  assert.equal(fs.existsSync(sidecarDir), false);
+
+  // This is a NEW Node process with an empty in-memory enrollment flag.
+  // Before the fix, it silently CREATED a new empty sidecar and accepted
+  // strict Sync even though the acknowledged pending audit event was missing.
+  const restart = `const f=require(process.argv[1]);let accepted=false,code=null;
+try{f.createSyncSqliteAccountWriteFence();accepted=true;}
+catch(error){code=error.code||error.message;}
+process.stdout.write(JSON.stringify({accepted,code}));`;
+  const { stdout } = await execFileAsync(process.execPath, ["-e", restart,
+    require.resolve("../src/services/syncSqliteAccountWriteFence")],
+  { timeout: 15000, env: { ...process.env, NODE_PATH: process.env.NODE_PATH } });
+  const outcome = JSON.parse(stdout);
+  assert.equal(outcome.accepted, false, "a new process must not accept strict Sync when its existing audit journal vanished");
+  assert.equal(outcome.code, "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE");
+  assert.equal(fs.existsSync(sidecarDir), false,
+    "strict restart must not create any replacement sidecar directory");
+  assert.equal(getDb().prepare("SELECT mode FROM rootark_strict_sync_audit_mode WHERE id=1").get().mode,
+    "append_only", "the main durable marker stays enrolled");
+  const Database = require("better-sqlite3");
+  const archive = new Database(path.join(moved, "pending.sqlite"), { fileMustExist: true, readonly: true });
+  try {
+    assert.equal(archive.prepare("SELECT COUNT(*) AS n FROM pending_audit WHERE id=?").get(pending.id).n, 1,
+      "the original acknowledged audit event must survive in the disconnected journal");
+  } finally { archive.close(); }
+  // A second form of removal (only pending.sqlite, original directory still
+  // present) must fail identically and leave no replacement DB.
+  fs.renameSync(moved, sidecarDir);
+  const orphan = path.join(ctx.dir, "original-pending-disconnected.sqlite");
+  fs.renameSync(sidecarDb, orphan);
+  const { stdout: secondOutput } = await execFileAsync(process.execPath, ["-e", restart,
+    require.resolve("../src/services/syncSqliteAccountWriteFence")],
+  { timeout: 15000, env: { ...process.env, NODE_PATH: process.env.NODE_PATH } });
+  const second = JSON.parse(secondOutput);
+  assert.equal(second.accepted, false, "missing pending.sqlite must not be replaced on restart");
+  assert.equal(second.code, "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE");
+  assert.equal(fs.existsSync(sidecarDb), false);
+  // Restore the ORIGINAL acknowledged journal. A genuine restart must then
+  // succeed, and the staged audit event must be visible exactly once.
+  fs.renameSync(orphan, sidecarDb);
+  const validRestart = `const f=require(process.argv[1]);const audit=require(process.argv[2]);
+f.createSyncSqliteAccountWriteFence();
+process.stdout.write(JSON.stringify(audit.loadAuditLogs().logs.filter(x=>x.id===process.argv[3]).length));`;
+  const { stdout: recovered } = await execFileAsync(process.execPath, ["-e", validRestart,
+    require.resolve("../src/services/syncSqliteAccountWriteFence"),
+    require.resolve("../repositories/auditRepository"), pending.id],
+  { timeout: 15000, env: { ...process.env, NODE_PATH: process.env.NODE_PATH } });
+  assert.equal(JSON.parse(recovered), 1, "recovering original FULL journal must restore pending audit exactly once");
+});
+
 test("busy sidecar cleanup after main commit remains retryable without failing a committed audit event", async (t) => {
   await fixture(t);
   const event = { id: crypto.randomUUID(), timestamp: new Date().toISOString(),
@@ -570,12 +631,15 @@ test("strict audit sidecar rejects an existing Windows directory with an untrust
   const root = isolatedDirectory();
   const oldPath = process.env.DATABASE_URL;
   t.after(() => {
+    closeDb();
     if (oldPath === undefined) delete process.env.DATABASE_URL;
     else process.env.DATABASE_URL = oldPath;
     fs.rmSync(root, { recursive: true, force: true });
   });
+  closeDb();
   const dbPath = path.join(root, "untrusted-accounts.sqlite");
   process.env.DATABASE_URL = dbPath;
+  getDb(); // No strict marker exists in this unrelated disposable database.
   const unsafeDir = dbPath + ".audit-private";
   fs.mkdirSync(unsafeDir);
   await execFileAsync("icacls.exe", [unsafeDir, "/grant", "*S-1-5-32-545:(OI)(CI)M"]);
@@ -586,7 +650,9 @@ test("strict audit sidecar rejects an existing Windows directory with an untrust
   // A directory can be restricted while an existing SQLite WAL/SHM or DB
   // file carries an unsafe explicit ACE. Verify its descendants as well.
   const nextDb = path.join(root, "unsafe-wal.sqlite");
+  closeDb();
   process.env.DATABASE_URL = nextDb;
+  getDb(); // Ensure process-local marker state follows this separate authority.
   const safeDir = nextDb + ".audit-private";
   ensureWindowsChunkUploadRoot(safeDir);
   const unsafeWal = path.join(safeDir, "pending.sqlite-wal");
