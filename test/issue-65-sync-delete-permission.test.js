@@ -13,6 +13,9 @@ const { registerSyncRoutes } = require("../src/routes/sync");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
+const { runMigrations } = require("../db/migrations");
+const { getDb, closeDb } = require("../db");
+const usersRepository = require("../repositories/usersRepository");
 
 function send(port, method, route, operation) {
   return new Promise((resolve, reject) => {
@@ -36,12 +39,29 @@ test("upload-only account cannot delete sync ciphertext through POST, PUT or DEL
       + crypto.randomBytes(8).toString("hex"))
     : await fs.mkdtemp(path.join(os.tmpdir(), "rootark-sync-delete-permission-"));
   if (process.platform === "win32") ensureWindowsChunkUploadRoot(directory);
-  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const originalSqliteEnv = {
+    DB_ENABLED: process.env.DB_ENABLED,
+    DATABASE_URL: process.env.DATABASE_URL,
+    DB_WRITE_LEGACY_JSON: process.env.DB_WRITE_LEGACY_JSON,
+  };
+  process.env.DB_ENABLED = "true";
+  process.env.DB_WRITE_LEGACY_JSON = "false";
+  process.env.DATABASE_URL = path.join(directory, "accounts.sqlite");
+  t.after(async () => {
+    closeDb();
+    for (const [key, value] of Object.entries(originalSqliteEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+  runMigrations({ backup: false });
   const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
   const publicSpki = publicKey.export({ type: "spki", format: "der" }).toString("base64url");
   const fileKey = crypto.randomBytes(32);
-  const account = { username: "alice", permissions: {
-    upload: true, delete: false, listFiles: true } };
+  const account = { username: "alice", role: "user", sessionVersion: 1,
+    permissions: { upload: true, delete: false, listFiles: true } };
+  usersRepository.saveUsers([{ ...account, password: "fixture-only" }]);
   const app = express();
   app.use(express.json());
   const route = registerSyncRoutes({ app,
@@ -88,6 +108,10 @@ test("upload-only account cannot delete sync ciphertext through POST, PUT or DEL
   }
 
   account.permissions.delete = true;
+  // Permission approval now has to advance the independently durable SQLite
+  // account authority; changing only req.user cannot bypass the live fence.
+  getDb().prepare("UPDATE users SET permissions_json=?,storage_revision=storage_revision+1 WHERE username=?")
+    .run(JSON.stringify(account.permissions), account.username);
   assert.equal(await send(port, "POST", "/sync/v1/objects", deletion), 201,
     "a permitted signed device may still delete its own synced object");
   assert.equal(route.store.list("alice", "object-one")[0].tombstone, true);
