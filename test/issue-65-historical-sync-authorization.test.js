@@ -27,19 +27,18 @@ test("expired historical device proof remains readable but cannot authorize a ne
     deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
     revision: { counter: 1, deviceId: "device-a" }, metadata: { path: "historical.txt" },
     plaintext: Buffer.from("ciphertext-only"), fileKey: crypto.randomBytes(32) });
-  operation.authorization = await createAuthorizationProof(operation, {
-    // Strict Windows ACL/bootstrap verification can outlast a 5-second test
-    // proof. Exercise actual expiry with the explicit clock advance below,
-    // not with incidental fixture setup latency.
-    username: "alice", privateKey: keys.privateKey, publicKey, expiresAt: Date.now() + 120_000,
-  });
-  assert.equal(validateOperation(operation).operationId, operation.operationId);
   // Signed records require an owner-controlled atomic device registry even
   // in a historical-read fixture. Enroll before the original write, never
   // allow a legacy unsigned store to bypass revocation fencing.
   const store = await new SyncObjectStore(file, { atomicDeviceRegistry: true }).open();
   await store.enrollDevice({ username: "alice", deviceId: "device-a", publicKey,
     expectedEpoch: 0 });
+  // Sign only after slow Windows native ACL/registry initialization. Preserve
+  // the original short expiry window rather than extending authorization.
+  operation.authorization = await createAuthorizationProof(operation, {
+    username: "alice", privateKey: keys.privateKey, publicKey, expiresAt: Date.now() + 5000,
+  });
+  assert.equal(validateOperation(operation).operationId, operation.operationId);
   assert.equal((await store.put("alice", operation)).kind, "stored");
   const now = Date.now;
   try {
