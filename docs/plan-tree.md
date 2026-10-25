@@ -1,5 +1,43 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: opt-in browser restore of signed persisted ciphertext chunks (2026-10-25)
+
+The development-only `/zk1-protected-file-lab.html` now offers a separate,
+explicit **local ciphertext-chunk recovery** option. Without that checkbox,
+the existing signed protected HTTP GET path remains unchanged. With it, the
+owner imports the portable encrypted bundle, separate ciphertext-root pin,
+signed owner-root/history, signed persisted-chunk inventory and every opaque
+chunk file from their **local device**. Owner Ed25519 raw key, independent
+raw/SPKI SHA-256 fingerprints and current revision/digest/epoch come only from
+the manually provided off-server inputs, never from a Root.ark endpoint or
+the self-attesting archive. Missing trust material displays an explicit refusal
+before ciphertext reads. A separately and explicitly provisioned IndexedDB
+owner floor, active owner-signed device grant, signed history and root are
+checked before accessing chunks. The `rootark-zk1-persisted-portable-chunk-recovery`
+module authenticates all chunk hashes/lengths, reassembled ciphertext root,
+and encrypted bundle before local HKDF/AES-GCM decryption; the browser rechecks
+the floor after the last asynchronous decryption and before downloading.
+A synchronous liveness callback returning a rejection value, rather than
+throwing, is also denied at the final plaintext-release fence: an adversarial
+late-revocation test failed before this fix and passed afterward.
+
+The disposable local SQLite integration tests on Node 24/22 cover missing
+pins, fork, wrong key, revocation, rollback/mismatched head and missing chunk
+without using a legacy or production restore route. A real headless Edge
+test verifies the **actual UI** refuses missing external pins, accepts correctly
+signed local chunks, and denies a revised pinned head without a second file
+download. Its test server does not expose a protected ciphertext GET endpoint.
+The focused local matrix (including the existing portable recovery crypto
+regressions) completed **17 PASS / 0 FAIL** each on Windows Node 24 and Node 22,
+including the actual Edge scenario on each runtime. The unrelated full legacy
+suite was not rerun in this isolated worktree, where optional dependencies
+for that broader suite are not installed.
+This does not verify pin *provenance*, defend against jointly rolled-back
+off-server pins and browser IndexedDB, provide external witness/CAS freshness,
+live server revocation, external provider durability or recovery of an entire
+account. The experimental option cannot authorize production restore; PR #228
+remains DRAFT / NO-GO.
+
 ## Issue #65 / PR #228: remote CAS witness-enrollment preflight (2026-10-25)
 
 The opt-in standalone CAS status service now refuses an RFC1918/private-interface

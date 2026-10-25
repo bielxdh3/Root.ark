@@ -16,6 +16,7 @@
   <script defer src="/client/rootark-zk1-normal-browser-trust-floor.js"></script>
   <script defer src="/client/rootark-zk1-normal-browser-content.js"></script>
   <script defer src="/client/rootark-zk1-portable-file-recovery.js"></script>
+  <script defer src="/client/rootark-zk1-persisted-portable-chunk-recovery.js"></script>
   <script defer src="/client/rootark-zk1-browser-recovery-http.js"></script>
   <script defer src="/client/rootark-zk1-normal-browser-lab-ui.js"></script>
   <script defer src="/client/rootark-zk1-portable-recovery-lab-ui.js"></script>
@@ -83,6 +84,18 @@
       <label for="portable-root">Raiz do ciphertext conferida fora do pacote, base64url</label>
       <input id="portable-root" type="text" maxlength="43" autocomplete="off" spellcheck="false">
       <button id="portable-restore" type="button">Recuperar por GET protegido e baixar arquivo</button>
+      <label for="portable-offline-opt-in"><input id="portable-offline-opt-in" type="checkbox">
+      Recuperar localmente dos chunks cifrados que selecionei (opt-in; sem GET do servidor)</label>
+      <label for="portable-chunk-inventory">Inventário Ed25519 dos chunks (.json, assinado pelo proprietário)</label>
+      <input id="portable-chunk-inventory" type="file" accept=".json,application/json">
+      <label for="portable-chunks">Chunks cifrados locais em ordem de índice 0, 1, ... (selecione todos, múltiplos arquivos)</label>
+      <input id="portable-chunks" type="file" multiple accept=".bin,application/octet-stream">
+      <p class="notice">No modo local, o navegador exige TODOS os pins externos da seção 1,
+      o checkpoint histórico e a raiz assinada pelo proprietário, além do piso local já
+      provisionado. Se faltar qualquer âncora externa, a recuperação é recusada. Nenhuma
+      informação fornecida pelo servidor substitui esses pins. A ordem dos chunks
+      selecionados deve corresponder exatamente ao inventário assinado. A verificação
+      local não comprova atualidade de witness/CAS remoto nem durabilidade externa.</p>
       <p class="notice">Guarde a raiz separada do pacote. Ela deve ser conferida
       por um checkpoint Ed25519 assinado pelo proprietário e por um canal
       independente antes de restaurar. A recuperação exige também o checkpoint

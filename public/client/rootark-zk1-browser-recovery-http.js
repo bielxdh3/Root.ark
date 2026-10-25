@@ -5,15 +5,17 @@
       require("./rootark-zk1-normal-browser-trust-floor"),
       require("./rootark-zk1-portable-file-recovery"),
       require("./rootark-zk1-protected-http-client"),
-      require("./rootark-zk1-owner-ciphertext-root-checkpoint"));
+      require("./rootark-zk1-owner-ciphertext-root-checkpoint"),
+      require("./rootark-zk1-persisted-portable-chunk-recovery"));
   } else {
     root.RootarkZk1BrowserRecoveryHttp = factory(root.crypto,
       root.RootarkZk1NormalBrowserContent, root.RootarkZk1NormalBrowserTrustFloor,
       root.RootarkZk1PortableFileRecovery, root.RootarkZk1ProtectedHttpClient,
-      root.RootarkZk1OwnerCiphertextRootCheckpoint);
+      root.RootarkZk1OwnerCiphertextRootCheckpoint,
+      root.RootarkZk1PersistedPortableChunkRecovery);
   }
 }(typeof globalThis === "object" ? globalThis : this,
-  function (webCrypto, normal, floor, portable, http, ownerRoots) {
+  function (webCrypto, normal, floor, portable, http, ownerRoots, persisted) {
     "use strict";
 
     // A development-only normal HTTP GET followed by CLIENT-SIDE recovery
@@ -223,5 +225,104 @@
         deny();
       }
     }
-    return Object.freeze({ recoverFromProtectedGet, recoverFromOwnerSignedProtectedGet });
+    // Separate explicitly opt-in OFFLINE flow. Nothing is fetched from the
+    // Root.ark server: trusted fingerprints/head/root MUST be supplied from
+    // independently retained owner evidence and the persisted chunks from a
+    // user-selected local source. Never fall back to bundle/server pin fields.
+    const offlineFields = ["ownerPublicKey", "pinnedOwnerKeyHash",
+      "independentOwnerSpkiSha256", "pinnedCurrentHead", "signedDeviceGrant",
+      "devicePublicKey", "devicePrivateKey", "ownerHistoryCheckpoint",
+      "previousOwnerHistoryProof", "ownerSignerKeyId", "ownerDeviceId",
+      "ownerRootCheckpoint", "recoverySecret", "bundle", "expectedMetadata",
+      "independentlyPinnedCiphertextRoot", "signedInventory", "readChunk", "assertLive"];
+    async function recoverFromOwnerSignedPersistedChunks(input) {
+      let opened;
+      try {
+        if (!input || !input.ownerPublicKey || !input.pinnedOwnerKeyHash
+          || !input.independentOwnerSpkiSha256 || !input.pinnedCurrentHead?.digest
+          || !input.independentlyPinnedCiphertextRoot || !input.ownerHistoryCheckpoint
+          || !input.ownerRootCheckpoint || !input.signedInventory
+          || typeof input.readChunk !== "function"
+          || typeof input.assertLive !== "function") {
+          throw new Error("ZK_BROWSER_RECOVERY_EXTERNAL_TRUST_REQUIRED");
+        }
+        exact(input, offlineFields);
+        exact(input.expectedMetadata, metaFields);
+        const metadata = { ...input.expectedMetadata };
+        const grant = input.signedDeviceGrant;
+        if (!grant || scopes.some((name) => metadata[name] !== grant[name])
+          || metadata.kind !== "file" || metadata.epoch !== input.pinnedCurrentHead.epoch
+          || !persisted?.recoverPersistedPortableChunks
+          || !ownerRoots?.verifyOwnerCiphertextRootCheckpoint) deny();
+        if (input.assertLive() !== undefined) deny();
+        const anchor = {
+          ownerPublicKey: input.ownerPublicKey,
+          independentOwnerSpkiSha256: input.independentOwnerSpkiSha256,
+          pinnedCurrentHead: input.pinnedCurrentHead,
+          signedDeviceGrant: grant,
+          ownerHistoryCheckpoint: input.ownerHistoryCheckpoint,
+          previousOwnerHistoryProof: input.previousOwnerHistoryProof,
+        };
+        const grantProof = await normal.verifyOwnerGrant({
+          ownerPublicKey: input.ownerPublicKey,
+          pinnedOwnerKeyHash: input.pinnedOwnerKeyHash,
+          pinnedCurrentHead: input.pinnedCurrentHead,
+          signedDeviceGrant: grant,
+          devicePublicKey: input.devicePublicKey,
+          devicePrivateKey: input.devicePrivateKey,
+        });
+        if (grantProof.ownerGrantSignatureVerified !== true) deny();
+        await floor.verifyExternalAnchor(anchor);
+        if (typeof window === "object") await floor.assertCurrent(anchor);
+        const signedRoot = await ownerRoots.verifyOwnerCiphertextRootCheckpoint({
+          checkpoint: input.ownerRootCheckpoint,
+          ownerHistoryCheckpoint: input.ownerHistoryCheckpoint,
+          previousHistoryProof: input.previousOwnerHistoryProof,
+          pinnedOwner: {
+            scope: Object.fromEntries(scopes.map((name) => [name, metadata[name]])),
+            deviceId: input.ownerDeviceId,
+            signerKeyId: from64(input.ownerSignerKeyId, 16),
+            publicKey: input.ownerPublicKey,
+          },
+          expected: {
+            manifestRevision: input.pinnedCurrentHead.revision,
+            manifestDigest: input.pinnedCurrentHead.digest,
+            manifestEpoch: input.pinnedCurrentHead.epoch,
+            objectId: metadata.object_id,
+            objectRevision: input.bundle?.objectRevision,
+            ciphertextEpoch: metadata.epoch,
+            ciphertextRoot: input.independentlyPinnedCiphertextRoot,
+          },
+        });
+        if (signedRoot.trustedOwnerSignatureVerified !== true
+          || signedRoot.manifestCheckpointVerified !== true
+          || signedRoot.authorizesRecovery !== false) deny();
+        if (input.assertLive() !== undefined) deny();
+        opened = await persisted.recoverPersistedPortableChunks({
+          bundle: input.bundle, signedInventory: input.signedInventory,
+          ownerPublicKey: input.ownerPublicKey,
+          independentOwnerSpkiSha256: input.independentOwnerSpkiSha256,
+          expectedOwnerHead: input.pinnedCurrentHead,
+          expectedMetadata: metadata,
+          independentlyPinnedCiphertextRoot: input.independentlyPinnedCiphertextRoot,
+          recoverySecret: input.recoverySecret,
+          readChunk: input.readChunk, assertLive: input.assertLive,
+        });
+        // No plaintext release until the local floor has been re-read after
+        // the last asynchronous ciphertext/crypto operation.
+        if (typeof window === "object") await floor.assertCurrent(anchor);
+        if (input.assertLive() !== undefined) deny();
+        return Object.freeze({ ...opened, ownerSignedHistoricalRootVerified: true,
+          localPersistedChunksVerified: true,
+          onlineWitnessFreshnessVerified: false,
+          independentRemoteDurabilityProven: false,
+          authorizesProductionRestore: false });
+      } catch (error) {
+        opened?.data?.fill(0);
+        if (error?.message === "ZK_BROWSER_RECOVERY_EXTERNAL_TRUST_REQUIRED") throw error;
+        deny();
+      }
+    }
+    return Object.freeze({ recoverFromProtectedGet, recoverFromOwnerSignedProtectedGet,
+      recoverFromOwnerSignedPersistedChunks });
   }));

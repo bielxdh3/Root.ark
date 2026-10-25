@@ -42,6 +42,7 @@ const scriptNames = ["rootark-zk1-file-content", "rootark-zk1-ciphertext-chunk-r
   "rootark-zk1-owner-ciphertext-root-checkpoint", "rootark-zk1-protected-http-client",
   "rootark-zk1-uncertain-put-reconciliation", "rootark-zk1-normal-browser-trust-floor",
   "rootark-zk1-normal-browser-content", "rootark-zk1-portable-file-recovery",
+  "rootark-zk1-persisted-portable-chunk-recovery",
   "rootark-zk1-browser-recovery-http", "rootark-zk1-recoverable-pending-journal",
   "rootark-zk1-recoverable-workspace",
   "rootark-zk1-normal-browser-lab-ui", "rootark-zk1-portable-recovery-lab-ui",

@@ -10,6 +10,8 @@
   const re64 = /^[A-Za-z0-9_-]{43}$/;
   const text = new TextDecoder("utf-8", { fatal: true });
   const maxFile = 2 * 1024 * 1024;
+  let pageEpoch = 0;
+  root.addEventListener("pagehide", () => { pageEpoch++; });
   function deny() { throw new Error("PORTABLE_RECOVERY_INPUT_INVALID"); }
   function decode64(value) {
     if (typeof value !== "string" || !re64.test(value)) deny();
@@ -155,13 +157,17 @@
   }
   function cleanupInputs() {
     for (const id of ["portable-secret", "device-private", "file", "portable-bundle",
-      "portable-owner-root"])
+      "portable-owner-root", "portable-chunk-inventory", "portable-chunks"])
       find(id).value = "";
   }
   async function withBusy(action) {
     for (const item of [generate, publish, restore]) item.disabled = true;
     try { await action(); }
-    catch (_) { status.textContent = "Operação portátil recusada: autoridade, arquivo, rede ou chave inválida."; }
+    catch (error) {
+      status.textContent = error?.message === "ZK_BROWSER_RECOVERY_EXTERNAL_TRUST_REQUIRED"
+        ? "Recuperação local recusada: faltam pins externos independentes, histórico assinado ou inventário/chunks locais. Não confie em pins do servidor."
+        : "Operação portátil recusada: autoridade, arquivo, rede ou chave inválida.";
+    }
     finally {
       cleanupInputs();
       for (const item of [generate, publish, restore]) item.disabled = false;
@@ -228,6 +234,20 @@
   restore.addEventListener("click", () => withBusy(async () => {
     let secret, opened;
     try {
+      const offline = find("portable-offline-opt-in")?.checked === true;
+      if (offline && (!find("owner-key")?.files?.length
+        || !find("owner-spki-hash")?.value.trim()
+        || !find("owner-hash")?.value.trim()
+        || !find("head-digest")?.value.trim()
+        || !find("head-revision")?.value.trim()
+        || !find("head-epoch")?.value.trim()
+        || !find("portable-root")?.value.trim()
+        || !find("owner-history")?.files?.length
+        || !find("portable-owner-root")?.files?.length
+        || !find("portable-chunk-inventory")?.files?.length
+        || !find("portable-chunks")?.files?.length)) {
+        throw new Error("ZK_BROWSER_RECOVERY_EXTERNAL_TRUST_REQUIRED");
+      }
       const ctx = await context();
       secret = await fileBytes("portable-secret", 32, 32);
       const bundle = JSON.parse(text.decode(
@@ -238,16 +258,59 @@
       // The root is supplied separately. Do not fill it from bundle contents.
       const independentlyPinnedCiphertextRoot =
         decode64(find("portable-root").value.trim());
-      opened = await root.RootarkZk1BrowserRecoveryHttp.recoverFromOwnerSignedProtectedGet({
-        ...ctx, recoverySecret: secret, bundle,
-        expectedMetadata: bundle.metadata, independentlyPinnedCiphertextRoot,
-        ownerRootCheckpoint,
-        ownerSignerKeyId: ownerRootCheckpoint.signer_key_id,
-        ownerDeviceId: ownerRootCheckpoint.device_id,
-        previousOwnerHistoryProof: ctx.previousOwnerHistoryProof,
-      });
+      if (offline) {
+        const inventory = JSON.parse(text.decode(
+          await fileBytes("portable-chunk-inventory", 2, 16384)));
+        const chunks = Array.from(find("portable-chunks").files || []);
+        if (!root.RootarkZk1PersistedPortableChunkRecovery
+          || !Array.isArray(inventory.chunkLengths)
+          || inventory.chunkLengths.length < 1 || inventory.chunkLengths.length > 16
+          || chunks.length !== inventory.chunkLengths.length) deny();
+        const started = pageEpoch;
+        const assertLive = () => {
+          if (started !== pageEpoch || !root.isSecureContext) deny();
+        };
+        await beforeNetwork(ctx, bundle.metadata);
+        opened = await root.RootarkZk1BrowserRecoveryHttp.recoverFromOwnerSignedPersistedChunks({
+          ownerPublicKey: ctx.ownerPublicKey,
+          pinnedOwnerKeyHash: ctx.pinnedOwnerKeyHash,
+          independentOwnerSpkiSha256: ctx.independentOwnerSpkiSha256,
+          pinnedCurrentHead: ctx.pinnedCurrentHead,
+          signedDeviceGrant: ctx.signedDeviceGrant,
+          devicePublicKey: ctx.devicePublicKey,
+          devicePrivateKey: ctx.devicePrivateKey,
+          ownerHistoryCheckpoint: ctx.ownerHistoryCheckpoint,
+          previousOwnerHistoryProof: ctx.previousOwnerHistoryProof,
+          recoverySecret: secret, bundle,
+          expectedMetadata: bundle.metadata, independentlyPinnedCiphertextRoot,
+          ownerRootCheckpoint,
+          ownerSignerKeyId: ownerRootCheckpoint.signer_key_id,
+          ownerDeviceId: ownerRootCheckpoint.device_id,
+          signedInventory: inventory,
+          readChunk: async ({ index }) => {
+            assertLive();
+            if (!Number.isSafeInteger(index) || index < 0 || index >= chunks.length
+              || chunks[index].size !== inventory.chunkLengths[index]
+              || chunks[index].size > 1024 * 1024) deny();
+            return new Uint8Array(await chunks[index].arrayBuffer());
+          },
+          assertLive,
+        });
+      } else {
+        // Existing authenticated GET path is unchanged when opt-in is OFF.
+        opened = await root.RootarkZk1BrowserRecoveryHttp.recoverFromOwnerSignedProtectedGet({
+          ...ctx, recoverySecret: secret, bundle,
+          expectedMetadata: bundle.metadata, independentlyPinnedCiphertextRoot,
+          ownerRootCheckpoint,
+          ownerSignerKeyId: ownerRootCheckpoint.signer_key_id,
+          ownerDeviceId: ownerRootCheckpoint.device_id,
+          previousOwnerHistoryProof: ctx.previousOwnerHistoryProof,
+        });
+      }
       download(opened.name, opened.data, opened.mediaType || "application/octet-stream");
-      status.textContent = "GET protegido, assinatura da raiz do proprietário e abertura local concluídos. Nenhuma CEK foi enviada ao servidor.";
+      status.textContent = offline
+        ? "Recuperação local concluída: assinatura do proprietário e todos os chunks verificados; nenhuma requisição GET ao servidor. Sem prova de witness remoto/durabilidade."
+        : "GET protegido, assinatura da raiz do proprietário e abertura local concluídos. Nenhuma CEK foi enviada ao servidor.";
     } finally { secret?.fill(0); opened?.data?.fill(0); }
   }));
 }(typeof globalThis === "object" ? globalThis : this));
