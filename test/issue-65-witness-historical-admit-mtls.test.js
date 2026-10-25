@@ -72,6 +72,7 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
       Buffer.from(await z.encodeDeterministic(unsignedEntry))]), inventorySigner.privateKey) }));
   let called = 0, received;
   let corruptNonce = false, corruptFence = false;
+  let corruptProof = "";
   let alreadyIssued = false;
   const floor = {
     requiresPhysicalAttestation: true,
@@ -108,9 +109,26 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
         witnessSequence: head.sequence, witnessLastHash: head.lastHash,
         witnessPhysicalFenceDigest: corruptFence ? random(32).toString("hex")
           : head.physicalFenceDigest };
-      if (!corruptNonce && !corruptFence) alreadyIssued = true;
+      const readback = { status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
+        walFlushConfirmed: true, authorizesIo: false, provesIndependentOperator: false,
+        generation: 4, admissionId: random(16),
+        operationId: accepted.operation.operation_id, revision: accepted.operation.revision,
+        epoch: accepted.operation.epoch,
+        expectedInventorySequence: accepted.operation.expected_sequence,
+        expectedInventoryRoot: accepted.operation.expected_root,
+        ciphertextSha256: accepted.operation.ciphertext_sha256,
+        digest: random(32), root: random(32), chunkCount: 1 };
+      const attestation = await signCommittedPhysicalReadback({
+        scope: input.scope, operation: accepted.operation,
+        nonce: corruptProof === "wrong-nonce" ? random(32) : input.nonce,
+        readback, issuedAt: Math.floor(Date.now() / 1000) }, physicalSigner.privateKey);
+      if (!corruptNonce && !corruptFence && !corruptProof) alreadyIssued = true;
       return { freshFloor, admission: { ...admissionUnsigned,
-        signature: signed(witness.privateKey, HISTORICAL_DOMAIN, admissionUnsigned) } };
+        signature: signed(witness.privateKey, HISTORICAL_DOMAIN, admissionUnsigned) },
+      ...(corruptProof === "missing" ? {} : {
+        physicalAttestation: corruptProof === "malformed" ? "not-a-buffer"
+          : corruptProof === "oversize" ? Buffer.alloc(2049) : attestation,
+      }) };
     },
   };
   const none = async () => { throw Error("WRONG_LEDGER_ROLE"); };
@@ -188,8 +206,24 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
   assert.notEqual((await post("historical", data)).status, 200,
     "response cannot combine signed admission with a different physical floor");
   corruptFence = false;
+  corruptProof = "missing";
+  assert.notEqual((await post("historical", data)).status, 200,
+    "issuer cannot omit PG attestation from successful HTTP response");
+  corruptProof = "malformed";
+  assert.notEqual((await post("historical", data)).status, 200,
+    "issuer cannot claim success with non-Buffer physical attestation");
+  corruptProof = "oversize";
+  assert.notEqual((await post("historical", data)).status, 200,
+    "signed physical evidence must be bounded to 2048 bytes");
+  corruptProof = "wrong-nonce";
+  assert.notEqual((await post("historical", data)).status, 200,
+    "issuer cannot relay independently signed PG attestation for a different nonce");
+  corruptProof = "";
   const answer = await post("historical", data);
   assert.equal(answer.status, 200);
+  assert.ok(typeof answer.data.physicalAttestation === "string"
+    && answer.data.physicalAttestation.length > 0,
+  "successful HTTP result must contain the issuer-supplied signed PG proof");
   assert.equal(answer.data.freshFloor.nonce, data.nonce);
   assert.deepEqual(received.nonce, challenge);
   assert.deepEqual(received.scope, allowed);
@@ -206,18 +240,7 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
   // This issuer is a crypto fixture, not a replacement for W2's durable
   // SQLite authority. The published consumer itself validates both signatures
   // and an independently challenged signed PG physical readback here.
-  const readback = { status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
-    walFlushConfirmed: true, authorizesIo: false, provesIndependentOperator: false,
-    generation: 4, admissionId: random(16),
-    operationId: bound.operation.operation_id, revision: bound.operation.revision,
-    epoch: bound.operation.epoch,
-    expectedInventorySequence: bound.operation.expected_sequence,
-    expectedInventoryRoot: bound.operation.expected_root,
-    ciphertextSha256: bound.operation.ciphertext_sha256,
-    digest: random(32), root: random(32), chunkCount: 1 };
-  const physicalAttestation = await signCommittedPhysicalReadback({
-    scope: allowed, operation: bound.operation, nonce: challenge,
-    readback, issuedAt: Math.floor(Date.now() / 1000) }, physicalSigner.privateKey);
+  const physicalAttestation = Buffer.from(answer.data.physicalAttestation, "base64url");
   const minimum = { sequence: answer.data.freshFloor.sequence,
     lastHash: answer.data.freshFloor.lastHash,
     physicalFenceDigest: answer.data.freshFloor.physicalFenceDigest };
@@ -253,4 +276,107 @@ test("dedicated witness historical mTLS principal enforces scope, challenge and 
   await assert.rejects(verify({ nonce: random(32) }),
     /SYNC_ZK1_HISTORICAL_ADMISSION_DENIED/,
   "tampered challenge cannot replay physical signed admission evidence");
+});
+
+test("historical mTLS admission limits per principal/global concurrent JSON buffering and request rate", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-historical-capacity-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  generateNativeFixtureCertificates(dir, { caSubject: "Historical Admission Capacity CA",
+    servers: ["server"], clients: ["a", "b", "c"] });
+  const read = (name) => fs.readFileSync(path.join(dir, name));
+  const allowed = scope();
+  const role = { roles: ["cas-historical-admit"], scopes: [wireScope(allowed)] };
+  const principals = Object.fromEntries(["a", "b", "c"].map((name) =>
+    [new crypto.X509Certificate(read(name + ".pem")).fingerprint256, role]));
+  let issued = 0;
+  let resume;
+  const blocked = new Promise((resolve) => { resume = resolve; });
+  const unusable = async () => { throw Error("UNUSED"); };
+  const floor = { requiresPhysicalAttestation: true, supportsClientHistoricalNonce: true,
+    advance: unusable, freshHeadAsync: unusable,
+    async issueSyncHistoricalAdmission() {
+      issued += 1;
+      await blocked;
+      throw new Error("SIMULATED_WITNESS_ISSUER_DENIED");
+    } };
+  const server = createZk1WitnessHttpsServer({
+    key: read("server.key"), cert: read("server.pem"), clientCa: read("ca.pem"),
+    casAnchorFloor: floor,
+    ledger: { reserve: unusable, freshHead: unusable, resolve: unusable,
+      prepareQuiesce: unusable, cancelExpiredQuiesce: unusable,
+      beginIoAdmission: unusable, finishIoAdmission: unusable },
+    principals,
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => { resume(); await drainZk1WitnessHttpsServer(server); });
+  const reqBody = JSON.stringify({ envelope: { ciphertext: "opaque" },
+    scope: wireScope(allowed), expectedSequence: 0,
+    expectedRoot: random(32).toString("base64url"),
+    inventoryReceipt: random(100).toString("base64url"),
+    nonce: random(32).toString("base64url") });
+  const request = (who, body = reqBody) => new Promise((resolve, reject) => {
+    const payload = Buffer.from(body);
+    const req = https.request({ hostname: "127.0.0.1", port: server.address().port,
+      servername: "localhost", ca: read("ca.pem"), cert: read(who + ".pem"),
+      key: read(who + ".key"), method: "POST",
+      path: "/v1/cas-anchor/historical-admit",
+      headers: { "content-type": "application/json", "content-length": payload.length },
+    }, (res) => { res.resume(); res.once("end", () => resolve(res.statusCode)); });
+    req.once("error", reject);
+    req.end(payload);
+  });
+  const headersOnly = (who) => new Promise((resolve, reject) => {
+    let done = false;
+    const req = https.request({ hostname: "127.0.0.1", port: server.address().port,
+      servername: "localhost", ca: read("ca.pem"), cert: read(who + ".pem"),
+      key: read(who + ".key"), method: "POST",
+      path: "/v1/cas-anchor/historical-admit",
+      headers: { "content-type": "application/json",
+        "content-length": String(12 * 1024 * 1024) },
+    }, (res) => { res.resume(); res.once("end", () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(res.statusCode);
+      req.destroy();
+    }); });
+    req.once("error", (error) => { if (!done) { done = true; clearTimeout(timer); reject(error); } });
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      req.destroy();
+      reject(new Error("historical admission must reject before buffering a 12MiB HTTP body"));
+    }, 1500);
+    req.flushHeaders(); // deliberately NEVER transmit a body
+  });
+  const aPending = request("a");
+  // A second request from A is rejected even while A's first 12MiB-capable
+  // body may be buffered or an expensive physical PG challenge is pending.
+  for (let attempts = 0; issued < 1 && attempts < 100; attempts += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(issued, 1, "first W2 issuer must actually be in flight");
+  assert.equal(await request("a"), 429,
+    "same mTLS principal cannot occupy a second large request buffer");
+  const bPending = request("b");
+  for (let attempts = 0; issued < 2 && attempts < 100; attempts += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(issued, 2, "two distinct principals can fill the global in-flight budget");
+  assert.equal(await headersOnly("c"), 429,
+    "third authenticated principal must be rejected before even receiving a 12MiB JSON body");
+  resume();
+  assert.equal(await aPending, 503);
+  assert.equal(await bPending, 503);
+  // The fixed monotonic rate budget is independent of in-flight capacity.
+  // A and B spent one accepted request each; rejecting over-limit requests
+  // must not schedule more signer or PostgreSQL work.
+  for (let i = 0; i < 11; i += 1) assert.equal(await request("a"), 503);
+  assert.equal(await request("a"), 429,
+    "per-principal budget admits at most 12 requests per 60-second window");
+  for (let i = 0; i < 11; i += 1) assert.equal(await request("b"), 503);
+  assert.equal(await request("c"), 429,
+    "global 24/60s budget prevents fresh certificates from bypassing capacity");
+  assert.equal(issued, 24,
+    "rate-limited HTTP requests never enter the expensive W2 issuer queue");
 });

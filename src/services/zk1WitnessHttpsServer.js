@@ -11,6 +11,13 @@ const z = require("../crypto/rootark-zk-1");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
 
 const MAX_BODY_BYTES = 4096;
+const HISTORICAL_BODY_BYTES = 12 * 1024 * 1024;
+// Fixed monotonic-window protection ahead of reading a potentially 12 MiB
+// encrypted envelope. Only independently authorized mTLS principals count.
+const HISTORICAL_WINDOW_NS = 60_000_000_000n;
+const HISTORICAL_PER_PRINCIPAL_RATE = 12;
+const HISTORICAL_GLOBAL_RATE = 24;
+const HISTORICAL_GLOBAL_INFLIGHT = 2;
 const GENESIS_DOMAIN = Buffer.from("Root.ark/zk-1/witness-genesis-authorization/v1\0", "ascii");
 const B64U = /^[A-Za-z0-9_-]+$/;
 const ROLES = Object.freeze({
@@ -143,6 +150,33 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals,
     || !principals || typeof principals !== "object"
     || Object.keys(principals).length === 0) invalid();
   const authorized = new Map();
+  const historicalGlobal = { active: 0, since: 0n, attempts: 0 };
+  function historicalSlot(principal) {
+    const now = process.hrtime.bigint();
+    const reset = (bucket) => {
+      if (bucket.since === 0n || now - bucket.since >= HISTORICAL_WINDOW_NS) {
+        bucket.since = now;
+        bucket.attempts = 0;
+      }
+    };
+    reset(principal.historical);
+    reset(historicalGlobal);
+    if (principal.historical.active >= 1
+      || historicalGlobal.active >= HISTORICAL_GLOBAL_INFLIGHT
+      || principal.historical.attempts >= HISTORICAL_PER_PRINCIPAL_RATE
+      || historicalGlobal.attempts >= HISTORICAL_GLOBAL_RATE) return null;
+    principal.historical.active += 1;
+    historicalGlobal.active += 1;
+    principal.historical.attempts += 1;
+    historicalGlobal.attempts += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      principal.historical.active -= 1;
+      historicalGlobal.active -= 1;
+    };
+  }
   if (Object.keys(principals).length > 128) invalid();
   for (const [fingerprint, settings] of Object.entries(principals)) {
     exact(settings, Object.hasOwn(settings, "initializeKeys")
@@ -186,12 +220,14 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals,
     if (authorized.has(fingerprint.toUpperCase())) invalid();
     authorized.set(fingerprint.toUpperCase(), {
       roles: new Set(roles), scopes: scoped, initializers,
+      historical: { active: 0, since: 0n, attempts: 0 },
     });
   }
   const server = https.createServer({
     key, cert, ca: clientCa, minVersion: "TLSv1.3",
     requestCert: true, rejectUnauthorized: true,
   }, async (req, res) => {
+    let releaseHistorical = null;
     try {
       if (req.method !== "POST" || !Object.hasOwn(ROLES, req.url)) {
         return write(res, 404, { error: "NOT_FOUND" });
@@ -202,9 +238,15 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals,
         // Refuse before buffering any externally supplied JSON.
         return write(res, 403, { error: "FORBIDDEN" });
       }
+      if (req.url === "/v1/cas-anchor/historical-admit") {
+        releaseHistorical = historicalSlot(granted);
+        if (!releaseHistorical) {
+          return write(res, 429, { error: "WITNESS_HISTORICAL_RATE_LIMIT" });
+        }
+      }
       const body = await readBoundedJson(req,
         req.url === "/v1/cas-anchor/historical-admit"
-          ? 12 * 1024 * 1024
+          ? HISTORICAL_BODY_BYTES
           : req.url === "/v1/cas-anchor/advance"
           ? (casAnchorFloor?.requiresPhysicalAttestation ? 96 * 1024 : 40 * 1024)
           : MAX_BODY_BYTES);
@@ -233,8 +275,24 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals,
           || issued.admission.witnessLastHash !== issued.freshFloor.lastHash
           || issued.admission.witnessPhysicalFenceDigest
             !== issued.freshFloor.physicalFenceDigest) invalid();
+        // W2 has already verified the independent PG signer/receipt, but the
+        // client MUST receive those exact signed bytes. Never substitute a
+        // caller-generated PG fixture or silently discard the attestation.
+        const physical = issued.physicalAttestation;
+        if (!Buffer.isBuffer(physical) || physical.length < 1 || physical.length > 2048
+          || (typeof SharedArrayBuffer !== "undefined"
+            && physical.buffer instanceof SharedArrayBuffer)) invalid();
+        const capturedPhysical = Buffer.from(physical);
+        let claims;
+        try { claims = await z.decodeDeterministic(capturedPhysical); }
+        catch (_) { invalid(); }
+        if (!claims || claims.type !== "rootark-zk1-physical-pg-readback-attestation/v1"
+          || (!Buffer.isBuffer(claims.nonce) && !(claims.nonce instanceof Uint8Array))
+          || claims.nonce.length !== 32
+          || !crypto.timingSafeEqual(Buffer.from(claims.nonce), nonce)) invalid();
         return write(res, 200, { admission: issued.admission,
           freshFloor: issued.freshFloor,
+          physicalAttestation: capturedPhysical.toString("base64url"),
           authority: "WITNESS_SYNC_HISTORICAL_ADMISSION_V1" });
       }
       if (req.url === "/v1/cas-anchor/head") {
@@ -379,6 +437,8 @@ function createZk1WitnessHttpsServer({ key, cert, clientCa, ledger, principals,
           : status === 400 ? "WITNESS_INVALID_REQUEST"
             : status === 404 ? "NOT_FOUND" : "WITNESS_CONFLICT",
       });
+    } finally {
+      if (releaseHistorical) releaseHistorical();
     }
   });
   // Bound slowloris requests even when the operator does not stop the service.

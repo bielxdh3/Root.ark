@@ -73,6 +73,25 @@ scope mismatch, malformed nonce, unrecognized fields, tampered signed floor,
 and cryptographic verification against the published Sync v2 historical
 consumer loaded from its own commit. The transport fixture signs test-only PG
 proofs; it does NOT prove real PostgreSQL18 fsync or external durability.
+An incremental transport hardening gate now **requires** the existing W2 issuer
+to return its own independently verified signed `physicalAttestation` Buffer
+(1..2048 bytes); the endpoint inspects the deterministic CBOR PG-attestation
+nonce, requires it to equal the exact 32-byte caller challenge, and sends the
+same raw bytes as canonical base64url in `physicalAttestation`. Missing,
+non-Buffer, oversized or nonce-mismatched evidence is refused; transport tests
+feed **only the HTTP-returned physical proof** to the published consumer,
+never fabricate a PG signature on behalf of the caller after HTTP succeeds.
+
+Authenticated historical clients additionally face a fixed monotonic 60s
+window at most **12 attempted requests per principal** and **24 globally**,
+plus **one in-flight request per principal** and **two globally**. The slot is
+reserved immediately after mTLS role authentication and **before reading** the
+up-to-12MiB body, and always released after request completion/error. HTTP
+429 never invokes the issuer or reads the body. Tests hold simultaneous issuer
+calls, reject a third authorized peer with a deliberately unsent 12MiB body,
+and exhaust both principal/global request budgets. These local process budgets
+do not replace a cross-host distributed rate limit or an external witness
+monotonicity guarantee.
 This scoped patch alone does not make W2's historical issuer/PR #228 production
 ready. Cherry-pick **only the transport commit** onto W2's verified latest
 core, then run full issuer+TLS+consumer tests together. Do not combine the
