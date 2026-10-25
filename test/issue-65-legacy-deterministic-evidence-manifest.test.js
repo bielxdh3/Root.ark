@@ -652,19 +652,22 @@ test("Windows generic access ACEs cannot evade private snapshot ancestor checks"
       "Set-Acl -LiteralPath $p -AclObject $a;" +
       "$actual=(Get-Acl -LiteralPath $p).GetSecurityDescriptorBinaryForm();" +
       "$r=New-Object Security.AccessControl.RawSecurityDescriptor($actual,0);" +
+      // Hosted NTFS may normalize GENERIC_ALL into destructive FILE_* rights on Set-Acl.
+      // Require a persisted untrusted write/delete/WRITE_DAC ACE in either form.
       "$found=$false;foreach($entry in $r.DiscretionaryAcl) {" +
       "if($entry.SecurityIdentifier.Value -eq 'S-1-5-11' -and" +
-      " ($entry.AccessMask -band 268435456) -ne 0){$found=$true}};" +
-      "if(-not $found){throw 'Generic access ACE did not persist'};" +
-      "Write-Output 'RAW_GENERIC_ALL_FOUND';"], {
+      " (($entry.AccessMask -band 268435456) -ne 0 -or" +
+      " ($entry.AccessMask -band 327682) -ne 0)){$found=$true}};" +
+      "if(-not $found){throw 'Unsafe access ACE did not persist'};" +
+      "Write-Output 'UNSAFE_GENERIC_OR_NORMALIZED_ACE_FOUND';"], {
       windowsHide: true, encoding: "utf8", timeout: 12000,
     });
     diag.stage("ACE_READBACK");
-    if (apply.status === 0 && /RAW_GENERIC_ALL_FOUND/.test(apply.stdout || ""))
+    if (apply.status === 0 && /UNSAFE_GENERIC_OR_NORMALIZED_ACE_FOUND/.test(apply.stdout || ""))
       diag.trust("UNTRUSTED_ADDED");
     assert.equal(apply.status, 0, apply.stderr);
-    assert.match(apply.stdout, /RAW_GENERIC_ALL_FOUND/,
-      "fixture must store the raw GENERIC_ALL bit, not a normalized file-right alias");
+    assert.match(apply.stdout, /UNSAFE_GENERIC_OR_NORMALIZED_ACE_FOUND/,
+      "fixture must store a GENERIC_ALL ACE or its dangerous normalized file-right equivalent");
     diag.stage("GUARD_VERIFY");
     const check = spawnSync(nativePs, ["-NoProfile", "-NonInteractive", "-File", nativeScript,
       "-Action", "verify", "-Directory", parent], { encoding: "utf8", windowsHide: true });
