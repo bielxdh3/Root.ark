@@ -80,7 +80,13 @@ test("real PG18 child read-only attestor binds strict mTLS signed chain across r
       env: { NODE_ENV: "test", PATH: process.env.PATH,
         SystemRoot: process.env.SystemRoot,
         ROOTARK_ZK1_ATTESTOR_PG_URL: process.env.ROOTARK_ZK1_ATTESTOR_PG_URL } });
-  t.after(() => { if (child.exitCode === null) child.kill(); });
+  t.after(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const exited = new Promise((resolve) => child.once("exit", resolve));
+    child.kill("SIGTERM");
+    const timer = setTimeout(() => child.kill("SIGKILL"), 5000);
+    try { await exited; } finally { clearTimeout(timer); }
+  });
   let childError = "";
   child.stderr.on("data", (bytes) => {
     childError = (childError + bytes.toString()).slice(-1024);
