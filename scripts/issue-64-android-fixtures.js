@@ -59,7 +59,8 @@ async function captureSync(responses) {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue64-sync-"));
   const app = express();
   app.use(express.json({ limit: "9mb" }));
-  const authenticate = (req, _res, next) => { req.user = { username: "alice" }; next(); };
+  // The captured happy-path tombstone is issued by an account authorized to delete.
+  const authenticate = (req, _res, next) => { req.user = { username: "alice", permissions: { delete: true } }; next(); };
   const requirePermission = () => (_req, _res, next) => next();
   const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath: path.join(dir, "objects.json") });
   await route.ready;

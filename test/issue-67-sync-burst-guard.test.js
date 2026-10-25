@@ -136,7 +136,8 @@ async function startServer(t, { storagePath, burstGuard, auditEvents = [], bcryp
   const accountState = { users: accountUsers || [{ username: "alice", password: ALICE_HASH }] };
   const app = express();
   app.use("/sync/v1", express.json({ limit: "9mb" }));
-  const authenticate = (req, _res, next) => { req.user = { username: "alice", role: "user" }; next(); };
+  // Route tests exercise legitimately authorized deletes, then assert burst fencing.
+  const authenticate = (req, _res, next) => { req.user = { username: "alice", role: "user", permissions: { delete: true } }; next(); };
   const requirePermission = () => (_req, _res, next) => next();
   const auditLog = (eventType, actor, target, action, result, details) => auditEvents.push({ eventType, actor, target, action, result, details });
   const loadUsers = () => JSON.parse(JSON.stringify(accountState.users));
