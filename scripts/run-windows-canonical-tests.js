@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const { StringDecoder } = require("node:string_decoder");
 const { getNpmInvocation, canonicalTestArgs } = require("./release-gate-environment");
+const { parseAclFailureDiagnostic } = require("./acl-test-failure-diagnostic");
 
 const HEARTBEAT_MS = 60_000;
 const IDLE_LIMIT_MS = 15 * 60_000;
@@ -54,7 +55,9 @@ function createTapProgressRecorder(write) {
       failurePaths.set(pending.pathHash, (failurePaths.get(pending.pathHash) || 0) + 1);
     }
     if (detailed < 12) {
-      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}`);
+      const acl = pending.acl
+        ? ` aclStage=${pending.acl.stage} aclError=${pending.acl.code} aclTrust=${pending.acl.trust}` : "";
+      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${acl}`);
       detailed++;
     }
     pending = null;
@@ -93,6 +96,8 @@ function createTapProgressRecorder(write) {
         if (kind && SAFE_FAILURE_TYPES.has(kind[1])) pending.failureType = kind[1];
         const code = /^  code: '([A-Z0-9_]{1,40})'$/.exec(line);
         if (code && SAFE_CODES.has(code[1])) pending.code = code[1];
+        const acl = parseAclFailureDiagnostic(line, pending);
+        if (acl) pending.acl = acl;
       }
       if (/^1\.\.\d+$/.test(line)) state.plan = true;
       const tests = /^# tests (\d+)$/.exec(line);

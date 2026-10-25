@@ -12,6 +12,8 @@ const unzipper = require("unzipper");
 const { MIGRATIONS } = require("../db/migrations");
 const { inspectZk1LegacyEvidenceManifest: inspect } =
   require("../src/services/zk1LegacyEvidenceManifest");
+const { createAclFailureDiagnostic } =
+  require("../scripts/acl-test-failure-diagnostic");
 
 const sha = (buffer) => crypto.createHash("sha256").update(buffer).digest("hex");
 const payload = Buffer.from("fixture ciphertext bytes \0 stored");
@@ -624,7 +626,10 @@ test("unlink and recursive removal both blocked still leave zero-length private 
 test("Windows generic access ACEs cannot evade private snapshot ancestor checks", {
   skip: process.platform !== "win32",
 }, async (t) => {
+  const diag = createAclFailureDiagnostic(t, "LEGACY_GENERIC_ACE");
+  return diag.run(async () => {
   const f = await fixture(t);
+  diag.stage("FIXTURE_READY");
   const parent = fs.mkdtempSync(path.join(process.env.LOCALAPPDATA, "zk65-generic-ace-"));
   const oldRoot = process.env.LOCALAPPDATA;
   const nativePs = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
@@ -632,6 +637,7 @@ test("Windows generic access ACEs cannot evade private snapshot ancestor checks"
   const originalWrite = fs.openSync;
   let wrote = false;
   try {
+    diag.stage("ACE_WRITE");
     const quotedParent = parent.replace(/'/g, "''");
     const apply = spawnSync(nativePs, ["-NoProfile", "-NonInteractive", "-Command",
       "$ErrorActionPreference='Stop';$p='" + quotedParent + "';$a=Get-Acl -LiteralPath $p;" +
@@ -653,18 +659,25 @@ test("Windows generic access ACEs cannot evade private snapshot ancestor checks"
       "Write-Output 'RAW_GENERIC_ALL_FOUND';"], {
       windowsHide: true, encoding: "utf8", timeout: 12000,
     });
+    diag.stage("ACE_READBACK");
+    if (apply.status === 0 && /RAW_GENERIC_ALL_FOUND/.test(apply.stdout || ""))
+      diag.trust("UNTRUSTED_ADDED");
     assert.equal(apply.status, 0, apply.stderr);
     assert.match(apply.stdout, /RAW_GENERIC_ALL_FOUND/,
       "fixture must store the raw GENERIC_ALL bit, not a normalized file-right alias");
+    diag.stage("GUARD_VERIFY");
     const check = spawnSync(nativePs, ["-NoProfile", "-NonInteractive", "-File", nativeScript,
       "-Action", "verify", "-Directory", parent], { encoding: "utf8", windowsHide: true });
+    diag.trust(check.status === 0 ? "ACCEPTED" : "REJECTED");
     assert.notEqual(check.status, 0, "raw GENERIC_ALL cannot pass the ACL guardian");
     process.env.LOCALAPPDATA = parent;
     fs.openSync = function (name, ...args) {
       if (typeof name === "string" && path.basename(name) === "image.sqlite") wrote = true;
       return originalWrite.call(fs, name, ...args);
     };
+    diag.stage("CUSTODY_SCAN");
     const report = await scan(f);
+    diag.stage("CUSTODY_ASSERT");
     assert.equal(wrote, false, "no SQLite bytes can be staged under a GENERIC_ALL principal");
     assert.equal(report.sections.sqlite.status, "UNKNOWN");
   } finally {
@@ -672,6 +685,7 @@ test("Windows generic access ACEs cannot evade private snapshot ancestor checks"
     fs.openSync = originalWrite;
     fs.rmSync(parent, { recursive: true, force: true });
   }
+  });
 });
 
 test("native ACL unsafe mask explicitly covers raw GENERIC_ALL and GENERIC_WRITE", () => {

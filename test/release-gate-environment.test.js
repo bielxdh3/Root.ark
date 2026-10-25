@@ -7,6 +7,92 @@ const { EventEmitter } = require("node:events");
 const { PassThrough } = require("node:stream");
 const { getNpmInvocation, canonicalTestArgs, hasSeparateWindowsCiCanonicalTest, isDependencyOrNetworkUnavailable } = require("../scripts/release-gate-environment");
 const { createTapProgressRecorder } = require("../scripts/run-windows-canonical-tests");
+const { createAclFailureDiagnostic } = require("../scripts/acl-test-failure-diagnostic");
+
+test("ACL stage reporter rethrows original failure but never emits source error text", async () => {
+  const diagnostic = [];
+  const wrapped = createAclFailureDiagnostic({ diagnostic: (value) => diagnostic.push(value) }, "ATOMIC_MUTATION");
+  assert.throws(() => wrapped.stage("PRIVATE_SECRET_PATH"), /INVALID_ACL_DIAGNOSTIC_STAGE/);
+  assert.throws(() => wrapped.trust("S-1-5-11"), /INVALID_ACL_DIAGNOSTIC_TRUST/);
+  wrapped.stage("ACL_WRITE");
+  wrapped.trust("UNTRUSTED_ADDED");
+  const failure = Object.assign(new Error("C:\\private\\token.txt password=secret"), { code: "EPERM" });
+  await assert.rejects(wrapped.run(async () => { throw failure; }), (error) => error === failure);
+  if (process.platform === "win32") {
+    assert.deepEqual(diagnostic, [
+      "ROOTARK_ACL_V1 case=ATOMIC_MUTATION stage=ACL_WRITE code=PERMISSION trust=UNTRUSTED_ADDED",
+    ]);
+  } else assert.deepEqual(diagnostic, []);
+  assert.doesNotMatch(JSON.stringify(diagnostic), /private|token|password|secret|S-1-5/);
+});
+
+test("Windows canonical runner emits only bounded verified ACL stage enums for known failing tests", () => {
+  const { createHash } = require("node:crypto");
+  const hash = (value) => createHash("sha256").update(value).digest("hex").slice(0, 24);
+  const title = "strict atomic registry refuses a later untrusted file permission change";
+  const nameHash = hash(title);
+  const lines = [];
+  const recorder = createTapProgressRecorder((line) => lines.push(line));
+  recorder.accept(`not ok 7 - ${title}`);
+  recorder.accept("  location: 'C:\\host\\test\\issue-65-sync-atomic-private-acl.test.js:77:1'");
+  recorder.accept("  error: 'password=raw-secret C:\\host\\private\\keys.pem'");
+  recorder.accept("# ROOTARK_ACL_V1 case=ATOMIC_MUTATION stage=ACL_WRITE code=ASSERTION trust=UNTRUSTED_ADDED");
+  recorder.accept("ok 8 - next fixture");
+  const emitted = lines.join("\n");
+  assert.match(emitted, new RegExp(`nameSha256=${nameHash}`));
+  assert.match(emitted, /aclStage=ACL_WRITE aclError=ASSERTION aclTrust=UNTRUSTED_ADDED/);
+  assert.doesNotMatch(emitted, /raw-secret|keys\.pem|C:\\host|issue-65-sync-atomic-private-acl/);
+});
+
+test("Windows canonical runner ignores forged ACL diagnostics, unknown enums and passing tests", () => {
+  const lines = [];
+  const recorder = createTapProgressRecorder((line) => lines.push(line));
+  const title = "strict atomic registry refuses a later untrusted file permission change";
+  const location = "  location: 'C:\\host\\test\\issue-65-sync-atomic-private-acl.test.js:77:1'";
+  recorder.accept(`ok 1 - ${title}`);
+  recorder.accept("# ROOTARK_ACL_V1 case=ATOMIC_MUTATION stage=ACL_WRITE code=ASSERTION trust=UNTRUSTED_ADDED");
+  recorder.accept("not ok 2 - unrelated private title");
+  recorder.accept(location);
+  recorder.accept("# ROOTARK_ACL_V1 case=ATOMIC_MUTATION stage=ACL_WRITE code=ASSERTION trust=UNTRUSTED_ADDED");
+  recorder.accept(`not ok 3 - ${title}`);
+  recorder.accept("  location: 'C:\\host\\test\\wrong-test.test.js:77:1'");
+  recorder.accept("# ROOTARK_ACL_V1 case=ATOMIC_MUTATION stage=ACL_WRITE code=ASSERTION trust=UNTRUSTED_ADDED");
+  recorder.accept(`not ok 4 - ${title}`);
+  recorder.accept(location);
+  recorder.accept("# ROOTARK_ACL_V1 case=ATOMIC_MUTATION stage=LEAK_private_path code=ASSERTION trust=UNTRUSTED_ADDED");
+  recorder.accept("# ROOTARK_ACL_V1 case=ATOMIC_MUTATION stage=ACL_WRITE code=SECRET_PASSWORD trust=UNTRUSTED_ADDED");
+  recorder.accept("# ROOTARK_ACL_V1 case=ATOMIC_MUTATION stage=ACL_WRITE code=ASSERTION trust=C:\\secrets");
+  recorder.accept("# ROOTARK_ACL_V1 case=ATOMIC_MUTATION stage=ACL_WRITE code=ASSERTION trust=UNTRUSTED_ADDED password=shhh");
+  recorder.accept("ok 5 - next fixture");
+  const emitted = lines.join("\n");
+  assert.doesNotMatch(emitted, /aclStage=|aclTrust=|aclError=|SECRET_PASSWORD|secrets|password=shhh|wrong-test|private title/);
+});
+
+test("Windows canonical runner recognizes all four ACL failure profiles without exposing paths", () => {
+  const profiles = [
+    ["Windows generic access ACEs cannot evade private snapshot ancestor checks",
+      "issue-65-legacy-deterministic-evidence-manifest.test.js", "LEGACY_GENERIC_ACE", "GUARD_VERIFY"],
+    ["strict atomic registry rejects insecure default inherited ACL/mode without mutating it",
+      "issue-65-sync-atomic-private-acl.test.js", "ATOMIC_INHERIT", "INHERIT_CHECK"],
+    ["strict atomic registry refuses a later untrusted file permission change",
+      "issue-65-sync-atomic-private-acl.test.js", "ATOMIC_MUTATION", "ACL_WRITE"],
+    ["a newly unsafe ACL after rename quarantines the lock instead of allowing a retry",
+      "issue-65-sync-atomic-private-acl.test.js", "ATOMIC_RENAME", "RENAME_HOOK"],
+  ];
+  const logged = [];
+  const recorder = createTapProgressRecorder((line) => logged.push(line));
+  for (const [title, filename, caseId, stage] of profiles) {
+    recorder.accept(`not ok ${logged.length + 1} - ${title}`);
+    recorder.accept(`  location: 'C:\\private-host\\test\\${filename}:15:1'`);
+    recorder.accept(`# ROOTARK_ACL_V1 case=${caseId} stage=${stage} code=RUNTIME trust=UNKNOWN`);
+  }
+  recorder.finish();
+  const details = logged.filter((line) => line.startsWith("FAIL detail "));
+  assert.equal(details.length, 4);
+  for (const [, , , stage] of profiles)
+    assert.ok(details.some((line) => line.includes(`aclStage=${stage} aclError=RUNTIME aclTrust=UNKNOWN`)), stage);
+  assert.doesNotMatch(logged.join("\n"), /private-host|test\.js|generic access ACEs|permission change/);
+});
 
 test("Windows canonical runner synchronously reports failure even when console output is buffered", () => {
   const runnerPath = path.join(__dirname, "..", "scripts", "run-windows-canonical-tests.js");
@@ -33,6 +119,8 @@ test("Windows canonical runner synchronously reports failure even when console o
         getNpmInvocation: () => ({ executable: "fixture", args: [] }),
         canonicalTestArgs: () => [],
       };
+      if (id === "./acl-test-failure-diagnostic")
+        return require("../scripts/acl-test-failure-diagnostic");
       return require(id);
     };
     fakeRequire.main = fakeModule;
