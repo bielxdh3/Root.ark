@@ -126,7 +126,7 @@ test("readback is bound to the exact sidecar across process restart, provider co
       pinnedDriveFileId, expectedContext, domainAttestation, adminSpki, trustDomainId, namespace })),
   };
   const child = spawnSync(process.execPath,
-    [path.join(__dirname, "support", "issue-65-sidecar-restart-child.js")],
+    [path.resolve(__dirname, "../scripts/fixtures/issue-65-sidecar-restart-child.js")],
     { input: JSON.stringify(childInput), encoding: "utf8", timeout: 10000 });
   assert.equal(child.status, 0, child.stderr);
   assert.equal(JSON.parse(child.stdout).matchingCount, 2);

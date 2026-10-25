@@ -1,5 +1,7 @@
 "use strict";
 
+// Standalone stdin-driven fixture, intentionally outside test/: Node --test
+// discovers .js files under test/support and would block on stdin at startup.
 // Disposable second OS process: it has no writer, private key or parent memory.
 // Its only authority is the separately supplied public administrator pinset.
 const assert = require("node:assert/strict");
