@@ -637,6 +637,32 @@ cannot be lifted by editing the on-disk config. Without independent policy
 custody the strict mode refuses to start; this is not a substitute for a
 fresh network revocation source or durable independent floor retention.
 
+Isolated Sync v2 strict witness historical-ISSUER development milestone
+(2026-10-25): the opt-in `enableSyncHistoricalIssuer` mode of
+`Zk1WitnessCasAnchorFloor` issues an independently witness-Ed25519-signed
+historical receipt over the full canonical encrypted and device-signed Sync v2
+envelope SHA-256, device ID and SPKI fingerprint, ZK1 operation ID, epoch,
+inventory predecessor checkpoint, exact committed inventory receipt digest,
+pre-device-expiry admission timestamp, and witness CAS/physical-fence head.
+Issuance requires fresh device Ed25519 authorization and revocation check,
+fresh independently pinned inventory and PostgreSQL-attestor signature proof
+over a private nonce, and an existing owner-authorized physically fenced CAS
+terminal record whose operation ID, inventory sequence and root agree exactly.
+It uses a separate witness-owned immutable SQLite receipt table with
+`synchronous=FULL`, an Ed25519-signed and SHA-256 chained operation history,
+unique operation IDs, and a mandatory **externally retained exact** historical
+receipt high-water on restart (in addition to the external physical floor).
+Duplicate issuance and missing/tampered historical rows fail closed.
+The issuer has no default HTTP/Sync CLI wiring, grants no historical-read or
+I/O permission by itself, and the receipt still needs a fresh independent
+witness/physical check by a separately pinned client before historical use.
+Focused tests exercise signed and revoked device envelopes, forged inventory
+proofs, operation/floor mismatch, replay, SQLite rewind/restart and a real
+mTLS peer in a separate OS child **whose PostgreSQL readback is simulated**.
+This is a local durable signing milestone, **not** a demonstrated production
+PG18 end-to-end deployment, atomic PG-to-witness commit, owner-custodied
+monotonic receipt floor, cross-provider external durability, or issue #65 GO.
+
 Last reconstructed: 2026-07-25 (historical baseline)
 Latest application-code snapshot for this closure: 2026-10-16 after PR #201 merged at `341804fa2bfd02dcd50f2d1bde560cb677fc27fd`. The [2026-10-16 pre-publication snapshot](validation/2026-10-16-rootark-prepublication-closure.md) records GitHub state and validation evidence queried after PR #199; it is historical and does not describe PR #201 or later commits. Track the final exact `Root/main` SHA and local validation for the documentation-only closure publication in the [final closure PR #202](https://github.com/bielxdh3/Root.ark/pull/202).
 

@@ -27,6 +27,9 @@ const { Zk1DurableCasStatusLedger } =
   require("../src/services/zk1DurableCasStatusLedger");
 const { createZk1PgPhysicalAttestorHttpsClient } =
   require("../src/services/zk1PgPhysicalAttestorHttpsClient");
+const { createOperation } = require("../sync-client/rootark-sync-protocol");
+const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
+const { envelopeBinding } = require("../sync-client/rootark-sync-zk1-physical-binding");
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/cas-witness-physical-owner-binding/v1\0");
 const ENTRY = Buffer.from("Root.ark/zk-1/content-inventory-entry/v1\0");
@@ -50,8 +53,19 @@ test("strict CAS witness floor refuses signed status advance without independent
     scope, sequence: 0, previousRoot: null, entries: [], nonce: random(32),
   }));
   const genesisRoot = Buffer.from((await z.decodeDeterministic(genesisSnapshot)).root);
-  const op = { operation_id: random(16), expected_sequence: 0, expected_root: genesisRoot,
-    object_id: random(16), revision: 1, epoch: 1, ciphertext_sha256: random(32) };
+  const device = crypto.generateKeyPairSync("ed25519");
+  const deviceSpki = device.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const syncEnvelope = createOperation({ operation: "create",
+    operationId: "witness-historical-sync-1", objectId: "witness-historical-object-1",
+    deviceId: "device-a", compartmentId: "vault", keyEpoch: "epoch-1",
+    revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "encrypted-object.bin" },
+    plaintext: Buffer.from("client encrypted bytes"), fileKey: random(32) });
+  syncEnvelope.authorization = await createAuthorizationProof(syncEnvelope, {
+    username: "owner", privateKey: device.privateKey, publicKey: deviceSpki,
+    expiresAt: Date.now() + 120000 });
+  const bound = envelopeBinding(syncEnvelope, scope, 0, genesisRoot);
+  const op = bound.operation;
   const requestDigest = sha(await z.encodeDeterministic(op));
   const tuple = { object_id: op.object_id, revision: op.revision,
     epoch: op.epoch, ciphertext_sha256: op.ciphertext_sha256 };
@@ -195,6 +209,106 @@ test("strict CAS witness floor refuses signed status advance without independent
     shiftClockAfterChain = false;
   }
   assert.equal(result.sequence, 1);
+  assert.equal(physicalCalls, 4,
+    "each attempted new admission requires a fresh target readback");
+  assert.equal(inventoryCalls, 3,
+    "each authorized attempt requires its own signed inventory snapshot");
+  const committedFence = await floor.proveCommittedPhysicalFence({ scope,
+    operationId: op.operation_id, inventorySequence: 1, inventoryRoot: root,
+    nonce: random(32) });
+  assert.equal(committedFence.committedSequence, 1);
+  assert.equal(committedFence.signedFloor.sequence, 1);
+  assert.deepEqual(committedFence.operationId, op.operation_id);
+  assert.equal(committedFence.authorizesHistoricalRead, false,
+    "a durable witness floor alone is NOT a Sync historical admission receipt");
+  for (const forged of [
+    { operationId: random(16) }, { inventorySequence: 2 },
+    { inventoryRoot: random(32) },
+    { scope: { ...scope, account_id: random(16) } },
+    { nonce: random(31) },
+  ]) {
+    await assert.rejects(floor.proveCommittedPhysicalFence({ scope,
+      operationId: op.operation_id, inventorySequence: 1, inventoryRoot: root,
+      nonce: random(32), ...forged }), /WITNESS_CAS_FLOOR_DENIED/);
+  }
+  // The separately provisioned historical issuer persists the exact Sync
+  // envelope receipt only AFTER an independently attested physical CAS event.
+  // A forged writer ACK, unrelated physical operation or user-supplied floor
+  // cannot manufacture this witness-signed admission.
+  const historicalFilename = path.join(directory, "witness-historical-sync.sqlite");
+  const historicalOptions = {
+    witnessKeyId, witnessPrivateKey: witness.privateKey,
+    statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission,
+    enableSyncHistoricalIssuer: true,
+  };
+  let historical = new Zk1WitnessCasAnchorFloor(historicalFilename, {
+    ...historicalOptions, bootstrapNew: true });
+  await historical.advanceAttested({ records: [record], evidence: [evidence] });
+  const issueInput = { envelope: syncEnvelope, scope, expectedSequence: 0,
+    expectedRoot: genesisRoot, inventoryReceipt: receipt,
+    localTrustedDevicePolicy: { username: "owner", trustedDevicePublicKeys: {
+      "device-a": deviceSpki }, revokedDeviceIds: [] } };
+  await assert.rejects(historical.issueSyncHistoricalAdmission({ ...issueInput,
+    localTrustedDevicePolicy: { ...issueInput.localTrustedDevicePolicy,
+      revokedDeviceIds: ["device-a"] } }), /WITNESS_CAS_FLOOR_DENIED/);
+  await assert.rejects(historical.issueSyncHistoricalAdmission({ ...issueInput,
+    inventoryReceipt: Buffer.from("untrusted-user-ACK") }),
+  /WITNESS_CAS_FLOOR_DENIED/);
+  assert.deepEqual(historical.historicalAdmissionHead(), {
+    sequence: 0, lastHash: "0".repeat(64) });
+  const issued = await historical.issueSyncHistoricalAdmission(issueInput);
+  assert.equal(issued.durableLocalWitnessAdmission, true);
+  assert.equal(issued.authorizesHistoricalRead, false);
+  assert.equal(issued.authorizesIo, false);
+  assert.equal(issued.admission.envelopeSha256,
+    sha(bound.canonicalEnvelope).toString("base64url"));
+  assert.equal(issued.admission.operationId, op.operation_id.toString("base64url"));
+  assert.equal(issued.admission.inventoryReceiptSha256,
+    sha(receipt).toString("base64url"));
+  assert.ok(issued.admission.admittedAtMs < syncEnvelope.authorization.expiresAt);
+  assert.equal(issued.admission.witnessPhysicalFenceDigest,
+    issued.freshFloor.physicalFenceDigest);
+  const { signature: admissionSignature, ...unsignedAdmission } = issued.admission;
+  assert.equal(crypto.verify(null, Buffer.concat([
+    Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0"),
+    Buffer.from(JSON.stringify(unsignedAdmission)),
+  ]), witness.publicKey, Buffer.from(admissionSignature, "base64url")), true);
+  await assert.rejects(historical.issueSyncHistoricalAdmission(issueInput),
+    /WITNESS_CAS_FLOOR_DENIED/, "repeated same op ID cannot mint another signed receipt");
+  const admittedFloor = issued.freshFloor;
+  const admittedHistoryHead = issued.historicalAdmissionHead;
+  historical.close();
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(historicalFilename, {
+    ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
+      sequence: 1, lastHash: admittedFloor.lastHash,
+      physicalFenceDigest: admittedFloor.physicalFenceDigest },
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "an independent receipt issuer may not infer receipt high-water from its own DB");
+  historical = new Zk1WitnessCasAnchorFloor(historicalFilename, {
+    ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
+      sequence: 1, lastHash: admittedFloor.lastHash,
+      physicalFenceDigest: admittedFloor.physicalFenceDigest },
+    trustedHistoricalAdmissionHead: admittedHistoryHead,
+  });
+  assert.deepEqual(historical.historicalAdmissionHead(), admittedHistoryHead);
+  assert.deepEqual(historical.historicalAdmissionForOperation(op.operation_id).admission,
+    issued.admission, "signed admission remains retrievable after durable restart");
+  assert.equal(historical.historicalAdmissionForOperation(random(16)), null);
+  historical.close();
+  // A SQL editor can forge an empty local history by deleting a row, but
+  // cannot make the exact separately pinned signed-receipt high-water agree.
+  const historicalDb = new Database(historicalFilename);
+  try {
+    historicalDb.exec("DROP TRIGGER no_historical_admission_delete");
+    historicalDb.prepare("DELETE FROM witness_cas_sync_historical_admission").run();
+  } finally { historicalDb.close(); }
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(historicalFilename, {
+    ...historicalOptions, bootstrapNew: false, trustedMinimumHead: {
+      sequence: 1, lastHash: admittedFloor.lastHash,
+      physicalFenceDigest: admittedFloor.physicalFenceDigest },
+    trustedHistoricalAdmissionHead: admittedHistoryHead,
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "a missing history row or immutable trigger cannot pass an external receipt floor");
   const durableFenceDb = new Database(path.join(directory, "witness-floor.sqlite"),
     { readonly: true, fileMustExist: true });
   try {
@@ -257,10 +371,6 @@ test("strict CAS witness floor refuses signed status advance without independent
     pinnedWitnessKeyId: witnessKeyId, pinnedStatusKeyId: statusKeyId,
     requirePhysicalAdmission: true,
   }), /WITNESS_CAS_FLOOR_DENIED/, "a replayed strict signed head fails a new challenge");
-  assert.equal(physicalCalls, 4,
-    "each attempted new admission requires a fresh target readback");
-  assert.equal(inventoryCalls, 3,
-    "each authorized attempt requires its own signed inventory snapshot");
   assert.deepEqual(await floor.advanceAttested({ records: [record], evidence: [evidence] }),
     result, "exact retries of an already-fenced record are idempotent");
   // A compromised writer and separately valid inventory signer can make B1,
@@ -447,12 +557,16 @@ test("strict CAS witness floor refuses signed status advance without independent
     path.join(directory, "separate-os-process-witness.sqlite"), {
       bootstrapNew: true, witnessKeyId, witnessPrivateKey: witness.privateKey,
       statusKeyId, statusPublicKey: status.publicKey,
-      attestedAdmission: endToEndAdmission,
+      attestedAdmission: endToEndAdmission, enableSyncHistoricalIssuer: true,
     });
   try {
     assert.equal((await remoteFloor.advanceAttested({
       records: [record], evidence: [evidence],
     })).sequence, 1, "separate-process mTLS physical attestor completes strict witness admission");
+    const remoteReceipt = await remoteFloor.issueSyncHistoricalAdmission(issueInput);
+    assert.equal(remoteReceipt.durableLocalWitnessAdmission, true);
+    assert.equal(remoteReceipt.independentPhysicalReadbackVerified, true);
+    assert.equal(remoteReceipt.authorizesIo, false);
     const unauthorized = createZk1PgPhysicalAttestorHttpsClient({
       ...physicalConnection, clientKey: physicalRead("denied.key"),
       clientCert: physicalRead("denied.pem"),

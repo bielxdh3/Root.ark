@@ -10,11 +10,15 @@ const { ensurePrivateSqliteDirectory, assertPrivateSqliteFile } = require("./zk1
 const { Worker } = require("node:worker_threads");
 const Database = require("better-sqlite3");
 const { Zk1WitnessCasPhysicalAdmission } = require("./zk1WitnessCasPhysicalAdmission");
+const { envelopeBinding, snapshotLocalDevicePolicy } =
+  require("../../sync-client/rootark-sync-zk1-physical-binding");
+const { verifyAuthorizationProof } = require("../../sync-client/rootark-sync-authorization");
 
 const RECORD_DOMAIN = Buffer.from("Root.ark/zk-1/cas-terminal-anchor/v1\0", "ascii");
 const FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-anchor-floor/v1\0", "ascii");
 const PHYSICAL_FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-physical-floor/v2\0", "ascii");
 const PHYSICAL_FENCE_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-inventory-fence/v2\0", "ascii");
+const HISTORICAL_SYNC_DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0");
 const RECORD_FIELDS = ["sequence", "reservation", "scope", "status", "ticketHash",
   "manifestHash", "terminalSeal", "previousHash", "signature"];
 const RECORD_PAYLOAD = RECORD_FIELDS.slice(0, -1);
@@ -158,9 +162,22 @@ class Zk1WitnessCasAnchorFloor {
   #physicalFenceChain = crypto.createHash("sha256");
   #physicalFenceDigest = digest("");
   #advanceQueue = Promise.resolve();
+  #historicalEnabled = false;
+  #historicalHead = Object.freeze({ sequence: 0, lastHash: ZERO });
   constructor(filename, { bootstrapNew = false, witnessKeyId, witnessPrivateKey,
     statusKeyId, statusPublicKey, trustedMinimumHead,
-    attestedAdmission = null } = {}) {
+    attestedAdmission = null, enableSyncHistoricalIssuer = false,
+    trustedHistoricalAdmissionHead } = {}) {
+    if (typeof enableSyncHistoricalIssuer !== "boolean"
+      || (enableSyncHistoricalIssuer && !attestedAdmission)) fail();
+    this.#historicalEnabled = enableSyncHistoricalIssuer;
+    if (enableSyncHistoricalIssuer && !bootstrapNew) {
+      if (!trustedHistoricalAdmissionHead) fail();
+      const pinned = exact(trustedHistoricalAdmissionHead, ["sequence", "lastHash"]);
+      if (!Number.isSafeInteger(pinned.sequence) || pinned.sequence < 0
+        || pinned.sequence > 100000 || !validHex(pinned.lastHash)) fail();
+      this.#historicalHead = Object.freeze({ ...pinned });
+    }
     if (trustedMinimumHead !== undefined) {
       // Strict restart's independent high-water anchor must bind the physical
       // witness chain, not merely its signed CAS sequence and last hash.
@@ -233,6 +250,7 @@ class Zk1WitnessCasAnchorFloor {
           normativePhysicalAdmissionDigest: this.#attestedAdmission.policyDigest(),
           physicalFenceSchema: "operation-id-v2",
         } : {}),
+        ...(this.#historicalEnabled ? { historicalSyncAdmissionIssuer: true } : {}),
       });
       if (exists) {
         const row = db.prepare("SELECT identity FROM witness_cas_floor_identity WHERE id=1").get();
@@ -250,6 +268,19 @@ class Zk1WitnessCasAnchorFloor {
             cas_hash TEXT NOT NULL, scope TEXT NOT NULL,
             operation_id TEXT, inventory_sequence INTEGER, inventory_root TEXT,
             snapshot BLOB, signature BLOB NOT NULL);`);
+        }
+        if (this.#historicalEnabled) {
+          db.exec(`CREATE TABLE witness_cas_sync_historical_admission (
+            sequence INTEGER PRIMARY KEY CHECK(sequence>=1),
+            operation_id TEXT NOT NULL UNIQUE,
+            previous_hash TEXT NOT NULL, receipt TEXT NOT NULL,
+            hash TEXT NOT NULL UNIQUE);
+            CREATE TRIGGER no_historical_admission_update
+            BEFORE UPDATE ON witness_cas_sync_historical_admission
+            BEGIN SELECT RAISE(ABORT,'HISTORICAL_ADMISSION_LOCKED'); END;
+            CREATE TRIGGER no_historical_admission_delete
+            BEFORE DELETE ON witness_cas_sync_historical_admission
+            BEGIN SELECT RAISE(ABORT,'HISTORICAL_ADMISSION_LOCKED'); END;`);
         }
         db.prepare("INSERT INTO witness_cas_floor_identity VALUES(1,?)").run(this.#identity);
       }
@@ -324,6 +355,37 @@ class Zk1WitnessCasAnchorFloor {
       }
       if (this.#attestedAdmission && this.#externalMinimum
         && this.#externalMinimum.physicalFenceDigest !== this.#physicalFenceDigest) fail();
+      if (this.#historicalEnabled) {
+        const triggerNames = new Set(db.prepare(
+          "SELECT name FROM sqlite_master WHERE type='trigger'").all().map((r) => r.name));
+        if (!triggerNames.has("no_historical_admission_update")
+          || !triggerNames.has("no_historical_admission_delete")) fail();
+        let sequence = 0;
+        let previousHash = ZERO;
+        let totalBytes = 0;
+        for (const row of db.prepare(
+          "SELECT * FROM witness_cas_sync_historical_admission ORDER BY sequence").iterate()) {
+          sequence += 1;
+          totalBytes += Buffer.byteLength(row.receipt || "");
+          if (sequence > 100000 || totalBytes > 64 * 1024 * 1024) fail();
+          if (row.sequence !== sequence || row.previous_hash !== previousHash
+            || !validHex(row.hash) || typeof row.receipt !== "string"
+            || row.receipt.length > 4096 || row.hash !== digest(previousHash + "\0" + row.receipt)) fail();
+          let admission;
+          try { admission = JSON.parse(row.receipt); } catch (_) { fail(); }
+          if (JSON.stringify(admission) !== row.receipt
+            || admission.operationId !== row.operation_id
+            || typeof admission.signature !== "string") fail();
+          const { signature, ...unsigned } = admission;
+          if (!crypto.verify(null, Buffer.concat([HISTORICAL_SYNC_DOMAIN,
+            Buffer.from(JSON.stringify(unsigned))]),
+          crypto.createPublicKey(this.#witness), Buffer.from(signature, "base64url"))) fail();
+          previousHash = row.hash;
+        }
+        if (exists && (this.#historicalHead.sequence !== sequence
+          || this.#historicalHead.lastHash !== previousHash)) fail();
+        this.#historicalHead = Object.freeze({ sequence, lastHash: previousHash });
+      }
       this.#verifiedChain = verifiedChain;
       this.#verifiedChainDigest = verifiedChain.copy().digest("hex");
       this.#trustedFloor = Object.freeze({ sequence: state?.sequence || 0,
@@ -503,6 +565,208 @@ class Zk1WitnessCasAnchorFloor {
       }
       return Object.freeze({ ...trusted });
       }).deferred();
+    } catch (_) { fail(); }
+  }
+  // Independent witness-owned evidence that an EXACT operation was included
+  // in a physically attested, owner-authorized CAS terminal transition. The
+  // signed floor is produced only after the full on-disk SQLite history and
+  // physical-fence chain have been verified. This does NOT issue a Sync v2
+  // historical admission receipt or assert fresh PostgreSQL readback now.
+  async proveCommittedPhysicalFence({ scope, operationId, inventorySequence,
+    inventoryRoot, nonce } = {}) {
+    try {
+      if (!this.#attestedAdmission || this.#closed
+        || !scope || typeof scope !== "object"
+        || ![Object.prototype, null].includes(Object.getPrototypeOf(scope))
+        || Reflect.ownKeys(scope).length !== 3
+        || !["account_id", "compartment_id", "keyring_id"].every((name) =>
+          Object.hasOwn(scope, name))) fail();
+      const account = id(scope.account_id);
+      const compartment = Buffer.from(scope.compartment_id);
+      const keyring = id(scope.keyring_id);
+      const operation = id(operationId);
+      const expectedRoot = Buffer.from(inventoryRoot);
+      const challenge = Buffer.from(nonce);
+      if (compartment.length < 1 || compartment.length > 128
+        || expectedRoot.length !== 32 || challenge.length !== 32
+        || !Number.isSafeInteger(inventorySequence)
+        || inventorySequence < 1) fail();
+      const expectedScope = account.toString("hex") + ":" + compartment.length
+        + ":" + compartment.toString("hex") + ":" + keyring.toString("hex");
+      const signedFloor = await this.freshHeadAsync({ nonce: challenge });
+      const rows = this.#db.prepare(
+        "SELECT * FROM witness_cas_inventory_fence WHERE operation_id=? AND scope=?")
+        .all(operation.toString("hex"), expectedScope);
+      if (rows.length !== 1) fail();
+      const row = rows[0];
+      if (row.sequence > signedFloor.sequence
+        || row.inventory_sequence !== inventorySequence
+        || row.inventory_root !== expectedRoot.toString("hex")
+        || !Buffer.isBuffer(row.signature) || row.signature.length !== 64
+        || !crypto.verify(null, physicalFenceMessage(row),
+          crypto.createPublicKey(this.#witness), row.signature)) fail();
+      const committed = this.#db.prepare(
+        "SELECT line,hash FROM witness_cas_floor_event WHERE sequence=?")
+        .get(row.sequence);
+      if (!committed || committed.hash !== row.cas_hash
+        || parseRecord(committed.line, this.#status).status !== "committed") fail();
+      const after = this.head();
+      if (after.sequence !== signedFloor.sequence
+        || after.lastHash !== signedFloor.lastHash) fail();
+      return Object.freeze({ signedFloor, committedSequence: row.sequence,
+        operationId: Buffer.from(operation), inventorySequence,
+        inventoryRoot: Buffer.from(expectedRoot),
+        authorizesHistoricalRead: false, authorizesIo: false });
+    } catch (_) { fail(); }
+  }
+  historicalAdmissionHead() {
+    if (!this.#historicalEnabled || this.#closed) fail();
+    this.head();
+    this.#assertHistoricalIntegrity();
+    return Object.freeze({ ...this.#historicalHead });
+  }
+  #assertHistoricalIntegrity() {
+    if (!this.#historicalEnabled) fail();
+    let sequence = 0;
+    let previousHash = ZERO;
+    let totalBytes = 0;
+    const verifyKey = crypto.createPublicKey(this.#witness);
+    const triggers = new Set(this.#db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='trigger'").all().map((r) => r.name));
+    if (!triggers.has("no_historical_admission_update")
+      || !triggers.has("no_historical_admission_delete")) fail();
+    for (const row of this.#db.prepare(
+      "SELECT * FROM witness_cas_sync_historical_admission ORDER BY sequence").iterate()) {
+      sequence += 1;
+      totalBytes += Buffer.byteLength(row.receipt || "");
+      if (sequence > 100000 || totalBytes > 64 * 1024 * 1024) fail();
+      if (row.sequence !== sequence || row.previous_hash !== previousHash
+        || !validHex(row.hash) || typeof row.receipt !== "string"
+        || row.receipt.length > 4096 || row.hash !== digest(previousHash + "\0" + row.receipt)) fail();
+      let admission;
+      try { admission = JSON.parse(row.receipt); } catch (_) { fail(); }
+      if (JSON.stringify(admission) !== row.receipt
+        || admission.operationId !== row.operation_id
+        || typeof admission.signature !== "string") fail();
+      const { signature, ...unsigned } = admission;
+      const raw = Buffer.from(signature, "base64url");
+      if (raw.length !== 64 || raw.toString("base64url") !== signature
+        || !crypto.verify(null, Buffer.concat([HISTORICAL_SYNC_DOMAIN,
+          Buffer.from(JSON.stringify(unsigned))]), verifyKey, raw)) fail();
+      previousHash = row.hash;
+    }
+    if (this.#historicalHead.sequence !== sequence
+      || this.#historicalHead.lastHash !== previousHash) fail();
+  }
+  historicalAdmissionForOperation(operationId) {
+    if (!this.#historicalEnabled || this.#closed) fail();
+    const operation = id(operationId).toString("base64url");
+    this.historicalAdmissionHead();
+    const row = this.#db.prepare(
+      "SELECT receipt FROM witness_cas_sync_historical_admission WHERE operation_id=?")
+      .get(operation);
+    if (!row) return null;
+    const receipt = JSON.parse(row.receipt);
+    return Object.freeze({ admission: Object.freeze(receipt),
+      authorizesHistoricalRead: false, authorizesIo: false });
+  }
+  // Witness-owned issuance after (1) fresh DEVICE Ed25519 authorization,
+  // (2) fresh independent mTLS PostgreSQL readback plus inventory signature,
+  // and (3) a previously committed owner-authorized CAS physical fence.
+  // The receipt is returned ONLY after an immutable SQLite FULL-sync commit.
+  // This is NOT cross-service atomicity or an external monotonic anchor.
+  async issueSyncHistoricalAdmission(input) {
+    if (!this.#historicalEnabled || this.#closed) fail();
+    const pending = this.#advanceQueue.then(() => this.#issueSyncSerial(input));
+    this.#advanceQueue = pending.catch(() => {});
+    return pending;
+  }
+  async #issueSyncSerial(input) {
+    try {
+      const v = exact(input, ["envelope", "scope", "expectedSequence",
+        "expectedRoot", "inventoryReceipt", "localTrustedDevicePolicy"]);
+      const bound = envelopeBinding(v.envelope, v.scope, v.expectedSequence,
+        v.expectedRoot);
+      const policy = snapshotLocalDevicePolicy(v.localTrustedDevicePolicy);
+      if ((!Buffer.isBuffer(v.inventoryReceipt)
+        && !(v.inventoryReceipt instanceof Uint8Array))
+        || v.inventoryReceipt.length < 1 || v.inventoryReceipt.length > 8192) fail();
+      const signedReceipt = Buffer.from(v.inventoryReceipt);
+      const deviceSpki = Buffer.from(bound.envelope.authorization.publicKey, "base64url");
+      const deviceKey = crypto.createPublicKey({ key: deviceSpki,
+        format: "der", type: "spki" });
+      const witnessKey = crypto.createPublicKey(this.#witness);
+      if (deviceKey.asymmetricKeyType !== "ed25519"
+        || crypto.KeyObject.prototype.equals.call(deviceKey, witnessKey)
+        || crypto.KeyObject.prototype.equals.call(deviceKey, this.#status)
+        || signedReceipt.length < 1 || signedReceipt.length > 8192) fail();
+      this.#attestedAdmission.assertSeparateDevice(deviceKey);
+      if (await verifyAuthorizationProof(bound.envelope.authorization,
+        bound.envelope, policy) !== true
+        || bound.envelope.authorization.expiresAt <= Date.now()) fail();
+      if (this.#db.prepare("SELECT 1 FROM witness_cas_sync_historical_admission WHERE operation_id=?")
+        .get(bound.operation.operation_id.toString("base64url"))) fail();
+      const nonce = crypto.randomBytes(32);
+      const composite = await this.#attestedAdmission.attestSyncCommitted({
+        scope: bound.scope, operation: bound.operation,
+        receipt: signedReceipt, nonce,
+      });
+      if (!composite.pgReadbackVerified || composite.authorizesIo !== false
+        || composite.inventorySequence !== bound.operation.expected_sequence + 1) fail();
+      const fenced = await this.proveCommittedPhysicalFence({ scope: bound.scope,
+        operationId: bound.operation.operation_id,
+        inventorySequence: composite.inventorySequence,
+        inventoryRoot: composite.inventoryRoot, nonce: crypto.randomBytes(32) });
+      const admittedAtMs = Date.now();
+      if (!Number.isSafeInteger(admittedAtMs) || admittedAtMs < 1
+        || admittedAtMs >= bound.envelope.authorization.expiresAt
+        || !Number.isSafeInteger(composite.physicalIssuedAt)
+        || Math.abs(Math.floor(admittedAtMs / 1000)
+          - composite.physicalIssuedAt) > 30) fail();
+      const floor = fenced.signedFloor;
+      const unsigned = {
+        type: "rootark-sync-v2-historical-witness-admission/v1",
+        envelopeSha256: crypto.createHash("sha256")
+          .update(bound.canonicalEnvelope).digest("base64url"),
+        operationId: bound.operation.operation_id.toString("base64url"),
+        deviceId: bound.envelope.deviceId,
+        deviceSpkiSha256: crypto.createHash("sha256").update(deviceSpki)
+          .digest("base64url"),
+        epoch: bound.operation.epoch,
+        checkpointSequence: bound.operation.expected_sequence,
+        checkpointRoot: bound.operation.expected_root.toString("base64url"),
+        inventoryReceiptSha256: composite.receiptSha256.toString("base64url"),
+        admittedAtMs,
+        witnessSequence: floor.sequence,
+        witnessLastHash: floor.lastHash,
+        witnessPhysicalFenceDigest: floor.physicalFenceDigest,
+      };
+      const signature = crypto.sign(null, Buffer.concat([HISTORICAL_SYNC_DOMAIN,
+        Buffer.from(JSON.stringify(unsigned))]), this.#witness);
+      const admission = Object.freeze({ ...unsigned,
+        signature: signature.toString("base64url") });
+      const serialized = JSON.stringify(admission);
+      const previous = this.#historicalHead;
+      const hash = digest(previous.lastHash + "\0" + serialized);
+      const head = this.head();
+      if (head.sequence !== floor.sequence || head.lastHash !== floor.lastHash) fail();
+      this.#assertHistoricalIntegrity();
+      this.#db.transaction(() => {
+        if (this.#db.prepare("SELECT COUNT(*) AS n FROM witness_cas_sync_historical_admission")
+            .get().n !== previous.sequence) fail();
+        this.#db.prepare("INSERT INTO witness_cas_sync_historical_admission"
+          + " (sequence,operation_id,previous_hash,receipt,hash) VALUES(?,?,?,?,?)")
+          .run(previous.sequence + 1, unsigned.operationId,
+            previous.lastHash, serialized, hash);
+      }).immediate();
+      this.#historicalHead = Object.freeze({ sequence: previous.sequence + 1,
+        lastHash: hash });
+      return Object.freeze({ admission, freshFloor: floor,
+        historicalAdmissionHead: this.historicalAdmissionHead(),
+        durableLocalWitnessAdmission: true,
+        independentPhysicalReadbackVerified: true,
+        authorizesHistoricalRead: false, authorizesIo: false,
+        externalCustodyProven: false });
     } catch (_) { fail(); }
   }
   // A signed CAS event is the only admissible means of advancing the floor.

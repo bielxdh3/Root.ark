@@ -124,6 +124,12 @@ class Zk1WitnessCasPhysicalAdmission {
       if (sameKey(pin, status) || sameKey(pin, witness)) deny();
     }
   }
+  assertSeparateDevice(devicePublicKey) {
+    const device = key(devicePublicKey);
+    for (const pin of [this.#owner, this.#inventory, this.#physical]) {
+      if (sameKey(pin, device)) deny();
+    }
+  }
   policyDigest() {
     const nativeSpki = (pin) => Object.getPrototypeOf(pin).export.call(pin, {
       type: "spki", format: "der",
@@ -136,6 +142,51 @@ class Zk1WitnessCasPhysicalAdmission {
       minimumSnapshotSha256: crypto.createHash("sha256")
         .update(this.#minimumSnapshot).digest("hex"),
     })).digest("hex");
+  }
+  // Challenge the witness's ALREADY PINNED independent mTLS PostgreSQL
+  // attestor for the exact Sync envelope operation, and verify both Ed25519
+  // signatures. A writer-provided success boolean is never admitted here.
+  async attestSyncCommitted({ scope, operation, receipt, nonce } = {}) {
+    try {
+      const trustedScope = inventory.normalizeScope(scope);
+      const trustedOperation = {
+        operation_id: Buffer.from(operation.operation_id),
+        expected_sequence: operation.expected_sequence,
+        expected_root: Buffer.from(operation.expected_root),
+        object_id: Buffer.from(operation.object_id), revision: operation.revision,
+        epoch: operation.epoch,
+        ciphertext_sha256: Buffer.from(operation.ciphertext_sha256),
+      };
+      const challenge = Buffer.from(nonce);
+      const signedReceipt = Buffer.from(receipt);
+      if (challenge.length !== 32 || signedReceipt.length < 1
+        || signedReceipt.length > inventory.MAX_COMMITTED_PROOF_BYTES) deny();
+      const raw = await this.#attestorClient.requestAttestation({
+        scope: trustedScope, operation: trustedOperation,
+        nonce: Buffer.from(challenge),
+      });
+      const verified = await verifyAttestedInventoryCommit({
+        receipt: signedReceipt, physicalAttestation: Buffer.from(raw),
+        scope: trustedScope, operation: trustedOperation,
+        nonce: challenge, pinnedInventoryPublicKey: this.#inventory,
+        pinnedInventorySignerKeyId: this.#signerId,
+        pinnedPhysicalAttestorPublicKey: this.#physical,
+        nowSeconds: Math.floor(Date.now() / 1000),
+      });
+      const now = Math.floor(Date.now() / 1000);
+      if (verified.status !== "VERIFIED_COMPOSITE_NONAUTHORIZING"
+        || verified.authorizesIo !== false
+        || !Number.isSafeInteger(verified.physicalReadback.issuedAt)
+        || !Number.isSafeInteger(now) || now < 1
+        || Math.abs(now - verified.physicalReadback.issuedAt) > 30) deny();
+      return Object.freeze({
+        inventorySequence: verified.inventoryReceipt.sequence,
+        inventoryRoot: Buffer.from(verified.inventoryReceipt.root),
+        receiptSha256: crypto.createHash("sha256").update(signedReceipt).digest(),
+        physicalIssuedAt: verified.physicalReadback.issuedAt,
+        pgReadbackVerified: true, authorizesIo: false,
+      });
+    } catch (_) { deny(); }
   }
   async verify(record, evidence, minimumInventory = null) {
     try {
