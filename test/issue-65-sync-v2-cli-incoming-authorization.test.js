@@ -113,14 +113,22 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
   // Strict opt-in must ignore the forgeable on-disk local journal admission.
   config.historicalAdmissionMode = "independent-physical-witness-v1";
   await assert.rejects(sandboxModule.exports.start({ config: "not-opened.json",
-    once: true }), /Independent witness evidence provider/);
+    once: true }), /externally enforced|external.*required/i);
   const externalPins = Object.freeze({ pinnedWitnessPublicKey: "trusted-witness-key",
     pinnedInventoryPublicKey: "trusted-inventory-key", trustedMinimumFloor: {
       sequence: 9, lastHash: "externally-pinned" },
     localTrustedDevicePolicy: { username: "alice",
       trustedDevicePublicKeys: { device1: publicKey }, revokedDeviceIds: [] } });
   let challenge;
+  // A config-only opt-in must not begin running a seemingly strict mode,
+  // even if evidence/pins were injected: deleting this mutable JSON field
+  // would turn on legacy locallyAdmitted admission after a restart.
+  await assert.rejects(sandboxModule.exports.start({ config: "not-opened.json", once: true,
+    trustedHistoricalAdmission: externalPins,
+    historicalEvidenceProvider: async () => ({}) }),
+  /externally enforced|external.*required/i);
   await sandboxModule.exports.start({ config: "not-opened.json", once: true,
+    requireIndependentHistoricalAdmission: true,
     trustedHistoricalAdmission: externalPins,
     historicalEvidenceProvider: async (_operation, args) => {
       challenge = args.nonce;
@@ -190,6 +198,21 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
   // An attacker rolling the JSON config back cannot disable an externally
   // enforced historical policy, even when the old journal claims admission.
   delete config.historicalAdmissionMode;
+  await sandboxModule.exports.start({ config: "not-opened.json", once: true,
+    requireIndependentHistoricalAdmission: true,
+    trustedHistoricalAdmission: externalPins,
+    historicalEvidenceProvider: async () => ({}) });
+  assert.equal(engineOptions.reverifySeenIncoming, true,
+    "JSON mode deletion cannot silently reinstate legacy journal bypass");
+  historicalVerifierArgs = null;
+  try {
+    Date.now = () => signature.expiresAt + 1;
+    assert.equal(await engineOptions.verifyIncoming(signedIncoming,
+      { locallyAdmitted: true }), true,
+    "historical admission must still invoke independent witness verification after restart");
+    assert.ok(historicalVerifierArgs,
+      "external witness verifier remains connected after JSON rollback");
+  } finally { Date.now = now; }
   await assert.rejects(sandboxModule.exports.start({ config: "not-opened.json",
     once: true, requireIndependentHistoricalAdmission: true }),
   /Independent witness evidence provider/);

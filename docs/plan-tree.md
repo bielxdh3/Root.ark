@@ -576,11 +576,15 @@ the caller-owned nonce. The fresh physical witness floor must match an exact
 out-of-band pinned minimum, including its physical-fence digest; this
 conservatively refuses later head advances until signed ancestry is supported.
 The opt-in `independent-physical-witness-v1` CLI engine mode disregards mutable
-local journal historical-admission evidence, can be enforced independently via
+local journal historical-admission evidence, MUST be enforced independently via
 `requireIndependentHistoricalAdmission` or the external
 `ROOTARK_SYNC_REQUIRE_INDEPENDENT_HISTORY=1` environment setting, requires separately injected
 trusted keys/floor and an independent evidence provider, and refuses to start
-without both. Previously seen remote entries are rechecked in strict mode,
+without all. A JSON-only `historicalAdmissionMode` setting is rejected even if
+evidence/pins are supplied: deleting it before restart would silently fall
+back to forgeable legacy `locallyAdmitted` journal evidence. Removing the JSON
+setting does NOT disable the externally required mode. Previously seen remote
+entries are rechecked in strict mode,
 because mutable `seen` journal IDs cannot suppress independent authorization
 on a restarted LIST. Default CLI behavior remains unchanged. Fixture-level negative
 tests cover forged signatures, replay, floor rollback, wrong device/checkpoint,

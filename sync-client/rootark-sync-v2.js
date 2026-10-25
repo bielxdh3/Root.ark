@@ -71,13 +71,15 @@ async function start(options = {}) {
     && historicalMode !== "independent-physical-witness-v1") {
     throw new Error("Unsupported Sync v2 historical admission mode");
   }
-  // The required mode must also be enforceable outside the mutable on-disk
-  // config, or a local attacker can simply delete that JSON setting and
-  // reactivate forgeable local-journal admissions on the next restart.
+  // The required mode MUST be activated outside the mutable on-disk config.
+  // A config-only opt-in would silently become the legacy locallyAdmitted
+  // policy when an attacker deletes this JSON field before a restart.
   const externalMode = options.requireIndependentHistoricalAdmission === true
     || process.env.ROOTARK_SYNC_REQUIRE_INDEPENDENT_HISTORY === "1";
-  const strictHistorical = externalMode
-    || historicalMode === "independent-physical-witness-v1";
+  if (historicalMode === "independent-physical-witness-v1" && !externalMode) {
+    throw new Error("Strict historical admission must be externally enforced; config-only mode is unsafe");
+  }
+  const strictHistorical = externalMode;
   if (strictHistorical && (typeof options.historicalEvidenceProvider !== "function"
     || !options.trustedHistoricalAdmission
     || !options.trustedHistoricalAdmission.localTrustedDevicePolicy)) {
