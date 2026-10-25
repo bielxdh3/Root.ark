@@ -7,7 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const { DatabaseSync } = require("node:sqlite");
-const archiver = require("archiver");
+const { ZipArchive } = require("archiver");
 const unzipper = require("unzipper");
 const { MIGRATIONS } = require("../db/migrations");
 const { inspectZk1LegacyEvidenceManifest: inspect } =
@@ -24,7 +24,7 @@ const backupName = "rootark-backup-2026-10-25-00-00-00.zip";
 async function archive(filename) {
   await new Promise((resolve, reject) => {
     const output = fs.createWriteStream(filename);
-    const zip = archiver("zip", { zlib: { level: 5 } });
+    const zip = new ZipArchive({ zlib: { level: 5 } });
     output.on("close", resolve);
     output.on("error", reject);
     zip.on("error", reject);
@@ -325,7 +325,7 @@ test("ZIP self-inclusion never substitutes for a missing real physical member", 
   const replaced = path.join(f.root, "forged.zip");
   await new Promise((resolve, reject) => {
     const output = fs.createWriteStream(replaced);
-    const zip = archiver("zip", { zlib: { level: 5 } });
+    const zip = new ZipArchive({ zlib: { level: 5 } });
     output.on("close", resolve);
     output.on("error", reject);
     zip.on("error", reject);
