@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const { execFile } = require("node:child_process");
 const crypto = require("node:crypto");
+const fsSync = require("node:fs");
 const fs = require("node:fs/promises");
 const http = require("node:http");
 const os = require("node:os");
@@ -14,7 +15,30 @@ const { createOperation } = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { SyncObjectStore, registerSyncRoutes } = require("../src/routes/sync");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
+const { runMigrations } = require("../db/migrations");
+const { closeDb } = require("../db");
+const usersRepository = require("../repositories/usersRepository");
 const execFileAsync = promisify(execFile);
+
+function configureStrictSqliteAuthority(t) {
+  const directory = fsSync.mkdtempSync(path.join(os.tmpdir(), "rootark-sync-authority-"));
+  const prior = { DATABASE_URL: process.env.DATABASE_URL,
+    DB_ENABLED: process.env.DB_ENABLED, DB_WRITE_LEGACY_JSON: process.env.DB_WRITE_LEGACY_JSON };
+  process.env.DATABASE_URL = path.join(directory, "accounts.sqlite");
+  process.env.DB_ENABLED = "true";
+  process.env.DB_WRITE_LEGACY_JSON = "false";
+  runMigrations({ backup: false });
+  usersRepository.saveUsers([{ username: "alice", role: "user", password: "fixture",
+    sessionVersion: 0, permissions: { upload: true, delete: true } }]);
+  t.after(() => {
+    closeDb();
+    for (const [name, value] of Object.entries(prior)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    fsSync.rmSync(directory, { recursive: true, force: true });
+  });
+}
 
 async function isolatedRegistryDirectory(prefix) {
   if (process.platform !== "win32") return fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -40,6 +64,7 @@ function post(port, body) {
 }
 
 test("revocation committed before sync put must fence operation across authorization gap", async (t) => {
+  configureStrictSqliteAuthority(t);
   const directory = await isolatedRegistryDirectory("rootark-sync-revoke-race-");
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const storagePath = path.join(directory, "objects.json");
@@ -62,7 +87,8 @@ test("revocation committed before sync put must fence operation across authoriza
   app.use(express.json({ limit: "9mb" }));
   const route = registerSyncRoutes({ app, storagePath,
     atomicDeviceRegistry: true, requireDeviceAuthorization: true,
-    authenticate: (req, _res, next) => { req.user = { username: "alice" }; next(); },
+    authenticate: (req, _res, next) => { req.user = { username: "alice", sessionVersion: 0,
+      permissions: { upload: true, delete: true } }; next(); },
     requirePermission: () => (_req, _res, next) => next() });
   await route.ready;
   assert.deepEqual(await route.store.enrollDevice({ username: "alice", deviceId: "device-a", publicKey,
@@ -214,6 +240,7 @@ test("atomic device authorization expires during Ed25519 verification before dur
 });
 
 test("a separate Node process revokes durably before a queued HTTP object commit", async (t) => {
+  configureStrictSqliteAuthority(t);
   const directory = await isolatedRegistryDirectory("rootark-sync-revoke-process-");
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const storagePath = path.join(directory, "objects.json");
@@ -234,7 +261,8 @@ test("a separate Node process revokes durably before a queued HTTP object commit
   app.use(express.json());
   const route = registerSyncRoutes({ app, storagePath, atomicDeviceRegistry: true,
     requireDeviceAuthorization: true,
-    authenticate: (req, _res, next) => { req.user = { username: "alice" }; next(); },
+    authenticate: (req, _res, next) => { req.user = { username: "alice", sessionVersion: 0,
+      permissions: { upload: true, delete: true } }; next(); },
     requirePermission: () => (_req, _res, next) => next() });
   await route.ready;
   await route.store.enrollDevice({ username: "alice", deviceId: "device-a", publicKey, expectedEpoch: 0 });

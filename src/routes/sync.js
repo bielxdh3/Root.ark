@@ -10,6 +10,7 @@ const { attestCiphertextOnlySyncState } = require("../services/deploymentResilie
 const { createSyncBurstGuard } = require("../services/syncBurstGuard");
 const { DEFAULT_WINDOW, decryptSecret, normalizeOtp, verifyRecoveryCodeAsync, verifyTotp } = require("../services/totp");
 const { authorizationDigest } = require("../services/syncResumeAccountProof");
+const { createSyncSqliteAccountWriteFence } = require("../services/syncSqliteAccountWriteFence");
 const {
   MAX_DEVICES, assertAtomicDeviceRegistry, emptyAtomicDeviceRegistry, invalidRegistry,
   validIdentifier, validPublicKey,
@@ -699,6 +700,7 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       code: "SYNC_ATOMIC_DEVICE_CONFIGURATION",
     });
   }
+  const persistUnderAccountFence = atomicDeviceRegistry ? createSyncSqliteAccountWriteFence() : null;
   const audit = (eventType, req, deviceId, action, result, details = {}) => {
     if (typeof auditLog !== "function") return;
     auditLog(eventType, { username: req.user?.username, role: req.user?.role }, { type: "sync_device", id: String(deviceId).slice(0, 200) }, action, result, details);
@@ -782,10 +784,16 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
     }
     let result;
     try {
-      result = await store.put(req.user.username, operation);
+      result = persistUnderAccountFence
+        ? await persistUnderAccountFence(req.user, operation, () => store.put(req.user.username, operation))
+        : await store.put(req.user.username, operation);
     } catch (error) {
-      if (error?.code === "SYNC_ATOMIC_DEVICE_AUTH_REJECTED") {
+      if (error?.code === "SYNC_ATOMIC_DEVICE_AUTH_REJECTED"
+        || error?.code === "SYNC_ATOMIC_ACCOUNT_AUTH_REJECTED") {
         return errorResponse(res, 403, "Sync device authorization rejected");
+      }
+      if (error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE") {
+        return errorResponse(res, 503, "Sync account authorization unavailable");
       }
       if (error?.code === "SYNC_COMMIT_INDETERMINATE" || store.commitIndeterminate) {
         return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
