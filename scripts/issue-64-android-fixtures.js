@@ -20,6 +20,11 @@ const { createAuthorizationProof } = require("../sync-client/rootark-sync-author
 const { registerSyncRoutes } = require("../src/routes/sync");
 const registerAuthRoutes = require("../src/routes/auth");
 const totp = require("../src/services/totp");
+const { runMigrations } = require("../db/migrations");
+const { closeDb } = require("../db");
+const usersRepository = require("../repositories/usersRepository");
+const { createPrivateAuthorityFixture } =
+  require("../test/support/issue-65-private-authority-fixture");
 
 const FIXTURE_PATH = path.join(__dirname, "..", "android", "core", "src", "test", "resources", "server-responses.json");
 const REDACTED = "<redacted>";
@@ -56,21 +61,51 @@ function redact(body) {
 }
 
 async function captureSync(responses) {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-issue64-sync-"));
+  const dir = createPrivateAuthorityFixture("rootark-issue64-sync-");
+  const oldEnv = { DB_ENABLED: process.env.DB_ENABLED,
+    DATABASE_URL: process.env.DATABASE_URL, DB_WRITE_LEGACY_JSON: process.env.DB_WRITE_LEGACY_JSON };
+  process.env.DB_ENABLED = "true";
+  process.env.DB_WRITE_LEGACY_JSON = "false";
+  process.env.DATABASE_URL = path.join(dir, "accounts.sqlite");
+  try {
+    runMigrations({ backup: false });
+    usersRepository.saveUsers([{ username: "alice", password: "fixture-only-hash", role: "user",
+      sessionVersion: 0, permissions: { upload: true, delete: true } }]);
+  } catch (error) {
+    closeDb();
+    for (const [key, value] of Object.entries(oldEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await fsp.rm(dir, { recursive: true, force: true });
+    throw error;
+  }
+  let server;
+  try {
   const app = express();
   app.use(express.json({ limit: "9mb" }));
   // The captured happy-path tombstone is issued by an account authorized to delete.
-  const authenticate = (req, _res, next) => { req.user = { username: "alice", permissions: { delete: true } }; next(); };
+  const authenticate = (req, _res, next) => { req.user = { username: "alice", role: "user",
+    sessionVersion: 0, permissions: { upload: true, delete: true } }; next(); };
   const requirePermission = () => (_req, _res, next) => next();
-  const route = registerSyncRoutes({ app, authenticate, requirePermission, storagePath: path.join(dir, "objects.json") });
+  const route = registerSyncRoutes({ app, authenticate, requirePermission,
+    storagePath: path.join(dir, "objects.json"),
+    atomicDeviceRegistry: true, requireDeviceAuthorization: true });
   await route.ready;
-  const server = await listen(app);
+  server = await listen(app);
   const base = `http://127.0.0.1:${server.address().port}`;
-  try {
     const fileKey = crypto.randomBytes(32);
     const keys = crypto.generateKeyPairSync("ed25519");
     const publicKey = keys.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
     const deviceId = "fixture-device-a";
+    await route.store.enrollDevice({ username: "alice", deviceId, publicKey, expectedEpoch: 0 });
+    // Every captured write is signed and enrolled. Only the wire shape is
+    // committed, never any private key or reusable credential.
+    const signed = async (operation) => ({ ...operation, authorization: await createAuthorizationProof(operation, {
+      username: "alice", privateKey: keys.privateKey, publicKey,
+      expiresAt: Date.now() + 60_000,
+      idempotencyKey: crypto.createHash("sha256").update(operation.operationId).digest("base64url"),
+    }) });
     const common = {
       objectId: "fixture-object-1", fileId: "fixture-file-1", versionId: "fixture-version-1",
       deviceId, keyEpoch: "epoch-1", compartmentId: "private", fileKey,
@@ -81,12 +116,7 @@ async function captureSync(responses) {
       metadata: { path: "docs/readme.txt", name: "readme.txt", contentType: "text/plain", size: 5, parentId: "root" },
       plaintext: Buffer.from("hello"),
     });
-    const authorization = await createAuthorizationProof(create, {
-      username: "alice", privateKey: keys.privateKey, publicKey, expiresAt: Date.now() + 60_000,
-      // Server rejects idempotencyKey lengths that are 1 mod 4; the operationId default (17 chars) is one.
-      idempotencyKey: "fixture-create-key",
-    });
-    const createBody = { ...create, authorization };
+    const createBody = await signed(create);
     const created = expectStatus(await call(base, "POST", "/sync/v1/objects", createBody), 201, "create");
     responses["sync.post.201"] = created;
 
@@ -101,39 +131,47 @@ async function captureSync(responses) {
       baseRevision: { counter: 1, deviceId }, metadata: { path: "docs/readme.txt", name: "readme.txt", contentType: "text/plain", size: 6 },
       plaintext: Buffer.from("hello!"),
     });
-    responses["sync.put.200.update"] = expectStatus(await call(base, "PUT", "/sync/v1/objects/fixture-object-1", update), 200, "update");
+    responses["sync.put.200.update"] = expectStatus(await call(base, "PUT", "/sync/v1/objects/fixture-object-1", await signed(update)), 200, "update");
 
     const stale = protocol.createOperation({
       ...common, operation: "update", operationId: "fixture-op-stale", revision: { counter: 2, deviceId },
       baseRevision: { counter: 2, deviceId }, metadata: { path: "docs/readme.txt", name: "readme.txt", contentType: "text/plain", size: 6 },
       plaintext: Buffer.from("stale"),
     });
-    responses["sync.put.409.stale"] = expectStatus(await call(base, "PUT", "/sync/v1/objects/fixture-object-1", stale), 409, "stale");
+    responses["sync.put.409.stale"] = expectStatus(await call(base, "PUT", "/sync/v1/objects/fixture-object-1", await signed(stale)), 409, "stale");
 
     const conflict = protocol.createOperation({
       ...common, operation: "update", operationId: "fixture-op-conflict", revision: { counter: 3, deviceId },
       baseRevision: { counter: 1, deviceId }, metadata: { path: "docs/readme.txt", name: "readme.txt", contentType: "text/plain", size: 6 },
       plaintext: Buffer.from("conflict"),
     });
-    responses["sync.put.409.base"] = expectStatus(await call(base, "PUT", "/sync/v1/objects/fixture-object-1", conflict), 409, "base conflict");
+    responses["sync.put.409.base"] = expectStatus(await call(base, "PUT", "/sync/v1/objects/fixture-object-1", await signed(conflict)), 409, "base conflict");
 
     const move = protocol.createOperation({
       ...common, operation: "move", operationId: "fixture-op-move", revision: { counter: 3, deviceId },
       baseRevision: { counter: 2, deviceId }, metadata: { path: "docs/moved.txt", sourcePath: "docs/readme.txt" },
       plaintext: Buffer.from(""),
     });
-    responses["sync.put.200.move"] = expectStatus(await call(base, "PUT", "/sync/v1/objects/fixture-object-1", move), 200, "move");
+    responses["sync.put.200.move"] = expectStatus(await call(base, "PUT", "/sync/v1/objects/fixture-object-1", await signed(move)), 200, "move");
 
     const remove = protocol.createOperation({
       ...common, operation: "delete", operationId: "fixture-op-delete", revision: { counter: 4, deviceId },
       baseRevision: { counter: 3, deviceId }, metadata: { path: "docs/moved.txt" }, plaintext: Buffer.from(""),
     });
-    responses["sync.delete.200"] = expectStatus(await call(base, "DELETE", "/sync/v1/objects/fixture-object-1", remove), 200, "delete");
+    responses["sync.delete.200"] = expectStatus(await call(base, "DELETE", "/sync/v1/objects/fixture-object-1", await signed(remove)), 200, "delete");
 
     return { createBody };
   } finally {
-    await closeServer(server);
-    await fsp.rm(dir, { recursive: true, force: true });
+    try {
+      if (server) await closeServer(server);
+    } finally {
+      closeDb();
+      for (const [key, value] of Object.entries(oldEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
   }
 }
 

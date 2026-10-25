@@ -33,12 +33,21 @@ test("JSON migration preserves trash and backup history in SQLite across restart
     for (const directory of ["db", "repositories"]) {
       fs.cpSync(path.join(ROOT, directory), path.join(fixtureRoot, directory), { recursive: true });
     }
+    fs.mkdirSync(path.join(fixtureRoot, "services"), { recursive: true });
+    fs.copyFileSync(path.join(ROOT, "services", "chunkUploadWindowsAcl.js"),
+      path.join(fixtureRoot, "services", "chunkUploadWindowsAcl.js"));
     fs.mkdirSync(path.join(fixtureRoot, "src"), { recursive: true });
     fs.copyFileSync(path.join(ROOT, "src", "runtime-paths.js"), path.join(fixtureRoot, "src", "runtime-paths.js"));
     fs.copyFileSync(path.join(ROOT, "src", "fs-atomic-rename.js"), path.join(fixtureRoot, "src", "fs-atomic-rename.js"));
     fs.mkdirSync(path.join(fixtureRoot, "src", "services"), { recursive: true });
     fs.copyFileSync(path.join(ROOT, "src", "services", "syncResumeAccountProof.js"),
       path.join(fixtureRoot, "src", "services", "syncResumeAccountProof.js"));
+    // The cloned trash repository now imports the strict SQLite account
+    // writer fence. Use its real implementation; a stub would hide failures.
+    fs.copyFileSync(path.join(ROOT, "src", "services", "syncSqliteAccountWriteFence.js"),
+      path.join(fixtureRoot, "src", "services", "syncSqliteAccountWriteFence.js"));
+    fs.copyFileSync(path.join(ROOT, "src", "services", "zk1PrivateSqlitePath.js"),
+      path.join(fixtureRoot, "src", "services", "zk1PrivateSqlitePath.js"));
     fs.mkdirSync(path.join(fixtureRoot, "data"), { recursive: true });
 
     const trashItem = {

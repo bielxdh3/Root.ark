@@ -13,9 +13,11 @@ const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
 const { SyncObjectStore } = require("../src/routes/sync");
 const { attestCiphertextOnlyRecords } = require("../src/services/deploymentResilience");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 test("expired historical device proof remains readable but cannot authorize a new write", async (t) => {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-historical-sync-auth-"));
+  const directory = createPrivateAuthorityFixture("rootark-historical-sync-auth-");
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const file = path.join(directory, "sync.json");
   const keys = crypto.generateKeyPairSync("ed25519");
@@ -29,13 +31,18 @@ test("expired historical device proof remains readable but cannot authorize a ne
     username: "alice", privateKey: keys.privateKey, publicKey, expiresAt: Date.now() + 5000,
   });
   assert.equal(validateOperation(operation).operationId, operation.operationId);
-  const store = await new SyncObjectStore(file).open();
+  // Signed records require an owner-controlled atomic device registry even
+  // in a historical-read fixture. Enroll before the original write, never
+  // allow a legacy unsigned store to bypass revocation fencing.
+  const store = await new SyncObjectStore(file, { atomicDeviceRegistry: true }).open();
+  await store.enrollDevice({ username: "alice", deviceId: "device-a", publicKey,
+    expectedEpoch: 0 });
   assert.equal((await store.put("alice", operation)).kind, "stored");
   const now = Date.now;
   try {
     Date.now = () => operation.authorization.expiresAt + 1;
     assert.throws(() => validateOperation(operation), { code: "authorization_expired" });
-    const reopened = await new SyncObjectStore(file).open();
+    const reopened = await new SyncObjectStore(file, { atomicDeviceRegistry: true }).open();
     assert.equal(reopened.list("alice").length, 1);
     assert.equal(reopened.list("alice")[0].authorization.signature,
       operation.authorization.signature);
