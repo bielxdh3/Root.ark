@@ -83,10 +83,11 @@ class Zk1SharedPgSealedGetReader {
         const sealed = await db.query(`SELECT revision,digest,generation,expected_chunks,root_hash
           FROM zk1_gate.sealed_object WHERE scope_key=$1 AND object_id=$2`, [s.key, objectId]);
         const object = sealed.rows[0];
+        const expectedChunks = Number(object?.expected_chunks);
         if (sealed.rowCount !== 1 || !object || Number(object.revision) !== revision
           || !object.digest.equals(digest) || Number(object.generation) !== generation
-          || !object.root_hash.equals(root) || Number(object.expected_chunks) !== 2
-          || chunkIndex >= Number(object.expected_chunks)) deny();
+          || !object.root_hash.equals(root) || !Number.isSafeInteger(expectedChunks)
+          || expectedChunks < 1 || expectedChunks > 4096 || chunkIndex >= expectedChunks) deny();
         const chunk = await db.query(`SELECT ciphertext FROM zk1_gate.ciphertext_chunk
           WHERE scope_key=$1 AND object_id=$2 AND chunk_index=$3`, [s.key, objectId, chunkIndex]);
         if (chunk.rowCount !== 1 || !Buffer.isBuffer(chunk.rows[0]?.ciphertext)
