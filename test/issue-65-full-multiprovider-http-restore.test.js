@@ -25,7 +25,8 @@ const { Zk1MultiproviderCiphertextRestore,
   require("../src/services/zk1MultiproviderCiphertextRestore");
 const { signOwnerProviderVersionPin } =
   require("../src/services/zk1OwnerProviderVersionPin");
-const { publishSignedCatalogSidecars, recoverSignedCatalogSidecar, zk1CatalogSidecarAddress } =
+const { publishSignedCatalogSidecars, recoverSignedCatalogSidecar,
+  verifyPublishedSignedCatalogSidecars, zk1CatalogSidecarAddress } =
   require("../src/services/zk1CloudSignedCatalogSidecar");
 const { Zk1ExternallyPinnedProviderDomains, signProviderDomainAttestation,
   spkiFingerprint } = require("../src/services/zk1ExternallyPinnedProviderDomains");
@@ -670,6 +671,14 @@ test("restores opaque ciphertext + signed catalog over client HTTP GET from S3 S
   const catalogReaders = catalogTargets.map(({ cloudWriter, expectedContext,
     provider, pinnedDriveFileId, domainAttestation }) => ({ cloudReader: cloudWriter,
     expectedContext, provider, pinnedDriveFileId, domainAttestation }));
+  const verifiedSidecarReadback = await verifyPublishedSignedCatalogSidecars({
+    scope, operationId: operation.operation_id, signedCatalog,
+    readers: catalogReaders, minimumMatchingProviders: 2, providerDomainPinset,
+    deadlineMs: 5000 });
+  assert.equal(verifiedSidecarReadback.status, "SIGNED_CATALOG_EXACT_REMOTE_REREAD");
+  assert.equal(verifiedSidecarReadback.readbackMatched, true);
+  assert.equal(verifiedSidecarReadback.authorizesIo, false);
+  assert.equal(verifiedSidecarReadback.remoteDurabilityProven, false);
   const remoteRecovery = { scope, operation, catalogReaders,
     readers, minimumMatchingProviders: 2, minimumMatchingCatalogProviders: 2 };
 

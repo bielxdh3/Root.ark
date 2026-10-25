@@ -161,10 +161,14 @@ async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog,
 }
 async function recoverSignedCatalogSidecar({ scope, operationId, readers,
   minimumMatchingProviders = 2, providerDomainPinset, deadlineMs, abortSignal,
-  deadline } = {}) {
+  deadline, expectedCatalogSha256 } = {}) {
   if (!Array.isArray(readers) || readers.length < 2 || readers.length > 3
     || !Number.isSafeInteger(minimumMatchingProviders)
     || minimumMatchingProviders < 2 || minimumMatchingProviders > readers.length) deny();
+  // Optional externally retained commitment to the exact published sidecar.
+  // A quorum of two providers alone can agree on an old but well-formed blob.
+  const expectedDigest = expectedCatalogSha256 === undefined ? null
+    : bytes(expectedCatalogSha256, 32);
   const pinned = readers.map((target) => keyIdentity(target, "cloudReader"));
   if (new Set(pinned.map((target) => target.provider)).size !== pinned.length
     || new Set(pinned.map((target) => target.namespace)).size !== pinned.length) deny();
@@ -205,6 +209,8 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
           || now.dev !== opened.dev || now.nlink !== 1n || now.isSymbolicLink()) deny();
       } finally { fs.closeSync(fd); }
       const parsed = parseCatalog(data, operationId);
+      if (expectedDigest && !crypto.timingSafeEqual(
+        crypto.createHash("sha256").update(data).digest(), expectedDigest)) deny();
       recovered.push({ data, parsed, provider: target.provider });
       const matching = recovered.filter((item) => item.data.equals(data));
       if (matching.length >= minimumMatchingProviders) break;
@@ -222,6 +228,16 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
   }
   const eligible = [...groups.values()].filter((group) => group.length >= minimumMatchingProviders);
   if (eligible.length !== 1 || eligible[0].some((value) => !value.data.equals(eligible[0][0].data))) deny();
+  // The principal/namespace attested at the beginning must still own each
+  // counted GET when the quorum completes. A second provider can stall long
+  // enough for the first to be reconfigured or its attestation to expire.
+  for (const match of eligible[0]) {
+    const target = pinned.find((item) => item.provider === match.provider);
+    if (!target || await limit.run(() => target.adapter.resolveInventoryContext()) !== target.context
+      || target.adapter.zk1StorageNamespace() !== target.namespace) deny();
+  }
+  pinnedDomains(providerDomainPinset, scope, pinned);
+  limit.assertActive();
   return Object.freeze({ signedCatalog: eligible[0][0].parsed,
     providers: Object.freeze(eligible[0].map((item) => item.provider)),
     matchingCount: eligible[0].length, remoteDurabilityProven: false,
@@ -229,5 +245,29 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
   } finally { if (!deadline) limit.close(); }
 }
 
+// Read-only reconciliation after a lost PUT acknowledgement or after a process
+// restart. The caller must retain the expected signed wire independently of
+// the providers; verify the exact bytes on >=2 distinct pinned domains.
+// Signatures, cloud fsync, and live protected IO are verified elsewhere.
+async function verifyPublishedSignedCatalogSidecars({ scope, operationId, signedCatalog,
+  readers, minimumMatchingProviders = 2, providerDomainPinset, deadlineMs,
+  abortSignal } = {}) {
+  try {
+    // Capture the exact expected wire before any provider await, so callers
+    // cannot swap a mutable input after the first read and authorize a replay.
+    const expected = encodeCatalog({ ...signedCatalog, operationId });
+    const digest = crypto.createHash("sha256").update(expected).digest();
+    const result = await recoverSignedCatalogSidecar({ scope, operationId,
+      readers, minimumMatchingProviders, providerDomainPinset, deadlineMs,
+      abortSignal, expectedCatalogSha256: digest });
+    return Object.freeze({ status: "SIGNED_CATALOG_EXACT_REMOTE_REREAD",
+      catalogSha256: Buffer.from(digest), matchingCount: result.matchingCount,
+      providers: result.providers, readbackMatched: true,
+      authorizesIo: false, signaturesVerifiedBySidecar: false,
+      remoteDurabilityProven: false, providerPhysicalIndependenceProven: false });
+  } catch (_) { deny(); }
+}
+
 module.exports = { publishSignedCatalogSidecars, recoverSignedCatalogSidecar,
+  verifyPublishedSignedCatalogSidecars,
   zk1CatalogSidecarAddress: copyAddress };
