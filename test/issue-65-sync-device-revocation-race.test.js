@@ -159,6 +159,48 @@ test("registered signer can commit; wrong signer, revoked signer, and legacy pro
   assert.deepEqual(store.list("alice").map((record) => record.objectId), ["object-good"]);
 });
 
+test("atomic device authorization expires during Ed25519 verification before durable commit", async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-sync-expiry-race-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = await new SyncObjectStore(path.join(directory, "objects.json"),
+    { atomicDeviceRegistry: true }).open();
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const publicKey = signer.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  await store.enrollDevice({ username: "alice", deviceId: "device-expiry", publicKey,
+    expectedEpoch: 0 });
+  const operation = createOperation({ operation: "create", objectId: "expired-object",
+    fileId: "expired-file", versionId: "expired-version", operationId: "expired-operation",
+    deviceId: "device-expiry", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 1, deviceId: "device-expiry" },
+    metadata: { path: "expired.txt" }, plaintext: Buffer.from("ciphertext fixture"),
+    fileKey: crypto.randomBytes(32) });
+  const nativeNow = Date.now;
+  const nativeVerify = crypto.verify;
+  const expiresAt = nativeNow() + 60_000;
+  operation.authorization = await createAuthorizationProof(operation,
+    { username: "alice", publicKey, privateKey: signer.privateKey, expiresAt });
+  let verifiedRealSignature = false;
+  try {
+    Date.now = () => verifiedRealSignature ? expiresAt + 1 : nativeNow();
+    crypto.verify = function (...args) {
+      const result = nativeVerify.apply(this, args);
+      if (result === true) verifiedRealSignature = true;
+      return result;
+    };
+    await assert.rejects(store.put("alice", operation),
+      { code: "SYNC_ATOMIC_DEVICE_AUTH_REJECTED" },
+      "real signed proof must be rejected if its clock expires before persistence");
+  } finally {
+    crypto.verify = nativeVerify;
+    Date.now = nativeNow;
+  }
+  assert.equal(verifiedRealSignature, true, "native Ed25519 signature must actually verify");
+  assert.deepEqual(store.list("alice"), [], "expired proof cannot durably write ciphertext");
+  const restarted = await new SyncObjectStore(path.join(directory, "objects.json"),
+    { atomicDeviceRegistry: true }).open();
+  assert.deepEqual(restarted.list("alice"), [], "expired proof cannot survive restart");
+});
+
 test("a separate Node process revokes durably before a queued HTTP object commit", async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-sync-revoke-process-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));

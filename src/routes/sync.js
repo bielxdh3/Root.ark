@@ -477,6 +477,10 @@ class SyncObjectStore {
             username, trustedDevicePublicKeys: { [input.deviceId]: record.publicKey },
           }) !== true) throw atomicDeviceAuthError();
         } catch { throw atomicDeviceAuthError(); }
+        // The device proof may expire while the Ed25519 verifier awaits. Its
+        // earlier check is not sufficient to authorize a later durable write.
+        if (!Number.isSafeInteger(input.authorization.expiresAt)
+          || input.authorization.expiresAt <= Date.now()) throw atomicDeviceAuthError();
       }
       const at = this.now();
       const user = this.user(next, username);
@@ -512,6 +516,11 @@ class SyncObjectStore {
       setOwnRecord(user.seen, input.operationId, true);
       const seenIds = Object.keys(user.seen);
       for (const oldId of seenIds.slice(0, Math.max(0, seenIds.length - MAX_SEEN_OPERATIONS))) delete user.seen[oldId];
+      if (this.atomicDeviceRegistry && input.authorization.expiresAt <= Date.now()) {
+        // No awaited processing remains inside this mutator. Reject if the
+        // signed authorization expired while applying the bounded mutation.
+        throw atomicDeviceAuthError();
+      }
       return { kind: "stored", record };
     });
   }
