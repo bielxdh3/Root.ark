@@ -54,7 +54,8 @@ const server = createZk1PgPhysicalAttestorHttpsServer({
   signerPrivateKey: crypto.createPrivateKey(fs.readFileSync(config.signerKeyPath)),
   verifier: pool ? new Zk1SharedPgPhysicalCiphertextVerifier({ pool })
     : new ProtocolFixtureVerifier(),
-  principals: { [config.allowedFingerprint]: [scope] },
+  principals: { [config.allowedFingerprint]: [scope],
+    ...(config.additionalFingerprint ? { [config.additionalFingerprint]: [scope] } : {}) },
 });
 server.listen(0, "127.0.0.1", () => process.send?.({ port: server.address().port }));
 process.on("SIGTERM", () => server.close(async () => {

@@ -36,6 +36,12 @@ const { createZk1PgPhysicalAttestorHttpsClient } =
   require("../src/services/zk1PgPhysicalAttestorHttpsClient");
 const { verifyCommittedPhysicalReadback } =
   require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
+const { Zk1WitnessCasPhysicalAdmission } =
+  require("../src/services/zk1WitnessCasPhysicalAdmission");
+const { Zk1WitnessCasAnchorFloor } =
+  require("../src/services/zk1WitnessCasAnchorFloor");
+const { Zk1CasTerminalAnchor } =
+  require("../src/services/zk1CasTerminalAnchor");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 
@@ -54,7 +60,7 @@ test("real PG18 child read-only attestor binds strict mTLS signed chain across r
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-real-pg-attestor-chain-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10 }));
   generateNativeFixtureCertificates(dir, { caSubject: "ZK65 real PG18 chain lab",
-    servers: ["attestor", "inventory"], clients: ["inventory-service", "reader"] });
+    servers: ["attestor", "inventory"], clients: ["inventory-service", "reader", "witness"] });
   const read = (name) => fs.readFileSync(path.join(dir, name));
   const physicalSigner = crypto.generateKeyPairSync("ed25519");
   assert.equal(crypto.KeyObject.prototype.equals.call(physicalSigner.publicKey,
@@ -71,7 +77,8 @@ test("real PG18 child read-only attestor binds strict mTLS signed chain across r
     serverKeyPath: path.join(dir, "attestor.key"),
     serverCertPath: path.join(dir, "attestor.pem"),
     signerKeyPath: path.join(dir, "physical-signer.key"),
-    allowedFingerprint: new crypto.X509Certificate(read("inventory-service.pem")).fingerprint256 };
+    allowedFingerprint: new crypto.X509Certificate(read("inventory-service.pem")).fingerprint256,
+    additionalFingerprint: new crypto.X509Certificate(read("witness.pem")).fingerprint256 };
   const cfgPath = path.join(dir, "child.json");
   fs.writeFileSync(cfgPath, JSON.stringify(cfg), { mode: 0o600 });
   const child = spawn(process.execPath,
@@ -153,6 +160,59 @@ test("real PG18 child read-only attestor binds strict mTLS signed chain across r
   assert.equal(first.independentPhysicalChainVerified, true);
   assert.equal(first.authenticatedProofChain.length, 1);
   assert.equal(first.authenticatedPhysicalProofChain.length, 1);
+  const status = crypto.generateKeyPairSync("ed25519");
+  const witness = crypto.generateKeyPairSync("ed25519");
+  const owner = crypto.generateKeyPairSync("ed25519");
+  const statusKeyId = crypto.randomBytes(16);
+  const witnessKeyId = crypto.randomBytes(16);
+  const anchor = new Zk1CasTerminalAnchor(path.join(dir, "cas-anchor.log"), {
+    bootstrapNew: true, statusKeyId, statusPrivateKey: status.privateKey });
+  const reservation = crypto.randomBytes(16);
+  const query = { ...f.scope, reservation_id: reservation };
+  const ticket = crypto.randomBytes(80), manifest = crypto.randomBytes(120);
+  anchor.prepare(query, ticket, "committed", manifest);
+  await anchor.append(query, ticket, "committed", manifest, crypto.randomBytes(64));
+  const record = fs.readFileSync(anchor.filename, "utf8").trimEnd().split("\n").at(-1);
+  const recordHash = crypto.createHash("sha256").update(record).digest("hex");
+  const admissionScope = f.scope.account_id.toString("hex") + ":"
+    + f.scope.compartment_id.length + ":" + f.scope.compartment_id.toString("hex")
+    + ":" + f.scope.keyring_id.toString("hex");
+  const committed = await f.ledger.getOperationStatus(f.op.operation_id);
+  assert.equal(committed.status, "committed");
+  const binding = { recordHash, scope: wireScope, operation: wireOperation,
+    inventoryReceipt: committed.proof.toString("base64url") };
+  const evidence = { ...binding, ownerSignature: crypto.sign(null,
+    Buffer.concat([Buffer.from("Root.ark/zk-1/cas-witness-physical-owner-binding/v1\0"),
+      Buffer.from(JSON.stringify(binding))]), owner.privateKey).toString("base64url") };
+  const witnessAttestorClient = createZk1PgPhysicalAttestorHttpsClient({
+    endpoint: `https://localhost:${physicalPort}`, ca: read("ca.pem"),
+    clientKey: read("witness.key"), clientCert: read("witness.pem"),
+    serverFingerprint256: new crypto.X509Certificate(read("attestor.pem")).fingerprint256,
+  });
+  const unauthorizedAttestorClient = createZk1PgPhysicalAttestorHttpsClient({
+    endpoint: `https://localhost:${physicalPort}`, ca: read("ca.pem"),
+    clientKey: read("reader.key"), clientCert: read("reader.pem"),
+    serverFingerprint256: new crypto.X509Certificate(read("attestor.pem")).fingerprint256,
+  });
+  await assert.rejects(unauthorizedAttestorClient.requestAttestation({
+    scope: f.scope, operation: f.op, nonce: crypto.randomBytes(32),
+  }), /ZK_PHYSICAL_ATTESTOR_TRANSPORT_UNAVAILABLE/,
+  "a reader mTLS identity cannot challenge the independent PG attestor");
+  const admission = new Zk1WitnessCasPhysicalAdmission({
+    pinnedOwnerPublicKey: owner.publicKey,
+    pinnedInventoryPublicKey: f.keys.publicKey,
+    pinnedInventorySignerKeyId: f.signerKeyId,
+    pinnedPhysicalAttestorPublicKey: physicalSigner.publicKey,
+    physicalAttestorClient: witnessAttestorClient, inventoryClient: reader,
+    trustedMinimumInventoryHead: minimumHead,
+    trustedMinimumInventorySnapshot: minimumSnapshot,
+  });
+  const floor = new Zk1WitnessCasAnchorFloor(path.join(dir, "witness-floor.sqlite"), {
+    bootstrapNew: true, witnessKeyId, witnessPrivateKey: witness.privateKey,
+    statusKeyId, statusPublicKey: status.publicKey, attestedAdmission: admission });
+  t.after(() => floor.close());
+  assert.equal((await floor.advanceAttested({ records: [record], evidence: [evidence] })).sequence, 1,
+    "independently challenged real PG readback must precede witness floor advance");
   await drainZk1ContentInventoryHttpsServer(server);
   await f.restart();
   reader = await startInventory();
