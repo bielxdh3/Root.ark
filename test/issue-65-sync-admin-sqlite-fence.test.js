@@ -10,6 +10,7 @@ const path = require("node:path");
 const { execFile, spawn } = require("node:child_process");
 const { promisify } = require("node:util");
 const { performance } = require("node:perf_hooks");
+const vm = require("node:vm");
 const test = require("node:test");
 const express = require("express");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
@@ -562,6 +563,7 @@ test("busy sidecar cleanup after main commit remains retryable without failing a
   const program = `const D=require(process.argv[1]);const db=new D(process.argv[2]);db.exec("BEGIN IMMEDIATE");process.stdout.write("LOCKED\\n");setTimeout(()=>{db.exec("ROLLBACK");db.close()},700)`;
   const child = spawn(process.execPath, ["-e", program, require.resolve("better-sqlite3"), sidecar],
     { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  const childEnded = new Promise((resolve) => child.once("exit", resolve));
   t.after(() => { if (child.exitCode === null) child.kill(); });
   await new Promise((resolve, reject) => {
     child.stdout.once("data", (data) => data.toString().includes("LOCKED") ? resolve() : reject(new Error("No sidecar lock")));
@@ -572,7 +574,7 @@ test("busy sidecar cleanup after main commit remains retryable without failing a
   // process. It must retain the pending duplicate, not claim HTTP500.
   assert.doesNotThrow(() => auditRepository.saveAuditLogs({ logs: [event] }));
   assert.equal(getDb().prepare("SELECT COUNT(*) AS n FROM audit_logs WHERE id=?").get(event.id).n, 1);
-  await new Promise((resolve) => child.once("exit", resolve));
+  await childEnded;
   assert.equal(auditRepository.loadAuditLogs().logs.filter(({ id }) => id === event.id).length, 1);
   auditRepository.saveAuditLogs({ logs: [event] });
   assert.equal(auditRepository.loadAuditLogs().logs.filter(({ id }) => id === event.id).length, 1);
@@ -690,6 +692,130 @@ test("busy external audit sidecar writer fails promptly without corrupting earli
     child.once("exit", resolve);
   });
   assert.equal(auditRepository.loadAuditLogs().logs.filter((entry) => entry.id === id).length, 1);
+});
+
+test("strict malformed archived_audit fails closed through actual server audit loader instead of empty fallback", async (t) => {
+  await fixture(t);
+  const pending = { id: crypto.randomUUID(), eventType: "file.access.denied",
+    timestamp: new Date().toISOString(), action: "denied", result: "failure" };
+  auditRepository.deferAuditLog(pending);
+  const sidecar = path.join(process.env.DATABASE_URL + ".audit-private", "pending.sqlite");
+  const sqlite = new (require("better-sqlite3"))(sidecar);
+  try {
+    sqlite.exec("DROP TABLE archived_audit; CREATE TABLE archived_audit (wrong_column TEXT NOT NULL)");
+  } finally { sqlite.close(); }
+
+  assert.throws(() => auditRepository.loadAuditLogs(),
+    { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" },
+    "valid pending evidence cannot be ignored when archive schema is corrupt");
+  assert.throws(() => auditRepository.loadArchivedAuditLogs(),
+    { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" });
+
+  // Execute the real server.js loadAuditLogs function without starting its
+  // singleton server/background maintenance; it must propagate 503-class
+  // errors instead of returning getDefaultAuditLogs/JSON fallbacks.
+  const source = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const start = source.indexOf("function loadAuditLogs(file = AUDIT_LOGS_FILE) {");
+  const end = source.indexOf("\nfunction saveAuditLogs(", start);
+  assert.ok(start > 0 && end > start, "server audit loader must be located");
+  const auditLogsFile = path.join(process.env.DATABASE_URL + ".legacy-audit.json");
+  fs.writeFileSync(auditLogsFile, JSON.stringify({ logs: [{ id: "FABRICATED_JSON_FALLBACK" }] }));
+  const load = vm.runInNewContext(source.slice(start, end) + "\nloadAuditLogs;", {
+    AUDIT_LOGS_FILE: auditLogsFile,
+    AUDIT_ARCHIVE_FILE: auditLogsFile + ".archive",
+    dbConfig: require("../db"),
+    auditRepository, fs,
+    shouldUseDatabase: () => true,
+    shouldReadJsonFallback: () => true,
+    getDefaultAuditLogs: () => ({ logs: [{ id: "FABRICATED_EMPTY_FALLBACK" }] }),
+    console,
+  });
+  assert.throws(() => load(), { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" },
+    "server loader must not invent audit contents or return legacy JSON on strict integrity failure");
+
+  // Exercise actual audit router + production error middleware over HTTP.
+  // Authentication is supplied by this isolated disposable fixture; no
+  // production session or server.js timers are started.
+  const api = express();
+  require("../src/routes/audit")(api, {
+    authenticate: (_req, _res, next) => next(),
+    requireAuditAccess: (_req, _res, next) => next(),
+    getFilteredAuditLogs: () => load().logs,
+  });
+  const errorStart = source.lastIndexOf("app.use((error, _req, res, next) => {");
+  const errorEnd = source.indexOf("\n});", errorStart);
+  assert.ok(errorStart > 0 && errorEnd > errorStart, "production HTTP 503 middleware must exist");
+  vm.runInNewContext(source.slice(errorStart, errorEnd + 4), { app: api });
+  const listener = await new Promise((resolve) => {
+    const server = api.listen(0, "127.0.0.1", () => resolve(server));
+  });
+  t.after(() => new Promise((resolve) => listener.close(resolve)));
+  const response = await new Promise((resolve, reject) => {
+    http.get({ host: "127.0.0.1", port: listener.address().port, path: "/audit/logs" }, (res) => {
+      let body = "";
+      res.on("data", (part) => { body += part; });
+      res.on("end", () => resolve({ status: res.statusCode, body, headers: res.headers }));
+    }).on("error", reject);
+  });
+  assert.equal(response.status, 503, "broken audit journal must return HTTP 503 instead of fabricated 200");
+  assert.equal(JSON.parse(response.body).code, "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE");
+  assert.equal(response.headers["retry-after"], "1");
+});
+
+test("strict main audit SQL schema faults fail closed on read and write; legacy stays unmarked", async (t) => {
+  await fixture(t);
+  const db = getDb();
+  db.exec("ALTER TABLE audit_logs RENAME TO audit_logs_damaged");
+  assert.throws(() => auditRepository.loadAuditLogs(), { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" });
+  assert.throws(() => auditRepository.saveAuditLogs({ logs: [] }),
+    { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" });
+  assert.equal(db.prepare("SELECT mode FROM rootark_strict_sync_audit_mode WHERE id=1").get().mode,
+    "append_only", "a failed audit SQL operation cannot downgrade the enrolled strict marker");
+});
+
+test("strict empty audit view never substitutes stale JSON when JSON fallback is configured", async (t) => {
+  await fixture(t);
+  const auditFile = path.join(process.env.DATABASE_URL + ".legacy-audit.json");
+  fs.writeFileSync(auditFile, JSON.stringify({ logs: [
+    { id: "FABRICATED_STALE_JSON_AUDIT", eventType: "auth.login.failed" },
+  ] }));
+  const source = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const start = source.indexOf("function loadAuditLogs(file = AUDIT_LOGS_FILE) {");
+  const end = source.indexOf("\nfunction saveAuditLogs(", start);
+  const load = vm.runInNewContext(source.slice(start, end) + "\nloadAuditLogs;", {
+    AUDIT_LOGS_FILE: auditFile, AUDIT_ARCHIVE_FILE: auditFile + ".archive",
+    auditRepository, dbConfig: require("../db"), fs, console,
+    shouldUseDatabase: () => true, shouldReadJsonFallback: () => true,
+    getDefaultAuditLogs: () => ({ logs: [] }),
+  });
+  assert.deepEqual(Array.from(load().logs), [],
+    "durably enrolled strict audit must not accept a fabricated legacy JSON log when active table is empty");
+});
+
+test("strict sidecar SQLite BUSY during load maps to explicit retryable 503-class unavailable", async (t) => {
+  await fixture(t);
+  const pending = { id: crypto.randomUUID(), eventType: "file.access.denied",
+    timestamp: new Date().toISOString(), action: "denied", result: "failure" };
+  auditRepository.deferAuditLog(pending);
+  const sidecar = path.join(process.env.DATABASE_URL + ".audit-private", "pending.sqlite");
+  const program = `const D=require(process.argv[1]);const db=new D(process.argv[2]);db.pragma("locking_mode = EXCLUSIVE");db.exec("BEGIN EXCLUSIVE");process.stdout.write("HELD\\n");setTimeout(()=>{db.exec("ROLLBACK");db.close()},1200)`;
+  const child = spawn(process.execPath, ["-e", program, require.resolve("better-sqlite3"), sidecar],
+    { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  const childEnded = new Promise((resolve) => child.once("exit", resolve));
+  await new Promise((resolve, reject) => {
+    child.stdout.once("data", (data) => data.toString().includes("HELD") ? resolve() : reject(new Error("Writer lock not held")));
+    child.once("error", reject);
+    child.once("exit", (code) => reject(new Error(`Writer lock ended early ${code}`)));
+  });
+  try {
+    const began = performance.now();
+    assert.throws(() => auditRepository.loadAuditLogs(), { code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" });
+    assert.ok(performance.now() - began < 1000, "read must not synchronously stall for 5 seconds");
+  } finally {
+    await childEnded;
+  }
+  assert.equal(auditRepository.loadAuditLogs().logs.filter(({ id }) => id === pending.id).length, 1);
 });
 
 test("strict REST rejects a missing SQLite authority or concurrent legacy JSON account writes at setup", (t) => {

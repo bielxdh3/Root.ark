@@ -72,24 +72,56 @@ function assertSafePendingFiles(filename) {
   }
 }
 
+function sidecarUnavailable(error) {
+  if (error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE") return error;
+  return Object.assign(new Error("Durable strict audit journal unavailable or corrupt", { cause: error }), {
+    code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+  });
+}
+
+function assertAuditTableSchema(db, name) {
+  const type = db.prepare("SELECT type FROM sqlite_master WHERE name = ?").get(name);
+  if (type?.type !== "table") throw new Error("Invalid durable audit table type");
+  const columns = db.pragma(`table_info(${name})`);
+  if (columns.length !== 2
+    || columns[0].name !== "id" || columns[0].type.toUpperCase() !== "TEXT"
+    || columns[0].notnull !== 1 || columns[0].pk !== 1
+    || columns[1].name !== "event" || columns[1].type.toUpperCase() !== "TEXT"
+    || columns[1].notnull !== 1 || columns[1].pk !== 0) {
+    throw new Error("Invalid durable audit table schema");
+  }
+}
+
 // Separate, FULL-durable SQLite sidecar: when strict Sync holds the MAIN SQLite
 // writer reservation across fsync, audit events still need a crash-safe home.
 // The sidecar never bypasses the main account authorization transaction.
 function withPendingAuditDb(callback) {
-  const filename = preparePendingAuditJournal();
-  assertSafePendingFiles(filename);
-  if (isStrictSyncModeObserved() && !fs.existsSync(filename)) {
-    throw Object.assign(new Error("Previously enrolled strict audit journal missing"), {
-      code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
-    });
-  }
-  const db = new Database(filename, { timeout: 100 });
+  let db;
   try {
+    const filename = preparePendingAuditJournal();
+    assertSafePendingFiles(filename);
+    const strict = isStrictSyncModeObserved();
+    if (strict && !fs.existsSync(filename)) {
+      throw Object.assign(new Error("Previously enrolled strict audit journal missing"), {
+        code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+      });
+    }
+    db = new Database(filename, { timeout: 100, fileMustExist: strict });
     // Sidecar is a separate SQLite file, NOT the locked account authority.
     // A small bounded writer wait serializes peers without a five-second
     // event-loop stall. Exhaustion is explicit fail-closed, never lost log.
     db.pragma("busy_timeout = 100");
-    db.pragma("journal_mode = WAL");
+    if (strict) {
+      // A WAL read may overlap another process's BEGIN IMMEDIATE. Setting
+      // journal_mode=WAL again can require a writer lock and turn a harmless
+      // read into SQLITE_BUSY before main audit commit. Never mutate an
+      // enrolled journal's mode: verify and reject a downgrade instead.
+      if (String(db.pragma("journal_mode", { simple: true })).toLowerCase() !== "wal") {
+        throw new Error("Durable strict audit journal is not WAL");
+      }
+    } else {
+      db.pragma("journal_mode = WAL");
+    }
     db.pragma("synchronous = FULL");
     if (db.pragma("synchronous", { simple: true }) !== 2) throw new Error("Pending audit journal must be durable");
     // On POSIX, SQLite uses the process umask and may otherwise expose new
@@ -99,14 +131,29 @@ function withPendingAuditDb(callback) {
         if (fs.existsSync(candidate)) fs.chmodSync(candidate, 0o600);
       }
     }
-    db.exec("CREATE TABLE IF NOT EXISTS pending_audit (id TEXT PRIMARY KEY NOT NULL, event TEXT NOT NULL)");
-    // The archive is a separate, FULL-durable tombstone ledger. A stale
-    // snapshot can never resurrect an archived ID, even after another process
-    // drops its staged pending copy.
-    db.exec("CREATE TABLE IF NOT EXISTS archived_audit (id TEXT PRIMARY KEY NOT NULL, event TEXT NOT NULL)");
+    // Only initial, unmarked enrollment may initialize schema. Once the main
+    // SQLite has durably enrolled strict mode, missing/malformed tables are
+    // evidence of loss or tampering, NEVER grounds for recreating empty logs.
+    if (!strict) {
+      db.exec("CREATE TABLE IF NOT EXISTS pending_audit (id TEXT PRIMARY KEY NOT NULL, event TEXT NOT NULL)");
+      db.exec("CREATE TABLE IF NOT EXISTS archived_audit (id TEXT PRIMARY KEY NOT NULL, event TEXT NOT NULL)");
+    }
+    assertAuditTableSchema(db, "pending_audit");
+    assertAuditTableSchema(db, "archived_audit");
     return callback(db);
+  } catch (error) {
+    // A strict sidecar SQL error, malformed schema, WAL contention, integrity
+    // error or unreadable path MUST propagate as 503; returning a fabricated
+    // empty audit list would hide an already acknowledged security event.
+    if (isStrictSyncModeObserved()) throw sidecarUnavailable(error);
+    throw error;
   } finally {
-    db.close();
+    if (db) {
+      try { db.close(); } catch (error) {
+        if (isStrictSyncModeObserved()) throw sidecarUnavailable(error);
+        throw error;
+      }
+    }
   }
 }
 
@@ -152,6 +199,7 @@ function archiveAuditLogs(logs) {
         code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
       });
     }
+    if (isStrictSyncModeObserved()) throw sidecarUnavailable(error);
     throw error;
   }
 }
@@ -329,23 +377,28 @@ function logToRow(log) {
 }
 
 function loadAuditLogs() {
-  const rows = getDb().prepare(`
+  try {
+    const rows = getDb().prepare(`
     SELECT id, event_type, severity, actor_username, actor_ip, target_type, target_id, action, result, timestamp, details_json
     FROM audit_logs
     ORDER BY timestamp ASC
   `).all();
-  const logs = rows.map(rowToLog);
-  const seen = new Set(logs.map(({ id }) => id));
-  for (const log of pendingAudits()) {
-    if (!seen.has(log.id)) { seen.add(log.id); logs.push(log); }
+    const logs = rows.map(rowToLog);
+    const seen = new Set(logs.map(({ id }) => id));
+    for (const log of pendingAudits()) {
+      if (!seen.has(log.id)) { seen.add(log.id); logs.push(log); }
+    }
+    const archived = archivedAuditIds(logs.map(({ id }) => id));
+    const activeLogs = logs.filter(({ id }) => !archived.has(id));
+    activeLogs.sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
+    return { logs: activeLogs };
+  } catch (error) {
+    if (isStrictSyncModeObserved()) throw sidecarUnavailable(error);
+    throw error;
   }
-  const archived = archivedAuditIds(logs.map(({ id }) => id));
-  const activeLogs = logs.filter(({ id }) => !archived.has(id));
-  activeLogs.sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
-  return { logs: activeLogs };
 }
 
-function saveAuditLogs(entries = {}) {
+function saveAuditLogsImpl(entries = {}) {
   assertNoLocalStrictSyncWriter();
   const db = getDb();
   const logs = Array.isArray(entries?.logs) ? entries.logs : [];
@@ -413,15 +466,26 @@ function saveAuditLogs(entries = {}) {
         })();
       });
     } catch (error) {
-      if (["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_BUSY_SNAPSHOT"].includes(error?.code)) {
+      const sqliteBusy = (value) => ["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_BUSY_SNAPSHOT"].includes(value);
+      if (sqliteBusy(error?.code)
+        || (error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE" && sqliteBusy(error?.cause?.code))) {
         // Main audit event is already committed and durable. Cleanup is
-        // idempotent: retaining the pending record is safer than throwing an
-        // ambiguous HTTP 500 AFTER acknowledging the primary write.
+        // idempotent: ONLY transient SQLite writer contention is deferrable.
+        // A malformed schema or integrity error must never be suppressed.
         console.warn("Deferred non-destructive audit journal cleanup after SQLite contention");
       } else {
         throw error;
       }
     }
+  }
+}
+
+function saveAuditLogs(entries = {}) {
+  try {
+    return saveAuditLogsImpl(entries);
+  } catch (error) {
+    if (isStrictSyncModeObserved()) throw sidecarUnavailable(error);
+    throw error;
   }
 }
 

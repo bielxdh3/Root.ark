@@ -1337,9 +1337,19 @@ function loadAuditLogs(file = AUDIT_LOGS_FILE) {
   if (shouldUseDatabase() && file === AUDIT_LOGS_FILE) {
     try {
       const entries = auditRepository.loadAuditLogs();
-      if (entries.logs.length || !shouldReadJsonFallback()) return entries;
+      // Once the MAIN SQLite records strict audit enrollment, even a truly
+      // empty active audit view is authoritative. A JSON mirror must never
+      // fabricate stale audit evidence or hide a broken sidecar.
+      if (dbConfig.isStrictSyncModeObserved() || entries.logs.length || !shouldReadJsonFallback()) {
+        return entries;
+      }
     } catch (error) {
       if (error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE") throw error;
+      if (dbConfig.isStrictSyncModeObserved()) {
+        throw Object.assign(new Error("Durable strict audit unavailable", { cause: error }), {
+          code: "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE",
+        });
+      }
       console.error("Falha ao ler auditoria do SQLite:", error.message);
       if (!shouldReadJsonFallback()) return getDefaultAuditLogs();
     }
