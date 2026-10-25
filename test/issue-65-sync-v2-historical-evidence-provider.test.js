@@ -13,6 +13,8 @@ const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
+const { signCommittedPhysicalReadback } =
+  require("../src/crypto/rootark-zk-pg-physical-attestation-v1");
 const { envelopeBinding, verifySyncV2HistoricalWitnessAdmission } =
   require("../sync-client/rootark-sync-zk1-physical-binding");
 const { createSyncV2HistoricalEvidenceProvider } =
@@ -71,7 +73,7 @@ test("Sync v2 historical provider uses real child witness mTLS and fails closed 
   });
   operation.authorization = await createAuthorizationProof(operation, {
     username: "alice", privateKey: device.privateKey, publicKey: deviceSpki,
-    expiresAt: Date.now() + 120_000,
+    expiresAt: Date.now() + 600_000,
   });
   const bound = envelopeBinding(operation, scope, 0, expectedRoot);
   const entry = {
@@ -142,8 +144,6 @@ test("Sync v2 historical provider uses real child witness mTLS and fails closed 
   assert.equal(sent.receipt, sha(receipt));
   assert.equal(sent.envelope, sha(bound.canonicalEnvelope));
   assert.deepEqual(sent.scope, wireScope(scope));
-  await assert.rejects(provider(operation, { nonce }),
-    /SYNC_V2_HISTORICAL_EVIDENCE_UNAVAILABLE/, "cannot reuse a challenge");
   const originalPolicy = { username: "alice",
     trustedDevicePublicKeys: { "device-a": deviceSpki }, revokedDeviceIds: [] };
   const verified = await verifySyncV2HistoricalWitnessAdmission({
@@ -190,6 +190,38 @@ test("Sync v2 historical provider uses real child witness mTLS and fails closed 
       }
       if (responseMode === "forged-signature") mutated.admission.signature = random(64).toString("base64url");
       if (responseMode === "wrong-authority") mutated.authority = "WITNESS_ENGINE_ONLY";
+      if (responseMode === "fresh-signed") {
+        const currentNonce = Buffer.from(challenge, "base64url");
+        const floorUnsigned = { ...proof.freshFloor, nonce: challenge };
+        delete floorUnsigned.signature;
+        mutated.freshFloor = { ...floorUnsigned,
+          signature: crypto.sign(null, Buffer.concat([
+            Buffer.from("Root.ark/zk-1/witness-cas-physical-floor/v2\0"),
+            Buffer.from(JSON.stringify(floorUnsigned)),
+          ]), repeatedWitness.privateKey).toString("base64url"),
+        };
+        const admissionUnsigned = { ...proof.admission };
+        delete admissionUnsigned.signature;
+        mutated.admission = { ...admissionUnsigned,
+          signature: crypto.sign(null, Buffer.concat([
+            Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0"),
+            Buffer.from(JSON.stringify(admissionUnsigned)),
+          ]), repeatedWitness.privateKey).toString("base64url"),
+        };
+        mutated.physicalAttestation = Buffer.from(await signCommittedPhysicalReadback({
+          scope, operation: bound.operation, nonce: currentNonce,
+          readback: {
+            status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
+            walFlushConfirmed: true, authorizesIo: false,
+            provesIndependentOperator: false, generation: 4, admissionId: random(16),
+            operationId: bound.operation.operation_id, revision: bound.operation.revision,
+            epoch: bound.operation.epoch, expectedInventorySequence: 0,
+            expectedInventoryRoot: expectedRoot,
+            ciphertextSha256: bound.operation.ciphertext_sha256,
+            digest: random(32), root: random(32), chunkCount: 1,
+          }, issuedAt: Math.floor(Date.now() / 1000),
+        }, repeatedPhysical.privateKey)).toString("base64url");
+      }
       let raw = Buffer.from(JSON.stringify(mutated));
       if (responseMode === "oversize") raw = Buffer.alloc(32 * 1024, 65);
       if (responseMode === "invalid-json") raw = Buffer.from("{");
@@ -199,6 +231,8 @@ test("Sync v2 historical provider uses real child witness mTLS and fails closed 
   });
   const roguePort = await listen(rogue);
   t.after(() => close(rogue));
+  const repeatedWitness = crypto.generateKeyPairSync("ed25519");
+  const repeatedPhysical = crypto.generateKeyPairSync("ed25519");
   const rogueProvider = createSyncV2HistoricalEvidenceProvider({
     ...options, endpoint: `https://127.0.0.1:${roguePort}`, timeoutMs: 350,
   });
@@ -209,6 +243,72 @@ test("Sync v2 historical provider uses real child witness mTLS and fails closed 
     await assert.rejects(rogueProvider(operation, { nonce: random(32) }),
       /SYNC_V2_HISTORICAL_EVIDENCE_UNAVAILABLE/, mode);
   }
+  // Re-verifying previously seen history is routine Sync v2 behavior. A
+  // bounded in-flight nonce guard must not accumulate completed attempts.
+  responseMode = "fresh-signed";
+  let latest, latestNonce;
+  for (let iteration = 0; iteration < 4100; iteration += 1) {
+    latestNonce = random(32);
+    latest = await rogueProvider(operation, { nonce: latestNonce });
+  }
+  assert.equal(latest.freshFloor.nonce, latestNonce.toString("base64url"));
+  assert.equal((await verifySyncV2HistoricalWitnessAdmission({
+    envelope: operation, ...latest, nonce: latestNonce,
+    pinnedInventoryPublicKey: inventorySigner.publicKey,
+    pinnedInventorySignerKeyId: signerId,
+    pinnedPhysicalAttestorPublicKey: repeatedPhysical.publicKey,
+    pinnedWitnessPublicKey: repeatedWitness.publicKey,
+    witnessKeyId: Buffer.from(ready.witnessKeyId, "base64url"),
+    statusKeyId: Buffer.from(ready.statusKeyId, "base64url"),
+    trustedMinimumFloor: ready.minimum,
+    localTrustedDevicePolicy: originalPolicy,
+    trustedCurrentDevicePolicyProvider: () => originalPolicy,
+  })).authorizesHistoricalRead, true, "late fresh response still passes independent crypto verification");
+  // A rejected trust-source attempt must also release its nonce, regardless
+  // of the failure point; a second successful attempt must still work.
+  let gateMode = "fail", sourceCalls = 0, releaseGate;
+  const gate = new Promise((resolve) => { releaseGate = resolve; });
+  const gatedProvider = createSyncV2HistoricalEvidenceProvider({
+    ...options, endpoint: `https://127.0.0.1:${roguePort}`,
+    trustedInventoryEvidenceProvider: async () => {
+      sourceCalls += 1;
+      const mode = gateMode;
+      if (mode === "hold") await gate;
+      if (mode === "fail" || mode === "hold") throw Error("SOURCE_UNAVAILABLE");
+      return trustedSource();
+    },
+  });
+  for (let iteration = 0; iteration < 4100; iteration += 1) {
+    await assert.rejects(gatedProvider(operation, { nonce: random(32) }),
+      /SYNC_V2_HISTORICAL_EVIDENCE_UNAVAILABLE/);
+  }
+  gateMode = "hold";
+  const concurrentNonce = random(32);
+  const pending = [gatedProvider(operation, { nonce: concurrentNonce })
+    .then(() => false, () => true)];
+  await assert.rejects(gatedProvider(operation, { nonce: concurrentNonce }),
+    /SYNC_V2_HISTORICAL_EVIDENCE_UNAVAILABLE/,
+  "same nonce cannot enter the trusted callback twice while in flight");
+  for (let iteration = 1; iteration < 4096; iteration += 1) {
+    pending.push(gatedProvider(operation, { nonce: random(32) })
+      .then(() => false, () => true));
+  }
+  assert.equal(sourceCalls, 4100 + 4096,
+    "exactly 4096 admitted calls, no duplicate enters independent source");
+  const overCapacity = gatedProvider(operation, { nonce: random(32) })
+    .then(() => "BYPASS", (error) => error.message);
+  assert.equal(await Promise.race([
+    overCapacity, new Promise((resolve) => setTimeout(() => resolve("STUCK"), 500)),
+  ]), "SYNC_V2_HISTORICAL_EVIDENCE_UNAVAILABLE",
+  "in-flight cap rejects an additional active request promptly");
+  assert.equal(sourceCalls, 4100 + 4096, "over-capacity never reaches trust source");
+  gateMode = "ready";
+  releaseGate();
+  assert.equal((await Promise.all(pending)).every(Boolean), true);
+  const afterFailures = random(32);
+  assert.equal((await gatedProvider(operation, { nonce: afterFailures }))
+    .freshFloor.nonce, afterFailures.toString("base64url"),
+  "after 4096 overlapping failures, valid historical reads resume");
   // The adapter intentionally transports signed objects without authorizing
   // them; the existing strict verifier catches a forged witness signature.
   responseMode = "forged-signature";

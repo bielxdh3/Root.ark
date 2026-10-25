@@ -16,7 +16,7 @@ const { envelopeBinding } = require("./rootark-sync-zk1-physical-binding");
 const FINGERPRINT = /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/i;
 const RESPONSE_LIMIT = 16 * 1024;
 const REQUEST_LIMIT = 12 * 1024 * 1024;
-const MAX_NONCES = 4096;
+const MAX_IN_FLIGHT_NONCES = 4096;
 const FLOOR = ["type", "witnessKeyId", "statusKeyId", "sequence",
   "lastHash", "physicalFenceDigest", "nonce", "signature"];
 const ADMISSION = ["type", "envelopeSha256", "operationId", "deviceId",
@@ -86,15 +86,20 @@ function createSyncV2HistoricalEvidenceProvider({
       fingerprint: serverFingerprint256.toUpperCase(), timeoutMs };
   } catch (_) { fail(); }
 
-  // One client challenge may authorize no more than one attempt. The finite
-  // cache fails closed instead of discarding old nonces and accepting replays.
-  const issuedNonces = new Set();
+  // A challenge can occur in only one in-flight request. Completed requests
+  // release their slot; strict Sync v2 generates a fresh random challenge for
+  // every historical recheck, and the cryptographic verifier binds the
+  // witness floor and PG attestation to that exact original challenge.
+  const inFlightNonces = new Set();
   return async function historicalEvidenceProvider(operation, { nonce } = {}) {
+    let acquiredNonce;
     try {
       const challenge = bytes(nonce, 32);
       const nonceText = challenge.toString("base64url");
-      if (issuedNonces.size >= MAX_NONCES || issuedNonces.has(nonceText)) fail();
-      issuedNonces.add(nonceText);
+      if (inFlightNonces.size >= MAX_IN_FLIGHT_NONCES
+        || inFlightNonces.has(nonceText)) fail();
+      inFlightNonces.add(nonceText);
+      acquiredNonce = nonceText;
       // TRUST BOUNDARY: this callback is operator-injected. The server cannot
       // provide a checkpoint, receipt, root or scope for its own admission.
       const source = exact(await trustedInventoryEvidenceProvider(operation),
@@ -162,6 +167,9 @@ function createSyncV2HistoricalEvidenceProvider({
         receipt, physicalAttestation, admission, freshFloor: floor,
       };
     } catch (_) { fail(); }
+    finally {
+      if (acquiredNonce !== undefined) inFlightNonces.delete(acquiredNonce);
+    }
   };
 }
 function bytesOrPem(input) {
