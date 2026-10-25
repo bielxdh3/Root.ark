@@ -24,7 +24,8 @@ const z = require("../src/crypto/rootark-zk-1");
 const fixtures = require("./support/issue-65-recovery-v2-fixtures");
 
 test("real mTLS CAS commit publishes signed independent witness floor; both local CAS files rolled back cannot restart", async (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cas-witness-floor-e2e-"));
+  const directory = require("./support/issue-65-private-authority-fixture")
+    .createPrivateAuthorityFixture("rootark-cas-witness-floor-e2e-");
   generateNativeFixtureCertificates(directory, {
     caSubject: "Dual Authority Floor CA", servers: ["server", "cas-server"], clients: ["allowed"],
   });

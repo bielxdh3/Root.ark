@@ -99,11 +99,37 @@ public static class RootarkChunkAclNative {
     foreach (string sid in trusted) if (!fullControl.Contains(sid)) throw new InvalidOperationException("Trusted principal lacks full control in chunk staging tree");
   }
 
+  // Authority signing keys, CA bundles and the bootstrap JSON can be loaded
+  // from an operator-owned inherited (but safe) DACL. Do not demand a special
+  // protected staging root. Reject ANY nontrusted ALLOW ACE on the leaf:
+  // reading an Ed25519 private key is already an authority compromise.
+  static void AssertAuthorityFile(string file, string[] trusted) {
+    AssertTrustedOwnerAndSafeAncestors(file, trusted);
+    FileAttributes attributes = File.GetAttributes(file);
+    if ((attributes & FileAttributes.Directory) != 0 || (attributes & FileAttributes.ReparsePoint) != 0) throw new InvalidOperationException("Authority file is a reparse point");
+    RawSecurityDescriptor descriptor = ReadDescriptor(file);
+    if (descriptor.Owner == null || !IsTrusted(descriptor.Owner.Value, trusted)
+      || descriptor.DiscretionaryAcl == null) throw new InvalidOperationException("Untrusted authority file owner or DACL");
+    foreach (GenericAce entry in descriptor.DiscretionaryAcl) {
+      QualifiedAce ace = entry as QualifiedAce;
+      if (ace == null || ace.SecurityIdentifier == null) throw new InvalidOperationException("Unverifiable authority ACE");
+      if (ace.AceQualifier == AceQualifier.AccessAllowed && !IsTrusted(ace.SecurityIdentifier.Value, trusted))
+        throw new InvalidOperationException("Untrusted authority file ACE");
+    }
+  }
+
   public static string Ensure(string root, string action) {
     root = Path.GetFullPath(root);
     string currentSid = WindowsIdentity.GetCurrent().User.Value;
     string[] trusted = new string[] { currentSid, "S-1-5-18", "S-1-5-32-544" };
     if (action == "sddl") return ReadSddl(root);
+    if (action == "verify-authority") {
+      // No UNC/server path or alternate device namespace for signing keys.
+      if (root.StartsWith(@"\\", StringComparison.Ordinal) || !Path.IsPathRooted(root))
+        throw new InvalidOperationException("Authority path must be local");
+      AssertAuthorityFile(root, trusted);
+      return String.Empty;
+    }
     AssertTrustedOwnerAndSafeAncestors(root, trusted);
     if (action == "create") {
       if (!Directory.Exists(root)) {
@@ -165,7 +191,12 @@ function runAclScript(rootDir, action) {
   const script = `Add-Type -TypeDefinition @'\n${NATIVE_ACL}\n'@\n[RootarkChunkAclNative]::Ensure('${escapedRoot}', '${action}')`;
   const encoded = Buffer.from(script, "utf16le").toString("base64");
   try {
-    return execFileSync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand", encoded], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true }).trim();
+    // Authority-file security checks must not execute powershell.exe from a
+    // caller-controlled PATH. Only the fixed in-box Windows binary is allowed.
+    const shell = action === "verify-authority"
+      ? "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+      : "powershell.exe";
+    return execFileSync(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand", encoded], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, timeout: 12000, maxBuffer: 32 * 1024 }).trim();
   } catch (error) {
     const detail = String(error.stdout || error.stderr || "").match(/Untrusted principal can replace[^"_<\r\n]*/)?.[0];
     throw new Error(detail || "Windows chunk staging ACL validation failed");
@@ -187,4 +218,10 @@ function getWindowsChunkAclDescriptor(rootDir) {
   return runAclScript(rootDir, "sddl");
 }
 
-module.exports = { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree, getWindowsChunkAclDescriptor };
+function verifyWindowsAuthorityFilePath(filename) {
+  if (process.platform !== "win32") return;
+  runAclScript(filename, "verify-authority");
+}
+
+module.exports = { ensureWindowsChunkUploadRoot, verifyWindowsChunkUploadTree, getWindowsChunkAclDescriptor,
+  verifyWindowsAuthorityFilePath };

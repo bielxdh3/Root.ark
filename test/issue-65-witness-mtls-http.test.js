@@ -69,7 +69,8 @@ function send(port, tls, pathname, body, identity = "allowed") {
 }
 
 test("mTLS standalone witness listener rejects unknown principals and returns signed pending/committed receipts", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-witness-mtls-"));
+  const dir = require("./support/issue-65-private-authority-fixture")
+    .createPrivateAuthorityFixture("rootark-witness-mtls-");
   const tls = createCertificates(dir);
   const witnessKey = crypto.generateKeyPairSync("ed25519");
   const authorityKey = crypto.generateKeyPairSync("ed25519");

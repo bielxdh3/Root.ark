@@ -74,7 +74,8 @@ function send(port, tls, route, body, identity = "allowed", host = "127.0.0.1") 
 }
 
 test("real mTLS CAS endpoint handles signed v2 commit, rejects alien scope, and witnesses remote signed status", async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cas-mtls-"));
+  const dir = require("./support/issue-65-private-authority-fixture")
+    .createPrivateAuthorityFixture("rootark-zk1-cas-mtls-");
   const connections = new Set();
   const ownedChildren = new Set();
   let server;

@@ -15,10 +15,9 @@ const { Zk1DurableWitnessLedger } = require("../src/services/zk1DurableWitnessLe
 const { Zk1WitnessCasAnchorFloor } = require("../src/services/zk1WitnessCasAnchorFloor");
 
 test("actual standalone witness refuses signed-prefix floor rollback against separately owner-pinned head", async (t) => {
-  // A runner's TEMP can be a junction: preserve the CLI/anchor's fail-closed
-  // ancestor policy while generating this legitimate fixture at its real path.
-  const dir = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()),
-    "rootark-witness-floor-standalone-"));
+  // A runner's TEMP can be a junction or have an unsafe inherited DACL.
+  const dir = require("./support/issue-65-private-authority-fixture")
+    .createPrivateAuthorityFixture("rootark-witness-floor-standalone-");
   generateNativeFixtureCertificates(dir, { caSubject: "Standalone Witness CA",
     servers: ["server"], clients: ["allowed"] });
   const read = (name) => fs.readFileSync(path.join(dir, name));
