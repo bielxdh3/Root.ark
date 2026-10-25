@@ -5,6 +5,9 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 
 const JOURNAL_VERSION = 1;
+const MAX_OBSERVATIONS = 10000;
+const VALID_OPERATION_ID = /^[A-Za-z0-9._:-]{1,160}$/;
+const VALID_DIGEST = /^[0-9a-f]{64}$/;
 const WINDOWS_RENAME_MAX_ATTEMPTS = 3;
 const WINDOWS_RENAME_RETRY_DELAY_MS = 10;
 
@@ -65,7 +68,8 @@ async function durableWrite(filePath, value) {
 class SyncJournal {
   constructor(filePath) {
     this.filePath = path.resolve(filePath);
-    this.state = { version: JOURNAL_VERSION, pending: [], seen: [] };
+    this.state = { version: JOURNAL_VERSION, pending: [], seen: [],
+      admitted: Object.create(null), observed: Object.create(null) };
     this.queue = Promise.resolve();
   }
 
@@ -73,6 +77,28 @@ class SyncJournal {
     try {
       this.state = JSON.parse(await fsp.readFile(this.filePath, "utf8"));
       if (this.state.version !== JOURNAL_VERSION || !Array.isArray(this.state.pending) || !Array.isArray(this.state.seen)) throw new Error("Invalid sync journal");
+      // Legacy operation-ID-only receipts are not proof of prior admission.
+      // The new exact signed-envelope fingerprints must be independently
+      // observed while the device's write authorization is still fresh.
+      if (this.state.admitted === undefined) this.state.admitted = Object.create(null);
+      if (this.state.observed === undefined) this.state.observed = Object.create(null);
+      if (!this.state.admitted || typeof this.state.admitted !== "object"
+        || Array.isArray(this.state.admitted)
+        || Object.entries(this.state.admitted).length > MAX_OBSERVATIONS
+        || Object.entries(this.state.admitted).some(([id, digest]) =>
+          !VALID_OPERATION_ID.test(id) || typeof digest !== "string"
+          || !VALID_DIGEST.test(digest) || !this.state.seen.includes(id))) {
+        throw new Error("Invalid previously admitted sync envelope journal");
+      }
+      if (!this.state.observed || typeof this.state.observed !== "object"
+        || Array.isArray(this.state.observed)
+        || Object.entries(this.state.observed).length > MAX_OBSERVATIONS
+        || Object.entries(this.state.observed).some(([id, digest]) =>
+          !VALID_OPERATION_ID.test(id) || typeof digest !== "string"
+          || !VALID_DIGEST.test(digest)
+          || (Object.hasOwn(this.state.admitted, id) && this.state.admitted[id] !== digest))) {
+        throw new Error("Invalid previously observed sync envelope journal");
+      }
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
       await durableWrite(this.filePath, this.state);
@@ -82,10 +108,17 @@ class SyncJournal {
 
   async commit(mutator) {
     const transaction = this.queue.then(async () => {
-      const next = { version: JOURNAL_VERSION, pending: [...this.state.pending], seen: [...this.state.seen] };
+      const next = { version: JOURNAL_VERSION, pending: [...this.state.pending],
+        seen: [...this.state.seen],
+        admitted: Object.assign(Object.create(null), this.state.admitted),
+        observed: Object.assign(Object.create(null), this.state.observed) };
       await mutator(next);
       next.pending = next.pending.slice(-10000);
       next.seen = next.seen.slice(-10000);
+      const retained = new Set(next.seen);
+      for (const id of Object.keys(next.admitted)) {
+        if (!retained.has(id)) delete next.admitted[id];
+      }
       try {
         await durableWrite(this.filePath, next);
       } catch (error) {
@@ -118,10 +151,27 @@ class SyncJournal {
     return operations;
   }
 
-  async markSeen(operationId) {
+  async markSeen(operationId, admittedDigest = null) {
+    if (!VALID_OPERATION_ID.test(operationId)
+      || (admittedDigest !== null && (typeof admittedDigest !== "string"
+        || !VALID_DIGEST.test(admittedDigest)))) {
+      throw new Error("Invalid local sync admission evidence");
+    }
     await this.commit((next) => {
       next.pending = next.pending.filter((item) => item.operationId !== operationId);
       if (!next.seen.includes(operationId)) next.seen.push(operationId);
+      if (admittedDigest !== null) {
+        const previous = Object.hasOwn(next.admitted, operationId)
+          ? next.admitted[operationId] : null;
+        const observed = Object.hasOwn(next.observed, operationId)
+          ? next.observed[operationId] : null;
+        if ((previous !== null && previous !== admittedDigest)
+          || (observed !== null && observed !== admittedDigest)) {
+          throw new Error("Conflicting local sync admission evidence");
+        }
+        next.admitted[operationId] = admittedDigest;
+        delete next.observed[operationId];
+      }
     });
   }
 
@@ -141,6 +191,42 @@ class SyncJournal {
 
   pending() { return this.state.pending.map((operation) => ({ ...operation })); }
   hasSeen(operationId) { return this.state.seen.includes(operationId); }
+  assertCompatibleAdmission(operationId, digest) {
+    if (!VALID_OPERATION_ID.test(operationId) || !VALID_DIGEST.test(digest)) {
+      throw new Error("Invalid local sync admission evidence");
+    }
+    if ((Object.hasOwn(this.state.admitted, operationId)
+        && this.state.admitted[operationId] !== digest)
+      || (Object.hasOwn(this.state.observed, operationId)
+        && this.state.observed[operationId] !== digest)) {
+      throw Object.assign(new Error("Conflicting local sync admission evidence"),
+        { code: "remote_authorization_rejected" });
+    }
+  }
+  async observeAdmission(operationId, digest) {
+    this.assertCompatibleAdmission(operationId, digest);
+    if (this.hasLocalAdmission(operationId, digest)) return;
+    await this.commit((next) => {
+      const already = Object.hasOwn(next.observed, operationId);
+      if (!already && Object.keys(next.observed).length >= MAX_OBSERVATIONS) {
+        throw new Error("Sync pre-observation journal capacity exceeded");
+      }
+      if (Object.hasOwn(next.admitted, operationId) && next.admitted[operationId] !== digest) {
+        throw new Error("Conflicting local sync admission evidence");
+      }
+      if (already && next.observed[operationId] !== digest) {
+        throw new Error("Conflicting local sync admission evidence");
+      }
+      next.observed[operationId] = digest;
+    });
+  }
+  hasLocalAdmission(operationId, digest) {
+    return VALID_OPERATION_ID.test(operationId) && VALID_DIGEST.test(digest)
+      && ((Object.hasOwn(this.state.admitted, operationId)
+        && this.state.admitted[operationId] === digest && this.hasSeen(operationId))
+        || (Object.hasOwn(this.state.observed, operationId)
+          && this.state.observed[operationId] === digest));
+  }
   async recover() { return this.pending(); }
 }
 

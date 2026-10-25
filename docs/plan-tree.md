@@ -443,6 +443,34 @@ distinguished from local cryptographic and PostgreSQL proof. Do not mark issue
 #65 100% done until each acceptance criterion has executable evidence. See
 `docs/issue-65-zk1-runtime-leakage-register.md` for the current threat boundary.
 
+Sync v2 historical admission development note (2026-10-24): a device's expired
+Ed25519 authorization proves historical signing, not when a server admitted the
+operation. The current CLI intentionally rejects never-observed expired
+envelopes; only exact pre-expiry signed envelopes recorded in the local durable
+journal can be replayed after expiry, subject to ongoing revocation. Legacy
+`seen` IDs, HTTP success/opaque ACKs, unsigned server timestamps, and mismatched
+push echoes do not constitute admission evidence. Conflicting envelopes using
+the same `operationId` are rejected before remote-only snapshot or filesystem
+mutation, including conflicts within a single pulled batch. Incoming envelopes
+are detached from mutable transport references before asynchronous application.
+Verified remote winners of 409 conflicts are also pinned by their own exact
+envelope IDs only after snapshot persistence, not by the unsigned conflict ACK.
+The journal is
+local JSON. For materialization, local operation authorization, file-key resolution,
+AEAD decryption and path validation precede the fsynced pre-expiry observation;
+excluded/remote-only entries preserve signed-envelope-only observation without
+requiring client-side file keys. Observations are fsynced before file/snapshot
+mutation and only later promoted to applied admissions; a failed final journal write
+retains the pre-observation across restart without falsely setting `seen`.
+Outstanding pre-observations have a fail-closed limit of 10,000 without an
+independent lifecycle/GC witness: prolonged failed applications can exhaust
+this budget and block new entries. This remains a development availability
+limitation, not an assurance of infinite historical retention.
+The journal can be forged or rolled back by a filesystem writer; it is NOT
+an independent monotonic witness, proof of external admission, or physical
+PostgreSQL attestation. Independent Sync v2 admission receipts bound to the
+ZK1 physical inventory/CAS/FLOOR authority remain an acceptance blocker.
+
 Last reconstructed: 2026-07-25 (historical baseline)
 Latest application-code snapshot for this closure: 2026-10-16 after PR #201 merged at `341804fa2bfd02dcd50f2d1bde560cb677fc27fd`. The [2026-10-16 pre-publication snapshot](validation/2026-10-16-rootark-prepublication-closure.md) records GitHub state and validation evidence queried after PR #199; it is historical and does not describe PR #201 or later commits. Track the final exact `Root/main` SHA and local validation for the documentation-only closure publication in the [final closure PR #202](https://github.com/bielxdh3/Root.ark/pull/202).
 

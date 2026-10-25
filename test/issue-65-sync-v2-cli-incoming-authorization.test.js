@@ -59,7 +59,7 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
     process: { env: { ROOTARK_SYNC_FILE_KEY: crypto.randomBytes(32).toString("base64url"),
       ROOTARK_SYNC_DEVICE_PRIVATE_KEY: keys.privateKey.export({ type: "pkcs8", format: "der" }).toString("base64url"),
       ROOTARK_SYNC_DEVICE_PUBLIC_KEY: publicKey }, cwd: () => process.cwd(), argv: [] },
-    Buffer, console: { log() {} }, setTimeout,
+    Buffer, Date, console: { log() {} }, setTimeout,
   }, { filename: "sync-client/rootark-sync-v2.js" });
   await sandboxModule.exports.start({ config: "not-opened.json", once: true });
   assert.ok(engineOptions && engineOptions.requireAuthorization === true);
@@ -67,8 +67,11 @@ test("Sync v2 CLI verifies real signed incoming operations and rejects absent or
   const now = Date.now;
   try {
     Date.now = () => signature.expiresAt + 1;
-    assert.equal(await engineOptions.verifyIncoming(signedIncoming), true,
-      "the CLI must verify signed historical remote records after proof expiry");
+    assert.equal(await engineOptions.verifyIncoming(signedIncoming), false,
+      "the CLI must reject a first-ever expired signed record lacking local admission");
+    assert.equal(await engineOptions.verifyIncoming(signedIncoming, {
+      locallyAdmitted: true }), true,
+    "a previously admitted exact envelope may remain readable after expiry");
   } finally { Date.now = now; }
   // A perfectly valid Ed25519 signature by an attacker must not enroll its
   // self-asserted public key as the trusted device1 authority.
