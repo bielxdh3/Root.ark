@@ -471,35 +471,13 @@ test("real mTLS CAS endpoint handles signed v2 commit, rejects alien scope, and 
     "-out", "server.pem", "-days", "1", "-extfile", "server.ext"]);
   assert.ok(new crypto.X509Certificate(fs.readFileSync(path.join(dir, "server.pem")))
     .checkIP(privateHost, { subject: "never" }));
-  const originalHost = config.listenHost;
-  let privatelyBound;
-  try {
-    config.listenHost = privateHost;
-    privatelyBound = await launch(validPins);
-  } finally { config.listenHost = originalHost; }
-  try {
-    const privatelyPinned = createZk1CasStatusHttpsClient({
-      endpoint: `https://${privateHost}:${privatelyBound.port}/v1/terminal`,
-      ca: tls.ca, clientKey: tls.witnessClientKey, clientCert: tls.witnessClientCert,
-      serverFingerprint256: new crypto.X509Certificate(
-        fs.readFileSync(path.join(dir, "server.pem"))).fingerprint256,
-    });
-    assert.equal((await z.decodeDeterministic(await privatelyPinned.getTerminalProof({
-      query, nonce: crypto.randomBytes(32),
-    }))).terminal_status, "committed");
-    assert.equal((await send(privatelyBound.port, tls, "/v1/terminal", {
-      query: queryJson(query), nonce: enc(crypto.randomBytes(32)),
-    }, "allowed", privateHost)).status, 403, "remote writer is not a witness");
-    assert.equal((await send(privatelyBound.port, tls, "/v1/terminal", {
-      query: queryJson(alienQuery), nonce: enc(crypto.randomBytes(32)),
-    }, "witness", privateHost)).status, 403, "remote witness cannot cross scope");
-    await assert.rejects(createZk1CasStatusHttpsClient({
-      endpoint: `https://${privateHost}:${privatelyBound.port}/v1/terminal`,
-      ca: tls.ca, clientKey: tls.witnessClientKey, clientCert: tls.witnessClientCert,
-      serverFingerprint256: "00:".repeat(31) + "00",
-    }).getTerminalProof({ query, nonce: crypto.randomBytes(32) }),
-    /CAS_STATUS_TRANSPORT_UNAVAILABLE/, "remote TLS identity pin still applies");
-  } finally { await privatelyBound.stop(); }
+  // IP SAN, live private NIC and two operator interface pins are insufficient
+  // for remote CAS monotonicity. This pre-existing local-only CAS has no
+  // independent witness: the real standalone subprocess must fail closed.
+  await rejectBind(privateConfig, validPins);
+  // Positive non-loopback CAS transport and authorization remain covered by
+  // the independent disposable server below; strict real-process HTTPS
+  // CAS+witness enrollment is covered by cas-witness-floor-e2e.
 
   // Exercise the real signed register/commit and manifest/history transports
   // on the assigned private adapter. This separate disposable ledger uses the

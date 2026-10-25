@@ -5,9 +5,10 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
+const net = require("node:net");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
-const { generateNativeFixtureCertificates } =
+const { generateNativeFixtureCertificates, runNativeOpenSsl } =
   require("./support/issue-65-native-openssl-fixture");
 const { Zk1WitnessCasAnchorFloor } = require("../src/services/zk1WitnessCasAnchorFloor");
 const { Zk1WitnessCasAnchorHttpsClient } =
@@ -144,12 +145,13 @@ test("real mTLS CAS commit publishes signed independent witness floor; both loca
       serverFingerprint256: new crypto.X509Certificate(read("server.pem")).fingerprint256,
     },
   };
-  async function launchStandalone(config, expectReady) {
+  async function launchStandalone(config, expectReady, extraEnv = {}) {
     fs.writeFileSync(configPath, JSON.stringify(config));
     const child = spawn(process.execPath, [
       path.resolve(__dirname, "../scripts/zk1-cas-status-standalone.js"),
       "--config", configPath,
-    ], { stdio: ["ignore", "pipe", "pipe", "ipc"], windowsHide: true });
+    ], { stdio: ["ignore", "pipe", "pipe", "ipc"], windowsHide: true,
+      env: { ...process.env, ...extraEnv } });
     let timer;
     try {
       const ready = await Promise.race([
@@ -172,6 +174,53 @@ test("real mTLS CAS commit publishes signed independent witness floor; both loca
     }
   }
   await launchStandalone(standaloneConfig, true);
+  // An operator can opt in to a real private-IP listener. That is a wider
+  // trust boundary than loopback: never let an unanchored fresh CAS bootstrap
+  // there, even with a valid mTLS server identity and bound interface.
+  const privateAdapter = Object.entries(os.networkInterfaces()).flatMap(([name, addresses]) =>
+    (addresses || []).map((a) => ({ name, a }))).find(({ a }) => {
+      if (a.internal || (a.family !== "IPv4" && a.family !== 4)
+        || net.isIP(a.address) !== 4) return false;
+      const [x, y] = a.address.split(".").map(Number);
+      return x === 10 || (x === 172 && y >= 16 && y <= 31)
+        || (x === 192 && y === 168);
+    });
+  if (privateAdapter) {
+    const host = privateAdapter.a.address;
+    const pins = {
+      ROOTARK_ZK1_CAS_PRIVATE_BIND_HOST: host,
+      ROOTARK_ZK1_CAS_PRIVATE_BIND_INTERFACE: privateAdapter.name,
+    };
+    const certName = "cas-server-private.pem";
+    fs.writeFileSync(path.join(directory, "cas-server-private.ext"), [
+      "extendedKeyUsage=serverAuth", "keyUsage=digitalSignature,keyEncipherment",
+      "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:" + host, "",
+    ].join("\n"));
+    runNativeOpenSsl(directory, ["x509", "-req", "-in", "cas-server.csr",
+      "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
+      "-out", certName, "-days", "1", "-extfile", "cas-server-private.ext"]);
+    const remoteBase = { ...standaloneConfig, listenHost: host,
+      serverCertPath: path.join(directory, certName) };
+    const unanchored = { ...remoteBase, bootstrapNew: true,
+      dbPath: path.join(directory, "unanchored-remote.sqlite"),
+      anchorPath: path.join(directory, "unanchored-remote.log") };
+    delete unanchored.casAnchorWitness;
+    await launchStandalone(unanchored, false, pins);
+    assert.equal(fs.existsSync(unanchored.dbPath), false,
+      "no new SQLite CAS may be created before remote witness enrollment");
+    await launchStandalone({ ...unanchored, casAnchorWitness: null }, false, pins);
+    assert.equal(fs.existsSync(unanchored.dbPath), false);
+    // An advertised witness with an unavailable live mTLS endpoint is also
+    // insufficient: no stale copy of a formerly valid head authorizes start.
+    const offline = { ...remoteBase, casAnchorWitness: {
+      ...remoteBase.casAnchorWitness, endpoint: "https://127.0.0.1:1/",
+    } };
+    const originalDb = fs.readFileSync(casPath);
+    await launchStandalone(offline, false, pins);
+    assert.deepEqual(fs.readFileSync(casPath), originalDb,
+      "witness outage must refuse before mutating an existing CAS image");
+    await launchStandalone(remoteBase, true, pins);
+  } else t.diagnostic("No RFC1918 interface: cross-host-capable bind test omitted");
   // The CAS database writer can directly rewrite the OPTIONAL-mode marker.
   // The independently signed CAS genesis must still force the witness role:
   // mutable SQLite alone is not trusted to enable/disable security features.

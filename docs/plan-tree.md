@@ -1,5 +1,26 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: remote CAS witness-enrollment preflight (2026-10-25)
+
+The opt-in standalone CAS status service now refuses an RFC1918/private-interface
+listener unless `casAnchorWitness` is explicitly provisioned. As before,
+the service obtains and verifies a fresh signed, nonce-bound witness high-water
+head over pinned mutual TLS **before opening CAS SQLite or its terminal log**.
+Missing, null, offline or misconfigured witness configuration fails closed;
+loopback-only legacy/laboratory workflows remain unchanged. Adversarial
+separate-process tests exercise an assigned private interface with IP-SAN
+certificate, genuine HTTPS witness, missing witness (including a fresh CAS
+genesis), witness outage and successful pinned restart, without rewriting
+the existing CAS/FLOOR consensus protocols.
+
+This is a startup/configuration fail-closed gate, **not** proof that the
+witness lives on a different machine, has separately administered keys, uses
+independently monotonic media, or is externally recoverable after coordinated
+rollback. A same-host SQLite witness in a disposable test gives only a
+local runtime invariant. No hosted two-administrator independent witness,
+provider durability, cross-service atomicity or production GO is claimed.
+PR #228 remains DRAFT / NO-GO.
+
 ## Issue #65 / PR #228: development browser vault cross-tab revocation (2026-10-25)
 
 The **experimental** `/zk-dev` browser vault uses an IndexedDB v3 per-account

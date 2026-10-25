@@ -78,6 +78,12 @@ async function configure(config) {
     || typeof config.anchorPath !== "string" || !path.isAbsolute(config.anchorPath)
     || path.resolve(config.anchorPath) === path.resolve(config.dbPath)) fail();
   validateListenHost(config.listenHost);
+  // A network-reachable standalone CAS authority MUST fence its local
+  // SQLite/terminal history against a separately reachable, nonce-bound
+  // Ed25519 witness head. Loopback remains available for explicitly local
+  // legacy recovery/labs. Interface pins and IP-SAN alone are not monotonic.
+  if (config.listenHost !== "127.0.0.1" && config.listenHost !== "::1"
+    && !Object.hasOwn(config, "casAnchorWitness")) fail();
   const statusKeyId = id(config.statusKeyId);
   const statusPrivateKey = crypto.createPrivateKey(readFile(config.statusPrivateKeyPath));
   const witnessKeyId = id(config.witnessKeyId);
