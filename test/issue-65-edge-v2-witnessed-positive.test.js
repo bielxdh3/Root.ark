@@ -162,12 +162,16 @@ async function createTlsAuthorities(t, dir, state, getHead, signer) {
     }
   });
   const pin = (bytes) => new crypto.X509Certificate(bytes).fingerprint256;
+  // Both fixture peers listen on IPv4 loopback only. Using `localhost` here
+  // relies on platform DNS order or Node's dual-stack fallback and can fail
+  // on hosted Windows when localhost resolves to ::1 before 127.0.0.1.
+  // The disposable test certificate has an explicit 127.0.0.1 IP SAN.
   const casClient = createZk1CasManifestHttpsClient({
-    endpoint: "https://localhost:" + cas.address().port + "/v1/manifest",
+    endpoint: "https://127.0.0.1:" + cas.address().port + "/v1/manifest",
     ca: certs.ca, clientKey: certs.cas.clientKey, clientCert: certs.cas.clientCert,
     serverFingerprint256: pin(certs.cas.cert) });
   const witnessClient = createZk1WitnessHttpsClient({
-    endpoint: "https://localhost:" + witness.address().port,
+    endpoint: "https://127.0.0.1:" + witness.address().port,
     ca: certs.ca, clientKey: certs.witness.clientKey, clientCert: certs.witness.clientCert,
     serverFingerprint256: pin(certs.witness.cert) });
   return { casClient, witnessClient, addManifest(manifest) { entries.push(manifest); },

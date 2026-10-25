@@ -1,5 +1,20 @@
 # Root.ark Plan Tree
 
+## Issue #65 / PR #228: Windows Edge V2 IPv4 fixture binding (2026-10-24)
+
+The disposable positive Edge + strict mTLS CAS/witness fixture bound both HTTPS
+authorities to `127.0.0.1` but requested them through `localhost`. When Node 22
+was forced to resolve localhost to `::1` first without network-family fallback,
+the previously passing end-to-end test reproduced `ERR_TEST_FAILURE` and
+`ZK_BROWSER_CONTENT_UNAVAILABLE` during the first authenticated ciphertext PUT.
+The isolated fixture now connects to the actual IPv4 listener using its
+existing `127.0.0.1` certificate IP SAN, without weakening TLS or fingerprint
+pinning. Windows Node 22 original/fixed RED→GREEN in forced IPv6 resolution,
+and the normal case remains GREEN (1 PASS / 0 FAIL each fixed run). This matches
+the hosted failure category and test hash but does not establish that hosted
+Windows had the same DNS configuration; a completed hosted run is required.
+No production transport or deployment was changed. PR remains DRAFT / NO-GO.
+
 ## Issue #65 / PR #228: physical evidence freshness after multiprovider owner verification (2026-10-24)
 
 The strict multiprovider recovery path now retains the independently verified
