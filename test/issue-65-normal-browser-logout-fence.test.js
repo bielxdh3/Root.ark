@@ -95,6 +95,12 @@ async function harness() {
       }),
       assertForRestore: async () => true,
     },
+    // This harness exercises the existing logout/session-fence actions. The
+    // persisted HTTP recovery action has its own real browser/mTLS tests;
+    // keep its required dependency present without bypassing ensureScripts.
+    RootarkZk1PersistedBrowserRecovery: {
+      recoverFromPinnedPersistedHttpGet: () => { throw Error("UNEXPECTED_PERSISTED_RECOVERY"); },
+    },
     RootarkZk1KeyringPortableArchive: {
       createArchive: async () => ({}),
       verifyVersionedAuthority: async () => ({}),
