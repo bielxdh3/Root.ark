@@ -821,7 +821,101 @@ test("strict CAS witness floor refuses signed status advance without independent
       "SELECT operation_id FROM witness_cas_inventory_fence WHERE sequence=1"
     ).get().operation_id, op.operation_id.toString("hex"),
     "the witness must sign and durably pin the independent PG operation ID");
+    const retained = durableFenceDb.prepare(
+      "SELECT original_pg_evidence FROM witness_cas_inventory_fence WHERE sequence=1"
+    ).get().original_pg_evidence;
+    assert.ok(Buffer.isBuffer(retained) && retained.length > 100,
+      "the original attestor Ed25519 proof, signed inventory receipt and nonce must survive");
+    const cold = await admission.verifyRetainedPhysicalEvidence(retained);
+    assert.deepEqual(cold.operationId, op.operation_id);
+    assert.equal(cold.scope, scope.account_id.toString("hex") + ":"
+      + scope.compartment_id.length + ":" + scope.compartment_id.toString("hex")
+      + ":" + scope.keyring_id.toString("hex"));
+    assert.equal(cold.inventorySequence, 1);
+    const changed = JSON.parse(retained.toString("utf8"));
+    changed.operation.operation_id = random(16).toString("base64url");
+    await assert.rejects(admission.verifyRetainedPhysicalEvidence(
+      Buffer.from(JSON.stringify(changed))), /WITNESS_CAS_PHYSICAL_ADMISSION_DENIED/,
+    "original Ed25519 attestor evidence cannot be replayed for another operation");
+    const forgedAttestor = JSON.parse(retained.toString("utf8"));
+    forgedAttestor.attestorSpki = status.publicKey.export({ type: "spki",
+      format: "der" }).toString("base64url");
+    await assert.rejects(admission.verifyRetainedPhysicalEvidence(
+      Buffer.from(JSON.stringify(forgedAttestor))),
+    /WITNESS_CAS_PHYSICAL_ADMISSION_DENIED/,
+    "the persisted PG signer cannot be swapped for the CAS status signer");
+    const forgedSignature = JSON.parse(retained.toString("utf8"));
+    const originalBytes = Buffer.from(forgedSignature.physicalAttestation, "base64url");
+    originalBytes[originalBytes.length - 1] ^= 1;
+    forgedSignature.physicalAttestation = originalBytes.toString("base64url");
+    await assert.rejects(admission.verifyRetainedPhysicalEvidence(
+      Buffer.from(JSON.stringify(forgedSignature))),
+    /WITNESS_CAS_PHYSICAL_ADMISSION_DENIED/,
+    "the ORIGINAL PG signature must verify, not just a witness-reported boolean");
+    assert.equal((await floor.auditRetainedPhysicalEvidence()).verifiedCommitted, 1);
   } finally { durableFenceDb.close(); }
+  // Open a second independent witness instance with its PG transport OFFLINE.
+  // All historical Ed25519 bytes must remain verifiable without a fresh PG ACK.
+  const offlineAdmission = new Zk1WitnessCasPhysicalAdmission({
+    pinnedOwnerPublicKey: owner.publicKey,
+    pinnedInventoryPublicKey: inventory.publicKey,
+    pinnedInventorySignerKeyId: inventoryKeyId,
+    pinnedPhysicalAttestorPublicKey: attestor.publicKey,
+    trustedMinimumInventoryHead: { sequence: 0, root: genesisRoot },
+    trustedMinimumInventorySnapshot: genesisSnapshot,
+    physicalAttestorClient: { requestAttestation() {
+      throw new Error("PG18 is deliberately OFFLINE for cold audit");
+    } },
+    inventoryClient: { getVerifiedSnapshotWithChain() {
+      throw new Error("inventory transport deliberately OFFLINE for cold audit");
+    } },
+  });
+  const sealedHead = floor.head();
+  const coldFloor = new Zk1WitnessCasAnchorFloor(path.join(directory,
+    "witness-floor.sqlite"), { bootstrapNew: false, witnessKeyId,
+    witnessPrivateKey: witness.privateKey, statusKeyId,
+    statusPublicKey: status.publicKey, attestedAdmission: offlineAdmission,
+    trustedMinimumHead: { ...sealedHead,
+      physicalFenceDigest: floor.freshHead({ nonce: random(32) }).physicalFenceDigest },
+  });
+  try {
+    assert.throws(() => coldFloor.freshHead({ nonce: random(32) }),
+      /WITNESS_CAS_FLOOR_DENIED/,
+      "restarted witness cannot sign a new head before cold PG Ed25519 re-audit");
+    const recovery = await coldFloor.auditRetainedPhysicalEvidence();
+    assert.equal(recovery.verifiedCommitted, 1);
+    assert.equal(recovery.currentPgReadbackProven, false);
+    assert.equal(recovery.externalDurabilityProven, false);
+    assert.equal(coldFloor.freshHead({ nonce: random(32) }).sequence, 1);
+    assert.equal((await coldFloor.proveCommittedPhysicalFence({ scope,
+      operationId: op.operation_id, inventorySequence: 1,
+      inventoryRoot: root, nonce: random(32) })).committedSequence, 1);
+  } finally { coldFloor.close(); }
+  // SQL-authorized tampering after an ACK must not survive even if CAS row,
+  // witness key and signed high-water were not touched. Use a disposable copy.
+  const corruptedPath = path.join(directory, "corrupted-original-pg.sqlite");
+  const sourceDb = new Database(path.join(directory, "witness-floor.sqlite"),
+    { readonly: true, fileMustExist: true });
+  try { await sourceDb.backup(corruptedPath); }
+  finally { sourceDb.close(); }
+  const corruptedDb = new Database(corruptedPath);
+  try {
+    const row = corruptedDb.prepare(
+      "SELECT original_pg_evidence FROM witness_cas_inventory_fence WHERE sequence=1"
+    ).get();
+    const tampered = Buffer.from(row.original_pg_evidence);
+    tampered[tampered.length - 1] ^= 1;
+    corruptedDb.prepare("UPDATE witness_cas_inventory_fence"
+      + " SET original_pg_evidence=? WHERE sequence=1").run(tampered);
+  } finally { corruptedDb.close(); }
+  assert.throws(() => new Zk1WitnessCasAnchorFloor(corruptedPath, {
+    bootstrapNew: false, witnessKeyId, witnessPrivateKey: witness.privateKey,
+    statusKeyId, statusPublicKey: status.publicKey,
+    attestedAdmission: offlineAdmission,
+    trustedMinimumHead: { ...sealedHead,
+      physicalFenceDigest: floor.freshHead({ nonce: random(32) }).physicalFenceDigest },
+  }), /WITNESS_CAS_FLOOR_DENIED/,
+  "tampering retained PG bytes cannot pass signed witness startup after cold restore");
   const strictNonce = random(32);
   const strictSignedHead = floor.freshHead({ nonce: strictNonce });
   assert.equal(strictSignedHead.type, "rootark-zk1-witness-cas-physical-floor/v2",

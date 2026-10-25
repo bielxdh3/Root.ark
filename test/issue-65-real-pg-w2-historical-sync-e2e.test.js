@@ -12,6 +12,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { test } = require("node:test");
 const { Pool } = require("pg");
+const Database = require("better-sqlite3");
 const { generateNativeFixtureCertificates } =
   require("./support/issue-65-native-openssl-fixture");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
@@ -391,6 +392,20 @@ test("PG18 WAL readback -> separate mTLS attestor -> signed inventory -> W2 SQLi
       Buffer.from(JSON.stringify(binding))]), owner.privateKey)) };
   const witnessed = await witness.advanceAttested({ records: [record], evidence: [evidence] });
   assert.equal(witnessed.sequence, 1);
+  const savedWitness = new Database(witnessPath, { readonly: true, fileMustExist: true });
+  let originalPg;
+  try {
+    originalPg = savedWitness.prepare(
+      "SELECT original_pg_evidence FROM witness_cas_inventory_fence WHERE sequence=1"
+    ).get()?.original_pg_evidence;
+  } finally { savedWitness.close(); }
+  assert.ok(Buffer.isBuffer(originalPg) && originalPg.length < 8192,
+    "real PostgreSQL18 attestor Ed25519 evidence must survive SQLite commit");
+  const independentlyColdVerified = await admission.verifyRetainedPhysicalEvidence(originalPg);
+  assert.equal(independentlyColdVerified.verifiedOriginalPgSignature, true);
+  assert.deepEqual(independentlyColdVerified.operationId, physical.operation.operation_id);
+  assert.equal(independentlyColdVerified.inventorySequence, 1);
+  assert.equal(independentlyColdVerified.currentPgReadbackProven, false);
   const challengeForFloor = random(32);
   const trustedMinimumFloor = verifyFreshWitnessCasFloor({
     signed: witness.freshHead({ nonce: challengeForFloor }), nonce: challengeForFloor,

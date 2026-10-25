@@ -16,6 +16,7 @@ const OWNER_DOMAIN = Buffer.from("Root.ark/zk-1/cas-witness-physical-owner-bindi
 const B64 = /^[A-Za-z0-9_-]+$/;
 const HEX = /^[0-9a-f]{64}$/;
 const MAX_CHAIN_ELAPSED_NS = 300_000_000_000n;
+const MAX_RETAINED_PG_EVIDENCE_BYTES = 8192;
 function deny() {
   const error = new Error("WITNESS_CAS_PHYSICAL_ADMISSION_DENIED");
   error.code = error.message;
@@ -142,6 +143,58 @@ class Zk1WitnessCasPhysicalAdmission {
       minimumSnapshotSha256: crypto.createHash("sha256")
         .update(this.#minimumSnapshot).digest("hex"),
     })).digest("hex");
+  }
+  // Cold audit deliberately has no PostgreSQL transport. The witness keeps
+  // the ORIGINAL signed inventory and PG readback bytes, not a reconstructed
+  // writer-controlled claim. Its independently provisioned attestor SPKI is
+  // part of this exact, witness-signed persistent record.
+  async verifyRetainedPhysicalEvidence(serialized) {
+    try {
+      if (!Buffer.isBuffer(serialized) || serialized.length < 1
+        || serialized.length > MAX_RETAINED_PG_EVIDENCE_BYTES) deny();
+      const original = JSON.parse(serialized.toString("utf8"));
+      const e = exact(original, ["version", "scope", "operation", "nonce",
+        "inventoryReceipt", "physicalAttestation", "attestorSpki",
+        "checkpointSequence", "checkpointRoot"]);
+      if (e.version !== "rootark-witness-original-pg-evidence/v1"
+        || Buffer.from(JSON.stringify(original)).compare(serialized) !== 0) deny();
+      const spki = decode(e.attestorSpki, 44, 44);
+      const pinned = Object.getPrototypeOf(this.#physical).export.call(this.#physical,
+        { type: "spki", format: "der" });
+      if (!same(spki, pinned)) deny();
+      const scope = snapshotScope(e.scope);
+      const operation = snapshotOperation(e.operation);
+      const nonce = decode(e.nonce, 32);
+      const receipt = decode(e.inventoryReceipt, 1, inventory.MAX_COMMITTED_PROOF_BYTES);
+      const physical = decode(e.physicalAttestation, 1, 2048);
+      const signed = await z.decodeDeterministic(physical);
+      if (!Number.isSafeInteger(signed?.issued_at) || signed.issued_at < 1) deny();
+      // Timestamp is part of the ORIGINAL Ed25519 signed CBOR. This validates
+      // historical signature authenticity, NOT freshness or live PG state.
+      const proof = await verifyAttestedInventoryCommit({
+        receipt, physicalAttestation: physical, scope, operation, nonce,
+        pinnedInventoryPublicKey: this.#inventory,
+        pinnedInventorySignerKeyId: this.#signerId,
+        pinnedPhysicalAttestorPublicKey: this.#physical,
+        nowSeconds: signed.issued_at,
+      });
+      if (proof.status !== "VERIFIED_COMPOSITE_NONAUTHORIZING"
+        || proof.authorizesIo !== false
+        || !Number.isSafeInteger(e.checkpointSequence)
+        || e.checkpointSequence < proof.inventoryReceipt.sequence
+        || e.checkpointSequence > inventory.MAX_ENTRIES) deny();
+      const checkpointRoot = decode(e.checkpointRoot, 32);
+      return Object.freeze({ operationId: Buffer.from(operation.operation_id),
+        scope: scopeKey(scope), inventorySequence: e.checkpointSequence,
+        inventoryRoot: checkpointRoot,
+        originalReceiptSequence: proof.inventoryReceipt.sequence,
+        originalReceiptRoot: Buffer.from(proof.inventoryReceipt.root),
+        originalPgEvidenceSha256: crypto.createHash("sha256").update(serialized).digest("hex"),
+        attestorSpkiSha256: crypto.createHash("sha256").update(spki).digest("hex"),
+        originallyIssuedAt: signed.issued_at,
+        verifiedOriginalPgSignature: true, currentPgReadbackProven: false,
+        externalDurabilityProven: false, authorizesIo: false });
+    } catch (_) { deny(); }
   }
   // Challenge the witness's ALREADY PINNED independent mTLS PostgreSQL
   // attestor for the exact Sync envelope operation, and verify both Ed25519
@@ -317,12 +370,30 @@ class Zk1WitnessCasPhysicalAdmission {
         || offset >= chain.length || !same(chain[offset], receipt)
         || proof.inventoryReceipt.sequence > checked.sequence) deny();
       if (process.hrtime.bigint() - chainStartMonotonic > MAX_CHAIN_ELAPSED_NS) deny();
+      const attestorSpki = Object.getPrototypeOf(this.#physical).export.call(
+        this.#physical, { type: "spki", format: "der" });
+      const retained = Buffer.from(JSON.stringify({
+        version: "rootark-witness-original-pg-evidence/v1",
+        scope: signedScope, operation: signedOperation,
+        nonce: nonce.toString("base64url"),
+        inventoryReceipt: receipt.toString("base64url"),
+        physicalAttestation: Buffer.from(physical).toString("base64url"),
+        attestorSpki: attestorSpki.toString("base64url"),
+        checkpointSequence: checked.sequence,
+        checkpointRoot: Buffer.from(checked.root).toString("base64url"),
+      }));
+      if (retained.length > MAX_RETAINED_PG_EVIDENCE_BYTES) deny();
+      const cold = await this.verifyRetainedPhysicalEvidence(retained);
+      if (!cold.verifiedOriginalPgSignature
+        || cold.inventorySequence !== checked.sequence
+        || !same(cold.inventoryRoot, checked.root)
+        || !same(cold.operationId, operation.operation_id)) deny();
       return Object.freeze({ ownerBound: true, physicallyCommitted: true,
         localReadbackConfirmed: true, externallyDurable: false,
         operationId: Buffer.from(proof.physicalReadback.operationId),
         inventoryScope: r.scope,
         inventorySequence: checked.sequence, inventoryRoot: Buffer.from(checked.root),
-        inventorySnapshot: snapshot });
+        inventorySnapshot: snapshot, originalPgEvidence: retained });
     } catch (_) { deny(); }
   }
 }

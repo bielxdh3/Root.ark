@@ -18,7 +18,9 @@ const { verifyAuthorizationProof, verifyHistoricalAuthorizationProof } =
 const RECORD_DOMAIN = Buffer.from("Root.ark/zk-1/cas-terminal-anchor/v1\0", "ascii");
 const FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-anchor-floor/v1\0", "ascii");
 const PHYSICAL_FLOOR_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-physical-floor/v2\0", "ascii");
-const PHYSICAL_FENCE_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-inventory-fence/v2\0", "ascii");
+// Changing the signature domain makes missing original PG evidence fail closed.
+// Existing v2 floors need an explicit external-owner-approved migration.
+const PHYSICAL_FENCE_DOMAIN = Buffer.from("Root.ark/zk-1/witness-cas-inventory-fence/v3\0", "ascii");
 const HISTORICAL_SYNC_DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-admission/v1\0");
 const RECOVERY_LEDGER_DOMAIN = Buffer.from("Root.ark/sync-v2/historical-witness-recovery-ledger/v1\0");
 // No TTL deletion is safe until an externally anchored compaction protocol
@@ -63,12 +65,14 @@ function physicalFenceEvidence(row) {
   return JSON.stringify([row.sequence, row.cas_hash, row.scope,
     row.operation_id, row.inventory_sequence, row.inventory_root,
     row.snapshot === null ? null : digest(row.snapshot),
+    row.original_pg_evidence === null ? null : digest(row.original_pg_evidence),
     row.signature.toString("base64url")]) + "\n";
 }
 function physicalFenceMessage(row) {
   return Buffer.concat([PHYSICAL_FENCE_DOMAIN, Buffer.from(JSON.stringify([
     row.sequence, row.cas_hash, row.scope, row.operation_id, row.inventory_sequence,
     row.inventory_root, row.snapshot === null ? null : digest(row.snapshot),
+    row.original_pg_evidence === null ? null : digest(row.original_pg_evidence),
   ]))]);
 }
 function id(value) {
@@ -172,6 +176,7 @@ class Zk1WitnessCasAnchorFloor {
   #inventoryHeads = new Map();
   #physicalFenceChain = crypto.createHash("sha256");
   #physicalFenceDigest = digest("");
+  #auditedOriginalPgDigest = null;
   #advanceQueue = Promise.resolve();
   #historicalEnabled = false;
   #historicalHead = Object.freeze({ sequence: 0, lastHash: ZERO });
@@ -301,7 +306,7 @@ class Zk1WitnessCasAnchorFloor {
         statusFingerprint: digest(spki(statusPublicKey)),
         ...(this.#attestedAdmission ? {
           normativePhysicalAdmissionDigest: this.#attestedAdmission.policyDigest(),
-          physicalFenceSchema: "operation-id-v2",
+          physicalFenceSchema: "operation-id-v3-original-pg-attestor",
         } : {}),
         ...(this.#historicalEnabled ? { historicalSyncAdmissionIssuer: true } : {}),
       });
@@ -320,7 +325,8 @@ class Zk1WitnessCasAnchorFloor {
             sequence INTEGER PRIMARY KEY CHECK(sequence>=1),
             cas_hash TEXT NOT NULL, scope TEXT NOT NULL,
             operation_id TEXT, inventory_sequence INTEGER, inventory_root TEXT,
-            snapshot BLOB, signature BLOB NOT NULL);`);
+            snapshot BLOB, original_pg_evidence BLOB,
+            signature BLOB NOT NULL);`);
         }
         if (this.#historicalEnabled) {
           db.exec(`CREATE TABLE witness_cas_sync_historical_admission (
@@ -426,7 +432,10 @@ class Zk1WitnessCasAnchorFloor {
               || row.inventory_sequence < 1 || !validHex(row.inventory_root)
               || !Buffer.isBuffer(row.snapshot)
               || row.snapshot.length < 1
-              || row.snapshot.length > 2 * 1024 * 1024) fail();
+              || row.snapshot.length > 2 * 1024 * 1024
+              || !Buffer.isBuffer(row.original_pg_evidence)
+              || row.original_pg_evidence.length < 1
+              || row.original_pg_evidence.length > 8192) fail();
             totalSnapshotBytes += row.snapshot.length;
             if (totalSnapshotBytes > 64 * 1024 * 1024) fail();
             const preceding = this.#inventoryHeads.get(row.scope);
@@ -438,7 +447,7 @@ class Zk1WitnessCasAnchorFloor {
             });
           } else if (row.operation_id !== null || row.inventory_sequence !== null
             || row.inventory_root !== null
-            || row.snapshot !== null) fail();
+            || row.snapshot !== null || row.original_pg_evidence !== null) fail();
           physicalChain.update(physicalFenceEvidence(row));
         }
         if (number !== count) fail();
@@ -518,14 +527,20 @@ class Zk1WitnessCasAnchorFloor {
     const physical = crypto.createHash("sha256");
     let sequence = 0;
     let totalSnapshotBytes = 0;
+    let totalOriginalPgBytes = 0;
     for (const row of this.#db.prepare(
       "SELECT * FROM witness_cas_inventory_fence ORDER BY sequence").iterate()) {
       sequence += 1;
       if (row.sequence !== sequence || !Buffer.isBuffer(row.signature)
         || row.signature.length !== 64
-        || (row.snapshot !== null && !Buffer.isBuffer(row.snapshot))) fail();
+        || (row.snapshot !== null && !Buffer.isBuffer(row.snapshot))
+        || (row.original_pg_evidence !== null
+          && (!Buffer.isBuffer(row.original_pg_evidence)
+            || row.original_pg_evidence.length > 8192))) fail();
       totalSnapshotBytes += row.snapshot?.length || 0;
-      if (totalSnapshotBytes > 64 * 1024 * 1024) fail();
+      totalOriginalPgBytes += row.original_pg_evidence?.length || 0;
+      if (totalSnapshotBytes > 64 * 1024 * 1024
+        || totalOriginalPgBytes > 64 * 1024 * 1024) fail();
       physical.update(physicalFenceEvidence(row));
     }
     if (sequence !== this.#trustedFloor.sequence
@@ -576,6 +591,7 @@ class Zk1WitnessCasAnchorFloor {
     if (this.#closed || this.#activeHeadVerifications >= 2) fail();
     this.#activeHeadVerifications += 1;
     try {
+      if (this.#attestedAdmission) await this.auditRetainedPhysicalEvidence();
       this.#assertFileIdentity();
       const initialMutationStamp = this.#fileMutationStamp();
       const initialDataVersion = this.#db.pragma("data_version", { simple: true });
@@ -672,6 +688,7 @@ class Zk1WitnessCasAnchorFloor {
   async proveCommittedPhysicalFence({ scope, operationId, inventorySequence,
     inventoryRoot, nonce } = {}) {
     try {
+      await this.auditRetainedPhysicalEvidence();
       if (!this.#attestedAdmission || this.#closed
         || !scope || typeof scope !== "object"
         || ![Object.prototype, null].includes(Object.getPrototypeOf(scope))
@@ -714,6 +731,45 @@ class Zk1WitnessCasAnchorFloor {
         operationId: Buffer.from(operation), inventorySequence,
         inventoryRoot: Buffer.from(expectedRoot),
         authorizesHistoricalRead: false, authorizesIo: false });
+    } catch (_) { fail(); }
+  }
+  // Revalidate ORIGINAL independent PostgreSQL signatures from SQLite after
+  // restart without opening PostgreSQL. This is a historical observation only.
+  async auditRetainedPhysicalEvidence() {
+    try {
+      if (!this.#attestedAdmission || this.#closed) fail();
+      this.head();
+      this.#assertPhysicalFenceIntegrity();
+      const before = this.#physicalFenceDigest;
+      const version = this.#db.pragma("data_version", { simple: true });
+      const rows = this.#db.prepare(
+        "SELECT * FROM witness_cas_inventory_fence ORDER BY sequence").all();
+      let total = 0;
+      let verifiedCommitted = 0;
+      if (this.#auditedOriginalPgDigest !== before) {
+        for (const row of rows) {
+          total += row.original_pg_evidence?.length || 0;
+          if (total > 64 * 1024 * 1024) fail();
+          if (row.original_pg_evidence === null) continue;
+          const verified = await this.#attestedAdmission.verifyRetainedPhysicalEvidence(
+            row.original_pg_evidence);
+          if (!verified.verifiedOriginalPgSignature
+            || verified.scope !== row.scope
+            || verified.operationId.toString("hex") !== row.operation_id
+            || verified.inventorySequence !== row.inventory_sequence
+            || verified.inventoryRoot.toString("hex") !== row.inventory_root) fail();
+          verifiedCommitted++;
+        }
+      } else {
+        verifiedCommitted = rows.filter((row) => row.original_pg_evidence !== null).length;
+      }
+      if (rows.length !== this.#trustedFloor.sequence
+        || this.#db.pragma("data_version", { simple: true }) !== version) fail();
+      this.#assertPhysicalFenceIntegrity();
+      if (this.#physicalFenceDigest !== before) fail();
+      this.#auditedOriginalPgDigest = before;
+      return Object.freeze({ verifiedCommitted, currentPgReadbackProven: false,
+        externalDurabilityProven: false });
     } catch (_) { fail(); }
   }
   historicalAdmissionHead() {
@@ -1280,6 +1336,7 @@ class Zk1WitnessCasAnchorFloor {
   }
   async #advanceAttestedSerial(captured, evidence) {
     if (this.#closed) fail();
+    await this.auditRetainedPhysicalEvidence();
     const admissionStart = process.hrtime.bigint();
     const maxAdmissionNs = 300_000_000_000n;
     this.head();
@@ -1307,7 +1364,10 @@ class Zk1WitnessCasAnchorFloor {
             || verified.inventoryRoot.length !== 32
             || !Buffer.isBuffer(verified.inventorySnapshot)
             || verified.inventorySnapshot.length < 1
-            || verified.inventorySnapshot.length > 2 * 1024 * 1024) fail();
+            || verified.inventorySnapshot.length > 2 * 1024 * 1024
+            || !Buffer.isBuffer(verified.originalPgEvidence)
+            || verified.originalPgEvidence.length < 1
+            || verified.originalPgEvidence.length > 8192) fail();
           const minimum = pendingHeads.get(record.scope);
           if (minimum && verified.inventorySequence <= minimum.head.sequence) fail();
           pendingHeads.set(record.scope, { head: {
@@ -1332,10 +1392,13 @@ class Zk1WitnessCasAnchorFloor {
       const existing = this.#db.prepare("SELECT hash,line FROM witness_cas_floor_event WHERE sequence=?");
       const insert = this.#db.prepare("INSERT INTO witness_cas_floor_event VALUES(?,?,?,?)");
       const insertFence = verifiedPhysical ? this.#db.prepare(
-        "INSERT INTO witness_cas_inventory_fence VALUES(?,?,?,?,?,?,?,?)") : null;
+        "INSERT INTO witness_cas_inventory_fence VALUES(?,?,?,?,?,?,?,?,?)") : null;
       const existingBytes = verifiedPhysical ? this.#db.prepare(
         "SELECT COALESCE(SUM(length(snapshot)),0) AS total FROM witness_cas_inventory_fence").get().total : 0;
+      const existingPgBytes = verifiedPhysical ? this.#db.prepare(
+        "SELECT COALESCE(SUM(length(original_pg_evidence)),0) AS total FROM witness_cas_inventory_fence").get().total : 0;
       let totalSnapshotBytes = existingBytes;
+      let totalPgBytes = existingPgBytes;
       for (const item of captured) {
         if (item.sequence <= previous.sequence) {
           const saved = existing.get(item.sequence);
@@ -1350,16 +1413,21 @@ class Zk1WitnessCasAnchorFloor {
           const committed = item.status === "committed";
           const snapshot = committed ? Buffer.from(verified.inventorySnapshot) : null;
           totalSnapshotBytes += snapshot?.length || 0;
-          if (totalSnapshotBytes > 64 * 1024 * 1024) fail();
+          totalPgBytes += committed ? verified.originalPgEvidence.length : 0;
+          if (totalSnapshotBytes > 64 * 1024 * 1024
+            || totalPgBytes > 64 * 1024 * 1024) fail();
           const fence = { sequence: item.sequence, cas_hash: item.lastHash,
             scope: item.scope,
             operation_id: committed ? verified.operationId.toString("hex") : null,
             inventory_sequence: committed ? verified.inventorySequence : null,
             inventory_root: committed ? verified.inventoryRoot.toString("hex") : null,
-            snapshot, signature: null };
+            snapshot,
+            original_pg_evidence: committed ? Buffer.from(verified.originalPgEvidence) : null,
+            signature: null };
           fence.signature = crypto.sign(null, physicalFenceMessage(fence), this.#witness);
           insertFence.run(fence.sequence, fence.cas_hash, fence.scope, fence.operation_id,
-            fence.inventory_sequence, fence.inventory_root, fence.snapshot, fence.signature);
+            fence.inventory_sequence, fence.inventory_root, fence.snapshot,
+            fence.original_pg_evidence, fence.signature);
           insertedFences.push(fence);
         }
         insert.run(item.sequence, item.line, item.lastHash, item.previousHash);
@@ -1382,6 +1450,7 @@ class Zk1WitnessCasAnchorFloor {
     if (verifiedPhysical) {
       this.#physicalFenceDigest = this.#physicalFenceChain.copy().digest("hex");
       this.#inventoryHeads = pendingHeads;
+      this.#auditedOriginalPgDigest = this.#physicalFenceDigest;
     }
     this.#trustedFloor = Object.freeze({ ...updated });
     this.#generation += 1;
@@ -1390,6 +1459,10 @@ class Zk1WitnessCasAnchorFloor {
   freshHead({ nonce }) {
     if ((!Buffer.isBuffer(nonce) && !(nonce instanceof Uint8Array))
       || nonce.byteLength !== 32) fail();
+    // Require cold Ed25519 re-audit before signed synchronous readback after
+    // restart. The mTLS async path runs that audit automatically.
+    if (this.#attestedAdmission && this.#trustedFloor.sequence > 0
+      && this.#auditedOriginalPgDigest !== this.#physicalFenceDigest) fail();
     const value = this.head();
     return this.#signHead(Buffer.from(nonce), value);
   }
