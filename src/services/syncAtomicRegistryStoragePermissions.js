@@ -23,9 +23,17 @@ function assertPosixPrivate(directory, filename) {
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw denied();
     if (current === directory) {
       if (stat.uid !== uid || (stat.mode & 0o777) !== 0o700) throw denied();
-    } else if ((stat.mode & 0o022) !== 0
-      && !((stat.mode & 0o1000) !== 0 && stat.uid === 0)) {
-      throw denied();
+    } else {
+      // chmod(0755) only removes group/other writes; it does NOT prevent
+      // the directory's owner from renaming this subtree or chmod-ing its
+      // parent writable again. Only our own UID or privileged root is an
+      // acceptable ancestor owner. Root-owned sticky /tmp is the sole
+      // intentional exception to the group/other writable rule.
+      if (stat.uid !== uid && stat.uid !== 0) throw denied();
+      if ((stat.mode & 0o022) !== 0
+        && !((stat.mode & 0o1000) !== 0 && stat.uid === 0)) {
+        throw denied();
+      }
     }
     const parent = path.dirname(current);
     if (parent === current) break;

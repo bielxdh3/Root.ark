@@ -1,5 +1,12 @@
 const { execFileSync } = require("node:child_process");
 
+// This verifier is the final authority for protected on-disk ciphertext and
+// its co-located device registry. Executing a PATH-selected powershell.exe
+// lets a local attacker substitute a no-op binary returning exit status 0,
+// silently approving arbitrary NTFS ACLs. Pin ALL native ACL actions to
+// Windows PowerShell's canonical system executable, including create/sddl.
+const TRUSTED_POWERSHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+
 const NATIVE_ACL = String.raw`
 using System;
 using System.Collections.Generic;
@@ -191,12 +198,9 @@ function runAclScript(rootDir, action) {
   const script = `Add-Type -TypeDefinition @'\n${NATIVE_ACL}\n'@\n[RootarkChunkAclNative]::Ensure('${escapedRoot}', '${action}')`;
   const encoded = Buffer.from(script, "utf16le").toString("base64");
   try {
-    // Authority-file security checks must not execute powershell.exe from a
-    // caller-controlled PATH. Only the fixed in-box Windows binary is allowed.
-    const shell = action === "verify-authority"
-      ? "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
-      : "powershell.exe";
-    return execFileSync(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand", encoded], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, timeout: 12000, maxBuffer: 32 * 1024 }).trim();
+    // Pin every ACL action, not only authority verification, while retaining
+    // the existing bounded subprocess execution and output limits.
+    return execFileSync(TRUSTED_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand", encoded], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, timeout: 12000, maxBuffer: 32 * 1024 }).trim();
   } catch (error) {
     const detail = String(error.stdout || error.stderr || "").match(/Untrusted principal can replace[^"_<\r\n]*/)?.[0];
     throw new Error(detail || "Windows chunk staging ACL validation failed");

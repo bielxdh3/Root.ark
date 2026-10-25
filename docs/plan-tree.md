@@ -2,6 +2,32 @@
 
 ## Issue #65 / PR #228: protected Sync v2 atomic revocation ingress gate (2026-10-25)
 
+**Security follow-up (independent W15 P1/P2 review).** The legacy direct-store
+gate now also checks the **current record and every retained historical
+version** for any `authorization` field, including malformed values, inside
+the transaction's freshly reloaded on-disk snapshot and **before** replay,
+stale revision, create, update or delete handling. A historically signed
+ciphertext can no longer be downgraded to an unsigned tombstone through an
+otherwise permitted legacy route, even after process restart or when a peer
+commits the signed version after HTTP request parsing. The route returns
+`503 SYNC_PROTECTED_ATOMIC_REQUIRED` rather than an unhandled 500. Unsigned
+legacy-only objects remain writable. This can only protect signed history
+**still present in the legacy inventory**; a former signed version already
+erased from all durable records before this patch requires independent
+reconciliation and cannot be proven from absent evidence.
+
+POSIX atomic registry storage validation now rejects **every foreign-owned
+ancestor** (owner neither the current service UID nor trusted root), even if
+its mode is `0755`: the foreign owner could still rename/chmod the parent
+and replace the private registry tree. The real root-owned world-writable
+sticky `/tmp` exception remains permitted, and a foreign-owned sticky
+directory does not qualify. On Windows the shared chunk/registry ACL helper
+executes the **absolute canonical system PowerShell path for create, verify
+and SDDL**. A real malicious `powershell.exe` injected first in `PATH`
+previously made an unsafe NTFS directory pass verification; the focused
+adversarial test now verifies it is rejected and genuine secured roots
+still pass. No ACLs or legacy data are silently modified.
+
 The signed, encrypted Sync v2 object PUT/POST/DELETE ingress now **fails closed**
 with `503 SYNC_PROTECTED_ATOMIC_REQUIRED` when the server does not use an
 explicitly provisioned, co-located atomic device registry. This applies when

@@ -485,10 +485,24 @@ class SyncObjectStore {
       // JSON/callback registry cannot fence revocation against durableWrite.
       // Never interpret a valid old signature as permission to bypass the
       // co-located, cross-process atomic registry.
-      if (!this.atomicDeviceRegistry && input.authorization) {
-        throw Object.assign(new Error("Protected Sync v2 requires an atomic device registry"), {
-          code: "SYNC_PROTECTED_ATOMIC_REQUIRED",
-        });
+      if (!this.atomicDeviceRegistry) {
+        const account = ownRecord(next.users, username);
+        const current = ownRecord(ownRecord(account, "objects"), input.objectId);
+        const history = ownRecord(ownRecord(account, "versions"), input.objectId);
+        const isProtected = (record) => record && typeof record === "object"
+          && Object.hasOwn(record, "authorization");
+        // A previously signed object cannot be downgraded by an unsigned
+        // legacy writer. Check both the current record AND every retained
+        // historical version, before replay/conflict handling and within the
+        // freshly loaded cross-process transaction snapshot. A preflight
+        // check in the HTTP route would race another writer's durable commit.
+        if (isProtected(input) || isProtected(current)
+          || (history !== undefined && (!Array.isArray(history)
+            || history.some(isProtected)))) {
+          throw Object.assign(new Error("Protected Sync v2 requires an atomic device registry"), {
+            code: "SYNC_PROTECTED_ATOMIC_REQUIRED",
+          });
+        }
       }
       // A legacy process may point at the SAME storage file during a staged
       // rollout. Never allow its pre-transaction JSON/callback authorization
@@ -794,6 +808,10 @@ function registerSyncRoutes({ app, authenticate, requirePermission, storagePath 
       }
       if (error?.code === "SYNC_ATOMIC_ACCOUNT_UNAVAILABLE") {
         return errorResponse(res, 503, "Sync account authorization unavailable");
+      }
+      if (error?.code === "SYNC_PROTECTED_ATOMIC_REQUIRED") {
+        return errorResponse(res, 503, "Protected Sync v2 requires atomic device registry",
+          { code: "SYNC_PROTECTED_ATOMIC_REQUIRED" });
       }
       if (error?.code === "SYNC_COMMIT_INDETERMINATE" || store.commitIndeterminate) {
         return errorResponse(res, 503, "sync_commit_indeterminate", { code: "SYNC_COMMIT_INDETERMINATE" });
